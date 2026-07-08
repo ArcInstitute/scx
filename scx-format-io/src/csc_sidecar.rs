@@ -207,7 +207,7 @@ mod tests {
     }
 
     /// `write_csc_sidecar(..., Some(framing))` emits **framed (v2)** CSC shards
-    /// (SHARDAD-F5 §11.3 producer). The framed sidecar round-trips to the same
+    /// (framed CSC sidecar producer). The framed sidecar round-trips to the same
     /// dense matrix and every emitted CSC shard reports `shard_format_version == 2`,
     /// while a `None` control emits v1. Also confirms scattered per-column-group
     /// reads over the produced framed sidecar match a full column-slice.

@@ -199,6 +199,13 @@ pub struct AccelExecutionInfo {
     pub device_id: Option<usize>,
     /// Bytes uploaded host→device (HtoD) for the op / handoff, if tracked.
     pub bytes_uploaded: Option<u64>,
+    /// Number of shards that took the ShufDeltaZstd GPU decode path
+    /// (CPU zstd + GPU undelta/unshuffle/convert),
+    /// set by the `to_gpu_anndata` device handoff. Lets a benchmark/gate observe
+    /// per-codec GPU routing on `compact-trial` (mixed-codec) files, which the
+    /// aggregate `transfer_mode` cannot (it stays `scx_device_handoff_streamed`
+    /// while any shard uploads decompressed bytes). `None` outside that path.
+    pub n_shards_shufdelta_gpu: Option<u32>,
 }
 
 impl AccelExecutionInfo {

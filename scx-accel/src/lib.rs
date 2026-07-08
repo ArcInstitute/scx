@@ -107,6 +107,8 @@ pub use neighbors::cuvs_available;
 #[cfg(feature = "gpu")]
 pub use pca::{gpu_available, gpu_info, randomized_pca_gpu, GpuInfo};
 #[cfg(feature = "gpu")]
+pub use scx_gpu::nvcomp::nvcomp_enabled;
+#[cfg(feature = "gpu")]
 pub use scx_gpu::profile;
 #[cfg(feature = "gpu")]
 pub use scx_gpu::{

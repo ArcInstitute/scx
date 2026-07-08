@@ -68,10 +68,12 @@ pub mod gpu_preprocess;
 pub mod gpu_shard_source;
 pub mod linear_operator;
 pub mod math_policy;
+pub mod nvcomp;
 pub mod preprocessed_gpu_matrix_source;
 pub mod profile;
 pub mod rice_gpu;
 pub mod shard_decode;
+pub mod shufdelta_gpu;
 pub mod sparse_dense;
 pub mod staging;
 

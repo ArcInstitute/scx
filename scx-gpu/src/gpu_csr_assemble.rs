@@ -18,7 +18,8 @@
 
 use std::io::Cursor;
 
-use scx_format_io::shard::ShardHeader;
+use scx_codec::{CodecId, ValueEncoding};
+use scx_format_io::shard::{ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION};
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -58,10 +59,14 @@ pub fn decode_csr_shards_to_device_with_stats(
     }
 
     // 1. Pre-scan headers (cheap, no decode) → total rows / nnz + per-shard nnz.
+    //    Also detect whether *every* shard is a framed (shard-v2) ShufDeltaZstd
+    //    shard with an integer value encoding — the eligibility condition for the
+    //    Phase-2.x cross-shard nvcomp batched decode.
     let mut total_rows: usize = 0;
     let mut total_nnz: usize = 0;
     let mut n_cols: usize = 0;
     let mut per_shard: Vec<(usize, usize)> = Vec::with_capacity(shards.len()); // (rows, nnz)
+    let mut all_framed_shufdelta_int = true;
     for (i, bytes) in shards.iter().enumerate() {
         let header = ShardHeader::read_from(&mut Cursor::new(bytes))
             .map_err(|e| GpuError::InvalidShard(format!("shard {i} header: {e}")))?;
@@ -75,9 +80,32 @@ pub fn decode_csr_shards_to_device_with_stats(
                 "shard {i} column count {cols} != {n_cols} (shards must agree)"
             )));
         }
+        let framed = header.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION;
+        let is_shufdelta = matches!(
+            CodecId::from_u8(header.codec_id),
+            Some(CodecId::ShufDeltaZstd)
+        );
+        let is_integer = ValueEncoding::from_u8(header.value_encoding)
+            .map(|v| v.is_integer())
+            .unwrap_or(false);
+        all_framed_shufdelta_int &= framed && is_shufdelta && is_integer;
         total_rows += rows;
         total_nnz += nnz;
         per_shard.push((rows, nnz));
+    }
+
+    // Phase-2.x batched path (2x-d): when every CSR shard is framed
+    // ShufDeltaZstd-integer and the opt-in nvcomp decode is enabled, decode all
+    // shards' compressed frames in **2** batched nvcomp calls (idx, val) instead
+    // of ~2 per shard. `SCX_NVCOMP_NO_BATCH=1` forces the per-shard loop below
+    // (for the batched-vs-per-shard A/B). Mixed-codec / Scx1 / float modalities
+    // fall through to the per-shard loop, which still nvcomp-decodes each
+    // shufdelta shard individually.
+    let no_batch = std::env::var("SCX_NVCOMP_NO_BATCH")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if all_framed_shufdelta_int && !no_batch && crate::nvcomp::nvcomp_enabled() {
+        return crate::shufdelta_gpu::decode_shufdelta_shards_nvcomp_batched(dev, shards);
     }
 
     // 2. Allocate the combined nnz-sized device buffers once.

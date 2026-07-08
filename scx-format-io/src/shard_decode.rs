@@ -303,7 +303,7 @@ mod tests {
 
     /// `decode_shard_regions_scipy` on a **framed (v2)** shard reassembles the
     /// same global CSR as decoding the identical matrix unframed (v1). Covers the
-    /// helper shared with the scx-gpu host-bounce (SHARDAD-F5 §11.2).
+    /// helper shared with the scx-gpu host-bounce.
     #[test]
     fn decode_shard_regions_framed_matches_unframed() {
         use crate::encoder::{encode_one_shard, FramingConfig};

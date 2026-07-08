@@ -2,11 +2,20 @@
 //
 // Run: cargo bench -p scx-codec
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+};
 use scx_codec::bitstream::BitWriter;
+use scx_codec::byte_delta::{byte_delta_planes, byte_undelta_planes};
 use scx_codec::forbp::{forbp_decode, forbp_encode};
 use scx_codec::rice::{rice_decode, rice_encode, B_VAL};
+use scx_codec::shuffle::{byte_shuffle, byte_unshuffle};
 use scx_codec::{decode_shard, encode_shard, CodecId, ValueEncoding};
+
+/// zstd level used by the `ShufDeltaZstd` codec (`SHUFDELTA_ZSTD_LEVEL` in
+/// `scx-codec/src/dispatch.rs`). Kept in sync so the compressed sub-stream this
+/// bench decodes is byte-representative of a real on-disk shard.
+const SHUFDELTA_ZSTD_LEVEL: i32 = 3;
 
 // ---------------------------------------------------------------------------
 // P3 / OPT-2.1 before/after: u64-buffered BitWriter vs the old per-bit writer.
@@ -371,11 +380,128 @@ fn bench_decode_shard(c: &mut Criterion) {
     group.finish();
 }
 
+/// GPU ShufDeltaZstd decode, Phase 0 task 0b: quantify the CPU cost split of a
+/// ShufDeltaZstd shard decode across its three stages — zstd-decompress,
+/// byte-undelta (prefix scan), byte-unshuffle (transpose) — on the nnz-sized
+/// `indices` sub-stream, plus zstd-decompress of the `values` sub-stream.
+///
+/// This tests the spec §8 performance-model assumption that **zstd dominates**
+/// the CPU decode (~800 μs zstd vs ~100 μs undelta+unshuffle). The measured
+/// split bounds the win a Phase-1 GPU offload of undelta/unshuffle can deliver;
+/// in practice the scalar transforms are *slower* than zstd, so they, not zstd,
+/// dominate — the opposite of the spec's estimate.
+///
+/// The encode pipeline mirrors `encode_shufdelta_zstd` exactly
+/// (`shuffle → delta → zstd`, `scx-codec/src/dispatch.rs`); the decode reverses
+/// it (`zstd → undelta → unshuffle`). We reconstruct the three intermediate
+/// buffers so each stage can be timed on a byte-representative input:
+///
+/// - `idx_shuffled` — plane-major, pre-delta → input to `unshuffle`.
+/// - `idx_delta` — delta'd plane-major → input to `undelta`; also the exact zstd-decompress output.
+/// - `idx_compressed` — on-disk zstd bytes → input to `zstd_decode`.
+///
+/// Both index widths are covered: 2 (u16, n_cols ≤ 65535 — the common census
+/// case) and 4 (u32, the spec's performance-model case).
+fn bench_shufdelta_decode_stages(c: &mut Criterion) {
+    // Census-representative shard: 16K rows × ~2000 nnz/row.
+    let (_indptr, indices, values, _n_rows, nnz) = generate_shard(16_384, 2000, 60_000);
+    let n_indices = indices.len();
+    debug_assert_eq!(nnz, n_indices);
+
+    let mut group = c.benchmark_group("shufdelta_decode_stages");
+
+    for &index_width in &[2usize, 4usize] {
+        let width_label = if index_width == 2 { "u16" } else { "u32" };
+
+        // Element-major LE bytes of the indices, matching `indices_to_le_bytes`.
+        let mut indices_raw = Vec::with_capacity(n_indices * index_width);
+        for &v in &indices {
+            let le = v.to_le_bytes();
+            indices_raw.extend_from_slice(&le[..index_width]);
+        }
+
+        // Reproduce the encode pipeline, capturing each intermediate buffer.
+        let idx_shuffled = byte_shuffle(&indices_raw, index_width).unwrap();
+        let mut idx_delta = idx_shuffled.clone();
+        byte_delta_planes(&mut idx_delta, index_width, n_indices);
+        let idx_compressed = zstd::encode_all(idx_delta.as_slice(), SHUFDELTA_ZSTD_LEVEL).unwrap();
+
+        // Sanity: the decode of each stage reproduces its predecessor.
+        {
+            let zres = zstd::decode_all(idx_compressed.as_slice()).unwrap();
+            assert_eq!(
+                zres, idx_delta,
+                "zstd decode != delta'd planes ({width_label})"
+            );
+            let mut und = idx_delta.clone();
+            byte_undelta_planes(&mut und, index_width, n_indices);
+            assert_eq!(
+                und, idx_shuffled,
+                "undelta != shuffled planes ({width_label})"
+            );
+            let un = byte_unshuffle(&idx_shuffled, index_width).unwrap();
+            assert_eq!(un, indices_raw, "unshuffle != raw indices ({width_label})");
+        }
+
+        // Report throughput over the decompressed sub-stream byte size so the
+        // three stages print directly comparable ns / GB/s.
+        group.throughput(Throughput::Bytes(idx_delta.len() as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("indices_zstd_decode", width_label),
+            &idx_compressed,
+            |b, comp| b.iter(|| black_box(zstd::decode_all(black_box(comp.as_slice())).unwrap())),
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("indices_undelta", width_label),
+            &idx_delta,
+            |b, delta| {
+                // `PerIteration`: the undelta is in-place, so each iteration
+                // needs a fresh delta'd buffer. The multi-hundred-MB buffer
+                // makes larger batch sizes memory-thrash and distort timings,
+                // so clone exactly once per timed iteration (clone excluded).
+                b.iter_batched(
+                    || delta.clone(),
+                    |mut buf| {
+                        byte_undelta_planes(&mut buf, index_width, n_indices);
+                        buf
+                    },
+                    BatchSize::PerIteration,
+                )
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("indices_unshuffle", width_label),
+            &idx_shuffled,
+            |b, shuf| b.iter(|| black_box(byte_unshuffle(black_box(shuf), index_width).unwrap())),
+        );
+    }
+
+    // Values sub-stream (u8 counts): zstd → unshuffle(width=1). Width-1
+    // unshuffle is a no-op copy, so only the zstd-decompress cost is material.
+    {
+        let val_shuffled = byte_shuffle(&values, 1).unwrap();
+        let val_compressed =
+            zstd::encode_all(val_shuffled.as_slice(), SHUFDELTA_ZSTD_LEVEL).unwrap();
+        group.throughput(Throughput::Bytes(values.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("values_zstd_decode", "u8"),
+            &val_compressed,
+            |b, comp| b.iter(|| black_box(zstd::decode_all(black_box(comp.as_slice())).unwrap())),
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_forbp_decode,
     bench_rice_decode,
     bench_decode_shard,
+    bench_shufdelta_decode_stages,
     bench_bitwriter_encode,
     bench_rice_encode,
     bench_encode_shard

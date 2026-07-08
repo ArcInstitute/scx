@@ -574,6 +574,40 @@ absolute_floors:
   #   dataset: tabula_sapiens_100k
   #   metric: scx_format_pipeline_devdecode_route
   #   min: 1.0
+
+  # --- GPU ShufDeltaZstd decode route floor ---
+  # Phase 1 added a GPU decode path for framed/unframed ShufDeltaZstd shards
+  # (CPU zstd + GPU undelta/unshuffle/convert). `to_gpu_anndata` now stamps
+  # `uns["scx_accel"]["to_gpu_anndata"]["n_shards_shufdelta_gpu"]` — the count of
+  # shards that took that GPU path (> 0 proves compact-trial/shufdelta shards no
+  # longer host-bounce). The standalone `benchmarks/scripts/bench_gpu_codec.py`
+  # already reports it. This floor is DEFERRED (commented) until both hold:
+  #   1. the comprehensive `accel_to_gpu_anndata` benchmark runs a shufdelta /
+  #      compact-trial format variant and emits `n_shards_shufdelta_gpu` via
+  #      `add_run` (today it runs only the `scx1` variant), and
+  #   2. a clean `scx-bench-gpu` baseline carries the metric (a floor on a
+  #      metric the baseline lacks reads as a violation).
+  # - benchmark: accel_to_gpu_anndata
+  #   format: accel_to_gpu_anndata__shufdelta_gpu
+  #   dataset: census_1m
+  #   metric: shufdelta_n_shards_gpu
+  #   min: 1.0
+
+  # --- Phase 2 (nvcomp) full-device-decode floor  ---
+  # Phase 2 decodes framed ShufDeltaZstd fully in VRAM via nvcomp (upload
+  # compressed, GPU zstd), so `to_gpu_anndata` reports
+  # `transfer_mode == "scx_device_decode_gpu"` (fully_device_decoded) for a
+  # shufdelta/compact-trial file — Scx1 route parity. nvcomp is runtime-dlopen'd
+  # (present in scx-bench-gpu); where it is absent the pipeline path runs and
+  # this route would be false, so the floor must only gate GPU hosts that carry
+  # nvcomp. DEFERRED (commented) until the comprehensive suite runs a shufdelta
+  # variant emitting `shufdelta_fully_device_decoded` AND a clean nvcomp-enabled
+  # baseline carries it (same rationale as the Phase-1 block above).
+  # - benchmark: accel_to_gpu_anndata
+  #   format: accel_to_gpu_anndata__shufdelta_gpu
+  #   dataset: census_1m
+  #   metric: shufdelta_fully_device_decoded
+  #   min: 1.0
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_hh
     dataset: pbmc3k

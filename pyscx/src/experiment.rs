@@ -1036,13 +1036,14 @@ impl PyExperiment {
                 && !self.reader.header().has_deletion_vectors()
                 && n_csr_shards > 0;
 
-            let (adata, holder, n_rows, n_cols, bytes_uploaded, transfer_mode): (
+            let (adata, holder, n_rows, n_cols, bytes_uploaded, transfer_mode, n_shufdelta_gpu): (
                 Bound<'py, PyAny>,
                 crate::accel::gpu_handoff::GpuCsrMatrix,
                 usize,
                 usize,
                 u64,
                 &'static str,
+                Option<u32>,
             ) = if fast_path {
                 // X-less skeleton (obs / var / obsm / uns / layers assembled eagerly;
                 // X is assigned after the device decode below).
@@ -1068,6 +1069,14 @@ impl PyExperiment {
                 let mut shard_refs: Vec<&[u8]> = Vec::with_capacity(n_csr_shards);
                 let mut total_rows: usize = 0;
                 let mut total_nnz: usize = 0;
+                // Phase-2.x batched-nvcomp VRAM accounting: whether every shard is
+                // framed ShufDeltaZstd-integer (batched path eligible) + the total
+                // compressed idx/val bytes and the max index/value width — used to
+                // size the all-shards-decompressed transient below.
+                let mut all_framed_shufdelta_int = true;
+                let mut total_compressed_bytes: u64 = 0;
+                let mut max_index_width: u64 = 2;
+                let mut max_value_width: u64 = 1;
                 for i in 0..n_csr_shards {
                     let bytes = self
                         .reader
@@ -1079,6 +1088,23 @@ impl PyExperiment {
                     .map_err(|e| PyRuntimeError::new_err(format!("shard {i} header: {e}")))?;
                     total_rows += header.n_major as usize;
                     total_nnz += header.nnz as usize;
+                    let framed = header.shard_format_version
+                        > scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION;
+                    let is_shufdelta = matches!(
+                        scx_codec::CodecId::from_u8(header.codec_id),
+                        Some(scx_codec::CodecId::ShufDeltaZstd)
+                    );
+                    let is_integer = scx_codec::ValueEncoding::from_u8(header.value_encoding)
+                        .map(|v| v.is_integer())
+                        .unwrap_or(false);
+                    all_framed_shufdelta_int &= framed && is_shufdelta && is_integer;
+                    total_compressed_bytes +=
+                        header.indices_length as u64 + header.values_length as u64;
+                    let iw = if header.index_dtype == 0 { 2u64 } else { 4 };
+                    max_index_width = max_index_width.max(iw);
+                    if let Some(ve) = scx_codec::ValueEncoding::from_u8(header.value_encoding) {
+                        max_value_width = max_value_width.max(ve.byte_width() as u64);
+                    }
                     shard_refs.push(bytes);
                 }
 
@@ -1092,7 +1118,30 @@ impl PyExperiment {
 
                 // ≤VRAM pre-flight on the device-resident CSR size (HEADROOM covers
                 // the transient single-shard decode buffer during concat).
-                let device_bytes = (total_nnz as u64) * 8 + (total_rows as u64 + 1) * 8;
+                let csr_bytes = (total_nnz as u64) * 8 + (total_rows as u64 + 1) * 8;
+                // The Phase-2.x batched nvcomp path (2x-e) holds three buffers at
+                // peak: the compressed blob (all shards' idx+val frames), the
+                // decompressed plane buffers (nnz × index_width + nnz × value_width),
+                // and the final CSR — vs the per-shard path's CSR + one shard's
+                // transient. Size the gate on that transient when the batched path
+                // will actually run so a card that fits the CSR but not the transient
+                // is rejected up front rather than OOMing mid-decode.
+                let no_batch = std::env::var("SCX_NVCOMP_NO_BATCH")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                let device_bytes =
+                    if all_framed_shufdelta_int && !no_batch && scx_accel::nvcomp_enabled() {
+                        let plane_bytes = (total_nnz as u64) * max_index_width
+                            + (total_nnz as u64) * max_value_width;
+                        csr_bytes + total_compressed_bytes + plane_bytes
+                    } else {
+                        // Per-shard fallback (mixed-codec / Scx1 / float, or the
+                        // batched path forced off): the nvcomp/pipeline transient is
+                        // bounded by a *single* shard's compressed + plane buffers
+                        // (one shard is decoded then dropped before the next), which
+                        // HEADROOM's 20% slack on the full CSR comfortably absorbs.
+                        csr_bytes
+                    };
                 let (free, total) = dev
                     .free_memory()
                     .map_err(|e| PyRuntimeError::new_err(format!("query free VRAM: {e}")))?;
@@ -1133,6 +1182,7 @@ impl PyExperiment {
                     n_cols,
                     decode_stats.host_uploaded_bytes,
                     transfer_mode,
+                    Some(decode_stats.n_shards_shufdelta_gpu),
                 )
             } else {
                 // Host-assemble fallback (filtered / projected / multimodal inputs):
@@ -1222,6 +1272,7 @@ impl PyExperiment {
                     n_cols,
                     bytes_uploaded,
                     "scx_device_handoff",
+                    None,
                 )
             };
 
@@ -1256,6 +1307,7 @@ impl PyExperiment {
             info.device_id = Some(gpu_id);
             info.bytes_uploaded = Some(bytes_uploaded);
             info.cupy_version = Some(cupy_version);
+            info.n_shards_shufdelta_gpu = n_shufdelta_gpu;
             crate::accel::route::write_accel_route(py, &adata, "to_gpu_anndata", &info)?;
 
             Ok(adata)

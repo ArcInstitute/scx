@@ -1190,7 +1190,7 @@ def capability_matrix_table() -> TableBlock:
 
     The head-to-head perf tables cover the axes both formats support; this grid
     records the *capability* differences that a race can't (they're not "slower",
-    they're absent on one side). Hand-authored from SHARDAD-SCX-COMPARE.md and the
+    they're absent on one side). Hand-authored from the scx-vs-shardad comparison and the
     two projects' feature surfaces. ``✓`` = supported, ``✗`` = not supported,
     ``~`` = partial; ``✓✓`` = a notable strength.
     """

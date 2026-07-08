@@ -114,8 +114,8 @@ pub fn encode_one_shard(
     //     byte-identical to the legacy layout; shard v1.
     //   - Row-group-framed (`framing`): each row-group is encoded independently
     //     and the multi-entry BlockIndex records per-group byte offsets, enabling
-    //     codec-agnostic sub-shard random access (SIDECAR-LONG-TERM-FIX.md
-    //     Option B); shard v2. `trial` picks the smaller of {heuristic winner,
+    //     codec-agnostic sub-shard random access; shard v2. `trial` picks the
+    //     smaller of {heuristic winner,
     //     ShufDeltaZstd} per shard.
     let n_major = (shard_indptr.len() - 1) as u32;
     let nnz = *shard_indptr.last().unwrap_or(&0);
@@ -272,7 +272,7 @@ pub fn encode_one_shard(
 }
 
 /// Frame a `CodecId::None` CSR shard into row-groups for codec-agnostic
-/// sub-shard random access (SIDECAR-LONG-TERM-FIX.md Option B, Phase 1).
+/// sub-shard random access.
 ///
 /// Returns the re-framed **indptr sub-stream** (a concatenation of per-group
 /// *local-rebased* indptrs — each group `[r0, r1)` contributes `r1-r0+1` u64s
@@ -325,7 +325,7 @@ fn framed_size(e: &EncodedShard) -> usize {
     e.indptr_bytes.len() + e.indices_bytes.len() + e.values_bytes.len()
 }
 
-/// Encode a shard **row-group-framed** (F5-b / SIDECAR-LONG-TERM-FIX.md Option B):
+/// Encode a shard **row-group-framed** (F5-b):
 /// partition the major axis into groups (≤ `row_group_rows` rows and, if set,
 /// ≤ `target_nnz` nnz — always ≥1 row), encode each group independently as a
 /// standalone sub-shard via [`encode_shard`], and concatenate the three
