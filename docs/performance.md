@@ -939,6 +939,35 @@ reference-isolation gates on all fixtures. The live tables render in the compreh
 report's "Grouped Read/Write — scx vs shardad", "Out-of-Core Peak RSS", and "Format
 Capability Matrix" sections.
 
+**F6 — in-memory grouped-write fast path (closes the write-speed gap).** The
+grouped-write times in the head-to-head table above are the pre-F6 path (scx
+streamed the reorder row-by-row through a single-threaded encoder, losing to
+shardad's in-RAM encode). F6 fixed both halves: **Phase 0** caps the emitter's
+per-shard buffer at `--group-write-block-bytes` (default 256 MB), sub-flushing an
+oversized group across shards so grouped write no longer OOMs on a huge reference
+group; **Phase 1** added an in-memory **parallel** fast path (`scx sort
+--group-by` / `pyscx.sort(group_by=)` with no `--memory-budget`) that gathers the
+resident CSR and encodes blocks across rayon threads — **byte-identical** to the
+single-threaded path. A/B on real fixtures (release pyscx, 16-core `cpu`,
+`/usr/bin/time -v` true peak; "legacy" = `SCX_SORT_NO_INMEM_FAST=1`, the
+Phase-0 single-threaded emitter):
+
+| dataset | scx fast | scx legacy | speedup | shardad grouped write | fast peak RSS |
+|---|---|---|---|---|---|
+| `chemogenetic_rgfp` (136K × 18K, 909M nnz) | **6.5 s** | 24.2 s | 3.7× | 21.0 s | 18.7 GB |
+| `replogle_k562` (69K × 6.5K) | **12.8 s** | 28.0 s | 2.2× | 53.2 s | 6.3 GB |
+| `tahoe_c38` (69K × 63K) | **9.0 s** | 17.4 s | 1.9× | 9.5 s | 5.0 GB |
+
+scx now **beats shardad on grouped write** for in-RAM-sized data (chemogenetic
+6.5 s ≪ 21 s; tahoe 9.0 s < 9.5 s), while keeping the streaming/`--memory-budget`
+path as the atlas-scale moat. The parallel gather trades peak RSS for speed — on
+`chemogenetic_rgfp` (127K-cell reference group) the 16-way gather peaks at
+~18.7 GB vs the emitter's ~11.9 GB, still far under the historical 48–72 GB OOM;
+neutral on the other two. Bound it with `RAYON_NUM_THREADS`, or set
+`SCX_SORT_NO_INMEM_FAST=1` to force the memory-lean single-threaded emitter. A
+`grouped_sort` `peak_rss_mb` gross-regression ceiling gates each dataset in
+`thresholds.yaml` (wall time stays measured-not-gated — hardware-sensitive).
+
 **Beyond grouped sharding (full cross-format campaign, release build).** shardad also
 runs as a first-class format in the comprehensive suite:
 
