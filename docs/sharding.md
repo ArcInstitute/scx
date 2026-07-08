@@ -462,6 +462,15 @@ across the reference / non-reference boundary (only possible with
 `scx_engine::QueryPipeline::{read_group, read_reference, group_labels,
 iter_group_shards, read_row_range}`.
 
+> **F6 note.** `read_group` / `read_reference` are safe under the F6 sub-flush:
+> they union all of a label's records via `GroupIndex::label_range` /
+> `reference_range`, so a group split across shards reads back in full. The
+> lower-level **streaming** surface (`iter_group_shards` / `GroupShardHandle`)
+> yields one handle **per shard**, so an oversized group now appears in
+> **several** handles (each covering its shard-local slice) — a streaming
+> consumer must accumulate across handles rather than stop at the first handle
+> mentioning a label.
+
 ### Limitations & staleness
 
 The `group_index` sidecar is **write-once** — produced only by `scx sort

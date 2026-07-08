@@ -136,8 +136,10 @@ impl GroupIndex {
         // gap or overlap would make the union pull in interloping rows from
         // another group. Enforce it here (mirrors the reference `[0, k)` check).
         {
-            use std::collections::BTreeMap;
-            let mut by_group: BTreeMap<&str, Vec<&GroupRecord>> = BTreeMap::new();
+            // Group order does not affect this validation (each label's records
+            // are sorted by `row_start` independently), so a HashMap's O(1)
+            // grouping is preferable to an ordered map here.
+            let mut by_group: HashMap<&str, Vec<&GroupRecord>> = HashMap::new();
             for r in records.iter().filter(|r| r.role == GroupRole::Group) {
                 by_group.entry(r.label.as_str()).or_default().push(r);
             }

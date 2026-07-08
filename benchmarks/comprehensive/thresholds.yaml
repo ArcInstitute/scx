@@ -1423,15 +1423,18 @@ absolute_floors:
     dataset: chemogenetic_rgfp
     metric: reference_isolated_int
     min: 1
-  # Grouped-write peak-RSS ceilings (gross-regression guards only).
-  # `peak_rss_mb` is sampled after the op (not a true peak) and is cumulative
-  # across the benchmark's scenarios in one process, so it is noisy — these
-  # ceilings are set well above the observed A/B peaks (chemogenetic ~18.7 GB,
-  # replogle ~6.3 GB, tahoe ~5.0 GB true-peak under /usr/bin/time) to catch a
-  # blowup toward the historical 48–72 GB OOM regime, NOT to gate fine-grained
-  # memory. The Phase-1 parallel fast path trades peak RSS for speed (16-way
-  # gather); RAYON_NUM_THREADS bounds it for memory-constrained hosts. Wall time
-  # stays measured-not-gated (grouped-sort perf floors are hardware-sensitive).
+  # Grouped-write RSS ceilings (gross-regression guards only).
+  # NOTE: `peak_rss_mb` is `current_rss_mb()` sampled *after* the op — the
+  # residual resident set, NOT the transient parallel-gather high-water mark (the
+  # A/B campaign measured true peak separately with `/usr/bin/time -v`:
+  # chemogenetic ~18.7 GB, replogle ~6.3 GB, tahoe ~5.0 GB), and it is cumulative
+  # across the benchmark's scenarios in one process. So this gate catches a
+  # sustained blowup toward the historical 48–72 GB OOM regime, but will NOT catch
+  # a spike-then-free peak; ceilings sit well above the residual to avoid flaky
+  # failures. The Phase-1 parallel fast path trades peak RSS for speed, bounded to
+  # O(concurrency × block cap) — RAYON_NUM_THREADS caps concurrency and the block
+  # cap is clamped to --memory-budget. Wall time stays measured-not-gated
+  # (grouped-sort perf floors are hardware-sensitive).
   - benchmark: grouped_sort
     format: scx_auto
     dataset: chemogenetic_rgfp

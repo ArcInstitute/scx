@@ -1866,6 +1866,18 @@ fn x_shard_section_bytes(path: &Path) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Raw section bytes of every detection-bitmap shard, in catalog order — the
+/// fast path builds bitmaps in parallel, so this guards bitmap-section parity
+/// with the emitter (which builds them in `flush`).
+fn bitmap_section_bytes(path: &Path) -> Vec<Vec<u8>> {
+    let r = ScxReader::open(path).unwrap();
+    r.catalog()
+        .shards(SectionType::BitmapShard)
+        .iter()
+        .map(|e| r.section_bytes(e).unwrap().to_vec())
+        .collect()
+}
+
 /// The parallel fast path (grouped `InMemory`) must be **byte-identical**
 /// to the row-by-row `CsrEmitter` path. We drive the emitter via
 /// `ExternalPartition` (which pushes rows through the same `CsrEmitter` with the
@@ -1874,41 +1886,60 @@ fn x_shard_section_bytes(path: &Path) -> Vec<Vec<u8>> {
 /// splits groups across multiple blocks.
 #[test]
 fn grouped_fast_path_byte_identical_to_emitter() {
+    // Cross both the block cap (no sub-flush / splitting) and the bitmap policy
+    // (Off / Always) so the parallel bitmap build is byte-compared too. The
+    // fixture header is v4, so the sort output is row-group-framed — framing
+    // parity is exercised in every case.
     for cap in [None, Some(120u64)] {
-        let dir = tempfile::tempdir().unwrap();
-        let mut genes: Vec<&str> = vec!["nt"; 20];
-        genes.extend(["MYC"; 15]);
-        genes.extend(["TP53"; 12]);
-        genes.extend(["GATA1"; 9]);
-        let control: Vec<bool> = genes.iter().map(|g| *g == "nt").collect();
-        let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
-        let mk = || SortOptions {
-            group_by: Some("target_gene".to_string()),
-            reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
-            shard_target_rows: 8,
-            group_write_block_bytes: cap,
-            ..Default::default()
-        };
-        let fast = dir.path().join("fast.scx");
-        sort_with_strategy(&inp, &fast, &mk(), Some(SortStrategy::InMemory)).unwrap();
-        let emit = dir.path().join("emit.scx");
-        sort_with_strategy(&inp, &emit, &mk(), Some(SortStrategy::ExternalPartition)).unwrap();
+        for bmp in [BitmapPolicy::Off, BitmapPolicy::Always] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut genes: Vec<&str> = vec!["nt"; 20];
+            genes.extend(["MYC"; 15]);
+            genes.extend(["TP53"; 12]);
+            genes.extend(["GATA1"; 9]);
+            let control: Vec<bool> = genes.iter().map(|g| *g == "nt").collect();
+            let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+            let mk = || SortOptions {
+                group_by: Some("target_gene".to_string()),
+                reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+                shard_target_rows: 8,
+                bitmap: bmp,
+                group_write_block_bytes: cap,
+                ..Default::default()
+            };
+            let fast = dir.path().join("fast.scx");
+            sort_with_strategy(&inp, &fast, &mk(), Some(SortStrategy::InMemory)).unwrap();
+            let emit = dir.path().join("emit.scx");
+            sort_with_strategy(&inp, &emit, &mk(), Some(SortStrategy::ExternalPartition)).unwrap();
 
-        assert_eq!(
-            x_shard_section_bytes(&fast),
-            x_shard_section_bytes(&emit),
-            "fast-path X shard bytes must equal the emitter path (cap={cap:?})"
-        );
-        assert_eq!(
-            read_group_index(&fast),
-            read_group_index(&emit),
-            "group_index must match the emitter path (cap={cap:?})"
-        );
-        assert_eq!(
-            csr_shard_ranges(&fast),
-            csr_shard_ranges(&emit),
-            "shard ranges must match the emitter path (cap={cap:?})"
-        );
+            let tag = format!("cap={cap:?}, bitmap={bmp:?}");
+            assert_eq!(
+                x_shard_section_bytes(&fast),
+                x_shard_section_bytes(&emit),
+                "fast-path X shard bytes must equal the emitter path ({tag})"
+            );
+            assert_eq!(
+                bitmap_section_bytes(&fast),
+                bitmap_section_bytes(&emit),
+                "detection-bitmap sections must match the emitter path ({tag})"
+            );
+            if bmp == BitmapPolicy::Always {
+                assert!(
+                    !bitmap_section_bytes(&fast).is_empty(),
+                    "bitmap=Always must emit bitmap sections ({tag})"
+                );
+            }
+            assert_eq!(
+                read_group_index(&fast),
+                read_group_index(&emit),
+                "group_index must match the emitter path ({tag})"
+            );
+            assert_eq!(
+                csr_shard_ranges(&fast),
+                csr_shard_ranges(&emit),
+                "shard ranges must match the emitter path ({tag})"
+            );
+        }
     }
 }
 
