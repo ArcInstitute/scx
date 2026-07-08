@@ -18,6 +18,12 @@
 //! `NVCOMP_DECOMPRESS_BACKEND_DEFAULT=0`). We over-align every buffer to 256
 //! bytes (≥ the 8-byte minimum) so no per-algorithm alignment query is needed.
 
+// The FFI below passes `CUdeviceptr` (u64) through `usize` when building the
+// device pointer arrays; that is only lossless on a 64-bit target (CUDA is
+// 64-bit-only anyway). Fail the build loudly on a hypothetical 32-bit target.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("scx-gpu nvcomp FFI requires a 64-bit target (CUdeviceptr passed via usize)");
+
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -95,8 +101,13 @@ fn load_nvcomp() -> Option<NvcompLib> {
     {
         return None;
     }
-    // Bare SONAME first (honors LD_LIBRARY_PATH / ld cache), then $CONDA_PREFIX/lib.
-    let names = ["libnvcomp.so.5", "libnvcomp.so"];
+    // Versioned SONAME only (honors LD_LIBRARY_PATH / ld cache), then
+    // $CONDA_PREFIX/lib. The FFI signatures below are pinned to the nvcomp 5.x
+    // ABI, so we deliberately do NOT fall back to an unversioned `libnvcomp.so`:
+    // a different major on the path can export these same symbols with a
+    // different signature (UB through the wrong fn pointer). Absent `.so.5` →
+    // CPU fallback, which is the correct failure mode.
+    let names = ["libnvcomp.so.5"];
     let mut search: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(conda) = std::env::var("CONDA_PREFIX") {
         search.push(std::path::PathBuf::from(format!("{conda}/lib")));
@@ -136,7 +147,10 @@ fn nvcomp_lib() -> Option<&'static NvcompLib> {
     NVCOMP_LIB.get_or_init(load_nvcomp).as_ref()
 }
 
-/// Whether nvcomp GPU zstd is available (loadable and not disabled). Cached.
+/// Whether nvcomp GPU zstd is available (loadable and not disabled). Cached in a
+/// `OnceLock`, so `SCX_DISABLE_NVCOMP` is captured **once** at first use — set it
+/// before the first nvcomp call, not mid-process. (Only `SCX_SHUFDELTA_NVCOMP`,
+/// read in [`nvcomp_enabled`], toggles per-call.)
 pub fn nvcomp_available() -> bool {
     nvcomp_lib().is_some()
 }
@@ -177,7 +191,13 @@ pub fn batch_decompress_concat(
 ) -> Result<(CudaSlice<u8>, Vec<usize>), GpuError> {
     let lib =
         nvcomp_lib().ok_or_else(|| GpuError::CudaError("nvcomp not available".to_string()))?;
-    assert_eq!(frames.len(), expected.len());
+    if frames.len() != expected.len() {
+        return Err(GpuError::CudaError(format!(
+            "batch_decompress_concat: {} frames but {} expected sizes",
+            frames.len(),
+            expected.len()
+        )));
+    }
     let n = frames.len();
 
     // Output layout: 256-aligned per-frame offsets in one buffer.

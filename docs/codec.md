@@ -224,12 +224,16 @@ float/log-normalized `X` the value stream falls back to zstd-only and the codec
 is ≈`zstd` with no win, which is why it is opt-in / trial-selected and never
 auto-forced. Per sub-stream:
 
-> **GPU decode:** ShufDeltaZstd has **no GPU decode path**. Scx1 (unframed)
-> decodes directly in VRAM via the BitPacker4x GPU kernel
-> (`scx_device_decode_gpu`); ShufDeltaZstd shards always host-bounce through
-> the CPU (`scx_device_handoff_streamed`). For GPU ML training workloads where
-> codec decode is 25–35% of per-batch wall time, switching from Scx1 to
-> ShufDeltaZstd would regress throughput. See § "Codec tradeoff summary" below.
+> **GPU decode:** Scx1 decodes directly in VRAM via the BitPacker4x / Rice GPU
+> kernels, uploading only the tiny indptr (`scx_device_decode_gpu`).
+> ShufDeltaZstd **also decodes on the GPU** — the undelta / unshuffle / convert
+> transforms run as CUDA kernels — but the default path still runs zstd on the
+> CPU and uploads the decompressed plane bytes, so its transfer mode stays
+> `scx_device_handoff_streamed` (throughput ~parity-to-faster than Scx1 on GPU).
+> The opt-in nvcomp path (`SCX_SHUFDELTA_NVCOMP=1`) decompresses on-device and
+> uploads only the compressed frames, reporting `scx_device_decode_gpu`. The **ML
+> training loader is CPU-only** for both codecs, so there ShufDeltaZstd's slower
+> CPU decode is paid in full. See § "Codec tradeoff summary" below.
 
 - **indices / indptr**: byte-shuffle (transpose to byte planes) → byte-delta
   (per-plane wrapping-`u8`, on the sorted/monotonic streams) → zstd. The delta on
@@ -364,10 +368,13 @@ scattered 300-gene `col_sums` measured **~3.2× faster** than the unframed CSC p
 (fine groups, `row_group_rows=16`). The win is granularity-dependent: choose
 `row_group_rows` for the read pattern — with coarse groups a broadly-scattered
 subset touches ~every group, so framing overhead can make it *slower* than a plain
-full decode. On GPU, `to_gpu_anndata` decodes only **unframed Scx1** shards
-in-VRAM (`scx_device_decode_gpu`); any **framed** shard (any codec, including
-framed Scx1) host-bounces through the shared group-aware decoder
-(`scx_device_handoff_streamed`).
+full decode. On GPU, `to_gpu_anndata` decodes **Scx1** shards in-VRAM — unframed via the
+BitPacker4x / Rice kernels and framed group-by-group — uploading only the indptr
+(`scx_device_decode_gpu`). Framed **ShufDeltaZstd** shards decode via the GPU
+transform kernels but upload the decompressed planes
+(`scx_device_handoff_streamed`) unless the opt-in nvcomp path
+(`SCX_SHUFDELTA_NVCOMP=1`) is enabled, which decompresses on-device
+(`scx_device_decode_gpu`).
 
 ### Codec tradeoff summary — Scx1 vs ShufDeltaZstd
 
@@ -379,7 +386,7 @@ tables in [performance.md](performance.md#scx-vs-shardad--full-feature-parity)):
 |---|---|---|
 | **Compression (integer)** | Baseline | **1.3–2.1× smaller** on medium/large datasets; slightly larger on tiny (pbmc3k) |
 | **CPU decode speed** | **~1.3–1.8× faster** | Baseline |
-| **GPU decode** | **✅ In-VRAM** (unframed; BitPacker4x kernel) | **❌ CPU-only** (host-bounce) |
+| **GPU decode** | **✅ In-VRAM** (BitPacker4x / Rice kernel; only indptr uploaded) | **✅ On-GPU kernels** (undelta/unshuffle); default uploads planes (`handoff_streamed`), `SCX_SHUFDELTA_NVCOMP=1` = full in-VRAM |
 | **Random access (unframed)** | ✅ Per-row (Rice/DGR independently decodable) | ❌ Full-shard (byte-shuffle is global) |
 | **Random access (framed)** | ✅ Per row-group (via BlockIndex) | ✅ Per row-group (via BlockIndex) |
 | **Encode speed** | ~parity | ~parity (slightly faster — no per-row strategy) |
@@ -398,10 +405,11 @@ tables in [performance.md](performance.md#scx-vs-shardad--full-feature-parity)):
 
 `compact-trial` trial-encodes each shard with both the heuristic winner and
 ShufDeltaZstd and keeps the smaller, so it never regresses vs `auto` on size —
-but it **doubles encode time** and produces framed output (shard v2) where
-all shards host-bounce on GPU decode (including any Scx1 shards that won
-the trial). Use `auto` when decode speed or GPU training throughput matters
-more than on-disk size.
+but it **doubles encode time** and produces framed output (shard v2): framed
+Scx1 shards that won the trial still decode in-VRAM group-by-group, while
+ShufDeltaZstd shards decode via the GPU transform kernels (planes uploaded, or
+full in-VRAM under `SCX_SHUFDELTA_NVCOMP=1`). Use `auto` when decode speed or GPU
+training throughput matters more than on-disk size.
 
 ## 8a. Per-modality Codec Defaults
 

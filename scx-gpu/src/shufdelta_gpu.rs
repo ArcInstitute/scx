@@ -453,6 +453,14 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
             consume(rx)
         })
     };
+    // On the error path the slot-event drain below is skipped, so an async H2D on
+    // `copy_stream` out of the pinned host ring may still be in flight when
+    // `pinned_idx`/`pinned_val` drop at end of function → host-side
+    // use-after-free. Best-effort sync the copy stream before propagating so any
+    // outstanding DMA out of the pinned buffers has completed first.
+    if scope_result.is_err() {
+        let _ = copy_stream.synchronize();
+    }
     scope_result?;
 
     // Drain outstanding slot events so the pinned buffers are safe to drop.
@@ -879,6 +887,15 @@ fn prescan_shufdelta_shards<'a>(shards: &[&'a [u8]]) -> Result<ShufdeltaBatchPla
 /// concatenating. Only compressed bytes cross PCIe, so the returned stats report
 /// `fully_device_decoded = true`. The dispatcher guarantees every shard is framed
 /// ShufDeltaZstd with an integer value encoding (2x-d) and that nvcomp is loadable.
+///
+/// **VRAM ceiling (caller must pre-flight):** unlike the pipeline's bounded
+/// 2-slot ring, the batch holds the whole modality resident at peak — the
+/// compressed blob (Σ all frames), both decompressed plane buffers
+/// (`total_nnz·(index_width+value_width)`), and the final CSR
+/// (`total_nnz·8 + rows·8`), plus nvcomp temp (≈ 19 GB on census_1m). There is
+/// **no internal chunking**, so a caller must gate on free VRAM before calling
+/// (pyscx's `to_gpu_anndata` does; see `experiment.rs`). Shard-chunking to bound
+/// the transient on smaller cards is a documented follow-on.
 pub fn decode_shufdelta_shards_nvcomp_batched(
     dev: &GpuDevice,
     shards: &[&[u8]],

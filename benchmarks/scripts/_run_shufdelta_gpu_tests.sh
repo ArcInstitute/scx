@@ -11,7 +11,7 @@
 # pipeline-vs-sequential equality test forces the Phase-1 sequential path.
 set -uo pipefail
 
-SCX_DIR="/home/nickyoungblut/dev/rust/scx"
+SCX_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "${SCX_DIR}"
 
 echo "=== node: $(hostname) ==="

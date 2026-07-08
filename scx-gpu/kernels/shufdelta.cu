@@ -31,6 +31,9 @@ extern "C" __global__ void undelta_planes_kernel(
     if (p >= width) return;
     size_t base = (size_t)p * (size_t)n;
 
+    // Sized for blockDim.x == 256, which the launcher always sets
+    // (`block_dim: (256, 1, 1)`). The scan indexes s[threadIdx.x], so a larger
+    // block would read/write out of bounds — keep the two in lockstep.
     __shared__ unsigned char s[256];
     unsigned char carry = 0;
 
@@ -81,6 +84,11 @@ extern "C" __global__ void unshuffle_convert_kernel(
         v |= ((unsigned int)src[(size_t)j * (size_t)n + (size_t)i]) << (8u * j);
     }
     if (out_is_float) {
+        // Numeric widening cast, NOT a bit-reinterpret: ShufDeltaZstd value
+        // planes hold small integer counts (uint8/16/32), so u32 -> f32 by value
+        // matches the CPU path (`values_u16 as f32`). A genuinely float-typed
+        // encoding would need __int_as_float() instead — but float ShufDeltaZstd
+        // values have no GPU path today (guarded out in the dispatcher).
         ((float*)dst)[i] = (float)v;
     } else {
         ((int*)dst)[i] = (int)v;

@@ -1135,6 +1135,11 @@ impl PyExperiment {
                             + (total_nnz as u64) * max_value_width;
                         csr_bytes + total_compressed_bytes + plane_bytes
                     } else {
+                        // Per-shard fallback (mixed-codec / Scx1 / float, or the
+                        // batched path forced off): the nvcomp/pipeline transient is
+                        // bounded by a *single* shard's compressed + plane buffers
+                        // (one shard is decoded then dropped before the next), which
+                        // HEADROOM's 20% slack on the full CSR comfortably absorbs.
                         csr_bytes
                     };
                 let (free, total) = dev
