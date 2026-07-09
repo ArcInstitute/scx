@@ -984,10 +984,12 @@ runs as a first-class format in the comprehensive suite:
   below for the full per-dataset tables.
 
   > **Why isn't ShufDeltaZstd the default?** Despite better compression,
-  > ShufDeltaZstd has **no GPU decode path** (Scx1 decodes in VRAM via
-  > BitPacker4x; ShufDeltaZstd host-bounces) and is **~1.3–1.8× slower to
-  > decode on CPU**. For GPU ML training — where codec decode is 25–35% of
-  > per-batch time — Scx1's GPU decode drops that to ~5–8%. `compact-trial`
+  > ShufDeltaZstd has **no in-VRAM decode via BitPacker4x** (Scx1 decodes its
+  > indices in VRAM; ShufDeltaZstd's GPU path uploads planes / host-bounces).
+  > CPU decode is now **≈ Scx1 parity (~1.09× at a 16 K-row shard, at/below Scx1
+  > for smaller shards)** after the Phase-B SSE2 byte-transforms (was 1.3–1.8×
+  > slower); the remaining reason to keep Scx1 as the `auto` default is the GPU
+  > analysis path, not CPU decode. `compact-trial`
   > gives the best of both by trial-encoding each shard and keeping the
   > smaller, but doubles encode time and frames all output (no in-VRAM Scx1
   > decode). See [codec.md § "Codec tradeoff summary"](codec.md#codec-tradeoff-summary--scx1-vs-shufdeltazstd)
@@ -1020,20 +1022,28 @@ runs as a first-class format in the comprehensive suite:
   CPU decode goes, and **inverts the spec's `§8` assumption that zstd
   dominates**:
 
-  | stage | u16 indices | u32 indices |
-  |---|---|---|
-  | zstd-decompress | 93.5 ms | 124.3 ms |
-  | byte-undelta (prefix scan) | 156.7 ms | 313.8 ms |
-  | byte-unshuffle (transpose) | 102.9 ms | 181.1 ms |
+  | stage | u16 scalar | u16 SSE2 | u32 scalar | u32 SSE2 |
+  |---|---|---|---|---|
+  | zstd-decompress | 93.5 ms | 91.4 ms | 124.3 ms | 124.2 ms |
+  | byte-undelta (prefix scan) | 156.7 ms | **16.3 ms** (9.6×) | 313.8 ms | **32.8 ms** (9.6×) |
+  | byte-unshuffle (transpose) | 102.9 ms | **26.7 ms** (3.9×) | 181.1 ms | **53.7 ms** (3.4×) |
 
-  The scalar `byte_undelta_planes` / `byte_unshuffle` (production's exact decode
-  path; no SIMD variant) run at ~0.4–0.7 GB/s and together are **63–73% of the
-  per-shard CPU decode**, with zstd only 27–37%. Because Phase 1 offloads
-  exactly those transforms to the GPU (zstd stays on CPU), it targets the
-  dominant cost — so its expected win is **substantially larger than the spec's
-  ~1.1× estimate**, potentially approaching Scx1 parity. Phase 2 (nvcomp GPU
-  zstd) adds less at census scale, where PCIe transfer is already a rounding
-  error against CPU decode.
+  The original scalar `byte_undelta_planes` / `byte_unshuffle` ran at ~0.4–0.7
+  GB/s and together were **63–73% of the per-shard CPU decode**, with zstd only
+  27–37% — inverting the spec's `§8` assumption that zstd dominates.
+
+  **Phase B result — SSE2 SIMD byte-transforms (`scx-codec/src/simd.rs`).** The
+  two transforms are now 128-bit SSE2 kernels (baseline-guaranteed on x86_64;
+  scalar fallback on other arches; bit-identical, `simd == scalar` proptested):
+  a log-step (Hillis–Steele) wrapping-`u8` prefix scan for undelta and an
+  `unpack`-cascade transpose (width-specialized for 2/4/8) for unshuffle. undelta
+  drops ~9.6× and unshuffle ~3.4–3.9× (SSE2 column above), so zstd becomes the
+  dominant decode stage again. Whole-shard `decode_shard` (16 384-row × ~2000-nnz,
+  u16 indices) is now **ShufDeltaZstd 274.6 ms vs Scx1 251.7 ms — ~1.09× (within
+  ~9%)**, down from the previous 1.3–1.8×; on the smaller 2048-row shard
+  ShufDeltaZstd is at/below Scx1 (5.4 vs 7.7 ms). This removes ShufDeltaZstd's
+  CPU-decode training tax and is the Phase-C `auto_v2` enabler. (Phase 1's GPU
+  decode below offloads the *same* transforms for the in-VRAM analysis path.)
 
   **Phase 1 result — GPU ShufDeltaZstd decode lands (H100).** Phase 1 added a
   GPU decode path for framed/unframed ShufDeltaZstd shards: the CPU still runs

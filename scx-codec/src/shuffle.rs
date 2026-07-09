@@ -55,6 +55,20 @@ pub fn byte_unshuffle(input: &[u8], element_width: usize) -> Result<Vec<u8>, Cod
             element_width
         )));
     }
+    // On x86_64 the common index/value/indptr widths take the SSE2 kernel
+    // (baseline-guaranteed, bit-identical to the scalar transpose below).
+    #[cfg(target_arch = "x86_64")]
+    if matches!(element_width, 2 | 4 | 8) {
+        return Ok(crate::simd::unshuffle(input, element_width));
+    }
+    Ok(byte_unshuffle_scalar(input, element_width))
+}
+
+/// Scalar reference transpose for [`byte_unshuffle`]. Assumes
+/// `input.len() % element_width == 0` and `element_width >= 2` (the public
+/// wrapper handles validation and the width-≤1 / empty identity). Kept as the
+/// SIMD correctness oracle and used for non-x86_64 targets / uncommon widths.
+pub(crate) fn byte_unshuffle_scalar(input: &[u8], element_width: usize) -> Vec<u8> {
     let n = input.len() / element_width;
     let mut out = vec![0u8; input.len()];
     for i in 0..n {
@@ -62,7 +76,7 @@ pub fn byte_unshuffle(input: &[u8], element_width: usize) -> Result<Vec<u8>, Cod
             out[i * element_width + b] = input[b * n + i];
         }
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -134,5 +148,35 @@ mod tests {
             byte_unshuffle(&input, 4),
             Err(CodecError::MalformedInput(_))
         ));
+    }
+
+    proptest::proptest! {
+        /// Phase B: the SIMD `byte_unshuffle` (dispatched on x86_64) must be
+        /// bit-identical to the scalar transpose across the real element widths
+        /// (1/2/4/8) and element counts that straddle the 16-element SIMD block
+        /// + scalar tail.
+        #[test]
+        fn unshuffle_simd_matches_scalar(
+            element_width in proptest::sample::select(vec![1usize, 2, 4, 8]),
+            n in 0usize..=300,
+            seed in proptest::prelude::any::<u64>(),
+        ) {
+            let mut state = seed;
+            let input: Vec<u8> = (0..n * element_width)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (state >> 33) as u8
+                })
+                .collect();
+            let simd = byte_unshuffle(&input, element_width).unwrap();
+            // Oracle: the scalar transpose (width 1 / empty stay identity, matching
+            // the public wrapper's early return).
+            let scalar = if element_width <= 1 || input.is_empty() {
+                input.clone()
+            } else {
+                byte_unshuffle_scalar(&input, element_width)
+            };
+            proptest::prop_assert_eq!(simd, scalar);
+        }
     }
 }

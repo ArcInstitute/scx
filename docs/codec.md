@@ -395,7 +395,7 @@ tables in [performance.md](performance.md#scx-vs-shardad--full-feature-parity)):
 | Dimension | Scx1 (auto default) | ShufDeltaZstd (compact-trial) |
 |---|---|---|
 | **Compression (integer)** | Baseline | **1.3–2.1× smaller** on medium/large datasets; slightly larger on tiny (pbmc3k) |
-| **CPU decode speed** | **~1.3–1.8× faster** | Baseline |
+| **CPU decode speed** | Baseline | **≈ parity** (~1.09× slower at a 16K-row shard, at/below Scx1 for smaller shards) since the Phase-B SSE2 byte-transforms; was ~1.3–1.8× slower |
 | **GPU decode** | **✅ In-VRAM** (BitPacker4x / Rice kernel; only indptr uploaded) | **✅ On-GPU kernels** (undelta/unshuffle); default uploads planes (`handoff_streamed`), `SCX_SHUFDELTA_NVCOMP=1` = full in-VRAM |
 | **Random access (unframed)** | ✅ Per-row (Rice/DGR independently decodable) | ❌ Full-shard (byte-shuffle is global) |
 | **Random access (framed)** | ✅ Per row-group (via BlockIndex) | ✅ Per row-group (via BlockIndex) |
