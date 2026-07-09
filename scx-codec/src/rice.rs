@@ -121,7 +121,17 @@ pub fn rice_decode_with_metadata(
     data: &[u8],
     blocks: &[RiceBlockMetadata],
 ) -> Result<Vec<u32>, CodecError> {
-    let n_values: usize = blocks.iter().map(|b| b.n_values as usize).sum();
+    // F-f: sum with `checked_add` so many caller-supplied blocks can't wrap
+    // `n_values` past `usize::MAX` (bypassing the plausibility bound below via a
+    // small wrapped value), then cap the allocation to what `data` could
+    // physically encode before allocating.
+    let n_values: usize = blocks
+        .iter()
+        .try_fold(0usize, |acc, b| acc.checked_add(b.n_values as usize))
+        .ok_or_else(|| {
+            CodecError::MalformedInput("rice metadata block count sum overflows usize".to_string())
+        })?;
+    crate::dispatch::bound_capacity(n_values, data.len(), "rice metadata decode")?;
     let mut output = Vec::with_capacity(n_values);
 
     for (block_idx, block) in blocks.iter().enumerate() {
@@ -188,6 +198,9 @@ pub fn rice_decode(
     n_values: usize,
     block_size: usize,
 ) -> Result<Vec<u32>, CodecError> {
+    // F-f: bound the allocation to what `data` could physically encode so a
+    // hostile `n_values` can't drive an eager multi-GiB `with_capacity`.
+    crate::dispatch::bound_capacity(n_values, data.len(), "rice values")?;
     let mut output = Vec::with_capacity(n_values);
     let mut reader = BitReader::new(data);
     let mut remaining = n_values;

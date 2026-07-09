@@ -369,8 +369,21 @@ pub fn decode_shard_scipy(
         if !value_encoding.is_integer() {
             return Err(CodecError::FloatWithScx1);
         }
+
+        // Same L1 overflow + L2 plausibility guards as `decode_scx1_ref`, so
+        // every Scx1 decode entry point rejects hostile headers up front (F-f).
+        indptr_byte_cap(n_rows)?;
+        checked_len(nnz, if index_dtype_u16 { 2 } else { 4 }, "scx1 indices")?;
+        checked_len(nnz, value_encoding.byte_width(), "scx1 values")?;
+        let n_rows_p1 = n_rows.checked_add(1).ok_or_else(|| {
+            CodecError::MalformedInput(format!("scx1 n_rows+1 overflow: {n_rows}"))
+        })?;
+        bound_capacity(n_rows_p1, encoded.indptr_bytes.len(), "scx1 indptr")?;
+        bound_capacity(nnz, encoded.indices_bytes.len(), "scx1 indices")?;
+        bound_capacity(nnz, encoded.values_bytes.len(), "scx1 values")?;
+
         // indptr: delta_golomb → Vec<u64> → Vec<i64>
-        let indptr_u64 = delta_golomb_decode(encoded.indptr_bytes, n_rows + 1)?;
+        let indptr_u64 = delta_golomb_decode(encoded.indptr_bytes, n_rows_p1)?;
         let indptr = u64_vec_to_i64(indptr_u64)?;
 
         // indices: forbp → Vec<u32> → Vec<i32>
@@ -428,25 +441,30 @@ pub fn decode_indptr_only(
     codec_id: CodecId,
     n_rows: usize,
 ) -> Result<Vec<i64>, CodecError> {
+    // Guard the `+ 1` so a `usize::MAX` `n_rows` can't wrap before it reaches
+    // the sub-stream decoders (parity with the other Scx1 entry points — F-f).
+    let n_rows_p1 = n_rows
+        .checked_add(1)
+        .ok_or_else(|| CodecError::MalformedInput(format!("n_rows+1 overflow: {n_rows}")))?;
     let indptr_u64: Vec<u64> = match codec_id {
-        CodecId::None => le_bytes_to_u64(indptr_bytes, n_rows + 1)?,
-        CodecId::Scx1 => delta_golomb_decode(indptr_bytes, n_rows + 1)?,
+        CodecId::None => le_bytes_to_u64(indptr_bytes, n_rows_p1)?,
+        CodecId::Scx1 => delta_golomb_decode(indptr_bytes, n_rows_p1)?,
         CodecId::Zstd | CodecId::Pcodec => {
             let raw = zstd_decode_bounded(indptr_bytes, indptr_byte_cap(n_rows)?)?;
-            le_bytes_to_u64(&raw, n_rows + 1)?
+            le_bytes_to_u64(&raw, n_rows_p1)?
         }
         CodecId::Lz4Shuffle => {
             let shuffled = lz4_frame_decompress(indptr_bytes)?;
             let raw = byte_unshuffle(&shuffled, 8)?;
-            le_bytes_to_u64(&raw, n_rows + 1)?
+            le_bytes_to_u64(&raw, n_rows_p1)?
         }
         CodecId::ShufDeltaZstd => {
             let indptr_max = indptr_byte_cap(n_rows)?;
             let mut planes = zstd_decode_bounded(indptr_bytes, indptr_max)?;
             expect_exact_len(planes.len(), indptr_max, "indptr")?;
-            byte_undelta_planes(&mut planes, 8, n_rows + 1);
+            byte_undelta_planes(&mut planes, 8, n_rows_p1);
             let raw = byte_unshuffle(&planes, 8)?;
-            le_bytes_to_u64(&raw, n_rows + 1)?
+            le_bytes_to_u64(&raw, n_rows_p1)?
         }
     };
     u64_vec_to_i64(indptr_u64)
@@ -914,8 +932,24 @@ fn decode_scx1_ref(
         return Err(CodecError::FloatWithScx1);
     }
 
+    // L1: reject headers whose byte-length computations overflow `usize`
+    // (parity with every other codec path — F-e).
+    indptr_byte_cap(n_rows)?;
+    let idx_width = if index_dtype_u16 { 2 } else { 4 };
+    checked_len(nnz, idx_width, "scx1 indices")?;
+    checked_len(nnz, value_encoding.byte_width(), "scx1 values")?;
+
+    // L2: reject headers declaring more elements than the compressed
+    // sub-streams could physically produce (F-f), before any allocation.
+    let n_rows_p1 = n_rows
+        .checked_add(1)
+        .ok_or_else(|| CodecError::MalformedInput(format!("scx1 n_rows+1 overflow: {n_rows}")))?;
+    bound_capacity(n_rows_p1, encoded.indptr_bytes.len(), "scx1 indptr")?;
+    bound_capacity(nnz, encoded.indices_bytes.len(), "scx1 indices")?;
+    bound_capacity(nnz, encoded.values_bytes.len(), "scx1 values")?;
+
     // indptr ← Delta-Golomb
-    let indptr = delta_golomb_decode(encoded.indptr_bytes, n_rows + 1)?;
+    let indptr = delta_golomb_decode(encoded.indptr_bytes, n_rows_p1)?;
 
     // indices ← FOR-BP (with nnz hint for pre-allocation)
     let (indices, _row_lengths) =
@@ -1236,6 +1270,38 @@ fn indptr_byte_cap(n_rows: usize) -> Result<usize, CodecError> {
                 "indptr length (n_rows={n_rows} + 1) * 8 overflows usize"
             ))
         })
+}
+
+/// Plausibility bound for a decode allocation (F-f): the number of output
+/// elements a Scx1 primitive can produce is physically bounded by the number
+/// of input *bits*, since the theoretical minimum is 1 bit per element (a
+/// Golomb/Rice code with `k ≥ ceil(log2(max))` encodes zero in 1 bit). Reject
+/// a header that declares more elements than `input_len * 8`, so a hostile
+/// `nnz`/`n_rows` can't drive a `Vec::with_capacity` into an eager multi-GiB
+/// allocation (or a 32-bit `capacity overflow` panic) from a few bytes of
+/// compressed input. This bound is deliberately loose — it can never reject
+/// valid data — and complements the `checked_len`/`indptr_byte_cap` overflow
+/// guards, which catch a different failure mode (`usize` overflow).
+///
+/// Uses `checked_mul` (not `saturating_mul`): on a 32-bit target an
+/// `input_len ≥ 512 MiB` would saturate `input_len * 8` to `usize::MAX`, and a
+/// `declared == usize::MAX` would then slip past a saturating comparison. When
+/// `input_len * 8` overflows `usize` the true bound exceeds any representable
+/// `declared`, so the input is trivially plausible and we accept it.
+pub(crate) fn bound_capacity(
+    declared: usize,
+    input_len: usize,
+    what: &str,
+) -> Result<usize, CodecError> {
+    if let Some(max_elements) = input_len.checked_mul(8) {
+        if declared > max_elements {
+            return Err(CodecError::MalformedInput(format!(
+                "{what}: declared {declared} elements but input is only {input_len} bytes \
+                 (max {max_elements} elements at 1 bit/element)"
+            )));
+        }
+    }
+    Ok(declared)
 }
 
 // ---------------------------------------------------------------------------
@@ -2493,7 +2559,8 @@ mod tests {
     /// when scaled by the value/index byte width must return a `MalformedInput`
     /// error, not panic (debug) or wrap to a bogus allocation cap (release).
     /// Covers `None` (whose `le_bytes_to_indices` computes `nnz * elem`
-    /// internally) as well as `Zstd` (whose caps are computed up front).
+    /// internally), `Zstd` (whose caps are computed up front), and `Scx1`
+    /// (whose `checked_len` guards were added in F-f).
     #[test]
     fn decode_rejects_nnz_length_overflow() {
         let encoded = EncodedShardRef {
@@ -2501,7 +2568,7 @@ mod tests {
             indices_bytes: &[0u8; 4],
             values_bytes: &[0u8; 4],
         };
-        for codec in [CodecId::None, CodecId::Zstd] {
+        for codec in [CodecId::None, CodecId::Zstd, CodecId::Scx1] {
             let err = decode_shard_ref(
                 &encoded,
                 codec,

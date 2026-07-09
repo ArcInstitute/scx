@@ -281,6 +281,13 @@ pub fn forbp_decode_with_metadata(
         .try_fold(0usize, |acc, nnz| {
             acc.checked_add(nnz).ok_or(BitStreamError)
         })?;
+    // F-f: bound the eager allocation to what `data` could physically encode
+    // (≥1 bit per index) before allocating — the metadata `nnz` fields are
+    // caller-supplied. Twin of the guard in `rice_decode_with_metadata`; the
+    // per-row payload guard below only fires *after* this `with_capacity`.
+    if data.len().checked_mul(8).is_some_and(|cap| nnz_total > cap) {
+        return Err(BitStreamError);
+    }
     let mut all_indices = Vec::with_capacity(nnz_total);
 
     for row in rows {
@@ -464,6 +471,17 @@ fn forbp_decode_inner(
     nnz_hint: usize,
     index_dtype_u16: bool,
 ) -> Result<(Vec<u32>, Vec<usize>), BitStreamError> {
+    // F-f: bound both `with_capacity` args to what `data` could physically
+    // encode before allocating, so a hostile `nnz_hint` or `n_rows` can't drive
+    // an eager multi-GiB allocation. Guards direct callers of this primitive;
+    // the Scx1 decode path also bounds these upstream with a `MalformedInput`
+    // message. Indices need ≥1 bit each (`data.len() * 8`, via `checked_mul` so
+    // a huge `data.len()` on 32-bit can't saturate the bound and be bypassed);
+    // each row writes ≥1 varint byte even when empty (`forbp_encode`), so the
+    // far tighter `n_rows ≤ data.len()` holds for any valid stream.
+    if data.len().checked_mul(8).is_some_and(|cap| nnz_hint > cap) || n_rows > data.len() {
+        return Err(BitStreamError);
+    }
     let mut all_indices = Vec::with_capacity(nnz_hint);
     let mut all_row_lengths = Vec::with_capacity(n_rows);
     let mut cursor = Cursor::new(data);

@@ -7,10 +7,12 @@
 //! Also covers the Float16 stride conformance test from P0 #3.
 
 use scx_codec::bitstream::{BitReader, BitWriter};
-use scx_codec::delta_golomb::delta_golomb_encode;
-use scx_codec::dispatch::CodecError;
-use scx_codec::forbp::forbp_encode;
-use scx_codec::rice::{rice_decode, B_VAL};
+use scx_codec::delta_golomb::{delta_golomb_decode, delta_golomb_encode};
+use scx_codec::dispatch::{decode_shard_ref, CodecError, CodecId, EncodedShardRef};
+use scx_codec::forbp::{
+    forbp_decode_with_hint, forbp_decode_with_metadata, forbp_encode, ForBpRowMetadata,
+};
+use scx_codec::rice::{rice_decode, rice_decode_with_metadata, RiceBlockMetadata, B_VAL};
 use scx_codec::shuffle::{byte_shuffle, byte_unshuffle};
 use scx_codec::value_encoding::values_to_raw_bytes;
 use scx_codec::ValueEncoding;
@@ -132,4 +134,113 @@ fn delta_golomb_accepts_equal_indptr_windows() {
     let indptr = vec![0u64, 5, 5, 10];
     let encoded = delta_golomb_encode(&indptr).expect("equal deltas are valid");
     assert!(!encoded.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// F-f: hostile-capacity rejection — a shard header declaring far more elements
+// than the compressed sub-stream could physically produce must return `Err`
+// (not eagerly allocate GBs / `capacity overflow`-panic) before any allocation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_decode_hostile_capacity_rice() {
+    // 10 bytes can encode at most 80 elements (1 bit/element); 1M is rejected.
+    match rice_decode(&[0u8; 10], 1_000_000, B_VAL) {
+        Err(CodecError::MalformedInput(msg)) => {
+            assert!(msg.contains("rice values"), "got: {msg}");
+        }
+        other => panic!("expected MalformedInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_decode_hostile_capacity_delta_golomb() {
+    // Returns the primitive's own `BitStreamError` (not a CodecError); the
+    // Scx1 decode path produces the `MalformedInput` message upstream.
+    assert!(delta_golomb_decode(&[0u8; 10], 1_000_000).is_err());
+}
+
+#[test]
+fn test_decode_hostile_capacity_forbp() {
+    // nnz_hint = 1M against a 10-byte input → rejected before allocation.
+    assert!(forbp_decode_with_hint(&[0u8; 10], 1, 1_000_000, false).is_err());
+    // n_rows = 1M against a 10-byte input → rejected by the tighter
+    // `n_rows > data.len()` bound (each row writes ≥1 varint byte).
+    assert!(forbp_decode_with_hint(&[0u8; 10], 1_000_000, 0, false).is_err());
+}
+
+#[test]
+fn test_decode_hostile_capacity_forbp_metadata() {
+    // Caller-supplied metadata with nnz ≈ u32::MAX must be rejected before the
+    // eager `Vec::with_capacity(nnz_total)` (F-1 review finding).
+    let rows = vec![ForBpRowMetadata {
+        nnz: u32::MAX,
+        value_start: 0,
+        frame_min: 0,
+        frame_bits: 0,
+        index_packing: 0,
+        indices_bit_offset: 0,
+    }];
+    assert!(forbp_decode_with_metadata(&[0u8; 4], &rows).is_err());
+}
+
+#[test]
+fn test_decode_hostile_capacity_rice_metadata() {
+    // Summed block counts (1000) exceed input_len * 8 (8) → MalformedInput
+    // before allocation.
+    let blocks = vec![RiceBlockMetadata {
+        value_start: 0,
+        n_values: 1000,
+        bit_offset: 0,
+        k: 0,
+    }];
+    match rice_decode_with_metadata(&[0u8; 1], &blocks) {
+        Err(CodecError::MalformedInput(msg)) => {
+            assert!(msg.contains("rice metadata decode"), "got: {msg}");
+        }
+        other => panic!("expected MalformedInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_decode_hostile_capacity_shard_ref_scx1() {
+    // A crafted Scx1 shard header with nnz = 2^32 - 1 and a tiny payload must
+    // return MalformedInput without requesting a multi-GiB allocation.
+    let encoded = EncodedShardRef {
+        indptr_bytes: &[0u8; 16],
+        indices_bytes: &[0u8; 8],
+        values_bytes: &[0u8; 8],
+    };
+    let err = decode_shard_ref(
+        &encoded,
+        CodecId::Scx1,
+        ValueEncoding::Uint32,
+        1,                 // n_rows
+        u32::MAX as usize, // nnz = 2^32 - 1
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CodecError::MalformedInput(_)),
+        "expected MalformedInput, got {err:?}"
+    );
+}
+
+#[test]
+fn test_decode_capacity_boundary_passes() {
+    // n_values exactly at the bound (input_len * 8) must NOT be rejected by the
+    // capacity guard. Decode may still fail on actual stream content, but the
+    // error must not be the `bound_capacity` "declared … elements" message.
+    let data = [0u8; 4];
+    let n = data.len() * 8; // 32 — exactly at the bound
+    match rice_decode(&data, n, B_VAL) {
+        Ok(_) => {}
+        Err(CodecError::MalformedInput(msg)) => {
+            assert!(
+                !msg.contains("max") || !msg.contains("at 1 bit/element"),
+                "boundary must not trip the capacity guard, got: {msg}"
+            );
+        }
+        Err(_) => {} // any other downstream failure is fine
+    }
 }
