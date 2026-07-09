@@ -152,6 +152,7 @@ fn write_framed_file(
                 row_group_rows,
                 target_nnz: None,
                 trial: false,
+                decode_target: None,
             }),
         )
         .unwrap();

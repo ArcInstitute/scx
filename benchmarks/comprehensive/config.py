@@ -187,6 +187,11 @@ class DatasetConfig:
         return DATA_DIR / f"{self.name}_compact_trial_g1024.scx"
 
     @property
+    def scx_auto_v2_path(self) -> Path:
+        # Phase C: workload-aware auto_v2 (decode_target=storage, framed G=256).
+        return DATA_DIR / f"{self.name}_auto_v2.scx"
+
+    @property
     def anndata_zarr_backed_path(self) -> Path:
         return DATA_DIR / f"{self.name}_anndata.zarr"
 
@@ -275,6 +280,7 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "scx_compact_trial_g256": "scx_compact_trial_g256_path",
     "scx_compact_trial_g512": "scx_compact_trial_g512_path",
     "scx_compact_trial_g1024": "scx_compact_trial_g1024_path",
+    "scx_auto_v2": "scx_auto_v2_path",
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
@@ -706,6 +712,12 @@ ADDITIONAL_FORMATS: list[FormatVariant] = [
                   "scx_runner", {"codec": "compact-trial", "row_group_rows": 512}),
     FormatVariant("SCX (compact-trial G=1024)", "scx_compact_trial_g1024", "additional",
                   "scx_runner", {"codec": "compact-trial", "row_group_rows": 1024}),
+    # Phase C — workload-aware auto_v2 (decode_target=storage): adopts
+    # ShufDeltaZstd per integer shard where it compresses ≤ the heuristic.
+    # Gates "no size regression vs scx_auto" + "no training-throughput regression".
+    FormatVariant("SCX (auto_v2 storage)", "scx_auto_v2", "additional",
+                  "scx_runner",
+                  {"codec": "auto_v2", "row_group_rows": 256, "decode_target": "storage"}),
 ]
 
 

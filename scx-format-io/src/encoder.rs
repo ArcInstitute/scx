@@ -9,7 +9,7 @@ use scx_codec::value_encoding::{detect_value_encoding, values_to_raw_bytes};
 use scx_codec::{encode_shard, CodecId, EncodedShard, ValueEncoding};
 use scx_sparse::is_canonical_csr;
 
-use crate::codec_select::select_codec_for_modality;
+use crate::codec_select::{pick_codec_v2, select_codec_for_modality, DecodeTarget};
 use crate::error::ScxError;
 use crate::modality::ModalityType;
 use crate::section::SectionType;
@@ -18,6 +18,14 @@ use crate::shard::{
     DEFAULT_WRITE_SHARD_FORMAT_VERSION, MAX_BLOCK_ROWS, SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
 use crate::writer::{compute_shard_stats, MajorAxis, PreEncodedSection};
+
+/// Which rule picks the framed codec when a ShufDeltaZstd trial-encode competes
+/// with the heuristic winner: `Trial` = compact-trial (keep strictly smaller);
+/// `V2` = auto_v2 (target-biased [`pick_codec_v2`]).
+enum FramedPick {
+    Trial,
+    V2(DecodeTarget),
+}
 
 /// Encode a single shard's CSR triplet into a `PreEncodedSection`
 /// ready for sequential write via
@@ -176,25 +184,46 @@ pub fn encode_one_shard_with_value_encoding(
                     fc.target_nnz,
                 )
             };
-            if fc.trial && shard_codec != CodecId::ShufDeltaZstd {
-                // Trial: pick the smaller framed representation per shard —
-                // (A) framed heuristic winner vs (B) framed ShufDeltaZstd.
-                // Both are row-group-framed (shard v2); random access is always
-                // via the codec-agnostic BlockIndex (no unframed-Scx1 sidecar
-                // fallback — that path was removed).
-                let (e_h, bi_h) = frame(shard_codec)?;
-                let (e_s, bi_s) = frame(CodecId::ShufDeltaZstd)?;
-                let (framed_codec, framed_enc, framed_bi) = if framed_size(&e_s) < framed_size(&e_h)
-                {
-                    (CodecId::ShufDeltaZstd, e_s, bi_s)
-                } else {
-                    (shard_codec, e_h, bi_h)
-                };
-                shard_codec = framed_codec;
-                (framed_enc, framed_bi, CURRENT_SHARD_FORMAT_VERSION)
+            // Decide whether to trial-encode ShufDeltaZstd as a second candidate.
+            // `decode_target` (auto_v2) takes precedence over `trial`
+            // (compact-trial): Cpu keeps the heuristic and never trials;
+            // Gpu/Storage/Auto trial only integer shards; compact-trial trials any
+            // non-ShufDeltaZstd heuristic. In all cases both candidates are
+            // row-group-framed (shard v2) with codec-agnostic BlockIndex access.
+            let is_integer = shard_value_encoding.is_integer();
+            let pick_mode: Option<FramedPick> = if shard_codec == CodecId::ShufDeltaZstd {
+                None
+            } else if let Some(dt) = fc.decode_target {
+                (dt != DecodeTarget::Cpu && is_integer).then_some(FramedPick::V2(dt))
+            } else if fc.trial {
+                Some(FramedPick::Trial)
             } else {
-                let (enc, bi) = frame(shard_codec)?;
-                (enc, bi, CURRENT_SHARD_FORMAT_VERSION)
+                None
+            };
+            match pick_mode {
+                Some(mode) => {
+                    let (e_h, bi_h) = frame(shard_codec)?;
+                    let (e_s, bi_s) = frame(CodecId::ShufDeltaZstd)?;
+                    let (size_h, size_s) = (framed_size(&e_h), framed_size(&e_s));
+                    let pick_shufdelta = match mode {
+                        FramedPick::Trial => size_s < size_h,
+                        FramedPick::V2(dt) => {
+                            pick_codec_v2(shard_codec, dt, size_h, size_s, true)
+                                == CodecId::ShufDeltaZstd
+                        }
+                    };
+                    let (framed_codec, framed_enc, framed_bi) = if pick_shufdelta {
+                        (CodecId::ShufDeltaZstd, e_s, bi_s)
+                    } else {
+                        (shard_codec, e_h, bi_h)
+                    };
+                    shard_codec = framed_codec;
+                    (framed_enc, framed_bi, CURRENT_SHARD_FORMAT_VERSION)
+                }
+                None => {
+                    let (enc, bi) = frame(shard_codec)?;
+                    (enc, bi, CURRENT_SHARD_FORMAT_VERSION)
+                }
             }
         }
         _ => {
@@ -335,11 +364,18 @@ pub fn encode_one_shard_with_value_encoding(
 /// codec-agnostic `BlockIndex` for random access; the historical unframed-Scx1 +
 /// decode-sidecar representation was removed once framed Scx1 gained an in-VRAM
 /// GPU decode path.
+/// `decode_target` (auto_v2) is the workload-aware alternative to `trial`: when
+/// `Some`, the per-shard integer codec is picked by [`pick_codec_v2`] using the
+/// same dual-encode as `trial` but biased toward/away from ShufDeltaZstd by the
+/// downstream target (`Cpu` keeps the heuristic; `Gpu`/`Storage`/`Auto` adopt
+/// ShufDeltaZstd where it compresses ≤/< the heuristic). `decode_target` takes
+/// precedence over `trial` (the CLI/pyscx layers keep them mutually exclusive).
 #[derive(Debug, Clone, Copy)]
 pub struct FramingConfig {
     pub row_group_rows: u32,
     pub target_nnz: Option<u64>,
     pub trial: bool,
+    pub decode_target: Option<DecodeTarget>,
 }
 
 /// Default row-group size (G) for framed writes. Chosen from the F5 follow-up
@@ -359,6 +395,7 @@ impl Default for FramingConfig {
             row_group_rows: DEFAULT_ROW_GROUP_ROWS,
             target_nnz: None,
             trial: false,
+            decode_target: None,
         }
     }
 }
@@ -462,4 +499,189 @@ pub fn encode_shard_framed(
         },
         BlockIndex { entries },
     ))
+}
+
+#[cfg(test)]
+mod auto_v2_tests {
+    use super::*;
+    use crate::modality::ModalityType;
+    use scx_codec::CodecId;
+
+    /// Census-like integer shard: `n_rows` rows, `nnz` sorted unique column
+    /// indices each. `max_count` sets the value range (≤8 median → Scx1 heuristic;
+    /// larger → Zstd heuristic). Sorted indices make ShufDeltaZstd (shuffle+delta+
+    /// zstd on the index stream) a strong candidate.
+    fn gen_int_shard(
+        n_rows: usize,
+        nnz: usize,
+        n_cols: u32,
+        max_count: u32,
+    ) -> (Vec<u64>, Vec<u32>, Vec<f32>) {
+        let mut indptr = Vec::with_capacity(n_rows + 1);
+        let mut indices = Vec::with_capacity(n_rows * nnz);
+        let mut values = Vec::with_capacity(n_rows * nnz);
+        indptr.push(0u64);
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..n_rows {
+            // Pick `nnz` sorted, unique columns via a fixed stride + jitter.
+            let stride = (n_cols as usize / nnz.max(1)).max(1);
+            let mut col = 0usize;
+            for _ in 0..nnz {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                col += 1 + (state as usize % stride);
+                if col >= n_cols as usize {
+                    break;
+                }
+                indices.push(col as u32);
+                values.push((1 + (state % max_count as u64) as u32) as f32);
+            }
+            indptr.push(indices.len() as u64);
+        }
+        (indptr, indices, values)
+    }
+
+    fn encode(
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[f32],
+        n_cols: u32,
+        framing: FramingConfig,
+    ) -> PreEncodedSection {
+        encode_one_shard_with_value_encoding(
+            indptr,
+            indices,
+            values,
+            None, // auto-select heuristic
+            0,    // u16 indices
+            n_cols,
+            0,
+            SectionType::CsrShard,
+            ModalityType::Rna,
+            "X_shard_0".to_string(),
+            Some(framing),
+            Some(ValueEncoding::Uint8),
+        )
+        .expect("encode")
+    }
+
+    /// auto_v2 with decode_target=Cpu is byte-identical to plain auto: Cpu keeps
+    /// the heuristic winner and never runs the ShufDeltaZstd dual-encode.
+    #[test]
+    fn auto_v2_cpu_matches_auto() {
+        let (indptr, indices, values) = gen_int_shard(512, 40, 5000, 4);
+        let base = FramingConfig {
+            row_group_rows: 256,
+            target_nnz: None,
+            trial: false,
+            decode_target: None,
+        };
+        let auto = encode(&indptr, &indices, &values, 5000, base);
+        let v2_cpu = encode(
+            &indptr,
+            &indices,
+            &values,
+            5000,
+            FramingConfig {
+                decode_target: Some(DecodeTarget::Cpu),
+                ..base
+            },
+        );
+        assert_eq!(
+            auto.codec_id(),
+            v2_cpu.codec_id(),
+            "Cpu must keep the heuristic codec"
+        );
+        assert_eq!(
+            auto.encoded.indices_bytes, v2_cpu.encoded.indices_bytes,
+            "Cpu auto_v2 must be byte-identical to auto"
+        );
+        assert_eq!(auto.section_length, v2_cpu.section_length);
+    }
+
+    /// auto_v2 with decode_target=Storage adopts ShufDeltaZstd on this
+    /// census-like integer shard (where it compresses better) and never exceeds
+    /// the plain-auto size — the "no size regression vs auto" guard.
+    #[test]
+    fn auto_v2_storage_adopts_shufdelta_and_no_size_regression() {
+        // Larger counts (median > 8) → heuristic Zstd, which ShufDeltaZstd's
+        // delta+shuffle on the structured index/value streams reliably beats.
+        let (indptr, indices, values) = gen_int_shard(2048, 60, 20000, 255);
+        let base = FramingConfig {
+            row_group_rows: 256,
+            target_nnz: None,
+            trial: false,
+            decode_target: None,
+        };
+        let auto = encode(&indptr, &indices, &values, 20000, base);
+        let v2_storage = encode(
+            &indptr,
+            &indices,
+            &values,
+            20000,
+            FramingConfig {
+                decode_target: Some(DecodeTarget::Storage),
+                ..base
+            },
+        );
+        assert_eq!(
+            auto.codec_id(),
+            CodecId::Zstd as u8,
+            "large-count heuristic is Zstd"
+        );
+        assert_eq!(
+            v2_storage.codec_id(),
+            CodecId::ShufDeltaZstd as u8,
+            "Storage should adopt ShufDeltaZstd where it compresses better"
+        );
+        // Core no-regression guarantee: Storage picks the smaller-or-equal codec.
+        assert!(
+            v2_storage.section_length <= auto.section_length,
+            "auto_v2/Storage ({}) must not exceed auto ({})",
+            v2_storage.section_length,
+            auto.section_length
+        );
+        assert!(v2_storage.section_length > 0);
+    }
+
+    /// Float modality stays Pcodec under every decode target (ShufDeltaZstd never
+    /// competes for float).
+    #[test]
+    fn auto_v2_float_stays_pcodec() {
+        let (indptr, indices, _) = gen_int_shard(256, 20, 5000, 4);
+        let nnz = *indptr.last().unwrap() as usize;
+        let values: Vec<f32> = (0..nnz).map(|i| (i as f32) * 0.5 + 0.25).collect();
+        let base = FramingConfig {
+            row_group_rows: 256,
+            target_nnz: None,
+            trial: false,
+            decode_target: None,
+        };
+        for dt in [DecodeTarget::Auto, DecodeTarget::Gpu, DecodeTarget::Storage] {
+            let sec = encode_one_shard_with_value_encoding(
+                &indptr,
+                &indices,
+                &values,
+                None,
+                0,
+                5000,
+                0,
+                SectionType::CsrShard,
+                ModalityType::Rna,
+                "X_shard_0".to_string(),
+                Some(FramingConfig {
+                    decode_target: Some(dt),
+                    ..base
+                }),
+                Some(ValueEncoding::Float32),
+            )
+            .expect("encode");
+            assert_eq!(
+                sec.codec_id(),
+                CodecId::Pcodec as u8,
+                "float must stay Pcodec under {dt:?}"
+            );
+        }
+    }
 }

@@ -145,3 +145,83 @@ def test_invalid_codec_raises(synthetic_adata, tmp_dir):
     path = str(tmp_dir / "bad.scx")
     with pytest.raises(RuntimeError, match="Unknown codec"):
         pyscx.from_anndata(synthetic_adata, path, codec="invalid")
+
+
+def _read_x(path):
+    import pyscx
+
+    return pyscx.open(path).to_anndata().X.toarray()
+
+
+def test_auto_v2_roundtrip_and_no_size_regression(tmp_dir):
+    """`codec='auto_v2'` round-trips and never exceeds the plain-`auto` size
+    (Phase C: per-shard it keeps the smaller of the heuristic vs ShufDeltaZstd,
+    biased by `decode_target`)."""
+    import os
+
+    import anndata
+    import pyscx
+
+    # Larger counts (median > 8) → Zstd heuristic, which ShufDeltaZstd beats;
+    # enough rows for the size delta to be meaningful.
+    rng = np.random.default_rng(0)
+    X = sp.random(3000, 1500, density=0.05, format="csr", random_state=0)
+    X.data = np.round(X.data * 60 + 1).astype(np.float32)
+    adata = anndata.AnnData(X=X)
+
+    auto = str(tmp_dir / "auto.scx")
+    av2 = str(tmp_dir / "av2.scx")
+    pyscx.from_anndata(adata, auto, codec="auto", row_group_rows=256)
+    pyscx.from_anndata(adata, av2, codec="auto_v2", decode_target="storage", row_group_rows=256)
+
+    # Data round-trips identically.
+    np.testing.assert_array_equal(_read_x(auto), X.toarray())
+    np.testing.assert_array_equal(_read_x(av2), X.toarray())
+
+    # No size regression vs auto (Storage picks the smaller-or-equal codec).
+    assert os.path.getsize(av2) <= os.path.getsize(auto)
+
+
+def test_auto_v2_cpu_matches_auto_size(tmp_dir):
+    """`decode_target='cpu'` is conservative — the shard data matches plain
+    `auto` (Rust proves byte-identity); the file differs only by the small
+    codec-selection provenance stamp auto_v2 records."""
+    import os
+
+    import pyscx
+
+    a = str(tmp_dir / "a.scx")
+    c = str(tmp_dir / "c.scx")
+    pyscx.from_anndata(large_value_adata_big(), a, codec="auto", row_group_rows=256)
+    pyscx.from_anndata(large_value_adata_big(), c, codec="auto_v2", decode_target="cpu",
+                       row_group_rows=256)
+    np.testing.assert_array_equal(_read_x(a), _read_x(c))
+    # Cpu never adopts ShufDeltaZstd, so the only file-size delta is the
+    # provenance stamp (< 1 KB), never a codec change.
+    assert abs(os.path.getsize(a) - os.path.getsize(c)) < 1024
+
+
+def large_value_adata_big():
+    import anndata
+
+    X = sp.random(1000, 800, density=0.06, format="csr", random_state=7)
+    X.data = np.round(X.data * 40 + 1).astype(np.float32)
+    return anndata.AnnData(X=X)
+
+
+def test_decode_target_requires_auto_v2(synthetic_adata, tmp_dir):
+    """`decode_target` is only valid with `codec='auto_v2'`."""
+    import pyscx
+
+    with pytest.raises((ValueError, RuntimeError), match="auto_v2"):
+        pyscx.from_anndata(synthetic_adata, str(tmp_dir / "x.scx"),
+                           codec="auto", decode_target="gpu", row_group_rows=256)
+
+
+def test_auto_v2_requires_framing(synthetic_adata, tmp_dir):
+    """`codec='auto_v2'` requires row-group framing (row_group_rows > 0)."""
+    import pyscx
+
+    with pytest.raises((ValueError, RuntimeError), match="row_group_rows"):
+        pyscx.from_anndata(synthetic_adata, str(tmp_dir / "x.scx"),
+                           codec="auto_v2", row_group_rows=0)

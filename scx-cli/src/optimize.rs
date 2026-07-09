@@ -15,6 +15,7 @@ pub fn run_optimize(
     codec: &str,
     row_group_rows: Option<u32>,
     row_group_target_nnz: Option<u64>,
+    decode_target: &str,
     shard_obs: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !input.exists() {
@@ -26,27 +27,51 @@ pub fn run_optimize(
     // require `--row-group-rows` for the block-index random-access layout. clap's
     // `value_parser` restricts the surface; this match is the in-function source
     // of truth (and guards direct callers).
-    let (codec_id, codec_trial) = match codec {
-        "auto" => (None, false),
-        "scx1" => (Some(scx_codec::CodecId::Scx1), false),
-        "shufdelta" => (Some(scx_codec::CodecId::ShufDeltaZstd), false),
+    let (codec_id, codec_trial, is_auto_v2) = match codec {
+        "auto" => (None, false, false),
+        "scx1" => (Some(scx_codec::CodecId::Scx1), false, false),
+        "shufdelta" => (Some(scx_codec::CodecId::ShufDeltaZstd), false, false),
         // `compact-trial` is a framing *profile*, not a codec: per shard, keep
         // the smaller of {heuristic winner, ShufDeltaZstd}.
-        "compact-trial" => (None, true),
+        "compact-trial" => (None, true, false),
+        // `auto_v2` is a workload-aware profile: per integer shard, pick by
+        // `--decode-target` (Cpu keeps the heuristic; Gpu/Storage/Auto adopt
+        // ShufDeltaZstd where it compresses at least as well).
+        "auto_v2" => (None, false, true),
         other => {
             return Err(format!(
                 "--codec {other:?} is not supported by optimize \
-                 (`auto` | `scx1` | `shufdelta` | `compact-trial`)"
+                 (`auto` | `scx1` | `shufdelta` | `compact-trial` | `auto_v2`)"
             )
             .into())
         }
     };
 
+    if decode_target != "auto" && !is_auto_v2 {
+        return Err("--decode-target is only valid with `--codec auto_v2`".into());
+    }
+    let decode_target = if is_auto_v2 {
+        Some(match decode_target {
+            "auto" => scx_format_io::DecodeTarget::Auto,
+            "cpu" => scx_format_io::DecodeTarget::Cpu,
+            "gpu" => scx_format_io::DecodeTarget::Gpu,
+            "storage" => scx_format_io::DecodeTarget::Storage,
+            other => {
+                return Err(format!(
+                    "--decode-target {other:?} not supported (`auto` | `cpu` | `gpu` | `storage`)"
+                )
+                .into())
+            }
+        })
+    } else {
+        None
+    };
+
     // Framing is on by default; `--row-group-rows 0` is the explicit unframed
     // (v3) opt-out → normalize to None so the guard and framing agree.
     let row_group_rows = row_group_rows.filter(|&g| g > 0);
-    // The framed codecs only make sense with row-group framing on.
-    if (codec_trial || codec_id == Some(scx_codec::CodecId::ShufDeltaZstd))
+    // The framed codecs/profiles only make sense with row-group framing on.
+    if (codec_trial || is_auto_v2 || codec_id == Some(scx_codec::CodecId::ShufDeltaZstd))
         && row_group_rows.is_none()
     {
         return Err(format!(
@@ -59,6 +84,7 @@ pub fn run_optimize(
         row_group_rows: g,
         target_nnz: row_group_target_nnz,
         trial: codec_trial,
+        decode_target,
     });
     // Allow an explicit in-place upgrade (`--output` == input): `ScxWriter`
     // writes a sibling tempfile and atomically renames over the target on

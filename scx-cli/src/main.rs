@@ -100,6 +100,12 @@ enum Commands {
         /// this many non-zeros. Only meaningful with `--row-group-rows`.
         #[arg(long, value_name = "NNZ")]
         row_group_target_nnz: Option<u64>,
+        /// Downstream decode target for `--codec auto_v2` (ignored otherwise):
+        /// `cpu` keeps the heuristic codec (Scx1/Zstd); `gpu`/`storage`/`auto`
+        /// adopt ShufDeltaZstd for integer shards where it compresses at least as
+        /// well. Default: auto.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "cpu", "gpu", "storage"])]
+        decode_target: String,
         /// Extract a single modality from a multi-modality SCX file
         /// when writing to h5ad. Required when `--to h5ad` is used on
         /// a multimodal SCX input; ignored otherwise.
@@ -347,20 +353,26 @@ enum Commands {
         /// `shufdelta` / `compact-trial` require `--row-group-rows`; framed
         /// shards use the block index for random access. Other
         /// codecs are rejected. Default: auto.
-        #[arg(long, default_value = "auto", value_parser = ["auto", "scx1", "shufdelta", "compact-trial"])]
+        #[arg(long, default_value = "auto", value_parser = ["auto", "scx1", "shufdelta", "compact-trial", "auto_v2"])]
         codec: String,
         /// Row-group-frame each re-encoded shard into groups of at most N rows,
         /// producing a v4 file with a multi-entry BlockIndex for codec-agnostic
         /// sub-shard random access. Framing is ON BY DEFAULT (G=256) — `scx
         /// optimize` upgrades an unframed file to framed; pass `0` to keep the
         /// legacy unframed (v3) layout. Required (> 0) for `--codec shufdelta` /
-        /// `--codec compact-trial`.
+        /// `--codec compact-trial` / `--codec auto_v2`.
         #[arg(long, value_name = "N", default_value_t = scx_format_io::DEFAULT_ROW_GROUP_ROWS)]
         row_group_rows: u32,
         /// Byte/nnz-aware row-group cap: also close a group once it reaches this
         /// many non-zeros. Only meaningful with `--row-group-rows`.
         #[arg(long, value_name = "NNZ")]
         row_group_target_nnz: Option<u64>,
+        /// Downstream decode target for `--codec auto_v2` (ignored otherwise):
+        /// `cpu` keeps the heuristic codec (Scx1/Zstd); `gpu`/`storage`/`auto`
+        /// adopt ShufDeltaZstd for integer shards where it compresses at least as
+        /// well. Default: auto.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "cpu", "gpu", "storage"])]
+        decode_target: String,
         /// Migrate a legacy single-section obs table to the sharded
         /// `ObsMetadataShard` layout: `auto` (shard when n_obs >
         /// shard_target_rows — the from_anndata threshold), `always`, or
@@ -912,6 +924,7 @@ fn main() {
             csc_cols_per_shard,
             row_group_rows,
             row_group_target_nnz,
+            decode_target,
             modality,
             stream,
             memory_budget,
@@ -952,6 +965,7 @@ fn main() {
                 csc_cols_per_shard,
                 row_group_rows,
                 row_group_target_nnz,
+                decode_target,
                 modality.as_deref(),
                 stream,
                 memory_budget.as_deref(),
@@ -1034,6 +1048,7 @@ fn main() {
             codec,
             row_group_rows,
             row_group_target_nnz,
+            decode_target,
             shard_obs,
         } => optimize::run_optimize(
             &input,
@@ -1044,6 +1059,7 @@ fn main() {
             // (the unframed v3 opt-out).
             Some(row_group_rows),
             row_group_target_nnz,
+            &decode_target,
             &shard_obs,
         ),
         Commands::Compact {
@@ -1333,6 +1349,7 @@ fn run_convert(
     // unframed (v3) opt-out, normalized to `None` in the body.
     row_group_rows: u32,
     row_group_target_nnz: Option<u64>,
+    decode_target: String,
     modality: Option<&str>,
     stream: bool,
     memory_budget: Option<&str>,
@@ -1549,6 +1566,7 @@ fn run_convert(
         csc_cols_per_shard,
         row_group_rows,
         row_group_target_nnz,
+        decode_target,
         modality,
         stream,
         memory_budget_bytes,
@@ -1659,6 +1677,7 @@ fn dispatch_convert(
     // Framed by default; `0` = unframed (v3) opt-out, normalized to `None` below.
     row_group_rows: u32,
     row_group_target_nnz: Option<u64>,
+    decode_target: String,
     modality: Option<&str>,
     stream: bool,
     memory_budget: Option<u64>,
@@ -1687,17 +1706,34 @@ fn dispatch_convert(
     use scx_codec::CodecId;
     let bitmap_policy = BitmapPolicy::parse(bitmap).map_err(|e| e.to_string())?;
 
-    // `compact-trial` is a framing *profile*, not a codec: per shard, keep the
-    // smaller of {heuristic winner, ShufDeltaZstd}. It requires framing.
+    // `compact-trial` and `auto_v2` are framing *profiles*, not codecs: per
+    // shard, `compact-trial` keeps the smaller of {heuristic, ShufDeltaZstd};
+    // `auto_v2` picks by `--decode-target`. Both require framing.
     let codec_trial = codec == "compact-trial";
-    let explicit_codec = if codec_trial {
+    let is_auto_v2 = codec == "auto_v2";
+    let explicit_codec = if codec_trial || is_auto_v2 {
         None
     } else {
         CodecId::parse_cli(codec)?
     };
-    if codec_trial && row_group_rows == 0 {
+    if decode_target != "auto" && !is_auto_v2 {
+        return Err("--decode-target is only valid with `--codec auto_v2`".into());
+    }
+    let decode_target = if is_auto_v2 {
+        Some(match decode_target.as_str() {
+            "auto" => scx_format_io::DecodeTarget::Auto,
+            "cpu" => scx_format_io::DecodeTarget::Cpu,
+            "gpu" => scx_format_io::DecodeTarget::Gpu,
+            "storage" => scx_format_io::DecodeTarget::Storage,
+            other => return Err(format!("--decode-target {other:?} not supported").into()),
+        })
+    } else {
+        None
+    };
+    if (codec_trial || is_auto_v2) && row_group_rows == 0 {
         return Err(
-            "`--codec compact-trial` requires row-group framing; drop `--row-group-rows 0`".into(),
+            "`--codec compact-trial`/`auto_v2` requires row-group framing; drop `--row-group-rows 0`"
+                .into(),
         );
     }
     // Framing is on by default (row_group_rows default = 256); `0` is the
@@ -1712,6 +1748,7 @@ fn dispatch_convert(
         row_group_rows,
         row_group_target_nnz,
         codec_trial,
+        decode_target,
         tool: "scx".into(),
         memory_budget,
         stream,
@@ -1848,6 +1885,7 @@ fn dispatch_convert(
     _csc_cols_per_shard: usize,
     _row_group_rows: u32,
     _row_group_target_nnz: Option<u64>,
+    _decode_target: String,
     _modality: Option<&str>,
     _stream: bool,
     _memory_budget: Option<u64>,

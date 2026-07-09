@@ -518,33 +518,47 @@ pub fn from_anndata_impl(
     sort_reverse: bool,
     row_group_rows: Option<u32>,
     row_group_target_nnz: Option<u64>,
+    decode_target: Option<&str>,
 ) -> PyResult<()> {
-    // `compact-trial` is a framing profile, not a codec (mirror the CLI):
-    // per shard keep the smaller of {heuristic, ShufDeltaZstd}. It — and an
-    // explicit `shufdelta` — require row-group framing to stay random-access-safe.
+    // `compact-trial` and `auto_v2` are framing profiles, not codecs (mirror the
+    // CLI): per shard, `compact-trial` keeps the smaller of {heuristic,
+    // ShufDeltaZstd}; `auto_v2` picks by decode target. They — and an explicit
+    // `shufdelta` — require row-group framing to stay random-access-safe.
     let codec_trial = codec == Some("compact-trial");
-    let explicit_codec = if codec_trial {
+    let is_auto_v2 = codec == Some("auto_v2");
+    let explicit_codec = if codec_trial || is_auto_v2 {
         None
     } else {
         parse_codec(codec)?
     };
-    if (codec_trial || explicit_codec == Some(CodecId::ShufDeltaZstd))
+    if decode_target.is_some() && !is_auto_v2 {
+        return Err(PyValueError::new_err(
+            "decode_target=… is only valid with codec='auto_v2'",
+        ));
+    }
+    let decode_target = if is_auto_v2 {
+        Some(parse_decode_target(decode_target)?)
+    } else {
+        None
+    };
+    if (codec_trial || is_auto_v2 || explicit_codec == Some(CodecId::ShufDeltaZstd))
         && !matches!(row_group_rows, Some(g) if g > 0)
     {
         return Err(PyValueError::new_err(
-            "codec='compact-trial'/'shufdelta' requires row_group_rows=N with N > 0 \
+            "codec='compact-trial'/'auto_v2'/'shufdelta' requires row_group_rows=N with N > 0 \
              (row-group-framed output for random-access-safe reads)",
         ));
     }
     // Framing is on by default (row_group_rows default = 256); `Some(0)` is the
     // explicit unframed (v3) opt-out — normalize to None so it threads through as
     // the legacy layout rather than a confusing v4-header-with-v1-shards no-op.
-    // (The compact-trial/shufdelta guard above already rejects `0` for those.)
+    // (The compact-trial/auto_v2/shufdelta guard above already rejects `0`.)
     let row_group_rows = row_group_rows.filter(|&g| g > 0);
     let framing = row_group_rows.map(|g| scx_format_io::FramingConfig {
         row_group_rows: g,
         target_nnz: row_group_target_nnz,
         trial: codec_trial,
+        decode_target,
     });
     let shard_target_rows = shard_size.unwrap_or(16384);
     let csc_policy =
@@ -598,6 +612,7 @@ pub fn from_anndata_impl(
                 row_group_rows,
                 row_group_target_nnz,
                 codec_trial,
+                decode_target,
             );
         }
         #[cfg(not(feature = "hdf5"))]
@@ -1329,7 +1344,9 @@ pub fn from_anndata_impl(
         index_auto_threshold,
     )?;
 
-    // Write provenance
+    // Write provenance, stamping the codec-selection profile (intent) so a
+    // downstream reader / gate can verify it — `scx info` prints non-empty
+    // `params_json`. Plain `auto`/explicit writes keep the empty `{}`.
     writer
         .write_provenance(vec![ProvenanceEntry {
             timestamp: std::time::SystemTime::now()
@@ -1338,7 +1355,7 @@ pub fn from_anndata_impl(
                 .as_secs() as i64,
             action: "from_anndata".to_string(),
             tool: format!("pyscx {}", env!("CARGO_PKG_VERSION")),
-            params_json: "{}".to_string(),
+            params_json: codec_selection_params_json(codec_trial, decode_target),
             input_checksums: vec![],
         }])
         .map_err(to_pyerr)?;

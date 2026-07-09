@@ -510,6 +510,7 @@ mod tests {
                 row_group_rows: 8,
                 target_nnz: None,
                 trial: true,
+                decode_target: None,
             }),
         )
         .unwrap();

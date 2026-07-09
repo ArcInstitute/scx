@@ -1713,6 +1713,34 @@ absolute_floors:
     metric: compression_ratio
     min: 6.0
 
+  # ─── Phase C auto_v2 compression ratio (no size regression vs auto) ───
+  # `scx_auto_v2` (decode_target=storage) adopts ShufDeltaZstd per integer shard
+  # where it compresses ≤ the heuristic, and keeps Pcodec on float — so its
+  # ratio is ≥ `scx_auto` and ≥ `scx_compact_trial_g512` on every dataset. These
+  # floors reuse the (conservative, deterministic) compact-trial-g512 values as a
+  # proven lower bound — the "no size regression vs auto" guard. Conversion is
+  # deterministic; tighten to the captured medians on the next full baseline.
+  - benchmark: compression
+    format: scx_auto_v2
+    dataset: pbmc3k
+    metric: compression_ratio
+    min: 4.3
+  - benchmark: compression
+    format: scx_auto_v2
+    dataset: pbmc10k
+    metric: compression_ratio
+    min: 6.0
+  - benchmark: compression
+    format: scx_auto_v2
+    dataset: smartseq2
+    metric: compression_ratio
+    min: 3.6
+  - benchmark: compression
+    format: scx_auto_v2
+    dataset: tabula_sapiens_100k
+    metric: compression_ratio
+    min: 6.0
+
 # ---------------------------------------------------------------------------
 # Deferred floors — known gaps tracked here so operators can see what's
 # missing and why. Add entries above this block once the blockers below
@@ -1761,3 +1789,13 @@ absolute_floors:
 #    `de_route_csc_direct`) on `accel_de_nb_glm__pyscx_gpu` + an
 #    aggregation-phase perf signal. The `gpu_nb_glm_csc` route string is
 #    reserved but never emitted today.
+#
+# 5. ml_loader batches_per_sec floors for `scx_auto_v2` (Phase C)
+#    The Phase-C auto_v2 *size* gate is ACTIVE above (compression_ratio floors,
+#    deterministic). The training-throughput half ("no throughput regression vs
+#    scx_auto") is deferred until a full capture produces `ml_loader` rows for
+#    `scx_auto_v2` — auto_v2 shards decode as ShufDeltaZstd (~1.09x Scx1 CPU
+#    decode post-Phase-B), so a safe floor needs the measured median, not a
+#    guess. When captured, add `ml_loader` `batches_per_sec__{raw,hvg_norm,
+#    gpu_train}` floors on `scx_auto_v2` (mirroring the `scx_auto` rows) set
+#    within N% of the scx_auto medians.

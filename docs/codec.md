@@ -386,6 +386,34 @@ transform kernels but upload the decompressed planes
 (`SCX_SHUFDELTA_NVCOMP=1`) is enabled, which decompresses on-device
 (`scx_device_decode_gpu`).
 
+### Workload-aware selection (`codec="auto_v2"`, framed only)
+
+`auto_v2` extends the trial-encode with a **`decode_target`** bias so the writer
+picks ShufDeltaZstd *where it's a net win* and keeps the CPU-conservative heuristic
+elsewhere. Like `compact-trial` it is framed-only (requires `--row-group-rows`/`row_group_rows>0`)
+and picks per **integer** shard between the heuristic winner and ShufDeltaZstd by
+size (float always stays Pcodec). The `--decode-target` / `decode_target=` knob
+(`scx convert`/`scx optimize`/`pyscx.from_anndata`/`from_h5ad`/`from_10x`) sets the rule:
+
+| `decode_target` | Rule (integer shards) |
+|---|---|
+| `cpu` | Keep the heuristic (Scx1/Zstd) — never ShufDeltaZstd (conservative). |
+| `auto` (default) | Adopt ShufDeltaZstd when **strictly smaller** (== `compact-trial`). |
+| `gpu` / `storage` | Adopt ShufDeltaZstd when **≤** the heuristic (tie → ShufDeltaZstd: GPU-decodable / smaller egress). |
+
+The chosen profile + target is stamped in the file's provenance
+(`params_json.codec_selection`, surfaced by `scx info`). Implementation:
+`scx-format/src/codec_select.rs::pick_codec_v2` (per-modality decision) +
+`scx-format-io/src/encoder.rs` (the shared dual-encode).
+
+**Default policy.** `codec="auto"` (Scx1 for low-median integers) remains the
+**compute default**; `auto_v2` is **opt-in**. **Convergence note:** since Phase B
+brought ShufDeltaZstd CPU decode to ~parity with Scx1 (`docs/performance.md`), for
+integers `auto`-target `auto_v2` already collapses to "ShufDeltaZstd where it
+compresses better" — the `decode_target` knob is transitional and only the `cpu`
+branch still differs. The compute default stays Scx1 until a GPU training loader
+(Phase D) makes ShufDeltaZstd the better default for the GPU-training case.
+
 ### Codec tradeoff summary — Scx1 vs ShufDeltaZstd
 
 The two integer codecs serve different workloads. Summary of measured

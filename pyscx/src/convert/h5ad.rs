@@ -51,6 +51,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
     row_group_rows: Option<u32>,
     row_group_target_nnz: Option<u64>,
     codec_trial: bool,
+    decode_target: Option<scx_format_io::DecodeTarget>,
 ) -> PyResult<()> {
     let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -229,6 +230,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
         row_group_rows,
         row_group_target_nnz,
         codec_trial,
+        decode_target,
         // Convert-time grouping is exposed via `pyscx.from_h5ad(group_by=...)`,
         // not this in-memory `from_anndata` path.
         ..Default::default()
