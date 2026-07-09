@@ -122,6 +122,9 @@ pub fn rice_decode_with_metadata(
     blocks: &[RiceBlockMetadata],
 ) -> Result<Vec<u32>, CodecError> {
     let n_values: usize = blocks.iter().map(|b| b.n_values as usize).sum();
+    // F-f: the summed `u16` block counts are otherwise unbounded — cap the
+    // allocation to what `data` could physically encode before allocating.
+    crate::dispatch::bound_capacity(n_values, data.len(), "rice metadata decode")?;
     let mut output = Vec::with_capacity(n_values);
 
     for (block_idx, block) in blocks.iter().enumerate() {
@@ -188,6 +191,9 @@ pub fn rice_decode(
     n_values: usize,
     block_size: usize,
 ) -> Result<Vec<u32>, CodecError> {
+    // F-f: bound the allocation to what `data` could physically encode so a
+    // hostile `n_values` can't drive an eager multi-GiB `with_capacity`.
+    crate::dispatch::bound_capacity(n_values, data.len(), "rice values")?;
     let mut output = Vec::with_capacity(n_values);
     let mut reader = BitReader::new(data);
     let mut remaining = n_values;

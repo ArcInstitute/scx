@@ -464,6 +464,15 @@ fn forbp_decode_inner(
     nnz_hint: usize,
     index_dtype_u16: bool,
 ) -> Result<(Vec<u32>, Vec<usize>), BitStreamError> {
+    // F-f: bound both `with_capacity` args to what `data` could physically
+    // encode (≥1 bit per element) before allocating, so a hostile `nnz_hint`
+    // or `n_rows` can't drive an eager multi-GiB allocation. Guards direct
+    // callers of this primitive; the Scx1 decode path also bounds these
+    // upstream with a `MalformedInput` message.
+    let cap = data.len().saturating_mul(8);
+    if nnz_hint > cap || n_rows > cap {
+        return Err(BitStreamError);
+    }
     let mut all_indices = Vec::with_capacity(nnz_hint);
     let mut all_row_lengths = Vec::with_capacity(n_rows);
     let mut cursor = Cursor::new(data);
