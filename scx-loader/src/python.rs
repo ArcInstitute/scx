@@ -824,6 +824,7 @@ impl IndexPlanDataset {
         scatter_block_index=None,
     ))]
     fn new(
+        py: Python<'_>,
         path: &str,
         hvg_indices: Option<Vec<u32>>,
         obs_columns: Option<Vec<String>>,
@@ -881,6 +882,24 @@ impl IndexPlanDataset {
         )
         .map_err(loader_err_to_py)?;
         loader.set_scatter_block_index(scatter_block_index);
+
+        // Preflight: the scattered block-index fast path can only fire on
+        // row-group-framed shards. If the caller asked for it (default) but the
+        // file is an all-unframed legacy layout, every batch full-shard-decodes
+        // with no other signal — warn loudly and point at the reframe command.
+        // (One-shot: Python's default warning filter dedupes per call site.)
+        if scatter_block_index && !loader.any_shard_framed() {
+            let warnings = py.import("warnings")?;
+            let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+            let msg = format!(
+                "IndexPlanDataset opened '{path}' with scatter_block_index=True, but no \
+                 CSR shard is row-group framed (unframed legacy file). Scattered reads \
+                 will full-shard-decode every batch — the block-index fast path cannot \
+                 fire. Reframe with `scx optimize --row-group-rows 256 <file>`, or pass \
+                 scatter_block_index=False to silence this warning."
+            );
+            warnings.call_method1("warn", (msg, user_warning))?;
+        }
 
         Ok(Self {
             loader: Arc::new(loader),

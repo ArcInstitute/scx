@@ -283,8 +283,18 @@ block-index-eligible framed shards so the gather reaches the group-level path
 `IndexPlanDataset.cache_metrics()["block_index_groups"]` (`> 0` ⇒ the framed path
 was taken; `full_shard_groups` is the fallback route). The `read_scattered`
 comprehensive benchmark drives an unsorted scattered gather over a framed
-compact-trial file and gates `block_index_groups ≥ 1` +
-`block_index_adoption_rate == 1.0`.
+compact-trial file and gates `block_index_groups ≥ 1`,
+`block_index_adoption_rate == 1.0`, and (on the multi-shard datasets)
+`full_shard_groups == 0` — a direct "no silent full-shard fallback" floor. Those
+floors run against **both** the shipped write default **G=256** (`scx_compact_trial_g256`
+— what a plain `codec="auto"` write frames at) and the historical compact-trial
+fixture default **G=512**, so a regression that drops framing or unwires the loader
+block-index path fails the gate at the default G too.
+
+Opening an `IndexPlanDataset` with `scatter_block_index=True` on an **all-unframed**
+(legacy v1) file emits a one-shot `UserWarning`: the block-index fast path cannot fire,
+so every batch full-shard-decodes. Reframe with `scx optimize --row-group-rows 256
+<file>` (or pass `scatter_block_index=False` to silence).
 
 **Choosing `row_group_rows` (G).** The `compression` + `read_scattered` sweep over
 `G ∈ {128, 256, 512, 1024}` (2026-07-04, pbmc3k/pbmc10k/smartseq2/tabula_sapiens_100k):

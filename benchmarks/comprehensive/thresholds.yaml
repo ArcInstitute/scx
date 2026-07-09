@@ -1586,12 +1586,19 @@ absolute_floors:
   # `read_scattered` drives an unsorted, scattered random-row gather over a
   # row-group-framed compact-trial file, opened with scatter_block_index=True.
   # On a framed file every scattered shard-group is
-  # served by the codec-agnostic block index, so `block_index_groups > 0` and
-  # `block_index_adoption_rate == 1.0`. A regression that silently full-shard-
-  # decodes (framing dropped, or the loader block-index path unwired) drops
-  # `block_index_groups` to 0 → gate failure. These are correctness contracts,
-  # not perf floors; they survive baseline promotion. Gated on the default G
-  # (512) across the tier-small float datasets that produce framed shards.
+  # served by the codec-agnostic block index, so `block_index_groups > 0`,
+  # `full_shard_groups == 0`, and `block_index_adoption_rate == 1.0`. A
+  # regression that silently full-shard-decodes (framing dropped, or the loader
+  # block-index path unwired) drops `block_index_groups` to 0 (and lifts
+  # `full_shard_groups` above 0) → gate failure. These are correctness
+  # contracts, not perf floors; they survive baseline promotion.
+  #
+  # Gated on BOTH the shipped write default G=256 (DEFAULT_ROW_GROUP_ROWS — the
+  # G a plain `codec="auto"` / from_anndata write actually frames at) and the
+  # historical compact-trial fixture default G=512, across the tier-small float
+  # datasets that produce framed shards. The explicit `full_shard_groups max: 0`
+  # floor on the multi-shard datasets makes the "no silent full-shard fallback"
+  # guard direct rather than only implied by adoption_rate == 1.0.
   # `check_absolute_floors` skips any triple silently on runs that didn't
   # execute it (e.g. a narrower --formats/--datasets gate). See the F5
   # follow-up plan and docs/codec.md.
@@ -1628,6 +1635,54 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: block_index_adoption_rate
     min: 1.0
+  # Direct "no full-shard fallback" floor (multi-shard G=512): full_shard_groups
+  # must be exactly 0 when the block index is adopted for every scattered group.
+  - benchmark: read_scattered
+    format: scx_compact_trial_g512
+    dataset: smartseq2
+    metric: full_shard_groups
+    max: 0
+  - benchmark: read_scattered
+    format: scx_compact_trial_g512
+    dataset: tabula_sapiens_100k
+    metric: full_shard_groups
+    max: 0
+
+  # ─── Same adoption contract at the shipped write default G=256 ───────
+  # G=256 is DEFAULT_ROW_GROUP_ROWS, so this mirrors what a default-framed
+  # training file (codec="auto", no explicit --row-group-rows) sees. Same
+  # correctness floors: block_index_groups > 0, adoption == 1.0, and
+  # full_shard_groups == 0 on the multi-shard datasets.
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: smartseq2
+    metric: block_index_groups
+    min: 1
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: tabula_sapiens_100k
+    metric: block_index_groups
+    min: 1
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: smartseq2
+    metric: block_index_adoption_rate
+    min: 1.0
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: tabula_sapiens_100k
+    metric: block_index_adoption_rate
+    min: 1.0
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: smartseq2
+    metric: full_shard_groups
+    max: 0
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: tabula_sapiens_100k
+    metric: full_shard_groups
+    max: 0
 
   # ─── F5 compact-trial compression ratio (default G=512) ──────────────
   # Conversion is deterministic, so these ratios are stable; the floors sit

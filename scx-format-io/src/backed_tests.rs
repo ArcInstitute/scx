@@ -300,7 +300,31 @@ fn read_rows_with_bumps_block_index_counters() {
     );
 }
 
-/// F5 follow-up (Phase A): a framed shard's scattered gather routes through the
+/// `any_shard_framed` reports whether the fast scattered
+/// path can fire — true on a framed file, false on a legacy unframed one. The
+/// Python `IndexPlanDataset` constructor uses it to warn when a caller requests
+/// `scatter_block_index=True` on an unframed file that can only full-shard-decode.
+#[test]
+fn any_shard_framed_detects_framing() {
+    let dir = TempDir::new().unwrap();
+
+    // Framed file (v4 / shard v2, multi-entry block index) ⇒ true.
+    let (framed_path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let framed = BackedCsrReader::new(ScxReader::open(&framed_path).unwrap(), 4);
+    assert!(
+        framed.any_shard_framed(),
+        "a row-group-framed file must report at least one framed shard",
+    );
+
+    // Legacy unframed file (plain write_csr_shard ⇒ shard v1) ⇒ false.
+    let (unframed, _full2) = write_test_file_and_open(&dir, 64, 100, 2, 4);
+    assert!(
+        !unframed.any_shard_framed(),
+        "an all-unframed legacy file must report no framed shards",
+    );
+}
+
+/// A framed shard's scattered gather routes through the
 /// codec-agnostic block index. `block_index_eligible` gates the group-level
 /// row-group path — the loader-adoption goal for framed training files.
 #[test]

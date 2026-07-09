@@ -12,6 +12,7 @@ Coverage:
 """
 
 import os
+import warnings
 
 import numpy as np
 import pyscx
@@ -854,3 +855,42 @@ class TestBlockIndexAdoption:
             "L1 gather must not adopt block-index when scatter_block_index=False"
         )
         assert cm["full_shard_groups"] > 0
+
+    def test_unframed_scatter_emits_preflight_warning(self, unframed_scx_path):
+        """Opening an all-unframed (v3) file with scatter_block_index=True (the
+        default) must emit a one-shot UserWarning: the block-index fast path
+        cannot fire on unframed shards, so every batch full-shard-decodes. The
+        warning points at `scx optimize --row-group-rows 256`."""
+        with pytest.warns(UserWarning, match="row-group framed"):
+            ds = pyscx.IndexPlanDataset(
+                unframed_scx_path, normalize=False, scatter_block_index=True
+            )
+        # It still works — warn-and-continue, not a hard refusal.
+        plan = [(0, 1), (2, 3)]
+        batches = list(ds.iter_with_plans(iter([plan]), lookahead=0))
+        assert batches[0]["X"].shape[0] == 2
+        # And it did full-shard-decode (no block-index adoption on an unframed file).
+        assert ds.cache_metrics()["block_index_groups"] == 0
+
+    def test_unframed_scatter_off_is_silent(self, unframed_scx_path):
+        """No preflight warning when the caller opts out — an unframed file with
+        scatter_block_index=False is the intended full-shard path, not a footgun."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            pyscx.IndexPlanDataset(
+                unframed_scx_path, normalize=False, scatter_block_index=False
+            )
+
+    def test_framed_scatter_has_no_preflight_warning(self, tmp_path):
+        """A framed file opened with scatter_block_index=True must NOT emit the
+        unframed preflight warning — the fast path is available."""
+        path = str(tmp_path / "framed_no_warn.scx")
+        self._write_framed(path)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            pyscx.IndexPlanDataset(
+                path, normalize=False, scatter_block_index=True
+            )
+        assert not [w for w in caught if "row-group framed" in str(w.message)], (
+            "a framed file must not trigger the unframed preflight warning"
+        )

@@ -375,6 +375,38 @@ enabling per-shard adaptive codec selection and mixed integer/float layers.
 
 For the full binary specification, see [format.md §CSR Shard Internal Layout](format.md#4-csr-shard-internal-layout).
 
+## Row-group framing & scattered reads
+
+A shard's `Block Index` is what lets a scattered read decode only the row-groups it
+touches instead of the whole 16,384-row shard — the key lever for random-row training
+loaders. Two shard layouts exist:
+
+- **Unframed** (legacy, `shard_format_version = 1`, in a `format_version = 3` file): the
+  block index is a single entry (or an oversized-row split) with **zero byte offsets**.
+  A scattered gather has no sub-shard offsets to seek to, so it **full-shard-decodes**.
+- **Framed** (`shard_format_version = 2`, in a `format_version = 4` file): the block index
+  has **multiple entries with real per-group byte offsets**, so `read_rows_with` decodes
+  only the touched groups via `resolve_block_index`. Framing is **codec-agnostic** (works
+  for Scx1/Zstd/Pcodec/ShufDeltaZstd) and adds no extra encode cost.
+
+**Framing is on by default at `DEFAULT_ROW_GROUP_ROWS = 256`** — the write paths
+(`convert`, `from_anndata`/`from_h5ad`/`from_10x`, `scx optimize`) frame every re-encoded
+CSR shard unless you pass `--row-group-rows 0` (the legacy unframed v3 opt-out). G=256 is
+the scatter-friendly middle: compression ratio is flat across G (±0.3%), while finer groups
+cut worst-case scattered-gather latency on multi-shard files — e.g. smartseq2 p50 `G=128`
+2.18 s vs `G=512` 3.05 s (1.4×), tabula `G=128` 1.70 s vs `G=512` 3.50 s (2.1×). Prefer
+G=128–256 for scatter-heavy training; coarser G only pays off for sequential full-shard
+scans. (See [codec.md §7b](codec.md) for the bit-level layout and the full G sweep.)
+
+**Loader adoption.** `IndexPlanDataset` defaults `scatter_block_index=True` and its
+prefetcher skips pre-warming block-index-eligible framed shards so the gather reaches the
+group-level path; `SparseCellSetDataset` defaults it off. The process-wide kill-switch is
+`SCX_SCATTER_BLOCK_INDEX=0`. Adoption is observable via
+`IndexPlanDataset.cache_metrics()["block_index_groups"]` (> 0 ⇒ framed path taken;
+`full_shard_groups` is the fallback). Opening an **all-unframed** file with
+`scatter_block_index=True` emits a one-shot `UserWarning` — the fast path is inert on that
+file, so reframe it with `scx optimize --row-group-rows 256 <file>`.
+
 ## Condition/label-grouped sharding (F1) + grouped reads (F2)
 
 By default shards are cut by a fixed row count (`--shard-size`). For
