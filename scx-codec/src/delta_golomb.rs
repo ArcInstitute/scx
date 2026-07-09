@@ -103,7 +103,14 @@ pub fn delta_golomb_decode(
     // F-f: bound the allocation to what `data` could physically encode (≥1 bit
     // per element). Guards direct callers of this `pub` primitive; the Scx1
     // decode path also bounds this upstream with a `MalformedInput` message.
-    if n_rows_plus_one > data.len().saturating_mul(8) {
+    // `checked_mul` (not `saturating_mul`) so a huge `data.len()` on 32-bit
+    // can't saturate the bound to `usize::MAX` and let the guard be bypassed;
+    // if `data.len() * 8` overflows, any `n_rows_plus_one` is plausible.
+    if data
+        .len()
+        .checked_mul(8)
+        .is_some_and(|cap| n_rows_plus_one > cap)
+    {
         return Err(BitStreamError);
     }
 
