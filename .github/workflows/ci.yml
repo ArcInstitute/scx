@@ -17,6 +17,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PR branches restore-only; only main saves the cache. The post-job
+          # cache-save step packs the whole-workspace target/ and was running the
+          # runner out of disk on PRs ("No space left on device" — tests passed,
+          # only the save failed). main keeps the cache fresh.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Validates that the entire workspace — including scx-gpu (cudarc) —
       # compiles on machines without CUDA installed. GPU tests gracefully
       # skip at runtime via require_gpu!().
@@ -30,6 +36,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PR branches restore-only; only main saves the cache. The post-job
+          # cache-save step packs the whole-workspace target/ and was running the
+          # runner out of disk on PRs ("No space left on device" — tests passed,
+          # only the save failed). main keeps the cache fresh.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --exclude rscx
 
   clippy:
@@ -41,6 +53,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PR branches restore-only; only main saves the cache. The post-job
+          # cache-save step packs the whole-workspace target/ and was running the
+          # runner out of disk on PRs ("No space left on device" — tests passed,
+          # only the save failed). main keeps the cache fresh.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --exclude rscx -- -D warnings
 
   fmt:
@@ -113,6 +131,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PR branches restore-only; only main saves the cache. The post-job
+          # cache-save step packs the whole-workspace target/ and was running the
+          # runner out of disk on PRs ("No space left on device" — tests passed,
+          # only the save failed). main keeps the cache fresh.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # hdf5 feature needs the system library. Install on demand.
       - name: Install hdf5 dev headers
         if: contains(matrix.flags, 'hdf5')
