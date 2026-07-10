@@ -130,10 +130,13 @@ pub async fn io_stage(
     let mut group_count = 0usize;
     let n_groups = shard_groups.len();
     // D0 profiling accumulators (only meaningful when `profile`): the sum of
-    // per-group in-`spawn_blocking` decode wall vs the sum of per-group
-    // `tx.send` back-pressure wait. Their ratio is the critical-path verdict —
-    // decode ≈ wall & send-wait ≈ 0 ⇒ stage-1 codec decode is the bottleneck;
-    // large send-wait ⇒ decode is hidden behind the downstream consumer.
+    // per-group whole-shard **decode** wall vs the sum of per-group `tx.send`
+    // back-pressure wait. `decode_total` times the `read_shard_from_entry` call
+    // — codec decode (zstd + byte-transforms) + CSR-vector assembly; the dense
+    // scatter into batch buffers is a *separate* stage (`decode_stage`). Their
+    // ratio is the critical-path verdict — decode ≈ wall & send-wait ≈ 0 ⇒
+    // stage-1 decode is the bottleneck; large send-wait ⇒ decode is hidden
+    // behind the downstream consumer.
     let mut total_decode_us = 0u128;
     let mut total_send_wait_us = 0u128;
 

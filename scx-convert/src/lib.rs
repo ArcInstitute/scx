@@ -105,10 +105,9 @@ pub mod pipeline;
 
 #[cfg(feature = "hdf5")]
 pub use pipeline::{
-    codec_selection_json, codec_selection_params_json, h5ad_to_scx, h5ad_to_scx_streaming,
-    run_streaming_writer_coordinator, scx_to_h5ad, scx_to_h5ad_streaming,
-    streaming_writer_coordinator, tenx_to_scx, BitmapPolicy, ConvertError, ConvertOptions,
-    StreamingOverrides,
+    codec_selection_json, h5ad_to_scx, h5ad_to_scx_streaming, run_streaming_writer_coordinator,
+    scx_to_h5ad, scx_to_h5ad_streaming, streaming_writer_coordinator, tenx_to_scx, BitmapPolicy,
+    ConvertError, ConvertOptions, StreamingOverrides,
 };
 
 #[cfg(feature = "hdf5")]

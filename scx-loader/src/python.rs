@@ -884,11 +884,18 @@ impl IndexPlanDataset {
         loader.set_scatter_block_index(scatter_block_index);
 
         // Preflight: the scattered block-index fast path can only fire on
-        // row-group-framed shards. If the caller asked for it (default) but the
-        // file is an all-unframed legacy layout, every batch full-shard-decodes
-        // with no other signal — warn loudly and point at the reframe command.
-        // (One-shot: Python's default warning filter dedupes per call site.)
-        if scatter_block_index && !loader.any_shard_framed() {
+        // row-group-framed shards, and only when the process-global switch is on
+        // (`SCX_SCATTER_BLOCK_INDEX`). If the caller asked for it (default), the
+        // switch is enabled, but the file is an all-unframed legacy layout, every
+        // batch full-shard-decodes with no other signal — warn loudly and point
+        // at the reframe command. When the switch is off, reframing can't enable
+        // the path, so there is nothing to warn about.
+        // (One-shot per path: Python's default warning filter dedupes per call
+        // site + message text, and the message embeds `{path}`.)
+        if scatter_block_index
+            && scx_format_io::backed::scatter_block_index_enabled()
+            && !loader.any_shard_framed()
+        {
             let warnings = py.import("warnings")?;
             let user_warning = py.import("builtins")?.getattr("UserWarning")?;
             let msg = format!(

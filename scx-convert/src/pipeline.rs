@@ -440,21 +440,6 @@ pub fn codec_selection_json(
     }
 }
 
-/// Codec-selection `params_json` string for the pyscx in-memory `from_anndata`
-/// writer (which stamps only the codec selection). Returns `"{}"` for plain
-/// `auto`/explicit writes so unchanged output stays byte-stable.
-pub fn codec_selection_params_json(
-    codec_trial: bool,
-    decode_target: Option<scx_format_io::DecodeTarget>,
-) -> String {
-    if decode_target.is_some() || codec_trial {
-        serde_json::json!({ "codec_selection": codec_selection_json(None, codec_trial, decode_target) })
-            .to_string()
-    } else {
-        "{}".to_string()
-    }
-}
-
 impl Default for ConvertOptions {
     fn default() -> Self {
         ConvertOptions {

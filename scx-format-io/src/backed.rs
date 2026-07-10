@@ -25,7 +25,12 @@ use crate::section::SectionType;
 /// path (F5 Phase 1). Default on; `SCX_SCATTER_BLOCK_INDEX=0` (or `false`)
 /// disables the row-group path so a framed shard falls back to full-shard
 /// decode. Read once per process.
-fn scatter_block_index_enabled() -> bool {
+///
+/// Exposed so callers (e.g. the loader's unframed-file preflight warning) can
+/// gate on the same process-global switch that `block_index_eligible` uses —
+/// with the path globally disabled, reframing can't enable the fast path, so
+/// there is nothing to warn about.
+pub fn scatter_block_index_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("SCX_SCATTER_BLOCK_INDEX")
