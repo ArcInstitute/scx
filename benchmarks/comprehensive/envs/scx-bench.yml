@@ -106,3 +106,10 @@ dependencies:
     # conflict, so shardad shares scx-bench rather than needing an isolated
     # env. Override with a checkout elsewhere as needed.
     - -e /home/nickyoungblut/dev/python/shardad
+    # CellStream — scatter-immune per-cell store over shardad's codec,
+    # benchmarked as a competing training loader (cellstream_runner) via random
+    # row-gather. Not on PyPI; installed from the local repo. Depends on shardad
+    # (above) + pyfastpfor (its PFOR codec); both CPU-only, no env conflict, so
+    # cellstream shares scx-bench alongside shardad.
+    - pyfastpfor>=1.4
+    - -e /home/nickyoungblut/dev/python/cellstream

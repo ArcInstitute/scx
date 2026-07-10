@@ -133,6 +133,11 @@ class DatasetConfig:
     def shardad_path(self) -> Path:
         return DATA_DIR / f"{self.name}.shad"
 
+    @property
+    def cellstream_path(self) -> Path:
+        # cellstream stores are directories, not single files.
+        return DATA_DIR / f"{self.name}.cellstream"
+
     # Per-codec SCX paths for benchmark isolation
     @property
     def scx_auto_path(self) -> Path:
@@ -285,6 +290,7 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
     "shardad": "shardad_path",
+    "cellstream": "cellstream_path",
     "anndata_zarr_backed": "anndata_zarr_backed_path",
     # Phase K — multimodal format keys.
     "h5mu_uncompressed": "h5mu_path",
@@ -690,6 +696,7 @@ PRIMARY_FORMATS: list[FormatVariant] = [
                   {"codec": "compact-trial", "row_group_rows": 512}),
     FormatVariant("SLAF", "slaf", "primary", "slaf_runner"),
     FormatVariant("Shardad", "shardad", "primary", "shardad_runner"),
+    FormatVariant("CellStream", "cellstream", "primary", "cellstream_runner"),
 ]
 
 ADDITIONAL_FORMATS: list[FormatVariant] = [
@@ -1277,9 +1284,12 @@ def estimate_time_minutes(
         # Bumped from 45 → 60 after the 2026-05-09 tier-full gate run
         # timed out `ml_loader/h5ad_gzip/census_1m` at 85 min wallclock.
         # The full 1M-cell h5ad-gzip read is the slowest combination
-        # in the suite; 60-min base + 12-min/M slope + 1.5× density
-        # multiplier yields ~108 min, comfortable headroom.
-        "ml_loader":              60,
+        # in the suite. Base bumped 60→120 (2026-07-10): the workers2 /
+        # gpu_train / competitor-gather scenarios pushed smartseq2/tabula/census
+        # past the old 65-min cap (base 60 + 12-min/M slope rounds to 65 for
+        # ≤100k-cell sets), timing out the deferred auto_v2 + cellstream floors.
+        # 120 base + 12-min/M slope + 1.5× density gives comfortable headroom.
+        "ml_loader":              120,
         "correctness":            60,
         "roundtrip":              10,
         "cell_eval_parity_perf":  60,
