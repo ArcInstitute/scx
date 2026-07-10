@@ -37,7 +37,8 @@ pub use catalog::{
 pub use catalog_view::{CatalogView, CatalogViewEntry, ShardStatsLite};
 pub use checksum::{blake3_hash, blake3_truncated_64};
 pub use codec_select::{
-    select_codec, select_codec_for_modality, select_codec_with_profile, CodecProfile,
+    pick_codec_v2, select_codec, select_codec_for_modality, select_codec_with_profile,
+    CodecProfile, DecodeTarget,
 };
 pub use csc_policy::{
     auto_obs_threshold, auto_vars_threshold, CscPolicy, AUTO_CSC_OBS_THRESHOLD,

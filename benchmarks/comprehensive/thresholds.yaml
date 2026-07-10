@@ -843,6 +843,38 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__gpu_train
     min: 63.3
+
+  # ─── Phase C auto_v2 training-throughput (no regression vs auto) ──────
+  # Absolute floors on auto_v2's OWN batches/sec — catch a throughput
+  # regression of the ShufDeltaZstd-decoding loader. Set at 0.85× the
+  # min observed run from the 2026-07-09 capture (candidate_2026_07_09_auto_v2),
+  # so no measured run violates and there is ~15% noise headroom. Only
+  # pbmc10k is floored: it was the one dataset that ran clean and stable
+  # (tight runs), whereas pbmc3k measured node-contended this capture
+  # (scx_auto/pbmc3k raw itself came in under its own 38.6 floor), and
+  # smartseq2/tabula/census ml_loader jobs timed out at the 65-min limit
+  # (the workers2 scenario is too heavy for larger data in that window).
+  # Add pbmc3k + tabula auto_v2 floors from a future clean full capture.
+  # Measured relationship (pbmc10k): auto_v2 vs auto — raw 22.2 vs 27.7
+  # (~20% slower, the CPU-decode-bound worst case, matching Phase B's
+  # ~1.09-1.2× ShufDeltaZstd CPU decode), hvg_norm 34.3 vs 36.6 (~6%),
+  # gpu_train 34.1 vs 35.5 (~4%). No throughput regression beyond the
+  # known ShufDeltaZstd CPU-decode band.
+  - benchmark: ml_loader
+    format: scx_auto_v2
+    dataset: pbmc10k
+    metric: batches_per_sec__raw
+    min: 18.0
+  - benchmark: ml_loader
+    format: scx_auto_v2
+    dataset: pbmc10k
+    metric: batches_per_sec__hvg_norm
+    min: 28.0
+  - benchmark: ml_loader
+    format: scx_auto_v2
+    dataset: pbmc10k
+    metric: batches_per_sec__gpu_train
+    min: 28.0
   - benchmark: ml_loader
     format: h5ad_none
     dataset: tabula_sapiens_100k
@@ -1586,12 +1618,19 @@ absolute_floors:
   # `read_scattered` drives an unsorted, scattered random-row gather over a
   # row-group-framed compact-trial file, opened with scatter_block_index=True.
   # On a framed file every scattered shard-group is
-  # served by the codec-agnostic block index, so `block_index_groups > 0` and
-  # `block_index_adoption_rate == 1.0`. A regression that silently full-shard-
-  # decodes (framing dropped, or the loader block-index path unwired) drops
-  # `block_index_groups` to 0 → gate failure. These are correctness contracts,
-  # not perf floors; they survive baseline promotion. Gated on the default G
-  # (512) across the tier-small float datasets that produce framed shards.
+  # served by the codec-agnostic block index, so `block_index_groups > 0`,
+  # `full_shard_groups == 0`, and `block_index_adoption_rate == 1.0`. A
+  # regression that silently full-shard-decodes (framing dropped, or the loader
+  # block-index path unwired) drops `block_index_groups` to 0 (and lifts
+  # `full_shard_groups` above 0) → gate failure. These are correctness
+  # contracts, not perf floors; they survive baseline promotion.
+  #
+  # Gated on BOTH the shipped write default G=256 (DEFAULT_ROW_GROUP_ROWS — the
+  # G a plain `codec="auto"` / from_anndata write actually frames at) and the
+  # historical compact-trial fixture default G=512, across the tier-small float
+  # datasets that produce framed shards. The explicit `full_shard_groups max: 0`
+  # floor on the multi-shard datasets makes the "no silent full-shard fallback"
+  # guard direct rather than only implied by adoption_rate == 1.0.
   # `check_absolute_floors` skips any triple silently on runs that didn't
   # execute it (e.g. a narrower --formats/--datasets gate). See the F5
   # follow-up plan and docs/codec.md.
@@ -1628,6 +1667,54 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: block_index_adoption_rate
     min: 1.0
+  # Direct "no full-shard fallback" floor (multi-shard G=512): full_shard_groups
+  # must be exactly 0 when the block index is adopted for every scattered group.
+  - benchmark: read_scattered
+    format: scx_compact_trial_g512
+    dataset: smartseq2
+    metric: full_shard_groups
+    max: 0
+  - benchmark: read_scattered
+    format: scx_compact_trial_g512
+    dataset: tabula_sapiens_100k
+    metric: full_shard_groups
+    max: 0
+
+  # ─── Same adoption contract at the shipped write default G=256 ───────
+  # G=256 is DEFAULT_ROW_GROUP_ROWS, so this mirrors what a default-framed
+  # training file (codec="auto", no explicit --row-group-rows) sees. Same
+  # correctness floors: block_index_groups > 0, adoption == 1.0, and
+  # full_shard_groups == 0 on the multi-shard datasets.
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: smartseq2
+    metric: block_index_groups
+    min: 1
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: tabula_sapiens_100k
+    metric: block_index_groups
+    min: 1
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: smartseq2
+    metric: block_index_adoption_rate
+    min: 1.0
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: tabula_sapiens_100k
+    metric: block_index_adoption_rate
+    min: 1.0
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: smartseq2
+    metric: full_shard_groups
+    max: 0
+  - benchmark: read_scattered
+    format: scx_compact_trial_g256
+    dataset: tabula_sapiens_100k
+    metric: full_shard_groups
+    max: 0
 
   # ─── F5 compact-trial compression ratio (default G=512) ──────────────
   # Conversion is deterministic, so these ratios are stable; the floors sit
@@ -1654,6 +1741,34 @@ absolute_floors:
     min: 3.6
   - benchmark: compression
     format: scx_compact_trial_g512
+    dataset: tabula_sapiens_100k
+    metric: compression_ratio
+    min: 6.0
+
+  # ─── Phase C auto_v2 compression ratio (no size regression vs auto) ───
+  # `scx_auto_v2` (decode_target=storage) adopts ShufDeltaZstd per integer shard
+  # where it compresses ≤ the heuristic, and keeps Pcodec on float — so its
+  # ratio is ≥ `scx_auto` and ≥ `scx_compact_trial_g512` on every dataset. These
+  # floors reuse the (conservative, deterministic) compact-trial-g512 values as a
+  # proven lower bound — the "no size regression vs auto" guard. Conversion is
+  # deterministic; tighten to the captured medians on the next full baseline.
+  - benchmark: compression
+    format: scx_auto_v2
+    dataset: pbmc3k
+    metric: compression_ratio
+    min: 4.3
+  - benchmark: compression
+    format: scx_auto_v2
+    dataset: pbmc10k
+    metric: compression_ratio
+    min: 6.0
+  - benchmark: compression
+    format: scx_auto_v2
+    dataset: smartseq2
+    metric: compression_ratio
+    min: 3.6
+  - benchmark: compression
+    format: scx_auto_v2
     dataset: tabula_sapiens_100k
     metric: compression_ratio
     min: 6.0
@@ -1706,3 +1821,13 @@ absolute_floors:
 #    `de_route_csc_direct`) on `accel_de_nb_glm__pyscx_gpu` + an
 #    aggregation-phase perf signal. The `gpu_nb_glm_csc` route string is
 #    reserved but never emitted today.
+#
+# 5. ml_loader batches_per_sec floors for `scx_auto_v2` (Phase C) — PARTIALLY
+#    ACTIVE. The size gate (compression_ratio) is active + validated; the
+#    training-throughput floors are now ACTIVE for `pbmc10k` (raw/hvg_norm/
+#    gpu_train) from the 2026-07-09 capture. Still deferred: `pbmc3k` (node
+#    contention that capture — scx_auto/pbmc3k raw itself came in under its own
+#    38.6 floor) and `tabula_sapiens_100k` / census (ml_loader jobs timed out at
+#    the 65-min limit — the workers2 scenario is too heavy for larger data).
+#    Add those from a future clean full capture with a longer ml_loader timeout,
+#    mirroring the pbmc10k rows (min = 0.85× the measured min run).

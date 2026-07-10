@@ -35,7 +35,27 @@ pub fn byte_delta_planes(buf: &mut [u8], n_planes: usize, n_elems: usize) {
 
 /// Inverse of [`byte_delta_planes`]: in-place per-plane wrapping-`u8` cumulative
 /// sum along the element axis. `buf.len()` must equal `n_planes * n_elems`.
+///
+/// On x86_64 this dispatches to the SSE2 kernel ([`crate::simd::undelta_planes`],
+/// baseline-guaranteed, bit-identical); every other target uses the scalar
+/// reference below.
 pub fn byte_undelta_planes(buf: &mut [u8], n_planes: usize, n_elems: usize) {
+    if n_elems <= 1 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    crate::simd::undelta_planes(buf, n_planes, n_elems);
+    #[cfg(not(target_arch = "x86_64"))]
+    byte_undelta_planes_scalar(buf, n_planes, n_elems);
+}
+
+/// Scalar reference for [`byte_undelta_planes`]: in-place per-plane wrapping-`u8`
+/// cumulative sum. Kept as the correctness oracle for the SIMD kernel (see the
+/// `simd == scalar` proptest) and used directly on non-x86_64 targets.
+// On x86_64 the SIMD kernel always supersedes this in the lib build; it is still
+// reached by the proptest oracle (cfg(test)) and by non-x86_64 targets.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+pub(crate) fn byte_undelta_planes_scalar(buf: &mut [u8], n_planes: usize, n_elems: usize) {
     if n_elems <= 1 {
         return;
     }
@@ -106,6 +126,29 @@ mod tests {
             byte_delta_planes(&mut buf, n_planes, n_elems);
             byte_undelta_planes(&mut buf, n_planes, n_elems);
             prop_assert_eq!(buf, orig);
+        }
+
+        /// Phase B: the SIMD `byte_undelta_planes` (dispatched on x86_64) must be
+        /// bit-identical to the scalar reference across the real plane counts
+        /// (2/4/8) and lengths that straddle the 16-byte SIMD block + tail.
+        #[test]
+        fn undelta_simd_matches_scalar(
+            n_planes in prop::sample::select(vec![2usize, 4, 8]),
+            n_elems in 0usize..=300,
+            seed in any::<u64>(),
+        ) {
+            let mut state = seed;
+            let buf: Vec<u8> = (0..n_planes * n_elems)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (state >> 33) as u8
+                })
+                .collect();
+            let mut simd_buf = buf.clone();
+            let mut scalar_buf = buf;
+            byte_undelta_planes(&mut simd_buf, n_planes, n_elems);
+            byte_undelta_planes_scalar(&mut scalar_buf, n_planes, n_elems);
+            prop_assert_eq!(simd_buf, scalar_buf);
         }
     }
 }

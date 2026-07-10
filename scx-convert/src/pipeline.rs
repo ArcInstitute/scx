@@ -118,6 +118,11 @@ pub struct ConvertOptions {
     /// Trial-encode (`--codec compact-trial`): per framed shard, keep the smaller
     /// of {heuristic codec, ShufDeltaZstd}. Ignored unless `row_group_rows` is set.
     pub codec_trial: bool,
+    /// Workload-aware `auto_v2` profile (`--codec auto_v2 --decode-target …`):
+    /// per framed integer shard, pick the codec by [`scx_format_io::pick_codec_v2`]
+    /// biased by the downstream decode target. `None` = not auto_v2. Takes
+    /// precedence over `codec_trial`; ignored unless `row_group_rows` is set.
+    pub decode_target: Option<scx_format_io::DecodeTarget>,
     /// Tool name recorded in the provenance entry. Defaults to
     /// `"scx"`; `pyscx` overrides this to `"pyscx"` so the
     /// recorded provenance reflects the actual caller.
@@ -399,7 +404,39 @@ impl ConvertOptions {
                 row_group_rows: g,
                 target_nnz: self.row_group_target_nnz,
                 trial: self.codec_trial,
+                decode_target: self.decode_target,
             })
+    }
+
+    /// Codec-selection intent for the provenance `params_json` (`codec_selection`
+    /// key): the chosen profile (`auto_v2` + `decode_target`, `compact-trial`, an
+    /// explicit codec name, or `auto`) so a downstream reader / gate can verify it.
+    pub fn codec_selection_value(&self) -> serde_json::Value {
+        codec_selection_json(self.codec, self.codec_trial, self.decode_target)
+    }
+}
+
+/// Build the `codec_selection` provenance value from a write's codec choice.
+/// Shared by the streaming coordinators and the pyscx in-memory writer so the
+/// stamp is identical across paths.
+pub fn codec_selection_json(
+    codec: Option<scx_codec::CodecId>,
+    codec_trial: bool,
+    decode_target: Option<scx_format_io::DecodeTarget>,
+) -> serde_json::Value {
+    use scx_format_io::DecodeTarget;
+    if let Some(dt) = decode_target {
+        let name = match dt {
+            DecodeTarget::Auto => "auto",
+            DecodeTarget::Cpu => "cpu",
+            DecodeTarget::Gpu => "gpu",
+            DecodeTarget::Storage => "storage",
+        };
+        serde_json::json!({"profile": "auto_v2", "decode_target": name})
+    } else if codec_trial {
+        serde_json::json!({"profile": "compact-trial"})
+    } else {
+        serde_json::json!({"profile": codec.map(|c| c.display_name()).unwrap_or("auto")})
     }
 }
 
@@ -417,6 +454,7 @@ impl Default for ConvertOptions {
             row_group_rows: Some(scx_format_io::DEFAULT_ROW_GROUP_ROWS),
             row_group_target_nnz: None,
             codec_trial: false,
+            decode_target: None,
             tool: "scx".into(),
             memory_budget: None,
             stream: true,
@@ -963,6 +1001,7 @@ pub fn h5ad_to_scx(
         params_json: serde_json::json!({
             "input": input.display().to_string(),
             "format": "h5ad",
+            "codec_selection": opts.codec_selection_value(),
             "warnings": sink.summary_json(),
             "predicate_index": {
                 "obs_columns": obs_indexed,
@@ -1080,6 +1119,7 @@ pub fn tenx_to_scx(
         params_json: serde_json::json!({
             "input": input.display().to_string(),
             "format": "10x",
+            "codec_selection": opts.codec_selection_value(),
             "warnings": sink.summary_json(),
             "predicate_index": {
                 "obs_columns": obs_indexed,
@@ -1722,6 +1762,7 @@ pub fn h5ad_to_scx_streaming(
             "input": input.display().to_string(),
             "format": "h5ad",
             "stream": true,
+            "codec_selection": opts.codec_selection_value(),
             "source_matrix_format": source_format_str,
             "warnings": sink.summary_json(),
             "predicate_index": {
@@ -2151,12 +2192,8 @@ fn streaming_writer_coordinator_parallel(
                 spawn_shard!(s, next_to_spawn);
                 next_to_spawn += 1;
             }
-            match r {
-                Err(e) => return Err(e),
-                Ok(out) => {
-                    buffer.insert(idx, out);
-                }
-            }
+            let out = r?;
+            buffer.insert(idx, out);
             while let Some(out) = buffer.remove(&next_idx) {
                 if out.duplicates_merged > 0 {
                     sink.emit(ConvertWarning::DuplicateCoordinatesMerged {

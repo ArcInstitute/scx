@@ -347,6 +347,7 @@ mod tests {
             row_group_rows: 2,
             target_nnz: None,
             trial: false,
+            decode_target: None,
         }));
 
         assert_eq!(v_unframed, 1, "control must be unframed (v1)");
@@ -391,6 +392,7 @@ mod tests {
                 row_group_rows: 2,
                 target_nnz: None,
                 trial: false,
+                decode_target: None,
             }),
         )
         .expect("encode_one_shard");

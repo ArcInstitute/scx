@@ -52,6 +52,10 @@ _CODEC_NAMES = {
     # F5 compact-trial: per shard keep the smaller of {heuristic, ShufDeltaZstd},
     # row-group-framed. Requires `row_group_rows`.
     "compact-trial": ("SCX (compact-trial)", "scx_compact_trial"),
+    # Phase C auto_v2: workload-aware per-shard selection biased by
+    # `decode_target` (storage → prefer ShufDeltaZstd where smaller).
+    # Row-group-framed; requires `row_group_rows`.
+    "auto_v2": ("SCX (auto_v2)", "scx_auto_v2"),
     # Phase K multimodal variants — name + key tags for the
     # comprehensive results pipeline.
     "_multimodal_per_modality_auto": (
@@ -85,17 +89,21 @@ class ScxRunner(FormatRunner):
         codec_per_modality: bool = True,
         with_csc: bool = False,
         row_group_rows: int | None = None,
+        decode_target: str | None = None,
     ) -> None:
         if codec not in _CODEC_NAMES:
             raise ValueError(
                 f"Unsupported codec {codec!r}; "
                 f"expected one of {list(_CODEC_NAMES)}"
             )
-        if codec in ("shufdelta", "compact-trial") and row_group_rows is None:
-            # Framed codecs need row-group framing to stay random-access-safe;
-            # default to a representative G so the benchmark variant is turnkey.
+        if codec in ("shufdelta", "compact-trial", "auto_v2") and row_group_rows is None:
+            # Framed codecs/profiles need row-group framing to stay
+            # random-access-safe; default to a representative G so the variant
+            # is turnkey.
             row_group_rows = 512
         self.codec = codec
+        # Phase C: decode-target bias for the auto_v2 profile (None otherwise).
+        self.decode_target = decode_target
         # F5 row-group framing (None = monolithic/unframed). Required (and
         # auto-defaulted above) for shufdelta / compact-trial.
         self.row_group_rows = row_group_rows
@@ -169,6 +177,8 @@ class ScxRunner(FormatRunner):
             from_anndata_kwargs["csc"] = "always"
         if self.row_group_rows is not None:
             from_anndata_kwargs["row_group_rows"] = self.row_group_rows
+        if self.decode_target is not None:
+            from_anndata_kwargs["decode_target"] = self.decode_target
         pyscx.from_anndata(adata, output_path, **from_anndata_kwargs)
 
         wall = time.perf_counter() - t0

@@ -375,6 +375,37 @@ fn bench_decode_shard(c: &mut Criterion) {
                 .unwrap()
             })
         });
+
+        // Phase B: whole-shard ShufDeltaZstd decode (through the SIMD
+        // byte-undelta + byte-unshuffle kernels) against the Scx1 arm above —
+        // the "ShufDeltaZstd CPU decode within a few % of Scx1" parity AC.
+        let encoded_sd = encode_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::ShufDeltaZstd,
+            ValueEncoding::Uint8,
+            index_dtype_u16,
+        )
+        .unwrap();
+
+        group.bench_with_input(
+            BenchmarkId::new("shufdelta", label),
+            &encoded_sd,
+            |b, enc| {
+                b.iter(|| {
+                    decode_shard(
+                        black_box(enc),
+                        black_box(CodecId::ShufDeltaZstd),
+                        black_box(ValueEncoding::Uint8),
+                        black_box(n_rows_actual),
+                        black_box(nnz),
+                        black_box(index_dtype_u16),
+                    )
+                    .unwrap()
+                })
+            },
+        );
     }
 
     group.finish();

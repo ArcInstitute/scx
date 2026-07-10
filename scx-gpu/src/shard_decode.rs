@@ -1007,6 +1007,7 @@ mod tests {
             row_group_rows,
             target_nnz: None,
             trial: false,
+            decode_target: None,
         };
         let section = scx_format_io::encode_one_shard(
             indptr,

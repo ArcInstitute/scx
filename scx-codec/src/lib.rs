@@ -7,6 +7,8 @@ pub mod forbp;
 pub mod median;
 pub mod rice;
 pub mod shuffle;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod simd;
 pub mod value_encoding;
 
 pub use byte_delta::{byte_delta_planes, byte_undelta_planes};

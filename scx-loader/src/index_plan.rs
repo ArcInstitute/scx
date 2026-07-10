@@ -498,6 +498,16 @@ impl IndexPlanLoader {
         self.scatter_block_index
     }
 
+    /// True if the opened file has at least one row-group-framed CSR shard.
+    /// The scattered block-index fast path can only fire on framed shards; an
+    /// all-unframed (legacy v1) file full-shard-decodes every gather no matter
+    /// the `scatter_block_index` setting. The Python constructor uses this to
+    /// warn when a caller requests the fast path on an unframed file — reframe
+    /// with `scx optimize --row-group-rows 256 <file>`.
+    pub fn any_shard_framed(&self) -> bool {
+        self.backed.any_shard_framed()
+    }
+
     /// Per-component memory breakdown produced by the auto-tune at
     /// construction. Surfaces the cache / batch / lookahead / transient /
     /// python-overhead split that drove the effective `cache_shards` and

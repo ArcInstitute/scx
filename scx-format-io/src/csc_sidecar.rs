@@ -281,6 +281,7 @@ mod tests {
                 row_group_rows: 1, // one column-group per gene
                 target_nnz: None,
                 trial: false,
+                decode_target: None,
             }),
         );
 

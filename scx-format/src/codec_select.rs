@@ -17,6 +17,61 @@ pub enum CodecProfile {
     Scx1,
 }
 
+/// Downstream decode target for the workload-aware `auto_v2` codec profile.
+///
+/// Biases the per-modality integer codec choice between the size/GPU-friendly
+/// `ShufDeltaZstd` and the CPU-conservative heuristic winner (`Scx1`/`Zstd`).
+/// Since Phase B brought ShufDeltaZstd CPU decode to ~parity with Scx1, this is
+/// a transitional knob: for integers `Auto` already behaves like `compact-trial`
+/// (adopt ShufDeltaZstd where it compresses at least as well). See [`pick_codec_v2`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecodeTarget {
+    /// Balanced default: adopt ShufDeltaZstd for integers when strictly smaller.
+    #[default]
+    Auto,
+    /// Conservative: keep the heuristic winner (never ShufDeltaZstd).
+    Cpu,
+    /// GPU training: prefer ShufDeltaZstd (GPU-decodable) on size ties.
+    Gpu,
+    /// Cloud/egress: prefer ShufDeltaZstd (smaller payload) on size ties.
+    Storage,
+}
+
+/// Pick the final integer codec for the `auto_v2` profile, given the heuristic
+/// winner and the measured framed sizes of the heuristic vs a ShufDeltaZstd
+/// trial-encode.
+///
+/// `ShufDeltaZstd` only competes for **integer** data whose heuristic winner is
+/// not already ShufDeltaZstd (float always stays Pcodec, so this returns the
+/// heuristic unchanged there). Decision matrix:
+///
+/// - `Cpu` → `heuristic` (conservative; keeps Scx1 for low-median counts).
+/// - `Auto` → ShufDeltaZstd iff `size_shufdelta < size_heuristic` (tie → heuristic;
+///   matches the `compact-trial` "keep the smaller" rule).
+/// - `Gpu` / `Storage` → ShufDeltaZstd iff `size_shufdelta <= size_heuristic`
+///   (tie → ShufDeltaZstd: GPU-decodable / smaller egress).
+pub fn pick_codec_v2(
+    heuristic: CodecId,
+    decode_target: DecodeTarget,
+    size_heuristic: usize,
+    size_shufdelta: usize,
+    is_integer: bool,
+) -> CodecId {
+    if !is_integer || heuristic == CodecId::ShufDeltaZstd {
+        return heuristic;
+    }
+    let adopt = match decode_target {
+        DecodeTarget::Cpu => false,
+        DecodeTarget::Auto => size_shufdelta < size_heuristic,
+        DecodeTarget::Gpu | DecodeTarget::Storage => size_shufdelta <= size_heuristic,
+    };
+    if adopt {
+        CodecId::ShufDeltaZstd
+    } else {
+        heuristic
+    }
+}
+
 /// Select codec using a profile hint.
 ///
 /// - `Fast` → LZ4+shuffle for all data types.
@@ -141,6 +196,81 @@ fn atac_sample_is_binary(raw: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_v2_cpu_keeps_heuristic() {
+        // Conservative: never adopt ShufDeltaZstd, even when strictly smaller.
+        assert_eq!(
+            pick_codec_v2(CodecId::Scx1, DecodeTarget::Cpu, 100, 50, true),
+            CodecId::Scx1
+        );
+        assert_eq!(
+            pick_codec_v2(CodecId::Zstd, DecodeTarget::Cpu, 100, 50, true),
+            CodecId::Zstd
+        );
+    }
+
+    #[test]
+    fn pick_v2_auto_adopts_when_strictly_smaller() {
+        assert_eq!(
+            pick_codec_v2(CodecId::Scx1, DecodeTarget::Auto, 100, 99, true),
+            CodecId::ShufDeltaZstd
+        );
+        // Tie → keep heuristic (compact-trial semantics).
+        assert_eq!(
+            pick_codec_v2(CodecId::Scx1, DecodeTarget::Auto, 100, 100, true),
+            CodecId::Scx1
+        );
+        // Larger → keep heuristic.
+        assert_eq!(
+            pick_codec_v2(CodecId::Scx1, DecodeTarget::Auto, 100, 101, true),
+            CodecId::Scx1
+        );
+    }
+
+    #[test]
+    fn pick_v2_gpu_storage_prefer_shufdelta_on_ties() {
+        for dt in [DecodeTarget::Gpu, DecodeTarget::Storage] {
+            // Tie → ShufDeltaZstd (GPU-decodable / smaller egress).
+            assert_eq!(
+                pick_codec_v2(CodecId::Scx1, dt, 100, 100, true),
+                CodecId::ShufDeltaZstd
+            );
+            assert_eq!(
+                pick_codec_v2(CodecId::Scx1, dt, 100, 90, true),
+                CodecId::ShufDeltaZstd
+            );
+            // Strictly larger → keep heuristic.
+            assert_eq!(
+                pick_codec_v2(CodecId::Scx1, dt, 100, 101, true),
+                CodecId::Scx1
+            );
+        }
+    }
+
+    #[test]
+    fn pick_v2_float_never_adopts_shufdelta() {
+        // Non-integer: heuristic (Pcodec) is returned regardless of target/size.
+        for dt in [
+            DecodeTarget::Auto,
+            DecodeTarget::Cpu,
+            DecodeTarget::Gpu,
+            DecodeTarget::Storage,
+        ] {
+            assert_eq!(
+                pick_codec_v2(CodecId::Pcodec, dt, 100, 1, false),
+                CodecId::Pcodec
+            );
+        }
+    }
+
+    #[test]
+    fn pick_v2_heuristic_already_shufdelta_is_noop() {
+        assert_eq!(
+            pick_codec_v2(CodecId::ShufDeltaZstd, DecodeTarget::Cpu, 100, 200, true),
+            CodecId::ShufDeltaZstd
+        );
+    }
 
     #[test]
     fn test_small_umi_values_select_scx1() {

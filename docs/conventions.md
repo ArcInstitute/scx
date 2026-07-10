@@ -97,6 +97,26 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   `no_rapids` `UserWarning` and falls back to CPU. rapids is a detected
   runtime dependency (conda), not a build dependency or pip extra.
 
+## SIMD / platform-specific code
+
+- **Scalar reference is the source of truth.** Every SIMD kernel must produce
+  **bit-identical** output to a scalar reference function kept alongside it
+  (e.g. `byte_undelta_planes_scalar` / `byte_unshuffle_scalar` in `scx-codec`).
+  The scalar fn is both the fallback and the correctness oracle.
+- **Gate, don't assume.** House x86 intrinsics in a `#[cfg(target_arch = "x86_64")]`
+  module (`scx-codec/src/simd.rs`) so non-x86 targets compile the scalar path
+  only. SSE2 is part of the x86_64 ABI baseline, so SSE2 intrinsics need no
+  `#[target_feature]` or `is_x86_feature_detected!` probe; a *wider* path (AVX2+)
+  must sit behind a runtime `is_x86_feature_detected!` check with the SSE2/scalar
+  path as fallback. No `-C target-feature` build flags — dispatch at runtime.
+- **Test `simd == scalar` directly.** Add a proptest that calls the SIMD and
+  scalar fns directly and `prop_assert_eq!`s them across all real widths/lengths
+  (incl. the sub-vector tail) — this exercises the scalar path deterministically
+  without needing a non-x86 CI runner, and the SIMD path on the x86 runner.
+- **`unsafe` hygiene.** Each `unsafe` intrinsic block carries a `// SAFETY:`
+  note; keep the crate `clippy -D warnings`-clean. No new SIMD dependency —
+  `core::arch` (std) is preferred over pulling in a portable-SIMD crate.
+
 ## Accelerators (scx-accel)
 
 - `faer` for dense linear algebra (QR, SVD, eigendecomposition in PCA).

@@ -895,6 +895,7 @@ fn test_csc_shard_framed_round_trip() {
         row_group_rows: 1, // ≥2 gene-groups over the fixture → framing exercised
         target_nnz: None,
         trial: false,
+        decode_target: None,
     }));
     writer.write_obs(&sample_obs()).unwrap();
     writer.write_var(&sample_var()).unwrap();
@@ -946,6 +947,7 @@ fn read_csc_columns_scattered_matches_full_decode() {
         row_group_rows: 1, // one column-group per gene → framing fully exercised
         target_nnz: None,
         trial: false,
+        decode_target: None,
     }));
     writer.write_obs(&sample_obs()).unwrap();
     writer.write_var(&sample_var()).unwrap();
@@ -993,6 +995,7 @@ fn decode_block_index_row_runs_rejects_out_of_range_run() {
         row_group_rows: 1,
         target_nnz: None,
         trial: false,
+        decode_target: None,
     }));
     writer.write_obs(&sample_obs()).unwrap();
     writer.write_var(&sample_var()).unwrap();
@@ -1090,6 +1093,7 @@ fn v4_guard_rejects_unframed_v1_shard() {
             row_group_rows: 1,
             target_nnz: None,
             trial: false,
+            decode_target: None,
         }),
     )
     .unwrap();

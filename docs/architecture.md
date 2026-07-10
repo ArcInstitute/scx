@@ -1075,7 +1075,7 @@ re-describe them. All are optional — defaults apply when unset.
 | `SCX_CUVS_TRUST_LAYOUT` | `scx-gpu` | unset | `=1` downgrades a cuVS version/layout-compatibility mismatch from a hard error to a warning (kNN results may be wrong). |
 | `SCX_DISABLE_CUDA_GRAPHS` | `scx-gpu` | unset | `=1`/`true` bypasses CUDA-graph capture at every call site. |
 | `SCX_GPU_PROFILE` | `scx-gpu` | unset | Any non-empty, non-`0` value emits GPU profiling output. |
-| `SCX_LOADER_PROFILE` | `scx-loader` | unset | `=1`/`true` emits ML-loader memory-budget profiling on drop. |
+| `SCX_LOADER_PROFILE` | `scx-loader` | unset | `=1`/`true` emits ML-loader profiling: per-stage timing (I/O-stage decode + `tx.send` back-pressure wait, decode-stage scatter) and the memory-budget breakdown on drop. |
 
 Benchmark-harness shell/Python variables (`SCX_WORK_DIR`, `SCX_DATA_DIR`,
 `SCX_BENCH_HIGH_MEM_PARTITION`) are consumed by `benchmarks/` scripts, not by

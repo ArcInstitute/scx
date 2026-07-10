@@ -25,7 +25,12 @@ use crate::section::SectionType;
 /// path (F5 Phase 1). Default on; `SCX_SCATTER_BLOCK_INDEX=0` (or `false`)
 /// disables the row-group path so a framed shard falls back to full-shard
 /// decode. Read once per process.
-fn scatter_block_index_enabled() -> bool {
+///
+/// Exposed so callers (e.g. the loader's unframed-file preflight warning) can
+/// gate on the same process-global switch that `block_index_eligible` uses —
+/// with the path globally disabled, reframing can't enable the fast path, so
+/// there is nothing to warn about.
+pub fn scatter_block_index_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("SCX_SCATTER_BLOCK_INDEX")
@@ -1157,6 +1162,17 @@ impl BackedCsrReader {
                 .shard_range(shard_idx)
                 .is_some_and(|(s, e)| (group_len as u64) * ROW_RANGE_WINDOW_DIVISOR < (e - s))
             && self.shard_is_framed(shard_idx)
+    }
+
+    /// True if any CSR shard is row-group framed (`shard_format_version >= 2`),
+    /// i.e. the scattered block-index fast path can fire on at least one shard.
+    /// An all-unframed (legacy v1) file full-shard-decodes every scattered
+    /// gather regardless of `scatter_block_index` — callers use this at open
+    /// time to warn that the fast path is inert. Early-returns on the first
+    /// framed shard; reads only shard headers (no payload), memoized per shard
+    /// via `framed_cache`.
+    pub fn any_shard_framed(&self) -> bool {
+        (0..self.shard_count()).any(|i| self.shard_is_framed(i))
     }
 
     /// Live count cap on the decoded-shard LRU. `0` means no cache was

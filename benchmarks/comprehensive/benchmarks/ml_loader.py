@@ -109,7 +109,15 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCX_KEYS = {"scx_auto", "scx_scx1", "scx_zstd", "scx_lz4", "scx_none", "scx_pcodec"}
+_SCX_KEYS = {
+    "scx_auto",
+    "scx_auto_v2",
+    "scx_scx1",
+    "scx_zstd",
+    "scx_lz4",
+    "scx_none",
+    "scx_pcodec",
+}
 
 SUPPORTED_FORMATS: frozenset[str] = frozenset(
     _SCX_KEYS | {"h5ad_none", "h5ad_gzip", "tiledb_soma", "slaf", "shardad"}

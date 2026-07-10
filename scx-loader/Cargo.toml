@@ -10,6 +10,9 @@ authors.workspace = true
 scx-format-io = { path = "../scx-format-io", features = ["deletion-vectors"] }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
+# GPU training-loader decode (Phase D). Hard-cudarc crate — only builds with the
+# CUDA toolchain, so gated behind the opt-in `gpu` feature (mirrors scx-accel).
+scx-gpu = { path = "../scx-gpu", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 crossbeam-channel = { workspace = true }
@@ -32,6 +35,9 @@ optional = true
 
 [features]
 python = ["pyo3", "numpy"]
+# Opt-in GPU training-loader decode (Phase D). Pulls in scx-gpu (CUDA toolchain
+# required to build). The default CPU loader is untouched when this is off.
+gpu = ["dep:scx-gpu"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
