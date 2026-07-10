@@ -2,6 +2,8 @@ pub mod batch;
 pub mod budget;
 pub mod decode_stage;
 pub mod error;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod index_plan;
 pub mod io_stage;
 pub mod normalize;

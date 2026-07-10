@@ -3685,6 +3685,7 @@ dependencies = [
  "roaring",
  "scx-codec",
  "scx-format-io",
+ "scx-gpu",
  "scx-sparse",
  "serde_json",
  "tempfile",

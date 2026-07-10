@@ -129,6 +129,13 @@ pub async fn io_stage(
     let io_start = Instant::now();
     let mut group_count = 0usize;
     let n_groups = shard_groups.len();
+    // D0 profiling accumulators (only meaningful when `profile`): the sum of
+    // per-group in-`spawn_blocking` decode wall vs the sum of per-group
+    // `tx.send` back-pressure wait. Their ratio is the critical-path verdict —
+    // decode ≈ wall & send-wait ≈ 0 ⇒ stage-1 codec decode is the bottleneck;
+    // large send-wait ⇒ decode is hidden behind the downstream consumer.
+    let mut total_decode_us = 0u128;
+    let mut total_send_wait_us = 0u128;
 
     for group_indices in shard_groups {
         // Prefetch upcoming groups with MADV_WILLNEED (look ahead 2 groups).
@@ -158,121 +165,128 @@ pub async fn io_stage(
 
         // Perform blocking shard reads inside spawn_blocking.
         let group_modality_id = modality_id;
-        let group = tokio::task::spawn_blocking(move || -> Result<ShardGroup> {
-            let t0 = Instant::now();
-            let sorted: Vec<&scx_format_io::FullCatalogEntry> = match group_modality_id {
-                Some(mid) => reader.catalog().csr_shards_for_modality(mid),
-                None => reader.catalog().shards_sorted(),
-            };
-            let mut shards = Vec::with_capacity(group_indices.len());
-
-            // Issue a coalesced MADV_WILLNEED for this group's byte range.
-            // Uses the pre-computed range to avoid reiterating over group_indices.
-            #[cfg(unix)]
-            {
-                let (min_offset, max_end) = current_byte_range;
-                if min_offset < max_end {
-                    reader.advise_willneed(min_offset, max_end - min_offset);
-                }
-            }
-
-            for &shard_idx in &group_indices {
-                if shard_idx >= sorted.len() {
-                    return Err(LoaderError::ConfigError {
-                        reason: format!(
-                            "shard index {} out of bounds (file has {} shards)",
-                            shard_idx,
-                            sorted.len()
-                        ),
-                    });
-                }
-
-                let entry = sorted[shard_idx];
-
-                // Extract row metadata from catalog stats.
-                let stats = entry
-                    .stats
-                    .as_ref()
-                    .ok_or_else(|| LoaderError::ConfigError {
-                        reason: format!(
-                            "shard '{}' has no stats (row_start/row_end unavailable)",
-                            entry.name
-                        ),
-                    })?;
-
-                let global_row_offset = stats.row_start;
-                let n_rows = if stats.row_end < stats.row_start {
-                    return Err(LoaderError::ConfigError {
-                        reason: format!(
-                            "shard '{}' has row_end ({}) < row_start ({})",
-                            entry.name, stats.row_end, stats.row_start
-                        ),
-                    });
-                } else {
-                    let n = stats.row_end - stats.row_start;
-                    u32::try_from(n).map_err(|_| LoaderError::ConfigError {
-                        reason: format!("shard '{}' row count {} exceeds u32::MAX", entry.name, n),
-                    })?
+        let group =
+            tokio::task::spawn_blocking(move || -> Result<(ShardGroup, std::time::Duration)> {
+                let t0 = Instant::now();
+                let sorted: Vec<&scx_format_io::FullCatalogEntry> = match group_modality_id {
+                    Some(mid) => reader.catalog().csr_shards_for_modality(mid),
+                    None => reader.catalog().shards_sorted(),
                 };
+                let mut shards = Vec::with_capacity(group_indices.len());
 
-                // Check deletion status.
-                let deleted_bitmap = deletion_map.get(&shard_idx).cloned();
-
-                // Skip fully-deleted shards.
-                if let Some(ref bm) = deleted_bitmap {
-                    if bm.len() >= n_rows as u64 {
-                        // All rows deleted — exclude this shard entirely.
-                        continue;
+                // Issue a coalesced MADV_WILLNEED for this group's byte range.
+                // Uses the pre-computed range to avoid reiterating over group_indices.
+                #[cfg(unix)]
+                {
+                    let (min_offset, max_end) = current_byte_range;
+                    if min_offset < max_end {
+                        reader.advise_willneed(min_offset, max_end - min_offset);
                     }
                 }
 
-                // Decode the shard CSR data (skip checksum for throughput —
-                // data integrity verified at file open or via explicit validate()).
-                let (indptr, indices, data) = reader.read_shard_from_entry(entry)?;
+                for &shard_idx in &group_indices {
+                    if shard_idx >= sorted.len() {
+                        return Err(LoaderError::ConfigError {
+                            reason: format!(
+                                "shard index {} out of bounds (file has {} shards)",
+                                shard_idx,
+                                sorted.len()
+                            ),
+                        });
+                    }
 
-                shards.push(ShardData {
-                    indptr,
-                    indices,
-                    data,
-                    global_row_offset,
-                    n_rows,
-                    deleted_rows: deleted_bitmap,
-                });
-            }
+                    let entry = sorted[shard_idx];
 
-            // `profile` (read once via `profiling_enabled()` at pipeline scope)
-            // is captured by copy into this `move` closure — no per-group env read.
-            if profile {
-                let total_rows: u32 = shards.iter().map(|s| s.n_rows).sum();
-                eprintln!(
+                    // Extract row metadata from catalog stats.
+                    let stats = entry
+                        .stats
+                        .as_ref()
+                        .ok_or_else(|| LoaderError::ConfigError {
+                            reason: format!(
+                                "shard '{}' has no stats (row_start/row_end unavailable)",
+                                entry.name
+                            ),
+                        })?;
+
+                    let global_row_offset = stats.row_start;
+                    let n_rows = if stats.row_end < stats.row_start {
+                        return Err(LoaderError::ConfigError {
+                            reason: format!(
+                                "shard '{}' has row_end ({}) < row_start ({})",
+                                entry.name, stats.row_end, stats.row_start
+                            ),
+                        });
+                    } else {
+                        let n = stats.row_end - stats.row_start;
+                        u32::try_from(n).map_err(|_| LoaderError::ConfigError {
+                            reason: format!(
+                                "shard '{}' row count {} exceeds u32::MAX",
+                                entry.name, n
+                            ),
+                        })?
+                    };
+
+                    // Check deletion status.
+                    let deleted_bitmap = deletion_map.get(&shard_idx).cloned();
+
+                    // Skip fully-deleted shards.
+                    if let Some(ref bm) = deleted_bitmap {
+                        if bm.len() >= n_rows as u64 {
+                            // All rows deleted — exclude this shard entirely.
+                            continue;
+                        }
+                    }
+
+                    // Decode the shard CSR data (skip checksum for throughput —
+                    // data integrity verified at file open or via explicit validate()).
+                    let (indptr, indices, data) = reader.read_shard_from_entry(entry)?;
+
+                    shards.push(ShardData {
+                        indptr,
+                        indices,
+                        data,
+                        global_row_offset,
+                        n_rows,
+                        deleted_rows: deleted_bitmap,
+                    });
+                }
+
+                // `profile` (read once via `profiling_enabled()` at pipeline scope)
+                // is captured by copy into this `move` closure — no per-group env read.
+                let decode_elapsed = t0.elapsed();
+                if profile {
+                    let total_rows: u32 = shards.iter().map(|s| s.n_rows).sum();
+                    eprintln!(
                     "[scx-loader profile] io_stage group {group_num}: {:?} ({} shards, {} rows)",
-                    t0.elapsed(),
+                    decode_elapsed,
                     shards.len(),
                     total_rows
                 );
-            }
+                }
 
-            Ok(ShardGroup { shards })
-        })
-        .await
-        .map_err(|e| LoaderError::ShutdownError(format!("I/O stage task panicked: {e}")))??;
+                Ok((ShardGroup { shards }, decode_elapsed))
+            })
+            .await
+            .map_err(|e| LoaderError::ShutdownError(format!("I/O stage task panicked: {e}")))??;
+        let (group, decode_elapsed) = group;
+        total_decode_us += decode_elapsed.as_micros();
 
         // Send the group via bounded channel (blocks if full = back-pressure).
         let t_send = Instant::now();
         tx.send(group).await.map_err(|e| {
             LoaderError::ChannelError(format!("I/O stage: failed to send shard group: {e}"))
         })?;
+        let send_wait = t_send.elapsed();
+        total_send_wait_us += send_wait.as_micros();
         if profile {
-            eprintln!(
-                "[scx-loader profile] io_stage group {group_num} send wait: {:?}",
-                t_send.elapsed()
-            );
+            eprintln!("[scx-loader profile] io_stage group {group_num} send wait: {send_wait:?}");
         }
     }
 
     if profile {
         eprintln!(
-            "[scx-loader profile] io_stage total: {:?} ({group_count} groups)",
+            "[scx-loader profile] io_stage total: {:?} ({group_count} groups, \
+             decode_total={total_decode_us}µs, send_wait_total={total_send_wait_us}µs)",
             io_start.elapsed()
         );
     }
