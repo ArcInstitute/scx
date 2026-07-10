@@ -558,12 +558,8 @@ fn stream_csr_into_prealloc_parallel(
                 )
             })?;
             received += 1;
-            match res {
-                Err(e) => return Err(e),
-                Ok(out) => {
-                    buffer.insert(idx, out);
-                }
-            }
+            let out = res?;
+            buffer.insert(idx, out);
             while let Some(shard) = buffer.remove(&next_idx) {
                 let DecodedShard {
                     shard_row_start,

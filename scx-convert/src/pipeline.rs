@@ -2207,12 +2207,8 @@ fn streaming_writer_coordinator_parallel(
                 spawn_shard!(s, next_to_spawn);
                 next_to_spawn += 1;
             }
-            match r {
-                Err(e) => return Err(e),
-                Ok(out) => {
-                    buffer.insert(idx, out);
-                }
-            }
+            let out = r?;
+            buffer.insert(idx, out);
             while let Some(out) = buffer.remove(&next_idx) {
                 if out.duplicates_merged > 0 {
                     sink.emit(ConvertWarning::DuplicateCoordinatesMerged {
