@@ -658,6 +658,64 @@ returns 0 batches per scenario (TTFB 90.2 s then timeout) — flagged as a
 SLAF-upstream tuning issue, not a harness defect. Source JSONs:
 `benchmarks/comprehensive/results/raw/ml_loader__slaf__census_{1m,10m}.json`.
 
+### scx vs shardad vs cellstream — random-gather training loader (2026-07-10)
+
+Head-to-head against the two custom per-cell stores built for scatter-heavy
+training: **shardad** (`.shad`, condition-grouped zstd CSR shards) and
+**cellstream** (`~/dev/python/cellstream` — a scatter-immune per-cell store over
+shardad's codec, `gather_rows(row_ids)→CSR`). Neither has a native batched
+DataLoader, so each is driven as the honest "loader you'd build on it": permute
+cell ids, slice into batches, gather each batch and apply the same HVG/normalize as
+scx. batch_size=1024; median batches/sec over the shuffled epoch.
+
+**`raw` scenario** (random gather, no HVG/normalize):
+
+| Dataset | **scx (auto)** | cellstream | shardad |
+|---|---|---|---|
+| pbmc3k | **35.2** | 14.6 | 8.1 |
+| pbmc10k | **27.7** | 11.7 | 2.7 |
+| smartseq2 | **18.1** | 8.2 | 0.6 |
+| tabula_sapiens_100k | **36.0** | 2.7 | 0.5 |
+| census_500k | **48.1** | 13.0 | — |
+
+**`hvg_norm` scenario** (HVG-2000 + normalize + log1p):
+
+| Dataset | **scx (auto)** | cellstream | shardad |
+|---|---|---|---|
+| pbmc3k | **49.2** | 12.5 | 8.2 |
+| pbmc10k | **36.6** | 11.3 | 2.6 |
+| smartseq2 | **23.0** | 7.5 | 0.6 |
+| tabula_sapiens_100k | **40.9** | 12.7 | 0.5 |
+| census_500k | **57.3** | 11.7 | — |
+
+**On-disk fixture size (MB, lower is better):**
+
+| Dataset | scx (auto=Scx1) | scx auto_v2 (ShufDeltaZstd) | cellstream | shardad |
+|---|---|---|---|---|
+| pbmc10k | 39.8 | 30.1 | 34.6 | 31.7 |
+| smartseq2 | 552.7 | 262.7 | 255.7 | 253.2 |
+| tabula_sapiens_100k | 448.9 | 233.5 | 234.5 | 222.2 |
+| census_500k | 1841.8 | 1182.9 | 920.6 | 859.2 |
+| census_1m | 3988.8 | 2800.1 | 1747.0 | 1622.0 |
+
+**Findings.**
+- **Throughput: scx is the fastest training loader at every scale** — ~2.4× cellstream
+  and ~10× shardad on pbmc10k random gather, widening to ~13× cellstream on tabula.
+  cellstream clearly beats shardad (shardad's per-call subset read collapses to
+  ~0.5 batches/sec at ≥50k cells; it did not complete the census fixtures).
+- **Storage: the compute default trades disk for speed.** scx `auto` (Scx1) is chosen
+  for decode speed and is the largest on disk (~2.3× cellstream at census scale);
+  the opt-in `auto_v2` (ShufDeltaZstd) recovers ~30% of that (census_1m 3989→2800 MB)
+  while keeping scx-class throughput (auto_v2 ml_loader ≈ auto on pbmc3k/pbmc10k),
+  narrowing but not closing the gap to cellstream/shardad's aggressive zstd+dictionary
+  codec. Storage-bound archival should prefer `auto_v2`/`compact-trial`; training
+  throughput should stay on `auto`.
+
+*Methodology: `benchmarks/comprehensive` ml_loader, 2026-07-10 capture, scx
+`TrainingDataset` streaming pipeline vs per-batch competitor gather. `census_1m` scx
+throughput is excluded here — it reported an anomalous ~15× jump over census_500k
+(a known census_1m fixture discrepancy, `thresholds.yaml`), under investigation.*
+
 ### ShufDeltaZstd loader-decode cost (Phase-D D0 profiling)
 
 The training loader decodes CSR shards on **CPU** (stage-1 `io_stage`
