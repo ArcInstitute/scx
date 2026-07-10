@@ -411,8 +411,12 @@ The chosen profile + target is stamped in the file's provenance
 brought ShufDeltaZstd CPU decode to ~parity with Scx1 (`docs/performance.md`), for
 integers `auto`-target `auto_v2` already collapses to "ShufDeltaZstd where it
 compresses better" — the `decode_target` knob is transitional and only the `cpu`
-branch still differs. The compute default stays Scx1 until a GPU training loader
-(Phase D) makes ShufDeltaZstd the better default for the GPU-training case.
+branch still differs. The compute default stays Scx1. A GPU training loader
+(Phase D) that would make ShufDeltaZstd the better default for GPU training was
+**profiled (D0) and deferred** — the training loader decodes on CPU, where
+ShufDeltaZstd is only ~9% slower than Scx1 (Phase-B SIMD), so host-bounce is not
+the measured training ceiling ([performance.md § ShufDeltaZstd loader-decode
+cost](performance.md#shufdeltazstd-loader-decode-cost-phase-d-d0-profiling)).
 
 ### Codec tradeoff summary — Scx1 vs ShufDeltaZstd
 
@@ -429,13 +433,13 @@ tables in [performance.md](performance.md#scx-vs-shardad--full-feature-parity)):
 | **Random access (framed)** | ✅ Per row-group (via BlockIndex) | ✅ Per row-group (via BlockIndex) |
 | **Encode speed** | ~parity | ~parity (slightly faster — no per-row strategy) |
 | **Float data** | N/A — both route to Pcodec | N/A — ShufDeltaZstd falls back to zstd-only |
-| **ML training loader** | Preferred — GPU decode drops codec cost to ~5–8% of batch time | Would regress GPU training throughput |
+| **ML training loader** | Marginal edge (loader decodes on **CPU**) | ~9% slower CPU decode/epoch (D0); GPU-loader decode deferred — not the training ceiling |
 
 **When to use which codec:**
 
 | Your workload | Recommended | CLI / Python | Why |
 |---|---|---|---|
-| GPU ML training | `auto` (Scx1) | `codec="auto"` (default) | GPU in-VRAM decode; fastest training throughput |
+| GPU ML training | `auto` (Scx1) | `codec="auto"` (default) | Loader decodes on CPU; Scx1's ~9% faster CPU decode (D0) is the marginal default |
 | Interactive analysis, CPU | `auto` (Scx1) | `codec="auto"` (default) | Faster CPU decode |
 | Storage-constrained archival | `compact-trial` | `--codec compact-trial --row-group-rows 256` / `codec="compact-trial", row_group_rows=256` | 1.3–2.1× smaller; retains random access via framing |
 | Cloud hosting (minimize egress) | `compact-trial` | same as above | Smaller = fewer bytes transferred |

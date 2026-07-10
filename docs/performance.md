@@ -658,6 +658,32 @@ returns 0 batches per scenario (TTFB 90.2 s then timeout) — flagged as a
 SLAF-upstream tuning issue, not a harness defect. Source JSONs:
 `benchmarks/comprehensive/results/raw/ml_loader__slaf__census_{1m,10m}.json`.
 
+### ShufDeltaZstd loader-decode cost (Phase-D D0 profiling)
+
+The training loader decodes CSR shards on **CPU** (stage-1 `io_stage`
+`read_shard_from_entry`, inside `spawn_blocking`; stage-2 `decode_stage` scatters
+to dense) — the merged GPU ShufDeltaZstd decoder serves the `to_gpu_anndata`
+*analysis* path, not the loader. D0 profiled whether moving loader decode onto the
+GPU (Phase D) would lift training throughput. H100, pbmc10k (single 16,384-cap
+shard = 1 row-group), `SCX_LOADER_PROFILE=1`, batch_size=1024:
+
+| Regime | Codec | Stage-1 decode/epoch | `io_stage` send-wait | GPU util |
+|--------|-------|----------------------|----------------------|----------|
+| raw (null consumer) | `auto` (Scx1) | 325.8 ms | ~0 (4 µs) | — |
+| raw (null consumer) | `auto_v2` (ShufDeltaZstd) | 357.1 ms (**+9.6%**) | ~0 (4 µs) | — |
+| gpu_train (scVI VAE) | `auto` (Scx1) | 262.6 ms | ~0 (5 µs) | 0% |
+| gpu_train (scVI VAE) | `auto_v2` (ShufDeltaZstd) | 286.3 ms (**+9.0%**) | ~0 (4 µs) | 0% |
+
+The ShufDeltaZstd CPU-decode tax over Scx1 is only **~9%** (consistent with the
+Phase-B whole-shard ~1.09×; SSE2 SIMD already closed the gap that once was
+1.3–1.8×). Stage-1 send-wait is ≈0 (the loader never blocks handing batches to the
+consumer) and GPU util is ≈0% (the model is too light to expose decode) — so the
+"smaller PCIe payload → throughput" lever Phase D would exploit is not on the
+critical path in any measured regime. **GPU-loader decode (Phase D D2–D5) is
+therefore deferred**; a `gpu`-gated `scx-loader → scx-gpu` feature edge (D1) exists
+as scaffolding. Storage is unaffected: `auto_v2` is 24% smaller on this dataset
+(30.1 vs 39.8 MB) — the egress win is real and orthogonal to loader throughput.
+
 ### IndexPlanDataset (plan-driven paired reads)
 
 `pyscx.IndexPlanDataset` is the sibling type for perturbation training and
