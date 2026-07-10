@@ -843,6 +843,38 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__gpu_train
     min: 63.3
+
+  # ─── Phase C auto_v2 training-throughput (no regression vs auto) ──────
+  # Absolute floors on auto_v2's OWN batches/sec — catch a throughput
+  # regression of the ShufDeltaZstd-decoding loader. Set at 0.85× the
+  # min observed run from the 2026-07-09 capture (candidate_2026_07_09_auto_v2),
+  # so no measured run violates and there is ~15% noise headroom. Only
+  # pbmc10k is floored: it was the one dataset that ran clean and stable
+  # (tight runs), whereas pbmc3k measured node-contended this capture
+  # (scx_auto/pbmc3k raw itself came in under its own 38.6 floor), and
+  # smartseq2/tabula/census ml_loader jobs timed out at the 65-min limit
+  # (the workers2 scenario is too heavy for larger data in that window).
+  # Add pbmc3k + tabula auto_v2 floors from a future clean full capture.
+  # Measured relationship (pbmc10k): auto_v2 vs auto — raw 22.2 vs 27.7
+  # (~20% slower, the CPU-decode-bound worst case, matching Phase B's
+  # ~1.09-1.2× ShufDeltaZstd CPU decode), hvg_norm 34.3 vs 36.6 (~6%),
+  # gpu_train 34.1 vs 35.5 (~4%). No throughput regression beyond the
+  # known ShufDeltaZstd CPU-decode band.
+  - benchmark: ml_loader
+    format: scx_auto_v2
+    dataset: pbmc10k
+    metric: batches_per_sec__raw
+    min: 18.0
+  - benchmark: ml_loader
+    format: scx_auto_v2
+    dataset: pbmc10k
+    metric: batches_per_sec__hvg_norm
+    min: 28.0
+  - benchmark: ml_loader
+    format: scx_auto_v2
+    dataset: pbmc10k
+    metric: batches_per_sec__gpu_train
+    min: 28.0
   - benchmark: ml_loader
     format: h5ad_none
     dataset: tabula_sapiens_100k
@@ -1790,12 +1822,12 @@ absolute_floors:
 #    aggregation-phase perf signal. The `gpu_nb_glm_csc` route string is
 #    reserved but never emitted today.
 #
-# 5. ml_loader batches_per_sec floors for `scx_auto_v2` (Phase C)
-#    The Phase-C auto_v2 *size* gate is ACTIVE above (compression_ratio floors,
-#    deterministic). The training-throughput half ("no throughput regression vs
-#    scx_auto") is deferred until a full capture produces `ml_loader` rows for
-#    `scx_auto_v2` — auto_v2 shards decode as ShufDeltaZstd (~1.09x Scx1 CPU
-#    decode post-Phase-B), so a safe floor needs the measured median, not a
-#    guess. When captured, add `ml_loader` `batches_per_sec__{raw,hvg_norm,
-#    gpu_train}` floors on `scx_auto_v2` (mirroring the `scx_auto` rows) set
-#    within N% of the scx_auto medians.
+# 5. ml_loader batches_per_sec floors for `scx_auto_v2` (Phase C) — PARTIALLY
+#    ACTIVE. The size gate (compression_ratio) is active + validated; the
+#    training-throughput floors are now ACTIVE for `pbmc10k` (raw/hvg_norm/
+#    gpu_train) from the 2026-07-09 capture. Still deferred: `pbmc3k` (node
+#    contention that capture — scx_auto/pbmc3k raw itself came in under its own
+#    38.6 floor) and `tabula_sapiens_100k` / census (ml_loader jobs timed out at
+#    the 65-min limit — the workers2 scenario is too heavy for larger data).
+#    Add those from a future clean full capture with a longer ml_loader timeout,
+#    mirroring the pbmc10k rows (min = 0.85× the measured min run).
