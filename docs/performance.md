@@ -713,12 +713,16 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
 
 *Methodology: `benchmarks/comprehensive` ml_loader, 2026-07-10 capture, scx
 `TrainingDataset` streaming pipeline vs per-batch competitor gather. `census_1m` scx
-`auto` batches/sec is excluded — the `census_1m_auto.scx` fixture emits **64-cell
-batches** (15,625/epoch) instead of 1024, inflating batches/sec ~15×; **cells/sec is
-consistent** (~50–66k, matching census_500k). This is a stale-fixture bug specific to
-`census_1m_auto.scx` (the `_auto_v2` fixture batches correctly at 1024) — rebuild it;
-tracked as a follow-up. Competitor batches/sec at census_1m use 1024-cell batches and
-are unaffected.*
+`auto` batches/sec is excluded because the loader's **memory-budget auto-tune** collapses
+`batch_size` to its 64 minimum for 1M×61,497 full-width at the default 4096 MB budget
+(estimated ~4.6 GB > budget). This is a budget/estimator interaction, **not** a fixture
+bug — the geometry is a standard 62×16k-shard layout and with `max_memory_mb=32000` it
+batches at 1024 normally. The larger-on-disk Scx1 `auto` file estimates ~0.5 GB more than
+the smaller `auto_v2`, so `auto` tips over the 4096 threshold while `auto_v2` (and
+census_500k) stay at 1024 — making census_1m `auto` batches/sec incomparable. **cells/sec
+is the fair, batch-size-invariant metric and is consistent** (~50–66k, matching
+census_500k), showing auto ≈ auto_v2. Competitor batches/sec at census_1m use 1024-cell
+batches and are unaffected.*
 
 ### scx auto_v2 vs cellstream — the storage-optimized head-to-head
 
