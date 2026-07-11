@@ -706,15 +706,57 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
 - **Storage: the compute default trades disk for speed.** scx `auto` (Scx1) is chosen
   for decode speed and is the largest on disk (~2.3× cellstream at census scale);
   the opt-in `auto_v2` (ShufDeltaZstd) recovers ~30% of that (census_1m 3989→2800 MB)
-  while keeping scx-class throughput (auto_v2 ml_loader ≈ auto on pbmc3k/pbmc10k),
-  narrowing but not closing the gap to cellstream/shardad's aggressive zstd+dictionary
-  codec. Storage-bound archival should prefer `auto_v2`/`compact-trial`; training
-  throughput should stay on `auto`.
+  while keeping scx-class throughput (**auto_v2 within ≤~3% of `auto` on the realistic
+  `hvg_norm` scenario at every scale** — see the auto_v2-vs-cellstream section), narrowing
+  but not closing the gap to cellstream/shardad's aggressive zstd+dictionary codec.
+  Storage-bound archival should prefer `auto_v2`/`compact-trial`.
 
 *Methodology: `benchmarks/comprehensive` ml_loader, 2026-07-10 capture, scx
 `TrainingDataset` streaming pipeline vs per-batch competitor gather. `census_1m` scx
-throughput is excluded here — it reported an anomalous ~15× jump over census_500k
-(a known census_1m fixture discrepancy, `thresholds.yaml`), under investigation.*
+`auto` batches/sec is excluded — the `census_1m_auto.scx` fixture emits **64-cell
+batches** (15,625/epoch) instead of 1024, inflating batches/sec ~15×; **cells/sec is
+consistent** (~50–66k, matching census_500k). This is a stale-fixture bug specific to
+`census_1m_auto.scx` (the `_auto_v2` fixture batches correctly at 1024) — rebuild it;
+tracked as a follow-up. Competitor batches/sec at census_1m use 1024-cell batches and
+are unaffected.*
+
+### scx auto_v2 vs cellstream — the storage-optimized head-to-head
+
+The fairest apples-to-apples: scx's **storage-optimized codec** (`auto_v2` =
+ShufDeltaZstd, framed) vs **cellstream**, the storage-optimized scatter competitor.
+Both target smaller-on-disk random-access training. batch_size=1024; 2026-07-10/11.
+
+**Compression + on-disk size** (ratio vs source h5ad; MB):
+
+| Dataset | ratio auto_v2 | ratio cellstream | MB auto_v2 | MB cellstream |
+|---|---|---|---|---|
+| pbmc10k | **6.73** | 5.86 | 30 | 35 |
+| smartseq2 | 4.08 | 4.19 | 263 | 256 |
+| tabula_100k | 6.79 | 6.77 | 234 | 235 |
+| census_500k | 5.14 | **6.60** | 1183 | 921 |
+| census_1m | 4.07 | **6.52** | 2800 | **1747** |
+
+**Training throughput** (median batches/sec; higher = better):
+
+| Dataset | raw auto_v2 | raw cellstream | hvg_norm auto_v2 | hvg_norm cellstream | throughput edge |
+|---|---|---|---|---|---|
+| pbmc10k | 24.4 | 11.7 | 37.2 | 11.3 | **auto_v2 2–3×** |
+| smartseq2 | 18.8 | 8.2 | 23.3 | 7.5 | **auto_v2 2–3×** |
+| tabula_100k | 29.8 | 2.7 | 39.5 | 12.7 | **auto_v2 3–11×** |
+| census_500k | 51.7 | 13.0 | 54.8 | 11.7 | **auto_v2 4–5×** |
+| census_1m | 55.9 | 12.7 | 62.7 | 11.3 | **auto_v2 4–6×** |
+
+**Tradeoff.** `auto_v2` delivers **2–11× cellstream's training throughput at every
+scale**; the two are **comparable on compression through tabula**, and cellstream pulls
+ahead only at **census** (~6.5× vs ~4.1×, ~1.6× smaller on disk) via its trained zstd
+dictionary. cellstream also opens faster (pbmc10k TTFB ~0.035 s vs auto_v2's ~0.4 s —
+mmap store vs pipeline spin-up). Net: `auto_v2` dominates on throughput; cellstream only
+edges it on atlas-scale footprint, at a 4–6× throughput cost.
+
+*Methodology: cellstream from the `benchmarks/comprehensive` ml_loader capture; auto_v2
+throughput from a direct `_run_scx_epoch` measurement (warmup + timed epoch) that
+bypasses the `pyscx_training_dataset_workers2` scenario (which times out at scale in the
+full harness). Both use batch_size=1024, HVG=2000.*
 
 ### ShufDeltaZstd loader-decode cost (Phase-D D0 profiling)
 
