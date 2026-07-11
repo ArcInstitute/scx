@@ -136,6 +136,34 @@ incompatible (bench, format) cells never get submitted. Derived from
 match the keys that ``_resolve_loader`` recognises. The runtime guard
 in ``run()`` still catches direct invocation."""
 
+
+def _scx_memory_budget_mb() -> int | None:
+    """Loader `max_memory_mb` scaled to the SLURM allocation.
+
+    The default (4096 MB) is too small for atlas-scale full-width datasets
+    (1M × 61,497): the loader's memory-budget auto-tune then collapses
+    ``batch_size`` to its 64 minimum, which both makes batches/sec
+    incomparable across codecs (a larger-on-disk codec tips over the
+    threshold first) and inflates the epoch to ~16× more tiny batches
+    (a cause of the census `workers2` time-outs). Use most of whatever
+    ``--mem`` the SLURM job got so ``batch_size`` stays at 1024. Returns
+    ``None`` off-SLURM so local/CI runs keep the built-in default.
+    """
+    per_node = os.environ.get("SLURM_MEM_PER_NODE")
+    if per_node:
+        try:
+            return max(4096, int(int(per_node) * 0.6))
+        except ValueError:
+            pass
+    per_cpu = os.environ.get("SLURM_MEM_PER_CPU")
+    n_cpu = os.environ.get("SLURM_CPUS_ON_NODE")
+    if per_cpu and n_cpu:
+        try:
+            return max(4096, int(int(per_cpu) * int(n_cpu) * 0.6))
+        except ValueError:
+            pass
+    return None
+
 _SCENARIOS: list[tuple[str, bool, bool]] = [
     # (name, hvg, normalize)
     ("raw", False, False),
@@ -266,6 +294,7 @@ def _run_scx_epoch(
         normalize=normalize,
         log1p=normalize,
         seed=seed,
+        max_memory_mb=_scx_memory_budget_mb(),
     )
     n_batches = 0
     n_cells = 0
@@ -333,6 +362,7 @@ if _HAS_TORCH:
                 normalize=self.normalize,
                 log1p=self.normalize,
                 seed=self.seed,
+                max_memory_mb=_scx_memory_budget_mb(),
             )
             try:
                 for i, batch in enumerate(ds):
@@ -700,6 +730,7 @@ def _ttfb_scx(path: str, batch_size: int, hvg: bool, normalize: bool, seed: int)
         normalize=normalize,
         log1p=normalize,
         seed=seed,
+        max_memory_mb=_scx_memory_budget_mb(),
     )
     for _ in ds:
         break
@@ -860,6 +891,7 @@ def _run_gpu_train_epoch(
         normalize=True,
         log1p=True,
         seed=seed,
+        max_memory_mb=_scx_memory_budget_mb(),
     )
 
     # Warmup epoch
@@ -891,6 +923,7 @@ def _run_gpu_train_epoch(
             normalize=True,
             log1p=True,
             seed=seed + 1,
+            max_memory_mb=_scx_memory_budget_mb(),
         )
         t0 = time.perf_counter()
         for batch in ds:
