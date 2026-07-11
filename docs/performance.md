@@ -677,6 +677,7 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
 | smartseq2 | **18.1** | 8.2 | 0.6 |
 | tabula_sapiens_100k | **36.0** | 2.7 | 0.5 |
 | census_500k | **48.1** | 13.0 | — |
+| census_1m | **58.9** | 12.7 | — |
 
 **`hvg_norm` scenario** (HVG-2000 + normalize + log1p):
 
@@ -687,6 +688,7 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
 | smartseq2 | **23.0** | 7.5 | 0.6 |
 | tabula_sapiens_100k | **40.9** | 12.7 | 0.5 |
 | census_500k | **57.3** | 11.7 | — |
+| census_1m | **65.6** | 11.3 | — |
 
 **On-disk fixture size (MB, lower is better):**
 
@@ -711,18 +713,16 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
   but not closing the gap to cellstream/shardad's aggressive zstd+dictionary codec.
   Storage-bound archival should prefer `auto_v2`/`compact-trial`.
 
-*Methodology: `benchmarks/comprehensive` ml_loader, 2026-07-10 capture, scx
-`TrainingDataset` streaming pipeline vs per-batch competitor gather. `census_1m` scx
-`auto` batches/sec is excluded because the loader's **memory-budget auto-tune** collapses
-`batch_size` to its 64 minimum for 1M×61,497 full-width at the default 4096 MB budget
-(estimated ~4.6 GB > budget). This is a budget/estimator interaction, **not** a fixture
-bug — the geometry is a standard 62×16k-shard layout and with `max_memory_mb=32000` it
-batches at 1024 normally. The larger-on-disk Scx1 `auto` file estimates ~0.5 GB more than
-the smaller `auto_v2`, so `auto` tips over the 4096 threshold while `auto_v2` (and
-census_500k) stay at 1024 — making census_1m `auto` batches/sec incomparable. **cells/sec
-is the fair, batch-size-invariant metric and is consistent** (~50–66k, matching
-census_500k), showing auto ≈ auto_v2. Competitor batches/sec at census_1m use 1024-cell
-batches and are unaffected.*
+*Methodology: `benchmarks/comprehensive` ml_loader (competitor formats) + a direct
+`_run_scx_epoch` measurement for scx (warmup + timed epoch, batch_size=1024, HVG=2000),
+2026-07-10/11. All rows use 1024-cell batches. `census_1m` scx required scaling the loader
+`memory_budget` to the SLURM allocation (`_scx_memory_budget_mb`, 0.6×`--mem`) — the default
+4096 MB is too small for 1M×61,497 full width and the auto-tune otherwise collapses
+`batch_size` to 64. This is a budget/estimator interaction, not a fixture bug (standard
+62×16k-shard geometry). Competitor census_1m numbers use 1024-cell batches. The full
+ml_loader benchmark can't emit census scx rows directly — its `pyscx_training_dataset_workers2`
+scenario times out at census scale — so scx census rows come from the direct raw/hvg_norm
+epoch measurement (which the benchmark's own `_run_scx_epoch` powers).*
 
 ### scx auto_v2 vs cellstream — the storage-optimized head-to-head
 
@@ -747,8 +747,8 @@ Both target smaller-on-disk random-access training. batch_size=1024; 2026-07-10/
 | pbmc10k | 24.4 | 11.7 | 37.2 | 11.3 | **auto_v2 2–3×** |
 | smartseq2 | 18.8 | 8.2 | 23.3 | 7.5 | **auto_v2 2–3×** |
 | tabula_100k | 29.8 | 2.7 | 39.5 | 12.7 | **auto_v2 3–11×** |
-| census_500k | 51.7 | 13.0 | 54.8 | 11.7 | **auto_v2 4–5×** |
-| census_1m | 55.9 | 12.7 | 62.7 | 11.3 | **auto_v2 4–6×** |
+| census_500k | 52.5 | 13.0 | 58.3 | 11.7 | **auto_v2 4–5×** |
+| census_1m | 57.3 | 12.7 | 63.6 | 11.3 | **auto_v2 4.5–5.6×** |
 
 **Tradeoff.** `auto_v2` delivers **2–11× cellstream's training throughput at every
 scale**; the two are **comparable on compression through tabula**, and cellstream pulls
