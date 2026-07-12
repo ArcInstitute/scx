@@ -677,7 +677,7 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
 | smartseq2 | **18.1** | 8.2 | 0.6 |
 | tabula_sapiens_100k | **36.0** | 2.7 | 0.5 |
 | census_500k | **48.1** | 13.0 | — |
-| census_1m | **58.9** | 12.7 | — |
+| census_1m | **57.2** | 12.7 | — |
 
 **`hvg_norm` scenario** (HVG-2000 + normalize + log1p):
 
@@ -688,7 +688,7 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
 | smartseq2 | **23.0** | 7.5 | 0.6 |
 | tabula_sapiens_100k | **40.9** | 12.7 | 0.5 |
 | census_500k | **57.3** | 11.7 | — |
-| census_1m | **65.6** | 11.3 | — |
+| census_1m | **64.1** | 11.3 | — |
 
 **On-disk fixture size (MB, lower is better):**
 
@@ -704,7 +704,8 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
 - **Throughput: scx is the fastest training loader at every scale** — ~2.4× cellstream
   and ~10× shardad on pbmc10k random gather, widening to ~13× cellstream on tabula.
   cellstream clearly beats shardad (shardad's per-call subset read collapses to
-  ~0.5 batches/sec at ≥50k cells; it did not complete the census fixtures).
+  ~0.5 batches/sec at ≥50k cells; its census fixtures exist but the loader runs
+  did not complete).
 - **Storage: the compute default trades disk for speed.** scx `auto` (Scx1) is chosen
   for decode speed and is the largest on disk (~2.3× cellstream at census scale);
   the opt-in `auto_v2` (ShufDeltaZstd) recovers ~30% of that (census_1m 3989→2800 MB)
@@ -713,16 +714,15 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
   but not closing the gap to cellstream/shardad's aggressive zstd+dictionary codec.
   Storage-bound archival should prefer `auto_v2`/`compact-trial`.
 
-*Methodology: `benchmarks/comprehensive` ml_loader (competitor formats) + a direct
-`_run_scx_epoch` measurement for scx (warmup + timed epoch, batch_size=1024, HVG=2000),
-2026-07-10/11. All rows use 1024-cell batches. `census_1m` scx required scaling the loader
-`memory_budget` to the SLURM allocation (`_scx_memory_budget_mb`, 0.6×`--mem`) — the default
-4096 MB is too small for 1M×61,497 full width and the auto-tune otherwise collapses
-`batch_size` to 64. This is a budget/estimator interaction, not a fixture bug (standard
-62×16k-shard geometry). Competitor census_1m numbers use 1024-cell batches. The full
-ml_loader benchmark can't emit census scx rows directly — its `pyscx_training_dataset_workers2`
-scenario times out at census scale — so scx census rows come from the direct raw/hvg_norm
-epoch measurement (which the benchmark's own `_run_scx_epoch` powers).*
+*Methodology: all rows from the `benchmarks/comprehensive` ml_loader capture
+(median-of-N, batch_size=1024, HVG=2000), 2026-07-10/11, consistent with the promoted
+`v0.11.0-cellstream-recapture` baseline. Emitting census scx rows required two harness
+fixes: scaling the loader `memory_budget` to the SLURM allocation (`_scx_memory_budget_mb`,
+0.6×`--mem`) so `batch_size` stays at 1024 — the default 4096 MB is too small for 1M×61,497
+full width and the auto-tune otherwise collapses `batch_size` to 64 (a budget/estimator
+interaction, not a fixture bug: standard 62×16k-shard geometry) — and skipping the
+`pyscx_training_dataset_workers2` scenarios above 250k cells, which time out at census scale
+and would otherwise discard the whole (dataset, format) result.*
 
 ### scx auto_v2 vs cellstream — the storage-optimized head-to-head
 
@@ -760,7 +760,10 @@ edges it on atlas-scale footprint, at a 4–6× throughput cost.
 *Methodology: cellstream from the `benchmarks/comprehensive` ml_loader capture; auto_v2
 throughput from a direct `_run_scx_epoch` measurement (warmup + timed epoch) that
 bypasses the `pyscx_training_dataset_workers2` scenario (which times out at scale in the
-full harness). Both use batch_size=1024, HVG=2000.*
+full harness). Both use batch_size=1024, HVG=2000. The single-epoch direct auto_v2 figures
+run a few percent above the harness median-of-N (e.g. pbmc10k 24.4/37.2 here vs the baseline
+harness row 22.2/34.3); the at-scale auto_v2 harness capture is deferred, so these are the
+best available auto_v2 numbers at census scale.*
 
 ### ShufDeltaZstd loader-decode cost (Phase-D D0 profiling)
 

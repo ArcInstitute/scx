@@ -146,7 +146,20 @@ in ``run()`` still catches direct invocation."""
 # scenarios that finished. Skipping keeps census scx rows capturable. tabula
 # (100k) completes workers2 comfortably; census_500k (500k) does not, so the
 # default threshold sits between them. Env-tunable via SCX_BENCH_WORKERS2_MAX_OBS.
-_WORKERS2_MAX_OBS: int = int(os.environ.get("SCX_BENCH_WORKERS2_MAX_OBS", "250000"))
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var, falling back to ``default`` on unset/malformed
+    input (e.g. a float string like ``250000.0``) instead of raising at
+    import time and taking the whole benchmark module down."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+_WORKERS2_MAX_OBS: int = _env_int("SCX_BENCH_WORKERS2_MAX_OBS", 250000)
 
 
 def _scx_memory_budget_mb() -> int | None:

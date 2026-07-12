@@ -127,10 +127,18 @@ class CellStreamRunner(FormatRunner):
         self._require_cellstream()
 
         def _read() -> None:
+            import cellstream
+
             store = cellstream.open(str(path))
             try:
                 X = store.gather_rows(np.arange(store.n_obs))
-                _ = X.nnz + int(X.data.sum())
+                # gather_rows returns scipy CSR, but guard the dense case so a
+                # future / configured dense return doesn't AttributeError on
+                # `.nnz`/`.data` (mirrors read_subset below).
+                if sp.issparse(X):
+                    _ = X.nnz + int(X.data.sum())
+                else:
+                    _ = X.shape + (int(X.sum()),)
             finally:
                 store.close()
 
@@ -156,6 +164,8 @@ class CellStreamRunner(FormatRunner):
             mechanism = "cellstream_row_gather+slice_genes"
 
         def _read_subset() -> None:
+            import cellstream
+
             store = cellstream.open(str(path))
             try:
                 rows = (
