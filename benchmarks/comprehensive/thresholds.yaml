@@ -798,15 +798,21 @@ absolute_floors:
     min: 0.90
 
   # --- ml_loader throughput floors -----------------------------------
-  # Floors at 0.5x observed baseline median (0.6x on pbmc3k
-  # since N_RUNS_SMALL=5 gives a tighter median than N_RUNS_LARGE=3).
+  # SCX own-throughput floors: min = 0.85 × the min-observed run for
+  # that scenario (~15% noise headroom). Competitor floors (shardad,
+  # cellstream, tiledb_soma, h5ad_*): min = 0.5 × median.
   # Per-scenario keys (batches_per_sec__<scenario>) are emitted only
   # on that scenario's runs, so the gate's median is over scenario-
   # coherent runs (not aliased across raw/hvg/norm/hvg_norm).
   #
-  # Headline claim ("82x vs TileDB-SOMA-ML, ~340x vs SLAFDataLoader,
-  # 1,405 batches/sec on 1M cells") is in docs/performance.md; these
-  # floors protect that claim at the small / medium tier.
+  # Recalibrated 2026-07-12 from the v0.11.0-cellstream-recapture
+  # Chimera capture (results/baseline_2026_07_10). The prior scx_auto
+  # tabula floors (66/66/63) and workers2 floors (647/681) predated the
+  # SLURM-scaled memory-budget + workers2-skip harness fixes and were
+  # set under an older batch-counting methodology (Lambda synthetic,
+  # ~1300 bps scale) — not comparable to the current Chimera numbers.
+  # Headline claim ("82x vs TileDB-SOMA-ML, ~340x vs SLAFDataLoader")
+  # is in docs/performance.md; these floors protect it at each tier.
   #
   # GPU utilization (avg_gpu_util_pct__gpu_train) is intentionally
   # NOT gated yet — `nvidia-smi dmon` polls at 1 Hz but pbmc3k epochs
@@ -817,32 +823,64 @@ absolute_floors:
     format: scx_auto
     dataset: pbmc3k
     metric: batches_per_sec__raw
-    min: 38.6
+    min: 29.0
   - benchmark: ml_loader
     format: scx_auto
     dataset: pbmc3k
     metric: batches_per_sec__hvg_norm
-    min: 11.7
+    min: 40.0
   - benchmark: ml_loader
     format: scx_auto
     dataset: pbmc3k
     metric: batches_per_sec__gpu_train
-    min: 12.1
+    min: 41.0
   - benchmark: ml_loader
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__raw
-    min: 66.3
+    min: 29.0
   - benchmark: ml_loader
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__hvg_norm
-    min: 66.0
+    min: 33.0
   - benchmark: ml_loader
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__gpu_train
-    min: 63.3
+    min: 32.0
+  # scx_auto census (500k / 1m) — new coverage, capturable after the
+  # workers2-skip + SLURM-scaled memory-budget fixes. 0.85× min run.
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: census_500k
+    metric: batches_per_sec__raw
+    min: 40.0
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: census_500k
+    metric: batches_per_sec__hvg_norm
+    min: 47.0
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: census_500k
+    metric: batches_per_sec__gpu_train
+    min: 51.0
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: census_1m
+    metric: batches_per_sec__raw
+    min: 48.0
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: census_1m
+    metric: batches_per_sec__hvg_norm
+    min: 54.0
+  - benchmark: ml_loader
+    format: scx_auto
+    dataset: census_1m
+    metric: batches_per_sec__gpu_train
+    min: 56.0
 
   # ─── Phase C auto_v2 training-throughput (no regression vs auto) ──────
   # Absolute floors on auto_v2's OWN batches/sec — catch a throughput
@@ -886,38 +924,130 @@ absolute_floors:
     metric: batches_per_sec__hvg_norm
     min: 10.0
   # shardad row-slice loader (no native DataLoader; random-access read).
-  # Seeded at 0.0 — re-baseline to 0.5x the measured median with
-  # `promote_baseline.py` + a justification once numbers land.
+  # Competitor floors at 0.5× median from the 2026-07-12 Chimera
+  # capture. shardad collapses to ~0.5 b/s ≥50k cells (no census run).
+  - benchmark: ml_loader
+    format: shardad
+    dataset: pbmc3k
+    metric: batches_per_sec__raw
+    min: 4.0
+  - benchmark: ml_loader
+    format: shardad
+    dataset: pbmc3k
+    metric: batches_per_sec__hvg_norm
+    min: 4.0
+  - benchmark: ml_loader
+    format: shardad
+    dataset: pbmc10k
+    metric: batches_per_sec__raw
+    min: 1.3
+  - benchmark: ml_loader
+    format: shardad
+    dataset: pbmc10k
+    metric: batches_per_sec__hvg_norm
+    min: 1.3
+  - benchmark: ml_loader
+    format: shardad
+    dataset: smartseq2
+    metric: batches_per_sec__raw
+    min: 0.3
+  - benchmark: ml_loader
+    format: shardad
+    dataset: smartseq2
+    metric: batches_per_sec__hvg_norm
+    min: 0.3
   - benchmark: ml_loader
     format: shardad
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__raw
-    min: 0.0
+    min: 0.25
   - benchmark: ml_loader
     format: shardad
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__hvg_norm
-    min: 0.0
+    min: 0.25
+  # cellstream scatter-immune gather store (no native DataLoader) — new
+  # competitor. Floors at 0.5× median from the 2026-07-12 Chimera
+  # capture; catches a harness/env break that tanks the gather path.
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: pbmc3k
+    metric: batches_per_sec__raw
+    min: 7.3
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: pbmc3k
+    metric: batches_per_sec__hvg_norm
+    min: 6.2
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: pbmc10k
+    metric: batches_per_sec__raw
+    min: 5.8
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: pbmc10k
+    metric: batches_per_sec__hvg_norm
+    min: 5.6
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: smartseq2
+    metric: batches_per_sec__raw
+    min: 4.1
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: smartseq2
+    metric: batches_per_sec__hvg_norm
+    min: 3.7
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__raw
+    min: 1.3
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__hvg_norm
+    min: 6.3
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: census_500k
+    metric: batches_per_sec__raw
+    min: 6.5
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: census_500k
+    metric: batches_per_sec__hvg_norm
+    min: 5.8
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: census_1m
+    metric: batches_per_sec__raw
+    min: 6.3
+  - benchmark: ml_loader
+    format: cellstream
+    dataset: census_1m
+    metric: batches_per_sec__hvg_norm
+    min: 5.6
 
-  # `num_workers > 0` floors. Activated after the fork-safety fix —
-  # pre-fix this path deadlocked, so no historical baseline exists.
-  # Floors are seeded conservatively at 0.0 (any non-zero throughput is
-  # an improvement over an infinite hang) and will be re-baselined to
-  # 0.5× the post-fix median by a future
-  # `promote_baseline.py --version v0.X.Y-fork-safety`. Once that
-  # baseline lands, replace `min: 0.0` with the calibrated floors and
-  # write a justification under
-  # `benchmarks/comprehensive/results/justifications/`.
+  # `num_workers > 0` (workers2) floors. Recalibrated 2026-07-12 to the
+  # Chimera capture at 0.85× min-observed run. tabula_sapiens_100k still
+  # runs workers2 (< the 250k workers2-skip threshold); census is
+  # skipped, so no census workers2 floor. The prior 647.2/680.8 seeds
+  # came from a 2026-05-01 Lambda synthetic run (~1300 bps) at an
+  # incomparable batches/sec scale — replaced here, and the phase5
+  # whole-cell justification that masked the stale tabula floors is
+  # retired alongside this.
   - benchmark: ml_loader
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__pyscx_training_dataset_workers2
-    min: 647.2
+    min: 23.0
   - benchmark: ml_loader
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__pyscx_training_dataset_workers2_persistent
-    min: 680.8
+    min: 11.0
 
   # IndexPlanDataset workers2 floor — same 0.5×-of-post-fix-median
   # convention as the workers2 entries above.
