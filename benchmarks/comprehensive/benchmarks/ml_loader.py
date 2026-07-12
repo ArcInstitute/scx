@@ -105,6 +105,14 @@ try:
 except ImportError:
     pass
 
+_HAS_CELLSTREAM = False
+try:
+    import cellstream  # noqa: F401
+
+    _HAS_CELLSTREAM = True
+except ImportError:
+    pass
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -120,13 +128,66 @@ _SCX_KEYS = {
 }
 
 SUPPORTED_FORMATS: frozenset[str] = frozenset(
-    _SCX_KEYS | {"h5ad_none", "h5ad_gzip", "tiledb_soma", "slaf", "shardad"}
+    _SCX_KEYS | {"h5ad_none", "h5ad_gzip", "tiledb_soma", "slaf", "shardad", "cellstream"}
 )
 """Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
 incompatible (bench, format) cells never get submitted. Derived from
 ``_resolve_loader`` (the canonical static dict) — any change here must
 match the keys that ``_resolve_loader`` recognises. The runtime guard
 in ``run()`` still catches direct invocation."""
+
+
+# Above this cell count the `num_workers>0` DataLoader scenarios
+# (`pyscx_training_dataset_workers2[_persistent]`) are skipped: at census scale
+# (≥500k cells) they reliably exceed the SLURM time limit (num_workers=2 spawn
+# each rebuild the dataset over the full epoch), and because the benchmark only
+# writes its result JSON after *all* scenarios complete, a workers2 time-out
+# discards the whole (dataset, format) result — including the raw/hvg_norm/gpu_train
+# scenarios that finished. Skipping keeps census scx rows capturable. tabula
+# (100k) completes workers2 comfortably; census_500k (500k) does not, so the
+# default threshold sits between them. Env-tunable via SCX_BENCH_WORKERS2_MAX_OBS.
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var, falling back to ``default`` on unset/malformed
+    input (e.g. a float string like ``250000.0``) instead of raising at
+    import time and taking the whole benchmark module down."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+_WORKERS2_MAX_OBS: int = _env_int("SCX_BENCH_WORKERS2_MAX_OBS", 250000)
+
+
+def _scx_memory_budget_mb() -> int | None:
+    """Loader `max_memory_mb` scaled to the SLURM allocation.
+
+    The default (4096 MB) is too small for atlas-scale full-width datasets
+    (1M × 61,497): the loader's memory-budget auto-tune then collapses
+    ``batch_size`` to its 64 minimum, which both makes batches/sec
+    incomparable across codecs (a larger-on-disk codec tips over the
+    threshold first) and inflates the epoch to ~16× more tiny batches
+    (a cause of the census `workers2` time-outs). Use most of whatever
+    ``--mem`` the SLURM job got so ``batch_size`` stays at 1024. Returns
+    ``None`` off-SLURM so local/CI runs keep the built-in default.
+    """
+    per_node = os.environ.get("SLURM_MEM_PER_NODE")
+    if per_node:
+        try:
+            return max(4096, int(int(per_node) * 0.6))
+        except ValueError:
+            pass
+    per_cpu = os.environ.get("SLURM_MEM_PER_CPU")
+    n_cpu = os.environ.get("SLURM_CPUS_ON_NODE")
+    if per_cpu and n_cpu:
+        try:
+            return max(4096, int(int(per_cpu) * int(n_cpu) * 0.6))
+        except ValueError:
+            pass
+    return None
 
 _SCENARIOS: list[tuple[str, bool, bool]] = [
     # (name, hvg, normalize)
@@ -211,6 +272,8 @@ def _resolve_loader(format_key: str) -> str | None:
         return "slaf"
     if format_key == "shardad":
         return "shardad"
+    if format_key == "cellstream":
+        return "cellstream"
     return None
 
 
@@ -233,6 +296,8 @@ def _loader_available(loader_type: str) -> bool:
         return _HAS_SLAF and _HAS_TORCH
     if loader_type == "shardad":
         return _HAS_SHARDAD
+    if loader_type == "cellstream":
+        return _HAS_CELLSTREAM
     return False
 
 
@@ -254,6 +319,7 @@ def _run_scx_epoch(
         normalize=normalize,
         log1p=normalize,
         seed=seed,
+        max_memory_mb=_scx_memory_budget_mb(),
     )
     n_batches = 0
     n_cells = 0
@@ -321,6 +387,7 @@ if _HAS_TORCH:
                 normalize=self.normalize,
                 log1p=self.normalize,
                 seed=self.seed,
+                max_memory_mb=_scx_memory_budget_mb(),
             )
             try:
                 for i, batch in enumerate(ds):
@@ -581,6 +648,59 @@ def _ttfb_shardad(shad_path: str, batch_size: int, seed: int = RANDOM_SEED) -> N
     _ = arch[idx].to_anndata(container="csr", n_workers=1).X
 
 
+def _run_cellstream_epoch(
+    cellstream_path: str, batch_size: int, hvg: bool, normalize: bool, seed: int
+) -> _EpochResult:
+    """Shuffled row-gather loader on a cellstream store.
+
+    cellstream is a random-access gather store with no built-in DataLoader, so the
+    honest "loader you'd build on it" mirrors the shardad path: permute cell ids,
+    slice into batches, gather each batch via ``store.gather_rows`` and apply the
+    same HVG / normalize as the other loaders.
+    """
+    import cellstream
+
+    store = cellstream.open(cellstream_path)
+    try:
+        n_obs = int(store.n_obs)
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(n_obs)
+
+        n_batches = 0
+        n_cells = 0
+        for start in range(0, n_obs, batch_size):
+            # sort within-batch ids for read locality (batch membership unchanged).
+            idx = np.sort(perm[start : start + batch_size])
+            X = store.gather_rows(idx)
+            if hasattr(X, "toarray"):
+                X = X.toarray()
+            X = np.asarray(X, dtype=np.float32)
+            if hvg and X.shape[1] > QUERY_N_HVGS:
+                X = X[:, :QUERY_N_HVGS]
+            if normalize:
+                row_sums = X.sum(axis=1, keepdims=True)
+                row_sums[row_sums == 0] = 1.0
+                X = np.log1p(X / row_sums * 1e4)
+            n_batches += 1
+            n_cells += X.shape[0]
+        return _EpochResult(n_batches=n_batches, n_cells=n_cells)
+    finally:
+        store.close()
+
+
+def _ttfb_cellstream(cellstream_path: str, batch_size: int, seed: int = RANDOM_SEED) -> None:
+    import cellstream
+
+    store = cellstream.open(cellstream_path)
+    try:
+        n_obs = int(store.n_obs)
+        rng = np.random.default_rng(seed)
+        idx = np.sort(rng.permutation(n_obs)[:batch_size])
+        _ = store.gather_rows(idx)
+    finally:
+        store.close()
+
+
 def _run_scdataloader_epoch(
     h5ad_path: str, batch_size: int, hvg: bool, normalize: bool
 ) -> _EpochResult:
@@ -635,6 +755,7 @@ def _ttfb_scx(path: str, batch_size: int, hvg: bool, normalize: bool, seed: int)
         normalize=normalize,
         log1p=normalize,
         seed=seed,
+        max_memory_mb=_scx_memory_budget_mb(),
     )
     for _ in ds:
         break
@@ -795,6 +916,7 @@ def _run_gpu_train_epoch(
         normalize=True,
         log1p=True,
         seed=seed,
+        max_memory_mb=_scx_memory_budget_mb(),
     )
 
     # Warmup epoch
@@ -826,6 +948,7 @@ def _run_gpu_train_epoch(
             normalize=True,
             log1p=True,
             seed=seed + 1,
+            max_memory_mb=_scx_memory_budget_mb(),
         )
         t0 = time.perf_counter()
         for batch in ds:
@@ -1009,6 +1132,22 @@ def run(
                 runner = make_runner(format_variant)
                 runner.convert_from_h5ad(h5ad_path, out)
                 data_path = str(out)
+    elif loader_type == "cellstream":
+        if converted_path is not None and Path(converted_path).exists():
+            data_path = str(converted_path)
+        else:
+            persistent = dataset.cellstream_path
+            if persistent.exists():
+                data_path = str(persistent)
+            else:
+                _cleanup = tempfile.TemporaryDirectory(
+                    prefix=f"scx_bench_cellstream_{dataset.name}_"
+                )
+                out = Path(_cleanup.name) / f"{dataset.name}.cellstream"
+                logger.info("Converting %s -> %s", h5ad_path.name, out)
+                runner = make_runner(format_variant)
+                runner.convert_from_h5ad(h5ad_path, out)
+                data_path = str(out)
     else:
         return None
 
@@ -1074,6 +1213,11 @@ def run(
                     data_path, ML_BATCH_SIZE, hvg, normalize, RANDOM_SEED
                 )
                 ttfb_fn = lambda: _ttfb_shardad(data_path, ML_BATCH_SIZE)
+            elif loader_type == "cellstream":
+                epoch_fn = lambda hvg=hvg, normalize=normalize: _run_cellstream_epoch(
+                    data_path, ML_BATCH_SIZE, hvg, normalize, RANDOM_SEED
+                )
+                ttfb_fn = lambda: _ttfb_cellstream(data_path, ML_BATCH_SIZE)
             else:
                 continue
 
@@ -1244,7 +1388,23 @@ def run(
         # ---------------------------------------------------------------
         # `num_workers > 0` DataLoader scenarios (SCX-only)
         # ---------------------------------------------------------------
-        if loader_type == "scx" and _HAS_TORCH:
+        if loader_type == "scx" and _HAS_TORCH and dataset.n_obs > _WORKERS2_MAX_OBS:
+            logger.info(
+                "Skipping num_workers>0 scenarios for %s (n_obs=%d > %d): they time "
+                "out at this scale and would discard the whole result. Set "
+                "SCX_BENCH_WORKERS2_MAX_OBS to override.",
+                dataset.name,
+                dataset.n_obs,
+                _WORKERS2_MAX_OBS,
+            )
+            for scenario_name in (
+                "pyscx_training_dataset_workers2",
+                "pyscx_training_dataset_workers2_persistent",
+            ):
+                scenario_summary[scenario_name] = {
+                    "skipped": f"n_obs {dataset.n_obs} > {_WORKERS2_MAX_OBS}"
+                }
+        elif loader_type == "scx" and _HAS_TORCH:
             for scenario_name, persistent_workers, n_epochs_per_run in (
                 ("pyscx_training_dataset_workers2", False, 1),
                 ("pyscx_training_dataset_workers2_persistent", True, 2),

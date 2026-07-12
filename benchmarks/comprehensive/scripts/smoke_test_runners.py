@@ -196,6 +196,15 @@ def main() -> None:
     except ImportError as exc:
         print(f"SKIP Shardad runner: {exc}")
 
+    # CellStream
+    try:
+        from benchmarks.comprehensive.runners.cellstream_runner import CellStreamRunner
+        runner = CellStreamRunner()
+        runner._require_cellstream()  # skip cleanly if cellstream isn't installed
+        runners.append(runner)
+    except ImportError as exc:
+        print(f"SKIP CellStream runner: {exc}")
+
     print(f"\nRunning smoke tests on {h5ad_path} ({len(runners)} runners)\n")
 
     passed = 0
