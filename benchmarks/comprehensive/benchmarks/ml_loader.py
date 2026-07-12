@@ -137,6 +137,18 @@ match the keys that ``_resolve_loader`` recognises. The runtime guard
 in ``run()`` still catches direct invocation."""
 
 
+# Above this cell count the `num_workers>0` DataLoader scenarios
+# (`pyscx_training_dataset_workers2[_persistent]`) are skipped: at census scale
+# (≥500k cells) they reliably exceed the SLURM time limit (num_workers=2 spawn
+# each rebuild the dataset over the full epoch), and because the benchmark only
+# writes its result JSON after *all* scenarios complete, a workers2 time-out
+# discards the whole (dataset, format) result — including the raw/hvg_norm/gpu_train
+# scenarios that finished. Skipping keeps census scx rows capturable. tabula
+# (100k) completes workers2 comfortably; census_500k (500k) does not, so the
+# default threshold sits between them. Env-tunable via SCX_BENCH_WORKERS2_MAX_OBS.
+_WORKERS2_MAX_OBS: int = int(os.environ.get("SCX_BENCH_WORKERS2_MAX_OBS", "250000"))
+
+
 def _scx_memory_budget_mb() -> int | None:
     """Loader `max_memory_mb` scaled to the SLURM allocation.
 
@@ -1363,7 +1375,23 @@ def run(
         # ---------------------------------------------------------------
         # `num_workers > 0` DataLoader scenarios (SCX-only)
         # ---------------------------------------------------------------
-        if loader_type == "scx" and _HAS_TORCH:
+        if loader_type == "scx" and _HAS_TORCH and dataset.n_obs > _WORKERS2_MAX_OBS:
+            logger.info(
+                "Skipping num_workers>0 scenarios for %s (n_obs=%d > %d): they time "
+                "out at this scale and would discard the whole result. Set "
+                "SCX_BENCH_WORKERS2_MAX_OBS to override.",
+                dataset.name,
+                dataset.n_obs,
+                _WORKERS2_MAX_OBS,
+            )
+            for scenario_name in (
+                "pyscx_training_dataset_workers2",
+                "pyscx_training_dataset_workers2_persistent",
+            ):
+                scenario_summary[scenario_name] = {
+                    "skipped": f"n_obs {dataset.n_obs} > {_WORKERS2_MAX_OBS}"
+                }
+        elif loader_type == "scx" and _HAS_TORCH:
             for scenario_name, persistent_workers, n_epochs_per_run in (
                 ("pyscx_training_dataset_workers2", False, 1),
                 ("pyscx_training_dataset_workers2_persistent", True, 2),
