@@ -239,26 +239,35 @@ pyscx.from_anndata(adata, "data.scx",
 
 ### Codec and shard tuning
 
-The `auto` codec routes integer data to Scx1 or Zstd (by median) and float data
-to Pcodec. For the full codec spec and auto-selection heuristic, see
-[docs/codec.md § 8. Automatic Codec Selection](codec.md#8-automatic-codec-selection).
+`codec=` is a three-profile **intent axis**: `auto` (default, cost-aware adaptive
+— adopts the compact ShufDeltaZstd per integer shard where it wins by a margin,
+else the Scx1/Zstd heuristic; float → Pcodec), `fast` (decode-speed-max heuristic
+— the pre-flip default), and `compact` (size-max). For the full spec see
+[docs/codec.md § The codec intent axis](codec.md#the-codec-intent-axis-auto--fast--compact).
 For shard sizing guidelines, see
 [docs/sharding.md § Shard sizing guidelines](sharding.md#shard-sizing-guidelines).
+
+> **Default change (2026-07-12).** The default `codec="auto"` now writes
+> **size-optimizing adaptive** output (predominantly ShufDeltaZstd, 1.3–2× smaller
+> on integer counts) instead of the old decode-max Scx1. Round-trip fidelity is
+> unchanged. If you need the old decode-max behavior for latency-critical CPU
+> training, pass `codec="fast"`. The former `codec="auto_v2"` + `decode_target`
+> were removed (pre-1.0 clean break) — use `auto` (or `compact` for max size).
 
 **CLI** (`--codec`, `--shard-size`)**:**
 
 ```bash
-scx convert data.h5ad data.scx --codec auto     # recommended (default)
-scx convert data.h5ad data.scx --codec scx1     # force integer codec
-scx convert data.h5ad data.scx --codec zstd     # force Zstandard
+scx convert data.h5ad data.scx --codec auto      # recommended (default, adaptive/size)
+scx convert data.h5ad data.scx --codec fast      # decode-speed-max (old default)
+scx convert data.h5ad data.scx --codec compact   # size-max
 scx convert data.h5ad data.scx --shard-size 8192 # smaller shards (default: 16384)
 ```
 
 **Python** (`codec=`, `shard_size=`)**:**
 
 ```python
-pyscx.from_h5ad("data.h5ad", "data.scx", codec="scx1", shard_size=8192)
-pyscx.from_anndata(adata, "data.scx", codec="zstd", shard_size=32768)
+pyscx.from_h5ad("data.h5ad", "data.scx", codec="fast", shard_size=8192)
+pyscx.from_anndata(adata, "data.scx", codec="compact", shard_size=32768)
 ```
 
 ### Memory and parallelism

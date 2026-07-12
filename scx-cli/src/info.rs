@@ -36,6 +36,10 @@ struct InfoModel {
     distinct_codec_ids: Vec<u8>,
     /// Distinct value-encoding bytes across all CSR shards, sorted ascending.
     distinct_value_encodings: Vec<u8>,
+    /// Per-`codec_id` CSR shard counts (sorted by codec id). Surfaces what an
+    /// adaptive `codec="auto"` write realized per shard. Empty when there are
+    /// no shards, or on the cloud path (which reports only the distinct set).
+    codec_histogram: Vec<(u8, u64)>,
     file_size: u64,
     /// Orphaned (non-live) bytes, or `None` when the concept doesn't apply
     /// (an exploded `.scxd/` directory has no single file and no orphans).
@@ -126,14 +130,15 @@ fn collect_local(reader: &ScxReader, path: &Path, history: bool) -> CliResult<In
     // Scx1/Zstd; a subset can mix uint16/uint32), so summarize across ALL CSR
     // shards rather than trusting the file-level header default.
     let csr_shards = catalog.shards(SectionType::CsrShard);
-    let (distinct_codec_ids, distinct_value_encodings) = if csr_shards.is_empty() {
-        (Vec::new(), Vec::new())
+    let (distinct_codec_ids, distinct_value_encodings, codec_histogram) = if csr_shards.is_empty() {
+        (Vec::new(), Vec::new(), Vec::new())
     } else {
         (
             crate::shard_utils::distinct_sorted_shard_field(reader, &csr_shards, |h| h.codec_id)?,
             crate::shard_utils::distinct_sorted_shard_field(reader, &csr_shards, |h| {
                 h.value_encoding
             })?,
+            crate::shard_utils::codec_id_histogram(reader, &csr_shards)?,
         )
     };
 
@@ -154,6 +159,7 @@ fn collect_local(reader: &ScxReader, path: &Path, history: bool) -> CliResult<In
         catalog,
         distinct_codec_ids,
         distinct_value_encodings,
+        codec_histogram,
         file_size,
         orphaned,
         history,
@@ -189,6 +195,9 @@ async fn collect_cloud(reader: &scx_cloud::CloudReader) -> CliResult<InfoModel> 
         catalog,
         distinct_codec_ids,
         distinct_value_encodings,
+        // Cloud path reports only the distinct set today; per-shard counts
+        // would require an extra range-read pass over every shard header.
+        codec_histogram: Vec::new(),
         file_size,
         orphaned,
         history: None,
@@ -229,6 +238,19 @@ fn render_text(model: &InfoModel) -> CliResult<()> {
             "Shards: {} CSR | Codec: {} | Index dtype: {}",
             header.n_csr_shards, codec_name, index_dtype,
         );
+    }
+
+    // Per-shard codec breakdown when adaptive `auto` mixed codecs across shards
+    // (e.g. predominantly shufdelta with some scx1). A uniform file prints the
+    // single codec on the line above, so only elaborate when it's mixed.
+    if model.codec_histogram.len() > 1 {
+        let breakdown = model
+            .codec_histogram
+            .iter()
+            .map(|(id, n)| format!("{} {}", fmt_num(*n), codec_id_name(*id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Codec breakdown: {breakdown}");
     }
 
     let value_enc_name = format_distinct(&model.distinct_value_encodings, value_encoding_name);
@@ -461,6 +483,11 @@ fn render_json(model: &InfoModel) -> CliResult<()> {
         "has_csc": header.has_csc(),
         "codec": codec_name,
         "codec_default": codec_default,
+        "codec_breakdown": model
+            .codec_histogram
+            .iter()
+            .map(|(id, n)| (codec_id_name(*id).to_string(), serde_json::json!(*n)))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
         "index_dtype": if header.index_dtype == 0 { "u16" } else { "u32" },
         "shard_target_rows": header.shard_target_rows,
         "manifest_sequence": header.manifest_sequence,

@@ -4,51 +4,52 @@ use crate::modality::ModalityType;
 use scx_codec::floor_median_u32;
 use scx_codec::{CodecId, ValueEncoding};
 
-/// Codec selection profile for user-facing codec choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodecProfile {
-    /// Automatic selection (Scx1 for small UMI integers, Pcodec for floats, Zstd for larger integers).
-    Auto,
-    /// Optimizes for fast encode/decode: LZ4 with byte-shuffle.
-    Fast,
-    /// Optimizes for compression ratio: Zstd or Scx1 depending on data.
-    Compact,
-    /// Force the domain-specific Scx1 codec (integer only).
-    Scx1,
-}
-
-/// Downstream decode target for the workload-aware `auto_v2` codec profile.
+/// Internal mechanism backing the user-facing codec **intent axis**
+/// (`codec="auto" | "fast" | "compact"`).
 ///
 /// Biases the per-modality integer codec choice between the size/GPU-friendly
 /// `ShufDeltaZstd` and the CPU-conservative heuristic winner (`Scx1`/`Zstd`).
-/// Since Phase B brought ShufDeltaZstd CPU decode to ~parity with Scx1, this is
-/// a transitional knob: for integers `Auto` already behaves like `compact-trial`
-/// (adopt ShufDeltaZstd where it compresses at least as well). See [`pick_codec_v2`].
+/// Not user-settable: the writer entry points map the codec string to a variant
+/// (`"auto"` → [`DecodeTarget::Auto`], `"fast"` → [`DecodeTarget::Cpu`],
+/// `"compact"` → [`DecodeTarget::Storage`]). See [`pick_codec_v2`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecodeTarget {
-    /// Balanced default: adopt ShufDeltaZstd for integers when strictly smaller.
+    /// Balanced default (`codec="auto"`): adopt ShufDeltaZstd for integers only
+    /// when it is smaller by at least [`ADOPT_MARGIN`] (cost-aware — a marginal
+    /// size win never pays the ShufDeltaZstd CPU-decode tax).
     #[default]
     Auto,
-    /// Conservative: keep the heuristic winner (never ShufDeltaZstd).
+    /// Decode-speed-max (`codec="fast"`): keep the heuristic winner (never
+    /// ShufDeltaZstd).
     Cpu,
     /// GPU training: prefer ShufDeltaZstd (GPU-decodable) on size ties.
     Gpu,
-    /// Cloud/egress: prefer ShufDeltaZstd (smaller payload) on size ties.
+    /// Size-max (`codec="compact"`): prefer ShufDeltaZstd (smaller payload) on
+    /// size ties.
     Storage,
 }
 
-/// Pick the final integer codec for the `auto_v2` profile, given the heuristic
-/// winner and the measured framed sizes of the heuristic vs a ShufDeltaZstd
-/// trial-encode.
+/// Minimum fractional size win required before `codec="auto"` adopts
+/// ShufDeltaZstd over the heuristic winner. Offsets the ~6–9% ShufDeltaZstd
+/// CPU-decode tax so a marginal size gain doesn't erode decode speed by default;
+/// the large (1.3–2×) real wins clear it comfortably. `codec="compact"` ignores
+/// this (adopts on ties). Tunable.
+pub const ADOPT_MARGIN: f64 = 0.05;
+
+/// Pick the final integer codec for the adaptive profiles (`auto`/`compact`),
+/// given the heuristic winner and the measured framed sizes of the heuristic vs
+/// a ShufDeltaZstd trial-encode.
 ///
 /// `ShufDeltaZstd` only competes for **integer** data whose heuristic winner is
 /// not already ShufDeltaZstd (float always stays Pcodec, so this returns the
 /// heuristic unchanged there). Decision matrix:
 ///
-/// - `Cpu` → `heuristic` (conservative; keeps Scx1 for low-median counts).
-/// - `Auto` → ShufDeltaZstd iff `size_shufdelta < size_heuristic` (tie → heuristic;
-///   matches the `compact-trial` "keep the smaller" rule).
-/// - `Gpu` / `Storage` → ShufDeltaZstd iff `size_shufdelta <= size_heuristic`
+/// - `Cpu` (`fast`) → `heuristic` (conservative; keeps Scx1 for low-median counts).
+/// - `Auto` (`auto`) → ShufDeltaZstd iff it is smaller by at least [`ADOPT_MARGIN`]
+///   (`size_shufdelta < size_heuristic * (1 - ADOPT_MARGIN)`); a within-margin win
+///   or tie keeps the heuristic (cost-aware — don't pay the decode tax for a marginal
+///   size gain).
+/// - `Gpu` / `Storage` (`compact`) → ShufDeltaZstd iff `size_shufdelta <= size_heuristic`
 ///   (tie → ShufDeltaZstd: GPU-decodable / smaller egress).
 pub fn pick_codec_v2(
     heuristic: CodecId,
@@ -62,7 +63,11 @@ pub fn pick_codec_v2(
     }
     let adopt = match decode_target {
         DecodeTarget::Cpu => false,
-        DecodeTarget::Auto => size_shufdelta < size_heuristic,
+        // `size_heuristic == 0` (empty shard) → threshold is 0.0, `< 0.0` is
+        // false, so we keep the heuristic — no division/overflow hazard.
+        DecodeTarget::Auto => {
+            (size_shufdelta as f64) < (size_heuristic as f64) * (1.0 - ADOPT_MARGIN)
+        }
         DecodeTarget::Gpu | DecodeTarget::Storage => size_shufdelta <= size_heuristic,
     };
     if adopt {
@@ -72,27 +77,79 @@ pub fn pick_codec_v2(
     }
 }
 
-/// Select codec using a profile hint.
+/// A user-facing `codec=` string resolved into the encoder's knobs.
 ///
-/// - `Fast` → LZ4+shuffle for all data types.
-/// - `Compact` → Scx1 for small UMI integers, Pcodec for float, Zstd for larger integers.
-/// - `Scx1` → Force Scx1 (falls back to Pcodec for float encodings).
-/// - `Auto` → Same as `Compact` (backward-compatible default).
-pub fn select_codec_with_profile(
-    raw_values: &[u8],
-    value_encoding: ValueEncoding,
-    profile: CodecProfile,
-) -> CodecId {
-    match profile {
-        CodecProfile::Fast => CodecId::Lz4Shuffle,
-        CodecProfile::Scx1 => {
-            if value_encoding.is_integer() {
-                CodecId::Scx1
-            } else {
-                CodecId::Pcodec
+/// The single source of truth for the codec **intent axis** shared by every
+/// writer entry point (`scx convert`/`scx optimize`, `pyscx.from_anndata`/
+/// `from_h5ad`/`from_10x`). Collapses what used to be four near-identical
+/// string-match blocks. See [`resolve_codec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedCodec {
+    /// Explicit codec force. `None` = adaptive/heuristic (decided per shard by
+    /// the profile + [`pick_codec_v2`]).
+    pub explicit_codec: Option<CodecId>,
+    /// `compact-trial`: strict-`<` dual-encode (keep the smaller of
+    /// {heuristic, ShufDeltaZstd} per shard).
+    pub codec_trial: bool,
+    /// Adaptive dual-encode bias for `auto`/`compact`. `None` = single-encode
+    /// the heuristic (`fast`, or an explicit codec). Only takes effect on
+    /// row-group-framed writes.
+    pub decode_target: Option<DecodeTarget>,
+    /// Whether this profile requires row-group framing (`row_group_rows > 0`).
+    /// `auto` is deliberately `false`: it silently falls back to the heuristic
+    /// single-encode when unframed rather than erroring (it is the default).
+    pub requires_framing: bool,
+    /// Profile name for the provenance `codec_selection` stamp.
+    pub profile: &'static str,
+}
+
+/// Resolve a user-facing `codec=` string into [`ResolvedCodec`].
+///
+/// Intent axis: `auto` (default, cost-aware adaptive), `fast` (decode-max
+/// heuristic), `compact` (size-max, adopt on ties). `compact-trial` and the
+/// explicit codec forces (`none`/`scx1`/`zstd`/`lz4`/`pcodec`/`shufdelta`) are
+/// retained. `auto_v2` was removed (pre-1.0 clean break) and errors with a
+/// message naming its replacements.
+pub fn resolve_codec(codec: Option<&str>) -> Result<ResolvedCodec, String> {
+    let mk = |explicit_codec, codec_trial, decode_target, requires_framing, profile| {
+        Ok(ResolvedCodec {
+            explicit_codec,
+            codec_trial,
+            decode_target,
+            requires_framing,
+            profile,
+        })
+    };
+    match codec {
+        // Default: cost-aware adaptive. Framing not required — unframed writes
+        // fall back to the heuristic single-encode (see the encoder).
+        None | Some("auto") => mk(None, false, Some(DecodeTarget::Auto), false, "auto"),
+        // Decode-speed-max: heuristic single-encode (the old `auto`).
+        Some("fast") => mk(None, false, None, false, "fast"),
+        // Size-max: adopt ShufDeltaZstd on ties. Framed only.
+        Some("compact") => mk(None, false, Some(DecodeTarget::Storage), true, "compact"),
+        // Compact-trial: strict-`<` dual-encode. Framed only.
+        Some("compact-trial") => mk(None, true, None, true, "compact-trial"),
+        Some("auto_v2") => Err(
+            "codec='auto_v2' was removed. Use codec='auto' (cost-aware adaptive default, \
+             adopts ShufDeltaZstd where it wins by a margin) or codec='compact' \
+             (size-max, adopts on ties). The `decode_target` knob was removed with it."
+                .to_string(),
+        ),
+        // Explicit codec force.
+        other => match CodecId::parse_cli(other.unwrap_or("auto")) {
+            Ok(cid) => {
+                let requires_framing = cid == Some(CodecId::ShufDeltaZstd);
+                let profile = cid.map(|c| c.display_name()).unwrap_or("auto");
+                mk(cid, false, None, requires_framing, profile)
             }
-        }
-        CodecProfile::Auto | CodecProfile::Compact => select_codec(raw_values, value_encoding),
+            Err(_) => Err(format!(
+                "Unknown codec: '{}'. Use 'auto' (default, adaptive), 'fast' (decode-max), \
+                 'compact' (size-max), 'compact-trial', 'none', 'scx1', 'zstd', 'lz4', \
+                 'pcodec', or 'shufdelta'.",
+                other.unwrap_or("")
+            )),
+        },
     }
 }
 
@@ -211,12 +268,24 @@ mod tests {
     }
 
     #[test]
-    fn pick_v2_auto_adopts_when_strictly_smaller() {
+    fn pick_v2_auto_adopts_only_past_margin() {
+        // ADOPT_MARGIN = 0.05 → threshold for size_heuristic=100 is 95.0.
+        // Clears the margin (94 < 95) → adopt.
         assert_eq!(
-            pick_codec_v2(CodecId::Scx1, DecodeTarget::Auto, 100, 99, true),
+            pick_codec_v2(CodecId::Scx1, DecodeTarget::Auto, 100, 94, true),
             CodecId::ShufDeltaZstd
         );
-        // Tie → keep heuristic (compact-trial semantics).
+        // Exactly at the margin (95 is not < 95) → keep heuristic.
+        assert_eq!(
+            pick_codec_v2(CodecId::Scx1, DecodeTarget::Auto, 100, 95, true),
+            CodecId::Scx1
+        );
+        // Within the margin (a marginal size win) → keep heuristic (cost-aware).
+        assert_eq!(
+            pick_codec_v2(CodecId::Scx1, DecodeTarget::Auto, 100, 99, true),
+            CodecId::Scx1
+        );
+        // Tie → keep heuristic.
         assert_eq!(
             pick_codec_v2(CodecId::Scx1, DecodeTarget::Auto, 100, 100, true),
             CodecId::Scx1
@@ -224,6 +293,41 @@ mod tests {
         // Larger → keep heuristic.
         assert_eq!(
             pick_codec_v2(CodecId::Scx1, DecodeTarget::Auto, 100, 101, true),
+            CodecId::Scx1
+        );
+        // Large real win (1.5×) clears the margin comfortably.
+        assert_eq!(
+            pick_codec_v2(CodecId::Zstd, DecodeTarget::Auto, 150, 100, true),
+            CodecId::ShufDeltaZstd
+        );
+    }
+
+    #[test]
+    fn pick_v2_auto_margin_invariant() {
+        // Invariant: `auto` never adopts ShufDeltaZstd unless it is strictly
+        // smaller than heuristic*(1-ADOPT_MARGIN). Sweep a grid.
+        for size_heuristic in [1usize, 10, 100, 1000, 65536] {
+            let threshold = (size_heuristic as f64) * (1.0 - ADOPT_MARGIN);
+            for delta in 0..=size_heuristic + 5 {
+                let size_shufdelta = delta;
+                let picked = pick_codec_v2(
+                    CodecId::Scx1,
+                    DecodeTarget::Auto,
+                    size_heuristic,
+                    size_shufdelta,
+                    true,
+                );
+                let adopted = picked == CodecId::ShufDeltaZstd;
+                assert_eq!(
+                    adopted,
+                    (size_shufdelta as f64) < threshold,
+                    "h={size_heuristic} s={size_shufdelta}: adopted={adopted}"
+                );
+            }
+        }
+        // Empty shard (heuristic size 0) never adopts.
+        assert_eq!(
+            pick_codec_v2(CodecId::Scx1, DecodeTarget::Auto, 0, 0, true),
             CodecId::Scx1
         );
     }
@@ -262,6 +366,59 @@ mod tests {
                 CodecId::Pcodec
             );
         }
+    }
+
+    #[test]
+    fn resolve_codec_intent_axis() {
+        // Default / auto: adaptive, framing not required.
+        for c in [None, Some("auto")] {
+            let r = resolve_codec(c).unwrap();
+            assert_eq!(r.explicit_codec, None);
+            assert!(!r.codec_trial);
+            assert_eq!(r.decode_target, Some(DecodeTarget::Auto));
+            assert!(!r.requires_framing);
+            assert_eq!(r.profile, "auto");
+        }
+        // fast: heuristic single-encode (old auto), framing not required.
+        let r = resolve_codec(Some("fast")).unwrap();
+        assert_eq!(r.explicit_codec, None);
+        assert!(!r.codec_trial);
+        assert_eq!(r.decode_target, None);
+        assert!(!r.requires_framing);
+        assert_eq!(r.profile, "fast");
+        // compact: tie-adopt, framed only.
+        let r = resolve_codec(Some("compact")).unwrap();
+        assert_eq!(r.decode_target, Some(DecodeTarget::Storage));
+        assert!(r.requires_framing);
+        assert_eq!(r.profile, "compact");
+        // compact-trial: strict trial, framed only.
+        let r = resolve_codec(Some("compact-trial")).unwrap();
+        assert!(r.codec_trial);
+        assert_eq!(r.decode_target, None);
+        assert!(r.requires_framing);
+        // explicit forces.
+        let r = resolve_codec(Some("scx1")).unwrap();
+        assert_eq!(r.explicit_codec, Some(CodecId::Scx1));
+        assert!(!r.requires_framing);
+        assert_eq!(r.profile, "scx1");
+        let r = resolve_codec(Some("shufdelta")).unwrap();
+        assert_eq!(r.explicit_codec, Some(CodecId::ShufDeltaZstd));
+        assert!(r.requires_framing);
+    }
+
+    #[test]
+    fn resolve_codec_auto_v2_removed() {
+        let err = resolve_codec(Some("auto_v2")).unwrap_err();
+        assert!(err.contains("auto_v2"), "{err}");
+        assert!(err.contains("auto"), "{err}");
+        assert!(err.contains("compact"), "{err}");
+    }
+
+    #[test]
+    fn resolve_codec_unknown_errors() {
+        let err = resolve_codec(Some("gzip")).unwrap_err();
+        assert!(err.contains("gzip"), "{err}");
+        assert!(err.contains("fast") && err.contains("compact"), "{err}");
     }
 
     #[test]

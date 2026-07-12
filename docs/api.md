@@ -400,24 +400,39 @@ scx subset in.scx rna_only.scx --modality rna
 
 ## Codec Selection (`scx-format/src/codec_select.rs`)
 
-- `select_codec(values, encoding)` — Auto-select best codec per shard based on data type and distribution:
-  - Integer values with median ≤ 8 → Scx1 (Rice coding, optimal for typical 10x UMI counts)
-  - Integer values with median > 8 → Zstd (LZ77 dictionary wins for larger values)
-  - Float values (Float32, Float16) → Pcodec (7–16% better compression than Zstd on log-normalized data)
-- LZ4+shuffle (`codec="lz4"`) and Pcodec (`codec="pcodec"`) also available as explicit overrides
+The user-facing `codec=` argument is a single **intent axis** with three profiles,
+resolved by `resolve_codec`:
 
-**Codec tradeoffs:**
+- **`auto`** (default) — cost-aware adaptive. Per framed integer shard, dual-encode
+  the heuristic vs ShufDeltaZstd and adopt ShufDeltaZstd only when it is smaller by
+  at least `ADOPT_MARGIN` (5%), so a marginal size win never pays the ShufDeltaZstd
+  decode tax. The heuristic itself is `select_codec`: integer median ≤ 8 → Scx1 (Rice,
+  optimal for 10x UMI counts), median > 8 → Zstd, float → Pcodec. Unframed writes fall
+  back to the heuristic single-encode. `auto` files are typically **mixed-codec**;
+  `scx info` prints the per-shard breakdown.
+- **`fast`** — decode-speed-max: the heuristic single-encode (Scx1/Zstd), never
+  ShufDeltaZstd. This is the pre-flip default; pin it for latency-critical CPU training.
+- **`compact`** — size-max: adopt ShufDeltaZstd on ties (framed only).
+
+Explicit forces (`none`/`scx1`/`zstd`/`lz4`/`pcodec`/`shufdelta`) and `compact-trial`
+remain available. (The prior `auto_v2` profile + `decode_target` knob were removed as
+a pre-1.0 clean break — use `auto`/`compact`.)
+
+**Codec / profile tradeoffs:**
 
 | Codec | Best for | Compression | Read speed | Write speed |
 |-------|----------|-------------|------------|-------------|
-| `auto` | General use (recommended default) | Best per-shard | Best per-shard | Best per-shard |
+| `auto` | General use (recommended default) — size-optimizing adaptive | Best per-shard (adopts ShufDeltaZstd where it wins) | Near-best (~6% ShufDeltaZstd tax on adopted shards) | Moderate (dual-encode) |
+| `fast` | Latency-critical CPU training | Heuristic per-shard | Fastest (SIMD Scx1 decode) | Best (single-encode) |
+| `compact` | Storage/egress-bound archival | Highest (adopts on ties) | ~6% ShufDeltaZstd tax | Moderate (dual-encode) |
 | `scx1` | Small UMI counts (median ≤ 8) | Best for 10x data (~4.8×) | Fastest (SIMD decode) | Moderate |
 | `zstd` | Large integers, general fallback | Good (~4.3× UMI, ~3.8× float) | Fast | Fast |
+| `shufdelta` | Force the compact integer codec | ~1.5–2.5× smaller than Scx1 | ~6% slower than Scx1 | Moderate |
 | `pcodec` | Log-normalized, PCA embeddings, float layers | Best for floats (~4.1–4.7×) | Moderate (19–39% slower than Zstd) | Slower (35–40% slower than Zstd) |
 | `lz4` | Speed-critical pipelines | Lower (~2.2–3.1×) | Fast | Fastest compressed |
 | `none` | GDS bypass, debugging | 1× (no compression) | Fastest (I/O bound) | Fastest |
 
-For raw count data (integer-valued), `auto` selects Scx1 or Zstd — Pcodec falls through to Zstd internally since its advantage is specific to float values. For storage-constrained workflows with normalized float data, explicitly selecting `pcodec` gives the best compression. For latency-sensitive pipelines, `zstd` or `lz4` are better choices.
+For storage-constrained workflows with normalized float data, explicitly selecting `pcodec` gives the best compression. For latency-sensitive pipelines, `fast`, `zstd`, or `lz4` are better choices.
 
 ## Provenance
 
@@ -2138,7 +2153,7 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 - `scx append <target> <source> [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Streaming append (reads source one shard at a time). `--index-*` rebuilds predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
 - `scx delete <file> --filter <expr> [--dry-run]`
 - `scx compact <input> <output> [--force] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Rewrite reclaiming space; `--index-*` rebuilds the predicate index against the compacted output.
-- `scx optimize <input> <output> [--force] [--codec {auto|scx1}] [--shard-obs {off|auto|always}]` — In-place upgrade (single-modality): re-encode + canonicalize every CSR shard and row-group-frame it (codec-agnostic random access via the row-group `BlockIndex`), stamping `format_version=4`, preserving row layout / obs / var / obsm / uns / indexes / deletion vectors. `--codec scx1` forces Scx1 on every integer shard (keeps the GPU device-decode route — framed Scx1 shards decode in VRAM; default `auto` leaves high-median shards as Zstd). `--shard-obs` (default `auto`) migrates a legacy single-section obs to the sharded layout — `auto` shards when `n_obs > shard_target_rows`, `always` unconditionally, `off` keeps the single section; an already-sharded obs is preserved regardless. Drops the CSC sidecar (rerun `scx build-csc`). `<output>` may equal `<input>` (atomic rename). See [docs/operations.md § Optimize](operations.md#optimize).
+- `scx optimize <input> <output> [--force] [--codec {auto|fast|compact|scx1|shufdelta|compact-trial}] [--shard-obs {off|auto|always}]` — In-place upgrade (single-modality): re-encode + canonicalize every CSR shard and row-group-frame it (codec-agnostic random access via the row-group `BlockIndex`), stamping `format_version=4`, preserving row layout / obs / var / obsm / uns / indexes / deletion vectors. Default `auto` re-encodes adaptively (adopts ShufDeltaZstd where it wins by the margin); `--codec fast` forces the heuristic (Scx1 on low-median integer shards — keeps the GPU device-decode route, framed Scx1 shards decode in VRAM); `--codec scx1` forces Scx1 on every integer shard. `--shard-obs` (default `auto`) migrates a legacy single-section obs to the sharded layout — `auto` shards when `n_obs > shard_target_rows`, `always` unconditionally, `off` keeps the single section; an already-sharded obs is preserved regardless. Drops the CSC sidecar (rerun `scx build-csc`). `<output>` may equal `<input>` (atomic rename). See [docs/operations.md § Optimize](operations.md#optimize).
 - `scx rollback <file> [--to-seq N]`
 - `scx merge <file1> <file2> [<...>] --output <path> [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Merge multiple files; `--index-*` rebuilds the predicate index against the merged output (without it, pushdown regresses to a full obs scan on the merged file).
 - `scx query <input> (--filter <expr> | <filter>) [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]` — the obs predicate may be given via `--filter` (consistent with `scx subset` / `scx delete`) or positionally (back-compat); supply one form, not both. `<input>` accepts a local `.scx` file path, an exploded `.scxd/` directory, or a cloud URL (`gs://`, `s3://`, `az://`, `file://`). For cloud inputs the query is served via the `SectionReader` cloud path with no `scx pull` step. See [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query).

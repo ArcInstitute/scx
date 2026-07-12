@@ -81,53 +81,20 @@ pub(crate) fn parse_codec(codec: Option<&str>) -> PyResult<Option<CodecId>> {
         Some("pcodec") => Ok(Some(CodecId::Pcodec)),
         Some("shufdelta") => Ok(Some(CodecId::ShufDeltaZstd)),
         Some(other) => Err(PyRuntimeError::new_err(format!(
-            "Unknown codec: '{}'. Use 'auto', 'auto_v2', 'none', 'scx1', 'zstd', 'lz4', 'pcodec', 'shufdelta', or 'compact-trial'.",
-            other
-        ))),
-    }
-}
-
-/// Parse a `decode_target` string for the `auto_v2` codec profile.
-/// `None`/"auto" → [`DecodeTarget::Auto`]; also accepts "cpu"/"gpu"/"storage".
-pub(crate) fn parse_decode_target(
-    decode_target: Option<&str>,
-) -> PyResult<scx_format_io::DecodeTarget> {
-    use scx_format_io::DecodeTarget;
-    match decode_target {
-        None | Some("auto") => Ok(DecodeTarget::Auto),
-        Some("cpu") => Ok(DecodeTarget::Cpu),
-        Some("gpu") => Ok(DecodeTarget::Gpu),
-        Some("storage") => Ok(DecodeTarget::Storage),
-        Some(other) => Err(PyRuntimeError::new_err(format!(
-            "Unknown decode_target: '{}'. Use 'auto', 'cpu', 'gpu', or 'storage'.",
+            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'zstd', 'lz4', 'pcodec', or 'shufdelta'.",
             other
         ))),
     }
 }
 
 /// Codec-selection `params_json` for the in-memory `from_anndata` provenance
-/// stamp. Returns `"{}"` for plain `auto`/explicit writes (byte-stable), else a
-/// `{"codec_selection": {...}}` object recording the profile intent. Kept local
-/// to pyscx (not the hdf5-gated `scx_convert` helper) so the in-memory path
-/// compiles without the `hdf5` feature.
-pub(crate) fn codec_selection_params_json(
-    codec_trial: bool,
-    decode_target: Option<scx_format_io::DecodeTarget>,
-) -> String {
-    use scx_format_io::DecodeTarget;
-    if let Some(dt) = decode_target {
-        let name = match dt {
-            DecodeTarget::Auto => "auto",
-            DecodeTarget::Cpu => "cpu",
-            DecodeTarget::Gpu => "gpu",
-            DecodeTarget::Storage => "storage",
-        };
-        format!("{{\"codec_selection\":{{\"profile\":\"auto_v2\",\"decode_target\":\"{name}\"}}}}")
-    } else if codec_trial {
-        "{\"codec_selection\":{\"profile\":\"compact-trial\"}}".to_string()
-    } else {
-        "{}".to_string()
-    }
+/// stamp. Records the resolved profile intent (`auto`/`fast`/`compact`/
+/// `compact-trial`/explicit codec name); the realized per-shard codecs are
+/// reported read-side by `scx info`. Kept local to pyscx (not the hdf5-gated
+/// `scx_convert` helper) so the in-memory path compiles without the `hdf5`
+/// feature.
+pub(crate) fn codec_selection_params_json(profile: &str) -> String {
+    format!("{{\"codec_selection\":{{\"profile\":\"{profile}\"}}}}")
 }
 
 /// Convert a pandas DataFrame to an Arrow RecordBatch via pyarrow IPC.

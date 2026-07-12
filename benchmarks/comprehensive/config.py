@@ -144,6 +144,10 @@ class DatasetConfig:
         return DATA_DIR / f"{self.name}_auto.scx"
 
     @property
+    def scx_fast_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_fast.scx"
+
+    @property
     def scx_scx1_path(self) -> Path:
         return DATA_DIR / f"{self.name}_scx1.scx"
 
@@ -190,11 +194,6 @@ class DatasetConfig:
     @property
     def scx_compact_trial_g1024_path(self) -> Path:
         return DATA_DIR / f"{self.name}_compact_trial_g1024.scx"
-
-    @property
-    def scx_auto_v2_path(self) -> Path:
-        # Phase C: workload-aware auto_v2 (decode_target=storage, framed G=256).
-        return DATA_DIR / f"{self.name}_auto_v2.scx"
 
     @property
     def anndata_zarr_backed_path(self) -> Path:
@@ -274,6 +273,7 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "zarr_lz4": "zarr_lz4_path",
     "tiledb_soma": "soma_path",
     "scx_auto": "scx_auto_path",
+    "scx_fast": "scx_fast_path",
     "scx_scx1": "scx_scx1_path",
     "scx_zstd": "scx_zstd_path",
     "scx_none": "scx_none_path",
@@ -285,7 +285,6 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "scx_compact_trial_g256": "scx_compact_trial_g256_path",
     "scx_compact_trial_g512": "scx_compact_trial_g512_path",
     "scx_compact_trial_g1024": "scx_compact_trial_g1024_path",
-    "scx_auto_v2": "scx_auto_v2_path",
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
@@ -405,6 +404,7 @@ def ensure_instance_region_matches_bucket(instance_region: str) -> None:
 # on GCS (see docs/cloud.md); others keep their native directory suffix.
 _FORMAT_KEY_TO_CLOUD_SUFFIX: dict[str, str] = {
     "scx_auto": ".scxd",
+    "scx_fast": ".scxd",
     "scx_scx1": ".scxd",
     "scx_zstd": ".scxd",
     "scx_none": ".scxd",
@@ -680,6 +680,11 @@ PRIMARY_FORMATS: list[FormatVariant] = [
     FormatVariant("TileDB-SOMA", "tiledb_soma", "primary", "tiledb_runner"),
     FormatVariant("SCX (auto)", "scx_auto", "primary", "scx_runner",
                   {"codec": "auto"}),
+    # Decode-speed-max escape hatch (the pre-flip `auto` behavior): heuristic
+    # single-encode (Scx1 for low-median integer shards). Gates the decode-max
+    # throughput floors that `scx_auto` used to carry.
+    FormatVariant("SCX (fast)", "scx_fast", "primary", "scx_runner",
+                  {"codec": "fast"}),
     FormatVariant("SCX (none)", "scx_none", "primary", "scx_runner",
                   {"codec": "none"}),
     FormatVariant("SCX (scx1)", "scx_scx1", "primary", "scx_runner",
@@ -719,12 +724,6 @@ ADDITIONAL_FORMATS: list[FormatVariant] = [
                   "scx_runner", {"codec": "compact-trial", "row_group_rows": 512}),
     FormatVariant("SCX (compact-trial G=1024)", "scx_compact_trial_g1024", "additional",
                   "scx_runner", {"codec": "compact-trial", "row_group_rows": 1024}),
-    # Phase C — workload-aware auto_v2 (decode_target=storage): adopts
-    # ShufDeltaZstd per integer shard where it compresses ≤ the heuristic.
-    # Gates "no size regression vs scx_auto" + "no training-throughput regression".
-    FormatVariant("SCX (auto_v2 storage)", "scx_auto_v2", "additional",
-                  "scx_runner",
-                  {"codec": "auto_v2", "row_group_rows": 256, "decode_target": "storage"}),
 ]
 
 

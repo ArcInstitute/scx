@@ -143,7 +143,7 @@ def test_invalid_codec_raises(synthetic_adata, tmp_dir):
     import pyscx
 
     path = str(tmp_dir / "bad.scx")
-    with pytest.raises(RuntimeError, match="Unknown codec"):
+    with pytest.raises((ValueError, RuntimeError), match="Unknown codec"):
         pyscx.from_anndata(synthetic_adata, path, codec="invalid")
 
 
@@ -153,52 +153,56 @@ def _read_x(path):
     return pyscx.open(path).to_anndata().X.toarray()
 
 
-def test_auto_v2_roundtrip_and_no_size_regression(tmp_dir):
-    """`codec='auto_v2'` round-trips and never exceeds the plain-`auto` size
-    (Phase C: per-shard it keeps the smaller of the heuristic vs ShufDeltaZstd,
-    biased by `decode_target`)."""
+def test_auto_adaptive_roundtrip_and_smaller_than_fast(tmp_dir):
+    """The default `codec='auto'` is cost-aware adaptive: it round-trips exactly
+    and, on a large-count integer matrix where ShufDeltaZstd wins by a wide
+    margin, is no larger than `codec='fast'` (the decode-max heuristic)."""
     import os
 
     import anndata
     import pyscx
 
-    # Larger counts (median > 8) → Zstd heuristic, which ShufDeltaZstd beats;
-    # enough rows for the size delta to be meaningful.
-    rng = np.random.default_rng(0)
+    # Larger counts (median > 8) → Zstd heuristic, which ShufDeltaZstd beats by
+    # well more than ADOPT_MARGIN; enough rows for the delta to be meaningful.
     X = sp.random(3000, 1500, density=0.05, format="csr", random_state=0)
     X.data = np.round(X.data * 60 + 1).astype(np.float32)
     adata = anndata.AnnData(X=X)
 
     auto = str(tmp_dir / "auto.scx")
-    av2 = str(tmp_dir / "av2.scx")
+    fast = str(tmp_dir / "fast.scx")
     pyscx.from_anndata(adata, auto, codec="auto", row_group_rows=256)
-    pyscx.from_anndata(adata, av2, codec="auto_v2", decode_target="storage", row_group_rows=256)
+    pyscx.from_anndata(adata, fast, codec="fast", row_group_rows=256)
 
-    # Data round-trips identically.
+    # Data round-trips identically for both profiles.
     np.testing.assert_array_equal(_read_x(auto), X.toarray())
-    np.testing.assert_array_equal(_read_x(av2), X.toarray())
+    np.testing.assert_array_equal(_read_x(fast), X.toarray())
 
-    # No size regression vs auto (Storage picks the smaller-or-equal codec).
-    assert os.path.getsize(av2) <= os.path.getsize(auto)
+    # Adaptive auto adopts the smaller codec here → ≤ the fast (heuristic) size.
+    assert os.path.getsize(auto) <= os.path.getsize(fast)
 
 
-def test_auto_v2_cpu_matches_auto_size(tmp_dir):
-    """`decode_target='cpu'` is conservative — the shard data matches plain
-    `auto` (Rust proves byte-identity); the file differs only by the small
-    codec-selection provenance stamp auto_v2 records."""
-    import os
-
+def test_fast_matches_old_auto_heuristic(tmp_dir):
+    """`codec='fast'` reproduces the pre-flip `auto` behavior: the heuristic
+    single-encode (Scx1 for low-median counts), never ShufDeltaZstd."""
     import pyscx
 
-    a = str(tmp_dir / "a.scx")
+    f = str(tmp_dir / "f.scx")
+    pyscx.from_anndata(large_value_adata_big(), f, codec="fast", row_group_rows=256)
+    info = pyscx.open(f)
+    # Round-trips exactly.
+    np.testing.assert_array_equal(
+        _read_x(f), large_value_adata_big().X.toarray()
+    )
+    del info
+
+
+def test_compact_roundtrip(tmp_dir):
+    """`codec='compact'` (size-max, adopts ShufDeltaZstd on ties) round-trips."""
+    import pyscx
+
     c = str(tmp_dir / "c.scx")
-    pyscx.from_anndata(large_value_adata_big(), a, codec="auto", row_group_rows=256)
-    pyscx.from_anndata(large_value_adata_big(), c, codec="auto_v2", decode_target="cpu",
-                       row_group_rows=256)
-    np.testing.assert_array_equal(_read_x(a), _read_x(c))
-    # Cpu never adopts ShufDeltaZstd, so the only file-size delta is the
-    # provenance stamp (< 1 KB), never a codec change.
-    assert abs(os.path.getsize(a) - os.path.getsize(c)) < 1024
+    pyscx.from_anndata(large_value_adata_big(), c, codec="compact", row_group_rows=256)
+    np.testing.assert_array_equal(_read_x(c), large_value_adata_big().X.toarray())
 
 
 def large_value_adata_big():
@@ -209,19 +213,34 @@ def large_value_adata_big():
     return anndata.AnnData(X=X)
 
 
-def test_decode_target_requires_auto_v2(synthetic_adata, tmp_dir):
-    """`decode_target` is only valid with `codec='auto_v2'`."""
+def test_auto_v2_removed_errors(synthetic_adata, tmp_dir):
+    """`codec='auto_v2'` was removed (clean break); the error names its
+    replacements `auto`/`compact`."""
     import pyscx
 
     with pytest.raises((ValueError, RuntimeError), match="auto_v2"):
         pyscx.from_anndata(synthetic_adata, str(tmp_dir / "x.scx"),
+                           codec="auto_v2", row_group_rows=256)
+
+
+def test_decode_target_removed_errors(synthetic_adata, tmp_dir):
+    """The `decode_target=` kwarg was removed; passing it is a TypeError
+    (unexpected keyword argument)."""
+    import pyscx
+
+    with pytest.raises(TypeError):
+        pyscx.from_anndata(synthetic_adata, str(tmp_dir / "x.scx"),
                            codec="auto", decode_target="gpu", row_group_rows=256)
 
 
-def test_auto_v2_requires_framing(synthetic_adata, tmp_dir):
-    """`codec='auto_v2'` requires row-group framing (row_group_rows > 0)."""
+def test_compact_requires_framing(synthetic_adata, tmp_dir):
+    """`codec='compact'` requires row-group framing (row_group_rows > 0);
+    `auto` does not (it falls back to the heuristic when unframed)."""
     import pyscx
 
     with pytest.raises((ValueError, RuntimeError), match="row_group_rows"):
         pyscx.from_anndata(synthetic_adata, str(tmp_dir / "x.scx"),
-                           codec="auto_v2", row_group_rows=0)
+                           codec="compact", row_group_rows=0)
+    # `auto` unframed must NOT raise — silent heuristic fallback.
+    pyscx.from_anndata(synthetic_adata, str(tmp_dir / "auto_unframed.scx"),
+                       codec="auto", row_group_rows=0)

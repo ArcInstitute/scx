@@ -386,37 +386,37 @@ transform kernels but upload the decompressed planes
 (`SCX_SHUFDELTA_NVCOMP=1`) is enabled, which decompresses on-device
 (`scx_device_decode_gpu`).
 
-### Workload-aware selection (`codec="auto_v2"`, framed only)
+### The codec intent axis (`auto` / `fast` / `compact`)
 
-`auto_v2` extends the trial-encode with a **`decode_target`** bias so the writer
-picks ShufDeltaZstd *where it's a net win* and keeps the CPU-conservative heuristic
-elsewhere. Like `compact-trial` it is framed-only (requires `--row-group-rows`/`row_group_rows>0`)
-and picks per **integer** shard between the heuristic winner and ShufDeltaZstd by
-size (float always stays Pcodec). The `--decode-target` / `decode_target=` knob
-(`scx convert`/`scx optimize`/`pyscx.from_anndata`/`from_h5ad`/`from_10x`) sets the rule:
+`codec=` is a single **intent axis** with three profiles. The default `auto` is
+cost-aware adaptive; the other two are its escape hatches.
 
-| `decode_target` | Rule (integer shards) |
-|---|---|
-| `cpu` | Keep the heuristic (Scx1/Zstd) — never ShufDeltaZstd (conservative). |
-| `auto` (default) | Adopt ShufDeltaZstd when **strictly smaller** (== `compact-trial`). |
-| `gpu` / `storage` | Adopt ShufDeltaZstd when **≤** the heuristic (tie → ShufDeltaZstd: GPU-decodable / smaller egress). |
+| `codec=` | Behavior (integer shards) | Float | Framing |
+|---|---|---|---|
+| `auto` (default) | Per shard, adopt ShufDeltaZstd when it is smaller by at least `ADOPT_MARGIN` (5%); else the heuristic (Scx1 ≤ median 8, Zstd above). Cost-aware: a marginal size win never pays the ShufDeltaZstd decode tax. | Pcodec | Framed default (G=256); **unframed falls back to the heuristic single-encode**. |
+| `fast` | Always the heuristic (Scx1/Zstd), single-encode — decode-speed-max. This is the pre-flip `auto`. | Pcodec | Any / none. |
+| `compact` | Adopt ShufDeltaZstd on **ties** (`≤` the heuristic) — size-max. | Pcodec | Framed only. |
 
-The chosen profile + target is stamped in the file's provenance
-(`params_json.codec_selection`, surfaced by `scx info`). Implementation:
-`scx-format/src/codec_select.rs::pick_codec_v2` (per-modality decision) +
-`scx-format-io/src/encoder.rs` (the shared dual-encode).
+`auto` and `compact` dual-encode each framed integer shard (heuristic +
+ShufDeltaZstd) and pick by size; `fast` single-encodes. The realized codec is
+per-shard on disk (`codec_id`), so an `auto` file is typically **mixed**
+(predominantly ShufDeltaZstd, with Scx1 on low-median shards). `scx info` reports
+the per-shard breakdown (`Codec breakdown: N shufdelta, M scx1`); the resolved
+profile is stamped in provenance (`params_json.codec_selection.profile`).
+Implementation: `scx-format/src/codec_select.rs::{resolve_codec, pick_codec_v2,
+ADOPT_MARGIN}` + `scx-format-io/src/encoder.rs` (the shared dual-encode).
 
-**Default policy.** `codec="auto"` (Scx1 for low-median integers) remains the
-**compute default**; `auto_v2` is **opt-in**. **Convergence note:** since Phase B
-brought ShufDeltaZstd CPU decode to ~parity with Scx1 (`docs/performance.md`), for
-integers `auto`-target `auto_v2` already collapses to "ShufDeltaZstd where it
-compresses better" — the `decode_target` knob is transitional and only the `cpu`
-branch still differs. The compute default stays Scx1. A GPU training loader
-(Phase D) that would make ShufDeltaZstd the better default for GPU training was
-**profiled (D0) and deferred** — the training loader decodes on CPU, where
-ShufDeltaZstd is only ~9% slower than Scx1 (Phase-B SIMD), so host-bounce is not
-the measured training ceiling ([performance.md § ShufDeltaZstd loader-decode
-cost](performance.md#shufdeltazstd-loader-decode-cost-phase-d-d0-profiling)).
+**Why `auto` defaults to size.** Storage + egress is paid on every read forever
+and the win is large (1.3–2× smaller on integer counts); the ShufDeltaZstd
+CPU-decode tax is small (~6% on realistic `hvg_norm` training, ~4% once a GPU
+model sits on top — Phase B SIMD), paid only during active CPU training, and
+opt-out-able via `codec="fast"`. The amortized trade favors size for the default
+while the latency-critical minority keeps a one-word escape. (Historical note:
+this replaces the transitional two-option `auto`/`auto_v2` + `decode_target`
+surface, which was removed as a pre-1.0 clean break.)
+
+Explicit codec forces (`none`/`scx1`/`zstd`/`lz4`/`pcodec`/`shufdelta`) and
+`compact-trial` (strict-`<` trial) remain available.
 
 ### Codec tradeoff summary — Scx1 vs ShufDeltaZstd
 

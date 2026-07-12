@@ -805,12 +805,19 @@ absolute_floors:
   # on that scenario's runs, so the gate's median is over scenario-
   # coherent runs (not aliased across raw/hvg/norm/hvg_norm).
   #
+  # PROFILE FLIP (auto→adaptive, 2026-07-12): `scx_auto` is now the
+  # cost-aware adaptive profile (predominantly ShufDeltaZstd), and the
+  # decode-speed-max heuristic (the pre-flip `auto` = Scx1) moved to
+  # `scx_fast`. So the decode-max throughput floors below are keyed to
+  # `scx_fast` (their numbers were measured on the old `auto` = the
+  # identical heuristic single-encode), and `scx_auto` carries the
+  # adaptive floors (measured on the old `auto_v2`, a conservative lower
+  # bound — the margin rule adopts ≤ auto_v2's shufdelta, so adaptive
+  # `auto` decodes no slower). PROVISIONAL pending the P4.3 recapture,
+  # which re-derives exact adaptive floors for every dataset.
+  #
   # Recalibrated 2026-07-12 from the v0.11.0-cellstream-recapture
-  # Chimera capture (results/baseline_2026_07_10). The prior scx_auto
-  # tabula floors (66/66/63) and workers2 floors (647/681) predated the
-  # SLURM-scaled memory-budget + workers2-skip harness fixes and were
-  # set under an older batch-counting methodology (Lambda synthetic,
-  # ~1300 bps scale) — not comparable to the current Chimera numbers.
+  # Chimera capture (results/baseline_2026_07_10).
   # Headline claim ("82x vs TileDB-SOMA-ML, ~340x vs SLAFDataLoader")
   # is in docs/performance.md; these floors protect it at each tier.
   #
@@ -819,97 +826,92 @@ absolute_floors:
   # finish in ~0.15s and tabula_sapiens_100k epochs in ~0.8s, so the
   # samples miss peak compute. Throughput is reliable; util% needs an
   # in-process sampler before it can be a floor.
+  #
+  # scx_fast (decode-speed-max; the pre-flip `auto` heuristic) — carries
+  # the decode-max throughput floors across all measured tiers.
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: pbmc3k
     metric: batches_per_sec__raw
     min: 29.0
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: pbmc3k
     metric: batches_per_sec__hvg_norm
     min: 40.0
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: pbmc3k
     metric: batches_per_sec__gpu_train
     min: 41.0
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__raw
     min: 29.0
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__hvg_norm
     min: 33.0
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__gpu_train
     min: 32.0
-  # scx_auto census (500k / 1m) — new coverage, capturable after the
-  # workers2-skip + SLURM-scaled memory-budget fixes. 0.85× min run.
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: census_500k
     metric: batches_per_sec__raw
     min: 40.0
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: census_500k
     metric: batches_per_sec__hvg_norm
     min: 47.0
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: census_500k
     metric: batches_per_sec__gpu_train
     min: 51.0
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: census_1m
     metric: batches_per_sec__raw
     min: 48.0
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: census_1m
     metric: batches_per_sec__hvg_norm
     min: 54.0
   - benchmark: ml_loader
-    format: scx_auto
+    format: scx_fast
     dataset: census_1m
     metric: batches_per_sec__gpu_train
     min: 56.0
 
-  # ─── Phase C auto_v2 training-throughput (no regression vs auto) ──────
-  # Absolute floors on auto_v2's OWN batches/sec — catch a throughput
-  # regression of the ShufDeltaZstd-decoding loader. Set at 0.85× the
-  # min observed run from the 2026-07-09 capture (candidate_2026_07_09_auto_v2),
-  # so no measured run violates and there is ~15% noise headroom. Only
-  # pbmc10k is floored: it was the one dataset that ran clean and stable
-  # (tight runs), whereas pbmc3k measured node-contended this capture
-  # (scx_auto/pbmc3k raw itself came in under its own 38.6 floor), and
-  # smartseq2/tabula/census ml_loader jobs timed out at the 65-min limit
-  # (the workers2 scenario is too heavy for larger data in that window).
-  # Add pbmc3k + tabula auto_v2 floors from a future clean full capture.
-  # Measured relationship (pbmc10k): auto_v2 vs auto — raw 22.2 vs 27.7
-  # (~20% slower, the CPU-decode-bound worst case, matching Phase B's
-  # ~1.09-1.2× ShufDeltaZstd CPU decode), hvg_norm 34.3 vs 36.6 (~6%),
-  # gpu_train 34.1 vs 35.5 (~4%). No throughput regression beyond the
-  # known ShufDeltaZstd CPU-decode band.
+  # ─── scx_auto (adaptive) training-throughput — no regression by default ──
+  # Absolute floors on the adaptive `auto`'s OWN batches/sec — catch a
+  # throughput regression of the ShufDeltaZstd-decoding loader. Reused from
+  # the old `auto_v2` (decode_target=storage) pbmc10k floors (0.85× the min
+  # observed run, 2026-07-09 capture) — a conservative lower bound, since the
+  # margin rule adopts ≤ auto_v2's shufdelta. Only pbmc10k is floored today;
+  # pbmc3k / tabula / census adaptive floors are DEFERRED to the P4.3
+  # recapture (see the deferred-floors note). Measured (pbmc10k, old auto_v2
+  # vs old auto=fast): raw 22.2 vs 27.7, hvg_norm 34.3 vs 36.6 (~6%),
+  # gpu_train 34.1 vs 35.5 (~4%).
   - benchmark: ml_loader
-    format: scx_auto_v2
+    format: scx_auto
     dataset: pbmc10k
     metric: batches_per_sec__raw
     min: 18.0
   - benchmark: ml_loader
-    format: scx_auto_v2
+    format: scx_auto
     dataset: pbmc10k
     metric: batches_per_sec__hvg_norm
     min: 28.0
   - benchmark: ml_loader
-    format: scx_auto_v2
+    format: scx_auto
     dataset: pbmc10k
     metric: batches_per_sec__gpu_train
     min: 28.0
@@ -1875,30 +1877,34 @@ absolute_floors:
     metric: compression_ratio
     min: 6.0
 
-  # ─── Phase C auto_v2 compression ratio (no size regression vs auto) ───
-  # `scx_auto_v2` (decode_target=storage) adopts ShufDeltaZstd per integer shard
-  # where it compresses ≤ the heuristic, and keeps Pcodec on float — so its
-  # ratio is ≥ `scx_auto` and ≥ `scx_compact_trial_g512` on every dataset. These
-  # floors reuse the (conservative, deterministic) compact-trial-g512 values as a
-  # proven lower bound — the "no size regression vs auto" guard. Conversion is
-  # deterministic; tighten to the captured medians on the next full baseline.
+  # ─── scx_auto (adaptive) compression ratio — no size regression ───
+  # Post-flip `scx_auto` is cost-aware adaptive: it adopts ShufDeltaZstd per
+  # integer shard where it wins by ≥ ADOPT_MARGIN (5%), keeps the heuristic
+  # otherwise, and keeps Pcodec on float — so its ratio is ≥ `scx_fast` (the
+  # heuristic) and close to `scx_compact_trial_g512` (which adopts on any win;
+  # the 5% margin can leave a few marginal-win shards on the heuristic, so
+  # adaptive `auto` ≤ compact-trial in ratio by a small amount). These floors
+  # reuse the (conservative, deterministic) compact-trial-g512 values as the
+  # "no size regression" guard — the measured medians (e.g. pbmc10k 6.73,
+  # tabula 6.79) leave headroom well above the margin effect. PROVISIONAL:
+  # tighten to the captured adaptive medians on the P4.3 recapture.
   - benchmark: compression
-    format: scx_auto_v2
+    format: scx_auto
     dataset: pbmc3k
     metric: compression_ratio
     min: 4.3
   - benchmark: compression
-    format: scx_auto_v2
+    format: scx_auto
     dataset: pbmc10k
     metric: compression_ratio
     min: 6.0
   - benchmark: compression
-    format: scx_auto_v2
+    format: scx_auto
     dataset: smartseq2
     metric: compression_ratio
     min: 3.6
   - benchmark: compression
-    format: scx_auto_v2
+    format: scx_auto
     dataset: tabula_sapiens_100k
     metric: compression_ratio
     min: 6.0
@@ -1952,12 +1958,15 @@ absolute_floors:
 #    aggregation-phase perf signal. The `gpu_nb_glm_csc` route string is
 #    reserved but never emitted today.
 #
-# 5. ml_loader batches_per_sec floors for `scx_auto_v2` (Phase C) — PARTIALLY
-#    ACTIVE. The size gate (compression_ratio) is active + validated; the
-#    training-throughput floors are now ACTIVE for `pbmc10k` (raw/hvg_norm/
-#    gpu_train) from the 2026-07-09 capture. Still deferred: `pbmc3k` (node
-#    contention that capture — scx_auto/pbmc3k raw itself came in under its own
-#    38.6 floor) and `tabula_sapiens_100k` / census (ml_loader jobs timed out at
-#    the 65-min limit — the workers2 scenario is too heavy for larger data).
-#    Add those from a future clean full capture with a longer ml_loader timeout,
-#    mirroring the pbmc10k rows (min = 0.85× the measured min run).
+# 5. ml_loader batches_per_sec floors for the adaptive `scx_auto` (post-flip) —
+#    PARTIALLY ACTIVE + PROVISIONAL. After the auto→adaptive flip (2026-07-12),
+#    `scx_auto` is cost-aware adaptive and `scx_fast` is the decode-max heuristic
+#    (the pre-flip `auto`). The `scx_fast` throughput floors and the `scx_auto`
+#    compression floors are transplanted from the pre-flip numbers (see the
+#    ml_loader + compression blocks). The adaptive `scx_auto` throughput floor is
+#    ACTIVE only for `pbmc10k` (reused from the old `auto_v2` capture — a
+#    conservative lower bound). DEFERRED to the P4.3 recapture: adaptive
+#    `scx_auto` throughput floors for `pbmc3k` / `tabula_sapiens_100k` / census,
+#    and tightening every PROVISIONAL floor to the captured adaptive medians
+#    (min = 0.85× the measured min run). The recapture must also add the looser
+#    raw-path (G1b) floor documented in docs/performance.md.

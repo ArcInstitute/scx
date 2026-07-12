@@ -119,7 +119,7 @@ except ImportError:
 
 _SCX_KEYS = {
     "scx_auto",
-    "scx_auto_v2",
+    "scx_fast",
     "scx_scx1",
     "scx_zstd",
     "scx_lz4",

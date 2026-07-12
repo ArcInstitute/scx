@@ -409,8 +409,9 @@ impl ConvertOptions {
     }
 
     /// Codec-selection intent for the provenance `params_json` (`codec_selection`
-    /// key): the chosen profile (`auto_v2` + `decode_target`, `compact-trial`, an
-    /// explicit codec name, or `auto`) so a downstream reader / gate can verify it.
+    /// key): the resolved profile (`auto`/`fast`/`compact`/`compact-trial` or an
+    /// explicit codec name). The realized per-shard codecs are reported read-side
+    /// by `scx info`; this records only the intent so a gate can verify it.
     pub fn codec_selection_value(&self) -> serde_json::Value {
         codec_selection_json(self.codec, self.codec_trial, self.decode_target)
     }
@@ -418,26 +419,29 @@ impl ConvertOptions {
 
 /// Build the `codec_selection` provenance value from a write's codec choice.
 /// Shared by the streaming coordinators and the pyscx in-memory writer so the
-/// stamp is identical across paths.
+/// stamp is identical across paths. `decode_target` is the internal mechanism
+/// behind the intent axis: `Auto` → `auto`, `Storage`/`Gpu` → `compact`,
+/// `Cpu` → `fast`.
 pub fn codec_selection_json(
     codec: Option<scx_codec::CodecId>,
     codec_trial: bool,
     decode_target: Option<scx_format_io::DecodeTarget>,
 ) -> serde_json::Value {
     use scx_format_io::DecodeTarget;
-    if let Some(dt) = decode_target {
-        let name = match dt {
+    let profile = if let Some(dt) = decode_target {
+        match dt {
             DecodeTarget::Auto => "auto",
-            DecodeTarget::Cpu => "cpu",
-            DecodeTarget::Gpu => "gpu",
-            DecodeTarget::Storage => "storage",
-        };
-        serde_json::json!({"profile": "auto_v2", "decode_target": name})
+            DecodeTarget::Cpu => "fast",
+            DecodeTarget::Gpu | DecodeTarget::Storage => "compact",
+        }
     } else if codec_trial {
-        serde_json::json!({"profile": "compact-trial"})
+        "compact-trial"
     } else {
-        serde_json::json!({"profile": codec.map(|c| c.display_name()).unwrap_or("auto")})
-    }
+        // No adaptive bias and no explicit codec → heuristic single-encode
+        // (the `fast` profile). An explicit codec stamps its own name.
+        codec.map(|c| c.display_name()).unwrap_or("fast")
+    };
+    serde_json::json!({ "profile": profile })
 }
 
 impl Default for ConvertOptions {

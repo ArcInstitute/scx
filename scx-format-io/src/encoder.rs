@@ -502,7 +502,7 @@ pub fn encode_shard_framed(
 }
 
 #[cfg(test)]
-mod auto_v2_tests {
+mod adaptive_codec_tests {
     use super::*;
     use crate::modality::ModalityType;
     use scx_codec::CodecId;
@@ -566,10 +566,11 @@ mod auto_v2_tests {
         .expect("encode")
     }
 
-    /// auto_v2 with decode_target=Cpu is byte-identical to plain auto: Cpu keeps
-    /// the heuristic winner and never runs the ShufDeltaZstd dual-encode.
+    /// The `fast` profile (`DecodeTarget::Cpu`) is byte-identical to a plain
+    /// heuristic single-encode: it keeps the heuristic winner and never runs the
+    /// ShufDeltaZstd dual-encode.
     #[test]
-    fn auto_v2_cpu_matches_auto() {
+    fn fast_matches_heuristic() {
         let (indptr, indices, values) = gen_int_shard(512, 40, 5000, 4);
         let base = FramingConfig {
             row_group_rows: 256,
@@ -577,8 +578,8 @@ mod auto_v2_tests {
             trial: false,
             decode_target: None,
         };
-        let auto = encode(&indptr, &indices, &values, 5000, base);
-        let v2_cpu = encode(
+        let heuristic = encode(&indptr, &indices, &values, 5000, base);
+        let fast = encode(
             &indptr,
             &indices,
             &values,
@@ -589,24 +590,26 @@ mod auto_v2_tests {
             },
         );
         assert_eq!(
-            auto.codec_id(),
-            v2_cpu.codec_id(),
-            "Cpu must keep the heuristic codec"
+            heuristic.codec_id(),
+            fast.codec_id(),
+            "fast must keep the heuristic codec"
         );
         assert_eq!(
-            auto.encoded.indices_bytes, v2_cpu.encoded.indices_bytes,
-            "Cpu auto_v2 must be byte-identical to auto"
+            heuristic.encoded.indices_bytes, fast.encoded.indices_bytes,
+            "fast must be byte-identical to the heuristic single-encode"
         );
-        assert_eq!(auto.section_length, v2_cpu.section_length);
+        assert_eq!(heuristic.section_length, fast.section_length);
     }
 
-    /// auto_v2 with decode_target=Storage adopts ShufDeltaZstd on this
-    /// census-like integer shard (where it compresses better) and never exceeds
-    /// the plain-auto size — the "no size regression vs auto" guard.
+    /// The `auto` (cost-aware) and `compact` (tie-adopt) profiles both adopt
+    /// ShufDeltaZstd on this census-like integer shard, where it wins by well
+    /// more than `ADOPT_MARGIN`, and neither exceeds the heuristic size — the
+    /// "no size regression vs the heuristic" guard.
     #[test]
-    fn auto_v2_storage_adopts_shufdelta_and_no_size_regression() {
+    fn auto_and_compact_adopt_shufdelta_on_large_win() {
         // Larger counts (median > 8) → heuristic Zstd, which ShufDeltaZstd's
-        // delta+shuffle on the structured index/value streams reliably beats.
+        // delta+shuffle on the structured index/value streams reliably beats by
+        // a wide margin (far past ADOPT_MARGIN).
         let (indptr, indices, values) = gen_int_shard(2048, 60, 20000, 255);
         let base = FramingConfig {
             row_group_rows: 256,
@@ -614,41 +617,42 @@ mod auto_v2_tests {
             trial: false,
             decode_target: None,
         };
-        let auto = encode(&indptr, &indices, &values, 20000, base);
-        let v2_storage = encode(
-            &indptr,
-            &indices,
-            &values,
-            20000,
-            FramingConfig {
-                decode_target: Some(DecodeTarget::Storage),
-                ..base
-            },
-        );
+        let heuristic = encode(&indptr, &indices, &values, 20000, base);
         assert_eq!(
-            auto.codec_id(),
+            heuristic.codec_id(),
             CodecId::Zstd as u8,
             "large-count heuristic is Zstd"
         );
-        assert_eq!(
-            v2_storage.codec_id(),
-            CodecId::ShufDeltaZstd as u8,
-            "Storage should adopt ShufDeltaZstd where it compresses better"
-        );
-        // Core no-regression guarantee: Storage picks the smaller-or-equal codec.
-        assert!(
-            v2_storage.section_length <= auto.section_length,
-            "auto_v2/Storage ({}) must not exceed auto ({})",
-            v2_storage.section_length,
-            auto.section_length
-        );
-        assert!(v2_storage.section_length > 0);
+        for dt in [DecodeTarget::Auto, DecodeTarget::Storage] {
+            let adaptive = encode(
+                &indptr,
+                &indices,
+                &values,
+                20000,
+                FramingConfig {
+                    decode_target: Some(dt),
+                    ..base
+                },
+            );
+            assert_eq!(
+                adaptive.codec_id(),
+                CodecId::ShufDeltaZstd as u8,
+                "{dt:?} should adopt ShufDeltaZstd on a large win"
+            );
+            assert!(
+                adaptive.section_length <= heuristic.section_length,
+                "{dt:?} ({}) must not exceed the heuristic ({})",
+                adaptive.section_length,
+                heuristic.section_length
+            );
+            assert!(adaptive.section_length > 0);
+        }
     }
 
     /// Float modality stays Pcodec under every decode target (ShufDeltaZstd never
     /// competes for float).
     #[test]
-    fn auto_v2_float_stays_pcodec() {
+    fn adaptive_float_stays_pcodec() {
         let (indptr, indices, _) = gen_int_shard(256, 20, 5000, 4);
         let nnz = *indptr.last().unwrap() as usize;
         let values: Vec<f32> = (0..nnz).map(|i| (i as f32) * 0.5 + 0.25).collect();
