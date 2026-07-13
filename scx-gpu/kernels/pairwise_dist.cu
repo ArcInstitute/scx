@@ -48,8 +48,12 @@ extern "C" __global__ void pairwise_dist_sum_kernel(
     for (long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total;
          idx += (long long)gridDim.x * blockDim.x) {
-        long long i = idx % na;
+        // idx = i + j*na. Derive (i,j) with one 64-bit division and a
+        // mul-subtract — avoids the second slow 64-bit modulo (GPUs emulate
+        // 64-bit div/mod in software). Kept 64-bit: na*nb can exceed 2^31 for
+        // large control groups, so a 32-bit cast would overflow.
         long long j = idx / na;
+        long long i = idx - j * na;
         double g = (double)gram[idx];
         double dist;
         if (mode == 0) {

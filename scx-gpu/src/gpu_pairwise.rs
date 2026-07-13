@@ -90,14 +90,30 @@ pub fn gpu_mean_pairwise_distance(
         });
     }
 
+    // Self-distance fast path: `compute_energy_distance_gpu` calls this with
+    // the SAME slice for `a` and `b` for every control and per-perturbation
+    // self term (`mean_pair(&group, &group, ..)`). When so, upload +
+    // normalize + squared-norm the data once and reuse the buffer for both
+    // gemm operands — halving the host→device copy, the cosine normalize, and
+    // the col_sqnorm launches on those calls. Numerically identical (same
+    // buffers feed the gemm / reduce).
+    let is_self = std::ptr::eq(a, b);
+
     // Row-major [n × d] host slice == col-major [d × n] device buffer.
     let mut a_dev = dev.htod_copy(a)?;
-    let mut b_dev = dev.htod_copy(b)?;
-
     if cosine {
         gpu_harmony_l2_normalize_cols(dev, &mut a_dev, d, na)?;
-        gpu_harmony_l2_normalize_cols(dev, &mut b_dev, d, nb)?;
     }
+    let b_dev_opt = if is_self {
+        None
+    } else {
+        let mut b_dev = dev.htod_copy(b)?;
+        if cosine {
+            gpu_harmony_l2_normalize_cols(dev, &mut b_dev, d, nb)?;
+        }
+        Some(b_dev)
+    };
+    let b_dev: &CudaSlice<f32> = b_dev_opt.as_ref().unwrap_or(&a_dev);
 
     // gram[na × nb] (col-major) = a_i · b_j — same gemm shape as
     // gpu_harmony_distances_gemm, with alpha=1 (the −2 is applied in finalize).
@@ -106,7 +122,7 @@ pub fn gpu_mean_pairwise_distance(
         handle,
         dev.stream(),
         &a_dev,
-        &b_dev,
+        b_dev,
         &mut gram,
         na,
         nb,
@@ -118,14 +134,18 @@ pub fn gpu_mean_pairwise_distance(
     )?;
 
     // Squared norms (euclidean only; cosine ignores them — pass dummies).
-    let (a_sq, b_sq) = if cosine {
-        (dev.alloc_zeros::<f64>(1)?, dev.alloc_zeros::<f64>(1)?)
+    // For a self-distance a_sq == b_sq, so compute it once and alias.
+    let a_sq = if cosine {
+        dev.alloc_zeros::<f64>(1)?
     } else {
-        (
-            col_sqnorm(dev, &a_dev, d, na)?,
-            col_sqnorm(dev, &b_dev, d, nb)?,
-        )
+        col_sqnorm(dev, &a_dev, d, na)?
     };
+    let b_sq_opt = if cosine || is_self {
+        None
+    } else {
+        Some(col_sqnorm(dev, b_dev, d, nb)?)
+    };
+    let b_sq: &CudaSlice<f64> = b_sq_opt.as_ref().unwrap_or(&a_sq);
 
     let mut out = dev.alloc_zeros::<f64>(1)?;
     let module = dev.load_module_cached(PAIRWISE_DIST_PTX)?;
@@ -146,7 +166,7 @@ pub fn gpu_mean_pairwise_distance(
             .launch_builder(&func)
             .arg(&gram)
             .arg(&a_sq)
-            .arg(&b_sq)
+            .arg(b_sq)
             .arg(&na_i64)
             .arg(&nb_i64)
             .arg(&mode)

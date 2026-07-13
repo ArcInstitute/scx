@@ -522,8 +522,10 @@ fn pseudobulk_means_impl<'py>(
         ));
     }
 
-    // Convert to numpy [P, G] float64 array.
-    let counts_array = np.call_method1("array", (result.counts.clone(),))?;
+    // Convert to numpy [P, G] float64 array. `from_vec` is a zero-copy move of
+    // the Rust Vec into a numpy array — avoids the slow `np.array(list)` path
+    // that allocates a Python float per element before copying back.
+    let counts_array = numpy::PyArray::from_vec(py, result.counts).into_any();
     let means_2d = counts_array.call_method1("reshape", ((result.n_groups, result.n_vars),))?;
 
     // Extract group names (first column of group_labels, since we only have
@@ -781,7 +783,7 @@ fn compute_obsm_pseudobulk<'py>(
                     "no groups passed the min_cells_per_group filter",
                 ));
             }
-            let means_arr = np.call_method1("array", (result.counts.clone(),))?;
+            let means_arr = numpy::PyArray::from_vec(py, result.counts).into_any();
             let means_2d =
                 means_arr.call_method1("reshape", ((result.n_groups, result.n_vars),))?;
             let group_names: Vec<String> =
@@ -830,7 +832,7 @@ fn compute_obsm_pseudobulk<'py>(
 
     let group_names: Vec<String> = groups.iter().map(|(name, _)| name.clone()).collect();
 
-    let means_arr = np.call_method1("array", (means_data,))?;
+    let means_arr = numpy::PyArray::from_vec(py, means_data).into_any();
     let means_2d = means_arr.call_method1("reshape", ((n_groups, n_dims),))?;
 
     Ok((means_2d, group_names))
