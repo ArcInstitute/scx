@@ -842,6 +842,13 @@ def accel_formats() -> list[FormatVariant]:
     except ImportError:
         pass
     try:
+        from benchmarks.comprehensive.benchmarks.accel_eval_metrics import (
+            accel_eval_metrics_variants,
+        )
+        out.extend(accel_eval_metrics_variants())
+    except ImportError:
+        pass
+    try:
         from benchmarks.comprehensive.benchmarks.bench_csc_dispatch import (
             bench_csc_dispatch_variants,
         )
@@ -1146,6 +1153,12 @@ def estimate_memory_gb(
         # Bounded by the dense materialisation of the small fixture; size like
         # accel_de's chunked-dense tier.
         peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark == "accel_eval_metrics":
+        # Paired real/pred AnnData held simultaneously + per-group pseudobulk
+        # means + an O(n_perts^2) GEMM staging area for energy_distance. Same
+        # working-set shape as cell_eval_parity_perf (which holds the same pair)
+        # but without the extra raw_adata copy — size like it, slightly leaner.
+        peak_mb = max(base_mb * 2, dense_mb * 2.0)
     elif benchmark == "bench_csc_dispatch":
         # CSC dispatch benchmark — peak RSS dominated by the operation
         # being run (qc / hvg / de / pseudobulk). DE chunked dense
@@ -1341,6 +1354,11 @@ def estimate_time_minutes(
         # scale (100 perts × 18K genes) costs tens of seconds per call, so the
         # CPU-baseline + concordance triple-run dominates. Generous base.
         "accel_de_nb_glm":        60,
+        # GPU eval metrics: the GPU variant runs one op gpu×reps + cpu×reps on a
+        # paired real/pred fixture. energy_distance is O(N²) in cells per pert
+        # on the CPU baseline, so the CPU triple-run dominates at the larger
+        # synthetic tiers; the gate tier (pert_synth_10k) is fast.
+        "accel_eval_metrics":     60,
         # CSC dispatch sweep runs eight ops (qc/hvg/de/pseudobulk × csr/csc)
         # against a converted CSC-equipped fixture; one-shot conversion is
         # cached per dataset so the per-variant work is bounded by the op

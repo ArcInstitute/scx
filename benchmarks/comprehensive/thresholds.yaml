@@ -136,6 +136,28 @@ absolute_floors:
     metric: nb_glm_pdex_ref_concordant
     min: 1.0
 
+  # GPU perturbation-evaluation metric route gates. `accel_eval_metrics.py`
+  # emits `<op>_route_gpu_correct` (1.0 when a `gpu_*` route ran, 0.0 on a
+  # silent GPU→CPU fallback) for the two GPU-capable cell-eval effect metrics,
+  # gated on the small synthetic paired fixture `pert_synth_10k`. The GPU
+  # variant is skipped on non-GPU hosts (returns None → no JSON), so
+  # `check_absolute_floors` treats it as a scoped-out triple there; a present
+  # row always means GPU was attempted. A cpu_* route on the GPU variant means
+  # device= didn't thread through / the planner regressed. CPU↔GPU concordance
+  # and GPU speedup are surfaced-not-floored (node-dependent / covered by the
+  # pyscx parity tests). `discrimination_score` GPU is deferred (see § "Deferred
+  # floors"), so it has no live route floor.
+  - benchmark: accel_eval_metrics
+    format: accel_eval_metrics__pyscx_perturbation_metrics_gpu
+    dataset: pert_synth_10k
+    metric: perturbation_metrics_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_eval_metrics
+    format: accel_eval_metrics__pyscx_energy_distance_gpu
+    dataset: pert_synth_10k
+    metric: energy_distance_route_gpu_correct
+    min: 1.0
+
   # CSC dispatch verification. `bench_csc_dispatch.py` emits
   # `csc_dispatch_correct` per run for ops that stamp a route: 1.0 when the
   # variant's intended layout actually dispatched (a `_csc` variant ran a route
@@ -1970,3 +1992,15 @@ absolute_floors:
 #    and tightening every PROVISIONAL floor to the captured adaptive medians
 #    (min = 0.85× the measured min run). The recapture must also add the looser
 #    raw-path (G1b) floor documented in docs/performance.md.
+#
+# 6. discrimination_route_gpu_correct (GPU discrimination_score)
+#    The GPU eval-metric route floors (perturbation_metrics_route_gpu_correct,
+#    energy_distance_route_gpu_correct) are now ACTIVE `absolute_floors` rows
+#    above, gated on `pert_synth_10k` via the `accel_eval_metrics` bench module.
+#    `discrimination_score` GPU stays DEFERRED: it needs exact-rank parity
+#    (`rank = count(d < correct_dist)`) that an f32 cuBLAS gemm can't guarantee
+#    (f32 rounding can flip near-tie ranks), and it is already fast on the small
+#    `[P×G]` effect matrix — low ROI. When a GPU kernel lands (exact-rank-safe),
+#    add a `discrimination_route_gpu_correct` floor mirroring the two above, plus
+#    an `accel_eval_metrics__pyscx_discrimination_score_gpu` variant. The
+#    `discrimination_score` op stamps only `cpu_*` routes today.

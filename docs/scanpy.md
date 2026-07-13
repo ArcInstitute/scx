@@ -1305,7 +1305,8 @@ calls on large datasets.
 ## Rust-native accelerators
 
 SCX includes optional Rust-native implementations of PCA, kNN graph
-construction, UMAP embedding, Leiden clustering, and differential expression
+construction, UMAP embedding, Leiden clustering, differential expression, and
+the perturbation-evaluation metrics (`perturbation_metrics`, `energy_distance`)
 via `pyscx.accel`. These accelerators are 2–40× faster than their scanpy
 equivalents at scale (>100K cells) while writing results to the same AnnData
 slots — so downstream scanpy functions (plotting, etc.) work identically.
@@ -1366,10 +1367,21 @@ All accelerators that support GPU expose a `device` parameter:
 | `pseudobulk_dex`         | ✓   | —   | `groupby`, `design`, `reference`                                      | `test_col`, `aggr_method`, `stratify_by`, `prefer_format`, `backend`, `nbglm_options`, `gene_indices`, `n_cpus` |
 | `nb_glm`                 | ✓   | —   | — (no scanpy equivalent)                                             | `counts`, `design`, `contrast`                 |
 | `pdex_nb_glm`            | ✓   | —   | — (no scanpy equivalent)                                             | `groupby`, `reference`, `stratify_by`          |
+| `pseudobulk_means`       | ✓   | ✓   | — (no scanpy equivalent)                                             | `groupby`, `min_cells_per_group`, `device`     |
+| `perturbation_metrics`   | ✓   | ✓   | — (cell-eval metric)                                                 | `pert_col`, `control`, `metrics`, `min_cells_per_group`, `device` |
+| `energy_distance`        | ✓   | ✓²  | — (cell-eval metric)                                                 | `pert_col`, `control`, `metric`, `embed_key`, `backend`, `dtype`, `device` |
+| `discrimination_score`   | ✓   | —   | — (cell-eval metric)                                                 | `pert_col`, `control`, `metric`, `exclude_target_gene`, `embed_key` |
 
 ¹ GPU Leiden has a documented label-stability divergence vs `leidenalg` —
 pin `device="cpu"` to preserve label stability for downstream DE / annotation
 transfer. See `CLAUDE.md § Known Limitations`.
+
+² GPU `energy_distance` covers **euclidean + cosine** at `dtype="f32"` (gemm
+decomposition). `metric="l1"` and `dtype="f64"` stay on CPU even under
+`device="gpu"` (route `cpu_csr`, no error). `discrimination_score` has no GPU
+kernel yet — it needs exact-rank parity that f32 gemm can't guarantee, and is
+already fast on the small `[P×G]` effect matrix; `device` is accepted for
+symmetry but always runs CPU.
 
 ### `prefer_format="csr"|"csc"`: explicit column-major dispatch
 
@@ -1504,8 +1516,10 @@ to catch.
 via absolute-floor gates in `thresholds.yaml`. Every `accel_*.py` GPU variant
 emits an `<op>_route_gpu_correct` signal (1.0 when a GPU route ran, 0.0 on a
 silent CPU fallback); `bench_csc_dispatch.py` emits `csc_dispatch_correct` for
-CSC-labelled variants; and `accel_de.py` emits `de_route_csc_direct` for the
-pdex_ref CSC-direct path. See
+CSC-labelled variants; `accel_de.py` emits `de_route_csc_direct` for the
+pdex_ref CSC-direct path; and `accel_eval_metrics.py` emits
+`perturbation_metrics_route_gpu_correct` / `energy_distance_route_gpu_correct`
+for the perturbation-evaluation metric GPU variants. See
 [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating)
 for the full gate table.
 
@@ -2389,6 +2403,7 @@ results = pyscx.accel.perturbation_metrics(
 | `control` | `"control"` | Control label |
 | `metrics` | all 5 | Subset of `{pearson_delta, mse, mae, mse_delta, mae_delta}` |
 | `min_cells_per_group` | 1 | Skip perturbations with fewer cells |
+| `device` | `"auto"` | `"auto"`/`"cpu"`/`"gpu"`/`"gpu:N"` — GPU runs the per-group pseudobulk means on the device (f64), bulk metrics on the host; CPU parity `atol≈1e-6`. Route `gpu_dense` / `cpu_csr`. |
 
 #### Discrimination score (`pyscx.accel.discrimination_score`)
 
@@ -2449,6 +2464,19 @@ reductions always accumulate in `f64` regardless. Default `"f32"` is
 ~2× faster than `"f64"` on AVX2 and matches `f64` within `atol=1e-4`
 (verified by `pyscx/tests/test_cell_eval_parity.py::TestEdistanceParity`,
 parametrised over `dtype ∈ {"f32", "f64"}`).
+
+**GPU** (`device="gpu"`/`"auto"` on a GPU host, requires a `--features gpu`
+build): the gemm decomposition runs on the device (one cuBLAS `sgemm` for
+the `aᵀb` gram, per-point squared norms + a finalize/reduce kernel summing
+distances in `f64`), reusing the harmony L2-normalize-columns kernel for the
+cosine pre-normalization. GPU covers **euclidean + cosine** at `dtype="f32"`
+only; `metric="l1"` (no gemm decomposition) and `dtype="f64"` stay on the CPU
+path even under `device="gpu"` — the route is stamped `cpu_csr` rather than
+erroring. GPU parity with the CPU is at the same `atol=1e-4` correlation bar.
+Route `gpu_dense` / `cpu_csr`, recorded on
+`adata.uns["scx_accel"]["energy_distance"]`. Because energy distance is
+`O(N²)` in cells per perturbation (auto-skipped ≥ 500K cells on the CPU
+reference), the GPU path is what makes it tractable at scale.
 
 SCX's implementation avoids materializing the `[N, N]` distance matrix per
 perturbation (streaming accumulation of per-row sums even on the gemm
@@ -2696,7 +2724,8 @@ parallelism — see [docs/multithreading.md](multithreading.md).
 | `pyscx.accel.rank_genes_groups` | Rayon | Parallel Wilcoxon rank-sum across genes |
 | `pyscx.accel.pseudobulk_dex` | Rayon (aggregation) | Streaming aggregation is parallel; downstream `pydeseq2` testing runs single-threaded |
 | `pyscx.accel.highly_variable_genes` | Rayon (via streaming reader) | Parallelism comes from shard decode; the mean/var reduction itself is serial |
-| `pyscx.accel.perturbation_metrics`, `discrimination_score`, `energy_distance` | Rayon | Parallelizes across perturbations / pairwise-distance rows |
+| `pyscx.accel.perturbation_metrics`, `energy_distance` | Rayon (CPU) or GPU | CPU parallelizes across perturbations / pairwise-distance rows; GPU runs pseudobulk means (`perturbation_metrics`) or a gemm pairwise-distance mean (`energy_distance`, euclidean/cosine f32) on the device |
+| `pyscx.accel.discrimination_score` | Rayon (CPU only) | Parallelizes across perturbations; no GPU kernel (exact-rank parity not f32-safe) |
 | `pyscx.accel.knockdown_efficiency`, `clustering_agreement` | Rayon | Parallel per-perturbation / per-label reductions |
 | `pyscx.accel.harmony` (batch correction) | Rayon | Parallel per-cluster correction |
 | `pyscx.accel.normalize_total`, `log1p`, `filter_cells`, `filter_genes`, `calculate_qc_metrics` | Rayon (via streaming reader) | Lazy — no work until materialized or consumed |

@@ -49,6 +49,229 @@ fn scaffold_device_route(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// GPU dispatch for the pseudobulk aggregation.
+//
+// `perturbation_metrics` / `pseudobulk_means` GPU-accelerate the pseudobulk
+// aggregation (the cell-count-scaling step) via `scx_accel::pseudobulk_means_gpu_*`,
+// which wrap the DE pseudobulk kernels. The resulting `[P×G]` f64 means then flow
+// through the unchanged host alignment + `compute_bulk_metrics`. The GPU device
+// handle is `!Send`, so the GPU folds hold the GIL (they run on-device); the CPU
+// fallbacks release it via `py.detach`.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// GPU device id from a resolved device (always `None` without the gpu feature).
+fn eval_resolve_gpu_id(resolved: super::gpu::ResolvedDevice) -> Option<usize> {
+    #[cfg(feature = "gpu")]
+    {
+        resolved.gpu_id()
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = resolved;
+        None
+    }
+}
+
+#[cfg(feature = "gpu")]
+type EvalGpuDev = Option<scx_accel::GpuDevice>;
+#[cfg(not(feature = "gpu"))]
+type EvalGpuDev = Option<()>;
+
+/// Build the reusable GPU device handle (`None` → CPU). Errors only on CUDA
+/// context-creation failure.
+fn eval_make_gpu_dev(gpu_device_id: Option<usize>) -> PyResult<EvalGpuDev> {
+    #[cfg(feature = "gpu")]
+    {
+        match gpu_device_id {
+            Some(id) => Ok(Some(scx_accel::GpuDevice::new(id).map_err(|e| {
+                PyRuntimeError::new_err(format!("GPU eval-metrics device init failed: {e}"))
+            })?)),
+            None => Ok(None),
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = gpu_device_id;
+        Ok(None)
+    }
+}
+
+/// Resolve device + plan the route for `energy_distance` / `energy_distance_details`.
+///
+/// GPU `energy_distance` is gemm-based (f32) and covers **euclidean/cosine only**;
+/// L1 (no gemm decomposition) and f64 stay on CPU. So the op is GPU-eligible only
+/// when built with the gpu feature AND the metric isn't L1 AND the dtype is f32
+/// (the default). Returns the (possibly `None`) device handle and the planned
+/// `AccelExecutionInfo`; the caller stamps it via `write_accel_route` after
+/// compute. Route pair: `gpu_dense` / `cpu_csr` (cells materialise dense).
+fn edist_device_dispatch(
+    py: Python<'_>,
+    op: &'static str,
+    device: &str,
+    metric: &str,
+    dtype: Option<&str>,
+) -> PyResult<(EvalGpuDev, scx_accel::route::AccelExecutionInfo)> {
+    let resolved = super::gpu::resolve_device(device)?;
+    let metric_is_l1 = matches!(
+        metric.to_ascii_lowercase().as_str(),
+        "l1" | "manhattan" | "cityblock"
+    );
+    let dtype_is_f32 = matches!(
+        dtype.map(|s| s.to_ascii_lowercase()).as_deref(),
+        None | Some("f32") | Some("float32")
+    );
+    let gpu_eligible = cfg!(feature = "gpu") && !metric_is_l1 && dtype_is_f32;
+    let info = super::route::simple_exec_info(
+        device,
+        gpu_eligible,
+        scx_accel::route::AccelRoute::GpuDense,
+        scx_accel::route::AccelRoute::CpuCsr,
+    );
+    super::route::announce_route(py, op, device, &info);
+    let gpu_id = if info.route.is_gpu() {
+        eval_resolve_gpu_id(resolved)
+    } else {
+        None
+    };
+    let gpu_dev = eval_make_gpu_dev(gpu_id)?;
+    Ok((gpu_dev, info))
+}
+
+/// Backed-CSR pseudobulk means — GPU when `gpu_dev` is `Some`, else CPU.
+fn agg_backed(
+    py: Python<'_>,
+    gpu_dev: &EvalGpuDev,
+    reader: &scx_format_io::backed::BackedCsrReader,
+    obs_groups: &[Vec<String>],
+    groupby_columns: &[String],
+    gene_names: &[String],
+    min_cells_per_group: usize,
+) -> scx_accel::Result<scx_accel::PseudobulkResult> {
+    #[cfg(feature = "gpu")]
+    {
+        if let Some(dev) = gpu_dev {
+            return scx_accel::pseudobulk_means_gpu_backed(
+                dev,
+                reader,
+                obs_groups,
+                groupby_columns,
+                gene_names,
+                min_cells_per_group,
+            );
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = gpu_dev;
+    }
+    py.detach(|| {
+        scx_accel::pseudobulk_aggregate(
+            reader,
+            obs_groups,
+            groupby_columns,
+            gene_names,
+            scx_accel::AggregationMethod::Mean,
+            min_cells_per_group,
+        )
+    })
+}
+
+/// In-memory CSR-slice pseudobulk means — GPU when `gpu_dev` is `Some`, else CPU.
+#[allow(clippy::too_many_arguments)]
+fn agg_from_slices(
+    py: Python<'_>,
+    gpu_dev: &EvalGpuDev,
+    shape: (usize, usize),
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    obs_groups: &[Vec<String>],
+    groupby_columns: &[String],
+    gene_names: &[String],
+    min_cells_per_group: usize,
+) -> scx_accel::Result<scx_accel::PseudobulkResult> {
+    #[cfg(feature = "gpu")]
+    {
+        if let Some(dev) = gpu_dev {
+            return scx_accel::pseudobulk_means_gpu_from_slices(
+                dev,
+                shape,
+                indptr,
+                indices,
+                data,
+                obs_groups,
+                groupby_columns,
+                gene_names,
+                min_cells_per_group,
+            );
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = gpu_dev;
+    }
+    py.detach(|| {
+        scx_accel::pseudobulk_aggregate_from_slices(
+            shape,
+            indptr,
+            indices,
+            data,
+            obs_groups,
+            groupby_columns,
+            gene_names,
+            scx_accel::AggregationMethod::Mean,
+            min_cells_per_group,
+        )
+    })
+}
+
+/// Dense pseudobulk means (in-memory dense X or obsm embedding) — GPU when
+/// `gpu_dev` is `Some`, else CPU. Note the GPU dense kernel is f32; for f64
+/// embeddings the caller downcasts, so GPU/CPU parity on the `embed_key` path
+/// is at the f32 bar (~1e-4), not the 1e-6 of the sparse gene-space paths.
+#[allow(clippy::too_many_arguments)]
+fn agg_dense(
+    py: Python<'_>,
+    gpu_dev: &EvalGpuDev,
+    data: &[f32],
+    shape: (usize, usize),
+    obs_groups: &[Vec<String>],
+    groupby_columns: &[String],
+    gene_names: &[String],
+    min_cells_per_group: usize,
+) -> scx_accel::Result<scx_accel::PseudobulkResult> {
+    #[cfg(feature = "gpu")]
+    {
+        if let Some(dev) = gpu_dev {
+            return scx_accel::pseudobulk_means_gpu_dense(
+                dev,
+                data,
+                shape,
+                obs_groups,
+                groupby_columns,
+                gene_names,
+                min_cells_per_group,
+            );
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = gpu_dev;
+    }
+    py.detach(|| {
+        scx_accel::pseudobulk_aggregate_dense(
+            data,
+            shape,
+            obs_groups,
+            groupby_columns,
+            gene_names,
+            scx_accel::AggregationMethod::Mean,
+            min_cells_per_group,
+        )
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // pseudobulk_means
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -84,8 +307,25 @@ pub fn pseudobulk_means<'py>(
     min_cells_per_group: usize,
     device: &str,
 ) -> PyResult<Py<PyAny>> {
-    scaffold_device_route(py, adata, "pseudobulk_means", device)?;
-    pseudobulk_means_impl(py, adata, groupby, min_cells_per_group)
+    // Phase 2: GPU-accelerate the aggregation. Sparse X → gpu_csr, dense/obsm →
+    // gpu_dense (route stamped GpuCsr either way — the op ran on GPU); CPU/auto-
+    // on-CPU-host / non-gpu-build fall through to the CPU path.
+    let resolved = super::gpu::resolve_device(device)?;
+    let info = super::route::simple_exec_info(
+        device,
+        cfg!(feature = "gpu"),
+        scx_accel::route::AccelRoute::GpuCsr,
+        scx_accel::route::AccelRoute::CpuCsr,
+    );
+    super::route::announce_route(py, "pseudobulk_means", device, &info);
+    super::route::write_accel_route(py, adata, "pseudobulk_means", &info)?;
+    let gpu_id = if info.route.is_gpu() {
+        eval_resolve_gpu_id(resolved)
+    } else {
+        None
+    };
+    let gpu_dev = eval_make_gpu_dev(gpu_id)?;
+    pseudobulk_means_impl(py, adata, groupby, min_cells_per_group, &gpu_dev)
 }
 
 /// Body of [`pseudobulk_means`] without the device/route scaffolding, so
@@ -97,6 +337,7 @@ fn pseudobulk_means_impl<'py>(
     adata: &Bound<'py, PyAny>,
     groupby: &str,
     min_cells_per_group: usize,
+    gpu_dev: &EvalGpuDev,
 ) -> PyResult<Py<PyAny>> {
     let np = py.import("numpy")?;
 
@@ -128,16 +369,15 @@ fn pseudobulk_means_impl<'py>(
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         let backed_reader = std::sync::Arc::clone(&backed.backed);
         drop(backed);
-        py.detach(|| {
-            scx_accel::pseudobulk_aggregate(
-                &backed_reader,
-                &obs_groups,
-                &groupby_columns,
-                &gene_names,
-                scx_accel::AggregationMethod::Mean,
-                min_cells_per_group,
-            )
-        })
+        agg_backed(
+            py,
+            gpu_dev,
+            &backed_reader,
+            &obs_groups,
+            &groupby_columns,
+            &gene_names,
+            min_cells_per_group,
+        )
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         // Lazy-transformed datasets: materialize through the transform pipeline
@@ -171,19 +411,18 @@ fn pseudobulk_means_impl<'py>(
             .as_slice()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        py.detach(|| {
-            scx_accel::pseudobulk_aggregate_from_slices(
-                shape,
-                indptr_slice,
-                indices_slice,
-                data_slice,
-                &obs_groups,
-                &groupby_columns,
-                &gene_names,
-                scx_accel::AggregationMethod::Mean,
-                min_cells_per_group,
-            )
-        })
+        agg_from_slices(
+            py,
+            gpu_dev,
+            shape,
+            indptr_slice,
+            indices_slice,
+            data_slice,
+            &obs_groups,
+            &groupby_columns,
+            &gene_names,
+            min_cells_per_group,
+        )
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     } else {
         // In-memory: dense fast-path for non-sparse inputs. At Replogle
@@ -217,17 +456,16 @@ fn pseudobulk_means_impl<'py>(
                 .as_slice()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            py.detach(|| {
-                scx_accel::pseudobulk_aggregate_dense(
-                    data_slice,
-                    shape,
-                    &obs_groups,
-                    &groupby_columns,
-                    &gene_names,
-                    scx_accel::AggregationMethod::Mean,
-                    min_cells_per_group,
-                )
-            })
+            agg_dense(
+                py,
+                gpu_dev,
+                data_slice,
+                shape,
+                &obs_groups,
+                &groupby_columns,
+                &gene_names,
+                min_cells_per_group,
+            )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else {
             // True sparse input: extract scipy CSR → zero-copy slices.
@@ -284,8 +522,10 @@ fn pseudobulk_means_impl<'py>(
         ));
     }
 
-    // Convert to numpy [P, G] float64 array.
-    let counts_array = np.call_method1("array", (result.counts.clone(),))?;
+    // Convert to numpy [P, G] float64 array. `from_vec` is a zero-copy move of
+    // the Rust Vec into a numpy array — avoids the slow `np.array(list)` path
+    // that allocates a Python float per element before copying back.
+    let counts_array = numpy::PyArray::from_vec(py, result.counts).into_any();
     let means_2d = counts_array.call_method1("reshape", ((result.n_groups, result.n_vars),))?;
 
     // Extract group names (first column of group_labels, since we only have
@@ -312,7 +552,7 @@ fn pseudobulk_means_impl<'py>(
 /// them to a common set of perturbations (sorted), and return flat f64 arrays.
 ///
 /// Returns: (means_real_flat, means_pred_flat, common_pert_names, n_genes, gene_names)
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn compute_aligned_pseudobulk_means<'py>(
     py: Python<'py>,
     adata_real: &Bound<'py, PyAny>,
@@ -321,6 +561,7 @@ fn compute_aligned_pseudobulk_means<'py>(
     control: &str,
     embed_key: Option<&str>,
     min_cells_per_group: usize,
+    gpu_dev: &EvalGpuDev,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<String>, usize, Vec<String>)> {
     let np = py.import("numpy")?;
 
@@ -344,38 +585,54 @@ fn compute_aligned_pseudobulk_means<'py>(
 
     // For embed_key: use obsm-based pseudobulk (compute manually).
     // For X: use the existing pseudobulk_means infrastructure.
-    let (means_real_np, groups_real, means_pred_np, groups_pred, gene_names) = if let Some(key) =
-        embed_key
-    {
-        // Extract obsm embeddings and compute group means manually
-        let (means_r, groups_r) =
-            compute_obsm_pseudobulk(py, &np, adata_real, pert_col, key, min_cells_per_group)?;
-        let (means_p, groups_p) =
-            compute_obsm_pseudobulk(py, &np, adata_pred, pert_col, key, min_cells_per_group)?;
-        // No gene names when using embeddings
-        let n_dims: usize = means_r.getattr("shape")?.extract::<(usize, usize)>()?.1;
-        let empty_genes: Vec<String> = (0..n_dims).map(|i| format!("embed_{i}")).collect();
-        (means_r, groups_r, means_p, groups_p, empty_genes)
-    } else {
-        // Use standard X-based pseudobulk means
-        let means_real_obj = pseudobulk_means_impl(py, adata_real, pert_col, min_cells_per_group)?;
-        let means_pred_obj = pseudobulk_means_impl(py, adata_pred, pert_col, min_cells_per_group)?;
+    let (means_real_np, groups_real, means_pred_np, groups_pred, gene_names) =
+        if let Some(key) = embed_key {
+            // Extract obsm embeddings and compute group means (GPU dense when a
+            // device is set — see the f32/f64 precision note on `agg_dense`).
+            let (means_r, groups_r) = compute_obsm_pseudobulk(
+                py,
+                &np,
+                adata_real,
+                pert_col,
+                key,
+                min_cells_per_group,
+                gpu_dev,
+            )?;
+            let (means_p, groups_p) = compute_obsm_pseudobulk(
+                py,
+                &np,
+                adata_pred,
+                pert_col,
+                key,
+                min_cells_per_group,
+                gpu_dev,
+            )?;
+            // No gene names when using embeddings
+            let n_dims: usize = means_r.getattr("shape")?.extract::<(usize, usize)>()?.1;
+            let empty_genes: Vec<String> = (0..n_dims).map(|i| format!("embed_{i}")).collect();
+            (means_r, groups_r, means_p, groups_p, empty_genes)
+        } else {
+            // Use standard X-based pseudobulk means
+            let means_real_obj =
+                pseudobulk_means_impl(py, adata_real, pert_col, min_cells_per_group, gpu_dev)?;
+            let means_pred_obj =
+                pseudobulk_means_impl(py, adata_pred, pert_col, min_cells_per_group, gpu_dev)?;
 
-        let real_tuple = means_real_obj.bind(py);
-        let pred_tuple = means_pred_obj.bind(py);
+            let real_tuple = means_real_obj.bind(py);
+            let pred_tuple = means_pred_obj.bind(py);
 
-        let means_r = real_tuple.get_item(0)?;
-        let groups_r: Vec<String> = real_tuple.get_item(1)?.extract()?;
-        let means_p = pred_tuple.get_item(0)?;
-        let groups_p: Vec<String> = pred_tuple.get_item(1)?.extract()?;
+            let means_r = real_tuple.get_item(0)?;
+            let groups_r: Vec<String> = real_tuple.get_item(1)?.extract()?;
+            let means_p = pred_tuple.get_item(0)?;
+            let groups_p: Vec<String> = pred_tuple.get_item(1)?.extract()?;
 
-        // Extract gene names from adata_real.var_names
-        let var = adata_real.getattr("var")?;
-        let var_names = var.getattr("index")?;
-        let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
+            // Extract gene names from adata_real.var_names
+            let var = adata_real.getattr("var")?;
+            let var_names = var.getattr("index")?;
+            let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
 
-        (means_r, groups_r, means_p, groups_p, gene_names)
-    };
+            (means_r, groups_r, means_p, groups_p, gene_names)
+        };
 
     // ── Align perturbation groups ───────────────────────────────────
     if groups_real.is_empty() || groups_pred.is_empty() {
@@ -451,7 +708,9 @@ fn compute_aligned_pseudobulk_means<'py>(
     ))
 }
 
-/// Compute pseudobulk means from adata.obsm[embed_key] using numpy group-by.
+/// Compute pseudobulk means from adata.obsm[embed_key] using numpy group-by
+/// (CPU) or the GPU dense kernel when `gpu_dev` is set.
+#[allow(clippy::too_many_arguments)]
 fn compute_obsm_pseudobulk<'py>(
     py: Python<'py>,
     np: &Bound<'py, PyModule>,
@@ -459,7 +718,11 @@ fn compute_obsm_pseudobulk<'py>(
     pert_col: &str,
     embed_key: &str,
     min_cells_per_group: usize,
+    gpu_dev: &EvalGpuDev,
 ) -> PyResult<(Bound<'py, PyAny>, Vec<String>)> {
+    // `gpu_dev` is only consumed by the `#[cfg(feature = "gpu")]` branch below.
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu_dev;
     let obsm = adata.getattr("obsm")?;
     let embeddings = obsm.get_item(embed_key).map_err(|_| {
         PyValueError::new_err(format!("embed_key '{}' not found in adata.obsm", embed_key))
@@ -484,6 +747,49 @@ fn compute_obsm_pseudobulk<'py>(
             "obs has {} rows but obsm['{embed_key}'] has {n_obs} rows",
             labels.len()
         )));
+    }
+
+    // GPU dense path: aggregate the embedding on the device. The DE dense
+    // kernel is f32, so the f64 embedding is downcast — parity with the CPU
+    // f64 path here is at the f32 bar (see `agg_dense`). Group ordering matches
+    // the CPU `BTreeMap` (both lexicographically sorted via `build_group_mapping`).
+    #[cfg(feature = "gpu")]
+    {
+        if gpu_dev.is_some() {
+            let arr = np
+                .call_method1("asarray", (&embeddings,))?
+                .call_method1("astype", ("float32",))?;
+            let arr = np.call_method1("ascontiguousarray", (&arr,))?;
+            let arr_ro: numpy::PyReadonlyArray2<'_, f32> = arr.extract()?;
+            let data_slice = arr_ro
+                .as_slice()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let obs_groups = vec![labels.clone()];
+            let groupby_columns = vec![pert_col.to_string()];
+            let gene_names: Vec<String> = (0..n_dims).map(|i| format!("embed_{i}")).collect();
+            let result = agg_dense(
+                py,
+                gpu_dev,
+                data_slice,
+                (n_obs, n_dims),
+                &obs_groups,
+                &groupby_columns,
+                &gene_names,
+                min_cells_per_group,
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            if result.n_groups == 0 {
+                return Err(PyRuntimeError::new_err(
+                    "no groups passed the min_cells_per_group filter",
+                ));
+            }
+            let means_arr = numpy::PyArray::from_vec(py, result.counts).into_any();
+            let means_2d =
+                means_arr.call_method1("reshape", ((result.n_groups, result.n_vars),))?;
+            let group_names: Vec<String> =
+                result.group_labels.iter().map(|l| l[0].clone()).collect();
+            return Ok((means_2d, group_names));
+        }
     }
 
     // Group by label and compute mean.
@@ -526,7 +832,7 @@ fn compute_obsm_pseudobulk<'py>(
 
     let group_names: Vec<String> = groups.iter().map(|(name, _)| name.clone()).collect();
 
-    let means_arr = np.call_method1("array", (means_data,))?;
+    let means_arr = numpy::PyArray::from_vec(py, means_data).into_any();
     let means_2d = means_arr.call_method1("reshape", ((n_groups, n_dims),))?;
 
     Ok((means_2d, group_names))
@@ -539,16 +845,78 @@ trait NumpyDtype: numpy::Element + Sized {
     const NUMPY_NAME: &'static str;
     /// Bytes per element — used to gate the "large materialization" warning.
     const BYTES: usize;
+
+    /// GPU energy distance (Phase 3), specialised by element type: `Some(..)`
+    /// for f32 (the GPU path runs), `None` for f64 (no f64 cuBLAS gemm → caller
+    /// falls back to the CPU path). Lets the generic `run_energy_distance_inner`
+    /// dispatch to the GPU kernel only for f32 without runtime type juggling.
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    fn edist_gpu(
+        dev: &scx_accel::GpuDevice,
+        real: &[Self],
+        pred: &[Self],
+        real_groups: &[u32],
+        pred_groups: &[u32],
+        ctrl_group_idx: u32,
+        pert_names: &[String],
+        pert_group_indices: &[u32],
+        n_dims: usize,
+        metric: scx_accel::DistanceMetric,
+    ) -> Option<scx_accel::Result<scx_accel::EDistanceResult>>;
 }
 
 impl NumpyDtype for f32 {
     const NUMPY_NAME: &'static str = "float32";
     const BYTES: usize = 4;
+
+    #[cfg(feature = "gpu")]
+    fn edist_gpu(
+        dev: &scx_accel::GpuDevice,
+        real: &[f32],
+        pred: &[f32],
+        real_groups: &[u32],
+        pred_groups: &[u32],
+        ctrl_group_idx: u32,
+        pert_names: &[String],
+        pert_group_indices: &[u32],
+        n_dims: usize,
+        metric: scx_accel::DistanceMetric,
+    ) -> Option<scx_accel::Result<scx_accel::EDistanceResult>> {
+        Some(scx_accel::compute_energy_distance_gpu(
+            dev,
+            real,
+            pred,
+            real_groups,
+            pred_groups,
+            ctrl_group_idx,
+            pert_names,
+            pert_group_indices,
+            n_dims,
+            metric,
+        ))
+    }
 }
 
 impl NumpyDtype for f64 {
     const NUMPY_NAME: &'static str = "float64";
     const BYTES: usize = 8;
+
+    #[cfg(feature = "gpu")]
+    fn edist_gpu(
+        _dev: &scx_accel::GpuDevice,
+        _real: &[f64],
+        _pred: &[f64],
+        _real_groups: &[u32],
+        _pred_groups: &[u32],
+        _ctrl_group_idx: u32,
+        _pert_names: &[String],
+        _pert_group_indices: &[u32],
+        _n_dims: usize,
+        _metric: scx_accel::DistanceMetric,
+    ) -> Option<scx_accel::Result<scx_accel::EDistanceResult>> {
+        None // f64 has no cuBLAS gemm → CPU fallback
+    }
 }
 
 /// Extract a dense `[N, D]` matrix from `adata.X` (or `adata.obsm[embed_key]`)
@@ -711,7 +1079,23 @@ pub fn perturbation_metrics<'py>(
     min_cells_per_group: usize,
     device: &str,
 ) -> PyResult<Py<PyAny>> {
-    scaffold_device_route(py, adata_pred, "perturbation_metrics", device)?;
+    // Phase 2 GPU dispatch: the pseudobulk aggregation runs on the GPU (mirrors
+    // pdex_nb_glm's skeleton); the five bulk metrics run on the host. `auto` on a
+    // CPU host, `cpu`, and non-gpu builds fall through to the CPU path.
+    let resolved = super::gpu::resolve_device(device)?;
+    let info = super::route::simple_exec_info(
+        device,
+        cfg!(feature = "gpu"),
+        scx_accel::route::AccelRoute::GpuCsr,
+        scx_accel::route::AccelRoute::CpuCsr,
+    );
+    super::route::announce_route(py, "perturbation_metrics", device, &info);
+    let gpu_id = if info.route.is_gpu() {
+        eval_resolve_gpu_id(resolved)
+    } else {
+        None
+    };
+    let gpu_dev = eval_make_gpu_dev(gpu_id)?;
 
     // Determine which metrics to compute.
     let default_metrics = vec![
@@ -745,6 +1129,7 @@ pub fn perturbation_metrics<'py>(
             control,
             embed_key,
             min_cells_per_group,
+            &gpu_dev,
         )?;
 
     let n_perts = common.len();
@@ -772,6 +1157,8 @@ pub fn perturbation_metrics<'py>(
             )
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    super::route::write_accel_route(py, adata_pred, "perturbation_metrics", &info)?;
 
     // Convert to dict[str, dict[str, float]].
     let outer_dict = PyDict::new(py);
@@ -834,10 +1221,13 @@ fn run_energy_distance_inner<'py, F>(
     dist_metric: scx_accel::DistanceMetric,
     embed_key: Option<&str>,
     dist_backend: scx_accel::DistanceBackend,
+    gpu_dev: &EvalGpuDev,
 ) -> PyResult<scx_accel::EDistanceResult>
 where
     F: scx_accel::PairwiseFloat + NumpyDtype,
 {
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu_dev;
     // ── Extract dense matrices from both AnnData objects ────────────
     let (real_flat, n_real, n_dims_real) = materialize_dense::<F>(py, np, adata_real, embed_key)?;
     let (pred_flat, n_pred, n_dims_pred) = materialize_dense::<F>(py, np, adata_pred, embed_key)?;
@@ -912,8 +1302,31 @@ where
         ));
     }
 
-    // Release the GIL for the O(N²) rayon-parallel kernel. All arguments are
-    // owned Vecs or plain scalars.
+    // GPU path (f32 + euclidean/cosine only): F::edist_gpu returns None for f64
+    // so the generic dispatch falls through to CPU. GpuDevice is !Send, so the
+    // GIL is held around the device work (mirrors agg_backed / pdex_nb_glm).
+    #[cfg(feature = "gpu")]
+    if let Some(dev) = gpu_dev.as_ref() {
+        if !matches!(dist_metric, scx_accel::DistanceMetric::L1) {
+            if let Some(res) = F::edist_gpu(
+                dev,
+                &real_flat,
+                &pred_flat,
+                &real_groups,
+                &pred_groups,
+                ctrl_group_idx,
+                &pert_names,
+                &pert_group_indices,
+                n_dims,
+                dist_metric,
+            ) {
+                return res.map_err(|e| PyRuntimeError::new_err(e.to_string()));
+            }
+        }
+    }
+
+    // CPU path. Release the GIL for the O(N²) rayon-parallel kernel. All
+    // arguments are owned Vecs or plain scalars.
     py.detach(|| {
         scx_accel::compute_energy_distance::<F>(
             &real_flat,
@@ -943,6 +1356,7 @@ fn run_energy_distance<'py>(
     embed_key: Option<&str>,
     backend: Option<&str>,
     dtype: Option<&str>,
+    gpu_dev: &EvalGpuDev,
 ) -> PyResult<scx_accel::EDistanceResult> {
     let np = py.import("numpy")?;
 
@@ -973,6 +1387,7 @@ fn run_energy_distance<'py>(
             dist_metric,
             embed_key,
             dist_backend,
+            gpu_dev,
         ),
         Dtype::F64 => run_energy_distance_inner::<f64>(
             py,
@@ -984,6 +1399,7 @@ fn run_energy_distance<'py>(
             dist_metric,
             embed_key,
             dist_backend,
+            gpu_dev,
         ),
     }
 }
@@ -1053,10 +1469,11 @@ pub fn energy_distance<'py>(
     dtype: Option<&str>,
     device: &str,
 ) -> PyResult<f64> {
-    scaffold_device_route(py, adata_pred, "energy_distance", device)?;
+    let (gpu_dev, info) = edist_device_dispatch(py, "energy_distance", device, metric, dtype)?;
     let result = run_energy_distance(
-        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype,
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype, &gpu_dev,
     )?;
+    super::route::write_accel_route(py, adata_pred, "energy_distance", &info)?;
     Ok(result.correlation)
 }
 
@@ -1102,10 +1519,12 @@ pub fn energy_distance_details<'py>(
     dtype: Option<&str>,
     device: &str,
 ) -> PyResult<Py<PyAny>> {
-    scaffold_device_route(py, adata_pred, "energy_distance_details", device)?;
+    let (gpu_dev, info) =
+        edist_device_dispatch(py, "energy_distance_details", device, metric, dtype)?;
     let result = run_energy_distance(
-        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype,
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype, &gpu_dev,
     )?;
+    super::route::write_accel_route(py, adata_pred, "energy_distance_details", &info)?;
 
     let d_real = PyDict::new(py);
     let d_pred = PyDict::new(py);
@@ -1216,6 +1635,7 @@ pub fn discrimination_score<'py>(
             control,
             effective_embed_key,
             min_cells_per_group,
+            &None, // discrimination_score / clustering_agreement stay CPU (Phase 3)
         )?;
 
     let n_perts = common.len();
@@ -1540,6 +1960,7 @@ pub fn clustering_agreement<'py>(
             control,
             embed_key,
             min_cells_per_group,
+            &None, // discrimination_score / clustering_agreement stay CPU (Phase 3)
         )?;
 
     let n_perts = common.len();

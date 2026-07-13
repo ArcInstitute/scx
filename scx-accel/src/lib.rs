@@ -40,6 +40,8 @@ pub use diffexp::{
     DiffExpResult, PdexRefResult,
 };
 pub use error::{AccelError, Result};
+#[cfg(feature = "gpu")]
+pub use eval_metrics::edistance::compute_energy_distance_gpu;
 pub use eval_metrics::{
     bulk_metrics::{compute_bulk_metrics, pearson_correlation, BulkMetric, BulkMetricsResult},
     clustering::{
@@ -76,6 +78,10 @@ pub use pseudobulk::{
     build_group_mapping, pseudobulk_aggregate, pseudobulk_aggregate_dense,
     pseudobulk_aggregate_from_slices, pseudobulk_aggregate_inmemory, AggregationMethod,
     GeomMeanMode, PseudobulkResult,
+};
+#[cfg(feature = "gpu")]
+pub use pseudobulk::{
+    pseudobulk_means_gpu_backed, pseudobulk_means_gpu_dense, pseudobulk_means_gpu_from_slices,
 };
 #[cfg(feature = "gpu")]
 pub use route::plan_de_route_from_source;

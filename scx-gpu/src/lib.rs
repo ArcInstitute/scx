@@ -62,9 +62,11 @@ pub mod gpu_hvg;
 pub mod gpu_knn;
 pub mod gpu_matrix_source;
 pub mod gpu_nb_glm;
+pub mod gpu_pairwise;
 pub mod gpu_pca;
 pub mod gpu_pca_resident;
 pub mod gpu_preprocess;
+pub mod gpu_pseudobulk;
 pub mod gpu_shard_source;
 pub mod linear_operator;
 pub mod math_policy;
@@ -126,6 +128,7 @@ pub use gpu_nb_glm::{
     gpu_nb_glm_fit, GpuNbGlmFit, GpuNbGlmOpts, GpuNbGlmPass, GPU_NB_GLM_METHOD_CR_MLE,
     GPU_NB_GLM_METHOD_CR_SHRUNK, GPU_NB_GLM_METHOD_MOMENTS, GPU_NB_GLM_NSUB_MAX, GPU_NB_GLM_PMAX,
 };
+pub use gpu_pairwise::gpu_mean_pairwise_distance;
 pub use gpu_pca::{
     gpu_randomized_pca, gpu_randomized_pca_device, mean_correct_gpu, GpuPcaDeviceResult,
     GpuPcaResult,
@@ -133,6 +136,7 @@ pub use gpu_pca::{
 pub use gpu_preprocess::{
     gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,
 };
+pub use gpu_pseudobulk::{gpu_pseudobulk_means_csr, gpu_pseudobulk_means_dense};
 pub use gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource, RawGpuShardSource};
 pub use linear_operator::CenteredSparseOperator;
 pub use math_policy::{GpuMathMode, GpuPcaTuning, SpmmAlgPolicy};
