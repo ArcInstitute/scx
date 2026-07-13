@@ -609,6 +609,190 @@ fn filter_and_build_result(
     })
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// GPU pseudobulk means.
+//
+// GPU-accelerate ONLY the aggregation (the cell-count-scaling step): produce
+// per-group means `[n_groups × n_vars]` f64 by wrapping the scx-gpu DE
+// pseudobulk primitives, then reuse `filter_and_build_result` so the
+// `PseudobulkResult` is identical to the CPU `pseudobulk_aggregate*` output
+// (same lexicographic group ordering, min-cells filtering, and cell counts).
+// The five bulk metrics run downstream on the host. GPU sums accumulate in f64
+// with the identity pre-transform, matching the CPU f32→f64 accumulate.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Sorted group mapping shared by the GPU means paths: per-cell group id (i32,
+/// in the same lexicographic order as [`build_group_mapping`]), the sorted
+/// group labels, and per-group cell counts.
+#[cfg(feature = "gpu")]
+fn gpu_group_plan(
+    obs_groups: &[Vec<String>],
+    n_obs: usize,
+) -> (Vec<i32>, Vec<Vec<String>>, Vec<usize>) {
+    let (cell_to_group, group_labels) = build_group_mapping(obs_groups, n_obs);
+    let n_groups = group_labels.len();
+    let mut cell_counts = vec![0usize; n_groups];
+    for &g in &cell_to_group {
+        cell_counts[g] += 1;
+    }
+    let cell_to_group_i32 = cell_to_group.iter().map(|&g| g as i32).collect();
+    (cell_to_group_i32, group_labels, cell_counts)
+}
+
+/// GPU pseudobulk **means** from a backed CSR reader. Mirrors
+/// [`pseudobulk_aggregate`] with `AggregationMethod::Mean`, but streams the
+/// shards in-VRAM and folds them with the DE pseudobulk kernel on the GPU.
+#[cfg(feature = "gpu")]
+pub fn pseudobulk_means_gpu_backed(
+    dev: &scx_gpu::GpuDevice,
+    reader: &scx_format_io::backed::BackedCsrReader,
+    obs_groups: &[Vec<String>],
+    groupby_columns: &[String],
+    gene_names: &[String],
+    min_cells_per_group: usize,
+) -> Result<PseudobulkResult> {
+    let n_obs = reader.n_obs();
+    let n_vars = reader.n_vars();
+    validate_inputs(obs_groups, groupby_columns, gene_names, n_obs, n_vars)?;
+
+    let (cell_to_group, group_labels, cell_counts) = gpu_group_plan(obs_groups, n_obs);
+    let n_groups = group_labels.len();
+
+    let means = scx_gpu::gpu_pseudobulk_means_csr(
+        dev,
+        reader,
+        &cell_to_group,
+        n_groups,
+        n_vars,
+        &cell_counts,
+    )
+    .map_err(|e| crate::AccelError::LinAlg(format!("GPU pseudobulk means (backed): {e}")))?;
+
+    filter_and_build_result(
+        means,
+        group_labels,
+        groupby_columns,
+        cell_counts,
+        gene_names,
+        n_groups,
+        n_vars,
+        min_cells_per_group,
+    )
+}
+
+/// GPU pseudobulk means from in-memory CSR slices (scipy CSR). Mirrors
+/// [`pseudobulk_aggregate_from_slices`] with `Mean`; wraps the borrowed CSR in
+/// a single-shard source for the streaming kernel.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn pseudobulk_means_gpu_from_slices(
+    dev: &scx_gpu::GpuDevice,
+    shape: (usize, usize),
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    obs_groups: &[Vec<String>],
+    groupby_columns: &[String],
+    gene_names: &[String],
+    min_cells_per_group: usize,
+) -> Result<PseudobulkResult> {
+    let (n_obs, n_vars) = shape;
+    validate_inputs(obs_groups, groupby_columns, gene_names, n_obs, n_vars)?;
+
+    let (cell_to_group, group_labels, cell_counts) = gpu_group_plan(obs_groups, n_obs);
+    let n_groups = group_labels.len();
+
+    let csr =
+        scx_sparse::ScxCsr::new_unchecked(shape, indptr.to_vec(), indices.to_vec(), data.to_vec());
+    let source = scx_format_io::shard_source::SingleShardSource { csr: &csr };
+
+    let means = scx_gpu::gpu_pseudobulk_means_csr(
+        dev,
+        &source,
+        &cell_to_group,
+        n_groups,
+        n_vars,
+        &cell_counts,
+    )
+    .map_err(|e| crate::AccelError::LinAlg(format!("GPU pseudobulk means (csr): {e}")))?;
+
+    filter_and_build_result(
+        means,
+        group_labels,
+        groupby_columns,
+        cell_counts,
+        gene_names,
+        n_groups,
+        n_vars,
+        min_cells_per_group,
+    )
+}
+
+/// GPU pseudobulk means from a dense row-major `[n_obs × n_vars]` f32 matrix
+/// (in-memory dense `X` or an `obsm` embedding). Mirrors
+/// [`pseudobulk_aggregate_dense`] with `Mean`.
+#[cfg(feature = "gpu")]
+pub fn pseudobulk_means_gpu_dense(
+    dev: &scx_gpu::GpuDevice,
+    data: &[f32],
+    shape: (usize, usize),
+    obs_groups: &[Vec<String>],
+    groupby_columns: &[String],
+    gene_names: &[String],
+    min_cells_per_group: usize,
+) -> Result<PseudobulkResult> {
+    let (n_obs, n_vars) = shape;
+    if data.len() != n_obs * n_vars {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "data length {} != n_obs ({}) × n_vars ({})",
+            data.len(),
+            n_obs,
+            n_vars
+        )));
+    }
+    validate_inputs(obs_groups, groupby_columns, gene_names, n_obs, n_vars)?;
+
+    let (cell_to_group, group_labels, cell_counts) = gpu_group_plan(obs_groups, n_obs);
+    let n_groups = group_labels.len();
+
+    // Concatenated per-group cell lists + prefix offsets that the dense kernel
+    // consumes (built in the sorted group order from `gpu_group_plan`).
+    let mut group_offsets = vec![0i32; n_groups + 1];
+    for g in 0..n_groups {
+        group_offsets[g + 1] = group_offsets[g] + cell_counts[g] as i32;
+    }
+    let mut cursor: Vec<i32> = group_offsets[..n_groups].to_vec();
+    let mut all_group_cells = vec![0i32; n_obs];
+    for (cell, &g) in cell_to_group.iter().enumerate() {
+        let g = g as usize;
+        all_group_cells[cursor[g] as usize] = cell as i32;
+        cursor[g] += 1;
+    }
+
+    let means = scx_gpu::gpu_pseudobulk_means_dense(
+        dev,
+        data,
+        n_obs,
+        n_vars,
+        &all_group_cells,
+        &group_offsets,
+        n_groups,
+        &cell_counts,
+    )
+    .map_err(|e| crate::AccelError::LinAlg(format!("GPU pseudobulk means (dense): {e}")))?;
+
+    filter_and_build_result(
+        means,
+        group_labels,
+        groupby_columns,
+        cell_counts,
+        gene_names,
+        n_groups,
+        n_vars,
+        min_cells_per_group,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

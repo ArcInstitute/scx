@@ -65,6 +65,7 @@ pub mod gpu_nb_glm;
 pub mod gpu_pca;
 pub mod gpu_pca_resident;
 pub mod gpu_preprocess;
+pub mod gpu_pseudobulk;
 pub mod gpu_shard_source;
 pub mod linear_operator;
 pub mod math_policy;
@@ -133,6 +134,7 @@ pub use gpu_pca::{
 pub use gpu_preprocess::{
     gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,
 };
+pub use gpu_pseudobulk::{gpu_pseudobulk_means_csr, gpu_pseudobulk_means_dense};
 pub use gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource, RawGpuShardSource};
 pub use linear_operator::CenteredSparseOperator;
 pub use math_policy::{GpuMathMode, GpuPcaTuning, SpmmAlgPolicy};

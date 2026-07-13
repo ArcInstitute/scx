@@ -91,19 +91,26 @@ class TestEvalMetricsDeviceScaffolding:
         # Both are the same CPU kernel; identical bit-for-bit (or both nan).
         assert (default == cpu) or (np.isnan(default) and np.isnan(cpu))
 
-    def test_route_stamped_cpu(self):
-        """Each metric stamps a cpu_* route in uns["scx_accel"] on the pred."""
+    def test_route_stamped(self):
+        """Each metric stamps a route in uns["scx_accel"] on the pred under the
+        default (auto) device. perturbation_metrics has a GPU kernel (Phase 2),
+        so on a GPU host auto→gpu; energy_distance/discrimination_score are still
+        CPU-only (Phase 3), so always cpu_*."""
         real, pred = _make_paired_adata()
         pyscx.accel.perturbation_metrics(real, pred)
         pyscx.accel.energy_distance(real, pred)
         pyscx.accel.discrimination_score(real, pred)
-        for op in ("perturbation_metrics", "energy_distance", "discrimination_score"):
+        pm_expected = "gpu" if pyscx.accel.gpu_available() else "cpu"
+        assert _route(pred, "perturbation_metrics").startswith(pm_expected)
+        for op in ("energy_distance", "discrimination_score"):
             assert _route(pred, op).startswith("cpu")
 
     def test_pseudobulk_means_route_stamped_single_input(self):
         real, _ = _make_paired_adata()
         pyscx.accel.pseudobulk_means(real, "perturbation")
-        assert _route(real, "pseudobulk_means").startswith("cpu")
+        # Pseudobulk_means has a GPU kernel, so auto→gpu on a GPU host.
+        expected = "gpu" if pyscx.accel.gpu_available() else "cpu"
+        assert _route(real, "pseudobulk_means").startswith(expected)
 
     def test_inner_pseudobulk_does_not_shadow_outer_route(self):
         """perturbation_metrics stamps its own op, not the inner pseudobulk_means.
@@ -130,12 +137,24 @@ class TestEvalMetricsDeviceScaffolding:
         not pyscx.accel.gpu_available(),
         reason="requires a GPU host to exercise the no-kernel-yet CPU fallback",
     )
-    def test_gpu_on_host_runs_cpu_and_warns(self):
-        """On a GPU host, device="gpu" runs CPU (no kernel yet) and warns."""
+    def test_gpu_on_host_effect_metric_runs_cpu_and_warns(self):
+        """On a GPU host, an eval metric without a GPU kernel yet (energy_distance
+        — Phase 3) runs CPU and emits the one-shot fallback warning; route cpu_*."""
         real, pred = _make_paired_adata()
         with pytest.warns(UserWarning):
-            pyscx.accel.perturbation_metrics(real, pred, device="gpu")
-        assert _route(pred, "perturbation_metrics").startswith("cpu")
+            pyscx.accel.energy_distance(real, pred, device="gpu")
+        assert _route(pred, "energy_distance").startswith("cpu")
+
+    @pytest.mark.skipif(
+        not pyscx.accel.gpu_available(),
+        reason="requires a GPU host to run the perturbation_metrics GPU kernel",
+    )
+    def test_gpu_on_host_perturbation_metrics_runs_gpu(self):
+        """Phase 2: perturbation_metrics runs on the GPU on a GPU host (route gpu_*).
+        (GPU-vs-CPU numeric parity is covered in test_eval_metrics_gpu_parity.py.)"""
+        real, pred = _make_paired_adata()
+        pyscx.accel.perturbation_metrics(real, pred, device="gpu")
+        assert _route(pred, "perturbation_metrics").startswith("gpu")
 
     def test_invalid_device_string_raises(self):
         real, pred = _make_paired_adata()

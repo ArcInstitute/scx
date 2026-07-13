@@ -78,6 +78,10 @@ pub use pseudobulk::{
     GeomMeanMode, PseudobulkResult,
 };
 #[cfg(feature = "gpu")]
+pub use pseudobulk::{
+    pseudobulk_means_gpu_backed, pseudobulk_means_gpu_dense, pseudobulk_means_gpu_from_slices,
+};
+#[cfg(feature = "gpu")]
 pub use route::plan_de_route_from_source;
 pub use route::{
     plan_de_route, plan_hvg_route, plan_nb_glm_route, plan_simple_gpu_route, AccelExecutionInfo,
