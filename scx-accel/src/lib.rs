@@ -40,6 +40,8 @@ pub use diffexp::{
     DiffExpResult, PdexRefResult,
 };
 pub use error::{AccelError, Result};
+#[cfg(feature = "gpu")]
+pub use eval_metrics::edistance::compute_energy_distance_gpu;
 pub use eval_metrics::{
     bulk_metrics::{compute_bulk_metrics, pearson_correlation, BulkMetric, BulkMetricsResult},
     clustering::{

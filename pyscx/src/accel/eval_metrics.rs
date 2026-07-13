@@ -96,6 +96,47 @@ fn eval_make_gpu_dev(gpu_device_id: Option<usize>) -> PyResult<EvalGpuDev> {
     }
 }
 
+/// Resolve device + plan the route for `energy_distance` / `energy_distance_details`.
+///
+/// GPU `energy_distance` is gemm-based (f32) and covers **euclidean/cosine only**;
+/// L1 (no gemm decomposition) and f64 stay on CPU. So the op is GPU-eligible only
+/// when built with the gpu feature AND the metric isn't L1 AND the dtype is f32
+/// (the default). Returns the (possibly `None`) device handle and the planned
+/// `AccelExecutionInfo`; the caller stamps it via `write_accel_route` after
+/// compute. Route pair: `gpu_dense` / `cpu_csr` (cells materialise dense).
+fn edist_device_dispatch(
+    py: Python<'_>,
+    op: &'static str,
+    device: &str,
+    metric: &str,
+    dtype: Option<&str>,
+) -> PyResult<(EvalGpuDev, scx_accel::route::AccelExecutionInfo)> {
+    let resolved = super::gpu::resolve_device(device)?;
+    let metric_is_l1 = matches!(
+        metric.to_ascii_lowercase().as_str(),
+        "l1" | "manhattan" | "cityblock"
+    );
+    let dtype_is_f32 = matches!(
+        dtype.map(|s| s.to_ascii_lowercase()).as_deref(),
+        None | Some("f32") | Some("float32")
+    );
+    let gpu_eligible = cfg!(feature = "gpu") && !metric_is_l1 && dtype_is_f32;
+    let info = super::route::simple_exec_info(
+        device,
+        gpu_eligible,
+        scx_accel::route::AccelRoute::GpuDense,
+        scx_accel::route::AccelRoute::CpuCsr,
+    );
+    super::route::announce_route(py, op, device, &info);
+    let gpu_id = if info.route.is_gpu() {
+        eval_resolve_gpu_id(resolved)
+    } else {
+        None
+    };
+    let gpu_dev = eval_make_gpu_dev(gpu_id)?;
+    Ok((gpu_dev, info))
+}
+
 /// Backed-CSR pseudobulk means — GPU when `gpu_dev` is `Some`, else CPU.
 fn agg_backed(
     py: Python<'_>,
@@ -802,16 +843,78 @@ trait NumpyDtype: numpy::Element + Sized {
     const NUMPY_NAME: &'static str;
     /// Bytes per element — used to gate the "large materialization" warning.
     const BYTES: usize;
+
+    /// GPU energy distance (Phase 3), specialised by element type: `Some(..)`
+    /// for f32 (the GPU path runs), `None` for f64 (no f64 cuBLAS gemm → caller
+    /// falls back to the CPU path). Lets the generic `run_energy_distance_inner`
+    /// dispatch to the GPU kernel only for f32 without runtime type juggling.
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    fn edist_gpu(
+        dev: &scx_accel::GpuDevice,
+        real: &[Self],
+        pred: &[Self],
+        real_groups: &[u32],
+        pred_groups: &[u32],
+        ctrl_group_idx: u32,
+        pert_names: &[String],
+        pert_group_indices: &[u32],
+        n_dims: usize,
+        metric: scx_accel::DistanceMetric,
+    ) -> Option<scx_accel::Result<scx_accel::EDistanceResult>>;
 }
 
 impl NumpyDtype for f32 {
     const NUMPY_NAME: &'static str = "float32";
     const BYTES: usize = 4;
+
+    #[cfg(feature = "gpu")]
+    fn edist_gpu(
+        dev: &scx_accel::GpuDevice,
+        real: &[f32],
+        pred: &[f32],
+        real_groups: &[u32],
+        pred_groups: &[u32],
+        ctrl_group_idx: u32,
+        pert_names: &[String],
+        pert_group_indices: &[u32],
+        n_dims: usize,
+        metric: scx_accel::DistanceMetric,
+    ) -> Option<scx_accel::Result<scx_accel::EDistanceResult>> {
+        Some(scx_accel::compute_energy_distance_gpu(
+            dev,
+            real,
+            pred,
+            real_groups,
+            pred_groups,
+            ctrl_group_idx,
+            pert_names,
+            pert_group_indices,
+            n_dims,
+            metric,
+        ))
+    }
 }
 
 impl NumpyDtype for f64 {
     const NUMPY_NAME: &'static str = "float64";
     const BYTES: usize = 8;
+
+    #[cfg(feature = "gpu")]
+    fn edist_gpu(
+        _dev: &scx_accel::GpuDevice,
+        _real: &[f64],
+        _pred: &[f64],
+        _real_groups: &[u32],
+        _pred_groups: &[u32],
+        _ctrl_group_idx: u32,
+        _pert_names: &[String],
+        _pert_group_indices: &[u32],
+        _n_dims: usize,
+        _metric: scx_accel::DistanceMetric,
+    ) -> Option<scx_accel::Result<scx_accel::EDistanceResult>> {
+        None // f64 has no cuBLAS gemm → CPU fallback
+    }
 }
 
 /// Extract a dense `[N, D]` matrix from `adata.X` (or `adata.obsm[embed_key]`)
@@ -1116,10 +1219,13 @@ fn run_energy_distance_inner<'py, F>(
     dist_metric: scx_accel::DistanceMetric,
     embed_key: Option<&str>,
     dist_backend: scx_accel::DistanceBackend,
+    gpu_dev: &EvalGpuDev,
 ) -> PyResult<scx_accel::EDistanceResult>
 where
     F: scx_accel::PairwiseFloat + NumpyDtype,
 {
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu_dev;
     // ── Extract dense matrices from both AnnData objects ────────────
     let (real_flat, n_real, n_dims_real) = materialize_dense::<F>(py, np, adata_real, embed_key)?;
     let (pred_flat, n_pred, n_dims_pred) = materialize_dense::<F>(py, np, adata_pred, embed_key)?;
@@ -1194,8 +1300,31 @@ where
         ));
     }
 
-    // Release the GIL for the O(N²) rayon-parallel kernel. All arguments are
-    // owned Vecs or plain scalars.
+    // GPU path (f32 + euclidean/cosine only): F::edist_gpu returns None for f64
+    // so the generic dispatch falls through to CPU. GpuDevice is !Send, so the
+    // GIL is held around the device work (mirrors agg_backed / pdex_nb_glm).
+    #[cfg(feature = "gpu")]
+    if let Some(dev) = gpu_dev.as_ref() {
+        if !matches!(dist_metric, scx_accel::DistanceMetric::L1) {
+            if let Some(res) = F::edist_gpu(
+                dev,
+                &real_flat,
+                &pred_flat,
+                &real_groups,
+                &pred_groups,
+                ctrl_group_idx,
+                &pert_names,
+                &pert_group_indices,
+                n_dims,
+                dist_metric,
+            ) {
+                return res.map_err(|e| PyRuntimeError::new_err(e.to_string()));
+            }
+        }
+    }
+
+    // CPU path. Release the GIL for the O(N²) rayon-parallel kernel. All
+    // arguments are owned Vecs or plain scalars.
     py.detach(|| {
         scx_accel::compute_energy_distance::<F>(
             &real_flat,
@@ -1225,6 +1354,7 @@ fn run_energy_distance<'py>(
     embed_key: Option<&str>,
     backend: Option<&str>,
     dtype: Option<&str>,
+    gpu_dev: &EvalGpuDev,
 ) -> PyResult<scx_accel::EDistanceResult> {
     let np = py.import("numpy")?;
 
@@ -1255,6 +1385,7 @@ fn run_energy_distance<'py>(
             dist_metric,
             embed_key,
             dist_backend,
+            gpu_dev,
         ),
         Dtype::F64 => run_energy_distance_inner::<f64>(
             py,
@@ -1266,6 +1397,7 @@ fn run_energy_distance<'py>(
             dist_metric,
             embed_key,
             dist_backend,
+            gpu_dev,
         ),
     }
 }
@@ -1335,10 +1467,11 @@ pub fn energy_distance<'py>(
     dtype: Option<&str>,
     device: &str,
 ) -> PyResult<f64> {
-    scaffold_device_route(py, adata_pred, "energy_distance", device)?;
+    let (gpu_dev, info) = edist_device_dispatch(py, "energy_distance", device, metric, dtype)?;
     let result = run_energy_distance(
-        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype,
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype, &gpu_dev,
     )?;
+    super::route::write_accel_route(py, adata_pred, "energy_distance", &info)?;
     Ok(result.correlation)
 }
 
@@ -1384,10 +1517,12 @@ pub fn energy_distance_details<'py>(
     dtype: Option<&str>,
     device: &str,
 ) -> PyResult<Py<PyAny>> {
-    scaffold_device_route(py, adata_pred, "energy_distance_details", device)?;
+    let (gpu_dev, info) =
+        edist_device_dispatch(py, "energy_distance_details", device, metric, dtype)?;
     let result = run_energy_distance(
-        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype,
+        py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype, &gpu_dev,
     )?;
+    super::route::write_accel_route(py, adata_pred, "energy_distance_details", &info)?;
 
     let d_real = PyDict::new(py);
     let d_pred = PyDict::new(py);

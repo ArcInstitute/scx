@@ -117,3 +117,54 @@ def test_pseudobulk_means_gpu_matches_cpu():
     assert list(groups_cpu) == list(groups_gpu)
     np.testing.assert_allclose(means_cpu, means_gpu, atol=1e-5, rtol=0.0)
     assert real.uns["scx_accel"]["pseudobulk_means"]["route"].startswith("gpu")
+
+
+# ── energy_distance (Phase 3): gemm pairwise distance, euclidean + cosine ──
+#
+# energy_distance is a Pearson correlation of per-perturbation e-distances, so
+# f32-gemm parity is at the 1e-4 bar. L1 has no gemm decomposition → CPU.
+
+
+def _edist_route(adata):
+    return adata.uns["scx_accel"]["energy_distance"]
+
+
+def _close_or_nan(a, b, atol):
+    return (abs(a - b) <= atol) or (np.isnan(a) and np.isnan(b))
+
+
+def test_energy_distance_gpu_matches_cpu_euclidean():
+    real, pred = _make_paired_adata(seed=4)
+    cpu = pyscx.accel.energy_distance(real, pred, metric="euclidean", device="cpu")
+    gpu = pyscx.accel.energy_distance(real, pred, metric="euclidean", device="gpu")
+    assert _edist_route(pred)["route"].startswith("gpu"), _edist_route(pred)
+    assert _close_or_nan(float(cpu), float(gpu), 1e-4), f"cpu={cpu} gpu={gpu}"
+
+
+def test_energy_distance_gpu_matches_cpu_cosine():
+    real, pred = _make_paired_adata(seed=5)
+    cpu = pyscx.accel.energy_distance(real, pred, metric="cosine", device="cpu")
+    gpu = pyscx.accel.energy_distance(real, pred, metric="cosine", device="gpu")
+    assert _edist_route(pred)["route"].startswith("gpu"), _edist_route(pred)
+    assert _close_or_nan(float(cpu), float(gpu), 1e-4), f"cpu={cpu} gpu={gpu}"
+
+
+def test_energy_distance_gpu_matches_cpu_backed(tmp_path):
+    real, pred = _make_paired_adata(seed=6)
+    rp = str(tmp_path / "real.scx")
+    pp = str(tmp_path / "pred.scx")
+    pyscx.from_anndata(real, rp)
+    pyscx.from_anndata(pred, pp)
+    real_b = pyscx.open(rp).to_anndata(backed=True)
+    pred_b = pyscx.open(pp).to_anndata(backed=True)
+    cpu = pyscx.accel.energy_distance(real_b, pred_b, metric="euclidean", device="cpu")
+    gpu = pyscx.accel.energy_distance(real_b, pred_b, metric="euclidean", device="gpu")
+    assert _edist_route(pred_b)["route"].startswith("gpu"), _edist_route(pred_b)
+    assert _close_or_nan(float(cpu), float(gpu), 1e-4), f"cpu={cpu} gpu={gpu}"
+
+
+def test_energy_distance_l1_stays_cpu_under_gpu():
+    """L1 has no gemm decomposition, so device='gpu' runs the CPU path (route cpu_*)."""
+    real, pred = _make_paired_adata(seed=7)
+    pyscx.accel.energy_distance(real, pred, metric="l1", device="gpu")
+    assert _edist_route(pred)["route"].startswith("cpu"), _edist_route(pred)

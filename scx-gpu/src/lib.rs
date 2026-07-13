@@ -62,6 +62,7 @@ pub mod gpu_hvg;
 pub mod gpu_knn;
 pub mod gpu_matrix_source;
 pub mod gpu_nb_glm;
+pub mod gpu_pairwise;
 pub mod gpu_pca;
 pub mod gpu_pca_resident;
 pub mod gpu_preprocess;
@@ -127,6 +128,7 @@ pub use gpu_nb_glm::{
     gpu_nb_glm_fit, GpuNbGlmFit, GpuNbGlmOpts, GpuNbGlmPass, GPU_NB_GLM_METHOD_CR_MLE,
     GPU_NB_GLM_METHOD_CR_SHRUNK, GPU_NB_GLM_METHOD_MOMENTS, GPU_NB_GLM_NSUB_MAX, GPU_NB_GLM_PMAX,
 };
+pub use gpu_pairwise::gpu_mean_pairwise_distance;
 pub use gpu_pca::{
     gpu_randomized_pca, gpu_randomized_pca_device, mean_correct_gpu, GpuPcaDeviceResult,
     GpuPcaResult,

@@ -69,41 +69,48 @@ def _route(adata, op):
 
 class TestEvalMetricsDeviceScaffolding:
     def test_perturbation_metrics_cpu_matches_default(self):
-        """device="cpu" is byte-identical to the default (auto) on a CPU host."""
+        """device="cpu" matches the default (auto). Bit-identical on a CPU host;
+        on a GPU host the default runs GPU (f64 pseudobulk), so allow a tiny atol."""
         real, pred = _make_paired_adata()
         default = pyscx.accel.perturbation_metrics(real, pred)
         cpu = pyscx.accel.perturbation_metrics(real, pred, device="cpu")
+        atol = 1e-6 if pyscx.accel.gpu_available() else 0.0
         assert default.keys() == cpu.keys()
         for metric, per_pert in default.items():
             for name, value in per_pert.items():
-                assert cpu[metric][name] == value
+                assert abs(cpu[metric][name] - value) <= atol
 
     def test_discrimination_score_cpu_matches_default(self):
+        # discrimination_score has no GPU kernel yet (deferred), so the default
+        # (auto) runs CPU on every host → bit-identical to device="cpu".
         real, pred = _make_paired_adata()
         default = pyscx.accel.discrimination_score(real, pred)
         cpu = pyscx.accel.discrimination_score(real, pred, device="cpu")
         assert default == cpu
 
     def test_energy_distance_cpu_matches_default(self):
+        """device="cpu" matches the default (auto). Bit-identical on a CPU host;
+        on a GPU host the default runs the f32-gemm GPU kernel, so parity is at
+        the 1e-4 bar (energy_distance is a correlation)."""
         real, pred = _make_paired_adata()
         default = pyscx.accel.energy_distance(real, pred)
         cpu = pyscx.accel.energy_distance(real, pred, device="cpu")
-        # Both are the same CPU kernel; identical bit-for-bit (or both nan).
-        assert (default == cpu) or (np.isnan(default) and np.isnan(cpu))
+        atol = 1e-4 if pyscx.accel.gpu_available() else 0.0
+        assert (abs(default - cpu) <= atol) or (np.isnan(default) and np.isnan(cpu))
 
     def test_route_stamped(self):
         """Each metric stamps a route in uns["scx_accel"] on the pred under the
-        default (auto) device. perturbation_metrics has a GPU kernel (Phase 2),
-        so on a GPU host auto→gpu; energy_distance/discrimination_score are still
-        CPU-only (Phase 3), so always cpu_*."""
+        default (auto) device. perturbation_metrics (Phase 2) and energy_distance
+        (Phase 3, default euclidean → gemm) have GPU kernels, so on a GPU host
+        auto→gpu; discrimination_score is still CPU-only (deferred), so cpu_*."""
         real, pred = _make_paired_adata()
         pyscx.accel.perturbation_metrics(real, pred)
         pyscx.accel.energy_distance(real, pred)
         pyscx.accel.discrimination_score(real, pred)
-        pm_expected = "gpu" if pyscx.accel.gpu_available() else "cpu"
-        assert _route(pred, "perturbation_metrics").startswith(pm_expected)
-        for op in ("energy_distance", "discrimination_score"):
-            assert _route(pred, op).startswith("cpu")
+        gpu_expected = "gpu" if pyscx.accel.gpu_available() else "cpu"
+        for op in ("perturbation_metrics", "energy_distance"):
+            assert _route(pred, op).startswith(gpu_expected), op
+        assert _route(pred, "discrimination_score").startswith("cpu")
 
     def test_pseudobulk_means_route_stamped_single_input(self):
         real, _ = _make_paired_adata()
@@ -138,12 +145,13 @@ class TestEvalMetricsDeviceScaffolding:
         reason="requires a GPU host to exercise the no-kernel-yet CPU fallback",
     )
     def test_gpu_on_host_effect_metric_runs_cpu_and_warns(self):
-        """On a GPU host, an eval metric without a GPU kernel yet (energy_distance
-        — Phase 3) runs CPU and emits the one-shot fallback warning; route cpu_*."""
+        """On a GPU host, an eval metric without a GPU kernel yet
+        (discrimination_score — deferred) runs CPU and emits the one-shot
+        fallback warning; route cpu_*."""
         real, pred = _make_paired_adata()
         with pytest.warns(UserWarning):
-            pyscx.accel.energy_distance(real, pred, device="gpu")
-        assert _route(pred, "energy_distance").startswith("cpu")
+            pyscx.accel.discrimination_score(real, pred, device="gpu")
+        assert _route(pred, "discrimination_score").startswith("cpu")
 
     @pytest.mark.skipif(
         not pyscx.accel.gpu_available(),

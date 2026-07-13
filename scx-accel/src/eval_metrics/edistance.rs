@@ -245,6 +245,136 @@ fn extract_group_rows_indexed<F: PairwiseFloat>(
     out
 }
 
+/// GPU energy distance (Phase 3 of CELL-EVAL-SCX-GPU-ACC).
+///
+/// Mirrors [`compute_energy_distance`] exactly, but computes each
+/// `mean_pairwise_distance` on the GPU via
+/// [`scx_gpu::gpu_mean_pairwise_distance`] (cuBLAS gemm decomposition). The
+/// group indexing, the fused `2·cross − self_pert − sigma_ctrl` formula, the
+/// once-per-side control self-distance, the empty-group→NaN rule, and the
+/// NaN-filtered host `pearson_correlation` are all identical to the CPU path —
+/// only the pairwise means move to the device.
+///
+/// Cells are f32 (the pyscx GPU path materialises f32); reductions inside the
+/// kernel accumulate f64. Supports **euclidean and cosine only** — L1 has no
+/// gemm decomposition and is a caller error (pyscx routes L1 to the CPU path).
+/// GPU/CPU parity is at the `atol=1e-4` bar.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_energy_distance_gpu(
+    dev: &scx_gpu::GpuDevice,
+    real_cells: &[f32],
+    pred_cells: &[f32],
+    real_groups: &[u32],
+    pred_groups: &[u32],
+    ctrl_group_idx: u32,
+    pert_names: &[String],
+    pert_group_indices: &[u32],
+    n_dims: usize,
+    metric: DistanceMetric,
+) -> crate::Result<EDistanceResult> {
+    if pert_names.len() != pert_group_indices.len() {
+        return Err(crate::AccelError::InvalidInput(
+            "pert_names and pert_group_indices must have the same length".to_string(),
+        ));
+    }
+    if pert_names.is_empty() {
+        return Err(crate::AccelError::InvalidInput(
+            "no perturbation groups provided".to_string(),
+        ));
+    }
+    let n_real = real_groups.len();
+    let n_pred = pred_groups.len();
+    if real_cells.len() != n_real * n_dims || pred_cells.len() != n_pred * n_dims {
+        return Err(crate::AccelError::InvalidInput(
+            "cell matrix length does not match n_cells × n_dims".to_string(),
+        ));
+    }
+
+    let cosine = match metric {
+        DistanceMetric::Euclidean => false,
+        DistanceMetric::Cosine => true,
+        DistanceMetric::L1 => {
+            return Err(crate::AccelError::InvalidInput(
+                "GPU energy_distance supports euclidean/cosine only; L1 runs on CPU".to_string(),
+            ))
+        }
+    };
+
+    let handle = scx_gpu::CublasHandle::new()
+        .map_err(|e| crate::AccelError::LinAlg(format!("cuBLAS handle init: {e}")))?;
+    let mean_pair = |a: &[f32], b: &[f32], na: usize, nb: usize| -> crate::Result<f64> {
+        scx_gpu::gpu_mean_pairwise_distance(dev, &handle, a, b, na, nb, n_dims, cosine)
+            .map_err(|e| crate::AccelError::LinAlg(format!("GPU pairwise distance: {e}")))
+    };
+
+    let real_index = build_group_index(real_groups);
+    let pred_index = build_group_index(pred_groups);
+
+    let ctrl_real = extract_group_rows_indexed(real_cells, real_index.get(&ctrl_group_idx), n_dims);
+    let ctrl_pred = extract_group_rows_indexed(pred_cells, pred_index.get(&ctrl_group_idx), n_dims);
+    let n_ctrl_real = ctrl_real.len() / n_dims;
+    let n_ctrl_pred = ctrl_pred.len() / n_dims;
+    if n_ctrl_real == 0 || n_ctrl_pred == 0 {
+        return Err(crate::AccelError::InvalidInput(
+            "control group has no cells".to_string(),
+        ));
+    }
+
+    // Control self-distance, once per side (self(a) = mean_pairwise(a, a)).
+    let sigma_ctrl_real = mean_pair(&ctrl_real, &ctrl_real, n_ctrl_real, n_ctrl_real)?;
+    let sigma_ctrl_pred = mean_pair(&ctrl_pred, &ctrl_pred, n_ctrl_pred, n_ctrl_pred)?;
+
+    // Per-perturbation, sequential: GpuDevice work serialises on the device.
+    let mut d_real = Vec::with_capacity(pert_group_indices.len());
+    let mut d_pred = Vec::with_capacity(pert_group_indices.len());
+    for &gi in pert_group_indices {
+        let pert_real = extract_group_rows_indexed(real_cells, real_index.get(&gi), n_dims);
+        let pert_pred = extract_group_rows_indexed(pred_cells, pred_index.get(&gi), n_dims);
+        let n_pr = pert_real.len() / n_dims;
+        let n_pp = pert_pred.len() / n_dims;
+
+        let e_real = if n_pr > 0 {
+            2.0 * mean_pair(&pert_real, &ctrl_real, n_pr, n_ctrl_real)?
+                - mean_pair(&pert_real, &pert_real, n_pr, n_pr)?
+                - sigma_ctrl_real
+        } else {
+            f64::NAN
+        };
+        let e_pred = if n_pp > 0 {
+            2.0 * mean_pair(&pert_pred, &ctrl_pred, n_pp, n_ctrl_pred)?
+                - mean_pair(&pert_pred, &pert_pred, n_pp, n_pp)?
+                - sigma_ctrl_pred
+        } else {
+            f64::NAN
+        };
+        d_real.push(e_real);
+        d_pred.push(e_pred);
+    }
+
+    // Identical NaN-filter + Pearson as the CPU path.
+    let valid: Vec<(f64, f64)> = d_real
+        .iter()
+        .zip(d_pred.iter())
+        .filter(|(r, p)| !r.is_nan() && !p.is_nan())
+        .map(|(&r, &p)| (r, p))
+        .collect();
+    let correlation = if valid.len() >= 2 {
+        let vr: Vec<f64> = valid.iter().map(|(r, _)| *r).collect();
+        let vp: Vec<f64> = valid.iter().map(|(_, p)| *p).collect();
+        pearson_correlation(&vr, &vp)
+    } else {
+        f64::NAN
+    };
+
+    Ok(EDistanceResult {
+        d_real,
+        d_pred,
+        correlation,
+        pert_names: pert_names.to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
