@@ -143,7 +143,7 @@ n_vars / nnz / 62-shard catalog).
 | streaming   | 87.6 | 87.8 | 88.4 | 87.6 | 87.9 | 88.9 |
 | materialise | 92.2 | 72.6 | 61.8 | 58.0 | 55.4 | 54.6 |
 
-The streaming pipeline now supports a **parallel reader coordinator**
+The streaming pipeline supports a **parallel reader coordinator**
 (`--reader-threads N` / `reader_threads=N`; default auto-derived from
 `RAYON_NUM_THREADS` or `available_parallelism()`), which fans shard
 reads across a rayon worker pool with a bounded crossbeam reorder
@@ -457,6 +457,8 @@ Rust-accelerated perturbation evaluation metrics exposed via `pyscx.accel.*` are
 
 Speedups grow with cell count for the pseudobulk-driven metrics (pseudobulk, bulk_metrics, discrimination_l1) — single-pass streaming aggregation in Rust wins harder as the per-cell work scales. `knockdown_efficiency` is within ±40% of arc-bench's tight NumPy column-access loop and is not currently a speedup target.
 
+The table above is the SCX-Rust-vs-Python-reference speedup on the **CPU**. `perturbation_metrics` and `energy_distance` (euclidean / cosine) also accept `device="gpu"` (pyscx ≥ 0.11.2) — CPU-vs-GPU wall times are in [GPU perturbation-evaluation metrics](#gpu-perturbation-evaluation-metrics) below.
+
 Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/comprehensive/results/raw/cell_eval_parity_perf__scx_auto__pert_synth_*.json` and rendered in the "Cell-eval / arc-bench Parity Performance" section of the comprehensive benchmark report. Kernel-level distance-kernel microbenchmarks live in `scx-accel/benches/distances.rs` (run via `cargo bench -p scx-accel --bench distances`; see [`benchmarks/README.md`](../benchmarks/README.md#rust-microbenchmarks-criterion)).
 
 ## GPU Acceleration (NVIDIA H100)
@@ -534,7 +536,7 @@ n_runs=5 (3 for tabula/census). v1 default and v2-CSR baselines are unchanged be
 
 In-memory inputs (`pyscx.accel.pdex_ref(scipy_csr_adata, device="gpu")`) and files without a CSC sidecar automatically fall back to the v3-CSR-direct path — same algorithm, no CSC sidecar needed, slightly slower than v3-CSC because it loses the atomicAdd-avoidance win but still drops the dense intermediate. v3 was promoted to the unconditional default in Phase V1b after a route-marked soak confirmed v3 ≥ CPU at every tier and 13–28× faster than the former v1 GPU path at medium+large scale. Parity tests (`scx-accel/src/csc/pdex.rs::tests::test_pdex_ref_gpu_v3_csc_matches_cpu_streaming` and `_csr_fallback_*`) pin v3 to the CPU oracle to fp32 tolerance.
 
-**Which route ran is now recorded, and the gate asserts it.** Every `pdex_ref` call stamps its execution route on `adata.uns["scx_accel"]["pdex_ref"]` (`route ∈ {gpu_csc_v3, gpu_csr_v3, …}`, `fallback_reason`, `csc_available`), decided by the single planner `scx_accel::route::plan_de_route`. The `accel_de` benchmark reads this back into `runs[].extra` as `gpu_dispatch_route` (human-readable) and `de_route_csc_direct` (numeric: `0.0` only when a CSC fixture was built yet a non-`gpu_csc_v3` route ran — v3 being the unconditional default since Phase V1b). `thresholds.yaml` floors `de_route_csc_direct ≥ 1.0` for the GPU pdex_ref triple, so a *silent fallback to CSR while CSC-direct was intended* — exactly the prior benchmark misread — is now a hard gate failure rather than an invisible footgun. The structured `adata.uns` metadata is the signal (the former ad-hoc stderr trace was removed).
+**Which route ran is recorded, and the gate asserts it.** Every `pdex_ref` call stamps its execution route on `adata.uns["scx_accel"]["pdex_ref"]` (`route ∈ {gpu_csc_v3, gpu_csr_v3, …}`, `fallback_reason`, `csc_available`), decided by the single planner `scx_accel::route::plan_de_route`. The `accel_de` benchmark reads this back into `runs[].extra` as `gpu_dispatch_route` (human-readable) and `de_route_csc_direct` (numeric: `0.0` only when a CSC fixture was built yet a non-`gpu_csc_v3` route ran — v3 being the unconditional default since Phase V1b). `thresholds.yaml` floors `de_route_csc_direct ≥ 1.0` for the GPU pdex_ref triple, so a *silent fallback to CSR while CSC-direct was intended* — exactly the prior benchmark misread — is a hard gate failure rather than an invisible footgun. The structured `adata.uns` metadata is the signal (the former ad-hoc stderr trace was removed).
 
 **Headline finding from the 2026-05-25 routing fix:** GPU Leiden at census scale (`pyscx_gpu` cuGraph, 1.59-3.06s on census_500k/_1m) was completely missing from prior LATEST baselines because the gate's worker jobs were activating `scx-bench` (no cugraph), failing every Leiden GPU run silently. With per-job routing → `scx-bench-gpu`, the 200-500× speedup over `leidenalg_cpu` is now visible. Same correction for kNN — the prior bench's "cuVS missing → CPU HNSW fallback" was disguising real GPU CAGRA wall times under scanpy-CPU speeds.
 
@@ -555,7 +557,7 @@ cuGraph's Leiden uses a different refinement step and seed-handling scheme from 
 
 #### Preprocessing device dispatch
 
-`pyscx.accel.{normalize_total, log1p, highly_variable_genes}` now accept `device="cpu|gpu|auto"`. The GPU path is eager (materializes to scipy CSR). **`log1p(device="gpu")` on a materialised scipy/dense X warns and falls back to CPU** — the H→D + kernel + D→H round-trip dominates log1p's trivial math. The pre-fallback measurement (retained as motivation):
+`pyscx.accel.{normalize_total, log1p, highly_variable_genes}` accept `device="cpu|gpu|auto"`. The GPU path is eager (materializes to scipy CSR). **`log1p(device="gpu")` on a materialised scipy/dense X warns and falls back to CPU** — the H→D + kernel + D→H round-trip dominates log1p's trivial math. The pre-fallback measurement (retained as motivation):
 
 | Op | pbmc3k CPU / GPU | tabula_sapiens_100k CPU / GPU | census_1m CPU / GPU |
 |---|---|---|---|
@@ -564,7 +566,7 @@ cuGraph's Leiden uses a different refinement step and seed-handling scheme from 
 | fused normalize+log1p | 0.006s / 0.41s (0.01×) | 0.83s / 9.73s (0.09×) | 4.50s / 67.45s (0.07×) |
 | highly_variable_genes (seurat_v3) | 0.06s / 0.07s (0.9×) | 3.42s / 3.40s (1.0×) | 25.77s / 28.31s (0.9×) |
 
-Practical recommendation: **use the GPU preprocessing path only via the `normalize_total → log1p` fusion-marker chain on backed SCX data, and only when the downstream consumer is also GPU**. The fused-chain optimization is the only case where GPU preprocessing doesn't round-trip through the host. Standalone `log1p(device="gpu")` on materialised X now emits a `UserWarning` and runs `sc.pp.log1p` instead; the GPU fast path is preserved when log1p sees the fusion marker planted by `normalize_total(device="gpu")`, or when X is still backed/lazy.
+Practical recommendation: **use the GPU preprocessing path only via the `normalize_total → log1p` fusion-marker chain on backed SCX data, and only when the downstream consumer is also GPU**. The fused-chain optimization is the only case where GPU preprocessing doesn't round-trip through the host. Standalone `log1p(device="gpu")` on materialised X emits a `UserWarning` and runs `sc.pp.log1p` instead; the GPU fast path is preserved when log1p sees the fusion marker planted by `normalize_total(device="gpu")`, or when X is still backed/lazy.
 
 **Dispatch logic:** for an in-memory `X`, in-VRAM `pyscx.accel.pca(device="gpu")` routes to rapids-singlecell (`rsc.pp.pca`). The native GPU PCA path (backed/lazy/streaming inputs, or `SCX_FORCE_NATIVE_GPU=1`) is **always randomized** — the in-VRAM covariance core was removed, so `method="covariance"` / `"auto"` resolve to randomized on GPU (covariance is still honored on the CPU path). The randomized path accepts `qr_method="householder"` (default, always-stable) or `"cholesky"` (CholeskyQR2 — opt-in, surfaces `RuntimeError` on non-SPD Gram so callers can retry with Householder).
 
@@ -598,7 +600,23 @@ The headline speedup is modest because v1 caps the per-gene sort pool at `GPU_DE
 
 Tolerance-based parity for p-values / FDR (not exact) because of `erfc` and sort-order numerics; U statistics agree exactly in f64. The CPU path itself is pinned bit-for-bit to upstream `pdex` via `pyscx/tests/test_pdex_ref_parity.py`, so CPU↔GPU parity here transitively pins the GPU path to the upstream oracle.
 
-GPU Wilcoxon rank-sum (`rank_genes_groups(device="gpu")`) now routes through `plan_de_route` — when a CSC sidecar is present, it takes the `gpu_csc_v3` CSC-direct path (same as `pdex_ref`); otherwise it falls back to `gpu_csr_v3`. `prefer_format="csc"` on the CPU path uses `CpuCsc`.
+GPU Wilcoxon rank-sum (`rank_genes_groups(device="gpu")`) routes through `plan_de_route` — when a CSC sidecar is present, it takes the `gpu_csc_v3` CSC-direct path (same as `pdex_ref`); otherwise it falls back to `gpu_csr_v3`. `prefer_format="csc"` on the CPU path uses `CpuCsc`.
+
+#### GPU perturbation-evaluation metrics
+
+`pyscx.accel.perturbation_metrics` and `pyscx.accel.energy_distance` gained a `device=` selector (pyscx ≥ 0.11.2). GPU `perturbation_metrics` runs the per-group pseudobulk means on the device (reusing the DE CSR pseudobulk kernels; route `gpu_csr`) with the five bulk metrics on the host; GPU `energy_distance` runs a gemm-based pairwise-distance mean (`‖x−y‖² = ‖x‖² + ‖y‖² − 2·xyᵀ`; route `gpu_dense`) for euclidean/cosine at f32 with f64 reductions. `discrimination_score` has no GPU kernel — exact-rank parity is not f32-safe, so it is deferred. CPU↔GPU parity: `perturbation_metrics` `atol ≈ 1e-6`, `energy_distance` `atol = 1e-4` (it is a Pearson correlation).
+
+CPU-vs-GPU wall time on H100 (synthetic paired real/pred, 2K genes × 50 perturbations, 3-run median, pyscx 0.11.2; via `benchmarks/scripts/gpu_cpu_bench.py` in the cell-eval-scx fork):
+
+| Metric | n_obs | CPU (s) | GPU (s) | Speedup | Route |
+|---|---:|---:|---:|---:|---|
+| `perturbation_metrics` | 10K | 0.50 | 1.31 | 0.38× | `gpu_csr` |
+| `perturbation_metrics` | 100K | 4.89 | 4.90 | 1.00× | `gpu_csr` |
+| `perturbation_metrics` | 1M | 40.35 | 44.26 | 0.91× | `gpu_csr` |
+| `energy_distance` (euclidean) | 10K | 0.91 | 0.97 | 0.94× | `gpu_dense` |
+| `energy_distance` (euclidean) | 100K | 7.44 | 4.35 | **1.71×** | `gpu_dense` |
+
+GPU helps the compute-bound metric: `energy_distance` (an O(N²)-per-perturbation pairwise-distance gemm) reaches **1.71× at 100K** and widens with cell count — and it is what makes the metric feasible at atlas scale, where the CPU O(N²) reference is skipped (the bench caps `energy_distance` at ~200K cells; the CPU baseline is infeasible beyond — see the [Perturbation Metrics](#perturbation-metrics-cell-eval--arc-bench-parity) footnote ¹). `perturbation_metrics` is a cheap pseudobulk mean (O(nnz), memory / host-transfer-bound), so GPU ≈ CPU across sizes (small data even regresses on kernel-launch + host→device overhead) — its GPU kernel exists for uniform `device=` dispatch, not a speedup. All GPU runs took a `gpu_*` route (no silent CPU fallback); numeric parity is gated by `pyscx/tests/test_eval_metrics_gpu_parity.py` and the fork's `tests/test_scx_parity.py`. End-to-end, `cell-eval run --device gpu` matches `--device cpu` within the documented per-metric tolerances (fork `benchmarks/scripts/gpu_e2e_parity.py`).
 
 #### Canonical baseline
 
@@ -624,8 +642,8 @@ Older accel-only baselines (`v0.6.0-gpu-phase1-7`, `v0.6.0-gpu-phase1-7-multidat
 
 #### Changes vs previous version
 
-- **Covariance-PCA dispatch path** on GPU (threshold `n_vars ≤ 8000`) — *historical, removed.* The native in-VRAM covariance PCA core (`gpu_pca_covariance.rs`, `covariance_pca_gpu`, `GPU_COVARIANCE_PCA_THRESHOLD`) was deleted; in-VRAM PCA now routes to rapids `rsc.pp.pca`. The numbers below are from the pre-removal baseline: on tabula_sapiens_100k (HVG-shaped input) GPU PCA ran 1.7× vs CPU, up from 0.9× in the earlier baseline. On census_1m at the same n_vars, the speedup remained 0.9×. Native streaming/randomized PCA survives for >VRAM workloads.
-- **Randomized PCA's critical path** now fully GPU-resident — the prior `Q → host → f64` SVD tail and per-iteration `d_m` download round-trip are gone (cuBLAS `sgemv` + `sgemm`). Correctness preserved (cosine ≥ 0.9999 on real data).
+- **Covariance-PCA dispatch path** on GPU (threshold `n_vars ≤ 8000`) — *historical, removed.* The native in-VRAM covariance PCA core (`gpu_pca_covariance.rs`, `covariance_pca_gpu`, `GPU_COVARIANCE_PCA_THRESHOLD`) was deleted; in-VRAM PCA routes to rapids `rsc.pp.pca`. The numbers below are from the pre-removal baseline: on tabula_sapiens_100k (HVG-shaped input) GPU PCA ran 1.7× vs CPU, up from 0.9× in the earlier baseline. On census_1m at the same n_vars, the speedup remained 0.9×. Native streaming/randomized PCA survives for >VRAM workloads.
+- **Randomized PCA's critical path** fully GPU-resident — the prior `Q → host → f64` SVD tail and per-iteration `d_m` download round-trip are gone (cuBLAS `sgemv` + `sgemm`). Correctness preserved (cosine ≥ 0.9999 on real data).
 - **Opt-in CholeskyQR2** (`qr_method="cholesky"`) for the randomized path; benchmark-suite variants `gpu_randomized_pca_chol` vs `gpu_randomized_pca_householder` pending from the current cluster run.
 - **Standalone GPU preprocessing ops** (`normalize_total`, `log1p`, `highly_variable_genes`) gain a `device` kwarg. In isolation they are slower than the CPU path (see table above — `log1p` is ~40× slower on tabula due to H2D/D2H round-trips); the `normalize_total → log1p` fusion marker is the only fast path.
 - **cuGraph Leiden** exposes the `theta` knob via `pyscx.accel.leiden(theta=...)`.
@@ -706,10 +724,10 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
   cellstream clearly beats shardad (shardad's per-call subset read collapses to
   ~0.5 batches/sec at ≥50k cells; its census fixtures exist but the loader runs
   did not complete).
-- **Storage: the default now optimizes for size.** As of the 2026-07-12 codec-intent
+- **Storage: the default optimizes for size.** As of the 2026-07-12 codec-intent
   flip, `codec="auto"` is **cost-aware adaptive** (predominantly ShufDeltaZstd) — the
   column labeled `scx auto_v2 (ShufDeltaZstd)` above is what the new default `auto`
-  produces, and the old decode-max `auto=Scx1` column is now `codec="fast"`. Adaptive
+  produces, and the old decode-max `auto=Scx1` column is `codec="fast"`. Adaptive
   `auto` recovers ~30% of the disk vs `fast` (census_1m 3989→2800 MB) while staying
   **within ≤~3% of `fast` on the realistic `hvg_norm` training scenario at every scale**
   (see the head-to-head section below), narrowing but not closing the gap to
@@ -1101,7 +1119,7 @@ Phase-0 single-threaded emitter):
 | `replogle_k562` (69K × 6.5K) | **12.8 s** | 28.0 s | 2.2× | 53.2 s | 6.3 GB |
 | `tahoe_c38` (69K × 63K) | **9.0 s** | 17.4 s | 1.9× | 9.5 s | 5.0 GB |
 
-scx now **beats shardad on grouped write** for in-RAM-sized data (chemogenetic
+scx **beats shardad on grouped write** for in-RAM-sized data (chemogenetic
 6.5 s ≪ 21 s; tahoe 9.0 s < 9.5 s), while keeping the streaming/`--memory-budget`
 path as the atlas-scale moat. The parallel gather trades peak RSS for speed — on
 `chemogenetic_rgfp` (127K-cell reference group) the 16-way gather peaks at
@@ -1129,7 +1147,7 @@ runs as a first-class format in the comprehensive suite:
   > **Why isn't ShufDeltaZstd the default?** Despite better compression,
   > ShufDeltaZstd has **no in-VRAM decode via BitPacker4x** (Scx1 decodes its
   > indices in VRAM; ShufDeltaZstd's GPU path uploads planes / host-bounces).
-  > CPU decode is now **≈ Scx1 parity (~1.09× at a 16 K-row shard, at/below Scx1
+  > CPU decode is **≈ Scx1 parity (~1.09× at a 16 K-row shard, at/below Scx1
   > for smaller shards)** after the Phase-B SSE2 byte-transforms (was 1.3–1.8×
   > slower); the remaining reason to keep Scx1 as the `auto` default is the GPU
   > analysis path, not CPU decode. `compact-trial`
@@ -1176,13 +1194,13 @@ runs as a first-class format in the comprehensive suite:
   27–37% — inverting the spec's `§8` assumption that zstd dominates.
 
   **Phase B result — SSE2 SIMD byte-transforms (`scx-codec/src/simd.rs`).** The
-  two transforms are now 128-bit SSE2 kernels (baseline-guaranteed on x86_64;
+  two transforms are 128-bit SSE2 kernels (baseline-guaranteed on x86_64;
   scalar fallback on other arches; bit-identical, `simd == scalar` proptested):
   a log-step (Hillis–Steele) wrapping-`u8` prefix scan for undelta and an
   `unpack`-cascade transpose (width-specialized for 2/4/8) for unshuffle. undelta
   drops ~9.6× and unshuffle ~3.4–3.9× (SSE2 column above), so zstd becomes the
   dominant decode stage again. Whole-shard `decode_shard` (16 384-row × ~2000-nnz,
-  u16 indices) is now **ShufDeltaZstd 274.6 ms vs Scx1 251.7 ms — ~1.09× (within
+  u16 indices) is **ShufDeltaZstd 274.6 ms vs Scx1 251.7 ms — ~1.09× (within
   ~9%)**, down from the previous 1.3–1.8×; on the smaller 2048-row shard
   ShufDeltaZstd is at/below Scx1 (5.4 vs 7.7 ms). This removes ShufDeltaZstd's
   CPU-decode training tax and is the Phase-C `auto_v2` enabler. (Phase 1's GPU
@@ -1202,7 +1220,7 @@ runs as a first-class format in the comprehensive suite:
   | census_500k | compact_trial | 0.38× | **1.20× Scx1** | 4.57 (vs Scx1 5.49) |
   | census_500k | shufdelta | 0.38× | **1.21× Scx1** | 4.54 |
 
-  Framed ShufDeltaZstd now decodes at **~parity-to-faster than Scx1 (0.86–1.21×
+  Framed ShufDeltaZstd decodes at **~parity-to-faster than Scx1 (0.86–1.21×
   across runs), a ~2.4–3.2× jump over the Phase-0 host-bounce** — vindicating the
   0b finding (offloading the transform-dominated CPU cost was the lever, not the
   spec's ~1.1× estimate). Two corroborating signals: host→device upload fell
@@ -1367,7 +1385,7 @@ sidecars), the SLAF cloud-path probe failure (missing
 
 ### SLAF parity
 
-SLAF (`slafdb==0.5.2`) is now a first-class competitor across every
+SLAF (`slafdb==0.5.2`) is a first-class competitor across every
 comprehensive-suite dimension — compression, full read, selective read,
 filtered-query pushdown (SQL via its DuckDB engine), correctness
 round-trip, ML loader, and out-of-core memory. Key results on census_1m:
@@ -1530,7 +1548,7 @@ pbmc3k (see §8b):
 
 ### Regression gating
 
-All benchmark results now carry a `schema_version=1` stamp + full
+All benchmark results carry a `schema_version=1` stamp + full
 provenance (git SHA, thread pinning, run_id) in their
 `system.provenance` block. The on-demand gate
 (`scripts/gate_candidate.py` + `scripts/compare_against_baseline.py
