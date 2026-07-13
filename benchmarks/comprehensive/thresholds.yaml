@@ -1468,35 +1468,44 @@ absolute_floors:
     min: 3.0         # ~70% of measured 4.56×
 
   # ----- multimodal_training (Phase K) ----------------------------
-  # MultimodalTrainingDataset throughput + time-to-first-batch
-  # floors. SCX should hit at least ~50% of measured batches/s and
-  # TTFB no worse than ~2× measured. 50% / 2× is wider than the
-  # ml_loader floors because the multimodal loader handles two
-  # streams in parallel and is more sensitive to per-modality codec
-  # choice than the single-stream `ml_loader`.
+  # MultimodalTrainingDataset throughput + time-to-first-batch floors.
   #
-  # Measured CITE-seq SCX per-modality: 570 batches/s, 0.079 s TTFB.
-  # Measured Multiome SCX per-modality: 24 batches/s, 1.84 s TTFB.
+  # Throughput is floored on cells_per_sec (batch-size-INVARIANT), not
+  # batches_per_sec. These fixtures are small and the loader does not
+  # cycle, so a measured "epoch" is a single pass: cite_seq 5,247 cells
+  # / batch 4,096 ≈ 2 batches; multiome 11,898 cells with the batch
+  # pinned to 256 by the wide-ATAC per-modality memory budget ≈ 47
+  # batches. batches_per_sec therefore depends on batch_size and the
+  # single-pass batch count (it was the old 285/12 floors, which assumed
+  # a 100-batch cycled epoch that never happens) — not a stable signal.
+  # cells_per_sec is the cells/s the loader actually sustains and is
+  # comparable across batch-size / batch-pinning changes.
+  #
+  # Measured (release build, single worker node, 5-epoch median):
+  #   CITE-seq per-modality: 9,565 cells/s, 0.55 s TTFB.
+  #   Multiome per-modality: 1,717 cells/s, 1.61 s TTFB.
+  # Floors: ~0.5× measured cells/s; TTFB ~2.5× measured. Confirmed /
+  # refined by the Phase 5 SLURM recapture against LATEST.
   - benchmark: multimodal_training
     format: scx_multimodal_per_modality_auto
     dataset: cite_seq_pbmc_5k
-    metric: batches_per_sec
-    min: 285         # 0.5× measured 570
+    metric: cells_per_sec
+    min: 4500        # ~0.5× measured 9,565
   - benchmark: multimodal_training
     format: scx_multimodal_per_modality_auto
     dataset: cite_seq_pbmc_5k
     metric: time_to_first_batch_s
-    max: 0.2         # ~2.5× measured 0.079s; absorbs cold-cache jitter
+    max: 1.5         # ~2.7× measured 0.55s; absorbs cold-cache jitter
   - benchmark: multimodal_training
     format: scx_multimodal_per_modality_auto
     dataset: multiome_pbmc_10k
-    metric: batches_per_sec
-    min: 12          # 0.5× measured 24
+    metric: cells_per_sec
+    min: 850         # ~0.5× measured 1,717
   - benchmark: multimodal_training
     format: scx_multimodal_per_modality_auto
     dataset: multiome_pbmc_10k
     metric: time_to_first_batch_s
-    max: 4.0         # ~2.2× measured 1.84s
+    max: 4.0         # ~2.5× measured 1.61s
 
   # ─── Streaming h5ad → SCX conversion (Phase 10) ─────────────────────
   # The streaming converter's whole point is bounded peak memory: at

@@ -175,17 +175,28 @@ for batch in ds:
     ...
 ```
 
-The wrapper holds one `TrainingPipeline` per modality, sharing seed /
-batch_size so the per-modality shufflers produce aligned row orderings.
-Per-batch `cell_indices` are validated to match across modalities; a
-mismatch raises with a clear error directing to a writer-side fix
-(typically a uniform `shard_target_rows` across modalities).
+The wrapper holds one `TrainingPipeline` per modality, sharing the seed
+so the per-modality shufflers produce aligned row orderings. To keep
+per-batch `cell_indices` identical across modalities, the wrapper pins a
+**uniform effective `batch_size` and `shard_group_size`** — the minimum
+across modalities — so the per-modality memory-budget auto-tuner cannot
+shrink one modality's batch below another's and desync the batching. It
+also validates at construction that all modalities share the same CSR
+shard layout (row ranges); a genuine layout mismatch raises a clear error
+directing to a writer-side fix (a uniform `shard_target_rows` across
+modalities). Per-batch `cell_indices` are still checked on every batch as
+a final guard.
 
 `return_dict=False` switches the iterator to tuple batches
 `(X_rna, X_adt)` aligned with the constructor's `modalities` order.
 
 `max_memory_mb` is divided across modalities proportionally to
-per-modality nnz with a 64 MB floor so the auto-tuner has room.
+per-modality nnz with a 64 MB floor so the auto-tuner has room. Because a
+uniform batch is pinned, a **wide modality** (many features — e.g. an ATAC
+peak matrix) can pull the shared effective `batch_size` below the
+requested value under the default budget; pass a larger `max_memory_mb`
+to keep a larger batch across all modalities (a one-shot `log::info` fires
+when the batch is reduced).
 
 `pyscx.TrainingDataset(path)` on a multimodal file falls back to the
 alphabetically-first modality and emits a `UserWarning` directing the
