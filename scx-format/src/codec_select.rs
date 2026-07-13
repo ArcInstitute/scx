@@ -136,18 +136,18 @@ pub fn resolve_codec(codec: Option<&str>) -> Result<ResolvedCodec, String> {
              (size-max, adopts on ties). The `decode_target` knob was removed with it."
                 .to_string(),
         ),
-        // Explicit codec force.
-        other => match CodecId::parse_cli(other.unwrap_or("auto")) {
+        // Explicit codec force (`None`/`auto` and the profiles are handled above,
+        // so `name` here is always a concrete codec string or unknown).
+        Some(name) => match CodecId::parse_cli(name) {
             Ok(cid) => {
                 let requires_framing = cid == Some(CodecId::ShufDeltaZstd);
                 let profile = cid.map(|c| c.display_name()).unwrap_or("auto");
                 mk(cid, false, None, requires_framing, profile)
             }
             Err(_) => Err(format!(
-                "Unknown codec: '{}'. Use 'auto' (default, adaptive), 'fast' (decode-max), \
+                "Unknown codec: '{name}'. Use 'auto' (default, adaptive), 'fast' (decode-max), \
                  'compact' (size-max), 'compact-trial', 'none', 'scx1', 'zstd', 'lz4', \
-                 'pcodec', or 'shufdelta'.",
-                other.unwrap_or("")
+                 'pcodec', or 'shufdelta'."
             )),
         },
     }

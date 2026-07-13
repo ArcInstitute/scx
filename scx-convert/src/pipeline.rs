@@ -118,9 +118,11 @@ pub struct ConvertOptions {
     /// Trial-encode (`--codec compact-trial`): per framed shard, keep the smaller
     /// of {heuristic codec, ShufDeltaZstd}. Ignored unless `row_group_rows` is set.
     pub codec_trial: bool,
-    /// Workload-aware `auto_v2` profile (`--codec auto_v2 --decode-target …`):
-    /// per framed integer shard, pick the codec by [`scx_format_io::pick_codec_v2`]
-    /// biased by the downstream decode target. `None` = not auto_v2. Takes
+    /// Internal adaptive-profile mechanism behind `codec="auto"`/`"compact"`
+    /// (set by `scx_format::resolve_codec`, not a user-facing knob): per framed
+    /// integer shard, pick the codec by [`scx_format_io::pick_codec_v2`] biased by
+    /// this target — `Auto` (auto, cost-aware margin) or `Storage` (compact, tie
+    /// -adopt). `None` = heuristic single-encode (`fast` / explicit codec). Takes
     /// precedence over `codec_trial`; ignored unless `row_group_rows` is set.
     pub decode_target: Option<scx_format_io::DecodeTarget>,
     /// Tool name recorded in the provenance entry. Defaults to

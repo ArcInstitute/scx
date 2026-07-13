@@ -69,22 +69,27 @@ pub(crate) fn encode_values(
 // change.
 pub(crate) use scx_codec::value_encoding::detect_value_encoding;
 
-/// Parse codec name string to Option<CodecId>.
-/// Returns None for auto mode (default), Some(id) for explicit codec.
-pub(crate) fn parse_codec(codec: Option<&str>) -> PyResult<Option<CodecId>> {
-    match codec {
-        None | Some("auto") => Ok(None),
-        Some("none") => Ok(Some(CodecId::None)),
-        Some("scx1") => Ok(Some(CodecId::Scx1)),
-        Some("zstd") => Ok(Some(CodecId::Zstd)),
-        Some("lz4") => Ok(Some(CodecId::Lz4Shuffle)),
-        Some("pcodec") => Ok(Some(CodecId::Pcodec)),
-        Some("shufdelta") => Ok(Some(CodecId::ShufDeltaZstd)),
-        Some(other) => Err(PyRuntimeError::new_err(format!(
-            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'zstd', 'lz4', 'pcodec', or 'shufdelta'.",
-            other
-        ))),
+/// Resolve a `codec=` string for writer paths that do **not** support the
+/// row-group-framed / adaptive profiles (`from_h5mu`, `merge`, `append`,
+/// `from_mtx`). Routes through the shared [`scx_format_io::resolve_codec`] so
+/// the intent-axis vocabulary gets consistent errors — `auto_v2` reports as
+/// removed, and the framing-only profiles (`compact` / `compact-trial`) report
+/// a clear "use `scx convert` / `from_anndata`" message instead of a bare
+/// "Unknown codec". `auto` and `fast` resolve to the heuristic single-encode
+/// (`None`) here (the adaptive `auto` write is deferred on these paths); every
+/// explicit codec — including `shufdelta` — passes through unchanged.
+pub(crate) fn parse_codec_nonframed(codec: Option<&str>) -> PyResult<Option<CodecId>> {
+    use scx_format_io::DecodeTarget;
+    let resolved = scx_format_io::resolve_codec(codec).map_err(PyRuntimeError::new_err)?;
+    if resolved.codec_trial || resolved.decode_target == Some(DecodeTarget::Storage) {
+        return Err(PyRuntimeError::new_err(format!(
+            "codec='{}' needs row-group-framed output and is not supported on this path; \
+             use `scx convert` / `pyscx.from_anndata` for the framed/adaptive profiles, \
+             or pass 'auto'/'fast'/an explicit codec here.",
+            resolved.profile
+        )));
     }
+    Ok(resolved.explicit_codec)
 }
 
 /// Codec-selection `params_json` for the in-memory `from_anndata` provenance

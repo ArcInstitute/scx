@@ -329,9 +329,12 @@ Writers SHOULD choose per-shard codecs automatically. Benchmarks found
 that Rice (Scx1) **increases** file size for non-UMI data (Smart-seq2: 0.852×
 h5ad vs 0.746× uncompressed), while Zstd achieves 0.345×.
 
-### Heuristic (used by `codec="auto"`)
+### Heuristic (used by `codec="fast"`, and `auto`'s fallback)
 
-Canonical implementation: `scx-format/src/codec_select.rs::select_codec()`.
+This is the median-based heuristic: it is the whole of `codec="fast"`, the
+unframed fallback for `codec="auto"`, and one of the two candidates `auto` /
+`compact` dual-encode against ShufDeltaZstd (see § "The codec intent axis"
+below). Canonical implementation: `scx-format/src/codec_select.rs::select_codec()`.
 
 - Float32 / Float16 values → **Pcodec** (typical 7–16 % better than Zstd
   on log-normalized data; see `docs/api.md` § "Codec Selection").

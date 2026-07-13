@@ -28,6 +28,15 @@ expires: 2026-10-12
 
 The multimodal_training / cite_seq per-modality-auto floor (285 b/s) and the
 failing `multiome_pbmc` multimodal_training jobs are a separate, pre-existing
-multimodal-benchmark issue independent of the codec convergence. Suppressed
-here so the codec-flip baseline can promote; reconcile the multimodal_training
-floors + multiome breakage in a dedicated multimodal recapture.
+multimodal-benchmark issue independent of the codec convergence.
+
+Scope of this justification: it suppresses **only** the `cite_seq_pbmc_5k`
+per-modality-auto `batches_per_sec` + `time_to_first_batch_s` floor violations
+(the `triples:` above). It does **not** suppress `multiome_pbmc_10k` — those
+jobs fail before producing a result row, so their floors
+(`thresholds.yaml`: `batches_per_sec >= 12`, `time_to_first_batch_s <= 4.0`)
+are simply not exercised in this promotion (carried-forward, un-re-measured).
+If `multiome_pbmc_10k` is re-run it will **not** be suppressed by this file and
+will trip its floors until the underlying shard-alignment failure is fixed.
+Reconcile the multimodal_training floors + the multiome breakage in a dedicated
+multimodal recapture (see `MULTI-MODAL-TRAINING-ISSUE.md`).

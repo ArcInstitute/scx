@@ -287,7 +287,7 @@ pub fn from_h5mu_impl(
             "no such file: '{path}'"
         )));
     }
-    let explicit_codec = crate::convert::parse_codec(codec)?;
+    let explicit_codec = crate::convert::parse_codec_nonframed(codec)?;
     let csc_policy =
         scx_format_io::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
