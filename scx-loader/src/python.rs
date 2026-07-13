@@ -369,6 +369,14 @@ impl TrainingDataset {
 /// divergent layouts can never yield aligned `cell_indices`. Returns a
 /// human-readable error naming the first disagreeing pair. Pure (no Python),
 /// so it is unit-testable without a Python interpreter.
+///
+/// Assumes per-shard `stats` are present (always true for single-writer v2+
+/// files). A shard missing `stats` maps to a `(u64::MAX, u64::MAX)` sentinel:
+/// two such shards compare equal (degenerate files pass, then the per-batch
+/// `cell_indices` check in `__next__` is the backstop), while a mix of
+/// present/absent stats compares unequal and fails loud here. Either way the
+/// loader never silently emits mis-aligned batches; a missing-stats shard is
+/// logged so a corrupt/legacy file is diagnosable.
 fn check_uniform_modality_layouts(
     reader: &scx_format_io::ScxReader,
     modalities: &[(String, u8, u64)],
@@ -380,10 +388,15 @@ fn check_uniform_modality_layouts(
                 .catalog()
                 .csr_shards_for_modality(*mid)
                 .iter()
-                .map(|e| {
-                    e.stats
-                        .as_ref()
-                        .map_or((u64::MAX, u64::MAX), |s| (s.row_start, s.row_end))
+                .map(|e| match e.stats.as_ref() {
+                    Some(s) => (s.row_start, s.row_end),
+                    None => {
+                        log::warn!(
+                            "MultimodalTrainingDataset: modality '{name}' has a CSR shard with no \
+                             stats; layout-uniformity check falls back to a sentinel row range."
+                        );
+                        (u64::MAX, u64::MAX)
+                    }
                 })
                 .collect();
             (name.as_str(), ranges)
@@ -609,12 +622,25 @@ impl MultimodalTrainingDataset {
         });
         if needs_repin {
             let requested_batch = batch_size.unwrap_or(defaults.batch_size);
+            let requested_sgs = shard_group_size.unwrap_or(defaults.shard_group_size);
             if common_batch < requested_batch {
                 log::info!(
                     "MultimodalTrainingDataset: pinning uniform effective batch_size \
                      {common_batch} (requested {requested_batch}) across modalities so a wide \
                      modality's memory-budget auto-tune does not desync per-modality batching. \
                      Pass a larger max_memory_mb to keep the requested batch.",
+                );
+            }
+            if common_sgs < requested_sgs {
+                // A pinned shard_group_size below what a narrow modality would
+                // pick lowers its within-group shuffle entropy (the per-pipeline
+                // `shuffle_quality_degraded` warn only fires for modalities the
+                // tuner itself shrank, so surface the cross-modality pin here).
+                log::info!(
+                    "MultimodalTrainingDataset: pinning uniform effective shard_group_size \
+                     {common_sgs} (requested {requested_sgs}) across modalities; narrow \
+                     modalities see lower within-group shuffle entropy as a result. Pass a \
+                     larger max_memory_mb to keep a larger shard_group_size.",
                 );
             }
             pipelines.clear();
@@ -1938,7 +1964,7 @@ mod layout_check_tests {
         writer.set_modality_n_vars(rna_id, n_vars as u64).unwrap();
         writer.set_modality_n_vars(atac_id, n_vars as u64).unwrap();
 
-        let mut write_shard = |writer: &mut ScxWriter, mid: u8, row_offset: usize, rows: usize| {
+        let write_shard = |writer: &mut ScxWriter, mid: u8, row_offset: usize, rows: usize| {
             let mut indptr = vec![0u64];
             let mut indices = Vec::new();
             let mut values = Vec::new();
