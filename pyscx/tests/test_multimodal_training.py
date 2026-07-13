@@ -86,6 +86,67 @@ def test_multimodal_dataset_dict_batches(cite_seq_path):
     ds.close()
 
 
+def test_multimodal_uniform_batch_across_wide_and_narrow_modalities(tmp_path):
+    """Regression: a wide modality (many genes) and a narrow one must not
+    desync their per-batch row ordering.
+
+    Each modality runs its own ``TrainingPipeline`` with a per-modality
+    memory budget. Without a uniform-batch guard the wide modality's
+    ``batch_size`` is shrunk independently by the memory-budget auto-tuner
+    (``compute_memory_budget``) below the narrow modality's, so the two
+    pipelines chunk the (identical) shuffled cell order into different
+    batch boundaries and the ``__next__`` alignment check raises
+    ``RuntimeError``. The loader now pins a uniform effective ``batch_size``
+    across modalities, so the epoch iterates cleanly with aligned rows.
+    """
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    n_obs, rna_n_vars, wide_n_vars = 400, 20, 8000
+    rna = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.4, size=(n_obs, rna_n_vars)).astype(np.float32))
+    )
+    rna.var_names = [f"g{i}" for i in range(rna_n_vars)]
+    wide = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.4, size=(n_obs, wide_n_vars)).astype(np.float32))
+    )
+    wide.var_names = [f"p{i}" for i in range(wide_n_vars)]
+    mu = mudata.MuData({"rna": rna, "prot": wide})
+    mu.obs_names = [f"c{i}" for i in range(n_obs)]
+    path = str(tmp_path / "wide.scx")
+    pyscx.from_mudata(mu, path)
+
+    # A small explicit budget forces the wide modality's per-modality
+    # batch below the requested 256; the narrow modality would otherwise
+    # keep 256. The uniform-batch guard reconciles them.
+    ds = pyscx.MultimodalTrainingDataset(
+        path,
+        modalities=["rna", "prot"],
+        batch_size=256,
+        max_memory_mb=64,
+        normalize=False,
+        log1p=False,
+        seed=1,
+    )
+    seen = 0
+    first_rows = None
+    for batch in ds:
+        n_rna = batch["X"]["rna"].shape[0]
+        n_prot = batch["X"]["prot"].shape[0]
+        assert n_rna == n_prot, "per-modality batches must share a row count"
+        if first_rows is None:
+            first_rows = n_rna
+        seen += n_rna
+    assert seen == n_obs, "one full epoch over all cells"
+    # The wide modality forced the pinned batch below the requested 256,
+    # so this run genuinely exercised the uniform-batch reconciliation.
+    assert first_rows is not None and first_rows < 256
+    ds.close()
+
+
 def test_multimodal_dataset_tuple_batches(cite_seq_path):
     """Phase H.2: `return_dict=False` yields tuples of X arrays."""
     import pyscx

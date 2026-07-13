@@ -363,6 +363,60 @@ impl TrainingDataset {
 /// `RuntimeError` if the per-modality shufflers diverge (e.g. because
 /// the modalities have different shard layouts on disk — typically a
 /// writer / file-construction bug).
+/// Verify that all requested modalities share identical per-modality CSR
+/// shard layouts (shard counts + row ranges). The multimodal loader chunks
+/// each modality independently but assembles batches positionally, so
+/// divergent layouts can never yield aligned `cell_indices`. Returns a
+/// human-readable error naming the first disagreeing pair. Pure (no Python),
+/// so it is unit-testable without a Python interpreter.
+///
+/// Assumes per-shard `stats` are present (always true for single-writer v2+
+/// files). A shard missing `stats` maps to a `(u64::MAX, u64::MAX)` sentinel:
+/// two such shards compare equal (degenerate files pass, then the per-batch
+/// `cell_indices` check in `__next__` is the backstop), while a mix of
+/// present/absent stats compares unequal and fails loud here. Either way the
+/// loader never silently emits mis-aligned batches; a missing-stats shard is
+/// logged so a corrupt/legacy file is diagnosable.
+fn check_uniform_modality_layouts(
+    reader: &scx_format_io::ScxReader,
+    modalities: &[(String, u8, u64)],
+) -> Result<(), String> {
+    let layouts: Vec<(&str, Vec<(u64, u64)>)> = modalities
+        .iter()
+        .map(|(name, mid, _)| {
+            let ranges = reader
+                .catalog()
+                .csr_shards_for_modality(*mid)
+                .iter()
+                .map(|e| match e.stats.as_ref() {
+                    Some(s) => (s.row_start, s.row_end),
+                    None => {
+                        log::warn!(
+                            "MultimodalTrainingDataset: modality '{name}' has a CSR shard with no \
+                             stats; layout-uniformity check falls back to a sentinel row range."
+                        );
+                        (u64::MAX, u64::MAX)
+                    }
+                })
+                .collect();
+            (name.as_str(), ranges)
+        })
+        .collect();
+    if let Some((first_name, first_ranges)) = layouts.first() {
+        for (name, ranges) in layouts.iter().skip(1) {
+            if ranges != first_ranges {
+                return Err(format!(
+                    "modalities '{first_name}' and '{name}' have different per-modality CSR \
+                     shard layouts (shard counts or row ranges disagree). The multimodal loader \
+                     requires uniform per-modality sharding; reshard the file with a uniform \
+                     shard_target_rows before training."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[pyclass]
 pub struct MultimodalTrainingDataset {
     /// One pipeline per requested modality, in the order the user
@@ -493,15 +547,34 @@ impl MultimodalTrainingDataset {
             })
             .collect();
 
-        // Build one pipeline per modality. All pipelines share the
-        // same seed so the per-modality shufflers agree on row
-        // ordering as long as the per-modality shard layouts align
-        // (which the standard multimodal writer guarantees).
+        // Per-modality shard-layout alignment check (fail loud at
+        // construction rather than mid-`__next__`). The per-modality
+        // shufflers can only agree on row ordering when the shard
+        // layouts match; a genuine layout mismatch (different shard
+        // counts or row ranges) can never produce aligned batches.
+        check_uniform_modality_layouts(&reader, &resolved)
+            .map_err(|e| PyRuntimeError::new_err(format!("MultimodalTrainingDataset: {e}")))?;
+
+        // Build one pipeline per modality. All pipelines share the same
+        // seed, and the shard layouts are validated identical above, so
+        // the per-modality Level-1/Level-2 shufflers agree on row
+        // ordering. Batching, however, is chunked by each pipeline's
+        // *effective* `batch_size`, which the per-modality memory-budget
+        // auto-tuner (`compute_memory_budget`) can shrink independently:
+        // a wide modality (e.g. ATAC, ~144k genes) can be forced below
+        // the `ADAPTIVE_BUDGET_CAP_MB` ceiling while a narrow one (e.g.
+        // RNA) keeps the requested batch. Different effective batch sizes
+        // desync the per-batch `cell_indices` and trip the alignment
+        // check in `__next__`. To prevent that, build once to discover
+        // each modality's effective batch/shard_group_size, then pin all
+        // pipelines to the minimum across modalities (always feasible —
+        // each modality already fit its own larger effective config).
         drop(reader);
-        let mut pipelines = Vec::with_capacity(resolved.len());
-        let mut names = Vec::with_capacity(resolved.len());
-        for ((name, mid, _), modality_mb) in resolved.into_iter().zip(per_modality_mb) {
-            let config = LoaderConfig {
+        let names: Vec<String> = resolved.iter().map(|(n, _, _)| n.clone()).collect();
+        let base_configs: Vec<LoaderConfig> = resolved
+            .iter()
+            .zip(per_modality_mb)
+            .map(|((_, mid, _), modality_mb)| LoaderConfig {
                 batch_size: batch_size.unwrap_or(defaults.batch_size),
                 shard_group_size: shard_group_size.unwrap_or(defaults.shard_group_size),
                 prefetch_batches: prefetch_batches.unwrap_or(defaults.prefetch_batches),
@@ -518,12 +591,66 @@ impl MultimodalTrainingDataset {
                 // each modality's pipeline raises to fit its own full-width
                 // configuration rather than shrinking the batch.
                 auto_memory_budget: max_memory_mb.is_none(),
-                modality_id: Some(mid),
-            };
-            let pipeline = TrainingPipeline::new(path, config)
+                modality_id: Some(*mid),
+            })
+            .collect();
+
+        let mut pipelines = Vec::with_capacity(base_configs.len());
+        for config in &base_configs {
+            let pipeline = TrainingPipeline::new(path, config.clone())
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             pipelines.push(pipeline);
-            names.push(name);
+        }
+
+        // Pin uniform effective batch_size + shard_group_size (min across
+        // modalities). Rebuilding at the common minimum never over-shrinks
+        // because each modality already fit its own effective (>=) config,
+        // so a smaller pinned config always fits within the same budget.
+        let common_batch = pipelines
+            .iter()
+            .map(|p| p.effective_batch_size())
+            .min()
+            .unwrap_or_else(|| batch_size.unwrap_or(defaults.batch_size));
+        let common_sgs = pipelines
+            .iter()
+            .map(|p| p.memory_budget_info().shard_group_size)
+            .min()
+            .unwrap_or_else(|| shard_group_size.unwrap_or(defaults.shard_group_size));
+        let needs_repin = pipelines.iter().any(|p| {
+            p.effective_batch_size() != common_batch
+                || p.memory_budget_info().shard_group_size != common_sgs
+        });
+        if needs_repin {
+            let requested_batch = batch_size.unwrap_or(defaults.batch_size);
+            let requested_sgs = shard_group_size.unwrap_or(defaults.shard_group_size);
+            if common_batch < requested_batch {
+                log::info!(
+                    "MultimodalTrainingDataset: pinning uniform effective batch_size \
+                     {common_batch} (requested {requested_batch}) across modalities so a wide \
+                     modality's memory-budget auto-tune does not desync per-modality batching. \
+                     Pass a larger max_memory_mb to keep the requested batch.",
+                );
+            }
+            if common_sgs < requested_sgs {
+                // A pinned shard_group_size below what a narrow modality would
+                // pick lowers its within-group shuffle entropy (the per-pipeline
+                // `shuffle_quality_degraded` warn only fires for modalities the
+                // tuner itself shrank, so surface the cross-modality pin here).
+                log::info!(
+                    "MultimodalTrainingDataset: pinning uniform effective shard_group_size \
+                     {common_sgs} (requested {requested_sgs}) across modalities; narrow \
+                     modalities see lower within-group shuffle entropy as a result. Pass a \
+                     larger max_memory_mb to keep a larger shard_group_size.",
+                );
+            }
+            pipelines.clear();
+            for mut config in base_configs {
+                config.batch_size = common_batch;
+                config.shard_group_size = common_sgs;
+                let pipeline = TrainingPipeline::new(path, config)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                pipelines.push(pipeline);
+            }
         }
 
         Ok(MultimodalTrainingDataset {
@@ -1769,4 +1896,137 @@ pub fn collate_cellset_gathered<'py>(
         })
         .map_err(loader_err_to_py)?;
     collated_cellset_batch_to_dict(py, batch)
+}
+
+#[cfg(test)]
+mod layout_check_tests {
+    use super::*;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use scx_codec::{CodecId, ValueEncoding};
+    use scx_format_io::header::FileHeader;
+    use scx_format_io::modality::ModalityType;
+    use scx_format_io::reader::ScxReader;
+    use scx_format_io::writer::ScxWriter;
+    use std::sync::Arc as StdArc;
+
+    /// Build a two-modality (`rna`, `atac`) `.scx`. `rna` is always a single
+    /// CSR shard over all `n_obs` rows; `atac` is written as one shard per
+    /// entry in `atac_shard_rows` (so passing `&[n_obs]` yields an identical
+    /// layout, and e.g. `&[5, 5]` yields a divergent one).
+    fn build_two_modality(path: &std::path::Path, n_obs: usize, atac_shard_rows: &[usize]) {
+        let n_vars = 4usize;
+        let header =
+            FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, n_obs as u32, 0, 0);
+        let mut writer = ScxWriter::new(path, header).unwrap();
+
+        let obs_schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+        let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+        let obs = arrow::record_batch::RecordBatch::try_new(
+            StdArc::new(obs_schema),
+            vec![StdArc::new(StringArray::from(
+                cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        writer.write_obs(&obs).unwrap();
+
+        let var_schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+        let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+        let var = arrow::record_batch::RecordBatch::try_new(
+            StdArc::new(var_schema),
+            vec![StdArc::new(StringArray::from(
+                gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let atac_id = writer
+            .add_modality(
+                "atac",
+                ModalityType::Atac,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &var).unwrap();
+        writer.write_var_for(atac_id, &var).unwrap();
+        writer.set_modality_n_vars(rna_id, n_vars as u64).unwrap();
+        writer.set_modality_n_vars(atac_id, n_vars as u64).unwrap();
+
+        let write_shard = |writer: &mut ScxWriter, mid: u8, row_offset: usize, rows: usize| {
+            let mut indptr = vec![0u64];
+            let mut indices = Vec::new();
+            let mut values = Vec::new();
+            for local in 0..rows {
+                let row = row_offset + local;
+                indices.push((row % n_vars) as u32);
+                values.push(((row + 1) & 0xFF) as u8);
+                indptr.push(*indptr.last().unwrap() + 1);
+            }
+            writer
+                .write_csr_shard_for(
+                    mid,
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_offset as u64,
+                )
+                .unwrap();
+        };
+
+        write_shard(&mut writer, rna_id, 0, n_obs);
+        let mut off = 0usize;
+        for &rows in atac_shard_rows {
+            write_shard(&mut writer, atac_id, off, rows);
+            off += rows;
+        }
+        assert_eq!(off, n_obs, "atac shard rows must sum to n_obs");
+        writer.finish().unwrap();
+    }
+
+    fn resolved(reader: &ScxReader) -> Vec<(String, u8, u64)> {
+        vec![
+            ("rna".to_string(), reader.modality_id("rna").unwrap(), 0),
+            ("atac".to_string(), reader.modality_id("atac").unwrap(), 0),
+        ]
+    }
+
+    #[test]
+    fn uniform_layout_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uniform.scx");
+        build_two_modality(&path, 10, &[10]);
+        let reader = ScxReader::open(&path).unwrap();
+        assert!(check_uniform_modality_layouts(&reader, &resolved(&reader)).is_ok());
+    }
+
+    #[test]
+    fn divergent_layout_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("divergent.scx");
+        build_two_modality(&path, 10, &[5, 5]);
+        let reader = ScxReader::open(&path).unwrap();
+        let err = check_uniform_modality_layouts(&reader, &resolved(&reader)).unwrap_err();
+        assert!(
+            err.contains("different per-modality CSR shard layouts"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("rna") && err.contains("atac"),
+            "error names pair: {err}"
+        );
+    }
 }

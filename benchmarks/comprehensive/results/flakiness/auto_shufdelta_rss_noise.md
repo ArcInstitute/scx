@@ -10,19 +10,6 @@ overrides:
     dataset: tabula_sapiens_100k
     metric: peak_rss_mb_median
     tolerance: 0.15
-  # Competitor multimodal rows re-measured during the out-of-scope
-  # multimodal_training/cite_seq refresh — sub-100ms wall jitter on 0.3s
-  # benchmarks (shared 192-core node), unrelated to the codec flip.
-  - benchmark: multimodal_training
-    format: h5mu_uncompressed
-    dataset: cite_seq_pbmc_5k
-    metric: median_wall_s
-    tolerance: 0.25
-  - benchmark: multimodal_training
-    format: zarr_mudata_zstd
-    dataset: cite_seq_pbmc_5k
-    metric: median_wall_s
-    tolerance: 0.25
 reason: >
   Peak-RSS sampling noise on the adaptive `codec="auto"` decode path, not a
   systematic ShufDeltaZstd memory regression. Evidence (post-flip candidate

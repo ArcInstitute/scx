@@ -235,7 +235,11 @@ LRU thrashing across modalities.
   - `to_mudata() -> mudata.MuData` — round-trips back to MuData.
 - `pyscx.MultimodalTrainingDataset(path, modalities=[…], …)` — yields
   per-batch dicts `{"X": {modality_name: ndarray}, "obs": {...},
-  "cell_indices": ndarray}` (or tuples in `return_dict=False` mode).
+  "cell_indices": ndarray}` (or tuples in `return_dict=False` mode). Pins a
+  uniform effective `batch_size`/`shard_group_size` across modalities so a
+  wide modality (e.g. ATAC) can't desync the per-modality batching; pass a
+  larger `max_memory_mb` to lift the pinned batch. See
+  [docs/multimodal.md § Training](multimodal.md#33-training--pyscxmultimodaltrainingdataset).
 - Backward compat: `pyscx.TrainingDataset(path)` on a multimodal file
   emits `UserWarning` and falls back to the alphabetically-first
   modality. Pass `modality="rna"` explicitly to suppress.

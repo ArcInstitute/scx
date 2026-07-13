@@ -400,13 +400,24 @@ def run(
         peak_rss,
     )
 
+    # Actual batches produced per epoch. ``_BATCHES_PER_EPOCH`` is only a
+    # *cap*; the SCX loader does not cycle, so a small file exhausts in a
+    # single pass (e.g. cite_seq 5,247 cells / batch 4,096 ≈ 2 batches).
+    # Recording the observed count keeps the raw JSON honest — the derived
+    # ``batches_per_sec`` is over this many batches, not the 100 target.
+    n_batches_observed = int(np.median([e.n_batches for e in epochs])) if epochs else 0
+
     metadata = {
         "n_modalities": len(dataset.modality_names),
         "modality_names": list(dataset.modality_names),
         "batch_size": _BATCH_SIZE,
-        "n_batches_per_epoch": _BATCHES_PER_EPOCH,
+        "n_batches_per_epoch_target": _BATCHES_PER_EPOCH,
+        "n_batches_observed_median": n_batches_observed,
         "time_to_first_batch_s": round(median_ttfb, 6),
         "ttfb_runs_s": [round(t, 6) for t in ttfbs],
+        # ``cells_per_sec`` is the floored, batch-size-invariant throughput
+        # metric (see thresholds.yaml). ``batches_per_sec`` is retained for
+        # continuity but is batch-size- and single-pass-sensitive.
         "batches_per_sec_median": round(float(np.median(bps)), 4),
         "cells_per_sec_median": round(float(np.median(cps)), 2),
         "peak_rss_mb": round(peak_rss, 2),
