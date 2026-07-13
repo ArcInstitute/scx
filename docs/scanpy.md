@@ -2403,7 +2403,7 @@ results = pyscx.accel.perturbation_metrics(
 | `control` | `"control"` | Control label |
 | `metrics` | all 5 | Subset of `{pearson_delta, mse, mae, mse_delta, mae_delta}` |
 | `min_cells_per_group` | 1 | Skip perturbations with fewer cells |
-| `device` | `"auto"` | `"auto"`/`"cpu"`/`"gpu"`/`"gpu:N"` — GPU runs the per-group pseudobulk means on the device (f64), bulk metrics on the host; CPU parity `atol≈1e-6`. Route `gpu_dense` / `cpu_csr`. |
+| `device` | `"auto"` | `"auto"`/`"cpu"`/`"gpu"`/`"gpu:N"` — GPU runs the per-group pseudobulk means on the device (f64), bulk metrics on the host; CPU parity `atol≈1e-6`. Route `gpu_csr` / `cpu_csr`. |
 
 #### Discrimination score (`pyscx.accel.discrimination_score`)
 
