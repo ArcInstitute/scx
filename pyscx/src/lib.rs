@@ -290,7 +290,6 @@ pub(crate) fn deep_validate_into(
     bitmap="off", memory_budget=None, force_legacy_metadata=false,
     sort_by=None, reverse=false,
     row_group_rows=scx_format_io::DEFAULT_ROW_GROUP_ROWS, row_group_target_nnz=None,
-    decode_target=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_anndata(
@@ -314,7 +313,6 @@ fn from_anndata(
     reverse: bool,
     row_group_rows: Option<u32>,
     row_group_target_nnz: Option<u64>,
-    decode_target: Option<&str>,
 ) -> PyResult<()> {
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
@@ -339,7 +337,6 @@ fn from_anndata(
         reverse,
         row_group_rows,
         row_group_target_nnz,
-        decode_target,
     )
 }
 
@@ -444,7 +441,6 @@ fn from_anndata(
     group_pass="auto",
     obs_override=None, var_override=None, uns_override=None,
     row_group_rows=scx_format_io::DEFAULT_ROW_GROUP_ROWS, row_group_target_nnz=None,
-    decode_target=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5ad(
@@ -480,7 +476,6 @@ fn from_h5ad(
     uns_override: Option<Bound<'_, PyAny>>,
     row_group_rows: u32,
     row_group_target_nnz: Option<u64>,
-    decode_target: Option<&str>,
 ) -> PyResult<()> {
     // A missing input is the common wrong-path case. The converter opens
     // the h5ad via `hdf5::File::open`, which surfaces as `ConvertError::Hdf5`
@@ -491,33 +486,17 @@ fn from_h5ad(
             "no such file: '{path}'"
         )));
     }
-    // `compact-trial` / `auto_v2` are framing profiles, not codecs (mirror
-    // `from_anndata` + the CLI). Both — and an explicit `shufdelta` — require
-    // row-group framing.
-    let codec_trial = codec == Some("compact-trial");
-    let is_auto_v2 = codec == Some("auto_v2");
-    let explicit_codec = if codec_trial || is_auto_v2 {
-        None
-    } else {
-        convert::parse_codec(codec)?
-    };
-    if decode_target.is_some() && !is_auto_v2 {
-        return Err(PyValueError::new_err(
-            "decode_target=… is only valid with codec='auto_v2'",
-        ));
-    }
-    let decode_target_parsed = if is_auto_v2 {
-        Some(convert::parse_decode_target(decode_target)?)
-    } else {
-        None
-    };
-    if (codec_trial || is_auto_v2 || explicit_codec == Some(scx_codec::CodecId::ShufDeltaZstd))
-        && row_group_rows == 0
-    {
-        return Err(PyValueError::new_err(
-            "codec='compact-trial'/'auto_v2'/'shufdelta' requires row_group_rows=N with N > 0 \
+    // Resolve the codec intent axis (`auto`/`fast`/`compact` + explicit forces).
+    let resolved = scx_format_io::resolve_codec(codec).map_err(PyValueError::new_err)?;
+    let explicit_codec = resolved.explicit_codec;
+    let codec_trial = resolved.codec_trial;
+    let decode_target_parsed = resolved.decode_target;
+    if resolved.requires_framing && row_group_rows == 0 {
+        return Err(PyValueError::new_err(format!(
+            "codec='{}' requires row_group_rows=N with N > 0 \
              (row-group-framed output for random-access-safe reads)",
-        ));
+            resolved.profile
+        )));
     }
     let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     let csc_policy =
@@ -656,7 +635,6 @@ fn from_h5ad(
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", memory_budget=None, force_legacy_metadata=false,
     row_group_rows=scx_format_io::DEFAULT_ROW_GROUP_ROWS, row_group_target_nnz=None,
-    decode_target=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_10x(
@@ -677,7 +655,6 @@ fn from_10x(
     force_legacy_metadata: bool,
     row_group_rows: u32,
     row_group_target_nnz: Option<u64>,
-    decode_target: Option<&str>,
 ) -> PyResult<()> {
     let scanpy = py.import("scanpy").map_err(|e| {
         // Only rewrite when scanpy itself is the missing module — if scanpy
@@ -725,7 +702,6 @@ fn from_10x(
         // Framing on by default (G=256); `row_group_rows=0` opts out to unframed.
         (row_group_rows != 0).then_some(row_group_rows),
         row_group_target_nnz,
-        decode_target,
     )
 }
 

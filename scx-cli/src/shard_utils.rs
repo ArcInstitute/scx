@@ -42,3 +42,20 @@ where
     bytes.dedup();
     Ok(bytes)
 }
+
+/// Per-`codec_id` shard count across `shards`, sorted ascending by codec id.
+///
+/// Surfaces what an adaptive `codec="auto"` write actually chose per shard
+/// (predominantly ShufDeltaZstd, mixed with Scx1 for low-median shards) rather
+/// than a single "the codec". Reads each shard's 76-byte header.
+pub fn codec_id_histogram(
+    reader: &ScxReader,
+    shards: &[&scx_format_io::catalog::FullCatalogEntry],
+) -> CliResult<Vec<(u8, u64)>> {
+    let mut counts: std::collections::BTreeMap<u8, u64> = std::collections::BTreeMap::new();
+    for e in shards {
+        let h = reader.read_shard_header(e)?;
+        *counts.entry(h.codec_id).or_insert(0) += 1;
+    }
+    Ok(counts.into_iter().collect())
+}

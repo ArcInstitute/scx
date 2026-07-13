@@ -706,13 +706,23 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
   cellstream clearly beats shardad (shardad's per-call subset read collapses to
   ~0.5 batches/sec at ≥50k cells; its census fixtures exist but the loader runs
   did not complete).
-- **Storage: the compute default trades disk for speed.** scx `auto` (Scx1) is chosen
-  for decode speed and is the largest on disk (~2.3× cellstream at census scale);
-  the opt-in `auto_v2` (ShufDeltaZstd) recovers ~30% of that (census_1m 3989→2800 MB)
-  while keeping scx-class throughput (**auto_v2 within ≤~3% of `auto` on the realistic
-  `hvg_norm` scenario at every scale** — see the auto_v2-vs-cellstream section), narrowing
-  but not closing the gap to cellstream/shardad's aggressive zstd+dictionary codec.
-  Storage-bound archival should prefer `auto_v2`/`compact-trial`.
+- **Storage: the default now optimizes for size.** As of the 2026-07-12 codec-intent
+  flip, `codec="auto"` is **cost-aware adaptive** (predominantly ShufDeltaZstd) — the
+  column labeled `scx auto_v2 (ShufDeltaZstd)` above is what the new default `auto`
+  produces, and the old decode-max `auto=Scx1` column is now `codec="fast"`. Adaptive
+  `auto` recovers ~30% of the disk vs `fast` (census_1m 3989→2800 MB) while staying
+  **within ≤~3% of `fast` on the realistic `hvg_norm` training scenario at every scale**
+  (see the head-to-head section below), narrowing but not closing the gap to
+  cellstream/shardad's aggressive zstd+dictionary codec. Latency-critical CPU training
+  that wants the old decode-max behavior pins `codec="fast"`.
+
+> **Naming (2026-07-12 flip).** These tables were captured under the pre-flip names:
+> the old `auto` (Scx1, decode-max) is now **`fast`**, and the old opt-in `auto_v2`
+> (ShufDeltaZstd, adaptive) is now the default **`auto`**. The numbers are unchanged
+> measurements; an exact recapture under the new names (and the tightened adaptive
+> floors, incl. a **looser raw-path (G1b) throughput floor** — the `raw`
+> full-width-scatter path carries the full ~9.6–20% ShufDeltaZstd CPU-decode tax, vs
+> ~6% on `hvg_norm` and ~4% on `gpu_train`) is deferred to the comprehensive recapture.
 
 *Methodology: all rows from the `benchmarks/comprehensive` ml_loader capture
 (median-of-N, batch_size=1024, HVG=2000), 2026-07-10/11, consistent with the promoted

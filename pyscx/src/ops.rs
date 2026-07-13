@@ -144,7 +144,7 @@ fn validate_shard_size(shard_size: Option<i64>) -> PyResult<NonZeroU32> {
     NonZeroU32::new(v_u32).ok_or_else(|| PyValueError::new_err("shard_size must be > 0"))
 }
 
-/// Map an Option<CodecId> (from convert::parse_codec) plus the detected
+/// Map an Option<CodecId> (from convert::parse_codec_nonframed) plus the detected
 /// value encoding into a CodecSelection. Preserves the legacy
 /// Scx1+float silent fixup at the binding boundary.
 fn resolve_codec_selection(
@@ -224,7 +224,7 @@ pub fn append(
     index_auto_threshold: Option<usize>,
     modality: Option<&str>,
 ) -> PyResult<()> {
-    let explicit_codec = convert::parse_codec(codec)?;
+    let explicit_codec = convert::parse_codec_nonframed(codec)?;
     let shard_target_rows = validate_shard_size(shard_size)?;
 
     // Open input file
@@ -362,7 +362,7 @@ pub fn append_from_anndata(
     index_auto_threshold: Option<usize>,
     modality: Option<&str>,
 ) -> PyResult<()> {
-    let explicit_codec = convert::parse_codec(codec)?;
+    let explicit_codec = convert::parse_codec_nonframed(codec)?;
     let shard_target_rows = validate_shard_size(shard_size)?;
 
     // Extract CSR from adata.X
