@@ -1,6 +1,6 @@
 [package]
 name = "pyscx"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2021"
 description = "Python bindings for SCX via PyO3"
 license.workspace = true

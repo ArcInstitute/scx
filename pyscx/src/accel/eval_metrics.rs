@@ -12,6 +12,43 @@ use crate::lazy_transform::ScxLazyTransformedDataset;
 use super::util::{astype_no_copy, extract_csr_slices};
 
 // ──────────────────────────────────────────────────────────────────────────────
+// device scaffolding (Phase 0 of CELL-EVAL-SCX-GPU-ACC.md)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Validate the `device=` selector and record the resolved route on
+/// `adata.uns["scx_accel"][op]` for a CPU-only eval metric.
+///
+/// None of the perturbation-evaluation metrics has a GPU kernel yet (the GPU
+/// kernels land in later phases of `CELL-EVAL-SCX-GPU-ACC.md`), so this is the
+/// no-op API surface that lets callers pass `device=` today and observe the
+/// route via `uns["scx_accel"]`:
+///
+/// * [`resolve_device`](super::gpu::resolve_device) validates the string, so an
+///   explicit `device="gpu"`/`"gpu:N"` errors loudly when pyscx was built
+///   without the `gpu` feature or no CUDA device is visible. `"auto"`/`"cpu"`
+///   always resolve to CPU here.
+/// * The route is planned via [`cpu_only_exec_info`](super::route::cpu_only_exec_info):
+///   `UserForcedCpu` for `device="cpu"`, `NoCuda` when no GPU is present, and
+///   `UnsupportedInputLayout` for an explicit GPU request on a GPU host (there
+///   is no GPU eval-metric kernel yet). An explicit `device="gpu"` landing on
+///   CPU emits the standard one-shot [`announce_route`](super::route::announce_route)
+///   `UserWarning`; `"auto"` stays quiet.
+///
+/// Stamp on the AnnData the caller would inspect for the route — the prediction
+/// (`adata_pred`) for the pair metrics, the sole input for single-input ops.
+fn scaffold_device_route(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    op: &'static str,
+    device: &str,
+) -> PyResult<()> {
+    super::gpu::resolve_device(device)?;
+    let info = super::route::cpu_only_exec_info(device);
+    super::route::announce_route(py, op, device, &info);
+    super::route::write_accel_route(py, adata, op, &info)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // pseudobulk_means
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -39,8 +76,23 @@ use super::util::{astype_no_copy, extract_csr_slices};
 ///     # means.shape == (n_perturbations, n_genes)
 ///     # groups == ["control", "drug_A", "drug_B", ...]
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, min_cells_per_group=1))]
+#[pyo3(signature = (adata, groupby, min_cells_per_group=1, device="auto"))]
 pub fn pseudobulk_means<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    groupby: &str,
+    min_cells_per_group: usize,
+    device: &str,
+) -> PyResult<Py<PyAny>> {
+    scaffold_device_route(py, adata, "pseudobulk_means", device)?;
+    pseudobulk_means_impl(py, adata, groupby, min_cells_per_group)
+}
+
+/// Body of [`pseudobulk_means`] without the device/route scaffolding, so
+/// internal callers (e.g. `compute_aligned_pseudobulk_means`) reuse the
+/// extraction + aggregation without re-stamping `uns["scx_accel"]` or
+/// re-validating `device`.
+fn pseudobulk_means_impl<'py>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
     groupby: &str,
@@ -292,37 +344,38 @@ fn compute_aligned_pseudobulk_means<'py>(
 
     // For embed_key: use obsm-based pseudobulk (compute manually).
     // For X: use the existing pseudobulk_means infrastructure.
-    let (means_real_np, groups_real, means_pred_np, groups_pred, gene_names) =
-        if let Some(key) = embed_key {
-            // Extract obsm embeddings and compute group means manually
-            let (means_r, groups_r) =
-                compute_obsm_pseudobulk(py, &np, adata_real, pert_col, key, min_cells_per_group)?;
-            let (means_p, groups_p) =
-                compute_obsm_pseudobulk(py, &np, adata_pred, pert_col, key, min_cells_per_group)?;
-            // No gene names when using embeddings
-            let n_dims: usize = means_r.getattr("shape")?.extract::<(usize, usize)>()?.1;
-            let empty_genes: Vec<String> = (0..n_dims).map(|i| format!("embed_{i}")).collect();
-            (means_r, groups_r, means_p, groups_p, empty_genes)
-        } else {
-            // Use standard X-based pseudobulk means
-            let means_real_obj = pseudobulk_means(py, adata_real, pert_col, min_cells_per_group)?;
-            let means_pred_obj = pseudobulk_means(py, adata_pred, pert_col, min_cells_per_group)?;
+    let (means_real_np, groups_real, means_pred_np, groups_pred, gene_names) = if let Some(key) =
+        embed_key
+    {
+        // Extract obsm embeddings and compute group means manually
+        let (means_r, groups_r) =
+            compute_obsm_pseudobulk(py, &np, adata_real, pert_col, key, min_cells_per_group)?;
+        let (means_p, groups_p) =
+            compute_obsm_pseudobulk(py, &np, adata_pred, pert_col, key, min_cells_per_group)?;
+        // No gene names when using embeddings
+        let n_dims: usize = means_r.getattr("shape")?.extract::<(usize, usize)>()?.1;
+        let empty_genes: Vec<String> = (0..n_dims).map(|i| format!("embed_{i}")).collect();
+        (means_r, groups_r, means_p, groups_p, empty_genes)
+    } else {
+        // Use standard X-based pseudobulk means
+        let means_real_obj = pseudobulk_means_impl(py, adata_real, pert_col, min_cells_per_group)?;
+        let means_pred_obj = pseudobulk_means_impl(py, adata_pred, pert_col, min_cells_per_group)?;
 
-            let real_tuple = means_real_obj.bind(py);
-            let pred_tuple = means_pred_obj.bind(py);
+        let real_tuple = means_real_obj.bind(py);
+        let pred_tuple = means_pred_obj.bind(py);
 
-            let means_r = real_tuple.get_item(0)?;
-            let groups_r: Vec<String> = real_tuple.get_item(1)?.extract()?;
-            let means_p = pred_tuple.get_item(0)?;
-            let groups_p: Vec<String> = pred_tuple.get_item(1)?.extract()?;
+        let means_r = real_tuple.get_item(0)?;
+        let groups_r: Vec<String> = real_tuple.get_item(1)?.extract()?;
+        let means_p = pred_tuple.get_item(0)?;
+        let groups_p: Vec<String> = pred_tuple.get_item(1)?.extract()?;
 
-            // Extract gene names from adata_real.var_names
-            let var = adata_real.getattr("var")?;
-            let var_names = var.getattr("index")?;
-            let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
+        // Extract gene names from adata_real.var_names
+        let var = adata_real.getattr("var")?;
+        let var_names = var.getattr("index")?;
+        let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
 
-            (means_r, groups_r, means_p, groups_p, gene_names)
-        };
+        (means_r, groups_r, means_p, groups_p, gene_names)
+    };
 
     // ── Align perturbation groups ───────────────────────────────────
     if groups_real.is_empty() || groups_pred.is_empty() {
@@ -645,7 +698,7 @@ fn extract_obs_column<'py>(
 ///     # results["pearson_delta"]["drug_A"] == 0.95
 ///     # results["mse"]["drug_A"] == 0.12
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metrics=None, embed_key=None, min_cells_per_group=1))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metrics=None, embed_key=None, min_cells_per_group=1, device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn perturbation_metrics<'py>(
     py: Python<'py>,
@@ -656,7 +709,10 @@ pub fn perturbation_metrics<'py>(
     metrics: Option<Vec<String>>,
     embed_key: Option<&str>,
     min_cells_per_group: usize,
+    device: &str,
 ) -> PyResult<Py<PyAny>> {
+    scaffold_device_route(py, adata_pred, "perturbation_metrics", device)?;
+
     // Determine which metrics to compute.
     let default_metrics = vec![
         "pearson_delta".to_string(),
@@ -983,7 +1039,7 @@ fn run_energy_distance<'py>(
 ///     # corr ≈ 0.85 means real and predicted perturbation effects
 ///     # have similar relative magnitudes (higher = better, 1.0 = perfect)
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None, device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn energy_distance<'py>(
     py: Python<'py>,
@@ -995,7 +1051,9 @@ pub fn energy_distance<'py>(
     embed_key: Option<&str>,
     backend: Option<&str>,
     dtype: Option<&str>,
+    device: &str,
 ) -> PyResult<f64> {
+    scaffold_device_route(py, adata_pred, "energy_distance", device)?;
     let result = run_energy_distance(
         py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype,
     )?;
@@ -1030,7 +1088,7 @@ pub fn energy_distance<'py>(
 ///     # out["correlation"] ≈ 0.85   (higher = better, 1.0 = perfect)
 ///     # out["d_real"]["drug_A"] == 12.34
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None, device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn energy_distance_details<'py>(
     py: Python<'py>,
@@ -1042,7 +1100,9 @@ pub fn energy_distance_details<'py>(
     embed_key: Option<&str>,
     backend: Option<&str>,
     dtype: Option<&str>,
+    device: &str,
 ) -> PyResult<Py<PyAny>> {
+    scaffold_device_route(py, adata_pred, "energy_distance_details", device)?;
     let result = run_energy_distance(
         py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype,
     )?;
@@ -1104,7 +1164,7 @@ pub fn energy_distance_details<'py>(
 ///     scores = pyscx.accel.discrimination_score(adata_real, adata_pred)
 ///     # scores["drug_A"] == 0.95  (high = good prediction)
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="l1", exclude_target_gene=true, embed_key=None, min_cells_per_group=1))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="l1", exclude_target_gene=true, embed_key=None, min_cells_per_group=1, device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn discrimination_score<'py>(
     py: Python<'py>,
@@ -1116,7 +1176,10 @@ pub fn discrimination_score<'py>(
     exclude_target_gene: bool,
     embed_key: Option<&str>,
     min_cells_per_group: usize,
+    device: &str,
 ) -> PyResult<Py<PyAny>> {
+    scaffold_device_route(py, adata_pred, "discrimination_score", device)?;
+
     // Parse distance metric.
     let dist_metric = match metric.to_lowercase().as_str() {
         "euclidean" | "l2" => scx_accel::DistanceMetric::Euclidean,
@@ -1257,14 +1320,16 @@ pub fn discrimination_score<'py>(
 ///     - "KnockDownEfficiency": per-cell knockdown efficiency (float32)
 ///     - "KnockDownGeneFC": per-cell log fold change (float32)
 #[pyfunction]
-#[pyo3(signature = (adata, pert_col="perturbation", control="control", eps=1e-8))]
+#[pyo3(signature = (adata, pert_col="perturbation", control="control", eps=1e-8, device="auto"))]
 pub fn knockdown_efficiency<'py>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
     pert_col: &str,
     control: &str,
     eps: f64,
+    device: &str,
 ) -> PyResult<()> {
+    scaffold_device_route(py, adata, "knockdown_efficiency", device)?;
     let np = py.import("numpy")?;
 
     // ── Extract perturbation labels ─────────────────────────────────
@@ -1426,7 +1491,7 @@ pub fn knockdown_efficiency<'py>(
 /// Returns:
 ///     float — Best clustering agreement score across predicted resolutions
 #[pyfunction]
-#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="ami", real_resolution=1.0, pred_resolutions=None, n_neighbors=15, embed_key=None, min_cells_per_group=1))]
+#[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="ami", real_resolution=1.0, pred_resolutions=None, n_neighbors=15, embed_key=None, min_cells_per_group=1, device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn clustering_agreement<'py>(
     py: Python<'py>,
@@ -1440,7 +1505,10 @@ pub fn clustering_agreement<'py>(
     n_neighbors: usize,
     embed_key: Option<&str>,
     min_cells_per_group: usize,
+    device: &str,
 ) -> PyResult<f64> {
+    scaffold_device_route(py, adata_pred, "clustering_agreement", device)?;
+
     // Native-Rust path: kNN graph + Leiden clustering live entirely in
     // `scx_accel`, so the entire hot path runs under `py.detach`.
     // No scanpy / anndata / igraph imports — the Leiden defaults
