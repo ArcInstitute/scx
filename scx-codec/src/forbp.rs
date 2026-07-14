@@ -465,6 +465,18 @@ pub fn forbp_decode_with_hint(
     forbp_decode_inner(data, n_rows, nnz_hint, index_dtype_u16)
 }
 
+/// Cap on total decoded indices when the caller passes no `nnz_hint` (tests /
+/// benches / fuzz; the production Scx1 path always passes the exact nnz via
+/// [`forbp_decode_with_hint`]). A `frame_bits == 0` row is a zero-payload
+/// constant run whose nnz the stream does not otherwise bound, so this caps the
+/// allocation a hostile no-hint input can drive.
+///
+/// `1 << 24` (16.7M indices ≈ 64 MiB of i32 output) is chosen to sit far above
+/// any realistic no-hint decode — the largest such caller is the codec bench,
+/// well under a million indices — while keeping a hostile constant-run bounded
+/// to tens of MiB rather than the multi-GiB OOM the old `nnz <= 1` guard blocked.
+const FORBP_NO_HINT_MAX_NNZ: usize = 1 << 24;
+
 fn forbp_decode_inner(
     data: &[u8],
     n_rows: usize,
@@ -482,6 +494,14 @@ fn forbp_decode_inner(
     if data.len().checked_mul(8).is_some_and(|cap| nnz_hint > cap) || n_rows > data.len() {
         return Err(BitStreamError);
     }
+    // Ceiling on total decoded indices: exact when the caller knows the nnz
+    // (production Scx1 path), else a generous absolute cap. Bounds the one
+    // otherwise-unbounded allocation — a zero-payload `frame_bits == 0` run.
+    let max_output = if nnz_hint > 0 {
+        nnz_hint
+    } else {
+        FORBP_NO_HINT_MAX_NNZ
+    };
     let mut all_indices = Vec::with_capacity(nnz_hint);
     let mut all_row_lengths = Vec::with_capacity(n_rows);
     let mut cursor = Cursor::new(data);
@@ -538,19 +558,25 @@ fn forbp_decode_inner(
                 return Err(BitStreamError);
             }
 
-            // Bound this row's nnz against the remaining payload *before* it
-            // drives an allocation (`resize`/`push` below). A malformed nnz
-            // varint could otherwise request gigabytes from a few-byte input
-            // (fuzz: a per-row nnz of ~5.4e8 forced a 2 GiB allocation). A
-            // frame_bits-packed row needs at least `nnz * frame_bits` bits of
-            // payload; a frame_bits == 0 row encodes a constant value and is
-            // only valid for a single index (distinct, sorted indices force
-            // every delta >= 1, so frame_bits >= 1 whenever nnz >= 2).
+            // Bound this row's nnz *before* it drives an allocation
+            // (`resize`/`push` below). A malformed nnz varint could otherwise
+            // request gigabytes from a few-byte input (fuzz: a per-row nnz of
+            // ~5.4e8 forced a 2 GiB allocation).
             if frame_bits == 0 {
-                if nnz > 1 {
+                // A frame_bits == 0 row is a zero-payload run of equal indices:
+                // the encoder only requires non-decreasing indices, so repeated
+                // columns encode as all-zero deltas (valid for any nnz — real
+                // CSR rows have distinct columns and never hit this, but the
+                // contract permits it). It is decoded by the `else` branch below
+                // as `frame_min` repeated `nnz` times. Since it carries no
+                // payload, bound the *cumulative* output instead of payload
+                // bytes so a hostile nnz varint can't drive an unbounded run.
+                if all_indices.len().saturating_add(nnz) > max_output {
                     return Err(BitStreamError);
                 }
             } else {
+                // A frame_bits-packed row needs at least `nnz * frame_bits` bits
+                // of payload; reject a length the remaining bytes can't hold.
                 let need_bytes = (nnz as u64).saturating_mul(frame_bits as u64).div_ceil(8);
                 let remaining = (data.len() as u64).saturating_sub(cursor.position());
                 if need_bytes > remaining {
@@ -704,6 +730,22 @@ mod tests {
                 assert!(forbp_decode(&data, n_rows, u16dt).is_err());
             }
         }
+    }
+
+    /// A >=128-nnz row of *repeated* column indices encodes as frame_bits == 0
+    /// (zero deltas, no payload). The encoder allows non-decreasing (not only
+    /// strictly-increasing) indices, so the host decoder must accept
+    /// frame_bits == 0 for nnz > 1 too — regression for a guard that previously
+    /// only allowed nnz <= 1 (the GPU test
+    /// `test_forbp_gpu_bp4x_frame_bits_zero_dense` caught it only on H100 sbatch
+    /// runs; this reproduces it in plain `cargo test`, no GPU required).
+    #[test]
+    fn frame_bits_zero_repeated_indices_round_trips() {
+        round_trip(&[vec![7u32; 200]], true);
+        round_trip(&[vec![7u32; 200]], false);
+        // Constant run interleaved with a strictly-increasing dense (SIMD) row,
+        // mirroring the GPU test's two-row fixture.
+        round_trip(&[vec![7u32; 200], (0u32..256).collect()], true);
     }
 
     // 5.5: Single row, multiple rows, empty rows

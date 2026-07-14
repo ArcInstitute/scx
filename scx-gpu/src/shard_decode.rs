@@ -438,20 +438,20 @@ fn decode_framed_scx1_gpu(
     let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
     combined_indptr.push(0);
 
-    let mut nnz_base: usize = 0;
-    for span in &spans {
+    // Pass 1: host-assemble the global indptr + per-group nnz base offsets
+    // (indices/values frames are never host-decoded). Pass 2 below decodes each
+    // group's frames on the device and places them at `offsets[gi]`.
+    let (offsets, nnz_final) = crate::shufdelta_gpu::prescan_framed_group_indptr(
+        CodecId::Scx1,
+        &spans,
+        indptr_bytes,
+        0,
+        &mut combined_indptr,
+    )?;
+    for (gi, span) in spans.iter().enumerate() {
         let g_rows = span.n_rows as usize;
         let g_nnz = span.nnz as usize;
-
-        // Global indptr: decode only this group's local indptr frame on the host
-        // (indices/values frames are never host-decoded), then rebase by nnz_base.
-        let g_indptr = scx_codec::decode_row_group_indptr_only(CodecId::Scx1, span, indptr_bytes)?;
-        // decode_row_group_indptr_only returns exactly g_rows+1 entries (or an
-        // error); assert it so the `[1..=g_rows]` slice can never panic.
-        debug_assert_eq!(g_indptr.len(), g_rows + 1);
-        for &local in &g_indptr[1..=g_rows] {
-            combined_indptr.push(nnz_base as i64 + local);
-        }
+        let base = offsets[gi];
 
         if g_nnz > 0 {
             // Decode this group's index + value frames on the device.
@@ -468,19 +468,17 @@ fn decode_framed_scx1_gpu(
             debug_assert_eq!(d_indices.len(), g_nnz);
             debug_assert_eq!(d_data.len(), g_nnz);
 
-            let mut idx_dst = combined_indices.slice_mut(nnz_base..nnz_base + g_nnz);
+            let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
             dev.stream()
                 .memcpy_dtod(&d_indices, &mut idx_dst)
                 .map_err(|e| GpuError::CudaError(format!("dtod indices (framed group): {e}")))?;
-            let mut data_dst = combined_data.slice_mut(nnz_base..nnz_base + g_nnz);
+            let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
             dev.stream()
                 .memcpy_dtod(&d_data, &mut data_dst)
                 .map_err(|e| GpuError::CudaError(format!("dtod data (framed group): {e}")))?;
         }
-
-        nnz_base += g_nnz;
     }
-    debug_assert_eq!(nnz_base, nnz);
+    debug_assert_eq!(nnz_final, nnz);
     debug_assert_eq!(combined_indptr.len(), n_rows + 1);
 
     let indptr_bytes_uploaded = (combined_indptr.len() * 8) as u64;
@@ -634,17 +632,18 @@ fn decode_framed_shufdelta_gpu(
     combined_indptr.push(0);
 
     let mut host_uploaded_bytes: u64 = 0;
-    let mut nnz_base: usize = 0;
-    for span in &spans {
-        let g_rows = span.n_rows as usize;
+    // Pass 1: host-assemble the rebased global indptr + per-group nnz offsets;
+    // pass 2 decodes each group's frames on the device at `offsets[gi]`.
+    let (offsets, nnz_final) = crate::shufdelta_gpu::prescan_framed_group_indptr(
+        CodecId::ShufDeltaZstd,
+        &spans,
+        indptr_bytes,
+        0,
+        &mut combined_indptr,
+    )?;
+    for (gi, span) in spans.iter().enumerate() {
         let g_nnz = span.nnz as usize;
-
-        let g_indptr =
-            scx_codec::decode_row_group_indptr_only(CodecId::ShufDeltaZstd, span, indptr_bytes)?;
-        debug_assert_eq!(g_indptr.len(), g_rows + 1);
-        for &local in &g_indptr[1..=g_rows] {
-            combined_indptr.push(nnz_base as i64 + local);
-        }
+        let base = offsets[gi];
 
         if g_nnz > 0 {
             let ix_frame = &indices_bytes[span.indices.clone()];
@@ -657,19 +656,17 @@ fn decode_framed_shufdelta_gpu(
             debug_assert_eq!(d_indices.len(), g_nnz);
             debug_assert_eq!(d_data.len(), g_nnz);
 
-            let mut idx_dst = combined_indices.slice_mut(nnz_base..nnz_base + g_nnz);
+            let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
             dev.stream()
                 .memcpy_dtod(&d_indices, &mut idx_dst)
                 .map_err(|e| GpuError::CudaError(format!("dtod indices (shufdelta group): {e}")))?;
-            let mut data_dst = combined_data.slice_mut(nnz_base..nnz_base + g_nnz);
+            let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
             dev.stream()
                 .memcpy_dtod(&d_data, &mut data_dst)
                 .map_err(|e| GpuError::CudaError(format!("dtod data (shufdelta group): {e}")))?;
         }
-
-        nnz_base += g_nnz;
     }
-    debug_assert_eq!(nnz_base, nnz);
+    debug_assert_eq!(nnz_final, nnz);
     debug_assert_eq!(combined_indptr.len(), n_rows + 1);
 
     host_uploaded_bytes += (combined_indptr.len() * 8) as u64;
@@ -1036,6 +1033,90 @@ mod tests {
         buf.extend_from_slice(&section.encoded.values_bytes);
         buf.extend_from_slice(&section.block_index_bytes);
         buf
+    }
+
+    /// Host-only unit test for the shared
+    /// [`crate::shufdelta_gpu::prescan_framed_group_indptr`] helper (no GPU
+    /// required — pure host indptr work). All five framed GPU decode bodies now
+    /// route their per-group indptr pre-scan through it, so this locks in the
+    /// rebased global indptr + per-group nnz offsets against a hand-computed
+    /// prefix sum. Covers: multi-group, a fully-empty group (`g_nnz == 0`), a
+    /// non-zero starting nnz base (the cross-shard batched path), and both
+    /// framed codecs (`Scx1` FOR-BP/Rice and `ShufDeltaZstd`).
+    #[test]
+    fn prescan_framed_group_indptr_matches_prefix_sum() {
+        let n_cols: u32 = 4000;
+        // 14 rows, row_group_rows = 4 → groups tile rows 0..4, 4..8, 8..12,
+        // 12..14. Rows 4..8 are all empty so group 1 has g_nnz == 0.
+        let row_nnzs = [1usize, 5, 3, 2, 0, 0, 0, 0, 9, 3, 4, 1, 5, 2];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        let values_f32: Vec<f32> = values_u16.iter().map(|&v| v as f32).collect();
+        let n_rows = indptr.len() - 1;
+        let row_group_rows = 4u32;
+
+        for codec in [CodecId::Scx1, CodecId::ShufDeltaZstd] {
+            let section = framed_section_bytes(
+                &indptr,
+                &indices,
+                &values_f32,
+                codec,
+                n_cols,
+                row_group_rows,
+            );
+            let header = ShardHeader::read_from(&mut Cursor::new(&section)).unwrap();
+            let indptr_bytes =
+                &section[header.indptr_rel_offset as usize..][..header.indptr_length as usize];
+            let block_index_bytes = &section[header.block_index_rel_offset as usize..]
+                [..header.block_index_length as usize];
+            let spans = resolve_block_index(&header, block_index_bytes).unwrap();
+
+            // Expected per-group nnz base = cumulative nnz at each group's first
+            // row (groups tile rows in `row_group_rows` chunks).
+            let mut expected_offsets = Vec::new();
+            let mut r = 0usize;
+            for span in &spans {
+                expected_offsets.push(indptr[r] as usize);
+                r += span.n_rows as usize;
+            }
+            assert_eq!(r, n_rows, "{codec:?}: spans must cover all rows");
+
+            // Base 0: combined_indptr must reproduce the source CSR indptr exactly.
+            let mut combined = vec![0i64];
+            let (offsets, final_nnz) = crate::shufdelta_gpu::prescan_framed_group_indptr(
+                codec,
+                &spans,
+                indptr_bytes,
+                0,
+                &mut combined,
+            )
+            .unwrap();
+            let want_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
+            assert_eq!(combined, want_indptr, "{codec:?}: base-0 indptr");
+            assert_eq!(offsets, expected_offsets, "{codec:?}: base-0 offsets");
+            assert_eq!(final_nnz, indices.len(), "{codec:?}: base-0 final nnz");
+
+            // Non-zero base (cross-shard batched path): every appended indptr
+            // entry and every offset shifts by exactly `base`; seed with [base].
+            let base = 1000usize;
+            let mut combined_b = vec![base as i64];
+            let (offsets_b, final_nnz_b) = crate::shufdelta_gpu::prescan_framed_group_indptr(
+                codec,
+                &spans,
+                indptr_bytes,
+                base,
+                &mut combined_b,
+            )
+            .unwrap();
+            let want_indptr_b: Vec<i64> = indptr.iter().map(|&v| v as i64 + base as i64).collect();
+            assert_eq!(combined_b, want_indptr_b, "{codec:?}: base-shifted indptr");
+            let want_offsets_b: Vec<usize> = expected_offsets.iter().map(|&o| o + base).collect();
+            assert_eq!(offsets_b, want_offsets_b, "{codec:?}: base-shifted offsets");
+            assert_eq!(
+                final_nnz_b,
+                base + indices.len(),
+                "{codec:?}: base-shifted final nnz"
+            );
+        }
     }
 
     /// GPU decode of a **framed (v2)** shard produces output byte-identical to the
@@ -1496,6 +1577,77 @@ mod tests {
         assert_eq!(b_stats.n_shards_shufdelta_gpu, 3, "batched shard count");
         assert_eq!(p_stats.n_shards_shufdelta_gpu, 3, "per-shard shard count");
         assert_eq!(b_stats.n_shards_host_bounced, 0);
+    }
+
+    /// Multi-shard byte-exactness through
+    /// `decode_csr_shards_to_device_with_stats` on framed ShufDeltaZstd shards
+    /// **without** nvcomp, so the per-shard pipelined intra-shard assembly (the
+    /// `prescan_framed_group_indptr` + pipeline assemble extractions) is
+    /// exercised across shards even on hosts where nvcomp is not loadable — the
+    /// batched tests above early-return there, leaving that path uncovered.
+    /// Runs whenever a GPU is present.
+    #[test]
+    fn test_shufdelta_shards_no_nvcomp_matches_host() {
+        let dev = require_gpu!();
+        // Force the non-nvcomp per-shard path regardless of nvcomp availability,
+        // and the default (pipeline/sequential) intra-shard path.
+        std::env::remove_var("SCX_SHUFDELTA_NVCOMP");
+        std::env::remove_var("SCX_SHUFDELTA_GPU_SEQUENTIAL");
+        let n_cols: u32 = 4000;
+        // Three uneven multi-group shards (row_group_rows = 4) with empty,
+        // sparse, exactly-threshold and dense (>=128 nnz) rows.
+        let shard_row_nnzs: [&[usize]; 3] = [
+            &[0usize, 1, 5, 130, 256, 7, 0, 384],
+            &[200usize, 3, 128, 129],
+            &[512usize, 50, 0, 9, 300, 1],
+        ];
+        let mut sections: Vec<Vec<u8>> = Vec::new();
+        let mut want_indptr: Vec<i64> = vec![0];
+        let mut want_indices: Vec<i32> = Vec::new();
+        let mut want_data: Vec<f32> = Vec::new();
+        let mut nnz_base: i64 = 0;
+        let mut total_rows: usize = 0;
+        for row_nnzs in shard_row_nnzs {
+            let (indptr, indices, values_u16) = build_dense_csr(row_nnzs, n_cols);
+            let values_f32: Vec<f32> = values_u16.iter().map(|&v| v as f32).collect();
+            for &p in &indptr[1..] {
+                want_indptr.push(nnz_base + p as i64);
+            }
+            want_indices.extend(indices.iter().map(|&v| v as i32));
+            want_data.extend_from_slice(&values_f32);
+            nnz_base += *indptr.last().unwrap() as i64;
+            total_rows += row_nnzs.len();
+            sections.push(framed_section_bytes(
+                &indptr,
+                &indices,
+                &values_f32,
+                CodecId::ShufDeltaZstd,
+                n_cols,
+                4,
+            ));
+        }
+        let refs: Vec<&[u8]> = sections.iter().map(|s| s.as_slice()).collect();
+
+        let (csr, stats) =
+            crate::gpu_csr_assemble::decode_csr_shards_to_device_with_stats(&dev, &refs)
+                .unwrap_or_else(|e| panic!("no-nvcomp multi-shard assembly failed: {e}"));
+
+        assert_eq!(csr.shape, (total_rows, n_cols as usize), "shape");
+        assert_eq!(
+            dev.dtoh_copy(&csr.indptr).unwrap(),
+            want_indptr,
+            "indptr vs host"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&csr.indices).unwrap(),
+            want_indices,
+            "indices vs host"
+        );
+        assert_eq!(dev.dtoh_copy(&csr.data).unwrap(), want_data, "data vs host");
+        // No nvcomp → the per-shard shufdelta GPU path (decompressed planes
+        // crossed PCIe), never a host-bounce.
+        assert_eq!(stats.n_shards_shufdelta_gpu, 3, "shufdelta GPU shard count");
+        assert_eq!(stats.n_shards_host_bounced, 0, "should not host-bounce");
     }
 
     /// The batched nvcomp decode with a tiny per-chunk byte budget

@@ -190,26 +190,25 @@ impl TrainingDataset {
         // MultimodalTrainingDataset).
         let modality_id = resolve_modality_id_with_warning(py, path, modality.as_deref())?;
 
-        let defaults = LoaderConfig::default();
-        let config = LoaderConfig {
-            batch_size: batch_size.unwrap_or(defaults.batch_size),
-            shard_group_size: shard_group_size.unwrap_or(defaults.shard_group_size),
-            prefetch_batches: prefetch_batches.unwrap_or(defaults.prefetch_batches),
+        // No explicit budget → adaptive (treat the default as a floor and raise
+        // to fit a full-width file). An explicit budget is a hard ceiling
+        // (preserves the auto-tune-down + warning behaviour).
+        let config = resolve_loader_config(
+            batch_size,
+            shard_group_size,
+            prefetch_batches,
+            normalize,
+            log1p,
+            target_sum,
+            pflog1ppf,
+            pflog1ppf_c,
+            seed,
             hvg_indices,
-            obs_columns: obs_columns.unwrap_or_default(),
-            normalize: normalize.unwrap_or(defaults.normalize),
-            log1p: log1p.unwrap_or(defaults.log1p),
-            target_sum: target_sum.unwrap_or(defaults.target_sum),
-            pflog1ppf: pflog1ppf.unwrap_or(defaults.pflog1ppf),
-            pflog1ppf_c: pflog1ppf_c.unwrap_or(defaults.pflog1ppf_c),
-            seed: seed.unwrap_or(defaults.seed),
-            max_memory_mb: max_memory_mb.unwrap_or(defaults.max_memory_mb),
-            // No explicit budget → adaptive (treat the default as a floor and
-            // raise to fit a full-width file). An explicit budget is a hard
-            // ceiling (preserves the auto-tune-down + warning behaviour).
-            auto_memory_budget: max_memory_mb.is_none(),
+            obs_columns.unwrap_or_default(),
+            max_memory_mb.unwrap_or_else(|| LoaderConfig::default().max_memory_mb),
+            max_memory_mb.is_none(),
             modality_id,
-        };
+        );
 
         let pipeline = TrainingPipeline::new(path, config)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -345,24 +344,49 @@ impl TrainingDataset {
     }
 }
 
-/// Multimodal training dataset.
-///
-/// Wraps N independent `TrainingPipeline` instances — one per requested
-/// modality — and yields per-batch dicts whose cell axes align across
-/// modalities. Cells (obs) are global across modalities, so all
-/// pipelines see the same `n_obs` and the same shuffler seed produces
-/// the same row ordering when their per-modality shard layouts agree
-/// (the standard CITE-seq / multiome writer guarantees this).
-///
-/// On `__next__`, returns
-/// `{"X": {modality_name: ndarray, ...}, "obs": {...}, "cell_indices": ndarray}`
-/// when constructed with `return_dict=True` (default), or a tuple
-/// `(X_modality_0, X_modality_1, ...)` when `return_dict=False`. The
-/// per-modality X arrays share the same `cell_indices` row ordering;
-/// the wrapper validates this on each batch and raises
-/// `RuntimeError` if the per-modality shufflers diverge (e.g. because
-/// the modalities have different shard layouts on disk — typically a
-/// writer / file-construction bug).
+/// Resolve the shared user overrides against [`LoaderConfig::default()`],
+/// filling the fields that vary per construction site (`hvg_indices`,
+/// `obs_columns`, `max_memory_mb`, `auto_memory_budget`, `modality_id`) from
+/// the caller. Shared by `TrainingDataset::new` and the per-modality
+/// `MultimodalTrainingDataset::new` construction so the default-resolution is
+/// spelled out in exactly one place (otherwise a new `LoaderConfig` field must
+/// be wired through two field-for-field literal blocks that silently drift).
+#[allow(clippy::too_many_arguments)]
+fn resolve_loader_config(
+    batch_size: Option<usize>,
+    shard_group_size: Option<usize>,
+    prefetch_batches: Option<usize>,
+    normalize: Option<bool>,
+    log1p: Option<bool>,
+    target_sum: Option<f64>,
+    pflog1ppf: Option<bool>,
+    pflog1ppf_c: Option<f64>,
+    seed: Option<u64>,
+    hvg_indices: Option<Vec<u32>>,
+    obs_columns: Vec<String>,
+    max_memory_mb: usize,
+    auto_memory_budget: bool,
+    modality_id: Option<u8>,
+) -> LoaderConfig {
+    let defaults = LoaderConfig::default();
+    LoaderConfig {
+        batch_size: batch_size.unwrap_or(defaults.batch_size),
+        shard_group_size: shard_group_size.unwrap_or(defaults.shard_group_size),
+        prefetch_batches: prefetch_batches.unwrap_or(defaults.prefetch_batches),
+        hvg_indices,
+        obs_columns,
+        normalize: normalize.unwrap_or(defaults.normalize),
+        log1p: log1p.unwrap_or(defaults.log1p),
+        target_sum: target_sum.unwrap_or(defaults.target_sum),
+        pflog1ppf: pflog1ppf.unwrap_or(defaults.pflog1ppf),
+        pflog1ppf_c: pflog1ppf_c.unwrap_or(defaults.pflog1ppf_c),
+        seed: seed.unwrap_or(defaults.seed),
+        max_memory_mb,
+        auto_memory_budget,
+        modality_id,
+    }
+}
+
 /// Verify that all requested modalities share identical per-modality CSR
 /// shard layouts (shard counts + row ranges). The multimodal loader chunks
 /// each modality independently but assembles batches positionally, so
@@ -417,6 +441,24 @@ fn check_uniform_modality_layouts(
     Ok(())
 }
 
+/// Multimodal training dataset.
+///
+/// Wraps N independent `TrainingPipeline` instances — one per requested
+/// modality — and yields per-batch dicts whose cell axes align across
+/// modalities. Cells (obs) are global across modalities, so all
+/// pipelines see the same `n_obs` and the same shuffler seed produces
+/// the same row ordering when their per-modality shard layouts agree
+/// (the standard CITE-seq / multiome writer guarantees this).
+///
+/// On `__next__`, returns
+/// `{"X": {modality_name: ndarray, ...}, "obs": {...}, "cell_indices": ndarray}`
+/// when constructed with `return_dict=True` (default), or a tuple
+/// `(X_modality_0, X_modality_1, ...)` when `return_dict=False`. The
+/// per-modality X arrays share the same `cell_indices` row ordering;
+/// the wrapper validates this on each batch and raises
+/// `RuntimeError` if the per-modality shufflers diverge (e.g. because
+/// the modalities have different shard layouts on disk — typically a
+/// writer / file-construction bug).
 #[pyclass]
 pub struct MultimodalTrainingDataset {
     /// One pipeline per requested modality, in the order the user
@@ -571,27 +613,31 @@ impl MultimodalTrainingDataset {
         // each modality already fit its own larger effective config).
         drop(reader);
         let names: Vec<String> = resolved.iter().map(|(n, _, _)| n.clone()).collect();
+        // Resolve `obs_columns` once (not per modality inside the map).
+        let obs_columns = obs_columns.unwrap_or_default();
         let base_configs: Vec<LoaderConfig> = resolved
             .iter()
             .zip(per_modality_mb)
-            .map(|((_, mid, _), modality_mb)| LoaderConfig {
-                batch_size: batch_size.unwrap_or(defaults.batch_size),
-                shard_group_size: shard_group_size.unwrap_or(defaults.shard_group_size),
-                prefetch_batches: prefetch_batches.unwrap_or(defaults.prefetch_batches),
-                hvg_indices: hvg_indices.clone(),
-                obs_columns: obs_columns.clone().unwrap_or_default(),
-                normalize: normalize.unwrap_or(defaults.normalize),
-                log1p: log1p.unwrap_or(defaults.log1p),
-                target_sum: target_sum.unwrap_or(defaults.target_sum),
-                pflog1ppf: pflog1ppf.unwrap_or(defaults.pflog1ppf),
-                pflog1ppf_c: pflog1ppf_c.unwrap_or(defaults.pflog1ppf_c),
-                seed: seed.unwrap_or(defaults.seed),
-                max_memory_mb: modality_mb,
-                // No explicit total budget → adaptive per-modality floor:
-                // each modality's pipeline raises to fit its own full-width
-                // configuration rather than shrinking the batch.
-                auto_memory_budget: max_memory_mb.is_none(),
-                modality_id: Some(*mid),
+            // `max_memory_mb: modality_mb` — no explicit total budget → adaptive
+            // per-modality floor: each modality's pipeline raises to fit its own
+            // full-width configuration rather than shrinking the batch.
+            .map(|((_, mid, _), modality_mb)| {
+                resolve_loader_config(
+                    batch_size,
+                    shard_group_size,
+                    prefetch_batches,
+                    normalize,
+                    log1p,
+                    target_sum,
+                    pflog1ppf,
+                    pflog1ppf_c,
+                    seed,
+                    hvg_indices.clone(),
+                    obs_columns.clone(),
+                    modality_mb,
+                    max_memory_mb.is_none(),
+                    Some(*mid),
+                )
             })
             .collect();
 
@@ -652,6 +698,21 @@ impl MultimodalTrainingDataset {
                 pipelines.push(pipeline);
             }
         }
+
+        // Loud-at-construction guard: every pipeline must now report the pinned
+        // effective `(batch_size, shard_group_size)`. This holds by construction
+        // (rebuild forces it; when `!needs_repin` they already matched the min),
+        // but a future non-monotonic `estimate_memory` term could break the
+        // "pinned config always fits" assumption and silently reintroduce the
+        // per-modality desync — fail here rather than mid-epoch in `__next__`.
+        debug_assert!(
+            pipelines.iter().all(|p| {
+                p.effective_batch_size() == common_batch
+                    && p.memory_budget_info().shard_group_size == common_sgs
+            }),
+            "MultimodalTrainingDataset: repin failed to pin uniform \
+             (batch_size={common_batch}, shard_group_size={common_sgs}) across modalities",
+        );
 
         Ok(MultimodalTrainingDataset {
             pipelines,

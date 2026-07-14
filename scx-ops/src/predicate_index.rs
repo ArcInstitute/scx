@@ -10,12 +10,12 @@
 //! warning channel.
 //!
 //! Cross-crate warning routing is intentionally left to the caller:
-//! `scx-ops` returns the raw outcomes from
-//! [`scx_engine::build_and_write_conversion_predicate_indexes`] plus a
-//! `multimodal_skip` slot so `scx-cli` / `pyscx` can emit
-//! `ConvertWarning::PredicateIndexSkippedMultimodal` /
-//! `ConvertWarning::MissingPresetIndexColumn` themselves without
-//! `scx-ops` taking a dep on `scx-convert`.
+//! `scx-ops` has no warning type of its own. It returns the raw outcomes
+//! from [`scx_engine::build_and_write_conversion_predicate_indexes`] plus a
+//! `multimodal_skip` slot on [`PredicateIndexBuildSummary`], and each caller
+//! maps those onto its own channel — e.g. `scx-cli` / `pyscx` translate them
+//! into `scx-convert`'s `ConvertWarning` variants. This keeps `scx-ops` free
+//! of any dep on `scx-convert`.
 
 use arrow::datatypes::Schema;
 use scx_engine::{ConversionPredicateIndexOptions, ConversionPredicateIndexResult};
@@ -24,8 +24,8 @@ use crate::error::{OpsError, Result};
 
 /// Outcome of attempting to build predicate indexes during a `merge`,
 /// `append`, or `compact` rewrite. The caller decides how to surface
-/// the per-axis outcomes to its user (typed `ConvertWarning`s, Python
-/// `warnings.warn(...)`, CLI stderr, etc.).
+/// the per-axis outcomes to its user — e.g. `scx-convert`'s typed
+/// `ConvertWarning`s, Python `warnings.warn(...)`, or CLI stderr.
 #[derive(Debug, Default)]
 pub struct PredicateIndexBuildSummary {
     /// Populated when the op actually invoked the engine builder. The
@@ -37,8 +37,9 @@ pub struct PredicateIndexBuildSummary {
     /// index. Predicate-index sections are unimodal-only today (the
     /// `scx-format::writer` emitters take no `modality_id` and the
     /// `scx-engine` read-side ignores it). Multimodal merge / compact /
-    /// append must skip the write and surface this list as a single
-    /// `PredicateIndexSkippedMultimodal { columns }` warning.
+    /// append skip the write and hand back this column list so the caller
+    /// can surface it as a single warning (e.g. `scx-convert`'s
+    /// `PredicateIndexSkippedMultimodal { columns }`).
     pub multimodal_skip: Option<Vec<String>>,
 }
 
@@ -51,8 +52,8 @@ impl PredicateIndexBuildSummary {
 
     /// True when the request was non-trivial but no index was written
     /// because the output is multimodal. Callers should emit a single
-    /// `PredicateIndexSkippedMultimodal { columns }` warning in that
-    /// case.
+    /// warning naming the skipped columns in that case (e.g.
+    /// `scx-convert`'s `PredicateIndexSkippedMultimodal { columns }`).
     pub fn was_multimodal_skip(&self) -> bool {
         self.multimodal_skip.is_some()
     }

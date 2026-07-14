@@ -16,7 +16,7 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cudarc::driver::safe::{
-    CudaEvent, CudaSlice, CudaView, CudaViewMut, LaunchConfig, PinnedHostSlice,
+    CudaEvent, CudaFunction, CudaSlice, CudaView, CudaViewMut, LaunchConfig, PinnedHostSlice,
 };
 use cudarc::driver::PushKernelArg;
 
@@ -31,6 +31,99 @@ use crate::shard_decode::{DeviceDecodeStats, GpuCsr};
 /// Compiled PTX for the shufdelta kernels (produced by build.rs via nvcc --ptx).
 const SHUFDELTA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/shufdelta.ptx"));
 
+/// Host-decode each framed row-group's local indptr and fold its `[1..=g_rows]`
+/// tail into `combined_indptr`, rebased by a running nnz base that starts at
+/// `nnz_base`. Returns `(per-group nnz base offsets in span order, final nnz
+/// base)`.
+///
+/// `combined_indptr` must already hold its leading `0` (or a prior shard's tail
+/// — the cross-shard batched path calls this once per shard, passing the
+/// running `total_nnz` as `nnz_base`). `offsets[i]` is the global nnz offset of
+/// group `i`: exactly where its decoded indices/values are placed in the
+/// combined CSR, i.e. the same running base the per-group assembly loops need.
+///
+/// Pure host work (frame-header parse + tiny per-group indptr decode; the large
+/// index/value plane frames are never touched here), so callers keep their own
+/// `profile::record_host_decode_since` timing wrapper. Parameterized by `codec`
+/// so both the Scx1 (FOR-BP/Rice) and ShufDeltaZstd framed GPU decode paths
+/// share it.
+pub(crate) fn prescan_framed_group_indptr(
+    codec: scx_codec::CodecId,
+    spans: &[RowGroupSpan],
+    indptr_bytes: &[u8],
+    nnz_base: usize,
+    combined_indptr: &mut Vec<i64>,
+) -> Result<(Vec<usize>, usize), GpuError> {
+    let mut offsets: Vec<usize> = Vec::with_capacity(spans.len());
+    let mut base = nnz_base;
+    for span in spans {
+        offsets.push(base);
+        let g_rows = span.n_rows as usize;
+        let g_indptr = scx_codec::decode_row_group_indptr_only(codec, span, indptr_bytes)?;
+        // decode_row_group_indptr_only should return exactly g_rows+1 entries;
+        // validate explicitly (not just debug_assert) so a malformed frame that
+        // decoded a short indptr errors here instead of panicking the
+        // `[1..=g_rows]` slice in a release build.
+        if g_indptr.len() != g_rows + 1 {
+            return Err(GpuError::InvalidShard(format!(
+                "framed indptr: decoded {} entries, expected {}",
+                g_indptr.len(),
+                g_rows + 1
+            )));
+        }
+        for &local in &g_indptr[1..=g_rows] {
+            combined_indptr.push(base as i64 + local);
+        }
+        base += span.nnz as usize;
+    }
+    Ok((offsets, base))
+}
+
+// ---------------------------------------------------------------------------
+// Kernel-launch primitives. cudarc's `PushKernelArg` has separate concrete
+// impls for `&CudaSlice`, `&mut CudaSlice`, `&CudaView`, `&mut CudaViewMut`
+// (no blanket `DevicePtr` impl), so the four launchers below cannot share one
+// generic body — the `.arg(buf/src)` line is irreducibly per-type. What *is*
+// shared (and was previously copy-pasted) is the module load + kernel resolve
+// and the `LaunchConfig` constants; those live in these helpers so a kernel
+// name, block size, or grid formula is spelled out exactly once.
+// ---------------------------------------------------------------------------
+
+/// Resolve `undelta_planes_kernel` from the cached shufdelta PTX module.
+fn undelta_kernel(dev: &GpuDevice) -> Result<CudaFunction, GpuError> {
+    dev.load_module_cached(SHUFDELTA_PTX)?
+        .load_function("undelta_planes_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("load undelta_planes_kernel: {e}")))
+}
+
+/// Resolve `unshuffle_convert_kernel` from the cached shufdelta PTX module.
+fn unshuffle_kernel(dev: &GpuDevice) -> Result<CudaFunction, GpuError> {
+    dev.load_module_cached(SHUFDELTA_PTX)?
+        .load_function("unshuffle_convert_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("load unshuffle_convert_kernel: {e}")))
+}
+
+/// Launch config for `undelta_planes_kernel`: one 256-thread block per plane
+/// (`grid_dim.x == width`).
+fn undelta_cfg(width: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (width, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Launch config for `unshuffle_convert_kernel`: 256-thread blocks over the
+/// `n` output elements.
+fn unshuffle_cfg(n: u32) -> LaunchConfig {
+    let threads: u32 = 256;
+    LaunchConfig {
+        grid_dim: (n.div_ceil(threads), 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
 /// In-place per-plane wrapping-u8 inclusive prefix scan (undo byte-delta).
 ///
 /// `buf` is plane-major `[width][n]`; each of the `width` planes is scanned
@@ -44,23 +137,14 @@ fn undelta_planes_gpu(
     if n == 0 || width == 0 {
         return Ok(());
     }
-    let module = dev.load_module_cached(SHUFDELTA_PTX)?;
-    let kernel = module
-        .load_function("undelta_planes_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("load undelta_planes_kernel: {e}")))?;
-
-    let cfg = LaunchConfig {
-        grid_dim: (width, 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let kernel = undelta_kernel(dev)?;
     unsafe {
         dev.stream()
             .launch_builder(&kernel)
             .arg(buf)
             .arg(&n)
             .arg(&width)
-            .launch(cfg)
+            .launch(undelta_cfg(width))
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("undelta_planes_kernel: {e}")))?;
     Ok(())
@@ -80,18 +164,7 @@ fn launch_unshuffle_convert<T: cudarc::driver::DeviceRepr>(
     width: u32,
     out_is_float: u32,
 ) -> Result<(), GpuError> {
-    let module = dev.load_module_cached(SHUFDELTA_PTX)?;
-    let kernel = module
-        .load_function("unshuffle_convert_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("load unshuffle_convert_kernel: {e}")))?;
-
-    let threads: u32 = 256;
-    let grid = n.div_ceil(threads);
-    let cfg = LaunchConfig {
-        grid_dim: (grid, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let kernel = unshuffle_kernel(dev)?;
     unsafe {
         dev.stream()
             .launch_builder(&kernel)
@@ -100,7 +173,7 @@ fn launch_unshuffle_convert<T: cudarc::driver::DeviceRepr>(
             .arg(&n)
             .arg(&width)
             .arg(&out_is_float)
-            .launch(cfg)
+            .launch(unshuffle_cfg(n))
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("unshuffle_convert_kernel: {e}")))?;
     Ok(())
@@ -260,27 +333,18 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     // (tiny; the large index/value frames go to the device). Offsets let the
     // GPU consumer place each group independently, so producers can run ahead
     // and out of order.
-    let mut offsets: Vec<usize> = Vec::with_capacity(spans.len());
     let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
     combined_indptr.push(0);
-    let mut nnz_base = 0usize;
     let t_indptr = profile::start();
-    for span in spans {
-        offsets.push(nnz_base);
-        let g_rows = span.n_rows as usize;
-        let g_indptr = scx_codec::decode_row_group_indptr_only(
-            scx_codec::CodecId::ShufDeltaZstd,
-            span,
-            indptr_bytes,
-        )?;
-        debug_assert_eq!(g_indptr.len(), g_rows + 1);
-        for &local in &g_indptr[1..=g_rows] {
-            combined_indptr.push(nnz_base as i64 + local);
-        }
-        nnz_base += span.nnz as usize;
-    }
+    let (offsets, nnz_final) = prescan_framed_group_indptr(
+        scx_codec::CodecId::ShufDeltaZstd,
+        spans,
+        indptr_bytes,
+        0,
+        &mut combined_indptr,
+    )?;
     profile::record_host_decode_since(CodecClass::Generic, t_indptr);
-    debug_assert_eq!(nnz_base, nnz);
+    debug_assert_eq!(nnz_final, nnz);
     debug_assert_eq!(combined_indptr.len(), n_rows + 1);
 
     let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
@@ -523,22 +587,14 @@ fn undelta_planes_view(
     if n == 0 || width == 0 {
         return Ok(());
     }
-    let module = dev.load_module_cached(SHUFDELTA_PTX)?;
-    let kernel = module
-        .load_function("undelta_planes_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("load undelta_planes_kernel: {e}")))?;
-    let cfg = LaunchConfig {
-        grid_dim: (width, 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let kernel = undelta_kernel(dev)?;
     unsafe {
         dev.stream()
             .launch_builder(&kernel)
             .arg(buf)
             .arg(&n)
             .arg(&width)
-            .launch(cfg)
+            .launch(undelta_cfg(width))
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("undelta_planes_kernel (view): {e}")))?;
     Ok(())
@@ -553,17 +609,7 @@ fn unshuffle_convert_view<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidA
     out_is_float: u32,
 ) -> Result<CudaSlice<T>, GpuError> {
     let mut out = dev.alloc_zeros::<T>(n)?;
-    let module = dev.load_module_cached(SHUFDELTA_PTX)?;
-    let kernel = module
-        .load_function("unshuffle_convert_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("load unshuffle_convert_kernel: {e}")))?;
-    let threads: u32 = 256;
-    let grid = (n as u32).div_ceil(threads);
-    let cfg = LaunchConfig {
-        grid_dim: (grid, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let kernel = unshuffle_kernel(dev)?;
     let n_u32 = n as u32;
     let w_u32 = width as u32;
     unsafe {
@@ -574,10 +620,113 @@ fn unshuffle_convert_view<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidA
             .arg(&n_u32)
             .arg(&w_u32)
             .arg(&out_is_float)
-            .launch(cfg)
+            .launch(unshuffle_cfg(n_u32))
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("unshuffle_convert_kernel (view): {e}")))?;
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Per-group assembly from batched nvcomp plane buffers into the combined CSR.
+// Shared by the per-shard (`decode_framed_shufdelta_gpu_nvcomp`, one
+// interleaved loop) and cross-shard (`decode_shufdelta_shards_nvcomp_batched`,
+// two passes) decode bodies. The two halves are exposed separately because the
+// cross-shard path frees the indices plane buffer before allocating the values
+// one, so it cannot hold a `&mut d_idx_planes` and `&d_val_planes` borrow at
+// once. `g_nnz == 0` groups are never passed (both callers skip them). All ops
+// run on `dev.stream()`.
+// ---------------------------------------------------------------------------
+
+/// Undelta (in place) + unshuffle/convert one group's **indices** plane
+/// sub-range `[idx_off .. idx_off + g_nnz*index_width)`, then `memcpy_dtod` the
+/// widened `i32` into `combined_indices[base .. base + g_nnz]`.
+fn assemble_group_indices_view(
+    dev: &GpuDevice,
+    d_idx_planes: &mut CudaSlice<u8>,
+    idx_off: usize,
+    base: usize,
+    g_nnz: usize,
+    index_width: usize,
+    combined_indices: &mut CudaSlice<i32>,
+) -> Result<(), GpuError> {
+    let ilen = g_nnz * index_width;
+    {
+        let mut idx_view = d_idx_planes.slice_mut(idx_off..idx_off + ilen);
+        undelta_planes_view(dev, &mut idx_view, g_nnz as u32, index_width as u32)?;
+    }
+    let out_i: CudaSlice<i32> = {
+        let idx_view = d_idx_planes.slice(idx_off..idx_off + ilen);
+        unshuffle_convert_view(dev, &idx_view, g_nnz, index_width, 0)?
+    };
+    let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
+    dev.stream()
+        .memcpy_dtod(&out_i, &mut idx_dst)
+        .map_err(|e| GpuError::CudaError(format!("dtod indices (shufdelta assemble): {e}")))?;
+    Ok(())
+}
+
+/// unshuffle/convert one group's **values** plane sub-range (no undelta —
+/// values are shuffle-only) → `memcpy_dtod` the widened `f32` into
+/// `combined_data[base .. base + g_nnz]`. Sibling of
+/// [`assemble_group_indices_view`].
+fn assemble_group_values_view(
+    dev: &GpuDevice,
+    d_val_planes: &CudaSlice<u8>,
+    val_off: usize,
+    base: usize,
+    g_nnz: usize,
+    value_width: usize,
+    combined_data: &mut CudaSlice<f32>,
+) -> Result<(), GpuError> {
+    let vlen = g_nnz * value_width;
+    let out_v: CudaSlice<f32> = {
+        let val_view = d_val_planes.slice(val_off..val_off + vlen);
+        unshuffle_convert_view(dev, &val_view, g_nnz, value_width, 1)?
+    };
+    let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
+    dev.stream()
+        .memcpy_dtod(&out_v, &mut data_dst)
+        .map_err(|e| GpuError::CudaError(format!("dtod data (shufdelta assemble): {e}")))?;
+    Ok(())
+}
+
+/// Assemble one group's indices then values into the combined CSR at nnz offset
+/// `base`. Convenience wrapper for the single-shard nvcomp path (one
+/// interleaved loop); the cross-shard batched path calls the two halves
+/// directly across its separate indices/values passes.
+#[allow(clippy::too_many_arguments)]
+fn assemble_group_view(
+    dev: &GpuDevice,
+    d_idx_planes: &mut CudaSlice<u8>,
+    d_val_planes: &CudaSlice<u8>,
+    idx_off: usize,
+    val_off: usize,
+    base: usize,
+    g_nnz: usize,
+    index_width: usize,
+    value_width: usize,
+    combined_indices: &mut CudaSlice<i32>,
+    combined_data: &mut CudaSlice<f32>,
+) -> Result<(), GpuError> {
+    assemble_group_indices_view(
+        dev,
+        d_idx_planes,
+        idx_off,
+        base,
+        g_nnz,
+        index_width,
+        combined_indices,
+    )?;
+    assemble_group_values_view(
+        dev,
+        d_val_planes,
+        val_off,
+        base,
+        g_nnz,
+        value_width,
+        combined_data,
+    )?;
+    Ok(())
 }
 
 /// **Phase 2**: full in-VRAM decode of a framed ShufDeltaZstd shard via nvcomp.
@@ -603,27 +752,18 @@ pub fn decode_framed_shufdelta_gpu_nvcomp(
     let value_width = value_encoding.byte_width();
 
     // Host-decode the tiny indptr per group + per-group nnz offsets.
-    let mut offsets: Vec<usize> = Vec::with_capacity(spans.len());
     let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
     combined_indptr.push(0);
-    let mut nnz_base = 0usize;
     let t_indptr = profile::start();
-    for span in spans {
-        offsets.push(nnz_base);
-        let g_rows = span.n_rows as usize;
-        let g_indptr = scx_codec::decode_row_group_indptr_only(
-            scx_codec::CodecId::ShufDeltaZstd,
-            span,
-            indptr_bytes,
-        )?;
-        debug_assert_eq!(g_indptr.len(), g_rows + 1);
-        for &local in &g_indptr[1..=g_rows] {
-            combined_indptr.push(nnz_base as i64 + local);
-        }
-        nnz_base += span.nnz as usize;
-    }
+    let (offsets, nnz_final) = prescan_framed_group_indptr(
+        scx_codec::CodecId::ShufDeltaZstd,
+        spans,
+        indptr_bytes,
+        0,
+        &mut combined_indptr,
+    )?;
     profile::record_host_decode_since(CodecClass::Generic, t_indptr);
-    debug_assert_eq!(nnz_base, nnz);
+    debug_assert_eq!(nnz_final, nnz);
 
     let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
     let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
@@ -670,33 +810,19 @@ pub fn decode_framed_shufdelta_gpu_nvcomp(
     // Per group: undelta (indices) + unshuffle/convert on the group's sub-range
     // → combined buffers at the running nnz offset.
     for (k, &gi) in gids.iter().enumerate() {
-        let g_nnz = spans[gi].nnz as usize;
-        let base = offsets[gi];
-        let io = idx_off[k];
-        let ilen = g_nnz * index_width;
-        {
-            let mut idx_view = d_idx_planes.slice_mut(io..io + ilen);
-            undelta_planes_view(dev, &mut idx_view, g_nnz as u32, index_width as u32)?;
-        }
-        let out_i: CudaSlice<i32> = {
-            let idx_view = d_idx_planes.slice(io..io + ilen);
-            unshuffle_convert_view(dev, &idx_view, g_nnz, index_width, 0)?
-        };
-        let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
-        dev.stream()
-            .memcpy_dtod(&out_i, &mut idx_dst)
-            .map_err(|e| GpuError::CudaError(format!("dtod indices (nvcomp): {e}")))?;
-
-        let vo = val_off[k];
-        let vlen = g_nnz * value_width;
-        let out_v: CudaSlice<f32> = {
-            let val_view = d_val_planes.slice(vo..vo + vlen);
-            unshuffle_convert_view(dev, &val_view, g_nnz, value_width, 1)?
-        };
-        let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
-        dev.stream()
-            .memcpy_dtod(&out_v, &mut data_dst)
-            .map_err(|e| GpuError::CudaError(format!("dtod data (nvcomp): {e}")))?;
+        assemble_group_view(
+            dev,
+            &mut d_idx_planes,
+            &d_val_planes,
+            idx_off[k],
+            val_off[k],
+            offsets[gi],
+            spans[gi].nnz as usize,
+            index_width,
+            value_width,
+            &mut combined_indices,
+            &mut combined_data,
+        )?;
     }
     profile::record_gpu_decode_since(t_gpu);
 
@@ -840,33 +966,33 @@ fn prescan_shufdelta_shards<'a>(shards: &[&'a [u8]]) -> Result<ShufdeltaBatchPla
         let spans = resolve_block_index(&header, block_index_bytes)
             .map_err(|e| GpuError::InvalidShard(format!("shard {si} block index: {e}")))?;
 
-        for span in &spans {
-            let g_rows = span.n_rows as usize;
+        // Rebase this shard's group indptrs onto the running global nnz base;
+        // `offsets[gi]` is each group's global nnz offset (== the old inline
+        // `total_nnz` captured before that group), used as its `global_nnz_base`.
+        let (offsets, new_total_nnz) = prescan_framed_group_indptr(
+            scx_codec::CodecId::ShufDeltaZstd,
+            &spans,
+            indptr_bytes,
+            total_nnz,
+            &mut combined_indptr,
+        )?;
+        for (gi, span) in spans.iter().enumerate() {
             let g_nnz = span.nnz as usize;
-            let g_indptr = scx_codec::decode_row_group_indptr_only(
-                scx_codec::CodecId::ShufDeltaZstd,
-                span,
-                indptr_bytes,
-            )?;
-            debug_assert_eq!(g_indptr.len(), g_rows + 1);
-            for &local in &g_indptr[1..=g_rows] {
-                combined_indptr.push(total_nnz as i64 + local);
-            }
             if g_nnz > 0 {
                 groups.push(GlobalGroup {
                     idx_frame: &indices_bytes[span.indices.clone()],
                     idx_expected: g_nnz * index_width,
                     val_frame: &values_bytes[span.values.clone()],
                     val_expected: g_nnz * value_width,
-                    global_nnz_base: total_nnz,
+                    global_nnz_base: offsets[gi],
                     g_nnz,
                     index_width,
                     value_width,
                 });
             }
-            total_nnz += g_nnz;
-            total_rows += g_rows;
+            total_rows += span.n_rows as usize;
         }
+        total_nnz = new_total_nnz;
     }
     debug_assert_eq!(combined_indptr.len(), total_rows + 1);
 
@@ -1008,24 +1134,15 @@ pub fn decode_shufdelta_shards_nvcomp_batched(
             let (mut d_idx_planes, idx_off) =
                 crate::nvcomp::batch_decompress_concat(dev, dev.stream(), &idx_frames, &idx_exp)?;
             for (k, g) in chunk_groups.iter().enumerate() {
-                let base = g.global_nnz_base;
-                let g_nnz = g.g_nnz;
-                let io = idx_off[k];
-                let ilen = g_nnz * g.index_width;
-                {
-                    let mut idx_view = d_idx_planes.slice_mut(io..io + ilen);
-                    undelta_planes_view(dev, &mut idx_view, g_nnz as u32, g.index_width as u32)?;
-                }
-                let out_i: CudaSlice<i32> = {
-                    let idx_view = d_idx_planes.slice(io..io + ilen);
-                    unshuffle_convert_view(dev, &idx_view, g_nnz, g.index_width, 0)?
-                };
-                let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
-                dev.stream()
-                    .memcpy_dtod(&out_i, &mut idx_dst)
-                    .map_err(|e| {
-                        GpuError::CudaError(format!("dtod indices (nvcomp batched): {e}"))
-                    })?;
+                assemble_group_indices_view(
+                    dev,
+                    &mut d_idx_planes,
+                    idx_off[k],
+                    g.global_nnz_base,
+                    g.g_nnz,
+                    g.index_width,
+                    &mut combined_indices,
+                )?;
             }
             // `d_idx_planes` dropped here — its plane buffer frees before the
             // values pass allocates its own.
@@ -1037,18 +1154,15 @@ pub fn decode_shufdelta_shards_nvcomp_batched(
         let (d_val_planes, val_off) =
             crate::nvcomp::batch_decompress_concat(dev, dev.stream(), &val_frames, &val_exp)?;
         for (k, g) in chunk_groups.iter().enumerate() {
-            let base = g.global_nnz_base;
-            let g_nnz = g.g_nnz;
-            let vo = val_off[k];
-            let vlen = g_nnz * g.value_width;
-            let out_v: CudaSlice<f32> = {
-                let val_view = d_val_planes.slice(vo..vo + vlen);
-                unshuffle_convert_view(dev, &val_view, g_nnz, g.value_width, 1)?
-            };
-            let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
-            dev.stream()
-                .memcpy_dtod(&out_v, &mut data_dst)
-                .map_err(|e| GpuError::CudaError(format!("dtod data (nvcomp batched): {e}")))?;
+            assemble_group_values_view(
+                dev,
+                &d_val_planes,
+                val_off[k],
+                g.global_nnz_base,
+                g.g_nnz,
+                g.value_width,
+                &mut combined_data,
+            )?;
         }
     }
     profile::record_gpu_decode_since(t_gpu);
