@@ -50,6 +50,64 @@ pub struct ShardData {
     pub deleted_rows: Option<RoaringBitmap>,
 }
 
+/// Reconstruct per-output-position shard-local deletion bitmaps from a
+/// global-shard-keyed deletion vector.
+///
+/// The on-disk `DeletionVectors` is keyed by GLOBAL shard index (position in
+/// `shards_sorted()`, how `scx delete` writes it — `scx-ops/src/delete.rs`) with
+/// shard-local row bitmaps; each deleted cell is assigned to exactly one global
+/// shard, so the union over all entries is the exact set of deleted *global cell*
+/// indices. We recover that set (`global_row_starts[gid] + local`) and re-bucket
+/// it into `target_ranges` — the output shard list, which is one modality's
+/// shards on the per-modality loader path (whose positions don't match the global
+/// DV keys) and the global list otherwise.
+///
+/// - `global_row_starts[i]` is the `row_start` of `shards_sorted()[i]` (`None` if
+///   the shard has no stats); DV keys pointing out of range or at a no-stats shard
+///   are skipped.
+/// - `target_ranges[p]` is the `(row_start, row_end)` of output shard position `p`
+///   (`None` skips it). The returned map is keyed by `p`, matching the positions in
+///   `shard_groups`, and holds shard-local (`global - row_start`) bitmaps.
+///
+/// For the single-modality/global path (`target_ranges == global` ranges) this is
+/// byte-identical to copying `dv.shards` directly.
+fn reconstruct_deletion_map(
+    dv: &scx_format_io::deletion_vectors::DeletionVectors,
+    global_row_starts: &[Option<u64>],
+    target_ranges: &[Option<(u64, u64)>],
+) -> std::collections::HashMap<usize, RoaringBitmap> {
+    // Recover the set of deleted global cell indices.
+    let mut deleted_global: Vec<u64> = Vec::new();
+    for (&global_shard_id, bitmap) in &dv.shards {
+        let Some(Some(rs)) = global_row_starts.get(global_shard_id as usize).copied() else {
+            // DV key out of range or shard has no stats — cannot place it; skip.
+            continue;
+        };
+        deleted_global.extend(bitmap.iter().map(|local| rs + local as u64));
+    }
+    if deleted_global.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    deleted_global.sort_unstable();
+    deleted_global.dedup();
+
+    // Re-bucket into each target shard's row range as shard-local bitmaps.
+    let mut map = std::collections::HashMap::new();
+    for (pos, range) in target_ranges.iter().enumerate() {
+        let Some((rs, re)) = *range else { continue };
+        let lo = deleted_global.partition_point(|&g| g < rs);
+        let hi = deleted_global.partition_point(|&g| g < re);
+        if hi > lo {
+            let mut bm = RoaringBitmap::new();
+            for &g in &deleted_global[lo..hi] {
+                bm.insert((g - rs) as u32);
+            }
+            map.insert(pos, bm);
+        }
+    }
+    map
+}
+
 /// Run the I/O stage: read shard groups and send them to the decode stage.
 ///
 /// For each shard group in `shard_groups`:
@@ -80,29 +138,36 @@ pub async fn io_stage(
         Some(mid) => reader.catalog().csr_shards_for_modality(mid),
         None => reader.catalog().shards_sorted(),
     };
-    let n_shards = sorted_entries.len();
 
     // Pre-compute per-shard deletion bitmaps for O(1) lookup.
-    // Map: shard_index (position in sorted list) → RoaringBitmap of deleted local rows.
+    // Map: output shard position (index into `sorted_entries`, matching the
+    // positions in `shard_groups`) → RoaringBitmap of deleted *shard-local* rows.
     //
-    // Phase H.1: deletion vectors and per-modality filtering are
-    // mutually exclusive — the deletion_vectors `shards` map keys are
-    // global shard indices, which don't match the per-modality
-    // positions in `sorted_entries` after filtering. Skip applying
-    // deletion vectors when `modality_id` is set.
+    // The on-disk deletion vector is keyed by GLOBAL shard index (position in
+    // `shards_sorted()`, how `scx delete` writes it) with shard-local bitmaps.
+    // That losslessly encodes a set of deleted *global cell* indices (each
+    // deleted cell is assigned to exactly one global shard). We reconstruct that
+    // global set and re-bucket it into `sorted_entries`' row ranges — so the
+    // per-modality path (where `sorted_entries` is one modality's shards, whose
+    // positions don't match the global DV keys) applies deletions correctly, and
+    // all modalities skip the same global cells (alignment preserved). For the
+    // single-modality/global path (`sorted_entries == shards_sorted()`) this is
+    // byte-identical to a direct copy.
     let deletion_map: Arc<std::collections::HashMap<usize, RoaringBitmap>> =
-        Arc::new(match (&deletion_vectors, modality_id) {
-            (Some(dv), None) => {
-                let mut map = std::collections::HashMap::new();
-                for (&shard_id, bitmap) in &dv.shards {
-                    let shard_idx = shard_id as usize;
-                    if shard_idx < n_shards && !bitmap.is_empty() {
-                        map.insert(shard_idx, bitmap.clone());
-                    }
-                }
-                map
+        Arc::new(match &deletion_vectors {
+            Some(dv) => {
+                let global = reader.catalog().shards_sorted();
+                let global_row_starts: Vec<Option<u64>> = global
+                    .iter()
+                    .map(|e| e.stats.as_ref().map(|s| s.row_start))
+                    .collect();
+                let target_ranges: Vec<Option<(u64, u64)>> = sorted_entries
+                    .iter()
+                    .map(|e| e.stats.as_ref().map(|s| (s.row_start, s.row_end)))
+                    .collect();
+                reconstruct_deletion_map(dv, &global_row_starts, &target_ranges)
             }
-            _ => std::collections::HashMap::new(),
+            None => std::collections::HashMap::new(),
         });
 
     // Pre-compute per-group byte ranges for coalesced MADV_WILLNEED prefetch.
@@ -583,6 +648,83 @@ mod tests {
             // Shard 1 should have no deletions
             assert!(group.shards[1].deleted_rows.is_none());
         });
+    }
+
+    // -----------------------------------------------------------------
+    // Reconstruct_deletion_map — global-cell reconstruction + per-modality
+    // re-bucketing (pure, no file fixture).
+    // -----------------------------------------------------------------
+
+    fn dv_from(entries: &[(u32, &[u32])]) -> scx_format_io::deletion_vectors::DeletionVectors {
+        let mut dv = scx_format_io::deletion_vectors::DeletionVectors::new();
+        for &(sid, locals) in entries {
+            let mut bm = RoaringBitmap::new();
+            for &l in locals {
+                bm.insert(l);
+            }
+            dv.shards.insert(sid, bm);
+        }
+        dv
+    }
+
+    /// Single-modality / global: target ranges == global ranges → byte-identical
+    /// to a direct copy of the DV bitmaps.
+    #[test]
+    fn reconstruct_deletion_map_single_modality_identity() {
+        // Two shards: [0,5) and [5,10).
+        let global_row_starts = [Some(0u64), Some(5u64)];
+        let ranges = [Some((0u64, 5u64)), Some((5u64, 10u64))];
+        let dv = dv_from(&[(0, &[1, 3])]);
+
+        let map = reconstruct_deletion_map(&dv, &global_row_starts, &ranges);
+        assert_eq!(map.len(), 1);
+        let bm = map.get(&0).unwrap();
+        assert_eq!(bm.iter().collect::<Vec<_>>(), vec![1, 3]);
+        assert!(!map.contains_key(&1));
+    }
+
+    /// Multimodal: the DV names only modality-A's global shards, but the deleted
+    /// cells must still be applied to modality-B's shards (same global cells).
+    #[test]
+    fn reconstruct_deletion_map_cross_modality() {
+        // Global list interleaves two modalities over the SAME row ranges:
+        //   idx 0 = A[0,5)  idx 1 = B[0,5)  idx 2 = A[5,10)  idx 3 = B[5,10)
+        let global_row_starts = [Some(0u64), Some(0u64), Some(5u64), Some(5u64)];
+        // DV entries live only on modality-A's global shards (idx 0 and 2):
+        //   cell 1, 3 (from A[0,5)) and cell 5 (local 0 of A[5,10)).
+        let dv = dv_from(&[(0, &[1, 3]), (2, &[0])]);
+
+        // Target = modality B's shards: positions 0=[0,5), 1=[5,10).
+        let target_b = [Some((0u64, 5u64)), Some((5u64, 10u64))];
+        let map = reconstruct_deletion_map(&dv, &global_row_starts, &target_b);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&0).unwrap().iter().collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(map.get(&1).unwrap().iter().collect::<Vec<_>>(), vec![0]); // cell 5 → local 0
+    }
+
+    /// Out-of-range and no-stats DV keys are skipped without panicking.
+    #[test]
+    fn reconstruct_deletion_map_skips_bad_keys() {
+        let global_row_starts = [Some(0u64), None]; // idx 1 has no stats
+        let ranges = [Some((0u64, 5u64)), Some((5u64, 10u64))];
+        // Key 1 → no-stats (skip); key 9 → out of range (skip); key 0 → valid.
+        let dv = dv_from(&[(0, &[2]), (1, &[0]), (9, &[0])]);
+
+        let map = reconstruct_deletion_map(&dv, &global_row_starts, &ranges);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&0).unwrap().iter().collect::<Vec<_>>(), vec![2]);
+    }
+
+    /// A fully-deleted shard yields a bitmap whose length equals the shard's row
+    /// count, so io_stage's `bm.len() >= n_rows` skip still fires.
+    #[test]
+    fn reconstruct_deletion_map_full_shard() {
+        let global_row_starts = [Some(0u64)];
+        let ranges = [Some((0u64, 5u64))];
+        let dv = dv_from(&[(0, &[0, 1, 2, 3, 4])]);
+
+        let map = reconstruct_deletion_map(&dv, &global_row_starts, &ranges);
+        assert_eq!(map.get(&0).unwrap().len(), 5);
     }
 
     // -----------------------------------------------------------------
