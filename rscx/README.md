@@ -128,9 +128,10 @@ pyscx/CLI.
 **Parity note.** A few pyscx/CLI write-side knobs are intentionally not exposed
 in R (tracked in `ROADMAP.md` § 3.3): streaming-convert threading
 (`reader_threads`/`writer_queue_depth`), grouped-write args (`group_by` /
-`reference` — R has the F2 *reads* `read_group`/`read_reference` only), and the
-accel `device=` selector (rscx accelerators are CPU-only). Use the `scx` CLI or
-pyscx when you need those.
+`reference` — R has the F2 *reads* `read_group`/`read_reference` only), the accel
+`device=` selector (rscx accelerators are CPU-only), and the byte/nnz-aware
+framing knob `row_group_target_nnz` (R exposes `row_group_rows` only). Use the
+`scx` CLI or pyscx when you need those.
 
 ## Backed (out-of-core) access
 

@@ -134,9 +134,17 @@ test_that("from_sce accepts the codec intent axis and round-trips losslessly", {
     path <- tempfile(fileext = ".scx")
     expect_no_error(from_sce(sce, path, codec = codec))
     expect_true(scx_validate(path), info = paste("validate failed for", codec))
+    # Default row_group_rows (256) frames → v4, matching pyscx/CLI.
+    expect_equal(scx_info(path)$format_version, 4L, info = paste("not v4 for", codec))
     mat <- as.matrix(scx_open(path)$x_matrix())
     expect_equal(mat, ref_mat, info = paste("values diverged for codec", codec))
   }
+
+  # row_group_rows = 0L opts out of framing → legacy v3 layout.
+  unframed <- tempfile(fileext = ".scx")
+  from_sce(sce, unframed, codec = "fast", row_group_rows = 0L)
+  expect_equal(scx_info(unframed)$format_version, 3L)
+  expect_equal(as.matrix(scx_open(unframed)$x_matrix()), ref_mat)
 })
 
 test_that("codec='compact' with row_group_rows=0 errors cleanly (no session abort)", {
@@ -155,4 +163,21 @@ test_that("unknown codec name errors via resolve_codec", {
     from_sce(sce, tempfile(fileext = ".scx"), codec = "bogus"),
     "codec|bogus"
   )
+})
+
+test_that("csc=TRUE writes a valid framed CSC sidecar under codec='compact'", {
+  skip_if_no_sce_codecs()
+  sce <- codec_count_sce()
+  ref_mat <- as.matrix(scx_open({
+    p <- tempfile(fileext = ".scx"); from_sce(sce, p, codec = "zstd"); p
+  })$x_matrix())
+
+  path <- tempfile(fileext = ".scx")
+  # Framed (v4) CSC sidecar path: previously the CSC sidecar was always unframed.
+  expect_no_error(from_sce(sce, path, csc = TRUE, codec = "compact"))
+  # scx_validate re-checks every shard's checksum, incl. the CSC sidecar shards.
+  expect_true(scx_validate(path))
+  expect_equal(scx_info(path)$format_version, 4L) # framed → v4
+  # CSR values still round-trip losslessly alongside the sidecar.
+  expect_equal(as.matrix(scx_open(path)$x_matrix()), ref_mat)
 })

@@ -1131,9 +1131,6 @@ fn write_csr_to_scx(
 
     let mut row_start: usize = 0;
     let mut shard_idx: u32 = 0;
-    // Track the last shard's resolved codec; reused for the optional CSC sidecar
-    // so the two layouts share encoder semantics.
-    let mut last_csr_codec = header_codec;
     while row_start < n_obs {
         let row_end = (row_start + shard_target_rows).min(n_obs);
 
@@ -1166,7 +1163,6 @@ fn write_csr_to_scx(
             framing,
         )
         .map_err(|e| Error::Other(format!("encode X shard {shard_idx} failed: {}", e)))?;
-        last_csr_codec = CodecId::from_u8(section.codec_id()).unwrap_or(last_csr_codec);
         writer
             .write_preencoded_shard(section)
             .map_err(|e| Error::Other(format!("write_csr_shard failed: {}", e)))?;
@@ -1176,7 +1172,9 @@ fn write_csr_to_scx(
     }
 
     // Optional CSC sidecar — streaming transpose over the full
-    // in-memory CSR matrix. Framed to match the CSR layout under v4.
+    // in-memory CSR matrix. Framed to match the CSR layout under v4. Uses the
+    // representative `header_codec` (first-shard heuristic) for parity with
+    // pyscx, rather than whatever the last CSR shard adaptively resolved to.
     if csc_always && n_obs > 0 && n_vars > 0 {
         write_csc_shards_from_csr_r(
             &mut writer,
@@ -1186,7 +1184,7 @@ fn write_csr_to_scx(
             value_encoding,
             n_obs,
             n_vars,
-            last_csr_codec,
+            header_codec,
             csc_cols_per_shard,
             framing,
         )?;
@@ -1677,9 +1675,10 @@ fn from_seurat_multi_assay(
     // shards in shard_target_rows row chunks.
     let shard_target_rows: usize = 16384;
     for payload in &payloads {
-        // Resolve the per-modality auto-codec by feeding the first
-        // shard's bytes through `select_codec_for_modality`. The
-        // modality table records this codec as the default.
+        // Resolve the per-modality auto-codec by feeding the FIRST shard's bytes
+        // through `select_codec_for_modality` (the modality table records this as
+        // the default). Scanning only the first shard mirrors `write_csr_to_scx`'s
+        // `header_codec`; the per-shard codec is still chosen adaptively below.
         let resolved_codec = match explicit_codec {
             Some(c) => {
                 if c == CodecId::Scx1 && !payload.value_encoding.is_integer() {
@@ -1688,11 +1687,17 @@ fn from_seurat_multi_assay(
                     c
                 }
             }
-            None => select_codec_for_modality(
-                &payload.values_bytes,
-                payload.value_encoding,
-                payload.modality_type,
-            ),
+            None if payload.n_obs > 0 => {
+                let bw = payload.value_encoding.byte_width();
+                let first_row_end = shard_target_rows.min(payload.n_obs);
+                let first_bytes = payload.csr_indptr[first_row_end] as usize * bw;
+                select_codec_for_modality(
+                    &payload.values_bytes[..first_bytes],
+                    payload.value_encoding,
+                    payload.modality_type,
+                )
+            }
+            None => CodecId::None,
         };
 
         let modality_id = writer
@@ -1711,9 +1716,6 @@ fn from_seurat_multi_assay(
         writer
             .write_var_for(modality_id, &payload.var_batch)
             .map_err(|e| Error::Other(format!("write_var_for failed: {}", e)))?;
-        let _ = resolved_codec; // recorded on the modality table above; per-shard
-                                // codec is chosen adaptively by the encoder below.
-
         let bw = payload.value_encoding.byte_width();
         let index_dtype: u8 = if payload.n_vars <= 65535 { 0 } else { 1 };
         let mut row_start: usize = 0;
@@ -2129,9 +2131,6 @@ fn from_mae_impl(
         writer
             .write_var_for(modality_id, &payload.var_batch)
             .map_err(|e| Error::Other(format!("write_var_for failed: {}", e)))?;
-        let _ = resolved_codec; // recorded on the modality table above; per-shard
-                                // codec is chosen adaptively by the encoder below.
-
         let bw = payload.value_encoding.byte_width();
         let index_dtype: u8 = if payload.n_vars <= 65535 { 0 } else { 1 };
         let mut row_start: usize = 0;

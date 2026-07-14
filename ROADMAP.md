@@ -305,6 +305,9 @@ are not exposed in R and are tracked here rather than implemented:
 - Accel `device=` selector: `rscx` accelerators are CPU-only.
 - `scx_append(codec=)` accepts `Auto`/explicit only (not the `fast`/`compact`
   intent axis, which is a rewrite-path concern in `scx-ops`).
+- Framing granularity: `from_*` expose `row_group_rows` but hardcode
+  `target_nnz = None` (no `row_group_target_nnz` byte/nnz-aware sizing knob that
+  pyscx/CLI carry).
 
 ### 3.4 Multimodal Support — SHIPPED
 - [x] Format v2 bump; carve `n_modalities` /
