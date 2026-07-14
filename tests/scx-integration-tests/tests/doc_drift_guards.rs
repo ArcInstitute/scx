@@ -245,6 +245,43 @@ fn scx_format_layout_crate_has_no_fs_io() {
     );
 }
 
+/// `pyscx.from_anndata`'s `codec` docstring must describe the current intent
+/// axis (`scx_format::resolve_codec`), not the removed pure-heuristic
+/// `select_codec()` prose. The `doc_drift_guards` above pin numbers/identifiers
+/// but miss free prose; this guards the codec paragraph specifically (D3).
+#[test]
+fn from_anndata_codec_docstring_names_intent_axis() {
+    let src = std::fs::read_to_string(workspace_root().join("pyscx/src/lib.rs"))
+        .expect("pyscx/src/lib.rs readable");
+    // The `from_anndata` doc block is the `///` run starting at its summary line.
+    let anchor = "/// Convert an AnnData object to an SCX file.";
+    let start = src.find(anchor).expect(
+        "from_anndata docstring anchor present \
+         (update this guard if the summary line changed)",
+    );
+    let block: String = src[start..]
+        .lines()
+        .take_while(|l| l.trim_start().starts_with("///"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Must name the adaptive codec + at least the `compact` profile so the
+    // intent axis is documented (the review's requested shufdelta/compact guard).
+    for needle in ["shufdelta", "compact"] {
+        assert!(
+            block.contains(needle),
+            "pyscx.from_anndata codec docstring must mention `{needle}` — it drifted from \
+             the scx_format::resolve_codec intent axis:\n{block}"
+        );
+    }
+    // Must not resurrect the removed pure-heuristic framing (the old `auto`).
+    assert!(
+        !block.contains("select_codec()"),
+        "pyscx.from_anndata codec docstring cites the removed `select_codec()` heuristic; \
+         describe the `auto`/`fast`/`compact` intent axis instead"
+    );
+}
+
 /// Extract the quoted members from a workspace `Cargo.toml`'s
 /// `members = [ ... ]` array (single- or multi-line).
 fn parse_members(cargo_toml: &str) -> BTreeSet<String> {

@@ -35,7 +35,7 @@ fn index_options(
 }
 
 /// Parse a codec string into a [`CodecSelection`]. `NULL` / `"auto"` ⇒ `Auto`;
-/// otherwise an explicit codec (`none`/`scx1`/`zstd`/`lz4`/`pcodec`).
+/// otherwise an explicit codec (`none`/`scx1`/`zstd`/`lz4`/`pcodec`/`shufdelta`).
 fn parse_codec(codec: Nullable<String>) -> Result<CodecSelection> {
     match codec {
         Nullable::Null => Ok(CodecSelection::Auto),
@@ -57,7 +57,8 @@ fn parse_codec(codec: Nullable<String>) -> Result<CodecSelection> {
 /// @param target Path to the target SCX file (modified in place).
 /// @param input Path to the input SCX file to append from.
 /// @param codec Codec for the new shards: `NULL`/`"auto"` (per-shard
-///   auto-selection) or one of `"none"`/`"scx1"`/`"zstd"`/`"lz4"`/`"pcodec"`.
+///   auto-selection) or one of
+///   `"none"`/`"scx1"`/`"zstd"`/`"lz4"`/`"pcodec"`/`"shufdelta"`.
 /// @param shard_size Target rows per CSR shard (default 16384; must be > 0).
 /// @param index_obs,index_var Obs/var columns to build predicate indexes for.
 /// @param index_preset Named index preset (`cellxgene`/`perturbseq`/`training`).

@@ -21,7 +21,8 @@ use crate::writer::{compute_shard_stats, MajorAxis, PreEncodedSection};
 
 /// Which rule picks the framed codec when a ShufDeltaZstd trial-encode competes
 /// with the heuristic winner: `Trial` = compact-trial (keep strictly smaller);
-/// `V2` = auto_v2 (target-biased [`pick_codec_v2`]).
+/// `V2` = the adaptive profiles (`auto`/`compact`), target-biased via
+/// [`pick_codec_v2`].
 enum FramedPick {
     Trial,
     V2(DecodeTarget),
@@ -185,16 +186,16 @@ pub fn encode_one_shard_with_value_encoding(
                 )
             };
             // Decide whether to trial-encode ShufDeltaZstd as a second candidate.
-            // `decode_target` (auto_v2) takes precedence over `trial`
-            // (compact-trial): Cpu keeps the heuristic and never trials;
-            // Gpu/Storage/Auto trial only integer shards; compact-trial trials any
-            // non-ShufDeltaZstd heuristic. In all cases both candidates are
-            // row-group-framed (shard v2) with codec-agnostic BlockIndex access.
+            // The adaptive `decode_target` (`auto`/`compact`) takes precedence over
+            // `trial` (compact-trial): the adaptive profiles trial only integer
+            // shards (`pick_codec_v2` biases the pick by target); compact-trial
+            // trials any non-ShufDeltaZstd heuristic. In all cases both candidates
+            // are row-group-framed (shard v2) with codec-agnostic BlockIndex access.
             let is_integer = shard_value_encoding.is_integer();
             let pick_mode: Option<FramedPick> = if shard_codec == CodecId::ShufDeltaZstd {
                 None
             } else if let Some(dt) = fc.decode_target {
-                (dt != DecodeTarget::Cpu && is_integer).then_some(FramedPick::V2(dt))
+                is_integer.then_some(FramedPick::V2(dt))
             } else if fc.trial {
                 Some(FramedPick::Trial)
             } else {
@@ -364,12 +365,14 @@ pub fn encode_one_shard_with_value_encoding(
 /// codec-agnostic `BlockIndex` for random access; the historical unframed-Scx1 +
 /// decode-sidecar representation was removed once framed Scx1 gained an in-VRAM
 /// GPU decode path.
-/// `decode_target` (auto_v2) is the workload-aware alternative to `trial`: when
-/// `Some`, the per-shard integer codec is picked by [`pick_codec_v2`] using the
-/// same dual-encode as `trial` but biased toward/away from ShufDeltaZstd by the
-/// downstream target (`Cpu` keeps the heuristic; `Gpu`/`Storage`/`Auto` adopt
-/// ShufDeltaZstd where it compresses ≤/< the heuristic). `decode_target` takes
-/// precedence over `trial` (the CLI/pyscx layers keep them mutually exclusive).
+/// `decode_target` is the adaptive alternative to `trial`, backing the
+/// `auto`/`compact` intent profiles: when `Some`, the per-shard integer codec is
+/// picked by [`pick_codec_v2`] using the same dual-encode as `trial` but biased
+/// by the profile (`Auto` adopts ShufDeltaZstd only when it wins by
+/// [`pick_codec_v2`]'s margin; `Storage` adopts on ≤ ties). `None` = heuristic
+/// single-encode (`fast`, or an explicit codec — no ShufDeltaZstd trial).
+/// `decode_target` takes precedence over `trial` (the CLI/pyscx layers keep them
+/// mutually exclusive).
 #[derive(Debug, Clone, Copy)]
 pub struct FramingConfig {
     pub row_group_rows: u32,
@@ -413,8 +416,7 @@ fn framed_size(e: &EncodedShard) -> usize {
 /// [`BlockIndex`]. Codec-agnostic: a group decodes via
 /// `scx_codec::decode_row_group` (→ the ordinary per-shard decoder). For
 /// `CodecId::None` this is byte-identical to the legacy contiguous layout with a
-/// framed indptr. `scx1_decode` is dropped — framed shards use the block index
-/// for random access, not the monolithic Scx1 sidecar.
+/// framed indptr.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_shard_framed(
     indptr: &[u64],
@@ -495,7 +497,6 @@ pub fn encode_shard_framed(
             indptr_bytes: indptr_stream,
             indices_bytes: indices_stream,
             values_bytes: values_stream,
-            scx1_decode: None,
         },
         BlockIndex { entries },
     ))
@@ -566,39 +567,28 @@ mod adaptive_codec_tests {
         .expect("encode")
     }
 
-    /// The `fast` profile (`DecodeTarget::Cpu`) is byte-identical to a plain
-    /// heuristic single-encode: it keeps the heuristic winner and never runs the
-    /// ShufDeltaZstd dual-encode.
+    /// The `fast` profile resolves to `decode_target: None` — a plain heuristic
+    /// single-encode that keeps the heuristic winner and never runs the
+    /// ShufDeltaZstd dual-encode, even on a shard where ShufDeltaZstd would win
+    /// (which `auto`/`compact` adopt — see `auto_and_compact_adopt_shufdelta_on_large_win`).
     #[test]
-    fn fast_matches_heuristic() {
-        let (indptr, indices, values) = gen_int_shard(512, 40, 5000, 4);
-        let base = FramingConfig {
+    fn fast_keeps_heuristic_even_when_shufdelta_would_win() {
+        // Large-count shard: heuristic is Zstd and ShufDeltaZstd beats it by a
+        // wide margin, so the adaptive profiles adopt it. `fast` must not.
+        let (indptr, indices, values) = gen_int_shard(2048, 60, 20000, 255);
+        let fast = FramingConfig {
             row_group_rows: 256,
             target_nnz: None,
             trial: false,
             decode_target: None,
         };
-        let heuristic = encode(&indptr, &indices, &values, 5000, base);
-        let fast = encode(
-            &indptr,
-            &indices,
-            &values,
-            5000,
-            FramingConfig {
-                decode_target: Some(DecodeTarget::Cpu),
-                ..base
-            },
-        );
+        let encoded = encode(&indptr, &indices, &values, 20000, fast);
         assert_eq!(
-            heuristic.codec_id(),
-            fast.codec_id(),
-            "fast must keep the heuristic codec"
+            encoded.codec_id(),
+            CodecId::Zstd as u8,
+            "fast (decode_target=None) must keep the heuristic Zstd, never trial ShufDeltaZstd"
         );
-        assert_eq!(
-            heuristic.encoded.indices_bytes, fast.encoded.indices_bytes,
-            "fast must be byte-identical to the heuristic single-encode"
-        );
-        assert_eq!(heuristic.section_length, fast.section_length);
+        assert!(encoded.section_length > 0);
     }
 
     /// The `auto` (cost-aware) and `compact` (tie-adopt) profiles both adopt
@@ -662,7 +652,7 @@ mod adaptive_codec_tests {
             trial: false,
             decode_target: None,
         };
-        for dt in [DecodeTarget::Auto, DecodeTarget::Gpu, DecodeTarget::Storage] {
+        for dt in [DecodeTarget::Auto, DecodeTarget::Storage] {
             let sec = encode_one_shard_with_value_encoding(
                 &indptr,
                 &indices,
