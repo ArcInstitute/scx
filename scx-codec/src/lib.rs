@@ -19,9 +19,10 @@ pub use cast::{
 };
 pub use dispatch::{
     decode_indptr_only, decode_row_group, decode_row_group_indptr_only, decode_shard,
-    decode_shard_ref, decode_shard_scipy, decoded_shard_to_scipy, encode_shard,
-    zstd_decode_bounded as zstd_decompress_bounded, CodecError, CodecId, CodecSelection,
-    DecodedShard, EncodedShard, EncodedShardRef, RowGroupSpan, ScipyShard, ValueEncoding,
+    decode_shard_native, decode_shard_ref, decode_shard_scipy, decoded_shard_to_native,
+    decoded_shard_to_scipy, encode_shard, zstd_decode_bounded as zstd_decompress_bounded,
+    CodecError, CodecId, CodecSelection, DecodedShard, EncodedShard, EncodedShardRef, NativeShard,
+    RowGroupSpan, ScipyShard, ShardValuesNative, ValueEncoding,
 };
 pub use median::{
     floor_median_u32, floor_median_u32_inplace, floor_median_u64, floor_median_u64_inplace,

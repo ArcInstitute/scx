@@ -413,6 +413,111 @@ pub fn decoded_shard_to_scipy(
     Ok((indptr, indices, data))
 }
 
+/// A shard's decoded values kept at their **native** width: integer-encoded
+/// shards stay `u32` (never rounded through `f32`), float-encoded shards stay
+/// `f32`. This is the value carrier for the in-assembly narrow read path — the
+/// caller casts each variant into the target dtype via `scx_codec`'s
+/// `checked_cast_u32_into` / `checked_cast_f32_into`, so an integer count above
+/// 2²⁴ narrows to an exact integer dtype losslessly.
+pub enum ShardValuesNative {
+    /// Integer-encoded shard values (`Uint8`/`Uint16`/`Uint32`), widened to `u32`.
+    U32(Vec<u32>),
+    /// Float-encoded shard values (`Float32`/`Float16`), decoded to `f32`.
+    F32(Vec<f32>),
+}
+
+/// A shard decoded to native types: `i64` indptr, `u32` indices, and
+/// [`ShardValuesNative`] values.
+pub type NativeShard = (Vec<i64>, Vec<u32>, ShardValuesNative);
+
+/// Decode an `EncodedShardRef` to native types (the in-assembly narrow twin of
+/// [`decode_shard_scipy`]).
+///
+/// Unlike the scipy path, integer values are kept as `u32` (not cast to `f32`)
+/// and indices are kept as `u32` (not cast to `i32`), so the caller can narrow
+/// directly to the requested dtype through the fail-loud native cast gate. Only
+/// float-encoded shards produce `f32` values (there is no lossless integer form
+/// for them).
+pub fn decode_shard_native(
+    encoded: &EncodedShardRef,
+    codec_id: CodecId,
+    value_encoding: ValueEncoding,
+    n_rows: usize,
+    nnz: usize,
+    index_dtype_u16: bool,
+) -> Result<NativeShard, CodecError> {
+    // Scx1: keep the Rice-decoded u32 values and forbp u32 indices as-is.
+    if codec_id == CodecId::Scx1 {
+        if !value_encoding.is_integer() {
+            return Err(CodecError::FloatWithScx1);
+        }
+
+        // Same L1 overflow + L2 plausibility guards as `decode_shard_scipy`.
+        indptr_byte_cap(n_rows)?;
+        checked_len(nnz, if index_dtype_u16 { 2 } else { 4 }, "scx1 indices")?;
+        checked_len(nnz, value_encoding.byte_width(), "scx1 values")?;
+        let n_rows_p1 = n_rows.checked_add(1).ok_or_else(|| {
+            CodecError::MalformedInput(format!("scx1 n_rows+1 overflow: {n_rows}"))
+        })?;
+        bound_capacity(n_rows_p1, encoded.indptr_bytes.len(), "scx1 indptr")?;
+        bound_capacity(nnz, encoded.indices_bytes.len(), "scx1 indices")?;
+        bound_capacity(nnz, encoded.values_bytes.len(), "scx1 values")?;
+
+        let indptr_u64 = delta_golomb_decode(encoded.indptr_bytes, n_rows_p1)?;
+        let indptr = u64_vec_to_i64(indptr_u64)?;
+        let (indices, _) =
+            forbp_decode_with_hint(encoded.indices_bytes, n_rows, nnz, index_dtype_u16)?;
+        let values_u32 = rice_decode(encoded.values_bytes, nnz, B_VAL)?;
+        return Ok((indptr, indices, ShardValuesNative::U32(values_u32)));
+    }
+
+    // None / Zstd / Lz4Shuffle / ShufDeltaZstd / Pcodec: decode to raw types,
+    // then widen integer bytes to u32 (or decode float bytes to f32).
+    let (indptr_u64, indices, values_raw) = decode_shard_ref(
+        encoded,
+        codec_id,
+        value_encoding,
+        n_rows,
+        nnz,
+        index_dtype_u16,
+    )?;
+    let indptr = u64_vec_to_i64(indptr_u64)?;
+    let values = decoded_values_to_native(&values_raw, value_encoding)?;
+    Ok((indptr, indices, values))
+}
+
+/// Convert a raw [`DecodedShard`] into the native `(i64, u32, ShardValuesNative)`
+/// triple (the in-assembly narrow twin of [`decoded_shard_to_scipy`]), used by
+/// the framed per-row-group decode path.
+pub fn decoded_shard_to_native(
+    decoded: DecodedShard,
+    value_encoding: ValueEncoding,
+) -> Result<NativeShard, CodecError> {
+    let (indptr_u64, indices, values_raw) = decoded;
+    let indptr = u64_vec_to_i64(indptr_u64)?;
+    let values = decoded_values_to_native(&values_raw, value_encoding)?;
+    Ok((indptr, indices, values))
+}
+
+/// Raw value bytes → native values per encoding: integer → widened `u32`,
+/// float → `f32`.
+fn decoded_values_to_native(
+    values_raw: &[u8],
+    value_encoding: ValueEncoding,
+) -> Result<ShardValuesNative, CodecError> {
+    if value_encoding.is_integer() {
+        Ok(ShardValuesNative::U32(raw_bytes_to_u32(
+            values_raw,
+            value_encoding,
+        )?))
+    } else {
+        Ok(ShardValuesNative::F32(values_raw_to_f32(
+            values_raw,
+            value_encoding,
+        )))
+    }
+}
+
 /// Decode **only** the indptr region of a shard, skipping indices/data.
 ///
 /// Used by callers that need just the row-pointer array — e.g. the

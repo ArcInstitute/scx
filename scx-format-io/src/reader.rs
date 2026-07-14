@@ -2874,7 +2874,7 @@ impl ScxReader {
         }
     }
 
-    fn legacy_layer_shards(&self, name: &str) -> Vec<&FullCatalogEntry> {
+    pub(crate) fn legacy_layer_shards(&self, name: &str) -> Vec<&FullCatalogEntry> {
         let prefix = format!("{name}_shard_");
         self.full_catalog
             .entries
@@ -3636,6 +3636,24 @@ impl ScxReader {
             entry,
             self.full_catalog.catalog_version,
             verify_checksum,
+        )
+    }
+
+    /// Read and decode a single shard to **native** types (`i64` indptr, `u32`
+    /// indices, [`scx_codec::ShardValuesNative`] values) — the in-assembly narrow
+    /// twin of [`read_shard_from_entry`](Self::read_shard_from_entry). Integer
+    /// values stay `u32` (never rounded through `f32`); float values are `f32`.
+    /// Used by the typed whole-matrix reader in `typed_read.rs`.
+    pub(crate) fn read_shard_from_entry_native(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> Result<(Vec<i64>, Vec<u32>, scx_codec::ShardValuesNative)> {
+        let section = self.section_bytes(entry)?;
+        crate::shard_decode::decode_shard_bytes_native(
+            section,
+            entry,
+            self.full_catalog.catalog_version,
+            false,
         )
     }
 

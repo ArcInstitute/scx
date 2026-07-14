@@ -151,6 +151,26 @@ impl ValueBuffer {
         }
     }
 
+    /// Allocate a zero-filled buffer of `dtype` with exactly `n` values.
+    ///
+    /// The in-assembly reader fills the buffer by writing per-shard slices at
+    /// their running nnz offset, so it needs a *sized* (not just capacity)
+    /// buffer. Zero is the natural fill for numeric dtypes.
+    pub fn zeroed(dtype: ValueDtype, n: usize) -> Self {
+        match dtype {
+            ValueDtype::F16 => ValueBuffer::F16(vec![half::f16::default(); n]),
+            ValueDtype::F32 => ValueBuffer::F32(vec![0.0f32; n]),
+            ValueDtype::F64 => ValueBuffer::F64(vec![0.0f64; n]),
+            ValueDtype::I8 => ValueBuffer::I8(vec![0i8; n]),
+            ValueDtype::I16 => ValueBuffer::I16(vec![0i16; n]),
+            ValueDtype::I32 => ValueBuffer::I32(vec![0i32; n]),
+            ValueDtype::I64 => ValueBuffer::I64(vec![0i64; n]),
+            ValueDtype::U8 => ValueBuffer::U8(vec![0u8; n]),
+            ValueDtype::U16 => ValueBuffer::U16(vec![0u16; n]),
+            ValueDtype::U32 => ValueBuffer::U32(vec![0u32; n]),
+        }
+    }
+
     /// The `ValueDtype` this buffer carries.
     pub fn dtype(&self) -> ValueDtype {
         match self {
@@ -204,6 +224,16 @@ impl IndexBuffer {
             IndexDtype::I16 => IndexBuffer::I16(Vec::with_capacity(nnz)),
             IndexDtype::I32 => IndexBuffer::I32(Vec::with_capacity(nnz)),
             IndexDtype::I64 => IndexBuffer::I64(Vec::with_capacity(nnz)),
+        }
+    }
+
+    /// Allocate a zero-filled buffer of `dtype` with exactly `n` indices
+    /// (sized for per-shard slice fills; see [`ValueBuffer::zeroed`]).
+    pub fn zeroed(dtype: IndexDtype, n: usize) -> Self {
+        match dtype {
+            IndexDtype::I16 => IndexBuffer::I16(vec![0i16; n]),
+            IndexDtype::I32 => IndexBuffer::I32(vec![0i32; n]),
+            IndexDtype::I64 => IndexBuffer::I64(vec![0i64; n]),
         }
     }
 
@@ -290,6 +320,26 @@ mod tests {
             assert_eq!(buf.len(), 0);
             assert!(buf.is_empty());
             assert_eq!(buf.dtype().numpy_name(), dt.numpy_name());
+        }
+    }
+
+    #[test]
+    fn zeroed_is_sized_and_roundtrips_dtype() {
+        for dt in ALL_VALUE_DTYPES {
+            let buf = ValueBuffer::zeroed(dt, 5);
+            assert_eq!(buf.dtype(), dt, "value arm mismatch for {dt:?}");
+            assert_eq!(buf.len(), 5, "zeroed must be sized, not capacity-only");
+            assert!(!buf.is_empty());
+        }
+        for dt in ALL_INDEX_DTYPES {
+            let buf = IndexBuffer::zeroed(dt, 5);
+            assert_eq!(buf.dtype(), dt, "index arm mismatch for {dt:?}");
+            assert_eq!(buf.len(), 5);
+        }
+        // Spot-check the fill value is actually zero.
+        match ValueBuffer::zeroed(ValueDtype::U16, 3) {
+            ValueBuffer::U16(v) => assert_eq!(v, vec![0u16; 3]),
+            _ => panic!("wrong arm"),
         }
     }
 
