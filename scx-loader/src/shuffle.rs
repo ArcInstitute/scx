@@ -59,28 +59,37 @@ impl ShardShuffler {
         self.shuffle_epoch_inner()
     }
 
-    /// Generate offset-sorted shard groups for this epoch.
+    /// Generate key-sorted shard groups for this epoch.
     ///
     /// Like the unsorted shuffle, randomly permutes shard indices and groups them,
-    /// but then sorts shards within each group by file offset (ascending) and
-    /// sorts the groups themselves by minimum offset. This converts random I/O
-    /// into a mostly-sequential scan while preserving stochastic group
-    /// composition across epochs.
+    /// but then sorts shards within each group by `sort_keys[idx]` (ascending) and
+    /// sorts the groups themselves by their minimum key. `sort_by_key` is stable,
+    /// so shards/groups with equal keys keep the (RNG-determined) permuted order.
     ///
-    /// `shard_offsets[i]` is the file offset of shard `i`.
-    pub fn shuffle_epoch_sorted(&mut self, shard_offsets: &[u64]) -> Vec<Vec<usize>> {
+    /// `sort_keys[i]` is the per-position sort key for shard `i`. Production passes
+    /// each shard's `row_start` (see `TrainingPipeline::start_epoch`), which makes
+    /// the group ordering **layout-invariant**: the multimodal loader runs one
+    /// shuffler per modality with the same seed, and all modalities share the same
+    /// per-position `row_start` (validated by `check_uniform_modality_layouts`), so
+    /// every modality produces an identical group sequence regardless of how a
+    /// rewrite (`append`/`merge`/`compact`) reordered shards on disk. Sorting on
+    /// raw file offset instead would diverge across modalities whenever offset
+    /// order no longer tracks row order, desyncing the per-batch cell axis. In the
+    /// common case offsets are written in row order, so the `row_start` key still
+    /// yields a disk-sequential scan.
+    pub fn shuffle_epoch_sorted(&mut self, sort_keys: &[u64]) -> Vec<Vec<usize>> {
         let mut groups = self.shuffle_epoch_inner();
 
-        // Sort shards within each group by file offset (ascending)
+        // Sort shards within each group by their key (ascending).
         for group in &mut groups {
-            group.sort_by_key(|&idx| shard_offsets.get(idx).copied().unwrap_or(u64::MAX));
+            group.sort_by_key(|&idx| sort_keys.get(idx).copied().unwrap_or(u64::MAX));
         }
 
-        // Sort groups by the minimum offset within each group
+        // Sort groups by the minimum key within each group.
         groups.sort_by_key(|group| {
             group
                 .iter()
-                .filter_map(|&idx| shard_offsets.get(idx).copied())
+                .filter_map(|&idx| sort_keys.get(idx).copied())
                 .min()
                 .unwrap_or(u64::MAX)
         });
@@ -379,5 +388,46 @@ mod tests {
         let groups2 = shuffler2.shuffle_epoch_sorted(&offsets);
 
         assert_eq!(groups1, groups2, "same seed + same epoch must be identical");
+    }
+
+    /// Two modalities share the same per-position `row_start` (the shuffle
+    /// key) but have *different* on-disk offset orderings. Feeding the shared
+    /// `row_start` keys must produce identical group sequences (layout-invariant),
+    /// so the multimodal per-batch cell axis stays aligned. Feeding the divergent
+    /// *offset* arrays instead would desync them — the bug this fix closes.
+    #[test]
+    fn test_shuffle_epoch_sorted_layout_invariant_on_row_start_key() {
+        let n_shards = 20;
+        // Shared sort key = row_start rank (identical across modalities).
+        let row_start: Vec<u64> = (0..n_shards).map(|i| (i as u64) * 1000).collect();
+        // Two modalities whose file offsets rank differently from row_start:
+        // modality A is offset-monotonic, modality B has a reversed offset layout
+        // (as if a rewrite re-emitted its shards out of row order).
+        let offsets_a: Vec<u64> = (0..n_shards).map(|i| (i as u64) * 1000).collect();
+        let offsets_b: Vec<u64> = (0..n_shards)
+            .map(|i| ((n_shards - 1 - i) as u64) * 1000)
+            .collect();
+
+        // Same seed per modality (as MultimodalTrainingDataset uses config.seed).
+        let mut sh_a = ShardShuffler::new(n_shards, 4, 42).unwrap();
+        let mut sh_b = ShardShuffler::new(n_shards, 4, 42).unwrap();
+        let groups_a = sh_a.shuffle_epoch_sorted(&row_start);
+        let groups_b = sh_b.shuffle_epoch_sorted(&row_start);
+        assert_eq!(
+            groups_a, groups_b,
+            "row_start-keyed shuffle must be identical across modalities regardless \
+             of on-disk offset order"
+        );
+
+        // Sanity: keying on the divergent raw offsets would NOT be aligned — this
+        // is precisely the pre-fix desync path.
+        let mut sh_a_off = ShardShuffler::new(n_shards, 4, 42).unwrap();
+        let mut sh_b_off = ShardShuffler::new(n_shards, 4, 42).unwrap();
+        let groups_a_off = sh_a_off.shuffle_epoch_sorted(&offsets_a);
+        let groups_b_off = sh_b_off.shuffle_epoch_sorted(&offsets_b);
+        assert_ne!(
+            groups_a_off, groups_b_off,
+            "divergent offset keys must produce different orderings (the bug)"
+        );
     }
 }
