@@ -1431,6 +1431,15 @@ impl ScxWriter {
     /// The encoding, checksums, and stats have all been computed in advance
     /// (typically in parallel via rayon). This method only performs the
     /// sequential I/O write and catalog entry bookkeeping.
+    ///
+    /// Note: for a `CsrShard` this bumps the *global* `csr_shard_count` /
+    /// `total_nnz` unconditionally, even inside a [`Self::with_modality`] scope
+    /// (unlike [`Self::write_csr_shard_for`], which only touches the per-modality
+    /// counters). That is inert today — the header's `n_csr_shards` / `nnz` are
+    /// re-derived from the catalog in [`Self::finish`], and the global counter is
+    /// only read by the single-modality `X_shard_{n}` auto-namer — but a writer
+    /// that interleaves modality-scoped `write_preencoded_shard` calls with a
+    /// later global `write_csr_shard` would see a skewed auto-name index.
     pub fn write_preencoded_shard(&mut self, section: PreEncodedSection) -> Result<()> {
         self.guard_no_legacy_shard_in_v4(section.section_type, &section.header_buf)?;
         self.write_padding()?;

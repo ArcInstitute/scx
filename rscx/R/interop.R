@@ -16,6 +16,29 @@
 #' expect genes x cells. The conversion functions handle the transpose
 #' automatically.
 #'
+#' @section Codecs and framing:
+#' \code{from_seurat()}, \code{from_sce()}, and \code{from_mae()} accept a
+#' \code{codec} argument selecting the same codec intent axis as
+#' \code{pyscx.from_anndata} and the \code{scx} CLI (resolved by the shared
+#' \code{scx_format::resolve_codec}):
+#' \describe{
+#'   \item{\code{"auto"} (default)}{Cost-aware adaptive: per integer shard,
+#'     adopt \code{ShufDeltaZstd} when it is smaller by a margin, else the
+#'     heuristic (Scx1 for low-count / Zstd otherwise). Float always uses
+#'     Pcodec.}
+#'   \item{\code{"fast"}}{Decode-optimized heuristic single-encode (the prior
+#'     default behaviour); never trials \code{ShufDeltaZstd}.}
+#'   \item{\code{"compact"}}{Size-optimized: adopts \code{ShufDeltaZstd} on ties.
+#'     Requires framing (\code{row_group_rows > 0}).}
+#'   \item{explicit codecs}{\code{"none"}, \code{"scx1"}, \code{"zstd"},
+#'     \code{"lz4"}, \code{"pcodec"}, \code{"shufdelta"}.}
+#' }
+#' \code{row_group_rows} controls row-group framing (sub-shard random access);
+#' the default (\code{NULL}) frames at 256 rows to match pyscx/CLI, producing v4
+#' files. Pass \code{0L} to opt out of framing (which the \code{"compact"} /
+#' \code{"compact-trial"} profiles reject). Framed files require an SCX reader
+#' that understands the v4 layout.
+#'
 #' @examples
 #' \dontrun{
 #' # ── Export: SCX → Seurat v5 ──
@@ -33,5 +56,8 @@
 #'
 #' # ── Import: SingleCellExperiment → SCX ──
 #' from_sce(sce, "output.scx")
+#'
+#' # ── Size-optimized import (adaptive ShufDeltaZstd, framed) ──
+#' from_seurat(seu, "compact.scx", codec = "compact")
 #' }
 NULL

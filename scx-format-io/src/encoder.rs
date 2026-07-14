@@ -141,12 +141,61 @@ pub fn encode_one_shard_with_value_encoding(
          zeros); call scx_sparse::canonicalize_csr upstream"
     );
 
-    let index_dtype_u16 = index_dtype == 0;
-
     // 3. Determine value encoding (caller override wins) and encode values.
     let shard_value_encoding: ValueEncoding =
         value_encoding.unwrap_or_else(|| detect_value_encoding(shard_values));
     let shard_values_bytes = values_to_raw_bytes(shard_values, shard_value_encoding)?;
+
+    // The remaining steps (codec selection, framed/unframed encode, block index,
+    // checksums, stats) operate purely on value BYTES — no f32 dependency — so
+    // they live in the byte-oriented helper below, shared with callers (e.g. rscx)
+    // that already hold raw LE value bytes + a fixed ValueEncoding.
+    encode_one_shard_from_bytes(
+        shard_indptr,
+        shard_indices,
+        &shard_values_bytes,
+        shard_value_encoding,
+        explicit_codec,
+        index_dtype,
+        n_vars,
+        global_row_offset,
+        section_type,
+        modality_type,
+        name,
+        framing,
+    )
+}
+
+/// Byte-oriented sibling of [`encode_one_shard`]: encode a CSR shard whose values
+/// are already serialized to raw little-endian bytes under a fixed
+/// [`ValueEncoding`]. This is the shared adaptive core — codec selection
+/// (heuristic or explicit), row-group framing with the `auto`/`compact` adaptive
+/// [`pick_codec_v2`] bias (or `compact-trial` dual-encode), block index,
+/// checksums, and shard stats — reused by the f32 entry points
+/// ([`encode_one_shard`] / [`encode_one_shard_with_value_encoding`]) and by
+/// callers that hold raw bytes directly (e.g. rscx, which serializes counts
+/// f64→uN and would lose >2^24 counts on an f32 round-trip).
+///
+/// `shard_values_bytes` MUST equal
+/// `values_to_raw_bytes(values, shard_value_encoding)` for canonical CSR values;
+/// the caller owns canonicalization (this fn does not re-validate, unlike the f32
+/// [`encode_one_shard`] debug assert).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_one_shard_from_bytes(
+    shard_indptr: &[u64],
+    shard_indices: &[u32],
+    shard_values_bytes: &[u8],
+    shard_value_encoding: ValueEncoding,
+    explicit_codec: Option<CodecId>,
+    index_dtype: u8,
+    n_vars: u32,
+    global_row_offset: u64,
+    section_type: SectionType,
+    modality_type: ModalityType,
+    name: String,
+    framing: Option<FramingConfig>,
+) -> Result<PreEncodedSection, ScxError> {
+    let index_dtype_u16 = index_dtype == 0;
 
     // 4. Select codec (heuristic when not explicit).
     let mut shard_codec = match explicit_codec {
@@ -157,7 +206,7 @@ pub fn encode_one_shard_with_value_encoding(
                 codec_id
             }
         }
-        None => select_codec_for_modality(&shard_values_bytes, shard_value_encoding, modality_type),
+        None => select_codec_for_modality(shard_values_bytes, shard_value_encoding, modality_type),
     };
 
     // 5–6. Encode shard + build block index. Two layouts:
@@ -177,7 +226,7 @@ pub fn encode_one_shard_with_value_encoding(
                 encode_shard_framed(
                     shard_indptr,
                     shard_indices,
-                    &shard_values_bytes,
+                    shard_values_bytes,
                     codec,
                     shard_value_encoding,
                     index_dtype_u16,
@@ -231,7 +280,7 @@ pub fn encode_one_shard_with_value_encoding(
             let enc = encode_shard(
                 shard_indptr,
                 shard_indices,
-                &shard_values_bytes,
+                shard_values_bytes,
                 shard_codec,
                 shard_value_encoding,
                 index_dtype_u16,
@@ -322,7 +371,7 @@ pub fn encode_one_shard_with_value_encoding(
     // 10. Compute shard stats. pyscx writes row-major CSR shards
     // exclusively; CSC sidecars use a separate path.
     let stats = compute_shard_stats(
-        &shard_values_bytes,
+        shard_values_bytes,
         shard_value_encoding,
         MajorAxis::Row,
         global_row_offset,
@@ -676,6 +725,77 @@ mod adaptive_codec_tests {
                 CodecId::Pcodec as u8,
                 "float must stay Pcodec under {dt:?}"
             );
+        }
+    }
+
+    /// The byte-oriented [`encode_one_shard_from_bytes`] must produce a
+    /// byte-identical `PreEncodedSection` to the f32 [`encode_one_shard_with_value_encoding`]
+    /// for the same canonical CSR + value encoding, proving the extraction is a
+    /// no-op refactor. Checked across unframed, `fast`, and adaptive `auto`/`compact`
+    /// framings so the shared adaptive core is exercised on both paths.
+    #[test]
+    fn from_bytes_matches_f32_path_byte_for_byte() {
+        let (indptr, indices, values) = gen_int_shard(2048, 60, 20000, 255);
+        let enc = ValueEncoding::Uint8;
+        let bytes = values_to_raw_bytes(&values, enc).expect("values_to_raw_bytes");
+        let base = FramingConfig {
+            row_group_rows: 256,
+            target_nnz: None,
+            trial: false,
+            decode_target: None,
+        };
+        let framings: [Option<FramingConfig>; 4] = [
+            None, // unframed
+            Some(base),
+            Some(FramingConfig {
+                decode_target: Some(DecodeTarget::Auto),
+                ..base
+            }),
+            Some(FramingConfig {
+                decode_target: Some(DecodeTarget::Storage),
+                ..base
+            }),
+        ];
+        for framing in framings {
+            let f32_sec = encode_one_shard_with_value_encoding(
+                &indptr,
+                &indices,
+                &values,
+                None,
+                0,
+                20000,
+                0,
+                SectionType::CsrShard,
+                ModalityType::Rna,
+                "X_shard_0".to_string(),
+                framing,
+                Some(enc),
+            )
+            .expect("f32 encode");
+            let bytes_sec = encode_one_shard_from_bytes(
+                &indptr,
+                &indices,
+                &bytes,
+                enc,
+                None,
+                0,
+                20000,
+                0,
+                SectionType::CsrShard,
+                ModalityType::Rna,
+                "X_shard_0".to_string(),
+                framing,
+            )
+            .expect("bytes encode");
+            assert_eq!(
+                f32_sec.section_checksum, bytes_sec.section_checksum,
+                "section checksum diverged for framing {framing:?}"
+            );
+            assert_eq!(
+                f32_sec.section_length, bytes_sec.section_length,
+                "section length diverged for framing {framing:?}"
+            );
+            assert_eq!(f32_sec.codec_id(), bytes_sec.codec_id());
         }
     }
 }
