@@ -77,18 +77,28 @@ def test_allow_lossy_escapes_default(tmp_dir):
     assert rt.X.max() == pytest.approx(float(np.float32(BIG)))
 
 
-def test_widening_dtype_also_fails_loud(tmp_dir):
-    # float64 *could* hold the value, but Phase-1 decode intermediates through
-    # f32, so the read is still lossy — it must fail loud rather than silently
-    # widen a rounded f32. (Lossless typed decode is the deferred Phase 2.)
+def test_widening_to_exact_dtype_now_lossless(tmp_dir):
+    # The in-decode narrow assembles X directly from the
+    # native u32 stream, so a > 2**24 integer count read into an exactly
+    # representable dtype (float64 / int64 / uint32) now SUCCEEDS losslessly —
+    # where the old f32-intermediate path failed loud. This is the documented
+    # behavior change: a prior hard error becomes an exact read.
+    path = _write(tmp_dir, _big_count_adata())
+    for dt, np_dt in [("float64", np.float64), ("int64", np.int64), ("uint32", np.uint32)]:
+        rt = pyscx.open(path).to_anndata(data_dtype=dt)
+        assert rt.X.data.dtype == np_dt
+        # The > 2**24 value round-trips exactly (no f32 rounding).
+        assert int(rt.X.max()) == BIG
+
+
+def test_narrow_f32_target_still_fails_loud(tmp_dir):
+    # float32 (and the default) genuinely cannot hold a > 2**24 integer exactly,
+    # so the conservative guard still fails loud unless allow_lossy.
     path = _write(tmp_dir, _big_count_adata())
     with pytest.raises(ValueError, match="allow_lossy"):
-        pyscx.open(path).to_anndata(data_dtype="float64")
-    with pytest.raises(ValueError, match="allow_lossy"):
-        pyscx.open(path).to_anndata(data_dtype="int64")
-    # allow_lossy accepts the rounding.
-    rt = pyscx.open(path).to_anndata(data_dtype="float64", allow_lossy=True)
-    assert rt.X.data.dtype == np.float64
+        pyscx.open(path).to_anndata(data_dtype="float32")
+    rt = pyscx.open(path).to_anndata(data_dtype="float32", allow_lossy=True)
+    assert rt.X.data.dtype == np.float32
 
 
 def test_dense_container_fails_loud(tmp_dir):
