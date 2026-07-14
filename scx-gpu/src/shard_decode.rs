@@ -1498,6 +1498,87 @@ mod tests {
         assert_eq!(b_stats.n_shards_host_bounced, 0);
     }
 
+    /// The batched nvcomp decode with a tiny per-chunk byte budget
+    /// (`SCX_SHUFDELTA_NVCOMP_CHUNK_BYTES`) — forcing many chunks — is
+    /// byte-identical to the host reference (and hence to the unchunked batched
+    /// path). Guards the shard-chunking that bounds the transient host/device
+    /// footprint. Skipped when nvcomp is absent.
+    #[test]
+    fn test_shufdelta_shards_nvcomp_batched_chunked_matches_host() {
+        let dev = require_gpu!();
+        if !crate::nvcomp::nvcomp_available() {
+            eprintln!("nvcomp not available — skipping M3 chunked batched test");
+            return;
+        }
+        let n_cols: u32 = 4000;
+        let shard_row_nnzs: [&[usize]; 3] = [
+            &[0usize, 1, 5, 130, 256, 7, 0, 384],
+            &[200usize, 3, 128, 129],
+            &[512usize, 50, 0, 9, 300, 1],
+        ];
+
+        let mut sections: Vec<Vec<u8>> = Vec::new();
+        let mut want_indptr: Vec<i64> = vec![0];
+        let mut want_indices: Vec<i32> = Vec::new();
+        let mut want_data: Vec<f32> = Vec::new();
+        let mut nnz_base: i64 = 0;
+        let mut total_rows: usize = 0;
+        for row_nnzs in shard_row_nnzs {
+            let (indptr, indices, values_u16) = build_dense_csr(row_nnzs, n_cols);
+            let values_f32: Vec<f32> = values_u16.iter().map(|&v| v as f32).collect();
+            for &p in &indptr[1..] {
+                want_indptr.push(nnz_base + p as i64);
+            }
+            want_indices.extend(indices.iter().map(|&v| v as i32));
+            want_data.extend_from_slice(&values_f32);
+            nnz_base += *indptr.last().unwrap() as i64;
+            total_rows += row_nnzs.len();
+            sections.push(framed_section_bytes(
+                &indptr,
+                &indices,
+                &values_f32,
+                CodecId::ShufDeltaZstd,
+                n_cols,
+                4,
+            ));
+        }
+        let refs: Vec<&[u8]> = sections.iter().map(|s| s.as_slice()).collect();
+
+        // env::set_var is safe on edition 2021; GPU tests run --test-threads=1.
+        std::env::set_var("SCX_SHUFDELTA_NVCOMP", "1");
+        std::env::remove_var("SCX_NVCOMP_NO_BATCH");
+        // Tiny budget → one group per chunk (each group's planes far exceed 1 byte).
+        std::env::set_var("SCX_SHUFDELTA_NVCOMP_CHUNK_BYTES", "1");
+        let (chunked, stats) =
+            crate::gpu_csr_assemble::decode_csr_shards_to_device_with_stats(&dev, &refs)
+                .unwrap_or_else(|e| panic!("chunked batched nvcomp assembly failed: {e}"));
+        std::env::remove_var("SCX_SHUFDELTA_NVCOMP_CHUNK_BYTES");
+        std::env::remove_var("SCX_SHUFDELTA_NVCOMP");
+
+        assert_eq!(
+            chunked.shape,
+            (total_rows, n_cols as usize),
+            "chunked shape"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&chunked.indptr).unwrap(),
+            want_indptr,
+            "chunked indptr vs host"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&chunked.indices).unwrap(),
+            want_indices,
+            "chunked indices vs host"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&chunked.data).unwrap(),
+            want_data,
+            "chunked data vs host"
+        );
+        assert!(stats.fully_device_decoded, "chunked fully_device_decoded");
+        assert_eq!(stats.n_shards_shufdelta_gpu, 3, "chunked shard count");
+    }
+
     /// GPU ShufDeltaZstd decode Phase 2 spike (GATE): nvcomp batched GPU zstd decode
     /// of a shard's per-group indices/values frames is **byte-identical** to the
     /// CPU `zstd_decompress_bounded`, and prints GPU vs **parallel** CPU

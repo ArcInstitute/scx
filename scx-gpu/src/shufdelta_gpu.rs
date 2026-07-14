@@ -879,6 +879,49 @@ fn prescan_shufdelta_shards<'a>(shards: &[&'a [u8]]) -> Result<ShufdeltaBatchPla
     })
 }
 
+/// Split `group_plane_bytes` (per-group decompressed idx+val plane bytes) into
+/// contiguous chunks whose summed bytes fit `budget`, so the nvcomp batched
+/// decode's transient host/device footprint stays bounded. Greedy: start a
+/// new chunk before a group that would overflow the current one. A single group
+/// larger than `budget` forms its own chunk (progress guaranteed). The returned
+/// ranges exactly partition `0..group_plane_bytes.len()`.
+fn plan_nvcomp_chunks(group_plane_bytes: &[usize], budget: usize) -> Vec<std::ops::Range<usize>> {
+    let budget = budget.max(1);
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0usize;
+    for (i, &b) in group_plane_bytes.iter().enumerate() {
+        if i > start && acc.saturating_add(b) > budget {
+            chunks.push(start..i);
+            start = i;
+            acc = 0;
+        }
+        acc = acc.saturating_add(b);
+    }
+    if start < group_plane_bytes.len() {
+        chunks.push(start..group_plane_bytes.len());
+    }
+    chunks
+}
+
+/// Per-chunk transient-byte budget for [`decode_shufdelta_shards_nvcomp_batched`]
+/// . `SCX_SHUFDELTA_NVCOMP_CHUNK_BYTES` overrides it (tests force small
+/// chunks); otherwise ~15% of free VRAM — conservative headroom for the nvcomp
+/// temp buffer (which scales with the chunk's output) on top of the resident
+/// combined CSR. If free VRAM can't be queried, returns `usize::MAX` ⇒ a single
+/// chunk ⇒ the pre-M3 single-batch behavior.
+fn nvcomp_batch_chunk_budget(dev: &GpuDevice) -> usize {
+    if let Ok(v) = std::env::var("SCX_SHUFDELTA_NVCOMP_CHUNK_BYTES") {
+        if let Ok(bytes) = v.parse::<usize>() {
+            return bytes.max(1);
+        }
+    }
+    match dev.free_memory() {
+        Ok((free, _total)) => ((free as f64 * 0.15) as usize).max(1),
+        Err(_) => usize::MAX,
+    }
+}
+
 /// **Phase 2.x**: full in-VRAM decode of a *run of* framed ShufDeltaZstd shards
 /// via nvcomp, batching every group's compressed frame into **2** batched
 /// `nvcompBatchedZstdDecompressAsync` calls total (all indices, then all values)
@@ -888,14 +931,17 @@ fn prescan_shufdelta_shards<'a>(shards: &[&'a [u8]]) -> Result<ShufdeltaBatchPla
 /// `fully_device_decoded = true`. The dispatcher guarantees every shard is framed
 /// ShufDeltaZstd with an integer value encoding (2x-d) and that nvcomp is loadable.
 ///
-/// **VRAM ceiling (caller must pre-flight):** unlike the pipeline's bounded
-/// 2-slot ring, the batch holds the whole modality resident at peak — the
-/// compressed blob (Σ all frames), both decompressed plane buffers
-/// (`total_nnz·(index_width+value_width)`), and the final CSR
-/// (`total_nnz·8 + rows·8`), plus nvcomp temp (≈ 19 GB on census_1m). There is
-/// **no internal chunking**, so a caller must gate on free VRAM before calling
-/// (pyscx's `to_gpu_anndata` does; see `experiment.rs`). Shard-chunking to bound
-/// the transient on smaller cards is a documented follow-on.
+/// **Memory:** the final combined CSR (`total_nnz·8 + rows·8`) is the resident
+/// result and the caller must pre-flight free VRAM for it (pyscx's
+/// `to_gpu_anndata` does; see `experiment.rs`). The *transient* decode footprint
+/// — the host compressed `blob`, the decompressed plane buffer, and the nvcomp
+/// temp — is **bounded per chunk** by [`nvcomp_batch_chunk_budget`]
+/// ([`plan_nvcomp_chunks`] splits the groups into runs whose decompressed plane
+/// bytes fit the budget). Indices and values are decoded in separate passes per
+/// chunk, so at most one plane buffer (not both) is resident at a time. Set
+/// `SCX_SHUFDELTA_NVCOMP_CHUNK_BYTES` to force a specific chunk size (tests);
+/// otherwise the budget is a fraction of free VRAM measured after the combined
+/// buffers are allocated. Output is byte-identical to a single-batch decode.
 pub fn decode_shufdelta_shards_nvcomp_batched(
     dev: &GpuDevice,
     shards: &[&[u8]],
@@ -931,50 +977,79 @@ pub fn decode_shufdelta_shards_nvcomp_batched(
         ));
     }
 
-    // Two batched decompress calls over ALL groups of ALL shards (idx, then val).
-    let idx_frames: Vec<&[u8]> = plan.groups.iter().map(|g| g.idx_frame).collect();
-    let idx_exp: Vec<usize> = plan.groups.iter().map(|g| g.idx_expected).collect();
-    let val_frames: Vec<&[u8]> = plan.groups.iter().map(|g| g.val_frame).collect();
-    let val_exp: Vec<usize> = plan.groups.iter().map(|g| g.val_expected).collect();
-    host_uploaded_bytes += idx_frames.iter().map(|f| f.len() as u64).sum::<u64>();
-    host_uploaded_bytes += val_frames.iter().map(|f| f.len() as u64).sum::<u64>();
+    // Account for every group's compressed frames up front (idx + val).
+    host_uploaded_bytes += plan
+        .groups
+        .iter()
+        .map(|g| (g.idx_frame.len() + g.val_frame.len()) as u64)
+        .sum::<u64>();
+
+    // Chunk the groups so each `batch_decompress_concat` — and its host `blob`,
+    // device plane buffer, and nvcomp temp — stays within a VRAM-derived budget
+    // (measured now, after the combined output buffers are allocated). Indices
+    // and values are decoded in separate passes per chunk, so at most one plane
+    // buffer is resident at a time.
+    let group_plane_bytes: Vec<usize> = plan
+        .groups
+        .iter()
+        .map(|g| g.idx_expected + g.val_expected)
+        .collect();
+    let budget = nvcomp_batch_chunk_budget(dev);
+    let chunks = plan_nvcomp_chunks(&group_plane_bytes, budget);
 
     let t_gpu = profile::start();
-    let (mut d_idx_planes, idx_off) =
-        crate::nvcomp::batch_decompress_concat(dev, dev.stream(), &idx_frames, &idx_exp)?;
-    let (d_val_planes, val_off) =
-        crate::nvcomp::batch_decompress_concat(dev, dev.stream(), &val_frames, &val_exp)?;
+    for chunk in chunks {
+        let chunk_groups = &plan.groups[chunk.clone()];
 
-    // Per group: undelta (indices) + unshuffle/convert on the group's plane
-    // sub-range → combined buffers at the group's global nnz offset.
-    for (k, g) in plan.groups.iter().enumerate() {
-        let base = g.global_nnz_base;
-        let g_nnz = g.g_nnz;
-        let io = idx_off[k];
-        let ilen = g_nnz * g.index_width;
+        // Pass 1: indices for this chunk.
+        let idx_frames: Vec<&[u8]> = chunk_groups.iter().map(|g| g.idx_frame).collect();
+        let idx_exp: Vec<usize> = chunk_groups.iter().map(|g| g.idx_expected).collect();
         {
-            let mut idx_view = d_idx_planes.slice_mut(io..io + ilen);
-            undelta_planes_view(dev, &mut idx_view, g_nnz as u32, g.index_width as u32)?;
+            let (mut d_idx_planes, idx_off) =
+                crate::nvcomp::batch_decompress_concat(dev, dev.stream(), &idx_frames, &idx_exp)?;
+            for (k, g) in chunk_groups.iter().enumerate() {
+                let base = g.global_nnz_base;
+                let g_nnz = g.g_nnz;
+                let io = idx_off[k];
+                let ilen = g_nnz * g.index_width;
+                {
+                    let mut idx_view = d_idx_planes.slice_mut(io..io + ilen);
+                    undelta_planes_view(dev, &mut idx_view, g_nnz as u32, g.index_width as u32)?;
+                }
+                let out_i: CudaSlice<i32> = {
+                    let idx_view = d_idx_planes.slice(io..io + ilen);
+                    unshuffle_convert_view(dev, &idx_view, g_nnz, g.index_width, 0)?
+                };
+                let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
+                dev.stream()
+                    .memcpy_dtod(&out_i, &mut idx_dst)
+                    .map_err(|e| {
+                        GpuError::CudaError(format!("dtod indices (nvcomp batched): {e}"))
+                    })?;
+            }
+            // `d_idx_planes` dropped here — its plane buffer frees before the
+            // values pass allocates its own.
         }
-        let out_i: CudaSlice<i32> = {
-            let idx_view = d_idx_planes.slice(io..io + ilen);
-            unshuffle_convert_view(dev, &idx_view, g_nnz, g.index_width, 0)?
-        };
-        let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
-        dev.stream()
-            .memcpy_dtod(&out_i, &mut idx_dst)
-            .map_err(|e| GpuError::CudaError(format!("dtod indices (nvcomp batched): {e}")))?;
 
-        let vo = val_off[k];
-        let vlen = g_nnz * g.value_width;
-        let out_v: CudaSlice<f32> = {
-            let val_view = d_val_planes.slice(vo..vo + vlen);
-            unshuffle_convert_view(dev, &val_view, g_nnz, g.value_width, 1)?
-        };
-        let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
-        dev.stream()
-            .memcpy_dtod(&out_v, &mut data_dst)
-            .map_err(|e| GpuError::CudaError(format!("dtod data (nvcomp batched): {e}")))?;
+        // Pass 2: values for this chunk.
+        let val_frames: Vec<&[u8]> = chunk_groups.iter().map(|g| g.val_frame).collect();
+        let val_exp: Vec<usize> = chunk_groups.iter().map(|g| g.val_expected).collect();
+        let (d_val_planes, val_off) =
+            crate::nvcomp::batch_decompress_concat(dev, dev.stream(), &val_frames, &val_exp)?;
+        for (k, g) in chunk_groups.iter().enumerate() {
+            let base = g.global_nnz_base;
+            let g_nnz = g.g_nnz;
+            let vo = val_off[k];
+            let vlen = g_nnz * g.value_width;
+            let out_v: CudaSlice<f32> = {
+                let val_view = d_val_planes.slice(vo..vo + vlen);
+                unshuffle_convert_view(dev, &val_view, g_nnz, g.value_width, 1)?
+            };
+            let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
+            dev.stream()
+                .memcpy_dtod(&out_v, &mut data_dst)
+                .map_err(|e| GpuError::CudaError(format!("dtod data (nvcomp batched): {e}")))?;
+        }
     }
     profile::record_gpu_decode_since(t_gpu);
 
@@ -996,4 +1071,55 @@ pub fn decode_shufdelta_shards_nvcomp_batched(
             ..DeviceDecodeStats::default()
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plan_nvcomp_chunks;
+
+    /// Chunks exactly partition `0..n` in order (no gaps, no overlap, ascending).
+    fn assert_partitions(chunks: &[std::ops::Range<usize>], n: usize) {
+        let mut expected = 0usize;
+        for c in chunks {
+            assert_eq!(c.start, expected, "chunk starts contiguous");
+            assert!(c.end > c.start, "chunk non-empty");
+            expected = c.end;
+        }
+        assert_eq!(expected, n, "chunks cover 0..n");
+    }
+
+    #[test]
+    fn plan_nvcomp_chunks_respects_budget() {
+        // budget 10: [3,4,5,2,9] → [3,4] (7) | [5,2] (7) | [9] (9)
+        let bytes = [3usize, 4, 5, 2, 9];
+        let chunks = plan_nvcomp_chunks(&bytes, 10);
+        assert_partitions(&chunks, bytes.len());
+        assert_eq!(chunks, vec![0..2, 2..4, 4..5]);
+        for c in &chunks {
+            // Each chunk fits the budget unless it is a single (oversized) group.
+            let sum: usize = bytes[c.clone()].iter().sum();
+            assert!(sum <= 10 || c.len() == 1, "chunk {c:?} sum {sum} > budget");
+        }
+    }
+
+    #[test]
+    fn plan_nvcomp_chunks_oversized_group_alone() {
+        // A group larger than the budget forms its own chunk; progress is made.
+        let bytes = [2usize, 100, 3];
+        let chunks = plan_nvcomp_chunks(&bytes, 10);
+        assert_partitions(&chunks, bytes.len());
+        assert_eq!(chunks, vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn plan_nvcomp_chunks_single_chunk_when_budget_huge() {
+        // usize::MAX budget (VRAM unqueryable) ⇒ exactly one chunk (pre-M3 behavior).
+        let bytes = [3usize, 4, 5, 2, 9];
+        assert_eq!(plan_nvcomp_chunks(&bytes, usize::MAX), vec![0..5]);
+    }
+
+    #[test]
+    fn plan_nvcomp_chunks_empty() {
+        assert!(plan_nvcomp_chunks(&[], 10).is_empty());
+    }
 }
