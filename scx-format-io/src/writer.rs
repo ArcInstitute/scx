@@ -1501,7 +1501,10 @@ impl ScxWriter {
     /// `shard_target_rows`, same codec, same value encoding), the
     /// source shard bytes — header, indptr, indices, values,
     /// block-index — can be written into the new file without
-    /// decode + re-encode.
+    /// decode + re-encode. Also used by `scx optimize` to carry
+    /// non-CSR sections through unchanged — obsm/varm/obsp/varp
+    /// matrices and the `BitmapShard` / `GroupIndex` sidecars —
+    /// where the source layout is preserved 1:1.
     ///
     /// `src_entry` carries the source section's name, length,
     /// checksum, `section_type`, modality routing key, and shard
@@ -1750,8 +1753,10 @@ impl ScxWriter {
     /// underflow. CSC bumps the `has_csc` flag but not `nnz` (CSC mirrors the
     /// same entries as CSR — adding would double-count). Used by the
     /// pre-encoded (`write_preencoded_shard`) and verbatim-copy
-    /// (`copy_section_verbatim`) paths, which only ever carry CSR/CSC shards;
-    /// other section types are ignored.
+    /// (`copy_section_verbatim`) paths. Only `CsrShard` / `CscShard` update the
+    /// modality stats; any other section the verbatim-copy path may carry (e.g.
+    /// `optimize` routing `BitmapShard` / `GroupIndex` / obsm/varm through
+    /// `copy_section_verbatim`) falls through the `_ => {}` arm and is ignored.
     fn record_modality_shard(&mut self, section_type: SectionType, nnz: u64) {
         if self.current_modality_id == 0 {
             return;

@@ -834,7 +834,34 @@ impl TrainingPipeline {
                 .collect(),
         };
 
-        // Phase 3.3 mmap smoke-read. Touch one byte of the first CSR shard's
+        // Per-position sort keys for the shuffle. Use each shard's `row_start`
+        // (the order `csr_shards_for_modality`/`shards_sorted` already return
+        // entries in) rather than the raw file offset, so the group ordering is
+        // layout-invariant: every modality shares the same per-position
+        // `row_start` (checked by `check_uniform_modality_layouts`), so the
+        // per-modality shufflers produce identical group sequences and the
+        // per-batch cell axis stays aligned even if a rewrite reordered shards on
+        // disk. `shard_offsets` above stays byte offsets for the mmap smoke-read /
+        // prefetch below. Missing-stats shards map to `u64::MAX` identically for
+        // all modalities (stable sort keeps ties in RNG order). (H2)
+        let sort_keys: Vec<u64> = match self.config.modality_id {
+            Some(mid) => self
+                .reader
+                .catalog()
+                .csr_shards_for_modality(mid)
+                .iter()
+                .map(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start))
+                .collect(),
+            None => self
+                .reader
+                .catalog()
+                .shards_sorted()
+                .iter()
+                .map(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start))
+                .collect(),
+        };
+
+        // Touch one byte of the first CSR shard's
         // backing region before spawning the I/O / decode threads. If the
         // mmap'd file has been poisoned (truncated, unmapped via outer
         // munmap, or unmapped because the underlying file was deleted by
@@ -862,7 +889,7 @@ impl TrainingPipeline {
         // spawning the decode thread that uses it.
         let decode_pool = Arc::clone(self.ensure_decode_pool()?);
 
-        let shard_groups = self.shuffler.shuffle_epoch_sorted(&shard_offsets);
+        let shard_groups = self.shuffler.shuffle_epoch_sorted(&sort_keys);
 
         // Create bounded channels
         //

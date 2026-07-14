@@ -303,6 +303,26 @@ pub fn optimize_with_framing(
         let bytes = reader.section_bytes(entry)?;
         writer.copy_section_verbatim(entry, bytes)?;
     }
+
+    // Detection-bitmap shards (SCXB) are keyed to CSR shard-local rows and are
+    // read back in `row_start` order (`bitmap_shards_for_modality`). Optimize
+    // preserves row order and CSR shard boundaries 1:1, and `canonicalize_csr`
+    // only reorders `(col, val)` *within* a row (the set of expressed genes per
+    // row is unchanged), so the gene→rows-expressing bitmaps stay valid — copy
+    // them verbatim (sorted by `row_start` for deterministic output). Dropping
+    // them would silently disable `detection_counts` / `cells_expressing`.
+    let mut bitmap_entries: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::BitmapShard)
+        .collect();
+    bitmap_entries.sort_by_key(|e| e.stats.as_ref().map(|s| s.row_start).unwrap_or(0));
+    for entry in bitmap_entries {
+        let bytes = reader.section_bytes(entry)?;
+        writer.copy_section_verbatim(entry, bytes)?;
+    }
+
     if let Ok(uns) = reader.read_uns() {
         writer.write_uns(&uns)?;
     }
@@ -313,6 +333,22 @@ pub fn optimize_with_framing(
     // re-sets the header flag (cleared above) so it is set iff the section exists.
     if let Some(dv) = reader.read_deletion_vectors()? {
         writer.write_deletion_vectors(&dv)?;
+    }
+
+    // The F1 grouped-sharding sidecar (`group_index`) records GLOBAL output-row
+    // ranges + shard indices. Optimize preserves row order and CSR shard
+    // boundaries 1:1, so those ranges/indices still point at the right rows and
+    // shards — copy it verbatim to keep grouped reads (`read_group` /
+    // `read_reference`) working. Contrast `append`, which appends rows over the
+    // pre-append row universe and therefore must drop it (append.rs).
+    if let Some(gi_entry) = reader
+        .catalog()
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::GroupIndex)
+    {
+        let bytes = reader.section_bytes(gi_entry)?;
+        writer.copy_section_verbatim(gi_entry, bytes)?;
     }
 
     // Predicate indexes reference obs row ranges; rows + shard boundaries are
@@ -450,6 +486,115 @@ mod tests {
         // obs/var preserved.
         assert_eq!(out.read_obs().unwrap().num_rows(), n_obs);
         assert_eq!(out.read_var().unwrap().num_rows(), n_vars);
+    }
+
+    /// Optimize must carry the F1 `group_index` sidecar and the
+    /// detection-bitmap shards through verbatim (CSR boundaries are preserved
+    /// 1:1), so a grouped / bitmapped file stays grouped / bitmapped after
+    /// optimize instead of silently losing those capabilities.
+    #[test]
+    fn optimize_preserves_group_index_and_bitmaps() {
+        use scx_format::{GroupIndexPayload, GroupRecordWire};
+        use scx_format_io::bitmap::BitmapShard;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        let n_obs = 8usize;
+        let n_vars = 100usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 0; // u16 indices (n_vars < 65536)
+
+        // Simple canonical CSR: each row expresses one or two genes.
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<u8> = Vec::new();
+        for r in 0..n_obs {
+            let g0 = (r % n_vars) as u32;
+            let g1 = ((r + 5) % n_vars) as u32;
+            let (lo, hi) = if g0 <= g1 { (g0, g1) } else { (g1, g0) };
+            indices.push(lo);
+            values.push(1);
+            if hi != lo {
+                indices.push(hi);
+                values.push(2);
+            }
+            indptr.push(indices.len() as u64);
+        }
+
+        // Realistic group_index (two contiguous groups over the single shard).
+        let payload = GroupIndexPayload {
+            group_by: "cell_type".to_string(),
+            records: vec![
+                GroupRecordWire {
+                    label: "ref".to_string(),
+                    role: "reference".to_string(),
+                    row_start: 0,
+                    row_stop: 4,
+                    shard: 0,
+                },
+                GroupRecordWire {
+                    label: "grp".to_string(),
+                    role: "group".to_string(),
+                    row_start: 4,
+                    row_stop: n_obs as u64,
+                    shard: 0,
+                },
+            ],
+            reference_labels: vec!["ref".to_string()],
+            reference_shard: Some(0),
+        };
+        let gi_bytes = serde_json::to_vec(&payload).unwrap();
+        let bm = BitmapShard::build_from_csr(0, n_obs as u32, n_vars as u32, &indptr, &indices);
+
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&sample_obs(n_obs)).unwrap();
+            w.write_var(&sample_var(n_vars)).unwrap();
+            w.write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            w.write_bitmap_shard(&bm).unwrap();
+            w.write_group_index(&gi_bytes).unwrap();
+            w.finish().unwrap();
+        }
+
+        // Sanity: the input carries both sidecars.
+        {
+            let inp = ScxReader::open(&input).unwrap();
+            assert_eq!(
+                inp.read_group_index_bytes().unwrap(),
+                Some(gi_bytes.as_slice())
+            );
+            assert_eq!(inp.bitmap_shard_count(0), 1);
+        }
+
+        optimize(&input, &output, None, ObsShardPolicy::Off).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        // group_index carried through byte-identically → grouped reads still work.
+        assert_eq!(
+            out.read_group_index_bytes().unwrap(),
+            Some(gi_bytes.as_slice()),
+            "optimize must preserve the group_index sidecar verbatim"
+        );
+        // Detection bitmap preserved and still associated with the shard.
+        assert_eq!(
+            out.bitmap_shard_count(0),
+            1,
+            "optimize must preserve detection-bitmap shards"
+        );
+        let out_bm = out.read_bitmap_shard(0).unwrap();
+        assert_eq!(out_bm.n_rows, n_obs as u32);
+        assert_eq!(out_bm.n_vars, n_vars as u32);
     }
 
     /// T3.2: `optimize_with_framing` (the `scx optimize --codec compact-trial

@@ -1968,6 +1968,55 @@ fn grouped_fast_path_deterministic() {
     assert_eq!(read_group_index(&a), read_group_index(&b));
 }
 
+/// H1: the parallel fast path's concurrency is capped by `--memory-budget` so its
+/// total peak (`concurrency × per-block transient`) stays within the budget,
+/// instead of scaling with core count.
+#[test]
+fn grouped_fast_concurrency_honors_budget() {
+    use super::{grouped_fast_concurrency, GROUP_BYTES_PER_NNZ};
+
+    // f32 encoding: per_nnz_bytes = 4 (index) + 4 (value) = 8.
+    let per_nnz_bytes: u64 = 8;
+    let block_byte_cap: u64 = 256 * 1024 * 1024; // default 256 MB cap
+    let per_block = (2 * GROUP_BYTES_PER_NNZ) * (block_byte_cap / per_nnz_bytes); // ≈ 2× cap = 512 MB
+    let threads = 192;
+
+    // No budget → full thread count.
+    assert_eq!(
+        grouped_fast_concurrency(threads, block_byte_cap, per_nnz_bytes, None),
+        threads
+    );
+
+    // 8 GB budget on a 192-core host → capped to budget/per_block (= 16), NOT 192.
+    let budget = 8u64 * 1024 * 1024 * 1024;
+    let c = grouped_fast_concurrency(threads, block_byte_cap, per_nnz_bytes, Some(budget));
+    assert_eq!(c, (budget / per_block) as usize);
+    assert!(c < threads, "budget must cap concurrency below core count");
+    assert!(
+        (c as u64) * per_block <= budget,
+        "concurrency × per-block transient ({}) must fit budget ({budget})",
+        (c as u64) * per_block
+    );
+
+    // Tiny budget → at least 1 block (parity with the one-block-at-a-time emitter).
+    assert_eq!(
+        grouped_fast_concurrency(threads, block_byte_cap, per_nnz_bytes, Some(1)),
+        1
+    );
+
+    // Sub-flush disabled (cap 0) with a budget → whole-shard blocks, size unknown
+    // here, so bound to one at a time (NOT left uncapped at `threads`).
+    assert_eq!(
+        grouped_fast_concurrency(threads, 0, per_nnz_bytes, Some(budget)),
+        1
+    );
+    // Sub-flush disabled (cap 0) with no budget → full threads (unchanged).
+    assert_eq!(
+        grouped_fast_concurrency(threads, 0, per_nnz_bytes, None),
+        threads
+    );
+}
+
 /// T1.4 — the fast path is X-only; layers and obsp continue through the existing
 /// row-by-row path and must still be reordered correctly under a grouped sort
 /// (with X sub-flushing across blocks).
