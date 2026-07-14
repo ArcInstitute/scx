@@ -614,6 +614,7 @@ pub fn sort_with_strategy(
             opts.codec,
             opts.bitmap,
             block_byte_cap,
+            opts.memory_budget,
         )?
     } else {
         let mut x_emitter = CsrEmitter::new(
@@ -1456,6 +1457,40 @@ fn emit_x_in_memory(
     Ok(())
 }
 
+/// Cap the grouped-write fast path's parallel `concurrency` so its **total** peak
+/// transient honors `--memory-budget` (H1).
+///
+/// Each in-flight block holds gather buffers (u32 index + f32 value =
+/// [`GROUP_BYTES_PER_NNZ`] bytes per nnz) plus ~1× that again for the encoded
+/// output, over the `nnz ≈ block_byte_cap / per_nnz_bytes` a full block holds at
+/// the cap — i.e. `per_block ≈ 2 × GROUP_BYTES_PER_NNZ × block_byte_cap /
+/// per_nnz_bytes` (`2× block_byte_cap` for f32, `~3.2×` for uint8). We cap
+/// `concurrency` to `budget / per_block` (min 1), so `concurrency × per_block ≤
+/// budget`; concurrency 1 gives parity with the one-block-at-a-time `CsrEmitter`.
+///
+/// `None` budget keeps the full rayon-thread concurrency (the user opted out of
+/// budgeting). `block_byte_cap == 0` (sub-flush disabled) can't reach here with a
+/// budget set — the grouped-shard guard hard-errors first — but the guard also
+/// avoids a divide-by-zero.
+fn grouped_fast_concurrency(
+    threads: usize,
+    block_byte_cap: u64,
+    per_nnz_bytes: u64,
+    memory_budget: Option<u64>,
+) -> usize {
+    match memory_budget {
+        Some(budget) if block_byte_cap > 0 && per_nnz_bytes > 0 => {
+            let nnz_per_block = (block_byte_cap / per_nnz_bytes).max(1);
+            let per_block = (2 * GROUP_BYTES_PER_NNZ)
+                .saturating_mul(nnz_per_block)
+                .max(1);
+            let by_budget = (budget / per_block).max(1) as usize;
+            threads.min(by_budget)
+        }
+        _ => threads,
+    }
+}
+
 /// In-memory grouped-write fast path (X only).
 ///
 /// Reads the source CSR once, computes the output shard/block boundaries up
@@ -1478,10 +1513,15 @@ fn emit_x_in_memory(
 /// so at most ~`concurrency` blocks' gather + encoded buffers are in flight on
 /// top of the resident source CSR — O(concurrency × block cap), independent of
 /// the block count (it does NOT buffer the whole encoded matrix). `block_byte_cap`
-/// is clamped to `--memory-budget` upstream, and `RAYON_NUM_THREADS` caps
-/// `concurrency`, so the peak stays bounded. Returns the emitted
-/// `[row_start, row_stop)` ranges (what `CsrEmitter::ranges` would hold) for the
-/// GroupIndex write-back.
+/// is clamped to `--memory-budget` upstream, which bounds a *single* block's
+/// transient. The **total** peak is `concurrency × per-block transient`, so when a
+/// `memory_budget` is set `concurrency` is additionally capped to
+/// `budget / per-block transient` (see [`grouped_fast_concurrency`]) — otherwise a
+/// many-core host would run `rayon::current_num_threads()` blocks in flight and
+/// blow past the budget by that factor (the F6 OOM fix would be defeated by
+/// default). With no budget the concurrency is only bounded by the rayon pool
+/// (`RAYON_NUM_THREADS`). Returns the emitted `[row_start, row_stop)` ranges (what
+/// `CsrEmitter::ranges` would hold) for the GroupIndex write-back.
 #[allow(clippy::too_many_arguments)]
 fn emit_x_in_memory_grouped_fast(
     reader: &ScxReader,
@@ -1493,6 +1533,7 @@ fn emit_x_in_memory_grouped_fast(
     codec: CodecSelection,
     bitmap: BitmapPolicy,
     block_byte_cap: u64,
+    memory_budget: Option<u64>,
 ) -> Result<Vec<(u64, u64)>> {
     let csr = reader.read_all_csr_shards()?;
     let n_obs = order_old.len();
@@ -1560,7 +1601,16 @@ fn emit_x_in_memory_grouped_fast(
         1
     };
     let framing = writer.framing();
-    let concurrency = rayon::current_num_threads().max(1);
+    // Total peak is `concurrency × per-block transient`, so cap `concurrency` by
+    // the budget (H1). Without this, a many-core host runs
+    // `rayon::current_num_threads()` blocks in flight and overshoots the budget by
+    // that factor even though each block is individually budget-clamped.
+    let concurrency = grouped_fast_concurrency(
+        rayon::current_num_threads().max(1),
+        block_byte_cap,
+        per_nnz_bytes,
+        memory_budget,
+    );
 
     let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(blocks.len());
     let mut base: usize = 0;
