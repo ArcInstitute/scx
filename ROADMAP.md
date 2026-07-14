@@ -290,6 +290,21 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [x] Seurat v5 assay integration
 - [x] SingleCellExperiment interop
 - [x] Harmony batch correction in R (see `rscx/R/harmony.R`)
+- [x] Codec intent axis (`auto`/`fast`/`compact` + explicit codecs) on
+  `from_seurat` / `from_sce` / `from_mae` via the shared
+  `scx_format::resolve_codec` (single-modality **and** multimodal write paths),
+  plus a `row_group_rows` framing knob. R defaults to v4-framed adaptive `auto`,
+  matching pyscx/CLI.
+
+**R parity — intentional gaps (defer):** the following pyscx/CLI write-side knobs
+are not exposed in R and are tracked here rather than implemented:
+- Streaming-convert threading (`reader_threads` / `writer_queue_depth`): R has no
+  streaming-convert entry (the `from_*` importers materialize in memory).
+- Grouped-write args (`group_by` / `reference`): R exposes the F2 *reads*
+  (`read_group` / `read_reference` / `group_labels`) but not the write side.
+- Accel `device=` selector: `rscx` accelerators are CPU-only.
+- `scx_append(codec=)` accepts `Auto`/explicit only (not the `fast`/`compact`
+  intent axis, which is a rewrite-path concern in `scx-ops`).
 
 ### 3.4 Multimodal Support — SHIPPED
 - [x] Format v2 bump; carve `n_modalities` /

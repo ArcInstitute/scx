@@ -357,27 +357,31 @@ scx_nb_glm_matrix <- function(counts, design, contrast_index, size_factors,
 # ── Import functions (interop module) ──────────────────────────
 #' @export
 from_seurat <- function(seurat_obj, output_path, codec = NULL,
-                        csc = FALSE, csc_cols_per_shard = 5000L) {
+                        csc = FALSE, csc_cols_per_shard = 5000L,
+                        row_group_rows = NULL) {
   invisible(.Call(
     wrap__from_seurat,
     seurat_obj,
     output_path,
     if (is.null(codec)) NULL else as.character(codec),
     as.logical(csc),
-    as.integer(csc_cols_per_shard)
+    as.integer(csc_cols_per_shard),
+    if (is.null(row_group_rows)) NULL else as.integer(row_group_rows)
   ))
 }
 
 #' @export
 from_sce <- function(sce_obj, output_path, codec = NULL,
-                     csc = FALSE, csc_cols_per_shard = 5000L) {
+                     csc = FALSE, csc_cols_per_shard = 5000L,
+                     row_group_rows = NULL) {
   invisible(.Call(
     wrap__from_sce,
     sce_obj,
     output_path,
     if (is.null(codec)) NULL else as.character(codec),
     as.logical(csc),
-    as.integer(csc_cols_per_shard)
+    as.integer(csc_cols_per_shard),
+    if (is.null(row_group_rows)) NULL else as.integer(row_group_rows)
   ))
 }
 
@@ -386,14 +390,16 @@ from_sce <- function(sce_obj, output_path, codec = NULL,
 # a clear message on mismatch.
 #' @export
 from_mae <- function(mae_obj, output_path, codec = NULL,
-                     csc = FALSE, csc_cols_per_shard = 5000L) {
+                     csc = FALSE, csc_cols_per_shard = 5000L,
+                     row_group_rows = NULL) {
   invisible(.Call(
     wrap__from_mae,
     mae_obj,
     output_path,
     if (is.null(codec)) NULL else as.character(codec),
     as.logical(csc),
-    as.integer(csc_cols_per_shard)
+    as.integer(csc_cols_per_shard),
+    if (is.null(row_group_rows)) NULL else as.integer(row_group_rows)
   ))
 }
 

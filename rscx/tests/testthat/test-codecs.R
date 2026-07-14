@@ -100,3 +100,59 @@ test_that("scx_info returns metadata for all codec fixtures", {
     expect_equal(info$n_vars, 10)
   }
 })
+
+# --- Codec intent axis on the write path (E1) ---
+#
+# rscx `from_sce` / `from_seurat` / `from_mae` route through the shared
+# `scx_format::resolve_codec`, so R can request the same `auto` / `fast` /
+# `compact` profiles (and explicit codecs) as pyscx/CLI. These write a small SCE
+# with each profile, read it back, and assert values round-trip losslessly.
+
+skip_if_no_sce_codecs <- function() {
+  skip_if_not_installed("Matrix")
+  skip_if_not_installed("SingleCellExperiment")
+}
+
+# 6-gene x 8-cell integer count dgCMatrix (genes x cells, as SCE stores).
+codec_count_sce <- function() {
+  set.seed(1)
+  dense <- matrix(rpois(6 * 8, lambda = 3), nrow = 6, ncol = 8)
+  m <- Matrix::Matrix(dense, sparse = TRUE)
+  SingleCellExperiment::SingleCellExperiment(assays = list(counts = m))
+}
+
+test_that("from_sce accepts the codec intent axis and round-trips losslessly", {
+  skip_if_no_sce_codecs()
+  sce <- codec_count_sce()
+
+  # Reference: explicit zstd (a plain lossless codec).
+  ref_path <- tempfile(fileext = ".scx")
+  from_sce(sce, ref_path, codec = "zstd")
+  ref_mat <- as.matrix(scx_open(ref_path)$x_matrix())
+
+  for (codec in c("auto", "fast", "compact")) {
+    path <- tempfile(fileext = ".scx")
+    expect_no_error(from_sce(sce, path, codec = codec))
+    expect_true(scx_validate(path), info = paste("validate failed for", codec))
+    mat <- as.matrix(scx_open(path)$x_matrix())
+    expect_equal(mat, ref_mat, info = paste("values diverged for codec", codec))
+  }
+})
+
+test_that("codec='compact' with row_group_rows=0 errors cleanly (no session abort)", {
+  skip_if_no_sce_codecs()
+  sce <- codec_count_sce()
+  expect_error(
+    from_sce(sce, tempfile(fileext = ".scx"), codec = "compact", row_group_rows = 0L),
+    "requires row_group_rows"
+  )
+})
+
+test_that("unknown codec name errors via resolve_codec", {
+  skip_if_no_sce_codecs()
+  sce <- codec_count_sce()
+  expect_error(
+    from_sce(sce, tempfile(fileext = ".scx"), codec = "bogus"),
+    "codec|bogus"
+  )
+})

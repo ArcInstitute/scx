@@ -988,21 +988,57 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
 
 // ─── Shared SCX writer helper ────────────────────────────────────────────────
 
-/// Parse a codec name from R to an Option<CodecId>.
-fn parse_codec_r(codec: Option<&str>) -> Result<Option<scx_codec::CodecId>> {
-    use scx_codec::CodecId;
-    match codec {
-        None | Some("auto") => Ok(None),
-        Some("none") => Ok(Some(CodecId::None)),
-        Some("scx1") => Ok(Some(CodecId::Scx1)),
-        Some("zstd") => Ok(Some(CodecId::Zstd)),
-        Some("lz4") => Ok(Some(CodecId::Lz4Shuffle)),
-        Some("pcodec") => Ok(Some(CodecId::Pcodec)),
-        Some("shufdelta") => Ok(Some(CodecId::ShufDeltaZstd)),
-        Some(other) => Err(Error::Other(format!(
-            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'zstd', 'lz4', 'pcodec', or 'shufdelta'.",
-            other
+/// The framed-write knobs a codec-intent string resolves to, mirroring the
+/// pyscx / scx-cli write paths (`scx_format::resolve_codec`).
+struct ResolvedWrite {
+    /// Concrete codec, or `None` for adaptive/heuristic per-shard selection.
+    explicit_codec: Option<scx_codec::CodecId>,
+    /// Row-group framing (carrying the adaptive `decode_target` / `trial`
+    /// bias); `None` = legacy unframed single-encode.
+    framing: Option<scx_format_io::FramingConfig>,
+}
+
+/// Resolve an R-supplied codec string through the shared
+/// [`scx_format::resolve_codec`] intent axis (`auto`/`fast`/`compact`/
+/// `compact-trial`, or an explicit `none`/`scx1`/`zstd`/`lz4`/`pcodec`/
+/// `shufdelta`). This is the single codec-resolution surface for the rscx write
+/// path — it no longer maintains a private codec vocabulary — so R gets the same
+/// cost-aware adaptive `auto` and `fast`/`compact` profiles as pyscx/CLI.
+///
+/// `row_group_rows` enables row-group framing (default 256 at the `from_*`
+/// entry points, matching pyscx/CLI); `0` opts out of framing, which the
+/// framing-required profiles (`compact`/`compact-trial`) reject.
+fn resolve_write_codec(codec: Option<&str>, row_group_rows: u32) -> Result<ResolvedWrite> {
+    let resolved = scx_format_io::resolve_codec(codec).map_err(Error::Other)?;
+    if resolved.requires_framing && row_group_rows == 0 {
+        return Err(Error::Other(format!(
+            "codec='{}' requires row_group_rows > 0 (row-group framing); pass a \
+             positive row_group_rows or use codec='auto'/'fast'.",
+            resolved.profile
+        )));
+    }
+    let framing = (row_group_rows > 0).then_some(scx_format_io::FramingConfig {
+        row_group_rows,
+        target_nnz: None,
+        trial: resolved.codec_trial,
+        decode_target: resolved.decode_target,
+    });
+    Ok(ResolvedWrite {
+        explicit_codec: resolved.explicit_codec,
+        framing,
+    })
+}
+
+/// Normalize the R `row_group_rows` arg to a `u32`. `NULL` (None) defaults to
+/// framing-on at [`scx_format_io::DEFAULT_ROW_GROUP_ROWS`] (256, matching
+/// pyscx/CLI); `0L` opts out of framing; negatives error.
+fn parse_row_group_rows(row_group_rows: Option<i32>) -> Result<u32> {
+    match row_group_rows {
+        None => Ok(scx_format_io::DEFAULT_ROW_GROUP_ROWS),
+        Some(v) if v < 0 => Err(Error::Other(format!(
+            "row_group_rows must be >= 0, got {v}"
         ))),
+        Some(v) => Ok(v as u32),
     }
 }
 
@@ -1030,29 +1066,58 @@ fn write_csr_to_scx(
     obs_batch: &RecordBatch,
     var_batch: &RecordBatch,
     explicit_codec: Option<scx_codec::CodecId>,
+    framing: Option<scx_format_io::FramingConfig>,
     csc_always: bool,
     csc_cols_per_shard: usize,
 ) -> Result<()> {
     use scx_codec::CodecId;
+    use scx_format_io::encoder::encode_one_shard_from_bytes;
     use scx_format_io::header::FileHeader;
+    use scx_format_io::section::SectionType;
     use scx_format_io::writer::ScxWriter;
     use scx_format_io::{select_codec_for_modality, ModalityType};
 
     let nnz = *csr_indptr.last().unwrap_or(&0);
     let shard_target_rows: usize = 16384;
     let n_shards = n_obs.div_ceil(shard_target_rows.max(1));
+    let bw = value_encoding.byte_width();
+    let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
 
-    let header = FileHeader {
+    // Representative file-level codec hint (informational — `scx info` reports the
+    // true per-shard breakdown for adaptive/mixed-codec files). Mirror pyscx:
+    // derive from the first shard's heuristic when the codec is adaptive.
+    let first_row_end = shard_target_rows.min(n_obs);
+    let header_codec = match explicit_codec {
+        Some(c) if c == CodecId::Scx1 && !value_encoding.is_integer() => CodecId::Zstd,
+        Some(c) => c,
+        None if n_obs > 0 => {
+            let first_bytes = (csr_indptr[first_row_end] as usize) * bw;
+            select_codec_for_modality(
+                &values_bytes[..first_bytes],
+                value_encoding,
+                ModalityType::Rna,
+            )
+        }
+        None => CodecId::None,
+    };
+
+    let mut header = FileHeader {
         n_obs: n_obs as u64,
         n_vars: n_vars as u64,
         nnz,
         n_csr_shards: n_shards as u32,
         shard_target_rows: shard_target_rows as u32,
-        codec_id: CodecId::None as u8,
-        index_dtype: if n_vars <= 65535 { 0 } else { 1 },
+        codec_id: header_codec as u8,
+        index_dtype,
         manifest_sequence: 1,
         ..Default::default()
     };
+    // Row-group framing produces v4/shard-v2 shards; stamp the file v4 so old
+    // readers reject it and the v4 write-guard admits the framed shards (mirrors
+    // pyscx `from_anndata` and the streaming convert pipeline).
+    if framing.is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(output_path, header)
         .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
@@ -1064,11 +1129,11 @@ fn write_csr_to_scx(
         .write_var(var_batch)
         .map_err(|e| Error::Other(format!("write_var failed: {}", e)))?;
 
-    let bw = value_encoding.byte_width();
     let mut row_start: usize = 0;
-    // Track the last shard's resolved codec; reused for the optional
-    // CSC sidecar so the two layouts share encoder semantics.
-    let mut last_csr_codec = CodecId::None;
+    let mut shard_idx: u32 = 0;
+    // Track the last shard's resolved codec; reused for the optional CSC sidecar
+    // so the two layouts share encoder semantics.
+    let mut last_csr_codec = header_codec;
     while row_start < n_obs {
         let row_end = (row_start + shard_target_rows).min(n_obs);
 
@@ -1083,34 +1148,35 @@ fn write_csr_to_scx(
         let shard_indices: Vec<u32> = csr_indices[nnz_start..nnz_end].to_vec();
         let shard_values = &values_bytes[nnz_start * bw..nnz_end * bw];
 
-        let codec = match explicit_codec {
-            Some(c) => {
-                if c == CodecId::Scx1 && !value_encoding.is_integer() {
-                    CodecId::Zstd
-                } else {
-                    c
-                }
-            }
-            None => select_codec_for_modality(shard_values, value_encoding, ModalityType::Rna),
-        };
-        last_csr_codec = codec;
-
+        // Route through the shared adaptive encoder so R participates in the
+        // codec intent axis (cost-aware `auto`, `fast`, `compact`) identically to
+        // pyscx/CLI. Byte-oriented so counts serialized f64→uN keep >2^24 values.
+        let section = encode_one_shard_from_bytes(
+            &shard_indptr,
+            &shard_indices,
+            shard_values,
+            value_encoding,
+            explicit_codec,
+            index_dtype,
+            n_vars as u32,
+            row_start as u64,
+            SectionType::CsrShard,
+            ModalityType::Rna,
+            format!("X_shard_{shard_idx}"),
+            framing,
+        )
+        .map_err(|e| Error::Other(format!("encode X shard {shard_idx} failed: {}", e)))?;
+        last_csr_codec = CodecId::from_u8(section.codec_id()).unwrap_or(last_csr_codec);
         writer
-            .write_csr_shard(
-                &shard_indptr,
-                &shard_indices,
-                shard_values,
-                codec,
-                value_encoding,
-                row_start as u64,
-            )
+            .write_preencoded_shard(section)
             .map_err(|e| Error::Other(format!("write_csr_shard failed: {}", e)))?;
 
         row_start = row_end;
+        shard_idx += 1;
     }
 
     // Optional CSC sidecar — streaming transpose over the full
-    // in-memory CSR matrix.
+    // in-memory CSR matrix. Framed to match the CSR layout under v4.
     if csc_always && n_obs > 0 && n_vars > 0 {
         write_csc_shards_from_csr_r(
             &mut writer,
@@ -1122,6 +1188,7 @@ fn write_csr_to_scx(
             n_vars,
             last_csr_codec,
             csc_cols_per_shard,
+            framing,
         )?;
     }
 
@@ -1149,6 +1216,7 @@ fn write_csc_shards_from_csr_r(
     n_vars: usize,
     codec_id: scx_codec::CodecId,
     csc_cols_per_shard: usize,
+    framing: Option<scx_format_io::FramingConfig>,
 ) -> Result<()> {
     // Decode raw value bytes to f32 once (the streaming iterator works
     // on f32 data internally).
@@ -1169,7 +1237,10 @@ fn write_csc_shards_from_csr_r(
         csc_cols_per_shard,
         scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
-        None, // framing: rscx CSC is unframed (no row-group kwarg)
+        // Keep the CSC sidecar's framing consistent with the CSR X shards (both
+        // framed under v4). The v4 write-guard exempts CscShard, so this is for
+        // layout parity with pyscx, not a correctness requirement.
+        framing,
     )
     .map_err(|e| Error::Other(format!("CSC sidecar write failed: {}", e)))
 }
@@ -1242,6 +1313,7 @@ pub fn from_seurat(
     codec: Option<&str>,
     csc: Option<bool>,
     csc_cols_per_shard: Option<i32>,
+    row_group_rows: Option<i32>,
 ) -> Robj {
     // Returns `Robj` and throws a clean R error via `throw_on_err`: a fallible
     // `#[extendr]` fn would otherwise `unwrap()`-panic in extendr 0.8.0, masking
@@ -1252,6 +1324,7 @@ pub fn from_seurat(
         codec,
         csc,
         csc_cols_per_shard,
+        row_group_rows,
     ))
 }
 
@@ -1261,8 +1334,11 @@ fn from_seurat_impl(
     codec: Option<&str>,
     csc: Option<bool>,
     csc_cols_per_shard: Option<i32>,
+    row_group_rows: Option<i32>,
 ) -> Result<()> {
-    let explicit_codec = parse_codec_r(codec)?;
+    let resolved = resolve_write_codec(codec, parse_row_group_rows(row_group_rows)?)?;
+    let explicit_codec = resolved.explicit_codec;
+    let framing = resolved.framing;
     let csc_always = csc.unwrap_or(false);
     let csc_cols_per_shard = csc_cols_per_shard
         .map(|v| {
@@ -1305,6 +1381,7 @@ fn from_seurat_impl(
             &assay_names_vec,
             output_path,
             explicit_codec,
+            framing,
             csc_always,
             csc_cols_per_shard,
         );
@@ -1363,6 +1440,7 @@ fn from_seurat_impl(
         &obs_batch,
         &var_batch,
         explicit_codec,
+        framing,
         csc_always,
         csc_cols_per_shard,
     )
@@ -1380,6 +1458,7 @@ pub fn from_sce(
     codec: Option<&str>,
     csc: Option<bool>,
     csc_cols_per_shard: Option<i32>,
+    row_group_rows: Option<i32>,
 ) -> Robj {
     // Returns `Robj`, throws cleanly via `throw_on_err` (see `from_seurat`, B3/B7).
     crate::util::throw_on_err(from_sce_impl(
@@ -1388,6 +1467,7 @@ pub fn from_sce(
         codec,
         csc,
         csc_cols_per_shard,
+        row_group_rows,
     ))
 }
 
@@ -1397,8 +1477,11 @@ fn from_sce_impl(
     codec: Option<&str>,
     csc: Option<bool>,
     csc_cols_per_shard: Option<i32>,
+    row_group_rows: Option<i32>,
 ) -> Result<()> {
-    let explicit_codec = parse_codec_r(codec)?;
+    let resolved = resolve_write_codec(codec, parse_row_group_rows(row_group_rows)?)?;
+    let explicit_codec = resolved.explicit_codec;
+    let framing = resolved.framing;
     let csc_always = csc.unwrap_or(false);
     let csc_cols_per_shard = csc_cols_per_shard
         .map(|v| {
@@ -1456,6 +1539,7 @@ fn from_sce_impl(
         &obs_batch,
         &var_batch,
         explicit_codec,
+        framing,
         csc_always,
         csc_cols_per_shard,
     )
@@ -1471,11 +1555,14 @@ fn from_seurat_multi_assay(
     assay_names: &[String],
     output_path: &str,
     explicit_codec: Option<scx_codec::CodecId>,
+    framing: Option<scx_format_io::FramingConfig>,
     csc_always: bool,
     csc_cols_per_shard: usize,
 ) -> Result<()> {
     use scx_codec::CodecId;
+    use scx_format_io::encoder::encode_one_shard_from_bytes;
     use scx_format_io::header::FileHeader;
+    use scx_format_io::section::SectionType;
     use scx_format_io::writer::ScxWriter;
     use scx_format_io::{select_codec_for_modality, ModalityType};
 
@@ -1567,7 +1654,7 @@ fn from_seurat_multi_assay(
     // n_csc_shards — are all stamped by `ScxWriter::finish` from the registered
     // modalities + `write_csr_shard_for` calls, so the constructor only needs
     // to seed the matrix dims here.
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         n_obs as u64,
         max_n_vars,
         0,
@@ -1575,6 +1662,10 @@ fn from_seurat_multi_assay(
         CodecId::None as u8,
         if max_n_vars <= 65535 { 0 } else { 1 },
     );
+    // Framed shards are v4/shard-v2 (mirrors the single-modality path).
+    if framing.is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
     let mut writer = ScxWriter::new(output_path, header)
         .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
 
@@ -1620,9 +1711,13 @@ fn from_seurat_multi_assay(
         writer
             .write_var_for(modality_id, &payload.var_batch)
             .map_err(|e| Error::Other(format!("write_var_for failed: {}", e)))?;
+        let _ = resolved_codec; // recorded on the modality table above; per-shard
+                                // codec is chosen adaptively by the encoder below.
 
         let bw = payload.value_encoding.byte_width();
+        let index_dtype: u8 = if payload.n_vars <= 65535 { 0 } else { 1 };
         let mut row_start: usize = 0;
+        let mut shard_idx: u32 = 0;
         while row_start < payload.n_obs {
             let row_end = (row_start + shard_target_rows).min(payload.n_obs);
             let base = payload.csr_indptr[row_start];
@@ -1634,18 +1729,31 @@ fn from_seurat_multi_assay(
             let nnz_end = payload.csr_indptr[row_end] as usize;
             let shard_indices: Vec<u32> = payload.csr_indices[nnz_start..nnz_end].to_vec();
             let shard_values = &payload.values_bytes[nnz_start * bw..nnz_end * bw];
+            // Adaptive framed encode per modality (name mirrors
+            // `write_csr_shard_for`), then a modality-scoped preencoded write so
+            // R's multimodal path shares the codec intent axis with pyscx/CLI.
+            let section = encode_one_shard_from_bytes(
+                &shard_indptr,
+                &shard_indices,
+                shard_values,
+                payload.value_encoding,
+                explicit_codec,
+                index_dtype,
+                payload.n_vars as u32,
+                row_start as u64,
+                SectionType::CsrShard,
+                payload.modality_type,
+                format!("X/{}/shard_{}", payload.name, shard_idx),
+                framing,
+            )
+            .map_err(|e| Error::Other(format!("encode modality shard failed: {}", e)))?;
             writer
-                .write_csr_shard_for(
-                    modality_id,
-                    &shard_indptr,
-                    &shard_indices,
-                    shard_values,
-                    resolved_codec,
-                    payload.value_encoding,
-                    row_start as u64,
-                )
-                .map_err(|e| Error::Other(format!("write_csr_shard_for failed: {}", e)))?;
+                .with_modality(modality_id, |this| this.write_preencoded_shard(section))
+                .map_err(|e: scx_format_io::ScxError| {
+                    Error::Other(format!("write_csr_shard_for failed: {}", e))
+                })?;
             row_start = row_end;
+            shard_idx += 1;
         }
     }
 
@@ -1788,6 +1896,7 @@ pub fn from_mae(
     codec: Option<&str>,
     csc: Option<bool>,
     csc_cols_per_shard: Option<i32>,
+    row_group_rows: Option<i32>,
 ) -> Robj {
     // Returns `Robj`, throws cleanly via `throw_on_err` (see `from_seurat`, B3/B7).
     crate::util::throw_on_err(from_mae_impl(
@@ -1796,6 +1905,7 @@ pub fn from_mae(
         codec,
         csc,
         csc_cols_per_shard,
+        row_group_rows,
     ))
 }
 
@@ -1805,8 +1915,11 @@ fn from_mae_impl(
     codec: Option<&str>,
     csc: Option<bool>,
     csc_cols_per_shard: Option<i32>,
+    row_group_rows: Option<i32>,
 ) -> Result<()> {
-    let explicit_codec = parse_codec_r(codec)?;
+    let resolved = resolve_write_codec(codec, parse_row_group_rows(row_group_rows)?)?;
+    let explicit_codec = resolved.explicit_codec;
+    let framing = resolved.framing;
     let csc_always = csc.unwrap_or(false);
     let csc_cols_per_shard = csc_cols_per_shard
         .map(|v| {
@@ -1893,7 +2006,9 @@ fn from_mae_impl(
     let _ = csc_cols_per_shard;
 
     use scx_codec::CodecId;
+    use scx_format_io::encoder::encode_one_shard_from_bytes;
     use scx_format_io::header::FileHeader;
+    use scx_format_io::section::SectionType;
     use scx_format_io::writer::ScxWriter;
     use scx_format_io::{select_codec_for_modality, ModalityType};
 
@@ -1964,7 +2079,7 @@ fn from_mae_impl(
 
     let n_obs = shared_n_obs.unwrap_or(0);
     let max_n_vars = payloads.iter().map(|p| p.n_vars).max().unwrap_or(0) as u64;
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         n_obs as u64,
         max_n_vars,
         0,
@@ -1972,6 +2087,10 @@ fn from_mae_impl(
         CodecId::None as u8,
         if max_n_vars <= 65535 { 0 } else { 1 },
     );
+    // Framed shards are v4/shard-v2 (mirrors the single-modality path).
+    if framing.is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
     let mut writer = ScxWriter::new(output_path, header)
         .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
     writer
@@ -2010,9 +2129,13 @@ fn from_mae_impl(
         writer
             .write_var_for(modality_id, &payload.var_batch)
             .map_err(|e| Error::Other(format!("write_var_for failed: {}", e)))?;
+        let _ = resolved_codec; // recorded on the modality table above; per-shard
+                                // codec is chosen adaptively by the encoder below.
 
         let bw = payload.value_encoding.byte_width();
+        let index_dtype: u8 = if payload.n_vars <= 65535 { 0 } else { 1 };
         let mut row_start: usize = 0;
+        let mut shard_idx: u32 = 0;
         while row_start < payload.n_obs {
             let row_end = (row_start + shard_target_rows).min(payload.n_obs);
             let base = payload.csr_indptr[row_start];
@@ -2024,18 +2147,31 @@ fn from_mae_impl(
             let nnz_end = payload.csr_indptr[row_end] as usize;
             let shard_indices: Vec<u32> = payload.csr_indices[nnz_start..nnz_end].to_vec();
             let shard_values = &payload.values_bytes[nnz_start * bw..nnz_end * bw];
+            // Adaptive framed encode per modality (name mirrors
+            // `write_csr_shard_for`), then a modality-scoped preencoded write so
+            // R's multimodal path shares the codec intent axis with pyscx/CLI.
+            let section = encode_one_shard_from_bytes(
+                &shard_indptr,
+                &shard_indices,
+                shard_values,
+                payload.value_encoding,
+                explicit_codec,
+                index_dtype,
+                payload.n_vars as u32,
+                row_start as u64,
+                SectionType::CsrShard,
+                payload.modality_type,
+                format!("X/{}/shard_{}", payload.name, shard_idx),
+                framing,
+            )
+            .map_err(|e| Error::Other(format!("encode modality shard failed: {}", e)))?;
             writer
-                .write_csr_shard_for(
-                    modality_id,
-                    &shard_indptr,
-                    &shard_indices,
-                    shard_values,
-                    resolved_codec,
-                    payload.value_encoding,
-                    row_start as u64,
-                )
-                .map_err(|e| Error::Other(format!("write_csr_shard_for failed: {}", e)))?;
+                .with_modality(modality_id, |this| this.write_preencoded_shard(section))
+                .map_err(|e: scx_format_io::ScxError| {
+                    Error::Other(format!("write_csr_shard_for failed: {}", e))
+                })?;
             row_start = row_end;
+            shard_idx += 1;
         }
     }
 

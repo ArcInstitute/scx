@@ -106,6 +106,32 @@ and `assume_identical_var`/`sort_by` on merge, `codec`/`shard_size`/`modality` o
 append, `reshape_obs` on compact). `shard_target_rows` is inherited from the
 input; CSC sidecars are dropped by these ops (rebuild separately).
 
+## Codecs and framing on import
+
+`from_seurat()` / `from_sce()` / `from_mae()` take the same `codec` intent axis
+as `pyscx.from_anndata` and the `scx` CLI:
+
+```r
+from_seurat(seu, "auto.scx")                       # default: cost-aware adaptive
+from_seurat(seu, "fast.scx",    codec = "fast")     # decode-optimized heuristic
+from_seurat(seu, "compact.scx", codec = "compact")  # size-optimized (adaptive ShufDeltaZstd)
+from_seurat(seu, "z.scx",       codec = "zstd")     # explicit codec
+from_seurat(seu, "u.scx",       row_group_rows = 0L)  # opt out of row-group framing
+```
+
+`codec` accepts `"auto"` (default), `"fast"`, `"compact"`, or an explicit
+`"none"`/`"scx1"`/`"zstd"`/`"lz4"`/`"pcodec"`/`"shufdelta"`, resolved by the same
+`scx_format::resolve_codec` used everywhere else. `row_group_rows` (default 256)
+controls row-group framing; the defaults produce v4-framed files matching
+pyscx/CLI.
+
+**Parity note.** A few pyscx/CLI write-side knobs are intentionally not exposed
+in R (tracked in `ROADMAP.md` § 3.3): streaming-convert threading
+(`reader_threads`/`writer_queue_depth`), grouped-write args (`group_by` /
+`reference` — R has the F2 *reads* `read_group`/`read_reference` only), and the
+accel `device=` selector (rscx accelerators are CPU-only). Use the `scx` CLI or
+pyscx when you need those.
+
 ## Backed (out-of-core) access
 
 `exp$x_matrix()` materialises the whole matrix in memory. For atlas-scale files
