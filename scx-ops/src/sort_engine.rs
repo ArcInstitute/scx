@@ -1469,9 +1469,13 @@ fn emit_x_in_memory(
 /// budget`; concurrency 1 gives parity with the one-block-at-a-time `CsrEmitter`.
 ///
 /// `None` budget keeps the full rayon-thread concurrency (the user opted out of
-/// budgeting). `block_byte_cap == 0` (sub-flush disabled) can't reach here with a
-/// budget set — the grouped-shard guard hard-errors first — but the guard also
-/// avoids a divide-by-zero.
+/// budgeting). When a budget **is** set but the sub-flush is disabled
+/// (`block_byte_cap == 0`, i.e. `--group-write-block-bytes 0`), each block is a
+/// whole shard whose byte size isn't known here, so concurrency falls back to 1
+/// (the one-block-at-a-time `CsrEmitter` bound) rather than being left uncapped —
+/// the `InMemory` strategy gate guarantees a single shard fits the budget, so
+/// peak stays ~≤ 2× budget. (`per_nnz_bytes` is `4 + value_width` ≥ 5, never 0;
+/// the guard is defensive.)
 fn grouped_fast_concurrency(
     threads: usize,
     block_byte_cap: u64,
@@ -1479,15 +1483,19 @@ fn grouped_fast_concurrency(
     memory_budget: Option<u64>,
 ) -> usize {
     match memory_budget {
+        // Sub-flush enabled: cap concurrency so `concurrency × per-block ≤ budget`.
         Some(budget) if block_byte_cap > 0 && per_nnz_bytes > 0 => {
             let nnz_per_block = (block_byte_cap / per_nnz_bytes).max(1);
             let per_block = (2 * GROUP_BYTES_PER_NNZ)
                 .saturating_mul(nnz_per_block)
                 .max(1);
-            let by_budget = (budget / per_block).max(1) as usize;
-            threads.min(by_budget)
+            // Compare in u64 before narrowing to avoid truncation on 32-bit usize.
+            let by_budget = (budget / per_block).max(1).min(threads as u64);
+            by_budget as usize
         }
-        _ => threads,
+        // Budget set, sub-flush disabled (whole-shard blocks): bound to one at a time.
+        Some(_) => 1,
+        None => threads,
     }
 }
 
@@ -1520,8 +1528,12 @@ fn grouped_fast_concurrency(
 /// many-core host would run `rayon::current_num_threads()` blocks in flight and
 /// blow past the budget by that factor (the F6 OOM fix would be defeated by
 /// default). With no budget the concurrency is only bounded by the rayon pool
-/// (`RAYON_NUM_THREADS`). Returns the emitted `[row_start, row_stop)` ranges (what
-/// `CsrEmitter::ranges` would hold) for the GroupIndex write-back.
+/// (`RAYON_NUM_THREADS`). Note the budget bounds the *transient*: total peak is
+/// the resident source CSR (≤ budget under the `InMemory` gate) plus the
+/// transient (≤ budget), i.e. up to ~2× budget — the documented `CsrEmitter`
+/// parity floor, not a per-call ceiling. Returns the emitted `[row_start,
+/// row_stop)` ranges (what `CsrEmitter::ranges` would hold) for the GroupIndex
+/// write-back.
 #[allow(clippy::too_many_arguments)]
 fn emit_x_in_memory_grouped_fast(
     reader: &ScxReader,

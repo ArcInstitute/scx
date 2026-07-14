@@ -85,8 +85,9 @@ impl ShardShuffler {
             group.sort_by_key(|&idx| sort_keys.get(idx).copied().unwrap_or(u64::MAX));
         }
 
-        // Sort groups by the minimum key within each group.
-        groups.sort_by_key(|group| {
+        // Sort groups by the minimum key within each group. `sort_by_cached_key`
+        // evaluates the per-group min once (not on every comparison).
+        groups.sort_by_cached_key(|group| {
             group
                 .iter()
                 .filter_map(|&idx| sort_keys.get(idx).copied())

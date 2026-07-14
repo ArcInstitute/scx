@@ -83,7 +83,7 @@ fn reconstruct_deletion_map(
             // DV key out of range or shard has no stats — cannot place it; skip.
             continue;
         };
-        deleted_global.extend(bitmap.iter().map(|local| rs + local as u64));
+        deleted_global.extend(bitmap.iter().map(|local| rs + (local as u64)));
     }
     if deleted_global.is_empty() {
         return std::collections::HashMap::new();

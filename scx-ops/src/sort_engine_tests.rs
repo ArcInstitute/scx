@@ -2004,9 +2004,15 @@ fn grouped_fast_concurrency_honors_budget() {
         1
     );
 
-    // Sub-flush disabled (cap 0) → no divide-by-zero, full threads.
+    // Sub-flush disabled (cap 0) with a budget → whole-shard blocks, size unknown
+    // here, so bound to one at a time (NOT left uncapped at `threads`).
     assert_eq!(
         grouped_fast_concurrency(threads, 0, per_nnz_bytes, Some(budget)),
+        1
+    );
+    // Sub-flush disabled (cap 0) with no budget → full threads (unchanged).
+    assert_eq!(
+        grouped_fast_concurrency(threads, 0, per_nnz_bytes, None),
         threads
     );
 }
