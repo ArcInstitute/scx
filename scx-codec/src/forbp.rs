@@ -469,7 +469,12 @@ pub fn forbp_decode_with_hint(
 /// benches / fuzz; the production Scx1 path always passes the exact nnz via
 /// [`forbp_decode_with_hint`]). A `frame_bits == 0` row is a zero-payload
 /// constant run whose nnz the stream does not otherwise bound, so this caps the
-/// allocation a hostile no-hint input can drive (~64 MiB of i32 output).
+/// allocation a hostile no-hint input can drive.
+///
+/// `1 << 24` (16.7M indices ≈ 64 MiB of i32 output) is chosen to sit far above
+/// any realistic no-hint decode — the largest such caller is the codec bench,
+/// well under a million indices — while keeping a hostile constant-run bounded
+/// to tens of MiB rather than the multi-GiB OOM the old `nnz <= 1` guard blocked.
 const FORBP_NO_HINT_MAX_NNZ: usize = 1 << 24;
 
 fn forbp_decode_inner(

@@ -60,9 +60,17 @@ pub(crate) fn prescan_framed_group_indptr(
         offsets.push(base);
         let g_rows = span.n_rows as usize;
         let g_indptr = scx_codec::decode_row_group_indptr_only(codec, span, indptr_bytes)?;
-        // decode_row_group_indptr_only returns exactly g_rows+1 entries (or an
-        // error), so the `[1..=g_rows]` slice can never panic.
-        debug_assert_eq!(g_indptr.len(), g_rows + 1);
+        // decode_row_group_indptr_only should return exactly g_rows+1 entries;
+        // validate explicitly (not just debug_assert) so a malformed frame that
+        // decoded a short indptr errors here instead of panicking the
+        // `[1..=g_rows]` slice in a release build.
+        if g_indptr.len() != g_rows + 1 {
+            return Err(GpuError::InvalidShard(format!(
+                "framed indptr: decoded {} entries, expected {}",
+                g_indptr.len(),
+                g_rows + 1
+            )));
+        }
         for &local in &g_indptr[1..=g_rows] {
             combined_indptr.push(base as i64 + local);
         }

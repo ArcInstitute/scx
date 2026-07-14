@@ -344,24 +344,6 @@ impl TrainingDataset {
     }
 }
 
-/// Multimodal training dataset.
-///
-/// Wraps N independent `TrainingPipeline` instances — one per requested
-/// modality — and yields per-batch dicts whose cell axes align across
-/// modalities. Cells (obs) are global across modalities, so all
-/// pipelines see the same `n_obs` and the same shuffler seed produces
-/// the same row ordering when their per-modality shard layouts agree
-/// (the standard CITE-seq / multiome writer guarantees this).
-///
-/// On `__next__`, returns
-/// `{"X": {modality_name: ndarray, ...}, "obs": {...}, "cell_indices": ndarray}`
-/// when constructed with `return_dict=True` (default), or a tuple
-/// `(X_modality_0, X_modality_1, ...)` when `return_dict=False`. The
-/// per-modality X arrays share the same `cell_indices` row ordering;
-/// the wrapper validates this on each batch and raises
-/// `RuntimeError` if the per-modality shufflers diverge (e.g. because
-/// the modalities have different shard layouts on disk — typically a
-/// writer / file-construction bug).
 /// Resolve the shared user overrides against [`LoaderConfig::default()`],
 /// filling the fields that vary per construction site (`hvg_indices`,
 /// `obs_columns`, `max_memory_mb`, `auto_memory_budget`, `modality_id`) from
@@ -459,6 +441,24 @@ fn check_uniform_modality_layouts(
     Ok(())
 }
 
+/// Multimodal training dataset.
+///
+/// Wraps N independent `TrainingPipeline` instances — one per requested
+/// modality — and yields per-batch dicts whose cell axes align across
+/// modalities. Cells (obs) are global across modalities, so all
+/// pipelines see the same `n_obs` and the same shuffler seed produces
+/// the same row ordering when their per-modality shard layouts agree
+/// (the standard CITE-seq / multiome writer guarantees this).
+///
+/// On `__next__`, returns
+/// `{"X": {modality_name: ndarray, ...}, "obs": {...}, "cell_indices": ndarray}`
+/// when constructed with `return_dict=True` (default), or a tuple
+/// `(X_modality_0, X_modality_1, ...)` when `return_dict=False`. The
+/// per-modality X arrays share the same `cell_indices` row ordering;
+/// the wrapper validates this on each batch and raises
+/// `RuntimeError` if the per-modality shufflers diverge (e.g. because
+/// the modalities have different shard layouts on disk — typically a
+/// writer / file-construction bug).
 #[pyclass]
 pub struct MultimodalTrainingDataset {
     /// One pipeline per requested modality, in the order the user
@@ -613,6 +613,8 @@ impl MultimodalTrainingDataset {
         // each modality already fit its own larger effective config).
         drop(reader);
         let names: Vec<String> = resolved.iter().map(|(n, _, _)| n.clone()).collect();
+        // Resolve `obs_columns` once (not per modality inside the map).
+        let obs_columns = obs_columns.unwrap_or_default();
         let base_configs: Vec<LoaderConfig> = resolved
             .iter()
             .zip(per_modality_mb)
@@ -631,7 +633,7 @@ impl MultimodalTrainingDataset {
                     pflog1ppf_c,
                     seed,
                     hvg_indices.clone(),
-                    obs_columns.clone().unwrap_or_default(),
+                    obs_columns.clone(),
                     modality_mb,
                     max_memory_mb.is_none(),
                     Some(*mid),
