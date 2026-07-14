@@ -56,14 +56,15 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
 /// When `index_options` requests one or more obs / var columns (or
 /// names a preset), the helper writes the matching `ObsPredicateIndex`
 /// / `VarPredicateIndex` sections after the obs / var sections and
-/// before `provenance`. The returned summary carries per-axis outcomes
-/// so the caller can emit user-facing warnings (see
-/// `scx-convert::pipeline::process_predicate_index_outcomes` for the
-/// reference outcome → `ConvertWarning` mapping).
+/// before `provenance`. The returned [`PredicateIndexBuildSummary`]
+/// carries per-axis outcomes so the caller can emit user-facing warnings
+/// on its own channel (see `scx-convert::pipeline::process_predicate_index_outcomes`
+/// for the reference outcome → `ConvertWarning` mapping).
 ///
 /// Multimodal merge currently cannot persist predicate-index sections
-/// per modality — the helper sets `summary.multimodal_skip` and the
-/// caller surfaces `ConvertWarning::PredicateIndexSkippedMultimodal`.
+/// per modality — the helper sets `summary.multimodal_skip` and leaves it
+/// to the caller to surface (e.g. as `scx-convert`'s
+/// `ConvertWarning::PredicateIndexSkippedMultimodal`).
 pub fn merge_with_index_options(
     input_paths: &[&Path],
     output_path: &Path,
