@@ -3739,6 +3739,7 @@ name = "scx-sparse"
 version = "0.11.3"
 dependencies = [
  "criterion",
+ "half",
  "log",
  "proptest",
  "rand 0.8.5",

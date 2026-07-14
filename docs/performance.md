@@ -1636,11 +1636,15 @@ in-process — so only size + wall are reported here.
 | chemogenetic_rgfp | **2.78** / 772 | 3.70 / 1081 | 4.74 / **392** |
 
 Read **speed** is roughly parity, dataset-dependent. Read **peak RSS** is
-shardad's clear win — its `to_anndata` materializes narrow uint16 CSR, while scx's
-`to_anndata` builds float32 CSR (the "in-decode dtype materialization" gap noted in
-the design comparison; scx's answer is its streaming accelerators, which never
-build full X — see below). On census_1m scx's f32 AnnData is ~2.3 GB vs shardad's
-uint16 ~0.55 GB.
+shardad's clear win — its `to_anndata` materializes narrow uint16 CSR directly.
+scx's `to_anndata` *does* expose the equivalent dtype/container API
+(`data_dtype=`, `container=`, `index_dtype=`), but it is implemented as a
+read-then-convert: every shard is decoded to a full-matrix float32 CSR first and
+*then* cast down, so a narrow `data_dtype=` request does not lower peak RSS (it is
+transiently higher, since the f32 buffer and the narrow copy coexist). shardad
+never builds the f32 intermediate. scx's structural answer at scale is instead its
+streaming accelerators, which never build full X — see below. On census_1m scx's
+default f32 AnnData is ~2.3 GB vs shardad's uint16 ~0.55 GB.
 
 ### Out-of-core streaming vs materialize — peak RSS (MB), the at-scale story
 
@@ -1720,7 +1724,7 @@ Features with no meaningful two-sided benchmark, reported as capability presence
 | Multimodal (CITE-seq / Multiome) | ✅ | ❌ |
 | R bindings (Seurat / SCE) | ✅ | ❌ (Python only) |
 | In-place mutation (append/delete/compact/merge) | ✅ | metadata-tail only (`update_obs`) |
-| In-decode dtype/density materialization | ❌ (`to_anndata` builds f32) | ✅ (`data_dtype=`, `container=`) |
+| In-decode dtype/density materialization | ⚠️ API present (`data_dtype=`/`container=`/`index_dtype=`), but read-then-convert (builds full f32 CSR first) → no peak-RSS reduction | ✅ (true in-decode narrow, direct to target dtype) |
 | Physical group-aligned (condition) sharding | approximated (sort + query pruning) | ✅ (native) |
 
 ### Takeaways
@@ -1743,7 +1747,12 @@ deep-narrow specialist on its home turf, and the projects' real difference is
 scope (a broad platform vs a focused perturbation-screen tool), not a one-sided
 performance gap. The clearest scx-specific perf win is **bounded out-of-core RAM
 at scale**; the clearest shardad-specific win is **lowest peak RSS for
-whole-matrix integer reads** via in-decode dtype narrowing (an ergonomics gap scx
-could close on the `to_anndata` path).
+whole-matrix integer reads** via in-decode dtype narrowing. scx already exposes
+the equivalent dtype/container API on `to_anndata`, but implements it as a
+read-then-convert (it assembles the full f32 CSR first, then casts), so it does
+not yet reduce peak RSS. Closing this requires a *true* in-decode narrow that
+assembles each shard directly into the target dtype's full-matrix buffer, never
+allocating the intermediate f32 matrix — a decode/assembly-path change (not the
+already-shipped Python-surface API).
 
 [#40]: https://github.com/ArcInstitute/shardad/issues/40

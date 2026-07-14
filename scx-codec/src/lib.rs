@@ -13,8 +13,9 @@ pub mod value_encoding;
 
 pub use byte_delta::{byte_delta_planes, byte_undelta_planes};
 pub use cast::{
-    checked_cast_indices, checked_cast_values, guard_f32_decode_loss, CastFromF32, CastFromI32,
-    F32_MAX_EXACT_INT,
+    checked_cast_f32_into, checked_cast_i32_into, checked_cast_indices, checked_cast_u32_into,
+    checked_cast_values, checked_cast_values_u32, guard_decode_loss_for, guard_f32_decode_loss,
+    CastFromF32, CastFromI32, CastFromU32, F32_MAX_EXACT_INT,
 };
 pub use dispatch::{
     decode_indptr_only, decode_row_group, decode_row_group_indptr_only, decode_shard,
