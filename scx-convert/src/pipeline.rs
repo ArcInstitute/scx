@@ -422,8 +422,8 @@ impl ConvertOptions {
 /// Build the `codec_selection` provenance value from a write's codec choice.
 /// Shared by the streaming coordinators and the pyscx in-memory writer so the
 /// stamp is identical across paths. `decode_target` is the internal mechanism
-/// behind the intent axis: `Auto` → `auto`, `Storage`/`Gpu` → `compact`,
-/// `Cpu` → `fast`.
+/// behind the adaptive intent profiles: `Auto` → `auto`, `Storage` → `compact`.
+/// `None` (no adaptive bias) stamps `fast` (or the explicit codec name).
 pub fn codec_selection_json(
     codec: Option<scx_codec::CodecId>,
     codec_trial: bool,
@@ -433,8 +433,7 @@ pub fn codec_selection_json(
     let profile = if let Some(dt) = decode_target {
         match dt {
             DecodeTarget::Auto => "auto",
-            DecodeTarget::Cpu => "fast",
-            DecodeTarget::Gpu | DecodeTarget::Storage => "compact",
+            DecodeTarget::Storage => "compact",
         }
     } else if codec_trial {
         "compact-trial"

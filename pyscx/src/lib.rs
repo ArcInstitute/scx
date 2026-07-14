@@ -189,11 +189,14 @@ pub(crate) fn deep_validate_into(
 
 /// Convert an AnnData object to an SCX file.
 ///
-/// Codec defaults to `"auto"`, which selects per shard via
-/// `scx-format/src/codec_select.rs::select_codec()`:
-/// Float32/Float16 values → Pcodec; integer values with floor-median ≤ 8
-/// → Scx1 (Rice); larger integers → Zstd. Explicit options:
-/// `"none"`, `"scx1"`, `"zstd"`, `"lz4"`, `"pcodec"`.
+/// `codec` is the intent axis (resolved by `scx_format::resolve_codec`):
+/// `"auto"` (default) is cost-aware adaptive — per framed integer shard it
+/// adopts `ShufDeltaZstd` when it wins by a margin, else the heuristic
+/// (`Scx1` for floor-median ≤ 8, `Zstd` above); float always → `Pcodec`.
+/// `"fast"` is the decode-max heuristic single-encode; `"compact"` is size-max
+/// (adopts `ShufDeltaZstd` on ties; framed). Also accepted: the explicit codec
+/// forces `"none"`, `"scx1"`, `"zstd"`, `"lz4"`, `"pcodec"`, `"shufdelta"`, and
+/// `"compact-trial"` (framed; requires `row_group_rows > 0`).
 ///
 /// `adata.uns` is serialized as JSON. The `uns_format` kwarg selects the
 /// envelope:

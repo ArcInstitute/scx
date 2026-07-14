@@ -17,11 +17,10 @@ pub use cast::{
     F32_MAX_EXACT_INT,
 };
 pub use dispatch::{
-    decode_indptr_only, decode_row_group, decode_row_group_indptr_only, decode_scx1_row_range,
-    decode_scx1_with_metadata, decode_shard, decode_shard_ref, decode_shard_scipy,
-    decoded_shard_to_scipy, encode_shard, zstd_decode_bounded as zstd_decompress_bounded,
-    CodecError, CodecId, CodecSelection, DecodedShard, EncodedShard, EncodedShardRef, RowGroupSpan,
-    ScipyShard, Scx1DecodeMetadata, ValueEncoding,
+    decode_indptr_only, decode_row_group, decode_row_group_indptr_only, decode_shard,
+    decode_shard_ref, decode_shard_scipy, decoded_shard_to_scipy, encode_shard,
+    zstd_decode_bounded as zstd_decompress_bounded, CodecError, CodecId, CodecSelection,
+    DecodedShard, EncodedShard, EncodedShardRef, RowGroupSpan, ScipyShard, ValueEncoding,
 };
 pub use median::{
     floor_median_u32, floor_median_u32_inplace, floor_median_u64, floor_median_u64_inplace,
