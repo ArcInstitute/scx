@@ -69,6 +69,43 @@ impl ScxReader {
         self.assemble_shards_typed(&shards, n_cols, plan)
     }
 
+    /// Read a single modality's whole `X` matrix as a [`TypedCsr`] materialized
+    /// directly at `plan`'s value/index dtypes.
+    ///
+    /// **Unfiltered** by construction — it delegates straight to the
+    /// [`assemble_shards_typed`](Self::assemble_shards_typed) core, mirroring the
+    /// f32 sibling [`read_all_csr_shards_for`](ScxReader::read_all_csr_shards_for).
+    /// This is an intentional asymmetry with the global
+    /// [`read_all_csr_shards_typed`](Self::read_all_csr_shards_typed) (which IS
+    /// deletion-vector filtered): the per-modality path stays unfiltered because
+    /// multimodal deletion-vector filtering is a pre-existing gap.
+    ///
+    /// `n_cols` comes from the modality table's `n_vars` (matching
+    /// `read_all_csr_shards_for`'s preferred shape); a missing `modality_info`
+    /// is an error here (the typed assembler needs `n_cols` up front, whereas the
+    /// f32 path can fall back to the assembled shard extent).
+    ///
+    /// `plan.index_dtype` narrows the returned [`TypedCsr`]'s index buffer, but is
+    /// effectively a **no-op for a Python CSR** consumer: scipy upcasts `int16 →
+    /// int32` on `csr_matrix` construction (see `docs/api.md`).
+    pub fn read_all_csr_shards_for_typed(
+        &self,
+        modality_id: u8,
+        plan: &MaterializePlan,
+    ) -> Result<TypedCsr> {
+        let shards = self.catalog().csr_shards_for_modality(modality_id);
+        let n_cols = self
+            .modality_info(modality_id)
+            .map(|i| i.n_vars as usize)
+            .ok_or_else(|| {
+                ScxError::InvalidCatalog(format!(
+                    "modality_info({modality_id}) is None — modality table corrupt \
+                     or file is single-modality"
+                ))
+            })?;
+        self.assemble_shards_typed(&shards, n_cols, plan)
+    }
+
     /// Read a layer as a [`TypedCsr`] (unfiltered, mirroring
     /// [`read_layer`](ScxReader::read_layer)).
     pub fn read_layer_typed(&self, name: &str, plan: &MaterializePlan) -> Result<TypedCsr> {

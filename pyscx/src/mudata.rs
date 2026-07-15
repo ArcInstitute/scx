@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::RecordBatch;
-use pyo3::exceptions::{PyImportError, PyRuntimeError};
+use pyo3::exceptions::{PyImportError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use scx_codec::CodecId;
@@ -28,9 +28,12 @@ use scx_format_io::select_codec_for_modality;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::ScxReader;
 
+use scx_sparse::{Container, MaterializePlan};
+
 use crate::convert::{
-    csr_to_scipy, obsm_batch_to_numpy, pandas_to_record_batch, parse_uns_format,
-    pyarrow_table_to_pandas, record_batch_to_pyarrow, uns_py_to_json, UnsFormat,
+    build_plan, csr_max_value, csr_to_scipy, guard_decode_loss_dtype, obsm_batch_to_numpy,
+    pandas_to_record_batch, parse_uns_format, pyarrow_table_to_pandas, record_batch_to_pyarrow,
+    typed_csr_to_scipy, typed_read_to_pyerr, uns_py_to_json, UnsFormat,
 };
 use crate::to_pyerr;
 
@@ -142,13 +145,97 @@ pub fn to_mudata_backed<'py>(
     Ok(mu)
 }
 
+/// Resolve one scalar-or-dict shaping argument to a per-modality string value.
+///
+/// `arg` is a Python `str` (applied to every modality), a `dict` keyed by
+/// modality name (per-modality), or `None`. A dict key that names no modality in
+/// the file is a `ValueError` (fail loud on typos, before any decode). Returns
+/// `None` for a missing modality / `None` arg (caller applies its default).
+fn resolve_shape_arg(
+    arg: Option<&Bound<'_, PyAny>>,
+    mname: &str,
+    modality_names: &[&str],
+    arg_label: &str,
+) -> PyResult<Option<String>> {
+    let Some(arg) = arg else { return Ok(None) };
+    if let Ok(s) = arg.extract::<String>() {
+        return Ok(Some(s));
+    }
+    if let Ok(dict) = arg.cast::<PyDict>() {
+        // Validate every key names a real modality (once per lookup is cheap:
+        // dicts are tiny; the alternative is threading a validated set through).
+        for key in dict.keys() {
+            let k = key.extract::<String>()?;
+            if !modality_names.contains(&k.as_str()) {
+                return Err(PyValueError::new_err(format!(
+                    "{arg_label}: '{k}' names no modality in this file; \
+                     available modalities: {modality_names:?}"
+                )));
+            }
+        }
+        return match dict.get_item(mname)? {
+            // An explicit `None` value (e.g. `{"rna": None}`) means "no override
+            // for this modality" — same as omitting the key — not a type error.
+            Some(v) if v.is_none() => Ok(None),
+            Some(v) => Ok(Some(v.extract::<String>()?)),
+            None => Ok(None),
+        };
+    }
+    Err(PyValueError::new_err(format!(
+        "{arg_label} must be a str (applied to all modalities) or a dict keyed by \
+         modality name, got {}",
+        arg.get_type().name()?
+    )))
+}
+
+/// Build the per-modality [`MaterializePlan`] for `mname` from the scalar-or-dict
+/// shaping args. Missing keys resolve to the default (`csr` / `f32` / `i32`);
+/// `container="dense"` is rejected (deferred — CSR only for now).
+fn resolve_modality_plan(
+    py: Python<'_>,
+    mname: &str,
+    modality_names: &[&str],
+    container: Option<&Bound<'_, PyAny>>,
+    data_dtype: Option<&Bound<'_, PyAny>>,
+    index_dtype: Option<&Bound<'_, PyAny>>,
+    allow_lossy: bool,
+) -> PyResult<MaterializePlan> {
+    let container_str = resolve_shape_arg(container, mname, modality_names, "container")?
+        .unwrap_or_else(|| "csr".to_string());
+    let data_dtype_str = resolve_shape_arg(data_dtype, mname, modality_names, "data_dtype")?;
+    let index_dtype_str = resolve_shape_arg(index_dtype, mname, modality_names, "index_dtype")?;
+    let plan = build_plan(
+        py,
+        &container_str,
+        data_dtype_str.as_deref(),
+        index_dtype_str.as_deref(),
+        allow_lossy,
+    )?;
+    if plan.container == Container::Dense {
+        return Err(PyValueError::new_err(format!(
+            "container='dense' is not yet supported for to_mudata (modality '{mname}'); \
+             use container='csr' (the default)"
+        )));
+    }
+    Ok(plan)
+}
+
 /// Materialise an `ScxReader` as a `mudata.MuData` object. Iterates
-/// `modality_names()`, builds an AnnData per modality via the
-/// existing zero-copy CSR path, and attaches them to a `MuData(...)`
-/// with the shared global obs.
+/// `modality_names()`, builds an AnnData per modality, and attaches them to a
+/// `MuData(...)` with the shared global obs.
+///
+/// Each modality's `X` narrows **in-decode** to a caller-chosen target dtype
+/// (`data_dtype` / `index_dtype`, scalar-or-dict per modality): a non-default
+/// plan assembles directly at the target width via
+/// `read_all_csr_shards_for_typed` (never building the intermediate f32 CSR),
+/// while a default-plan modality keeps the untouched zero-copy
+/// `read_all_csr_shards_for` → `csr_to_scipy` path (byte-identical).
 pub fn to_mudata<'py>(
     py: Python<'py>,
     reader: &ScxReader,
+    container: Option<&Bound<'_, PyAny>>,
+    data_dtype: Option<&Bound<'_, PyAny>>,
+    index_dtype: Option<&Bound<'_, PyAny>>,
     allow_lossy: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     if !reader.is_multimodal() {
@@ -157,6 +244,8 @@ pub fn to_mudata<'py>(
              use to_anndata() for single-modality files",
         ));
     }
+
+    let modality_names = reader.modality_names();
 
     let anndata_mod = py.import("anndata")?;
     let mudata_mod = import_mudata(py)?;
@@ -171,6 +260,27 @@ pub fn to_mudata<'py>(
         Err(e) => return Err(to_pyerr(e)),
     };
 
+    // Resolve every modality's materialization plan up front, before decoding
+    // anything, so a validation error (bad dict key, dense request) fails fast
+    // and uniformly rather than after some modalities have already been
+    // decoded/built. `plans[modality_id - 1]` aligns with the 1-based loop below
+    // (both `modality_names` and `modality_info(id).name` derive from the same
+    // registration-order table).
+    let plans: Vec<MaterializePlan> = modality_names
+        .iter()
+        .map(|mname| {
+            resolve_modality_plan(
+                py,
+                mname,
+                &modality_names,
+                container,
+                data_dtype,
+                index_dtype,
+                allow_lossy,
+            )
+        })
+        .collect::<PyResult<_>>()?;
+
     // Iterate modalities in registration order. modality_id is
     // 1-based; index 0 is reserved for "global".
     let mod_dict = PyDict::new(py);
@@ -181,17 +291,28 @@ pub fn to_mudata<'py>(
             ))
         })?;
         let mname = info.name.clone();
+        let plan = &plans[(modality_id - 1) as usize];
 
-        // X — fail loud on the silent u32→f32 decode loss for this modality's
-        // shards before decoding.
-        crate::convert::guard_decode_loss(
-            crate::convert::csr_max_value(reader, Some(modality_id)),
-            allow_lossy,
+        // X — fail loud on the decode loss for this modality's shards before
+        // decoding, keyed on the target dtype (f32 for a default plan).
+        guard_decode_loss_dtype(
+            csr_max_value(reader, Some(modality_id)),
+            plan.data_dtype,
+            plan.allow_lossy,
         )?;
-        let csr = reader
-            .read_all_csr_shards_for(modality_id)
-            .map_err(to_pyerr)?;
-        let x = csr_to_scipy(py, csr)?;
+        let x = if plan.is_default_csr_f32() {
+            // Untouched zero-copy f32 CSR path — byte-identical to pre-narrow.
+            let csr = reader
+                .read_all_csr_shards_for(modality_id)
+                .map_err(to_pyerr)?;
+            csr_to_scipy(py, csr)?
+        } else {
+            // In-decode narrow: assemble directly at the target dtype.
+            let typed = reader
+                .read_all_csr_shards_for_typed(modality_id, plan)
+                .map_err(typed_read_to_pyerr)?;
+            typed_csr_to_scipy(py, typed)?
+        };
 
         // var
         let var = reader.read_var_for(modality_id).map_err(to_pyerr)?;

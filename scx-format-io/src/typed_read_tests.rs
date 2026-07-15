@@ -217,6 +217,206 @@ fn u8_shard(n_rows: usize, n_vars: usize, row_start: u64, val_base: u8) -> Shard
     (indptr, indices, values, ValueEncoding::Uint8, row_start)
 }
 
+/// Build a small Uint16 shard: `n_rows` rows, 2 nnz each, LE value bytes.
+fn u16_shard(n_rows: usize, n_vars: usize, row_start: u64, val_base: u16) -> ShardSpec {
+    let mut indptr = vec![0u64];
+    let mut indices = Vec::new();
+    let mut values: Vec<u8> = Vec::new();
+    for row in 0..n_rows {
+        indices.push(((row * 2) % n_vars) as u32);
+        indices.push(((row * 2 + 1) % n_vars) as u32);
+        values.extend_from_slice(&(val_base + row as u16 + 1).to_le_bytes());
+        values.extend_from_slice(&(val_base + row as u16 + 2).to_le_bytes());
+        indptr.push(indptr.last().unwrap() + 2);
+    }
+    (indptr, indices, values, ValueEncoding::Uint16, row_start)
+}
+
+/// A per-modality spec for the multimodal writer.
+type ModalitySpec = (&'static str, ModalityType, usize, Vec<ShardSpec>);
+
+/// Write a v2 multimodal SCX file. Mirrors `mudata.rs::from_mudata_impl`'s writer
+/// sequence (`add_modality` → `set_modality_n_vars` → `write_var_for` →
+/// `write_csr_shard_for`), so `finish()` emits a `ModalityTable` and the reader
+/// opens it as multimodal.
+fn write_multimodal_file(
+    dir: &tempfile::TempDir,
+    name: &str,
+    n_obs: usize,
+    modalities: &[ModalitySpec],
+    codec: CodecId,
+    framing: Option<FramingConfig>,
+) -> std::path::PathBuf {
+    let path = dir.path().join(name);
+    let total_nnz: u64 = modalities
+        .iter()
+        .flat_map(|(_, _, _, shards)| shards.iter())
+        .map(|s| *s.0.last().unwrap())
+        .sum();
+    let max_n_vars = modalities
+        .iter()
+        .map(|(_, _, nv, _)| *nv)
+        .max()
+        .unwrap_or(0) as u64;
+    let hdr = FileHeader::new_single_modality(n_obs as u64, max_n_vars, total_nnz, 16384, 0, 0);
+    let mut writer = ScxWriter::new(&path, hdr).unwrap();
+    writer.set_framing(framing);
+    writer.write_obs(&obs_batch(n_obs)).unwrap();
+    for (mname, mtype, n_vars, shards) in modalities {
+        let enc = shards[0].3;
+        let mid = writer
+            .add_modality(mname, *mtype, codec, enc, false)
+            .unwrap();
+        writer.set_modality_n_vars(mid, *n_vars as u64).unwrap();
+        writer.write_var_for(mid, &var_batch(*n_vars)).unwrap();
+        for (indptr, indices, values, senc, row_start) in shards {
+            writer
+                .write_csr_shard_for(mid, indptr, indices, values, codec, *senc, *row_start)
+                .unwrap();
+        }
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// Per-modality typed read equals the f32 sibling (`read_all_csr_shards_for`) cast
+/// down, for `None` and a framed non-`None` codec — with the RNA modality narrowed
+/// to `uint16` and a second (ATAC-like) modality to `uint8` in the same file.
+#[test]
+fn typed_per_modality_matches_f32_cast() {
+    for (codec, framing) in [
+        (CodecId::None, None),
+        (
+            CodecId::Scx1,
+            Some(FramingConfig {
+                row_group_rows: 2,
+                target_nnz: None,
+                trial: false,
+                decode_target: None,
+            }),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let modalities: Vec<ModalitySpec> = vec![
+            (
+                "rna",
+                ModalityType::Rna,
+                10,
+                vec![u16_shard(3, 10, 0, 300), u16_shard(3, 10, 3, 1000)],
+            ),
+            ("atac", ModalityType::Atac, 8, vec![u8_shard(6, 8, 0, 0)]),
+        ];
+        let path = write_multimodal_file(&dir, "mm.scx", 6, &modalities, codec, framing);
+        let reader = ScxReader::open(&path).unwrap();
+        assert!(reader.is_multimodal(), "codec {codec:?}: not multimodal");
+        assert_eq!(reader.n_modalities(), 2);
+
+        // Modality 1 (rna) → uint16.
+        let rna_f32 = reader.read_all_csr_shards_for(1).unwrap();
+        let rna_plan = MaterializePlan {
+            container: Container::Csr,
+            data_dtype: ValueDtype::U16,
+            index_dtype: IndexDtype::I32,
+            allow_lossy: false,
+        };
+        let rna_typed = reader.read_all_csr_shards_for_typed(1, &rna_plan).unwrap();
+        assert_eq!(rna_typed.shape, rna_f32.shape, "codec {codec:?}: rna shape");
+        assert_eq!(
+            rna_typed.indptr, rna_f32.indptr,
+            "codec {codec:?}: rna indptr"
+        );
+        let want_v: Vec<u16> = checked_cast_values(&rna_f32.data, false).unwrap();
+        match &rna_typed.values {
+            ValueBuffer::U16(v) => assert_eq!(v, &want_v, "codec {codec:?}: rna values"),
+            _ => panic!("codec {codec:?}: wrong rna value arm"),
+        }
+
+        // Modality 2 (atac) → uint8, in the same read.
+        let atac_f32 = reader.read_all_csr_shards_for(2).unwrap();
+        let atac_plan = MaterializePlan {
+            container: Container::Csr,
+            data_dtype: ValueDtype::U8,
+            index_dtype: IndexDtype::I32,
+            allow_lossy: false,
+        };
+        let atac_typed = reader.read_all_csr_shards_for_typed(2, &atac_plan).unwrap();
+        assert_eq!(
+            atac_typed.shape, atac_f32.shape,
+            "codec {codec:?}: atac shape"
+        );
+        let want_a: Vec<u8> = checked_cast_values(&atac_f32.data, false).unwrap();
+        match &atac_typed.values {
+            ValueBuffer::U8(v) => assert_eq!(v, &want_a, "codec {codec:?}: atac values"),
+            _ => panic!("codec {codec:?}: wrong atac value arm"),
+        }
+    }
+}
+
+/// A per-modality read of a modality carrying a `value_max > 2²⁴` count reads exact
+/// under `uint32` (G2), and fails loud into `uint16` without `allow_lossy`.
+#[test]
+fn typed_per_modality_exact_above_2pow24() {
+    let big: u32 = (1 << 24) + 7; // 16_777_223, unrepresentable exactly in f32
+    let mut vals = Vec::new();
+    vals.extend_from_slice(&big.to_le_bytes());
+    vals.extend_from_slice(&5u32.to_le_bytes());
+    let big_shard: ShardSpec = (
+        vec![0u64, 1, 2],
+        vec![0u32, 1u32],
+        vals,
+        ValueEncoding::Uint32,
+        0,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let modalities: Vec<ModalitySpec> = vec![
+        ("rna", ModalityType::Rna, 4, vec![u8_shard(2, 4, 0, 0)]),
+        ("big", ModalityType::Custom, 4, vec![big_shard]),
+    ];
+    let path = write_multimodal_file(&dir, "mm_big.scx", 2, &modalities, CodecId::None, None);
+    let reader = ScxReader::open(&path).unwrap();
+
+    let plan_u32 = MaterializePlan {
+        container: Container::Csr,
+        data_dtype: ValueDtype::U32,
+        index_dtype: IndexDtype::I32,
+        allow_lossy: false,
+    };
+    let typed = reader.read_all_csr_shards_for_typed(2, &plan_u32).unwrap();
+    match &typed.values {
+        ValueBuffer::U32(v) => assert_eq!(v, &vec![big, 5]),
+        _ => panic!("wrong arm"),
+    }
+
+    let plan_u16 = MaterializePlan {
+        data_dtype: ValueDtype::U16,
+        ..plan_u32
+    };
+    assert!(
+        reader.read_all_csr_shards_for_typed(2, &plan_u16).is_err(),
+        "value_max > 65535 must fail loud into uint16"
+    );
+}
+
+/// A missing modality id (e.g. id 0 / global on a multimodal file) errors rather
+/// than assembling a garbage shape — the typed reader needs `n_cols` up front.
+#[test]
+fn typed_per_modality_missing_modality_info_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let modalities: Vec<ModalitySpec> =
+        vec![("rna", ModalityType::Rna, 4, vec![u8_shard(2, 4, 0, 0)])];
+    let path = write_multimodal_file(&dir, "mm_one.scx", 2, &modalities, CodecId::None, None);
+    let reader = ScxReader::open(&path).unwrap();
+    let plan = MaterializePlan {
+        container: Container::Csr,
+        data_dtype: ValueDtype::U16,
+        index_dtype: IndexDtype::I32,
+        allow_lossy: false,
+    };
+    // modality_id 0 is the global slot — no ModalityInfo → error.
+    assert!(reader.read_all_csr_shards_for_typed(0, &plan).is_err());
+}
+
 #[test]
 fn typed_assembly_matches_f32_cast_csr() {
     let dir = tempfile::tempdir().unwrap();

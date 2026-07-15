@@ -166,7 +166,7 @@ impl ScxBackedMuDataset {
         // Convenience materialize on a backed handle: pass allow_lossy=true so the
         // decode-loss guard does not hard-error here, consistent with backed reads
         // being ungated (the caller already opted into a backed workflow).
-        crate::mudata::to_mudata(py, &self.meta_reader, true)
+        crate::mudata::to_mudata(py, &self.meta_reader, None, None, None, true)
     }
 
     fn __repr__(&self) -> String {

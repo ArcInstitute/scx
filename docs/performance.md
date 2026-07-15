@@ -319,6 +319,36 @@ The RSS-saving regime activates at census-scale CITE-seq / Multiome
 (not staged on the current Lambda fleet); the pattern at single-modality
 ``census_500k`` / ``census_1m`` is the load-bearing extrapolation.
 
+#### Per-modality in-decode narrow (eager `to_mudata`)
+
+`to_mudata` narrows each modality's `X` **in-decode** to a caller-chosen dtype
+(`data_dtype={"rna": "uint16", "atac": "uint16"}`, scalar or per-modality dict),
+assembling directly at the target width via `read_all_csr_shards_for_typed` —
+never building the intermediate f32 CSR. The returned MuData's value-buffer
+footprint drops deterministically: on `multiome_pbmc_10k` (RNA 23.5M nnz + ATAC
+104M nnz), the two `X` value buffers go from **510 MB f32 → 255 MB uint16 (2×)**,
+lossless (RNA max 5 585, ATAC max 762 both fit `uint16`). Whole-process peak RSS
+for the eager `to_mudata()` call, `/usr/bin/time -v`, multi-shard file
+(2 048-row shards, 6 shards/modality):
+
+| `to_mudata` call | peak RSS |
+|---|---:|
+| default (all f32) | **1.98 GB** |
+| `data_dtype={"rna":"uint16","atac":"uint16"}` | **1.52 GB** |
+
+≈0.46 GB (~24%) lower, driven by the narrower value buffers *and* the in-decode
+path avoiding the f32 assembly/concat transients. The process-level win scales
+with **shard count**: on a single-shard-per-modality file (the default 16 384-row
+shards → 1 shard each here) the whole ATAC `u32` stream is resident during the
+cast, so the transient advantage collapses (~44 MB delta) even though the
+returned buffers still halve — atlas-scale multimodal files (many shards) sit in
+the multi-shard regime. A modality that binarizes / stays shallow (`uint8`, e.g.
+peak-called ATAC or small ADT panels) reaches **4×** on the value buffer; the
+available Multiome fixture's ATAC counts exceed 255 (max 762), so `uint8` there
+needs `allow_lossy=True` and is not lossless. Default (no override) modalities
+keep the byte-identical zero-copy f32 path. A dict key naming no modality raises
+`ValueError`; `container="dense"` is not yet supported for `to_mudata`.
+
 Source: ``benchmarks/comprehensive/results/raw/read_streaming_vs_inmemory__scx_auto__{census_500k,census_1m}.json``
 and ``benchmarks/comprehensive/results/raw/multimodal_read_streaming_vs_inmemory__scx_multimodal_per_modality_auto__{cite_seq_pbmc_5k,multiome_pbmc_10k}.json``.
 SLURM wrapper: ``benchmarks/comprehensive/scripts/slurm_read_streaming_vs_inmemory.sh``.

@@ -1430,20 +1430,45 @@ impl PyExperiment {
     /// in `ScxBackedSparseDataset` (per-modality `BackedCsrReader` + CSC
     /// sidecar if present). Single-modality files are wrapped in a
     /// one-modality `MuData` rather than raising.
-    #[pyo3(signature = (backed=false, cache_shards=4, allow_lossy=false))]
+    /// Eager narrowing (`container` / `data_dtype` / `index_dtype`): each of the
+    /// three accepts **either** a scalar (applied to every modality) **or** a
+    /// dict keyed by modality name (e.g. `data_dtype={"rna": "uint16", "atac":
+    /// "uint8"}`); a dict key naming no modality raises `ValueError`. A modality
+    /// with no override keeps the byte-identical zero-copy `f32` CSR path.
+    /// `container="dense"` is not yet supported (CSR only). These are rejected
+    /// under `backed=True` (backed X stays lazily f32-native, like `to_anndata`).
+    #[pyo3(signature = (backed=false, cache_shards=4, container=None, data_dtype=None, index_dtype=None, allow_lossy=false))]
+    #[allow(clippy::too_many_arguments)]
     fn to_mudata<'py>(
         &self,
         py: Python<'py>,
         backed: bool,
         cache_shards: usize,
+        container: Option<Bound<'py, PyAny>>,
+        data_dtype: Option<Bound<'py, PyAny>>,
+        index_dtype: Option<Bound<'py, PyAny>>,
         allow_lossy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         if backed {
-            // Backed mode decodes lazily per-slice, so the decode-loss guard is
-            // not applied (consistent with backed to_anndata).
+            // Backed mode decodes lazily per-slice as f32, so a non-default plan
+            // can't be honoured (mirrors backed to_anndata). Reject rather than
+            // silently ignore the shaping args.
+            if container.is_some() || data_dtype.is_some() || index_dtype.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "to_mudata(container=/data_dtype=/index_dtype=) require backed=False; \
+                     backed multimodal X is lazily f32-native",
+                ));
+            }
             crate::mudata::to_mudata_backed(py, &self.path, &self.reader, cache_shards)
         } else {
-            crate::mudata::to_mudata(py, &self.reader, allow_lossy)
+            crate::mudata::to_mudata(
+                py,
+                &self.reader,
+                container.as_ref(),
+                data_dtype.as_ref(),
+                index_dtype.as_ref(),
+                allow_lossy,
+            )
         }
     }
 
