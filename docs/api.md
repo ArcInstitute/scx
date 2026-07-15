@@ -1306,13 +1306,32 @@ the repr onto `Experiment.info() -> str`.
     not subject to deletion-vector row filtering — when cells are
     logically deleted, the pairwise matrices still cover the full
     original axis; `compact` resolves this by rebuilding from scratch.
-- `to_mudata(backed=False, cache_shards=4)` — Materialise a multimodal file as `mudata.MuData`
+- `to_mudata(backed=False, cache_shards=4, container=None, data_dtype=None, index_dtype=None, allow_lossy=False)` — Materialise a multimodal file as `mudata.MuData`
   - Eager (`backed=False`): per-modality scipy CSR AnnData sharing the
-    global obs (existing behaviour). Raises on single-modality files.
+    global obs. Raises on single-modality files.
+  - **Per-modality in-decode narrow.** `container` / `data_dtype` /
+    `index_dtype` each accept **either a scalar** (applied to every modality)
+    **or a dict keyed by modality name** — e.g.
+    `data_dtype={"rna": "uint16", "atac": "uint8"}`. A modality with no
+    override keeps the **byte-identical zero-copy `f32` CSR** path; a
+    narrowed modality assembles directly at the target width via the typed
+    per-modality reader (`scx_format_io::read_all_csr_shards_for_typed`),
+    never building the intermediate f32 CSR. This matters most for
+    multimodal reads: modalities differ in range (shallow/binarized ATAC and
+    small ADT fit `uint8` = 4× on the value buffer; RNA/deep counts fit
+    `uint16` = 2×) and `to_mudata` materialises *N* matrices at once. The
+    same fail-loud cast gate applies **per modality** (a lossy narrow raises
+    unless `allow_lossy=True`); integer→integer narrows are exact, including
+    `> 2²⁴`. A dict key naming no modality in the file raises `ValueError`.
+    `index_dtype` is accepted for symmetry but is a **no-op for the returned
+    CSR** — scipy upcasts `int16 → int32` (same as `to_anndata`, below).
+    `container="dense"` is **not yet supported** for `to_mudata` (CSR only).
+    The narrow kwargs require `backed=False`.
   - **Backed (`backed=True`)**: per-modality
-    `ScxBackedSparseDataset` AnnData sharing the global obs.
-    Single-modality files are wrapped in a one-modality MuData rather
-    than raising, so the call works uniformly across layouts.
+    `ScxBackedSparseDataset` AnnData sharing the global obs (lazily
+    f32-native — the narrow kwargs are rejected). Single-modality files are
+    wrapped in a one-modality MuData rather than raising, so the call works
+    uniformly across layouts.
 - `query() -> PyQueryPipeline` — Start lazy query pipeline
 - `mark_deleted(mask)` — Delete cells matching boolean array
 - `validate()` — Check checksums, returns list of `(section_name, passed)`

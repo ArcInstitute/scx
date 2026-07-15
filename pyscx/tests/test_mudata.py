@@ -908,3 +908,142 @@ def test_to_mudata_backed_single_modality_preserves_dv_unfiltered_obs(tmp_path):
     assert only.X.shape[0] == n_obs
     # Cross-check: outer and inner must be in lockstep on this path.
     assert mu.n_obs == only.n_obs
+
+
+# ---------------------------------------------------------------------------
+# Per-modality in-decode narrow for `to_mudata` (multimodal typed reads).
+# ---------------------------------------------------------------------------
+
+
+def _open_cite(tmp, mu):
+    """Write `mu` to an SCX file under `tmp` and return an open reader."""
+    import pyscx
+
+    path = os.path.join(tmp, "cite.scx")
+    pyscx.from_mudata(mu, path)
+    return pyscx.open(path)
+
+
+def test_to_mudata_scalar_narrow_all_modalities(cite_seq_mudata):
+    """A scalar `data_dtype` narrows every modality; values equal the default
+    read cast, and each modality's X carries the target dtype."""
+    pytest.importorskip("mudata")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reader = _open_cite(tmp, cite_seq_mudata)
+        mu = reader.to_mudata(data_dtype="uint16")
+        for name in ("rna", "adt"):
+            orig = cite_seq_mudata.mod[name].X.toarray()
+            back = mu.mod[name].X
+            assert back.dtype == np.uint16, f"{name}: {back.dtype}"
+            np.testing.assert_array_equal(orig, back.toarray())
+
+
+def test_to_mudata_per_modality_dict_mixed(cite_seq_mudata):
+    """A dict `data_dtype` narrows per modality: RNA left default (f32,
+    byte-identical) while ADT narrows to uint8 in the same call."""
+    pytest.importorskip("mudata")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reader = _open_cite(tmp, cite_seq_mudata)
+        mu = reader.to_mudata(data_dtype={"adt": "uint8"})
+
+        # RNA: untouched default path → float32, byte-identical.
+        rna = mu.mod["rna"].X
+        assert rna.dtype == np.float32
+        np.testing.assert_array_equal(
+            cite_seq_mudata.mod["rna"].X.toarray(), rna.toarray()
+        )
+        # ADT: narrowed to uint8.
+        adt = mu.mod["adt"].X
+        assert adt.dtype == np.uint8
+        np.testing.assert_array_equal(
+            cite_seq_mudata.mod["adt"].X.toarray(), adt.toarray()
+        )
+
+
+def test_to_mudata_default_unchanged(cite_seq_mudata):
+    """An all-default `to_mudata()` is unchanged: values equal and X stays
+    float32 for every modality."""
+    pytest.importorskip("mudata")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reader = _open_cite(tmp, cite_seq_mudata)
+        mu = reader.to_mudata()
+        for name in ("rna", "adt"):
+            back = mu.mod[name].X
+            assert back.dtype == np.float32
+            np.testing.assert_array_equal(
+                cite_seq_mudata.mod[name].X.toarray(), back.toarray()
+            )
+
+
+def test_to_mudata_bad_modality_key_raises(cite_seq_mudata):
+    """A dict key naming no modality fails loud with ValueError."""
+    pytest.importorskip("mudata")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reader = _open_cite(tmp, cite_seq_mudata)
+        with pytest.raises(ValueError, match="names no modality"):
+            reader.to_mudata(data_dtype={"nope": "uint16"})
+
+
+def test_to_mudata_dense_not_supported(cite_seq_mudata):
+    """container='dense' is not yet supported for to_mudata (CSR only)."""
+    pytest.importorskip("mudata")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reader = _open_cite(tmp, cite_seq_mudata)
+        with pytest.raises(ValueError, match="dense"):
+            reader.to_mudata(container="dense", data_dtype="uint8")
+
+
+def test_to_mudata_narrow_rejected_under_backed(cite_seq_mudata):
+    """The narrow kwargs require backed=False (backed X is lazily f32-native)."""
+    pytest.importorskip("mudata")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reader = _open_cite(tmp, cite_seq_mudata)
+        with pytest.raises(ValueError, match="backed=False"):
+            reader.to_mudata(backed=True, data_dtype="uint16")
+
+
+@pytest.fixture
+def cite_seq_mudata_bigcount():
+    """CITE-seq fixture whose ADT modality carries a count > 255 (overflows
+    uint8) — used to exercise the fail-loud narrow gate."""
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import scipy.sparse as sp
+
+    rng = np.random.default_rng(1)
+    n_obs, rna_n_vars, adt_n_vars = 16, 20, 6
+    rna = sp.csr_matrix(
+        rng.poisson(lam=0.4, size=(n_obs, rna_n_vars)).astype(np.float32)
+    )
+    adt_dense = rng.poisson(lam=0.4, size=(n_obs, adt_n_vars)).astype(np.float32)
+    adt_dense[0, 0] = 300.0  # > uint8 max (255)
+    adt = sp.csr_matrix(adt_dense)
+
+    rna_ad = anndata.AnnData(X=rna)
+    rna_ad.var_names = [f"g{i}" for i in range(rna_n_vars)]
+    adt_ad = anndata.AnnData(X=adt)
+    adt_ad.var_names = [f"a{i}" for i in range(adt_n_vars)]
+    mu = mudata.MuData({"rna": rna_ad, "adt": adt_ad})
+    mu.obs_names = [f"cell_{i}" for i in range(n_obs)]
+    return mu
+
+
+def test_to_mudata_lossy_narrow_fails_loud(cite_seq_mudata_bigcount):
+    """A narrow that would lose a modality's value_max raises ValueError, and
+    allow_lossy=True bypasses it."""
+    pytest.importorskip("mudata")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reader = _open_cite(tmp, cite_seq_mudata_bigcount)
+        # ADT count 300 > uint8 max → fail loud.
+        with pytest.raises(ValueError):
+            reader.to_mudata(data_dtype={"adt": "uint8"})
+        # allow_lossy wraps without error (RSS-measurement escape hatch).
+        mu = reader.to_mudata(data_dtype={"adt": "uint8"}, allow_lossy=True)
+        assert mu.mod["adt"].X.dtype == np.uint8

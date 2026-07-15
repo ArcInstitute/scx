@@ -26,7 +26,7 @@ const DEFAULT_EAGER_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// `ValueError` to match the F4 contract (`to_anndata(data_dtype=…)` raises
 /// `ValueError` on a lossy narrow). Genuine I/O / catalog errors keep the
 /// default `to_pyerr` mapping (`RuntimeError`).
-fn typed_read_to_pyerr(e: scx_format_io::ScxError) -> PyErr {
+pub(crate) fn typed_read_to_pyerr(e: scx_format_io::ScxError) -> PyErr {
     match e {
         scx_format_io::ScxError::Codec(ce) => {
             pyo3::exceptions::PyValueError::new_err(ce.to_string())

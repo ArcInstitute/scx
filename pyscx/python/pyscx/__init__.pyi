@@ -340,7 +340,31 @@ class Experiment:
         obsm: list[str] | None = ...,
         preserve_var_order: bool = ...,
         strict_var_names: bool = ...,
+        container: str | dict[str, str] = ...,
+        data_dtype: str | dict[str, str] | None = ...,
+        index_dtype: str | dict[str, str] | None = ...,
+        allow_lossy: bool = ...,
     ) -> Any: ...
+
+    def to_mudata(
+        self,
+        backed: bool = ...,
+        cache_shards: int = ...,
+        container: str | dict[str, str] | None = ...,
+        data_dtype: str | dict[str, str] | None = ...,
+        index_dtype: str | dict[str, str] | None = ...,
+        allow_lossy: bool = ...,
+    ) -> Any:
+        """Materialise a multimodal SCX file as a ``mudata.MuData``.
+
+        ``container`` / ``data_dtype`` / ``index_dtype`` each accept either a
+        scalar (applied to every modality) or a dict keyed by modality name
+        (e.g. ``data_dtype={"rna": "uint16", "atac": "uint8"}``); a modality
+        with no override keeps the byte-identical zero-copy ``f32`` CSR. A dict
+        key naming no modality raises ``ValueError``. ``container="dense"`` is
+        not yet supported (CSR only). The narrow kwargs require ``backed=False``.
+        """
+        ...
 
     def query(self) -> Any: ...
     def provenance(self) -> list[dict[str, Any]]: ...
