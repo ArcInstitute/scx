@@ -340,9 +340,9 @@ class Experiment:
         obsm: list[str] | None = ...,
         preserve_var_order: bool = ...,
         strict_var_names: bool = ...,
-        container: str | dict[str, str] = ...,
-        data_dtype: str | dict[str, str] | None = ...,
-        index_dtype: str | dict[str, str] | None = ...,
+        container: str = ...,
+        data_dtype: str | None = ...,
+        index_dtype: str | None = ...,
         allow_lossy: bool = ...,
     ) -> Any: ...
 

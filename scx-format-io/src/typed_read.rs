@@ -84,6 +84,10 @@ impl ScxReader {
     /// `read_all_csr_shards_for`'s preferred shape); a missing `modality_info`
     /// is an error here (the typed assembler needs `n_cols` up front, whereas the
     /// f32 path can fall back to the assembled shard extent).
+    ///
+    /// `plan.index_dtype` narrows the returned [`TypedCsr`]'s index buffer, but is
+    /// effectively a **no-op for a Python CSR** consumer: scipy upcasts `int16 →
+    /// int32` on `csr_matrix` construction (see `docs/api.md`).
     pub fn read_all_csr_shards_for_typed(
         &self,
         modality_id: u8,

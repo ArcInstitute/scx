@@ -174,6 +174,9 @@ fn resolve_shape_arg(
             }
         }
         return match dict.get_item(mname)? {
+            // An explicit `None` value (e.g. `{"rna": None}`) means "no override
+            // for this modality" — same as omitting the key — not a type error.
+            Some(v) if v.is_none() => Ok(None),
             Some(v) => Ok(Some(v.extract::<String>()?)),
             None => Ok(None),
         };
@@ -257,6 +260,27 @@ pub fn to_mudata<'py>(
         Err(e) => return Err(to_pyerr(e)),
     };
 
+    // Resolve every modality's materialization plan up front, before decoding
+    // anything, so a validation error (bad dict key, dense request) fails fast
+    // and uniformly rather than after some modalities have already been
+    // decoded/built. `plans[modality_id - 1]` aligns with the 1-based loop below
+    // (both `modality_names` and `modality_info(id).name` derive from the same
+    // registration-order table).
+    let plans: Vec<MaterializePlan> = modality_names
+        .iter()
+        .map(|mname| {
+            resolve_modality_plan(
+                py,
+                mname,
+                &modality_names,
+                container,
+                data_dtype,
+                index_dtype,
+                allow_lossy,
+            )
+        })
+        .collect::<PyResult<_>>()?;
+
     // Iterate modalities in registration order. modality_id is
     // 1-based; index 0 is reserved for "global".
     let mod_dict = PyDict::new(py);
@@ -267,18 +291,7 @@ pub fn to_mudata<'py>(
             ))
         })?;
         let mname = info.name.clone();
-
-        // Resolve this modality's materialization plan from the scalar-or-dict
-        // shaping args (default → csr/f32/i32; dense rejected).
-        let plan = resolve_modality_plan(
-            py,
-            &mname,
-            &modality_names,
-            container,
-            data_dtype,
-            index_dtype,
-            allow_lossy,
-        )?;
+        let plan = &plans[(modality_id - 1) as usize];
 
         // X — fail loud on the decode loss for this modality's shards before
         // decoding, keyed on the target dtype (f32 for a default plan).
@@ -296,7 +309,7 @@ pub fn to_mudata<'py>(
         } else {
             // In-decode narrow: assemble directly at the target dtype.
             let typed = reader
-                .read_all_csr_shards_for_typed(modality_id, &plan)
+                .read_all_csr_shards_for_typed(modality_id, plan)
                 .map_err(typed_read_to_pyerr)?;
             typed_csr_to_scipy(py, typed)?
         };

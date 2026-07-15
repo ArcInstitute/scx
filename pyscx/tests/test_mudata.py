@@ -1047,3 +1047,42 @@ def test_to_mudata_lossy_narrow_fails_loud(cite_seq_mudata_bigcount):
         # allow_lossy wraps without error (RSS-measurement escape hatch).
         mu = reader.to_mudata(data_dtype={"adt": "uint8"}, allow_lossy=True)
         assert mu.mod["adt"].X.dtype == np.uint8
+
+
+def test_to_mudata_explicit_csr_and_none_value_are_default(cite_seq_mudata):
+    """An explicit scalar container='csr', and a dict value of None, both resolve
+    to the byte-identical default f32 path (a None value = 'no override')."""
+    pytest.importorskip("mudata")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reader = _open_cite(tmp, cite_seq_mudata)
+        # Explicit container="csr" scalar == default.
+        mu = reader.to_mudata(container="csr")
+        for name in ("rna", "adt"):
+            assert mu.mod[name].X.dtype == np.float32
+            np.testing.assert_array_equal(
+                cite_seq_mudata.mod[name].X.toarray(), mu.mod[name].X.toarray()
+            )
+        # A dict value of None means "default for this modality" (not TypeError).
+        mu2 = reader.to_mudata(data_dtype={"rna": None, "adt": "uint16"})
+        assert mu2.mod["rna"].X.dtype == np.float32
+        assert mu2.mod["adt"].X.dtype == np.uint16
+
+
+def test_to_mudata_index_dtype_noop_for_csr(cite_seq_mudata):
+    """`index_dtype` is accepted per modality but is a no-op for the returned CSR
+    (scipy upcasts int16 -> int32); values stay correct."""
+    pytest.importorskip("mudata")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reader = _open_cite(tmp, cite_seq_mudata)
+        mu = reader.to_mudata(
+            data_dtype={"rna": "uint16"}, index_dtype={"rna": "int16"}
+        )
+        rna = mu.mod["rna"].X
+        assert rna.dtype == np.uint16
+        # scipy upcast: the returned CSR indices are int32 regardless.
+        assert rna.indices.dtype == np.int32
+        np.testing.assert_array_equal(
+            cite_seq_mudata.mod["rna"].X.toarray(), rna.toarray()
+        )
