@@ -12,7 +12,7 @@
 
 use std::io::Cursor;
 
-use scx_codec::{CodecId, EncodedShardRef, ValueEncoding};
+use scx_codec::{CodecId, EncodedShardRef, ShardValuesNative, ValueEncoding};
 
 use crate::catalog::FullCatalogEntry;
 use crate::error::{Result, ScxError};
@@ -193,6 +193,165 @@ fn decode_framed_shard_scipy(
     }
 
     Ok((indptr, indices, data))
+}
+
+/// Native-value twin of [`decode_shard_bytes`]: decodes a single CSR shard to
+/// `(Vec<i64>` indptr, `Vec<u32>` indices, [`ShardValuesNative`] values`)`,
+/// keeping integer values as `u32` (never rounded through `f32`) so the
+/// in-assembly narrow reader can cast directly to the target dtype. Handles both
+/// legacy (v1) and framed (v2) layouts.
+pub fn decode_shard_bytes_native(
+    section: &[u8],
+    entry: &FullCatalogEntry,
+    catalog_version: u16,
+    verify_checksum: bool,
+) -> Result<(Vec<i64>, Vec<u32>, ShardValuesNative)> {
+    let vs = ValidatedSection::new(section);
+    let sh = ShardHeader::read_from(&mut Cursor::new(vs.header()?))?;
+
+    if catalog_version >= 2 {
+        sh.validate_csc_strict(entry.section_type)?;
+    }
+
+    let indptr_bytes = vs.subslice(sh.indptr_rel_offset, sh.indptr_length)?;
+    let indices_bytes = vs.subslice(sh.indices_rel_offset, sh.indices_length)?;
+    let values_bytes = vs.subslice(sh.values_rel_offset, sh.values_length)?;
+    let block_index_bytes = vs.subslice(sh.block_index_rel_offset, sh.block_index_length)?;
+
+    if verify_checksum {
+        let mut shard_hasher = blake3::Hasher::new();
+        shard_hasher.update(indptr_bytes);
+        shard_hasher.update(indices_bytes);
+        shard_hasher.update(values_bytes);
+        shard_hasher.update(block_index_bytes);
+        let hash = shard_hasher.finalize();
+        let mut computed = [0u8; 8];
+        computed.copy_from_slice(&hash.as_bytes()[..8]);
+        if computed != sh.checksum {
+            return Err(ScxError::ChecksumMismatch {
+                section: format!("shard '{}'", entry.name),
+            });
+        }
+    }
+
+    decode_shard_regions_native(
+        &sh,
+        indptr_bytes,
+        indices_bytes,
+        values_bytes,
+        block_index_bytes,
+    )
+}
+
+/// Native-value twin of [`decode_shard_regions_scipy`]. Same framed/legacy split,
+/// but delegates to [`scx_codec::decode_shard_native`] /
+/// [`scx_codec::decoded_shard_to_native`] so integer values stay `u32`.
+pub fn decode_shard_regions_native(
+    sh: &ShardHeader,
+    indptr_bytes: &[u8],
+    indices_bytes: &[u8],
+    values_bytes: &[u8],
+    block_index_bytes: &[u8],
+) -> Result<(Vec<i64>, Vec<u32>, ShardValuesNative)> {
+    let codec_id = CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?;
+    let value_encoding = ValueEncoding::from_u8(sh.value_encoding)
+        .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
+    let index_dtype_u16 = sh.index_dtype == 0;
+
+    if sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+        return decode_framed_shard_native(
+            sh,
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+            block_index_bytes,
+            codec_id,
+            value_encoding,
+            index_dtype_u16,
+        );
+    }
+
+    let encoded = EncodedShardRef {
+        indptr_bytes,
+        indices_bytes,
+        values_bytes,
+    };
+
+    Ok(scx_codec::decode_shard_native(
+        &encoded,
+        codec_id,
+        value_encoding,
+        sh.n_major as usize,
+        sh.nnz as usize,
+        index_dtype_u16,
+    )?)
+}
+
+/// Native-value twin of [`decode_framed_shard_scipy`]. Reassembles a framed (v2)
+/// shard from its block index, keeping integer values as `u32`. The value
+/// accumulator variant is fixed by `value_encoding.is_integer()` (a shard is
+/// uniformly integer- or float-encoded).
+#[allow(clippy::too_many_arguments)]
+fn decode_framed_shard_native(
+    sh: &ShardHeader,
+    indptr_bytes: &[u8],
+    indices_bytes: &[u8],
+    values_bytes: &[u8],
+    block_index_bytes: &[u8],
+    codec_id: CodecId,
+    value_encoding: ValueEncoding,
+    index_dtype_u16: bool,
+) -> Result<(Vec<i64>, Vec<u32>, ShardValuesNative)> {
+    let spans = resolve_block_index(sh, block_index_bytes)?;
+    let n_major = sh.n_major as usize;
+    let nnz = sh.nnz as usize;
+
+    let mut indptr = Vec::with_capacity(n_major + 1);
+    indptr.push(0i64);
+    let mut indices = Vec::with_capacity(nnz);
+    let mut values_u32: Vec<u32> = if value_encoding.is_integer() {
+        Vec::with_capacity(nnz)
+    } else {
+        Vec::new()
+    };
+    let mut values_f32: Vec<f32> = if value_encoding.is_integer() {
+        Vec::new()
+    } else {
+        Vec::with_capacity(nnz)
+    };
+    let mut running: i64 = 0;
+
+    for span in &spans {
+        let decoded = scx_codec::decode_row_group(
+            codec_id,
+            span,
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+            value_encoding,
+            index_dtype_u16,
+        )?;
+        let (g_indptr, g_indices, g_values) =
+            scx_codec::decoded_shard_to_native(decoded, value_encoding)?;
+        for &local in &g_indptr[1..] {
+            indptr.push(running + local);
+        }
+        if let Some(&last) = g_indptr.last() {
+            running += last;
+        }
+        indices.extend_from_slice(&g_indices);
+        match g_values {
+            ShardValuesNative::U32(v) => values_u32.extend_from_slice(&v),
+            ShardValuesNative::F32(v) => values_f32.extend_from_slice(&v),
+        }
+    }
+
+    let values = if value_encoding.is_integer() {
+        ShardValuesNative::U32(values_u32)
+    } else {
+        ShardValuesNative::F32(values_f32)
+    };
+    Ok((indptr, indices, values))
 }
 
 /// Decode **only** the indptr region of a shard.

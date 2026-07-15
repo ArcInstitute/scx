@@ -20,6 +20,21 @@ use super::*;
 /// is advisory.
 const DEFAULT_EAGER_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Map a typed-read error to a Python exception. The in-assembly narrow reader
+/// surfaces the fail-loud cast gate (lossy narrow / decode-loss) as
+/// `ScxError::Codec(..)`; that is a bad-request condition — map it to
+/// `ValueError` to match the F4 contract (`to_anndata(data_dtype=…)` raises
+/// `ValueError` on a lossy narrow). Genuine I/O / catalog errors keep the
+/// default `to_pyerr` mapping (`RuntimeError`).
+fn typed_read_to_pyerr(e: scx_format_io::ScxError) -> PyErr {
+    match e {
+        scx_format_io::ScxError::Codec(ce) => {
+            pyo3::exceptions::PyValueError::new_err(ce.to_string())
+        }
+        other => to_pyerr(other),
+    }
+}
+
 /// Catalog-only estimate of the bytes required to assemble the full X
 /// matrix plus obs / var metadata into an in-memory AnnData. Sums
 /// `nnz × 16` for CSR shards (i32 indices + f32 data), `n_rows × 8`
@@ -133,7 +148,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
     eager: bool,
     memory_budget: Option<u64>,
     skip_x: bool,
-    allow_lossy: bool,
+    plan: &scx_sparse::MaterializePlan,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::lazy_mapping::{
         PairwiseAxis, ScxLazyLayersMapping, ScxLazyObsmMapping, ScxLazyPairwiseMapping,
@@ -166,7 +181,11 @@ pub(crate) fn to_anndata_with_layers<'py>(
     // rather than at each call site. The check is catalog-only, so it applies
     // even when `skip_x` defers the host X decode to `to_gpu_anndata`'s
     // f32-native device path.
-    guard_decode_loss(csr_max_value(reader, None), allow_lossy)?;
+    guard_decode_loss_dtype(
+        csr_max_value(reader, None),
+        plan.data_dtype,
+        plan.allow_lossy,
+    )?;
 
     // X — assemble all CSR shards (with deletion vector filtering).
     //
@@ -175,11 +194,27 @@ pub(crate) fn to_anndata_with_layers<'py>(
     // device-resident streamed path, which decodes X straight onto the GPU
     // instead of materialising a host scipy CSR here. obs/var/obsm/uns/layers
     // are assembled identically either way.
+    //
+    // Non-default plans narrow **in-decode**: the typed reader assembles X
+    // directly at the target dtype (never building the full-matrix f32 CSR), so
+    // a narrow read lowers peak RSS and integer→integer narrows are exact for
+    // any value (including > 2²⁴). The default (csr/f32/i32) plan stays on the
+    // untouched zero-copy path.
     let x = if skip_x {
         None
-    } else {
+    } else if plan.is_default_csr_f32() {
         let csr = reader.read_all_csr_shards_filtered().map_err(to_pyerr)?;
         Some(csr_to_scipy(py, csr)?)
+    } else if plan.container == scx_sparse::Container::Dense {
+        let dense = reader
+            .read_all_csr_shards_dense_typed(plan)
+            .map_err(typed_read_to_pyerr)?;
+        Some(typed_dense_to_numpy(py, dense)?)
+    } else {
+        let csr = reader
+            .read_all_csr_shards_typed(plan)
+            .map_err(typed_read_to_pyerr)?;
+        Some(typed_csr_to_scipy(py, csr)?)
     };
 
     // obs metadata — filter by deletion vectors if present
@@ -316,8 +351,16 @@ pub(crate) fn to_anndata_with_layers<'py>(
             kwargs.set_item("varm", m.materialize_all(py)?)?;
         }
         if let Some(m) = &lazy_layers {
-            // Eager layer materialization decodes layer counts to f32 too.
-            guard_decode_loss(layer_csr_max_value(reader, 0), allow_lossy)?;
+            // Layers still materialize to f32 (the in-decode typed layer reader is
+            // a Phase-5 follow-up), then a non-default plan narrows them via the
+            // post-assembly `retype_matrix` pass in `experiment.rs`. Because that
+            // pass casts the *already-f32* values, a layer count > 2²⁴ cannot be
+            // delivered losslessly on any path — so the f32 decode-loss guard is
+            // the honest gate here (fail loud rather than silently round). The
+            // non-eager narrow path is guarded symmetrically in `experiment.rs`
+            // before the retype loop; X/raw, by contrast, narrow in-decode and are
+            // exact for `>2²⁴` integer targets.
+            guard_decode_loss(layer_csr_max_value(reader, 0), plan.allow_lossy)?;
             kwargs.set_item("layers", m.materialize_all(py)?)?;
         }
     }
@@ -338,10 +381,21 @@ pub(crate) fn to_anndata_with_layers<'py>(
             )?;
         } else {
             // adata.raw holds pre-normalization counts — the most likely place
-            // a > 2²⁴ integer lives. Guard before the f32 decode.
-            guard_decode_loss(raw_csr_max_value(reader), allow_lossy)?;
-            let raw_csr = reader.read_all_raw_csr_shards().map_err(to_pyerr)?;
-            let raw_x = csr_to_scipy(py, raw_csr)?;
+            // a > 2²⁴ integer lives. Guard before decode (dtype-aware).
+            guard_decode_loss_dtype(raw_csr_max_value(reader), plan.data_dtype, plan.allow_lossy)?;
+            // Non-default plans narrow raw in-decode too (raw stays CSR even for
+            // `container="dense"` — the conventional raw representation). This
+            // also fixes the pre-existing gap where raw stayed f32 under a
+            // non-default plan (the old post-assembly retype only touched X/layers).
+            let raw_x = if plan.is_default_csr_f32() {
+                let raw_csr = reader.read_all_raw_csr_shards().map_err(to_pyerr)?;
+                csr_to_scipy(py, raw_csr)?
+            } else {
+                let raw_csr = reader
+                    .read_all_raw_csr_shards_typed(plan)
+                    .map_err(typed_read_to_pyerr)?;
+                typed_csr_to_scipy(py, raw_csr)?
+            };
             let raw_var_batch = reader.read_raw_var().map_err(to_pyerr)?;
             let raw_var_table = record_batch_to_pyarrow(py, &raw_var_batch)?;
             let raw_var = pyarrow_table_to_pandas(&raw_var_table)?;
@@ -416,7 +470,7 @@ pub fn to_anndata_filtered<'py>(
     skip_x: bool,
     preserve_var_order: bool,
     strict_var_names: bool,
-    allow_lossy: bool,
+    plan: &scx_sparse::MaterializePlan,
 ) -> PyResult<Bound<'py, PyAny>> {
     // `skip_x` (the X-less skeleton for `to_gpu_anndata`) is only meaningful on
     // the no-filter fast path — the caller guarantees no var_names / obs_filter /
@@ -440,7 +494,7 @@ pub fn to_anndata_filtered<'py>(
             eager,
             memory_budget,
             skip_x,
-            allow_lossy,
+            plan,
         );
     }
 
@@ -461,7 +515,7 @@ pub fn to_anndata_filtered<'py>(
             true,
             memory_budget,
             false,
-            allow_lossy,
+            plan,
         )?;
 
         let obs_attr = full.getattr("obs")?;
@@ -539,11 +593,15 @@ pub fn to_anndata_filtered<'py>(
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // Guard against the silent u32→f32 decode loss over exactly the shards
-        // that survived predicate pushdown (`result.max_value`).
-        guard_decode_loss(result.max_value, allow_lossy)?;
+        // that survived predicate pushdown (`result.max_value`). The query path
+        // assembles X as f32 first (Option A: post-assembly cast), so a `>2²⁴`
+        // integer request is still gated here rather than decoded losslessly —
+        // the in-decode narrow (G2) lands on the eager path only.
+        guard_decode_loss(result.max_value, plan.allow_lossy)?;
 
         let anndata_mod = py.import("anndata")?;
-        let x = csr_to_scipy(py, result.x)?;
+        // Narrow to the requested container/dtype (no-op for the default plan).
+        let x = csr_to_scipy_typed(py, result.x, plan)?;
         let obs_table = record_batch_to_pyarrow(py, &result.obs)?;
         let obs_df = pyarrow_table_to_pandas(&obs_table)?;
         let var_table = record_batch_to_pyarrow(py, &result.var)?;
@@ -638,7 +696,7 @@ pub fn to_anndata_filtered<'py>(
         true,
         memory_budget,
         false,
-        allow_lossy,
+        plan,
     )?;
 
     if let Some(names) = var_names {

@@ -75,6 +75,33 @@ pub(crate) fn guard_decode_loss(max_value: u32, allow_lossy: bool) -> PyResult<(
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+/// Dtype-aware decode-loss guard for the in-decode narrow path: fails loud iff
+/// the shards' `max_value` cannot be represented exactly in the *target*
+/// `dtype`. Dispatches the runtime `ValueDtype` to the generic
+/// `scx_codec::guard_decode_loss_for::<T>` (scx-codec can't see `ValueDtype`);
+/// mirrors `scx_format_io::typed_read`'s internal `guard_value_dtype`. For the
+/// default `f32` target this is exactly [`guard_decode_loss`].
+pub(crate) fn guard_decode_loss_dtype(
+    max_value: u32,
+    dtype: ValueDtype,
+    allow_lossy: bool,
+) -> PyResult<()> {
+    use scx_codec::guard_decode_loss_for;
+    let r = match dtype {
+        ValueDtype::F16 => guard_decode_loss_for::<half::f16>(max_value, allow_lossy),
+        ValueDtype::F32 => guard_decode_loss_for::<f32>(max_value, allow_lossy),
+        ValueDtype::F64 => guard_decode_loss_for::<f64>(max_value, allow_lossy),
+        ValueDtype::I8 => guard_decode_loss_for::<i8>(max_value, allow_lossy),
+        ValueDtype::I16 => guard_decode_loss_for::<i16>(max_value, allow_lossy),
+        ValueDtype::I32 => guard_decode_loss_for::<i32>(max_value, allow_lossy),
+        ValueDtype::I64 => guard_decode_loss_for::<i64>(max_value, allow_lossy),
+        ValueDtype::U8 => guard_decode_loss_for::<u8>(max_value, allow_lossy),
+        ValueDtype::U16 => guard_decode_loss_for::<u16>(max_value, allow_lossy),
+        ValueDtype::U32 => guard_decode_loss_for::<u32>(max_value, allow_lossy),
+    };
+    r.map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// Build a `MaterializePlan` from the four read kwargs, applying validation and
 /// the "index_dtype ignored for dense" warning.
 pub(crate) fn build_plan(

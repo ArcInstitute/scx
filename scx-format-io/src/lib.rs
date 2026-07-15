@@ -27,6 +27,7 @@ pub mod mem;
 pub mod reader;
 pub mod shard_decode;
 pub mod shard_source;
+pub mod typed_read;
 pub(crate) mod validated_section;
 pub mod writer;
 
@@ -54,7 +55,10 @@ pub use mem::MemoryBudget;
 pub use reader::{
     assemble_filtered_metadata, assemble_sharded_metadata, decode_arrow_ipc_schema, ScxReader,
 };
-pub use shard_decode::{decode_shard_bytes, decode_shard_indptr_bytes, decode_shard_regions_scipy};
+pub use shard_decode::{
+    decode_shard_bytes, decode_shard_bytes_native, decode_shard_indptr_bytes,
+    decode_shard_regions_native, decode_shard_regions_scipy,
+};
 pub use shard_source::{ColumnShardSource, ShardSource};
 pub use writer::{
     assign_csr_shard_column_stats, chmod_to_umask, compute_shard_stats, fsync_parent_dir,

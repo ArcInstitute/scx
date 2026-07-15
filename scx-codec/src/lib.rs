@@ -13,14 +13,16 @@ pub mod value_encoding;
 
 pub use byte_delta::{byte_delta_planes, byte_undelta_planes};
 pub use cast::{
-    checked_cast_indices, checked_cast_values, guard_f32_decode_loss, CastFromF32, CastFromI32,
-    F32_MAX_EXACT_INT,
+    checked_cast_f32_into, checked_cast_i32_into, checked_cast_indices, checked_cast_u32_into,
+    checked_cast_values, checked_cast_values_u32, guard_decode_loss_for, guard_f32_decode_loss,
+    CastFromF32, CastFromI32, CastFromU32, F32_MAX_EXACT_INT,
 };
 pub use dispatch::{
     decode_indptr_only, decode_row_group, decode_row_group_indptr_only, decode_shard,
-    decode_shard_ref, decode_shard_scipy, decoded_shard_to_scipy, encode_shard,
-    zstd_decode_bounded as zstd_decompress_bounded, CodecError, CodecId, CodecSelection,
-    DecodedShard, EncodedShard, EncodedShardRef, RowGroupSpan, ScipyShard, ValueEncoding,
+    decode_shard_native, decode_shard_ref, decode_shard_scipy, decoded_shard_to_native,
+    decoded_shard_to_scipy, encode_shard, zstd_decode_bounded as zstd_decompress_bounded,
+    CodecError, CodecId, CodecSelection, DecodedShard, EncodedShard, EncodedShardRef, NativeShard,
+    RowGroupSpan, ScipyShard, ShardValuesNative, ValueEncoding,
 };
 pub use median::{
     floor_median_u32, floor_median_u32_inplace, floor_median_u64, floor_median_u64_inplace,

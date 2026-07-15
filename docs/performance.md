@@ -1635,42 +1635,56 @@ in-process — so only size + wall are reported here.
 | tahoe_c38 | **3.39** / 1537 | 3.35 / 1660 | 3.71 / **428** |
 | chemogenetic_rgfp | **2.78** / 772 | 3.70 / 1081 | 4.74 / **392** |
 
-Read **speed** is roughly parity, dataset-dependent. Read **peak RSS** is
-shardad's clear win — its `to_anndata` materializes narrow uint16 CSR, while scx's
-`to_anndata` builds float32 CSR (the "in-decode dtype materialization" gap noted in
-the design comparison; scx's answer is its streaming accelerators, which never
-build full X — see below). On census_1m scx's f32 AnnData is ~2.3 GB vs shardad's
-uint16 ~0.55 GB.
+Read **speed** is roughly parity, dataset-dependent. The peak-RSS figures in this
+table are the `read_full` 2-sample sampler's steady-state numbers (they miss the
+transient assembly high-water mark; the true peak is in the `ooc_rss_boundary`
+table below). scx's `to_anndata` now narrows **in-decode**: a
+`data_dtype="uint16"` request assembles `X` (and `adata.raw`) directly at the
+target width (2 B/nnz), never building the intermediate float32 CSR, so a narrow
+read **lowers** peak RSS instead of raising it. Measured on the true-peak
+`ooc_rss_boundary` boundary (below), the narrow `scx_materialize_u16` read
+matches or beats shardad's uint16 materialize on pbmc10k, tabula, and
+chemogenetic, and closes most of the remaining gap on census_1m (12.6 vs
+11.6 GB — shardad additionally narrows its column indices, which scx keeps at
+i32). scx's structural answer at the largest scale remains its streaming
+accelerators, which never build full X — see below.
 
 ### Out-of-core streaming vs materialize — peak RSS (MB), the at-scale story
 
-`ooc_rss_boundary`: scx streaming (bounded) vs scx full-materialize vs shardad
-full-materialize.
+`ooc_rss_boundary`: scx streaming (bounded) vs scx full-materialize (f32) vs scx
+full-materialize narrowed in-decode (uint16) vs shardad full-materialize. True
+peak RSS via the background `PeakRssSampler`. Refreshed on the Phase-4 in-decode
+narrow build (`scx_materialize_u16` = `to_anndata(data_dtype="uint16")`).
 
-| dataset | scx_stream | scx_materialize | shardad_materialize |
-|---|---:|---:|---:|
-| smartseq2 | 3977 | 2050 | **1389** |
-| tabula_100k | 3686 | 2462 | **1890** |
-| tahoe_c38 | 4909 | 4715 | **3856** |
-| chemogenetic_rgfp | 14802 | 8928 | **7473** |
-| **census_1m** | **6106** | 16560 | 11615 |
+| dataset | scx_stream | scx_materialize (f32) | scx_materialize_u16 | shardad_materialize |
+|---|---:|---:|---:|---:|
+| pbmc10k | 924 | 556 | **508** | 527 |
+| tabula_100k | 3567 | 2230 | **1887** | 1892 |
+| tahoe_c38 | 4732 | 4238 | 4047 | **3844** |
+| chemogenetic_rgfp | 14763 | 8869 | **7178** | 7471 |
+| **census_1m** | **5630** | 15268 | 12605 | 11608 |
 
-At small/medium scale shardad's narrow-dtype materialize wins (streaming overhead
-dominates when the matrix fits). **At census_1m scale the picture inverts: scx
-streaming (6.1 GB) is the lowest — below shardad's materialize (11.6 GB) and well
-under scx's own materialize (16.6 GB).** This is scx's structural out-of-core
-advantage: full-matrix approaches (both shardad and scx `to_anndata`) grow with
-dataset size, while scx streaming stays bounded — the gap widens further at
-census_5m/10m (not run here).
+The **in-decode narrow** (`scx_materialize_u16`) lowers peak RSS vs the f32
+materialize on every dataset (the value buffer drops from 4 B/nnz to 2 B/nnz with
+no f32 intermediate) — enough to **match or beat** shardad's own uint16
+materialize on pbmc10k, tabula, and chemogenetic. shardad stays lower on tahoe and
+census because it also narrows its column indices (scx keeps i32) and uses a
+tighter materialize layout; scx closes most of the census gap (12.6 vs 11.6 GB).
 
-> **Note — why `scx_materialize` here (16.6 GB) ≠ the "Full read → AnnData" peak
+**At census_1m scale the picture inverts entirely: scx streaming (5.6 GB) is the
+lowest by far — below shardad's materialize (11.6 GB) and well under either scx
+materialize (15.3 GB f32 / 12.6 GB uint16).** This is scx's structural
+out-of-core advantage: full-matrix approaches (shardad, and both scx materialize
+modes) grow with dataset size, while scx streaming stays bounded — the gap widens
+further at census_5m/10m (not run here).
+
+> **Note — why `scx_materialize` here (15.3 GB) ≠ the "Full read → AnnData" peak
 > above (~2.3 GB) for census_1m:** the two rows measure different things. The
-> `read_full` benchmark measures a steady-state `to_anndata()` peak; the
-> `ooc_rss_boundary` `scx_materialize` op runs back-to-back with `scx_stream` in
-> one process (and reads through a backed handle), so its high-water mark captures
-> transient decode buffers + the residue of the preceding streaming pass, not the
-> final AnnData size. Compare each column *within* its own table, not across the
-> two tables.
+> `read_full` benchmark's 2-sample sampler catches the *steady-state* resident
+> AnnData; the `ooc_rss_boundary` `PeakRssSampler` catches the true high-water
+> mark, which includes the transient decode/assembly buffers a narrow sampler
+> misses (and the residue of the preceding `scx_stream` pass, run back-to-back in
+> one process). Compare each column *within* its own table, not across the two.
 
 ### Selective / row-subset read (wall s)
 
@@ -1720,7 +1734,7 @@ Features with no meaningful two-sided benchmark, reported as capability presence
 | Multimodal (CITE-seq / Multiome) | ✅ | ❌ |
 | R bindings (Seurat / SCE) | ✅ | ❌ (Python only) |
 | In-place mutation (append/delete/compact/merge) | ✅ | metadata-tail only (`update_obs`) |
-| In-decode dtype/density materialization | ❌ (`to_anndata` builds f32) | ✅ (`data_dtype=`, `container=`) |
+| In-decode dtype/density materialization | ✅ true in-decode narrow on the eager path (`data_dtype=`/`container=`/`index_dtype=`): `X`/`raw` assemble directly at target dtype, no f32 intermediate → lowers peak RSS (matches/beats shardad on 3/5 datasets); `>2²⁴` integer reads exact. (query path + layers still post-assembly) | ✅ (true in-decode narrow, direct to target dtype; also narrows indices) |
 | Physical group-aligned (condition) sharding | approximated (sort + query pruning) | ✅ (native) |
 
 ### Takeaways
@@ -1730,9 +1744,11 @@ Features with no meaningful two-sided benchmark, reported as capability presence
   small datasets.
 - **Write:** shardad faster (simpler codec + multiprocessing).
 - **Read speed:** parity, dataset-dependent.
-- **Memory:** shardad's narrow-dtype materialize wins at small/medium scale; **scx
-  streaming wins at census scale** (census_1m: 6.1 vs 11.6 GB) and is the only path
-  that stays bounded as datasets grow.
+- **Memory:** scx's in-decode narrow (`to_anndata(data_dtype="uint16")`) now
+  matches or beats shardad's uint16 materialize on 3/5 datasets and closes most of
+  the gap on the rest (shardad edges ahead where it also narrows indices); **scx
+  streaming wins outright at census scale** (census_1m: 5.6 vs 11.6 GB) and is the
+  only path that stays bounded as datasets grow.
 - **Grouped access:** shardad's native physical grouping vs scx's query-pruning —
   mixed, neither dominates.
 - **Breadth:** scx carries GPU, a query engine, an ML loader, streaming
@@ -1742,8 +1758,14 @@ Two honest conclusions: scx has reached rough **compression/read parity** with a
 deep-narrow specialist on its home turf, and the projects' real difference is
 scope (a broad platform vs a focused perturbation-screen tool), not a one-sided
 performance gap. The clearest scx-specific perf win is **bounded out-of-core RAM
-at scale**; the clearest shardad-specific win is **lowest peak RSS for
-whole-matrix integer reads** via in-decode dtype narrowing (an ergonomics gap scx
-could close on the `to_anndata` path).
+at scale**. On whole-matrix integer reads, scx's eager `to_anndata` now performs a
+*true* in-decode narrow — each shard assembles directly into the target dtype's
+full-matrix buffer, never allocating the intermediate f32 matrix — so a
+`data_dtype="uint16"` read genuinely lowers peak RSS (matching or beating
+shardad's uint16 materialize on 3/5 datasets above). shardad retains a small edge
+where it also narrows column indices and uses a tighter materialize layout; scx
+keeps i32 indices. Integer→integer narrows additionally decode from the native
+`u32` stream, so a `>2²⁴` count read into `uint32`/`int64`/`float64` is now exact
+(previously a hard error).
 
 [#40]: https://github.com/ArcInstitute/shardad/issues/40

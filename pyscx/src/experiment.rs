@@ -898,7 +898,7 @@ impl PyExperiment {
                 false,
                 preserve_var_order,
                 strict_var_names,
-                plan.allow_lossy,
+                &plan,
             )?;
             // F10: a materialized (in-memory CSR) AnnData drops the on-disk CSC
             // sidecar, so a later GPU DE call silently falls back to the slower
@@ -918,17 +918,25 @@ impl PyExperiment {
                 let _ = uns.del_item("scx_source_has_csc_sidecar");
             }
 
-            // F3: convert X (and layers) into the requested container/dtype.
-            // No-op for the default plan (guarded inside retype_matrix). This is
-            // a post-assembly retype (re-extract → cast), so a narrowing eager
-            // read peaks higher than the default before shrinking; the query path
-            // is leaner and Phase 2 removes the round-trip. See `retype_matrix`.
+            // X (and raw) now narrow **in-decode** inside
+            // `to_anndata_filtered` (the typed reader assembles directly at the
+            // target dtype — see `read_all_csr_shards_typed`), so no post-assembly
+            // X retype is needed. **Layers** still materialize to f32 and are
+            // narrowed here via `retype_matrix` (a DV-filtered typed layer reader
+            // is a Phase-5 follow-up). No-op for the default plan.
             if !plan.is_default_csr_f32() {
-                let x = adata.getattr("X")?;
-                if !x.is_none() {
-                    let new_x = convert::retype_matrix(py, x, &plan)?;
-                    adata.setattr("X", new_x)?;
-                }
+                // Layers go through f32 before this cast, so a layer count > 2²⁴
+                // cannot be delivered losslessly regardless of the requested
+                // dtype — fail loud here rather than silently round (the eager
+                // path guards the same value_max inside `to_anndata_with_layers`;
+                // this covers the non-eager narrow path, which materializes layers
+                // lazily via the retype loop below). Matches the X/raw fail-loud
+                // contract; the exact `>2²⁴` layer read awaits the Phase-5 typed
+                // layer reader.
+                convert::guard_decode_loss(
+                    convert::layer_csr_max_value(&self.reader, 0),
+                    plan.allow_lossy,
+                )?;
                 let layers_obj = adata.getattr("layers")?;
                 let mut keys: Vec<String> = Vec::new();
                 for k in layers_obj.call_method0("keys")?.try_iter()? {
@@ -1061,7 +1069,7 @@ impl PyExperiment {
                     true,  // skip_x
                     false, // preserve_var_order (fast path: var_names is None)
                     false, // strict_var_names (no names to check)
-                    allow_lossy,
+                    &plan, // default plan (non-default rejected above); GPU X is f32-native
                 )?;
 
                 // Raw shard bytes (borrow the reader's mmap) + a cheap header
@@ -1201,7 +1209,7 @@ impl PyExperiment {
                     false, // skip_x
                     preserve_var_order,
                     strict_var_names,
-                    allow_lossy,
+                    &plan, // default plan (non-default rejected above); GPU X is f32-native
                 )?;
 
                 // Pull X's CSR arrays. scipy may store indptr/indices as int32 when

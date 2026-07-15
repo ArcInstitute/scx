@@ -274,6 +274,31 @@ class ScxRunner(FormatRunner):
         _, timing = self.timed_run(_read)
         return timing
 
+    def read_full_narrow(
+        self,
+        path: str | Path,
+        data_dtype: str = "uint16",
+        allow_lossy: bool = True,
+    ) -> TimingResult:
+        """Full read narrowed to `data_dtype` (F3 in-decode narrow).
+
+        Unlike `read_full`, the eager `to_anndata` path assembles X directly at
+        the target width (never building the full-matrix f32 CSR), so this is the
+        peak-RSS analog of shardad's narrow `uint16` materialize. `allow_lossy`
+        defaults on so the RSS measurement stays robust across datasets (a count
+        above the target range wraps rather than erroring — value correctness is
+        covered by the fail-loud gate tests, not this benchmark).
+        """
+        self._check_pyscx()
+
+        def _read():
+            ds = pyscx.open(str(path))
+            adata = ds.to_anndata(data_dtype=data_dtype, allow_lossy=allow_lossy)
+            _ = adata.X
+
+        _, timing = self.timed_run(_read)
+        return timing
+
     def read_subset(
         self,
         path: str | Path,

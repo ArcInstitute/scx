@@ -10,9 +10,12 @@ RAM — the capability boundary).
 
 Scenarios (per format):
   * ``scx_stream``    — scx `iterate_streaming` (backed row-chunk pass, bounded).
-  * ``scx_materialize`` — scx `read_full` (to_anndata, full CSR resident).
-  * ``shardad_materialize`` — shardad `read_full` (whole matrix in RAM). shardad
-    has no streaming path, so this is its only full-read mode.
+  * ``scx_materialize`` — scx `read_full` (to_anndata, full f32 CSR resident).
+  * ``scx_materialize_u16`` — scx `read_full_narrow` (to_anndata data_dtype=uint16;
+    F3 in-decode narrow — X assembles directly at 2 B/nnz, never building the f32
+    CSR). The peak-RSS analog of shardad's narrow uint16 materialize.
+  * ``shardad_materialize`` — shardad `read_full` (whole matrix in RAM, uint16).
+    shardad has no streaming path, so this is its only full-read mode.
 
 Peak RSS is a **true high-water mark** via ``rss.PeakRssSampler`` (a background
 sampler), not the 2-sample max the other read benches use — the materialize peak
@@ -89,6 +92,7 @@ def run(
         scenarios = [
             ("scx_stream", lambda: runner.iterate_streaming(path, STREAMING_CHUNK_ROWS)),
             ("scx_materialize", lambda: runner.read_full(path)),
+            ("scx_materialize_u16", lambda: runner.read_full_narrow(path, "uint16")),
         ]
     else:  # shardad
         scenarios = [("shardad_materialize", lambda: runner.read_full(path))]

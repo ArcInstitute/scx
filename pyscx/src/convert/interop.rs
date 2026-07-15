@@ -300,6 +300,77 @@ pub(crate) fn csr_to_scipy<'py>(
     scipy_sparse.call_method("csr_matrix", args, Some(&kwargs))
 }
 
+/// Move a typed value buffer into a 1-D numpy array (zero-copy per arm).
+///
+/// The in-assembly narrow reader already produced values at the target dtype, so
+/// there is no cast here — each `Vec<T>` moves straight into numpy (the `half`
+/// feature gives a native `f16` array for the `F16` arm).
+pub(crate) fn value_buffer_to_numpy<'py>(
+    py: Python<'py>,
+    buf: scx_sparse::ValueBuffer,
+) -> Bound<'py, PyAny> {
+    use scx_sparse::ValueBuffer;
+    match buf {
+        ValueBuffer::F16(v) => PyArray1::from_vec(py, v).into_any(),
+        ValueBuffer::F32(v) => PyArray1::from_vec(py, v).into_any(),
+        ValueBuffer::F64(v) => PyArray1::from_vec(py, v).into_any(),
+        ValueBuffer::I8(v) => PyArray1::from_vec(py, v).into_any(),
+        ValueBuffer::I16(v) => PyArray1::from_vec(py, v).into_any(),
+        ValueBuffer::I32(v) => PyArray1::from_vec(py, v).into_any(),
+        ValueBuffer::I64(v) => PyArray1::from_vec(py, v).into_any(),
+        ValueBuffer::U8(v) => PyArray1::from_vec(py, v).into_any(),
+        ValueBuffer::U16(v) => PyArray1::from_vec(py, v).into_any(),
+        ValueBuffer::U32(v) => PyArray1::from_vec(py, v).into_any(),
+    }
+}
+
+/// Move a typed CSR index buffer into a 1-D numpy array (zero-copy per arm).
+pub(crate) fn index_buffer_to_numpy<'py>(
+    py: Python<'py>,
+    buf: scx_sparse::IndexBuffer,
+) -> Bound<'py, PyAny> {
+    use scx_sparse::IndexBuffer;
+    match buf {
+        IndexBuffer::I16(v) => PyArray1::from_vec(py, v).into_any(),
+        IndexBuffer::I32(v) => PyArray1::from_vec(py, v).into_any(),
+        IndexBuffer::I64(v) => PyArray1::from_vec(py, v).into_any(),
+    }
+}
+
+/// Assemble a [`scx_sparse::TypedCsr`] into a scipy `csr_matrix` (zero-copy).
+///
+/// The in-assembly narrow reader (`read_all_csr_shards_typed`) already
+/// materialized the values / indices at the target dtype, so this is a pure
+/// move into numpy + scipy assembly — no `f32` intermediate, no cast. Mirrors
+/// [`csr_to_scipy`].
+pub(crate) fn typed_csr_to_scipy<'py>(
+    py: Python<'py>,
+    csr: scx_sparse::TypedCsr,
+) -> PyResult<Bound<'py, PyAny>> {
+    let shape = csr.shape;
+    let data = value_buffer_to_numpy(py, csr.values);
+    let indices = index_buffer_to_numpy(py, csr.indices);
+    let indptr = PyArray1::from_vec(py, csr.indptr).into_any();
+
+    let scipy_sparse = py.import("scipy.sparse")?;
+    let args = ((data, indices, indptr),);
+    let kwargs = pyo3::types::PyDict::new(py);
+    kwargs.set_item("shape", shape)?;
+    kwargs.set_item("copy", false)?;
+    scipy_sparse.call_method("csr_matrix", args, Some(&kwargs))
+}
+
+/// Assemble a [`scx_sparse::TypedDense`] into a row-major 2-D numpy array
+/// (zero-copy move of the flat buffer, then reshape).
+pub(crate) fn typed_dense_to_numpy<'py>(
+    py: Python<'py>,
+    dense: scx_sparse::TypedDense,
+) -> PyResult<Bound<'py, PyAny>> {
+    let (n_rows, n_cols) = dense.shape;
+    let flat = value_buffer_to_numpy(py, dense.values);
+    super::reshape_2d(flat, n_rows, n_cols)
+}
+
 /// Materialize an ScxCsr into the container/dtype requested by `plan` (F3).
 ///
 /// The default plan (CSR / f32 / i32) delegates to the untouched `csr_to_scipy`

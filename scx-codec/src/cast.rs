@@ -270,6 +270,252 @@ impl CastFromI32 for i16 {
     }
 }
 
+// --- Native integer source (u32) ------------------------------------------
+//
+// The in-assembly narrow read decodes an integer-encoded shard to its native
+// `u32` stream (Scx1 `rice_decode`, or raw-LE `u8`/`u16`/`u32` widened to
+// `u32`) and casts *directly* to the target dtype, never routing through `f32`.
+// This makes integer→integer narrows exact for any `value_max` (including
+// counts `> 2²⁴`, which the f32 path rounds) — that is the correctness win the
+// `CastFromF32` path cannot deliver.
+
+/// A target dtype reachable from a `u32` value stream.
+pub trait CastFromU32: Copy + Sized {
+    /// numpy dtype name, used in error messages.
+    const NAME: &'static str;
+    /// `true` when every `u32` casts without loss (`u32` ⊆ target exactly).
+    const ALWAYS_SAFE: bool;
+    /// Largest `u32` that casts to this target losslessly. Drives the O(1)
+    /// pre-decode guard: integer range limits (`u16` → 65535) and float
+    /// exact-integer limits (`f16` → 2048, `f32` → 2²⁴) both fall out of it.
+    const MAX_LOSSLESS_U32: u32;
+    /// Plain cast, no checking. Only called when known safe or `allow_lossy`.
+    fn cast_unchecked(v: u32) -> Self;
+    /// `Some(cast)` iff the value casts losslessly, else `None`.
+    fn cast_lossless(v: u32) -> Option<Self>;
+}
+
+/// Integer value target from `u32`: `TryFrom<u32>` is the exact range check
+/// (exact for any `value_max`, including `> 2²⁴`, because `f32` is never
+/// involved).
+macro_rules! impl_cast_from_u32_int {
+    ($t:ty, $name:literal, $always:expr, $max_lossless:expr) => {
+        impl CastFromU32 for $t {
+            const NAME: &'static str = $name;
+            const ALWAYS_SAFE: bool = $always;
+            const MAX_LOSSLESS_U32: u32 = $max_lossless;
+            fn cast_unchecked(v: u32) -> Self {
+                v as $t
+            }
+            fn cast_lossless(v: u32) -> Option<Self> {
+                <$t>::try_from(v).ok()
+            }
+        }
+    };
+}
+
+impl_cast_from_u32_int!(u8, "uint8", false, 255);
+impl_cast_from_u32_int!(u16, "uint16", false, 65535);
+impl_cast_from_u32_int!(u32, "uint32", true, u32::MAX);
+impl_cast_from_u32_int!(i8, "int8", false, 127);
+impl_cast_from_u32_int!(i16, "int16", false, 32767);
+impl_cast_from_u32_int!(i32, "int32", false, i32::MAX as u32);
+impl_cast_from_u32_int!(i64, "int64", true, u32::MAX);
+
+impl CastFromU32 for f64 {
+    const NAME: &'static str = "float64";
+    const ALWAYS_SAFE: bool = true;
+    const MAX_LOSSLESS_U32: u32 = u32::MAX;
+    fn cast_unchecked(v: u32) -> Self {
+        v as f64
+    }
+    fn cast_lossless(v: u32) -> Option<Self> {
+        Some(v as f64)
+    }
+}
+
+impl CastFromU32 for f32 {
+    const NAME: &'static str = "float32";
+    const ALWAYS_SAFE: bool = false;
+    const MAX_LOSSLESS_U32: u32 = F32_MAX_EXACT_INT;
+    fn cast_unchecked(v: u32) -> Self {
+        v as f32
+    }
+    fn cast_lossless(v: u32) -> Option<Self> {
+        let t = v as f32;
+        // Exact iff the f32 round-trips to the same integer. Compare in f64,
+        // which represents every u32 exactly, so the check itself is exact.
+        if (t as f64) == v as f64 {
+            Some(t)
+        } else {
+            None
+        }
+    }
+}
+
+impl CastFromU32 for half::f16 {
+    const NAME: &'static str = "float16";
+    const ALWAYS_SAFE: bool = false;
+    const MAX_LOSSLESS_U32: u32 = 2048;
+    fn cast_unchecked(v: u32) -> Self {
+        half::f16::from_f32(v as f32)
+    }
+    fn cast_lossless(v: u32) -> Option<Self> {
+        let t = half::f16::from_f32(v as f32);
+        if (t.to_f32() as f64) == v as f64 {
+            Some(t)
+        } else {
+            None
+        }
+    }
+}
+
+/// Cast a `u32` value stream to `T`, failing loud on any lossy narrowing unless
+/// `allow_lossy` is set. Mirror of [`checked_cast_values`] with a `u32` source.
+pub fn checked_cast_values_u32<T: CastFromU32>(
+    src: &[u32],
+    allow_lossy: bool,
+) -> Result<Vec<T>, CodecError> {
+    if T::ALWAYS_SAFE || allow_lossy {
+        return Ok(src.iter().map(|&v| T::cast_unchecked(v)).collect());
+    }
+    let mut out = Vec::with_capacity(src.len());
+    for (i, &v) in src.iter().enumerate() {
+        match T::cast_lossless(v) {
+            Some(t) => out.push(t),
+            None => {
+                return Err(CodecError::MalformedInput(format!(
+                    "lossy cast of value {v} (at nnz index {i}) to {name}; \
+                     use a wider `data_dtype` or pass `allow_lossy=True`",
+                    name = T::NAME,
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Length mismatch between an in-place cast's source and destination slices.
+fn cast_into_len_check(src_len: usize, dst_len: usize) -> Result<(), CodecError> {
+    if src_len != dst_len {
+        return Err(CodecError::MalformedInput(format!(
+            "cast_into length mismatch: {src_len} source values into {dst_len} destination slots"
+        )));
+    }
+    Ok(())
+}
+
+/// Cast a `u32` stream into a caller-owned destination slice (the in-assembly
+/// reader fills a shard's slice of the target buffer at its running nnz offset).
+pub fn checked_cast_u32_into<T: CastFromU32>(
+    src: &[u32],
+    dst: &mut [T],
+    allow_lossy: bool,
+) -> Result<(), CodecError> {
+    cast_into_len_check(src.len(), dst.len())?;
+    if T::ALWAYS_SAFE || allow_lossy {
+        for (d, &v) in dst.iter_mut().zip(src) {
+            *d = T::cast_unchecked(v);
+        }
+        return Ok(());
+    }
+    for (i, (d, &v)) in dst.iter_mut().zip(src).enumerate() {
+        match T::cast_lossless(v) {
+            Some(t) => *d = t,
+            None => {
+                return Err(CodecError::MalformedInput(format!(
+                    "lossy cast of value {v} (at nnz index {i}) to {name}; \
+                     use a wider `data_dtype` or pass `allow_lossy=True`",
+                    name = T::NAME,
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cast an `f32` stream into a caller-owned destination slice (float-encoded
+/// shards decode native → `f32`, then narrow via this in-place variant).
+pub fn checked_cast_f32_into<T: CastFromF32>(
+    src: &[f32],
+    dst: &mut [T],
+    allow_lossy: bool,
+) -> Result<(), CodecError> {
+    cast_into_len_check(src.len(), dst.len())?;
+    if T::ALWAYS_SAFE || allow_lossy {
+        for (d, &v) in dst.iter_mut().zip(src) {
+            *d = T::cast_unchecked(v);
+        }
+        return Ok(());
+    }
+    for (i, (d, &v)) in dst.iter_mut().zip(src).enumerate() {
+        match T::cast_lossless(v) {
+            Some(t) => *d = t,
+            None => {
+                return Err(CodecError::MalformedInput(format!(
+                    "lossy cast of value {v} (at nnz index {i}) to {name}; \
+                     use a wider `data_dtype` or pass `allow_lossy=True`",
+                    name = T::NAME,
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cast an `i32` index stream into a caller-owned destination slice.
+pub fn checked_cast_i32_into<I: CastFromI32>(
+    src: &[i32],
+    dst: &mut [I],
+    allow_lossy: bool,
+) -> Result<(), CodecError> {
+    cast_into_len_check(src.len(), dst.len())?;
+    if I::ALWAYS_SAFE || allow_lossy {
+        for (d, &v) in dst.iter_mut().zip(src) {
+            *d = I::cast_unchecked(v);
+        }
+        return Ok(());
+    }
+    for (i, (d, &v)) in dst.iter_mut().zip(src).enumerate() {
+        match I::cast_lossless(v) {
+            Some(t) => *d = t,
+            None => {
+                return Err(CodecError::MalformedInput(format!(
+                    "lossy cast of column index {v} (at nnz index {i}) to {name}; \
+                     use a wider `index_dtype`",
+                    name = I::NAME,
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// O(1) pre-decode guard for a chosen target dtype: fails loud when an
+/// integer-encoded shard's `max_value` cannot be represented losslessly in the
+/// target `T` and the caller has not opted into lossy narrowing.
+///
+/// The dtype-aware generalization of [`guard_f32_decode_loss`]: keyed on
+/// `T::MAX_LOSSLESS_U32`, so it covers float exact-integer limits (`f16` → 2048,
+/// `f32` → 2²⁴, `f64` → never) and integer range limits (`u16` → 65535, …)
+/// uniformly. Float-encoded shards record `value_max = 0`, so they never trip
+/// it regardless of target.
+pub fn guard_decode_loss_for<T: CastFromU32>(
+    max_value: u32,
+    allow_lossy: bool,
+) -> Result<(), CodecError> {
+    if allow_lossy || max_value <= T::MAX_LOSSLESS_U32 {
+        return Ok(());
+    }
+    Err(CodecError::MalformedInput(format!(
+        "integer value {max_value} exceeds {limit}, the largest integer representable \
+         exactly in {name}; this read would lose precision. Use a wider `data_dtype` or \
+         pass `allow_lossy=True`.",
+        limit = T::MAX_LOSSLESS_U32,
+        name = T::NAME,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +601,95 @@ mod tests {
         // 32768 overflows i16 -> fail loud
         let big = vec![32768i32];
         assert!(checked_cast_indices::<i16>(&big, false).is_err());
+    }
+
+    // --- Native u32-source gate ---
+
+    #[test]
+    fn u32_source_exact_above_2pow24() {
+        // The whole point: integer counts > 2²⁴ narrow losslessly to exact
+        // integer targets, where the f32 path would round.
+        let vals = [
+            F32_MAX_EXACT_INT - 1,
+            F32_MAX_EXACT_INT,
+            F32_MAX_EXACT_INT + 1,
+            u32::MAX,
+        ];
+        for &v in &vals {
+            // u32 target (identity, ALWAYS_SAFE) and i64 target are exact.
+            let u: Vec<u32> = checked_cast_values_u32(&[v], false).unwrap();
+            assert_eq!(u, vec![v]);
+            let i: Vec<i64> = checked_cast_values_u32(&[v], false).unwrap();
+            assert_eq!(i, vec![v as i64]);
+            // u16 cannot represent any of these (all > 65535) -> fail loud.
+            assert!(checked_cast_values_u32::<u16>(&[v], false).is_err());
+        }
+    }
+
+    #[test]
+    fn u32_narrow_out_of_range_fails_loud() {
+        let err = checked_cast_values_u32::<u8>(&[256], false).unwrap_err();
+        assert!(matches!(err, CodecError::MalformedInput(_)));
+        // allow_lossy saturates/truncates without error (256 as u8 == 0).
+        let out: Vec<u8> = checked_cast_values_u32(&[256], true).unwrap();
+        assert_eq!(out, vec![0u8]);
+    }
+
+    #[test]
+    fn u32_into_fills_slice() {
+        let src = [1u32, 2, 3];
+        let mut dst = [0u16; 3];
+        checked_cast_u32_into(&src, &mut dst, false).unwrap();
+        assert_eq!(dst, [1u16, 2, 3]);
+        // length mismatch is an error
+        let mut short = [0u16; 2];
+        assert!(checked_cast_u32_into(&src, &mut short, false).is_err());
+        // lossy element without allow_lossy errors, leaving the destination untouched past the fault
+        let mut d2 = [0u8; 2];
+        assert!(checked_cast_u32_into(&[10u32, 300], &mut d2, false).is_err());
+    }
+
+    #[test]
+    fn f32_and_i32_into_fill_slices() {
+        let mut vd = [0.0f64; 3];
+        checked_cast_f32_into(&[1.0f32, 2.5, -3.0], &mut vd, false).unwrap();
+        assert_eq!(vd, [1.0f64, 2.5, -3.0]);
+
+        let mut idx = [0i16; 3];
+        checked_cast_i32_into(&[0i32, 5, 32767], &mut idx, false).unwrap();
+        assert_eq!(idx, [0i16, 5, 32767]);
+        let mut idx_bad = [0i16; 1];
+        assert!(checked_cast_i32_into(&[32768i32], &mut idx_bad, false).is_err());
+    }
+
+    #[test]
+    fn guard_decode_loss_for_thresholds() {
+        // Integer targets: fire on range overflow.
+        assert!(guard_decode_loss_for::<u16>(65535, false).is_ok());
+        assert!(guard_decode_loss_for::<u16>(65536, false).is_err());
+        // Always-safe targets never fire.
+        assert!(guard_decode_loss_for::<u32>(u32::MAX, false).is_ok());
+        assert!(guard_decode_loss_for::<i64>(u32::MAX, false).is_ok());
+        assert!(guard_decode_loss_for::<f64>(u32::MAX, false).is_ok());
+        // Float exact-integer limits.
+        assert!(guard_decode_loss_for::<half::f16>(2048, false).is_ok());
+        assert!(guard_decode_loss_for::<half::f16>(2049, false).is_err());
+        assert!(guard_decode_loss_for::<f32>(F32_MAX_EXACT_INT, false).is_ok());
+        assert!(guard_decode_loss_for::<f32>(F32_MAX_EXACT_INT + 1, false).is_err());
+        // allow_lossy bypasses regardless of target.
+        assert!(guard_decode_loss_for::<u16>(65536, true).is_ok());
+        assert!(guard_decode_loss_for::<f32>(u32::MAX, true).is_ok());
+    }
+
+    #[test]
+    fn guard_f32_parity_with_generic() {
+        // The f32 specialization must agree with the generic guard at the boundary.
+        for &v in &[F32_MAX_EXACT_INT, F32_MAX_EXACT_INT + 1, u32::MAX] {
+            assert_eq!(
+                guard_f32_decode_loss(v, false).is_ok(),
+                guard_decode_loss_for::<f32>(v, false).is_ok(),
+                "mismatch at {v}"
+            );
+        }
     }
 }
