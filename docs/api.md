@@ -1296,8 +1296,11 @@ the repr onto `Experiment.info() -> str`.
       negative-into-unsigned, or a count above 2²⁴ into `float16`) raises
       `ValueError`; `True` performs the narrowing anyway.
     - The default (`container="csr"`, no dtype kwargs) is **byte-identical and
-      zero-copy** — the Vec is moved into numpy with no cast. Any non-default
-      request is a read-then-convert (an extra cast/copy of `X`).
+      zero-copy** — the Vec is moved into numpy with no cast. A non-default eager
+      request narrows **in-decode**: `X` (and `adata.raw`) assemble directly at the
+      target width, never building the full-matrix f32 CSR, so a narrow
+      `data_dtype=` lowers peak RSS. (The `obs_filter` query path and eager
+      `layers` still cast post-assembly.)
   - Returns `obsm` (dense), `varm` (dense), `obsp` (scipy CSR), and
     `varp` (scipy CSR) when present in the file. `obsp` / `varp` are
     not subject to deletion-vector row filtering — when cells are
@@ -1353,8 +1356,18 @@ rejects any non-default request — the device path is f32-native).
 **Zero-copy default preserved.** `container="csr"` with no dtype kwargs takes the
 exact pre-existing path: the decoded `Vec`s are moved into numpy with `copy=False`
 and no cast. This is guaranteed byte-identical and is the performance-sensitive
-common case. Any non-default request is a **read-then-convert**: the f32 CSR is
-built first, then cast into the requested container/dtype (an extra copy of `X`).
+common case.
+
+**In-decode narrow (eager `X` / `raw`).** A non-default request on the eager
+`to_anndata` path narrows **in-decode**: each shard is decoded to its native
+stream (integer counts as `u32`, floats as `f32`) and cast straight into a
+full-matrix buffer *of the target dtype*, so the intermediate f32 CSR is never
+allocated. A narrow `data_dtype="uint16"` read therefore **lowers** peak RSS
+(2 B/nnz for the value buffer, not 4 B/nnz + a narrow copy) — see
+[performance.md § Full read → AnnData](performance.md#full-read--anndata). Two
+paths still cast post-assembly (correct, no RSS win): the `obs_filter` **query**
+path (it assembles f32 after predicate pushdown) and eagerly-materialized
+**layers**. `to_gpu_anndata` is unchanged (f32-native device path).
 
 **Fail-loud cast gate (`allow_lossy`).** With `allow_lossy=False` (the default),
 any narrowing that would lose data raises `ValueError` rather than silently
@@ -1369,25 +1382,27 @@ The error names the offending value and suggests a wider dtype or
 `allow_lossy=True`. Widening casts (e.g. `uint8 → float32`, the default) are
 always safe and are never gated.
 
-**Decode-loss guard (the `u32 → f32` case).** scx decodes on-disk integer counts
-to an `f32` CSR *before* any dtype materialization, so counts above 2²⁴
-(16,777,216 — routine in pseudobulk / aggregated counts) would silently round.
-Every read now consults the catalog's per-shard `value_max` first and **fails
-loud when it exceeds 2²⁴** — including the plain `to_anndata()` default, and
-regardless of the requested `data_dtype` (even `float64`, because the read still
-intermediates through f32 in this release). Pass `allow_lossy=True` to accept the
-rounding. This is a **behavior change**: reads that previously returned silently
-rounded values on such archives now raise. Notes:
+**Decode-loss guard (the `u32 → f32` case).** The guard fires per *target dtype*:
+a read fails loud when the shards' `value_max` cannot be represented exactly in
+the requested `data_dtype`. Because the eager path now narrows **in-decode**
+(integer counts cast straight from the native `u32` stream, never through f32), a
+`> 2²⁴` integer count read into an **exactly representable** dtype
+(`uint32` / `int64` / `float64`) now **succeeds losslessly** — where it previously
+failed loud. The guard still fires (unless `allow_lossy=True`) for targets that
+genuinely cannot hold the value: the plain `to_anndata()` default (`float32`, exact
+only to 2²⁴), and `float16` (exact only to 2¹¹). Notes:
 
 - The guard is **integer-encoding-only** and O(1): float-encoded shards record
   `value_max = 0` in the catalog, so continuous / log-normalized data never trips
   it, and the check is a single per-shard comparison (no data scan).
-- It is **conservative**: the catalog carries only the per-shard maximum, so a
-  shard whose max exceeds 2²⁴ trips the guard even if that particular value is
-  itself f32-exact. `allow_lossy=True` is the escape hatch.
-- A *lossless* wide read (returning the exact counts as `float64` / `int64`)
-  requires pushing dtype into the decode; that is a planned follow-up. Until then,
-  such a read fails loud rather than returning corrupted values.
+- For `float32` it is **conservative**: the catalog carries only the per-shard
+  maximum, so a shard whose max exceeds 2²⁴ trips the guard even if that particular
+  value is itself f32-exact. Read into `uint32` / `int64` / `float64` (exact), or
+  pass `allow_lossy=True`, to bypass.
+- The **query** (`obs_filter`) path assembles f32 first (post-assembly cast), so a
+  `> 2²⁴` integer request there still fails loud (or rounds under `allow_lossy`) —
+  the lossless-wide read lands on the eager path. Extending it to the query path is
+  a planned follow-up.
 
 **Which matrices are guarded.** The guard covers every eagerly-decoded count
 matrix: `X` (all `to_anndata` paths — default, `var_names`, `obs_filter`,
