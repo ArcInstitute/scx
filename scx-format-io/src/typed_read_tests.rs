@@ -176,6 +176,17 @@ fn write_file(
     n_vars: usize,
     shards: &[ShardSpec],
 ) -> std::path::PathBuf {
+    write_file_codec(dir, name, n_obs, n_vars, shards, CodecId::None)
+}
+
+fn write_file_codec(
+    dir: &tempfile::TempDir,
+    name: &str,
+    n_obs: usize,
+    n_vars: usize,
+    shards: &[ShardSpec],
+    codec: CodecId,
+) -> std::path::PathBuf {
     let path = dir.path().join(name);
     let total_nnz: u64 = shards.iter().map(|s| *s.0.last().unwrap()).sum();
     let hdr = header(n_obs as u64, n_vars as u64, total_nnz);
@@ -184,7 +195,7 @@ fn write_file(
     writer.write_var(&var_batch(n_vars)).unwrap();
     for (indptr, indices, values, enc, row_start) in shards {
         writer
-            .write_csr_shard(indptr, indices, values, CodecId::None, *enc, *row_start)
+            .write_csr_shard(indptr, indices, values, codec, *enc, *row_start)
             .unwrap();
     }
     writer.finish().unwrap();
@@ -253,6 +264,96 @@ fn typed_assembly_matches_f32_cast_csr() {
         }
         _ => panic!("wrong buffer arms"),
     }
+}
+
+/// End-to-end typed assembly (the reader + `assemble_shards_typed` +
+/// `read_shard_from_entry_native`, not just the `decode_shard_regions_native`
+/// primitive) across the real codecs — not only `CodecId::None`. Confirms the
+/// assembler's per-shard native decode + cast + indptr rebasing is codec-agnostic.
+#[test]
+fn typed_assembly_matches_f32_cast_across_codecs() {
+    let plan = MaterializePlan {
+        container: Container::Csr,
+        data_dtype: ValueDtype::U16,
+        index_dtype: IndexDtype::I32,
+        allow_lossy: false,
+    };
+    for codec in [
+        CodecId::None,
+        CodecId::Zstd,
+        CodecId::Scx1,
+        CodecId::ShufDeltaZstd,
+        CodecId::Lz4Shuffle,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let shards = vec![u8_shard(3, 10, 0, 0), u8_shard(3, 10, 3, 100)];
+        let path = write_file_codec(&dir, "codec.scx", 6, 10, &shards, codec);
+        let reader = ScxReader::open(&path).unwrap();
+
+        let f32_csr = reader.read_all_csr_shards().unwrap();
+        let typed = reader.read_all_csr_shards_typed(&plan).unwrap();
+        assert_eq!(typed.shape, f32_csr.shape, "shape mismatch for {codec:?}");
+        assert_eq!(
+            typed.indptr, f32_csr.indptr,
+            "indptr mismatch for {codec:?}"
+        );
+        let want_ix: Vec<i32> = checked_cast_indices(&f32_csr.indices, false).unwrap();
+        let want_v: Vec<u16> = checked_cast_values(&f32_csr.data, false).unwrap();
+        match (&typed.indices, &typed.values) {
+            (IndexBuffer::I32(ix), ValueBuffer::U16(v)) => {
+                assert_eq!(ix, &want_ix, "indices mismatch for {codec:?}");
+                assert_eq!(v, &want_v, "values mismatch for {codec:?}");
+            }
+            _ => panic!("wrong buffer arms for {codec:?}"),
+        }
+    }
+}
+
+/// `index_dtype="int16"` narrowing: the reader produces an `IndexBuffer::I16`
+/// arm, and a column index that overflows `i16` (≥ 32768) fails loud unless
+/// `allow_lossy` (spec § 4 index-narrowing contract). This is the only coverage
+/// of the I16 fill arm (scipy upcasts int16→int32, so a Python CSR read can't
+/// observe it — see docs/api.md).
+#[test]
+fn typed_index_narrow_i16() {
+    // In-range: n_vars small, indices < 32768 → I16 arm, exact.
+    let dir = tempfile::tempdir().unwrap();
+    let shards = vec![u8_shard(4, 10, 0, 0)];
+    let path = write_file(&dir, "i16_ok.scx", 4, 10, &shards);
+    let reader = ScxReader::open(&path).unwrap();
+    let plan = MaterializePlan {
+        container: Container::Csr,
+        data_dtype: ValueDtype::U16,
+        index_dtype: IndexDtype::I16,
+        allow_lossy: false,
+    };
+    let typed = reader.read_all_csr_shards_typed(&plan).unwrap();
+    let f32_csr = reader.read_all_csr_shards().unwrap();
+    let want_ix: Vec<i16> = checked_cast_indices(&f32_csr.indices, false).unwrap();
+    match &typed.indices {
+        IndexBuffer::I16(ix) => assert_eq!(ix, &want_ix),
+        _ => panic!("expected I16 index arm"),
+    }
+
+    // Out-of-range: a column index of 32768 (≥ i16::MAX+1) fails loud into i16.
+    let dir2 = tempfile::tempdir().unwrap();
+    let n_vars = 40_000usize;
+    let indptr = vec![0u64, 1];
+    let indices = vec![32_768u32]; // > i16::MAX (32767)
+    let values = vec![7u8];
+    let shard: ShardSpec = (indptr, indices, values, ValueEncoding::Uint8, 0);
+    let path2 = write_file(&dir2, "i16_overflow.scx", 1, n_vars, &[shard]);
+    let reader2 = ScxReader::open(&path2).unwrap();
+    assert!(
+        reader2.read_all_csr_shards_typed(&plan).is_err(),
+        "column index 32768 must fail loud into int16 without allow_lossy"
+    );
+    // allow_lossy wraps without error.
+    let plan_lossy = MaterializePlan {
+        allow_lossy: true,
+        ..plan
+    };
+    assert!(reader2.read_all_csr_shards_typed(&plan_lossy).is_ok());
 }
 
 #[test]

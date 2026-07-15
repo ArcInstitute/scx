@@ -288,12 +288,27 @@ fn fill_value_slice(
     Ok(())
 }
 
+/// Total nnz retained by the keep-mask — used to pre-size the compacted
+/// buffers so the copy doesn't repeatedly reallocate (the common case is few
+/// deletions on a large matrix, where the kept total is close to the original).
+#[cfg(feature = "deletion-vectors")]
+fn kept_nnz(indptr: &[i64], keep: &[bool]) -> usize {
+    let mut n = 0usize;
+    for (row, &k) in keep.iter().enumerate() {
+        if k {
+            n += (indptr[row + 1] - indptr[row]) as usize;
+        }
+    }
+    n
+}
+
 /// Compact an index buffer to the kept rows (deletion-vector filter).
 #[cfg(feature = "deletion-vectors")]
 fn compact_index_buffer(src: &IndexBuffer, indptr: &[i64], keep: &[bool]) -> IndexBuffer {
+    let cap = kept_nnz(indptr, keep);
     macro_rules! compact {
         ($arm:ident, $v:expr) => {{
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity(cap);
             for (row, &k) in keep.iter().enumerate() {
                 if !k {
                     continue;
@@ -315,9 +330,10 @@ fn compact_index_buffer(src: &IndexBuffer, indptr: &[i64], keep: &[bool]) -> Ind
 /// Compact a value buffer to the kept rows (deletion-vector filter).
 #[cfg(feature = "deletion-vectors")]
 fn compact_value_buffer(src: &ValueBuffer, indptr: &[i64], keep: &[bool]) -> ValueBuffer {
+    let cap = kept_nnz(indptr, keep);
     macro_rules! compact {
         ($arm:ident, $v:expr) => {{
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity(cap);
             for (row, &k) in keep.iter().enumerate() {
                 if !k {
                     continue;

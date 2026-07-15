@@ -921,10 +921,22 @@ impl PyExperiment {
             // X (and raw) now narrow **in-decode** inside
             // `to_anndata_filtered` (the typed reader assembles directly at the
             // target dtype — see `read_all_csr_shards_typed`), so no post-assembly
-            // X retype is needed. Eager **layers** still decode to f32 and are
+            // X retype is needed. **Layers** still materialize to f32 and are
             // narrowed here via `retype_matrix` (a DV-filtered typed layer reader
             // is a Phase-5 follow-up). No-op for the default plan.
             if !plan.is_default_csr_f32() {
+                // Layers go through f32 before this cast, so a layer count > 2²⁴
+                // cannot be delivered losslessly regardless of the requested
+                // dtype — fail loud here rather than silently round (the eager
+                // path guards the same value_max inside `to_anndata_with_layers`;
+                // this covers the non-eager narrow path, which materializes layers
+                // lazily via the retype loop below). Matches the X/raw fail-loud
+                // contract; the exact `>2²⁴` layer read awaits the Phase-5 typed
+                // layer reader.
+                convert::guard_decode_loss(
+                    convert::layer_csr_max_value(&self.reader, 0),
+                    plan.allow_lossy,
+                )?;
                 let layers_obj = adata.getattr("layers")?;
                 let mut keys: Vec<String> = Vec::new();
                 for k in layers_obj.call_method0("keys")?.try_iter()? {

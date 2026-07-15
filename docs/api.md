@@ -1350,7 +1350,7 @@ rejects any non-default request — the device path is f32-native).
 |-------|--------|---------|-------|
 | `container` | `"csr"` \| `"dense"` | `"csr"` | `"dense"` returns a row-major `numpy.ndarray` (no scipy CSR) |
 | `data_dtype` | `float16/32/64`, `int8/16/32/64`, `uint8/16/32` | `None` → `float32` | numeric dtype of the values |
-| `index_dtype` | `int16` \| `int32` \| `int64` | `None` → `int32` | CSR column-index dtype; ignored (warns) for `"dense"` |
+| `index_dtype` | `int16` \| `int32` \| `int64` | `None` → `int32` | CSR column-index dtype; ignored (warns) for `"dense"`. **Note:** scipy `csr_matrix` does not support 16-bit indices, so `index_dtype="int16"` is upcast back to `int32` by scipy on construction — the narrow int16 buffer is built (and range-gated: a column index ≥ 32768 fails loud) but does not persist in the returned CSR |
 | `allow_lossy` | `bool` | `False` | fail-loud cast gate — see below |
 
 **Zero-copy default preserved.** `container="csr"` with no dtype kwargs takes the

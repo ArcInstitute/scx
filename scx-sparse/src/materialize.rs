@@ -115,9 +115,9 @@ impl Default for MaterializePlan {
 // allocates the intermediate full-matrix `f32` CSR. They mirror `ValueDtype` /
 // `IndexDtype` one-to-one, so a resolved `MaterializePlan` maps to a buffer arm
 // mechanically. `TypedCsr` / `TypedDense` are the assembled outputs the reader
-// returns and pyscx maps to numpy (zero-copy per arm).
-//
-// Scaffolding only: no read path constructs these yet.
+// returns and pyscx maps to numpy (zero-copy per arm). Constructed by the
+// in-assembly typed reader (`scx_format_io::read_all_csr_shards_typed` and
+// siblings).
 
 /// A value buffer at one of the numpy-representable dtypes (mirrors `ValueDtype`).
 #[derive(Debug, Clone)]

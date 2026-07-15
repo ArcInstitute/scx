@@ -351,10 +351,15 @@ pub(crate) fn to_anndata_with_layers<'py>(
             kwargs.set_item("varm", m.materialize_all(py)?)?;
         }
         if let Some(m) = &lazy_layers {
-            // Eager layers still decode to f32 here and are narrowed by the
-            // post-assembly `retype_matrix` pass in `experiment.rs` (the typed
-            // layer reader that preserves deletion-vector filtering is a Phase-5
-            // follow-up), so the f32 decode-loss guard is the right one.
+            // Layers still materialize to f32 (the in-decode typed layer reader is
+            // a Phase-5 follow-up), then a non-default plan narrows them via the
+            // post-assembly `retype_matrix` pass in `experiment.rs`. Because that
+            // pass casts the *already-f32* values, a layer count > 2²⁴ cannot be
+            // delivered losslessly on any path — so the f32 decode-loss guard is
+            // the honest gate here (fail loud rather than silently round). The
+            // non-eager narrow path is guarded symmetrically in `experiment.rs`
+            // before the retype loop; X/raw, by contrast, narrow in-decode and are
+            // exact for `>2²⁴` integer targets.
             guard_decode_loss(layer_csr_max_value(reader, 0), plan.allow_lossy)?;
             kwargs.set_item("layers", m.materialize_all(py)?)?;
         }
