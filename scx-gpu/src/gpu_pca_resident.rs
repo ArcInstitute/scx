@@ -490,7 +490,7 @@ fn run_direct_resident_loop(
 mod tests {
     use crate::cusolver::QrMethod;
     use crate::gpu_graph::set_cuda_graphs_enabled_override;
-    use crate::gpu_pca::gpu_randomized_pca;
+    use crate::gpu_pca::{gpu_column_sums, gpu_column_sums_into, gpu_randomized_pca};
     use crate::math_policy::GpuPcaTuning;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -697,10 +697,13 @@ mod tests {
     }
 
     /// Regression for the device-resident randomized-PCA mean over-subtraction
-    /// bug: `d_sum_q` was allocated once and reused across the power loop while
-    /// `column_sum_kernel` accumulates via `atomicAdd`, so the mean correction
+    /// bug (finding G1): `d_sum_q` was allocated once and reused across the power
+    /// loop while `column_sum_kernel` at the time combined blocks via
+    /// `atomicAdd` (accumulating into the reused buffer), so the mean correction
     /// `Z[v,j] -= μ[v]·Σ_r Q[r,j]` was inflated on iteration ≥2 and on the final
-    /// `B`, rotating the returned basis. The sibling
+    /// `B`, rotating the returned basis. (The kernel was later reworked under
+    /// finding G2 to a single-block plain-store reduction, which also removes
+    /// this reuse hazard structurally.) The sibling
     /// `test_resident_capture_vs_direct_subspace` compares two GPU paths that
     /// share the buggy code and cannot catch this; here we compare the GPU
     /// device-resident PCA (default config: `zero_center = true`,
@@ -774,5 +777,80 @@ mod tests {
                 "PC {pc}: GPU-vs-CPU |cosine| = {cos} (mean-correction regression?)"
             );
         }
+    }
+
+    /// Build a col-major `(m × k)` matrix as a flat `Vec<f32>` (element `(r, c)`
+    /// at index `c * m + r`) with non-dyadic fractional values, plus the exact
+    /// per-column f64 reference sums. The magnitude/count push the running sum
+    /// into the range where f32 accumulation drifts.
+    fn colmajor_fixture(m: usize, k: usize) -> (Vec<f32>, Vec<f64>) {
+        let mut data = vec![0f32; m * k];
+        let mut refs = vec![0f64; k];
+        for c in 0..k {
+            let mut acc = 0f64;
+            for r in 0..m {
+                // Non-power-of-two fractions so f32 partial sums lose low bits.
+                let val = 1.0 + ((r % 7) as f32) * 0.1 + (c as f32) * 0.01;
+                data[c * m + r] = val;
+                acc += val as f64;
+            }
+            refs[c] = acc;
+        }
+        (data, refs)
+    }
+
+    /// Regression for finding G2: `column_sum_kernel` must accumulate in f64 and
+    /// be deterministic (single-block, no cross-block atomicAdd). Asserts (1)
+    /// GPU column sums match an exact f64 CPU reference within a tight relative
+    /// tolerance the old f32 cross-block atomicAdd misses at this scale, (2) two
+    /// runs are bit-identical, and (3) writing into a reused buffer fully
+    /// overwrites it (also guards the G1 concern).
+    #[test]
+    fn test_column_sum_kernel_f64_deterministic() {
+        let dev = require_gpu!();
+        let (m, k) = (262_144usize, 3usize);
+        let (host_a, refs_a) = colmajor_fixture(m, k);
+        let d_a = dev.htod_copy(&host_a).unwrap();
+
+        // (1) Precision vs exact f64 reference.
+        let sums_a = dev
+            .dtoh_copy(&gpu_column_sums(&dev, &d_a, m, k).unwrap())
+            .unwrap();
+        for c in 0..k {
+            let rel = (sums_a[c] as f64 - refs_a[c]).abs() / refs_a[c].abs().max(1e-12);
+            assert!(
+                rel < 1e-6,
+                "col {c}: GPU sum {} vs f64 ref {} (rel {rel:.2e})",
+                sums_a[c],
+                refs_a[c]
+            );
+        }
+
+        // (2) Determinism: identical input → bit-identical output across runs.
+        let sums_a2 = dev
+            .dtoh_copy(&gpu_column_sums(&dev, &d_a, m, k).unwrap())
+            .unwrap();
+        assert_eq!(
+            sums_a, sums_a2,
+            "column sums must be deterministic run-to-run"
+        );
+
+        // (3) Reuse/overwrite: a second input into the SAME buffer must equal a
+        // fresh reduction of that input (no leakage from the first call).
+        let (host_b, _refs_b) = colmajor_fixture(m, k);
+        // Perturb B so it differs from A.
+        let host_b: Vec<f32> = host_b.iter().map(|v| v + 0.5).collect();
+        let d_b = dev.htod_copy(&host_b).unwrap();
+        let mut reused = dev.alloc_zeros::<f32>(k).unwrap();
+        gpu_column_sums_into(&dev, &d_a, &mut reused, m, k).unwrap();
+        gpu_column_sums_into(&dev, &d_b, &mut reused, m, k).unwrap();
+        let reused_host = dev.dtoh_copy(&reused).unwrap();
+        let fresh_b = dev
+            .dtoh_copy(&gpu_column_sums(&dev, &d_b, m, k).unwrap())
+            .unwrap();
+        assert_eq!(
+            reused_host, fresh_b,
+            "reused buffer must be fully overwritten by the second call"
+        );
     }
 }

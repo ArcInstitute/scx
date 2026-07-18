@@ -719,11 +719,13 @@ pub(crate) fn gpu_column_sums(
 /// device allocations are forbidden — the resident PCA transpose segment
 /// pre-allocates the column-sum buffer once and reuses it across replays.
 ///
-/// `out` is zeroed by this function before the kernel runs: `column_sum_kernel`
-/// reduces cross-block via `atomicAdd(&out[col], …)`, i.e. it *accumulates* into
-/// the target rather than overwriting it, so a reused (non-fresh) buffer must be
-/// re-zeroed each call or the sums leak across invocations. The zero is a
-/// `memset` (not a device allocation), so it stays CUDA-graph-capture legal.
+/// `column_sum_kernel` uses exactly one block per column and writes each
+/// `out[col]` with a single plain store, so it fully overwrites `out` and a
+/// reused (non-fresh) buffer is safe across power iterations without re-zeroing.
+/// The `memset_zeros(out)` below is therefore only needed for the `m == 0`
+/// short-circuit, where the kernel is skipped and a reused buffer must still
+/// read back zero. The zero is a `memset` (not a device allocation), so it stays
+/// CUDA-graph-capture legal (this function is capture-safe: no device allocs).
 pub(crate) fn gpu_column_sums_into(
     dev: &GpuDevice,
     x: &CudaSlice<f32>, // (m × k) col-major
@@ -748,16 +750,17 @@ pub(crate) fn gpu_column_sums_into(
     let m_i32 = m as i32;
     let k_i32 = k as i32;
 
-    // Launch: grid = (ceil(m/256), k), block = (256, 1)
-    // Shared memory: column_sum_kernel uses extern __shared__ float warp_sums[]
-    // which needs (blockDim.x / 32) floats = (256/32) * 4 = 32 bytes.
+    // Launch: grid = (1, k) — exactly one block per column; block = (256, 1).
+    // Each block reduces all m rows of its column in f64 (finding G2: no
+    // cross-block atomicAdd → deterministic + precise). Dynamic shared memory:
+    // `column_sum_kernel` uses `extern __shared__ double warp_sums[]`, needing
+    // (blockDim.x / 32) doubles = (256/32) * 8 = 64 bytes.
     let threads: u32 = 256;
-    let blocks_x = (m as u32).div_ceil(threads);
     let n_warps = threads.div_ceil(32);
     let cfg = LaunchConfig {
-        grid_dim: (blocks_x, k as u32, 1),
+        grid_dim: (1, k as u32, 1),
         block_dim: (threads, 1, 1),
-        shared_mem_bytes: n_warps * std::mem::size_of::<f32>() as u32,
+        shared_mem_bytes: n_warps * std::mem::size_of::<f64>() as u32,
     };
 
     unsafe {
