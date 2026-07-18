@@ -130,10 +130,13 @@ impl Drop for CusparseHandle {
     }
 }
 
-// SAFETY: cuSPARSE handles are thread-safe per NVIDIA documentation.
-// The handle internally synchronizes access to shared state.
+// SAFETY: the wrapper owns its raw cuSPARSE handle exclusively, so it is safe to
+// MOVE between threads (Send) — only one thread can access it at a time. It is
+// deliberately NOT `Sync`: a cuSPARSE handle is stream-bound and NVIDIA requires
+// one handle per thread, so sharing `&CusparseHandle` for concurrent calls would
+// race on the handle's internal stream/state. Need a handle on another thread?
+// Create one there with `CusparseHandle::new()`.
 unsafe impl Send for CusparseHandle {}
-unsafe impl Sync for CusparseHandle {}
 
 /// RAII wrapper around a cuSPARSE sparse matrix descriptor (`cusparseSpMatDescr_t`).
 ///

@@ -83,11 +83,13 @@ impl Drop for CublasHandle {
     }
 }
 
-// SAFETY: cuBLAS handles are thread-safe per NVIDIA documentation, provided
-// concurrent calls target different streams. The handle internally synchronizes
-// its shared state.
+// SAFETY: the wrapper owns its raw cuBLAS handle exclusively, so it is safe to
+// MOVE between threads (Send) — only one thread can access it at a time. It is
+// deliberately NOT `Sync`: a cuBLAS handle is stream-bound and NVIDIA requires
+// one handle per thread, so sharing `&CublasHandle` for concurrent calls would
+// race on the handle's internal stream/state. Need a handle on another thread?
+// Create one there with `CublasHandle::new()`.
 unsafe impl Send for CublasHandle {}
-unsafe impl Sync for CublasHandle {}
 
 /// Single-precision matrix–matrix multiply: `C = α · op(A) · op(B) + β · C`.
 ///
