@@ -623,4 +623,156 @@ mod tests {
             );
         }
     }
+
+    /// Materialize an [`InMemorySource`] into a dense row-major `(n_obs × n_vars)`
+    /// f64 matrix for the CPU reference PCA below.
+    fn materialize_dense(src: &InMemorySource) -> Vec<f64> {
+        let (n_obs, n_vars) = (src.n_obs, src.n_vars);
+        let mut dense = vec![0f64; n_obs * n_vars];
+        let mut row0 = 0usize;
+        for shard in &src.shards {
+            let rows = shard.shape.0;
+            for r in 0..rows {
+                let lo = shard.indptr[r] as usize;
+                let hi = shard.indptr[r + 1] as usize;
+                for p in lo..hi {
+                    let c = shard.indices[p] as usize;
+                    dense[(row0 + r) * n_vars + c] = shard.data[p] as f64;
+                }
+            }
+            row0 += rows;
+        }
+        dense
+    }
+
+    /// Dense-stored CSR carrying a strong rank-2 signal on top of a large
+    /// per-column baseline offset. The big column means make this fixture
+    /// sensitive to the mean-correction path; the clean rank-2 structure lets
+    /// randomized PCA converge to the exact top-2 subspace, so a GPU-vs-CPU
+    /// `|cosine|` comparison on the leading components is tight.
+    fn low_rank_source_with_offset(
+        n_obs: usize,
+        n_vars: usize,
+        n_shards: usize,
+        seed: u64,
+    ) -> InMemorySource {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let w1: Vec<f64> = (0..n_vars).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let w2: Vec<f64> = (0..n_vars).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        // Large per-column baseline → large column means (the lever the bug hits).
+        let base: Vec<f64> = (0..n_vars).map(|_| rng.gen_range(10.0..30.0)).collect();
+
+        let rows_per = n_obs.div_ceil(n_shards);
+        let mut shards = Vec::new();
+        let mut r0 = 0;
+        while r0 < n_obs {
+            let r1 = (r0 + rows_per).min(n_obs);
+            let mut indptr = vec![0i64];
+            let mut indices: Vec<i32> = Vec::new();
+            let mut data: Vec<f32> = Vec::new();
+            for _ in r0..r1 {
+                let f1: f64 = rng.gen_range(-3.0..3.0);
+                let f2: f64 = rng.gen_range(-3.0..3.0);
+                for c in 0..n_vars {
+                    let noise: f64 = rng.gen_range(-0.05..0.05);
+                    let v = base[c] + f1 * w1[c] + f2 * w2[c] + noise;
+                    indices.push(c as i32); // dense, ascending c → sorted
+                    data.push(v as f32);
+                }
+                indptr.push(indices.len() as i64);
+            }
+            shards.push(ScxCsr::new_unchecked(
+                (r1 - r0, n_vars),
+                indptr,
+                indices,
+                data,
+            ));
+            r0 = r1;
+        }
+        InMemorySource {
+            shards,
+            n_obs,
+            n_vars,
+        }
+    }
+
+    /// Regression for the device-resident randomized-PCA mean over-subtraction
+    /// bug: `d_sum_q` was allocated once and reused across the power loop while
+    /// `column_sum_kernel` accumulates via `atomicAdd`, so the mean correction
+    /// `Z[v,j] -= μ[v]·Σ_r Q[r,j]` was inflated on iteration ≥2 and on the final
+    /// `B`, rotating the returned basis. The sibling
+    /// `test_resident_capture_vs_direct_subspace` compares two GPU paths that
+    /// share the buggy code and cannot catch this; here we compare the GPU
+    /// device-resident PCA (default config: `zero_center = true`,
+    /// `n_power_iterations = 2`) against an exact CPU SVD reference on mean-heavy,
+    /// low-rank data. Pre-fix the top subspace is rotated and this fails;
+    /// post-fix it passes.
+    #[test]
+    fn test_resident_pca_matches_cpu_reference() {
+        let dev = require_gpu!();
+        let (n_obs, n_vars, n_shards) = (300usize, 40usize, 3usize);
+        let n_components = 4usize;
+        let source = low_rank_source_with_offset(n_obs, n_vars, n_shards, 2024);
+
+        set_cuda_graphs_enabled_override(None);
+        let gpu = gpu_randomized_pca(
+            &dev,
+            &source,
+            n_components,
+            10,   // n_oversamples
+            2,    // n_power_iterations (accelerator default)
+            true, // zero_center (accelerator default)
+            2024,
+            QrMethod::Householder,
+            GpuPcaTuning::default(),
+        )
+        .unwrap();
+        assert!(
+            gpu.mean.is_some(),
+            "zero_center=true must record column means"
+        );
+
+        // Exact CPU reference: column-center, then thin SVD via faer (f64).
+        let dense = materialize_dense(&source);
+        let mut means = vec![0f64; n_vars];
+        for i in 0..n_obs {
+            for j in 0..n_vars {
+                means[j] += dense[i * n_vars + j];
+            }
+        }
+        for m in &mut means {
+            *m /= n_obs as f64;
+        }
+        let mut c_mat = faer::Mat::<f64>::zeros(n_obs, n_vars);
+        for i in 0..n_obs {
+            for j in 0..n_vars {
+                c_mat[(i, j)] = dense[i * n_vars + j] - means[j];
+            }
+        }
+        let svd = c_mat.thin_svd().expect("CPU SVD");
+        let v = svd.V().to_owned(); // (n_vars × min) right singular vectors
+
+        // CPU embeddings E = C · V[:, :n_components], row-major (n_obs × n_components).
+        let mut cpu_emb = vec![0f32; n_obs * n_components];
+        for i in 0..n_obs {
+            for pc in 0..n_components {
+                let mut acc = 0f64;
+                for j in 0..n_vars {
+                    acc += (dense[i * n_vars + j] - means[j]) * v[(j, pc)];
+                }
+                cpu_emb[i * n_components + pc] = acc as f32;
+            }
+        }
+
+        // Compare the top-2 (well-separated signal) PCs by sign-free cosine.
+        // Randomized PCA with 2 power iterations recovers this subspace to
+        // ~1.0; the mean bug rotates it well below the 0.98 bar.
+        for pc in 0..2 {
+            let cos = abs_cosine(&gpu.embeddings, &cpu_emb, n_obs, n_components, pc);
+            assert!(
+                cos > 0.98,
+                "PC {pc}: GPU-vs-CPU |cosine| = {cos} (mean-correction regression?)"
+            );
+        }
+    }
 }

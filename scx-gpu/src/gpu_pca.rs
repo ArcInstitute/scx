@@ -719,8 +719,11 @@ pub(crate) fn gpu_column_sums(
 /// device allocations are forbidden — the resident PCA transpose segment
 /// pre-allocates the column-sum buffer once and reuses it across replays.
 ///
-/// `out` must be zeroed by the caller if the kernel does not fully overwrite
-/// it; `column_sum_kernel` writes every `out[j]`, so no pre-zero is needed.
+/// `out` is zeroed by this function before the kernel runs: `column_sum_kernel`
+/// reduces cross-block via `atomicAdd(&out[col], …)`, i.e. it *accumulates* into
+/// the target rather than overwriting it, so a reused (non-fresh) buffer must be
+/// re-zeroed each call or the sums leak across invocations. The zero is a
+/// `memset` (not a device allocation), so it stays CUDA-graph-capture legal.
 pub(crate) fn gpu_column_sums_into(
     dev: &GpuDevice,
     x: &CudaSlice<f32>, // (m × k) col-major
@@ -728,6 +731,11 @@ pub(crate) fn gpu_column_sums_into(
     m: usize,
     k: usize,
 ) -> Result<(), GpuError> {
+    // Zero first (before the m == 0 || k == 0 short-circuit) so that an
+    // empty-matrix call with a reused buffer still returns all-zero sums.
+    dev.stream()
+        .memset_zeros(out)
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("column_sum zero: {e}")))?;
     if m == 0 || k == 0 {
         return Ok(());
     }
