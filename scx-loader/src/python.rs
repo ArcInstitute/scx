@@ -985,13 +985,15 @@ fn build_multimodal_batch_dict<'py>(
 /// `TrainingDataset`. Because `IndexPlanLoader` does *not* use rayon's
 /// global pool (its prefetch goes via `tokio::spawn_blocking` and
 /// `std::thread::spawn`), the rayon-after-fork hazard that motivated
-/// Phase 2.0 for `TrainingDataset` does **not** apply here. The remaining
-/// concern is the eager `tokio::runtime::Builder::new_multi_thread()` built
-/// in `IndexPlanLoader::new()` (`scx-loader/src/index_plan.rs:276`); under
-/// the lazy-construct-in-worker pattern that runtime is built fresh in the
-/// worker process, so the parent's runtime threads are never inherited.
-/// The eager-construct-then-fork case is caught by the PID check in
-/// `iter_with_plans` / `next_batch_for_test`.
+/// Phase 2.0 for `TrainingDataset` does **not** apply here. The multi-threaded
+/// tokio runtime is, moreover, **not** built eagerly in `IndexPlanLoader::new()`
+/// — it is constructed lazily on first use in `IndexPlanLoader::runtime()`
+/// (a `OnceLock<Runtime>` in `scx-loader/src/index_plan.rs`), whose first touch
+/// is always from an `IndexPlanIter`, post-fork in the `DataLoader` worker. So
+/// the loader never owns runtime threads at the moment a child is forked, and
+/// each worker builds its own runtime fresh; the parent's runtime threads are
+/// never inherited. The construct-then-fork case is additionally caught by the
+/// PID check in `iter_with_plans` / `next_batch_for_test`.
 ///
 /// **Acceptance test**: `pyscx/tests/test_fork_safety.py::test_fork_index_plan_dataset`
 /// pins this contract end-to-end (multiprocessing.fork + lazy worker
