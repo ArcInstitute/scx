@@ -740,7 +740,7 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
 
 **On-disk fixture size (MB, lower is better):**
 
-| Dataset | scx (auto=Scx1) | scx auto_v2 (ShufDeltaZstd) | cellstream | shardad |
+| Dataset | scx fast (Scx1) | scx auto (ShufDeltaZstd) | cellstream | shardad |
 |---|---|---|---|---|
 | pbmc10k | 39.8 | 30.1 | 34.6 | 31.7 |
 | smartseq2 | 552.7 | 262.7 | 255.7 | 253.2 |
@@ -756,18 +756,19 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
   did not complete).
 - **Storage: the default optimizes for size.** As of the 2026-07-12 codec-intent
   flip, `codec="auto"` is **cost-aware adaptive** (predominantly ShufDeltaZstd) — the
-  column labeled `scx auto_v2 (ShufDeltaZstd)` above is what the new default `auto`
-  produces, and the old decode-max `auto=Scx1` column is `codec="fast"`. Adaptive
+  column labeled `scx auto (ShufDeltaZstd)` above is what the new default `auto`
+  produces, and the `scx fast (Scx1)` column is `codec="fast"`. Adaptive
   `auto` recovers ~30% of the disk vs `fast` (census_1m 3989→2800 MB) while staying
   **within ≤~3% of `fast` on the realistic `hvg_norm` training scenario at every scale**
   (see the head-to-head section below), narrowing but not closing the gap to
   cellstream/shardad's aggressive zstd+dictionary codec. Latency-critical CPU training
   that wants the old decode-max behavior pins `codec="fast"`.
 
-> **Naming (2026-07-12 flip).** These tables were captured under the pre-flip names:
-> the old `auto` (Scx1, decode-max) is now **`fast`**, and the old opt-in `auto_v2`
-> (ShufDeltaZstd, adaptive) is now the default **`auto`**. The numbers are unchanged
-> measurements; an exact recapture under the new names (and the tightened adaptive
+> **Naming (2026-07-12 flip).** These tables use the current codec-intent names;
+> the numbers are the original pre-flip measurements. For reference, the old `auto`
+> (Scx1, decode-max) is now **`fast`**, and the old opt-in `auto_v2` (ShufDeltaZstd,
+> adaptive) is now the default **`auto`**. An exact recapture under the new names
+> (and the tightened adaptive
 > floors, incl. a **looser raw-path (G1b) throughput floor** — the `raw`
 > full-width-scatter path carries the full ~9.6–20% ShufDeltaZstd CPU-decode tax, vs
 > ~6% on `hvg_norm` and ~4% on `gpu_train`) is deferred to the comprehensive recapture.
@@ -782,15 +783,15 @@ interaction, not a fixture bug: standard 62×16k-shard geometry) — and skippin
 `pyscx_training_dataset_workers2` scenarios above 250k cells, which time out at census scale
 and would otherwise discard the whole (dataset, format) result.*
 
-### scx auto_v2 vs cellstream — the storage-optimized head-to-head
+### scx auto vs cellstream — the size-vs-throughput head-to-head
 
-The fairest apples-to-apples: scx's **storage-optimized codec** (`auto_v2` =
+The fairest apples-to-apples: scx's **adaptive default codec** (`auto` =
 ShufDeltaZstd, framed) vs **cellstream**, the storage-optimized scatter competitor.
 Both target smaller-on-disk random-access training. batch_size=1024; 2026-07-10/11.
 
 **Compression + on-disk size** (ratio vs source h5ad; MB):
 
-| Dataset | ratio auto_v2 | ratio cellstream | MB auto_v2 | MB cellstream |
+| Dataset | ratio auto | ratio cellstream | MB auto | MB cellstream |
 |---|---|---|---|---|
 | pbmc10k | **6.73** | 5.86 | 30 | 35 |
 | smartseq2 | 4.08 | 4.19 | 263 | 256 |
@@ -800,28 +801,28 @@ Both target smaller-on-disk random-access training. batch_size=1024; 2026-07-10/
 
 **Training throughput** (median batches/sec; higher = better):
 
-| Dataset | raw auto_v2 | raw cellstream | hvg_norm auto_v2 | hvg_norm cellstream | throughput edge |
+| Dataset | raw auto | raw cellstream | hvg_norm auto | hvg_norm cellstream | throughput edge |
 |---|---|---|---|---|---|
-| pbmc10k | 24.4 | 11.7 | 37.2 | 11.3 | **auto_v2 2–3×** |
-| smartseq2 | 18.8 | 8.2 | 23.3 | 7.5 | **auto_v2 2–3×** |
-| tabula_100k | 29.8 | 2.7 | 39.5 | 12.7 | **auto_v2 3–11×** |
-| census_500k | 52.5 | 13.0 | 58.3 | 11.7 | **auto_v2 4–5×** |
-| census_1m | 57.3 | 12.7 | 63.6 | 11.3 | **auto_v2 4.5–5.6×** |
+| pbmc10k | 24.4 | 11.7 | 37.2 | 11.3 | **auto 2–3×** |
+| smartseq2 | 18.8 | 8.2 | 23.3 | 7.5 | **auto 2–3×** |
+| tabula_100k | 29.8 | 2.7 | 39.5 | 12.7 | **auto 3–11×** |
+| census_500k | 52.5 | 13.0 | 58.3 | 11.7 | **auto 4–5×** |
+| census_1m | 57.3 | 12.7 | 63.6 | 11.3 | **auto 4.5–5.6×** |
 
-**Tradeoff.** `auto_v2` delivers **2–11× cellstream's training throughput at every
+**Tradeoff.** `auto` delivers **2–11× cellstream's training throughput at every
 scale**; the two are **comparable on compression through tabula**, and cellstream pulls
 ahead only at **census** (~6.5× vs ~4.1×, ~1.6× smaller on disk) via its trained zstd
-dictionary. cellstream also opens faster (pbmc10k TTFB ~0.035 s vs auto_v2's ~0.4 s —
-mmap store vs pipeline spin-up). Net: `auto_v2` dominates on throughput; cellstream only
+dictionary. cellstream also opens faster (pbmc10k TTFB ~0.035 s vs `auto`'s ~0.4 s —
+mmap store vs pipeline spin-up). Net: `auto` dominates on throughput; cellstream only
 edges it on atlas-scale footprint, at a 4–6× throughput cost.
 
-*Methodology: cellstream from the `benchmarks/comprehensive` ml_loader capture; auto_v2
+*Methodology: cellstream from the `benchmarks/comprehensive` ml_loader capture; `auto`
 throughput from a direct `_run_scx_epoch` measurement (warmup + timed epoch) that
 bypasses the `pyscx_training_dataset_workers2` scenario (which times out at scale in the
-full harness). Both use batch_size=1024, HVG=2000. The single-epoch direct auto_v2 figures
+full harness). Both use batch_size=1024, HVG=2000. The single-epoch direct `auto` figures
 run a few percent above the harness median-of-N (e.g. pbmc10k 24.4/37.2 here vs the baseline
-harness row 22.2/34.3); the at-scale auto_v2 harness capture is deferred, so these are the
-best available auto_v2 numbers at census scale.*
+harness row 22.2/34.3); the at-scale `auto` harness capture is deferred, so these are the
+best available `auto` numbers at census scale.*
 
 ### ShufDeltaZstd loader-decode cost (Phase-D D0 profiling)
 
@@ -834,10 +835,10 @@ shard = 1 row-group), `SCX_LOADER_PROFILE=1`, batch_size=1024:
 
 | Regime | Codec | Stage-1 decode/epoch | `io_stage` send-wait | GPU util |
 |--------|-------|----------------------|----------------------|----------|
-| raw (null consumer) | `auto` (Scx1) | 325.8 ms | ~0 (4 µs) | — |
-| raw (null consumer) | `auto_v2` (ShufDeltaZstd) | 357.1 ms (**+9.6%**) | ~0 (4 µs) | — |
-| gpu_train (scVI VAE) | `auto` (Scx1) | 262.6 ms | ~0 (5 µs) | 0% |
-| gpu_train (scVI VAE) | `auto_v2` (ShufDeltaZstd) | 286.3 ms (**+9.0%**) | ~0 (4 µs) | 0% |
+| raw (null consumer) | `fast` (Scx1) | 325.8 ms | ~0 (4 µs) | — |
+| raw (null consumer) | `auto` (ShufDeltaZstd) | 357.1 ms (**+9.6%**) | ~0 (4 µs) | — |
+| gpu_train (scVI VAE) | `fast` (Scx1) | 262.6 ms | ~0 (5 µs) | 0% |
+| gpu_train (scVI VAE) | `auto` (ShufDeltaZstd) | 286.3 ms (**+9.0%**) | ~0 (4 µs) | 0% |
 
 The ShufDeltaZstd CPU-decode tax over Scx1 is only **~9%** (consistent with the
 Phase-B whole-shard ~1.09×; SSE2 SIMD already closed the gap that once was
@@ -846,7 +847,7 @@ consumer) and GPU util is ≈0% (the model is too light to expose decode) — so
 "smaller PCIe payload → throughput" lever Phase D would exploit is not on the
 critical path in any measured regime. **GPU-loader decode (Phase D D2–D5) is
 therefore deferred**; a `gpu`-gated `scx-loader → scx-gpu` feature edge (D1) exists
-as scaffolding. Storage is unaffected: `auto_v2` is 24% smaller on this dataset
+as scaffolding. Storage is unaffected: `auto` is 24% smaller on this dataset
 (30.1 vs 39.8 MB) — the egress win is real and orthogonal to loader throughput.
 
 ### IndexPlanDataset (plan-driven paired reads)
@@ -1233,7 +1234,7 @@ runs as a first-class format in the comprehensive suite:
   u16 indices) is **ShufDeltaZstd 274.6 ms vs Scx1 251.7 ms — ~1.09× (within
   ~9%)**, down from the previous 1.3–1.8×; on the smaller 2048-row shard
   ShufDeltaZstd is at/below Scx1 (5.4 vs 7.7 ms). This removes ShufDeltaZstd's
-  CPU-decode training tax and is the Phase-C `auto_v2` enabler. (Phase 1's GPU
+  CPU-decode training tax and is the Phase-C adaptive-`auto` enabler. (Phase 1's GPU
   decode below offloads the *same* transforms for the in-VRAM analysis path.)
 
   **Phase 1 result — GPU ShufDeltaZstd decode lands (H100).** Phase 1 added a

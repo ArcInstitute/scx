@@ -7,6 +7,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 ## Key Documents
 
 - **[ROADMAP.md](ROADMAP.md)** — Capability tiers and status.
+- **[docs/quickstart.md](docs/quickstart.md)** — 5-minute end-to-end pipeline: h5ad→SCX convert, QC, normalize, and downstream steps.
 - **[docs/architecture.md](docs/architecture.md)** — Crate graph, feature flags, file format overview, codec system, data model, reader/writer architecture.
 - **[docs/format.md](docs/format.md)** — Binary format reference: file header, catalogs, CSR shard layout, fragment/manifest model, checksums.
 - **[docs/codec.md](docs/codec.md)** — Bit-level codec spec: Delta-Golomb-Rice, FOR-BP, Rice, LZ4+shuffle, auto-selection.
@@ -15,11 +16,14 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[docs/pseudobulk_nb_glm.md](docs/pseudobulk_nb_glm.md)** — Rust-native pseudobulk negative-binomial GLM (DESeq2-style DE): `accel.nb_glm` / `accel.pdex_nb_glm` / `pseudobulk_dex(backend="nb_glm")`, replicate requirement, when to prefer `pdex_ref`/`wilcoxon`.
 - **[docs/migrating-from-h5ad.md](docs/migrating-from-h5ad.md)** — Analyst-facing h5ad→SCX migration: loader decision tree, round-trip fidelity, scanpy-divergence gotchas.
 - **[docs/performance.md](docs/performance.md)** — Benchmark results and performance characteristics.
+- **[docs/training.md](docs/training.md)** — ML training data loading: the triple-buffered loader, `TrainingDataset`/`IndexPlanDataset`, and GPU handoff.
+- **[docs/benchmark_manifest.md](docs/benchmark_manifest.md)** — Benchmark manifest format: how every `README.md` / `docs/performance.md` performance claim is backed by a reproducible capture.
 - **[docs/gpu-setup.md](docs/gpu-setup.md)** — GPU setup: CUDA, RAPIDS, conda, container, SLURM, troubleshooting.
 - **[docs/development.md](docs/development.md)** — Developer build guide: CPU-only, HDF5, cloud, GPU, Python, R builds; test matrix; fuzzing.
 - **[docs/testing.md](docs/testing.md)** — Test, benchmark, and correctness validation details.
 - **[docs/multithreading.md](docs/multithreading.md)** — Multithreading architecture across crates.
 - **[docs/sharding.md](docs/sharding.md)** — Sharding design and usage.
+- **[docs/operations.md](docs/operations.md)** — SCX operations reference: behavior of mutating ops (append, delete, compact, merge, rollback) and their invariants.
 - **[docs/multimodal.md](docs/multimodal.md)** — Multimodal (CITE-seq / Multiome / TEA-seq / spatial) layout and APIs.
 - **[docs/cloud.md](docs/cloud.md)** — Cloud auth, layouts, tuning, provider-specific notes.
 - **[docs/conventions.md](docs/conventions.md)** — Coding conventions (serialization, error handling, checksums, language binding rules, GPU/accel constraints).
@@ -54,7 +58,7 @@ cd rscx && R CMD INSTALL .
 
 15 workspace crates plus an integration-test crate; the dependency core is `{scx-codec, scx-sparse} → scx-format (pure on-disk layout/spec) → scx-format-io (runtime reader/writer/backed I/O) → {scx-mtx, scx-ops, scx-engine, scx-loader, scx-cloud, scx-gpu, scx-accel, scx-convert} → {scx-cli, pyscx, rscx}`. Full graph and isolation rules in [docs/architecture.md § Crate Dependency Graph](docs/architecture.md#crate-dependency-graph). Feature flags: `scx-cli{hdf5,cloud}`, `scx-convert{hdf5}`, `pyscx{cloud,gpu}`, `scx-gpu{gds}`, `scx-accel{gpu}` — all opt-in.
 
-File format ([docs/format.md](docs/format.md)): 256-byte LE header (magic `b"SCX\x01"`), 4096-byte root catalog at offset 256, 8-byte-aligned sections (29 types, IDs 0–28), full catalog at EOF with per-entry checksums + shard statistics. v3 writers emit canonical row-major CSR. 76-byte CSR shard headers (magic `b"SCXS"`). Codecs: `None`, `Scx1` (integer only), `Pcodec` (float), `Zstd`, `Lz4Shuffle`, `ShufDeltaZstd`. The user-facing codec **intent axis** is `codec="auto"|"fast"|"compact"` (resolved by `scx_format::resolve_codec`): `auto` (default) is cost-aware adaptive — per framed integer shard it adopts `ShufDeltaZstd` when smaller by ≥ `ADOPT_MARGIN` (5%), else the heuristic (`Scx1` median ≤ 8, `Zstd` > 8); `fast` is the decode-max heuristic single-encode (the pre-flip default); `compact` adopts `ShufDeltaZstd` on ties. Float always → `Pcodec`. `auto` files are typically mixed-codec (`scx info` shows the per-shard breakdown). The prior `auto_v2` profile + `decode_target` knob were removed (pre-1.0 clean break). On-disk `u64`/`u16-u32`/`u8-u32`, in-memory `i64`/`i32`/`f32` to match scipy CSR zero-copy.
+File format ([docs/format.md](docs/format.md)): 256-byte LE header (magic `b"SCX\x01"`), 4096-byte root catalog at offset 256, 8-byte-aligned sections (29 types, IDs 0–29 with id 26 reserved), full catalog at EOF with per-entry checksums + shard statistics. v3 writers emit canonical row-major CSR. 76-byte CSR shard headers (magic `b"SCXS"`). Codecs: `None`, `Scx1` (integer only), `Pcodec` (float), `Zstd`, `Lz4Shuffle`, `ShufDeltaZstd`. The user-facing codec **intent axis** is `codec="auto"|"fast"|"compact"` (resolved by `scx_format::resolve_codec`): `auto` (default) is cost-aware adaptive — per framed integer shard it adopts `ShufDeltaZstd` when smaller by ≥ `ADOPT_MARGIN` (5%), else the heuristic (`Scx1` median ≤ 8, `Zstd` > 8); `fast` is the decode-max heuristic single-encode (the pre-flip default); `compact` adopts `ShufDeltaZstd` on ties. Float always → `Pcodec`. `auto` files are typically mixed-codec (`scx info` shows the per-shard breakdown). The prior `auto_v2` profile + `decode_target` knob were removed (pre-1.0 clean break). On-disk `u64`/`u16-u32`/`u8-u32`, in-memory `i64`/`i32`/`f32` to match scipy CSR zero-copy.
 
 ## Capabilities (summary)
 

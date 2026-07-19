@@ -41,7 +41,7 @@ fn cpu_pca_threshold_pinned() {
     );
 }
 
-/// The workspace member set must match the documented crate graph (14 code
+/// The workspace member set must match the documented crate graph (15 code
 /// crates + the integration-test crate). A crate added or renamed without
 /// updating AGENTS.md / docs/architecture.md trips this (D3).
 #[test]
