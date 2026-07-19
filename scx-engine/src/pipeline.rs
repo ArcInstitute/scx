@@ -182,9 +182,11 @@ impl QueryPipeline {
         modality_id: u8,
     ) -> Result<Self> {
         // Validate the modality id against the file's modality table. id 0 is
-        // always valid (global / single-modality). A registered modality has
-        // a resolvable per-modality var section + n_vars.
-        if modality_id != 0 && reader.modality_n_vars(modality_id).is_err() {
+        // always valid (global / single-modality). Validate a registered
+        // modality by table membership (ids are 1-based) so a genuine I/O error
+        // from `modality_n_vars` below propagates as-is rather than being masked
+        // as `UnknownModality`.
+        if modality_id != 0 && u32::from(modality_id) > reader.n_modalities() {
             return Err(crate::error::EngineError::UnknownModality {
                 requested: modality_id.to_string(),
                 available: reader.modality_names(),

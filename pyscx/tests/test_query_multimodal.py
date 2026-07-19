@@ -5,17 +5,15 @@ per-modality X width, the global obs mask applied per modality, gene projection
 in modality var space, and the fail-loud error paths.
 """
 
-import os
-import tempfile
-
 import numpy as np
 import pytest
 
 
 @pytest.fixture
-def citeseq_scx():
+def citeseq_scx(tmp_path):
     """Write a tiny 2-modality (rna: 8 vars, adt: 4 vars) CITE-seq SCX file
-    with a global `cell_type` obs column, and yield its path."""
+    with a global `cell_type` obs column, and yield its path. Uses pytest's
+    `tmp_path` so the fixture directory is cleaned up automatically."""
     mudata = pytest.importorskip("mudata")
     anndata = pytest.importorskip("anndata")
     import scipy.sparse as sp
@@ -37,8 +35,7 @@ def citeseq_scx():
     # Global obs column, shared across modalities. T/B/NK cell, 10 each.
     mu.obs["cell_type"] = [["T cell", "B cell", "NK cell"][i % 3] for i in range(n_obs)]
 
-    tmp = tempfile.mkdtemp()
-    path = os.path.join(tmp, "cite.scx")
+    path = str(tmp_path / "cite.scx")
     pyscx.from_mudata(mu, path)
     return path
 
