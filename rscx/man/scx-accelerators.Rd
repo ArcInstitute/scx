@@ -218,7 +218,9 @@ its PCA are always computed over the full counts layer.}
 \item{groups}{Subset of group labels to test (character vector); \code{NULL}
 (default) tests every group.}
 
-\item{reference}{Reference level in \code{test_col} (the DE baseline).}
+\item{reference}{Reference baseline: for \code{scx_rank_genes_groups}, the group to
+test against (\code{NULL} tests each group vs the rest); for \code{scx_pseudobulk_dex} /
+\code{scx_nb_glm}, the reference level of \code{test_col}.}
 
 \item{log_transformed}{Whether \code{layer} is already log-transformed.}
 

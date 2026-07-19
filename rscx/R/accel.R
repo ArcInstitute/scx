@@ -253,7 +253,9 @@ scx_leiden <- function(object, reduction = "pca", dims = 1:30,
 #' @param group.by `meta.data` column with per-cell group labels.
 #' @param groups Subset of group labels to test (character vector); `NULL`
 #'   (default) tests every group.
-#' @param reference Reference group, or `NULL` to test each group vs rest.
+#' @param reference Reference baseline: for `scx_rank_genes_groups`, the group to
+#'   test against (`NULL` tests each group vs the rest); for `scx_pseudobulk_dex` /
+#'   `scx_nb_glm`, the reference level of `test_col`.
 #' @param log_transformed Whether `layer` is already log-transformed.
 #' @param rankby_abs,tie_correct Wilcoxon options; defaults (`FALSE`/`FALSE`)
 #'   match `pyscx`/scanpy. The kernel densifies the matrix internally, so on a
@@ -536,7 +538,9 @@ scx_pseudobulk <- function(object, group_by, method = "sum",
 #'   cells into pseudobulk samples and fits each non-reference level of
 #'   `test_col` vs `reference`.
 #' @param test_col The `group_by` column holding the condition being tested.
-#' @param reference Reference level in `test_col` (the DE baseline).
+#' @param reference Reference baseline: for `scx_rank_genes_groups`, the group to
+#'   test against (`NULL` tests each group vs the rest); for `scx_pseudobulk_dex` /
+#'   `scx_nb_glm`, the reference level of `test_col`.
 #' @param aggr_method Pseudobulk aggregation, `"sum"` (default) or `"mean"`.
 #' @param dispersion Dispersion estimator: `"cox_reid_shrunk"` (default),
 #'   `"cox_reid_mle"`, or `"moments"`.

@@ -177,7 +177,9 @@ fn scx_append_impl(
 /// deleted).
 ///
 /// @param path Path to the SCX file.
-/// @param cell_indices Numeric vector of 0-based cell indices to delete.
+/// @param cell_indices 0-based cell indices at this FFI boundary. The R-facing
+///   `scx_delete()` wrapper takes **1-based** indices (R convention) and subtracts
+///   1 before calling in, so values arrive here already 0-based.
 /// @return Total number of deleted cells as numeric (f64 to avoid i32 overflow).
 ///
 /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).

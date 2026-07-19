@@ -62,6 +62,11 @@ select_genes <- function(pipeline, indices) {
     stop("gene indices must be >= 1 (1-based); 0 / negative indices are not supported",
          call. = FALSE)
   }
+  # Reject fractional indices explicitly rather than letting the extendr wrapper's
+  # `as.integer` silently truncate them.
+  if (length(indices) && any(indices != floor(indices))) {
+    stop("non-integer gene index: gene indices must be whole numbers", call. = FALSE)
+  }
   pipeline$select_genes(indices - 1)
 }
 

@@ -77,6 +77,12 @@ scx_delete <- function(path, cell_indices) {
     stop("cell indices must be >= 1 (1-based); 0 / negative indices are not supported",
          call. = FALSE)
   }
+  # Reject fractional indices up front so the error reports the original value
+  # (the Rust core also guards this after the 1->0 conversion, as defense-in-depth).
+  if (length(idx) && any(idx != floor(idx))) {
+    bad <- idx[idx != floor(idx)][1]
+    stop(sprintf("non-integer cell index: %s", format(bad)), call. = FALSE)
+  }
   .Call(wrap__scx_delete, path, idx - 1)
 }
 

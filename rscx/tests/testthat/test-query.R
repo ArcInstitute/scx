@@ -79,9 +79,10 @@ test_that("select_genes projects columns", {
   expect_equal(result$n_obs(), 20)
 })
 
-test_that("select_genes rejects 0 / negative indices (1-based guard, R4)", {
+test_that("select_genes rejects 0 / negative / non-integer indices (1-based guard, R4)", {
   path <- skip_if_no_fixture()
   pipe <- scx_open(path) |> scx_query()
   expect_error(select_genes(pipe, 0L), regexp = "1-based")
   expect_error(select_genes(pipe, -1L), regexp = "1-based")
+  expect_error(select_genes(pipe, 1.5), regexp = "non-integer")
 })

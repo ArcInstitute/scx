@@ -86,8 +86,9 @@ impl RQueryPipeline {
     }
 
     /// Select specific gene indices for projection.
-    /// Note: indices are i32 from R (no unsigned int), converted to u32 internally.
-    /// Negative indices will raise an error.
+    /// Note: indices arrive as 0-based i32 (the R-facing `select_genes()` wrapper
+    /// takes 1-based indices and subtracts 1; the extendr wrapper coerces to
+    /// integer), converted to u32 internally. Negative indices raise an error.
     /// Returns `Robj` and throws via `throw_on_err` (see `filter_obs`).
     fn select_genes(&mut self, indices: Vec<i32>) -> Robj {
         crate::util::throw_on_err((|| -> Result<RQueryPipeline> {
