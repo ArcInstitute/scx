@@ -103,3 +103,68 @@ pub fn write_test_file(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> 
     writer.finish().unwrap();
     path
 }
+
+/// Write a 2-modality test SCX file (rna: `rna_vars`, adt: `adt_vars`) over a
+/// shared `n_obs` obs axis with a global `cell_type` column. Each modality has
+/// one CSR shard covering `[0, n_obs)`; row `r` in modality m expresses gene
+/// `r % m_vars`. Returns the file path. Used by the `--modality` query tests.
+pub fn write_multimodal_test_file(
+    dir: &tempfile::TempDir,
+    n_obs: usize,
+    rna_vars: usize,
+    adt_vars: usize,
+) -> std::path::PathBuf {
+    use scx_format_io::modality::ModalityType;
+    let path = dir.path().join("mm.scx");
+    let header = sample_header(n_obs as u64, rna_vars.max(adt_vars) as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var(rna_vars)).unwrap();
+    writer.write_var_for(adt_id, &sample_var(adt_vars)).unwrap();
+    writer.set_modality_n_vars(rna_id, rna_vars as u64).unwrap();
+    writer.set_modality_n_vars(adt_id, adt_vars as u64).unwrap();
+
+    for (id, m_vars) in [(rna_id, rna_vars), (adt_id, adt_vars)] {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for r in 0..n_obs {
+            indices.push((r % m_vars) as u32);
+            values.push(((r + 1) % 256) as u8);
+            indptr.push(indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard_for(
+                id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+    }
+
+    writer.finish().unwrap();
+    path
+}

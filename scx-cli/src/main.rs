@@ -655,6 +655,11 @@ enum Commands {
     Query {
         /// SCX file path or cloud URL (e.g. `gs://bucket/atlas.scxd/`)
         source: String,
+        /// Restrict the query to one modality of a multimodal file (by name).
+        /// X / `--select-genes` resolve against that modality's var; the obs
+        /// predicate stays on the shared global obs axis. Local sources only.
+        #[arg(long)]
+        modality: Option<String>,
         /// Obs predicate expression (positional). Alternatively pass it via
         /// `--filter` to match `scx subset` / `scx delete`. Provide one form,
         /// not both.
@@ -1206,6 +1211,7 @@ fn main() {
         },
         Commands::Query {
             source,
+            modality,
             filter,
             filter_flag,
             count,
@@ -1226,6 +1232,7 @@ fn main() {
             // predicate.
             query::run_query(
                 &source,
+                modality.as_deref(),
                 filter.or(filter_flag).as_deref(),
                 count,
                 output.as_deref(),

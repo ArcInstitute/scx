@@ -20,8 +20,12 @@ ScxExperiment$new <- function(path) {
   self$x_matrix <- function(allow_lossy = FALSE) .Call(wrap__ScxExperiment__x_matrix, self$.ptr, as.logical(allow_lossy))
   self$layer <- function(name, allow_lossy = FALSE) .Call(wrap__ScxExperiment__layer, self$.ptr, name, as.logical(allow_lossy))
   self$layer_names <- function() .Call(wrap__ScxExperiment__layer_names, self$.ptr)
-  self$query <- function() {
-    ptr <- .Call(wrap__ScxExperiment__query, self$.ptr)
+  self$query <- function(modality = NULL) {
+    ptr <- .Call(
+      wrap__ScxExperiment__query,
+      self$.ptr,
+      if (is.null(modality)) NULL else as.character(modality)
+    )
     RQueryPipeline$.wrap(ptr)
   }
   # Phase I.1 / I.2: multimodal accessors.

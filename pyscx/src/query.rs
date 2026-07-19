@@ -56,6 +56,11 @@ pub(crate) fn engine_to_pyerr(e: EngineError) -> PyErr {
         EngineError::SchemaError { .. } | EngineError::PredicateParseError { .. } => {
             PyValueError::new_err(e.to_string())
         }
+        // Unknown modality name — matches the `KeyError` convention used across
+        // pyscx's other `modality=` kwargs (`read_uns`, `detection_counts`, …).
+        EngineError::UnknownModality { .. } => PyKeyError::new_err(e.to_string()),
+        // Multimodal file queried without a modality → a value/usage error.
+        EngineError::ModalityRequired { .. } => PyValueError::new_err(e.to_string()),
         _ => PyRuntimeError::new_err(e.to_string()),
     }
 }
@@ -197,9 +202,15 @@ impl PyQueryPipeline {
         {
             let mut inner = slf.borrow_mut();
             let p = inner.take_pipeline()?;
-            // Read var only when at least one name needs resolving.
+            // Read var only when at least one name needs resolving. Scope to the
+            // pipeline's modality so names resolve against the modality's var
+            // (a multimodal file has no global `var` section).
             let var_batch = if genes.iter().any(|g| matches!(g, GeneRef::Name(_))) {
-                Some(p.reader().read_var().map_err(engine_to_pyerr)?)
+                Some(
+                    p.reader()
+                        .read_var_for(p.modality_id())
+                        .map_err(engine_to_pyerr)?,
+                )
             } else {
                 None
             };

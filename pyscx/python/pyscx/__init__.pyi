@@ -409,7 +409,18 @@ class Experiment:
         """
         ...
 
-    def query(self) -> Any: ...
+    def query(self, modality: str | None = None) -> Any:
+        """Start a lazy query pipeline (``.filter_obs()`` / ``.select_genes()`` /
+        ``.collect()``).
+
+        ``modality`` scopes the query to one modality of a multimodal file
+        (X / ``select_genes`` / ``filter_var`` resolve against that modality's
+        var; ``filter_obs`` stays on the shared global obs axis). On a
+        multimodal file ``modality`` is required (omitting raises ``ValueError``);
+        an unknown name raises ``KeyError``. Omit it on single-modality files.
+        """
+        ...
+
     def provenance(self) -> list[dict[str, Any]]: ...
 
     def detection_counts(self, axis: str = "var", modality: str | None = None) -> Any:
