@@ -195,7 +195,13 @@ fn fill_batch_parallel(
                 // be a panel-local depth that silently diverges from scanpy's
                 // normalize-then-subset and from the pflog1ppf path above. For
                 // the no-projection case this equals `output_row.iter().sum()`.
-                let depth: f64 = csr_data.iter().map(|&v| v as f64).sum();
+                // Only needed when normalizing — skip the sum on raw-count /
+                // log1p-only configs (e.g. scVI) where `depth` is ignored.
+                let depth: f64 = if normalize {
+                    csr_data.iter().map(|&v| v as f64).sum()
+                } else {
+                    0.0
+                };
 
                 // Scatter CSR row into dense output row (with or without projection)
                 match projection {

@@ -359,3 +359,35 @@ class TestDropShutdown:
             del ds
             gc.collect()
 
+    def test_drop_at_interpreter_exit_is_clean(self, scx_path):
+        """The in-test gc.collect() cases drop with a healthy interpreter. This
+        covers the other L3 path: a dataset with live I/O/decode threads, never
+        close()d and held in a module global, dropped during interpreter
+        finalization. The wrapper Drop's Py_IsInitialized-guarded GIL release
+        must not crash/abort the process at teardown.
+        """
+        import subprocess
+        import sys
+        import textwrap
+
+        code = textwrap.dedent(
+            f"""
+            import pyscx
+            ds = pyscx.TrainingDataset({scx_path!r}, batch_size=16)
+            it = iter(ds)
+            next(it)  # start an epoch so the I/O + decode threads are live
+            # Hold a reference in a module global and do NOT close(): the
+            # wrapper Drop runs during interpreter finalization.
+            _held = ds
+            print("ok")
+            """
+        )
+        r = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, timeout=120
+        )
+        assert r.returncode == 0, (
+            f"interpreter-exit drop crashed: rc={r.returncode}\n"
+            f"stderr={r.stderr.decode()[-2000:]}"
+        )
+        assert b"ok" in r.stdout
+

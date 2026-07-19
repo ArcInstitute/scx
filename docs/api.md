@@ -893,8 +893,10 @@ let pipeline = TrainingPipeline::new("file.scx", LoaderConfig {
     log1p: true,
     ..Default::default()
 })?;
-pipeline.start_epoch();
-while let Some(batch) = pipeline.next_batch() {
+pipeline.start_epoch()?;
+// `next_batch` returns `Result<Option<Batch>>`: `Ok(None)` = clean epoch end,
+// `Err(e)` = a mid-epoch I/O/decode fault (propagate it — don't treat as EOF).
+while let Some(batch) = pipeline.next_batch()? {
     // batch.x: dense f32 matrix, batch.obs_columns: Vec<Vec<f32>>
 }
 ```

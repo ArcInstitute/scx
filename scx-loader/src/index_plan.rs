@@ -776,11 +776,14 @@ impl IndexPlanLoader {
             // row's stored nonzeros) for the post-scatter normalize dispatch.
             // With an HVG projection `out` holds only the panel genes, so its
             // own sum would be a panel-local depth that diverges from scanpy's
-            // normalize-then-subset semantics.
-            let depth: f64 = data.iter().map(|&v| v as f64).sum();
-            match request.side {
-                PairSide::Perturbed => depth_x[request.pair_idx] = depth,
-                PairSide::Control => depth_x_paired[request.pair_idx] = depth,
+            // normalize-then-subset semantics. Only needed when normalizing —
+            // the depth vectors stay 0.0 (and are ignored) otherwise.
+            if self.config.normalize {
+                let depth: f64 = data.iter().map(|&v| v as f64).sum();
+                match request.side {
+                    PairSide::Perturbed => depth_x[request.pair_idx] = depth,
+                    PairSide::Control => depth_x_paired[request.pair_idx] = depth,
+                }
             }
         }
         Ok(())
