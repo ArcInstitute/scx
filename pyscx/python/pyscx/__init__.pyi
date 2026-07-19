@@ -607,7 +607,17 @@ class CloudExperiment:
     # the schema; the result is cached on this handle.
     def obs_keys(self) -> list[str]: ...
     def var_keys(self) -> list[str]: ...
-    def query(self) -> Any: ...
+    def query(self, modality: str | None = None) -> Any:
+        """Start a lazy cloud query pipeline.
+
+        ``modality`` scopes the query to one modality of a multimodal file
+        (X / ``select_genes`` / ``filter_var`` resolve against that modality's
+        var; ``filter_obs`` stays on the shared global obs axis). On a
+        multimodal file ``modality`` is required (omitting → ``ValueError``);
+        an unknown name → ``KeyError``. Omit it on single-modality files.
+        """
+        ...
+
     def __repr__(self) -> str: ...
 
 
@@ -619,9 +629,14 @@ def read_cloud(
     *,
     obs_filter: str | None = ...,
     var_names: list[str] | None = ...,
+    modality: str | None = ...,
 ) -> Any:
     """One-call cloud read into an AnnData (= `open_cloud(url).query()…
-    collect().to_anndata()`)."""
+    collect().to_anndata()`).
+
+    ``modality`` scopes the read to one modality of a multimodal file (see
+    ``CloudExperiment.query``).
+    """
     ...
 
 

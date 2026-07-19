@@ -526,6 +526,70 @@ impl CloudReader {
         Ok(scx_format_io::decode_arrow_ipc_schema(&bytes)?)
     }
 
+    /// Resolve a 1-based `modality_id` to its registered name. Errors for
+    /// `modality_id == 0` (reserved for the global axis) and for an unknown id.
+    /// Mirrors `ScxReader::modality_name_for_id`; used by the per-modality
+    /// `var` / `uns` readers.
+    async fn modality_name_for_id(&self, modality_id: u8) -> Result<String> {
+        if modality_id == 0 {
+            return Err(CloudError::Io(std::io::Error::other(
+                "modality_id 0 is reserved for global entries",
+            )));
+        }
+        let table = self.modality_table().await?;
+        table
+            .as_ref()
+            .and_then(|t| t.info_of(modality_id))
+            .map(|m| m.name.clone())
+            .ok_or_else(|| {
+                CloudError::SectionNotFound(format!("modality_id {modality_id} not found"))
+            })
+    }
+
+    /// Read the `var` RecordBatch for a specific modality. `modality_id == 0`
+    /// reads the global / single-modality `var` section (matches
+    /// [`Self::read_var`]); `> 0` reads the per-modality `var/<name>` section.
+    /// Mirror of `ScxReader::read_var_for` over the cloud path.
+    pub async fn read_var_for(&self, modality_id: u8) -> Result<RecordBatch> {
+        if modality_id == 0 {
+            return self.read_var().await;
+        }
+        let mname = self.modality_name_for_id(modality_id).await?;
+        let bytes = self.read_section(&format!("var/{mname}")).await?;
+        Ok(scx_format_io::downcast_large_types(
+            &decode_arrow_ipc_batch(&bytes, "var")?,
+        )?)
+    }
+
+    /// Read the `var` schema for a specific modality without assembling the
+    /// batch. `modality_id == 0` → the global var schema. Mirror of
+    /// `ScxReader::read_var_schema_for`.
+    pub async fn read_var_schema_for(&self, modality_id: u8) -> Result<Schema> {
+        if modality_id == 0 {
+            return self.read_var_schema().await;
+        }
+        let mname = self.modality_name_for_id(modality_id).await?;
+        let bytes = self.read_section(&format!("var/{mname}")).await?;
+        Ok(scx_format_io::decode_arrow_ipc_schema(&bytes)?)
+    }
+
+    /// Per-modality variable count. `modality_id == 0` → the file-wide
+    /// `header.n_vars`; `> 0` → the modality table's `n_vars` (the canonical
+    /// per-modality width; `header.n_vars` is the max across modalities).
+    pub async fn modality_n_vars(&self, modality_id: u8) -> Result<u64> {
+        if modality_id == 0 {
+            return Ok(self.header.n_vars);
+        }
+        let table = self.modality_table().await?;
+        table
+            .as_ref()
+            .and_then(|t| t.info_of(modality_id))
+            .map(|m| m.n_vars)
+            .ok_or_else(|| {
+                CloudError::SectionNotFound(format!("modality_id {modality_id} not found"))
+            })
+    }
+
     /// Resolve the first obs section catalog entry: `obs_metadata/shard_0`
     /// when obs is sharded, else the legacy single `obs` section. Mirror of
     /// `ScxReader::first_obs_section_entry`.

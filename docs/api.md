@@ -244,9 +244,11 @@ LRU thrashing across modalities.
 - The `SectionReader` trait gains modality-aware methods
   (`read_var_for` / `read_var_schema_for` / `modality_n_vars` /
   `modality_id_by_name` / `n_modalities` / `is_multimodal` / `modality_names`),
-  with single-modality default impls so non-local backends (cloud) compile
-  unchanged and reject non-zero modality ids until per-modality cloud routing
-  lands.
+  with single-modality default impls. Both backends override them: `ScxReader`
+  (local) and `CloudSectionReader` (cloud — routes per-modality `var`/CSR
+  sections over packed and exploded `.scxd/` layouts), so
+  `open_cloud(url).query(modality=…)` runs the same modality-scoped pushdown as
+  the local path.
 
 ### Python (`pyscx`)
 
@@ -1248,8 +1250,10 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.cloud_optimize(input, output=None)` — Front-of-file catalog
 - `pyscx.explode(input, output)` — Packed → exploded directory
 - `pyscx.pack(input, output)` — Exploded → packed
-- `pyscx.open_cloud(url) -> CloudExperiment` — Direct cloud reads
-- `pyscx.read_cloud(url, *, obs_filter=None, var_names=None) -> AnnData` — One-call cloud read (= `open_cloud(url).query()…collect().to_anndata()`); see [docs/cloud.md § `pyscx.read_cloud(...)`](cloud.md#pyscxread_cloud--one-liner-cloud-read).
+- `pyscx.open_cloud(url) -> CloudExperiment` — Direct cloud reads.
+  `CloudExperiment.query(modality=…)` scopes to one modality of a multimodal
+  file (same semantics as the local `Experiment.query`).
+- `pyscx.read_cloud(url, *, obs_filter=None, var_names=None, modality=None) -> AnnData` — One-call cloud read (= `open_cloud(url).query(modality=…)…collect().to_anndata()`); see [docs/cloud.md § `pyscx.read_cloud(...)`](cloud.md#pyscxread_cloud--one-liner-cloud-read).
 
 ### Experiment
 

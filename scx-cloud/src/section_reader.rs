@@ -20,6 +20,7 @@ use scx_engine::error::EngineError;
 use scx_engine::SectionReader;
 use scx_format_io::catalog::FullCatalogEntry;
 use scx_format_io::header::FileHeader;
+use scx_format_io::modality::ModalityTable;
 use scx_format_io::{DeletionVectors, FullCatalog};
 use tokio::runtime::Runtime;
 
@@ -36,6 +37,11 @@ use crate::error::CloudError;
 pub struct CloudSectionReader {
     inner: Arc<CloudReader>,
     rt: Arc<Runtime>,
+    /// Lazily-fetched modality table, memoized so the sync modality accessors
+    /// (`modality_names` / `modality_id_by_name`) don't re-read the section per
+    /// call. `None` for single-modality files (or if the read failed — the
+    /// modality-scoped `read_var_*` methods surface the real error instead).
+    modalities: std::sync::OnceLock<Option<ModalityTable>>,
 }
 
 impl CloudSectionReader {
@@ -43,13 +49,26 @@ impl CloudSectionReader {
     /// it stays alive for the adapter's lifetime; callers may share
     /// the same runtime across many adapters.
     pub fn new(inner: Arc<CloudReader>, rt: Arc<Runtime>) -> Self {
-        Self { inner, rt }
+        Self {
+            inner,
+            rt,
+            modalities: std::sync::OnceLock::new(),
+        }
     }
 
     /// Underlying `CloudReader` (for callers that want to issue
     /// additional async calls outside the `SectionReader` surface).
     pub fn cloud_reader(&self) -> &Arc<CloudReader> {
         &self.inner
+    }
+
+    /// Memoized parsed modality table (`None` for single-modality files or on
+    /// read error — best-effort; the fallible `read_var_*` / `modality_n_vars`
+    /// methods block_on the reader directly and surface real errors).
+    fn modalities(&self) -> Option<&ModalityTable> {
+        self.modalities
+            .get_or_init(|| self.rt.block_on(self.inner.modality_table()).ok().flatten())
+            .as_ref()
     }
 }
 
@@ -102,6 +121,44 @@ impl SectionReader for CloudSectionReader {
     fn read_var(&self) -> scx_engine::Result<RecordBatch> {
         self.rt
             .block_on(self.inner.read_var())
+            .map_err(cloud_to_engine)
+    }
+
+    // --- Modality-aware surface (enables `query(modality=…)` over cloud). ---
+
+    fn n_modalities(&self) -> u32 {
+        self.inner.header().n_modalities
+    }
+
+    fn is_multimodal(&self) -> bool {
+        self.inner.header().n_modalities > 0
+    }
+
+    fn modality_names(&self) -> Vec<String> {
+        self.modalities()
+            .map(|t| t.entries.iter().map(|m| m.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn modality_id_by_name(&self, name: &str) -> Option<u8> {
+        self.modalities().and_then(|t| t.id_of(name))
+    }
+
+    fn read_var_schema_for(&self, modality_id: u8) -> scx_engine::Result<Schema> {
+        self.rt
+            .block_on(self.inner.read_var_schema_for(modality_id))
+            .map_err(cloud_to_engine)
+    }
+
+    fn read_var_for(&self, modality_id: u8) -> scx_engine::Result<RecordBatch> {
+        self.rt
+            .block_on(self.inner.read_var_for(modality_id))
+            .map_err(cloud_to_engine)
+    }
+
+    fn modality_n_vars(&self, modality_id: u8) -> scx_engine::Result<u64> {
+        self.rt
+            .block_on(self.inner.modality_n_vars(modality_id))
             .map_err(cloud_to_engine)
     }
 

@@ -155,9 +155,8 @@ wired — the *backed* path doesn't share the `QueryPipeline` — so use
 `query(modality=...)` (in-memory result) or `scx subset --modality NAME --filter
 '<expr>'` (§ 5, materialises a filtered single-modality file, then
 `to_anndata(backed=True)` on the result) instead.
-Cloud-backed `open_cloud(...).to_mudata(backed=True)` and cloud
-`.query(modality=...)` are not yet wired even though the `SectionReader`
-abstraction has landed — the cloud `.query()` path is single-axis for now.
+Cloud-backed `open_cloud(...).query(modality=...)` **is** supported (§ 3.4);
+`open_cloud(...).to_mudata(backed=True)` is a separate follow-on.
 
 ### 3.3 Training — `pyscx.MultimodalTrainingDataset`
 
@@ -243,8 +242,10 @@ raises `KeyError`. On a single-modality / v1 file omit `modality=` (the
 default global axis; passing a name errors). A file carrying deletion
 vectors rejects a modality query with a clear error — compact it first
 (`scx compact`) to apply the deletions (per-modality deletion vectors are a
-follow-on). The cloud `.query()` path is single-axis; a modality query on a
-cloud source is rejected.
+follow-on). Modality-scoped queries run over the **cloud** reader too —
+`open_cloud(url).query(modality="rna")`, `read_cloud(url, modality="rna")`, and
+`scx query <url> --modality rna` — for both packed and exploded `.scxd/`
+layouts. (`open_cloud(...).to_mudata()` over cloud remains a separate follow-on.)
 
 CLI and R equivalents:
 
@@ -392,7 +393,7 @@ are resolved.
 | `scx merge` on multimodal inputs | Supported | Dispatches to `merge_multimodal`; per-modality CSC dropped — `--rebuild-csc` to re-emit |
 | `scx compact` on multimodal inputs | Supported | Dispatches to `compact_multimodal`; keep mask applied across every modality |
 | `to_anndata(modality=…, backed=True)` + filter kwargs | Not supported | Use `query(modality=…)` (in-memory) or `scx subset --modality NAME --filter` |
-| `open_cloud(...).query(modality=…)` | Not supported | Cloud `.query()` is single-axis; a modality query on a cloud source is rejected (follow-on) |
+| `open_cloud(...).query(modality=…)` / `read_cloud(..., modality=…)` | Supported | Modality-scoped predicate pushdown over the cloud reader (packed + exploded `.scxd/`); `scx query <url> --modality` too |
 | `open_cloud(...).to_mudata(backed=True)` | Not supported | Cloud `SectionReader` is wired for unimodal `.query()`; multimodal backed export is a follow-on |
 
 ### Detail
