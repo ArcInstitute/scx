@@ -37,7 +37,7 @@ test_that("scx_delete marks cells as deleted", {
   on.exit(unlink(tmp), add = TRUE)
   file.copy(path, tmp)
 
-  total <- scx_delete(tmp, c(0L, 1L))
+  total <- scx_delete(tmp, c(1L, 2L))
   expect_equal(total, 2)
 })
 
@@ -54,8 +54,10 @@ test_that("scx_delete addresses indices above 2^31 and validates values (R3)", {
   expect_gt(big, .Machine$integer.max)
   expect_error(scx_delete(tmp, big), regexp = "out of bounds")
 
-  # Value validation: negatives and non-integers are rejected with clear errors.
-  expect_error(scx_delete(tmp, -1), regexp = "negative")
+  # Value validation: 0 / negatives trip the R-side 1-based guard (R4);
+  # non-integers are caught by the Rust core after the 1->0 conversion.
+  expect_error(scx_delete(tmp, 0), regexp = "1-based")
+  expect_error(scx_delete(tmp, -1), regexp = "1-based")
   expect_error(scx_delete(tmp, 1.5), regexp = "non-integer")
 })
 
@@ -66,7 +68,7 @@ test_that("scx_compact produces valid file with fewer cells", {
   on.exit(unlink(c(tmp, out)), add = TRUE)
   file.copy(path, tmp)
 
-  scx_delete(tmp, c(0L, 1L, 2L))
+  scx_delete(tmp, c(1L, 2L, 3L))
   scx_compact(tmp, out)
 
   info <- scx_info(out)
@@ -81,7 +83,7 @@ test_that("scx_rollback reverts to previous state", {
   file.copy(path, tmp)
 
   # Delete some cells (creates a new manifest version)
-  scx_delete(tmp, c(0L, 1L))
+  scx_delete(tmp, c(1L, 2L))
 
   # Rollback
   scx_rollback(tmp)
@@ -168,7 +170,7 @@ test_that("scx_compact honours reshape_obs + index_obs", {
   on.exit(unlink(c(tmp, out)), add = TRUE)
   file.copy(path, tmp)
 
-  scx_delete(tmp, c(0L, 1L, 2L))
+  scx_delete(tmp, c(1L, 2L, 3L))
   scx_compact(tmp, out, index_obs = "batch", reshape_obs = TRUE)
 
   info <- scx_info(out)

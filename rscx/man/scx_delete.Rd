@@ -9,10 +9,11 @@ scx_delete(path, cell_indices)
 \arguments{
 \item{path}{Path to the SCX file.}
 
-\item{cell_indices}{Numeric vector of 0-based cell indices to delete. Passed
-as doubles so indices above \code{.Machine$integer.max} (2^31) are
-addressable (mirrors the backed reader); values must be whole and
-non-negative.}
+\item{cell_indices}{Numeric vector of 1-based cell indices to delete (R
+convention, matching the \code{[} operator). Passed as doubles so indices
+above \code{.Machine$integer.max} (2^31) are addressable (mirrors the backed
+reader); values must be whole and \code{>= 1} (\code{0} / negatives raise an
+error).}
 }
 \value{
 Total number of deleted cells (including previously deleted).
@@ -24,6 +25,6 @@ compaction.
 }
 \examples{
 \dontrun{
-total <- scx_delete("experiment.scx", c(0, 5, 10, 42))
+total <- scx_delete("experiment.scx", c(1, 6, 11, 43))
 }
 }

@@ -65,10 +65,11 @@ var <- exp$var()     # R data.frame
 dgc <- exp$x_matrix()
 
 # Lazy query pipeline (pipe-friendly)
+# Indices are 1-based (R convention), e.g. hvg_indices <- which(hvg$highly_variable)
 result <- scx_open("experiment.scx") |>
   scx_query() |>
   filter_obs("tissue == 'lung'") |>
-  select_genes(hvg_indices) |>
+  select_genes(hvg_indices) |>   # 1-based gene indices
   with_normalize(target_sum = 1e4) |>
   with_log1p() |>
   collect()
@@ -81,7 +82,7 @@ sce <- result$to_sce()
 
 # File operations
 scx_append("atlas.scx", "new_batch.scx")
-scx_delete("experiment.scx", c(0L, 5L, 10L))
+scx_delete("experiment.scx", c(1L, 6L, 11L))   # 1-based cell indices
 scx_compact("experiment.scx", "clean.scx")
 scx_rollback("experiment.scx")
 scx_merge(c("batch1.scx", "batch2.scx"), "atlas.scx")

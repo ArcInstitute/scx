@@ -55,18 +55,29 @@ scx_append <- function(target, input, codec = NULL, shard_size = 16384L,
 #' compaction.
 #'
 #' @param path Path to the SCX file.
-#' @param cell_indices Numeric vector of 0-based cell indices to delete. Passed
-#'   as doubles so indices above \code{.Machine$integer.max} (2^31) are
-#'   addressable (mirrors the backed reader); values must be whole and
-#'   non-negative.
+#' @param cell_indices Numeric vector of 1-based cell indices to delete (R
+#'   convention, matching the \code{[} operator). Passed as doubles so indices
+#'   above \code{.Machine$integer.max} (2^31) are addressable (mirrors the backed
+#'   reader); values must be whole and \code{>= 1} (\code{0} / negatives raise an
+#'   error).
 #' @return Total number of deleted cells (including previously deleted).
 #' @export
 #' @examples
 #' \dontrun{
-#' total <- scx_delete("experiment.scx", c(0, 5, 10, 42))
+#' total <- scx_delete("experiment.scx", c(1, 6, 11, 43))
 #' }
 scx_delete <- function(path, cell_indices) {
-  .Call(wrap__scx_delete, path, as.numeric(cell_indices))
+  idx <- as.numeric(cell_indices)
+  if (anyNA(idx)) {
+    stop("NA cell indices are not supported", call. = FALSE)
+  }
+  # R is 1-based (like the `[` operator); reject 0 / negatives before converting
+  # to the 0-based core index.
+  if (length(idx) && any(idx < 1)) {
+    stop("cell indices must be >= 1 (1-based); 0 / negative indices are not supported",
+         call. = FALSE)
+  }
+  .Call(wrap__scx_delete, path, idx - 1)
 }
 
 #' Compact an SCX file
