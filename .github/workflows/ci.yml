@@ -32,9 +32,34 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    env:
+      # Link with mold (installed below): far lower peak memory/temp per link
+      # than the default rust-lld, and faster. `cargo test --workspace` links a
+      # separate binary per doctest against the full arrow dependency closure,
+      # and on a stock runner that burst faulted the linker with SIGBUS
+      # (ld "signal 7 [Bus error]" — an ENOSPC-on-mmap symptom). Pairs with the
+      # disk-reclaim step below.
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
+      # Reclaim ~25-30 GB of preinstalled toolchains/images. The stock
+      # ubuntu-latest disk (~14 GB free) fills mid-link during the doctest
+      # phase (see the "No space left on device" history in the cache note
+      # below), which is what faulted the linker. `tool-cache: false` keeps the
+      # hosted toolchain cache the Rust/Python setup actions rely on.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           # PR branches restore-only; only main saves the cache. The post-job
