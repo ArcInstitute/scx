@@ -99,6 +99,8 @@ def pseudobulk_dex(
     prefer_format: PreferFormat = "csr",
     gene_indices: list[int] | None = None,
     n_cpus: int | None = None,
+    backend: Literal["pydeseq2", "nb_glm"] = "pydeseq2",
+    nbglm_options: dict[str, Any] | None = None,
 ) -> Any: ...
 
 
