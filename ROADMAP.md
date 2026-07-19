@@ -186,7 +186,7 @@ and parallel shard decode (highest-impact fixes from earlier benchmarks).
 - [x] Numeric predicate index: B+ tree for range queries
 - [x] High-cardinality hash index (>10K unique values)
 - [x] Auto-indexing for low-cardinality columns (<1K unique values)
-- [ ] `scx-cli` flag to specify indexed columns during conversion — **DEFERRED**
+- [x] `scx-cli` flag to specify indexed columns during conversion — `scx convert --index-obs` / `--index-var` / `--index-preset` (also on `append`/`compact`)
 
 ### 2.4 Fragment/Manifest Operations
 - [x] `scx append` — append new shards + updated catalog (docs/format.md §Append)

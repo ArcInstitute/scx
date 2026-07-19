@@ -268,7 +268,11 @@ scx validate citeseq.scx    # ModalityTable checksum + cross-check;
                             # accepts partial per-modality CSC sidecars
 
 # Mutating ops (per-modality routing)
-scx append citeseq.scx new_rna_cells.scx --modality rna          # preserves ADT's CSC
+# NOTE: `scx append --modality` on a multimodal file is NOT yet supported
+# (deferred) — it errors. Appending cells to one modality would grow the global
+# obs axis while leaving sibling modalities under-covering it, producing an
+# unreadable file. Extract a single modality first (see `scx subset` below),
+# append to the extracted file, then re-merge.
 scx subset citeseq.scx rna_only.scx --modality rna
 scx subset citeseq.scx rna_tcells.scx --modality rna \
     --filter "cell_type == 'T cell'" --genes hvg.txt             # filter + projection
@@ -276,20 +280,15 @@ scx merge cite1.scx cite2.scx --output cite_merged.scx            # multimodal m
 scx compact cite_merged.scx cite_compacted.scx                   # multimodal compact
 ```
 
-From Python, `pyscx.append` / `append_from_anndata` take the same `modality=`
-name (the Python equivalent of `scx append --modality`):
-
-```python
-import pyscx
-
-# Append cells into the rna modality of a multimodal target (the same name
-# resolves the source modality too). Required on multimodal targets; rejected
-# on single-modality files. Use Experiment.modality_names to list them.
-pyscx.append("citeseq.scx", "new_rna_cells.scx", modality="rna")
-
-# Append from an in-memory AnnData into one modality (source is global-axis).
-pyscx.append_from_anndata("citeseq.scx", new_rna_adata, modality="rna")
-```
+> **Multimodal append is deferred.** `pyscx.append` / `append_from_anndata` (and
+> `scx append`) reject a multimodal target with a `ValueError` ("append is not
+> yet supported for multimodal files; extract individual modalities first with
+> `scx subset --modality NAME`"). Appending cells to a single modality cannot
+> keep the shared global obs axis consistent across the other modalities, so the
+> result would be unreadable. Workaround: `scx subset --modality NAME` to a
+> single-modality file, `pyscx.append` into that, then `scx merge` back.
+> `pyscx.append` / `append_from_anndata` still work normally on single-modality
+> files (omit `modality=`).
 
 Python equivalent for the export direction:
 
@@ -329,7 +328,7 @@ are resolved.
 | `pyscx.MultimodalTrainingDataset` | Supported | — |
 | `scx subset --modality NAME` | Supported | — |
 | `scx subset --modality NAME --filter … --genes …` | Supported | Composes filter + projection in one pass |
-| `scx append --modality NAME` | Supported | Per-modality CSC invalidation; other modalities' CSC preserved |
+| `scx append --modality NAME` | Not supported (deferred) | Rejected with `MultimodalUnsupported`: a single-modality append would leave siblings under-covering the global obs axis. Extract via `scx subset --modality`, append, then `scx merge` |
 | `scx merge` on multimodal inputs | Supported | Dispatches to `merge_multimodal`; per-modality CSC dropped — `--rebuild-csc` to re-emit |
 | `scx compact` on multimodal inputs | Supported | Dispatches to `compact_multimodal`; keep mask applied across every modality |
 | `to_anndata(modality=…, backed=True)` + filter kwargs | Not supported | `scx subset --modality NAME --filter` |
@@ -337,14 +336,15 @@ are resolved.
 
 ### Detail
 
-- **Per-modality CSC sidecars on append**: `scx append --modality rna`
-  clears `HAS_CSC` only on the target modality; ADT's CSC sidecar
-  stays intact. The file-level `header.has_csc()` flag means
-  "at least one modality still owns a CSC sidecar" for v2 files.
-  `scx info` shows the per-modality state in a `has_csc` column.
-  Pass `--rebuild-csc` to re-emit the dropped sidecar (today this
-  re-runs against the full file; per-affected-modality
-  `--rebuild-csc all` is a follow-on).
+- **Multimodal append (deferred)**: `scx append` / `pyscx.append` reject a
+  multimodal target (`MultimodalUnsupported`). SCX requires cell-aligned
+  modalities (every modality covers the global `[0, n_obs)` obs axis; `to_mudata`
+  enforces this), so appending new cells to one modality — which bumps the
+  global `n_obs` but extends only that modality — would leave siblings
+  under-covering the axis and the file unreadable. Per-modality append that
+  keeps all modalities aligned is a planned follow-on. Until then, extract a
+  modality with `scx subset --modality NAME`, append to the single-modality
+  file, and `scx merge` the modalities back together.
 - **Multimodal merge / compact**: `merge` walks every modality,
   copies/re-encodes CSR shards in input order with `row_start`
   adjusted for the cumulative global obs offset, and preserves

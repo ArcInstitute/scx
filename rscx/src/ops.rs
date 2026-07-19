@@ -169,27 +169,37 @@ fn scx_append_impl(
 
 /// Mark specific cell indices as logically deleted.
 ///
-/// Note: indices are i32 from R (no unsigned int), converted to u64 internally.
-/// Returns the total number of deleted cells (including previously deleted).
+/// Note: indices cross the FFI boundary as R doubles (`f64`), matching the
+/// backed reader's row-index contract so cell indices beyond `.Machine$integer.max`
+/// (2^31) remain addressable (an `i32` vector would truncate them to `NA`).
+/// Each value is validated (finite, non-negative, integral) and converted to
+/// `u64`. Returns the total number of deleted cells (including previously
+/// deleted).
 ///
 /// @param path Path to the SCX file.
-/// @param cell_indices Integer vector of 0-based cell indices to delete.
+/// @param cell_indices 0-based cell indices at this FFI boundary. The R-facing
+///   `scx_delete()` wrapper takes **1-based** indices (R convention) and subtracts
+///   1 before calling in, so values arrive here already 0-based.
 /// @return Total number of deleted cells as numeric (f64 to avoid i32 overflow).
 ///
 /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
 #[extendr]
-fn scx_delete(path: &str, cell_indices: Vec<i32>) -> Robj {
+fn scx_delete(path: &str, cell_indices: Vec<f64>) -> Robj {
     crate::util::throw_on_err(scx_delete_impl(path, cell_indices))
 }
 
-fn scx_delete_impl(path: &str, cell_indices: Vec<i32>) -> Result<Robj> {
+fn scx_delete_impl(path: &str, cell_indices: Vec<f64>) -> Result<Robj> {
     let indices: Vec<u64> = cell_indices
         .into_iter()
-        .map(|i| {
-            if i < 0 {
-                Err(Error::Other(format!("negative cell index: {}", i)))
+        .map(|v| {
+            if !v.is_finite() {
+                Err(Error::Other(format!("non-finite cell index: {v}")))
+            } else if v < 0.0 {
+                Err(Error::Other(format!("negative cell index: {v}")))
+            } else if v.fract() != 0.0 {
+                Err(Error::Other(format!("non-integer cell index: {v}")))
             } else {
-                Ok(i as u64)
+                Ok(v as u64)
             }
         })
         .collect::<Result<Vec<u64>>>()?;

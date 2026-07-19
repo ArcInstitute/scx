@@ -183,7 +183,8 @@ fn ops_to_pyerr(e: OpsError) -> PyErr {
         | OpsError::ValueOutOfRange { .. }
         | OpsError::UnknownCodec(_)
         | OpsError::UnknownValueEncoding(_)
-        | OpsError::InvalidInput(_) => PyValueError::new_err(msg),
+        | OpsError::InvalidInput(_)
+        | OpsError::MultimodalUnsupported { .. } => PyValueError::new_err(msg),
         OpsError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
             PyFileNotFoundError::new_err(msg)
         }

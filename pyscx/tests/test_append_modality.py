@@ -107,7 +107,10 @@ def test_append_multimodal_unknown_modality(tmp_path):
         pyscx.append(target, source, modality="nope")
 
 
-def test_append_into_modality_succeeds(tmp_path):
+def test_append_into_modality_rejected(tmp_path):
+    """Multimodal append is deferred (review finding #3): it would leave sibling
+    modalities under-covering the global obs axis → an unreadable file. It must
+    be rejected before touching the target."""
     import pyscx
 
     pytest.importorskip("mudata")
@@ -116,11 +119,12 @@ def test_append_into_modality_succeeds(tmp_path):
     pyscx.from_mudata(_make_mudata(32), target)
     pyscx.from_mudata(_make_mudata(8, seed=3), source)
 
-    pyscx.append(target, source, modality="rna")
+    with pytest.raises(ValueError, match="multimodal"):
+        pyscx.append(target, source, modality="rna")
 
+    # Target left untouched.
     out = pyscx.open(target)
-    assert out.is_multimodal is True
-    assert sorted(out.modality_names) == ["adt", "rna"]
+    assert out.n_obs == 32
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +132,8 @@ def test_append_into_modality_succeeds(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_append_from_anndata_into_modality(tmp_path):
+def test_append_from_anndata_into_modality_rejected(tmp_path):
+    """Multimodal append is deferred — rejected for the anndata path too."""
     import anndata as ad
     import pyscx
 
@@ -143,14 +148,17 @@ def test_append_from_anndata_into_modality(tmp_path):
     new.var_names = [f"g{i}" for i in range(20)]
     new.obs_names = [f"new_{i}" for i in range(5)]
 
-    pyscx.append_from_anndata(target, new, modality="rna")
+    with pytest.raises(ValueError, match="multimodal"):
+        pyscx.append_from_anndata(target, new, modality="rna")
 
     out = pyscx.open(target)
-    assert out.is_multimodal is True
-    assert sorted(out.modality_names) == ["adt", "rna"]
+    assert out.n_obs == 32
 
 
 def test_append_from_anndata_modality_nvars_mismatch(tmp_path):
+    """pyscx validates the AnnData's n_vars against the resolved modality
+    before calling into scx-ops, so an n_vars mismatch still surfaces its own
+    error (this check runs ahead of the core multimodal-append reject)."""
     import anndata as ad
     import pyscx
 

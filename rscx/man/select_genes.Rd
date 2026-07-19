@@ -9,7 +9,10 @@ select_genes(pipeline, indices)
 \arguments{
 \item{pipeline}{An RQueryPipeline object.}
 
-\item{indices}{Integer vector of 0-based gene indices.}
+\item{indices}{Numeric vector of 1-based gene indices (R convention, matching
+the \code{[} operator). For example, obtain them from
+\code{which(scx_highly_variable_genes(...)$highly_variable)}. Indices must be
+\code{>= 1}; \code{0} / negatives raise an error.}
 }
 \value{
 A new RQueryPipeline object (for pipe chaining).

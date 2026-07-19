@@ -5,10 +5,11 @@
 #' @export
 #' @examples
 #' \dontrun{
+#' hvg_indices <- which(scx_highly_variable_genes(exp)$highly_variable)  # 1-based
 #' result <- scx_open("experiment.scx") |>
 #'   scx_query() |>
 #'   filter_obs("tissue == 'lung'") |>
-#'   select_genes(hvg_indices) |>
+#'   select_genes(hvg_indices) |>   # 1-based gene indices
 #'   with_normalize(target_sum = 1e4) |>
 #'   with_log1p() |>
 #'   collect()
@@ -44,11 +45,29 @@ filter_var <- function(pipeline, expr) {
 #' Select specific gene indices for projection
 #'
 #' @param pipeline An RQueryPipeline object.
-#' @param indices Integer vector of 0-based gene indices.
+#' @param indices Numeric vector of 1-based gene indices (R convention, matching
+#'   the \code{[} operator). For example, obtain them from
+#'   \code{which(scx_highly_variable_genes(...)$highly_variable)}. Indices must be
+#'   \code{>= 1}; \code{0} / negatives raise an error.
 #' @return A new RQueryPipeline object (for pipe chaining).
 #' @export
 select_genes <- function(pipeline, indices) {
-  pipeline$select_genes(indices)
+  indices <- as.numeric(indices)
+  if (anyNA(indices)) {
+    stop("NA gene indices are not supported", call. = FALSE)
+  }
+  # R is 1-based (like the `[` operator); reject 0 / negatives before the
+  # conversion to the 0-based core index.
+  if (length(indices) && any(indices < 1)) {
+    stop("gene indices must be >= 1 (1-based); 0 / negative indices are not supported",
+         call. = FALSE)
+  }
+  # Reject fractional indices explicitly rather than letting the extendr wrapper's
+  # `as.integer` silently truncate them.
+  if (length(indices) && any(indices != floor(indices))) {
+    stop("non-integer gene index: gene indices must be whole numbers", call. = FALSE)
+  }
+  pipeline$select_genes(indices - 1)
 }
 
 #' Enable total-count normalization

@@ -17,10 +17,11 @@ Start a query pipeline from an ScxExperiment
 }
 \examples{
 \dontrun{
+hvg_indices <- which(scx_highly_variable_genes(exp)$highly_variable)  # 1-based
 result <- scx_open("experiment.scx") |>
   scx_query() |>
   filter_obs("tissue == 'lung'") |>
-  select_genes(hvg_indices) |>
+  select_genes(hvg_indices) |>   # 1-based gene indices
   with_normalize(target_sum = 1e4) |>
   with_log1p() |>
   collect()

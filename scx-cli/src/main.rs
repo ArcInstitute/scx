@@ -272,10 +272,12 @@ enum Commands {
         target: PathBuf,
         /// Source SCX file containing cells to append
         source: PathBuf,
-        /// Modality name to append into. Required on multimodal target
-        /// files (`scx info` shows the modality table). Optional on
-        /// single-modality files — defaults to the global / primary
-        /// modality.
+        /// Modality name to append into. NOTE: append into a multimodal
+        /// target is not yet supported (deferred) and is rejected — extract
+        /// a modality with `scx subset --modality NAME`, append to the
+        /// single-modality file, then `scx merge` back. Optional on
+        /// single-modality files (the only supported case) — defaults to the
+        /// global / primary modality.
         #[arg(long)]
         modality: Option<String>,
         /// Compression codec for new shards: auto, none, scx1, zstd, lz4, pcodec, shufdelta

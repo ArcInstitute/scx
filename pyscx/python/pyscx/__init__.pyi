@@ -275,6 +275,25 @@ class TrainingDataset:
 # ---------------------------------------------------------------------------
 
 
+class GroupShard:
+    """One shard of a grouped (sorted) SCX layout. Yielded by
+    `Experiment.iter_group_shards`."""
+
+    @property
+    def shard_index(self) -> int: ...
+    @property
+    def global_start(self) -> int: ...
+    @property
+    def global_stop(self) -> int: ...
+    @property
+    def labels(self) -> list[str]: ...
+    @property
+    def groups(self) -> dict[str, tuple[int, int]]: ...
+    def to_anndata(self) -> Any: ...
+    def read_group(self, label: str) -> Any: ...
+    def __repr__(self) -> str: ...
+
+
 class Experiment:
     """Handle to an open SCX file. Returned by `pyscx.open(path)`."""
 
@@ -300,6 +319,18 @@ class Experiment:
     def has_csc(self) -> bool: ...
     @property
     def has_deletions(self) -> bool: ...
+    @property
+    def obs_metadata_shard_count(self) -> int: ...
+    @property
+    def var_metadata_shard_count(self) -> int: ...
+    @property
+    def index_dtype(self) -> int: ...
+    @property
+    def is_multimodal(self) -> bool: ...
+    @property
+    def n_modalities(self) -> int: ...
+    @property
+    def modality_names(self) -> list[str]: ...
     # List-returning accessors — callable methods (not properties): the
     # AnnData-style `*_keys()` family plus `layer_names()` (F1/F7).
     def layer_names(self) -> list[str]: ...
@@ -320,6 +351,18 @@ class Experiment:
         modality's ``uns/<name>`` section instead of the global one.
         Unknown modality names raise ``KeyError``.
         """
+        ...
+
+    def read_obs(self, columns: list[str] | None = ...) -> Any:
+        """Read obs (optionally a column projection) as a pandas DataFrame,
+        without materializing X. `columns=None` reads the full obs table."""
+        ...
+
+    def distinct_values(
+        self, col: str, *, limit: int | None = ..., sort: bool = ...
+    ) -> tuple[list[str], bool]:
+        """Distinct values of a string/categorical obs column as
+        `(values, has_more)`. Never decodes X."""
         ...
 
     def info(self) -> str:
@@ -404,6 +447,58 @@ class Experiment:
         utility, not the training hot path). Out-of-range ids raise
         ``IndexError``. Drop-in for the backed ``adata.X[rows]`` analysis path.
         """
+        ...
+
+    def to_gpu_anndata(
+        self,
+        var_names: list[str] | None = ...,
+        obs_filter: str | None = ...,
+        layers: list[str] | None = ...,
+        obsm: list[str] | None = ...,
+        device: str = ...,
+        memory_budget: Any = ...,
+        preserve_var_order: bool = ...,
+        strict_var_names: bool = ...,
+        container: str = ...,
+        data_dtype: str | None = ...,
+        index_dtype: str | None = ...,
+        allow_lossy: bool = ...,
+    ) -> Any:
+        """Materialise on-device as an AnnData backed by a
+        ``cupyx.scipy.sparse.csr_matrix`` (f32-native). Rejects the
+        dtype/container narrowing kwargs at runtime."""
+        ...
+
+    def mark_deleted(self, mask: np.ndarray) -> int:
+        """Mark cells for deletion via a boolean mask (length ``n_obs``);
+        returns the number of rows newly marked. Writes a deletion vector."""
+        ...
+
+    def validate(self, deep: bool = ...) -> list[tuple[str, bool]]:
+        """Run structural checks, returning ``(check_name, passed)`` pairs.
+        ``deep=True`` additionally re-verifies per-shard checksums."""
+        ...
+
+    # --- Grouped (sorted) layout accessors ---
+    def read_group(self, label: str) -> Any:
+        """Read all cells of ``label`` (grouped layout) as an AnnData."""
+        ...
+
+    def read_reference(self) -> Any | None:
+        """Read the reference group as an AnnData, or ``None`` if absent."""
+        ...
+
+    def group_labels(self) -> list[str]: ...
+    def iter_group_shards(self) -> list[GroupShard]: ...
+
+    # --- Multimodal accessors ---
+    def modality_id(self, name: str) -> int | None:
+        """Resolve a modality name to its id, or ``None`` if unknown."""
+        ...
+
+    def modality_info(self, modality_id: int) -> dict[str, Any] | None:
+        """Per-modality metadata dict (name, n_vars, nnz, shard counts, …),
+        or ``None`` if the id is unknown."""
         ...
 
     def __repr__(self) -> str: ...

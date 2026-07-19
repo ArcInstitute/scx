@@ -24,4 +24,6 @@
 #' lab <- sample(c("A", "B"), N, replace = TRUE)
 #' mean(scx_compute_lisi(emb, lab))
 #' }
+#' @name scx_compute_lisi
+#' @rdname scx_compute_lisi
 NULL

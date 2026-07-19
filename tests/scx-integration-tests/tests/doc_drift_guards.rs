@@ -41,7 +41,39 @@ fn cpu_pca_threshold_pinned() {
     );
 }
 
-/// The workspace member set must match the documented crate graph (14 code
+/// The section-type ID range is documented in AGENTS.md and docs/format.md and
+/// drifted from the enum (the 2026-07-18 review found "IDs 0–28" / "unknown ≥29"
+/// stale after `GroupIndex = 29` landed). Pin the range to the enum so a new
+/// `SectionType` variant forces a doc update.
+#[test]
+fn section_type_id_range_pinned() {
+    use scx_format_io::SectionType;
+    assert_eq!(
+        SectionType::GroupIndex as u8,
+        29,
+        "max SectionType id changed — update the range in AGENTS.md and the \
+         unknown-types threshold in docs/format.md, then update this pin"
+    );
+    assert!(
+        SectionType::from_u8(30).is_none(),
+        "id 30 became a known section type — bump the '≥30' unknown-types \
+         threshold in docs/format.md"
+    );
+    let root = workspace_root();
+    let agents = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("IDs 0–29"),
+        "AGENTS.md section-type range drifted from the enum (expected 'IDs 0–29')"
+    );
+    let format = std::fs::read_to_string(root.join("docs/format.md")).unwrap();
+    assert!(
+        format.contains("≥30 for the current format"),
+        "docs/format.md unknown-types threshold drifted from the enum \
+         (expected '≥30 for the current format')"
+    );
+}
+
+/// The workspace member set must match the documented crate graph (15 code
 /// crates + the integration-test crate). A crate added or renamed without
 /// updating AGENTS.md / docs/architecture.md trips this (D3).
 #[test]
@@ -99,6 +131,12 @@ fn tracked_files_free_of_scratch_doc_citations_and_removed_gates() {
         "MERGE-INDEX-OBS-DROPPED",
         "SCX-USER-REPORT",
         "STATE3-PYSCX-KERNEL-ISSUE",
+        // Removed codec profile used as a *live* label. The un-backticked
+        // "auto_v2 (…)" form only ever appeared in benchmark table columns /
+        // prose presenting it as a usable codec; legitimate historical mentions
+        // use backticks (`auto_v2`) or `codec="auto_v2"` and are unaffected.
+        // `codec="auto_v2"` errors at runtime — see codec_select.rs.
+        "auto_v2 (",
     ];
     let root = workspace_root();
     let mut files = Vec::new();

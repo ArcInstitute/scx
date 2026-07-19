@@ -562,6 +562,17 @@ fn prepare_append(target_path: &Path, modality_id: u8) -> Result<(FileLock, InPl
     if prep.header.has_raw() {
         return Err(OpsError::RawUnsupported { op: "append" });
     }
+    // Multimodal append is deferred: `obs` is a single global axis and every
+    // modality must cover `[0, n_obs)` (SCX has no per-modality obs model —
+    // `to_mudata` requires cell-aligned modalities). Appending new rows into one
+    // modality bumps the global `n_obs` while writing CSR shards for only that
+    // modality, leaving siblings under-covering the obs axis → an unreadable file
+    // (X/obs row mismatch). Refuse before any mutation rather than corrupt.
+    // (`prepare_in_place` has only read so far; the exclusive lock drops on this
+    // early return.) Extract a single modality first via `scx subset --modality`.
+    if prep.header.n_modalities > 0 {
+        return Err(OpsError::MultimodalUnsupported { op: "append" });
+    }
     Ok((lock, prep))
 }
 

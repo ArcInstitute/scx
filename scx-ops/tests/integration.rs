@@ -2677,22 +2677,19 @@ fn test_merge_preserves_utf8_schema_via_largeutf8_round_trip() {
 // Multimodal append tests (PR #68 regression)
 // ---------------------------------------------------------------------------
 
-/// `append` (with `AppendOptions.modality_id` set) must stamp the appended CSR shard's
-/// `ShardHeader.n_minor` with the target modality's `n_vars`, not the
-/// file-wide `header.n_vars`.  This was one of the original validation
-/// sites in `scx-ops::append::append`.
+/// Multimodal append is deferred (review finding #3): appending into one
+/// modality bumps the global `n_obs` while writing shards for only that
+/// modality, leaving siblings under-covering the obs axis → an unreadable
+/// file. `append` must reject any multimodal target with
+/// `OpsError::MultimodalUnsupported` before touching the file.
 #[test]
-fn test_append_for_modality_uses_per_modality_n_vars() {
+fn test_append_for_modality_rejected() {
     use scx_format_io::modality::ModalityType;
     use scx_format_io::section::SectionType;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("multimodal_append.scx");
 
-    // Two modalities with DISTINCT n_vars; "rna" is the max so the
-    // file-wide header.n_vars = 30 == rna.n_vars. We then append into
-    // "adt" (n_vars = 10) — if the fix is missing, the appended shard
-    // would stamp n_minor = 30 instead of 10.
     let rna_n_vars: u64 = 30;
     let adt_n_vars: u64 = 10;
     let header = sample_header(4, rna_n_vars);
@@ -2728,7 +2725,7 @@ fn test_append_for_modality_uses_per_modality_n_vars() {
         writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
 
         // Seed each modality with one CSR shard so the file is well-
-        // formed before the append.
+        // formed before the append attempt.
         let (rna_indptr, rna_indices, rna_values) = sample_shard_data(4, rna_n_vars as usize);
         writer
             .write_csr_shard_for(
@@ -2757,10 +2754,10 @@ fn test_append_for_modality_uses_per_modality_n_vars() {
         writer.finish().unwrap();
     }
 
-    // Append two new rows into the "adt" modality.
+    // Attempt to append two new rows into the "adt" modality — must be rejected.
     let new_obs = sample_obs(2);
     let (new_indptr, new_indices, new_values) = sample_shard_data(2, adt_n_vars as usize);
-    scx_ops::append(
+    let err = scx_ops::append(
         &path,
         &new_obs,
         &new_indptr,
@@ -2772,44 +2769,33 @@ fn test_append_for_modality_uses_per_modality_n_vars() {
             ..AppendOptions::default()
         },
     )
-    .unwrap();
+    .expect_err("multimodal append must be rejected");
+    assert!(
+        matches!(
+            err,
+            scx_ops::OpsError::MultimodalUnsupported { op: "append" }
+        ),
+        "expected MultimodalUnsupported, got {err:?}"
+    );
 
-    // The appended shard should carry adt.n_vars in both stats and
-    // on-disk header — not rna.n_vars (which is the file-wide max).
+    // The file must be left untouched: n_obs unchanged, adt still has its
+    // single seed shard (the guard fires before any write).
     let reader = ScxReader::open(&path).unwrap();
-    let adt_shards: Vec<&scx_format_io::FullCatalogEntry> = reader
+    assert_eq!(
+        reader.n_obs(),
+        4,
+        "n_obs must be unchanged after a rejected append"
+    );
+    let adt_shards = reader
         .catalog()
         .shards(SectionType::CsrShard)
         .into_iter()
         .filter(|e| e.modality_id == 2)
-        .collect();
+        .count();
     assert_eq!(
-        adt_shards.len(),
-        2,
-        "adt should have 2 CSR shards after append (1 seed + 1 appended)"
+        adt_shards, 1,
+        "adt shard count must be unchanged after a rejected append"
     );
-
-    for entry in &adt_shards {
-        let stats = entry
-            .stats
-            .as_ref()
-            .expect("v2 catalog must carry shard stats");
-        assert_eq!(
-            stats.col_end, adt_n_vars,
-            "appended shard col_end should be adt.n_vars ({adt_n_vars}), got {}",
-            stats.col_end
-        );
-        assert_eq!(stats.col_start, 0);
-
-        let bytes = reader.section_bytes(entry).unwrap();
-        let sh =
-            ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE])).unwrap();
-        assert_eq!(
-            sh.n_minor as u64, adt_n_vars,
-            "appended shard ShardHeader.n_minor should be adt.n_vars ({adt_n_vars}), got {}",
-            sh.n_minor
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3206,10 +3192,11 @@ fn test_streaming_append_drops_csc_from_input() {
     assert_eq!(csc_count, 0);
 }
 
-/// Streaming append into a per-modality target stamps the appended
-/// shard's `ShardHeader.n_minor` with the target modality's `n_vars`.
+/// Streaming append (`append_from_reader`) into a multimodal target must be
+/// rejected for the same reason as the bulk path (review finding #3): it would
+/// leave sibling modalities under-covering the global obs axis.
 #[test]
-fn test_streaming_append_multimodal() {
+fn test_streaming_append_multimodal_rejected() {
     use scx_format_io::modality::ModalityType;
     use scx_format_io::section::SectionType;
 
@@ -3284,7 +3271,7 @@ fn test_streaming_append_multimodal() {
         1,
     );
     let src_reader = ScxReader::open(&source).unwrap();
-    scx_ops::append_from_reader(
+    let err = scx_ops::append_from_reader(
         &path,
         &src_reader,
         &AppendOptions {
@@ -3293,32 +3280,32 @@ fn test_streaming_append_multimodal() {
         },
         0, // source is single-modality
     )
-    .unwrap();
+    .expect_err("multimodal streaming append must be rejected");
+    assert!(
+        matches!(
+            err,
+            scx_ops::OpsError::MultimodalUnsupported { op: "append" }
+        ),
+        "expected MultimodalUnsupported, got {err:?}"
+    );
     drop(src_reader);
 
+    // File left untouched: n_obs unchanged, adt still has its single seed shard.
     let reader = ScxReader::open(&path).unwrap();
-    let adt_shards: Vec<&scx_format_io::FullCatalogEntry> = reader
+    assert_eq!(
+        reader.n_obs(),
+        4,
+        "n_obs must be unchanged after a rejected append"
+    );
+    let adt_shards = reader
         .catalog()
         .shards(SectionType::CsrShard)
         .into_iter()
         .filter(|e| e.modality_id == 2)
-        .collect();
+        .count();
     assert_eq!(
-        adt_shards.len(),
-        2,
-        "adt should have 2 CSR shards after streaming append"
-    );
-    // The newly appended shard should have n_minor == adt_n_vars.
-    let appended = adt_shards
-        .iter()
-        .find(|e| e.stats.as_ref().map(|s| s.row_start == 4).unwrap_or(false))
-        .expect("appended adt shard not found");
-    let bytes = reader.section_bytes(appended).unwrap();
-    let sh =
-        ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE])).unwrap();
-    assert_eq!(
-        sh.n_minor as u64, adt_n_vars,
-        "streaming-appended shard ShardHeader.n_minor should equal adt.n_vars"
+        adt_shards, 1,
+        "adt shard count must be unchanged after a rejected append"
     );
 }
 
@@ -3435,125 +3422,11 @@ fn write_multimodal_with_csc(
     path
 }
 
-/// Appending into RNA on a multimodal file drops ADT's CSC sidecar too.
-/// Per-modality CSC preservation is a Phase F+ follow-on (see
-/// docs/multimodal.md § append) — CSC `n_minor` is stamped from the
-/// file-wide `header.n_obs` so any preserved sidecar would become stale
-/// when global n_obs bumps. Regression guard against re-introducing the
-/// premature preservation.
-#[test]
-fn test_append_into_rna_drops_adt_csc() {
-    use scx_format_io::section::SectionType;
-
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_multimodal_with_csc(&dir, "partial_csc.scx", 4, 30, 10, true);
-
-    // Verify the seed file has CSC on adt only.
-    {
-        let reader = ScxReader::open(&path).unwrap();
-        assert!(
-            reader.header().has_csc(),
-            "seed file should advertise has_csc"
-        );
-        let adt_info = reader.modality_info(2).unwrap();
-        let rna_info = reader.modality_info(1).unwrap();
-        assert!(adt_info.flags.has_csc(), "adt should have CSC");
-        assert!(!rna_info.flags.has_csc(), "rna should not have CSC");
-    }
-
-    // Append two new rows into rna.
-    let new_obs = sample_obs(2);
-    let (new_indptr, new_indices, new_values) = sample_shard_data(2, 30);
-    scx_ops::append(
-        &path,
-        &new_obs,
-        &new_indptr,
-        &new_indices,
-        &new_values,
-        ValueEncoding::Uint8,
-        &AppendOptions {
-            modality_id: 1, // rna
-            ..AppendOptions::default()
-        },
-    )
-    .unwrap();
-
-    // After append, every modality's CSC is dropped and the file-wide
-    // has_csc flag clears.
-    let reader = ScxReader::open(&path).unwrap();
-    assert!(
-        !reader.header().has_csc(),
-        "header.has_csc should clear when every modality's CSC is dropped"
-    );
-    let adt_info = reader.modality_info(2).unwrap();
-    let rna_info = reader.modality_info(1).unwrap();
-    assert!(
-        !adt_info.flags.has_csc(),
-        "append must clear adt's HAS_CSC flag even when appending to rna"
-    );
-    assert!(!rna_info.flags.has_csc(), "rna must still have no CSC");
-
-    let csc_shards: Vec<_> = reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::CscShard)
-        .collect();
-    assert!(
-        csc_shards.is_empty(),
-        "all CSC catalog entries must be dropped after append, found {}",
-        csc_shards.len()
-    );
-}
-
-/// Appending into a modality that owns the only CSC drops it and
-/// clears the file-wide HAS_CSC flag.
-#[test]
-fn test_append_into_adt_drops_csc() {
-    use scx_format_io::section::SectionType;
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_multimodal_with_csc(&dir, "partial_csc_target.scx", 4, 30, 10, true);
-
-    // Append two rows into adt — drops adt CSC (the only CSC present).
-    let new_obs = sample_obs(2);
-    let (new_indptr, new_indices, new_values) = sample_shard_data(2, 10);
-    scx_ops::append(
-        &path,
-        &new_obs,
-        &new_indptr,
-        &new_indices,
-        &new_values,
-        ValueEncoding::Uint8,
-        &AppendOptions {
-            modality_id: 2, // adt
-            ..AppendOptions::default()
-        },
-    )
-    .unwrap();
-
-    let reader = ScxReader::open(&path).unwrap();
-    let adt_info = reader.modality_info(2).unwrap();
-    assert!(
-        !adt_info.flags.has_csc(),
-        "appending to adt should clear adt's HAS_CSC"
-    );
-    let adt_csc_shards: Vec<_> = reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::CscShard && e.modality_id == 2)
-        .collect();
-    assert!(
-        adt_csc_shards.is_empty(),
-        "appending to adt should drop adt's CSC catalog entries"
-    );
-
-    // No other modality owned CSC, so the header should be cleared.
-    assert!(
-        !reader.header().has_csc(),
-        "no remaining CSC anywhere => header should clear has_csc"
-    );
-}
+// Note: per-modality CSC-drop-on-append tests were removed when multimodal
+// append was deferred (review finding #3 — it corrupted sibling obs coverage).
+// Single-modality CSC drop on append stays covered by
+// `test_append_drops_csc_from_input`. Multimodal CSC preservation across
+// compact is covered by the multimodal-compact tests below.
 
 /// Phase 6: multimodal compact applies the global delete mask to all
 /// modalities and preserves the modality table.

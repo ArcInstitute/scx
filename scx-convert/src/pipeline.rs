@@ -2111,6 +2111,13 @@ fn streaming_writer_coordinator_parallel(
     #[cfg(test)]
     let captured_fault_shard = test_hooks::current_ingest_fault_shard();
 
+    // Panic-injection sibling of the fault switch above: forces a
+    // real worker `panic!` before `tx.send(...)`, exercising the
+    // `catch_unwind` guard in the worker body. Copied here on the
+    // calling thread and propagated into workers via closure capture.
+    #[cfg(test)]
+    let captured_panic_shard = test_hooks::current_ingest_panic_shard();
+
     // Macro-style local spawn: must inline because extracting a
     // closure would re-borrow `reader` from a nested closure scope
     // and rayon's `'scope` lifetime can't be reconciled with that
@@ -2146,26 +2153,55 @@ fn streaming_writer_coordinator_parallel(
                         let _ = tx.send((idx_, Err(wrapped)));
                         return;
                     }
-                    let result = encode_one_shard_worker(
-                        reader,
-                        row_start,
-                        n_rows,
-                        opts_codec,
-                        index_dtype,
-                        n_vars_u32,
-                        section_type,
-                        modality_type,
-                        name,
-                        opts_bitmap,
-                        want_bitmap,
-                        opts_framing,
-                    );
-                    let wrapped = result.map_err(|inner| ConvertError::ShardRead {
-                        row_start,
-                        n_rows,
-                        source: source_name,
-                        inner: Box::new(inner),
-                    });
+                    // `catch_unwind` converts a worker panic into a
+                    // delivered `Err` rather than a silent no-send. A
+                    // panic that skipped the `tx.send(...)` below would
+                    // leave the drain loop's `received` counter short
+                    // of `n_ranges` forever (the original `tx` in the
+                    // scope frame keeps `rx` open), so the coordinator
+                    // would deadlock. `AssertUnwindSafe` is sound: the
+                    // worker only reads the shared `&dyn` stream and
+                    // builds output locally; the writer runs on the
+                    // calling thread, so nothing shared is left
+                    // poisoned by a caught unwind.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        if Some(idx_) == captured_panic_shard {
+                            panic!("test_hooks: injected panic at shard {idx_}");
+                        }
+                        encode_one_shard_worker(
+                            reader,
+                            row_start,
+                            n_rows,
+                            opts_codec,
+                            index_dtype,
+                            n_vars_u32,
+                            section_type,
+                            modality_type,
+                            name,
+                            opts_bitmap,
+                            want_bitmap,
+                            opts_framing,
+                        )
+                    }));
+                    let wrapped = match outcome {
+                        Ok(Ok(out)) => Ok(out),
+                        Ok(Err(inner)) => Err(ConvertError::ShardRead {
+                            row_start,
+                            n_rows,
+                            source: source_name,
+                            inner: Box::new(inner),
+                        }),
+                        Err(payload) => Err(ConvertError::ShardRead {
+                            row_start,
+                            n_rows,
+                            source: source_name,
+                            inner: Box::new(ConvertError::Other(format!(
+                                "worker panicked while encoding shard {idx_}: {}",
+                                panic_message(payload)
+                            ))),
+                        }),
+                    };
                     let _ = tx.send((idx_, wrapped));
                 });
             }};
@@ -2243,6 +2279,19 @@ fn streaming_writer_coordinator_parallel(
     }
 
     Ok((n_ranges as u32, row_ranges))
+}
+
+/// Extract a human-readable message from a `catch_unwind` panic
+/// payload. Mirrors the idiom in `pyscx/src/accel/pca.rs`: most
+/// panics carry a `String` or `&str`; anything else falls back to a
+/// placeholder. Shared by both parallel coordinators (ingest here and
+/// SCX → h5ad export in `h5ad::stream_write`).
+pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_else(|| "unknown panic payload".to_string())
 }
 
 /// Worker body: read + canonicalise + encode one shard and (if

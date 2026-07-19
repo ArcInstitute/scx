@@ -9,6 +9,10 @@
 \alias{scx_leiden}
 \alias{scx_rank_genes_groups}
 \alias{scx_highly_variable_genes}
+\alias{scx_score_genes}
+\alias{scx_pseudobulk}
+\alias{scx_pseudobulk_dex}
+\alias{scx_nb_glm}
 \title{Rust-native analysis accelerators for R}
 \usage{
 scx_pca(
@@ -99,6 +103,53 @@ scx_highly_variable_genes(
   n_top_genes = 2000L,
   span = 0.3
 )
+
+scx_score_genes(
+  object,
+  gene_list,
+  method = "control",
+  ctrl_size = 50L,
+  n_bins = 25L,
+  random_state = 0L,
+  gene_pool = NULL,
+  score_name = "score",
+  assay = NULL,
+  layer = "data"
+)
+
+scx_pseudobulk(
+  object,
+  group_by,
+  method = "sum",
+  min_cells_per_group = 0L,
+  assay = NULL,
+  layer = "counts"
+)
+
+scx_pseudobulk_dex(
+  object,
+  group_by,
+  test_col,
+  reference,
+  aggr_method = "sum",
+  min_cells_per_group = 10L,
+  dispersion = "cox_reid_shrunk",
+  cooks_filtering = TRUE,
+  independent_filtering = TRUE,
+  assay = NULL,
+  layer = "counts"
+)
+
+scx_nb_glm(
+  counts,
+  design,
+  contrast = NULL,
+  size_factors = NULL,
+  gene_names = rownames(counts),
+  dispersion = "cox_reid_shrunk",
+  cooks_filtering = TRUE,
+  independent_filtering = TRUE
+)
 }
 \arguments{
 \item{object}{A \code{Seurat} object or a genes x cells \code{dgCMatrix}.}
@@ -164,7 +215,12 @@ its PCA are always computed over the full counts layer.}
 
 \item{group.by}{\code{meta.data} column with per-cell group labels.}
 
-\item{reference}{Reference group, or \code{NULL} to test each group vs rest.}
+\item{groups}{Subset of group labels to test (character vector); \code{NULL}
+(default) tests every group.}
+
+\item{reference}{Reference baseline: for \code{scx_rank_genes_groups}, the group to
+test against (\code{NULL} tests each group vs the rest); for \code{scx_pseudobulk_dex} /
+\code{scx_nb_glm}, the reference level of \code{test_col}.}
 
 \item{log_transformed}{Whether \code{layer} is already log-transformed.}
 
@@ -176,10 +232,80 @@ when set; passing the full gene set materializes a dense matrix.}
 \item{n_top_genes}{Number of HVGs to select (default \code{2000}).}
 
 \item{span}{Loess span for the mean-variance fit (default \code{0.3}).}
+
+\item{gene_list}{Character vector of gene names to score. Genes absent from
+the matrix are dropped with a warning; an all-missing set is an error.}
+
+\item{method}{One of \code{"control"} (scanpy \code{score_genes}: mean(gene_list) minus
+a binned control set), \code{"mean"} (per-cell mean over \code{gene_list}), or
+\code{"zscore"} (decoupler \code{mt.zscore}). Default \code{"control"}.}
+
+\item{ctrl_size, n_bins}{Control-method knobs (control genes per expression
+bin / number of bins). Defaults \code{50} / \code{25}.}
+
+\item{random_state}{Seed for the deterministic control sampler (not
+numpy-compatible). Default \code{0}.}
+
+\item{gene_pool}{Optional character vector restricting the control binning
+universe (control method only); default \code{NULL} = all genes.}
+
+\item{score_name}{obs/meta.data column to write the score into on a Seurat
+object. Default \code{"score"}.}
+
+\item{group_by}{Grouping of cells. On a Seurat object: a character vector of
+\code{meta.data} column name(s). On a matrix: a per-cell label vector, or a
+\code{data.frame} / named list of per-cell label columns for multi-column
+groupby.}
+
+\item{min_cells_per_group}{Drop groups with fewer than this many cells
+(default \code{0} = keep all).}
+
+\item{test_col}{The \code{group_by} column holding the condition being tested.}
+
+\item{aggr_method}{Pseudobulk aggregation, \code{"sum"} (default) or \code{"mean"}.}
+
+\item{dispersion}{Dispersion estimator: \code{"cox_reid_shrunk"} (default),
+\code{"cox_reid_mle"}, or \code{"moments"}.}
+
+\item{cooks_filtering, independent_filtering}{DESeq2 results-stage filters
+(both \code{TRUE} by default).}
+
+\item{counts}{A genes x samples numeric matrix of pseudobulk counts (DESeq2
+orientation).}
+
+\item{design}{A samples x features numeric design matrix of full column rank,
+e.g. \code{model.matrix(~ condition, sampleinfo)}.}
+
+\item{contrast}{1-based design column (coefficient) to test; \code{NULL} (default)
+tests the last coefficient.}
+
+\item{size_factors}{Per-sample size factors; \code{NULL} (default) uses the
+DESeq2 median-ratio estimate.}
+
+\item{gene_names}{Character vector of gene names (length \code{nrow(counts)});
+defaults to \code{rownames(counts)}, falling back to positional indices.}
 }
 \value{
 For DE, a long-format \code{data.frame} with columns \code{group}, \code{gene},
 \code{score}, \code{pval}, \code{pval_adj}, \code{logfoldchange}.
+
+For \code{scx_score_genes}: on a Seurat object, the object with
+\code{score_name} added to \code{meta.data} (returned invisibly); on a matrix, a
+numeric per-cell score vector (named by cell when column names exist).
+
+For \code{scx_pseudobulk}: a list with \code{counts} (a genes x groups matrix,
+rownames = genes, colnames = the group labels joined by \code{"_"}), \code{samples}
+(a \code{data.frame} of the groupby columns plus \code{n_cells} per group), and
+\code{gene_names}. Returned for both Seurat and matrix inputs (pseudobulk
+collapses the cell axis, so it cannot be written back into the object).
+
+For \code{scx_pseudobulk_dex}: a long-format \code{data.frame} with one row per
+gene per non-reference target and DESeq2-style columns \code{gene}, \code{baseMean},
+\code{log2FoldChange}, \code{lfcSE}, \code{stat}, \code{pvalue}, \code{padj}, \code{target}, \code{reference}.
+
+For \code{scx_nb_glm}: a \code{data.frame} with columns \code{gene}, \code{baseMean},
+\code{log2FoldChange}, \code{lfcSE}, \code{stat}, \code{pvalue}, \code{padj}, \code{dispersion},
+\code{converged}.
 }
 \description{
 Pipe-friendly front ends over the \code{scx-accel} CPU kernels, mirroring the
@@ -211,6 +337,18 @@ Normalize -> \code{scx_highly_variable_genes} -> \code{scx_pca} -> \code{scx_nei
 
 \item \code{scx_highly_variable_genes()}: Highly variable genes (seurat_v3 / vst).
 
+\item \code{scx_score_genes()}: Gene-set scoring (scanpy \code{score_genes} analog).
+
+\item \code{scx_pseudobulk()}: Pseudobulk aggregation (cells -> group x gene).
+
+\item \code{scx_pseudobulk_dex()}: Pseudobulk differential expression via a
+Rust-native negative-binomial GLM (DESeq2-style, CPU-only). Aggregates
+cells into pseudobulk samples and fits each non-reference level of
+\code{test_col} vs \code{reference}.
+
+\item \code{scx_nb_glm()}: Direct negative-binomial GLM on a pre-aggregated
+pseudobulk count matrix and design (the \code{nb_glm} building block).
+
 }}
 \section{Note}{
 
@@ -219,5 +357,22 @@ Python accelerator), but the loess fit uses R's native \code{stats::loess}
 whereas \code{pyscx} uses \code{skmisc.loess}. The two LOESS implementations can give
 slightly different fitted values, so the selected HVG set may differ
 marginally between R and Python on the same data.
+}
+
+\section{Replicates & input}{
+
+NB-GLM requires \strong{≥2 pseudobulk replicates per condition}, so \code{group_by}
+must include \code{test_col} \strong{and} a replicate column (donor/batch/well), e.g.
+\code{group_by = c("condition", "donor")}. Targets with fewer than 2 replicates
+per side are skipped with a warning. Input must be \strong{raw counts} (use
+\code{layer = "counts"}); for no-replicate or log-normalized data use
+\link{scx_rank_genes_groups} (Wilcoxon).
+
+Each non-reference level is fit as an independent pairwise 2-coefficient
+NB-GLM (intercept + treatment) on only that target's and the reference's
+pseudobulk samples, with size factors recomputed per contrast. The replicate
+column is \strong{not} entered as a covariate, so batch/donor confounders are not
+adjusted and \code{baseMean}/\code{dispersion} differ per contrast (this matches
+pyscx, not a single joint DESeq2 fit).
 }
 

@@ -1,8 +1,7 @@
-#' @title SCX file operations
-#'
-#' @description
-#' Append, delete, compact, rollback, and merge SCX files from R.
-#' Info and validation utilities.
+# SCX file operations: append, delete, compact, rollback, and merge SCX files
+# from R, plus info/validation utilities. Each exported verb is documented on
+# its own help page below (this header is a plain comment so roxygen does not
+# attach it to the internal helper that follows).
 
 # Internal: NULL -> character(0); otherwise coerce to character (for the
 # optional index-column / sort-column vectors passed to the Rust ops).
@@ -56,15 +55,35 @@ scx_append <- function(target, input, codec = NULL, shard_size = 16384L,
 #' compaction.
 #'
 #' @param path Path to the SCX file.
-#' @param cell_indices Integer vector of 0-based cell indices to delete.
+#' @param cell_indices Numeric vector of 1-based cell indices to delete (R
+#'   convention, matching the \code{[} operator). Passed as doubles so indices
+#'   above \code{.Machine$integer.max} (2^31) are addressable (mirrors the backed
+#'   reader); values must be whole and \code{>= 1} (\code{0} / negatives raise an
+#'   error).
 #' @return Total number of deleted cells (including previously deleted).
 #' @export
 #' @examples
 #' \dontrun{
-#' total <- scx_delete("experiment.scx", c(0L, 5L, 10L, 42L))
+#' total <- scx_delete("experiment.scx", c(1, 6, 11, 43))
 #' }
 scx_delete <- function(path, cell_indices) {
-  .Call(wrap__scx_delete, path, as.integer(cell_indices))
+  idx <- as.numeric(cell_indices)
+  if (anyNA(idx)) {
+    stop("NA cell indices are not supported", call. = FALSE)
+  }
+  # R is 1-based (like the `[` operator); reject 0 / negatives before converting
+  # to the 0-based core index.
+  if (length(idx) && any(idx < 1)) {
+    stop("cell indices must be >= 1 (1-based); 0 / negative indices are not supported",
+         call. = FALSE)
+  }
+  # Reject fractional indices up front so the error reports the original value
+  # (the Rust core also guards this after the 1->0 conversion, as defense-in-depth).
+  if (length(idx) && any(idx != floor(idx))) {
+    bad <- idx[idx != floor(idx)][1]
+    stop(sprintf("non-integer cell index: %s", format(bad)), call. = FALSE)
+  }
+  .Call(wrap__scx_delete, path, idx - 1)
 }
 
 #' Compact an SCX file

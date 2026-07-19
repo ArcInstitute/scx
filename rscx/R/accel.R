@@ -251,7 +251,11 @@ scx_leiden <- function(object, reduction = "pca", dims = 1:30,
 
 #' @describeIn scx-accelerators Wilcoxon rank-sum DE (FindAllMarkers analog).
 #' @param group.by `meta.data` column with per-cell group labels.
-#' @param reference Reference group, or `NULL` to test each group vs rest.
+#' @param groups Subset of group labels to test (character vector); `NULL`
+#'   (default) tests every group.
+#' @param reference Reference baseline: for `scx_rank_genes_groups`, the group to
+#'   test against (`NULL` tests each group vs the rest); for `scx_pseudobulk_dex` /
+#'   `scx_nb_glm`, the reference level of `test_col`.
 #' @param log_transformed Whether `layer` is already log-transformed.
 #' @param rankby_abs,tie_correct Wilcoxon options; defaults (`FALSE`/`FALSE`)
 #'   match `pyscx`/scanpy. The kernel densifies the matrix internally, so on a
@@ -534,7 +538,9 @@ scx_pseudobulk <- function(object, group_by, method = "sum",
 #'   cells into pseudobulk samples and fits each non-reference level of
 #'   `test_col` vs `reference`.
 #' @param test_col The `group_by` column holding the condition being tested.
-#' @param reference Reference level in `test_col` (the DE baseline).
+#' @param reference Reference baseline: for `scx_rank_genes_groups`, the group to
+#'   test against (`NULL` tests each group vs the rest); for `scx_pseudobulk_dex` /
+#'   `scx_nb_glm`, the reference level of `test_col`.
 #' @param aggr_method Pseudobulk aggregation, `"sum"` (default) or `"mean"`.
 #' @param dispersion Dispersion estimator: `"cox_reid_shrunk"` (default),
 #'   `"cox_reid_mle"`, or `"moments"`.
@@ -625,6 +631,8 @@ scx_pseudobulk_dex <- function(object, group_by, test_col, reference,
 #'   pseudobulk count matrix and design (the `nb_glm` building block).
 #' @param counts A genes x samples numeric matrix of pseudobulk counts (DESeq2
 #'   orientation).
+#' @param gene_names Character vector of gene names (length `nrow(counts)`);
+#'   defaults to `rownames(counts)`, falling back to positional indices.
 #' @param design A samples x features numeric design matrix of full column rank,
 #'   e.g. `model.matrix(~ condition, sampleinfo)`.
 #' @param contrast 1-based design column (coefficient) to test; `NULL` (default)
