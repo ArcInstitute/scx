@@ -713,6 +713,10 @@ mod tests {
     #[test]
     fn test_resident_pca_matches_cpu_reference() {
         let dev = require_gpu!();
+        // A small matrix suffices: G1 was cross-*iteration* accumulation into a
+        // reused `d_sum_q` (buffer reused across the 2 power iterations + final
+        // B), not within-iteration multi-block atomicAdd — so it fires even at
+        // n_obs < 256 where only one column-sum block would ever launch.
         let (n_obs, n_vars, n_shards) = (300usize, 40usize, 3usize);
         let n_components = 4usize;
         let source = low_rank_source_with_offset(n_obs, n_vars, n_shards, 2024);

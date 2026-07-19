@@ -720,12 +720,13 @@ pub(crate) fn gpu_column_sums(
 /// pre-allocates the column-sum buffer once and reuses it across replays.
 ///
 /// `column_sum_kernel` uses exactly one block per column and writes each
-/// `out[col]` with a single plain store, so it fully overwrites `out` and a
-/// reused (non-fresh) buffer is safe across power iterations without re-zeroing.
-/// The `memset_zeros(out)` below is therefore only needed for the `m == 0`
-/// short-circuit, where the kernel is skipped and a reused buffer must still
-/// read back zero. The zero is a `memset` (not a device allocation), so it stays
-/// CUDA-graph-capture legal (this function is capture-safe: no device allocs).
+/// `out[col]` with a single plain store, so for `m > 0` it fully overwrites
+/// `out` and a reused (non-fresh) buffer is safe across power iterations with
+/// no pre-zero. The only path that needs zeroing is the `m == 0` / `k == 0`
+/// short-circuit, where the kernel is skipped and a reused buffer would
+/// otherwise retain stale sums — that path `memset`s `out`. The zero is a
+/// `memset` (not a device allocation), so it stays CUDA-graph-capture legal;
+/// this function is capture-safe (no device allocs on any path).
 pub(crate) fn gpu_column_sums_into(
     dev: &GpuDevice,
     x: &CudaSlice<f32>, // (m × k) col-major
@@ -733,12 +734,13 @@ pub(crate) fn gpu_column_sums_into(
     m: usize,
     k: usize,
 ) -> Result<(), GpuError> {
-    // Zero first (before the m == 0 || k == 0 short-circuit) so that an
-    // empty-matrix call with a reused buffer still returns all-zero sums.
-    dev.stream()
-        .memset_zeros(out)
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("column_sum zero: {e}")))?;
     if m == 0 || k == 0 {
+        // Kernel is skipped here, so zero `out` — a reused buffer must still
+        // read back zero. (For m > 0 the kernel writes every out[col] exactly
+        // once, so there is no redundant pre-zero on the hot path.)
+        dev.stream()
+            .memset_zeros(out)
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("column_sum zero: {e}")))?;
         return Ok(());
     }
 
@@ -747,6 +749,14 @@ pub(crate) fn gpu_column_sums_into(
         .load_function("column_sum_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("column_sum: {e}")))?;
 
+    // `column_sum_kernel` takes `m`/`k` as i32. Both fit for any real matrix —
+    // the resident CSR path already caps n_obs so the cuSPARSE i32 indptr fits —
+    // but assert the contract (defense-in-depth, mirroring the crate's i32-cast
+    // guards; cf. review finding G4).
+    debug_assert!(
+        m <= i32::MAX as usize && k <= i32::MAX as usize,
+        "column_sum_kernel dims exceed i32: m={m}, k={k}"
+    );
     let m_i32 = m as i32;
     let k_i32 = k as i32;
 
