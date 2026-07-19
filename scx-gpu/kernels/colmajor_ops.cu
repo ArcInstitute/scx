@@ -43,30 +43,40 @@ extern "C" __global__ void mean_correct_colmajor_strided_kernel(
 // X: (m × k) col-major: X[r, c] = flat[c * m + r]
 // out: [k] column sums
 //
-// Strategy: one block per column, each block reduces m elements.
-// For PCA, k is small (50-60), m is large (up to 1M cells).
-// Uses shared memory reduction within each block, then atomicAdd.
+// Strategy: exactly ONE block per column (grid.y = k, grid.x = 1); each block
+// reduces all m elements of its column. For PCA, k is small (~50), m is large
+// (up to 1M cells), so this is a negligible fraction of PCA cost.
+//
+// DETERMINISM + PRECISION (finding G2): accumulate in f64 and reduce entirely
+// *within a single block* (warp shuffle → shared-memory warp partials → single
+// plain store), with NO cross-block atomicAdd. The prior version summed in f32
+// and combined across ceil(m/256) blocks via atomicAdd, which (a) lost ~1e-6
+// relative precision once the running sum reached ~1e6-1e7 at census scale and
+// (b) was non-deterministic run-to-run (atomicAdd ordering). The single-block
+// f64 reduction fixes both; `out` stays f32 (one store of the f64 result per
+// column), so downstream `gpu_outer_sub` is unchanged. Because every out[col]
+// is written exactly once, the buffer may be safely reused across power
+// iterations without re-zeroing (see gpu_column_sums_into).
 extern "C" __global__ void column_sum_kernel(
     const float* __restrict__ X,     // [m × k], col-major
     float* __restrict__ out,         // [k], output column sums
     int m,
     int k
 ) {
-    // Grid: blockIdx.x = which chunk of rows, blockIdx.y = which column
+    // Grid: blockIdx.y = which column; blockIdx.x is unused (host launches
+    // grid.x = 1). Each block strides over all m rows of its column.
     int col = blockIdx.y;
     if (col >= k) return;
 
-    const float* col_ptr = X + col * m;
+    const float* col_ptr = X + (size_t)col * m;
 
-    // Each thread sums a strided range of rows
-    float local_sum = 0.0f;
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = gridDim.x * blockDim.x;
-    for (int r = row; r < m; r += stride) {
-        local_sum += col_ptr[r];
+    // Each thread sums a strided range of rows, accumulating in f64.
+    double local_sum = 0.0;
+    for (int r = threadIdx.x; r < m; r += blockDim.x) {
+        local_sum += (double)col_ptr[r];
     }
 
-    // Warp reduction
+    // Warp reduction (f64).
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
         local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
     }
@@ -74,9 +84,9 @@ extern "C" __global__ void column_sum_kernel(
     // Block reduction via shared memory (one value per warp).
     // Uses dynamic shared memory (extern __shared__) so the host controls the
     // allocation size, preventing silent overflow if block size changes.
-    // Caller must pass shared_mem_bytes >= (blockDim.x / warpSize) * sizeof(float).
+    // Caller must pass shared_mem_bytes >= (blockDim.x / warpSize) * sizeof(double).
     assert(blockDim.x <= 1024 && "column_sum_kernel: block size must be <= 1024 threads");
-    extern __shared__ float warp_sums[];
+    extern __shared__ double warp_sums[];
     int lane = threadIdx.x % warpSize;
     int warp_id = threadIdx.x / warpSize;
 
@@ -85,12 +95,12 @@ extern "C" __global__ void column_sum_kernel(
     }
     __syncthreads();
 
-    // First warp reduces the warp sums
+    // First warp reduces the warp sums.
     int n_warps = (blockDim.x + warpSize - 1) / warpSize;
     if (threadIdx.x < (unsigned int)n_warps) {
         local_sum = warp_sums[threadIdx.x];
     } else {
-        local_sum = 0.0f;
+        local_sum = 0.0;
     }
 
     if (warp_id == 0) {
@@ -98,7 +108,9 @@ extern "C" __global__ void column_sum_kernel(
             local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
         }
         if (lane == 0) {
-            atomicAdd(&out[col], local_sum);
+            // Single plain store (no atomicAdd): the whole column is reduced by
+            // this one block, so no cross-block combination is needed.
+            out[col] = (float)local_sum;
         }
     }
 }

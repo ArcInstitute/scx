@@ -67,9 +67,13 @@ impl Drop for CusolverHandle {
     }
 }
 
-// SAFETY: cuSOLVER handles are thread-safe per NVIDIA documentation.
+// SAFETY: the wrapper owns its raw cuSOLVER handle exclusively, so it is safe to
+// MOVE between threads (Send) — only one thread can access it at a time. It is
+// deliberately NOT `Sync`: a cuSOLVER handle is stream-bound and NVIDIA requires
+// one handle per thread, so sharing `&CusolverHandle` for concurrent calls would
+// race on the handle's internal stream/state. Need a handle on another thread?
+// Create one there with `CusolverHandle::new()`.
 unsafe impl Send for CusolverHandle {}
-unsafe impl Sync for CusolverHandle {}
 
 /// Economy QR decomposition on GPU: A = Q·R, returning Q.
 ///

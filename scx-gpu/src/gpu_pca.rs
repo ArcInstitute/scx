@@ -719,8 +719,14 @@ pub(crate) fn gpu_column_sums(
 /// device allocations are forbidden — the resident PCA transpose segment
 /// pre-allocates the column-sum buffer once and reuses it across replays.
 ///
-/// `out` must be zeroed by the caller if the kernel does not fully overwrite
-/// it; `column_sum_kernel` writes every `out[j]`, so no pre-zero is needed.
+/// `column_sum_kernel` uses exactly one block per column and writes each
+/// `out[col]` with a single plain store, so for `m > 0` it fully overwrites
+/// `out` and a reused (non-fresh) buffer is safe across power iterations with
+/// no pre-zero. The only path that needs zeroing is the `m == 0` / `k == 0`
+/// short-circuit, where the kernel is skipped and a reused buffer would
+/// otherwise retain stale sums — that path `memset`s `out`. The zero is a
+/// `memset` (not a device allocation), so it stays CUDA-graph-capture legal;
+/// this function is capture-safe (no device allocs on any path).
 pub(crate) fn gpu_column_sums_into(
     dev: &GpuDevice,
     x: &CudaSlice<f32>, // (m × k) col-major
@@ -729,6 +735,12 @@ pub(crate) fn gpu_column_sums_into(
     k: usize,
 ) -> Result<(), GpuError> {
     if m == 0 || k == 0 {
+        // Kernel is skipped here, so zero `out` — a reused buffer must still
+        // read back zero. (For m > 0 the kernel writes every out[col] exactly
+        // once, so there is no redundant pre-zero on the hot path.)
+        dev.stream()
+            .memset_zeros(out)
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("column_sum zero: {e}")))?;
         return Ok(());
     }
 
@@ -737,19 +749,28 @@ pub(crate) fn gpu_column_sums_into(
         .load_function("column_sum_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("column_sum: {e}")))?;
 
+    // `column_sum_kernel` takes `m`/`k` as i32. Both fit for any real matrix —
+    // the resident CSR path already caps n_obs so the cuSPARSE i32 indptr fits —
+    // but assert the contract (defense-in-depth, mirroring the crate's i32-cast
+    // guards; cf. review finding G4).
+    debug_assert!(
+        m <= i32::MAX as usize && k <= i32::MAX as usize,
+        "column_sum_kernel dims exceed i32: m={m}, k={k}"
+    );
     let m_i32 = m as i32;
     let k_i32 = k as i32;
 
-    // Launch: grid = (ceil(m/256), k), block = (256, 1)
-    // Shared memory: column_sum_kernel uses extern __shared__ float warp_sums[]
-    // which needs (blockDim.x / 32) floats = (256/32) * 4 = 32 bytes.
+    // Launch: grid = (1, k) — exactly one block per column; block = (256, 1).
+    // Each block reduces all m rows of its column in f64 (finding G2: no
+    // cross-block atomicAdd → deterministic + precise). Dynamic shared memory:
+    // `column_sum_kernel` uses `extern __shared__ double warp_sums[]`, needing
+    // (blockDim.x / 32) doubles = (256/32) * 8 = 64 bytes.
     let threads: u32 = 256;
-    let blocks_x = (m as u32).div_ceil(threads);
     let n_warps = threads.div_ceil(32);
     let cfg = LaunchConfig {
-        grid_dim: (blocks_x, k as u32, 1),
+        grid_dim: (1, k as u32, 1),
         block_dim: (threads, 1, 1),
-        shared_mem_bytes: n_warps * std::mem::size_of::<f32>() as u32,
+        shared_mem_bytes: n_warps * std::mem::size_of::<f64>() as u32,
     };
 
     unsafe {
