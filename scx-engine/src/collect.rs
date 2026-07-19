@@ -173,13 +173,29 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
         Some(&category_dicts)
     };
 
-    // Catalog-level shard pruning (B1), now with category dictionary support
+    // Catalog-level shard pruning (B1), now with category dictionary support,
+    // scoped to the pipeline's modality (== shards_sorted() for the default
+    // single-modality axis).
     let candidate_shards = prune_shards_by_catalog_with_dict(
         catalog,
         pipeline.obs_predicates(),
         pipeline.deletion_vectors().as_ref(),
         dicts_ref,
+        pipeline.modality_id(),
     );
+
+    // Level-2 row-set pushdown keys `ShardRange.shard_id` to the flattened
+    // (all-modality) shard order at write time; those ids do not match a
+    // per-modality enumeration. Disable the fast path for modality-scoped
+    // queries so they fall back to modality-scoped Level-1 pruning + a global
+    // obs residual scan (correct, just less pruned). The category dictionaries
+    // above are position-based vocab (shard-id-independent) so Level-1 pruning
+    // keeps working. See `docs/multimodal.md` § 3.4.
+    let obs_predicate_index = if pipeline.modality_id() == 0 {
+        obs_predicate_index
+    } else {
+        None
+    };
 
     Ok(ExecutionPlan {
         candidate_shards,
@@ -432,6 +448,23 @@ fn partition_obs_predicates(
         }
     }
     (indexed, residual)
+}
+
+/// The CSR shard list a modality-scoped pipeline scans, sorted by `row_start`.
+///
+/// This is the single source of truth for the shard set every enumerate-position
+/// consumer (`build_plan` pruning, the shard-range table, candidate coverage, the
+/// deletion rowset, and `materialize`'s decode) walks, so `shard_idx` numbering
+/// stays internally consistent. On a single-modality / v1 file `modality_id == 0`
+/// and this is order-and-set identical to the legacy `catalog.shards_sorted()`
+/// (both filter `CsrShard` and sort by `row_start`; v1 entries carry
+/// `modality_id = 0`) — the default path is byte-for-byte unchanged. See
+/// `docs/multimodal.md` § 3.4.
+pub(crate) fn scan_shards(
+    catalog: &scx_format_io::FullCatalog,
+    modality_id: u8,
+) -> Vec<&FullCatalogEntry> {
+    catalog.csr_shards_for_modality(modality_id)
 }
 
 /// The CSR/output shard row-range table the predicate index was built against:
@@ -1031,11 +1064,22 @@ fn resolve_gene_projection(
 fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
     let plan = build_plan(pipeline)?;
     let reader = pipeline.reader();
-    let n_vars = reader.header().n_vars as usize;
+    let modality_id = pipeline.modality_id();
+    // Per-modality X width (header().n_vars is the file-wide max, not the
+    // modality's — docs/format.md § 13.4).
+    let n_vars = pipeline.n_vars();
 
     // Sorted CSR-shard view, computed once and reused across this function
-    // (was recomputed — filter+sort+alloc — ≥4× per query). OE6.
-    let sorted_shards = reader.catalog().shards_sorted();
+    // (was recomputed — filter+sort+alloc — ≥4× per query). OE6. Scoped to the
+    // pipeline's modality (== shards_sorted() for the single-modality default).
+    let sorted_shards = scan_shards(reader.catalog(), modality_id);
+    debug_assert!(
+        modality_id == 0
+            || reader
+                .catalog()
+                .modality_csr_ranges_tile_obs(modality_id, reader.header().n_obs),
+        "modality {modality_id} CSR shards must tile [0, n_obs)"
+    );
     let total_shards = sorted_shards.len();
     let skipped_shards = total_shards - plan.candidate_shards.len();
 
@@ -1062,7 +1106,7 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
     // (MB-scale) predicate-index read regardless of file size, and we report
     // every shard skipped. Var is still read (cheap) for the output schema.
     if plan.candidate_shards.is_empty() {
-        let var_batch = reader.read_var()?;
+        let var_batch = reader.read_var_for(modality_id)?;
         let GeneProjection {
             decode_indices: effective_gene_indices,
             n_output_cols,
@@ -1108,7 +1152,7 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
     } = compute_mask(pipeline, &plan, &sorted_shards, n_obs)?;
 
     // Step 6: Handle var predicates and gene projection (assembled via trait impl)
-    let var_batch = reader.read_var()?;
+    let var_batch = reader.read_var_for(modality_id)?;
     let GeneProjection {
         decode_indices: effective_gene_indices,
         n_output_cols,
@@ -1251,7 +1295,7 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
     } = pm;
 
     let reader = pipeline.reader();
-    let sorted_shards = reader.catalog().shards_sorted();
+    let sorted_shards = scan_shards(reader.catalog(), pipeline.modality_id());
 
     // Step 7: Parallel shard decode with optional projection.
     //

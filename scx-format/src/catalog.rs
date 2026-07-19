@@ -1037,6 +1037,38 @@ impl FullCatalog {
         shards
     }
 
+    /// Whether the CSR shards of `modality_id` form disjoint
+    /// `[row_start, row_end)` ranges that exactly tile `[0, n_obs)`.
+    ///
+    /// This is the invariant every multimodal query path relies on: each
+    /// modality independently covers the shared global obs axis (empty CSR
+    /// rows encode "no measurement"), so a global obs row mask can be
+    /// applied to any single modality's shard list without cross-modality
+    /// interleaving. Returns `false` if any shard lacks row-range stats, if
+    /// two ranges overlap, or if the union leaves a gap or overshoots
+    /// `n_obs`. An empty shard list is "covering" only when `n_obs == 0`.
+    ///
+    /// Intended for `debug_assert!` at modality-scoped scan sites and for
+    /// property tests; it is O(n_shards · log n_shards) and does no I/O.
+    pub fn modality_csr_ranges_tile_obs(&self, modality_id: u8, n_obs: u64) -> bool {
+        let shards = self.csr_shards_for_modality(modality_id);
+        let mut expected: u64 = 0;
+        for entry in &shards {
+            let Some(stats) = entry.stats.as_ref() else {
+                return false;
+            };
+            let start = stats.major_start(SectionType::CsrShard);
+            let end = stats.major_end(SectionType::CsrShard);
+            // Sorted by row_start; a contiguous tiling requires each shard
+            // to begin exactly where the previous one ended.
+            if start != expected || end < start {
+                return false;
+            }
+            expected = end;
+        }
+        expected == n_obs
+    }
+
     /// Phase 5b: return detection-bitmap shards belonging to a given
     /// modality, sorted by `row_start`. Mirrors
     /// [`Self::csr_shards_for_modality`] but filters on

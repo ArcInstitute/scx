@@ -634,11 +634,41 @@ impl PyExperiment {
     /// Returns a `PyQueryPipeline` builder — call `.filter_obs()`,
     /// `.select_genes()`, etc., then `.collect()` to execute.
     ///
+    /// `modality` scopes the query to one modality of a multimodal file: X
+    /// assembly, `select_genes`, and `filter_var` resolve against that
+    /// modality's var / `n_vars`, while `filter_obs` always evaluates against
+    /// the shared global obs axis. On a multimodal file `modality` is
+    /// **required** (omitting it raises `ValueError`); an unknown name raises
+    /// `KeyError`. On a single-modality file omit `modality` (the default).
+    ///
     /// Example:
     ///     result = pyscx.open("data.scx").query().collect()
-    fn query(&self) -> PyResult<PyQueryPipeline> {
-        let pipeline = QueryPipeline::open(&self.path)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    ///     rna = pyscx.open("cite.scx").query(modality="rna") \
+    ///               .filter_obs("cell_type == 'T cell'").collect()
+    #[pyo3(signature = (modality=None))]
+    fn query(&self, modality: Option<&str>) -> PyResult<PyQueryPipeline> {
+        // Resolve the modality name → 1-based id (0 = global) using the
+        // already-open reader (mirrors `open_backed_csr`). On a multimodal file
+        // a modality is required; on a single-modality file it must be omitted.
+        let modality_id: u8 = match modality {
+            None => {
+                if self.reader.is_multimodal() {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "file is multimodal; pass modality=... (one of {:?})",
+                        self.reader.modality_names()
+                    )));
+                }
+                0
+            }
+            Some(name) => self.reader.modality_id(name).ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "unknown modality '{name}'; available: {:?}",
+                    self.reader.modality_names()
+                ))
+            })?,
+        };
+        let pipeline = QueryPipeline::open_for_modality(&self.path, modality_id)
+            .map_err(crate::query::engine_to_pyerr)?;
         Ok(PyQueryPipeline::from_pipeline(pipeline))
     }
 

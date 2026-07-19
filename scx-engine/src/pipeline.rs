@@ -88,6 +88,17 @@ impl std::fmt::Debug for QueryResult {
 /// Schema errors (unknown columns, type mismatches) are raised immediately.
 pub struct QueryPipeline {
     reader: Box<dyn SectionReader>,
+    /// Modality scope for X / var / gene resolution. `0` = global /
+    /// single-modality axis (the default, back-compatible). `>= 1` scopes
+    /// the pipeline to one modality of a multimodal file (see
+    /// `docs/multimodal.md` § 3.4). Obs predicate evaluation is always
+    /// global — obs is shared across modalities.
+    modality_id: u8,
+    /// Cached per-modality variable count. For `modality_id == 0` this is
+    /// `header().n_vars`; for a modality it is `modality_info(id).n_vars`
+    /// (the file-wide header carries the **max** across modalities and must
+    /// not be used as the X width — see docs/format.md § 13.4).
+    n_vars: usize,
     obs_schema: Schema,
     var_schema: Schema,
     obs_predicates: Vec<Predicate>,
@@ -129,21 +140,79 @@ impl QueryPipeline {
         Self::from_reader(Box::new(ScxReader::open(path)?))
     }
 
+    /// Open a local SCX file scoped to a single modality.
+    ///
+    /// `modality_id == 0` is the global / single-modality axis (identical
+    /// to [`open`](Self::open)); `>= 1` scopes X / var / gene resolution to
+    /// that modality of a multimodal file. See
+    /// [`from_reader_for_modality`](Self::from_reader_for_modality).
+    pub fn open_for_modality(path: impl AsRef<Path>, modality_id: u8) -> Result<Self> {
+        Self::from_reader_for_modality(Box::new(ScxReader::open(path)?), modality_id)
+    }
+
     /// Create a new query pipeline from any `SectionReader`.
     ///
     /// This is the entry point for cloud-backed pipelines: hand it a
     /// `scx_cloud::CloudSectionReader` (or any other backend) to drive
     /// the same query engine against remote storage.
+    ///
+    /// Scopes to the global / single-modality axis (`modality_id = 0`).
     pub fn from_reader(reader: Box<dyn SectionReader>) -> Result<Self> {
-        // Cache schemas for eager validation
-        let obs_schema = reader.read_obs_schema()?;
-        let var_schema = reader.read_var_schema()?;
+        Self::from_reader_for_modality(reader, 0)
+    }
 
-        // Load deletion vectors if present
+    /// Create a modality-scoped query pipeline from any `SectionReader`.
+    ///
+    /// `modality_id == 0` is the global / single-modality axis. `>= 1`
+    /// scopes X assembly, var, `filter_var`, and `select_genes` to one
+    /// modality of a multimodal file; `filter_obs` still evaluates against
+    /// the shared global obs axis. The modality is fixed here (not a
+    /// builder setter) because `filter_var` / `select_genes` validate
+    /// against the var schema immediately.
+    ///
+    /// Errors:
+    ///  - [`EngineError::UnknownModality`](crate::error::EngineError::UnknownModality)
+    ///    if `modality_id` is not registered.
+    ///  - [`EngineError::MultimodalDeletionVectorsUnsupported`](crate::error::EngineError::MultimodalDeletionVectorsUnsupported)
+    ///    if a modality (`>= 1`) query hits a file carrying deletion
+    ///    vectors — DV shard keys are recorded against the flattened
+    ///    all-modality shard order and cannot be mapped per-modality yet.
+    pub fn from_reader_for_modality(
+        reader: Box<dyn SectionReader>,
+        modality_id: u8,
+    ) -> Result<Self> {
+        // Validate the modality id against the file's modality table. id 0 is
+        // always valid (global / single-modality). Validate a registered
+        // modality by table membership (ids are 1-based) so a genuine I/O error
+        // from `modality_n_vars` below propagates as-is rather than being masked
+        // as `UnknownModality`.
+        if modality_id != 0 && u32::from(modality_id) > reader.n_modalities() {
+            return Err(crate::error::EngineError::UnknownModality {
+                requested: modality_id.to_string(),
+                available: reader.modality_names(),
+            });
+        }
+
+        // Cache schemas for eager validation. obs is global; var is
+        // modality-scoped.
+        let obs_schema = reader.read_obs_schema()?;
+        let var_schema = reader.read_var_schema_for(modality_id)?;
+        let n_vars = reader.modality_n_vars(modality_id)? as usize;
+
+        // Load deletion vectors if present.
         let deletion_vectors = reader.read_deletion_vectors()?;
+
+        // Fail loud: DV bitmaps are keyed by flattened (all-modality) shard
+        // position, which cannot be remapped onto a single modality's shard
+        // list. See `docs/multimodal.md` § 3.4.
+        if modality_id != 0 && deletion_vectors.is_some() {
+            return Err(crate::error::EngineError::MultimodalDeletionVectorsUnsupported);
+        }
 
         Ok(Self {
             reader,
+            modality_id,
+            n_vars,
             obs_schema,
             var_schema,
             obs_predicates: Vec::new(),
@@ -155,6 +224,12 @@ impl QueryPipeline {
             deletion_vectors,
             group_index: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The modality this pipeline is scoped to (`0` = global /
+    /// single-modality).
+    pub fn modality_id(&self) -> u8 {
+        self.modality_id
     }
 
     /// Filter observations (cells) by a predicate expression.
@@ -332,7 +407,7 @@ impl QueryPipeline {
             )));
         }
         let range_len = (stop - start) as usize;
-        let n_vars = self.reader.header().n_vars as usize;
+        let n_vars = self.n_vars;
 
         // Global keep-mask for deletion vectors (None when the archive is clean,
         // which is the case for a freshly written grouped output).
@@ -341,7 +416,17 @@ impl QueryPipeline {
             .as_ref()
             .map(|dv| dv.build_keep_mask(n_obs as usize, self.reader.catalog()));
 
-        let csr_shards: Vec<&FullCatalogEntry> = self.reader.catalog().shards_sorted();
+        let csr_shards: Vec<&FullCatalogEntry> =
+            crate::collect::scan_shards(self.reader.catalog(), self.modality_id);
+        debug_assert!(
+            self.modality_id == 0
+                || self
+                    .reader
+                    .catalog()
+                    .modality_csr_ranges_tile_obs(self.modality_id, n_obs),
+            "modality {} CSR shards must tile [0, n_obs)",
+            self.modality_id
+        );
         let total_shards = csr_shards.len();
 
         let mut merged_indptr: Vec<i64> = vec![0];
@@ -438,7 +523,7 @@ impl QueryPipeline {
         } else {
             self.read_obs_range_full(start, range_len, &keep_local, keep_mask.is_some())?
         };
-        let var = self.reader.read_var()?;
+        let var = self.reader.read_var_for(self.modality_id)?;
 
         Ok(QueryResult {
             x,
@@ -496,6 +581,13 @@ impl QueryPipeline {
         &self.var_schema
     }
 
+    /// The per-modality variable count (X width) this pipeline assembles to.
+    /// For `modality_id == 0` this is `header().n_vars`; for a modality it is
+    /// `modality_info(id).n_vars`.
+    pub fn n_vars(&self) -> usize {
+        self.n_vars
+    }
+
     /// Access the accumulated obs predicates.
     pub fn obs_predicates(&self) -> &[Predicate] {
         &self.obs_predicates
@@ -548,6 +640,7 @@ impl QueryPipeline {
 mod tests {
     use super::*;
     use crate::error::EngineError;
+    use arrow::array::Array;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field};
     use scx_codec::{CodecId, ValueEncoding};
@@ -688,5 +781,227 @@ mod tests {
         let result = pipeline.collect().unwrap();
         assert_eq!(result.x.n_rows(), 10);
         assert_eq!(result.x.n_cols(), 5);
+    }
+
+    // -------------------------------------------------------------------
+    // Multimodal-aware predicate pushdown. A two-modality fixture with
+    // DIFFERENT n_vars per modality
+    // (rna=5, adt=3) exercises the per-modality X width + global obs mask.
+    // -------------------------------------------------------------------
+
+    /// Write a 2-modality file (rna: n_vars=5, adt: n_vars=3) over a shared
+    /// `n_obs` obs axis. Each modality has one CSR shard covering [0, n_obs).
+    /// Row `r` in rna expresses gene `r % 5` (value r+1); in adt gene `r % 3`
+    /// (value 100). Returns `(path, rna_id, adt_id)`.
+    fn write_multimodal_test_file(
+        dir: &tempfile::TempDir,
+        n_obs: usize,
+    ) -> (std::path::PathBuf, u8, u8) {
+        use scx_format_io::modality::ModalityType;
+        let path = dir.path().join("mm.scx");
+        // header n_vars is the file-wide max across modalities.
+        let header = sample_header(n_obs as u64, 5, 0);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &sample_var(5)).unwrap();
+        writer.write_var_for(adt_id, &sample_var(3)).unwrap();
+        writer.set_modality_n_vars(rna_id, 5).unwrap();
+        writer.set_modality_n_vars(adt_id, 3).unwrap();
+
+        let mut rna_indptr = vec![0u64];
+        let mut rna_indices = Vec::new();
+        let mut rna_values = Vec::new();
+        let mut adt_indptr = vec![0u64];
+        let mut adt_indices = Vec::new();
+        let mut adt_values = Vec::new();
+        for r in 0..n_obs {
+            rna_indices.push((r % 5) as u32);
+            rna_values.push(((r + 1) % 256) as u8);
+            rna_indptr.push(rna_indptr.last().unwrap() + 1);
+            adt_indices.push((r % 3) as u32);
+            adt_values.push(100u8);
+            adt_indptr.push(adt_indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &rna_indptr,
+                &rna_indices,
+                &rna_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &adt_indptr,
+                &adt_indices,
+                &adt_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        (path, rna_id, adt_id)
+    }
+
+    /// Invariant 1: on a single-modality file, `open` and `open_for_modality(0)`
+    /// are identical; the default path is unchanged.
+    #[test]
+    fn single_modality_parity_modality_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 10, 5);
+        let a = QueryPipeline::open(&path).unwrap().collect().unwrap();
+        let b = QueryPipeline::open_for_modality(&path, 0)
+            .unwrap()
+            .collect()
+            .unwrap();
+        assert_eq!(a.x.n_rows(), b.x.n_rows());
+        assert_eq!(a.x.n_cols(), b.x.n_cols());
+        assert_eq!(a.x.indices, b.x.indices);
+        assert_eq!(a.x.data, b.x.data);
+        assert_eq!(a.total_shards, b.total_shards);
+    }
+
+    /// Invariant 2: X width comes from the modality, not header().n_vars (max).
+    #[test]
+    fn multimodal_per_modality_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, rna_id, adt_id) = write_multimodal_test_file(&dir, 9);
+
+        let rna = QueryPipeline::open_for_modality(&path, rna_id)
+            .unwrap()
+            .collect()
+            .unwrap();
+        assert_eq!(rna.x.n_rows(), 9);
+        assert_eq!(rna.x.n_cols(), 5, "rna width is its own n_vars");
+        assert_eq!(rna.var.num_rows(), 5);
+
+        let adt = QueryPipeline::open_for_modality(&path, adt_id)
+            .unwrap()
+            .collect()
+            .unwrap();
+        assert_eq!(adt.x.n_rows(), 9);
+        assert_eq!(
+            adt.x.n_cols(),
+            3,
+            "adt width is its own n_vars, not header max 5"
+        );
+        assert_eq!(adt.var.num_rows(), 3);
+    }
+
+    /// Invariant 3: the obs predicate is global; querying either modality with
+    /// the same filter yields the same obs rows (but each modality's own X).
+    #[test]
+    fn multimodal_global_obs_mask_applied_per_modality() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, rna_id, adt_id) = write_multimodal_test_file(&dir, 9);
+        // cell_type cycles T/B/NK → "T cell" selects rows 0, 3, 6.
+        let rna = QueryPipeline::open_for_modality(&path, rna_id)
+            .unwrap()
+            .filter_obs("cell_type == 'T cell'")
+            .unwrap()
+            .collect()
+            .unwrap();
+        let adt = QueryPipeline::open_for_modality(&path, adt_id)
+            .unwrap()
+            .filter_obs("cell_type == 'T cell'")
+            .unwrap()
+            .collect()
+            .unwrap();
+        assert_eq!(rna.x.n_rows(), 3);
+        assert_eq!(adt.x.n_rows(), 3);
+        // Same obs rows regardless of modality.
+        let rna_ids = rna
+            .obs
+            .column_by_name("cell_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let adt_ids = adt
+            .obs
+            .column_by_name("cell_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let rna_vec: Vec<&str> = (0..rna_ids.len()).map(|i| rna_ids.value(i)).collect();
+        let adt_vec: Vec<&str> = (0..adt_ids.len()).map(|i| adt_ids.value(i)).collect();
+        assert_eq!(rna_vec, vec!["cell_0", "cell_3", "cell_6"]);
+        assert_eq!(rna_vec, adt_vec, "obs rows identical across modalities");
+        // But widths differ.
+        assert_eq!(rna.x.n_cols(), 5);
+        assert_eq!(adt.x.n_cols(), 3);
+    }
+
+    /// Invariant 6: gene projection resolves in the modality's var index space.
+    #[test]
+    fn multimodal_gene_projection_in_modality_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _rna_id, adt_id) = write_multimodal_test_file(&dir, 9);
+        // adt has only 3 genes; select the last two.
+        let adt = QueryPipeline::open_for_modality(&path, adt_id)
+            .unwrap()
+            .select_genes(vec![1, 2])
+            .collect()
+            .unwrap();
+        assert_eq!(adt.x.n_cols(), 2);
+        assert_eq!(adt.var.num_rows(), 2);
+    }
+
+    /// Unknown modality id → `UnknownModality`.
+    #[test]
+    fn unknown_modality_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _rna_id, _adt_id) = write_multimodal_test_file(&dir, 9);
+        let err = QueryPipeline::open_for_modality(&path, 99).unwrap_err();
+        assert!(
+            matches!(err, EngineError::UnknownModality { .. }),
+            "expected UnknownModality, got {err:?}"
+        );
+    }
+
+    /// count()/exists() are modality-scoped (obs mask global, count identical
+    /// across modalities for a global predicate).
+    #[test]
+    fn multimodal_count_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, rna_id, adt_id) = write_multimodal_test_file(&dir, 9);
+        let rna_count = QueryPipeline::open_for_modality(&path, rna_id)
+            .unwrap()
+            .filter_obs("cell_type == 'T cell'")
+            .unwrap()
+            .count()
+            .unwrap();
+        let adt_count = QueryPipeline::open_for_modality(&path, adt_id)
+            .unwrap()
+            .filter_obs("cell_type == 'T cell'")
+            .unwrap()
+            .count()
+            .unwrap();
+        assert_eq!(rna_count.matched_rows, 3);
+        assert_eq!(adt_count.matched_rows, 3);
     }
 }

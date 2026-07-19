@@ -3,8 +3,10 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use scx_engine::error::EngineError;
 use scx_engine::{QueryPipeline, QueryResult};
 use scx_format_io::header::FileHeader;
+use scx_format_io::reader::ScxReader;
 use scx_format_io::writer::ScxWriter;
 
 use crate::cloud_url::is_cloud_url;
@@ -35,6 +37,7 @@ fn format_level2_eliminations(candidate_shard_rows: usize, matched_rows: usize) 
 #[allow(clippy::too_many_arguments)]
 pub fn run_query(
     source: &str,
+    modality: Option<&str>,
     filter: Option<&str>,
     count: bool,
     output: Option<&Path>,
@@ -48,7 +51,9 @@ pub fn run_query(
     // Cloud URLs require the tokio runtime to outlive the pipeline
     // (the `CloudSectionReader` stores a `Handle` into it). Hold the
     // runtime in a guard binding tied to the function's lifetime.
-    let opened = open_pipeline_for(source)?;
+    // `--modality` scopes to one modality of a multimodal file (local or
+    // cloud); see `open_pipeline_for`.
+    let opened = open_pipeline_for(source, modality)?;
     let mut pipeline = opened.pipeline;
     #[cfg(feature = "cloud")]
     let _rt_guard = opened.runtime; // kept alive for the pipeline's lifetime
@@ -214,8 +219,51 @@ struct OpenedPipeline {
     runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
 }
 
+/// Open a local pipeline, optionally scoped to a modality. `modality = Some`
+/// resolves the name against the file's modality table (mirrors
+/// `subset::extract_modality`) so the error can suggest `scx info`.
+fn open_local_pipeline(
+    source: &str,
+    modality: Option<&str>,
+) -> Result<QueryPipeline, Box<dyn std::error::Error>> {
+    let path = Path::new(source);
+    let Some(name) = modality else {
+        // Fail loud on a multimodal file when no modality is given (mirrors the
+        // pyscx / rscx bindings). Querying `modality_id = 0` on a multimodal
+        // file has no CSR shards and no global `var` section, so it would
+        // otherwise surface an opaque `SectionNotFound`.
+        let reader = ScxReader::open(path)?;
+        if reader.is_multimodal() {
+            let available = reader
+                .modality_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            return Err(EngineError::ModalityRequired { available }.into());
+        }
+        return Ok(QueryPipeline::open(path)?);
+    };
+    let reader = ScxReader::open(path)?;
+    if !reader.is_multimodal() {
+        return Err(format!(
+            "input file is single-modality; `--modality {name}` is not applicable"
+        )
+        .into());
+    }
+    let modality_id = reader.modality_id(name).ok_or_else(|| {
+        format!(
+            "input file has no modality named '{name}'; \
+             run `scx info {source}` to list modalities"
+        )
+    })?;
+    Ok(QueryPipeline::open_for_modality(path, modality_id)?)
+}
+
 #[cfg(feature = "cloud")]
-fn open_pipeline_for(source: &str) -> Result<OpenedPipeline, Box<dyn std::error::Error>> {
+fn open_pipeline_for(
+    source: &str,
+    modality: Option<&str>,
+) -> Result<OpenedPipeline, Box<dyn std::error::Error>> {
     if is_cloud_url(source) {
         // Multi-threaded runtime sized to match rayon's default pool
         // so that rayon-parallel shard decodes (each calling
@@ -236,26 +284,58 @@ fn open_pipeline_for(source: &str) -> Result<OpenedPipeline, Box<dyn std::error:
             std::sync::Arc::new(reader),
             std::sync::Arc::clone(&rt),
         );
-        let pipeline = QueryPipeline::from_reader(Box::new(adapter))?;
+        let pipeline = match modality {
+            None => {
+                use scx_engine::SectionReader;
+                // Fail loud on a multimodal cloud source with no modality
+                // (mirrors the local path and the pyscx / rscx bindings).
+                if adapter.is_multimodal() {
+                    return Err(EngineError::ModalityRequired {
+                        available: adapter.modality_names(),
+                    }
+                    .into());
+                }
+                QueryPipeline::from_reader(Box::new(adapter))?
+            }
+            Some(name) => {
+                use scx_engine::SectionReader;
+                if !adapter.is_multimodal() {
+                    return Err(format!(
+                        "source is single-modality; `--modality {name}` is not applicable"
+                    )
+                    .into());
+                }
+                let modality_id = adapter.modality_id_by_name(name).ok_or_else(|| {
+                    format!(
+                        "cloud source has no modality named '{name}'; \
+                         run `scx info {source}` to list modalities"
+                    )
+                })?;
+                QueryPipeline::from_reader_for_modality(Box::new(adapter), modality_id)?
+            }
+        };
         Ok(OpenedPipeline {
             pipeline,
             runtime: Some(rt),
         })
     } else {
         Ok(OpenedPipeline {
-            pipeline: QueryPipeline::open(Path::new(source))?,
+            pipeline: open_local_pipeline(source, modality)?,
             runtime: None,
         })
     }
 }
 
 #[cfg(not(feature = "cloud"))]
-fn open_pipeline_for(source: &str) -> Result<OpenedPipeline, Box<dyn std::error::Error>> {
+fn open_pipeline_for(
+    source: &str,
+    modality: Option<&str>,
+) -> Result<OpenedPipeline, Box<dyn std::error::Error>> {
     if is_cloud_url(source) {
         return Err("cloud URLs require `scx-cli` to be built with `--features cloud`".into());
     }
     Ok(OpenedPipeline {
-        pipeline: QueryPipeline::open(Path::new(source))?,
+        pipeline: open_local_pipeline(source, modality)?,
     })
 }
 
@@ -429,5 +509,138 @@ mod tests {
             vec![5.0, 70_000.0, 130_000.0],
             "wide values must round-trip losslessly"
         );
+    }
+
+    // -- `--modality` (multimodal query pushdown) --
+
+    /// A modality-scoped open resolves the modality's own var width.
+    #[test]
+    fn modality_open_scopes_to_modality_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::test_utils::write_multimodal_test_file(&dir, 12, 7, 3);
+        let src = path.to_str().unwrap();
+
+        let rna = open_pipeline_for(src, Some("rna"))
+            .unwrap()
+            .pipeline
+            .collect()
+            .unwrap();
+        assert_eq!(rna.x.n_rows(), 12);
+        assert_eq!(rna.x.n_cols(), 7);
+
+        let adt = open_pipeline_for(src, Some("adt"))
+            .unwrap()
+            .pipeline
+            .collect()
+            .unwrap();
+        assert_eq!(adt.x.n_cols(), 3, "adt uses its own n_vars, not the max");
+    }
+
+    /// `run_query --modality NAME --count` reports the modality's matching rows
+    /// under a global obs predicate.
+    #[test]
+    fn run_query_modality_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::test_utils::write_multimodal_test_file(&dir, 12, 7, 3);
+        let src = path.to_str().unwrap();
+        // cell_type cycles T/B/NK → 4 T cells in 12.
+        run_query(
+            src,
+            Some("rna"),
+            Some("cell_type == 'T cell'"),
+            true, // count
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            false,
+        )
+        .expect("modality count query should succeed");
+    }
+
+    /// Unknown modality name is a clear error suggesting `scx info`.
+    #[test]
+    fn modality_unknown_name_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::test_utils::write_multimodal_test_file(&dir, 8, 5, 2);
+        let err = open_pipeline_for(path.to_str().unwrap(), Some("atac"))
+            .err()
+            .expect("should error");
+        assert!(err.to_string().contains("atac"), "{err}");
+    }
+
+    /// `--modality` on a single-modality file is rejected.
+    #[test]
+    fn modality_on_single_modality_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::test_utils::write_test_file(&dir, 10, 5);
+        let err = open_pipeline_for(path.to_str().unwrap(), Some("rna"))
+            .err()
+            .expect("should error");
+        assert!(err.to_string().contains("single-modality"), "{err}");
+    }
+
+    /// A multimodal file queried WITHOUT `--modality` fails loud (mirrors the
+    /// pyscx / rscx bindings) instead of a degenerate/opaque error.
+    #[test]
+    fn multimodal_without_modality_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::test_utils::write_multimodal_test_file(&dir, 8, 5, 2);
+        let err = open_pipeline_for(path.to_str().unwrap(), None)
+            .err()
+            .expect("should error");
+        assert!(err.to_string().contains("multimodal"), "{err}");
+    }
+
+    /// A modality query on a multimodal file carrying deletion vectors fails
+    /// loud (DV shard keys are global-flattened; `scx compact` first).
+    #[test]
+    fn modality_on_multimodal_with_deletion_vectors_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::test_utils::write_multimodal_test_file(&dir, 12, 7, 3);
+        scx_ops::mark_deleted(&path, &[0, 1]).unwrap();
+        let err = open_pipeline_for(path.to_str().unwrap(), Some("rna"))
+            .err()
+            .expect("should error");
+        assert!(err.to_string().contains("deletion"), "{err}");
+    }
+
+    /// Under a non-cloud build, a cloud-scheme source is rejected with the
+    /// feature-gate message (whether or not `--modality` is set).
+    #[cfg(not(feature = "cloud"))]
+    #[test]
+    fn modality_on_cloud_source_requires_feature() {
+        let err = open_pipeline_for("gs://bucket/atlas.scxd/", Some("rna"))
+            .err()
+            .expect("should error");
+        assert!(err.to_string().contains("cloud"), "{err}");
+    }
+
+    /// Under a cloud build, `--modality` works end-to-end over a local exploded
+    /// `.scxd/` directory (routed through the cloud reader by `is_cloud_url`).
+    #[cfg(feature = "cloud")]
+    #[test]
+    fn modality_query_over_exploded_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx = crate::test_utils::write_multimodal_test_file(&dir, 12, 7, 3);
+        let exploded = dir.path().join("mm.scxd");
+        scx_cloud::explode(&scx, &exploded).unwrap();
+        let src = exploded.to_str().unwrap();
+
+        let rna = open_pipeline_for(src, Some("rna"))
+            .unwrap()
+            .pipeline
+            .collect()
+            .unwrap();
+        assert_eq!(rna.x.n_cols(), 7, "rna width over cloud exploded dir");
+
+        let adt = open_pipeline_for(src, Some("adt"))
+            .unwrap()
+            .pipeline
+            .collect()
+            .unwrap();
+        assert_eq!(adt.x.n_cols(), 3, "adt width over cloud exploded dir");
     }
 }

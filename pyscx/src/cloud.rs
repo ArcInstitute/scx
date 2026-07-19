@@ -687,15 +687,41 @@ impl PyCloudExperiment {
     /// metadata, predicate indexes (if present), and CSR shards that
     /// match the predicate / projection — no `scx pull` to local disk
     /// is required first.
-    fn query(&self, py: Python<'_>) -> PyResult<PyQueryPipeline> {
+    ///
+    /// `modality` scopes the query to one modality of a multimodal file
+    /// (X / `select_genes` / `filter_var` resolve against that modality's var;
+    /// `filter_obs` stays on the shared global obs axis). On a multimodal file
+    /// `modality` is required (omitting → `ValueError`); an unknown name →
+    /// `KeyError`. Omit it on single-modality files.
+    #[pyo3(signature = (modality=None))]
+    fn query(&self, py: Python<'_>, modality: Option<&str>) -> PyResult<PyQueryPipeline> {
+        // Resolve name → 1-based id against the cached modality table (0 =
+        // global). Mirrors the local `Experiment.query`.
+        let modality_id: u8 = match modality {
+            None => {
+                if self.modalities.is_some() {
+                    return Err(PyValueError::new_err(format!(
+                        "file is multimodal; pass modality=... (one of {:?})",
+                        self.modality_names()
+                    )));
+                }
+                0
+            }
+            Some(name) => self.modality_id(name).ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "unknown modality '{name}'; available: {:?}",
+                    self.modality_names()
+                ))
+            })?,
+        };
         let reader = Arc::clone(&self.reader);
         let rt = Arc::clone(&self.rt);
         let pipeline = py
             .detach(|| {
                 let adapter = scx_cloud::CloudSectionReader::new(reader, rt);
-                QueryPipeline::from_reader(Box::new(adapter))
+                QueryPipeline::from_reader_for_modality(Box::new(adapter), modality_id)
             })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(crate::query::engine_to_pyerr)?;
         Ok(PyQueryPipeline::from_pipeline(pipeline))
     }
 
@@ -831,12 +857,13 @@ pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
 /// not exposed here — build the explicit `open_cloud(url).query()` chain
 /// when you need them.
 #[pyfunction]
-#[pyo3(signature = (url, *, obs_filter=None, var_names=None))]
+#[pyo3(signature = (url, *, obs_filter=None, var_names=None, modality=None))]
 pub fn read_cloud<'py>(
     py: Python<'py>,
     url: &str,
     obs_filter: Option<&str>,
     var_names: Option<Vec<String>>,
+    modality: Option<&str>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let rt = build_cloud_runtime()
         .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {e}")))?;
@@ -847,8 +874,42 @@ pub fn read_cloud<'py>(
     let reader = Arc::new(reader);
     let rt = Arc::new(rt);
 
-    // Resolve gene names → indices against the file's var index before
-    // the reader is moved into the section-reader adapter. An explicitly
+    // Resolve `modality` name → 1-based id (0 = global) against the modality
+    // table (fetched once). Multimodal + None → ValueError; unknown → KeyError.
+    let modality_table = {
+        let reader_for_table = Arc::clone(&reader);
+        py.detach(|| rt.block_on(reader_for_table.modality_table()))
+            .map_err(cloud_to_pyerr)?
+    };
+    let modality_id: u8 = match modality {
+        None => {
+            if modality_table.is_some() {
+                let names: Vec<String> = modality_table
+                    .as_ref()
+                    .map(|t| t.entries.iter().map(|m| m.name.clone()).collect())
+                    .unwrap_or_default();
+                return Err(PyValueError::new_err(format!(
+                    "file is multimodal; pass modality=... (one of {names:?})"
+                )));
+            }
+            0
+        }
+        Some(name) => modality_table
+            .as_ref()
+            .and_then(|t| t.id_of(name))
+            .ok_or_else(|| {
+                let names: Vec<String> = modality_table
+                    .as_ref()
+                    .map(|t| t.entries.iter().map(|m| m.name.clone()).collect())
+                    .unwrap_or_default();
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "unknown modality '{name}'; available: {names:?}"
+                ))
+            })?,
+    };
+
+    // Resolve gene names → indices against the (modality-scoped) var index
+    // before the reader is moved into the section-reader adapter. An explicitly
     // empty `var_names=[]` is honored as "project to zero genes" (it must
     // NOT fall through to None / all-genes, which would silently download
     // the full matrix for a caller-computed empty marker list).
@@ -858,7 +919,7 @@ pub fn read_cloud<'py>(
         Some(names) => {
             let reader_for_var = Arc::clone(&reader);
             let var_batch = py
-                .detach(|| rt.block_on(reader_for_var.read_var()))
+                .detach(|| rt.block_on(reader_for_var.read_var_for(modality_id)))
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let mut indices = Vec::with_capacity(names.len());
             for name in &names {
@@ -881,9 +942,9 @@ pub fn read_cloud<'py>(
     let mut pipeline = py
         .detach(|| {
             let adapter = scx_cloud::CloudSectionReader::new(reader_for_adapter, rt_for_adapter);
-            QueryPipeline::from_reader(Box::new(adapter))
+            QueryPipeline::from_reader_for_modality(Box::new(adapter), modality_id)
         })
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        .map_err(crate::query::engine_to_pyerr)?;
 
     if let Some(expr) = obs_filter {
         pipeline = pipeline

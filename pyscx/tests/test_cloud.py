@@ -828,3 +828,118 @@ class TestCloudCatalogEnumParity:
             assert cloud.obsm_keys() == []
             assert cloud.varm_keys() == []
             assert cloud.layer_names() == []
+
+
+def _create_multimodal_scx(path: str, n_obs: int = 40, rna_vars: int = 12, adt_vars: int = 4):
+    """Write a 2-modality (rna/adt) CITE-seq .scx via from_mudata, with a
+    global `cell_type` obs column for filter_obs."""
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    rna = sp.csr_matrix(rng.poisson(0.6, size=(n_obs, rna_vars)).astype(np.float32))
+    adt = sp.csr_matrix(rng.poisson(0.6, size=(n_obs, adt_vars)).astype(np.float32))
+    rna_ad = anndata.AnnData(X=rna)
+    rna_ad.var_names = [f"g{i}" for i in range(rna_vars)]
+    adt_ad = anndata.AnnData(X=adt)
+    adt_ad.var_names = [f"a{i}" for i in range(adt_vars)]
+    mu = mudata.MuData({"rna": rna_ad, "adt": adt_ad})
+    mu.obs_names = [f"cell_{i}" for i in range(n_obs)]
+    mu.obs["cell_type"] = [["T_cell", "B_cell", "NK_cell"][i % 3] for i in range(n_obs)]
+    pyscx.from_mudata(mu, path, codec="none")
+
+
+class TestCloudModalityQuery:
+    """Phase 6: open_cloud(...).query(modality=...) over an exploded .scxd/
+    must match the local open(...).query(modality=...) pipeline."""
+
+    def test_modality_query_matches_local(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "cite.scx")
+            _create_multimodal_scx(scx_path, n_obs=45, rna_vars=12, adt_vars=4)
+            exploded = os.path.join(tmpdir, "cite.scxd")
+            pyscx.explode(scx_path, exploded)
+
+            for modality, expect_vars in [("rna", 12), ("adt", 4)]:
+                local = (
+                    pyscx.open(scx_path)
+                    .query(modality=modality)
+                    .filter_obs("cell_type == 'T_cell'")
+                    .collect()
+                    .to_anndata()
+                )
+                cloud = (
+                    pyscx.open_cloud(exploded)
+                    .query(modality=modality)
+                    .filter_obs("cell_type == 'T_cell'")
+                    .collect()
+                    .to_anndata()
+                )
+                assert cloud.n_vars == expect_vars
+                assert cloud.n_obs == local.n_obs
+                assert cloud.n_obs > 0
+                np.testing.assert_array_equal(
+                    cloud.X.toarray(), local.X.toarray()
+                )
+                assert list(cloud.var_names) == list(local.var_names)
+                assert list(cloud.obs_names) == list(local.obs_names)
+
+    def test_modality_select_genes_over_cloud(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "cite.scx")
+            _create_multimodal_scx(scx_path, n_obs=30, rna_vars=12, adt_vars=4)
+            exploded = os.path.join(tmpdir, "cite.scxd")
+            pyscx.explode(scx_path, exploded)
+
+            cloud = (
+                pyscx.open_cloud(exploded)
+                .query(modality="rna")
+                .select_genes(["g0", "g5"])
+                .collect()
+                .to_anndata()
+            )
+            assert list(cloud.var_names) == ["g0", "g5"]
+
+    def test_cloud_multimodal_without_modality_raises(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "cite.scx")
+            _create_multimodal_scx(scx_path)
+            exploded = os.path.join(tmpdir, "cite.scxd")
+            pyscx.explode(scx_path, exploded)
+
+            with pytest.raises(ValueError, match="multimodal"):
+                pyscx.open_cloud(exploded).query()
+
+    def test_cloud_unknown_modality_raises(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "cite.scx")
+            _create_multimodal_scx(scx_path)
+            exploded = os.path.join(tmpdir, "cite.scxd")
+            pyscx.explode(scx_path, exploded)
+
+            with pytest.raises(KeyError):
+                pyscx.open_cloud(exploded).query(modality="atac")
+
+    def test_read_cloud_modality(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "cite.scx")
+            _create_multimodal_scx(scx_path, n_obs=30, rna_vars=12, adt_vars=4)
+            exploded = os.path.join(tmpdir, "cite.scxd")
+            pyscx.explode(scx_path, exploded)
+
+            adata = pyscx.read_cloud(
+                exploded, obs_filter="cell_type == 'B_cell'", modality="rna"
+            )
+            assert adata.n_vars == 12
+            assert adata.n_obs > 0

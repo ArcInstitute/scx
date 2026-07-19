@@ -80,7 +80,20 @@ pub(crate) fn section_name_to_path(
     match section_type {
         SectionType::ObsMetadata => Ok("obs.arrow".to_string()),
         SectionType::ObsIndex => Ok("obs_index.arrow".to_string()),
-        SectionType::VarMetadata => Ok("var.arrow".to_string()),
+        // Global var → "var.arrow"; per-modality var (written by
+        // `ScxWriter::write_var_for` as "var/{modality_name}") → top-level
+        // "var.{modality_name}.arrow" so modalities never collide on the single
+        // "var.arrow" object. A top-level dot-separated name (rather than a
+        // `var/{name}.arrow` subdir file) keeps it out of the `var/` sharded-var
+        // directory, so a modality named with pure digits can't be mistaken for
+        // a `var/{idx:06}.arrow` shard on the reverse map.
+        SectionType::VarMetadata => {
+            if let Some(mname) = name.strip_prefix("var/") {
+                Ok(format!("var.{mname}.arrow"))
+            } else {
+                Ok("var.arrow".to_string())
+            }
+        }
         SectionType::VarIndex => Ok("var_index.arrow".to_string()),
         SectionType::CsrShard => {
             // Phase G.2: per-modality CSR shards are named
@@ -272,6 +285,9 @@ pub(crate) fn path_to_section_name(rel_path: &str) -> Option<(String, SectionTyp
                 SectionType::ObsMetadataShard,
             ))
         }
+        // "var/NNNNNN.arrow" → "var_metadata/shard_N" (Phase 2 sharded var).
+        // The `var/` subdir holds ONLY sharded var; per-modality var lives at
+        // top-level "var.{name}.arrow" (below), so this stem is always numeric.
         _ if rel_path.starts_with("var/") && rel_path.ends_with(".arrow") => {
             let idx: u32 = rel_path
                 .strip_prefix("var/")
@@ -284,6 +300,17 @@ pub(crate) fn path_to_section_name(rel_path: &str) -> Option<(String, SectionTyp
                 format!("var_metadata/shard_{idx}"),
                 SectionType::VarMetadataShard,
             ))
+        }
+        // "var.{modality_name}.arrow" → per-modality var "var/{name}". Global
+        // "var.arrow" is exact-matched above, so the middle segment is always a
+        // non-empty modality name (even a pure-digit one — no shard collision,
+        // since sharded var lives under the `var/` subdir).
+        _ if rel_path.starts_with("var.")
+            && rel_path.ends_with(".arrow")
+            && rel_path.len() > "var.".len() + ".arrow".len() =>
+        {
+            let mname = &rel_path["var.".len()..rel_path.len() - ".arrow".len()];
+            Some((format!("var/{mname}"), SectionType::VarMetadata))
         }
         _ if rel_path.starts_with("obsm/") && rel_path.ends_with(".arrow") => {
             let name = rel_path
@@ -386,6 +413,48 @@ mod tests {
         assert_eq!(
             section_name_to_path("var_metadata/shard_7", SectionType::VarMetadataShard).unwrap(),
             "var/000007.arrow"
+        );
+        // Per-modality var gets a distinct path (no collision with global var
+        // or across modalities).
+        assert_eq!(
+            section_name_to_path("var/rna", SectionType::VarMetadata).unwrap(),
+            "var.rna.arrow"
+        );
+        assert_eq!(
+            section_name_to_path("var/adt", SectionType::VarMetadata).unwrap(),
+            "var.adt.arrow"
+        );
+    }
+
+    #[test]
+    fn per_modality_var_path_round_trips() {
+        // Forward then reverse must recover the per-modality var section name
+        // and type. A pure-digit modality name (e.g. "000007") must round-trip
+        // as a modality var, NOT be mistaken for a `var/{idx:06}.arrow` shard —
+        // per-modality var lives at top-level "var.{name}.arrow", sharded var
+        // under the "var/" subdir.
+        for mname in ["rna", "adt", "atac", "000007"] {
+            let name = format!("var/{mname}");
+            let path = section_name_to_path(&name, SectionType::VarMetadata).unwrap();
+            assert_eq!(path, format!("var.{mname}.arrow"));
+            let (rev_name, rev_ty) = path_to_section_name(&path).unwrap();
+            assert_eq!(rev_name, name);
+            assert_eq!(rev_ty, SectionType::VarMetadata);
+        }
+        // Global var round-trips to the global section.
+        let g = section_name_to_path("var", SectionType::VarMetadata).unwrap();
+        assert_eq!(g, "var.arrow");
+        assert_eq!(
+            path_to_section_name(&g).unwrap(),
+            ("var".to_string(), SectionType::VarMetadata)
+        );
+        // A "var/NNNNNN.arrow" (subdir) is always a sharded-var section.
+        assert_eq!(
+            path_to_section_name("var/000007.arrow").unwrap(),
+            (
+                "var_metadata/shard_7".to_string(),
+                SectionType::VarMetadataShard
+            )
         );
     }
 

@@ -90,12 +90,34 @@ impl ScxExperiment {
     }
 
     /// Fallible body of `query` (see B3 / `throw_on_err`).
-    fn query_impl(&self) -> Result<RQueryPipeline> {
+    ///
+    /// `modality` scopes the query to one modality of a multimodal file. On a
+    /// multimodal file it is required (omitting it errors); an unknown name
+    /// errors. On a single-modality file omit it (`NULL`).
+    fn query_impl(&self, modality: Nullable<String>) -> Result<RQueryPipeline> {
         let path = self
             .path
             .to_str()
             .ok_or_else(|| Error::Other("file path is not valid UTF-8".into()))?;
-        RQueryPipeline::from_path(path)
+        match modality {
+            Nullable::Null => {
+                if self.reader.is_multimodal() {
+                    return Err(Error::Other(format!(
+                        "file is multimodal; pass modality= (one of {:?})",
+                        self.reader.modality_names()
+                    )));
+                }
+                RQueryPipeline::from_path(path)
+            }
+            Nullable::NotNull(name) => {
+                let id = self.reader.modality_id(&name).ok_or_else(|| {
+                    Error::Other(format!(
+                        "file has no modality named '{name}' (run scx_info to list modalities)"
+                    ))
+                })?;
+                RQueryPipeline::from_path_for_modality(path, id)
+            }
+        }
     }
 
     /// Open a fresh `QueryPipeline` over this file (re-open, like `query()`).
@@ -299,9 +321,12 @@ impl ScxExperiment {
     /// Start a query pipeline. Returns an RQueryPipeline.
     /// Re-opens the file (QueryPipeline::open creates its own ScxReader).
     ///
+    /// `modality` (a name, or `NULL` for the global / single-modality axis)
+    /// scopes the query to one modality of a multimodal file.
+    ///
     /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
-    fn query(&self) -> Robj {
-        crate::util::throw_on_err(self.query_impl())
+    fn query(&self, modality: Nullable<String>) -> Robj {
+        crate::util::throw_on_err(self.query_impl(modality))
     }
 
     /// F2: read exactly the cells of one `group_by` label as an `RQueryResult`

@@ -86,3 +86,71 @@ test_that("select_genes rejects 0 / negative / non-integer indices (1-based guar
   expect_error(select_genes(pipe, -1L), regexp = "1-based")
   expect_error(select_genes(pipe, 1.5), regexp = "non-integer")
 })
+
+# --- Multimodal-scoped query -----------
+# Builds a multimodal SCX on the fly via from_seurat (like test-multimodal.R),
+# then scopes the query to one modality. Skips cleanly without Seurat/Matrix.
+
+test_that("scx_query(modality=) scopes to one modality of a multimodal file", {
+  skip_if_not_installed("Seurat", minimum_version = "5.0.0")
+  skip_if_not_installed("Matrix")
+
+  set.seed(7)
+  n_cells <- 18
+  rna_n <- 9
+  adt_n <- 4
+  rna_counts <- Matrix::Matrix(
+    matrix(rpois(rna_n * n_cells, lambda = 0.6), nrow = rna_n, ncol = n_cells),
+    sparse = TRUE
+  )
+  adt_counts <- Matrix::Matrix(
+    matrix(rpois(adt_n * n_cells, lambda = 0.6), nrow = adt_n, ncol = n_cells),
+    sparse = TRUE
+  )
+  rownames(rna_counts) <- paste0("g", seq_len(rna_n))
+  rownames(adt_counts) <- paste0("a", seq_len(adt_n))
+  colnames(rna_counts) <- paste0("cell_", seq_len(n_cells))
+  colnames(adt_counts) <- paste0("cell_", seq_len(n_cells))
+
+  seu <- Seurat::CreateSeuratObject(counts = rna_counts, assay = "rna")
+  seu[["adt"]] <- SeuratObject::CreateAssay5Object(counts = adt_counts)
+
+  out <- tempfile(fileext = ".scx")
+  on.exit(unlink(out), add = TRUE)
+  from_seurat(seu, out)
+
+  # Each modality collects at its own var width, over the shared obs axis.
+  rna <- scx_open(out) |> scx_query(modality = "rna") |> collect()
+  expect_equal(rna$n_obs(), n_cells)
+  expect_equal(rna$n_vars(), rna_n)
+
+  adt <- scx_open(out) |> scx_query(modality = "adt") |> collect()
+  expect_equal(adt$n_obs(), n_cells)
+  expect_equal(adt$n_vars(), adt_n)
+})
+
+test_that("scx_query on a multimodal file errors without / with a bad modality", {
+  skip_if_not_installed("Seurat", minimum_version = "5.0.0")
+  skip_if_not_installed("Matrix")
+
+  set.seed(8)
+  n_cells <- 12
+  rna_counts <- Matrix::Matrix(
+    matrix(rpois(6 * n_cells, lambda = 0.5), nrow = 6, ncol = n_cells), sparse = TRUE
+  )
+  adt_counts <- Matrix::Matrix(
+    matrix(rpois(3 * n_cells, lambda = 0.5), nrow = 3, ncol = n_cells), sparse = TRUE
+  )
+  rownames(rna_counts) <- paste0("g", seq_len(6))
+  rownames(adt_counts) <- paste0("a", seq_len(3))
+  colnames(rna_counts) <- paste0("cell_", seq_len(n_cells))
+  colnames(adt_counts) <- paste0("cell_", seq_len(n_cells))
+  seu <- Seurat::CreateSeuratObject(counts = rna_counts, assay = "rna")
+  seu[["adt"]] <- SeuratObject::CreateAssay5Object(counts = adt_counts)
+  out <- tempfile(fileext = ".scx")
+  on.exit(unlink(out), add = TRUE)
+  from_seurat(seu, out)
+
+  expect_error(scx_open(out) |> scx_query(), regexp = "multimodal")
+  expect_error(scx_open(out) |> scx_query(modality = "atac"), regexp = "atac")
+})

@@ -496,3 +496,160 @@ fn cloud_query_sharded_obs_packed_matches_local() {
     assert_results_match(&local, &cloud);
     assert!(local.x.n_rows() > 0, "filter should keep at least one cell");
 }
+
+// ---------------------------------------------------------------------------
+// Modality-scoped cloud queries. A 2-modality file (rna: 8 vars,
+// adt: 3 vars) where BOTH modalities tile [0, n_obs) (single shard each), so
+// the engine's per-modality tiling debug_assert holds. Verifies the cloud
+// per-modality var + shard routing matches the local `open_for_modality`
+// result across exploded + both packed layouts (the exploded arm also guards
+// the `var/{name}` filename-collision fix in explode.rs).
+// ---------------------------------------------------------------------------
+
+fn write_multimodal_scx(
+    dir: &tempfile::TempDir,
+    n_obs: usize,
+    rna_vars: usize,
+    adt_vars: usize,
+) -> PathBuf {
+    use scx_format_io::modality::ModalityType;
+    let path = dir.path().join("mm.scx");
+    let header = test_header(n_obs as u64, rna_vars.max(adt_vars) as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var(rna_vars)).unwrap();
+    writer.write_var_for(adt_id, &sample_var(adt_vars)).unwrap();
+    writer.set_modality_n_vars(rna_id, rna_vars as u64).unwrap();
+    writer.set_modality_n_vars(adt_id, adt_vars as u64).unwrap();
+
+    for (id, m_vars) in [(rna_id, rna_vars), (adt_id, adt_vars)] {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for r in 0..n_obs {
+            indices.push((r % m_vars) as u32);
+            values.push(((r + 1) % 256) as u8);
+            indptr.push(indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard_for(
+                id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}
+
+fn build_cloud_pipeline_for_modality(
+    rt: &Arc<tokio::runtime::Runtime>,
+    url: &str,
+    modality_id: u8,
+) -> QueryPipeline {
+    let reader = rt.block_on(scx_cloud::open_cloud(url)).unwrap();
+    let adapter = CloudSectionReader::new(Arc::new(reader), Arc::clone(rt));
+    QueryPipeline::from_reader_for_modality(Box::new(adapter), modality_id).unwrap()
+}
+
+#[test]
+fn cloud_modality_query_matches_local_all_layouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = write_multimodal_scx(&dir, 60, 8, 3);
+
+    let exploded_path = dir.path().join("mm.scxd");
+    explode(&scx_path, &exploded_path).unwrap();
+    let optimized_path = dir.path().join("mm_opt.scx");
+    cloud_optimize(&scx_path, &optimized_path).unwrap();
+
+    let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+
+    // rna is modality 1, adt is modality 2.
+    for (modality_id, expect_vars) in [(1u8, 8usize), (2u8, 3usize)] {
+        let local = QueryPipeline::open_for_modality(&scx_path, modality_id)
+            .unwrap()
+            .filter_obs("cell_type == 'T_cell'")
+            .unwrap()
+            .collect()
+            .unwrap();
+        assert_eq!(local.x.n_cols(), expect_vars, "local per-modality width");
+
+        for url in [
+            exploded_path.to_string_lossy().to_string(),
+            optimized_path.to_string_lossy().to_string(),
+            scx_path.to_string_lossy().to_string(),
+        ] {
+            let cloud = build_cloud_pipeline_for_modality(&rt, &url, modality_id)
+                .filter_obs("cell_type == 'T_cell'")
+                .unwrap()
+                .collect()
+                .unwrap();
+            assert_eq!(
+                cloud.x.n_cols(),
+                expect_vars,
+                "cloud modality {modality_id} width for {url}"
+            );
+            assert_results_match(&local, &cloud);
+            assert!(cloud.x.n_rows() > 0, "filter should keep cells ({url})");
+        }
+    }
+}
+
+#[test]
+fn cloud_modality_accessors_and_unknown_modality() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = write_multimodal_scx(&dir, 30, 8, 3);
+    let exploded_path = dir.path().join("mm.scxd");
+    explode(&scx_path, &exploded_path).unwrap();
+
+    let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+    for url in [
+        exploded_path.to_string_lossy().to_string(),
+        scx_path.to_string_lossy().to_string(),
+    ] {
+        let reader = rt.block_on(scx_cloud::open_cloud(&url)).unwrap();
+        let adapter = CloudSectionReader::new(Arc::new(reader), Arc::clone(&rt));
+        assert!(adapter.is_multimodal(), "{url}");
+        assert_eq!(adapter.n_modalities(), 2, "{url}");
+        let mut names = adapter.modality_names();
+        names.sort();
+        assert_eq!(names, vec!["adt".to_string(), "rna".to_string()], "{url}");
+        assert_eq!(adapter.modality_id_by_name("rna"), Some(1), "{url}");
+        assert_eq!(adapter.modality_id_by_name("nope"), None, "{url}");
+
+        // Unknown modality id → engine UnknownModality at construction.
+        let reader2 = rt.block_on(scx_cloud::open_cloud(&url)).unwrap();
+        let adapter2 = CloudSectionReader::new(Arc::new(reader2), Arc::clone(&rt));
+        let err = QueryPipeline::from_reader_for_modality(Box::new(adapter2), 99)
+            .err()
+            .expect("unknown modality should error");
+        assert!(
+            matches!(err, scx_engine::EngineError::UnknownModality { .. }),
+            "expected UnknownModality, got {err:?} ({url})"
+        );
+    }
+}

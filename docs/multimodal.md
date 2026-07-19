@@ -146,15 +146,17 @@ rna.X                # ScxLazyTransformedDataset (modality-scoped)
 too — the result is a one-modality `MuData` rather than an error, so the
 same code paths work uniformly across file layouts.
 
-Filter kwargs (`var_names`, `obs_filter`, `layers`) are **not** supported
-together with `modality=...` currently — the modality-scoped backed
-path doesn't share a `QueryPipeline` with the unimodal predicate-pushdown
-machinery yet. Use `scx subset --modality NAME --filter '<expr>'` (now
-supported, see § 5) to materialise a filtered single-modality file
-first, then `to_anndata(backed=True)` on the result.
-Cloud-backed `open_cloud(...).to_mudata(backed=True)` is not yet wired
-even though the `SectionReader` abstraction has landed —
-local cloud query goes through `open_cloud(...).query()` for now.
+For **filtered per-modality reads**, use the modality-scoped query pipeline
+(§ 3.4): `open(path).query(modality="rna").filter_obs(...).select_genes(...)
+.collect()` pushes the obs predicate down and assembles only the matching cells
+of that modality's X. The `to_anndata(modality=..., backed=True)` +
+filter-kwargs (`var_names` / `obs_filter` / `layers`) combination is still not
+wired — the *backed* path doesn't share the `QueryPipeline` — so use
+`query(modality=...)` (in-memory result) or `scx subset --modality NAME --filter
+'<expr>'` (§ 5, materialises a filtered single-modality file, then
+`to_anndata(backed=True)` on the result) instead.
+Cloud-backed `open_cloud(...).query(modality=...)` **is** supported (§ 3.4);
+`open_cloud(...).to_mudata(backed=True)` is a separate follow-on.
 
 ### 3.3 Training — `pyscx.MultimodalTrainingDataset`
 
@@ -202,6 +204,64 @@ when the batch is reduced).
 alphabetically-first modality and emits a `UserWarning` directing the
 user to `MultimodalTrainingDataset`. Pass `modality="rna"` explicitly
 to suppress the warning.
+
+### 3.4 Modality-scoped queries — `query(modality=…)`
+
+Selective, out-of-core reads of **one** modality run through the query
+engine's predicate pushdown, scoped to that modality:
+
+```python
+import pyscx
+
+exp = pyscx.open("citeseq.scx")
+
+# The obs predicate resolves against the shared global obs axis; X,
+# select_genes, and filter_var resolve against the RNA modality's var.
+rna = (
+    exp.query(modality="rna")
+       .filter_obs("cell_type == 'T cell'")
+       .select_genes(["MS4A1", "CD3D"])
+       .collect()
+       .to_anndata()          # single-modality AnnData, filtered + projected
+)
+
+# count() is modality-scoped too (obs predicate is global, so the count is
+# the same across modalities):
+n = exp.query(modality="adt").filter_obs("cell_type == 'T cell'").count()
+```
+
+Because obs is global (§ 2) and every modality's CSR shards independently
+tile `[0, n_obs)`, the obs predicate produces one global row mask that is
+applied to the target modality's shards — only the matching cells of that
+modality are decoded (no full-modality materialisation, unlike `scx subset
+--modality --filter`). X assembles at the modality's own `n_vars`.
+
+On a multimodal file `modality=` is **required**: omitting it raises
+`ValueError` (there is no unambiguous default axis), and an unknown name
+raises `KeyError`. On a single-modality / v1 file omit `modality=` (the
+default global axis; passing a name errors). A file carrying deletion
+vectors rejects a modality query with a clear error — compact it first
+(`scx compact`) to apply the deletions (per-modality deletion vectors are a
+follow-on). Modality-scoped queries run over the **cloud** reader too —
+`open_cloud(url).query(modality="rna")`, `read_cloud(url, modality="rna")`, and
+`scx query <url> --modality rna` — for both packed and exploded `.scxd/`
+layouts. (`open_cloud(...).to_mudata()` over cloud remains a separate follow-on.)
+
+CLI and R equivalents:
+
+```bash
+scx query citeseq.scx --modality rna --filter "cell_type == 'T cell'" \
+    --select-genes hvg.txt --output rna_tcells.scx
+scx query citeseq.scx --modality rna --count --filter "total_counts > 1000"
+```
+
+```r
+library(rscx)
+rna <- scx_open("citeseq.scx") |>
+  scx_query(modality = "rna") |>
+  filter_obs("cell_type == 'T cell'") |>
+  collect()
+```
 
 ---
 
@@ -328,10 +388,12 @@ are resolved.
 | `pyscx.MultimodalTrainingDataset` | Supported | — |
 | `scx subset --modality NAME` | Supported | — |
 | `scx subset --modality NAME --filter … --genes …` | Supported | Composes filter + projection in one pass |
+| `query(modality=…)` / `scx query --modality` / `scx_query(modality=)` | Supported | Local modality-scoped predicate pushdown (obs mask global, X at the modality's `n_vars`); §&nbsp;3.4 |
 | `scx append --modality NAME` | Not supported (deferred) | Rejected with `MultimodalUnsupported`: a single-modality append would leave siblings under-covering the global obs axis. Extract via `scx subset --modality`, append, then `scx merge` |
 | `scx merge` on multimodal inputs | Supported | Dispatches to `merge_multimodal`; per-modality CSC dropped — `--rebuild-csc` to re-emit |
 | `scx compact` on multimodal inputs | Supported | Dispatches to `compact_multimodal`; keep mask applied across every modality |
-| `to_anndata(modality=…, backed=True)` + filter kwargs | Not supported | `scx subset --modality NAME --filter` |
+| `to_anndata(modality=…, backed=True)` + filter kwargs | Not supported | Use `query(modality=…)` (in-memory) or `scx subset --modality NAME --filter` |
+| `open_cloud(...).query(modality=…)` / `read_cloud(..., modality=…)` | Supported | Modality-scoped predicate pushdown over the cloud reader (packed + exploded `.scxd/`); `scx query <url> --modality` too |
 | `open_cloud(...).to_mudata(backed=True)` | Not supported | Cloud `SectionReader` is wired for unimodal `.query()`; multimodal backed export is a follow-on |
 
 ### Detail
@@ -356,6 +418,17 @@ are resolved.
   `extract_modality_with_filter` reads the modality CSR, applies the
   obs predicate against the global obs, projects to the chosen genes,
   and writes a single-modality v2 SCX in one pass.
+- **`query(modality=…)` (modality-scoped pushdown)**:
+  `scx_engine::QueryPipeline::open_for_modality` scopes X assembly and
+  var/gene resolution to one modality (`csr_shards_for_modality`,
+  per-modality `n_vars`) while the obs predicate evaluates against the
+  shared global obs axis — so only the matching cells of that modality are
+  decoded, no full-modality materialisation. The Level-2 predicate-index
+  fast path is disabled for modality-scoped queries (the index's shard ids
+  are keyed to the flattened all-modality shard order); Level-1
+  catalog-stats pruning still runs per modality. A file with deletion
+  vectors rejects a modality query (DV shard keys are global-flattened;
+  compact first). See § 3.4.
 - **MAE sampleMap with non-aligned cells**: `from_mae` raises rather
   than NA-padding. Users should `intersectColumns()` upfront. Future
   work could lift this by emitting NA values into the mismatched cells

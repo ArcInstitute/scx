@@ -40,6 +40,17 @@ impl RQueryPipeline {
         })
     }
 
+    /// Create a modality-scoped pipeline (called by
+    /// `ScxExperiment$query(modality=...)`). `modality_id == 0` is the global /
+    /// single-modality axis.
+    pub fn from_path_for_modality(path: &str, modality_id: u8) -> Result<Self> {
+        let pipeline = QueryPipeline::open_for_modality(path, modality_id)
+            .map_err(|e| Error::Other(e.to_string()))?;
+        Ok(Self {
+            inner: Some(pipeline),
+        })
+    }
+
     /// Take the inner pipeline, returning an error if already consumed.
     fn take_inner(&mut self) -> Result<QueryPipeline> {
         self.inner
