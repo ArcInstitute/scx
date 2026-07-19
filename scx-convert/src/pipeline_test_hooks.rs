@@ -47,6 +47,74 @@ pub fn current_ingest_fault_shard() -> Option<usize> {
     FAIL_INGEST_SHARD_AT.with(|c| c.get())
 }
 
+thread_local! {
+    /// Per-thread panic-injection switch for the ingest coordinator.
+    /// Unlike [`FAIL_INGEST_SHARD_AT`] (which makes a worker *send* an
+    /// `Err`), this makes the worker `panic!` *before* its
+    /// `tx.send(...)` — exercising the `catch_unwind` guard that turns
+    /// a worker panic into a delivered error rather than a deadlock.
+    /// Mutate only via [`PanicIngestShardGuard`].
+    pub static PANIC_INGEST_SHARD_AT: Cell<Option<usize>> = const { Cell::new(None) };
+
+    /// Per-thread panic-injection switch for the export coordinator
+    /// (`stream_csr_to_group_at`). Same semantics as
+    /// [`PANIC_INGEST_SHARD_AT`] for the SCX → h5ad direction. Mutate
+    /// only via [`PanicExportShardGuard`].
+    pub static PANIC_EXPORT_SHARD_AT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Read the current thread's ingest panic-injection setting.
+pub fn current_ingest_panic_shard() -> Option<usize> {
+    PANIC_INGEST_SHARD_AT.with(|c| c.get())
+}
+
+/// Read the current thread's export panic-injection setting.
+pub fn current_export_panic_shard() -> Option<usize> {
+    PANIC_EXPORT_SHARD_AT.with(|c| c.get())
+}
+
+/// RAII guard arming the ingest panic injector for the current
+/// thread. Drop restores the previous value. Same thread-scoping
+/// rules as [`FailIngestShardGuard`]: create it on the thread that
+/// invokes the convert.
+pub struct PanicIngestShardGuard {
+    prev: Option<usize>,
+}
+
+impl PanicIngestShardGuard {
+    pub fn new(shard_idx: usize) -> Self {
+        let prev = PANIC_INGEST_SHARD_AT.with(|c| c.replace(Some(shard_idx)));
+        Self { prev }
+    }
+}
+
+impl Drop for PanicIngestShardGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        PANIC_INGEST_SHARD_AT.with(|c| c.set(prev));
+    }
+}
+
+/// RAII guard arming the export panic injector for the current
+/// thread. Drop restores the previous value.
+pub struct PanicExportShardGuard {
+    prev: Option<usize>,
+}
+
+impl PanicExportShardGuard {
+    pub fn new(shard_idx: usize) -> Self {
+        let prev = PANIC_EXPORT_SHARD_AT.with(|c| c.replace(Some(shard_idx)));
+        Self { prev }
+    }
+}
+
+impl Drop for PanicExportShardGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        PANIC_EXPORT_SHARD_AT.with(|c| c.set(prev));
+    }
+}
+
 /// RAII guard that arms the ingest fault injector for the
 /// current thread. Drop restores the previous value — keeps the
 /// hook from leaking when the test panics mid-flight. The fault is

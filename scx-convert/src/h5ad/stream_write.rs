@@ -482,6 +482,12 @@ fn stream_csr_into_prealloc_parallel(
         .collect();
     let source_label = source_label_for(modality_id, section_type, layer_name, reader);
 
+    // Panic-injection switch for the deadlock regression test. Copied
+    // on the calling thread and propagated into workers via the
+    // `move` closure capture; `#[cfg(test)]`-gated, no production cost.
+    #[cfg(test)]
+    let captured_panic_shard = crate::pipeline::test_hooks::current_export_panic_shard();
+
     // Macro-style local spawn (mirrors `pipeline.rs:1325` in the
     // ingest coordinator): extracting this as a closure runs afoul
     // of rayon's invariant `'scope` lifetime — the nested closure
@@ -503,14 +509,23 @@ fn stream_csr_into_prealloc_parallel(
                 let entry = shards[idx_];
                 let tx = tx.clone();
                 $scope.spawn(move |_| {
-                    let res = match read_shard_payload(
-                        reader,
-                        modality_id,
-                        section_type,
-                        layer_name,
-                        idx_,
-                    ) {
-                        Ok((indptr, indices, data)) => {
+                    // `catch_unwind` converts a worker panic into a
+                    // delivered `Err` rather than a silent no-send,
+                    // which would strand the drain loop's `received`
+                    // counter below `n_shards` forever (deadlock). See
+                    // the ingest coordinator in `pipeline.rs` for the
+                    // full rationale; `AssertUnwindSafe` is sound
+                    // because the worker only reads via `reader` and
+                    // the HDF5 writer runs on the calling thread.
+                    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        if Some(idx_) == captured_panic_shard {
+                            panic!("test_hooks: injected panic at shard {idx_}");
+                        }
+                        read_shard_payload(reader, modality_id, section_type, layer_name, idx_)
+                    }));
+                    let res = match decoded {
+                        Ok(Ok((indptr, indices, data))) => {
                             let n_rows = indptr.len().saturating_sub(1) as u32;
                             Ok(DecodedShard {
                                 shard_idx: idx_ as u32,
@@ -521,7 +536,18 @@ fn stream_csr_into_prealloc_parallel(
                                 data,
                             })
                         }
-                        Err(inner) => Err(wrap_shard_read_error(inner, row_start, entry, &source)),
+                        Ok(Err(inner)) => {
+                            Err(wrap_shard_read_error(inner, row_start, entry, &source))
+                        }
+                        Err(payload) => Err(wrap_shard_read_error(
+                            ConvertError::Other(format!(
+                                "worker panicked while decoding shard {idx_}: {}",
+                                crate::pipeline::panic_message(payload)
+                            )),
+                            row_start,
+                            entry,
+                            &source,
+                        )),
                     };
                     let _ = tx.send((idx_ as u32, res));
                 });

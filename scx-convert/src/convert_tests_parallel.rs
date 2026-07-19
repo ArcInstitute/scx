@@ -997,3 +997,111 @@ fn parallel_ingest_worker_error_does_not_deadlock() {
         "expected Err from injected ingest shard failure; got Ok"
     );
 }
+
+/// Regression test for review finding #4: a worker that *panics*
+/// before its `tx.send(...)` (rather than sending an `Err`) must not
+/// deadlock the ingest coordinator. Without the `catch_unwind` guard
+/// the panicking worker produces no message, the drain loop's
+/// `received` counter never reaches `n_ranges`, and `rx.recv()` blocks
+/// forever because the original `tx` in the scope frame keeps the
+/// channel open. The `PanicIngestShardGuard` hook forces a real
+/// `panic!` inside `encode_one_shard_worker`'s `catch_unwind`; the
+/// coordinator must convert it to a `ConvertError` and return `Err`.
+#[test]
+fn parallel_ingest_worker_panic_does_not_deadlock() {
+    use super::pipeline::{h5ad_to_scx_streaming, test_hooks, StreamingOverrides};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("src.h5ad");
+    let scx_out = dir.path().join("out.scx");
+
+    // 80 rows × 11 vars, shard_size 10 → 8 ingest shards. Shard index
+    // 3 is in the initial prime spawn (outstanding_cap = threads +
+    // depth = 5) so several workers are guaranteed to be parked on
+    // `tx.send(...)` against the depth-1 channel when this one panics.
+    create_test_h5ad(&h5ad, 80, 11, "csr", false);
+
+    let h5ad_owned = h5ad.clone();
+    let scx_out_owned = scx_out.clone();
+    let handle = std::thread::spawn(move || {
+        // Guard lives for the whole convert; Drop restores the
+        // thread-local on normal return *and* on panic.
+        let _panic = test_hooks::PanicIngestShardGuard::new(3);
+        let mut opts = streaming_opts(10);
+        opts.reader_threads = Some(4);
+        opts.writer_queue_depth = 1;
+        h5ad_to_scx_streaming(
+            &h5ad_owned,
+            &scx_out_owned,
+            &opts,
+            &StreamingOverrides::default(),
+            &mut WarningSink::log(),
+        )
+    });
+
+    let timeout = Duration::from_secs(30);
+    let start = Instant::now();
+    while !handle.is_finished() {
+        if start.elapsed() > timeout {
+            panic!(
+                "parallel ingest deadlocked on worker panic: convert thread did \
+                 not finish within {timeout:?}; the `catch_unwind` guard on the \
+                 worker body may be missing or regressed"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let result = handle.join().expect("convert thread panicked");
+    assert!(
+        result.is_err(),
+        "expected Err from injected ingest worker panic; got Ok"
+    );
+}
+
+/// Symmetric regression test for the export coordinator
+/// (`stream_csr_into_prealloc_parallel`): a worker that panics before
+/// `tx.send(...)` must not deadlock the SCX → h5ad drain loop. Same
+/// `catch_unwind` fix, forced via the `PanicExportShardGuard` hook.
+#[test]
+fn parallel_export_worker_panic_does_not_deadlock() {
+    use super::pipeline::{scx_to_h5ad_streaming, test_hooks};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = dir.path().join("src.scx");
+    let h5ad_out = dir.path().join("out.h5ad");
+
+    // 80 rows / shard 10 → 8 CSR shards. Shard index 3 is in the
+    // initial prime spawn so other workers park on the depth-1 channel.
+    make_multishard_scx(&scx_path, 80, 11, 10);
+
+    let scx = scx_path.clone();
+    let handle = std::thread::spawn(move || {
+        let _panic = test_hooks::PanicExportShardGuard::new(3);
+        let opts = ConvertOptions {
+            reader_threads: Some(4),
+            writer_queue_depth: 1,
+            ..ConvertOptions::default()
+        };
+        scx_to_h5ad_streaming(&scx, &h5ad_out, &opts, &mut WarningSink::log())
+    });
+
+    let timeout = Duration::from_secs(30);
+    let start = Instant::now();
+    while !handle.is_finished() {
+        if start.elapsed() > timeout {
+            panic!(
+                "parallel export deadlocked on worker panic: convert thread did \
+                 not finish within {timeout:?}; the `catch_unwind` guard on the \
+                 worker body may be missing or regressed"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let result = handle.join().expect("convert thread panicked");
+    assert!(
+        result.is_err(),
+        "expected Err from injected export worker panic; got Ok"
+    );
+}
