@@ -985,6 +985,41 @@ full-shard — **regenerate fixtures** (or `scx optimize` in place; `scx info <f
 | Selective query | **4.2 ms** |
 | vs AnnData subsetting | **2.1x** faster |
 
+### Modality-scoped query pushdown vs `scx subset` (multimodal)
+
+Getting a filtered single-modality slice out of a multimodal (CITE-seq–shaped)
+file two ways — both the **same `scx` release CLI** (apples-to-apples, no
+Python-interpreter RSS baseline):
+
+- `scx query f --modality rna --filter P --output q.scx` — Level-1 catalog
+  pruning + per-shard decode-and-filter; only the **matching** cells' rows of
+  the modality are ever assembled (`QueryPipeline::collect` never holds the
+  whole modality in memory).
+- `scx subset f out.scx --modality rna --filter P` — the pre-pushdown
+  workaround: `extract_modality` reads the **entire** modality X into memory
+  (`read_all_csr_shards_for`), masks rows, then rewrites the file.
+
+Synthetic CITE-seq fixture (RNA 3000 vars @ 5% density + ADT 30 vars), filter
+`cell_type == 'rare'` selecting ~5% of cells (spread across all shards, so no
+shards are Level-1-skipped — the win is purely avoided materialization). Peak
+RSS = `/usr/bin/time -v` Maximum RSS; min-of-3 wall. Reproduce with
+[`benchmarks/multimodal_query_bench.py`](../benchmarks/multimodal_query_bench.py)
+(`benchmarks/multimodal_query_bench.sbatch`).
+
+| Cells | `scx query` (pushdown) | `scx subset` (materialize) | Peak-RSS reduction | Wall |
+|------:|------------------------:|---------------------------:|-------------------:|-----:|
+| 100K | 158 MB · 0.081 s | 258 MB · 0.098 s | **1.63×** | 1.2× |
+| 300K | 302 MB · 0.221 s | 532 MB · 0.263 s | **1.76×** | 1.19× |
+
+The peak-RSS **delta** (subset − query ≈ 100 MB @ 100K, 230 MB @ 300K) tracks the
+full-modality CSR that `subset` holds resident and pushdown never assembles, so
+the reduction grows with cell count; at atlas scale (10–100M cells) `subset`'s
+whole-modality materialization runs to many GB while the pushdown query stays
+bounded by one shard + the matched slice. Wall is modestly faster (pushdown skips
+the mask-after-full-decode). The obs predicate is evaluated once against the
+shared global obs axis and applied per modality (see
+[docs/multimodal.md § 3.4](multimodal.md#34-modality-scoped-queries--querymodality)).
+
 ## File Operations
 
 | Operation | Speed |
