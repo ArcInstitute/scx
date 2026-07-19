@@ -55,15 +55,18 @@ scx_append <- function(target, input, codec = NULL, shard_size = 16384L,
 #' compaction.
 #'
 #' @param path Path to the SCX file.
-#' @param cell_indices Integer vector of 0-based cell indices to delete.
+#' @param cell_indices Numeric vector of 0-based cell indices to delete. Passed
+#'   as doubles so indices above \code{.Machine$integer.max} (2^31) are
+#'   addressable (mirrors the backed reader); values must be whole and
+#'   non-negative.
 #' @return Total number of deleted cells (including previously deleted).
 #' @export
 #' @examples
 #' \dontrun{
-#' total <- scx_delete("experiment.scx", c(0L, 5L, 10L, 42L))
+#' total <- scx_delete("experiment.scx", c(0, 5, 10, 42))
 #' }
 scx_delete <- function(path, cell_indices) {
-  .Call(wrap__scx_delete, path, as.integer(cell_indices))
+  .Call(wrap__scx_delete, path, as.numeric(cell_indices))
 }
 
 #' Compact an SCX file

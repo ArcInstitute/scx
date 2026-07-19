@@ -41,6 +41,24 @@ test_that("scx_delete marks cells as deleted", {
   expect_equal(total, 2)
 })
 
+test_that("scx_delete addresses indices above 2^31 and validates values (R3)", {
+  path <- skip_if_no_fixture()
+  tmp <- tempfile(fileext = ".scx")
+  on.exit(unlink(tmp), add = TRUE)
+  file.copy(path, tmp)
+
+  # A >2^31 index reaches Rust as a double (the old as.integer() path would
+  # truncate it to NA). On this small fixture it is out of bounds — the error
+  # carries the real index, proving no NA truncation / i32 overflow.
+  big <- 2^31 + 5
+  expect_gt(big, .Machine$integer.max)
+  expect_error(scx_delete(tmp, big), regexp = "out of bounds")
+
+  # Value validation: negatives and non-integers are rejected with clear errors.
+  expect_error(scx_delete(tmp, -1), regexp = "negative")
+  expect_error(scx_delete(tmp, 1.5), regexp = "non-integer")
+})
+
 test_that("scx_compact produces valid file with fewer cells", {
   path <- skip_if_no_fixture()
   tmp <- tempfile(fileext = ".scx")
