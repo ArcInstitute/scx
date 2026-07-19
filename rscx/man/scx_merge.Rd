@@ -37,8 +37,7 @@ identity checks across inputs.}
 \code{"require-equal"}, \code{"namespace"}, or \code{"summary"}.}
 
 \item{sort_by}{Obs columns for a globally-ordered (sorted) k-way merge;
-\code{NULL} = legacy concatenation. Each input must already be sorted by the
-key.}
+\code{NULL} = legacy concatenation.}
 
 \item{reverse}{Descending order when \code{sort_by} is set.}
 }

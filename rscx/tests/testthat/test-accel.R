@@ -203,7 +203,7 @@ test_that("scx_hvg_mean_var matches base-R mean/var (Bessel-corrected)", {
   m[7L, ] <- m[7L, ] + rbinom(nc, 1, 0.3) * 40L   # gene 7: clearly overdispersed
   counts <- methods::as(Matrix::Matrix(m, sparse = TRUE), "CsparseMatrix")
 
-  st <- scx_hvg_mean_var(counts)
+  st <- rscx:::scx_hvg_mean_var(counts)  # low-level wrapper is internal (unexported)
   # Per-gene mean and (ddof=1) variance must match base R row-wise stats.
   expect_equal(st$means, rowMeans(m), tolerance = 1e-6)
   expect_equal(st$variances, apply(m, 1, var), tolerance = 1e-5)

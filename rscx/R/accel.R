@@ -251,6 +251,8 @@ scx_leiden <- function(object, reduction = "pca", dims = 1:30,
 
 #' @describeIn scx-accelerators Wilcoxon rank-sum DE (FindAllMarkers analog).
 #' @param group.by `meta.data` column with per-cell group labels.
+#' @param groups Subset of group labels to test (character vector); `NULL`
+#'   (default) tests every group.
 #' @param reference Reference group, or `NULL` to test each group vs rest.
 #' @param log_transformed Whether `layer` is already log-transformed.
 #' @param rankby_abs,tie_correct Wilcoxon options; defaults (`FALSE`/`FALSE`)
@@ -625,6 +627,8 @@ scx_pseudobulk_dex <- function(object, group_by, test_col, reference,
 #'   pseudobulk count matrix and design (the `nb_glm` building block).
 #' @param counts A genes x samples numeric matrix of pseudobulk counts (DESeq2
 #'   orientation).
+#' @param gene_names Character vector of gene names (length `nrow(counts)`);
+#'   defaults to `rownames(counts)`, falling back to positional indices.
 #' @param design A samples x features numeric design matrix of full column rank,
 #'   e.g. `model.matrix(~ condition, sampleinfo)`.
 #' @param contrast 1-based design column (coefficient) to test; `NULL` (default)

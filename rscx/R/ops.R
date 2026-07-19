@@ -1,8 +1,7 @@
-#' @title SCX file operations
-#'
-#' @description
-#' Append, delete, compact, rollback, and merge SCX files from R.
-#' Info and validation utilities.
+# SCX file operations: append, delete, compact, rollback, and merge SCX files
+# from R, plus info/validation utilities. Each exported verb is documented on
+# its own help page below (this header is a plain comment so roxygen does not
+# attach it to the internal helper that follows).
 
 # Internal: NULL -> character(0); otherwise coerce to character (for the
 # optional index-column / sort-column vectors passed to the Rust ops).

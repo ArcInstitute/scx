@@ -2,7 +2,37 @@
 % Please edit documentation in R/interop.R
 \name{rscx-interop}
 \alias{rscx-interop}
+\alias{from_seurat}
+\alias{from_sce}
+\alias{from_mae}
 \title{SCX interop with Seurat v5 and SingleCellExperiment}
+\arguments{
+\item{seurat_obj}{A \code{Seurat} object to import (\code{from_seurat}).}
+
+\item{sce_obj}{A \code{SingleCellExperiment} to import (\code{from_sce}).}
+
+\item{mae_obj}{A \code{MultiAssayExperiment} to import as a multimodal SCX
+file (\code{from_mae}); requires aligned cell axes across experiments.}
+
+\item{output_path}{Destination \code{.scx} path.}
+
+\item{codec}{Codec intent (\code{"auto"}/\code{"fast"}/\code{"compact"} or an
+explicit codec name; see \dQuote{Codecs and framing}). \code{NULL} =
+\code{"auto"}.}
+
+\item{csc}{Also write a gene-major CSC sidecar (logical; default
+\code{FALSE}).}
+
+\item{csc_cols_per_shard}{Columns per CSC shard when \code{csc = TRUE}
+(default \code{5000L}).}
+
+\item{row_group_rows}{Row-group framing size; \code{NULL} frames at 256 rows
+(v4), \code{0L} disables framing.}
+}
+\value{
+Invisibly \code{NULL}; called for the side effect of writing
+\code{output_path}.
+}
 \description{
 Convert between SCX and R single-cell data structures.
 
@@ -25,16 +55,16 @@ automatically.
 \code{pyscx.from_anndata} and the \code{scx} CLI (resolved by the shared
 \code{scx_format::resolve_codec}):
 \describe{
-  \item{\code{"auto"} (default)}{Cost-aware adaptive: per integer shard,
-    adopt \code{ShufDeltaZstd} when it is smaller by a margin, else the
-    heuristic (Scx1 for low-count / Zstd otherwise). Float always uses
-    Pcodec.}
-  \item{\code{"fast"}}{Decode-optimized heuristic single-encode (the prior
-    default behaviour); never trials \code{ShufDeltaZstd}.}
-  \item{\code{"compact"}}{Size-optimized: adopts \code{ShufDeltaZstd} on ties.
-    Requires framing (\code{row_group_rows > 0}).}
-  \item{explicit codecs}{\code{"none"}, \code{"scx1"}, \code{"zstd"},
-    \code{"lz4"}, \code{"pcodec"}, \code{"shufdelta"}.}
+\item{\code{"auto"} (default)}{Cost-aware adaptive: per integer shard,
+adopt \code{ShufDeltaZstd} when it is smaller by a margin, else the
+heuristic (Scx1 for low-count / Zstd otherwise). Float always uses
+Pcodec.}
+\item{\code{"fast"}}{Decode-optimized heuristic single-encode (the prior
+default behaviour); never trials \code{ShufDeltaZstd}.}
+\item{\code{"compact"}}{Size-optimized: adopts \code{ShufDeltaZstd} on ties.
+Requires framing (\code{row_group_rows > 0}).}
+\item{explicit codecs}{\code{"none"}, \code{"scx1"}, \code{"zstd"},
+\code{"lz4"}, \code{"pcodec"}, \code{"shufdelta"}.}
 }
 \code{row_group_rows} controls row-group framing (sub-shard random access);
 the default (\code{NULL}) frames at 256 rows to match pyscx/CLI, producing v4

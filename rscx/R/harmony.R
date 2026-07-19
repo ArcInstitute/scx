@@ -52,6 +52,8 @@
 #' res <- scx_harmony_integrate(pca, batch, max_iter = 5L)
 #' str(res)
 #' }
+#' @name scx_harmony_integrate
+#' @rdname scx_harmony_integrate
 #' @export
 NULL
 

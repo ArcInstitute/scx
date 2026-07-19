@@ -39,6 +39,23 @@
 #' \code{"compact-trial"} profiles reject). Framed files require an SCX reader
 #' that understands the v4 layout.
 #'
+#' @param seurat_obj A \code{Seurat} object to import (\code{from_seurat}).
+#' @param sce_obj A \code{SingleCellExperiment} to import (\code{from_sce}).
+#' @param mae_obj A \code{MultiAssayExperiment} to import as a multimodal SCX
+#'   file (\code{from_mae}); requires aligned cell axes across experiments.
+#' @param output_path Destination \code{.scx} path.
+#' @param codec Codec intent (\code{"auto"}/\code{"fast"}/\code{"compact"} or an
+#'   explicit codec name; see \dQuote{Codecs and framing}). \code{NULL} =
+#'   \code{"auto"}.
+#' @param csc Also write a gene-major CSC sidecar (logical; default
+#'   \code{FALSE}).
+#' @param csc_cols_per_shard Columns per CSC shard when \code{csc = TRUE}
+#'   (default \code{5000L}).
+#' @param row_group_rows Row-group framing size; \code{NULL} frames at 256 rows
+#'   (v4), \code{0L} disables framing.
+#' @return Invisibly \code{NULL}; called for the side effect of writing
+#'   \code{output_path}.
+#'
 #' @examples
 #' \dontrun{
 #' # ── Export: SCX → Seurat v5 ──
@@ -60,4 +77,20 @@
 #' # ── Size-optimized import (adaptive ShufDeltaZstd, framed) ──
 #' from_seurat(seu, "compact.scx", codec = "compact")
 #' }
+NULL
+
+# Companion doc blocks attaching the extendr-generated importers (defined in
+# R/extendr-wrappers.R) to the shared `rscx-interop` help page. The `@export`
+# for each comes from the wrapper; these only supply the doc destination.
+
+#' @rdname rscx-interop
+#' @name from_seurat
+NULL
+
+#' @rdname rscx-interop
+#' @name from_sce
+NULL
+
+#' @rdname rscx-interop
+#' @name from_mae
 NULL
