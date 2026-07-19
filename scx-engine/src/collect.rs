@@ -190,7 +190,7 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
     // queries so they fall back to modality-scoped Level-1 pruning + a global
     // obs residual scan (correct, just less pruned). The category dictionaries
     // above are position-based vocab (shard-id-independent) so Level-1 pruning
-    // keeps working. See MULTI-MODAL-PRED-PUSHDOWN.md § 5.5.
+    // keeps working. See `docs/multimodal.md` § 3.4.
     let obs_predicate_index = if pipeline.modality_id() == 0 {
         obs_predicate_index
     } else {
@@ -459,7 +459,7 @@ fn partition_obs_predicates(
 /// and this is order-and-set identical to the legacy `catalog.shards_sorted()`
 /// (both filter `CsrShard` and sort by `row_start`; v1 entries carry
 /// `modality_id = 0`) — the default path is byte-for-byte unchanged. See
-/// MULTI-MODAL-PRED-PUSHDOWN.md § 5.3.
+/// `docs/multimodal.md` § 3.4.
 pub(crate) fn scan_shards(
     catalog: &scx_format_io::FullCatalog,
     modality_id: u8,

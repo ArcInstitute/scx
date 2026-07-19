@@ -1441,12 +1441,14 @@ impl ScxReader {
     /// `modality_id == 0` reads the global / single-modality `var`
     /// section (matches `read_var()`).
     pub fn read_var_for(&self, modality_id: u8) -> Result<RecordBatch> {
-        let key = if modality_id == 0 {
-            "var".to_string()
-        } else {
-            let mname = self.modality_name_for_id(modality_id)?;
-            format!("var/{mname}")
-        };
+        // Global / single-modality var: delegate to `read_var`, which assembles
+        // sharded var (`var_metadata/shard_*`) and falls back to the legacy
+        // single `var` section — a naive `get("var")` would miss sharded var.
+        if modality_id == 0 {
+            return self.read_var();
+        }
+        let mname = self.modality_name_for_id(modality_id)?;
+        let key = format!("var/{mname}");
         let entry = self
             .full_catalog
             .get(&key)
@@ -1459,12 +1461,14 @@ impl ScxReader {
     /// global / single-modality `var` section (matches
     /// [`Self::read_var_schema`]). Mirror of [`Self::read_var_for`].
     pub fn read_var_schema_for(&self, modality_id: u8) -> Result<arrow::datatypes::Schema> {
-        let key = if modality_id == 0 {
-            "var".to_string()
-        } else {
-            let mname = self.modality_name_for_id(modality_id)?;
-            format!("var/{mname}")
-        };
+        // Global / single-modality var schema: delegate to `read_var_schema`,
+        // which resolves the first var section for both sharded and legacy
+        // single-section layouts (a naive `get("var")` would miss sharded var).
+        if modality_id == 0 {
+            return self.read_var_schema();
+        }
+        let mname = self.modality_name_for_id(modality_id)?;
+        let key = format!("var/{mname}");
         let entry = self
             .full_catalog
             .get(&key)

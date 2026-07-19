@@ -3,6 +3,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use scx_engine::error::EngineError;
 use scx_engine::{QueryPipeline, QueryResult};
 use scx_format_io::header::FileHeader;
 use scx_format_io::reader::ScxReader;
@@ -227,6 +228,19 @@ fn open_local_pipeline(
 ) -> Result<QueryPipeline, Box<dyn std::error::Error>> {
     let path = Path::new(source);
     let Some(name) = modality else {
+        // Fail loud on a multimodal file when no modality is given (mirrors the
+        // pyscx / rscx bindings). Querying `modality_id = 0` on a multimodal
+        // file has no CSR shards and no global `var` section, so it would
+        // otherwise surface an opaque `SectionNotFound`.
+        let reader = ScxReader::open(path)?;
+        if reader.is_multimodal() {
+            let available = reader
+                .modality_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            return Err(EngineError::ModalityRequired { available }.into());
+        }
         return Ok(QueryPipeline::open(path)?);
     };
     let reader = ScxReader::open(path)?;
@@ -271,7 +285,18 @@ fn open_pipeline_for(
             std::sync::Arc::clone(&rt),
         );
         let pipeline = match modality {
-            None => QueryPipeline::from_reader(Box::new(adapter))?,
+            None => {
+                use scx_engine::SectionReader;
+                // Fail loud on a multimodal cloud source with no modality
+                // (mirrors the local path and the pyscx / rscx bindings).
+                if adapter.is_multimodal() {
+                    return Err(EngineError::ModalityRequired {
+                        available: adapter.modality_names(),
+                    }
+                    .into());
+                }
+                QueryPipeline::from_reader(Box::new(adapter))?
+            }
             Some(name) => {
                 use scx_engine::SectionReader;
                 if !adapter.is_multimodal() {
@@ -555,6 +580,31 @@ mod tests {
             .err()
             .expect("should error");
         assert!(err.to_string().contains("single-modality"), "{err}");
+    }
+
+    /// A multimodal file queried WITHOUT `--modality` fails loud (mirrors the
+    /// pyscx / rscx bindings) instead of a degenerate/opaque error.
+    #[test]
+    fn multimodal_without_modality_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::test_utils::write_multimodal_test_file(&dir, 8, 5, 2);
+        let err = open_pipeline_for(path.to_str().unwrap(), None)
+            .err()
+            .expect("should error");
+        assert!(err.to_string().contains("multimodal"), "{err}");
+    }
+
+    /// A modality query on a multimodal file carrying deletion vectors fails
+    /// loud (DV shard keys are global-flattened; `scx compact` first).
+    #[test]
+    fn modality_on_multimodal_with_deletion_vectors_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::test_utils::write_multimodal_test_file(&dir, 12, 7, 3);
+        scx_ops::mark_deleted(&path, &[0, 1]).unwrap();
+        let err = open_pipeline_for(path.to_str().unwrap(), Some("rna"))
+            .err()
+            .expect("should error");
+        assert!(err.to_string().contains("deletion"), "{err}");
     }
 
     /// Under a non-cloud build, a cloud-scheme source is rejected with the

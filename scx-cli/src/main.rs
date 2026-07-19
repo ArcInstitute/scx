@@ -657,7 +657,8 @@ enum Commands {
         source: String,
         /// Restrict the query to one modality of a multimodal file (by name).
         /// X / `--select-genes` resolve against that modality's var; the obs
-        /// predicate stays on the shared global obs axis. Local sources only.
+        /// predicate stays on the shared global obs axis. Works on local and
+        /// cloud sources. Required for `scx query` on a multimodal file.
         #[arg(long)]
         modality: Option<String>,
         /// Obs predicate expression (positional). Alternatively pass it via

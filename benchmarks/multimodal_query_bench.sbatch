@@ -16,8 +16,9 @@
 
 set -euo pipefail
 
-REPO=/home/nickyoungblut/dev/rust/scx
-SCRATCH=/scratch/ctc/nickyoungblut
+# Override REPO / SCRATCH via the environment; defaults suit a standard checkout.
+REPO=${SCX_REPO:-$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}
+SCRATCH=${SCX_SCRATCH:-/scratch/$(id -u)}
 FIXTURE_DIR=${SCRATCH}/scx_mm_query
 RESULTS_DIR=${REPO}/benchmarks/results/multimodal_query
 mkdir -p "${FIXTURE_DIR}" "${RESULTS_DIR}"

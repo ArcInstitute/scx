@@ -90,8 +90,8 @@ pub struct QueryPipeline {
     reader: Box<dyn SectionReader>,
     /// Modality scope for X / var / gene resolution. `0` = global /
     /// single-modality axis (the default, back-compatible). `>= 1` scopes
-    /// the pipeline to one modality of a multimodal file
-    /// (MULTI-MODAL-PRED-PUSHDOWN.md). Obs predicate evaluation is always
+    /// the pipeline to one modality of a multimodal file (see
+    /// `docs/multimodal.md` § 3.4). Obs predicate evaluation is always
     /// global — obs is shared across modalities.
     modality_id: u8,
     /// Cached per-modality variable count. For `modality_id == 0` this is
@@ -202,7 +202,7 @@ impl QueryPipeline {
 
         // Fail loud: DV bitmaps are keyed by flattened (all-modality) shard
         // position, which cannot be remapped onto a single modality's shard
-        // list. See MULTI-MODAL-PRED-PUSHDOWN.md § 5.4.
+        // list. See `docs/multimodal.md` § 3.4.
         if modality_id != 0 && deletion_vectors.is_some() {
             return Err(crate::error::EngineError::MultimodalDeletionVectorsUnsupported);
         }
@@ -782,8 +782,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Multimodal-aware predicate pushdown (MULTI-MODAL-PRED-PUSHDOWN.md
-    // Phase 1). A two-modality fixture with DIFFERENT n_vars per modality
+    // Multimodal-aware predicate pushdown. A two-modality fixture with
+    // DIFFERENT n_vars per modality
     // (rna=5, adt=3) exercises the per-modality X width + global obs mask.
     // -------------------------------------------------------------------
 
