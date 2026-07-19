@@ -95,9 +95,11 @@ use scx_format_io::ScxReader;
 /// **Recommended for clean shutdown:** call `dataset.close()` (or register
 /// `weakref.finalize(dataset, dataset.close)` at construction time) before
 /// process exit so the rayon pool and I/O thread shut down while the
-/// interpreter is still healthy. `Drop` runs at interpreter teardown as a
-/// fallback but is bounded by a 5-second deadline per thread to avoid
-/// hangs.
+/// interpreter is still healthy. `Drop` runs on garbage-collection /
+/// interpreter teardown as a fallback — bounded by a 5-second deadline per
+/// thread to avoid hangs, and it **releases the GIL for the duration of the
+/// join** (like `close()`) so a slow shutdown never freezes other Python
+/// threads. Still prefer `close()` for prompt, deterministic teardown.
 #[pyclass]
 pub struct TrainingDataset {
     pipeline: TrainingPipeline,
@@ -347,6 +349,31 @@ impl TrainingDataset {
             self.pipeline.n_vars(),
             self.pipeline.n_output_genes(),
         )
+    }
+}
+
+impl Drop for TrainingDataset {
+    /// Release the GIL around the pipeline's bounded thread joins on drop.
+    ///
+    /// A `#[pyclass]` is dropped with the GIL held, so `TrainingPipeline`'s
+    /// `Drop` (which bound-joins the I/O + decode threads, up to
+    /// `~2×SHUTDOWN_DEADLINE`) would otherwise stall every other Python thread.
+    /// Mirror `close()` and detach the GIL around the join. `py.detach` only
+    /// wraps the pure-Rust join — it never calls *into* Python — so this is
+    /// safe even mid-finalization, where the finalizing thread holds the GIL
+    /// while destructors run.
+    ///
+    /// `Py_IsInitialized` guards the case where we are dropped *after* the
+    /// interpreter has fully finalized (no GIL to acquire): fall back to an
+    /// in-place shutdown, preserving `TrainingPipeline::drop`'s teardown-safety
+    /// contract. (`Py_IsFinalizing` would be the tighter predicate but is
+    /// `Py_3_13`-gated, so it can't be used on the supported 3.11 baseline.)
+    fn drop(&mut self) {
+        if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
+            Python::attach(|py| py.detach(|| self.pipeline.shutdown()));
+        } else {
+            self.pipeline.shutdown();
+        }
     }
 }
 
@@ -857,6 +884,29 @@ impl MultimodalTrainingDataset {
             "MultimodalTrainingDataset(n_obs={}, modalities={names:?})",
             self.n_obs(),
         )
+    }
+}
+
+impl Drop for MultimodalTrainingDataset {
+    /// Release the GIL around the per-modality pipeline shutdowns on drop.
+    /// See [`TrainingDataset`]'s `Drop` for the full rationale (pyclass drop
+    /// holds the GIL; the bounded joins would otherwise freeze other Python
+    /// threads; `py.detach` never calls into Python; `Py_IsInitialized` guards
+    /// the post-finalization case). Mirrors this type's `close()`.
+    fn drop(&mut self) {
+        if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
+            Python::attach(|py| {
+                py.detach(|| {
+                    for p in self.pipelines.iter_mut() {
+                        p.shutdown();
+                    }
+                })
+            });
+        } else {
+            for p in self.pipelines.iter_mut() {
+                p.shutdown();
+            }
+        }
     }
 }
 
