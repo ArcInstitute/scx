@@ -1004,13 +1004,23 @@ impl TrainingPipeline {
 
     /// Get the next training batch from the pipeline.
     ///
-    /// Returns `Some(batch)` while batches are available, `None` when the
-    /// epoch is complete (all cells have been yielded). After `None` is
-    /// returned, call `start_epoch()` again for the next epoch.
+    /// - `Ok(Some(batch))` — a batch is available.
+    /// - `Ok(None)` — the epoch completed cleanly (all cells yielded, or no
+    ///   epoch is active). Call `start_epoch()` again for the next epoch.
+    /// - `Err(e)` — a mid-epoch I/O or decode fault (or a stage panic). The
+    ///   epoch is torn down; the error is surfaced rather than silently
+    ///   truncating the epoch.
     ///
-    /// Returns `None` if no epoch is active.
-    pub fn next_batch(&mut self) -> Option<Batch> {
-        let rx = self.batch_rx.as_ref()?;
+    /// When the batch channel closes we cannot, on its own, tell a clean
+    /// epoch end from a stage that faulted early and dropped its sender.
+    /// `join_epoch_handles()` disambiguates: it returns `Ok(())` for a clean
+    /// end (and for the `ChannelError` cancellation signal) and
+    /// `Err(..)` for a real io/decode error or panic — so we propagate its
+    /// result instead of discarding it.
+    pub fn next_batch(&mut self) -> Result<Option<Batch>> {
+        let Some(rx) = self.batch_rx.as_ref() else {
+            return Ok(None);
+        };
         let t_recv = Instant::now();
         match rx.recv() {
             Ok(batch) => {
@@ -1020,18 +1030,22 @@ impl TrainingPipeline {
                     n_rows = batch.n_rows(),
                     "next_batch: received",
                 );
-                Some(batch)
+                Ok(Some(batch))
             }
             Err(_) => {
-                // Channel closed — epoch is complete
-                // Join handles to propagate any errors (logged, not returned)
+                // Channel closed — either a clean epoch end or a stage fault.
+                // Join the handles and let their result decide which.
                 tracing::trace!(
                     pid = std::process::id(),
-                    "next_batch: channel closed (epoch end)"
+                    "next_batch: channel closed (epoch end or fault)"
                 );
-                let _ = self.join_epoch_handles();
+                // The epoch is over either way; tear it down before deciding
+                // clean-vs-fault (`join_epoch_handles` only clears
+                // `epoch_active` on its clean tail, not its early error
+                // returns, so set it here unconditionally).
+                let join = self.join_epoch_handles();
                 self.epoch_active = false;
-                None
+                join.map(|()| None)
             }
         }
     }
@@ -1754,7 +1768,7 @@ mod tests {
         pipeline.start_epoch().unwrap();
 
         let mut all_cells: Vec<u64> = Vec::new();
-        while let Some(batch) = pipeline.next_batch() {
+        while let Some(batch) = pipeline.next_batch().unwrap() {
             assert_eq!(batch.x_shape.1, n_vars);
             assert_eq!(batch.x.len(), batch.x_shape.0 * batch.x_shape.1);
             all_cells.extend_from_slice(&batch.cell_indices);
@@ -1789,11 +1803,65 @@ mod tests {
         pipeline.start_epoch().unwrap();
 
         // First batch should have all cells
-        let batch = pipeline.next_batch().unwrap();
+        let batch = pipeline.next_batch().unwrap().unwrap();
         assert_eq!(batch.cell_indices.len(), 10);
 
         // Second call should return None
-        assert!(pipeline.next_batch().is_none());
+        assert!(pipeline.next_batch().unwrap().is_none());
+    }
+
+    /// L1 regression: a mid-epoch I/O/decode fault must surface as `Err` from
+    /// `next_batch`, not be swallowed as a clean epoch end (which would train
+    /// a truncated epoch with no exception).
+    ///
+    /// Drives the exact `rx.recv() == Err` → `join_epoch_handles` →
+    /// propagate-error path with a hand-installed faulting decode handle, so
+    /// the test is deterministic and needs no corrupt on-disk fixture.
+    #[test]
+    fn test_next_batch_surfaces_mid_epoch_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "test.scx", 10, 5, 1);
+
+        let config = LoaderConfig {
+            batch_size: 100,
+            normalize: false,
+            log1p: false,
+            ..LoaderConfig::default()
+        };
+
+        let mut pipeline = TrainingPipeline::new(&path, config).unwrap();
+
+        // Hand-install a faulting epoch: a decode handle that returns an error
+        // (any variant other than ChannelError, which join_epoch_handles treats
+        // as a clean cancellation) and immediately drops its sender so the
+        // consumer's recv() sees the channel close.
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded::<Batch>(1);
+        let decode_handle = std::thread::spawn(move || {
+            drop(batch_tx);
+            Err(LoaderError::ConfigError {
+                reason: "injected decode fault".to_string(),
+            })
+        });
+        pipeline.batch_rx = Some(batch_rx);
+        pipeline.decode_handle = Some(decode_handle);
+        pipeline.io_handle = None;
+        pipeline.epoch_active = true;
+
+        let result = pipeline.next_batch();
+        assert!(
+            result.is_err(),
+            "mid-epoch decode fault must surface as Err, got {result:?}"
+        );
+        // The epoch is torn down; the error message carries the stage context.
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("decode stage error") && msg.contains("injected decode fault"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            !pipeline.epoch_active,
+            "epoch must be inactive after a fault"
+        );
     }
 
     #[test]
@@ -1814,14 +1882,14 @@ mod tests {
         // Epoch 0
         pipeline.start_epoch().unwrap();
         let mut epoch0_cells = Vec::new();
-        while let Some(batch) = pipeline.next_batch() {
+        while let Some(batch) = pipeline.next_batch().unwrap() {
             epoch0_cells.extend_from_slice(&batch.cell_indices);
         }
 
         // Epoch 1
         pipeline.start_epoch().unwrap();
         let mut epoch1_cells = Vec::new();
-        while let Some(batch) = pipeline.next_batch() {
+        while let Some(batch) = pipeline.next_batch().unwrap() {
             epoch1_cells.extend_from_slice(&batch.cell_indices);
         }
 
@@ -1852,7 +1920,7 @@ mod tests {
 
         let mut pipeline = TrainingPipeline::new(&path, config).unwrap();
         // next_batch before start_epoch should return None
-        assert!(pipeline.next_batch().is_none());
+        assert!(pipeline.next_batch().unwrap().is_none());
     }
 
     #[test]
@@ -1898,7 +1966,7 @@ mod tests {
         for epoch in 0..3 {
             pipeline.start_epoch().unwrap();
             let mut cells = Vec::new();
-            while let Some(batch) = pipeline.next_batch() {
+            while let Some(batch) = pipeline.next_batch().unwrap() {
                 cells.extend_from_slice(&batch.cell_indices);
             }
             let set: std::collections::HashSet<u64> = cells.iter().copied().collect();
@@ -1930,7 +1998,7 @@ mod tests {
         for _ in 0..3 {
             pipeline.start_epoch().unwrap();
             let mut cells = Vec::new();
-            while let Some(batch) = pipeline.next_batch() {
+            while let Some(batch) = pipeline.next_batch().unwrap() {
                 cells.extend_from_slice(&batch.cell_indices);
             }
             all_epoch_cells.push(cells);
@@ -1961,7 +2029,7 @@ mod tests {
         let mut pipeline1 = TrainingPipeline::new(&path, config.clone()).unwrap();
         pipeline1.start_epoch().unwrap();
         let mut cells1 = Vec::new();
-        while let Some(batch) = pipeline1.next_batch() {
+        while let Some(batch) = pipeline1.next_batch().unwrap() {
             cells1.extend_from_slice(&batch.cell_indices);
         }
         drop(pipeline1);
@@ -1970,7 +2038,7 @@ mod tests {
         let mut pipeline2 = TrainingPipeline::new(&path, config).unwrap();
         pipeline2.start_epoch().unwrap();
         let mut cells2 = Vec::new();
-        while let Some(batch) = pipeline2.next_batch() {
+        while let Some(batch) = pipeline2.next_batch().unwrap() {
             cells2.extend_from_slice(&batch.cell_indices);
         }
 

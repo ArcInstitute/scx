@@ -255,16 +255,22 @@ impl TrainingDataset {
         // Release the GIL while waiting for the next batch from the Rust
         // pipeline. This allows other Python threads (e.g., PyTorch CUDA
         // threads) to run while Stage 2 builds the next batch.
-        let batch_opt = py.detach(|| self.pipeline.next_batch());
+        let batch_res = py.detach(|| self.pipeline.next_batch());
 
-        match batch_opt {
-            Some(batch) => {
+        match batch_res {
+            Ok(Some(batch)) => {
                 let dict = batch_to_dict(py, batch)?;
                 Ok(Some(dict))
             }
-            None => {
+            Ok(None) => {
                 self.epoch_started = false;
                 Ok(None) // StopIteration
+            }
+            Err(e) => {
+                // A mid-epoch I/O/decode fault: end iteration and surface the
+                // error rather than silently truncating the epoch.
+                self.epoch_started = false;
+                Err(loader_err_to_py(e))
             }
         }
     }
@@ -749,22 +755,28 @@ impl MultimodalTrainingDataset {
         // GIL once around all pulls is the simplest correct
         // implementation; with the same seed the pipelines should
         // produce in roughly aligned cadence.
-        let batches_opt: Option<Vec<Batch>> = py.detach(|| {
+        let batches_res: std::result::Result<Option<Vec<Batch>>, LoaderError> = py.detach(|| {
             let mut out = Vec::with_capacity(self.pipelines.len());
             for p in self.pipelines.iter_mut() {
-                match p.next_batch() {
+                match p.next_batch()? {
                     Some(b) => out.push(b),
-                    None => return None,
+                    None => return Ok(None),
                 }
             }
-            Some(out)
+            Ok(Some(out))
         });
 
-        let batches = match batches_opt {
-            Some(b) => b,
-            None => {
+        let batches = match batches_res {
+            Ok(Some(b)) => b,
+            Ok(None) => {
                 self.epoch_started = false;
                 return Ok(None);
+            }
+            Err(e) => {
+                // A mid-epoch fault in any modality's pipeline: end iteration
+                // and surface the error rather than silently truncating.
+                self.epoch_started = false;
+                return Err(loader_err_to_py(e));
             }
         };
 

@@ -188,6 +188,15 @@ fn fill_batch_parallel(
                     return Ok(());
                 }
 
+                // Normalization depth is the cell's FULL pre-projection total
+                // count — computed from `csr_data` (all stored nonzeros of the
+                // row) before any HVG projection. With a projection, the dense
+                // `output_row` holds only the panel genes, so its own sum would
+                // be a panel-local depth that silently diverges from scanpy's
+                // normalize-then-subset and from the pflog1ppf path above. For
+                // the no-projection case this equals `output_row.iter().sum()`.
+                let depth: f64 = csr_data.iter().map(|&v| v as f64).sum();
+
                 // Scatter CSR row into dense output row (with or without projection)
                 match projection {
                     Some(proj) => proj.scatter_row(csr_indices, csr_data, output_row),
@@ -195,7 +204,7 @@ fn fill_batch_parallel(
                 }
 
                 // Apply configured dense-row transforms
-                apply_dense_transforms(output_row, normalize, log1p, target_sum);
+                apply_dense_transforms(output_row, normalize, log1p, target_sum, depth);
                 Ok(())
             })
     })?;

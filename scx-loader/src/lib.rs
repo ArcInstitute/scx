@@ -23,7 +23,8 @@ pub use error::{LoaderError, Result};
 pub use index_plan::{IndexPlanBatch, IndexPlanIter, IndexPlanLoader};
 pub use io_stage::{io_stage, ShardData, ShardGroup};
 pub use normalize::{
-    apply_dense_transforms, fused_normalize_log1p_dense, log1p_dense_row, normalize_dense_row,
+    apply_dense_transforms, fused_normalize_log1p_dense, fused_normalize_log1p_dense_with_depth,
+    log1p_dense_row, normalize_dense_row, normalize_dense_row_with_depth,
 };
 pub use pipeline::{compute_memory_budget, LoaderConfig, MemoryBudget, TrainingPipeline};
 pub use plan_engine::{PlanPrefetchIter, PrefetchEngine};

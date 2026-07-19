@@ -186,6 +186,97 @@ pub fn write_dense_scx1_fixture(
     path.to_path_buf()
 }
 
+/// Build a fixture where every row has nonzeros at the **same known** genes
+/// (`2, 7, 33, 58`) with strictly-positive values. Because the columns are
+/// fixed, a test can choose an HVG panel that captures some-but-not-all of a
+/// row's mass and know exactly that the panel-local depth is strictly below the
+/// full-transcriptome depth — the condition under which the L2 panel-local
+/// normalize bug would diverge from the correct (full-depth) result. `n_vars`
+/// is 64 (> the max gene id, 58).
+pub fn write_known_multinnz_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    n_shards: usize,
+) -> std::path::PathBuf {
+    assert!(n_obs % n_shards == 0, "n_obs must divide n_shards");
+    const GENES: [u32; 4] = [2, 7, 33, 58];
+    let n_vars: usize = 64;
+    let rows_per_shard = n_obs / n_shards;
+    let nnz_per_row = GENES.len();
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        (n_obs * nnz_per_row) as u64,
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+
+    let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    writer
+        .write_obs(
+            &RecordBatch::try_new(
+                StdArc::new(Schema::new(vec![Field::new(
+                    "cell_id",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![StdArc::new(StringArray::from(
+                    cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    writer
+        .write_var(
+            &RecordBatch::try_new(
+                StdArc::new(Schema::new(vec![Field::new(
+                    "gene_id",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![StdArc::new(StringArray::from(
+                    gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    for s in 0..n_shards {
+        let row_start = s * rows_per_shard;
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows_per_shard {
+            let row = row_start + local;
+            for (k, &g) in GENES.iter().enumerate() {
+                indices.push(g);
+                // Strictly positive, gene- and row-dependent so panel and full
+                // depth vary across rows.
+                values.push(1u8 + ((row + k * 3) % 7) as u8);
+            }
+            indptr.push(*indptr.last().unwrap() + nnz_per_row as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
 /// Build an `IndexPlanLoader` against a fixture with default settings —
 /// no normalization, no log1p, single obs column `"cell_id"`, 4 cache shards,
 /// shard sort enabled, lookahead 4, plan-size cap 16384, and a generous
