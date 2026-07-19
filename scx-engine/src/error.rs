@@ -30,6 +30,34 @@ pub enum EngineError {
         suggestions: Vec<String>,
     },
 
+    /// A modality-scoped query named a modality that is not registered in
+    /// the file's modality table (or named one on a single-modality file).
+    #[error("unknown modality '{requested}'{}", modality_hint(.available))]
+    UnknownModality {
+        requested: String,
+        available: Vec<String>,
+    },
+
+    /// `query()` was called without a modality on a multimodal file, where
+    /// there is no unambiguous default axis (`modality_id = 0` carries no
+    /// CSR shards on a multimodal file).
+    #[error(
+        "file is multimodal; specify a modality (one of: {})",
+        .available.join(", ")
+    )]
+    ModalityRequired { available: Vec<String> },
+
+    /// A modality-scoped query hit a multimodal file that carries deletion
+    /// vectors. DV shard keys are recorded against the flattened
+    /// (all-modality) shard order, which cannot be mapped onto a single
+    /// modality's shard list; per-modality deletion vectors are a planned
+    /// follow-on. See `MULTI-MODAL-PRED-PUSHDOWN.md` § 5.4.
+    #[error(
+        "modality-scoped queries are not supported on a multimodal file with deletion \
+         vectors present; compact the file first (`scx compact`) to apply deletions"
+    )]
+    MultimodalDeletionVectorsUnsupported,
+
     #[error(transparent)]
     FormatError(#[from] scx_format_io::ScxError),
 
@@ -59,5 +87,15 @@ fn suggestions_hint(suggestions: &[String]) -> String {
         String::new()
     } else {
         format!("; did you mean: {}?", suggestions.join(", "))
+    }
+}
+
+/// Render `; available: a, b` for unknown-modality errors (empty when the
+/// modality table is absent — e.g. a modality named on a single-modality file).
+fn modality_hint(available: &[String]) -> String {
+    if available.is_empty() {
+        String::new()
+    } else {
+        format!("; available: {}", available.join(", "))
     }
 }

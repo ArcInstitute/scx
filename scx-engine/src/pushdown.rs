@@ -42,18 +42,24 @@ pub fn prune_shards_by_catalog(
     predicates: &[Predicate],
     deletion_vectors: Option<&DeletionVectors>,
 ) -> Vec<ShardCandidate> {
-    prune_shards_by_catalog_with_dict(catalog, predicates, deletion_vectors, None)
+    prune_shards_by_catalog_with_dict(catalog, predicates, deletion_vectors, None, 0)
 }
 
 /// Like `prune_shards_by_catalog`, but accepts an optional category dictionary
-/// for resolving `Utf8` predicate values against `CategoryBitset` column stats.
+/// for resolving `Utf8` predicate values against `CategoryBitset` column stats,
+/// and a `modality_id` scoping the shard list. `modality_id == 0` is the global
+/// / single-modality axis (identical to the legacy `shards_sorted()` view);
+/// `>= 1` prunes only that modality's CSR shards. `shard_idx` in the returned
+/// candidates indexes the modality-scoped shard list — callers MUST index the
+/// same [`crate::collect::scan_shards`] list downstream.
 pub fn prune_shards_by_catalog_with_dict(
     catalog: &FullCatalog,
     predicates: &[Predicate],
     deletion_vectors: Option<&DeletionVectors>,
     category_dicts: Option<&CategoryDictionaries>,
+    modality_id: u8,
 ) -> Vec<ShardCandidate> {
-    let sorted_shards = catalog.shards_sorted();
+    let sorted_shards = crate::collect::scan_shards(catalog, modality_id);
 
     let mut candidates = Vec::with_capacity(sorted_shards.len());
 

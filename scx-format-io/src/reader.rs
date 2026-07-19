@@ -1454,6 +1454,24 @@ impl ScxReader {
         self.read_arrow_ipc(entry)
     }
 
+    /// Read the `var` schema for a specific modality without
+    /// materialising the full RecordBatch. `modality_id == 0` reads the
+    /// global / single-modality `var` section (matches
+    /// [`Self::read_var_schema`]). Mirror of [`Self::read_var_for`].
+    pub fn read_var_schema_for(&self, modality_id: u8) -> Result<arrow::datatypes::Schema> {
+        let key = if modality_id == 0 {
+            "var".to_string()
+        } else {
+            let mname = self.modality_name_for_id(modality_id)?;
+            format!("var/{mname}")
+        };
+        let entry = self
+            .full_catalog
+            .get(&key)
+            .ok_or_else(|| ScxError::SectionNotFound(key))?;
+        self.read_arrow_ipc_schema(entry)
+    }
+
     /// Number of CSR shards belonging to the given modality.
     /// `modality_id == 0` returns the global CSR shard count
     /// (matches the legacy single-modality semantics).

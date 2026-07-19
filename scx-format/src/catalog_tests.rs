@@ -1192,3 +1192,129 @@ fn list_logical_names_empty_when_absent() {
         .is_empty());
     assert!(cat.layer_names().is_empty());
 }
+
+// -----------------------------------------------------------------------
+// Multimodal query-pushdown prerequisites.
+// The engine's modality-scoped scan replaces `csr_shards_sorted()`
+// with `csr_shards_for_modality(modality_id)`; on a single-modality/v1 file
+// the two MUST be order-and-set identical so the default path stays
+// byte-for-byte unchanged.
+// -----------------------------------------------------------------------
+
+/// A CSR shard entry for `modality_id` covering `[row_start, row_end)`.
+fn csr_shard_entry(name: &str, modality_id: u8, row_start: u64, row_end: u64) -> FullCatalogEntry {
+    let mut s = sample_stats();
+    s.row_start = row_start;
+    s.row_end = row_end;
+    FullCatalogEntry {
+        name: name.to_string(),
+        offset: 4352,
+        length: 50_000,
+        section_type: SectionType::CsrShard,
+        checksum: [0u8; 32],
+        modality_id,
+        stats: Some(s),
+    }
+}
+
+#[test]
+fn csr_shards_for_modality_0_matches_shards_sorted_single_modality() {
+    // sample_full_catalog is a single-modality file (all entries modality 0)
+    // with four CSR shards. The modality-0 scan must equal the flattened scan
+    // used by the current engine, in the same order.
+    let cat = sample_full_catalog();
+    let flattened: Vec<&str> = cat
+        .csr_shards_sorted()
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    let mod0: Vec<&str> = cat
+        .csr_shards_for_modality(0)
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(
+        flattened, mod0,
+        "single-modality csr_shards_for_modality(0) must equal csr_shards_sorted()"
+    );
+    // shards_sorted() is the alias the engine actually calls today.
+    let alias: Vec<&str> = cat
+        .shards_sorted()
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(alias, mod0);
+}
+
+#[test]
+fn modality_csr_ranges_tile_obs_positive_and_negative() {
+    // Two modalities, each independently tiling [0, 300): the multimodal
+    // invariant the query pushdown relies on. Insert shuffled so the sort in
+    // csr_shards_for_modality is exercised.
+    let good = FullCatalog {
+        catalog_version: CURRENT_CATALOG_VERSION,
+        manifest_sequence: 0,
+        prev_catalog_offset: 0,
+        n_obs: 300,
+        entries: vec![
+            csr_shard_entry("X/rna/shard_1", 1, 100, 300),
+            csr_shard_entry("X/rna/shard_0", 1, 0, 100),
+            csr_shard_entry("X/adt/shard_0", 2, 0, 150),
+            csr_shard_entry("X/adt/shard_1", 2, 150, 300),
+        ],
+        data_generation: 0,
+        csc_build_generation: 0,
+    };
+    assert!(
+        good.modality_csr_ranges_tile_obs(1, 300),
+        "rna tiles [0,300)"
+    );
+    assert!(
+        good.modality_csr_ranges_tile_obs(2, 300),
+        "adt tiles [0,300)"
+    );
+    // Wrong n_obs → not covering.
+    assert!(!good.modality_csr_ranges_tile_obs(1, 301));
+
+    // Gap: shard covers [0,100) then [150,300) → 100..150 missing.
+    let gap = FullCatalog {
+        n_obs: 300,
+        entries: vec![
+            csr_shard_entry("X/rna/shard_0", 1, 0, 100),
+            csr_shard_entry("X/rna/shard_1", 1, 150, 300),
+        ],
+        ..good.clone()
+    };
+    assert!(
+        !gap.modality_csr_ranges_tile_obs(1, 300),
+        "gap breaks tiling"
+    );
+
+    // Overlap: [0,200) and [100,300) overlap at 100..200.
+    let overlap = FullCatalog {
+        n_obs: 300,
+        entries: vec![
+            csr_shard_entry("X/rna/shard_0", 1, 0, 200),
+            csr_shard_entry("X/rna/shard_1", 1, 100, 300),
+        ],
+        ..good.clone()
+    };
+    assert!(
+        !overlap.modality_csr_ranges_tile_obs(1, 300),
+        "overlap breaks tiling"
+    );
+
+    // Missing stats → not covering.
+    let mut no_stats = csr_shard_entry("X/rna/shard_0", 1, 0, 300);
+    no_stats.stats = None;
+    let unstatted = FullCatalog {
+        n_obs: 300,
+        entries: vec![no_stats],
+        ..good.clone()
+    };
+    assert!(!unstatted.modality_csr_ranges_tile_obs(1, 300));
+
+    // Empty shard list covers only n_obs == 0.
+    assert!(good.modality_csr_ranges_tile_obs(7, 0));
+    assert!(!good.modality_csr_ranges_tile_obs(7, 300));
+}

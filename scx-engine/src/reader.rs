@@ -69,6 +69,76 @@ pub trait SectionReader: Send + Sync {
     /// Var metadata as an Arrow RecordBatch.
     fn read_var(&self) -> Result<RecordBatch>;
 
+    // -----------------------------------------------------------------------
+    // Modality-aware surface.
+    //
+    // Default impls model a single-modality (`modality_id = 0`) file, so
+    // existing backends (e.g. cloud) compile unchanged and reject non-zero
+    // modality ids until they implement per-modality section routing. The
+    // local `ScxReader` overrides all of these.
+    // -----------------------------------------------------------------------
+
+    /// Number of registered modalities (0 for single-modality / v1 files).
+    fn n_modalities(&self) -> u32 {
+        0
+    }
+
+    /// Whether this file carries a modality table (v2 multimodal).
+    fn is_multimodal(&self) -> bool {
+        false
+    }
+
+    /// Ordered modality names, in registration order. Empty for
+    /// single-modality files. Used to render `available: …` in errors.
+    fn modality_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Resolve a modality name to its 1-based `modality_id`, or `None` for
+    /// an unknown name / single-modality file.
+    fn modality_id_by_name(&self, _name: &str) -> Option<u8> {
+        None
+    }
+
+    /// Per-modality var schema. `modality_id == 0` is the global /
+    /// single-modality `var` section.
+    fn read_var_schema_for(&self, modality_id: u8) -> Result<Schema> {
+        if modality_id == 0 {
+            self.read_var_schema()
+        } else {
+            Err(crate::error::EngineError::UnknownModality {
+                requested: modality_id.to_string(),
+                available: self.modality_names(),
+            })
+        }
+    }
+
+    /// Per-modality var RecordBatch. `modality_id == 0` is the global /
+    /// single-modality `var` section.
+    fn read_var_for(&self, modality_id: u8) -> Result<RecordBatch> {
+        if modality_id == 0 {
+            self.read_var()
+        } else {
+            Err(crate::error::EngineError::UnknownModality {
+                requested: modality_id.to_string(),
+                available: self.modality_names(),
+            })
+        }
+    }
+
+    /// Per-modality variable count. `modality_id == 0` returns the
+    /// file-wide `header().n_vars` (single-modality semantics).
+    fn modality_n_vars(&self, modality_id: u8) -> Result<u64> {
+        if modality_id == 0 {
+            Ok(self.header().n_vars)
+        } else {
+            Err(crate::error::EngineError::UnknownModality {
+                requested: modality_id.to_string(),
+                available: self.modality_names(),
+            })
+        }
+    }
+
     /// Raw bytes of the obs predicate index section, if present.
     fn read_obs_predicate_index_bytes(&self) -> Result<Option<Vec<u8>>>;
 
@@ -127,6 +197,45 @@ impl SectionReader for ScxReader {
 
     fn read_var(&self) -> Result<RecordBatch> {
         Ok(ScxReader::read_var(self)?)
+    }
+
+    fn n_modalities(&self) -> u32 {
+        ScxReader::n_modalities(self)
+    }
+
+    fn is_multimodal(&self) -> bool {
+        ScxReader::is_multimodal(self)
+    }
+
+    fn modality_names(&self) -> Vec<String> {
+        ScxReader::modality_names(self)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn modality_id_by_name(&self, name: &str) -> Option<u8> {
+        ScxReader::modality_id(self, name)
+    }
+
+    fn read_var_schema_for(&self, modality_id: u8) -> Result<Schema> {
+        Ok(ScxReader::read_var_schema_for(self, modality_id)?)
+    }
+
+    fn read_var_for(&self, modality_id: u8) -> Result<RecordBatch> {
+        Ok(ScxReader::read_var_for(self, modality_id)?)
+    }
+
+    fn modality_n_vars(&self, modality_id: u8) -> Result<u64> {
+        if modality_id == 0 {
+            return Ok(ScxReader::header(self).n_vars);
+        }
+        ScxReader::modality_info(self, modality_id)
+            .map(|m| m.n_vars)
+            .ok_or_else(|| crate::error::EngineError::UnknownModality {
+                requested: modality_id.to_string(),
+                available: SectionReader::modality_names(self),
+            })
     }
 
     fn read_obs_predicate_index_bytes(&self) -> Result<Option<Vec<u8>>> {
