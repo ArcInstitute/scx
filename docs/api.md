@@ -169,6 +169,9 @@ pub struct ModalityInfo {
 - `modality_id(name)` → `Option<u8>` — name → id resolution.
 - `modality_info(id)` → `Option<&ModalityInfo>` — per-modality record.
 - `read_var_for(modality_id)` — per-modality var as `RecordBatch`.
+- `read_var_schema_for(modality_id)` — per-modality var schema without
+  materialising the batch (`modality_id == 0` → global `var`). Backs the
+  engine's modality-scoped `QueryPipeline`.
 - `read_csr_shard_for(modality_id, shard_idx)` — single shard from
   the modality's CSR shard list.
 - `read_all_csr_shards_for(modality_id)` — concatenated CSR for the
@@ -223,6 +226,28 @@ builds a column-major reader scoped to one modality so multimodal
 training (e.g. totalVI) can hold separate caches per modality without
 LRU thrashing across modalities.
 
+### Modality-scoped queries — `QueryPipeline` (`scx-engine`)
+
+- `QueryPipeline::open_for_modality(path, modality_id: u8)` /
+  `from_reader_for_modality(reader, modality_id)` — scope a query pipeline to
+  one modality (`modality_id == 0` = global / single-modality, the default that
+  `open` / `from_reader` delegate to). X assembly (`csr_shards_for_modality`),
+  the cached `n_vars`, `filter_var`, and `select_genes` resolve against the
+  modality; `filter_obs` evaluates against the shared global obs axis. The
+  Level-2 obs-predicate-index fast path is disabled for modality-scoped queries
+  (its shard ids are keyed to the flattened all-modality shard order); Level-1
+  catalog-stats pruning runs per modality.
+- Errors: `EngineError::UnknownModality { requested, available }`,
+  `ModalityRequired { available }`, and
+  `MultimodalDeletionVectorsUnsupported` (a modality query on a file carrying
+  deletion vectors — DV shard keys are global-flattened; `scx compact` first).
+- The `SectionReader` trait gains modality-aware methods
+  (`read_var_for` / `read_var_schema_for` / `modality_n_vars` /
+  `modality_id_by_name` / `n_modalities` / `is_multimodal` / `modality_names`),
+  with single-modality default impls so non-local backends (cloud) compile
+  unchanged and reject non-zero modality ids until per-modality cloud routing
+  lands.
+
 ### Python (`pyscx`)
 
 - `pyscx.from_mudata(mu, path, codec="auto", ...)` — write a MuData
@@ -233,6 +258,12 @@ LRU thrashing across modalities.
   - `is_multimodal: bool`, `n_modalities: int`, `modality_names: list[str]`.
   - `modality_id(name) -> int | None`, `modality_info(id) -> dict | None`.
   - `to_mudata() -> mudata.MuData` — round-trips back to MuData.
+  - `query(modality="rna")` — modality-scoped predicate pushdown: X /
+    `select_genes` / `filter_var` resolve against that modality's var while
+    `filter_obs` stays on the shared global obs axis. On a multimodal file
+    `modality=` is required (omitting → `ValueError`); unknown name →
+    `KeyError`. Omit it on single-modality files. See
+    [docs/multimodal.md § 3.4](multimodal.md#34-modality-scoped-queries--querymodality).
 - `pyscx.MultimodalTrainingDataset(path, modalities=[…], …)` — yields
   per-batch dicts `{"X": {modality_name: ndarray}, "obs": {...},
   "cell_indices": ndarray}` (or tuples in `return_dict=False` mode). Pins a
@@ -260,6 +291,10 @@ LRU thrashing across modalities.
   `SingleCellExperiment` per modality, shared `colData`).
 - `scx_open(path)$is_multimodal()` / `$modality_names()` — capability
   checks.
+- `scx_query(exp, modality = "rna")` — modality-scoped query pipeline (R
+  equivalent of pyscx `query(modality=…)`). `modality = NULL` is the global /
+  single-modality axis; on a multimodal file a name is required (omitting or an
+  unknown name `stop()`s).
 
 #### Backed (out-of-core) sparse access
 
@@ -394,6 +429,8 @@ CSC sidecars are dropped by these ops and must be rebuilt separately.
 ```
 scx info path.scx                 # Modalities (N): name, type, n_vars, nnz, csr/csc, codec
 scx validate path.scx             # ModalityTable checksum + n_modalities cross-check
+scx query cite.scx --modality rna --filter "cell_type == 'T cell'" --count
+                                  # modality-scoped predicate pushdown (local only)
 scx convert --from h5mu in.h5mu --to scx out.scx          # h5mu → SCX (streaming by default)
 scx convert --to h5ad out.scx out.h5ad --modality rna     # SCX → h5ad (streaming by default)
 scx convert --to h5mu out.scx out.h5mu                    # SCX → h5mu (streaming by default)

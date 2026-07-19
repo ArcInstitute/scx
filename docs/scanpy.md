@@ -97,6 +97,21 @@ trade-offs between memory usage, scanpy compatibility, and performance:
 > pyscx.accel.pca(adata, n_comps=50)                   # streaming
 > ```
 
+> [!TIP]
+> **Multimodal files:** scope the query to one modality with
+> `query(modality="rna")`. The obs predicate resolves against the shared
+> global obs axis; X / `select_genes` resolve against that modality's var:
+> ```python
+> rna = (pyscx.open("citeseq.scx")
+>     .query(modality="rna")
+>     .filter_obs("cell_type == 'T cell'")
+>     .select_genes(["MS4A1", "CD3D"])
+>     .collect()
+>     .to_anndata())
+> ```
+> On a multimodal file `modality=` is required (omitting raises `ValueError`).
+> See [docs/multimodal.md § 3.4](multimodal.md#34-modality-scoped-queries--querymodality).
+
 ## Quick start: in-memory
 
 The simplest approach. `to_anndata()` loads the entire expression matrix into
