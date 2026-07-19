@@ -14,10 +14,11 @@
 
 mod common;
 
-use common::write_multi_shard_fixture;
+use common::{write_known_multinnz_fixture, write_multi_shard_fixture};
 use scx_format_io::{BackedCsrReader, ScxReader};
 use scx_loader::{
-    fused_normalize_log1p_dense, scatter_row_full, HvgProjection, IndexPlanLoader, LoaderConfig,
+    fused_normalize_log1p_dense_with_depth, scatter_row_full, HvgProjection, IndexPlanLoader,
+    LoaderConfig,
 };
 
 const N_OBS: usize = 200;
@@ -60,7 +61,10 @@ fn manual_dense_row(
         None => scatter_row_full(&csr.indices[lo..hi], &csr.data[lo..hi], &mut out).unwrap(),
     }
     if normalize {
-        fused_normalize_log1p_dense(&mut out, target_sum);
+        // Normalize by the FULL pre-projection row depth (matches the loader's
+        // corrected semantics), NOT the panel-local sum of `out`.
+        let depth: f64 = csr.data[lo..hi].iter().map(|&v| v as f64).sum();
+        fused_normalize_log1p_dense_with_depth(&mut out, target_sum, depth);
     }
     out
 }
@@ -215,6 +219,79 @@ fn parity_hvg_projected_normalize_log1p() {
             "HVG+norm ctrl row {c} mismatch"
         );
     }
+}
+
+/// L2 regression: with an HVG projection, `normalize_total` must use the cell's
+/// FULL transcriptome depth as the denominator (scanpy's normalize-then-subset),
+/// NOT the panel-local sum. Uses a fixture where every row has mass both inside
+/// and outside the panel, so the two depths genuinely differ — the fixture in
+/// the other tests has one nonzero per row, which cannot exercise this.
+#[test]
+fn parity_hvg_normalize_uses_full_depth_not_panel() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_known_multinnz_fixture(&dir.path().join("f.scx"), 40, 4);
+
+    // Panel captures genes 2 and 7 (present in every row) but not 33 or 58, so
+    // panel-local depth = v2+v7 is strictly below full depth v2+v7+v33+v58.
+    let hvg_indices = vec![2u32, 7, 40];
+    let hvg = HvgProjection::new(hvg_indices.clone());
+    let n_hvg = hvg.n_output_cols();
+
+    let target_sum = 1.0e4_f64;
+    let loader = build_loader(&path, Some(hvg_indices), true, target_sum, false);
+    let backed = open_backed(&path);
+
+    let plan: Vec<(u64, u64)> = vec![(0, 5), (13, 27), (38, 2), (19, 31)];
+    let batch = loader.process_plan(plan.clone()).unwrap();
+
+    let mut saw_divergence = false;
+    for (i, &(p, c)) in plan.iter().enumerate() {
+        let p_actual = &batch.x[i * n_hvg..(i + 1) * n_hvg];
+        let c_actual = &batch.x_paired[i * n_hvg..(i + 1) * n_hvg];
+
+        // Correct reference: normalize by full transcriptome depth.
+        let p_expected = manual_dense_row(&backed, p, n_hvg, Some(&hvg), true, target_sum);
+        let c_expected = manual_dense_row(&backed, c, n_hvg, Some(&hvg), true, target_sum);
+
+        assert!(
+            allclose(p_actual, &p_expected, 1e-5, 1e-6),
+            "pert row {p}: loader must match full-depth normalize"
+        );
+        assert!(
+            allclose(c_actual, &c_expected, 1e-5, 1e-6),
+            "ctrl row {c}: loader must match full-depth normalize"
+        );
+
+        // The (incorrect) panel-local normalize must differ — otherwise the
+        // test would be vacuous and wouldn't catch a regression.
+        let panel_local = panel_local_normalize(&backed, p, n_hvg, &hvg, target_sum);
+        if !allclose(p_actual, &panel_local, 1e-5, 1e-6) {
+            saw_divergence = true;
+        }
+    }
+    assert!(
+        saw_divergence,
+        "fixture/panel failed to exercise full-depth vs panel-local divergence"
+    );
+}
+
+/// The buggy panel-local computation: scatter into the HVG panel, then normalize
+/// using the PANEL's own sum as depth. Used only to prove the fix diverges from it.
+fn panel_local_normalize(
+    backed: &BackedCsrReader,
+    row: u64,
+    n_output_cols: usize,
+    hvg: &HvgProjection,
+    target_sum: f64,
+) -> Vec<f32> {
+    let csr = backed.read_row_indices(&[row]).unwrap();
+    let lo = csr.indptr[0] as usize;
+    let hi = csr.indptr[1] as usize;
+    let mut out = vec![0f32; n_output_cols];
+    hvg.scatter_row(&csr.indices[lo..hi], &csr.data[lo..hi], &mut out);
+    let panel_sum: f64 = out.iter().map(|&v| v as f64).sum();
+    fused_normalize_log1p_dense_with_depth(&mut out, target_sum, panel_sum);
+    out
 }
 
 /// Sort-by-shard reorders the plan; `pairs` reflects the post-sort order, so

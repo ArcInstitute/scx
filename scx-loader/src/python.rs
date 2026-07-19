@@ -95,9 +95,11 @@ use scx_format_io::ScxReader;
 /// **Recommended for clean shutdown:** call `dataset.close()` (or register
 /// `weakref.finalize(dataset, dataset.close)` at construction time) before
 /// process exit so the rayon pool and I/O thread shut down while the
-/// interpreter is still healthy. `Drop` runs at interpreter teardown as a
-/// fallback but is bounded by a 5-second deadline per thread to avoid
-/// hangs.
+/// interpreter is still healthy. `Drop` runs on garbage-collection /
+/// interpreter teardown as a fallback — bounded by a 5-second deadline per
+/// thread to avoid hangs, and it **releases the GIL for the duration of the
+/// join** (like `close()`) so a slow shutdown never freezes other Python
+/// threads. Still prefer `close()` for prompt, deterministic teardown.
 #[pyclass]
 pub struct TrainingDataset {
     pipeline: TrainingPipeline,
@@ -255,16 +257,22 @@ impl TrainingDataset {
         // Release the GIL while waiting for the next batch from the Rust
         // pipeline. This allows other Python threads (e.g., PyTorch CUDA
         // threads) to run while Stage 2 builds the next batch.
-        let batch_opt = py.detach(|| self.pipeline.next_batch());
+        let batch_res = py.detach(|| self.pipeline.next_batch());
 
-        match batch_opt {
-            Some(batch) => {
+        match batch_res {
+            Ok(Some(batch)) => {
                 let dict = batch_to_dict(py, batch)?;
                 Ok(Some(dict))
             }
-            None => {
+            Ok(None) => {
                 self.epoch_started = false;
                 Ok(None) // StopIteration
+            }
+            Err(e) => {
+                // A mid-epoch I/O/decode fault: end iteration and surface the
+                // error rather than silently truncating the epoch.
+                self.epoch_started = false;
+                Err(loader_err_to_py(e))
             }
         }
     }
@@ -341,6 +349,31 @@ impl TrainingDataset {
             self.pipeline.n_vars(),
             self.pipeline.n_output_genes(),
         )
+    }
+}
+
+impl Drop for TrainingDataset {
+    /// Release the GIL around the pipeline's bounded thread joins on drop.
+    ///
+    /// A `#[pyclass]` is dropped with the GIL held, so `TrainingPipeline`'s
+    /// `Drop` (which bound-joins the I/O + decode threads, up to
+    /// `~2×SHUTDOWN_DEADLINE`) would otherwise stall every other Python thread.
+    /// Mirror `close()` and detach the GIL around the join. `py.detach` only
+    /// wraps the pure-Rust join — it never calls *into* Python — so this is
+    /// safe even mid-finalization, where the finalizing thread holds the GIL
+    /// while destructors run.
+    ///
+    /// `Py_IsInitialized` guards the case where we are dropped *after* the
+    /// interpreter has fully finalized (no GIL to acquire): fall back to an
+    /// in-place shutdown, preserving `TrainingPipeline::drop`'s teardown-safety
+    /// contract. (`Py_IsFinalizing` would be the tighter predicate but is
+    /// `Py_3_13`-gated, so it can't be used on the supported 3.11 baseline.)
+    fn drop(&mut self) {
+        if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
+            Python::attach(|py| py.detach(|| self.pipeline.shutdown()));
+        } else {
+            self.pipeline.shutdown();
+        }
     }
 }
 
@@ -749,22 +782,28 @@ impl MultimodalTrainingDataset {
         // GIL once around all pulls is the simplest correct
         // implementation; with the same seed the pipelines should
         // produce in roughly aligned cadence.
-        let batches_opt: Option<Vec<Batch>> = py.detach(|| {
+        let batches_res: std::result::Result<Option<Vec<Batch>>, LoaderError> = py.detach(|| {
             let mut out = Vec::with_capacity(self.pipelines.len());
             for p in self.pipelines.iter_mut() {
-                match p.next_batch() {
+                match p.next_batch()? {
                     Some(b) => out.push(b),
-                    None => return None,
+                    None => return Ok(None),
                 }
             }
-            Some(out)
+            Ok(Some(out))
         });
 
-        let batches = match batches_opt {
-            Some(b) => b,
-            None => {
+        let batches = match batches_res {
+            Ok(Some(b)) => b,
+            Ok(None) => {
                 self.epoch_started = false;
                 return Ok(None);
+            }
+            Err(e) => {
+                // A mid-epoch fault in any modality's pipeline: end iteration
+                // and surface the error rather than silently truncating.
+                self.epoch_started = false;
+                return Err(loader_err_to_py(e));
             }
         };
 
@@ -848,6 +887,29 @@ impl MultimodalTrainingDataset {
     }
 }
 
+impl Drop for MultimodalTrainingDataset {
+    /// Release the GIL around the per-modality pipeline shutdowns on drop.
+    /// See [`TrainingDataset`]'s `Drop` for the full rationale (pyclass drop
+    /// holds the GIL; the bounded joins would otherwise freeze other Python
+    /// threads; `py.detach` never calls into Python; `Py_IsInitialized` guards
+    /// the post-finalization case). Mirrors this type's `close()`.
+    fn drop(&mut self) {
+        if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
+            Python::attach(|py| {
+                py.detach(|| {
+                    for p in self.pipelines.iter_mut() {
+                        p.shutdown();
+                    }
+                })
+            });
+        } else {
+            for p in self.pipelines.iter_mut() {
+                p.shutdown();
+            }
+        }
+    }
+}
+
 /// Phase H.2 helper: build a `{"X": {name: ndarray}, "obs": {...},
 /// "cell_indices": ndarray}` dict from a slice of per-modality
 /// `Batch`es. Uses the first batch's `obs` and `cell_indices` (cells
@@ -923,13 +985,15 @@ fn build_multimodal_batch_dict<'py>(
 /// `TrainingDataset`. Because `IndexPlanLoader` does *not* use rayon's
 /// global pool (its prefetch goes via `tokio::spawn_blocking` and
 /// `std::thread::spawn`), the rayon-after-fork hazard that motivated
-/// Phase 2.0 for `TrainingDataset` does **not** apply here. The remaining
-/// concern is the eager `tokio::runtime::Builder::new_multi_thread()` built
-/// in `IndexPlanLoader::new()` (`scx-loader/src/index_plan.rs:276`); under
-/// the lazy-construct-in-worker pattern that runtime is built fresh in the
-/// worker process, so the parent's runtime threads are never inherited.
-/// The eager-construct-then-fork case is caught by the PID check in
-/// `iter_with_plans` / `next_batch_for_test`.
+/// Phase 2.0 for `TrainingDataset` does **not** apply here. The multi-threaded
+/// tokio runtime is, moreover, **not** built eagerly in `IndexPlanLoader::new()`
+/// — it is constructed lazily on first use in `IndexPlanLoader::runtime()`
+/// (a `OnceLock<Runtime>` in `scx-loader/src/index_plan.rs`), whose first touch
+/// is always from an `IndexPlanIter`, post-fork in the `DataLoader` worker. So
+/// the loader never owns runtime threads at the moment a child is forked, and
+/// each worker builds its own runtime fresh; the parent's runtime threads are
+/// never inherited. The construct-then-fork case is additionally caught by the
+/// PID check in `iter_with_plans` / `next_batch_for_test`.
 ///
 /// **Acceptance test**: `pyscx/tests/test_fork_safety.py::test_fork_index_plan_dataset`
 /// pins this contract end-to-end (multiprocessing.fork + lazy worker

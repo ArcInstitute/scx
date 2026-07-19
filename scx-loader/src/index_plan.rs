@@ -640,6 +640,11 @@ impl IndexPlanLoader {
 
         let mut x = vec![0f32; n_pairs * n_cols];
         let mut x_paired = vec![0f32; n_pairs * n_cols];
+        // Full pre-projection depth per output slot (see `scatter_pair_request`).
+        // Used as the normalize denominator so an HVG-projected panel normalizes
+        // by full transcriptome depth, not the panel-local sum.
+        let mut depth_x = vec![0f64; n_pairs];
+        let mut depth_x_paired = vec![0f64; n_pairs];
         let mut pert_indices = Vec::with_capacity(n_pairs);
         let mut ctrl_indices = Vec::with_capacity(n_pairs);
 
@@ -678,9 +683,16 @@ impl IndexPlanLoader {
             .backed
             .read_rows_with(&unique_rows, |orig_pos, idx, data| {
                 for &request in &row_to_requests[orig_pos] {
-                    if let Err(e) =
-                        self.scatter_pair_request(request, idx, data, n_cols, &mut x, &mut x_paired)
-                    {
+                    if let Err(e) = self.scatter_pair_request(
+                        request,
+                        idx,
+                        data,
+                        n_cols,
+                        &mut x,
+                        &mut x_paired,
+                        &mut depth_x,
+                        &mut depth_x_paired,
+                    ) {
                         // Stash the real LoaderError and abort iteration with a
                         // sentinel ScxError (the closure must return ScxError).
                         scatter_err = Some(e);
@@ -708,6 +720,7 @@ impl IndexPlanLoader {
                     self.config.normalize,
                     self.config.log1p,
                     self.config.target_sum,
+                    depth_x[i],
                 );
                 let c_out = &mut x_paired[i * n_cols..][..n_cols];
                 apply_dense_transforms(
@@ -715,6 +728,7 @@ impl IndexPlanLoader {
                     self.config.normalize,
                     self.config.log1p,
                     self.config.target_sum,
+                    depth_x_paired[i],
                 );
             }
         }
@@ -727,6 +741,7 @@ impl IndexPlanLoader {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scatter_pair_request(
         &self,
         request: PairRequest,
@@ -735,6 +750,8 @@ impl IndexPlanLoader {
         n_cols: usize,
         x: &mut [f32],
         x_paired: &mut [f32],
+        depth_x: &mut [f64],
+        depth_x_paired: &mut [f64],
     ) -> Result<()> {
         let out = match request.side {
             PairSide::Perturbed => &mut x[request.pair_idx * n_cols..][..n_cols],
@@ -754,6 +771,19 @@ impl IndexPlanLoader {
             match self.hvg_projection.as_ref() {
                 Some(hvg) => hvg.scatter_row(idx, data, out),
                 None => scatter_row_full(idx, data, out)?,
+            }
+            // Record the cell's FULL pre-projection depth (`data` is the full
+            // row's stored nonzeros) for the post-scatter normalize dispatch.
+            // With an HVG projection `out` holds only the panel genes, so its
+            // own sum would be a panel-local depth that diverges from scanpy's
+            // normalize-then-subset semantics. Only needed when normalizing —
+            // the depth vectors stay 0.0 (and are ignored) otherwise.
+            if self.config.normalize {
+                let depth: f64 = data.iter().map(|&v| v as f64).sum();
+                match request.side {
+                    PairSide::Perturbed => depth_x[request.pair_idx] = depth,
+                    PairSide::Control => depth_x_paired[request.pair_idx] = depth,
+                }
             }
         }
         Ok(())

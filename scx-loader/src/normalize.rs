@@ -8,25 +8,45 @@
 //! data layout differs: these functions operate on `&mut [f32]` dense rows
 //! where zero values are explicitly stored.
 
-/// Normalize a dense row to a target sum (in-place).
+/// Normalize a dense row to a target sum using an **explicit depth** as the
+/// denominator (in-place).
+///
+/// `row[i] = row[i] / depth * target_sum`
+///
+/// `depth` is the cell's total count over the **full transcriptome** — NOT
+/// necessarily `row.iter().sum()`. When `row` is an HVG-projected panel, its
+/// own sum is the panel-local depth, which is a different statistic from
+/// scanpy's `normalize_total` (computed over full depth, then subset to HVGs)
+/// and from the pflog1ppf sibling ([`pflog1ppf_depth_baseline`], full `s_i`).
+/// Passing the full-row depth here keeps the panel path consistent with both.
+///
+/// Zero values remain zero (0.0 × factor = 0.0). If `depth <= 0.0` the row is
+/// left unchanged (no division by zero).
+pub fn normalize_dense_row_with_depth(row: &mut [f32], target_sum: f64, depth: f64) {
+    if depth > 0.0 {
+        let factor = target_sum / depth;
+        for v in row.iter_mut() {
+            *v = (*v as f64 * factor) as f32;
+        }
+    }
+}
+
+/// Normalize a dense row to a target sum (in-place), deriving the depth from
+/// the row's own sum.
 ///
 /// Equivalent to `scanpy.pp.normalize_total` for one row:
 ///   `row[i] = row[i] / row_sum * target_sum`
 ///
-/// Zero values remain zero (0.0 × factor = 0.0). If the row sum is zero,
-/// the row is left unchanged (no division by zero).
+/// Convenience wrapper over [`normalize_dense_row_with_depth`] for callers
+/// whose `row` **is** the full transcriptome (no HVG projection). Projected
+/// callers must use [`normalize_dense_row_with_depth`] with the full-row depth.
 ///
 /// # Arguments
 /// - `row`: Dense row of f32 values to normalize in-place.
 /// - `target_sum`: Target sum for normalization (e.g., 1e4).
 pub fn normalize_dense_row(row: &mut [f32], target_sum: f64) {
     let row_sum: f64 = row.iter().map(|&v| v as f64).sum();
-    if row_sum > 0.0 {
-        let factor = target_sum / row_sum;
-        for v in row.iter_mut() {
-            *v = (*v as f64 * factor) as f32;
-        }
-    }
+    normalize_dense_row_with_depth(row, target_sum, row_sum);
 }
 
 /// Apply `ln(x + 1)` to each element of a dense row (in-place).
@@ -42,12 +62,34 @@ pub fn log1p_dense_row(row: &mut [f32]) {
     }
 }
 
-/// Fused normalize + log1p for a dense row (single pass, in-place).
+/// Fused normalize + log1p for a dense row using an **explicit depth** as the
+/// normalization denominator (single pass, in-place).
+///
+/// Computes `row[i] = ln(row[i] * target_sum / depth + 1.0)` in a single pass.
+/// See [`normalize_dense_row_with_depth`] for why `depth` is the full-row
+/// depth rather than `row.iter().sum()` on the HVG-projected path.
+///
+/// Zeros produce `ln(0.0 * factor + 1.0) = ln(1.0) = 0.0`, staying zero.
+/// `depth <= 0.0` leaves the row unchanged (all-zero → still zero).
+pub fn fused_normalize_log1p_dense_with_depth(row: &mut [f32], target_sum: f64, depth: f64) {
+    if depth > 0.0 {
+        let factor = target_sum / depth;
+        for v in row.iter_mut() {
+            // Scale in f64 for precision, cast to f32, then f32 ln for speed.
+            // Numerically matches sequential normalize→log1p path.
+            *v = ((*v as f64 * factor) as f32 + 1.0).ln();
+        }
+    }
+}
+
+/// Fused normalize + log1p for a dense row (single pass, in-place), deriving
+/// the depth from the row's own sum.
 ///
 /// Computes `row[i] = ln(row[i] * target_sum / row_sum + 1.0)` in a single
 /// pass, avoiding two separate traversals of the dense row.
 ///
-/// Zeros produce `ln(0.0 * factor + 1.0) = ln(1.0) = 0.0`, staying zero.
+/// Convenience wrapper over [`fused_normalize_log1p_dense_with_depth`] for
+/// callers whose `row` **is** the full transcriptome (no HVG projection).
 ///
 /// **Numerical note**: The fused version may produce slightly different f32
 /// results compared to sequential normalize-then-log1p due to intermediate
@@ -58,14 +100,7 @@ pub fn log1p_dense_row(row: &mut [f32]) {
 /// - `target_sum`: Target sum for normalization (e.g., 1e4).
 pub fn fused_normalize_log1p_dense(row: &mut [f32], target_sum: f64) {
     let row_sum: f64 = row.iter().map(|&v| v as f64).sum();
-    if row_sum > 0.0 {
-        let factor = target_sum / row_sum;
-        for v in row.iter_mut() {
-            // Scale in f64 for precision, cast to f32, then f32 ln for speed.
-            // Numerically matches sequential normalize→log1p path.
-            *v = ((*v as f64 * factor) as f32 + 1.0).ln();
-        }
-    }
+    fused_normalize_log1p_dense_with_depth(row, target_sum, row_sum);
 }
 
 /// Apply the configured dense-row transforms in-place.
@@ -84,11 +119,23 @@ pub fn fused_normalize_log1p_dense(row: &mut [f32], target_sum: f64) {
 /// - `normalize`: Whether to apply total-count normalization.
 /// - `log1p`: Whether to apply `ln(x + 1)` element-wise.
 /// - `target_sum`: Target sum for normalization (ignored if `normalize` is false).
+/// - `depth`: The normalization denominator — the cell's total count over the
+///   **full transcriptome**. Callers whose `row` is HVG-projected MUST pass the
+///   full pre-projection row sum here, not the panel-local sum, so normalization
+///   matches scanpy's normalize-then-subset and the pflog1ppf path. For a
+///   full-transcriptome `row` this equals `row.iter().sum()`. Ignored when
+///   `normalize == false`.
 #[inline]
-pub fn apply_dense_transforms(row: &mut [f32], normalize: bool, log1p: bool, target_sum: f64) {
+pub fn apply_dense_transforms(
+    row: &mut [f32],
+    normalize: bool,
+    log1p: bool,
+    target_sum: f64,
+    depth: f64,
+) {
     match (normalize, log1p) {
-        (true, true) => fused_normalize_log1p_dense(row, target_sum),
-        (true, false) => normalize_dense_row(row, target_sum),
+        (true, true) => fused_normalize_log1p_dense_with_depth(row, target_sum, depth),
+        (true, false) => normalize_dense_row_with_depth(row, target_sum, depth),
         (false, true) => log1p_dense_row(row),
         (false, false) => {}
     }
@@ -285,7 +332,8 @@ mod tests {
     fn test_apply_normalize_and_log1p_matches_fused() {
         let target = 1e4_f64;
         let mut a = sample_row();
-        apply_dense_transforms(&mut a, true, true, target);
+        let depth: f64 = a.iter().map(|&v| v as f64).sum();
+        apply_dense_transforms(&mut a, true, true, target, depth);
 
         let mut b = sample_row();
         fused_normalize_log1p_dense(&mut b, target);
@@ -299,7 +347,8 @@ mod tests {
     fn test_apply_normalize_only_matches_normalize_dense_row() {
         let target = 1e4_f64;
         let mut a = sample_row();
-        apply_dense_transforms(&mut a, true, false, target);
+        let depth: f64 = a.iter().map(|&v| v as f64).sum();
+        apply_dense_transforms(&mut a, true, false, target, depth);
 
         let mut b = sample_row();
         normalize_dense_row(&mut b, target);
@@ -315,7 +364,9 @@ mod tests {
     #[test]
     fn test_apply_log1p_only_matches_log1p_dense_row() {
         let mut a = sample_row();
-        apply_dense_transforms(&mut a, false, true, /*ignored*/ 1.0);
+        apply_dense_transforms(
+            &mut a, false, true, /*ignored*/ 1.0, /*depth ignored*/ 0.0,
+        );
 
         let mut b = sample_row();
         log1p_dense_row(&mut b);
@@ -329,7 +380,52 @@ mod tests {
     fn test_apply_no_transform_is_identity() {
         let mut a = sample_row();
         let original = a.clone();
-        apply_dense_transforms(&mut a, false, false, 0.0);
+        apply_dense_transforms(&mut a, false, false, 0.0, 0.0);
         assert_eq!(a, original);
+    }
+
+    // ---- explicit-depth normalization (L2 fix) ----
+
+    /// The normalization denominator is the supplied `depth`, NOT the row's own
+    /// sum. This is what makes the HVG-projected loader path normalize by full
+    /// transcriptome depth (scanpy's normalize-then-subset), not the panel sum.
+    #[test]
+    fn test_normalize_with_depth_uses_explicit_depth() {
+        // Panel row (a 2-gene HVG subset). Its own sum is 15, but the cell's
+        // full-transcriptome depth is 100 (expression outside the panel).
+        let mut row = vec![5.0f32, 10.0];
+        let full_depth = 100.0_f64;
+        let target = 1e4_f64;
+        normalize_dense_row_with_depth(&mut row, target, full_depth);
+
+        // Scaled by target/full_depth = 100, NOT target/15.
+        assert!((row[0] - 500.0).abs() < 1e-2, "got {}", row[0]);
+        assert!((row[1] - 1000.0).abs() < 1e-2, "got {}", row[1]);
+
+        // And it differs from the panel-local (self-sum) result.
+        let mut panel_local = vec![5.0f32, 10.0];
+        normalize_dense_row(&mut panel_local, target);
+        assert!(
+            (panel_local[0] - row[0]).abs() > 1.0,
+            "explicit full-depth must diverge from panel-local normalize"
+        );
+    }
+
+    /// `apply_dense_transforms` threads the explicit depth through to the fused
+    /// path identically to a direct `*_with_depth` call.
+    #[test]
+    fn test_apply_dense_transforms_honors_depth() {
+        let target = 1e4_f64;
+        let full_depth = 250.0_f64;
+
+        let mut a = vec![0.0f32, 5.0, 0.0, 10.0];
+        apply_dense_transforms(&mut a, true, true, target, full_depth);
+
+        let mut b = vec![0.0f32, 5.0, 0.0, 10.0];
+        fused_normalize_log1p_dense_with_depth(&mut b, target, full_depth);
+
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-7);
+        }
     }
 }

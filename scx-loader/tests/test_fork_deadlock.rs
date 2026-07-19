@@ -82,7 +82,7 @@ fn run_one_epoch(path: &std::path::Path) -> usize {
     pipeline.start_epoch().expect("start_epoch");
 
     let mut n_batches = 0;
-    while let Some(batch) = pipeline.next_batch() {
+    while let Some(batch) = pipeline.next_batch().expect("next_batch") {
         n_batches += 1;
         // Touch the data so the optimizer can't elide the read.
         let _ = batch.n_rows();
