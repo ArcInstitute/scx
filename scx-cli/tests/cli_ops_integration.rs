@@ -116,6 +116,74 @@ fn write_test_file(
     path
 }
 
+/// Write a 2-modality test SCX file (`rna`: `rna_vars`, `adt`: `adt_vars`) over a
+/// shared `n_obs` obs axis with the global `cell_type` column from [`sample_obs`].
+/// Each modality has one CSR shard tiling `[0, n_obs)`; row `r` in modality m
+/// expresses gene `r % m_vars`. Mirrors the crate-private `test_utils` helper,
+/// which is `#![cfg(test)]`-private and unreachable from this external test crate
+/// (scx-cli exposes no `[lib]` target).
+fn write_multimodal_test_file(
+    dir: &tempfile::TempDir,
+    filename: &str,
+    n_obs: usize,
+    rna_vars: usize,
+    adt_vars: usize,
+) -> PathBuf {
+    use scx_format_io::modality::ModalityType;
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, rna_vars.max(adt_vars) as u64, n_obs as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var(rna_vars)).unwrap();
+    writer.write_var_for(adt_id, &sample_var(adt_vars)).unwrap();
+    writer.set_modality_n_vars(rna_id, rna_vars as u64).unwrap();
+    writer.set_modality_n_vars(adt_id, adt_vars as u64).unwrap();
+
+    for (id, m_vars) in [(rna_id, rna_vars), (adt_id, adt_vars)] {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for r in 0..n_obs {
+            indices.push((r % m_vars) as u32);
+            values.push(((r + 1) % 256) as u8);
+            indptr.push(indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard_for(
+                id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+    }
+
+    writer.finish().unwrap();
+    path
+}
+
 fn scx_cli() -> std::process::Command {
     std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
 }
@@ -220,6 +288,103 @@ fn test_lifecycle_append_delete_compact() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("passed"));
+}
+
+// ---------------------------------------------------------------------------
+// Multimodal delete lifecycle: build 2-modality file → delete --filter →
+//                              info (shows deletion vectors) → compact → validate
+// ---------------------------------------------------------------------------
+
+/// A whole-cell delete on a multimodal file removes the cell from every
+/// modality. This exercises the per-modality deletion-vector path end-to-end
+/// through the `scx` binary: an obs predicate delete, the `info` deletion
+/// summary, and a multimodal compact that physically reclaims the rows from
+/// both modalities.
+#[test]
+fn test_lifecycle_multimodal_delete_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    // 12 cells; rows 0,3,6,9 are "T cell" (cell_type cycles T/B/NK).
+    let target = write_multimodal_test_file(&dir, "mm_target.scx", 12, 8, 4);
+
+    // Initial info — should report a multimodal file with 12 cells.
+    let output = scx_cli()
+        .args(["info", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "info failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("12 cells"));
+
+    // Delete the T cells (rows 0,3,6,9 → 4 cells) via an obs predicate.
+    let output = scx_cli()
+        .args([
+            "delete",
+            target.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'T cell'",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "delete failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Deleted"));
+    assert!(stdout.contains("cells matching"));
+
+    // Info after delete — should surface the deletion vectors flag.
+    let output = scx_cli()
+        .args(["info", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("deletion_vectors"));
+
+    // Compact — physically reclaims the 4 deleted cells from both modalities.
+    let compacted = dir.path().join("mm_compacted.scx");
+    let output = scx_cli()
+        .args([
+            "compact",
+            target.to_str().unwrap(),
+            compacted.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "compact failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Compacted"));
+
+    // Compacted file: logical n_obs dropped to 8, both modalities aligned.
+    let reader = ScxReader::open(&compacted).unwrap();
+    assert_eq!(reader.header().n_obs, 8, "12 - 4 T cells");
+    let rna_id = reader.modality_id("rna").unwrap();
+    let adt_id = reader.modality_id("adt").unwrap();
+    for m in [rna_id, adt_id] {
+        let csr = reader.read_all_csr_shards_for(m).unwrap();
+        assert_eq!(csr.shape.0, 8, "modality {m} row count after compact");
+    }
+
+    // Validate the compacted multimodal file.
+    let output = scx_cli()
+        .args(["validate", compacted.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "validate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("passed"));
 }
 
 // ---------------------------------------------------------------------------
