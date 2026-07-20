@@ -224,3 +224,72 @@ test_that("scx_open(...)$to_mae() reconstructs a MultiAssayExperiment", {
     c("rna", "adt")
   )
 })
+
+
+# --- Multimodal whole-cell delete ---------------------------------------------
+# A whole-cell scx_delete on a multimodal file removes the cell from every
+# modality. Before compact, a modality-scoped query already reflects the
+# deletion (the engine applies the global deletion bitmap to each modality);
+# after compact the physical n_obs drops for both modalities. Builds the file
+# via from_seurat (like the query test) so it skips cleanly without Seurat.
+
+test_that("scx_delete on a multimodal file removes the cell from every modality", {
+  skip_if_not_installed("Seurat", minimum_version = "5.0.0")
+  skip_if_not_installed("Matrix")
+
+  set.seed(11)
+  n_cells <- 18
+  rna_n <- 9
+  adt_n <- 4
+  rna_counts <- Matrix::Matrix(
+    matrix(rpois(rna_n * n_cells, lambda = 0.6), nrow = rna_n, ncol = n_cells),
+    sparse = TRUE
+  )
+  adt_counts <- Matrix::Matrix(
+    matrix(rpois(adt_n * n_cells, lambda = 0.6), nrow = adt_n, ncol = n_cells),
+    sparse = TRUE
+  )
+  rownames(rna_counts) <- paste0("g", seq_len(rna_n))
+  rownames(adt_counts) <- paste0("a", seq_len(adt_n))
+  colnames(rna_counts) <- paste0("cell_", seq_len(n_cells))
+  colnames(adt_counts) <- paste0("cell_", seq_len(n_cells))
+
+  seu <- Seurat::CreateSeuratObject(counts = rna_counts, assay = "rna")
+  seu[["adt"]] <- SeuratObject::CreateAssay5Object(counts = adt_counts)
+
+  path <- tempfile(fileext = ".scx")
+  on.exit(unlink(path), add = TRUE)
+  from_seurat(seu, path)
+
+  # Delete three cells (1-based R indices).
+  deleted <- c(2L, 7L, 15L)
+  total <- scx_delete(path, deleted)
+  expect_equal(total, length(deleted))
+
+  # Before compact: a modality-scoped query drops the deleted rows from each
+  # modality (deletion applies to the shared global obs axis). This is the R
+  # equivalent of the CLI/engine "modality query with deletions succeeds" test.
+  kept <- n_cells - length(deleted)
+  rna <- scx_open(path) |> scx_query(modality = "rna") |> collect()
+  expect_equal(rna$n_obs(), kept)
+  expect_equal(rna$n_vars(), rna_n)
+  adt <- scx_open(path) |> scx_query(modality = "adt") |> collect()
+  expect_equal(adt$n_obs(), kept)
+  expect_equal(adt$n_vars(), adt_n)
+
+  # After compact: the deletions are physically reclaimed and n_obs drops.
+  out <- tempfile(fileext = ".scx")
+  on.exit(unlink(out), add = TRUE)
+  scx_compact(path, out)
+  expect_equal(scx_info(out)$n_obs, kept)
+  expect_true(scx_validate(out))
+
+  # Compacted file is still multimodal with both modalities aligned.
+  exp_out <- scx_open(out)
+  expect_true(exp_out$is_multimodal())
+  expect_setequal(exp_out$modality_names(), c("rna", "adt"))
+  rna_c <- scx_open(out) |> scx_query(modality = "rna") |> collect()
+  adt_c <- scx_open(out) |> scx_query(modality = "adt") |> collect()
+  expect_equal(rna_c$n_obs(), kept)
+  expect_equal(adt_c$n_obs(), kept)
+})

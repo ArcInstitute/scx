@@ -31,11 +31,21 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
     // Reject any index >= n_obs before mutating the file. Without this guard
     // such indices silently fall outside the shard range search below and the
     // returned total_deleted omits them, making user mistakes look successful.
+    // Also reject indices past the u32 ceiling: v2 deletion vectors store global
+    // obs rows in a u32-keyed RoaringBitmap, so `idx as u32` below would wrap and
+    // mark the WRONG cell deleted on a (hypothetical) file with n_obs > 2^32.
+    // Fail loud instead of silently corrupting.
     for &idx in cell_indices {
         if idx >= header.n_obs {
             return Err(OpsError::CellIndexOutOfBounds {
                 index: idx,
                 n_obs: header.n_obs,
+            });
+        }
+        if idx > u32::MAX as u64 {
+            return Err(OpsError::CellIndexExceedsDeletionLimit {
+                index: idx,
+                max: u32::MAX as u64,
             });
         }
     }
@@ -60,7 +70,12 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
             lock.seek(SeekFrom::Start(dv_entry.offset))?;
             let mut buf = vec![0u8; dv_entry.length as usize];
             std::io::Read::read_exact(&mut lock, &mut buf)?;
-            DeletionVectors::read_from(&mut Cursor::new(&buf), buf.len())?
+            let mut existing = DeletionVectors::read_from(&mut Cursor::new(&buf), buf.len())?;
+            // Writers always emit v2, so fold a legacy v1 (per-shard) section to
+            // the v2 global representation before merging/serializing — otherwise
+            // its pre-existing deletions would be dropped by the v2 `write_to`.
+            existing.fold_v1_to_global(&catalog);
+            existing
         } else {
             DeletionVectors::new()
         }
@@ -68,33 +83,12 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         DeletionVectors::new()
     };
 
-    // Get shard stats sorted by row_start to map global indices -> (shard_id, local_row).
-    // Use the sort-order index as shard_id. This is safe because deletion vectors are
-    // always stored in the same catalog as the shards they reference, and shards_sorted()
-    // is deterministic (sorted by row_start). The compact operation reads DVs and shards
-    // from the same catalog, so the mapping is consistent.
-    let shards = catalog.shards_sorted();
-    let shard_ranges: Vec<(u32, u64, u64)> = shards
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| e.stats.as_ref().map(|s| (i as u32, s.row_start, s.row_end)))
-        .collect();
-
-    // Map cell indices to per-shard bitmaps.
-    // shard_ranges is sorted by row_start, so use binary search (O(n log m))
-    // instead of linear scan (O(n × m)).
+    // Deletion vectors are v2 global-obs bitmaps: record each validated global
+    // cell index directly under the whole-cell (modality 0) key. No shard
+    // mapping — a global bitmap over `[0, n_obs)` applies identically to every
+    // modality's CSR shards, so a multimodal delete is correct by construction.
     let mut new_dv = DeletionVectors::new();
-    for &global_idx in cell_indices {
-        // Find the first shard whose row_end > global_idx
-        let shard_idx = shard_ranges.partition_point(|&(_, _, end)| end <= global_idx);
-        if shard_idx < shard_ranges.len() {
-            let (shard_id, row_start, _) = shard_ranges[shard_idx];
-            if global_idx >= row_start {
-                let local_row = (global_idx - row_start) as u32;
-                new_dv.shards.entry(shard_id).or_default().insert(local_row);
-            }
-        }
-    }
+    new_dv.insert_global(cell_indices.iter().map(|&idx| idx as u32));
 
     // Merge new deletions into existing
     dv.merge(&new_dv);
@@ -250,4 +244,104 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
     finalize_header_with_checksum(&mut lock, &mut header)?;
 
     Ok(dv.total_deleted())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Safety net for the per-modality deletion-vector rewrite (DV wire format
+    //! v1 → v2: global-obs-indexed bitmaps keyed by modality, replacing the
+    //! flattened positional-shard keying).
+    //!
+    //! Must-stay-green set the DV v1→v2 rewrite must not regress:
+    //!   - `scx-format-io/src/deletion_vectors.rs` unit tests (round_trip,
+    //!     merge_vectors, build_keep_mask_translates_local_rows_to_global,
+    //!     read_rejects_unknown_version, check_version_rejects_future,
+    //!     empty_round_trip, sorted_serialization_byte_stable,
+    //!     dv_rejects_oversized_n_shards, dv_rejects_oversized_bitmap_len)
+    //!   - `scx-ops/tests/integration.rs`: test_delete_marks_cells,
+    //!     test_mark_deleted_rejects_oob_indices, test_delete_filtered_read,
+    //!     test_delete_then_compact, test_delete_idempotent
+    //!   - `pyscx/tests/test_ops.py`: test_mark_deleted_*,
+    //!     test_n_obs_reflects_deletions, test_compact
+    //!   - `rscx/tests/testthat/test-ops.R`: delete / compact / rollback
+    //!   - conformance `v1_deletion_vectors` validators (Rust + pyscx) plus the
+    //!     Phase 0 back-compat anchor
+    //!     `conformance_vectors::test_v1_deletion_vectors_backcompat_read_baseline`
+    use crate::test_utils::{fixture_multimodal, fixture_multimodal_multishard};
+    use scx_format_io::ScxReader;
+
+    /// GREEN lock: on the single-shard-per-modality fixture the common eager
+    /// filtered read is already correct today (the v1 `local = idx - row_start`
+    /// / `global = row_start + local` arithmetic cancels for single-shard
+    /// modalities). The DV v2 rewrite must keep this path correct.
+    #[test]
+    fn delete_multimodal_eager_read_drops_rows_from_all_modalities() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_multimodal(&dir);
+        let deleted = [3u64, 7];
+        let n = crate::mark_deleted(&path, &deleted).unwrap();
+        assert_eq!(n, deleted.len() as u64);
+
+        let reader = ScxReader::open(&path).unwrap();
+        let rna_id = reader.modality_id("rna").unwrap();
+        let adt_id = reader.modality_id("adt").unwrap();
+        for m in [rna_id, adt_id] {
+            let csr = reader.read_all_csr_shards_for_filtered(m).unwrap();
+            assert_eq!(csr.shape.0, 10, "modality {m}: 12 - 2 deleted rows");
+            assert_eq!(csr.nnz(), 20, "modality {m}: 10 rows x 2 nnz");
+        }
+    }
+
+    /// GREEN lock (multi-shard-per-modality): deleting a global cell must drop
+    /// that row from EVERY modality's *eager* filtered read and keep every
+    /// modality cell-aligned. Notably this already holds under the v1
+    /// positional-shard mapping — even though `shards_sorted()` +
+    /// `partition_point` runs over overlapping per-modality ranges, the write
+    /// side's `local = idx - row_start` and the read side's
+    /// `global = row_start + local` cancel through the *same* flattened list, so
+    /// the obs-length keep-mask is reconstructed correctly. The v1 bug is
+    /// therefore confined to per-modality DV *resolution* (only one modality's
+    /// bitmap is marked) and the engine's modality-scoped-query guard — not this
+    /// eager path. The DV v2 rewrite must keep this lock green.
+    #[test]
+    fn delete_multimodal_multishard_marks_all_modalities() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_multimodal_multishard(&dir);
+        // Rows chosen to land in non-first shards of each modality.
+        let deleted = [3u64, 8, 10];
+        let n = crate::mark_deleted(&path, &deleted).unwrap();
+        assert_eq!(n, deleted.len() as u64);
+
+        let reader = ScxReader::open(&path).unwrap();
+        let rna_id = reader.modality_id("rna").unwrap();
+        let adt_id = reader.modality_id("adt").unwrap();
+        let expect_rows = 12 - deleted.len();
+        for m in [rna_id, adt_id] {
+            let csr = reader.read_all_csr_shards_for_filtered(m).unwrap();
+            assert_eq!(
+                csr.shape.0, expect_rows,
+                "modality {m} must drop every deleted row"
+            );
+            assert_eq!(csr.nnz(), expect_rows * 2, "modality {m} row-alignment");
+        }
+    }
+
+    /// The payoff of the per-modality deletion-vector feature: a modality-scoped
+    /// engine query against a multimodal file that carries deletion vectors now
+    /// **succeeds** (the old guard that rejected it is gone) and applies the
+    /// whole-cell deletion to the queried modality's X.
+    #[test]
+    fn modality_scoped_query_with_deletions_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_multimodal(&dir); // n_obs = 12
+        crate::mark_deleted(&path, &[4]).unwrap();
+
+        let rna_id = ScxReader::open(&path).unwrap().modality_id("rna").unwrap();
+        let result = scx_engine::QueryPipeline::open_for_modality(&path, rna_id)
+            .unwrap()
+            .collect()
+            .unwrap();
+        // The deleted global cell (row 4) is dropped from the modality's X.
+        assert_eq!(result.x.n_rows(), 11);
+    }
 }

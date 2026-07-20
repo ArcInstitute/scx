@@ -296,10 +296,39 @@ fn test_delete_marks_cells() {
 
     let dv = reader.read_deletion_vectors().unwrap().unwrap();
     assert_eq!(dv.total_deleted(), 3);
-    assert!(dv.is_deleted(0, 0));
-    assert!(dv.is_deleted(0, 3));
-    assert!(dv.is_deleted(0, 5));
-    assert!(!dv.is_deleted(0, 1));
+    assert!(dv.is_deleted_global(0));
+    assert!(dv.is_deleted_global(3));
+    assert!(dv.is_deleted_global(5));
+    assert!(!dv.is_deleted_global(1));
+}
+
+/// Appending a delete onto a file that still carries a legacy **v1** deletion
+/// vector must fold the existing v1 (per-shard) deletions to the v2 global
+/// representation and preserve them — not drop them. Uses the committed v1
+/// golden fixture (n_obs=40, existing deletes {2,5,11,13,28}).
+#[test]
+fn test_delete_appends_onto_v1_deletion_vectors() {
+    let golden = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/reference_files/v1_deletion_vectors.scx");
+    if !golden.exists() {
+        return; // fixture absent (mirrors the conformance anchor's skip)
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1_append.scx");
+    std::fs::copy(&golden, &path).unwrap();
+
+    // Delete two more rows, disjoint from the existing v1 set.
+    let total = scx_ops::mark_deleted(&path, &[0, 39]).unwrap();
+    assert_eq!(total, 7, "5 pre-existing v1 deletes + 2 new");
+
+    let reader = ScxReader::open(&path).unwrap();
+    let dv = reader.read_deletion_vectors().unwrap().unwrap();
+    assert_eq!(dv.total_deleted(), 7);
+    // The pre-existing v1 deletions were folded and preserved, plus the new two.
+    for row in [0u32, 2, 5, 11, 13, 28, 39] {
+        assert!(dv.is_deleted_global(row), "row {row} must be deleted");
+    }
+    assert!(!dv.is_deleted_global(1), "survivor row 1 must remain");
 }
 
 #[test]

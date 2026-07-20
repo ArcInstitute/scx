@@ -327,10 +327,13 @@ pub fn optimize_with_framing(
         writer.write_uns(&uns)?;
     }
 
-    // Deletion vectors are carried through unchanged (optimize does not apply
-    // them — that is `compact`'s job). The section references obs row ranges /
-    // shard ids, both preserved here, so it stays valid; `write_deletion_vectors`
-    // re-sets the header flag (cleared above) so it is set iff the section exists.
+    // Deletion vectors are carried through (optimize does not apply them — that
+    // is `compact`'s job). v2 deletion vectors store global obs row indices,
+    // independent of shard layout, and optimize preserves the obs ordering, so
+    // the section stays valid; a legacy v1 section is folded to v2 by
+    // `read_deletion_vectors`, so `write_deletion_vectors` re-emits v2 bytes.
+    // It also re-sets the header flag (cleared above) so it is set iff the
+    // section exists.
     if let Some(dv) = reader.read_deletion_vectors()? {
         writer.write_deletion_vectors(&dv)?;
     }
@@ -702,7 +705,6 @@ mod tests {
 
     #[test]
     fn optimize_preserves_deletion_vectors() {
-        use roaring::RoaringBitmap;
         use scx_format_io::deletion_vectors::DeletionVectors;
 
         let dir = tempfile::tempdir().unwrap();
@@ -728,11 +730,9 @@ mod tests {
                 0,
             )
             .unwrap();
-            // Mark local row 1 of shard 0 as logically deleted.
+            // Mark global row 1 as logically deleted (single shard, row_start 0).
             let mut dv = DeletionVectors::new();
-            let mut bm = RoaringBitmap::new();
-            bm.insert(1);
-            dv.insert(0, bm);
+            dv.insert_global([1u32]);
             w.write_deletion_vectors(&dv).unwrap();
             w.finish().unwrap();
         }
@@ -751,7 +751,7 @@ mod tests {
             .read_deletion_vectors()
             .unwrap()
             .expect("deletion-vector section present after optimize");
-        assert!(dv.is_deleted(0, 1));
+        assert!(dv.is_deleted_global(1));
         assert_eq!(dv.total_deleted(), 1);
         // optimize does NOT apply deletions — rows stay (logical deletion).
         assert_eq!(out.read_obs().unwrap().num_rows(), n_obs);

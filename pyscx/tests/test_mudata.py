@@ -136,6 +136,47 @@ def test_from_mudata_round_trip(cite_seq_mudata):
         np.testing.assert_array_equal(adt_orig, adt_back)
 
 
+def test_mark_deleted_multimodal(cite_seq_mudata):
+    """A whole-cell `mark_deleted` on a multimodal file removes the cell from
+    every modality's *filtered* read.
+
+    The deletion-filtered per-modality read is the modality-scoped query
+    pipeline (`open(path).query(modality=...)`), which the engine drives
+    through the deletion vectors. Note that eager `to_mudata()` is deliberately
+    UNFILTERED per modality — each modality's X stays row-aligned with the
+    unfiltered outer `global_obs` — so it keeps the physical shape after a
+    delete; this test locks in both behaviors.
+    """
+    pytest.importorskip("mudata")
+    import pyscx
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "cite.scx")
+        pyscx.from_mudata(cite_seq_mudata, path)
+        n_obs = 32  # matches the cite_seq_mudata fixture
+
+        deleted = [3, 17]
+        total = pyscx.mark_deleted(path, deleted)
+        assert total == len(deleted)
+
+        # Whole-cell delete: the filtered per-modality query drops the rows
+        # from BOTH modalities (global bitmap applies to every modality).
+        kept = n_obs - len(deleted)
+        for modality in ("rna", "adt"):
+            assert pyscx.open(path).query(modality=modality).count() == kept
+            filtered = (
+                pyscx.open(path).query(modality=modality).collect().to_anndata()
+            )
+            assert filtered.n_obs == kept
+
+        # Eager to_mudata() is unfiltered by design — physical shape (32 rows)
+        # is preserved consistently across modalities and the outer obs.
+        mu_back = pyscx.open(path).to_mudata()
+        assert mu_back.n_obs == n_obs
+        assert mu_back.mod["rna"].X.shape[0] == n_obs
+        assert mu_back.mod["adt"].X.shape[0] == n_obs
+
+
 def test_from_mudata_frames_v4_by_default(cite_seq_mudata):
     """Multimodal in-memory convert inherits the v4 row-group-framing
     default (parity with the unimodal `from_anndata` path)."""

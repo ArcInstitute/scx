@@ -73,6 +73,32 @@ fn section_type_id_range_pinned() {
     );
 }
 
+/// The deletion-vector wire-format version is documented in docs/format.md §7.3
+/// (the v2 modality-keyed global-obs-row layout) and AGENTS.md. Pin it so a
+/// `DV_VERSION` bump forces the wire-format docs to move with the code.
+#[test]
+fn deletion_vector_version_pinned() {
+    assert_eq!(
+        scx_format_io::deletion_vectors::DV_VERSION,
+        2,
+        "DV_VERSION changed — update the deletion-vector wire format in \
+         docs/format.md §7.3 and AGENTS.md, then update this pin"
+    );
+    let root = workspace_root();
+    let format = std::fs::read_to_string(root.join("docs/format.md")).unwrap();
+    assert!(
+        format.contains("`DV_VERSION = 2`"),
+        "docs/format.md §7.3 deletion-vector version drifted from the code \
+         (expected the wire-format block to cite '`DV_VERSION = 2`')"
+    );
+    let agents = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("global-obs-row bitmap by `modality_id`"),
+        "AGENTS.md no longer describes the v2 modality-keyed deletion-vector model \
+         (expected 'global-obs-row bitmap by `modality_id`')"
+    );
+}
+
 /// The workspace member set must match the documented crate graph (15 code
 /// crates + the integration-test crate). A crate added or renamed without
 /// updating AGENTS.md / docs/architecture.md trips this (D3).

@@ -47,17 +47,6 @@ pub enum EngineError {
     )]
     ModalityRequired { available: Vec<String> },
 
-    /// A modality-scoped query hit a multimodal file that carries deletion
-    /// vectors. DV shard keys are recorded against the flattened
-    /// (all-modality) shard order, which cannot be mapped onto a single
-    /// modality's shard list; per-modality deletion vectors are a planned
-    /// follow-on. See `docs/multimodal.md` § 3.4.
-    #[error(
-        "modality-scoped queries are not supported on a multimodal file with deletion \
-         vectors present; compact the file first (`scx compact`) to apply deletions"
-    )]
-    MultimodalDeletionVectorsUnsupported,
-
     #[error(transparent)]
     FormatError(#[from] scx_format_io::ScxError),
 

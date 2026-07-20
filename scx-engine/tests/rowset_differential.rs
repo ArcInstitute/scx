@@ -25,7 +25,6 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use roaring::RoaringBitmap;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{
     build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions, QueryPipeline,
@@ -170,16 +169,9 @@ fn build_fixture(dir: &TempDir) -> PathBuf {
         write_csr_shard(&mut writer, ROWS_PER_SHARD, (s * ROWS_PER_SHARD) as u64);
     }
 
-    // Deletion vectors keyed by CSR shard index (matches DELETED_GLOBAL).
+    // Deletion vectors as v2 global obs rows (== DELETED_GLOBAL).
     let mut dv = DeletionVectors::new();
-    let mut bm0 = RoaringBitmap::new();
-    bm0.insert(1); // global 1
-    bm0.insert(3); // global 3
-    dv.shards.insert(0, bm0);
-    let mut bm2 = RoaringBitmap::new();
-    bm2.insert(0); // shard 2 starts at global 16 -> global 16
-    bm2.insert(2); // -> global 18
-    dv.shards.insert(2, bm2);
+    dv.insert_global(DELETED_GLOBAL.iter().map(|&i| i as u32));
     writer.write_deletion_vectors(&dv).unwrap();
 
     // Index keyed to CSR shard ranges (mirrors merge/compact/conversion).

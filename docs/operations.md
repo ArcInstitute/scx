@@ -80,6 +80,13 @@ rewritten. Readers apply the bitmap during decode.
 | Matrix shards | Unchanged |
 | Obs/var metadata | Unchanged |
 
+**Multimodal is fully supported.** `mark_deleted` is a whole-cell delete: the
+deletion vector stores global obs row indices (`modality_id = 0`), so a deleted
+cell is removed from **every** modality's read and from `compact` output, and a
+modality-scoped query (`query(modality=…)`) on a file that carries deletions
+returns deletion-filtered rows. (This supersedes the earlier limitation where
+multimodal `mark_deleted` was guarded off.)
+
 ## Modify Metadata Complexity
 
 `scx_ops::modify_metadata` / `set_uns` (CLI: `scx modify-metadata` / `scx

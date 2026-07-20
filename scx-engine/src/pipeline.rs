@@ -170,13 +170,13 @@ impl QueryPipeline {
     /// builder setter) because `filter_var` / `select_genes` validate
     /// against the var schema immediately.
     ///
+    /// Deletion vectors (v2 global-obs bitmaps) apply identically to every
+    /// modality, so a modality-scoped query on a file with deletions is fully
+    /// supported — the deleted cells are dropped from the queried modality's X.
+    ///
     /// Errors:
     ///  - [`EngineError::UnknownModality`](crate::error::EngineError::UnknownModality)
     ///    if `modality_id` is not registered.
-    ///  - [`EngineError::MultimodalDeletionVectorsUnsupported`](crate::error::EngineError::MultimodalDeletionVectorsUnsupported)
-    ///    if a modality (`>= 1`) query hits a file carrying deletion
-    ///    vectors — DV shard keys are recorded against the flattened
-    ///    all-modality shard order and cannot be mapped per-modality yet.
     pub fn from_reader_for_modality(
         reader: Box<dyn SectionReader>,
         modality_id: u8,
@@ -199,15 +199,10 @@ impl QueryPipeline {
         let var_schema = reader.read_var_schema_for(modality_id)?;
         let n_vars = reader.modality_n_vars(modality_id)? as usize;
 
-        // Load deletion vectors if present.
+        // Load deletion vectors if present. v2 bitmaps are global obs rows, so
+        // they apply identically to any modality's CSR shards (each tiles
+        // `[0, n_obs)`) — no per-modality remapping needed.
         let deletion_vectors = reader.read_deletion_vectors()?;
-
-        // Fail loud: DV bitmaps are keyed by flattened (all-modality) shard
-        // position, which cannot be remapped onto a single modality's shard
-        // list. See `docs/multimodal.md` § 3.4.
-        if modality_id != 0 && deletion_vectors.is_some() {
-            return Err(crate::error::EngineError::MultimodalDeletionVectorsUnsupported);
-        }
 
         Ok(Self {
             reader,
@@ -409,12 +404,16 @@ impl QueryPipeline {
         let range_len = (stop - start) as usize;
         let n_vars = self.n_vars;
 
-        // Global keep-mask for deletion vectors (None when the archive is clean,
-        // which is the case for a freshly written grouped output).
+        // Modality-aware keep-mask for deletion vectors (None when the archive
+        // is clean, which is the case for a freshly written grouped output).
+        // The global (whole-cell) bitmap always applies; a scoped
+        // (`modality_id >= 1`) bitmap, when present, additionally drops that
+        // modality's rows. Today only the global bitmap is populated, so this
+        // equals the whole-cell mask for every modality.
         let keep_mask: Option<Vec<bool>> = self
             .deletion_vectors
             .as_ref()
-            .map(|dv| dv.build_keep_mask(n_obs as usize, self.reader.catalog()));
+            .map(|dv| dv.build_keep_mask(n_obs as usize, self.modality_id));
 
         let csr_shards: Vec<&FullCatalogEntry> =
             crate::collect::scan_shards(self.reader.catalog(), self.modality_id);

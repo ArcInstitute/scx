@@ -337,7 +337,8 @@ scx subset citeseq.scx rna_only.scx --modality rna
 scx subset citeseq.scx rna_tcells.scx --modality rna \
     --filter "cell_type == 'T cell'" --genes hvg.txt             # filter + projection
 scx merge cite1.scx cite2.scx --output cite_merged.scx            # multimodal merge
-scx compact cite_merged.scx cite_compacted.scx                   # multimodal compact
+scx delete cite_merged.scx --filter "cell_type == 'B cell'"      # whole-cell delete (all modalities)
+scx compact cite_merged.scx cite_compacted.scx                   # multimodal compact (reclaims deleted rows)
 ```
 
 > **Multimodal append is deferred.** `pyscx.append` / `append_from_anndata` (and
@@ -391,6 +392,7 @@ are resolved.
 | `query(modality=…)` / `scx query --modality` / `scx_query(modality=)` | Supported | Local modality-scoped predicate pushdown (obs mask global, X at the modality's `n_vars`); §&nbsp;3.4 |
 | `scx append --modality NAME` | Not supported (deferred) | Rejected with `MultimodalUnsupported`: a single-modality append would leave siblings under-covering the global obs axis. Extract via `scx subset --modality`, append, then `scx merge` |
 | `scx merge` on multimodal inputs | Supported | Dispatches to `merge_multimodal`; per-modality CSC dropped — `--rebuild-csc` to re-emit |
+| `scx delete` / `mark_deleted` / `scx_delete` on multimodal inputs | Supported | Whole-cell delete: global-obs deletion vector removes the cell from **every** modality; modality-scoped query returns deletion-filtered rows |
 | `scx compact` on multimodal inputs | Supported | Dispatches to `compact_multimodal`; keep mask applied across every modality |
 | `to_anndata(modality=…, backed=True)` + filter kwargs | Not supported | Use `query(modality=…)` (in-memory) or `scx subset --modality NAME --filter` |
 | `open_cloud(...).query(modality=…)` / `read_cloud(..., modality=…)` | Supported | Modality-scoped predicate pushdown over the cloud reader (packed + exploded `.scxd/`); `scx query <url> --modality` too |
@@ -414,6 +416,19 @@ are resolved.
   the deletion-vector keep mask across every modality's CSR shards
   and per-modality layers. Both drop CSC sidecars by default;
   `--rebuild-csc` regenerates them.
+- **Deleting cells (whole-cell)**: `scx delete` / `pyscx.mark_deleted` /
+  `scx_delete` mark cells on the shared global obs axis. The deletion vector
+  stores global obs row indices (`modality_id = 0`, see
+  [docs/format.md §7.3](format.md#73-deletion-vectors-logical-delete)), so a
+  deleted cell is removed from **every** modality — the default read, each
+  modality-scoped `query(modality=…)`, and `compact` all drop the same rows and
+  stay cell-aligned. `scx rollback` still undoes a delete (shard bytes are never
+  touched). Note that eager `to_mudata()` is deliberately *unfiltered* per
+  modality — each modality's X stays row-aligned with the unfiltered outer
+  `global_obs`, so it returns the physical shape; use `query(modality=…)` (or a
+  `compact`ed file) for the deletion-filtered view. Per-modality scoped deletion
+  (drop one modality's measurement, keep the others) is reserved wire-format
+  headroom, not yet exposed.
 - **`subset --modality NAME` + `--filter` / `--genes`**:
   `extract_modality_with_filter` reads the modality CSR, applies the
   obs predicate against the global obs, projects to the chosen genes,

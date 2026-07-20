@@ -501,25 +501,15 @@ fn candidate_shard_coverage(plan: &ExecutionPlan, sorted_shards: &[&FullCatalogE
     RowSet::from_ranges(ranges)
 }
 
-/// The set of deleted global rows, built from the per-CSR-shard deletion
-/// bitmaps (same shard-idx→global translation as the legacy path).
-fn deletion_rowset(
-    dv: &DeletionVectors,
-    sorted_shards: &[&FullCatalogEntry],
-    n_obs: u64,
-) -> RowSet {
+/// The set of globally-deleted obs rows as a [`RowSet`], read directly from
+/// the v2 global deletion bitmap (`deletions[0]`).
+fn deletion_rowset(dv: &DeletionVectors, n_obs: u64) -> RowSet {
     let mut ranges: Vec<RowRange> = Vec::new();
-    for (shard_idx, entry) in sorted_shards.iter().enumerate() {
-        let Some(stats) = entry.stats.as_ref() else {
-            continue;
-        };
-        let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) else {
-            continue;
-        };
+    if let Some(bitmap) = dv.global_deleted() {
         // Bitmap iterates ascending; coalesce consecutive deleted rows.
         let mut run: Option<(u64, u64)> = None;
-        for local_row in bitmap.iter() {
-            let g = stats.row_start + local_row as u64;
+        for row in bitmap.iter() {
+            let g = row as u64;
             if g >= n_obs {
                 break;
             }
@@ -734,7 +724,7 @@ fn try_rowset_mask(
     // Restrict to surviving candidate shards, then subtract deletions.
     rs = rs.intersect(&candidate_shard_coverage(plan, sorted_shards));
     if let Some(ref dv) = plan.deletion_vectors {
-        rs = rs.difference(&deletion_rowset(dv, sorted_shards, n_obs as u64));
+        rs = rs.difference(&deletion_rowset(dv, n_obs as u64));
     }
 
     // Residual predicates: decode only the obs shards `rs` spans.
@@ -864,17 +854,13 @@ fn build_legacy_mask(
         legacy_obs = Some(obs_batch);
     }
 
-    // Step 4: Apply deletion vectors — exclude deleted cells.
+    // Step 4: Apply deletion vectors — exclude deleted cells. v2 stores global
+    // obs rows directly, so no shard-local translation is needed.
     if let Some(ref dv) = plan.deletion_vectors {
-        for (shard_idx, shard_entry) in sorted_shards.iter().enumerate() {
-            if let Some(ref stats) = shard_entry.stats {
-                if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
-                    for local_row in bitmap.iter() {
-                        let global_row = stats.row_start + local_row as u64;
-                        if (global_row as usize) < n_obs {
-                            obs_mask[global_row as usize] = false;
-                        }
-                    }
+        if let Some(bitmap) = dv.global_deleted() {
+            for row in bitmap.iter() {
+                if (row as usize) < n_obs {
+                    obs_mask[row as usize] = false;
                 }
             }
         }
