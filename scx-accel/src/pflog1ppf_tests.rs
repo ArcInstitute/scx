@@ -512,6 +512,156 @@ fn rejects_non_finite_c() {
     assert!(pflog1ppf_baseline(&raw, &depths, f64::NAN).is_err());
 }
 
+// --- v4 α estimator --------------------------------------------------------
+
+/// Independent f64 reference for `estimate_alpha`: per-gene MoM
+/// `α_g = (var − mean)/mean²` (Bessel-corrected, matching
+/// `streaming_mean_var`), filtered by `mean > mu_min && var > mean`, pooled by
+/// median. Returns `(median_alpha, n_genes_used)`.
+fn reference_alpha(rows: &[Vec<f32>], n_vars: usize, mu_min: f64) -> (f64, usize) {
+    let n = rows.len() as f64;
+    let denom = (n - 1.0).max(1.0);
+    let mut cand: Vec<f64> = Vec::new();
+    for g in 0..n_vars {
+        let mut sum = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        for row in rows {
+            let v = row[g] as f64;
+            sum += v;
+            sum_sq += v * v;
+        }
+        let mean = sum / n;
+        let var = ((sum_sq - n * mean * mean) / denom).max(0.0);
+        if mean > mu_min && var > mean {
+            let a = (var - mean) / (mean * mean);
+            if a.is_finite() && a > 0.0 {
+                cand.push(a);
+            }
+        }
+    }
+    let k = cand.len();
+    cand.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = if k == 0 {
+        f64::NAN
+    } else if k % 2 == 1 {
+        cand[k / 2]
+    } else {
+        0.5 * (cand[k / 2 - 1] + cand[k / 2])
+    };
+    (med, k)
+}
+
+/// Hand-computed single gene: cells [1, 5] → mean 3, var 8 (n−1 denom),
+/// α = (8−3)/9 = 5/9, pseudocount = 1/(4α) = 0.45.
+#[test]
+fn estimate_alpha_known_single_gene() {
+    let rows = vec![vec![1.0f32], vec![5.0f32]];
+    let raw = raw_source_from_shards(&[&rows], 1);
+    let est = estimate_alpha(&raw, &AlphaOptions::default()).unwrap();
+    assert_eq!(est.n_genes_used, 1);
+    assert!(!est.fell_back);
+    assert!((est.alpha - 5.0 / 9.0).abs() <= 1e-12, "α={}", est.alpha);
+    assert!(
+        (est.pseudocount - 0.45).abs() <= 1e-12,
+        "pc={}",
+        est.pseudocount
+    );
+}
+
+/// `estimate_alpha` matches the independent f64 reference on a mixed matrix.
+#[test]
+fn estimate_alpha_matches_reference() {
+    let rows = vec![
+        vec![0.0f32, 5.0, 2.0, 0.0],
+        vec![3.0, 0.0, 8.0, 1.0],
+        vec![1.0, 2.0, 0.0, 4.0],
+        vec![7.0, 1.0, 3.0, 0.0],
+        vec![0.0, 9.0, 1.0, 2.0],
+    ];
+    let n_vars = 4;
+    let opts = AlphaOptions::default();
+    let raw = raw_source_from_shards(&[&rows], n_vars);
+    let est = estimate_alpha(&raw, &opts).unwrap();
+    let (ref_alpha, ref_k) = reference_alpha(&rows, n_vars, opts.mu_min);
+    assert_eq!(est.n_genes_used, ref_k);
+    assert!(!est.fell_back);
+    assert!(
+        (est.alpha - ref_alpha).abs() <= 1e-9,
+        "{} != {}",
+        est.alpha,
+        ref_alpha
+    );
+    assert!((est.pseudocount - 1.0 / (4.0 * ref_alpha)).abs() <= 1e-9);
+}
+
+/// Only overdispersed, above-mu_min genes count. Here gene0 (α=1/9) and gene3
+/// (α=10/9) qualify; gene1 is constant (var=0) and gene2 is all-zero (mean=0),
+/// both excluded → `n_genes_used == 2`, median = mean of the two.
+#[test]
+fn estimate_alpha_counts_and_pools_mixed_genes() {
+    let rows = vec![
+        vec![1.0f32, 4.0, 0.0, 2.0],
+        vec![5.0, 4.0, 0.0, 0.0],
+        vec![3.0, 4.0, 0.0, 7.0],
+    ];
+    let raw = raw_source_from_shards(&[&rows], 4);
+    let est = estimate_alpha(&raw, &AlphaOptions::default()).unwrap();
+    assert_eq!(est.n_genes_used, 2);
+    assert!(!est.fell_back);
+    let expected = 0.5 * (1.0 / 9.0 + 10.0 / 9.0);
+    assert!((est.alpha - expected).abs() <= 1e-12, "α={}", est.alpha);
+}
+
+/// All-zero matrix: no candidate → fallback to α=0.25 (pseudocount 1.0), no error.
+#[test]
+fn estimate_alpha_falls_back_on_all_zero() {
+    let rows = vec![vec![0.0f32, 0.0, 0.0], vec![0.0, 0.0, 0.0]];
+    let raw = raw_source_from_shards(&[&rows], 3);
+    let est = estimate_alpha(&raw, &AlphaOptions::default()).unwrap();
+    assert!(est.fell_back);
+    assert_eq!(est.n_genes_used, 0);
+    assert_eq!(est.alpha, 0.25);
+    assert!((est.pseudocount - 1.0).abs() <= 1e-12);
+}
+
+/// Under-dispersed input (constant columns → var 0 ≤ mean for every gene):
+/// no positive dispersion signal anywhere → fallback fires, no error.
+#[test]
+fn estimate_alpha_falls_back_when_underdispersed() {
+    let rows = vec![
+        vec![2.0f32, 3.0, 4.0],
+        vec![2.0, 3.0, 4.0],
+        vec![2.0, 3.0, 4.0],
+    ];
+    let raw = raw_source_from_shards(&[&rows], 3);
+    let est = estimate_alpha(&raw, &AlphaOptions::default()).unwrap();
+    assert!(est.fell_back);
+    assert_eq!(est.n_genes_used, 0);
+    assert_eq!(est.alpha, 0.25);
+}
+
+/// A non-finite count is rejected via `streaming_mean_var`'s input guard.
+#[test]
+fn estimate_alpha_rejects_non_finite() {
+    let rows = vec![vec![1.0f32, f32::NAN, 3.0], vec![2.0, 1.0, 0.0]];
+    let raw = raw_source_from_shards(&[&rows], 3);
+    assert!(estimate_alpha(&raw, &AlphaOptions::default()).is_err());
+}
+
+/// `n_vars == 0` is rejected before any streaming pass.
+#[test]
+fn estimate_alpha_rejects_zero_n_vars() {
+    let src = MultiShardSource {
+        shards: vec![],
+        n_obs: 0,
+        n_vars: 0,
+    };
+    assert!(matches!(
+        estimate_alpha(&src, &AlphaOptions::default()),
+        Err(AccelError::InvalidInput(_))
+    ));
+}
+
 /// A malformed source whose shard rows exceed the declared `n_obs` must return
 /// a clean `ShapeError`, not panic on out-of-bounds `cell_depths` indexing.
 #[test]

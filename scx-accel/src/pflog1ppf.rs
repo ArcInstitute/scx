@@ -34,6 +34,7 @@
 //! deviations match the rest of the streaming kernels (~`1e-6` floor).
 
 use crate::error::{AccelError, Result};
+use crate::hvg::streaming_mean_var;
 use scx_format_io::ShardSource;
 
 /// Reject non-finite values at the normalization boundary (mirrors the
@@ -239,6 +240,146 @@ pub fn pflog1ppf_baseline_from_delta<S: ShardSource>(delta_source: &S) -> Result
         )));
     }
     Ok(baseline)
+}
+
+// ---------------------------------------------------------------------------
+// v4 PFlog: matrix-wide negative-binomial overdispersion (α) estimator
+// ---------------------------------------------------------------------------
+//
+// v4 PFlog shifts raw counts by the matrix-wide Anscombe pseudocount `1/(4α)`,
+// where `α` is the negative-binomial overdispersion of the matrix
+// (`Var = μ + α·μ²`). This section estimates that single scalar; wiring it into
+// the transform/delta/PCA path is a later phase. Nothing calls it yet.
+
+/// Tuning knobs for the matrix-wide NB overdispersion (`α`) estimate.
+#[derive(Debug, Clone)]
+pub struct AlphaOptions {
+    /// Genes with per-gene mean ≤ `mu_min` are excluded from the pool (their
+    /// per-gene `α_g` is unstable near zero mean).
+    pub mu_min: f64,
+    /// `α` used when no valid candidate survives. Default `0.25` ⇒ pseudocount
+    /// `1/(4α) = 1.0`, i.e. the transform degrades to plain `log1p(x)` on raw
+    /// counts.
+    pub fallback_alpha: f64,
+}
+
+impl Default for AlphaOptions {
+    fn default() -> Self {
+        Self {
+            mu_min: 1e-3,
+            fallback_alpha: 0.25,
+        }
+    }
+}
+
+/// Result of [`estimate_alpha`]: the pooled overdispersion `α`, its Anscombe
+/// pseudocount `1/(4α)`, how many genes contributed to the median, and whether
+/// the degenerate-input fallback fired.
+#[derive(Debug, Clone)]
+pub struct AlphaEstimate {
+    /// Pooled negative-binomial overdispersion (`Var = μ + α·μ²`).
+    pub alpha: f64,
+    /// Anscombe pseudocount `1/(4·alpha)` — the matrix-wide shift for v4 PFlog.
+    pub pseudocount: f64,
+    /// Number of genes whose `α_g` entered the median pool.
+    pub n_genes_used: usize,
+    /// `true` when no valid candidate survived and `fallback_alpha` was used.
+    pub fell_back: bool,
+}
+
+/// Estimate one matrix-wide NB overdispersion `α` from raw counts by per-gene
+/// method-of-moments, pooled by median.
+///
+/// For each gene `g`, `α_g = (var_g − mean_g) / mean_g²` — the standard MoM NB
+/// dispersion estimator for `Var = μ + α·μ²`. This is the identical algebra to
+/// the pseudobulk estimator at `nb_glm::dispersion.rs:65`, replicated here
+/// (rather than shared) because that `pub(crate)` helper takes
+/// size-factor-normalized pseudobulk rows, not per-gene raw-count moments.
+/// Genes with `mean_g ≤ opts.mu_min` or `var_g ≤ mean_g` (Poisson /
+/// under-dispersed — no positive dispersion signal) are excluded. The pooled
+/// `α` is the median of the survivors.
+///
+/// `raw` must carry **raw counts**. Per-gene moments are computed in `f64` in a
+/// single streaming pass via [`crate::hvg::streaming_mean_var`] (Bessel-corrected
+/// sample variance), which also runs the non-finite input guard per shard — so
+/// a NaN/Inf count surfaces as [`AccelError::InvalidInput`].
+///
+/// On a degenerate matrix (no surviving candidate, or a non-positive/non-finite
+/// median) this does **not** error: it logs a warning, falls back to
+/// `opts.fallback_alpha`, and sets `fell_back = true`.
+pub fn estimate_alpha<S: ShardSource>(raw: &S, opts: &AlphaOptions) -> Result<AlphaEstimate> {
+    if raw.n_vars() == 0 {
+        return Err(AccelError::InvalidInput(
+            "estimate_alpha requires n_vars > 0".into(),
+        ));
+    }
+
+    let stats = streaming_mean_var(raw)?;
+
+    // Per-gene method-of-moments: α_g = (var − mean) / mean².
+    // Same algebra as nb_glm::dispersion.rs:65 (see doc comment).
+    let mut candidates: Vec<f64> = stats
+        .means
+        .iter()
+        .zip(stats.variances.iter())
+        .filter(|(&m, &v)| m > opts.mu_min && v > m)
+        .map(|(&m, &v)| (v - m) / (m * m))
+        .filter(|a| a.is_finite() && *a > 0.0)
+        .collect();
+
+    let n_genes_used = candidates.len();
+
+    let fallback = |n_used: usize, why: &str| {
+        log::warn!(
+            "estimate_alpha: {why}; falling back to α={} (pseudocount {})",
+            opts.fallback_alpha,
+            1.0 / (4.0 * opts.fallback_alpha)
+        );
+        AlphaEstimate {
+            alpha: opts.fallback_alpha,
+            pseudocount: 1.0 / (4.0 * opts.fallback_alpha),
+            n_genes_used: n_used,
+            fell_back: true,
+        }
+    };
+
+    if n_genes_used == 0 {
+        return Ok(fallback(
+            0,
+            "no gene passed the mean>mu_min and var>mean filters (degenerate/near-empty matrix)",
+        ));
+    }
+
+    let alpha = median(&mut candidates);
+    if !alpha.is_finite() || alpha <= 0.0 {
+        return Ok(fallback(
+            n_genes_used,
+            "pooled median α is non-positive or non-finite",
+        ));
+    }
+
+    Ok(AlphaEstimate {
+        alpha,
+        pseudocount: 1.0 / (4.0 * alpha),
+        n_genes_used,
+        fell_back: false,
+    })
+}
+
+/// Median of `v` (sorts in place; averages the two middle elements for even
+/// length). `v` must be non-empty and finite (guaranteed by the caller's
+/// `is_finite` filter).
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(|a, b| {
+        a.partial_cmp(b)
+            .expect("candidates are finite by construction")
+    });
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
 }
 
 #[cfg(test)]

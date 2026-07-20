@@ -72,7 +72,8 @@ pub use pca::{
     randomized_pca_inmemory, PcaResult, COVARIANCE_PCA_THRESHOLD,
 };
 pub use pflog1ppf::{
-    pflog1ppf_baseline, pflog1ppf_baseline_from_delta, pflog1ppf_cell_depths, PFlog1pPF,
+    estimate_alpha, pflog1ppf_baseline, pflog1ppf_baseline_from_delta, pflog1ppf_cell_depths,
+    AlphaEstimate, AlphaOptions, PFlog1pPF,
 };
 pub use pseudobulk::{
     build_group_mapping, pseudobulk_aggregate, pseudobulk_aggregate_dense,
