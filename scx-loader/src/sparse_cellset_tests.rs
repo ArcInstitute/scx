@@ -333,6 +333,7 @@ fn collate_gathered_emits_stacked_tensors_matching_kernel() {
         k_enc: 4,
         mode: PreprocessMode::Log1pRaw,
         target_sum: 1e4,
+        pflog_alpha: None,
         n_genes_total: 8,
         lib_size_redef: false,
     };

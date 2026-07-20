@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use arrow::record_batch::RecordBatch;
 use scx_format_io::deletion_vectors::DeletionVectors;
 use scx_format_io::reader::ScxReader;
+use scx_format_io::BackedCsrReader;
 
 use crate::batch::Batch;
 use crate::budget::{profiling_enabled, BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
@@ -63,20 +64,24 @@ pub struct LoaderConfig {
     pub log1p: bool,
     /// Normalization target sum (default: 1e4).
     pub target_sum: f64,
-    /// Apply PFlog1pPF / shifted-CLR normalization (Booeshaghi et al. 2026)
-    /// instead of normalize/log1p (default: false).
+    /// Apply PFlog (v4) / shifted-log normalization on raw counts (Booeshaghi
+    /// et al.) instead of normalize/log1p (default: false).
     ///
-    /// PFlog1pPF is itself a normalization, so it is **mutually exclusive**
-    /// with `normalize`/`log1p`: when `true` it takes precedence and those
-    /// flags are ignored. Per cell it computes
-    /// `z_ij = log1p(x_ij/(c·s_i)) − (1/D)·Σ_k log1p(x_ik/(c·s_i))`, where the
-    /// depth `s_i` and centering denominator `D` are over the **full
-    /// transcriptome** (not the HVG-projected panel — see
-    /// [`crate::projection::HvgProjection::scatter_pflog1ppf_row`]).
-    pub pflog1ppf: bool,
-    /// PFlog1pPF shift / pseudocount `c` (default: 1.0; only used when
-    /// `pflog1ppf` is true).
-    pub pflog1ppf_c: f64,
+    /// PFlog is itself a normalization, so it is **mutually exclusive** with
+    /// `normalize`/`log1p`: when `true` it takes precedence and those flags are
+    /// ignored. Per cell it computes
+    /// `z_ij = log1p(4α·x_ij) − (1/D)·Σ_k log1p(4α·x_ik)` on **raw counts** —
+    /// no per-cell depth (it cancels under the Anscombe scale). The centering
+    /// denominator `D` is over the **full transcriptome** (not the HVG-projected
+    /// panel — see [`crate::projection::HvgProjection::scatter_pflog_row`]).
+    pub pflog: bool,
+    /// PFlog NB overdispersion `α` (only used when `pflog` is true). The
+    /// matrix-wide Anscombe pseudocount is `1/(4α)`. `None` (default) →
+    /// **estimate once at loader construction** via `scx_accel::estimate_alpha`
+    /// over the dataset's raw CSR shards (single-modality only); `Some(α)` pins
+    /// a value (e.g. a reference α from `pyscx.accel.pflog`). Resolved to
+    /// `Some` before decoding.
+    pub pflog_alpha: Option<f64>,
     /// RNG seed for reproducibility.
     pub seed: u64,
     /// Memory budget in MB (default: 512).
@@ -116,8 +121,8 @@ impl Default for LoaderConfig {
             normalize: true,
             log1p: true,
             target_sum: 1e4,
-            pflog1ppf: false,
-            pflog1ppf_c: 1.0,
+            pflog: false,
+            pflog_alpha: None,
             seed: 42,
             max_memory_mb: 512,
             auto_memory_budget: false,
@@ -157,19 +162,19 @@ impl LoaderConfig {
                 reason: "target_sum must be > 0.0".to_string(),
             });
         }
-        if self.pflog1ppf
-            && (self.pflog1ppf_c <= 0.0
-                || self.pflog1ppf_c.is_nan()
-                || self.pflog1ppf_c.is_infinite())
-        {
-            return Err(LoaderError::ConfigError {
-                reason: "pflog1ppf_c must be positive and finite".to_string(),
-            });
+        if self.pflog {
+            if let Some(a) = self.pflog_alpha {
+                if a <= 0.0 || a.is_nan() || a.is_infinite() {
+                    return Err(LoaderError::ConfigError {
+                        reason: "pflog_alpha must be positive and finite".to_string(),
+                    });
+                }
+            }
         }
-        if self.pflog1ppf && (self.normalize || self.log1p) {
+        if self.pflog && (self.normalize || self.log1p) {
             log::warn!(
-                "pflog1ppf=true takes precedence; normalize/log1p flags are ignored \
-                 (pflog1ppf is itself a normalization)"
+                "pflog=true takes precedence; normalize/log1p flags are ignored \
+                 (pflog is itself a normalization)"
             );
         }
         if self.max_memory_mb < 64 {
@@ -554,7 +559,7 @@ impl TrainingPipeline {
 
         // Open SCX file
         let t0 = Instant::now();
-        let reader = Arc::new(ScxReader::open(path)?);
+        let reader = Arc::new(ScxReader::open(path.as_ref())?);
         tracing::trace!(
             elapsed_us = t0.elapsed().as_micros() as u64,
             "ScxReader::open"
@@ -594,6 +599,33 @@ impl TrainingPipeline {
                 header.nnz,
             )
         };
+
+        // v4 PFlog: resolve α once. `None` ⇒ estimate over the raw CSR shards
+        // (single-modality only — modality-scoped estimation isn't wired, so a
+        // modality-scoped loader must pin `pflog_alpha`). After this,
+        // `config.pflog_alpha` is `Some` whenever `config.pflog`.
+        if config.pflog && config.pflog_alpha.is_none() {
+            if config.modality_id.is_some() {
+                return Err(LoaderError::ConfigError {
+                    reason: "pflog_alpha must be set explicitly for a modality-scoped loader; \
+                             estimate it once via pyscx.accel.pflog and pass pflog_alpha"
+                        .to_string(),
+                });
+            }
+            let est_reader = BackedCsrReader::new(ScxReader::open(path.as_ref())?, 0);
+            let est = scx_accel::estimate_alpha(&est_reader, &scx_accel::AlphaOptions::default())
+                .map_err(|e| LoaderError::ConfigError {
+                reason: format!("pflog α estimation failed: {e}"),
+            })?;
+            log::info!(
+                "pflog: estimated α={:.6} (pseudocount={:.6}, n_genes_used={}, fell_back={})",
+                est.alpha,
+                est.pseudocount,
+                est.n_genes_used,
+                est.fell_back
+            );
+            config.pflog_alpha = Some(est.alpha);
+        }
 
         // Read obs metadata (full RecordBatch for column extraction)
         let t0 = Instant::now();

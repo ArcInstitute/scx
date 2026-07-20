@@ -52,6 +52,8 @@ pub struct CollateScalars {
     pub k_enc: usize,
     pub mode: PreprocessMode,
     pub target_sum: f64,
+    /// PFlog (v4) NB overdispersion `α`; required when `mode == PflogRaw`.
+    pub pflog_alpha: Option<f64>,
     pub n_genes_total: i64,
     pub lib_size_redef: bool,
 }
@@ -443,6 +445,7 @@ pub fn collate_gathered(
                 mode: scalars.mode,
                 target_sum: scalars.target_sum,
                 n_measured: n_measured[s] as usize,
+                pflog_alpha: scalars.pflog_alpha,
                 n_genes_total: scalars.n_genes_total,
                 lib_size_redef: scalars.lib_size_redef,
             };

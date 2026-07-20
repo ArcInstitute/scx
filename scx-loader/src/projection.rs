@@ -125,40 +125,40 @@ impl HvgProjection {
         }
     }
 
-    /// Scatter a CSR row as **PFlog1pPF** into a projected dense output row.
+    /// Scatter a CSR row as **PFlog (v4)** into a projected dense output row.
     ///
     /// Mirrors [`scatter_row`](Self::scatter_row) (dense-remap fast path +
-    /// merge-scan fallback), but writes the exact PFlog1pPF transform
-    /// `z = log1p(x/(c·s)) + baseline` instead of the raw value, and pre-fills
+    /// merge-scan fallback), but writes the exact PFlog transform
+    /// `z = log1p(4α·x) + baseline` instead of the raw value, and pre-fills
     /// every output column with `baseline` (so projected columns that were zero
     /// in the original row carry the per-cell baseline, as the exact transform
     /// requires).
     ///
-    /// Depth `s` and the centering denominator `n_vars_full` are taken over the
-    /// **full pre-projection row** (`csr_indices`/`csr_data` span the whole
+    /// The centering denominator `n_vars_full` is taken over the **full
+    /// pre-projection row** (`csr_indices`/`csr_data` span the whole
     /// transcriptome), NOT the projected panel — see
-    /// [`crate::normalize::pflog1ppf_depth_baseline`]. An empty cell
-    /// (non-positive depth) leaves the output row zeroed.
+    /// [`crate::normalize::pflog_baseline_row`]. v4 has no per-cell depth; an
+    /// empty cell yields `baseline = 0` (the output row is all zeros).
     ///
     /// # Arguments
     /// - `csr_indices` / `csr_data`: the full CSR row (sorted, i32 columns).
-    /// - `c`: PFlog1pPF shift / pseudocount (> 0).
+    /// - `four_alpha`: `4α` (the matrix-wide Anscombe scale; pseudocount `1/(4α)`).
     /// - `n_vars_full`: full feature count `D` (NOT `n_output_cols`).
     /// - `output_row`: pre-zeroed dense output row of length `n_output_cols`.
-    pub fn scatter_pflog1ppf_row(
+    pub fn scatter_pflog_row(
         &self,
         csr_indices: &[i32],
         csr_data: &[f32],
-        c: f64,
+        four_alpha: f64,
         n_vars_full: usize,
         output_row: &mut [f32],
     ) {
         debug_assert_eq!(output_row.len(), self.n_output_cols);
 
-        let Some((depth, baseline)) =
-            crate::normalize::pflog1ppf_depth_baseline(csr_data, c, n_vars_full)
+        let Some(baseline) =
+            crate::normalize::pflog_baseline_row(csr_data, four_alpha, n_vars_full)
         else {
-            // Empty cell — undefined transform; leave the row zeroed.
+            // Degenerate (n_vars == 0); leave the row zeroed.
             for v in output_row.iter_mut() {
                 *v = 0.0;
             }
@@ -168,7 +168,6 @@ impl HvgProjection {
         for v in output_row.iter_mut() {
             *v = baseline_f32;
         }
-        let inv = 1.0 / (c * depth);
 
         if let Some(dense_remap) = &self.dense_remap {
             for (&col_idx, &value) in csr_indices.iter().zip(csr_data.iter()) {
@@ -180,7 +179,8 @@ impl HvgProjection {
                     continue;
                 };
                 if out_idx >= 0 {
-                    output_row[out_idx as usize] = ((value as f64 * inv).ln_1p() + baseline) as f32;
+                    output_row[out_idx as usize] =
+                        ((four_alpha * value as f64).ln_1p() + baseline) as f32;
                 }
             }
             return;
@@ -197,7 +197,7 @@ impl HvgProjection {
                 gi += 1;
             }
             if gi < self.gene_indices.len() && self.gene_indices[gi] == col {
-                output_row[gi] = ((value as f64 * inv).ln_1p() + baseline) as f32;
+                output_row[gi] = ((four_alpha * value as f64).ln_1p() + baseline) as f32;
             }
         }
     }
@@ -242,22 +242,21 @@ pub fn scatter_row_full(
     Ok(())
 }
 
-/// Scatter a CSR row as **PFlog1pPF** without projection (all genes).
+/// Scatter a CSR row as **PFlog (v4)** without projection (all genes).
 ///
-/// No-projection analog of [`HvgProjection::scatter_pflog1ppf_row`]: writes the
-/// exact transform `z = log1p(x/(c·s)) + baseline` at each original column,
+/// No-projection analog of [`HvgProjection::scatter_pflog_row`]: writes the
+/// exact transform `z = log1p(4α·x) + baseline` at each original column,
 /// pre-filling every column with `baseline` so original zeros carry it. `n_vars`
-/// is both the output width and the centering denominator `D`. An empty cell
-/// (non-positive depth) leaves the output row zeroed.
-pub fn pflog1ppf_row_full(
+/// is both the output width and the centering denominator `D`. v4 has no depth;
+/// an empty cell yields `baseline = 0` (the output row is all zeros).
+pub fn pflog_row_full(
     csr_indices: &[i32],
     csr_data: &[f32],
-    c: f64,
+    four_alpha: f64,
     n_vars: usize,
     output_row: &mut [f32],
 ) -> Result<(), crate::error::LoaderError> {
-    let Some((depth, baseline)) = crate::normalize::pflog1ppf_depth_baseline(csr_data, c, n_vars)
-    else {
+    let Some(baseline) = crate::normalize::pflog_baseline_row(csr_data, four_alpha, n_vars) else {
         for v in output_row.iter_mut() {
             *v = 0.0;
         }
@@ -267,7 +266,6 @@ pub fn pflog1ppf_row_full(
     for v in output_row.iter_mut() {
         *v = baseline_f32;
     }
-    let inv = 1.0 / (c * depth);
     for (&col_idx, &value) in csr_indices.iter().zip(csr_data.iter()) {
         if col_idx < 0 {
             return Err(crate::error::LoaderError::ConfigError {
@@ -283,7 +281,7 @@ pub fn pflog1ppf_row_full(
                 ),
             });
         }
-        output_row[idx] = ((value as f64 * inv).ln_1p() + baseline) as f32;
+        output_row[idx] = ((four_alpha * value as f64).ln_1p() + baseline) as f32;
     }
     Ok(())
 }
@@ -485,16 +483,18 @@ mod tests {
         );
     }
 
-    // ----- PFlog1pPF kernel tests -----------------------------------------
+    // ----- PFlog (v4) kernel tests ----------------------------------------
     //
-    // Shared single-row reference (spec §11.1, exact f64): given a dense row,
-    //   z_j = log(x_j/s + c) − mean_k log(x_k/s + c),   s = Σ x.
-    // Kernel paths ride on f32, so assert to ~1e-5.
+    // Shared single-row reference (exact f64): given a dense raw-count row,
+    //   z_j = log1p(4α·x_j) − mean_k log1p(4α·x_k).
+    // No depth (v4). Kernel paths ride on f32, so assert to ~1e-5.
 
-    /// Exact PFlog1pPF for one dense row over the FULL transcriptome.
-    fn reference_dense_row(full: &[f32], c: f64) -> Vec<f64> {
-        let depth: f64 = full.iter().map(|&v| v as f64).sum();
-        let logs: Vec<f64> = full.iter().map(|&v| (v as f64 / depth + c).ln()).collect();
+    /// Exact PFlog (v4) for one dense row over the FULL transcriptome.
+    fn reference_dense_row(full: &[f32], four_alpha: f64) -> Vec<f64> {
+        let logs: Vec<f64> = full
+            .iter()
+            .map(|&v| (four_alpha * v as f64).ln_1p())
+            .collect();
         let mean = logs.iter().sum::<f64>() / logs.len() as f64;
         logs.iter().map(|&l| l - mean).collect()
     }
@@ -513,14 +513,14 @@ mod tests {
     }
 
     #[test]
-    fn test_pflog1ppf_row_full_matches_reference() {
+    fn test_pflog_row_full_matches_reference() {
         let full = vec![0.0f32, 1.0, 3.0, 0.0, 2.0];
         let (idx, data) = sparsify(&full);
-        let c = 1.0;
+        let four_alpha = 4.0; // α = 1
         let mut out = vec![0.0f32; full.len()];
-        pflog1ppf_row_full(&idx, &data, c, full.len(), &mut out).unwrap();
+        pflog_row_full(&idx, &data, four_alpha, full.len(), &mut out).unwrap();
 
-        let expected = reference_dense_row(&full, c);
+        let expected = reference_dense_row(&full, four_alpha);
         for (j, (&got, &want)) in out.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (got as f64 - want).abs() <= 1e-5,
@@ -535,47 +535,52 @@ mod tests {
     }
 
     #[test]
-    fn test_pflog1ppf_row_full_general_c() {
+    fn test_pflog_row_full_various_alpha() {
         let full = vec![4.0f32, 0.0, 1.0, 0.0, 7.0, 2.0];
         let (idx, data) = sparsify(&full);
-        for &c in &[0.1f64, 0.5, 1.0, 2.0] {
+        for &four_alpha in &[0.4f64, 2.0, 4.0, 8.0] {
             let mut out = vec![0.0f32; full.len()];
-            pflog1ppf_row_full(&idx, &data, c, full.len(), &mut out).unwrap();
-            let expected = reference_dense_row(&full, c);
+            pflog_row_full(&idx, &data, four_alpha, full.len(), &mut out).unwrap();
+            let expected = reference_dense_row(&full, four_alpha);
             for (&got, &want) in out.iter().zip(expected.iter()) {
-                assert!((got as f64 - want).abs() <= 1e-5, "c={c}: {got} vs {want}");
+                assert!(
+                    (got as f64 - want).abs() <= 1e-5,
+                    "four_alpha={four_alpha}: {got} vs {want}"
+                );
             }
         }
     }
 
     #[test]
-    fn test_pflog1ppf_row_full_empty_cell_zeroed() {
+    fn test_pflog_row_full_empty_cell_zeroed() {
+        // v4: an empty cell yields baseline 0 → the whole row is zero.
         let full = vec![0.0f32, 0.0, 0.0];
         let (idx, data) = sparsify(&full);
         let mut out = vec![9.0f32; full.len()]; // pre-dirtied
-        pflog1ppf_row_full(&idx, &data, 1.0, full.len(), &mut out).unwrap();
+        pflog_row_full(&idx, &data, 4.0, full.len(), &mut out).unwrap();
         assert!(
             out.iter().all(|&v| v == 0.0),
             "empty cell must zero the row"
         );
     }
 
-    /// 🔴 The load-bearing property (review item A): projected PFlog1pPF must
-    /// equal the corresponding columns of FULL-transcriptome PFlog1pPF — depth
-    /// and D are over all genes, not the panel. Exercises the dense-remap path.
+    /// 🔴 The load-bearing property (review item A): projected PFlog must equal
+    /// the corresponding columns of FULL-transcriptome PFlog — the centering
+    /// denominator D and baseline sum are over all genes, not the panel.
+    /// Exercises the dense-remap path.
     #[test]
-    fn test_pflog1ppf_projection_equals_full_columns_dense_remap() {
+    fn test_pflog_projection_equals_full_columns_dense_remap() {
         let full = vec![0.0f32, 1.0, 3.0, 0.0, 2.0, 5.0, 0.0, 4.0];
         let (idx, data) = sparsify(&full);
-        let c = 1.0;
+        let four_alpha = 4.0;
         let panel = vec![1u32, 2, 5, 7]; // strict subset
         let proj = HvgProjection::new(panel.clone());
         assert!(proj.uses_dense_remap());
 
         let mut out = vec![0.0f32; proj.n_output_cols()];
-        proj.scatter_pflog1ppf_row(&idx, &data, c, full.len(), &mut out);
+        proj.scatter_pflog_row(&idx, &data, four_alpha, full.len(), &mut out);
 
-        let full_ref = reference_dense_row(&full, c);
+        let full_ref = reference_dense_row(&full, four_alpha);
         for (pos, &g) in panel.iter().enumerate() {
             assert!(
                 (out[pos] as f64 - full_ref[g as usize]).abs() <= 1e-5,
@@ -589,19 +594,19 @@ mod tests {
     /// Same property via the merge-scan fallback (forced by a tiny dense-remap
     /// byte cap), so both projection code paths are guarded.
     #[test]
-    fn test_pflog1ppf_projection_equals_full_columns_merge_scan() {
+    fn test_pflog_projection_equals_full_columns_merge_scan() {
         let full = vec![0.0f32, 1.0, 3.0, 0.0, 2.0, 5.0, 0.0, 4.0];
         let (idx, data) = sparsify(&full);
-        let c = 1.0;
+        let four_alpha = 4.0;
         let panel = vec![1u32, 2, 5, 7];
         // max_dense_remap_bytes = 0 forces the merge-scan path.
         let proj = HvgProjection::new_with_dense_remap_limit(panel.clone(), 0);
         assert!(!proj.uses_dense_remap());
 
         let mut out = vec![0.0f32; proj.n_output_cols()];
-        proj.scatter_pflog1ppf_row(&idx, &data, c, full.len(), &mut out);
+        proj.scatter_pflog_row(&idx, &data, four_alpha, full.len(), &mut out);
 
-        let full_ref = reference_dense_row(&full, c);
+        let full_ref = reference_dense_row(&full, four_alpha);
         for (pos, &g) in panel.iter().enumerate() {
             assert!(
                 (out[pos] as f64 - full_ref[g as usize]).abs() <= 1e-5,
@@ -612,23 +617,24 @@ mod tests {
         }
     }
 
-    /// A panel-LOCAL transform (depth/D over the panel only) would differ from
-    /// the full-transcriptome result — assert they actually diverge, so the
-    /// test above is meaningful (not trivially equal).
+    /// A panel-LOCAL transform (centering D and baseline sum over the panel
+    /// only) still differs from the full-transcriptome result in v4 — the
+    /// per-element `log1p(4α·x)` matches, but the baseline (over full-D / full
+    /// row) does not — so the property test above is non-trivial.
     #[test]
-    fn test_pflog1ppf_full_differs_from_panel_local() {
+    fn test_pflog_full_differs_from_panel_local() {
         let full = vec![0.0f32, 1.0, 3.0, 0.0, 2.0, 5.0, 0.0, 4.0];
         let (idx, data) = sparsify(&full);
-        let c = 1.0;
+        let four_alpha = 4.0;
         let panel = vec![1u32, 2, 5, 7];
         let proj = HvgProjection::new(panel.clone());
 
         let mut out = vec![0.0f32; proj.n_output_cols()];
-        proj.scatter_pflog1ppf_row(&idx, &data, c, full.len(), &mut out);
+        proj.scatter_pflog_row(&idx, &data, four_alpha, full.len(), &mut out);
 
-        // Panel-local reference: depth & D over the 4 panel genes only.
+        // Panel-local reference: D & baseline sum over the 4 panel genes only.
         let panel_vals: Vec<f32> = panel.iter().map(|&g| full[g as usize]).collect();
-        let panel_local = reference_dense_row(&panel_vals, c);
+        let panel_local = reference_dense_row(&panel_vals, four_alpha);
 
         let max_diff = out
             .iter()
@@ -637,7 +643,7 @@ mod tests {
             .fold(0.0f64, f64::max);
         assert!(
             max_diff > 1e-3,
-            "full-transcriptome and panel-local PFlog1pPF should differ, max_diff={max_diff}"
+            "full-transcriptome and panel-local PFlog should differ, max_diff={max_diff}"
         );
     }
 }

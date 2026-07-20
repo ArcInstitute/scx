@@ -28,7 +28,7 @@ use crate::error::{LoaderError, Result};
 use crate::io_stage::ShardGroup;
 use crate::normalize::apply_dense_transforms;
 use crate::pipeline::LoaderConfig;
-use crate::projection::{pflog1ppf_row_full, scatter_row_full, HvgProjection};
+use crate::projection::{pflog_row_full, scatter_row_full, HvgProjection};
 use crate::shuffle::RowShuffler;
 
 // ---------------------------------------------------------------------------
@@ -134,8 +134,8 @@ fn fill_batch_parallel(
     normalize: bool,
     log1p: bool,
     target_sum: f64,
-    pflog1ppf: bool,
-    pflog1ppf_c: f64,
+    pflog: bool,
+    four_alpha: f64,
     n_vars: usize,
     n_output_genes: usize,
     pool: &rayon::ThreadPool,
@@ -161,28 +161,22 @@ fn fill_batch_parallel(
             .try_for_each(|(output_row, &global_cell_idx)| -> Result<()> {
                 let (csr_indices, csr_data) = group_index.get_row(global_cell_idx, group)?;
 
-                if pflog1ppf {
-                    // PFlog1pPF needs the FULL pre-projection row to compute
-                    // depth s_i and the centering denominator D = n_vars, so it
-                    // dispatches here (at scatter time) rather than via the
-                    // post-scatter `apply_dense_transforms`. It IS the
-                    // normalization — normalize/log1p are not applied.
+                if pflog {
+                    // PFlog needs the FULL pre-projection row for the centering
+                    // denominator D = n_vars, so it dispatches here (at scatter
+                    // time) rather than via the post-scatter
+                    // `apply_dense_transforms`. It IS the normalization —
+                    // normalize/log1p are not applied. `four_alpha = 4α`.
                     match projection {
-                        Some(proj) => proj.scatter_pflog1ppf_row(
+                        Some(proj) => proj.scatter_pflog_row(
                             csr_indices,
                             csr_data,
-                            pflog1ppf_c,
+                            four_alpha,
                             n_vars,
                             output_row,
                         ),
                         None => {
-                            pflog1ppf_row_full(
-                                csr_indices,
-                                csr_data,
-                                pflog1ppf_c,
-                                n_vars,
-                                output_row,
-                            )?;
+                            pflog_row_full(csr_indices, csr_data, four_alpha, n_vars, output_row)?;
                         }
                     }
                     return Ok(());
@@ -193,7 +187,7 @@ fn fill_batch_parallel(
                 // row) before any HVG projection. With a projection, the dense
                 // `output_row` holds only the panel genes, so its own sum would
                 // be a panel-local depth that silently diverges from scanpy's
-                // normalize-then-subset and from the pflog1ppf path above. For
+                // normalize-then-subset and from the pflog path above. For
                 // the no-projection case this equals `output_row.iter().sum()`.
                 // Only needed when normalizing — skip the sum on raw-count /
                 // log1p-only configs (e.g. scVI) where `depth` is ignored.
@@ -717,8 +711,10 @@ pub fn decode_stage(
                 config.normalize,
                 config.log1p,
                 config.target_sum,
-                config.pflog1ppf,
-                config.pflog1ppf_c,
+                config.pflog,
+                // Resolved to Some at construction when pflog is on; 0.0 is an
+                // unused placeholder when pflog is off (branch not taken).
+                config.pflog_alpha.map(|a| 4.0 * a).unwrap_or(0.0),
                 n_vars as usize,
                 n_output_genes,
                 pool,
@@ -1626,7 +1622,7 @@ mod tests {
         }
     }
 
-    // ---- PFlog1pPF loader mode -------------------------------------------
+    // ---- PFlog (v4) loader mode ------------------------------------------
 
     /// Reconstruct the full dense row produced by `make_shard_data` for a given
     /// global cell index: two nonzeros at cols `(g*2)%n_vars` / `(g*2+1)%n_vars`
@@ -1638,26 +1634,25 @@ mod tests {
         row
     }
 
-    /// Spec §11.1 exact reference for one row.
-    fn pflog1ppf_reference_row(full: &[f64], c: f64) -> Vec<f64> {
-        let depth: f64 = full.iter().sum();
-        let logs: Vec<f64> = full.iter().map(|&v| (v / depth + c).ln()).collect();
+    /// v4 exact reference for one row: `log1p(4α·x) − rowmean` (no depth).
+    fn pflog_reference_row(full: &[f64], four_alpha: f64) -> Vec<f64> {
+        let logs: Vec<f64> = full.iter().map(|&v| (four_alpha * v).ln_1p()).collect();
         let mean = logs.iter().sum::<f64>() / logs.len() as f64;
         logs.iter().map(|&l| l - mean).collect()
     }
 
     #[test]
-    fn test_decode_pflog1ppf_no_projection() {
+    fn test_decode_pflog_no_projection() {
         let n_vars = 10;
         let shard = make_shard_data(4, n_vars, 0, None);
         let group = ShardGroup {
             shards: vec![shard],
         };
-        let c = 1.0;
+        let four_alpha = 4.0; // α = 1 (pinned — decode_stage has no reader to estimate from)
         let config = LoaderConfig {
             batch_size: 10,
-            pflog1ppf: true,
-            pflog1ppf_c: c,
+            pflog: true,
+            pflog_alpha: Some(1.0),
             obs_columns: Vec::new(),
             ..LoaderConfig::default()
         };
@@ -1687,7 +1682,7 @@ mod tests {
 
         for (row_pos, &global_idx) in batch.cell_indices.iter().enumerate() {
             let full = make_shard_full_row(global_idx as usize, n_vars);
-            let expected = pflog1ppf_reference_row(&full, c);
+            let expected = pflog_reference_row(&full, four_alpha);
             let row = &batch.x[row_pos * n_vars..(row_pos + 1) * n_vars];
             // Exact-transform match.
             for (col, (&got, &want)) in row.iter().zip(expected.iter()).enumerate() {
@@ -1712,24 +1707,24 @@ mod tests {
     }
 
     /// 🔴 End-to-end projection regression (review item A): with an HVG panel,
-    /// the loader's PFlog1pPF output must equal the corresponding columns of
-    /// FULL-transcriptome PFlog1pPF (depth & D over all genes), NOT panel-local.
+    /// the loader's PFlog output must equal the corresponding columns of
+    /// FULL-transcriptome PFlog (centering D over all genes), NOT panel-local.
     #[test]
-    fn test_decode_pflog1ppf_projection_uses_full_transcriptome() {
+    fn test_decode_pflog_projection_uses_full_transcriptome() {
         let n_vars = 10;
         let shard = make_shard_data(5, n_vars, 0, None);
         let group = ShardGroup {
             shards: vec![shard],
         };
-        let c = 1.0;
+        let four_alpha = 4.0; // α = 1 (pinned)
         let panel: Vec<u32> = vec![0, 1, 2, 3]; // strict subset of 10 genes
         let proj = HvgProjection::new(panel.clone());
         let n_output = proj.n_output_cols();
 
         let config = LoaderConfig {
             batch_size: 10,
-            pflog1ppf: true,
-            pflog1ppf_c: c,
+            pflog: true,
+            pflog_alpha: Some(1.0),
             obs_columns: Vec::new(),
             ..LoaderConfig::default()
         };
@@ -1760,7 +1755,7 @@ mod tests {
         assert_eq!(batch.x_shape.1, n_output);
         for (row_pos, &global_idx) in batch.cell_indices.iter().enumerate() {
             let full = make_shard_full_row(global_idx as usize, n_vars);
-            let full_ref = pflog1ppf_reference_row(&full, c); // depth & D over ALL 10 genes
+            let full_ref = pflog_reference_row(&full, four_alpha); // D over ALL 10 genes
             let row = &batch.x[row_pos * n_output..(row_pos + 1) * n_output];
             for (pos, &g) in panel.iter().enumerate() {
                 assert!(

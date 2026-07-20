@@ -10,6 +10,9 @@ authors.workspace = true
 scx-format-io = { path = "../scx-format-io", features = ["deletion-vectors"] }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
+# v4 PFlog α estimator (estimate_alpha) — cycle-free (scx-accel deps only
+# scx-format-io + scx-sparse). Used at loader construction when pflog_alpha=None.
+scx-accel = { path = "../scx-accel" }
 # GPU training-loader decode (Phase D). Hard-cudarc crate — only builds with the
 # CUDA toolchain, so gated behind the opt-in `gpu` feature (mirrors scx-accel).
 scx-gpu = { path = "../scx-gpu", optional = true }

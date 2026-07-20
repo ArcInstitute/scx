@@ -3683,6 +3683,7 @@ dependencies = [
  "rand_chacha 0.3.1",
  "rayon",
  "roaring",
+ "scx-accel",
  "scx-codec",
  "scx-format-io",
  "scx-gpu",

@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1};
-use pyo3::exceptions::{PyIndexError, PyKeyError, PyRuntimeError, PyStopIteration};
+use pyo3::exceptions::{PyIndexError, PyKeyError, PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use scx_format_io::CacheMetrics;
@@ -64,7 +64,7 @@ use scx_format_io::ScxReader;
 ///                            normalize=False, log1p=False)
 /// ```
 ///
-/// See the `normalize` / `log1p` / `target_sum` / `pflog1ppf` constructor args
+/// See the `normalize` / `log1p` / `target_sum` / `pflog` constructor args
 /// below for the full normalization surface.
 ///
 /// # Fork safety
@@ -125,15 +125,17 @@ impl TrainingDataset {
     ///     log1p: Apply log1p transformation (default: True). On by default;
     ///         pass `log1p=False` to disable. See `normalize`.
     ///     target_sum: Normalization target sum (default: 1e4).
-    ///     pflog1ppf: Apply PFlog1pPF / shifted-CLR normalization
-    ///         (Booeshaghi et al. 2026) instead of normalize/log1p
-    ///         (default: False). PFlog1pPF is itself a normalization, so it is
-    ///         mutually exclusive with `normalize`/`log1p`: when True it takes
-    ///         precedence and those flags are ignored. Depth and the centering
-    ///         denominator are computed over the full transcriptome even under
-    ///         `hvg_indices` projection.
-    ///     pflog1ppf_c: PFlog1pPF shift / pseudocount `c` (default: 1.0; only
-    ///         used when `pflog1ppf=True`).
+    ///     pflog: Apply PFlog (v4) / shifted-log normalization on raw counts
+    ///         (Booeshaghi et al.) instead of normalize/log1p (default: False).
+    ///         PFlog is itself a normalization, so it is mutually exclusive with
+    ///         `normalize`/`log1p`: when True it takes precedence and those flags
+    ///         are ignored. The centering denominator is computed over the full
+    ///         transcriptome even under `hvg_indices` projection.
+    ///     pflog_alpha: PFlog NB overdispersion `α` (matrix-wide pseudocount
+    ///         1/(4α); only used when `pflog=True`). None (default) estimates α
+    ///         once at construction from the dataset's raw counts (single-modality
+    ///         only; a modality-scoped loader must pin it); a float pins a
+    ///         reference α (e.g. from `pyscx.accel.pflog`).
     ///     shard_group_size: Shards per I/O group (default: 8).
     ///     prefetch_batches: Ring buffer depth (default: 4).
     ///     seed: RNG seed for reproducibility (default: 42).
@@ -160,8 +162,8 @@ impl TrainingDataset {
         normalize=None,
         log1p=None,
         target_sum=None,
-        pflog1ppf=None,
-        pflog1ppf_c=None,
+        pflog=None,
+        pflog_alpha=None,
         shard_group_size=None,
         prefetch_batches=None,
         seed=None,
@@ -177,8 +179,8 @@ impl TrainingDataset {
         normalize: Option<bool>,
         log1p: Option<bool>,
         target_sum: Option<f64>,
-        pflog1ppf: Option<bool>,
-        pflog1ppf_c: Option<f64>,
+        pflog: Option<bool>,
+        pflog_alpha: Option<f64>,
         shard_group_size: Option<usize>,
         prefetch_batches: Option<usize>,
         seed: Option<u64>,
@@ -202,8 +204,8 @@ impl TrainingDataset {
             normalize,
             log1p,
             target_sum,
-            pflog1ppf,
-            pflog1ppf_c,
+            pflog,
+            pflog_alpha,
             seed,
             hvg_indices,
             obs_columns.unwrap_or_default(),
@@ -392,8 +394,8 @@ fn resolve_loader_config(
     normalize: Option<bool>,
     log1p: Option<bool>,
     target_sum: Option<f64>,
-    pflog1ppf: Option<bool>,
-    pflog1ppf_c: Option<f64>,
+    pflog: Option<bool>,
+    pflog_alpha: Option<f64>,
     seed: Option<u64>,
     hvg_indices: Option<Vec<u32>>,
     obs_columns: Vec<String>,
@@ -411,8 +413,8 @@ fn resolve_loader_config(
         normalize: normalize.unwrap_or(defaults.normalize),
         log1p: log1p.unwrap_or(defaults.log1p),
         target_sum: target_sum.unwrap_or(defaults.target_sum),
-        pflog1ppf: pflog1ppf.unwrap_or(defaults.pflog1ppf),
-        pflog1ppf_c: pflog1ppf_c.unwrap_or(defaults.pflog1ppf_c),
+        pflog: pflog.unwrap_or(defaults.pflog),
+        pflog_alpha: pflog_alpha.or(defaults.pflog_alpha),
         seed: seed.unwrap_or(defaults.seed),
         max_memory_mb,
         auto_memory_budget,
@@ -526,11 +528,11 @@ impl MultimodalTrainingDataset {
     ///         `{"X": {name: ndarray}, "obs": {...}, "cell_indices": ...}`.
     ///         If False, yield a tuple `(X_0, X_1, …)` aligned with
     ///         `modalities` order.
-    ///     normalize, log1p, target_sum, pflog1ppf, pflog1ppf_c,
+    ///     normalize, log1p, target_sum, pflog, pflog_alpha,
     ///     shard_group_size, prefetch_batches, seed, max_memory_mb: see
     ///     `TrainingDataset` for semantics — applied to every modality
-    ///     uniformly. `pflog1ppf` (RNA-appropriate) replaces normalize/log1p
-    ///     when set. An explicit `max_memory_mb` is divided across modalities
+    ///     uniformly. `pflog` (RNA-appropriate) replaces normalize/log1p
+    ///     when set (a modality-scoped loader must pin `pflog_alpha`). An explicit `max_memory_mb` is divided across modalities
     ///     proportionally to per-modality nnz (modalities with denser X get a
     ///     larger share of the memory budget). When omitted, each modality's
     ///     per-modality share becomes an adaptive floor (raised to fit that
@@ -548,8 +550,8 @@ impl MultimodalTrainingDataset {
         normalize=None,
         log1p=None,
         target_sum=None,
-        pflog1ppf=None,
-        pflog1ppf_c=None,
+        pflog=None,
+        pflog_alpha=None,
         shard_group_size=None,
         prefetch_batches=None,
         seed=None,
@@ -565,8 +567,8 @@ impl MultimodalTrainingDataset {
         normalize: Option<bool>,
         log1p: Option<bool>,
         target_sum: Option<f64>,
-        pflog1ppf: Option<bool>,
-        pflog1ppf_c: Option<f64>,
+        pflog: Option<bool>,
+        pflog_alpha: Option<f64>,
         shard_group_size: Option<usize>,
         prefetch_batches: Option<usize>,
         seed: Option<u64>,
@@ -662,8 +664,8 @@ impl MultimodalTrainingDataset {
                     normalize,
                     log1p,
                     target_sum,
-                    pflog1ppf,
-                    pflog1ppf_c,
+                    pflog,
+                    pflog_alpha,
                     seed,
                     hvg_indices.clone(),
                     obs_columns.clone(),
@@ -1023,14 +1025,14 @@ impl IndexPlanDataset {
     ///         `normalize`; all four (normalize, log1p) combinations are
     ///         honoured, matching `TrainingDataset` semantics.
     ///     target_sum: Normalization target sum (default: 1e4).
-    ///     pflog1ppf: Apply PFlog1pPF / shifted-CLR normalization
-    ///         (Booeshaghi et al. 2026) instead of normalize/log1p
-    ///         (default: False). Mutually exclusive with `normalize`/`log1p`
-    ///         (takes precedence when True). Depth and the centering
-    ///         denominator are over the full transcriptome even under
-    ///         `hvg_indices` projection. See `TrainingDataset` for semantics.
-    ///     pflog1ppf_c: PFlog1pPF shift / pseudocount `c` (default: 1.0; only
-    ///         used when `pflog1ppf=True`).
+    ///     pflog: Apply PFlog (v4) / shifted-log normalization on raw counts
+    ///         (Booeshaghi et al.) instead of normalize/log1p (default: False).
+    ///         Mutually exclusive with `normalize`/`log1p` (takes precedence when
+    ///         True). The centering denominator is over the full transcriptome
+    ///         even under `hvg_indices` projection. See `TrainingDataset`.
+    ///     pflog_alpha: PFlog NB overdispersion `α` (pseudocount 1/(4α); only
+    ///         used when `pflog=True`). None (default) estimates α once at
+    ///         construction (single-modality only); a float pins a reference α.
     ///     cache_shards: LRU shard cache count cap (default: 128). Must be
     ///         >= 1. Auto-tuned downward to fit `max_memory_mb`; check the
     ///         resolved value via `effective_cache_shards()`. The cache also
@@ -1066,8 +1068,8 @@ impl IndexPlanDataset {
         normalize=None,
         log1p=None,
         target_sum=None,
-        pflog1ppf=None,
-        pflog1ppf_c=None,
+        pflog=None,
+        pflog_alpha=None,
         cache_shards=None,
         sort_by_shard=None,
         lookahead=None,
@@ -1083,8 +1085,8 @@ impl IndexPlanDataset {
         normalize: Option<bool>,
         log1p: Option<bool>,
         target_sum: Option<f64>,
-        pflog1ppf: Option<bool>,
-        pflog1ppf_c: Option<f64>,
+        pflog: Option<bool>,
+        pflog_alpha: Option<f64>,
         cache_shards: Option<usize>,
         sort_by_shard: Option<bool>,
         lookahead: Option<usize>,
@@ -1108,11 +1110,11 @@ impl IndexPlanDataset {
         if let Some(v) = target_sum {
             config.target_sum = v;
         }
-        if let Some(v) = pflog1ppf {
-            config.pflog1ppf = v;
+        if let Some(v) = pflog {
+            config.pflog = v;
         }
-        if let Some(v) = pflog1ppf_c {
-            config.pflog1ppf_c = v;
+        if let Some(v) = pflog_alpha {
+            config.pflog_alpha = Some(v);
         }
         if let Some(v) = max_memory_mb {
             config.max_memory_mb = v;
@@ -1959,6 +1961,7 @@ fn collated_cellset_batch_to_dict<'py>(
     indptr, indices, data, set_offsets, cell_indices, file_ids, role_tags,
     k_dec, query_gene_ids, enc_mask_positions, hide_readout, n_measured,
     k_enc, mode, n_genes_total, target_sum=None, lib_size_redef=None,
+    pflog_alpha=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn collate_cellset_gathered<'py>(
@@ -1980,12 +1983,31 @@ pub fn collate_cellset_gathered<'py>(
     n_genes_total: i64,
     target_sum: Option<f64>,
     lib_size_redef: Option<bool>,
+    pflog_alpha: Option<f64>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let mode = PreprocessMode::parse(&mode).map_err(loader_err_to_py)?;
+    // v4 PFlog collate mode needs a pinned α (no dataset to estimate from here).
+    if mode == PreprocessMode::PflogRaw {
+        match pflog_alpha {
+            None => {
+                return Err(PyValueError::new_err(
+                    "collate mode 'pflog_raw' requires pflog_alpha (estimate it once via \
+                     pyscx.accel.pflog and pass it here)",
+                ));
+            }
+            Some(a) if a <= 0.0 || !a.is_finite() => {
+                return Err(PyValueError::new_err(format!(
+                    "pflog_alpha must be positive and finite, got {a}"
+                )));
+            }
+            _ => {}
+        }
+    }
     let scalars = CollateScalars {
         k_enc,
         mode,
         target_sum: target_sum.unwrap_or(1e4),
+        pflog_alpha,
         n_genes_total,
         lib_size_redef: lib_size_redef.unwrap_or(false),
     };
