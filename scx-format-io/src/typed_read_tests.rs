@@ -634,7 +634,6 @@ fn g2_exact_integer_read_above_2pow24() {
 #[test]
 fn typed_read_applies_deletion_vectors() {
     use crate::deletion_vectors::DeletionVectors;
-    use roaring::RoaringBitmap;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("dv.scx");
@@ -648,12 +647,9 @@ fn typed_read_applies_deletion_vectors() {
     writer
         .write_csr_shard(ip, ix, v, CodecId::None, *enc, *rs)
         .unwrap();
-    // Delete local rows 1 and 4 of shard 0.
+    // Delete global rows 1 and 4 (single shard, row_start 0 → local == global).
     let mut dv = DeletionVectors::new();
-    let mut bm = RoaringBitmap::new();
-    bm.insert(1);
-    bm.insert(4);
-    dv.insert(0, bm);
+    dv.insert_global([1u32, 4]);
     writer.write_deletion_vectors(&dv).unwrap();
     writer.finish().unwrap();
 

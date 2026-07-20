@@ -667,8 +667,11 @@ impl CloudReader {
             None => return Ok(None),
         };
         let bytes = self.read_section_for_entry(&entry).await?;
-        let dv = scx_format_io::DeletionVectors::read_from(&mut Cursor::new(&bytes), bytes.len())
-            .map_err(CloudError::from)?;
+        let mut dv =
+            scx_format_io::DeletionVectors::read_from(&mut Cursor::new(&bytes), bytes.len())
+                .map_err(CloudError::from)?;
+        // Fold a legacy v1 (per-shard) section to the v2 global representation.
+        dv.fold_v1_to_global(&self.catalog);
         Ok(Some(dv))
     }
 

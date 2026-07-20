@@ -45,7 +45,7 @@ pub use bitmap::{
     BITMAP_SHARD_VERSION,
 };
 #[cfg(feature = "deletion-vectors")]
-pub use deletion_vectors::{DeletionVectors, ShardDeletion};
+pub use deletion_vectors::DeletionVectors;
 pub use distinct::DistinctAccumulator;
 pub use encoder::{
     encode_one_shard, encode_one_shard_from_bytes, encode_one_shard_with_value_encoding,

@@ -411,10 +411,13 @@ impl QueryPipeline {
 
         // Global keep-mask for deletion vectors (None when the archive is clean,
         // which is the case for a freshly written grouped output).
+        // The DV-present guard (`from_reader_for_modality`) still forces
+        // modality 0 whenever deletions exist, so the global keep-mask matches
+        // today's behavior. Phase 4 switches this to `self.modality_id`.
         let keep_mask: Option<Vec<bool>> = self
             .deletion_vectors
             .as_ref()
-            .map(|dv| dv.build_keep_mask(n_obs as usize, self.reader.catalog()));
+            .map(|dv| dv.build_keep_mask_global(n_obs as usize));
 
         let csr_shards: Vec<&FullCatalogEntry> =
             crate::collect::scan_shards(self.reader.catalog(), self.modality_id);

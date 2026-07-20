@@ -68,33 +68,12 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         DeletionVectors::new()
     };
 
-    // Get shard stats sorted by row_start to map global indices -> (shard_id, local_row).
-    // Use the sort-order index as shard_id. This is safe because deletion vectors are
-    // always stored in the same catalog as the shards they reference, and shards_sorted()
-    // is deterministic (sorted by row_start). The compact operation reads DVs and shards
-    // from the same catalog, so the mapping is consistent.
-    let shards = catalog.shards_sorted();
-    let shard_ranges: Vec<(u32, u64, u64)> = shards
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| e.stats.as_ref().map(|s| (i as u32, s.row_start, s.row_end)))
-        .collect();
-
-    // Map cell indices to per-shard bitmaps.
-    // shard_ranges is sorted by row_start, so use binary search (O(n log m))
-    // instead of linear scan (O(n × m)).
+    // Deletion vectors are v2 global-obs bitmaps: record each validated global
+    // cell index directly under the whole-cell (modality 0) key. No shard
+    // mapping — a global bitmap over `[0, n_obs)` applies identically to every
+    // modality's CSR shards, so a multimodal delete is correct by construction.
     let mut new_dv = DeletionVectors::new();
-    for &global_idx in cell_indices {
-        // Find the first shard whose row_end > global_idx
-        let shard_idx = shard_ranges.partition_point(|&(_, _, end)| end <= global_idx);
-        if shard_idx < shard_ranges.len() {
-            let (shard_id, row_start, _) = shard_ranges[shard_idx];
-            if global_idx >= row_start {
-                let local_row = (global_idx - row_start) as u32;
-                new_dv.shards.entry(shard_id).or_default().insert(local_row);
-            }
-        }
-    }
+    new_dv.insert_global(cell_indices.iter().map(|&idx| idx as u32));
 
     // Merge new deletions into existing
     dv.merge(&new_dv);

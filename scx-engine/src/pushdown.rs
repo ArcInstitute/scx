@@ -76,14 +76,14 @@ pub fn prune_shards_by_catalog_with_dict(
             }
         };
 
-        // B3: Check deletion vectors — if entire shard is deleted, skip it
+        // B3: Check deletion vectors — if entire shard is deleted, skip it.
+        // v2 deletions are global obs rows, so count those falling in the
+        // shard's [row_start, row_end).
         if let Some(dv) = deletion_vectors {
             let shard_n_rows = stats.row_end - stats.row_start;
-            if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
-                if bitmap.len() >= shard_n_rows {
-                    // All rows deleted → skip this shard entirely
-                    continue;
-                }
+            if dv.deleted_in_range(stats.row_start, stats.row_end) >= shard_n_rows {
+                // All rows deleted → skip this shard entirely
+                continue;
             }
         }
 
@@ -551,7 +551,8 @@ mod tests {
             bm.insert(i);
         }
         let mut dv = DeletionVectors::new();
-        dv.shards.insert(0, bm);
+        // Shard 0 has row_start 0, so local rows == global obs rows.
+        dv.deletions.insert(0, bm);
         let candidates = prune_shards_by_catalog(&catalog, &[], Some(&dv));
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].shard_idx, 1);
@@ -569,7 +570,8 @@ mod tests {
             bm.insert(i);
         }
         let mut dv = DeletionVectors::new();
-        dv.shards.insert(0, bm);
+        // Shard 0 has row_start 0, so local rows == global obs rows.
+        dv.deletions.insert(0, bm);
         let candidates = prune_shards_by_catalog(&catalog, &[], Some(&dv));
         // Both shards included: shard 0 is only partially deleted
         assert_eq!(candidates.len(), 2);

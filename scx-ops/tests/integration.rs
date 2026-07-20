@@ -296,10 +296,10 @@ fn test_delete_marks_cells() {
 
     let dv = reader.read_deletion_vectors().unwrap().unwrap();
     assert_eq!(dv.total_deleted(), 3);
-    assert!(dv.is_deleted(0, 0));
-    assert!(dv.is_deleted(0, 3));
-    assert!(dv.is_deleted(0, 5));
-    assert!(!dv.is_deleted(0, 1));
+    assert!(dv.is_deleted_global(0));
+    assert!(dv.is_deleted_global(3));
+    assert!(dv.is_deleted_global(5));
+    assert!(!dv.is_deleted_global(1));
 }
 
 #[test]

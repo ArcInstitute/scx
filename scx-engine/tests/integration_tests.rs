@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use roaring::RoaringBitmap;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{build_indexes, QueryPipeline};
 use scx_format_io::header::FileHeader;
@@ -284,17 +283,10 @@ fn write_deletion_vectors_fixture(dir: &TempDir) -> PathBuf {
             .unwrap();
     }
 
-    // Write deletion vectors: delete rows 0,1,2 in shard 0 and rows 10,11 in shard 2
+    // Write deletion vectors as v2 global obs rows: shard 0 rows 0,1,2 and
+    // shard 2 (row_start 400) local rows 10,11 → global 410,411.
     let mut dv = DeletionVectors::new();
-    let mut bm0 = RoaringBitmap::new();
-    bm0.insert(0);
-    bm0.insert(1);
-    bm0.insert(2);
-    dv.shards.insert(0, bm0);
-    let mut bm2 = RoaringBitmap::new();
-    bm2.insert(10);
-    bm2.insert(11);
-    dv.shards.insert(2, bm2);
+    dv.insert_global([0u32, 1, 2, 410, 411]);
     writer.write_deletion_vectors(&dv).unwrap();
 
     writer.finish().unwrap();

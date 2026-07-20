@@ -553,12 +553,9 @@ mod tests {
             )
             .unwrap();
 
-        // Write deletion vectors
-        let mut bitmap = roaring::RoaringBitmap::new();
-        bitmap.insert(5);
-        bitmap.insert(10);
+        // Write deletion vectors (global obs rows 5 and 10).
         let mut dv = DeletionVectors::new();
-        dv.shards.insert(0, bitmap);
+        dv.insert_global([5u32, 10]);
         writer.write_deletion_vectors(&dv).unwrap();
         writer.finish().unwrap();
 
@@ -575,7 +572,7 @@ mod tests {
         assert!(reader.header().has_deletion_vectors());
 
         let dv_read = reader.read_deletion_vectors().unwrap().unwrap();
-        assert_eq!(dv_read.shards.len(), 1);
+        assert_eq!(dv_read.deletions.len(), 1);
         assert_eq!(dv_read.total_deleted(), 2);
     }
 

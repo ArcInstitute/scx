@@ -702,7 +702,6 @@ mod tests {
 
     #[test]
     fn optimize_preserves_deletion_vectors() {
-        use roaring::RoaringBitmap;
         use scx_format_io::deletion_vectors::DeletionVectors;
 
         let dir = tempfile::tempdir().unwrap();
@@ -728,11 +727,9 @@ mod tests {
                 0,
             )
             .unwrap();
-            // Mark local row 1 of shard 0 as logically deleted.
+            // Mark global row 1 as logically deleted (single shard, row_start 0).
             let mut dv = DeletionVectors::new();
-            let mut bm = RoaringBitmap::new();
-            bm.insert(1);
-            dv.insert(0, bm);
+            dv.insert_global([1u32]);
             w.write_deletion_vectors(&dv).unwrap();
             w.finish().unwrap();
         }
@@ -751,7 +748,7 @@ mod tests {
             .read_deletion_vectors()
             .unwrap()
             .expect("deletion-vector section present after optimize");
-        assert!(dv.is_deleted(0, 1));
+        assert!(dv.is_deleted_global(1));
         assert_eq!(dv.total_deleted(), 1);
         // optimize does NOT apply deletions — rows stay (logical deletion).
         assert_eq!(out.read_obs().unwrap().num_rows(), n_obs);

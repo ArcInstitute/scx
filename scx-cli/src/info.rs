@@ -400,11 +400,12 @@ fn render_text(model: &InfoModel) -> CliResult<()> {
 
     // Deletion vector detail
     if let Some(dv) = &model.deletion_vectors {
-        let n_shards_with_dv = dv.shards.len();
+        let n_entries = dv.deletions.len();
         let total_deleted = dv.total_deleted();
         println!(
-            "Deletion vectors: {} shards, {} cells deleted",
-            n_shards_with_dv,
+            "Deletion vectors: {} modality {}, {} cells deleted",
+            n_entries,
+            if n_entries == 1 { "entry" } else { "entries" },
             fmt_num(total_deleted),
         );
     }
@@ -541,7 +542,7 @@ fn render_json(model: &InfoModel) -> CliResult<()> {
     // Deletion vectors
     if let Some(dv) = &model.deletion_vectors {
         obj["deletion_vectors"] = serde_json::json!({
-            "n_shards": dv.shards.len(),
+            "n_entries": dv.deletions.len(),
             "total_deleted": dv.total_deleted(),
         });
     }

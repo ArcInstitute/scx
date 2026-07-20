@@ -115,7 +115,7 @@ pub fn compact_with_index_options(
     // vectors + catalog shard order. Needs only `n_obs` + the catalog, so it
     // runs before any obs read. `total_kept` is the post-deletion obs row
     // count (== the filtered batch's row count on the eager path).
-    let keep_mask = build_keep_mask(n_obs, &dv, reader.catalog());
+    let keep_mask = build_keep_mask(n_obs, &dv);
     let total_kept = keep_mask
         .as_ref()
         .map(|m| m.iter().filter(|&&k| k).count())
@@ -881,7 +881,7 @@ fn compact_multimodal(
     let dv = reader.read_deletion_vectors()?;
 
     let n_obs = in_header.n_obs as usize;
-    let keep_mask = build_keep_mask(n_obs, &dv, reader.catalog());
+    let keep_mask = build_keep_mask(n_obs, &dv);
     let total_kept = keep_mask
         .as_ref()
         .map(|m| m.iter().filter(|&&k| k).count())
@@ -1356,19 +1356,13 @@ fn compact_multimodal(
     Ok(())
 }
 
-/// Build a keep mask based on deletion vectors.
-fn build_keep_mask(
-    n_obs: usize,
-    dv: &Option<scx_format_io::DeletionVectors>,
-    catalog: &scx_format_io::FullCatalog,
-) -> Option<Vec<bool>> {
+/// Build a keep mask based on deletion vectors (v2 global obs bitmap).
+fn build_keep_mask(n_obs: usize, dv: &Option<scx_format_io::DeletionVectors>) -> Option<Vec<bool>> {
     let dv = dv.as_ref()?;
     if dv.total_deleted() == 0 {
         return None;
     }
-    // Shared mask construction (sort-order shard index → global rows via
-    // `stats.row_start`); see `DeletionVectors::build_keep_mask`.
-    Some(dv.build_keep_mask(n_obs, catalog))
+    Some(dv.build_keep_mask_global(n_obs))
 }
 
 #[cfg(test)]

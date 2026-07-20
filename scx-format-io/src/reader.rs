@@ -3171,10 +3171,13 @@ impl ScxReader {
             .find(|e| e.section_type == SectionType::DeletionVectors)
             .ok_or_else(|| ScxError::SectionNotFound("deletion_vectors".to_string()))?;
         let slice = self.section_bytes(entry)?;
-        let dv = crate::deletion_vectors::DeletionVectors::read_from(
+        let mut dv = crate::deletion_vectors::DeletionVectors::read_from(
             &mut Cursor::new(slice),
             slice.len(),
         )?;
+        // Fold a legacy v1 (per-shard, shard-local) section to the v2 global
+        // representation so every downstream consumer sees the v2 shape.
+        dv.fold_v1_to_global(&self.full_catalog);
         Ok(Some(dv))
     }
 
@@ -3195,10 +3198,7 @@ impl ScxReader {
             Some(dv) if dv.total_deleted() > 0 => dv,
             _ => return Ok(None),
         };
-        Ok(Some(dv.build_keep_mask(
-            self.n_obs() as usize,
-            &self.full_catalog,
-        )))
+        Ok(Some(dv.build_keep_mask_global(self.n_obs() as usize)))
     }
 
     /// Read all CSR shards with deletion vectors applied.

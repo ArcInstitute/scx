@@ -27,7 +27,6 @@ use std::sync::Arc;
 
 use arrow::array::{Float32Array, RecordBatch, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use roaring::RoaringBitmap;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{
     build_obs_predicate_index_bytes, build_var_predicate_index_bytes, BuildOutcome,
@@ -36,7 +35,7 @@ use scx_engine::{
 use scx_format_io::header::{FileHeader, DEFAULT_WRITE_FORMAT_VERSION};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::writer::ScxWriter;
-use scx_format_io::{BitmapShard, DeletionVectors, FullCatalog, ModalityType, SectionType};
+use scx_format_io::{BitmapShard, FullCatalog, ModalityType, SectionType};
 use serde::{Deserialize, Serialize};
 
 const SEED: u64 = 0xDEAD_BEEF_CAFE_1234;
@@ -400,29 +399,18 @@ fn generate_v1_predicate_indexes(out: &Path) {
 }
 
 fn generate_v1_deletion_vectors(out: &Path) {
-    // Seed the file with a single shard, then write a deletion vector
-    // bitmap directly. Goes through ScxWriter rather than scx-ops so
-    // the manifest chain stays single-catalog (deterministic across
-    // platforms, no scx-ops shard layout depending on
-    // shard_target_rows).
-    let n_obs = 40;
-    let n_vars = 25;
-    let header = default_header(n_obs as u64, n_vars as u64);
-    let mut writer = ScxWriter::new(out, header).unwrap();
-    write_minimal_into(&mut writer, n_obs, n_vars, 5);
-
-    let mut bitmap = RoaringBitmap::new();
-    // Delete a deterministic spread of rows.
-    bitmap.insert(2);
-    bitmap.insert(5);
-    bitmap.insert(11);
-    bitmap.insert(13);
-    bitmap.insert(28);
-    let mut dv = DeletionVectors::new();
-    dv.insert(0, bitmap);
-    writer.write_deletion_vectors(&dv).unwrap();
-
-    writer.finish().unwrap();
+    // `v1_deletion_vectors.scx` is a FROZEN legacy back-compat fixture: it must
+    // remain a genuine v1 (per-shard, shard-local) deletion-vectors file so the
+    // reader's v1 -> v2 fold stays under test. Writers now emit the v2 layout
+    // only (global-obs bitmap keyed by modality), so this generator can no
+    // longer recreate the v1 bytes — it preserves the committed file instead of
+    // overwriting it with a v2 section.
+    assert!(
+        out.exists(),
+        "v1_deletion_vectors.scx is a frozen v1 back-compat fixture that the \
+         v2 writer cannot regenerate; restore it from git ({})",
+        out.display()
+    );
 }
 
 fn generate_v2_multimodal_citeseq(out: &Path) {
