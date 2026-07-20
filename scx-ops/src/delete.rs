@@ -251,3 +251,108 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
 
     Ok(dv.total_deleted())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Safety net for the per-modality deletion-vector rewrite (DV wire format
+    //! v1 → v2: global-obs-indexed bitmaps keyed by modality, replacing the
+    //! flattened positional-shard keying).
+    //!
+    //! Must-stay-green set the DV v1→v2 rewrite must not regress:
+    //!   - `scx-format-io/src/deletion_vectors.rs` unit tests (round_trip,
+    //!     merge_vectors, build_keep_mask_translates_local_rows_to_global,
+    //!     read_rejects_unknown_version, check_version_rejects_future,
+    //!     empty_round_trip, sorted_serialization_byte_stable,
+    //!     dv_rejects_oversized_n_shards, dv_rejects_oversized_bitmap_len)
+    //!   - `scx-ops/tests/integration.rs`: test_delete_marks_cells,
+    //!     test_mark_deleted_rejects_oob_indices, test_delete_filtered_read,
+    //!     test_delete_then_compact, test_delete_idempotent
+    //!   - `pyscx/tests/test_ops.py`: test_mark_deleted_*,
+    //!     test_n_obs_reflects_deletions, test_compact
+    //!   - `rscx/tests/testthat/test-ops.R`: delete / compact / rollback
+    //!   - conformance `v1_deletion_vectors` validators (Rust + pyscx) plus the
+    //!     Phase 0 back-compat anchor
+    //!     `conformance_vectors::test_v1_deletion_vectors_backcompat_read_baseline`
+    use crate::test_utils::{fixture_multimodal, fixture_multimodal_multishard};
+    use scx_format_io::ScxReader;
+
+    /// GREEN lock: on the single-shard-per-modality fixture the common eager
+    /// filtered read is already correct today (the v1 `local = idx - row_start`
+    /// / `global = row_start + local` arithmetic cancels for single-shard
+    /// modalities). The DV v2 rewrite must keep this path correct.
+    #[test]
+    fn delete_multimodal_eager_read_drops_rows_from_all_modalities() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_multimodal(&dir);
+        let deleted = [3u64, 7];
+        let n = crate::mark_deleted(&path, &deleted).unwrap();
+        assert_eq!(n, deleted.len() as u64);
+
+        let reader = ScxReader::open(&path).unwrap();
+        let rna_id = reader.modality_id("rna").unwrap();
+        let adt_id = reader.modality_id("adt").unwrap();
+        for m in [rna_id, adt_id] {
+            let csr = reader.read_all_csr_shards_for_filtered(m).unwrap();
+            assert_eq!(csr.shape.0, 10, "modality {m}: 12 - 2 deleted rows");
+            assert_eq!(csr.nnz(), 20, "modality {m}: 10 rows x 2 nnz");
+        }
+    }
+
+    /// GREEN lock (multi-shard-per-modality): deleting a global cell must drop
+    /// that row from EVERY modality's *eager* filtered read and keep every
+    /// modality cell-aligned. Notably this already holds under the v1
+    /// positional-shard mapping — even though `shards_sorted()` +
+    /// `partition_point` runs over overlapping per-modality ranges, the write
+    /// side's `local = idx - row_start` and the read side's
+    /// `global = row_start + local` cancel through the *same* flattened list, so
+    /// the obs-length keep-mask is reconstructed correctly. The v1 bug is
+    /// therefore confined to per-modality DV *resolution* (only one modality's
+    /// bitmap is marked) and the engine's modality-scoped-query guard — not this
+    /// eager path. The DV v2 rewrite must keep this lock green.
+    #[test]
+    fn delete_multimodal_multishard_marks_all_modalities() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_multimodal_multishard(&dir);
+        // Rows chosen to land in non-first shards of each modality.
+        let deleted = [3u64, 8, 10];
+        let n = crate::mark_deleted(&path, &deleted).unwrap();
+        assert_eq!(n, deleted.len() as u64);
+
+        let reader = ScxReader::open(&path).unwrap();
+        let rna_id = reader.modality_id("rna").unwrap();
+        let adt_id = reader.modality_id("adt").unwrap();
+        let expect_rows = 12 - deleted.len();
+        for m in [rna_id, adt_id] {
+            let csr = reader.read_all_csr_shards_for_filtered(m).unwrap();
+            assert_eq!(
+                csr.shape.0, expect_rows,
+                "modality {m} must drop every deleted row"
+            );
+            assert_eq!(csr.nnz(), expect_rows * 2, "modality {m} row-alignment");
+        }
+    }
+
+    /// Current-limitation lock — the concrete behavior this feature removes. A
+    /// modality-scoped engine query against a multimodal file that carries
+    /// deletion vectors is rejected today with
+    /// `EngineError::MultimodalDeletionVectorsUnsupported` (the v1 DV keys are
+    /// recorded against the flattened all-modality shard order and cannot be
+    /// remapped per modality). Phase 4 removes this guard; this test then flips
+    /// to assert the modality query succeeds and returns deletion-filtered rows.
+    #[test]
+    fn modality_scoped_query_with_deletions_is_currently_guarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_multimodal(&dir);
+        crate::mark_deleted(&path, &[4]).unwrap();
+
+        let rna_id = ScxReader::open(&path).unwrap().modality_id("rna").unwrap();
+        let err = scx_engine::QueryPipeline::open_for_modality(&path, rna_id).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                scx_engine::EngineError::MultimodalDeletionVectorsUnsupported
+            ),
+            "expected the modality-DV guard, got {err:?}"
+        );
+    }
+}

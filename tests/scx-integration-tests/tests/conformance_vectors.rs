@@ -986,6 +986,47 @@ fn test_conformance_files_reader_opens() {
     }
 }
 
+/// Back-compat anchor for the per-modality deletion-vector rewrite (DV wire
+/// format v1 → v2). Records the *observable read result* of the existing v1
+/// deletion-vector golden. The v1→v2 rewrite changes the in-memory struct
+/// (`shards` → `deletions`), but this v1 file must keep producing the exact
+/// same keep-mask, filtered row count, and deleted count — the eventual
+/// v1→global fold is verified against this baseline.
+#[test]
+fn test_v1_deletion_vectors_backcompat_read_baseline() {
+    let path = reference_dir().join("v1_deletion_vectors.scx");
+    if !path.exists() {
+        // Pre-generation: silently skip, mirroring `require_sidecar!`.
+        return;
+    }
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(reader.header().has_deletion_vectors());
+
+    const N_OBS: usize = 40;
+    const DELETED: [usize; 5] = [2, 5, 11, 13, 28];
+
+    // Keep mask: length n_obs, `false` exactly at the deleted rows.
+    let mask = reader
+        .deletion_keep_mask()
+        .unwrap()
+        .expect("v1 golden carries deletions");
+    assert_eq!(mask.len(), N_OBS, "keep-mask length");
+    let expected: Vec<bool> = (0..N_OBS).map(|r| !DELETED.contains(&r)).collect();
+    assert_eq!(mask, expected, "v1 keep-mask baseline");
+
+    // Filtered read drops exactly the deleted rows.
+    let filtered = reader.read_all_csr_shards_filtered().unwrap();
+    assert_eq!(
+        filtered.shape.0,
+        N_OBS - DELETED.len(),
+        "filtered row count baseline"
+    );
+
+    // DV section reports the same deleted count.
+    let dv = reader.read_deletion_vectors().unwrap().unwrap();
+    assert_eq!(dv.total_deleted(), DELETED.len() as u64, "total_deleted");
+}
+
 #[test]
 fn test_conformance_files_validate() {
     for fixture in FIXTURES {

@@ -346,6 +346,81 @@ pub fn fixture_multimodal(dir: &tempfile::TempDir) -> PathBuf {
     path
 }
 
+/// (e') Multimodal fixture with MULTIPLE CSR shards per modality, arranged so
+/// the flattened `csr_shards_sorted()` list has non-monotonic row-ranges — the
+/// layout that exercises the `mark_deleted` positional-shard mapping across
+/// interleaved per-modality shards. `rna` (8 vars) is sharded `[0,7)+[7,12)`;
+/// `adt` (4 vars) is sharded `[0,5)+[5,12)`. Both modalities still tile the
+/// shared obs axis `[0,12)`. 2 nnz per row, so every deleted row is observable.
+#[allow(dead_code)]
+pub fn fixture_multimodal_multishard(dir: &tempfile::TempDir) -> PathBuf {
+    let n_obs = 12usize;
+    let (rna_vars, adt_vars) = (8usize, 4usize);
+    let path = dir.path().join("multimodal_multishard.scx");
+    let mut writer = ScxWriter::new(&path, sample_header(n_obs as u64, rna_vars as u64)).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+
+    writer.write_var_for(rna_id, &sample_var(rna_vars)).unwrap();
+    writer.set_modality_n_vars(rna_id, rna_vars as u64).unwrap();
+    writer.write_var_for(adt_id, &sample_var(adt_vars)).unwrap();
+    writer.set_modality_n_vars(adt_id, adt_vars as u64).unwrap();
+
+    // (modality id, n_vars, shard row-ranges tiling [0, n_obs)).
+    let rna_ranges = [(0usize, 7usize), (7, 12)];
+    let adt_ranges = [(0usize, 5usize), (5, 12)];
+    for (mod_id, n_vars, ranges) in [
+        (rna_id, rna_vars, &rna_ranges[..]),
+        (adt_id, adt_vars, &adt_ranges[..]),
+    ] {
+        for &(start, end) in ranges {
+            let mut indptr = vec![0u64];
+            let mut indices = Vec::new();
+            let mut values = Vec::new();
+            for row in start..end {
+                let col0 = (row * 2) % n_vars;
+                let col1 = (row * 2 + 1) % n_vars;
+                indices.push(col0 as u32);
+                indices.push(col1 as u32);
+                values.push(((row + 1) % 256) as u8);
+                values.push(((row + 2) % 256) as u8);
+                indptr.push(indptr.last().unwrap() + 2);
+            }
+            writer
+                .write_csr_shard_for(
+                    mod_id,
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    start as u64,
+                )
+                .unwrap();
+        }
+    }
+    writer.finish().unwrap();
+    path
+}
+
 /// (f) obsp + layers fixture: primary X, a `raw` layer, and a cell×cell
 /// `connectivities` obsp (v2 Int64 COO).
 #[allow(dead_code)]
