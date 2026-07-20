@@ -176,6 +176,11 @@ fn apply_transforms_to_csc(
                     *v = v.ln_1p();
                 }
             }
+            Transform::Scale { factor } => {
+                for v in &mut csc.data {
+                    *v = (*v as f64 * *factor) as f32;
+                }
+            }
             Transform::NormalizeTotal { .. } | Transform::RowScale { .. } => {
                 return Err(scx_format_io::ScxError::Io(std::io::Error::other(
                     "CSC unavailable: chain contains a non-column-local transform \

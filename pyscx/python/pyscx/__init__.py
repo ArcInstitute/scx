@@ -39,9 +39,9 @@ from .pyscx import accel as _accel_submodule  # noqa: E402
 _sys.modules.setdefault("pyscx.accel", _accel_submodule)
 
 
-def _pflog1ppf_reconstruct(adata, baseline_key="pflog1ppf_baseline"):
-    """Reconstruct the exact dense PFlog1pPF ``Z`` from a compact
-    ``store_repr="delta_baseline"`` file written by ``accel.pflog1ppf(..., out=)``.
+def _pflog_reconstruct(adata, baseline_key="pflog_baseline"):
+    """Reconstruct the exact dense PFlog ``Z`` from a compact
+    ``store_repr="delta_baseline"`` file written by ``accel.pflog(..., out=)``.
 
     Such a file stores the sparse ``delta`` as ``X`` and the per-cell
     ``baseline`` as an obs column, so ``Z = delta + baseline[:, None]``. This is
@@ -62,20 +62,20 @@ def _pflog1ppf_reconstruct(adata, baseline_key="pflog1ppf_baseline"):
         and ``adata.obs[baseline_key]`` the per-cell baseline.
     baseline_key
         Name of the obs column holding the baseline (default
-        ``"pflog1ppf_baseline"``).
+        ``"pflog_baseline"``).
 
     Returns
     -------
     numpy.ndarray
         Dense ``float32`` array of shape ``(n_obs, n_vars)`` equal to the exact
-        PFlog1pPF transform.
+        PFlog transform.
     """
     import numpy as _np
 
     if baseline_key not in adata.obs:
         raise KeyError(
-            f"pflog1ppf_reconstruct: obs column {baseline_key!r} not found; this "
-            "is not a compact delta_baseline PFlog1pPF file (or baseline_key is wrong)"
+            f"pflog_reconstruct: obs column {baseline_key!r} not found; this "
+            "is not a compact delta_baseline PFlog file (or baseline_key is wrong)"
         )
     x = adata.X
     delta = _np.asarray(x.toarray() if hasattr(x, "toarray") else x, dtype=_np.float32)
@@ -83,10 +83,10 @@ def _pflog1ppf_reconstruct(adata, baseline_key="pflog1ppf_baseline"):
     return delta + baseline[:, None]
 
 
-# Expose as `pyscx.accel.pflog1ppf_reconstruct` (pure-Python companion to the
-# native `accel.pflog1ppf` writer) and at top level for discoverability.
-_accel_submodule.pflog1ppf_reconstruct = _pflog1ppf_reconstruct
-pflog1ppf_reconstruct = _pflog1ppf_reconstruct
+# Expose as `pyscx.accel.pflog_reconstruct` (pure-Python companion to the
+# native `accel.pflog` writer) and at top level for discoverability.
+_accel_submodule.pflog_reconstruct = _pflog_reconstruct
+pflog_reconstruct = _pflog_reconstruct
 
 del _sys, _accel_submodule
 

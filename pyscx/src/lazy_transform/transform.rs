@@ -21,6 +21,11 @@ pub enum Transform {
     /// Per-row multiply by a scalar vector.
     /// Used by normalize_total(inplace=False) which returns X * (target_sum / row_sums).
     RowScale { factors: Arc<Vec<f64>> },
+
+    /// Element-wise multiply by a single matrix-wide scalar.
+    /// Used by PFlog (v4): the delta source is `Scale{4α} → Log1p`, i.e.
+    /// `log1p(4α·x)`. Depends only on the value itself, so it is column-local.
+    Scale { factor: f64 },
 }
 
 impl Transform {
@@ -33,10 +38,11 @@ impl Transform {
     /// transform-chain compatibility test for CSC dispatch.
     ///
     /// - `Log1p`: `ln(x + 1)` is element-wise, no row context. **true**
+    /// - `Scale`: multiplies by a matrix-wide scalar, element-wise. **true**
     /// - `NormalizeTotal`: divides by per-row sum. **false**
     /// - `RowScale`: multiplies each row by a per-row factor. **false**
     pub fn is_column_local(&self) -> bool {
-        matches!(self, Transform::Log1p)
+        matches!(self, Transform::Log1p | Transform::Scale { .. })
     }
 }
 

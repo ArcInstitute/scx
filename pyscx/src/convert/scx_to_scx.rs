@@ -574,6 +574,10 @@ pub(crate) fn route_scx_lazy_to_scx(
                 "name": "row_scale",
                 "params": { "factors_len": factors.len() },
             }),
+            crate::lazy_transform::Transform::Scale { factor } => serde_json::json!({
+                "name": "scale",
+                "params": { "factor": factor },
+            }),
         })
         .collect();
     let source_path_json: serde_json::Value = lazy

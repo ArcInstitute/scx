@@ -103,6 +103,11 @@ fn apply_single_transform(csr: &mut ScxCsr, transform: &Transform, global_row_of
                 }
             }
         }
+        Transform::Scale { factor } => {
+            for v in &mut csr.data {
+                *v = (*v as f64 * *factor) as f32;
+            }
+        }
     }
 }
 

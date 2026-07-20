@@ -170,27 +170,30 @@ def pca(
 
 
 # ---------------------------------------------------------------------------
-# PFlog1pPF / shifted-CLR normalization (Booeshaghi et al. 2026). Default
-# `store="pca"` writes a baseline-aware PCA embedding to `adata.obsm[obsm_key]`
-# and leaves `X` as raw counts (it does NOT transform `X` in place — pass
-# `store="dense"` for the matrix). `pflog1ppf_reconstruct` is a pure-Python
-# companion exposed on this submodule (and at top level) by `pyscx/__init__.py`.
+# PFlog (v4) / shifted-log normalization on raw counts (Booeshaghi et al.,
+# DOI 10.1101/2022.05.06.490859). Default `store="pca"` writes a baseline-aware
+# PCA embedding to `adata.obsm[obsm_key]` and leaves `X` as raw counts (it does
+# NOT transform `X` in place — pass `store="dense"` for the matrix). `alpha=None`
+# estimates the NB overdispersion once from the matrix (pseudocount 1/(4α)) and
+# stamps `adata.uns["pflog"]`; pass a float to pin it. `pflog_reconstruct` is a
+# pure-Python companion exposed on this submodule (and at top level) by
+# `pyscx/__init__.py`.
 # ---------------------------------------------------------------------------
 
 
-def pflog1ppf(
+def pflog(
     adata: Any,
-    c: float = 1.0,
-    layer: str | None = None,
     *,
+    alpha: float | None = None,
+    layer: str | None = None,
     store: str = "pca",
     n_components: int = 50,
     n_oversamples: int = 10,
     n_power_iterations: int = 2,
     zero_center: bool = True,
     random_state: int = 0,
-    obsm_key: str = "X_pflog1ppf_pca",
-    baseline_key: str = "pflog1ppf_baseline",
+    obsm_key: str = "X_pflog_pca",
+    baseline_key: str = "pflog_baseline",
     layer_out: str | None = None,
     out: str | None = None,
     store_repr: str = "delta_baseline",
@@ -200,9 +203,7 @@ def pflog1ppf(
 ) -> None: ...
 
 
-def pflog1ppf_reconstruct(
-    adata: Any, baseline_key: str = "pflog1ppf_baseline"
-) -> Any: ...
+def pflog_reconstruct(adata: Any, baseline_key: str = "pflog_baseline") -> Any: ...
 
 
 # ---------------------------------------------------------------------------

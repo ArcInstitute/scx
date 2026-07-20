@@ -32,7 +32,7 @@ pub mod lisi;
 pub mod nb_glm;
 pub mod neighbors;
 pub mod pca;
-pub mod pflog1ppf;
+pub mod pflog;
 pub mod preprocessing;
 pub mod pseudobulk;
 #[cfg(feature = "gpu")]

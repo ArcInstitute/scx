@@ -1,4 +1,5 @@
-//! PFlog1pPF / shifted-CLR normalization — Booeshaghi et al. 2026 (CPU-native).
+//! PFlog (v4) / shifted-log normalization on raw counts — Booeshaghi et al.
+//! (DOI 10.1101/2022.05.06.490859), CPU-native.
 //!
 //! **Default (`store="pca"`): computes a baseline-aware PCA embedding into
 //! `adata.obsm[obsm_key]` and leaves `X` as raw counts** — unlike
@@ -6,33 +7,39 @@
 //! `store="dense"` (with `out=<path.scx>` for large data) to materialize the
 //! normalized matrix itself.
 //!
-//! The exact transform `Z = delta + baseline·1ᵀ` is dense, but it decomposes
-//! into a sparse `delta` (= the lazy `NormalizeTotal{1/c}→Log1p` chain) plus a
-//! per-cell `baseline`. This binding:
+//! v4 shifts raw counts by the matrix-wide Anscombe pseudocount `1/(4α)`, where
+//! `α` is the negative-binomial overdispersion estimated once from the matrix
+//! (`alpha=None`) or pinned by the caller (`alpha=<float>`). The exact transform
+//! `Z = delta + baseline·1ᵀ` is dense, but it decomposes into a sparse `delta`
+//! (= the lazy `Scale{4α}→Log1p` chain, i.e. `log1p(4α·x)`) plus a per-cell
+//! `baseline`. Per-cell depth cancels under the Anscombe scale — there is no
+//! depth division. This binding:
 //!
 //! * always writes the per-cell `baseline` to `adata.obs[baseline_key]`;
+//! * stamps the fit into `adata.uns["pflog"]` (`alpha`, `pseudocount`, …);
 //! * `store ∈ {"pca","all"}` runs baseline-aware out-of-core randomized PCA
-//!   (`scx_accel::pflog1ppf_pca`) → `adata.obsm[obsm_key]` + singular values in
+//!   (`scx_accel::pflog_pca`) → `adata.obsm[obsm_key]` + singular values in
 //!   `adata.uns[f"{obsm_key}_singular_values"]`;
 //! * `store ∈ {"dense","all"}` materializes the exact dense `Z`. Without
 //!   `out=` it lands in `adata.layers[layer_out]`, guarded to in-memory-feasible
 //!   sizes (`dense_max_elems`). With `out=<scx path>` it is streamed shard-by-shard
-//!   to a new SCX file (Phase 4c, no size guard) in one of two reprs:
+//!   to a new SCX file (no size guard) in one of two reprs:
 //!   `store_repr="delta_baseline"` (default, compact: Pcodec `delta` X + `baseline`
 //!   obs column, reconstruct-on-read) or `store_repr="dense"` (literal full-density
 //!   CSR, forced Zstd, small default `shard_size`).
 //!
 //! CPU-only: `device` is accepted for API symmetry but there is no GPU kernel.
-//! PFlog1pPF requires **raw counts**; an already-transformed (lazy) `X` is
-//! rejected (the raw-count guard).
+//! PFlog requires **raw counts**; an already-transformed (lazy) `X` is rejected
+//! (the raw-count guard).
 
 use std::sync::Arc;
 
 use numpy::{PyArray, PyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
-use scx_accel::{pflog_baseline_from_delta, pflog_pca, PcaResult};
+use scx_accel::{estimate_alpha, pflog_baseline_from_delta, pflog_pca, AlphaOptions, PcaResult};
 use scx_codec::CodecId;
 use scx_format_io::section::SectionType;
 use scx_format_io::shard_source::SingleShardSource;
@@ -62,21 +69,21 @@ const DENSE_DEFAULT_SHARD_ROWS: u32 = 2048;
 /// `O(M)` — matches the workspace default).
 const DELTA_DEFAULT_SHARD_ROWS: u32 = 16384;
 
-/// Apply PFlog1pPF normalization to `adata`.
+/// Apply PFlog (v4) normalization to `adata`.
 #[pyfunction]
 #[pyo3(signature = (
     adata,
-    c=1.0,
-    layer=None,
     *,
+    alpha=None,
+    layer=None,
     store="pca",
     n_components=50,
     n_oversamples=10,
     n_power_iterations=2,
     zero_center=true,
     random_state=0,
-    obsm_key="X_pflog1ppf_pca",
-    baseline_key="pflog1ppf_baseline",
+    obsm_key="X_pflog_pca",
+    baseline_key="pflog_baseline",
     layer_out=None,
     out=None,
     store_repr="delta_baseline",
@@ -85,10 +92,10 @@ const DELTA_DEFAULT_SHARD_ROWS: u32 = 16384;
     device="auto",
 ))]
 #[allow(clippy::too_many_arguments)]
-pub fn pflog1ppf(
+pub fn pflog(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
-    c: f64,
+    alpha: Option<f64>,
     layer: Option<&str>,
     store: &str,
     n_components: usize,
@@ -105,14 +112,17 @@ pub fn pflog1ppf(
     dense_max_elems: usize,
     device: &str,
 ) -> PyResult<()> {
-    if c <= 0.0 || c.is_nan() || c.is_infinite() {
-        return Err(PyValueError::new_err(format!(
-            "pflog1ppf: shift c must be positive and finite, got {c}"
-        )));
+    // A pinned α must be positive and finite; `None` ⇒ estimate from the matrix.
+    if let Some(a) = alpha {
+        if a <= 0.0 || !a.is_finite() {
+            return Err(PyValueError::new_err(format!(
+                "pflog: alpha must be positive and finite, got {a}"
+            )));
+        }
     }
     // Builds a ShardSource over the sorted projection; a presentation-ordered
     // backed X (preserve_var_order=True) would misalign the result against var.
-    super::reject_preserve_var_order(adata, "pflog1ppf")?;
+    super::reject_preserve_var_order(adata, "pflog")?;
     let (want_pca, want_dense) = match store {
         "pca" => (true, false),
         "baseline" => (false, false),
@@ -120,7 +130,7 @@ pub fn pflog1ppf(
         "all" => (true, true),
         other => {
             return Err(PyValueError::new_err(format!(
-                "pflog1ppf: unknown store {other:?}; expected \"pca\", \"baseline\", \"dense\", or \"all\""
+                "pflog: unknown store {other:?}; expected \"pca\", \"baseline\", \"dense\", or \"all\""
             )));
         }
     };
@@ -128,7 +138,7 @@ pub fn pflog1ppf(
         "delta_baseline" | "dense" => {}
         other => {
             return Err(PyValueError::new_err(format!(
-                "pflog1ppf: unknown store_repr {other:?}; expected \"delta_baseline\" or \"dense\""
+                "pflog: unknown store_repr {other:?}; expected \"delta_baseline\" or \"dense\""
             )));
         }
     }
@@ -136,7 +146,7 @@ pub fn pflog1ppf(
     // meaningful when the transform is being materialized (`store` ∈ dense/all).
     if out.is_some() && !want_dense {
         return Err(PyValueError::new_err(
-            "pflog1ppf: out= streams the materialized transform to disk; pass \
+            "pflog: out= streams the materialized transform to disk; pass \
              store=\"dense\" or store=\"all\" (got store that does not materialize)",
         ));
     }
@@ -147,47 +157,42 @@ pub fn pflog1ppf(
         None => adata.getattr("X")?,
     };
 
-    // ── Build the delta source (NormalizeTotal{1/c} → Log1p) ────────────────
-    // Three X kinds: backed (out-of-core), lazy (raw-count guard), in-memory.
-    let target_sum = 1.0 / c;
-
+    // ── Build the delta source (Scale{4α} → Log1p) ─────────────────────────
+    // v4 acts on raw counts: the matrix-wide Anscombe pseudocount 1/(4α) — no
+    // per-cell depth. `α` is estimated once from the raw matrix (`alpha=None`)
+    // or pinned. Three X kinds: backed (out-of-core), lazy (raw-count guard),
+    // in-memory.
     if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let backed_ref = backed.borrow();
         let reader = Arc::clone(&backed_ref.backed);
         let n_vars = backed_ref.shape_val.1;
         let kept = backed_ref.kept_to_global.clone();
         let col_proj = backed_ref.col_projection_arc();
-        // Physical-indexed (projected-aware) raw row sums — what NormalizeTotal
-        // divides by (transforms run pre-deletion, pre-projection per shard).
-        let phys_row_sums = if let Some(cols) = backed_ref.col_projection() {
-            crate::projected_agg::row_sums_projected(&backed_ref.backed, cols)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        } else {
-            backed_ref
-                .backed
-                .row_sums()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        };
         drop(backed_ref);
-        let transforms = vec![
-            Transform::NormalizeTotal {
-                row_sums: Arc::new(phys_row_sums),
-                target_sum,
-            },
-            Transform::Log1p,
-        ];
-        let source = build_shard_source(&reader, &transforms, &kept, &col_proj, n_vars);
+        // α from the raw-count source (empty transform chain = raw).
+        let raw_source = build_shard_source(&reader, &[], &kept, &col_proj, n_vars);
+        let meta = resolve_alpha(alpha, &raw_source)?;
+        let four_alpha = 4.0 * meta.alpha;
+        let source = build_shard_source(
+            &reader,
+            &[Transform::Scale { factor: four_alpha }, Transform::Log1p],
+            &kept,
+            &col_proj,
+            n_vars,
+        );
         let disk = DiskOut {
             out,
             store_repr,
             shard_size,
-            c,
+            alpha: meta.alpha,
+            pseudocount: meta.pseudocount,
             source_kind: "backed",
         };
         return run_on_source(
             py,
             adata,
             &source,
+            &meta,
             want_pca,
             want_dense,
             n_components,
@@ -208,8 +213,8 @@ pub fn pflog1ppf(
         let lazy_ref = lazy.borrow();
         if !lazy_ref.transforms.is_empty() {
             return Err(PyValueError::new_err(
-                "pflog1ppf requires raw counts, but X is a lazy-transformed dataset that \
-                 already carries transforms (e.g. normalize_total / log1p). Run pflog1ppf on \
+                "pflog requires raw counts, but X is a lazy-transformed dataset that \
+                 already carries transforms (e.g. normalize_total / log1p). Run pflog on \
                  the raw-count X instead.",
             ));
         }
@@ -218,32 +223,29 @@ pub fn pflog1ppf(
         let kept = lazy_ref.kept_to_global.clone();
         let col_proj = lazy_ref.col_projection.clone();
         drop(lazy_ref);
-        let phys_row_sums = match &col_proj {
-            Some(cols) => crate::projected_agg::row_sums_projected(&reader, cols)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-            None => reader
-                .row_sums()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        };
-        let transforms = vec![
-            Transform::NormalizeTotal {
-                row_sums: Arc::new(phys_row_sums),
-                target_sum,
-            },
-            Transform::Log1p,
-        ];
-        let source = build_shard_source(&reader, &transforms, &kept, &col_proj, n_vars);
+        let raw_source = build_shard_source(&reader, &[], &kept, &col_proj, n_vars);
+        let meta = resolve_alpha(alpha, &raw_source)?;
+        let four_alpha = 4.0 * meta.alpha;
+        let source = build_shard_source(
+            &reader,
+            &[Transform::Scale { factor: four_alpha }, Transform::Log1p],
+            &kept,
+            &col_proj,
+            n_vars,
+        );
         let disk = DiskOut {
             out,
             store_repr,
             shard_size,
-            c,
+            alpha: meta.alpha,
+            pseudocount: meta.pseudocount,
             source_kind: "lazy",
         };
         return run_on_source(
             py,
             adata,
             &source,
+            &meta,
             want_pca,
             want_dense,
             n_components,
@@ -262,19 +264,22 @@ pub fn pflog1ppf(
 
     // In-memory scipy/dense X → build the delta CSR directly, one shard.
     let raw = extract_materialized_csr(py, &x)?;
-    let delta = delta_from_raw_csr(&raw, c)?;
+    let meta = resolve_alpha(alpha, &SingleShardSource { csr: &raw })?;
+    let delta = delta_from_raw_csr(&raw, 4.0 * meta.alpha)?;
     let source = SingleShardSource { csr: &delta };
     let disk = DiskOut {
         out,
         store_repr,
         shard_size,
-        c,
+        alpha: meta.alpha,
+        pseudocount: meta.pseudocount,
         source_kind: "in_memory",
     };
     run_on_source(
         py,
         adata,
         &source,
+        &meta,
         want_pca,
         want_dense,
         n_components,
@@ -291,32 +296,78 @@ pub fn pflog1ppf(
     )
 }
 
-/// Build the `delta` CSR `log1p(x_ij / (c·s_i))` from a raw-count CSR.
+/// Fit metadata for `α`: the value, its Anscombe pseudocount `1/(4α)`, and
+/// (when estimated) the estimator diagnostics. Stamped into `adata.uns["pflog"]`.
+struct AlphaMeta {
+    alpha: f64,
+    pseudocount: f64,
+    /// `"estimated"` or `"pinned"`.
+    alpha_source: &'static str,
+    n_genes_used: Option<usize>,
+    fell_back: Option<bool>,
+}
+
+/// Resolve `α`: use a pinned value as-is, or estimate it once from the raw
+/// matrix via [`scx_accel::estimate_alpha`].
+fn resolve_alpha<S: ShardSource>(alpha: Option<f64>, raw: &S) -> PyResult<AlphaMeta> {
+    match alpha {
+        Some(a) => Ok(AlphaMeta {
+            alpha: a,
+            pseudocount: 1.0 / (4.0 * a),
+            alpha_source: "pinned",
+            n_genes_used: None,
+            fell_back: None,
+        }),
+        None => {
+            let est = estimate_alpha(raw, &AlphaOptions::default())
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(AlphaMeta {
+                alpha: est.alpha,
+                pseudocount: est.pseudocount,
+                alpha_source: "estimated",
+                n_genes_used: Some(est.n_genes_used),
+                fell_back: Some(est.fell_back),
+            })
+        }
+    }
+}
+
+/// Stamp the fit into `adata.uns["pflog"]`.
+fn stamp_uns_pflog(py: Python<'_>, adata: &Bound<'_, PyAny>, meta: &AlphaMeta) -> PyResult<()> {
+    let d = PyDict::new(py);
+    d.set_item("alpha", meta.alpha)?;
+    d.set_item("pseudocount", meta.pseudocount)?;
+    d.set_item("alpha_source", meta.alpha_source)?;
+    if let Some(n) = meta.n_genes_used {
+        d.set_item("n_genes_used", n)?;
+    }
+    if let Some(fb) = meta.fell_back {
+        d.set_item("fell_back", fb)?;
+    }
+    adata.getattr("uns")?.set_item("pflog", d)?;
+    Ok(())
+}
+
+/// Build the v4 `delta` CSR `log1p(4α·x_ij)` from a raw-count CSR
+/// (`four_alpha = 4α`). No depth — empty cells are fine.
 #[allow(clippy::needless_range_loop)]
-fn delta_from_raw_csr(raw: &ScxCsr, c: f64) -> PyResult<ScxCsr> {
-    let depths = raw.row_sums();
+fn delta_from_raw_csr(raw: &ScxCsr, four_alpha: f64) -> PyResult<ScxCsr> {
     let mut delta = raw.clone();
     for r in 0..raw.n_rows() {
-        let depth = depths[r];
-        if depth <= 0.0 {
-            return Err(PyValueError::new_err(format!(
-                "pflog1ppf: cell {r} has non-positive depth {depth}; filter empty cells first"
-            )));
-        }
         let start = delta.indptr[r] as usize;
         let end = delta.indptr[r + 1] as usize;
         for v in &mut delta.data[start..end] {
             if !v.is_finite() {
                 return Err(PyValueError::new_err(format!(
-                    "pflog1ppf: non-finite count {v} at cell {r}; counts must be finite"
+                    "pflog: non-finite count {v} at cell {r}; counts must be finite"
                 )));
             }
             if (*v as f64) < 0.0 {
                 return Err(PyValueError::new_err(format!(
-                    "pflog1ppf: negative count {v} at cell {r}; counts must be non-negative"
+                    "pflog: negative count {v} at cell {r}; counts must be non-negative"
                 )));
             }
-            *v = ((*v as f64) / (c * depth)).ln_1p() as f32;
+            *v = (four_alpha * (*v as f64)).ln_1p() as f32;
         }
     }
     Ok(delta)
@@ -331,8 +382,10 @@ struct DiskOut<'a> {
     store_repr: &'a str,
     /// Output shard height override.
     shard_size: Option<u32>,
-    /// Shift `c` (provenance only).
-    c: f64,
+    /// NB overdispersion `α` (provenance only).
+    alpha: f64,
+    /// Anscombe pseudocount `1/(4α)` (provenance only).
+    pseudocount: f64,
     /// `"backed" | "lazy" | "in_memory"` (provenance only).
     source_kind: &'a str,
 }
@@ -344,6 +397,7 @@ fn run_on_source<S: ShardSource>(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     source: &S,
+    meta: &AlphaMeta,
     want_pca: bool,
     want_dense: bool,
     n_components: usize,
@@ -359,6 +413,9 @@ fn run_on_source<S: ShardSource>(
     device: &str,
 ) -> PyResult<()> {
     let (n_obs, n_vars) = source.shape();
+
+    // Stamp the fit (α / pseudocount) → adata.uns["pflog"].
+    stamp_uns_pflog(py, adata, meta)?;
 
     // Baseline (always) → adata.obs[baseline_key].
     let baseline =
@@ -386,13 +443,13 @@ fn run_on_source<S: ShardSource>(
             // No in-memory size guard: peak RAM is bounded per shard. The
             // baseline was just stamped into adata.obs, so it rides into the
             // output file's obs automatically (compact reconstruct-on-read).
-            stream_pflog1ppf_to_scx(py, adata, source, &baseline, out_path, disk)?;
+            stream_pflog_to_scx(py, adata, source, &baseline, out_path, disk)?;
         } else {
             let n_elems = n_obs.saturating_mul(n_vars);
             if n_elems > dense_max_elems {
                 return Err(PyRuntimeError::new_err(format!(
-                    "pflog1ppf: dense materialization is {n_obs}×{n_vars} = {n_elems} elements, \
-                     over the dense_max_elems={dense_max_elems} guard. The exact PFlog1pPF transform \
+                    "pflog: dense materialization is {n_obs}×{n_vars} = {n_elems} elements, \
+                     over the dense_max_elems={dense_max_elems} guard. The exact PFlog transform \
                      is dense; pass out=<path.scx> to stream it to disk (any size), use store=\"pca\" \
                      for an out-of-core embedding, or raise dense_max_elems if you have the RAM."
                 )));
@@ -400,7 +457,7 @@ fn run_on_source<S: ShardSource>(
             let dense = materialize_dense(source, &baseline)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let arr = PyArray2::<f32>::from_vec2(py, &dense)?;
-            let key = layer_out.unwrap_or("pflog1ppf");
+            let key = layer_out.unwrap_or("pflog");
             adata.getattr("layers")?.set_item(key, arr)?;
         }
     }
@@ -408,7 +465,7 @@ fn run_on_source<S: ShardSource>(
     super::route::write_accel_route(
         py,
         adata,
-        "pflog1ppf",
+        "pflog",
         &super::route::cpu_only_exec_info(device),
     )?;
     Ok(())
@@ -444,7 +501,7 @@ fn materialize_dense<S: ShardSource>(
     Ok(dense)
 }
 
-/// Write PFlog1pPF PCA results: `obsm[obsm_key]` (embeddings, f32) and
+/// Write PFlog PCA results: `obsm[obsm_key]` (embeddings, f32) and
 /// `uns[f"{obsm_key}_singular_values"]` (σ_i = sqrt(var_explained_i·(n−1))).
 fn write_pca(
     py: Python<'_>,
@@ -481,7 +538,7 @@ fn write_pca(
 // Phase 4c — streaming materialize-to-SCX
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Stream the materialized PFlog1pPF transform over the delta `ShardSource`
+/// Stream the materialized PFlog transform over the delta `ShardSource`
 /// to a new SCX file, shard-by-shard (never `O(N·D)` in RAM). Two reprs:
 ///
 /// * `"delta_baseline"` (compact): write `delta` as a sparse CSR `X`
@@ -492,7 +549,7 @@ fn write_pca(
 ///
 /// Mirrors the metadata-writing body of
 /// [`crate::convert::scx_to_scx::route_scx_lazy_to_scx`].
-fn stream_pflog1ppf_to_scx<S: ShardSource>(
+fn stream_pflog_to_scx<S: ShardSource>(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     source: &S,
@@ -540,7 +597,7 @@ fn stream_pflog1ppf_to_scx<S: ShardSource>(
     .map_err(to_pyerr)?;
 
     // X shards — re-chunk to `shard_rows` windows within each physical shard.
-    write_pflog1ppf_x_shards(
+    write_pflog_x_shards(
         py,
         &mut writer,
         source,
@@ -599,7 +656,8 @@ fn stream_pflog1ppf_to_scx<S: ShardSource>(
 
     // Provenance.
     let params_json = serde_json::json!({
-        "c": disk.c,
+        "alpha": disk.alpha,
+        "pseudocount": disk.pseudocount,
         "repr": disk.store_repr,
         "source": disk.source_kind,
     });
@@ -610,7 +668,7 @@ fn stream_pflog1ppf_to_scx<S: ShardSource>(
     writer
         .write_provenance(vec![ProvenanceEntry {
             timestamp,
-            action: "pflog1ppf".to_string(),
+            action: "pflog".to_string(),
             tool: format!("pyscx {}", env!("CARGO_PKG_VERSION")),
             params_json: params_json.to_string(),
             input_checksums: vec![],
@@ -625,7 +683,7 @@ fn stream_pflog1ppf_to_scx<S: ShardSource>(
 /// shard into `shard_rows`-row windows so the dense path's peak RAM stays
 /// bounded. Each output shard's rows come from a single physical shard.
 #[allow(clippy::too_many_arguments)]
-fn write_pflog1ppf_x_shards<S: ShardSource>(
+fn write_pflog_x_shards<S: ShardSource>(
     py: Python<'_>,
     writer: &mut ScxWriter,
     source: &S,
@@ -647,7 +705,7 @@ fn write_pflog1ppf_x_shards<S: ShardSource>(
         let rows = csr.n_rows();
         if global_row + rows as u64 > baseline.len() as u64 {
             return Err(PyRuntimeError::new_err(format!(
-                "pflog1ppf: shard {i} has {rows} rows, exceeding baseline length {} \
+                "pflog: shard {i} has {rows} rows, exceeding baseline length {} \
                  at global_row={global_row}",
                 baseline.len()
             )));
