@@ -38,7 +38,7 @@ impl ScxReader {
         let csr = self.assemble_shards_typed(&shards, self.n_vars() as usize, plan)?;
         #[cfg(feature = "deletion-vectors")]
         {
-            self.filter_typed_csr_rows_by_deletion_vectors(csr)
+            self.filter_typed_csr_rows_by_deletion_vectors(csr, crate::deletion_vectors::DV_GLOBAL)
         }
         #[cfg(not(feature = "deletion-vectors"))]
         {
@@ -78,7 +78,12 @@ impl ScxReader {
     /// This is an intentional asymmetry with the global
     /// [`read_all_csr_shards_typed`](Self::read_all_csr_shards_typed) (which IS
     /// deletion-vector filtered): the per-modality path stays unfiltered because
-    /// multimodal deletion-vector filtering is a pre-existing gap.
+    /// `to_mudata` reads each modality's X unfiltered to keep its row count in
+    /// lockstep with the unfiltered global obs axis (see `pyscx::mudata`). The
+    /// deletion-filtered per-modality read is
+    /// [`read_all_csr_shards_for_filtered`](ScxReader::read_all_csr_shards_for_filtered)
+    /// (f32); the global filtered typed read is
+    /// [`read_all_csr_shards_typed`](Self::read_all_csr_shards_typed).
     ///
     /// `n_cols` comes from the modality table's `n_vars` (matching
     /// `read_all_csr_shards_for`'s preferred shape); a missing `modality_info`
@@ -225,10 +230,15 @@ impl ScxReader {
     }
 
     /// Deletion-vector row compaction over a [`TypedCsr`] (typed twin of
-    /// `filter_csr_rows_by_deletion_vectors`).
+    /// `filter_csr_rows_by_deletion_vectors`), using the keep mask for
+    /// `modality_id` (global-only for `DV_GLOBAL`).
     #[cfg(feature = "deletion-vectors")]
-    fn filter_typed_csr_rows_by_deletion_vectors(&self, csr: TypedCsr) -> Result<TypedCsr> {
-        let keep = match self.deletion_keep_mask()? {
+    fn filter_typed_csr_rows_by_deletion_vectors(
+        &self,
+        csr: TypedCsr,
+        modality_id: u8,
+    ) -> Result<TypedCsr> {
+        let keep = match self.deletion_keep_mask_for(modality_id)? {
             Some(keep) => keep,
             None => return Ok(csr),
         };

@@ -3181,24 +3181,45 @@ impl ScxReader {
         Ok(Some(dv))
     }
 
-    /// Build the obs-indexed keep mask (`true` = retained) implied by this
-    /// file's deletion vectors, or `None` when the file has no deletion
-    /// vectors or nothing is deleted.
+    /// Build the whole-cell (global) obs-indexed keep mask (`true` = retained)
+    /// implied by this file's deletion vectors, or `None` when the file has no
+    /// deletion vectors or nothing is deleted.
     ///
     /// This is the single entry point that the reader's CSR filter, the
     /// h5ad/h5mu streaming export, `scx compact`, and the `pyscx` obs filter
-    /// all share, so the row-keep semantics stay identical everywhere. The
-    /// mask construction itself lives in
-    /// [`crate::DeletionVectors::build_keep_mask`].
+    /// all share, so the row-keep semantics stay identical everywhere. Delegates
+    /// to [`Self::deletion_keep_mask_for`] with the global modality key.
     pub fn deletion_keep_mask(&self) -> Result<Option<Vec<bool>>> {
+        self.deletion_keep_mask_for(crate::deletion_vectors::DV_GLOBAL)
+    }
+
+    /// Modality-aware keep mask (`true` = retained): global (whole-cell)
+    /// deletions plus, for `modality_id >= 1`, that modality's scoped deletions.
+    /// Returns `None` when no deletion applies to the requested modality.
+    ///
+    /// `modality_id == 0` (`DV_GLOBAL`) is the whole-cell mask that
+    /// [`Self::deletion_keep_mask`] exposes and that every global/single-modality
+    /// read uses. Because shipped writers only populate the global bitmap and it
+    /// applies identically to every modality, this is currently equal to the
+    /// global mask for all `modality_id`; scoped (`>= 1`) deletion is reserved.
+    pub fn deletion_keep_mask_for(&self, modality_id: u8) -> Result<Option<Vec<bool>>> {
         if !self.header.has_deletion_vectors() {
             return Ok(None);
         }
         let dv = match self.read_deletion_vectors()? {
-            Some(dv) if dv.total_deleted() > 0 => dv,
-            _ => return Ok(None),
+            Some(dv) => dv,
+            None => return Ok(None),
         };
-        Ok(Some(dv.build_keep_mask_global(self.n_obs() as usize)))
+        let applies = dv.total_deleted() > 0
+            || (modality_id != crate::deletion_vectors::DV_GLOBAL
+                && dv
+                    .deletions
+                    .get(&modality_id)
+                    .is_some_and(|b| !b.is_empty()));
+        if !applies {
+            return Ok(None);
+        }
+        Ok(Some(dv.build_keep_mask(self.n_obs() as usize, modality_id)))
     }
 
     /// Read all CSR shards with deletion vectors applied.
@@ -3207,40 +3228,43 @@ impl ScxReader {
     #[cfg(feature = "deletion-vectors")]
     pub fn read_all_csr_shards_filtered(&self) -> Result<ScxCsr> {
         let csr = self.read_all_csr_shards()?;
-        self.filter_csr_rows_by_deletion_vectors(csr)
+        self.filter_csr_rows_by_deletion_vectors(csr, crate::deletion_vectors::DV_GLOBAL)
     }
 
     /// Per-modality counterpart of [`Self::read_all_csr_shards_filtered`].
-    /// Assembles the modality's CSR via [`Self::read_all_csr_shards_for`]
-    /// and applies the file-wide deletion-vector keep mask. The mask is
-    /// obs-indexed and shared across modalities (h5mu invariant), so
-    /// each modality's filtered CSR has `n_obs - n_deleted` rows.
+    /// Assembles the modality's CSR via [`Self::read_all_csr_shards_for`] and
+    /// applies the modality-aware deletion-vector keep mask
+    /// ([`Self::deletion_keep_mask_for`]). The global (whole-cell) bitmap always
+    /// applies and is obs-indexed and shared across modalities (h5mu invariant),
+    /// so each modality's filtered CSR has `n_obs - n_deleted` rows; a scoped
+    /// (`modality_id >= 1`) bitmap, when present, additionally drops that
+    /// modality's rows.
     #[cfg(feature = "deletion-vectors")]
     pub fn read_all_csr_shards_for_filtered(&self, modality_id: u8) -> Result<ScxCsr> {
         let csr = self.read_all_csr_shards_for(modality_id)?;
-        self.filter_csr_rows_by_deletion_vectors(csr)
+        self.filter_csr_rows_by_deletion_vectors(csr, modality_id)
     }
 
     /// Read a named layer with deletion vectors applied.
     /// Deleted rows are excluded from the returned ScxCsr.
     /// If no deletion vectors are present, returns the same result as `read_layer()`.
     ///
-    /// Layers must share X's row count (an AnnData invariant); the row-keep
-    /// mask is built from the X-shard layout and applied to the layer CSR.
+    /// Layers must share X's row count (an AnnData invariant); the whole-cell
+    /// row-keep mask is applied to the layer CSR.
     #[cfg(feature = "deletion-vectors")]
     pub fn read_layer_filtered(&self, name: &str) -> Result<ScxCsr> {
         let csr = self.read_layer(name)?;
-        self.filter_csr_rows_by_deletion_vectors(csr)
+        self.filter_csr_rows_by_deletion_vectors(csr, crate::deletion_vectors::DV_GLOBAL)
     }
 
-    /// Apply deletion vectors to an already-assembled CSR (X or layer).
-    /// The keep mask is derived from the X-shard layout in the full catalog,
-    /// so the input CSR must share X's row count.
+    /// Apply deletion vectors to an already-assembled CSR (X or layer), using
+    /// the keep mask for `modality_id` (global-only for `DV_GLOBAL`). The mask
+    /// is obs-indexed, so the input CSR must share X's row count.
     #[cfg(feature = "deletion-vectors")]
-    fn filter_csr_rows_by_deletion_vectors(&self, csr: ScxCsr) -> Result<ScxCsr> {
+    fn filter_csr_rows_by_deletion_vectors(&self, csr: ScxCsr, modality_id: u8) -> Result<ScxCsr> {
         // The keep mask is obs-indexed; the input CSR (X or a layer) shares
         // X's row count, so the mask aligns with its rows.
-        let keep = match self.deletion_keep_mask()? {
+        let keep = match self.deletion_keep_mask_for(modality_id)? {
             Some(keep) => keep,
             None => return Ok(csr),
         };
