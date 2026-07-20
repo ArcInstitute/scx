@@ -1155,8 +1155,19 @@ impl FullCatalog {
         shards
     }
 
-    /// Return CSR shard entries sorted by `stats.row_start`.
-    /// Entries without stats are placed at the end.
+    /// Return CSR shard entries sorted by `stats.row_start`, across **all
+    /// modalities** (no `modality_id` filter). Entries without stats are placed
+    /// at the end.
+    ///
+    /// **Multimodal caveat:** on a multimodal file every modality independently
+    /// tiles the shared obs axis `[0, n_obs)`, so this flattened list contains
+    /// **overlapping** `[row_start, row_end)` ranges (e.g. RNA `[0,1000)` and
+    /// ADT `[0,1000)` both start at row 0). A shard's **positional index** in
+    /// this list therefore does **not** identify an obs row or a modality — do
+    /// not key anything obs-indexed (deletion vectors, row masks) by it. Use
+    /// [`Self::csr_shards_for_modality`] for per-modality iteration, and
+    /// [`Self::has_overlapping_csr_ranges`] to `debug_assert!` a clean single
+    /// tiling where one is required.
     pub fn csr_shards_sorted(&self) -> Vec<&FullCatalogEntry> {
         let mut shards: Vec<_> = self
             .entries
@@ -1169,6 +1180,33 @@ impl FullCatalog {
                 .map_or(u64::MAX, |s| s.major_start(SectionType::CsrShard))
         });
         shards
+    }
+
+    /// Whether the flattened [`Self::csr_shards_sorted`] list contains
+    /// overlapping `[row_start, row_end)` ranges. This is `true` for **any**
+    /// multimodal file (each modality independently tiles `[0, n_obs)`), and
+    /// `false` for a single clean tiling.
+    ///
+    /// It is the cross-cutting tripwire against the class of bug this guards:
+    /// code that positionally indexes `csr_shards_sorted()` as if it were one
+    /// non-overlapping tiling. `debug_assert!(!catalog.has_overlapping_csr_ranges())`
+    /// at any such site. O(n_shards) over the already-sorted list; no I/O.
+    pub fn has_overlapping_csr_ranges(&self) -> bool {
+        let mut max_end: Option<u64> = None;
+        for entry in self.csr_shards_sorted() {
+            let Some(stats) = entry.stats.as_ref() else {
+                continue;
+            };
+            let start = stats.major_start(SectionType::CsrShard);
+            let end = stats.major_end(SectionType::CsrShard);
+            if let Some(prev_end) = max_end {
+                if start < prev_end {
+                    return true;
+                }
+            }
+            max_end = Some(max_end.map_or(end, |m| m.max(end)));
+        }
+        false
     }
 
     /// Return `adata.raw` CSR shard entries ([`SectionType::RawCsrShard`])

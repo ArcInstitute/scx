@@ -594,17 +594,21 @@ mod tests {
         assert!(err.to_string().contains("multimodal"), "{err}");
     }
 
-    /// A modality query on a multimodal file carrying deletion vectors fails
-    /// loud (DV shard keys are global-flattened; `scx compact` first).
+    /// A modality query on a multimodal file carrying deletion vectors now
+    /// succeeds and applies the whole-cell deletion to the queried modality
+    /// (v2 deletion vectors are global obs rows that apply to every modality).
     #[test]
-    fn modality_on_multimodal_with_deletion_vectors_errors() {
+    fn modality_on_multimodal_with_deletion_vectors_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = crate::test_utils::write_multimodal_test_file(&dir, 12, 7, 3);
         scx_ops::mark_deleted(&path, &[0, 1]).unwrap();
-        let err = open_pipeline_for(path.to_str().unwrap(), Some("rna"))
-            .err()
-            .expect("should error");
-        assert!(err.to_string().contains("deletion"), "{err}");
+        let result = open_pipeline_for(path.to_str().unwrap(), Some("rna"))
+            .unwrap()
+            .pipeline
+            .collect()
+            .unwrap();
+        assert_eq!(result.x.n_rows(), 10, "12 obs - 2 deleted");
+        assert_eq!(result.x.n_cols(), 7, "rna width");
     }
 
     /// Under a non-cloud build, a cloud-scheme source is rejected with the

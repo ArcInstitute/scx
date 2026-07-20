@@ -181,6 +181,15 @@ impl DeletionVectors {
         let Some(shards) = self.v1_shards.take() else {
             return;
         };
+        // Folding v1 per-shard (shard-local) bitmaps positionally is only
+        // reliable on a single clean tiling. A multimodal v1 DV is already
+        // under-populated by the old writer (per-modality shards overlap in the
+        // flattened list); flag it in debug rather than silently mis-folding.
+        debug_assert!(
+            !catalog.has_overlapping_csr_ranges(),
+            "folding legacy v1 deletion vectors on a multimodal file is unreliable \
+             (v1 multimodal DVs are already under-populated by the old writer)"
+        );
         let sorted = catalog.shards_sorted();
         let global = self.deletions.entry(DV_GLOBAL).or_default();
         for (shard_idx, entry) in sorted.iter().enumerate() {
@@ -424,6 +433,26 @@ mod tests {
         // Folding is idempotent (no v1_shards left).
         dv.fold_v1_to_global(&catalog);
         assert_eq!(dv.total_deleted(), 3);
+    }
+
+    #[test]
+    fn has_overlapping_csr_ranges_detects_multimodal() {
+        // Single clean tiling [0,3),[3,5) → no overlap.
+        let single = catalog_with(
+            vec![csr_shard("X_shard_0", 0, 3), csr_shard("X_shard_1", 3, 5)],
+            5,
+        );
+        assert!(!single.has_overlapping_csr_ranges());
+
+        // Two modalities each tiling [0,5) → overlapping flattened ranges.
+        let multi = catalog_with(
+            vec![
+                csr_shard("X/rna/shard_0", 0, 5),
+                csr_shard("X/adt/shard_0", 0, 5),
+            ],
+            5,
+        );
+        assert!(multi.has_overlapping_csr_ranges());
     }
 
     /// An unknown `dv_version` on the wire must be rejected.

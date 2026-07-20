@@ -1357,8 +1357,19 @@ fn compact_multimodal(
 }
 
 /// Build a keep mask based on deletion vectors (v2 global obs bitmap).
+///
+/// Compact physically removes only the whole-cell (global) deletions. Shipped
+/// writers only populate the global bitmap; per-modality scoped-deletion
+/// compaction is deferred (it would remove a cell from one modality only,
+/// which changes per-modality row counts without changing the shared `n_obs`).
 fn build_keep_mask(n_obs: usize, dv: &Option<scx_format_io::DeletionVectors>) -> Option<Vec<bool>> {
     let dv = dv.as_ref()?;
+    debug_assert!(
+        dv.deletions
+            .keys()
+            .all(|&k| k == scx_format_io::deletion_vectors::DV_GLOBAL),
+        "compact does not yet apply modality-scoped (id >= 1) deletions"
+    );
     if dv.total_deleted() == 0 {
         return None;
     }

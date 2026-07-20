@@ -316,27 +316,22 @@ mod tests {
         }
     }
 
-    /// Current-limitation lock — the concrete behavior this feature removes. A
-    /// modality-scoped engine query against a multimodal file that carries
-    /// deletion vectors is rejected today with
-    /// `EngineError::MultimodalDeletionVectorsUnsupported` (the v1 DV keys are
-    /// recorded against the flattened all-modality shard order and cannot be
-    /// remapped per modality). Phase 4 removes this guard; this test then flips
-    /// to assert the modality query succeeds and returns deletion-filtered rows.
+    /// The payoff of the per-modality deletion-vector feature: a modality-scoped
+    /// engine query against a multimodal file that carries deletion vectors now
+    /// **succeeds** (the old guard that rejected it is gone) and applies the
+    /// whole-cell deletion to the queried modality's X.
     #[test]
-    fn modality_scoped_query_with_deletions_is_currently_guarded() {
+    fn modality_scoped_query_with_deletions_succeeds() {
         let dir = tempfile::tempdir().unwrap();
-        let path = fixture_multimodal(&dir);
+        let path = fixture_multimodal(&dir); // n_obs = 12
         crate::mark_deleted(&path, &[4]).unwrap();
 
         let rna_id = ScxReader::open(&path).unwrap().modality_id("rna").unwrap();
-        let err = scx_engine::QueryPipeline::open_for_modality(&path, rna_id).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                scx_engine::EngineError::MultimodalDeletionVectorsUnsupported
-            ),
-            "expected the modality-DV guard, got {err:?}"
-        );
+        let result = scx_engine::QueryPipeline::open_for_modality(&path, rna_id)
+            .unwrap()
+            .collect()
+            .unwrap();
+        // The deleted global cell (row 4) is dropped from the modality's X.
+        assert_eq!(result.x.n_rows(), 11);
     }
 }
