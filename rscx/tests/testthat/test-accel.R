@@ -32,68 +32,75 @@ test_that("scx_pca_matrix returns finite embeddings + loadings of the right shap
   expect_true(all(res$variance_ratio >= 0))
 })
 
-test_that("scx_pflog1ppf returns embeddings + a per-cell baseline matching the reference", {
+test_that("scx_pflog returns embeddings + a per-cell baseline matching the reference", {
   counts <- make_counts()
-  # PFlog1pPF requires raw counts with positive cell depth; drop empty cells.
-  counts <- counts[, Matrix::colSums(counts) > 0, drop = FALSE]
-  cc <- 1.0
-  res <- scx_pflog1ppf(counts, c = cc, n_components = 10L, seed = 0L)
+  a <- 1.0                              # pinned α → four_alpha = 4
+  res <- scx_pflog(counts, alpha = a, n_components = 10L, seed = 0L)
 
   expect_type(res, "list")
   expect_named(res, c("embeddings", "loadings", "variance_explained",
-                      "variance_ratio", "n_components", "baseline"))
+                      "variance_ratio", "n_components", "baseline",
+                      "alpha", "pseudocount"))
   expect_equal(nrow(res$embeddings), ncol(counts)) # cells
   expect_equal(ncol(res$embeddings), 10L)
   expect_equal(nrow(res$loadings), nrow(counts))   # genes
   expect_true(all(is.finite(res$embeddings)))
   expect_true(all(res$variance_ratio >= 0))
+  expect_equal(res$alpha, a)
+  expect_equal(res$pseudocount, 1 / (4 * a))
 
-  # Baseline is rotation/sign-free, so check it exactly against the reference:
-  # baseline_i = -(1/D) * sum_j log(x_ij/s_i + c).
+  # v4: baseline_i = -(1/D) * sum_j log1p(4α·x_ij) (raw counts, no depth).
   expect_equal(length(res$baseline), ncol(counts))
   expect_true(all(is.finite(res$baseline)))
   Xc <- as.matrix(counts)                 # genes x cells
-  depth <- colSums(Xc)
-  L <- log(t(Xc) / depth + cc)            # cells x genes
-  ref_baseline <- -rowMeans(L)
+  delta <- log1p(4 * a * t(Xc))           # cells x genes
+  ref_baseline <- -rowMeans(delta)
   # unname: rowMeans carries cell names; the Rust path returns a plain vector.
   expect_equal(unname(res$baseline), unname(ref_baseline), tolerance = 1e-4)
 })
 
-test_that("scx_pflog1ppf baseline matches the reference for c != 1", {
+test_that("scx_pflog baseline matches the reference for a != 1", {
   counts <- make_counts()
-  counts <- counts[, Matrix::colSums(counts) > 0, drop = FALSE]
-  cc <- 0.5
-  res <- scx_pflog1ppf(counts, c = cc, n_components = 8L, seed = 0L)
+  a <- 0.5                              # four_alpha = 2
+  res <- scx_pflog(counts, alpha = a, n_components = 8L, seed = 0L)
   expect_true(all(is.finite(res$embeddings)))
 
-  # For c != 1 the reference must use the log1p(x/(c*s)) form (the log(x/s + c)
-  # shortcut only matches at c = 1, since the two differ by the constant log(c)
-  # which cancels under centering only when c = 1 in that specific expansion).
   Xc <- as.matrix(counts)                 # genes x cells
-  depth <- colSums(Xc)
-  delta <- log1p(t(Xc) / (cc * depth))    # cells x genes
-  # Centering denominator D = number of genes = nrow(Xc); rowMeans over the
-  # cells x genes delta divides by exactly that.
+  delta <- log1p(4 * a * t(Xc))           # cells x genes
+  # Centering denominator D = number of genes = nrow(Xc).
   ref_baseline <- -rowMeans(delta)
   expect_equal(unname(res$baseline), unname(ref_baseline), tolerance = 1e-4)
 })
 
-test_that("scx_pflog1ppf rejects invalid c and empty cells", {
+test_that("scx_pflog with alpha = NULL estimates α from the matrix", {
   counts <- make_counts()
-  counts <- counts[, Matrix::colSums(counts) > 0, drop = FALSE]
-  expect_error(scx_pflog1ppf(counts, c = 0))
-  expect_error(scx_pflog1ppf(counts, c = -1))
-  expect_error(scx_pflog1ppf(counts, c = Inf))
+  res <- scx_pflog(counts, alpha = NULL, n_components = 8L, seed = 0L)
+  expect_true(is.finite(res$alpha) && res$alpha > 0)
+  expect_equal(res$pseudocount, 1 / (4 * res$alpha), tolerance = 1e-9)
+  expect_true(all(is.finite(res$embeddings)))
+  # Baseline matches the reference at the *estimated* α.
+  Xc <- as.matrix(counts)
+  delta <- log1p(4 * res$alpha * t(Xc))
+  expect_equal(unname(res$baseline), unname(-rowMeans(delta)), tolerance = 1e-4)
+})
 
-  # An empty cell (zero column in the genes x cells matrix) has undefined depth.
+test_that("scx_pflog rejects invalid alpha; empty cells are allowed (v4)", {
+  counts <- make_counts()
+  expect_error(scx_pflog(counts, alpha = 0))
+  expect_error(scx_pflog(counts, alpha = -1))
+  expect_error(scx_pflog(counts, alpha = Inf))
+
+  # v4 has no per-cell depth: an empty cell (zero column) is representable and
+  # yields baseline 0 — no error.
   empty <- make_counts(n_genes = 10L, n_cells = 5L)
   empty[, 1] <- 0
   empty <- methods::as(empty, "CsparseMatrix")
-  expect_error(scx_pflog1ppf(empty, c = 1))
+  res <- scx_pflog(empty, alpha = 1.0, n_components = 3L, seed = 0L)
+  expect_true(is.finite(res$baseline[1]))
+  expect_equal(res$baseline[1], 0, tolerance = 1e-7)
 })
 
-test_that("scx_pflog1ppf Seurat path writes reduction + baseline, ignores features", {
+test_that("scx_pflog Seurat path writes reduction + baseline + misc, ignores features", {
   skip_if_not_installed("Seurat")
   skip_if_not_installed("SeuratObject")
 
@@ -101,20 +108,22 @@ test_that("scx_pflog1ppf Seurat path writes reduction + baseline, ignores featur
   counts <- counts[, Matrix::colSums(counts) > 0, drop = FALSE]
   obj <- SeuratObject::CreateSeuratObject(counts = counts)
 
-  obj <- scx_pflog1ppf(obj, c = 1, n_components = 5L, seed = 0L)
-  expect_true("pflog1ppf" %in% names(obj@reductions))
-  emb <- SeuratObject::Embeddings(obj[["pflog1ppf"]])
+  obj <- scx_pflog(obj, alpha = 1, n_components = 5L, seed = 0L)
+  expect_true("pflog" %in% names(obj@reductions))
+  emb <- SeuratObject::Embeddings(obj[["pflog"]])
   expect_equal(nrow(emb), ncol(counts))
   expect_equal(ncol(emb), 5L)
-  expect_true("pflog1ppf_baseline" %in% colnames(obj@meta.data))
+  expect_true("pflog_baseline" %in% colnames(obj@meta.data))
+  expect_equal(obj@misc$pflog$alpha, 1)
+  expect_equal(obj@misc$pflog$pseudocount, 0.25)
 
   # Regression for fix #7: setting VariableFeatures must NOT change the
-  # full-transcriptome baseline (no feature subsetting in PFlog1pPF).
+  # full-transcriptome baseline (no feature subsetting in PFlog).
   SeuratObject::VariableFeatures(obj) <- rownames(counts)[1:5]
-  obj2 <- scx_pflog1ppf(obj, c = 1, n_components = 5L, seed = 0L)
+  obj2 <- scx_pflog(obj, alpha = 1, n_components = 5L, seed = 0L)
   expect_equal(
-    unname(obj2$pflog1ppf_baseline),
-    unname(obj$pflog1ppf_baseline),
+    unname(obj2$pflog_baseline),
+    unname(obj$pflog_baseline),
     tolerance = 1e-6
   )
 })

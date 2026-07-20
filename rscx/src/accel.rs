@@ -14,11 +14,11 @@
 use extendr_api::prelude::*;
 
 use scx_accel::{
-    build_knn_graph, compute_umap, covariance_pca_inmemory, leiden, pflog_baseline_from_delta,
-    pflog_pca, pseudobulk_aggregate_inmemory, pseudobulk_nb_glm, randomized_pca_inmemory,
-    score_genes, streaming_clip_square_sum, streaming_mean_var, wilcoxon_rank_sum,
-    AggregationMethod, DispersionMethod, NbGlmContrast, NbGlmOptions, NbGlmResult, ScoreMethod,
-    COVARIANCE_PCA_THRESHOLD,
+    build_knn_graph, compute_umap, covariance_pca_inmemory, estimate_alpha, leiden,
+    pflog_baseline_from_delta, pflog_pca, pseudobulk_aggregate_inmemory, pseudobulk_nb_glm,
+    randomized_pca_inmemory, score_genes, streaming_clip_square_sum, streaming_mean_var,
+    wilcoxon_rank_sum, AggregationMethod, AlphaOptions, DispersionMethod, NbGlmContrast,
+    NbGlmOptions, NbGlmResult, ScoreMethod, COVARIANCE_PCA_THRESHOLD,
 };
 use scx_sparse::ScxCsr;
 
@@ -233,78 +233,76 @@ fn scx_pca_matrix_impl(
     .map_err(|e| Error::Other(e.to_string()))
 }
 
-// ─── PFlog1pPF (shifted-CLR) ────────────────────────────────────────────
+// ─── PFlog (v4, shifted-log on raw counts) ──────────────────────────────
 
-/// Build the in-memory `delta` CSR `log1p(x_ij / (c·s_i))` from raw counts.
+/// Build the in-memory v4 `delta` CSR `log1p(4α·x_ij)` from raw counts
+/// (`four_alpha = 4α`).
 ///
-/// Mirrors `pyscx`'s `delta_from_raw_csr`: validates positive cell depths and
-/// non-negative counts, then rewrites each nonzero in place (f64 math, f32
-/// store). `delta` is the sparse, same-pattern part of `Z = delta + baseline`;
-/// the centering `baseline` is recovered from it by
-/// [`pflog1ppf_baseline_from_delta`].
+/// Mirrors `pyscx`'s `delta_from_raw_csr`: validates non-negative, finite
+/// counts, then rewrites each nonzero in place (f64 math, f32 store). Unlike v2
+/// there is **no per-cell depth** (it cancels under the Anscombe scale), so
+/// empty cells are fine. `delta` is the sparse, same-pattern part of
+/// `Z = delta + baseline`; the centering `baseline` is recovered from it by
+/// [`pflog_baseline_from_delta`].
 #[allow(clippy::needless_range_loop)]
-fn delta_from_raw_csr(raw: &ScxCsr, c: f64) -> Result<ScxCsr> {
-    let depths = raw.row_sums();
+fn delta_from_raw_csr(raw: &ScxCsr, four_alpha: f64) -> Result<ScxCsr> {
     let mut delta = raw.clone();
     for r in 0..raw.n_rows() {
-        let depth = depths[r];
-        if depth <= 0.0 {
-            return Err(Error::Other(format!(
-                "pflog1ppf: cell {r} has non-positive depth {depth}; filter empty cells first"
-            )));
-        }
         let start = delta.indptr[r] as usize;
         let end = delta.indptr[r + 1] as usize;
         for v in &mut delta.data[start..end] {
             if !v.is_finite() {
                 return Err(Error::Other(format!(
-                    "pflog1ppf: non-finite count {v} at cell {r}; counts must be finite"
+                    "pflog: non-finite count {v} at cell {r}; counts must be finite"
                 )));
             }
             if (*v as f64) < 0.0 {
                 return Err(Error::Other(format!(
-                    "pflog1ppf: negative count {v} at cell {r}; counts must be non-negative"
+                    "pflog: negative count {v} at cell {r}; counts must be non-negative"
                 )));
             }
-            *v = ((*v as f64) / (c * depth)).ln_1p() as f32;
+            *v = (four_alpha * (*v as f64)).ln_1p() as f32;
         }
     }
     Ok(delta)
 }
 
-/// PFlog1pPF / shifted centered-log-ratio normalization (Booeshaghi et al.
-/// 2026), returning a baseline-aware PCA embedding.
+/// PFlog (v4) / shifted-log normalization on raw counts (Booeshaghi et al.),
+/// returning a baseline-aware PCA embedding.
 ///
 /// @param counts A **genes × cells** raw-counts `dgCMatrix` (Seurat's native
-///   layout). PFlog1pPF is defined on raw counts, **not** log-normalized data.
-/// @param c Shift / pseudocount (default `1.0` for PFlog1pPF).
+///   layout). PFlog is defined on raw counts, **not** log-normalized data.
+/// @param alpha NB overdispersion `α` (matrix-wide pseudocount `1/(4α)`). Pass
+///   `NA_real_` to estimate it once from `counts`; a finite positive value pins it.
 /// @param n_components Number of principal components.
 /// @param zero_center Mean-center columns (genes) before decomposition.
 /// @param n_oversamples,n_power_iterations Randomized-SVD accuracy knobs.
 /// @param seed RNG seed.
 ///
-/// The exact transform `Z = delta + baseline·1ᵀ` is dense, but decomposes into
-/// the sparse `delta` plus a per-cell `baseline`, so PCA never densifies. This
-/// is the **in-memory** R path (materialized `dgCMatrix`); the streaming /
-/// atlas-scale out-of-core path is `pyscx`-only.
+/// v4 shifts raw counts by the matrix-wide Anscombe pseudocount `1/(4α)` — no
+/// per-cell depth. The exact transform `Z = delta + baseline·1ᵀ` is dense but
+/// decomposes into the sparse `delta = log1p(4α·x)` plus a per-cell `baseline`,
+/// so PCA never densifies. This is the **in-memory** R path (materialized
+/// `dgCMatrix`); the streaming / atlas-scale out-of-core path is `pyscx`-only.
 ///
 /// @return list(`embeddings` = cells × n_components, `loadings` =
 ///   genes × n_components, `variance_explained`, `variance_ratio`,
-///   `n_components`, `baseline` = per-cell length-`n_cells` vector).
+///   `n_components`, `baseline` = per-cell length-`n_cells` vector, `alpha`,
+///   `pseudocount`).
 /// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
 #[extendr]
-fn scx_pflog1ppf_matrix(
+fn scx_pflog_matrix(
     counts: Robj,
-    c: f64,
+    alpha: Option<f64>,
     n_components: i32,
     zero_center: bool,
     n_oversamples: i32,
     n_power_iterations: i32,
     seed: f64,
 ) -> Robj {
-    crate::util::throw_on_err(scx_pflog1ppf_matrix_impl(
+    crate::util::throw_on_err(scx_pflog_matrix_impl(
         counts,
-        c,
+        alpha,
         n_components,
         zero_center,
         n_oversamples,
@@ -313,9 +311,9 @@ fn scx_pflog1ppf_matrix(
     ))
 }
 
-fn scx_pflog1ppf_matrix_impl(
+fn scx_pflog_matrix_impl(
     counts: Robj,
-    c: f64,
+    alpha: Option<f64>,
     n_components: i32,
     zero_center: bool,
     n_oversamples: i32,
@@ -325,18 +323,34 @@ fn scx_pflog1ppf_matrix_impl(
     if n_components < 1 {
         return Err(Error::Other("n_components must be >= 1".into()));
     }
-    if c <= 0.0 || c.is_nan() || c.is_infinite() {
-        return Err(Error::Other(format!(
-            "pflog1ppf: shift c must be positive and finite, got {c}"
-        )));
-    }
     let raw = dgc_genes_by_cells_to_csr(&counts)?;
-    let delta = delta_from_raw_csr(&raw, c)?;
+
+    // Resolve α: `NULL`/`NA` (⇒ `None`) estimates from the matrix; else pin (validate).
+    let alpha = match alpha {
+        None => {
+            let src = SingleShardSource { csr: &raw };
+            estimate_alpha(&src, &AlphaOptions::default())
+                .map_err(|e| Error::Other(format!("pflog α estimation: {e}")))?
+                .alpha
+        }
+        Some(a) => {
+            if a <= 0.0 || a.is_nan() || a.is_infinite() {
+                return Err(Error::Other(format!(
+                    "pflog: alpha must be positive and finite, got {a}"
+                )));
+            }
+            a
+        }
+    };
+    let four_alpha = 4.0 * alpha;
+    let pseudocount = 1.0 / four_alpha;
+
+    let delta = delta_from_raw_csr(&raw, four_alpha)?;
     let source = SingleShardSource { csr: &delta };
     let n_comp = n_components as usize;
 
     let baseline = pflog_baseline_from_delta(&source)
-        .map_err(|e| Error::Other(format!("pflog1ppf baseline: {e}")))?;
+        .map_err(|e| Error::Other(format!("pflog baseline: {e}")))?;
     let result = pflog_pca(
         &source,
         &baseline,
@@ -346,7 +360,7 @@ fn scx_pflog1ppf_matrix_impl(
         zero_center,
         seed as u64,
     )
-    .map_err(|e| Error::Other(format!("pflog1ppf pca: {e}")))?;
+    .map_err(|e| Error::Other(format!("pflog pca: {e}")))?;
 
     let embeddings = row_major_to_rmatrix(&result.embeddings, result.n_obs, result.n_components)?;
     // `components` is row-major (n_components × n_vars); the genes × components
@@ -369,7 +383,9 @@ fn scx_pflog1ppf_matrix_impl(
         variance_explained = {{variance_explained}},
         variance_ratio = {{variance_ratio}},
         n_components = {{n_comp_i}},
-        baseline = {{baseline}}
+        baseline = {{baseline}},
+        alpha = {{alpha}},
+        pseudocount = {{pseudocount}}
     )")
     .map_err(|e| Error::Other(e.to_string()))
 }
@@ -1402,7 +1418,7 @@ fn scx_nb_glm_matrix_impl(
 extendr_module! {
     mod accel;
     fn scx_pca_matrix;
-    fn scx_pflog1ppf_matrix;
+    fn scx_pflog_matrix;
     fn scx_knn_matrix;
     fn scx_umap_graph;
     fn scx_leiden_graph;

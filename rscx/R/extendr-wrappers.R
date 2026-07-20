@@ -231,11 +231,11 @@ scx_pca_matrix <- function(counts, n_components, zero_center,
         as.numeric(seed))
 }
 
-scx_pflog1ppf_matrix <- function(counts, c, n_components, zero_center,
-                                 n_oversamples, n_power_iterations, seed) {
-  .Call(wrap__scx_pflog1ppf_matrix,
+scx_pflog_matrix <- function(counts, alpha, n_components, zero_center,
+                             n_oversamples, n_power_iterations, seed) {
+  .Call(wrap__scx_pflog_matrix,
         counts,
-        as.numeric(c),
+        as.numeric(alpha),
         as.integer(n_components),
         as.logical(zero_center),
         as.integer(n_oversamples),

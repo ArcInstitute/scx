@@ -3,7 +3,7 @@
 \name{scx-accelerators}
 \alias{scx-accelerators}
 \alias{scx_pca}
-\alias{scx_pflog1ppf}
+\alias{scx_pflog}
 \alias{scx_neighbors}
 \alias{scx_umap}
 \alias{scx_leiden}
@@ -29,18 +29,18 @@ scx_pca(
   reduction.key = "PC_"
 )
 
-scx_pflog1ppf(
+scx_pflog(
   object,
   assay = NULL,
   layer = "counts",
-  c = 1,
+  alpha = NULL,
   n_components = 50L,
   zero_center = TRUE,
   n_oversamples = 10L,
   n_power_iterations = 2L,
   seed = 0L,
-  reduction.name = "pflog1ppf",
-  reduction.key = "PFLOG1PPF_"
+  reduction.name = "pflog",
+  reduction.key = "PFLOG_"
 )
 
 scx_neighbors(
@@ -171,22 +171,26 @@ genes for a matrix input).}
 
 \item{reduction.name, reduction.key}{Output reduction slot name / key.}
 
-\item{c}{Shift / pseudocount (default \code{1} for PFlog1pPF).
+\item{alpha}{NB overdispersion \code{α} (matrix-wide pseudocount \code{1/(4α)}).
+\code{NULL} (default) estimates \code{α} once from the counts; a finite positive
+value pins it (e.g. a reference \code{α} reused across datasets).
 
 Operates on \strong{raw counts} (hence \code{layer = "counts"}), not log-normalized
-data: counts are converted to within-cell proportions, shifted by \code{c},
-log-transformed, then centered within each cell. The exact transform is
-dense but decomposes into a sparse \code{delta} plus a per-cell \code{baseline}, so
-PCA never densifies. For a \code{Seurat} object the embedding is written to the
-\code{reduction.name} reduction and the per-cell baseline to
-\code{object$pflog1ppf_baseline}. This is the \strong{in-memory} R path; the
-streaming / atlas-scale out-of-core path is \code{pyscx}-only.
+data: counts are shifted by the matrix-wide Anscombe pseudocount \code{1/(4α)},
+log-transformed, then centered within each cell — no per-cell depth (it cancels
+under the Anscombe scale). The exact transform is dense but decomposes into a
+sparse \code{delta = log1p(4α·x)} plus a per-cell \code{baseline}, so PCA never
+densifies. For a \code{Seurat} object the embedding is written to the
+\code{reduction.name} reduction, the per-cell baseline to
+\code{object$pflog_baseline}, and the fit (\code{alpha}, \code{pseudocount}) to
+\code{object@misc$pflog}. This is the \strong{in-memory} R path; the streaming /
+atlas-scale out-of-core path is \code{pyscx}-only.
 
-Unlike \link{scx_pca}, this does \strong{not} accept a \code{features} argument: PFlog1pPF's
-per-cell depth \code{s_i} and centering denominator \code{D} are defined over the full
-transcriptome, so subsetting to variable features before the transform would
-silently change the statistic (and the stored \code{baseline}). The transform and
-its PCA are always computed over the full counts layer.}
+Unlike \link{scx_pca}, this does \strong{not} accept a \code{features} argument: PFlog's
+centering denominator \code{D} is defined over the full transcriptome, so
+subsetting to variable features before the transform would silently change the
+statistic (and the stored \code{baseline}). The transform and its PCA are always
+computed over the full counts layer.}
 
 \item{reduction}{Input reduction (default \code{"pca"}).}
 
@@ -324,8 +328,8 @@ Normalize -> \code{scx_highly_variable_genes} -> \code{scx_pca} -> \code{scx_nei
 \itemize{
 \item \code{scx_pca()}: PCA via randomized / covariance SVD.
 
-\item \code{scx_pflog1ppf()}: PFlog1pPF / shifted-CLR normalization
-(Booeshaghi et al. 2026) returning a baseline-aware PCA embedding.
+\item \code{scx_pflog()}: PFlog (v4) / shifted-log normalization on raw
+counts (Booeshaghi et al.) returning a baseline-aware PCA embedding.
 
 \item \code{scx_neighbors()}: kNN graph (HNSW) from an embedding.
 
