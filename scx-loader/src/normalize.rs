@@ -17,7 +17,7 @@
 /// necessarily `row.iter().sum()`. When `row` is an HVG-projected panel, its
 /// own sum is the panel-local depth, which is a different statistic from
 /// scanpy's `normalize_total` (computed over full depth, then subset to HVGs)
-/// and from the pflog1ppf sibling ([`pflog1ppf_depth_baseline`], full `s_i`).
+/// and from the pflog sibling ([`pflog_baseline_row`], full `D`).
 /// Passing the full-row depth here keeps the panel path consistent with both.
 ///
 /// Zero values remain zero (0.0 × factor = 0.0). If `depth <= 0.0` the row is
@@ -122,7 +122,7 @@ pub fn fused_normalize_log1p_dense(row: &mut [f32], target_sum: f64) {
 /// - `depth`: The normalization denominator — the cell's total count over the
 ///   **full transcriptome**. Callers whose `row` is HVG-projected MUST pass the
 ///   full pre-projection row sum here, not the panel-local sum, so normalization
-///   matches scanpy's normalize-then-subset and the pflog1ppf path. For a
+///   matches scanpy's normalize-then-subset and the pflog path. For a
 ///   full-transcriptome `row` this equals `row.iter().sum()`. Ignored when
 ///   `normalize == false`.
 #[inline]
@@ -141,30 +141,32 @@ pub fn apply_dense_transforms(
     }
 }
 
-/// Per-cell PFlog1pPF depth and baseline from a sparse CSR row's stored values.
+/// Per-cell PFlog (v4) baseline from a sparse CSR row's stored values.
 ///
-/// PFlog1pPF (Booeshaghi et al. 2026) is the shifted centered-log-ratio
-/// transform `z_ij = log1p(x_ij/(c·s_i)) − (1/D)·Σ_k log1p(x_ik/(c·s_i))`. The
-/// `delta = log1p(x/(c·s))` part is sparse (zeros stay zero) and the per-cell
-/// `baseline = −(1/D)·Σ delta` is the value every original zero collapses to.
+/// PFlog (v4, Booeshaghi et al.) is the shifted-log transform on **raw counts**
+/// `z_ij = log1p(4α·x_ij) − (1/D)·Σ_k log1p(4α·x_ik)`, where `4α = four_alpha`
+/// and the matrix-wide Anscombe pseudocount is `1/(4α)`. The `delta =
+/// log1p(4α·x)` part is sparse (zeros stay zero) and the per-cell `baseline =
+/// −(1/D)·Σ delta` is the value every original zero collapses to. Unlike v2
+/// there is **no per-cell depth** (it cancels under the Anscombe scale).
 ///
 /// **Critical**: `csr_data` MUST be the **full pre-projection** row and `n_vars`
-/// the **full** feature count `D`. Computing depth/`D` over an HVG-projected
-/// subset is a different statistic that silently diverges from the analysis
-/// path (`scx_accel::pflog1ppf_*`, which use full `s_i` and full `D`).
+/// the **full** feature count `D`. Computing `D` over an HVG-projected subset is
+/// a different statistic that silently diverges from the analysis path
+/// (`scx_accel::pflog_*`, which use full `D`).
 ///
-/// Returns `None` for a non-positive depth (empty cell) or `n_vars == 0` —
-/// callers leave the output row zeroed (mirrors [`normalize_dense_row`]'s
-/// `if row_sum > 0.0` guard). Accumulates in `f64`.
+/// Returns `None` only for `n_vars == 0` (degenerate). An empty cell yields
+/// `Some(0.0)` (v4 is representable at zero depth). Accumulates in `f64`.
 #[inline]
-pub fn pflog1ppf_depth_baseline(csr_data: &[f32], c: f64, n_vars: usize) -> Option<(f64, f64)> {
-    let depth: f64 = csr_data.iter().map(|&v| v as f64).sum();
-    if depth <= 0.0 || n_vars == 0 {
+pub fn pflog_baseline_row(csr_data: &[f32], four_alpha: f64, n_vars: usize) -> Option<f64> {
+    if n_vars == 0 {
         return None;
     }
-    let inv = 1.0 / (c * depth);
-    let sum_delta: f64 = csr_data.iter().map(|&v| (v as f64 * inv).ln_1p()).sum();
-    Some((depth, -sum_delta / n_vars as f64))
+    let sum_delta: f64 = csr_data
+        .iter()
+        .map(|&v| (four_alpha * v as f64).ln_1p())
+        .sum();
+    Some(-sum_delta / n_vars as f64)
 }
 
 #[cfg(test)]

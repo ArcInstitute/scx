@@ -647,6 +647,7 @@ impl ScxLazyTransformedDataset {
                 Transform::NormalizeTotal { .. } => "NormalizeTotal",
                 Transform::Log1p => "Log1p",
                 Transform::RowScale { .. } => "RowScale",
+                Transform::Scale { .. } => "Scale",
             })
             .collect();
         format!(
@@ -679,6 +680,10 @@ impl ScxLazyTransformedDataset {
                 Transform::RowScale { factors } => {
                     params.set_item("factors_len", factors.len())?;
                     "row_scale"
+                }
+                Transform::Scale { factor } => {
+                    params.set_item("factor", *factor)?;
+                    "scale"
                 }
             };
             entry.set_item("name", name)?;
@@ -1674,6 +1679,11 @@ impl ScxLazyTransformedDataset {
                 let factor = factors[global_row] as f32;
                 for v in &mut csr.data[start..end] {
                     *v *= factor;
+                }
+            }
+            Transform::Scale { factor } => {
+                for v in &mut csr.data[start..end] {
+                    *v = (*v as f64 * *factor) as f32;
                 }
             }
         }

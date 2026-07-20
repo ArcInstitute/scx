@@ -223,8 +223,8 @@ loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=0)
 | `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). The per-cell depth is the **full transcriptome** total count even under `hvg_indices` projection (matching scanpy's normalize-then-subset), not the panel-local sum. **scVI and other count-likelihood models need `normalize=False, log1p=False`.** |
 | `log1p` | `True` | Apply `log1p` after normalize. |
 | `target_sum` | `1e4` | Normalization target sum. |
-| `pflog1ppf` | `False` | Apply PFlog1pPF / shifted-CLR normalization (Booeshaghi et al. 2026) instead of normalize/log1p. Mutually exclusive with `normalize`/`log1p` (takes precedence when `True`). Depth and centering denominator are computed over the full transcriptome even under `hvg_indices` projection. |
-| `pflog1ppf_c` | `1.0` | PFlog1pPF shift / pseudocount `c` (only used when `pflog1ppf=True`). |
+| `pflog` | `False` | Apply PFlog (v4) / shifted-log normalization on raw counts (Booeshaghi et al.) instead of normalize/log1p. Mutually exclusive with `normalize`/`log1p` (takes precedence when `True`). The centering denominator is computed over the full transcriptome even under `hvg_indices` projection (no per-cell depth in v4). |
+| `pflog_alpha` | `None` | PFlog NB overdispersion `α` (matrix-wide pseudocount `1/(4α)`; only used when `pflog=True`). `None` estimates `α` once at loader construction from the raw counts (single-modality only; a modality-scoped loader must pin it); a float pins a reference `α`. |
 | `shard_group_size` | `8` | Shards per I/O group. Sequential I/O within each group for disk efficiency. |
 | `prefetch_batches` | `4` | Ring buffer depth — number of pre-built batches to buffer ahead. |
 | `seed` | `42` | RNG seed. Deterministic shuffle via `(seed, epoch_number)`. |

@@ -69,8 +69,8 @@ class IndexPlanDataset:
         normalize: bool | None = None,
         log1p: bool | None = None,
         target_sum: float | None = None,
-        pflog1ppf: bool | None = None,
-        pflog1ppf_c: float | None = None,
+        pflog: bool | None = None,
+        pflog_alpha: float | None = None,
         cache_shards: int | None = None,
         sort_by_shard: bool | None = None,
         lookahead: int | None = None,
@@ -245,8 +245,8 @@ class TrainingDataset:
         normalize: bool | None = None,  # default True — see class docstring
         log1p: bool | None = None,  # default True — see class docstring
         target_sum: float | None = None,
-        pflog1ppf: bool | None = None,
-        pflog1ppf_c: float | None = None,
+        pflog: bool | None = None,
+        pflog_alpha: float | None = None,
         shard_group_size: int | None = None,
         prefetch_batches: int | None = None,
         seed: int | None = None,

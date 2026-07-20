@@ -43,7 +43,7 @@ use crate::error::{LoaderError, Result};
 pub enum PreprocessMode {
     PassThrough,
     Log1pRaw,
-    Pflog1ppfRaw,
+    PflogRaw,
     NormalizeLog1p,
 }
 
@@ -52,7 +52,7 @@ impl PreprocessMode {
         match s {
             "pass_through" => Ok(Self::PassThrough),
             "log1p_raw" => Ok(Self::Log1pRaw),
-            "pflog1ppf_raw" => Ok(Self::Pflog1ppfRaw),
+            "pflog_raw" => Ok(Self::PflogRaw),
             "normalize_log1p" => Ok(Self::NormalizeLog1p),
             other => Err(LoaderError::ConfigError {
                 reason: format!("unknown preprocessing mode {other:?}"),
@@ -109,8 +109,12 @@ pub struct CollateConfig {
     pub k_enc: usize,
     pub mode: PreprocessMode,
     pub target_sum: f64,
-    /// Measured panel size, for the `pflog1ppf` per-cell `center`.
+    /// Measured panel size, for the `pflog` per-cell `center` (denominator `D`).
     pub n_measured: usize,
+    /// PFlog (v4) NB overdispersion `α`; required when `mode == PflogRaw`. The
+    /// encoder value is `log1p(4α·rc) − center` on raw counts (matrix-wide
+    /// pseudocount `1/(4α)`). No per-cell depth. Validated at the caller.
+    pub pflog_alpha: Option<f64>,
     pub n_genes_total: i64,
     /// Redefine `library_size` as the sum of raw counts at query positions
     /// (perturbation fixed-query case, `task.py:1729`). Does NOT affect the
@@ -166,24 +170,22 @@ pub fn collate_cell(cin: &CellIn, cfg: &CollateConfig, out: &mut CellOut) -> f32
                 tgt_vals[i] = v;
             }
         }
-        PreprocessMode::Pflog1ppfRaw => {
-            if lib <= 0.0 {
-                for i in 0..n {
-                    enc_vals[i] = 0.0;
-                    tgt_vals[i] = cin.raw[i].max(0.0);
-                }
-            } else {
-                let libf = lib as f32;
-                for i in 0..n {
-                    let rc = cin.raw[i].max(0.0);
-                    enc_vals[i] = (rc / libf).ln_1p();
-                }
-                let center = (enc_vals.iter().map(|&v| v as f64).sum::<f64>()
-                    / cfg.n_measured as f64) as f32;
-                for i in 0..n {
-                    enc_vals[i] -= center;
-                    tgt_vals[i] = cin.raw[i].max(0.0);
-                }
+        PreprocessMode::PflogRaw => {
+            // v4: raw-count shifted log `log1p(4α·rc)`, centered by `n_measured`.
+            // No per-cell depth (an empty cell → all enc 0 → center 0 → stays 0).
+            let four_alpha = 4.0
+                * cfg
+                    .pflog_alpha
+                    .expect("pflog_alpha required for PflogRaw mode (validated at the caller)");
+            for i in 0..n {
+                let rc = cin.raw[i].max(0.0) as f64;
+                enc_vals[i] = (four_alpha * rc).ln_1p() as f32;
+            }
+            let center =
+                (enc_vals.iter().map(|&v| v as f64).sum::<f64>() / cfg.n_measured as f64) as f32;
+            for i in 0..n {
+                enc_vals[i] -= center;
+                tgt_vals[i] = cin.raw[i].max(0.0);
             }
         }
     }

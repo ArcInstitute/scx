@@ -18,6 +18,7 @@ fn cfg(mode: PreprocessMode, k_enc: usize) -> CollateConfig {
         mode,
         target_sum: 1e4,
         n_measured: 8,
+        pflog_alpha: Some(1.0),
         n_genes_total: N_GENES,
         lib_size_redef: false,
     }
@@ -249,17 +250,19 @@ fn library_size_redefinition_sums_query_positions() {
 }
 
 #[test]
-fn pflog1ppf_target_is_raw_and_encoder_centered() {
-    let c = cfg(PreprocessMode::Pflog1ppfRaw, 4);
+fn pflog_target_is_raw_and_encoder_centered() {
+    // cfg pins pflog_alpha = 1.0 → four_alpha = 4.0. v4: enc = log1p(4α·rc) − center
+    // (raw counts, no /lib).
+    let c = cfg(PreprocessMode::PflogRaw, 4);
     let (b, lib) = run(&[1, 3, 5], &[2.0, 4.0, 1.0], &[3, 5, 7, 1], None, false, &c);
-    // target = RAW (exact); library = full sum.
+    // target = RAW (exact); library = full sum (still reported for other uses).
     assert_eq!(b.target, vec![4.0, 1.0, 0.0, 2.0]);
     assert_eq!(lib, 7.0);
-    // encoder values: log1p(raw/lib) - center, finite, ordered by raw desc.
-    let libf = 7.0f32;
+    // encoder values: log1p(4α·raw) - center, ordered by raw desc.
+    let four_alpha = 4.0f64;
     let lp: Vec<f32> = [4.0f32, 2.0, 1.0]
         .iter()
-        .map(|&r| (r / libf).ln_1p())
+        .map(|&r| (four_alpha * r as f64).ln_1p() as f32)
         .collect();
     let center = (lp.iter().map(|&v| v as f64).sum::<f64>() / 8.0) as f32;
     approx(b.counts[0], lp[0] - center);
@@ -360,6 +363,7 @@ fn golden_vectors_match_state3_reference() {
             mode: PreprocessMode::PassThrough,
             target_sum: 1e4,
             n_measured: gene_ids.len().max(1),
+            pflog_alpha: None,
             n_genes_total,
             lib_size_redef: false,
         };

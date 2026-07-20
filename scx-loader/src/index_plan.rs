@@ -36,7 +36,7 @@ use crate::decode_stage::{build_category_dicts, extract_obs_columns, CategoryDic
 use crate::error::{LoaderError, Result};
 use crate::normalize::apply_dense_transforms;
 use crate::pipeline::LoaderConfig;
-use crate::projection::{pflog1ppf_row_full, scatter_row_full, HvgProjection};
+use crate::projection::{pflog_row_full, scatter_row_full, HvgProjection};
 
 /// One paired batch produced by `IndexPlanLoader`.
 ///
@@ -179,7 +179,7 @@ impl IndexPlanLoader {
     /// this path.
     pub fn new(
         path: impl AsRef<Path>,
-        config: LoaderConfig,
+        mut config: LoaderConfig,
         cache_shards: usize,
         sort_by_shard: bool,
         lookahead: usize,
@@ -199,6 +199,10 @@ impl IndexPlanLoader {
         let reader = ScxReader::open(path.as_ref())?;
         let n_obs = reader.n_obs();
         let n_vars = reader.n_vars();
+        // Captured before `reader` is consumed by `BackedCsrReader::new` below;
+        // gates the pflog α auto-estimate (a whole-file source would pool
+        // modalities on a multimodal file).
+        let n_modalities = reader.n_modalities();
 
         // Borrow obs / sizes off ScxReader before BackedCsrReader::new takes ownership.
         let obs_metadata = reader.read_obs()?;
@@ -383,6 +387,45 @@ impl IndexPlanLoader {
         // Always-on metrics on this surface — the iter's profile log and
         // the per-iter snapshot accessor read from this handle.
         let cache_metrics = backed.enable_metrics();
+
+        // v4 PFlog: resolve α once (mirrors TrainingPipeline::new). A pinned α
+        // is validated; `None` ⇒ estimate over the raw CSR shards via the
+        // just-built `backed` reader (single-modality only). After this,
+        // `config.pflog_alpha` is `Some` whenever `config.pflog`.
+        if config.pflog {
+            match config.pflog_alpha {
+                Some(a) if a <= 0.0 || a.is_nan() || a.is_infinite() => {
+                    return Err(LoaderError::ConfigError {
+                        reason: "pflog_alpha must be positive and finite".to_string(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    if config.modality_id.is_some() || n_modalities > 1 {
+                        return Err(LoaderError::ConfigError {
+                            reason: "pflog_alpha must be set explicitly for a multimodal or \
+                                     modality-scoped loader (auto-estimation would pool \
+                                     modalities); estimate it once via pyscx.accel.pflog and \
+                                     pass pflog_alpha"
+                                .to_string(),
+                        });
+                    }
+                    let est =
+                        scx_accel::estimate_alpha(&backed, &scx_accel::AlphaOptions::default())
+                            .map_err(|e| LoaderError::ConfigError {
+                                reason: format!("pflog α estimation failed: {e}"),
+                            })?;
+                    log::info!(
+                        "pflog: estimated α={:.6} (pseudocount={:.6}, n_genes_used={}, fell_back={})",
+                        est.alpha,
+                        est.pseudocount,
+                        est.n_genes_used,
+                        est.fell_back
+                    );
+                    config.pflog_alpha = Some(est.alpha);
+                }
+            }
+        }
 
         // The tokio runtime is built lazily on first use (see `Self::runtime`)
         // to keep `new` fork-safe — a parent process can construct an
@@ -709,10 +752,10 @@ impl IndexPlanLoader {
         }
         res?;
 
-        // PFlog1pPF is applied at scatter time (it needs the full pre-projection
-        // row for depth/baseline — see `scatter_pair_request`), so the
+        // PFlog is applied at scatter time (it needs the full pre-projection
+        // row for the centering baseline — see `scatter_pair_request`), so the
         // post-scatter normalize/log1p dispatch is skipped in that mode.
-        if !self.config.pflog1ppf {
+        if !self.config.pflog {
             for i in 0..n_pairs {
                 let p_out = &mut x[i * n_cols..][..n_cols];
                 apply_dense_transforms(
@@ -757,15 +800,20 @@ impl IndexPlanLoader {
             PairSide::Perturbed => &mut x[request.pair_idx * n_cols..][..n_cols],
             PairSide::Control => &mut x_paired[request.pair_idx * n_cols..][..n_cols],
         };
-        if self.config.pflog1ppf {
-            // Depth/D over the FULL transcriptome (`idx`/`data` is the full row);
-            // each output slot is written by exactly one request, so the scatter
-            // fully produces the final PFlog1pPF row (delta + baseline).
+        if self.config.pflog {
+            // Centering D over the FULL transcriptome (`idx`/`data` is the full
+            // row); each output slot is written by exactly one request, so the
+            // scatter fully produces the final PFlog row (delta + baseline).
+            // v4 has no depth; `four_alpha = 4α`.
             let n_vars_full = self.backed.n_vars();
-            let c = self.config.pflog1ppf_c;
+            let four_alpha = 4.0
+                * self
+                    .config
+                    .pflog_alpha
+                    .expect("pflog_alpha resolved at construction");
             match self.hvg_projection.as_ref() {
-                Some(hvg) => hvg.scatter_pflog1ppf_row(idx, data, c, n_vars_full, out),
-                None => pflog1ppf_row_full(idx, data, c, n_vars_full, out)?,
+                Some(hvg) => hvg.scatter_pflog_row(idx, data, four_alpha, n_vars_full, out),
+                None => pflog_row_full(idx, data, four_alpha, n_vars_full, out)?,
             }
         } else {
             match self.hvg_projection.as_ref() {
