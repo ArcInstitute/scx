@@ -23,7 +23,7 @@ pub mod lisi;
 pub mod nb_glm;
 pub mod neighbors;
 pub mod pca;
-pub mod pflog1ppf;
+pub mod pflog;
 pub mod pseudobulk;
 pub mod route;
 pub mod umap;
@@ -68,12 +68,12 @@ pub use nb_glm::{
 };
 pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{
-    covariance_pca, covariance_pca_inmemory, pflog1ppf_pca, randomized_pca,
-    randomized_pca_inmemory, PcaResult, COVARIANCE_PCA_THRESHOLD,
+    covariance_pca, covariance_pca_inmemory, pflog_pca, randomized_pca, randomized_pca_inmemory,
+    PcaResult, COVARIANCE_PCA_THRESHOLD,
 };
-pub use pflog1ppf::{
-    estimate_alpha, pflog1ppf_baseline, pflog1ppf_baseline_from_delta, pflog1ppf_cell_depths,
-    AlphaEstimate, AlphaOptions, PFlog1pPF,
+pub use pflog::{
+    estimate_alpha, pflog_baseline_from_delta, pflog_baseline_from_raw, AlphaEstimate,
+    AlphaOptions, PFlog,
 };
 pub use pseudobulk::{
     build_group_mapping, pseudobulk_aggregate, pseudobulk_aggregate_dense,

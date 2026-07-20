@@ -151,7 +151,7 @@ pub fn apply_dense_transforms(
 /// **Critical**: `csr_data` MUST be the **full pre-projection** row and `n_vars`
 /// the **full** feature count `D`. Computing depth/`D` over an HVG-projected
 /// subset is a different statistic that silently diverges from the analysis
-/// path (`scx_accel::pflog1ppf_*`, which use full `s_i` and full `D`).
+/// path (`scx_accel::pflog_*`, which use full `s_i` and full `D`).
 ///
 /// Returns `None` for a non-positive depth (empty cell) or `n_vars == 0` —
 /// callers leave the output row zeroed (mirrors [`normalize_dense_row`]'s

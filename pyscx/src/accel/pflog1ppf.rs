@@ -32,7 +32,7 @@ use numpy::{PyArray, PyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use scx_accel::{pflog1ppf_baseline_from_delta, pflog1ppf_pca, PcaResult};
+use scx_accel::{pflog_baseline_from_delta, pflog_pca, PcaResult};
 use scx_codec::CodecId;
 use scx_format_io::section::SectionType;
 use scx_format_io::shard_source::SingleShardSource;
@@ -361,13 +361,13 @@ fn run_on_source<S: ShardSource>(
     let (n_obs, n_vars) = source.shape();
 
     // Baseline (always) → adata.obs[baseline_key].
-    let baseline = pflog1ppf_baseline_from_delta(source)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let baseline =
+        pflog_baseline_from_delta(source).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let baseline_arr = PyArray::from_slice(py, &baseline);
     adata.getattr("obs")?.set_item(baseline_key, baseline_arr)?;
 
     if want_pca {
-        let result: PcaResult = pflog1ppf_pca(
+        let result: PcaResult = pflog_pca(
             source,
             &baseline,
             n_components,

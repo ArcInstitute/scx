@@ -433,7 +433,7 @@ pub fn randomized_pca<S: ShardSource>(
 }
 
 // ---------------------------------------------------------------------------
-// PFlog1pPF — baseline-aware randomized PCA
+// PFlog (v4) — baseline-aware randomized PCA
 // ---------------------------------------------------------------------------
 
 /// Streaming forward SpMM with a per-row baseline offset:
@@ -442,7 +442,7 @@ pub fn randomized_pca<S: ShardSource>(
 /// Reuses [`streaming_spmm_forward`] for the `delta@M − 1⊗(μᵀM)` part (the
 /// column-centering rank-1 term, when `means` is `Some`), then adds the
 /// row-baseline rank-1 term `baseline_i · colsum(M)_j`. `delta` is whatever
-/// `source` streams (the lazy `NormalizeTotal→Log1p` source for PFlog1pPF).
+/// `source` streams (the lazy `Scale{4α}→Log1p` source for PFlog v4).
 fn streaming_spmm_forward_offset<S: ShardSource>(
     source: &S,
     m_data: &[f64],
@@ -512,7 +512,7 @@ fn streaming_spmm_transpose_offset<S: ShardSource>(
     Ok(z)
 }
 
-/// Total variance of the exact PFlog1pPF matrix `Z = delta + baseline·1ᵀ`,
+/// Total variance of the exact PFlog matrix `Z = delta + baseline·1ᵀ`,
 /// computed in closed form from the `delta` column statistics + baseline.
 ///
 /// `colmean_delta` is `Some` for the column-centered case (the variance of the
@@ -525,7 +525,7 @@ fn streaming_spmm_transpose_offset<S: ShardSource>(
 /// `C_j = n_obs·colmean_delta_j`. Since `colmean_delta_j = μ_j − b̄`, the two
 /// cross terms collapse to `2·n_obs·Σμ²`, leaving the closed form
 /// `S_dd − D·B2 − n_obs·Σμ²`.
-fn pflog1ppf_total_variance(
+fn pflog_total_variance(
     col_sum_sq_delta: &[f64],
     colmean_delta: Option<&[f64]>,
     baseline: &[f64],
@@ -554,11 +554,11 @@ fn pflog1ppf_total_variance(
     }
 }
 
-/// Exact PFlog1pPF randomized PCA, streaming the `delta` source out-of-core.
+/// Exact PFlog (v4) randomized PCA, streaming the `delta` source out-of-core.
 ///
-/// `delta_source` streams the sparse `delta` shards (the lazy
-/// `NormalizeTotal{target_sum=1/c} → Log1p` source); `baseline` is the per-cell
-/// offset from [`crate::pflog1ppf::pflog1ppf_baseline`]. The randomized SVD is
+/// `delta_source` streams the sparse `delta` shards (the lazy `Scale{4α} → Log1p`
+/// source, i.e. `delta_ij = log1p(4α·x_ij)`); `baseline` is the per-cell offset
+/// from [`crate::pflog::pflog_baseline_from_raw`]. The randomized SVD is
 /// driven exactly as [`randomized_pca`] but over the implicit dense
 /// `Z = delta + baseline·1ᵀ`: each SpMM pass folds the row-baseline rank-1 term
 /// alongside the existing column-centering rank-1 term, so `Z` is never
@@ -574,7 +574,7 @@ fn pflog1ppf_total_variance(
 /// which recomputes `normalize→log1p` per pass; with a non-caching source this is
 /// decode-bound (acceptable for randomized PCA).
 #[allow(clippy::too_many_arguments)]
-pub fn pflog1ppf_pca<S: ShardSource>(
+pub fn pflog_pca<S: ShardSource>(
     delta_source: &S,
     baseline: &[f64],
     n_components: usize,
@@ -591,7 +591,7 @@ pub fn pflog1ppf_pca<S: ShardSource>(
             baseline.len()
         )));
     }
-    warn_if_cache_undersized(delta_source, "pflog1ppf_pca");
+    warn_if_cache_undersized(delta_source, "pflog_pca");
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
 
@@ -622,7 +622,7 @@ pub fn pflog1ppf_pca<S: ShardSource>(
     }
 
     let b_rm = streaming_spmm_transpose_offset(delta_source, &q, means_ref, baseline)?;
-    let total_var = pflog1ppf_total_variance(
+    let total_var = pflog_total_variance(
         &col_sum_sq_delta,
         colmean_delta.as_deref(),
         baseline,
@@ -2124,13 +2124,15 @@ mod tests {
         }
     }
 
-    /// `pflog1ppf_total_variance` (both branches) must match a brute-force dense
+    /// `pflog_total_variance` (both branches) must match a brute-force dense
     /// computation of `Σ Z² / (n−1)` (uncentered) and `Σ (Z − colmean)² / (n−1)`
     /// (centered) for the exact `Z = delta + baseline·1ᵀ`. Guards the simplified
-    /// centered closed form `S_dd − D·B2 − n·Σμ²`.
+    /// centered closed form `S_dd − D·B2 − n·Σμ²`. The closed form is
+    /// transform-agnostic (it holds for any `delta` with `b_i = −Σδ/D`), so an
+    /// arbitrary `delta` exercises it regardless of the v4 formula.
     #[test]
-    fn pflog1ppf_total_variance_matches_dense() {
-        // Arbitrary dense `delta`; baseline must be the true PFlog1pPF baseline
+    fn pflog_total_variance_matches_dense() {
+        // Arbitrary dense `delta`; baseline must be the true PFlog baseline
         // (`b_i = −(1/D) Σ_j delta_ij`) — the closed form relies on that identity.
         let delta = [
             [0.10f64, -0.30, 0.50, 0.20],
@@ -2170,7 +2172,7 @@ mod tests {
 
         // Uncentered: Σ Z² / (n−1).
         let ss_uncentered: f64 = z.iter().flat_map(|r| r.iter().map(|&v| v * v)).sum();
-        let got_uncentered = pflog1ppf_total_variance(&col_sum_sq, None, &baseline, n_obs, n_vars);
+        let got_uncentered = pflog_total_variance(&col_sum_sq, None, &baseline, n_obs, n_vars);
         assert!(
             (got_uncentered - ss_uncentered / denom).abs() < 1e-9,
             "uncentered {got_uncentered} != {}",
@@ -2192,7 +2194,7 @@ mod tests {
             .flat_map(|r| r.iter().enumerate().map(|(j, &v)| (v - zmu[j]).powi(2)))
             .sum();
         let got_centered =
-            pflog1ppf_total_variance(&col_sum_sq, Some(&col_mean), &baseline, n_obs, n_vars);
+            pflog_total_variance(&col_sum_sq, Some(&col_mean), &baseline, n_obs, n_vars);
         assert!(
             (got_centered - ss_centered / denom).abs() < 1e-9,
             "centered {got_centered} != {}",

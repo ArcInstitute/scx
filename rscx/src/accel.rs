@@ -14,8 +14,8 @@
 use extendr_api::prelude::*;
 
 use scx_accel::{
-    build_knn_graph, compute_umap, covariance_pca_inmemory, leiden, pflog1ppf_baseline_from_delta,
-    pflog1ppf_pca, pseudobulk_aggregate_inmemory, pseudobulk_nb_glm, randomized_pca_inmemory,
+    build_knn_graph, compute_umap, covariance_pca_inmemory, leiden, pflog_baseline_from_delta,
+    pflog_pca, pseudobulk_aggregate_inmemory, pseudobulk_nb_glm, randomized_pca_inmemory,
     score_genes, streaming_clip_square_sum, streaming_mean_var, wilcoxon_rank_sum,
     AggregationMethod, DispersionMethod, NbGlmContrast, NbGlmOptions, NbGlmResult, ScoreMethod,
     COVARIANCE_PCA_THRESHOLD,
@@ -335,9 +335,9 @@ fn scx_pflog1ppf_matrix_impl(
     let source = SingleShardSource { csr: &delta };
     let n_comp = n_components as usize;
 
-    let baseline = pflog1ppf_baseline_from_delta(&source)
+    let baseline = pflog_baseline_from_delta(&source)
         .map_err(|e| Error::Other(format!("pflog1ppf baseline: {e}")))?;
-    let result = pflog1ppf_pca(
+    let result = pflog_pca(
         &source,
         &baseline,
         n_comp,
