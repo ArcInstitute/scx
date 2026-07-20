@@ -547,6 +547,14 @@ def build_csc(
 ) -> None: ...
 
 
+def mark_deleted(path: str, cell_indices: Sequence[int]) -> int:
+    """Mark specific global cell indices as logically deleted, returning the
+    total number of deleted cells (including any previously deleted). Deletions
+    apply to the whole cell across every modality; reclaim the rows with
+    `compact`."""
+    ...
+
+
 def optimize(
     input: str, output: str, codec: str = ..., shard_obs: str = ...
 ) -> None: ...
