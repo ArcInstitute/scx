@@ -184,7 +184,19 @@ impl DeletionVectors {
         // Folding v1 per-shard (shard-local) bitmaps positionally is only
         // reliable on a single clean tiling. A multimodal v1 DV is already
         // under-populated by the old writer (per-modality shards overlap in the
-        // flattened list); flag it in debug rather than silently mis-folding.
+        // flattened list). The removed engine guard used to fail loud on any
+        // file-with-deletions modality query; for the one genuinely-unsafe case
+        // (a v1 *multimodal* DV) emit a runtime warning so a release build is not
+        // silent, plus a debug assert that trips tests.
+        if catalog.has_overlapping_csr_ranges() {
+            log::warn!(
+                "folding legacy v1 deletion vectors on a multimodal file is \
+                 unreliable: v1 multimodal deletion vectors were already \
+                 under-populated by the old (positional-shard) writer, so the \
+                 recovered deletion set may be incomplete. Re-run `scx delete` to \
+                 rewrite it as a v2 whole-cell deletion."
+            );
+        }
         debug_assert!(
             !catalog.has_overlapping_csr_ranges(),
             "folding legacy v1 deletion vectors on a multimodal file is unreliable \
@@ -239,14 +251,31 @@ impl DeletionVectors {
     /// `[start, end)` — used by shard pruning to detect a fully-deleted shard.
     pub fn deleted_in_range(&self, start: u64, end: u64) -> u64 {
         self.global_deleted().map_or(0, |bm| {
+            if end <= start {
+                return 0;
+            }
             let lo = start.min(u32::MAX as u64) as u32;
-            let hi = end.min(u32::MAX as u64 + 1) as u32;
-            bm.range(lo..hi).count() as u64
+            // Bitmap values are all <= u32::MAX. When `end` reaches or exceeds the
+            // u32 domain (2^32), count everything from `lo` through u32::MAX
+            // inclusive — casting `end` to u32 there would wrap (2^32 -> 0) and
+            // undercount a shard straddling the boundary to zero.
+            if end > u32::MAX as u64 {
+                bm.range(lo..=u32::MAX).count() as u64
+            } else {
+                bm.range(lo..end as u32).count() as u64
+            }
         })
     }
 
-    /// Insert global obs rows into the whole-cell (`DV_GLOBAL`) bitmap.
+    /// Insert global obs rows into the whole-cell (`DV_GLOBAL`) bitmap. An empty
+    /// `rows` is a no-op — it does not materialize an empty `DV_GLOBAL` entry, so
+    /// the "empty ⇒ empty" round-trip symmetry that `fold_v1_to_global` preserves
+    /// is not broken.
     pub fn insert_global<I: IntoIterator<Item = u32>>(&mut self, rows: I) {
+        let mut rows = rows.into_iter().peekable();
+        if rows.peek().is_none() {
+            return;
+        }
         let global = self.deletions.entry(DV_GLOBAL).or_default();
         for r in rows {
             global.insert(r);

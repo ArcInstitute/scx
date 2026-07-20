@@ -33,6 +33,12 @@ pub enum OpsError {
     #[error("cell index {index} out of bounds for n_obs={n_obs}")]
     CellIndexOutOfBounds { index: u64, n_obs: u64 },
 
+    #[error(
+        "cell index {index} exceeds the deletion-vector addressable maximum of \
+         {max} (deletion vectors use a u32-keyed bitmap of global obs rows)"
+    )]
+    CellIndexExceedsDeletionLimit { index: u64, max: u64 },
+
     #[error("layer '{name}' missing in input file {file_index}")]
     LayerMissing { name: String, file_index: usize },
 

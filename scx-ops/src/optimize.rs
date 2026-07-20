@@ -327,10 +327,13 @@ pub fn optimize_with_framing(
         writer.write_uns(&uns)?;
     }
 
-    // Deletion vectors are carried through unchanged (optimize does not apply
-    // them — that is `compact`'s job). The section references obs row ranges /
-    // shard ids, both preserved here, so it stays valid; `write_deletion_vectors`
-    // re-sets the header flag (cleared above) so it is set iff the section exists.
+    // Deletion vectors are carried through (optimize does not apply them — that
+    // is `compact`'s job). v2 deletion vectors store global obs row indices,
+    // independent of shard layout, and optimize preserves the obs ordering, so
+    // the section stays valid; a legacy v1 section is folded to v2 by
+    // `read_deletion_vectors`, so `write_deletion_vectors` re-emits v2 bytes.
+    // It also re-sets the header flag (cleared above) so it is set iff the
+    // section exists.
     if let Some(dv) = reader.read_deletion_vectors()? {
         writer.write_deletion_vectors(&dv)?;
     }

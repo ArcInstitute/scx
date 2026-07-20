@@ -237,10 +237,12 @@ LRU thrashing across modalities.
   Level-2 obs-predicate-index fast path is disabled for modality-scoped queries
   (its shard ids are keyed to the flattened all-modality shard order); Level-1
   catalog-stats pruning runs per modality.
-- Errors: `EngineError::UnknownModality { requested, available }`,
-  `ModalityRequired { available }`, and
-  `MultimodalDeletionVectorsUnsupported` (a modality query on a file carrying
-  deletion vectors — DV shard keys are global-flattened; `scx compact` first).
+- Errors: `EngineError::UnknownModality { requested, available }` and
+  `ModalityRequired { available }`. A modality-scoped query on a file that
+  carries deletion vectors is now fully supported — v2 deletion vectors are a
+  global-obs bitmap that applies identically to every modality, so the query
+  returns deletion-filtered rows for the queried modality (no error and no
+  `scx compact` workaround).
 - The `SectionReader` trait gains modality-aware methods
   (`read_var_for` / `read_var_schema_for` / `modality_n_vars` /
   `modality_id_by_name` / `n_modalities` / `is_multimodal` / `modality_names`),

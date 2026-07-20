@@ -31,11 +31,21 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
     // Reject any index >= n_obs before mutating the file. Without this guard
     // such indices silently fall outside the shard range search below and the
     // returned total_deleted omits them, making user mistakes look successful.
+    // Also reject indices past the u32 ceiling: v2 deletion vectors store global
+    // obs rows in a u32-keyed RoaringBitmap, so `idx as u32` below would wrap and
+    // mark the WRONG cell deleted on a (hypothetical) file with n_obs > 2^32.
+    // Fail loud instead of silently corrupting.
     for &idx in cell_indices {
         if idx >= header.n_obs {
             return Err(OpsError::CellIndexOutOfBounds {
                 index: idx,
                 n_obs: header.n_obs,
+            });
+        }
+        if idx > u32::MAX as u64 {
+            return Err(OpsError::CellIndexExceedsDeletionLimit {
+                index: idx,
+                max: u32::MAX as u64,
             });
         }
     }

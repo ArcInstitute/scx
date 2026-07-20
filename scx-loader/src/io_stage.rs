@@ -50,24 +50,22 @@ pub struct ShardData {
     pub deleted_rows: Option<RoaringBitmap>,
 }
 
-/// Reconstruct per-output-position shard-local deletion bitmaps from a
-/// global-shard-keyed deletion vector.
+/// Reconstruct per-output-position shard-local deletion bitmaps from the
+/// (v2, global-obs) deletion vector.
 ///
-/// The on-disk `DeletionVectors` is keyed by GLOBAL shard index (position in
-/// `shards_sorted()`, how `scx delete` writes it — `scx-ops/src/delete.rs`) with
-/// shard-local row bitmaps; each deleted cell is assigned to exactly one global
-/// shard, so the union over all entries is the exact set of deleted *global cell*
-/// indices. We recover that set (`global_row_starts[gid] + local`) and re-bucket
-/// it into `target_ranges` — the output shard list, which is one modality's
-/// shards on the per-modality loader path (whose positions don't match the global
-/// DV keys) and the global list otherwise.
+/// The on-disk `DeletionVectors` (v2) stores a global obs-row bitmap keyed by
+/// `modality_id` (`0` = whole-cell / all modalities). `global_deleted()` is
+/// therefore the exact set of deleted *global cell* indices directly — no
+/// per-shard remapping needed. We re-bucket that set into `target_ranges` — the
+/// output shard list, which is one modality's shards on the per-modality loader
+/// path and the global list otherwise.
 ///
-/// - `global_row_starts[i]` is the `row_start` of `shards_sorted()[i]` (`None` if
-///   the shard has no stats); DV keys pointing out of range or at a no-stats shard
-///   are skipped.
 /// - `target_ranges[p]` is the `(row_start, row_end)` of output shard position `p`
 ///   (`None` skips it). The returned map is keyed by `p`, matching the positions in
 ///   `shard_groups`, and holds shard-local (`global - row_start`) bitmaps.
+/// - `global_row_starts` is retained for signature stability with the caller but
+///   is unused under v2 (deletions are already global obs rows); it existed for
+///   the legacy v1 per-shard `global_row_starts[gid] + local` remapping.
 ///
 /// For the single-modality/global path (`target_ranges == global` ranges) this is
 /// byte-identical to bucketing the global deletion bitmap directly.
@@ -76,7 +74,7 @@ fn reconstruct_deletion_map(
     global_row_starts: &[Option<u64>],
     target_ranges: &[Option<(u64, u64)>],
 ) -> std::collections::HashMap<usize, RoaringBitmap> {
-    let _ = global_row_starts; // v2 deletions are already global obs rows.
+    let _ = global_row_starts; // unused under v2 (deletions are already global obs rows).
                                // Recover the set of deleted global cell indices.
     let mut deleted_global: Vec<u64> = match dv.global_deleted() {
         Some(bitmap) => bitmap.iter().map(|r| r as u64).collect(),

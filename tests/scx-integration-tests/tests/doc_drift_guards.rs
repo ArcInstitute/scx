@@ -91,6 +91,12 @@ fn deletion_vector_version_pinned() {
         "docs/format.md §7.3 deletion-vector version drifted from the code \
          (expected the wire-format block to cite '`DV_VERSION = 2`')"
     );
+    let agents = std::fs::read_to_string(root.join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("global-obs-row bitmap by `modality_id`"),
+        "AGENTS.md no longer describes the v2 modality-keyed deletion-vector model \
+         (expected 'global-obs-row bitmap by `modality_id`')"
+    );
 }
 
 /// The workspace member set must match the documented crate graph (15 code
