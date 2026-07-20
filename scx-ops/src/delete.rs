@@ -60,7 +60,12 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
             lock.seek(SeekFrom::Start(dv_entry.offset))?;
             let mut buf = vec![0u8; dv_entry.length as usize];
             std::io::Read::read_exact(&mut lock, &mut buf)?;
-            DeletionVectors::read_from(&mut Cursor::new(&buf), buf.len())?
+            let mut existing = DeletionVectors::read_from(&mut Cursor::new(&buf), buf.len())?;
+            // Writers always emit v2, so fold a legacy v1 (per-shard) section to
+            // the v2 global representation before merging/serializing — otherwise
+            // its pre-existing deletions would be dropped by the v2 `write_to`.
+            existing.fold_v1_to_global(&catalog);
+            existing
         } else {
             DeletionVectors::new()
         }
