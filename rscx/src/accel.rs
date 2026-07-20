@@ -385,7 +385,8 @@ fn scx_pflog_matrix_impl(
         n_components = {{n_comp_i}},
         baseline = {{baseline}},
         alpha = {{alpha}},
-        pseudocount = {{pseudocount}}
+        pseudocount = {{pseudocount}},
+        version = \"v4\"
     )")
     .map_err(|e| Error::Other(e.to_string()))
 }

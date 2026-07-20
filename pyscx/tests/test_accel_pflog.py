@@ -112,6 +112,7 @@ class TestAlphaEstimation:
         meta = ad.uns["pflog"]
         ref_alpha, ref_k = reference_alpha(X)
         assert ref_k > 0  # fixture is overdispersed → real estimate, not fallback
+        assert meta["version"] == "v4"
         assert meta["alpha_source"] == "estimated"
         assert int(meta["n_genes_used"]) == ref_k
         assert not bool(meta["fell_back"])
@@ -124,6 +125,7 @@ class TestAlphaEstimation:
         ad, _ = small_adata()
         pyscx.accel.pflog(ad, alpha=ALPHA, store="baseline")
         meta = ad.uns["pflog"]
+        assert meta["version"] == "v4"
         assert meta["alpha_source"] == "pinned"
         np.testing.assert_allclose(float(meta["alpha"]), ALPHA)
         np.testing.assert_allclose(float(meta["pseudocount"]), 1.0 / (4.0 * ALPHA))

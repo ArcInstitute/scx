@@ -197,6 +197,12 @@ pub fn pflog_baseline_from_delta<S: ShardSource>(delta_source: &S) -> Result<Vec
         let csr = delta_source.read_shard(shard_idx)?;
         ensure_finite(&csr.data)?;
         let rows = csr.n_rows();
+        if row_base + rows > n_obs {
+            return Err(AccelError::ShapeError(format!(
+                "PFlog: shard {shard_idx} has {rows} rows, exceeding n_obs={n_obs} \
+                 at row_base={row_base}"
+            )));
+        }
         for (r, s) in csr.row_sums().into_iter().enumerate() {
             baseline[row_base + r] = -s * inv_d;
         }
@@ -216,8 +222,8 @@ pub fn pflog_baseline_from_delta<S: ShardSource>(delta_source: &S) -> Result<Vec
 //
 // v4 PFlog shifts raw counts by the matrix-wide Anscombe pseudocount `1/(4α)`,
 // where `α` is the negative-binomial overdispersion of the matrix
-// (`Var = μ + α·μ²`). This section estimates that single scalar; wiring it into
-// the transform/delta/PCA path is a later phase. Nothing calls it yet.
+// (`Var = μ + α·μ²`). This section estimates that single scalar; it is wired into
+// the pyscx binding, the scx-loader training path, and rscx.
 
 /// Tuning knobs for the matrix-wide NB overdispersion (`α`) estimate.
 #[derive(Debug, Clone)]

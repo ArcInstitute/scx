@@ -40,7 +40,8 @@ test_that("scx_pflog returns embeddings + a per-cell baseline matching the refer
   expect_type(res, "list")
   expect_named(res, c("embeddings", "loadings", "variance_explained",
                       "variance_ratio", "n_components", "baseline",
-                      "alpha", "pseudocount"))
+                      "alpha", "pseudocount", "version"))
+  expect_equal(res$version, "v4")
   expect_equal(nrow(res$embeddings), ncol(counts)) # cells
   expect_equal(ncol(res$embeddings), 10L)
   expect_equal(nrow(res$loadings), nrow(counts))   # genes

@@ -199,6 +199,10 @@ impl IndexPlanLoader {
         let reader = ScxReader::open(path.as_ref())?;
         let n_obs = reader.n_obs();
         let n_vars = reader.n_vars();
+        // Captured before `reader` is consumed by `BackedCsrReader::new` below;
+        // gates the pflog α auto-estimate (a whole-file source would pool
+        // modalities on a multimodal file).
+        let n_modalities = reader.n_modalities();
 
         // Borrow obs / sizes off ScxReader before BackedCsrReader::new takes ownership.
         let obs_metadata = reader.read_obs()?;
@@ -397,11 +401,12 @@ impl IndexPlanLoader {
                 }
                 Some(_) => {}
                 None => {
-                    if config.modality_id.is_some() {
+                    if config.modality_id.is_some() || n_modalities > 1 {
                         return Err(LoaderError::ConfigError {
-                            reason: "pflog_alpha must be set explicitly for a modality-scoped \
-                                     loader; estimate it once via pyscx.accel.pflog and pass \
-                                     pflog_alpha"
+                            reason: "pflog_alpha must be set explicitly for a multimodal or \
+                                     modality-scoped loader (auto-estimation would pool \
+                                     modalities); estimate it once via pyscx.accel.pflog and \
+                                     pass pflog_alpha"
                                 .to_string(),
                         });
                     }

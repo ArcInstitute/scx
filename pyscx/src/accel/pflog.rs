@@ -335,6 +335,10 @@ fn resolve_alpha<S: ShardSource>(alpha: Option<f64>, raw: &S) -> PyResult<AlphaM
 /// Stamp the fit into `adata.uns["pflog"]`.
 fn stamp_uns_pflog(py: Python<'_>, adata: &Bound<'_, PyAny>, meta: &AlphaMeta) -> PyResult<()> {
     let d = PyDict::new(py);
+    // Formula version so a `delta_baseline` file (format-unchanged from v2) is
+    // self-describing — v2-formula and v4-formula deltas are otherwise
+    // indistinguishable on disk.
+    d.set_item("version", "v4")?;
     d.set_item("alpha", meta.alpha)?;
     d.set_item("pseudocount", meta.pseudocount)?;
     d.set_item("alpha_source", meta.alpha_source)?;
@@ -656,6 +660,7 @@ fn stream_pflog_to_scx<S: ShardSource>(
 
     // Provenance.
     let params_json = serde_json::json!({
+        "version": "v4",
         "alpha": disk.alpha,
         "pseudocount": disk.pseudocount,
         "repr": disk.store_repr,

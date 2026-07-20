@@ -123,7 +123,9 @@ scx_pflog <- function(object, assay = NULL, layer = "counts",
   )
   object[[reduction.name]] <- red
   object$pflog_baseline <- res$baseline
-  object@misc$pflog <- list(alpha = res$alpha, pseudocount = res$pseudocount)
+  object@misc$pflog <- list(
+    alpha = res$alpha, pseudocount = res$pseudocount, version = res$version
+  )
   invisible(object)
 }
 

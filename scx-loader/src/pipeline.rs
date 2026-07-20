@@ -601,13 +601,16 @@ impl TrainingPipeline {
         };
 
         // v4 PFlog: resolve α once. `None` ⇒ estimate over the raw CSR shards
-        // (single-modality only — modality-scoped estimation isn't wired, so a
-        // modality-scoped loader must pin `pflog_alpha`). After this,
-        // `config.pflog_alpha` is `Some` whenever `config.pflog`.
+        // (single-modality only — modality-scoped estimation isn't wired, and a
+        // whole-file `BackedCsrReader` on a multimodal file would pool every
+        // modality's counts into one α, so a multimodal or modality-scoped
+        // loader must pin `pflog_alpha`). After this, `config.pflog_alpha` is
+        // `Some` whenever `config.pflog`.
         if config.pflog && config.pflog_alpha.is_none() {
-            if config.modality_id.is_some() {
+            if config.modality_id.is_some() || reader.n_modalities() > 1 {
                 return Err(LoaderError::ConfigError {
-                    reason: "pflog_alpha must be set explicitly for a modality-scoped loader; \
+                    reason: "pflog_alpha must be set explicitly for a multimodal or \
+                             modality-scoped loader (auto-estimation would pool modalities); \
                              estimate it once via pyscx.accel.pflog and pass pflog_alpha"
                         .to_string(),
                 });

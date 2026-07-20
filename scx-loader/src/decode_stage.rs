@@ -697,6 +697,14 @@ pub fn decode_stage(
         RowShuffler::shuffle_rows(&mut cell_indices, &mut rng);
 
         // Step 4: Draw mini-batches
+        // Invariant: when pflog is on, α is resolved to Some at construction
+        // (TrainingPipeline::new). Fail loud in debug if that ever breaks —
+        // otherwise the 0.0 placeholder below would silently emit an all-zero
+        // batch (log1p(0)=0) instead of the transform.
+        debug_assert!(
+            !config.pflog || config.pflog_alpha.is_some(),
+            "pflog_alpha must be resolved to Some before decode when pflog is enabled"
+        );
         let mut group_batches = 0;
         for batch_cells in cell_indices.chunks(config.batch_size) {
             let n_rows = batch_cells.len();

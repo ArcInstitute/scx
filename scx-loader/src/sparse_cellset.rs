@@ -370,6 +370,26 @@ pub fn collate_gathered(
     n_measured: &[u32],
     scalars: &CollateScalars,
 ) -> Result<CollatedCellSetBatch> {
+    // Fail loud (not `expect`-panic in the per-cell kernel) for a direct Rust
+    // caller that selects the v4 PFlog mode without a pinned α — there is no
+    // dataset here to estimate from.
+    if scalars.mode == PreprocessMode::PflogRaw {
+        match scalars.pflog_alpha {
+            None => {
+                return Err(LoaderError::ConfigError {
+                    reason: "PflogRaw collate mode requires pflog_alpha (no dataset to estimate \
+                             from here)"
+                        .to_string(),
+                });
+            }
+            Some(a) if a <= 0.0 || a.is_nan() || a.is_infinite() => {
+                return Err(LoaderError::ConfigError {
+                    reason: format!("pflog_alpha must be positive and finite, got {a}"),
+                });
+            }
+            _ => {}
+        }
+    }
     let n_rows = cell_indices.len();
     let k_enc = scalars.k_enc;
     let n_sets = set_offsets.len().saturating_sub(1);

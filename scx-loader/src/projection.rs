@@ -256,6 +256,9 @@ pub fn pflog_row_full(
     n_vars: usize,
     output_row: &mut [f32],
 ) -> Result<(), crate::error::LoaderError> {
+    // No-projection contract: the dense output row spans the full transcriptome,
+    // so its width is the centering denominator `n_vars`.
+    debug_assert_eq!(output_row.len(), n_vars);
     let Some(baseline) = crate::normalize::pflog_baseline_row(csr_data, four_alpha, n_vars) else {
         for v in output_row.iter_mut() {
             *v = 0.0;

@@ -78,10 +78,15 @@ rscx (R bindings via extendr, depends on scx-format-io, scx-codec, scx-sparse, s
 | **rscx** | R bindings via extendr | Seurat v5 + SingleCellExperiment interop, pipe-friendly query API |
 
 > [!NOTE]
-> `scx-loader` does **not** depend on `scx-engine` — it has its own streaming-optimized
-> gene projection and fused normalization, designed for the hot-path requirements
-> of ML training. `scx-cloud` does **not** depend on `scx-loader` — they are siblings.
-> `scx-cloud` reuses `scx-engine` for predicate parsing (selective pull).
+> `scx-loader` has its own streaming-optimized gene projection and fused
+> normalization for the hot-path requirements of ML training. It depends on
+> `scx-accel` for one thing — the v4 PFlog α estimator (`estimate_alpha`) used
+> when a `pflog=True` loader is constructed with `pflog_alpha=None` — and so
+> **transitively** pulls in `scx-accel`'s dependencies (`scx-engine`, `faer`,
+> HNSW, …). This edge is cycle-free (`scx-accel` depends only on
+> `scx-format-io` + `scx-sparse`). `scx-cloud` does **not** depend on
+> `scx-loader` — they are siblings; `scx-cloud` reuses `scx-engine` for
+> predicate parsing (selective pull).
 > `scx-mtx` is **always-on** (no feature gate) since MTX is pure text I/O with no
 > HDF5 dependency. Both `scx-cli` and `pyscx` depend on it.
 > `scx-accel` depends on `scx-format-io`, `scx-sparse`, and `scx-engine` (for
