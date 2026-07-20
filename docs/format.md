@@ -770,18 +770,37 @@ only).
 ### 7.3 Deletion vectors (logical delete)
 
 Filters that want to mark cells as deleted without rewriting shards append a
-deletion vectors section + a new catalog:
+deletion vectors section + a new catalog. The section is keyed by
+`modality_id` and stores **global obs row indices** (`DV_VERSION = 2`):
 
 ```
 DELETION VECTORS SECTION:
-  dv_version: u8                 (1)
-  n_shards_with_deletions: u32
-  For each shard with deletions:
-    shard_id: u32                (index into the catalog's CSR shard list)
-    deletion_bitmap_length: u32
-    deletion_bitmap: [u8]        (Roaring Bitmap of deleted row indices,
-                                   local to the shard)
+  dv_version: u8                 (2)
+  n_entries:  u32                (number of (modality_id, bitmap) groups)
+  For each entry:
+    modality_id: u8              (0 = global / all modalities; ≥1 = scoped
+                                   to that modality — reserved, see below)
+    reserved:    [u8; 3]         (zeroed; alignment + future flags)
+    bitmap_length: u32
+    bitmap:      [u8]            (Roaring Bitmap of GLOBAL obs row indices)
 ```
+
+Because every modality independently tiles the shared global obs axis
+`[0, n_obs)`, a global bitmap (`modality_id = 0`) applies identically to any
+modality's shards — the read keep-mask is
+`keep[r] = !(global(0).contains(r) || scoped(m).contains(r))`. Shipped writers
+only ever populate `modality_id = 0` (whole-cell delete); `modality_id ≥ 1`
+scopes a deletion to a single modality and is reserved wire-format headroom for
+a future "drop one modality's measurement" capability (not emitted today).
+`total_deleted()` — the logical `n_obs = physical − deleted` — counts only the
+global bitmap.
+
+**v1 back-compat.** `DV_VERSION 1` (per-shard bitmaps of shard-local row indices,
+keyed by positional CSR-shard id) is still read: the reader parses the v1 shards
+and immediately folds them to a global bitmap
+(`global_row = csr_shards_sorted()[shard_id].row_start + local_row`) stored under
+`modality_id = 0`. For single-modality files — the only ones with trustworthy v1
+deletion vectors — this is exact. Writers always emit v2.
 
 When `has_deletion_vectors` is set, readers apply the bitmap during shard
 decode — deleted rows are skipped. `scx rollback` undoes a logical delete
@@ -1061,6 +1080,13 @@ The `modality_id` of an entry is its 1-based position in this table.
 `obs_index`, `provenance`, `obs_predicate_index`, `deletion_vectors`,
 the `modality_table` section itself, and any v1 catalog entry parsed
 by the v2 reader).
+
+Deletion vectors are global by default: `mark_deleted` writes a whole-cell
+delete under `modality_id = 0` in the DV section (§7.3), and because every
+modality tiles `[0, n_obs)` that bitmap is applied to **every** modality's
+shards on read and compact. The DV wire format reserves per-modality
+(`modality_id ≥ 1`) scoping for a future "delete one modality's measurement"
+capability; no writer emits it today.
 
 ### 13.3 Catalog routing
 
