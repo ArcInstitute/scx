@@ -846,7 +846,7 @@ codebase by **Nick Youngblut**:
 | **F11** | **CSC sidecar** | Optional column-major storage for 13–24× faster GPU DE and gene-axis streaming without full transpose. |
 | **F12** | **Multi-layer / sharded metadata** | Layers, obsm, varm, obsp, varp stored as sharded sections for full AnnData round-trip. |
 | **F13** | **Cloud-native reads** | `open_cloud()`, HTTP range reads per shard, `scx pull --filter` for selective download; S3, GCS, and Azure support. |
-| **F14** | **PFlog1pPF / shifted-CLR normalization** | Booeshaghi et al. 2026 method: sparse delta + per-cell baseline decomposition → out-of-core baseline-aware PCA, streaming materialize-to-SCX in compact `delta_baseline` / `dense` representations; integrated across accel, format, loader, and rscx. |
+| **F14** | **PFlog (v4) / shifted-log normalization** | Booeshaghi et al. method (raw counts, matrix-wide Anscombe pseudocount `1/(4α)`, α estimated once): sparse delta + per-cell baseline decomposition → out-of-core baseline-aware PCA, streaming materialize-to-SCX in compact `delta_baseline` / `dense` representations; integrated across accel, format, loader, and rscx. |
 | **F15** | **Multimodal** | CITE-seq, 10x Multiome, TEA-seq support in a single v2 file with per-modality codec routing and h5mu streaming. |
 | **F16** | **Perturbation evaluation metrics (cell-eval / arc-bench parity)** | Rust-accelerated pseudobulk means, bulk metrics (pearson_delta / mse / mae), discrimination score, energy distance, knockdown efficiency, and clustering agreement — 5–52× speedups, 32/32 numerical parity. |
 | **F17** | **Fuzzing & property-based testing** | 13 libfuzzer targets + 7 proptest suites; CI fuzz build check on every PR. |

@@ -1368,7 +1368,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`                                         | `prefer_format`                                |
 | `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
 | `score_genes`            | ✓   | —   | `gene_list`, `ctrl_size`, `gene_pool`, `n_bins`, `score_name`, `random_state` | `method`, `layer`, `device`           |
-| `pflog1ppf`              | ✓   | —   | — (no scanpy equivalent)                                             | `c`, `store`, `n_components`, `store_repr`, `out`, `shard_size`, `layer`, `device` |
+| `pflog`                 | ✓   | —   | — (no scanpy equivalent)                                             | `alpha`, `store`, `n_components`, `store_repr`, `out`, `shard_size`, `layer`, `device` |
 | `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `qr_method`, `prefer_format`, `allow_tf32`, `n_oversamples`, `n_power_iterations`, `spmm_policy`, `memory_budget` |
 | `neighbors`              | ✓   | ✓   | `n_neighbors`, `use_rep`, `random_state`                              | `device`, `ef_construction`, `ef_search`       |
 | `pca_neighbors`          | ✓   | ✓   | (PCA + neighbors kwargs, see below)                                   | `device`, `method`, `qr_method`, `prefer_format` |
@@ -2048,35 +2048,41 @@ pyscx.accel.score_genes(adata, marker_genes, method="zscore", score_name="sig_z"
 > a `UserWarning`. Use `layer=` to score a named layer instead of `X`. CPU-only —
 > `device` is accepted for API symmetry but there is no GPU kernel.
 
-### PFlog1pPF normalization (`pyscx.accel.pflog1ppf`)
+### PFlog normalization (`pyscx.accel.pflog`)
 
-PFlog1pPF (a.k.a. the **shifted centered-log-ratio** transform, Booeshaghi et
-al. 2026) is a depth-normalizing, variance-stabilizing transform with **no
-direct scanpy function**. Per cell, counts become within-cell proportions,
-are shifted by a pseudocount `c` (default `1`), log-transformed, and then
-centered by subtracting the within-cell mean:
+PFlog (v4, the **shifted-log** transform on raw counts, Booeshaghi et al.,
+DOI 10.1101/2022.05.06.490859) is a variance-stabilizing transform with **no
+direct scanpy function**. Counts are shifted by a single **matrix-wide** Anscombe
+pseudocount `1/(4α)`, log-transformed, and centered by subtracting the within-cell
+mean:
 
 ```
-z_ij = log(x_ij / s_i + c) − (1/D) Σ_k log(x_ik / s_i + c)
+z_ij = log(x_ij + 1/(4α)) − (1/D) Σ_k log(x_ik + 1/(4α))
 ```
+
+`α` is the negative-binomial overdispersion of the matrix (`Var = μ + α·μ²`),
+estimated once from the counts (`alpha=None`, the default) or pinned
+(`alpha=<float>`, e.g. a reference `α` reused across datasets). Unlike v2 there is
+**no per-cell depth** — it cancels under the Anscombe scale.
 
 The exact output is **dense** (zeros map to a per-cell baseline), so a naïve
 materialization is `O(N·D)`. The accelerator avoids that by exploiting the
-decomposition `Z = delta + baseline·1ᵀ`, where `delta` is exactly the lazy
-`normalize_total(target_sum=1/c) → log1p` chain (sparse, same pattern as `X`)
-and `baseline_i = −(1/D) Σ_j delta_ij` is one float per cell. So the out-of-core
-PCA never densifies, and a compact on-disk form stores only `delta` + `baseline`.
+decomposition `Z = delta + baseline·1ᵀ`, where `delta = log1p(4α·x)` is exactly the
+lazy `scale(4α) → log1p` chain (sparse, same pattern as `X`) and
+`baseline_i = −(1/D) Σ_j delta_ij` is one float per cell. So the out-of-core PCA
+never densifies, and a compact on-disk form stores only `delta` + `baseline`.
 
 Operates on **raw counts** — run it on the raw-count `X`, not a normalized
 layer. Streams shard-by-shard, so it runs identically on in-memory, backed, and
 lazy `X` (a lazy `X` that already carries transforms is rejected).
 
 > **Default is a PCA embedding, not an in-place `X` transform.** Unlike
-> `normalize_total` / `log1p` (which overwrite `adata.X`), `pflog1ppf` defaults
+> `normalize_total` / `log1p` (which overwrite `adata.X`), `pflog` defaults
 > to `store="pca"`: it writes a baseline-aware PCA embedding to
 > `adata.obsm[obsm_key]` (plus the per-cell baseline to `adata.obs[baseline_key]`)
 > and **leaves `X` as raw counts**. To get the normalized matrix itself, pass
 > `store="dense"` (with `out=<path.scx>` for data too large to densify in memory).
+> The fit is recorded in `adata.uns["pflog"]` (`alpha`, `pseudocount`, …).
 
 | `store`            | writes                                                          | transforms `X`? |
 | ------------------ | --------------------------------------------------------------- | --------------- |
@@ -2090,22 +2096,23 @@ import pyscx
 
 adata = pyscx.open("pbmc.scx").to_anndata(backed=True)
 
-# Headline path: out-of-core baseline-aware PCA embedding.
-pyscx.accel.pflog1ppf(adata, c=1.0, store="pca", n_components=50)
-adata.obsm["X_pflog1ppf_pca"]      # cells × n_components
-adata.obs["pflog1ppf_baseline"]    # per-cell baseline (always written)
+# Headline path: out-of-core baseline-aware PCA embedding (α estimated once).
+pyscx.accel.pflog(adata, store="pca", n_components=50)
+adata.obsm["X_pflog_pca"]      # cells × n_components
+adata.obs["pflog_baseline"]    # per-cell baseline (always written)
+adata.uns["pflog"]             # {"alpha", "pseudocount", "alpha_source", ...}
 
 # Precompute-once / train-many: stream the transform to a compact SCX file
 # (sparse `delta` + `baseline` obs column), then reconstruct exact dense rows.
-pyscx.accel.pflog1ppf(adata, store="dense", out="pbmc_pflog1ppf.scx")  # store_repr="delta_baseline"
-re = pyscx.open("pbmc_pflog1ppf.scx").to_anndata()
-Z = pyscx.accel.pflog1ppf_reconstruct(re)   # exact dense Z = delta + baseline[:, None]
+pyscx.accel.pflog(adata, store="dense", out="pbmc_pflog.scx")  # store_repr="delta_baseline"
+re = pyscx.open("pbmc_pflog.scx").to_anndata()
+Z = pyscx.accel.pflog_reconstruct(re)   # exact dense Z = delta + baseline[:, None]
 ```
 
 > **Representations & codecs.** `store_repr="delta_baseline"` (default) is the
 > compact `O(M)` form — the `delta` layer is written as a sparse CSR with
 > **Pcodec** float values (the natural codec for log-ratios) and `baseline`
-> rides in `obs`; reconstruct with `pyscx.accel.pflog1ppf_reconstruct` (or feed
+> rides in `obs`; reconstruct with `pyscx.accel.pflog_reconstruct` (or feed
 > the file to `TrainingDataset` with its transform mode off). `store_repr="dense"`
 > writes the literal full-density `Z` as a CSR with **forced Zstd** values and a
 > small default `shard_size` (peak RAM per shard ≈ `2·shard_rows·n_vars·4 B`),

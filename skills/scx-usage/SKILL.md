@@ -324,7 +324,7 @@ only when the filtered result fits in RAM, else switch to
   preserved, duplicates collapsed** (unlike NumPy fancy indexing).
 
 The `pyscx.accel.*` catalog (PCA/neighbors/UMAP/leiden, DE & perturbation
-metrics, HVG/QC, PFlog1pPF & shifted-CLR normalization, gene-set scoring
+metrics, HVG/QC, PFlog (v4) shifted-log normalization, gene-set scoring
 (`score_genes`), pseudobulk NB GLM (`nb_glm`/`pdex_nb_glm`), harmony, LISI,
 streaming column stats, fused GPU pipelines (`pca_neighbors`,
 `pca_neighbors_umap`)), the `device=` and `prefer_format=` dispatch, and the
@@ -408,7 +408,7 @@ splitting, grouped sharding details, and Lightning examples are in
 - `pyscx.to_h5ad` / `from_h5ad` are **free functions**; `to_anndata` / `query` are Experiment methods.
 - Backed mode: `pyscx.accel.normalize_total/log1p`, **not** `sc.pp.*` (which materialize).
 - `qc_vars=["mt"]` + tag `var["mt"]` yourself; HVG seurat_v3 on raw counts; `leiden(device="cpu")` for stable labels.
-- Training loaders: `num_workers=0`; HVG indices as `np.uint32`; `close()` when done. `pflog1ppf=True` for PFlog1pPF normalization (replaces `normalize`/`log1p`).
+- Training loaders: `num_workers=0`; HVG indices as `np.uint32`; `close()` when done. `pflog=True` for PFlog (v4) normalization (replaces `normalize`/`log1p`; `pflog_alpha=None` estimates α once, or pin a float).
 - GPU ops fall back to CPU silently — check `pyscx.accel.gpu_info()` / `nvidia-smi` / `adata.uns["scx_accel"]` route. PCA/kNN/UMAP/preprocess route to rapids-singlecell when installed; `SCX_DISABLE_RAPIDS=1` forces CPU fallback for testing. Build pyscx `--features gpu` once, then **run from the conda env that has rapids** (a plain `.venv` usually doesn't).
 - GPU-fast CSC-direct DE (`gpu_csc_v3`): call `rank_genes_groups`/`pdex_ref` with the **default `prefer_format="csr"`** + `device="gpu"` (or `"auto"`) on a file with a `csc=` sidecar — the planner picks it automatically. `prefer_format="csc"` is the **CPU** path; `prefer_format="csc"` + `device="gpu"` raises.
 - CLI predicate: `scx query <file> <filter>` accepts the filter positionally **or** via `--filter EXPR` (matching `scx subset`/`delete`; one form, not both); cloud subcommands (`scx pull`/`push`/…) only exist in a `--features cloud` build.

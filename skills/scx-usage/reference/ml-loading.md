@@ -47,19 +47,21 @@ ds.close()
 | `seed` | `42` | Deterministic shuffle via `(seed, epoch)`. |
 | `max_memory_mb` | adaptive (≥512) | Omit → adaptive budget scales to fit a full-width file (floor 512 MB, cap 4096 MB), so the requested `batch_size` survives. Pass a value → hard ceiling that auto-tunes `shard_group_size`/`prefetch_batches`/`batch_size` down. |
 | `modality` | `None` | For multimodal v2 files; ignored on single-modality. |
-| `pflog1ppf` | `False` | Apply PFlog1pPF normalization (Booeshaghi et al. 2026) instead of normalize+log1p. Mutually exclusive with `normalize`/`log1p` (those are ignored when `pflog1ppf=True`). |
-| `pflog1ppf_c` | `1.0` | PFlog1pPF shift / pseudocount `c`. Only used when `pflog1ppf=True`. |
+| `pflog` | `False` | Apply PFlog (v4) shifted-log normalization on raw counts (Booeshaghi et al.) instead of normalize+log1p. Mutually exclusive with `normalize`/`log1p` (those are ignored when `pflog=True`). |
+| `pflog_alpha` | `None` | PFlog NB overdispersion `α` (matrix-wide pseudocount `1/(4α)`). `None` estimates `α` once at construction from the raw counts (single-modality only); a float pins it. Only used when `pflog=True`. |
 
 **Properties:** `n_obs`, `n_vars`, `n_output_genes` (HVG count if projected else
 `n_vars`), `effective_batch_size`.
 **Methods:** `close()` (idempotent; recommended before process exit),
 `memory_budget()` (diagnostics dict).
 
-**PFlog1pPF normalization:** Pass `pflog1ppf=True` (optionally with `pflog1ppf_c`)
-to apply PFlog1pPF (shifted-CLR) normalization in the Rust pipeline instead of
-the default `normalize_total → log1p`. When enabled, `normalize` and `log1p`
-are ignored. Available on `TrainingDataset`, `IndexPlanDataset`, and
-`MultimodalTrainingDataset`.
+**PFlog normalization:** Pass `pflog=True` (optionally with `pflog_alpha`) to
+apply PFlog (v4, shifted-log on raw counts) normalization in the Rust pipeline
+instead of the default `normalize_total → log1p`. `pflog_alpha=None` estimates the
+NB overdispersion `α` once at loader construction (single-modality only; a
+modality-scoped loader must pin `pflog_alpha`); a float pins a reference `α`.
+When enabled, `normalize` and `log1p` are ignored. Available on
+`TrainingDataset`, `IndexPlanDataset`, and `MultimodalTrainingDataset`.
 
 **Batch dict schema:**
 ```python
@@ -92,8 +94,8 @@ for batch in ds.iter_with_plans(iter(plans), lookahead=4):
 ```
 
 **Constructor kwargs:** `path`, `hvg_indices=None`, `obs_columns=[]`,
-`normalize=True`, `log1p=True`, `target_sum=1e4`, `pflog1ppf=False`,
-`pflog1ppf_c=1.0`, `cache_shards=128` (LRU; auto-tuned to fit `max_memory_mb`;
+`normalize=True`, `log1p=True`, `target_sum=1e4`, `pflog=False`,
+`pflog_alpha=None`, `cache_shards=128` (LRU; auto-tuned to fit `max_memory_mb`;
 check `effective_cache_shards()`), `sort_by_shard=True` (reorder each plan by
 shard locality; disable to preserve caller order), `lookahead=4` (in-flight
 plans / shard prefetch; `0` disables; check `effective_lookahead()`),
