@@ -61,6 +61,22 @@ pub fn run_build_csc(
         return Err("Input file has no CSR shards".into());
     }
 
+    // SCX-005: build-csc re-emits CSR shards without re-canonicalizing them, so
+    // it must not *raise* the format version's canonicality claim above what
+    // the input already guarantees. Framing (v4) structurally requires the v3
+    // canonical-CSR invariant; refuse to frame a pre-v3 input rather than stamp
+    // a v4 file whose shards may be unsorted/duplicated. Run `scx optimize`
+    // first (which canonicalizes) for such inputs.
+    let in_version = in_header.format_version;
+    if framing.is_some() && in_version < scx_format_io::header::DEFAULT_WRITE_FORMAT_VERSION {
+        return Err(format!(
+            "build-csc cannot row-group-frame a format v{in_version} input (framing implies the \
+             v3 canonical-CSR invariant, which build-csc does not re-establish); run \
+             `scx optimize` first to canonicalize, then build-csc"
+        )
+        .into());
+    }
+
     let n_rows = in_header.n_obs as usize;
     let n_cols = in_header.n_vars as usize;
 
@@ -77,15 +93,44 @@ pub fn run_build_csc(
     ));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    // 6. Read CSR shard entries and determine default codec from first shard
+    // 6. Read CSR shard entries and pick a CSC value encoding wide enough to
+    //    cover EVERY shard. The CSC sidecar transposes all shards into shared
+    //    columns, so a first-shard-only encoding can truncate later shards
+    //    (SCX-004): a `Uint8` first shard followed by a `Float32` shard would
+    //    otherwise encode `1.5` as integer `1`. Scan every header for the
+    //    float/integer kind; if any is float the CSC must be Float32 (+ a
+    //    float-safe codec), else use the widest integer width across shards.
     let csr_entries = reader.catalog().csr_shards_sorted();
     let first_sh = reader.read_shard_header(csr_entries[0])?;
-    let csc_value_encoding = ValueEncoding::from_u8(first_sh.value_encoding).ok_or(format!(
-        "unknown value encoding: {}",
-        first_sh.value_encoding
-    ))?;
-    let csc_codec = CodecId::from_u8(first_sh.codec_id)
-        .ok_or(format!("unknown codec: {}", first_sh.codec_id))?;
+    let mut any_float = false;
+    let mut max_int_val: u32 = 0;
+    for entry in &csr_entries {
+        let sh = reader.read_shard_header(entry)?;
+        let enc = ValueEncoding::from_u8(sh.value_encoding)
+            .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
+        if matches!(enc, ValueEncoding::Float32 | ValueEncoding::Float16) {
+            any_float = true;
+        }
+        if let Some(stats) = entry.stats.as_ref() {
+            max_int_val = max_int_val.max(stats.value_max);
+        }
+    }
+    let (csc_value_encoding, csc_codec) = if any_float {
+        // Pcodec is the canonical float codec; the first shard's codec may be
+        // an integer-only codec (Scx1) that cannot represent float values.
+        (ValueEncoding::Float32, CodecId::Pcodec)
+    } else {
+        let enc = if max_int_val <= u8::MAX as u32 {
+            ValueEncoding::Uint8
+        } else if max_int_val <= u16::MAX as u32 {
+            ValueEncoding::Uint16
+        } else {
+            ValueEncoding::Uint32
+        };
+        let codec = CodecId::from_u8(first_sh.codec_id)
+            .ok_or(format!("unknown codec: {}", first_sh.codec_id))?;
+        (enc, codec)
+    };
 
     // 7. Read CSR shards individually (preserves shard boundaries for streaming transpose)
     let csr_shards: Vec<scx_sparse::ScxCsr> = csr_entries
@@ -112,12 +157,14 @@ pub fn run_build_csc(
         codec_id: in_header.codec_id,
         index_dtype: in_header.index_dtype,
         manifest_sequence: in_header.manifest_sequence + 1,
-        // Row-group framing produces a v4 file (its shards are v2); otherwise the
-        // default (v3) unframed layout.
+        // Row-group framing produces a v4 file (guarded above so the input is
+        // already ≥ v3 canonical). Otherwise clamp the unframed version to what
+        // the input guarantees — build-csc does not canonicalize, so it must
+        // not claim v3 for a pre-v3 input (SCX-005).
         format_version: if framing.is_some() {
             scx_format_io::header::CURRENT_FORMAT_VERSION
         } else {
-            FileHeader::default().format_version
+            scx_format_io::header::rewrite_output_format_version(&[in_version], 1)
         },
         ..Default::default()
     };

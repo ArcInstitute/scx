@@ -543,7 +543,7 @@ pub fn from_anndata_impl(
         trial: codec_trial,
         decode_target,
     });
-    let shard_target_rows = shard_size.unwrap_or(16384);
+    let shard_target_rows = crate::resolve_shard_size(shard_size, 16384)?;
     let csc_policy =
         scx_format_io::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let uns_format_parsed = parse_uns_format(uns_format)?;

@@ -219,34 +219,39 @@ pub fn write_scx_to_h5ad_streaming(
 
     // obsm. Obs-axis embeddings must be filtered by the same keep
     // mask as /X and obs so anndata sees consistent row counts.
-    if let Ok(obsm_map) = reader.read_all_obsm() {
-        if !obsm_map.is_empty() {
-            let obsm_group = root.create_group("obsm")?;
-            for (name, batch) in &obsm_map {
-                let filtered = match keep_mask.as_deref() {
-                    Some(mask) => filter_record_batch_by_mask(batch, mask)?,
-                    None => batch.clone(),
-                };
-                write_obsm_entry_at(&obsm_group, name, &filtered)?;
-            }
+    // Readers return Ok(empty) on absence, so an error is corruption and
+    // must abort rather than silently omit the section (SCX-009).
+    let obsm_map = reader.read_all_obsm()?;
+    if !obsm_map.is_empty() {
+        let obsm_group = root.create_group("obsm")?;
+        for (name, batch) in &obsm_map {
+            let filtered = match keep_mask.as_deref() {
+                Some(mask) => filter_record_batch_by_mask(batch, mask)?,
+                None => batch.clone(),
+            };
+            write_obsm_entry_at(&obsm_group, name, &filtered)?;
         }
     }
 
     // varm. Var-axis features are not affected by deletion vectors
     // (DVs are obs-only), so no filtering here.
-    if let Ok(varm_map) = reader.read_all_varm() {
-        if !varm_map.is_empty() {
-            let varm_group = root.create_group("varm")?;
-            for (name, batch) in &varm_map {
-                write_obsm_entry_at(&varm_group, name, batch)?;
-            }
+    let varm_map = reader.read_all_varm()?;
+    if !varm_map.is_empty() {
+        let varm_group = root.create_group("varm")?;
+        for (name, batch) in &varm_map {
+            write_obsm_entry_at(&varm_group, name, batch)?;
         }
     }
 
-    // uns.
-    if let Ok(uns) = reader.read_uns() {
-        let uns_group = root.create_group("uns")?;
-        write_uns_entries_at(&uns_group, &uns)?;
+    // uns. Absence is a clean `SectionNotFound`; any other error (e.g.
+    // malformed JSON) is corruption and must abort (SCX-009).
+    match reader.read_uns() {
+        Ok(uns) => {
+            let uns_group = root.create_group("uns")?;
+            write_uns_entries_at(&uns_group, &uns)?;
+        }
+        Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {}
+        Err(e) => return Err(e.into()),
     }
 
     // /layers/{name}.
@@ -258,13 +263,12 @@ pub fn write_scx_to_h5ad_streaming(
 
     // obsp / varp pairwise matrices (COO → csr_matrix groups). Read eagerly,
     // mirroring obsm/varm above. obsp filters both axes by the obs keep mask;
-    // varp (var axis) is never obs-deleted. Shared with the eager exporter.
-    if let Ok(obsp) = reader.read_all_obsp() {
-        super::write::write_pairwise_group(&root, "obsp", &obsp, keep_mask.as_deref())?;
-    }
-    if let Ok(varp) = reader.read_all_varp() {
-        super::write::write_pairwise_group(&root, "varp", &varp, None)?;
-    }
+    // varp (var axis) is never obs-deleted. Both readers return Ok(empty) on
+    // absence, so errors are corruption and propagate (SCX-009).
+    let obsp = reader.read_all_obsp()?;
+    super::write::write_pairwise_group(&root, "obsp", &obsp, keep_mask.as_deref())?;
+    let varp = reader.read_all_varp()?;
+    super::write::write_pairwise_group(&root, "varp", &varp, None)?;
 
     Ok(())
 }

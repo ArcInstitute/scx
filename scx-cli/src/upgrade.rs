@@ -1,7 +1,10 @@
-// scx upgrade — Upgrade an SCX file to the latest format version.
+// scx upgrade — Upgrade an SCX file to the latest UNFRAMED format version (v3).
 //
-// Rewrites the file fully through the current ScxWriter, which produces
-// the latest format version. If old and current versions match, no-op.
+// Rewrites the file fully through the current ScxWriter, which produces the
+// newest unframed version (DEFAULT_WRITE_FORMAT_VERSION). It intentionally does
+// NOT add row-group framing, so it does not reach CURRENT_FORMAT_VERSION (v4) —
+// use `scx optimize --row-group-rows N` for the framed v4 layout. If the file
+// is already at the unframed target, this is a no-op. See SCX-013.
 
 use std::path::Path;
 
@@ -27,7 +30,8 @@ pub fn run_upgrade(
     // row-group framing, which upgrade does not add).
     if old_version == DEFAULT_WRITE_FORMAT_VERSION {
         println!(
-            "File is already at format version {} (current). Nothing to do.",
+            "File is already at format version {} (newest unframed version; \
+             use `scx optimize --row-group-rows N` for framed v4). Nothing to do.",
             DEFAULT_WRITE_FORMAT_VERSION
         );
         return Ok(());

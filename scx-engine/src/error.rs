@@ -47,6 +47,17 @@ pub enum EngineError {
     )]
     ModalityRequired { available: Vec<String> },
 
+    /// A streaming rewrite (`streaming_preprocess` / `streaming_save_layer`)
+    /// was called on an input whose layout it cannot faithfully reproduce
+    /// (multimodal files, or files carrying `adata.raw`). Rather than silently
+    /// drop or corrupt those sections, the operation refuses. See SCX-002.
+    #[error("{op} does not support {feature} inputs: {remedy}")]
+    UnsupportedRewrite {
+        op: String,
+        feature: String,
+        remedy: String,
+    },
+
     #[error(transparent)]
     FormatError(#[from] scx_format_io::ScxError),
 

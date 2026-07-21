@@ -51,6 +51,21 @@ pub(crate) fn to_pyerr(e: ScxError) -> PyErr {
     }
 }
 
+/// Resolve an optional `shard_size` to a concrete row count, rejecting an
+/// explicit zero (SCX-011). A zero shard size stalls every shard-boundary loop
+/// (`row_end == (row_start + 0).min(n)` never advances → the writer hangs).
+/// `None` falls back to `default`. The CLI already rejects zero via its
+/// `positive_u32` parser; this closes the same gap for the Python API.
+pub(crate) fn resolve_shard_size(shard_size: Option<u32>, default: u32) -> PyResult<u32> {
+    match shard_size {
+        Some(0) => Err(PyValueError::new_err(
+            "shard_size must be > 0 (0 would stall the shard-writing loop and hang)",
+        )),
+        Some(n) => Ok(n),
+        None => Ok(default),
+    }
+}
+
 /// Convert a `scx_convert::ConvertError` into the most appropriate
 /// Python exception. A missing input file raises `FileNotFoundError`
 /// (not `RuntimeError`), a permission failure raises `PermissionError`,
@@ -505,7 +520,8 @@ fn from_h5ad(
     let csc_policy =
         scx_format_io::CscPolicy::parse(&csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let uns_format_parsed = convert::parse_uns_format(uns_format)?;
-    let shard_target_rows = shard_size.unwrap_or(scx_format_io::DEFAULT_SHARD_TARGET_ROWS);
+    let shard_target_rows =
+        resolve_shard_size(shard_size, scx_format_io::DEFAULT_SHARD_TARGET_ROWS)?;
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -973,7 +989,7 @@ fn from_mtx(
     let orientation = scx_mtx::mtx_to_scx(
         std::path::Path::new(mtx_dir),
         std::path::Path::new(scx_path),
-        shard_size.unwrap_or(16384),
+        resolve_shard_size(shard_size, 16384)?,
         codec.unwrap_or("auto"),
         "pyscx",
     )

@@ -30,6 +30,12 @@ pub fn mtx_to_scx(
     codec_str: &str,
     tool_name: &str,
 ) -> Result<MtxOrientation, MtxError> {
+    // Defense-in-depth (SCX-011): a zero shard size never advances the
+    // shard-boundary loop below and would hang. Callers (CLI, pyscx) also
+    // validate, but reject here too so no entry point can stall.
+    if shard_target_rows == 0 {
+        return Err(MtxError::InvalidShardSize);
+    }
     let mtx_data = crate::read_mtx_directory(input_dir)?;
     let orientation = mtx_data.orientation;
 

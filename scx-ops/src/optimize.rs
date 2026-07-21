@@ -114,6 +114,16 @@ pub fn optimize_with_framing(
             input_path.display()
         );
     }
+    // Raw (`adata.raw`) is not carried through optimize's section allowlist.
+    // Warn loudly rather than drop it silently (SCX-002), matching
+    // compact/sort/merge.
+    if in_header.has_raw() {
+        log::warn!(
+            "scx optimize: input {} carries an adata.raw matrix, which is not yet \
+             preserved through optimize — raw will be dropped from the output",
+            input_path.display()
+        );
+    }
     let out_flags = in_header.flags & !(1 << 0) & !(1 << 5);
 
     // Resolve a malformed `shard_target_rows == 0` to the default up front and

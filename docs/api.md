@@ -2,7 +2,7 @@
 
 ## Section Types
 
-29 section types (IDs 0–28) are defined in `scx-format/src/section.rs`:
+29 section types (IDs 0–29, with ID 26 reserved) are defined in `scx-format/src/section.rs`:
 
 ```
 ObsMetadata (0)        — Arrow IPC metadata for observations
@@ -59,6 +59,10 @@ RawCsrShard (27)       — Row-sharded `raw.X` CSR (anndata `.raw` layer),
                          parallel to CsrShard (4).
 RawVarMetadata (28)    — Arrow IPC var metadata for the `.raw` layer
                          (mirror of VarMetadata (2)).
+GroupIndex (29)        — Condition/label-grouped sharding sidecar (one per
+                         file; `group_index` JSON). Written by
+                         `scx sort --group-by`; consumed by the grouped-read
+                         API. See docs/format.md § section ids.
 ```
 
 ## ScxReader (`scx-format-io/src/reader.rs`)
@@ -2248,7 +2252,7 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 - `scx query <input> (--filter <expr> | <filter>) [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]` — the obs predicate may be given via `--filter` (consistent with `scx subset` / `scx delete`) or positionally (back-compat); supply one form, not both. `<input>` accepts a local `.scx` file path, an exploded `.scxd/` directory, or a cloud URL (`gs://`, `s3://`, `az://`, `file://`). For cloud inputs the query is served via the `SectionReader` cloud path with no `scx pull` step. See [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query).
 - `scx subset <input> [output] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4|pcodec]` — Extract a subset of cells and/or genes into a new SCX file (`output` is optional with `--dry-run`)
 - `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data. `--memory-limit` accepts the same size forms as `--memory-budget` (see [Memory budgets](#memory-budgets)).
-- `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest format version
+- `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest **unframed** format version (v3). Does not add row-group framing, so it does not reach v4 — use `scx optimize --row-group-rows N` for the framed v4 layout.
 
 ### Cloud operations (`--features cloud`)
 - `scx cloud-optimize <input> [--output <path>]`

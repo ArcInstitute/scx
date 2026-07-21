@@ -214,6 +214,17 @@ pub fn merge_with_options(
         );
     }
 
+    // Raw (`adata.raw`) is not carried through merge: the raw obs axis would
+    // need to be concatenated in lockstep with X across inputs, which is not
+    // yet implemented. Warn loudly rather than drop it silently (SCX-002),
+    // matching compact/sort behavior.
+    if readers.iter().any(|r| r.header().has_raw()) {
+        log::warn!(
+            "merge: at least one input carries an adata.raw matrix, which is not \
+             yet preserved through merge — raw will be dropped from the merged output"
+        );
+    }
+
     // Build output header. codec_id is 0 (None) because actual codec is
     // selected per-shard via select_codec(). `flags` stays 0 — merge
     // intentionally produces a clean output header rather than carrying

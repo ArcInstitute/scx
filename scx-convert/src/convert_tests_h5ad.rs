@@ -1930,7 +1930,13 @@ fn test_append_for_modality_updates_table() {
     // Build a new obs batch by truncating the existing obs to 4 rows.
     let new_obs_batch = pre_obs.slice(0, n_new_rows as usize);
 
-    scx_ops::append(
+    // Append into a single modality of a multimodal file is deferred by
+    // design: it would bump the global n_obs while extending only one
+    // modality's CSR shards, leaving the sibling modalities under-covering the
+    // cell-aligned obs axis → an unreadable file. `prepare_append` refuses with
+    // `MultimodalUnsupported` before any mutation (documented in CLAUDE.md
+    // "Known Limitations"; the workflow is extract → append → merge back).
+    let err = scx_ops::append(
         &scx_path,
         &new_obs_batch,
         &new_indptr,
@@ -1943,29 +1949,30 @@ fn test_append_for_modality_updates_table() {
             modality_id: rna_id,
         },
     )
-    .unwrap();
+    .unwrap_err();
+    assert!(
+        matches!(err, scx_ops::OpsError::MultimodalUnsupported { op } if op == "append"),
+        "multimodal append must be rejected, got {err:?}"
+    );
 
-    // Re-open and verify post-append state.
+    // The file must be untouched by the refused append (no mutation before the
+    // guard). Silence unused-binding warnings for the captured pre-state.
     let post = ScxReader::open(&scx_path).unwrap();
-    assert_eq!(post.header().n_obs, 8 + n_new_rows);
+    assert_eq!(post.header().n_obs, 8);
     let rna_post = post.modality_info(rna_id).unwrap();
     let adt_post = post.modality_info(adt_id).unwrap();
-    assert!(
-        rna_post.n_csr_shards > pre_rna_csr,
-        "rna n_csr_shards should grow"
-    );
-    assert!(rna_post.nnz > pre_rna_nnz, "rna nnz should grow");
+    assert_eq!(rna_post.n_csr_shards, pre_rna_csr, "rna untouched");
+    assert_eq!(rna_post.nnz, pre_rna_nnz, "rna untouched");
     assert_eq!(adt_post.n_csr_shards, pre_adt_csr, "adt untouched");
     assert_eq!(adt_post.nnz, pre_adt_nnz, "adt untouched");
-
-    // The new shard's catalog entry must be stamped with rna_id.
-    let new_shards: Vec<_> = post
+    // No new rna CSR shard should have been written.
+    let rna_shards = post
         .catalog()
         .entries
         .iter()
         .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == rna_id)
-        .collect();
-    assert!(new_shards.len() as u32 >= rna_post.n_csr_shards);
+        .count() as u32;
+    assert_eq!(rna_shards, pre_rna_csr);
 }
 
 /// Report B1: integer- and float-keyed categorical obs columns (valid

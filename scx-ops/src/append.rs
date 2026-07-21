@@ -303,8 +303,24 @@ pub fn append_from_reader_with_index_options(
     // of base and source — never claim v3 unless both already guarantee it.
     let feature_floor = if prep.header.n_modalities > 0 { 2 } else { 1 };
     let base_version = prep.header.format_version;
+    let source_version = source.header().format_version;
+    // SCX-005: a v3+ base declares the canonical-CSR invariant, but append does
+    // not re-canonicalize the appended source's shards. Appending a pre-v3
+    // (non-canonical) source into a v3+ base would therefore produce a file that
+    // claims canonical while carrying unsorted/duplicate appended shards (which
+    // `scx validate --deep` would reject). Refuse rather than mislabel; the user
+    // can canonicalize the source with `scx optimize` first.
+    if base_version >= scx_format_io::header::DEFAULT_WRITE_FORMAT_VERSION
+        && source_version < scx_format_io::header::DEFAULT_WRITE_FORMAT_VERSION
+    {
+        return Err(OpsError::InvalidInput(format!(
+            "cannot append a format v{source_version} source into a v{base_version} target: the \
+             target declares the canonical-CSR invariant that append does not re-establish for \
+             the appended shards. Run `scx optimize` on the source first, then append."
+        )));
+    }
     let clamped = scx_format_io::rewrite_output_format_version(
-        &[base_version, source.header().format_version],
+        &[base_version, source_version],
         feature_floor,
     );
     // BUT append never rewrites the base's existing shards — they are preserved

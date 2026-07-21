@@ -2841,16 +2841,23 @@ fn layer_value_encoding(reader: &ScxReader, layer_name: &str) -> Result<ValueEnc
 
 /// Pick the narrowest encoding that covers every shard in `shards`: float wins
 /// outright; otherwise the integer width that fits the max `value_max`.
+///
+/// The float/integer *kind* must be probed across EVERY shard, not just the
+/// first (SCX-004): a `Uint8` first shard followed by a `Float32` shard would
+/// otherwise pick an integer encoding and truncate the float shard's
+/// fractional values (e.g. `1.5 → 1`).
 fn widest_value_encoding(
     reader: &ScxReader,
     shards: &[&FullCatalogEntry],
 ) -> Result<ValueEncoding> {
-    let Some(first) = shards.first() else {
+    if shards.is_empty() {
         return Ok(ValueEncoding::Uint8);
-    };
-    let base = entry_value_encoding(reader, Some(*first))?;
-    if matches!(base, ValueEncoding::Float32 | ValueEncoding::Float16) {
-        return Ok(ValueEncoding::Float32);
+    }
+    for entry in shards {
+        let enc = entry_value_encoding(reader, Some(*entry))?;
+        if matches!(enc, ValueEncoding::Float32 | ValueEncoding::Float16) {
+            return Ok(ValueEncoding::Float32);
+        }
     }
     let max_val = shards
         .iter()
