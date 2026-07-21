@@ -83,8 +83,21 @@ impl RootCatalog {
     }
 
     /// Deserialize a root catalog from a reader.
+    ///
+    /// The root catalog is bounded to [`ROOT_CATALOG_MAX_SIZE`] bytes, so a
+    /// trustworthy count can be at most `ROOT_CATALOG_MAX_SIZE /
+    /// ROOT_CATALOG_ENTRY_SIZE` entries. A corrupt count is rejected up front
+    /// (SCX-007) rather than driving a large `with_capacity` and reading past
+    /// the root region into section-body bytes.
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self> {
+        const MAX_ROOT_ENTRIES: usize = ROOT_CATALOG_MAX_SIZE / ROOT_CATALOG_ENTRY_SIZE;
         let n_section_groups = r.read_u16::<LittleEndian>()?;
+        if n_section_groups as usize > MAX_ROOT_ENTRIES {
+            return Err(ScxError::InvalidCatalog(format!(
+                "root catalog declares {n_section_groups} entries, exceeds max {MAX_ROOT_ENTRIES} \
+                 for the {ROOT_CATALOG_MAX_SIZE}-byte root region"
+            )));
+        }
         let mut entries = Vec::with_capacity(n_section_groups as usize);
         for _ in 0..n_section_groups {
             entries.push(RootCatalogEntry::read_from(r)?);
@@ -150,7 +163,14 @@ impl ColumnStat {
             } => {
                 w.write_u8(1)?; // stat_type
                 w.write_u64::<LittleEndian>(*column_name_hash)?;
-                w.write_u16::<LittleEndian>(bitset.len() as u16)?;
+                // Checked wire-width conversion (SCX-006).
+                let bitset_len = u16::try_from(bitset.len()).map_err(|_| {
+                    ScxError::InvalidCatalog(format!(
+                        "category bitset is {} bytes, exceeds u16::MAX",
+                        bitset.len()
+                    ))
+                })?;
+                w.write_u16::<LittleEndian>(bitset_len)?;
                 w.write_all(bitset)?;
             }
         }
@@ -326,7 +346,11 @@ impl ShardStats {
         w.write_u32::<LittleEndian>(self.value_min)?;
         w.write_u32::<LittleEndian>(self.value_max)?;
         w.write_u64::<LittleEndian>(self.value_sum)?;
-        w.write_u8(self.column_stats.len() as u8)?;
+        // Checked wire-width conversion (SCX-006): >255 indexed columns would
+        // wrap the u8 count and desync the stats blob on read-back.
+        let n_stats = u8::try_from(self.column_stats.len())
+            .map_err(|_| ScxError::ColumnStatsOverflow(self.column_stats.len()))?;
+        w.write_u8(n_stats)?;
         for cs in &self.column_stats {
             cs.write_to(w)?;
         }
@@ -701,7 +725,16 @@ impl FullCatalog {
         buf.write_u64::<LittleEndian>(self.manifest_sequence)?;
         buf.write_u64::<LittleEndian>(self.prev_catalog_offset)?;
         buf.write_u64::<LittleEndian>(self.n_obs)?;
-        buf.write_u32::<LittleEndian>(self.entries.len() as u32)?;
+        // Checked wire-width conversions (SCX-006): a value that overflows the
+        // serialized field must fail loudly at write time, never silently
+        // narrow and desynchronize the reader.
+        let n_entries = u32::try_from(self.entries.len()).map_err(|_| {
+            ScxError::InvalidCatalog(format!(
+                "catalog has {} entries, exceeds u32::MAX",
+                self.entries.len()
+            ))
+        })?;
+        buf.write_u32::<LittleEndian>(n_entries)?;
 
         // Entries. v2 layout adds a single `modality_id: u8` between
         // the per-entry checksum and the stats length prefix. Since we
@@ -709,7 +742,14 @@ impl FullCatalog {
         // its modality_id (zero for single-modality files).
         for entry in &self.entries {
             let name_bytes = entry.name.as_bytes();
-            buf.write_u16::<LittleEndian>(name_bytes.len() as u16)?;
+            let name_len = u16::try_from(name_bytes.len()).map_err(|_| {
+                ScxError::InvalidCatalog(format!(
+                    "section name '{}' is {} bytes, exceeds u16::MAX",
+                    entry.name,
+                    name_bytes.len()
+                ))
+            })?;
+            buf.write_u16::<LittleEndian>(name_len)?;
             buf.write_all(name_bytes)?;
             buf.write_u64::<LittleEndian>(entry.offset)?;
             buf.write_u64::<LittleEndian>(entry.length)?;
@@ -722,7 +762,14 @@ impl FullCatalog {
                 Some(stats) => {
                     let mut stats_buf = Vec::new();
                     stats.write_to(&mut stats_buf)?;
-                    buf.write_u16::<LittleEndian>(stats_buf.len() as u16)?;
+                    let stats_len = u16::try_from(stats_buf.len()).map_err(|_| {
+                        ScxError::InvalidCatalog(format!(
+                            "stats blob for section '{}' is {} bytes, exceeds u16::MAX",
+                            entry.name,
+                            stats_buf.len()
+                        ))
+                    })?;
+                    buf.write_u16::<LittleEndian>(stats_len)?;
                     buf.write_all(&stats_buf)?;
                 }
                 None => {

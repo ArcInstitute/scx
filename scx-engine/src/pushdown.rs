@@ -127,9 +127,15 @@ fn can_exclude_shard(
                 }
                 match cs {
                     ColumnStat::MinMax { min, max, .. } => {
-                        // For numeric equality: skip if value outside [min, max]
-                        if let Some(v) = scalar_to_f64(val) {
-                            if v < *min || v > *max {
+                        // For numeric equality: skip if value outside [min, max].
+                        // Eq is provably safe from false-prunes under monotonic
+                        // f64 rounding, but guard it uniformly with the Gt/Ge/
+                        // Lt/Le/In branches for defense-in-depth (SCX-003).
+                        if let Some((v, is_int)) = scalar_to_f64_typed(val) {
+                            if prune_exact(v, *min, is_int)
+                                && prune_exact(v, *max, is_int)
+                                && (v < *min || v > *max)
+                            {
                                 return true;
                             }
                         }
@@ -181,13 +187,19 @@ fn can_exclude_shard(
         }
         Predicate::Gt(col, val) | Predicate::Ge(col, val) => {
             let hash = column_name_hash(col);
-            if let Some(v) = scalar_to_f64(val) {
+            if let Some((v, is_int)) = scalar_to_f64_typed(val) {
                 for cs in column_stats {
                     if cs.column_name_hash() != hash {
                         continue;
                     }
                     if let ColumnStat::MinMax { max, .. } = cs {
                         // Gt: skip if col_max <= v; Ge: skip if col_max < v
+                        // Refuse to prune when the f64 comparison is not exact
+                        // for an integer predicate (SCX-003): a bound rounded
+                        // inward could false-prune a matching shard.
+                        if !prune_exact(v, *max, is_int) {
+                            continue;
+                        }
                         let skip = match predicate {
                             Predicate::Gt(..) => *max <= v,
                             Predicate::Ge(..) => *max < v,
@@ -203,13 +215,17 @@ fn can_exclude_shard(
         }
         Predicate::Lt(col, val) | Predicate::Le(col, val) => {
             let hash = column_name_hash(col);
-            if let Some(v) = scalar_to_f64(val) {
+            if let Some((v, is_int)) = scalar_to_f64_typed(val) {
                 for cs in column_stats {
                     if cs.column_name_hash() != hash {
                         continue;
                     }
                     if let ColumnStat::MinMax { min, .. } = cs {
                         // Lt: skip if col_min >= v; Le: skip if col_min > v
+                        // See SCX-003 note on the Gt/Ge branch above.
+                        if !prune_exact(v, *min, is_int) {
+                            continue;
+                        }
                         let skip = match predicate {
                             Predicate::Lt(..) => *min >= v,
                             Predicate::Le(..) => *min > v,
@@ -238,10 +254,20 @@ fn can_exclude_shard(
                 }
                 match cs {
                     ColumnStat::MinMax { min, max, .. } => {
-                        let all_outside = values
-                            .iter()
-                            .filter_map(scalar_to_f64_ref)
-                            .all(|v| v < *min || v > *max);
+                        // A value is only counted as "outside" when its f64
+                        // comparison against both bounds is exact (SCX-003);
+                        // otherwise it is treated as possibly-inside so the
+                        // shard is not pruned. Require at least one convertible
+                        // (numeric) value so an all-non-numeric `In` list does
+                        // not prune via a vacuously-true `all()`.
+                        let numeric: Vec<(f64, bool)> =
+                            values.iter().filter_map(scalar_to_f64_typed).collect();
+                        let all_outside = !numeric.is_empty()
+                            && numeric.iter().all(|&(v, is_int)| {
+                                prune_exact(v, *min, is_int)
+                                    && prune_exact(v, *max, is_int)
+                                    && (v < *min || v > *max)
+                            });
                         if all_outside {
                             return true;
                         }
@@ -301,18 +327,30 @@ fn can_exclude_shard(
     }
 }
 
-/// Convert a ScalarValue to f64 for numeric comparisons.
-fn scalar_to_f64(val: &ScalarValue) -> Option<f64> {
+/// Integers with magnitude below 2^53 are exactly representable in f64, so
+/// f64-based min/max pruning is exact for them. At or above 2^53, an i64/u64
+/// value may have been rounded when the stored bound was derived from the
+/// column (`value as f64`), or when the predicate value is widened here, so
+/// pruning could drop a shard that actually matches. See SCX-003.
+const F64_EXACT_INT_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+
+/// Convert a ScalarValue to (f64, is_integer). The `is_integer` flag records
+/// whether the value originated from an integer predicate, which determines
+/// whether the `F64_EXACT_INT_LIMIT` pruning guard applies.
+fn scalar_to_f64_typed(val: &ScalarValue) -> Option<(f64, bool)> {
     match val {
-        ScalarValue::Int64(v) => Some(*v as f64),
-        ScalarValue::Float64(v) => Some(*v),
+        ScalarValue::Int64(v) => Some((*v as f64, true)),
+        ScalarValue::Float64(v) => Some((*v, false)),
         _ => None,
     }
 }
 
-/// Same as scalar_to_f64 but takes a reference (for use in iterator chains).
-fn scalar_to_f64_ref(val: &ScalarValue) -> Option<f64> {
-    scalar_to_f64(val)
+/// Whether an f64 comparison between a predicate value `v` and a stored `bound`
+/// is exact enough to prune a shard. Float predicates are always exact (both
+/// sides are genuine f64); integer predicates are exact only when both operands
+/// are below the exact-representable limit. See SCX-003.
+fn prune_exact(v: f64, bound: f64, is_int: bool) -> bool {
+    !is_int || (v.abs() < F64_EXACT_INT_LIMIT && bound.abs() < F64_EXACT_INT_LIMIT)
 }
 
 #[cfg(test)]
@@ -433,6 +471,66 @@ mod tests {
         let candidates = prune_shards_by_catalog(&catalog, &preds, None);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].shard_idx, 1);
+    }
+
+    #[test]
+    fn int64_above_f64_exact_limit_does_not_false_prune() {
+        // SCX-003 regression. A shard containing 2^53 + 1 records a max of
+        // 2^53 (rounded to even) in its f64 stat. The predicate `col > 2^53`
+        // must NOT prune this shard, because row 2^53 + 1 genuinely matches.
+        let two_pow_53: i64 = 1 << 53;
+        let rounded_max = two_pow_53 as f64; // (2^53 + 1) as f64 == 2^53
+        let stats = vec![minmax_stat("big_id", 0.0, rounded_max)];
+
+        // Gt just above the exact limit: pruning would be a false negative.
+        assert!(
+            !can_exclude_shard(
+                &Predicate::Gt("big_id".to_string(), ScalarValue::Int64(two_pow_53)),
+                &stats,
+                None,
+            ),
+            "Gt(2^53) must not prune a shard whose true max is 2^53 + 1"
+        );
+
+        // In with a single value above the limit likewise must not prune.
+        assert!(
+            !can_exclude_shard(
+                &Predicate::In(
+                    "big_id".to_string(),
+                    vec![ScalarValue::Int64(two_pow_53 + 10)],
+                ),
+                &stats,
+                None,
+            ),
+            "In([> 2^53]) must not prune when the bound may be rounded"
+        );
+
+        // Eq above the limit must not prune either: a shard whose only value
+        // is 2^53 + 1 stores max == 2^53, and Eq(2^53 + 1) rounds to 2^53, so
+        // an unguarded `v > max` check could not exclude it here — but the
+        // guard keeps Eq uniform with the other branches.
+        assert!(
+            !can_exclude_shard(
+                &Predicate::Eq("big_id".to_string(), ScalarValue::Int64(two_pow_53 + 1)),
+                &[minmax_stat("big_id", rounded_max, rounded_max)],
+                None,
+            ),
+            "Eq(2^53 + 1) must not prune a shard whose true value is 2^53 + 1"
+        );
+
+        // Sanity: small integers below the limit still prune exactly.
+        let small = vec![minmax_stat("n_genes", 100.0, 500.0)];
+        assert!(can_exclude_shard(
+            &Predicate::Gt("n_genes".to_string(), ScalarValue::Int64(600)),
+            &small,
+            None,
+        ));
+        // Eq below the limit still prunes when genuinely outside [min, max].
+        assert!(can_exclude_shard(
+            &Predicate::Eq("n_genes".to_string(), ScalarValue::Int64(600)),
+            &small,
+            None,
+        ));
     }
 
     #[test]

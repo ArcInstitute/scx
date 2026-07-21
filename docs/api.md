@@ -2,7 +2,7 @@
 
 ## Section Types
 
-29 section types (IDs 0–28) are defined in `scx-format/src/section.rs`:
+29 section types (IDs 0–29, with ID 26 reserved) are defined in `scx-format/src/section.rs`:
 
 ```
 ObsMetadata (0)        — Arrow IPC metadata for observations
@@ -59,6 +59,10 @@ RawCsrShard (27)       — Row-sharded `raw.X` CSR (anndata `.raw` layer),
                          parallel to CsrShard (4).
 RawVarMetadata (28)    — Arrow IPC var metadata for the `.raw` layer
                          (mirror of VarMetadata (2)).
+GroupIndex (29)        — Condition/label-grouped sharding sidecar (one per
+                         file; `group_index` JSON). Written by
+                         `scx sort --group-by`; consumed by the grouped-read
+                         API. See docs/format.md § section ids.
 ```
 
 ## ScxReader (`scx-format-io/src/reader.rs`)
@@ -1232,8 +1236,8 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   semantics as `to_h5ad`; each modality runs through the same
   dispatcher independently.
 - `pyscx.iter_chunks(adata, chunk_size="shard")` — Shard-aligned or fixed-size chunk iterator
-- `pyscx.preprocess(source, target, ops, target_sum=None)` — Streaming shard-by-shard preprocessing
-- `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as layer
+- `pyscx.preprocess(source, target, ops, target_sum=None)` — Streaming shard-by-shard preprocessing. Preserves obs/var/obsm/uns only; **rejects multimodal and `adata.raw`-bearing inputs** (would otherwise corrupt X / drop raw) — extract a single modality first, or transform before attaching raw.
+- `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as a layer. Preserves obs/var/original-X/obsm/uns only (pre-existing layers, raw, CSC, varm/obsp/varp, indexes, bitmaps, deletion vectors are not carried over); same multimodal/raw rejection as `preprocess`.
 
 ### File operations
 - `pyscx.append(target, input, codec=None, shard_size=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, modality=None)` — Streaming append from SCX file (reads one shard at a time; raw-copy fast path when codec/encoding match). **Append into a multimodal target is deferred** — it raises `ValueError` (`MultimodalUnsupported`); a single-modality append would leave sibling modalities under-covering the shared obs axis. Extract a modality with `scx subset --modality`, append to that single-modality file, then re-merge. Single-modality append is unaffected. `index_*` kwargs rebuild predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps). Appending categorical `obs`/`var` onto a **row-sharded** base reassembles the existing metadata through the shared canonical assembler (`scx_format_io::assemble_sharded_metadata`), so disjoint/duplicate per-shard categorical vocabularies and a mixed `Dictionary`/plain-string shard layout are reconciled rather than failing to read back. A genuinely corrupt/gapped obs/var shard cover (non-contiguous `row_start` stamps) is now rejected with a clear error instead of being silently mis-assembled.
@@ -2248,7 +2252,7 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 - `scx query <input> (--filter <expr> | <filter>) [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]` — the obs predicate may be given via `--filter` (consistent with `scx subset` / `scx delete`) or positionally (back-compat); supply one form, not both. `<input>` accepts a local `.scx` file path, an exploded `.scxd/` directory, or a cloud URL (`gs://`, `s3://`, `az://`, `file://`). For cloud inputs the query is served via the `SectionReader` cloud path with no `scx pull` step. See [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query).
 - `scx subset <input> [output] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4|pcodec]` — Extract a subset of cells and/or genes into a new SCX file (`output` is optional with `--dry-run`)
 - `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data. `--memory-limit` accepts the same size forms as `--memory-budget` (see [Memory budgets](#memory-budgets)).
-- `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest format version
+- `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest **unframed** format version (v3). Does not add row-group framing, so it does not reach v4 — use `scx optimize --row-group-rows N` for the framed v4 layout.
 
 ### Cloud operations (`--features cloud`)
 - `scx cloud-optimize <input> [--output <path>]`

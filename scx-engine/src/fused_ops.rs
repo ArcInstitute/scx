@@ -131,8 +131,14 @@ fn write_preprocess_provenance(
 ///
 /// Reads the source SCX file one shard at a time, applies fused
 /// normalize+log1p operations, and writes the result to a new SCX file.
-/// Metadata sections (obs, var, obsm, uns) are copied verbatim from
-/// the source.
+///
+/// **Preserved sections:** `obs`, `var`, `obsm`, and `uns` are copied from the
+/// source; a fresh provenance entry is added. **Not preserved:** `adata.raw`,
+/// layers, CSC sidecars, `varm`/`obsp`/`varp`, predicate indexes, detection
+/// bitmaps, and deletion vectors are *not* carried over. Inputs carrying
+/// `adata.raw`, and multimodal inputs, are rejected (see SCX-002) rather than
+/// silently dropped or corrupted — extract the modality of interest first, or
+/// run the transform before attaching raw.
 ///
 /// Post-transformation data is always Float32 + Zstd codec, since
 /// normalization produces float values that can't use the integer-only
@@ -147,6 +153,33 @@ fn write_preprocess_provenance(
 /// # Returns
 ///
 /// The number of shards processed on success.
+/// Reject inputs whose full section layout the streaming rewrites cannot
+/// faithfully reproduce (SCX-002). Both `streaming_preprocess` and
+/// `streaming_save_layer` iterate `shards_sorted()`, which flattens CSR shards
+/// across every modality with overlapping obs-row ranges; writing those back
+/// against a single assembled obs axis would corrupt X. And neither carries
+/// `adata.raw`, so a raw-bearing input would silently lose it. Fail loudly
+/// instead of producing a semantically incomplete or corrupt file.
+fn reject_unsupported_rewrite(reader: &scx_format_io::ScxReader, op: &str) -> crate::Result<()> {
+    if reader.is_multimodal() {
+        return Err(crate::EngineError::UnsupportedRewrite {
+            op: op.to_string(),
+            feature: "multimodal".to_string(),
+            remedy: "extract a single modality with `scx subset --modality NAME` first".to_string(),
+        });
+    }
+    if reader.has_raw() {
+        return Err(crate::EngineError::UnsupportedRewrite {
+            op: op.to_string(),
+            feature: "adata.raw-bearing".to_string(),
+            remedy: "raw would be dropped; run the transform before attaching raw, \
+                     or drop raw first"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 pub fn streaming_preprocess(
     source_path: &std::path::Path,
     target_path: &std::path::Path,
@@ -157,6 +190,7 @@ pub fn streaming_preprocess(
     use scx_format_io::{ScxReader, ScxWriter};
 
     let reader = ScxReader::open(source_path)?;
+    reject_unsupported_rewrite(&reader, "streaming_preprocess")?;
     let header = build_output_header(reader.header(), CodecId::Zstd as u8);
     let mut writer = ScxWriter::new(target_path, header)?;
 
@@ -247,11 +281,15 @@ pub fn streaming_preprocess(
 
 /// Streaming shard-by-shard save-as-layer pipeline.
 ///
-/// Copies all sections from the source SCX file to a new file, then adds
-/// the transformed X data as a named layer (`LayerCsrShard` entries).
+/// Copies `obs`, `var`, the original `X`, `obsm`, and `uns` from the source
+/// SCX file to a new file, then adds the transformed X data as a named layer
+/// (`LayerCsrShard` entries) plus a fresh provenance entry.
 ///
-/// This effectively creates a new SCX file that contains both the original
-/// X and a new layer with the preprocessed data.
+/// **Not preserved:** pre-existing layers, `adata.raw`, CSC sidecars,
+/// `varm`/`obsp`/`varp`, predicate indexes, detection bitmaps, and deletion
+/// vectors are *not* carried over. Inputs carrying `adata.raw`, and multimodal
+/// inputs, are rejected (see SCX-002) rather than silently dropped or
+/// corrupted.
 ///
 /// # Arguments
 ///
@@ -269,6 +307,7 @@ pub fn streaming_save_layer(
     use scx_format_io::{ScxReader, ScxWriter};
 
     let reader = ScxReader::open(source_path)?;
+    reject_unsupported_rewrite(&reader, "streaming_save_layer")?;
     let header = build_output_header(reader.header(), reader.header().codec_id);
     let mut writer = ScxWriter::new(target_path, header)?;
 

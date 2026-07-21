@@ -51,6 +51,16 @@ pub enum ScxError {
     #[error("invalid catalog: {0}")]
     InvalidCatalog(String),
 
+    #[error(
+        "duplicate section: (modality_id={modality_id}, section_type={section_type:?}, \
+         name='{name}') was already written; readers resolve names to the first match"
+    )]
+    DuplicateSection {
+        name: String,
+        section_type: String,
+        modality_id: u8,
+    },
+
     #[error("unsupported {section} version: found {found}, expected {expected}")]
     UnsupportedSectionVersion {
         section: &'static str,
@@ -197,6 +207,7 @@ impl ScxError {
             | ScxError::StaleCscSidecar { .. }
             | ScxError::ColumnStatsOverflow(_)
             | ScxError::UnsupportedColumnType { .. }
+            | ScxError::DuplicateSection { .. }
             | ScxError::ObsLayoutConflict { .. } => ScxErrorClass::Validation,
             // File is corrupt or was written by an incompatible/newer SCX:
             // bad magic/version/endian/checksum/catalog, an unknown on-disk

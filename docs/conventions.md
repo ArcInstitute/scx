@@ -66,7 +66,7 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
 ## Python Bindings (pyscx)
 
 - PyO3 with `Bound<'py, T>` API (not deprecated `&PyAny`).
-- Pin `pyo3` and `numpy` crate to the same minor version (currently 0.23).
+- Pin `pyo3` and `numpy` crate to the same minor version (currently 0.28).
 - `PyArray::from_vec()` for zero-copy (moves Rust `Vec` to numpy).
 - `ScxCsr` `i64`/`i32`/`f32` matches scipy exactly — avoids copy.
 - Arrow → pandas via pyarrow's `to_pandas()` for obs/var metadata.

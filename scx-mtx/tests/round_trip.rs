@@ -504,3 +504,41 @@ fn round_trip_empty_matrix() {
     assert_eq!(round_tripped.data.len(), 0);
     assert_eq!(original.indptr, round_tripped.indptr);
 }
+
+/// SCX-010: exported `matrix.mtx` must be features × barcodes (Cell Ranger /
+/// 10x convention), not the internal cells × genes orientation. Assert the
+/// raw size line directly so a self-round-trip (which the reader would silently
+/// re-transpose) cannot mask a wrong orientation.
+#[test]
+fn export_is_features_by_barcodes() {
+    use std::io::Read;
+
+    let tmp = TempDir::new().unwrap();
+    let mtx_in = tmp.path().join("mtx_in");
+    std::fs::create_dir_all(&mtx_in).unwrap();
+    // 4 genes × 3 cells, 5 nnz. On read → SCX with n_obs=3 (cells),
+    // n_vars=4 (genes).
+    create_v3_mtx_dir(&mtx_in);
+
+    let scx_path = tmp.path().join("test.scx");
+    mtx_to_scx(&mtx_in, &scx_path, 1000, "auto", "orient-test").unwrap();
+
+    let mtx_out = tmp.path().join("mtx_out");
+    write_scx_to_mtx(&scx_path, &mtx_out).unwrap();
+
+    // Decompress matrix.mtx.gz and find the size line (first non-comment line).
+    let gz = std::fs::File::open(mtx_out.join("matrix.mtx.gz")).unwrap();
+    let mut dec = flate2::read::GzDecoder::new(gz);
+    let mut body = String::new();
+    dec.read_to_string(&mut body).unwrap();
+    let size_line = body
+        .lines()
+        .find(|l| !l.starts_with('%'))
+        .expect("size line");
+    // features × barcodes = n_vars n_obs nnz = 4 3 5, NOT 3 4 5.
+    assert_eq!(
+        size_line.trim(),
+        "4 3 5",
+        "export must be features × barcodes (n_vars n_obs nnz)"
+    );
+}

@@ -145,6 +145,31 @@ impl SectionType {
             _ => None,
         }
     }
+
+    /// Whether this section carries essential data whose corruption must cause
+    /// [`crate`]-level validation to fail (SCX-008). Covers the obs/var tables
+    /// in BOTH the legacy single-section and the sharded layouts, the main `X`
+    /// CSR shards, and the `adata.raw` count/var sections. Optional/auxiliary
+    /// sections (embeddings, predicate indexes, detection bitmaps, provenance,
+    /// deletion vectors, group index, …) are not essential: their absence or
+    /// corruption is recoverable and must not, on its own, mark a whole file
+    /// invalid.
+    ///
+    /// Keeping this on the enum (rather than a hardcoded `matches!` at each
+    /// call site) means a newly-added essential family cannot be silently
+    /// forgotten by a validator.
+    pub fn is_essential(self) -> bool {
+        matches!(
+            self,
+            SectionType::ObsMetadata
+                | SectionType::ObsMetadataShard
+                | SectionType::VarMetadata
+                | SectionType::VarMetadataShard
+                | SectionType::CsrShard
+                | SectionType::RawCsrShard
+                | SectionType::RawVarMetadata
+        )
+    }
 }
 
 /// Round `offset` up to the next 8-byte boundary.

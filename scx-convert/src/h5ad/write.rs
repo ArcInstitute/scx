@@ -74,43 +74,49 @@ pub fn write_scx_to_h5ad(
     super::stream_write::write_var_streaming_or_eager(&root, &reader, sink)?;
 
     // Write obsm (DV-filtered when active — obs-axis rows must match
-    // /X and /obs).
-    if let Ok(obsm_map) = reader.read_all_obsm() {
-        if !obsm_map.is_empty() {
-            let obsm_group = file.create_group("obsm")?;
-            for (name, batch) in &obsm_map {
-                let filtered = match keep_mask.as_deref() {
-                    Some(mask) => super::stream_write::filter_record_batch_by_mask(batch, mask)?,
-                    None => batch.clone(),
-                };
-                write_obsm_entry(&obsm_group, name, &filtered)?;
-            }
+    // /X and /obs). `read_all_obsm` returns Ok(empty) when absent, so a
+    // propagated error means genuine corruption — never swallow it (SCX-009).
+    let obsm_map = reader.read_all_obsm()?;
+    if !obsm_map.is_empty() {
+        let obsm_group = file.create_group("obsm")?;
+        for (name, batch) in &obsm_map {
+            let filtered = match keep_mask.as_deref() {
+                Some(mask) => super::stream_write::filter_record_batch_by_mask(batch, mask)?,
+                None => batch.clone(),
+            };
+            write_obsm_entry(&obsm_group, name, &filtered)?;
         }
     }
 
-    // Write uns
-    if let Ok(uns) = reader.read_uns() {
-        let uns_group = file.create_group("uns")?;
-        write_uns_entries(&uns_group, &uns)?;
+    // Write uns. Absence is a clean `SectionNotFound`; any other error
+    // (e.g. malformed JSON) is corruption and must abort (SCX-009).
+    match reader.read_uns() {
+        Ok(uns) => {
+            let uns_group = file.create_group("uns")?;
+            write_uns_entries(&uns_group, &uns)?;
+        }
+        Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {}
+        Err(e) => return Err(e.into()),
     }
 
     // Write layers (DV-filtered when active — layers share X's
-    // row count by AnnData invariant)
+    // row count by AnnData invariant). `layer_names()` already enumerates the
+    // layers present, so a read failure here is corruption, not absence — it
+    // must abort rather than silently omit the layer (SCX-009).
     let layer_names = reader.layer_names();
     if !layer_names.is_empty() {
         let layers_group = file.create_group("layers")?;
         for layer_name in &layer_names {
-            if let Ok(layer_csr) = reader.read_layer_filtered(layer_name) {
-                let lg = layers_group.create_group(layer_name)?;
-                write_sparse_arrays(
-                    &lg,
-                    &layer_csr.indptr,
-                    &layer_csr.indices,
-                    &layer_csr.data,
-                    layer_csr.shape.0,
-                    layer_csr.shape.1,
-                )?;
-            }
+            let layer_csr = reader.read_layer_filtered(layer_name)?;
+            let lg = layers_group.create_group(layer_name)?;
+            write_sparse_arrays(
+                &lg,
+                &layer_csr.indptr,
+                &layer_csr.indices,
+                &layer_csr.data,
+                layer_csr.shape.0,
+                layer_csr.shape.1,
+            )?;
         }
     }
 
@@ -119,13 +125,12 @@ pub fn write_scx_to_h5ad(
 
     // Write obsp / varp pairwise matrices (COO → csr_matrix groups). obsp is
     // square on the obs axis, so deletion vectors filter BOTH axes; varp lives
-    // on the var axis and is never obs-deleted.
-    if let Ok(obsp) = reader.read_all_obsp() {
-        write_pairwise_group(&root, "obsp", &obsp, keep_mask.as_deref())?;
-    }
-    if let Ok(varp) = reader.read_all_varp() {
-        write_pairwise_group(&root, "varp", &varp, None)?;
-    }
+    // on the var axis and is never obs-deleted. Both readers return Ok(empty)
+    // on absence, so errors are corruption and propagate (SCX-009).
+    let obsp = reader.read_all_obsp()?;
+    write_pairwise_group(&root, "obsp", &obsp, keep_mask.as_deref())?;
+    let varp = reader.read_all_varp()?;
+    write_pairwise_group(&root, "varp", &varp, None)?;
 
     Ok(())
 }

@@ -35,6 +35,9 @@ pub enum MtxError {
     #[error("invalid codec: {0}")]
     InvalidCodec(String),
 
+    #[error("shard_target_rows must be > 0 (0 would stall the shard-writing loop)")]
+    InvalidShardSize,
+
     #[error("{0}")]
     Other(String),
 }

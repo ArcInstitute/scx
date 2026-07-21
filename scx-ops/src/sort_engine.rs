@@ -958,14 +958,10 @@ fn sort_multimodal(
         writer.write_var_for(out_id, &reader.read_var_for(in_id)?)?;
 
         // X — in-memory gather, reordered by the global order.
-        let ve = entry_value_encoding(
-            reader,
-            reader
-                .catalog()
-                .csr_shards_for_modality(in_id)
-                .first()
-                .copied(),
-        )?;
+        // Scan ALL of this modality's shards for the widest encoding (SCX-004):
+        // sort reorders rows across shards, so a first-shard-only encoding would
+        // truncate a later float/wider-int shard.
+        let ve = widest_value_encoding(reader, &reader.catalog().csr_shards_for_modality(in_id))?;
         let csr = reader.read_all_csr_shards_for(in_id)?;
         let mut emitter = CsrEmitter::new(
             EmitTarget::X,
@@ -1020,13 +1016,12 @@ fn sort_multimodal(
 
         // Per-modality layers (obs-axis → reorder; in-memory gather).
         for layer_name in modality_layer_names(reader, in_id, &info.name) {
-            let lve = entry_value_encoding(
+            // All-shard widest encoding, same rationale as X above (SCX-004).
+            let lve = widest_value_encoding(
                 reader,
-                reader
+                &reader
                     .catalog()
-                    .layer_csr_shards_for_modality(in_id, &layer_name)
-                    .first()
-                    .copied(),
+                    .layer_csr_shards_for_modality(in_id, &layer_name),
             )?;
             let (l_indptr, l_indices, l_data) =
                 assemble_modality_layer(reader, in_id, &layer_name)?;
@@ -2841,16 +2836,23 @@ fn layer_value_encoding(reader: &ScxReader, layer_name: &str) -> Result<ValueEnc
 
 /// Pick the narrowest encoding that covers every shard in `shards`: float wins
 /// outright; otherwise the integer width that fits the max `value_max`.
+///
+/// The float/integer *kind* must be probed across EVERY shard, not just the
+/// first (SCX-004): a `Uint8` first shard followed by a `Float32` shard would
+/// otherwise pick an integer encoding and truncate the float shard's
+/// fractional values (e.g. `1.5 → 1`).
 fn widest_value_encoding(
     reader: &ScxReader,
     shards: &[&FullCatalogEntry],
 ) -> Result<ValueEncoding> {
-    let Some(first) = shards.first() else {
+    if shards.is_empty() {
         return Ok(ValueEncoding::Uint8);
-    };
-    let base = entry_value_encoding(reader, Some(*first))?;
-    if matches!(base, ValueEncoding::Float32 | ValueEncoding::Float16) {
-        return Ok(ValueEncoding::Float32);
+    }
+    for entry in shards {
+        let enc = entry_value_encoding(reader, Some(*entry))?;
+        if matches!(enc, ValueEncoding::Float32 | ValueEncoding::Float16) {
+            return Ok(ValueEncoding::Float32);
+        }
     }
     let max_val = shards
         .iter()

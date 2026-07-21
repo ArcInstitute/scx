@@ -68,6 +68,31 @@ fn root_catalog_too_large() {
 }
 
 #[test]
+fn root_catalog_read_rejects_oversized_count() {
+    // SCX-007: a corrupt entry count larger than the root region can hold must
+    // be rejected before allocating/reading, not trusted.
+    use byteorder::{LittleEndian, WriteBytesExt};
+    let max_entries = ROOT_CATALOG_MAX_SIZE / ROOT_CATALOG_ENTRY_SIZE; // 77
+    let mut buf = Vec::new();
+    // Declare far more entries than the region could contain.
+    buf.write_u16::<LittleEndian>((max_entries as u16) + 1)
+        .unwrap();
+    let mut cursor = std::io::Cursor::new(buf);
+    let err = RootCatalog::read_from(&mut cursor).unwrap_err();
+    assert!(matches!(err, ScxError::InvalidCatalog(_)));
+
+    // A legal count still round-trips.
+    let catalog = RootCatalog {
+        n_section_groups: 2,
+        entries: vec![sample_root_entry(0), sample_root_entry(1)],
+    };
+    let mut ok_buf = Vec::new();
+    catalog.write_to(&mut ok_buf).unwrap();
+    let decoded = RootCatalog::read_from(&mut std::io::Cursor::new(ok_buf)).unwrap();
+    assert_eq!(decoded.entries.len(), 2);
+}
+
+#[test]
 fn root_catalog_entry_size_constant() {
     let entry = sample_root_entry(0);
     let mut buf = Vec::new();

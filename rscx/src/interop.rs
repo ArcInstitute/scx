@@ -1602,7 +1602,19 @@ fn from_seurat_multi_assay(
             counts <- Seurat::GetAssayData(seu, assay = assay_name, layer = 'counts')
             var_df <- tryCatch(seu[[assay_name]]@meta.data,
                 error = function(e) data.frame(feature_id = rownames(counts)))
-            list(counts = counts, var = var_df)
+            # SCX-012: verify this assay's cell axis matches the global obs
+            # (meta.data) row order. When both carry cell names we require an
+            # exact ordered match; an equal-but-permuted or different set would
+            # silently attach counts to the wrong metadata rows. If either side
+            # lacks names, fall back to the count-only check below.
+            cn <- colnames(counts)
+            gn <- rownames(seu@meta.data)
+            aligned <- if (is.null(cn) || is.null(gn) || length(cn) == 0 || length(gn) == 0) {
+                TRUE
+            } else {
+                identical(as.character(cn), as.character(gn))
+            }
+            list(counts = counts, var = var_df, aligned = aligned)
         ")
         .map_err(|e| Error::Other(format!("failed to extract assay '{name}': {e}")))?;
         let counts = parts
@@ -1611,13 +1623,18 @@ fn from_seurat_multi_assay(
         let var_df = parts
             .dollar("var")
             .map_err(|e| Error::Other(format!("failed to get var for '{name}': {e}")))?;
+        let cells_aligned = parts
+            .dollar("aligned")
+            .ok()
+            .and_then(|r| r.as_bool())
+            .unwrap_or(true);
 
         let (csr_indptr, csr_indices, values_bytes, n_obs, n_vars, value_encoding) =
             dgcmatrix_to_csr(&counts)?;
         let var_batch = dataframe_to_record_batch(&var_df)?;
         let modality_type = infer_modality_type_from_name(name);
 
-        // Cell-axis alignment check across assays.
+        // Cell-axis alignment check across assays (count-based).
         match shared_n_obs {
             None => shared_n_obs = Some(n_obs),
             Some(expected) if expected == n_obs => {}
@@ -1628,6 +1645,18 @@ fn from_seurat_multi_assay(
                      objects require identical cell axes across all assays."
                 )));
             }
+        }
+
+        // SCX-012: an equal cell COUNT is not sufficient — the cell IDENTITIES
+        // and order must also match the global obs, or counts attach to the
+        // wrong metadata rows. Fail loudly on mismatch (reorder in R first).
+        if !cells_aligned {
+            return Err(Error::Other(format!(
+                "from_seurat: assay '{name}' cell names (colnames of its counts) do not \
+                 match the global obs (meta.data) row names in order. Attaching would \
+                 misalign counts to metadata rows. Reorder the assay's cells to match \
+                 colnames(seurat_obj) / rownames(seurat_obj@meta.data) before import."
+            )));
         }
 
         payloads.push(AssayPayload {

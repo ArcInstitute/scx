@@ -413,7 +413,8 @@ pub fn from_h5mu_impl(
         scx_format_io::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let shard_target_rows = shard_size.unwrap_or(scx_format_io::DEFAULT_SHARD_TARGET_ROWS);
+    let shard_target_rows =
+        crate::resolve_shard_size(shard_size, scx_format_io::DEFAULT_SHARD_TARGET_ROWS)?;
     let memory_budget_bytes = crate::convert::parse_memory_budget(memory_budget.as_ref())?;
 
     // Translate the Python dict form into ConvertOptions::modality_types.
@@ -713,7 +714,7 @@ pub fn from_mudata_impl(
     let total_nnz: u64 = modalities.iter().map(|m| m.nnz).sum();
     let max_n_vars = modalities.iter().map(|m| m.n_vars).max().unwrap_or(0) as u64;
     let index_dtype: u8 = if max_n_vars <= 65535 { 0 } else { 1 };
-    let shard_target_rows = shard_size.unwrap_or(16384);
+    let shard_target_rows = crate::resolve_shard_size(shard_size, 16384)?;
 
     let mut header = FileHeader::new_single_modality(
         n_obs as u64,

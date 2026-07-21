@@ -2824,3 +2824,19 @@ fn csr_shard_over_u16_rows_round_trips_as_multiple_blocks() {
         .all(|(r, &c)| c == (r as i32) % n_cols as i32));
     assert!(rt_data.iter().all(|&v| v == 1.0));
 }
+
+#[test]
+fn duplicate_section_name_is_rejected() {
+    // SCX-015: writing the same logical section twice produces a file whose
+    // second section is silently unreachable (readers resolve to the first
+    // match). The writer must reject it at the single write choke-point.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dup.scx");
+    let mut writer = ScxWriter::new(&path, sample_header()).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    let err = writer.write_obs(&sample_obs()).unwrap_err();
+    assert!(
+        matches!(err, ScxError::DuplicateSection { .. }),
+        "expected DuplicateSection, got {err:?}"
+    );
+}

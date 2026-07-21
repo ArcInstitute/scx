@@ -455,6 +455,25 @@ impl ScxWriter {
         data: &[u8],
         stats: Option<ShardStats>,
     ) -> Result<()> {
+        let name = name.into();
+
+        // Central uniqueness guard (SCX-015): readers resolve a section name to
+        // the first catalog match, so a duplicate (modality_id, section_type,
+        // name) triple produces a file whose extra section is silently
+        // unreachable. Reject it at the single write choke-point. Legitimate
+        // shard families are unaffected because their names carry distinct
+        // `_shard_N` suffixes.
+        let modality_id = self.current_modality_id;
+        if self.entries.iter().any(|e| {
+            e.name == name && e.section_type == section_type && e.modality_id == modality_id
+        }) {
+            return Err(ScxError::DuplicateSection {
+                name,
+                section_type: format!("{section_type:?}"),
+                modality_id,
+            });
+        }
+
         self.write_padding()?;
 
         let offset = self.current_offset;
@@ -465,12 +484,12 @@ impl ScxWriter {
         self.current_offset += length;
 
         self.entries.push(FullCatalogEntry {
-            name: name.into(),
+            name,
             offset,
             length,
             section_type,
             checksum,
-            modality_id: self.current_modality_id,
+            modality_id,
             stats,
         });
 
@@ -2168,20 +2187,39 @@ impl ScxWriter {
             // in `scx-format/src/reader.rs::read_shard_from_entry_inner`,
             // adapted to a `File` (no mmap).
             let mut csr_shards: Vec<scx_sparse::ScxCsr> = Vec::with_capacity(csr_entries.len());
-            // First-shard codec / value_encoding govern the CSC sidecar
-            // (matches the standalone `scx build-csc` choice).
-            let mut csc_codec: Option<CodecId> = None;
-            let mut csc_value_encoding: Option<ValueEncoding> = None;
+            // The CSC sidecar encoding must cover EVERY shard, not just the
+            // first (SCX-004): a Uint8 first shard followed by a Float32 shard
+            // would truncate the float values. Scan all shards for the
+            // float/integer kind; float ⇒ Float32 + Pcodec (float-safe codec),
+            // else widen the integer width to fit the max value.
+            let mut any_float = false;
+            let mut max_int_val: u32 = 0;
+            let mut first_codec: Option<CodecId> = None;
+            // Floor the integer width on each shard's declared encoding too, so
+            // a wide integer shard that lacks stats is not under-picked as
+            // Uint8 (see build_csc.rs for the same guard).
+            let mut header_int_enc = ValueEncoding::Uint8;
+            let enc_width = |e: ValueEncoding| match e {
+                ValueEncoding::Uint8 => 1u8,
+                ValueEncoding::Uint16 => 2,
+                _ => 4,
+            };
             for entry in &csr_entries {
                 let (sh, indptr, indices, data) = self.decode_csr_entry(entry, n_vars)?;
-                if csc_codec.is_none() {
-                    csc_codec = Some(
+                let enc = ValueEncoding::from_u8(sh.value_encoding)
+                    .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
+                if matches!(enc, ValueEncoding::Float32 | ValueEncoding::Float16) {
+                    any_float = true;
+                } else if enc_width(enc) > enc_width(header_int_enc) {
+                    header_int_enc = enc;
+                }
+                if first_codec.is_none() {
+                    first_codec = Some(
                         CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?,
                     );
-                    csc_value_encoding = Some(
-                        ValueEncoding::from_u8(sh.value_encoding)
-                            .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?,
-                    );
+                }
+                if let Some(stats) = entry.stats.as_ref() {
+                    max_int_val = max_int_val.max(stats.value_max);
                 }
                 let n_shard_rows = indptr.len() - 1;
                 csr_shards.push(scx_sparse::ScxCsr::new_unchecked(
@@ -2192,8 +2230,23 @@ impl ScxWriter {
                 ));
             }
 
-            let codec = csc_codec.expect("at least one CSR entry processed");
-            let value_encoding = csc_value_encoding.expect("at least one CSR entry processed");
+            let (value_encoding, codec) = if any_float {
+                (ValueEncoding::Float32, CodecId::Pcodec)
+            } else {
+                let by_value = if max_int_val <= u8::MAX as u32 {
+                    ValueEncoding::Uint8
+                } else if max_int_val <= u16::MAX as u32 {
+                    ValueEncoding::Uint16
+                } else {
+                    ValueEncoding::Uint32
+                };
+                let enc = if enc_width(header_int_enc) > enc_width(by_value) {
+                    header_int_enc
+                } else {
+                    by_value
+                };
+                (enc, first_codec.expect("at least one CSR entry processed"))
+            };
 
             // Streaming CSR→CSC transpose. Mirrors
             // `scx-cli/src/build_csc.rs:159`.

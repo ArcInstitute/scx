@@ -9,8 +9,11 @@ use pyo3::prelude::*;
 
 /// Streaming preprocess: read source SCX → apply ops shard-by-shard → write new SCX.
 ///
-/// The output file contains the transformed X data with all metadata (obs, var,
-/// obsm, uns) copied from the source. Post-transformation data uses Float32+Zstd.
+/// The output file contains the transformed X data with obs, var, obsm, and uns
+/// copied from the source. adata.raw, layers, CSC sidecars, varm/obsp/varp,
+/// predicate indexes, detection bitmaps, and deletion vectors are NOT carried
+/// over; multimodal and raw-bearing inputs are rejected rather than silently
+/// altered. Post-transformation data uses Float32+Zstd.
 ///
 /// Parameters
 /// ----------
@@ -49,8 +52,12 @@ pub fn preprocess(
 
 /// Save transformed data as a new layer in a copied SCX file.
 ///
-/// Copies all sections from the source SCX file, then adds the
-/// transformed X data as a named layer (LayerCsrShard entries).
+/// Copies obs, var, the original X, obsm, and uns from the source SCX file,
+/// then adds the transformed X data as a named layer (LayerCsrShard entries).
+/// Pre-existing layers, adata.raw, CSC sidecars, varm/obsp/varp, predicate
+/// indexes, detection bitmaps, and deletion vectors are NOT carried over.
+/// Multimodal and raw-bearing inputs are rejected rather than silently
+/// altered.
 ///
 /// Parameters
 /// ----------

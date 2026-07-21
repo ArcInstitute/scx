@@ -148,8 +148,11 @@ impl ScxReader {
         // Read and validate file header
         let header = FileHeader::read_from(&mut Cursor::new(&mmap[..HEADER_SIZE]))?;
 
-        // Read root catalog at offset 256
-        let root_catalog = RootCatalog::read_from(&mut Cursor::new(&mmap[HEADER_SIZE..]))?;
+        // Read root catalog at offset 256. Bound the cursor to the root-catalog
+        // region so a corrupt entry count cannot read past it into section-body
+        // bytes (SCX-007).
+        let root_end = (HEADER_SIZE + crate::ROOT_CATALOG_MAX_SIZE).min(mmap.len());
+        let root_catalog = RootCatalog::read_from(&mut Cursor::new(&mmap[HEADER_SIZE..root_end]))?;
 
         // Read full catalog using header's offset and length
         let fc_offset = header.full_catalog_offset as usize;
@@ -3416,14 +3419,10 @@ impl ScxReader {
             let computed = blake3_hash(slice);
             let passed = computed == entry.checksum;
 
-            if !passed {
-                let is_essential = matches!(
-                    entry.section_type,
-                    SectionType::ObsMetadata | SectionType::VarMetadata | SectionType::CsrShard
-                );
-                if is_essential {
-                    essential_failed = true;
-                }
+            if !passed && entry.section_type.is_essential() {
+                // Covers legacy AND sharded obs/var, main X CSR, and raw
+                // CSR/var — not just the three legacy types (SCX-008).
+                essential_failed = true;
             }
 
             results.push((entry.name.clone(), passed));
@@ -3717,9 +3716,15 @@ impl ScxReader {
     }
 
     fn is_canonical_csr_section(section_type: SectionType) -> bool {
+        // RawCsrShard is stored as canonical CSR too, so deep validation must
+        // cover it — otherwise `.raw` corruption escapes the canonical pass
+        // (SCX-008).
         matches!(
             section_type,
-            SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+            SectionType::CsrShard
+                | SectionType::LayerCsrShard
+                | SectionType::ObspCsrShard
+                | SectionType::RawCsrShard
         )
     }
 
