@@ -958,14 +958,10 @@ fn sort_multimodal(
         writer.write_var_for(out_id, &reader.read_var_for(in_id)?)?;
 
         // X — in-memory gather, reordered by the global order.
-        let ve = entry_value_encoding(
-            reader,
-            reader
-                .catalog()
-                .csr_shards_for_modality(in_id)
-                .first()
-                .copied(),
-        )?;
+        // Scan ALL of this modality's shards for the widest encoding (SCX-004):
+        // sort reorders rows across shards, so a first-shard-only encoding would
+        // truncate a later float/wider-int shard.
+        let ve = widest_value_encoding(reader, &reader.catalog().csr_shards_for_modality(in_id))?;
         let csr = reader.read_all_csr_shards_for(in_id)?;
         let mut emitter = CsrEmitter::new(
             EmitTarget::X,
@@ -1020,13 +1016,12 @@ fn sort_multimodal(
 
         // Per-modality layers (obs-axis → reorder; in-memory gather).
         for layer_name in modality_layer_names(reader, in_id, &info.name) {
-            let lve = entry_value_encoding(
+            // All-shard widest encoding, same rationale as X above (SCX-004).
+            let lve = widest_value_encoding(
                 reader,
-                reader
+                &reader
                     .catalog()
-                    .layer_csr_shards_for_modality(in_id, &layer_name)
-                    .first()
-                    .copied(),
+                    .layer_csr_shards_for_modality(in_id, &layer_name),
             )?;
             let (l_indptr, l_indices, l_data) =
                 assemble_modality_layer(reader, in_id, &layer_name)?;

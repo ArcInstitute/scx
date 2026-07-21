@@ -2195,12 +2195,23 @@ impl ScxWriter {
             let mut any_float = false;
             let mut max_int_val: u32 = 0;
             let mut first_codec: Option<CodecId> = None;
+            // Floor the integer width on each shard's declared encoding too, so
+            // a wide integer shard that lacks stats is not under-picked as
+            // Uint8 (see build_csc.rs for the same guard).
+            let mut header_int_enc = ValueEncoding::Uint8;
+            let enc_width = |e: ValueEncoding| match e {
+                ValueEncoding::Uint8 => 1u8,
+                ValueEncoding::Uint16 => 2,
+                _ => 4,
+            };
             for entry in &csr_entries {
                 let (sh, indptr, indices, data) = self.decode_csr_entry(entry, n_vars)?;
                 let enc = ValueEncoding::from_u8(sh.value_encoding)
                     .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
                 if matches!(enc, ValueEncoding::Float32 | ValueEncoding::Float16) {
                     any_float = true;
+                } else if enc_width(enc) > enc_width(header_int_enc) {
+                    header_int_enc = enc;
                 }
                 if first_codec.is_none() {
                     first_codec = Some(
@@ -2222,12 +2233,17 @@ impl ScxWriter {
             let (value_encoding, codec) = if any_float {
                 (ValueEncoding::Float32, CodecId::Pcodec)
             } else {
-                let enc = if max_int_val <= u8::MAX as u32 {
+                let by_value = if max_int_val <= u8::MAX as u32 {
                     ValueEncoding::Uint8
                 } else if max_int_val <= u16::MAX as u32 {
                     ValueEncoding::Uint16
                 } else {
                     ValueEncoding::Uint32
+                };
+                let enc = if enc_width(header_int_enc) > enc_width(by_value) {
+                    header_int_enc
+                } else {
+                    by_value
                 };
                 (enc, first_codec.expect("at least one CSR entry processed"))
             };

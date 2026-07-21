@@ -104,12 +104,25 @@ pub fn run_build_csc(
     let first_sh = reader.read_shard_header(csr_entries[0])?;
     let mut any_float = false;
     let mut max_int_val: u32 = 0;
+    // Floor the integer width on each shard's declared encoding, not only on
+    // `stats.value_max`: a shard may lack stats (format-permitted), in which
+    // case `value_max` contributes nothing and a wide integer shard could be
+    // under-picked as Uint8. `header_int_enc` is the widest integer encoding
+    // any shard header declares.
+    let mut header_int_enc = ValueEncoding::Uint8;
+    let enc_width = |e: ValueEncoding| match e {
+        ValueEncoding::Uint8 => 1u8,
+        ValueEncoding::Uint16 => 2,
+        _ => 4,
+    };
     for entry in &csr_entries {
         let sh = reader.read_shard_header(entry)?;
         let enc = ValueEncoding::from_u8(sh.value_encoding)
             .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
         if matches!(enc, ValueEncoding::Float32 | ValueEncoding::Float16) {
             any_float = true;
+        } else if enc_width(enc) > enc_width(header_int_enc) {
+            header_int_enc = enc;
         }
         if let Some(stats) = entry.stats.as_ref() {
             max_int_val = max_int_val.max(stats.value_max);
@@ -120,12 +133,18 @@ pub fn run_build_csc(
         // an integer-only codec (Scx1) that cannot represent float values.
         (ValueEncoding::Float32, CodecId::Pcodec)
     } else {
-        let enc = if max_int_val <= u8::MAX as u32 {
+        let by_value = if max_int_val <= u8::MAX as u32 {
             ValueEncoding::Uint8
         } else if max_int_val <= u16::MAX as u32 {
             ValueEncoding::Uint16
         } else {
             ValueEncoding::Uint32
+        };
+        // Take the wider of the value-derived and header-declared widths.
+        let enc = if enc_width(header_int_enc) > enc_width(by_value) {
+            header_int_enc
+        } else {
+            by_value
         };
         let codec = CodecId::from_u8(first_sh.codec_id)
             .ok_or(format!("unknown codec: {}", first_sh.codec_id))?;
