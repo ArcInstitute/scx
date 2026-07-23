@@ -119,7 +119,10 @@ impl PFlog {
 /// matrix produces nonsense. It rejects `four_alpha ≤ 0` / non-finite, negative
 /// counts, and non-finite values rather than silently proceeding. Unlike v2
 /// there is **no depth** and hence no non-positive-depth rejection.
-pub fn pflog_baseline_from_raw<S: ShardSource>(source: &S, four_alpha: f64) -> Result<Vec<f64>> {
+pub fn pflog_baseline_from_raw<S: ShardSource + Sync>(
+    source: &S,
+    four_alpha: f64,
+) -> Result<Vec<f64>> {
     if four_alpha <= 0.0 || four_alpha.is_nan() || four_alpha.is_infinite() {
         return Err(AccelError::InvalidInput(format!(
             "PFlog four_alpha (= 4α) must be positive and finite, got {four_alpha}"
@@ -133,37 +136,43 @@ pub fn pflog_baseline_from_raw<S: ShardSource>(source: &S, four_alpha: f64) -> R
         ));
     }
 
+    // Per-cell baseline is indexed by the global cell id, so ordered
+    // decode-prefetch (2.1) keeps the `row_base` cursor valid.
     let mut row_sum_delta = vec![0.0f64; n_obs];
     let mut row_base = 0usize;
-    for shard_idx in 0..source.n_shards() {
-        let csr = source.read_shard(shard_idx)?;
-        let _r = scx_format_io::reduction_guard();
-        ensure_finite(&csr.data)?;
-        let rows = csr.n_rows();
-        if row_base + rows > n_obs {
-            return Err(AccelError::ShapeError(format!(
-                "PFlog: shard {shard_idx} has {rows} rows, exceeding n_obs={n_obs} \
-                 at row_base={row_base}"
-            )));
-        }
-        for r in 0..rows {
-            let cell = row_base + r;
-            let start = csr.indptr[r] as usize;
-            let end = csr.indptr[r + 1] as usize;
-            let mut acc = 0.0f64;
-            for nz in start..end {
-                let v = csr.data[nz] as f64;
-                if v < 0.0 {
-                    return Err(AccelError::InvalidInput(format!(
-                        "PFlog: negative count {v} at cell {cell}; counts must be non-negative"
-                    )));
-                }
-                acc += (four_alpha * v).ln_1p();
+    crate::prefetch::for_each_shard_ordered(
+        source,
+        crate::prefetch::prefetch_depth(),
+        |shard_idx, csr| {
+            let _r = scx_format_io::reduction_guard();
+            ensure_finite(&csr.data)?;
+            let rows = csr.n_rows();
+            if row_base + rows > n_obs {
+                return Err(AccelError::ShapeError(format!(
+                    "PFlog: shard {shard_idx} has {rows} rows, exceeding n_obs={n_obs} \
+                     at row_base={row_base}"
+                )));
             }
-            row_sum_delta[cell] += acc;
-        }
-        row_base += rows;
-    }
+            for r in 0..rows {
+                let cell = row_base + r;
+                let start = csr.indptr[r] as usize;
+                let end = csr.indptr[r + 1] as usize;
+                let mut acc = 0.0f64;
+                for nz in start..end {
+                    let v = csr.data[nz] as f64;
+                    if v < 0.0 {
+                        return Err(AccelError::InvalidInput(format!(
+                            "PFlog: negative count {v} at cell {cell}; counts must be non-negative"
+                        )));
+                    }
+                    acc += (four_alpha * v).ln_1p();
+                }
+                row_sum_delta[cell] += acc;
+            }
+            row_base += rows;
+            Ok(())
+        },
+    )?;
     if row_base != n_obs {
         return Err(AccelError::ShapeError(format!(
             "PFlog baseline pass streamed {row_base} rows but source reports n_obs={n_obs}"
@@ -183,7 +192,7 @@ pub fn pflog_baseline_from_raw<S: ShardSource>(source: &S, four_alpha: f64) -> R
 /// where the lazy source already handles column projection and deletion
 /// filtering. Use [`pflog_baseline_from_raw`] (raw counts + `four_alpha`) when
 /// you need the raw-count validation guard.
-pub fn pflog_baseline_from_delta<S: ShardSource>(delta_source: &S) -> Result<Vec<f64>> {
+pub fn pflog_baseline_from_delta<S: ShardSource + Sync>(delta_source: &S) -> Result<Vec<f64>> {
     let n_obs = delta_source.n_obs();
     let n_vars = delta_source.n_vars();
     if n_vars == 0 {
@@ -194,22 +203,26 @@ pub fn pflog_baseline_from_delta<S: ShardSource>(delta_source: &S) -> Result<Vec
     let inv_d = 1.0 / n_vars as f64;
     let mut baseline = vec![0.0f64; n_obs];
     let mut row_base = 0usize;
-    for shard_idx in 0..delta_source.n_shards() {
-        let csr = delta_source.read_shard(shard_idx)?;
-        let _r = scx_format_io::reduction_guard();
-        ensure_finite(&csr.data)?;
-        let rows = csr.n_rows();
-        if row_base + rows > n_obs {
-            return Err(AccelError::ShapeError(format!(
-                "PFlog: shard {shard_idx} has {rows} rows, exceeding n_obs={n_obs} \
-                 at row_base={row_base}"
-            )));
-        }
-        for (r, s) in csr.row_sums().into_iter().enumerate() {
-            baseline[row_base + r] = -s * inv_d;
-        }
-        row_base += rows;
-    }
+    crate::prefetch::for_each_shard_ordered(
+        delta_source,
+        crate::prefetch::prefetch_depth(),
+        |shard_idx, csr| {
+            let _r = scx_format_io::reduction_guard();
+            ensure_finite(&csr.data)?;
+            let rows = csr.n_rows();
+            if row_base + rows > n_obs {
+                return Err(AccelError::ShapeError(format!(
+                    "PFlog: shard {shard_idx} has {rows} rows, exceeding n_obs={n_obs} \
+                     at row_base={row_base}"
+                )));
+            }
+            for (r, s) in csr.row_sums().into_iter().enumerate() {
+                baseline[row_base + r] = -s * inv_d;
+            }
+            row_base += rows;
+            Ok(())
+        },
+    )?;
     if row_base != n_obs {
         return Err(AccelError::ShapeError(format!(
             "PFlog baseline pass streamed {row_base} rows but source reports n_obs={n_obs}"
@@ -283,7 +296,10 @@ pub struct AlphaEstimate {
 /// On a degenerate matrix (no surviving candidate, or a non-positive/non-finite
 /// median) this does **not** error: it logs a warning, falls back to
 /// `opts.fallback_alpha`, and sets `fell_back = true`.
-pub fn estimate_alpha<S: ShardSource>(raw: &S, opts: &AlphaOptions) -> Result<AlphaEstimate> {
+pub fn estimate_alpha<S: ShardSource + Sync>(
+    raw: &S,
+    opts: &AlphaOptions,
+) -> Result<AlphaEstimate> {
     if raw.n_vars() == 0 {
         return Err(AccelError::InvalidInput(
             "estimate_alpha requires n_vars > 0".into(),

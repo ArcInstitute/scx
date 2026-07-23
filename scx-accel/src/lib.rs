@@ -26,6 +26,7 @@ pub mod nb_glm;
 pub mod neighbors;
 pub mod pca;
 pub mod pflog;
+pub mod prefetch;
 pub mod projected_source;
 pub mod pseudobulk;
 pub mod route;

@@ -224,7 +224,7 @@ pub fn score_genes<'py>(
 /// Run the kernel on a `ShardSource`, write per-cell scores to
 /// `adata.obs[score_name]`, and stamp the CPU route metadata.
 #[allow(clippy::too_many_arguments)]
-fn score_on_source<S: ShardSource>(
+fn score_on_source<S: ShardSource + Sync>(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     source: &S,
