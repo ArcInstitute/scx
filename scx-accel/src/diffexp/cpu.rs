@@ -319,8 +319,40 @@ pub fn wilcoxon_rank_sum(
     })
 }
 
+/// Wilcoxon `(z, two_sided_p)` from a **precomputed** group rank-sum.
+///
+/// Same math as [`wilcoxon_from_ranks`] (continuity=`false`, the scanpy-parity
+/// path) but takes the group rank-sum directly instead of summing a ranks array
+/// — the seam the exact sparse-nnz Wilcoxon (§5.3) uses, since it computes the
+/// rank-sum analytically from a gene's nonzeros + implicit-zero block rather
+/// than materializing an `n_obs` ranks array. `n1` is the test-group cell count,
+/// `n_total` the full cell count, `tie_correction` the `Σ(t³−t)` term.
+pub(crate) fn wilcoxon_stats_from_rank_sum(
+    rank_sum: f64,
+    n1: usize,
+    n_total: usize,
+    tie_correction: f64,
+) -> (f64, f64) {
+    let n1f = n1 as f64;
+    let n2f = (n_total - n1) as f64;
+    let n = n_total as f64;
+    if n1f == 0.0 || n2f == 0.0 {
+        return (0.0, 1.0);
+    }
+    let u1 = rank_sum - n1f * (n1f + 1.0) / 2.0;
+    let mu = n1f * n2f / 2.0;
+    let sigma_sq = (n1f * n2f / 12.0) * ((n + 1.0) - tie_correction / (n * (n - 1.0)));
+    if sigma_sq <= 0.0 {
+        return (0.0, 1.0);
+    }
+    let sigma = sigma_sq.sqrt();
+    let z = (u1 - mu) / sigma;
+    let p = 2.0 * normal_sf(z.abs());
+    (z, p)
+}
+
 /// Compute log2 fold-change between group and reference means.
-fn compute_logfc(mean_group: f64, mean_ref: f64, log_transformed: bool) -> f64 {
+pub(crate) fn compute_logfc(mean_group: f64, mean_ref: f64, log_transformed: bool) -> f64 {
     if log_transformed {
         let expm1_group = mean_group.exp_m1();
         let expm1_ref = mean_ref.exp_m1();

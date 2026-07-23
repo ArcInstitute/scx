@@ -512,6 +512,19 @@ The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell f
 
 `pyscx.accel.pdex_ref` (perturbation-screen Mann–Whitney U + pseudobulk geometric-mean log fold change, pinned bit-for-bit to upstream [`pdex`](https://github.com/ArcInstitute/pdex)) tracks similarly: 0.59 s on pbmc3k, 5.52 s on pbmc10k, 42.04 s on tabula_sapiens_100k, 119.86 s on census_500k, 268.28 s on census_1m. The CPU path uses gene-chunked dense materialisation (default `gene_chunk_size=500`) with rayon-parallel per-gene rank tests — peak RSS is `O(n_obs × gene_chunk_size)`, not `O(n_obs × n_vars)`. CPU numbers improved 20-40% vs the prior `v0.4.3-g1-gpu-de` baseline after the `pdex-unsorted-csr` fix (commit b423a2f).
 
+**CPU DE routing (Phase-2 §5.2/§5.3).** `rank_genes_groups` and `pdex_ref` now
+default to `prefer_format="auto"`: on CPU they take the CSC-direct kernel when the
+file has a valid CSC sidecar (no active deletion vector, column-local transforms),
+else the CSR streamer; on GPU they stay CSR so the planner can route `gpu_csc_v3`.
+The route + `csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`.
+This is a compatibility change (DE previously defaulted to `"csr"`); pin
+`prefer_format="csr"` for the old behaviour. An **exact sparse-nnz Wilcoxon**
+kernel (opt-in `SCX_ACCEL_WILCOXON_NNZ=1`, 1-vs-rest) ranks only each gene's
+nonzeros plus an analytic implicit-zero tie-block — `O(nnz·log nnz)`/gene instead
+of an `O(n_obs·log n_obs)` dense sort — numerically equivalent to the dense kernel
+(property-tested to 1e-9). _Both-route (CSR vs CSC-direct) and nnz-vs-dense
+wall-clock + peak-RSS numbers: capture pending; recorded here before merge._
+
 Source: 2026-05-25 full-tier gate (post-G10 graph capture + bench env-routing fix), candidate `candidate_2623788_20260525`. Benchmark module: `benchmarks/comprehensive/benchmarks/accel_de.py` — picks the best obs column from `cell_type`/`leiden`/`louvain`/`cluster`/`perturbation`/`target` or falls back to a deterministic 50/50 synthetic split, restricts to top-4 test groups + reference, and records the chosen `groupby` in `metadata`. Each SLURM bench job is allocated 16 CPUs; `pyscx_cpu`'s `user_s/wall_s` ratio shows ~3-5 effective cores per run.
 
 ### Harmony2 batch integration + LISI

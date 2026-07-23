@@ -228,8 +228,80 @@ def test_pdex_ref_invalid_prefer_format(small_adata, tmp_path):
     import pyscx
 
     a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    # "auto" is now a valid value (Phase-2 §5.2 default); only genuinely unknown
+    # strings raise.
     with pytest.raises(ValueError, match="prefer_format"):
-        pyscx.accel.pdex_ref(a_csc, "group", reference="A", prefer_format="auto")
+        pyscx.accel.pdex_ref(a_csc, "group", reference="A", prefer_format="bogus")
+
+
+def test_pdex_ref_auto_routes_csc_when_sidecar_present(small_adata, tmp_path):
+    """`prefer_format="auto"` (the default) on a CPU file *with* a CSC sidecar
+    takes the CSC-direct route and matches the explicit CSC result."""
+    pytest.importorskip("polars")
+    import pyscx
+
+    a_auto = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+
+    df_auto = pyscx.accel.pdex_ref(
+        a_auto, "group", reference="A", geometric_mean=False, gene_chunk_size=4,
+        device="cpu",  # prefer_format defaults to "auto"
+    )
+    df_csc = pyscx.accel.pdex_ref(
+        a_csc, "group", reference="A", geometric_mean=False,
+        gene_chunk_size=4, prefer_format="csc", device="cpu",
+    )
+    assert a_auto.uns["scx_accel"]["pdex_ref"]["route"] == "cpu_csc"
+    df_auto = df_auto.sort(["target", "feature"])
+    df_csc = df_csc.sort(["target", "feature"])
+    for col in ("target_mean", "ref_mean", "log2_fold_change", "p_value", "statistic", "fdr"):
+        np.testing.assert_allclose(
+            df_auto[col].to_numpy(), df_csc[col].to_numpy(), atol=1e-9, rtol=1e-6, err_msg=col,
+        )
+
+
+def test_pdex_ref_auto_falls_back_to_csr_without_sidecar(small_adata, tmp_path):
+    """`prefer_format="auto"` on a CSR-only file falls back to the CSR streamer
+    (no error) and records `cpu_csr` + `csc_available=False`."""
+    pytest.importorskip("polars")
+    import pyscx
+
+    a_auto = _open_csr_only(tmp_path / "csr_only.scx", small_adata)
+    a_csr = _open_csr_only(tmp_path / "csr_only.scx", small_adata)
+
+    df_auto = pyscx.accel.pdex_ref(
+        a_auto, "group", reference="A", geometric_mean=False, gene_chunk_size=4, device="cpu",
+    )
+    df_csr = pyscx.accel.pdex_ref(
+        a_csr, "group", reference="A", geometric_mean=False,
+        gene_chunk_size=4, prefer_format="csr", device="cpu",
+    )
+    info = a_auto.uns["scx_accel"]["pdex_ref"]
+    assert info["route"] == "cpu_csr"
+    assert info["csc_available"] is False
+    df_auto = df_auto.sort(["target", "feature"])
+    df_csr = df_csr.sort(["target", "feature"])
+    for col in ("target_mean", "ref_mean", "log2_fold_change", "p_value", "statistic", "fdr"):
+        np.testing.assert_allclose(
+            df_auto[col].to_numpy(), df_csr[col].to_numpy(), atol=1e-9, rtol=1e-6, err_msg=col,
+        )
+
+
+def test_rank_genes_groups_auto_routes_csc_when_sidecar_present(small_adata, tmp_path):
+    """Default `prefer_format="auto"` routes CSC-direct on a sidecar file and
+    matches the explicit CSC gene ordering."""
+    import pyscx
+
+    a_auto = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+
+    pyscx.accel.rank_genes_groups(a_auto, "group", device="cpu")  # auto default
+    pyscx.accel.rank_genes_groups(a_csc, "group", prefer_format="csc", device="cpu")
+
+    assert a_auto.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csc"
+    auto_names = np.asarray(a_auto.uns["rank_genes_groups"]["names"]).tolist()[0]
+    csc_names = np.asarray(a_csc.uns["rank_genes_groups"]["names"]).tolist()[0]
+    assert auto_names == csc_names
 
 
 def test_pdex_ref_csc_with_device_auto_falls_back_to_cpu(small_adata, tmp_path):

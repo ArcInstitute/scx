@@ -197,6 +197,49 @@ fn select_de_matrix<'py>(
     }
 }
 
+/// Runtime CSC-sidecar availability probe for the `prefer_format="auto"` policy.
+///
+/// Mirrors the single capability-detection point (`as_column_source`): a valid
+/// CSC route needs a sidecar present, no active row-deletion vector, and — for a
+/// lazy source — only column-local transforms. Never errors: a `false` result
+/// just routes `auto` to the CSR streamer. A materialized matrix (numpy/scipy,
+/// e.g. `use_raw`/`layer`) is not a backed/lazy SCX dataset → `false`.
+fn csc_route_available(x: &Bound<'_, PyAny>) -> bool {
+    if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        return backed.as_column_source().is_some();
+    }
+    if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
+        return lazy.as_column_source().is_some();
+    }
+    false
+}
+
+/// Resolve `prefer_format` to a concrete `"csr"` / `"csc"` route.
+///
+/// `"auto"` (the default since Phase-2 §5.2) picks the CSC-direct CPU route when
+/// a valid CSC sidecar is available and the op runs on CPU; on GPU it stays
+/// `"csr"` so the planner routes `gpu_csc_v3` from the CSR path when a sidecar
+/// is present. Explicit `"csr"` / `"csc"` pass through unchanged.
+fn resolve_de_format(
+    prefer_format: &str,
+    gpu_device_id: Option<usize>,
+    x: &Bound<'_, PyAny>,
+) -> &'static str {
+    match prefer_format {
+        "auto" => {
+            if gpu_device_id.is_some() {
+                "csr"
+            } else if csc_route_available(x) {
+                "csc"
+            } else {
+                "csr"
+            }
+        }
+        "csc" => "csc",
+        _ => "csr",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_rank_genes_groups_inner(
     py: Python<'_>,
@@ -273,6 +316,11 @@ fn run_rank_genes_groups_inner(
     // (adata.X by default; adata.raw.X with raw var names for use_raw; a named
     // layer otherwise). The selected matrix flows through the same dispatch.
     let (x, gene_names) = select_de_matrix(adata, use_raw, layer)?;
+
+    // Resolve the `"auto"` policy (§5.2) against the *selected* matrix: CSC-direct
+    // on CPU when a valid sidecar is present, else CSR; CSR on GPU (the planner
+    // routes gpu_csc_v3 from there). Explicit "csr"/"csc" pass through.
+    let prefer_format = resolve_de_format(prefer_format, gpu_device_id, &x);
 
     // Auto-detect whether data has been log-transformed (sc.pp.log1p sets
     // adata.uns["log1p"]). When true, logFC uses expm1 back-transform to
@@ -724,7 +772,7 @@ fn de_result_to_dataframe<'py>(
 /// ``is_log1p`` override) when analyzing a matrix whose transform state differs
 /// from ``X``.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="csr", device="auto", use_raw=None, layer=None))]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="auto", device="auto", use_raw=None, layer=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups(
     py: Python<'_>,
@@ -748,9 +796,9 @@ pub fn rank_genes_groups(
             "unsupported method '{method}': only 'wilcoxon' is currently supported"
         )));
     }
-    if !matches!(prefer_format, "csr" | "csc") {
+    if !matches!(prefer_format, "csr" | "csc" | "auto") {
         return Err(PyValueError::new_err(format!(
-            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
+            "Invalid prefer_format={prefer_format:?}; expected 'auto', 'csr', or 'csc'"
         )));
     }
     // Resolve scanpy's use_raw/layer contract once (mutual-exclusion + default).
@@ -1582,6 +1630,10 @@ fn run_pdex_ref_inner(
     // Select the input matrix + gene names per the use_raw/layer contract.
     let (x, gene_names) = select_de_matrix(adata, use_raw, layer)?;
 
+    // Resolve the `"auto"` policy (§5.2): CSC-direct on CPU when a valid sidecar
+    // is present, else CSR; CSR on GPU (planner routes gpu_csc_v3 from there).
+    let prefer_format = resolve_de_format(prefer_format, gpu_device_id, &x);
+
     let resolved_log1p = match is_log1p {
         Some(v) => v,
         None => detect_is_log1p(py, adata)?,
@@ -2104,7 +2156,7 @@ fn pdex_ref_result_to_dataframe<'py>(
 /// fall back to ``"gpu_csr_v3"`` with ``fallback_reason == "no_csc_sidecar"``. Check
 /// ``route`` when comparing performance.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="csr", device="auto", output="polars", use_raw=None, layer=None))]
+#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="auto", device="auto", output="polars", use_raw=None, layer=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref(
     py: Python<'_>,
@@ -2147,9 +2199,9 @@ pub fn pdex_ref(
             )?;
         }
     }
-    if !matches!(prefer_format, "csr" | "csc") {
+    if !matches!(prefer_format, "csr" | "csc" | "auto") {
         return Err(PyValueError::new_err(format!(
-            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
+            "Invalid prefer_format={prefer_format:?}; expected 'auto', 'csr', or 'csc'"
         )));
     }
     if !matches!(output, "polars" | "pandas") {

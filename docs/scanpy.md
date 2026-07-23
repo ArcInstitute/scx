@@ -1412,11 +1412,11 @@ kernel yet — it needs exact-rank parity that f32 gemm can't guarantee, and is
 already fast on the small `[P×G]` effect matrix; `device` is accepted for
 symmetry but always runs CPU.
 
-### `prefer_format="csr"|"csc"`: explicit column-major dispatch
+### `prefer_format="auto"|"csr"|"csc"`: column-major dispatch
 
 A subset of accelerators take a `prefer_format` kwarg that selects
-between the row-major CSR path (default) and the column-major CSC
-sidecar path. Entries that accept it:
+between the row-major CSR path and the column-major CSC sidecar path.
+Entries that accept it:
 
 | Function | CSC win |
 |----------|---------|
@@ -1427,11 +1427,20 @@ sidecar path. Entries that accept it:
 | `pyscx.accel.col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | Per-column aggregations on `ScxBackedSparseDataset` / `ScxLazyTransformedDataset`. |
 | `pyscx.accel.pca` | **Rejects `prefer_format="csc"`** with `ValueError`. Covariance build and randomized SpMM are row-major; CSC offers no measurable speed-up. |
 
-**Default is `"csr"` everywhere.** No `"auto"` — the runtime can't
-guess whether CSC dispatch is safe (depends on the file having a
-sidecar AND the user's transform chain being column-local). No
-thread-local default. No env-var override. Each call sets the
-choice locally.
+**DE (`rank_genes_groups`, `pdex_ref`) defaults to `"auto"`; every
+other `prefer_format`-taking function defaults to `"csr"`.**
+`"auto"` (a **compatibility change** in the CPU-accelerator Phase-2
+work — DE previously defaulted to `"csr"`) resolves at call time
+against the *selected* matrix: on CPU it takes the CSC-direct route
+when a valid sidecar is available (sidecar present ∧ no active row
+deletion vector ∧ column-local transform chain — the same capability
+gate `"csc"` enforces) and CSR otherwise; on GPU it stays CSR so the
+planner routes `gpu_csc_v3` when a sidecar is present. The route and
+`csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`
+(`cpu_csc` vs `cpu_csr`). Pass `prefer_format="csr"` explicitly to pin
+the pre-change behaviour. The non-DE functions keep `"csr"` — the
+runtime does not yet auto-route them. No thread-local default; no
+env-var override; each call sets the choice locally.
 
 `prefer_format="csc"` requires *all* of the following; otherwise it
 raises `RuntimeError` with a message naming the missing capability:
@@ -1448,7 +1457,9 @@ raises `RuntimeError` with a message naming the missing capability:
    dataset has `kept_to_global` set; CSC dispatch then raises until
    you `materialize()` or rebuild the file.
 
-Invalid values (e.g. `"auto"`, `"CSC"`) raise `ValueError`.
+Unknown values (e.g. `"CSC"`, `"bogus"`) raise `ValueError`. `"auto"`
+is accepted by `rank_genes_groups` / `pdex_ref` (and is their default);
+the other `prefer_format`-taking functions accept only `"csr"` / `"csc"`.
 
 ```python
 import pyscx
