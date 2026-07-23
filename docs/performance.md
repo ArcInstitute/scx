@@ -457,9 +457,27 @@ prefetch, within noise; the file has 1 CSR shard). The overlap only pays off whe
 there are many shards to decode ahead — the atlas tier (`tabula_sapiens_100k` ~6 shards,
 `census_500k`/`census_1m` tens of shards).
 
-_Full-tier before/after (prefetch off = `SCX_ACCEL_PREFETCH_DEPTH=1` vs default) with
-wall-clock and peak RSS: capture submitted on `cpu_preemptible`; table lands here before
-the PR merges (no `×` claim is recorded until measured)._
+**Measured before/after** (same host + `.so`; prefetch off = `SCX_ACCEL_PREFETCH_DEPTH=1`
+vs default depth 4), backed-streaming wall-clock (median of runs):
+
+| Dataset | Op | wall off (ms) | wall on (ms) | Speedup |
+|---|---|--:|--:|--:|
+| tabula_sapiens_100k | hvg | 4930.8 | 2179.4 | **2.26×** |
+| census_500k | hvg | 16714.1 | 7255.7 | **2.30×** |
+| census_1m | hvg | 29150.5 | 12735.3 | **2.29×** |
+| tabula_sapiens_100k | normalize | 5013.6 | 4610.6 | 1.09× |
+| census_500k / 1m | normalize | 20477 / 38584 | 20817 / 38423 | ~1.0× |
+| tabula/500k/1m | pca | 8364 / 31368 / 138220 | 8222 / 31613 / 135041 | ~1.0× |
+
+**HVG — the fully-prefetched kernel — is ~2.3× faster at every multi-shard scale**, the
+first measured Phase-2 win. In the profiler the `decode` bucket now *exceeds* wall
+(Σ/wall 220–275 %) because it sums each worker's decode time and those run concurrently;
+the wall drop is the real gain. `normalize_total` (a pyscx lazy-transform path, not one of
+the wired `scx-accel` streaming kernels) and `pca` (streaming decode-prefetch deferred —
+see above) are flat by construction, confirming the change is scoped to the kernels it
+touched and introduces no regression elsewhere. Peak-RSS held flat (bounded to `depth`
+decoded shards). Source: `pf21_cap` capture on `cpu_preemptible`,
+`benchmarks/scripts/profile_cpu_stages_backed.py` before/after.
 
 **Deferred to a measured Phase-2 follow-up:** PCA streaming decode-prefetch (its
 covariance/transpose passes already own inner rayon parallelism — wrapping them adds a
