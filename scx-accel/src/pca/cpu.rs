@@ -139,7 +139,18 @@ fn sparse_outer_product_accumulate(csr: &ScxCsr, col_sums: &mut [f64], cov: &mut
 /// reduced by element-wise addition.
 fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>, Vec<f64>) {
     let n_rows = csr.n_rows();
-    let chunk_size = (n_rows / rayon::current_num_threads()).max(256);
+    // Bound peak memory: each parallel fold segment allocates a full
+    // n_vars×n_vars f64 accumulator (n_vars²·8 bytes). rayon `fold` produces one
+    // accumulator per segment, and `with_min_len(L)` caps segments at n_rows/L,
+    // so sizing the segment length by the budget-derived worker count limits the
+    // number of concurrent accumulators — the same guarantee the streaming
+    // covariance path gets from `cov_accumulator_workers` (previously this
+    // in-memory path used the full thread count, so peak scaled with cores).
+    let max_threads = rayon::current_num_threads().max(1);
+    // `.max(1)` is defensive: cov_accumulator_workers already floors at 1, but
+    // guard the `n_rows / workers` divisor against any future 0-return.
+    let workers = cov_accumulator_workers(n_vars, cov_memory_budget(), max_threads).max(1);
+    let chunk_size = (n_rows / workers).max(256);
 
     (0..n_rows)
         .into_par_iter()

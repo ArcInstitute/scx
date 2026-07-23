@@ -26,7 +26,8 @@ a fixed penalty for every batch level.}
 \item{max_iter}{Maximum Harmony iterations. Default \code{10L}.}
 
 \item{max_iter_kmeans}{Maximum k-means sub-iterations per Harmony
-iteration. Default \code{4L}.}
+iteration. Default \code{6L} (must be >= 2*window_size for the convergence
+check to fire).}
 
 \item{epsilon_harmony}{Harmony convergence tolerance (signed relative
 change). Default \code{1e-2}.}

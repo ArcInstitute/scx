@@ -67,7 +67,15 @@ impl Default for HarmonyConfig {
             lambda: None,
             alpha: 0.2,
             max_iter: 10,
-            max_iter_kmeans: 4,
+            // INVARIANT: max_iter_kmeans >= 2 * window_size, otherwise
+            // `check_convergence_kmeans` (which needs 2*window objectives) can
+            // never fire and the k-means sub-loop always burns the full cap
+            // (the pre-1.4 `4 < 2*3` convergence deadlock). At 6 the check
+            // becomes reachable and k-means gets two extra refinement
+            // sub-iterations (closer to the R reference). Raising this further
+            // above 2*window_size would additionally enable early-exit before
+            // the cap.
+            max_iter_kmeans: 6,
             epsilon_harmony: 1e-2,
             epsilon_kmeans: 1e-3,
             window_size: 3,
@@ -687,7 +695,15 @@ fn compute_o_e(
 
 // ─── K-means++ seeding (Harmony variant) ─────────────────────────────
 
-/// Gumbel-max weighted sampling from the most recently chosen centroid.
+/// D²-weighted k-means++ seeding (Harmony variant). Each candidate is scored by
+/// its **minimum distance to ALL previously chosen centroids** — standard
+/// k-means++ — not the distance to the last centroid only (the pre-1.4 bug,
+/// which biased seeds and diverged from k-means++). Candidates are then sampled
+/// proportionally to that distance via the exponential-race (Gumbel-min) trick.
+///
+/// The distance is `2·(1 − cosθ)`, which for unit vectors equals the squared
+/// chord distance `‖a−b‖²`, so weighting by it is genuinely D²-proportional.
+///
 /// Returns a (d x K) column-major matrix of centroids (already L2-normalized
 /// — equal to the normalized embedding column at each chosen cell index).
 ///
@@ -709,9 +725,6 @@ fn kmeans_plus_plus(z: &[f64], d: usize, n: usize, k: usize, rng: &mut ChaCha8Rn
     }
 
     for ci in 1..k {
-        // Compute cosine distance from the most recently chosen centroid.
-        let last = &y[(ci - 1) * d..ci * d];
-
         // Try up to a few resamples on duplicate collisions.
         let mut picked = usize::MAX;
         'outer: for _attempt in 0..10 {
@@ -723,16 +736,26 @@ fn kmeans_plus_plus(z: &[f64], d: usize, n: usize, k: usize, rng: &mut ChaCha8Rn
                     continue;
                 }
                 let z_col = &z[j * d..(j + 1) * d];
-                let mut dot = 0f64;
-                for t in 0..d {
-                    dot += last[t] * z_col[t];
+                // D² k-means++: minimum squared chord distance to ALL chosen
+                // centroids (y[0..ci]), not just the last one. `2(1 - cosθ)` is
+                // already the squared distance for unit vectors.
+                let mut min_dist = f64::INFINITY;
+                for cc in 0..ci {
+                    let cent = &y[cc * d..(cc + 1) * d];
+                    let mut dot = 0f64;
+                    for t in 0..d {
+                        dot += cent[t] * z_col[t];
+                    }
+                    let dist_c = (2.0 * (1.0 - dot * inv)).abs();
+                    if dist_c < min_dist {
+                        min_dist = dist_c;
+                    }
                 }
-                let dist = (2.0 * (1.0 - dot * inv)).abs();
-                if dist == 0.0 {
+                if min_dist == 0.0 {
                     continue;
                 }
                 let u: f64 = rng.gen::<f64>().max(f64::MIN_POSITIVE);
-                let v = -u.ln() / dist;
+                let v = -u.ln() / min_dist;
                 if v < best_val {
                     best_val = v;
                     best_j = j;

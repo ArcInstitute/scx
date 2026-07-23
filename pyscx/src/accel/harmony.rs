@@ -16,15 +16,21 @@ use super::gpu::resolve_device;
 
 /// Run Harmony2 batch integration on PCA embeddings stored in AnnData.
 ///
-/// Scanpy-shaped signature (same role as `scanpy.external.pp.harmony_integrate()`)
-/// but a distinct implementation: a clean-room **Harmony2 / R-harmony**
-/// integrator validated against cached R fixtures — NOT the harmonypy algorithm
-/// scanpy wraps, and defaults differ (see `harmony/cpu.rs`). Corrects batch
-/// effects in `adata.obsm[basis]` via iterative soft clustering + ridge
-/// regression and writes the corrected embeddings to `adjusted_basis` (a new
-/// obsm key), preserving the input `basis`. (Contract resolution — a `mode=`
-/// pin or documented divergence — is tracked separately; this only drops the
-/// inaccurate "mirrors harmonypy" claim.)
+/// **Compatibility tier 2 — scanpy-shaped, documented divergence.** Same role
+/// and signature as `scanpy.external.pp.harmony_integrate()`, but a distinct
+/// clean-room **Harmony2 / R-harmony** integrator — NOT the harmonypy algorithm
+/// scanpy wraps. The pinned reference is **R-harmony**, validated against cached
+/// R fixtures (per-PC Pearson r; see `pyscx/tests/test_harmony_validation.py`);
+/// there is no harmonypy-parity mode. Corrects batch effects in
+/// `adata.obsm[basis]` via iterative soft clustering + ridge regression and
+/// writes the corrected embeddings to `adjusted_basis` (a new obsm key),
+/// preserving the input `basis`.
+///
+/// Defaults intentionally differ from harmonypy (documented divergence):
+/// `epsilon_harmony=1e-2` (harmonypy `1e-4`), `lamb=None` → dynamic estimation
+/// (harmonypy `lamb=1`), `theta=2.0` per covariate, `sigma=0.1`,
+/// `max_iter_kmeans=6`. Do not treat harmonypy differences as bugs — the
+/// R-harmony fixture is the acceptance oracle.
 ///
 /// Args:
 ///     adata: AnnData with PCA embeddings at `adata.obsm[basis]`.
@@ -41,7 +47,8 @@ use super::gpu::resolve_device;
 ///     lamb: Ridge penalty. None = dynamic estimation (default).
 ///     alpha: Dynamic lambda scale factor (default 0.2).
 ///     max_iter: Maximum Harmony iterations (default 10).
-///     max_iter_kmeans: Maximum k-means sub-iterations (default 4).
+///     max_iter_kmeans: Maximum k-means sub-iterations (default 6; must be
+///         >= 2*window_size so the k-means convergence check can fire).
 ///     epsilon_harmony: Harmony convergence tolerance (default 1e-2).
 ///     epsilon_kmeans: K-means convergence tolerance (default 1e-3).
 ///     block_size: Stochastic block size as fraction of N (default 0.05).
@@ -67,7 +74,7 @@ use super::gpu::resolve_device;
     lamb = None,
     alpha = 0.2,
     max_iter = 10,
-    max_iter_kmeans = 4,
+    max_iter_kmeans = 6,
     epsilon_harmony = 1e-2,
     epsilon_kmeans = 1e-3,
     block_size = 0.05,

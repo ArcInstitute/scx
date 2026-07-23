@@ -137,6 +137,67 @@ pub(super) fn extract_strata<'py>(
 ///
 /// Returns the DiffExpResult from scx_accel.
 #[allow(clippy::too_many_arguments)]
+/// Resolve scanpy's `use_raw` / `layer` selection contract.
+///
+/// `use_raw=None` (the scanpy default) resolves to `True` iff `adata.raw` is
+/// present and no `layer` was requested; otherwise `False`. `use_raw=True` with
+/// a `layer` is rejected (mutually exclusive, matching scanpy). Returns the
+/// resolved boolean.
+fn resolve_use_raw(
+    adata: &Bound<'_, PyAny>,
+    use_raw: Option<bool>,
+    layer: Option<&str>,
+) -> PyResult<bool> {
+    if layer.is_some() && matches!(use_raw, Some(true)) {
+        return Err(PyValueError::new_err(
+            "Cannot specify both use_raw=True and layer=...; they are mutually exclusive.",
+        ));
+    }
+    let has_raw = !adata.getattr("raw")?.is_none();
+    Ok(match use_raw {
+        Some(v) => v,
+        None => has_raw && layer.is_none(),
+    })
+}
+
+/// Select the DE input matrix and its gene names per the resolved `use_raw` /
+/// `layer` contract. `use_raw` → `adata.raw.X` with `adata.raw.var.index`;
+/// `layer` → `adata.layers[layer]` with `adata.var.index`; otherwise `adata.X`
+/// with `adata.var.index`. The returned matrix flows through the same
+/// backed/lazy/scipy/dense dispatch as before — only the source object changes.
+fn select_de_matrix<'py>(
+    adata: &Bound<'py, PyAny>,
+    use_raw: bool,
+    layer: Option<&str>,
+) -> PyResult<(Bound<'py, PyAny>, Vec<String>)> {
+    let var_names_of = |frame: &Bound<'py, PyAny>| -> PyResult<Vec<String>> {
+        frame
+            .getattr("index")?
+            .call_method0("tolist")?
+            .extract::<Vec<String>>()
+    };
+    if use_raw {
+        let raw = adata.getattr("raw")?;
+        if raw.is_none() {
+            return Err(PyValueError::new_err("use_raw=True but adata.raw is None."));
+        }
+        let x = raw.getattr("X")?;
+        let gene_names = var_names_of(&raw.getattr("var")?)?;
+        Ok((x, gene_names))
+    } else if let Some(name) = layer {
+        let x = adata.getattr("layers")?.get_item(name).map_err(|_| {
+            PyValueError::new_err(format!("layer '{name}' not found in adata.layers"))
+        })?;
+        let gene_names = var_names_of(&adata.getattr("var")?)?;
+        Ok((x, gene_names))
+    } else {
+        let x = adata.getattr("X")?;
+        let gene_names = var_names_of(&adata.getattr("var")?)?;
+        Ok((x, gene_names))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_rank_genes_groups_inner(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -148,6 +209,8 @@ fn run_rank_genes_groups_inner(
     prefer_format: &str,
     device: &str,
     gpu_device_id: Option<usize>,
+    use_raw: bool,
+    layer: Option<&str>,
 ) -> PyResult<(scx_accel::DiffExpResult, Vec<String>)> {
     let numpy = py.import("numpy")?;
     let scipy_sparse = py.import("scipy.sparse")?;
@@ -206,10 +269,10 @@ fn run_rank_genes_groups_inner(
         })?)
     };
 
-    // Get gene names.
-    let var = adata.getattr("var")?;
-    let var_names = var.getattr("index")?;
-    let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
+    // Select the input matrix + gene names per the use_raw/layer contract
+    // (adata.X by default; adata.raw.X with raw var names for use_raw; a named
+    // layer otherwise). The selected matrix flows through the same dispatch.
+    let (x, gene_names) = select_de_matrix(adata, use_raw, layer)?;
 
     // Auto-detect whether data has been log-transformed (sc.pp.log1p sets
     // adata.uns["log1p"]). When true, logFC uses expm1 back-transform to
@@ -219,10 +282,6 @@ fn run_rank_genes_groups_inner(
         .call_method1("get", ("log1p",))
         .map(|v| !v.is_none())
         .unwrap_or(false);
-
-    // Check if X is a ScxBackedSparseDataset / ScxLazyTransformedDataset
-    // for streaming path. CSC dispatch routes through `as_column_source()`.
-    let x = adata.getattr("X")?;
 
     if prefer_format == "csc" {
         if gpu_device_id.is_some() {
@@ -649,8 +708,23 @@ fn de_result_to_dataframe<'py>(
 /// when the input layout matches the op. Returns ``None`` (results live on
 /// ``adata.uns``); the stratified path (``stratify_by``) instead returns a
 /// concatenated pandas DataFrame and does not write route metadata.
+///
+/// ``use_raw`` / ``layer`` select the analyzed matrix (scanpy semantics):
+/// ``use_raw`` analyzes ``adata.raw.X`` (with ``adata.raw.var`` names),
+/// ``layer`` analyzes ``adata.layers[layer]``, and they are mutually exclusive.
+/// ``use_raw=None`` (default) resolves to ``True`` iff ``adata.raw`` exists and
+/// ``layer`` is None, else ``False``. The resolved ``use_raw`` and ``layer`` are
+/// written to ``adata.uns["rank_genes_groups"]["params"]``.
+///
+/// NOTE: the log-fold-change back-transform uses the ``adata.uns["log1p"]``
+/// flag, which describes ``X``. For the conventional case (``.raw`` /
+/// ``layer`` hold log-normalized data, like ``X``) this is correct; if ``.raw``
+/// holds raw counts while ``X`` is log1p-transformed, the logFC is computed as
+/// if the counts were log-space. Prefer ``pdex_ref`` (which exposes an explicit
+/// ``is_log1p`` override) when analyzing a matrix whose transform state differs
+/// from ``X``.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="csr", device="auto"))]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="csr", device="auto", use_raw=None, layer=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups(
     py: Python<'_>,
@@ -666,6 +740,8 @@ pub fn rank_genes_groups(
     tie_correct: bool,
     prefer_format: &str,
     device: &str,
+    use_raw: Option<bool>,
+    layer: Option<&str>,
 ) -> PyResult<Py<PyAny>> {
     if method != "wilcoxon" {
         return Err(PyRuntimeError::new_err(format!(
@@ -677,6 +753,8 @@ pub fn rank_genes_groups(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
         )));
     }
+    // Resolve scanpy's use_raw/layer contract once (mutual-exclusion + default).
+    let resolved_use_raw = resolve_use_raw(adata, use_raw, layer)?;
     let resolved = super::gpu::resolve_device(device)?;
     #[cfg(feature = "gpu")]
     let gpu_device_id = resolved.gpu_id();
@@ -746,6 +824,8 @@ pub fn rank_genes_groups(
                 prefer_format,
                 device,
                 gpu_device_id,
+                resolved_use_raw,
+                layer,
             ) {
                 Ok((result, _unique)) => {
                     let df = de_result_to_dataframe(py, &result, n_genes)?;
@@ -795,10 +875,21 @@ pub fn rank_genes_groups(
         prefer_format,
         device,
         gpu_device_id,
+        resolved_use_raw,
+        layer,
     )?;
 
     // Write results to adata.uns["rank_genes_groups"] in scanpy format.
-    write_de_to_adata(py, adata, &result, groupby, reference, n_genes)?;
+    write_de_to_adata(
+        py,
+        adata,
+        &result,
+        groupby,
+        reference,
+        n_genes,
+        resolved_use_raw,
+        layer,
+    )?;
 
     // Record the accelerator execution route: both inside the scanpy-style
     // rank_genes_groups dict (as `scx_accel_route`) and under the unified
@@ -826,6 +917,7 @@ pub fn rank_genes_groups(
 /// Scanpy stores results as numpy structured arrays (rec.arrays) with one
 /// field per group. Each field contains gene names/scores/p-values sorted
 /// by the test statistic.
+#[allow(clippy::too_many_arguments)]
 fn write_de_to_adata(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -833,6 +925,8 @@ fn write_de_to_adata(
     groupby: &str,
     reference: &str,
     n_genes: Option<usize>,
+    use_raw: bool,
+    layer: Option<&str>,
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
     // The builder closures below iterate `result.group_names` (length n_groups)
@@ -877,7 +971,8 @@ fn write_de_to_adata(
     params.set_item("groupby", groupby)?;
     params.set_item("reference", reference)?;
     params.set_item("method", "wilcoxon")?;
-    params.set_item("use_raw", false)?;
+    params.set_item("use_raw", use_raw)?;
+    params.set_item("layer", layer)?;
 
     // Helper to build structured array (like scanpy's recarray format).
     // Scanpy stores e.g. names as a structured array with dtype like:
@@ -1342,6 +1437,8 @@ pub fn rank_genes_groups_df(
         "csr",
         device,
         gpu_device_id,
+        false, // use_raw: this cell-eval bridge is X-only
+        None,  // layer
     )?;
 
     // Record the accelerator execution route on adata.uns; the returned
@@ -1474,23 +1571,22 @@ fn run_pdex_ref_inner(
     prefer_format: &str,
     device: &str,
     gpu_device_id: Option<usize>,
+    use_raw: bool,
+    layer: Option<&str>,
 ) -> PyResult<scx_accel::PdexRefResult> {
     let numpy = py.import("numpy")?;
     let scipy_sparse = py.import("scipy.sparse")?;
 
     let (groups, unique_groups, ref_idx) = resolve_groups_and_reference(adata, groupby, reference)?;
 
-    let var = adata.getattr("var")?;
-    let var_names = var.getattr("index")?;
-    let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
+    // Select the input matrix + gene names per the use_raw/layer contract.
+    let (x, gene_names) = select_de_matrix(adata, use_raw, layer)?;
 
     let resolved_log1p = match is_log1p {
         Some(v) => v,
         None => detect_is_log1p(py, adata)?,
     };
     let mode = scx_accel::GeomMeanMode::from_flags(geometric_mean, resolved_log1p);
-
-    let x = adata.getattr("X")?;
 
     if prefer_format == "csc" {
         if gpu_device_id.is_some() {
@@ -1993,6 +2089,12 @@ fn pdex_ref_result_to_dataframe<'py>(
 ///     output: Return type — `"polars"` (default) or `"pandas"`. Columns are
 ///         identical either way; `"pandas"` builds a pandas DataFrame directly and
 ///         does not require polars. (A polars result also supports `.to_pandas()`.)
+///     use_raw: Analyze `adata.raw.X` (with `adata.raw.var` names) instead of
+///         `adata.X`. `None` (default) → `True` iff `adata.raw` is present and
+///         `layer` is None (scanpy semantics), else `False`. Mutually exclusive
+///         with `layer`. Recorded on `adata.uns["scx_accel"]["pdex_ref"]`.
+///     layer: Analyze `adata.layers[layer]` instead of `adata.X`. Mutually
+///         exclusive with `use_raw=True`.
 ///
 /// The accelerator execution route is recorded on
 /// ``adata.uns["scx_accel"]["pdex_ref"]`` (keys: ``route``,
@@ -2002,7 +2104,7 @@ fn pdex_ref_result_to_dataframe<'py>(
 /// fall back to ``"gpu_csr_v3"`` with ``fallback_reason == "no_csc_sidecar"``. Check
 /// ``route`` when comparing performance.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="csr", device="auto", output="polars"))]
+#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="csr", device="auto", output="polars", use_raw=None, layer=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref(
     py: Python<'_>,
@@ -2017,6 +2119,8 @@ pub fn pdex_ref(
     prefer_format: &str,
     device: &str,
     output: &str,
+    use_raw: Option<bool>,
+    layer: Option<&str>,
 ) -> PyResult<Py<PyAny>> {
     if epsilon < 0.0 || !epsilon.is_finite() {
         return Err(PyValueError::new_err(format!(
@@ -2053,6 +2157,8 @@ pub fn pdex_ref(
             "Invalid output={output:?}; expected 'polars' or 'pandas'"
         )));
     }
+    // Resolve scanpy's use_raw/layer contract once (mutual-exclusion + default).
+    let resolved_use_raw = resolve_use_raw(adata, use_raw, layer)?;
     let resolved = super::gpu::resolve_device(device)?;
     #[cfg(feature = "gpu")]
     let gpu_device_id = resolved.gpu_id();
@@ -2107,6 +2213,8 @@ pub fn pdex_ref(
         prefer_format,
         device,
         gpu_device_id,
+        resolved_use_raw,
+        layer,
     )?;
     // Record the accelerator execution route on adata.uns["scx_accel"]["pdex_ref"].
     // `result.exec_info` is already complete (route + reason) from the single
@@ -2114,6 +2222,17 @@ pub fn pdex_ref(
     super::route::announce_route(py, "pdex_ref", device, &result.exec_info);
     super::route::warn_materialized_csc_sidecar(py, "pdex_ref", device, adata, &result.exec_info);
     super::route::write_accel_route(py, adata, "pdex_ref", &result.exec_info)?;
+    // Record the resolved data-selection contract alongside the route so callers
+    // can see which matrix was analyzed (X / raw.X / a layer).
+    // Defensive: `get_item` with `?` would raise KeyError if either key is
+    // absent. `write_accel_route` just created both, but check both with
+    // `if let Ok(...)` so a missing route entry never crashes the op.
+    if let Ok(scx_accel) = adata.getattr("uns")?.get_item("scx_accel") {
+        if let Ok(entry) = scx_accel.get_item("pdex_ref") {
+            entry.set_item("use_raw", resolved_use_raw)?;
+            entry.set_item("layer", layer)?;
+        }
+    }
     let df = pdex_ref_result_to_dataframe(py, &result, output)?;
     Ok(df.unbind())
 }

@@ -1,8 +1,16 @@
 //! Leiden community detection algorithm for network community detection.
 //!
-//! Provides a Rust-native implementation of the Leiden algorithm
-//! (Traag, Waltman & van Eck, 2019) with the Reichardt-Bornholdt (RB) configuration
-//! model quality function and conflict-free parallel batching via rayon.
+//! Provides a Rust-native community-detection implementation in the Leiden
+//! family (Traag, Waltman & van Eck, 2019) with the Reichardt-Bornholdt (RB)
+//! configuration model quality function and conflict-free parallel batching via
+//! rayon.
+//!
+//! NOTE: the refinement phase moves singleton nodes under a constrained-partition
+//! rule but does NOT implement the paper's node/candidate well-connectedness
+//! admissibility conditions or `theta`-randomized selection — it is closer to
+//! Louvain with constrained refinement than to full Leiden (tracked for
+//! completion; see `LeidenConfig::refine_partition`). Do not describe the output
+//! as "well-connected communities".
 //!
 //! Core algorithm adapted from single-clustering
 //! (BSD 3-Clause License, Copyright 2025 Ian F. Diks)

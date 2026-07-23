@@ -940,6 +940,20 @@ pyscx.accel.umap(adata)
 sc.tl.leiden(adata)
 ```
 
+> **HVG masking without subsetting.** `pyscx.accel.pca(adata, mask_var=...)`
+> restricts PCA to the selected genes in-place (scanpy semantics): pass a
+> var-column name or a boolean array, or leave `mask_var=None` to auto-consume
+> `adata.var["highly_variable"]` when present. It projects columns on the fly
+> (backed/lazy/in-memory) — no HVG subset copy — and `varm["PCs"]` stays aligned
+> to the full `var` axis (excluded genes filled with 0), so you never need the
+> `adata[:, adata.var["highly_variable"]]` slice before PCA.
+>
+> **Behavior change (v0.11.6+):** matching scanpy, `mask_var=None` now
+> **auto-consumes** `adata.var["highly_variable"]` when that column exists — so a
+> PCA that previously ran on all genes will run on the HVG subset if you have
+> flagged HVGs. `uns["pca"]["params"]["use_highly_variable"]` records whether a
+> mask was applied. To force all genes, pass an all-`True` `mask_var`.
+
 ### Backed layers
 
 Layers are also lazy in backed mode:
@@ -1922,7 +1936,7 @@ pyscx.accel.leiden(adata)
 | `sigma` | `0.1` | Gaussian bandwidth for soft assignments. |
 | `lamb` | `None` | Ridge penalty. `None` enables dynamic estimation (`alpha × E[k,b]`). |
 | `max_iter` | `10` | Maximum Harmony outer iterations (cluster → correct rounds). |
-| `max_iter_kmeans` | `4` | Maximum k-means sub-iterations per Harmony iter. |
+| `max_iter_kmeans` | `6` | Maximum k-means sub-iterations per Harmony iter (must be ≥ 2×window_size so the convergence check can fire). |
 | `random_state` | `0` | RNG seed (`ChaCha8Rng` for determinism across runs). |
 | `device` | `"auto"` | `"cpu"` / `"gpu"` / `"auto"`. GPU path requires pyscx built with `--features gpu`. |
 

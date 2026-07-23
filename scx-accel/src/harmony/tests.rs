@@ -108,6 +108,64 @@ fn test_kmeans_pp_distinct() {
 }
 
 #[test]
+fn test_kmeans_config_convergence_reachable() {
+    // Regression guard for the pre-1.4 k-means convergence deadlock: the check
+    // needs >= 2*window_size objectives, so the default config MUST allow at
+    // least that many sub-iterations (4 < 2*3 made it dead code).
+    let cfg = HarmonyConfig::default();
+    assert!(
+        cfg.max_iter_kmeans >= 2 * cfg.window_size,
+        "max_iter_kmeans ({}) < 2*window_size ({}) — convergence check can never fire",
+        cfg.max_iter_kmeans,
+        2 * cfg.window_size
+    );
+}
+
+#[test]
+fn test_kmeans_pp_spreads_across_clusters() {
+    // Four tight, well-separated clusters, each a pure unit axis in 4-D.
+    // Correct D²-to-ALL k-means++ must place its k seeds on k distinct axes
+    // (a candidate coinciding with any chosen centroid has min-distance 0 and
+    // is skipped). The pre-1.4 last-centroid-only seeding measured distance to
+    // the most-recent centroid alone, so it could re-select an already-covered
+    // axis (via a different cell index) and collapse two seeds onto it.
+    let d = 4;
+    let k = 4;
+    let per = 25;
+    let n = k * per;
+    let mut emb = vec![0f32; n * d];
+    for c in 0..k {
+        for p in 0..per {
+            emb[(c * per + p) * d + c] = 1.0; // pure axis c
+        }
+    }
+    // Transpose + normalize like HarmonyState::new.
+    let mut z = vec![0f64; d * n];
+    for i in 0..n {
+        for j in 0..d {
+            z[j + i * d] = emb[i * d + j] as f64;
+        }
+    }
+    l2_normalize_columns(&mut z, d, n);
+    let mut rng = ChaCha8Rng::seed_from_u64(11);
+    let y = kmeans_plus_plus(&z, d, n, k, &mut rng);
+    // Every pair of chosen centroids must be near-orthogonal (squared chord
+    // distance ≈ 2). Collapsed same-axis seeds would have distance ≈ 0.
+    for a in 0..k {
+        for b in (a + 1)..k {
+            let sa = &y[a * d..(a + 1) * d];
+            let sb = &y[b * d..(b + 1) * d];
+            let dot: f64 = sa.iter().zip(sb).map(|(x, y)| x * y).sum();
+            let dsq = 2.0 * (1.0 - dot);
+            assert!(
+                dsq > 1.0,
+                "seeds {a},{b} too close (dsq={dsq}); k-means++ failed to spread across clusters"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_soft_assignments_sum_to_one() {
     let n = 150;
     let d = 4;

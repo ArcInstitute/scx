@@ -631,6 +631,12 @@ pub fn wilcoxon_rank_sum_streaming(
             "gene_chunk_size must be > 0".to_string(),
         ));
     }
+    // Clamp the dense n_obs×chunk f32 workspace to the CPU memory budget.
+    let gene_chunk_size = crate::mem_budget::de_gene_chunk_or_err(
+        gene_chunk_size,
+        n_obs,
+        "wilcoxon_rank_sum_streaming",
+    )?;
 
     let n_shards = reader.index().n_shards();
 
@@ -753,6 +759,12 @@ pub fn wilcoxon_rank_sum_sparse(
             csr.n_cols()
         )));
     }
+    // Clamp the dense n_obs×chunk f32 workspace to the CPU memory budget.
+    let gene_chunk_size = crate::mem_budget::de_gene_chunk_or_err(
+        gene_chunk_size,
+        n_obs,
+        "wilcoxon_rank_sum_sparse",
+    )?;
 
     let mut all_chunk_results = Vec::new();
 
@@ -1355,6 +1367,9 @@ pub fn pdex_ref_sparse(
             "gene_chunk_size must be > 0".to_string(),
         ));
     }
+    // Clamp the dense n_obs×chunk f32 workspace to the CPU memory budget.
+    let gene_chunk_size =
+        crate::mem_budget::de_gene_chunk_or_err(gene_chunk_size, n_obs, "pdex_ref_sparse")?;
 
     let mut combined: Option<PdexRefResult> = None;
 
@@ -1434,6 +1449,9 @@ pub fn pdex_ref_streaming(
             "gene_chunk_size must be > 0".to_string(),
         ));
     }
+    // Clamp the dense n_obs×chunk f32 workspace to the CPU memory budget.
+    let gene_chunk_size =
+        crate::mem_budget::de_gene_chunk_or_err(gene_chunk_size, n_obs, "pdex_ref_streaming")?;
 
     let n_shards = reader.index().n_shards();
     let cache_cap = reader.cache_capacity();

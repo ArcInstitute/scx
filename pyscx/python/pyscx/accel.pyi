@@ -37,6 +37,8 @@ def rank_genes_groups(
     tie_correct: bool = False,
     prefer_format: PreferFormat = "csr",
     device: str = "auto",
+    use_raw: bool | None = None,
+    layer: str | None = None,
 ) -> Any: ...
 
 
@@ -117,6 +119,8 @@ def pdex_ref(
     prefer_format: PreferFormat = "csr",
     device: str = "auto",
     output: str = "polars",
+    use_raw: bool | None = None,
+    layer: str | None = None,
 ) -> Any: ...
 
 
@@ -166,6 +170,7 @@ def pca(
     allow_tf32: bool = False,
     spmm_policy: str = "default",
     memory_budget: int | str | None = None,
+    mask_var: Any | None = None,
 ) -> None: ...
 
 
@@ -259,7 +264,7 @@ def harmony_integrate(
     lamb: Any | None = None,
     alpha: float = 0.2,
     max_iter: int = 10,
-    max_iter_kmeans: int = 4,
+    max_iter_kmeans: int = 6,
     epsilon_harmony: float = 1e-2,
     epsilon_kmeans: float = 1e-3,
     block_size: float = 0.05,

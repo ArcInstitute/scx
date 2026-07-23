@@ -313,6 +313,14 @@ pub fn pca_neighbors(
         false,     // allow_tf32
         "default", // spmm_policy
         None,      // memory_budget (default PCA cache ceiling)
+        // mask_var: this CPU/rapids fallback delegates to pca(), so mask_var=None
+        // auto-consumes adata.var["highly_variable"] if present (scanpy semantics).
+        // KNOWN LIMITATION: the native device-resident GPU fused path
+        // (run_fused_gpu) does NOT mask and analyzes all genes, so the fused
+        // PCA gene set is route-dependent when highly_variable is set. For a
+        // deterministic HVG-masked pipeline, run pca(mask_var=...) then
+        // neighbors()/umap() separately. Tracked for unification.
+        None,
     )?;
     super::neighbors::neighbors(
         py,
@@ -485,6 +493,14 @@ pub fn pca_neighbors_umap(
         false,     // allow_tf32
         "default", // spmm_policy
         None,      // memory_budget (default PCA cache ceiling)
+        // mask_var: this CPU/rapids fallback delegates to pca(), so mask_var=None
+        // auto-consumes adata.var["highly_variable"] if present (scanpy semantics).
+        // KNOWN LIMITATION: the native device-resident GPU fused path
+        // (run_fused_gpu) does NOT mask and analyzes all genes, so the fused
+        // PCA gene set is route-dependent when highly_variable is set. For a
+        // deterministic HVG-masked pipeline, run pca(mask_var=...) then
+        // neighbors()/umap() separately. Tracked for unification.
+        None,
     )?;
     super::neighbors::neighbors(
         py,
@@ -554,7 +570,7 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     )
     .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
 
-    write_pca_to_adata(py, adata, &pca_res, "scx-gpu-cusparse")?;
+    write_pca_to_adata(py, adata, &pca_res, "scx-gpu-cusparse", None)?;
     super::neighbors::write_neighbors_to_adata(py, adata, &knn_res, n_neighbors, use_rep, "cagra")?;
     // Stamp the device-resident route on pca / neighbors / pca_neighbors,
     // carrying the Task 2.5 metadata (finding 5): `graph_replay` from the PCA

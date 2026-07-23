@@ -22,7 +22,8 @@
 #' @param alpha Dynamic-lambda scale factor. Default `0.2`.
 #' @param max_iter Maximum Harmony iterations. Default `10L`.
 #' @param max_iter_kmeans Maximum k-means sub-iterations per Harmony
-#'   iteration. Default `4L`.
+#'   iteration. Default `6L` (must be >= 2*window_size for the convergence
+#'   check to fire).
 #' @param epsilon_harmony Harmony convergence tolerance (signed relative
 #'   change). Default `1e-2`.
 #' @param epsilon_kmeans K-means convergence tolerance (absolute relative
