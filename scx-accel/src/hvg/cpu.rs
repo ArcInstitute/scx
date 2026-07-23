@@ -19,22 +19,12 @@ pub struct HvgStats {
 
 /// Reject non-finite values at the HVG accelerator boundary.
 ///
-/// NaN/Inf cannot be summarised into a meaningful mean/variance and would
-/// silently poison HVG selection. This is the HVG analogue of the DE boundary
-/// check ([`crate::diffexp`]'s `ensure_finite_de_input`): finiteness is a
-/// contract at the accelerator entry, validated where the streaming pass
-/// already touches every nonzero — not at file ingest. (The GPU HVG path does
-/// not yet enforce this on-device; tracked as a follow-on.)
+/// Thin wrapper over the shared [`crate::finite::ensure_finite_values`]
+/// primitive so every storage route (CSR here, CSC in [`crate::csc`]) enforces
+/// the same guard. (The GPU HVG path does not yet enforce this on-device;
+/// tracked as a follow-on.)
 fn ensure_finite_hvg_data(data: &[f32]) -> Result<()> {
-    if let Some(pos) = data.iter().position(|v| !v.is_finite()) {
-        return Err(crate::error::AccelError::InvalidInput(format!(
-            "HVG input contains a non-finite value ({}) at nonzero index {pos}; \
-             highly-variable-gene selection requires finite input — filter/QC NaN \
-             and Inf before computing variance",
-            data[pos]
-        )));
-    }
-    Ok(())
+    crate::finite::ensure_finite_values(data, "HVG")
 }
 
 /// Single-pass streaming mean and variance per column.
@@ -96,6 +86,59 @@ pub fn streaming_mean_var<S: ShardSource>(source: &S) -> Result<HvgStats> {
         // Var = (sum_sq - n * mean^2) / (n - 1)
         variances[j] = (col_sum_sq[j] - n * mean * mean) / denom;
         // Clamp to zero (numerical noise can produce tiny negatives)
+        if variances[j] < 0.0 {
+            variances[j] = 0.0;
+        }
+    }
+
+    Ok(HvgStats { means, variances })
+}
+
+/// Single-pass streaming mean/variance per column on `expm1(scale · value)`.
+///
+/// scanpy's `seurat` HVG flavor un-`log1p`s the matrix before computing
+/// moments: `x *= ln(base)` (identity when the stored base is natural log /
+/// `None`, i.e. `scale = 1.0`), then `expm1`. Because `expm1(0) == 0`, implicit
+/// and stored zeros contribute nothing, so the count-space moments stream from
+/// the sparse nonzeros exactly like [`streaming_mean_var`].
+///
+/// `scale` is `ln(base)` for a log1p base of `base`, or `1.0` for natural-log /
+/// no recorded base. Bessel's correction (ddof=1) matches scanpy's
+/// `correction=1`.
+pub fn streaming_mean_var_expm1<S: ShardSource>(source: &S, scale: f64) -> Result<HvgStats> {
+    let n_vars = source.n_vars();
+    let n_obs = source.n_obs();
+
+    if n_obs == 0 {
+        return Ok(HvgStats {
+            means: vec![0.0; n_vars],
+            variances: vec![0.0; n_vars],
+        });
+    }
+
+    let mut col_sum = vec![0.0f64; n_vars];
+    let mut col_sum_sq = vec![0.0f64; n_vars];
+
+    for shard_idx in 0..source.n_shards() {
+        let csr = source.read_shard(shard_idx)?;
+        ensure_finite_hvg_data(&csr.data)?;
+        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+            let c = col as usize;
+            // expm1(scale · v): un-log to count space before accumulating.
+            let cv = ((val as f64) * scale).exp_m1();
+            col_sum[c] += cv;
+            col_sum_sq[c] += cv * cv;
+        }
+    }
+
+    let n = n_obs as f64;
+    let denom = (n - 1.0).max(1.0);
+    let mut means = vec![0.0f64; n_vars];
+    let mut variances = vec![0.0f64; n_vars];
+    for j in 0..n_vars {
+        let mean = col_sum[j] / n;
+        means[j] = mean;
+        variances[j] = (col_sum_sq[j] - n * mean * mean) / denom;
         if variances[j] < 0.0 {
             variances[j] = 0.0;
         }

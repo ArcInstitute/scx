@@ -1842,7 +1842,7 @@ pyscx.accel.leiden(adata, resolution=1.0)
 | `key_added` | `"leiden"` | Key in `adata.obs` for community labels |
 | `random_state` | 0 | Random seed for reproducibility |
 | `n_iterations` | 2 | **Unit differs by backend.** Rust-native (CPU): leidenalg-style outer iterations (default 2 is plenty — each is a full multilevel cycle). cuGraph (GPU): maps to cuGraph's `max_iter` (a *coarsening-pass* count). The leidenalg default of 2 would starve cuGraph's coarsening and produce a degenerate, over-partitioned result, so the cuGraph path uses cuGraph's own default of **100** whenever `n_iterations <= 2` (including the `-1`/`0` convergence sentinels); only values `> 2` are forwarded verbatim. The effective cap is recorded in `uns["leiden"]["params"]["max_iter"]`. |
-| `parallel` | `False` | Run the **Rust-native** Leiden in conflict-free batched mode. `False` (default) matches C++ leidenalg sequential moving. **Ignored on the cuGraph path** (warns when `True`). |
+| `parallel` | `False` | Run the **Rust-native** Leiden in conflict-free batched mode. `False` (default) reproduces C++ leidenalg's sequential move-node *ordering* (the refinement omits the paper's well-connectedness admissibility conditions). **Ignored on the cuGraph path** (warns when `True`). |
 | `device` | `"auto"` | `"auto"` (cuGraph if available, else Rust-native), `"cpu"` (Rust-native), `"gpu"` / `"gpu:N"` (cuGraph on CUDA device 0 or N — `gpu:N` pins via `cupy.cuda.Device(N)`). |
 | `theta` | 1.0 | cuGraph-only resolution scaling knob (forwarded to `cugraph.leiden(theta=...)`). **Ignored on the Rust-native path** (warns when non-default). |
 
@@ -1990,9 +1990,11 @@ Returns a `numpy.ndarray` of length N and also writes the values to
 `adata.obs[f"lisi_{key}"]`.
 
 By default the implementation uses an exact brute-force kNN (per-row
-squared-norm expansion + per-cell top-k heap) to stay numerically in
-lockstep with the R `lisi` reference. On D1–D4 it is **~10× faster** than
-R `lisi::compute_lisi` with mean-LISI agreement within 0.8–2.4 %.
+squared-norm expansion + per-cell top-k heap) and follows the harmonypy /
+R `lisi` LISI formulation (raw-distance Gaussian kernel `exp(-D·β)`). On
+D1–D4 it is **~10× faster** than R `lisi::compute_lisi`; the previously
+reported mean-LISI agreement of 0.8–2.4 % predates the 2026-07 raw-distance
+kernel fix and is pending a benchmark recapture.
 Brute-force kNN is O(N²·d); above ~50k cells the exact path logs a hint
 to set `approximate_knn=True`, which swaps in an HNSW kNN for an
 order-of-magnitude speed-up at census scale (D5+) at the cost of small
@@ -2742,7 +2744,7 @@ parallelism — see [docs/multithreading.md](multithreading.md).
 | `pyscx.accel.pca` (CPU) | Rayon | Parallel covariance accumulation (thread-local matrices); streaming SpMM parallelizes inner products |
 | `pyscx.accel.neighbors` (CPU) | Rayon | Parallel kNN queries on HNSW index |
 | `pyscx.accel.umap` (CPU) | Single-threaded SGD | Edge updates are serial on CPU; GPU path uses CUDA kernel parallelism |
-| `pyscx.accel.leiden` | Opt-in rayon via `parallel=True` | Sequential by default (matches C++ leidenalg); parallel uses conflict-free graph coloring |
+| `pyscx.accel.leiden` | Opt-in rayon via `parallel=True` | Sequential by default (reproduces C++ leidenalg's move-node ordering); parallel uses conflict-free graph coloring |
 | `pyscx.accel.rank_genes_groups` | Rayon | Parallel Wilcoxon rank-sum across genes |
 | `pyscx.accel.pseudobulk_dex` | Rayon (aggregation) | Streaming aggregation is parallel; downstream `pydeseq2` testing runs single-threaded |
 | `pyscx.accel.highly_variable_genes` | Rayon (via streaming reader) | Parallelism comes from shard decode; the mean/var reduction itself is serial |

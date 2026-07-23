@@ -6,12 +6,17 @@
 //! mixing) and approach the number of categories when neighbours are
 //! uniformly distributed across categories (good mixing).
 //!
-//! Matches the R `lisi` reference package (Korsunsky et al., 2019):
-//! * exact kNN by Euclidean distance (NOT HNSW, to stay numerically in
-//!   lockstep with `FNN::get.knn`),
+//! Follows the LISI formulation of Korsunsky et al., 2019 (harmonypy /
+//! R `lisi`):
+//! * exact kNN by Euclidean distance (NOT HNSW by default),
 //! * per-cell beta (Gaussian bandwidth) calibrated via binary search to
-//!   hit a target `perplexity` (identical to t-SNE's H-target routine),
+//!   hit a target `perplexity` (the t-SNE H-target routine), with the
+//!   kernel `exp(-D · beta)` on the raw neighbour distances,
 //! * Simpson index over kernel-weighted neighbour probabilities.
+//!
+//! Numerical parity against the reference is asserted per-cell by the pyscx
+//! test `test_lisi_matches_harmonypy_per_cell` (compared against harmonypy's
+//! `compute_lisi`), not merely on the dataset-wide mean.
 
 use rayon::prelude::*;
 
@@ -33,7 +38,7 @@ pub struct LisiConfig {
     /// When true, use an HNSW approximate kNN (via `instant-distance`) instead
     /// of the O(N²) exact sweep. Trades small numerical drift (~0.01–0.05 on
     /// mean-LISI for D1–D4 fixtures) for an order-of-magnitude speed-up at
-    /// N ≳ 100k. Default `false` to match the R `lisi` reference byte-for-byte.
+    /// N ≳ 100k. Default `false` (exact sweep) for reference-parity results.
     pub approximate_knn: bool,
 }
 
@@ -337,12 +342,14 @@ fn approximate_knn(emb: &[f32], n: usize, d: usize, k: usize) -> Result<(Vec<usi
 /// that the entropy of the kernel-weighted neighbour distribution equals
 /// `log(perplexity)`. Returns the normalised probabilities.
 ///
-/// This is the standard t-SNE `Hbeta` routine reused by the R `lisi`
-/// reference package. Distances are non-squared Euclidean; we square
-/// them once on entry so the inner loop only has to multiply by beta.
+/// This is the `Hbeta` routine used by harmonypy's `compute_simpson_index`
+/// (and the R `lisi` reference): the kernel is `exp(-D · beta)` applied to the
+/// **raw** (non-squared) Euclidean neighbour distances returned by the kNN
+/// search — NOT `exp(-D² · beta)`. Squaring here would double-apply the metric
+/// (the distances are already `sqrt`'d in [`exact_knn`]) and change the
+/// per-cell kernel shape.
 fn hbeta_weights(dists: &[f64], target_logu: f64, tol: f64, max_iter: usize) -> Vec<f64> {
     let k = dists.len();
-    let d2: Vec<f64> = dists.iter().map(|&d| d * d).collect();
 
     let mut beta = 1.0f64;
     let mut beta_min = f64::NEG_INFINITY;
@@ -351,13 +358,13 @@ fn hbeta_weights(dists: &[f64], target_logu: f64, tol: f64, max_iter: usize) -> 
     // Scratch buffer for exponentiated (and normalised) probabilities.
     let mut p = vec![0f64; k];
 
-    // `hbeta_at` evaluates P and H for a given beta; both the R lisi
-    // reference and t-SNE compute H = log(sum_p) + beta * sum(D² * p_un)
-    // / sum_p_un, which is the entropy of the *normalised* distribution
-    // before dividing out.
-    fn hbeta_at(d2: &[f64], beta: f64, p: &mut [f64]) -> f64 {
+    // `hbeta_at` evaluates P and H for a given beta; harmonypy and t-SNE
+    // compute H = log(sum_p) + beta * sum(D * p_un) / sum_p_un, the entropy
+    // of the *normalised* distribution before dividing out. `D` is the raw
+    // Euclidean distance — the same quantity used in the exponent.
+    fn hbeta_at(dists: &[f64], beta: f64, p: &mut [f64]) -> f64 {
         let mut sum_p = 0f64;
-        for (i, &d) in d2.iter().enumerate() {
+        for (i, &d) in dists.iter().enumerate() {
             let v = (-d * beta).exp();
             p[i] = v;
             sum_p += v;
@@ -371,7 +378,7 @@ fn hbeta_weights(dists: &[f64], target_logu: f64, tol: f64, max_iter: usize) -> 
             return 0.0;
         }
         let mut sum_dp = 0f64;
-        for (i, &d) in d2.iter().enumerate() {
+        for (i, &d) in dists.iter().enumerate() {
             sum_dp += d * p[i];
         }
         let h = sum_p.ln() + beta * sum_dp / sum_p;
@@ -383,7 +390,7 @@ fn hbeta_weights(dists: &[f64], target_logu: f64, tol: f64, max_iter: usize) -> 
         h
     }
 
-    let mut h = hbeta_at(&d2, beta, &mut p);
+    let mut h = hbeta_at(dists, beta, &mut p);
     let mut h_diff = h - target_logu;
 
     let mut iter = 0usize;
@@ -404,7 +411,7 @@ fn hbeta_weights(dists: &[f64], target_logu: f64, tol: f64, max_iter: usize) -> 
                 (beta + beta_min) / 2.0
             };
         }
-        h = hbeta_at(&d2, beta, &mut p);
+        h = hbeta_at(dists, beta, &mut p);
         h_diff = h - target_logu;
         iter += 1;
     }

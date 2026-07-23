@@ -13,6 +13,7 @@ pub mod csc;
 pub mod diffexp;
 pub mod error;
 pub mod eval_metrics;
+pub(crate) mod finite;
 #[cfg(feature = "gpu")]
 pub mod fused;
 pub mod gene_score;
@@ -58,7 +59,7 @@ pub use gene_score::{score_genes, ScoreMethod};
 pub use harmony::{harmony_integrate, BatchCovariate, HarmonyConfig, HarmonyResult};
 pub use hvg::{
     streaming_clip_square_sum, streaming_clip_square_sum_batched, streaming_mean_var,
-    streaming_mean_var_batched, BatchedHvgStats, HvgStats,
+    streaming_mean_var_batched, streaming_mean_var_expm1, BatchedHvgStats, HvgStats,
 };
 pub use leiden::{leiden, LeidenConfig, LeidenResult};
 pub use lisi::{compute_lisi, LisiConfig, LisiResult};

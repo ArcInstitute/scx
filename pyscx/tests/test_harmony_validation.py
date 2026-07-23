@@ -206,3 +206,61 @@ def test_lisi_mean_within_5pct(
         f"{name}: LISI mean scx={scx_mean:.4f} R={r_mean:.4f} "
         f"rel diff {rel:.3%} > 5% (see test docstring for rationale)"
     )
+
+
+def test_lisi_matches_harmonypy_per_cell():
+    """Per-cell LISI parity against the harmonypy reference (§2.3 fix).
+
+    The dataset-wide mean test above can hide a systematic per-cell kernel
+    error. This asserts SCX's LISI agrees with harmonypy's ``compute_lisi``
+    on *every* cell, which only holds once the Gaussian kernel is
+    ``exp(-D·beta)`` on the raw (non-squared) neighbour distances — the bug
+    fixed in ``scx-accel/src/lisi.rs`` was squaring D a second time.
+
+    harmonypy fits ``3*perplexity`` neighbours (kd-tree) then drops self, so
+    it uses ``3*perplexity - 1`` neighbours; we pin ``n_neighbors`` to match.
+    """
+    harmonypy = pytest.importorskip("harmonypy")
+    import pyscx
+    import anndata as ad
+
+    rng = np.random.default_rng(0)
+    # perplexity is int: harmonypy fits NearestNeighbors(n_neighbors=3*perplexity)
+    # and newer sklearn rejects a float n_neighbors.
+    n_per, n_dims, n_batches, perplexity = 60, 5, 3, 15
+    # Three loosely separated batch blobs so LISI has non-trivial structure.
+    centers = rng.normal(scale=4.0, size=(n_batches, n_dims))
+    emb = np.vstack(
+        [centers[b] + rng.normal(scale=1.0, size=(n_per, n_dims)) for b in range(n_batches)]
+    ).astype(np.float32)
+    batch = np.concatenate([np.full(n_per, b, dtype=np.int32) for b in range(n_batches)])
+    labels = [f"b{int(v)}" for v in batch]
+
+    ref = harmonypy.compute_lisi(
+        emb.astype(np.float64),
+        pd.DataFrame({"batch": pd.Categorical(labels)}),
+        ["batch"],
+        perplexity=perplexity,
+    )[:, 0]
+
+    adata = ad.AnnData(
+        X=np.zeros((emb.shape[0], 1), dtype=np.float32),
+        obs=pd.DataFrame({"batch": pd.Categorical(labels)}),
+    )
+    adata.obsm["X_emb"] = emb
+    scx_lisi = np.asarray(
+        pyscx.accel.compute_lisi(
+            adata,
+            "batch",
+            basis="X_emb",
+            perplexity=perplexity,
+            n_neighbors=int(3 * perplexity - 1),
+        ),
+        dtype=np.float64,
+    )
+
+    max_abs = float(np.max(np.abs(scx_lisi - ref)))
+    assert max_abs < 1e-2, (
+        f"per-cell LISI diverges from harmonypy: max abs diff {max_abs:.4g} "
+        f"(scx mean {scx_lisi.mean():.4f} vs ref {ref.mean():.4f})"
+    )

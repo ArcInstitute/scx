@@ -66,13 +66,26 @@ pub fn validate_inputs(
         }
     }
 
-    // Counts: finite & non-negative. Report the first offender.
+    // Counts: finite, non-negative, and integer-valued. Report the first
+    // offender. The NB count likelihood is defined on integer counts (spec
+    // §7.2, §2.5); fractional inputs — e.g. `aggr_method="mean"` pseudobulk or
+    // an accidentally normalized/log-transformed matrix — violate the model
+    // contract. Integer sums are exact in f64 up to 2^53, so a whole-number
+    // count has zero fractional part; the tolerance only absorbs fp noise.
+    const COUNT_INTEGER_TOL: f64 = 1e-6;
     for (i, &c) in counts_gene_major.iter().enumerate() {
+        let g = i / n_samples;
+        let s = i % n_samples;
         if !c.is_finite() || c < 0.0 {
-            let g = i / n_samples;
-            let s = i % n_samples;
             return Err(AccelError::InvalidInput(format!(
                 "counts[gene={g}, sample={s}] = {c} must be finite and >= 0"
+            )));
+        }
+        if (c - c.round()).abs() > COUNT_INTEGER_TOL {
+            return Err(AccelError::InvalidInput(format!(
+                "counts[gene={g}, sample={s}] = {c} must be an integer count: the \
+                 negative-binomial model requires summed integer counts, not fractional \
+                 values (e.g. mean aggregation or normalized/log-transformed input)."
             )));
         }
     }

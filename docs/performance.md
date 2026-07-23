@@ -460,7 +460,7 @@ Increasing d or K shifts wall time (see the D4 PC/K secondary sweeps in
 `benchmarks/results/harmony/REPORT.md`) but leaves memory roughly
 unchanged for the Harmony core.
 
-LISI: `pyscx.accel.compute_lisi` is **~10× faster** than R `lisi::compute_lisi` on D1–D4 (e.g. smartseq2 3.85 s vs 43.11 s; tabula_sapiens_100k 12 s vs 110 s), with mean-LISI agreement within 0.8–2.4 % of the R reference.
+LISI: `pyscx.accel.compute_lisi` is **~10× faster** than R `lisi::compute_lisi` on D1–D4 (e.g. smartseq2 3.85 s vs 43.11 s; tabula_sapiens_100k 12 s vs 110 s). (The previously reported mean-LISI agreement of 0.8–2.4 % vs the R reference predates the 2026-07 raw-distance kernel fix — §2.3 of the accelerator review — and is pending a benchmark recapture.)
 
 ## Perturbation Metrics (cell-eval / arc-bench parity)
 

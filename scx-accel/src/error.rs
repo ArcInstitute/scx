@@ -25,6 +25,14 @@ pub enum AccelError {
     #[error("numerical instability: {0}")]
     NumericalInstability(String),
 
+    /// GPU device initialization failed (no driver, context creation error,
+    /// out of memory, …) after a GPU route was requested. An explicit
+    /// `device="gpu"` must surface this to the caller rather than silently
+    /// running the CPU kernel under a GPU route stamp (§4.1). Surfaced as
+    /// `RuntimeError` on the Python side.
+    #[error("GPU device initialization failed: {0}")]
+    GpuInitFailed(String),
+
     /// `prefer_format="csc"` was requested but the dataset cannot
     /// service CSC reads. The inner string names the missing
     /// capability — for example: no CSC sidecar on disk, a
