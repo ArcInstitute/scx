@@ -21,10 +21,12 @@ pub mod harmony;
 pub mod hvg;
 pub mod leiden;
 pub mod lisi;
+pub mod mem_budget;
 pub mod nb_glm;
 pub mod neighbors;
 pub mod pca;
 pub mod pflog;
+pub mod projected_source;
 pub mod pseudobulk;
 pub mod route;
 pub mod umap;
@@ -76,6 +78,7 @@ pub use pflog::{
     estimate_alpha, pflog_baseline_from_delta, pflog_baseline_from_raw, AlphaEstimate,
     AlphaOptions, PFlog,
 };
+pub use projected_source::ProjectedShardSource;
 pub use pseudobulk::{
     build_group_mapping, pseudobulk_aggregate, pseudobulk_aggregate_dense,
     pseudobulk_aggregate_from_slices, pseudobulk_aggregate_inmemory, AggregationMethod,

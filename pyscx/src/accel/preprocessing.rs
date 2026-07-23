@@ -55,6 +55,42 @@ pub struct ScxGpuNormalizeMarker {
     n_vars: usize,
 }
 
+/// Resolve scanpy's `target_sum=None` semantics: the median of positive
+/// per-cell totals over the **visible** cells (matching `sc.pp.normalize_total`,
+/// which medians `counts_per_cell[counts_per_cell > 0]`). `row_sums` is in
+/// physical-row space; `kept`, when present, maps visible → physical row so the
+/// median is taken over user-visible cells only (deletion-correct).
+///
+/// For an all-zero matrix (no positive totals) scanpy yields NaN; we fall back
+/// to `1.0` to avoid a NaN denominator — no cell has counts to scale anyway.
+fn median_positive_visible(row_sums: &[f64], kept: Option<&[u64]>) -> f64 {
+    let mut vals: Vec<f64> = match kept {
+        Some(map) => map
+            .iter()
+            .map(|&g| row_sums[g as usize])
+            .filter(|&s| s > 0.0)
+            .collect(),
+        None => row_sums.iter().copied().filter(|&s| s > 0.0).collect(),
+    };
+    if vals.is_empty() {
+        return 1.0;
+    }
+    vals.sort_by(|a, b| a.total_cmp(b));
+    let n = vals.len();
+    if n % 2 == 1 {
+        vals[n / 2]
+    } else {
+        0.5 * (vals[n / 2 - 1] + vals[n / 2])
+    }
+}
+
+/// Resolve a caller `target_sum` (`None` → scanpy median of positive per-cell
+/// totals) to a concrete scalar, given the per-cell `row_sums` and the optional
+/// visible→physical row map.
+fn resolve_target_sum(target_sum: Option<f64>, row_sums: &[f64], kept: Option<&[u64]>) -> f64 {
+    target_sum.unwrap_or_else(|| median_positive_visible(row_sums, kept))
+}
+
 /// Normalize total counts per cell.
 ///
 /// By default (`device="auto"` or `device="cpu"`), replaces `adata.X` with a
@@ -80,15 +116,20 @@ pub struct ScxGpuNormalizeMarker {
 ///
 /// Args:
 ///     adata: AnnData object
-///     target_sum: Target total counts per cell (default: 1e4)
+///     target_sum: Target total counts per cell. `None` (default) uses the
+///         **median of positive per-cell totals** — scanpy's `target_sum=None`
+///         semantics. A float pins an explicit target.
+///         COMPATIBILITY BREAK: the previous default was a hard `1e4`; it is now
+///         `None` (scanpy-parity). Pass `target_sum=1e4` to restore the old
+///         behavior.
 ///     device: Device selection — "auto" (default), "cpu", "gpu", or
 ///         "gpu:N" to target CUDA device N on multi-GPU systems.
 #[pyfunction]
-#[pyo3(signature = (adata, target_sum=10000.0, device="auto"))]
+#[pyo3(signature = (adata, target_sum=None, device="auto"))]
 pub fn normalize_total(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
-    target_sum: f64,
+    target_sum: Option<f64>,
     device: &str,
 ) -> PyResult<()> {
     let _device = validate_device_or_default(device)?;
@@ -181,6 +222,13 @@ pub fn normalize_total(
         })
         .map_err(PyRuntimeError::new_err)?;
 
+        // Resolve target_sum=None → median of positive visible-cell totals
+        // before moving all_row_sums into the transform.
+        let target = resolve_target_sum(
+            target_sum,
+            &all_row_sums,
+            backed_ref.kept_to_global.as_deref().map(|v| v.as_slice()),
+        );
         let non_negative = backed_ref.non_negative;
         let lazy = ScxLazyTransformedDataset::new(
             Arc::clone(&backed_ref.backed),
@@ -191,7 +239,7 @@ pub fn normalize_total(
             backed_ref.col_projection_arc(),
             vec![Transform::NormalizeTotal {
                 row_sums: Arc::new(all_row_sums),
-                target_sum,
+                target_sum: target,
             }],
             non_negative,
         )
@@ -224,9 +272,16 @@ pub fn normalize_total(
             let l: &ScxLazyTransformedDataset = &lazy_ref;
             detached(py, || l.streaming_row_sums_projected()).map_err(PyRuntimeError::new_err)?
         };
+        // Resolve target_sum=None → median of positive visible-cell totals
+        // (over the correct denominator, which already reflects prior transforms).
+        let target = resolve_target_sum(
+            target_sum,
+            &sums,
+            lazy_ref.kept_to_global.as_deref().map(|v| v.as_slice()),
+        );
         lazy_ref.transforms.push(Transform::NormalizeTotal {
             row_sums: Arc::new(sums),
-            target_sum,
+            target_sum: target,
         });
         return Ok(());
     }
@@ -863,7 +918,7 @@ fn source_from_x(x: &Bound<'_, PyAny>) -> PyResult<Option<GpuShardSource>> {
 fn gpu_normalize_total(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
-    target_sum: f64,
+    target_sum: Option<f64>,
     device_id: usize,
     device: &str,
 ) -> PyResult<()> {
@@ -893,10 +948,30 @@ fn gpu_normalize_total(
         n_vars,
     } = gs;
 
+    // Resolve target_sum=None → median of positive visible-cell totals. The GPU
+    // kernel needs a concrete scalar, so when the caller left it to the default
+    // we compute host-side row sums off the GIL (mirrors the CPU backed path).
+    // Clones move into the closure so the originals stay live for the marker.
+    let resolved_target = match target_sum {
+        Some(t) => t,
+        None => {
+            let cols_opt = col_projection.clone();
+            let backed_for_sums = Arc::clone(&backed);
+            let row_sums = detached(py, move || match cols_opt.as_deref() {
+                Some(cols) => projected_agg::row_sums_projected(&backed_for_sums, cols)
+                    .map_err(|e| e.to_string()),
+                None => backed_for_sums.row_sums().map_err(|e| e.to_string()),
+            })
+            .map_err(PyRuntimeError::new_err)?;
+            median_positive_visible(&row_sums, kept_to_global.as_deref().map(|v| v.as_slice()))
+        }
+    };
+
     let dev = scx_accel::GpuDevice::new(device_id)
         .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
-    let csr = scx_accel::gpu_preprocess_to_csr(&dev, &source, Some(target_sum as f32), false, None)
-        .map_err(|e| PyRuntimeError::new_err(format!("gpu_preprocess_to_csr: {e}")))?;
+    let csr =
+        scx_accel::gpu_preprocess_to_csr(&dev, &source, Some(resolved_target as f32), false, None)
+            .map_err(|e| PyRuntimeError::new_err(format!("gpu_preprocess_to_csr: {e}")))?;
     drop(source);
 
     // Replace adata.X with materialized scipy CSR.
@@ -909,7 +984,7 @@ fn gpu_normalize_total(
         backed,
         kept_to_global,
         col_projection,
-        target_sum,
+        target_sum: resolved_target,
         n_obs,
         n_vars,
     };

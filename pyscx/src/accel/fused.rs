@@ -313,6 +313,7 @@ pub fn pca_neighbors(
         false,     // allow_tf32
         "default", // spmm_policy
         None,      // memory_budget (default PCA cache ceiling)
+        None,      // mask_var (fused pipelines PCA on all genes)
     )?;
     super::neighbors::neighbors(
         py,
@@ -485,6 +486,7 @@ pub fn pca_neighbors_umap(
         false,     // allow_tf32
         "default", // spmm_policy
         None,      // memory_budget (default PCA cache ceiling)
+        None,      // mask_var (fused pipelines PCA on all genes)
     )?;
     super::neighbors::neighbors(
         py,
@@ -554,7 +556,7 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     )
     .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
 
-    write_pca_to_adata(py, adata, &pca_res, "scx-gpu-cusparse")?;
+    write_pca_to_adata(py, adata, &pca_res, "scx-gpu-cusparse", None)?;
     super::neighbors::write_neighbors_to_adata(py, adata, &knn_res, n_neighbors, use_rep, "cagra")?;
     // Stamp the device-resident route on pca / neighbors / pca_neighbors,
     // carrying the Task 2.5 metadata (finding 5): `graph_replay` from the PCA
