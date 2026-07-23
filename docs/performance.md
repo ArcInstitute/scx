@@ -397,26 +397,36 @@ Captured on the **backed streaming** path (`pyscx.open(scx).to_anndata(backed=Tr
 | census_1m | normalize | 39315 | 22247 | 0 | 0.0 | **decode** |
 
 **What the oracle says (ranks the Phase-2 work):**
-- **HVG and `normalize_total` are decode-bound at every scale** (decode > reduction,
-  ~1.5–3× at 1M) → §5.1 bounded-ordered decode-prefetch attacks their dominant cost
-  directly; highest-value Phase-2 target.
+- **HVG is decode-bound at every scale** — decode > reduction by a *measured* margin
+  (2.4× at 1M; Σ(buckets)/wall ≈ 85–94 %, so both stages are instrumented) → §5.1
+  bounded-ordered decode-prefetch attacks its dominant cost directly; highest-value
+  Phase-2 target.
+- **`normalize_total` is decode-heavy** — decode is the single largest *measured*
+  stage (~57 % of wall at 1M). Its `reduction` reads 0 **by construction, not by
+  measurement**: the lazy row-sum + scale path has no `reduction_guard`, so ~43 % of
+  wall is unattributed. Treat it as "decode-heavy, reduction not instrumented on this
+  path" — *not* as a decode-vs-reduction ratio peer of HVG. Decode-prefetch still
+  helps (decode dominates the accounted stages), but confirm with a guarded row-sum
+  pass before ranking preprocess against HVG.
 - **PCA is reduction-bound up to ~500k but FLIPS to decode-bound at census_1m**
   (decode 88.8 s vs reduction 30.6 s) — the streaming shard decode overtakes the
   randomized-PCA compute at atlas scale. So decode-prefetch pays off for PCA *only*
-  at ≥~1M cells; below that, PCA gains come from compute (§2.7 fusions) / marshalling
-  (§5.5), not decode.
-- `marshalling` stays sub-0.2 s even at 1M-cell embeddings — §2.4 flat-marshalling is
-  a low-priority micro-win on this path.
+  at ≥~1M cells; below that, PCA gains come from compute (Phase-2 task 2.7 fusions) /
+  marshalling (Phase-2 task 2.4), not decode.
+- `marshalling` stays sub-0.2 s even at 1M-cell embeddings — Phase-2 task 2.4 flat
+  marshalling is a low-priority micro-win on this path.
 
 `io` is ~0 because these are local mmap reads (page-fault cost folds into `decode`);
 the `decode` bucket is the §5.1 oracle signal. The `reduction` bucket covers per-shard
 kernel accumulation; PCA's post-streaming dense SVD and `normalize_total`'s row-sum
-pass fall outside it (so Σ(buckets) < wall for those). Known gaps: the CSC-sidecar
-decode route and the cloud range-read path are not in the `decode` bucket (local mmap
-CSR only); non-`auto` codec / shard-size / cold-vs-warm-storage axes are staged, not
-yet captured. Source: backed-streaming capture
-(`benchmarks/scripts/profile_cpu_stages_backed.py`, `SCX_CPU_PROFILE=1`), 3 runs
-median, `results/raw/accel_cpu_profile_backed__*`.
+pass fall outside it (so Σ(buckets) < wall for those). **Instrumentation gaps** (not in
+the `decode` bucket): the *framed/block-index* CSC route (`decode_block_index_row_runs`)
+and the typed-dtype path (`read_shard_from_entry_native`) — a *full-shard* CSC or CSR
+decode is captured; the cloud range-read readers that bypass the local `ScxReader`
+inner. Non-`auto` codec / shard-size / cold-vs-warm-storage axes are staged, not yet
+captured. Source: backed-streaming capture
+(`benchmarks/scripts/profile_cpu_stages_backed.py`, `SCX_CPU_PROFILE=1`), 3 runs,
+median across runs, `results/raw/accel_cpu_profile_backed__*`.
 
 ### Differential expression (CPU, full-matrix)
 

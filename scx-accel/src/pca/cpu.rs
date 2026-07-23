@@ -266,11 +266,13 @@ fn accumulate_covariance_streaming<S: ShardSource>(
     for shard_idx in 0..n_shards {
         // Cached read (T4.4): each pass decodes a shard once when the budget allows.
         let csr = source.read_shard_arc(shard_idx)?;
-        let _r = scx_format_io::reduction_guard();
         let n_rows = csr.n_rows();
         if n_rows == 0 {
             continue;
         }
+        // Bind the reduction guard only for shards that actually accumulate, so
+        // empty shards don't inflate the reduction call count.
+        let _r = scx_format_io::reduction_guard();
         let chunk_size = (n_rows / workers.max(1)).max(256);
         let csr_ref = &csr;
         let tls_ref = &tls;

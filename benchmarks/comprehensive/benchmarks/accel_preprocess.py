@@ -315,7 +315,9 @@ def run(
         with dispatch_env(key, requires_gpu), cpu_profile_capture(extras):
             backend = impl(a, target_sum)
             # Force materialization so the lazy-pyscx-CPU variant's wall time
-            # reflects end-to-end (not just transform enqueue).
+            # reflects end-to-end (not just transform enqueue). Kept *inside* the
+            # cpu_profile_capture window so the lazy chain's decode is attributed
+            # to the profiler, not treated as untimed post-op work.
             if "pyscx_cpu" in key:
                 _ = a.X[:, :]  # materializes the lazy chain
         wall = time.perf_counter() - t0

@@ -35,10 +35,10 @@ pub fn streaming_mean_var_csc<S: ColumnShardSource + ?Sized>(source: &S) -> Resu
     let n_shards = source.n_csc_shards();
     for shard_idx in 0..n_shards {
         let csc = source.read_csc_shard(shard_idx)?;
-        // NOTE: the central io/decode profiler hook (`read_shard_from_entry_inner`)
-        // covers the row-major CSR path; the CSC sidecar decode is a separate
-        // route, so its decode time is not captured in the `decode` bucket — only
-        // the reduction below. Documented CSC gap for the 2.0 oracle.
+        // NOTE: a full-shard CSC decode routes through `read_shard_from_entry`
+        // → the central io/decode hook, so its decode time IS captured. Only the
+        // framed/block-index CSC path (`decode_block_index_row_runs`) is not
+        // hooked. The guard below records this per-shard reduction.
         let _r = scx_format_io::reduction_guard();
         // Same finiteness contract as the CSR path (`crate::hvg::cpu`): a NaN
         // would otherwise be silently absorbed as the clip value by `f64::min`.

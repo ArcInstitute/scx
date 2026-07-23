@@ -111,12 +111,17 @@ def capture(dataset: str, op: str, n_runs: int, n_comps: int) -> BenchmarkResult
 
 
 def _fmt_row(dataset: str, op: str, r: BenchmarkResult) -> str:
-    run = r.runs[-1].extra
+    import statistics
+
+    def med(key: str) -> float:
+        vals = [run.extra.get(key, 0.0) for run in r.runs]
+        return statistics.median(vals) if vals else 0.0
+
     wall_ms = (r.median_wall_s or 0.0) * 1e3
-    dec = run.get("cpu_profile_decode_scx1_ms", 0) + run.get("cpu_profile_decode_generic_ms", 0)
-    io = run.get("cpu_profile_io_ms", 0)
-    red = run.get("cpu_profile_reduction_ms", 0)
-    mar = run.get("cpu_profile_marshalling_ms", 0)
+    dec = med("cpu_profile_decode_scx1_ms") + med("cpu_profile_decode_generic_ms")
+    io = med("cpu_profile_io_ms")
+    red = med("cpu_profile_reduction_ms")
+    mar = med("cpu_profile_marshalling_ms")
     tot = io + dec + red + mar
     frac = f"{tot / wall_ms:.0%}" if wall_ms else "n/a"
     return (f"| {dataset} | {op} | {wall_ms:.1f} | {io:.1f} | {dec:.1f} | "

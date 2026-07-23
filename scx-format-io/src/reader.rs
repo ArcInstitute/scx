@@ -3682,11 +3682,15 @@ impl ScxReader {
         let io_start = crate::profile::start();
         let section = self.section_bytes(entry)?;
         crate::profile::record_io_since(io_start, section.len());
-        // `decode` bucket: resolve the codec class only when profiling (a cheap
-        // header parse) so the hot path stays free.
+        // `decode` bucket: resolve the codec class only when profiling, parsing
+        // the header out of the section bytes we already fetched (no second
+        // `section_bytes`/`read_shard_header` round-trip — that would be
+        // untracked I/O and inflate the observer effect on the oracle wall).
         let class = if crate::profile::profile_enabled() {
-            self.read_shard_header(entry)
+            crate::validated_section::ValidatedSection::new(section)
+                .header()
                 .ok()
+                .and_then(|h| ShardHeader::read_from(&mut Cursor::new(h)).ok())
                 .and_then(|h| CodecId::from_u8(h.codec_id))
                 .map(crate::profile::CodecClass::from_codec)
                 .unwrap_or(crate::profile::CodecClass::Generic)

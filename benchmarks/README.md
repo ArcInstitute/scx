@@ -1117,8 +1117,10 @@ The breakdown is diagnostic (`extra`), not floored in `thresholds.yaml`, so a
 profiled run does not gate — it ranks the Phase-2 optimization targets. Profiling
 adds a small per-shard atomic/`Instant` cost, so read the *ratios* from a profiled
 run and the absolute wall from an unprofiled run. **Known gaps** (absent from the
-`decode` bucket): the CSC-sidecar decode route and the cloud range-read path
-(local mmap only in the current captures).
+`decode` bucket): the *framed/block-index* decode route and the typed-dtype path
+(`read_shard_from_entry_native`) — a full-shard CSR or CSC decode routes through the
+central hook and is captured — plus the cloud range-read readers that bypass the
+local `ScxReader` (current captures are local mmap only).
 
 **Per-op rapids-singlecell competitor (`accel_*__rapids_singlecell_gpu`).** Beyond
 the fused pipeline, every accel op carries a `rapids_singlecell_gpu` variant

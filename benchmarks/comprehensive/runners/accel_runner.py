@@ -70,6 +70,14 @@ def cpu_profile_capture(extras: dict[str, Any], prefix: str = "cpu_profile"):
     except Exception:  # pragma: no cover - pyscx always present in bench envs
         yield
         return
+    # Degrade gracefully on a pyscx too old to carry the CPU profiler surface
+    # (the functions landed in Phase-2 2.0) instead of raising AttributeError.
+    if not hasattr(pyscx.accel, "cpu_profile_snapshot") or not hasattr(
+        pyscx.accel, "cpu_profile_reset"
+    ):
+        logger.warning("cpu_profile_capture: pyscx lacks the CPU profiler surface; skipping")
+        yield
+        return
     pyscx.accel.cpu_profile_reset()
     try:
         yield

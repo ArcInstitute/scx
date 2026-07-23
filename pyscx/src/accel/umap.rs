@@ -295,7 +295,7 @@ pub(crate) fn write_umap_to_adata(
     result: &scx_accel::UmapResult,
 ) -> PyResult<()> {
     // Convert f64→f32 in Rust to avoid intermediate f64 numpy allocation
-    let _m = scx_accel::cpu_profile::start();
+    let marshal_start = scx_accel::cpu_profile::start();
     let embeddings_arr = PyArray2::<f32>::from_vec2(
         py,
         &(0..result.n_obs)
@@ -307,7 +307,7 @@ pub(crate) fn write_umap_to_adata(
             .collect::<Vec<Vec<f32>>>(),
     )?;
     scx_accel::cpu_profile::record_marshalling_since(
-        _m,
+        marshal_start,
         result.n_obs * result.n_components * std::mem::size_of::<f32>(),
     );
     let obsm = adata.getattr("obsm")?;
