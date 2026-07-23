@@ -286,5 +286,13 @@ def compute_lisi(
 ) -> Any: ...
 
 
+# CPU per-stage timing profiler (io / decode / reduction / marshalling).
+# Buckets are populated only when `SCX_CPU_PROFILE=1` is set at process start.
+def cpu_profile_snapshot() -> dict[str, Any]: ...
+
+
+def cpu_profile_reset() -> None: ...
+
+
 # Catch-all for the rest of `pyscx.accel.*`.
 def __getattr__(name: str) -> Any: ...

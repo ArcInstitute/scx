@@ -683,6 +683,7 @@ pub fn wilcoxon_rank_sum_streaming(
             let shard_csr = reader
                 .read_shard_cached_arc(shard_idx)
                 .map_err(crate::AccelError::Scx)?;
+            let _r = scx_format_io::reduction_guard();
             let projected = scx_engine::project_csr(&shard_csr, &col_indices);
 
             for row in 0..projected.n_rows() {
@@ -696,7 +697,11 @@ pub fn wilcoxon_rank_sum_streaming(
             global_row += projected.n_rows();
         }
 
-        // Run existing wilcoxon_rank_sum on this chunk's dense buffer.
+        // Run existing wilcoxon_rank_sum on this chunk's dense buffer. The
+        // per-gene ranking is the dominant DE compute (O(n_obs·log n_obs)/gene)
+        // and runs after the decode/densify above, so it attributes to
+        // `reduction` disjointly from `decode`.
+        let _rank = scx_format_io::reduction_guard();
         let chunk_genes: Vec<String> = gene_names[chunk_start..chunk_end].to_vec();
         let chunk_result = wilcoxon_rank_sum(
             &dense,
@@ -1480,6 +1485,7 @@ pub fn pdex_ref_streaming(
             let shard_csr = reader
                 .read_shard_cached_arc(shard_idx)
                 .map_err(crate::AccelError::Scx)?;
+            let _r = scx_format_io::reduction_guard();
             let projected = scx_engine::project_csr(&shard_csr, &col_indices);
             for row in 0..projected.n_rows() {
                 let s = projected.indptr[row] as usize;
@@ -1492,6 +1498,8 @@ pub fn pdex_ref_streaming(
             global_row += projected.n_rows();
         }
 
+        // MWU compute dominates and runs post-decode → `reduction`, disjoint.
+        let _rank = scx_format_io::reduction_guard();
         let chunk_genes: Vec<String> = gene_names[chunk_start..chunk_end].to_vec();
         let chunk_result = pdex_ref_core(
             &dense,

@@ -35,6 +35,11 @@ pub fn streaming_mean_var_csc<S: ColumnShardSource + ?Sized>(source: &S) -> Resu
     let n_shards = source.n_csc_shards();
     for shard_idx in 0..n_shards {
         let csc = source.read_csc_shard(shard_idx)?;
+        // NOTE: the central io/decode profiler hook (`read_shard_from_entry_inner`)
+        // covers the row-major CSR path; the CSC sidecar decode is a separate
+        // route, so its decode time is not captured in the `decode` bucket — only
+        // the reduction below. Documented CSC gap for the 2.0 oracle.
+        let _r = scx_format_io::reduction_guard();
         // Same finiteness contract as the CSR path (`crate::hvg::cpu`): a NaN
         // would otherwise be silently absorbed as the clip value by `f64::min`.
         crate::finite::ensure_finite_values(&csc.data, "HVG")?;
@@ -100,6 +105,7 @@ pub fn streaming_clip_square_sum_csc<S: ColumnShardSource + ?Sized>(
     let n_shards = source.n_csc_shards();
     for shard_idx in 0..n_shards {
         let csc = source.read_csc_shard(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         // Same finiteness contract as the CSR path: a NaN clips to `clip_val`
         // via `f64::min` (returns the non-NaN operand) and would silently
         // poison the clipped sums.

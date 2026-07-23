@@ -42,7 +42,10 @@ from benchmarks.comprehensive.config import (
     RANDOM_SEED,
 )
 from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
-from benchmarks.comprehensive.runners.accel_runner import AcceleratorRunner
+from benchmarks.comprehensive.runners.accel_runner import (
+    AcceleratorRunner,
+    cpu_profile_capture,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -303,20 +306,21 @@ def run(
     for i in range(n_runs):
         gc.collect()
         a = _fresh()
+        # 2.0 ranking oracle: CPU decode/io/reduction/marshalling breakdown
+        # (no-op unless SCX_CPU_PROFILE=1).
+        extras: dict[str, Any] = {}
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
-        with dispatch_env(key, requires_gpu):
+        with dispatch_env(key, requires_gpu), cpu_profile_capture(extras):
             backend = impl(a, target_sum)
-        # Force materialization so the lazy-pyscx-CPU variant's wall time
-        # reflects end-to-end (not just transform enqueue).
-        if "pyscx_cpu" in key:
-            _ = a.X[:, :]  # materializes the lazy chain
+            # Force materialization so the lazy-pyscx-CPU variant's wall time
+            # reflects end-to-end (not just transform enqueue).
+            if "pyscx_cpu" in key:
+                _ = a.X[:, :]  # materializes the lazy chain
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
-
-        extras: dict[str, Any] = {}
 
         # Record the accelerator route + a numeric gate signal for the GPU
         # variant. The GPU variant runs on a backed SCX input (see `_fresh`),

@@ -727,9 +727,14 @@ def _slurm_setup_cmds(env_name: str | None = None) -> list[str]:
     # bench worker; otherwise the OnceLock-cached check defaults graphs on.
     # (The `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` gates were removed once GPU DE v3
     # became the unconditional default.)
+    # `SCX_CPU_PROFILE` (Phase-2 task 2.0) turns on the CPU per-stage profiler
+    # (io/decode/reduction/marshalling → `runs[].extra["cpu_profile_*"]`); it is
+    # read once at profiler init, so it must be exported before the worker
+    # imports pyscx — hence forward it here like the other runtime knobs.
     for var in ("GCS_TEST_BUCKET", "GCP_PROJECT", "GCP_BUCKET_REGION",
                 "SCX_DATA_DIR", "SCX_WORK_DIR",
                 "SCX_DISABLE_CUDA_GRAPHS",
+                "SCX_CPU_PROFILE",
                 "SCX_BENCH_WITH_CSC"):
         val = os.environ.get(var, "").strip()
         if val:

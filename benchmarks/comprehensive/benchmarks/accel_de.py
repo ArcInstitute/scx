@@ -85,6 +85,7 @@ from benchmarks.comprehensive.config import (
     RANDOM_SEED,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.runners.accel_runner import cpu_profile_capture
 
 logger = logging.getLogger(__name__)
 
@@ -624,11 +625,15 @@ def run(
     for i in range(n_runs):
         gc.collect()
         a = base_adata.copy()
+        # 2.0 ranking oracle: CPU decode/io/reduction/marshalling breakdown
+        # (no-op unless SCX_CPU_PROFILE=1).
+        extras: dict[str, Any] = {}
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
         try:
-            ret = impl(a, groupby, reference)
+            with cpu_profile_capture(extras):
+                ret = impl(a, groupby, reference)
         except Exception as e:
             logger.error("%s run %d raised: %s", key, i + 1, e)
             del a
@@ -636,8 +641,6 @@ def run(
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
-
-        extras: dict[str, Any] = {}
 
         # Record which accelerator route actually ran (read from adata.uns,
         # written by pyscx). `gpu_dispatch_route` is a human-readable string

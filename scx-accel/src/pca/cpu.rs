@@ -266,6 +266,7 @@ fn accumulate_covariance_streaming<S: ShardSource>(
     for shard_idx in 0..n_shards {
         // Cached read (T4.4): each pass decodes a shard once when the budget allows.
         let csr = source.read_shard_arc(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         let n_rows = csr.n_rows();
         if n_rows == 0 {
             continue;
@@ -854,6 +855,7 @@ fn streaming_spmm_forward<S: ShardSource>(
 
     for shard_idx in 0..n_shards {
         let csr = source.read_shard_arc(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         let shard_rows = csr.n_rows();
 
         spmm_forward_into(
@@ -906,6 +908,7 @@ fn streaming_spmm_transpose<S: ShardSource>(
 
     for shard_idx in 0..n_shards {
         let csr = source.read_shard_arc(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         let shard_rows = csr.n_rows();
         let use_parallel = shard_rows * k > 10_000;
 
@@ -1417,6 +1420,7 @@ pub fn covariance_pca<S: ShardSource>(
     let mut global_row = 0usize;
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard_arc(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         let shard_rows = csr.n_rows();
 
         // E[row, :] = X[row, :] @ V - mc

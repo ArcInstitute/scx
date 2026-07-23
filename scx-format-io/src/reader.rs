@@ -3675,13 +3675,33 @@ impl ScxReader {
         self.debug_counts
             .read_shard_from_entry
             .fetch_add(1, Ordering::Relaxed);
+        // `io` bucket: raw byte fetch. On a local mmap reader this is an O(1)
+        // bounds-checked slice (≈0); the page-fault cost of touching the bytes
+        // is attributed to `decode` below. On a cloud/range-read path the fetch
+        // is real. See `crate::profile` module docs.
+        let io_start = crate::profile::start();
         let section = self.section_bytes(entry)?;
-        crate::shard_decode::decode_shard_bytes(
+        crate::profile::record_io_since(io_start, section.len());
+        // `decode` bucket: resolve the codec class only when profiling (a cheap
+        // header parse) so the hot path stays free.
+        let class = if crate::profile::profile_enabled() {
+            self.read_shard_header(entry)
+                .ok()
+                .and_then(|h| CodecId::from_u8(h.codec_id))
+                .map(crate::profile::CodecClass::from_codec)
+                .unwrap_or(crate::profile::CodecClass::Generic)
+        } else {
+            crate::profile::CodecClass::Generic
+        };
+        let decode_start = crate::profile::start();
+        let decoded = crate::shard_decode::decode_shard_bytes(
             section,
             entry,
             self.full_catalog.catalog_version,
             verify_checksum,
-        )
+        );
+        crate::profile::record_decode_since(class, decode_start, section.len());
+        decoded
     }
 
     /// Read and decode a single shard to **native** types (`i64` indptr, `u32`

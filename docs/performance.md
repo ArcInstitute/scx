@@ -365,6 +365,59 @@ Benchmarked on 1M cells (CELLxGENE Census), HVG-selected (2000 genes):
 
 Full pipeline (PCA -> kNN -> UMAP -> Leiden -> DE) on 1M cells: **870s** (vs 3,971s — **4.6x faster**).
 
+### CPU stage profile — the decode/reduction ranking oracle (Phase-2 task 2.0)
+
+Before any Phase-2 `×` speedup claim, the CPU per-stage profiler
+(`SCX_CPU_PROFILE=1`, `scx_format_io::profile`) breaks a streaming accelerator op
+into **io / decode / reduction / marshalling** so we know which stage bounds it.
+Captured on the **backed streaming** path (`pyscx.open(scx).to_anndata(backed=True)`
+→ the out-of-core shard source the Phase-2 §5.1 work targets) via
+`benchmarks/scripts/profile_cpu_stages_backed.py`. Times are median-of-runs ms;
+`bound` is the larger of decode vs reduction:
+
+| Dataset | Op | wall ms | decode ms | reduction ms | marshalling ms | Bound |
+|---|---|--:|--:|--:|--:|:--|
+| pbmc3k | pca | 765 | 18 | 192 | 0.5 | **reduction** |
+| pbmc3k | hvg | 80 | 34 | 14 | 0.0 | **decode** |
+| pbmc3k | normalize | 81 | 40 | 0 | 0.0 | **decode** |
+| pbmc10k | pca | 2819 | 276 | 1826 | 1.8 | **reduction** |
+| pbmc10k | hvg | 743 | 538 | 147 | 0.0 | **decode** |
+| pbmc10k | normalize | 821 | 535 | 0 | 0.0 | **decode** |
+| smartseq2 | pca | 6395 | 1499 | 3446 | 7.1 | **reduction** |
+| smartseq2 | hvg | 3951 | 2924 | 772 | 0.0 | **decode** |
+| smartseq2 | normalize | 3878 | 3020 | 0 | 0.0 | **decode** |
+| tabula_sapiens_100k | pca | 8147 | 1756 | 4253 | 13.4 | **reduction** |
+| tabula_sapiens_100k | hvg | 4671 | 3329 | 1033 | 0.0 | **decode** |
+| tabula_sapiens_100k | normalize | 5023 | 3510 | 0 | 0.0 | **decode** |
+| census_500k | pca | 32801 | 7259 | 17223 | 74.6 | **reduction** |
+| census_500k | hvg | 17470 | 12474 | 3905 | 0.0 | **decode** |
+| census_500k | normalize | 20714 | 13527 | 0 | 0.0 | **decode** |
+| census_1m | pca | 138311 | 88764 | 30587 | 183.6 | **decode** |
+| census_1m | hvg | 27888 | 18553 | 7677 | 0.0 | **decode** |
+| census_1m | normalize | 39315 | 22247 | 0 | 0.0 | **decode** |
+
+**What the oracle says (ranks the Phase-2 work):**
+- **HVG and `normalize_total` are decode-bound at every scale** (decode > reduction,
+  ~1.5–3× at 1M) → §5.1 bounded-ordered decode-prefetch attacks their dominant cost
+  directly; highest-value Phase-2 target.
+- **PCA is reduction-bound up to ~500k but FLIPS to decode-bound at census_1m**
+  (decode 88.8 s vs reduction 30.6 s) — the streaming shard decode overtakes the
+  randomized-PCA compute at atlas scale. So decode-prefetch pays off for PCA *only*
+  at ≥~1M cells; below that, PCA gains come from compute (§2.7 fusions) / marshalling
+  (§5.5), not decode.
+- `marshalling` stays sub-0.2 s even at 1M-cell embeddings — §2.4 flat-marshalling is
+  a low-priority micro-win on this path.
+
+`io` is ~0 because these are local mmap reads (page-fault cost folds into `decode`);
+the `decode` bucket is the §5.1 oracle signal. The `reduction` bucket covers per-shard
+kernel accumulation; PCA's post-streaming dense SVD and `normalize_total`'s row-sum
+pass fall outside it (so Σ(buckets) < wall for those). Known gaps: the CSC-sidecar
+decode route and the cloud range-read path are not in the `decode` bucket (local mmap
+CSR only); non-`auto` codec / shard-size / cold-vs-warm-storage axes are staged, not
+yet captured. Source: backed-streaming capture
+(`benchmarks/scripts/profile_cpu_stages_backed.py`, `SCX_CPU_PROFILE=1`), 3 runs
+median, `results/raw/accel_cpu_profile_backed__*`.
+
 ### Differential expression (CPU, full-matrix)
 
 The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell fixture. The dedicated `accel_de` benchmark sweeps the raw count matrix (no HVG projection) across the full dataset tier — scanpy's per-gene rank pass becomes the bottleneck and times out on census-scale:

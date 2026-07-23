@@ -51,7 +51,10 @@ from benchmarks.comprehensive.config import (
     RANDOM_SEED,
 )
 from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
-from benchmarks.comprehensive.runners.accel_runner import AcceleratorRunner
+from benchmarks.comprehensive.runners.accel_runner import (
+    AcceleratorRunner,
+    cpu_profile_capture,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -283,31 +286,34 @@ def run(
     for i in range(n_runs):
         gc.collect()
         a = raw.copy()
+        # 2.0 ranking oracle: CPU decode/io/reduction/marshalling breakdown
+        # (no-op unless SCX_CPU_PROFILE=1).
+        extras: dict[str, Any] = {}
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
-        if gpu_backed is not None:
-            # Time only the HVG call on the pre-opened backed dataset; the
-            # one-time open already happened above.
-            import pyscx
-            pyscx.accel.highly_variable_genes(
-                gpu_backed, n_top_genes=n_top_genes, flavor="seurat_v3", device="gpu",
-            )
-            wall = time.perf_counter() - t0
-            backend = "pyscx-gpu"
-            # Teardown outside the timed region: surface the route + HVG var
-            # columns on `a` for the route gate and the Jaccard overlap below.
-            # Gene order is identical (the CSC fixture was built from `raw`).
-            _propagate_route(gpu_backed, a)
-            for col in _HVG_VAR_COLS:
-                if col in gpu_backed.var.columns:
-                    a.var[col] = gpu_backed.var[col].to_numpy()
-        else:
-            backend = impl(a, n_top_genes)
-            wall = time.perf_counter() - t0
+        with cpu_profile_capture(extras):
+            if gpu_backed is not None:
+                # Time only the HVG call on the pre-opened backed dataset; the
+                # one-time open already happened above.
+                import pyscx
+                pyscx.accel.highly_variable_genes(
+                    gpu_backed, n_top_genes=n_top_genes, flavor="seurat_v3", device="gpu",
+                )
+                wall = time.perf_counter() - t0
+                backend = "pyscx-gpu"
+                # Teardown outside the timed region: surface the route + HVG var
+                # columns on `a` for the route gate and the Jaccard overlap below.
+                # Gene order is identical (the CSC fixture was built from `raw`).
+                _propagate_route(gpu_backed, a)
+                for col in _HVG_VAR_COLS:
+                    if col in gpu_backed.var.columns:
+                        a.var[col] = gpu_backed.var[col].to_numpy()
+            else:
+                backend = impl(a, n_top_genes)
+                wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
-        extras: dict[str, Any] = {}
         try:
             jaccards.append(_hvg_jaccard(ref_var, a.var))
             if not np.isnan(jaccards[-1]):
