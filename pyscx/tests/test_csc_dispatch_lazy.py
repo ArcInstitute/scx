@@ -94,7 +94,10 @@ def test_lazy_normalize_total_csr_works(small_adata, tmp_path):
     import pyscx
 
     a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
-    pyscx.accel.normalize_total(a_csc)
+    # Pin target_sum explicitly: the streaming-vs-materialized equality below is
+    # magnitude-sensitive at atol=1e-5, and the default is now None→median (a
+    # small target on integer counts), which tips two genes over the tolerance.
+    pyscx.accel.normalize_total(a_csc, target_sum=1e4)
 
     # CSR path on a lazy NormalizeTotal chain currently goes through
     # the dunder methods on the lazy wrapper (the col_sums pyfunction

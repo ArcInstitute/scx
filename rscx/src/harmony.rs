@@ -26,7 +26,8 @@ use crate::util::factorize_chars;
 ///   dynamic estimation (recommended).
 /// @param alpha Numeric — dynamic lambda scale factor (default 0.2).
 /// @param max_iter Integer — maximum Harmony iterations (default 10).
-/// @param max_iter_kmeans Integer — k-means sub-iterations (default 4).
+/// @param max_iter_kmeans Integer — k-means sub-iterations (default 6; must be
+///   >= 2*window_size so the k-means convergence check can fire).
 /// @param epsilon_harmony Numeric — Harmony convergence tolerance
 ///   (default 1e-2).
 /// @param epsilon_kmeans Numeric — k-means convergence tolerance

@@ -313,7 +313,14 @@ pub fn pca_neighbors(
         false,     // allow_tf32
         "default", // spmm_policy
         None,      // memory_budget (default PCA cache ceiling)
-        None,      // mask_var (fused pipelines PCA on all genes)
+        // mask_var: this CPU/rapids fallback delegates to pca(), so mask_var=None
+        // auto-consumes adata.var["highly_variable"] if present (scanpy semantics).
+        // KNOWN LIMITATION: the native device-resident GPU fused path
+        // (run_fused_gpu) does NOT mask and analyzes all genes, so the fused
+        // PCA gene set is route-dependent when highly_variable is set. For a
+        // deterministic HVG-masked pipeline, run pca(mask_var=...) then
+        // neighbors()/umap() separately. Tracked for unification.
+        None,
     )?;
     super::neighbors::neighbors(
         py,
@@ -486,7 +493,14 @@ pub fn pca_neighbors_umap(
         false,     // allow_tf32
         "default", // spmm_policy
         None,      // memory_budget (default PCA cache ceiling)
-        None,      // mask_var (fused pipelines PCA on all genes)
+        // mask_var: this CPU/rapids fallback delegates to pca(), so mask_var=None
+        // auto-consumes adata.var["highly_variable"] if present (scanpy semantics).
+        // KNOWN LIMITATION: the native device-resident GPU fused path
+        // (run_fused_gpu) does NOT mask and analyzes all genes, so the fused
+        // PCA gene set is route-dependent when highly_variable is set. For a
+        // deterministic HVG-masked pipeline, run pca(mask_var=...) then
+        // neighbors()/umap() separately. Tracked for unification.
+        None,
     )?;
     super::neighbors::neighbors(
         py,

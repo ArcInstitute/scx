@@ -342,15 +342,22 @@ fn stamp_pca_route(
 /// Extract a boolean array (from a numpy bool array or a pandas Series) into a
 /// `Vec<bool>`.
 fn extract_bool_vec(obj: &Bound<'_, PyAny>) -> PyResult<Vec<bool>> {
-    // pandas Series → numpy via to_numpy(); a numpy array is used as-is.
-    let arr = if obj.hasattr("to_numpy")? {
-        obj.call_method0("to_numpy")?
-    } else {
-        obj.clone()
-    };
+    // Coerce any sequence (numpy array, pandas Series, list, tuple, or a
+    // non-contiguous view/slice) to a C-contiguous bool array so `as_slice()`
+    // below cannot fail with AsSliceError on a non-contiguous input.
+    let np = obj.py().import("numpy")?;
+    let kwargs = PyDict::new(obj.py());
+    kwargs.set_item("dtype", "bool")?;
+    let arr = np
+        .call_method("ascontiguousarray", (obj,), Some(&kwargs))
+        .map_err(|_| {
+            PyValueError::new_err(
+                "mask_var must be a boolean array (or a var-column name resolving to one)",
+            )
+        })?;
     let ro: PyReadonlyArray1<bool> = arr.extract().map_err(|_| {
         PyValueError::new_err(
-            "mask_var must be a boolean array (or a var-column name resolving to one)",
+            "mask_var must be 1-D and boolean (or a var-column name resolving to one)",
         )
     })?;
     Ok(ro.as_slice()?.to_vec())

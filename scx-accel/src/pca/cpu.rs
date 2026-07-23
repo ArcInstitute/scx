@@ -147,7 +147,9 @@ fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>
     // covariance path gets from `cov_accumulator_workers` (previously this
     // in-memory path used the full thread count, so peak scaled with cores).
     let max_threads = rayon::current_num_threads().max(1);
-    let workers = cov_accumulator_workers(n_vars, cov_memory_budget(), max_threads);
+    // `.max(1)` is defensive: cov_accumulator_workers already floors at 1, but
+    // guard the `n_rows / workers` divisor against any future 0-return.
+    let workers = cov_accumulator_workers(n_vars, cov_memory_budget(), max_threads).max(1);
     let chunk_size = (n_rows / workers).max(256);
 
     (0..n_rows)

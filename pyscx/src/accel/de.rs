@@ -715,6 +715,14 @@ fn de_result_to_dataframe<'py>(
 /// ``use_raw=None`` (default) resolves to ``True`` iff ``adata.raw`` exists and
 /// ``layer`` is None, else ``False``. The resolved ``use_raw`` and ``layer`` are
 /// written to ``adata.uns["rank_genes_groups"]["params"]``.
+///
+/// NOTE: the log-fold-change back-transform uses the ``adata.uns["log1p"]``
+/// flag, which describes ``X``. For the conventional case (``.raw`` /
+/// ``layer`` hold log-normalized data, like ``X``) this is correct; if ``.raw``
+/// holds raw counts while ``X`` is log1p-transformed, the logFC is computed as
+/// if the counts were log-space. Prefer ``pdex_ref`` (which exposes an explicit
+/// ``is_log1p`` override) when analyzing a matrix whose transform state differs
+/// from ``X``.
 #[pyfunction]
 #[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="csr", device="auto", use_raw=None, layer=None))]
 #[allow(clippy::too_many_arguments)]
@@ -2216,13 +2224,14 @@ pub fn pdex_ref(
     super::route::write_accel_route(py, adata, "pdex_ref", &result.exec_info)?;
     // Record the resolved data-selection contract alongside the route so callers
     // can see which matrix was analyzed (X / raw.X / a layer).
-    if let Ok(entry) = adata
-        .getattr("uns")?
-        .get_item("scx_accel")?
-        .get_item("pdex_ref")
-    {
-        entry.set_item("use_raw", resolved_use_raw)?;
-        entry.set_item("layer", layer)?;
+    // Defensive: `get_item` with `?` would raise KeyError if either key is
+    // absent. `write_accel_route` just created both, but check both with
+    // `if let Ok(...)` so a missing route entry never crashes the op.
+    if let Ok(scx_accel) = adata.getattr("uns")?.get_item("scx_accel") {
+        if let Ok(entry) = scx_accel.get_item("pdex_ref") {
+            entry.set_item("use_raw", resolved_use_raw)?;
+            entry.set_item("layer", layer)?;
+        }
     }
     let df = pdex_ref_result_to_dataframe(py, &result, output)?;
     Ok(df.unbind())

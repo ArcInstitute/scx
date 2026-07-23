@@ -53,6 +53,12 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
             source.n_vars()
         )));
     }
+    // Clamp the dense n_obs×chunk f32 scatter buffer to the CPU memory budget.
+    let gene_chunk_size = crate::mem_budget::de_gene_chunk_or_err(
+        gene_chunk_size,
+        n_obs,
+        "wilcoxon_rank_sum_streaming_csc",
+    )?;
 
     let mut all_chunk_results = Vec::new();
     // Allocate the row-major dense scatter buffer once and reuse across

@@ -1936,7 +1936,7 @@ pyscx.accel.leiden(adata)
 | `sigma` | `0.1` | Gaussian bandwidth for soft assignments. |
 | `lamb` | `None` | Ridge penalty. `None` enables dynamic estimation (`alpha × E[k,b]`). |
 | `max_iter` | `10` | Maximum Harmony outer iterations (cluster → correct rounds). |
-| `max_iter_kmeans` | `4` | Maximum k-means sub-iterations per Harmony iter. |
+| `max_iter_kmeans` | `6` | Maximum k-means sub-iterations per Harmony iter (must be ≥ 2×window_size so the convergence check can fire). |
 | `random_state` | `0` | RNG seed (`ChaCha8Rng` for determinism across runs). |
 | `device` | `"auto"` | `"cpu"` / `"gpu"` / `"auto"`. GPU path requires pyscx built with `--features gpu`. |
 
