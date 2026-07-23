@@ -1241,6 +1241,8 @@ fn register_gpu(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(accel::gpu::estimate_gpu_memory, m)?)?;
     m.add_function(wrap_pyfunction!(accel::gpu::gpu_profile_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(accel::gpu::gpu_profile_reset, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::profile::cpu_profile_snapshot, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::profile::cpu_profile_reset, m)?)?;
     #[cfg(feature = "gpu")]
     {
         m.add_function(wrap_pyfunction!(accel::gpu_handoff::gpu_decode_shard, m)?)?;

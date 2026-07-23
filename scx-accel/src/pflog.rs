@@ -137,6 +137,7 @@ pub fn pflog_baseline_from_raw<S: ShardSource>(source: &S, four_alpha: f64) -> R
     let mut row_base = 0usize;
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         ensure_finite(&csr.data)?;
         let rows = csr.n_rows();
         if row_base + rows > n_obs {
@@ -195,6 +196,7 @@ pub fn pflog_baseline_from_delta<S: ShardSource>(delta_source: &S) -> Result<Vec
     let mut row_base = 0usize;
     for shard_idx in 0..delta_source.n_shards() {
         let csr = delta_source.read_shard(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         ensure_finite(&csr.data)?;
         let rows = csr.n_rows();
         if row_base + rows > n_obs {

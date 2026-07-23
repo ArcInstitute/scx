@@ -261,6 +261,7 @@ pub fn pseudobulk_aggregate(
             .read_shard_uncached(shard_idx)
             .map_err(crate::AccelError::Scx)?;
 
+        let _r = scx_format_io::reduction_guard();
         let shard_n_rows = shard_csr.n_rows();
         for row in 0..shard_n_rows {
             let cell_idx = global_row + row;

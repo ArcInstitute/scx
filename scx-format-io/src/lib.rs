@@ -24,6 +24,7 @@ pub mod deletion_vectors;
 pub mod distinct;
 pub mod encoder;
 pub mod mem;
+pub mod profile;
 pub mod reader;
 pub mod shard_decode;
 pub mod shard_source;
@@ -52,6 +53,10 @@ pub use encoder::{
     encode_shard_framed, FramingConfig, DEFAULT_ROW_GROUP_ROWS,
 };
 pub use mem::MemoryBudget;
+pub use profile::{
+    record_decode_since, record_io_since, record_marshalling_since, record_reduction_since,
+    reduction_guard, CodecClass, CpuProfileSnapshot, ReductionGuard, StageStat,
+};
 pub use reader::{
     assemble_filtered_metadata, assemble_sharded_metadata, decode_arrow_ipc_schema, ScxReader,
 };

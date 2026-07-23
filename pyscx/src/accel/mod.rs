@@ -34,6 +34,7 @@ pub mod neighbors;
 pub mod pca;
 pub mod pflog;
 pub mod preprocessing;
+pub mod profile;
 pub mod pseudobulk;
 #[cfg(feature = "gpu")]
 pub mod rapids;

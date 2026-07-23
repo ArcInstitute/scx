@@ -85,6 +85,7 @@ fn streaming_weighted_row_sums<S: ShardSource>(
     let mut row_base = 0usize;
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         ensure_finite(&csr.data)?;
         let rows = csr.n_rows();
         for r in 0..rows {

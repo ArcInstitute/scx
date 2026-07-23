@@ -51,6 +51,37 @@ Each entry in `runs`:
 | `peak_rss_mb` | `float` | Peak resident set size in MiB. |
 | `extra` | `dict` | Run-specific extra data. |
 
+### CPU stage profile (`extra["cpu_profile_*"]`)
+
+The `extra` dict is the free-form per-run channel. When the CPU per-stage
+profiler is enabled (`SCX_CPU_PROFILE=1` exported **before** the worker imports
+pyscx), the accel/read benchmark modules (`accel_pca`, `accel_hvg`,
+`accel_preprocess`, `accel_de`, `accel_format_pipeline`) record a
+decode / I-O / reduction / marshalling breakdown of the timed op into `extra`
+via `runners.accel_runner.cpu_profile_capture`. This is the Phase-2 **ranking
+oracle** — it tells you whether a streaming CPU accelerator op is decode/I-O-bound
+or reduction/marshalling-bound at a given scale, so no `×` speedup claim is
+trusted without it. Keys (all `float`; absent when the profiler is disabled):
+
+| Key | Meaning |
+|-----|---------|
+| `cpu_profile_enabled` | `1.0` iff the profiler was active for the run. |
+| `cpu_profile_io_ms` / `_count` / `_bytes` | Raw shard byte-fetch (mmap slice / cloud range read). ~0 for a warm local mmap (page-fault cost lands in `decode`). |
+| `cpu_profile_decode_scx1_ms` / `_count` / `_bytes` | Host decode of Scx1 shards. |
+| `cpu_profile_decode_generic_ms` / `_count` / `_bytes` | Host decode of None/Zstd/Lz4Shuffle/Pcodec/ShufDeltaZstd shards. |
+| `cpu_profile_reduction_ms` / `_count` | Per-shard kernel accumulation (disjoint from decode; includes the DE ranking pass). Its `_bytes` is always `0` — **not tracked** (no natural byte count for a kernel accumulation), not "zero bytes processed". |
+| `cpu_profile_marshalling_ms` / `_count` / `_bytes` | Python result assembly (`Vec<Vec<f32>>` → `PyArray2`). |
+
+The buckets are disjoint, so `io + decode + reduction + marshalling ≈ wall` for a
+streaming op. The Rust counters live in `scx_format_io::profile` (mirroring the
+GPU-path `scx_gpu::profile` / `SCX_GPU_PROFILE`) and are surfaced to Python via
+`pyscx.accel.cpu_profile_snapshot()` / `cpu_profile_reset()`. **Known gaps** (not
+captured in the `decode` bucket): the *framed/block-index* decode route
+(`decode_block_index_row_runs`) and the typed-dtype path
+(`read_shard_from_entry_native`) — a *full-shard* CSR **or CSC** decode routes
+through the central hook and **is** captured; and the cloud range-read readers that
+bypass the local `ScxReader` (current captures are local mmap only).
+
 ## File naming convention
 
 Raw results follow the naming pattern:

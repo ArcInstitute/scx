@@ -1095,6 +1095,33 @@ correctness (`pca_subspace_cos_min`, `knn_recall_vs_scanpy`,
 `accel_pca`/`accel_knn`/`accel_umap` gates, and `pipeline_route_rapids_correct`
 gates the rapids pipeline route (above).
 
+**CPU stage profile (`SCX_CPU_PROFILE`) — the Phase-2 ranking oracle.** To learn
+whether a streaming CPU accelerator op is decode/I-O-bound or
+reduction/marshalling-bound (so a `×` speedup claim can be trusted), export
+`SCX_CPU_PROFILE=1` **before** the worker imports pyscx. The accel/read modules
+(`accel_pca`, `accel_hvg`, `accel_preprocess`, `accel_de`,
+`accel_format_pipeline`) then record a per-run `cpu_profile_*` breakdown
+(io / decode-scx1 / decode-generic / reduction / marshalling) into `runs[].extra`
+via `runners.accel_runner.cpu_profile_capture` — the CPU twin of the GPU-path
+`SCX_GPU_PROFILE` / `bench_gpu_codec.py`. The buckets are disjoint
+(`io + decode + reduction + marshalling ≈ wall`). Capture example:
+
+```bash
+# from the scx-bench conda env, pyscx built --release
+SCX_CPU_PROFILE=1 python benchmarks/comprehensive/scripts/run_parallel.py \
+    --benchmarks accel_pca accel_hvg accel_preprocess accel_de \
+    --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k census_500k census_1m
+```
+
+The breakdown is diagnostic (`extra`), not floored in `thresholds.yaml`, so a
+profiled run does not gate — it ranks the Phase-2 optimization targets. Profiling
+adds a small per-shard atomic/`Instant` cost, so read the *ratios* from a profiled
+run and the absolute wall from an unprofiled run. **Known gaps** (absent from the
+`decode` bucket): the *framed/block-index* decode route and the typed-dtype path
+(`read_shard_from_entry_native`) — a full-shard CSR or CSC decode routes through the
+central hook and is captured — plus the cloud range-read readers that bypass the
+local `ScxReader` (current captures are local mmap only).
+
 **Per-op rapids-singlecell competitor (`accel_*__rapids_singlecell_gpu`).** Beyond
 the fused pipeline, every accel op carries a `rapids_singlecell_gpu` variant
 (`accel_{pca,knn,umap,leiden,preprocess,hvg}`) on the same fixture/device/dataset.

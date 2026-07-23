@@ -513,6 +513,7 @@ fn write_pca(
     result: &PcaResult,
     obsm_key: &str,
 ) -> PyResult<()> {
+    let marshal_start = scx_accel::cpu_profile::start();
     let embeddings = PyArray2::<f32>::from_vec2(
         py,
         &(0..result.n_obs)
@@ -523,6 +524,10 @@ fn write_pca(
             })
             .collect::<Vec<Vec<f32>>>(),
     )?;
+    scx_accel::cpu_profile::record_marshalling_since(
+        marshal_start,
+        result.n_obs * result.n_components * std::mem::size_of::<f32>(),
+    );
     adata.getattr("obsm")?.set_item(obsm_key, embeddings)?;
 
     let scale = (result.n_obs as f64 - 1.0).max(1.0);

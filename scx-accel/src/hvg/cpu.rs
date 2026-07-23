@@ -66,6 +66,7 @@ pub fn streaming_mean_var<S: ShardSource>(source: &S) -> Result<HvgStats> {
 
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         ensure_finite_hvg_data(&csr.data)?;
         for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
             let c = col as usize;
@@ -121,6 +122,7 @@ pub fn streaming_mean_var_expm1<S: ShardSource>(source: &S, scale: f64) -> Resul
 
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         ensure_finite_hvg_data(&csr.data)?;
         for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
             let c = col as usize;
@@ -173,6 +175,7 @@ pub fn streaming_clip_square_sum<S: ShardSource>(
 
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         ensure_finite_hvg_data(&csr.data)?;
         for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
             let c = col as usize;
@@ -220,6 +223,7 @@ pub fn streaming_mean_var_batched<S: ShardSource>(
     let mut cell_offset = 0usize;
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         ensure_finite_hvg_data(&csr.data)?;
         let n_rows = csr.n_rows();
 
@@ -320,6 +324,7 @@ pub fn streaming_clip_square_sum_batched<S: ShardSource>(
     let mut cell_offset = 0usize;
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
         ensure_finite_hvg_data(&csr.data)?;
         let n_rows = csr.n_rows();
 
