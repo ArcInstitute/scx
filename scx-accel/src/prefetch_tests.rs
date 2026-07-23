@@ -93,6 +93,78 @@ fn empty_source_is_noop() {
     assert_eq!(count, 0);
 }
 
+/// Source whose shard `0` stalls (spins) until `stall_head_until` *other*
+/// shards have decoded — forces the head-of-line-stall case that the
+/// spawn-on-consume fix must keep bounded.
+struct StallHeadSource {
+    n: usize,
+    n_vars: usize,
+    others_done: std::sync::atomic::AtomicUsize,
+    stall_head_until: usize,
+}
+
+impl ShardSource for StallHeadSource {
+    fn n_shards(&self) -> usize {
+        self.n
+    }
+    fn n_obs(&self) -> usize {
+        self.n
+    }
+    fn n_vars(&self) -> usize {
+        self.n_vars
+    }
+    fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
+        use std::sync::atomic::Ordering;
+        if shard_idx == 0 {
+            while self.others_done.load(Ordering::Acquire) < self.stall_head_until {
+                std::thread::yield_now();
+            }
+        } else {
+            self.others_done.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(ScxCsr::new_unchecked(
+            (1, self.n_vars),
+            vec![0, 1],
+            vec![0],
+            vec![1.0],
+        ))
+    }
+}
+
+/// Regression for the Cursor review: under a head-of-line stall the reorder
+/// buffer (decoded-but-unconsumed shards) must stay bounded by `depth`. With the
+/// old spawn-on-receive this grew to ~n_shards; spawn-on-consume caps it.
+#[test]
+fn head_stall_keeps_reorder_buffer_bounded_by_depth() {
+    // Skip on a single-thread pool (the prefetch path isn't taken there).
+    if rayon::current_num_threads() <= 1 {
+        return;
+    }
+    let depth = 4usize;
+    let n = 20usize;
+    let src = StallHeadSource {
+        n,
+        n_vars: 4,
+        others_done: std::sync::atomic::AtomicUsize::new(0),
+        // Head waits for the other primed shards (depth - 1) to decode.
+        stall_head_until: depth - 1,
+    };
+    MAX_REORDER_BUFFER.with(|m| m.set(0));
+    let mut seen = Vec::new();
+    for_each_shard_ordered(&src, depth, |idx, _csr| {
+        seen.push(idx);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, (0..n).collect::<Vec<_>>());
+    let peak = MAX_REORDER_BUFFER.with(|m| m.get());
+    assert!(
+        peak <= depth,
+        "reorder buffer peaked at {peak} shards, exceeding depth {depth} — \
+         the bounded-memory contract is violated"
+    );
+}
+
 #[test]
 fn worker_panic_becomes_error_not_hang() {
     let mut src = make_shards(32, 4);

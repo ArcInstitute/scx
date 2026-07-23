@@ -441,14 +441,24 @@ while decode now overlaps reduction and runs across shards. Applied to the decod
 streaming kernels: HVG (`streaming_mean_var{,_expm1}`, `streaming_clip_square_sum`, and
 the batched variants), `score_genes`, PFlog baselines, and pseudobulk aggregation.
 
-Two knobs (both default to the safe/bit-exact behaviour):
+Two knobs (both read once per process via `OnceLock`, so set them in the environment
+before the first accelerator call; both default to the safe/bit-exact behaviour):
 - **`SCX_ACCEL_PREFETCH_DEPTH`** — max shards decoded-but-unconsumed (default 4, capped
-  by the rayon pool size). `0`/`1` disables prefetch (sequential fallback). Peak extra
-  RSS is bounded to `depth` decoded shards.
+  by the rayon pool size). `0`/`1` disables prefetch (sequential fallback). New shards are
+  spawned only as one drains in shard order, so the decoded-but-unconsumed set — and hence
+  extra peak RSS — stays bounded to `depth` decoded shards **even under a head-of-line
+  stall** (regression-tested). This is a fixed small cap, not a per-shard byte budget.
 - **`SCX_ACCEL_REDUCTION_MODE`** — `stable` (default; ordered, bit-exact) vs `parallel`
-  (per-worker accumulators merged at the end, budget-derated; **tolerance-only** because
-  float summation reorders). The parallel mode is opt-in for the offset-independent
-  per-column reductions only.
+  (per-worker accumulators merged at the end, worker count derated by the CPU memory
+  budget; **tolerance-only** because float summation reorders). The parallel mode is opt-in
+  and reached **only** by the offset-independent per-column reductions (unbatched HVG
+  moments, clipped-square-sum); the offset-dependent kernels (batched HVG, `score_genes`,
+  PFlog, pseudobulk) always use the ordered path and ignore `parallel`.
+
+`for_each_shard_ordered` must not be called from within a rayon parallel region (the drain
+blocks the calling thread on the channel; a saturated pool worker would deadlock) — it
+detects a worker-thread caller and falls back to sequential decode, and this is why PCA
+(which owns inner rayon pools) is a deferred follow-up rather than wired here.
 
 **The win is multi-shard-gated.** A single-shard file (≤ the 16 384-row shard target,
 e.g. `pbmc3k`/`pbmc10k`) hits the `n_shards == 1` guard and runs the sequential path

@@ -102,8 +102,17 @@ pub fn prefetch_depth() -> usize {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(DEFAULT_PREFETCH_DEPTH);
         let threads = rayon::current_num_threads().max(1);
-        requested.min(threads.max(1))
+        requested.min(threads)
     })
+}
+
+// Reorder-buffer high-water mark, updated on the calling thread inside the drain
+// loop. Thread-local so concurrent test threads don't stomp each other's
+// measurement (the drain runs on the calling thread, which is the test thread).
+// Used by the head-of-line-stall bound test.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MAX_REORDER_BUFFER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Bounded, ordered decode-prefetch over `source`'s shards.
@@ -111,12 +120,24 @@ pub fn prefetch_depth() -> usize {
 /// Decodes up to `depth` shards concurrently on the rayon pool and invokes
 /// `consume(shard_idx, csr)` on the **calling thread in strict ascending shard
 /// order**. Accumulation performed inside `consume` therefore sees the exact
-/// sequential order → bit-reproducible.
+/// sequential order → bit-reproducible. Uses [`ShardSource::read_shard_arc`], so
+/// a caching source (e.g. `BackedCsrReader`) serves/populates its LRU; use
+/// [`for_each_shard_ordered_uncached`] for a single-pass op that must not warm
+/// the cache.
 ///
 /// Falls back to a plain sequential loop (no channel/threads) when `depth <= 1`,
-/// there is at most one shard, or the current rayon pool has a single thread
-/// (blocking the calling thread on the channel with no other worker to decode
-/// would otherwise stall).
+/// there is at most one shard, the current rayon pool has a single thread, or
+/// the caller is itself a rayon worker (see below).
+///
+/// # Must not be called from within a rayon parallel region
+///
+/// The drain runs on the calling thread and blocks on the channel while decode
+/// tasks run on other pool workers. If the caller is a saturated pool worker
+/// (nested `par_iter`/`scope`/`install`), those spawns can't schedule → deadlock.
+/// This is why PCA prefetch (which owns inner rayon pools) is deferred. The
+/// `current_thread_index().is_some()` fallback defuses it by decoding
+/// sequentially when invoked on a worker thread, but callers should still treat
+/// "top-level only" as the contract.
 ///
 /// A worker that panics while decoding is caught and delivered as an `Err`, so
 /// the drain loop always terminates. If `consume` returns `Err`, iteration
@@ -129,6 +150,26 @@ where
 {
     let n_shards = source.n_shards();
     let read = move |idx: usize| source.read_shard_arc(idx).map_err(AccelError::from);
+    for_each_ordered(n_shards, depth, &read, consume)
+}
+
+/// Like [`for_each_shard_ordered`] but decodes via [`ShardSource::read_shard`]
+/// (uncached) instead of `read_shard_arc`. For **single-pass** ops (e.g.
+/// pseudobulk aggregation) where warming a caching source's LRU yields no reuse
+/// and would only add cache pressure / evict a co-resident reader's entries
+/// (Cursor/Claude/Antigravity review). Same ordering + bounding guarantees.
+pub fn for_each_shard_ordered_uncached<S, F>(source: &S, depth: usize, consume: F) -> Result<()>
+where
+    S: ShardSource + Sync,
+    F: FnMut(usize, Arc<ScxCsr>) -> Result<()>,
+{
+    let n_shards = source.n_shards();
+    let read = move |idx: usize| {
+        source
+            .read_shard(idx)
+            .map(Arc::new)
+            .map_err(AccelError::from)
+    };
     for_each_ordered(n_shards, depth, &read, consume)
 }
 
@@ -166,7 +207,18 @@ where
     }
 
     let depth = depth.max(1);
-    if depth <= 1 || n_shards == 1 || rayon::current_num_threads() <= 1 {
+    // Sequential fallback (no channel/threads) when prefetch can't help or would
+    // be unsafe: trivial size, a single-thread pool, OR the caller is itself a
+    // rayon worker. The last case is the nesting-deadlock guard (Claude review):
+    // `in_place_scope` runs the drain on the calling thread, which then blocks on
+    // `rx.recv()`; if that thread is a pool worker and the pool is saturated, the
+    // decode spawns can never schedule. `current_thread_index().is_some()` is
+    // true exactly when we're on a rayon worker → decode sequentially instead.
+    if depth <= 1
+        || n_shards == 1
+        || rayon::current_num_threads() <= 1
+        || rayon::current_thread_index().is_some()
+    {
         for idx in 0..n_shards {
             let shard = read(idx)?;
             consume(idx, shard)?;
@@ -209,9 +261,14 @@ where
             }};
         }
 
-        // Prime with up to `in_flight_cap` tasks, then spawn one per received
-        // shard (rolling window). The BTreeMap holds ≤ `in_flight_cap - 1`
-        // out-of-order shards.
+        // Prime with up to `depth` tasks, then spawn one more **per ordered
+        // consume** (not per receive). This keeps the total live set —
+        // in-flight + in-channel + in the reorder buffer — at ≤ `depth` even
+        // under a head-of-line stall: if shard 0 is slow, no shard beyond the
+        // primed `depth` is ever spawned until shard 0 drains, so the BTreeMap
+        // can hold at most `depth - 1` out-of-order shards (Cursor review — the
+        // earlier spawn-on-receive let the buffer grow to ~n_shards and broke
+        // the RSS bound).
         let mut next_to_spawn = 0usize;
         let prime = in_flight_cap.min(n_shards);
         while next_to_spawn < prime {
@@ -229,15 +286,18 @@ where
                 )
             })?;
             received += 1;
-            if next_to_spawn < n_shards {
-                spawn_shard!(s, next_to_spawn);
-                next_to_spawn += 1;
-            }
             buffer.insert(idx, res);
+            #[cfg(test)]
+            MAX_REORDER_BUFFER.with(|m| m.set(m.get().max(buffer.len())));
             while let Some(res) = buffer.remove(&next_idx) {
                 let shard = res?;
                 consume(next_idx, shard)?;
                 next_idx += 1;
+                // Spawn the next shard only as one drains, bounding the live set.
+                if next_to_spawn < n_shards {
+                    spawn_shard!(s, next_to_spawn);
+                    next_to_spawn += 1;
+                }
             }
         }
         Ok(())

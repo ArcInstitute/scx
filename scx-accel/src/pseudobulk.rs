@@ -255,10 +255,12 @@ pub fn pseudobulk_aggregate(
     // Stream shards with ordered decode-prefetch (2.1). Counts land in
     // per-group bins keyed by the global cell index, so shards must be consumed
     // in order for the `global_row` cursor to map cells correctly — StableOrder
-    // (`for_each_shard_ordered`) is the only valid mode. `BackedCsrReader` is a
-    // `ShardSource`, so the prefetch drives its LRU-cached decode.
+    // is the only valid mode. Pseudobulk is a **single pass**, so use the
+    // *uncached* prefetch variant: `read_shard` (not the LRU `read_shard_arc`),
+    // preserving the pre-2.1 `read_shard_uncached` behaviour so this pass does
+    // not warm/evict the shared shard cache (review feedback).
     let mut global_row = 0usize;
-    crate::prefetch::for_each_shard_ordered(
+    crate::prefetch::for_each_shard_ordered_uncached(
         reader,
         crate::prefetch::prefetch_depth(),
         |_shard_idx, shard_csr| {
