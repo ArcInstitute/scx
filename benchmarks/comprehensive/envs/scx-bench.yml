@@ -113,3 +113,15 @@ dependencies:
     # cellstream shares scx-bench alongside shardad.
     - pyfastpfor>=1.4
     - -e /home/nickyoungblut/dev/python/cellstream
+    # Data-load Phase 0 competitor loaders (exercised by ooc_loader):
+    #   * annbatch (scverse/Lamin) — pre-shuffle-to-sharded-zarr + Loader. The
+    #     [zarrs] extra pulls the Rust zarr codec pipeline (local-FS perf; not
+    #     used for remote stores). Deps (zarr>=3, anndata, numba) are compatible
+    #     with this env.
+    #   * scDataset (ICML 2026) — block-sample + batched-fetch IterableDataset
+    #     over a backed h5ad; pure-Python, torch already present.
+    #   * AnnLoader ships in anndata.experimental — no install line needed.
+    # BioNeMo-SCDL is intentionally NOT added: its NeMo/CUDA deps conflict and
+    # need an isolated env — deferred fast-follow (see thresholds.yaml).
+    - annbatch[zarrs]>=0.2.1
+    - scDataset>=0.3.0

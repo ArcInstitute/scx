@@ -504,35 +504,14 @@ class FormatRunner(ABC):
         ``fadvise`` only evicts CLEAN pages — any recent writes on the path
         must be ``fsync``'d first (benchmark reads don't write, so this
         isn't a concern for the read-path).
+
+        Implementation lives in ``benchmarks.comprehensive.cache_control`` so
+        benchmark modules (not just runners) can share it; this method
+        delegates to keep one code path.
         """
-        path = Path(path)
-        if not path.exists():
-            return "warm"
-        try:
-            subprocess.run(["sync"], check=False)  # best-effort — no error surfaced on failure
-            files: list[Path] = (
-                [path] if path.is_file()
-                else [p for p in path.rglob("*") if p.is_file()]
-            )
-            evicted = 0
-            for fp in files:
-                try:
-                    fd = os.open(str(fp), os.O_RDONLY)
-                except OSError:
-                    continue
-                try:
-                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                    evicted += 1
-                except (AttributeError, OSError):
-                    # AttributeError: pre-Py-3.3 or platform without
-                    # POSIX_FADV_DONTNEED (macOS, WSL1). OSError: kernel
-                    # refused the hint (rare).
-                    pass
-                finally:
-                    os.close(fd)
-            return "cold_fadvise" if evicted > 0 else "warm"
-        except Exception:  # noqa: BLE001 — cache-drop is best-effort
-            return "warm"
+        from benchmarks.comprehensive.cache_control import drop_file_cache
+
+        return drop_file_cache(path)
 
     @staticmethod
     def _gc_collect() -> None:

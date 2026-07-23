@@ -35,6 +35,12 @@ ALL_BENCHMARKS: list[str] = [
     # true-peak RSS sampler. Shows scx-flat vs shardad-linear peak RSS.
     "ooc_rss_boundary",
     "ml_loader",
+    # Data-load Phase 0 — honest out-of-core sequential-loader throughput with
+    # a page-cache drop before every timed epoch (unlike ml_loader's warm,
+    # page-cache-resident number). SCX + TileDB-SOMA-ML + AnnLoader + annbatch +
+    # scDataset; reports samples/s + epoch wall-time + true-peak RSS. Gated to
+    # SUPPORTED_FORMATS inside the module.
+    "ooc_loader",
     # Correctness validation — scanpy / backed / preprocessing parity.
     # SCX-only (gated on format_variant.key == "scx_auto" inside the module).
     "correctness",
@@ -62,6 +68,13 @@ ALL_BENCHMARKS: list[str] = [
     # IndexPlanDataset throughput (plan-driven paired reads).
     # SCX-only (gated on scx_auto inside the module).
     "index_plan",
+    # Data-load Phase 0 — S=64 covariate-grouped cell-set gather throughput
+    # (the STATE/STATE3 hot path, distinct from i.i.d. batch rate) via
+    # SparseCellSetDataset. SCX-only.
+    "cellset_gather",
+    # Data-load Phase 0 — per-file obs-open cost microbench (matrix-free SCX
+    # read_obs vs anndata eager-obs baseline) at 1-file + manifest scale.
+    "obs_open",
     # Cloud (GCP) — Phase C through F
     "cloud_push",
     "cloud_pull",

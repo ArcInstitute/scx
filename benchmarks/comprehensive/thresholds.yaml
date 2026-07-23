@@ -2013,3 +2013,28 @@ absolute_floors:
 #    add a `discrimination_route_gpu_correct` floor mirroring the two above, plus
 #    an `accel_eval_metrics__pyscx_discrimination_score_gpu` variant. The
 #    `discrimination_score` op stamps only `cpu_*` routes today.
+#
+# 7. Data-load Phase 0 signals: ooc_loader / cellset_gather / obs_open
+#    Blocker: NEW metrics with no captured baseline yet. Gating a metric before
+#    it exists in a snapshot synthesises a "missing metric" violation on every
+#    run, so these stay deferred until the Phase-0 baseline is captured +
+#    promoted (see benchmarks/README.md; capture pins a NEW baseline, NOT the
+#    accel-only LATEST). Metrics to floor once captured (convention: SCX own
+#    throughput/RSS at 0.85× / 1.15× the measured min-run; competitors at
+#    0.5× / 2× median):
+#      * ooc_loader / {scx_auto,scx_fast} / {pbmc10k,tabula_sapiens_100k,
+#        census_500k,census_1m} — `samples_per_sec__raw`,
+#        `samples_per_sec__hvg_norm` (min), `peak_rss_mb__raw` (max).
+#      * ooc_loader competitor rows (h5ad_none / annloader / annbatch /
+#        scdataset) — `samples_per_sec__*` at 0.5× median, guarding a
+#        harness/env break that tanks the comparison.
+#      * cellset_gather / {scx_auto,scx_fast} / {tabula_sapiens_100k,census_1m}
+#        — `cellsets_per_sec__gather_random`, `cellsets_per_sec__gather_grouped`
+#        (min); grouped ≥ random validates grouped-sharding locality.
+#      * obs_open / scx_auto — `obs_open_s_per_file__open_1file`,
+#        `obs_open_s_per_file__open_manifest` (max); the matrix-free SCX open
+#        must stay well under the h5ad_none eager-obs baseline (the Phase-1A
+#        before/after number).
+#    BioNeMo-SCDL ooc_loader row: DEFERRED (isolated NeMo/CUDA env not yet
+#    added — see envs/scx-bench.yml note). Only AnnLoader + annbatch + scDataset
+#    are wired for Phase 0.
