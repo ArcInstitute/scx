@@ -60,12 +60,25 @@ measure only the two default codecs (adaptive `auto`, decode-max `fast`)."""
 _SET_SIZE = 64
 # Cells per batch ≈ ML_BATCH_SIZE → 16 sets/batch.
 _SETS_PER_BATCH = 16
-_DEFAULT_N_BATCHES = 500
+# The current raw-local gather path is unoptimized (the report's Phase-1 target):
+# a scattered 1024-cell batch costs ~O(seconds) even on small files. Throughput
+# (sets/s) is a rate, so a modest batch count measures it faithfully without a
+# runaway epoch — 500 batches × 5 runs × 2 scenarios timed out an 11k-cell fixture
+# at 95 min. Keep the count small and uniform; scale down further for big files.
+_DEFAULT_N_BATCHES = 50
 _LARGE_N_OBS = 30_000
 _MIN_N_BATCHES = 30
 _WARMUP_BATCHES = 3
+# Cap timed runs regardless of the harness default — the throughput median is
+# stable across a few runs and each run is expensive on the pre-optimization path.
+_MAX_N_RUNS = 3
 # Locality bucket when no categorical obs column is usable (≈ one shard).
 _LOCALITY_GROUP_SIZE = 4096
+# Skip obs columns whose cardinality exceeds this — a near-unique column (e.g.
+# a per-cell soma_joinid) yields singleton "groups" (grouped == random) AND made
+# the old per-value `np.where` grouping O(n_distinct × n_obs), which blew up /
+# FAST_FAILed on census_5m. Prefer a real covariate (cell_type-scale).
+_MAX_GROUPS = 5000
 
 
 def _have_pyscx() -> bool:
@@ -93,9 +106,12 @@ def _resolve_groups(scx_path: str, n_obs: int) -> list[np.ndarray]:
     """Return a list of row-index arrays, one per covariate group.
 
     Reads a single categorical/object ``obs`` column via ``read_obs`` (matrix-
-    free; no X touched). Picks the first column with ``1 < n_distinct < n_obs``.
-    Falls back to ``index // _LOCALITY_GROUP_SIZE`` buckets when none qualifies
-    (test fixtures / atlases with only a barcode index)."""
+    free; no X touched). Picks the first column with ``1 < n_distinct <=
+    _MAX_GROUPS`` (a real covariate; high-cardinality columns are skipped).
+    Groups are built with an O(n log n) argsort split — NOT a per-value
+    ``np.where`` scan, which is O(n_distinct × n_obs) and blows up at census
+    scale. Falls back to ``index // _LOCALITY_GROUP_SIZE`` buckets when no
+    column qualifies (barcode-index-only fixtures / atlases)."""
     try:
         import pyscx
 
@@ -109,12 +125,21 @@ def _resolve_groups(scx_path: str, n_obs: int) -> list[np.ndarray]:
             if col not in df.columns:
                 continue
             codes = df[col].astype("category").cat.codes.to_numpy()
-            n_distinct = int(codes.max()) + 1 if codes.size else 0
-            if 1 < n_distinct < n_obs:
-                groups = [np.where(codes == c)[0].astype(np.uint64) for c in range(n_distinct)]
-                groups = [g for g in groups if g.size > 0]
-                if len(groups) > 1:
-                    return groups
+            if codes.size == 0:
+                continue
+            n_distinct = int(codes.max()) + 1
+            # Require a modest, real covariate cardinality.
+            if not (1 < n_distinct <= _MAX_GROUPS):
+                continue
+            # O(n log n) group split: sort row indices by code, then cut at
+            # the unique-value boundaries. No per-value scan.
+            order = np.argsort(codes, kind="stable").astype(np.uint64)
+            sorted_codes = codes[order.astype(np.int64)]
+            _, starts = np.unique(sorted_codes, return_index=True)
+            groups = [g for g in np.split(order, starts[1:]) if g.size > 0]
+            if len(groups) > 1:
+                logger.info("cellset grouping on obs[%r]: %d groups", col, len(groups))
+                return groups
     except Exception as e:  # noqa: BLE001
         logger.info("obs grouping unavailable (%s); using index buckets", e)
     # Fallback: contiguous index buckets.
@@ -256,6 +281,7 @@ def run(
 
     n_obs = dataset.n_obs
     n_batches = _n_batches_for(n_obs)
+    n_runs = max(1, min(n_runs, _MAX_N_RUNS))
     groups = _resolve_groups(scx_path, n_obs)
 
     result = BenchmarkResult(
