@@ -389,6 +389,28 @@ pub fn pseudobulk_dex(
              (which merges groupby + stratify_by for you).",
         ));
     }
+    // §2.4: the NB-GLM backend fits a fixed [intercept, is_target] design and
+    // does NOT consume a caller-supplied `design`. Accepting one and silently
+    // ignoring it would discard a scientific argument, so reject it explicitly.
+    // (Honoring a custom design for this backend is tracked as a follow-on;
+    // use backend="pydeseq2" for custom designs today.)
+    if backend == "nb_glm" && design.is_some() {
+        return Err(PyValueError::new_err(
+            "pseudobulk_dex(backend=\"nb_glm\") does not support a custom `design`: it \
+             fits a fixed intercept + target-indicator design. Pass the covariate as a \
+             groupby/replicate column, or use backend=\"pydeseq2\" for a custom design.",
+        ));
+    }
+    // §2.5: the NB count likelihood requires replicate-level *summed* counts.
+    // Fractional aggregates (mean/median) are not valid inputs to the model, so
+    // the count backend accepts only aggr_method="sum".
+    if backend == "nb_glm" && aggr_method != "sum" {
+        return Err(PyValueError::new_err(format!(
+            "pseudobulk_dex(backend=\"nb_glm\") requires aggr_method=\"sum\" (got \
+             {aggr_method:?}): the negative-binomial count model is defined on summed \
+             replicate counts, not fractional {aggr_method} aggregates."
+        )));
+    }
 
     // Record the planned route on adata.uns["scx_accel"]["pseudobulk_dex"].
     // Pseudobulk aggregation + pydeseq2 is CPU-only; the only dispatch choice is

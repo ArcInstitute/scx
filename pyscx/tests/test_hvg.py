@@ -73,6 +73,77 @@ class TestSeuratV3:
         overlap = len(scx_hvg & ref_hvg) / max(len(ref_hvg), 1)
         assert overlap > 0.80, f"HVG overlap {overlap:.2f} < 0.80"
 
+    def test_batch_column_parity_with_scanpy(self, scx_from_adata):
+        """§2.2: multi-batch seurat_v3 publishes the per-gene MEDIAN rank (not
+        selection order), writes `highly_variable_nbatches`, uses a true
+        even-median, and sorts NaN ranks last — column parity with scanpy.
+
+        Uses an even batch count (4) so `np.ma.median` averages the two middle
+        ranks, exercising the even-median fix (half-integer ranks appear).
+        """
+        import anndata as ad
+        import pandas as pd
+        import pyscx
+        import scanpy as sc
+
+        pytest.importorskip("skmisc")
+        rng = np.random.default_rng(11)
+        n_per, n_vars, n_batches = 200, 80, 4
+        blocks, batches = [], []
+        for b in range(n_batches):
+            means = rng.uniform(0.3, 4.0, size=n_vars) * (1.0 + 0.25 * b)
+            blocks.append(
+                rng.poisson(means[None, :], size=(n_per, n_vars)).astype(np.float32)
+            )
+            batches += [f"b{b}"] * n_per
+        raw = ad.AnnData(X=np.vstack(blocks))
+        raw.obs_names = [f"c{i}" for i in range(raw.n_obs)]
+        raw.var_names = [f"g{j}" for j in range(n_vars)]
+        raw.obs["batch"] = pd.Categorical(batches)
+
+        path = scx_from_adata(raw.copy(), "hvg_v3_batch_parity.scx")
+        a = pyscx.open(path).to_anndata(backed=True)
+        pyscx.accel.highly_variable_genes(
+            a, n_top_genes=25, flavor="seurat_v3", batch_key="batch"
+        )
+
+        ref = raw.copy()
+        sc.pp.highly_variable_genes(
+            ref, n_top_genes=25, flavor="seurat_v3", batch_key="batch"
+        )
+
+        # highly_variable_nbatches is now written (was omitted) and matches.
+        assert "highly_variable_nbatches" in a.var.columns
+        np.testing.assert_array_equal(
+            a.var["highly_variable_nbatches"].values,
+            ref.var["highly_variable_nbatches"].values,
+        )
+        # Published rank is the per-gene median (NaN-last), matching scanpy —
+        # NOT the old 0..n_top-1 selection order.
+        rk = np.asarray(a.var["highly_variable_rank"], dtype=float)
+        np.testing.assert_array_equal(np.isnan(rk), np.isnan(ref.var["highly_variable_rank"].values.astype(float)))
+        np.testing.assert_allclose(
+            rk,
+            np.asarray(ref.var["highly_variable_rank"], dtype=float),
+            equal_nan=True,
+        )
+        finite_ranks = np.sort(rk[~np.isnan(rk)])
+        assert not np.array_equal(
+            finite_ranks, np.arange(finite_ranks.size, dtype=float)
+        ), "highly_variable_rank is still the old selection-order sequence"
+        assert np.any(finite_ranks != np.floor(finite_ranks)), (
+            "even-median should produce at least one half-integer rank"
+        )
+        np.testing.assert_allclose(
+            np.asarray(a.var["variances_norm"], dtype=float),
+            np.asarray(ref.var["variances_norm"], dtype=float),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        np.testing.assert_array_equal(
+            a.var["highly_variable"].values, ref.var["highly_variable"].values
+        )
+
     def test_after_filter_genes(self, scx_path):
         """HVG works after filter_genes (with active col_projection)."""
         import pyscx
@@ -179,6 +250,94 @@ class TestSeurat:
         # The seurat_v3 flavor achieves >99% on real data; seurat flavor is
         # more sensitive to binning details. Overlap >30% confirms reasonable gene selection.
         assert overlap > 0.30, f"Seurat HVG overlap {overlap:.2f} < 0.30"
+
+    def test_column_parity_with_scanpy(self, scx_from_adata):
+        """§2.1: every published seurat column matches scanpy 1.12 when both
+        see IDENTICAL log-normalized data.
+
+        The moments must be computed in count space (`expm1` first, honoring
+        `uns['log1p']['base']`), `means` published as `log1p(count-mean)`,
+        `dispersions` as `log(var/mean)`, and singleton bins normalized to
+        exactly 1. We normalize+log1p once with scanpy and write THAT matrix to
+        SCX so this isolates the HVG algorithm from the `normalize_total`
+        default divergence (§3.5).
+        """
+        import anndata as ad
+        import pyscx
+        import scanpy as sc
+
+        rng = np.random.default_rng(3)
+        n_obs, n_vars = 400, 60
+        X = rng.poisson(0.4, size=(n_obs, n_vars)).astype(np.float32)
+        X[:, 0] = rng.poisson(8, size=n_obs)
+        X[:, 5] = rng.poisson(5, size=n_obs)
+        raw = ad.AnnData(X=X)
+        raw.obs_names = [f"c{i}" for i in range(n_obs)]
+        raw.var_names = [f"g{j}" for j in range(n_vars)]
+
+        ref = raw.copy()
+        sc.pp.normalize_total(ref, target_sum=1e4)
+        sc.pp.log1p(ref)
+
+        path = scx_from_adata(ref.copy(), "hvg_seurat_parity.scx")
+        a = pyscx.open(path).to_anndata(backed=True)
+        a.uns["log1p"] = {"base": None}
+        pyscx.accel.highly_variable_genes(a, n_top_genes=15, flavor="seurat", n_bins=10)
+
+        ref2 = ref.copy()
+        sc.pp.highly_variable_genes(ref2, n_top_genes=15, flavor="seurat", n_bins=10)
+
+        for col in ["means", "dispersions", "dispersions_norm"]:
+            np.testing.assert_allclose(
+                np.asarray(a.var[col], dtype=float),
+                np.asarray(ref2.var[col], dtype=float),
+                rtol=1e-5,
+                atol=1e-5,
+                equal_nan=True,
+                err_msg=f"seurat column '{col}' diverges from scanpy",
+            )
+        np.testing.assert_array_equal(
+            a.var["highly_variable"].values, ref2.var["highly_variable"].values
+        )
+
+    def test_non_default_log_base_parity(self, scx_from_adata):
+        """§2.1: `expm1` un-log honors `uns['log1p']['base']`. With a base-2
+        log1p, count-space moments (and all columns) still match scanpy."""
+        import anndata as ad
+        import pyscx
+        import scanpy as sc
+
+        rng = np.random.default_rng(7)
+        n_obs, n_vars = 400, 50
+        counts = rng.poisson(1.0, size=(n_obs, n_vars)).astype(np.float32)
+        counts[:, 1] = rng.poisson(9, size=n_obs)
+        # log1p with base 2: stored = log2(1 + normalized_count).
+        norm = ad.AnnData(X=counts.copy())
+        norm.obs_names = [f"c{i}" for i in range(n_obs)]
+        norm.var_names = [f"g{j}" for j in range(n_vars)]
+        sc.pp.normalize_total(norm, target_sum=1e4)
+        sc.pp.log1p(norm, base=2)  # sets uns["log1p"]["base"] = 2
+
+        path = scx_from_adata(norm.copy(), "hvg_seurat_base2.scx")
+        a = pyscx.open(path).to_anndata(backed=True)
+        a.uns["log1p"] = {"base": 2}
+        pyscx.accel.highly_variable_genes(a, n_top_genes=12, flavor="seurat", n_bins=10)
+
+        ref = norm.copy()
+        sc.pp.highly_variable_genes(ref, n_top_genes=12, flavor="seurat", n_bins=10)
+
+        for col in ["means", "dispersions", "dispersions_norm"]:
+            np.testing.assert_allclose(
+                np.asarray(a.var[col], dtype=float),
+                np.asarray(ref.var[col], dtype=float),
+                rtol=1e-4,
+                atol=1e-4,
+                equal_nan=True,
+                err_msg=f"base-2 seurat column '{col}' diverges from scanpy",
+            )
+        np.testing.assert_array_equal(
+            a.var["highly_variable"].values, ref.var["highly_variable"].values
+        )
 
 
 # ---------------------------------------------------------------------------

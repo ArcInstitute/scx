@@ -16,10 +16,15 @@ use super::gpu::resolve_device;
 
 /// Run Harmony2 batch integration on PCA embeddings stored in AnnData.
 ///
-/// Mirrors `scanpy.external.pp.harmony_integrate()` — corrects batch effects
-/// in `adata.obsm[basis]` via iterative soft clustering + ridge regression
-/// and writes the corrected embeddings to `adjusted_basis` (a new obsm key),
-/// preserving the input `basis`.
+/// Scanpy-shaped signature (same role as `scanpy.external.pp.harmony_integrate()`)
+/// but a distinct implementation: a clean-room **Harmony2 / R-harmony**
+/// integrator validated against cached R fixtures — NOT the harmonypy algorithm
+/// scanpy wraps, and defaults differ (see `harmony/cpu.rs`). Corrects batch
+/// effects in `adata.obsm[basis]` via iterative soft clustering + ridge
+/// regression and writes the corrected embeddings to `adjusted_basis` (a new
+/// obsm key), preserving the input `basis`. (Contract resolution — a `mode=`
+/// pin or documented divergence — is tracked separately; this only drops the
+/// inaccurate "mirrors harmonypy" claim.)
 ///
 /// Args:
 ///     adata: AnnData with PCA embeddings at `adata.obsm[basis]`.

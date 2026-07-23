@@ -154,6 +154,53 @@ def test_pseudobulk_dex_nbglm_backend():
     assert adata.uns["scx_accel"]["pseudobulk_dex"]["route"] == "cpu_nb_glm"
 
 
+def test_pseudobulk_dex_nbglm_rejects_custom_design():
+    """§2.4: backend='nb_glm' fits a fixed intercept+target design and must
+    reject a supplied `design` rather than silently ignoring it."""
+    adata = _perturb_adata()
+    with pytest.raises(ValueError, match="does not support a custom `design`"):
+        pyscx.accel.pseudobulk_dex(
+            adata,
+            groupby=["perturbation", "donor"],
+            test_col="perturbation",
+            reference=REFERENCE,
+            design="~ perturbation + donor",
+            min_cells_per_group=1,
+            backend="nb_glm",
+        )
+    # The pydeseq2 backend still accepts a custom design (no rejection here).
+    pytest.importorskip("pydeseq2")
+
+
+def test_pseudobulk_dex_nbglm_requires_sum_aggregation():
+    """§2.5: the NB count likelihood is defined on summed integer counts, so
+    the nb_glm backend must reject mean (fractional) aggregation."""
+    adata = _perturb_adata()
+    with pytest.raises(ValueError, match='requires aggr_method="sum"'):
+        pyscx.accel.pseudobulk_dex(
+            adata,
+            groupby=["perturbation", "donor"],
+            test_col="perturbation",
+            reference=REFERENCE,
+            aggr_method="mean",
+            min_cells_per_group=1,
+            backend="nb_glm",
+        )
+
+
+def test_nb_glm_rejects_fractional_counts():
+    """§2.5: the low-level nb_glm fitter shares the count-contract validator —
+    fractional (non-integer) counts are rejected."""
+    # 4 samples × 1 gene (default counts_axis="samples_by_genes"); sample 1 is fractional.
+    counts = np.array([[10.0], [20.5], [30.0], [40.0]], dtype=np.float64)
+    design = np.array([[1, 0], [1, 0], [1, 1], [1, 1]], dtype=np.float64)
+    with pytest.raises(RuntimeError, match="integer count"):
+        pyscx.accel.nb_glm(counts, design, contrast=1)
+    # Integer-valued counts pass the same validator.
+    counts_ok = np.array([[10.0], [20.0], [30.0], [40.0]], dtype=np.float64)
+    pyscx.accel.nb_glm(counts_ok, design, contrast=1)
+
+
 def test_pdex_nb_glm_spearman_parity_vs_pdex_ref():
     pl = pytest.importorskip("polars")
     spearmanr = pytest.importorskip("scipy.stats").spearmanr

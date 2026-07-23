@@ -44,12 +44,22 @@ pub struct LeidenConfig {
     pub seed: Option<u64>,
     /// Resolution parameter γ — higher values yield more communities (default 1.0).
     pub resolution: f64,
-    /// Whether to refine partition for well-connected communities (default true).
+    /// Whether to run the refinement phase (singleton-start constrained
+    /// moving) between local-moving passes (default true).
+    ///
+    /// NOTE: this refinement moves singleton nodes greedily but does NOT
+    /// implement the paper's node/candidate **well-connectedness admissibility
+    /// conditions** or `theta`-randomized selection, so it is not the full
+    /// Leiden well-connected-community guarantee — closer to Louvain with
+    /// constrained refinement. (Tracked for completion; do not describe the
+    /// output as "well-connected communities".)
     pub refine_partition: bool,
     /// Whether to consider moving nodes to empty communities (default true).
     pub consider_empty_community: bool,
     /// Use parallel (conflict-free batched) local moving instead of sequential.
-    /// Sequential (default, `false`) matches C++ leidenalg exactly.
+    /// Sequential (default, `false`) reproduces C++ libleidenalg's move-node
+    /// *ordering* (not a guarantee of overall-algorithm parity — see
+    /// `refine_partition`).
     /// Parallel (`true`) is faster on large graphs but converges to a
     /// different local optimum due to stale-read approximation.
     pub parallel: bool,
@@ -1315,7 +1325,9 @@ impl LeidenOptimizer {
 ///   Each outer iteration is one complete hierarchical Leiden pass
 ///   (move → refine → aggregate → repeat until graph stops collapsing).
 /// * `parallel` — Use parallel (conflict-free batched) local moving. Default `false`
-///   uses sequential moving that matches C++ leidenalg exactly.
+///   uses sequential moving that reproduces C++ libleidenalg's move-node
+///   *ordering* (the refinement omits the paper's well-connectedness
+///   admissibility conditions — see `LeidenConfig::refine_partition`).
 #[allow(clippy::too_many_arguments)]
 pub fn leiden(
     indptr: &[i64],

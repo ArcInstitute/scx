@@ -9,7 +9,7 @@ pub mod gpu;
 
 pub use cpu::{
     streaming_clip_square_sum, streaming_clip_square_sum_batched, streaming_mean_var,
-    streaming_mean_var_batched, BatchedHvgStats, HvgStats,
+    streaming_mean_var_batched, streaming_mean_var_expm1, BatchedHvgStats, HvgStats,
 };
 #[cfg(feature = "gpu")]
 pub use gpu::{
