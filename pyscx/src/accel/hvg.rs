@@ -1147,7 +1147,12 @@ fn log1p_base_scale(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<f64> {
         Ok(v) if !v.is_none() => v,
         _ => return Ok(1.0),
     };
-    let base: f64 = base.extract()?;
+    // Defensive: an unexpected `base` type (not a number) must not crash HVG —
+    // fall back to natural-log scale (1.0), matching the "no recorded base" case.
+    let base: f64 = match base.extract() {
+        Ok(b) => b,
+        Err(_) => return Ok(1.0),
+    };
     if base <= 0.0 || base == 1.0 {
         return Ok(1.0);
     }

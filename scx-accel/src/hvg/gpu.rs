@@ -2,9 +2,17 @@
 //!
 //! Thin dispatchers: forward to the CPU path for `device = "cpu"` and to the
 //! `scx-gpu` streaming kernels for `device = "gpu"`. A requested GPU route that
-//! fails to initialize is a hard [`crate::error::AccelError::GpuInitFailed`], never a silent
-//! CPU fallback (§4.1) — the binding resolves `"auto"` to `"cpu"` up front when
-//! no GPU is available, so only an explicit/available GPU request reaches here.
+//! fails to initialize is a hard [`crate::error::AccelError::GpuInitFailed`],
+//! never a silent CPU fallback (§4.1).
+//!
+//! `device = "auto"` is resolved to CPU up front by the binding when **no GPU
+//! is visible** (`gpu_available()` is false). A GPU that is *visible* but whose
+//! context fails to initialize (compute-exclusive already claimed, ECC/XID,
+//! context-time OOM, driver/runtime mismatch) surfaces `GpuInitFailed` even
+//! under `auto` — a deliberate fail-loud choice: the op errors rather than
+//! silently returning a CPU result under a GPU route stamp. (Graceful
+//! auto-degradation on a broken context would be an untestable branch — it
+//! cannot be exercised on a healthy GPU — so it is intentionally not done here.)
 
 use scx_format_io::ShardSource;
 
@@ -34,11 +42,14 @@ use crate::error::Result;
 ///
 /// Only available with `feature = "gpu"`.
 ///
-/// A GPU route was requested (`device = "gpu"`), so GPU init failure is a hard
-/// error ([`crate::error::AccelError::GpuInitFailed`]) — it does NOT silently fall back to the
-/// CPU kernel, which would run under a GPU route stamp (§4.1). Callers that
-/// want CPU on absent hardware pass `device = "cpu"` (or `"auto"`, resolved to
-/// CPU by the binding when [`crate::gpu_available`] is false).
+/// A GPU route was requested (`device = "gpu"`, or `"auto"` on a host with a
+/// visible GPU), so GPU init failure is a hard error
+/// ([`crate::error::AccelError::GpuInitFailed`]) — it does NOT silently fall
+/// back to the CPU kernel, which would run under a GPU route stamp (§4.1).
+/// Callers that want CPU on absent hardware pass `device = "cpu"` (or `"auto"`,
+/// which the binding resolves to CPU when [`crate::gpu_available`] is false).
+/// A *visible-but-broken-context* GPU under `auto` fails loud rather than
+/// degrading (see the module docs).
 pub fn streaming_mean_var_with_device<S: ShardSource + Sync>(
     source: &S,
     device: &str,

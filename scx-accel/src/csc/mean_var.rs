@@ -140,7 +140,9 @@ pub fn streaming_clip_square_sum_csc<S: ColumnShardSource + ?Sized>(
 // requires `S: Sync` because the device source pipelines decode on a scoped
 // worker thread. A requested GPU route that fails to initialize errors
 // (`AccelError::GpuInitFailed`) rather than silently running the CPU CSC kernel
-// under a GPU route stamp (§4.1).
+// under a GPU route stamp (§4.1). This holds for `device="gpu"` and for
+// `device="auto"` on a host with a visible-but-broken-context GPU (fail-loud);
+// `auto` resolves to CPU up front only when no GPU is visible.
 // ---------------------------------------------------------------------------
 
 /// Device-dispatched [`streaming_mean_var_csc`].

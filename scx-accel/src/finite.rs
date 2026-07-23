@@ -7,9 +7,11 @@
 //! accelerator entry, validated where the streaming pass already touches
 //! every nonzero — not at file ingest.
 //!
-//! This is the single primitive used by every storage route (CSR and CSC,
-//! in-memory and backed) so the guard cannot be enforced on one layout and
-//! skipped on another.
+//! This is the single primitive used by every **HVG** storage route (CSR and
+//! CSC, in-memory and backed) so the guard cannot be enforced on one layout and
+//! skipped on another. (Other accelerators — `diffexp`, `gene_score`, `pflog`
+//! — still carry their own local finiteness checks; consolidating those is out
+//! of scope here.)
 
 use crate::error::{AccelError, Result};
 

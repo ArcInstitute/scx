@@ -14,8 +14,8 @@
 //!   kernel `exp(-D · beta)` on the raw neighbour distances,
 //! * Simpson index over kernel-weighted neighbour probabilities.
 //!
-//! Numerical parity against the reference is asserted per-cell by
-//! `test_lisi_matches_reference` (fixture generated from harmonypy's
+//! Numerical parity against the reference is asserted per-cell by the pyscx
+//! test `test_lisi_matches_harmonypy_per_cell` (compared against harmonypy's
 //! `compute_lisi`), not merely on the dataset-wide mean.
 
 use rayon::prelude::*;

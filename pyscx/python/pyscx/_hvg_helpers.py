@@ -18,8 +18,9 @@ def binned_dispersion_norm(
 
     Matches scanpy's seurat-flavor dispersion normalization:
     bins genes by ``pd.cut(log_means, bins=n_bins)``, then within each bin
-    computes ``(log_disp - mean) / std`` (ddof=1).  NaN values (from
-    zero-dispersion genes) are filled with 0.0.
+    computes ``(log_disp - mean) / std`` (ddof=1). NaN values (from
+    zero-dispersion genes) are **left as NaN**, matching scanpy; the caller
+    floors them to ``-inf`` for gene selection.
 
     Parameters
     ----------
@@ -53,8 +54,14 @@ def binned_dispersion_norm(
     stats.loc[one_gene, "dev"] = stats.loc[one_gene, "avg"]
     stats.loc[one_gene, "avg"] = 0.0
 
-    per_gene = stats.loc[df["mean_bin"]].set_index(df.index)
-    disp_norm = (df["dispersions"] - per_gene["avg"]) / per_gene["dev"]
+    # Map each gene's bin to its per-bin avg/dev. `.map()` on the categorical
+    # `mean_bin` is more robust than `.loc[...]` reindexing (no KeyError on
+    # unused categories / NaN bins across pandas versions).
+    # `.map()` on the categorical `mean_bin` returns a categorical Series;
+    # cast to float so the arithmetic below operates on numeric values.
+    avg = df["mean_bin"].map(stats["avg"]).astype("float64")
+    dev = df["mean_bin"].map(stats["dev"]).astype("float64")
+    disp_norm = (df["dispersions"] - avg) / dev
     # Leave NaN where scanpy would (zero-dispersion genes): the caller floors
     # NaN to -inf for selection, matching scanpy's `nan_to_num(nan=-inf)`.
     return disp_norm.to_numpy().tolist()
