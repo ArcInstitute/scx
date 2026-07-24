@@ -561,6 +561,23 @@ end-to-end wall), Leiden **~1.1×** (1186 ms → ~1060 ms), peak RSS slightly lo
 `aggregate` HashMaps were the source of the heap fragmentation the outer-loop `malloc_trim`
 was added to fight on 100 K+-node graphs.
 
+### UMAP determinism + invariant hoist (Phase-2 task 2.6)
+
+The CPU UMAP SGD stays **serial and deterministic** by design — a single seeded
+`ChaCha8Rng` stream plus in-order edge iteration make two same-seed runs byte-identical.
+Task 2.6 locks that in with a full-output determinism regression test
+(`umap::tests::test_compute_umap_deterministic`) and hoists the loop-invariant `b - 1` out
+of the per-edge gradient (`grad_coeff`). The hoist is **bit-identical** (proven by the
+determinism + cluster-separation tests) and **perf-neutral**: measured UMAP wall is
+unchanged within noise (~19.07 s → ~19.04 s on 40 000 × 50, `n_epochs=200`), because the two
+`powf` calls in `grad_coeff` dominate the single hoisted subtraction — so no `×` claim.
+
+The **opt-in parallel (Hogwild) UMAP** mode from the audit is **deferred**: CPU UMAP SGD is
+not a profiled bottleneck (it has a rapids GPU path), and a correct implementation needs a
+per-thread deterministic RNG design plus a trustworthiness / kNN-overlap quality gate (none
+exists yet). When revisited it should keep the serial path as the deterministic default and
+mirror Leiden's opt-in `parallel` flag.
+
 ### Differential expression (CPU, full-matrix)
 
 The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell fixture. The dedicated `accel_de` benchmark sweeps the raw count matrix (no HVG projection) across the full dataset tier — scanpy's per-gene rank pass becomes the bottleneck and times out on census-scale:
