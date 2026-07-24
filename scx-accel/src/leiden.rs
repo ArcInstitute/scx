@@ -1008,10 +1008,14 @@ impl LeidenOptimizer {
             collapsed = new_collapsed;
             is_first_iteration = false;
 
-            // Ask glibc to return freed heap pages to the OS. Without this,
-            // the repeated HashMap allocations in aggregate() fragment the
-            // heap, and glibc keeps all pages mapped, growing RSS to 50+ GB
-            // on graphs with 100K+ nodes.
+            // Ask glibc to return freed heap pages to the OS. Each collapse
+            // iteration allocates and drops large transient buffers in
+            // `aggregate` (the `pairs`/`edges` Vecs, and the per-node adjacency
+            // Vecs in `from_edges`); without trimming, glibc keeps the freed
+            // pages mapped and RSS climbs to 50+ GB on graphs with 100K+ nodes.
+            // (The earlier per-collapse HashMaps were replaced by a sort/merge
+            // over pre-sized Vecs, which reduces — but does not eliminate — this
+            // transient churn, so the trim is retained conservatively.)
             #[cfg(target_os = "linux")]
             unsafe {
                 libc::malloc_trim(0);
@@ -1767,6 +1771,41 @@ mod tests {
             agg.data.total_weight.to_bits(),
             expected.data.total_weight.to_bits()
         );
+    }
+
+    #[test]
+    fn test_aggregate_merge_sums_multiple_edges_per_pair() {
+        // Stress the merge-sum: multiple original edges collapse into a single
+        // (a,b) pair, so the sort/merge must accumulate ≥3 contributions per
+        // key. Groups {0,1,2}->0, {3,4,5}->1. Weights are exact-summable
+        // (powers of two) so the expected totals are unambiguous.
+        //   group-0 self-loop (intra {0,1,2}): 1 + 2 + 4 = 7
+        //   group-1 self-loop (intra {3,4,5}): 8 + 16 = 24
+        //   cross 0<->1: 0.5 + 1.5 + 3.0 = 5
+        let edges = [
+            (0, 1, 1.0),
+            (1, 2, 2.0),
+            (0, 2, 4.0),
+            (3, 4, 8.0),
+            (4, 5, 16.0),
+            (2, 3, 0.5),
+            (2, 4, 1.5),
+            (1, 5, 3.0),
+        ];
+        let g = LeidenGraph::from_edges(&edges, vec![1.0; 6]);
+        let grouping = Grouping::from_assignments(&[0, 0, 0, 1, 1, 1]);
+        let agg = g.aggregate(&grouping);
+        let expected =
+            LeidenGraph::from_edges(&[(0, 0, 7.0), (0, 1, 5.0), (1, 1, 24.0)], vec![3.0, 3.0]);
+
+        assert_eq!(agg.data.node_ptrs, expected.data.node_ptrs);
+        assert_eq!(agg.data.neighbors, expected.data.neighbors);
+        for (a, b) in agg.data.weights.iter().zip(&expected.data.weights) {
+            assert_eq!(a.to_bits(), b.to_bits(), "merged edge weight {a} != {b}");
+        }
+        for (a, b) in agg.data.strengths.iter().zip(&expected.data.strengths) {
+            assert_eq!(a.to_bits(), b.to_bits(), "strength {a} != {b}");
+        }
     }
 
     #[test]

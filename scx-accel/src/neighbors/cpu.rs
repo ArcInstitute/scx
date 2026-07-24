@@ -822,6 +822,39 @@ mod tests {
     }
 
     #[test]
+    fn connectivities_duplicate_neighbor_last_write_wins() {
+        // A kNN row with a duplicated neighbor id exercises the last-write-wins
+        // dedup in the CSR-merge path (a stable sort + keep-last, matching the
+        // prior HashMap insert). Row 0 lists neighbor 1 twice at different
+        // distances; the later (larger-distance) entry must win. The dense
+        // reference applies the same overwrite (`mu[i][j] = s` in j order), so
+        // the two must agree bit-for-bit.
+        let n_obs = 4;
+        let k = 3;
+        let knn_indices = vec![
+            0, 1, 1, // 0: neighbor 1 duplicated
+            1, 0, 2, // 1
+            2, 1, 3, // 2
+            3, 2, 1, // 3
+        ];
+        let knn_distances = vec![
+            0.0, 1.0, 2.0, // 0: dup neighbor 1 at d=1.0 then d=2.0 (last wins)
+            0.0, 1.0, 2.0, // 1
+            0.0, 1.5, 2.0, // 2
+            0.0, 1.0, 3.0, // 3
+        ];
+        let (indptr, indices, data) =
+            compute_connectivities(&knn_indices, &knn_distances, n_obs, k);
+        let (r_indptr, r_indices, r_data) =
+            dense_conn_reference(&knn_indices, &knn_distances, n_obs, k);
+        assert_eq!(indptr, r_indptr);
+        assert_eq!(indices, r_indices);
+        for (a, b) in data.iter().zip(&r_data) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    #[test]
     fn connectivities_match_dense_reference_realistic() {
         // A realistic kNN from build_knn_graph, to cover typical (asymmetric,
         // no-self) neighbor structure at k=5.
