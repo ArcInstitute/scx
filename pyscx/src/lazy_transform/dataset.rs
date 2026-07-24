@@ -369,10 +369,30 @@ impl ScxLazyTransformedDataset {
     /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
     /// it through `detached` with the GIL released.
     pub(crate) fn streaming_row_sums_projected(&self) -> Result<Vec<f64>, String> {
-        let cols = match &self.col_projection {
-            Some(c) => c,
-            None => return self.streaming_row_sums(),
-        };
+        match self.col_projection.clone() {
+            Some(cols) => self.streaming_row_sums_for_cols(&cols),
+            None => self.streaming_row_sums(),
+        }
+    }
+
+    /// Stream all shards, apply transforms to the **full-width** shard, then
+    /// restrict to `cols` before summing each row.
+    ///
+    /// `cols` are indices into the underlying reader's column space (on-disk
+    /// columns), NOT the visible axis — a caller holding visible-space indices
+    /// must compose them through `col_projection` first.
+    ///
+    /// Transforms run before the projection so a prior `NormalizeTotal`
+    /// divides by the correct whole-row denominator; see
+    /// [`Self::streaming_row_sums_projected`].
+    ///
+    /// Used for `calculate_qc_metrics`' per-`qc_var` subset sums, which must be
+    /// post-transform so `pct_counts_<v>` divides a transformed numerator by a
+    /// transformed denominator.
+    ///
+    /// Returns a global-length vector (`n_obs_global`), NOT filtered through
+    /// deletion vectors.
+    pub(crate) fn streaming_row_sums_for_cols(&self, cols: &[u32]) -> Result<Vec<f64>, String> {
         let n_obs_global = self.backed.shape().0;
         let mut sums = vec![0.0f64; n_obs_global];
         let mut global_row = 0usize;
@@ -554,6 +574,62 @@ impl ScxLazyTransformedDataset {
             global_row += csr.n_rows();
         }
         Ok(sums)
+    }
+
+    // --- Visible-space aggregation wrappers ---
+    //
+    // The `streaming_*` kernels above deliberately return **physical**-width
+    // column vectors and full-length row vectors. These `*_raw` wrappers are
+    // the visible-space equivalents — they mirror the identically named
+    // helpers on `ScxBackedSparseDataset` so a caller holding either type
+    // routes the `(col_projection, kept_to_global)` combination the same way
+    // and gets a vector whose length matches `shape_val`.
+
+    /// Per-column sums through transforms, honoring column projection and
+    /// keep-mask. Length = `shape_val.1`.
+    pub(crate) fn col_sums_raw(&self) -> Result<Vec<f64>, String> {
+        let physical = if self.kept_to_global.is_some() {
+            self.streaming_col_sums_masked()?
+        } else {
+            self.streaming_col_sums()?
+        };
+        Ok(self.apply_col_projection_to_vec(physical))
+    }
+
+    /// Per-column nnz, honoring column projection and keep-mask. Length =
+    /// `shape_val.1`.
+    ///
+    /// NNZ is transform-invariant (the supported transforms are value-wise and
+    /// preserve the sparsity pattern), so this reads the underlying backed
+    /// reader rather than streaming through the transform chain — matching the
+    /// dispatch `filter_genes` performs for the same quantity.
+    pub(crate) fn col_nnz_raw(&self) -> Result<Vec<u32>, String> {
+        match (self.col_projection(), &self.kept_to_global) {
+            (Some(cols), Some(kept)) => {
+                crate::projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
+                    .map_err(|e| e.to_string())
+            }
+            (Some(cols), None) => crate::projected_agg::col_nnz_projected(&self.backed, cols)
+                .map_err(|e| e.to_string()),
+            (None, Some(kept)) => self
+                .backed
+                .col_nnz_masked(kept)
+                .map(|f| f.iter().map(|&v| v as u32).collect())
+                .map_err(|e| e.to_string()),
+            (None, None) => self.backed.col_nnz().map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Per-row nnz over the visible columns. Returns a global-length vector
+    /// (deletion remapping is the caller's job, via `filter_row_results`).
+    ///
+    /// Transform-invariant for the same reason as [`Self::col_nnz_raw`].
+    pub(crate) fn row_nnz_raw(&self) -> Result<Vec<i64>, String> {
+        match self.col_projection() {
+            Some(cols) => crate::projected_agg::row_nnz_projected(&self.backed, cols)
+                .map_err(|e| e.to_string()),
+            None => self.backed.row_nnz().map_err(|e| e.to_string()),
+        }
     }
 
     /// Materialize the full matrix with all transforms applied.
