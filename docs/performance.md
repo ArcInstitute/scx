@@ -532,6 +532,35 @@ is lower allocation counts and one shared thread-control knob, with no regressio
   identical to before. It does **not** resize the ambient global rayon pool the many
   `current_num_threads()` callers use — that stays governed by `RAYON_NUM_THREADS`.
 
+### Graph-layout refactors (Phase-2 task 2.5)
+
+These are **result-preserving** layout/allocation refactors of the UMAP connectivity
+builder and the Rust-native Leiden — validated by parity gates before any timing, so the
+value is reduced allocation (fewer HashMaps) + parallelism headroom, not a large `×`.
+
+- **UMAP connectivities** (`neighbors/cpu.rs::compute_connectivities`): the per-point
+  bandwidth (σ) search now runs on `into_par_iter` (each point is independent and
+  `find_sigma` is deterministic → order-preserving, **byte-identical**), and the
+  fuzzy-simplicial-set symmetrization replaced its `HashMap<(i,j)>` + `HashSet` with a
+  counting-scatter CSR transpose + sorted row-merge. Output is **byte-identical** to the
+  prior path — the symmetrization is a fixed `μ(i,k)+μ(k,i)−μ(i,k)·μ(k,i)` per pair —
+  proven by a new independent dense O(n²) reference test (`connectivities_match_dense_reference_*`).
+- **Leiden** (`leiden.rs`): `aggregate` replaced its two per-collapse `HashMap`s with a
+  stable-sort + merge-sum over dense group ids (stable sort preserves the graph-visitation
+  accumulation order → byte-identical collapsed weights); per-node self-loop weights are
+  precomputed once (was a binary search per move candidate); the redundant `node_strengths`
+  copy and the dead `degrees` field were dropped. **Partition-identical** — guarded by
+  `test_deterministic_with_seed`, the quality goldens, a new `aggregate` reference test, and
+  the Python `test_ari_vs_scanpy_leiden_cpu` ARI floor.
+
+**Measured** (`benchmarks/scripts/bench_graph_layouts.py`, 50 000 × 50 synthetic PCA, 8
+blobs, CPU): kNN+connectivity end-to-end **flat within run-to-run noise** (~17.8–18.8 s;
+the HNSW kNN build dominates, so the parallelized connectivity sub-phase does not move the
+end-to-end wall), Leiden **~1.1×** (1186 ms → ~1060 ms), peak RSS slightly lower
+(651 → 643 MB). The allocation/fragmentation win scales with graph size — the Leiden
+`aggregate` HashMaps were the source of the heap fragmentation the outer-loop `malloc_trim`
+was added to fight on 100 K+-node graphs.
+
 ### Differential expression (CPU, full-matrix)
 
 The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell fixture. The dedicated `accel_de` benchmark sweeps the raw count matrix (no HVG projection) across the full dataset tier — scanpy's per-gene rank pass becomes the bottleneck and times out on census-scale:
