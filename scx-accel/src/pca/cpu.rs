@@ -149,7 +149,12 @@ fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>
     let max_threads = rayon::current_num_threads().max(1);
     // `.max(1)` is defensive: cov_accumulator_workers already floors at 1, but
     // guard the `n_rows / workers` divisor against any future 0-return.
-    let workers = cov_accumulator_workers(n_vars, cov_memory_budget(), max_threads).max(1);
+    // The shared `SCX_ACCEL_NUM_THREADS` ceiling lowers the segment count here
+    // too (when set), so the knob covers both the streaming and in-memory
+    // covariance accumulators; unset → the memory-derived cap is unchanged.
+    let workers = cov_accumulator_workers(n_vars, cov_memory_budget(), max_threads)
+        .min(crate::mem_budget::accel_num_threads().unwrap_or(usize::MAX))
+        .max(1);
     let chunk_size = (n_rows / workers).max(256);
 
     (0..n_rows)

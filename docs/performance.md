@@ -505,13 +505,16 @@ is lower allocation counts and one shared thread-control knob, with no regressio
 
 - **2.4 — flat NumPy marshalling.** The PCA / PFlog / UMAP result writers built a
   `Vec<Vec<f32>>` (one small allocation per obs row → ~N allocations at N cells) before
-  `PyArray2::from_vec2`. They now assemble one flat row-major `Vec<f32>` and copy it into a
-  pre-allocated `PyArray2` via the shared `accel::util::flat_pyarray2` helper (the pattern
-  the Harmony writer already used). Output is **byte-identical**. Measured with
-  `SCX_CPU_PROFILE=1` on an in-memory `pca(n_comps=50)` over a 300 000 × 2 000 matrix: the
-  `marshalling` bucket is **65.9 ms** for the 60 MB written (300k×50 `X_pca` + 2k×50 `PCs`)
-  — ~0.9 % of the 7.0 s `pca()` wall. The win is the allocation-count drop (one buffer vs
-  ~300k per-row `Vec`s), not wall time; this confirms the oracle's ranking.
+  `PyArray2::from_vec2`. They now assemble one flat row-major `Vec<f32>` and hand it to
+  numpy via the shared `accel::util::flat_pyarray2` helper — `PyArray1::from_vec` takes
+  ownership of the buffer (**no copy**) and `reshape([rows, cols])` returns a row-major view
+  (no `unsafe`; a size mismatch fails loud as a Python error). Output is **byte-identical**.
+  Measured with `SCX_CPU_PROFILE=1` on an in-memory `pca(n_comps=50)` over a 300 000 × 2 000
+  matrix (`benchmarks/scripts/bench_marshalling.py`): the `marshalling` bucket is **~31 ms**
+  for the 60 MB written (300k×50 `X_pca` + 2k×50 `PCs`) — well under 1 % of the ~7 s `pca()`
+  wall (and about half the ~66 ms an allocate-then-`copy_from_slice` path took, since the
+  zero-copy `from_vec` avoids the second buffer). The win is the allocation-count drop (one
+  moved buffer vs ~300k per-row `Vec`s), not wall time; this confirms the oracle's ranking.
 - **2.7a — `score_genes` weight fusion.** The control-set score fused the two weight
   vectors (`w_list`, `w_ctrl`) into a single `w = w_list − w_ctrl`, halving the per-nonzero
   inner iterations in `streaming_weighted_row_sums`. Numerically it matches the previous
@@ -521,12 +524,13 @@ is lower allocation counts and one shared thread-control knob, with no regressio
   cloning the whole per-gene state vector; the PCA transpose-spMM fold reuses one `q_row`
   scratch buffer per rayon task instead of allocating per row. Both **bit-identical**.
 - **2.7d — `SCX_ACCEL_NUM_THREADS`.** A shared thread-ceiling policy knob (read once via
-  `OnceLock`). When set to a positive integer it caps the two private rayon pools the
-  accelerators build — Harmony's integration pool and the PCA covariance-accumulator pool
-  (whose memory-derived worker cap still applies; the env only lowers it further). Unset
-  (the default) → behaviour is identical to before. It does **not** resize the ambient
-  global rayon pool the many `current_num_threads()` callers use — that stays governed by
-  `RAYON_NUM_THREADS`.
+  `OnceLock`). When set to a positive integer it caps the accelerators' private rayon work:
+  Harmony's integration pool and **both** PCA covariance-accumulator paths (the streaming
+  `accumulate_covariance_streaming` pool and the in-memory
+  `sparse_outer_product_accumulate_par` fold-segment count), whose memory-derived worker
+  cap still applies — the env only lowers it further. Unset (the default) → behaviour is
+  identical to before. It does **not** resize the ambient global rayon pool the many
+  `current_num_threads()` callers use — that stays governed by `RAYON_NUM_THREADS`.
 
 ### Differential expression (CPU, full-matrix)
 

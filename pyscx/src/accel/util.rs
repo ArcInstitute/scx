@@ -1,6 +1,6 @@
 //! Shared utility helpers for CSR extraction and type conversion.
 
-use numpy::{PyArray2, PyArrayMethods};
+use numpy::{PyArray1, PyArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -8,32 +8,24 @@ use pyo3::types::PyDict;
 /// Build a 2-D `float32` numpy array from a single flat row-major `Vec<f32>`
 /// of length `rows * cols` (shape `[rows, cols]`).
 ///
-/// Replaces the `Vec<Vec<f32>>` + [`PyArray2::from_vec2`] pattern, which
-/// allocates one small inner `Vec` per row (N allocations at atlas scale).
-/// One contiguous buffer copied into the array — the shape the harmony output
-/// path already uses.
+/// Replaces the `Vec<Vec<f32>>` + `PyArray2::from_vec2` pattern, which
+/// allocated one small inner `Vec` per row (N allocations at atlas scale).
+/// `PyArray1::from_vec` hands the owned buffer to numpy (no copy) and
+/// `reshape` returns a row-major view — so there is no `unsafe`, no extra
+/// copy, and a length mismatch fails loud as a Python error at the FFI
+/// boundary (reshape rejects `rows*cols != data.len()`) rather than aborting
+/// the interpreter.
 pub(super) fn flat_pyarray2<'py>(
     py: Python<'py>,
     data: Vec<f32>,
     rows: usize,
     cols: usize,
-) -> PyResult<Bound<'py, PyArray2<f32>>> {
-    debug_assert_eq!(
-        data.len(),
-        rows * cols,
-        "flat_pyarray2: data length {} != rows*cols {}",
-        data.len(),
-        rows * cols
-    );
-    let arr = unsafe { PyArray2::<f32>::new(py, [rows, cols], false) };
-    {
-        let mut rw = arr.readwrite();
-        let slice = rw
-            .as_slice_mut()
-            .map_err(|e| PyRuntimeError::new_err(format!("output array slice error: {e}")))?;
-        slice.copy_from_slice(&data);
-    }
-    Ok(arr)
+) -> PyResult<Bound<'py, numpy::PyArray2<f32>>> {
+    PyArray1::from_vec(py, data)
+        .reshape([rows, cols])
+        .map_err(|e| {
+            PyValueError::new_err(format!("flat_pyarray2: cannot reshape {rows}×{cols}: {e}"))
+        })
 }
 
 /// Call `array.astype(dtype, copy=False)` — avoids a deep copy when the

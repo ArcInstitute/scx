@@ -494,9 +494,7 @@ fn materialize_dense<S: ShardSource>(
             let b = baseline[cell] as f32;
             let base = cell * n_vars;
             let out = &mut dense[base..base + n_vars];
-            for v in out.iter_mut() {
-                *v = b;
-            }
+            out.fill(b);
             let start = csr.indptr[r] as usize;
             let end = csr.indptr[r + 1] as usize;
             for nz in start..end {
