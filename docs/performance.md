@@ -567,8 +567,10 @@ The CPU UMAP SGD stays **serial and deterministic** by design — a single seede
 `ChaCha8Rng` stream plus in-order edge iteration make two same-seed runs byte-identical.
 Task 2.6 locks that in with a full-output determinism regression test
 (`umap::tests::test_compute_umap_deterministic`) and hoists the loop-invariant `b - 1` out
-of the per-edge gradient (`grad_coeff`). The hoist is **bit-identical** (proven by the
-determinism + cluster-separation tests) and **perf-neutral**: measured UMAP wall is
+of the per-edge gradient (`grad_coeff`). The hoist is **bit-identical by construction**
+(constant subexpression elimination of a loop-invariant — no reassociation; `b` is bound
+once from `find_ab_params`), guarded (not proven) by the determinism + cluster-separation
+regressions, and **perf-neutral**: measured UMAP wall is
 unchanged within noise (~19.07 s → ~19.04 s on 40 000 × 50, `n_epochs=200`), because the two
 `powf` calls in `grad_coeff` dominate the single hoisted subtraction — so no `×` claim.
 
