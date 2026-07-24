@@ -57,6 +57,35 @@ pub fn col_nnz_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Resul
     Ok(counts)
 }
 
+/// Fused per-column sums + NNZ restricted to a subset of columns.
+///
+/// Single shard scan replacing `col_sums_projected()` + `col_nnz_projected()`.
+/// Bit-identical to those two calls: same projection, same visit order, same
+/// left-to-right f64 accumulation.
+pub fn col_sums_and_nnz_projected(
+    reader: &BackedCsrReader,
+    col_indices: &[u32],
+) -> Result<(Vec<f64>, Vec<u32>)> {
+    let n_proj = col_indices.len();
+    let mut sums = vec![0.0f64; n_proj];
+    let mut counts = vec![0u32; n_proj];
+
+    for shard_idx in 0..reader.index().n_shards() {
+        let csr = reader.read_shard_uncached(shard_idx)?;
+        let projected = project_csr(&csr, col_indices);
+        for row in 0..projected.n_rows() {
+            let s = projected.indptr[row] as usize;
+            let e = projected.indptr[row + 1] as usize;
+            for j in s..e {
+                let c = projected.indices[j] as usize;
+                sums[c] += projected.data[j] as f64;
+                counts[c] += 1;
+            }
+        }
+    }
+    Ok((sums, counts))
+}
+
 /// Streaming per-column max restricted to a subset of columns.
 ///
 /// Accounts for implicit zeros: if col_nnz < n_obs, max is at least 0.0.
@@ -312,6 +341,125 @@ pub fn row_stats_projected(
 }
 
 // ---------------------------------------------------------------------------
+// Fused QC row pass
+// ---------------------------------------------------------------------------
+
+/// Every per-cell quantity `calculate_qc_metrics` publishes, from one pass.
+///
+/// All vectors are **global**-length (`reader.shape().0`) and un-deleted;
+/// deletion remapping is the caller's job (`filter_row_results`), matching the
+/// convention of the other row-axis kernels here.
+pub struct QcRowStats {
+    /// Per-cell nnz over the visible columns (`n_genes_by_counts`).
+    pub nnz: Vec<i64>,
+    /// Per-cell sum over the visible columns (`total_counts`).
+    pub sums: Vec<f64>,
+    /// Per-cell sum over each `qc_var` gene subset, in the order the masks were
+    /// supplied (`total_counts_<v>`). Empty when no `qc_var` was requested.
+    pub qc_sums: Vec<Vec<f64>>,
+}
+
+impl QcRowStats {
+    /// All-zero accumulator for `n_obs` cells and `n_qc` gene subsets.
+    ///
+    /// Exposed so the lazy-transform twin
+    /// (`ScxLazyTransformedDataset::streaming_qc_row_pass`) can drive the same
+    /// accumulator with its own shard loop.
+    pub(crate) fn zeroed(n_obs: usize, n_qc: usize) -> Self {
+        Self {
+            nnz: vec![0i64; n_obs],
+            sums: vec![0.0f64; n_obs],
+            qc_sums: vec![vec![0.0f64; n_obs]; n_qc],
+        }
+    }
+}
+
+/// Accumulate one already-visible-space CSR shard into `out`.
+///
+/// `qc_bits[c]` is a bitmask over the requested `qc_var`s: bit *k* set means
+/// visible column `c` belongs to subset *k*. Most columns belong to none, so
+/// the hot path is a single load and a zero test.
+///
+/// Visits nonzeros in ascending column order within each row — the same order
+/// the per-statistic kernels use — so the f64 sums are bit-identical to them.
+pub(crate) fn accumulate_qc_rows_into(
+    csr: &scx_sparse::ScxCsr,
+    global_row: usize,
+    qc_bits: &[u64],
+    out: &mut QcRowStats,
+) {
+    // No subsets requested (or none representable) → skip the mask lookup
+    // entirely; the sum loop is then identical to `row_sums_projected`'s.
+    let plain = qc_bits.is_empty() || out.qc_sums.is_empty();
+    for row in 0..csr.n_rows() {
+        let s = csr.indptr[row] as usize;
+        let e = csr.indptr[row + 1] as usize;
+        let g = global_row + row;
+        out.nnz[g] = (e - s) as i64;
+
+        let mut total = 0.0f64;
+        if plain {
+            for &v in &csr.data[s..e] {
+                total += v as f64;
+            }
+        } else {
+            for j in s..e {
+                let v = csr.data[j] as f64;
+                total += v;
+                let mut bits = qc_bits[csr.indices[j] as usize];
+                while bits != 0 {
+                    let k = bits.trailing_zeros() as usize;
+                    out.qc_sums[k][g] += v;
+                    bits &= bits - 1;
+                }
+            }
+        }
+        out.sums[g] = total;
+    }
+}
+
+/// One-pass per-cell QC statistics: row nnz, row sums, and per-`qc_var` subset
+/// sums over the visible column set.
+///
+/// Replaces the previous `row_sums` + `row_nnz` + one `row_sums_projected` per
+/// `qc_var` — i.e. `2 + n_qc_vars` full shard decodes collapse into one.
+///
+/// `col_indices` is the on-disk index of each visible column (`None` when the
+/// visible axis is the on-disk axis). `qc_bits` is indexed by **visible**
+/// column and must therefore have length `col_indices.len()` (or `n_vars` when
+/// `col_indices` is `None`); pass an empty slice for no `qc_var`s.
+///
+/// `n_qc` is the number of requested subsets, passed explicitly rather than
+/// derived from the bits so an all-false mask still yields its (all-zero)
+/// output row and the caller's indexing stays aligned. At most 64 — the caller
+/// chunks beyond that.
+pub fn qc_row_pass(
+    reader: &BackedCsrReader,
+    col_indices: Option<&[u32]>,
+    qc_bits: &[u64],
+    n_qc: usize,
+) -> Result<QcRowStats> {
+    let (n_obs, n_vars) = reader.shape();
+    debug_assert!(n_qc <= 64, "qc_row_pass supports at most 64 subsets");
+    debug_assert!(qc_bits.is_empty() || qc_bits.len() == col_indices.map_or(n_vars, |c| c.len()));
+
+    let mut out = QcRowStats::zeroed(n_obs, n_qc);
+    let mut global_row = 0usize;
+    for shard_idx in 0..reader.index().n_shards() {
+        let csr = reader.read_shard_uncached(shard_idx)?;
+        let n_rows = csr.n_rows();
+        match col_indices {
+            Some(cols) => {
+                accumulate_qc_rows_into(&project_csr(&csr, cols), global_row, qc_bits, &mut out)
+            }
+            None => accumulate_qc_rows_into(&csr, global_row, qc_bits, &mut out),
+        }
+        global_row += n_rows;
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Masked + projected aggregation (deletion vector + column subset)
 // ---------------------------------------------------------------------------
 
@@ -380,6 +528,44 @@ pub fn col_nnz_masked_projected(
         }
     }
     Ok(counts)
+}
+
+/// Fused column sums + NNZ restricted to a subset of columns AND kept rows.
+///
+/// Single shard scan replacing `col_sums_masked_projected()` +
+/// `col_nnz_masked_projected()`; bit-identical to both.
+pub fn col_sums_and_nnz_masked_projected(
+    reader: &BackedCsrReader,
+    kept_rows: &[u64],
+    col_indices: &[u32],
+) -> Result<(Vec<f64>, Vec<u32>)> {
+    let n_proj = col_indices.len();
+    let mut sums = vec![0.0f64; n_proj];
+    let mut counts = vec![0u32; n_proj];
+
+    for shard_idx in 0..reader.index().n_shards() {
+        let csr = reader.read_shard_uncached(shard_idx)?;
+        let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
+            Some(r) => r,
+            None => continue,
+        };
+
+        let projected = project_csr(&csr, col_indices);
+
+        let lo = kept_rows.partition_point(|&r| r < s_start);
+        let hi = kept_rows.partition_point(|&r| r < s_end);
+        for &global_row in &kept_rows[lo..hi] {
+            let local_row = (global_row - s_start) as usize;
+            let s = projected.indptr[local_row] as usize;
+            let e = projected.indptr[local_row + 1] as usize;
+            for j in s..e {
+                let c = projected.indices[j] as usize;
+                sums[c] += projected.data[j] as f64;
+                counts[c] += 1;
+            }
+        }
+    }
+    Ok((sums, counts))
 }
 
 /// Column max restricted to a subset of columns AND kept rows.
@@ -617,6 +803,30 @@ pub fn col_nnz_projected_csc(
         counts[output_col] += (e - s) as u32;
     })?;
     Ok(counts)
+}
+
+/// Fused CSC twin of [`col_sums_and_nnz_projected`].
+///
+/// One `walk_csc_runs` sweep of the sidecar instead of the two that
+/// `col_sums_projected_csc` + `col_nnz_projected_csc` perform; bit-identical.
+pub fn col_sums_and_nnz_projected_csc(
+    source: &dyn ColumnShardSource,
+    col_indices: &[u32],
+) -> Result<(Vec<f64>, Vec<u32>)> {
+    let n_proj = col_indices.len();
+    let mut sums = vec![0.0f64; n_proj];
+    let mut counts = vec![0u32; n_proj];
+    walk_csc_runs(source, col_indices, |local_col, output_col, csc| {
+        let s = csc.indptr[local_col] as usize;
+        let e = csc.indptr[local_col + 1] as usize;
+        let mut acc = 0.0f64;
+        for &v in &csc.data[s..e] {
+            acc += v as f64;
+        }
+        sums[output_col] += acc;
+        counts[output_col] += (e - s) as u32;
+    })?;
+    Ok((sums, counts))
 }
 
 /// CSC twin of [`col_max_projected`]. `n_obs` accounts for implicit

@@ -576,6 +576,112 @@ impl ScxLazyTransformedDataset {
         Ok(sums)
     }
 
+    /// Fused per-cell QC pass through the transform chain: row nnz, row sums
+    /// and per-`qc_var` subset sums over the visible columns, in one scan.
+    ///
+    /// Lazy twin of [`crate::projected_agg::qc_row_pass`]. Transforms are
+    /// applied to the **full-width** shard before projection so a prior
+    /// `NormalizeTotal` divides by the denominator it was configured with; see
+    /// [`Self::streaming_row_sums_projected`].
+    ///
+    /// nnz is read from `indptr` *before* the transforms run, matching
+    /// [`Self::streaming_row_nnz_and_sums`] — the supported transforms are
+    /// value-wise and preserve the sparsity pattern.
+    ///
+    /// Returns global-length vectors (NOT filtered through deletion vectors).
+    pub(crate) fn streaming_qc_row_pass(
+        &self,
+        qc_bits: &[u64],
+        n_qc: usize,
+    ) -> Result<crate::projected_agg::QcRowStats, String> {
+        let cols = self.col_projection.clone();
+        let mut out = crate::projected_agg::QcRowStats::zeroed(self.backed.shape().0, n_qc);
+        let mut global_row = 0usize;
+        for shard_idx in 0..self.backed.index().n_shards() {
+            let mut csr = self
+                .backed
+                .read_shard_uncached(shard_idx)
+                .map_err(|e| e.to_string())?;
+            let n_rows = csr.n_rows();
+            self.apply_transforms(&mut csr, global_row);
+            match cols.as_deref() {
+                Some(c) => crate::projected_agg::accumulate_qc_rows_into(
+                    &scx_engine::projection::project_csr(&csr, c),
+                    global_row,
+                    qc_bits,
+                    &mut out,
+                ),
+                None => crate::projected_agg::accumulate_qc_rows_into(
+                    &csr, global_row, qc_bits, &mut out,
+                ),
+            }
+            global_row += n_rows;
+        }
+        Ok(out)
+    }
+
+    /// Fused per-column sums + nnz through the transform chain, honoring
+    /// column projection and keep-mask. Length = `shape_val.1`.
+    ///
+    /// One scan producing both statistics; the column-axis counterpart of
+    /// [`Self::streaming_qc_row_pass`]. NNZ counts stored entries, which the
+    /// value-wise transforms leave untouched, so it matches the raw reader's
+    /// `col_nnz`.
+    pub(crate) fn col_sums_and_nnz_raw(&self) -> Result<(Vec<f64>, Vec<u32>), String> {
+        let n_vars = self.backed.shape().1; // physical width, projected below
+        let mut sums = vec![0.0f64; n_vars];
+        let mut counts = vec![0u32; n_vars];
+        let mut global_row = 0usize;
+
+        for shard_idx in 0..self.backed.index().n_shards() {
+            let mut csr = self
+                .backed
+                .read_shard_uncached(shard_idx)
+                .map_err(|e| e.to_string())?;
+            let n_rows = csr.n_rows();
+            self.apply_transforms(&mut csr, global_row);
+
+            match &self.kept_to_global {
+                None => {
+                    for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                        let c = col as usize;
+                        sums[c] += val as f64;
+                        counts[c] += 1;
+                    }
+                }
+                Some(kept) => {
+                    let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                        Some(r) => r,
+                        None => {
+                            global_row += n_rows;
+                            continue;
+                        }
+                    };
+                    let lo = kept.partition_point(|&r| r < s_start);
+                    let hi = kept.partition_point(|&r| r < s_end);
+                    for &g_row in &kept[lo..hi] {
+                        let local = (g_row - s_start) as usize;
+                        let s = csr.indptr[local] as usize;
+                        let e = csr.indptr[local + 1] as usize;
+                        for j in s..e {
+                            let c = csr.indices[j] as usize;
+                            sums[c] += csr.data[j] as f64;
+                            counts[c] += 1;
+                        }
+                    }
+                }
+            }
+            global_row += n_rows;
+        }
+
+        let sums = self.apply_col_projection_to_vec(sums);
+        let counts = match &self.col_projection {
+            Some(cols) => cols.iter().map(|&c| counts[c as usize]).collect(),
+            None => counts,
+        };
+        Ok((sums, counts))
+    }
+
     // --- Visible-space aggregation wrappers ---
     //
     // The `streaming_*` kernels above deliberately return **physical**-width
@@ -584,53 +690,6 @@ impl ScxLazyTransformedDataset {
     // helpers on `ScxBackedSparseDataset` so a caller holding either type
     // routes the `(col_projection, kept_to_global)` combination the same way
     // and gets a vector whose length matches `shape_val`.
-
-    /// Per-column sums through transforms, honoring column projection and
-    /// keep-mask. Length = `shape_val.1`.
-    pub(crate) fn col_sums_raw(&self) -> Result<Vec<f64>, String> {
-        let physical = if self.kept_to_global.is_some() {
-            self.streaming_col_sums_masked()?
-        } else {
-            self.streaming_col_sums()?
-        };
-        Ok(self.apply_col_projection_to_vec(physical))
-    }
-
-    /// Per-column nnz, honoring column projection and keep-mask. Length =
-    /// `shape_val.1`.
-    ///
-    /// NNZ is transform-invariant (the supported transforms are value-wise and
-    /// preserve the sparsity pattern), so this reads the underlying backed
-    /// reader rather than streaming through the transform chain — matching the
-    /// dispatch `filter_genes` performs for the same quantity.
-    pub(crate) fn col_nnz_raw(&self) -> Result<Vec<u32>, String> {
-        match (self.col_projection(), &self.kept_to_global) {
-            (Some(cols), Some(kept)) => {
-                crate::projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
-                    .map_err(|e| e.to_string())
-            }
-            (Some(cols), None) => crate::projected_agg::col_nnz_projected(&self.backed, cols)
-                .map_err(|e| e.to_string()),
-            (None, Some(kept)) => self
-                .backed
-                .col_nnz_masked(kept)
-                .map(|f| f.iter().map(|&v| v as u32).collect())
-                .map_err(|e| e.to_string()),
-            (None, None) => self.backed.col_nnz().map_err(|e| e.to_string()),
-        }
-    }
-
-    /// Per-row nnz over the visible columns. Returns a global-length vector
-    /// (deletion remapping is the caller's job, via `filter_row_results`).
-    ///
-    /// Transform-invariant for the same reason as [`Self::col_nnz_raw`].
-    pub(crate) fn row_nnz_raw(&self) -> Result<Vec<i64>, String> {
-        match self.col_projection() {
-            Some(cols) => crate::projected_agg::row_nnz_projected(&self.backed, cols)
-                .map_err(|e| e.to_string()),
-            None => self.backed.row_nnz().map_err(|e| e.to_string()),
-        }
-    }
 
     /// Materialize the full matrix with all transforms applied.
     ///

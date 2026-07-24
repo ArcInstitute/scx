@@ -1086,6 +1086,46 @@ impl ScxBackedSparseDataset {
         .map(|v| self.present_reorder(v))
     }
 
+    /// Fused column sums + nnz (`axis=0`), honoring column projection and
+    /// keep-mask. One shard scan in place of [`Self::col_sums_raw`] +
+    /// [`Self::col_nnz_raw`]; bit-identical to calling both.
+    pub(crate) fn col_sums_and_nnz_raw(&self) -> Result<(Vec<f64>, Vec<u32>), String> {
+        match (&self.col_projection, &self.kept_to_global) {
+            (Some(cols), Some(kept)) => {
+                projected_agg::col_sums_and_nnz_masked_projected(&self.backed, kept, cols)
+                    .map_err(|e| e.to_string())
+            }
+            (Some(cols), None) => projected_agg::col_sums_and_nnz_projected(&self.backed, cols)
+                .map_err(|e| e.to_string()),
+            (None, Some(kept)) => self
+                .backed
+                .col_sums_and_nnz_masked(kept)
+                .map_err(|e| e.to_string()),
+            (None, None) => self.backed.col_sums_and_nnz().map_err(|e| e.to_string()),
+        }
+        .map(|(sums, counts)| (self.present_reorder(sums), self.present_reorder(counts)))
+    }
+
+    /// Fused per-cell QC pass: row nnz, row sums and per-`qc_var` subset sums
+    /// over the visible columns, in a single shard scan.
+    ///
+    /// `qc_bits` is indexed by visible column (bit *k* ⇒ member of subset *k*);
+    /// see [`projected_agg::qc_row_pass`]. Row vectors are global-length —
+    /// apply [`Self::filter_row_results`] for the visible rows.
+    pub(crate) fn qc_row_pass_raw(
+        &self,
+        qc_bits: &[u64],
+        n_qc: usize,
+    ) -> Result<projected_agg::QcRowStats, String> {
+        projected_agg::qc_row_pass(
+            &self.backed,
+            self.col_projection.as_ref().map(|c| c.as_slice()),
+            qc_bits,
+            n_qc,
+        )
+        .map_err(|e| e.to_string())
+    }
+
     /// Per-row nnz counts (`axis=1`), honoring column projection.
     pub(crate) fn row_nnz_raw(&self) -> Result<Vec<i64>, String> {
         if let Some(ref cols) = self.col_projection {

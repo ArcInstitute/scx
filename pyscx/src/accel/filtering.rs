@@ -113,6 +113,20 @@ fn backed_col_sums(backed: &ScxBackedSparseDataset) -> Result<Vec<f64>, String> 
     Ok(backed.present_reorder(sums))
 }
 
+/// Helper: fused col sums + NNZ for a backed dataset, in one shard scan.
+///
+/// Used when `filter_genes` needs both (a cell threshold *and* a count
+/// threshold). Bit-identical to `backed_col_nnz` + `backed_col_sums`, which
+/// decode every shard twice.
+///
+/// Pure-Rust (`Result<_, String>`, no `PyErr`) so callers can run it through
+/// `detached` with the GIL released.
+fn backed_col_sums_and_nnz(
+    backed: &ScxBackedSparseDataset,
+) -> Result<(Vec<f64>, Vec<u32>), String> {
+    backed.col_sums_and_nnz_raw()
+}
+
 // ---------------------------------------------------------------------------
 // Shared mask/projection helpers (used by hvg.rs too)
 // ---------------------------------------------------------------------------
@@ -531,23 +545,29 @@ pub fn filter_genes(
         let (col_nnz, col_sums): (Option<Vec<i64>>, Option<Vec<f64>>) = {
             let bref = backed.borrow();
             let b: &ScxBackedSparseDataset = &bref;
-            let col_nnz = if need_nnz {
-                Some(
-                    detached(py, || backed_col_nnz(b))
-                        .map_err(PyRuntimeError::new_err)?
-                        .iter()
-                        .map(|&v| v as i64)
-                        .collect(),
-                )
-            } else {
-                None
-            };
-            let col_sums = if need_sums {
-                Some(detached(py, || backed_col_sums(b)).map_err(PyRuntimeError::new_err)?)
-            } else {
-                None
-            };
-            (col_nnz, col_sums)
+            match (need_nnz, need_sums) {
+                // Both thresholds: one fused scan instead of two full decodes.
+                (true, true) => {
+                    let (sums, nnz) = detached(py, || backed_col_sums_and_nnz(b))
+                        .map_err(PyRuntimeError::new_err)?;
+                    (Some(nnz.iter().map(|&v| v as i64).collect()), Some(sums))
+                }
+                (true, false) => (
+                    Some(
+                        detached(py, || backed_col_nnz(b))
+                            .map_err(PyRuntimeError::new_err)?
+                            .iter()
+                            .map(|&v| v as i64)
+                            .collect(),
+                    ),
+                    None,
+                ),
+                (false, true) => (
+                    None,
+                    Some(detached(py, || backed_col_sums(b)).map_err(PyRuntimeError::new_err)?),
+                ),
+                (false, false) => (None, None),
+            }
         };
 
         let keep = build_keep_mask(

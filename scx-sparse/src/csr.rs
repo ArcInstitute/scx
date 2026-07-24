@@ -315,6 +315,27 @@ impl ScxCsr {
         (sums, sum_sq)
     }
 
+    /// Compute per-column sums and per-column NNZ counts in a single pass.
+    ///
+    /// Returns `(col_sums, col_nnz)`. Identical to calling [`Self::col_sums`]
+    /// and [`Self::col_nnz`] separately — the accumulation order over the
+    /// nonzeros is unchanged, so the sums are bit-identical — but touches the
+    /// `indices` / `data` arrays once instead of twice.
+    ///
+    /// Callers that need both (QC metrics' gene axis, `filter_genes` with a
+    /// cell *and* a count threshold) should prefer this: at the streaming layer
+    /// the second call is a second full shard decode, not just a second scan.
+    pub fn col_sums_and_nnz(&self) -> (Vec<f64>, Vec<u32>) {
+        let mut sums = vec![0.0f64; self.shape.1];
+        let mut counts = vec![0u32; self.shape.1];
+        for (&col, &val) in self.indices.iter().zip(self.data.iter()) {
+            let c = col as usize;
+            sums[c] += val as f64;
+            counts[c] += 1;
+        }
+        (sums, counts)
+    }
+
     /// Compute per-row NNZ counts: `indptr[r+1] - indptr[r]` for each row.
     pub fn row_nnz(&self) -> Vec<i64> {
         let mut counts = Vec::with_capacity(self.shape.0);
@@ -913,6 +934,15 @@ mod tests {
         assert_eq!(sums, csr.col_sums());
         // col 0: 1², col 1: 5², col 2: 3²+2², col 3: 10², col 4: 7²
         assert_eq!(sum_sq, vec![1.0, 25.0, 13.0, 100.0, 49.0]);
+    }
+
+    #[test]
+    fn test_col_sums_and_nnz() {
+        let csr = sample_csr();
+        let (sums, counts) = csr.col_sums_and_nnz();
+        // Bit-identical to the two standalone kernels it replaces.
+        assert_eq!(sums, csr.col_sums());
+        assert_eq!(counts, csr.col_nnz());
     }
 
     #[test]

@@ -2041,6 +2041,32 @@ impl BackedCsrReader {
         Ok((all_nnz, all_sums))
     }
 
+    /// Compute per-column sums and per-column NNZ in a single shard scan.
+    ///
+    /// The column-axis twin of [`Self::row_nnz_and_sums`]: avoids the second
+    /// full decode of every shard that calling `col_sums()` and `col_nnz()`
+    /// separately incurs. Used by `calculate_qc_metrics`' gene axis and by
+    /// `filter_genes` when both a cell and a count threshold are given.
+    ///
+    /// Bit-identical to the two separate calls — same per-shard visit order,
+    /// same left-to-right f64 accumulation.
+    pub fn col_sums_and_nnz(&self) -> Result<(Vec<f64>, Vec<u32>)> {
+        let n_shards = self.index.n_shards();
+        let mut sums = vec![0.0f64; self.n_vars];
+        let mut counts = vec![0u32; self.n_vars];
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_uncached(shard_idx)?;
+            let (partial_sums, partial_nnz) = csr.col_sums_and_nnz();
+            for (s, p) in sums.iter_mut().zip(partial_sums.iter()) {
+                *s += p;
+            }
+            for (c, p) in counts.iter_mut().zip(partial_nnz.iter()) {
+                *c = c.saturating_add(*p);
+            }
+        }
+        Ok((sums, counts))
+    }
+
     /// Compute per-column NNZ counts without materializing the full matrix.
     pub fn col_nnz(&self) -> Result<Vec<u32>> {
         let n_shards = self.index.n_shards();
@@ -2251,6 +2277,40 @@ impl BackedCsrReader {
     /// Column NNZ considering only the kept rows.
     pub fn col_nnz_masked(&self, kept_rows: &[u64]) -> Result<Vec<f64>> {
         self.col_aggregate_masked(kept_rows, AggOp::Nnz)
+    }
+
+    /// Column sums and column NNZ over the kept rows, in a single shard scan.
+    ///
+    /// Deletion-aware twin of [`Self::col_sums_and_nnz`]. Bit-identical to
+    /// `col_sums_masked()` + `col_nnz_masked()`, which walk the same rows in
+    /// the same order — this just decodes each shard once instead of twice.
+    pub fn col_sums_and_nnz_masked(&self, kept_rows: &[u64]) -> Result<(Vec<f64>, Vec<u32>)> {
+        let mut sums = vec![0.0f64; self.n_vars];
+        let mut counts = vec![0u32; self.n_vars];
+
+        let n_shards = self.index.n_shards();
+        for shard_idx in 0..n_shards {
+            let csr = self.read_shard_uncached(shard_idx)?;
+            let (s_start, s_end) = match self.index.shard_range(shard_idx) {
+                Some(r) => r,
+                None => continue,
+            };
+            // `kept_rows` is sorted by construction (see compute_kept_to_global),
+            // so the shard's slice is a binary-search range.
+            let lo = kept_rows.partition_point(|&r| r < s_start);
+            let hi = kept_rows.partition_point(|&r| r < s_end);
+            for &global_row in &kept_rows[lo..hi] {
+                let local_row = (global_row - s_start) as usize;
+                let row_start = csr.indptr[local_row] as usize;
+                let row_end = csr.indptr[local_row + 1] as usize;
+                for j in row_start..row_end {
+                    let c = csr.indices[j] as usize;
+                    sums[c] += csr.data[j] as f64;
+                    counts[c] += 1;
+                }
+            }
+        }
+        Ok((sums, counts))
     }
 
     /// Column max considering only the kept rows.
