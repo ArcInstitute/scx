@@ -154,22 +154,200 @@ def test_pseudobulk_dex_nbglm_backend():
     assert adata.uns["scx_accel"]["pseudobulk_dex"]["route"] == "cpu_nb_glm"
 
 
-def test_pseudobulk_dex_nbglm_rejects_custom_design():
-    """§2.4: backend='nb_glm' fits a fixed intercept+target design and must
-    reject a supplied `design` rather than silently ignoring it."""
+def _lfc_by_gene(df, target):
+    """Per-gene log2FoldChange for one target, indexed by gene (sorted)."""
+    sub = df[df["target"] == target].set_index("gene")["log2FoldChange"]
+    return sub.sort_index()
+
+
+def test_pseudobulk_dex_nbglm_honors_custom_design():
+    """§3.11: backend='nb_glm' now honors a `design` formula (formulaic) instead
+    of rejecting it — and the design must actually change the fit (never a silent
+    no-op vs the fixed intercept+target default)."""
+    pytest.importorskip("formulaic")
     adata = _perturb_adata()
-    with pytest.raises(ValueError, match="does not support a custom `design`"):
+    common = dict(
+        groupby=["perturbation", "donor"],
+        test_col="perturbation",
+        reference=REFERENCE,
+        min_cells_per_group=1,
+        backend="nb_glm",
+    )
+    default = pyscx.accel.pseudobulk_dex(adata, **common)
+    designed = pyscx.accel.pseudobulk_dex(adata, design="~ perturbation + donor", **common)
+
+    # Same schema + target/reference set as the default path.
+    for col in ["gene", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "target", "reference"]:
+        assert col in designed.columns
+    assert set(designed["target"].unique()) == {"ko_a", "ko_b", "ko_c"}
+    assert (designed["reference"] == REFERENCE).all()
+    assert adata.uns["scx_accel"]["pseudobulk_dex"]["route"] == "cpu_nb_glm"
+
+    # Donor-adjusted, shared-dispersion fit differs from the per-pair default:
+    # the supplied design is consumed, not ignored.
+    a = _lfc_by_gene(default, "ko_a")
+    b = _lfc_by_gene(designed, "ko_a")
+    assert np.nanmax(np.abs(a.to_numpy() - b.to_numpy())) > 1e-3
+
+
+def test_pseudobulk_dex_nbglm_covariate_adjustment_is_real():
+    """`~ perturbation + donor` must differ from `~ perturbation`: the covariate
+    enters the model (the fixture has a per-donor batch factor)."""
+    pytest.importorskip("formulaic")
+    adata = _perturb_adata()
+    common = dict(
+        groupby=["perturbation", "donor"],
+        test_col="perturbation",
+        reference=REFERENCE,
+        min_cells_per_group=1,
+        backend="nb_glm",
+    )
+    no_cov = pyscx.accel.pseudobulk_dex(adata, design="~ perturbation", **common)
+    with_cov = pyscx.accel.pseudobulk_dex(adata, design="~ perturbation + donor", **common)
+    a = _lfc_by_gene(no_cov, "ko_a").to_numpy()
+    b = _lfc_by_gene(with_cov, "ko_a").to_numpy()
+    assert np.nanmax(np.abs(a - b)) > 1e-3
+
+
+def test_pseudobulk_dex_nbglm_reference_coding_sign_flip():
+    """`reference` sets the base level: swapping reference and target negates the
+    contrast (target-vs-reference), confirming `test_col[T.<target>]` coding."""
+    pytest.importorskip("formulaic")
+    adata = _perturb_adata()
+    base = dict(
+        groupby=["perturbation", "donor"],
+        test_col="perturbation",
+        design="~ perturbation",
+        min_cells_per_group=1,
+        backend="nb_glm",
+    )
+    fwd = pyscx.accel.pseudobulk_dex(adata, reference="control", **base)
+    rev = pyscx.accel.pseudobulk_dex(adata, reference="ko_a", **base)
+    koa_vs_ctrl = _lfc_by_gene(fwd, "ko_a").to_numpy()
+    ctrl_vs_koa = _lfc_by_gene(rev, "control").to_numpy()
+    # Same pairwise model, reparameterized: the contrast flips sign.
+    assert np.allclose(koa_vs_ctrl, -ctrl_vs_koa, atol=1e-2, rtol=1e-2)
+
+
+def test_pseudobulk_dex_nbglm_explicit_contrast():
+    """An explicit `contrast` (int index or weight vector) in nbglm_options tests
+    a specific coefficient; index and equivalent weight vector agree; the default
+    formula is `~ test_col` when only a contrast is given."""
+    pytest.importorskip("formulaic")
+    adata = _perturb_adata()
+    common = dict(
+        groupby=["perturbation", "donor"],
+        test_col="perturbation",
+        reference=REFERENCE,
+        min_cells_per_group=1,
+        backend="nb_glm",
+    )
+    # Columns for `~ perturbation` (base=control): [Intercept, ko_a, ko_b, ko_c].
+    idx = pyscx.accel.pseudobulk_dex(adata, nbglm_options={"contrast": 1}, **common)
+    vec = pyscx.accel.pseudobulk_dex(
+        adata, nbglm_options={"contrast": [0.0, 1.0, 0.0, 0.0]}, **common
+    )
+    # A single explicit contrast → one result block.
+    assert idx["target"].nunique() == 1
+    assert np.allclose(
+        idx.sort_values("gene")["log2FoldChange"].to_numpy(),
+        vec.sort_values("gene")["log2FoldChange"].to_numpy(),
+        equal_nan=True,
+    )
+
+
+def test_pseudobulk_dex_nbglm_design_missing_test_col():
+    """A design that omits `test_col` cannot produce the per-target contrast → a
+    clear error, not a silent wrong result."""
+    pytest.importorskip("formulaic")
+    adata = _perturb_adata()
+    with pytest.raises(RuntimeError, match="does not produce a coefficient"):
         pyscx.accel.pseudobulk_dex(
             adata,
             groupby=["perturbation", "donor"],
             test_col="perturbation",
             reference=REFERENCE,
-            design="~ perturbation + donor",
+            design="~ donor",
             min_cells_per_group=1,
             backend="nb_glm",
         )
-    # The pydeseq2 backend still accepts a custom design (no rejection here).
+
+
+def test_pseudobulk_dex_nbglm_design_unknown_column():
+    """A formula referencing a column not in `groupby` fails loudly (formulaic)."""
+    pytest.importorskip("formulaic")
+    adata = _perturb_adata()
+    with pytest.raises(Exception):  # noqa: B017 - formulaic raises its own error type
+        pyscx.accel.pseudobulk_dex(
+            adata,
+            groupby=["perturbation", "donor"],
+            test_col="perturbation",
+            reference=REFERENCE,
+            design="~ perturbation + nonexistent_col",
+            min_cells_per_group=1,
+            backend="nb_glm",
+        )
+
+
+def test_pseudobulk_dex_nbglm_design_requires_formulaic(monkeypatch):
+    """When a `design` is supplied but formulaic is unavailable, fail loud with an
+    actionable message (rather than a cryptic import error)."""
+    import sys
+
+    adata = _perturb_adata()
+    # Poison the import so `py.import("formulaic")` raises ImportError.
+    monkeypatch.setitem(sys.modules, "formulaic", None)
+    with pytest.raises(RuntimeError, match="formulaic is required"):
+        pyscx.accel.pseudobulk_dex(
+            adata,
+            groupby=["perturbation", "donor"],
+            test_col="perturbation",
+            reference=REFERENCE,
+            design="~ perturbation",
+            min_cells_per_group=1,
+            backend="nb_glm",
+        )
+
+
+def test_pdex_nb_glm_design_smoke():
+    """pdex_nb_glm(design=...) fits a covariate-adjusted model and emits the
+    cell-eval polars schema."""
+    pytest.importorskip("formulaic")
+    pytest.importorskip("polars")
+    adata = _perturb_adata()
+    df = pyscx.accel.pdex_nb_glm(
+        adata,
+        "perturbation",
+        REFERENCE,
+        stratify_by=["donor"],
+        min_cells_per_group=1,
+        design="~ perturbation + donor",
+    )
+    assert list(df.columns) == CELL_EVAL_COLUMNS
+    assert set(df["target"].unique().to_list()) == {"ko_a", "ko_b", "ko_c"}
+
+
+def test_pseudobulk_dex_nbglm_parity_vs_pydeseq2():
+    """The nb_glm formula path and the pydeseq2 backend agree on direction /
+    ranking for the same design (DESeq2-*style*, not -*identical*)."""
+    pytest.importorskip("formulaic")
     pytest.importorskip("pydeseq2")
+    spearmanr = pytest.importorskip("scipy.stats").spearmanr
+    adata = _perturb_adata()
+    common = dict(
+        groupby=["perturbation", "donor"],
+        test_col="perturbation",
+        reference=REFERENCE,
+        design="~ perturbation + donor",
+        min_cells_per_group=1,
+    )
+    nb = pyscx.accel.pseudobulk_dex(adata, backend="nb_glm", **common)
+    dd = pyscx.accel.pseudobulk_dex(adata, backend="pydeseq2", n_cpus=1, **common)
+    a = _lfc_by_gene(nb, "ko_a").to_numpy()
+    b = _lfc_by_gene(dd, "ko_a").to_numpy()
+    ok = np.isfinite(a) & np.isfinite(b)
+    rho = spearmanr(a[ok], b[ok]).correlation
+    assert rho > 0.9, rho
 
 
 def test_pseudobulk_dex_nbglm_requires_sum_aggregation():

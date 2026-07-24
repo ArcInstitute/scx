@@ -214,11 +214,63 @@ The Rust API and `accel.nb_glm` take a numeric contrast:
 - `None` → the **last coefficient** (the DESeq2 "last coefficient" convention),
   since a numeric design carries no column names.
 
-`pdex_nb_glm` / `pseudobulk_dex(backend="nb_glm")` build a `[intercept,
+By default, `pdex_nb_glm` / `pseudobulk_dex(backend="nb_glm")` build a `[intercept,
 is_target]` design per non-reference level and test the `is_target` coefficient
 (1-vs-reference). Stratifiers enter only as **replicates** (extra rows), not as
 design covariates — this keeps the marginal effect aligned with the per-cell
-`pdex_ref` test for ranking parity (batch-as-covariate is a v2 refinement).
+`pdex_ref` test for ranking parity. To adjust for covariates (batch, donor) or fit
+a multi-factor model, pass a `design` **formula** — see
+[Custom designs (formula)](#custom-designs-formula).
+
+## Custom designs (formula)
+
+`pseudobulk_dex(backend="nb_glm", design="~ perturbation + donor")` and
+`pdex_nb_glm(design=...)` accept a **formula** so you can fit covariate-adjusted /
+multi-factor models, matching what `backend="pydeseq2"` allows. Without a `design`,
+the fixed `[intercept, is_target]` behaviour above is unchanged.
+
+```python
+df = pyscx.accel.pseudobulk_dex(
+    adata,
+    groupby=["perturbation", "donor"],   # pseudobulk sample covariates
+    test_col="perturbation",
+    reference="control",
+    backend="nb_glm",
+    design="~ perturbation + donor",     # adjust for donor
+)
+```
+
+**Semantics.**
+
+- The formula references the **`groupby` columns** — each pseudobulk *sample* (one
+  `condition × stratum` combination) carries those column values, and they are the
+  only covariates in scope. A formula naming a column not in `groupby` errors.
+- The design matrix is built with **[formulaic](https://github.com/matthewwardrop/formulaic)**
+  — the same engine `pydeseq2` uses — so the NB-GLM and pydeseq2 backends construct
+  **identical** design matrices from the same formula (treatment/dummy coding).
+- `reference` sets the **base level** of `test_col`: the column is coded so that the
+  default per-target contrast is exactly `test_col[T.<target>]` (target-vs-reference),
+  one contrast per non-reference level. Writing an explicit
+  `C(test_col, Treatment("x"))` in the formula overrides this (advanced).
+- The model is fit **once over all pseudobulk samples** with the full design (shared
+  dispersion, covariate-adjusted); each non-reference level's contrast is then
+  extracted. This is DESeq2-*style* (not -*identical*), consistent with the rest of
+  this backend — for exact DESeq2 numerics use `backend="pydeseq2"`.
+- **Explicit contrast override:** `nbglm_options={"contrast": <int|weights>}` tests a
+  specific coefficient index or weight vector `c` (`c·beta = 0`) instead of the
+  automatic per-target contrasts, reusing the same numeric contrast API as
+  `accel.nb_glm`.
+
+**Dependency.** `formulaic` is a transitive `pydeseq2` dependency; it is imported
+**only when a `design` is supplied** (a clear `ImportError`-derived message otherwise),
+so the no-formula path keeps its zero-dependency property. The fit is deterministic
+(no RNG). The design matrix is `n_samples × n_features` f64 — negligible memory
+versus the count matrix.
+
+> **Note.** With a formula, each non-reference level's contrast currently re-runs the
+> (identical, deterministic) full-design IRLS fit; the number of fits equals the
+> number of `test_col` levels. A fit-once / test-many-contrasts engine entry is a
+> planned optimization and does not change results.
 
 ## Options
 
