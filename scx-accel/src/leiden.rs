@@ -96,7 +96,6 @@ struct LeidenGraphData {
     neighbors: Vec<usize>,
     weights: Vec<f64>,
     node_weights: Vec<f64>,
-    degrees: Vec<usize>,
     strengths: Vec<f64>,
     total_weight: f64,
 }
@@ -166,7 +165,6 @@ impl LeidenGraph {
         }
 
         // Compute derived values.
-        let mut degrees = Vec::with_capacity(n_nodes);
         let mut strengths = vec![0.0f64; n_nodes];
         let node_weights = vec![1.0f64; n_nodes];
         let mut total_weight = 0.0f64;
@@ -174,7 +172,6 @@ impl LeidenGraph {
         for node in 0..n_nodes {
             let start = node_ptrs[node];
             let end = node_ptrs[node + 1];
-            degrees.push(end - start);
             for i in start..end {
                 strengths[node] += weights[i];
                 // Self-loops contribute twice to strength in igraph's convention
@@ -196,7 +193,6 @@ impl LeidenGraph {
                 neighbors,
                 weights,
                 node_weights,
-                degrees,
                 strengths,
                 total_weight,
             }),
@@ -261,7 +257,6 @@ impl LeidenGraph {
                 neighbors,
                 weights,
                 node_weights,
-                degrees,
                 strengths,
                 total_weight,
             }),
@@ -321,39 +316,46 @@ impl LeidenGraph {
             new_node_weights[grouping.get_group(node)] += self.data.node_weights[node];
         }
 
-        // Accumulate edge weights: self-loops (intra-group) and cross-group edges.
-        let mut self_loop_weights: HashMap<usize, f64> = HashMap::new();
-        let mut edge_memo: HashMap<(usize, usize), f64> = HashMap::new();
-
+        // Accumulate collapsed edge weights per ordered group pair `(a, b)` with
+        // `a <= b` (self-loop when `a == b`) via a sort/merge instead of two
+        // HashMaps — the group ids are dense `0..group_count`, so this avoids the
+        // per-collapse HashMap allocation churn (the source of the heap
+        // fragmentation the outer loop's `malloc_trim` compensates for).
+        //
+        // Byte-identical to the previous map-based path: pairs are collected in
+        // graph-visitation order (node ascending, then neighbor within row), and
+        // a **stable** sort preserves that order within each equal key, so the
+        // merge-sum below accumulates each pair's weight in exactly the order the
+        // HashMap's `+=` did. Emitting `a <= b` (self-loop stored once) matches
+        // what `from_edges` expects.
+        let mut pairs: Vec<(usize, usize, f64)> = Vec::with_capacity(self.data.neighbors.len());
         for node in 0..self.node_count() {
             let start = self.data.node_ptrs[node];
             let end = self.data.node_ptrs[node + 1];
             for i in start..end {
                 let neighbor = self.data.neighbors[i];
-                let w = self.data.weights[i];
                 // Upper triangle only to avoid double-counting.
                 if node <= neighbor {
+                    let w = self.data.weights[i];
                     let g1 = grouping.get_group(node);
                     let g2 = grouping.get_group(neighbor);
-                    if g1 == g2 {
-                        *self_loop_weights.entry(g1).or_insert(0.0) += w;
-                    } else {
-                        let key = if g1 < g2 { (g1, g2) } else { (g2, g1) };
-                        *edge_memo.entry(key).or_insert(0.0) += w;
-                    }
+                    let (a, b) = if g1 <= g2 { (g1, g2) } else { (g2, g1) };
+                    pairs.push((a, b, w));
                 }
             }
         }
+        pairs.sort_by_key(|&(a, b, _)| (a, b)); // stable — preserves visitation order
 
-        let mut edges = Vec::with_capacity(self_loop_weights.len() + edge_memo.len());
-        for (&group, &w) in &self_loop_weights {
-            if w > 0.0 {
-                edges.push((group, group, w));
+        let mut edges: Vec<(usize, usize, f64)> = Vec::with_capacity(pairs.len());
+        for (a, b, w) in pairs {
+            match edges.last_mut() {
+                Some(last) if last.0 == a && last.1 == b => last.2 += w,
+                _ => edges.push((a, b, w)),
             }
         }
-        for (&(g1, g2), &w) in &edge_memo {
-            edges.push((g1, g2, w));
-        }
+        // Drop zero-weight self-loops (the old path skipped `w <= 0.0` self-loops;
+        // cross edges were always pushed). Preserves the exact edge set.
+        edges.retain(|&(a, b, w)| a != b || w > 0.0);
 
         Self::from_edges(&edges, new_node_weights)
     }
@@ -513,8 +515,10 @@ struct RBPartition {
     grouping: Grouping,
     resolution: f64,
     two_m: f64,
-    /// Per-node strength (weighted degree), never changes.
-    node_strengths: Vec<f64>,
+    /// Per-node self-loop weight, precomputed once (the graph is immutable during
+    /// optimization). Caches `graph.self_loop_weight(node)` so the local-move hot
+    /// loop reads it in O(1) instead of re-binary-searching per candidate.
+    self_loop_weights: Vec<f64>,
     /// Per-community sum of node strengths — maintained incrementally.
     community_strengths: Vec<f64>,
 }
@@ -524,14 +528,16 @@ impl RBPartition {
         let two_m = 2.0 * graph.total_weight();
         let n = graph.node_count();
 
-        // Pre-compute node strengths (immutable).
-        let node_strengths: Vec<f64> = (0..n).map(|i| graph.strength(i)).collect();
+        // Per-node self-loop weight is immutable during optimization — compute
+        // once. Node strength is read directly from the graph (`graph.strength`,
+        // an O(1) slice index) rather than kept as a duplicate copy.
+        let self_loop_weights: Vec<f64> = (0..n).map(|i| graph.self_loop_weight(i)).collect();
 
         // Build community strengths.
         let nc = grouping.group_count();
         let mut community_strengths = vec![0.0f64; nc];
         for node in 0..n {
-            community_strengths[grouping.get_group(node)] += node_strengths[node];
+            community_strengths[grouping.get_group(node)] += graph.strength(node);
         }
 
         Self {
@@ -539,7 +545,7 @@ impl RBPartition {
             grouping,
             resolution,
             two_m,
-            node_strengths,
+            self_loop_weights,
             community_strengths,
         }
     }
@@ -642,8 +648,8 @@ impl RBPartition {
             return 0.0;
         }
 
-        let k_i = self.node_strengths[node];
-        let self_weight = self.graph.self_loop_weight(node);
+        let k_i = self.graph.strength(node);
+        let self_weight = self.self_loop_weights[node];
 
         let k_old = if old_comm < self.community_strengths.len() {
             self.community_strengths[old_comm]
@@ -690,7 +696,7 @@ impl RBPartition {
         if old == new_community {
             return;
         }
-        let k = self.node_strengths[node];
+        let k = self.graph.strength(node);
         self.community_strengths[old] -= k;
         if new_community >= self.community_strengths.len() {
             self.community_strengths.resize(new_community + 1, 0.0);
@@ -716,7 +722,7 @@ impl RBPartition {
         self.community_strengths = vec![0.0; nc];
         for node in 0..self.graph.node_count() {
             let c = self.grouping.get_group(node);
-            self.community_strengths[c] += self.node_strengths[node];
+            self.community_strengths[c] += self.graph.strength(node);
         }
     }
 
@@ -1724,6 +1730,43 @@ mod tests {
         for i in 0..3 {
             assert!((graph.strength(i) - 2.0).abs() < 1e-10);
         }
+    }
+
+    #[test]
+    fn test_aggregate_collapses_to_expected_graph() {
+        // 4 nodes, edges 0-1 (2.0), 1-2 (1.0), 2-3 (3.0). Group {0,1}→0, {2,3}→1.
+        // Collapse: group-0 self-loop = intra edge 0-1 = 2.0; group-1 self-loop =
+        // intra edge 2-3 = 3.0; cross 0↔1 = edge 1-2 = 1.0.
+        let g = LeidenGraph::from_edges(&[(0, 1, 2.0), (1, 2, 1.0), (2, 3, 3.0)], vec![1.0; 4]);
+        let grouping = Grouping::from_assignments(&[0, 0, 1, 1]);
+        let agg = g.aggregate(&grouping);
+
+        // Independent expected: feed the hand-derived collapsed edges through the
+        // same canonicalizing `from_edges`. Node weights sum per group (all 1.0).
+        let expected =
+            LeidenGraph::from_edges(&[(0, 0, 2.0), (0, 1, 1.0), (1, 1, 3.0)], vec![2.0, 2.0]);
+
+        assert_eq!(agg.data.node_ptrs, expected.data.node_ptrs);
+        assert_eq!(agg.data.neighbors, expected.data.neighbors);
+        assert_eq!(agg.data.weights.len(), expected.data.weights.len());
+        for (a, b) in agg.data.weights.iter().zip(&expected.data.weights) {
+            assert_eq!(a.to_bits(), b.to_bits(), "edge weight {a} != expected {b}");
+        }
+        for (a, b) in agg.data.strengths.iter().zip(&expected.data.strengths) {
+            assert_eq!(a.to_bits(), b.to_bits(), "strength {a} != expected {b}");
+        }
+        for (a, b) in agg
+            .data
+            .node_weights
+            .iter()
+            .zip(&expected.data.node_weights)
+        {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        assert_eq!(
+            agg.data.total_weight.to_bits(),
+            expected.data.total_weight.to_bits()
+        );
     }
 
     #[test]

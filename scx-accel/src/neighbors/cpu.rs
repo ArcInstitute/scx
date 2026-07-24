@@ -433,30 +433,35 @@ pub(crate) fn compute_connectivities(
 ) -> (Vec<i64>, Vec<i32>, Vec<f64>) {
     let target = (n_neighbors as f64).ln() / std::f64::consts::LN_2; // log2(k)
 
-    // Compute per-point bandwidths (σ) and membership strengths
+    // Compute per-point bandwidths (σ). Each point is independent (its own
+    // distance slice + ρ) and `find_sigma` is a deterministic fixed-iteration
+    // binary search, so the parallel map is order-preserving and bit-identical
+    // to the serial loop.
     let sigmas: Vec<f64> = (0..n_obs)
+        .into_par_iter()
         .map(|i| {
             let offset = i * n_neighbors;
             let rho = knn_distances[offset]; // nearest neighbor distance
-
-            // Binary search for σ
             find_sigma(&knn_distances[offset..offset + n_neighbors], rho, target)
         })
         .collect();
 
-    // Compute asymmetric membership strengths and build O(1) lookup map.
-    // HashMap keyed by (i, j) → μ(i,j) replaces the previous O(k) linear scan
-    // per edge, reducing total symmetrization cost from O(n × k²) to O(n × k).
-    use std::collections::HashMap;
-
-    let mut mu_map: HashMap<(usize, usize), f64> = HashMap::with_capacity(n_obs * n_neighbors);
-
-    #[allow(clippy::needless_range_loop)] // i indexes sigmas, knn_indices, and knn_distances
+    // Build the directed membership matrix A in CSR form (row i → μ(i,j)), with
+    // each row's columns sorted ascending (the kNN list is distance-ordered, not
+    // column-ordered, so sort per row). This replaces the previous
+    // HashMap<(i,j)> + HashSet symmetrization with an allocation-light,
+    // deterministic CSR transpose + sorted-merge.
+    let mut a_indptr = Vec::with_capacity(n_obs + 1);
+    a_indptr.push(0usize);
+    let mut a_cols: Vec<usize> = Vec::with_capacity(n_obs * n_neighbors);
+    let mut a_vals: Vec<f64> = Vec::with_capacity(n_obs * n_neighbors);
+    let mut row_buf: Vec<(usize, f64)> = Vec::with_capacity(n_neighbors);
+    #[allow(clippy::needless_range_loop)] // i indexes sigmas, knn_indices, knn_distances
     for i in 0..n_obs {
         let offset = i * n_neighbors;
         let rho = knn_distances[offset];
         let sigma = sigmas[i];
-
+        row_buf.clear();
         for j_idx in 0..n_neighbors {
             let j = knn_indices[offset + j_idx];
             let d = knn_distances[offset + j_idx];
@@ -465,51 +470,97 @@ pub(crate) fn compute_connectivities(
             } else {
                 (-(d - rho) / sigma).exp()
             };
-            mu_map.insert((i, j), strength);
+            row_buf.push((j, strength));
         }
-    }
-
-    // Symmetrize: conn(i,j) = μ(i,j) + μ(j,i) - μ(i,j) * μ(j,i)
-    // Use a HashSet to track processed edges so each (i,j)/(j,i) pair is
-    // computed exactly once — eliminates the previous dedup_by_key call that
-    // could silently drop values with different floating-point rounding.
-    let mut sym: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_obs];
-    let mut seen = std::collections::HashSet::<(usize, usize)>::new();
-
-    for &(i, j) in mu_map.keys() {
-        // Skip if we already processed this edge from the (j,i) direction
-        if !seen.insert((i, j)) {
-            continue;
-        }
-        seen.insert((j, i));
-
-        let mu_ij = mu_map.get(&(i, j)).copied().unwrap_or(0.0);
-        let mu_ji = mu_map.get(&(j, i)).copied().unwrap_or(0.0);
-        let conn = mu_ij + mu_ji - mu_ij * mu_ji;
-
-        if conn > 0.0 {
-            sym[i].push((j, conn));
-            if i != j {
-                sym[j].push((i, conn));
+        // Ascending by column; on a duplicate neighbor id the later entry wins,
+        // matching the prior HashMap insert (last-write-wins).
+        row_buf.sort_by_key(|&(col, _)| col);
+        let mut prev: Option<usize> = None;
+        for &(col, val) in &row_buf {
+            if prev == Some(col) {
+                *a_vals.last_mut().unwrap() = val;
+            } else {
+                a_cols.push(col);
+                a_vals.push(val);
+                prev = Some(col);
             }
         }
+        a_indptr.push(a_cols.len());
     }
 
-    // Sort each row by column index (no dedup needed — seen set prevents duplicates)
-    for row in &mut sym {
-        row.sort_by_key(|&(col, _)| col);
+    // Transpose A → Aᵀ via a counting-scatter (Aᵀ[j] lists, for each row i that
+    // has column j, the value μ(i,j) = A[i][j]); scattering rows 0..n_obs in
+    // order leaves each Aᵀ row sorted ascending by original row index.
+    let nnz = a_cols.len();
+    let mut at_indptr = vec![0usize; n_obs + 1];
+    for &c in &a_cols {
+        at_indptr[c + 1] += 1;
+    }
+    for c in 0..n_obs {
+        at_indptr[c + 1] += at_indptr[c];
+    }
+    let mut at_rows = vec![0usize; nnz]; // original row index i
+    let mut at_vals = vec![0.0f64; nnz];
+    let mut cursor = at_indptr[..n_obs].to_vec();
+    for i in 0..n_obs {
+        for idx in a_indptr[i]..a_indptr[i + 1] {
+            let c = a_cols[idx];
+            let dst = cursor[c];
+            at_rows[dst] = i;
+            at_vals[dst] = a_vals[idx];
+            cursor[c] += 1;
+        }
     }
 
-    // Convert to CSR
+    // Symmetrize row by row: conn(i,k) = μ(i,k) + μ(k,i) - μ(i,k)·μ(k,i), merging
+    // the two column-sorted lists A[i] (μ(i,·)) and Aᵀ[i] (μ(·,i)). Emitting k in
+    // ascending order gives a per-row column-sorted CSR; keep conn > 0. This is a
+    // fixed 3-term expression per pair, so the result is byte-identical to the
+    // previous map-based path (addition/multiplication of the same two operands).
     let mut indptr = Vec::with_capacity(n_obs + 1);
     let mut indices = Vec::new();
     let mut data = Vec::new();
-
     indptr.push(0i64);
-    for row in &sym {
-        for &(col, val) in row {
-            indices.push(col as i32);
-            data.push(val);
+    for i in 0..n_obs {
+        let (mut ap, ae) = (a_indptr[i], a_indptr[i + 1]);
+        let (mut tp, te) = (at_indptr[i], at_indptr[i + 1]);
+        while ap < ae || tp < te {
+            let a_col = if ap < ae { Some(a_cols[ap]) } else { None };
+            let t_col = if tp < te { Some(at_rows[tp]) } else { None };
+            let (col, mu_ik, mu_ki) = match (a_col, t_col) {
+                (Some(ac), Some(tc)) if ac == tc => {
+                    let v = (ac, a_vals[ap], at_vals[tp]);
+                    ap += 1;
+                    tp += 1;
+                    v
+                }
+                (Some(ac), Some(tc)) if ac < tc => {
+                    let v = (ac, a_vals[ap], 0.0);
+                    ap += 1;
+                    v
+                }
+                (Some(_), Some(tc)) => {
+                    let v = (tc, 0.0, at_vals[tp]);
+                    tp += 1;
+                    v
+                }
+                (Some(ac), None) => {
+                    let v = (ac, a_vals[ap], 0.0);
+                    ap += 1;
+                    v
+                }
+                (None, Some(tc)) => {
+                    let v = (tc, 0.0, at_vals[tp]);
+                    tp += 1;
+                    v
+                }
+                (None, None) => unreachable!("loop guard guarantees one side is non-empty"),
+            };
+            let conn = mu_ik + mu_ki - mu_ik * mu_ki;
+            if conn > 0.0 {
+                indices.push(col as i32);
+                data.push(conn);
+            }
         }
         indptr.push(indices.len() as i64);
     }
@@ -671,6 +722,121 @@ mod tests {
             result.conn_data.len() >= result.dist_data.len(),
             "connectivities should have at least as many entries as distances"
         );
+    }
+
+    /// Independent dense O(n²) reference for the fuzzy-simplicial-set union.
+    /// Reuses `find_sigma` (its own correctness is covered by `test_find_sigma`)
+    /// but computes the symmetrization independently of `compute_connectivities`,
+    /// so it is a genuine oracle for the CSR-merge refactor (task 2.5a). Produces
+    /// the same CSR triplet layout: per-row column-sorted, `conn > 0` filtered.
+    fn dense_conn_reference(
+        knn_indices: &[usize],
+        knn_distances: &[f64],
+        n_obs: usize,
+        k: usize,
+    ) -> (Vec<i64>, Vec<i32>, Vec<f64>) {
+        let target = (k as f64).ln() / std::f64::consts::LN_2;
+        let sigmas: Vec<f64> = (0..n_obs)
+            .map(|i| {
+                let off = i * k;
+                find_sigma(&knn_distances[off..off + k], knn_distances[off], target)
+            })
+            .collect();
+        // Dense directed membership μ(i,j); last-write-wins per (i,j) like the map.
+        let mut mu = vec![0.0f64; n_obs * n_obs];
+        for i in 0..n_obs {
+            let off = i * k;
+            let rho = knn_distances[off];
+            let sigma = sigmas[i];
+            for jn in 0..k {
+                let j = knn_indices[off + jn];
+                let d = knn_distances[off + jn];
+                let s = if d <= rho || sigma <= 1e-10 {
+                    1.0
+                } else {
+                    (-(d - rho) / sigma).exp()
+                };
+                mu[i * n_obs + j] = s;
+            }
+        }
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for i in 0..n_obs {
+            for kk in 0..n_obs {
+                let a = mu[i * n_obs + kk];
+                let b = mu[kk * n_obs + i];
+                if a > 0.0 || b > 0.0 {
+                    let conn = a + b - a * b;
+                    if conn > 0.0 {
+                        indices.push(kk as i32);
+                        data.push(conn);
+                    }
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        (indptr, indices, data)
+    }
+
+    /// Hand-built kNN fixture with self-neighbors (exercises the i==j path) and
+    /// an asymmetric edge (2→3 present, 3→2 absent). Distances ascending per row.
+    fn asymmetric_knn_fixture() -> (Vec<usize>, Vec<f64>, usize, usize) {
+        let n_obs = 6;
+        let k = 3;
+        let knn_indices = vec![
+            0, 1, 2, // 0
+            1, 0, 2, // 1
+            2, 1, 3, // 2 → 3 (asymmetric)
+            3, 4, 5, // 3
+            4, 3, 5, // 4
+            5, 4, 3, // 5
+        ];
+        let knn_distances = vec![
+            0.0, 1.0, 2.0, // 0
+            0.0, 1.0, 3.0, // 1
+            0.0, 1.5, 2.0, // 2
+            0.0, 1.0, 2.0, // 3
+            0.0, 1.0, 1.5, // 4
+            0.0, 1.0, 2.0, // 5
+        ];
+        (knn_indices, knn_distances, n_obs, k)
+    }
+
+    #[test]
+    fn connectivities_match_dense_reference_fixture() {
+        let (idx, dist, n_obs, k) = asymmetric_knn_fixture();
+        let (indptr, indices, data) = compute_connectivities(&idx, &dist, n_obs, k);
+        let (r_indptr, r_indices, r_data) = dense_conn_reference(&idx, &dist, n_obs, k);
+        assert_eq!(indptr, r_indptr, "indptr mismatch vs dense reference");
+        assert_eq!(indices, r_indices, "indices mismatch vs dense reference");
+        // Byte-identical f64: the symmetrization is a fixed per-pair expression.
+        assert_eq!(
+            data.len(),
+            r_data.len(),
+            "data length mismatch vs dense reference"
+        );
+        for (a, b) in data.iter().zip(&r_data) {
+            assert_eq!(a.to_bits(), b.to_bits(), "conn weight {a} != reference {b}");
+        }
+    }
+
+    #[test]
+    fn connectivities_match_dense_reference_realistic() {
+        // A realistic kNN from build_knn_graph, to cover typical (asymmetric,
+        // no-self) neighbor structure at k=5.
+        let (data, n_obs, n_vars) = two_cluster_data();
+        let result = build_knn_graph(&data, n_obs, n_vars, 5, 100, 50, 42).unwrap();
+        let knn_idx: Vec<usize> = result.indices.iter().map(|&i| i as usize).collect();
+        let (indptr, indices, cdata) =
+            compute_connectivities(&knn_idx, &result.distances, n_obs, 5);
+        let (r_indptr, r_indices, r_data) =
+            dense_conn_reference(&knn_idx, &result.distances, n_obs, 5);
+        assert_eq!(indptr, r_indptr);
+        assert_eq!(indices, r_indices);
+        for (a, b) in cdata.iter().zip(&r_data) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
     }
 
     #[test]
