@@ -453,6 +453,20 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
 ///         on CSR — row aggregations have no CSC win. Capability gate
 ///         applies (no row deletion vector, no non-column-local
 ///         transforms; raises on missing CSC sidecar).
+///
+/// At most 64 `qc_vars` per call (they are packed into a per-column bitmask so
+/// every subset is accumulated in the same shard pass).
+///
+/// BEHAVIOR CHANGE (bug fix): column projections — a `filter_genes` result, or
+/// `adata[:, mask]` on a backed `X` — are now honored on every route. Per-cell
+/// totals cover only the visible genes, the gene axis is returned at the
+/// visible width, and `qc_vars` masks are read against `adata.var`. Previously
+/// the default `prefer_format="csr"` route ignored the projection entirely:
+/// `total_counts` silently summed hidden genes and the gene axis came back at
+/// the underlying (physical) width. On a lazy `X` the `qc_vars` subset sums are
+/// now taken *through* the transform chain, so `pct_counts_<v>` divides a
+/// transformed numerator by a transformed denominator (the numerator used to be
+/// pre-transform). Results are unchanged for unprojected, untransformed input.
 #[pyfunction]
 #[pyo3(signature = (adata, qc_vars=None, log1p=true, inplace=true, prefer_format="csr"))]
 pub fn calculate_qc_metrics<'py>(
