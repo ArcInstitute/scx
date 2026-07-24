@@ -109,7 +109,8 @@ On the `cell-eval-scx` side this is a one-line `ScxDeMethod` addition
 `pyscx.accel.pseudobulk_dex` gains a `backend` argument
 (`"pydeseq2"` default, or `"nb_glm"`). The NB-GLM backend emits the **same pandas
 schema** as the pydeseq2 path, so existing consumers need no changes, and it has
-**no pydeseq2 dependency**.
+**no pydeseq2 dependency** (a custom `design=` formula additionally needs
+`formulaic`; see [Custom designs](#custom-designs-formula)).
 
 ```python
 df = pyscx.accel.pseudobulk_dex(
@@ -244,28 +245,53 @@ df = pyscx.accel.pseudobulk_dex(
 
 - The formula references the **`groupby` columns** — each pseudobulk *sample* (one
   `condition × stratum` combination) carries those column values, and they are the
-  only covariates in scope. A formula naming a column not in `groupby` errors.
+  only covariates in scope. A formula naming a column not in `groupby` errors. (All
+  covariates are stringified upstream, so a numeric-looking column is dummy-coded,
+  not fit as a linear term — same as the pydeseq2 backend.)
 - The design matrix is built with **[formulaic](https://github.com/matthewwardrop/formulaic)**
-  — the same engine `pydeseq2` uses — so the NB-GLM and pydeseq2 backends construct
-  **identical** design matrices from the same formula (treatment/dummy coding).
-- `reference` sets the **base level** of `test_col`: the column is coded so that the
-  default per-target contrast is exactly `test_col[T.<target>]` (target-vs-reference),
-  one contrast per non-reference level. Writing an explicit
-  `C(test_col, Treatment("x"))` in the formula overrides this (advanced).
+  — the same parser `pydeseq2` uses — with **treatment (dummy) coding** and the
+  `test_col` base level pinned to `reference`. The two backends therefore use the
+  same coding convention; the matrices are **not byte-identical** (the pydeseq2 path
+  passes plain-string columns with a lexicographic base and injects an extra
+  `n_cells` column), but the fitted contrasts agree in direction and magnitude for
+  main-effects models.
+- `reference` sets the **base level** of `test_col`, so the default per-target
+  contrast is `test_col[T.<target>]` (target-vs-reference), one per non-reference
+  level. A treatment-coded wrapper on `test_col` (e.g. `C(perturbation)` or
+  `C(perturbation, Treatment("control"))`) is also resolved (its
+  `…[T.<target>]` coefficient is matched). Sum coding, polynomial coding, and
+  no-intercept (`~ 0 + …`) designs are **not** supported for the automatic contrast
+  and will error — use an explicit `contrast` for those.
 - The model is fit **once over all pseudobulk samples** with the full design (shared
   dispersion, covariate-adjusted); each non-reference level's contrast is then
-  extracted. This is DESeq2-*style* (not -*identical*), consistent with the rest of
-  this backend — for exact DESeq2 numerics use `backend="pydeseq2"`.
-- **Explicit contrast override:** `nbglm_options={"contrast": <int|weights>}` tests a
-  specific coefficient index or weight vector `c` (`c·beta = 0`) instead of the
-  automatic per-target contrasts, reusing the same numeric contrast API as
-  `accel.nb_glm`.
+  extracted from that fit. Because the fit pools all samples, `design="~ test_col"`
+  is **not** numerically identical to omitting `design` (the default fits each
+  `{target, reference}` pair separately): with a formula the median-of-ratios size
+  factors, `baseMean`, Cook's cutoff, and independent-filtering are all computed over
+  the full sample set, and p-values come from the pooled fit. This is DESeq2-*style*
+  (not -*identical*) — for exact DESeq2 numerics use `backend="pydeseq2"`.
+- If `test_col` appears **inside an interaction** (`~ perturbation * donor`), the
+  extracted `perturbation[T.<target>]` is the effect **at the base level of the other
+  factor**, but the row is still labelled `target`/`reference` like a marginal effect
+  — interpret accordingly (or pass an explicit contrast).
+- **Explicit contrast override** (`pseudobulk_dex` / `accel.nb_glm` only):
+  `nbglm_options={"contrast": <int|weights>}` tests a specific coefficient index or
+  weight vector `c` (`c·beta = 0`) instead of the automatic per-target contrasts,
+  reusing the same numeric contrast API as `accel.nb_glm`. It returns a **single**
+  result block whose `target` is the coefficient label. `pdex_nb_glm` **rejects** an
+  explicit contrast (its cell-eval schema is keyed by perturbation name).
+- **Scale limit.** Because each contrast currently re-runs the full fit (see the note
+  below), the design path refuses a design wider than **100** columns or a `test_col`
+  with more than 100 non-reference levels — use `accel.nb_glm` per contrast, or a
+  narrower design, for larger problems.
 
-**Dependency.** `formulaic` is a transitive `pydeseq2` dependency; it is imported
-**only when a `design` is supplied** (a clear `ImportError`-derived message otherwise),
-so the no-formula path keeps its zero-dependency property. The fit is deterministic
-(no RNG). The design matrix is `n_samples × n_features` f64 — negligible memory
-versus the count matrix.
+**Dependency.** `formulaic` is imported **only when a `design` (or explicit
+`contrast`) is supplied** — a clear `ImportError` otherwise (install the `nbglm`
+extra: `pip install 'pyscx[nbglm]'`) — so the default NB-GLM path keeps its
+dependency-free property. In practice `formulaic` usually arrives transitively via
+`pydeseq2`. The fit is deterministic (no RNG). The design matrix itself is
+`n_samples × n_features` f64 (negligible), but note the per-gene fit workspace scales
+with `n_features²`, which is the real reason for the width limit above.
 
 > **Note.** With a formula, each non-reference level's contrast currently re-runs the
 > (identical, deterministic) full-design IRLS fit; the number of fits equals the
