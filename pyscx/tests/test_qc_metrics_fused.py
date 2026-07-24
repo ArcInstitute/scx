@@ -232,6 +232,32 @@ def test_empty_qc_var_keeps_historical_columns(multishard_path):
     assert "log1p_total_counts_some" in adata.obs.columns
 
 
+def test_inplace_false_returns_frames_without_writing(multishard_path):
+    """The `(obs_df, var_df)` return path survives the row-pass restructure."""
+    import pyscx
+
+    adata = _open(multishard_path)
+    adata.var["mt"] = np.arange(adata.n_vars) < 6
+    obs_df, var_df = pyscx.accel.calculate_qc_metrics(
+        adata, qc_vars=["mt"], inplace=False
+    )
+
+    assert "total_counts" not in adata.obs.columns
+    assert "total_counts" not in adata.var.columns
+    assert list(obs_df.index) == list(adata.obs_names)
+    assert list(var_df.index) == list(adata.var_names)
+
+    ref_total = np.asarray(adata.X.sum(axis=1)).ravel().astype(np.float64)
+    np.testing.assert_array_equal(
+        obs_df["total_counts"].to_numpy(dtype=np.float64), ref_total
+    )
+    subset = _open(multishard_path, project=list(range(6)))
+    np.testing.assert_array_equal(
+        obs_df["total_counts_mt"].to_numpy(dtype=np.float64),
+        np.asarray(subset.X.sum(axis=1)).ravel().astype(np.float64),
+    )
+
+
 def test_too_many_qc_vars_rejected(multishard_path):
     """>64 subsets exceeds the bitmask width and must fail loudly."""
     import pyscx
