@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use numpy::{PyArray, PyArray2};
+use numpy::PyArray;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -458,9 +458,10 @@ fn run_on_source<S: ShardSource + Sync>(
                      for an out-of-core embedding, or raise dense_max_elems if you have the RAM."
                 )));
             }
+            let (dn_obs, dn_vars) = source.shape();
             let dense = materialize_dense(source, &baseline)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let arr = PyArray2::<f32>::from_vec2(py, &dense)?;
+            let arr = super::util::flat_pyarray2(py, dense, dn_obs, dn_vars)?;
             let key = layer_out.unwrap_or("pflog");
             adata.getattr("layers")?.set_item(key, arr)?;
         }
@@ -475,13 +476,15 @@ fn run_on_source<S: ShardSource + Sync>(
     Ok(())
 }
 
-/// Materialize the exact dense `Z = delta + baseline·1ᵀ` (f32, row-major).
+/// Materialize the exact dense `Z = delta + baseline·1ᵀ` into a single flat
+/// row-major `Vec<f32>` (shape n_obs × n_vars, element (cell,v) at
+/// cell*n_vars+v) — avoids a per-row `Vec` allocation at n_obs rows.
 fn materialize_dense<S: ShardSource>(
     source: &S,
     baseline: &[f64],
-) -> Result<Vec<Vec<f32>>, scx_accel::AccelError> {
+) -> Result<Vec<f32>, scx_accel::AccelError> {
     let (n_obs, n_vars) = source.shape();
-    let mut dense = vec![vec![0.0f32; n_vars]; n_obs];
+    let mut dense = vec![0.0f32; n_obs * n_vars];
     let mut row_base = 0usize;
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
@@ -489,7 +492,8 @@ fn materialize_dense<S: ShardSource>(
         for r in 0..rows {
             let cell = row_base + r;
             let b = baseline[cell] as f32;
-            let out = &mut dense[cell];
+            let base = cell * n_vars;
+            let out = &mut dense[base..base + n_vars];
             for v in out.iter_mut() {
                 *v = b;
             }
@@ -513,20 +517,16 @@ fn write_pca(
     result: &PcaResult,
     obsm_key: &str,
 ) -> PyResult<()> {
+    // `result.embeddings` is row-major flat (n_obs × n_components); one flat
+    // f32 buffer avoids the per-row Vec allocation of `from_vec2`.
     let marshal_start = scx_accel::cpu_profile::start();
-    let embeddings = PyArray2::<f32>::from_vec2(
-        py,
-        &(0..result.n_obs)
-            .map(|i| {
-                (0..result.n_components)
-                    .map(|j| result.embeddings[i * result.n_components + j] as f32)
-                    .collect::<Vec<f32>>()
-            })
-            .collect::<Vec<Vec<f32>>>(),
-    )?;
+    let n_obs = result.n_obs;
+    let n_components = result.n_components;
+    let flat: Vec<f32> = result.embeddings.iter().map(|&v| v as f32).collect();
+    let embeddings = super::util::flat_pyarray2(py, flat, n_obs, n_components)?;
     scx_accel::cpu_profile::record_marshalling_since(
         marshal_start,
-        result.n_obs * result.n_components * std::mem::size_of::<f32>(),
+        n_obs * n_components * std::mem::size_of::<f32>(),
     );
     adata.getattr("obsm")?.set_item(obsm_key, embeddings)?;
 

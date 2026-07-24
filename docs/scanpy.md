@@ -2791,6 +2791,16 @@ os.environ["RAYON_NUM_THREADS"] = "8"   # must be set before `import pyscx`
 import pyscx
 ```
 
+`RAYON_NUM_THREADS` sizes the process-wide rayon pool that most accelerators use.
+`SCX_ACCEL_NUM_THREADS` is a narrower ceiling for the two accelerators that build their
+own **private** rayon pool — Harmony batch integration and the streaming PCA covariance
+accumulator — so you can cap those on a fat node without shrinking every op. It is read
+once at first use (set it before the first accelerator call); unset (the default) leaves
+today's behaviour unchanged, and the PCA pool's memory-derived worker cap still applies on
+top of it. Other `SCX_ACCEL_*` knobs (`SCX_ACCEL_PREFETCH_DEPTH`,
+`SCX_ACCEL_REDUCTION_MODE`, `SCX_ACCEL_DE_MEMORY_BUDGET`) are documented in
+[performance.md](performance.md).
+
 The cloud runtime exposes its own knob:
 
 ```python

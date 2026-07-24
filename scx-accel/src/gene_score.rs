@@ -311,30 +311,31 @@ pub fn score_genes<S: ShardSource + Sync>(
                 *random_state,
             );
 
-            let mut w_list = vec![0.0f64; n_vars];
+            // Fuse the two weight vectors into one: +1/k_list on list genes,
+            // −1/|control| on control genes. This halves the per-nonzero inner
+            // work in `streaming_weighted_row_sums` (one weight vector, not two).
+            // Use `+=`/`-=` so the fused weight is `w_list[g] − w_ctrl[g]` even
+            // if a gene were in both sets (today they are disjoint — scanpy's
+            // `ctrl_as_ref=True` removes scored genes from the control set).
+            // Numerics: the score is `Σ(w_list − w_ctrl)·v` accumulated in one
+            // f64 pass, which matches the previous `(Σ w_list·v) − (Σ w_ctrl·v)`
+            // up to f64 re-association (single accumulator vs two subtracted
+            // once) — within the tolerance of the scanpy parity test.
+            let mut w = vec![0.0f64; n_vars];
             let inv_list = 1.0 / k_list;
             for &g in gene_list {
-                w_list[g as usize] = inv_list;
+                w[g as usize] += inv_list;
             }
-
-            let mut w_ctrl = vec![0.0f64; n_vars];
             if !control.is_empty() {
                 let inv_ctrl = 1.0 / control.len() as f64;
                 for &g in &control {
-                    w_ctrl[g as usize] = inv_ctrl;
+                    w[g as usize] -= inv_ctrl;
                 }
             }
 
-            let out = streaming_weighted_row_sums(source, &[w_list, w_ctrl])?;
-            let mut it = out.into_iter();
-            let list_means = it.next().unwrap();
-            let ctrl_means = it.next().unwrap();
-            // Empty control set → ctrl_means is all-zero, so score = mean(list).
-            Ok(list_means
-                .into_iter()
-                .zip(ctrl_means)
-                .map(|(a, b)| a - b)
-                .collect())
+            // Empty control set → no negative entries, so score = mean(list).
+            let out = streaming_weighted_row_sums(source, std::slice::from_ref(&w))?;
+            Ok(out.into_iter().next().unwrap())
         }
     }
 }

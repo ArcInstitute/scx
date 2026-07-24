@@ -36,6 +36,32 @@ pub fn de_memory_budget() -> u64 {
     })
 }
 
+/// Pure parse of the `SCX_ACCEL_NUM_THREADS` value: `Some(n)` for a positive
+/// integer, `None` for unset / zero / unparseable. Split out so the env-cached
+/// [`accel_num_threads`] can be unit-tested without touching process env.
+fn parse_accel_num_threads(raw: Option<String>) -> Option<usize> {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// Accelerator-wide thread ceiling from `SCX_ACCEL_NUM_THREADS`.
+///
+/// Returns `Some(n)` (n ≥ 1) when the env var is a positive integer, else
+/// `None` — in which case callers keep their own default, so an unset knob
+/// preserves today's behaviour exactly. Cached on first read.
+///
+/// This is a shared *policy* knob, not one literal pool object: it caps the two
+/// private rayon pools the accelerators build — Harmony's integration pool and
+/// the PCA covariance-accumulator pool. The PCA pool's memory-derived worker
+/// cap still applies; this only lowers it further (a single shared pool could
+/// not also honour that per-accumulator RAM bound). Ambient global-pool sizing
+/// for the many `rayon::current_num_threads()` callers stays controlled by
+/// `RAYON_NUM_THREADS`.
+pub fn accel_num_threads() -> Option<usize> {
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| parse_accel_num_threads(std::env::var("SCX_ACCEL_NUM_THREADS").ok()))
+}
+
 /// Pure clamp (no allocation, unit-testable): the largest gene chunk
 /// `≤ requested` whose dense `f32` workspace (`n_obs × chunk × 4` bytes) fits
 /// `budget_bytes`, floored at [`MIN_DE_GENE_CHUNK`].
@@ -109,6 +135,17 @@ mod tests {
         assert_eq!(clamp_prefetch_depth(8, 100, 200), 2);
         // never below 1 even when a single shard exceeds the budget.
         assert_eq!(clamp_prefetch_depth(8, 10_000, 100), 1);
+    }
+
+    #[test]
+    fn accel_num_threads_parses_positive_only() {
+        assert_eq!(parse_accel_num_threads(Some("4".into())), Some(4));
+        assert_eq!(parse_accel_num_threads(Some(" 8 ".into())), Some(8));
+        assert_eq!(parse_accel_num_threads(None), None);
+        assert_eq!(parse_accel_num_threads(Some("0".into())), None);
+        assert_eq!(parse_accel_num_threads(Some("abc".into())), None);
+        assert_eq!(parse_accel_num_threads(Some("-2".into())), None);
+        assert_eq!(parse_accel_num_threads(Some("".into())), None);
     }
 
     #[test]

@@ -1,8 +1,40 @@
 //! Shared utility helpers for CSR extraction and type conversion.
 
+use numpy::{PyArray2, PyArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+
+/// Build a 2-D `float32` numpy array from a single flat row-major `Vec<f32>`
+/// of length `rows * cols` (shape `[rows, cols]`).
+///
+/// Replaces the `Vec<Vec<f32>>` + [`PyArray2::from_vec2`] pattern, which
+/// allocates one small inner `Vec` per row (N allocations at atlas scale).
+/// One contiguous buffer copied into the array — the shape the harmony output
+/// path already uses.
+pub(super) fn flat_pyarray2<'py>(
+    py: Python<'py>,
+    data: Vec<f32>,
+    rows: usize,
+    cols: usize,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    debug_assert_eq!(
+        data.len(),
+        rows * cols,
+        "flat_pyarray2: data length {} != rows*cols {}",
+        data.len(),
+        rows * cols
+    );
+    let arr = unsafe { PyArray2::<f32>::new(py, [rows, cols], false) };
+    {
+        let mut rw = arr.readwrite();
+        let slice = rw
+            .as_slice_mut()
+            .map_err(|e| PyRuntimeError::new_err(format!("output array slice error: {e}")))?;
+        slice.copy_from_slice(&data);
+    }
+    Ok(arr)
+}
 
 /// Call `array.astype(dtype, copy=False)` — avoids a deep copy when the
 /// source already has the target dtype. This mirrors numpy's behavior where

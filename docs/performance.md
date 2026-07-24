@@ -497,6 +497,37 @@ need a `+ Sync` dyn boundary change through the pyscx capability-detection layer
 `for_each_csc_shard_ordered` sibling primitive ships and is tested, ready for that
 follow-up.
 
+### Low-risk marshalling & fusions (Phase-2 tasks 2.4 + 2.7)
+
+These are **correctness-neutral** clean-ups — the 2.0 oracle rated marshalling negligible
+and none of the 2.7 items were bottlenecks — so they carry no `×` speed claim; the point
+is lower allocation counts and one shared thread-control knob, with no regression.
+
+- **2.4 — flat NumPy marshalling.** The PCA / PFlog / UMAP result writers built a
+  `Vec<Vec<f32>>` (one small allocation per obs row → ~N allocations at N cells) before
+  `PyArray2::from_vec2`. They now assemble one flat row-major `Vec<f32>` and copy it into a
+  pre-allocated `PyArray2` via the shared `accel::util::flat_pyarray2` helper (the pattern
+  the Harmony writer already used). Output is **byte-identical**. Measured with
+  `SCX_CPU_PROFILE=1` on an in-memory `pca(n_comps=50)` over a 300 000 × 2 000 matrix: the
+  `marshalling` bucket is **65.9 ms** for the 60 MB written (300k×50 `X_pca` + 2k×50 `PCs`)
+  — ~0.9 % of the 7.0 s `pca()` wall. The win is the allocation-count drop (one buffer vs
+  ~300k per-row `Vec`s), not wall time; this confirms the oracle's ranking.
+- **2.7a — `score_genes` weight fusion.** The control-set score fused the two weight
+  vectors (`w_list`, `w_ctrl`) into a single `w = w_list − w_ctrl`, halving the per-nonzero
+  inner iterations in `streaming_weighted_row_sums`. Numerically it matches the previous
+  two-accumulator `Σw_list·v − Σw_ctrl·v` up to f64 re-association (single accumulator vs
+  two subtracted once) — within the scanpy parity tolerance, unit-bounded to 1e-12.
+- **2.7b/2.7c — allocation hygiene.** NB-GLM's no-shrink branch moves `mle` instead of
+  cloning the whole per-gene state vector; the PCA transpose-spMM fold reuses one `q_row`
+  scratch buffer per rayon task instead of allocating per row. Both **bit-identical**.
+- **2.7d — `SCX_ACCEL_NUM_THREADS`.** A shared thread-ceiling policy knob (read once via
+  `OnceLock`). When set to a positive integer it caps the two private rayon pools the
+  accelerators build — Harmony's integration pool and the PCA covariance-accumulator pool
+  (whose memory-derived worker cap still applies; the env only lowers it further). Unset
+  (the default) → behaviour is identical to before. It does **not** resize the ambient
+  global rayon pool the many `current_num_threads()` callers use — that stays governed by
+  `RAYON_NUM_THREADS`.
+
 ### Differential expression (CPU, full-matrix)
 
 The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell fixture. The dedicated `accel_de` benchmark sweeps the raw count matrix (no HVG projection) across the full dataset tier — scanpy's per-gene rank pass becomes the bottleneck and times out on census-scale:

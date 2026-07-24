@@ -2,7 +2,7 @@
 
 use scx_format_io::ShardSource;
 
-use numpy::{PyArray2, PyReadonlyArray1};
+use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -997,51 +997,53 @@ pub(crate) fn write_pca_to_adata(
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
 
-    // adata.obsm["X_pca"] = embeddings (n_obs × n_components) as float32
+    // adata.obsm["X_pca"] = embeddings (n_obs × n_components) as float32.
+    // `result.embeddings` is already row-major flat (element (i,j) at
+    // i*n_components+j), so the flat f32 buffer matches shape [n_obs, n_comp].
     let marshal_start = scx_accel::cpu_profile::start();
-    let embeddings_arr = PyArray2::<f32>::from_vec2(
-        py,
-        &(0..result.n_obs)
-            .map(|i| {
-                (0..result.n_components)
-                    .map(|j| result.embeddings[i * result.n_components + j] as f32)
-                    .collect::<Vec<f32>>()
-            })
-            .collect::<Vec<Vec<f32>>>(),
-    )?;
+    let n_obs = result.n_obs;
+    let n_components = result.n_components;
+    let embeddings_flat: Vec<f32> = result.embeddings.iter().map(|&v| v as f32).collect();
+    let embeddings_arr = super::util::flat_pyarray2(py, embeddings_flat, n_obs, n_components)?;
     scx_accel::cpu_profile::record_marshalling_since(
         marshal_start,
-        result.n_obs * result.n_components * std::mem::size_of::<f32>(),
+        n_obs * n_components * std::mem::size_of::<f32>(),
     );
     let obsm = adata.getattr("obsm")?;
     obsm.set_item("X_pca", embeddings_arr)?;
 
-    // adata.varm["PCs"] = components as (var × n_components) f32. When a column
-    // mask was applied, scatter the masked components back onto the full var
-    // axis (excluded vars → 0) so PCs stays aligned to `adata.var` (scanpy).
+    // adata.varm["PCs"] = components as (var × n_components) f32, transposed
+    // from the component-major `result.components` (indexed pc*n_vars+v). When
+    // a column mask was applied, scatter the masked components back onto the
+    // full var axis (excluded vars → 0) so PCs stays aligned to `adata.var`
+    // (scanpy). Both branches fill one flat row-major buffer at
+    // full_var_rows*n_components (element (var,pc) at var*n_components+pc).
     let mask_cols = params.and_then(|p| p.mask_cols);
-    let pcs_rows: Vec<Vec<f32>> = match mask_cols {
+    let full_var_rows = match mask_cols {
+        Some(_) => params.map(|p| p.full_n_vars).unwrap_or(result.n_vars),
+        None => result.n_vars,
+    };
+    let mut pcs_flat = vec![0.0f32; full_var_rows * result.n_components];
+    match mask_cols {
         Some(cols) => {
-            let full_n_vars = params.map(|p| p.full_n_vars).unwrap_or(result.n_vars);
-            let mut rows = vec![vec![0.0f32; result.n_components]; full_n_vars];
             // result is in masked space: local column j ↔ original var cols[j].
             for (j, &orig) in cols.iter().enumerate() {
-                let row = &mut rows[orig as usize];
-                for (pc, slot) in row.iter_mut().enumerate() {
-                    *slot = result.components[pc * result.n_vars + j] as f32;
+                let base = orig as usize * result.n_components;
+                for pc in 0..result.n_components {
+                    pcs_flat[base + pc] = result.components[pc * result.n_vars + j] as f32;
                 }
             }
-            rows
         }
-        None => (0..result.n_vars)
-            .map(|v| {
-                (0..result.n_components)
-                    .map(|pc| result.components[pc * result.n_vars + v] as f32)
-                    .collect::<Vec<f32>>()
-            })
-            .collect(),
-    };
-    let pcs_arr = PyArray2::<f32>::from_vec2(py, &pcs_rows)?;
+        None => {
+            for v in 0..result.n_vars {
+                let base = v * result.n_components;
+                for pc in 0..result.n_components {
+                    pcs_flat[base + pc] = result.components[pc * result.n_vars + v] as f32;
+                }
+            }
+        }
+    }
+    let pcs_arr = super::util::flat_pyarray2(py, pcs_flat, full_var_rows, result.n_components)?;
     let varm = adata.getattr("varm")?;
     varm.set_item("PCs", pcs_arr)?;
 
