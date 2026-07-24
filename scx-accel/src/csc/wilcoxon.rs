@@ -234,6 +234,14 @@ fn gene_stats_nnz(
 
     let n_neg = neg.len();
     let n_pos = pos.len();
+    // Each stored entry is one distinct cell (one entry per (cell,gene) in CSC),
+    // and out-of-range rows are dropped above, so nonzeros never exceed n_obs.
+    // A corrupt sidecar with duplicate rows in a column would break this.
+    debug_assert!(
+        n_neg + n_pos <= n_obs,
+        "nnz ({}) exceeds n_obs ({n_obs}) — duplicate rows in a CSC column?",
+        n_neg + n_pos
+    );
     let n_zero_total = n_obs - n_neg - n_pos;
     // Mid-rank of the zero tie-block spanning 1-based ranks [n_neg+1 .. n_neg+n_zero].
     let zero_mid = n_neg as f64 + (n_zero_total as f64 + 1.0) / 2.0;
@@ -313,6 +321,7 @@ fn wilcoxon_rank_sum_nnz_csc<S: ColumnShardSource + ?Sized>(
     // per_gene[gene][group] = (score, pval, logfc).
     let mut per_gene: Vec<Vec<(f64, f64, f64)>> = vec![Vec::new(); n_vars];
 
+    use rayon::prelude::*;
     for chunk_start in (0..n_vars).step_by(gene_chunk_size) {
         let chunk_end = (chunk_start + gene_chunk_size).min(n_vars);
         let csc = source
@@ -321,19 +330,29 @@ fn wilcoxon_rank_sum_nnz_csc<S: ColumnShardSource + ?Sized>(
         // Finiteness contract at the DE boundary, same as the dense kernel.
         crate::finite::ensure_finite_values(&csc.data, "differential expression")?;
         let chunk_size = chunk_end - chunk_start;
-        for local_col in 0..chunk_size {
-            let s = csc.indptr[local_col] as usize;
-            let e = csc.indptr[local_col + 1] as usize;
-            per_gene[chunk_start + local_col] = gene_stats_nnz(
-                &csc.indices[s..e],
-                &csc.data[s..e],
-                groups,
-                &group_cell_counts,
-                n_obs,
-                n_groups,
-                tie_correct,
-                log_transformed,
-            );
+        // Genes are independent, so rank them in parallel (matches the dense
+        // kernel's rayon-over-genes; keeps the nnz path from looking slow only
+        // because it was single-threaded — gemini/Cursor review). Each result is
+        // self-contained, so order does not affect the output.
+        let chunk_results: Vec<Vec<(f64, f64, f64)>> = (0..chunk_size)
+            .into_par_iter()
+            .map(|local_col| {
+                let s = csc.indptr[local_col] as usize;
+                let e = csc.indptr[local_col + 1] as usize;
+                gene_stats_nnz(
+                    &csc.indices[s..e],
+                    &csc.data[s..e],
+                    groups,
+                    &group_cell_counts,
+                    n_obs,
+                    n_groups,
+                    tie_correct,
+                    log_transformed,
+                )
+            })
+            .collect();
+        for (local_col, res) in chunk_results.into_iter().enumerate() {
+            per_gene[chunk_start + local_col] = res;
         }
     }
 

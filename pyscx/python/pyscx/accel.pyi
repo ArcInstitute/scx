@@ -5,18 +5,23 @@ Intentionally narrow — mirrors the philosophy of the package-level
 function is typed; everything else falls back to `Any` via the
 trailing `__getattr__`.
 
-`prefer_format: Literal["csr", "csc"] = "csr"` is the explicit
-opt-in surface for the column-major sidecar dispatch. Validation
-lives in the Rust side (`PyValueError` on any other value,
-including `"auto"`).
+`prefer_format` selects the column-major sidecar dispatch. Most ops
+take `Literal["csr", "csc"] = "csr"`; the DE ops (`rank_genes_groups`,
+`pdex_ref`) additionally accept `"auto"` and **default to it** — `"auto"`
+routes CSC-direct on CPU when a valid sidecar is present, else CSR.
+Validation lives on the Rust side (`PyValueError` on any other value;
+non-DE ops still reject `"auto"`).
 """
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
-# Type alias used by every affected entry.
+# Non-DE ops: explicit CSR/CSC opt-in, default CSR.
 PreferFormat = Literal["csr", "csc"]
+# DE ops (rank_genes_groups / pdex_ref): additionally accept the "auto"
+# capability-routed default.
+DePreferFormat = Literal["auto", "csr", "csc"]
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +40,7 @@ def rank_genes_groups(
     min_cells_per_stratum: int = 50,
     rankby_abs: bool = False,
     tie_correct: bool = False,
-    prefer_format: PreferFormat = "csr",
+    prefer_format: DePreferFormat = "auto",
     device: str = "auto",
     use_raw: bool | None = None,
     layer: str | None = None,
@@ -116,7 +121,7 @@ def pdex_ref(
     epsilon: float = 1e-9,
     cpm_filter: float | None = None,
     gene_chunk_size: int | None = None,
-    prefer_format: PreferFormat = "csr",
+    prefer_format: DePreferFormat = "auto",
     device: str = "auto",
     output: str = "polars",
     use_raw: bool | None = None,

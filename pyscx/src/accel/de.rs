@@ -206,9 +206,19 @@ fn select_de_matrix<'py>(
 /// e.g. `use_raw`/`layer`) is not a backed/lazy SCX dataset → `false`.
 fn csc_route_available(x: &Bound<'_, PyAny>) -> bool {
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-        return backed.as_column_source().is_some();
+        // `as_column_source` exposes the *full-axis* CSC reader and ignores an
+        // active column projection (a gene subset, e.g. `adata[:, highly_variable]`
+        // on a backed file that keeps its sidecar). Routing such a projected
+        // dataset to the CSC kernel would trip its `n_vars` guard and raise,
+        // where the CSR streamer read the projected columns fine. §5.2 lists
+        // "filtering" among the `auto` gates — so exclude projected backed
+        // datasets from CSC-direct (they fall back to CSR). The lazy path below
+        // does not need this: its CSC reader honours the projection.
+        return backed.col_projection_arc().is_none() && backed.as_column_source().is_some();
     }
     if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
+        // A materialized matrix (numpy/scipy from `use_raw`/`layer`) is neither
+        // a backed nor a lazy SCX dataset, so it never reaches here → CSR.
         return lazy.as_column_source().is_some();
     }
     false
@@ -236,7 +246,16 @@ fn resolve_de_format(
             }
         }
         "csc" => "csc",
-        _ => "csr",
+        other => {
+            // Callers validate `"auto"|"csr"|"csc"` upstream; a stray value here
+            // means a new internal caller bypassed validation. Fail loud in debug,
+            // fall back to the safe CSR streamer in release.
+            debug_assert!(
+                other == "csr",
+                "resolve_de_format: unvalidated prefer_format {other:?}"
+            );
+            "csr"
+        }
     }
 }
 
@@ -336,7 +355,7 @@ fn run_rank_genes_groups_inner(
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' selects the CPU column-major path and has no \
                  GPU kernel, so it cannot be combined with device='gpu'. For GPU \
-                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 CSC-direct DE (route gpu_csc_v3), keep prefer_format='csr' \
                  with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
                  planner routes to gpu_csc_v3 automatically. For the CPU column-major \
                  path, use device='cpu'.",
@@ -821,7 +840,7 @@ pub fn rank_genes_groups(
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' selects the CPU column-major path and has no \
                  GPU kernel, so it cannot be combined with device='gpu'. For GPU \
-                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 CSC-direct DE (route gpu_csc_v3), keep prefer_format='csr' \
                  with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
                  planner routes to gpu_csc_v3 automatically. For the CPU column-major \
                  path, use device='cpu'.",
@@ -834,7 +853,7 @@ pub fn rank_genes_groups(
                     "rank_genes_groups(device=\"auto\", prefer_format=\"csc\") runs on the \
                      CPU: prefer_format=\"csc\" pins the CPU column-major path even on a GPU \
                      host. For GPU CSC-direct DE (route gpu_csc_v3), drop prefer_format \
-                     (keep the default \"csr\") with device=\"auto\"/\"gpu\" — the planner \
+                     (pass \"csr\" explicitly) with device=\"auto\"/\"gpu\" — the planner \
                      routes to gpu_csc_v3 automatically when a CSC sidecar is present.",
                     py.get_type::<pyo3::exceptions::PyUserWarning>(),
                 ),
@@ -1645,7 +1664,7 @@ fn run_pdex_ref_inner(
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' selects the CPU column-major path and has no \
                  GPU kernel, so it cannot be combined with device='gpu'. For GPU \
-                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 CSC-direct DE (route gpu_csc_v3), keep prefer_format='csr' \
                  with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
                  planner routes to gpu_csc_v3 automatically. For the CPU column-major \
                  path, use device='cpu'.",
@@ -2229,7 +2248,7 @@ pub fn pdex_ref(
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' selects the CPU column-major path and has no \
                  GPU kernel, so it cannot be combined with device='gpu'. For GPU \
-                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 CSC-direct DE (route gpu_csc_v3), keep prefer_format='csr' \
                  with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
                  planner routes to gpu_csc_v3 automatically. For the CPU column-major \
                  path, use device='cpu'.",
@@ -2242,7 +2261,7 @@ pub fn pdex_ref(
                     "pdex_ref(device=\"auto\", prefer_format=\"csc\") runs on the CPU: \
                      prefer_format=\"csc\" pins the CPU column-major path even on a GPU \
                      host. For GPU CSC-direct DE (route gpu_csc_v3), drop prefer_format \
-                     (keep the default \"csr\") with device=\"auto\"/\"gpu\" — the planner \
+                     (pass \"csr\" explicitly) with device=\"auto\"/\"gpu\" — the planner \
                      routes to gpu_csc_v3 automatically when a CSC sidecar is present.",
                     py.get_type::<pyo3::exceptions::PyUserWarning>(),
                 ),

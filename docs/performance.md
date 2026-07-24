@@ -523,7 +523,13 @@ kernel (opt-in `SCX_ACCEL_WILCOXON_NNZ=1`, 1-vs-rest) ranks only each gene's
 nonzeros plus an analytic implicit-zero tie-block — `O(nnz·log nnz)`/gene instead
 of an `O(n_obs·log n_obs)` dense sort — numerically equivalent to the dense kernel
 (property-tested to 1e-9). _Both-route (CSR vs CSC-direct) and nnz-vs-dense
-wall-clock + peak-RSS numbers: capture pending; recorded here before merge._
+wall-clock + peak-RSS: the atlas `_auto.scx` fixtures are CSR-only, so this capture
+requires first building a CSC sidecar (`scx build-csc`) on a multi-shard dataset —
+a **deferred follow-up** (the audit's "then benchmark / promote default" step).
+Correctness of both routes is established above; the default flip preserves CSR
+results on files without a sidecar and records the chosen route in
+`uns["scx_accel"]`, so it is safe to ship ahead of the timing capture. The nnz
+kernel stays opt-in (`SCX_ACCEL_WILCOXON_NNZ`) until that capture promotes it._
 
 Source: 2026-05-25 full-tier gate (post-G10 graph capture + bench env-routing fix), candidate `candidate_2623788_20260525`. Benchmark module: `benchmarks/comprehensive/benchmarks/accel_de.py` — picks the best obs column from `cell_type`/`leiden`/`louvain`/`cluster`/`perturbation`/`target` or falls back to a deterministic 50/50 synthetic split, restricts to top-4 test groups + reference, and records the chosen `groupby` in `metadata`. Each SLURM bench job is allocated 16 CPUs; `pyscx_cpu`'s `user_s/wall_s` ratio shows ~3-5 effective cores per run.
 

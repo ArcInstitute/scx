@@ -1517,14 +1517,15 @@ contiguous gene columns instead of decoding and projecting every row.
 > `prefer_format` are independent axes, and the GPU CSC-direct route is chosen
 > by the *route planner*, **not** by `prefer_format="csc"`:
 >
-> - **GPU-fast DE:** keep the **default `prefer_format="csr"`** and pass
->   `device="gpu"` (or `"auto"`). When the backed file has a CSC sidecar the
->   planner routes to `gpu_csc_v3` automatically; without one it uses
->   `gpu_csr_v3`. This is the intended GPU-fast entry point.
+> - **GPU-fast DE:** pass `device="gpu"` (or `"auto"`) with `prefer_format`
+>   left at its `"auto"` default (or set to `"csr"`) — both keep GPU on the
+>   planner-driven path. When the backed file has a CSC sidecar the planner
+>   routes to `gpu_csc_v3` automatically; without one it uses `gpu_csr_v3`. This
+>   is the intended GPU-fast entry point.
 > - `prefer_format="csc"` selects the **CPU** column-major streaming path
 >   (`cpu_csc`) — there is no GPU kernel behind that knob. With `device="auto"`
 >   it runs on CPU; combining it with an explicit `device="gpu"` raises a
->   `RuntimeError` that points you back to the default `prefer_format="csr"` +
+>   `RuntimeError` that points you back to `prefer_format="csr"`/`"auto"` +
 >   `device="gpu"` for GPU CSC-direct.
 >
 > In short: do **not** reach for `prefer_format="csc"` to get GPU speed — it is
@@ -2200,7 +2201,7 @@ df = sc.get.rank_genes_groups_df(adata, group="0")
 | `rankby_abs` | `False` | Sort genes by absolute z-score instead of signed score. `False` (default) matches scanpy's default: highest positive z-score first. `True` ranks by significance regardless of direction. |
 | `tie_correct` | `False` | Apply tie correction to the Wilcoxon rank-sum variance estimate. |
 | `gene_chunk_size` | `None` | Process genes in chunks of this size to limit memory. `None` processes all genes at once. |
-| `prefer_format` | `"csr"` | `"csr"` (default) or `"csc"` — selects the CPU column-major CSC streaming path when set to `"csc"`. |
+| `prefer_format` | `"auto"` | `"auto"` (default; CPU routes CSC-direct when a valid sidecar is present, else CSR), `"csr"`, or `"csc"`. |
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU routes to CSC-direct (`gpu_csc_v3`) when a sidecar is present, or CSR-direct (`gpu_csr_v3`) otherwise. |
 
 Benchmarked at 5.4s on 1M cells (3.2× faster than scanpy's 17.2s).
@@ -2228,7 +2229,7 @@ df = pyscx.accel.pdex_ref(adata, "perturbation", reference="non-targeting")
 | `epsilon` | `1e-9` | Finite-guard pseudocount on count-space means before fold-/percent-change (not CPM/MWU). Default keeps outputs finite; `0/0 → 0.0`. Pass `0.0` for legacy `±inf` on reference-undetected genes. |
 | `cpm_filter` | `None` | Optional CPM floor `T`: keep a gene iff `target_cpm > T` or `ref_cpm > T` (pooled arithmetic CPM, mode-independent); drops other rows, FDR recomputed over survivors. |
 | `gene_chunk_size` | `None` | Process genes in chunks to limit memory |
-| `prefer_format` | `"csr"` | `"csr"` or `"csc"` |
+| `prefer_format` | `"auto"` | `"auto"` (default), `"csr"`, or `"csc"` |
 | `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU takes the CSC-direct route (`gpu_csc_v3`) when a sidecar is present. |
 | `output` | `"polars"` | `"polars"` or `"pandas"` — output DataFrame type |
 
