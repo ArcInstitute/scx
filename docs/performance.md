@@ -522,14 +522,29 @@ This is a compatibility change (DE previously defaulted to `"csr"`); pin
 kernel (opt-in `SCX_ACCEL_WILCOXON_NNZ=1`, 1-vs-rest) ranks only each gene's
 nonzeros plus an analytic implicit-zero tie-block — `O(nnz·log nnz)`/gene instead
 of an `O(n_obs·log n_obs)` dense sort — numerically equivalent to the dense kernel
-(property-tested to 1e-9). _Both-route (CSR vs CSC-direct) and nnz-vs-dense
-wall-clock + peak-RSS: the atlas `_auto.scx` fixtures are CSR-only, so this capture
-requires first building a CSC sidecar (`scx build-csc`) on a multi-shard dataset —
-a **deferred follow-up** (the audit's "then benchmark / promote default" step).
-Correctness of both routes is established above; the default flip preserves CSR
-results on files without a sidecar and records the chosen route in
-`uns["scx_accel"]`, so it is safe to ship ahead of the timing capture. The nnz
-kernel stays opt-in (`SCX_ACCEL_WILCOXON_NNZ`) until that capture promotes it._
+(property-tested to 1e-9).
+
+**Measured DE-route benchmark** (`rank_genes_groups`, 1-vs-rest, backed streaming;
+a CSC sidecar built with `scx build-csc`; median of 2 runs, CPU). Routes confirmed
+via `uns["scx_accel"]` (`cpu_csr` / `cpu_csc`):
+
+| Dataset | Route | wall (s) | peak RSS (MB) | vs CSR | vs CSC-densify |
+|---|---|--:|--:|--:|--:|
+| tabula_100k (100K × 61.5K, 33 groups) | CSR streaming (`csr`) | 351.8 | 3454 | 1.0× | — |
+| tabula_100k | CSC-direct densify (`csc`, §5.2) | 25.6 | 2749 | **13.7×** | 1.0× |
+| tabula_100k | CSC-direct nnz (`csc`+`SCX_ACCEL_WILCOXON_NNZ`, §5.3) | 16.2 | 2552 | **21.7×** | **1.58×** |
+
+**§5.2 — CSR → CSC-direct is ~13.7× faster with lower peak RSS.** The CSR streamer
+re-decodes every shard for each gene-chunk (here ~123 chunks × 7 shards on the
+full 61.5K-gene matrix, cache-bound), while the CSC-direct route reads each
+column-chunk exactly once — so on a sidecar file the `auto` default's CPU routing
+is a large, measured win. (For CSR-*only* files the deferred loop-inversion / a
+larger shard cache addresses the same re-decode; `auto` sidesteps it when a sidecar
+exists.) **§5.3 — the exact sparse-nnz kernel adds ~1.58×** over CSC-densify by
+ranking only nonzeros + an analytic zero block instead of an `n_obs` dense sort,
+for **~21.7× end-to-end** over the old CSR default, at lower peak RSS. Numerically
+identical to the dense kernel (property-tested). Source: `bench_de_csc_routes.py`
+on `cpu_preemptible`; the nnz kernel stays opt-in pending a promotion decision.
 
 Source: 2026-05-25 full-tier gate (post-G10 graph capture + bench env-routing fix), candidate `candidate_2623788_20260525`. Benchmark module: `benchmarks/comprehensive/benchmarks/accel_de.py` — picks the best obs column from `cell_type`/`leiden`/`louvain`/`cluster`/`perturbation`/`target` or falls back to a deterministic 50/50 synthetic split, restricts to top-4 test groups + reference, and records the chosen `groupby` in `metadata`. Each SLURM bench job is allocated 16 CPUs; `pyscx_cpu`'s `user_s/wall_s` ratio shows ~3-5 effective cores per run.
 
