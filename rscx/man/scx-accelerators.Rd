@@ -376,7 +376,9 @@ Each non-reference level is fit as an independent pairwise 2-coefficient
 NB-GLM (intercept + treatment) on only that target's and the reference's
 pseudobulk samples, with size factors recomputed per contrast. The replicate
 column is \strong{not} entered as a covariate, so batch/donor confounders are not
-adjusted and \code{baseMean}/\code{dispersion} differ per contrast (this matches
-pyscx, not a single joint DESeq2 fit).
+adjusted and \code{baseMean}/\code{dispersion} differ per contrast. (rscx exposes
+only this fixed-design fit; the pyscx \code{pseudobulk_dex(backend="nb_glm",
+design=...)} path additionally supports a covariate-adjusted joint fit — not yet
+wired into rscx.)
 }
 

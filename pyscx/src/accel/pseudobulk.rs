@@ -389,18 +389,6 @@ pub fn pseudobulk_dex(
              (which merges groupby + stratify_by for you).",
         ));
     }
-    // §2.4: the NB-GLM backend fits a fixed [intercept, is_target] design and
-    // does NOT consume a caller-supplied `design`. Accepting one and silently
-    // ignoring it would discard a scientific argument, so reject it explicitly.
-    // (Honoring a custom design for this backend is tracked as a follow-on;
-    // use backend="pydeseq2" for custom designs today.)
-    if backend == "nb_glm" && design.is_some() {
-        return Err(PyValueError::new_err(
-            "pseudobulk_dex(backend=\"nb_glm\") does not support a custom `design`: it \
-             fits a fixed intercept + target-indicator design. Pass the covariate as a \
-             groupby/replicate column, or use backend=\"pydeseq2\" for a custom design.",
-        ));
-    }
     // §2.5: the NB count likelihood requires replicate-level *summed* counts.
     // Fractional aggregates (mean/median) are not valid inputs to the model, so
     // the count backend accepts only aggr_method="sum".
@@ -543,17 +531,41 @@ pub fn pseudobulk_dex(
     // assemble the same PyDESeq2-style pandas schema the pydeseq2 path returns.
     if backend == "nb_glm" {
         let test_col_idx = groupby.iter().position(|c| c == test_col).unwrap();
-        let nb_opts = super::nb_glm::nbglm_options_from_dict(py, nbglm_options)?;
+        // Split any explicit `contrast` out of nbglm_options (an explicit `None` is
+        // treated as absent); the rest is parsed as NbGlmOptions. An explicit
+        // `contrast` also triggers the design-aware path (it resolves against a
+        // named design).
+        let (contrast_override, opts_dict) = super::nb_glm::take_contrast_override(nbglm_options)?;
+        let nb_opts = super::nb_glm::nbglm_options_from_dict(py, opts_dict.as_ref())?;
         // `pseudobulk_dex` has no `device=` kwarg; the NB-GLM backend runs on CPU
         // here (the GPU path is reached via `pyscx.accel.pdex_nb_glm(device=…)`).
-        let df = super::nb_glm::fit_targets_pandas(
-            py,
-            &result,
-            test_col_idx,
-            reference,
-            &nb_opts,
-            None,
-        )?;
+        let df = if design.is_some() || contrast_override.is_some() {
+            // §3.11: honor a caller-supplied formula design + optional contrast.
+            // Default the formula to `~ `test_col`` (reproduces the intercept +
+            // target-indicator model, but as a single shared-dispersion fit).
+            // Backtick-quote so a non-identifier test_col (e.g. "cell type") is a
+            // valid formulaic token.
+            let owned_default;
+            let formula = match design {
+                Some(s) => s,
+                None => {
+                    owned_default = format!("~ `{test_col}`");
+                    owned_default.as_str()
+                }
+            };
+            super::nb_glm::fit_targets_pandas_with_design(
+                py,
+                &result,
+                test_col_idx,
+                reference,
+                formula,
+                contrast_override.as_ref(),
+                &nb_opts,
+                None,
+            )?
+        } else {
+            super::nb_glm::fit_targets_pandas(py, &result, test_col_idx, reference, &nb_opts, None)?
+        };
         return Ok(df.unbind());
     }
 

@@ -2341,6 +2341,12 @@ DESeq2-*style* — **not** DESeq2-*identical* — estimator: the bar is ranking 
 effect-sign / significance parity, not bit-for-bit numerics. Keep PyDESeq2 when
 you need exact DESeq2 behaviour. There is **no GPU path** (no `device=` argument).
 
+By default it fits a fixed `[intercept, is_target]` design per non-reference level.
+Pass a `design=` **formula** (e.g. `"~ perturbation + donor"`) to fit a
+covariate-adjusted joint model instead — built via `formulaic` (the parser pydeseq2
+uses; needs the `nbglm` extra) with one shared-dispersion fit and per-level
+contrasts. See [docs/pseudobulk_nb_glm.md § Custom designs](pseudobulk_nb_glm.md#custom-designs-formula).
+
 Three entry points, all CPU-only:
 
 ```python

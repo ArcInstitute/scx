@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::f64::consts::LN_2;
 
 use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyImportError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -238,6 +238,36 @@ const NBGLM_OPTION_KEYS: &[&str] = &[
     "independent_filtering",
     "independent_filter_alpha",
 ];
+
+// `"contrast"` is intentionally NOT a recognised `NbGlmOptions` key: the low-level
+// `nb_glm` pyfunction has its own `contrast=` argument and must still reject a
+// stray `options={"contrast": …}` as an unknown key (fail-loud, per §2.4). The
+// design-aware `pseudobulk_dex`/`pdex_nb_glm` wrappers read + strip `"contrast"`
+// from `nbglm_options` themselves (see `take_contrast_override`) before parsing.
+const NBGLM_CONTRAST_KEY: &str = "contrast";
+
+/// `(explicit contrast object or None, nbglm_options dict with "contrast" removed)`.
+type ContrastAndOptions<'py> = (Option<Bound<'py, PyAny>>, Option<Bound<'py, PyDict>>);
+
+/// Split an optional explicit `contrast` out of an `nbglm_options` dict: returns
+/// the (Python) contrast object (only when present **and not** `None`, so an
+/// explicit `{"contrast": None}` means "no override") plus a copy of the dict with
+/// `"contrast"` removed — the latter is safe to pass to [`nbglm_options_from_dict`]
+/// (which rejects unknown keys). Returns `(None, original)` when no dict was given.
+pub(super) fn take_contrast_override<'py>(
+    nbglm_options: Option<&Bound<'py, PyDict>>,
+) -> PyResult<ContrastAndOptions<'py>> {
+    let Some(d) = nbglm_options else {
+        return Ok((None, None));
+    };
+    let contrast = d.get_item(NBGLM_CONTRAST_KEY)?.filter(|o| !o.is_none());
+    if contrast.is_none() {
+        return Ok((None, Some(d.clone())));
+    }
+    let rest = d.copy()?;
+    rest.del_item(NBGLM_CONTRAST_KEY)?;
+    Ok((contrast, Some(rest)))
+}
 
 /// Parse an optional options dict onto `NbGlmOptions::default()`. Recognised keys
 /// mirror the Rust field names; an **unrecognised key raises** `ValueError` so a
@@ -507,6 +537,18 @@ pub(super) fn fit_targets_pandas<'py>(
              de_method=\"pdex_ref\" or \"wilcoxon\" (per-cell tests).",
         ));
     }
+    fits_to_pandas(py, result, reference, &fits)
+}
+
+/// Assemble per-target NB-GLM fits into the PyDESeq2-style pandas schema
+/// (`gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj, target,
+/// reference`). Shared by the default and design-aware `pseudobulk_dex` paths.
+fn fits_to_pandas<'py>(
+    py: Python<'py>,
+    result: &PseudobulkResult,
+    reference: &str,
+    fits: &[TargetFit],
+) -> PyResult<Bound<'py, PyAny>> {
     let n_vars = result.n_vars;
     let cap = fits.len() * n_vars;
     let (mut gene, mut target_col, mut ref_col) = (
@@ -522,7 +564,7 @@ pub(super) fn fit_targets_pandas<'py>(
         Vec::with_capacity(cap),
         Vec::with_capacity(cap),
     );
-    for tf in &fits {
+    for tf in fits {
         let r = &tf.result;
         for j in 0..n_vars {
             gene.push(result.gene_names[j].clone());
@@ -564,6 +606,251 @@ pub(super) fn fit_targets_pandas<'py>(
         ],
     )?;
     df.get_item(order)
+}
+
+/// Resolve the design-matrix column index for the `test_col` treatment coefficient
+/// of `target`. Matches the bare `test_col[T.target]` name first, then any
+/// treatment-coded wrapper (`C(test_col, …)[T.target]`) via a *unique*
+/// contains-`test_col` + `[T.target]`-suffix match. Returns `None` if absent or
+/// ambiguous (so the caller fails loud rather than picking an arbitrary column).
+fn resolve_contrast_column(columns: &[String], test_col: &str, target: &str) -> Option<usize> {
+    let exact = format!("{test_col}[T.{target}]");
+    if let Some(i) = columns.iter().position(|c| c == &exact) {
+        return Some(i);
+    }
+    let suffix = format!("[T.{target}]");
+    let mut matches = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.contains(test_col) && c.ends_with(&suffix))
+        .map(|(i, _)| i);
+    let first = matches.next()?;
+    match matches.next() {
+        Some(_) => None, // ambiguous (>1 match)
+        None => Some(first),
+    }
+}
+
+/// Design-aware sibling of [`fit_targets_nbglm`]: builds the pseudobulk-*sample*
+/// design matrix from a formulaic `design_formula` over the groupby columns, fits
+/// **one** full-design NB-GLM across all samples (shared dispersion,
+/// covariate-adjusted), and extracts one contrast per non-reference `test_col`
+/// level — or a single explicit `contrast_override`. DESeq2-*style*, not
+/// -*identical*. The formula references the groupby columns; `reference` is coded
+/// as the base level of `test_col` (ordered Categorical) so the default per-target
+/// contrast is `test_col[T.<target>]`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fit_targets_nbglm_with_design(
+    py: Python<'_>,
+    result: &PseudobulkResult,
+    test_col_idx: usize,
+    reference: &str,
+    design_formula: &str,
+    contrast_override: Option<&Bound<'_, PyAny>>,
+    options: &NbGlmOptions,
+    gpu_device_id: Option<usize>,
+) -> PyResult<Vec<TargetFit>> {
+    let gpu_dev = make_gpu_dev(gpu_device_id)?;
+    let n_groups = result.n_groups;
+    let n_vars = result.n_vars;
+    let test_col = result.groupby_columns[test_col_idx].as_str();
+
+    // test_col levels, `reference` first so treatment coding uses it as the base.
+    let mut uniq: Vec<&str> = (0..n_groups)
+        .map(|g| result.group_labels[g][test_col_idx].as_str())
+        .collect();
+    uniq.sort_unstable();
+    uniq.dedup();
+    if !uniq.contains(&reference) {
+        return Err(PyValueError::new_err(format!(
+            "reference level '{reference}' not found in test_col '{test_col}'"
+        )));
+    }
+    let mut ordered_levels: Vec<&str> = vec![reference];
+    ordered_levels.extend(uniq.into_iter().filter(|l| *l != reference));
+    let targets: Vec<String> = ordered_levels[1..].iter().map(|s| s.to_string()).collect();
+
+    // --- metadata_df: rows = pseudobulk samples, cols = groupby columns. ---
+    let pd = py.import("pandas")?;
+    let meta_dict = PyDict::new(py);
+    for (col_idx, col_name) in result.groupby_columns.iter().enumerate() {
+        let vals: Vec<String> = (0..n_groups)
+            .map(|g| result.group_labels[g][col_idx].clone())
+            .collect();
+        if col_idx == test_col_idx {
+            // Ordered Categorical with `reference` first → its treatment-coding
+            // base level, so `test_col[T.<target>]` is target-vs-reference.
+            let kw = PyDict::new(py);
+            kw.set_item("categories", &ordered_levels)?;
+            kw.set_item("ordered", true)?;
+            let cat = pd.getattr("Categorical")?.call((vals,), Some(&kw))?;
+            meta_dict.set_item(col_name.as_str(), cat)?;
+        } else {
+            meta_dict.set_item(col_name.as_str(), vals)?;
+        }
+    }
+    let sample_names: Vec<String> = (0..n_groups).map(|i| format!("sample_{i}")).collect();
+    let sample_index = pd.call_method1("Index", (sample_names,))?;
+    let df_kw = PyDict::new(py);
+    df_kw.set_item("index", &sample_index)?;
+    let metadata_df = pd.call_method("DataFrame", (meta_dict,), Some(&df_kw))?;
+
+    // --- Build the numeric design matrix via formulaic (pydeseq2's parser). ---
+    let formulaic = py.import("formulaic").map_err(|_| {
+        // ImportError-derived so callers can `except ImportError`.
+        PyImportError::new_err(
+            "formulaic is required to honor a `design` formula for the NB-GLM backend \
+             but is not installed. It ships with pydeseq2 — install with: pip install \
+             formulaic. Or omit `design` to use the fixed intercept + target design.",
+        )
+    })?;
+    let x = formulaic.call_method1("model_matrix", (design_formula, &metadata_df))?;
+    // A one-sided formula (`~ rhs`) yields a single ModelMatrix (DataFrame-like); a
+    // two-sided / multi-part formula yields a `ModelMatrices` with no `.columns`.
+    if !x.hasattr("columns")? {
+        return Err(PyValueError::new_err(format!(
+            "design formula {design_formula:?} must be one-sided (`~ terms`); a two-sided \
+             or multi-part formula is not supported for the NB-GLM design."
+        )));
+    }
+    let columns: Vec<String> = x.getattr("columns")?.call_method0("tolist")?.extract()?;
+    let (design_vec, ds_rows, n_features) = dense2d_f64(py, &x)?;
+    if ds_rows != n_groups {
+        return Err(PyValueError::new_err(format!(
+            "design formula {design_formula:?} produced {ds_rows} rows but there are \
+             {n_groups} pseudobulk samples"
+        )));
+    }
+    // Full column rank needs more samples than columns. The engine also guards this
+    // (validate::validate_inputs), but reports raw dims — give an actionable message.
+    if n_groups <= n_features {
+        return Err(PyValueError::new_err(format!(
+            "design formula {design_formula:?} has {n_features} columns but only \
+             {n_groups} pseudobulk samples — the model is under-determined. Reduce the \
+             design or add replicate samples (a batch/donor/well column in `groupby`)."
+        )));
+    }
+    // Guard the per-contrast-refit scale cliff: each contrast re-runs the full
+    // O(n_genes·n_features²·iters) IRLS fit (until the fit-once/test-many engine
+    // entry lands — see docs/pseudobulk_nb_glm.md). Refuse pathological design
+    // widths / level counts rather than silently launching an hours-long job.
+    const MAX_DESIGN_FEATURES: usize = 100;
+    if n_features > MAX_DESIGN_FEATURES {
+        return Err(PyValueError::new_err(format!(
+            "design formula {design_formula:?} has {n_features} columns (> \
+             {MAX_DESIGN_FEATURES}); the NB-GLM design path re-fits per contrast and would \
+             be prohibitively slow. Reduce the design width, or use pyscx.accel.nb_glm for \
+             a single explicit contrast on a prebuilt design."
+        )));
+    }
+
+    // Full-sample gene-major counts [n_vars × n_groups] (all samples, not a subset).
+    let mut cg = vec![0.0_f64; n_vars * n_groups];
+    for j in 0..n_vars {
+        for s in 0..n_groups {
+            cg[j * n_groups + s] = result.counts[s * n_vars + j];
+        }
+    }
+
+    // --- Contrasts: explicit override, or one per non-reference target level. ---
+    let contrast_specs: Vec<(String, NbGlmContrast)> = if let Some(obj) = contrast_override {
+        let c = contrast_from_pyany(Some(obj), n_features)?;
+        let label = match &c {
+            NbGlmContrast::Coefficient { index } => columns
+                .get(*index)
+                .cloned()
+                .unwrap_or_else(|| format!("coef[{index}]")),
+            NbGlmContrast::Vector { .. } => "custom_contrast".to_string(),
+        };
+        vec![(label, c)]
+    } else {
+        if targets.len() > MAX_DESIGN_FEATURES {
+            return Err(PyValueError::new_err(format!(
+                "test_col '{test_col}' has {} non-reference levels (> {MAX_DESIGN_FEATURES}); \
+                 the design path re-fits per level and would be prohibitively slow. Use \
+                 fewer levels, or pyscx.accel.nb_glm per contrast.",
+                targets.len()
+            )));
+        }
+        let mut specs = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let idx = resolve_contrast_column(&columns, test_col, target).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "design formula {design_formula:?} does not produce a unique treatment \
+                     coefficient for target level '{target}' of test_col '{test_col}' \
+                     (looked for a column `{test_col}…[T.{target}]`). The design must include \
+                     `{test_col}` with treatment coding and an intercept (no-intercept `~ 0 + \
+                     …` is not supported). Design columns: {columns:?}"
+                ))
+            })?;
+            specs.push((target.clone(), NbGlmContrast::Coefficient { index: idx }));
+        }
+        specs
+    };
+
+    // Fit the full design once per contrast. NOTE(perf, 3.11 follow-up): the IRLS +
+    // dispersion fit is contrast-independent, so every call after the first re-runs an
+    // identical deterministic fit — a fit-once/test-many CPU seam (mirroring the GPU
+    // `gpu_nb_glm_fit_states` + `finalize_nb_glm` split) would remove the O(k) waste.
+    let warnings = py.import("warnings")?;
+    let mut fits = Vec::with_capacity(contrast_specs.len());
+    for (label, contrast) in contrast_specs {
+        match fit_one(
+            py,
+            &gpu_dev,
+            &cg,
+            n_vars,
+            n_groups,
+            &design_vec,
+            n_features,
+            None,
+            contrast,
+            options.clone(),
+        ) {
+            Ok(r) => fits.push(TargetFit {
+                target: label,
+                result: r,
+            }),
+            Err(e) => {
+                warnings
+                    .call_method1("warn", (format!("NB-GLM: contrast '{label}' failed: {e}"),))?;
+            }
+        }
+    }
+    Ok(fits)
+}
+
+/// Design-aware `pseudobulk_dex(backend="nb_glm")` assembly: fit with a formula
+/// design + optional explicit contrast, then emit the standard pandas schema.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fit_targets_pandas_with_design<'py>(
+    py: Python<'py>,
+    result: &PseudobulkResult,
+    test_col_idx: usize,
+    reference: &str,
+    design_formula: &str,
+    contrast_override: Option<&Bound<'_, PyAny>>,
+    options: &NbGlmOptions,
+    gpu_device_id: Option<usize>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let fits = fit_targets_nbglm_with_design(
+        py,
+        result,
+        test_col_idx,
+        reference,
+        design_formula,
+        contrast_override,
+        options,
+        gpu_device_id,
+    )?;
+    if fits.is_empty() {
+        return Err(PyRuntimeError::new_err(
+            "NB-GLM produced no fittable contrasts for the supplied design. Check that \
+             the design is full column rank and there are more pseudobulk samples than \
+             design columns (include a batch/donor/well replicate column in `groupby`).",
+        ));
+    }
+    fits_to_pandas(py, result, reference, &fits)
 }
 
 /// Fit a Rust-native negative-binomial GLM on an already-pseudobulked count
@@ -762,8 +1049,16 @@ pub fn nb_glm_profile_reset() -> PyResult<()> {
 /// input (auto-detected via `adata.uns["log1p"]`, or `is_log1p=True`) is
 /// rejected. DESeq2-*style*, not DESeq2-*identical*. See
 /// docs/pseudobulk_nb_glm.md.
+///
+/// `design` (optional, §3.11): a formulaic formula over `groupby` + `stratify_by`
+/// (e.g. `"~ perturbation + donor"`) to fit a covariate-adjusted joint model
+/// (shared dispersion) with one contrast per non-reference `groupby` level, instead
+/// of the default fixed `[intercept, is_target]` per-target fit. Requires
+/// `formulaic`. Custom designs run on **CPU** (the GPU kernel is `p ≤ 8`). An
+/// explicit `nbglm_options["contrast"]` is rejected here (the cell-eval schema is
+/// keyed by perturbation name — use `pseudobulk_dex`/`accel.nb_glm` for that).
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference, stratify_by=None, min_cells_per_group=10, min_cells_per_stratum=50, is_log1p=None, nbglm_options=None, gene_chunk_size=None, prefer_format="csr", device="auto"))]
+#[pyo3(signature = (adata, groupby, reference, stratify_by=None, min_cells_per_group=10, min_cells_per_stratum=50, is_log1p=None, nbglm_options=None, gene_chunk_size=None, prefer_format="csr", device="auto", design=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_nb_glm(
     py: Python<'_>,
@@ -778,6 +1073,7 @@ pub fn pdex_nb_glm(
     gene_chunk_size: Option<usize>,
     prefer_format: &str,
     device: &str,
+    design: Option<&str>,
 ) -> PyResult<Py<PyAny>> {
     // `stratify_by` is list-only; turn the opaque PyO3 `Can't extract 'str' to
     // 'Vec'` into an actionable message when a bare string slips through.
@@ -838,16 +1134,33 @@ pub fn pdex_nb_glm(
         ));
     }
 
+    // §3.11: `pdex_nb_glm` honors a `design` FORMULA (covariate-adjusted joint fit,
+    // per-perturbation contrasts). An explicit `nbglm_options["contrast"]` is NOT
+    // accepted here: its single arbitrary contrast has no perturbation-name `target`,
+    // and the cell-eval polars schema this returns is keyed by perturbation name — a
+    // coefficient-name target would silently fail the downstream join.
+    let (contrast_override, options_dict) = take_contrast_override(nbglm_options)?;
+    if contrast_override.is_some() {
+        return Err(PyValueError::new_err(
+            "pdex_nb_glm does not accept an explicit nbglm_options[\"contrast\"]: it emits \
+             the cell-eval schema keyed by perturbation name, so only the automatic \
+             per-perturbation contrasts are valid. Pass a `design` formula, or use \
+             pseudobulk_dex(backend=\"nb_glm\") / accel.nb_glm for a custom contrast.",
+        ));
+    }
+    let design_aware = design.is_some();
+
     // Resolve device + plan the route **before** the expensive aggregation, so an
     // invalid `device=` string or `device="gpu"` on a CPU-only build / no-GPU host
-    // fails fast (rather than after a full pseudobulk pass). The per-target design
-    // is `[intercept, is_target]` (p=2 ≤ PMAX) so the kernel always supports the
-    // width → `gpu_eligible = true`; the per-target `n_sub` guard in `fit_one`
-    // silently routes any over-large target to CPU (the stamped GPU route below
-    // can therefore reflect a sweep that partially ran on CPU — see the note where
-    // it is written).
+    // fails fast (rather than after a full pseudobulk pass). The DEFAULT path's
+    // per-target design is `[intercept, is_target]` (p=2 ≤ PMAX) so the GPU kernel
+    // fits → `gpu_eligible = true` (the per-target `n_sub` guard in `fit_one` may
+    // still route an over-large target to CPU). The design-aware path fits the FULL
+    // formula width (routinely p > GPU_NB_GLM_PMAX = 8) across all samples, so it
+    // runs on CPU — stamp it honestly as CPU (§4.1 route honesty) and skip the CUDA
+    // context entirely.
     let resolved = super::gpu::resolve_device(device)?;
-    let info = super::route::nb_glm_exec_info(device, true);
+    let info = super::route::nb_glm_exec_info(device, !design_aware);
     super::route::announce_route(py, "pdex_nb_glm", device, &info);
     let gpu_device_id = if info.route.is_gpu() {
         resolve_gpu_id(resolved)
@@ -885,13 +1198,33 @@ pub fn pdex_nb_glm(
         ));
     }
 
-    let options = nbglm_options_from_dict(py, nbglm_options)?;
-    let fits = fit_targets_nbglm(py, &result, 0, reference, &options, gpu_device_id)?;
+    let options = nbglm_options_from_dict(py, options_dict.as_ref())?;
+    // §3.11: a `design` formula fits one full-design model (groupby=column 0,
+    // stratifiers available as covariates) with per-perturbation contrasts;
+    // otherwise the fixed [intercept, is_target] per-target path.
+    let fits = if let Some(formula) = design {
+        fit_targets_nbglm_with_design(
+            py,
+            &result,
+            0,
+            reference,
+            formula,
+            None,
+            &options,
+            gpu_device_id,
+        )?
+    } else {
+        fit_targets_nbglm(py, &result, 0, reference, &options, gpu_device_id)?
+    };
     if fits.is_empty() {
-        return Err(PyRuntimeError::new_err(
+        return Err(PyRuntimeError::new_err(if design_aware {
+            "NB-GLM produced no fittable contrasts for the supplied design: check the \
+             design is full column rank and there are more pseudobulk samples than \
+             design columns (add a batch/donor/well replicate column in `groupby`)."
+        } else {
             "no perturbation had enough pseudobulk replicates to fit NB-GLM; \
-             check stratify_by spans ≥2 strata per perturbation",
-        ));
+             check stratify_by spans ≥2 strata per perturbation"
+        }));
     }
 
     // Stamp the planned route on adata.uns["scx_accel"]["pdex_nb_glm"]. NOTE: a

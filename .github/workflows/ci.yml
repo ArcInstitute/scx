@@ -204,7 +204,7 @@ jobs:
           python -m venv .venv
           . .venv/bin/activate
           pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.0;sys_platform=='linux'"
-          pip install maturin pytest numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv
+          pip install maturin pytest numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv formulaic polars
       # libhdf5 is needed by the `hdf5` pyscx feature, which exposes
       # `pyscx.from_h5ad` and the backed-AnnData → streaming router that
       # `tests/test_streaming_conversion.py` exercises.
