@@ -301,7 +301,9 @@ pub fn pseudobulk_nb_glm(
             })
             .collect()
     } else {
-        mle.clone()
+        // No-shrink branch: `mle` is unused after this, so move it out
+        // instead of cloning the whole per-gene state vector.
+        mle
     };
 
     Ok(assemble_result(

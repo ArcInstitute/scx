@@ -149,7 +149,12 @@ fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>
     let max_threads = rayon::current_num_threads().max(1);
     // `.max(1)` is defensive: cov_accumulator_workers already floors at 1, but
     // guard the `n_rows / workers` divisor against any future 0-return.
-    let workers = cov_accumulator_workers(n_vars, cov_memory_budget(), max_threads).max(1);
+    // The shared `SCX_ACCEL_NUM_THREADS` ceiling lowers the segment count here
+    // too (when set), so the knob covers both the streaming and in-memory
+    // covariance accumulators; unset → the memory-derived cap is unchanged.
+    let workers = cov_accumulator_workers(n_vars, cov_memory_budget(), max_threads)
+        .min(crate::mem_budget::accel_num_threads().unwrap_or(usize::MAX))
+        .max(1);
     let chunk_size = (n_rows / workers).max(256);
 
     (0..n_rows)
@@ -241,7 +246,10 @@ fn accumulate_covariance_streaming<S: ShardSource>(
     let n_shards = source.n_shards();
     let max_threads = rayon::current_num_threads();
     let budget = cov_memory_budget();
-    let workers = cov_accumulator_workers(n_vars, budget, max_threads);
+    // Memory-derived worker cap, lowered further by the shared
+    // `SCX_ACCEL_NUM_THREADS` policy when set (unset → no change).
+    let workers = cov_accumulator_workers(n_vars, budget, max_threads)
+        .min(crate::mem_budget::accel_num_threads().unwrap_or(usize::MAX));
     if workers < max_threads {
         log::debug!(
             "covariance_pca: capping accumulator workers to {workers} of {max_threads} \
@@ -1052,7 +1060,10 @@ fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Vec<
         // We partition rows into ~equal chunks for rayon.
         let chunk_size = (n_obs / rayon::current_num_threads().max(1)).max(256);
 
-        let (z, sum_q) = (0..n_obs)
+        // The fold accumulator carries a reusable `q_row` scratch buffer as its
+        // third element so it is allocated once per rayon task (per chunk)
+        // rather than once per row. Values are identical to the per-row alloc.
+        let (z, sum_q, _) = (0..n_obs)
             .into_par_iter()
             .with_min_len(chunk_size)
             .fold(
@@ -1064,11 +1075,11 @@ fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Vec<
                         } else {
                             vec![]
                         },
+                        vec![0.0f64; k],
                     )
                 },
-                |(mut z_local, mut sq_local), r| {
-                    // Copy one row from column-major Q into contiguous buffer
-                    let mut q_row = vec![0.0f64; k];
+                |(mut z_local, mut sq_local, mut q_row), r| {
+                    // Copy one row from column-major Q into the reused buffer
                     for j in 0..k {
                         q_row[j] = q[(r, j)];
                     }
@@ -1087,7 +1098,7 @@ fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Vec<
                             z_local[z_offset + j] += val * q_row[j];
                         }
                     }
-                    (z_local, sq_local)
+                    (z_local, sq_local, q_row)
                 },
             )
             .reduce(
@@ -1099,16 +1110,17 @@ fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Vec<
                         } else {
                             vec![]
                         },
+                        Vec::new(),
                     )
                 },
-                |(mut za, mut sqa), (zb, sqb)| {
+                |(mut za, mut sqa, qa), (zb, sqb, _qb)| {
                     for i in 0..za.len() {
                         za[i] += zb[i];
                     }
                     for i in 0..sqa.len() {
                         sqa[i] += sqb[i];
                     }
-                    (za, sqa)
+                    (za, sqa, qa)
                 },
             );
 

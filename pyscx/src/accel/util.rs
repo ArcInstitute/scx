@@ -1,8 +1,32 @@
 //! Shared utility helpers for CSR extraction and type conversion.
 
+use numpy::{PyArray1, PyArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+
+/// Build a 2-D `float32` numpy array from a single flat row-major `Vec<f32>`
+/// of length `rows * cols` (shape `[rows, cols]`).
+///
+/// Replaces the `Vec<Vec<f32>>` + `PyArray2::from_vec2` pattern, which
+/// allocated one small inner `Vec` per row (N allocations at atlas scale).
+/// `PyArray1::from_vec` hands the owned buffer to numpy (no copy) and
+/// `reshape` returns a row-major view — so there is no `unsafe`, no extra
+/// copy, and a length mismatch fails loud as a Python error at the FFI
+/// boundary (reshape rejects `rows*cols != data.len()`) rather than aborting
+/// the interpreter.
+pub(super) fn flat_pyarray2<'py>(
+    py: Python<'py>,
+    data: Vec<f32>,
+    rows: usize,
+    cols: usize,
+) -> PyResult<Bound<'py, numpy::PyArray2<f32>>> {
+    PyArray1::from_vec(py, data)
+        .reshape([rows, cols])
+        .map_err(|e| {
+            PyValueError::new_err(format!("flat_pyarray2: cannot reshape {rows}×{cols}: {e}"))
+        })
+}
 
 /// Call `array.astype(dtype, copy=False)` — avoids a deep copy when the
 /// source already has the target dtype. This mirrors numpy's behavior where

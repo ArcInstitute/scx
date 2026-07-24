@@ -218,7 +218,12 @@ pub fn harmony_integrate(
     covariates: &[BatchCovariate],
     config: &HarmonyConfig,
 ) -> Result<HarmonyResult> {
-    if let Some(n) = config.n_threads {
+    // An explicit `config.n_threads` wins; otherwise the shared
+    // `SCX_ACCEL_NUM_THREADS` policy sizes the private integration pool.
+    let resolved_threads = config
+        .n_threads
+        .or_else(crate::mem_budget::accel_num_threads);
+    if let Some(n) = resolved_threads {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build()

@@ -1,7 +1,6 @@
 //! UMAP embedding — CPU SGD + in-VRAM rapids-singlecell (`rsc.tl.umap`) +
 //! cuML fallback. The native GPU CUDA SGD kernel was removed.
 
-use numpy::PyArray2;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -294,21 +293,17 @@ pub(crate) fn write_umap_to_adata(
     adata: &Bound<'_, PyAny>,
     result: &scx_accel::UmapResult,
 ) -> PyResult<()> {
-    // Convert f64→f32 in Rust to avoid intermediate f64 numpy allocation
+    // Convert f64→f32 in Rust into one flat row-major buffer (n_obs ×
+    // n_components) to avoid both the intermediate f64 numpy allocation and
+    // the per-row Vec allocation of `from_vec2`.
     let marshal_start = scx_accel::cpu_profile::start();
-    let embeddings_arr = PyArray2::<f32>::from_vec2(
-        py,
-        &(0..result.n_obs)
-            .map(|i| {
-                (0..result.n_components)
-                    .map(|j| result.embeddings[i * result.n_components + j] as f32)
-                    .collect::<Vec<f32>>()
-            })
-            .collect::<Vec<Vec<f32>>>(),
-    )?;
+    let n_obs = result.n_obs;
+    let n_components = result.n_components;
+    let flat: Vec<f32> = result.embeddings.iter().map(|&v| v as f32).collect();
+    let embeddings_arr = super::util::flat_pyarray2(py, flat, n_obs, n_components)?;
     scx_accel::cpu_profile::record_marshalling_since(
         marshal_start,
-        result.n_obs * result.n_components * std::mem::size_of::<f32>(),
+        n_obs * n_components * std::mem::size_of::<f32>(),
     );
     let obsm = adata.getattr("obsm")?;
     obsm.set_item("X_umap", embeddings_arr)?;
