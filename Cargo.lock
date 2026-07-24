@@ -3444,6 +3444,7 @@ version = "0.11.5"
 dependencies = [
  "arrow",
  "criterion",
+ "crossbeam-channel",
  "faer",
  "faer-traits",
  "instant-distance",

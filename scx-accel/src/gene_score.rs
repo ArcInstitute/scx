@@ -71,7 +71,7 @@ fn ensure_finite(data: &[f32]) -> Result<()> {
 /// The inner loop touches every nonzero once and does `weights.len()` (1–2)
 /// lookups per nonzero — CSR is row-major so a column subset cannot be reached
 /// without scanning, matching scanpy's `X[:, genes].mean(axis=1)`.
-fn streaming_weighted_row_sums<S: ShardSource>(
+fn streaming_weighted_row_sums<S: ShardSource + Sync>(
     source: &S,
     weights: &[Vec<f64>],
 ) -> Result<Vec<Vec<f64>>> {
@@ -81,30 +81,37 @@ fn streaming_weighted_row_sums<S: ShardSource>(
         debug_assert_eq!(w.len(), n_vars);
     }
 
+    // Per-cell output is indexed by the global cell id (`row_base + r`), so the
+    // 2.1 decode-prefetch must be ordered (`for_each_shard_ordered`) to keep the
+    // `row_base` cursor valid; the write pattern is row-disjoint scatter.
     let mut out = vec![vec![0.0f64; n_obs]; weights.len()];
     let mut row_base = 0usize;
-    for shard_idx in 0..source.n_shards() {
-        let csr = source.read_shard(shard_idx)?;
-        let _r = scx_format_io::reduction_guard();
-        ensure_finite(&csr.data)?;
-        let rows = csr.n_rows();
-        for r in 0..rows {
-            let start = csr.indptr[r] as usize;
-            let end = csr.indptr[r + 1] as usize;
-            let cell = row_base + r;
-            for nz in start..end {
-                let col = csr.indices[nz] as usize;
-                let v = csr.data[nz] as f64;
-                for (k, w) in weights.iter().enumerate() {
-                    let wc = w[col];
-                    if wc != 0.0 {
-                        out[k][cell] += wc * v;
+    crate::prefetch::for_each_shard_ordered(
+        source,
+        crate::prefetch::prefetch_depth(),
+        |_idx, csr| {
+            let _r = scx_format_io::reduction_guard();
+            ensure_finite(&csr.data)?;
+            let rows = csr.n_rows();
+            for r in 0..rows {
+                let start = csr.indptr[r] as usize;
+                let end = csr.indptr[r + 1] as usize;
+                let cell = row_base + r;
+                for nz in start..end {
+                    let col = csr.indices[nz] as usize;
+                    let v = csr.data[nz] as f64;
+                    for (k, w) in weights.iter().enumerate() {
+                        let wc = w[col];
+                        if wc != 0.0 {
+                            out[k][cell] += wc * v;
+                        }
                     }
                 }
             }
-        }
-        row_base += rows;
-    }
+            row_base += rows;
+            Ok(())
+        },
+    )?;
 
     if row_base != n_obs {
         return Err(AccelError::ShapeError(format!(
@@ -227,7 +234,7 @@ fn select_control_genes(
 /// Contract asymmetry: `gene_list` indices are hard-checked against `n_vars`
 /// (out-of-range is an error), but out-of-range `gene_pool` indices are silently
 /// filtered (they cannot be binned). Pass a pool that fits `0..n_vars`.
-pub fn score_genes<S: ShardSource>(
+pub fn score_genes<S: ShardSource + Sync>(
     source: &S,
     gene_list: &[u32],
     gene_pool: &[u32],

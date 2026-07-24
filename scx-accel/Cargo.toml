@@ -28,6 +28,9 @@ rand_distr = { workspace = true }
 instant-distance = "0.6"
 num-traits = "0.2"
 rayon = { workspace = true }
+# Bounded MPSC channel for the ordered decode-prefetch pipeline
+# (`prefetch.rs`), mirroring the ingest coordinator in scx-convert.
+crossbeam-channel = { workspace = true }
 thread_local = "1.1"
 libc = "0.2"
 libm = "0.2"

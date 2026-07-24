@@ -309,7 +309,7 @@ struct AlphaMeta {
 
 /// Resolve `α`: use a pinned value as-is, or estimate it once from the raw
 /// matrix via [`scx_accel::estimate_alpha`].
-fn resolve_alpha<S: ShardSource>(alpha: Option<f64>, raw: &S) -> PyResult<AlphaMeta> {
+fn resolve_alpha<S: ShardSource + Sync>(alpha: Option<f64>, raw: &S) -> PyResult<AlphaMeta> {
     match alpha {
         Some(a) => Ok(AlphaMeta {
             alpha: a,
@@ -397,7 +397,7 @@ struct DiskOut<'a> {
 /// Compute baseline + (optionally) PCA / dense over a delta `ShardSource`,
 /// writing results into `adata` and stamping the CPU route.
 #[allow(clippy::too_many_arguments)]
-fn run_on_source<S: ShardSource>(
+fn run_on_source<S: ShardSource + Sync>(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     source: &S,

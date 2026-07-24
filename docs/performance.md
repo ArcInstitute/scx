@@ -428,6 +428,75 @@ captured. Source: backed-streaming capture
 (`benchmarks/scripts/profile_cpu_stages_backed.py`, `SCX_CPU_PROFILE=1`), 3 runs,
 median across runs, `results/raw/accel_cpu_profile_backed__*`.
 
+### Bounded ordered decode-prefetch (Phase-2 task 2.1)
+
+The 2.0 oracle above ranked HVG (and `normalize_total`) as **decode-bound at every
+scale**. Task 2.1 attacks that directly with a **bounded, ordered decode-prefetch**
+pipeline (`scx_accel::prefetch::for_each_shard_ordered`): up to `depth` shards decode
+concurrently on the rayon pool while the reduction runs on the calling thread **in
+strict shard order**. Because consumption stays single-threaded and ordered, the
+reduction sees exactly the sequential accumulation order — the result is **bit-identical**
+to the pre-2.1 loop (unit-proven: `prefetch::tests::ordered_accumulation_is_bit_identical_to_sequential`),
+while decode now overlaps reduction and runs across shards. Applied to the decode-bound
+streaming kernels: HVG (`streaming_mean_var{,_expm1}`, `streaming_clip_square_sum`, and
+the batched variants), `score_genes`, PFlog baselines, and pseudobulk aggregation.
+
+Two knobs (both read once per process via `OnceLock`, so set them in the environment
+before the first accelerator call; both default to the safe/bit-exact behaviour):
+- **`SCX_ACCEL_PREFETCH_DEPTH`** — max shards decoded-but-unconsumed (default 4, capped
+  by the rayon pool size). `0`/`1` disables prefetch (sequential fallback). New shards are
+  spawned only as one drains in shard order, so the decoded-but-unconsumed set — and hence
+  extra peak RSS — stays bounded to `depth` decoded shards **even under a head-of-line
+  stall** (regression-tested). This is a fixed small cap, not a per-shard byte budget.
+- **`SCX_ACCEL_REDUCTION_MODE`** — `stable` (default; ordered, bit-exact) vs `parallel`
+  (per-worker accumulators merged at the end, worker count derated by the CPU memory
+  budget; **tolerance-only** because float summation reorders). The parallel mode is opt-in
+  and reached **only** by the offset-independent per-column reductions (unbatched HVG
+  moments, clipped-square-sum); the offset-dependent kernels (batched HVG, `score_genes`,
+  PFlog, pseudobulk) always use the ordered path and ignore `parallel`.
+
+`for_each_shard_ordered` must not be called from within a rayon parallel region (the drain
+blocks the calling thread on the channel; a saturated pool worker would deadlock) — it
+detects a worker-thread caller and falls back to sequential decode, and this is why PCA
+(which owns inner rayon pools) is a deferred follow-up rather than wired here.
+
+**The win is multi-shard-gated.** A single-shard file (≤ the 16 384-row shard target,
+e.g. `pbmc3k`/`pbmc10k`) hits the `n_shards == 1` guard and runs the sequential path
+unchanged — verified no-regression locally (pbmc10k HVG 802 ms sequential vs 797 ms
+prefetch, within noise; the file has 1 CSR shard). The overlap only pays off where
+there are many shards to decode ahead — the atlas tier (`tabula_sapiens_100k` ~6 shards,
+`census_500k`/`census_1m` tens of shards).
+
+**Measured before/after** (same host + `.so`; prefetch off = `SCX_ACCEL_PREFETCH_DEPTH=1`
+vs default depth 4), backed-streaming wall-clock (median of runs):
+
+| Dataset | Op | wall off (ms) | wall on (ms) | Speedup |
+|---|---|--:|--:|--:|
+| tabula_sapiens_100k | hvg | 4930.8 | 2179.4 | **2.26×** |
+| census_500k | hvg | 16714.1 | 7255.7 | **2.30×** |
+| census_1m | hvg | 29150.5 | 12735.3 | **2.29×** |
+| tabula_sapiens_100k | normalize | 5013.6 | 4610.6 | 1.09× |
+| census_500k / 1m | normalize | 20477 / 38584 | 20817 / 38423 | ~1.0× |
+| tabula/500k/1m | pca | 8364 / 31368 / 138220 | 8222 / 31613 / 135041 | ~1.0× |
+
+**HVG — the fully-prefetched kernel — is ~2.3× faster at every multi-shard scale**, the
+first measured Phase-2 win. In the profiler the `decode` bucket now *exceeds* wall
+(Σ/wall 220–275 %) because it sums each worker's decode time and those run concurrently;
+the wall drop is the real gain. `normalize_total` (a pyscx lazy-transform path, not one of
+the wired `scx-accel` streaming kernels) and `pca` (streaming decode-prefetch deferred —
+see above) are flat by construction, confirming the change is scoped to the kernels it
+touched and introduces no regression elsewhere. Peak-RSS held flat (bounded to `depth`
+decoded shards). Source: `pf21_cap` capture on `cpu_preemptible`,
+`benchmarks/scripts/profile_cpu_stages_backed.py` before/after.
+
+**Deferred to a measured Phase-2 follow-up:** PCA streaming decode-prefetch (its
+covariance/transpose passes already own inner rayon parallelism — wrapping them adds a
+nested-pool interaction that needs its own measurement; PCA is decode-bound only at
+≥~1M) and the CSC mean/var kernels (reached via `&dyn ColumnShardSource`, which would
+need a `+ Sync` dyn boundary change through the pyscx capability-detection layer). The
+`for_each_csc_shard_ordered` sibling primitive ships and is tested, ready for that
+follow-up.
+
 ### Differential expression (CPU, full-matrix)
 
 The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell fixture. The dedicated `accel_de` benchmark sweeps the raw count matrix (no HVG projection) across the full dataset tier — scanpy's per-gene rank pass becomes the bottleneck and times out on census-scale:

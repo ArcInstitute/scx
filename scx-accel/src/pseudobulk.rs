@@ -252,30 +252,35 @@ pub fn pseudobulk_aggregate(
         cell_counts[g] += 1;
     }
 
-    // Stream shards.
-    let n_shards = reader.index().n_shards();
+    // Stream shards with ordered decode-prefetch (2.1). Counts land in
+    // per-group bins keyed by the global cell index, so shards must be consumed
+    // in order for the `global_row` cursor to map cells correctly — StableOrder
+    // is the only valid mode. Pseudobulk is a **single pass**, so use the
+    // *uncached* prefetch variant: `read_shard` (not the LRU `read_shard_arc`),
+    // preserving the pre-2.1 `read_shard_uncached` behaviour so this pass does
+    // not warm/evict the shared shard cache (review feedback).
     let mut global_row = 0usize;
+    crate::prefetch::for_each_shard_ordered_uncached(
+        reader,
+        crate::prefetch::prefetch_depth(),
+        |_shard_idx, shard_csr| {
+            let _r = scx_format_io::reduction_guard();
+            let shard_n_rows = shard_csr.n_rows();
+            for row in 0..shard_n_rows {
+                let cell_idx = global_row + row;
+                let group_idx = cell_to_group[cell_idx];
 
-    for shard_idx in 0..n_shards {
-        let shard_csr = reader
-            .read_shard_uncached(shard_idx)
-            .map_err(crate::AccelError::Scx)?;
-
-        let _r = scx_format_io::reduction_guard();
-        let shard_n_rows = shard_csr.n_rows();
-        for row in 0..shard_n_rows {
-            let cell_idx = global_row + row;
-            let group_idx = cell_to_group[cell_idx];
-
-            let start = shard_csr.indptr[row] as usize;
-            let end = shard_csr.indptr[row + 1] as usize;
-            for j in start..end {
-                let col = shard_csr.indices[j] as usize;
-                counts[group_idx * n_vars + col] += shard_csr.data[j] as f64;
+                let start = shard_csr.indptr[row] as usize;
+                let end = shard_csr.indptr[row + 1] as usize;
+                for j in start..end {
+                    let col = shard_csr.indices[j] as usize;
+                    counts[group_idx * n_vars + col] += shard_csr.data[j] as f64;
+                }
             }
-        }
-        global_row += shard_n_rows;
-    }
+            global_row += shard_n_rows;
+            Ok(())
+        },
+    )?;
 
     // Apply mean if requested.
     if method == AggregationMethod::Mean {
