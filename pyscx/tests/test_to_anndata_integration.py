@@ -555,7 +555,9 @@ def test_strict_var_names_false_drops_unknown(tmp_dir):
     assert set(out.var["gene_symbol"]) == {"SYM_1", "SYM_3"}
 
 
-@pytest.mark.parametrize("op", ["normalize_total", "log1p", "score_genes"])
+@pytest.mark.parametrize(
+    "op", ["normalize_total", "log1p", "score_genes", "calculate_qc_metrics"]
+)
 def test_accel_ops_reject_preserve_var_order(tmp_dir, op):
     """Accel ops that gather over the sorted projection must reject a
     presentation-ordered backed dataset rather than silently misalign."""
@@ -574,8 +576,13 @@ def test_accel_ops_reject_preserve_var_order(tmp_dir, op):
             accel.normalize_total(ad)
         elif op == "log1p":
             accel.log1p(ad)
-        else:
+        elif op == "score_genes":
             accel.score_genes(ad, ["SYM_5", "SYM_1"])
+        else:
+            # This guard is what lets calculate_qc_metrics index its per-column
+            # qc_var bitmask by `adata.var` position: it holds only while the
+            # visible axis is the sorted projection.
+            accel.calculate_qc_metrics(ad)
 
 
 def test_accel_ops_allow_default_order(tmp_dir):
