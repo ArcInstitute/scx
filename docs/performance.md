@@ -634,6 +634,14 @@ projection / none × deletions / none × 0, 1, 3 `qc_vars`, and a
 `cpu_profile_snapshot()` decode-count test pins the pass count so a later refactor cannot
 silently re-split it.
 
+**Task 4.0a (axis-subsetting correctness) does not change these numbers.** It adds
+per-call bookkeeping over the aligned members — no matrix work and no I/O — and the
+decode-pass counts above are unchanged, which `test_qc_metrics_fused.py`'s
+`cpu_profile_snapshot()` test pins. Lazy `obsp` / `varp` / `varm` entries are not decoded
+by a subset at all; the subset is recorded and applied if and when the key is read. No
+wall-clock figures are quoted here because no capture backing them is checked in — see
+[docs/benchmark_manifest.md](benchmark_manifest.md).
+
 ### Differential expression (CPU, full-matrix)
 
 The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell fixture. The dedicated `accel_de` benchmark sweeps the raw count matrix (no HVG projection) across the full dataset tier — scanpy's per-gene rank pass becomes the bottleneck and times out on census-scale:

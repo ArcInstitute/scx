@@ -1116,14 +1116,17 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
             kept_to_global_arc.clone(),
         )
     });
-    let lazy_varp = lazy_reader
-        .as_ref()
-        .filter(|_| has_varp)
-        .map(|r| ScxLazyPairwiseMapping::new(Arc::clone(r), PairwiseAxis::Varp, None));
-    let lazy_varm = lazy_reader
-        .as_ref()
-        .filter(|_| has_varm)
-        .map(|r| ScxLazyVarmMapping::new(Arc::clone(r)));
+    // varp / varm decode at physical var width, so an open-time `var_names=`
+    // projection has to be seeded into the bridge — otherwise a later
+    // `filter_genes` replays visible-space indices against a physical-width
+    // value and silently returns the wrong genes' rows.
+    let lazy_varp = lazy_reader.as_ref().filter(|_| has_varp).map(|r| {
+        ScxLazyPairwiseMapping::new(Arc::clone(r), PairwiseAxis::Varp, None)
+            .with_var_projection(col_indices.as_deref())
+    });
+    let lazy_varm = lazy_reader.as_ref().filter(|_| has_varm).map(|r| {
+        ScxLazyVarmMapping::new(Arc::clone(r)).with_var_projection(col_indices.as_deref())
+    });
 
     // --- uns (eager; tagged envelopes reconstructed) ---
     let uns_dict = read_uns_as_pyobject(py, &reader, 0)?;
@@ -1151,7 +1154,14 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
             None => ScxBackedLayerDataset::from_reader(l_backed, cache_shards, name.clone()),
         };
         if let Some(ref indices) = col_indices {
-            l_dataset.inner.set_col_projection(indices.clone());
+            // Mirror X's setter: under `preserve_var_order` the visible axis is
+            // in request order, and using the sorted setter here left layers
+            // transposed relative to X from the moment the file was opened.
+            if preserve_var_order {
+                l_dataset.inner.set_col_projection_ordered(indices.clone());
+            } else {
+                l_dataset.inner.set_col_projection(indices.clone());
+            }
         }
         let l_py = l_dataset.into_pyobject(py)?;
         layers_dict.set_item(name, l_py)?;

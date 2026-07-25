@@ -29,6 +29,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 
 use scx_format_io::ScxReader;
 
+use crate::axis_align::{apply_subset_to_lazy_mapping, AxisSelection, PendingSubsets, ValueAxes};
 use crate::convert::{
     coo_record_batch_to_scipy, csr_to_scipy, filter_coo_obsp_by_kept_rows,
     filter_obs_by_deletion_vectors, obsm_batch_to_numpy,
@@ -67,6 +68,10 @@ pub struct ScxLazyPairwiseMapping {
     /// yet been read; `Some(obj)` = cached value (either disk-loaded
     /// and validated, or user-inserted via `__setitem__`).
     state: Mutex<HashMap<String, Option<Py<PyAny>>>>,
+    /// Axis subsets recorded while a key was still un-fetched, applied on
+    /// decode. Keeps `filter_cells` from dragging an obsp graph off disk
+    /// just to slice it.
+    pending: PendingSubsets,
 }
 
 impl ScxLazyPairwiseMapping {
@@ -86,7 +91,21 @@ impl ScxLazyPairwiseMapping {
             axis,
             kept_to_global,
             state: Mutex::new(state),
+            pending: PendingSubsets::default(),
         }
+    }
+
+    /// Seed the open-time var projection (`to_anndata(var_names=[...])`).
+    ///
+    /// Only meaningful for `Varp`: the obs axis gets its filter through
+    /// `kept_to_global` at decode, but the var-axis bridges decode at full
+    /// physical width. See [`PendingSubsets::seed_open_projection`].
+    pub(crate) fn with_var_projection(self, indices: Option<&[u32]>) -> Self {
+        if let Some(indices) = indices {
+            debug_assert_eq!(self.axis, PairwiseAxis::Varp);
+            self.pending.seed_open_projection(ValueAxes::Both, indices);
+        }
+        self
     }
 
     /// Convert the lazy mapping into a plain `dict` by materializing
@@ -129,6 +148,9 @@ impl ScxLazyPairwiseMapping {
             _ => coo_record_batch_to_scipy(py, &batch)?,
         };
         let obj: Py<PyAny> = bound.unbind();
+        // Apply any subset recorded while this key was un-fetched, *before*
+        // caching, so every later read sees the visible-axis value.
+        let obj = self.pending.apply(py, obj)?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // Re-check: a concurrent fetch may have populated the slot while
         // we were decoding. Return whatever's already there so callers
@@ -139,6 +161,21 @@ impl ScxLazyPairwiseMapping {
         }
         state.insert(key.to_string(), Some(obj.clone_ref(py)));
         Ok(obj)
+    }
+
+    /// Record an axis subset: slice what is already cached, defer the rest.
+    ///
+    /// obsp / varp values are square, so their subset hits `ValueAxes::Both`.
+    /// Nothing is read from disk here — that is the point of deferring: a
+    /// `filter_cells` on a census-scale file must not drag every section off
+    /// disk just to keep it aligned.
+    pub(crate) fn apply_axis_subset(
+        &self,
+        py: Python<'_>,
+        axes: ValueAxes,
+        sel: AxisSelection,
+    ) -> PyResult<()> {
+        apply_subset_to_lazy_mapping(py, &self.state, &self.pending, axes, sel)
     }
 }
 
@@ -267,15 +304,27 @@ impl ScxLazyPairwiseMapping {
 pub struct ScxLazyVarmMapping {
     reader: Arc<ScxReader>,
     state: Mutex<HashMap<String, Option<Py<PyAny>>>>,
+    /// See [`ScxLazyPairwiseMapping`]'s `pending`.
+    pending: PendingSubsets,
 }
 
 impl ScxLazyVarmMapping {
+    /// Seed the open-time var projection. varm is var-aligned on its rows;
+    /// see [`ScxLazyPairwiseMapping::with_var_projection`].
+    pub(crate) fn with_var_projection(self, indices: Option<&[u32]>) -> Self {
+        if let Some(indices) = indices {
+            self.pending.seed_open_projection(ValueAxes::Rows, indices);
+        }
+        self
+    }
+
     pub(crate) fn new(reader: Arc<ScxReader>) -> Self {
         let state: HashMap<String, Option<Py<PyAny>>> =
             reader.list_varm().into_iter().map(|k| (k, None)).collect();
         Self {
             reader,
             state: Mutex::new(state),
+            pending: PendingSubsets::default(),
         }
     }
 
@@ -307,6 +356,9 @@ impl ScxLazyVarmMapping {
         let batch = self.reader.read_varm(key).map_err(to_pyerr)?;
         let bound = obsm_batch_to_numpy(py, &batch)?;
         let obj: Py<PyAny> = bound.unbind();
+        // Apply any subset recorded while this key was un-fetched, *before*
+        // caching, so every later read sees the visible-axis value.
+        let obj = self.pending.apply(py, obj)?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // See `ScxLazyPairwiseMapping::fetch` for the double-check rationale.
         if let Some(Some(cached)) = state.get(key) {
@@ -314,6 +366,19 @@ impl ScxLazyVarmMapping {
         }
         state.insert(key.to_string(), Some(obj.clone_ref(py)));
         Ok(obj)
+    }
+
+    /// Record an axis subset: slice what is already cached, defer the rest.
+    ///
+    /// varm is var-aligned on its rows. Nothing is read from disk here; the
+    /// subset lands when (and only if) the key is decoded.
+    pub(crate) fn apply_axis_subset(
+        &self,
+        py: Python<'_>,
+        axes: ValueAxes,
+        sel: AxisSelection,
+    ) -> PyResult<()> {
+        apply_subset_to_lazy_mapping(py, &self.state, &self.pending, axes, sel)
     }
 }
 
@@ -453,6 +518,8 @@ pub struct ScxLazyObsmMapping {
     /// `O(batch)` memory) instead of a full dense numpy array.
     backed: Option<BackedObsmConfig>,
     state: Mutex<HashMap<String, Option<Py<PyAny>>>>,
+    /// See [`ScxLazyPairwiseMapping`]'s `pending`.
+    pending: PendingSubsets,
 }
 
 /// Construction inputs for a backed (row-gather) obsm value. Each key
@@ -499,6 +566,7 @@ impl ScxLazyObsmMapping {
             reader,
             backed,
             state: Mutex::new(state),
+            pending: PendingSubsets::default(),
         }
     }
 
@@ -546,6 +614,9 @@ impl ScxLazyObsmMapping {
                 obsm_batch_to_numpy(py, &filtered)?.unbind()
             }
         };
+        // Apply any subset recorded while this key was un-fetched, *before*
+        // caching, so every later read sees the visible-axis value.
+        let obj = self.pending.apply(py, obj)?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // See `ScxLazyPairwiseMapping::fetch` for the double-check rationale.
         if let Some(Some(cached)) = state.get(key) {
@@ -553,6 +624,20 @@ impl ScxLazyObsmMapping {
         }
         state.insert(key.to_string(), Some(obj.clone_ref(py)));
         Ok(obj)
+    }
+
+    /// Record an axis subset: slice what is already cached, defer the rest.
+    ///
+    /// obsm is obs-aligned on its rows. A backed value composes the subset into
+    /// its `kept_to_global` rather than gathering rows. Nothing is read from
+    /// disk here; the subset lands when (and only if) the key is decoded.
+    pub(crate) fn apply_axis_subset(
+        &self,
+        py: Python<'_>,
+        axes: ValueAxes,
+        sel: AxisSelection,
+    ) -> PyResult<()> {
+        apply_subset_to_lazy_mapping(py, &self.state, &self.pending, axes, sel)
     }
 }
 
@@ -685,6 +770,8 @@ impl ScxLazyObsmMapping {
 pub struct ScxLazyLayersMapping {
     reader: Arc<ScxReader>,
     state: Mutex<HashMap<String, Option<Py<PyAny>>>>,
+    /// See [`ScxLazyPairwiseMapping`]'s `pending`.
+    pending: PendingSubsets,
 }
 
 impl ScxLazyLayersMapping {
@@ -698,6 +785,7 @@ impl ScxLazyLayersMapping {
         Self {
             reader,
             state: Mutex::new(state),
+            pending: PendingSubsets::default(),
         }
     }
 
@@ -729,6 +817,9 @@ impl ScxLazyLayersMapping {
         let csr = self.reader.read_layer_filtered(key).map_err(to_pyerr)?;
         let bound = csr_to_scipy(py, csr)?;
         let obj: Py<PyAny> = bound.unbind();
+        // Apply any subset recorded while this key was un-fetched, *before*
+        // caching, so every later read sees the visible-axis value.
+        let obj = self.pending.apply(py, obj)?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // See `ScxLazyPairwiseMapping::fetch` for the double-check rationale.
         if let Some(Some(cached)) = state.get(key) {
@@ -736,6 +827,20 @@ impl ScxLazyLayersMapping {
         }
         state.insert(key.to_string(), Some(obj.clone_ref(py)));
         Ok(obj)
+    }
+
+    /// Record an axis subset: slice what is already cached, defer the rest.
+    ///
+    /// Layers are obs-aligned on rows and var-aligned on columns. Nothing is
+    /// read from disk here; the subset lands when (and only if) the key is
+    /// decoded.
+    pub(crate) fn apply_axis_subset(
+        &self,
+        py: Python<'_>,
+        axes: ValueAxes,
+        sel: AxisSelection,
+    ) -> PyResult<()> {
+        apply_subset_to_lazy_mapping(py, &self.state, &self.pending, axes, sel)
     }
 }
 

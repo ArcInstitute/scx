@@ -65,6 +65,18 @@ impl ScxBackedObsmDataset {
         }
     }
 
+    /// Re-point the row window after an obs-axis subset of the parent AnnData.
+    ///
+    /// `kept_to_global` is absolute (visible row → global file row), not a
+    /// composition against the current window, because the caller derives it
+    /// from `X`, which is subset in lockstep. Costs no I/O: this is what lets
+    /// an obs subset keep a backed embedding backed instead of gathering it
+    /// into a dense array.
+    pub(crate) fn set_kept_to_global(&mut self, kept_to_global: Arc<Vec<u64>>) {
+        self.shape_val.0 = kept_to_global.len();
+        self.kept_to_global = Some(kept_to_global);
+    }
+
     fn to_global_row(&self, user_row: usize) -> PyResult<u64> {
         match &self.kept_to_global {
             Some(mapping) => mapping.get(user_row).copied().ok_or_else(|| {

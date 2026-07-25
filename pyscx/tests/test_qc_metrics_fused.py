@@ -101,11 +101,14 @@ def test_fused_matches_unfused_reference(multishard_path, case, n_qc):
     one-statistic-per-scan kernels in the same accumulation order — so equality
     is asserted **exactly**.
 
-    Lazy cases use the materialized visible matrix instead: the lazy `sum` /
-    `getnnz` dunders call the *unprojected* `streaming_row_sums`, so under a
-    column projection they are not a valid reference (a separate pre-existing
-    defect, same family as the one this branch fixes in QC). numpy's pairwise
-    summation reorders the adds, so those compare at a tight tolerance.
+    Lazy cases use the materialized visible matrix instead. That was originally
+    because the lazy `sum` / `getnnz` dunders called the *unprojected*
+    `streaming_row_sums` and so were not a valid reference under a column
+    projection; Phase 4.0a fixed that, but the materialized matrix is kept here
+    deliberately — it is an oracle *independent* of the kernels under test,
+    where the dunders now share the projection machinery with them. numpy's
+    pairwise summation reorders the adds, so these compare at a tight tolerance
+    rather than exactly.
     """
     import pyscx
 
