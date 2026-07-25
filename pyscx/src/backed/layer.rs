@@ -46,6 +46,22 @@ impl ScxBackedLayerDataset {
         );
         ScxBackedLayerDataset { inner, layer_name }
     }
+
+    /// [`ScxBackedSparseDataset::subset_clone`], keeping the layer wrapper.
+    ///
+    /// Delegating to `inner` and returning the bare `ScxBackedSparseDataset`
+    /// (as `__getitem__` does) would silently drop the layer name that
+    /// `__repr__` and the SCX → SCX writer read.
+    pub(crate) fn subset_clone(
+        &self,
+        rows: Option<&[i64]>,
+        cols: Option<&[i64]>,
+    ) -> PyResult<Self> {
+        Ok(ScxBackedLayerDataset {
+            inner: self.inner.subset_clone(rows, cols)?,
+            layer_name: self.layer_name.clone(),
+        })
+    }
 }
 
 #[pymethods]

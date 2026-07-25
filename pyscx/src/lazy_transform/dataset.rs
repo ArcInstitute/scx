@@ -178,6 +178,65 @@ impl ScxLazyTransformedDataset {
         self.col_projection.as_ref().map(|v| v.as_slice())
     }
 
+    /// A second handle onto the same window with the same transform chain.
+    ///
+    /// The per-row transform parameters are indexed by *global* row, so a
+    /// changed `kept_to_global` re-points the window without invalidating
+    /// them — which is why a row subset needs no transform surgery.
+    pub(crate) fn clone_handle(&self) -> Self {
+        Self {
+            backed: Arc::clone(&self.backed),
+            backed_csc: self.backed_csc.clone(),
+            shape_val: self.shape_val,
+            transforms: self.transforms.clone(),
+            kept_to_global: self.kept_to_global.clone(),
+            col_projection: self.col_projection.clone(),
+            non_negative: self.non_negative,
+            source_path: self.source_path.clone(),
+        }
+    }
+
+    /// The lazy twin of [`crate::backed::ScxBackedSparseDataset::subset_clone`].
+    ///
+    /// A lazy dataset has no `col_presentation`, so it cannot express a
+    /// column *reorder* — `set_col_projection` sorts. A composed order that is
+    /// not already ascending is therefore rejected rather than silently
+    /// permuted: `adata.var` would follow the request order while `X` followed
+    /// disk order, which is the silent-divergence class §9.18 exists to close.
+    /// A mask-derived subset (every `filter_genes` / HVG path) always composes
+    /// ascending and never hits this.
+    pub(crate) fn subset_clone(
+        &self,
+        rows: Option<&[i64]>,
+        cols: Option<&[i64]>,
+    ) -> PyResult<Self> {
+        let mut out = self.clone_handle();
+        if let Some(rows) = rows {
+            out.set_kept_to_global(crate::axis_align::compose_rows_positional(
+                self.kept_to_global.as_ref().map(|v| v.as_slice()),
+                rows,
+                self.shape_val.0,
+            )?);
+        }
+        if let Some(cols) = cols {
+            let composed = crate::axis_align::compose_cols_positional(
+                self.col_projection.as_ref().map(|v| v.as_slice()),
+                cols,
+                self.shape_val.1,
+            )?;
+            if composed.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(PyRuntimeError::new_err(
+                    "cannot reorder or repeat the columns of a lazily transformed X \
+                     (normalize_total / log1p / row_scale): the projection is stored \
+                     sorted, so var and X would disagree. Materialize first with \
+                     `adata.X = adata.X.to_memory()`.",
+                ));
+            }
+            out.set_col_projection(composed);
+        }
+        Ok(out)
+    }
+
     /// Apply all transforms in-place on a decoded CSR shard.
     ///
     /// `global_row_offset` is the starting global row index for this shard,

@@ -77,6 +77,33 @@ impl ScxBackedObsmDataset {
         self.kept_to_global = Some(kept_to_global);
     }
 
+    /// A second handle onto the same embedding, same row window.
+    pub(crate) fn clone_handle(&self) -> Self {
+        ScxBackedObsmDataset {
+            backed: Arc::clone(&self.backed),
+            name: self.name.clone(),
+            shape_val: self.shape_val,
+            cache_shards: self.cache_shards,
+            kept_to_global: self.kept_to_global.clone(),
+        }
+    }
+
+    /// A handle onto a sub-window, composing rather than gathering.
+    ///
+    /// Rows only: an `obsm` / `varm` value is aligned on one axis, so anndata
+    /// hands `_subset` a 1-tuple. A column index would have to gather, which
+    /// the caller can do explicitly with `m[:, cols]`.
+    pub(crate) fn subset_clone(&self, rows: &[i64]) -> PyResult<Self> {
+        let mut out = self.clone_handle();
+        let composed = crate::axis_align::compose_rows_positional(
+            self.kept_to_global.as_ref().map(|v| v.as_slice()),
+            rows,
+            self.shape_val.0,
+        )?;
+        out.set_kept_to_global(Arc::new(composed));
+        Ok(out)
+    }
+
     fn to_global_row(&self, user_row: usize) -> PyResult<u64> {
         match &self.kept_to_global {
             Some(mapping) => mapping.get(user_row).copied().ok_or_else(|| {
@@ -313,6 +340,17 @@ impl ScxBackedObsmDataset {
 
     /// Alias for [`Self::to_memory`] — obsm values are already dense.
     fn toarray<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.to_memory(py)
+    }
+
+    /// Materialize, matching the other handles' `copy()`.
+    ///
+    /// `AnnData._mutated_copy` calls `.copy()` on every aligned value it was
+    /// not handed, so without this a backed embedding could not survive
+    /// `adata[mask].copy()` at all — it raised `AttributeError` before Phase
+    /// 4.0b. The in-place accelerators pass `obsm=` explicitly, so they keep
+    /// the handle instead of gathering it.
+    fn copy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.to_memory(py)
     }
 

@@ -1372,24 +1372,24 @@ All accelerators that support GPU expose a `device` parameter:
 
 ### Axis-subsetting ops and the aligned members
 
-`filter_cells`, `filter_genes`, `subset_obs`, and `highly_variable_genes(subset=True)`
-subset one axis of the AnnData in place. On a backed or lazy `X` the subset is a
-projection update — the matrix is never materialized — and every aligned member
-follows: `layers`, `obsm`, `obsp` on the obs axis; `layers`, `varm`, `varp` on the
-var axis. SCX handles absorb it as a projection update; lazy `to_anndata()` mapping
-entries record it and apply it on first read, so a `filter_cells` on a backed
-AnnData never pulls an `obsp` graph off disk; plain numpy / scipy / pandas members
-are positionally sliced. An in-memory `X` — including the default, non-backed
-`to_anndata()` — goes to anndata's own `_inplace_subset_obs` /
-`_inplace_subset_var` instead, which materializes every lazy bridge and drops
-unused categorical levels.
+`filter_cells`, `filter_genes`, `subset_obs`, `subset_var`, and
+`highly_variable_genes(subset=True)` subset one axis of the AnnData in place.
+**anndata performs the subset** — pyscx only makes a backed `X` subsettable and
+keeps its lazy mappings off disk — so `obs`, `var`, `uns`, `raw`, unused
+categorical levels and every aligned member (`layers`, `obsm`, `obsp` on the obs
+axis; `layers`, `varm`, `varp` on the var axis) behave exactly as on an in-memory
+AnnData, and a failure part-way leaves the object untouched.
 
-> [!NOTE]
-> **`adata.raw` is the one exception on the backed path.** It is obs-aligned, but a
-> backed `filter_cells` / `subset_obs` leaves it at the original row count. Set
-> `adata.raw = None` before filtering, or re-derive it. The in-memory route keeps it
-> aligned because anndata does. Full table in
-> [docs/api.md § Axis subsetting and aligned members](api.md#axis-subsetting-and-aligned-members).
+What stays SCX-specific is what you would lose otherwise: the matrix is never
+materialized (`type(adata.X)` is unchanged by a filter), and a backed `obsp` /
+`varp` / `varm` is never pulled off disk — the subset is recorded and applied on
+first read, so `filter_cells` on a file carrying a kNN graph costs nothing extra
+unless you read `obsp`.
+
+Plain anndata indexing works on a backed `X` too: `adata[:, mask]` is a lazy view,
+`adata[mask].copy()` subsets and materializes, `adata[mask].to_memory()` gives a
+fully in-memory AnnData. Full table in
+[docs/api.md § Axis subsetting and aligned members](api.md#axis-subsetting-and-aligned-members).
 
 On a **lazy** `X` with an active column projection, `filter_cells` thresholds the
 visible-gene totals — the same numbers `adata.obs["total_counts"]` and
@@ -1403,7 +1403,8 @@ visible-gene totals — the same numbers `adata.obs["total_counts"]` and
 | `log1p`                  | ✓   | ✓   | —                                                                     | `device`                                       |
 | `filter_cells`           | ✓   | —   | `min_genes`, `max_genes`, `min_counts`, `max_counts`                  | —                                              |
 | `filter_genes`           | ✓   | —   | `min_cells`, `max_cells`, `min_counts`, `max_counts`                  | —                                              |
-| `subset_obs`             | ✓   | —   | — (no direct scanpy equivalent)                                      | `mask_or_indices`                              |
+| `subset_obs`             | ✓   | —   | — (`adata[mask].copy()`, without materializing)                       | `mask_or_indices`                              |
+| `subset_var`             | ✓   | —   | — (`adata[:, mask].copy()`, without materializing)                    | `mask_or_indices`                              |
 | `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`                                         | `prefer_format`                                |
 | `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
 | `score_genes`            | ✓   | —   | `gene_list`, `ctrl_size`, `gene_pool`, `n_bins`, `score_name`, `random_state` | `method`, `layer`, `device`           |

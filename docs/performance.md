@@ -638,9 +638,83 @@ silently re-split it.
 per-call bookkeeping over the aligned members — no matrix work and no I/O — and the
 decode-pass counts above are unchanged, which `test_qc_metrics_fused.py`'s
 `cpu_profile_snapshot()` test pins. Lazy `obsp` / `varp` / `varm` entries are not decoded
-by a subset at all; the subset is recorded and applied if and when the key is read. No
-wall-clock figures are quoted here because no capture backing them is checked in — see
+by a subset at all; the subset is recorded and applied if and when the key is read.
+
+### Axis subsetting — what delegating to anndata costs (Phase-4 task 4.0b)
+
+Task 4.0b stopped reimplementing anndata's axis bookkeeping: `filter_cells`,
+`filter_genes`, `subset_obs`, `subset_var` and HVG `subset=True` now let **anndata**
+perform the subset, so `obs` / `var` / `uns` / `raw` / unused categorical levels /
+every aligned member behave exactly as they do in scanpy, and the operation is atomic.
+The cost is that anndata builds a whole replacement `AnnData` and swaps it in
+(`_mutated_copy` deep-copies `uns` and copies `obs` / `var` / every non-handle aligned
+member), so for a moment both the old and new frames are live. This capture answers the
+two questions that raises: does the matrix still stay on disk, and what does the rebuild
+cost at census scale?
+
+Measured on one `cpu`-partition host (24 cores, `RAYON_NUM_THREADS=24`), `--release`,
+both arms built from isolated git worktrees of the two commits (`59783883` = 4.0a /
+hand-rolled, `adfe70fc` = 4.0b / delegated), SLURM job 2707573, 3 runs each, median wall
+/ max peak RSS
+(`benchmarks/scripts/_run_4_0b_axis_subset_rss.sh`, which drives
+`profile_cpu_stages_backed.py --ops filter_cells filter_genes_real subset_obs`,
+`SCX_CPU_PROFILE=1`). Both arms report `git_dirty` — the current profile script is copied
+into both worktrees so the harness is identical, since the ops did not exist at the
+"before" commit; that is a benchmark-only change, per
 [docs/benchmark_manifest.md](benchmark_manifest.md).
+
+`subset_obs` is the isolated probe: a fixed 50 % mask, no threshold scan, **0 shard
+decodes**, so its wall and RSS are open + rebuild and nothing else. The two filters are
+the realistic ops, where a full streaming scan dominates.
+
+| Dataset | op | kept obs/vars | wall before | wall after | Δ | peak RSS before → after |
+|---|---|:-:|--:|--:|--:|--:|
+| pbmc10k (12K) | `subset_obs` | 0.50/1.00 | 18 ms | 24 ms | +30 % | 692 → 696 MB |
+| smartseq2 (18K) | `subset_obs` | 0.50/1.00 | 112 ms | 156 ms | +39 % | 1051 → 1070 MB |
+| tabula_sapiens_100k | `subset_obs` | 0.50/1.00 | 160 ms | 212 ms | +32 % | 1061 → 1083 MB |
+| census_500k | `subset_obs` | 0.50/1.00 | 0.97 s | 1.23 s | +27 % | 1878 → 1993 MB |
+| census_1m | `subset_obs` | 0.50/1.00 | 1.69 s | 2.19 s | +30 % | 3938 → 4088 MB |
+| pbmc10k | `filter_cells` | 0.98/1.00 | 371 ms | 382 ms | +3.0 % | 692 → 690 MB |
+| smartseq2 | `filter_cells` | 1.00/1.00 | 1.81 s | 1.94 s | +7.3 % | 1035 → 1042 MB |
+| tabula_sapiens_100k | `filter_cells` | 1.00/1.00 | 2.28 s | 2.27 s | −0.6 % | 1061 → 1083 MB |
+| census_500k | `filter_cells` | 0.98/1.00 | 8.64 s | 9.28 s | +7.5 % | 1715 → 1752 MB |
+| census_1m | `filter_cells` | 0.99/1.00 | 16.63 s | 17.36 s | +4.4 % | 3829 → 3899 MB |
+| pbmc10k | `filter_genes` | 1.00/0.61 | 391 ms | 406 ms | +3.9 % | 692 → 696 MB |
+| smartseq2 | `filter_genes` | 1.00/0.95 | 1.93 s | 2.04 s | +6.0 % | 1051 → 1070 MB |
+| tabula_sapiens_100k | `filter_genes` | 1.00/0.41 | 2.41 s | 2.54 s | +5.4 % | 1061 → 1083 MB |
+| census_500k | `filter_genes` | 1.00/0.59 | 9.32 s | 9.79 s | +5.1 % | 1847 → 1915 MB |
+| census_1m | `filter_genes` | 1.00/0.64 | 17.46 s | 17.90 s | +2.5 % | 3935 → 4046 MB |
+
+`filter_genes` here is `min_cells=3` (scanpy's canonical default), not the permissive
+`min_cells=1, min_counts=1.0` of the 4.1 table above — that one exists to time the *scan*
+and its cut is incidental. The `kept` column is reported for every row precisely because
+a subset that keeps everything is now correctly skipped, and would otherwise read as a
+speedup: `filter_cells(min_genes=200)` is a no-op on smartseq2 and tabula_sapiens_100k,
+and those two rows measure only the threshold scan.
+
+**The matrix never materialises.** census_1m is 1,000,000 × 61,497 with 1.40 G nonzeros;
+a materialised scipy CSR (f32 data + i32 indices, 8 B/nnz) is **~10.4 GiB**. The process
+high-water across the whole four-op sequence is **4.0 GiB** — and that figure is
+dominated by the obs frame and the decode buffers, not by `X`, which stays a projection
+update on a handle. `test_in_place_ops_keep_x_lazy` pins the property itself
+(`type(adata.X)` is unchanged by every in-place op), and
+`test_in_place_ops_do_not_decode_the_lazy_bridges` pins that a subset never pulls
+`varm` / `obsp` / `varp` off disk.
+
+**What the rebuild costs.** ~0.5 s and ~150 MB at 1M cells, which is +30 % on the
+isolated probe and **+2.5 % to +7.5 % on the realistic ops**, where the streaming scan —
+77–91 % of wall in the decode bucket — dominates. The RSS delta is the transient second copy of `obs` and the
+aligned members; it does not scale with nnz. Peak RSS here is a process high-water mark
+(`ru_maxrss`) over an identical op sequence in both arms, so the per-row deltas are
+comparable but the absolute values accumulate across the ops above them in the table.
+
+That regression buys correctness that the hand-rolled path could not reach: `adata.raw`
+follows an obs subset, unused categorical levels drop, a failure part-way leaves the
+object untouched, and members nobody enumerated are handled by construction. It also
+removes a silent pessimisation in the other direction — a filter that keeps every element
+no longer installs an identity deletion vector, which used to close the CSC capability
+gate and permanently downgrade the `gpu_csc_v3` CSC-direct DE route on a file that was
+never really filtered.
 
 ### Differential expression (CPU, full-matrix)
 

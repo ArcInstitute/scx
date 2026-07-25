@@ -23,10 +23,38 @@ def scx_path():
     yield path
     shutil.rmtree(tmpdir, ignore_errors=True)
 
+# The fixture's least-detected gene appears in 21 of 100 cells and its sparsest
+# cell carries 7 genes, so the original `min_cells=3` / `min_genes=1` kept
+# everything. That was still exercising an identity projection until
+# `filter_genes` / `filter_cells` learned to skip an all-kept mask outright — at
+# which point this whole file, whose subject *is* the column projection, stopped
+# having one. Thresholds now cut roughly half, and the helpers assert it.
+MIN_CELLS = 30
+MIN_GENES = 15
+
+
+def _filter_genes(adata, min_cells=MIN_CELLS):
+    before = adata.n_vars
+    pyscx.accel.filter_genes(adata, min_cells=min_cells)
+    assert 0 < adata.n_vars < before, (
+        f"min_cells={min_cells} kept {adata.n_vars}/{before} genes — this file "
+        "tests the column projection, so the filter has to create one"
+    )
+
+
+def _filter_cells(adata):
+    before = adata.n_obs
+    pyscx.accel.filter_cells(adata, min_genes=MIN_GENES)
+    assert 0 < adata.n_obs < before, (
+        f"min_genes={MIN_GENES} kept {adata.n_obs}/{before} cells — the "
+        "deletion-vector premise needs an actual cut"
+    )
+
+
 def test_sum_axis0_with_col_projection(scx_path):
     adata = pyscx.open(scx_path).to_anndata(backed=True)
     pyscx.accel.normalize_total(adata)
-    pyscx.accel.filter_genes(adata, min_cells=3)
+    _filter_genes(adata)
     n_proj = adata.X.shape[1]
     result = adata.X.sum(axis=0)
     assert np.asarray(result).shape == (1, n_proj)
@@ -36,7 +64,7 @@ def test_sum_axis0_with_col_projection(scx_path):
 def test_mean_axis0_with_col_projection(scx_path):
     adata = pyscx.open(scx_path).to_anndata(backed=True)
     pyscx.accel.normalize_total(adata)
-    pyscx.accel.filter_genes(adata, min_cells=3)
+    _filter_genes(adata)
     n_proj = adata.X.shape[1]
     result = adata.X.mean(axis=0)
     assert np.asarray(result).shape == (1, n_proj)
@@ -46,7 +74,7 @@ def test_mean_axis0_with_col_projection(scx_path):
 def test_var_axis0_with_col_projection(scx_path):
     adata = pyscx.open(scx_path).to_anndata(backed=True)
     pyscx.accel.normalize_total(adata)
-    pyscx.accel.filter_genes(adata, min_cells=3)
+    _filter_genes(adata)
     n_proj = adata.X.shape[1]
     result = adata.X.var(axis=0)
     assert np.asarray(result).shape == (1, n_proj)
@@ -57,8 +85,11 @@ def test_var_axis0_with_col_projection(scx_path):
 def test_both_deletion_and_col_projection(scx_path):
     adata = pyscx.open(scx_path).to_anndata(backed=True)
     pyscx.accel.normalize_total(adata)
-    pyscx.accel.filter_cells(adata, min_genes=1)
-    pyscx.accel.filter_genes(adata, min_cells=3)
+    _filter_cells(adata)
+    # The cell cut already removed 45 % of the rows, so per-gene detection
+    # counts here run 14–24 rather than 21–40 — MIN_CELLS would take the width
+    # to zero, and anything below 15 would keep all 50.
+    _filter_genes(adata, min_cells=20)
     n_obs, n_proj = adata.X.shape
     for method in ["sum", "mean", "var"]:
         r = getattr(adata.X, method)(axis=0)

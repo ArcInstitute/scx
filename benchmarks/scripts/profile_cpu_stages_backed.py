@@ -34,8 +34,36 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from benchmarks.comprehensive.bench_env import DATA_DIR  # noqa: E402
 from benchmarks.comprehensive.results import BenchmarkResult, write_result  # noqa: E402
 
-OPS = ("pca", "hvg", "normalize", "qc", "filter_genes")
+OPS = (
+    "pca",
+    "hvg",
+    "normalize",
+    "qc",
+    "filter_genes",
+    "filter_cells",
+    "filter_genes_real",
+    "subset_obs",
+)
 BENCHMARK = "accel_cpu_profile_backed"
+
+# `filter_cells` / `filter_genes_real` / `subset_obs` were added for the Phase-4
+# task 4.0b capture, where the question is not "how fast is the scan" but "what
+# does the axis subset itself cost". 4.0b hands the subset to anndata, which
+# builds a whole replacement AnnData (`_mutated_copy` deep-copies `uns` and
+# copies `obs` / `var` / every non-handle aligned member) and swaps it in — so
+# both the old and the new frames are live at once. At census scale that
+# transient is the thing worth measuring, and `subset_obs` isolates it: a fixed
+# mask, no threshold scan, so wall and peak RSS are open + rebuild and nothing
+# else.
+#
+# The pre-existing `filter_genes` thresholds (`min_cells=1, min_counts=1.0`) are
+# deliberately permissive — 4.1 wanted the *scan*, not the cut — which means
+# they may keep every gene. That is fine for 4.1's pass-count question but makes
+# them useless for 4.0b's, because a subset that keeps everything is now
+# correctly skipped. `filter_genes_real` uses scanpy's canonical `min_cells=3`
+# so the cut actually happens. Every op records `kept_frac_*` in `extra`, so a
+# no-op cut is visible in the capture rather than being read as a speedup.
+SUBSET_OBS_STRIDE = 2  # keep every other cell
 
 # Gene subsets for the `qc` op. Three qc_vars is the common analyst call
 # (`["mt", "ribo", "hb"]`); before the Phase-4.1 fusion each one cost its own
@@ -52,12 +80,27 @@ def _scx_path(dataset: str) -> Path:
     return DATA_DIR / f"{dataset}_auto.scx"
 
 
-def _run_op(op: str, scx_path: Path, n_comps: int) -> None:
-    """Open backed and run one accelerator op over the streaming shard source."""
+def _run_op(op: str, scx_path: Path, n_comps: int) -> dict[str, float]:
+    """Open backed and run one accelerator op over the streaming shard source.
+
+    Returns the shape before / after the op, so a capture can prove the op did
+    the work it claims — an axis subset that kept every element is a no-op, and
+    would otherwise read as a speedup.
+    """
+    import numpy as np
     import pyscx
 
     adata = pyscx.open(str(scx_path)).to_anndata(backed=True)
-    if op == "pca":
+    n_obs0, n_vars0 = adata.n_obs, adata.n_vars
+    if op == "filter_cells":
+        # scanpy's canonical default; drops a real fraction of real data.
+        pyscx.accel.filter_cells(adata, min_genes=200)
+    elif op == "filter_genes_real":
+        pyscx.accel.filter_genes(adata, min_cells=3)
+    elif op == "subset_obs":
+        keep = (np.arange(n_obs0) % SUBSET_OBS_STRIDE) == 0
+        pyscx.accel.subset_obs(adata, keep)
+    elif op == "pca":
         pyscx.accel.pca(adata, n_comps=n_comps, device="cpu")
     elif op == "hvg":
         pyscx.accel.highly_variable_genes(
@@ -75,6 +118,14 @@ def _run_op(op: str, scx_path: Path, n_comps: int) -> None:
         pyscx.accel.filter_genes(adata, min_cells=1, min_counts=1.0)
     else:
         raise ValueError(op)
+    return {
+        "n_obs_before": float(n_obs0),
+        "n_vars_before": float(n_vars0),
+        "n_obs_after": float(adata.n_obs),
+        "n_vars_after": float(adata.n_vars),
+        "kept_frac_obs": adata.n_obs / n_obs0 if n_obs0 else 1.0,
+        "kept_frac_vars": adata.n_vars / n_vars0 if n_vars0 else 1.0,
+    }
 
 
 def _assign_qc_masks(adata) -> None:
@@ -130,9 +181,10 @@ def capture(dataset: str, op: str, n_runs: int, n_comps: int) -> BenchmarkResult
         pyscx.accel.cpu_profile_reset()
         rss0 = _peak_rss_mb()
         t0 = time.perf_counter()
-        _run_op(op, scx_path, n_comps)
+        shape = _run_op(op, scx_path, n_comps)
         wall = time.perf_counter() - t0
         extra = _snapshot_flat()
+        extra.update(shape)
         result.add_run(wall_s=wall, peak_rss_mb=max(rss0, _peak_rss_mb()), **extra)
 
     write_result(result)
@@ -159,7 +211,13 @@ def _fmt_row(dataset: str, op: str, r: BenchmarkResult) -> str:
     n_dec = med("cpu_profile_decode_scx1_count") + med("cpu_profile_decode_generic_count")
     tot = io + dec + red + mar
     frac = f"{tot / wall_ms:.0%}" if wall_ms else "n/a"
-    return (f"| {dataset} | {op} | {wall_ms:.1f} | {io:.1f} | {dec:.1f} | "
+    # `ru_maxrss` is a process high-water mark, so take the max across runs —
+    # the same convention the 4.1 capture used.
+    peak = max((run.peak_rss_mb or 0.0) for run in r.runs) if r.runs else 0.0
+    # Kept fraction makes a no-op cut visible: a subset that keeps everything is
+    # correctly skipped, and would otherwise read as a speedup.
+    kept = f"{med('kept_frac_obs'):.2f}/{med('kept_frac_vars'):.2f}"
+    return (f"| {dataset} | {op} | {wall_ms:.1f} | {peak:.0f} | {kept} | {io:.1f} | {dec:.1f} | "
             f"{red:.1f} | {mar:.1f} | {n_dec:.0f} | {frac} |")
 
 
@@ -184,9 +242,9 @@ def main() -> int:
             if r is not None:
                 rows.append(_fmt_row(dataset, op, r))
 
-    print("\n| dataset | op | wall_ms | io_ms | decode_ms | reduction_ms | "
-          "marshalling_ms | n_decodes | Σ/wall |")
-    print("|---|---|--:|--:|--:|--:|--:|--:|--:|")
+    print("\n| dataset | op | wall_ms | peak_rss_mb | kept obs/vars | io_ms | decode_ms | "
+          "reduction_ms | marshalling_ms | n_decodes | Σ/wall |")
+    print("|---|---|--:|--:|:-:|--:|--:|--:|--:|--:|--:|")
     for row in rows:
         print(row)
     return 0

@@ -138,11 +138,41 @@ def test_csc_disabled_after_filter_cells(small_adata, tmp_path):
     pyscx.from_anndata(small_adata, str(path), csc="always", csc_cols_per_shard=4)
 
     adata = pyscx.open(str(path)).to_anndata(backed=True)
-    # Force a row deletion vector by filtering cells.
-    pyscx.accel.filter_cells(adata, min_counts=1)
+    # Force a row deletion vector by filtering cells. The threshold has to
+    # actually drop one: a filter that keeps every cell is a no-op (see
+    # `test_no_op_filter_cells_keeps_csc`).
+    threshold = float(np.median(np.asarray(adata.X.to_memory().sum(axis=1)).ravel()))
+    pyscx.accel.filter_cells(adata, min_counts=threshold)
+    assert adata.n_obs < small_adata.n_obs, "fixture must actually drop cells"
     # CSC dispatch must raise — `kept_to_global` is now active.
     with pytest.raises(RuntimeError, match="CSC|deletion"):
         pyscx.accel.col_sums(adata.X, prefer_format="csc")
+
+
+def test_no_op_filter_cells_keeps_csc(small_adata, tmp_path):
+    """A filter that drops nothing must not cost the CSC sidecar.
+
+    `filter_cells` used to install a `kept_to_global` unconditionally, and any
+    `kept_to_global` — even the identity one — closes the CSC capability gate
+    (`as_column_source` returns `None`). So a threshold every cell cleared
+    permanently downgraded the file's `gpu_csc_v3` CSC-direct DE route, with
+    nothing in the data to explain why.
+    """
+    import pyscx
+
+    path = tmp_path / "with_csc.scx"
+    pyscx.from_anndata(small_adata, str(path), csc="always", csc_cols_per_shard=4)
+
+    adata = pyscx.open(str(path)).to_anndata(backed=True)
+    before = pyscx.accel.col_sums(adata.X, prefer_format="csc")
+
+    # Every cell has at least one count, so this keeps all 30.
+    pyscx.accel.filter_cells(adata, min_counts=1)
+    assert adata.n_obs == small_adata.n_obs
+
+    np.testing.assert_allclose(
+        pyscx.accel.col_sums(adata.X, prefer_format="csc"), before, rtol=0
+    )
 
 
 # ---------------------------------------------------------------------------

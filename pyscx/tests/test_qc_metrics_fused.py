@@ -60,12 +60,27 @@ def multishard_path(fused_adata, tmp_dir):
     return path
 
 
+# The fixture's smallest row sum is ~6365, so the original 4000 kept every one
+# of the 240 cells. That was harmless until `filter_cells` learned to skip an
+# all-kept mask entirely (a no-op filter used to install an identity
+# `kept_to_global`, permanently closing the CSC capability gate): from then on
+# the four `*deleted*` cases below collapsed onto their non-deleted twins and
+# the deletion-aware fused kernels stopped being exercised at all. Above the
+# median (~10639) so the cut is unambiguous, and `_open` asserts it happened.
+DROP_CELLS_MIN_COUNTS = 10_000
+
+
 def _open(path, *, project=None, drop_cells=None, normalize=False):
     import pyscx
 
     adata = pyscx.open(path).to_anndata(backed=True)
     if drop_cells is not None:
+        before = adata.n_obs
         pyscx.accel.filter_cells(adata, min_counts=drop_cells)
+        assert 0 < adata.n_obs < before, (
+            f"min_counts={drop_cells} kept {adata.n_obs}/{before} cells — the "
+            "deletion-vector cases need an actual cut to mean anything"
+        )
     if project is not None:
         adata.X.set_col_projection([int(c) for c in project])
         adata._var = adata.var.iloc[project].copy()
@@ -79,14 +94,14 @@ PROJECTION = [3, 7, 11, 19, 23, 31, 44, 51, 58]
 CASES = {
     "plain": {},
     "projected": {"project": PROJECTION},
-    "deleted": {"drop_cells": 4000},
-    "projected+deleted": {"project": PROJECTION, "drop_cells": 4000},
+    "deleted": {"drop_cells": DROP_CELLS_MIN_COUNTS},
+    "projected+deleted": {"project": PROJECTION, "drop_cells": DROP_CELLS_MIN_COUNTS},
     "lazy": {"normalize": True},
-    "lazy+deleted": {"drop_cells": 4000, "normalize": True},
+    "lazy+deleted": {"drop_cells": DROP_CELLS_MIN_COUNTS, "normalize": True},
     "lazy+projected": {"project": PROJECTION, "normalize": True},
     "lazy+projected+deleted": {
         "project": PROJECTION,
-        "drop_cells": 4000,
+        "drop_cells": DROP_CELLS_MIN_COUNTS,
         "normalize": True,
     },
 }
@@ -335,7 +350,12 @@ _DECODE_PROBE = textwrap.dedent(
     adata = pyscx.open(path).to_anndata(backed=True)
     n_shards = adata.X.n_shards if hasattr(adata.X, "n_shards") else None
     if "deleted" in case:
-        pyscx.accel.filter_cells(adata, min_counts=4000)
+        # Must match DROP_CELLS_MIN_COUNTS above — a threshold that keeps every
+        # cell is skipped outright, so the deleted cases would silently become
+        # duplicates of the plain ones.
+        before = adata.n_obs
+        pyscx.accel.filter_cells(adata, min_counts=10_000)
+        assert 0 < adata.n_obs < before, "deleted case kept every cell"
     if "projected" in case:
         cols = [3, 7, 11, 19, 23, 31, 44, 51, 58]
         adata.X.set_col_projection(cols)
