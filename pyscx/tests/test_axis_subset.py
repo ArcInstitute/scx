@@ -209,7 +209,8 @@ def test_non_scx_members_are_sliced_not_skipped(scx_path, source):
         index=adata.obs_names,
     )
     adata.obsm["frame"] = frame
-    adata.obsm["plain"] = np.arange(N_OBS * 2, dtype=np.float32).reshape(N_OBS, 2)
+    plain = np.arange(N_OBS * 2, dtype=np.float32).reshape(N_OBS, 2)
+    adata.obsm["plain"] = plain
 
     obs_keep = np.arange(N_OBS) % 5 != 0
     pyscx.accel.subset_obs(adata, obs_keep)
@@ -217,8 +218,38 @@ def test_non_scx_members_are_sliced_not_skipped(scx_path, source):
 
     assert_allclose(_as_dense(adata.layers["inmem"]), dense_layer[o], rtol=0)
     assert_array_equal(np.asarray(adata.obsm["frame"]["score"]), o.astype(float))
-    assert_allclose(_as_dense(adata.obsm["plain"]), np.asarray(adata.obsm["plain"]))
-    assert adata.obsm["plain"].shape == (len(o), 2)
+    assert_allclose(_as_dense(adata.obsm["plain"]), plain[o], rtol=0)
+
+
+def test_backed_obsm_handle_composes_without_gathering(scx_path, source):
+    """The backed obsm handle absorbs the subset instead of materializing.
+
+    Only `to_anndata(backed=True, obsm=[...])` produces `ScxBackedObsmDataset`
+    — the default backed path loads obsm eagerly as numpy — so without this arm
+    `ScxBackedObsmDataset::set_kept_to_global` would be uncovered, and 4.0b
+    could break the handle path unnoticed. Two subsets, so the composition is
+    exercised rather than just the first assignment.
+    """
+    import pyscx
+
+    adata = pyscx.open(scx_path).to_anndata(backed=True, obsm=["X_emb"])
+    handle = adata.obsm["X_emb"]
+    assert type(handle).__name__ == "ScxBackedObsmDataset", (
+        f"fixture must yield the backed handle, got {type(handle).__name__}"
+    )
+
+    first = np.arange(N_OBS) % 3 != 0
+    pyscx.accel.subset_obs(adata, first)
+    # Still a lazy handle — the subset must not have gathered it into an array.
+    assert type(adata.obsm["X_emb"]).__name__ == "ScxBackedObsmDataset"
+    assert_allclose(_as_dense(adata.obsm["X_emb"][:]), source["obsm"][first], rtol=1e-6)
+
+    second = np.arange(first.sum()) % 2 == 0
+    pyscx.accel.subset_obs(adata, second)
+    expected = source["obsm"][first][second]
+    assert type(adata.obsm["X_emb"]).__name__ == "ScxBackedObsmDataset"
+    assert_allclose(_as_dense(adata.obsm["X_emb"][:]), expected, rtol=1e-6)
+    assert adata.obsm["X_emb"].shape == expected.shape
 
 
 def test_in_memory_anndata_goes_through_anndata(source):

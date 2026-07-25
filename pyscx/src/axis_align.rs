@@ -19,6 +19,16 @@
 //! that one body with anndata's own `_inplace_subset_var` / `_inplace_subset_obs`
 //! once the SCX handles register `as_view` / `_subset`, and no call site has to
 //! change.
+//!
+//! # What this does *not* give you
+//!
+//! Atomicity. `X` and `_obs` / `_var` move before the members do, so a member
+//! that raises part-way leaves the object half-subset. That is strictly better
+//! than the failure it replaces — where validation-on-read made the repair
+//! *unreachable*, so the half-subset state was the only reachable one — but it
+//! is not a transaction. Ending the class properly is 4.0b's job: once anndata
+//! owns the subset it builds a new object and swaps it in, and a raise leaves
+//! the original untouched.
 
 use std::sync::Arc;
 
@@ -516,6 +526,29 @@ impl PendingSubsets {
 }
 
 /// Record a subset on a lazy mapping: slice what is already cached, defer the rest.
+///
+/// # Ordering is load-bearing
+///
+/// The push and the cache snapshot must happen **before** any Python call, and
+/// in that order. The slicing loop below runs arbitrary Python (`__getitem__` on
+/// numpy / scipy / pandas), and numpy releases the GIL for large copies — so
+/// another thread can run [`PendingSubsets::apply`] via `fetch` partway through
+/// this function. Given that:
+///
+/// * **Push after the loop** (the obvious order) loses the subset entirely: a
+///   concurrent `fetch` of a not-yet-cached key applies a `pending` that does
+///   not contain this subset, caches the result, and — because it is now cached
+///   — never consults `pending` again. Silently un-subset, permanently.
+/// * **Push before the snapshot**, with no Python call between them, closes it.
+///   A concurrent `fetch` either has not inserted yet (so it will apply this
+///   subset itself on decode) or inserted before the push (so the snapshot sees
+///   it and slices it here). It cannot land in between, because `push` and the
+///   snapshot are pure Rust — `clone_ref` is an incref, not a Python call — so
+///   the GIL cannot be released between them.
+///
+/// The double-apply that the reverse order would risk is not recoverable
+/// either: these selections are positional, so applying one twice is not a
+/// no-op.
 pub(crate) fn apply_subset_to_lazy_mapping(
     py: Python<'_>,
     state: &std::sync::Mutex<std::collections::HashMap<String, Option<Py<PyAny>>>>,
@@ -523,6 +556,10 @@ pub(crate) fn apply_subset_to_lazy_mapping(
     axes: ValueAxes,
     sel: AxisSelection,
 ) -> PyResult<()> {
+    // Un-fetched keys get it on decode — nothing reads from disk here. Must
+    // precede the snapshot; see the ordering note above.
+    pending.push(axes, sel.clone());
+
     // Cached entries have already been decoded (and already had any earlier
     // pending subsets applied), so they take this one now.
     let cached: Vec<(String, Py<PyAny>)> = {
@@ -544,7 +581,5 @@ pub(crate) fn apply_subset_to_lazy_mapping(
             state.insert(key, Some(obj));
         }
     }
-    // Un-fetched keys get it on decode — nothing reads from disk here.
-    pending.push(axes, sel);
     Ok(())
 }
