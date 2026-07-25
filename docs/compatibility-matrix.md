@@ -72,23 +72,29 @@ declared bounds.
 
 ## Private anndata APIs pyscx depends on
 
-Axis subsetting on a backed / lazy `X` cannot go through anndata's public
-surface — reading an aligned mapping validates it, which raises the moment `X`
-changes width — so `pyscx.accel.filter_cells` / `filter_genes` / `subset_obs`
-and `highly_variable_genes(subset=True)` reach the raw stores directly. The
-names below are private and unversioned; a rename inside the declared bound
-would surface as an `AttributeError` from inside a user's `filter_cells`.
-Verified byte-identical across `0.11.4` / `0.12.10` / `0.12.16`.
+`pyscx.accel.filter_cells` / `filter_genes` / `subset_obs` / `subset_var` and
+`highly_variable_genes(subset=True)` let **anndata** perform the axis subset, so
+that `obs` / `var` / `uns` / `raw` / categoricals / every aligned member behave
+exactly as they do in scanpy. Making that possible on a backed `X` means
+registering with three private `singledispatch` hooks and driving two private
+`AnnData` methods. The names below are private and unversioned; a rename inside
+the declared bound would surface as an `AttributeError` or a
+`NotImplementedError` from inside a user's `filter_genes`.
 
 | Name | Used for |
 |---|---|
-| `AnnData._obs`, `._var` | Slice the axis frames without the public setter's length check |
-| `AnnData._layers`, `._obsm`, `._varm`, `._obsp`, `._varp` | Reach aligned members without triggering read-time validation |
+| `anndata._core.views.as_view` | Register SCX handles as their own view type — a handle is already a lazy window |
+| `anndata._core.index._subset` | Register a lazy clone with the row/column window composed, so a subset never materializes |
+| `anndata._core.file_backing.to_memory` | Register `handle.to_memory()`, so `AnnData.to_memory()` reaches inside |
+| `AnnData._mutated_copy`, `._init_as_actual` | Build the subset object and swap it in, substituting the un-copied `view.X` for `AnnData.copy()`'s materializing `.copy()` |
 | `AnnData._inplace_subset_obs`, `._inplace_subset_var` | Delegate the whole subset for an in-memory `X` |
+| `AnnData._layers`, `._obsm`, `._varm`, `._obsp`, `._varp` | Detach the lazy mapping bridges for the duration of the subset, so reading them cannot decode a section off disk |
 
-A compat test that fails loudly on upgrade is deferred to the structural
-follow-up (Phase 4.0b), which replaces these with registered `as_view` /
-`_subset` hooks.
+`pyscx/tests/test_anndata_hooks_compat.py` asserts every name above resolves,
+that each hook is still a `singledispatch` with all four SCX handle classes
+registered, and that `AnnData.X` on a view still resolves through `_subset`
+without copying — one assertion per name, so an upgrade names its casualty.
+Verified across `0.11.4` / `0.12.10` / `0.12.16`.
 
 ## Known incompatibilities
 

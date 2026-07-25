@@ -1,40 +1,42 @@
-//! Keeping AnnData's aligned members in step with an in-place axis subset.
+//! In-place axis subsetting — anndata's job, plus the one part it can't do.
 //!
-//! # Why this is not just `adata.layers[k] = adata.layers[k][:, keep]`
+//! # anndata owns the subset
 //!
-//! anndata validates an aligned mapping **when the attribute is read**
-//! (`AlignedMappingProperty.__get__` → `construct` → `_validate_value`), and it
-//! validates *every* entry, not the one being written. So the instant the axis
-//! shrinks, `adata.layers` and `adata.obsm` can no longer be *read* — the stale
-//! entries make the read itself raise — and repair code that goes through the
-//! public property can never run. No ordering escapes it: repair the members
-//! first and they fail against the old shape, repair the axis first and they
-//! fail against the new one.
+//! `sc.pp.filter_genes` *is* `adata._inplace_subset_var(mask)`. SCX only ever
+//! reimplemented that because a backed `X` could not be materialized; once the
+//! handles register `as_view` / `_subset` (see [`crate::anndata_hooks`]) they
+//! are subsettable, and anndata's own machinery — which builds a fresh
+//! `AnnData` and swaps it in — handles `obs`, `var`, `uns`, unused categorical
+//! levels, `raw`, and every aligned member, including ones nobody here
+//! enumerated. A raise leaves the original untouched.
 //!
-//! Note the trigger is `_obs` / `_var`, not `X`: `n_obs` and `n_vars` are
-//! `len(obs_names)` / `len(var_names)`, and `_validate_value` compares against
-//! `parent.shape[axis]`. Shrinking `X` alone leaves all five property reads
-//! working.
+//! The one substitution is `.copy()`: `AnnData.copy()` materializes an SCX
+//! handle *by design* (`adata[mask].copy()` is the documented "subset, then
+//! materialize" workflow), so [`rebuild_via_anndata`] goes through
+//! `view._mutated_copy(X=view.X, …)` — the same object graph anndata would
+//! build, minus the materialization.
 //!
-//! The raw stores (`adata._layers`, `_obsm`, `_varm`, `_obsp`, `_varp`) are
-//! plain dicts — or, for a backed AnnData, one of the [`crate::lazy_mapping`]
-//! bridges. Neither validates, so [`subset_axis`] works there and ordering
-//! stops mattering.
+//! # The one part it can't do: the lazy bridges
 //!
-//! Everything funnels through [`subset_axis`] deliberately: Phase 4.0b replaces
-//! that one body with anndata's own `_inplace_subset_var` / `_inplace_subset_obs`
-//! once the SCX handles register `as_view` / `_subset`, and no call site has to
-//! change.
+//! `_varm` / `_obsp` / `_varp` — and `_layers` / `_obsm` on some open paths —
+//! are [`crate::lazy_mapping`] bridges that decode a section only on first key
+//! access. anndata cannot see through that: `AnnData.copy()` reads
+//! `self.varm` / `obsp` / `varp`, and `AlignedMappingProperty.__get__` →
+//! `AlignedActual.__init__` runs `_validate_value` over *every* entry, which
+//! forces a decode. Measured: one `adata[:, mask].copy()` takes `_obsp` from
+//! `0 materialized` to `1 materialized`. On a census-scale file carrying a kNN
+//! graph that is a full `n_obs × n_obs` read nobody asked for.
 //!
-//! # What this does *not* give you
+//! So the bridges are detached for the duration of anndata's subset and
+//! re-attached with the selection *recorded* on [`PendingSubsets`], which
+//! applies it at decode time. The alternative — lazy per-key value handles, so
+//! a bridge could satisfy `_validate_value` without decoding — would change
+//! what `adata.obsp[k]` returns, and scanpy consumers expect scipy.
 //!
-//! Atomicity. `X` and `_obs` / `_var` move before the members do, so a member
-//! that raises part-way leaves the object half-subset. That is strictly better
-//! than the failure it replaces — where validation-on-read made the repair
-//! *unreachable*, so the half-subset state was the only reachable one — but it
-//! is not a transaction. Ending the class properly is 4.0b's job: once anndata
-//! owns the subset it builds a new object and swaps it in, and a raise leaves
-//! the original untouched.
+//! The selection handed to a bridge is read back off `adata.X` *after* the
+//! subset, so a bridge's window is composed from the same `kept_to_global` /
+//! `col_projection` X ended up with rather than a parallel computation that
+//! could drift from it.
 
 use std::sync::Arc;
 
@@ -115,6 +117,10 @@ impl AxisSelection {
     }
 }
 
+/// Every raw aligned store, regardless of axis. `_mutated_copy` reads all of
+/// them on any subset, so all of them have to be shielded from it.
+const ALL_ALIGNED_STORES: [&str; 5] = ["_layers", "_obsm", "_varm", "_obsp", "_varp"];
+
 /// The five aligned stores, and how each parent axis reaches them.
 ///
 /// Returned as `(raw attribute name, which axes of the value to subset)`. The
@@ -138,253 +144,221 @@ fn aligned_stores(axis: Axis) -> &'static [(&'static str, ValueAxes)] {
 /// Subset the **obs** axis of `adata` in place against a visible-space mask.
 ///
 /// The single entry point for every obs-axis mutation — `filter_cells`,
-/// `subset_obs`, and anything added later. Composes the new deletion vector
-/// from `X`'s current state, re-points `X` and every obs-aligned member, and
-/// slices `_obs`. Nothing is materialized: SCX handles absorb the subset as a
-/// `kept_to_global` update and lazy mapping entries defer it to decode time.
-///
-/// A non-SCX `X` hands the whole job to anndata's own `_inplace_subset_obs` —
-/// the implementation scanpy's `filter_cells` calls. Phase 4.0b makes that the
-/// only branch.
+/// `subset_obs`, and anything added later.
 pub(crate) fn subset_obs_axis(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     keep: &[bool],
 ) -> PyResult<()> {
-    // Any axis subset invalidates a pending GPU normalize-fusion marker: its
-    // `kept_to_global` / `n_obs` / `n_vars` no longer describe `adata`. Doing
-    // it here rather than per-op is what finally covers HVG `subset=True`,
-    // which never invalidated it and so could re-run the fused pass at the
-    // pre-subset width.
-    crate::accel::preprocessing::clear_gpu_normalize_marker(adata)?;
-    let x = adata.getattr("X")?;
-    let positional = positional_indices(keep);
-
-    let existing: Option<Arc<Vec<u64>>> = if let Ok(b) = x.cast::<ScxBackedSparseDataset>() {
-        b.borrow().kept_to_global.clone()
-    } else if let Ok(l) = x.cast::<ScxLazyTransformedDataset>() {
-        l.borrow().kept_to_global.clone()
-    } else {
-        return inplace_subset_via_anndata(py, adata, "_inplace_subset_obs", keep);
-    };
-
-    let new_kept = Arc::new(compose_kept_to_global(
-        keep,
-        existing.as_ref().map(|v| v.as_slice()),
-    ));
-    let sel = AxisSelection::rows(positional, new_kept);
-
-    // X first — the raw stores don't validate, so order is free, but keeping
-    // X's state authoritative before the members read it is easier to reason
-    // about.
-    if !subset_scx_handle(&x, ValueAxes::Rows, &sel)? {
-        return Err(PyRuntimeError::new_err(
-            "internal error: X changed type during an obs subset",
-        ));
-    }
-
-    // `_obs` bypasses anndata's shape validation (X's row count already moved).
-    let obs = adata.getattr("obs")?;
-    let sliced = obs.getattr("iloc")?.get_item(idx_array(py, &sel)?)?;
-    adata.setattr("_obs", sliced)?;
-
-    subset_axis(py, adata, Axis::Obs, &sel)
+    subset_axis(py, adata, Axis::Obs, keep)
 }
 
 /// Subset the **var** axis of `adata` in place against a visible-space mask.
 ///
 /// The var-axis twin of [`subset_obs_axis`], used by `filter_genes` and by HVG
 /// selection with `subset=True`. `keep` is indexed in the same order as
-/// `adata.var`, which under `preserve_var_order` is presentation order, not
-/// sorted on-disk order — `visible_ondisk_in_presentation_order` is what keeps
-/// the composed projection in step with the var rows.
-///
-/// **Out of scope, as of 4.0a:** `adata.raw` carries its own var axis and is
-/// left untouched, matching anndata (a var subset does not reach `raw`).
+/// `adata.var`, which under `preserve_var_order` is presentation order rather
+/// than sorted on-disk order; `_subset` composes through
+/// `visible_ondisk_in_presentation_order`, so request order survives.
 pub(crate) fn subset_var_axis(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     keep: &[bool],
 ) -> PyResult<()> {
-    // See `subset_obs_axis` — the marker is stale either way.
-    crate::accel::preprocessing::clear_gpu_normalize_marker(adata)?;
-    let x = adata.getattr("X")?;
-    let positional = positional_indices(keep);
-
-    let (new_cols, preserve_order) = if let Ok(b) = x.cast::<ScxBackedSparseDataset>() {
-        let backed = b.borrow();
-        let preserve = backed.col_presentation_arc().is_some();
-        (
-            compose_col_projection(
-                keep,
-                backed.visible_ondisk_in_presentation_order().as_deref(),
-            ),
-            preserve,
-        )
-    } else if let Ok(l) = x.cast::<ScxLazyTransformedDataset>() {
-        (
-            compose_col_projection(keep, l.borrow().col_projection()),
-            false,
-        )
-    } else {
-        return inplace_subset_via_anndata(py, adata, "_inplace_subset_var", keep);
-    };
-
-    let sel = AxisSelection::cols(positional, Arc::new(new_cols), preserve_order);
-
-    if !subset_scx_handle(&x, ValueAxes::Cols, &sel)? {
-        return Err(PyRuntimeError::new_err(
-            "internal error: X changed type during a var subset",
-        ));
-    }
-
-    // `_var` bypasses anndata's shape validation (X's width already moved).
-    let var = adata.getattr("var")?;
-    let sliced = var.getattr("iloc")?.get_item(idx_array(py, &sel)?)?;
-    adata.setattr("_var", sliced)?;
-
-    subset_axis(py, adata, Axis::Var, &sel)
+    subset_axis(py, adata, Axis::Var, keep)
 }
 
-/// Hand an in-memory AnnData to anndata's own in-place subsetter.
-///
-/// Not a fallback so much as the correct answer: `_inplace_subset_{obs,var}` is
-/// what `sc.pp.filter_{cells,genes}` calls, and it already handles every
-/// aligned member plus `raw`. SCX only reimplements it because a backed `X`
-/// cannot be materialized.
-fn inplace_subset_via_anndata(
-    py: Python<'_>,
-    adata: &Bound<'_, PyAny>,
-    method: &str,
-    keep: &[bool],
-) -> PyResult<()> {
-    let mask = numpy::PyArray1::from_slice(py, keep);
-    adata.call_method1(method, (mask,))?;
-    Ok(())
-}
-
-fn positional_indices(keep: &[bool]) -> Vec<i64> {
-    keep.iter()
-        .enumerate()
-        .filter(|(_, &k)| k)
-        .map(|(i, _)| i as i64)
-        .collect()
-}
-
-fn idx_array<'py>(
-    py: Python<'py>,
-    sel: &AxisSelection,
-) -> PyResult<Bound<'py, numpy::PyArray1<i64>>> {
-    Ok(numpy::PyArray1::from_slice(py, &sel.positional))
-}
-
-/// Compose a new deletion vector from a visible-space mask and the existing one.
-pub(crate) fn compose_kept_to_global(keep: &[bool], existing: Option<&[u64]>) -> Vec<u64> {
-    match existing {
-        Some(existing) => keep
-            .iter()
-            .enumerate()
-            .filter(|(_, &k)| k)
-            .map(|(i, _)| existing[i])
-            .collect(),
-        None => keep
-            .iter()
-            .enumerate()
-            .filter(|(_, &k)| k)
-            .map(|(i, _)| i as u64)
-            .collect(),
-    }
-}
-
-/// Compose a new column projection from a visible-space mask and the existing
-/// visible→on-disk map.
-fn compose_col_projection(keep: &[bool], existing: Option<&[u32]>) -> Vec<u32> {
-    match existing {
-        Some(existing) => keep
-            .iter()
-            .enumerate()
-            .filter(|(_, &k)| k)
-            .map(|(i, _)| existing[i])
-            .collect(),
-        None => keep
-            .iter()
-            .enumerate()
-            .filter(|(_, &k)| k)
-            .map(|(i, _)| i as u32)
-            .collect(),
-    }
-}
-
-/// Bring every aligned member into line with a subset already applied to `X`.
-///
-/// `adata` must already carry the new `X` state and the sliced `_obs` / `_var`;
-/// this handles the members. Reads and writes only the raw stores, so it is
-/// immune to anndata's read-time validation and order-independent.
 fn subset_axis(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     axis: Axis,
-    sel: &AxisSelection,
+    keep: &[bool],
 ) -> PyResult<()> {
-    // Resolve every store up front and fail before touching any of them. This
-    // is the cheap half of atomicity: a missing or unexpected store type is the
-    // one failure that would otherwise leave `X` and `_obs`/`_var` already
-    // moved while a member is still at the old width — permanently unreadable,
-    // which is the exact state this module exists to prevent.
-    let mut stores = Vec::with_capacity(3);
-    for (attr, axes) in aligned_stores(axis) {
-        let store = adata.getattr(*attr).map_err(|e| {
-            PyRuntimeError::new_err(format!(
-                "cannot reach aligned store `{attr}` to keep it in step with the \
-                 subset ({e}). This build of pyscx expects anndata to keep the \
-                 aligned mappings in `_`-prefixed dicts; see \
-                 docs/compatibility-matrix.md for the supported versions."
-            ))
-        })?;
-        if store.is_none() {
-            continue;
+    // Any axis subset invalidates a pending GPU normalize-fusion marker: its
+    // `kept_to_global` / `n_obs` / `n_vars` no longer describe `adata`. Doing
+    // it here rather than per-op is what covers HVG `subset=True`, which never
+    // invalidated it and so could re-run the fused pass at the pre-subset width.
+    crate::accel::preprocessing::clear_gpu_normalize_marker(adata)?;
+
+    // A filter that keeps everything must change nothing. Subsetting anyway
+    // would install an identity `kept_to_global` / `col_projection`, and a
+    // `kept_to_global` — even the identity one — disables the CSC sidecar
+    // (`as_column_source` returns `None`), permanently downgrading the
+    // `gpu_csc_v3` CSC-direct DE route on a file that was never filtered.
+    if keep.iter().all(|&k| k) {
+        return Ok(());
+    }
+
+    let positional = positional_indices(keep);
+    let x = adata.getattr("X")?;
+    if !is_scx_handle(&x) {
+        // A plain in-memory `X` is anndata's own routine, verbatim: it already
+        // handles every aligned member plus `raw`, and there is nothing to keep
+        // out of core.
+        let mask = numpy::PyArray1::from_slice(py, keep);
+        let method = match axis {
+            Axis::Obs => "_inplace_subset_obs",
+            Axis::Var => "_inplace_subset_var",
+        };
+        adata.call_method1(method, (mask,))?;
+        return Ok(());
+    }
+    if !crate::anndata_hooks::hooks_registered() {
+        return Err(crate::anndata_hooks::missing_hooks_error());
+    }
+    drop(x);
+
+    let bridges = detach_lazy_bridges(py, adata, axis)?;
+    if let Err(err) = rebuild_via_anndata(py, adata, axis, &positional) {
+        // The replacement is built before it is swapped in, so `adata` is
+        // untouched — put the bridges back and the failure is a clean no-op.
+        for (attr, _, bridge) in bridges {
+            adata.setattr(attr, bridge)?;
         }
-        ensure_subsettable(&store, attr)?;
-        stores.push((store, *axes));
+        return Err(err);
     }
-    for (store, axes) in stores {
-        subset_store(py, &store, axes, sel)?;
+
+    let sel = selection_from_x(adata, axis, positional)?;
+    let mut result = Ok(());
+    for (attr, axes, bridge) in bridges {
+        if let (Ok(()), Some(axes)) = (&result, axes) {
+            result = apply_bridge_subset(py, bridge.bind(py), axes, &sel);
+        }
+        // Reattach unconditionally: a store left detached would turn a wrong
+        // shape into a `KeyError` from an unrelated call later on.
+        adata.setattr(attr, bridge)?;
     }
+    result
+}
+
+/// Replace `adata` with its own subset, the way anndata would.
+///
+/// This is `AnnData._inplace_subset_{obs,var}` with exactly one substitution:
+/// where anndata writes `self[idx].copy()` we write
+/// `view._mutated_copy(X=view.X, …)`. `AnnData.copy()` calls `.copy()` on the
+/// matrix and on every aligned value, and an SCX handle's `.copy()`
+/// materializes — deliberately, because `adata[mask].copy()` is the documented
+/// "subset, then materialize" workflow. `view.X` is the *un-copied*
+/// `_subset(ref.X, idx)`, so the accelerators get the same object graph
+/// anndata would have built, minus the materialization.
+///
+/// Everything else is anndata's: `obs` / `var` sliced and re-categorized,
+/// `uns` deep-copied, `raw` subset on the obs axis, and — because it builds a
+/// whole new `AnnData` and `_init_as_actual` swaps it in — a raise part-way
+/// through leaves the original untouched.
+fn rebuild_via_anndata(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    axis: Axis,
+    positional: &[i64],
+) -> PyResult<()> {
+    let idx = numpy::PyArray1::from_slice(py, positional);
+    let view = match axis {
+        Axis::Obs => adata.get_item(&idx)?,
+        Axis::Var => adata.get_item((PySlice::full(py), &idx))?,
+    };
+
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("X", view.getattr("X")?)?;
+    for name in ["layers", "obsm", "varm", "obsp", "varp"] {
+        kwargs.set_item(name, subset_mapping_keeping_handles(py, &view, name)?)?;
+    }
+    let new = view.call_method("_mutated_copy", (), Some(&kwargs))?;
+    adata.call_method1("_init_as_actual", (new,))?;
     Ok(())
 }
 
-/// Reject a store we could not subset, *before* anything has been committed.
-fn ensure_subsettable(store: &Bound<'_, PyAny>, attr: &str) -> PyResult<()> {
-    if store.is_instance_of::<PyDict>()
-        || store.cast::<ScxLazyPairwiseMapping>().is_ok()
+/// `AlignedMapping.copy()`, except SCX handles are passed through un-copied.
+///
+/// Reading `view.<name>[key]` already yields `as_view(_subset(value, idx))`, so
+/// the subset itself is anndata's. The only change is skipping the trailing
+/// `.copy()` for a handle, which would gather it. Plain values are still
+/// copied — anndata copies them for a reason: the sliced result is a *view*
+/// into the parent's buffer, and storing that would pin the un-subset array
+/// alive.
+fn subset_mapping_keeping_handles<'py>(
+    py: Python<'py>,
+    view: &Bound<'py, PyAny>,
+    name: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let mapping = view.getattr(name)?;
+    let out = PyDict::new(py);
+    for key in mapping.try_iter()? {
+        let key = key?;
+        let value = mapping.get_item(&key)?;
+        let value = if is_scx_handle(&value) || value.cast::<ScxBackedObsmDataset>().is_ok() {
+            value
+        } else if value.hasattr("copy")? {
+            value.call_method0("copy")?
+        } else {
+            // anndata reaches for `copy.copy` on the one value type without a
+            // `.copy()` method (awkward arrays, whose buffers are immutable).
+            py.import("copy")?.call_method1("copy", (&value,))?
+        };
+        out.set_item(key, value)?;
+    }
+    Ok(out)
+}
+
+fn is_scx_handle(value: &Bound<'_, PyAny>) -> bool {
+    value.cast::<ScxBackedSparseDataset>().is_ok()
+        || value.cast::<ScxLazyTransformedDataset>().is_ok()
+        || value.cast::<ScxBackedLayerDataset>().is_ok()
+}
+
+/// A bridge held out of `adata` for the duration of the subset: the raw-store
+/// attribute it came from, how this axis subsets it (`None` = it doesn't), and
+/// the bridge itself.
+type DetachedBridge = (&'static str, Option<ValueAxes>, Py<PyAny>);
+
+/// Take the lazy bridges out of `adata` so anndata's subset cannot decode them.
+///
+/// **Every** bridge is detached, not just the ones this axis subsets:
+/// `_mutated_copy` reads all five aligned mappings whichever axis moved, so an
+/// obs subset would otherwise decode `varm` and `varp` for nothing. Off-axis
+/// bridges come back with no selection recorded — the returned `ValueAxes` is
+/// `None` for those.
+///
+/// Plain-dict stores are left in place: anndata subsets those correctly and
+/// cheaply, because their SCX-handle values go through the registered
+/// `_subset` / `copy()` and stay lazy.
+fn detach_lazy_bridges(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    axis: Axis,
+) -> PyResult<Vec<DetachedBridge>> {
+    let touched = aligned_stores(axis);
+    let mut out = Vec::new();
+    for attr in ALL_ALIGNED_STORES {
+        let Ok(store) = adata.getattr(attr) else {
+            continue;
+        };
+        if !is_lazy_bridge(&store) {
+            continue;
+        }
+        adata.setattr(attr, PyDict::new(py))?;
+        let axes = touched
+            .iter()
+            .find(|(name, _)| *name == attr)
+            .map(|(_, axes)| *axes);
+        out.push((attr, axes, store.unbind()));
+    }
+    Ok(out)
+}
+
+fn is_lazy_bridge(store: &Bound<'_, PyAny>) -> bool {
+    store.cast::<ScxLazyPairwiseMapping>().is_ok()
         || store.cast::<ScxLazyVarmMapping>().is_ok()
         || store.cast::<ScxLazyObsmMapping>().is_ok()
         || store.cast::<ScxLazyLayersMapping>().is_ok()
-    {
-        return Ok(());
-    }
-    Err(PyRuntimeError::new_err(format!(
-        "cannot subset aligned store `{attr}` of type {}: expected a dict or an \
-         SCX lazy mapping",
-        store
-            .get_type()
-            .name()
-            .map(|n| n.to_string())
-            .unwrap_or_default()
-    )))
 }
 
-/// Apply a selection to one raw store, whatever kind of mapping it is.
-fn subset_store(
+fn apply_bridge_subset(
     py: Python<'_>,
     store: &Bound<'_, PyAny>,
     axes: ValueAxes,
     sel: &AxisSelection,
 ) -> PyResult<()> {
-    // The lazy bridges own their own deferral: cached values are sliced now,
-    // un-fetched keys record the selection and apply it on decode. Going
-    // through the generic dict path instead would force every section on disk
-    // to materialize just to be subset.
     macro_rules! try_lazy {
         ($ty:ty) => {
             if let Ok(m) = store.cast::<$ty>() {
@@ -396,30 +370,121 @@ fn subset_store(
     try_lazy!(ScxLazyVarmMapping);
     try_lazy!(ScxLazyObsmMapping);
     try_lazy!(ScxLazyLayersMapping);
+    Err(PyRuntimeError::new_err(
+        "internal error: detached a store that is not an SCX lazy mapping",
+    ))
+}
 
-    // Unreachable: `ensure_subsettable` pre-flighted this before any commit.
-    let dict = store.cast::<PyDict>().map_err(|_| {
-        PyRuntimeError::new_err(format!(
-            "cannot subset aligned store of type {}: expected a dict or an SCX \
-             lazy mapping",
-            store
-                .get_type()
-                .name()
-                .map(|n| n.to_string())
-                .unwrap_or_default()
-        ))
-    })?;
-    let keys: Vec<Py<PyAny>> = dict.keys().iter().map(|k| k.unbind()).collect();
-    for key in keys {
-        let key = key.bind(py);
-        let Some(value) = dict.get_item(key)? else {
-            continue;
-        };
-        if let Some(replacement) = subset_value(py, &value, axes, sel)? {
-            dict.set_item(key, replacement)?;
+/// Build the deferred selection from the window `X` actually ended up with.
+///
+/// A bridge value can itself be an SCX handle (`ScxLazyObsmMapping` yields
+/// `ScxBackedObsmDataset` on the backed path), and those absorb the subset as a
+/// `kept_to_global` / `col_projection` update rather than a gather — so the
+/// selection has to carry the composed mapping, not just positions. Reading it
+/// back off the post-subset `X` is what guarantees the two agree.
+fn selection_from_x(
+    adata: &Bound<'_, PyAny>,
+    axis: Axis,
+    positional: Vec<i64>,
+) -> PyResult<AxisSelection> {
+    let x = adata.getattr("X")?;
+    Ok(match axis {
+        Axis::Obs => {
+            let kept: Option<Arc<Vec<u64>>> = if let Ok(b) = x.cast::<ScxBackedSparseDataset>() {
+                b.borrow().kept_to_global.clone()
+            } else if let Ok(l) = x.cast::<ScxLazyTransformedDataset>() {
+                l.borrow().kept_to_global.clone()
+            } else {
+                None
+            };
+            match kept {
+                Some(kept) => AxisSelection::rows(positional, kept),
+                None => AxisSelection::positional_only(positional),
+            }
         }
+        Axis::Var => {
+            let cols: Option<(Arc<Vec<u32>>, bool)> =
+                if let Ok(b) = x.cast::<ScxBackedSparseDataset>() {
+                    let backed = b.borrow();
+                    let preserve = backed.col_presentation_arc().is_some();
+                    backed
+                        .visible_ondisk_in_presentation_order()
+                        .map(|c| (Arc::new(c), preserve))
+                } else if let Ok(l) = x.cast::<ScxLazyTransformedDataset>() {
+                    l.borrow()
+                        .col_projection()
+                        .map(|c| (Arc::new(c.to_vec()), false))
+                } else {
+                    None
+                };
+            match cols {
+                Some((cols, preserve)) => AxisSelection::cols(positional, cols, preserve),
+                None => AxisSelection::positional_only(positional),
+            }
+        }
+    })
+}
+
+fn positional_indices(keep: &[bool]) -> Vec<i64> {
+    keep.iter()
+        .enumerate()
+        .filter(|(_, &k)| k)
+        .map(|(i, _)| i as i64)
+        .collect()
+}
+
+/// Compose a new deletion vector from *positional* visible-row indices.
+///
+/// The `_subset` twin of [`compose_kept_to_global`]: anndata hands us an index
+/// array rather than a mask, and unlike a mask it may repeat or reorder rows.
+/// Both are honoured — `kept_to_global` is a plain visible→global lookup, so
+/// duplication and permutation cost nothing and need no special case.
+pub(crate) fn compose_rows_positional(
+    existing: Option<&[u64]>,
+    rows: &[i64],
+    n_visible: usize,
+) -> PyResult<Vec<u64>> {
+    rows.iter()
+        .map(|&i| {
+            let i = normalize_index(i, n_visible, "row")?;
+            Ok(match existing {
+                Some(existing) => existing[i],
+                None => i as u64,
+            })
+        })
+        .collect()
+}
+
+/// Compose a new column projection from *positional* visible-column indices.
+///
+/// `existing` is the visible→on-disk map **in presentation order**, so the
+/// composed result is also in presentation order and must be installed with
+/// `set_col_projection_ordered`.
+pub(crate) fn compose_cols_positional(
+    existing: Option<&[u32]>,
+    cols: &[i64],
+    n_visible: usize,
+) -> PyResult<Vec<u32>> {
+    cols.iter()
+        .map(|&i| {
+            let i = normalize_index(i, n_visible, "column")?;
+            Ok(match existing {
+                Some(existing) => existing[i],
+                None => i as u32,
+            })
+        })
+        .collect()
+}
+
+/// Resolve a possibly-negative index against a visible axis length.
+fn normalize_index(i: i64, len: usize, what: &str) -> PyResult<usize> {
+    let normalized = if i < 0 { i + len as i64 } else { i };
+    if normalized < 0 || normalized >= len as i64 {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "{what} index {i} out of range for {len} {what}s"
+        )));
     }
-    Ok(())
+    Ok(normalized as usize)
 }
 
 /// Subset a single aligned value.

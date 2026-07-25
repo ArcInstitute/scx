@@ -1,4 +1,5 @@
 mod accel;
+pub(crate) mod anndata_hooks;
 pub(crate) mod axis_align;
 pub(crate) mod backed;
 mod convert;
@@ -1223,6 +1224,12 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
         ),
     }
 
+    // Teach anndata to subset an SCX handle without materializing it —
+    // `as_view` / `_subset` / `to_memory`. This is what lets the mutating
+    // accelerators delegate to `_inplace_subset_{obs,var}` instead of
+    // reimplementing the axis bookkeeping. See `anndata_hooks`.
+    anndata_hooks::register_anndata_subset_hooks(m)?;
+
     Ok(())
 }
 
@@ -1314,6 +1321,7 @@ fn register_filtering(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(accel::filtering::filter_cells, m)?)?;
     m.add_function(wrap_pyfunction!(accel::filtering::filter_genes, m)?)?;
     m.add_function(wrap_pyfunction!(accel::filtering::subset_obs, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::filtering::subset_var, m)?)?;
     Ok(())
 }
 

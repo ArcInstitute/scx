@@ -284,6 +284,55 @@ impl ScxBackedSparseDataset {
         }
     }
 
+    /// A second handle onto the same file, same window. O(1) — every heavy
+    /// field is behind an `Arc`.
+    pub(crate) fn clone_handle(&self) -> Self {
+        ScxBackedSparseDataset {
+            backed: Arc::clone(&self.backed),
+            backed_csc: self.backed_csc.clone(),
+            shape_val: self.shape_val,
+            n_shards: self.n_shards,
+            cache_shards: self.cache_shards,
+            kept_to_global: self.kept_to_global.clone(),
+            col_projection: self.col_projection.clone(),
+            col_presentation: self.col_presentation.clone(),
+            non_negative: self.non_negative,
+            modality_id: self.modality_id,
+            source_path: self.source_path.clone(),
+        }
+    }
+
+    /// A handle onto a sub-window of this one, composing rather than reading.
+    ///
+    /// Backs `anndata._core.index._subset`. `rows` / `cols` are positional
+    /// indices into the **visible** axes; `None` means "the whole axis". The
+    /// composed column map is in presentation order, so it goes in through
+    /// [`Self::set_col_projection_ordered`] — that is what keeps
+    /// `preserve_var_order` alive across `adata[:, idx]`.
+    pub(crate) fn subset_clone(
+        &self,
+        rows: Option<&[i64]>,
+        cols: Option<&[i64]>,
+    ) -> PyResult<Self> {
+        let mut out = self.clone_handle();
+        if let Some(rows) = rows {
+            out.set_kept_to_global(crate::axis_align::compose_rows_positional(
+                self.kept_to_global.as_ref().map(|v| v.as_slice()),
+                rows,
+                self.shape_val.0,
+            )?);
+        }
+        if let Some(cols) = cols {
+            let base = self.visible_ondisk_in_presentation_order();
+            out.set_col_projection_ordered(crate::axis_align::compose_cols_positional(
+                base.as_deref(),
+                cols,
+                self.shape_val.1,
+            )?);
+        }
+        Ok(out)
+    }
+
     /// Reorder a per-visible-column vector (in sorted-projection order) into
     /// presentation order. No-op when no presentation reorder is active.
     pub(crate) fn present_reorder<T: Clone>(&self, values: Vec<T>) -> Vec<T> {
@@ -443,6 +492,13 @@ impl ScxBackedSparseDataset {
     }
 
     /// Copy — materializes the full matrix. Required by AnnData .copy().
+    ///
+    /// Deliberately *not* a lazy clone. `AnnData.copy()` on a view runs
+    /// `_subset(ref.X, idx).copy()`, so this is what makes the documented
+    /// `adata[mask].copy()` → "subset, materialize, then run scanpy" workflow
+    /// mean what it says. The in-place accelerators stay out-of-core by
+    /// building their replacement through `_mutated_copy(X=view.X, …)`, which
+    /// never calls `.copy()` on the matrix — see [`crate::axis_align`].
     pub(crate) fn copy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let mat = self.to_memory(py)?;
         mat.call_method0("copy")

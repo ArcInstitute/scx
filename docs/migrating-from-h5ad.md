@@ -498,12 +498,13 @@ scanpy script. Each is documented in full in `docs/scanpy.md`.
   `filter_genes` will now keep and drop different cells. Re-check thresholds
   tuned against older output. (`getnnz` was already projection-aware, and the
   backed — non-lazy — dunders were already correct.)
-- **`adata.raw` is not kept aligned by the backed filter ops.** `raw` is
-  obs-aligned, but `filter_cells` / `subset_obs` on a backed or lazy `X` leave it
-  at the original row count; scanpy on an in-memory AnnData subsets it. Set
-  `adata.raw = None` before filtering, or re-derive it afterwards. Every other
-  aligned member (`layers`, `obsm`, `varm`, `obsp`, `varp`) *is* kept in step —
-  see [docs/api.md § Axis subsetting and aligned
+- **`adata[:, mask]` on a backed AnnData used to raise.** anndata had no view
+  registration for an SCX handle, so the var axis was unreachable through the
+  public API — including `sc.pp.filter_genes`, which calls
+  `adata._inplace_subset_var`. It now works: `adata[:, mask]` is a lazy view,
+  `adata[:, mask].copy()` materializes, and the backed filter ops subset `raw`
+  and drop unused categorical levels like scanpy does. See [docs/api.md § Axis
+  subsetting and aligned
   members](api.md#axis-subsetting-and-aligned-members).
 
 ## Errors you might see

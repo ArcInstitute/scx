@@ -540,9 +540,6 @@ pub fn filter_genes(
 /// This differs from NumPy fancy indexing. Use a boolean mask if you need
 /// exact control over which rows are kept.
 ///
-/// Falls back to standard numpy/pandas subsetting for non-SCX data
-/// (materializes X via `adata._X = adata.X[mask]`).
-///
 /// Args:
 ///     adata: AnnData object
 ///     mask_or_indices: Boolean mask (length n_obs) or integer index array
@@ -553,73 +550,86 @@ pub fn subset_obs(
     adata: &Bound<'_, PyAny>,
     mask_or_indices: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
+    let n_obs: usize = adata.getattr("shape")?.get_item(0)?.extract()?;
+    let keep = keep_mask_from_selector(py, mask_or_indices, n_obs, "n_obs")?;
+    subset_obs_axis(py, adata, &keep)
+}
+
+/// Subset genes (columns) by a boolean mask or an integer index array.
+///
+/// The var-axis twin of [`subset_obs`], and the general-purpose version of
+/// `filter_genes()`:
+///
+///     mask = adata.var["highly_variable"]
+///     pyscx.accel.subset_var(adata, mask)
+///
+/// Equivalent to `adata._inplace_subset_var(mask)`, which is also what
+/// `adata[:, mask].copy()` does — both keep a backed / lazy `X` out of core.
+/// The same set-membership caveat as [`subset_obs`] applies to integer
+/// indices; pass a boolean mask, or use `adata[:, indices]`, if you need
+/// ordered selection.
+///
+/// Args:
+///     adata: AnnData object
+///     mask_or_indices: Boolean mask (length n_vars) or integer index array
+#[pyfunction]
+#[pyo3(signature = (adata, mask_or_indices))]
+pub fn subset_var(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    mask_or_indices: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let n_vars: usize = adata.getattr("shape")?.get_item(1)?.extract()?;
+    let keep = keep_mask_from_selector(py, mask_or_indices, n_vars, "n_vars")?;
+    subset_var_axis(py, adata, &keep)
+}
+
+/// Normalize a boolean mask / integer index array into a keep mask of length
+/// `n`. Integer indices are set membership, not ordered selection — see
+/// [`subset_obs`].
+fn keep_mask_from_selector(
+    py: Python<'_>,
+    mask_or_indices: &Bound<'_, PyAny>,
+    n: usize,
+    axis_name: &str,
+) -> PyResult<Vec<bool>> {
     let np = py.import("numpy")?;
-
-    // Get n_obs from adata.shape[0]
-    let shape = adata.getattr("shape")?;
-    let n_obs: usize = shape.get_item(0)?.extract()?;
-
-    // Convert input to a numpy array to determine dtype
     let arr = np.call_method1("asarray", (mask_or_indices,))?;
-    let dtype_str: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
+    let kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
 
-    // Build boolean keep mask
-    let keep: Vec<bool> = match dtype_str.as_str() {
-        // Boolean mask
+    match kind.as_str() {
         "b" => {
             let bool_arr: numpy::PyReadonlyArray1<'_, bool> = arr.extract()?;
             let slice = bool_arr
                 .as_slice()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            if slice.len() != n_obs {
+            if slice.len() != n {
                 return Err(PyValueError::new_err(format!(
-                    "Boolean mask length ({}) does not match n_obs ({})",
+                    "Boolean mask length ({}) does not match {axis_name} ({n})",
                     slice.len(),
-                    n_obs
                 )));
             }
-            slice.to_vec()
+            Ok(slice.to_vec())
         }
-        // Integer indices
         "i" | "u" => {
             let idx_arr = arr.call_method1("astype", (np.getattr("int64")?,))?;
             let idx_ro: numpy::PyReadonlyArray1<'_, i64> = idx_arr.extract()?;
             let indices = idx_ro
                 .as_slice()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // Validate bounds
+            let mut mask = vec![false; n];
             for &idx in indices {
-                if idx < 0 || (idx as usize) >= n_obs {
+                if idx < 0 || (idx as usize) >= n {
                     return Err(PyValueError::new_err(format!(
-                        "Index {} is out of bounds for n_obs={}",
-                        idx, n_obs
+                        "Index {idx} is out of bounds for {axis_name}={n}"
                     )));
                 }
-            }
-
-            // Build boolean mask from indices
-            let mut mask = vec![false; n_obs];
-            for &idx in indices {
                 mask[idx as usize] = true;
             }
-            mask
+            Ok(mask)
         }
-        _ => {
-            return Err(PyValueError::new_err(
-                "mask_or_indices must be a boolean mask or integer index array",
-            ));
-        }
-    };
-
-    // Check if any rows are kept
-    let n_kept = keep.iter().filter(|&&k| k).count();
-    if n_kept == n_obs {
-        // All rows kept — nothing to do
-        return Ok(());
+        _ => Err(PyValueError::new_err(
+            "mask_or_indices must be a boolean mask or integer index array",
+        )),
     }
-
-    // Backed / lazy X compose a new deletion vector; a plain in-memory X goes
-    // to anndata's own `_inplace_subset_obs`, which also handles `raw`.
-    subset_obs_axis(py, adata, &keep)
 }

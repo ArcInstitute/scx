@@ -1747,7 +1747,8 @@ Confirm which path actually ran via the [route metadata](#accelerator-route-meta
 - `pyscx.accel.col_var(dataset, prefer_format="csr") → np.ndarray (f64)` — Streaming per-column variance. CSR uses a two-pass formulation; CSC uses single-pass `(sum_x² - n·mean²) / n`. Numerically equivalent within f64 epsilon (verified by `pyscx/tests/test_csc_dispatch.py`).
 - `pyscx.accel.filter_cells(adata, min_genes=None, max_genes=None, min_counts=None, max_counts=None)` — Non-materializing cell QC filter for backed/lazy data. Computes row NNZ and/or row sums via streaming, builds a boolean mask, and updates the deletion vector (`kept_to_global`) on `ScxBackedSparseDataset` or `ScxLazyTransformedDataset`. Slices `adata.obs` and every obs-aligned member (see [Axis subsetting and aligned members](#axis-subsetting-and-aligned-members)). Falls back to `sc.pp.filter_cells()` for scipy/dense. On a lazy `X` under an active column projection, the thresholds are evaluated against the **visible** genes, matching scanpy on the sliced object.
 - `pyscx.accel.filter_genes(adata, min_cells=None, max_cells=None, min_counts=None, max_counts=None)` — Non-materializing gene QC filter for backed/lazy data. Computes column NNZ and/or column sums via streaming, builds a boolean mask, and sets `col_projection` on `ScxBackedSparseDataset` or `ScxLazyTransformedDataset`. Slices `adata.var` and every var-aligned member. Composes with existing column projections. Falls back to `sc.pp.filter_genes()` for scipy/dense.
-- `pyscx.accel.subset_obs(adata, mask_or_indices)` — Subset observations (cells) without materializing. Accepts a **boolean numpy mask** or **integer index array**. Creates a new deletion vector (`kept_to_global`) on the backing dataset and slices `adata.obs` plus every obs-aligned member. Composes correctly with existing deletion vectors. For non-SCX `X` it delegates to anndata's `_inplace_subset_obs` — the routine `sc.pp.filter_cells` uses — so `adata.raw` comes along too.
+- `pyscx.accel.subset_obs(adata, mask_or_indices)` — Subset observations (cells) without materializing. Accepts a **boolean numpy mask** or **integer index array**. Creates a new deletion vector (`kept_to_global`) on the backing dataset; `adata.obs`, `raw` and every obs-aligned member follow via anndata. Composes correctly with existing deletion vectors. Equivalent to `adata[mask].copy()` except that `X` is not materialized.
+- `pyscx.accel.subset_var(adata, mask_or_indices)` — The var-axis twin: subset genes (columns) in place without materializing. Equivalent to `adata[:, mask].copy()`, minus the materialization. Prefer this over `adata.X.set_col_projection(...)`, which moves `X` alone.
 
   > [!WARNING]
   > **Integer index semantics differ from NumPy.** When `mask_or_indices` is an integer array, it is internally converted to a boolean mask. This means:
@@ -1758,23 +1759,25 @@ Confirm which path actually ran via the [route metadata](#accelerator-route-meta
 
 #### Axis subsetting and aligned members
 
-`filter_cells`, `filter_genes`, `subset_obs`, and `highly_variable_genes(subset=True)` all mutate one axis of the AnnData in place. On an SCX-backed or lazy `X` that mutation is a projection update, never a materialization — but the aligned members have to follow, and all five do:
+`filter_cells`, `filter_genes`, `subset_obs`, `subset_var`, and `highly_variable_genes(subset=True)` all mutate one axis of the AnnData in place. **anndata performs the subset**; pyscx only makes a backed `X` subsettable and keeps its lazy mappings off disk. So `obs`, `var`, `uns`, `raw`, unused categorical levels and every aligned member behave exactly as they do on an in-memory AnnData:
 
 | parent axis | members updated |
 |---|---|
-| obs (`filter_cells`, `subset_obs`) | `obs`, `layers` (rows), `obsm`, `obsp` (both axes) |
-| var (`filter_genes`, HVG `subset=True`) | `var`, `layers` (columns), `varm`, `varp` (both axes) |
+| obs (`filter_cells`, `subset_obs`) | `obs`, `raw`, `layers` (rows), `obsm`, `obsp` (both axes) |
+| var (`filter_genes`, `subset_var`, HVG `subset=True`) | `var`, `layers` (columns), `varm`, `varp` (both axes) |
 
-How each member is updated depends on what it is:
+Two properties are worth stating explicitly, because they are what the SCX-specific machinery exists to preserve:
 
-- **SCX handles** (`ScxBackedLayerDataset`, `ScxLazyTransformedDataset`, `ScxBackedObsmDataset`) absorb the subset as a `kept_to_global` / `col_projection` update — no copy, no decode.
-- **Lazy mapping entries** are not decoded at subset time — the subset is recorded and applied when the key is first read, so `filter_cells` on a file carrying a large kNN graph costs nothing extra unless you actually read `obsp`. This covers `obsp` / `varp` / `varm` on `to_anndata(backed=True)`, and `obsm` only under `to_anndata(backed=True, obsm=[...])`. It does **not** cover the default (non-backed) `to_anndata()`: there `X` is an in-memory scipy matrix, so the whole subset goes through anndata, which reads the public properties and materializes every bridge.
-- **Everything else** — a numpy array, scipy matrix, or pandas DataFrame you added yourself — is positionally sliced.
+- **Nothing materializes.** The subset of a backed / lazy `X` is a `kept_to_global` / `col_projection` update, and so is the subset of an SCX-handle layer or embedding — no copy, no decode. `type(adata.X)` is unchanged by a filter.
+- **Nothing decodes.** `obsp` / `varp` / `varm` on `to_anndata(backed=True)` (and `obsm` under `to_anndata(backed=True, obsm=[...])`) are lazy mappings that read a section only on first key access. A subset is *recorded* and applied when the key is first read, so `filter_cells` on a file carrying a large kNN graph costs nothing extra unless you actually read `obsp`. This does not apply to the default (non-backed) `to_anndata()`, where the values are already in memory.
 
-For an in-memory (non-SCX) `X`, the whole job goes to anndata's `_inplace_subset_obs` / `_inplace_subset_var`, matching scanpy exactly. Two consequences worth knowing: that route is a full AnnData copy (peak memory ~2×, and `uns` is deep-copied), and it drops now-unused categorical levels from `obs` / `var`. The backed / lazy route does neither — it keeps unused categories, which is what SCX has always done. The two routes therefore disagree on category levels; 4.0b removes the split by handing both to anndata.
+Members you added yourself — a numpy array, scipy matrix, or pandas DataFrame — are subset by anndata in the usual way.
 
-> [!NOTE]
-> **`adata.raw` is not updated** when `X` is backed or lazy. `raw` is obs-aligned, so after `filter_cells` `adata.raw` still has the original row count. Note that `to_anndata(backed=True)` drops `raw` on open with a `DroppedRaw` warning, so this only bites when you attach one yourself — re-derive it after filtering. Do **not** reach for `adata.raw = None` on the in-memory route: there `raw` is already kept aligned by anndata, and clearing it loses data.
+A subset is **atomic**: anndata builds the replacement object and swaps it in, so a failure part-way through leaves the original untouched.
+
+pyscx registers SCX handles with three private anndata `singledispatch` hooks to make this work (`as_view`, `_subset`, `to_memory`) and drives `_mutated_copy` / `_init_as_actual` directly. See [docs/compatibility-matrix.md § Private anndata APIs](compatibility-matrix.md#private-anndata-apis-pyscx-depends-on) for the supported versions and the compat test that fails loudly on an upgrade.
+
+**Plain anndata indexing works too.** `adata[:, mask]` builds a lazy view of a backed `X` (before, it raised `NotImplementedError`), `adata[mask].copy()` subsets and **materializes** — the documented "subset, then run scanpy" workflow — and `adata[mask].to_memory()` returns a fully in-memory AnnData. Use `pyscx.accel.subset_obs` / `subset_var` when you want the subset applied in place *without* materializing.
 
 #### Accelerator route metadata
 
@@ -1841,7 +1844,7 @@ PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`)
 - `set_col_projection(col_indices)` — Restrict all access and aggregation to a subset of columns. Used internally by `to_anndata(var_names=...)` and streaming QC with gene subsets (`qc_vars`).
 
   > [!WARNING]
-  > **This is a handle-level knob, not an axis subset.** It moves `X` only — `var`, `layers`, `varm` and `varp` are left at the old width, so the AnnData is inconsistent until you slice them yourself. It does not go through the funnel described in [Axis subsetting and aligned members](#axis-subsetting-and-aligned-members). Use `pyscx.accel.filter_genes` for a real gene subset; reach for this only when you want to reproject a bare handle.
+  > **This is a handle-level knob, not an axis subset.** It moves `X` only — `var`, `layers`, `varm` and `varp` are left at the old width, so the AnnData is inconsistent until you slice them yourself. Use `pyscx.accel.subset_var(adata, mask)` (or `adata[:, mask]`) for a real gene subset — see [Axis subsetting and aligned members](#axis-subsetting-and-aligned-members). Reach for this only when you want to reproject a bare handle.
 
 **Slicing:**
 - `__getitem__(row_slice)` `→ scipy.sparse.csr_matrix` — Decode requested shards, return scipy CSR.
