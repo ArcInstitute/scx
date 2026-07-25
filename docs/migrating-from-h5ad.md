@@ -487,15 +487,24 @@ scanpy script. Each is documented in full in `docs/scanpy.md`.
   pipeline that filters on `pct_counts_mt` after a lazy normalize will keep and
   drop different cells than it did before. Re-check any thresholds tuned against
   older output.
-- **Aggregations on a projected lazy `X` disagree with each other, for now.**
-  After `filter_genes` (or any column projection) on a lazy dataset,
-  `adata.obs["total_counts"]` covers only the visible genes — correct — but
-  `adata.X.sum(axis=1)` still sums the full physical width, and
-  `adata.X.mean(axis=1)` divides that physical-width sum by the *visible* column
-  count. `getnnz` is projection-aware. `filter_cells` on a lazy dataset
-  thresholds the physical-width totals. Only the QC accelerator has been fixed;
-  the array-protocol dunders are tracked as a follow-up. Prefer
-  `adata.obs["total_counts"]` over `adata.X.sum(axis=1)` on projected lazy data.
+- **Row-axis aggregations on a projected lazy `X` changed.** They used to sum the
+  full physical width: after `filter_genes` (or any column projection) on a lazy
+  dataset, `adata.X.sum(axis=1)` included the genes that had just been removed,
+  and `adata.X.mean(axis=1)` divided that physical-width sum by the *visible*
+  column count. `filter_cells` on a lazy dataset thresholded the same
+  physical-width totals. All of them now cover only the visible genes, matching
+  `adata.obs["total_counts"]` and scanpy on the sliced object. There is **no
+  runtime signal** for the change — a pipeline that filtered cells after a lazy
+  `filter_genes` will now keep and drop different cells. Re-check thresholds
+  tuned against older output. (`getnnz` was already projection-aware, and the
+  backed — non-lazy — dunders were already correct.)
+- **`adata.raw` is not kept aligned by the backed filter ops.** `raw` is
+  obs-aligned, but `filter_cells` / `subset_obs` on a backed or lazy `X` leave it
+  at the original row count; scanpy on an in-memory AnnData subsets it. Set
+  `adata.raw = None` before filtering, or re-derive it afterwards. Every other
+  aligned member (`layers`, `obsm`, `varm`, `obsp`, `varp`) *is* kept in step —
+  see [docs/api.md § Axis subsetting and aligned
+  members](api.md#axis-subsetting-and-aligned-members).
 
 ## Errors you might see
 

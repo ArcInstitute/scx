@@ -1370,6 +1370,28 @@ All accelerators that support GPU expose a `device` parameter:
 > if it didn't take the ideal one. See
 > [docs/api.md § Accelerator route metadata](api.md#accelerator-route-metadata).
 
+### Axis-subsetting ops and the aligned members
+
+`filter_cells`, `filter_genes`, `subset_obs`, and `highly_variable_genes(subset=True)`
+subset one axis of the AnnData in place. On a backed or lazy `X` the subset is a
+projection update — the matrix is never materialized — and every aligned member
+follows: `layers`, `obsm`, `obsp` on the obs axis; `layers`, `varm`, `varp` on the
+var axis. SCX handles absorb it as a projection update; lazy `to_anndata()` mapping
+entries record it and apply it on first read, so a `filter_cells` never pulls an
+`obsp` graph off disk; plain numpy / scipy / pandas members are positionally sliced.
+An in-memory `X` goes to anndata's own `_inplace_subset_obs` / `_inplace_subset_var`.
+
+> [!NOTE]
+> **`adata.raw` is the one exception on the backed path.** It is obs-aligned, but a
+> backed `filter_cells` / `subset_obs` leaves it at the original row count. Set
+> `adata.raw = None` before filtering, or re-derive it. The in-memory route keeps it
+> aligned because anndata does. Full table in
+> [docs/api.md § Axis subsetting and aligned members](api.md#axis-subsetting-and-aligned-members).
+
+On a **lazy** `X` with an active column projection, `filter_cells` thresholds the
+visible-gene totals — the same numbers `adata.obs["total_counts"]` and
+`adata.X.sum(axis=1)` report, and what scanpy would compute on the sliced object.
+
 ### Compatibility matrix
 
 | Op                       | CPU | GPU | Scanpy-parity kwargs                                                  | scx-only kwargs                                |
