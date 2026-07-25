@@ -1908,6 +1908,7 @@ impl ScxLazyTransformedDataset {
                 op.to_string(),
                 threshold,
                 self.kept_to_global.clone(),
+                self.col_projection.clone(),
                 self.non_negative,
                 self.transforms.clone(),
             );

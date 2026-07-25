@@ -95,6 +95,19 @@ impl ScxLazyPairwiseMapping {
         }
     }
 
+    /// Seed the open-time var projection (`to_anndata(var_names=[...])`).
+    ///
+    /// Only meaningful for `Varp`: the obs axis gets its filter through
+    /// `kept_to_global` at decode, but the var-axis bridges decode at full
+    /// physical width. See [`PendingSubsets::seed_open_projection`].
+    pub(crate) fn with_var_projection(self, indices: Option<&[u32]>) -> Self {
+        if let Some(indices) = indices {
+            debug_assert_eq!(self.axis, PairwiseAxis::Varp);
+            self.pending.seed_open_projection(ValueAxes::Both, indices);
+        }
+        self
+    }
+
     /// Convert the lazy mapping into a plain `dict` by materializing
     /// every key. Used by the `eager=True` `to_anndata()` path.
     pub(crate) fn materialize_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -296,6 +309,15 @@ pub struct ScxLazyVarmMapping {
 }
 
 impl ScxLazyVarmMapping {
+    /// Seed the open-time var projection. varm is var-aligned on its rows;
+    /// see [`ScxLazyPairwiseMapping::with_var_projection`].
+    pub(crate) fn with_var_projection(self, indices: Option<&[u32]>) -> Self {
+        if let Some(indices) = indices {
+            self.pending.seed_open_projection(ValueAxes::Rows, indices);
+        }
+        self
+    }
+
     pub(crate) fn new(reader: Arc<ScxReader>) -> Self {
         let state: HashMap<String, Option<Py<PyAny>>> =
             reader.list_varm().into_iter().map(|k| (k, None)).collect();

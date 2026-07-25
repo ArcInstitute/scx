@@ -4,7 +4,6 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::accel::preprocessing::clear_gpu_normalize_marker;
 use crate::axis_align::{subset_obs_axis, subset_var_axis};
 use crate::backed::{detached, ScxBackedSparseDataset};
 use crate::lazy_transform::ScxLazyTransformedDataset;
@@ -209,10 +208,6 @@ pub fn filter_cells(
         return Ok(());
     }
 
-    // Filtering changes n_obs, invalidating any pending GPU normalize-fusion
-    // marker (its kept_to_global / n_obs no longer match adata).
-    clear_gpu_normalize_marker(adata)?;
-
     let x = adata.getattr("X")?;
     let need_nnz = min_genes.is_some() || max_genes.is_some();
     let need_sums = min_counts.is_some() || max_counts.is_some();
@@ -383,10 +378,6 @@ pub fn filter_genes(
     if min_cells.is_none() && max_cells.is_none() && min_counts.is_none() && max_counts.is_none() {
         return Ok(());
     }
-
-    // Filtering changes n_vars / col_projection, invalidating any pending GPU
-    // normalize-fusion marker.
-    clear_gpu_normalize_marker(adata)?;
 
     let x = adata.getattr("X")?;
     let need_nnz = min_cells.is_some() || max_cells.is_some();
@@ -562,10 +553,6 @@ pub fn subset_obs(
     adata: &Bound<'_, PyAny>,
     mask_or_indices: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
-    // Subsetting changes n_obs, invalidating any pending GPU normalize-fusion
-    // marker (its kept_to_global / n_obs no longer match adata).
-    clear_gpu_normalize_marker(adata)?;
-
     let np = py.import("numpy")?;
 
     // Get n_obs from adata.shape[0]

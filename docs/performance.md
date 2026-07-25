@@ -634,13 +634,13 @@ projection / none × deletions / none × 0, 1, 3 `qc_vars`, and a
 `cpu_profile_snapshot()` decode-count test pins the pass count so a later refactor cannot
 silently re-split it.
 
-**Re-measured after task 4.0a** (axis-subsetting correctness, SLURM job 2707068, same
-`cpu` partition and harness): pbmc10k `qc` 0.85 s / `filter_genes` 0.41 s,
-tabula_sapiens_100k `qc` 5.08 s / `filter_genes` 2.63 s, at the same 1 and 2 decode
-passes. Within run-to-run noise of the post-fusion column above, which is the expected
-result — 4.0a adds per-call bookkeeping over the aligned members, no matrix work and no
-I/O. Lazy `obsp` / `varp` / `varm` entries are *not* decoded by a subset at all; the
-subset is recorded and applied if and when the key is read.
+**Task 4.0a (axis-subsetting correctness) does not change these numbers.** It adds
+per-call bookkeeping over the aligned members — no matrix work and no I/O — and the
+decode-pass counts above are unchanged, which `test_qc_metrics_fused.py`'s
+`cpu_profile_snapshot()` test pins. Lazy `obsp` / `varp` / `varm` entries are not decoded
+by a subset at all; the subset is recorded and applied if and when the key is read. No
+wall-clock figures are quoted here because no capture backing them is checked in — see
+[docs/benchmark_manifest.md](benchmark_manifest.md).
 
 ### Differential expression (CPU, full-matrix)
 

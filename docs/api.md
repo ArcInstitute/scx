@@ -1768,13 +1768,13 @@ Confirm which path actually ran via the [route metadata](#accelerator-route-meta
 How each member is updated depends on what it is:
 
 - **SCX handles** (`ScxBackedLayerDataset`, `ScxLazyTransformedDataset`, `ScxBackedObsmDataset`) absorb the subset as a `kept_to_global` / `col_projection` update — no copy, no decode.
-- **Lazy mapping entries** (`obsp` / `varp` / `varm`, and `layers` / `obsm` on the lazy `to_anndata()` path) are not decoded at subset time. The subset is recorded and applied when the key is first read, so `filter_cells` on a file carrying a large kNN graph costs nothing extra unless you actually read `obsp`.
+- **Lazy mapping entries** are not decoded at subset time — the subset is recorded and applied when the key is first read, so `filter_cells` on a file carrying a large kNN graph costs nothing extra unless you actually read `obsp`. This covers `obsp` / `varp` / `varm` on `to_anndata(backed=True)`, and `obsm` only under `to_anndata(backed=True, obsm=[...])`. It does **not** cover the default (non-backed) `to_anndata()`: there `X` is an in-memory scipy matrix, so the whole subset goes through anndata, which reads the public properties and materializes every bridge.
 - **Everything else** — a numpy array, scipy matrix, or pandas DataFrame you added yourself — is positionally sliced.
 
-For an in-memory (non-SCX) `X`, the whole job goes to anndata's `_inplace_subset_obs` / `_inplace_subset_var`, matching scanpy exactly.
+For an in-memory (non-SCX) `X`, the whole job goes to anndata's `_inplace_subset_obs` / `_inplace_subset_var`, matching scanpy exactly. Two consequences worth knowing: that route is a full AnnData copy (peak memory ~2×, and `uns` is deep-copied), and it drops now-unused categorical levels from `obs` / `var`. The backed / lazy route does neither — it keeps unused categories, which is what SCX has always done. The two routes therefore disagree on category levels; 4.0b removes the split by handing both to anndata.
 
 > [!NOTE]
-> **`adata.raw` is not updated** when `X` is backed or lazy. `raw` is obs-aligned, so after `filter_cells` on a backed dataset `adata.raw` still has the original row count. Call `adata.raw = None` before filtering, or re-derive `raw` afterwards. The in-memory route (above) does keep `raw` aligned, because anndata handles it.
+> **`adata.raw` is not updated** when `X` is backed or lazy. `raw` is obs-aligned, so after `filter_cells` `adata.raw` still has the original row count. Note that `to_anndata(backed=True)` drops `raw` on open with a `DroppedRaw` warning, so this only bites when you attach one yourself — re-derive it after filtering. Do **not** reach for `adata.raw = None` on the in-memory route: there `raw` is already kept aligned by anndata, and clearing it loses data.
 
 #### Accelerator route metadata
 
@@ -1839,6 +1839,9 @@ PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`)
 
 **Column projection:**
 - `set_col_projection(col_indices)` — Restrict all access and aggregation to a subset of columns. Used internally by `to_anndata(var_names=...)` and streaming QC with gene subsets (`qc_vars`).
+
+  > [!WARNING]
+  > **This is a handle-level knob, not an axis subset.** It moves `X` only — `var`, `layers`, `varm` and `varp` are left at the old width, so the AnnData is inconsistent until you slice them yourself. It does not go through the funnel described in [Axis subsetting and aligned members](#axis-subsetting-and-aligned-members). Use `pyscx.accel.filter_genes` for a real gene subset; reach for this only when you want to reproject a bare handle.
 
 **Slicing:**
 - `__getitem__(row_slice)` `→ scipy.sparse.csr_matrix` — Decode requested shards, return scipy CSR.
@@ -1917,7 +1920,7 @@ PyO3 class wrapping `ScxBackedSparseDataset` with chained per-row transforms. Cr
 **Aggregation (streaming through transforms):**
 - `sum(axis=0|1)` `→ numpy.ndarray` — Column or row sums of transformed data.
 - `mean(axis=0|1)` `→ numpy.ndarray` — Column or row means of transformed data.
-- `var(axis=0|1)` `→ numpy.ndarray` — Column or row variance (two-pass streaming).
+- `var(axis=0|1)` `→ numpy.ndarray` — Column or row variance. `axis=0` is two-pass streaming; `axis=1` and `axis=None` **materialize** the visible matrix via `to_memory()` and compute `E[X²] − E[X]²` in f32, so they are neither out-of-core nor clamped at zero (a near-constant row can return a small negative). Prefer the backed `X.var(axis=1)`, which streams in f64 and clamps.
 - `getnnz(axis=0|1)` `→ numpy.ndarray` — Non-zero counts (unchanged by normalize/log1p).
 - `max(axis=0|1)` `→ numpy.ndarray` — Column or row max of transformed data.
 - `min(axis=0|1)` `→ numpy.ndarray` — Column or row min of transformed data.

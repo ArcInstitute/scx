@@ -252,6 +252,101 @@ def test_backed_obsm_handle_composes_without_gathering(scx_path, source):
     assert adata.obsm["X_emb"].shape == expected.shape
 
 
+def test_var_subset_under_an_open_time_projection(scx_path, source):
+    """`varm` / `varp` must survive a var subset on a gene-selected open.
+
+    `to_anndata(backed=True, var_names=[...])` projects X / var / layers, but the
+    varm and varp bridges decode at *physical* var width — unlike the obs-axis
+    bridges, which receive the open-time filter. Replaying a visible-space
+    selection against a physical-width value returned a different gene's rows at
+    the right shape, so anndata's validation passed and nothing complained. That
+    is worse than the loud `ValueError` it replaced.
+    """
+    import pyscx
+
+    picked = [5, 7, 9, 11, 13, 15, 17, 19, 21, 23]
+    names = [f"gene_{j}" for j in picked]
+    adata = pyscx.open(scx_path).to_anndata(backed=True, var_names=names)
+    assert adata.n_vars == len(picked)
+    # Readable, and the right genes, before any subset.
+    assert_allclose(_as_dense(adata.varm["loadings"]), source["varm"][picked], rtol=1e-6)
+
+    # No public var-subset entry point yet; drive it through filter_genes on a
+    # threshold that keeps a strict subset of the visible genes.
+    detected = (source["X"][:, picked] != 0).sum(axis=0)
+    threshold = int(np.median(detected)) + 1
+    pyscx.accel.filter_genes(adata, min_cells=threshold)
+
+    kept_local = np.flatnonzero(detected >= threshold)
+    assert 0 < len(kept_local) < len(picked), "fixture must drop some visible genes"
+    v = np.asarray(picked)[kept_local]
+
+    _assert_members(adata, source, np.ones(N_OBS, bool), np.isin(np.arange(N_VARS), v))
+
+
+def test_var_subset_preserves_request_order(scx_path, source):
+    """`preserve_var_order=True` + a var subset keeps X, var and layers in step.
+
+    The composed projection has to follow presentation order, not sorted on-disk
+    order — `visible_ondisk_in_presentation_order` is what carries that through
+    the funnel, and nothing else covered it.
+    """
+    import pyscx
+
+    # Deliberately unsorted, so sorted order and request order differ.
+    picked = [21, 4, 17, 9, 28]
+    names = [f"gene_{j}" for j in picked]
+    adata = pyscx.open(scx_path).to_anndata(
+        backed=True, var_names=names, preserve_var_order=True
+    )
+    assert list(adata.var_names) == names
+    assert_allclose(_as_dense(adata.X.to_memory()), source["X"][:, picked], rtol=1e-6)
+    assert_allclose(
+        _as_dense(adata.layers["counts"].to_memory()), source["layer"][:, picked], rtol=1e-6
+    )
+
+    detected = (source["X"][:, picked] != 0).sum(axis=0)
+    threshold = int(np.median(detected)) + 1
+    pyscx.accel.filter_genes(adata, min_cells=threshold)
+
+    kept = [p for p, d in zip(picked, detected) if d >= threshold]
+    assert 0 < len(kept) < len(picked)
+    assert list(adata.var_names) == [f"gene_{j}" for j in kept], "request order lost"
+    assert_allclose(_as_dense(adata.X.to_memory()), source["X"][:, kept], rtol=1e-6)
+    assert_allclose(
+        _as_dense(adata.layers["counts"].to_memory()), source["layer"][:, kept], rtol=1e-6
+    )
+
+
+def test_comparison_shortcircuit_respects_the_projection(scx_path, source):
+    """`(X > 0).sum(...)` must agree with `X.getnnz(...)` under a projection.
+
+    `_ComparisonResult` dropped `col_projection` while keeping the projected
+    `shape_val`, so the short-circuit read the physical axis: `sum()` over-counted,
+    `sum(axis=1)` returned physical-width row counts, and `sum(axis=0)` raised a
+    reshape error. `docs/scanpy.md` advertises this short-circuit as the
+    `sc.pp.calculate_qc_metrics` fast path, so it reached scanpy's own QC.
+    """
+    import pyscx
+
+    adata = pyscx.open(scx_path).to_anndata(backed=True)
+    cols = [3, 7, 11, 12, 19]
+    adata.X.set_col_projection(cols)
+    adata._var = adata.var.iloc[cols].copy()
+
+    x = adata.X
+    nz = source["X"][:, cols] != 0
+    gt = x > 0
+
+    assert int(np.asarray(gt.sum())) == int(nz.sum())
+    assert_array_equal(np.asarray(gt.sum(axis=1)).ravel(), nz.sum(axis=1))
+    assert_array_equal(np.asarray(gt.sum(axis=0)).ravel(), nz.sum(axis=0))
+    # ...and agrees with the getnnz path this PR already fixed.
+    assert int(np.asarray(gt.sum())) == int(x.getnnz())
+    # The non-short-circuit fallback materializes; it must project too.
+    assert (x > 0).toarray().shape == (N_OBS, len(cols))
+
+
 def test_in_memory_anndata_goes_through_anndata(source):
     """A non-SCX `X` is anndata's job, not ours.
 

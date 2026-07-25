@@ -1233,6 +1233,8 @@ impl ScxBackedSparseDataset {
                 op: op.to_string(),
                 threshold,
                 kept_to_global: self.kept_to_global.clone(),
+                col_projection: self.col_projection.clone(),
+                col_presentation: self.col_presentation.clone(),
                 non_negative: self.non_negative,
                 transforms: None,
             };

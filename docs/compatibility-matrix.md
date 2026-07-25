@@ -70,11 +70,32 @@ This row is informative — Python 3.13 is not yet exercised in CI, but
 the maintainer's environment treats it as a known-good point inside the
 declared bounds.
 
+## Private anndata APIs pyscx depends on
+
+Axis subsetting on a backed / lazy `X` cannot go through anndata's public
+surface — reading an aligned mapping validates it, which raises the moment `X`
+changes width — so `pyscx.accel.filter_cells` / `filter_genes` / `subset_obs`
+and `highly_variable_genes(subset=True)` reach the raw stores directly. The
+names below are private and unversioned; a rename inside the declared bound
+would surface as an `AttributeError` from inside a user's `filter_cells`.
+Verified byte-identical across `0.11.4` / `0.12.10` / `0.12.16`.
+
+| Name | Used for |
+|---|---|
+| `AnnData._obs`, `._var` | Slice the axis frames without the public setter's length check |
+| `AnnData._layers`, `._obsm`, `._varm`, `._obsp`, `._varp` | Reach aligned members without triggering read-time validation |
+| `AnnData._inplace_subset_obs`, `._inplace_subset_var` | Delegate the whole subset for an in-memory `X` |
+
+A compat test that fails loudly on upgrade is deferred to the structural
+follow-up (Phase 4.0b), which replaces these with registered `as_view` /
+`_subset` hooks.
+
 ## Known incompatibilities
 
 - **`anndata >= 0.13`** — Out of the declared bound. The `0.13` line is
   expected to drop the legacy `AnnData(filename=...)` constructor path
-  that `pyscx.from_anndata` still uses; revisit when `0.13` ships.
+  that `pyscx.from_anndata` still uses; revisit when `0.13` ships. It is
+  also the release most likely to move the private names above.
 - **`pyarrow >= 24`** — Out of the declared bound. Bump after running
   the `pyscx/tests/test_to_anndata_integration.py` suite locally on the
   new release; pyarrow's `RecordBatch` API has been stable, but the cap

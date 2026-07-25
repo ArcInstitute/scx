@@ -460,6 +460,58 @@ pub fn qc_row_pass(
     Ok(out)
 }
 
+/// Per-column nnz over the visible axis, for any (projection, keep-mask) pair.
+///
+/// The 4-way dispatch had three copies — `ScxBackedSparseDataset::col_nnz_raw`,
+/// the lazy `filter_genes` arm, and `_ComparisonResult` (which had *no*
+/// projection arm at all, and so returned physical-width counts under a
+/// projection). One copy, so a projection cannot be forgotten in a fourth.
+pub(crate) fn col_nnz_for(
+    reader: &BackedCsrReader,
+    cols: Option<&[u32]>,
+    kept: Option<&[u64]>,
+) -> Result<Vec<u32>> {
+    match (cols, kept) {
+        (Some(cols), Some(kept)) => col_nnz_masked_projected(reader, kept, cols),
+        (Some(cols), None) => col_nnz_projected(reader, cols),
+        (None, Some(kept)) => Ok(reader
+            .col_nnz_masked(kept)?
+            .iter()
+            .map(|&v| v as u32)
+            .collect()),
+        (None, None) => reader.col_nnz(),
+    }
+}
+
+/// Per-row nnz over the visible columns. Global-length: the caller applies the
+/// keep-mask, because row vectors index the global row axis.
+pub(crate) fn row_nnz_for(reader: &BackedCsrReader, cols: Option<&[u32]>) -> Result<Vec<i64>> {
+    match cols {
+        Some(cols) => row_nnz_projected(reader, cols),
+        None => reader.row_nnz(),
+    }
+}
+
+/// Total stored entries inside the visible window.
+pub(crate) fn total_nnz_for(
+    reader: &BackedCsrReader,
+    cols: Option<&[u32]>,
+    kept: Option<&[u64]>,
+) -> Result<usize> {
+    match (cols, kept) {
+        // Sum as u64: projected nnz can exceed u32::MAX at atlas scale.
+        (Some(_), _) => Ok(col_nnz_for(reader, cols, kept)?
+            .iter()
+            .map(|&v| v as u64)
+            .sum::<u64>() as usize),
+        (None, Some(kept)) => {
+            let all_nnz = reader.row_nnz()?;
+            Ok(kept.iter().map(|&g| all_nnz[g as usize]).sum::<i64>() as usize)
+        }
+        (None, None) => reader.total_nnz(),
+    }
+}
+
 /// Enforce the per-pass subset contract. Shared by the backed and lazy row
 /// passes.
 ///

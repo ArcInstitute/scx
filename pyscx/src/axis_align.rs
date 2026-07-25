@@ -3,12 +3,18 @@
 //! # Why this is not just `adata.layers[k] = adata.layers[k][:, keep]`
 //!
 //! anndata validates an aligned mapping **when the attribute is read**
-//! (`AlignedMappingProperty.__get__` → `construct` → `_validate_value`). The
-//! instant `X` / `_var` / `_obs` changes width, `adata.layers` and `adata.obsm`
-//! can no longer be *read* — so repair code that goes through the public
-//! property can never run, because reading is what raises. No ordering escapes
-//! it: writing the members first fails against the old shape, writing `X` first
-//! fails against the new one.
+//! (`AlignedMappingProperty.__get__` → `construct` → `_validate_value`), and it
+//! validates *every* entry, not the one being written. So the instant the axis
+//! shrinks, `adata.layers` and `adata.obsm` can no longer be *read* — the stale
+//! entries make the read itself raise — and repair code that goes through the
+//! public property can never run. No ordering escapes it: repair the members
+//! first and they fail against the old shape, repair the axis first and they
+//! fail against the new one.
+//!
+//! Note the trigger is `_obs` / `_var`, not `X`: `n_obs` and `n_vars` are
+//! `len(obs_names)` / `len(var_names)`, and `_validate_value` compares against
+//! `parent.shape[axis]`. Shrinking `X` alone leaves all five property reads
+//! working.
 //!
 //! The raw stores (`adata._layers`, `_obsm`, `_varm`, `_obsp`, `_varp`) are
 //! plain dicts — or, for a backed AnnData, one of the [`crate::lazy_mapping`]
@@ -94,6 +100,19 @@ impl AxisSelection {
             col_projection: Some((cols, preserve_order)),
         }
     }
+
+    /// A selection that only plain values can consume.
+    ///
+    /// Used to seed a lazy bridge with the projection applied at *open* time:
+    /// there is no SCX handle to compose into, the value simply has to be cut
+    /// down to the visible axis when it decodes.
+    pub(crate) fn positional_only(positional: Vec<i64>) -> Self {
+        Self {
+            positional: Arc::new(positional),
+            kept_to_global: None,
+            col_projection: None,
+        }
+    }
 }
 
 /// The five aligned stores, and how each parent axis reaches them.
@@ -132,6 +151,12 @@ pub(crate) fn subset_obs_axis(
     adata: &Bound<'_, PyAny>,
     keep: &[bool],
 ) -> PyResult<()> {
+    // Any axis subset invalidates a pending GPU normalize-fusion marker: its
+    // `kept_to_global` / `n_obs` / `n_vars` no longer describe `adata`. Doing
+    // it here rather than per-op is what finally covers HVG `subset=True`,
+    // which never invalidated it and so could re-run the fused pass at the
+    // pre-subset width.
+    crate::accel::preprocessing::clear_gpu_normalize_marker(adata)?;
     let x = adata.getattr("X")?;
     let positional = positional_indices(keep);
 
@@ -181,6 +206,8 @@ pub(crate) fn subset_var_axis(
     adata: &Bound<'_, PyAny>,
     keep: &[bool],
 ) -> PyResult<()> {
+    // See `subset_obs_axis` — the marker is stale either way.
+    crate::accel::preprocessing::clear_gpu_normalize_marker(adata)?;
     let x = adata.getattr("X")?;
     let positional = positional_indices(keep);
 
@@ -299,18 +326,52 @@ fn subset_axis(
     axis: Axis,
     sel: &AxisSelection,
 ) -> PyResult<()> {
+    // Resolve every store up front and fail before touching any of them. This
+    // is the cheap half of atomicity: a missing or unexpected store type is the
+    // one failure that would otherwise leave `X` and `_obs`/`_var` already
+    // moved while a member is still at the old width — permanently unreadable,
+    // which is the exact state this module exists to prevent.
+    let mut stores = Vec::with_capacity(3);
     for (attr, axes) in aligned_stores(axis) {
-        let Ok(store) = adata.getattr(*attr) else {
-            // AnnData always defines all five; a caller passing something else
-            // (a Raw, a mock) simply has no members to fix up.
-            continue;
-        };
+        let store = adata.getattr(*attr).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "cannot reach aligned store `{attr}` to keep it in step with the \
+                 subset ({e}). This build of pyscx expects anndata to keep the \
+                 aligned mappings in `_`-prefixed dicts; see \
+                 docs/compatibility-matrix.md for the supported versions."
+            ))
+        })?;
         if store.is_none() {
             continue;
         }
-        subset_store(py, &store, *axes, sel)?;
+        ensure_subsettable(&store, attr)?;
+        stores.push((store, *axes));
+    }
+    for (store, axes) in stores {
+        subset_store(py, &store, axes, sel)?;
     }
     Ok(())
+}
+
+/// Reject a store we could not subset, *before* anything has been committed.
+fn ensure_subsettable(store: &Bound<'_, PyAny>, attr: &str) -> PyResult<()> {
+    if store.is_instance_of::<PyDict>()
+        || store.cast::<ScxLazyPairwiseMapping>().is_ok()
+        || store.cast::<ScxLazyVarmMapping>().is_ok()
+        || store.cast::<ScxLazyObsmMapping>().is_ok()
+        || store.cast::<ScxLazyLayersMapping>().is_ok()
+    {
+        return Ok(());
+    }
+    Err(PyRuntimeError::new_err(format!(
+        "cannot subset aligned store `{attr}` of type {}: expected a dict or an \
+         SCX lazy mapping",
+        store
+            .get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+    )))
 }
 
 /// Apply a selection to one raw store, whatever kind of mapping it is.
@@ -336,6 +397,7 @@ fn subset_store(
     try_lazy!(ScxLazyObsmMapping);
     try_lazy!(ScxLazyLayersMapping);
 
+    // Unreachable: `ensure_subsettable` pre-flighted this before any commit.
     let dict = store.cast::<PyDict>().map_err(|_| {
         PyRuntimeError::new_err(format!(
             "cannot subset aligned store of type {}: expected a dict or an SCX \
@@ -398,33 +460,53 @@ fn subset_scx_handle(
         let mut borrowed = lazy.borrow_mut();
         match axes {
             ValueAxes::Rows => {
-                if let Some(kept) = &sel.kept_to_global {
-                    borrowed.set_kept_to_global(kept.as_ref().clone());
-                }
+                borrowed.set_kept_to_global(require_rows(sel, "a lazy layer")?.as_ref().clone());
             }
             ValueAxes::Cols => {
                 // A lazy dataset cannot carry a presentation reorder: lazy
                 // arithmetic on a `preserve_var_order` backed X materializes
                 // instead, so `preserve_order` is unreachable here.
-                if let Some((cols, _)) = &sel.col_projection {
-                    borrowed.set_col_projection(cols.as_ref().clone());
-                }
+                let (cols, _) = require_cols(sel, "a lazy layer")?;
+                borrowed.set_col_projection(cols.as_ref().clone());
             }
             ValueAxes::Both => unreachable!("guarded by subset_value"),
         }
         return Ok(true);
     }
     if let Ok(obsm) = value.cast::<ScxBackedObsmDataset>() {
-        if axes == ValueAxes::Rows {
-            if let Some(kept) = &sel.kept_to_global {
-                obsm.borrow_mut().set_kept_to_global(Arc::clone(kept));
-            }
+        if axes == ValueAxes::Rows && sel.kept_to_global.is_some() {
+            let kept = require_rows(sel, "a backed embedding")?;
+            obsm.borrow_mut().set_kept_to_global(Arc::clone(kept));
             return Ok(true);
         }
-        // A column subset of a backed dense embedding has no lazy
-        // representation; fall through and gather it.
+        // `ValueAxes::Rows` means *obs* for `_obsm` but *var* for `_varm`, and a
+        // backed dense embedding can only absorb an obs subset. Falling through
+        // gathers it rather than silently reporting an absorption that did not
+        // happen — the failure mode this module exists to end.
     }
     Ok(false)
+}
+
+/// An obs-axis selection must carry the row mapping an SCX handle composes.
+///
+/// Returning `Ok` without applying anything would report the value as absorbed
+/// while leaving it at the old width — a silent no-op of exactly the kind
+/// §9.18 catalogues.
+fn require_rows<'a>(sel: &'a AxisSelection, what: &str) -> PyResult<&'a Arc<Vec<u64>>> {
+    sel.kept_to_global.as_ref().ok_or_else(|| {
+        PyRuntimeError::new_err(format!(
+            "internal error: row subset of {what} carries no kept_to_global mapping"
+        ))
+    })
+}
+
+/// The var-axis counterpart of [`require_rows`].
+fn require_cols<'a>(sel: &'a AxisSelection, what: &str) -> PyResult<&'a (Arc<Vec<u32>>, bool)> {
+    sel.col_projection.as_ref().ok_or_else(|| {
+        PyRuntimeError::new_err(format!(
+            "internal error: column subset of {what} carries no col_projection"
+        ))
+    })
 }
 
 fn apply_to_backed(
@@ -434,17 +516,14 @@ fn apply_to_backed(
 ) -> PyResult<()> {
     match axes {
         ValueAxes::Rows => {
-            if let Some(kept) = &sel.kept_to_global {
-                backed.set_kept_to_global(kept.as_ref().clone());
-            }
+            backed.set_kept_to_global(require_rows(sel, "a backed matrix")?.as_ref().clone());
         }
         ValueAxes::Cols => {
-            if let Some((cols, preserve_order)) = &sel.col_projection {
-                if *preserve_order {
-                    backed.set_col_projection_ordered(cols.as_ref().clone());
-                } else {
-                    backed.set_col_projection(cols.as_ref().clone());
-                }
+            let (cols, preserve_order) = require_cols(sel, "a backed matrix")?;
+            if *preserve_order {
+                backed.set_col_projection_ordered(cols.as_ref().clone());
+            } else {
+                backed.set_col_projection(cols.as_ref().clone());
             }
         }
         ValueAxes::Both => unreachable!("guarded by subset_value"),
@@ -498,6 +577,22 @@ fn slice_positional(
 pub(crate) struct PendingSubsets(std::sync::Mutex<Vec<(ValueAxes, AxisSelection)>>);
 
 impl PendingSubsets {
+    /// Seed the list with the column projection a `to_anndata(var_names=[...])`
+    /// open already applied to `X` / `var` / `layers`.
+    ///
+    /// The var-axis bridges decode at **physical** width — unlike the obs-axis
+    /// ones, which receive the open-time filter directly — so without this the
+    /// deferred selections, whose indices are visible-space, would index the
+    /// wrong rows. Seeding rather than adding a separate filter keeps one
+    /// invariant to hold: *a bridge's decode baseline is the visible width its
+    /// selections were recorded against.*
+    pub(crate) fn seed_open_projection(&self, axes: ValueAxes, indices: &[u32]) {
+        self.push(
+            axes,
+            AxisSelection::positional_only(indices.iter().map(|&c| c as i64).collect()),
+        );
+    }
+
     fn push(&self, axes: ValueAxes, sel: AxisSelection) {
         self.0
             .lock()

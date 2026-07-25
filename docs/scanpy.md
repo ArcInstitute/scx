@@ -1377,9 +1377,12 @@ subset one axis of the AnnData in place. On a backed or lazy `X` the subset is a
 projection update — the matrix is never materialized — and every aligned member
 follows: `layers`, `obsm`, `obsp` on the obs axis; `layers`, `varm`, `varp` on the
 var axis. SCX handles absorb it as a projection update; lazy `to_anndata()` mapping
-entries record it and apply it on first read, so a `filter_cells` never pulls an
-`obsp` graph off disk; plain numpy / scipy / pandas members are positionally sliced.
-An in-memory `X` goes to anndata's own `_inplace_subset_obs` / `_inplace_subset_var`.
+entries record it and apply it on first read, so a `filter_cells` on a backed
+AnnData never pulls an `obsp` graph off disk; plain numpy / scipy / pandas members
+are positionally sliced. An in-memory `X` — including the default, non-backed
+`to_anndata()` — goes to anndata's own `_inplace_subset_obs` /
+`_inplace_subset_var` instead, which materializes every lazy bridge and drops
+unused categorical levels.
 
 > [!NOTE]
 > **`adata.raw` is the one exception on the backed path.** It is obs-aligned, but a
