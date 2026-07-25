@@ -1,4 +1,5 @@
 mod accel;
+pub(crate) mod axis_align;
 pub(crate) mod backed;
 mod convert;
 mod experiment;

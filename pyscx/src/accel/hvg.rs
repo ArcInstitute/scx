@@ -9,7 +9,6 @@ use pyo3::types::PyDict;
 use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 
-use super::filtering::update_layers_col_projection;
 use super::util::extract_materialized_csr;
 
 /// Single-shard [`scx_format_io::ShardSource`] adapter over a borrowed in-memory
@@ -245,7 +244,7 @@ pub fn highly_variable_genes<'py>(
                             .as_slice()?
                             .to_vec();
                         let x_obj = adata.getattr("X")?;
-                        apply_hvg_subset(py, adata, &x_obj, &mask)?;
+                        apply_hvg_subset(py, adata, &mask)?;
                     }
                     return Ok(());
                 }
@@ -380,7 +379,6 @@ pub fn highly_variable_genes<'py>(
         return hvg_on_source(
             py,
             adata,
-            &x,
             &source,
             n_obs,
             n_vars,
@@ -409,7 +407,6 @@ pub fn highly_variable_genes<'py>(
         return hvg_on_source(
             py,
             adata,
-            &x,
             &source,
             n_obs,
             n_vars,
@@ -439,7 +436,6 @@ pub fn highly_variable_genes<'py>(
         return hvg_on_source(
             py,
             adata,
-            &x,
             &source,
             n_obs,
             n_vars,
@@ -509,7 +505,6 @@ pub fn highly_variable_genes<'py>(
 fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
-    x_obj: &Bound<'py, PyAny>,
     source: &S,
     n_obs: usize,
     n_vars: usize,
@@ -525,7 +520,6 @@ fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
         "seurat_v3" | "seurat_v3_paper" => hvg_seurat_v3(
             py,
             adata,
-            x_obj,
             source,
             n_obs,
             n_vars,
@@ -539,7 +533,6 @@ fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
         "seurat" => hvg_seurat(
             py,
             adata,
-            x_obj,
             source,
             n_obs,
             n_vars,
@@ -677,7 +670,6 @@ pub(super) fn build_shard_source(
 fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
-    x_obj: &Bound<'py, PyAny>,
     source: &S,
     n_obs: usize,
     n_vars: usize,
@@ -1121,7 +1113,7 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
 
     // ── 6. Subset if requested ──────────────────────────────────────────
     if subset {
-        apply_hvg_subset(py, adata, x_obj, &hvg_mask)?;
+        apply_hvg_subset(py, adata, &hvg_mask)?;
     }
 
     Ok(())
@@ -1164,7 +1156,6 @@ fn log1p_base_scale(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<f64> {
 fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
-    x_obj: &Bound<'py, PyAny>,
     source: &S,
     _n_obs: usize,
     n_vars: usize,
@@ -1285,88 +1276,21 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
 
     // ── 6. Subset if requested ──────────────────────────────────────────
     if subset {
-        apply_hvg_subset(py, adata, x_obj, &mask)?;
+        apply_hvg_subset(py, adata, &mask)?;
     }
 
     Ok(())
 }
 
-/// Apply HVG subset: set column projection on X (and layers), slice var.
+/// Apply HVG subset: the same var-axis mutation `filter_genes` performs.
 ///
-/// Order: update X col_projection + layers FIRST so shapes match,
-/// then set `_var` (bypassing AnnData shape validation).
-fn apply_hvg_subset(
-    py: Python<'_>,
-    adata: &Bound<'_, PyAny>,
-    x_obj: &Bound<'_, PyAny>,
-    hvg_mask: &[bool],
-) -> PyResult<()> {
-    let mask_arr = numpy::PyArray::from_vec(py, hvg_mask.to_vec());
-
-    if let Ok(backed) = x_obj.cast::<ScxBackedSparseDataset>() {
-        let new_col_indices: Vec<u32> = match backed.borrow().col_projection() {
-            Some(existing) => hvg_mask
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| existing[i])
-                .collect(),
-            None => hvg_mask
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| i as u32)
-                .collect(),
-        };
-
-        // Update X and layers FIRST so shapes are consistent
-        backed
-            .borrow_mut()
-            .set_col_projection(new_col_indices.clone());
-        update_layers_col_projection(adata, &new_col_indices, false)?;
-
-        // Slice var via _var: AnnData's public var setter validates
-        // len(value) == self.n_vars, where n_vars is derived from the current
-        // _var DataFrame. Since we're changing the column count, the public
-        // setter would reject the new (shorter) DataFrame. Setting _var
-        // directly is the same approach used by anndata's own _inplace_subset_var.
-        let var = adata.getattr("var")?;
-        let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
-        adata.setattr("_var", filtered_var)?;
-    } else if let Ok(lazy) = x_obj.cast::<ScxLazyTransformedDataset>() {
-        let new_col_indices: Vec<u32> = match lazy.borrow().col_projection() {
-            Some(existing) => hvg_mask
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| existing[i])
-                .collect(),
-            None => hvg_mask
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| i as u32)
-                .collect(),
-        };
-
-        lazy.borrow_mut()
-            .set_col_projection(new_col_indices.clone());
-        update_layers_col_projection(adata, &new_col_indices, false)?;
-
-        // See comment above in backed branch for why _var is used.
-        let var = adata.getattr("var")?;
-        let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
-        adata.setattr("_var", filtered_var)?;
-    } else {
-        // In-memory scipy/dense X (the native in-memory HVG path). There is no
-        // col_projection to update — slice the AnnData in place. anndata's own
-        // `_inplace_subset_var` handles X, var, varm, and layers consistently,
-        // and preserves the result columns we just wrote to `var` (the boolean
-        // mask selects the kept rows of the already-updated frame).
-        adata.call_method1("_inplace_subset_var", (mask_arr,))?;
-    }
-
-    Ok(())
+/// `subset_var_axis` composes the new `col_projection` for a backed / lazy X
+/// and hands a plain in-memory X to anndata's `_inplace_subset_var`; either way
+/// it slices `_var` and every var-aligned member. The boolean mask selects rows
+/// of the *already-updated* var frame, so the HVG result columns written above
+/// survive.
+fn apply_hvg_subset(py: Python<'_>, adata: &Bound<'_, PyAny>, hvg_mask: &[bool]) -> PyResult<()> {
+    crate::axis_align::subset_var_axis(py, adata, hvg_mask)
 }
 
 /// Loess fit on (log10 mean, log10 var) for non-constant genes — the
@@ -1436,7 +1360,6 @@ fn csc_clip_val(means: &[f64], estimat_var: &[f64], n_obs: usize) -> Vec<f64> {
 fn csc_finish_seurat_v3(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
-    x_obj: &Bound<'_, PyAny>,
     n_obs: usize,
     n_vars: usize,
     means: Vec<f64>,
@@ -1487,7 +1410,7 @@ fn csc_finish_seurat_v3(
     var.set_item("highly_variable_rank", numpy::PyArray::from_vec(py, ranks))?;
 
     if subset {
-        apply_hvg_subset(py, adata, x_obj, &hvg_mask)?;
+        apply_hvg_subset(py, adata, &hvg_mask)?;
     }
     Ok(())
 }
@@ -1599,7 +1522,6 @@ fn hvg_seurat_v3_csc(
         return csc_finish_seurat_v3(
             py,
             adata,
-            &x,
             n_obs,
             n_vars,
             stats.means,
@@ -1635,7 +1557,6 @@ fn hvg_seurat_v3_csc(
         return csc_finish_seurat_v3(
             py,
             adata,
-            &x,
             n_obs,
             n_vars,
             stats.means,

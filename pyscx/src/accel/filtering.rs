@@ -5,7 +5,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::accel::preprocessing::clear_gpu_normalize_marker;
-use crate::backed::{detached, ScxBackedLayerDataset, ScxBackedSparseDataset};
+use crate::axis_align::{subset_obs_axis, subset_var_axis};
+use crate::backed::{detached, ScxBackedSparseDataset};
 use crate::lazy_transform::ScxLazyTransformedDataset;
 use crate::projected_agg;
 
@@ -167,131 +168,13 @@ pub(super) fn build_keep_mask(
     keep
 }
 
-/// Compose a new deletion vector from a boolean mask and an existing kept_to_global.
-pub(super) fn compose_kept_to_global(keep: &[bool], existing: Option<&[u64]>) -> Vec<u64> {
-    match existing {
-        Some(existing) => keep
-            .iter()
-            .enumerate()
-            .filter(|(_, &k)| k)
-            .map(|(i, _)| existing[i])
-            .collect(),
-        None => keep
-            .iter()
-            .enumerate()
-            .filter(|(_, &k)| k)
-            .map(|(i, _)| i as u64)
-            .collect(),
-    }
-}
-
-/// Slice `adata.obs` and `adata.obsm` to match a boolean keep-mask.
-pub(super) fn slice_obs_and_obsm<'py>(
-    py: Python<'py>,
-    adata: &Bound<'py, PyAny>,
-    keep: &[bool],
-) -> PyResult<()> {
-    let np = py.import("numpy")?;
-    let mask_arr = numpy::PyArray::from_vec(py, keep.to_vec());
-
-    // Slice obs — use _obs to bypass anndata's shape validation
-    // (X.shape is already updated via set_kept_to_global before this call)
-    let obs = adata.getattr("obs")?;
-    let filtered_obs = obs.getattr("loc")?.get_item(&mask_arr)?;
-    adata.setattr("_obs", filtered_obs)?;
-
-    // Slice obsm entries
-    let obsm = adata.getattr("obsm")?;
-    // obsm may be empty or a dict-like; get keys safely
-    let keys_result: PyResult<Vec<String>> = obsm
-        .call_method0("keys")?
-        .try_iter()?
-        .map(|k| k.and_then(|k| k.extract()))
-        .collect();
-    if let Ok(keys) = keys_result {
-        // Build numpy boolean array for indexing
-        let np_mask = np.call_method1("array", (mask_arr,))?;
-        for key in &keys {
-            let arr = obsm.get_item(key)?;
-            let sliced = arr.get_item(&np_mask)?;
-            obsm.set_item(key, sliced)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Update all backed layers with a new deletion vector.
-pub(super) fn update_layers_kept_to_global(
-    adata: &Bound<'_, PyAny>,
-    new_kept: &[u64],
-) -> PyResult<()> {
-    let layers = adata.getattr("layers")?;
-    let keys_result: PyResult<Vec<String>> = layers
-        .call_method0("keys")?
-        .try_iter()?
-        .map(|k| k.and_then(|k| k.extract()))
-        .collect();
-    if let Ok(keys) = keys_result {
-        for key in &keys {
-            let layer_obj = layers.get_item(key)?;
-            if let Ok(layer) = layer_obj.cast::<ScxBackedLayerDataset>() {
-                layer
-                    .borrow_mut()
-                    .inner
-                    .set_kept_to_global(new_kept.to_vec());
-            }
-            // ScxLazyTransformedDataset layers are unlikely but handle them
-            if let Ok(lazy_layer) = layer_obj.cast::<ScxLazyTransformedDataset>() {
-                lazy_layer
-                    .borrow_mut()
-                    .set_kept_to_global(new_kept.to_vec());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Update all backed layers with a new column projection.
-pub(super) fn update_layers_col_projection(
-    adata: &Bound<'_, PyAny>,
-    new_cols: &[u32],
-    preserve_order: bool,
-) -> PyResult<()> {
-    let layers = adata.getattr("layers")?;
-    let keys_result: PyResult<Vec<String>> = layers
-        .call_method0("keys")?
-        .try_iter()?
-        .map(|k| k.and_then(|k| k.extract()))
-        .collect();
-    if let Ok(keys) = keys_result {
-        for key in &keys {
-            let layer_obj = layers.get_item(key)?;
-            if let Ok(layer) = layer_obj.cast::<ScxBackedLayerDataset>() {
-                if preserve_order {
-                    layer
-                        .borrow_mut()
-                        .inner
-                        .set_col_projection_ordered(new_cols.to_vec());
-                } else {
-                    layer
-                        .borrow_mut()
-                        .inner
-                        .set_col_projection(new_cols.to_vec());
-                }
-            }
-            // ScxLazyTransformedDataset cannot carry a presentation reorder;
-            // it never coexists with an ordered X (lazy arithmetic on an
-            // ordered backed dataset materializes instead). Sorted projection.
-            if let Ok(lazy_layer) = layer_obj.cast::<ScxLazyTransformedDataset>() {
-                lazy_layer
-                    .borrow_mut()
-                    .set_col_projection(new_cols.to_vec());
-            }
-        }
-    }
-    Ok(())
-}
+// Axis mutation — composing the new projection, re-pointing X, slicing the
+// obs/var frames and every aligned member — lives in `crate::axis_align`
+// behind `subset_obs_axis` / `subset_var_axis`. It used to be three helpers
+// here (`compose_kept_to_global`, `slice_obs_and_obsm`,
+// `update_layers_{kept_to_global,col_projection}`) that between them handled
+// two of the five aligned members and reached them through the *validating*
+// property, which raises the moment X changes width. See §9.18.
 
 // ---------------------------------------------------------------------------
 // filter_cells
@@ -374,19 +257,7 @@ pub fn filter_cells(
             max_counts,
         );
 
-        let new_kept = compose_kept_to_global(
-            &keep,
-            backed
-                .borrow()
-                .kept_to_global
-                .as_ref()
-                .map(|v| v.as_slice()),
-        );
-
-        backed.borrow_mut().set_kept_to_global(new_kept.clone());
-        slice_obs_and_obsm(py, adata, &keep)?;
-        update_layers_kept_to_global(adata, &new_kept)?;
-        return Ok(());
+        return subset_obs_axis(py, adata, &keep);
     }
 
     // Case 2: X is ScxLazyTransformedDataset
@@ -452,16 +323,9 @@ pub fn filter_cells(
             max_counts,
         );
 
-        let new_kept = compose_kept_to_global(
-            &keep,
-            lazy_ref.kept_to_global.as_ref().map(|v| v.as_slice()),
-        );
-
+        // Release the borrow before the funnel takes `borrow_mut` on the same X.
         drop(lazy_ref);
-        lazy.borrow_mut().set_kept_to_global(new_kept.clone());
-        slice_obs_and_obsm(py, adata, &keep)?;
-        update_layers_kept_to_global(adata, &new_kept)?;
-        return Ok(());
+        return subset_obs_axis(py, adata, &keep);
     }
 
     // Case 3: fallback to scanpy
@@ -572,48 +436,7 @@ pub fn filter_genes(
             max_counts,
         );
 
-        // Compose with the existing projection. `visible_ondisk_in_presentation_order`
-        // returns the on-disk index for each visible column in presentation order
-        // (or plain on-disk indices when no projection / no reorder is active), so
-        // the kept indices follow the same order as the (presentation-ordered) var
-        // rows the keep-mask was built against.
-        let preserve_order = backed.borrow().col_presentation_arc().is_some();
-        let visible_ondisk = backed.borrow().visible_ondisk_in_presentation_order();
-        let new_col_indices: Vec<u32> = match visible_ondisk {
-            Some(ondisk) => keep
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| ondisk[i])
-                .collect(),
-            None => keep
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| i as u32)
-                .collect(),
-        };
-
-        // Slice var BEFORE updating col_projection (AnnData validates
-        // shape consistency on .var setter, so we use ._var to bypass).
-        let mask_arr = numpy::PyArray::from_vec(py, keep);
-        let var = adata.getattr("var")?;
-        let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
-        // Use _var to skip shape validation (X.shape changes next)
-        adata.setattr("_var", filtered_var)?;
-
-        if preserve_order {
-            backed
-                .borrow_mut()
-                .set_col_projection_ordered(new_col_indices.clone());
-        } else {
-            backed
-                .borrow_mut()
-                .set_col_projection(new_col_indices.clone());
-        }
-
-        update_layers_col_projection(adata, &new_col_indices, preserve_order)?;
-        return Ok(());
+        return subset_var_axis(py, adata, &keep);
     }
 
     // Case 2: X is ScxLazyTransformedDataset
@@ -673,35 +496,9 @@ pub fn filter_genes(
             max_counts,
         );
 
-        let new_col_indices: Vec<u32> = match lazy_ref.col_projection() {
-            Some(existing) => keep
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| existing[i])
-                .collect(),
-            None => keep
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| i as u32)
-                .collect(),
-        };
-
+        // Release the borrow before the funnel takes `borrow_mut` on the same X.
         drop(lazy_ref);
-
-        // Slice var BEFORE updating col_projection (AnnData validates
-        // shape consistency on .var setter, so we use ._var to bypass).
-        let mask_arr = numpy::PyArray::from_vec(py, keep);
-        let var = adata.getattr("var")?;
-        let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
-        adata.setattr("_var", filtered_var)?;
-
-        lazy.borrow_mut()
-            .set_col_projection(new_col_indices.clone());
-
-        update_layers_col_projection(adata, &new_col_indices, false)?;
-        return Ok(());
+        return subset_var_axis(py, adata, &keep);
     }
 
     // Case 3: fallback to scanpy
@@ -835,46 +632,7 @@ pub fn subset_obs(
         return Ok(());
     }
 
-    let x = adata.getattr("X")?;
-
-    // Case 1: X is ScxBackedSparseDataset
-    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
-        let new_kept = compose_kept_to_global(
-            &keep,
-            backed
-                .borrow()
-                .kept_to_global
-                .as_ref()
-                .map(|v| v.as_slice()),
-        );
-        backed.borrow_mut().set_kept_to_global(new_kept.clone());
-        slice_obs_and_obsm(py, adata, &keep)?;
-        update_layers_kept_to_global(adata, &new_kept)?;
-        return Ok(());
-    }
-
-    // Case 2: X is ScxLazyTransformedDataset
-    if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
-        let new_kept = compose_kept_to_global(
-            &keep,
-            lazy.borrow().kept_to_global.as_ref().map(|v| v.as_slice()),
-        );
-        lazy.borrow_mut().set_kept_to_global(new_kept.clone());
-        slice_obs_and_obsm(py, adata, &keep)?;
-        update_layers_kept_to_global(adata, &new_kept)?;
-        return Ok(());
-    }
-
-    // Case 3: Fallback for non-SCX data — materialize subset
-    let mask_arr = numpy::PyArray::from_vec(py, keep.clone());
-    let np_mask = np.call_method1("array", (mask_arr,))?;
-
-    // Slice X
-    let x_sliced = x.get_item(&np_mask)?;
-    adata.setattr("_X", x_sliced)?;
-
-    // Slice obs and obsm
-    slice_obs_and_obsm(py, adata, &keep)?;
-
-    Ok(())
+    // Backed / lazy X compose a new deletion vector; a plain in-memory X goes
+    // to anndata's own `_inplace_subset_obs`, which also handles `raw`.
+    subset_obs_axis(py, adata, &keep)
 }
