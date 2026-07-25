@@ -209,26 +209,40 @@ fn subset_axis(
     drop(x);
 
     let bridges = detach_lazy_bridges(py, adata, axis)?;
-    if let Err(err) = rebuild_via_anndata(py, adata, axis, &positional) {
-        // The replacement is built before it is swapped in, so `adata` is
-        // untouched — put the bridges back and the failure is a clean no-op.
-        for (attr, _, bridge) in bridges {
-            adata.setattr(attr, bridge)?;
-        }
-        return Err(err);
-    }
+    let outcome = subset_detached(py, adata, axis, positional, &bridges);
 
-    let sel = selection_from_x(adata, axis, positional)?;
-    let mut result = Ok(());
-    for (attr, axes, bridge) in bridges {
-        if let (Ok(()), Some(axes)) = (&result, axes) {
-            result = apply_bridge_subset(py, bridge.bind(py), axes, &sel);
-        }
-        // Reattach unconditionally: a store left detached would turn a wrong
-        // shape into a `KeyError` from an unrelated call later on.
+    // Reattach unconditionally, whatever happened. A detached store is an empty
+    // dict left behind by `detach_lazy_bridges`, so leaking one turns a
+    // recoverable error into a silent `KeyError` from an unrelated call later
+    // on — strictly worse than the failure that caused it.
+    for (attr, _, bridge) in bridges {
         adata.setattr(attr, bridge)?;
     }
-    result
+    outcome
+}
+
+/// The body of [`subset_axis`] that runs while the bridges are detached.
+///
+/// Split out so the caller can reattach on every path: an early `?` in here
+/// cannot leak a detached store. On failure before the swap `adata` is
+/// untouched (anndata builds the replacement first), and on failure after it
+/// the bridges come back un-subset, which is loud — a shape mismatch on the
+/// next read — rather than silent.
+fn subset_detached(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    axis: Axis,
+    positional: Vec<i64>,
+    bridges: &[DetachedBridge],
+) -> PyResult<()> {
+    rebuild_via_anndata(py, adata, axis, &positional)?;
+    let sel = selection_from_x(adata, axis, positional)?;
+    for (_, axes, bridge) in bridges {
+        if let Some(axes) = axes {
+            apply_bridge_subset(py, bridge.bind(py), *axes, &sel)?;
+        }
+    }
+    Ok(())
 }
 
 /// Replace `adata` with its own subset, the way anndata would.
@@ -262,6 +276,17 @@ fn rebuild_via_anndata(
     kwargs.set_item("X", view.getattr("X")?)?;
     for name in ["layers", "obsm", "varm", "obsp", "varp"] {
         kwargs.set_item(name, subset_mapping_keeping_handles(py, &view, name)?)?;
+    }
+    // `raw` for the same reason as `X`. Left to `_mutated_copy`'s fallback it
+    // becomes `self.raw.copy()` → `Raw.copy()` → `.copy()` on the handle, which
+    // materializes the whole raw counts matrix. `adata.raw = adata` before
+    // `filter_genes` is the canonical scanpy pattern, so that would read an
+    // entire second matrix off disk on every gene filter. Handing over the
+    // view's own `Raw` keeps `raw._X` un-copied — `_init_as_actual` rebuilds it
+    // as `Raw(self, raw._X, raw.var, raw.varm)`.
+    let raw = view.getattr("raw")?;
+    if !raw.is_none() {
+        kwargs.set_item("raw", raw)?;
     }
     let new = view.call_method("_mutated_copy", (), Some(&kwargs))?;
     adata.call_method1("_init_as_actual", (new,))?;
@@ -444,9 +469,17 @@ pub(crate) fn compose_rows_positional(
     rows: &[i64],
     n_visible: usize,
 ) -> PyResult<Vec<u64>> {
+    // Bound by the map itself when there is one. Every handle keeps
+    // `shape_val` equal to its visible length (`set_kept_to_global` /
+    // `set_col_projection*` update both together), so the two agree — but
+    // `n_visible` arrives as a separate argument, and if a future construction
+    // path ever broke that invariant the indexing below would *panic* rather
+    // than raise. Deriving the bound from `existing` makes the out-of-bounds
+    // impossible instead of merely unlikely.
+    let len = existing.map_or(n_visible, |e| e.len());
     rows.iter()
         .map(|&i| {
-            let i = normalize_index(i, n_visible, "row")?;
+            let i = normalize_index(i, len, "row")?;
             Ok(match existing {
                 Some(existing) => existing[i],
                 None => i as u64,
@@ -465,15 +498,32 @@ pub(crate) fn compose_cols_positional(
     cols: &[i64],
     n_visible: usize,
 ) -> PyResult<Vec<u32>> {
+    // See [`compose_rows_positional`] — bound by the map so an invariant
+    // violation raises instead of panicking.
+    let len = existing.map_or(n_visible, |e| e.len());
     cols.iter()
         .map(|&i| {
-            let i = normalize_index(i, n_visible, "column")?;
+            let i = normalize_index(i, len, "column")?;
             Ok(match existing {
                 Some(existing) => existing[i],
                 None => i as u32,
             })
         })
         .collect()
+}
+
+/// Whether a composed row map selects every row of an already-unsubset handle.
+///
+/// Both conditions are load-bearing. `was_unsubset` because composing `0..n`
+/// onto an *existing* map reproduces that map, which is a real window and must
+/// be kept. And the **length** must match the handle's current row count: a
+/// prefix like `0..25` of a 100-row handle also satisfies `composed[i] == i`,
+/// but dropping it there would leave `X` at full height while `obs` shrank —
+/// which is exactly what `iter_chunks`' `adata[start:end].copy()` does.
+pub(crate) fn is_identity_rows(composed: &[u64], n_visible: usize, was_unsubset: bool) -> bool {
+    was_unsubset
+        && composed.len() == n_visible
+        && composed.iter().enumerate().all(|(i, &g)| i as u64 == g)
 }
 
 /// Resolve a possibly-negative index against a visible axis length.

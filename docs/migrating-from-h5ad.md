@@ -506,6 +506,12 @@ scanpy script. Each is documented in full in `docs/scanpy.md`.
   and drop unused categorical levels like scanpy does. See [docs/api.md § Axis
   subsetting and aligned
   members](api.md#axis-subsetting-and-aligned-members).
+- **A backed axis subset now deep-copies `uns`.** anndata builds the replacement
+  object with `deepcopy(uns)`, so an entry that cannot be deep-copied — a lock,
+  an open file handle, a live client — makes `filter_cells` / `filter_genes`
+  raise `TypeError` where the older backed path silently left `uns` alone. This
+  matches what an in-memory AnnData has always done. Keep non-copyable objects
+  out of `uns`, or drop them before filtering.
 
 ## Errors you might see
 

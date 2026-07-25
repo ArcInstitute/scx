@@ -80,8 +80,13 @@ fn scx_as_view(obj: Py<PyAny>, view_args: Option<Py<PyAny>>) -> Py<PyAny> {
 /// instead of passing the handles through untouched — its `object` fallback
 /// returns unrecognized values as-is, so `adata.to_memory().X` used to still be
 /// a handle. `copy` is irrelevant here: `to_memory` always allocates.
+/// `copy` is positional-or-keyword deliberately. anndata 0.12 calls this
+/// `to_memory(attr, copy=copy)`, but 0.11 — inside the declared
+/// `anndata>=0.11,<0.13` range — calls it **positionally**, and a keyword-only
+/// parameter would make `adata.to_memory()` raise `TypeError` there. The
+/// permissive signature satisfies both.
 #[pyfunction]
-#[pyo3(signature = (x, *, copy=false))]
+#[pyo3(signature = (x, copy=false))]
 fn scx_to_memory<'py>(x: &Bound<'py, PyAny>, copy: bool) -> PyResult<Bound<'py, PyAny>> {
     let _ = copy;
     x.call_method0("to_memory")
@@ -111,6 +116,14 @@ fn scx_subset<'py>(
     };
     let rows = rows.as_deref();
     let cols = cols.as_deref();
+
+    // Not every selection can be expressed as a lazy window. When it cannot,
+    // materialize — which is exactly what anndata's `object` fallback did
+    // before these hooks existed, so this is the shipped behaviour rather than
+    // a new limitation.
+    if !expressible_as_window(value, rows, cols) {
+        return value.get_item(subset_idx);
+    }
 
     if let Ok(layer) = value.cast::<ScxBackedLayerDataset>() {
         let out = layer.borrow().subset_clone(rows, cols)?;
@@ -152,6 +165,63 @@ fn scx_subset<'py>(
 // ---------------------------------------------------------------------------
 // Index handling
 // ---------------------------------------------------------------------------
+
+/// Whether this selection can be carried as a lazy projection update rather
+/// than materialized.
+///
+/// # Rows must be strictly ascending
+///
+/// `kept_to_global` (visible row → global file row) is a **construction
+/// invariant: strictly ascending**. Every masked column kernel
+/// `partition_point`s it instead of scanning — `col_aggregate_masked` /
+/// `col_sums_and_nnz_masked` in `scx-format-io`, `projected_agg`, the lazy
+/// shard source, `shard_boundaries`. Handed a reordered or duplicated map they
+/// compute a garbage `lo..hi` and index out of bounds, which surfaces as a
+/// `PanicException` with a wrapped `u64` from `X.sum(axis=0)` / `getnnz` / HVG
+/// / QC.
+///
+/// Critically this is invisible on a single-shard file, where `partition_point`
+/// returns the whole slice and order-independent aggregates come out right — so
+/// small fixtures pass and the failure only appears at real scale. Hence the
+/// guard here rather than a test-shaped assumption.
+///
+/// # Columns must be unique
+///
+/// The column axis *can* express a reorder (`set_col_projection_ordered` keeps
+/// a separate `col_presentation` permutation), but it dedups — so a repeated
+/// column would silently narrow `X` while anndata expects the repeat, and the
+/// shapes would diverge. A lazily-transformed `X` additionally cannot express a
+/// reorder at all: it stores its projection sorted.
+fn expressible_as_window(
+    value: &Bound<'_, PyAny>,
+    rows: Option<&[i64]>,
+    cols: Option<&[i64]>,
+) -> bool {
+    if let Some(rows) = rows {
+        if !is_strictly_ascending(rows) {
+            return false;
+        }
+    }
+    if let Some(cols) = cols {
+        if !is_strictly_ascending(cols) {
+            // Unique-but-reordered is fine for a backed handle, which carries a
+            // presentation permutation; a lazy one has nowhere to put it.
+            let unique = {
+                let mut sorted = cols.to_vec();
+                sorted.sort_unstable();
+                sorted.windows(2).all(|w| w[0] < w[1])
+            };
+            if !unique || value.cast::<ScxLazyTransformedDataset>().is_ok() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn is_strictly_ascending(v: &[i64]) -> bool {
+    v.windows(2).all(|w| w[0] < w[1])
+}
 
 fn shape_of(value: &Bound<'_, PyAny>) -> PyResult<(usize, usize)> {
     value.getattr("shape")?.extract()
@@ -232,7 +302,24 @@ fn positional_from_index(
     let slice = readonly
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    Ok(Some(slice.to_vec()))
+    // Normalize negatives here rather than leaving it to the compose helpers:
+    // `expressible_as_window` inspects these values, and `[-1, 0]` is ascending
+    // as written but descending once resolved — taking the lazy path on it
+    // would build exactly the non-monotone map that panics.
+    slice
+        .iter()
+        .map(|&i| {
+            let n = len as i64;
+            let normalized = if i < 0 { i + n } else { i };
+            if normalized < 0 || normalized >= n {
+                return Err(PyIndexError::new_err(format!(
+                    "index {i} is out of bounds for axis of length {len}"
+                )));
+            }
+            Ok(normalized)
+        })
+        .collect::<PyResult<Vec<i64>>>()
+        .map(Some)
 }
 
 // ---------------------------------------------------------------------------

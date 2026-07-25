@@ -1775,6 +1775,9 @@ Members you added yourself — a numpy array, scipy matrix, or pandas DataFrame 
 
 A subset is **atomic**: anndata builds the replacement object and swaps it in, so a failure part-way through leaves the original untouched.
 
+> [!NOTE]
+> **`uns` is deep-copied by the subset.** anndata's replacement object carries a `deepcopy` of `uns`, so an entry that cannot be deep-copied — a lock, an open file handle, a live client object — makes the whole subset raise `TypeError`. The pre-4.0b backed path left `uns` alone and so tolerated these. Store non-copyable objects outside `uns`, or drop them before filtering. Everything the accelerators themselves put in `uns` (`scx_accel` route metadata, `pflog`, neighbors params) is plain data and copies fine.
+
 pyscx registers SCX handles with three private anndata `singledispatch` hooks to make this work (`as_view`, `_subset`, `to_memory`) and drives `_mutated_copy` / `_init_as_actual` directly. See [docs/compatibility-matrix.md § Private anndata APIs](compatibility-matrix.md#private-anndata-apis-pyscx-depends-on) for the supported versions and the compat test that fails loudly on an upgrade.
 
 **Plain anndata indexing works too.** `adata[:, mask]` builds a lazy view of a backed `X` (before, it raised `NotImplementedError`), `adata[mask].copy()` subsets and **materializes** — the documented "subset, then run scanpy" workflow — and `adata[mask].to_memory()` returns a fully in-memory AnnData. Use `pyscx.accel.subset_obs` / `subset_var` when you want the subset applied in place *without* materializing.

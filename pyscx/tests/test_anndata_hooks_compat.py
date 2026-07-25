@@ -49,6 +49,27 @@ def _handle_classes():
     return [getattr(pyscx, name) for name in HANDLE_CLASS_NAMES]
 
 
+@pytest.fixture
+def scx_hooks_path(tmp_dir):
+    """A minimal backed SCX file for the behavioural compat checks."""
+    import anndata
+    import numpy as np
+    import pandas as pd
+    import pyscx
+    import scipy.sparse as sp
+
+    rng = np.random.RandomState(11)
+    x = (rng.random_sample((20, 8)) * 10).astype(np.float32)
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(x),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(20)]),
+        var=pd.DataFrame(index=[f"g{j}" for j in range(8)]),
+    )
+    path = str(tmp_dir / "hooks_compat.scx")
+    pyscx.from_anndata(adata, path)
+    return path
+
+
 @pytest.mark.parametrize(("module_name", "attr"), SEAMS)
 def test_seam_exists_and_is_singledispatch(module_name, attr):
     module = importlib.import_module(module_name)
@@ -101,27 +122,48 @@ def test_raw_aligned_store_is_reachable(store):
     )
 
 
-def test_view_x_does_not_copy():
+def test_view_x_does_not_copy_behaviourally(scx_hooks_path):
     """``view.X`` must be the *un-copied* ``_subset`` result.
 
     This is the single substitution `rebuild_via_anndata` makes against
     `_inplace_subset_var`: anndata's own routine goes through `.copy()`, which
     materializes an SCX handle on purpose. If `AnnData.X` on a view started
     copying, every in-place accelerator would silently materialize.
+
+    Asserted on behaviour rather than on source text, so an anndata refactor
+    that preserves the semantics does not fail the build.
+    """
+    import numpy as np
+    import pyscx
+
+    adata = pyscx.open(scx_hooks_path).to_anndata(backed=True)
+    view = adata[np.arange(adata.n_obs) % 2 == 0]
+    assert type(view.X).__name__ == "ScxBackedSparseDataset", (
+        f"AnnData.X on a view returned {type(view.X).__name__}, not a lazy SCX "
+        "handle — `rebuild_via_anndata` would materialize the matrix it is "
+        "trying to keep on disk"
+    )
+
+
+def test_view_x_source_still_routes_through_subset():
+    """Source-level tripwire for the same contract as the test above.
+
+    Kept as an *early warning* that names the mechanism, not as the primary
+    guard: it fires on a harmless anndata refactor, so it is deliberately
+    paired with the behavioural check and stays a `pytest.fail` with a
+    pointer rather than an assertion about correctness.
     """
     import inspect
 
     from anndata import AnnData
 
     src = inspect.getsource(AnnData.X.fget)
-    assert "_subset(self._adata_ref.X" in src, (
-        "AnnData.X no longer resolves a view through `_subset`; check that "
-        "`rebuild_via_anndata` still gets a lazy matrix out of `view.X`"
-    )
-    assert ".copy()" not in src, (
-        "AnnData.X on a view now copies; `rebuild_via_anndata` would "
-        "materialize the matrix it is trying to keep on disk"
-    )
+    if "_subset(self._adata_ref.X" not in src or ".copy()" in src:
+        pytest.fail(
+            "AnnData.X on a view no longer looks like an un-copied `_subset`. "
+            "If test_view_x_does_not_copy_behaviourally still passes, the "
+            "contract holds and this tripwire just needs updating."
+        )
 
 
 def test_registration_reports_success():

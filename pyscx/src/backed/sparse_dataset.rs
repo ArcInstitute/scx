@@ -316,11 +316,25 @@ impl ScxBackedSparseDataset {
     ) -> PyResult<Self> {
         let mut out = self.clone_handle();
         if let Some(rows) = rows {
-            out.set_kept_to_global(crate::axis_align::compose_rows_positional(
+            let composed = crate::axis_align::compose_rows_positional(
                 self.kept_to_global.as_ref().map(|v| v.as_slice()),
                 rows,
                 self.shape_val.0,
-            )?);
+            )?;
+            // An identity map is not a subset. Installing one anyway would set
+            // `kept_to_global`, and *any* `kept_to_global` closes the CSC
+            // capability gate (`as_column_source` returns `None`) — permanently
+            // downgrading the `gpu_csc_v3` CSC-direct DE route on a file that
+            // was never really subset. The mutating ops guard this with an
+            // all-kept early return; this covers a caller that reaches
+            // `_subset` directly, e.g. `adata[np.arange(n_obs)]`.
+            if !crate::axis_align::is_identity_rows(
+                &composed,
+                self.shape_val.0,
+                self.kept_to_global.is_none(),
+            ) {
+                out.set_kept_to_global(composed);
+            }
         }
         if let Some(cols) = cols {
             let base = self.visible_ondisk_in_presentation_order();
