@@ -479,6 +479,23 @@ scanpy script. Each is documented in full in `docs/scanpy.md`.
 - **Backed-mode preprocessing is lazy on CPU, eager on GPU.** CPU wraps `X` in a
   lazy transform; GPU streams through a fused kernel and materializes a scipy
   CSR. See [docs/scanpy.md § Lazy vs eager preprocessing](scanpy.md#lazy-vs-eager-preprocessing).
+- **`pct_counts_<qc_var>` changed on lazy input.** After a lazy
+  `normalize_total`, `calculate_qc_metrics` now takes the `qc_var` subset sums
+  *through* the transform chain, so the ratio divides a transformed numerator by
+  a transformed denominator. It previously used a pre-transform numerator, which
+  could be off by more than 2×. There is **no runtime signal** for this: a
+  pipeline that filters on `pct_counts_mt` after a lazy normalize will keep and
+  drop different cells than it did before. Re-check any thresholds tuned against
+  older output.
+- **Aggregations on a projected lazy `X` disagree with each other, for now.**
+  After `filter_genes` (or any column projection) on a lazy dataset,
+  `adata.obs["total_counts"]` covers only the visible genes — correct — but
+  `adata.X.sum(axis=1)` still sums the full physical width, and
+  `adata.X.mean(axis=1)` divides that physical-width sum by the *visible* column
+  count. `getnnz` is projection-aware. `filter_cells` on a lazy dataset
+  thresholds the physical-width totals. Only the QC accelerator has been fixed;
+  the array-protocol dunders are tracked as a follow-up. Prefer
+  `adata.obs["total_counts"]` over `adata.X.sum(axis=1)` on projected lazy data.
 
 ## Errors you might see
 

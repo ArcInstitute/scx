@@ -34,8 +34,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from benchmarks.comprehensive.bench_env import DATA_DIR  # noqa: E402
 from benchmarks.comprehensive.results import BenchmarkResult, write_result  # noqa: E402
 
-OPS = ("pca", "hvg", "normalize")
+OPS = ("pca", "hvg", "normalize", "qc", "filter_genes")
 BENCHMARK = "accel_cpu_profile_backed"
+
+# Gene subsets for the `qc` op. Three qc_vars is the common analyst call
+# (`["mt", "ribo", "hb"]`); before the Phase-4.1 fusion each one cost its own
+# full shard decode on top of the four axis statistics, so the decode-bucket
+# count is the headline signal for this op.
+QC_VARS = ("mt", "ribo", "hb")
 
 
 def _peak_rss_mb() -> float:
@@ -60,8 +66,31 @@ def _run_op(op: str, scx_path: Path, n_comps: int) -> None:
     elif op == "normalize":
         pyscx.accel.normalize_total(adata, target_sum=1e4)
         _ = adata.X[:, :]  # force materialization of the lazy transform
+    elif op == "qc":
+        _assign_qc_masks(adata)
+        pyscx.accel.calculate_qc_metrics(adata, qc_vars=list(QC_VARS))
+    elif op == "filter_genes":
+        # Both thresholds → exercises the fused column pass. Values are
+        # deliberately permissive: the cost is the full scan, not the cut.
+        pyscx.accel.filter_genes(adata, min_cells=1, min_counts=1.0)
     else:
         raise ValueError(op)
+
+
+def _assign_qc_masks(adata) -> None:
+    """Attach three deterministic gene subsets as boolean `var` columns.
+
+    Real MT/ribo/hb prefixes are absent from several fixtures (Census var_names
+    are integer strings), so select by position instead — the accumulator cost
+    depends on subset *size*, not on which genes are in it.
+    """
+    import numpy as np
+
+    n_vars = adata.n_vars
+    idx = np.arange(n_vars)
+    # ~1% / ~5% / ~0.5% of genes, echoing typical MT / ribo / hb fractions.
+    for name, stride in zip(QC_VARS, (100, 20, 200)):
+        adata.var[name] = (idx % stride) == 0
 
 
 def _snapshot_flat() -> dict[str, float]:
@@ -122,10 +151,16 @@ def _fmt_row(dataset: str, op: str, r: BenchmarkResult) -> str:
     io = med("cpu_profile_io_ms")
     red = med("cpu_profile_reduction_ms")
     mar = med("cpu_profile_marshalling_ms")
+    # Shard-decode COUNT, not just time: for the multi-pass ops (qc,
+    # filter_genes) the number of passes over the matrix is what a pass-fusion
+    # change moves. Note this is `passes x n_shards`, so it is NOT comparable
+    # across datasets — pbmc10k has 1 shard (qc -> 2) while census_1m has 62
+    # (qc -> 124). Divide by the dataset's shard count to recover the passes.
+    n_dec = med("cpu_profile_decode_scx1_count") + med("cpu_profile_decode_generic_count")
     tot = io + dec + red + mar
     frac = f"{tot / wall_ms:.0%}" if wall_ms else "n/a"
     return (f"| {dataset} | {op} | {wall_ms:.1f} | {io:.1f} | {dec:.1f} | "
-            f"{red:.1f} | {mar:.1f} | {frac} |")
+            f"{red:.1f} | {mar:.1f} | {n_dec:.0f} | {frac} |")
 
 
 def main() -> int:
@@ -150,8 +185,8 @@ def main() -> int:
                 rows.append(_fmt_row(dataset, op, r))
 
     print("\n| dataset | op | wall_ms | io_ms | decode_ms | reduction_ms | "
-          "marshalling_ms | Σ/wall |")
-    print("|---|---|--:|--:|--:|--:|--:|--:|")
+          "marshalling_ms | n_decodes | Σ/wall |")
+    print("|---|---|--:|--:|--:|--:|--:|--:|--:|")
     for row in rows:
         print(row)
     return 0

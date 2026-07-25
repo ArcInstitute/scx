@@ -369,10 +369,33 @@ impl ScxLazyTransformedDataset {
     /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
     /// it through `detached` with the GIL released.
     pub(crate) fn streaming_row_sums_projected(&self) -> Result<Vec<f64>, String> {
-        let cols = match &self.col_projection {
-            Some(c) => c,
-            None => return self.streaming_row_sums(),
-        };
+        match self.col_projection.clone() {
+            Some(cols) => self.streaming_row_sums_for_cols(&cols),
+            None => self.streaming_row_sums(),
+        }
+    }
+
+    /// Stream all shards, apply transforms to the **full-width** shard, then
+    /// restrict to `cols` before summing each row.
+    ///
+    /// `cols` are indices into the underlying reader's column space (on-disk
+    /// columns), NOT the visible axis — a caller holding visible-space indices
+    /// must compose them through `col_projection` first.
+    ///
+    /// Transforms run before the projection so a prior `NormalizeTotal`
+    /// divides by the correct whole-row denominator; see
+    /// [`Self::streaming_row_sums_projected`].
+    ///
+    /// Its only caller is [`Self::streaming_row_sums_projected`], which passes
+    /// `self.col_projection` — already on-disk indices by construction, so the
+    /// composition caveat above does not apply there. Any *new* caller holding
+    /// visible-space indices must compose them itself; handing visible indices
+    /// straight to a reader is exactly the bug class this module's QC pass
+    /// exists to avoid.
+    ///
+    /// Returns a global-length vector (`n_obs_global`), NOT filtered through
+    /// deletion vectors.
+    pub(crate) fn streaming_row_sums_for_cols(&self, cols: &[u32]) -> Result<Vec<f64>, String> {
         let n_obs_global = self.backed.shape().0;
         let mut sums = vec![0.0f64; n_obs_global];
         let mut global_row = 0usize;
@@ -554,6 +577,140 @@ impl ScxLazyTransformedDataset {
             global_row += csr.n_rows();
         }
         Ok(sums)
+    }
+
+    /// Fused per-cell QC pass through the transform chain: row nnz, row sums
+    /// and per-`qc_var` subset sums over the visible columns, in one scan.
+    ///
+    /// Lazy twin of [`crate::projected_agg::qc_row_pass`]. Transforms are
+    /// applied to the **full-width** shard before projection so a prior
+    /// `NormalizeTotal` divides by the denominator it was configured with; see
+    /// [`Self::streaming_row_sums_projected`].
+    ///
+    /// nnz is counted **after** `apply_transforms`, from the projected
+    /// `indptr`. That is equivalent to counting it before: every [`Transform`]
+    /// variant rewrites `csr.data` only and none prunes entries, so the
+    /// sparsity pattern — and therefore the count — is unchanged. A future
+    /// transform that *does* change the pattern would have to revisit this and
+    /// count pre-transform, as [`Self::streaming_row_nnz_and_sums`] does.
+    ///
+    /// Returns global-length vectors (NOT filtered through deletion vectors).
+    pub(crate) fn streaming_qc_row_pass(
+        &self,
+        qc_bits: &[u64],
+        n_qc: usize,
+    ) -> Result<crate::projected_agg::QcRowStats, String> {
+        let cols = self.col_projection.clone();
+        let n_visible = cols.as_deref().map_or(self.backed.shape().1, |c| c.len());
+        crate::projected_agg::ensure_qc_pass_args(n_qc, qc_bits, n_visible);
+        let mut out = crate::projected_agg::QcRowStats::zeroed(self.backed.shape().0, n_qc);
+        let mut global_row = 0usize;
+        for shard_idx in 0..self.backed.index().n_shards() {
+            let mut csr = self
+                .backed
+                .read_shard_uncached(shard_idx)
+                .map_err(|e| e.to_string())?;
+            let n_rows = csr.n_rows();
+            self.apply_transforms(&mut csr, global_row);
+            match cols.as_deref() {
+                Some(c) => crate::projected_agg::accumulate_qc_rows_into(
+                    &scx_engine::projection::project_csr(&csr, c),
+                    global_row,
+                    qc_bits,
+                    &mut out,
+                ),
+                None => crate::projected_agg::accumulate_qc_rows_into(
+                    &csr, global_row, qc_bits, &mut out,
+                ),
+            }
+            global_row += n_rows;
+        }
+        crate::projected_agg::ensure_full_row_coverage(global_row, self.backed.shape().0)
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    }
+
+    /// Per-column sums through the transform chain, honoring column projection
+    /// and keep-mask. Length = `shape_val.1`.
+    ///
+    /// The visible-space wrapper over the physical-width `streaming_col_sums*`
+    /// kernels, mirroring `ScxBackedSparseDataset::col_sums_raw`. Prefer
+    /// [`Self::col_sums_and_nnz_raw`] when the caller also needs nnz — that is
+    /// one scan instead of two.
+    pub(crate) fn col_sums_raw(&self) -> Result<Vec<f64>, String> {
+        let physical = if self.kept_to_global.is_some() {
+            self.streaming_col_sums_masked()?
+        } else {
+            self.streaming_col_sums()?
+        };
+        Ok(self.apply_col_projection_to_vec(physical))
+    }
+
+    /// Fused per-column sums + nnz through the transform chain, honoring
+    /// column projection and keep-mask. Length = `shape_val.1`.
+    ///
+    /// One scan producing both statistics; the column-axis counterpart of
+    /// [`Self::streaming_qc_row_pass`]. NNZ counts stored entries, which the
+    /// value-wise transforms leave untouched, so it matches the raw reader's
+    /// `col_nnz`.
+    ///
+    /// The kept-row walk is inlined rather than delegating to
+    /// [`scx_format_io::BackedCsrReader::col_sums_and_nnz_masked`] because the
+    /// transform chain has to run on each decoded shard *before* the values are
+    /// accumulated — the backed kernel reads the untransformed shard.
+    pub(crate) fn col_sums_and_nnz_raw(&self) -> Result<(Vec<f64>, Vec<u32>), String> {
+        let n_vars = self.backed.shape().1; // physical width, projected below
+        let mut sums = vec![0.0f64; n_vars];
+        let mut counts = vec![0u32; n_vars];
+        let mut global_row = 0usize;
+
+        for shard_idx in 0..self.backed.index().n_shards() {
+            let mut csr = self
+                .backed
+                .read_shard_uncached(shard_idx)
+                .map_err(|e| e.to_string())?;
+            let n_rows = csr.n_rows();
+            self.apply_transforms(&mut csr, global_row);
+
+            match &self.kept_to_global {
+                None => {
+                    for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                        let c = col as usize;
+                        sums[c] += val as f64;
+                        counts[c] += 1;
+                    }
+                }
+                Some(kept) => {
+                    let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                        Some(r) => r,
+                        None => {
+                            global_row += n_rows;
+                            continue;
+                        }
+                    };
+                    let lo = kept.partition_point(|&r| r < s_start);
+                    let hi = kept.partition_point(|&r| r < s_end);
+                    for &g_row in &kept[lo..hi] {
+                        let local = (g_row - s_start) as usize;
+                        let s = csr.indptr[local] as usize;
+                        let e = csr.indptr[local + 1] as usize;
+                        for j in s..e {
+                            let c = csr.indices[j] as usize;
+                            sums[c] += csr.data[j] as f64;
+                            counts[c] += 1;
+                        }
+                    }
+                }
+            }
+            global_row += n_rows;
+        }
+
+        let sums = self.apply_col_projection_to_vec(sums);
+        let counts = match &self.col_projection {
+            Some(cols) => cols.iter().map(|&c| counts[c as usize]).collect(),
+            None => counts,
+        };
+        Ok((sums, counts))
     }
 
     /// Materialize the full matrix with all transforms applied.

@@ -580,6 +580,60 @@ per-thread deterministic RNG design plus a trustworthiness / kNN-overlap quality
 exists yet). When revisited it should keep the serial path as the deterministic default and
 mirror Leiden's opt-in `parallel` flag.
 
+### QC / filtering pass fusion (Phase-4 task 4.1)
+
+`calculate_qc_metrics` used to decode every shard once **per statistic**: per-cell
+sums, per-cell nnz, per-gene sums, per-gene nnz, and one further full scan for each
+`qc_var`. The standard analyst call — `qc_vars=["mt", "ribo", "hb"]` — therefore read
+the whole matrix **seven** times. Every one of those quantities is an additive
+accumulator over the same nonzeros, so they collapse into one row-axis pass (sums +
+nnz + all subset sums, dispatched through a per-visible-column `u64` bitmask) and one
+column-axis pass. `filter_genes` with both a cell and a count threshold likewise drops
+from two column scans to one, and the CSC gene axis now walks the sidecar once.
+
+Measured on one `cpu`-partition host, `--release`, both arms built from isolated git
+worktrees of the two commits (`25479830` = projection fix only / unfused, `7d278365` =
+fused), SLURM job 2706142, 3 runs each, median wall / max peak RSS
+(`benchmarks/scripts/profile_cpu_stages_backed.py --ops qc filter_genes`, `SCX_CPU_PROFILE=1`):
+
+| Dataset | op | passes | wall before | wall after | speedup | peak RSS before → after |
+|---|---|--:|--:|--:|--:|--:|
+| pbmc10k (12K) | `qc` | 7 → 2 | 2.34 s | 0.83 s | **2.80×** | 553 → 549 MB |
+| smartseq2 (18K) | `qc` | 7 → 2 | 13.55 s | 4.14 s | **3.27×** | 900 → 885 MB |
+| tabula_sapiens_100k | `qc` | 7 → 2 | 17.15 s | 5.11 s | **3.36×** | 904 → 899 MB |
+| census_500k | `qc` | 7 → 2 | 65.76 s | 19.44 s | **3.38×** | 1508 → 1481 MB |
+| census_1m | `qc` | 7 → 2 | 120.01 s | 35.89 s | **3.34×** | 3566 → 3481 MB |
+| pbmc10k | `filter_genes` | 2 → 1 | 0.61 s | 0.43 s | 1.40× | 553 → 551 MB |
+| smartseq2 | `filter_genes` | 2 → 1 | 3.59 s | 2.08 s | 1.73× | 904 → 899 MB |
+| tabula_sapiens_100k | `filter_genes` | 2 → 1 | 4.56 s | 2.59 s | 1.76× | 904 → 899 MB |
+| census_500k | `filter_genes` | 2 → 1 | 17.48 s | 10.02 s | 1.74× | 1560 → 1542 MB |
+| census_1m | `filter_genes` | 2 → 1 | 31.99 s | 18.29 s | 1.75× | 3578 → 3488 MB |
+
+The speedups sit just under the pass ratios (3.5× and 2×) because the decode bucket is
+78–88 % of wall, not 100 % — the per-nonzero accumulation and the fixed AnnData/pandas
+handoff don't shrink. They converge on the ratio as the matrix grows (2.80× at 12K cells
+→ 3.34× at 1M), which is the signature of a fixed cost being amortized rather than a
+scale-dependent win. Peak RSS is marginally **lower** in every cell: the fused kernels
+allocate a handful of extra accumulator vectors (`n_qc × n_obs` f64 ≈ 24 MB at 1M cells ×
+3 subsets) but churn far fewer transient decode buffers.
+
+Both figures are for **3** `qc_vars`. The row pass carries up to 64 subsets in one
+scan; past that it repeats once per additional 64, so the pass count is
+`ceil(n_qc / 64) + 1`. Peak memory scales with the subsets held at once — the
+accumulator is `n_qc x n_obs` f64 (~24 MB at 3 subsets x 1M cells, ~1.5 GB at the
+64-subset ceiling x 3M cells), sized by the **physical** row count, and the
+deletion-filtering step transiently doubles each row vector. The "RSS marginally
+lower" result above characterises the ordinary handful-of-subsets call, not the
+ceiling.
+
+Output is unchanged. Each fused kernel keeps the existing left-to-right f64 accumulation
+over an ascending-column walk, so its sums are bit-identical to the per-statistic kernels
+it replaces; `pyscx/tests/test_qc_metrics_fused.py` asserts exact equality against the
+array-protocol dunders (which still drive the unfused path) across backed / lazy ×
+projection / none × deletions / none × 0, 1, 3 `qc_vars`, and a
+`cpu_profile_snapshot()` decode-count test pins the pass count so a later refactor cannot
+silently re-split it.
+
 ### Differential expression (CPU, full-matrix)
 
 The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell fixture. The dedicated `accel_de` benchmark sweeps the raw count matrix (no HVG projection) across the full dataset tier — scanpy's per-gene rank pass becomes the bottleneck and times out on census-scale:
