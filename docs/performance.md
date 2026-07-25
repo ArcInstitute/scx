@@ -592,7 +592,8 @@ column-axis pass. `filter_genes` with both a cell and a count threshold likewise
 from two column scans to one, and the CSC gene axis now walks the sidecar once.
 
 Measured on one `cpu`-partition host, `--release`, both arms built from isolated git
-worktrees of the two commits, 3 runs each, median wall / max peak RSS
+worktrees of the two commits (`25479830` = projection fix only / unfused, `7d278365` =
+fused), SLURM job 2706142, 3 runs each, median wall / max peak RSS
 (`benchmarks/scripts/profile_cpu_stages_backed.py --ops qc filter_genes`, `SCX_CPU_PROFILE=1`):
 
 | Dataset | op | passes | wall before | wall after | speedup | peak RSS before → after |
@@ -615,6 +616,15 @@ handoff don't shrink. They converge on the ratio as the matrix grows (2.80× at 
 scale-dependent win. Peak RSS is marginally **lower** in every cell: the fused kernels
 allocate a handful of extra accumulator vectors (`n_qc × n_obs` f64 ≈ 24 MB at 1M cells ×
 3 subsets) but churn far fewer transient decode buffers.
+
+Both figures are for **3** `qc_vars`. The row pass carries up to 64 subsets in one
+scan; past that it repeats once per additional 64, so the pass count is
+`ceil(n_qc / 64) + 1`. Peak memory scales with the subsets held at once — the
+accumulator is `n_qc x n_obs` f64 (~24 MB at 3 subsets x 1M cells, ~1.5 GB at the
+64-subset ceiling x 3M cells), sized by the **physical** row count, and the
+deletion-filtering step transiently doubles each row vector. The "RSS marginally
+lower" result above characterises the ordinary handful-of-subsets call, not the
+ceiling.
 
 Output is unchanged. Each fused kernel keeps the existing left-to-right f64 accumulation
 over an ascending-column walk, so its sums are bit-identical to the per-statistic kernels

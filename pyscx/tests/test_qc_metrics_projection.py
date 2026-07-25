@@ -11,8 +11,10 @@ Before this fix the default ``prefer_format="csr"`` route ignored
   ``total_counts`` was post-transform, making ``pct_counts_<v>`` a ratio of two
   different matrices.
 
-The CSC route (``prefer_format="csc"``) already handled the projection, so these
-tests also pin CSR/CSC agreement under a projection.
+Only the CSC **gene axis** already handled the projection. That made the CSC
+route the *silent* one: its lengths matched, so the call returned wrong per-cell
+numbers, whereas the CSR route raised a pandas length mismatch on the
+physical-width gene axis. These tests pin both routes and their agreement.
 """
 
 import numpy as np
@@ -347,22 +349,52 @@ def test_no_projection_unchanged(scx_path, dense_ref):
     )
 
 
-def test_csr_matches_csc_under_projection(synthetic_adata, tmp_dir, dense_ref):
-    """The CSC gene-axis route already honored the projection; CSR now agrees."""
+def test_csr_matches_csc_under_projection(qc_adata, tmp_dir, dense_ref):
+    """Both routes match an independent numpy oracle under a projection.
+
+    The CSC route is the one that used to return silently wrong per-cell numbers
+    (its gene axis was already projection-correct, so nothing raised). Both
+    kernels changed in this PR, so comparing them to each other proves nothing —
+    each is checked against `dense_ref` directly, and only then against the
+    other.
+    """
     import pyscx
 
     path = str(tmp_dir / "qc_proj_csc.scx")
-    pyscx.from_anndata(synthetic_adata, path, csc="always")
+    pyscx.from_anndata(qc_adata, path, csc="always")
 
-    a_csr = _project(pyscx.open(path).to_anndata(backed=True), GENE_SUBSET)
-    a_csc = _project(pyscx.open(path).to_anndata(backed=True), GENE_SUBSET)
-    pyscx.accel.calculate_qc_metrics(a_csr)
-    pyscx.accel.calculate_qc_metrics(a_csc, prefer_format="csc")
+    mt = np.zeros(len(GENE_SUBSET), dtype=bool)
+    mt[[0, 1]] = True
+    frames = {}
+    for fmt in ("csr", "csc"):
+        a = _project(pyscx.open(path).to_anndata(backed=True), GENE_SUBSET)
+        a.var["mt"] = mt
+        pyscx.accel.calculate_qc_metrics(a, qc_vars=["mt"], prefer_format=fmt)
+        frames[fmt] = a
+
+    sub = dense_ref[:, GENE_SUBSET]
+    mt_ondisk = [GENE_SUBSET[0], GENE_SUBSET[1]]
+    for fmt, a in frames.items():
+        np.testing.assert_allclose(
+            a.obs["total_counts"].to_numpy(dtype=np.float64), sub.sum(axis=1),
+            rtol=1e-6, err_msg=f"{fmt}: per-cell totals must cover only visible genes",
+        )
+        np.testing.assert_allclose(
+            a.obs["total_counts_mt"].to_numpy(dtype=np.float64),
+            dense_ref[:, mt_ondisk].sum(axis=1),
+            rtol=1e-6, err_msg=f"{fmt}: qc_var must score the visible-axis genes",
+        )
+        np.testing.assert_allclose(
+            a.var["total_counts"].to_numpy(dtype=np.float64), sub.sum(axis=0), rtol=1e-6
+        )
+        np.testing.assert_array_equal(
+            a.var["n_cells_by_counts"].to_numpy(dtype=np.int64), (sub != 0).sum(axis=0)
+        )
 
     for col in ("total_counts", "n_cells_by_counts"):
         np.testing.assert_allclose(
-            a_csr.var[col].to_numpy(dtype=np.float64),
-            a_csc.var[col].to_numpy(dtype=np.float64),
+            frames["csr"].var[col].to_numpy(dtype=np.float64),
+            frames["csc"].var[col].to_numpy(dtype=np.float64),
             rtol=1e-9,
             err_msg=f"var[{col}] must agree across prefer_format under a projection",
         )

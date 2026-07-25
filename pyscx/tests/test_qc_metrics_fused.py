@@ -38,7 +38,10 @@ def fused_adata():
     import scipy.sparse as sp
 
     rng = np.random.RandomState(7)
-    dense = rng.randint(0, 500, size=(N_OBS, N_VARS)).astype(np.float32)
+    # Non-integer values on purpose: with integer counts every partial sum is an
+    # exact f64 and `assert_array_equal` would pass under ANY accumulation
+    # order, making the bit-identity assertions vacuous.
+    dense = (rng.random_sample((N_OBS, N_VARS)) * 1e3).astype(np.float32)
     dense[rng.random_sample((N_OBS, N_VARS)) > 0.35] = 0
     return anndata.AnnData(
         X=sp.csr_matrix(dense),
@@ -79,6 +82,7 @@ CASES = {
     "deleted": {"drop_cells": 4000},
     "projected+deleted": {"project": PROJECTION, "drop_cells": 4000},
     "lazy": {"normalize": True},
+    "lazy+deleted": {"drop_cells": 4000, "normalize": True},
     "lazy+projected": {"project": PROJECTION, "normalize": True},
     "lazy+projected+deleted": {
         "project": PROJECTION,
@@ -258,35 +262,56 @@ def test_inplace_false_returns_frames_without_writing(multishard_path):
     )
 
 
-def test_too_many_qc_vars_rejected(multishard_path):
-    """>64 subsets exceeds the bitmask width and must fail loudly."""
+def test_many_qc_vars_chunk_rather_than_reject(multishard_path):
+    """>64 subsets exceed the bitmask width, so the row pass repeats per 64.
+
+    The pre-fusion implementation supported any number of `qc_vars` (one scan
+    each), so rejecting past 64 would have been a capability regression.
+    """
     import pyscx
 
     adata = _open(multishard_path)
     names = []
-    for k in range(65):
-        adata.var[f"m{k}"] = np.arange(adata.n_vars) % 65 == k
+    for k in range(70):
+        adata.var[f"m{k}"] = np.arange(adata.n_vars) % 70 == k
         names.append(f"m{k}")
-    with pytest.raises(ValueError, match="at most 64 qc_vars"):
-        pyscx.accel.calculate_qc_metrics(adata, qc_vars=names)
+
+    pyscx.accel.calculate_qc_metrics(adata, qc_vars=names)
+
+    # Every subset published, and — since the 70 masks partition the gene axis —
+    # they must sum back to total_counts.
+    parts = np.zeros(adata.n_obs, dtype=np.float64)
+    for name in names:
+        assert f"total_counts_{name}" in adata.obs.columns
+        parts += adata.obs[f"total_counts_{name}"].to_numpy(dtype=np.float64)
+    np.testing.assert_allclose(
+        parts, adata.obs["total_counts"].to_numpy(dtype=np.float64), rtol=1e-12
+    )
 
 
-def test_filter_genes_fused_matches_separate(multishard_path):
-    """filter_genes with both thresholds keeps the same genes as before."""
+def test_qc_var_beyond_first_chunk_is_correct(multishard_path):
+    """A subset landing in the 2nd chunk (index >= 64) gets the right sum."""
     import pyscx
 
-    both = _open(multishard_path)
-    pyscx.accel.filter_genes(both, min_cells=60, min_counts=8000)
+    adata = _open(multishard_path)
+    names = []
+    for k in range(66):
+        # Only subset 65 (2nd chunk) selects anything; the rest are empty.
+        adata.var[f"s{k}"] = (
+            np.arange(adata.n_vars) < 5 if k == 65 else np.zeros(adata.n_vars, bool)
+        )
+        names.append(f"s{k}")
 
-    # Reference: apply the two thresholds independently from the dunder
-    # (unfused) statistics and intersect.
-    ref = _open(multishard_path)
-    nnz = np.asarray(ref.X.getnnz(axis=0)).ravel()
-    sums = np.asarray(ref.X.sum(axis=0)).ravel()
-    keep = (nnz >= 60) & (sums >= 8000)
+    with pytest.warns(UserWarning):
+        pyscx.accel.calculate_qc_metrics(adata, qc_vars=names)
 
-    assert both.n_vars == int(keep.sum())
-    assert list(both.var_names) == list(ref.var_names[keep])
+    ref = _open(multishard_path, project=list(range(5)))
+    np.testing.assert_allclose(
+        adata.obs["total_counts_s65"].to_numpy(dtype=np.float64),
+        np.asarray(ref.X.sum(axis=1)).ravel().astype(np.float64),
+        rtol=1e-12,
+    )
+    assert np.all(adata.obs["total_counts_s0"].to_numpy() == 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -301,9 +326,19 @@ _DECODE_PROBE = textwrap.dedent(
 
     path = sys.argv[1]
     n_qc = int(sys.argv[2])
+    case = sys.argv[3]
+    op = sys.argv[4]
 
     adata = pyscx.open(path).to_anndata(backed=True)
     n_shards = adata.X.n_shards if hasattr(adata.X, "n_shards") else None
+    if "deleted" in case:
+        pyscx.accel.filter_cells(adata, min_counts=4000)
+    if "projected" in case:
+        cols = [3, 7, 11, 19, 23, 31, 44, 51, 58]
+        adata.X.set_col_projection(cols)
+        adata._var = adata.var.iloc[cols].copy()
+    if "lazy" in case:
+        pyscx.accel.normalize_total(adata, target_sum=1e4)
     qc_vars = []
     for k in range(n_qc):
         mask = np.zeros(adata.n_vars, dtype=bool)
@@ -312,7 +347,10 @@ _DECODE_PROBE = textwrap.dedent(
         qc_vars.append(f"qc{k}")
 
     pyscx.accel.cpu_profile_reset()
-    pyscx.accel.calculate_qc_metrics(adata, qc_vars=qc_vars or None)
+    if op == "qc":
+        pyscx.accel.calculate_qc_metrics(adata, qc_vars=qc_vars or None)
+    else:
+        pyscx.accel.filter_genes(adata, min_cells=1, min_counts=1.0)
     snap = pyscx.accel.cpu_profile_snapshot()
     decodes = snap["decode_scx1"]["count"] + snap["decode_generic"]["count"]
     print(json.dumps({"enabled": snap["enabled"], "decodes": decodes,
@@ -321,32 +359,57 @@ _DECODE_PROBE = textwrap.dedent(
 )
 
 
-def _probe_decodes(path, n_qc):
+def _probe_decodes(path, n_qc, case="plain", op="qc"):
+    import json
+
     env = dict(os.environ, SCX_CPU_PROFILE="1")
     out = subprocess.run(
-        [sys.executable, "-c", _DECODE_PROBE, path, str(n_qc)],
+        [sys.executable, "-c", _DECODE_PROBE, path, str(n_qc), case, op],
         capture_output=True,
         text=True,
         env=env,
-        check=True,
     )
-    import json
-
+    if out.returncode != 0:
+        # `check=True` would swallow stderr behind CalledProcessError.
+        raise AssertionError(
+            f"decode probe failed (case={case}, op={op}):\n{out.stderr[-2000:]}"
+        )
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
+@pytest.mark.parametrize(
+    "case", ["plain", "projected", "deleted", "lazy", "lazy+projected"]
+)
+def test_filter_genes_decode_count_is_one_pass(multishard_path, case):
+    """filter_genes with both thresholds decodes each shard once, every route.
+
+    The lazy arm is the one that regressed in review: it kept two scans after
+    the backed arm was fused.
+    """
+    res = _probe_decodes(multishard_path, 0, case=case, op="filter_genes")
+    assert res["enabled"]
+    n_shards = res["n_shards"]
+    assert res["decodes"] == n_shards, (
+        f"{case}: expected 1 pass over {n_shards} shards, saw {res['decodes']}"
+    )
+
+
+@pytest.mark.parametrize(
+    "case", ["plain", "projected", "deleted", "lazy", "lazy+projected"]
+)
 @pytest.mark.parametrize("n_qc", [0, 1, 3])
-def test_decode_count_is_two_passes(multishard_path, n_qc):
+def test_decode_count_is_two_passes(multishard_path, n_qc, case):
     """QC decodes each shard exactly twice — one row pass, one column pass.
 
     Before the fusion this was `(2 + n_qc) x n_shards` for the row-side
-    statistics plus `2 x n_shards` for the gene axis.
+    statistics plus `2 x n_shards` for the gene axis. Pinned on every fused
+    route, not just backed-plain, so a re-split anywhere is caught.
     """
-    res = _probe_decodes(multishard_path, n_qc)
+    res = _probe_decodes(multishard_path, n_qc, case=case)
     assert res["enabled"], "SCX_CPU_PROFILE=1 did not reach the child process"
     n_shards = res["n_shards"]
     assert n_shards and n_shards > 1, f"fixture must be multi-shard, got {n_shards}"
     assert res["decodes"] == 2 * n_shards, (
-        f"expected 2 passes over {n_shards} shards, saw {res['decodes']} decodes "
-        f"with n_qc={n_qc} — a statistic regained its own scan"
+        f"{case}: expected 2 passes over {n_shards} shards, saw {res['decodes']} "
+        f"decodes with n_qc={n_qc} — a statistic regained its own scan"
     )

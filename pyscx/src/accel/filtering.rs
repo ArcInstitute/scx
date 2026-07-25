@@ -113,20 +113,6 @@ fn backed_col_sums(backed: &ScxBackedSparseDataset) -> Result<Vec<f64>, String> 
     Ok(backed.present_reorder(sums))
 }
 
-/// Helper: fused col sums + NNZ for a backed dataset, in one shard scan.
-///
-/// Used when `filter_genes` needs both (a cell threshold *and* a count
-/// threshold). Bit-identical to `backed_col_nnz` + `backed_col_sums`, which
-/// decode every shard twice.
-///
-/// Pure-Rust (`Result<_, String>`, no `PyErr`) so callers can run it through
-/// `detached` with the GIL released.
-fn backed_col_sums_and_nnz(
-    backed: &ScxBackedSparseDataset,
-) -> Result<(Vec<f64>, Vec<u32>), String> {
-    backed.col_sums_and_nnz_raw()
-}
-
 // ---------------------------------------------------------------------------
 // Shared mask/projection helpers (used by hvg.rs too)
 // ---------------------------------------------------------------------------
@@ -548,7 +534,7 @@ pub fn filter_genes(
             match (need_nnz, need_sums) {
                 // Both thresholds: one fused scan instead of two full decodes.
                 (true, true) => {
-                    let (sums, nnz) = detached(py, || backed_col_sums_and_nnz(b))
+                    let (sums, nnz) = detached(py, || b.col_sums_and_nnz_raw())
                         .map_err(PyRuntimeError::new_err)?;
                     (Some(nnz.iter().map(|&v| v as i64).collect()), Some(sums))
                 }
@@ -633,53 +619,42 @@ pub fn filter_genes(
         // (Send) so the closures capture `l`, not the `!Send` PyRef. `l`'s borrow
         // ends before the direct `lazy_ref` use / `drop(lazy_ref)` below.
         let l: &ScxLazyTransformedDataset = &lazy_ref;
-        // For lazy datasets, NNZ is transform-invariant: use underlying backed reader
-        // with the lazy dataset's col_projection and kept_to_global
-        let col_nnz: Option<Vec<i64>> = if need_nnz {
-            let counts: Vec<u32> = detached(py, || match (l.col_projection(), &l.kept_to_global) {
-                (Some(cols), Some(kept)) => {
-                    projected_agg::col_nnz_masked_projected(&l.backed, kept, cols)
-                        .map_err(|e| e.to_string())
-                }
-                (Some(cols), None) => {
-                    projected_agg::col_nnz_projected(&l.backed, cols).map_err(|e| e.to_string())
-                }
-                (None, Some(kept)) => l
-                    .backed
-                    .col_nnz_masked(kept)
-                    .map(|f| f.iter().map(|&v| v as u32).collect())
-                    .map_err(|e| e.to_string()),
-                (None, None) => l.backed.col_nnz().map_err(|e| e.to_string()),
-            })
-            .map_err(PyRuntimeError::new_err)?;
-            Some(counts.iter().map(|&v| v as i64).collect())
-        } else {
-            None
-        };
-
-        // Col sums through transforms (streaming).
-        // streaming_col_sums returns full-width (all original columns).
-        // When col_projection is active, extract only projected columns.
-        let col_sums = if need_sums {
-            let full_sums = detached(py, || {
-                if l.kept_to_global.is_some() {
-                    l.streaming_col_sums_masked()
-                } else {
-                    l.streaming_col_sums()
-                }
-            })
-            .map_err(PyRuntimeError::new_err)?;
-            if let Some(cols) = lazy_ref.col_projection() {
-                Some(
-                    cols.iter()
-                        .map(|&c| full_sums[c as usize])
-                        .collect::<Vec<f64>>(),
-                )
-            } else {
-                Some(full_sums)
+        let (col_nnz, col_sums): (Option<Vec<i64>>, Option<Vec<f64>>) = match (need_nnz, need_sums)
+        {
+            // Both thresholds: one fused scan through the transform chain,
+            // mirroring the backed arm above. Without this the lazy path stayed
+            // at two full decodes while backed dropped to one.
+            (true, true) => {
+                let (sums, nnz) =
+                    detached(py, || l.col_sums_and_nnz_raw()).map_err(PyRuntimeError::new_err)?;
+                (Some(nnz.iter().map(|&v| v as i64).collect()), Some(sums))
             }
-        } else {
-            None
+            // NNZ is transform-invariant, so the single-statistic arm reads the
+            // underlying backed reader with the lazy dataset's projection/mask.
+            (true, false) => {
+                let counts: Vec<u32> =
+                    detached(py, || match (l.col_projection(), &l.kept_to_global) {
+                        (Some(cols), Some(kept)) => {
+                            projected_agg::col_nnz_masked_projected(&l.backed, kept, cols)
+                                .map_err(|e| e.to_string())
+                        }
+                        (Some(cols), None) => projected_agg::col_nnz_projected(&l.backed, cols)
+                            .map_err(|e| e.to_string()),
+                        (None, Some(kept)) => l
+                            .backed
+                            .col_nnz_masked(kept)
+                            .map(|f| f.iter().map(|&v| v as u32).collect())
+                            .map_err(|e| e.to_string()),
+                        (None, None) => l.backed.col_nnz().map_err(|e| e.to_string()),
+                    })
+                    .map_err(PyRuntimeError::new_err)?;
+                (Some(counts.iter().map(|&v| v as i64).collect()), None)
+            }
+            (false, true) => (
+                None,
+                Some(detached(py, || l.col_sums_raw()).map_err(PyRuntimeError::new_err)?),
+            ),
+            (false, false) => (None, None),
         };
 
         let keep = build_keep_mask(

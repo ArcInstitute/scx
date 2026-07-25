@@ -152,8 +152,10 @@ def _fmt_row(dataset: str, op: str, r: BenchmarkResult) -> str:
     red = med("cpu_profile_reduction_ms")
     mar = med("cpu_profile_marshalling_ms")
     # Shard-decode COUNT, not just time: for the multi-pass ops (qc,
-    # filter_genes) the number of passes over the matrix is the thing a
-    # pass-fusion change moves, and it is scale-independent.
+    # filter_genes) the number of passes over the matrix is what a pass-fusion
+    # change moves. Note this is `passes x n_shards`, so it is NOT comparable
+    # across datasets — pbmc10k has 1 shard (qc -> 2) while census_1m has 62
+    # (qc -> 124). Divide by the dataset's shard count to recover the passes.
     n_dec = med("cpu_profile_decode_scx1_count") + med("cpu_profile_decode_generic_count")
     tot = io + dec + red + mar
     frac = f"{tot / wall_ms:.0%}" if wall_ms else "n/a"

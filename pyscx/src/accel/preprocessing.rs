@@ -454,19 +454,46 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
 ///         applies (no row deletion vector, no non-column-local
 ///         transforms; raises on missing CSC sidecar).
 ///
-/// At most 64 `qc_vars` per call (they are packed into a per-column bitmask so
-/// every subset is accumulated in the same shard pass).
+/// Subsets are packed into a 64-bit per-column bitmask, so up to 64 `qc_vars`
+/// share one shard pass; beyond that the row pass repeats once per additional
+/// 64 (`ceil(n / 64) + 1` passes total).
 ///
-/// BEHAVIOR CHANGE (bug fix): column projections — a `filter_genes` result, or
-/// `adata[:, mask]` on a backed `X` — are now honored on every route. Per-cell
-/// totals cover only the visible genes, the gene axis is returned at the
-/// visible width, and `qc_vars` masks are read against `adata.var`. Previously
-/// the default `prefer_format="csr"` route ignored the projection entirely:
-/// `total_counts` silently summed hidden genes and the gene axis came back at
-/// the underlying (physical) width. On a lazy `X` the `qc_vars` subset sums are
-/// now taken *through* the transform chain, so `pct_counts_<v>` divides a
-/// transformed numerator by a transformed denominator (the numerator used to be
-/// pre-transform). Results are unchanged for unprojected, untransformed input.
+/// BEHAVIOR CHANGE (bug fix): column projections are now honored on every
+/// route. Per-cell totals cover only the visible genes, the gene axis is
+/// returned at the visible width, and `qc_vars` masks are read against
+/// `adata.var`. Projections reach here from `filter_genes`,
+/// `highly_variable_genes(subset=True)`, a gene-selected
+/// `to_anndata(backed=True, var_names=[...])`, `X.set_col_projection(...)`, or
+/// `adata.X = adata.X[:, cols]`. (`adata[:, mask]` is *not* among them — anndata
+/// has no registered view type for a backed SCX `X`, so it raises before
+/// reaching any accelerator.)
+///
+/// What was wrong before depends on the route, and only one of them was silent:
+///
+/// * `prefer_format="csr"` (default) — the gene axis came back at the
+///   underlying (physical) width, so building the `var` frame raised
+///   `ValueError: Length mismatch`. Loud; no wrong numbers were returned.
+/// * `prefer_format="csc"` — the CSC gene axis was already projection-correct,
+///   so the lengths matched and the call **returned silently wrong per-cell
+///   numbers**: the row axis was projection-blind, and `qc_vars` masks (visible
+///   positions) were applied to the on-disk axis, scoring different genes
+///   entirely. Anyone who ran projected QC on the CSC route should re-check
+///   published `total_counts` / `pct_counts_*`.
+///
+/// On a lazy `X` the `qc_vars` subset sums are now taken *through* the
+/// transform chain, so `pct_counts_<v>` divides a transformed numerator by a
+/// transformed denominator (the numerator used to be pre-transform). This is a
+/// silent numeric change with no runtime signal — a pipeline that filters on
+/// `pct_counts_mt` after a lazy `normalize_total` will keep and drop different
+/// cells than before.
+///
+/// Results are unchanged for unprojected, untransformed input.
+///
+/// SUPPORTED CONTRACT: `adata.var` row *i* must describe visible column *i*.
+/// `set_col_projection` sorts and dedups its input, so passing an unsorted
+/// column list and slicing `var` in that same unsorted order leaves the two
+/// disagreeing — the gene axis is then labelled wrongly with no error, since
+/// the lengths still match. Slice `var` in ascending column order.
 #[pyfunction]
 #[pyo3(signature = (adata, qc_vars=None, log1p=true, inplace=true, prefer_format="csr"))]
 pub fn calculate_qc_metrics<'py>(
@@ -562,22 +589,22 @@ pub fn calculate_qc_metrics<'py>(
         let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
         let b: &ScxBackedSparseDataset = &backed;
         detached(py, || {
-            let stats = b.qc_row_pass_raw(&qc_masks.bits, qc_masks.n_qc)?;
-            Ok::<_, String>(RowQcOutputs::from_stats(
-                stats,
+            RowQcOutputs::accumulate(
+                &qc_masks,
                 b.kept_to_global.as_ref().map(|k| k.as_slice()),
-            ))
+                |bits, n| b.qc_row_pass_raw(bits, n),
+            )
         })
         .map_err(PyRuntimeError::new_err)?
     } else {
         let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
         let l: &ScxLazyTransformedDataset = &lazy;
         detached(py, || {
-            let stats = l.streaming_qc_row_pass(&qc_masks.bits, qc_masks.n_qc)?;
-            Ok::<_, String>(RowQcOutputs::from_stats(
-                stats,
+            RowQcOutputs::accumulate(
+                &qc_masks,
                 l.kept_to_global.as_ref().map(|k| k.as_slice()),
-            ))
+                |bits, n| l.streaming_qc_row_pass(bits, n),
+            )
         })
         .map_err(PyRuntimeError::new_err)?
     };
@@ -1223,21 +1250,33 @@ fn count_mt_prefix_in_feature_name(adata: &Bound<'_, PyAny>) -> usize {
 /// transforms / row deletion vector active) is delegated to
 /// `as_column_source()`. Honors `col_projection` if set on the
 /// dataset.
+/// Width of the per-column subset bitmask; `qc_vars` beyond this are handled by
+/// running additional row passes (see [`resolve_qc_masks`]).
+const QC_MASK_BITS: usize = 64;
+
+/// One row pass' worth of `qc_var` subsets.
+struct QcMaskChunk {
+    /// One bitmask per **visible** column: bit *k* set ⇒ that column belongs to
+    /// this chunk's `k`-th subset.
+    bits: Vec<u64>,
+    /// Number of subsets in this chunk (≤ [`QC_MASK_BITS`]), carried separately
+    /// so an all-false mask still gets its own all-zero output row.
+    n_qc: usize,
+}
+
 /// The `qc_var` gene subsets, encoded for the fused row pass.
 struct QcMasks {
-    /// One bitmask per **visible** column: bit *k* set ⇒ that column belongs to
-    /// `qc_vars[k]`. Empty when no `qc_var` was requested.
-    bits: Vec<u64>,
-    /// Number of requested subsets (== `qc_vars.len()`), carried separately so
-    /// an all-false mask still gets its own all-zero output row.
-    n_qc: usize,
-    /// Per-subset "mask selected no genes", to reproduce the historical
-    /// zero-fill shape (no `log1p_total_counts_<v>` column).
+    /// Subsets split into ≤64-wide chunks, in `qc_vars` order. Empty when no
+    /// `qc_var` was requested (the row pass then runs once with no subsets).
+    chunks: Vec<QcMaskChunk>,
+    /// Per-subset "mask selected no genes", flattened across chunks in
+    /// `qc_vars` order, to reproduce the historical zero-fill shape (no
+    /// `log1p_total_counts_<v>` column).
     empty: Vec<bool>,
 }
 
 /// Read each `qc_var` boolean column off `adata.var` and pack the subsets into
-/// one bitmask per visible column.
+/// bitmasks over the visible columns, **chunked** at the 64-bit mask width.
 ///
 /// The masks index `adata.var`, i.e. the **visible** gene axis, which is also
 /// the space the row pass accumulates in (it projects each shard before
@@ -1245,9 +1284,12 @@ struct QcMasks {
 /// positions straight to the underlying reader — no index composition is needed
 /// here; the projection is applied once, by the kernel.
 ///
-/// A dataset with more than 64 `qc_var`s is rejected rather than silently
-/// truncated; nothing in practice approaches that (`["mt", "ribo", "hb"]` is
-/// the common case).
+/// More than 64 `qc_var`s is **supported**, not rejected: the subsets are split
+/// into `ceil(n / 64)` chunks and the row pass runs once per chunk, so the total
+/// is `ceil(n / 64) + 1` shard passes (the common `["mt", "ribo", "hb"]` case is
+/// one chunk → 2 passes). Rejecting instead would have been a capability
+/// regression — the pre-fusion implementation handled any number of `qc_var`s,
+/// at one full pass each.
 fn resolve_qc_masks(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -1256,48 +1298,44 @@ fn resolve_qc_masks(
 ) -> PyResult<QcMasks> {
     if qc_vars.is_empty() {
         return Ok(QcMasks {
-            bits: Vec::new(),
-            n_qc: 0,
+            chunks: Vec::new(),
             empty: Vec::new(),
         });
-    }
-    if qc_vars.len() > 64 {
-        return Err(PyValueError::new_err(format!(
-            "calculate_qc_metrics supports at most 64 qc_vars (got {})",
-            qc_vars.len()
-        )));
     }
 
     let n_visible = visible_n_vars(x)?;
     let np = py.import("numpy")?;
     let var_df = adata.getattr("var")?;
-    let mut bits = vec![0u64; n_visible];
     let mut empty = Vec::with_capacity(qc_vars.len());
+    let mut chunks: Vec<QcMaskChunk> = Vec::new();
 
-    for (k, qc_var) in qc_vars.iter().enumerate() {
-        let mask_values = var_df.get_item(qc_var.as_str())?.getattr("values")?;
-        let idx: Vec<u32> = np
-            .call_method1("where", (&mask_values,))?
-            .get_item(0)?
-            .call_method1("astype", ("uint32",))?
-            .extract()?;
-        empty.push(idx.is_empty());
-        for &i in &idx {
-            let slot = bits.get_mut(i as usize).ok_or_else(|| {
-                PyRuntimeError::new_err(format!(
-                    "qc_var {qc_var:?} mask index {i} is out of range for the {n_visible} \
-                     visible columns; adata.var and adata.X disagree on the gene axis"
-                ))
-            })?;
-            *slot |= 1u64 << k;
+    for group in qc_vars.chunks(QC_MASK_BITS) {
+        let mut bits = vec![0u64; n_visible];
+        for (k, qc_var) in group.iter().enumerate() {
+            let mask_values = var_df.get_item(qc_var.as_str())?.getattr("values")?;
+            let idx: Vec<u32> = np
+                .call_method1("where", (&mask_values,))?
+                .get_item(0)?
+                .call_method1("astype", ("uint32",))?
+                .extract()?;
+            empty.push(idx.is_empty());
+            for &i in &idx {
+                let slot = bits.get_mut(i as usize).ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "qc_var {qc_var:?} mask index {i} is out of range for the {n_visible} \
+                         visible columns; adata.var and adata.X disagree on the gene axis"
+                    ))
+                })?;
+                *slot |= 1u64 << k;
+            }
         }
+        chunks.push(QcMaskChunk {
+            bits,
+            n_qc: group.len(),
+        });
     }
 
-    Ok(QcMasks {
-        bits,
-        n_qc: qc_vars.len(),
-        empty,
-    })
+    Ok(QcMasks { chunks, empty })
 }
 
 /// Number of user-visible columns on a backed / lazy SCX `X`.
@@ -1321,21 +1359,58 @@ struct RowQcOutputs {
 }
 
 impl RowQcOutputs {
-    /// Restrict every global-length row vector the pass produced to the visible
-    /// rows. `kept` is the visible→global row map (`None` = no deletions),
-    /// matching `filter_row_results` on both dataset types.
-    fn from_stats(stats: projected_agg::QcRowStats, kept: Option<&[u64]>) -> Self {
-        fn take<T: Copy>(all: &[T], kept: Option<&[u64]>) -> Vec<T> {
+    /// Run `pass` once per `qc_var` chunk and assemble the visible-row outputs.
+    ///
+    /// With ≤64 `qc_var`s (every realistic call) this is a single pass. Beyond
+    /// that, each extra chunk costs one more shard scan; `nnz`/`sums` are taken
+    /// from the first chunk and the later chunks contribute only their subset
+    /// sums. A `qc_vars`-free call still runs exactly one pass.
+    ///
+    /// `kept` is the visible→global row map (`None` = no deletions), matching
+    /// `filter_row_results` on both dataset types.
+    fn accumulate<F>(masks: &QcMasks, kept: Option<&[u64]>, mut pass: F) -> Result<Self, String>
+    where
+        F: FnMut(&[u64], usize) -> Result<projected_agg::QcRowStats, String>,
+    {
+        // Consumes `all`: with no deletion vector the global-length vector is
+        // already the answer, so the common path moves instead of copying.
+        fn take<T: Copy>(all: Vec<T>, kept: Option<&[u64]>) -> Vec<T> {
             match kept {
                 Some(map) => map.iter().map(|&g| all[g as usize]).collect(),
-                None => all.to_vec(),
+                None => all,
             }
         }
-        Self {
-            total_counts: take(&stats.sums, kept),
-            n_genes: take(&stats.nnz, kept),
-            qc_subset_sums: stats.qc_sums.iter().map(|v| take(v, kept)).collect(),
+
+        let mut total_counts: Option<Vec<f64>> = None;
+        let mut n_genes: Option<Vec<i64>> = None;
+        let mut qc_subset_sums: Vec<Vec<f64>> = Vec::with_capacity(masks.empty.len());
+
+        // `chunks` is empty only when no qc_var was requested — still run one
+        // pass, for total_counts / n_genes_by_counts.
+        let empty_chunk = [QcMaskChunk {
+            bits: Vec::new(),
+            n_qc: 0,
+        }];
+        let chunks = if masks.chunks.is_empty() {
+            &empty_chunk[..]
+        } else {
+            &masks.chunks[..]
+        };
+
+        for chunk in chunks {
+            let stats = pass(&chunk.bits, chunk.n_qc)?;
+            if total_counts.is_none() {
+                total_counts = Some(take(stats.sums, kept));
+                n_genes = Some(take(stats.nnz, kept));
+            }
+            qc_subset_sums.extend(stats.qc_sums.into_iter().map(|v| take(v, kept)));
         }
+
+        Ok(Self {
+            total_counts: total_counts.unwrap_or_default(),
+            n_genes: n_genes.unwrap_or_default(),
+            qc_subset_sums,
+        })
     }
 }
 

@@ -386,9 +386,12 @@ impl ScxLazyTransformedDataset {
     /// divides by the correct whole-row denominator; see
     /// [`Self::streaming_row_sums_projected`].
     ///
-    /// Used for `calculate_qc_metrics`' per-`qc_var` subset sums, which must be
-    /// post-transform so `pct_counts_<v>` divides a transformed numerator by a
-    /// transformed denominator.
+    /// Its only caller is [`Self::streaming_row_sums_projected`], which passes
+    /// `self.col_projection` — already on-disk indices by construction, so the
+    /// composition caveat above does not apply there. Any *new* caller holding
+    /// visible-space indices must compose them itself; handing visible indices
+    /// straight to a reader is exactly the bug class this module's QC pass
+    /// exists to avoid.
     ///
     /// Returns a global-length vector (`n_obs_global`), NOT filtered through
     /// deletion vectors.
@@ -584,9 +587,12 @@ impl ScxLazyTransformedDataset {
     /// `NormalizeTotal` divides by the denominator it was configured with; see
     /// [`Self::streaming_row_sums_projected`].
     ///
-    /// nnz is read from `indptr` *before* the transforms run, matching
-    /// [`Self::streaming_row_nnz_and_sums`] — the supported transforms are
-    /// value-wise and preserve the sparsity pattern.
+    /// nnz is counted **after** `apply_transforms`, from the projected
+    /// `indptr`. That is equivalent to counting it before: every [`Transform`]
+    /// variant rewrites `csr.data` only and none prunes entries, so the
+    /// sparsity pattern — and therefore the count — is unchanged. A future
+    /// transform that *does* change the pattern would have to revisit this and
+    /// count pre-transform, as [`Self::streaming_row_nnz_and_sums`] does.
     ///
     /// Returns global-length vectors (NOT filtered through deletion vectors).
     pub(crate) fn streaming_qc_row_pass(
@@ -595,6 +601,8 @@ impl ScxLazyTransformedDataset {
         n_qc: usize,
     ) -> Result<crate::projected_agg::QcRowStats, String> {
         let cols = self.col_projection.clone();
+        let n_visible = cols.as_deref().map_or(self.backed.shape().1, |c| c.len());
+        crate::projected_agg::ensure_qc_pass_args(n_qc, qc_bits, n_visible);
         let mut out = crate::projected_agg::QcRowStats::zeroed(self.backed.shape().0, n_qc);
         let mut global_row = 0usize;
         for shard_idx in 0..self.backed.index().n_shards() {
@@ -617,7 +625,25 @@ impl ScxLazyTransformedDataset {
             }
             global_row += n_rows;
         }
+        crate::projected_agg::ensure_full_row_coverage(global_row, self.backed.shape().0)
+            .map_err(|e| e.to_string())?;
         Ok(out)
+    }
+
+    /// Per-column sums through the transform chain, honoring column projection
+    /// and keep-mask. Length = `shape_val.1`.
+    ///
+    /// The visible-space wrapper over the physical-width `streaming_col_sums*`
+    /// kernels, mirroring `ScxBackedSparseDataset::col_sums_raw`. Prefer
+    /// [`Self::col_sums_and_nnz_raw`] when the caller also needs nnz — that is
+    /// one scan instead of two.
+    pub(crate) fn col_sums_raw(&self) -> Result<Vec<f64>, String> {
+        let physical = if self.kept_to_global.is_some() {
+            self.streaming_col_sums_masked()?
+        } else {
+            self.streaming_col_sums()?
+        };
+        Ok(self.apply_col_projection_to_vec(physical))
     }
 
     /// Fused per-column sums + nnz through the transform chain, honoring
@@ -627,6 +653,11 @@ impl ScxLazyTransformedDataset {
     /// [`Self::streaming_qc_row_pass`]. NNZ counts stored entries, which the
     /// value-wise transforms leave untouched, so it matches the raw reader's
     /// `col_nnz`.
+    ///
+    /// The kept-row walk is inlined rather than delegating to
+    /// [`scx_format_io::BackedCsrReader::col_sums_and_nnz_masked`] because the
+    /// transform chain has to run on each decoded shard *before* the values are
+    /// accumulated — the backed kernel reads the untransformed shard.
     pub(crate) fn col_sums_and_nnz_raw(&self) -> Result<(Vec<f64>, Vec<u32>), String> {
         let n_vars = self.backed.shape().1; // physical width, projected below
         let mut sums = vec![0.0f64; n_vars];
@@ -681,15 +712,6 @@ impl ScxLazyTransformedDataset {
         };
         Ok((sums, counts))
     }
-
-    // --- Visible-space aggregation wrappers ---
-    //
-    // The `streaming_*` kernels above deliberately return **physical**-width
-    // column vectors and full-length row vectors. These `*_raw` wrappers are
-    // the visible-space equivalents — they mirror the identically named
-    // helpers on `ScxBackedSparseDataset` so a caller holding either type
-    // routes the `(col_projection, kept_to_global)` combination the same way
-    // and gets a vector whose length matches `shape_val`.
 
     /// Materialize the full matrix with all transforms applied.
     ///

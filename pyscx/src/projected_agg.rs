@@ -429,10 +429,11 @@ pub(crate) fn accumulate_qc_rows_into(
 /// column and must therefore have length `col_indices.len()` (or `n_vars` when
 /// `col_indices` is `None`); pass an empty slice for no `qc_var`s.
 ///
-/// `n_qc` is the number of requested subsets, passed explicitly rather than
-/// derived from the bits so an all-false mask still yields its (all-zero)
-/// output row and the caller's indexing stays aligned. At most 64 — the caller
-/// chunks beyond that.
+/// `n_qc` is the number of subsets in **this** pass, passed explicitly rather
+/// than derived from the bits so an all-false mask still yields its (all-zero)
+/// output row and the caller's indexing stays aligned. At most 64 per pass —
+/// a caller with more subsets runs one pass per 64 (`resolve_qc_masks` does),
+/// and the limit is enforced here rather than assumed.
 pub fn qc_row_pass(
     reader: &BackedCsrReader,
     col_indices: Option<&[u32]>,
@@ -440,8 +441,7 @@ pub fn qc_row_pass(
     n_qc: usize,
 ) -> Result<QcRowStats> {
     let (n_obs, n_vars) = reader.shape();
-    debug_assert!(n_qc <= 64, "qc_row_pass supports at most 64 subsets");
-    debug_assert!(qc_bits.is_empty() || qc_bits.len() == col_indices.map_or(n_vars, |c| c.len()));
+    ensure_qc_pass_args(n_qc, qc_bits, col_indices.map_or(n_vars, |c| c.len()));
 
     let mut out = QcRowStats::zeroed(n_obs, n_qc);
     let mut global_row = 0usize;
@@ -456,7 +456,46 @@ pub fn qc_row_pass(
         }
         global_row += n_rows;
     }
+    ensure_full_row_coverage(global_row, n_obs)?;
     Ok(out)
+}
+
+/// Enforce the per-pass subset contract. Shared by the backed and lazy row
+/// passes.
+///
+/// These are **caller-contract** violations, not data conditions — the Python
+/// entry point (`resolve_qc_masks`) chunks at 64 and sizes the mask to the
+/// visible axis, so neither can fire from a supported path. They are release-
+/// active `assert!`s rather than `debug_assert!`s because an oversized `n_qc`
+/// would shift past the mask width and *silently drop subsets* in the shipped
+/// `.so`, which is precisely the failure mode this module exists to prevent.
+pub(crate) fn ensure_qc_pass_args(n_qc: usize, qc_bits: &[u64], n_visible: usize) {
+    assert!(
+        n_qc <= 64,
+        "qc_row_pass accepts at most 64 subsets per pass, got {n_qc}; \
+         callers with more must run one pass per 64"
+    );
+    assert!(
+        qc_bits.is_empty() || qc_bits.len() == n_visible,
+        "qc_var bitmask has {} entries but the visible axis has {n_visible} columns",
+        qc_bits.len()
+    );
+}
+
+/// The row pass writes by index into `n_obs`-sized vectors from a running
+/// counter, so shards that don't tile `[0, n_obs)` would publish zeros as real
+/// QC values. The pre-fusion kernels built their output with `extend`, which
+/// surfaced that corruption as a length mismatch — keep the loudness. Unlike
+/// the argument checks above this *is* a data condition (a corrupt or
+/// hand-edited catalog), so it returns an error rather than panicking.
+pub(crate) fn ensure_full_row_coverage(seen: usize, n_obs: usize) -> Result<()> {
+    if seen != n_obs {
+        return Err(scx_format_io::ScxError::InvalidCatalog(format!(
+            "shards cover {seen} rows but the header declares {n_obs}; refusing to \
+             publish QC metrics from a partially-covered row axis"
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
