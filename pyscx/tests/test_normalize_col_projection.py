@@ -39,6 +39,23 @@ def _make_test_scx(tmpdir, n_obs=100, n_vars=50, density=0.3, seed=42):
     return path, X
 
 
+# `min_cells=3` on a 100-cell, density-0.3 fixture keeps every one of the 50
+# genes — so no `col_projection` was ever active and this whole file, whose
+# subject *is* the projection, was vacuous. 32 sits just above the ~30-cell
+# detection mean and drops a real fraction of the genes.
+MIN_CELLS = 32
+
+
+def _filter_genes(adata):
+    """`filter_genes` plus the guard that keeps this file from going vacuous."""
+    before = adata.n_vars
+    pyscx.accel.filter_genes(adata, min_cells=MIN_CELLS)
+    assert 0 < adata.n_vars < before, (
+        f"threshold must drop some but not all genes; kept {adata.n_vars}/{before}"
+    )
+    return adata
+
+
 @pytest.fixture
 def scx_file():
     """Create a test SCX file and return (path, reference_X)."""
@@ -61,14 +78,14 @@ class TestNormalizeTotalColProjectionBacked:
 
         # --- Reference: scanpy on materialized data ---
         adata_ref = anndata.AnnData(X=X_ref.copy())
-        sc.pp.filter_genes(adata_ref, min_cells=3)
+        sc.pp.filter_genes(adata_ref, min_cells=MIN_CELLS)
         kept_var_count = adata_ref.n_vars
         sc.pp.normalize_total(adata_ref, target_sum=1e4)
         ref_X = adata_ref.X
 
         # --- SCX backed path: filter_genes → normalize_total ---
         adata = pyscx.open(path).to_anndata(backed=True)
-        pyscx.accel.filter_genes(adata, min_cells=3)
+        _filter_genes(adata)
         assert adata.X.shape[1] == kept_var_count, "filter_genes should reduce n_vars"
 
         pyscx.accel.normalize_total(adata, target_sum=1e4)
@@ -89,7 +106,7 @@ class TestNormalizeTotalColProjectionBacked:
         path, X_ref = scx_file
 
         adata = pyscx.open(path).to_anndata(backed=True)
-        pyscx.accel.filter_genes(adata, min_cells=3)
+        _filter_genes(adata)
 
         target = 1e4
         pyscx.accel.normalize_total(adata, target_sum=target)
@@ -143,7 +160,7 @@ class TestNormalizeTotalColProjectionLazy:
         # --- Reference: scanpy pipeline ---
         adata_ref = anndata.AnnData(X=X_ref.copy())
         sc.pp.log1p(adata_ref)
-        sc.pp.filter_genes(adata_ref, min_cells=3)
+        sc.pp.filter_genes(adata_ref, min_cells=MIN_CELLS)
         sc.pp.normalize_total(adata_ref, target_sum=1e4)
 
         # --- SCX lazy pipeline ---
@@ -151,7 +168,7 @@ class TestNormalizeTotalColProjectionLazy:
         pyscx.accel.log1p(adata)
         assert type(adata.X).__name__ == 'ScxLazyTransformedDataset'
 
-        pyscx.accel.filter_genes(adata, min_cells=3)
+        _filter_genes(adata)
         assert adata.X.shape[1] == adata_ref.n_vars
 
         pyscx.accel.normalize_total(adata, target_sum=1e4)
@@ -175,13 +192,13 @@ class TestNormalizeTotalColProjectionLazy:
         # Reference
         adata_ref = anndata.AnnData(X=X_ref.copy())
         sc.pp.normalize_total(adata_ref, target_sum=1e4)
-        sc.pp.filter_genes(adata_ref, min_cells=3)
+        sc.pp.filter_genes(adata_ref, min_cells=MIN_CELLS)
         sc.pp.normalize_total(adata_ref, target_sum=1e4)
 
         # SCX path
         adata = pyscx.open(path).to_anndata(backed=True)
         pyscx.accel.normalize_total(adata, target_sum=1e4)
-        pyscx.accel.filter_genes(adata, min_cells=3)
+        _filter_genes(adata)
         pyscx.accel.normalize_total(adata, target_sum=1e4)
 
         lazy_X = adata.X.to_memory()
@@ -197,7 +214,7 @@ class TestNormalizeTotalColProjectionLazy:
         path, _ = scx_file
 
         adata = pyscx.open(path).to_anndata(backed=True)
-        pyscx.accel.filter_genes(adata, min_cells=3)
+        _filter_genes(adata)
         pyscx.accel.normalize_total(adata, target_sum=1e4)
 
         # Streaming

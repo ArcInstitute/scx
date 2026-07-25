@@ -260,9 +260,9 @@ pub fn normalize_total(
     if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let mut lazy_ref = lazy.borrow_mut();
         // Scanpy compat: sum only over projected (user-visible) genes.
-        // streaming_row_sums_projected() applies transforms to the full-width
-        // shard first (so prior NormalizeTotal sees correct denominator),
-        // then project_csr restricts to projected genes before summing.
+        // row_sums_raw() applies transforms to the full-width shard first (so a
+        // prior NormalizeTotal sees the correct denominator), then project_csr
+        // restricts to projected genes before summing.
         // Returns a global-length vector (n_obs_global), which is what
         // apply_transforms_to_csr expects (indexes by global row).
         // Heavy streaming scan runs off the GIL (`detached`); rebind to a plain
@@ -270,7 +270,7 @@ pub fn normalize_total(
         // `l`'s immutable borrow ends before the mutable `transforms.push` below.
         let sums = {
             let l: &ScxLazyTransformedDataset = &lazy_ref;
-            detached(py, || l.streaming_row_sums_projected()).map_err(PyRuntimeError::new_err)?
+            detached(py, || l.row_sums_raw()).map_err(PyRuntimeError::new_err)?
         };
         // Resolve target_sum=None → median of positive visible-cell totals
         // (over the correct denominator, which already reflects prior transforms).

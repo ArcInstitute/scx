@@ -397,12 +397,18 @@ pub fn filter_cells(
         // Fused: when both NNZ and sums are needed, compute them in a single
         // shard scan. NNZ is transform-invariant but we compute it from the
         // same decoded shard to avoid double I/O.
+        //
+        // All three arms go through the visible-space `*_raw` API, so a column
+        // projection is honored: a `filter_genes → normalize_total →
+        // filter_cells` pipeline thresholds cells on totals over the *kept*
+        // genes, as scanpy does on the sliced object. The physical-width
+        // kernels these used to call summed the removed genes back in (§9.18).
         // Heavy shard scan + transforms run off the GIL (`detached`); rebind to a
         // plain `&Self` (Send) so the closure captures `l`, not the `!Send` PyRef.
         let l: &ScxLazyTransformedDataset = &lazy_ref;
         let (row_nnz, row_sums) = if need_nnz && need_sums {
             let (nnz, sums) = detached(py, || {
-                let (all_nnz, all_sums) = l.streaming_row_nnz_and_sums()?;
+                let (all_nnz, all_sums) = l.row_nnz_and_sums_raw()?;
                 Ok::<_, String>((
                     l.filter_row_results(&all_nnz),
                     l.filter_row_results(&all_sums),
@@ -414,7 +420,7 @@ pub fn filter_cells(
             let nnz = if need_nnz {
                 Some(
                     detached(py, || {
-                        let all_nnz = l.backed.row_nnz().map_err(|e| e.to_string())?;
+                        let all_nnz = l.row_nnz_raw()?;
                         Ok::<_, String>(l.filter_row_results(&all_nnz))
                     })
                     .map_err(PyRuntimeError::new_err)?,
@@ -425,7 +431,7 @@ pub fn filter_cells(
             let sums = if need_sums {
                 Some(
                     detached(py, || {
-                        let all_sums = l.streaming_row_sums()?;
+                        let all_sums = l.row_sums_raw()?;
                         Ok::<_, String>(l.filter_row_results(&all_sums))
                     })
                     .map_err(PyRuntimeError::new_err)?,
