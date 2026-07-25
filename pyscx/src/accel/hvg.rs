@@ -243,7 +243,6 @@ pub fn highly_variable_genes<'py>(
                             .extract::<numpy::PyReadonlyArray1<bool>>()?
                             .as_slice()?
                             .to_vec();
-                        let x_obj = adata.getattr("X")?;
                         apply_hvg_subset(py, adata, &mask)?;
                     }
                     return Ok(());
