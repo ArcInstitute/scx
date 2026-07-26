@@ -584,6 +584,15 @@ Raw JSON under the job's `raw-off` / `raw-on` directories; `results/raw/` is git
 the numbers above cite the job and the two arms rather than a checked-in artifact, as 4.0b
 and 4.1 do.
 
+**The GPU staging path is not covered by the table above.** Those are CPU ops; the
+`gpu_shard_source.rs` rewrite needs its own `gpu_profile` host-decode capture
+(`benchmarks/scripts/profile_gpu_staging.py`, depth 1 vs 4 on an H100), which is still
+running at the time of writing. What *is* verified on GPU is correctness: `cargo test -p
+scx-gpu` 193/0 and `-p scx-accel --features gpu` 19/0, plus a failure-set A/B of the pyscx
+GPU suites against `2055f74f` — **11 failures on each arm, branch-only list empty**, so the
+rewrite of the staging loop every GPU streaming op shares introduced no regression. Do not
+read the CPU speedups as evidence for the GPU path until that capture lands.
+
 Where the pipeline declines to engage — `RAYON_NUM_THREADS=1`, or a caller that is itself
 a rayon worker — the GPU staging path is now fully sequential, where the old dedicated
 `std::thread` overlapped one shard ahead unconditionally. Accepted: both are an explicit
