@@ -2432,19 +2432,29 @@ fn clamp_chunk_to_de_budget(
 /// pre-4.5 streaming behaviour (every shard re-decoded for every gene chunk) —
 /// an escape hatch for a host where the extra VRAM is not available, and the
 /// "off" arm for an A/B.
+///
+/// Read once per process, matching every other `SCX_*` knob in the workspace.
+/// Not merely a consistency point: `pyscx/tests/test_gpu_de_resident.py` runs
+/// its two arms as **subprocesses** precisely because the setting is supposed
+/// to be process-stable, and a per-call `env::var` would quietly make that
+/// isolation unnecessary — and the promise untrue for anyone relying on it.
 fn resident_enabled() -> bool {
-    !matches!(std::env::var("SCX_GPU_DE_RESIDENT").as_deref(), Ok("0"))
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("SCX_GPU_DE_RESIDENT").as_deref(), Ok("0")))
 }
 
 /// Fraction of *free* VRAM the resident CSR may occupy. The remainder is what
 /// `clamp_chunk_to_de_budget` then sizes the per-chunk scratch against, so this
 /// must stay below 1.0.
 fn resident_max_frac() -> f64 {
-    std::env::var("SCX_GPU_DE_RESIDENT_MAX_FRAC")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v > 0.0 && *v < 1.0)
-        .unwrap_or(scx_gpu::DEFAULT_RESIDENT_MAX_FRAC)
+    static F: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("SCX_GPU_DE_RESIDENT_MAX_FRAC")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0 && *v < 1.0)
+            .unwrap_or(scx_gpu::DEFAULT_RESIDENT_MAX_FRAC)
+    })
 }
 
 /// Make `source`'s CSR shards device-resident when it is worth it.

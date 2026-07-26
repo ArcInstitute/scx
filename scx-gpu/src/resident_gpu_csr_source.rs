@@ -219,8 +219,14 @@ pub fn try_build_resident(
         if n_rows == 0 {
             return Ok(());
         }
-        // Exact retained cost for this shard: (n_rows + 1) i64 + nnz × (i32 + f32).
-        let want = (n_rows as u64 + 1) * 8 + (slot.nnz() as u64) * 8;
+        // What `clone_exact` will allocate for this shard, spelled the same way
+        // it spells it — including the `max(1)` floors, so the prediction the
+        // budget is checked against and the `device_bytes()` accumulated
+        // afterwards are the *same number* rather than two estimates that drift
+        // by a few bytes on a rows-but-no-nonzeros shard. The check has to
+        // predict (there is nothing to measure until it allocates), so the only
+        // way to keep the two honest is to derive them identically.
+        let want = (n_rows as u64 + 1) * 8 + (slot.nnz().max(1) as u64) * 8;
         if resident_bytes.saturating_add(want) > budget {
             // Abort the drain rather than finish a pass whose results we are
             // about to discard: a matrix far too large for the budget would
@@ -230,6 +236,11 @@ pub fn try_build_resident(
             return Err(budget_abort());
         }
         let retained = slot.clone_exact(dev)?;
+        debug_assert_eq!(
+            retained.device_bytes(),
+            want,
+            "budget prediction and actual retained bytes must agree"
+        );
         resident_bytes += retained.device_bytes();
         slots.push((idx, retained));
         Ok(())
@@ -237,8 +248,15 @@ pub fn try_build_resident(
     match drain {
         Ok(()) => {}
         Err(e) if is_budget_abort(&e) => {
-            // Dropping the slots frees the device memory retained so far.
+            // Dropping the slots returns the retained memory to cudarc's CUDA
+            // memory pool — but the pool keeps it charged to the process until
+            // trimmed, so `cuMemGetInfo` would still report it as used. The
+            // caller's very next act is to size its per-chunk scratch against
+            // free VRAM, and on this path it has *no* residency to release in
+            // exchange, so an untrimmed pool would shrink its chunk (or fail
+            // the budget outright) to pay for memory nothing is holding.
             drop(slots);
+            dev.reclaim_memory_pool()?;
             return Ok(None);
         }
         Err(e) => return Err(e),

@@ -197,6 +197,42 @@ fn tiny_budget_declines_and_leaves_the_source_usable() {
     );
 }
 
+/// A declined build must hand the device back in the state it found it, not
+/// merely stop retaining.
+///
+/// Dropping the retained slots returns them to cudarc's CUDA memory pool, which
+/// keeps them charged to the process until trimmed — so without the trim,
+/// `cuMemGetInfo` still counts memory nothing is holding. That matters because
+/// the caller's next act is to size its per-chunk scratch against free VRAM,
+/// and on the decline path it has no residency to give back in exchange.
+///
+/// Asserted behaviourally rather than by reading `free_memory()` directly: a
+/// bare byte comparison is flaky on a shared GPU, whereas "a generous build
+/// still succeeds and yields every shard after a declined one" is the property
+/// that actually has to hold.
+#[test]
+fn a_declined_build_leaves_the_device_reusable() {
+    let dev = require_gpu!();
+    let src = fixture();
+
+    let mut streaming = BackedGpuMatrixSource::new(&dev, &src).unwrap();
+    let expected = drain(&dev, &mut streaming);
+
+    // Several declines in a row: if each leaked its partial retention into the
+    // pool, the pressure would accumulate.
+    for _ in 0..3 {
+        let mut s = BackedGpuMatrixSource::new(&dev, &src).unwrap();
+        assert!(try_build_resident(&dev, &mut s, 1e-12).unwrap().is_none());
+    }
+
+    let mut s = BackedGpuMatrixSource::new(&dev, &src).unwrap();
+    let mut resident = try_build_resident(&dev, &mut s, DEFAULT_RESIDENT_MAX_FRAC)
+        .unwrap()
+        .expect("residency must still be grantable after repeated declines");
+    assert_eq!(resident.n_retained_shards(), 3);
+    assert_eq!(drain(&dev, &mut resident), expected);
+}
+
 /// An empty source is declined rather than producing a zero-shard resident
 /// source that would silently skip the caller's work.
 #[test]
