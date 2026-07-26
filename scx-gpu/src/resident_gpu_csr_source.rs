@@ -259,7 +259,20 @@ pub fn try_build_resident(
             dev.reclaim_memory_pool()?;
             return Ok(None);
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            // Same reasoning as the budget abort, for a genuine mid-drain
+            // failure (a `clone_exact` OOM, a CUDA fault): whatever was
+            // retained before the failure has to come off the process's books,
+            // or the caller's next free-VRAM probe pays for it. Best-effort and
+            // deliberately not `?` — a failing trim must never replace the
+            // error the caller actually needs to see. `GpuDevice::Drop` would
+            // eventually trim anyway, but only once the per-op device unwinds
+            // several frames up; doing it here keeps the two failure paths
+            // symmetric rather than one relying on a distant destructor.
+            drop(slots);
+            let _ = dev.reclaim_memory_pool();
+            return Err(e);
+        }
     }
 
     if slots.is_empty() {

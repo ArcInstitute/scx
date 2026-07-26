@@ -1424,10 +1424,11 @@ fn test_combined_tie_term_overflow_regression() {
     assert_eq!(got[0], expected);
 }
 
-/// §9.11 commit B: the two **production** CSR DE kernels
-/// (`csr_shard_to_gene_major_filtered_kernel` and `csr_shard_pseudobulk_kernel`)
-/// now binary-search each row down to the `[c0, c1)` window instead of striding
-/// the row's whole nonzero range and predicating per element.
+/// §9.11 commit B: the CSR DE kernels
+/// (`csr_shard_to_gene_major_filtered_kernel`, `csr_shard_pseudobulk_kernel`,
+/// and the currently-unwired v2 `csr_shard_to_gene_major_kernel`) now
+/// binary-search each row down to the `[c0, c1)` window instead of striding the
+/// row's whole nonzero range and predicating per element.
 ///
 /// The narrowing is only sound because per-row column indices are strictly
 /// increasing — enforced release-active by `validate_shard_for_gpu_de`. This
@@ -1501,6 +1502,15 @@ fn test_csr_gene_major_and_pseudobulk_window_parity() {
     let cell_to_pos_dev = dev.htod_copy(&cell_to_pos).unwrap();
     let n_groups = 2usize;
 
+    // The v2 gene-major scatter takes a single `cell_to_pool` map (-1 = not in
+    // the pool) rather than the group+pos pair. It has no production caller
+    // today but is still exported from scx-gpu and received the identical
+    // windowing rewrite, so it is covered here rather than left as an untested
+    // change waiting for a future wire-up to inherit.
+    let cell_to_pool: Vec<i32> = vec![0, 1, -1, -1, -1];
+    let cell_to_pool_dev = dev.htod_copy(&cell_to_pool).unwrap();
+    let n_pool = 2usize;
+
     // Host references, written the pre-windowing way (linear scan + predicate)
     // so the assertion compares the new kernel against the old formulation.
     let host_slab = |c0: usize, c1: usize, group: i32| -> Vec<f32> {
@@ -1548,9 +1558,34 @@ fn test_csr_gene_major_and_pseudobulk_window_parity() {
         sums
     };
 
+    // Host reference for the v2 pool scatter, again written the pre-windowing
+    // way (linear scan + predicate).
+    let host_pool_slab = |c0: usize, c1: usize| -> Vec<f32> {
+        let sz = c1 - c0;
+        let mut slab = vec![0.0f32; sz * n_pool];
+        let mut global_row = 0usize;
+        for shard in &shards {
+            for r in 0..shard.n_rows() {
+                let pos = cell_to_pool[global_row + r];
+                if pos < 0 {
+                    continue;
+                }
+                for k in shard.indptr[r] as usize..shard.indptr[r + 1] as usize {
+                    let col = shard.indices[k] as usize;
+                    if col >= c0 && col < c1 {
+                        slab[(col - c0) * n_pool + pos as usize] = shard.data[k];
+                    }
+                }
+            }
+            global_row += shard.n_rows();
+        }
+        slab
+    };
+
     let run_case = |c0: usize, c1: usize| {
         let sz = c1 - c0;
         let mut gpu_src = RawGpuShardSource::new(&dev, &src).unwrap();
+        let mut pool_slab = dev.alloc_zeros::<f32>(sz * n_pool).unwrap();
         let mut slab0 = dev.alloc_zeros::<f32>(sz * n_perm).unwrap();
         let mut slab1 = dev.alloc_zeros::<f32>(sz * n_perm).unwrap();
         let mut sums = dev.alloc_zeros::<f64>(n_groups * sz).unwrap();
@@ -1597,6 +1632,17 @@ fn test_csr_gene_major_and_pseudobulk_window_parity() {
                     c1,
                     0, // ArithRaw: f(x) = x
                 )?;
+                crate::gpu_diffexp::gpu_de_scatter_shard_to_gene_major(
+                    &dev,
+                    &view,
+                    &cell_to_pool_dev,
+                    &mut pool_slab,
+                    global_row,
+                    n_pool,
+                    sz,
+                    c0,
+                    c1,
+                )?;
                 global_row += n_rows;
                 Ok(())
             })
@@ -1617,6 +1663,11 @@ fn test_csr_gene_major_and_pseudobulk_window_parity() {
             dev.dtoh_copy(&sums).unwrap(),
             host_sums(c0, c1),
             "pseudobulk sums mismatch for [{c0}, {c1})"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&pool_slab).unwrap(),
+            host_pool_slab(c0, c1),
+            "v2 pool gene-major slab mismatch for [{c0}, {c1})"
         );
     };
 

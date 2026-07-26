@@ -2268,11 +2268,16 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
         n_slots.max(1),
     );
     let mut resident = try_resident_csr(dev, source, n_vars, probe_chunk)?;
-    // Feasibility re-check with the same arguments the core's own clamp will
-    // use, so residency releases its VRAM here rather than making the core's
-    // clamp fail an op that used to run. The returned chunk is discarded — the
-    // core re-derives it — but the backoff's side effect is the point.
-    let _ = clamp_chunk_with_residency_backoff(dev, &mut resident, || {
+    // Clamp with the same arguments the shared core will use, and **pass the
+    // result in** rather than discarding it. Two reasons. It releases
+    // residency's VRAM here if the per-chunk set no longer fits, instead of
+    // letting the core's clamp fail an op that used to run. And because
+    // `clamp_chunk_to_de_budget` is idempotent — re-clamping an already-clamped
+    // value returns it unchanged, so `chunk < requested` is false and it stays
+    // quiet — the core no longer emits a second "clamped N -> M" warning for
+    // the same decision. Discarding the result made this path both noisier and
+    // structurally different from `pdex_ref_gpu_chunked_v3_csr`, which rebinds.
+    let chunk_size = clamp_chunk_with_residency_backoff(dev, &mut resident, || {
         clamp_chunk_to_de_budget(
             dev,
             chunk_size,
