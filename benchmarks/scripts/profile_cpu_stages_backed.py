@@ -36,6 +36,7 @@ from benchmarks.comprehensive.results import BenchmarkResult, write_result  # no
 
 OPS = (
     "pca",
+    "pca_hvg",
     "hvg",
     "normalize",
     "qc",
@@ -71,6 +72,30 @@ SUBSET_OBS_STRIDE = 2  # keep every other cell
 # count is the headline signal for this op.
 QC_VARS = ("mt", "ribo", "hb")
 
+# `pca_hvg` exists because `pca` on these fixtures never reaches the covariance
+# route. `pyscx.accel.pca` picks covariance when the effective var count is
+# <= COVARIANCE_PCA_THRESHOLD (5000) and randomized otherwise, and every dataset
+# in the tier carries a full gene set — census_1m has 61,497 — so the whole
+# capture measures one of the two routes. Masking to a fixed gene count puts the
+# other one under measurement, and routes through `ProjectedShardSource` while
+# it is there.
+#
+# The mask is a positional stride, not a real HVG selection: the question is
+# which code path runs and how much it decodes, and a biologically meaningful
+# choice would only make the two arms harder to compare. `mask_n_vars` is
+# recorded per run so a fixture change that silently flips the route back is
+# visible in the capture instead of being read as a speedup.
+PCA_HVG_N_VARS = 2000
+# `scx_accel::pca::COVARIANCE_PCA_THRESHOLD`, pinned by the doc-drift guard in
+# tests/scx-integration-tests. Asserted rather than commented because exceeding
+# it is silent: the op still runs, still reports a number, and measures the
+# randomized route a second time.
+COVARIANCE_PCA_THRESHOLD = 5000
+assert PCA_HVG_N_VARS <= COVARIANCE_PCA_THRESHOLD, (
+    f"pca_hvg masks to {PCA_HVG_N_VARS} genes, which routes to randomized PCA, "
+    f"not the covariance route this op exists to cover"
+)
+
 
 def _peak_rss_mb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -90,7 +115,12 @@ def _run_op(op: str, scx_path: Path, n_comps: int) -> dict[str, float]:
     import numpy as np
     import pyscx
 
-    adata = pyscx.open(str(scx_path)).to_anndata(backed=True)
+    exp = pyscx.open(str(scx_path))
+    # Grab the shard count while the Experiment is still in hand: the decode
+    # bucket counts *shards decoded*, and only `count / n_shards` turns that
+    # into the number that matters — how many times the op walked the matrix.
+    n_shards = float(exp.shard_count)
+    adata = exp.to_anndata(backed=True)
     n_obs0, n_vars0 = adata.n_obs, adata.n_vars
     if op == "filter_cells":
         # scanpy's canonical default; drops a real fraction of real data.
@@ -102,6 +132,11 @@ def _run_op(op: str, scx_path: Path, n_comps: int) -> dict[str, float]:
         pyscx.accel.subset_obs(adata, keep)
     elif op == "pca":
         pyscx.accel.pca(adata, n_comps=n_comps, device="cpu")
+    elif op == "pca_hvg":
+        adata.var["highly_variable"] = _stride_mask(n_vars0, PCA_HVG_N_VARS)
+        pyscx.accel.pca(
+            adata, n_comps=n_comps, device="cpu", mask_var="highly_variable"
+        )
     elif op == "hvg":
         pyscx.accel.highly_variable_genes(
             adata, n_top_genes=2000, flavor="seurat_v3", device="cpu",
@@ -118,30 +153,35 @@ def _run_op(op: str, scx_path: Path, n_comps: int) -> dict[str, float]:
         pyscx.accel.filter_genes(adata, min_cells=1, min_counts=1.0)
     else:
         raise ValueError(op)
-    return {
+    out = {
         "n_obs_before": float(n_obs0),
         "n_vars_before": float(n_vars0),
         "n_obs_after": float(adata.n_obs),
         "n_vars_after": float(adata.n_vars),
         "kept_frac_obs": adata.n_obs / n_obs0 if n_obs0 else 1.0,
         "kept_frac_vars": adata.n_vars / n_vars0 if n_vars0 else 1.0,
+        "n_shards": n_shards,
     }
+    if op == "pca_hvg":
+        # Premise, not decoration: if this ever exceeded the routing ceiling the
+        # op would silently measure the randomized route a second time and the
+        # covariance route would go uncovered with nothing to show for it.
+        out["mask_n_vars"] = float(int(adata.var["highly_variable"].sum()))
+    return out
 
 
-def _assign_qc_masks(adata) -> None:
-    """Attach three deterministic gene subsets as boolean `var` columns.
-
-    Real MT/ribo/hb prefixes are absent from several fixtures (Census var_names
-    are integer strings), so select by position instead — the accumulator cost
-    depends on subset *size*, not on which genes are in it.
-    """
+def _stride_mask(n_vars: int, keep: int):
+    """A deterministic boolean mask over `keep` evenly-spaced genes."""
     import numpy as np
 
-    n_vars = adata.n_vars
     idx = np.arange(n_vars)
-    # ~1% / ~5% / ~0.5% of genes, echoing typical MT / ribo / hb fractions.
-    for name, stride in zip(QC_VARS, (100, 20, 200)):
-        adata.var[name] = (idx % stride) == 0
+    stride = max(1, n_vars // max(1, keep))
+    mask = (idx % stride) == 0
+    # Trim the tail so the count is exactly `keep` when the stride overshoots.
+    surplus = int(mask.sum()) - keep
+    if surplus > 0:
+        mask[np.flatnonzero(mask)[-surplus:]] = False
+    return mask
 
 
 def _snapshot_flat() -> dict[str, float]:

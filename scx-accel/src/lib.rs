@@ -72,8 +72,8 @@ pub use nb_glm::{
 };
 pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{
-    covariance_pca, covariance_pca_inmemory, pflog_pca, randomized_pca, randomized_pca_inmemory,
-    PcaResult, COVARIANCE_PCA_THRESHOLD,
+    covariance_pca, covariance_pca_inmemory, pca_prefetch_depth, pflog_pca, randomized_pca,
+    randomized_pca_inmemory, PcaResult, COVARIANCE_PCA_THRESHOLD,
 };
 pub use pflog::{
     estimate_alpha, pflog_baseline_from_delta, pflog_baseline_from_raw, AlphaEstimate,
