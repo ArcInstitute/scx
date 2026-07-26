@@ -655,17 +655,25 @@ CSC sidecar) has no column-range prefilter, so each of the two v3 CSR drivers ru
 full `for_each_gpu_csr_shard` pass **per gene chunk**. Cost is
 `n_gene_chunks × n_shards` host decodes and H→D uploads. At census_500k — 61 497 genes
 over a 500-gene chunk is 123 chunks, across 31 CSR shards — that is 123 complete passes
-over a 747 M-nnz matrix, and it is why GPU DE there was 96–99 % host-decode-bound.
+over a 747 M-nnz matrix. Pre-4.2, with staging decoding on one thread, that made GPU DE
+there **98.6 % host-decode-bound** (1 005.6 s of a 1 019.7 s wall).
 
 The arithmetic closes exactly, which is what made the diagnosis actionable rather than
-plausible: 1 005.6 s of host decode ÷ 123 chunks = 8.2 s, one full decode pass.
+plausible: 1 005.6 s ÷ 123 chunks = **8.2 s**, one full decode pass. (That prediction is
+what the 4.5 capture below then hit, at 8 578 ms.)
 
 **Decode was only half of it.** All four CSR row-scan kernels in `diffexp.cu` are
 one-block-per-row and stride the row's *entire* nonzero range, testing
 `col >= c0 && col < c1` per element — so the per-chunk *kernel* cost was O(nnz) too,
-another 123× over. Bounding 4.2's branch arm from wall (391.7 s) and Σ host-decode
-(≈ 940 s at depth 4) puts kernels + sync somewhere in **[84, 319] s**: residency alone
-could not have been shown to fix it. Both halves therefore ship together.
+another 123× over. 4.2 widened the decode but left that untouched: bounding its arm from
+wall (383.9 s as measured below) and Σ host-decode (≈ 941 s summed over depth-4 workers)
+puts kernels + sync somewhere in **[84, 319] s**. Residency alone could not have been
+shown to fix that, so both halves ship together.
+
+Note the two baselines in play. Everything above quoting 1 019.7 s is **pre-4.2**
+(`2055f74f`); the capture below is against **post-4.2** `main` (`2d1fe16b`), which is the
+383.9 s arm. 4.2's 2.60× on this op is already banked in that baseline and is not counted
+again here.
 
 **1. Device residency.** `scx_gpu::ResidentGpuCsrSource` drains the inner
 `GpuMatrixSource` once, retains every shard in its own device-resident `GpuCsrSlot`, and

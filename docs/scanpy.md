@@ -2902,6 +2902,14 @@ Two knobs:
 - **`SCX_GPU_DE_RESIDENT=0`** — kill switch. Restores the pre-4.5 streaming
   behaviour exactly.
 
+A third knob, `SCX_GPU_VALIDATE_PAR_MIN_NNZ`, sets the shard size above which
+the per-shard GPU-DE validation scan (strictly-increasing columns + finiteness)
+runs in parallel; default 65 536 nnz, and pinning it above any real shard's nnz
+restores the serial scan. It exists mainly so that choice stays measurable —
+the parallel scan is a **measured no-op** at current scales, because it runs on
+the consuming thread while the prefetch workers decode ahead and is therefore
+hidden behind decode.
+
 Residency is declined — silently and correctly — when the matrix does not fit
 the budget, or when there is only one gene chunk (streaming would run one pass
 anyway, so retaining the matrix would be pure cost). Because a declined run
