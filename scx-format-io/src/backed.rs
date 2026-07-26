@@ -2588,6 +2588,29 @@ impl crate::shard_source::ShardSource for BackedCsrReader {
             .unwrap_or(0))
     }
 
+    /// O(n_shards) over already-loaded catalog metadata — no decode, no I/O.
+    ///
+    /// Returns `None` when the catalog carries no shard statistics: `nnz` is
+    /// then 0 for every entry (`ShardEntryLite::from_view_entry` maps a missing
+    /// `stats` block to 0), and reporting `max_nnz = 0` would be an
+    /// *under*-estimate, which the hint contract forbids. An genuinely all-empty
+    /// matrix is indistinguishable here and also declines — harmless, since the
+    /// caller then grows buffers on demand exactly as it did before.
+    fn shard_size_hint(&self) -> Option<crate::ShardSizeHint> {
+        let max_nnz = (0..self.shard_count())
+            .filter_map(|i| self.shard_entry(i))
+            .map(|e| e.nnz)
+            .max()
+            .unwrap_or(0);
+        if max_nnz == 0 {
+            return None;
+        }
+        Some(crate::ShardSizeHint {
+            max_rows: <Self as crate::ShardSource>::max_shard_rows(self).ok()?,
+            max_nnz: max_nnz as usize,
+        })
+    }
+
     // col_means_and_sum_sq: not overridden here. Generic callers (`S:
     // ShardSource`) get the trait default, which iterates read_shard_arc() and
     // so shares the LRU cache. The inherent `BackedCsrReader::col_means_and_sum_sq`

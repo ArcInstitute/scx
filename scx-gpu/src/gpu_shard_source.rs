@@ -142,6 +142,57 @@ pub(crate) fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), 
 /// with a ~256 KB fixture and still exercise the parallel path.
 pub(crate) const VALIDATE_PAR_MIN_NNZ: usize = 65_536;
 
+/// Host-RAM budget, in bytes, for the shards the GPU staging path holds
+/// decoded-but-not-yet-staged. Unset means "no budget" — the depth is whatever
+/// `SCX_ACCEL_PREFETCH_DEPTH` / `DEFAULT_PREFETCH_DEPTH` says.
+const STAGING_MEMORY_BUDGET_ENV: &str = "SCX_GPU_STAGING_MEMORY_BUDGET";
+
+fn staging_memory_budget() -> Option<u64> {
+    static B: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var(STAGING_MEMORY_BUDGET_ENV)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|b| *b > 0)
+    })
+}
+
+/// Decode-prefetch depth for the multi-shard staging loop, derated to a host
+/// memory budget when one is set (§9.13 follow-on / the #373 review finding).
+///
+/// The pipeline holds up to `depth` decoded shards in host RAM at once, and GPU
+/// staging is the path with the largest shards in the system — a census_500k
+/// shard is ~190 MB decoded, so the default depth of 4 is ~760 MB. The #373
+/// review found that `clamp_prefetch_depth` existed but clamped nothing
+/// anywhere: its two call sites derated a `max_workers` that `StableOrder`
+/// discards, and every prefetch call site passed the raw depth. This is the
+/// first place it actually binds.
+///
+/// **No silent behaviour change**: with `SCX_GPU_STAGING_MEMORY_BUDGET` unset
+/// (the default) this returns exactly what the old code used. Setting it makes
+/// the advice "lower your prefetch depth on a memory-tight host" actionable in
+/// terms a user can reason about — bytes — instead of a shard count whose cost
+/// depends on the file.
+///
+/// Sources without a [`shard_size_hint`](ShardSource::shard_size_hint) cannot
+/// be budgeted (there is no per-shard byte estimate to divide by) and keep the
+/// unclamped depth.
+fn resolve_staging_prefetch_depth(source: &(dyn ShardSource + Sync)) -> usize {
+    let requested = prefetch::prefetch_depth();
+    let (Some(budget), Some(hint)) = (staging_memory_budget(), source.shard_size_hint()) else {
+        return requested;
+    };
+    let depth = prefetch::clamp_prefetch_depth(requested, hint.decoded_bytes(), budget);
+    if depth < requested {
+        log::debug!(
+            "GPU staging: clamped decode-prefetch depth {requested} -> {depth} to fit the \
+             {budget}-byte {STAGING_MEMORY_BUDGET_ENV} budget (~{} B/shard)",
+            hint.decoded_bytes(),
+        );
+    }
+    depth
+}
+
 /// `ShardSource` adapter that times every decode into the GPU profiler's
 /// host-decode bucket.
 ///
@@ -246,19 +297,33 @@ pub struct RawGpuShardSource<'a> {
     pinned_events: [Option<CudaEvent>; 2],
     slot: GpuCsrSlot,
     copy_stream: Arc<CudaStream>,
+    /// Decode-prefetch depth for the multi-shard path, resolved once at
+    /// construction by [`resolve_staging_prefetch_depth`].
+    prefetch_depth: usize,
 }
 
 impl<'a> RawGpuShardSource<'a> {
-    /// Construct a raw GPU shard source with lazy-grow staging buffers.
+    /// Construct a raw GPU shard source, pre-sizing the staging buffers from
+    /// the source's [`shard_size_hint`](ShardSource::shard_size_hint) when it
+    /// offers one and growing them on demand when it does not.
     ///
-    /// Deliberately does **not** call `ShardSource::max_shard_rows()`
-    /// to pre-size: the default trait impl reads every shard, which would
-    /// defeat the worker-thread pipelining and inflate I/O on backed
-    /// readers without an O(1) override. Backed readers with the O(1)
-    /// override and callers that know their max should use
-    /// [`Self::with_max_shard_rows`] instead.
+    /// Deliberately does **not** call `ShardSource::max_shard_rows()` directly:
+    /// its default trait impl decodes every shard, which would defeat the
+    /// decode-prefetch pipelining and inflate I/O on sources without an O(1)
+    /// override. `shard_size_hint` is `None` unless the implementor can answer
+    /// cheaply — a backed reader reads it straight from catalog statistics — so
+    /// consulting it is always safe. Callers who know their bounds
+    /// independently can still pass them via [`Self::with_max_shard_rows`].
+    ///
+    /// Before 4.5 this always built at capacity 1 and let the slots
+    /// grow-and-realloc up to the first shard's size, and
+    /// `with_max_shard_rows` — the obvious pre-sizing hook, on the path with
+    /// the largest shards in the system — had no production caller at all.
     pub fn new(dev: &'a GpuDevice, source: &'a (dyn ShardSource + Sync)) -> Result<Self, GpuError> {
-        Self::build(dev, source, 1, 1)
+        match source.shard_size_hint() {
+            Some(hint) => Self::with_max_shard_rows(dev, source, hint.max_rows, hint.max_nnz),
+            None => Self::build(dev, source, 1, 1),
+        }
     }
 
     /// Construct a raw GPU shard source with pinned and device buffers
@@ -294,6 +359,7 @@ impl<'a> RawGpuShardSource<'a> {
             PinnedCsrSlot::new(dev.context(), indptr_cap, nnz_cap),
         ];
         let slot = GpuCsrSlot::new(dev, indptr_cap, nnz_cap)?;
+        let prefetch_depth = resolve_staging_prefetch_depth(source);
 
         // Dedicated copy stream — used only when n_shards > 1 (single-
         // shard sources reuse the compute stream below).
@@ -312,7 +378,16 @@ impl<'a> RawGpuShardSource<'a> {
             pinned_events: [None, None],
             slot,
             copy_stream,
+            prefetch_depth,
         })
+    }
+
+    /// Capacity of the reusable device CSR slot. Test-only: lets the
+    /// pre-sizing test assert the staging buffers never grow-and-realloc when
+    /// the source offered a `shard_size_hint`.
+    #[cfg(test)]
+    pub(crate) fn slot_capacity(&self) -> (usize, usize, usize) {
+        self.slot.capacity()
     }
 
     /// Run `f` over each non-empty shard. Internal driver shared between
@@ -397,7 +472,7 @@ impl<'a> RawGpuShardSource<'a> {
         let profiled = ProfiledDecode(self.source);
         let scope_result = prefetch::for_each_shard_ordered_uncached(
             &profiled,
-            prefetch::prefetch_depth(),
+            self.prefetch_depth,
             |i, csr| -> Result<(), GpuError> {
                 if csr.n_rows() == 0 {
                     return Ok(());
@@ -633,6 +708,33 @@ mod tests {
         }
     }
 
+    /// Same as `InMemorySource` but advertises a `shard_size_hint`, standing in
+    /// for a catalog-backed reader.
+    struct HintedSource {
+        inner: InMemorySource,
+    }
+
+    impl ShardSource for HintedSource {
+        fn n_shards(&self) -> usize {
+            self.inner.n_shards()
+        }
+        fn n_obs(&self) -> usize {
+            self.inner.n_obs()
+        }
+        fn n_vars(&self) -> usize {
+            self.inner.n_vars()
+        }
+        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
+            self.inner.read_shard(shard_idx)
+        }
+        fn shard_size_hint(&self) -> Option<scx_format_io::ShardSizeHint> {
+            Some(scx_format_io::ShardSizeHint {
+                max_rows: self.inner.shards.iter().map(|s| s.n_rows()).max()?,
+                max_nnz: self.inner.shards.iter().map(|s| s.data.len()).max()?,
+            })
+        }
+    }
+
     fn make_csr(rows: usize, n_vars: usize, base: f32) -> ScxCsr {
         // One nonzero per row at column (row % n_vars), value (base + row).
         let mut indptr = vec![0i64];
@@ -644,6 +746,101 @@ mod tests {
             indptr.push(indices.len() as i64);
         }
         ScxCsr::new_unchecked((rows, n_vars), indptr, indices, data)
+    }
+
+    fn hinted(shards: Vec<ScxCsr>, n_vars: usize) -> HintedSource {
+        let n_obs = shards.iter().map(|s| s.n_rows()).sum();
+        HintedSource {
+            inner: InMemorySource {
+                shards,
+                n_obs,
+                n_vars,
+            },
+        }
+    }
+
+    /// §9.13 follow-on: with no budget set — the default — the depth clamp is
+    /// inert. This is the "no silent behaviour change" claim, so it is asserted
+    /// rather than argued, including the premise that the knob really is unset
+    /// in this process (a leaked env var would make the test vacuous).
+    #[test]
+    fn staging_depth_is_unclamped_without_a_budget() {
+        assert!(
+            std::env::var(STAGING_MEMORY_BUDGET_ENV).is_err(),
+            "premise: {STAGING_MEMORY_BUDGET_ENV} must be unset for this test to mean anything"
+        );
+        let src = hinted(vec![make_csr(4, 8, 1.0), make_csr(4, 8, 2.0)], 8);
+        assert_eq!(
+            resolve_staging_prefetch_depth(&src),
+            prefetch::prefetch_depth()
+        );
+    }
+
+    /// A source that cannot describe its shards cannot be budgeted — there is
+    /// no per-shard byte estimate to divide by — so it keeps the full depth
+    /// even when a budget is set.
+    #[test]
+    fn staging_depth_needs_a_hint_to_be_clamped() {
+        let src = InMemorySource {
+            shards: vec![make_csr(4, 8, 1.0), make_csr(4, 8, 2.0)],
+            n_obs: 8,
+            n_vars: 8,
+        };
+        assert!(ShardSource::shard_size_hint(&src).is_none());
+        assert_eq!(
+            resolve_staging_prefetch_depth(&src),
+            prefetch::prefetch_depth()
+        );
+    }
+
+    /// The clamp arithmetic the budget path performs, exercised directly since
+    /// the budget itself is a process-global `OnceLock` that a test cannot vary.
+    #[test]
+    fn staging_depth_clamp_arithmetic() {
+        let src = hinted(vec![make_csr(4, 8, 1.0)], 8);
+        let hint = ShardSource::shard_size_hint(&src).unwrap();
+        let per_shard = hint.decoded_bytes();
+        assert!(per_shard > 0);
+
+        // Budget for exactly two shards -> depth 2, whatever was requested.
+        assert_eq!(
+            prefetch::clamp_prefetch_depth(8, per_shard, per_shard * 2),
+            2
+        );
+        // A budget smaller than one shard still floors at 1: refusing to decode
+        // anything would be worse than exceeding the budget.
+        assert_eq!(prefetch::clamp_prefetch_depth(8, per_shard, 1), 1);
+        // A generous budget never raises the requested depth.
+        assert_eq!(
+            prefetch::clamp_prefetch_depth(2, per_shard, per_shard * 100),
+            2
+        );
+    }
+
+    /// A hinted source pre-sizes the staging slot at construction, so the drain
+    /// never grows-and-reallocs. Before 4.5 `with_max_shard_rows` — the hook for
+    /// this, on the path with the largest shards in the system — had no
+    /// production caller and every source started at capacity 1.
+    #[test]
+    fn hinted_source_presizes_the_staging_slot() {
+        let dev = require_gpu!();
+        let shards = vec![make_csr(3, 5, 1.0), make_csr(7, 5, 100.0)];
+        let src = hinted(shards, 5);
+
+        let mut gpu_src = RawGpuShardSource::new(&dev, &src).unwrap();
+        let at_construction = gpu_src.slot_capacity();
+        assert!(
+            at_construction.0 >= 8 && at_construction.1 >= 7 && at_construction.2 >= 7,
+            "slot must be pre-sized for the largest shard (7 rows / 7 nnz), got \
+             {at_construction:?}"
+        );
+
+        gpu_src.for_each_gpu_shard(|_idx, _slot| Ok(())).unwrap();
+        assert_eq!(
+            gpu_src.slot_capacity(),
+            at_construction,
+            "a pre-sized slot must not grow during the drain"
+        );
     }
 
     /// ACC3: a row with non-increasing (here duplicate) column indices is

@@ -25,6 +25,30 @@ use scx_sparse::{ScxCsc, ScxCsr};
 
 use crate::error::Result;
 
+/// Cheap upper bounds on the largest shard, from
+/// [`ShardSource::shard_size_hint`].
+///
+/// Both fields are upper bounds — see that method for why exactness is not
+/// promised and why the two travel together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardSizeHint {
+    /// Upper bound on rows in any one shard.
+    pub max_rows: usize,
+    /// Upper bound on nonzeros in any one shard.
+    pub max_nnz: usize,
+}
+
+impl ShardSizeHint {
+    /// Bytes one decoded shard of this size occupies as an
+    /// [`ScxCsr`](scx_sparse::ScxCsr): `indptr` i64 + `indices` i32 + `data`
+    /// f32. Saturating, so a nonsense hint cannot wrap into a small budget.
+    pub fn decoded_bytes(&self) -> u64 {
+        (self.max_rows as u64 + 1)
+            .saturating_mul(8)
+            .saturating_add((self.max_nnz as u64).saturating_mul(8))
+    }
+}
+
 /// A source of CSR shards for streaming computation.
 ///
 /// Implementations provide sequential shard access for algorithms like
@@ -96,6 +120,33 @@ pub trait ShardSource {
             }
         }
         Ok(max_rows)
+    }
+
+    /// Largest shard's dimensions, when both are available **without
+    /// decoding**.
+    ///
+    /// `None` — the default — means "no cheap estimate", not "zero". A caller
+    /// must treat the absence as unknown and fall back to growing buffers on
+    /// demand; it must never read `None` as a small number.
+    ///
+    /// Deliberately **not** split into a row hint and an nnz hint, and
+    /// deliberately not modelled on [`max_shard_rows`] (whose default decodes
+    /// every shard). The point of a hint is to *avoid* work — pre-sizing GPU
+    /// staging buffers so they never grow-and-realloc, and deriving a
+    /// per-shard byte estimate for the decode-prefetch depth clamp. A caller
+    /// needs both numbers together, and one method returning both means an
+    /// implementor cannot supply a cheap nnz while leaving the caller to fall
+    /// into the expensive default for rows. Implementors with O(1) catalog
+    /// access override this; everyone else returns `None`.
+    ///
+    /// Both fields are **upper bounds**, not exact counts: a reader over a
+    /// column-projected or deletion-filtered view reports the on-disk shard
+    /// statistics, which over-count. Over-estimating only costs a slightly
+    /// larger buffer or a slightly smaller prefetch depth.
+    ///
+    /// [`max_shard_rows`]: ShardSource::max_shard_rows
+    fn shard_size_hint(&self) -> Option<ShardSizeHint> {
+        None
     }
 
     /// Compute column means and per-column sum-of-squares in a single
