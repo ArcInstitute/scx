@@ -593,33 +593,33 @@ Raw JSON under the job's `raw-off` / `raw-on` directories; `results/raw/` is git
 the numbers above cite the job and the two arms rather than a checked-in artifact, as 4.0b
 and 4.1 do.
 
-**GPU staging.** (SLURM job 2708827, H100, `benchmarks/scripts/profile_gpu_staging.py`,
-3 runs, median wall, `SCX_DISABLE_CUDA_GRAPHS=1`.) The CPU table above does not cover this
-path; it has its own capture.
+**GPU staging.** (SLURM job 2709055, H100, `benchmarks/scripts/_run_4_2_gpu_main_vs_branch.sh`
+→ `profile_gpu_staging.py`, 3 runs, median wall, `SCX_DISABLE_CUDA_GRAPHS=1`.) The CPU table
+above does not cover this path; it has its own capture.
 
-> [!IMPORTANT]
-> **This is a depth-1 → depth-4 comparison inside 4.2, not a `main` → branch one, and the
-> two are not the same thing.** At `depth = 1` the pipeline declines to engage and staging
-> decodes fully sequentially with **zero** decode threads. `main` always spawned a
-> one-ahead `std::thread` + `sync_channel(1)` for multi-shard input, with no depth guard —
-> so the depth-1 arm is *slower than `main`*, and the ratios below overstate the
-> `main` → branch gain by however much that one-ahead overlap was worth. **The
-> `main` → branch speedup is currently unmeasured.** Treat the table as "what the depth
-> knob buys", which is also the actionable form for tuning.
-
-| Op | Dataset | depth 1 | depth 4 | Speedup | host-decode Σ/wall | HTOD |
+| Op | Dataset | `main` | branch | Speedup | host-decode Σ/wall | peak RSS |
 |---|---|--:|--:|--:|--:|--:|
-| HVG | tabula_sapiens_100k | 7 441.6 ms | 4 312.9 ms | **1.73×** | 52.5 % → 99.4 % | 1 643 → 1 614 ms |
-| HVG | census_500k | 22 931.5 ms | 10 389.3 ms | **2.21×** | 65.6 % → 147.1 % | 3 156 → 3 151 ms |
-| HVG | census_1m | 37 942.1 ms | 16 626.2 ms | **2.28×** | 71.3 % → 183.4 % | 4 010 → 4 076 ms |
-| DE | tabula_sapiens_100k | 297 997.9 ms | 115 091.8 ms | **2.59×** | 81.3 % → 213.2 % | 17 618 → 17 340 ms |
-| DE | census_500k | 1 152 722.4 ms | 384 089.9 ms | **3.00×** | 80.5 % → 246.2 % | 64 479 → 61 637 ms |
+| HVG | tabula_sapiens_100k | 5 590.8 ms | 4 487.9 ms | **1.25×** | 72.7 % → 92.8 % | 2 049 → 2 596 MB |
+| HVG | census_500k | 17 878.0 ms | 11 773.1 ms | **1.52×** | 86.4 % → 133.1 % | 3 129 → 3 394 MB |
+| HVG | census_1m | 31 180.5 ms | 18 443.8 ms | **1.69×** | 89.1 % → 160.8 % | 4 219 → 4 297 MB |
+| DE | tabula_sapiens_100k | 255 726.0 ms | 127 819.2 ms | **2.00×** | 96.0 % → 208.6 % | 2 164 → 2 650 MB |
+| DE | census_500k | 1 019 749.4 ms | 391 682.1 ms | **2.60×** | 98.6 % → 239.9 % | 3 113 → 3 557 MB |
 
-§9.12's diagnosis holds: with staging decoding serially, GPU DE is **80–81 %
-host-decode-bound** and GPU HVG 52–71 %, so the host side is the whole ceiling. Widening it
-takes census_500k DE from 19 minutes to 6.4. (Those percentages describe the depth-1 arm,
-which as noted above has no decode thread at all — `main`, with its one-ahead thread, sat
-somewhere below them.)
+Both arms are two builds in one job on one node, each at its own defaults — `main` ignores
+`SCX_ACCEL_PREFETCH_DEPTH` for staging, the branch uses its default of 4.
+
+§9.12's diagnosis holds, and `main`'s arm quantifies it: with a single one-ahead decode
+thread, GPU DE is **96–99 % host-decode-bound** and GPU HVG 73–89 %. The host side is
+essentially the whole ceiling, which is why widening it pays. census_500k DE goes from 17
+minutes to 6.5.
+
+**An earlier revision of this section reported 1.73–2.28× and 2.59–3.00×.** Those came from
+comparing `SCX_ACCEL_PREFETCH_DEPTH=1` against `4` on one branch build, and depth 1 is *not*
+`main`: at depth 1 the pipeline declines to engage and staging decodes with **zero** decode
+threads, whereas `main` unconditionally spawned a one-ahead `std::thread` +
+`sync_channel(1)` for multi-shard input. The depth-1 arm is slower than `main` — by ~12 % on
+census_500k DE — so the ratios were inflated. The table above is the two-build
+`main`-vs-branch measurement (SLURM job 2709055) that replaced them.
 
 **Nothing device-side changed, but the `htod` column is not the evidence for that.** The
 bucket is recorded around `PinnedCsrSlot::stage()` — a host memcpy into the pinned buffer —
@@ -630,10 +630,12 @@ argument is structural and checkable from the diff: the pinned 2-slot ring, the 
 already delivers to the calling thread in shard order. Host-decode Σ/wall exceeding 100 %
 is the pipeline working: it sums concurrent workers.
 
-**Peak RSS rises consistently here, by +651 to +814 MB (+19 % to +46 %).** That is the same
-`(depth − 1)` decoded-shards model as the CPU side, and unlike the CPU case it is plainly
-visible at every scale, because GPU staging otherwise keeps host RSS low (1.7–4.5 GB) — the
-extra shards are not hidden under a larger ceiling. Worth knowing before raising
+**Peak RSS rises by +78 to +547 MB (+2 % to +27 %)**, largest on the smallest fixture. It is
+the `(depth − 1)` decoded-shards model, but measured against `main` rather than against a
+zero-thread arm the increment is smaller than it first appeared: `main` already held ~2
+shards, so the true delta is roughly two extra shards, not three. (An earlier revision
+quoted +19–46 % from the depth-1 comparison.) GPU staging otherwise keeps host RSS at
+1.7–4.5 GB, so nothing hides it — worth knowing before raising
 `SCX_ACCEL_PREFETCH_DEPTH` on a memory-tight GPU host.
 
 Correctness on GPU is separately verified: `cargo test -p scx-gpu` 193/0 and
