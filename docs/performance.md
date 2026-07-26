@@ -775,6 +775,22 @@ none to disable the windowing, and adding one was not judged worth the API surfa
 > jobs on the same node, a 14 % swing that swallows the 7 % being chased. Single-job control
 > deltas below ~15 % on this node are not interpretable.
 
+**Output equivalence is checked at the scale the change was built for**, not only on unit
+fixtures (SLURM 2709125, census_500k, `SCX_GPU_DE_RESIDENT=0` vs default, same file and
+groups, both arms confirmed on `gpu_csr_v3` at 123 gene chunks):
+
+| Op | names / feature | p-values | statistics | pseudobulk means / log2FC |
+|---|---|---|---|---|
+| `rank_genes_groups` | exact | exact | exact | **exact** (streaming self-spread also 0) |
+| `pdex_ref` | exact | exact | exact | ≤ 1.7 × 10⁻¹³ |
+
+`pdex_ref`'s means are the only figures that are not bit-identical, and the bar they are
+judged against is measured rather than chosen: the streaming path was run **twice**, and
+its own run-to-run spread (1.0 × 10⁻¹³ — f64 `atomicAdd` ordering across rows is already
+nondeterministic) is what residency has to come in under. It does, at the same order of
+magnitude and ~5 decades inside the 2.9 × 10⁻⁸ relative floor. Wilcoxon's pseudobulk fold
+happened to be reproducible on this run, and residency matched it exactly.
+
 **Parallel shard validation (§9.13) is a measured no-op at these scales, and is kept as
 hygiene with no `×` claimed** — the same disposition as task 4.3's marshalling. The reason
 it does not show up is worth stating: validation runs on the consumer thread *while* the
