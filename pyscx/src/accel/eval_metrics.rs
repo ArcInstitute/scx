@@ -693,11 +693,22 @@ fn compute_aligned_pseudobulk_means<'py>(
         .map(|(i, s)| (s.as_str(), i))
         .collect();
 
-    let real_indices: Vec<usize> = common.iter().map(|s| real_idx_map[s.as_str()]).collect();
-    let pred_indices: Vec<usize> = common.iter().map(|s| pred_idx_map[s.as_str()]).collect();
+    // `i64`, not `usize`. These are fancy indices, and the pre-4.3 spelling
+    // `np.array(vec_of_usize)` went through a Python list, so numpy inferred
+    // **int64**. `PyArray1::from_vec` preserves the Rust width instead, and a
+    // `Vec<usize>` would land as uint64 — a silent dtype change on an array
+    // that reaches numpy's indexing machinery. Collect at the target width.
+    let real_indices: Vec<i64> = common
+        .iter()
+        .map(|s| real_idx_map[s.as_str()] as i64)
+        .collect();
+    let pred_indices: Vec<i64> = common
+        .iter()
+        .map(|s| pred_idx_map[s.as_str()] as i64)
+        .collect();
 
-    let real_idx_arr = np.call_method1("array", (real_indices,))?;
-    let pred_idx_arr = np.call_method1("array", (pred_indices,))?;
+    let real_idx_arr = numpy::PyArray1::from_vec(py, real_indices);
+    let pred_idx_arr = numpy::PyArray1::from_vec(py, pred_indices);
 
     let means_real_ordered = means_real_np.get_item(&real_idx_arr)?;
     let means_pred_ordered = means_pred_np.get_item(&pred_idx_arr)?;

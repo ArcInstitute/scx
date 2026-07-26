@@ -213,7 +213,7 @@ fn filter_sparse_strata<'py>(
     if keep.iter().all(|&b| b) {
         return Ok(adata.clone());
     }
-    let mask = py.import("numpy")?.call_method1("array", (keep,))?;
+    let mask = numpy::PyArray1::from_vec(py, keep);
     adata.get_item(&mask)?.call_method0("copy")
 }
 

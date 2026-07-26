@@ -26,7 +26,6 @@ pub(super) fn extract_strata<'py>(
     let obs = adata.getattr("obs")?;
     let warnings = py.import("warnings")?;
     let pd = py.import("pandas")?;
-    let np = py.import("numpy")?;
 
     // Validate each stratify_by column exists and doesn't collide.
     for col in stratify_by {
@@ -110,7 +109,7 @@ pub(super) fn extract_strata<'py>(
         for &idx in indices {
             mask_vec[idx] = true;
         }
-        let mask = np.call_method1("array", (mask_vec,))?;
+        let mask = numpy::PyArray1::from_vec(py, mask_vec).into_any();
         masks.push(mask);
     }
 
@@ -1134,8 +1133,17 @@ fn write_de_to_adata(
             Ok(arr.unbind().into_bound(py))
         };
 
+    // One structured array per field, one column per group. `from_slice` hands
+    // numpy the f64 buffer directly; the pre-4.3 spelling copied the slice into
+    // a `Vec`, then pyo3 built a Python `list` of `PyFloat`s, then numpy parsed
+    // that back — n_groups × n_genes objects per field, so a 30-group ×
+    // 60k-gene run materialised millions of them purely in transit.
+    //
+    // The `names` builder above keeps its `PyList`: its field dtype is `U200`,
+    // which genuinely needs Python strings.
     let build_structured_f64 =
         |field_data: &[Vec<f64>], groups: &[String]| -> PyResult<Bound<'_, PyAny>> {
+            let t_marshal = scx_accel::cpu_profile::start();
             let dt_list = pyo3::types::PyList::empty(py);
             for gn in groups {
                 let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), "f8"])?;
@@ -1146,10 +1154,13 @@ fn write_de_to_adata(
             let arr = numpy.call_method1("empty", (n_genes,))?;
             let arr = arr.call_method1("astype", (&dtype,))?;
             for (i, gn) in groups.iter().enumerate() {
-                let vals: Vec<f64> = field_data[i][..n_genes].to_vec();
-                let np_vals = numpy.call_method1("array", (vals,))?;
+                let np_vals = numpy::PyArray1::from_slice(py, &field_data[i][..n_genes]);
                 arr.set_item(gn.as_str(), np_vals)?;
             }
+            scx_accel::cpu_profile::record_marshalling_since(
+                t_marshal,
+                groups.len() * n_genes * std::mem::size_of::<f64>(),
+            );
             Ok(arr.unbind().into_bound(py))
         };
 

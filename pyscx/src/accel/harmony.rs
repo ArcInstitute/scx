@@ -308,7 +308,7 @@ pub fn harmony_integrate(
 
     info.set_item("converged", result.converged)?;
     info.set_item("n_iterations", result.n_iterations)?;
-    let obj_arr = np.call_method1("array", (result.objective_harmony.clone(),))?;
+    let obj_arr = numpy::PyArray1::from_slice(py, &result.objective_harmony);
     info.set_item("objective_harmony", obj_arr)?;
     info.set_item("backend", backend)?;
 

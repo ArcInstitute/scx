@@ -2,6 +2,7 @@
 
 use scx_format_io::ShardSource;
 
+use numpy::PyArray1;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -1017,8 +1018,6 @@ pub(crate) fn write_pca_to_adata(
     backend: &str,
     params: Option<&PcaWriteParams>,
 ) -> PyResult<()> {
-    let numpy = py.import("numpy")?;
-
     // adata.obsm["X_pca"] = embeddings (n_obs × n_components) as float32.
     // `result.embeddings` is already row-major flat (element (i,j) at
     // i*n_components+j), so the flat f32 buffer matches shape [n_obs, n_comp].
@@ -1072,10 +1071,10 @@ pub(crate) fn write_pca_to_adata(
     // adata.uns["pca"] = dict with variance info + backend
     let pca_dict = PyDict::new(py);
 
-    let var_explained = numpy.call_method1("array", (result.variance_explained.clone(),))?;
+    let var_explained = PyArray1::from_slice(py, &result.variance_explained);
     pca_dict.set_item("variance", var_explained)?;
 
-    let var_ratio = numpy.call_method1("array", (result.variance_ratio.clone(),))?;
+    let var_ratio = PyArray1::from_slice(py, &result.variance_ratio);
     pca_dict.set_item("variance_ratio", var_ratio)?;
 
     pca_dict.set_item("backend", backend)?;

@@ -584,10 +584,9 @@ pub fn pseudobulk_dex(
 
     // Build counts DataFrame and metadata DataFrame for pydeseq2.
     let pd = py.import("pandas")?;
-    let np = py.import("numpy")?;
 
     // counts_df: rows = pseudobulk samples, columns = genes
-    let counts_array = np.call_method1("array", (result.counts.clone(),))?;
+    let counts_array = numpy::PyArray1::from_slice(py, &result.counts);
     let counts_2d = counts_array.call_method1("reshape", ((result.n_groups, result.n_vars),))?;
 
     // Sample indices (row labels for pydeseq2 counts matrix).

@@ -497,6 +497,55 @@ need a `+ Sync` dyn boundary change through the pyscx capability-detection layer
 `for_each_csc_shard_ordered` sibling primitive ships and is tested, ready for that
 follow-up.
 
+### Decode-prefetch beyond `scx-accel` (Phase-4 task 4.2)
+
+2.1 applied the pipeline only to the `scx-accel` streaming kernels, because it *lived*
+in `scx-accel` — above two of its three natural consumers. `scx-format-io` and `scx-gpu`
+sit below that crate in the dependency graph, so neither could reach it, and both still
+decoded one shard at a time on the consuming thread. Task 4.2 moved the module to
+`scx-format-io` (where the `ShardSource` / `ColumnShardSource` traits it is generic over
+are already defined) and wired up the loops that could not previously see it:
+
+| Consumer | What now prefetches |
+|---|---|
+| `scx-format-io/src/backed.rs` | the 15 aggregation kernels behind QC, filtering, `col_*` and `normalize_total`'s row sums |
+| `pyscx/src/projected_agg.rs` | the 17 column-projected CSR twins |
+| `pyscx/src/lazy_transform/dataset.rs` | the 8 `streaming_*` lazy/transformed kernels |
+| `scx-gpu/src/gpu_shard_source.rs` | GPU staging — replaces a single scoped decode thread + `sync_channel(1)` |
+
+`scx_accel::prefetch` re-exports the surface with the error type pinned to `AccelError`,
+so the eight 2.1 call sites and both `SCX_ACCEL_*` knobs above are unchanged; the knobs
+now govern these loops too, including GPU staging.
+
+**Bit-identity is tested, not asserted.** `scx-format-io`'s
+`prefetched_aggregations_are_bit_identical_to_a_sequential_loop` compares every touched
+aggregation against a hand-written sequential reference on f64 bit patterns, and
+`pyscx/tests/test_prefetch_equivalence.py` compares 19 arrays across all four consumers
+between two subprocesses at `SCX_ACCEL_PREFETCH_DEPTH=1` and the default (the depth is a
+process-wide `OnceLock`, so one interpreter cannot hold both arms).
+
+Both fixtures needed a **cancelling ±1e16 pair** to be worth anything. The kernels reduce
+per-shard *partial* sums, so what has to be order-sensitive is the merge of a handful of
+numbers — and the obvious "cycle through three magnitudes" fixture is completely blind to
+it: 0 of the 119 non-identity permutations of a 5-shard visit order changed any column
+sum. Companion tests (`fixture_is_sensitive_to_shard_order`,
+`test_fixture_would_expose_a_reordering`) pin the property so the equivalence assertions
+cannot quietly go vacuous.
+
+**Note on peak RSS.** Decoded-but-unconsumed shards go from one (two on the GPU staging
+path) to `depth`, default 4. That is the one way this change can regress, so the capture
+below reports peak RSS alongside wall-clock. `prefetch::clamp_prefetch_depth` plus the
+exact per-shard `nnz` in `ShardEntryLite` is the derating lever if it ever needs one.
+
+<!-- CAPTURE PENDING: 4.2 before/after (SCX_ACCEL_PREFETCH_DEPTH=1 vs default),
+     full tier, wall-clock + peak RSS; GPU host-decode/HTOD buckets on an H100. -->
+
+Where the pipeline declines to engage — `RAYON_NUM_THREADS=1`, or a caller that is itself
+a rayon worker — the GPU staging path is now fully sequential, where the old dedicated
+`std::thread` overlapped one shard ahead unconditionally. Accepted: both are an explicit
+"no ambient parallelism" configuration, and the worker-thread guard is what keeps a
+nested call from deadlocking.
+
 ### Low-risk marshalling & fusions (Phase-2 tasks 2.4 + 2.7)
 
 These are **correctness-neutral** clean-ups — the 2.0 oracle rated marshalling negligible
@@ -531,6 +580,54 @@ is lower allocation counts and one shared thread-control knob, with no regressio
   cap still applies — the env only lowers it further. Unset (the default) → behaviour is
   identical to before. It does **not** resize the ambient global rayon pool the many
   `current_num_threads()` callers use — that stays governed by `RAYON_NUM_THREADS`.
+
+### Marshalling & GIL hygiene at the Python boundary (Phase-4 task 4.3)
+
+2.4 converted the 2-D result writers; 4.3 finishes the job for the 1-D ones and fixes a
+concurrency defect next door. Both halves are **output-neutral** and carry no `×` claim.
+
+- **Flat buffers for every remaining `numpy.array(<Rust Vec>)`.** That spelling cloned
+  the Rust buffer, had pyo3 build a Python `list` (one `PyLong`/`PyFloat` per element),
+  then made numpy re-parse it. The two that mattered: `write_neighbors_to_adata` built
+  **six** CSR arrays that way — `n_obs × k` each, so tens of millions of transient Python
+  objects at 1M cells × k=15, on a path shared by CPU kNN, GPU kNN, `pca_neighbors` and
+  `pca_neighbors_umap` — and the DE structured-array builder did it per group per field,
+  so a 30-group × 60k-gene run materialised millions more. Both now use
+  `PyArray1::from_vec` / `from_slice`; `write_neighbors_to_adata` takes its `KnnResult` by
+  value so the buffers are *moved*, not copied. Smaller instances converted alongside in
+  `pca.rs`, `harmony.rs`, `pseudobulk.rs`, `nb_glm.rs`, `de.rs` and `eval_metrics.rs`. The
+  `rank_genes_groups` `names` field keeps its `PyList` path — its `U200` dtype genuinely
+  needs Python strings.
+
+  **Dtype was the risk, not values.** `np.array(list[int])` is int64 whatever the Rust
+  width, so the kNN `Vec<i32>` indices used to arrive as int64 and now arrive as int32 —
+  absorbed, because `scipy.sparse.csr_matrix` re-derives its index dtype through
+  `get_index_dtype(..., check_contents=True)`. One site was *not* absorbed:
+  `eval_metrics.rs`'s group-reorder indices are `Vec<usize>`, which `from_vec` would land
+  as **uint64** where the list round-trip gave int64, so the kernel collects `i64`
+  explicitly. `pyscx/tests/test_marshalling_dtypes.py` asserts the observable dtype at
+  every converted site rather than assuming the absorption.
+
+- **`col_*` release the GIL.** `pyscx.accel.{col_sums,col_nnz,col_min,col_max,col_var}`
+  ran a full-matrix streaming decode **holding the GIL** (`run_csr_f64` had a
+  `let _ = py;` where the release belonged), so any one of them blocked every other Python
+  thread for the duration and concurrent use from a dataloader or server thread pool
+  serialised completely — while every sibling heavy entry point already released it. A
+  `PyRef` cannot cross `py.detach(...)`, so each entry now snapshots what the scan needs
+  into an owned handle (`Arc` clones + owned index vectors; no matrix data copied), runs
+  the kernel detached, and re-acquires only to build the array. The CSC dispatchers needed
+  a new owned accessor (`as_column_source_owned`) under the identical deletion-vector gate.
+
+  `pyscx/tests/test_col_aggs_gil.py` measures the property directly rather than as a
+  throughput ratio, which would be flaky on a loaded host: a monitor thread stamps
+  `perf_counter()` every ~1 ms during the scan and the assertion is on the largest gap.
+  Against `2055f74f` all three ops starve the monitor for **100 % of the scan**; after the
+  change the gap is a small fraction. A 4-thread concurrency test pins that overlapping
+  `col_sums` calls on one reader — newly possible, since they now share its mmap and LRU
+  concurrently — still agree exactly.
+
+<!-- CAPTURE PENDING: 4.3 marshalling bucket + wall + peak RSS for neighbors and DE
+     at >=500k cells (benchmarks/scripts/bench_marshalling.py). -->
 
 ### Graph-layout refactors (Phase-2 task 2.5)
 

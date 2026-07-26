@@ -2846,7 +2846,16 @@ once at first use (set it before the first accelerator call); unset (the default
 today's behaviour unchanged, and the PCA memory-derived worker cap still applies on top of
 it. Other `SCX_ACCEL_*` knobs (`SCX_ACCEL_PREFETCH_DEPTH`,
 `SCX_ACCEL_REDUCTION_MODE`, `SCX_ACCEL_DE_MEMORY_BUDGET`) are documented in
-[performance.md](performance.md).
+[performance.md](performance.md). `SCX_ACCEL_PREFETCH_DEPTH` bounds the
+decode-prefetch pipeline, which since Phase 4.2 also covers the backed
+aggregation kernels (QC, filtering, `col_*`, `normalize_total`'s row sums), their
+column-projected and lazy/transformed twins, and GPU staging — so raising it
+raises peak memory (`depth` decoded shards in flight) across all of those, not
+just HVG.
+
+The heavy accelerators, including `pyscx.accel.col_sums` and its siblings,
+release the GIL for their streaming scan, so they can be called concurrently
+from Python threads without serialising each other.
 
 The cloud runtime exposes its own knob:
 
