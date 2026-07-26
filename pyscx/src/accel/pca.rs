@@ -697,7 +697,14 @@ pub fn pca(
             // The handle's *view*, not the raw reader: `kept_to_global` and
             // `col_projection` folded in, so `n_vars` is the visible width and
             // `mask_cols` (resolved against `adata.n_vars`) composes directly.
-            let source = backed.as_shard_source().with_cached_reads();
+            // NOT `with_cached_reads()`: `RawGpuShardSource` stages via
+            // `ShardSource::read_shard`, so a cached source would hand back the
+            // shared LRU `Arc`, fail `try_unwrap`, and deep-clone every shard —
+            // where the raw reader decoded fresh and `MADV_DONTNEED`d after. The
+            // GPU arm also never calls `ensure_cache_capacity` (that is CPU-only,
+            // below), so the LRU would stay at the open-time `cache_shards` and
+            // thrash. Uncached matches the pre-existing behaviour exactly.
+            let source = backed.as_shard_source();
             let n_vars = ShardSource::n_vars(&source);
             let m = resolve_gpu_method(method, mask_cols.map(|c| c.len()).unwrap_or(n_vars))?;
             let result = match mask_cols {

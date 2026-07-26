@@ -149,9 +149,9 @@ def test_pseudobulk_means_after_row_subset(scx_path, counts, obs_cols, var_names
     assert adata.n_obs == int(ROW_KEEP.sum())
     assert type(adata.X).__name__ == "ScxBackedSparseDataset"
 
-    means, names = pyscx.accel.pseudobulk_means(adata, "pert")
+    means, names = pyscx.accel.pseudobulk_means(adata, "pert", device="cpu")
     ref_means, ref_names = pyscx.accel.pseudobulk_means(
-        _reference(counts, obs_cols, var_names, rows=ROW_KEEP), "pert"
+        _reference(counts, obs_cols, var_names, rows=ROW_KEEP), "pert", device="cpu"
     )
     assert names == ref_names
     np.testing.assert_allclose(means, ref_means, rtol=1e-6)
@@ -161,9 +161,9 @@ def test_pseudobulk_means_after_var_subset(scx_path, counts, obs_cols, var_names
     adata = _backed(scx_path)
     pyscx.accel.subset_var(adata, COL_KEEP)
 
-    means, names = pyscx.accel.pseudobulk_means(adata, "pert")
+    means, names = pyscx.accel.pseudobulk_means(adata, "pert", device="cpu")
     ref_means, ref_names = pyscx.accel.pseudobulk_means(
-        _reference(counts, obs_cols, var_names, cols=COL_KEEP), "pert"
+        _reference(counts, obs_cols, var_names, cols=COL_KEEP), "pert", device="cpu"
     )
     assert means.shape == ref_means.shape == (2, int(COL_KEEP.sum()))
     assert names == ref_names
@@ -175,18 +175,18 @@ def test_pseudobulk_means_composed_subset(scx_path, counts, obs_cols, var_names)
     pyscx.accel.subset_obs(adata, ROW_KEEP)
     pyscx.accel.subset_var(adata, COL_KEEP)
 
-    means, _ = pyscx.accel.pseudobulk_means(adata, "pert")
+    means, _ = pyscx.accel.pseudobulk_means(adata, "pert", device="cpu")
     ref_means, _ = pyscx.accel.pseudobulk_means(
-        _reference(counts, obs_cols, var_names, rows=ROW_KEEP, cols=COL_KEEP), "pert"
+        _reference(counts, obs_cols, var_names, rows=ROW_KEEP, cols=COL_KEEP), "pert", device="cpu"
     )
     np.testing.assert_allclose(means, ref_means, rtol=1e-6)
 
 
 def test_pseudobulk_means_unsubset_is_unchanged(scx_path, counts, obs_cols, var_names):
     """The common path must be untouched by the source swap."""
-    means, _ = pyscx.accel.pseudobulk_means(_backed(scx_path), "pert")
+    means, _ = pyscx.accel.pseudobulk_means(_backed(scx_path), "pert", device="cpu")
     ref_means, _ = pyscx.accel.pseudobulk_means(
-        _reference(counts, obs_cols, var_names), "pert"
+        _reference(counts, obs_cols, var_names), "pert", device="cpu"
     )
     np.testing.assert_allclose(means, ref_means, rtol=1e-6)
 
@@ -207,6 +207,32 @@ def _dex(adata):
     )
 
 
+def _assert_dex_equal(got, ref, n_expected):
+    """Compare the DE *statistics*, not just the gene labels.
+
+    Gene names come from `adata.var_names`, so a name-only assertion is
+    identical whichever physical columns were read — it cannot detect a wrong
+    -column read, which is the whole failure mode under test.
+    """
+    assert len(got) == len(ref) == n_expected
+    gene_col = "gene" if "gene" in got.columns else got.columns[0]
+    assert list(got[gene_col]) == list(ref[gene_col])
+    numeric = [
+        c
+        for c in got.columns
+        if c != gene_col and got[c].dtype.kind in "fi" and ref[c].dtype.kind in "fi"
+    ]
+    assert numeric, f"expected numeric DE columns to compare, got {list(got.columns)}"
+    for col in numeric:
+        np.testing.assert_allclose(
+            got[col].to_numpy().astype(np.float64),
+            ref[col].to_numpy().astype(np.float64),
+            rtol=1e-6,
+            atol=1e-9,
+            err_msg=f"pseudobulk_dex column {col!r} differs from the materialized run",
+        )
+
+
 def test_pseudobulk_dex_after_composed_subset(scx_path, counts, obs_cols, var_names):
     adata = _backed(scx_path)
     pyscx.accel.subset_obs(adata, ROW_KEEP)
@@ -214,16 +240,15 @@ def test_pseudobulk_dex_after_composed_subset(scx_path, counts, obs_cols, var_na
 
     got = _dex(adata)
     ref = _dex(_reference(counts, obs_cols, var_names, rows=ROW_KEEP, cols=COL_KEEP))
-
-    assert len(got) == len(ref) == int(COL_KEEP.sum())
-    gene_col = "gene" if "gene" in got.columns else got.columns[0]
-    assert list(got[gene_col]) == list(ref[gene_col])
+    _assert_dex_equal(got, ref, n_expected=int(COL_KEEP.sum()))
 
 
 def test_pseudobulk_dex_unsubset_is_unchanged(scx_path, counts, obs_cols, var_names):
-    got = _dex(_backed(scx_path))
-    ref = _dex(_reference(counts, obs_cols, var_names))
-    assert len(got) == len(ref) == N_VARS
+    _assert_dex_equal(
+        _dex(_backed(scx_path)),
+        _dex(_reference(counts, obs_cols, var_names)),
+        n_expected=N_VARS,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +336,77 @@ def test_pdex_ref_unsubset_is_unchanged(scx_path, counts, obs_cols, var_names):
 
 
 # ---------------------------------------------------------------------------
+# preserve_var_order — must be refused, not silently permuted
+# ---------------------------------------------------------------------------
+#
+# `as_shard_source()` emits columns in sorted on-disk order; under
+# `preserve_var_order=True` `adata.var` (and so `gene_names` / the result
+# columns) is in *request* order. Before these ops streamed the view, the
+# widths disagreed and most of them failed loudly on a length guard. Streaming
+# the view makes the widths *match*, which would turn that into a silent
+# gene↔column permutation — so every op that consumes the view has to refuse a
+# presentation-ordered handle, exactly as `pca` / HVG / `score_genes` do.
+
+
+@pytest.fixture(scope="module")
+def request_ordered(scx_path):
+    """A backed handle whose gene axis is in caller-request order."""
+
+    def _open():
+        names = ["g9", "g2", "g10", "g5"]  # deliberately unsorted
+        a = pyscx.open(str(scx_path)).to_anndata(
+            backed=True, var_names=names, preserve_var_order=True
+        )
+        assert list(a.var_names) == names
+        return a
+
+    return _open
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        pytest.param(
+            lambda a: pyscx.accel.rank_genes_groups(
+                a, groupby="pert", method="wilcoxon", device="cpu"
+            ),
+            id="rank_genes_groups",
+        ),
+        pytest.param(
+            lambda a: pyscx.accel.pdex_ref(a, "pert", reference="ctrl", device="cpu"),
+            id="pdex_ref",
+        ),
+        pytest.param(
+            lambda a: pyscx.accel.pseudobulk_means(a, "pert", device="cpu"),
+            id="pseudobulk_means",
+        ),
+        pytest.param(lambda a: _dex(a), id="pseudobulk_dex"),
+    ],
+)
+def test_preserve_var_order_is_refused(request_ordered, op):
+    with pytest.raises(RuntimeError, match="preserve_var_order"):
+        op(request_ordered())
+
+
+def test_sorted_projection_is_not_refused(scx_path, counts, obs_cols, var_names):
+    """The guard must only catch a genuine request-order axis.
+
+    `set_col_projection_ordered` leaves `col_presentation` unset when the
+    permutation is the identity, so an ordinary ascending subset — including
+    `var_names=` listed in sorted order — must still run.
+    """
+    a = pyscx.open(str(scx_path)).to_anndata(
+        backed=True, var_names=["g2", "g5", "g9", "g10"], preserve_var_order=True
+    )
+    means, _ = pyscx.accel.pseudobulk_means(a, "pert", device="cpu")
+    assert means.shape == (2, 4)
+
+    b = _backed(scx_path)
+    pyscx.accel.subset_var(b, COL_KEEP)
+    pyscx.accel.pseudobulk_means(b, "pert", device="cpu")  # must not raise
+
+
+# ---------------------------------------------------------------------------
 # prefer_format="csc" — still refused on a subset, but now says why
 # ---------------------------------------------------------------------------
 
@@ -332,6 +428,88 @@ def test_csc_on_var_subset_names_the_cause(csc_path):
         pyscx.accel.rank_genes_groups(
             adata, groupby="pert", method="wilcoxon", prefer_format="csc", device="cpu"
         )
+
+
+# ---------------------------------------------------------------------------
+# GPU DE route: the `has_axis_view()` switch
+# ---------------------------------------------------------------------------
+#
+# The riskiest edit in this change. `GpuDeShardInput::Lazy` cannot carry a CSC
+# sidecar, so an unsubset handle must keep going through `Backed { csr, csc }`
+# to preserve the CSC-direct `gpu_csc_v3` route — `CLAUDE.md` treats a silent
+# CSC→CSR downgrade as a hard gate failure. A subset handle must take `Lazy`:
+# neither of the other CSC gates protects this path (`Backed`'s `csc` is read
+# straight off `backed_csc`, bypassing `as_column_source()`, and
+# `resolve_de_format` short-circuits to "csr" on GPU without consulting
+# `csc_route_available`), so without the switch it would run the CSC-direct
+# kernel against on-disk columns.
+
+
+def _gpu_available():
+    try:
+        return pyscx.accel.gpu_info() is not None
+    except Exception:
+        return False
+
+
+gpu_only = pytest.mark.skipif(not _gpu_available(), reason="CUDA GPU not available")
+
+
+def _de_route(adata):
+    return adata.uns["scx_accel"]["rank_genes_groups"]["route"]
+
+
+@gpu_only
+def test_gpu_de_keeps_csc_direct_when_unsubset(csc_path):
+    adata = _backed(csc_path)
+    pyscx.accel.rank_genes_groups(
+        adata, groupby="pert", method="wilcoxon", device="gpu"
+    )
+    assert _de_route(adata) == "gpu_csc_v3", (
+        f"unsubset handle with a CSC sidecar must keep the CSC-direct route, "
+        f"got {_de_route(adata)!r}"
+    )
+
+
+@gpu_only
+@pytest.mark.parametrize(
+    "subset",
+    [
+        pytest.param(lambda a: pyscx.accel.subset_obs(a, ROW_KEEP), id="rows"),
+        pytest.param(lambda a: pyscx.accel.subset_var(a, COL_KEEP), id="cols"),
+    ],
+)
+def test_gpu_de_downgrades_to_csr_when_subset(csc_path, subset):
+    adata = _backed(csc_path)
+    subset(adata)
+    pyscx.accel.rank_genes_groups(
+        adata, groupby="pert", method="wilcoxon", device="gpu"
+    )
+    assert _de_route(adata) == "gpu_csr_v3", (
+        f"a subset handle must not reach the full-axis CSC kernel, "
+        f"got {_de_route(adata)!r}"
+    )
+
+
+@gpu_only
+def test_gpu_de_subset_matches_cpu(csc_path, counts, obs_cols, var_names):
+    """The downgrade must also produce the right answer, not just the route."""
+    adata = _backed(csc_path)
+    pyscx.accel.subset_obs(adata, ROW_KEEP)
+    pyscx.accel.subset_var(adata, COL_KEEP)
+    pyscx.accel.rank_genes_groups(
+        adata, groupby="pert", method="wilcoxon", device="gpu"
+    )
+    got = pyscx.accel.rank_genes_groups_df(adata, group="drug")
+    ref = _rgg(
+        _reference(counts, obs_cols, var_names, rows=ROW_KEEP, cols=COL_KEEP)
+    )
+    assert list(got["names"]) == list(ref["names"])
+    np.testing.assert_allclose(
+        got["scores"].to_numpy().astype(np.float64),
+        ref["scores"].to_numpy().astype(np.float64),
+        atol=1e-4,
+    )
 
 
 def test_csc_unsubset_still_works(csc_path, counts, obs_cols, var_names):

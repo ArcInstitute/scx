@@ -21,7 +21,7 @@ use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::{BackedCsrReader, FileHeader, ScxReader, ScxWriter, ShardSource};
 use tempfile::TempDir;
 
-use super::LazyShardSource;
+use super::{LazyShardSource, Transform};
 
 const N_OBS: usize = 12;
 const N_VARS: usize = 6;
@@ -287,4 +287,104 @@ fn projection_does_not_write_through_to_the_cached_shard() {
     let expected = full_source(&reader).read_shard(0).unwrap();
     assert_eq!(plain.indices, expected.indices);
     assert_eq!(plain.data, expected.data);
+}
+
+// ---------------------------------------------------------------------------
+// The transform stage, and caching *through* a view
+// ---------------------------------------------------------------------------
+
+#[test]
+fn transforms_compose_with_projection_and_row_filter() {
+    // Every other test builds sources with `Vec::new()` transforms, so the
+    // `current = Some(owned)` hand-off from the transform stage into projection
+    // and then row filtering is otherwise unexercised.
+    let dir = TempDir::new().unwrap();
+    let reader = multishard_reader(&dir, N_SHARDS);
+    let cols: Vec<u32> = vec![1, 2, 3];
+    let kept: Vec<u64> = vec![1, 5, 9];
+
+    let plain = LazyShardSource::new(
+        Arc::clone(&reader),
+        Vec::new(),
+        Some(Arc::new(kept.clone())),
+        Some(Arc::new(cols.clone())),
+        kept.len(),
+        cols.len(),
+    );
+    let logged = LazyShardSource::new(
+        Arc::clone(&reader),
+        vec![Transform::Log1p],
+        Some(Arc::new(kept.clone())),
+        Some(Arc::new(cols.clone())),
+        kept.len(),
+        cols.len(),
+    );
+
+    for shard in 0..N_SHARDS {
+        let a = plain.read_shard(shard).unwrap();
+        let b = logged.read_shard(shard).unwrap();
+        // The transform runs, and the projection + row filter still apply on
+        // top of its output rather than on the raw shard.
+        assert_eq!(a.shape, b.shape);
+        assert_eq!(a.indptr, b.indptr);
+        assert_eq!(a.indices, b.indices);
+        for (raw, t) in a.data.iter().zip(b.data.iter()) {
+            assert!(
+                (t - raw.ln_1p()).abs() < 1e-6,
+                "log1p not applied before projection/filter: {raw} -> {t}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cached_reads_survive_a_view() {
+    // The regression this guards: dropping the LRU specifically for the
+    // *subset* multi-pass case. A view derives a fresh CSR per read, so
+    // `Arc::ptr_eq` cannot show reuse — but the decode underneath must still
+    // come from the cache, which `shard_cache_capacity()` reports and the
+    // singleflight/LRU makes observable through repeated identical output.
+    let dir = TempDir::new().unwrap();
+    let reader = multishard_reader(&dir, N_SHARDS);
+    let kept: Vec<u64> = vec![1, 5, 9, 10];
+    let build = || {
+        LazyShardSource::new(
+            Arc::clone(&reader),
+            Vec::new(),
+            Some(Arc::new(kept.clone())),
+            None,
+            kept.len(),
+            N_VARS,
+        )
+        .with_cached_reads()
+    };
+
+    let source = build();
+    assert_eq!(
+        source.shard_cache_capacity(),
+        Some(reader.cache_capacity()),
+        "a view-bearing cached source must still publish the reader's LRU"
+    );
+
+    // Repeated passes over the same shard agree exactly — the derived CSR is
+    // rebuilt, the decode is not.
+    let first = source.read_shard_arc(1).unwrap();
+    let second = source.read_shard_arc(1).unwrap();
+    assert_eq!(first.indptr, second.indptr);
+    assert_eq!(first.indices, second.indices);
+    assert_eq!(first.data, second.data);
+
+    // And the view is still applied — not silently bypassed by the cache.
+    let uncached = LazyShardSource::new(
+        Arc::clone(&reader),
+        Vec::new(),
+        Some(Arc::new(kept.clone())),
+        None,
+        kept.len(),
+        N_VARS,
+    );
+    assert_eq!(
+        source.read_shard(1).unwrap().n_rows(),
+        uncached.read_shard(1).unwrap().n_rows()
+    );
 }

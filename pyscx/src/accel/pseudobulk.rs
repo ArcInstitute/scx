@@ -377,6 +377,14 @@ pub fn pseudobulk_dex(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
         )));
     }
+    // A presentation-ordered backed `X` (`preserve_var_order=True`) has no
+    // `ShardSource` spelling: the source emits columns in sorted on-disk order
+    // while `adata.var` — and so `gene_names` — stays in request order. Now
+    // that this op streams the handle's *view*, the two widths match, so the
+    // mismatch would be a silent gene/column permutation instead of a shape
+    // error. Refuse, as the other streaming accel ops do.
+    super::reject_preserve_var_order(adata, "pseudobulk_dex")?;
+
     if !matches!(backend, "pydeseq2" | "nb_glm") {
         return Err(PyValueError::new_err(format!(
             "Invalid backend={backend:?}; expected 'pydeseq2' or 'nb_glm'"

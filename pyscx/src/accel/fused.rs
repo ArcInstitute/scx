@@ -196,7 +196,10 @@ pub fn pca_neighbors(
                 // The handle's *view*, not the raw reader — otherwise a
                 // subset backed `X` feeds PCA every on-disk row/column and
                 // the embedding misaligns against `adata.obs` (see `pca`).
-                let source = backed.as_shard_source().with_cached_reads();
+                // Uncached for the same reason as `pca`'s GPU arm: the GPU
+                // shard source stages through `read_shard`, so cached reads
+                // would deep-clone each shard instead of decoding fresh.
+                let source = backed.as_shard_source();
                 run_fused_gpu(
                     py,
                     adata,

@@ -736,9 +736,10 @@ accelerators on the resulting **backed** dataset: they decode columns in
 sorted on-disk order, so a request-ordered gene axis would silently misalign
 the result against `adata.var`. `highly_variable_genes`, `normalize_total`,
 `log1p`, `calculate_qc_metrics`, `score_genes`, `pflog`, `pca`,
-`pca_neighbors` and `pca_neighbors_umap` raise `RuntimeError` rather than
-return misaligned output — run them before projecting by name, or re-open
-without `preserve_var_order`.
+`pca_neighbors`, `pca_neighbors_umap`, `rank_genes_groups`, `pdex_ref`,
+`pseudobulk_means`, `pseudobulk_dex` and `pdex_nb_glm` raise `RuntimeError`
+rather than return misaligned output — run them before projecting by name, or
+re-open without `preserve_var_order`.
 
 Unknown names raise `KeyError` by default (`strict_var_names=True`). Pass
 `strict_var_names=False` to silently drop names absent from the var metadata

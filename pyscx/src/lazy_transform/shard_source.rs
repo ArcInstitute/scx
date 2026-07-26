@@ -144,8 +144,14 @@ impl scx_format_io::ShardSource for LazyShardSource {
         }
     }
 
-    /// Row counts are unchanged by transforms and column projection — delegate
-    /// to the wrapped reader's O(1) implementation.
+    /// An **upper bound**, not the exact visible maximum.
+    ///
+    /// Transforms and column projection leave row counts alone, so this
+    /// delegates to the wrapped reader's O(1) value — but `kept_to_global`
+    /// *shrinks* them, and this does not account for that. Safe because every
+    /// consumer sizes scratch/staging buffers with it (GPU pinned slots,
+    /// covariance densification), where over-estimating costs memory, not
+    /// correctness. Do not treat it as exact.
     fn max_shard_rows(&self) -> scx_format_io::Result<usize> {
         self.backed.max_shard_rows()
     }

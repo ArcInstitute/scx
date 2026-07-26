@@ -447,9 +447,28 @@ def test_gpu_var_subset_plus_mask_var_matches_cpu(multishard_path, dense_counts)
     assert wrong[0] < 0.99, f"GPU used the wrong gene axis (cos={wrong[0]:.4f})"
 
 
+def test_fused_entry_points_reject_preserve_var_order(multishard_path):
+    """`pca_neighbors` / `pca_neighbors_umap` guard before any device dispatch.
+
+    The fused GPU path would otherwise skip the check `pca` applies on the
+    delegating path, so the guard sits at the top of each entry point — which
+    makes it reachable (and testable) without a GPU.
+    """
+    exp = pyscx.open(str(multishard_path))
+    names = [f"g{i}" for i in (9, 2, 30, 5)]
+    adata = exp.to_anndata(backed=True, var_names=names, preserve_var_order=True)
+    for op in (
+        pyscx.accel.pca,
+        pyscx.accel.pca_neighbors,
+        pyscx.accel.pca_neighbors_umap,
+    ):
+        with pytest.raises(RuntimeError, match="preserve_var_order"):
+            op(adata, n_comps=2, device="cpu")
+
+
 @gpu_only
 def test_gpu_preserve_var_order_is_rejected(multishard_path):
-    """The fused GPU entry points guard too — they bypass `pca`'s own check."""
+    """Same guards on the GPU device selector."""
     exp = pyscx.open(str(multishard_path))
     names = [f"g{i}" for i in (9, 2, 30, 5)]
     adata = exp.to_anndata(backed=True, var_names=names, preserve_var_order=True)

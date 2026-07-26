@@ -5,8 +5,10 @@
 //! The resulting count matrix is fed to `pydeseq2` on the Python side for
 //! negative binomial GLM testing.
 //!
-//! Supports both streaming (shard-by-shard via `BackedCsrReader`) and
-//! in-memory (`ScxCsr`) paths.
+//! Supports both streaming (shard-by-shard over any CSR `ShardSource`) and
+//! in-memory (`ScxCsr`) paths. Streaming callers holding a subset SCX handle
+//! must pass that handle's *view* (`as_shard_source()`), not the reader
+//! underneath it — `obs_groups` is indexed by visible cell.
 
 use std::collections::HashMap;
 

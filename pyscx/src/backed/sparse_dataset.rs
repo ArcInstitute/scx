@@ -325,10 +325,14 @@ impl ScxBackedSparseDataset {
     /// matrix, and reach for [`Self::as_shard_source`] only when they differ.
     /// That matters where the concrete reader type unlocks something a
     /// `ShardSource` cannot express — GPU DE's CSC-direct route, which takes
-    /// `GpuDeShardInput::Backed { csr, csc }`. Nothing is lost by downgrading a
-    /// *subset* handle to the generic path: any `kept_to_global` already makes
-    /// `as_column_source()` return `None`, and `csc_route_available` already
-    /// excludes a projected one.
+    /// `GpuDeShardInput::Backed { csr, csc }`.
+    ///
+    /// On that route the switch is **load-bearing**: the `csc` handed to
+    /// `Backed` is read straight off `backed_csc`, so it never passes through
+    /// `as_column_source()`'s deletion gate, and `csc_route_available` is not
+    /// consulted on GPU at all. Without this predicate a subset handle with a
+    /// sidecar runs the CSC-direct kernel against *on-disk* columns, and the
+    /// widths agree, so nothing catches it.
     ///
     /// Only the GPU DE dispatch needs this today — the CPU kernels are all
     /// generic over `ShardSource` and take the view unconditionally.

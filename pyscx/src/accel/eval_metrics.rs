@@ -344,6 +344,14 @@ fn pseudobulk_means_impl<'py>(
     min_cells_per_group: usize,
     gpu_dev: &EvalGpuDev,
 ) -> PyResult<Py<PyAny>> {
+    // A presentation-ordered backed `X` (`preserve_var_order=True`) has no
+    // `ShardSource` spelling: the source emits columns in sorted on-disk order
+    // while `adata.var` — and so `gene_names` — stays in request order. Now
+    // that this op streams the handle's *view*, the two widths match, so the
+    // mismatch would be a silent gene/column permutation instead of a shape
+    // error. Refuse, as the other streaming accel ops do.
+    super::reject_preserve_var_order(adata, "pseudobulk_means")?;
+
     let np = py.import("numpy")?;
 
     // Extract groupby column from adata.obs as Vec<String>.

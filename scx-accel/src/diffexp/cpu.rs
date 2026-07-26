@@ -670,6 +670,22 @@ pub fn wilcoxon_rank_sum_streaming<S: ShardSource>(
             "gene_chunk_size must be > 0".to_string(),
         ));
     }
+    // `gene_names` describes the *visible* gene axis; the source must present
+    // that same axis. Without this a caller that handed over the file instead
+    // of a subset handle's view is not caught: the chunk loop slices columns
+    // `0..k` and `project_csr` silently drops anything out of range, so the
+    // result comes back fully formed and describing the wrong genes. Mirrors
+    // the check `pseudobulk_aggregate` already makes.
+    if n_vars != source.n_vars() {
+        return Err(crate::AccelError::ShapeError(format!(
+            "wilcoxon_rank_sum_streaming: gene_names length {} != source.n_vars() {} — the source must \
+             be the same gene axis the names describe (pass the handle's view, \
+             e.g. `as_shard_source()`, not the raw reader)",
+            n_vars,
+            source.n_vars(),
+        )));
+    }
+
     // Clamp the dense n_obs×chunk f32 workspace to the CPU memory budget.
     let gene_chunk_size = crate::mem_budget::de_gene_chunk_or_err(
         gene_chunk_size,
@@ -1465,11 +1481,14 @@ pub fn pdex_ref_sparse(
     Ok(result)
 }
 
-/// Gene-chunked pdex `mode="ref"` streaming from `BackedCsrReader`.
+/// Gene-chunked pdex `mode="ref"` streaming over a CSR [`ShardSource`].
 ///
-/// Mirrors `wilcoxon_rank_sum_streaming`: walks every shard once per gene
-/// chunk through the cached shard API. Size the reader's cache to
-/// `>= n_shards` to keep the inner loop cache-resident across chunks.
+/// Mirrors [`wilcoxon_rank_sum_streaming`], including the reason it is generic:
+/// `groups` / `gene_names` are indexed by *visible* cell and gene, so a caller
+/// holding a subset SCX handle must pass that handle's view
+/// (`as_shard_source()`), not the reader underneath it. Walks every shard once
+/// per gene chunk, so a caching source should opt in (`with_cached_reads()`)
+/// and be sized to `>= n_shards`.
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref_streaming<S: ShardSource>(
     source: &S,
@@ -1496,6 +1515,23 @@ pub fn pdex_ref_streaming<S: ShardSource>(
             "gene_chunk_size must be > 0".to_string(),
         ));
     }
+    // `gene_names` describes the *visible* gene axis; the source must present
+    // that same axis. Without this a caller that handed over the file instead
+    // of a subset handle's view is not caught: the chunk loop slices columns
+    // `0..k` and `project_csr` silently drops anything out of range, so the
+    // result comes back fully formed and describing the wrong genes. Mirrors
+    // the check `pseudobulk_aggregate` already makes. See
+    // `wilcoxon_rank_sum_streaming`.
+    if n_vars != source.n_vars() {
+        return Err(crate::AccelError::ShapeError(format!(
+            "pdex_ref_streaming: gene_names length {} != source.n_vars() {} — the source must \
+             be the same gene axis the names describe (pass the handle's view, \
+             e.g. `as_shard_source()`, not the raw reader)",
+            n_vars,
+            source.n_vars(),
+        )));
+    }
+
     // Clamp the dense n_obs×chunk f32 workspace to the CPU memory budget.
     let gene_chunk_size =
         crate::mem_budget::de_gene_chunk_or_err(gene_chunk_size, n_obs, "pdex_ref_streaming")?;
