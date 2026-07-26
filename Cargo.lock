@@ -3641,6 +3641,7 @@ dependencies = [
  "libloading 0.8.9",
  "rand 0.8.5",
  "rand_distr 0.4.3",
+ "rayon",
  "scx-codec",
  "scx-format-io",
  "scx-sparse",

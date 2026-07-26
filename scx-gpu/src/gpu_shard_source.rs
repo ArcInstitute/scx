@@ -38,6 +38,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::safe::{CudaEvent, CudaSlice, CudaStream};
+use rayon::prelude::*;
 use scx_format_io::{prefetch, ShardSource};
 
 use crate::device::GpuDevice;
@@ -70,25 +71,61 @@ fn csr_htod_bytes(csr: &scx_sparse::ScxCsr) -> usize {
 ///    `+INF` and sorts on the raw IEEE-754 bit pattern, so a NaN lands at the
 ///    wrong position and corrupts the U statistic and tie counts.
 ///
-/// O(nnz) — negligible beside the H2D copy and the per-gene device sort. Run
-/// once per shard for every GPU DE consumer (the `for_each_gpu_shard` driver
-/// calls it before staging).
-fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), GpuError> {
-    for r in 0..csr.n_rows() {
+/// Two 2×O(nnz) host scans that sit on the staging thread, so they are the
+/// serial section between two parallel ones (the decode-prefetch pool feeding
+/// this shard, and the device kernels consuming it). Before §9.11 this was
+/// amortised away — the same shard was re-validated once per gene chunk, so it
+/// was a rounding error beside the 123 re-decodes. Now that
+/// [`ResidentGpuCsrSource`](crate::ResidentGpuCsrSource) makes each shard's
+/// decode happen exactly once, this scan is one of the few things left on the
+/// critical path, hence the parallel form below (§9.13).
+///
+/// Both scans keep the serial version's *exact* answer, not just the same
+/// accept/reject decision: the sortedness check reduces by **minimum row
+/// index** rather than taking whichever offending row a worker reaches first,
+/// and the finiteness check uses `position_first`. So the error message names
+/// the same offending position it always did — a first-hit early exit would
+/// have made the message nondeterministic under load.
+///
+/// Small shards run serially: below [`VALIDATE_PAR_MIN_NNZ`] the rayon
+/// split/join costs more than the scan.
+pub(crate) fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), GpuError> {
+    /// First `(row, a, b)` whose row has `a >= b` at adjacent positions,
+    /// minimised over rows.
+    fn first_unsorted_row(csr: &scx_sparse::ScxCsr, r: usize) -> Option<(usize, i32, i32)> {
         let s = csr.indptr[r] as usize;
         let e = csr.indptr[r + 1] as usize;
-        for w in csr.indices[s..e].windows(2) {
-            if w[0] >= w[1] {
-                return Err(GpuError::InvalidShard(format!(
-                    "ScxCsr row {r} has unsorted or duplicate column indices ({} >= {}): \
-                     GPU shard scatter requires strictly-increasing per-row indices for \
-                     deterministic output",
-                    w[0], w[1]
-                )));
-            }
-        }
+        csr.indices[s..e]
+            .windows(2)
+            .find(|w| w[0] >= w[1])
+            .map(|w| (r, w[0], w[1]))
     }
-    if let Some(pos) = csr.data.iter().position(|v| !v.is_finite()) {
+
+    let n_rows = csr.n_rows();
+    let parallel = csr.data.len() >= VALIDATE_PAR_MIN_NNZ;
+
+    let unsorted = if parallel {
+        (0..n_rows)
+            .into_par_iter()
+            .filter_map(|r| first_unsorted_row(csr, r))
+            .min_by_key(|(r, _, _)| *r)
+    } else {
+        (0..n_rows).find_map(|r| first_unsorted_row(csr, r))
+    };
+    if let Some((r, a, b)) = unsorted {
+        return Err(GpuError::InvalidShard(format!(
+            "ScxCsr row {r} has unsorted or duplicate column indices ({a} >= {b}): \
+             GPU shard scatter requires strictly-increasing per-row indices for \
+             deterministic output"
+        )));
+    }
+
+    let non_finite = if parallel {
+        csr.data.par_iter().position_first(|v| !v.is_finite())
+    } else {
+        csr.data.iter().position(|v| !v.is_finite())
+    };
+    if let Some(pos) = non_finite {
         return Err(GpuError::InvalidShard(format!(
             "ScxCsr contains a non-finite value ({}) at nonzero index {pos}: GPU DE ranking \
              requires finite input (NaN corrupts the radix sort; sanitise/QC before DE)",
@@ -97,6 +134,13 @@ fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), GpuError> {
     }
     Ok(())
 }
+
+/// nnz below which [`validate_shard_for_gpu_de`] scans serially. Real shards
+/// are orders of magnitude above this (a census_500k shard carries ~24 M nnz);
+/// the threshold exists so unit fixtures and degenerate single-row shards don't
+/// pay a pool round-trip. Deliberately low enough that a test can exceed it
+/// with a ~256 KB fixture and still exercise the parallel path.
+pub(crate) const VALIDATE_PAR_MIN_NNZ: usize = 65_536;
 
 /// `ShardSource` adapter that times every decode into the GPU profiler's
 /// host-decode bucket.
@@ -632,6 +676,139 @@ mod tests {
     #[test]
     fn validate_accepts_clean_shard() {
         let csr = make_csr(8, 4, 1.0);
+        assert!(validate_shard_for_gpu_de(&csr).is_ok());
+    }
+
+    /// Build a shard above [`VALIDATE_PAR_MIN_NNZ`] so validation takes the
+    /// parallel path: `rows` rows × `per_row` strictly-increasing columns.
+    fn make_big_csr(rows: usize, per_row: usize) -> ScxCsr {
+        let mut indptr = Vec::with_capacity(rows + 1);
+        indptr.push(0i64);
+        let mut indices = Vec::with_capacity(rows * per_row);
+        let mut data = Vec::with_capacity(rows * per_row);
+        for r in 0..rows {
+            for c in 0..per_row {
+                indices.push(c as i32);
+                data.push((r * per_row + c) as f32);
+            }
+            indptr.push(indices.len() as i64);
+        }
+        ScxCsr::new_unchecked((rows, per_row), indptr, indices, data)
+    }
+
+    /// §9.13: the parallel scan must name the **first** offending row, not
+    /// whichever one a worker happens to reach first. Three rows are corrupted;
+    /// only the lowest may be reported, and the message must be the one the
+    /// serial scan produced.
+    #[test]
+    fn validate_parallel_reports_the_minimum_offending_row() {
+        let per_row = 64;
+        let rows = 4096; // 262 144 nnz — comfortably over the parallel threshold
+        let mut csr = make_big_csr(rows, per_row);
+        assert!(
+            csr.data.len() >= VALIDATE_PAR_MIN_NNZ,
+            "premise: fixture must exceed the parallel threshold, got {} nnz",
+            csr.data.len()
+        );
+
+        // Corrupt rows 3000, 977 and 2500 (inserted out of order on purpose).
+        for &r in &[3000usize, 977, 2500] {
+            let s = csr.indptr[r] as usize;
+            csr.indices[s + 5] = csr.indices[s + 4]; // duplicate → a >= b
+        }
+
+        let err = validate_shard_for_gpu_de(&csr).unwrap_err();
+        let GpuError::InvalidShard(msg) = err else {
+            panic!("expected InvalidShard, got {err:?}");
+        };
+        assert_eq!(
+            msg,
+            "ScxCsr row 977 has unsorted or duplicate column indices (4 >= 4): \
+             GPU shard scatter requires strictly-increasing per-row indices for \
+             deterministic output",
+            "parallel scan must report the same first offending row as the serial one"
+        );
+
+        // The identical shard truncated below the threshold takes the serial
+        // path and must agree on the row it names.
+        let small = {
+            let rows_small = 1000;
+            let nnz = csr.indptr[rows_small] as usize;
+            ScxCsr::new_unchecked(
+                (rows_small, per_row),
+                csr.indptr[..=rows_small].to_vec(),
+                csr.indices[..nnz].to_vec(),
+                csr.data[..nnz].to_vec(),
+            )
+        };
+        assert!(
+            small.data.len() < VALIDATE_PAR_MIN_NNZ,
+            "premise: serial path"
+        );
+        let GpuError::InvalidShard(small_msg) = validate_shard_for_gpu_de(&small).unwrap_err()
+        else {
+            panic!("expected InvalidShard from the serial path");
+        };
+        assert_eq!(small_msg, msg, "serial and parallel scans must agree");
+    }
+
+    /// Same for the finiteness scan: `position_first`, not "any position".
+    #[test]
+    fn validate_parallel_reports_the_first_non_finite_position() {
+        let mut csr = make_big_csr(4096, 64);
+        assert!(
+            csr.data.len() >= VALIDATE_PAR_MIN_NNZ,
+            "premise: parallel path"
+        );
+
+        csr.data[200_000] = f32::INFINITY;
+        csr.data[12_345] = f32::NAN;
+        csr.data[99_999] = f32::NEG_INFINITY;
+
+        let GpuError::InvalidShard(msg) = validate_shard_for_gpu_de(&csr).unwrap_err() else {
+            panic!("expected InvalidShard");
+        };
+        assert!(
+            msg.contains("at nonzero index 12345"),
+            "must name the first non-finite position, got: {msg}"
+        );
+    }
+
+    /// A large clean shard is accepted — guards against the parallel path
+    /// inventing an offender (e.g. a window straddling a row boundary).
+    #[test]
+    fn validate_accepts_large_clean_shard() {
+        let csr = make_big_csr(4096, 64);
+        assert!(
+            csr.data.len() >= VALIDATE_PAR_MIN_NNZ,
+            "premise: parallel path"
+        );
+        assert!(validate_shard_for_gpu_de(&csr).is_ok());
+    }
+
+    /// Rows are validated independently: `indices` is one flat array, so a
+    /// naive `windows(2)` over the whole array would see the boundary pair
+    /// (last column of row r, first column of row r+1) and reject a perfectly
+    /// legal shard. Every row here ends high and starts low.
+    #[test]
+    fn validate_does_not_straddle_row_boundaries() {
+        let rows = 2048;
+        let per_row = 64;
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for r in 0..rows {
+            for c in 0..per_row {
+                indices.push(c as i32); // every row restarts at column 0
+                data.push(1.0f32 + r as f32);
+            }
+            indptr.push(indices.len() as i64);
+        }
+        let csr = ScxCsr::new_unchecked((rows, per_row), indptr, indices, data);
+        assert!(
+            csr.data.len() >= VALIDATE_PAR_MIN_NNZ,
+            "premise: parallel path"
+        );
         assert!(validate_shard_for_gpu_de(&csr).is_ok());
     }
 
