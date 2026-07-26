@@ -670,8 +670,35 @@ concurrency defect next door. Both halves are **output-neutral** and carry no `�
   `col_sums` calls on one reader — newly possible, since they now share its mmap and LRU
   concurrently — still agree exactly.
 
-<!-- CAPTURE PENDING: 4.3 marshalling bucket + wall + peak RSS for neighbors and DE
-     at >=500k cells (benchmarks/scripts/bench_marshalling.py). -->
+**Measured — and the headline prediction did not hold.** Finding §9.5 expected the kNN
+path's "tens of millions of transient Python objects" to be a real cost at atlas scale. It
+is a real *allocation* cost, but it does not show up in either metric that would justify
+the change on performance grounds (SLURM jobs 2708544 and 2708786, `cpu` partition,
+synthetic 500k/1M × 2 000 at density 0.05, k=15):
+
+| | peak RSS | wall |
+|---|--:|--:|
+| `neighbors`, 500k, `2055f74f` | 9 212 MB | 219.8 s |
+| `neighbors`, 500k, this change | 9 211 MB | 215.1 s |
+
+**Peak RSS is unchanged (−1 MB, 0.01 %), and the 2 % wall difference is noise on a single
+220 s run.** The transient list for a 14M-element `Vec<f64>` really is ~560 MB, but the
+process high-water at this scale is set elsewhere (the HNSW build), and CPython's allocator
+serves the churn from arenas it already holds — so `ru_maxrss` never sees it.
+
+The bucket itself, on the new path: 533 MB of CSR arrays marshalled in **4.4 ms** at 1M
+cells (0.00 % of a 754 s wall) — a memory-move rate, consistent with `from_vec` handing the
+buffer to numpy rather than copying it. `pca` writes 200 MB in 106 ms (0.49 % of wall, and
+a genuine copy via `from_slice`); DE writes 128 KB in 0.09 ms. The `main` arm reports a
+zero bucket because the instrumentation is part of this change, so the two bucket numbers
+are **not** a before/after — only the branch column is meaningful.
+
+So this lands as **hygiene, not a speedup**, and is described that way deliberately: it
+removes a full Rust-side buffer clone (533 MB at 1M cells) and tens of millions of
+transient object allocations, it is byte-identical in output, and it is simpler. The 2.0
+oracle ranked marshalling negligible and both 2.4 and this capture agree; §9.5's
+"largest remaining marshalling cost" was right about the *ordering* among marshalling
+sites and wrong that the absolute mattered.
 
 ### Graph-layout refactors (Phase-2 task 2.5)
 
