@@ -1541,25 +1541,22 @@ fn covariance_pca_with_depth<S: ShardSource + Sync + ?Sized>(
         let _r = scx_format_io::reduction_guard();
         let shard_rows = csr.n_rows();
 
-        // E[row, :] = X[row, :] @ V - mc
-        for r in 0..shard_rows {
-            let start = csr.indptr[r] as usize;
-            let end = csr.indptr[r + 1] as usize;
-            let e_offset = (global_row + r) * n_components;
-            for idx in start..end {
-                let c = csr.indices[idx] as usize;
-                let val = csr.data[idx] as f64;
-                let v_offset = c * n_components;
-                for pc in 0..n_components {
-                    embeddings[e_offset + pc] += val * v_rm[v_offset + pc];
-                }
-            }
-            if let Some(ref mc) = mean_correction {
-                for pc in 0..n_components {
-                    embeddings[e_offset + pc] -= mc[pc];
-                }
-            }
-        }
+        // E[row, :] = X[row, :] @ V - mc — the same `Y = (X - μ) @ M` the
+        // randomized route runs, so it uses the same kernel rather than a
+        // hand-inlined copy of it. Output rows are disjoint and each row's
+        // nonzeros are still consumed in index order, so this is bit-identical
+        // to the serial loop it replaces; the difference is that
+        // `spmm_forward_into` parallelises across rows above its work
+        // threshold, and this pass was the covariance route's one entirely
+        // single-threaded scan.
+        spmm_forward_into(
+            &csr,
+            &v_rm,
+            n_components,
+            &mut embeddings,
+            global_row,
+            mean_correction.as_deref(),
+        );
         global_row += shard_rows;
         Ok(())
     })?;
@@ -2605,5 +2602,93 @@ mod tests {
         // `depth.max(1)` the only thing standing between us and a stall.
         assert!(pca_prefetch_depth() >= 1);
         assert!(pca_prefetch_depth() <= crate::prefetch::prefetch_depth());
+    }
+
+    /// The embeddings scatter exactly as `covariance_pca` used to inline it,
+    /// kept as the oracle for the `spmm_forward_into` swap.
+    fn inlined_embeddings_scatter_reference(
+        csr: &ScxCsr,
+        v_rm: &[f64],
+        n_components: usize,
+        embeddings: &mut [f64],
+        global_row: usize,
+        mean_correction: Option<&[f64]>,
+    ) {
+        for r in 0..csr.n_rows() {
+            let start = csr.indptr[r] as usize;
+            let end = csr.indptr[r + 1] as usize;
+            let e_offset = (global_row + r) * n_components;
+            for idx in start..end {
+                let c = csr.indices[idx] as usize;
+                let val = csr.data[idx] as f64;
+                let v_offset = c * n_components;
+                for pc in 0..n_components {
+                    embeddings[e_offset + pc] += val * v_rm[v_offset + pc];
+                }
+            }
+            if let Some(mc) = mean_correction {
+                for pc in 0..n_components {
+                    embeddings[e_offset + pc] -= mc[pc];
+                }
+            }
+        }
+    }
+
+    /// `covariance_pca`'s embeddings pass now calls the shared kernel instead of
+    /// its own copy. The claim is bit-identity, not "close": each output row is
+    /// written by exactly one thread and still walks that row's nonzeros in
+    /// index order, so parallelising across rows reassociates nothing.
+    ///
+    /// Both `spmm_forward_into` branches are covered — the small fixture takes
+    /// its serial path and the large one crosses the 10 000-element threshold
+    /// into `par_chunks_mut`, which is the branch the claim is actually about.
+    #[test]
+    fn covariance_embeddings_kernel_matches_the_inlined_scatter_bitwise() {
+        for (rows_per_shard, n_vars, n_components, expect_parallel) in
+            [(8usize, 5usize, 4usize, false), (600, 12, 30, true)]
+        {
+            assert_eq!(
+                rows_per_shard * n_components > 10_000,
+                expect_parallel,
+                "premise: fixture ({rows_per_shard} rows x {n_components} comps) must land \
+                 on the {} branch",
+                if expect_parallel {
+                    "parallel"
+                } else {
+                    "serial"
+                }
+            );
+            let src = gauged_fixture(3, rows_per_shard, n_vars);
+            let n_obs = src.n_obs();
+            let v_rm = random_gaussian(n_vars, n_components, 5);
+            let mc: Vec<f64> = (0..n_components).map(|j| 0.03 * (j + 1) as f64).collect();
+
+            for mean_correction in [None, Some(mc.as_slice())] {
+                let mut got = vec![0.0f64; n_obs * n_components];
+                let mut want = vec![0.0f64; n_obs * n_components];
+                let mut global_row = 0usize;
+                for shard_idx in 0..src.n_shards() {
+                    let csr = src.read_shard(shard_idx).unwrap();
+                    spmm_forward_into(
+                        &csr,
+                        &v_rm,
+                        n_components,
+                        &mut got,
+                        global_row,
+                        mean_correction,
+                    );
+                    inlined_embeddings_scatter_reference(
+                        &csr,
+                        &v_rm,
+                        n_components,
+                        &mut want,
+                        global_row,
+                        mean_correction,
+                    );
+                    global_row += csr.n_rows();
+                }
+                assert_bits_eq(&got, &want, "covariance embeddings scatter");
+            }
+        }
     }
 }
