@@ -13,17 +13,30 @@
 #
 #   sbatch benchmarks/scripts/_run_4_2_gpu_verify.sh
 #
-# **Do not run this concurrently with `_run_4_2_prefetch_ab.sh`.** Chain it:
+# **Run this alone. No other scx job may be queued or running.** Chain anything
+# else behind it:
 #
-#   cpu=$(sbatch --parsable benchmarks/scripts/_run_4_2_prefetch_ab.sh)
-#   sbatch --dependency=afterany:$cpu benchmarks/scripts/_run_4_2_gpu_verify.sh
+#   gpu=$(sbatch --parsable benchmarks/scripts/_run_4_2_gpu_verify.sh)
+#   sbatch --dependency=afterany:$gpu <the next one>
 #
-# Two reasons, both learned by doing it wrong once. The `branch` arm below
-# rebuilds `$SCX_DIR/pyscx`, which overwrites the **shared in-tree `.so`** the
-# CPU job's venv is running out of. And Slurm will happily co-schedule both on
-# one node (they landed together on GPU71BA), where this job's cargo builds
-# steal CPU from a *timing* A/B — unevenly across its two arms, which biases the
-# result rather than merely adding noise.
+# `$SCX_DIR/pyscx/python/pyscx/*.so` is **global mutable state shared by every
+# job on the cluster**, because every venv and conda env resolves `pyscx` to a
+# single editable install pointing at it. The rule is not "don't run two builds
+# at once" — it is:
+#
+#     any job that runs `maturin develop` in $SCX_DIR invalidates every other
+#     job that will *import* pyscx, whether or not that job builds anything.
+#
+# Learned three times, the last one expensively: a marshalling A/B was submitted
+# alongside this job on the reasoning that it "targets $VENV and writes into the
+# tree it builds". Both clauses were true; the conclusion was not, because the
+# tree it built *was* $SCX_DIR. It wrote a `--features hdf5` (no-GPU) `.so`, and
+# this job's second staging arm — which had not started yet — failed every op
+# with "pyscx was built without the 'gpu' feature", losing ~3 GPU-hours.
+#
+# Slurm will also co-schedule jobs on one node (two landed together on GPU71BA),
+# where cargo builds steal CPU from a *timing* capture unevenly across its arms,
+# biasing the result rather than merely adding noise.
 #
 # Two hard-won details, both from #372 and both load-bearing:
 #
