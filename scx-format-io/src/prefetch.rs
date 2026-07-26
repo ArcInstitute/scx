@@ -439,6 +439,54 @@ where
     })
 }
 
+/// Decode-prefetched twin of [`ShardSource::col_means_and_sum_sq`].
+///
+/// Same single pass, same per-column accumulation order (consumption is
+/// single-threaded and in strict shard order), so the result is **bit-identical**
+/// to the trait default — which stays in place as this function's oracle. The
+/// only difference is that up to `depth` shards decode concurrently instead of
+/// one at a time on the calling thread.
+///
+/// A free function rather than a trait method because the pipeline needs
+/// `Self: Sync`, and putting that bound on a *provided* method would make it
+/// unavailable through the `&dyn ShardSource` boundaries `scx-gpu` uses. Callers
+/// that can name a `Sync` source (CPU PCA today, GPU PCA's identical serial loop
+/// in `scx_gpu::gpu_pca` next) opt in here; everyone else keeps the default.
+pub fn col_means_and_sum_sq_prefetched<S>(
+    source: &S,
+    zero_center: bool,
+    depth: usize,
+) -> Result<(Option<Vec<f64>>, Vec<f64>), ScxError>
+where
+    S: ShardSource + Sync + ?Sized,
+{
+    let n_vars = source.n_vars();
+    let mut col_sums = vec![0.0f64; n_vars];
+    let mut col_sum_sq = vec![0.0f64; n_vars];
+
+    for_each_shard_ordered(source, depth, |_shard_idx, csr| {
+        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+            let v = val as f64;
+            col_sums[col as usize] += v;
+            col_sum_sq[col as usize] += v * v;
+        }
+        Ok::<(), ScxError>(())
+    })?;
+
+    let means = if zero_center {
+        let n = source.n_obs() as f64;
+        if n == 0.0 {
+            Some(vec![0.0f64; n_vars])
+        } else {
+            Some(col_sums.iter().map(|s| s / n).collect())
+        }
+    } else {
+        None
+    };
+
+    Ok((means, col_sum_sq))
+}
+
 /// Operation-specific **parallel** shard reduction with one accumulator per
 /// worker, merged at the end. Reorders floating summation, so only reachable
 /// under [`ReductionMode::ParallelTolerant`].
