@@ -462,6 +462,69 @@ impl GpuCsrSlot {
         })
     }
 
+    /// Deep-copy the **live shard** into a fresh, exactly-sized slot.
+    ///
+    /// Unlike [`Self::new`] + [`Self::ensure_capacity`] (which round buffer
+    /// capacity up to the next power of two, so a 24 M-nnz shard reserves
+    /// 33.5 M), this allocates exactly `n_rows + 1` / `nnz` / `nnz` elements
+    /// and `memcpy_dtod`s the staged prefix across. Nothing round-trips to the
+    /// host.
+    ///
+    /// Used by [`ResidentGpuCsrSource`](crate::ResidentGpuCsrSource) to retain
+    /// every shard on the device: a streaming source stages each shard into one
+    /// reusable slot and overwrites it on the next iteration, so retaining a
+    /// shard means copying it out. Exact sizing matters there — the retained
+    /// set is the whole matrix, and a power-of-two round-up on each shard would
+    /// inflate resident VRAM by up to 2× for no benefit.
+    ///
+    /// The cached cuSPARSE descriptor is **not** copied: it is keyed by device
+    /// pointer, and the clone's buffers are new allocations. The clone rebuilds
+    /// it lazily on first use, like any freshly-grown slot.
+    pub fn clone_exact(&self, dev: &GpuDevice) -> Result<Self, GpuError> {
+        let indptr_len = self.shape.0 + 1;
+        let mut indptr = dev.alloc_zeros::<i64>(indptr_len.max(1))?;
+        let mut indices = dev.alloc_zeros::<i32>(self.nnz.max(1))?;
+        let mut data = dev.alloc_zeros::<f32>(self.nnz.max(1))?;
+
+        let stream = dev.stream();
+        {
+            let src = self.indptr.slice(..indptr_len);
+            let mut dst = indptr.slice_mut(..indptr_len);
+            stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| GpuError::CudaError(format!("dtod indptr (clone_exact): {e}")))?;
+        }
+        if self.nnz > 0 {
+            let src = self.indices.slice(..self.nnz);
+            let mut dst = indices.slice_mut(..self.nnz);
+            stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| GpuError::CudaError(format!("dtod indices (clone_exact): {e}")))?;
+            let src = self.data.slice(..self.nnz);
+            let mut dst = data.slice_mut(..self.nnz);
+            stream
+                .memcpy_dtod(&src, &mut dst)
+                .map_err(|e| GpuError::CudaError(format!("dtod data (clone_exact): {e}")))?;
+        }
+
+        Ok(Self {
+            indptr,
+            indices,
+            data,
+            shape: self.shape,
+            nnz: self.nnz,
+            cached_desc: None,
+        })
+    }
+
+    /// Total device bytes this slot's three buffers occupy (capacity, not the
+    /// live shard). Used by the resident-CSR VRAM budget.
+    pub fn device_bytes(&self) -> u64 {
+        (self.indptr.len() as u64) * 8
+            + (self.indices.len() as u64) * 4
+            + (self.data.len() as u64) * 4
+    }
+
     /// Capacity (in elements) of the three buffers.
     pub fn capacity(&self) -> (usize, usize, usize) {
         (self.indptr.len(), self.indices.len(), self.data.len())

@@ -206,6 +206,20 @@ pub struct AccelExecutionInfo {
     /// aggregate `transfer_mode` cannot (it stays `scx_device_handoff_streamed`
     /// while any shard uploads decompressed bytes). `None` outside that path.
     pub n_shards_shufdelta_gpu: Option<u32>,
+    /// Whether a GPU CSR route held the whole matrix device-resident across
+    /// gene chunks instead of re-decoding every shard per chunk (§9.11).
+    ///
+    /// `Some(true)` = resident, `Some(false)` = the streaming path ran (matrix
+    /// over the VRAM budget, only one gene chunk, or the kill switch set),
+    /// `None` = the route has no residency decision to make (CPU, dense, or a
+    /// CSC-direct route, which prefilters by column range and never re-decodes
+    /// in the first place).
+    ///
+    /// A gate reads this to catch a *silent* fall back to streaming, the same
+    /// way `de_route_csc_direct` catches a silent CSR fallback. Note the
+    /// companion counter `shards_decoded` keeps its old meaning — slab passes,
+    /// which residency does not change — so it is **not** the signal for this.
+    pub resident_csr: Option<bool>,
 }
 
 impl AccelExecutionInfo {
