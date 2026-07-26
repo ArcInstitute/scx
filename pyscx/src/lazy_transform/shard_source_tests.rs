@@ -337,6 +337,56 @@ fn transforms_compose_with_projection_and_row_filter() {
     }
 }
 
+/// Phase 4.2 made the transform stage take ownership of the decoded shard via
+/// `Arc::try_unwrap` instead of always cloning it. That is free on the uncached
+/// path — but it must still clone on a **cache hit**, because mutating the
+/// shard the LRU is holding would poison it for every other reader of the same
+/// file. `try_unwrap` fails there (the cache holds a strong ref), which is what
+/// makes the optimisation safe; this pins that it stays that way.
+#[test]
+fn transforms_do_not_write_through_to_the_cached_shard() {
+    let dir = TempDir::new().unwrap();
+    let reader = multishard_reader(&dir, N_SHARDS);
+
+    // Warm the LRU with the untransformed shard, and keep a copy of the truth.
+    let expected = full_source(&reader)
+        .with_cached_reads()
+        .read_shard(0)
+        .unwrap();
+
+    // A transformed source over the same reader now takes a cache hit.
+    let logged = LazyShardSource::new(
+        Arc::clone(&reader),
+        vec![Transform::Log1p],
+        None,
+        None,
+        N_OBS,
+        N_VARS,
+    )
+    .with_cached_reads();
+    let transformed = logged.read_shard(0).unwrap();
+    assert!(
+        transformed
+            .data
+            .iter()
+            .zip(expected.data.iter())
+            .any(|(t, e)| (t - e).abs() > 1e-6),
+        "fixture has no values log1p actually changes — the write-through \
+         check below cannot fail"
+    );
+
+    // Re-read through a plain source: the cached shard must still be raw.
+    let after = full_source(&reader)
+        .with_cached_reads()
+        .read_shard(0)
+        .unwrap();
+    assert_eq!(
+        after.data, expected.data,
+        "the transform mutated the LRU's shard in place — every other consumer \
+         of this reader would now see log1p'd values"
+    );
+}
+
 #[test]
 fn cached_reads_survive_a_view() {
     // The regression this guards: dropping the LRU specifically for the

@@ -1772,3 +1772,369 @@ fn shared_shard_cache_spans_readers_under_one_budget() {
     assert_eq!(r0.cache_capacity(), 1);
     assert_eq!(r1.cache_capacity(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4.2 — decode-prefetch bit-identity
+//
+// The aggregation kernels above stream shards through
+// `prefetch::for_each_shard_ordered_uncached` instead of a plain `for` loop.
+// The pipeline decodes up to `depth` shards concurrently but *consumes* them on
+// the calling thread in strict shard order, so every f64 accumulation and every
+// `Vec::extend` concatenation must see the exact sequence the old loop did.
+//
+// "Must" is the claim these tests discharge, against a hand-written sequential
+// reference over `read_shard_uncached` — not against another prefetched kernel.
+// ---------------------------------------------------------------------------
+
+/// Multi-shard **float** fixture, built so that shard order is *observable* in
+/// the f64 accumulators.
+///
+/// Two properties, both load-bearing:
+///
+/// 1. **Float, not integer.** Integer values sum exactly at every grouping, so
+///    a bit-identity assertion over them proves nothing.
+/// 2. **Shard 0 holds `+1e16`, shard 1 holds `-1e16`, the rest hold small
+///    inexact fractions.** This is the property that took two attempts to get
+///    right. The kernels reduce *per-shard partial sums*, not raw values, so
+///    what has to be order-sensitive is the merge of five numbers — and the
+///    obvious "cycle through three magnitudes" fixture is completely blind to
+///    it (measured: 0 of the 119 non-identity permutations of a 5-shard visit
+///    order changed any column sum). With a cancelling pair the small terms are
+///    swallowed or retained depending on *when* they are added, and 108 of
+///    those 119 orders now give a different f64 result.
+///    [`fixture_is_sensitive_to_shard_order`] pins the property so the
+///    bit-identity tests below cannot quietly become vacuous.
+fn write_float_file_and_open(
+    dir: &TempDir,
+    n_obs: usize,
+    n_vars: usize,
+    n_shards: usize,
+) -> BackedCsrReader {
+    let path = dir.path().join("float.scx");
+    let nnz_per_row = 3usize;
+    let header = sample_header(n_obs as u64, n_vars as u64, (n_obs * nnz_per_row) as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    let rows_per_shard = n_obs / n_shards;
+    for s in 0..n_shards {
+        let row_start = s * rows_per_shard;
+        let shard_rows = if s == n_shards - 1 {
+            n_obs - row_start
+        } else {
+            rows_per_shard
+        };
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<f32> = Vec::new();
+        for r in 0..shard_rows {
+            let g = row_start + r;
+            // Three strictly-increasing columns per row, values alternating
+            // between huge, tiny and awkward-fraction so summation order is
+            // observable in the low mantissa bits.
+            let cols = [
+                (g % n_vars) as u32,
+                ((g + 3) % n_vars) as u32,
+                ((g + 7) % n_vars) as u32,
+            ];
+            let mut cols: Vec<u32> = cols.to_vec();
+            cols.sort_unstable();
+            cols.dedup();
+            for (k, &c) in cols.iter().enumerate() {
+                indices.push(c);
+                values.push(match s {
+                    0 => 1.0e16f32,
+                    1 => -1.0e16f32,
+                    _ => [1.0f32 / 3.0, 2.0 / 7.0, 11.0 / 13.0][(g + k) % 3],
+                });
+            }
+            indptr.push(indices.len() as u64);
+        }
+        let value_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &value_bytes,
+                CodecId::None,
+                ValueEncoding::Float32,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0)
+}
+
+/// Guard against a vacuous pass: the prefetch pipeline only engages with a
+/// multi-thread rayon pool, `depth > 1` and more than one shard. If any of
+/// those is false every kernel silently takes the same sequential path as the
+/// reference and these tests prove nothing.
+fn assert_prefetch_engages(backed: &BackedCsrReader) {
+    assert!(
+        crate::prefetch::prefetch_depth() > 1,
+        "SCX_ACCEL_PREFETCH_DEPTH<=1 in this process — the prefetch path is \
+         disabled and the bit-identity assertions below are vacuous"
+    );
+    assert!(
+        rayon::current_num_threads() > 1,
+        "single-thread rayon pool — the prefetch path is disabled and the \
+         bit-identity assertions below are vacuous"
+    );
+    assert!(
+        backed.index().n_shards() > 1,
+        "single-shard fixture — the prefetch path is disabled"
+    );
+}
+
+fn assert_bits_eq(label: &str, got: &[f64], want: &[f64]) {
+    assert_eq!(got.len(), want.len(), "{label}: length differs");
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "{label}[{i}]: {g} is not bit-identical to the sequential {w}"
+        );
+    }
+}
+
+/// The premise check for the two bit-identity tests: on this fixture, visiting
+/// shards in a different order *does* change the f64 column sums. Without it a
+/// reordering regression would slip through silently and both tests would still
+/// be green — the failure mode that made the previous fixture worthless.
+#[test]
+fn fixture_is_sensitive_to_shard_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, n_shards) = (120usize, 11usize, 5usize);
+    let backed = write_float_file_and_open(&dir, n_obs, n_vars, n_shards);
+
+    let sum_in = |order: &[usize]| -> Vec<f64> {
+        let mut sums = vec![0.0f64; n_vars];
+        for &idx in order {
+            let csr = backed.read_shard_uncached(idx).unwrap();
+            for (s, p) in sums.iter_mut().zip(csr.col_sums().iter()) {
+                *s += p;
+            }
+        }
+        sums
+    };
+    let forward: Vec<usize> = (0..n_shards).collect();
+    let reversed: Vec<usize> = (0..n_shards).rev().collect();
+    let a = sum_in(&forward);
+    let b = sum_in(&reversed);
+    assert!(
+        a.iter().zip(&b).any(|(x, y)| x.to_bits() != y.to_bits()),
+        "fixture is order-insensitive: reversing the shard visit order left \
+         every column sum bit-identical, so the bit-identity tests below \
+         cannot detect a reordering regression"
+    );
+}
+
+#[test]
+fn prefetched_aggregations_are_bit_identical_to_a_sequential_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, n_shards) = (120usize, 11usize, 5usize);
+    let backed = write_float_file_and_open(&dir, n_obs, n_vars, n_shards);
+    assert_prefetch_engages(&backed);
+
+    // --- Sequential reference: the pre-4.2 loop shape, spelled out once. ---
+    let mut ref_row_sums: Vec<f64> = Vec::new();
+    let mut ref_row_nnz: Vec<i64> = Vec::new();
+    let mut ref_row_sq: Vec<f64> = Vec::new();
+    let mut ref_row_var: Vec<f64> = Vec::new();
+    let mut ref_row_max: Vec<f64> = Vec::new();
+    let mut ref_row_min: Vec<f64> = Vec::new();
+    let mut ref_col_sums = vec![0.0f64; n_vars];
+    let mut ref_col_nnz = vec![0u32; n_vars];
+    let mut ref_col_max = vec![f64::NEG_INFINITY; n_vars];
+    let mut ref_col_min = vec![f64::INFINITY; n_vars];
+    for idx in 0..n_shards {
+        let csr = backed.read_shard_uncached(idx).unwrap();
+        ref_row_sums.extend(csr.row_sums());
+        ref_row_nnz.extend(csr.row_nnz());
+        ref_row_sq.extend(csr.row_sum_of_squares());
+        ref_row_var.extend(csr.row_var());
+        ref_row_max.extend(csr.row_max());
+        ref_row_min.extend(csr.row_min());
+        for (s, p) in ref_col_sums.iter_mut().zip(csr.col_sums().iter()) {
+            *s += p;
+        }
+        for (c, p) in ref_col_nnz.iter_mut().zip(csr.col_nnz().iter()) {
+            *c = c.saturating_add(*p);
+        }
+        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+            let c = col as usize;
+            ref_col_max[c] = ref_col_max[c].max(val as f64);
+            ref_col_min[c] = ref_col_min[c].min(val as f64);
+        }
+    }
+    // Implicit-zero corrections, matching `col_max` / `col_min`.
+    let total_nnz: Vec<usize> = ref_col_nnz.iter().map(|&c| c as usize).collect();
+    for c in 0..n_vars {
+        if total_nnz[c] < n_obs {
+            ref_col_max[c] = if ref_col_max[c] == f64::NEG_INFINITY {
+                0.0
+            } else {
+                ref_col_max[c].max(0.0)
+            };
+            ref_col_min[c] = if ref_col_min[c] == f64::INFINITY {
+                0.0
+            } else {
+                ref_col_min[c].min(0.0)
+            };
+        }
+    }
+
+    // --- Prefetched kernels ---
+    assert_bits_eq("row_sums", &backed.row_sums().unwrap(), &ref_row_sums);
+    assert_bits_eq(
+        "row_sum_of_squares",
+        &backed.row_sum_of_squares().unwrap(),
+        &ref_row_sq,
+    );
+    assert_bits_eq("row_var", &backed.row_var().unwrap(), &ref_row_var);
+    assert_bits_eq("row_max", &backed.row_max().unwrap(), &ref_row_max);
+    assert_bits_eq("row_min", &backed.row_min().unwrap(), &ref_row_min);
+    assert_bits_eq("col_sums", &backed.col_sums().unwrap(), &ref_col_sums);
+    assert_bits_eq("col_max", &backed.col_max().unwrap(), &ref_col_max);
+    assert_bits_eq("col_min", &backed.col_min().unwrap(), &ref_col_min);
+    assert_eq!(backed.row_nnz().unwrap(), ref_row_nnz, "row_nnz");
+    assert_eq!(backed.col_nnz().unwrap(), ref_col_nnz, "col_nnz");
+
+    // The fused twins must agree bit-for-bit with their unfused counterparts,
+    // which is what makes them a safe substitution (4.1's contract, re-checked
+    // now that both sides stream through the prefetch pipeline).
+    let (nnz, sums) = backed.row_nnz_and_sums().unwrap();
+    assert_eq!(nnz, ref_row_nnz, "row_nnz_and_sums: nnz");
+    assert_bits_eq("row_nnz_and_sums: sums", &sums, &ref_row_sums);
+    let (csums, cnnz) = backed.col_sums_and_nnz().unwrap();
+    assert_bits_eq("col_sums_and_nnz: sums", &csums, &ref_col_sums);
+    assert_eq!(cnnz, ref_col_nnz, "col_sums_and_nnz: nnz");
+
+    // `col_var` is two prefetched passes (means, then squared deviations).
+    let means: Vec<f64> = ref_col_sums.iter().map(|&s| s / n_obs as f64).collect();
+    let mut ref_sq_dev = vec![0.0f64; n_vars];
+    for idx in 0..n_shards {
+        let csr = backed.read_shard_uncached(idx).unwrap();
+        for (s, p) in ref_sq_dev
+            .iter_mut()
+            .zip(csr.col_var_partial(&means).iter())
+        {
+            *s += p;
+        }
+    }
+    let ref_col_var: Vec<f64> = (0..n_vars)
+        .map(|c| {
+            let n_zeros = n_obs - total_nnz[c];
+            (ref_sq_dev[c] + n_zeros as f64 * means[c] * means[c]) / n_obs as f64
+        })
+        .collect();
+    assert_bits_eq("col_var", &backed.col_var().unwrap(), &ref_col_var);
+}
+
+#[test]
+fn prefetched_masked_aggregations_are_bit_identical_to_a_sequential_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, n_shards) = (120usize, 11usize, 5usize);
+    let backed = write_float_file_and_open(&dir, n_obs, n_vars, n_shards);
+    assert_prefetch_engages(&backed);
+
+    // Strictly ascending kept set spanning every shard — the masked kernels
+    // `partition_point` it per shard, so it must stay sorted.
+    let kept: Vec<u64> = (0..n_obs as u64).filter(|r| r % 3 != 1).collect();
+    let n_kept = kept.len();
+
+    let mut ref_sums = vec![0.0f64; n_vars];
+    let mut ref_counts = vec![0u32; n_vars];
+    let mut ref_max = vec![f64::NEG_INFINITY; n_vars];
+    let mut ref_min = vec![f64::INFINITY; n_vars];
+    let mut ref_nnz = vec![0usize; n_vars];
+    for idx in 0..n_shards {
+        let csr = backed.read_shard_uncached(idx).unwrap();
+        let (s_start, s_end) = backed.index().shard_range(idx).unwrap();
+        let lo = kept.partition_point(|&r| r < s_start);
+        let hi = kept.partition_point(|&r| r < s_end);
+        for &g in &kept[lo..hi] {
+            let local = (g - s_start) as usize;
+            for j in csr.indptr[local] as usize..csr.indptr[local + 1] as usize {
+                let c = csr.indices[j] as usize;
+                let v = csr.data[j] as f64;
+                ref_sums[c] += v;
+                ref_counts[c] += 1;
+                ref_nnz[c] += 1;
+                ref_max[c] = ref_max[c].max(v);
+                ref_min[c] = ref_min[c].min(v);
+            }
+        }
+    }
+    for c in 0..n_vars {
+        if ref_nnz[c] < n_kept {
+            ref_max[c] = if ref_max[c] == f64::NEG_INFINITY {
+                0.0
+            } else {
+                ref_max[c].max(0.0)
+            };
+            ref_min[c] = if ref_min[c] == f64::INFINITY {
+                0.0
+            } else {
+                ref_min[c].min(0.0)
+            };
+        }
+    }
+
+    assert_bits_eq(
+        "col_sums_masked",
+        &backed.col_sums_masked(&kept).unwrap(),
+        &ref_sums,
+    );
+    assert_bits_eq(
+        "col_max_masked",
+        &backed.col_max_masked(&kept).unwrap(),
+        &ref_max,
+    );
+    assert_bits_eq(
+        "col_min_masked",
+        &backed.col_min_masked(&kept).unwrap(),
+        &ref_min,
+    );
+    let nnz_as_f64: Vec<f64> = ref_counts.iter().map(|&c| c as f64).collect();
+    assert_bits_eq(
+        "col_nnz_masked",
+        &backed.col_nnz_masked(&kept).unwrap(),
+        &nnz_as_f64,
+    );
+
+    let (fs, fc) = backed.col_sums_and_nnz_masked(&kept).unwrap();
+    assert_bits_eq("col_sums_and_nnz_masked: sums", &fs, &ref_sums);
+    assert_eq!(fc, ref_counts, "col_sums_and_nnz_masked: nnz");
+
+    // col_var_masked: two prefetched passes over the kept rows.
+    let means: Vec<f64> = ref_sums.iter().map(|&s| s / n_kept as f64).collect();
+    let mut sq_dev = vec![0.0f64; n_vars];
+    for idx in 0..n_shards {
+        let csr = backed.read_shard_uncached(idx).unwrap();
+        let (s_start, s_end) = backed.index().shard_range(idx).unwrap();
+        let lo = kept.partition_point(|&r| r < s_start);
+        let hi = kept.partition_point(|&r| r < s_end);
+        for &g in &kept[lo..hi] {
+            let local = (g - s_start) as usize;
+            for j in csr.indptr[local] as usize..csr.indptr[local + 1] as usize {
+                let c = csr.indices[j] as usize;
+                let d = csr.data[j] as f64 - means[c];
+                sq_dev[c] += d * d;
+            }
+        }
+    }
+    let ref_var: Vec<f64> = (0..n_vars)
+        .map(|c| {
+            let n_zeros = n_kept - ref_nnz[c];
+            (sq_dev[c] + n_zeros as f64 * means[c] * means[c]) / n_kept as f64
+        })
+        .collect();
+    assert_bits_eq(
+        "col_var_masked",
+        &backed.col_var_masked(&kept).unwrap(),
+        &ref_var,
+    );
+}

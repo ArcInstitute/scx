@@ -9,7 +9,7 @@ use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySlice, PyTuple};
 
-use scx_format_io::{BackedCscReader, BackedCsrReader};
+use scx_format_io::{prefetch, BackedCscReader, BackedCsrReader};
 use scx_sparse::ScxCsr;
 
 use crate::backed::detached;
@@ -365,19 +365,24 @@ impl ScxLazyTransformedDataset {
         let mut sums = vec![0.0f64; n_obs_global];
         let mut global_row = 0usize;
 
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
-            for row in 0..csr.n_rows() {
-                let s = csr.indptr[row] as usize;
-                let e = csr.indptr[row + 1] as usize;
-                sums[global_row + row] = csr.data[s..e].iter().map(|&v| v as f64).sum();
-            }
-            global_row += csr.n_rows();
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
+                for row in 0..csr.n_rows() {
+                    let s = csr.indptr[row] as usize;
+                    let e = csr.indptr[row + 1] as usize;
+                    sums[global_row + row] = csr.data[s..e].iter().map(|&v| v as f64).sum();
+                }
+                global_row += csr.n_rows();
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(sums)
     }
 
@@ -455,20 +460,25 @@ impl ScxLazyTransformedDataset {
         let n_obs_global = self.backed.shape().0;
         let mut sums = vec![0.0f64; n_obs_global];
         let mut global_row = 0usize;
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
-            let projected = scx_engine::projection::project_csr(&csr, cols);
-            for row in 0..projected.n_rows() {
-                let s = projected.indptr[row] as usize;
-                let e = projected.indptr[row + 1] as usize;
-                sums[global_row + row] = projected.data[s..e].iter().map(|&v| v as f64).sum();
-            }
-            global_row += csr.n_rows();
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
+                let projected = scx_engine::projection::project_csr(&csr, cols);
+                for row in 0..projected.n_rows() {
+                    let s = projected.indptr[row] as usize;
+                    let e = projected.indptr[row + 1] as usize;
+                    sums[global_row + row] = projected.data[s..e].iter().map(|&v| v as f64).sum();
+                }
+                global_row += csr.n_rows();
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(sums)
     }
 
@@ -485,17 +495,22 @@ impl ScxLazyTransformedDataset {
         let mut sums = vec![0.0f64; n_vars];
         let mut global_row = 0usize;
 
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
-            for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-                sums[col as usize] += val as f64;
-            }
-            global_row += csr.n_rows();
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
+                for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                    sums[col as usize] += val as f64;
+                }
+                global_row += csr.n_rows();
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(sums)
     }
 
@@ -531,45 +546,50 @@ impl ScxLazyTransformedDataset {
         let mut col_nnz = vec![0usize; n_vars];
         let mut global_row = 0usize;
 
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
 
-            if let Some(ref kept) = self.kept_to_global {
-                let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
-                    Some(r) => r,
-                    None => {
-                        global_row += csr.n_rows();
-                        continue;
+                if let Some(ref kept) = self.kept_to_global {
+                    let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                        Some(r) => r,
+                        None => {
+                            global_row += csr.n_rows();
+                            return Ok(());
+                        }
+                    };
+                    let lo = kept.partition_point(|&r| r < s_start);
+                    let hi = kept.partition_point(|&r| r < s_end);
+                    for &g_row in &kept[lo..hi] {
+                        let local = (g_row - s_start) as usize;
+                        let s = csr.indptr[local] as usize;
+                        let e = csr.indptr[local + 1] as usize;
+                        for j in s..e {
+                            let c = csr.indices[j] as usize;
+                            let diff = csr.data[j] as f64 - col_means[c];
+                            sq_devs[c] += diff * diff;
+                            col_nnz[c] += 1;
+                        }
                     }
-                };
-                let lo = kept.partition_point(|&r| r < s_start);
-                let hi = kept.partition_point(|&r| r < s_end);
-                for &g_row in &kept[lo..hi] {
-                    let local = (g_row - s_start) as usize;
-                    let s = csr.indptr[local] as usize;
-                    let e = csr.indptr[local + 1] as usize;
-                    for j in s..e {
-                        let c = csr.indices[j] as usize;
-                        let diff = csr.data[j] as f64 - col_means[c];
+                } else {
+                    for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                        let c = col as usize;
+                        let diff = val as f64 - col_means[c];
                         sq_devs[c] += diff * diff;
                         col_nnz[c] += 1;
                     }
                 }
-            } else {
-                for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-                    let c = col as usize;
-                    let diff = val as f64 - col_means[c];
-                    sq_devs[c] += diff * diff;
-                    col_nnz[c] += 1;
-                }
-            }
 
-            global_row += csr.n_rows();
-        }
+                global_row += csr.n_rows();
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
 
         // Add contribution from implicit zeros
         let mut variances = vec![0.0f64; n_vars];
@@ -605,33 +625,38 @@ impl ScxLazyTransformedDataset {
             None => return self.streaming_col_sums(),
         };
 
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
 
-            let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
-                Some(r) => r,
-                None => {
-                    global_row += csr.n_rows();
-                    continue;
+                let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                    Some(r) => r,
+                    None => {
+                        global_row += csr.n_rows();
+                        return Ok(());
+                    }
+                };
+                let lo = kept.partition_point(|&r| r < s_start);
+                let hi = kept.partition_point(|&r| r < s_end);
+                for &g_row in &kept[lo..hi] {
+                    let local = (g_row - s_start) as usize;
+                    let s = csr.indptr[local] as usize;
+                    let e = csr.indptr[local + 1] as usize;
+                    for j in s..e {
+                        sums[csr.indices[j] as usize] += csr.data[j] as f64;
+                    }
                 }
-            };
-            let lo = kept.partition_point(|&r| r < s_start);
-            let hi = kept.partition_point(|&r| r < s_end);
-            for &g_row in &kept[lo..hi] {
-                let local = (g_row - s_start) as usize;
-                let s = csr.indptr[local] as usize;
-                let e = csr.indptr[local + 1] as usize;
-                for j in s..e {
-                    sums[csr.indices[j] as usize] += csr.data[j] as f64;
-                }
-            }
 
-            global_row += csr.n_rows();
-        }
+                global_row += csr.n_rows();
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(sums)
     }
 
@@ -662,26 +687,31 @@ impl ScxLazyTransformedDataset {
         crate::projected_agg::ensure_qc_pass_args(n_qc, qc_bits, n_visible);
         let mut out = crate::projected_agg::QcRowStats::zeroed(self.backed.shape().0, n_qc);
         let mut global_row = 0usize;
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            let n_rows = csr.n_rows();
-            self.apply_transforms(&mut csr, global_row);
-            match cols.as_deref() {
-                Some(c) => crate::projected_agg::accumulate_qc_rows_into(
-                    &scx_engine::projection::project_csr(&csr, c),
-                    global_row,
-                    qc_bits,
-                    &mut out,
-                ),
-                None => crate::projected_agg::accumulate_qc_rows_into(
-                    &csr, global_row, qc_bits, &mut out,
-                ),
-            }
-            global_row += n_rows;
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                let n_rows = csr.n_rows();
+                self.apply_transforms(&mut csr, global_row);
+                match cols.as_deref() {
+                    Some(c) => crate::projected_agg::accumulate_qc_rows_into(
+                        &scx_engine::projection::project_csr(&csr, c),
+                        global_row,
+                        qc_bits,
+                        &mut out,
+                    ),
+                    None => crate::projected_agg::accumulate_qc_rows_into(
+                        &csr, global_row, qc_bits, &mut out,
+                    ),
+                }
+                global_row += n_rows;
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
         crate::projected_agg::ensure_full_row_coverage(global_row, self.backed.shape().0)
             .map_err(|e| e.to_string())?;
         Ok(out)
@@ -761,46 +791,51 @@ impl ScxLazyTransformedDataset {
         let mut counts = vec![0u32; n_vars];
         let mut global_row = 0usize;
 
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            let n_rows = csr.n_rows();
-            self.apply_transforms(&mut csr, global_row);
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                let n_rows = csr.n_rows();
+                self.apply_transforms(&mut csr, global_row);
 
-            match &self.kept_to_global {
-                None => {
-                    for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-                        let c = col as usize;
-                        sums[c] += val as f64;
-                        counts[c] += 1;
-                    }
-                }
-                Some(kept) => {
-                    let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
-                        Some(r) => r,
-                        None => {
-                            global_row += n_rows;
-                            continue;
-                        }
-                    };
-                    let lo = kept.partition_point(|&r| r < s_start);
-                    let hi = kept.partition_point(|&r| r < s_end);
-                    for &g_row in &kept[lo..hi] {
-                        let local = (g_row - s_start) as usize;
-                        let s = csr.indptr[local] as usize;
-                        let e = csr.indptr[local + 1] as usize;
-                        for j in s..e {
-                            let c = csr.indices[j] as usize;
-                            sums[c] += csr.data[j] as f64;
+                match &self.kept_to_global {
+                    None => {
+                        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                            let c = col as usize;
+                            sums[c] += val as f64;
                             counts[c] += 1;
                         }
                     }
+                    Some(kept) => {
+                        let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                            Some(r) => r,
+                            None => {
+                                global_row += n_rows;
+                                return Ok(());
+                            }
+                        };
+                        let lo = kept.partition_point(|&r| r < s_start);
+                        let hi = kept.partition_point(|&r| r < s_end);
+                        for &g_row in &kept[lo..hi] {
+                            let local = (g_row - s_start) as usize;
+                            let s = csr.indptr[local] as usize;
+                            let e = csr.indptr[local + 1] as usize;
+                            for j in s..e {
+                                let c = csr.indices[j] as usize;
+                                sums[c] += csr.data[j] as f64;
+                                counts[c] += 1;
+                            }
+                        }
+                    }
                 }
-            }
-            global_row += n_rows;
-        }
+                global_row += n_rows;
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
 
         let sums = self.apply_col_projection_to_vec(sums);
         let counts = match &self.col_projection {
@@ -820,15 +855,20 @@ impl ScxLazyTransformedDataset {
         let mut global_row = 0usize;
         let mut all_slices = Vec::new();
 
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
-            global_row += csr.n_rows();
-            all_slices.push(csr);
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
+                global_row += csr.n_rows();
+                all_slices.push(csr);
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
 
         // Concatenate all shards
         let full = concatenate_csr_vec(&all_slices, self.backed.n_vars());

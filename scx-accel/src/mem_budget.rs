@@ -107,35 +107,17 @@ pub fn de_gene_chunk_or_err(requested: usize, n_obs: usize, context: &str) -> Re
     Ok(chunk)
 }
 
-/// Pure clamp for the decode-prefetch depth (`prefetch.rs`): the largest
-/// in-flight shard count `≤ requested` whose decoded footprint
-/// (`depth × per_shard_bytes`) fits `budget_bytes`, floored at 1.
+/// Pure clamp for the decode-prefetch depth.
 ///
-/// Peak prefetch memory is `depth` decoded shards (the sequential loop held
-/// one), so this bounds the extra RSS the pipeline can add. Callers that know a
-/// per-shard byte estimate (e.g. from catalog `nnz` stats) pass it here;
-/// callers without one rely on the small [`crate::prefetch::DEFAULT_PREFETCH_DEPTH`]
-/// cap instead.
-pub fn clamp_prefetch_depth(requested: usize, per_shard_bytes: u64, budget_bytes: u64) -> usize {
-    let requested = requested.max(1);
-    let per = per_shard_bytes.max(1);
-    let max_by_budget = (budget_bytes / per).max(1) as usize;
-    requested.min(max_by_budget)
-}
+/// Moved to [`scx_format_io::prefetch`] in Phase 4.2 alongside the pipeline it
+/// bounds; re-exported here so `mem_budget::clamp_prefetch_depth` still resolves
+/// at the HVG call sites. See [`scx_format_io::prefetch::clamp_prefetch_depth`]
+/// for the semantics and its unit test.
+pub use scx_format_io::prefetch::clamp_prefetch_depth;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn prefetch_depth_clamps_to_budget() {
-        // 10 shards × 100 B = 1000 B budget → at most 10 in flight.
-        assert_eq!(clamp_prefetch_depth(4, 100, 1000), 4);
-        // budget only fits 2 shards → clamp 8 → 2.
-        assert_eq!(clamp_prefetch_depth(8, 100, 200), 2);
-        // never below 1 even when a single shard exceeds the budget.
-        assert_eq!(clamp_prefetch_depth(8, 10_000, 100), 1);
-    }
 
     #[test]
     fn accel_num_threads_parses_positive_only() {

@@ -38,7 +38,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::safe::{CudaEvent, CudaSlice, CudaStream};
-use scx_format_io::ShardSource;
+use scx_format_io::{prefetch, ShardSource};
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -96,6 +96,41 @@ fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), GpuError> {
         )));
     }
     Ok(())
+}
+
+/// `ShardSource` adapter that times every decode into the GPU profiler's
+/// host-decode bucket.
+///
+/// Before Phase 4.2 the staging loop owned its decode call and could time it
+/// inline. The bounded decode-prefetch pipeline owns it now, so the
+/// instrumentation moves onto the source — otherwise the multi-shard path
+/// silently stops reporting host-decode time, and "the host-decode bucket
+/// dropped" becomes unfalsifiable.
+///
+/// As on the CPU side after 2.1, the reported total is the **sum over
+/// concurrent workers** and so can exceed wall-clock; the ratio against wall is
+/// the signal, not the absolute.
+struct ProfiledDecode<'a>(&'a (dyn ShardSource + Sync));
+
+impl ShardSource for ProfiledDecode<'_> {
+    fn n_shards(&self) -> usize {
+        self.0.n_shards()
+    }
+    fn n_obs(&self) -> usize {
+        self.0.n_obs()
+    }
+    fn n_vars(&self) -> usize {
+        self.0.n_vars()
+    }
+    fn max_shard_rows(&self) -> scx_format_io::Result<usize> {
+        self.0.max_shard_rows()
+    }
+    fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<scx_sparse::ScxCsr> {
+        let t_decode = profile::start();
+        let out = self.0.read_shard(shard_idx);
+        profile::record_host_decode_since(CodecClass::Generic, t_decode);
+        out
+    }
 }
 
 /// Sequence of GPU-resident CSR shards.
@@ -282,46 +317,46 @@ impl<'a> RawGpuShardSource<'a> {
             return Ok(());
         }
 
-        // Multi-shard: scoped worker decodes one shard ahead of main.
-        // Borrow split: hoist references to inner fields up-front so the
-        // scoped thread closure can capture them without going through
-        // `&mut self`.
-        let source = self.source;
+        // Multi-shard: a bounded parallel decode feeds the pinned ring.
+        //
+        // Until Phase 4.2 this was a single scoped worker decoding one shard
+        // ahead through a `sync_channel(1)` — one CPU decode thread feeding an
+        // H100, which made every GPU streaming op host-decode-bound (§9.12).
+        // `for_each_shard_ordered_uncached` widens that to `depth` concurrent
+        // decodes on the rayon pool while still delivering shards to the
+        // consumer **on this thread in strict shard order**, which is exactly
+        // the contract the staging body below already assumed — so the pinned
+        // 2-slot ring, the host-side `pinned_events` gate and both device-side
+        // event gates are unchanged.
+        //
+        // Two deliberate consequences:
+        //
+        // * `depth` decoded shards are now live in host RAM instead of ~2.
+        // * Where the pipeline declines to engage — `RAYON_NUM_THREADS=1`, or a
+        //   caller that is itself a rayon worker — decode is now fully
+        //   sequential, whereas the old dedicated `std::thread` overlapped one
+        //   shard ahead unconditionally. Accepted: both cases are an explicit
+        //   "no ambient parallelism" configuration, and the pipeline's
+        //   worker-thread guard is what keeps a nested call from deadlocking.
+        //
+        // An early worker failure now propagates as an `Err` instead of ending
+        // the old `while let Ok(msg) = rx.recv()` loop, which would silently
+        // stage fewer shards than the source has.
         let dev = self.dev;
         let pinned = &mut self.pinned;
         let pinned_events = &mut self.pinned_events;
         let slot = &mut self.slot;
         let copy_stream = &self.copy_stream;
         let compute_stream = dev.stream();
+        let mut pinned_idx: usize = 0;
 
-        let scope_result = std::thread::scope(|scope| -> Result<(), GpuError> {
-            use std::sync::mpsc;
-            type Msg = Result<(usize, scx_sparse::ScxCsr), scx_format_io::ScxError>;
-            let (tx, rx) = mpsc::sync_channel::<Msg>(1);
-
-            scope.spawn(move || {
-                for i in 0..n_shards {
-                    let t_decode = profile::start();
-                    let out = source.read_shard(i).map(|c| (i, c));
-                    profile::record_host_decode_since(CodecClass::Generic, t_decode);
-                    if tx.send(out).is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let mut pinned_idx: usize = 0;
-            while let Ok(msg) = rx.recv() {
-                let (i, csr) = match msg {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Err(GpuError::InvalidShard(format!(
-                            "SCX read error during streaming decode: {e}"
-                        )))
-                    }
-                };
+        let profiled = ProfiledDecode(self.source);
+        let scope_result = prefetch::for_each_shard_ordered_uncached(
+            &profiled,
+            prefetch::prefetch_depth(),
+            |i, csr| -> Result<(), GpuError> {
                 if csr.n_rows() == 0 {
-                    continue;
+                    return Ok(());
                 }
 
                 // Host-side gate: if this pinned slot still has an
@@ -373,9 +408,9 @@ impl<'a> RawGpuShardSource<'a> {
                     .map_err(|e| GpuError::CudaError(format!("copy wait: {e}")))?;
 
                 pinned_idx ^= 1;
-            }
-            Ok(())
-        });
+                Ok(())
+            },
+        );
 
         // Drain any remaining pinned events so the caller may safely
         // mutate or drop the pinned host buffers immediately after this

@@ -8,7 +8,7 @@
 // which cannot depend on each other.
 
 use scx_engine::projection::project_csr;
-use scx_format_io::BackedCsrReader;
+use scx_format_io::{prefetch, BackedCsrReader};
 
 type Result<T> = std::result::Result<T, scx_format_io::ScxError>;
 
@@ -24,17 +24,21 @@ pub fn col_sums_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Resu
     let n_proj = col_indices.len();
     let mut sums = vec![0.0f64; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let projected = project_csr(&csr, col_indices);
-        for row in 0..projected.n_rows() {
-            let s = projected.indptr[row] as usize;
-            let e = projected.indptr[row + 1] as usize;
-            for j in s..e {
-                sums[projected.indices[j] as usize] += projected.data[j] as f64;
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |_shard_idx, csr| -> Result<()> {
+            let projected = project_csr(&csr, col_indices);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                for j in s..e {
+                    sums[projected.indices[j] as usize] += projected.data[j] as f64;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     Ok(sums)
 }
 
@@ -43,17 +47,21 @@ pub fn col_nnz_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Resul
     let n_proj = col_indices.len();
     let mut counts = vec![0u32; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let projected = project_csr(&csr, col_indices);
-        for row in 0..projected.n_rows() {
-            let s = projected.indptr[row] as usize;
-            let e = projected.indptr[row + 1] as usize;
-            for j in s..e {
-                counts[projected.indices[j] as usize] += 1;
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |_shard_idx, csr| -> Result<()> {
+            let projected = project_csr(&csr, col_indices);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                for j in s..e {
+                    counts[projected.indices[j] as usize] += 1;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     Ok(counts)
 }
 
@@ -70,19 +78,23 @@ pub fn col_sums_and_nnz_projected(
     let mut sums = vec![0.0f64; n_proj];
     let mut counts = vec![0u32; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let projected = project_csr(&csr, col_indices);
-        for row in 0..projected.n_rows() {
-            let s = projected.indptr[row] as usize;
-            let e = projected.indptr[row + 1] as usize;
-            for j in s..e {
-                let c = projected.indices[j] as usize;
-                sums[c] += projected.data[j] as f64;
-                counts[c] += 1;
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |_shard_idx, csr| -> Result<()> {
+            let projected = project_csr(&csr, col_indices);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                for j in s..e {
+                    let c = projected.indices[j] as usize;
+                    sums[c] += projected.data[j] as f64;
+                    counts[c] += 1;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     Ok((sums, counts))
 }
 
@@ -98,20 +110,24 @@ pub fn col_max_projected(
     let mut maxes = vec![f64::NEG_INFINITY; n_proj];
     let mut col_nnz = vec![0usize; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let projected = project_csr(&csr, col_indices);
-        for row in 0..projected.n_rows() {
-            let s = projected.indptr[row] as usize;
-            let e = projected.indptr[row + 1] as usize;
-            for j in s..e {
-                let c = projected.indices[j] as usize;
-                let v = projected.data[j] as f64;
-                maxes[c] = maxes[c].max(v);
-                col_nnz[c] += 1;
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |_shard_idx, csr| -> Result<()> {
+            let projected = project_csr(&csr, col_indices);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                for j in s..e {
+                    let c = projected.indices[j] as usize;
+                    let v = projected.data[j] as f64;
+                    maxes[c] = maxes[c].max(v);
+                    col_nnz[c] += 1;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
 
     // Implicit zeros: if column has fewer stored entries than n_obs
     for c in 0..n_proj {
@@ -138,20 +154,24 @@ pub fn col_min_projected(
     let mut mins = vec![f64::INFINITY; n_proj];
     let mut col_nnz = vec![0usize; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let projected = project_csr(&csr, col_indices);
-        for row in 0..projected.n_rows() {
-            let s = projected.indptr[row] as usize;
-            let e = projected.indptr[row + 1] as usize;
-            for j in s..e {
-                let c = projected.indices[j] as usize;
-                let v = projected.data[j] as f64;
-                mins[c] = mins[c].min(v);
-                col_nnz[c] += 1;
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |_shard_idx, csr| -> Result<()> {
+            let projected = project_csr(&csr, col_indices);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                for j in s..e {
+                    let c = projected.indices[j] as usize;
+                    let v = projected.data[j] as f64;
+                    mins[c] = mins[c].min(v);
+                    col_nnz[c] += 1;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
 
     for c in 0..n_proj {
         if col_nnz[c] < n_obs {
@@ -189,20 +209,24 @@ pub fn col_var_projected(
     let mut sq_devs = vec![0.0f64; n_proj];
     let mut col_nnz = vec![0usize; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let projected = project_csr(&csr, col_indices);
-        for row in 0..projected.n_rows() {
-            let s = projected.indptr[row] as usize;
-            let e = projected.indptr[row + 1] as usize;
-            for j in s..e {
-                let c = projected.indices[j] as usize;
-                let diff = projected.data[j] as f64 - col_means[c];
-                sq_devs[c] += diff * diff;
-                col_nnz[c] += 1;
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |_shard_idx, csr| -> Result<()> {
+            let projected = project_csr(&csr, col_indices);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                for j in s..e {
+                    let c = projected.indices[j] as usize;
+                    let diff = projected.data[j] as f64 - col_means[c];
+                    sq_devs[c] += diff * diff;
+                    col_nnz[c] += 1;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
 
     // Add contribution from implicit zeros
     let mut variances = vec![0.0f64; n_proj];
@@ -234,16 +258,20 @@ pub fn row_sums_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Resu
     let mut sums = vec![0.0f64; n_obs];
     let mut global_row = 0usize;
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let projected = project_csr(&csr, col_indices);
-        for row in 0..projected.n_rows() {
-            let s = projected.indptr[row] as usize;
-            let e = projected.indptr[row + 1] as usize;
-            sums[global_row + row] = projected.data[s..e].iter().map(|&v| v as f64).sum();
-        }
-        global_row += csr.n_rows();
-    }
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |_shard_idx, csr| -> Result<()> {
+            let projected = project_csr(&csr, col_indices);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                sums[global_row + row] = projected.data[s..e].iter().map(|&v| v as f64).sum();
+            }
+            global_row += csr.n_rows();
+            Ok(())
+        },
+    )?;
     Ok(sums)
 }
 
@@ -253,16 +281,20 @@ pub fn row_nnz_projected(reader: &BackedCsrReader, col_indices: &[u32]) -> Resul
     let mut counts = vec![0i64; n_obs];
     let mut global_row = 0usize;
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let projected = project_csr(&csr, col_indices);
-        for row in 0..projected.n_rows() {
-            let s = projected.indptr[row] as usize;
-            let e = projected.indptr[row + 1] as usize;
-            counts[global_row + row] = (e - s) as i64;
-        }
-        global_row += csr.n_rows();
-    }
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |_shard_idx, csr| -> Result<()> {
+            let projected = project_csr(&csr, col_indices);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                counts[global_row + row] = (e - s) as i64;
+            }
+            global_row += csr.n_rows();
+            Ok(())
+        },
+    )?;
     Ok(counts)
 }
 
@@ -281,17 +313,21 @@ pub fn row_nnz_and_sums_projected(
     let mut sums = vec![0.0f64; n_obs];
     let mut global_row = 0usize;
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let projected = project_csr(&csr, col_indices);
-        for row in 0..projected.n_rows() {
-            let s = projected.indptr[row] as usize;
-            let e = projected.indptr[row + 1] as usize;
-            counts[global_row + row] = (e - s) as i64;
-            sums[global_row + row] = projected.data[s..e].iter().map(|&v| v as f64).sum();
-        }
-        global_row += csr.n_rows();
-    }
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |_shard_idx, csr| -> Result<()> {
+            let projected = project_csr(&csr, col_indices);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                counts[global_row + row] = (e - s) as i64;
+                sums[global_row + row] = projected.data[s..e].iter().map(|&v| v as f64).sum();
+            }
+            global_row += csr.n_rows();
+            Ok(())
+        },
+    )?;
     Ok((counts, sums))
 }
 
@@ -318,25 +354,29 @@ pub fn row_stats_projected(
     let mut sumsq = vec![0.0f64; n_obs];
     let mut global_row = 0usize;
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let projected = project_csr(&csr, col_indices);
-        for row in 0..projected.n_rows() {
-            let s = projected.indptr[row] as usize;
-            let e = projected.indptr[row + 1] as usize;
-            let g = global_row + row;
-            let mut sm = 0.0f64;
-            let mut sq = 0.0f64;
-            for &v in &projected.data[s..e] {
-                let v = v as f64;
-                sm += v;
-                sq += v * v;
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |_shard_idx, csr| -> Result<()> {
+            let projected = project_csr(&csr, col_indices);
+            for row in 0..projected.n_rows() {
+                let s = projected.indptr[row] as usize;
+                let e = projected.indptr[row + 1] as usize;
+                let g = global_row + row;
+                let mut sm = 0.0f64;
+                let mut sq = 0.0f64;
+                for &v in &projected.data[s..e] {
+                    let v = v as f64;
+                    sm += v;
+                    sq += v * v;
+                }
+                sums[g] = sm;
+                sumsq[g] = sq;
             }
-            sums[g] = sm;
-            sumsq[g] = sq;
-        }
-        global_row += csr.n_rows();
-    }
+            global_row += csr.n_rows();
+            Ok(())
+        },
+    )?;
     Ok(ProjectedRowStats { sums, sumsq })
 }
 
@@ -445,17 +485,21 @@ pub fn qc_row_pass(
 
     let mut out = QcRowStats::zeroed(n_obs, n_qc);
     let mut global_row = 0usize;
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let n_rows = csr.n_rows();
-        match col_indices {
-            Some(cols) => {
-                accumulate_qc_rows_into(&project_csr(&csr, cols), global_row, qc_bits, &mut out)
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |_shard_idx, csr| -> Result<()> {
+            let n_rows = csr.n_rows();
+            match col_indices {
+                Some(cols) => {
+                    accumulate_qc_rows_into(&project_csr(&csr, cols), global_row, qc_bits, &mut out)
+                }
+                None => accumulate_qc_rows_into(&csr, global_row, qc_bits, &mut out),
             }
-            None => accumulate_qc_rows_into(&csr, global_row, qc_bits, &mut out),
-        }
-        global_row += n_rows;
-    }
+            global_row += n_rows;
+            Ok(())
+        },
+    )?;
     ensure_full_row_coverage(global_row, n_obs)?;
     Ok(out)
 }
@@ -565,27 +609,31 @@ pub fn col_sums_masked_projected(
     let n_proj = col_indices.len();
     let mut sums = vec![0.0f64; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
-            Some(r) => r,
-            None => continue,
-        };
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |shard_idx, csr| -> Result<()> {
+            let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
+                Some(r) => r,
+                None => return Ok(()),
+            };
 
-        let projected = project_csr(&csr, col_indices);
+            let projected = project_csr(&csr, col_indices);
 
-        // Binary-search to find the sub-slice of kept_rows within [s_start, s_end)
-        let lo = kept_rows.partition_point(|&r| r < s_start);
-        let hi = kept_rows.partition_point(|&r| r < s_end);
-        for &global_row in &kept_rows[lo..hi] {
-            let local_row = (global_row - s_start) as usize;
-            let s = projected.indptr[local_row] as usize;
-            let e = projected.indptr[local_row + 1] as usize;
-            for j in s..e {
-                sums[projected.indices[j] as usize] += projected.data[j] as f64;
+            // Binary-search to find the sub-slice of kept_rows within [s_start, s_end)
+            let lo = kept_rows.partition_point(|&r| r < s_start);
+            let hi = kept_rows.partition_point(|&r| r < s_end);
+            for &global_row in &kept_rows[lo..hi] {
+                let local_row = (global_row - s_start) as usize;
+                let s = projected.indptr[local_row] as usize;
+                let e = projected.indptr[local_row + 1] as usize;
+                for j in s..e {
+                    sums[projected.indices[j] as usize] += projected.data[j] as f64;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     Ok(sums)
 }
 
@@ -598,26 +646,30 @@ pub fn col_nnz_masked_projected(
     let n_proj = col_indices.len();
     let mut counts = vec![0u32; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
-            Some(r) => r,
-            None => continue,
-        };
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |shard_idx, csr| -> Result<()> {
+            let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
+                Some(r) => r,
+                None => return Ok(()),
+            };
 
-        let projected = project_csr(&csr, col_indices);
+            let projected = project_csr(&csr, col_indices);
 
-        let lo = kept_rows.partition_point(|&r| r < s_start);
-        let hi = kept_rows.partition_point(|&r| r < s_end);
-        for &global_row in &kept_rows[lo..hi] {
-            let local_row = (global_row - s_start) as usize;
-            let s = projected.indptr[local_row] as usize;
-            let e = projected.indptr[local_row + 1] as usize;
-            for j in s..e {
-                counts[projected.indices[j] as usize] += 1;
+            let lo = kept_rows.partition_point(|&r| r < s_start);
+            let hi = kept_rows.partition_point(|&r| r < s_end);
+            for &global_row in &kept_rows[lo..hi] {
+                let local_row = (global_row - s_start) as usize;
+                let s = projected.indptr[local_row] as usize;
+                let e = projected.indptr[local_row + 1] as usize;
+                for j in s..e {
+                    counts[projected.indices[j] as usize] += 1;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     Ok(counts)
 }
 
@@ -634,28 +686,32 @@ pub fn col_sums_and_nnz_masked_projected(
     let mut sums = vec![0.0f64; n_proj];
     let mut counts = vec![0u32; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
-            Some(r) => r,
-            None => continue,
-        };
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |shard_idx, csr| -> Result<()> {
+            let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
+                Some(r) => r,
+                None => return Ok(()),
+            };
 
-        let projected = project_csr(&csr, col_indices);
+            let projected = project_csr(&csr, col_indices);
 
-        let lo = kept_rows.partition_point(|&r| r < s_start);
-        let hi = kept_rows.partition_point(|&r| r < s_end);
-        for &global_row in &kept_rows[lo..hi] {
-            let local_row = (global_row - s_start) as usize;
-            let s = projected.indptr[local_row] as usize;
-            let e = projected.indptr[local_row + 1] as usize;
-            for j in s..e {
-                let c = projected.indices[j] as usize;
-                sums[c] += projected.data[j] as f64;
-                counts[c] += 1;
+            let lo = kept_rows.partition_point(|&r| r < s_start);
+            let hi = kept_rows.partition_point(|&r| r < s_end);
+            for &global_row in &kept_rows[lo..hi] {
+                let local_row = (global_row - s_start) as usize;
+                let s = projected.indptr[local_row] as usize;
+                let e = projected.indptr[local_row + 1] as usize;
+                for j in s..e {
+                    let c = projected.indices[j] as usize;
+                    sums[c] += projected.data[j] as f64;
+                    counts[c] += 1;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     Ok((sums, counts))
 }
 
@@ -670,29 +726,33 @@ pub fn col_max_masked_projected(
     let mut maxes = vec![f64::NEG_INFINITY; n_proj];
     let mut col_nnz = vec![0usize; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
-            Some(r) => r,
-            None => continue,
-        };
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |shard_idx, csr| -> Result<()> {
+            let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
+                Some(r) => r,
+                None => return Ok(()),
+            };
 
-        let projected = project_csr(&csr, col_indices);
+            let projected = project_csr(&csr, col_indices);
 
-        let lo = kept_rows.partition_point(|&r| r < s_start);
-        let hi = kept_rows.partition_point(|&r| r < s_end);
-        for &global_row in &kept_rows[lo..hi] {
-            let local_row = (global_row - s_start) as usize;
-            let s = projected.indptr[local_row] as usize;
-            let e = projected.indptr[local_row + 1] as usize;
-            for j in s..e {
-                let c = projected.indices[j] as usize;
-                let v = projected.data[j] as f64;
-                maxes[c] = maxes[c].max(v);
-                col_nnz[c] += 1;
+            let lo = kept_rows.partition_point(|&r| r < s_start);
+            let hi = kept_rows.partition_point(|&r| r < s_end);
+            for &global_row in &kept_rows[lo..hi] {
+                let local_row = (global_row - s_start) as usize;
+                let s = projected.indptr[local_row] as usize;
+                let e = projected.indptr[local_row + 1] as usize;
+                for j in s..e {
+                    let c = projected.indices[j] as usize;
+                    let v = projected.data[j] as f64;
+                    maxes[c] = maxes[c].max(v);
+                    col_nnz[c] += 1;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
 
     for c in 0..n_proj {
         if col_nnz[c] < n_kept {
@@ -717,29 +777,33 @@ pub fn col_min_masked_projected(
     let mut mins = vec![f64::INFINITY; n_proj];
     let mut col_nnz = vec![0usize; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
-            Some(r) => r,
-            None => continue,
-        };
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |shard_idx, csr| -> Result<()> {
+            let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
+                Some(r) => r,
+                None => return Ok(()),
+            };
 
-        let projected = project_csr(&csr, col_indices);
+            let projected = project_csr(&csr, col_indices);
 
-        let lo = kept_rows.partition_point(|&r| r < s_start);
-        let hi = kept_rows.partition_point(|&r| r < s_end);
-        for &global_row in &kept_rows[lo..hi] {
-            let local_row = (global_row - s_start) as usize;
-            let s = projected.indptr[local_row] as usize;
-            let e = projected.indptr[local_row + 1] as usize;
-            for j in s..e {
-                let c = projected.indices[j] as usize;
-                let v = projected.data[j] as f64;
-                mins[c] = mins[c].min(v);
-                col_nnz[c] += 1;
+            let lo = kept_rows.partition_point(|&r| r < s_start);
+            let hi = kept_rows.partition_point(|&r| r < s_end);
+            for &global_row in &kept_rows[lo..hi] {
+                let local_row = (global_row - s_start) as usize;
+                let s = projected.indptr[local_row] as usize;
+                let e = projected.indptr[local_row + 1] as usize;
+                for j in s..e {
+                    let c = projected.indices[j] as usize;
+                    let v = projected.data[j] as f64;
+                    mins[c] = mins[c].min(v);
+                    col_nnz[c] += 1;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
 
     for c in 0..n_proj {
         if col_nnz[c] < n_kept {
@@ -773,29 +837,33 @@ pub fn col_var_masked_projected(
     let mut sq_devs = vec![0.0f64; n_proj];
     let mut col_nnz = vec![0usize; n_proj];
 
-    for shard_idx in 0..reader.index().n_shards() {
-        let csr = reader.read_shard_uncached(shard_idx)?;
-        let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
-            Some(r) => r,
-            None => continue,
-        };
+    prefetch::for_each_shard_ordered_uncached(
+        reader,
+        prefetch::prefetch_depth(),
+        |shard_idx, csr| -> Result<()> {
+            let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
+                Some(r) => r,
+                None => return Ok(()),
+            };
 
-        let projected = project_csr(&csr, col_indices);
+            let projected = project_csr(&csr, col_indices);
 
-        let lo = kept_rows.partition_point(|&r| r < s_start);
-        let hi = kept_rows.partition_point(|&r| r < s_end);
-        for &global_row in &kept_rows[lo..hi] {
-            let local_row = (global_row - s_start) as usize;
-            let s = projected.indptr[local_row] as usize;
-            let e = projected.indptr[local_row + 1] as usize;
-            for j in s..e {
-                let c = projected.indices[j] as usize;
-                let diff = projected.data[j] as f64 - col_means[c];
-                sq_devs[c] += diff * diff;
-                col_nnz[c] += 1;
+            let lo = kept_rows.partition_point(|&r| r < s_start);
+            let hi = kept_rows.partition_point(|&r| r < s_end);
+            for &global_row in &kept_rows[lo..hi] {
+                let local_row = (global_row - s_start) as usize;
+                let s = projected.indptr[local_row] as usize;
+                let e = projected.indptr[local_row + 1] as usize;
+                for j in s..e {
+                    let c = projected.indices[j] as usize;
+                    let diff = projected.data[j] as f64 - col_means[c];
+                    sq_devs[c] += diff * diff;
+                    col_nnz[c] += 1;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
 
     // Add zero-entry contributions
     let mut variances = vec![0.0f64; n_proj];

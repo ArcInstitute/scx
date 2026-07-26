@@ -180,14 +180,19 @@ impl scx_format_io::ShardSource for LazyShardSource {
             }
         })?;
 
-        let decoded = self.decode_shard(shard_idx)?;
+        let mut decoded = Some(self.decode_shard(shard_idx)?);
 
         // Transforms mutate in place, so they are the one stage that needs its
-        // own buffer up front.
+        // own buffer up front. `try_unwrap` is what decides whether that costs a
+        // copy: on the uncached path the decode just built a refcount-1 `Arc`
+        // and this takes ownership for free, while a hit on the shared LRU
+        // legitimately clones — mutating the cached shard would corrupt it for
+        // every other reader.
         let mut current: Option<ScxCsr> = if self.transforms.is_empty() {
             None
         } else {
-            let mut owned = (*decoded).clone();
+            let arc = decoded.take().expect("decoded is Some until moved here");
+            let mut owned = Arc::try_unwrap(arc).unwrap_or_else(|shared| (*shared).clone());
             apply_transforms_to_csr(&self.transforms, &mut owned, s_start as usize);
             Some(owned)
         };
@@ -195,7 +200,11 @@ impl scx_format_io::ShardSource for LazyShardSource {
         // Column projection: remap column indices into projected space.
         if let Some(cols) = &self.col_projection {
             let projected = {
-                let src = current.as_ref().unwrap_or(decoded.as_ref());
+                let src = current.as_ref().unwrap_or_else(|| {
+                    decoded
+                        .as_deref()
+                        .expect("decoded survives when untransformed")
+                });
                 scx_engine::projection::project_csr(src, cols)
             };
             current = Some(projected);
@@ -204,7 +213,11 @@ impl scx_format_io::ShardSource for LazyShardSource {
         // Deletion vector: keep only this shard's visible rows.
         if let Some(kept) = &self.kept_to_global {
             let filtered = {
-                let src = current.as_ref().unwrap_or(decoded.as_ref());
+                let src = current.as_ref().unwrap_or_else(|| {
+                    decoded
+                        .as_deref()
+                        .expect("decoded survives when untransformed")
+                });
                 let lo = kept.partition_point(|&r| r < s_start);
                 let hi = kept.partition_point(|&r| r < s_end);
                 if hi > lo {
@@ -225,7 +238,11 @@ impl scx_format_io::ShardSource for LazyShardSource {
             current = Some(filtered);
         }
 
-        Ok(current.map_or(decoded, Arc::new))
+        Ok(match current {
+            Some(derived) => Arc::new(derived),
+            // Untouched by every stage — hand the decoded `Arc` straight back.
+            None => decoded.expect("no stage applied, so decoded was never taken"),
+        })
     }
 
     /// Republish the wrapped reader's LRU capacity, but only when this source
