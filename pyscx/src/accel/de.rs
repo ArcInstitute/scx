@@ -372,7 +372,22 @@ fn run_rank_genes_groups_inner(
             // the Rust kernel can run without holding the GIL.
             if backed.kept_to_global.is_some() {
                 return Err(PyRuntimeError::new_err(
-                    "CSC requested but unavailable: a row deletion vector is active",
+                    "CSC requested but unavailable: a row deletion vector is active \
+                     (this dataset has been subset along obs, e.g. by filter_cells). \
+                     Use prefer_format='csr'.",
+                ));
+            }
+            // The CSC sidecar is full-axis and has no projection surface, so a
+            // gene-subset handle would reach the kernel with visible-width
+            // `gene_names` against a full-width source — a bare
+            // `gene_names length N != source.n_vars() M` ShapeError. Say what
+            // actually happened instead.
+            if backed.col_projection_arc().is_some() {
+                return Err(PyRuntimeError::new_err(
+                    "CSC requested but unavailable: a column projection is active \
+                     (this dataset has been subset along var, e.g. by filter_genes or \
+                     highly_variable_genes(subset=True)); the CSC sidecar is full-axis. \
+                     Use prefer_format='csr'.",
                 ));
             }
             let csc_reader = backed
@@ -460,7 +475,18 @@ fn run_rank_genes_groups_inner(
         // Backed mode: stream shards with gene-chunked DE. Clone the Arc
         // so the kernel runs without holding the GIL.
         let chunk_size = gene_chunk_size.unwrap_or(500);
+        // The handle's *view*, not the file: `groups` is one label per
+        // *visible* cell and `gene_names` one per visible gene, so a subset
+        // handle has to stream its window. `with_cached_reads` because the
+        // kernel walks every shard once per gene chunk — the same LRU the raw
+        // reader served from.
+        let source = backed.as_shard_source().with_cached_reads();
+        // Only the GPU arm still needs the concrete reader (for the
+        // CSC-direct `Backed` input); the CPU arm runs entirely off `source`.
+        #[cfg(feature = "gpu")]
         let reader = std::sync::Arc::clone(&backed.backed);
+        #[cfg(feature = "gpu")]
+        let has_view = backed.has_axis_view();
         // If a CSC sidecar reader exists on the dataset, hand it to the GPU
         // streaming path so the default v3 route can dispatch to the
         // CSC-direct Wilcoxon driver. None falls through to the v3 CSR-direct
@@ -473,12 +499,23 @@ fn run_rank_genes_groups_inner(
             #[cfg(feature = "gpu")]
             Some(device_id) => py
                 .detach(|| {
-                    scx_accel::wilcoxon_rank_sum_gpu(
-                        device_id,
+                    // A *subset* handle has no CSC surface to lose — any
+                    // `kept_to_global` already makes `as_column_source()`
+                    // return `None`, and `csc_route_available` excludes a
+                    // projected one — so it takes the generic `Lazy` input.
+                    // An unsubset handle keeps `Backed`, and with it the
+                    // CSC-direct `gpu_csc_v3` route.
+                    let input = if has_view {
+                        scx_accel::GpuDeShardInput::Lazy(&source)
+                    } else {
                         scx_accel::GpuDeShardInput::Backed {
                             csr: &reader,
                             csc: csc_reader.as_deref(),
-                        },
+                        }
+                    };
+                    scx_accel::wilcoxon_rank_sum_gpu(
+                        device_id,
+                        input,
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -495,7 +532,7 @@ fn run_rank_genes_groups_inner(
             None => py
                 .detach(|| {
                     scx_accel::wilcoxon_rank_sum_streaming(
-                        &reader,
+                        &source,
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -1675,7 +1712,22 @@ fn run_pdex_ref_inner(
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
             if backed.kept_to_global.is_some() {
                 return Err(PyRuntimeError::new_err(
-                    "CSC requested but unavailable: a row deletion vector is active",
+                    "CSC requested but unavailable: a row deletion vector is active \
+                     (this dataset has been subset along obs, e.g. by filter_cells). \
+                     Use prefer_format='csr'.",
+                ));
+            }
+            // The CSC sidecar is full-axis and has no projection surface, so a
+            // gene-subset handle would reach the kernel with visible-width
+            // `gene_names` against a full-width source — a bare
+            // `gene_names length N != source.n_vars() M` ShapeError. Say what
+            // actually happened instead.
+            if backed.col_projection_arc().is_some() {
+                return Err(PyRuntimeError::new_err(
+                    "CSC requested but unavailable: a column projection is active \
+                     (this dataset has been subset along var, e.g. by filter_genes or \
+                     highly_variable_genes(subset=True)); the CSC sidecar is full-axis. \
+                     Use prefer_format='csr'.",
                 ));
             }
             let csc_reader = backed
@@ -1757,7 +1809,14 @@ fn run_pdex_ref_inner(
 
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         let chunk_size = gene_chunk_size.unwrap_or(500);
+        // The handle's *view* — see the matching branch in
+        // `run_rank_genes_groups_inner` for why the raw reader is wrong here.
+        let source = backed.as_shard_source().with_cached_reads();
+        // GPU-only: the concrete reader backs the CSC-direct `Backed` input.
+        #[cfg(feature = "gpu")]
         let reader = std::sync::Arc::clone(&backed.backed);
+        #[cfg(feature = "gpu")]
+        let has_view = backed.has_axis_view();
         // G4.3: if a CSC sidecar reader exists on the dataset, hand it to
         // the GPU streaming path so the default v3 route can dispatch to
         // the CSC-direct driver. None falls through to the v3 CSR-direct
@@ -1770,12 +1829,20 @@ fn run_pdex_ref_inner(
             #[cfg(feature = "gpu")]
             Some(device_id) => py
                 .detach(|| {
-                    scx_accel::pdex_ref_gpu(
-                        device_id,
+                    // Subset handle → generic `Lazy` (it has no reachable CSC
+                    // surface anyway); unsubset → `Backed`, preserving the
+                    // CSC-direct `gpu_csc_v3` route.
+                    let input = if has_view {
+                        scx_accel::GpuDeShardInput::Lazy(&source)
+                    } else {
                         scx_accel::GpuDeShardInput::Backed {
                             csr: &reader,
                             csc: csc_reader.as_deref(),
-                        },
+                        }
+                    };
+                    scx_accel::pdex_ref_gpu(
+                        device_id,
+                        input,
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -1792,7 +1859,7 @@ fn run_pdex_ref_inner(
             None => py
                 .detach(|| {
                     scx_accel::pdex_ref_streaming(
-                        &reader,
+                        &source,
                         &gene_names,
                         &groups,
                         &unique_groups,

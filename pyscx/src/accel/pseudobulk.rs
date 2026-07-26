@@ -256,8 +256,13 @@ pub(super) fn aggregate_pseudobulk(
             unreachable!("type check above")
         }
     } else if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        // The handle's *view*: `obs_groups` came from `adata.obs`, so it is one
+        // label per *visible* cell. Streaming the raw reader would walk every
+        // on-disk row and trip the kernel's `obs_groups` length guard on any
+        // subset handle (`filter_cells` → `pseudobulk` used to raise).
+        let source = backed.as_shard_source();
         scx_accel::pseudobulk_aggregate(
-            &backed.backed,
+            &source,
             &obs_groups,
             groupby,
             &gene_names,

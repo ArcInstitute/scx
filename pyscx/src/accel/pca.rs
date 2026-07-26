@@ -535,6 +535,13 @@ pub fn pca(
              measurable speed-up and is not implemented."
         )));
     }
+    // A presentation-ordered backed `X` (`preserve_var_order=True`) cannot be
+    // expressed as a `ShardSource`: the source emits columns in sorted
+    // on-disk order while `adata.var` is in request order, so `varm["PCs"]`
+    // would silently misalign against the gene names. Same guard the other
+    // streaming accel ops already apply.
+    super::reject_preserve_var_order(adata, "pca")?;
+
     let backend: &str;
 
     // Extract X from adata
@@ -687,12 +694,15 @@ pub fn pca(
         };
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-            let reader = &*backed.backed;
-            let (_n_obs, n_vars) = reader.shape();
+            // The handle's *view*, not the raw reader: `kept_to_global` and
+            // `col_projection` folded in, so `n_vars` is the visible width and
+            // `mask_cols` (resolved against `adata.n_vars`) composes directly.
+            let source = backed.as_shard_source().with_cached_reads();
+            let n_vars = ShardSource::n_vars(&source);
             let m = resolve_gpu_method(method, mask_cols.map(|c| c.len()).unwrap_or(n_vars))?;
             let result = match mask_cols {
                 Some(cols) => {
-                    let proj = scx_accel::ProjectedShardSource::new(reader, cols.to_vec());
+                    let proj = scx_accel::ProjectedShardSource::new(&source, cols.to_vec());
                     gpu_pca_dispatch_unwind_safe(
                         device_id,
                         &proj,
@@ -708,7 +718,7 @@ pub fn pca(
                 }
                 None => gpu_pca_dispatch_unwind_safe(
                     device_id,
-                    reader,
+                    &source,
                     n_comps,
                     n_oversamples,
                     n_power_iterations,
@@ -881,7 +891,12 @@ pub fn pca(
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         backend = "scx-accel-cpu";
         let reader = std::sync::Arc::clone(&backed.backed);
-        let full_vars = reader.shape().1;
+        // The handle's *view* — `kept_to_global` + `col_projection` applied, so
+        // the embedding rows line up with `adata.obs` and the components with
+        // `adata.var`. `with_cached_reads` keeps the LRU that
+        // `ensure_cache_capacity` below sizes.
+        let source = backed.as_shard_source().with_cached_reads();
+        let full_vars = ShardSource::n_vars(&source);
         drop(backed);
         // Out-of-core PCA re-reads every shard once per pass; size the decoded
         // shard cache to hold the whole working set within the RAM ceiling so
@@ -890,7 +905,7 @@ pub fn pca(
         let m = pick_cpu_method(n_vars_eff(full_vars));
         match mask_cols {
             Some(cols) => {
-                let proj = scx_accel::ProjectedShardSource::new(&*reader, cols.to_vec());
+                let proj = scx_accel::ProjectedShardSource::new(&source, cols.to_vec());
                 py.detach(|| {
                     cpu_pca_stream(
                         &proj,
@@ -905,7 +920,7 @@ pub fn pca(
             }
             None => py.detach(|| {
                 cpu_pca_stream(
-                    &*reader,
+                    &source,
                     m,
                     n_comps,
                     n_oversamples,

@@ -731,9 +731,14 @@ list(adata.var_names)  # ['CD8A', 'CD4', 'CD3E']  (request order)
 ```
 
 `preserve_var_order` works on the eager, backed, GPU, and query-engine
-(`obs_filter` + `var_names`) paths. It is **not** supported by
-`pyscx.accel.highly_variable_genes` on the resulting backed dataset (HVG
-discovery on a hand-ordered panel raises) — run HVG before projecting by name.
+(`obs_filter` + `var_names`) paths. It is **not** supported by the streaming
+accelerators on the resulting **backed** dataset: they decode columns in
+sorted on-disk order, so a request-ordered gene axis would silently misalign
+the result against `adata.var`. `highly_variable_genes`, `normalize_total`,
+`log1p`, `calculate_qc_metrics`, `score_genes`, `pflog`, `pca`,
+`pca_neighbors` and `pca_neighbors_umap` raise `RuntimeError` rather than
+return misaligned output — run them before projecting by name, or re-open
+without `preserve_var_order`.
 
 Unknown names raise `KeyError` by default (`strict_var_names=True`). Pass
 `strict_var_names=False` to silently drop names absent from the var metadata
@@ -1482,6 +1487,15 @@ raises `RuntimeError` with a message naming the missing capability:
    `pyscx.accel.filter_cells()` or `pyscx.accel.subset_obs()`, the
    dataset has `kept_to_global` set; CSC dispatch then raises until
    you `materialize()` or rebuild the file.
+4. No active column projection. After `pyscx.accel.filter_genes()`,
+   `pyscx.accel.subset_var()`, `highly_variable_genes(subset=True)` or
+   `adata[:, mask]`, the sidecar (written against the *full* gene axis)
+   no longer describes the visible one, so CSC dispatch raises. The CSR
+   path streams the projected window and works normally.
+
+Both subset cases are refusals, not silent fallbacks — the CSR default
+handles them, so reach for `prefer_format="csc"` before you subset, not
+after.
 
 Unknown values (e.g. `"CSC"`, `"bogus"`) raise `ValueError`. `"auto"`
 is accepted by `rank_genes_groups` / `pdex_ref` (and is their default);

@@ -2925,6 +2925,7 @@ dependencies = [
  "scx-ops",
  "scx-sparse",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

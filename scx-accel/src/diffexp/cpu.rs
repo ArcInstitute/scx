@@ -10,6 +10,7 @@
 
 use crate::Result;
 use rayon::prelude::*;
+use scx_format_io::ShardSource;
 
 /// Pseudocount added to group means before log2 fold-change computation.
 /// Matches scanpy's value in `_rank_genes_groups.py`.
@@ -619,10 +620,16 @@ pub fn benjamini_hochberg(pvals: &[f64]) -> Vec<f64> {
     adjusted
 }
 
-/// Gene-chunked streaming Wilcoxon rank-sum from `BackedCsrReader`.
+/// Gene-chunked streaming Wilcoxon rank-sum over a CSR [`ShardSource`].
+///
+/// Generic over the source rather than taking a `BackedCsrReader`: `groups` is
+/// indexed by *visible* cell, so a caller holding a subset SCX handle must pass
+/// that handle's view (`as_shard_source()`). Passing the reader underneath it
+/// streams every on-disk row and trips the `groups.len() != n_obs` guard below.
+/// Multi-pass, so a caching source should opt in (`with_cached_reads()`).
 ///
 /// Instead of materializing the full matrix, processes genes in chunks:
-/// 1. For each gene chunk, iterate all shards via `read_shard_cached_arc()`,
+/// 1. For each gene chunk, iterate all shards via `read_shard_arc()`,
 ///    apply `project_csr()` per shard, scatter into a dense buffer. The
 ///    cache is populated on the first chunk and reused by every subsequent
 ///    chunk; sizing `cache_shards >= n_shards` on the `BackedCsrReader`
@@ -637,8 +644,8 @@ pub fn benjamini_hochberg(pvals: &[f64]) -> Vec<f64> {
 ///   * + O(min(cache_shards, n_shards) × decoded-shard-bytes) for the LRU
 ///       shard cache (≈ 640 MB / shard on Replogle-scale inputs)
 #[allow(clippy::too_many_arguments)]
-pub fn wilcoxon_rank_sum_streaming(
-    reader: &scx_format_io::backed::BackedCsrReader,
+pub fn wilcoxon_rank_sum_streaming<S: ShardSource>(
+    source: &S,
     gene_names: &[String],
     groups: &[usize],
     group_names: &[String],
@@ -648,7 +655,7 @@ pub fn wilcoxon_rank_sum_streaming(
     rankby_abs: bool,
     tie_correct: bool,
 ) -> Result<DiffExpResult> {
-    let n_obs = reader.n_obs();
+    let n_obs = source.n_obs();
     let n_vars = gene_names.len();
 
     if groups.len() != n_obs {
@@ -670,7 +677,7 @@ pub fn wilcoxon_rank_sum_streaming(
         "wilcoxon_rank_sum_streaming",
     )?;
 
-    let n_shards = reader.index().n_shards();
+    let n_shards = source.n_shards();
 
     // Cache-sizing footgun guard. The kernel walks every shard once per
     // gene chunk; if the LRU can't hold all `n_shards` decoded shards
@@ -679,17 +686,20 @@ pub fn wilcoxon_rank_sum_streaming(
     // strictly slower than `read_shard_uncached` (LRU bookkeeping +
     // re-decode). Warn once per call so the caller sees it without
     // spamming per-shard.
-    let cache_cap = reader.cache_capacity();
+    // `None` = a non-caching source (every `read_shard_arc` re-decodes by
+    // design); there is no cache to size, so there is nothing to warn about.
     let n_chunks = n_vars.div_ceil(gene_chunk_size);
-    if n_chunks > 1 && cache_cap < n_shards {
-        log::warn!(
-            "wilcoxon_rank_sum_streaming: cache_shards={} < n_shards={} with {} gene chunks — \
-             the cached read path will evict and re-decode every shard on each chunk. \
-             Size the BackedCsrReader cache to >= n_shards for the documented speedup.",
-            cache_cap,
-            n_shards,
-            n_chunks,
-        );
+    if let Some(cache_cap) = source.shard_cache_capacity() {
+        if n_chunks > 1 && cache_cap < n_shards {
+            log::warn!(
+                "wilcoxon_rank_sum_streaming: cache_shards={} < n_shards={} with {} gene chunks — \
+                 the cached read path will evict and re-decode every shard on each chunk. \
+                 Size the shard cache to >= n_shards for the documented speedup.",
+                cache_cap,
+                n_shards,
+                n_chunks,
+            );
+        }
     }
 
     let mut all_chunk_results = Vec::new();
@@ -712,8 +722,8 @@ pub fn wilcoxon_rank_sum_streaming(
         // auto-derefs to `&ScxCsr` for `project_csr` — no extra clone.
         let mut global_row = 0usize;
         for shard_idx in 0..n_shards {
-            let shard_csr = reader
-                .read_shard_cached_arc(shard_idx)
+            let shard_csr = source
+                .read_shard_arc(shard_idx)
                 .map_err(crate::AccelError::Scx)?;
             let _r = scx_format_io::reduction_guard();
             let projected = scx_engine::project_csr(&shard_csr, &col_indices);
@@ -1461,8 +1471,8 @@ pub fn pdex_ref_sparse(
 /// chunk through the cached shard API. Size the reader's cache to
 /// `>= n_shards` to keep the inner loop cache-resident across chunks.
 #[allow(clippy::too_many_arguments)]
-pub fn pdex_ref_streaming(
-    reader: &scx_format_io::backed::BackedCsrReader,
+pub fn pdex_ref_streaming<S: ShardSource>(
+    source: &S,
     gene_names: &[String],
     groups: &[usize],
     group_names: &[String],
@@ -1472,7 +1482,7 @@ pub fn pdex_ref_streaming(
     epsilon: f64,
     cpm_filter: Option<f64>,
 ) -> Result<PdexRefResult> {
-    let n_obs = reader.n_obs();
+    let n_obs = source.n_obs();
     let n_vars = gene_names.len();
     if groups.len() != n_obs {
         return Err(crate::AccelError::InvalidInput(format!(
@@ -1490,18 +1500,21 @@ pub fn pdex_ref_streaming(
     let gene_chunk_size =
         crate::mem_budget::de_gene_chunk_or_err(gene_chunk_size, n_obs, "pdex_ref_streaming")?;
 
-    let n_shards = reader.index().n_shards();
-    let cache_cap = reader.cache_capacity();
+    let n_shards = source.n_shards();
+    // `None` = a non-caching source (every `read_shard_arc` re-decodes by
+    // design); there is no cache to size, so there is nothing to warn about.
     let n_chunks = n_vars.div_ceil(gene_chunk_size);
-    if n_chunks > 1 && cache_cap < n_shards {
-        log::warn!(
-            "pdex_ref_streaming: cache_shards={} < n_shards={} with {} gene chunks — \
-             the cached read path will evict and re-decode every shard on each chunk. \
-             Size the BackedCsrReader cache to >= n_shards for the documented speedup.",
-            cache_cap,
-            n_shards,
-            n_chunks,
-        );
+    if let Some(cache_cap) = source.shard_cache_capacity() {
+        if n_chunks > 1 && cache_cap < n_shards {
+            log::warn!(
+                "pdex_ref_streaming: cache_shards={} < n_shards={} with {} gene chunks — \
+                 the cached read path will evict and re-decode every shard on each chunk. \
+                 Size the shard cache to >= n_shards for the documented speedup.",
+                cache_cap,
+                n_shards,
+                n_chunks,
+            );
+        }
     }
 
     let mut combined: Option<PdexRefResult> = None;
@@ -1514,8 +1527,8 @@ pub fn pdex_ref_streaming(
         let mut dense = vec![0.0f32; n_obs * chunk_size];
         let mut global_row = 0usize;
         for shard_idx in 0..n_shards {
-            let shard_csr = reader
-                .read_shard_cached_arc(shard_idx)
+            let shard_csr = source
+                .read_shard_arc(shard_idx)
                 .map_err(crate::AccelError::Scx)?;
             let _r = scx_format_io::reduction_guard();
             let projected = scx_engine::project_csr(&shard_csr, &col_indices);

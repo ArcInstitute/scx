@@ -284,6 +284,59 @@ impl ScxBackedSparseDataset {
         }
     }
 
+    /// This handle's **view** as a streaming [`ShardSource`].
+    ///
+    /// `kept_to_global` and `col_projection` are folded in, and `n_obs` /
+    /// `n_vars` report the *visible* widths — so a kernel consuming this sees
+    /// exactly the matrix `adata.X` presents, and any per-cell / per-gene array
+    /// it produces lines up with `adata.obs` / `adata.var`.
+    ///
+    /// Reach for this, never for `&*self.backed`: the raw reader is *the file*,
+    /// not *the view*. It streams every on-disk row and column, silently
+    /// ignoring both fields — which is how PCA came to attribute each cell's
+    /// embedding to the wrong cell after a `filter_cells`.
+    ///
+    /// Mirrors [`crate::lazy_transform::ScxLazyTransformedDataset::as_shard_source`],
+    /// with an empty transform chain. Multi-pass kernels (out-of-core PCA)
+    /// should chain
+    /// [`with_cached_reads`](crate::lazy_transform::LazyShardSource::with_cached_reads)
+    /// to keep serving from the reader's decoded-shard LRU.
+    ///
+    /// `col_presentation` is **not** representable here (the source emits
+    /// columns in sorted-projection order). Callers must first reject a
+    /// presentation-ordered handle via
+    /// [`crate::accel::reject_preserve_var_order`].
+    pub(crate) fn as_shard_source(&self) -> crate::lazy_transform::LazyShardSource {
+        crate::lazy_transform::LazyShardSource::new(
+            Arc::clone(&self.backed),
+            Vec::new(),
+            self.kept_to_global.clone(),
+            self.col_projection.clone(),
+            self.shape_val.0,
+            self.shape_val.1,
+        )
+    }
+
+    /// Whether this handle is a strict *window* onto the file rather than the
+    /// whole of it — i.e. some axis has been subset.
+    ///
+    /// Lets a call site keep passing the raw reader in the (overwhelmingly
+    /// common) unsubset case, where the reader and the view are the same
+    /// matrix, and reach for [`Self::as_shard_source`] only when they differ.
+    /// That matters where the concrete reader type unlocks something a
+    /// `ShardSource` cannot express — GPU DE's CSC-direct route, which takes
+    /// `GpuDeShardInput::Backed { csr, csc }`. Nothing is lost by downgrading a
+    /// *subset* handle to the generic path: any `kept_to_global` already makes
+    /// `as_column_source()` return `None`, and `csc_route_available` already
+    /// excludes a projected one.
+    ///
+    /// Only the GPU DE dispatch needs this today — the CPU kernels are all
+    /// generic over `ShardSource` and take the view unconditionally.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    pub(crate) fn has_axis_view(&self) -> bool {
+        self.kept_to_global.is_some() || self.col_projection.is_some()
+    }
+
     /// A second handle onto the same file, same window. O(1) — every heavy
     /// field is behind an `Arc`.
     pub(crate) fn clone_handle(&self) -> Self {

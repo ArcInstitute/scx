@@ -87,7 +87,7 @@ pub use pseudobulk::{
 };
 #[cfg(feature = "gpu")]
 pub use pseudobulk::{
-    pseudobulk_means_gpu_backed, pseudobulk_means_gpu_dense, pseudobulk_means_gpu_from_slices,
+    pseudobulk_means_gpu_dense, pseudobulk_means_gpu_from_slices, pseudobulk_means_gpu_streaming,
 };
 #[cfg(feature = "gpu")]
 pub use route::plan_de_route_from_source;
