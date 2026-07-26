@@ -1877,6 +1877,7 @@ fn assert_prefetch_engages(backed: &BackedCsrReader) {
         "SCX_ACCEL_PREFETCH_DEPTH<=1 in this process — the prefetch path is \
          disabled and the bit-identity assertions below are vacuous"
     );
+    #[cfg(feature = "parallel")]
     assert!(
         rayon::current_num_threads() > 1,
         "single-thread rayon pool — the prefetch path is disabled and the \

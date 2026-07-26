@@ -78,6 +78,10 @@ Two constraints on callers:
 - **Peak memory scales with `depth`** (default 4) — that many decoded shards can
   be live at once, versus one for the sequential loop. New shards are spawned
   only as one drains, so the bound holds even under a head-of-line stall.
+  The bound is **per invocation**, not per process: the depth is a global
+  `OnceLock`, so *N* concurrent callers hold up to *N* × `depth` decoded shards.
+  That is reachable from Python — `pyscx.accel.col_*` release the GIL — and
+  nothing caps the aggregate.
 
 Without the `parallel` feature the front-ends still exist and fall back to a
 plain sequential loop, so no call site needs a `cfg`.

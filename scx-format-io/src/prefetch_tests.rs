@@ -161,6 +161,12 @@ impl ShardSource for StallHeadSource {
 /// Regression for the Cursor review: under a head-of-line stall the reorder
 /// buffer (decoded-but-unconsumed shards) must stay bounded by `depth`. With the
 /// old spawn-on-receive this grew to ~n_shards; spawn-on-consume caps it.
+///
+/// `parallel`-only, and not merely because of the `rayon` reference: without
+/// the pipeline the sequential loop reads shard 0 first, and `StallHeadSource`
+/// spins shard 0 until `depth - 1` *others* have decoded — which never happens.
+/// The test would hang, not fail.
+#[cfg(feature = "parallel")]
 #[test]
 fn head_stall_keeps_reorder_buffer_bounded_by_depth() {
     // Skip on a single-thread pool (the prefetch path isn't taken there).
@@ -192,6 +198,10 @@ fn head_stall_keeps_reorder_buffer_bounded_by_depth() {
     );
 }
 
+/// `parallel`-only: `catch_unwind` exists only on the prefetched path, so
+/// without it an injected decode panic propagates as a panic rather than the
+/// delivered `Err` this asserts.
+#[cfg(feature = "parallel")]
 #[test]
 fn worker_panic_becomes_error_not_hang() {
     let mut src = make_shards(32, 4);

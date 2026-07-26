@@ -17,8 +17,13 @@ milliseconds misleading on their own:
 
 * It is a **sum over concurrent workers**, so with prefetch on it can exceed
   wall-clock. Compare the ratio against wall, not the absolute.
-* The GPU-side buckets (HTOD, compute) are what should *not* move. If they do,
-  something other than host decode changed.
+* **The `htod` bucket is not the device copy.** `gpu_shard_source.rs` records it
+  around `PinnedCsrSlot::stage()` — a *host* memcpy into the pinned buffer —
+  and the asynchronous `upload_to` happens after the timer closes. It is a
+  useful invariant (a single-threaded host memcpy on the consuming thread
+  should not change when only decode widens) but it is **not** evidence about
+  anything device-side. For that, read the diff: the pinned ring, the
+  `pinned_events` host gate and both device event gates are untouched.
 
 Run under `sbatch` on a GPU node, in the `scx-bench-gpu` conda env::
 
@@ -131,9 +136,12 @@ def main() -> int:
                 snaps.append(_flat(pyscx.accel.gpu_profile_snapshot()))
             if not walls:
                 continue
-            walls.sort()
-            median = walls[len(walls) // 2]
-            snap = snaps[len(walls) // 2]
+            # Sort (wall, snapshot) *together*. Sorting `walls` alone and then
+            # indexing `snaps` at the same position pairs the median wall with
+            # whichever run happened to sit there originally, which silently
+            # turns every derived ratio below into a cross-run mix.
+            paired = sorted(zip(walls, snaps), key=lambda t: t[0])
+            median, snap = paired[len(paired) // 2]
             hd = snap["host_decode_scx1_ms"] + snap["host_decode_generic_ms"]
             htod = snap["htod_scx1_ms"] + snap["htod_generic_ms"]
             row = {
@@ -161,8 +169,16 @@ def main() -> int:
     if not rows:
         print("NOTE: nothing captured — no dataset produced a usable run")
         return 1
-    if not rows[0] and not any(r["host_decode_ms"] for r in rows):
-        print("NOTE: set SCX_GPU_PROFILE=1 to populate the gpu_profile buckets")
+    # Fail loud rather than emit an all-zero table that is indistinguishable
+    # from a real result after hours of H100 time. The previous spelling,
+    # `if not rows[0] and ...`, tested a non-empty dict and was always False.
+    if not any(r["host_decode_ms"] for r in rows):
+        print(
+            "ERROR: every host-decode bucket is zero — the profiler was not "
+            "enabled. Re-run with SCX_GPU_PROFILE=1; the table above measures "
+            "nothing."
+        )
+        return 1
     return 0
 
 

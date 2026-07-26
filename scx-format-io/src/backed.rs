@@ -1978,8 +1978,16 @@ impl BackedCsrReader {
     // --- Native shard-by-shard aggregation ---
     //
     // These methods compute statistics without materializing the full
-    // concatenated CSR. Peak memory = one decoded shard at a time
-    // (plus the output vector).
+    // concatenated CSR. Peak memory is `SCX_ACCEL_PREFETCH_DEPTH` decoded
+    // shards (default 4) plus the output vector — the ordered decode-prefetch
+    // pipeline keeps that many in flight so decode overlaps the reduction.
+    // It was one shard before Phase 4.2, and still is whenever the pipeline
+    // declines to engage (depth 1, a single shard, a one-thread rayon pool, or
+    // a caller that is itself a rayon worker).
+    //
+    // The bound is **per call**, and the depth knob is process-global: N
+    // concurrent callers hold N x depth shards. `pyscx.accel.col_*` release the
+    // GIL, so that is reachable from Python threads.
 
     /// Compute per-row sums without materializing the full matrix.
     ///

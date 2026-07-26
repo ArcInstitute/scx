@@ -544,8 +544,7 @@ exact per-shard `nnz` in `ShardEntryLite` is the derating lever if it ever needs
 
 **Measured before/after** (SLURM job 2708500, `cpu` partition, one host, 24 cores,
 `RAYON_NUM_THREADS=24`, `--release`, **one build** with `SCX_ACCEL_PREFETCH_DEPTH=1` vs
-the default 4, `off` arm first so `on` cannot ride a warmer page cache, 3 runs, median
-wall):
+the default 4, 3 runs, median wall):
 
 | Dataset | shards | `qc` | `filter_genes` | `filter_genes_real` | `filter_cells` | `normalize` |
 |---|--:|--:|--:|--:|--:|--:|
@@ -554,6 +553,11 @@ wall):
 | tabula_sapiens_100k | 14 | **2.13×** | **2.00×** | **2.13×** | **2.18×** | 1.24× |
 | census_500k | 62 | **2.09×** | 1.86× | 1.80× | 1.78× | 1.16× |
 | census_1m | 124 | **2.70×** | **2.30×** | **2.35×** | **2.29×** | 1.35× |
+
+Arm order is `off` then `on`, which if anything warms the page cache *for* the `on` arm —
+the opposite of a safeguard. What actually controls for it is
+`profile_cpu_stages_backed.py`'s per-(op, dataset) warm-up run, which precedes the timed
+runs in both arms.
 
 `qc` at census_1m goes 33.2 s → 12.3 s. The profiler shows why: the decode bucket is
 26.1 s sequential and 28.7 s prefetched — **the same work, ~10 % concurrency overhead** —
@@ -589,9 +593,19 @@ Raw JSON under the job's `raw-off` / `raw-on` directories; `results/raw/` is git
 the numbers above cite the job and the two arms rather than a checked-in artifact, as 4.0b
 and 4.1 do.
 
-**GPU staging — the largest win in the task** (SLURM job 2708827, H100,
-`benchmarks/scripts/profile_gpu_staging.py`, depth 1 vs 4, 3 runs, median wall). The CPU
-table above does not cover this path; it has its own capture:
+**GPU staging.** (SLURM job 2708827, H100, `benchmarks/scripts/profile_gpu_staging.py`,
+3 runs, median wall, `SCX_DISABLE_CUDA_GRAPHS=1`.) The CPU table above does not cover this
+path; it has its own capture.
+
+> [!IMPORTANT]
+> **This is a depth-1 → depth-4 comparison inside 4.2, not a `main` → branch one, and the
+> two are not the same thing.** At `depth = 1` the pipeline declines to engage and staging
+> decodes fully sequentially with **zero** decode threads. `main` always spawned a
+> one-ahead `std::thread` + `sync_channel(1)` for multi-shard input, with no depth guard —
+> so the depth-1 arm is *slower than `main`*, and the ratios below overstate the
+> `main` → branch gain by however much that one-ahead overlap was worth. **The
+> `main` → branch speedup is currently unmeasured.** Treat the table as "what the depth
+> knob buys", which is also the actionable form for tuning.
 
 | Op | Dataset | depth 1 | depth 4 | Speedup | host-decode Σ/wall | HTOD |
 |---|---|--:|--:|--:|--:|--:|
@@ -601,14 +615,20 @@ table above does not cover this path; it has its own capture:
 | DE | tabula_sapiens_100k | 297 997.9 ms | 115 091.8 ms | **2.59×** | 81.3 % → 213.2 % | 17 618 → 17 340 ms |
 | DE | census_500k | 1 152 722.4 ms | 384 089.9 ms | **3.00×** | 80.5 % → 246.2 % | 64 479 → 61 637 ms |
 
-§9.12's diagnosis was exactly right, and the sequential arm quantifies it: one decode
-thread feeding an H100 leaves GPU DE **80–81 % host-decode-bound** and GPU HVG 52–71 %.
-Widening it takes census_500k DE from 19 minutes to 6.4.
+§9.12's diagnosis holds: with staging decoding serially, GPU DE is **80–81 %
+host-decode-bound** and GPU HVG 52–71 %, so the host side is the whole ceiling. Widening it
+takes census_500k DE from 19 minutes to 6.4. (Those percentages describe the depth-1 arm,
+which as noted above has no decode thread at all — `main`, with its one-ahead thread, sat
+somewhere below them.)
 
-**HTOD is the control and it does not move** (within ±4 % on every row). Only the host side
-changed, which is what makes the wall reduction attributable to the decode widening rather
-than to anything device-side. Host-decode Σ/wall exceeding 100 % is the pipeline working:
-it sums concurrent workers.
+**Nothing device-side changed, but the `htod` column is not the evidence for that.** The
+bucket is recorded around `PinnedCsrSlot::stage()` — a host memcpy into the pinned buffer —
+and the asynchronous `upload_to` runs after the timer closes, so its flatness (±4.4 % here)
+says a single-threaded host memcpy did not change, which it could hardly do. The real
+argument is structural and checkable from the diff: the pinned 2-slot ring, the host-side
+`pinned_events` gate and both device event gates are untouched, because the pipeline
+already delivers to the calling thread in shard order. Host-decode Σ/wall exceeding 100 %
+is the pipeline working: it sums concurrent workers.
 
 **Peak RSS rises consistently here, by +651 to +814 MB (+19 % to +46 %).** That is the same
 `(depth − 1)` decoded-shards model as the CPU side, and unlike the CPU case it is plainly
@@ -664,8 +684,13 @@ is lower allocation counts and one shared thread-control knob, with no regressio
 
 ### Marshalling & GIL hygiene at the Python boundary (Phase-4 task 4.3)
 
-2.4 converted the 2-D result writers; 4.3 finishes the job for the 1-D ones and fixes a
-concurrency defect next door. Both halves are **output-neutral** and carry no `×` claim.
+2.4 converted the 2-D result writers; 4.3 converts the 1-D ones on the `uns` / `obsp`
+result paths and fixes a concurrency defect next door. It is **not** exhaustive: the DE
+DataFrame builders (`de.rs`'s `rank_genes_groups_df` path and three siblings) still push
+`n_groups × n_genes` f64 columns through Python lists, some of them larger than sites that
+were converted. They were left because they feed pandas/polars constructors rather than a
+numpy array, so the conversion is a different shape — and, per the measurement below, not
+one worth reaching for on performance grounds. Both halves are **output-neutral** and carry no `×` claim.
 
 - **Flat buffers for every remaining `numpy.array(<Rust Vec>)`.** That spelling cloned
   the Rust buffer, had pyo3 build a Python `list` (one `PyLong`/`PyFloat` per element),

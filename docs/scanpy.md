@@ -2849,7 +2849,7 @@ it. Other `SCX_ACCEL_*` knobs (`SCX_ACCEL_PREFETCH_DEPTH`,
 [performance.md](performance.md). `SCX_ACCEL_PREFETCH_DEPTH` bounds the
 decode-prefetch pipeline, which since Phase 4.2 also covers the backed
 aggregation kernels (QC, filtering, `col_*`, `normalize_total`'s row sums), their
-column-projected and lazy/transformed twins, and GPU staging — so raising it
+column-projected **CSR** and lazy/transformed twins, and GPU staging — so raising it
 raises peak memory (`depth` decoded shards in flight) across all of those, not
 just HVG.
 

@@ -132,6 +132,21 @@ adr = adr[row_keep.tolist(), :]
 rec("masked_col_sums", pyscx.accel.col_sums(adr.X))
 rec("masked_col_var", pyscx.accel.col_var(adr.X))
 
+# --- backed + BOTH axes: the *_masked_projected kernels ---
+# Neither single-axis block above reaches them. `col_aggs`' (Some(cols),
+# Some(kept)) arm is the only route to col_sums_masked_projected and friends,
+# and a row subset alone lands on the scx-format-io kernel instead. Without
+# this, a dropped `global_row` cursor in e.g. row_nnz_and_sums_projected would
+# leave the suite green.
+adb = pyscx.open(path).to_anndata(backed=True)
+adb = adb[row_keep.tolist(), :][:, col_keep.tolist()]
+rec("both_col_sums", pyscx.accel.col_sums(adb.X))
+rec("both_col_nnz", pyscx.accel.col_nnz(adb.X))
+rec("both_col_var", pyscx.accel.col_var(adb.X))
+rec("both_col_max", pyscx.accel.col_max(adb.X))
+rec("both_row_sums", adb.X.sum(axis=1))
+rec("both_row_nnz", adb.X.getnnz(axis=1))
+
 # --- lazy/transformed: lazy_transform/dataset.rs ---
 adl = pyscx.open(path).to_anndata(backed=True)
 pyscx.accel.normalize_total(adl, target_sum=1e4)
