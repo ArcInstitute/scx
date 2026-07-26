@@ -184,6 +184,22 @@ def _stride_mask(n_vars: int, keep: int):
     return mask
 
 
+def _assign_qc_masks(adata) -> None:
+    """Attach three deterministic gene subsets as boolean `var` columns.
+
+    Real MT/ribo/hb prefixes are absent from several fixtures (Census var_names
+    are integer strings), so select by position instead — the accumulator cost
+    depends on subset *size*, not on which genes are in it.
+    """
+    import numpy as np
+
+    n_vars = adata.n_vars
+    idx = np.arange(n_vars)
+    # ~1% / ~5% / ~0.5% of genes, echoing typical MT / ribo / hb fractions.
+    for name, stride in zip(QC_VARS, (100, 20, 200)):
+        adata.var[name] = (idx % stride) == 0
+
+
 def _snapshot_flat() -> dict[str, float]:
     import pyscx
 
