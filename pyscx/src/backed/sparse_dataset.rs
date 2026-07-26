@@ -190,6 +190,24 @@ impl ScxBackedSparseDataset {
         Some(backed_csc.as_ref() as &dyn scx_format_io::ColumnShardSource)
     }
 
+    /// [`Self::as_column_source`] as an **owned** handle, under the identical
+    /// gate.
+    ///
+    /// The borrowed form is tied to the `PyRef` it came from, so it cannot
+    /// cross a `py.detach(...)` boundary. Callers that release the GIL for the
+    /// streaming scan — `pyscx.accel.col_*` with `prefer_format="csc"` — take
+    /// this instead and get an `Arc` they can move into the detached closure.
+    ///
+    /// Keep the two gates in step: an `Arc` handed out here bypasses nothing,
+    /// but if the deletion-vector condition above ever grows a clause, this
+    /// must grow it too.
+    pub(crate) fn as_column_source_owned(&self) -> Option<Arc<BackedCscReader>> {
+        if self.kept_to_global.is_some() {
+            return None;
+        }
+        self.backed_csc.as_ref().map(Arc::clone)
+    }
+
     /// Set column projection on this dataset.
     /// `col_indices` are the original column indices to retain (will be sorted internally).
     /// Shape is adjusted: n_vars becomes col_indices.len().

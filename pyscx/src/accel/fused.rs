@@ -585,7 +585,7 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
 
     write_pca_to_adata(py, adata, &pca_res, "scx-gpu-cusparse", None)?;
-    super::neighbors::write_neighbors_to_adata(py, adata, &knn_res, n_neighbors, use_rep, "cagra")?;
+    super::neighbors::write_neighbors_to_adata(py, adata, knn_res, n_neighbors, use_rep, "cagra")?;
     // Stamp the device-resident route on pca / neighbors / pca_neighbors,
     // carrying the Task 2.5 metadata (finding 5): `graph_replay` from the PCA
     // result and the math-mode / SpMM-policy knobs (the randomized path consumes

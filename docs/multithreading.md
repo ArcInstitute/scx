@@ -48,6 +48,44 @@ Downstream crates that depend on `scx-format-io` with `default-features = true`
 back to sequential decode, which is useful for single-shard use cases or when
 keeping `scx-format-io` lightweight.
 
+#### Bounded ordered decode-prefetch (`scx_format_io::prefetch`)
+
+`read_all_csr_shards()` above decodes shards concurrently and returns the whole
+matrix. The *streaming* kernels cannot do that — they visit one shard at a time
+precisely so peak memory stays at one shard — so they use a different shape:
+`for_each_shard_ordered{,_uncached}` decodes up to `depth` shards concurrently
+on the rayon pool while invoking the consumer **on the calling thread in strict
+shard order**. Decode overlaps reduction and runs across shards; the reduction
+still sees the exact sequential accumulation order, so results stay
+bit-identical.
+
+It lives here (rather than in `scx-accel`, where Phase 2.1 wrote it) because
+`scx-format-io`'s own backed aggregations and `scx-gpu`'s staging pipeline are
+two of its three consumers and both sit below `scx-accel` in the crate graph.
+`scx_accel::prefetch` re-exports the whole surface, so accelerator call sites
+and the `SCX_ACCEL_PREFETCH_DEPTH` / `SCX_ACCEL_REDUCTION_MODE` knobs are
+unchanged — those knobs now also govern the backed aggregation kernels
+(`row_sums`, `col_sums`, `col_var`, the QC/filter passes, …), pyscx's
+column-projected and lazy/transformed twins, and GPU staging.
+
+Two constraints on callers:
+
+- **Not from inside a rayon parallel region.** The drain blocks the calling
+  thread on the channel while decode tasks run on other pool workers; a
+  saturated pool worker calling in would deadlock. The primitive detects a
+  worker-thread caller (`rayon::current_thread_index().is_some()`) and decodes
+  sequentially instead, but "top-level only" is the contract.
+- **Peak memory scales with `depth`** (default 4) — that many decoded shards can
+  be live at once, versus one for the sequential loop. New shards are spawned
+  only as one drains, so the bound holds even under a head-of-line stall.
+  The bound is **per invocation**, not per process: the depth is a global
+  `OnceLock`, so *N* concurrent callers hold up to *N* × `depth` decoded shards.
+  That is reachable from Python — `pyscx.accel.col_*` release the GIL — and
+  nothing caps the aggregate.
+
+Without the `parallel` feature the front-ends still exist and fall back to a
+plain sequential loop, so no call site needs a `cfg`.
+
 ### scx-engine (always parallel)
 
 The query engine decodes candidate shards in parallel via
@@ -346,6 +384,22 @@ The `scx-gpu` crate launches CUDA kernels with hundreds of GPU threads:
 
 This is GPU parallelism rather than CPU multithreading — the CPU side launches
 kernels and manages memory transfers.
+
+### Host-side staging (`GpuShardSource`)
+
+Feeding those kernels is a host-side pipeline, and it used to be the bottleneck:
+a single scoped `std::thread` decoded shard *i+1* through a `sync_channel(1)`
+while the main thread staged and uploaded shard *i*. One CPU decode thread
+feeding an H100 makes every GPU streaming op host-decode-bound.
+
+It now uses the shared [bounded ordered decode-prefetch](#bounded-ordered-decode-prefetch-scx_format_ioprefetch)
+above, so `depth` shards decode concurrently while consumption stays on the
+calling thread in shard order — which is exactly what the pinned 2-slot ring and
+the copy/compute event handshake already assumed, so none of that device-side
+machinery changed. Decode time is attributed through a `ProfiledDecode` adapter
+on the source; as on the CPU side, the reported total sums concurrent workers
+and can exceed wall-clock, so read it as a ratio against wall rather than an
+absolute.
 
 ## Thread safety of key types
 

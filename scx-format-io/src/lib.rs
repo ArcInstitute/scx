@@ -24,6 +24,7 @@ pub mod deletion_vectors;
 pub mod distinct;
 pub mod encoder;
 pub mod mem;
+pub mod prefetch;
 pub mod profile;
 pub mod reader;
 pub mod shard_decode;
@@ -53,6 +54,11 @@ pub use encoder::{
     encode_shard_framed, FramingConfig, DEFAULT_ROW_GROUP_ROWS,
 };
 pub use mem::MemoryBudget;
+pub use prefetch::{
+    accumulate_shards, clamp_prefetch_depth, for_each_csc_shard_ordered, for_each_shard_ordered,
+    for_each_shard_ordered_uncached, prefetch_depth, reduce_shards_budgeted, reduction_mode,
+    PrefetchError, ReductionMode, DEFAULT_PREFETCH_DEPTH,
+};
 pub use profile::{
     record_decode_since, record_io_since, record_marshalling_since, record_reduction_since,
     reduction_guard, CodecClass, CpuProfileSnapshot, ReductionGuard, StageStat,

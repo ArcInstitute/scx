@@ -1,5 +1,6 @@
 //! kNN graph construction — HNSW (CPU) + cuVS CAGRA (GPU).
 
+use numpy::PyArray1;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -151,28 +152,55 @@ pub fn neighbors(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     // Write results to AnnData
-    write_neighbors_to_adata(py, adata, &result, n_neighbors, use_rep, "hnsw")?;
+    write_neighbors_to_adata(py, adata, result, n_neighbors, use_rep, "hnsw")?;
 
     Ok(())
 }
 
 /// Write kNN results to AnnData slots matching scanpy's format.
+///
+/// Takes `result` **by value** so the six CSR buffers can be handed to numpy
+/// with [`PyArray1::from_vec`], which moves them. The pre-4.3 spelling —
+/// `numpy.array(vec.clone())` — cloned the Rust buffer, then pyo3 converted the
+/// `Vec` into a Python `list` (one `PyLong`/`PyFloat` object per element), then
+/// numpy re-parsed that list. At 1M cells × k=15 that is tens of millions of
+/// transient Python objects per call, on a path shared by CPU kNN, GPU kNN,
+/// `pca_neighbors` and `pca_neighbors_umap`.
+///
+/// Output is unchanged. The intermediate dtypes differ — `np.array(list[int])`
+/// is int64 regardless of the Rust width, whereas `from_vec` preserves i64/i32 —
+/// but `scipy.sparse.csr_matrix` re-derives the index dtype through
+/// `get_index_dtype(..., check_contents=True)`, so the matrices it builds are
+/// identical either way. `test_marshalling_dtypes.py` asserts that rather than
+/// assuming it.
 pub(crate) fn write_neighbors_to_adata(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
-    result: &scx_accel::KnnResult,
+    result: scx_accel::KnnResult,
     n_neighbors: usize,
     use_rep: &str,
     method: &str,
 ) -> PyResult<()> {
+    let t_marshal = scx_accel::cpu_profile::start();
     let scipy_sparse = py.import("scipy.sparse")?;
-    let numpy = py.import("numpy")?;
     let n_obs = result.n_obs;
+    let scx_accel::KnnResult {
+        conn_indptr,
+        conn_indices,
+        conn_data,
+        dist_indptr,
+        dist_indices,
+        dist_data,
+        ..
+    } = result;
+    let marshalled_bytes = (conn_indptr.len() + dist_indptr.len()) * 8
+        + (conn_indices.len() + dist_indices.len()) * 4
+        + (conn_data.len() + dist_data.len()) * 8;
 
     // Build distance CSR matrix (n_obs × n_obs)
-    let dist_indptr = numpy.call_method1("array", (result.dist_indptr.clone(),))?;
-    let dist_indices = numpy.call_method1("array", (result.dist_indices.clone(),))?;
-    let dist_data = numpy.call_method1("array", (result.dist_data.clone(),))?;
+    let dist_indptr = PyArray1::from_vec(py, dist_indptr);
+    let dist_indices = PyArray1::from_vec(py, dist_indices);
+    let dist_data = PyArray1::from_vec(py, dist_data);
     let dist_shape = (n_obs, n_obs);
     let distances_csr = scipy_sparse.call_method1(
         "csr_matrix",
@@ -180,14 +208,15 @@ pub(crate) fn write_neighbors_to_adata(
     )?;
 
     // Build connectivities CSR matrix (n_obs × n_obs)
-    let conn_indptr = numpy.call_method1("array", (result.conn_indptr.clone(),))?;
-    let conn_indices = numpy.call_method1("array", (result.conn_indices.clone(),))?;
-    let conn_data = numpy.call_method1("array", (result.conn_data.clone(),))?;
+    let conn_indptr = PyArray1::from_vec(py, conn_indptr);
+    let conn_indices = PyArray1::from_vec(py, conn_indices);
+    let conn_data = PyArray1::from_vec(py, conn_data);
     let conn_shape = (n_obs, n_obs);
     let connectivities_csr = scipy_sparse.call_method1(
         "csr_matrix",
         ((&conn_data, &conn_indices, &conn_indptr), conn_shape),
     )?;
+    scx_accel::cpu_profile::record_marshalling_since(t_marshal, marshalled_bytes);
 
     // Write to adata.obsp
     let obsp = adata.getattr("obsp")?;

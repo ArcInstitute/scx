@@ -5,6 +5,7 @@
 //! white-box `super::*` access.
 
 use super::*;
+use crate::error::Result;
 use scx_sparse::{ScxCsc, ScxCsr};
 
 /// In-memory `ShardSource` that can be told to panic while decoding a chosen
@@ -37,7 +38,7 @@ impl ShardSource for StubSource {
     fn n_vars(&self) -> usize {
         self.n_vars
     }
-    fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
+    fn read_shard(&self, shard_idx: usize) -> Result<ScxCsr> {
         if Some(shard_idx) == self.panic_on {
             panic!("injected decode panic at shard {shard_idx}");
         }
@@ -58,10 +59,36 @@ fn make_shards(n: usize, n_vars: usize) -> StubSource {
 }
 
 #[test]
+fn prefetch_depth_clamps_to_budget() {
+    // 10 shards × 100 B = 1000 B budget → at most 10 in flight.
+    assert_eq!(clamp_prefetch_depth(4, 100, 1000), 4);
+    // budget only fits 2 shards → clamp 8 → 2.
+    assert_eq!(clamp_prefetch_depth(8, 100, 200), 2);
+    // never below 1 even when a single shard exceeds the budget.
+    assert_eq!(clamp_prefetch_depth(8, 10_000, 100), 1);
+}
+
+/// The `S: ?Sized` bound exists so `scx-gpu`'s staging sources — which hold
+/// their input as `&'a (dyn ShardSource + Sync)` — can pass it straight in.
+/// Without `?Sized` this does not compile, so the test is the guard.
+#[test]
+fn accepts_an_unsized_dyn_source() {
+    let owned = make_shards(16, 4);
+    let src: &(dyn ShardSource + Sync) = &owned;
+    let mut seen = Vec::new();
+    for_each_shard_ordered_uncached(src, 8, |idx, _csr| -> Result<()> {
+        seen.push(idx);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, (0..16).collect::<Vec<_>>());
+}
+
+#[test]
 fn ordered_delivery_is_in_shard_order() {
     let src = make_shards(64, 8);
     let mut seen = Vec::new();
-    for_each_shard_ordered(&src, 8, |idx, _csr| {
+    for_each_shard_ordered(&src, 8, |idx, _csr| -> Result<()> {
         seen.push(idx);
         Ok(())
     })
@@ -73,7 +100,7 @@ fn ordered_delivery_is_in_shard_order() {
 fn depth_one_uses_sequential_fallback() {
     let src = make_shards(16, 4);
     let mut seen = Vec::new();
-    for_each_shard_ordered(&src, 1, |idx, _csr| {
+    for_each_shard_ordered(&src, 1, |idx, _csr| -> Result<()> {
         seen.push(idx);
         Ok(())
     })
@@ -85,7 +112,7 @@ fn depth_one_uses_sequential_fallback() {
 fn empty_source_is_noop() {
     let src = StubSource::new(vec![], 0, 4);
     let mut count = 0usize;
-    for_each_shard_ordered(&src, 8, |_idx, _csr| {
+    for_each_shard_ordered(&src, 8, |_idx, _csr| -> Result<()> {
         count += 1;
         Ok(())
     })
@@ -113,7 +140,7 @@ impl ShardSource for StallHeadSource {
     fn n_vars(&self) -> usize {
         self.n_vars
     }
-    fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
+    fn read_shard(&self, shard_idx: usize) -> Result<ScxCsr> {
         use std::sync::atomic::Ordering;
         if shard_idx == 0 {
             while self.others_done.load(Ordering::Acquire) < self.stall_head_until {
@@ -134,6 +161,12 @@ impl ShardSource for StallHeadSource {
 /// Regression for the Cursor review: under a head-of-line stall the reorder
 /// buffer (decoded-but-unconsumed shards) must stay bounded by `depth`. With the
 /// old spawn-on-receive this grew to ~n_shards; spawn-on-consume caps it.
+///
+/// `parallel`-only, and not merely because of the `rayon` reference: without
+/// the pipeline the sequential loop reads shard 0 first, and `StallHeadSource`
+/// spins shard 0 until `depth - 1` *others* have decoded — which never happens.
+/// The test would hang, not fail.
+#[cfg(feature = "parallel")]
 #[test]
 fn head_stall_keeps_reorder_buffer_bounded_by_depth() {
     // Skip on a single-thread pool (the prefetch path isn't taken there).
@@ -151,7 +184,7 @@ fn head_stall_keeps_reorder_buffer_bounded_by_depth() {
     };
     MAX_REORDER_BUFFER.with(|m| m.set(0));
     let mut seen = Vec::new();
-    for_each_shard_ordered(&src, depth, |idx, _csr| {
+    for_each_shard_ordered(&src, depth, |idx, _csr| -> Result<()> {
         seen.push(idx);
         Ok(())
     })
@@ -165,11 +198,15 @@ fn head_stall_keeps_reorder_buffer_bounded_by_depth() {
     );
 }
 
+/// `parallel`-only: `catch_unwind` exists only on the prefetched path, so
+/// without it an injected decode panic propagates as a panic rather than the
+/// delivered `Err` this asserts.
+#[cfg(feature = "parallel")]
 #[test]
 fn worker_panic_becomes_error_not_hang() {
     let mut src = make_shards(32, 4);
     src.panic_on = Some(7);
-    let err = for_each_shard_ordered(&src, 8, |_idx, _csr| Ok(())).unwrap_err();
+    let err = for_each_shard_ordered(&src, 8, |_idx, _csr| -> Result<()> { Ok(()) }).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("panicked") && msg.contains("shard 7"),
@@ -181,10 +218,10 @@ fn worker_panic_becomes_error_not_hang() {
 fn consumer_error_propagates_and_stops() {
     let src = make_shards(32, 4);
     let mut n_consumed = 0usize;
-    let err = for_each_shard_ordered(&src, 8, |idx, _csr| {
+    let err = for_each_shard_ordered(&src, 8, |idx, _csr| -> Result<()> {
         n_consumed += 1;
         if idx == 5 {
-            return Err(AccelError::InvalidInput("stop here".into()));
+            return Err(ScxError::prefetch_internal("stop here".into()));
         }
         Ok(())
     })
@@ -217,7 +254,7 @@ fn ordered_accumulation_is_bit_identical_to_sequential() {
     // Prefetched ordered accumulation.
     let mut pf_sum = vec![0.0f64; n_vars];
     let mut pf_sq = vec![0.0f64; n_vars];
-    for_each_shard_ordered(&src, 8, |_idx, csr| {
+    for_each_shard_ordered(&src, 8, |_idx, csr| -> Result<()> {
         for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
             let c = col as usize;
             let v = val as f64;
@@ -261,7 +298,7 @@ fn budgeted_reduction_matches_sequential_within_tolerance() {
         &src,
         4,
         || vec![0.0f64; n_vars],
-        |acc: &mut Vec<f64>, _idx, csr| {
+        |acc: &mut Vec<f64>, _idx, csr| -> Result<()> {
             for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
                 acc[col as usize] += val as f64;
             }
@@ -303,10 +340,10 @@ impl ColumnShardSource for StubCscSource {
     fn n_vars(&self) -> usize {
         self.n_vars
     }
-    fn read_csc_shard(&self, idx: usize) -> scx_format_io::Result<ScxCsc> {
+    fn read_csc_shard(&self, idx: usize) -> Result<ScxCsc> {
         Ok(self.shards[idx].clone())
     }
-    fn read_csc_columns(&self, _r: std::ops::Range<u32>) -> scx_format_io::Result<ScxCsc> {
+    fn read_csc_columns(&self, _r: std::ops::Range<u32>) -> Result<ScxCsc> {
         unreachable!("prefetch does not call read_csc_columns")
     }
     fn csc_shard_col_range(&self, idx: usize) -> Option<(u32, u32)> {
@@ -326,7 +363,7 @@ fn csc_ordered_delivery_is_in_shard_order() {
         n_vars: 16,
     };
     let mut seen = Vec::new();
-    for_each_csc_shard_ordered(&src, 8, |idx, _csc| {
+    for_each_csc_shard_ordered(&src, 8, |idx, _csc| -> Result<()> {
         seen.push(idx);
         Ok(())
     })
@@ -352,7 +389,7 @@ fn accumulate_shards_default_matches_sequential() {
         &src,
         4,
         || vec![0.0f64; n_vars],
-        |acc: &mut Vec<f64>, _idx, csr| {
+        |acc: &mut Vec<f64>, _idx, csr| -> Result<()> {
             for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
                 acc[col as usize] += val as f64;
             }

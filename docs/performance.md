@@ -481,7 +481,9 @@ vs default depth 4), backed-streaming wall-clock (median of runs):
 
 **HVG — the fully-prefetched kernel — is ~2.3× faster at every multi-shard scale**, the
 first measured Phase-2 win. In the profiler the `decode` bucket now *exceeds* wall
-(Σ/wall 220–275 %) because it sums each worker's decode time and those run concurrently;
+(**Σ/wall** — the profiler's summed per-shard decode time divided by wall-clock, so 100 %
+means "decode accounted for the entire run" and anything above it means decode threads
+overlapped — 220–275 %) because it sums each worker's decode time and those run concurrently;
 the wall drop is the real gain. `normalize_total` (a pyscx lazy-transform path, not one of
 the wired `scx-accel` streaming kernels) and `pca` (streaming decode-prefetch deferred —
 see above) are flat by construction, confirming the change is scoped to the kernels it
@@ -496,6 +498,154 @@ nested-pool interaction that needs its own measurement; PCA is decode-bound only
 need a `+ Sync` dyn boundary change through the pyscx capability-detection layer). The
 `for_each_csc_shard_ordered` sibling primitive ships and is tested, ready for that
 follow-up.
+
+### Decode-prefetch beyond `scx-accel` (Phase-4 task 4.2)
+
+2.1 applied the pipeline only to the `scx-accel` streaming kernels, because it *lived*
+in `scx-accel` — above two of its three natural consumers. `scx-format-io` and `scx-gpu`
+sit below that crate in the dependency graph, so neither could reach it, and both still
+decoded one shard at a time on the consuming thread. Task 4.2 moved the module to
+`scx-format-io` (where the `ShardSource` / `ColumnShardSource` traits it is generic over
+are already defined) and wired up the loops that could not previously see it:
+
+| Consumer | What now prefetches |
+|---|---|
+| `scx-format-io/src/backed.rs` | the 15 aggregation kernels behind QC, filtering, `col_*` and `normalize_total`'s row sums |
+| `pyscx/src/projected_agg.rs` | the 17 column-projected CSR twins |
+| `pyscx/src/lazy_transform/dataset.rs` | the 8 `streaming_*` lazy/transformed kernels |
+| `scx-gpu/src/gpu_shard_source.rs` | GPU staging — replaces a single scoped decode thread + `sync_channel(1)` |
+
+`scx_accel::prefetch` re-exports the surface with the error type pinned to `AccelError`,
+so the eight 2.1 call sites and both `SCX_ACCEL_*` knobs above are unchanged; the knobs
+now govern these loops too, including GPU staging.
+
+**Bit-identity is tested, not asserted.** `scx-format-io`'s
+`prefetched_aggregations_are_bit_identical_to_a_sequential_loop` compares every touched
+aggregation against a hand-written sequential reference on f64 bit patterns, and
+`pyscx/tests/test_prefetch_equivalence.py` compares 19 arrays across the three **CPU**
+consumers — backed, projected and lazy — between two subprocesses at
+`SCX_ACCEL_PREFETCH_DEPTH=1` and the default (the depth is a process-wide `OnceLock`, so
+one interpreter cannot hold both arms). It does **not** reach `gpu_shard_source`; GPU
+equivalence is discharged by the cargo suites and the failure-set A/B described below, not
+by hex bit-identity.
+
+Both fixtures needed a **cancelling ±1e16 pair** to be worth anything. The kernels reduce
+per-shard *partial* sums, so what has to be order-sensitive is the merge of a handful of
+numbers — and the obvious "cycle through three magnitudes" fixture is completely blind to
+it: 0 of the 119 non-identity permutations of a 5-shard visit order changed any column
+sum. Companion tests (`fixture_is_sensitive_to_shard_order`,
+`test_fixture_would_expose_a_reordering`) pin the property so the equivalence assertions
+cannot quietly go vacuous.
+
+**Note on peak RSS.** Decoded-but-unconsumed shards go from one (two on the GPU staging
+path) to `depth`, default 4. That is the one way this change can regress, so the capture
+below reports peak RSS alongside wall-clock. `prefetch::clamp_prefetch_depth` plus the
+exact per-shard `nnz` in `ShardEntryLite` is the derating lever if it ever needs one.
+
+**Measured before/after** (SLURM job 2708500, `cpu` partition, one host, 24 cores,
+`RAYON_NUM_THREADS=24`, `--release`, **one build** with `SCX_ACCEL_PREFETCH_DEPTH=1` vs
+the default 4, 3 runs, median wall):
+
+| Dataset | shards | `qc` | `filter_genes` | `filter_genes_real` | `filter_cells` | `normalize` |
+|---|--:|--:|--:|--:|--:|--:|
+| pbmc10k | 2 | 1.02× | 1.04× | 0.98× | 0.99× | 0.97× |
+| smartseq2 | 8 | **2.18×** | **2.07×** | **2.03×** | **2.11×** | 1.20× |
+| tabula_sapiens_100k | 14 | **2.13×** | **2.00×** | **2.13×** | **2.18×** | 1.24× |
+| census_500k | 62 | **2.09×** | 1.86× | 1.80× | 1.78× | 1.16× |
+| census_1m | 124 | **2.70×** | **2.30×** | **2.35×** | **2.29×** | 1.35× |
+
+Arm order is `off` then `on`, which if anything warms the page cache *for* the `on` arm —
+the opposite of a safeguard. What actually controls for it is
+`profile_cpu_stages_backed.py`'s per-(op, dataset) warm-up run, which precedes the timed
+runs in both arms.
+
+`qc` at census_1m goes 33.2 s → 12.3 s. The profiler shows why: the decode bucket is
+26.1 s sequential and 28.7 s prefetched — **the same work, ~10 % concurrency overhead** —
+but Σ/wall moves from 79 % to **234 %**, i.e. it is now summing workers that run at the
+same time. That is overlap, not less decoding.
+
+`normalize` gains least (1.16–1.35×) and its Σ/wall only reaches 84 %, because the
+lazy/transformed kernels still apply the transform chain on the *consumer* thread; only
+the decode ahead of it overlaps. Moving transforms into the workers is possible — the
+position each shard needs is `shard_range(idx).0`, not a running cursor — but it is a
+separate change with its own equivalence argument.
+
+**Two things the table is not.** `pbmc10k` is 2 shards, so the pipeline mostly no-ops and
+those columns are noise, exactly as 2.1 found — the win is multi-shard-gated. And `hvg`
+is **not** a control here even though 2.1 already prefetched it: `SCX_ACCEL_PREFETCH_DEPTH`
+is global, so the `off` arm disables 2.1's HVG prefetch too, and HVG's 1.93–2.62× in this
+capture is a re-measurement of the 2.1 result, not a 4.2 gain. The genuine control is
+**`pca`**, whose prefetch is still deferred and which stays flat at 1.01–1.04× at the three
+largest scales (`smartseq2` reads 0.90×, a single outlier in a median-of-3 on a 4-shard
+file — reported rather than dropped).
+
+**Peak RSS: flat at the ceiling, visible in the middle.** The extra memory is
+`(depth − 1)` decoded shards, and the capture shows exactly that. Final process high-water
+per arm is **26 437 MB off vs 26 346 MB on at census_1m (−0.3 %)** — the ceiling is set by
+the obs frame and the largest decode buffers, not by the in-flight count. But partway
+through, on `smartseq2`, the prefetch arm sits at 2 116 MB against 1 426 MB (**+48 %**,
+≈ 3 × one decoded shard): a workload whose baseline is small enough for three extra shards
+to matter *will* see it. `prefetch::clamp_prefetch_depth` plus the exact per-shard `nnz` in
+`ShardEntryLite` is the lever if that ever needs bounding; it is deliberately not wired
+yet.
+
+Raw JSON under the job's `raw-off` / `raw-on` directories; `results/raw/` is gitignored, so
+the numbers above cite the job and the two arms rather than a checked-in artifact, as 4.0b
+and 4.1 do.
+
+**GPU staging.** (SLURM job 2708827, H100, `benchmarks/scripts/profile_gpu_staging.py`,
+3 runs, median wall, `SCX_DISABLE_CUDA_GRAPHS=1`.) The CPU table above does not cover this
+path; it has its own capture.
+
+> [!IMPORTANT]
+> **This is a depth-1 → depth-4 comparison inside 4.2, not a `main` → branch one, and the
+> two are not the same thing.** At `depth = 1` the pipeline declines to engage and staging
+> decodes fully sequentially with **zero** decode threads. `main` always spawned a
+> one-ahead `std::thread` + `sync_channel(1)` for multi-shard input, with no depth guard —
+> so the depth-1 arm is *slower than `main`*, and the ratios below overstate the
+> `main` → branch gain by however much that one-ahead overlap was worth. **The
+> `main` → branch speedup is currently unmeasured.** Treat the table as "what the depth
+> knob buys", which is also the actionable form for tuning.
+
+| Op | Dataset | depth 1 | depth 4 | Speedup | host-decode Σ/wall | HTOD |
+|---|---|--:|--:|--:|--:|--:|
+| HVG | tabula_sapiens_100k | 7 441.6 ms | 4 312.9 ms | **1.73×** | 52.5 % → 99.4 % | 1 643 → 1 614 ms |
+| HVG | census_500k | 22 931.5 ms | 10 389.3 ms | **2.21×** | 65.6 % → 147.1 % | 3 156 → 3 151 ms |
+| HVG | census_1m | 37 942.1 ms | 16 626.2 ms | **2.28×** | 71.3 % → 183.4 % | 4 010 → 4 076 ms |
+| DE | tabula_sapiens_100k | 297 997.9 ms | 115 091.8 ms | **2.59×** | 81.3 % → 213.2 % | 17 618 → 17 340 ms |
+| DE | census_500k | 1 152 722.4 ms | 384 089.9 ms | **3.00×** | 80.5 % → 246.2 % | 64 479 → 61 637 ms |
+
+§9.12's diagnosis holds: with staging decoding serially, GPU DE is **80–81 %
+host-decode-bound** and GPU HVG 52–71 %, so the host side is the whole ceiling. Widening it
+takes census_500k DE from 19 minutes to 6.4. (Those percentages describe the depth-1 arm,
+which as noted above has no decode thread at all — `main`, with its one-ahead thread, sat
+somewhere below them.)
+
+**Nothing device-side changed, but the `htod` column is not the evidence for that.** The
+bucket is recorded around `PinnedCsrSlot::stage()` — a host memcpy into the pinned buffer —
+and the asynchronous `upload_to` runs after the timer closes, so its flatness (±4.4 % here)
+says a single-threaded host memcpy did not change, which it could hardly do. The real
+argument is structural and checkable from the diff: the pinned 2-slot ring, the host-side
+`pinned_events` gate and both device event gates are untouched, because the pipeline
+already delivers to the calling thread in shard order. Host-decode Σ/wall exceeding 100 %
+is the pipeline working: it sums concurrent workers.
+
+**Peak RSS rises consistently here, by +651 to +814 MB (+19 % to +46 %).** That is the same
+`(depth − 1)` decoded-shards model as the CPU side, and unlike the CPU case it is plainly
+visible at every scale, because GPU staging otherwise keeps host RSS low (1.7–4.5 GB) — the
+extra shards are not hidden under a larger ceiling. Worth knowing before raising
+`SCX_ACCEL_PREFETCH_DEPTH` on a memory-tight GPU host.
+
+Correctness on GPU is separately verified: `cargo test -p scx-gpu` 193/0 and
+`-p scx-accel --features gpu` 19/0, plus a failure-set A/B of the pyscx GPU suites against
+`2055f74f` — **11 failures on each arm, branch-only list empty** — so rewriting the staging
+loop every GPU streaming op shares introduced no regression.
+
+Where the pipeline declines to engage — `RAYON_NUM_THREADS=1`, or a caller that is itself
+a rayon worker — the GPU staging path is now fully sequential, where the old dedicated
+`std::thread` overlapped one shard ahead unconditionally. Accepted: both are an explicit
+"no ambient parallelism" configuration, and the worker-thread guard is what keeps a
+nested call from deadlocking.
 
 ### Low-risk marshalling & fusions (Phase-2 tasks 2.4 + 2.7)
 
@@ -531,6 +681,86 @@ is lower allocation counts and one shared thread-control knob, with no regressio
   cap still applies — the env only lowers it further. Unset (the default) → behaviour is
   identical to before. It does **not** resize the ambient global rayon pool the many
   `current_num_threads()` callers use — that stays governed by `RAYON_NUM_THREADS`.
+
+### Marshalling & GIL hygiene at the Python boundary (Phase-4 task 4.3)
+
+2.4 converted the 2-D result writers; 4.3 converts the 1-D ones on the `uns` / `obsp`
+result paths and fixes a concurrency defect next door. It is **not** exhaustive: the DE
+DataFrame builders (`de.rs`'s `rank_genes_groups_df` path and three siblings) still push
+`n_groups × n_genes` f64 columns through Python lists, some of them larger than sites that
+were converted. They were left because they feed pandas/polars constructors rather than a
+numpy array, so the conversion is a different shape — and, per the measurement below, not
+one worth reaching for on performance grounds. Both halves are **output-neutral** and carry no `×` claim.
+
+- **Flat buffers for every remaining `numpy.array(<Rust Vec>)`.** That spelling cloned
+  the Rust buffer, had pyo3 build a Python `list` (one `PyLong`/`PyFloat` per element),
+  then made numpy re-parse it. The two that mattered: `write_neighbors_to_adata` built
+  **six** CSR arrays that way — `n_obs × k` each, so tens of millions of transient Python
+  objects at 1M cells × k=15, on a path shared by CPU kNN, GPU kNN, `pca_neighbors` and
+  `pca_neighbors_umap` — and the DE structured-array builder did it per group per field,
+  so a 30-group × 60k-gene run materialised millions more. Both now use
+  `PyArray1::from_vec` / `from_slice`; `write_neighbors_to_adata` takes its `KnnResult` by
+  value so the buffers are *moved*, not copied. Smaller instances converted alongside in
+  `pca.rs`, `harmony.rs`, `pseudobulk.rs`, `nb_glm.rs`, `de.rs` and `eval_metrics.rs`. The
+  `rank_genes_groups` `names` field keeps its `PyList` path — its `U200` dtype genuinely
+  needs Python strings.
+
+  **Dtype was the risk, not values.** `np.array(list[int])` is int64 whatever the Rust
+  width, so the kNN `Vec<i32>` indices used to arrive as int64 and now arrive as int32 —
+  absorbed, because `scipy.sparse.csr_matrix` re-derives its index dtype through
+  `get_index_dtype(..., check_contents=True)`. One site was *not* absorbed:
+  `eval_metrics.rs`'s group-reorder indices are `Vec<usize>`, which `from_vec` would land
+  as **uint64** where the list round-trip gave int64, so the kernel collects `i64`
+  explicitly. `pyscx/tests/test_marshalling_dtypes.py` asserts the observable dtype at
+  every converted site rather than assuming the absorption.
+
+- **`col_*` release the GIL.** `pyscx.accel.{col_sums,col_nnz,col_min,col_max,col_var}`
+  ran a full-matrix streaming decode **holding the GIL** (`run_csr_f64` had a
+  `let _ = py;` where the release belonged), so any one of them blocked every other Python
+  thread for the duration and concurrent use from a dataloader or server thread pool
+  serialised completely — while every sibling heavy entry point already released it. A
+  `PyRef` cannot cross `py.detach(...)`, so each entry now snapshots what the scan needs
+  into an owned handle (`Arc` clones + owned index vectors; no matrix data copied), runs
+  the kernel detached, and re-acquires only to build the array. The CSC dispatchers needed
+  a new owned accessor (`as_column_source_owned`) under the identical deletion-vector gate.
+
+  `pyscx/tests/test_col_aggs_gil.py` measures the property directly rather than as a
+  throughput ratio, which would be flaky on a loaded host: a monitor thread stamps
+  `perf_counter()` every ~1 ms during the scan and the assertion is on the largest gap.
+  Against `2055f74f` all three ops starve the monitor for **100 % of the scan**; after the
+  change the gap is a small fraction. A 4-thread concurrency test pins that overlapping
+  `col_sums` calls on one reader — newly possible, since they now share its mmap and LRU
+  concurrently — still agree exactly.
+
+**Measured — and the headline prediction did not hold.** Finding §9.5 expected the kNN
+path's "tens of millions of transient Python objects" to be a real cost at atlas scale. It
+is a real *allocation* cost, but it does not show up in either metric that would justify
+the change on performance grounds (SLURM jobs 2708544 and 2708786, `cpu` partition,
+synthetic 500k/1M × 2 000 at density 0.05, k=15):
+
+| | peak RSS | wall |
+|---|--:|--:|
+| `neighbors`, 500k, `2055f74f` | 9 212 MB | 219.8 s |
+| `neighbors`, 500k, this change | 9 211 MB | 215.1 s |
+
+**Peak RSS is unchanged (−1 MB, 0.01 %), and the 2 % wall difference is noise on a single
+220 s run.** The transient list for a 14M-element `Vec<f64>` really is ~560 MB, but the
+process high-water at this scale is set elsewhere (the HNSW build), and CPython's allocator
+serves the churn from arenas it already holds — so `ru_maxrss` never sees it.
+
+The bucket itself, on the new path: 533 MB of CSR arrays marshalled in **4.4 ms** at 1M
+cells (0.00 % of a 754 s wall) — a memory-move rate, consistent with `from_vec` handing the
+buffer to numpy rather than copying it. `pca` writes 200 MB in 106 ms (0.49 % of wall, and
+a genuine copy via `from_slice`); DE writes 128 KB in 0.09 ms. The `main` arm reports a
+zero bucket because the instrumentation is part of this change, so the two bucket numbers
+are **not** a before/after — only the branch column is meaningful.
+
+So this lands as **hygiene, not a speedup**, and is described that way deliberately: it
+removes a full Rust-side buffer clone (533 MB at 1M cells) and tens of millions of
+transient object allocations, it is byte-identical in output, and it is simpler. The 2.0
+oracle ranked marshalling negligible and both 2.4 and this capture agree; §9.5's
+"largest remaining marshalling cost" was right about the *ordering* among marshalling
+sites and wrong that the absolute mattered.
 
 ### Graph-layout refactors (Phase-2 task 2.5)
 

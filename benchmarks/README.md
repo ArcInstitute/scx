@@ -260,6 +260,41 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 > [!IMPORTANT]
 > The `scx-bench-gpu` environment pins `cuda-version` to match the NVIDIA driver. The default is `12.2` (for driver 535.x). Edit `benchmarks/comprehensive/envs/scx-bench-gpu.yml` to adjust for your driver version. See [docs/gpu-setup.md](../docs/gpu-setup.md) for the driver compatibility table.
 
+> [!CAUTION]
+> **Run capture jobs one at a time. `pyscx/python/pyscx/*.so` is shared mutable
+> state across every environment and every concurrently-running job.**
+>
+> Each env's editable install of `pyscx` points at that one file in the repo, so
+> the rule is stronger than "don't run two builds at once":
+>
+> > Any job that runs `maturin develop` in the repo invalidates every other job
+> > that will **import** pyscx — whether or not that job builds anything.
+>
+> The failure is a rebuild racing a future *import*, not build-vs-build, which is
+> why "the other job already finished its build phase" is not a safe argument.
+> Phase 4.2 lost ~3 H100-hours to exactly that: a CPU job whose own build targeted
+> `.venv` still wrote a `--features hdf5` (no-GPU) `.so` into the shared path, and
+> a running GPU capture's not-yet-started second arm then failed every op with
+> `pyscx was built without the 'gpu' feature`.
+>
+> Chain jobs with `sbatch --dependency=afterany:$prev` when they are independent
+> captures and you want the second to run regardless — but use **`afterok`**
+> whenever the second job would inherit state from the first, so a failed build
+> cannot leave a stale `.so` for the next job to measure against.
+>
+> Two guards worth copying into any new capture script:
+> - **Preflight the feature you are about to measure.** Run one real GPU op and
+>   exit non-zero if it raises. Nine seconds beats discovering a wrong build after
+>   three hours — see `benchmarks/scripts/_run_4_2_gpu_staging_only.sh`.
+> - **`rm -rf` a reused `CARGO_TARGET_DIR` wholesale.** Clearing only
+>   `$TARGET/maturin` lets cargo report "Finished in 0.9s", re-link a 0-byte
+>   artifact from `release/`, and maturin die on `Malformed entity: Object is too
+>   small`.
+>
+> Slurm will also co-schedule two of your jobs on one node, where one's cargo
+> builds steal CPU from the other's *timing* measurement — unevenly across its
+> arms, so it biases the result rather than merely adding noise.
+
 ### Which environment to use
 
 > [!CAUTION]
