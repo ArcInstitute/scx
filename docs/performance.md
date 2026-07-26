@@ -730,13 +730,49 @@ code — and gives `clamp_prefetch_depth` a real per-shard byte estimate, so
 `SCX_GPU_STAGING_MEMORY_BUDGET` can bound the decoded-but-unconsumed set. Unset, nothing
 derates and the depth is unchanged.
 
+**Measured** (SLURM job 2709095, H100, **two builds** — `main` at `2d1fe16b` (i.e. post-4.2)
+vs the branch, both at their own defaults, `benchmarks/scripts/profile_gpu_de_resident.py`,
+3 runs, median wall, `SCX_DISABLE_CUDA_GRAPHS=1`):
+
+| Op | Dataset | `main` (4.2) | branch | Speedup | Σ host-decode | pinned HTOD | VRAM peak |
+|---|---|--:|--:|--:|--:|--:|--:|
+| pdex_ref | tabula_sapiens_100k | 114 902 ms | 3 154 ms | **36.4×** | 246 868 → 2 105 ms | 17 313 → 203 ms | 1 775 → 2 984 MB |
+| wilcoxon | tabula_sapiens_100k | 113 185 ms | 3 661 ms | **30.9×** | 247 348 → 2 120 ms | 17 351 → 200 ms | 2 127 → 3 334 MB |
+| pdex_ref | census_500k | 383 890 ms | 12 536 ms | **30.6×** | 941 404 → 8 578 ms | 64 656 → 641 ms | 3 658 → 9 128 MB |
+| wilcoxon | census_500k | 385 877 ms | 14 064 ms | **27.4×** | 945 281 → 8 146 ms | 64 477 → 631 ms | 5 162 → 10 632 MB |
+| hvg *(control)* | 100k / 500k / 1m | 4 409 / 10 559 / 16 030 ms | 4 447 / 11 232 / 17 255 ms | 0.99 / 0.94 / 0.93× | — | — | 1 192 → 1 192 MB |
+
+**The mechanism is confirmed three ways, not just by the wall.** At census_500k `pdex_ref`
+the summed host-decode falls **110×** (predicted 123×: one pass instead of one per gene
+chunk) and lands on **8 578 ms** against the 8 200 ms predicted *before the run* from
+1 005.6 s ÷ 123. The pinned-staging bucket falls **101×**. And the VRAM delta between arms
+is **5 470 MB** against a predicted 5 976 MB of resident CSR. Host peak RSS *falls* 14 %
+(3 643 → 3 127 MB) — one decode pass churns far less host memory than 123.
+
+**Residency alone would not have done this.** Its own predicted range was 1.2–4.4× (the
+[84, 319] s kernel bound above). Post-change, kernels + sync are ~10 s of the 12.5 s wall,
+so the windowing cut the per-chunk scan by roughly 8–32×. The capture measures the two
+**together** and cannot attribute between them: there is a knob to disable residency but
+none to disable the windowing, and adding one was not judged worth the API surface.
+
 > [!NOTE]
-> **Capture pending.** The `main`-vs-branch measurement (two builds, H100, SLURM jobs
-> 2709094 / 2709095, `benchmarks/scripts/profile_gpu_de_resident.py`) has not landed yet.
-> Per the phase's profile-first rule no `×` is claimed until it does; this section
-> describes the mechanism only. The capture reports wall, the `gpu_profile`
-> host-decode / htod buckets, host peak RSS **and VRAM** — residency's whole cost is
-> device memory, which the 4.2 harness did not record at all.
+> **The hvg control's 0.93–0.99× is noise, and that was measured rather than assumed.**
+> Consistently-below-1.0 across three datasets looked like a real cost — plausibly the
+> parallel shard validation, which runs on the consuming thread and so competes with the
+> prefetch workers on a decode-bound op. Job 2709123 tested exactly that with one build and
+> two arms (`SCX_GPU_VALIDATE_PAR_MIN_NNZ` pinned high takes the unchanged serial branch),
+> 5 runs each. The result scattered in **both** directions — 1.037× / 1.001× / 0.944× on
+> hvg, 0.977×–1.014× on DE — i.e. no effect. The job-to-job spread is the explanation: the
+> *same* branch build measured census_500k hvg at 11 232, 12 822 and 12 839 ms across two
+> jobs on the same node, a 14 % swing that swallows the 7 % being chased. Single-job control
+> deltas below ~15 % on this node are not interpretable.
+
+**Parallel shard validation (§9.13) is a measured no-op at these scales, and is kept as
+hygiene with no `×` claimed** — the same disposition as task 4.3's marshalling. The reason
+it does not show up is worth stating: validation runs on the consumer thread *while* the
+prefetch workers decode ahead, so it is hidden behind decode entirely. What actually made
+validation cheap was residency, which cut it from once-per-shard-per-chunk to once per
+shard — 123× fewer invocations. Parallelising what remains is correct and free, not a win.
 
 ### Low-risk marshalling & fusions (Phase-2 tasks 2.4 + 2.7)
 
