@@ -112,9 +112,10 @@ def main() -> int:
     for dataset in DATASETS:
         scx_path = DATA_DIR / f"{dataset}_auto.scx"
         if not scx_path.exists():
-            print(f"  SKIP {dataset}: {scx_path} not found")
+            print(f"  SKIP {dataset}: {scx_path} not found", flush=True)
             continue
         for op in OPS:
+            print(f"  ... {dataset}/{op}", flush=True)
             walls = []
             snaps = []
             for _ in range(N_RUNS):
@@ -123,7 +124,7 @@ def main() -> int:
                 try:
                     _run_op(op, scx_path)
                 except Exception as exc:  # noqa: BLE001
-                    print(f"  FAIL {dataset}/{op}: {type(exc).__name__}: {exc}")
+                    print(f"  FAIL {dataset}/{op}: {type(exc).__name__}: {exc}", flush=True)
                     walls = []
                     break
                 walls.append(time.perf_counter() - t0)
@@ -151,7 +152,8 @@ def main() -> int:
                 f"  {dataset:<22} {op:<4} wall {row['wall_ms']:9.1f} ms | "
                 f"host-decode {hd:9.1f} ms ({row['host_decode_over_wall'] * 100:5.1f}% of wall) | "
                 f"HTOD {htod:8.1f} ms | compute {snap['compute_ms']:8.1f} ms | "
-                f"peak {row['peak_rss_mb']:.0f} MB"
+                f"peak {row['peak_rss_mb']:.0f} MB",
+                flush=True,
             )
 
     print()

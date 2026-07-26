@@ -40,10 +40,14 @@ OUT="$WORK/run_${SLURM_JOB_ID:-manual}"
 SHA=$(cd "$REPO" && git rev-parse HEAD)
 
 DATASETS="pbmc10k smartseq2 tabula_sapiens_100k census_500k census_1m"
-# `qc` / `filter_genes*` / `filter_cells` are the ops whose kernels 4.2 rewired.
-# `normalize` exercises the lazy/transformed streaming twins. `hvg` was already
-# prefetched by 2.1 and `pca` is still a deferred path — both are controls and
-# should come out flat; if either moves, something unintended changed.
+# `qc` / `filter_genes*` / `filter_cells` are the ops whose kernels 4.2 rewired;
+# `normalize` exercises the lazy/transformed streaming twins.
+#
+# **`pca` is the control, `hvg` is not.** `SCX_ACCEL_PREFETCH_DEPTH` is global,
+# so the `off` arm also disables the prefetch 2.1 already gave HVG — HVG's ~2x
+# here re-measures the 2.1 result rather than showing a 4.2 gain. `pca`'s
+# prefetch is still deferred, so it stays sequential in both arms and should
+# come out flat; if it moves, something unintended changed.
 OPS="qc filter_genes filter_genes_real filter_cells normalize hvg pca"
 N_RUNS=3
 

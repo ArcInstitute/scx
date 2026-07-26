@@ -537,8 +537,52 @@ path) to `depth`, default 4. That is the one way this change can regress, so the
 below reports peak RSS alongside wall-clock. `prefetch::clamp_prefetch_depth` plus the
 exact per-shard `nnz` in `ShardEntryLite` is the derating lever if it ever needs one.
 
-<!-- CAPTURE PENDING: 4.2 before/after (SCX_ACCEL_PREFETCH_DEPTH=1 vs default),
-     full tier, wall-clock + peak RSS; GPU host-decode/HTOD buckets on an H100. -->
+**Measured before/after** (SLURM job 2708500, `cpu` partition, one host, 24 cores,
+`RAYON_NUM_THREADS=24`, `--release`, **one build** with `SCX_ACCEL_PREFETCH_DEPTH=1` vs
+the default 4, `off` arm first so `on` cannot ride a warmer page cache, 3 runs, median
+wall):
+
+| Dataset | shards | `qc` | `filter_genes` | `filter_genes_real` | `filter_cells` | `normalize` |
+|---|--:|--:|--:|--:|--:|--:|
+| pbmc10k | 2 | 1.02× | 1.04× | 0.98× | 0.99× | 0.97× |
+| smartseq2 | 8 | **2.18×** | **2.07×** | **2.03×** | **2.11×** | 1.20× |
+| tabula_sapiens_100k | 14 | **2.13×** | **2.00×** | **2.13×** | **2.18×** | 1.24× |
+| census_500k | 62 | **2.09×** | 1.86× | 1.80× | 1.78× | 1.16× |
+| census_1m | 124 | **2.70×** | **2.30×** | **2.35×** | **2.29×** | 1.35× |
+
+`qc` at census_1m goes 33.2 s → 12.3 s. The profiler shows why: the decode bucket is
+26.1 s sequential and 28.7 s prefetched — **the same work, ~10 % concurrency overhead** —
+but Σ/wall moves from 79 % to **234 %**, i.e. it is now summing workers that run at the
+same time. That is overlap, not less decoding.
+
+`normalize` gains least (1.16–1.35×) and its Σ/wall only reaches 84 %, because the
+lazy/transformed kernels still apply the transform chain on the *consumer* thread; only
+the decode ahead of it overlaps. Moving transforms into the workers is possible — the
+position each shard needs is `shard_range(idx).0`, not a running cursor — but it is a
+separate change with its own equivalence argument.
+
+**Two things the table is not.** `pbmc10k` is 2 shards, so the pipeline mostly no-ops and
+those columns are noise, exactly as 2.1 found — the win is multi-shard-gated. And `hvg`
+is **not** a control here even though 2.1 already prefetched it: `SCX_ACCEL_PREFETCH_DEPTH`
+is global, so the `off` arm disables 2.1's HVG prefetch too, and HVG's 1.93–2.62× in this
+capture is a re-measurement of the 2.1 result, not a 4.2 gain. The genuine control is
+**`pca`**, whose prefetch is still deferred and which stays flat at 1.01–1.04× at the three
+largest scales (`smartseq2` reads 0.90×, a single outlier in a median-of-3 on a 4-shard
+file — reported rather than dropped).
+
+**Peak RSS: flat at the ceiling, visible in the middle.** The extra memory is
+`(depth − 1)` decoded shards, and the capture shows exactly that. Final process high-water
+per arm is **26 437 MB off vs 26 346 MB on at census_1m (−0.3 %)** — the ceiling is set by
+the obs frame and the largest decode buffers, not by the in-flight count. But partway
+through, on `smartseq2`, the prefetch arm sits at 2 116 MB against 1 426 MB (**+48 %**,
+≈ 3 × one decoded shard): a workload whose baseline is small enough for three extra shards
+to matter *will* see it. `prefetch::clamp_prefetch_depth` plus the exact per-shard `nnz` in
+`ShardEntryLite` is the lever if that ever needs bounding; it is deliberately not wired
+yet.
+
+Raw JSON under the job's `raw-off` / `raw-on` directories; `results/raw/` is gitignored, so
+the numbers above cite the job and the two arms rather than a checked-in artifact, as 4.0b
+and 4.1 do.
 
 Where the pipeline declines to engage — `RAYON_NUM_THREADS=1`, or a caller that is itself
 a rayon worker — the GPU staging path is now fully sequential, where the old dedicated
