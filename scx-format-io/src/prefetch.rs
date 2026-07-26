@@ -217,10 +217,24 @@ thread_local! {
 /// The drain runs on the calling thread and blocks on the channel while decode
 /// tasks run on other pool workers. If the caller is a saturated pool worker
 /// (nested `par_iter`/`scope`/`install`), those spawns can't schedule → deadlock.
-/// This is why PCA prefetch (which owns inner rayon pools) is deferred. The
-/// `current_thread_index().is_some()` fallback defuses it by decoding
+/// The `current_thread_index().is_some()` fallback defuses it by decoding
 /// sequentially when invoked on a worker thread, but callers should still treat
 /// "top-level only" as the contract.
+///
+/// **The safe nesting is the other way round**, which is what let PCA adopt this
+/// after being deferred for owning inner pools: a consumer may enter a parallel
+/// region — even one on a private pool — from *inside* `consume`, because the
+/// live set never exceeds `depth` and the channel capacity **is** `depth`, so a
+/// decode worker can always complete its `tx.send` rather than parking while the
+/// calling thread is blocked. What is unsafe is calling this function from a
+/// worker, not calling into a pool from the consumer.
+///
+/// Note that a caller who takes this path silently gets the sequential loop.
+/// That is a correct outcome, but it is indistinguishable from a correct
+/// prefetching one in every result — so a new consumer should carry a test that
+/// observes concurrent decodes (see
+/// `scx_accel::pca::cpu::tests::covariance_build_decodes_shards_concurrently`),
+/// not just one that checks its numbers.
 ///
 /// A worker that panics while decoding is caught and delivered as an `Err`, so
 /// the drain loop always terminates. If `consume` returns `Err`, iteration
