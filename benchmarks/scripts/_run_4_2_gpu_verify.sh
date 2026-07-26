@@ -13,6 +13,18 @@
 #
 #   sbatch benchmarks/scripts/_run_4_2_gpu_verify.sh
 #
+# **Do not run this concurrently with `_run_4_2_prefetch_ab.sh`.** Chain it:
+#
+#   cpu=$(sbatch --parsable benchmarks/scripts/_run_4_2_prefetch_ab.sh)
+#   sbatch --dependency=afterany:$cpu benchmarks/scripts/_run_4_2_gpu_verify.sh
+#
+# Two reasons, both learned by doing it wrong once. The `branch` arm below
+# rebuilds `$SCX_DIR/pyscx`, which overwrites the **shared in-tree `.so`** the
+# CPU job's venv is running out of. And Slurm will happily co-schedule both on
+# one node (they landed together on GPU71BA), where this job's cargo builds
+# steal CPU from a *timing* A/B — unevenly across its two arms, which biases the
+# result rather than merely adding noise.
+#
 # Two hard-won details, both from #372 and both load-bearing:
 #
 #   * The two arms need **separate** `CARGO_TARGET_DIR`s. Sharing one leaves a
