@@ -97,6 +97,11 @@ pub fn pca_neighbors(
         )));
     }
 
+    // Same reason as `pca`: a presentation-ordered backed `X` has no
+    // `ShardSource` representation, and the fused GPU path below would
+    // otherwise skip the guard `pca` applies on the delegating path.
+    super::reject_preserve_var_order(adata, "pca_neighbors")?;
+
     // In-VRAM `device="gpu"` fused PCA→kNN routes to a full rapids pipeline
     // (rsc.pp.pca → rsc.pp.neighbors) on an in-memory X. backed/lazy X stays on
     // the native device-resident fused path (>VRAM moat). Gated on the default
@@ -188,12 +193,18 @@ pub fn pca_neighbors(
             let x = adata.getattr("X")?;
 
             let ran = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-                let reader = &*backed.backed;
+                // The handle's *view*, not the raw reader — otherwise a
+                // subset backed `X` feeds PCA every on-disk row/column and
+                // the embedding misaligns against `adata.obs` (see `pca`).
+                // Uncached for the same reason as `pca`'s GPU arm: the GPU
+                // shard source stages through `read_shard`, so cached reads
+                // would deep-clone each shard instead of decoding fresh.
+                let source = backed.as_shard_source();
                 run_fused_gpu(
                     py,
                     adata,
                     device_id,
-                    reader,
+                    &source,
                     n_comps,
                     n_oversamples,
                     n_power_iterations,
@@ -405,6 +416,9 @@ pub fn pca_neighbors_umap(
              {prefer_format:?}); PCA's SpMM path is row-major and CSC is not implemented."
         )));
     }
+
+    // See `pca_neighbors`.
+    super::reject_preserve_var_order(adata, "pca_neighbors_umap")?;
 
     // In-VRAM `device="gpu"` fused PCA→kNN→UMAP routes to a full rapids pipeline
     // (rsc.pp.pca → rsc.pp.neighbors → rsc.tl.umap) on an in-memory X.

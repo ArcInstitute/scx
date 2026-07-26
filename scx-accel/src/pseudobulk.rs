@@ -5,10 +5,14 @@
 //! The resulting count matrix is fed to `pydeseq2` on the Python side for
 //! negative binomial GLM testing.
 //!
-//! Supports both streaming (shard-by-shard via `BackedCsrReader`) and
-//! in-memory (`ScxCsr`) paths.
+//! Supports both streaming (shard-by-shard over any CSR `ShardSource`) and
+//! in-memory (`ScxCsr`) paths. Streaming callers holding a subset SCX handle
+//! must pass that handle's *view* (`as_shard_source()`), not the reader
+//! underneath it — `obs_groups` is indexed by visible cell.
 
 use std::collections::HashMap;
+
+use scx_format_io::ShardSource;
 
 use crate::Result;
 
@@ -214,29 +218,34 @@ pub fn build_group_mapping(
     (remapped_cells, sorted_labels)
 }
 
-/// Streaming pseudobulk aggregation from `BackedCsrReader`.
+/// Streaming pseudobulk aggregation over a CSR [`ShardSource`].
 ///
 /// Iterates shards one at a time, accumulating per-group sums without
 /// materializing the full matrix.
 ///
+/// Generic over the source rather than taking a `BackedCsrReader`, because
+/// `obs_groups` is indexed by *visible* cell: a caller holding a subset SCX
+/// handle must pass that handle's view (`as_shard_source()`), not the reader
+/// underneath it, or the group labels line up against the wrong rows.
+///
 /// # Arguments
-/// * `reader` — Backed CSR reader for shard-by-shard iteration.
+/// * `source` — CSR shard source for shard-by-shard iteration.
 /// * `obs_groups` — Per-cell group labels for each groupby column.
 ///   `obs_groups[col_idx][cell_idx]` is the label for cell `cell_idx` in column `col_idx`.
 /// * `groupby_columns` — Column names from obs (e.g., `["perturbation", "donor"]`).
 /// * `gene_names` — Gene names (length = n_vars).
 /// * `method` — Aggregation method (Sum or Mean).
 /// * `min_cells_per_group` — Groups with fewer cells are excluded from the result.
-pub fn pseudobulk_aggregate(
-    reader: &scx_format_io::backed::BackedCsrReader,
+pub fn pseudobulk_aggregate<S: ShardSource + Sync>(
+    source: &S,
     obs_groups: &[Vec<String>],
     groupby_columns: &[String],
     gene_names: &[String],
     method: AggregationMethod,
     min_cells_per_group: usize,
 ) -> Result<PseudobulkResult> {
-    let n_obs = reader.n_obs();
-    let n_vars = reader.n_vars();
+    let n_obs = source.n_obs();
+    let n_vars = source.n_vars();
 
     validate_inputs(obs_groups, groupby_columns, gene_names, n_obs, n_vars)?;
 
@@ -261,7 +270,7 @@ pub fn pseudobulk_aggregate(
     // not warm/evict the shared shard cache (review feedback).
     let mut global_row = 0usize;
     crate::prefetch::for_each_shard_ordered_uncached(
-        reader,
+        source,
         crate::prefetch::prefetch_depth(),
         |_shard_idx, shard_csr| {
             let _r = scx_format_io::reduction_guard();
@@ -645,20 +654,23 @@ fn gpu_group_plan(
     (cell_to_group_i32, group_labels, cell_counts)
 }
 
-/// GPU pseudobulk **means** from a backed CSR reader. Mirrors
+/// GPU pseudobulk **means** over a CSR [`ShardSource`]. Mirrors
 /// [`pseudobulk_aggregate`] with `AggregationMethod::Mean`, but streams the
 /// shards in-VRAM and folds them with the DE pseudobulk kernel on the GPU.
+///
+/// Generic for the same reason as [`pseudobulk_aggregate`]: `obs_groups` is
+/// per *visible* cell, so a subset SCX handle must hand over its view.
 #[cfg(feature = "gpu")]
-pub fn pseudobulk_means_gpu_backed(
+pub fn pseudobulk_means_gpu_streaming<S: ShardSource + Sync>(
     dev: &scx_gpu::GpuDevice,
-    reader: &scx_format_io::backed::BackedCsrReader,
+    source: &S,
     obs_groups: &[Vec<String>],
     groupby_columns: &[String],
     gene_names: &[String],
     min_cells_per_group: usize,
 ) -> Result<PseudobulkResult> {
-    let n_obs = reader.n_obs();
-    let n_vars = reader.n_vars();
+    let n_obs = source.n_obs();
+    let n_vars = source.n_vars();
     validate_inputs(obs_groups, groupby_columns, gene_names, n_obs, n_vars)?;
 
     let (cell_to_group, group_labels, cell_counts) = gpu_group_plan(obs_groups, n_obs);
@@ -666,13 +678,13 @@ pub fn pseudobulk_means_gpu_backed(
 
     let means = scx_gpu::gpu_pseudobulk_means_csr(
         dev,
-        reader,
+        source,
         &cell_to_group,
         n_groups,
         n_vars,
         &cell_counts,
     )
-    .map_err(|e| crate::AccelError::LinAlg(format!("GPU pseudobulk means (backed): {e}")))?;
+    .map_err(|e| crate::AccelError::LinAlg(format!("GPU pseudobulk means (streaming): {e}")))?;
 
     filter_and_build_result(
         means,

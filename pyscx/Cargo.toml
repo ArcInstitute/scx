@@ -36,6 +36,9 @@ pyo3-log = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 # `hdf5` gates `pyscx.from_h5ad` and the backed-AnnData auto-routing in
 # `pyscx.from_anndata`. Both reach into `scx_convert::h5ad_to_scx_streaming`,

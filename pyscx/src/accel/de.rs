@@ -201,6 +201,40 @@ fn select_de_matrix<'py>(
 ///
 /// Mirrors the single capability-detection point (`as_column_source`): a valid
 /// CSC route needs a sidecar present, no active row-deletion vector, and — for a
+/// Refuse an explicit `prefer_format="csc"` on a **subset** backed handle.
+///
+/// The gene-major sidecar is written against the full axis and has no
+/// projection surface, so a subset handle reaches the CSC kernel with
+/// visible-width `gene_names` (or a row count the sidecar cannot express).
+/// The kernel does catch it, but as a bare
+/// `gene_names length 15 != source.n_vars() 30` — say what actually happened.
+///
+/// Only the *explicit* CSC request lands here; `prefer_format="auto"` never
+/// picks CSC for a subset handle (`csc_route_available` excludes a projected
+/// one, and any `kept_to_global` makes `as_column_source()` return `None`).
+fn reject_csc_on_subset(backed: &ScxBackedSparseDataset) -> PyResult<()> {
+    if backed.kept_to_global.is_some() {
+        return Err(PyRuntimeError::new_err(
+            "CSC requested but unavailable: a row deletion vector is active \
+             (this dataset has been subset along obs, e.g. by filter_cells). \
+             Use prefer_format='csr'.",
+        ));
+    }
+    if backed.col_projection_arc().is_some() {
+        return Err(PyRuntimeError::new_err(
+            "CSC requested but unavailable: a column projection is active \
+             (this dataset has been subset along var, e.g. by filter_genes or \
+             highly_variable_genes(subset=True)); the CSC sidecar is full-axis. \
+             Use prefer_format='csr'.",
+        ));
+    }
+    Ok(())
+}
+
+/// Runtime CSC-sidecar availability probe for the `prefer_format="auto"` policy.
+///
+/// Mirrors the single capability-detection point (`as_column_source`): a valid
+/// CSC route needs a sidecar present, no active row-deletion vector, and — for a
 /// lazy source — only column-local transforms. Never errors: a `false` result
 /// just routes `auto` to the CSR streamer. A materialized matrix (numpy/scipy,
 /// e.g. `use_raw`/`layer`) is not a backed/lazy SCX dataset → `false`.
@@ -370,11 +404,7 @@ fn run_rank_genes_groups_inner(
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
             // Validate CSC availability under the GIL, then clone the Arc so
             // the Rust kernel can run without holding the GIL.
-            if backed.kept_to_global.is_some() {
-                return Err(PyRuntimeError::new_err(
-                    "CSC requested but unavailable: a row deletion vector is active",
-                ));
-            }
+            reject_csc_on_subset(&backed)?;
             let csc_reader = backed
                 .backed_csc
                 .as_ref()
@@ -460,7 +490,18 @@ fn run_rank_genes_groups_inner(
         // Backed mode: stream shards with gene-chunked DE. Clone the Arc
         // so the kernel runs without holding the GIL.
         let chunk_size = gene_chunk_size.unwrap_or(500);
+        // The handle's *view*, not the file: `groups` is one label per
+        // *visible* cell and `gene_names` one per visible gene, so a subset
+        // handle has to stream its window. `with_cached_reads` because the
+        // kernel walks every shard once per gene chunk — the same LRU the raw
+        // reader served from.
+        let source = backed.as_shard_source().with_cached_reads();
+        // Only the GPU arm still needs the concrete reader (for the
+        // CSC-direct `Backed` input); the CPU arm runs entirely off `source`.
+        #[cfg(feature = "gpu")]
         let reader = std::sync::Arc::clone(&backed.backed);
+        #[cfg(feature = "gpu")]
+        let has_view = backed.has_axis_view();
         // If a CSC sidecar reader exists on the dataset, hand it to the GPU
         // streaming path so the default v3 route can dispatch to the
         // CSC-direct Wilcoxon driver. None falls through to the v3 CSR-direct
@@ -473,12 +514,31 @@ fn run_rank_genes_groups_inner(
             #[cfg(feature = "gpu")]
             Some(device_id) => py
                 .detach(|| {
-                    scx_accel::wilcoxon_rank_sum_gpu(
-                        device_id,
+                    // Load-bearing, not bookkeeping. Neither of the CSC
+                    // gates elsewhere protects this path: the `csc` below
+                    // comes straight off `backed.backed_csc`, bypassing
+                    // `as_column_source()`'s deletion check, and
+                    // `csc_route_available` is never consulted on GPU
+                    // (`resolve_de_format` short-circuits to "csr" whenever
+                    // `gpu_device_id.is_some()`). So a subset handle with a
+                    // sidecar would otherwise reach the CSC-direct kernel and
+                    // read *on-disk* columns under visible-width
+                    // `gene_names` — a silent wrong answer, since
+                    // `Backed::shape()` takes `n_vars` from `gene_names.len()`
+                    // and the widths agree. Route it to the generic `Lazy`
+                    // input; only an unsubset handle keeps `Backed` and with
+                    // it the CSC-direct `gpu_csc_v3` route.
+                    let input = if has_view {
+                        scx_accel::GpuDeShardInput::Lazy(&source)
+                    } else {
                         scx_accel::GpuDeShardInput::Backed {
                             csr: &reader,
                             csc: csc_reader.as_deref(),
-                        },
+                        }
+                    };
+                    scx_accel::wilcoxon_rank_sum_gpu(
+                        device_id,
+                        input,
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -495,7 +555,7 @@ fn run_rank_genes_groups_inner(
             None => py
                 .detach(|| {
                     scx_accel::wilcoxon_rank_sum_streaming(
-                        &reader,
+                        &source,
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -820,6 +880,14 @@ pub fn rank_genes_groups(
             "Invalid prefer_format={prefer_format:?}; expected 'auto', 'csr', or 'csc'"
         )));
     }
+    // A presentation-ordered backed `X` (`preserve_var_order=True`) has no
+    // `ShardSource` spelling: the source emits columns in sorted on-disk order
+    // while `adata.var` — and so `gene_names` — stays in request order. Now
+    // that this op streams the handle's *view*, the two widths match, so the
+    // mismatch would be a silent gene/column permutation instead of a shape
+    // error. Refuse, as the other streaming accel ops do.
+    super::reject_preserve_var_order(adata, "rank_genes_groups")?;
+
     // Resolve scanpy's use_raw/layer contract once (mutual-exclusion + default).
     let resolved_use_raw = resolve_use_raw(adata, use_raw, layer)?;
     let resolved = super::gpu::resolve_device(device)?;
@@ -1673,11 +1741,7 @@ fn run_pdex_ref_inner(
         let chunk_size = gene_chunk_size.unwrap_or(500);
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-            if backed.kept_to_global.is_some() {
-                return Err(PyRuntimeError::new_err(
-                    "CSC requested but unavailable: a row deletion vector is active",
-                ));
-            }
+            reject_csc_on_subset(&backed)?;
             let csc_reader = backed
                 .backed_csc
                 .as_ref()
@@ -1757,7 +1821,14 @@ fn run_pdex_ref_inner(
 
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         let chunk_size = gene_chunk_size.unwrap_or(500);
+        // The handle's *view* — see the matching branch in
+        // `run_rank_genes_groups_inner` for why the raw reader is wrong here.
+        let source = backed.as_shard_source().with_cached_reads();
+        // GPU-only: the concrete reader backs the CSC-direct `Backed` input.
+        #[cfg(feature = "gpu")]
         let reader = std::sync::Arc::clone(&backed.backed);
+        #[cfg(feature = "gpu")]
+        let has_view = backed.has_axis_view();
         // G4.3: if a CSC sidecar reader exists on the dataset, hand it to
         // the GPU streaming path so the default v3 route can dispatch to
         // the CSC-direct driver. None falls through to the v3 CSR-direct
@@ -1770,12 +1841,22 @@ fn run_pdex_ref_inner(
             #[cfg(feature = "gpu")]
             Some(device_id) => py
                 .detach(|| {
-                    scx_accel::pdex_ref_gpu(
-                        device_id,
+                    // Subset handle → generic `Lazy`; unsubset → `Backed`,
+                    // preserving the CSC-direct `gpu_csc_v3` route. See the
+                    // matching branch in `run_rank_genes_groups_inner`: this
+                    // switch is what stops a subset handle running the
+                    // CSC-direct kernel against on-disk columns.
+                    let input = if has_view {
+                        scx_accel::GpuDeShardInput::Lazy(&source)
+                    } else {
                         scx_accel::GpuDeShardInput::Backed {
                             csr: &reader,
                             csc: csc_reader.as_deref(),
-                        },
+                        }
+                    };
+                    scx_accel::pdex_ref_gpu(
+                        device_id,
+                        input,
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -1792,7 +1873,7 @@ fn run_pdex_ref_inner(
             None => py
                 .detach(|| {
                     scx_accel::pdex_ref_streaming(
-                        &reader,
+                        &source,
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -2223,6 +2304,14 @@ pub fn pdex_ref(
             "Invalid prefer_format={prefer_format:?}; expected 'auto', 'csr', or 'csc'"
         )));
     }
+    // A presentation-ordered backed `X` (`preserve_var_order=True`) has no
+    // `ShardSource` spelling: the source emits columns in sorted on-disk order
+    // while `adata.var` — and so `gene_names` — stays in request order. Now
+    // that this op streams the handle's *view*, the two widths match, so the
+    // mismatch would be a silent gene/column permutation instead of a shape
+    // error. Refuse, as the other streaming accel ops do.
+    super::reject_preserve_var_order(adata, "pdex_ref")?;
+
     if !matches!(output, "polars" | "pandas") {
         return Err(PyValueError::new_err(format!(
             "Invalid output={output:?}; expected 'polars' or 'pandas'"

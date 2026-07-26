@@ -256,8 +256,13 @@ pub(super) fn aggregate_pseudobulk(
             unreachable!("type check above")
         }
     } else if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        // The handle's *view*: `obs_groups` came from `adata.obs`, so it is one
+        // label per *visible* cell. Streaming the raw reader would walk every
+        // on-disk row and trip the kernel's `obs_groups` length guard on any
+        // subset handle (`filter_cells` → `pseudobulk` used to raise).
+        let source = backed.as_shard_source();
         scx_accel::pseudobulk_aggregate(
-            &backed.backed,
+            &source,
             &obs_groups,
             groupby,
             &gene_names,
@@ -372,6 +377,14 @@ pub fn pseudobulk_dex(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
         )));
     }
+    // A presentation-ordered backed `X` (`preserve_var_order=True`) has no
+    // `ShardSource` spelling: the source emits columns in sorted on-disk order
+    // while `adata.var` — and so `gene_names` — stays in request order. Now
+    // that this op streams the handle's *view*, the two widths match, so the
+    // mismatch would be a silent gene/column permutation instead of a shape
+    // error. Refuse, as the other streaming accel ops do.
+    super::reject_preserve_var_order(adata, "pseudobulk_dex")?;
+
     if !matches!(backend, "pydeseq2" | "nb_glm") {
         return Err(PyValueError::new_err(format!(
             "Invalid backend={backend:?}; expected 'pydeseq2' or 'nb_glm'"

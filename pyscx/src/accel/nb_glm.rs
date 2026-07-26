@@ -1075,6 +1075,12 @@ pub fn pdex_nb_glm(
     device: &str,
     design: Option<&str>,
 ) -> PyResult<Py<PyAny>> {
+    // A presentation-ordered backed `X` (`preserve_var_order=True`) has no
+    // `ShardSource` spelling, and the shared pseudobulk aggregation now
+    // streams the handle's view — so a request-ordered gene axis would be a
+    // silent permutation against `adata.var` rather than a shape error.
+    super::reject_preserve_var_order(adata, "pdex_nb_glm")?;
+
     // `stratify_by` is list-only; turn the opaque PyO3 `Can't extract 'str' to
     // 'Vec'` into an actionable message when a bare string slips through.
     let stratify_by: Option<Vec<String>> = match stratify_by {
