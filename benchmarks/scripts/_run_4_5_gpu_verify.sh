@@ -116,7 +116,11 @@ PY
         echo "--- ${f}"
         python -m pytest "pyscx/tests/${f}.py" -q -p no:randomly 2>&1 \
             | tee "${OUT}/log_${name}_${f}.txt" | tail -3
-        grep -E "^FAILED" "${OUT}/log_${name}_${f}.txt" | sed 's/ - .*//' \
+        # `^ERROR` as well as `^FAILED`: a collection or fixture error never
+        # produces a FAILED line, so a diff that greps only FAILED is blind to
+        # a whole class of regression — the branch could error out every test
+        # in a file and the diff would report nothing.
+        grep -E "^(FAILED|ERROR)" "${OUT}/log_${name}_${f}.txt" | sed 's/ - .*//' \
             >> "${OUT}/ab_${name}_failures.txt"
     done
     sort -o "${OUT}/ab_${name}_failures.txt" "${OUT}/ab_${name}_failures.txt"

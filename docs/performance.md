@@ -647,6 +647,97 @@ a rayon worker — the GPU staging path is now fully sequential, where the old d
 "no ambient parallelism" configuration, and the worker-thread guard is what keeps a
 nested call from deadlocking.
 
+### GPU DE device residency + gene-chunk windowing (Phase-4 task 4.5)
+
+4.2 widened GPU staging's decode; it did not reduce how much decoding there was.
+The GPU CSR DE route (`gpu_csr_v3` — the mandatory route for any file **without** a
+CSC sidecar) has no column-range prefilter, so each of the two v3 CSR drivers runs a
+full `for_each_gpu_csr_shard` pass **per gene chunk**. Cost is
+`n_gene_chunks × n_shards` host decodes and H→D uploads. At census_500k — 61 497 genes
+over a 500-gene chunk is 123 chunks, across 31 CSR shards — that is 123 complete passes
+over a 747 M-nnz matrix, and it is why GPU DE there was 96–99 % host-decode-bound.
+
+The arithmetic closes exactly, which is what made the diagnosis actionable rather than
+plausible: 1 005.6 s of host decode ÷ 123 chunks = 8.2 s, one full decode pass.
+
+**Decode was only half of it.** All four CSR row-scan kernels in `diffexp.cu` are
+one-block-per-row and stride the row's *entire* nonzero range, testing
+`col >= c0 && col < c1` per element — so the per-chunk *kernel* cost was O(nnz) too,
+another 123× over. Bounding 4.2's branch arm from wall (391.7 s) and Σ host-decode
+(≈ 940 s at depth 4) puts kernels + sync somewhere in **[84, 319] s**: residency alone
+could not have been shown to fix it. Both halves therefore ship together.
+
+**1. Device residency.** `scx_gpu::ResidentGpuCsrSource` drains the inner
+`GpuMatrixSource` once, retains every shard in its own device-resident `GpuCsrSlot`, and
+serves each later chunk from VRAM. Decode and H→D collapse from `n_chunks × n_shards` to
+`n_shards`.
+
+Shards are **retained separately, not concatenated**. Two builders in `scx-gpu` already
+concatenate (`decode_csr_shards_to_device` for the `to_gpu_anndata` handoff,
+`gpu_pca_resident::try_build_resident_csr` for the PCA power loop) because their consumers
+need one cuSPARSE descriptor spanning the matrix. DE does not — its kernels take a
+per-shard view plus a `global_row` offset. Collapsing 31 shards into one 500 000-row shard
+would change every kernel's grid shape and, for the f64 `atomicAdd` pseudobulk fold, the
+accumulation interleaving. Keeping them separate means the callback sees byte-for-byte
+what it saw while streaming: same shard indices, shapes, launch geometry, arguments. Total
+VRAM is the same either way (~6 GB at census_500k, 8 B/nnz).
+
+**2. Gene-chunk windowing.** Every one of those kernels already requires
+strictly-increasing per-row column indices — `validate_shard_for_gpu_de` enforces it
+release-active, because a duplicate column races the scatter. Sorted indices make a
+chunk's columns a contiguous sub-range of the row, so two `lower_bound` searches replace
+the linear scan and the per-chunk term becomes `O(nnz / n_chunks + log(row_len))`.
+
+`[lower_bound(c0), lower_bound(c1))` selects exactly the elements the predicate selected.
+For the three scatter kernels each output cell has a single writer, so this is
+bit-identical. `csr_shard_pseudobulk_kernel` folds with f64 `atomicAdd`, whose ordering
+across rows is **already** run-to-run nondeterministic; narrowing the loop changes the
+interleaving but not the character, and the equivalence test compares means and fold
+changes to tolerance while holding statistics and p-values exact.
+
+**What residency costs, per tier** (8 B/nnz — one f32 value + one i32 index; all three fit
+inside half an 80 GB H100 many times over, and all three run 123 gene chunks at the default
+500-gene chunk over 61 497 genes):
+
+| Dataset | nnz | CSR shards | resident VRAM | shard decodes before → after |
+|---|--:|--:|--:|--:|
+| tabula_sapiens_100k | 194.9 M | 7 | ~1.6 GB | 861 → 7 |
+| census_500k | 747.0 M | 31 | ~6.0 GB | 3 813 → 31 |
+| census_1m | 1 402.4 M | 62 | ~11.2 GB | 7 626 → 62 |
+
+**Knobs.** `SCX_GPU_DE_RESIDENT_MAX_FRAC` (default `0.5`) caps residency at half the free
+card, leaving the rest for the per-chunk gene slabs; `SCX_GPU_DE_RESIDENT=0` is the kill
+switch. Residency is declined for a single gene chunk (streaming would run one pass
+anyway) and when the matrix does not fit the budget — checked before every shard, aborting
+the drain at the offending one rather than retaining more than it checked for. If the
+per-chunk budget then cannot fit *alongside* the resident matrix, residency is released
+and the clamp retried: an optimisation must never be the reason a call errors.
+
+**A declined run is invisible in the output** — it produces the same numbers, slowly. So
+the decision is stamped on `uns["scx_accel"][<op>]["resident_csr"]` and floored by the
+`de_route_resident_csr` gate, the same reasoning behind `de_route_csc_direct`.
+`shards_decoded` is *not* the signal: it counts slab passes, which residency does not
+change.
+
+**Also in 4.5.** `validate_shard_for_gpu_de`'s two O(nnz) scans go parallel above 65 536
+nnz — they were amortised into irrelevance when the same shard was re-validated 123 times
+beside 123 re-decodes, and are on the critical path once each shard is decoded once. The
+parallel form reduces by *minimum row index* rather than first-hit, so the error names the
+same offending position it always did rather than one that varies with load. And
+`ShardSource::shard_size_hint()` (catalog-backed, no decode) finally lets GPU staging
+pre-size its pinned/device slots — `RawGpuShardSource::with_max_shard_rows` had been dead
+code — and gives `clamp_prefetch_depth` a real per-shard byte estimate, so
+`SCX_GPU_STAGING_MEMORY_BUDGET` can bound the decoded-but-unconsumed set. Unset, nothing
+derates and the depth is unchanged.
+
+> [!NOTE]
+> **Capture pending.** The `main`-vs-branch measurement (two builds, H100, SLURM jobs
+> 2709094 / 2709095, `benchmarks/scripts/profile_gpu_de_resident.py`) has not landed yet.
+> Per the phase's profile-first rule no `×` is claimed until it does; this section
+> describes the mechanism only. The capture reports wall, the `gpu_profile`
+> host-decode / htod buckets, host peak RSS **and VRAM** — residency's whole cost is
+> device memory, which the 4.2 harness did not record at all.
+
 ### Low-risk marshalling & fusions (Phase-2 tasks 2.4 + 2.7)
 
 These are **correctness-neutral** clean-ups — the 2.0 oracle rated marshalling negligible

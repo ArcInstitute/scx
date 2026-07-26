@@ -2872,6 +2872,48 @@ Three consequences worth knowing before you tune it:
   serially; only the CSR paths are prefetched. They do benefit from the `col_*`
   GIL release.
 
+Since Phase 4.5, `SCX_GPU_STAGING_MEMORY_BUDGET` (bytes) expresses the same
+bound in a unit that does not depend on the file: GPU staging derates the
+prefetch depth so `depth × per-shard-decoded-bytes` fits the budget, using the
+per-shard `nnz` the catalog already carries. Unset — the default — nothing is
+derated and the depth is exactly `SCX_ACCEL_PREFETCH_DEPTH`.
+
+### GPU DE device residency
+
+GPU DE's CSR route (`gpu_csr_v3`, the mandatory route for any file **without** a
+CSC sidecar) has no column-range prefilter, so before Phase 4.5 it walked every
+shard once **per gene chunk** — `n_gene_chunks × n_shards` host decodes and
+uploads. On a 61 497-gene file at the default 500-gene chunk that is 123 full
+passes over the matrix, and it made GPU DE almost entirely host-decode-bound.
+
+4.5 drains the source **once** into device-resident per-shard CSR buffers and
+serves every later chunk from VRAM, and narrows each row to the chunk's column
+window with a binary search instead of scanning the whole row and predicating
+per element. Neither changes what the kernels compute.
+
+The cost is device memory: one f32 value plus one i32 index per nonzero, so
+roughly `8 × nnz` bytes for the whole matrix on top of the per-chunk scratch.
+Two knobs:
+
+- **`SCX_GPU_DE_RESIDENT_MAX_FRAC`** (default `0.5`) — the fraction of *free*
+  VRAM the resident matrix may occupy. The remainder is what the per-chunk
+  gene-slab budget then sizes itself against, so a matrix that takes half the
+  card simply yields a smaller gene chunk rather than an OOM.
+- **`SCX_GPU_DE_RESIDENT=0`** — kill switch. Restores the pre-4.5 streaming
+  behaviour exactly.
+
+Residency is declined — silently and correctly — when the matrix does not fit
+the budget, or when there is only one gene chunk (streaming would run one pass
+anyway, so retaining the matrix would be pure cost). Because a declined run
+produces *identical output*, just slower, the only way to tell is the route
+stamp: `adata.uns["scx_accel"][<op>]["resident_csr"]` is `True` when residency
+engaged, `False` when the CSR route streamed, and `None` on a route with no
+residency decision to make (CPU, dense, or CSC-direct). A benchmark gate
+(`de_route_resident_csr`) floors it for exactly that reason.
+
+The CSC-direct route is unaffected: it already prefilters by column range and
+never re-decodes.
+
 The heavy accelerators, including `pyscx.accel.col_sums` and its siblings,
 release the GIL for their streaming scan, so they can be called concurrently
 from Python threads without serialising each other.

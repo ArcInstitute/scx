@@ -957,7 +957,7 @@ fn pdex_ref_gpu_chunked_v3_csr(
     // VRAM residency actually left. That makes the interaction self-correcting
     // — a big resident matrix simply yields a smaller chunk — rather than
     // requiring the two budgets to be reconciled by hand.
-    let probe_chunk = clamp_chunk_to_de_budget(
+    let probe_chunk = probe_de_gene_chunk(
         dev,
         chunk_size,
         n_pool_max,
@@ -965,28 +965,30 @@ fn pdex_ref_gpu_chunked_v3_csr(
         n_g_max,
         n_test,
         n_groups_for_means,
-    )?;
+    );
     let mut resident = try_resident_csr(dev, source, n_vars, probe_chunk)?;
-    let resident_csr = resident.is_some();
-    let source: &mut dyn GpuMatrixSource = match resident.as_mut() {
-        Some(r) => r,
-        None => source,
-    };
 
     // Clamp the gene chunk so the whole per-chunk working set — dominated by the
     // `n_test × chunk × n_g_max` per-target-group pool slabs — fits a budget
     // fraction of free VRAM. Closes the census-scale OOM (B8): the `chunk_size`
     // passed in (user-set or auto) ignored the per-target-group term, so a large
     // `n_test × n_g_max` overflowed VRAM regardless of `gene_chunk_size`.
-    let chunk_size = clamp_chunk_to_de_budget(
-        dev,
-        chunk_size,
-        n_pool_max,
-        n_ref,
-        n_g_max,
-        n_test,
-        n_groups_for_means,
-    )?;
+    let chunk_size = clamp_chunk_with_residency_backoff(dev, &mut resident, || {
+        clamp_chunk_to_de_budget(
+            dev,
+            chunk_size,
+            n_pool_max,
+            n_ref,
+            n_g_max,
+            n_test,
+            n_groups_for_means,
+        )
+    })?;
+    let resident_csr = resident.is_some();
+    let source: &mut dyn GpuMatrixSource = match resident.as_mut() {
+        Some(r) => r,
+        None => source,
+    };
     let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
     scratch
@@ -2256,7 +2258,7 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
         .map(|&g| group_indices[g].len())
         .max()
         .unwrap_or(0);
-    let probe_chunk = clamp_chunk_to_de_budget(
+    let probe_chunk = probe_de_gene_chunk(
         dev,
         chunk_size,
         pool_len.max(1),
@@ -2264,8 +2266,23 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
         n_g_max,
         n_test,
         n_slots.max(1),
-    )?;
+    );
     let mut resident = try_resident_csr(dev, source, n_vars, probe_chunk)?;
+    // Feasibility re-check with the same arguments the core's own clamp will
+    // use, so residency releases its VRAM here rather than making the core's
+    // clamp fail an op that used to run. The returned chunk is discarded — the
+    // core re-derives it — but the backoff's side effect is the point.
+    let _ = clamp_chunk_with_residency_backoff(dev, &mut resident, || {
+        clamp_chunk_to_de_budget(
+            dev,
+            chunk_size,
+            pool_len.max(1),
+            pool_len.max(1),
+            n_g_max,
+            n_test,
+            n_slots.max(1),
+        )
+    })?;
     let resident_csr = resident.is_some();
     let source: &mut dyn GpuMatrixSource = match resident.as_mut() {
         Some(r) => r,
@@ -2465,6 +2482,68 @@ fn try_resident_csr(
         );
     }
     Ok(resident)
+}
+
+/// Chunk size the budget clamp *would* pick, without logging or erroring.
+///
+/// Used only to learn how many gene chunks residency would be amortised over.
+/// [`clamp_chunk_to_de_budget`] is the real decision and stays where it was —
+/// routing the probe through it too would emit its "clamped N → M" warning
+/// twice per call, which reads as a bug. When even the minimum chunk will not
+/// fit, this returns the requested size and lets the real clamp raise the
+/// actionable error a few lines later.
+fn probe_de_gene_chunk(
+    dev: &GpuDevice,
+    requested_chunk: usize,
+    n_pool_max: usize,
+    n_ref: usize,
+    n_g_max: usize,
+    n_test: usize,
+    n_slots: usize,
+) -> usize {
+    let per_gene =
+        scx_gpu::gpu_de_per_gene_scratch_bytes(n_pool_max, n_ref, n_g_max, n_test, n_slots);
+    let (chunk, fits) = scx_gpu::gpu_de_budget_gene_chunk(dev, requested_chunk, per_gene);
+    if fits {
+        chunk
+    } else {
+        requested_chunk
+    }
+}
+
+/// Run `clamp`, and if it fails *while a resident matrix is held*, give the
+/// VRAM back and try once more.
+///
+/// `clamp_chunk_to_de_budget` errors — deliberately, with an actionable
+/// message — when even the minimum gene chunk will not fit free VRAM. Residency
+/// takes up to `SCX_GPU_DE_RESIDENT_MAX_FRAC` of that VRAM, so without this an
+/// op that ran (slowly) before 4.5 could start failing outright on a
+/// tight-memory workload. Residency is an optimisation; it must never be the
+/// reason a call errors.
+///
+/// The pool trim is required, not cosmetic: cudarc frees into a CUDA memory
+/// pool, so the dropped buffers stay charged to the process until
+/// `cuMemPoolTrimTo(0)` runs and would not show up in the retried
+/// `cuMemGetInfo`.
+fn clamp_chunk_with_residency_backoff(
+    dev: &GpuDevice,
+    resident: &mut Option<scx_gpu::ResidentGpuCsrSource>,
+    clamp: impl Fn() -> Result<usize>,
+) -> Result<usize> {
+    match clamp() {
+        Ok(chunk) => Ok(chunk),
+        Err(e) if resident.is_some() => {
+            log::warn!(
+                "GPU DE: the per-chunk working set does not fit alongside the resident CSR \
+                 ({e}); releasing residency and streaming instead"
+            );
+            *resident = None;
+            dev.reclaim_memory_pool()
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE pool trim after backoff: {e}")))?;
+            clamp()
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn resolve_chunk_size(dev: &GpuDevice, n_obs: usize, user: Option<usize>, n_vars: usize) -> usize {

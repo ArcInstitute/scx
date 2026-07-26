@@ -69,6 +69,22 @@ pub const DEFAULT_RESIDENT_MAX_FRAC: f64 = 0.5;
 /// Built by [`try_build_resident`]. Replays the retained shards in their
 /// original order with their original shard indices; every call is a pure VRAM
 /// read, with no host decode, no pinned staging and no H→D copy.
+///
+/// # Consumers must not mutate the slot
+///
+/// The callback receives `&mut GpuCsrSlot` — the signature the trait requires
+/// so a streaming source can hand over its reusable staging slot — but here
+/// the slot is the **retained** shard, not a scratch buffer refilled on the
+/// next iteration. An in-place transform (the shape
+/// [`GpuPreprocessedShardSource`](crate::gpu_shard_source::GpuPreprocessedShardSource)
+/// uses) would persist into every later pass and compound: normalize applied
+/// once per gene chunk instead of once.
+///
+/// Today's consumers are the GPU DE CSR drivers, which read through
+/// [`GpuCsrSlot::view`] and never write. A source's *own* transforms are safe
+/// and correct — they run during the drain, so the retained bytes are already
+/// post-transform — but a consumer that mutates must not be handed a resident
+/// source.
 pub struct ResidentGpuCsrSource {
     /// `(original shard index, retained device CSR)`, in iteration order.
     /// Empty shards are absent — the streaming driver skips them too, so the

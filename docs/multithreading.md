@@ -401,6 +401,33 @@ on the source; as on the CPU side, the reported total sums concurrent workers
 and can exceed wall-clock, so read it as a ratio against wall rather than an
 absolute.
 
+The pinned and device staging buffers are pre-sized from
+`ShardSource::shard_size_hint()` when the source can answer cheaply — a backed
+reader reads the bound straight from catalog statistics, so no shard is decoded
+to obtain it — which removes the grow-and-realloc the staging slots used to do
+on the first shard. The same hint gives the depth clamp a real per-shard byte
+estimate, so `SCX_GPU_STAGING_MEMORY_BUDGET` (bytes) can bound the
+decoded-but-unconsumed set. Unset, nothing is derated.
+
+Per-shard validation (`validate_shard_for_gpu_de`, two O(nnz) host scans
+enforcing the strictly-increasing-columns and finiteness contracts the DE
+kernels depend on) runs on the consuming thread and is rayon-parallel above
+65 536 nnz. It reduces by **minimum row index** rather than stopping at the
+first offender any worker finds, so the error still names the same position the
+serial scan named — an error message that changes under load is not one a user
+can act on.
+
+### GPU DE device residency
+
+The GPU DE CSR route iterates the source once per gene chunk. When the matrix
+fits a fraction of free VRAM, `ResidentGpuCsrSource` drains it once into
+per-shard device buffers and replays those, so host decode and H→D happen
+`n_shards` times rather than `n_gene_chunks × n_shards`. Shards are retained
+separately rather than concatenated: the DE kernels take a per-shard view plus a
+`global_row` offset, so the callback sees the identical shard sequence, shapes
+and launch geometry it saw while streaming. See
+[scanpy.md § GPU DE device residency](scanpy.md#gpu-de-device-residency).
+
 ## Thread safety of key types
 
 | Type | Thread-safe? | Notes |
