@@ -2139,3 +2139,61 @@ fn prefetched_masked_aggregations_are_bit_identical_to_a_sequential_loop() {
         &ref_var,
     );
 }
+
+/// `shard_size_hint` reads catalog statistics — no decode — and reports upper
+/// bounds that actually bound the shards.
+///
+/// The GPU staging path pre-sizes its pinned + device buffers from this and
+/// derates its decode-prefetch depth by `decoded_bytes()`, so an *under*-bound
+/// would silently reintroduce the grow-and-realloc it exists to remove.
+#[test]
+fn shard_size_hint_bounds_every_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    // 12 rows over 4 shards: 3, 3, 3, 3 rows; sample_shard_data puts 2 nnz per
+    // row, so every shard has 6 nnz.
+    let (backed, _full) = write_test_file_and_open(&dir, 12, 8, 4, 2);
+
+    let hint = crate::ShardSource::shard_size_hint(&backed).expect("catalog carries shard stats");
+
+    let mut observed_max_rows = 0usize;
+    let mut observed_max_nnz = 0usize;
+    for s in 0..crate::ShardSource::n_shards(&backed) {
+        let csr = backed.read_shard_uncached(s).unwrap();
+        observed_max_rows = observed_max_rows.max(csr.n_rows());
+        observed_max_nnz = observed_max_nnz.max(csr.data.len());
+    }
+    assert!(observed_max_nnz > 0, "premise: the fixture has nonzeros");
+
+    assert!(
+        hint.max_rows >= observed_max_rows,
+        "row hint {} under-bounds the largest shard ({observed_max_rows} rows)",
+        hint.max_rows
+    );
+    assert!(
+        hint.max_nnz >= observed_max_nnz,
+        "nnz hint {} under-bounds the largest shard ({observed_max_nnz} nnz)",
+        hint.max_nnz
+    );
+    // On an unprojected, undeleted reader the bounds are exact.
+    assert_eq!(hint.max_rows, observed_max_rows);
+    assert_eq!(hint.max_nnz, observed_max_nnz);
+
+    // The byte estimate the depth clamp divides by: indptr i64 + indices i32 +
+    // data f32.
+    assert_eq!(
+        hint.decoded_bytes(),
+        (hint.max_rows as u64 + 1) * 8 + hint.max_nnz as u64 * 8
+    );
+}
+
+/// A source with no cheap hint declines rather than reporting zero — a caller
+/// must be able to tell "unknown" from "empty", since it sizes buffers from it.
+#[test]
+fn shard_size_hint_defaults_to_none() {
+    let csr = ScxCsr::new_unchecked((2, 3), vec![0i64, 1, 2], vec![0i32, 2], vec![1.0f32, 2.0]);
+    let src = crate::shard_source::SingleShardSource { csr: &csr };
+    assert!(
+        crate::ShardSource::shard_size_hint(&src).is_none(),
+        "the trait default must be None, not Some(zero)"
+    );
+}

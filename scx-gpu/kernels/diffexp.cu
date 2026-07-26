@@ -39,6 +39,51 @@
 #define BLOCK_SORT_CAPACITY (BLOCK_THREADS * ITEMS_PER_THREAD)  // 8192
 
 // ---------------------------------------------------------------------------
+// Per-row gene-chunk window (§9.11).
+//
+// Every CSR row-scan kernel below is launched once per gene chunk and keeps
+// only the nonzeros whose column falls in `[c0, c1)`. Scanning the row's full
+// nonzero range and predicating per element makes the *kernel* cost O(nnz) per
+// chunk — with 61,497 genes at a 500-gene chunk that is the whole matrix walked
+// 123 times, the same quadratic on the compute side that device residency
+// removes on the decode side.
+//
+// Every one of those kernels already requires **strictly increasing per-row
+// column indices** (each documents it; `validate_shard_for_gpu_de` enforces it
+// release-active at the host staging boundary, since a duplicate column races
+// the scatter). Sorted indices mean the chunk's columns are a contiguous
+// sub-range of the row, so two binary searches replace the linear scan and the
+// per-chunk cost becomes O(nnz / n_chunks + log(row_len)).
+//
+// `lower_bound` semantics: the first index in `[lo, hi)` whose column is `>=
+// key`, or `hi` when none is. Applied as `[lower_bound(c0), lower_bound(c1))`
+// this selects exactly `{e : c0 <= indices[e] < c1}` — the identical element
+// set the predicate selected, so the surviving writes and their values are
+// unchanged.
+//
+// Every thread in the block runs the same search redundantly rather than
+// computing it once and broadcasting through shared memory: the searches are
+// warp-uniform, hit the same cache lines, and cost far less than the
+// `__syncthreads()` a broadcast would need.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ long long scx_row_lower_bound(
+    const int* __restrict__ indices,
+    long long lo,
+    long long hi,
+    int key
+) {
+    while (lo < hi) {
+        long long mid = lo + ((hi - lo) >> 1);
+        if (indices[mid] < key) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// ---------------------------------------------------------------------------
 // Scatter dense [n_obs × chunk_size] (row-major) into a gene-major slab.
 //
 // Input  dense[cell * chunk_size + gene]
@@ -75,9 +120,9 @@ extern "C" __global__ void scatter_perm_to_gene_major_kernel(
 // [c0, c1). Output column index is (col - c0). Caller MUST zero the
 // affected row range before invoking — zeros are implicit in the CSR.
 //
-// One block per shard row (gridDim.x = n_shard_rows). Each block walks
-// its row's nonzero entries cooperatively; threads stride over
-// (indptr[r+1] − indptr[r]) and predicate `c0 <= col < c1`.
+// One block per shard row (gridDim.x = n_shard_rows). Each block binary-
+// searches its row down to the `[c0, c1)` column window (see
+// `scx_row_lower_bound`) and strides over that window cooperatively.
 //
 // PRECONDITION: each row's column indices must be strictly increasing
 // (no duplicates). Threads write `dense[...] = data[e]` in parallel, so
@@ -106,14 +151,12 @@ extern "C" __global__ void csr_shard_to_dense_chunk_kernel(
 ) {
     int r = blockIdx.x;
     if (r >= n_shard_rows) return;
-    long long start = indptr[r];
-    long long end   = indptr[r + 1];
+    // Narrow to the row's [c0, c1) window; see `scx_row_lower_bound`.
+    long long w0 = scx_row_lower_bound(indices, indptr[r], indptr[r + 1], c0);
+    long long w1 = scx_row_lower_bound(indices, w0, indptr[r + 1], c1);
     long long out_row_base = (global_row_offset + (long long)r) * (long long)chunk_size;
-    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
-        int col = indices[e];
-        if (col >= c0 && col < c1) {
-            dense[out_row_base + (col - c0)] = data[e];
-        }
+    for (long long e = w0 + threadIdx.x; e < w1; e += blockDim.x) {
+        dense[out_row_base + (indices[e] - c0)] = data[e];
     }
 }
 
@@ -159,14 +202,12 @@ extern "C" __global__ void csr_shard_to_gene_major_kernel(
     int pool_pos = cell_to_pool[cell_global];
     if (pool_pos < 0) return;  // cell not in this pool; whole-block early exit
 
-    long long start = indptr[r];
-    long long end   = indptr[r + 1];
-    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
-        int col = indices[e];
-        if (col >= c0 && col < c1) {
-            int gene_local = col - c0;
-            slab[(long long)gene_local * (long long)n_perm + (long long)pool_pos] = data[e];
-        }
+    // Narrow to the row's [c0, c1) window; see `scx_row_lower_bound`.
+    long long w0 = scx_row_lower_bound(indices, indptr[r], indptr[r + 1], c0);
+    long long w1 = scx_row_lower_bound(indices, w0, indptr[r + 1], c1);
+    for (long long e = w0 + threadIdx.x; e < w1; e += blockDim.x) {
+        long long gene_local = (long long)(indices[e] - c0);
+        slab[gene_local * (long long)n_perm + (long long)pool_pos] = data[e];
     }
 }
 
@@ -203,14 +244,12 @@ extern "C" __global__ void csr_shard_to_gene_major_filtered_kernel(
     if (cell_to_group[cell_global] != this_group_id) return;  // whole-block exit
     int pos = cell_to_pos[cell_global];
 
-    long long start = indptr[r];
-    long long end   = indptr[r + 1];
-    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
-        int col = indices[e];
-        if (col >= c0 && col < c1) {
-            int gene_local = col - c0;
-            slab[(long long)gene_local * (long long)n_perm + (long long)pos] = data[e];
-        }
+    // Narrow to the row's [c0, c1) window; see `scx_row_lower_bound`.
+    long long w0 = scx_row_lower_bound(indices, indptr[r], indptr[r + 1], c0);
+    long long w1 = scx_row_lower_bound(indices, w0, indptr[r + 1], c1);
+    for (long long e = w0 + threadIdx.x; e < w1; e += blockDim.x) {
+        long long gene_local = (long long)(indices[e] - c0);
+        slab[gene_local * (long long)n_perm + (long long)pos] = data[e];
     }
 }
 
@@ -470,7 +509,8 @@ extern "C" __global__ void csc_shard_to_gene_major_kernel(
 //
 // One block per shard row; whole-block early exit when the cell is not in
 // any group (`cell_to_group[global_cell] < 0`). Threads stride over the
-// row's nonzeros, apply the matching `pre()` transform per element, and
+// row's `[c0, c1)` column window (see `scx_row_lower_bound`), apply the
+// matching `pre()` transform per element, and
 // f64-atomicAdd into `sums[group × chunk_size + gene_local]`. f64 atomicAdd
 // is hardware-native on H100 (CC 9.0; shipped in CC 6.0).
 //
@@ -502,15 +542,13 @@ extern "C" __global__ void csr_shard_pseudobulk_kernel(
     int g = cell_to_group[cell_global];
     if (g < 0) return;  // cell not in any group; whole-block early exit
 
-    long long start = indptr[r];
-    long long end   = indptr[r + 1];
-    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
-        int col = indices[e];
-        if (col >= c0 && col < c1) {
-            int gene_local = col - c0;
-            double val = apply_pre_transform(data[e], mode_id);
-            atomicAdd(&sums[(long long)g * (long long)chunk_size + (long long)gene_local], val);
-        }
+    // Narrow to the row's [c0, c1) window; see `scx_row_lower_bound`.
+    long long w0 = scx_row_lower_bound(indices, indptr[r], indptr[r + 1], c0);
+    long long w1 = scx_row_lower_bound(indices, w0, indptr[r + 1], c1);
+    for (long long e = w0 + threadIdx.x; e < w1; e += blockDim.x) {
+        long long gene_local = (long long)(indices[e] - c0);
+        double val = apply_pre_transform(data[e], mode_id);
+        atomicAdd(&sums[(long long)g * (long long)chunk_size + gene_local], val);
     }
 }
 

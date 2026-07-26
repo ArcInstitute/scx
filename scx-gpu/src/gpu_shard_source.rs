@@ -38,6 +38,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::safe::{CudaEvent, CudaSlice, CudaStream};
+use rayon::prelude::*;
 use scx_format_io::{prefetch, ShardSource};
 
 use crate::device::GpuDevice;
@@ -70,25 +71,61 @@ fn csr_htod_bytes(csr: &scx_sparse::ScxCsr) -> usize {
 ///    `+INF` and sorts on the raw IEEE-754 bit pattern, so a NaN lands at the
 ///    wrong position and corrupts the U statistic and tie counts.
 ///
-/// O(nnz) — negligible beside the H2D copy and the per-gene device sort. Run
-/// once per shard for every GPU DE consumer (the `for_each_gpu_shard` driver
-/// calls it before staging).
-fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), GpuError> {
-    for r in 0..csr.n_rows() {
+/// Two 2×O(nnz) host scans that sit on the staging thread, so they are the
+/// serial section between two parallel ones (the decode-prefetch pool feeding
+/// this shard, and the device kernels consuming it). Before §9.11 this was
+/// amortised away — the same shard was re-validated once per gene chunk, so it
+/// was a rounding error beside the 123 re-decodes. Now that
+/// [`ResidentGpuCsrSource`](crate::ResidentGpuCsrSource) makes each shard's
+/// decode happen exactly once, this scan is one of the few things left on the
+/// critical path, hence the parallel form below (§9.13).
+///
+/// Both scans keep the serial version's *exact* answer, not just the same
+/// accept/reject decision: the sortedness check reduces by **minimum row
+/// index** rather than taking whichever offending row a worker reaches first,
+/// and the finiteness check uses `position_first`. So the error message names
+/// the same offending position it always did — a first-hit early exit would
+/// have made the message nondeterministic under load.
+///
+/// Small shards run serially: below [`VALIDATE_PAR_MIN_NNZ`] the rayon
+/// split/join costs more than the scan.
+pub(crate) fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), GpuError> {
+    /// First `(row, a, b)` whose row has `a >= b` at adjacent positions,
+    /// minimised over rows.
+    fn first_unsorted_row(csr: &scx_sparse::ScxCsr, r: usize) -> Option<(usize, i32, i32)> {
         let s = csr.indptr[r] as usize;
         let e = csr.indptr[r + 1] as usize;
-        for w in csr.indices[s..e].windows(2) {
-            if w[0] >= w[1] {
-                return Err(GpuError::InvalidShard(format!(
-                    "ScxCsr row {r} has unsorted or duplicate column indices ({} >= {}): \
-                     GPU shard scatter requires strictly-increasing per-row indices for \
-                     deterministic output",
-                    w[0], w[1]
-                )));
-            }
-        }
+        csr.indices[s..e]
+            .windows(2)
+            .find(|w| w[0] >= w[1])
+            .map(|w| (r, w[0], w[1]))
     }
-    if let Some(pos) = csr.data.iter().position(|v| !v.is_finite()) {
+
+    let n_rows = csr.n_rows();
+    let parallel = csr.data.len() >= validate_par_min_nnz();
+
+    let unsorted = if parallel {
+        (0..n_rows)
+            .into_par_iter()
+            .filter_map(|r| first_unsorted_row(csr, r))
+            .min_by_key(|(r, _, _)| *r)
+    } else {
+        (0..n_rows).find_map(|r| first_unsorted_row(csr, r))
+    };
+    if let Some((r, a, b)) = unsorted {
+        return Err(GpuError::InvalidShard(format!(
+            "ScxCsr row {r} has unsorted or duplicate column indices ({a} >= {b}): \
+             GPU shard scatter requires strictly-increasing per-row indices for \
+             deterministic output"
+        )));
+    }
+
+    let non_finite = if parallel {
+        csr.data.par_iter().position_first(|v| !v.is_finite())
+    } else {
+        csr.data.iter().position(|v| !v.is_finite())
+    };
+    if let Some(pos) = non_finite {
         return Err(GpuError::InvalidShard(format!(
             "ScxCsr contains a non-finite value ({}) at nonzero index {pos}: GPU DE ranking \
              requires finite input (NaN corrupts the radix sort; sanitise/QC before DE)",
@@ -96,6 +133,84 @@ fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), GpuError> {
         )));
     }
     Ok(())
+}
+
+/// Default nnz below which [`validate_shard_for_gpu_de`] scans serially. Real
+/// shards are orders of magnitude above this (a census_500k shard carries
+/// ~24 M nnz); the threshold exists so unit fixtures and degenerate single-row
+/// shards don't pay a pool round-trip. Deliberately low enough that a test can
+/// exceed it with a ~256 KB fixture and still exercise the parallel path.
+pub(crate) const VALIDATE_PAR_MIN_NNZ: usize = 65_536;
+
+/// Effective threshold, overridable by `SCX_GPU_VALIDATE_PAR_MIN_NNZ`.
+///
+/// Exists because the parallel scan is not free for every consumer. It runs on
+/// the **consuming** thread, so on a decode-bound op it competes with the very
+/// decode-prefetch workers that are feeding it — GPU DE wins (validation is on
+/// its critical path now that each shard is decoded once) while GPU HVG, which
+/// validates but gains nothing from residency, can only lose. Setting the knob
+/// above any real shard's nnz restores the pre-4.5 serial scan **exactly**: the
+/// `else` arm below is the original code, unchanged, so this is a genuine
+/// baseline rather than an "off" arm that means something new.
+pub(crate) fn validate_par_min_nnz() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SCX_GPU_VALIDATE_PAR_MIN_NNZ")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(VALIDATE_PAR_MIN_NNZ)
+    })
+}
+
+/// Host-RAM budget, in bytes, for the shards the GPU staging path holds
+/// decoded-but-not-yet-staged. Unset means "no budget" — the depth is whatever
+/// `SCX_ACCEL_PREFETCH_DEPTH` / `DEFAULT_PREFETCH_DEPTH` says.
+const STAGING_MEMORY_BUDGET_ENV: &str = "SCX_GPU_STAGING_MEMORY_BUDGET";
+
+fn staging_memory_budget() -> Option<u64> {
+    static B: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var(STAGING_MEMORY_BUDGET_ENV)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|b| *b > 0)
+    })
+}
+
+/// Decode-prefetch depth for the multi-shard staging loop, derated to a host
+/// memory budget when one is set (§9.13 follow-on / the #373 review finding).
+///
+/// The pipeline holds up to `depth` decoded shards in host RAM at once, and GPU
+/// staging is the path with the largest shards in the system — a census_500k
+/// shard is ~190 MB decoded, so the default depth of 4 is ~760 MB. The #373
+/// review found that `clamp_prefetch_depth` existed but clamped nothing
+/// anywhere: its two call sites derated a `max_workers` that `StableOrder`
+/// discards, and every prefetch call site passed the raw depth. This is the
+/// first place it actually binds.
+///
+/// **No silent behaviour change**: with `SCX_GPU_STAGING_MEMORY_BUDGET` unset
+/// (the default) this returns exactly what the old code used. Setting it makes
+/// the advice "lower your prefetch depth on a memory-tight host" actionable in
+/// terms a user can reason about — bytes — instead of a shard count whose cost
+/// depends on the file.
+///
+/// Sources without a [`shard_size_hint`](ShardSource::shard_size_hint) cannot
+/// be budgeted (there is no per-shard byte estimate to divide by) and keep the
+/// unclamped depth.
+fn resolve_staging_prefetch_depth(source: &(dyn ShardSource + Sync)) -> usize {
+    let requested = prefetch::prefetch_depth();
+    let (Some(budget), Some(hint)) = (staging_memory_budget(), source.shard_size_hint()) else {
+        return requested;
+    };
+    let depth = prefetch::clamp_prefetch_depth(requested, hint.decoded_bytes(), budget);
+    if depth < requested {
+        log::debug!(
+            "GPU staging: clamped decode-prefetch depth {requested} -> {depth} to fit the \
+             {budget}-byte {STAGING_MEMORY_BUDGET_ENV} budget (~{} B/shard)",
+            hint.decoded_bytes(),
+        );
+    }
+    depth
 }
 
 /// `ShardSource` adapter that times every decode into the GPU profiler's
@@ -202,19 +317,33 @@ pub struct RawGpuShardSource<'a> {
     pinned_events: [Option<CudaEvent>; 2],
     slot: GpuCsrSlot,
     copy_stream: Arc<CudaStream>,
+    /// Decode-prefetch depth for the multi-shard path, resolved once at
+    /// construction by [`resolve_staging_prefetch_depth`].
+    prefetch_depth: usize,
 }
 
 impl<'a> RawGpuShardSource<'a> {
-    /// Construct a raw GPU shard source with lazy-grow staging buffers.
+    /// Construct a raw GPU shard source, pre-sizing the staging buffers from
+    /// the source's [`shard_size_hint`](ShardSource::shard_size_hint) when it
+    /// offers one and growing them on demand when it does not.
     ///
-    /// Deliberately does **not** call `ShardSource::max_shard_rows()`
-    /// to pre-size: the default trait impl reads every shard, which would
-    /// defeat the worker-thread pipelining and inflate I/O on backed
-    /// readers without an O(1) override. Backed readers with the O(1)
-    /// override and callers that know their max should use
-    /// [`Self::with_max_shard_rows`] instead.
+    /// Deliberately does **not** call `ShardSource::max_shard_rows()` directly:
+    /// its default trait impl decodes every shard, which would defeat the
+    /// decode-prefetch pipelining and inflate I/O on sources without an O(1)
+    /// override. `shard_size_hint` is `None` unless the implementor can answer
+    /// cheaply — a backed reader reads it straight from catalog statistics — so
+    /// consulting it is always safe. Callers who know their bounds
+    /// independently can still pass them via [`Self::with_max_shard_rows`].
+    ///
+    /// Before 4.5 this always built at capacity 1 and let the slots
+    /// grow-and-realloc up to the first shard's size, and
+    /// `with_max_shard_rows` — the obvious pre-sizing hook, on the path with
+    /// the largest shards in the system — had no production caller at all.
     pub fn new(dev: &'a GpuDevice, source: &'a (dyn ShardSource + Sync)) -> Result<Self, GpuError> {
-        Self::build(dev, source, 1, 1)
+        match source.shard_size_hint() {
+            Some(hint) => Self::with_max_shard_rows(dev, source, hint.max_rows, hint.max_nnz),
+            None => Self::build(dev, source, 1, 1),
+        }
     }
 
     /// Construct a raw GPU shard source with pinned and device buffers
@@ -250,6 +379,7 @@ impl<'a> RawGpuShardSource<'a> {
             PinnedCsrSlot::new(dev.context(), indptr_cap, nnz_cap),
         ];
         let slot = GpuCsrSlot::new(dev, indptr_cap, nnz_cap)?;
+        let prefetch_depth = resolve_staging_prefetch_depth(source);
 
         // Dedicated copy stream — used only when n_shards > 1 (single-
         // shard sources reuse the compute stream below).
@@ -268,7 +398,16 @@ impl<'a> RawGpuShardSource<'a> {
             pinned_events: [None, None],
             slot,
             copy_stream,
+            prefetch_depth,
         })
+    }
+
+    /// Capacity of the reusable device CSR slot. Test-only: lets the
+    /// pre-sizing test assert the staging buffers never grow-and-realloc when
+    /// the source offered a `shard_size_hint`.
+    #[cfg(test)]
+    pub(crate) fn slot_capacity(&self) -> (usize, usize, usize) {
+        self.slot.capacity()
     }
 
     /// Run `f` over each non-empty shard. Internal driver shared between
@@ -353,7 +492,7 @@ impl<'a> RawGpuShardSource<'a> {
         let profiled = ProfiledDecode(self.source);
         let scope_result = prefetch::for_each_shard_ordered_uncached(
             &profiled,
-            prefetch::prefetch_depth(),
+            self.prefetch_depth,
             |i, csr| -> Result<(), GpuError> {
                 if csr.n_rows() == 0 {
                     return Ok(());
@@ -589,6 +728,33 @@ mod tests {
         }
     }
 
+    /// Same as `InMemorySource` but advertises a `shard_size_hint`, standing in
+    /// for a catalog-backed reader.
+    struct HintedSource {
+        inner: InMemorySource,
+    }
+
+    impl ShardSource for HintedSource {
+        fn n_shards(&self) -> usize {
+            self.inner.n_shards()
+        }
+        fn n_obs(&self) -> usize {
+            self.inner.n_obs()
+        }
+        fn n_vars(&self) -> usize {
+            self.inner.n_vars()
+        }
+        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
+            self.inner.read_shard(shard_idx)
+        }
+        fn shard_size_hint(&self) -> Option<scx_format_io::ShardSizeHint> {
+            Some(scx_format_io::ShardSizeHint {
+                max_rows: self.inner.shards.iter().map(|s| s.n_rows()).max()?,
+                max_nnz: self.inner.shards.iter().map(|s| s.data.len()).max()?,
+            })
+        }
+    }
+
     fn make_csr(rows: usize, n_vars: usize, base: f32) -> ScxCsr {
         // One nonzero per row at column (row % n_vars), value (base + row).
         let mut indptr = vec![0i64];
@@ -600,6 +766,101 @@ mod tests {
             indptr.push(indices.len() as i64);
         }
         ScxCsr::new_unchecked((rows, n_vars), indptr, indices, data)
+    }
+
+    fn hinted(shards: Vec<ScxCsr>, n_vars: usize) -> HintedSource {
+        let n_obs = shards.iter().map(|s| s.n_rows()).sum();
+        HintedSource {
+            inner: InMemorySource {
+                shards,
+                n_obs,
+                n_vars,
+            },
+        }
+    }
+
+    /// §9.13 follow-on: with no budget set — the default — the depth clamp is
+    /// inert. This is the "no silent behaviour change" claim, so it is asserted
+    /// rather than argued, including the premise that the knob really is unset
+    /// in this process (a leaked env var would make the test vacuous).
+    #[test]
+    fn staging_depth_is_unclamped_without_a_budget() {
+        assert!(
+            std::env::var(STAGING_MEMORY_BUDGET_ENV).is_err(),
+            "premise: {STAGING_MEMORY_BUDGET_ENV} must be unset for this test to mean anything"
+        );
+        let src = hinted(vec![make_csr(4, 8, 1.0), make_csr(4, 8, 2.0)], 8);
+        assert_eq!(
+            resolve_staging_prefetch_depth(&src),
+            prefetch::prefetch_depth()
+        );
+    }
+
+    /// A source that cannot describe its shards cannot be budgeted — there is
+    /// no per-shard byte estimate to divide by — so it keeps the full depth
+    /// even when a budget is set.
+    #[test]
+    fn staging_depth_needs_a_hint_to_be_clamped() {
+        let src = InMemorySource {
+            shards: vec![make_csr(4, 8, 1.0), make_csr(4, 8, 2.0)],
+            n_obs: 8,
+            n_vars: 8,
+        };
+        assert!(ShardSource::shard_size_hint(&src).is_none());
+        assert_eq!(
+            resolve_staging_prefetch_depth(&src),
+            prefetch::prefetch_depth()
+        );
+    }
+
+    /// The clamp arithmetic the budget path performs, exercised directly since
+    /// the budget itself is a process-global `OnceLock` that a test cannot vary.
+    #[test]
+    fn staging_depth_clamp_arithmetic() {
+        let src = hinted(vec![make_csr(4, 8, 1.0)], 8);
+        let hint = ShardSource::shard_size_hint(&src).unwrap();
+        let per_shard = hint.decoded_bytes();
+        assert!(per_shard > 0);
+
+        // Budget for exactly two shards -> depth 2, whatever was requested.
+        assert_eq!(
+            prefetch::clamp_prefetch_depth(8, per_shard, per_shard * 2),
+            2
+        );
+        // A budget smaller than one shard still floors at 1: refusing to decode
+        // anything would be worse than exceeding the budget.
+        assert_eq!(prefetch::clamp_prefetch_depth(8, per_shard, 1), 1);
+        // A generous budget never raises the requested depth.
+        assert_eq!(
+            prefetch::clamp_prefetch_depth(2, per_shard, per_shard * 100),
+            2
+        );
+    }
+
+    /// A hinted source pre-sizes the staging slot at construction, so the drain
+    /// never grows-and-reallocs. Before 4.5 `with_max_shard_rows` — the hook for
+    /// this, on the path with the largest shards in the system — had no
+    /// production caller and every source started at capacity 1.
+    #[test]
+    fn hinted_source_presizes_the_staging_slot() {
+        let dev = require_gpu!();
+        let shards = vec![make_csr(3, 5, 1.0), make_csr(7, 5, 100.0)];
+        let src = hinted(shards, 5);
+
+        let mut gpu_src = RawGpuShardSource::new(&dev, &src).unwrap();
+        let at_construction = gpu_src.slot_capacity();
+        assert!(
+            at_construction.0 >= 8 && at_construction.1 >= 7 && at_construction.2 >= 7,
+            "slot must be pre-sized for the largest shard (7 rows / 7 nnz), got \
+             {at_construction:?}"
+        );
+
+        gpu_src.for_each_gpu_shard(|_idx, _slot| Ok(())).unwrap();
+        assert_eq!(
+            gpu_src.slot_capacity(),
+            at_construction,
+            "a pre-sized slot must not grow during the drain"
+        );
     }
 
     /// ACC3: a row with non-increasing (here duplicate) column indices is
@@ -632,6 +893,152 @@ mod tests {
     #[test]
     fn validate_accepts_clean_shard() {
         let csr = make_csr(8, 4, 1.0);
+        assert!(validate_shard_for_gpu_de(&csr).is_ok());
+    }
+
+    /// Skip rather than fail when `SCX_GPU_VALIDATE_PAR_MIN_NNZ` puts the
+    /// parallel path out of reach for a fixture of `nnz`. A premise assertion
+    /// should fire when the *fixture* is wrong, not when the environment
+    /// deliberately disables the feature under test — the A/B arm that pins the
+    /// threshold high would otherwise report four failures instead of a
+    /// measurement.
+    fn parallel_path_reachable(nnz: usize) -> bool {
+        if nnz >= validate_par_min_nnz() {
+            return true;
+        }
+        eprintln!(
+            "SCX_GPU_VALIDATE_PAR_MIN_NNZ={} puts the parallel scan out of reach for a \
+             {nnz}-nnz fixture — skipping",
+            validate_par_min_nnz()
+        );
+        false
+    }
+
+    /// Build a shard above [`validate_par_min_nnz`] so validation takes the
+    /// parallel path: `rows` rows × `per_row` strictly-increasing columns.
+    fn make_big_csr(rows: usize, per_row: usize) -> ScxCsr {
+        let mut indptr = Vec::with_capacity(rows + 1);
+        indptr.push(0i64);
+        let mut indices = Vec::with_capacity(rows * per_row);
+        let mut data = Vec::with_capacity(rows * per_row);
+        for r in 0..rows {
+            for c in 0..per_row {
+                indices.push(c as i32);
+                data.push((r * per_row + c) as f32);
+            }
+            indptr.push(indices.len() as i64);
+        }
+        ScxCsr::new_unchecked((rows, per_row), indptr, indices, data)
+    }
+
+    /// §9.13: the parallel scan must name the **first** offending row, not
+    /// whichever one a worker happens to reach first. Three rows are corrupted;
+    /// only the lowest may be reported, and the message must be the one the
+    /// serial scan produced.
+    #[test]
+    fn validate_parallel_reports_the_minimum_offending_row() {
+        let per_row = 64;
+        let rows = 4096; // 262 144 nnz — comfortably over the parallel threshold
+        let mut csr = make_big_csr(rows, per_row);
+        if !parallel_path_reachable(csr.data.len()) {
+            return;
+        }
+
+        // Corrupt rows 3000, 977 and 2500 (inserted out of order on purpose).
+        for &r in &[3000usize, 977, 2500] {
+            let s = csr.indptr[r] as usize;
+            csr.indices[s + 5] = csr.indices[s + 4]; // duplicate → a >= b
+        }
+
+        let err = validate_shard_for_gpu_de(&csr).unwrap_err();
+        let GpuError::InvalidShard(msg) = err else {
+            panic!("expected InvalidShard, got {err:?}");
+        };
+        assert_eq!(
+            msg,
+            "ScxCsr row 977 has unsorted or duplicate column indices (4 >= 4): \
+             GPU shard scatter requires strictly-increasing per-row indices for \
+             deterministic output",
+            "parallel scan must report the same first offending row as the serial one"
+        );
+
+        // The identical shard truncated below the threshold takes the serial
+        // path and must agree on the row it names.
+        let small = {
+            let rows_small = 1000;
+            let nnz = csr.indptr[rows_small] as usize;
+            ScxCsr::new_unchecked(
+                (rows_small, per_row),
+                csr.indptr[..=rows_small].to_vec(),
+                csr.indices[..nnz].to_vec(),
+                csr.data[..nnz].to_vec(),
+            )
+        };
+        assert!(
+            small.data.len() < validate_par_min_nnz(),
+            "premise: the truncated fixture must take the serial path"
+        );
+        let GpuError::InvalidShard(small_msg) = validate_shard_for_gpu_de(&small).unwrap_err()
+        else {
+            panic!("expected InvalidShard from the serial path");
+        };
+        assert_eq!(small_msg, msg, "serial and parallel scans must agree");
+    }
+
+    /// Same for the finiteness scan: `position_first`, not "any position".
+    #[test]
+    fn validate_parallel_reports_the_first_non_finite_position() {
+        let mut csr = make_big_csr(4096, 64);
+        if !parallel_path_reachable(csr.data.len()) {
+            return;
+        }
+
+        csr.data[200_000] = f32::INFINITY;
+        csr.data[12_345] = f32::NAN;
+        csr.data[99_999] = f32::NEG_INFINITY;
+
+        let GpuError::InvalidShard(msg) = validate_shard_for_gpu_de(&csr).unwrap_err() else {
+            panic!("expected InvalidShard");
+        };
+        assert!(
+            msg.contains("at nonzero index 12345"),
+            "must name the first non-finite position, got: {msg}"
+        );
+    }
+
+    /// A large clean shard is accepted — guards against the parallel path
+    /// inventing an offender (e.g. a window straddling a row boundary).
+    #[test]
+    fn validate_accepts_large_clean_shard() {
+        let csr = make_big_csr(4096, 64);
+        if !parallel_path_reachable(csr.data.len()) {
+            return;
+        }
+        assert!(validate_shard_for_gpu_de(&csr).is_ok());
+    }
+
+    /// Rows are validated independently: `indices` is one flat array, so a
+    /// naive `windows(2)` over the whole array would see the boundary pair
+    /// (last column of row r, first column of row r+1) and reject a perfectly
+    /// legal shard. Every row here ends high and starts low.
+    #[test]
+    fn validate_does_not_straddle_row_boundaries() {
+        let rows = 2048;
+        let per_row = 64;
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for r in 0..rows {
+            for c in 0..per_row {
+                indices.push(c as i32); // every row restarts at column 0
+                data.push(1.0f32 + r as f32);
+            }
+            indptr.push(indices.len() as i64);
+        }
+        let csr = ScxCsr::new_unchecked((rows, per_row), indptr, indices, data);
+        if !parallel_path_reachable(csr.data.len()) {
+            return;
+        }
         assert!(validate_shard_for_gpu_de(&csr).is_ok());
     }
 

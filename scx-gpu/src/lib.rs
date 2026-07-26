@@ -73,6 +73,7 @@ pub mod math_policy;
 pub mod nvcomp;
 pub mod preprocessed_gpu_matrix_source;
 pub mod profile;
+pub mod resident_gpu_csr_source;
 pub mod rice_gpu;
 pub mod shard_decode;
 pub mod shufdelta_gpu;
@@ -142,6 +143,9 @@ pub use linear_operator::CenteredSparseOperator;
 pub use math_policy::{GpuMathMode, GpuPcaTuning, SpmmAlgPolicy};
 pub use preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;
 pub use profile::{ProfileSnapshot, StageStat};
+pub use resident_gpu_csr_source::{
+    try_build_resident, ResidentGpuCsrSource, DEFAULT_RESIDENT_MAX_FRAC,
+};
 pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, decode_shard_gpu_with_stats, DeviceDecodeStats, GpuCsr};
 pub use sparse_dense::{

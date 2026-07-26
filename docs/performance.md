@@ -649,6 +649,157 @@ a rayon worker — the GPU staging path is now fully sequential, where the old d
 "no ambient parallelism" configuration, and the worker-thread guard is what keeps a
 nested call from deadlocking.
 
+### GPU DE device residency + gene-chunk windowing (Phase-4 task 4.5)
+
+4.2 widened GPU staging's decode; it did not reduce how much decoding there was.
+The GPU CSR DE route (`gpu_csr_v3` — the mandatory route for any file **without** a
+CSC sidecar) has no column-range prefilter, so each of the two v3 CSR drivers runs a
+full `for_each_gpu_csr_shard` pass **per gene chunk**. Cost is
+`n_gene_chunks × n_shards` host decodes and H→D uploads. At census_500k — 61 497 genes
+over a 500-gene chunk is 123 chunks, across 31 CSR shards — that is 123 complete passes
+over a 747 M-nnz matrix. Pre-4.2, with staging decoding on one thread, that made GPU DE
+there **98.6 % host-decode-bound** (1 005.6 s of a 1 019.7 s wall).
+
+The arithmetic closes exactly, which is what made the diagnosis actionable rather than
+plausible: 1 005.6 s ÷ 123 chunks = **8.2 s**, one full decode pass. (That prediction is
+what the 4.5 capture below then hit, at 8 578 ms.)
+
+**Decode was only half of it.** All four CSR row-scan kernels in `diffexp.cu` are
+one-block-per-row and stride the row's *entire* nonzero range, testing
+`col >= c0 && col < c1` per element — so the per-chunk *kernel* cost was O(nnz) too,
+another 123× over. 4.2 widened the decode but left that untouched: bounding its arm from
+wall (383.9 s as measured below) and Σ host-decode (≈ 941 s summed over depth-4 workers)
+puts kernels + sync somewhere in **[84, 319] s**. Residency alone could not have been
+shown to fix that, so both halves ship together.
+
+Note the two baselines in play. Everything above quoting 1 019.7 s is **pre-4.2**
+(`2055f74f`); the capture below is against **post-4.2** `main` (`2d1fe16b`), which is the
+383.9 s arm. 4.2's 2.60× on this op is already banked in that baseline and is not counted
+again here.
+
+**1. Device residency.** `scx_gpu::ResidentGpuCsrSource` drains the inner
+`GpuMatrixSource` once, retains every shard in its own device-resident `GpuCsrSlot`, and
+serves each later chunk from VRAM. Decode and H→D collapse from `n_chunks × n_shards` to
+`n_shards`.
+
+Shards are **retained separately, not concatenated**. Two builders in `scx-gpu` already
+concatenate (`decode_csr_shards_to_device` for the `to_gpu_anndata` handoff,
+`gpu_pca_resident::try_build_resident_csr` for the PCA power loop) because their consumers
+need one cuSPARSE descriptor spanning the matrix. DE does not — its kernels take a
+per-shard view plus a `global_row` offset. Collapsing 31 shards into one 500 000-row shard
+would change every kernel's grid shape and, for the f64 `atomicAdd` pseudobulk fold, the
+accumulation interleaving. Keeping them separate means the callback sees byte-for-byte
+what it saw while streaming: same shard indices, shapes, launch geometry, arguments. Total
+VRAM is the same either way (~6 GB at census_500k, 8 B/nnz).
+
+**2. Gene-chunk windowing.** Every one of those kernels already requires
+strictly-increasing per-row column indices — `validate_shard_for_gpu_de` enforces it
+release-active, because a duplicate column races the scatter. Sorted indices make a
+chunk's columns a contiguous sub-range of the row, so two `lower_bound` searches replace
+the linear scan and the per-chunk term becomes `O(nnz / n_chunks + log(row_len))`.
+
+`[lower_bound(c0), lower_bound(c1))` selects exactly the elements the predicate selected.
+For the three scatter kernels each output cell has a single writer, so this is
+bit-identical. `csr_shard_pseudobulk_kernel` folds with f64 `atomicAdd`, whose ordering
+across rows is **already** run-to-run nondeterministic; narrowing the loop changes the
+interleaving but not the character, and the equivalence test compares means and fold
+changes to tolerance while holding statistics and p-values exact.
+
+**What residency costs, per tier** (8 B/nnz — one f32 value + one i32 index; all three fit
+inside half an 80 GB H100 many times over, and all three run 123 gene chunks at the default
+500-gene chunk over 61 497 genes):
+
+| Dataset | nnz | CSR shards | resident VRAM | shard decodes before → after |
+|---|--:|--:|--:|--:|
+| tabula_sapiens_100k | 194.9 M | 7 | ~1.6 GB | 861 → 7 |
+| census_500k | 747.0 M | 31 | ~6.0 GB | 3 813 → 31 |
+| census_1m | 1 402.4 M | 62 | ~11.2 GB | 7 626 → 62 |
+
+**Knobs.** `SCX_GPU_DE_RESIDENT_MAX_FRAC` (default `0.5`) caps residency at half the free
+card, leaving the rest for the per-chunk gene slabs; `SCX_GPU_DE_RESIDENT=0` is the kill
+switch. Residency is declined for a single gene chunk (streaming would run one pass
+anyway) and when the matrix does not fit the budget — checked before every shard, aborting
+the drain at the offending one rather than retaining more than it checked for. If the
+per-chunk budget then cannot fit *alongside* the resident matrix, residency is released
+and the clamp retried: an optimisation must never be the reason a call errors.
+
+**A declined run is invisible in the output** — it produces the same numbers, slowly. So
+the decision is stamped on `uns["scx_accel"][<op>]["resident_csr"]` and floored by the
+`de_route_resident_csr` gate, the same reasoning behind `de_route_csc_direct`.
+`shards_decoded` is *not* the signal: it counts slab passes, which residency does not
+change.
+
+**Also in 4.5.** `validate_shard_for_gpu_de`'s two O(nnz) scans go parallel above 65 536
+nnz — they were amortised into irrelevance when the same shard was re-validated 123 times
+beside 123 re-decodes, and are on the critical path once each shard is decoded once. The
+parallel form reduces by *minimum row index* rather than first-hit, so the error names the
+same offending position it always did rather than one that varies with load. And
+`ShardSource::shard_size_hint()` (catalog-backed, no decode) finally lets GPU staging
+pre-size its pinned/device slots — `RawGpuShardSource::with_max_shard_rows` had been dead
+code — and gives `clamp_prefetch_depth` a real per-shard byte estimate, so
+`SCX_GPU_STAGING_MEMORY_BUDGET` can bound the decoded-but-unconsumed set. Unset, nothing
+derates and the depth is unchanged.
+
+**Measured** (SLURM job 2709095, H100, **two builds** — `main` at `2d1fe16b` (i.e. post-4.2)
+vs the branch, both at their own defaults, `benchmarks/scripts/profile_gpu_de_resident.py`,
+3 runs, median wall, `SCX_DISABLE_CUDA_GRAPHS=1`):
+
+| Op | Dataset | `main` (4.2) | branch | Speedup | Σ host-decode | pinned HTOD | VRAM peak |
+|---|---|--:|--:|--:|--:|--:|--:|
+| pdex_ref | tabula_sapiens_100k | 114 902 ms | 3 154 ms | **36.4×** | 246 868 → 2 105 ms | 17 313 → 203 ms | 1 775 → 2 984 MB |
+| wilcoxon | tabula_sapiens_100k | 113 185 ms | 3 661 ms | **30.9×** | 247 348 → 2 120 ms | 17 351 → 200 ms | 2 127 → 3 334 MB |
+| pdex_ref | census_500k | 383 890 ms | 12 536 ms | **30.6×** | 941 404 → 8 578 ms | 64 656 → 641 ms | 3 658 → 9 128 MB |
+| wilcoxon | census_500k | 385 877 ms | 14 064 ms | **27.4×** | 945 281 → 8 146 ms | 64 477 → 631 ms | 5 162 → 10 632 MB |
+| hvg *(control)* | 100k / 500k / 1m | 4 409 / 10 559 / 16 030 ms | 4 447 / 11 232 / 17 255 ms | 0.99 / 0.94 / 0.93× | — | — | 1 192 → 1 192 MB |
+
+**The mechanism is confirmed three ways, not just by the wall.** At census_500k `pdex_ref`
+the summed host-decode falls **110×** (predicted 123×: one pass instead of one per gene
+chunk) and lands on **8 578 ms** against the 8 200 ms predicted *before the run* from
+1 005.6 s ÷ 123. The pinned-staging bucket falls **101×**. And the VRAM delta between arms
+is **5 470 MB** against a predicted 5 976 MB of resident CSR. Host peak RSS *falls* 14 %
+(3 643 → 3 127 MB) — one decode pass churns far less host memory than 123.
+
+**Residency alone would not have done this.** Its own predicted range was 1.2–4.4× (the
+[84, 319] s kernel bound above). Post-change, kernels + sync are ~10 s of the 12.5 s wall,
+so the windowing cut the per-chunk scan by roughly 8–32×. The capture measures the two
+**together** and cannot attribute between them: there is a knob to disable residency but
+none to disable the windowing, and adding one was not judged worth the API surface.
+
+> [!NOTE]
+> **The hvg control's 0.93–0.99× is noise, and that was measured rather than assumed.**
+> Consistently-below-1.0 across three datasets looked like a real cost — plausibly the
+> parallel shard validation, which runs on the consuming thread and so competes with the
+> prefetch workers on a decode-bound op. Job 2709123 tested exactly that with one build and
+> two arms (`SCX_GPU_VALIDATE_PAR_MIN_NNZ` pinned high takes the unchanged serial branch),
+> 5 runs each. The result scattered in **both** directions — 1.037× / 1.001× / 0.944× on
+> hvg, 0.977×–1.014× on DE — i.e. no effect. The job-to-job spread is the explanation: the
+> *same* branch build measured census_500k hvg at 11 232, 12 822 and 12 839 ms across two
+> jobs on the same node, a 14 % swing that swallows the 7 % being chased. Single-job control
+> deltas below ~15 % on this node are not interpretable.
+
+**Output equivalence is checked at the scale the change was built for**, not only on unit
+fixtures (SLURM 2709125, census_500k, `SCX_GPU_DE_RESIDENT=0` vs default, same file and
+groups, both arms confirmed on `gpu_csr_v3` at 123 gene chunks):
+
+| Op | names / feature | p-values | statistics | pseudobulk means / log2FC |
+|---|---|---|---|---|
+| `rank_genes_groups` | exact | exact | exact | **exact** (streaming self-spread also 0) |
+| `pdex_ref` | exact | exact | exact | ≤ 1.7 × 10⁻¹³ |
+
+`pdex_ref`'s means are the only figures that are not bit-identical, and the bar they are
+judged against is measured rather than chosen: the streaming path was run **twice**, and
+its own run-to-run spread (1.0 × 10⁻¹³ — f64 `atomicAdd` ordering across rows is already
+nondeterministic) is what residency has to come in under. It does, at the same order of
+magnitude and ~5 decades inside the 2.9 × 10⁻⁸ relative floor. Wilcoxon's pseudobulk fold
+happened to be reproducible on this run, and residency matched it exactly.
+
+**Parallel shard validation (§9.13) is a measured no-op at these scales, and is kept as
+hygiene with no `×` claimed** — the same disposition as task 4.3's marshalling. The reason
+it does not show up is worth stating: validation runs on the consumer thread *while* the
+prefetch workers decode ahead, so it is hidden behind decode entirely. What actually made
+validation cheap was residency, which cut it from once-per-shard-per-chunk to once per
+shard — 123× fewer invocations. Parallelising what remains is correct and free, not a win.
+
 ### Low-risk marshalling & fusions (Phase-2 tasks 2.4 + 2.7)
 
 These are **correctness-neutral** clean-ups — the 2.0 oracle rated marshalling negligible

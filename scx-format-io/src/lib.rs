@@ -70,7 +70,7 @@ pub use shard_decode::{
     decode_shard_bytes, decode_shard_bytes_native, decode_shard_indptr_bytes,
     decode_shard_regions_native, decode_shard_regions_scipy,
 };
-pub use shard_source::{ColumnShardSource, ShardSource};
+pub use shard_source::{ColumnShardSource, ShardSizeHint, ShardSource};
 pub use writer::{
     assign_csr_shard_column_stats, chmod_to_umask, compute_shard_stats, fsync_parent_dir,
     make_sibling_tempfile, MajorAxis, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,
