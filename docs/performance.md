@@ -584,14 +584,37 @@ Raw JSON under the job's `raw-off` / `raw-on` directories; `results/raw/` is git
 the numbers above cite the job and the two arms rather than a checked-in artifact, as 4.0b
 and 4.1 do.
 
-**The GPU staging path is not covered by the table above.** Those are CPU ops; the
-`gpu_shard_source.rs` rewrite needs its own `gpu_profile` host-decode capture
-(`benchmarks/scripts/profile_gpu_staging.py`, depth 1 vs 4 on an H100), which is still
-running at the time of writing. What *is* verified on GPU is correctness: `cargo test -p
-scx-gpu` 193/0 and `-p scx-accel --features gpu` 19/0, plus a failure-set A/B of the pyscx
-GPU suites against `2055f74f` — **11 failures on each arm, branch-only list empty**, so the
-rewrite of the staging loop every GPU streaming op shares introduced no regression. Do not
-read the CPU speedups as evidence for the GPU path until that capture lands.
+**GPU staging — the largest win in the task** (SLURM job 2708827, H100,
+`benchmarks/scripts/profile_gpu_staging.py`, depth 1 vs 4, 3 runs, median wall). The CPU
+table above does not cover this path; it has its own capture:
+
+| Op | Dataset | depth 1 | depth 4 | Speedup | host-decode Σ/wall | HTOD |
+|---|---|--:|--:|--:|--:|--:|
+| HVG | tabula_sapiens_100k | 7 441.6 ms | 4 312.9 ms | **1.73×** | 52.5 % → 99.4 % | 1 643 → 1 614 ms |
+| HVG | census_500k | 22 931.5 ms | 10 389.3 ms | **2.21×** | 65.6 % → 147.1 % | 3 156 → 3 151 ms |
+| HVG | census_1m | 37 942.1 ms | 16 626.2 ms | **2.28×** | 71.3 % → 183.4 % | 4 010 → 4 076 ms |
+| DE | tabula_sapiens_100k | 297 997.9 ms | 115 091.8 ms | **2.59×** | 81.3 % → 213.2 % | 17 618 → 17 340 ms |
+| DE | census_500k | 1 152 722.4 ms | 384 089.9 ms | **3.00×** | 80.5 % → 246.2 % | 64 479 → 61 637 ms |
+
+§9.12's diagnosis was exactly right, and the sequential arm quantifies it: one decode
+thread feeding an H100 leaves GPU DE **80–81 % host-decode-bound** and GPU HVG 52–71 %.
+Widening it takes census_500k DE from 19 minutes to 6.4.
+
+**HTOD is the control and it does not move** (within ±4 % on every row). Only the host side
+changed, which is what makes the wall reduction attributable to the decode widening rather
+than to anything device-side. Host-decode Σ/wall exceeding 100 % is the pipeline working:
+it sums concurrent workers.
+
+**Peak RSS rises consistently here, by +651 to +814 MB (+19 % to +46 %).** That is the same
+`(depth − 1)` decoded-shards model as the CPU side, and unlike the CPU case it is plainly
+visible at every scale, because GPU staging otherwise keeps host RSS low (1.7–4.5 GB) — the
+extra shards are not hidden under a larger ceiling. Worth knowing before raising
+`SCX_ACCEL_PREFETCH_DEPTH` on a memory-tight GPU host.
+
+Correctness on GPU is separately verified: `cargo test -p scx-gpu` 193/0 and
+`-p scx-accel --features gpu` 19/0, plus a failure-set A/B of the pyscx GPU suites against
+`2055f74f` — **11 failures on each arm, branch-only list empty** — so rewriting the staging
+loop every GPU streaming op shares introduced no regression.
 
 Where the pipeline declines to engage — `RAYON_NUM_THREADS=1`, or a caller that is itself
 a rayon worker — the GPU staging path is now fully sequential, where the old dedicated

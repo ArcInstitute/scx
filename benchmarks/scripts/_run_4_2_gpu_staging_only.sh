@@ -50,11 +50,20 @@ export NUMBA_NUM_THREADS=8
 # The in-tree `.so` cannot be assumed GPU-enabled — the previous run of this
 # capture died precisely because another job had left a `--features hdf5` build
 # there. Rebuild, then *prove* the feature is present before spending GPU hours.
+#
+# The target dir must be **removed wholesale**, not reused and not merely
+# cleared of `maturin/`. A previous job leaves a 0-byte `libpyscx.so` hardlink;
+# cargo then reports "Finished in 0.9s", re-links that artifact from `release/`,
+# and maturin dies with "Malformed entity: Object is too small" — which is
+# exactly how the first attempt at this script failed. A full rebuild costs
+# ~10 min and is the only reliable option.
+TARGET=/home/nickyoungblut/.cargo-target-42-staging
 echo ""
-echo "=== rebuilding with hdf5,gpu ==="
-( cd "${SCX_DIR}/pyscx" && VIRTUAL_ENV="${ENV}" \
-    CARGO_TARGET_DIR=/home/nickyoungblut/.cargo-target-42-branch \
+echo "=== rebuilding with hdf5,gpu (clean target dir) ==="
+rm -rf "${TARGET}"
+( cd "${SCX_DIR}/pyscx" && VIRTUAL_ENV="${ENV}" CARGO_TARGET_DIR="${TARGET}" \
     "${ENV}/bin/maturin" develop --release --features hdf5,gpu ) 2>&1 | tail -3
+ls -la "${TARGET}/maturin/libpyscx.so" || { echo "FATAL: no maturin artifact"; exit 1; }
 
 cd "${SCX_DIR}"
 python - <<'PY' || { echo "FATAL: refusing to burn GPU hours on a non-GPU build"; exit 1; }
