@@ -275,8 +275,12 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 > Phase 4.2 lost ~3 H100-hours to exactly that: a CPU job whose own build targeted
 > `.venv` still wrote a `--features hdf5` (no-GPU) `.so` into the shared path, and
 > a running GPU capture's not-yet-started second arm then failed every op with
-> `pyscx was built without the 'gpu' feature`. Chain jobs with
-> `sbatch --dependency=afterany:$prev`.
+> `pyscx was built without the 'gpu' feature`.
+>
+> Chain jobs with `sbatch --dependency=afterany:$prev` when they are independent
+> captures and you want the second to run regardless — but use **`afterok`**
+> whenever the second job would inherit state from the first, so a failed build
+> cannot leave a stale `.so` for the next job to measure against.
 >
 > Two guards worth copying into any new capture script:
 > - **Preflight the feature you are about to measure.** Run one real GPU op and

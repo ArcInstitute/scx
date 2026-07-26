@@ -481,7 +481,9 @@ vs default depth 4), backed-streaming wall-clock (median of runs):
 
 **HVG — the fully-prefetched kernel — is ~2.3× faster at every multi-shard scale**, the
 first measured Phase-2 win. In the profiler the `decode` bucket now *exceeds* wall
-(Σ/wall 220–275 %) because it sums each worker's decode time and those run concurrently;
+(**Σ/wall** — the profiler's summed per-shard decode time divided by wall-clock, so 100 %
+means "decode accounted for the entire run" and anything above it means decode threads
+overlapped — 220–275 %) because it sums each worker's decode time and those run concurrently;
 the wall drop is the real gain. `normalize_total` (a pyscx lazy-transform path, not one of
 the wired `scx-accel` streaming kernels) and `pca` (streaming decode-prefetch deferred —
 see above) are flat by construction, confirming the change is scoped to the kernels it
@@ -520,9 +522,12 @@ now govern these loops too, including GPU staging.
 **Bit-identity is tested, not asserted.** `scx-format-io`'s
 `prefetched_aggregations_are_bit_identical_to_a_sequential_loop` compares every touched
 aggregation against a hand-written sequential reference on f64 bit patterns, and
-`pyscx/tests/test_prefetch_equivalence.py` compares 19 arrays across all four consumers
-between two subprocesses at `SCX_ACCEL_PREFETCH_DEPTH=1` and the default (the depth is a
-process-wide `OnceLock`, so one interpreter cannot hold both arms).
+`pyscx/tests/test_prefetch_equivalence.py` compares 19 arrays across the three **CPU**
+consumers — backed, projected and lazy — between two subprocesses at
+`SCX_ACCEL_PREFETCH_DEPTH=1` and the default (the depth is a process-wide `OnceLock`, so
+one interpreter cannot hold both arms). It does **not** reach `gpu_shard_source`; GPU
+equivalence is discharged by the cargo suites and the failure-set A/B described below, not
+by hex bit-identity.
 
 Both fixtures needed a **cancelling ±1e16 pair** to be worth anything. The kernels reduce
 per-shard *partial* sums, so what has to be order-sensitive is the merge of a handful of

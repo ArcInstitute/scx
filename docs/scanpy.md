@@ -2853,6 +2853,25 @@ column-projected and lazy/transformed twins, and GPU staging — so raising it
 raises peak memory (`depth` decoded shards in flight) across all of those, not
 just HVG.
 
+Three consequences worth knowing before you tune it:
+
+- **On a memory-tight GPU host, consider `SCX_ACCEL_PREFETCH_DEPTH=2`.** GPU
+  staging keeps host RSS low otherwise (1.7–4.5 GB in the Phase-4.2 capture), so
+  the extra `depth − 1` decoded shards are plainly visible there: **+19–46 %**
+  peak host RSS across every measured op. Depth 2 keeps most of the overlap at
+  roughly a third of the extra footprint. The default of 4 is tuned for
+  throughput, not for the tightest node.
+- **`RAYON_NUM_THREADS=1` now makes GPU staging fully sequential.** Before 4.2 it
+  had a dedicated `std::thread` that overlapped one shard ahead *unconditionally*;
+  the shared pipeline instead declines to engage on a single-thread pool (that
+  guard is what prevents a nested-call deadlock). If you pin
+  `RAYON_NUM_THREADS=1` for reproducibility, GPU HVG/DE will be **slower than
+  before 4.2**, not faster.
+- **`prefer_format="csc"` does not inherit the 4.2 speedups.** The CSC column
+  kernels reach their source through `&dyn ColumnShardSource` and still decode
+  serially; only the CSR paths are prefetched. They do benefit from the `col_*`
+  GIL release.
+
 The heavy accelerators, including `pyscx.accel.col_sums` and its siblings,
 release the GIL for their streaming scan, so they can be called concurrently
 from Python threads without serialising each other.

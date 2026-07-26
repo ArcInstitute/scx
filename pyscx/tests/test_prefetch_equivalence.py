@@ -95,6 +95,13 @@ import pyscx
 path = sys.argv[1]
 out = {}
 
+# Which binary is this arm actually testing? The two subprocesses must load the
+# *same* `.so`, and the in-tree editable install is shared state that any
+# concurrent `maturin develop` can swap. If the arms diverge, the comparison
+# below silently becomes "build A vs build B" instead of "prefetch off vs on" —
+# it would still produce a diff, just not the one being asserted.
+out["__binary__"] = [pyscx.__file__]
+
 def rec(name, arr):
     a = np.ascontiguousarray(np.asarray(arr, dtype=np.float64)).ravel()
     out[name] = [float(v).hex() for v in a]
@@ -178,16 +185,33 @@ def test_probe_covered_every_kernel(ab):
     """Guard against a silently-empty comparison."""
     off, on = ab
     assert off.keys() == on.keys()
-    assert len(off) >= 15, f"probe recorded only {len(off)} arrays"
+    # 19 arrays + the binary-identity marker.
+    assert len(off) >= 16, f"probe recorded only {len(off)} entries"
     for name, vals in off.items():
         assert vals, f"{name} came back empty — nothing is being compared"
+
+
+def test_both_arms_loaded_the_same_binary(ab):
+    """The two arms must differ only in the env knob, not in the library.
+
+    `pyscx` resolves through a single editable install pointing at one in-tree
+    `.so`, and any concurrent `maturin develop` — another test session, a
+    benchmark job — replaces it. If that happened between the two subprocess
+    launches, `test_prefetch_is_bit_identical` would be comparing two *builds*
+    while reporting on two prefetch depths.
+    """
+    off, on = ab
+    assert off["__binary__"] == on["__binary__"], (
+        f"arms loaded different pyscx builds: {off['__binary__']} vs "
+        f"{on['__binary__']} — the comparison is not depth-vs-depth"
+    )
 
 
 def test_prefetch_is_bit_identical(ab):
     """Every aggregation, hex-exact, prefetch off vs on."""
     off, on = ab
     mismatched = [
-        name for name in off if off[name] != on[name]
+        name for name in off if name != "__binary__" and off[name] != on[name]
     ]
     assert not mismatched, (
         "decode-prefetch changed these results: "
