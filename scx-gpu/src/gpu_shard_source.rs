@@ -102,7 +102,7 @@ pub(crate) fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), 
     }
 
     let n_rows = csr.n_rows();
-    let parallel = csr.data.len() >= VALIDATE_PAR_MIN_NNZ;
+    let parallel = csr.data.len() >= validate_par_min_nnz();
 
     let unsorted = if parallel {
         (0..n_rows)
@@ -135,12 +135,32 @@ pub(crate) fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), 
     Ok(())
 }
 
-/// nnz below which [`validate_shard_for_gpu_de`] scans serially. Real shards
-/// are orders of magnitude above this (a census_500k shard carries ~24 M nnz);
-/// the threshold exists so unit fixtures and degenerate single-row shards don't
-/// pay a pool round-trip. Deliberately low enough that a test can exceed it
-/// with a ~256 KB fixture and still exercise the parallel path.
+/// Default nnz below which [`validate_shard_for_gpu_de`] scans serially. Real
+/// shards are orders of magnitude above this (a census_500k shard carries
+/// ~24 M nnz); the threshold exists so unit fixtures and degenerate single-row
+/// shards don't pay a pool round-trip. Deliberately low enough that a test can
+/// exceed it with a ~256 KB fixture and still exercise the parallel path.
 pub(crate) const VALIDATE_PAR_MIN_NNZ: usize = 65_536;
+
+/// Effective threshold, overridable by `SCX_GPU_VALIDATE_PAR_MIN_NNZ`.
+///
+/// Exists because the parallel scan is not free for every consumer. It runs on
+/// the **consuming** thread, so on a decode-bound op it competes with the very
+/// decode-prefetch workers that are feeding it — GPU DE wins (validation is on
+/// its critical path now that each shard is decoded once) while GPU HVG, which
+/// validates but gains nothing from residency, can only lose. Setting the knob
+/// above any real shard's nnz restores the pre-4.5 serial scan **exactly**: the
+/// `else` arm below is the original code, unchanged, so this is a genuine
+/// baseline rather than an "off" arm that means something new.
+pub(crate) fn validate_par_min_nnz() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SCX_GPU_VALIDATE_PAR_MIN_NNZ")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(VALIDATE_PAR_MIN_NNZ)
+    })
+}
 
 /// Host-RAM budget, in bytes, for the shards the GPU staging path holds
 /// decoded-but-not-yet-staged. Unset means "no budget" — the depth is whatever
@@ -876,7 +896,25 @@ mod tests {
         assert!(validate_shard_for_gpu_de(&csr).is_ok());
     }
 
-    /// Build a shard above [`VALIDATE_PAR_MIN_NNZ`] so validation takes the
+    /// Skip rather than fail when `SCX_GPU_VALIDATE_PAR_MIN_NNZ` puts the
+    /// parallel path out of reach for a fixture of `nnz`. A premise assertion
+    /// should fire when the *fixture* is wrong, not when the environment
+    /// deliberately disables the feature under test — the A/B arm that pins the
+    /// threshold high would otherwise report four failures instead of a
+    /// measurement.
+    fn parallel_path_reachable(nnz: usize) -> bool {
+        if nnz >= validate_par_min_nnz() {
+            return true;
+        }
+        eprintln!(
+            "SCX_GPU_VALIDATE_PAR_MIN_NNZ={} puts the parallel scan out of reach for a \
+             {nnz}-nnz fixture — skipping",
+            validate_par_min_nnz()
+        );
+        false
+    }
+
+    /// Build a shard above [`validate_par_min_nnz`] so validation takes the
     /// parallel path: `rows` rows × `per_row` strictly-increasing columns.
     fn make_big_csr(rows: usize, per_row: usize) -> ScxCsr {
         let mut indptr = Vec::with_capacity(rows + 1);
@@ -902,11 +940,9 @@ mod tests {
         let per_row = 64;
         let rows = 4096; // 262 144 nnz — comfortably over the parallel threshold
         let mut csr = make_big_csr(rows, per_row);
-        assert!(
-            csr.data.len() >= VALIDATE_PAR_MIN_NNZ,
-            "premise: fixture must exceed the parallel threshold, got {} nnz",
-            csr.data.len()
-        );
+        if !parallel_path_reachable(csr.data.len()) {
+            return;
+        }
 
         // Corrupt rows 3000, 977 and 2500 (inserted out of order on purpose).
         for &r in &[3000usize, 977, 2500] {
@@ -939,8 +975,8 @@ mod tests {
             )
         };
         assert!(
-            small.data.len() < VALIDATE_PAR_MIN_NNZ,
-            "premise: serial path"
+            small.data.len() < validate_par_min_nnz(),
+            "premise: the truncated fixture must take the serial path"
         );
         let GpuError::InvalidShard(small_msg) = validate_shard_for_gpu_de(&small).unwrap_err()
         else {
@@ -953,10 +989,9 @@ mod tests {
     #[test]
     fn validate_parallel_reports_the_first_non_finite_position() {
         let mut csr = make_big_csr(4096, 64);
-        assert!(
-            csr.data.len() >= VALIDATE_PAR_MIN_NNZ,
-            "premise: parallel path"
-        );
+        if !parallel_path_reachable(csr.data.len()) {
+            return;
+        }
 
         csr.data[200_000] = f32::INFINITY;
         csr.data[12_345] = f32::NAN;
@@ -976,10 +1011,9 @@ mod tests {
     #[test]
     fn validate_accepts_large_clean_shard() {
         let csr = make_big_csr(4096, 64);
-        assert!(
-            csr.data.len() >= VALIDATE_PAR_MIN_NNZ,
-            "premise: parallel path"
-        );
+        if !parallel_path_reachable(csr.data.len()) {
+            return;
+        }
         assert!(validate_shard_for_gpu_de(&csr).is_ok());
     }
 
@@ -1002,10 +1036,9 @@ mod tests {
             indptr.push(indices.len() as i64);
         }
         let csr = ScxCsr::new_unchecked((rows, per_row), indptr, indices, data);
-        assert!(
-            csr.data.len() >= VALIDATE_PAR_MIN_NNZ,
-            "premise: parallel path"
-        );
+        if !parallel_path_reachable(csr.data.len()) {
+            return;
+        }
         assert!(validate_shard_for_gpu_de(&csr).is_ok());
     }
 
