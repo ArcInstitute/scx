@@ -19,49 +19,68 @@ use super::util::extract_materialized_csr;
 /// typical multi-shard files while bounding growth on a count-only-opened
 /// reader (whose byte budget is otherwise unbounded). Raise via `memory_budget`
 /// for atlas-scale matrices that exceed this.
-const DEFAULT_PCA_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub(super) const DEFAULT_PCA_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[cfg(feature = "gpu")]
 use super::util::{extract_csr_slices, CsrSlices};
 
 /// Floor on the share of `memory_budget` the decoded-shard LRU keeps.
 ///
-/// Only binds on a pathologically small budget — one where a single shard is a
-/// large fraction of the whole ceiling, in which case PCA is thrashing already
-/// and shrinking the cache further would make it worse, not better.
+/// A backstop only. [`resolve_pca_prefetch`] clamps the *depth* so the reserve
+/// can never exceed half the budget, which makes this floor unreachable —
+/// `prefetch_reserve_floor_is_unreachable` asserts exactly that. Kept because
+/// the alternative is an invariant that lives only in a comment.
 const MIN_LRU_SHARE_OF_BUDGET: u64 = 2;
 
-/// Split `memory_budget` between the decoded-shard LRU and the decode-prefetch
-/// pipeline, returning the LRU's share.
+/// How PCA splits `memory_budget` between the decoded-shard LRU and the
+/// decode-prefetch pipeline: `(depth, lru_bytes)`.
 ///
 /// `pca(memory_budget=…)` is documented as the RAM ceiling for out-of-core PCA,
 /// and prefetch keeps up to `depth` decoded shards alive on top of whatever the
-/// LRU holds. Reserving them here is what keeps that number meaning what it
-/// says.
+/// LRU holds — so the depth *is* a memory knob and has to be resolved against
+/// that ceiling rather than taken from the process-wide default.
 ///
-/// The reserve is `depth - 1` shards, not `depth`, and that is the whole
-/// argument: the pre-prefetch loop already held one decoded shard outside the
-/// cache, so worst-case live bytes go from `B + s` to
-/// `(B - (depth-1)·s) + depth·s = B + s` — **exactly memory-neutral** against
-/// the sequential loop. It also makes `depth == 1` reserve nothing, so the
-/// `SCX_ACCEL_PREFETCH_DEPTH=1` arm of the capture is byte-for-byte the old
-/// behaviour rather than a third configuration.
+/// **The depth is clamped first, and that is what makes the ceiling hold.** With
+/// the reserve bounded to half the budget, worst-case live bytes are
+/// `(B − (depth−1)·s) + depth·s = B + s` — exactly what the pre-prefetch loop
+/// peaked at, since it too held one decoded shard outside the cache. An earlier
+/// version clamped the *reserve* against a floor instead, which broke that
+/// identity whenever `(depth−1)·s > B/2`: the LRU stopped shrinking while the
+/// pipeline kept holding `depth` shards, so peak could reach `B/2 + depth·s`.
+/// Clamping the depth cannot do that, because both terms move together.
 ///
-/// `None` (a source with no catalog statistics) reserves nothing: there is no
-/// per-shard estimate to reserve *with*, and guessing one would be worse than
-/// the documented over-run.
-fn lru_bytes_after_prefetch_reserve(
-    budget_bytes: u64,
+/// `depth == 1` reserves nothing, which keeps the capture's
+/// `SCX_ACCEL_PREFETCH_DEPTH=1` arm byte-for-byte the pre-prefetch behaviour.
+///
+/// `per_shard_bytes = None` leaves both alone: with no catalog statistics there
+/// is nothing to resolve *against*, and inventing an estimate would be worse
+/// than the documented over-run.
+///
+/// `lru_bytes` is meaningless for a source that has no LRU — the lazy and pflog
+/// paths decode fresh on every read — so those callers take `depth` and discard
+/// it. They need the clamp more, not less: without an LRU nothing else bounds
+/// what the pipeline holds.
+pub(super) fn resolve_pca_prefetch(
     per_shard_bytes: Option<u64>,
-    depth: usize,
-) -> u64 {
+    budget_bytes: u64,
+) -> (usize, u64) {
+    let base = scx_accel::pca_prefetch_depth();
     let Some(per_shard) = per_shard_bytes else {
-        return budget_bytes;
+        return (base, budget_bytes);
     };
+    let depth = scx_format_io::clamp_prefetch_depth(
+        base,
+        per_shard,
+        budget_bytes / MIN_LRU_SHARE_OF_BUDGET,
+    );
     let reserve = per_shard.saturating_mul(depth.saturating_sub(1) as u64);
-    budget_bytes
-        .saturating_sub(reserve)
-        .max(budget_bytes / MIN_LRU_SHARE_OF_BUDGET)
+    (depth, budget_bytes.saturating_sub(reserve))
+}
+
+/// Per-shard decoded-byte estimate, or `None` when the catalog carries no
+/// statistics to derive one from.
+pub(super) fn per_shard_estimate<S: ShardSource + ?Sized>(source: &S) -> Option<u64> {
+    ShardSource::shard_size_hint(source).map(|h| h.decoded_bytes())
 }
 
 /// Single-shard `ShardSource` adapter wrapping a borrowed `ScxCsr`.
@@ -487,6 +506,7 @@ pub(crate) struct PcaWriteParams<'a> {
 }
 
 /// Run streaming CPU PCA on a `ShardSource` (covariance or randomized per `m`).
+#[allow(clippy::too_many_arguments)]
 fn cpu_pca_stream<S: ShardSource + Sync>(
     source: &S,
     m: &str,
@@ -495,16 +515,22 @@ fn cpu_pca_stream<S: ShardSource + Sync>(
     n_power_iterations: usize,
     zero_center: bool,
     random_state: u64,
+    depth: usize,
 ) -> std::result::Result<scx_accel::PcaResult, scx_accel::AccelError> {
+    // The depth-explicit entries, never the convenience wrappers: every caller
+    // has resolved the depth against `memory_budget` via `resolve_pca_prefetch`,
+    // and falling back to the process-wide default here would put the ceiling
+    // back outside the user's control.
     match m {
-        "covariance" => scx_accel::covariance_pca(source, n_comps, zero_center),
-        _ => scx_accel::randomized_pca(
+        "covariance" => scx_accel::covariance_pca_with_depth(source, n_comps, zero_center, depth),
+        _ => scx_accel::randomized_pca_with_depth(
             source,
             n_comps,
             n_oversamples,
             n_power_iterations,
             zero_center,
             random_state,
+            depth,
         ),
     }
 }
@@ -952,11 +978,8 @@ pub fn pca(
         // each shard decodes once per pass instead of every pass. The
         // decode-prefetch pipeline holds shards too, so its share comes out of
         // the same ceiling rather than sitting on top of it.
-        let lru_bytes = lru_bytes_after_prefetch_reserve(
-            pca_cache_bytes as u64,
-            ShardSource::shard_size_hint(&source).map(|h| h.decoded_bytes()),
-            scx_accel::pca_prefetch_depth(),
-        );
+        let (depth, lru_bytes) =
+            resolve_pca_prefetch(per_shard_estimate(&source), pca_cache_bytes as u64);
         reader.ensure_cache_capacity(reader.n_shards(), lru_bytes as usize);
         let m = pick_cpu_method(n_vars_eff(full_vars));
         match mask_cols {
@@ -971,6 +994,7 @@ pub fn pca(
                         n_power_iterations,
                         zero_center,
                         random_state,
+                        depth,
                     )
                 })
             }
@@ -983,6 +1007,7 @@ pub fn pca(
                     n_power_iterations,
                     zero_center,
                     random_state,
+                    depth,
                 )
             }),
         }
@@ -992,6 +1017,14 @@ pub fn pca(
         let source = lazy.as_shard_source();
         let full_vars = source.shape().1;
         drop(lazy);
+        // No LRU on this path — a lazy source decodes and re-transforms on every
+        // read — so the whole budget is available to the pipeline, and the
+        // clamp is the *only* thing bounding what it holds. Before this the lazy
+        // and pflog paths took the process-wide depth and went from holding one
+        // transformed shard to `depth` of them with nothing binding, while
+        // `memory_budget` was documented as covering prefetch. It only did on
+        // the backed branch.
+        let (depth, _) = resolve_pca_prefetch(per_shard_estimate(&source), pca_cache_bytes as u64);
         let m = pick_cpu_method(n_vars_eff(full_vars));
         match mask_cols {
             Some(cols) => {
@@ -1005,6 +1038,7 @@ pub fn pca(
                         n_power_iterations,
                         zero_center,
                         random_state,
+                        depth,
                     )
                 })
             }
@@ -1017,6 +1051,7 @@ pub fn pca(
                     n_power_iterations,
                     zero_center,
                     random_state,
+                    depth,
                 )
             }),
         }
@@ -1148,50 +1183,81 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
 
     #[test]
     fn prefetch_reserve_is_memory_neutral_against_the_sequential_loop() {
         let shard = 90 * 1024 * 1024; // ~census_1m
         let budget = 8 * GIB;
+        let (depth, lru) = resolve_pca_prefetch(Some(shard), budget);
+        // Peak live bytes = LRU + the shards the pipeline holds. The pre-prefetch
+        // loop peaked at `budget + shard` (the cache, plus the one decoded shard
+        // it held outside it), so matching that exactly is the whole claim.
+        assert_eq!(lru + shard * depth as u64, budget + shard);
+        assert_eq!(lru, budget - shard * (depth as u64 - 1));
+    }
 
-        // depth 1 reserves nothing, so the `SCX_ACCEL_PREFETCH_DEPTH=1` arm of
-        // the capture is byte-for-byte the pre-prefetch behaviour — not a third
-        // configuration whose numbers mean something else.
-        assert_eq!(
-            lru_bytes_after_prefetch_reserve(budget, Some(shard), 1),
-            budget
-        );
+    #[test]
+    fn prefetch_reserve_is_neutral_at_every_budget_and_shard_size() {
+        // Including the regime the old floor-clamped version broke: a shard that
+        // is a large fraction of the budget. The identity must hold there too,
+        // which it now does because the *depth* absorbs the pressure.
+        for budget in [1_000u64, 64 * MIB, GIB, 8 * GIB] {
+            for shard in [
+                1u64,
+                1_000,
+                401,
+                MIB,
+                90 * MIB,
+                budget / 3,
+                budget,
+                budget * 2,
+            ] {
+                let (depth, lru) = resolve_pca_prefetch(Some(shard), budget);
+                assert!(depth >= 1, "depth must never be zero");
+                assert_eq!(
+                    lru + shard * depth as u64,
+                    budget + shard,
+                    "neutrality broken at budget={budget} shard={shard} depth={depth} lru={lru}"
+                );
+            }
+        }
+    }
 
-        // depth d reserves d-1 shards, so worst-case live bytes are
-        // (B - (d-1)s) + d*s == B + s, the same high-water the sequential loop
-        // already had from the one shard it held outside the cache.
-        for depth in 2..=8usize {
-            let lru = lru_bytes_after_prefetch_reserve(budget, Some(shard), depth);
-            assert_eq!(lru, budget - shard * (depth as u64 - 1));
-            assert_eq!(lru + shard * depth as u64, budget + shard);
+    #[test]
+    fn prefetch_reserve_floor_is_unreachable() {
+        // `MIN_LRU_SHARE_OF_BUDGET` is a backstop, not a policy: clamping the
+        // depth first bounds the reserve to half the budget, so the LRU can never
+        // be driven below that. If this ever fails, the floor has started binding
+        // and the neutrality identity above is no longer guaranteed.
+        for budget in [1_000u64, 64 * MIB, GIB, 8 * GIB] {
+            for shard in [1u64, 401, MIB, 90 * MIB, budget / 3, budget, budget * 2] {
+                let (_, lru) = resolve_pca_prefetch(Some(shard), budget);
+                assert!(
+                    lru >= budget / MIN_LRU_SHARE_OF_BUDGET,
+                    "floor bound at budget={budget} shard={shard}: lru={lru}"
+                );
+            }
         }
     }
 
     #[test]
     fn prefetch_reserve_needs_a_per_shard_estimate() {
-        // No catalog statistics → nothing to reserve *with*. Guessing would be
-        // worse than the documented over-run, so the budget is left whole.
-        assert_eq!(lru_bytes_after_prefetch_reserve(8 * GIB, None, 4), 8 * GIB);
+        // No catalog statistics → nothing to resolve *against*. Guessing would be
+        // worse than the documented over-run, so the budget is left whole and the
+        // depth stays the process default.
+        let (depth, lru) = resolve_pca_prefetch(None, 8 * GIB);
+        assert_eq!(lru, 8 * GIB);
+        assert_eq!(depth, scx_accel::pca_prefetch_depth());
     }
 
     #[test]
-    fn prefetch_reserve_never_starves_the_cache() {
-        // A shard that is a large fraction of the whole ceiling: PCA is already
-        // thrashing here, and shrinking the LRU further would make it worse.
-        let lru = lru_bytes_after_prefetch_reserve(1000, Some(400), 4);
-        assert_eq!(
-            lru, 500,
-            "must floor at half the budget, not underflow to 0"
-        );
-        // And a shard larger than the budget cannot wrap.
-        assert_eq!(
-            lru_bytes_after_prefetch_reserve(1000, Some(u64::MAX), 4),
-            500
-        );
+    fn a_shard_larger_than_the_budget_falls_back_to_depth_one() {
+        // Degenerate but reachable via a tight `memory_budget=`. Prefetching at
+        // all would blow the ceiling, so it must not: depth 1 reserves nothing
+        // and the run behaves exactly as it did before prefetch existed.
+        let (depth, lru) = resolve_pca_prefetch(Some(4 * GIB), GIB);
+        assert_eq!(depth, 1);
+        assert_eq!(lru, GIB);
     }
 }

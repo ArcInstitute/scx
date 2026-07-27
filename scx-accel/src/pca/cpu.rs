@@ -428,12 +428,18 @@ pub fn randomized_pca<S: ShardSource + Sync + ?Sized>(
 
 /// [`randomized_pca`] with an explicit decode-prefetch depth.
 ///
-/// Exists so the equivalence tests can A/B depth 1 against depth 4 **in one
+/// **The resource-explicit entry point.** `depth` is how many decoded shards the
+/// pipeline may hold at once, so it is a memory knob: a binding that has a byte
+/// budget (pyscx's `pca(memory_budget=…)`) resolves the depth against it and
+/// passes the result here, instead of letting the process-wide default apply to
+/// a path whose footprint it never sized. [`randomized_pca`] is the convenience
+/// wrapper that takes [`pca_prefetch_depth`].
+///
+/// Also what lets the equivalence tests A/B depth 1 against depth 4 **in one
 /// process** — [`prefetch_depth`](crate::prefetch::prefetch_depth) is a
-/// `OnceLock`, so the environment knob cannot be flipped after the first read
-/// and an in-process comparison would otherwise be impossible.
+/// `OnceLock`, so the environment knob cannot be flipped after the first read.
 #[allow(clippy::too_many_arguments)]
-fn randomized_pca_with_depth<S: ShardSource + Sync + ?Sized>(
+pub fn randomized_pca_with_depth<S: ShardSource + Sync + ?Sized>(
     source: &S,
     n_components: usize,
     n_oversamples: usize,
@@ -679,7 +685,7 @@ pub fn pflog_pca<S: ShardSource + Sync + ?Sized>(
 /// [`pflog_pca`] with an explicit decode-prefetch depth — see
 /// [`randomized_pca_with_depth`] for why this seam exists.
 #[allow(clippy::too_many_arguments)]
-fn pflog_pca_with_depth<S: ShardSource + Sync + ?Sized>(
+pub fn pflog_pca_with_depth<S: ShardSource + Sync + ?Sized>(
     delta_source: &S,
     baseline: &[f64],
     n_components: usize,
@@ -1428,7 +1434,7 @@ pub fn covariance_pca<S: ShardSource + Sync + ?Sized>(
 
 /// [`covariance_pca`] with an explicit decode-prefetch depth — see
 /// [`randomized_pca_with_depth`] for why this seam exists.
-fn covariance_pca_with_depth<S: ShardSource + Sync + ?Sized>(
+pub fn covariance_pca_with_depth<S: ShardSource + Sync + ?Sized>(
     source: &S,
     n_components: usize,
     zero_center: bool,
