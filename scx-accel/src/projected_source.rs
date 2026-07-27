@@ -76,6 +76,16 @@ impl<S: ShardSource + ?Sized> ShardSource for ProjectedShardSource<'_, S> {
         // Column projection does not change row counts.
         self.inner.max_shard_rows()
     }
+
+    fn shard_size_hint(&self) -> Option<scx_format_io::ShardSizeHint> {
+        // Forwarded unchanged: rows are untouched by a column projection and
+        // `max_nnz` can only shrink, so the inner value stays a valid **upper
+        // bound** — which is all the contract promises. Deliberately not scaled
+        // by `cols.len() / inner.n_vars()`: nonzeros are not uniform across
+        // columns, so a scaled figure could under-bound, and an under-bound is
+        // the one thing a consumer may not receive.
+        self.inner.shard_size_hint()
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +133,60 @@ mod tests {
         assert_eq!(dense(0), vec![1.0, 0.0]);
         assert_eq!(dense(1), vec![0.0, 4.0]);
         assert_eq!(dense(2), vec![5.0, 6.0]);
+    }
+
+    /// A source that advertises a hint, so the forward is observable.
+    struct HintedSource<'a> {
+        csr: &'a ScxCsr,
+        hint: Option<scx_format_io::ShardSizeHint>,
+    }
+
+    impl ShardSource for HintedSource<'_> {
+        fn n_shards(&self) -> usize {
+            1
+        }
+        fn n_obs(&self) -> usize {
+            self.csr.n_rows()
+        }
+        fn n_vars(&self) -> usize {
+            self.csr.n_cols()
+        }
+        fn read_shard(&self, _shard_idx: usize) -> Result<ScxCsr> {
+            Ok(self.csr.clone())
+        }
+        fn shard_size_hint(&self) -> Option<scx_format_io::ShardSizeHint> {
+            self.hint
+        }
+    }
+
+    /// The hint must reach a consumer through the projection, unscaled.
+    ///
+    /// Scaling `max_nnz` by the kept-column fraction would look tidier and be
+    /// wrong: nonzeros are not uniform across columns, so a scaled figure can
+    /// *under*-bound, and the contract forbids under-bounding. Over-bounding
+    /// only costs a slightly smaller prefetch depth or cache carve.
+    #[test]
+    fn forwards_the_inner_shard_size_hint_unscaled() {
+        let csr = csr_3x4();
+        let hint = scx_format_io::ShardSizeHint {
+            max_rows: 3,
+            max_nnz: 6,
+        };
+        let inner = HintedSource {
+            csr: &csr,
+            hint: Some(hint),
+        };
+        let proj = ProjectedShardSource::new(&inner, vec![0]);
+        assert_eq!(proj.shard_size_hint(), Some(hint));
+
+        // And "no cheap estimate" stays "no cheap estimate" — never zero.
+        let blind = HintedSource {
+            csr: &csr,
+            hint: None,
+        };
+        assert_eq!(
+            ProjectedShardSource::new(&blind, vec![0]).shard_size_hint(),
+            None
+        );
     }
 }

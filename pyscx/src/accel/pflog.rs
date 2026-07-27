@@ -39,7 +39,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use scx_accel::{estimate_alpha, pflog_baseline_from_delta, pflog_pca, AlphaOptions, PcaResult};
+use scx_accel::{estimate_alpha, pflog_baseline_from_delta, AlphaOptions, PcaResult};
 use scx_codec::CodecId;
 use scx_format_io::section::SectionType;
 use scx_format_io::shard_source::SingleShardSource;
@@ -428,7 +428,15 @@ fn run_on_source<S: ShardSource + Sync>(
     adata.getattr("obs")?.set_item(baseline_key, baseline_arr)?;
 
     if want_pca {
-        let result: PcaResult = pflog_pca(
+        // Same clamp as `accel::pca`'s lazy branch, and for the same reason: a
+        // pflog delta source has no LRU, so the depth is the only thing bounding
+        // how many transformed shards the pipeline holds. `pflog` exposes no
+        // `memory_budget` kwarg, so the ceiling is the shared PCA default.
+        let (depth, _) = super::pca::resolve_pca_prefetch(
+            super::pca::per_shard_estimate(source),
+            super::pca::DEFAULT_PCA_CACHE_BYTES,
+        );
+        let result: PcaResult = scx_accel::pflog_pca_with_depth(
             source,
             &baseline,
             n_components,
@@ -436,6 +444,7 @@ fn run_on_source<S: ShardSource + Sync>(
             n_power_iterations,
             zero_center,
             random_state,
+            depth,
         )
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         write_pca(py, adata, &result, obsm_key)?;

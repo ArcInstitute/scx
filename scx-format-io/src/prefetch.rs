@@ -217,10 +217,24 @@ thread_local! {
 /// The drain runs on the calling thread and blocks on the channel while decode
 /// tasks run on other pool workers. If the caller is a saturated pool worker
 /// (nested `par_iter`/`scope`/`install`), those spawns can't schedule → deadlock.
-/// This is why PCA prefetch (which owns inner rayon pools) is deferred. The
-/// `current_thread_index().is_some()` fallback defuses it by decoding
+/// The `current_thread_index().is_some()` fallback defuses it by decoding
 /// sequentially when invoked on a worker thread, but callers should still treat
 /// "top-level only" as the contract.
+///
+/// **The safe nesting is the other way round**, which is what let PCA adopt this
+/// after being deferred for owning inner pools: a consumer may enter a parallel
+/// region — even one on a private pool — from *inside* `consume`, because the
+/// live set never exceeds `depth` and the channel capacity **is** `depth`, so a
+/// decode worker can always complete its `tx.send` rather than parking while the
+/// calling thread is blocked. What is unsafe is calling this function from a
+/// worker, not calling into a pool from the consumer.
+///
+/// Note that a caller who takes this path silently gets the sequential loop.
+/// That is a correct outcome, but it is indistinguishable from a correct
+/// prefetching one in every result — so a new consumer should carry a test that
+/// observes concurrent decodes (see
+/// `scx_accel::pca::cpu::tests::covariance_build_decodes_shards_concurrently`),
+/// not just one that checks its numbers.
 ///
 /// A worker that panics while decoding is caught and delivered as an `Err`, so
 /// the drain loop always terminates. If `consume` returns `Err`, iteration
@@ -437,6 +451,54 @@ where
         }
         Ok(())
     })
+}
+
+/// Decode-prefetched twin of [`ShardSource::col_means_and_sum_sq`].
+///
+/// Same single pass, same per-column accumulation order (consumption is
+/// single-threaded and in strict shard order), so the result is **bit-identical**
+/// to the trait default — which stays in place as this function's oracle. The
+/// only difference is that up to `depth` shards decode concurrently instead of
+/// one at a time on the calling thread.
+///
+/// A free function rather than a trait method because the pipeline needs
+/// `Self: Sync`, and putting that bound on a *provided* method would make it
+/// unavailable through the `&dyn ShardSource` boundaries `scx-gpu` uses. Callers
+/// that can name a `Sync` source (CPU PCA today, GPU PCA's identical serial loop
+/// in `scx_gpu::gpu_pca` next) opt in here; everyone else keeps the default.
+pub fn col_means_and_sum_sq_prefetched<S>(
+    source: &S,
+    zero_center: bool,
+    depth: usize,
+) -> Result<(Option<Vec<f64>>, Vec<f64>), ScxError>
+where
+    S: ShardSource + Sync + ?Sized,
+{
+    let n_vars = source.n_vars();
+    let mut col_sums = vec![0.0f64; n_vars];
+    let mut col_sum_sq = vec![0.0f64; n_vars];
+
+    for_each_shard_ordered(source, depth, |_shard_idx, csr| {
+        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+            let v = val as f64;
+            col_sums[col as usize] += v;
+            col_sum_sq[col as usize] += v * v;
+        }
+        Ok::<(), ScxError>(())
+    })?;
+
+    let means = if zero_center {
+        let n = source.n_obs() as f64;
+        if n == 0.0 {
+            Some(vec![0.0f64; n_vars])
+        } else {
+            Some(col_sums.iter().map(|s| s / n).collect())
+        }
+    } else {
+        None
+    };
+
+    Ok((means, col_sum_sq))
 }
 
 /// Operation-specific **parallel** shard reduction with one accumulator per

@@ -412,3 +412,106 @@ fn accumulate_shards_default_matches_sequential() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// col_means_and_sum_sq_prefetched — bit-identity against the trait default
+// ---------------------------------------------------------------------------
+
+/// Column-statistics fixture whose per-column sums **depend on shard order**: a
+/// cancelling ±1e16 pair in column 0, small fractions everywhere else.
+///
+/// The pair is the whole point. With uniformly-scaled values every partial sum
+/// is exact, so a reordering regression produces bit-identical output and every
+/// assertion below is vacuous — the trap Phase 4.2 hit, where the obvious
+/// fixture was blind in 0 of 119 shard permutations.
+/// `col_means_fixture_is_sensitive_to_shard_order` pins the premise.
+fn cancelling_shards(n_shards: usize, n_vars: usize) -> StubSource {
+    assert!(n_shards >= 3 && n_vars >= 2);
+    let shards: Vec<ScxCsr> = (0..n_shards)
+        .map(|i| {
+            let big = match i {
+                0 => 1e16f32,
+                1 => -1e16f32,
+                _ => 0.1f32 * (i as f32 + 1.0),
+            };
+            let mut data = vec![big];
+            let mut indices = vec![0i32];
+            for c in 1..n_vars {
+                indices.push(c as i32);
+                data.push(0.125f32 * (i + c) as f32);
+            }
+            ScxCsr::new_unchecked((1, n_vars), vec![0, n_vars as i64], indices, data)
+        })
+        .collect();
+    StubSource::new(shards, n_shards, n_vars)
+}
+
+/// Sequential reference over an explicit shard order — the oracle for the
+/// order-sensitivity premise below.
+fn col_sums_in_order(src: &StubSource, order: &[usize]) -> Vec<f64> {
+    let mut sums = vec![0.0f64; src.n_vars()];
+    for &idx in order {
+        let csr = src.read_shard(idx).unwrap();
+        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+            sums[col as usize] += val as f64;
+        }
+    }
+    sums
+}
+
+/// Premise: this fixture can actually see a reordering. Without it the
+/// bit-identity test below proves nothing.
+#[test]
+fn col_means_fixture_is_sensitive_to_shard_order() {
+    let src = cancelling_shards(8, 4);
+    let forward = col_sums_in_order(&src, &(0..8).collect::<Vec<_>>());
+    let reversed = col_sums_in_order(&src, &(0..8).rev().collect::<Vec<_>>());
+    assert_ne!(
+        forward[0].to_bits(),
+        reversed[0].to_bits(),
+        "fixture is blind to shard order — the bit-identity assertion would be vacuous"
+    );
+}
+
+#[test]
+fn col_means_prefetched_is_bit_identical_to_the_trait_default() {
+    let src = cancelling_shards(8, 4);
+    for zero_center in [true, false] {
+        // The trait default: one shard at a time on the calling thread.
+        let (want_means, want_sq) = src.col_means_and_sum_sq(zero_center).unwrap();
+        // Depth 4 engages the pipeline; depth 1 takes its sequential fallback.
+        // Both must agree with the default to the bit.
+        for depth in [1usize, 4] {
+            let (got_means, got_sq) =
+                col_means_and_sum_sq_prefetched(&src, zero_center, depth).unwrap();
+            assert_eq!(got_means.is_some(), want_means.is_some());
+            if let (Some(g), Some(w)) = (got_means.as_ref(), want_means.as_ref()) {
+                for (c, (a, b)) in g.iter().zip(w.iter()).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "mean col {c} at depth {depth}");
+                }
+            }
+            for (c, (a, b)) in got_sq.iter().zip(want_sq.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "sum_sq col {c} at depth {depth}");
+            }
+        }
+    }
+}
+
+/// `?Sized` here too: GPU PCA holds its source as `&dyn ShardSource + Sync`, so
+/// the signature has to admit one for 4.4 to adopt this without another move.
+#[test]
+fn col_means_prefetched_accepts_an_unsized_dyn_source() {
+    let owned = cancelling_shards(6, 3);
+    let src: &(dyn ShardSource + Sync) = &owned;
+    let (_, sq) = col_means_and_sum_sq_prefetched(src, false, 4).unwrap();
+    assert_eq!(sq.len(), 3);
+}
+
+/// An empty source must not divide by zero when centering.
+#[test]
+fn col_means_prefetched_handles_zero_shards() {
+    let src = StubSource::new(Vec::new(), 0, 5);
+    let (means, sq) = col_means_and_sum_sq_prefetched(&src, true, 4).unwrap();
+    assert_eq!(means.unwrap(), vec![0.0f64; 5]);
+    assert_eq!(sq, vec![0.0f64; 5]);
+}

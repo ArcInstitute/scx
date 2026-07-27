@@ -36,6 +36,7 @@ from benchmarks.comprehensive.results import BenchmarkResult, write_result  # no
 
 OPS = (
     "pca",
+    "pca_hvg",
     "hvg",
     "normalize",
     "qc",
@@ -71,6 +72,45 @@ SUBSET_OBS_STRIDE = 2  # keep every other cell
 # count is the headline signal for this op.
 QC_VARS = ("mt", "ribo", "hb")
 
+# `pca_hvg` exists because `pca` on these fixtures never reaches the covariance
+# route. `pyscx.accel.pca` picks covariance when the effective var count is
+# <= COVARIANCE_PCA_THRESHOLD (5000) and randomized otherwise, and every dataset
+# in the tier carries a full gene set — census_1m has 61,497 — so the whole
+# capture measures one of the two routes. Selecting 2000 genes puts the other one
+# under measurement, and routes through `ProjectedShardSource` while it is there.
+#
+# The selection is a **real seurat_v3 HVG call**, memoized per dataset and paid
+# for in the discarded warm-up run, not a positional stride. The first attempt
+# used a stride and did not survive contact with the data: on
+# tabula_sapiens_100k every `pca_hvg` capture failed its warm-up with
+# `Eigendecomposition failed: NoConvergence`.
+#
+# Reproduced identically on `main` at 2a485d05, so it is pre-existing rather than
+# a regression, and it is **not explained**. What is established: a positionally
+# strided set of 2000 genes fails, while a seurat_v3 set, a random expressed set,
+# and a top-2000-by-detection set of the same size all succeed. Two obvious
+# explanations are ruled out — all-zero columns are not the trigger (a 1000-gene
+# HVG set plus 1000 all-zero genes runs clean) and neither are high-expression
+# outliers (dropping the strided set's top 20 genes by column sum lowers its max
+# 86x and it still fails). Worth its own issue; `covariance_pca` is the route
+# `pyscx.accel.pca` **auto-selects** at n_vars <= 5000, so whatever this is, some
+# real gene set reaches it. Out of scope here: the canonical `hvg -> pca`
+# workflow is both unaffected and the one worth measuring.
+PCA_HVG_N_VARS = 2000
+# `scx_accel::pca::COVARIANCE_PCA_THRESHOLD`, pinned by the doc-drift guard in
+# tests/scx-integration-tests. Asserted rather than commented because exceeding
+# it is silent: the op still runs, still reports a number, and measures the
+# randomized route a second time.
+COVARIANCE_PCA_THRESHOLD = 5000
+assert PCA_HVG_N_VARS <= COVARIANCE_PCA_THRESHOLD, (
+    f"pca_hvg masks to {PCA_HVG_N_VARS} genes, which routes to randomized PCA, "
+    f"not the covariance route this op exists to cover"
+)
+
+# dataset path -> boolean HVG mask. Populated during warm-up so the timed runs
+# measure PCA, not gene selection.
+_HVG_MASK_CACHE: dict[str, "object"] = {}
+
 
 def _peak_rss_mb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -90,7 +130,12 @@ def _run_op(op: str, scx_path: Path, n_comps: int) -> dict[str, float]:
     import numpy as np
     import pyscx
 
-    adata = pyscx.open(str(scx_path)).to_anndata(backed=True)
+    exp = pyscx.open(str(scx_path))
+    # Grab the shard count while the Experiment is still in hand: the decode
+    # bucket counts *shards decoded*, and only `count / n_shards` turns that
+    # into the number that matters — how many times the op walked the matrix.
+    n_shards = float(exp.shard_count)
+    adata = exp.to_anndata(backed=True)
     n_obs0, n_vars0 = adata.n_obs, adata.n_vars
     if op == "filter_cells":
         # scanpy's canonical default; drops a real fraction of real data.
@@ -102,6 +147,11 @@ def _run_op(op: str, scx_path: Path, n_comps: int) -> dict[str, float]:
         pyscx.accel.subset_obs(adata, keep)
     elif op == "pca":
         pyscx.accel.pca(adata, n_comps=n_comps, device="cpu")
+    elif op == "pca_hvg":
+        adata.var["highly_variable"] = _hvg_mask(adata, scx_path)
+        pyscx.accel.pca(
+            adata, n_comps=n_comps, device="cpu", mask_var="highly_variable"
+        )
     elif op == "hvg":
         pyscx.accel.highly_variable_genes(
             adata, n_top_genes=2000, flavor="seurat_v3", device="cpu",
@@ -118,14 +168,42 @@ def _run_op(op: str, scx_path: Path, n_comps: int) -> dict[str, float]:
         pyscx.accel.filter_genes(adata, min_cells=1, min_counts=1.0)
     else:
         raise ValueError(op)
-    return {
+    out = {
         "n_obs_before": float(n_obs0),
         "n_vars_before": float(n_vars0),
         "n_obs_after": float(adata.n_obs),
         "n_vars_after": float(adata.n_vars),
         "kept_frac_obs": adata.n_obs / n_obs0 if n_obs0 else 1.0,
         "kept_frac_vars": adata.n_vars / n_vars0 if n_vars0 else 1.0,
+        "n_shards": n_shards,
     }
+    if op == "pca_hvg":
+        # Premise, not decoration: if this ever exceeded the routing ceiling the
+        # op would silently measure the randomized route a second time and the
+        # covariance route would go uncovered with nothing to show for it.
+        out["mask_n_vars"] = float(int(adata.var["highly_variable"].sum()))
+    return out
+
+
+def _hvg_mask(adata, scx_path: Path):
+    """Top-`PCA_HVG_N_VARS` genes by seurat_v3 dispersion, memoized per dataset.
+
+    Real selection rather than a positional one, and the reason is not realism
+    for its own sake: an arbitrary gene set on a sparse atlas is mostly
+    unexpressed genes, and a covariance matrix with zero rows does not
+    eigendecompose. Memoized because the timed region has to be PCA — the first
+    call lands in the discarded warm-up run.
+    """
+    import numpy as np
+    import pyscx
+
+    key = str(scx_path)
+    if key not in _HVG_MASK_CACHE:
+        pyscx.accel.highly_variable_genes(
+            adata, n_top_genes=PCA_HVG_N_VARS, flavor="seurat_v3", device="cpu",
+        )
+        _HVG_MASK_CACHE[key] = np.asarray(adata.var["highly_variable"]).astype(bool)
+    return _HVG_MASK_CACHE[key]
 
 
 def _assign_qc_masks(adata) -> None:

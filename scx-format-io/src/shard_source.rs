@@ -155,6 +155,13 @@ pub trait ShardSource {
     /// Returns `(means, col_sum_sq)` where:
     /// - `means`: `Some(Vec<f64>)` of length `n_vars` if `zero_center`, else `None`
     /// - `col_sum_sq`: `Vec<f64>` of length `n_vars` — per-column Σ x²
+    ///
+    /// **Decodes one shard at a time on the calling thread.** A caller that can
+    /// name a `Sync` source should prefer
+    /// [`col_means_and_sum_sq_prefetched`](crate::prefetch::col_means_and_sum_sq_prefetched),
+    /// which overlaps decode across shards and is bit-identical to this. This
+    /// stays as the fallback for `&dyn ShardSource` callers *and* as that
+    /// function's test oracle, so the two must not drift.
     fn col_means_and_sum_sq(&self, zero_center: bool) -> Result<(Option<Vec<f64>>, Vec<f64>)> {
         let n_vars = self.n_vars();
         let mut col_sums = vec![0.0f64; n_vars];

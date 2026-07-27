@@ -3,8 +3,9 @@
 Phase 4.2 routed the backed aggregation kernels (`scx-format-io`), their
 column-projected twins (`pyscx/src/projected_agg.rs`) and the lazy/transformed
 streaming kernels (`pyscx/src/lazy_transform/dataset.rs`) through the bounded
-ordered decode-prefetch pipeline that Phase 2.1 built for `scx-accel`. Up to
-`depth` shards now decode concurrently on the rayon pool.
+ordered decode-prefetch pipeline that Phase 2.1 built for `scx-accel`; the PCA
+follow-up added streaming PCA's six shard loops (`scx-accel/src/pca/cpu.rs`).
+Up to `depth` shards now decode concurrently on the rayon pool.
 
 The safety argument is that *consumption* stays single-threaded and in strict
 shard order, so every f64 accumulation and every row-wise concatenation sees the
@@ -154,6 +155,30 @@ rec("lazy_col_sums", np.asarray(adl.X.sum(axis=0)).ravel())
 rec("lazy_row_sums", np.asarray(adl.X.sum(axis=1)).ravel())
 rec("lazy_col_var", np.asarray(adl.X.var(axis=0)).ravel())
 
+# --- streaming PCA: pca/cpu.rs's six shard loops ---
+# `method="randomized"` only, and deliberately. That route is *structurally*
+# deterministic — the forward SpMM writes each output row exactly once, the
+# transpose takes its sequential branch at this size, and the fused column-means
+# pass accumulates in shard order — so it belongs under this file's exact-bits
+# blanket. `method="covariance"` does not: it folds into `ThreadLocal`
+# accumulators whose merge order is scheduler-dependent, and five consecutive
+# runs on this very fixture produce five different results with no prefetch
+# involved at all. Putting it here would make the suite flaky and would tell you
+# nothing; `covariance_pca_agrees_across_depths_within_reassociation_noise` in
+# scx-accel covers it against the bar it can actually hold.
+adpca = pyscx.open(path).to_anndata(backed=True)
+pyscx.accel.pca(adpca, n_comps=3, device="cpu", method="randomized")
+rec("pca_embeddings", adpca.obsm["X_pca"])
+rec("pca_components", adpca.varm["PCs"])
+rec("pca_variance_ratio", adpca.uns["pca"]["variance_ratio"])
+
+# Same, through a column projection — `ProjectedShardSource` wraps the shard
+# source, so this is the only arm that exercises the projected path's ordering.
+adpcap = pyscx.open(path).to_anndata(backed=True)
+adpcap = adpcap[:, col_keep.tolist()]
+pyscx.accel.pca(adpcap, n_comps=3, device="cpu", method="randomized")
+rec("pca_proj_embeddings", adpcap.obsm["X_pca"])
+
 # --- QC, which fans out over both axes in one fused pass ---
 adq = pyscx.open(path).to_anndata(backed=True)
 pyscx.accel.calculate_qc_metrics(adq)
@@ -200,10 +225,18 @@ def test_probe_covered_every_kernel(ab):
     """Guard against a silently-empty comparison."""
     off, on = ab
     assert off.keys() == on.keys()
-    # 19 arrays + the binary-identity marker.
-    assert len(off) >= 16, f"probe recorded only {len(off)} entries"
+    # 23 arrays + the binary-identity marker.
+    assert len(off) >= 20, f"probe recorded only {len(off)} entries"
     for name, vals in off.items():
         assert vals, f"{name} came back empty — nothing is being compared"
+    # PCA specifically: an all-zero or non-finite embedding would satisfy the
+    # bit-identity assertion while comparing nothing. NaN in particular would
+    # sail through, because `float('nan').hex()` is the string "nan" on both
+    # arms.
+    for name in ("pca_embeddings", "pca_proj_embeddings"):
+        vals = np.array([float.fromhex(v) for v in off[name]])
+        assert np.isfinite(vals).all(), f"{name} is not finite"
+        assert vals.std() > 0.0, f"{name} is constant — the comparison is vacuous"
 
 
 def test_both_arms_loaded_the_same_binary(ab):

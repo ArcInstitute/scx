@@ -55,9 +55,10 @@ pub use encoder::{
 };
 pub use mem::MemoryBudget;
 pub use prefetch::{
-    accumulate_shards, clamp_prefetch_depth, for_each_csc_shard_ordered, for_each_shard_ordered,
-    for_each_shard_ordered_uncached, prefetch_depth, reduce_shards_budgeted, reduction_mode,
-    PrefetchError, ReductionMode, DEFAULT_PREFETCH_DEPTH,
+    accumulate_shards, clamp_prefetch_depth, col_means_and_sum_sq_prefetched,
+    for_each_csc_shard_ordered, for_each_shard_ordered, for_each_shard_ordered_uncached,
+    prefetch_depth, reduce_shards_budgeted, reduction_mode, PrefetchError, ReductionMode,
+    DEFAULT_PREFETCH_DEPTH,
 };
 pub use profile::{
     record_decode_since, record_io_since, record_marshalling_since, record_reduction_since,

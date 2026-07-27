@@ -438,3 +438,47 @@ fn cached_reads_survive_a_view() {
         uncached.read_shard(1).unwrap().n_rows()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Size hints
+// ---------------------------------------------------------------------------
+
+/// `shard_size_hint` must survive the view, and must stay an upper bound.
+///
+/// PCA reads it to decide how much of the user's `memory_budget` to carve out
+/// for decode-prefetch. If it stopped reaching the caller the carve would
+/// silently become zero — no error, no wrong answer, just a peak-RSS ceiling
+/// that no longer means what `pca(memory_budget=…)` documents.
+#[test]
+fn shard_size_hint_survives_transforms_projection_and_row_filter() {
+    let dir = TempDir::new().unwrap();
+    let reader = multishard_reader(&dir, N_SHARDS);
+    let from_reader = ShardSource::shard_size_hint(&*reader).expect("catalog carries shard stats");
+
+    let plain = full_source(&reader);
+    assert_eq!(plain.shard_size_hint(), Some(from_reader));
+
+    // Every stage that narrows the view can only *lower* the true figures, so
+    // the on-disk numbers stay valid upper bounds rather than becoming stale.
+    let narrowed = LazyShardSource::new(
+        Arc::clone(&reader),
+        vec![Transform::Log1p],
+        Some(Arc::new((0..N_OBS as u64).step_by(2).collect())),
+        Some(Arc::new(vec![0u32, 2])),
+        N_OBS.div_ceil(2),
+        2,
+    );
+    let hint = narrowed.shard_size_hint().expect("hint survives the view");
+    assert_eq!(hint, from_reader);
+
+    for shard in 0..N_SHARDS {
+        let csr = narrowed.read_shard(shard).unwrap();
+        assert!(
+            csr.n_rows() <= hint.max_rows && csr.indices.len() <= hint.max_nnz,
+            "shard {shard} ({} rows, {} nnz) exceeds the hint {hint:?} — an \
+             under-bound is the one thing the contract forbids",
+            csr.n_rows(),
+            csr.indices.len()
+        );
+    }
+}

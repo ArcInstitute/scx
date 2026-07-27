@@ -156,6 +156,17 @@ impl scx_format_io::ShardSource for LazyShardSource {
         self.backed.max_shard_rows()
     }
 
+    /// Forwarded from the wrapped reader's catalog statistics, for the same
+    /// reason and with the same caveat as [`Self::max_shard_rows`]: transforms
+    /// and column projection cannot raise either figure and `kept_to_global`
+    /// only lowers them, so the on-disk numbers stay valid **upper bounds** —
+    /// which is exactly what the contract promises. `None` when the catalog
+    /// carries no stats block; a consumer must read that as "unknown", never as
+    /// zero.
+    fn shard_size_hint(&self) -> Option<scx_format_io::ShardSizeHint> {
+        scx_format_io::ShardSource::shard_size_hint(&*self.backed)
+    }
+
     fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
         // `read_shard_arc` owns the pipeline. When nothing else holds the Arc
         // (the uncached path, or any path that derived a fresh CSR) this

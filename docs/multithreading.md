@@ -339,7 +339,7 @@ accelerator uses rayon's global thread pool or a locally-scoped pool:
 
 | Accelerator | Threading model |
 |-------------|----------------|
-| **PCA** (covariance / randomized) | Per-op `rayon::ThreadPool`; row-chunked `par_chunks` for SpMM with thread-local accumulators |
+| **PCA** (covariance / randomized) | Bounded ordered decode-prefetch on the global pool; per-op `rayon::ThreadPool` for the covariance accumulation; row-chunked `par_chunks` for SpMM with thread-local accumulators |
 | **Differential expression** (Wilcoxon rank-sum) | `par_iter` over genes |
 | **NB-GLM** (DESeq2-style DE) | `par_iter` over genes for IRLS, shrinkage refit, and Wald inference |
 | **Harmony** batch integration | Per-op `rayon::ThreadPool`; tiled cell updates via `par_chunks` |
@@ -354,6 +354,18 @@ accelerator uses rayon's global thread pool or a locally-scoped pool:
 PCA and Harmony build isolated `rayon::ThreadPool` instances scoped to the
 op to avoid contention with the global pool. All other ops use the process-global
 rayon registry (controllable via `RAYON_NUM_THREADS`).
+
+PCA is the one accelerator that runs on **two pools at once**. Its shard loops —
+the fused column-means pass, the covariance build, the covariance embeddings
+pass, both streaming SpMM passes — deliver through the bounded ordered
+decode-prefetch pipeline, so up to `depth` shards decode on the *global* pool
+while the reduction runs on the private one. The two are disjoint sets of OS
+threads, and the pipeline never has more outstanding decode tasks than its
+channel can hold, so a decode worker cannot park while the calling thread is
+blocked inside `pool.install`. Depth is `SCX_ACCEL_PREFETCH_DEPTH` (default 4)
+additionally lowered by `SCX_ACCEL_NUM_THREADS`, so that knob bounds PCA's decode
+concurrency as well as its two pools. The decoded-but-unconsumed shards are
+reserved out of `pca(memory_budget=…)` rather than added on top of it.
 
 > `errno 37` ("No locks available") on NFS/Lustre/GPFS.
 

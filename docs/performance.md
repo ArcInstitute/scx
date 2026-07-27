@@ -963,6 +963,136 @@ per-thread deterministic RNG design plus a trustworthiness / kNN-overlap quality
 exists yet). When revisited it should keep the serial path as the deterministic default and
 mirror Leiden's opt-in `parallel` flag.
 
+### PCA streaming decode-prefetch (Phase-4)
+
+Task 4.2 wired the bounded ordered decode-prefetch pipeline into the backed aggregation
+kernels, the column-projected twins, the lazy/transformed kernels and GPU staging — but
+not PCA, which owns two inner rayon pools and was deferred on a deadlock concern. `pca`
+was that capture's *control* for exactly that reason and came out flat at 1.02× while
+everything around it moved ~2×, leaving it the single most expensive CPU op in the tier.
+`scx-codec` contains no rayon, so a shard decode is genuinely single-threaded: more than
+half of census_1m `pca` was one core decoding while the other 23 waited.
+
+**The deferral rested on the wrong nesting.** What deadlocks `for_each_shard_ordered` is
+being *called from* a saturated pool worker — the drain blocks on the channel while its own
+decode spawns queue behind it. Entering a parallel region *from inside* `consume` is the
+opposite, and is safe: outstanding decode tasks never exceed `depth` and the channel
+capacity **is** `depth`, so a decode worker always completes its `tx.send` rather than
+parking, and PCA's private covariance pool is a disjoint set of OS threads from the global
+pool the decodes run on. Streaming CPU PCA is only ever entered from `py.detach` on the
+calling Python thread, never from a worker.
+
+Six loops now prefetch: the fused column-means pass (`col_means_and_sum_sq_prefetched`,
+added to `scx-format-io` beside the pipeline so GPU PCA's identical serial loop can adopt
+it later), the covariance build, the covariance embeddings pass, both streaming SpMM
+passes, and the rare centered-variance re-stream. The covariance embeddings pass also
+stopped hand-inlining `spmm_forward_into` — same accumulation, same order, same mean
+correction, but serial, where the randomized route already called the shared parallel
+kernel.
+
+**Measured** (SLURM job 2709414, `cpu` partition, one host, 24 cores,
+`RAYON_NUM_THREADS=24`, `--release`, **one build** with `SCX_ACCEL_PREFETCH_DEPTH=1` vs the
+default 4, 3 runs, median wall):
+
+| Dataset | CSR shards | `pca` (randomized) | `pca_hvg` (covariance) | `qc` ⁺ | `subset_obs` ⁻ |
+|---|--:|--:|--:|--:|--:|
+| pbmc10k | 1 | 1.31× ‡ | 0.98× | 1.01× | 1.06× |
+| smartseq2 | 4 | 1.11× | **1.63×** | 1.57× | 1.01× |
+| tabula_sapiens_100k | 7 | 1.20× | **1.80×** | 1.75× | 1.08× |
+| census_500k | 31 | 1.27× | **2.55×** | 1.97× | 0.96× |
+| census_1m | 62 | **2.29×** | **2.91×** | 2.13× | 1.01× |
+
+⁺ positive control — wired for prefetch in 4.2, so the knob *must* move it; it re-measures
+that result and confirms the knob binds. ⁻ negative control — decodes no shards at all, so
+the knob must *not* move it; its 0.96–1.08× spread is the host's noise floor.
+‡ **discount this one**: pbmc10k is a single-shard file, where `for_each_ordered` declines
+to engage by construction, so 1.31× on a 2.5 s op is page-cache asymmetry between the
+first and second arm, not prefetch.
+
+**The win tracks how much the LRU misses, and the decode counts say so exactly.** They are
+**identical between arms** at every point — 434/434 at census_1m `pca`, 124/124 for
+`pca_hvg`, 31/31 at census_500k — so prefetch changes *when* decoding happens, never how
+much. Read against the shard count they also explain the shape of the table:
+
+- census_1m `pca`: 434 decodes over **62** shards = **exactly 7 passes**, which is
+  randomized PCA's pass count (means + forward + 2 × (transpose + forward) + final
+  transpose). The default 8 GiB shard LRU cannot hold the ~11 GB decoded working set, so
+  it serves *nothing* and every pass re-decodes. Everything is available to overlap → 2.29×.
+- census_500k `pca`: 31 decodes over 31 shards = **1 pass**. The LRU holds the whole matrix,
+  six of the seven passes are cache hits, and there is almost nothing left to overlap →
+  1.27×. Not a disappointing result; a different regime.
+- census_1m `pca_hvg`: 124 / 62 = **2 passes**, covariance's exact count.
+
+Σ decode ÷ wall crossing 100 % is the overlap signal (it sums concurrent workers):
+census_1m `pca` goes 65 % → **170 %**, `pca_hvg` 51 % → **156 %**.
+
+**The wall drops by more than the decode bucket accounts for, and the reason is worth
+knowing.** At census_1m `pca` the sequential model closes exactly — decode 99.3 s +
+reduction 29.7 s + ~24 s of QR/SVD = 153.5 s measured. `pca_hvg` does not: 28.7 + 2.0 leaves
+25.6 s unexplained in the off arm but only ~10 s in the on arm. The missing term is
+`ProjectedShardSource::read_shard_arc`, which calls `project_csr` **after**
+`inner.read_shard_arc()` returns — outside `record_decode_since`, which wraps only the codec
+in `reader.rs`. Projecting 61,497 → 2,000 columns over every shard's nonzeros is real
+row-scale work, it is untimed, and because it sits inside the pipeline's read closure it is
+**also** overlapped. So the `decode` bucket *understates* what prefetch moves off the
+critical path for any projected or transformed source, and `pca_hvg` beats `pca` at 500k
+and 1m despite doing 3.5× fewer decode passes.
+
+**The one-build protocol's premise was confirmed, not argued** (SLURM job 2709415, two
+worktree builds on one host, census_1m, 3 runs). Its whole validity rests on
+`SCX_ACCEL_PREFETCH_DEPTH=1` being what `main` actually did — the claim #373 got wrong for
+GPU staging, where the "off" arm had zero decode threads and `main` had one. Here `main`
+and the depth-1 arm land within host noise, on **different nodes**:
+
+| census_1m | `main` (two-build) | depth-1 arm (one-build) | agreement | two-build speedup | one-build speedup |
+|---|--:|--:|--:|--:|--:|
+| `pca` | 145.8 s | 153.5 s | 5.0 % | **2.27×** | 2.29× |
+| `pca_hvg` | 56.8 s | 56.3 s | 1.0 % | **3.03×** | 2.91× |
+
+**And it retires a claim.** The two-build arms differ by prefetch *and* the
+`spmm_forward_into` swap; the one-build arms differ by prefetch alone. The gap between them
+— 3.03× vs 2.91× — is the swap's entire contribution, and at ~4 % it is not separable from
+the 1–5 % host spread. The reduction bucket says why: the covariance build **and** the
+embeddings scatter together are 2.0 s of a 56 s op, so parallelising the scatter can save
+about a second. The framing that motivated including it (that it was "the covariance
+route's dominant cost") was wrong — it is dominated by the eigendecomposition and by the
+untimed projection above. It is kept as hygiene, deleting ~20 lines of a duplicated kernel,
+with **no `×` claimed** — the same disposition as 4.3's marshalling and 4.5's parallel
+validation.
+
+**Peak RSS is flat or lower** — −716 MB and −564 MB at census_1m, +9 to +53 MB elsewhere.
+Prefetch keeps up to `depth` decoded shards alive, and `pca(memory_budget=…)` is documented
+as the RAM ceiling for out-of-core PCA, so those are reserved *out of* that ceiling rather
+than added on top, sized from the catalog-backed `shard_size_hint()` (no decode). The
+reserve is `depth − 1` shards, not `depth`: the pre-prefetch loop already held one decoded
+shard outside the cache, so worst-case live bytes go from `B + s` to
+`(B − (depth−1)s) + depth·s = B + s`, memory-neutral by construction — and zero at
+`depth = 1`, which is what keeps the off arm byte-for-byte the old behaviour. That the
+decode counts did not move is the direct evidence the smaller LRU cost no hit rate.
+
+**Equivalence splits, and the split is a finding.** PCA's parallel reductions fold into
+`ThreadLocal` accumulators whose row→thread assignment is decided by work-stealing and whose
+merge order is `ThreadLocal::iter_mut()`. Five consecutive `method="covariance"` runs on a
+cancelling-pair fixture produce five different results; `method="randomized"` produces one.
+The diff shows both the accumulator declaration and the merge loop unchanged, so this
+predates decode-prefetch. Exact f64 bit patterns are therefore claimed only where they are
+earned — the forward SpMM, the embeddings-kernel swap, `col_means_and_sum_sq_prefetched`
+against the trait default it replaces, and randomized PCA end-to-end on the deterministic
+branch — with a relative bar for the covariance build and the transpose SpMM's parallel
+branch, and a premise assertion on each fixture pinning which branch it reaches.
+
+The fixture rule inverts between the two, which is worth stating because it reads as a
+contradiction. A pure *reduction* needs a cancelling ±1e16 pair or a lost ordering shows up
+in no bit at all and the assertion is vacuous — the trap 4.2 hit, where the obvious fixture
+was blind in 0 of 119 permutations. A *row-scatter* pass needs a well-conditioned one,
+because there a wiring bug misplaces whole rows rather than perturbing a sum, and a
+cancelling fixture would only drown that signal.
+
+Because "the pipeline silently declined to engage" is invisible in every result, three
+tests measure it rather than infer it: `GaugedSource` counts concurrent decodes and demands
+more than one for the covariance build (the private-pool case), for both SpMM passes and
+for the two whole ops, while `depth_one_never_overlaps` pins the other side.
+
 ### QC / filtering pass fusion (Phase-4 task 4.1)
 
 `calculate_qc_metrics` used to decode every shard once **per statistic**: per-cell
