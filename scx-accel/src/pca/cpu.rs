@@ -2343,23 +2343,35 @@ mod tests {
     // Decode-prefetch: engagement, and equivalence at depth 1 vs depth 4
     // -----------------------------------------------------------------------
 
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::thread::ThreadId;
 
-    /// A `ShardSource` that measures how many decodes are in flight at once.
+    /// A `ShardSource` that records **which thread** decoded each shard.
     ///
     /// This is the anti-trap instrument, and the reason it exists is specific:
     /// `for_each_ordered` **silently** falls back to a sequential loop when the
     /// caller is a rayon worker, when the pool has one thread, or when the depth
     /// is 1. PCA owns two inner rayon pools, so a mis-nested wiring here would
     /// produce no speedup and no error — the whole task could land, pass every
-    /// correctness test below, and do nothing at all. A gauge is the only thing
-    /// that distinguishes "prefetching" from "looks like it is prefetching".
+    /// correctness test below, and do nothing at all.
+    ///
+    /// **Thread identity, not observed overlap.** An earlier version asserted a
+    /// maximum-in-flight count of >= 2, which is a *timing* property: it held on
+    /// a 24-core box 20 runs out of 20 and failed on a 2-core CI runner, where
+    /// libtest's own parallelism saturates the pool and the spawned decodes run
+    /// one at a time. "Did the pipeline engage" is structural — when it does,
+    /// `read_shard` runs on a rayon worker; when it declines, on the calling
+    /// thread — so that is what these tests assert. `max_live` is still
+    /// recorded, but only to make a failure message informative.
     struct GaugedSource {
         shards: Vec<ScxCsr>,
         n_obs: usize,
         n_vars: usize,
         live: AtomicUsize,
         max_live: AtomicUsize,
+        decode_threads: Mutex<HashSet<ThreadId>>,
     }
 
     impl GaugedSource {
@@ -2370,7 +2382,21 @@ mod tests {
                 n_vars,
                 live: AtomicUsize::new(0),
                 max_live: AtomicUsize::new(0),
+                decode_threads: Mutex::new(HashSet::new()),
             }
+        }
+
+        /// True when at least one shard decoded somewhere other than `caller`.
+        fn decoded_off_thread(&self, caller: ThreadId) -> bool {
+            self.decode_threads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| *t != caller)
+        }
+
+        fn decode_thread_count(&self) -> usize {
+            self.decode_threads.lock().unwrap().len()
         }
 
         fn max_concurrent_decodes(&self) -> usize {
@@ -2379,7 +2405,20 @@ mod tests {
 
         fn reset(&self) {
             self.max_live.store(0, Ordering::SeqCst);
+            self.decode_threads.lock().unwrap().clear();
         }
+    }
+
+    /// Assert the pipeline engaged: some shard decoded off the calling thread.
+    fn assert_prefetch_engaged(src: &GaugedSource, what: &str) {
+        let me = std::thread::current().id();
+        assert!(
+            src.decoded_off_thread(me),
+            "{what}: every shard decoded on the calling thread — the prefetch \
+             pipeline declined to engage (threads seen: {}, max in flight: {})",
+            src.decode_thread_count(),
+            src.max_concurrent_decodes()
+        );
     }
 
     impl ShardSource for GaugedSource {
@@ -2393,11 +2432,15 @@ mod tests {
             self.n_vars
         }
         fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
+            self.decode_threads
+                .lock()
+                .unwrap()
+                .insert(std::thread::current().id());
             let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_live.fetch_max(now, Ordering::SeqCst);
-            // Long enough that a genuinely concurrent decode overlaps and a
-            // sequential one cannot, without making the suite slow.
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            // Kept short: nothing asserts on overlap now, so this only widens the
+            // window in which `max_live` can observe some.
+            std::thread::sleep(std::time::Duration::from_millis(1));
             let out = self.shards[shard_idx].clone();
             self.live.fetch_sub(1, Ordering::SeqCst);
             Ok(out)
@@ -2446,12 +2489,7 @@ mod tests {
         // The load-bearing case: the consume closure enters a *private* rayon
         // pool via `pool.install` while decode runs on the global one.
         accumulate_covariance_streaming(&src, 6, 4).unwrap();
-        assert!(
-            src.max_concurrent_decodes() >= 2,
-            "covariance build never overlapped a decode (max in flight = {}) — the \
-             prefetch pipeline declined to engage",
-            src.max_concurrent_decodes()
-        );
+        assert_prefetch_engaged(&src, "covariance build");
     }
 
     #[test]
@@ -2464,20 +2502,12 @@ mod tests {
         let m = random_gaussian(6, k, 1);
 
         streaming_spmm_forward(&src, &m, k, None, 4).unwrap();
-        assert!(
-            src.max_concurrent_decodes() >= 2,
-            "forward SpMM never overlapped a decode (max in flight = {})",
-            src.max_concurrent_decodes()
-        );
+        assert_prefetch_engaged(&src, "forward SpMM");
 
         src.reset();
         let q = Mat::<f64>::from_fn(src.n_obs(), k, |i, j| (i + j) as f64 * 0.25);
         streaming_spmm_transpose(&src, &q, None, 4).unwrap();
-        assert!(
-            src.max_concurrent_decodes() >= 2,
-            "transpose SpMM never overlapped a decode (max in flight = {})",
-            src.max_concurrent_decodes()
-        );
+        assert_prefetch_engaged(&src, "transpose SpMM");
     }
 
     #[test]
@@ -2487,19 +2517,11 @@ mod tests {
         }
         let src = gauged_fixture(8, 12, 6);
         randomized_pca_with_depth(&src, 2, 2, 2, true, 42, 4).unwrap();
-        assert!(
-            src.max_concurrent_decodes() >= 2,
-            "randomized_pca never overlapped a decode (max in flight = {})",
-            src.max_concurrent_decodes()
-        );
+        assert_prefetch_engaged(&src, "randomized_pca");
 
         src.reset();
         covariance_pca_with_depth(&src, 2, true, 4).unwrap();
-        assert!(
-            src.max_concurrent_decodes() >= 2,
-            "covariance_pca never overlapped a decode (max in flight = {})",
-            src.max_concurrent_decodes()
-        );
+        assert_prefetch_engaged(&src, "covariance_pca");
     }
 
     /// Depth 1 must take the sequential fallback — this is what makes
@@ -2507,14 +2529,17 @@ mod tests {
     /// than merely an "off" arm. #373's GPU staging A/B got this wrong: there,
     /// depth 1 had zero decode threads where `main` had one.
     #[test]
-    fn depth_one_never_overlaps() {
+    fn depth_one_decodes_on_the_calling_thread() {
         let src = gauged_fixture(6, 8, 5);
         randomized_pca_with_depth(&src, 2, 2, 2, true, 42, 1).unwrap();
-        assert_eq!(
-            src.max_concurrent_decodes(),
-            1,
-            "depth 1 must decode strictly one shard at a time"
+        let me = std::thread::current().id();
+        assert!(
+            !src.decoded_off_thread(me),
+            "depth 1 must take the sequential fallback and decode inline on the \
+             calling thread — that is what makes SCX_ACCEL_PREFETCH_DEPTH=1 a \
+             genuine baseline rather than merely an 'off' arm"
         );
+        assert_eq!(src.max_concurrent_decodes(), 1);
     }
 
     fn assert_bits_eq(got: &[f64], want: &[f64], what: &str) {
