@@ -717,26 +717,26 @@ fn explicit_zero_before_a_duplicate_column_does_not_corrupt_the_row() {
 /// When every candidate var key fails, the reported error must be the *first*
 /// candidate's — the caller's preferred key — not the last fallback's.
 ///
-/// Distinguishing them needs candidates that fail *differently*: the target
-/// carries both `gene_id` (preferred, 2 genes) and `gene_name` (3 genes), and
-/// the source matches neither. The error names the count of unmatched source
-/// keys, so the two candidates produce different messages.
+/// Telling those apart needs the two candidates to fail with *different* error
+/// kinds; a target where both merely fail to overlap produces the same message
+/// either way and would pass even with last-error behaviour. So `gene_id` (the
+/// preferred candidate) carries duplicates and fails with `DuplicateJoinKey`,
+/// while `gene_name` is well-formed but has no overlap and fails with
+/// `AxisMismatch`.
 #[test]
 fn var_key_retry_reports_the_first_candidate_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("two_var_keys.scx");
-    let n_vars = 2usize;
-    let header = FileHeader::new_single_modality(3, n_vars as u64, 0, 16384, 0, 0);
+    let header = FileHeader::new_single_modality(3, 2, 0, 16384, 0, 0);
     let mut writer = ScxWriter::new(&path, header).unwrap();
     writer.write_obs(&obs_batch(3)).unwrap();
-    // `gene_id` is the first candidate; `gene_name` is a later one.
     let var = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("gene_id", DataType::Utf8, false),
             Field::new("gene_name", DataType::Utf8, false),
         ])),
         vec![
-            Arc::new(StringArray::from(vec!["ens0", "ens1"])),
+            Arc::new(StringArray::from(vec!["dup", "dup"])),
             Arc::new(StringArray::from(vec!["SYM0", "SYM1"])),
         ],
     )
@@ -747,21 +747,23 @@ fn var_key_retry_reports_the_first_candidate_failure() {
         .unwrap();
     writer.finish().unwrap();
 
-    // Source keys match neither candidate.
+    // Overlaps neither candidate, so both are tried and both fail.
     let data = diagonal_data(
         keys("cell_", 3),
         vec!["nope_a".into(), "nope_b".into()],
         |i| i as f32 + 1.0,
     );
 
-    let err = attach_external_layer(&path, &data, &opts("cb")).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("absent from the target var axis"), "{msg}");
-    // Both candidates fail; the preferred one (`gene_id`) must be the reported
-    // failure. Its examples list the source keys it could not place.
+    let msg = attach_external_layer(&path, &data, &opts("cb"))
+        .unwrap_err()
+        .to_string();
     assert!(
-        msg.contains("nope_a"),
-        "must show the unmatched source keys: {msg}"
+        msg.contains("duplicates"),
+        "expected the preferred key's (gene_id) duplicate error, got: {msg}"
+    );
+    assert!(
+        !msg.contains("absent from the target var axis"),
+        "reported the last candidate's error instead of the first: {msg}"
     );
 }
 
