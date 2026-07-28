@@ -497,6 +497,32 @@ fn source_checksum_is_recorded() {
     assert_eq!(out.data.source_name.as_deref(), Some("out.h5"));
 }
 
+/// A damaged file with a negative offset must be rejected by name, not wrap
+/// through `as u64` into an enormous value and panic downstream.
+#[test]
+fn negative_indptr_is_rejected_rather_than_wrapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt.h5");
+    create_cellbender_h5(&path, 4, 3, Kind::Full, Strings::VarLen, false);
+    {
+        let f = hdf5::File::open_rw(&path).unwrap();
+        let m = f.group("matrix").unwrap();
+        m.unlink("indptr").unwrap();
+        write_i64(&m, "indptr", &[0, 1, -2, 3, 4]);
+    }
+
+    let msg = match read_cellbender_h5(
+        &path,
+        &CellBenderReadOptions::default(),
+        &mut WarningSink::log(),
+    ) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a negative indptr offset must be rejected"),
+    };
+    assert!(msg.contains("negative offset"), "{msg}");
+    assert!(msg.contains("corrupt"), "{msg}");
+}
+
 // ---------------------------------------------------------------------------
 // Detection
 // ---------------------------------------------------------------------------

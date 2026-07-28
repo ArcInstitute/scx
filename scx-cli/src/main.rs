@@ -115,8 +115,7 @@ enum Commands {
         /// substituted for — the deletion-vector mask. Intended as a
         /// result-preserving low-UMI pre-trim on a RAW all-droplet file
         /// before CellBender `remove-background`. Requires the streaming
-        /// export path. Note: clap reads a bare leading-hyphen token as a
-        /// flag, so a negative value must be written `--min-counts=-1`.
+        /// export path.
         #[arg(long, value_name = "N", value_parser = validators::non_negative_f64)]
         min_counts: Option<f64>,
         /// Stream the conversion without materializing the full X

@@ -143,6 +143,13 @@ pub fn is_cellbender_h5(path: &Path) -> bool {
 }
 
 /// Read a CellBender `remove-background` output into an [`ExternalLayerData`].
+///
+/// **Not streaming**, unlike the h5ad/h5mu ingest pipelines, and it does not
+/// honour `memory_budget`: the barcode-keyed join reorders rows arbitrarily, so
+/// the matrix has to be resident. That is bounded in practice — CellBender
+/// analyses at most `total_droplets_included` barcodes (default 25k, heuristic
+/// cap 70k) — but a full all-droplet output on a very wide feature axis will
+/// still cost several GB.
 pub fn read_cellbender_h5(
     path: &Path,
     opts: &CellBenderReadOptions,
@@ -186,11 +193,24 @@ pub fn read_cellbender_h5(
             n_rows
         )));
     }
+    // A damaged file can carry negative offsets/indices; `as u64` would wrap
+    // them into enormous values and panic somewhere downstream. Reject with a
+    // message that names the file instead.
+    if let Some(bad) = indptr_i64.iter().find(|v| **v < 0) {
+        return Err(ConvertError::Other(format!(
+            "/matrix/indptr contains a negative offset ({bad}); '{}' is corrupt",
+            path.display()
+        )));
+    }
     let indptr: Vec<u64> = indptr_i64.iter().map(|v| *v as u64).collect();
-    let indices: Vec<u32> = crate::h5ad::read::read_i32_dataset(&matrix.dataset("indices")?)?
-        .into_iter()
-        .map(|v| v as u32)
-        .collect();
+    let indices_i32 = crate::h5ad::read::read_i32_dataset(&matrix.dataset("indices")?)?;
+    if let Some(bad) = indices_i32.iter().find(|v| **v < 0) {
+        return Err(ConvertError::Other(format!(
+            "/matrix/indices contains a negative index ({bad}); '{}' is corrupt",
+            path.display()
+        )));
+    }
+    let indices: Vec<u32> = indices_i32.into_iter().map(|v| v as u32).collect();
     let values = read_f32_dataset(&matrix.dataset("data")?)?;
 
     let row_keys = read_string_dataset(&matrix.dataset("barcodes")?)?;

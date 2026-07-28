@@ -716,22 +716,109 @@ fn explicit_zero_before_a_duplicate_column_does_not_corrupt_the_row() {
 
 /// When every candidate var key fails, the reported error must be the *first*
 /// candidate's — the caller's preferred key — not the last fallback's.
+///
+/// Distinguishing them needs candidates that fail *differently*: the target
+/// carries both `gene_id` (preferred, 2 genes) and `gene_name` (3 genes), and
+/// the source matches neither. The error names the count of unmatched source
+/// keys, so the two candidates produce different messages.
 #[test]
 fn var_key_retry_reports_the_first_candidate_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
-    // No source gene matches any target key, so every candidate fails.
+    let path = dir.path().join("two_var_keys.scx");
+    let n_vars = 2usize;
+    let header = FileHeader::new_single_modality(3, n_vars as u64, 0, 16384, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&obs_batch(3)).unwrap();
+    // `gene_id` is the first candidate; `gene_name` is a later one.
+    let var = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("gene_id", DataType::Utf8, false),
+            Field::new("gene_name", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["ens0", "ens1"])),
+            Arc::new(StringArray::from(vec!["SYM0", "SYM1"])),
+        ],
+    )
+    .unwrap();
+    writer.write_var(&var).unwrap();
+    writer
+        .write_csr_shard(&[0u64; 4], &[], &[], CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+    writer.finish().unwrap();
+
+    // Source keys match neither candidate.
     let data = diagonal_data(
         keys("cell_", 3),
-        vec!["unknown_a".into(), "unknown_b".into()],
+        vec!["nope_a".into(), "nope_b".into()],
         |i| i as f32 + 1.0,
     );
 
     let err = attach_external_layer(&path, &data, &opts("cb")).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("absent from the target var axis"), "{msg}");
+    // Both candidates fail; the preferred one (`gene_id`) must be the reported
+    // failure. Its examples list the source keys it could not place.
     assert!(
-        err.to_string().contains("absent from the target var axis"),
-        "{err}"
+        msg.contains("nope_a"),
+        "must show the unmatched source keys: {msg}"
     );
+}
+
+/// A column index past the declared column-key count is rejected up front,
+/// rather than panicking inside the gather's `col_map[...]` lookup.
+#[test]
+fn out_of_range_column_index_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 2, 3, 1);
+    let before = std::fs::read(&path).unwrap();
+
+    let mut data = diagonal_data(keys("cell_", 2), keys("g", 3), |i| (i + 1) as f32);
+    data.indices[0] = 99; // only 3 column keys exist
+
+    let err = attach_external_layer(&path, &data, &opts("cb")).unwrap_err();
+    assert!(err.to_string().contains("out of range"), "{err}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// A dry run must predict the same nnz the real import writes, including when
+/// the source carries explicit zeros or duplicate coordinates.
+#[test]
+fn dry_run_nnz_matches_the_real_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let messy = |p: &std::path::Path| ExternalLayerData {
+        row_keys: vec!["cell_0".into(), "cell_1".into()],
+        col_keys: keys("g", 3),
+        indptr: vec![0, 3, 4],
+        indices: vec![2, 1, 2, 0],
+        values: vec![0.0, 1.0, 3.0, 7.0],
+        row_annotations: None,
+        row_embeddings: Vec::new(),
+        col_annotations: None,
+        uns: None,
+        source_checksum: None,
+        source_name: Some(p.display().to_string()),
+    };
+
+    let dry_path = write_fixture(dir.path(), "dry.scx", 2, 3, 1);
+    let dry = attach_external_layer(
+        &dry_path,
+        &messy(&dry_path),
+        &AttachLayerOptions {
+            dry_run: true,
+            ..opts("cb")
+        },
+    )
+    .unwrap();
+
+    let real_path = write_fixture(dir.path(), "real.scx", 2, 3, 1);
+    let real = attach_external_layer(&real_path, &messy(&real_path), &opts("cb")).unwrap();
+
+    assert_eq!(
+        dry.layer_nnz, real.layer_nnz,
+        "a dry run must not overstate nnz relative to the import it previews"
+    );
+    assert_eq!(real.layer_nnz, 3);
 }
 
 #[test]

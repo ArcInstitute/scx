@@ -197,6 +197,25 @@ def test_x_and_provenance_survive_and_rollback_undoes_the_import(target, tmp_dir
     np.testing.assert_allclose(rolled.X.toarray(), before.X.toarray())
 
 
+@pytest.mark.parametrize(
+    ("kwarg", "value"),
+    [
+        ("on_missing_rows", "nope"),
+        ("on_extra_rows", "nope"),
+        ("gene_axis", "nope"),
+    ],
+)
+def test_invalid_enum_arguments_raise(target, tmp_dir, kwarg, value):
+    """Document the accepted spellings — a typo must fail loudly rather than
+    falling back to a default policy."""
+    path, barcodes, genes = target
+    cb = tmp_dir / "cb.h5"
+    _write_cellbender_h5(cb, barcodes, genes, lambda bc: 1)
+
+    with pytest.raises(ValueError, match=kwarg):
+        pyscx.cellbender_import(str(path), str(cb), **{kwarg: value})
+
+
 def test_is_cellbender_h5_discriminates(target, tmp_dir):
     path, barcodes, genes = target
     cb = tmp_dir / "cb.h5"

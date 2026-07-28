@@ -435,12 +435,19 @@ pub fn attach_external_layer(
     if opts.dry_run {
         // Everything above is validation and the join itself, so the caller
         // gets a real `n_matched` while the file stays untouched.
+        //
+        // nnz goes through the *same* gather+canonicalize the write path uses,
+        // rather than summing raw source row lengths: otherwise a dry run
+        // would overstate nnz exactly when the source has explicit zeros or
+        // duplicate coordinates, and the preview would disagree with the
+        // import it is meant to predict.
         summary.obsm_keys_added = obsm_batches.iter().map(|(k, _)| k.clone()).collect();
-        summary.layer_nnz = row_join
-            .source_of_target
-            .iter()
-            .filter_map(|s| s.map(|i| data.indptr[i as usize + 1] - data.indptr[i as usize]))
-            .sum();
+        for (row_start, row_end) in &shard_ranges {
+            let (mut i, mut j, mut v) =
+                gather_shard(data, &row_join, &col_map, *row_start, *row_end);
+            scx_sparse::canonicalize_csr(&mut i, &mut j, &mut v);
+            summary.layer_nnz += *i.last().unwrap_or(&0);
+        }
         return Ok(summary);
     }
 
@@ -628,6 +635,15 @@ fn validate_shape(data: &ExternalLayerData) -> Result<()> {
             ),
         });
     }
+    // `ExternalLayerData` is a public seam, so a malformed value must not reach
+    // `gather_shard` — the remap path indexes `col_map` by column index and
+    // would panic, and the identity path would emit an out-of-range index.
+    let n_cols = data.col_keys.len();
+    if let Some(bad) = data.indices.iter().find(|c| **c as usize >= n_cols) {
+        return Err(OpsError::ShapeMismatch {
+            detail: format!("column index {bad} is out of range for {n_cols} column keys"),
+        });
+    }
     let nnz = *data.indptr.last().unwrap_or(&0) as usize;
     if nnz != data.indices.len() {
         return Err(OpsError::ShapeMismatch {
@@ -792,6 +808,9 @@ fn string_column(batch: &RecordBatch, name: &str) -> Result<Vec<String>> {
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| OpsError::InvalidInput(format!("column '{name}' is not Utf8 after cast")))?;
+    // A null key becomes "". Two or more nulls are caught by the duplicate-key
+    // check; a single one can only mis-join against a literal empty-string key
+    // on the other side, which no real barcode or gene id is.
     Ok((0..arr.len())
         .map(|i| {
             if arr.is_null(i) {
