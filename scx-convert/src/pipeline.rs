@@ -237,6 +237,40 @@ pub struct ConvertOptions {
     /// (the grouped random-row gather over a dense matrix reads full rows and
     /// is ~4–5× slower / ~2× the memory). `One` / `Two` force the choice.
     pub group_pass: GroupPass,
+    /// SCX → h5ad/h5mu **export only**: caller-supplied obs keep mask.
+    ///
+    /// Indexed in the **global / physical** obs row space — the length must
+    /// equal the file header's `n_obs`, *not* the post-deletion live count.
+    /// This is the same coordinate system
+    /// [`scx_format_io::ScxReader::deletion_keep_mask`] and
+    /// [`crate::min_counts_obs_mask`] use.
+    ///
+    /// Intersected (AND) with the deletion-vector mask, never substituted for
+    /// it: a logically deleted row stays dropped regardless of its entry here.
+    ///
+    /// `Arc<[bool]>` so the derived `Clone` stays O(1) on atlas-scale masks.
+    /// Rejected up front on import directions.
+    pub export_obs_keep_mask: Option<std::sync::Arc<[bool]>>,
+    /// SCX → h5ad **export only**: keep observations whose total `X` UMI count
+    /// is `>= export_min_counts`, computed with one streaming pass over the CSR
+    /// shards (see [`crate::min_counts_obs_mask`]) in the same global obs row
+    /// space as [`Self::export_obs_keep_mask`], and ANDed with it and with the
+    /// deletion-vector mask.
+    ///
+    /// `>=` matches `pyscx.accel.filter_cells(min_counts=)` and
+    /// `sc.pp.filter_cells`. Ambiguous for a multimodal h5mu export (which
+    /// modality's X?), so that direction rejects it.
+    pub export_min_counts: Option<f64>,
+}
+
+impl ConvertOptions {
+    /// True when any caller-supplied export row filter is set. Import
+    /// directions use this to reject options that would otherwise be
+    /// silently ignored; the export path uses it to decide whether to
+    /// record filter provenance.
+    pub fn has_export_row_filter(&self) -> bool {
+        self.export_obs_keep_mask.is_some() || self.export_min_counts.is_some()
+    }
 }
 
 /// Phase 5b: density threshold below which `--bitmap=auto` considers a
@@ -482,8 +516,30 @@ impl Default for ConvertOptions {
             group_target_bytes: None,
             group_max_bytes: None,
             group_pass: GroupPass::default(),
+            export_obs_keep_mask: None,
+            export_min_counts: None,
         }
     }
+}
+
+/// Reject the SCX → h5ad/h5mu export row-filter options on an import
+/// direction.
+///
+/// `ConvertOptions` is shared across both directions, so an export-only field
+/// would otherwise be silently ignored on ingest. Erroring keeps the "an option
+/// you set always did something" contract that the existing `--index-*` /
+/// `--stream` / `--modalities` direction guards uphold.
+pub(crate) fn reject_export_row_filter_on_import(
+    opts: &ConvertOptions,
+    direction: &str,
+) -> Result<(), ConvertError> {
+    if opts.has_export_row_filter() {
+        return Err(ConvertError::Other(format!(
+            "export_obs_keep_mask / export_min_counts are SCX → h5ad export options \
+             and have no effect on '{direction}'"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve [`ConvertOptions::reader_threads`] to a concrete
@@ -798,6 +854,7 @@ pub fn h5ad_to_scx(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
+    reject_export_row_filter_on_import(opts, "h5ad_to_scx")?;
     // Reorder-on-convert (`--sort-by` / `--group-by`) runs only on the streaming
     // path (it needs the random-access gather). Callers route these to streaming;
     // guard the eager path defensively.
@@ -1028,6 +1085,7 @@ pub fn tenx_to_scx(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
+    reject_export_row_filter_on_import(opts, "tenx_to_scx")?;
     let file = hdf5::File::open(input)?;
 
     let format = detect_input_format(&file)?;
@@ -1236,6 +1294,7 @@ pub fn h5ad_to_scx_streaming(
     overrides: &StreamingOverrides,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
+    reject_export_row_filter_on_import(opts, "h5ad_to_scx_streaming")?;
     let file = hdf5::File::open(input)?;
 
     // Format gating. `open_x_streaming` re-checks CSC/dense and the

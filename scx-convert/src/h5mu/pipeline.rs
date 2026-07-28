@@ -205,6 +205,7 @@ pub fn h5mu_to_scx(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
+    crate::pipeline::reject_export_row_filter_on_import(opts, "h5mu_to_scx")?;
     let file = hdf5::File::open(input)?;
 
     if !is_h5mu_file(&file) {
@@ -432,6 +433,7 @@ pub fn h5mu_to_scx_streaming(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
+    crate::pipeline::reject_export_row_filter_on_import(opts, "h5mu_to_scx_streaming")?;
     let file = hdf5::File::open(input)?;
 
     if !is_h5mu_file(&file) {

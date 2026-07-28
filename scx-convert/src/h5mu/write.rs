@@ -114,9 +114,21 @@ pub fn scx_to_h5mu_streaming(
         )));
     }
 
+    // `export_min_counts` sums one modality's X, which is ambiguous when every
+    // modality is being written. An explicit mask is unambiguous (the obs axis
+    // is shared across modalities), so it is honoured.
+    if opts.export_min_counts.is_some() {
+        return Err(ConvertError::Other(
+            "min_counts is ambiguous for a multimodal h5mu export (which modality's X?); \
+             pass an explicit obs mask, or export one modality with to_h5ad(modality=…)"
+                .into(),
+        ));
+    }
+
     let file = hdf5::File::create(h5mu_path)?;
     let root = file.as_group()?;
-    let keep_mask = crate::h5ad::stream_write::build_keep_mask(&reader)?;
+    let keep_mask =
+        crate::h5ad::stream_write::build_export_keep_mask(&reader, scx_path, 0, opts)?.mask;
     write_h5mu_root_attrs_and_global_blocks(&reader, &file, &root, keep_mask.as_deref(), sink)?;
 
     let mod_group = root.create_group("mod")?;
@@ -367,7 +379,10 @@ pub fn scx_modality_to_h5ad_streaming(
     let file = hdf5::File::create(h5ad_path)?;
     let root = file.as_group()?;
 
-    let keep_mask = crate::h5ad::stream_write::build_keep_mask(&reader)?;
+    // `modality_id` scopes a `min_counts` pre-pass to this modality's X.
+    let keep_mask =
+        crate::h5ad::stream_write::build_export_keep_mask(&reader, scx_path, modality_id, opts)?
+            .mask;
 
     stream_csr_to_group_at(
         &root,
