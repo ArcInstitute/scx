@@ -5,6 +5,7 @@ use std::process;
 
 mod append;
 mod benchmark;
+mod cellbender;
 mod cli_utils;
 mod cloud_url;
 mod compact;
@@ -108,6 +109,15 @@ enum Commands {
         /// a multimodal SCX input; ignored otherwise.
         #[arg(long)]
         modality: Option<String>,
+        /// SCX → h5ad only: drop observations whose total X UMI count is
+        /// below N. Computed with one streaming pass over the CSR shards
+        /// (the matrix is never materialized) and intersected with — never
+        /// substituted for — the deletion-vector mask. Intended as a
+        /// result-preserving low-UMI pre-trim on a RAW all-droplet file
+        /// before CellBender `remove-background`. Requires the streaming
+        /// export path.
+        #[arg(long, value_name = "N", value_parser = validators::non_negative_f64)]
+        min_counts: Option<f64>,
         /// Stream the conversion without materializing the full X
         /// matrix in memory. Defaults to true — pass `--stream=false`
         /// to opt into the legacy materializing path. Supported for
@@ -849,6 +859,53 @@ enum Commands {
         #[arg(long)]
         in_place: bool,
     },
+    /// Import a CellBender `remove-background` output as a layer on an
+    /// existing SCX file, in place.
+    ///
+    /// Joins by barcode — never by row position, because CellBender's
+    /// `_filtered.h5` is in descending-UMI order. X, the CSC sidecar, .raw,
+    /// deletion vectors and predicate indexes are preserved; undo with
+    /// `scx rollback`.
+    CellbenderImport {
+        /// Target SCX file (mutated in place).
+        input: PathBuf,
+        /// CellBender remove-background output .h5
+        cellbender_h5: PathBuf,
+        /// Name of the layer to write
+        #[arg(long, default_value = "cellbender")]
+        layer: String,
+        /// obs column holding the barcode (default: auto-resolve)
+        #[arg(long)]
+        obs_key: Option<String>,
+        /// var column holding the gene key (default: auto-resolve)
+        #[arg(long)]
+        var_key: Option<String>,
+        /// Prefix for the emitted obs/var columns
+        #[arg(long, default_value = "cellbender_")]
+        prefix: String,
+        /// uns key for the CellBender run metadata
+        #[arg(long, default_value = "cellbender")]
+        uns_key: String,
+        /// Replace an existing layer / columns / uns key
+        #[arg(long)]
+        overwrite: bool,
+        /// Target rows with no matching source row: zero-fill or fail
+        #[arg(long, default_value = "zero", value_parser = ["zero", "error"])]
+        on_missing_rows: String,
+        /// Source rows absent from the target: warn and skip, or fail
+        #[arg(long, default_value = "warn", value_parser = ["warn", "error"])]
+        on_extra_rows: String,
+        /// Gene-axis tolerance. A silent permutation is biologically wrong,
+        /// so reordering must be opted into.
+        #[arg(long, default_value = "identical", value_parser = ["identical", "reorder", "subset"])]
+        gene_axis: String,
+        /// Also import the z latent as obsm["X_cellbender_latent"]
+        #[arg(long)]
+        latent_embedding: bool,
+        /// Validate and report the join without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Restore the default `SIGPIPE` disposition (`SIG_DFL`).
@@ -925,6 +982,7 @@ fn main() {
             row_group_rows,
             row_group_target_nnz,
             modality,
+            min_counts,
             stream,
             memory_budget,
             strict_uns,
@@ -965,6 +1023,7 @@ fn main() {
                 row_group_rows,
                 row_group_target_nnz,
                 modality.as_deref(),
+                min_counts,
                 stream,
                 memory_budget.as_deref(),
                 strict_uns,
@@ -988,6 +1047,35 @@ fn main() {
                 &group_pass,
             )
         }
+        Commands::CellbenderImport {
+            input,
+            cellbender_h5,
+            layer,
+            obs_key,
+            var_key,
+            prefix,
+            uns_key,
+            overwrite,
+            on_missing_rows,
+            on_extra_rows,
+            gene_axis,
+            latent_embedding,
+            dry_run,
+        } => cellbender::run_cellbender_import(
+            &input,
+            &cellbender_h5,
+            &layer,
+            obs_key.as_deref(),
+            var_key.as_deref(),
+            &prefix,
+            &uns_key,
+            overwrite,
+            &on_missing_rows,
+            &on_extra_rows,
+            &gene_axis,
+            latent_embedding,
+            dry_run,
+        ),
         Commands::Info {
             source,
             json,
@@ -1348,6 +1436,7 @@ fn run_convert(
     row_group_rows: u32,
     row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
+    min_counts: Option<f64>,
     stream: bool,
     memory_budget: Option<&str>,
     strict_uns: bool,
@@ -1435,6 +1524,30 @@ fn run_convert(
             "--modalities / --modality-types only apply to h5mu → scx; got direction '{direction}'."
         )
         .into());
+    }
+    // `--min-counts` is an export-side row filter. Check it before the
+    // `--stream` guard below so a user who passes both gets the specific
+    // message rather than the generic direction complaint.
+    if let Some(mc) = min_counts {
+        if direction != "scx_to_h5ad" {
+            return Err(format!(
+                "--min-counts is only supported for scx → h5ad; got direction '{direction}'. \
+                 (For a multimodal source, extract one modality with --modality.)"
+            )
+            .into());
+        }
+        if !stream {
+            return Err(
+                "--min-counts requires the streaming export path; drop --stream=false. \
+                        The legacy materializing path cannot apply a caller-supplied row mask."
+                    .into(),
+            );
+        }
+        if !mc.is_finite() || mc < 0.0 {
+            return Err(
+                format!("--min-counts must be a finite non-negative number; got {mc}").into(),
+            );
+        }
     }
     // Sort-on-convert applies only to h5ad → scx and requires the streaming
     // path (the random-access permuted gather). Force streaming on.
@@ -1564,6 +1677,7 @@ fn run_convert(
         row_group_rows,
         row_group_target_nnz,
         modality,
+        min_counts,
         stream,
         memory_budget_bytes,
         strict_uns,
@@ -1674,6 +1788,7 @@ fn dispatch_convert(
     row_group_rows: u32,
     row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
+    min_counts: Option<f64>,
     stream: bool,
     memory_budget: Option<u64>,
     strict_uns: bool,
@@ -1749,6 +1864,8 @@ fn dispatch_convert(
         group_target_bytes,
         group_max_bytes,
         group_pass,
+        export_obs_keep_mask: None,
+        export_min_counts: min_counts,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -1864,6 +1981,7 @@ fn dispatch_convert(
     _row_group_rows: u32,
     _row_group_target_nnz: Option<u64>,
     _modality: Option<&str>,
+    _min_counts: Option<f64>,
     _stream: bool,
     _memory_budget: Option<u64>,
     _strict_uns: bool,

@@ -18,7 +18,7 @@
 //! [`OpsError::MultimodalUnsupported`]; per-modality metadata replace is a
 //! focused follow-on.
 
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use arrow::array::RecordBatch;
@@ -34,8 +34,7 @@ use scx_format_io::writer::ScxWriter;
 
 use crate::append::{predicate_index_build_options_for_obs, unify_dict_columns};
 use crate::error::{OpsError, Result};
-use crate::flock::FileLock;
-use crate::in_place::{commit_in_place, prepare_in_place};
+use crate::in_place::{commit_in_place, entry_matches_key, prepare_in_place, read_provenance_ops};
 use crate::predicate_index::{user_wants_index, validate_forced_columns};
 
 /// A set of metadata replacements to apply atomically. Any `None` field is left
@@ -446,45 +445,6 @@ fn should_drop_old_entry(e: &FullCatalogEntry, patch: &MetadataPatch) -> bool {
         }
     }
     false
-}
-
-/// Match an obsm/varm catalog entry name against a replaced key. Section names
-/// are `{prefix}/{key}` (single) or `{prefix}/{key}_shard_{idx}` (sharded).
-///
-/// Uses `rfind("_shard_")` stem extraction (mirroring `merge`/`compact`) rather
-/// than a `starts_with` prefix test, so a key like `pca` does not falsely match
-/// the sharded sections of a distinct key `pca_shard` (`{prefix}/pca_shard_shard_0`).
-fn entry_matches_key(name: &str, prefix: &str, key: &str) -> bool {
-    let Some(rest) = name.strip_prefix(&format!("{prefix}/")) else {
-        return false;
-    };
-    if rest == key {
-        return true; // single, unsharded section: {prefix}/{key}
-    }
-    match rest.rfind("_shard_") {
-        Some(pos) => &rest[..pos] == key, // {prefix}/{key}_shard_{idx}
-        None => false,
-    }
-}
-
-/// Read the existing `Provenance` operations (empty if the file has none).
-fn read_provenance_ops(
-    lock: &mut FileLock,
-    old_catalog: &FullCatalog,
-) -> Result<Vec<ProvenanceEntry>> {
-    if let Some(e) = old_catalog
-        .entries
-        .iter()
-        .find(|e| e.section_type == SectionType::Provenance)
-    {
-        lock.seek(SeekFrom::Start(e.offset))?;
-        let mut buf = vec![0u8; e.length as usize];
-        Read::read_exact(lock, &mut buf)?;
-        let prov = Provenance::read_from(&mut Cursor::new(&buf), buf.len())?;
-        Ok(prov.operations)
-    } else {
-        Ok(Vec::new())
-    }
 }
 
 /// Provenance params recording which fields changed + any indexed columns.

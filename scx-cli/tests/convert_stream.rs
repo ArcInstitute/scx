@@ -634,3 +634,187 @@ fn convert_stream_rejects_h5mu_direction() {
         "expected error mentioning --stream and h5mu, got: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `--min-counts`: streaming low-UMI pre-trim on the export direction.
+// ---------------------------------------------------------------------------
+
+/// Per-row totals of `create_test_h5ad`'s deterministic fixture, so the
+/// expected kept count is computed rather than hard-coded.
+fn fixture_row_sums(n_obs: usize, n_vars: usize) -> Vec<f64> {
+    (0..n_obs)
+        .map(|row| {
+            let c0 = (row * 3) % n_vars;
+            let c1 = (row * 3 + 1) % n_vars;
+            let v0 = ((row + 1) * 7 % 200 + 1) as f64;
+            if c0 == c1 {
+                v0
+            } else {
+                v0 + ((row + 2) * 11 % 200 + 1) as f64
+            }
+        })
+        .collect()
+}
+
+fn h5ad_to_scx_fixture(dir: &Path, n_obs: usize, n_vars: usize) -> std::path::PathBuf {
+    let h5ad = dir.join("in.h5ad");
+    let scx_path = dir.join("in.scx");
+    create_test_h5ad(&h5ad, n_obs, n_vars);
+    let status = Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--to",
+            "scx",
+            h5ad.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    scx_path
+}
+
+#[test]
+fn convert_min_counts_filters_rows_on_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars) = (64usize, 12usize);
+    let scx_path = h5ad_to_scx_fixture(dir.path(), n_obs, n_vars);
+    let out = dir.path().join("out.h5ad");
+
+    let threshold = 150.0;
+    let expected = fixture_row_sums(n_obs, n_vars)
+        .iter()
+        .filter(|&&s| s >= threshold)
+        .count();
+    assert!(
+        expected > 0 && expected < n_obs,
+        "threshold must actually bite: kept {expected} of {n_obs}"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args([
+            "convert",
+            "--to",
+            "h5ad",
+            "--min-counts",
+            &threshold.to_string(),
+            scx_path.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "scx convert --min-counts exited {status}");
+
+    let f = hdf5::File::open(&out).unwrap();
+    let shape: Vec<i64> = f
+        .group("X")
+        .unwrap()
+        .attr("shape")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(shape, vec![expected as i64, n_vars as i64]);
+}
+
+/// `--min-counts` on an ingest direction must fail loudly rather than being
+/// silently ignored (the option lives on the shared `ConvertOptions`).
+#[test]
+fn convert_min_counts_rejected_on_import_direction() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let scx_path = dir.path().join("out.scx");
+    create_test_h5ad(&h5ad, 16, 8);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--to",
+            "scx",
+            "--min-counts",
+            "5",
+            h5ad.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--min-counts"), "{stderr}");
+    assert!(stderr.contains("h5ad_to_scx"), "{stderr}");
+}
+
+#[test]
+fn convert_min_counts_rejects_stream_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = h5ad_to_scx_fixture(dir.path(), 16, 8);
+    let out_path = dir.path().join("out.h5ad");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args([
+            "convert",
+            "--to",
+            "h5ad",
+            "--stream=false",
+            "--min-counts",
+            "5",
+            scx_path.to_str().unwrap(),
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--stream"), "{stderr}");
+}
+
+#[test]
+fn convert_min_counts_zero_rows_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = h5ad_to_scx_fixture(dir.path(), 16, 8);
+    let out_path = dir.path().join("out.h5ad");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args([
+            "convert",
+            "--to",
+            "h5ad",
+            "--min-counts",
+            "1000000",
+            scx_path.to_str().unwrap(),
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("keeps zero"), "{stderr}");
+}
+
+#[test]
+fn convert_min_counts_negative_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = h5ad_to_scx_fixture(dir.path(), 16, 8);
+    let out_path = dir.path().join("out.h5ad");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args([
+            "convert",
+            "--to",
+            "h5ad",
+            // `=` form: clap treats a bare `-1` token as a flag, so this is
+            // the only spelling that reaches the value parser.
+            "--min-counts=-1",
+            scx_path.to_str().unwrap(),
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("non-negative"), "{stderr}");
+}

@@ -42,6 +42,15 @@ pub enum OpsError {
     #[error("layer '{name}' missing in input file {file_index}")]
     LayerMissing { name: String, file_index: usize },
 
+    #[error("could not resolve the {axis} join key column: {detail}")]
+    KeyColumnUnresolved { axis: &'static str, detail: String },
+
+    #[error("duplicate {axis} join key(s): {detail}")]
+    DuplicateJoinKey { axis: &'static str, detail: String },
+
+    #[error("{axis} axis mismatch: {detail}")]
+    AxisMismatch { axis: &'static str, detail: String },
+
     #[error("obs schema mismatch on append: {detail}")]
     SchemaMismatch { detail: String },
 

@@ -377,6 +377,30 @@ count matches `/X[0]`); for high-cardinality categorical obs columns
 the writer emits the modern `categorical` group form so
 `anndata.read_h5ad` reads them cleanly at census scale.
 
+`to_h5ad` also takes an optional obs-axis row filter, so a large file can be
+exported as a subset without materialising it: `obs_mask=` (a boolean array) and
+`min_counts=` (a per-cell total-UMI floor, computed with one streaming pass over
+the CSR shards). Both are indexed in the **global / physical** obs row space —
+length must equal `pyscx.open(path).n_obs_physical`, not `.n_obs`, which is the
+post-deletion live count — and both are ANDed with the deletion-vector mask
+rather than replacing it, so a logically deleted row stays dropped. A filtered
+export records what it dropped in `uns["scx_export"]`. Both require
+`stream=True`.
+
+The motivating case is feeding a raw all-droplet file to CellBender
+`remove-background`:
+
+```python
+# Result-preserving pre-trim: CellBender's own prior estimation ignores
+# droplets at or below its --low-count-threshold, and never-analyzed barcodes
+# are all-zero rows in its output.
+pyscx.to_h5ad("raw.scx", "raw_trimmed.h5ad", min_counts=5)
+```
+
+Bring the corrected counts back with `pyscx.cellbender_import` /
+`scx cellbender-import` — see
+[docs/operations.md § CellBender import](operations.md#cellbender-import).
+
 ```python
 import pyscx
 

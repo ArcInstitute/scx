@@ -36,7 +36,7 @@ use super::write::{
 };
 use crate::h5_write_util::vlu;
 use crate::pipeline::{ConvertError, ConvertOptions};
-use crate::warnings::WarningSink;
+use crate::warnings::{ConvertWarning, WarningSink};
 
 /// Write obs into `parent` under `name="obs"`. Routes to the streaming
 /// path when the source has `ObsMetadataShard` sections, else falls back
@@ -192,7 +192,12 @@ pub fn write_scx_to_h5ad_streaming(
     let file = hdf5::File::create(h5ad_path)?;
     let root = file.as_group()?;
 
-    let keep_mask = build_keep_mask(&reader)?;
+    let filter = build_export_keep_mask(&reader, scx_path, 0, opts)?;
+    // Built before the mask is moved out; `caller_filtered` is Copy so the
+    // eager-section warnings below still see it.
+    let export_note = build_export_provenance(&reader, scx_path, opts, &filter);
+    let caller_filtered = filter.caller_filtered;
+    let keep_mask = filter.mask;
 
     // /X.
     let n_vars = reader.n_vars() as usize;
@@ -223,6 +228,9 @@ pub fn write_scx_to_h5ad_streaming(
     // must abort rather than silently omit the section (SCX-009).
     let obsm_map = reader.read_all_obsm()?;
     if !obsm_map.is_empty() {
+        if caller_filtered {
+            sink.emit(ConvertWarning::ExportFilterSectionEager { section: "obsm" });
+        }
         let obsm_group = root.create_group("obsm")?;
         for (name, batch) in &obsm_map {
             let filtered = match keep_mask.as_deref() {
@@ -246,11 +254,20 @@ pub fn write_scx_to_h5ad_streaming(
     // uns. Absence is a clean `SectionNotFound`; any other error (e.g.
     // malformed JSON) is corruption and must abort (SCX-009).
     match reader.read_uns() {
-        Ok(uns) => {
+        Ok(mut uns) => {
+            merge_export_provenance(&mut uns, export_note, sink);
             let uns_group = root.create_group("uns")?;
             write_uns_entries_at(&uns_group, &uns)?;
         }
-        Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {}
+        // No uns section. Only materialise one when we actually have a filter
+        // note to record, so unfiltered exports stay byte-identical.
+        Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {
+            if let Some(note) = export_note {
+                let uns = serde_json::json!({ EXPORT_PROVENANCE_KEY: note });
+                let uns_group = root.create_group("uns")?;
+                write_uns_entries_at(&uns_group, &uns)?;
+            }
+        }
         Err(e) => return Err(e.into()),
     }
 
@@ -259,6 +276,9 @@ pub fn write_scx_to_h5ad_streaming(
 
     // /raw (DV-filtered on the obs axis like /X). Read eagerly; shared
     // with the eager exporter.
+    if caller_filtered && reader.has_raw() {
+        sink.emit(ConvertWarning::ExportFilterSectionEager { section: "raw" });
+    }
     super::write::write_raw_to_h5ad(&root, &reader, keep_mask.as_deref(), sink)?;
 
     // obsp / varp pairwise matrices (COO → csr_matrix groups). Read eagerly,
@@ -266,6 +286,9 @@ pub fn write_scx_to_h5ad_streaming(
     // varp (var axis) is never obs-deleted. Both readers return Ok(empty) on
     // absence, so errors are corruption and propagate (SCX-009).
     let obsp = reader.read_all_obsp()?;
+    if caller_filtered && !obsp.is_empty() {
+        sink.emit(ConvertWarning::ExportFilterSectionEager { section: "obsp" });
+    }
     super::write::write_pairwise_group(&root, "obsp", &obsp, keep_mask.as_deref())?;
     let varp = reader.read_all_varp()?;
     super::write::write_pairwise_group(&root, "varp", &varp, None)?;
@@ -967,6 +990,172 @@ pub(crate) fn build_keep_mask(reader: &ScxReader) -> Result<Option<Vec<bool>>, C
     // Shared with the reader CSR filter, `scx compact`, and the pyscx obs
     // filter: see `ScxReader::deletion_keep_mask`.
     Ok(reader.deletion_keep_mask()?)
+}
+
+/// The resolved obs-axis row filter for one streaming export: the deletion
+/// vector intersected with whatever the caller supplied.
+pub(crate) struct ExportRowFilter {
+    /// `None` means "keep every row". Keeping it an `Option` (rather than an
+    /// all-true vector) is load-bearing: it preserves `filter_shard`'s no-copy
+    /// fast path and `precompute_total_nnz`'s zero-decode `stats.nnz` path for
+    /// unfiltered exports.
+    pub(crate) mask: Option<Vec<bool>>,
+    /// Rows kept. Computed once here so obs and `/X` can never disagree about
+    /// the output row count.
+    pub(crate) n_kept: usize,
+    /// The deletion vector contributed at least one dropped row.
+    pub(crate) dv_filtered: bool,
+    /// A caller-supplied filter (`export_obs_keep_mask` and/or
+    /// `export_min_counts`) contributed to the mask. Deletion-vector-only
+    /// exports leave this `false`.
+    pub(crate) caller_filtered: bool,
+}
+
+/// Validate a caller-supplied mask against the physical obs row count.
+///
+/// Deliberately `!=`, not `<`. The pre-existing per-shard checks only reject
+/// short masks, so an *over-long* mask — the classic symptom of a mask built
+/// against a different file — is silently truncated today.
+fn validate_export_mask_len(len: usize, n_obs: usize, what: &str) -> Result<(), ConvertError> {
+    if len != n_obs {
+        return Err(ConvertError::Other(format!(
+            "{what} length {len} does not match the file's physical n_obs {n_obs}; \
+             export row masks are indexed in the global (pre-deletion) obs row space"
+        )));
+    }
+    Ok(())
+}
+
+fn intersect_into(acc: &mut Option<Vec<bool>>, next: Vec<bool>) {
+    match acc {
+        Some(existing) => {
+            for (a, b) in existing.iter_mut().zip(next.iter()) {
+                *a &= *b;
+            }
+        }
+        None => *acc = Some(next),
+    }
+}
+
+/// `uns` key under which a filtered export records what it dropped.
+pub(crate) const EXPORT_PROVENANCE_KEY: &str = "scx_export";
+
+/// Describe a caller-filtered export for `uns["scx_export"]`, or `None` when
+/// only the deletion vector was in play.
+///
+/// Gating on `caller_filtered` (not on `mask.is_some()`) is deliberate: a
+/// deletion-vector-carrying file has nothing to do with this feature and must
+/// not newly grow a `/uns` group. DV drops are already surfaced by
+/// `pyscx`'s `_warn_if_deletions`.
+///
+/// Scalars only — the mask itself is never written. It would duplicate `/obs`
+/// and bloat the file at atlas scale.
+pub(crate) fn build_export_provenance(
+    reader: &ScxReader,
+    scx_path: &Path,
+    opts: &ConvertOptions,
+    filter: &ExportRowFilter,
+) -> Option<serde_json::Value> {
+    if !filter.caller_filtered {
+        return None;
+    }
+    let kind = match (
+        opts.export_obs_keep_mask.is_some(),
+        opts.export_min_counts.is_some(),
+    ) {
+        (true, true) => "obs_mask+min_counts",
+        (true, false) => "obs_mask",
+        _ => "min_counts",
+    };
+    let mut note = serde_json::json!({
+        "tool": opts.tool,
+        "scx_version": env!("CARGO_PKG_VERSION"),
+        "source": scx_path.display().to_string(),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "n_obs_source": reader.n_obs(),
+        "n_obs_written": filter.n_kept as u64,
+        "deletion_filtered": filter.dv_filtered,
+        "filter": kind,
+    });
+    if let Some(mc) = opts.export_min_counts {
+        note["min_counts"] = serde_json::json!(mc);
+    }
+    Some(note)
+}
+
+/// Merge the export note into the source `uns`, never clobbering a user key.
+pub(crate) fn merge_export_provenance(
+    uns: &mut serde_json::Value,
+    note: Option<serde_json::Value>,
+    sink: &mut WarningSink,
+) {
+    let Some(note) = note else { return };
+    match uns.as_object_mut() {
+        Some(map) if !map.contains_key(EXPORT_PROVENANCE_KEY) => {
+            map.insert(EXPORT_PROVENANCE_KEY.to_string(), note);
+        }
+        _ => sink.emit(ConvertWarning::SkippedUnsKey {
+            key: EXPORT_PROVENANCE_KEY.to_string(),
+            reason: "source uns already defines it (or is not a JSON object); \
+                     export filter provenance not recorded"
+                .to_string(),
+        }),
+    }
+}
+
+/// Resolve the effective obs keep mask for a streaming export:
+/// `deletion_vector ∧ export_obs_keep_mask ∧ (row_sum >= export_min_counts)`.
+///
+/// The caller filters are intersected with the deletion-vector mask, never
+/// substituted for it — a logically deleted row stays dropped even if the
+/// caller's mask marks it `true`.
+///
+/// `scx_path` is needed because the `min_counts` pre-pass opens its own
+/// `BackedCsrReader`; `modality_id` scopes that pass to one modality's `X`
+/// (`0` = global / single-modality).
+pub(crate) fn build_export_keep_mask(
+    reader: &ScxReader,
+    scx_path: &Path,
+    modality_id: u8,
+    opts: &ConvertOptions,
+) -> Result<ExportRowFilter, ConvertError> {
+    let n_obs = reader.n_obs() as usize;
+
+    let mut mask: Option<Vec<bool>> = build_keep_mask(reader)?;
+    let dv_filtered = mask.is_some();
+    let caller_filtered = opts.has_export_row_filter();
+
+    if let Some(caller_mask) = opts.export_obs_keep_mask.as_deref() {
+        validate_export_mask_len(caller_mask.len(), n_obs, "export_obs_keep_mask")?;
+        intersect_into(&mut mask, caller_mask.to_vec());
+    }
+
+    if let Some(min_counts) = opts.export_min_counts {
+        let counts_mask =
+            crate::export_filter::min_counts_obs_mask(scx_path, modality_id, min_counts)?;
+        validate_export_mask_len(counts_mask.len(), n_obs, "min_counts mask")?;
+        intersect_into(&mut mask, counts_mask);
+    }
+
+    let n_kept = mask
+        .as_ref()
+        .map_or(n_obs, |m| m.iter().filter(|&&b| b).count());
+
+    // Scoped to caller filters on purpose: a file whose deletion vector
+    // happens to cover every row keeps its current (no-error) behaviour.
+    if caller_filtered && n_kept == 0 {
+        return Err(ConvertError::Other(format!(
+            "obs row filter keeps zero of {n_obs} observations; an empty h5ad is \
+             never a useful export — lower min_counts or widen the mask"
+        )));
+    }
+
+    Ok(ExportRowFilter {
+        mask,
+        n_kept,
+        dv_filtered,
+        caller_filtered,
+    })
 }
 
 fn create_csr_triplet(
