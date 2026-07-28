@@ -625,6 +625,9 @@ fn from_h5ad(
         group_target_bytes: group_target_bytes_val,
         group_max_bytes: group_max_bytes_val,
         group_pass: group_pass_val,
+        // Export-only; this is an ingest direction.
+        export_obs_keep_mask: None,
+        export_min_counts: None,
     };
 
     let input = std::path::PathBuf::from(path);
@@ -831,13 +834,28 @@ fn from_h5mu(
 ///         the legacy materializing path.
 ///     modality: Modality name to extract (only valid on multimodal
 ///         SCX inputs).
+///     obs_mask: Boolean numpy array selecting observations to keep.
+///         Indexed in the GLOBAL / physical obs row space — its length
+///         must equal `pyscx.open(path).n_obs_physical` (the file header
+///         count), NOT `.n_obs` (the live, post-deletion count). Rows
+///         already logically deleted stay dropped regardless of their
+///         entry here: the mask is ANDed with the deletion-vector mask,
+///         never substituted for it. Requires stream=True.
+///     min_counts: Per-cell total-UMI floor. Keeps rows where
+///         `X[i, :].sum() >= min_counts`, computed with one streaming
+///         pass over the CSR shards (no materialization) in the same
+///         global row space as obs_mask, and ANDed with it. Sums `X`,
+///         not a layer — meaningless on an already-normalized matrix.
+///         Requires stream=True.
 ///
 /// Example:
 ///     pyscx.to_h5ad("data.scx", "data.h5ad")
 ///     pyscx.to_h5ad("cite.scx", "rna.h5ad", modality="rna")
+///     # Result-preserving CellBender pre-trim on a raw all-droplet file.
+///     pyscx.to_h5ad("raw.scx", "raw_trimmed.h5ad", min_counts=5)
 #[cfg(feature = "hdf5")]
 #[pyfunction]
-#[pyo3(signature = (path, out, stream=true, modality=None, reader_threads=None, writer_queue_depth=4, memory_budget=None))]
+#[pyo3(signature = (path, out, stream=true, modality=None, reader_threads=None, writer_queue_depth=4, memory_budget=None, obs_mask=None, min_counts=None))]
 #[allow(clippy::too_many_arguments)]
 fn to_h5ad(
     py: Python<'_>,
@@ -848,15 +866,73 @@ fn to_h5ad(
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
     memory_budget: Option<Bound<'_, PyAny>>,
+    obs_mask: Option<numpy::PyReadonlyArray1<'_, bool>>,
+    min_counts: Option<f64>,
 ) -> PyResult<()> {
     use std::path::Path;
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
+
+    // Copy the mask out of numpy while the GIL is held: `PyReadonlyArray1` is
+    // GIL-bound and `!Send`, so it cannot cross the `py.detach` boundary below.
+    let obs_mask_owned: Option<std::sync::Arc<[bool]>> = match obs_mask {
+        None => None,
+        Some(arr) => {
+            let slice = arr.as_slice().map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "obs_mask must be a contiguous 1-D bool array",
+                )
+            })?;
+            Some(std::sync::Arc::from(slice.to_vec()))
+        }
+    };
+
+    if let Some(mc) = min_counts {
+        if !mc.is_finite() || mc < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "min_counts must be a finite non-negative number; got {mc}"
+            )));
+        }
+    }
+
+    // The legacy path applies deletion vectors inside the `scx-format-io`
+    // readers rather than through a local mask, so it has nowhere to put a
+    // caller mask — and it materializes the whole matrix, defeating the point.
+    // Fail loudly rather than silently promoting to the streaming path, whose
+    // stricter catalog-stats requirement could turn a working export into a
+    // confusing failure.
+    if !stream && (obs_mask_owned.is_some() || min_counts.is_some()) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "obs_mask / min_counts require stream=True; the legacy materializing \
+             export path cannot apply a caller-supplied row mask",
+        ));
+    }
+
+    // Validate length here so the user gets ValueError rather than the
+    // RuntimeError that a ConvertError maps to, and with a message that names
+    // the coordinate system.
+    if let Some(mask) = &obs_mask_owned {
+        let n_obs = scx_format_io::ScxReader::open(Path::new(path))
+            .map_err(to_pyerr)?
+            .n_obs() as usize;
+        if mask.len() != n_obs {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "obs_mask length {} does not match the SCX file's physical n_obs {n_obs}. \
+                 obs_mask is indexed in the GLOBAL (pre-deletion) obs row space — use \
+                 `pyscx.open(path).n_obs_physical`, not `.n_obs` (the post-deletion \
+                 live count).",
+                mask.len()
+            )));
+        }
+    }
+
     let opts = scx_convert::ConvertOptions {
         stream,
         tool: "pyscx".into(),
         reader_threads,
         writer_queue_depth,
         memory_budget: memory_budget_bytes,
+        export_obs_keep_mask: obs_mask_owned,
+        export_min_counts: min_counts,
         ..Default::default()
     };
     py.detach(|| -> Result<(), scx_convert::ConvertError> {

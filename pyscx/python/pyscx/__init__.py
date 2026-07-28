@@ -150,6 +150,28 @@ def _warn_if_deletions(src_path, out_fmt):
         pass
 
 
+def _coerce_obs_mask(mask):
+    """Normalise a user obs_mask to a C-contiguous 1-D numpy bool array.
+
+    Accepts numpy bool arrays, pandas boolean Series, and lists of bool.
+    Non-bool dtypes are rejected rather than coerced: an int or float array
+    silently becoming `!= 0` is exactly the kind of quiet wrong answer a row
+    filter must never produce. Strided views are copied because the Rust side
+    reads the buffer as a contiguous slice.
+    """
+    import numpy as _np
+
+    arr = _np.asarray(mask)  # deliberately no dtype= — do NOT coerce
+    if arr.dtype.kind != "b":
+        raise TypeError(
+            f"obs_mask must be a boolean array; got dtype {arr.dtype!r}. "
+            "Pass a predicate result (e.g. `counts >= 500`), not the counts."
+        )
+    if arr.ndim != 1:
+        raise ValueError(f"obs_mask must be 1-D; got shape {arr.shape}")
+    return _np.ascontiguousarray(arr)
+
+
 def _require_hdf5(fn_name):
     if not _HAS_HDF5:
         raise NotImplementedError(
@@ -396,8 +418,31 @@ def to_h5ad(path, out, **kwargs):
             (powers of 1024); decimal KB/MB/GB/TB is rejected. E.g. "4G" /
             "512M" / "2GiB". A single shard exceeding the budget raises;
             smaller mismatches emit ReaderThreadsDerated.
+        obs_mask: Boolean array selecting the observations to keep. Indexed
+            in the GLOBAL / physical obs row space — its length must equal
+            `pyscx.open(path).n_obs_physical` (the file header count), NOT
+            `.n_obs` (the live, post-deletion count). Rows already logically
+            deleted stay dropped regardless of their entry here: the mask is
+            ANDed with the deletion-vector mask, never substituted for it.
+            Accepts a numpy bool array, a pandas boolean Series, or a list of
+            bool; a non-bool dtype raises rather than being coerced. Requires
+            stream=True.
+        min_counts: Per-cell total-UMI floor. Keeps rows where
+            `X[i, :].sum() >= min_counts`, computed with one streaming pass
+            over the CSR shards (no materialization) in the same global row
+            space as obs_mask, and ANDed with it. Sums `X`, so it is
+            meaningless on an already-normalized matrix. Requires stream=True.
+
+    Example:
+        # Result-preserving CellBender pre-trim on a raw all-droplet file:
+        # CellBender's own prior estimation ignores droplets at or below its
+        # --low-count-threshold, and never-analyzed barcodes are all-zero
+        # rows in its output.
+        pyscx.to_h5ad("raw.scx", "raw_trimmed.h5ad", min_counts=5)
     """
     _require_hdf5("to_h5ad")
+    if kwargs.get("obs_mask") is not None:
+        kwargs["obs_mask"] = _coerce_obs_mask(kwargs["obs_mask"])
     src = _coerce_path(path)
     _warn_if_deletions(src, "h5ad")
     return _to_h5ad_native(src, _coerce_path(out), **kwargs)

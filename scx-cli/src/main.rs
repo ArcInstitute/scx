@@ -108,6 +108,15 @@ enum Commands {
         /// a multimodal SCX input; ignored otherwise.
         #[arg(long)]
         modality: Option<String>,
+        /// SCX → h5ad only: drop observations whose total X UMI count is
+        /// below N. Computed with one streaming pass over the CSR shards
+        /// (the matrix is never materialized) and intersected with — never
+        /// substituted for — the deletion-vector mask. Intended as a
+        /// result-preserving low-UMI pre-trim on a RAW all-droplet file
+        /// before CellBender `remove-background`. Requires the streaming
+        /// export path.
+        #[arg(long, value_name = "N", value_parser = validators::non_negative_f64)]
+        min_counts: Option<f64>,
         /// Stream the conversion without materializing the full X
         /// matrix in memory. Defaults to true — pass `--stream=false`
         /// to opt into the legacy materializing path. Supported for
@@ -925,6 +934,7 @@ fn main() {
             row_group_rows,
             row_group_target_nnz,
             modality,
+            min_counts,
             stream,
             memory_budget,
             strict_uns,
@@ -965,6 +975,7 @@ fn main() {
                 row_group_rows,
                 row_group_target_nnz,
                 modality.as_deref(),
+                min_counts,
                 stream,
                 memory_budget.as_deref(),
                 strict_uns,
@@ -1348,6 +1359,7 @@ fn run_convert(
     row_group_rows: u32,
     row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
+    min_counts: Option<f64>,
     stream: bool,
     memory_budget: Option<&str>,
     strict_uns: bool,
@@ -1435,6 +1447,30 @@ fn run_convert(
             "--modalities / --modality-types only apply to h5mu → scx; got direction '{direction}'."
         )
         .into());
+    }
+    // `--min-counts` is an export-side row filter. Check it before the
+    // `--stream` guard below so a user who passes both gets the specific
+    // message rather than the generic direction complaint.
+    if let Some(mc) = min_counts {
+        if direction != "scx_to_h5ad" {
+            return Err(format!(
+                "--min-counts is only supported for scx → h5ad; got direction '{direction}'. \
+                 (For a multimodal source, extract one modality with --modality.)"
+            )
+            .into());
+        }
+        if !stream {
+            return Err(
+                "--min-counts requires the streaming export path; drop --stream=false. \
+                        The legacy materializing path cannot apply a caller-supplied row mask."
+                    .into(),
+            );
+        }
+        if !mc.is_finite() || mc < 0.0 {
+            return Err(
+                format!("--min-counts must be a finite non-negative number; got {mc}").into(),
+            );
+        }
     }
     // Sort-on-convert applies only to h5ad → scx and requires the streaming
     // path (the random-access permuted gather). Force streaming on.
@@ -1564,6 +1600,7 @@ fn run_convert(
         row_group_rows,
         row_group_target_nnz,
         modality,
+        min_counts,
         stream,
         memory_budget_bytes,
         strict_uns,
@@ -1674,6 +1711,7 @@ fn dispatch_convert(
     row_group_rows: u32,
     row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
+    min_counts: Option<f64>,
     stream: bool,
     memory_budget: Option<u64>,
     strict_uns: bool,
@@ -1749,6 +1787,8 @@ fn dispatch_convert(
         group_target_bytes,
         group_max_bytes,
         group_pass,
+        export_obs_keep_mask: None,
+        export_min_counts: min_counts,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -1864,6 +1904,7 @@ fn dispatch_convert(
     _row_group_rows: u32,
     _row_group_target_nnz: Option<u64>,
     _modality: Option<&str>,
+    _min_counts: Option<f64>,
     _stream: bool,
     _memory_budget: Option<u64>,
     _strict_uns: bool,
