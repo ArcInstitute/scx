@@ -2902,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "pyscx"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "base64",
@@ -3273,7 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "rscx"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "extendr-api",
@@ -3441,7 +3441,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scx-accel"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "criterion",
@@ -3469,7 +3469,7 @@ dependencies = [
 
 [[package]]
 name = "scx-cli"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "byteorder",
@@ -3501,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "scx-cloud"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3524,7 +3524,7 @@ dependencies = [
 
 [[package]]
 name = "scx-codec"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "bitpacking",
  "bytemuck",
@@ -3541,7 +3541,7 @@ dependencies = [
 
 [[package]]
 name = "scx-convert"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "base64",
@@ -3570,7 +3570,7 @@ dependencies = [
 
 [[package]]
 name = "scx-engine"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "blake3",
@@ -3590,7 +3590,7 @@ dependencies = [
 
 [[package]]
 name = "scx-format"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "blake3",
@@ -3608,7 +3608,7 @@ dependencies = [
 
 [[package]]
 name = "scx-format-io"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "blake3",
@@ -3633,7 +3633,7 @@ dependencies = [
 
 [[package]]
 name = "scx-gpu"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "byteorder",
  "crossbeam-channel",
@@ -3675,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "scx-loader"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "crossbeam-channel",
@@ -3703,7 +3703,7 @@ dependencies = [
 
 [[package]]
 name = "scx-mtx"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "flate2",
@@ -3717,7 +3717,7 @@ dependencies = [
 
 [[package]]
 name = "scx-ops"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "arrow",
  "blake3",
@@ -3742,7 +3742,7 @@ dependencies = [
 
 [[package]]
 name = "scx-sparse"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "criterion",
  "half",
