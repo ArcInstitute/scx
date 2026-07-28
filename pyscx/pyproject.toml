@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pyscx"
-version = "0.11.6"
+version = "0.11.7"
 description = "Python bindings for SCX (Sparse Cell eXpression System)"
 license = {text = "MIT"}
 authors = [
