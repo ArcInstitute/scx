@@ -230,6 +230,26 @@ def test_accepts_list_series_and_strided_views(synthetic_adata, scx_path, tmp_di
         assert _n_obs_written(out) == expected, name
 
 
+def test_accepts_pandas_nullable_boolean_and_rejects_pd_na(
+    synthetic_adata, scx_path, tmp_dir
+):
+    """A pandas nullable BooleanDtype Series becomes an object array under
+    np.asarray, so it needs its own branch. pd.NA has no defensible reading as
+    keep-or-drop, so it must raise rather than default."""
+    pd = pytest.importorskip("pandas")
+    n_obs = synthetic_adata.n_obs
+    base = np.arange(n_obs) % 2 == 0
+
+    out = tmp_dir / "nullable.h5ad"
+    pyscx.to_h5ad(scx_path, out, obs_mask=pd.array(base, dtype="boolean"))
+    assert _n_obs_written(out) == int(base.sum())
+
+    with_na = pd.array(base, dtype="boolean")
+    with_na[0] = pd.NA
+    with pytest.raises(ValueError, match="pd.NA"):
+        pyscx.to_h5ad(scx_path, tmp_dir / "na.h5ad", obs_mask=with_na)
+
+
 # ---------------------------------------------------------------------------
 # Export provenance
 # ---------------------------------------------------------------------------

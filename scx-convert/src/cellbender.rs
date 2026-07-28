@@ -596,13 +596,31 @@ fn build_latent_embedding(
         return Vec::new();
     };
     let n_latents = if *z_dim == 0 { 0 } else { flat.len() / z_dim };
+    // The alignment step validated every index against the *latent* arrays, so
+    // an index past the embedding's own row count means the two disagree —
+    // corruption, not an un-analysed droplet. Say so instead of emitting a
+    // column of nulls that reads as "CellBender analysed nothing".
+    if latents
+        .latent_of_row
+        .iter()
+        .any(|k| k.is_some_and(|i| i >= n_latents))
+    {
+        sink.emit(ConvertWarning::SkippedObsm {
+            name: "X_cellbender_latent".to_string(),
+            reason: format!(
+                "gene_expression_encoding has {n_latents} rows but the droplet \
+                 latents index beyond it; the two are inconsistent"
+            ),
+        });
+        return Vec::new();
+    }
     let mut fields = Vec::new();
     let mut columns: Vec<ArrayRef> = Vec::new();
     for d in 0..*z_dim {
         let arr: Float32Array = latents
             .latent_of_row
             .iter()
-            .map(|k| k.filter(|i| *i < n_latents).map(|i| flat[i * z_dim + d]))
+            .map(|k| k.map(|i| flat[i * z_dim + d]))
             .collect();
         fields.push(Field::new(format!("z{d}"), DataType::Float32, true));
         columns.push(Arc::new(arr) as ArrayRef);

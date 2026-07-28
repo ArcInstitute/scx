@@ -669,6 +669,71 @@ fn negative_and_non_finite_values_are_rejected() {
     }
 }
 
+/// Regression: an explicit zero followed by a duplicate of the same column.
+///
+/// A hand-rolled canonicalizer here skipped the zero without emitting it but
+/// still advanced its "previous column" marker, so the duplicate accumulated
+/// onto whatever was emitted last — a different column, or even the previous
+/// row. Row `[(1, 1.0), (2, 0.0), (2, 3.0)]` came out as `[(1, 4.0)]` instead
+/// of `[(1, 1.0), (2, 3.0)]`. Now delegated to `scx_sparse::canonicalize_csr`,
+/// which dedup-sums before dropping zeros.
+#[test]
+fn explicit_zero_before_a_duplicate_column_does_not_corrupt_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 2, 3, 1);
+
+    // Row 0: col 1 = 1.0, then col 2 = 0.0, then col 2 = 3.0 (out of order too).
+    // Row 1: a plain single entry, to catch cross-row bleed.
+    let data = ExternalLayerData {
+        row_keys: vec!["cell_0".into(), "cell_1".into()],
+        col_keys: keys("g", 3),
+        indptr: vec![0, 3, 4],
+        indices: vec![2, 1, 2, 0],
+        values: vec![0.0, 1.0, 3.0, 7.0],
+        row_annotations: None,
+        row_embeddings: Vec::new(),
+        col_annotations: None,
+        uns: None,
+        source_checksum: None,
+        source_name: None,
+    };
+
+    let summary = attach_external_layer(&path, &data, &opts("cb")).unwrap();
+    let layer = ScxReader::open(&path).unwrap().read_layer("cb").unwrap();
+
+    let row0 = |i: usize| (layer.indptr[i] as usize, layer.indptr[i + 1] as usize);
+    let (s0, e0) = row0(0);
+    assert_eq!(&layer.indices[s0..e0], &[1, 2], "row 0 columns");
+    assert_eq!(&layer.data[s0..e0], &[1.0, 3.0], "row 0 values");
+
+    let (s1, e1) = row0(1);
+    assert_eq!(&layer.indices[s1..e1], &[0], "row 1 must be untouched");
+    assert_eq!(&layer.data[s1..e1], &[7.0]);
+
+    // And the reported nnz counts what was written, not the pre-dedup input.
+    assert_eq!(summary.layer_nnz, 3, "explicit zero must not be counted");
+}
+
+/// When every candidate var key fails, the reported error must be the *first*
+/// candidate's — the caller's preferred key — not the last fallback's.
+#[test]
+fn var_key_retry_reports_the_first_candidate_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
+    // No source gene matches any target key, so every candidate fails.
+    let data = diagonal_data(
+        keys("cell_", 3),
+        vec!["unknown_a".into(), "unknown_b".into()],
+        |i| i as f32 + 1.0,
+    );
+
+    let err = attach_external_layer(&path, &data, &opts("cb")).unwrap_err();
+    assert!(
+        err.to_string().contains("absent from the target var axis"),
+        "{err}"
+    );
+}
+
 #[test]
 fn reserved_and_slashed_layer_names_are_rejected() {
     let dir = tempfile::tempdir().unwrap();

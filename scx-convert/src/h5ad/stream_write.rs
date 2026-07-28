@@ -1050,7 +1050,7 @@ pub(crate) const EXPORT_PROVENANCE_KEY: &str = "scx_export";
 ///
 /// Scalars only — the mask itself is never written. It would duplicate `/obs`
 /// and bloat the file at atlas scale.
-fn build_export_provenance(
+pub(crate) fn build_export_provenance(
     reader: &ScxReader,
     scx_path: &Path,
     opts: &ConvertOptions,
@@ -1084,7 +1084,7 @@ fn build_export_provenance(
 }
 
 /// Merge the export note into the source `uns`, never clobbering a user key.
-fn merge_export_provenance(
+pub(crate) fn merge_export_provenance(
     uns: &mut serde_json::Value,
     note: Option<serde_json::Value>,
     sink: &mut WarningSink,

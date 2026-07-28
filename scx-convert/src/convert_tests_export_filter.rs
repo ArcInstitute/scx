@@ -333,6 +333,86 @@ fn masked_export_parallel_equals_sequential() {
     }
 }
 
+/// A modality-scoped export is reachable with `--min-counts` (the direction is
+/// still `scx_to_h5ad`), so it must honour the same "records what it dropped"
+/// contract as the single-modality path — that path writes no `/uns` of its
+/// own, so the note has to be added explicitly.
+#[test]
+fn modality_scoped_export_records_provenance_and_filters() {
+    use crate::h5mu::write::scx_modality_to_h5ad_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("in.h5mu");
+    let scx = dir.path().join("in.scx");
+    create_test_h5mu(&h5mu, 20, 8, 4);
+    crate::h5mu::pipeline::h5mu_to_scx(
+        &h5mu,
+        &scx,
+        &ConvertOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let n_obs = ScxReader::open(&scx).unwrap().n_obs() as usize;
+    let mask: Vec<bool> = (0..n_obs).map(|i| i % 2 == 0).collect();
+    let kept = mask.iter().filter(|&&b| b).count();
+
+    let out = dir.path().join("rna.h5ad");
+    scx_modality_to_h5ad_streaming(&scx, &out, "rna", &mask_opts(mask), &mut WarningSink::log())
+        .unwrap();
+
+    let f = hdf5::File::open(&out).unwrap();
+    assert_eq!(x_rows(&f), kept, "modality X must be filtered");
+    assert_eq!(dataset_len(&f, "obs/_index"), kept, "shared obs too");
+
+    let note = f.group(&format!("uns/{EXPORT_PROVENANCE_KEY}")).unwrap();
+    let written: i64 = note
+        .dataset("n_obs_written")
+        .unwrap()
+        .read_scalar()
+        .unwrap();
+    assert_eq!(written as usize, kept);
+}
+
+/// And an unfiltered modality export must stay byte-identical — no new /uns.
+#[test]
+fn unfiltered_modality_export_writes_no_provenance() {
+    use crate::h5mu::write::scx_modality_to_h5ad_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("in.h5mu");
+    let scx = dir.path().join("in.scx");
+    create_test_h5mu(&h5mu, 10, 6, 3);
+    crate::h5mu::pipeline::h5mu_to_scx(
+        &h5mu,
+        &scx,
+        &ConvertOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let out = dir.path().join("rna.h5ad");
+    scx_modality_to_h5ad_streaming(
+        &scx,
+        &out,
+        "rna",
+        &ConvertOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let f = hdf5::File::open(&out).unwrap();
+    assert!(
+        f.group("uns").is_err()
+            || !f
+                .group("uns")
+                .unwrap()
+                .member_names()
+                .unwrap()
+                .contains(&EXPORT_PROVENANCE_KEY.to_string())
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Direction guards
 // ---------------------------------------------------------------------------

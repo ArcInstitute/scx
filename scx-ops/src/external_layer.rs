@@ -348,6 +348,7 @@ pub fn attach_external_layer(
         }
     }
     let mut attempt = None;
+    let mut first_err = None;
     for key in &candidates {
         let target_col_keys = string_column(&var, key)?;
         match build_column_map(&target_col_keys, &data.col_keys, opts.column_axis_policy) {
@@ -355,19 +356,15 @@ pub fn attach_external_layer(
                 attempt = Some((key.clone(), v));
                 break;
             }
-            Err(e) => {
-                if attempt.is_none() {
-                    attempt = None;
-                }
-                // Keep the first error to report if every candidate fails.
-                if candidates.last() == Some(key) {
-                    return Err(e);
-                }
-            }
+            // Report the *first* candidate's failure if every one fails: that
+            // is the caller's preferred key, and the reason it did not work is
+            // more useful than why the last fallback did not.
+            Err(e) => first_err = first_err.or(Some(e)),
         }
     }
-    let (var_key_column, (col_map, column_axis_match)) =
-        attempt.expect("loop returns on the final failure");
+    let Some((var_key_column, (col_map, column_axis_match))) = attempt else {
+        return Err(first_err.expect("a non-empty candidate list either matches or errors"));
+    };
 
     // --- Collision checks ---------------------------------------------------
     let obs_new_columns = planned_obs_columns(data, opts);
@@ -481,11 +478,20 @@ pub fn attach_external_layer(
 
     // Layer shards last, so the bulk bytes land contiguously at EOF.
     for (shard_idx, (row_start, row_end)) in shard_ranges.iter().enumerate() {
-        let (s_indptr, s_indices, s_values) =
+        let (mut s_indptr, mut s_indices, mut s_values) =
             gather_shard(data, &row_join, &col_map, *row_start, *row_end);
-        summary.layer_nnz += *s_indptr.last().unwrap_or(&0);
 
-        let (s_indptr, s_indices, s_values) = canonicalize(s_indptr, s_indices, s_values);
+        // Shared canonicalizer: sort, dedup-summing duplicate coordinates,
+        // then drop explicit zeros — in that order. A hand-rolled version here
+        // got the ordering wrong and accumulated a duplicate onto the previous
+        // column when the first occurrence was an explicit zero. Mandatory
+        // after a gene-axis remap (indices come out unsorted), and `scx
+        // validate --deep` enforces canonical CSR on layer shards regardless.
+        scx_sparse::canonicalize_csr(&mut s_indptr, &mut s_indices, &mut s_values);
+
+        // Counted after canonicalization, so the reported nnz matches what was
+        // actually written rather than the pre-dedup input.
+        summary.layer_nnz += *s_indptr.last().unwrap_or(&0);
 
         let section = encode_one_shard_with_value_encoding(
             &s_indptr,
@@ -1092,54 +1098,6 @@ fn gather_shard(
         indptr.push(indices.len() as u64);
     }
     (indptr, indices, values)
-}
-
-/// Sort + dedupe + drop explicit zeros per row.
-///
-/// Mandatory after a column remap (indices come out unsorted), and cheap
-/// otherwise: `scx validate --deep` enforces canonical CSR on layer shards, and
-/// `encode_one_shard` debug-asserts it.
-fn canonicalize(
-    indptr: Vec<u64>,
-    indices: Vec<u32>,
-    values: Vec<f32>,
-) -> (Vec<u64>, Vec<u32>, Vec<f32>) {
-    let mut out_indptr = Vec::with_capacity(indptr.len());
-    let mut out_indices = Vec::with_capacity(indices.len());
-    let mut out_values = Vec::with_capacity(values.len());
-    out_indptr.push(0u64);
-
-    let mut row: Vec<(u32, f32)> = Vec::new();
-    for w in indptr.windows(2) {
-        let (s, e) = (w[0] as usize, w[1] as usize);
-        row.clear();
-        row.extend((s..e).map(|k| (indices[k], values[k])));
-        row.sort_by_key(|(c, _)| *c);
-        let mut prev: Option<u32> = None;
-        for (c, v) in row.iter().copied() {
-            if Some(c) == prev {
-                // Duplicate coordinate: accumulate onto the previous entry.
-                if let Some(last) = out_values.last_mut() {
-                    *last += v;
-                }
-                continue;
-            }
-            if v == 0.0 {
-                prev = Some(c);
-                continue;
-            }
-            out_indices.push(c);
-            out_values.push(v);
-            prev = Some(c);
-        }
-        // Drop any entry that summed back to zero.
-        while out_values.last() == Some(&0.0) {
-            out_values.pop();
-            out_indices.pop();
-        }
-        out_indptr.push(out_indices.len() as u64);
-    }
-    (out_indptr, out_indices, out_values)
 }
 
 // ---------------------------------------------------------------------------

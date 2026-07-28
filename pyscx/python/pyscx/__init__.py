@@ -161,6 +161,18 @@ def _coerce_obs_mask(mask):
     """
     import numpy as _np
 
+    # A pandas *nullable* boolean Series (dtype="boolean") becomes an object
+    # array under np.asarray, so it needs its own branch. pd.NA is rejected
+    # rather than defaulted: a missing entry has no defensible reading as
+    # "keep" or "drop", and silently picking one would filter the wrong rows.
+    if str(getattr(mask, "dtype", "")) == "boolean":
+        if mask.isna().any():
+            raise ValueError(
+                "obs_mask contains pd.NA; a keep mask must be unambiguously "
+                "True or False for every observation"
+            )
+        return _np.ascontiguousarray(mask.to_numpy(dtype=bool))
+
     arr = _np.asarray(mask)  # deliberately no dtype= — do NOT coerce
     if arr.dtype.kind != "b":
         raise TypeError(
