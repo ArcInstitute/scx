@@ -1096,6 +1096,20 @@ pub fn tenx_to_scx(
         });
     }
 
+    // A CellBender output also has `/matrix/barcodes`, so it lands here by
+    // extension. Redirect rather than failing somewhere deep inside the 10x
+    // reader — and note this is a *different* operation, not a conversion:
+    // the corrected counts belong on an existing file's obs axis.
+    if file.group("droplet_latents").is_ok() {
+        return Err(ConvertError::Other(format!(
+            "'{}' looks like a CellBender remove-background output (it has a \
+             /droplet_latents group), not a 10x CellRanger matrix. Attach it to \
+             an existing SCX file with: scx cellbender-import <target.scx> {}",
+            input.display(),
+            input.display()
+        )));
+    }
+
     let tenx = read_tenx_h5(&file)?;
     let nnz = *tenx.indptr.last().unwrap_or(&0) as u64;
     let (value_encoding, codec_id) =

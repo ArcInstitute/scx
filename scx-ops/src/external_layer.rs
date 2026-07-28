@@ -69,7 +69,13 @@ use crate::in_place::{
 };
 
 /// Obs/var column names that resolve a join key when the caller does not name
-/// one. Tried in order; ambiguity (more than one present) is an error.
+/// one, in **preference order** — the first present column wins.
+///
+/// Ordered preference rather than "exactly one must be present": a
+/// 10x-converted target carries both `id` and `name`, which is the standard
+/// shape, not an ambiguity. A wrong pick is caught downstream by the
+/// zero-overlap error (and, on the column axis, retried against the next
+/// candidate), and the resolved column is reported in the summary.
 ///
 /// `barcode` earns its place because `scx convert --from 10x` writes obs as a
 /// bare `barcode` column with no pandas index metadata — exactly the files most
@@ -221,6 +227,11 @@ pub struct AttachLayerOptions {
     pub provenance_action: String,
     /// Merged into the provenance `params_json` object.
     pub provenance_params: Value,
+    /// Run every validation and resolve the join, then return the summary
+    /// **without writing anything**. The point is to let a caller see
+    /// `n_matched` before mutating a large file; a dry run that skipped the
+    /// join would report nothing worth seeing.
+    pub dry_run: bool,
 }
 
 impl Default for AttachLayerOptions {
@@ -241,6 +252,7 @@ impl Default for AttachLayerOptions {
             modality_id: 0,
             provenance_action: "attach_external_layer".to_string(),
             provenance_params: Value::Null,
+            dry_run: false,
         }
     }
 }
@@ -317,13 +329,45 @@ pub fn attach_external_layer(
 
     // --- Resolve join keys and build the maps ------------------------------
     let obs_key_column = resolve_key_column("obs", &obs, opts.obs_key_column.as_deref())?;
-    let var_key_column = resolve_key_column("var", &var, opts.var_key_column.as_deref())?;
     let target_row_keys = string_column(&obs, &obs_key_column)?;
-    let target_col_keys = string_column(&var, &var_key_column)?;
-
     let row_join = build_row_join(&target_row_keys, data, opts)?;
-    let (col_map, column_axis_match) =
-        build_column_map(&target_col_keys, &data.col_keys, opts.column_axis_policy)?;
+
+    // Column axis: try the resolved key, then — only when the caller did not
+    // name one — the remaining candidates, so an Ensembl-id target still joins
+    // against a symbol-keyed source (and vice versa).
+    let mut candidates = vec![resolve_key_column(
+        "var",
+        &var,
+        opts.var_key_column.as_deref(),
+    )?];
+    if opts.var_key_column.is_none() {
+        for c in candidate_key_columns("var", &var) {
+            if !candidates.contains(&c) {
+                candidates.push(c);
+            }
+        }
+    }
+    let mut attempt = None;
+    for key in &candidates {
+        let target_col_keys = string_column(&var, key)?;
+        match build_column_map(&target_col_keys, &data.col_keys, opts.column_axis_policy) {
+            Ok(v) => {
+                attempt = Some((key.clone(), v));
+                break;
+            }
+            Err(e) => {
+                if attempt.is_none() {
+                    attempt = None;
+                }
+                // Keep the first error to report if every candidate fails.
+                if candidates.last() == Some(key) {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    let (var_key_column, (col_map, column_axis_match)) =
+        attempt.expect("loop returns on the final failure");
 
     // --- Collision checks ---------------------------------------------------
     let obs_new_columns = planned_obs_columns(data, opts);
@@ -373,6 +417,36 @@ pub fn attach_external_layer(
     let modality_type = prep.modality_type;
     let framing = framing_for(&prep);
 
+    let mut summary = AttachLayerSummary {
+        n_obs,
+        n_matched: row_join.n_matched,
+        n_target_rows_absent: row_join.n_target_absent,
+        n_source_rows_absent: row_join.n_source_absent,
+        n_source_rows_absent_nonzero: row_join.n_source_absent_nonzero,
+        obs_key_column,
+        var_key_column,
+        column_axis_match,
+        // Filled in by the write loop.
+        layer_nnz: 0,
+        value_encoding,
+        shard_ranges_from,
+        obs_columns_added: obs_new_columns,
+        var_columns_added: var_new_columns,
+        obsm_keys_added: Vec::new(),
+    };
+
+    if opts.dry_run {
+        // Everything above is validation and the join itself, so the caller
+        // gets a real `n_matched` while the file stays untouched.
+        summary.obsm_keys_added = obsm_batches.iter().map(|(k, _)| k.clone()).collect();
+        summary.layer_nnz = row_join
+            .source_of_target
+            .iter()
+            .filter_map(|s| s.map(|i| data.indptr[i as usize + 1] - data.indptr[i as usize]))
+            .sum();
+        return Ok(summary);
+    }
+
     let mut prov_ops = read_provenance_ops(&mut lock, &prep.old_catalog)?;
 
     // --- Emit sections at EOF through an adopted writer --------------------
@@ -400,18 +474,16 @@ pub fn attach_external_layer(
         cursor += take;
     }
 
-    let mut obsm_keys_added = Vec::new();
     for (name, batch) in &obsm_batches {
         writer.write_obsm(name, batch)?;
-        obsm_keys_added.push(name.clone());
+        summary.obsm_keys_added.push(name.clone());
     }
 
     // Layer shards last, so the bulk bytes land contiguously at EOF.
-    let mut layer_nnz = 0u64;
     for (shard_idx, (row_start, row_end)) in shard_ranges.iter().enumerate() {
         let (s_indptr, s_indices, s_values) =
             gather_shard(data, &row_join, &col_map, *row_start, *row_end);
-        layer_nnz += *s_indptr.last().unwrap_or(&0);
+        summary.layer_nnz += *s_indptr.last().unwrap_or(&0);
 
         let (s_indptr, s_indices, s_values) = canonicalize(s_indptr, s_indices, s_values);
 
@@ -437,23 +509,6 @@ pub fn attach_external_layer(
     lock.seek(SeekFrom::Start(new_offset))?;
 
     // --- Append provenance --------------------------------------------------
-    let summary = AttachLayerSummary {
-        n_obs,
-        n_matched: row_join.n_matched,
-        n_target_rows_absent: row_join.n_target_absent,
-        n_source_rows_absent: row_join.n_source_absent,
-        n_source_rows_absent_nonzero: row_join.n_source_absent_nonzero,
-        obs_key_column,
-        var_key_column,
-        column_axis_match,
-        layer_nnz,
-        value_encoding,
-        shard_ranges_from,
-        obs_columns_added: obs_new_columns,
-        var_columns_added: var_new_columns,
-        obsm_keys_added,
-    };
-
     prov_ops.push(ProvenanceEntry {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -685,20 +740,39 @@ fn resolve_key_column(
         .copied()
         .filter(|c| string_cols.contains(c))
         .collect();
-    match present.len() {
-        1 => Ok(present[0].to_string()),
-        0 => Err(OpsError::KeyColumnUnresolved {
+    present
+        .first()
+        .map(|c| c.to_string())
+        .ok_or_else(|| OpsError::KeyColumnUnresolved {
             axis,
             detail: format!(
                 "no pandas index and none of {fallbacks:?} present; string columns \
                  are {string_cols:?}. Pass an explicit key column."
             ),
-        }),
-        _ => Err(OpsError::KeyColumnUnresolved {
-            axis,
-            detail: format!("ambiguous: {present:?} are all present. Pass an explicit key column."),
-        }),
-    }
+        })
+}
+
+/// Every candidate key column for an axis, in preference order.
+///
+/// Used to retry the column join when the preferred key has no overlap: a
+/// target converted from 10x carries both Ensembl `id` and symbol `name`, and
+/// the external tool may have keyed on the other one.
+fn candidate_key_columns(axis: &'static str, batch: &RecordBatch) -> Vec<String> {
+    let schema = batch.schema();
+    let fallbacks = if axis == "obs" {
+        OBS_KEY_FALLBACKS
+    } else {
+        VAR_KEY_FALLBACKS
+    };
+    fallbacks
+        .iter()
+        .filter(|c| {
+            schema
+                .field_with_name(c)
+                .is_ok_and(|f| is_string_column(f.data_type()))
+        })
+        .map(|c| c.to_string())
+        .collect()
 }
 
 /// Materialize a string column as owned `String`s, resolving dictionaries.

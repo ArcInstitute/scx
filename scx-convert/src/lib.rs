@@ -26,6 +26,14 @@ mod hdf_dtype;
 mod tenx_read;
 
 #[cfg(feature = "hdf5")]
+mod cellbender;
+#[cfg(feature = "hdf5")]
+pub use cellbender::{
+    is_cellbender_h5, read_cellbender_h5, CellBenderInfo, CellBenderOutput, CellBenderOutputKind,
+    CellBenderReadOptions, FeatureKey, LatentAlignment,
+};
+
+#[cfg(feature = "hdf5")]
 mod export_filter;
 #[cfg(feature = "hdf5")]
 pub use export_filter::min_counts_obs_mask;

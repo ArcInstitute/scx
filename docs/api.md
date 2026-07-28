@@ -1185,7 +1185,14 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", memory_budget=None, force_legacy_metadata=False)` — 10x HDF5 to SCX.
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
 - `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
-- `pyscx.to_h5ad(path, out, stream=True, modality=None, reader_threads=None, writer_queue_depth=4, memory_budget=None)` — Stream SCX → h5ad
+- `pyscx.cellbender_import(path, cellbender_h5, *, layer="cellbender", obs_key=None, var_key=None, prefix="cellbender_", uns_key="cellbender", overwrite=False, on_missing_rows="zero", on_extra_rows="warn", gene_axis="identical", latent_embedding=False, dry_run=False)` —
+  Attach a CellBender `remove-background` output to an existing SCX file as a
+  layer, **in place**, joined by barcode. Returns a summary dict; inspect
+  `n_matched` (or run with `dry_run=True`) before trusting the result. See
+  [docs/operations.md § CellBender import](operations.md#cellbender-import).
+- `pyscx.is_cellbender_h5(path)` — True when a `.h5` looks like a CellBender
+  `remove-background` output rather than a plain 10x CellRanger matrix.
+- `pyscx.to_h5ad(path, out, stream=True, modality=None, reader_threads=None, writer_queue_depth=4, memory_budget=None, obs_mask=None, min_counts=None)` — Stream SCX → h5ad
   without materialising `X` in memory. Mirror of `pyscx.from_h5ad` in the
   opposite direction. Bounded peak memory: one shard's worth of CSR
   plus encode buffers per matrix written, plus the always-resident

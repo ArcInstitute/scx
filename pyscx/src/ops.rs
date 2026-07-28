@@ -184,6 +184,9 @@ fn ops_to_pyerr(e: OpsError) -> PyErr {
         | OpsError::UnknownCodec(_)
         | OpsError::UnknownValueEncoding(_)
         | OpsError::InvalidInput(_)
+        | OpsError::KeyColumnUnresolved { .. }
+        | OpsError::DuplicateJoinKey { .. }
+        | OpsError::AxisMismatch { .. }
         | OpsError::MultimodalUnsupported { .. } => PyValueError::new_err(msg),
         OpsError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
             PyFileNotFoundError::new_err(msg)
@@ -1349,4 +1352,170 @@ pub fn modify_metadata(
     py.detach(|| scx_ops::modify_metadata(&path_buf, &patch))
         .map_err(ops_to_pyerr)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CellBender interop
+// ---------------------------------------------------------------------------
+
+/// Shared option parsing for `cellbender_import`, so the CLI and Python
+/// surfaces cannot drift on the enum spellings.
+#[cfg(feature = "hdf5")]
+fn parse_missing_rows(s: &str) -> PyResult<scx_ops::MissingRowPolicy> {
+    match s {
+        "zero" => Ok(scx_ops::MissingRowPolicy::ZeroFill),
+        "error" => Ok(scx_ops::MissingRowPolicy::Error),
+        other => Err(PyValueError::new_err(format!(
+            "on_missing_rows must be 'zero' or 'error'; got '{other}'"
+        ))),
+    }
+}
+
+#[cfg(feature = "hdf5")]
+fn parse_extra_rows(s: &str) -> PyResult<scx_ops::ExtraRowPolicy> {
+    match s {
+        "warn" => Ok(scx_ops::ExtraRowPolicy::WarnSkip),
+        "error" => Ok(scx_ops::ExtraRowPolicy::Error),
+        other => Err(PyValueError::new_err(format!(
+            "on_extra_rows must be 'warn' or 'error'; got '{other}'"
+        ))),
+    }
+}
+
+#[cfg(feature = "hdf5")]
+fn parse_gene_axis(s: &str) -> PyResult<scx_ops::ColumnAxisPolicy> {
+    match s {
+        "identical" => Ok(scx_ops::ColumnAxisPolicy::RequireIdentical),
+        "reorder" => Ok(scx_ops::ColumnAxisPolicy::AllowReorder),
+        "subset" => Ok(scx_ops::ColumnAxisPolicy::AllowSubset),
+        other => Err(PyValueError::new_err(format!(
+            "gene_axis must be 'identical', 'reorder' or 'subset'; got '{other}'"
+        ))),
+    }
+}
+
+/// Import a CellBender `remove-background` output into an existing SCX file.
+///
+/// Reads the corrected count matrix and lands it as a new layer on `path`,
+/// **in place**, joined to the target's own obs axis by barcode. X, the CSC
+/// sidecar, `.raw`, deletion vectors and predicate indexes are preserved; the
+/// whole import is undoable with `scx rollback`.
+///
+/// The join is always by barcode string, never by position: CellBender's
+/// `_filtered.h5` is in descending-UMI order, so a positional import would
+/// silently put every cell's corrected counts on the wrong barcode.
+///
+/// Returns a dict summarising the join — inspect `n_matched` before trusting
+/// the result.
+#[cfg(feature = "hdf5")]
+#[pyfunction]
+#[pyo3(signature = (
+    path, cellbender_h5, *, layer="cellbender", obs_key=None, var_key=None,
+    prefix="cellbender_", uns_key="cellbender", overwrite=false,
+    on_missing_rows="zero", on_extra_rows="warn", gene_axis="identical",
+    latent_embedding=false, dry_run=false
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn cellbender_import(
+    py: Python<'_>,
+    path: &str,
+    cellbender_h5: &str,
+    layer: &str,
+    obs_key: Option<String>,
+    var_key: Option<String>,
+    prefix: &str,
+    uns_key: Option<&str>,
+    overwrite: bool,
+    on_missing_rows: &str,
+    on_extra_rows: &str,
+    gene_axis: &str,
+    latent_embedding: bool,
+    dry_run: bool,
+) -> PyResult<Py<pyo3::types::PyDict>> {
+    use pyo3::types::PyDict;
+
+    let read_opts = scx_convert::CellBenderReadOptions {
+        column_prefix: prefix.to_string(),
+        latent_embedding,
+        ..Default::default()
+    };
+    let attach_opts = scx_ops::AttachLayerOptions {
+        layer_name: layer.to_string(),
+        obs_key_column: obs_key,
+        var_key_column: var_key,
+        missing_row_policy: parse_missing_rows(on_missing_rows)?,
+        extra_row_policy: parse_extra_rows(on_extra_rows)?,
+        column_axis_policy: parse_gene_axis(gene_axis)?,
+        status_column: Some(format!("{prefix}status")),
+        row_sum_column: Some(format!("{prefix}total_counts")),
+        uns_key: uns_key.map(str::to_string),
+        overwrite,
+        provenance_action: "cellbender_import".to_string(),
+        dry_run,
+        ..Default::default()
+    };
+
+    let scx_path = PathBuf::from(path);
+    let h5_path = PathBuf::from(cellbender_h5);
+
+    // `dry_run` is honoured inside the op: it runs every validation and the
+    // join, then returns without writing, so `n_matched` below is real.
+    let (summary, info) = py.detach(|| -> PyResult<_> {
+        let mut sink = scx_convert::WarningSink::log();
+        let out = scx_convert::read_cellbender_h5(&h5_path, &read_opts, &mut sink)
+            .map_err(crate::convert_to_pyerr)?;
+        let summary = scx_ops::attach_external_layer(&scx_path, &out.data, &attach_opts)
+            .map_err(ops_to_pyerr)?;
+        Ok((summary, out.info))
+    })?;
+
+    let d = PyDict::new(py);
+    d.set_item(
+        "output_kind",
+        format!("{:?}", info.output_kind).to_lowercase(),
+    )?;
+    d.set_item(
+        "latent_alignment",
+        format!("{:?}", info.latent_alignment).to_lowercase(),
+    )?;
+    d.set_item("n_rows_in_source", info.n_rows)?;
+    d.set_item("n_features_in_source", info.n_features)?;
+    d.set_item("estimator", info.estimator.clone())?;
+    d.set_item("all_values_integer", info.all_values_integer)?;
+    d.set_item("dry_run", dry_run)?;
+    {
+        let s = summary;
+        d.set_item("layer", layer)?;
+        d.set_item("n_obs", s.n_obs)?;
+        d.set_item("n_matched", s.n_matched)?;
+        d.set_item("n_target_rows_absent", s.n_target_rows_absent)?;
+        d.set_item("n_source_rows_absent", s.n_source_rows_absent)?;
+        d.set_item(
+            "n_source_rows_absent_nonzero",
+            s.n_source_rows_absent_nonzero,
+        )?;
+        d.set_item("obs_key_column", s.obs_key_column)?;
+        d.set_item("var_key_column", s.var_key_column)?;
+        d.set_item(
+            "gene_axis_match",
+            format!("{:?}", s.column_axis_match).to_lowercase(),
+        )?;
+        d.set_item("layer_nnz", s.layer_nnz)?;
+        d.set_item(
+            "value_encoding",
+            format!("{:?}", s.value_encoding).to_lowercase(),
+        )?;
+        d.set_item("obs_columns_added", s.obs_columns_added)?;
+        d.set_item("var_columns_added", s.var_columns_added)?;
+        d.set_item("obsm_keys_added", s.obsm_keys_added)?;
+    }
+    Ok(d.into())
+}
+
+/// Probe whether a file looks like a CellBender `remove-background` output
+/// (as opposed to a plain 10x CellRanger matrix).
+#[cfg(feature = "hdf5")]
+#[pyfunction]
+pub fn is_cellbender_h5(path: &str) -> bool {
+    scx_convert::is_cellbender_h5(std::path::Path::new(path))
 }

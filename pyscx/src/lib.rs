@@ -1475,6 +1475,11 @@ fn register_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::merge, m)?)?;
     m.add_function(wrap_pyfunction!(ops::set_uns, m)?)?;
     m.add_function(wrap_pyfunction!(ops::modify_metadata, m)?)?;
+    #[cfg(feature = "hdf5")]
+    {
+        m.add_function(wrap_pyfunction!(ops::cellbender_import, m)?)?;
+        m.add_function(wrap_pyfunction!(ops::is_cellbender_h5, m)?)?;
+    }
     Ok(())
 }
 

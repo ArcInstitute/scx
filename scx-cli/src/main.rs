@@ -5,6 +5,7 @@ use std::process;
 
 mod append;
 mod benchmark;
+mod cellbender;
 mod cli_utils;
 mod cloud_url;
 mod compact;
@@ -858,6 +859,53 @@ enum Commands {
         #[arg(long)]
         in_place: bool,
     },
+    /// Import a CellBender `remove-background` output as a layer on an
+    /// existing SCX file, in place.
+    ///
+    /// Joins by barcode — never by row position, because CellBender's
+    /// `_filtered.h5` is in descending-UMI order. X, the CSC sidecar, .raw,
+    /// deletion vectors and predicate indexes are preserved; undo with
+    /// `scx rollback`.
+    CellbenderImport {
+        /// Target SCX file (mutated in place).
+        input: PathBuf,
+        /// CellBender remove-background output .h5
+        cellbender_h5: PathBuf,
+        /// Name of the layer to write
+        #[arg(long, default_value = "cellbender")]
+        layer: String,
+        /// obs column holding the barcode (default: auto-resolve)
+        #[arg(long)]
+        obs_key: Option<String>,
+        /// var column holding the gene key (default: auto-resolve)
+        #[arg(long)]
+        var_key: Option<String>,
+        /// Prefix for the emitted obs/var columns
+        #[arg(long, default_value = "cellbender_")]
+        prefix: String,
+        /// uns key for the CellBender run metadata
+        #[arg(long, default_value = "cellbender")]
+        uns_key: String,
+        /// Replace an existing layer / columns / uns key
+        #[arg(long)]
+        overwrite: bool,
+        /// Target rows with no matching source row: zero-fill or fail
+        #[arg(long, default_value = "zero", value_parser = ["zero", "error"])]
+        on_missing_rows: String,
+        /// Source rows absent from the target: warn and skip, or fail
+        #[arg(long, default_value = "warn", value_parser = ["warn", "error"])]
+        on_extra_rows: String,
+        /// Gene-axis tolerance. A silent permutation is biologically wrong,
+        /// so reordering must be opted into.
+        #[arg(long, default_value = "identical", value_parser = ["identical", "reorder", "subset"])]
+        gene_axis: String,
+        /// Also import the z latent as obsm["X_cellbender_latent"]
+        #[arg(long)]
+        latent_embedding: bool,
+        /// Validate and report the join without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Restore the default `SIGPIPE` disposition (`SIG_DFL`).
@@ -999,6 +1047,35 @@ fn main() {
                 &group_pass,
             )
         }
+        Commands::CellbenderImport {
+            input,
+            cellbender_h5,
+            layer,
+            obs_key,
+            var_key,
+            prefix,
+            uns_key,
+            overwrite,
+            on_missing_rows,
+            on_extra_rows,
+            gene_axis,
+            latent_embedding,
+            dry_run,
+        } => cellbender::run_cellbender_import(
+            &input,
+            &cellbender_h5,
+            &layer,
+            obs_key.as_deref(),
+            var_key.as_deref(),
+            &prefix,
+            &uns_key,
+            overwrite,
+            &on_missing_rows,
+            &on_extra_rows,
+            &gene_axis,
+            latent_embedding,
+            dry_run,
+        ),
         Commands::Info {
             source,
             json,
