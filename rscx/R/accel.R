@@ -567,8 +567,10 @@ scx_pseudobulk <- function(object, group_by, method = "sum",
 #' NB-GLM (intercept + treatment) on only that target's and the reference's
 #' pseudobulk samples, with size factors recomputed per contrast. The replicate
 #' column is **not** entered as a covariate, so batch/donor confounders are not
-#' adjusted and `baseMean`/`dispersion` differ per contrast (this matches
-#' pyscx, not a single joint DESeq2 fit).
+#' adjusted and `baseMean`/`dispersion` differ per contrast. (rscx exposes only
+#' this fixed-design fit; the pyscx `pseudobulk_dex(backend="nb_glm", design=...)`
+#' path additionally supports a covariate-adjusted joint fit — not yet wired into
+#' rscx.)
 #' @return For `scx_pseudobulk_dex`: a long-format `data.frame` with one row per
 #'   gene per non-reference target and DESeq2-style columns `gene`, `baseMean`,
 #'   `log2FoldChange`, `lfcSE`, `stat`, `pvalue`, `padj`, `target`, `reference`.

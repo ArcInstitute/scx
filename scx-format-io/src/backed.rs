@@ -18,6 +18,7 @@ use scx_sparse::{ScxCsc, ScxCsr};
 use crate::catalog::{FullCatalog, FullCatalogEntry};
 use crate::catalog_view::{CatalogView, CatalogViewEntry};
 use crate::error::{Result, ScxError};
+use crate::prefetch;
 use crate::reader::ScxReader;
 use crate::section::SectionType;
 
@@ -1977,20 +1978,31 @@ impl BackedCsrReader {
     // --- Native shard-by-shard aggregation ---
     //
     // These methods compute statistics without materializing the full
-    // concatenated CSR. Peak memory = one decoded shard at a time
-    // (plus the output vector).
+    // concatenated CSR. Peak memory is `SCX_ACCEL_PREFETCH_DEPTH` decoded
+    // shards (default 4) plus the output vector — the ordered decode-prefetch
+    // pipeline keeps that many in flight so decode overlaps the reduction.
+    // It was one shard before Phase 4.2, and still is whenever the pipeline
+    // declines to engage (depth 1, a single shard, a one-thread rayon pool, or
+    // a caller that is itself a rayon worker).
+    //
+    // The bound is **per call**, and the depth knob is process-global: N
+    // concurrent callers hold N x depth shards. `pyscx.accel.col_*` release the
+    // GIL, so that is reachable from Python threads.
 
     /// Compute per-row sums without materializing the full matrix.
     ///
     /// Iterates shards in order, computes row sums from each shard's
     /// CSR arrays, and concatenates the results.
     pub fn row_sums(&self) -> Result<Vec<f64>> {
-        let n_shards = self.index.n_shards();
         let mut all_sums = Vec::with_capacity(self.n_obs);
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            all_sums.extend(csr.row_sums());
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                all_sums.extend(csr.row_sums());
+                Ok(())
+            },
+        )?;
         Ok(all_sums)
     }
 
@@ -1998,26 +2010,32 @@ impl BackedCsrReader {
     ///
     /// Iterates shards, accumulates column sums into a single `n_vars`-length vector.
     pub fn col_sums(&self) -> Result<Vec<f64>> {
-        let n_shards = self.index.n_shards();
         let mut sums = vec![0.0f64; self.n_vars];
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            let partial = csr.col_sums();
-            for (s, p) in sums.iter_mut().zip(partial.iter()) {
-                *s += p;
-            }
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                let partial = csr.col_sums();
+                for (s, p) in sums.iter_mut().zip(partial.iter()) {
+                    *s += p;
+                }
+                Ok(())
+            },
+        )?;
         Ok(sums)
     }
 
     /// Compute per-row NNZ counts without materializing the full matrix.
     pub fn row_nnz(&self) -> Result<Vec<i64>> {
-        let n_shards = self.index.n_shards();
         let mut all_nnz = Vec::with_capacity(self.n_obs);
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            all_nnz.extend(csr.row_nnz());
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                all_nnz.extend(csr.row_nnz());
+                Ok(())
+            },
+        )?;
         Ok(all_nnz)
     }
 
@@ -2026,32 +2044,67 @@ impl BackedCsrReader {
     /// Avoids the double I/O of calling `row_nnz()` + `row_sums()` separately.
     /// Used by `filter_cells` when both `min_genes` and `min_counts` are specified.
     pub fn row_nnz_and_sums(&self) -> Result<(Vec<i64>, Vec<f64>)> {
-        let n_shards = self.index.n_shards();
         let mut all_nnz = Vec::with_capacity(self.n_obs);
         let mut all_sums = Vec::with_capacity(self.n_obs);
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            for row in 0..csr.n_rows() {
-                let start = csr.indptr[row] as usize;
-                let end = csr.indptr[row + 1] as usize;
-                all_nnz.push((end - start) as i64);
-                all_sums.push(csr.data[start..end].iter().map(|&v| v as f64).sum());
-            }
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                for row in 0..csr.n_rows() {
+                    let start = csr.indptr[row] as usize;
+                    let end = csr.indptr[row + 1] as usize;
+                    all_nnz.push((end - start) as i64);
+                    all_sums.push(csr.data[start..end].iter().map(|&v| v as f64).sum());
+                }
+                Ok(())
+            },
+        )?;
         Ok((all_nnz, all_sums))
+    }
+
+    /// Compute per-column sums and per-column NNZ in a single shard scan.
+    ///
+    /// The column-axis twin of [`Self::row_nnz_and_sums`]: avoids the second
+    /// full decode of every shard that calling `col_sums()` and `col_nnz()`
+    /// separately incurs. Used by `calculate_qc_metrics`' gene axis and by
+    /// `filter_genes` when both a cell and a count threshold are given.
+    ///
+    /// Bit-identical to the two separate calls — same per-shard visit order,
+    /// same left-to-right f64 accumulation.
+    pub fn col_sums_and_nnz(&self) -> Result<(Vec<f64>, Vec<u32>)> {
+        let mut sums = vec![0.0f64; self.n_vars];
+        let mut counts = vec![0u32; self.n_vars];
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                let (partial_sums, partial_nnz) = csr.col_sums_and_nnz();
+                for (s, p) in sums.iter_mut().zip(partial_sums.iter()) {
+                    *s += p;
+                }
+                for (c, p) in counts.iter_mut().zip(partial_nnz.iter()) {
+                    *c = c.saturating_add(*p);
+                }
+                Ok(())
+            },
+        )?;
+        Ok((sums, counts))
     }
 
     /// Compute per-column NNZ counts without materializing the full matrix.
     pub fn col_nnz(&self) -> Result<Vec<u32>> {
-        let n_shards = self.index.n_shards();
         let mut counts = vec![0u32; self.n_vars];
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            let partial = csr.col_nnz();
-            for (c, p) in counts.iter_mut().zip(partial.iter()) {
-                *c = c.saturating_add(*p);
-            }
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                let partial = csr.col_nnz();
+                for (c, p) in counts.iter_mut().zip(partial.iter()) {
+                    *c = c.saturating_add(*p);
+                }
+                Ok(())
+            },
+        )?;
         Ok(counts)
     }
 
@@ -2079,12 +2132,15 @@ impl BackedCsrReader {
     /// CSR arrays, and concatenates the results. Used for scalar variance:
     /// `Var(X) = E[X²] - (E[X])²`.
     pub fn row_sum_of_squares(&self) -> Result<Vec<f64>> {
-        let n_shards = self.index.n_shards();
         let mut all_sq = Vec::with_capacity(self.n_obs);
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            all_sq.extend(csr.row_sum_of_squares());
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                all_sq.extend(csr.row_sum_of_squares());
+                Ok(())
+            },
+        )?;
         Ok(all_sq)
     }
 
@@ -2094,12 +2150,15 @@ impl BackedCsrReader {
     ///
     /// Each shard independently computes row variances (one row = one shard's row).
     pub fn row_var(&self) -> Result<Vec<f64>> {
-        let n_shards = self.index.n_shards();
         let mut all_var = Vec::with_capacity(self.n_obs);
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            all_var.extend(csr.row_var());
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                all_var.extend(csr.row_var());
+                Ok(())
+            },
+        )?;
         Ok(all_var)
     }
 
@@ -2120,21 +2179,24 @@ impl BackedCsrReader {
         let col_means: Vec<f64> = col_sums.iter().map(|&s| s / n_obs as f64).collect();
 
         // Pass 2: accumulate (val - mean)² for stored entries
-        let n_shards = self.index.n_shards();
         let mut sq_devs = vec![0.0f64; self.n_vars];
         let mut col_nnz = vec![0usize; self.n_vars];
 
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            let partial = csr.col_var_partial(&col_means);
-            for (s, p) in sq_devs.iter_mut().zip(partial.iter()) {
-                *s += p;
-            }
-            let nnz = csr.col_nnz();
-            for (c, &n) in col_nnz.iter_mut().zip(nnz.iter()) {
-                *c += n as usize;
-            }
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                let partial = csr.col_var_partial(&col_means);
+                for (s, p) in sq_devs.iter_mut().zip(partial.iter()) {
+                    *s += p;
+                }
+                let nnz = csr.col_nnz();
+                for (c, &n) in col_nnz.iter_mut().zip(nnz.iter()) {
+                    *c += n as usize;
+                }
+                Ok(())
+            },
+        )?;
 
         // Add contribution from implicit zeros: (n_obs - col_nnz[c]) * mean[c]²
         let mut variances = vec![0.0f64; self.n_vars];
@@ -2151,12 +2213,15 @@ impl BackedCsrReader {
 
     /// Streaming per-row max without materializing the full matrix.
     pub fn row_max(&self) -> Result<Vec<f64>> {
-        let n_shards = self.index.n_shards();
         let mut all_max = Vec::with_capacity(self.n_obs);
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            all_max.extend(csr.row_max());
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                all_max.extend(csr.row_max());
+                Ok(())
+            },
+        )?;
         Ok(all_max)
     }
 
@@ -2166,23 +2231,26 @@ impl BackedCsrReader {
     /// if any column has fewer stored entries than `n_obs`, the max is
     /// at least 0.0.
     pub fn col_max(&self) -> Result<Vec<f64>> {
-        let n_shards = self.index.n_shards();
         let mut maxes = vec![f64::NEG_INFINITY; self.n_vars];
         let mut col_nnz = vec![0usize; self.n_vars];
 
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            // Get per-column max within this shard (using n_rows of shard, not global n_obs)
-            // We need the raw stored max, so we pass n_rows = shard.n_rows()
-            // But we want the global implicit-zero correction at the end,
-            // so we track NNZ ourselves and compute raw stored max.
-            for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-                let c = col as usize;
-                let v = val as f64;
-                maxes[c] = maxes[c].max(v);
-                col_nnz[c] += 1;
-            }
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                // Get per-column max within this shard (using n_rows of shard, not global n_obs)
+                // We need the raw stored max, so we pass n_rows = shard.n_rows()
+                // But we want the global implicit-zero correction at the end,
+                // so we track NNZ ourselves and compute raw stored max.
+                for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                    let c = col as usize;
+                    let v = val as f64;
+                    maxes[c] = maxes[c].max(v);
+                    col_nnz[c] += 1;
+                }
+                Ok(())
+            },
+        )?;
 
         // Apply implicit-zero correction at the global level
         for c in 0..self.n_vars {
@@ -2199,30 +2267,36 @@ impl BackedCsrReader {
 
     /// Streaming per-row min without materializing the full matrix.
     pub fn row_min(&self) -> Result<Vec<f64>> {
-        let n_shards = self.index.n_shards();
         let mut all_min = Vec::with_capacity(self.n_obs);
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            all_min.extend(csr.row_min());
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                all_min.extend(csr.row_min());
+                Ok(())
+            },
+        )?;
         Ok(all_min)
     }
 
     /// Streaming per-column min without materializing the full matrix.
     pub fn col_min(&self) -> Result<Vec<f64>> {
-        let n_shards = self.index.n_shards();
         let mut mins = vec![f64::INFINITY; self.n_vars];
         let mut col_nnz = vec![0usize; self.n_vars];
 
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-                let c = col as usize;
-                let v = val as f64;
-                mins[c] = mins[c].min(v);
-                col_nnz[c] += 1;
-            }
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> Result<()> {
+                for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                    let c = col as usize;
+                    let v = val as f64;
+                    mins[c] = mins[c].min(v);
+                    col_nnz[c] += 1;
+                }
+                Ok(())
+            },
+        )?;
 
         for c in 0..self.n_vars {
             if col_nnz[c] < self.n_obs {
@@ -2253,6 +2327,43 @@ impl BackedCsrReader {
         self.col_aggregate_masked(kept_rows, AggOp::Nnz)
     }
 
+    /// Column sums and column NNZ over the kept rows, in a single shard scan.
+    ///
+    /// Deletion-aware twin of [`Self::col_sums_and_nnz`]. Bit-identical to
+    /// `col_sums_masked()` + `col_nnz_masked()`, which walk the same rows in
+    /// the same order — this just decodes each shard once instead of twice.
+    pub fn col_sums_and_nnz_masked(&self, kept_rows: &[u64]) -> Result<(Vec<f64>, Vec<u32>)> {
+        let mut sums = vec![0.0f64; self.n_vars];
+        let mut counts = vec![0u32; self.n_vars];
+
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |shard_idx, csr| -> Result<()> {
+                let (s_start, s_end) = match self.index.shard_range(shard_idx) {
+                    Some(r) => r,
+                    None => return Ok(()),
+                };
+                // `kept_rows` is sorted by construction (see compute_kept_to_global),
+                // so the shard's slice is a binary-search range.
+                let lo = kept_rows.partition_point(|&r| r < s_start);
+                let hi = kept_rows.partition_point(|&r| r < s_end);
+                for &global_row in &kept_rows[lo..hi] {
+                    let local_row = (global_row - s_start) as usize;
+                    let row_start = csr.indptr[local_row] as usize;
+                    let row_end = csr.indptr[local_row + 1] as usize;
+                    for j in row_start..row_end {
+                        let c = csr.indices[j] as usize;
+                        sums[c] += csr.data[j] as f64;
+                        counts[c] += 1;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        Ok((sums, counts))
+    }
+
     /// Column max considering only the kept rows.
     pub fn col_max_masked(&self, kept_rows: &[u64]) -> Result<Vec<f64>> {
         self.col_aggregate_masked(kept_rows, AggOp::Max)
@@ -2278,30 +2389,33 @@ impl BackedCsrReader {
         let mut sq_devs = vec![0.0f64; self.n_vars];
         let mut col_nnz = vec![0usize; self.n_vars];
 
-        let n_shards = self.index.n_shards();
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            let (s_start, s_end) = match self.index.shard_range(shard_idx) {
-                Some(r) => r,
-                None => continue,
-            };
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |shard_idx, csr| -> Result<()> {
+                let (s_start, s_end) = match self.index.shard_range(shard_idx) {
+                    Some(r) => r,
+                    None => return Ok(()),
+                };
 
-            // Binary-search to find the sub-slice of kept_rows within [s_start, s_end).
-            // kept_rows is sorted by construction (see compute_kept_to_global).
-            let lo = kept_rows.partition_point(|&r| r < s_start);
-            let hi = kept_rows.partition_point(|&r| r < s_end);
-            for &global_row in &kept_rows[lo..hi] {
-                let local_row = (global_row - s_start) as usize;
-                let row_start = csr.indptr[local_row] as usize;
-                let row_end = csr.indptr[local_row + 1] as usize;
-                for j in row_start..row_end {
-                    let c = csr.indices[j] as usize;
-                    let diff = csr.data[j] as f64 - col_means[c];
-                    sq_devs[c] += diff * diff;
-                    col_nnz[c] += 1;
+                // Binary-search to find the sub-slice of kept_rows within [s_start, s_end).
+                // kept_rows is sorted by construction (see compute_kept_to_global).
+                let lo = kept_rows.partition_point(|&r| r < s_start);
+                let hi = kept_rows.partition_point(|&r| r < s_end);
+                for &global_row in &kept_rows[lo..hi] {
+                    let local_row = (global_row - s_start) as usize;
+                    let row_start = csr.indptr[local_row] as usize;
+                    let row_end = csr.indptr[local_row + 1] as usize;
+                    for j in row_start..row_end {
+                        let c = csr.indices[j] as usize;
+                        let diff = csr.data[j] as f64 - col_means[c];
+                        sq_devs[c] += diff * diff;
+                        col_nnz[c] += 1;
+                    }
                 }
-            }
-        }
+                Ok(())
+            },
+        )?;
 
         // Add zero-entry contributions
         let mut variances = vec![0.0f64; self.n_vars];
@@ -2323,35 +2437,38 @@ impl BackedCsrReader {
         };
         let mut col_nnz = vec![0usize; self.n_vars];
 
-        let n_shards = self.index.n_shards();
-        for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
-            let (s_start, s_end) = match self.index.shard_range(shard_idx) {
-                Some(r) => r,
-                None => continue,
-            };
+        prefetch::for_each_shard_ordered_uncached(
+            self,
+            prefetch::prefetch_depth(),
+            |shard_idx, csr| -> Result<()> {
+                let (s_start, s_end) = match self.index.shard_range(shard_idx) {
+                    Some(r) => r,
+                    None => return Ok(()),
+                };
 
-            // Binary-search to find the sub-slice of kept_rows within [s_start, s_end).
-            // kept_rows is sorted by construction (see compute_kept_to_global).
-            let lo = kept_rows.partition_point(|&r| r < s_start);
-            let hi = kept_rows.partition_point(|&r| r < s_end);
-            for &global_row in &kept_rows[lo..hi] {
-                let local_row = (global_row - s_start) as usize;
-                let row_start = csr.indptr[local_row] as usize;
-                let row_end = csr.indptr[local_row + 1] as usize;
-                for j in row_start..row_end {
-                    let c = csr.indices[j] as usize;
-                    let v = csr.data[j] as f64;
-                    match op {
-                        AggOp::Sum => result[c] += v,
-                        AggOp::Nnz => result[c] += 1.0,
-                        AggOp::Max => result[c] = result[c].max(v),
-                        AggOp::Min => result[c] = result[c].min(v),
+                // Binary-search to find the sub-slice of kept_rows within [s_start, s_end).
+                // kept_rows is sorted by construction (see compute_kept_to_global).
+                let lo = kept_rows.partition_point(|&r| r < s_start);
+                let hi = kept_rows.partition_point(|&r| r < s_end);
+                for &global_row in &kept_rows[lo..hi] {
+                    let local_row = (global_row - s_start) as usize;
+                    let row_start = csr.indptr[local_row] as usize;
+                    let row_end = csr.indptr[local_row + 1] as usize;
+                    for j in row_start..row_end {
+                        let c = csr.indices[j] as usize;
+                        let v = csr.data[j] as f64;
+                        match op {
+                            AggOp::Sum => result[c] += v,
+                            AggOp::Nnz => result[c] += 1.0,
+                            AggOp::Max => result[c] = result[c].max(v),
+                            AggOp::Min => result[c] = result[c].min(v),
+                        }
+                        col_nnz[c] += 1;
                     }
-                    col_nnz[c] += 1;
                 }
-            }
-        }
+                Ok(())
+            },
+        )?;
 
         // Handle implicit zeros for max/min
         match op {
@@ -2469,6 +2586,29 @@ impl crate::shard_source::ShardSource for BackedCsrReader {
             .map(|(s, e)| (e - s) as usize)
             .max()
             .unwrap_or(0))
+    }
+
+    /// O(n_shards) over already-loaded catalog metadata — no decode, no I/O.
+    ///
+    /// Returns `None` when the catalog carries no shard statistics: `nnz` is
+    /// then 0 for every entry (`ShardEntryLite::from_view_entry` maps a missing
+    /// `stats` block to 0), and reporting `max_nnz = 0` would be an
+    /// *under*-estimate, which the hint contract forbids. An genuinely all-empty
+    /// matrix is indistinguishable here and also declines — harmless, since the
+    /// caller then grows buffers on demand exactly as it did before.
+    fn shard_size_hint(&self) -> Option<crate::ShardSizeHint> {
+        let max_nnz = (0..self.shard_count())
+            .filter_map(|i| self.shard_entry(i))
+            .map(|e| e.nnz)
+            .max()
+            .unwrap_or(0);
+        if max_nnz == 0 {
+            return None;
+        }
+        Some(crate::ShardSizeHint {
+            max_rows: <Self as crate::ShardSource>::max_shard_rows(self).ok()?,
+            max_nnz: max_nnz as usize,
+        })
     }
 
     // col_means_and_sum_sq: not overridden here. Generic callers (`S:

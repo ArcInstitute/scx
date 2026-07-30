@@ -19,22 +19,67 @@ pub struct HvgStats {
 
 /// Reject non-finite values at the HVG accelerator boundary.
 ///
-/// NaN/Inf cannot be summarised into a meaningful mean/variance and would
-/// silently poison HVG selection. This is the HVG analogue of the DE boundary
-/// check ([`crate::diffexp`]'s `ensure_finite_de_input`): finiteness is a
-/// contract at the accelerator entry, validated where the streaming pass
-/// already touches every nonzero — not at file ingest. (The GPU HVG path does
-/// not yet enforce this on-device; tracked as a follow-on.)
+/// Thin wrapper over the shared [`crate::finite::ensure_finite_values`]
+/// primitive so every storage route (CSR here, CSC in [`crate::csc`]) enforces
+/// the same guard. (The GPU HVG path does not yet enforce this on-device;
+/// tracked as a follow-on.)
 fn ensure_finite_hvg_data(data: &[f32]) -> Result<()> {
-    if let Some(pos) = data.iter().position(|v| !v.is_finite()) {
-        return Err(crate::error::AccelError::InvalidInput(format!(
-            "HVG input contains a non-finite value ({}) at nonzero index {pos}; \
-             highly-variable-gene selection requires finite input — filter/QC NaN \
-             and Inf before computing variance",
-            data[pos]
-        )));
-    }
-    Ok(())
+    crate::finite::ensure_finite_values(data, "HVG")
+}
+
+/// Streaming per-column `(Σ t(x), Σ t(x)²)` moments over all shards, where
+/// `t` is a per-value transform (identity for raw moments, `expm1(scale·x)`
+/// for the seurat count-space moments).
+///
+/// Uses the 2.1 decode-prefetch primitives ([`crate::prefetch::accumulate_shards`]):
+/// order-stable + bit-exact by default, budgeted-parallel under
+/// `SCX_ACCEL_REDUCTION_MODE=parallel`. The accumulator is two `n_vars`-length
+/// f64 vectors, independent of the global row offset, so shard order does not
+/// affect correctness (only float summation order in the parallel mode). The
+/// finiteness guard is enforced per shard, matching the pre-2.1 loop.
+fn accumulate_col_moments<S, T>(
+    source: &S,
+    n_vars: usize,
+    transform: T,
+) -> Result<(Vec<f64>, Vec<f64>)>
+where
+    S: ShardSource + Sync,
+    T: Fn(f64) -> f64 + Sync,
+{
+    // Bound concurrent per-worker accumulators (each `2 · n_vars · f64`) to the
+    // shared CPU budget; the ordered default holds exactly one accumulator.
+    let per_acc = 2u64.saturating_mul(n_vars as u64).saturating_mul(8);
+    let workers = crate::mem_budget::clamp_prefetch_depth(
+        rayon::current_num_threads(),
+        per_acc,
+        crate::mem_budget::de_memory_budget(),
+    );
+    crate::prefetch::accumulate_shards(
+        source,
+        workers,
+        || (vec![0.0f64; n_vars], vec![0.0f64; n_vars]),
+        |acc: &mut (Vec<f64>, Vec<f64>), _idx, csr| {
+            let _r = scx_format_io::reduction_guard();
+            ensure_finite_hvg_data(&csr.data)?;
+            let (col_sum, col_sum_sq) = acc;
+            for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                let c = col as usize;
+                let v = transform(val as f64);
+                col_sum[c] += v;
+                col_sum_sq[c] += v * v;
+            }
+            Ok(())
+        },
+        |mut a: (Vec<f64>, Vec<f64>), b: (Vec<f64>, Vec<f64>)| {
+            for (x, y) in a.0.iter_mut().zip(b.0.iter()) {
+                *x += *y;
+            }
+            for (x, y) in a.1.iter_mut().zip(b.1.iter()) {
+                *x += *y;
+            }
+            a
+        },
+    )
 }
 
 /// Single-pass streaming mean and variance per column.
@@ -59,7 +104,7 @@ fn ensure_finite_hvg_data(data: &[f32]) -> Result<()> {
 /// stability at the cost of a branch per nonzero element.
 ///
 /// Returns zero means and zero variances when `n_obs == 0`.
-pub fn streaming_mean_var<S: ShardSource>(source: &S) -> Result<HvgStats> {
+pub fn streaming_mean_var<S: ShardSource + Sync>(source: &S) -> Result<HvgStats> {
     let n_vars = source.n_vars();
     let n_obs = source.n_obs();
 
@@ -71,19 +116,10 @@ pub fn streaming_mean_var<S: ShardSource>(source: &S) -> Result<HvgStats> {
         });
     }
 
-    let mut col_sum = vec![0.0f64; n_vars];
-    let mut col_sum_sq = vec![0.0f64; n_vars];
-
-    for shard_idx in 0..source.n_shards() {
-        let csr = source.read_shard(shard_idx)?;
-        ensure_finite_hvg_data(&csr.data)?;
-        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-            let c = col as usize;
-            let v = val as f64;
-            col_sum[c] += v;
-            col_sum_sq[c] += v * v;
-        }
-    }
+    // Decode-prefetched, order-stable per-column reduction (2.1). Accumulator
+    // is `(col_sum, col_sum_sq)`, independent of the global row offset, so both
+    // the ordered (bit-exact default) and budgeted-parallel modes are valid.
+    let (col_sum, col_sum_sq) = accumulate_col_moments(source, n_vars, |v| v)?;
 
     let n = n_obs as f64;
     let denom = (n - 1.0).max(1.0); // avoid division by zero for n <= 1
@@ -96,6 +132,49 @@ pub fn streaming_mean_var<S: ShardSource>(source: &S) -> Result<HvgStats> {
         // Var = (sum_sq - n * mean^2) / (n - 1)
         variances[j] = (col_sum_sq[j] - n * mean * mean) / denom;
         // Clamp to zero (numerical noise can produce tiny negatives)
+        if variances[j] < 0.0 {
+            variances[j] = 0.0;
+        }
+    }
+
+    Ok(HvgStats { means, variances })
+}
+
+/// Single-pass streaming mean/variance per column on `expm1(scale · value)`.
+///
+/// scanpy's `seurat` HVG flavor un-`log1p`s the matrix before computing
+/// moments: `x *= ln(base)` (identity when the stored base is natural log /
+/// `None`, i.e. `scale = 1.0`), then `expm1`. Because `expm1(0) == 0`, implicit
+/// and stored zeros contribute nothing, so the count-space moments stream from
+/// the sparse nonzeros exactly like [`streaming_mean_var`].
+///
+/// `scale` is `ln(base)` for a log1p base of `base`, or `1.0` for natural-log /
+/// no recorded base. Bessel's correction (ddof=1) matches scanpy's
+/// `correction=1`.
+pub fn streaming_mean_var_expm1<S: ShardSource + Sync>(source: &S, scale: f64) -> Result<HvgStats> {
+    let n_vars = source.n_vars();
+    let n_obs = source.n_obs();
+
+    if n_obs == 0 {
+        return Ok(HvgStats {
+            means: vec![0.0; n_vars],
+            variances: vec![0.0; n_vars],
+        });
+    }
+
+    // Count-space moments: `expm1(scale · v)` un-logs before accumulating.
+    // `expm1(0) == 0`, so implicit/stored zeros contribute nothing (2.1
+    // decode-prefetched, order-stable by default).
+    let (col_sum, col_sum_sq) = accumulate_col_moments(source, n_vars, |v| (v * scale).exp_m1())?;
+
+    let n = n_obs as f64;
+    let denom = (n - 1.0).max(1.0);
+    let mut means = vec![0.0f64; n_vars];
+    let mut variances = vec![0.0f64; n_vars];
+    for j in 0..n_vars {
+        let mean = col_sum[j] / n;
+        means[j] = mean;
+        variances[j] = (col_sum_sq[j] - n * mean * mean) / denom;
         if variances[j] < 0.0 {
             variances[j] = 0.0;
         }
@@ -118,28 +197,47 @@ pub fn streaming_mean_var<S: ShardSource>(source: &S) -> Result<HvgStats> {
 /// silently poison the clipped sums otherwise.
 ///
 /// Memory: O(n_vars).
-pub fn streaming_clip_square_sum<S: ShardSource>(
+pub fn streaming_clip_square_sum<S: ShardSource + Sync>(
     source: &S,
     clip_val: &[f64],
 ) -> Result<(Vec<f64>, Vec<f64>)> {
     let n_vars = source.n_vars();
     debug_assert_eq!(clip_val.len(), n_vars);
 
-    let mut batch_counts_sum = vec![0.0f64; n_vars];
-    let mut sq_batch_counts_sum = vec![0.0f64; n_vars];
-
-    for shard_idx in 0..source.n_shards() {
-        let csr = source.read_shard(shard_idx)?;
-        ensure_finite_hvg_data(&csr.data)?;
-        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-            let c = col as usize;
-            let v = (val as f64).min(clip_val[c]);
-            batch_counts_sum[c] += v;
-            sq_batch_counts_sum[c] += v * v;
-        }
-    }
-
-    Ok((batch_counts_sum, sq_batch_counts_sum))
+    // Per-column clipped `(Σ v, Σ v²)`, offset-independent → 2.1 prefetched,
+    // order-stable by default.
+    let per_acc = 2u64.saturating_mul(n_vars as u64).saturating_mul(8);
+    let workers = crate::mem_budget::clamp_prefetch_depth(
+        rayon::current_num_threads(),
+        per_acc,
+        crate::mem_budget::de_memory_budget(),
+    );
+    crate::prefetch::accumulate_shards(
+        source,
+        workers,
+        || (vec![0.0f64; n_vars], vec![0.0f64; n_vars]),
+        |acc: &mut (Vec<f64>, Vec<f64>), _idx, csr| {
+            let _r = scx_format_io::reduction_guard();
+            ensure_finite_hvg_data(&csr.data)?;
+            let (bcs, sbcs) = acc;
+            for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                let c = col as usize;
+                let v = (val as f64).min(clip_val[c]);
+                bcs[c] += v;
+                sbcs[c] += v * v;
+            }
+            Ok(())
+        },
+        |mut a: (Vec<f64>, Vec<f64>), b: (Vec<f64>, Vec<f64>)| {
+            for (x, y) in a.0.iter_mut().zip(b.0.iter()) {
+                *x += *y;
+            }
+            for (x, y) in a.1.iter_mut().zip(b.1.iter()) {
+                *x += *y;
+            }
+            a
+        },
+    )
 }
 
 /// Per-batch and global mean/variance from a single streaming pass.
@@ -163,7 +261,7 @@ pub struct BatchedHvgStats {
 /// Use `-1` for cells that should be excluded from all batches.
 ///
 /// Memory: O(n_vars * n_batches) for per-batch accumulators.
-pub fn streaming_mean_var_batched<S: ShardSource>(
+pub fn streaming_mean_var_batched<S: ShardSource + Sync>(
     source: &S,
     cell_batch: &[i32],
     n_batches: usize,
@@ -174,32 +272,41 @@ pub fn streaming_mean_var_batched<S: ShardSource>(
     let mut batch_sum_sq = vec![vec![0.0f64; n_vars]; n_batches];
     let mut batch_count = vec![0usize; n_batches];
 
+    // Ordered decode-prefetch (2.1): the cell→batch mapping is keyed by the
+    // global cell index, so shards must be consumed in order — StableOrder is
+    // the only valid mode here (`for_each_shard_ordered`, never the reordered
+    // parallel reduction). The `cell_offset` cursor advances per delivered shard.
     let mut cell_offset = 0usize;
-    for shard_idx in 0..source.n_shards() {
-        let csr = source.read_shard(shard_idx)?;
-        ensure_finite_hvg_data(&csr.data)?;
-        let n_rows = csr.n_rows();
+    crate::prefetch::for_each_shard_ordered(
+        source,
+        crate::prefetch::prefetch_depth(),
+        |_idx, csr| {
+            let _r = scx_format_io::reduction_guard();
+            ensure_finite_hvg_data(&csr.data)?;
+            let n_rows = csr.n_rows();
 
-        for row in 0..n_rows {
-            let cell_idx = cell_offset + row;
-            let b = cell_batch[cell_idx];
-            if b < 0 {
-                continue;
-            }
-            let b = b as usize;
-            batch_count[b] += 1;
+            for row in 0..n_rows {
+                let cell_idx = cell_offset + row;
+                let b = cell_batch[cell_idx];
+                if b < 0 {
+                    continue;
+                }
+                let b = b as usize;
+                batch_count[b] += 1;
 
-            let start = csr.indptr[row] as usize;
-            let end = csr.indptr[row + 1] as usize;
-            for j in start..end {
-                let c = csr.indices[j] as usize;
-                let v = csr.data[j] as f64;
-                batch_sum[b][c] += v;
-                batch_sum_sq[b][c] += v * v;
+                let start = csr.indptr[row] as usize;
+                let end = csr.indptr[row + 1] as usize;
+                for j in start..end {
+                    let c = csr.indices[j] as usize;
+                    let v = csr.data[j] as f64;
+                    batch_sum[b][c] += v;
+                    batch_sum_sq[b][c] += v * v;
+                }
             }
-        }
-        cell_offset += n_rows;
-    }
+            cell_offset += n_rows;
+            Ok(())
+        },
+    )?;
 
     // Compute per-batch means and variances.
     let mut per_batch = Vec::with_capacity(n_batches);
@@ -262,7 +369,7 @@ pub fn streaming_mean_var_batched<S: ShardSource>(
 /// [`ensure_finite_hvg_data`], mirroring [`streaming_mean_var_batched`].
 ///
 /// Memory: O(n_vars * n_batches).
-pub fn streaming_clip_square_sum_batched<S: ShardSource>(
+pub fn streaming_clip_square_sum_batched<S: ShardSource + Sync>(
     source: &S,
     cell_batch: &[i32],
     n_batches: usize,
@@ -274,31 +381,38 @@ pub fn streaming_clip_square_sum_batched<S: ShardSource>(
     let mut batch_bcs = vec![vec![0.0f64; n_vars]; n_batches];
     let mut batch_sbcs = vec![vec![0.0f64; n_vars]; n_batches];
 
+    // Ordered decode-prefetch (2.1): batch mapping is global-cell-index keyed,
+    // so the `cell_offset` cursor requires in-order shard delivery.
     let mut cell_offset = 0usize;
-    for shard_idx in 0..source.n_shards() {
-        let csr = source.read_shard(shard_idx)?;
-        ensure_finite_hvg_data(&csr.data)?;
-        let n_rows = csr.n_rows();
+    crate::prefetch::for_each_shard_ordered(
+        source,
+        crate::prefetch::prefetch_depth(),
+        |_idx, csr| {
+            let _r = scx_format_io::reduction_guard();
+            ensure_finite_hvg_data(&csr.data)?;
+            let n_rows = csr.n_rows();
 
-        for row in 0..n_rows {
-            let cell_idx = cell_offset + row;
-            let b = cell_batch[cell_idx];
-            if b < 0 {
-                continue;
-            }
-            let b = b as usize;
+            for row in 0..n_rows {
+                let cell_idx = cell_offset + row;
+                let b = cell_batch[cell_idx];
+                if b < 0 {
+                    continue;
+                }
+                let b = b as usize;
 
-            let start = csr.indptr[row] as usize;
-            let end = csr.indptr[row + 1] as usize;
-            for j in start..end {
-                let c = csr.indices[j] as usize;
-                let v = (csr.data[j] as f64).min(clip_vals[b][c]);
-                batch_bcs[b][c] += v;
-                batch_sbcs[b][c] += v * v;
+                let start = csr.indptr[row] as usize;
+                let end = csr.indptr[row + 1] as usize;
+                for j in start..end {
+                    let c = csr.indices[j] as usize;
+                    let v = (csr.data[j] as f64).min(clip_vals[b][c]);
+                    batch_bcs[b][c] += v;
+                    batch_sbcs[b][c] += v * v;
+                }
             }
-        }
-        cell_offset += n_rows;
-    }
+            cell_offset += n_rows;
+            Ok(())
+        },
+    )?;
 
     Ok(batch_bcs.into_iter().zip(batch_sbcs).collect())
 }

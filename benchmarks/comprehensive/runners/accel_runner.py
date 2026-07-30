@@ -26,7 +26,9 @@ once per dataset).
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import resource
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -34,6 +36,68 @@ from typing import Any, Optional
 from benchmarks.comprehensive.rss import current_rss_mb
 
 logger = logging.getLogger(__name__)
+
+
+def cpu_profile_enabled() -> bool:
+    """True iff `SCX_CPU_PROFILE` is set to a non-empty, non-``"0"`` value.
+
+    This mirrors the Rust-side gate (`scx_format_io::profile::profile_enabled`),
+    resolved once per process at profiler init; the env var must be exported
+    **before** the worker imports pyscx.
+    """
+    v = os.environ.get("SCX_CPU_PROFILE", "")
+    return bool(v) and v != "0"
+
+
+@contextlib.contextmanager
+def cpu_profile_capture(extras: dict[str, Any], prefix: str = "cpu_profile"):
+    """Capture the CPU per-stage profiler breakdown for the wrapped op.
+
+    Task 2.0 (the Phase-2 ranking oracle). When `SCX_CPU_PROFILE=1`, resets the
+    process-global CPU profiler on entry and, on exit, writes a flattened
+    per-stage breakdown into `extras` (so it lands in ``runs[].extra`` — the
+    sanctioned free-form manifest channel, `results.RunMeasurement`). Keys are
+    ``{prefix}_{bucket}_ms`` / ``_count`` / ``_bytes`` for buckets
+    ``io``/``decode_scx1``/``decode_generic``/``reduction``/``marshalling``, plus
+    ``{prefix}_enabled``. A no-op (zero overhead, no keys) when the profiler is
+    disabled or pyscx is unavailable, so it is always safe to wrap a timed op.
+    """
+    if not cpu_profile_enabled():
+        yield
+        return
+    try:
+        import pyscx
+    except Exception:  # pragma: no cover - pyscx always present in bench envs
+        yield
+        return
+    # Degrade gracefully on a pyscx too old to carry the CPU profiler surface
+    # (the functions landed in Phase-2 2.0) instead of raising AttributeError.
+    if not hasattr(pyscx.accel, "cpu_profile_snapshot") or not hasattr(
+        pyscx.accel, "cpu_profile_reset"
+    ):
+        logger.warning("cpu_profile_capture: pyscx lacks the CPU profiler surface; skipping")
+        yield
+        return
+    pyscx.accel.cpu_profile_reset()
+    try:
+        yield
+    finally:
+        try:
+            snap = pyscx.accel.cpu_profile_snapshot()
+            extras[f"{prefix}_enabled"] = 1.0 if snap.get("enabled") else 0.0
+            for bucket in (
+                "io",
+                "decode_scx1",
+                "decode_generic",
+                "reduction",
+                "marshalling",
+            ):
+                st = snap.get(bucket) or {}
+                extras[f"{prefix}_{bucket}_ms"] = float(st.get("ms", 0.0))
+                extras[f"{prefix}_{bucket}_count"] = float(st.get("count", 0))
+                extras[f"{prefix}_{bucket}_bytes"] = float(st.get("bytes", 0))
+        except Exception as e:  # pragma: no cover - diagnostics only
+            logger.warning("cpu_profile_capture snapshot failed: %s", e)
 
 
 @dataclass

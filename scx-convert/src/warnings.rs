@@ -121,6 +121,13 @@ pub enum ConvertWarning {
         granted: usize,
         reason: String,
     },
+    /// A caller-supplied export row filter (`export_obs_keep_mask` /
+    /// `export_min_counts`) is active, but this section is read eagerly and
+    /// filtered afterwards rather than streamed. The output is correct; the
+    /// filter simply does not bound peak RSS for this section the way it does
+    /// for `/X`, `obs`, and `/layers`. Matters most on raw-droplet files,
+    /// which are exactly the ones a row filter targets.
+    ExportFilterSectionEager { section: &'static str },
     /// In-memory `from_anndata` ingest detected an obsm / varm / obsp /
     /// varp key whose estimated peak footprint exceeds `memory_budget`.
     /// The shard is still written (no derating); the warning surfaces so
@@ -200,6 +207,7 @@ impl ConvertWarning {
             Self::BitmapSkipped { .. } => "bitmap_skipped",
             Self::Hdf5NotThreadsafe => "hdf5_not_threadsafe",
             Self::ReaderThreadsDerated { .. } => "reader_threads_derated",
+            Self::ExportFilterSectionEager { .. } => "export_filter_section_eager",
             Self::MappingPeakFootprintHigh { .. } => "mapping_peak_footprint_high",
             Self::EagerAssemblyMemoryHigh { .. } => "eager_assembly_memory_high",
             Self::CoercedNulls { .. } => "coerced_nulls",

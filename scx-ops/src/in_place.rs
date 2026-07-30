@@ -21,6 +21,7 @@ use std::path::Path;
 use scx_format_io::catalog::FullCatalog;
 use scx_format_io::header::{FileHeader, HEADER_SIZE};
 use scx_format_io::modality::{ModalityTable, ModalityType};
+use scx_format_io::provenance::{Provenance, ProvenanceEntry};
 use scx_format_io::section::{write_alignment_padding, SectionType};
 
 use crate::checksum::finalize_header_with_checksum;
@@ -223,4 +224,105 @@ pub(crate) fn commit_in_place(
 
     finalize_header_with_checksum(lock, header)?;
     Ok(())
+}
+
+/// Read the existing `Provenance` operations (empty if the file has none).
+///
+/// In-place ops must **append** to the chain, never overwrite it, so every op
+/// that writes a fresh `Provenance` section reads this first. Shared so the
+/// read stays identical across ops.
+pub(crate) fn read_provenance_ops(
+    lock: &mut FileLock,
+    old_catalog: &FullCatalog,
+) -> Result<Vec<ProvenanceEntry>> {
+    if let Some(e) = old_catalog
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::Provenance)
+    {
+        lock.seek(SeekFrom::Start(e.offset))?;
+        let mut buf = vec![0u8; e.length as usize];
+        std::io::Read::read_exact(lock, &mut buf)?;
+        let prov = Provenance::read_from(&mut Cursor::new(&buf), buf.len())?;
+        Ok(prov.operations)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Match a `{prefix}/{key}` or `{prefix}/{key}_shard_{idx}` catalog entry name
+/// against a replaced key.
+///
+/// Uses `rfind("_shard_")` stem extraction rather than a `starts_with` prefix
+/// test, so a key like `pca` does not falsely match the sharded sections of a
+/// distinct key `pca_shard` (`{prefix}/pca_shard_shard_0`).
+pub(crate) fn entry_matches_key(name: &str, prefix: &str, key: &str) -> bool {
+    let Some(rest) = name.strip_prefix(&format!("{prefix}/")) else {
+        return false;
+    };
+    if rest == key {
+        return true; // single, unsharded section: {prefix}/{key}
+    }
+    match rest.rfind("_shard_") {
+        Some(pos) => &rest[..pos] == key, // {prefix}/{key}_shard_{idx}
+        None => false,
+    }
+}
+
+/// Match a **layer** shard-section name against a layer name.
+///
+/// Legacy (single-modality) layer shards are named `{layer}_shard_{idx}` with
+/// no `{prefix}/`; multimodal ones are `layer/{modality}/{layer}/shard_{idx}`.
+/// The same stem rule applies: a layer named `pca` must not match a distinct
+/// layer named `pca_shard`.
+pub(crate) fn layer_entry_matches(name: &str, layer: &str) -> bool {
+    // Legacy: "{layer}_shard_{idx}".
+    if let Some(pos) = name.rfind("_shard_") {
+        if &name[..pos] == layer {
+            return true;
+        }
+    }
+    // Multimodal: "layer/{modality}/{layer}/shard_{idx}".
+    if let Some(rest) = name.strip_prefix("layer/") {
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() == 3 && parts[1] == layer && parts[2].starts_with("shard_") {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::*;
+
+    #[test]
+    fn entry_matches_key_uses_stem_not_prefix() {
+        assert!(entry_matches_key("obsm/pca", "obsm", "pca"));
+        assert!(entry_matches_key("obsm/pca_shard_0", "obsm", "pca"));
+        // The false-positive class: a distinct key that starts with `pca`.
+        assert!(!entry_matches_key("obsm/pca_shard_shard_0", "obsm", "pca"));
+        assert!(entry_matches_key(
+            "obsm/pca_shard_shard_0",
+            "obsm",
+            "pca_shard"
+        ));
+        assert!(!entry_matches_key("varm/pca", "obsm", "pca"));
+    }
+
+    #[test]
+    fn layer_entry_matches_legacy_and_multimodal() {
+        assert!(layer_entry_matches("cellbender_shard_0", "cellbender"));
+        assert!(layer_entry_matches("cellbender_shard_12", "cellbender"));
+        assert!(layer_entry_matches(
+            "layer/rna/cellbender/shard_0",
+            "cellbender"
+        ));
+        // Distinct layers must not collide.
+        assert!(!layer_entry_matches("cellbender_raw_shard_0", "cellbender"));
+        assert!(!layer_entry_matches("ambient_shard_0", "cellbender"));
+        // A layer literally named `pca_shard` owns `pca_shard_shard_0`.
+        assert!(layer_entry_matches("pca_shard_shard_0", "pca_shard"));
+        assert!(!layer_entry_matches("pca_shard_shard_0", "pca"));
+    }
 }

@@ -85,6 +85,7 @@ from benchmarks.comprehensive.config import (
     RANDOM_SEED,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.runners.accel_runner import cpu_profile_capture
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +292,20 @@ def _extract_shards_decoded(adata: Any, op: str) -> int | None:
     try:
         v = adata.uns["scx_accel"][op]["shards_decoded"]
         return None if v is None else int(v)
+    except Exception:
+        return None
+
+
+def _extract_resident_csr(adata: Any, op: str) -> bool | None:
+    """Read ``adata.uns["scx_accel"][op]["resident_csr"]`` (§9.11 telemetry).
+
+    ``None`` when the route had no residency decision to make (CPU, dense, or
+    a CSC-direct route, which prefilters by column range and never re-decodes)
+    or when the stamp predates the field.
+    """
+    try:
+        v = adata.uns["scx_accel"][op]["resident_csr"]
+        return None if v is None else bool(v)
     except Exception:
         return None
 
@@ -624,11 +639,15 @@ def run(
     for i in range(n_runs):
         gc.collect()
         a = base_adata.copy()
+        # 2.0 ranking oracle: CPU decode/io/reduction/marshalling breakdown
+        # (no-op unless SCX_CPU_PROFILE=1).
+        extras: dict[str, Any] = {}
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
         try:
-            ret = impl(a, groupby, reference)
+            with cpu_profile_capture(extras):
+                ret = impl(a, groupby, reference)
         except Exception as e:
             logger.error("%s run %d raised: %s", key, i + 1, e)
             del a
@@ -636,8 +655,6 @@ def run(
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
-
-        extras: dict[str, Any] = {}
 
         # Record which accelerator route actually ran (read from adata.uns,
         # written by pyscx). `gpu_dispatch_route` is a human-readable string
@@ -660,6 +677,21 @@ def run(
             shards_decoded = _extract_shards_decoded(a, op_key)
             if shards_decoded is not None:
                 extras["shards_decoded"] = float(shards_decoded)
+            if requires_gpu and route.startswith("gpu_csr"):
+                # Numeric gate signal for §9.11 device residency, in the same
+                # shape as `de_route_csc_direct`: 1.0 when the CSR route held
+                # the matrix device-resident across gene chunks, 0.0 on a
+                # *silent* fall back to re-decoding every shard per chunk.
+                #
+                # Only emitted on a CSR route — the CSC-direct route prefilters
+                # by column range and has no residency decision, so scoring it
+                # would be meaningless rather than N/A. Residency is also
+                # correctly declined for a single gene chunk, which at bench
+                # scale (tens of thousands of genes, a 500-gene chunk) never
+                # happens; if a future fixture makes it happen this reads 0.0
+                # and the floor should be revisited rather than the code.
+                resident = _extract_resident_csr(a, op_key)
+                extras["de_route_resident_csr"] = 1.0 if resident else 0.0
             if requires_gpu and kind == "pdex_ref":
                 # Numeric gate signal for the GPU pdex_ref triple. Always
                 # emitted (so the absolute-floor gate never sees a missing

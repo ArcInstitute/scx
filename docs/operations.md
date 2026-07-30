@@ -17,6 +17,7 @@ details, see [docs/format.md](format.md). For sharding details, see
 | **merge** | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
 | **subset** | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** (rebuild via `scx convert --index-obs ...` on the output) |
 | **sort** | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **cellbender-import** (`attach_external_layer`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | **Preserved** (only columns are added; CSR shard ranges are untouched, and the index carries no schema hash) |
 | **rollback** | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored |
 
 ### Restoring CSC after a mutating operation
@@ -187,6 +188,37 @@ In Python: `pyscx.optimize(input, output, codec="auto", shard_obs="auto")`. The
 `"off"|"auto"|"always"` (default `"auto"`), with the same semantics as the CLI
 flags; any other value raises `ValueError`. There is no `force` analogue — pass
 `output == input` for an in-place upgrade, or remove the target first.
+
+## CellBender import
+
+`scx cellbender-import <target.scx> <cellbender_out.h5>` (and
+`pyscx.cellbender_import`) attaches a CellBender `remove-background` output to
+an existing file as a layer, **in place**. It appends new sections at EOF and
+repoints the catalog — the same harness `append` and `modify_metadata` use — so
+`X`, the CSC sidecar, `.raw`, deletion vectors, detection bitmaps and predicate
+indexes all survive, and `scx rollback` undoes the whole import.
+
+The join is by **barcode string, never by row position**. CellBender's
+`<name>_filtered.h5` stores rows in descending-UMI order rather than the input's
+row order, so a positional import would place every cell's corrected counts on
+the wrong barcode while still producing a correctly-shaped layer. Target rows
+absent from the CellBender output become empty layer rows marked
+`cellbender_status = "absent"`, with `null` (not `0.0`) diagnostics.
+
+Because the join is the whole risk surface, `--dry-run` runs every validation
+and the join, prints the match counts, and writes nothing. Use it before
+importing onto a large file.
+
+Emitted alongside the layer: `obs` gets `cellbender_status`,
+`cellbender_cell_probability`, `cellbender_cell_size`,
+`cellbender_droplet_efficiency`, `cellbender_background_fraction`,
+`cellbender_analyzed` and `cellbender_total_counts`; `var` gets
+`cellbender_ambient_expression` and `cellbender_analyzed`; `uns["cellbender"]`
+records the run metadata and the full join report; and a provenance entry is
+appended with the source file's BLAKE3 in `input_checksums`.
+
+Known interaction: `scx subset` currently drops layers, so subset before
+importing rather than after.
 
 ## Rollback
 

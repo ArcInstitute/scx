@@ -5,18 +5,23 @@ Intentionally narrow — mirrors the philosophy of the package-level
 function is typed; everything else falls back to `Any` via the
 trailing `__getattr__`.
 
-`prefer_format: Literal["csr", "csc"] = "csr"` is the explicit
-opt-in surface for the column-major sidecar dispatch. Validation
-lives in the Rust side (`PyValueError` on any other value,
-including `"auto"`).
+`prefer_format` selects the column-major sidecar dispatch. Most ops
+take `Literal["csr", "csc"] = "csr"`; the DE ops (`rank_genes_groups`,
+`pdex_ref`) additionally accept `"auto"` and **default to it** — `"auto"`
+routes CSC-direct on CPU when a valid sidecar is present, else CSR.
+Validation lives on the Rust side (`PyValueError` on any other value;
+non-DE ops still reject `"auto"`).
 """
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
-# Type alias used by every affected entry.
+# Non-DE ops: explicit CSR/CSC opt-in, default CSR.
 PreferFormat = Literal["csr", "csc"]
+# DE ops (rank_genes_groups / pdex_ref): additionally accept the "auto"
+# capability-routed default.
+DePreferFormat = Literal["auto", "csr", "csc"]
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +40,10 @@ def rank_genes_groups(
     min_cells_per_stratum: int = 50,
     rankby_abs: bool = False,
     tie_correct: bool = False,
-    prefer_format: PreferFormat = "csr",
+    prefer_format: DePreferFormat = "auto",
     device: str = "auto",
+    use_raw: bool | None = None,
+    layer: str | None = None,
 ) -> Any: ...
 
 
@@ -114,9 +121,11 @@ def pdex_ref(
     epsilon: float = 1e-9,
     cpm_filter: float | None = None,
     gene_chunk_size: int | None = None,
-    prefer_format: PreferFormat = "csr",
+    prefer_format: DePreferFormat = "auto",
     device: str = "auto",
     output: str = "polars",
+    use_raw: bool | None = None,
+    layer: str | None = None,
 ) -> Any: ...
 
 
@@ -166,6 +175,7 @@ def pca(
     allow_tf32: bool = False,
     spmm_policy: str = "default",
     memory_budget: int | str | None = None,
+    mask_var: Any | None = None,
 ) -> None: ...
 
 
@@ -259,7 +269,7 @@ def harmony_integrate(
     lamb: Any | None = None,
     alpha: float = 0.2,
     max_iter: int = 10,
-    max_iter_kmeans: int = 4,
+    max_iter_kmeans: int = 6,
     epsilon_harmony: float = 1e-2,
     epsilon_kmeans: float = 1e-3,
     block_size: float = 0.05,
@@ -279,6 +289,14 @@ def compute_lisi(
     n_neighbors: int | None = None,
     approximate_knn: bool = False,
 ) -> Any: ...
+
+
+# CPU per-stage timing profiler (io / decode / reduction / marshalling).
+# Buckets are populated only when `SCX_CPU_PROFILE=1` is set at process start.
+def cpu_profile_snapshot() -> dict[str, Any]: ...
+
+
+def cpu_profile_reset() -> None: ...
 
 
 # Catch-all for the rest of `pyscx.accel.*`.

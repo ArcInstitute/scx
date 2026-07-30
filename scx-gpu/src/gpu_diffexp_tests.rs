@@ -1423,3 +1423,265 @@ fn test_combined_tie_term_overflow_regression() {
     let expected = total * total * total - total;
     assert_eq!(got[0], expected);
 }
+
+/// §9.11 commit B: the CSR DE kernels
+/// (`csr_shard_to_gene_major_filtered_kernel`, `csr_shard_pseudobulk_kernel`,
+/// and the currently-unwired v2 `csr_shard_to_gene_major_kernel`) now
+/// binary-search each row down to the `[c0, c1)` window instead of striding the
+/// row's whole nonzero range and predicating per element.
+///
+/// The narrowing is only sound because per-row column indices are strictly
+/// increasing — enforced release-active by `validate_shard_for_gpu_de`. This
+/// pins the equivalence against a host reference over column windows chosen to
+/// hit every edge of the search: before the first column, after the last,
+/// exactly on a stored column, and in the gap between two adjacent ones.
+///
+/// Values are small integers, so the f64 `atomicAdd` pseudobulk fold is exact
+/// regardless of accumulation order and an equality assertion is safe here even
+/// though the kernel is order-nondeterministic in general.
+#[test]
+fn test_csr_gene_major_and_pseudobulk_window_parity() {
+    use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
+    use scx_format_io::ShardSource;
+    use scx_sparse::ScxCsr;
+
+    let dev = require_gpu!();
+
+    struct InMemorySource {
+        shards: Vec<ScxCsr>,
+        n_obs: usize,
+        n_vars: usize,
+    }
+    impl ShardSource for InMemorySource {
+        fn n_shards(&self) -> usize {
+            self.shards.len()
+        }
+        fn n_obs(&self) -> usize {
+            self.n_obs
+        }
+        fn n_vars(&self) -> usize {
+            self.n_vars
+        }
+        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
+            Ok(self.shards[shard_idx].clone())
+        }
+    }
+
+    // 12 columns. Row column sets are deliberately gappy so a window can fall
+    // strictly between two stored columns, and one row is empty so the search
+    // runs on an empty range.
+    let n_vars = 12usize;
+    let shard0 = ScxCsr::new_unchecked(
+        (3, n_vars),
+        vec![0i64, 4, 4, 7],
+        //  row 0: cols 0, 3, 6, 11   row 1: (empty)   row 2: cols 2, 5, 9
+        vec![0i32, 3, 6, 11, 2, 5, 9],
+        vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+    );
+    let shard1 = ScxCsr::new_unchecked(
+        (2, n_vars),
+        vec![0i64, 2, 5],
+        //  row 3: cols 1, 10   row 4: cols 0, 1, 2
+        vec![1i32, 10, 0, 1, 2],
+        vec![8.0f32, 9.0, 10.0, 11.0, 12.0],
+    );
+    let shards = vec![shard0, shard1];
+    let n_obs = 5usize;
+    let src = InMemorySource {
+        shards: shards.clone(),
+        n_obs,
+        n_vars,
+    };
+
+    // Two groups over the 5 cells; cell 4 belongs to neither (group id -1), so
+    // the kernels' whole-block early exits are exercised too.
+    let cell_to_group: Vec<i32> = vec![0, 0, 1, 1, -1];
+    let cell_to_pos: Vec<i32> = vec![0, 1, 0, 1, -1];
+    let n_perm = 2usize; // both groups have two members
+    let cell_to_group_dev = dev.htod_copy(&cell_to_group).unwrap();
+    let cell_to_pos_dev = dev.htod_copy(&cell_to_pos).unwrap();
+    let n_groups = 2usize;
+
+    // The v2 gene-major scatter takes a single `cell_to_pool` map (-1 = not in
+    // the pool) rather than the group+pos pair. It has no production caller
+    // today but is still exported from scx-gpu and received the identical
+    // windowing rewrite, so it is covered here rather than left as an untested
+    // change waiting for a future wire-up to inherit.
+    let cell_to_pool: Vec<i32> = vec![0, 1, -1, -1, -1];
+    let cell_to_pool_dev = dev.htod_copy(&cell_to_pool).unwrap();
+    let n_pool = 2usize;
+
+    // Host references, written the pre-windowing way (linear scan + predicate)
+    // so the assertion compares the new kernel against the old formulation.
+    let host_slab = |c0: usize, c1: usize, group: i32| -> Vec<f32> {
+        let sz = c1 - c0;
+        let mut slab = vec![0.0f32; sz * n_perm];
+        let mut global_row = 0usize;
+        for shard in &shards {
+            for r in 0..shard.n_rows() {
+                let cell = global_row + r;
+                if cell_to_group[cell] != group {
+                    continue;
+                }
+                let pos = cell_to_pos[cell] as usize;
+                for k in shard.indptr[r] as usize..shard.indptr[r + 1] as usize {
+                    let col = shard.indices[k] as usize;
+                    if col >= c0 && col < c1 {
+                        slab[(col - c0) * n_perm + pos] = shard.data[k];
+                    }
+                }
+            }
+            global_row += shard.n_rows();
+        }
+        slab
+    };
+    let host_sums = |c0: usize, c1: usize| -> Vec<f64> {
+        let sz = c1 - c0;
+        let mut sums = vec![0.0f64; n_groups * sz];
+        let mut global_row = 0usize;
+        for shard in &shards {
+            for r in 0..shard.n_rows() {
+                let cell = global_row + r;
+                let g = cell_to_group[cell];
+                if g < 0 {
+                    continue;
+                }
+                for k in shard.indptr[r] as usize..shard.indptr[r + 1] as usize {
+                    let col = shard.indices[k] as usize;
+                    if col >= c0 && col < c1 {
+                        sums[g as usize * sz + (col - c0)] += shard.data[k] as f64;
+                    }
+                }
+            }
+            global_row += shard.n_rows();
+        }
+        sums
+    };
+
+    // Host reference for the v2 pool scatter, again written the pre-windowing
+    // way (linear scan + predicate).
+    let host_pool_slab = |c0: usize, c1: usize| -> Vec<f32> {
+        let sz = c1 - c0;
+        let mut slab = vec![0.0f32; sz * n_pool];
+        let mut global_row = 0usize;
+        for shard in &shards {
+            for r in 0..shard.n_rows() {
+                let pos = cell_to_pool[global_row + r];
+                if pos < 0 {
+                    continue;
+                }
+                for k in shard.indptr[r] as usize..shard.indptr[r + 1] as usize {
+                    let col = shard.indices[k] as usize;
+                    if col >= c0 && col < c1 {
+                        slab[(col - c0) * n_pool + pos as usize] = shard.data[k];
+                    }
+                }
+            }
+            global_row += shard.n_rows();
+        }
+        slab
+    };
+
+    let run_case = |c0: usize, c1: usize| {
+        let sz = c1 - c0;
+        let mut gpu_src = RawGpuShardSource::new(&dev, &src).unwrap();
+        let mut pool_slab = dev.alloc_zeros::<f32>(sz * n_pool).unwrap();
+        let mut slab0 = dev.alloc_zeros::<f32>(sz * n_perm).unwrap();
+        let mut slab1 = dev.alloc_zeros::<f32>(sz * n_perm).unwrap();
+        let mut sums = dev.alloc_zeros::<f64>(n_groups * sz).unwrap();
+
+        let mut global_row = 0usize;
+        gpu_src
+            .for_each_gpu_shard(|_idx, slot| {
+                let view = slot.view();
+                let n_rows = view.shape.0;
+                crate::gpu_diffexp::gpu_de_scatter_csr_to_gene_major_filtered(
+                    &dev,
+                    &view,
+                    &cell_to_group_dev,
+                    &cell_to_pos_dev,
+                    0,
+                    &mut slab0,
+                    global_row,
+                    n_perm,
+                    sz,
+                    c0,
+                    c1,
+                )?;
+                crate::gpu_diffexp::gpu_de_scatter_csr_to_gene_major_filtered(
+                    &dev,
+                    &view,
+                    &cell_to_group_dev,
+                    &cell_to_pos_dev,
+                    1,
+                    &mut slab1,
+                    global_row,
+                    n_perm,
+                    sz,
+                    c0,
+                    c1,
+                )?;
+                crate::gpu_diffexp::gpu_de_pseudobulk_csr_direct(
+                    &dev,
+                    &view,
+                    &cell_to_group_dev,
+                    &mut sums,
+                    global_row,
+                    sz,
+                    c0,
+                    c1,
+                    0, // ArithRaw: f(x) = x
+                )?;
+                crate::gpu_diffexp::gpu_de_scatter_shard_to_gene_major(
+                    &dev,
+                    &view,
+                    &cell_to_pool_dev,
+                    &mut pool_slab,
+                    global_row,
+                    n_pool,
+                    sz,
+                    c0,
+                    c1,
+                )?;
+                global_row += n_rows;
+                Ok(())
+            })
+            .unwrap();
+        dev.synchronize().unwrap();
+
+        assert_eq!(
+            dev.dtoh_copy(&slab0).unwrap(),
+            host_slab(c0, c1, 0),
+            "gene-major slab (group 0) mismatch for [{c0}, {c1})"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&slab1).unwrap(),
+            host_slab(c0, c1, 1),
+            "gene-major slab (group 1) mismatch for [{c0}, {c1})"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&sums).unwrap(),
+            host_sums(c0, c1),
+            "pseudobulk sums mismatch for [{c0}, {c1})"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&pool_slab).unwrap(),
+            host_pool_slab(c0, c1),
+            "v2 pool gene-major slab mismatch for [{c0}, {c1})"
+        );
+    };
+
+    run_case(0, n_vars); // whole row: window == [start, end)
+    run_case(0, 1); // exactly the first stored column of row 0 / row 4
+    run_case(11, 12); // exactly the last stored column of row 0
+    run_case(4, 5); // gap for row 0 (3 then 6) but a hit for row 2 (5)
+    run_case(7, 9); // strictly between stored columns for every row → empty
+    run_case(3, 7); // straddles a chunk boundary in the middle of several rows
+    run_case(2, 3); // single column, single contributing row
+                    // Every gene chunk a real driver would produce, at chunk_size 5 — the
+                    // trailing chunk is short, which is where an off-by-one in the upper bound
+                    // would surface.
+    for c0 in (0..n_vars).step_by(5) {
+        run_case(c0, (c0 + 5).min(n_vars));
+    }
+}

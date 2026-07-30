@@ -9,6 +9,10 @@ use scx_sparse::{ScxCsc, ScxCsr};
 
 use super::*;
 
+#[cfg(test)]
+#[path = "shard_source_tests.rs"]
+mod tests;
+
 /// Shard source that applies lazy transforms per-shard.
 ///
 /// Enables streaming PCA (and other shard-by-shard algorithms) on
@@ -24,6 +28,9 @@ pub(crate) struct LazyShardSource {
     kept_to_global: Option<Arc<Vec<u64>>>,
     col_projection: Option<Arc<Vec<u32>>>,
     shape_val: (usize, usize),
+    /// Serve shard decodes from the reader's decoded-shard LRU instead of
+    /// decoding fresh every time. See [`Self::with_cached_reads`].
+    cached_reads: bool,
 }
 
 impl LazyShardSource {
@@ -47,6 +54,36 @@ impl LazyShardSource {
             kept_to_global,
             col_projection,
             shape_val: (n_obs, n_vars),
+            cached_reads: false,
+        }
+    }
+
+    /// Serve shard decodes from the wrapped reader's decoded-shard LRU.
+    ///
+    /// **Multi-pass kernels must opt in.** Out-of-core PCA makes ~6–7 passes
+    /// over every shard; without this the source decodes through
+    /// `read_shard_uncached`, which also `MADV_DONTNEED`s the shard bytes, so
+    /// each pass re-faults *and* re-decodes. Opting in also republishes the
+    /// reader's [`shard_cache_capacity`], which is what feeds the
+    /// undersized-cache warning and makes `pca(memory_budget=…)` /
+    /// `ensure_cache_capacity` mean anything.
+    ///
+    /// Off by default: single-pass streaming callers (HVG, `score_genes`,
+    /// `pflog`) visit each shard once, where the LRU is pure overhead and the
+    /// `MADV_DONTNEED` is a win.
+    ///
+    /// [`shard_cache_capacity`]: scx_format_io::ShardSource::shard_cache_capacity
+    pub(crate) fn with_cached_reads(mut self) -> Self {
+        self.cached_reads = true;
+        self
+    }
+
+    /// Decode one shard, honouring [`Self::with_cached_reads`].
+    fn decode_shard(&self, shard_idx: usize) -> scx_format_io::Result<Arc<ScxCsr>> {
+        if self.cached_reads {
+            self.backed.read_shard_cached_arc(shard_idx)
+        } else {
+            Ok(Arc::new(self.backed.read_shard_uncached(shard_idx)?))
         }
     }
 
@@ -71,6 +108,7 @@ impl LazyShardSource {
             kept_to_global,
             col_projection,
             shape_val: (n_obs, n_vars),
+            cached_reads: false,
         }
     }
 
@@ -106,55 +144,133 @@ impl scx_format_io::ShardSource for LazyShardSource {
         }
     }
 
-    /// Row counts are unchanged by transforms and column projection — delegate
-    /// to the wrapped reader's O(1) implementation.
+    /// An **upper bound**, not the exact visible maximum.
+    ///
+    /// Transforms and column projection leave row counts alone, so this
+    /// delegates to the wrapped reader's O(1) value — but `kept_to_global`
+    /// *shrinks* them, and this does not account for that. Safe because every
+    /// consumer sizes scratch/staging buffers with it (GPU pinned slots,
+    /// covariance densification), where over-estimating costs memory, not
+    /// correctness. Do not treat it as exact.
     fn max_shard_rows(&self) -> scx_format_io::Result<usize> {
         self.backed.max_shard_rows()
     }
 
+    /// Forwarded from the wrapped reader's catalog statistics, for the same
+    /// reason and with the same caveat as [`Self::max_shard_rows`]: transforms
+    /// and column projection cannot raise either figure and `kept_to_global`
+    /// only lowers them, so the on-disk numbers stay valid **upper bounds** —
+    /// which is exactly what the contract promises. `None` when the catalog
+    /// carries no stats block; a consumer must read that as "unknown", never as
+    /// zero.
+    fn shard_size_hint(&self) -> Option<scx_format_io::ShardSizeHint> {
+        scx_format_io::ShardSource::shard_size_hint(&*self.backed)
+    }
+
     fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
-        let (s_start, _) = self.backed.index().shard_range(shard_idx).ok_or_else(|| {
+        // `read_shard_arc` owns the pipeline. When nothing else holds the Arc
+        // (the uncached path, or any path that derived a fresh CSR) this
+        // unwraps for free; only a passthrough hit on the shared LRU copies.
+        let arc = self.read_shard_arc(shard_idx)?;
+        Ok(Arc::try_unwrap(arc).unwrap_or_else(|shared| (*shared).clone()))
+    }
+
+    /// Decode → transforms → column projection → deletion vector.
+    ///
+    /// Overridden (rather than left to the trait default, which wraps
+    /// `read_shard`) so multi-pass kernels reach the reader's decoded-shard
+    /// LRU through [`LazyShardSource::with_cached_reads`]. Each stage that
+    /// applies produces an owned CSR and the next reads from it; stages that
+    /// don't apply are skipped, so a source with no transforms and no view
+    /// hands the cached `Arc` straight back with no copy at all.
+    fn read_shard_arc(&self, shard_idx: usize) -> scx_format_io::Result<Arc<ScxCsr>> {
+        let (s_start, s_end) = self.backed.index().shard_range(shard_idx).ok_or_else(|| {
             scx_format_io::ScxError::ShardIndexOutOfBounds {
                 index: shard_idx,
                 count: self.backed.index().n_shards(),
             }
         })?;
-        let global_row = s_start as usize;
 
-        let mut csr = self.backed.read_shard_uncached(shard_idx)?;
-        apply_transforms_to_csr(&self.transforms, &mut csr, global_row);
+        let mut decoded = Some(self.decode_shard(shard_idx)?);
 
-        // Apply column projection (remap column indices to projected space)
-        if let Some(ref cols) = self.col_projection {
-            csr = scx_engine::projection::project_csr(&csr, cols);
+        // Transforms mutate in place, so they are the one stage that needs its
+        // own buffer up front. `try_unwrap` is what decides whether that costs a
+        // copy: on the uncached path the decode just built a refcount-1 `Arc`
+        // and this takes ownership for free, while a hit on the shared LRU
+        // legitimately clones — mutating the cached shard would corrupt it for
+        // every other reader.
+        let mut current: Option<ScxCsr> = if self.transforms.is_empty() {
+            None
+        } else {
+            let arc = decoded.take().expect("decoded is Some until moved here");
+            let mut owned = Arc::try_unwrap(arc).unwrap_or_else(|shared| (*shared).clone());
+            apply_transforms_to_csr(&self.transforms, &mut owned, s_start as usize);
+            Some(owned)
+        };
+
+        // Column projection: remap column indices into projected space.
+        if let Some(cols) = &self.col_projection {
+            let projected = {
+                let src = current.as_ref().unwrap_or_else(|| {
+                    decoded
+                        .as_deref()
+                        .expect("decoded survives when untransformed")
+                });
+                scx_engine::projection::project_csr(src, cols)
+            };
+            current = Some(projected);
         }
 
-        // Apply deletion vector: filter to only kept rows within this shard
-        if let Some(ref kept) = self.kept_to_global {
-            let (s_start, s_end) = self.backed.index().shard_range(shard_idx).unwrap();
-            let lo = kept.partition_point(|&r| r < s_start);
-            let hi = kept.partition_point(|&r| r < s_end);
-            if hi > lo {
-                let local_rows: Vec<usize> = kept[lo..hi]
-                    .iter()
-                    .map(|&g| (g - s_start) as usize)
-                    .collect();
-                csr = extract_local_rows(&csr, &local_rows);
-            } else {
-                // No kept rows in this shard — return empty
-                let n_projected = self
-                    .col_projection
-                    .as_ref()
-                    .map_or(self.shape_val.1, |c| c.len());
-                csr = ScxCsr::new_unchecked((0, n_projected), vec![0], vec![], vec![]);
-            }
+        // Deletion vector: keep only this shard's visible rows.
+        if let Some(kept) = &self.kept_to_global {
+            let filtered = {
+                let src = current.as_ref().unwrap_or_else(|| {
+                    decoded
+                        .as_deref()
+                        .expect("decoded survives when untransformed")
+                });
+                let lo = kept.partition_point(|&r| r < s_start);
+                let hi = kept.partition_point(|&r| r < s_end);
+                if hi > lo {
+                    let local_rows: Vec<usize> = kept[lo..hi]
+                        .iter()
+                        .map(|&g| (g - s_start) as usize)
+                        .collect();
+                    extract_local_rows(src, &local_rows)
+                } else {
+                    // No kept rows in this shard — return empty.
+                    let n_projected = self
+                        .col_projection
+                        .as_ref()
+                        .map_or(self.shape_val.1, |c| c.len());
+                    ScxCsr::new_unchecked((0, n_projected), vec![0], vec![], vec![])
+                }
+            };
+            current = Some(filtered);
         }
 
-        Ok(csr)
+        Ok(match current {
+            Some(derived) => Arc::new(derived),
+            // Untouched by every stage — hand the decoded `Arc` straight back.
+            None => decoded.expect("no stage applied, so decoded was never taken"),
+        })
+    }
+
+    /// Republish the wrapped reader's LRU capacity, but only when this source
+    /// actually reads through it. Reporting `Some(..)` on the uncached path
+    /// would tell a multi-pass kernel its working set is cached when every
+    /// `read_shard_arc` re-decodes.
+    fn shard_cache_capacity(&self) -> Option<usize> {
+        if self.cached_reads {
+            scx_format_io::ShardSource::shard_cache_capacity(self.backed.as_ref())
+        } else {
+            None
+        }
     }
 
     // col_means_and_sum_sq: use the default trait impl which iterates
-    // read_shard() — transforms and col_projection are applied per-shard.
+    // read_shard_arc() — transforms and col_projection are applied per-shard,
+    // and the cached path is shared.
 }
 
 /// Apply column-local transforms in-place on a decoded CSC shard.

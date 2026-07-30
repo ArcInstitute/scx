@@ -479,6 +479,39 @@ scanpy script. Each is documented in full in `docs/scanpy.md`.
 - **Backed-mode preprocessing is lazy on CPU, eager on GPU.** CPU wraps `X` in a
   lazy transform; GPU streams through a fused kernel and materializes a scipy
   CSR. See [docs/scanpy.md § Lazy vs eager preprocessing](scanpy.md#lazy-vs-eager-preprocessing).
+- **`pct_counts_<qc_var>` changed on lazy input.** After a lazy
+  `normalize_total`, `calculate_qc_metrics` now takes the `qc_var` subset sums
+  *through* the transform chain, so the ratio divides a transformed numerator by
+  a transformed denominator. It previously used a pre-transform numerator, which
+  could be off by more than 2×. There is **no runtime signal** for this: a
+  pipeline that filters on `pct_counts_mt` after a lazy normalize will keep and
+  drop different cells than it did before. Re-check any thresholds tuned against
+  older output.
+- **Row-axis aggregations on a projected lazy `X` changed.** They used to sum the
+  full physical width: after `filter_genes` (or any column projection) on a lazy
+  dataset, `adata.X.sum(axis=1)` included the genes that had just been removed,
+  and `adata.X.mean(axis=1)` divided that physical-width sum by the *visible*
+  column count. `filter_cells` on a lazy dataset thresholded the same
+  physical-width totals. All of them now cover only the visible genes, matching
+  `adata.obs["total_counts"]` and scanpy on the sliced object. There is **no
+  runtime signal** for the change — a pipeline that filtered cells after a lazy
+  `filter_genes` will now keep and drop different cells. Re-check thresholds
+  tuned against older output. (`getnnz` was already projection-aware, and the
+  backed — non-lazy — dunders were already correct.)
+- **`adata[:, mask]` on a backed AnnData used to raise.** anndata had no view
+  registration for an SCX handle, so the var axis was unreachable through the
+  public API — including `sc.pp.filter_genes`, which calls
+  `adata._inplace_subset_var`. It now works: `adata[:, mask]` is a lazy view,
+  `adata[:, mask].copy()` materializes, and the backed filter ops subset `raw`
+  and drop unused categorical levels like scanpy does. See [docs/api.md § Axis
+  subsetting and aligned
+  members](api.md#axis-subsetting-and-aligned-members).
+- **A backed axis subset now deep-copies `uns`.** anndata builds the replacement
+  object with `deepcopy(uns)`, so an entry that cannot be deep-copied — a lock,
+  an open file handle, a live client — makes `filter_cells` / `filter_genes`
+  raise `TypeError` where the older backed path silently left `uns` alone. This
+  matches what an in-memory AnnData has always done. Keep non-copyable objects
+  out of `uns`, or drop them before filtering.
 
 ## Errors you might see
 

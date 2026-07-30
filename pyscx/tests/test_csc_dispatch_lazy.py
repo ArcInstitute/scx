@@ -35,6 +35,24 @@ def small_adata():
     return adata
 
 
+def _wide_adata():
+    """60x40 counts — wide enough that a real gene cut still fits loess.
+
+    `small_adata` is 40x16, which cannot be both narrowed (so a column
+    projection exists at all) and left loess-viable for `seurat_v3`.
+    """
+    import anndata as ad
+
+    rng = np.random.default_rng(11)
+    mat = sp.random(60, 40, density=0.4, format="csr", dtype=np.float32, random_state=rng)
+    mat.data = (mat.data * 50).astype(np.float32).round() + 1.0
+    adata = ad.AnnData(X=mat)
+    adata.obs["cell_id"] = [f"c{i}" for i in range(60)]
+    adata.obs["group"] = ["A"] * 30 + ["B"] * 30
+    adata.var["gene_id"] = [f"g{i}" for i in range(40)]
+    return adata
+
+
 def _open_with_csc(path, adata):
     import pyscx
 
@@ -94,7 +112,10 @@ def test_lazy_normalize_total_csr_works(small_adata, tmp_path):
     import pyscx
 
     a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
-    pyscx.accel.normalize_total(a_csc)
+    # Pin target_sum explicitly: the streaming-vs-materialized equality below is
+    # magnitude-sensitive at atol=1e-5, and the default is now None→median (a
+    # small target on integer counts), which tips two genes over the tolerance.
+    pyscx.accel.normalize_total(a_csc, target_sum=1e4)
 
     # CSR path on a lazy NormalizeTotal chain currently goes through
     # the dunder methods on the lazy wrapper (the col_sums pyfunction
@@ -153,24 +174,33 @@ def test_lazy_csc_with_col_projection_hvg_matches_csr(small_adata, tmp_path):
     """
     import pyscx
 
-    a_csr = _open_with_csc(tmp_path / "with_csc_csr.scx", small_adata)
-    a_csc = _open_with_csc(tmp_path / "with_csc_csc.scx", small_adata)
+    # Deliberately not `small_adata` (40x16): its least-detected gene appears in
+    # 10 of 40 cells, so the original `min_cells=3` kept all 16 — and once
+    # `filter_genes` learned to skip an all-kept mask outright, this test lost
+    # the projection that is its entire subject. Narrowing 16 genes far enough
+    # to cut leaves too few for the seurat_v3 loess fit ("Chernobyl! trL>n"), so
+    # the fixture is widened here instead: 60x40 with `min_cells=22` keeps 34,
+    # a strict subset spanning several `csc_cols_per_shard=4` shards and still
+    # comfortably loess-viable.
+    wide = _wide_adata()
+    a_csr = _open_with_csc(tmp_path / "with_csc_csr.scx", wide)
+    a_csc = _open_with_csc(tmp_path / "with_csc_csc.scx", wide)
 
     pyscx.accel.log1p(a_csr)
     pyscx.accel.log1p(a_csc)
 
-    pyscx.accel.filter_genes(a_csr, min_cells=3)
-    pyscx.accel.filter_genes(a_csc, min_cells=3)
+    n_before = a_csc.n_vars
+    pyscx.accel.filter_genes(a_csr, min_cells=22)
+    pyscx.accel.filter_genes(a_csc, min_cells=22)
 
     n_proj = a_csc.X.shape[1]
-    # The bug only fires when the projection spans at least two CSC
-    # shards. csc_cols_per_shard=4, so we need projected indices that
-    # fall in different shards. With min_cells=3 on the seeded fixture,
-    # the projection covers multiple shards by construction; assert as
-    # a guard against fixture drift.
-    assert n_proj >= 4, (
-        f"projection too narrow ({n_proj}); test won't exercise multi-shard "
-        f"col_projection. Adjust min_cells or fixture seed."
+    # The bug only fires when the projection spans at least two CSC shards.
+    # `csc_cols_per_shard=4`, so the projection must be both a strict subset
+    # (otherwise there is no projection at all) and wide enough to cross a
+    # shard boundary.
+    assert 4 <= n_proj < n_before, (
+        f"projection is {n_proj}/{n_before}; the test needs a strict subset "
+        "spanning multiple CSC shards. Adjust min_cells or the fixture seed."
     )
 
     n_top = max(2, min(5, n_proj - 1))

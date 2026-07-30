@@ -70,11 +70,38 @@ This row is informative — Python 3.13 is not yet exercised in CI, but
 the maintainer's environment treats it as a known-good point inside the
 declared bounds.
 
+## Private anndata APIs pyscx depends on
+
+`pyscx.accel.filter_cells` / `filter_genes` / `subset_obs` / `subset_var` and
+`highly_variable_genes(subset=True)` let **anndata** perform the axis subset, so
+that `obs` / `var` / `uns` / `raw` / categoricals / every aligned member behave
+exactly as they do in scanpy. Making that possible on a backed `X` means
+registering with three private `singledispatch` hooks and driving two private
+`AnnData` methods. The names below are private and unversioned; a rename inside
+the declared bound would surface as an `AttributeError` or a
+`NotImplementedError` from inside a user's `filter_genes`.
+
+| Name | Used for |
+|---|---|
+| `anndata._core.views.as_view` | Register SCX handles as their own view type — a handle is already a lazy window |
+| `anndata._core.index._subset` | Register a lazy clone with the row/column window composed, so a subset never materializes |
+| `anndata._core.file_backing.to_memory` | Register `handle.to_memory()`, so `AnnData.to_memory()` reaches inside |
+| `AnnData._mutated_copy`, `._init_as_actual` | Build the subset object and swap it in, substituting the un-copied `view.X` for `AnnData.copy()`'s materializing `.copy()` |
+| `AnnData._inplace_subset_obs`, `._inplace_subset_var` | Delegate the whole subset for an in-memory `X` |
+| `AnnData._layers`, `._obsm`, `._varm`, `._obsp`, `._varp` | Detach the lazy mapping bridges for the duration of the subset, so reading them cannot decode a section off disk |
+
+`pyscx/tests/test_anndata_hooks_compat.py` asserts every name above resolves,
+that each hook is still a `singledispatch` with all four SCX handle classes
+registered, and that `AnnData.X` on a view still resolves through `_subset`
+without copying — one assertion per name, so an upgrade names its casualty.
+Verified across `0.11.4` / `0.12.10` / `0.12.16`.
+
 ## Known incompatibilities
 
 - **`anndata >= 0.13`** — Out of the declared bound. The `0.13` line is
   expected to drop the legacy `AnnData(filename=...)` constructor path
-  that `pyscx.from_anndata` still uses; revisit when `0.13` ships.
+  that `pyscx.from_anndata` still uses; revisit when `0.13` ships. It is
+  also the release most likely to move the private names above.
 - **`pyarrow >= 24`** — Out of the declared bound. Bump after running
   the `pyscx/tests/test_to_anndata_integration.py` suite locally on the
   new release; pyarrow's `RecordBatch` API has been stable, but the cap

@@ -139,7 +139,23 @@ fn sparse_outer_product_accumulate(csr: &ScxCsr, col_sums: &mut [f64], cov: &mut
 /// reduced by element-wise addition.
 fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>, Vec<f64>) {
     let n_rows = csr.n_rows();
-    let chunk_size = (n_rows / rayon::current_num_threads()).max(256);
+    // Bound peak memory: each parallel fold segment allocates a full
+    // n_vars×n_vars f64 accumulator (n_vars²·8 bytes). rayon `fold` produces one
+    // accumulator per segment, and `with_min_len(L)` caps segments at n_rows/L,
+    // so sizing the segment length by the budget-derived worker count limits the
+    // number of concurrent accumulators — the same guarantee the streaming
+    // covariance path gets from `cov_accumulator_workers` (previously this
+    // in-memory path used the full thread count, so peak scaled with cores).
+    let max_threads = rayon::current_num_threads().max(1);
+    // `.max(1)` is defensive: cov_accumulator_workers already floors at 1, but
+    // guard the `n_rows / workers` divisor against any future 0-return.
+    // The shared `SCX_ACCEL_NUM_THREADS` ceiling lowers the segment count here
+    // too (when set), so the knob covers both the streaming and in-memory
+    // covariance accumulators; unset → the memory-derived cap is unchanged.
+    let workers = cov_accumulator_workers(n_vars, cov_memory_budget(), max_threads)
+        .min(crate::mem_budget::accel_num_threads().unwrap_or(usize::MAX))
+        .max(1);
+    let chunk_size = (n_rows / workers).max(256);
 
     (0..n_rows)
         .into_par_iter()
@@ -199,6 +215,27 @@ fn cov_memory_budget() -> u64 {
     }
 }
 
+/// Decode-prefetch depth for the streaming PCA passes.
+///
+/// The shared [`prefetch_depth`](crate::prefetch::prefetch_depth) —
+/// `SCX_ACCEL_PREFETCH_DEPTH`, default 4, already capped by the rayon pool
+/// width — additionally lowered by `SCX_ACCEL_NUM_THREADS` when that is set.
+///
+/// PCA is the only accelerator with two *private* rayon pools **and** a
+/// user-visible thread cap. Both pools already honour `SCX_ACCEL_NUM_THREADS`
+/// (see [`accumulate_covariance_streaming`] and
+/// [`sparse_outer_product_accumulate_par`]); leaving decode-prefetch outside it
+/// would quietly stop that knob from bounding PCA's concurrency at all.
+///
+/// `pyscx` calls this too, to size the slice of `pca(memory_budget=…)` it must
+/// reserve for decoded-but-unconsumed shards — the two have to agree, so there
+/// is exactly one definition.
+pub fn pca_prefetch_depth() -> usize {
+    crate::prefetch::prefetch_depth()
+        .min(crate::mem_budget::accel_num_threads().unwrap_or(usize::MAX))
+        .max(1)
+}
+
 /// Number of concurrent covariance accumulators that fit in `budget` bytes,
 /// clamped to `[1, max_threads]`. Each accumulator is one `n_vars × n_vars` f64
 /// matrix (`n_vars² × 8` bytes). Mirrors the worker-deration arithmetic used by
@@ -223,14 +260,24 @@ fn cov_accumulator_workers(n_vars: usize, budget: u64, max_threads: usize) -> us
 /// `n_obs` — while avoiding the per-shard accumulator reallocation of a naive
 /// `fold`-per-shard loop. Like the accumulators above, only the lower triangle is
 /// written (the eigensolver reads `Side::Lower`).
-fn accumulate_covariance_streaming<S: ShardSource>(
+///
+/// Shards arrive through the bounded ordered decode-prefetch pipeline at
+/// `depth`, so up to `depth` decode on the **global** rayon pool while the
+/// accumulation runs on this function's own memory-bounded private pool. The
+/// two pools are disjoint sets of OS threads, and the pipeline's live set is
+/// capped by its channel capacity, so a decode worker can never park while the
+/// calling thread is blocked inside `pool.install`.
+fn accumulate_covariance_streaming<S: ShardSource + Sync + ?Sized>(
     source: &S,
     n_vars: usize,
+    depth: usize,
 ) -> Result<(Mat<f64>, Vec<f64>)> {
-    let n_shards = source.n_shards();
     let max_threads = rayon::current_num_threads();
     let budget = cov_memory_budget();
-    let workers = cov_accumulator_workers(n_vars, budget, max_threads);
+    // Memory-derived worker cap, lowered further by the shared
+    // `SCX_ACCEL_NUM_THREADS` policy when set (unset → no change).
+    let workers = cov_accumulator_workers(n_vars, budget, max_threads)
+        .min(crate::mem_budget::accel_num_threads().unwrap_or(usize::MAX));
     if workers < max_threads {
         log::debug!(
             "covariance_pca: capping accumulator workers to {workers} of {max_threads} \
@@ -248,17 +295,18 @@ fn accumulate_covariance_streaming<S: ShardSource>(
         .map_err(|e| AccelError::InvalidInput(format!("rayon thread pool: {e}")))?;
 
     // Per-thread accumulators, reused across every shard (≤ `workers` of them).
-    // Shards are read sequentially on the calling thread; only the per-row
-    // accumulation runs in the bounded pool, so `S` need not be `Sync`.
+    // Only the per-row accumulation runs in the bounded private pool; decode
+    // happens on the global pool ahead of the consume closure.
     let mut tls: ThreadLocal<RefCell<(Mat<f64>, Vec<f64>)>> = ThreadLocal::new();
 
-    for shard_idx in 0..n_shards {
-        // Cached read (T4.4): each pass decodes a shard once when the budget allows.
-        let csr = source.read_shard_arc(shard_idx)?;
+    crate::prefetch::for_each_shard_ordered(source, depth, |_shard_idx, csr| {
         let n_rows = csr.n_rows();
         if n_rows == 0 {
-            continue;
+            return Ok(());
         }
+        // Bind the reduction guard only for shards that actually accumulate, so
+        // empty shards don't inflate the reduction call count.
+        let _r = scx_format_io::reduction_guard();
         let chunk_size = (n_rows / workers.max(1)).max(256);
         let csr_ref = &csr;
         let tls_ref = &tls;
@@ -293,7 +341,8 @@ fn accumulate_covariance_streaming<S: ShardSource>(
                     }
                 });
         });
-    }
+        Ok(())
+    })?;
 
     // Reduce the thread-local lower triangles + column sums into the result.
     let mut cov = Mat::<f64>::zeros(n_vars, n_vars);
@@ -356,7 +405,7 @@ fn thin_svd_decomp(mat: &Mat<f64>) -> Result<(Mat<f64>, Vec<f64>, Mat<f64>)> {
 /// * `n_power_iterations` — Power iterations for spectral accuracy (default: 2)
 /// * `zero_center` — Whether to mean-center the data (default: true)
 /// * `seed` — Random seed for reproducibility
-pub fn randomized_pca<S: ShardSource>(
+pub fn randomized_pca<S: ShardSource + Sync + ?Sized>(
     source: &S,
     n_components: usize,
     n_oversamples: usize,
@@ -364,13 +413,49 @@ pub fn randomized_pca<S: ShardSource>(
     zero_center: bool,
     seed: u64,
 ) -> Result<PcaResult> {
+    // Resolved once for the whole run: every pass below shares one depth, and
+    // `pyscx` reserves the matching slice of `memory_budget` from the same fn.
+    randomized_pca_with_depth(
+        source,
+        n_components,
+        n_oversamples,
+        n_power_iterations,
+        zero_center,
+        seed,
+        pca_prefetch_depth(),
+    )
+}
+
+/// [`randomized_pca`] with an explicit decode-prefetch depth.
+///
+/// **The resource-explicit entry point.** `depth` is how many decoded shards the
+/// pipeline may hold at once, so it is a memory knob: a binding that has a byte
+/// budget (pyscx's `pca(memory_budget=…)`) resolves the depth against it and
+/// passes the result here, instead of letting the process-wide default apply to
+/// a path whose footprint it never sized. [`randomized_pca`] is the convenience
+/// wrapper that takes [`pca_prefetch_depth`].
+///
+/// Also what lets the equivalence tests A/B depth 1 against depth 4 **in one
+/// process** — [`prefetch_depth`](crate::prefetch::prefetch_depth) is a
+/// `OnceLock`, so the environment knob cannot be flipped after the first read.
+#[allow(clippy::too_many_arguments)]
+pub fn randomized_pca_with_depth<S: ShardSource + Sync + ?Sized>(
+    source: &S,
+    n_components: usize,
+    n_oversamples: usize,
+    n_power_iterations: usize,
+    zero_center: bool,
+    seed: u64,
+    depth: usize,
+) -> Result<PcaResult> {
     let (n_obs, n_vars) = source.shape();
     validate_inputs(n_obs, n_vars, n_components)?;
     warn_if_cache_undersized(source, "randomized_pca");
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
     // Fused pass: compute column means and sum-of-squares together (1 shard pass)
-    let (means, col_sum_sq) = source.col_means_and_sum_sq(zero_center)?;
+    let (means, col_sum_sq) =
+        scx_format_io::col_means_and_sum_sq_prefetched(source, zero_center, depth)?;
     let means_ref = means.as_deref();
 
     // Step 2: Random Gaussian Ω (n_vars × k), row-major
@@ -387,26 +472,26 @@ pub fn randomized_pca<S: ShardSource>(
     // For difficult spectra (slow singular-value decay — e.g. noisy unnormalized
     // counts or cold-start raw expression matrices) callers should pass
     // `n_power_iterations >= 4` to engage the full-QR path for better convergence.
-    let y = streaming_spmm_forward(source, &omega, k, means_ref)?;
+    let y = streaming_spmm_forward(source, &omega, k, means_ref, depth)?;
     let mut q = qr_thin_q_row_major(&y, n_obs, k);
 
     for _ in 0..n_power_iterations {
-        let b = streaming_spmm_transpose(source, &q, means_ref)?;
+        let b = streaming_spmm_transpose(source, &q, means_ref, depth)?;
         if n_power_iterations > 2 {
             // Full QR normalization on transpose result for numerical stability
             let q_b = qr_thin_q_row_major(&b, n_vars, k);
             let q_b_rm = mat_to_row_major_buf(&q_b);
-            let y = streaming_spmm_forward(source, &q_b_rm, k, means_ref)?;
+            let y = streaming_spmm_forward(source, &q_b_rm, k, means_ref, depth)?;
             q = qr_thin_q_row_major(&y, n_obs, k);
         } else {
             // Skip QR on b — feed row-major b directly into forward SpMM
-            let y = streaming_spmm_forward(source, &b, k, means_ref)?;
+            let y = streaming_spmm_forward(source, &b, k, means_ref, depth)?;
             q = qr_thin_q_row_major(&y, n_obs, k);
         }
     }
 
     // Step 6: B = (X - μ)^T @ Q
-    let b_rm = streaming_spmm_transpose(source, &q, means_ref)?;
+    let b_rm = streaming_spmm_transpose(source, &q, means_ref, depth)?;
 
     // Step 7 + 8: SVD of B, recover embeddings (uses pre-computed col_sum_sq — no extra pass).
     // For the centered case, guard against catastrophic cancellation in the closed
@@ -421,10 +506,10 @@ pub fn randomized_pca<S: ShardSource>(
             );
             let mut total = 0.0f64;
             let mut col_nnz = vec![0u64; n_vars];
-            for shard_idx in 0..source.n_shards() {
-                let csr = source.read_shard_arc(shard_idx)?;
+            crate::prefetch::for_each_shard_ordered(source, depth, |_idx, csr| {
                 accumulate_centered_ss(&csr, mu, &mut total, &mut col_nnz);
-            }
+                Ok(())
+            })?;
             total_var = finalize_centered_variance(total, &col_nnz, mu, n_obs);
         }
     }
@@ -443,18 +528,19 @@ pub fn randomized_pca<S: ShardSource>(
 /// column-centering rank-1 term, when `means` is `Some`), then adds the
 /// row-baseline rank-1 term `baseline_i · colsum(M)_j`. `delta` is whatever
 /// `source` streams (the lazy `Scale{4α}→Log1p` source for PFlog v4).
-fn streaming_spmm_forward_offset<S: ShardSource>(
+fn streaming_spmm_forward_offset<S: ShardSource + Sync + ?Sized>(
     source: &S,
     m_data: &[f64],
     k: usize,
     means: Option<&[f64]>,
     baseline: &[f64],
+    depth: usize,
 ) -> Result<Vec<f64>> {
     let (n_obs, n_vars) = source.shape();
     debug_assert_eq!(m_data.len(), n_vars * k);
     debug_assert_eq!(baseline.len(), n_obs);
 
-    let mut y = streaming_spmm_forward(source, m_data, k, means)?;
+    let mut y = streaming_spmm_forward(source, m_data, k, means, depth)?;
 
     // colsum(M)_j = Σ_v M[v, j]
     let mut colsum_m = vec![0.0f64; k];
@@ -479,18 +565,19 @@ fn streaming_spmm_forward_offset<S: ShardSource>(
 ///
 /// Reuses [`streaming_spmm_transpose`] for the `deltaᵀQ − μ·(1ᵀQ)` part, then
 /// adds the row-baseline rank-1 term `1 ⊗ (baselineᵀ Q)` to every variable row.
-fn streaming_spmm_transpose_offset<S: ShardSource>(
+fn streaming_spmm_transpose_offset<S: ShardSource + Sync + ?Sized>(
     source: &S,
     q: &Mat<f64>,
     means: Option<&[f64]>,
     baseline: &[f64],
+    depth: usize,
 ) -> Result<Vec<f64>> {
     let (n_obs, n_vars) = source.shape();
     let k = q.ncols();
     debug_assert_eq!(q.nrows(), n_obs);
     debug_assert_eq!(baseline.len(), n_obs);
 
-    let mut z = streaming_spmm_transpose(source, q, means)?;
+    let mut z = streaming_spmm_transpose(source, q, means, depth)?;
 
     // bq_j = Σ_i baseline_i · Q[i, j]
     let mut bq = vec![0.0f64; k];
@@ -574,7 +661,7 @@ fn pflog_total_variance(
 /// which recomputes `normalize→log1p` per pass; with a non-caching source this is
 /// decode-bound (acceptable for randomized PCA).
 #[allow(clippy::too_many_arguments)]
-pub fn pflog_pca<S: ShardSource>(
+pub fn pflog_pca<S: ShardSource + Sync + ?Sized>(
     delta_source: &S,
     baseline: &[f64],
     n_components: usize,
@@ -582,6 +669,31 @@ pub fn pflog_pca<S: ShardSource>(
     n_power_iterations: usize,
     zero_center: bool,
     seed: u64,
+) -> Result<PcaResult> {
+    pflog_pca_with_depth(
+        delta_source,
+        baseline,
+        n_components,
+        n_oversamples,
+        n_power_iterations,
+        zero_center,
+        seed,
+        pca_prefetch_depth(),
+    )
+}
+
+/// [`pflog_pca`] with an explicit decode-prefetch depth — see
+/// [`randomized_pca_with_depth`] for why this seam exists.
+#[allow(clippy::too_many_arguments)]
+pub fn pflog_pca_with_depth<S: ShardSource + Sync + ?Sized>(
+    delta_source: &S,
+    baseline: &[f64],
+    n_components: usize,
+    n_oversamples: usize,
+    n_power_iterations: usize,
+    zero_center: bool,
+    seed: u64,
+    depth: usize,
 ) -> Result<PcaResult> {
     let (n_obs, n_vars) = delta_source.shape();
     validate_inputs(n_obs, n_vars, n_components)?;
@@ -597,7 +709,8 @@ pub fn pflog_pca<S: ShardSource>(
 
     // Column means + sum-of-squares of `delta` (one pass). The column mean of Z
     // adds mean(baseline) uniformly to colmean(delta).
-    let (colmean_delta, col_sum_sq_delta) = delta_source.col_means_and_sum_sq(zero_center)?;
+    let (colmean_delta, col_sum_sq_delta) =
+        scx_format_io::col_means_and_sum_sq_prefetched(delta_source, zero_center, depth)?;
     let baseline_mean = baseline.iter().sum::<f64>() / (n_obs as f64).max(1.0);
     let means: Option<Vec<f64>> = colmean_delta
         .as_ref()
@@ -605,23 +718,30 @@ pub fn pflog_pca<S: ShardSource>(
     let means_ref = means.as_deref();
 
     let omega = random_gaussian(n_vars, k, seed);
-    let y = streaming_spmm_forward_offset(delta_source, &omega, k, means_ref, baseline)?;
+    let y = streaming_spmm_forward_offset(delta_source, &omega, k, means_ref, baseline, depth)?;
     let mut q = qr_thin_q_row_major(&y, n_obs, k);
 
     for _ in 0..n_power_iterations {
-        let b = streaming_spmm_transpose_offset(delta_source, &q, means_ref, baseline)?;
+        let b = streaming_spmm_transpose_offset(delta_source, &q, means_ref, baseline, depth)?;
         if n_power_iterations > 2 {
             let q_b = qr_thin_q_row_major(&b, n_vars, k);
             let q_b_rm = mat_to_row_major_buf(&q_b);
-            let y = streaming_spmm_forward_offset(delta_source, &q_b_rm, k, means_ref, baseline)?;
+            let y = streaming_spmm_forward_offset(
+                delta_source,
+                &q_b_rm,
+                k,
+                means_ref,
+                baseline,
+                depth,
+            )?;
             q = qr_thin_q_row_major(&y, n_obs, k);
         } else {
-            let y = streaming_spmm_forward_offset(delta_source, &b, k, means_ref, baseline)?;
+            let y = streaming_spmm_forward_offset(delta_source, &b, k, means_ref, baseline, depth)?;
             q = qr_thin_q_row_major(&y, n_obs, k);
         }
     }
 
-    let b_rm = streaming_spmm_transpose_offset(delta_source, &q, means_ref, baseline)?;
+    let b_rm = streaming_spmm_transpose_offset(delta_source, &q, means_ref, baseline, depth)?;
     let total_var = pflog_total_variance(
         &col_sum_sq_delta,
         colmean_delta.as_deref(),
@@ -711,7 +831,7 @@ pub fn randomized_pca_inmemory(
 /// can't hold `n_shards`, each pass evicts and re-decodes from disk — the
 /// same silent perf cliff the DE streaming path warns about. No-op for
 /// non-caching sources (`shard_cache_capacity() == None`).
-fn warn_if_cache_undersized<S: ShardSource>(source: &S, op: &str) {
+fn warn_if_cache_undersized<S: ShardSource + ?Sized>(source: &S, op: &str) {
     if let Some(cap) = source.shard_cache_capacity() {
         let n_shards = source.n_shards();
         if n_shards > 1 && cap < n_shards {
@@ -816,11 +936,12 @@ fn random_gaussian(rows: usize, cols: usize, seed: u64) -> Vec<f64> {
 /// X is (n_obs × n_vars) stored as sharded CSR.
 /// `m_data` is row-major `&[f64]` of shape (n_vars × k).
 /// Returns row-major `Vec<f64>` of shape (n_obs × k).
-fn streaming_spmm_forward<S: ShardSource>(
+fn streaming_spmm_forward<S: ShardSource + Sync + ?Sized>(
     source: &S,
     m_data: &[f64],
     k: usize,
     means: Option<&[f64]>,
+    depth: usize,
 ) -> Result<Vec<f64>> {
     let (n_obs, n_vars) = source.shape();
     debug_assert_eq!(m_data.len(), n_vars * k);
@@ -838,11 +959,12 @@ fn streaming_spmm_forward<S: ShardSource>(
         mc
     });
 
-    let n_shards = source.n_shards();
+    // Ordered delivery keeps `global_row` advancing in shard order, and each
+    // output row is written by exactly one thread over that row's nonzeros in
+    // index order — so this stays **bit-identical** to the sequential loop.
     let mut global_row = 0usize;
-
-    for shard_idx in 0..n_shards {
-        let csr = source.read_shard_arc(shard_idx)?;
+    crate::prefetch::for_each_shard_ordered(source, depth, |_shard_idx, csr| {
+        let _r = scx_format_io::reduction_guard();
         let shard_rows = csr.n_rows();
 
         spmm_forward_into(
@@ -854,7 +976,8 @@ fn streaming_spmm_forward<S: ShardSource>(
             mean_correction.as_deref(),
         );
         global_row += shard_rows;
-    }
+        Ok(())
+    })?;
 
     Ok(y)
 }
@@ -864,10 +987,11 @@ fn streaming_spmm_forward<S: ShardSource>(
 /// Q is `Mat<f64>` (n_obs × k), column-major. Each shard is parallelized
 /// via rayon thread-local accumulators (same approach as `spmm_transpose_csr`).
 /// Returns row-major `Vec<f64>` of shape (n_vars × k).
-fn streaming_spmm_transpose<S: ShardSource>(
+fn streaming_spmm_transpose<S: ShardSource + Sync + ?Sized>(
     source: &S,
     q: &Mat<f64>,
     means: Option<&[f64]>,
+    depth: usize,
 ) -> Result<Vec<f64>> {
     let (n_obs, n_vars) = source.shape();
     let k = q.ncols();
@@ -880,7 +1004,6 @@ fn streaming_spmm_transpose<S: ShardSource>(
         vec![]
     };
 
-    let n_shards = source.n_shards();
     let mut global_row = 0usize;
 
     // Per-thread scratch buffers hoisted across *all* shards: each thread's
@@ -893,8 +1016,8 @@ fn streaming_spmm_transpose<S: ShardSource>(
     let tls_q_row: ThreadLocal<RefCell<Vec<f64>>> = ThreadLocal::new();
     let sq_len = if means.is_some() { k } else { 0 };
 
-    for shard_idx in 0..n_shards {
-        let csr = source.read_shard_arc(shard_idx)?;
+    crate::prefetch::for_each_shard_ordered(source, depth, |_shard_idx, csr| {
+        let _r = scx_format_io::reduction_guard();
         let shard_rows = csr.n_rows();
         let use_parallel = shard_rows * k > 10_000;
 
@@ -964,7 +1087,8 @@ fn streaming_spmm_transpose<S: ShardSource>(
         }
 
         global_row += shard_rows;
-    }
+        Ok(())
+    })?;
 
     // Reduce thread-local parallel-path accumulators into the globals.
     // Sequential-path shards wrote directly to `z` / `sum_q`, so this step
@@ -1036,7 +1160,10 @@ fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Vec<
         // We partition rows into ~equal chunks for rayon.
         let chunk_size = (n_obs / rayon::current_num_threads().max(1)).max(256);
 
-        let (z, sum_q) = (0..n_obs)
+        // The fold accumulator carries a reusable `q_row` scratch buffer as its
+        // third element so it is allocated once per rayon task (per chunk)
+        // rather than once per row. Values are identical to the per-row alloc.
+        let (z, sum_q, _) = (0..n_obs)
             .into_par_iter()
             .with_min_len(chunk_size)
             .fold(
@@ -1048,11 +1175,11 @@ fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Vec<
                         } else {
                             vec![]
                         },
+                        vec![0.0f64; k],
                     )
                 },
-                |(mut z_local, mut sq_local), r| {
-                    // Copy one row from column-major Q into contiguous buffer
-                    let mut q_row = vec![0.0f64; k];
+                |(mut z_local, mut sq_local, mut q_row), r| {
+                    // Copy one row from column-major Q into the reused buffer
                     for j in 0..k {
                         q_row[j] = q[(r, j)];
                     }
@@ -1071,7 +1198,7 @@ fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Vec<
                             z_local[z_offset + j] += val * q_row[j];
                         }
                     }
-                    (z_local, sq_local)
+                    (z_local, sq_local, q_row)
                 },
             )
             .reduce(
@@ -1083,16 +1210,17 @@ fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Vec<
                         } else {
                             vec![]
                         },
+                        Vec::new(),
                     )
                 },
-                |(mut za, mut sqa), (zb, sqb)| {
+                |(mut za, mut sqa, qa), (zb, sqb, _qb)| {
                     for i in 0..za.len() {
                         za[i] += zb[i];
                     }
                     for i in 0..sqa.len() {
                         sqa[i] += sqb[i];
                     }
-                    (za, sqa)
+                    (za, sqa, qa)
                 },
             );
 
@@ -1296,10 +1424,21 @@ pub const COVARIANCE_PCA_THRESHOLD: usize = 5_000;
 /// `X_shard^T @ X_shard` from row-major nonzeros and offers no win on
 /// CSC. CSC dispatch is rejected at the pyscx entry point —
 /// `pyscx.accel.pca(prefer_format="csc")` raises `ValueError`.
-pub fn covariance_pca<S: ShardSource>(
+pub fn covariance_pca<S: ShardSource + Sync + ?Sized>(
     source: &S,
     n_components: usize,
     zero_center: bool,
+) -> Result<PcaResult> {
+    covariance_pca_with_depth(source, n_components, zero_center, pca_prefetch_depth())
+}
+
+/// [`covariance_pca`] with an explicit decode-prefetch depth — see
+/// [`randomized_pca_with_depth`] for why this seam exists.
+pub fn covariance_pca_with_depth<S: ShardSource + Sync + ?Sized>(
+    source: &S,
+    n_components: usize,
+    zero_center: bool,
+    depth: usize,
 ) -> Result<PcaResult> {
     let (n_obs, n_vars) = source.shape();
     validate_inputs(n_obs, n_vars, n_components)?;
@@ -1311,7 +1450,7 @@ pub fn covariance_pca<S: ShardSource>(
     // data). Streams shard-by-shard with a memory-bounded set of thread-local
     // accumulators (see `accumulate_covariance_streaming`); only the lower triangle
     // is populated. Shard reads go through the cached `read_shard_arc` (T4.4).
-    let (mut cov, col_sums) = accumulate_covariance_streaming(source, n_vars)?;
+    let (mut cov, col_sums) = accumulate_covariance_streaming(source, n_vars, depth)?;
 
     // --- Mean centering ---
     let means = if zero_center {
@@ -1404,31 +1543,29 @@ pub fn covariance_pca<S: ShardSource>(
     });
 
     let mut global_row = 0usize;
-    for shard_idx in 0..source.n_shards() {
-        let csr = source.read_shard_arc(shard_idx)?;
+    crate::prefetch::for_each_shard_ordered(source, depth, |_shard_idx, csr| {
+        let _r = scx_format_io::reduction_guard();
         let shard_rows = csr.n_rows();
 
-        // E[row, :] = X[row, :] @ V - mc
-        for r in 0..shard_rows {
-            let start = csr.indptr[r] as usize;
-            let end = csr.indptr[r + 1] as usize;
-            let e_offset = (global_row + r) * n_components;
-            for idx in start..end {
-                let c = csr.indices[idx] as usize;
-                let val = csr.data[idx] as f64;
-                let v_offset = c * n_components;
-                for pc in 0..n_components {
-                    embeddings[e_offset + pc] += val * v_rm[v_offset + pc];
-                }
-            }
-            if let Some(ref mc) = mean_correction {
-                for pc in 0..n_components {
-                    embeddings[e_offset + pc] -= mc[pc];
-                }
-            }
-        }
+        // E[row, :] = X[row, :] @ V - mc — the same `Y = (X - μ) @ M` the
+        // randomized route runs, so it uses the same kernel rather than a
+        // hand-inlined copy of it. Output rows are disjoint and each row's
+        // nonzeros are still consumed in index order, so this is bit-identical
+        // to the serial loop it replaces; the difference is that
+        // `spmm_forward_into` parallelises across rows above its work
+        // threshold, and this pass was the covariance route's one entirely
+        // single-threaded scan.
+        spmm_forward_into(
+            &csr,
+            &v_rm,
+            n_components,
+            &mut embeddings,
+            global_row,
+            mean_correction.as_deref(),
+        );
         global_row += shard_rows;
-    }
+        Ok(())
+    })?;
 
     Ok(PcaResult {
         embeddings,
@@ -2200,5 +2337,428 @@ mod tests {
             "centered {got_centered} != {}",
             ss_centered / denom
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Decode-prefetch: engagement, and equivalence at depth 1 vs depth 4
+    // -----------------------------------------------------------------------
+
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::thread::ThreadId;
+
+    /// A `ShardSource` that records **which thread** decoded each shard.
+    ///
+    /// This is the anti-trap instrument, and the reason it exists is specific:
+    /// `for_each_ordered` **silently** falls back to a sequential loop when the
+    /// caller is a rayon worker, when the pool has one thread, or when the depth
+    /// is 1. PCA owns two inner rayon pools, so a mis-nested wiring here would
+    /// produce no speedup and no error — the whole task could land, pass every
+    /// correctness test below, and do nothing at all.
+    ///
+    /// **Thread identity, not observed overlap.** An earlier version asserted a
+    /// maximum-in-flight count of >= 2, which is a *timing* property: it held on
+    /// a 24-core box 20 runs out of 20 and failed on a 2-core CI runner, where
+    /// libtest's own parallelism saturates the pool and the spawned decodes run
+    /// one at a time. "Did the pipeline engage" is structural — when it does,
+    /// `read_shard` runs on a rayon worker; when it declines, on the calling
+    /// thread — so that is what these tests assert. `max_live` is still
+    /// recorded, but only to make a failure message informative.
+    struct GaugedSource {
+        shards: Vec<ScxCsr>,
+        n_obs: usize,
+        n_vars: usize,
+        live: AtomicUsize,
+        max_live: AtomicUsize,
+        decode_threads: Mutex<HashSet<ThreadId>>,
+    }
+
+    impl GaugedSource {
+        fn new(shards: Vec<ScxCsr>, n_obs: usize, n_vars: usize) -> Self {
+            Self {
+                shards,
+                n_obs,
+                n_vars,
+                live: AtomicUsize::new(0),
+                max_live: AtomicUsize::new(0),
+                decode_threads: Mutex::new(HashSet::new()),
+            }
+        }
+
+        /// True when at least one shard decoded somewhere other than `caller`.
+        fn decoded_off_thread(&self, caller: ThreadId) -> bool {
+            self.decode_threads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| *t != caller)
+        }
+
+        fn decode_thread_count(&self) -> usize {
+            self.decode_threads.lock().unwrap().len()
+        }
+
+        fn max_concurrent_decodes(&self) -> usize {
+            self.max_live.load(Ordering::SeqCst)
+        }
+
+        fn reset(&self) {
+            self.max_live.store(0, Ordering::SeqCst);
+            self.decode_threads.lock().unwrap().clear();
+        }
+    }
+
+    /// Assert the pipeline engaged: some shard decoded off the calling thread.
+    fn assert_prefetch_engaged(src: &GaugedSource, what: &str) {
+        let me = std::thread::current().id();
+        assert!(
+            src.decoded_off_thread(me),
+            "{what}: every shard decoded on the calling thread — the prefetch \
+             pipeline declined to engage (threads seen: {}, max in flight: {})",
+            src.decode_thread_count(),
+            src.max_concurrent_decodes()
+        );
+    }
+
+    impl ShardSource for GaugedSource {
+        fn n_shards(&self) -> usize {
+            self.shards.len()
+        }
+        fn n_obs(&self) -> usize {
+            self.n_obs
+        }
+        fn n_vars(&self) -> usize {
+            self.n_vars
+        }
+        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
+            self.decode_threads
+                .lock()
+                .unwrap()
+                .insert(std::thread::current().id());
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_live.fetch_max(now, Ordering::SeqCst);
+            // Kept short: nothing asserts on overlap now, so this only widens the
+            // window in which `max_live` can observe some.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let out = self.shards[shard_idx].clone();
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            Ok(out)
+        }
+    }
+
+    /// A multi-shard fixture. `rows_per_shard × k` stays under
+    /// `spmm_*`'s 10 000-element parallel threshold, so every reduction takes
+    /// its **sequential** branch and the whole op is deterministic — which is
+    /// what lets the equivalence tests below assert exact bits instead of a
+    /// tolerance. `parallel_branch_fixture` is the deliberate counterpart.
+    fn gauged_fixture(n_shards: usize, rows_per_shard: usize, n_vars: usize) -> GaugedSource {
+        let shards: Vec<ScxCsr> = (0..n_shards)
+            .map(|s| {
+                let mut indptr = vec![0i64];
+                let mut indices = Vec::new();
+                let mut data = Vec::new();
+                for r in 0..rows_per_shard {
+                    let global = s * rows_per_shard + r;
+                    for c in 0..n_vars {
+                        if !(global + c).is_multiple_of(3) {
+                            indices.push(c as i32);
+                            data.push(((global % 7) + c + 1) as f32 * 0.5);
+                        }
+                    }
+                    indptr.push(indices.len() as i64);
+                }
+                ScxCsr::new_unchecked((rows_per_shard, n_vars), indptr, indices, data)
+            })
+            .collect();
+        GaugedSource::new(shards, n_shards * rows_per_shard, n_vars)
+    }
+
+    /// Skip rather than fail where the pipeline is *designed* not to engage: a
+    /// single-thread pool takes the sequential fallback by construction.
+    fn pool_can_prefetch() -> bool {
+        rayon::current_num_threads() > 1
+    }
+
+    #[test]
+    fn covariance_build_decodes_shards_concurrently() {
+        if !pool_can_prefetch() {
+            return;
+        }
+        let src = gauged_fixture(8, 12, 6);
+        // The load-bearing case: the consume closure enters a *private* rayon
+        // pool via `pool.install` while decode runs on the global one.
+        accumulate_covariance_streaming(&src, 6, 4).unwrap();
+        assert_prefetch_engaged(&src, "covariance build");
+    }
+
+    #[test]
+    fn streaming_spmm_passes_decode_shards_concurrently() {
+        if !pool_can_prefetch() {
+            return;
+        }
+        let src = gauged_fixture(8, 12, 6);
+        let k = 4;
+        let m = random_gaussian(6, k, 1);
+
+        streaming_spmm_forward(&src, &m, k, None, 4).unwrap();
+        assert_prefetch_engaged(&src, "forward SpMM");
+
+        src.reset();
+        let q = Mat::<f64>::from_fn(src.n_obs(), k, |i, j| (i + j) as f64 * 0.25);
+        streaming_spmm_transpose(&src, &q, None, 4).unwrap();
+        assert_prefetch_engaged(&src, "transpose SpMM");
+    }
+
+    #[test]
+    fn whole_pca_ops_decode_shards_concurrently() {
+        if !pool_can_prefetch() {
+            return;
+        }
+        let src = gauged_fixture(8, 12, 6);
+        randomized_pca_with_depth(&src, 2, 2, 2, true, 42, 4).unwrap();
+        assert_prefetch_engaged(&src, "randomized_pca");
+
+        src.reset();
+        covariance_pca_with_depth(&src, 2, true, 4).unwrap();
+        assert_prefetch_engaged(&src, "covariance_pca");
+    }
+
+    /// Depth 1 must take the sequential fallback — this is what makes
+    /// `SCX_ACCEL_PREFETCH_DEPTH=1` a *genuine* baseline for the capture rather
+    /// than merely an "off" arm. #373's GPU staging A/B got this wrong: there,
+    /// depth 1 had zero decode threads where `main` had one.
+    #[test]
+    fn depth_one_decodes_on_the_calling_thread() {
+        let src = gauged_fixture(6, 8, 5);
+        randomized_pca_with_depth(&src, 2, 2, 2, true, 42, 1).unwrap();
+        let me = std::thread::current().id();
+        assert!(
+            !src.decoded_off_thread(me),
+            "depth 1 must take the sequential fallback and decode inline on the \
+             calling thread — that is what makes SCX_ACCEL_PREFETCH_DEPTH=1 a \
+             genuine baseline rather than merely an 'off' arm"
+        );
+        assert_eq!(src.max_concurrent_decodes(), 1);
+    }
+
+    fn assert_bits_eq(got: &[f64], want: &[f64], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "{what}[{i}]: {a} != {b}");
+        }
+    }
+
+    #[test]
+    fn forward_spmm_is_bit_identical_across_depths() {
+        let src = gauged_fixture(6, 8, 5);
+        let k = 4;
+        let m = random_gaussian(5, k, 7);
+        let means: Vec<f64> = (0..5).map(|v| 0.1 * v as f64).collect();
+        for mu in [None, Some(means.as_slice())] {
+            let seq = streaming_spmm_forward(&src, &m, k, mu, 1).unwrap();
+            let pre = streaming_spmm_forward(&src, &m, k, mu, 4).unwrap();
+            assert_bits_eq(&pre, &seq, "forward SpMM");
+        }
+    }
+
+    /// Randomized PCA is *structurally* deterministic on this branch — the
+    /// forward SpMM writes each output row once, the transpose takes its
+    /// sequential path, and `col_means_and_sum_sq_prefetched` accumulates in
+    /// shard order — so exact bits is the honest bar. (The covariance route is
+    /// not, and gets its own test below.)
+    #[test]
+    fn randomized_pca_is_bit_identical_across_depths_on_the_sequential_branch() {
+        let (n_shards, rows_per_shard, n_vars) = (6usize, 8usize, 5usize);
+        let (n_components, n_oversamples) = (2usize, 2usize);
+        let src = gauged_fixture(n_shards, rows_per_shard, n_vars);
+        // Premise: the reductions really are on their *deterministic* branch,
+        // so exact bits is the right bar here. If a future edit grew this
+        // fixture past the threshold the assertion would start flaking on
+        // f64 reassociation rather than on a real regression.
+        let k = (n_components + n_oversamples).min(n_vars).min(src.n_obs());
+        assert!(
+            rows_per_shard * k <= 10_000,
+            "fixture must stay under the parallel-reduction threshold"
+        );
+
+        let seq = randomized_pca_with_depth(&src, 2, 2, 2, true, 42, 1).unwrap();
+        let pre = randomized_pca_with_depth(&src, 2, 2, 2, true, 42, 4).unwrap();
+        assert_bits_eq(&pre.embeddings, &seq.embeddings, "randomized embeddings");
+        assert_bits_eq(&pre.components, &seq.components, "randomized components");
+        assert_bits_eq(
+            &pre.variance_ratio,
+            &seq.variance_ratio,
+            "randomized variance_ratio",
+        );
+    }
+
+    /// The covariance route gets a **relative** bar, not exact bits, and the
+    /// difference is not a convenience.
+    ///
+    /// `accumulate_covariance_streaming` folds into `ThreadLocal` accumulators
+    /// whose row→thread assignment is decided by work-stealing and whose merge
+    /// order is `ThreadLocal::iter_mut()`. Measured on a cancelling-pair
+    /// fixture through `pyscx.accel.pca`, five consecutive runs of
+    /// `method="covariance"` produced five different results while
+    /// `method="randomized"` produced one — and the diff against `main` shows
+    /// both the accumulator declaration and the merge loop unchanged, so this
+    /// predates decode-prefetch entirely.
+    ///
+    /// A well-conditioned fixture is the right one here, and this is the
+    /// converse of the cancelling-fixture rule the column-sum kernels need. In
+    /// a *reduction*, a lost ordering shows up only in rounding, so the fixture
+    /// has to amplify it. In this pass a wiring bug is not subtle — a dropped
+    /// or reordered `global_row` puts whole rows in the wrong place — so 1e-9
+    /// relative separates "f64 reassociation" from "broken" with room to spare,
+    /// and `col_means_and_sum_sq_prefetched` carries the cancelling-pair test
+    /// for the reduction that genuinely needs one.
+    #[test]
+    fn covariance_pca_agrees_across_depths_within_reassociation_noise() {
+        let src = gauged_fixture(6, 8, 5);
+        let seq = covariance_pca_with_depth(&src, 2, true, 1).unwrap();
+        let pre = covariance_pca_with_depth(&src, 2, true, 4).unwrap();
+        let scale = seq
+            .embeddings
+            .iter()
+            .fold(0.0f64, |m, v| m.max(v.abs()))
+            .max(1e-12);
+        assert!(scale > 1e-6, "premise: embeddings must not be all-zero");
+        for (i, (a, b)) in pre.embeddings.iter().zip(seq.embeddings.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-9 * scale,
+                "covariance embedding[{i}] {a} vs {b} exceeds the reassociation bar"
+            );
+        }
+    }
+
+    /// The parallel reduction branches (`shard_rows × k > 10 000`) accumulate
+    /// into `ThreadLocal` buffers whose row→thread assignment is decided by
+    /// rayon work-stealing and whose merge order is `ThreadLocal::iter_mut()`.
+    /// They are therefore **already** run-to-run non-bit-identical, before
+    /// prefetch touches anything — so the bar here is a tolerance, and saying so
+    /// is more honest than picking a fixture that hides it.
+    #[test]
+    fn pca_agrees_across_depths_on_the_parallel_branch() {
+        let (rows_per_shard, n_vars) = (1200usize, 12usize);
+        let (n_components, n_oversamples) = (2usize, 8usize);
+        let src = gauged_fixture(4, rows_per_shard, n_vars);
+        let k = (n_components + n_oversamples).min(n_vars).min(src.n_obs());
+        assert!(
+            rows_per_shard * k > 10_000,
+            "premise: this fixture must reach the parallel reduction branch \
+             (rows_per_shard {rows_per_shard} x k {k})"
+        );
+
+        let seq = randomized_pca_with_depth(&src, 2, 8, 2, true, 11, 1).unwrap();
+        let pre = randomized_pca_with_depth(&src, 2, 8, 2, true, 11, 4).unwrap();
+        let scale = seq
+            .embeddings
+            .iter()
+            .fold(0.0f64, |m, v| m.max(v.abs()))
+            .max(1e-12);
+        for (i, (a, b)) in pre.embeddings.iter().zip(seq.embeddings.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-9 * scale,
+                "embedding[{i}] {a} vs {b} exceeds the f64-reassociation bar"
+            );
+        }
+    }
+
+    #[test]
+    fn pca_prefetch_depth_is_at_least_one() {
+        // A `OnceLock` on both inputs, so this cannot A/B the env here — the
+        // point is the floor: a zero depth would make `for_each_ordered`'s
+        // `depth.max(1)` the only thing standing between us and a stall.
+        assert!(pca_prefetch_depth() >= 1);
+        assert!(pca_prefetch_depth() <= crate::prefetch::prefetch_depth());
+    }
+
+    /// The embeddings scatter exactly as `covariance_pca` used to inline it,
+    /// kept as the oracle for the `spmm_forward_into` swap.
+    fn inlined_embeddings_scatter_reference(
+        csr: &ScxCsr,
+        v_rm: &[f64],
+        n_components: usize,
+        embeddings: &mut [f64],
+        global_row: usize,
+        mean_correction: Option<&[f64]>,
+    ) {
+        for r in 0..csr.n_rows() {
+            let start = csr.indptr[r] as usize;
+            let end = csr.indptr[r + 1] as usize;
+            let e_offset = (global_row + r) * n_components;
+            for idx in start..end {
+                let c = csr.indices[idx] as usize;
+                let val = csr.data[idx] as f64;
+                let v_offset = c * n_components;
+                for pc in 0..n_components {
+                    embeddings[e_offset + pc] += val * v_rm[v_offset + pc];
+                }
+            }
+            if let Some(mc) = mean_correction {
+                for pc in 0..n_components {
+                    embeddings[e_offset + pc] -= mc[pc];
+                }
+            }
+        }
+    }
+
+    /// `covariance_pca`'s embeddings pass now calls the shared kernel instead of
+    /// its own copy. The claim is bit-identity, not "close": each output row is
+    /// written by exactly one thread and still walks that row's nonzeros in
+    /// index order, so parallelising across rows reassociates nothing.
+    ///
+    /// Both `spmm_forward_into` branches are covered — the small fixture takes
+    /// its serial path and the large one crosses the 10 000-element threshold
+    /// into `par_chunks_mut`, which is the branch the claim is actually about.
+    #[test]
+    fn covariance_embeddings_kernel_matches_the_inlined_scatter_bitwise() {
+        for (rows_per_shard, n_vars, n_components, expect_parallel) in
+            [(8usize, 5usize, 4usize, false), (600, 12, 30, true)]
+        {
+            assert_eq!(
+                rows_per_shard * n_components > 10_000,
+                expect_parallel,
+                "premise: fixture ({rows_per_shard} rows x {n_components} comps) must land \
+                 on the {} branch",
+                if expect_parallel {
+                    "parallel"
+                } else {
+                    "serial"
+                }
+            );
+            let src = gauged_fixture(3, rows_per_shard, n_vars);
+            let n_obs = src.n_obs();
+            let v_rm = random_gaussian(n_vars, n_components, 5);
+            let mc: Vec<f64> = (0..n_components).map(|j| 0.03 * (j + 1) as f64).collect();
+
+            for mean_correction in [None, Some(mc.as_slice())] {
+                let mut got = vec![0.0f64; n_obs * n_components];
+                let mut want = vec![0.0f64; n_obs * n_components];
+                let mut global_row = 0usize;
+                for shard_idx in 0..src.n_shards() {
+                    let csr = src.read_shard(shard_idx).unwrap();
+                    spmm_forward_into(
+                        &csr,
+                        &v_rm,
+                        n_components,
+                        &mut got,
+                        global_row,
+                        mean_correction,
+                    );
+                    inlined_embeddings_scatter_reference(
+                        &csr,
+                        &v_rm,
+                        n_components,
+                        &mut want,
+                        global_row,
+                        mean_correction,
+                    );
+                    global_row += csr.n_rows();
+                }
+                assert_bits_eq(&got, &want, "covariance embeddings scatter");
+            }
+        }
     }
 }

@@ -260,6 +260,41 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 > [!IMPORTANT]
 > The `scx-bench-gpu` environment pins `cuda-version` to match the NVIDIA driver. The default is `12.2` (for driver 535.x). Edit `benchmarks/comprehensive/envs/scx-bench-gpu.yml` to adjust for your driver version. See [docs/gpu-setup.md](../docs/gpu-setup.md) for the driver compatibility table.
 
+> [!CAUTION]
+> **Run capture jobs one at a time. `pyscx/python/pyscx/*.so` is shared mutable
+> state across every environment and every concurrently-running job.**
+>
+> Each env's editable install of `pyscx` points at that one file in the repo, so
+> the rule is stronger than "don't run two builds at once":
+>
+> > Any job that runs `maturin develop` in the repo invalidates every other job
+> > that will **import** pyscx — whether or not that job builds anything.
+>
+> The failure is a rebuild racing a future *import*, not build-vs-build, which is
+> why "the other job already finished its build phase" is not a safe argument.
+> Phase 4.2 lost ~3 H100-hours to exactly that: a CPU job whose own build targeted
+> `.venv` still wrote a `--features hdf5` (no-GPU) `.so` into the shared path, and
+> a running GPU capture's not-yet-started second arm then failed every op with
+> `pyscx was built without the 'gpu' feature`.
+>
+> Chain jobs with `sbatch --dependency=afterany:$prev` when they are independent
+> captures and you want the second to run regardless — but use **`afterok`**
+> whenever the second job would inherit state from the first, so a failed build
+> cannot leave a stale `.so` for the next job to measure against.
+>
+> Two guards worth copying into any new capture script:
+> - **Preflight the feature you are about to measure.** Run one real GPU op and
+>   exit non-zero if it raises. Nine seconds beats discovering a wrong build after
+>   three hours — see `benchmarks/scripts/_run_4_2_gpu_staging_only.sh`.
+> - **`rm -rf` a reused `CARGO_TARGET_DIR` wholesale.** Clearing only
+>   `$TARGET/maturin` lets cargo report "Finished in 0.9s", re-link a 0-byte
+>   artifact from `release/`, and maturin die on `Malformed entity: Object is too
+>   small`.
+>
+> Slurm will also co-schedule two of your jobs on one node, where one's cargo
+> builds steal CPU from the other's *timing* measurement — unevenly across its
+> arms, so it biases the result rather than merely adding noise.
+
 ### Which environment to use
 
 > [!CAUTION]
@@ -1018,6 +1053,7 @@ hard gate failure via the existing absolute-floor machinery.
 |------------|------------------|-----------------|
 | `de_route_csc_direct` | `accel_de` (pdex_ref GPU) | CSC sidecar present (v3 is the unconditional default GPU DE route), yet a non-CSC route ran. Gated on `pbmc3k`, `tabula_sapiens_100k`, and `census_1m`. |
 | `wilcoxon_route_gpu_correct` | `accel_de` (Wilcoxon GPU) | `device="gpu"` requested but a `cpu_*` route ran. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
+| `de_route_resident_csr` | `accel_de` (pdex_ref + Wilcoxon GPU) | A `gpu_csr*` route re-decoded every shard for every gene chunk instead of holding the matrix device-resident (§9.11). Emitted **only** on a CSR route — the CSC-direct route prefilters by column range and has no residency decision — so it is inert, not failing, on a CSC run. A 0.0 means the VRAM pre-flight refused, `SCX_GPU_DE_RESIDENT=0` leaked into the environment, or dispatch regressed. Gated on `tabula_sapiens_100k`. |
 | `nb_glm_route_gpu_correct` | `accel_de_nb_glm` (pdex_nb_glm GPU) | `device="gpu"` requested but a `cpu_nb_glm` route ran. Gated on the synthetic `nb_glm_synth`. |
 | `nb_glm_cpu_gpu_concordant` | `accel_de_nb_glm` (pdex_nb_glm GPU) | CPU↔GPU log2FC Spearman < 0.999 OR max per-gene rel-log2FC > 2e-3 (the precise-`f64`, no-`--use_fast_math` agreement floor — catches a fast-math/precision regression). Gated on `nb_glm_synth`. |
 | `nb_glm_pdex_ref_concordant` | `accel_de_nb_glm` (pdex_nb_glm GPU) | NB-GLM vs `pdex_ref` (a different algorithm) Spearman < 0.95 on log2FC/FDR — the only non-self-referential anchor (pyDESeq2 OOMs in the correctness reference). Gated on `nb_glm_synth`. |
@@ -1094,6 +1130,33 @@ correctness (`pca_subspace_cos_min`, `knn_recall_vs_scanpy`,
 `umap_trustworthiness`) is held to the same floors as the standalone
 `accel_pca`/`accel_knn`/`accel_umap` gates, and `pipeline_route_rapids_correct`
 gates the rapids pipeline route (above).
+
+**CPU stage profile (`SCX_CPU_PROFILE`) — the Phase-2 ranking oracle.** To learn
+whether a streaming CPU accelerator op is decode/I-O-bound or
+reduction/marshalling-bound (so a `×` speedup claim can be trusted), export
+`SCX_CPU_PROFILE=1` **before** the worker imports pyscx. The accel/read modules
+(`accel_pca`, `accel_hvg`, `accel_preprocess`, `accel_de`,
+`accel_format_pipeline`) then record a per-run `cpu_profile_*` breakdown
+(io / decode-scx1 / decode-generic / reduction / marshalling) into `runs[].extra`
+via `runners.accel_runner.cpu_profile_capture` — the CPU twin of the GPU-path
+`SCX_GPU_PROFILE` / `bench_gpu_codec.py`. The buckets are disjoint
+(`io + decode + reduction + marshalling ≈ wall`). Capture example:
+
+```bash
+# from the scx-bench conda env, pyscx built --release
+SCX_CPU_PROFILE=1 python benchmarks/comprehensive/scripts/run_parallel.py \
+    --benchmarks accel_pca accel_hvg accel_preprocess accel_de \
+    --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k census_500k census_1m
+```
+
+The breakdown is diagnostic (`extra`), not floored in `thresholds.yaml`, so a
+profiled run does not gate — it ranks the Phase-2 optimization targets. Profiling
+adds a small per-shard atomic/`Instant` cost, so read the *ratios* from a profiled
+run and the absolute wall from an unprofiled run. **Known gaps** (absent from the
+`decode` bucket): the *framed/block-index* decode route and the typed-dtype path
+(`read_shard_from_entry_native`) — a full-shard CSR or CSC decode routes through the
+central hook and is captured — plus the cloud range-read readers that bypass the
+local `ScxReader` (current captures are local mmap only).
 
 **Per-op rapids-singlecell competitor (`accel_*__rapids_singlecell_gpu`).** Beyond
 the fused pipeline, every accel op carries a `rapids_singlecell_gpu` variant

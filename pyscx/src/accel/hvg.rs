@@ -9,7 +9,6 @@ use pyo3::types::PyDict;
 use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 
-use super::filtering::update_layers_col_projection;
 use super::util::extract_materialized_csr;
 
 /// Single-shard [`scx_format_io::ShardSource`] adapter over a borrowed in-memory
@@ -193,6 +192,9 @@ pub fn highly_variable_genes<'py>(
         };
         // Route: gpu_csc_v3 (GPU reduce) or cpu_csc — the planner reads
         // gpu_available() internally, so a no-GPU host records cpu_csc.
+        // Pre-dispatch stamp is honest because the CSC GPU wrappers propagate
+        // `AccelError::GpuInitFailed` (§4.1) instead of silently CPU-ing under
+        // this stamp — a failed GPU init fails the op, never mislabels CPU.
         let info = super::route::hvg_exec_info(device, seurat_v3_family, true);
         super::route::announce_route(py, "highly_variable_genes", device, &info);
         super::route::write_accel_route(py, adata, "highly_variable_genes", &info)?;
@@ -241,8 +243,7 @@ pub fn highly_variable_genes<'py>(
                             .extract::<numpy::PyReadonlyArray1<bool>>()?
                             .as_slice()?
                             .to_vec();
-                        let x_obj = adata.getattr("X")?;
-                        apply_hvg_subset(py, adata, &x_obj, &mask)?;
+                        apply_hvg_subset(py, adata, &mask)?;
                     }
                     return Ok(());
                 }
@@ -377,7 +378,6 @@ pub fn highly_variable_genes<'py>(
         return hvg_on_source(
             py,
             adata,
-            &x,
             &source,
             n_obs,
             n_vars,
@@ -406,7 +406,6 @@ pub fn highly_variable_genes<'py>(
         return hvg_on_source(
             py,
             adata,
-            &x,
             &source,
             n_obs,
             n_vars,
@@ -436,7 +435,6 @@ pub fn highly_variable_genes<'py>(
         return hvg_on_source(
             py,
             adata,
-            &x,
             &source,
             n_obs,
             n_vars,
@@ -506,7 +504,6 @@ pub fn highly_variable_genes<'py>(
 fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
-    x_obj: &Bound<'py, PyAny>,
     source: &S,
     n_obs: usize,
     n_vars: usize,
@@ -522,7 +519,6 @@ fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
         "seurat_v3" | "seurat_v3_paper" => hvg_seurat_v3(
             py,
             adata,
-            x_obj,
             source,
             n_obs,
             n_vars,
@@ -536,7 +532,6 @@ fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
         "seurat" => hvg_seurat(
             py,
             adata,
-            x_obj,
             source,
             n_obs,
             n_vars,
@@ -674,7 +669,6 @@ pub(super) fn build_shard_source(
 fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
-    x_obj: &Bound<'py, PyAny>,
     source: &S,
     n_obs: usize,
     n_vars: usize,
@@ -1006,89 +1000,91 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
     // produces the same HVG mask as a direct 1-batch run on that batch
     // alone — that's the contract the parity test in
     // tests/test_hvg_loess_singularity.py asserts.
-    let (hvg_mask, ranks) = if n_valid_batches > 1 {
-        // Per-batch ranks: for each surviving batch, rank genes by
-        // normalized variance (descending). Failed batches are skipped
-        // so they neither cast a rank vote nor count toward
-        // `nbatches_hv` / `median_ranks`.
-        let mut batch_ranks: Vec<Vec<usize>> = Vec::new();
-        for (b, nv) in all_norm_vars.iter().enumerate() {
-            if batch_failed[b] {
-                continue;
-            }
-            let mut indices: Vec<usize> = (0..n_vars).collect();
-            indices.sort_by(|&a, &c| {
-                nv[c]
-                    .partial_cmp(&nv[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let mut rank = vec![0usize; n_vars];
-            for (r, &idx) in indices.iter().enumerate() {
-                rank[idx] = r;
-            }
-            batch_ranks.push(rank);
+    // Per-batch dense ranks (0 = most variable), matching scanpy's
+    // `argsort(argsort(-norm_gene_vars))`. Failed batches cast no rank vote and
+    // don't count toward `nbatches_hv` / `median_ranks`. A single surviving
+    // batch is just the 1-row case of the same algorithm (its `mean_norm_var`
+    // equals that batch's `norm_gene_var`), so we use one code path for both.
+    let mut batch_ranks: Vec<Vec<usize>> = Vec::new();
+    for (b, nv) in all_norm_vars.iter().enumerate() {
+        if batch_failed[b] {
+            continue;
         }
-
-        // Count in how many batches each gene is in top n_top_genes
-        let mut nbatches_hv = vec![0usize; n_vars];
-        let mut median_ranks = vec![f64::NAN; n_vars];
-        for j in 0..n_vars {
-            let ranks_j: Vec<usize> = batch_ranks.iter().map(|br| br[j]).collect();
-            nbatches_hv[j] = ranks_j.iter().filter(|&&r| r < n_top_genes).count();
-            // Median of ranks where gene is in top n_top_genes
-            let mut valid: Vec<f64> = ranks_j
-                .iter()
-                .filter(|&&r| r < n_top_genes)
-                .map(|&r| r as f64)
-                .collect();
-            if !valid.is_empty() {
-                valid.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                median_ranks[j] = valid[valid.len() / 2];
-            }
-        }
-
-        // Sort genes: by nbatches (desc), then median_rank (asc)
-        let mut gene_order: Vec<usize> = (0..n_vars).collect();
-        if flavor == "seurat_v3_paper" {
-            gene_order.sort_by(|&a, &b| {
-                nbatches_hv[b].cmp(&nbatches_hv[a]).then(
-                    median_ranks[a]
-                        .partial_cmp(&median_ranks[b])
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-            });
-        } else {
-            gene_order.sort_by(|&a, &b| {
-                median_ranks[a]
-                    .partial_cmp(&median_ranks[b])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(nbatches_hv[b].cmp(&nbatches_hv[a]))
-            });
-        }
-
-        let mut mask = vec![false; n_vars];
-        let mut rank_out = vec![f64::NAN; n_vars];
-        for (r, &g) in gene_order.iter().enumerate().take(n_top_genes.min(n_vars)) {
-            mask[g] = true;
-            rank_out[g] = r as f64;
-        }
-        (mask, rank_out)
-    } else {
-        // Single batch: simple rank by normalized variance descending
         let mut indices: Vec<usize> = (0..n_vars).collect();
-        indices.sort_by(|&a, &b| {
-            mean_norm_var[b]
-                .partial_cmp(&mean_norm_var[a])
+        indices.sort_by(|&a, &c| {
+            nv[c]
+                .partial_cmp(&nv[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let mut mask = vec![false; n_vars];
-        let mut rank_out = vec![f64::NAN; n_vars];
-        for (r, &g) in indices.iter().enumerate().take(n_top_genes.min(n_vars)) {
-            mask[g] = true;
-            rank_out[g] = r as f64;
+        let mut rank = vec![0usize; n_vars];
+        for (r, &idx) in indices.iter().enumerate() {
+            rank[idx] = r;
         }
-        (mask, rank_out)
+        batch_ranks.push(rank);
+    }
+
+    // scanpy: `num_batches_high_var = sum(rank < n_top_genes, axis=0)`;
+    // ranks >= n_top_genes are masked to NaN, then `highly_variable_rank` is
+    // the per-gene `np.ma.median` over surviving batches (NaN when the gene is
+    // never in any batch's top-N). `np.ma.median` AVERAGES the two middle
+    // values for an even count — not the upper-middle element.
+    let mut nbatches_hv = vec![0u32; n_vars];
+    let mut median_ranks = vec![f64::NAN; n_vars];
+    for j in 0..n_vars {
+        let mut valid: Vec<f64> = batch_ranks
+            .iter()
+            .map(|br| br[j])
+            .filter(|&r| r < n_top_genes)
+            .map(|r| r as f64)
+            .collect();
+        nbatches_hv[j] = valid.len() as u32;
+        if !valid.is_empty() {
+            valid.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let m = valid.len();
+            median_ranks[j] = if m % 2 == 1 {
+                valid[m / 2]
+            } else {
+                0.5 * (valid[m / 2 - 1] + valid[m / 2])
+            };
+        }
+    }
+
+    // Sort with scanpy's key + `na_position="last"`: NaN median-ranks sort
+    // after all finite ranks (mapped to +inf here). seurat_v3 sorts by
+    // (rank asc, nbatches desc); seurat_v3_paper by (nbatches desc, rank asc).
+    let rank_key = |g: usize| {
+        if median_ranks[g].is_nan() {
+            f64::INFINITY
+        } else {
+            median_ranks[g]
+        }
     };
+    let mut gene_order: Vec<usize> = (0..n_vars).collect();
+    if flavor == "seurat_v3_paper" {
+        gene_order.sort_by(|&a, &b| {
+            nbatches_hv[b].cmp(&nbatches_hv[a]).then(
+                rank_key(a)
+                    .partial_cmp(&rank_key(b))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+    } else {
+        gene_order.sort_by(|&a, &b| {
+            rank_key(a)
+                .partial_cmp(&rank_key(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(nbatches_hv[b].cmp(&nbatches_hv[a]))
+        });
+    }
+
+    // scanpy: `highly_variable = sorted_index[:n_top_genes]`. The published
+    // `highly_variable_rank` is the per-gene median rank (NaN-preserving), NOT
+    // the final selection order.
+    let mut hvg_mask = vec![false; n_vars];
+    for &g in gene_order.iter().take(n_top_genes.min(n_vars)) {
+        hvg_mask[g] = true;
+    }
+    let ranks = median_ranks;
 
     // ── 5. Write results to adata.var ───────────────────────────────────
     let var = adata.getattr("var")?;
@@ -1106,13 +1102,52 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
         numpy::PyArray::from_vec(py, mean_norm_var),
     )?;
     var.set_item("highly_variable_rank", numpy::PyArray::from_vec(py, ranks))?;
+    // scanpy writes `highly_variable_nbatches` only when a batch_key was given.
+    if batch_key.is_some() {
+        var.set_item(
+            "highly_variable_nbatches",
+            numpy::PyArray::from_vec(py, nbatches_hv),
+        )?;
+    }
 
     // ── 6. Subset if requested ──────────────────────────────────────────
     if subset {
-        apply_hvg_subset(py, adata, x_obj, &hvg_mask)?;
+        apply_hvg_subset(py, adata, &hvg_mask)?;
     }
 
     Ok(())
+}
+
+/// Resolve the `expm1` scale for the seurat flavor from
+/// `adata.uns["log1p"]["base"]`.
+///
+/// scanpy un-`log1p`s with `x *= np.log(base)` only when a numeric `base` is
+/// recorded; natural-log / no recorded base is `scale = 1.0`. Mirrors
+/// `uns.get("log1p", {}).get("base")` and tolerates a missing/none/odd `uns`.
+fn log1p_base_scale(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<f64> {
+    let _ = py;
+    let uns = match adata.getattr("uns") {
+        Ok(u) => u,
+        Err(_) => return Ok(1.0),
+    };
+    let log1p = match uns.call_method1("get", ("log1p",)) {
+        Ok(v) if !v.is_none() => v,
+        _ => return Ok(1.0),
+    };
+    let base = match log1p.call_method1("get", ("base",)) {
+        Ok(v) if !v.is_none() => v,
+        _ => return Ok(1.0),
+    };
+    // Defensive: an unexpected `base` type (not a number) must not crash HVG —
+    // fall back to natural-log scale (1.0), matching the "no recorded base" case.
+    let base: f64 = match base.extract() {
+        Ok(b) => b,
+        Err(_) => return Ok(1.0),
+    };
+    if base <= 0.0 || base == 1.0 {
+        return Ok(1.0);
+    }
+    Ok(base.ln())
 }
 
 /// seurat flavor: log-normalized data, binned dispersion normalization.
@@ -1120,7 +1155,6 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
 fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
-    x_obj: &Bound<'py, PyAny>,
     source: &S,
     _n_obs: usize,
     n_vars: usize,
@@ -1143,13 +1177,22 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
         return Ok(());
     }
 
-    // ── 1. Streaming mean/var ───────────────────────────────────────────
+    // ── 1. Streaming mean/var in COUNT space ───────────────────────────
+    // scanpy's seurat flavor un-`log1p`s the matrix before computing moments:
+    // `x *= ln(base)` (identity for natural-log / no recorded base), then
+    // `expm1`. We stream the same count-space moments directly from the
+    // (log-transformed) shards. `scale = ln(base)`, or 1.0 when no base is
+    // recorded (matches scanpy's `uns.get("log1p", {}).get("base")`).
+    let scale = log1p_base_scale(py, adata)?;
     let stats = py
-        .detach(|| scx_accel::streaming_mean_var(source))
-        .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var: {e}")))?;
+        .detach(|| scx_accel::streaming_mean_var_expm1(source, scale))
+        .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_expm1: {e}")))?;
 
     // ── 2. Compute dispersion (matching scanpy's seurat flavor) ────────
-    let mut dispersions = vec![0.0f64; n_vars];
+    // scanpy publishes the LOG dispersion and the LOG1P count-space mean:
+    //   mean[mean==0] = 1e-12; dispersion = var/mean;
+    //   dispersion[dispersion==0] = NaN; dispersion = log(dispersion);
+    //   mean = log1p(mean).
     let mut log_dispersions = vec![f64::NAN; n_vars];
     let mut log_means = vec![0.0f64; n_vars];
     let mut means_for_disp = stats.means.clone();
@@ -1159,20 +1202,20 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
         if means_for_disp[j] == 0.0 {
             means_for_disp[j] = 1e-12;
         }
-        dispersions[j] = stats.variances[j] / means_for_disp[j];
+        let disp = stats.variances[j] / means_for_disp[j];
         // scanpy: dispersion[dispersion == 0] = NaN, then log(dispersion)
-        if dispersions[j] > 0.0 {
-            log_dispersions[j] = dispersions[j].ln();
-        } else {
-            dispersions[j] = f64::NAN;
+        if disp > 0.0 {
+            log_dispersions[j] = disp.ln();
         }
-        // scanpy: mean = log1p(mean) — overwrite mean with log1p for binning
-        log_means[j] = (means_for_disp[j] + 1.0).ln();
+        // scanpy: mean = log1p(mean) — count-space mean, logged for binning
+        // and for the published `means` column.
+        log_means[j] = means_for_disp[j].ln_1p();
     }
 
     // ── 3. Bin by mean, z-score dispersion within bins (via Python) ────
-    let log_means_np = numpy::PyArray::from_vec(py, log_means);
-    let log_disp_np = numpy::PyArray::from_vec(py, log_dispersions);
+    // Clone: `log_means` / `log_dispersions` are also published to `var` below.
+    let log_means_np = numpy::PyArray::from_vec(py, log_means.clone());
+    let log_disp_np = numpy::PyArray::from_vec(py, log_dispersions.clone());
 
     let helpers = py.import("pyscx._hvg_helpers")?;
     let dispersions_norm: Vec<f64> = helpers
@@ -1183,26 +1226,42 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
         .extract()?;
 
     // ── 4. Select top genes by normalized dispersion ────────────────────
+    // scanpy selects via `nan_to_num(dispersion_norm, nan=-inf) >= cutoff`, so
+    // NaN dispersions (zero-dispersion genes) must sort LAST and never be
+    // selected. Order NaN as -inf.
     let mut indices: Vec<usize> = (0..n_vars).collect();
     indices.sort_by(|&a, &b| {
-        dispersions_norm[b]
-            .partial_cmp(&dispersions_norm[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let va = if dispersions_norm[a].is_nan() {
+            f64::NEG_INFINITY
+        } else {
+            dispersions_norm[a]
+        };
+        let vb = if dispersions_norm[b].is_nan() {
+            f64::NEG_INFINITY
+        } else {
+            dispersions_norm[b]
+        };
+        vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let mut mask = vec![false; n_vars];
     for &g in indices.iter().take(n_top_genes.min(n_vars)) {
-        mask[g] = true;
+        // Never select a NaN-dispersion gene (scanpy's -inf floor).
+        if !dispersions_norm[g].is_nan() {
+            mask[g] = true;
+        }
     }
 
     // ── 5. Write results to adata.var ───────────────────────────────────
+    // scanpy publishes `means = log1p(count-space mean)` and
+    // `dispersions = log(var/mean)` (both may be NaN for zero-dispersion genes).
     let var = adata.getattr("var")?;
     var.set_item(
         "highly_variable",
         numpy::PyArray::from_vec(py, mask.clone()),
     )?;
-    var.set_item("means", numpy::PyArray::from_vec(py, stats.means))?;
-    var.set_item("dispersions", numpy::PyArray::from_vec(py, dispersions))?;
+    var.set_item("means", numpy::PyArray::from_vec(py, log_means))?;
+    var.set_item("dispersions", numpy::PyArray::from_vec(py, log_dispersions))?;
     var.set_item(
         "dispersions_norm",
         numpy::PyArray::from_vec(
@@ -1216,88 +1275,21 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
 
     // ── 6. Subset if requested ──────────────────────────────────────────
     if subset {
-        apply_hvg_subset(py, adata, x_obj, &mask)?;
+        apply_hvg_subset(py, adata, &mask)?;
     }
 
     Ok(())
 }
 
-/// Apply HVG subset: set column projection on X (and layers), slice var.
+/// Apply HVG subset: the same var-axis mutation `filter_genes` performs.
 ///
-/// Order: update X col_projection + layers FIRST so shapes match,
-/// then set `_var` (bypassing AnnData shape validation).
-fn apply_hvg_subset(
-    py: Python<'_>,
-    adata: &Bound<'_, PyAny>,
-    x_obj: &Bound<'_, PyAny>,
-    hvg_mask: &[bool],
-) -> PyResult<()> {
-    let mask_arr = numpy::PyArray::from_vec(py, hvg_mask.to_vec());
-
-    if let Ok(backed) = x_obj.cast::<ScxBackedSparseDataset>() {
-        let new_col_indices: Vec<u32> = match backed.borrow().col_projection() {
-            Some(existing) => hvg_mask
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| existing[i])
-                .collect(),
-            None => hvg_mask
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| i as u32)
-                .collect(),
-        };
-
-        // Update X and layers FIRST so shapes are consistent
-        backed
-            .borrow_mut()
-            .set_col_projection(new_col_indices.clone());
-        update_layers_col_projection(adata, &new_col_indices, false)?;
-
-        // Slice var via _var: AnnData's public var setter validates
-        // len(value) == self.n_vars, where n_vars is derived from the current
-        // _var DataFrame. Since we're changing the column count, the public
-        // setter would reject the new (shorter) DataFrame. Setting _var
-        // directly is the same approach used by anndata's own _inplace_subset_var.
-        let var = adata.getattr("var")?;
-        let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
-        adata.setattr("_var", filtered_var)?;
-    } else if let Ok(lazy) = x_obj.cast::<ScxLazyTransformedDataset>() {
-        let new_col_indices: Vec<u32> = match lazy.borrow().col_projection() {
-            Some(existing) => hvg_mask
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| existing[i])
-                .collect(),
-            None => hvg_mask
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| i as u32)
-                .collect(),
-        };
-
-        lazy.borrow_mut()
-            .set_col_projection(new_col_indices.clone());
-        update_layers_col_projection(adata, &new_col_indices, false)?;
-
-        // See comment above in backed branch for why _var is used.
-        let var = adata.getattr("var")?;
-        let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
-        adata.setattr("_var", filtered_var)?;
-    } else {
-        // In-memory scipy/dense X (the native in-memory HVG path). There is no
-        // col_projection to update — slice the AnnData in place. anndata's own
-        // `_inplace_subset_var` handles X, var, varm, and layers consistently,
-        // and preserves the result columns we just wrote to `var` (the boolean
-        // mask selects the kept rows of the already-updated frame).
-        adata.call_method1("_inplace_subset_var", (mask_arr,))?;
-    }
-
-    Ok(())
+/// `subset_var_axis` composes the new `col_projection` for a backed / lazy X
+/// and hands a plain in-memory X to anndata's `_inplace_subset_var`; either way
+/// it slices `_var` and every var-aligned member. The boolean mask selects rows
+/// of the *already-updated* var frame, so the HVG result columns written above
+/// survive.
+fn apply_hvg_subset(py: Python<'_>, adata: &Bound<'_, PyAny>, hvg_mask: &[bool]) -> PyResult<()> {
+    crate::axis_align::subset_var_axis(py, adata, hvg_mask)
 }
 
 /// Loess fit on (log10 mean, log10 var) for non-constant genes — the
@@ -1367,7 +1359,6 @@ fn csc_clip_val(means: &[f64], estimat_var: &[f64], n_obs: usize) -> Vec<f64> {
 fn csc_finish_seurat_v3(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
-    x_obj: &Bound<'_, PyAny>,
     n_obs: usize,
     n_vars: usize,
     means: Vec<f64>,
@@ -1418,7 +1409,7 @@ fn csc_finish_seurat_v3(
     var.set_item("highly_variable_rank", numpy::PyArray::from_vec(py, ranks))?;
 
     if subset {
-        apply_hvg_subset(py, adata, x_obj, &hvg_mask)?;
+        apply_hvg_subset(py, adata, &hvg_mask)?;
     }
     Ok(())
 }
@@ -1530,7 +1521,6 @@ fn hvg_seurat_v3_csc(
         return csc_finish_seurat_v3(
             py,
             adata,
-            &x,
             n_obs,
             n_vars,
             stats.means,
@@ -1566,7 +1556,6 @@ fn hvg_seurat_v3_csc(
         return csc_finish_seurat_v3(
             py,
             adata,
-            &x,
             n_obs,
             n_vars,
             stats.means,

@@ -508,7 +508,12 @@ class TestIndexPreservation:
 
         assert list(adata.var.index) == gene_names
 
-        pyscx.accel.filter_genes(adata, min_cells=1)
+        # The fixture's least-detected gene appears in 9 of 30 cells, so the
+        # original `min_cells=1` kept all 15 — and a filter that keeps
+        # everything is now skipped outright, leaving `var` untouched and this
+        # assertion vacuous. 12 keeps 9 of 15.
+        pyscx.accel.filter_genes(adata, min_cells=12)
+        assert 0 < adata.n_vars < len(gene_names), "filter must actually drop genes"
 
         for gene in adata.var.index:
             assert gene in gene_names, f"Gene {gene} not in original gene names"
@@ -522,7 +527,10 @@ class TestIndexPreservation:
         adata = pyscx.open(path).to_anndata(backed=True)
         pyscx.accel.normalize_total(adata, target_sum=1e4)
 
-        pyscx.accel.filter_genes(adata, min_cells=1)
+        # See the backed twin above: `min_cells=1` keeps all 15 genes, which is
+        # now a no-op, so the var index would never be re-sliced.
+        pyscx.accel.filter_genes(adata, min_cells=12)
+        assert 0 < adata.n_vars < len(gene_names), "filter must actually drop genes"
 
         for gene in adata.var.index:
             assert gene in gene_names

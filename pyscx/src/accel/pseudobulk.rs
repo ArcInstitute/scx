@@ -256,8 +256,13 @@ pub(super) fn aggregate_pseudobulk(
             unreachable!("type check above")
         }
     } else if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        // The handle's *view*: `obs_groups` came from `adata.obs`, so it is one
+        // label per *visible* cell. Streaming the raw reader would walk every
+        // on-disk row and trip the kernel's `obs_groups` length guard on any
+        // subset handle (`filter_cells` → `pseudobulk` used to raise).
+        let source = backed.as_shard_source();
         scx_accel::pseudobulk_aggregate(
-            &backed.backed,
+            &source,
             &obs_groups,
             groupby,
             &gene_names,
@@ -372,6 +377,14 @@ pub fn pseudobulk_dex(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
         )));
     }
+    // A presentation-ordered backed `X` (`preserve_var_order=True`) has no
+    // `ShardSource` spelling: the source emits columns in sorted on-disk order
+    // while `adata.var` — and so `gene_names` — stays in request order. Now
+    // that this op streams the handle's *view*, the two widths match, so the
+    // mismatch would be a silent gene/column permutation instead of a shape
+    // error. Refuse, as the other streaming accel ops do.
+    super::reject_preserve_var_order(adata, "pseudobulk_dex")?;
+
     if !matches!(backend, "pydeseq2" | "nb_glm") {
         return Err(PyValueError::new_err(format!(
             "Invalid backend={backend:?}; expected 'pydeseq2' or 'nb_glm'"
@@ -388,6 +401,16 @@ pub fn pseudobulk_dex(
              (batch/donor/well) directly in `groupby`, or use pyscx.accel.pdex_nb_glm \
              (which merges groupby + stratify_by for you).",
         ));
+    }
+    // §2.5: the NB count likelihood requires replicate-level *summed* counts.
+    // Fractional aggregates (mean/median) are not valid inputs to the model, so
+    // the count backend accepts only aggr_method="sum".
+    if backend == "nb_glm" && aggr_method != "sum" {
+        return Err(PyValueError::new_err(format!(
+            "pseudobulk_dex(backend=\"nb_glm\") requires aggr_method=\"sum\" (got \
+             {aggr_method:?}): the negative-binomial count model is defined on summed \
+             replicate counts, not fractional {aggr_method} aggregates."
+        )));
     }
 
     // Record the planned route on adata.uns["scx_accel"]["pseudobulk_dex"].
@@ -521,26 +544,49 @@ pub fn pseudobulk_dex(
     // assemble the same PyDESeq2-style pandas schema the pydeseq2 path returns.
     if backend == "nb_glm" {
         let test_col_idx = groupby.iter().position(|c| c == test_col).unwrap();
-        let nb_opts = super::nb_glm::nbglm_options_from_dict(py, nbglm_options)?;
+        // Split any explicit `contrast` out of nbglm_options (an explicit `None` is
+        // treated as absent); the rest is parsed as NbGlmOptions. An explicit
+        // `contrast` also triggers the design-aware path (it resolves against a
+        // named design).
+        let (contrast_override, opts_dict) = super::nb_glm::take_contrast_override(nbglm_options)?;
+        let nb_opts = super::nb_glm::nbglm_options_from_dict(py, opts_dict.as_ref())?;
         // `pseudobulk_dex` has no `device=` kwarg; the NB-GLM backend runs on CPU
         // here (the GPU path is reached via `pyscx.accel.pdex_nb_glm(device=…)`).
-        let df = super::nb_glm::fit_targets_pandas(
-            py,
-            &result,
-            test_col_idx,
-            reference,
-            &nb_opts,
-            None,
-        )?;
+        let df = if design.is_some() || contrast_override.is_some() {
+            // §3.11: honor a caller-supplied formula design + optional contrast.
+            // Default the formula to `~ `test_col`` (reproduces the intercept +
+            // target-indicator model, but as a single shared-dispersion fit).
+            // Backtick-quote so a non-identifier test_col (e.g. "cell type") is a
+            // valid formulaic token.
+            let owned_default;
+            let formula = match design {
+                Some(s) => s,
+                None => {
+                    owned_default = format!("~ `{test_col}`");
+                    owned_default.as_str()
+                }
+            };
+            super::nb_glm::fit_targets_pandas_with_design(
+                py,
+                &result,
+                test_col_idx,
+                reference,
+                formula,
+                contrast_override.as_ref(),
+                &nb_opts,
+                None,
+            )?
+        } else {
+            super::nb_glm::fit_targets_pandas(py, &result, test_col_idx, reference, &nb_opts, None)?
+        };
         return Ok(df.unbind());
     }
 
     // Build counts DataFrame and metadata DataFrame for pydeseq2.
     let pd = py.import("pandas")?;
-    let np = py.import("numpy")?;
 
     // counts_df: rows = pseudobulk samples, columns = genes
-    let counts_array = np.call_method1("array", (result.counts.clone(),))?;
+    let counts_array = numpy::PyArray1::from_slice(py, &result.counts);
     let counts_2d = counts_array.call_method1("reshape", ((result.n_groups, result.n_vars),))?;
 
     // Sample indices (row labels for pydeseq2 counts matrix).

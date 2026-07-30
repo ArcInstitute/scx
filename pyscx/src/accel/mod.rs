@@ -34,6 +34,7 @@ pub mod neighbors;
 pub mod pca;
 pub mod pflog;
 pub mod preprocessing;
+pub mod profile;
 pub mod pseudobulk;
 #[cfg(feature = "gpu")]
 pub mod rapids;
@@ -55,6 +56,15 @@ use pyo3::prelude::*;
 /// propagated into those paths, refuse loudly rather than return wrong data.
 ///
 /// No-op when `X` is not a presentation-ordered backed dataset.
+///
+/// Only the backed type is inspected, and deliberately so:
+/// `ScxLazyTransformedDataset` has no `col_presentation` field at all, and its
+/// `set_col_projection` always sorts and dedups, so a lazy `X`'s visible axis is
+/// sorted by construction. (`normalize_total` / `log1p` additionally reject a
+/// presentation-ordered backed `X` before wrapping it, so a lazy dataset can
+/// never inherit one.) Callers that rely on sorted visible order — notably the
+/// `calculate_qc_metrics` bitmask, which indexes `adata.var` positions directly
+/// — are safe on both types because of this, not because both are checked.
 pub(crate) fn reject_preserve_var_order(adata: &Bound<'_, PyAny>, op: &str) -> PyResult<()> {
     let Ok(x) = adata.getattr("X") else {
         return Ok(());

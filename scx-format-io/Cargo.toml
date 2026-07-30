@@ -1,6 +1,6 @@
 [package]
 name = "scx-format-io"
-version = "0.11.5"
+version = "0.11.7"
 edition = "2021"
 description = "Runtime reader/writer, backed/streaming access, and shard codec dispatch for the SCX format"
 license.workspace = true
@@ -8,11 +8,16 @@ authors.workspace = true
 
 [features]
 default = ["parallel", "deletion-vectors"]
-parallel = ["rayon"]
+# `parallel` covers both the rayon-backed decode helpers and the bounded ordered
+# decode-prefetch pipeline in `prefetch.rs` (which needs a bounded MPSC channel
+# on top of the pool). Without it every prefetch front-end still exists and
+# falls back to a plain sequential loop.
+parallel = ["rayon", "crossbeam-channel"]
 deletion-vectors = ["roaring"]
 
 [dependencies]
 rayon = { workspace = true, optional = true }
+crossbeam-channel = { workspace = true, optional = true }
 blake3 = { workspace = true }
 arrow = { workspace = true }
 memmap2 = { workspace = true }

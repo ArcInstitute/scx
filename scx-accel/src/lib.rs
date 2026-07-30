@@ -13,6 +13,7 @@ pub mod csc;
 pub mod diffexp;
 pub mod error;
 pub mod eval_metrics;
+pub(crate) mod finite;
 #[cfg(feature = "gpu")]
 pub mod fused;
 pub mod gene_score;
@@ -20,10 +21,13 @@ pub mod harmony;
 pub mod hvg;
 pub mod leiden;
 pub mod lisi;
+pub mod mem_budget;
 pub mod nb_glm;
 pub mod neighbors;
 pub mod pca;
 pub mod pflog;
+pub mod prefetch;
+pub mod projected_source;
 pub mod pseudobulk;
 pub mod route;
 pub mod umap;
@@ -58,7 +62,7 @@ pub use gene_score::{score_genes, ScoreMethod};
 pub use harmony::{harmony_integrate, BatchCovariate, HarmonyConfig, HarmonyResult};
 pub use hvg::{
     streaming_clip_square_sum, streaming_clip_square_sum_batched, streaming_mean_var,
-    streaming_mean_var_batched, BatchedHvgStats, HvgStats,
+    streaming_mean_var_batched, streaming_mean_var_expm1, BatchedHvgStats, HvgStats,
 };
 pub use leiden::{leiden, LeidenConfig, LeidenResult};
 pub use lisi::{compute_lisi, LisiConfig, LisiResult};
@@ -68,13 +72,15 @@ pub use nb_glm::{
 };
 pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{
-    covariance_pca, covariance_pca_inmemory, pflog_pca, randomized_pca, randomized_pca_inmemory,
-    PcaResult, COVARIANCE_PCA_THRESHOLD,
+    covariance_pca, covariance_pca_inmemory, covariance_pca_with_depth, pca_prefetch_depth,
+    pflog_pca, pflog_pca_with_depth, randomized_pca, randomized_pca_inmemory,
+    randomized_pca_with_depth, PcaResult, COVARIANCE_PCA_THRESHOLD,
 };
 pub use pflog::{
     estimate_alpha, pflog_baseline_from_delta, pflog_baseline_from_raw, AlphaEstimate,
     AlphaOptions, PFlog,
 };
+pub use projected_source::ProjectedShardSource;
 pub use pseudobulk::{
     build_group_mapping, pseudobulk_aggregate, pseudobulk_aggregate_dense,
     pseudobulk_aggregate_from_slices, pseudobulk_aggregate_inmemory, AggregationMethod,
@@ -82,7 +88,7 @@ pub use pseudobulk::{
 };
 #[cfg(feature = "gpu")]
 pub use pseudobulk::{
-    pseudobulk_means_gpu_backed, pseudobulk_means_gpu_dense, pseudobulk_means_gpu_from_slices,
+    pseudobulk_means_gpu_dense, pseudobulk_means_gpu_from_slices, pseudobulk_means_gpu_streaming,
 };
 #[cfg(feature = "gpu")]
 pub use route::plan_de_route_from_source;
@@ -113,6 +119,11 @@ pub use nb_glm::{finalize_nb_glm, gpu_nb_glm_fit_states, gpu_pseudobulk_nb_glm, 
 pub use neighbors::cuvs_available;
 #[cfg(feature = "gpu")]
 pub use pca::{gpu_available, gpu_info, randomized_pca_gpu, GpuInfo};
+/// CPU per-stage timing profiler (io / decode / reduction / marshalling),
+/// enabled by `SCX_CPU_PROFILE=1`. The CPU-path twin of [`scx_gpu::profile`];
+/// the ranking oracle for the Phase-2 performance tasks. See
+/// [`scx_format_io::profile`].
+pub use scx_format_io::profile as cpu_profile;
 #[cfg(feature = "gpu")]
 pub use scx_gpu::nvcomp::nvcomp_enabled;
 #[cfg(feature = "gpu")]

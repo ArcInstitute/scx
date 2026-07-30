@@ -66,6 +66,7 @@ from benchmarks.comprehensive.rss import current_rss_mb as _get_rss_mb
 from benchmarks.comprehensive.runners.accel_runner import (
     AcceleratorRunner,
     PreprocessedFixture,
+    cpu_profile_capture,
 )
 
 logger = logging.getLogger(__name__)
@@ -480,11 +481,16 @@ def run(
         gc.collect()
         t_adata = fixture.adata.copy()
 
+        # 2.0 ranking oracle: capture the CPU decode/io/reduction/marshalling
+        # breakdown for this op (no-op unless SCX_CPU_PROFILE=1). Populated into
+        # `extras` → `runs[].extra`.
+        extras: dict[str, Any] = {}
+
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
 
-        with dispatch_env(variant_key, requires_gpu):
+        with dispatch_env(variant_key, requires_gpu), cpu_profile_capture(extras):
             backend = impl(t_adata, n_comps, RANDOM_SEED)
 
         wall = time.perf_counter() - t0
@@ -492,7 +498,6 @@ def run(
         rss_after = _get_rss_mb()
 
         # Cosine similarity vs scanpy reference (top-k PCs).
-        extras: dict[str, Any] = {}
         try:
             emb = np.asarray(t_adata.obsm["X_pca"], dtype=np.float32)
             cos = _sign_agnostic_cosine_per_pc(ref_embedding, emb)

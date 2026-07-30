@@ -26,6 +26,19 @@ mod hdf_dtype;
 mod tenx_read;
 
 #[cfg(feature = "hdf5")]
+mod cellbender;
+#[cfg(feature = "hdf5")]
+pub use cellbender::{
+    is_cellbender_h5, read_cellbender_h5, CellBenderInfo, CellBenderOutput, CellBenderOutputKind,
+    CellBenderReadOptions, FeatureKey, LatentAlignment,
+};
+
+#[cfg(feature = "hdf5")]
+mod export_filter;
+#[cfg(feature = "hdf5")]
+pub use export_filter::min_counts_obs_mask;
+
+#[cfg(feature = "hdf5")]
 mod hdf5_threadsafe;
 #[cfg(feature = "hdf5")]
 mod permuted_reader;
@@ -128,6 +141,8 @@ pub use scx_mtx::MtxOrientation;
 mod convert_tests_common;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_dataframe;
+#[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_export_filter;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_group;
 #[cfg(all(test, feature = "hdf5"))]

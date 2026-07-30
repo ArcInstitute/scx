@@ -65,22 +65,29 @@ class TestPcaInMemory:
         assert sum(vr) <= 1.0 + 1e-6
 
     def test_cosine_similarity_vs_sklearn(self, synthetic_adata):
-        """Top PCs should match sklearn PCA (cosine sim > 0.99, accounting for sign)."""
+        """Top PCs should match sklearn PCA (cosine sim > 0.95, accounting for sign).
+
+        NOTE (Phase 1 §3.1): `pyscx.accel.pca` now auto-consumes
+        `adata.var['highly_variable']` when present (scanpy semantics), and this
+        fixture sets it. The fair sklearn reference is therefore PCA on the same
+        masked genes; SCX records `uns['pca']['params']['use_highly_variable']`.
+        """
         import pyscx
         from sklearn.decomposition import PCA
 
         n_comps = 5
-        adata = synthetic_adata.copy()
 
-        # sklearn PCA
-        X = adata.X.toarray()
-        pca_sk = PCA(n_components=n_comps, random_state=0)
-        X_pca_sk = pca_sk.fit_transform(X)
-
-        # SCX PCA
+        # SCX PCA (default → masks to highly_variable).
         adata2 = synthetic_adata.copy()
         pyscx.accel.pca(adata2, n_comps=n_comps, random_state=0)
         X_pca_scx = adata2.obsm["X_pca"]
+        assert bool(adata2.uns["pca"]["params"]["use_highly_variable"]) is True
+
+        # sklearn PCA on the SAME masked columns.
+        hvg = synthetic_adata.var["highly_variable"].to_numpy().astype(bool)
+        X = synthetic_adata.X.toarray()[:, hvg]
+        pca_sk = PCA(n_components=n_comps, random_state=0)
+        X_pca_sk = pca_sk.fit_transform(X)
 
         # Compare via cosine similarity (accounting for sign ambiguity)
         for pc in range(min(3, n_comps)):

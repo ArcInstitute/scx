@@ -1,6 +1,6 @@
 [package]
 name = "scx-convert"
-version = "0.11.5"
+version = "0.11.7"
 edition = "2021"
 description = "External format <-> SCX conversion (h5ad, h5mu, MTX, 10x)"
 license.workspace = true
@@ -21,6 +21,7 @@ log = { workspace = true }
 # Only used by the hdf5-gated converters (f16 upcast + uns base64 envelope).
 half = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
+blake3 = { workspace = true }
 chrono = "0.4"
 scx-format-io = { path = "../scx-format-io" }
 scx-codec = { path = "../scx-codec" }

@@ -2298,6 +2298,7 @@ _DE_ROUTE_SIGNALS = [
     "wilcoxon_route_gpu_correct",
     "wilcoxon_route_csc_direct",
     "de_route_csc_direct",
+    "de_route_resident_csr",
 ]
 
 

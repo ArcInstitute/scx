@@ -137,11 +137,16 @@ fn edist_device_dispatch(
     Ok((gpu_dev, info))
 }
 
-/// Backed-CSR pseudobulk means — GPU when `gpu_dev` is `Some`, else CPU.
-fn agg_backed(
+/// Streaming pseudobulk means over a CSR shard source — GPU when `gpu_dev` is
+/// `Some`, else CPU.
+///
+/// Generic over the source so a backed handle can hand over its *view*:
+/// `obs_groups` is one label per visible cell, so a subset handle streamed as
+/// its raw reader would misalign (and trip the kernel's length guard).
+fn agg_streaming<S: scx_format_io::ShardSource + Sync>(
     py: Python<'_>,
     gpu_dev: &EvalGpuDev,
-    reader: &scx_format_io::backed::BackedCsrReader,
+    source: &S,
     obs_groups: &[Vec<String>],
     groupby_columns: &[String],
     gene_names: &[String],
@@ -150,9 +155,9 @@ fn agg_backed(
     #[cfg(feature = "gpu")]
     {
         if let Some(dev) = gpu_dev {
-            return scx_accel::pseudobulk_means_gpu_backed(
+            return scx_accel::pseudobulk_means_gpu_streaming(
                 dev,
-                reader,
+                source,
                 obs_groups,
                 groupby_columns,
                 gene_names,
@@ -166,7 +171,7 @@ fn agg_backed(
     }
     py.detach(|| {
         scx_accel::pseudobulk_aggregate(
-            reader,
+            source,
             obs_groups,
             groupby_columns,
             gene_names,
@@ -339,6 +344,14 @@ fn pseudobulk_means_impl<'py>(
     min_cells_per_group: usize,
     gpu_dev: &EvalGpuDev,
 ) -> PyResult<Py<PyAny>> {
+    // A presentation-ordered backed `X` (`preserve_var_order=True`) has no
+    // `ShardSource` spelling: the source emits columns in sorted on-disk order
+    // while `adata.var` — and so `gene_names` — stays in request order. Now
+    // that this op streams the handle's *view*, the two widths match, so the
+    // mismatch would be a silent gene/column permutation instead of a shape
+    // error. Refuse, as the other streaming accel ops do.
+    super::reject_preserve_var_order(adata, "pseudobulk_means")?;
+
     let np = py.import("numpy")?;
 
     // Extract groupby column from adata.obs as Vec<String>.
@@ -367,12 +380,14 @@ fn pseudobulk_means_impl<'py>(
     // only the plain `&[T]` slices cross `detach`.
     let x = adata.getattr("X")?;
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-        let backed_reader = std::sync::Arc::clone(&backed.backed);
+        // The handle's *view* — `obs_groups` / `gene_names` came off
+        // `adata.obs` / `adata.var`, so they describe the visible axes.
+        let source = backed.as_shard_source();
         drop(backed);
-        agg_backed(
+        agg_streaming(
             py,
             gpu_dev,
-            &backed_reader,
+            &source,
             &obs_groups,
             &groupby_columns,
             &gene_names,
@@ -678,11 +693,22 @@ fn compute_aligned_pseudobulk_means<'py>(
         .map(|(i, s)| (s.as_str(), i))
         .collect();
 
-    let real_indices: Vec<usize> = common.iter().map(|s| real_idx_map[s.as_str()]).collect();
-    let pred_indices: Vec<usize> = common.iter().map(|s| pred_idx_map[s.as_str()]).collect();
+    // `i64`, not `usize`. These are fancy indices, and the pre-4.3 spelling
+    // `np.array(vec_of_usize)` went through a Python list, so numpy inferred
+    // **int64**. `PyArray1::from_vec` preserves the Rust width instead, and a
+    // `Vec<usize>` would land as uint64 — a silent dtype change on an array
+    // that reaches numpy's indexing machinery. Collect at the target width.
+    let real_indices: Vec<i64> = common
+        .iter()
+        .map(|s| real_idx_map[s.as_str()] as i64)
+        .collect();
+    let pred_indices: Vec<i64> = common
+        .iter()
+        .map(|s| pred_idx_map[s.as_str()] as i64)
+        .collect();
 
-    let real_idx_arr = np.call_method1("array", (real_indices,))?;
-    let pred_idx_arr = np.call_method1("array", (pred_indices,))?;
+    let real_idx_arr = numpy::PyArray1::from_vec(py, real_indices);
+    let pred_idx_arr = numpy::PyArray1::from_vec(py, pred_indices);
 
     let means_real_ordered = means_real_np.get_item(&real_idx_arr)?;
     let means_pred_ordered = means_pred_np.get_item(&pred_idx_arr)?;

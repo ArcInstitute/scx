@@ -114,9 +114,21 @@ pub fn scx_to_h5mu_streaming(
         )));
     }
 
+    // `export_min_counts` sums one modality's X, which is ambiguous when every
+    // modality is being written. An explicit mask is unambiguous (the obs axis
+    // is shared across modalities), so it is honoured.
+    if opts.export_min_counts.is_some() {
+        return Err(ConvertError::Other(
+            "min_counts is ambiguous for a multimodal h5mu export (which modality's X?); \
+             pass an explicit obs mask, or export one modality with to_h5ad(modality=…)"
+                .into(),
+        ));
+    }
+
     let file = hdf5::File::create(h5mu_path)?;
     let root = file.as_group()?;
-    let keep_mask = crate::h5ad::stream_write::build_keep_mask(&reader)?;
+    let keep_mask =
+        crate::h5ad::stream_write::build_export_keep_mask(&reader, scx_path, 0, opts)?.mask;
     write_h5mu_root_attrs_and_global_blocks(&reader, &file, &root, keep_mask.as_deref(), sink)?;
 
     let mod_group = root.create_group("mod")?;
@@ -367,7 +379,12 @@ pub fn scx_modality_to_h5ad_streaming(
     let file = hdf5::File::create(h5ad_path)?;
     let root = file.as_group()?;
 
-    let keep_mask = crate::h5ad::stream_write::build_keep_mask(&reader)?;
+    // `modality_id` scopes a `min_counts` pre-pass to this modality's X.
+    let filter =
+        crate::h5ad::stream_write::build_export_keep_mask(&reader, scx_path, modality_id, opts)?;
+    let export_note =
+        crate::h5ad::stream_write::build_export_provenance(&reader, scx_path, opts, &filter);
+    let keep_mask = filter.mask;
 
     stream_csr_to_group_at(
         &root,
@@ -399,6 +416,19 @@ pub fn scx_modality_to_h5ad_streaming(
         opts,
         sink,
     )?;
+
+    // `write_modality_to_h5ad_non_x_blocks` writes no `/uns`, so a filtered
+    // modality export would otherwise silently skip the "records what it
+    // dropped" contract that the single-modality path upholds. Only
+    // materialised when a caller filter was actually applied, so unfiltered
+    // modality exports stay byte-identical.
+    if let Some(note) = export_note {
+        let uns = serde_json::json!({
+            crate::h5ad::stream_write::EXPORT_PROVENANCE_KEY: note,
+        });
+        let uns_group = root.create_group("uns")?;
+        crate::h5ad::write::write_uns_entries_at(&uns_group, &uns)?;
+    }
 
     Ok(())
 }

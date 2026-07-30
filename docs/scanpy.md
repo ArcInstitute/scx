@@ -377,6 +377,30 @@ count matches `/X[0]`); for high-cardinality categorical obs columns
 the writer emits the modern `categorical` group form so
 `anndata.read_h5ad` reads them cleanly at census scale.
 
+`to_h5ad` also takes an optional obs-axis row filter, so a large file can be
+exported as a subset without materialising it: `obs_mask=` (a boolean array) and
+`min_counts=` (a per-cell total-UMI floor, computed with one streaming pass over
+the CSR shards). Both are indexed in the **global / physical** obs row space —
+length must equal `pyscx.open(path).n_obs_physical`, not `.n_obs`, which is the
+post-deletion live count — and both are ANDed with the deletion-vector mask
+rather than replacing it, so a logically deleted row stays dropped. A filtered
+export records what it dropped in `uns["scx_export"]`. Both require
+`stream=True`.
+
+The motivating case is feeding a raw all-droplet file to CellBender
+`remove-background`:
+
+```python
+# Result-preserving pre-trim: CellBender's own prior estimation ignores
+# droplets at or below its --low-count-threshold, and never-analyzed barcodes
+# are all-zero rows in its output.
+pyscx.to_h5ad("raw.scx", "raw_trimmed.h5ad", min_counts=5)
+```
+
+Bring the corrected counts back with `pyscx.cellbender_import` /
+`scx cellbender-import` — see
+[docs/operations.md § CellBender import](operations.md#cellbender-import).
+
 ```python
 import pyscx
 
@@ -731,9 +755,15 @@ list(adata.var_names)  # ['CD8A', 'CD4', 'CD3E']  (request order)
 ```
 
 `preserve_var_order` works on the eager, backed, GPU, and query-engine
-(`obs_filter` + `var_names`) paths. It is **not** supported by
-`pyscx.accel.highly_variable_genes` on the resulting backed dataset (HVG
-discovery on a hand-ordered panel raises) — run HVG before projecting by name.
+(`obs_filter` + `var_names`) paths. It is **not** supported by the streaming
+accelerators on the resulting **backed** dataset: they decode columns in
+sorted on-disk order, so a request-ordered gene axis would silently misalign
+the result against `adata.var`. `highly_variable_genes`, `normalize_total`,
+`log1p`, `calculate_qc_metrics`, `score_genes`, `pflog`, `pca`,
+`pca_neighbors`, `pca_neighbors_umap`, `rank_genes_groups`, `pdex_ref`,
+`pseudobulk_means`, `pseudobulk_dex` and `pdex_nb_glm` raise `RuntimeError`
+rather than return misaligned output — run them before projecting by name, or
+re-open without `preserve_var_order`.
 
 Unknown names raise `KeyError` by default (`strict_var_names=True`). Pass
 `strict_var_names=False` to silently drop names absent from the var metadata
@@ -939,6 +969,20 @@ pyscx.accel.neighbors(adata, n_neighbors=15)
 pyscx.accel.umap(adata)
 sc.tl.leiden(adata)
 ```
+
+> **HVG masking without subsetting.** `pyscx.accel.pca(adata, mask_var=...)`
+> restricts PCA to the selected genes in-place (scanpy semantics): pass a
+> var-column name or a boolean array, or leave `mask_var=None` to auto-consume
+> `adata.var["highly_variable"]` when present. It projects columns on the fly
+> (backed/lazy/in-memory) — no HVG subset copy — and `varm["PCs"]` stays aligned
+> to the full `var` axis (excluded genes filled with 0), so you never need the
+> `adata[:, adata.var["highly_variable"]]` slice before PCA.
+>
+> **Behavior change (v0.11.6+):** matching scanpy, `mask_var=None` now
+> **auto-consumes** `adata.var["highly_variable"]` when that column exists — so a
+> PCA that previously ran on all genes will run on the HVG subset if you have
+> flagged HVGs. `uns["pca"]["params"]["use_highly_variable"]` records whether a
+> mask was applied. To force all genes, pass an all-`True` `mask_var`.
 
 ### Backed layers
 
@@ -1356,6 +1400,31 @@ All accelerators that support GPU expose a `device` parameter:
 > if it didn't take the ideal one. See
 > [docs/api.md § Accelerator route metadata](api.md#accelerator-route-metadata).
 
+### Axis-subsetting ops and the aligned members
+
+`filter_cells`, `filter_genes`, `subset_obs`, `subset_var`, and
+`highly_variable_genes(subset=True)` subset one axis of the AnnData in place.
+**anndata performs the subset** — pyscx only makes a backed `X` subsettable and
+keeps its lazy mappings off disk — so `obs`, `var`, `uns`, `raw`, unused
+categorical levels and every aligned member (`layers`, `obsm`, `obsp` on the obs
+axis; `layers`, `varm`, `varp` on the var axis) behave exactly as on an in-memory
+AnnData, and a failure part-way leaves the object untouched.
+
+What stays SCX-specific is what you would lose otherwise: the matrix is never
+materialized (`type(adata.X)` is unchanged by a filter), and a backed `obsp` /
+`varp` / `varm` is never pulled off disk — the subset is recorded and applied on
+first read, so `filter_cells` on a file carrying a kNN graph costs nothing extra
+unless you read `obsp`.
+
+Plain anndata indexing works on a backed `X` too: `adata[:, mask]` is a lazy view,
+`adata[mask].copy()` subsets and materializes, `adata[mask].to_memory()` gives a
+fully in-memory AnnData. Full table in
+[docs/api.md § Axis subsetting and aligned members](api.md#axis-subsetting-and-aligned-members).
+
+On a **lazy** `X` with an active column projection, `filter_cells` thresholds the
+visible-gene totals — the same numbers `adata.obs["total_counts"]` and
+`adata.X.sum(axis=1)` report, and what scanpy would compute on the sliced object.
+
 ### Compatibility matrix
 
 | Op                       | CPU | GPU | Scanpy-parity kwargs                                                  | scx-only kwargs                                |
@@ -1364,7 +1433,8 @@ All accelerators that support GPU expose a `device` parameter:
 | `log1p`                  | ✓   | ✓   | —                                                                     | `device`                                       |
 | `filter_cells`           | ✓   | —   | `min_genes`, `max_genes`, `min_counts`, `max_counts`                  | —                                              |
 | `filter_genes`           | ✓   | —   | `min_cells`, `max_cells`, `min_counts`, `max_counts`                  | —                                              |
-| `subset_obs`             | ✓   | —   | — (no direct scanpy equivalent)                                      | `mask_or_indices`                              |
+| `subset_obs`             | ✓   | —   | — (`adata[mask].copy()`, without materializing)                       | `mask_or_indices`                              |
+| `subset_var`             | ✓   | —   | — (`adata[:, mask].copy()`, without materializing)                    | `mask_or_indices`                              |
 | `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`                                         | `prefer_format`                                |
 | `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
 | `score_genes`            | ✓   | —   | `gene_list`, `ctrl_size`, `gene_pool`, `n_bins`, `score_name`, `random_state` | `method`, `layer`, `device`           |
@@ -1398,26 +1468,35 @@ kernel yet — it needs exact-rank parity that f32 gemm can't guarantee, and is
 already fast on the small `[P×G]` effect matrix; `device` is accepted for
 symmetry but always runs CPU.
 
-### `prefer_format="csr"|"csc"`: explicit column-major dispatch
+### `prefer_format="auto"|"csr"|"csc"`: column-major dispatch
 
 A subset of accelerators take a `prefer_format` kwarg that selects
-between the row-major CSR path (default) and the column-major CSC
-sidecar path. Entries that accept it:
+between the row-major CSR path and the column-major CSC sidecar path.
+Entries that accept it:
 
 | Function | CSC win |
 |----------|---------|
 | `pyscx.accel.highly_variable_genes` | Single-batch seurat_v3 only — single-pass per-column accumulators with no `O(n_vars)` row-wise scratch. Multi-batch and non-seurat_v3 raise. |
 | `pyscx.accel.rank_genes_groups` | Per gene chunk: read CSC slab + scatter into row-major dense buffer (vs decode every row + project for CSR). Clearest CSC win. |
 | `pyscx.accel.pseudobulk_dex` | Filtered-gene subsets only (`gene_indices=...` or column projection on `adata.X`). Full-gene pseudobulk has no CSC win and raises. |
-| `pyscx.accel.calculate_qc_metrics` | Gene-axis aggregations only (`total_counts`, `n_cells_by_counts`); cell-axis stays CSR. |
+| `pyscx.accel.calculate_qc_metrics` | Gene-axis aggregations only (`total_counts`, `n_cells_by_counts`); cell-axis stays CSR. Both axes take one shard pass each, whatever the `qc_vars` count. |
 | `pyscx.accel.col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | Per-column aggregations on `ScxBackedSparseDataset` / `ScxLazyTransformedDataset`. |
 | `pyscx.accel.pca` | **Rejects `prefer_format="csc"`** with `ValueError`. Covariance build and randomized SpMM are row-major; CSC offers no measurable speed-up. |
 
-**Default is `"csr"` everywhere.** No `"auto"` — the runtime can't
-guess whether CSC dispatch is safe (depends on the file having a
-sidecar AND the user's transform chain being column-local). No
-thread-local default. No env-var override. Each call sets the
-choice locally.
+**DE (`rank_genes_groups`, `pdex_ref`) defaults to `"auto"`; every
+other `prefer_format`-taking function defaults to `"csr"`.**
+`"auto"` (a **compatibility change** in the CPU-accelerator Phase-2
+work — DE previously defaulted to `"csr"`) resolves at call time
+against the *selected* matrix: on CPU it takes the CSC-direct route
+when a valid sidecar is available (sidecar present ∧ no active row
+deletion vector ∧ column-local transform chain — the same capability
+gate `"csc"` enforces) and CSR otherwise; on GPU it stays CSR so the
+planner routes `gpu_csc_v3` when a sidecar is present. The route and
+`csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`
+(`cpu_csc` vs `cpu_csr`). Pass `prefer_format="csr"` explicitly to pin
+the pre-change behaviour. The non-DE functions keep `"csr"` — the
+runtime does not yet auto-route them. No thread-local default; no
+env-var override; each call sets the choice locally.
 
 `prefer_format="csc"` requires *all* of the following; otherwise it
 raises `RuntimeError` with a message naming the missing capability:
@@ -1433,8 +1512,19 @@ raises `RuntimeError` with a message naming the missing capability:
    `pyscx.accel.filter_cells()` or `pyscx.accel.subset_obs()`, the
    dataset has `kept_to_global` set; CSC dispatch then raises until
    you `materialize()` or rebuild the file.
+4. No active column projection. After `pyscx.accel.filter_genes()`,
+   `pyscx.accel.subset_var()`, `highly_variable_genes(subset=True)` or
+   `adata[:, mask]`, the sidecar (written against the *full* gene axis)
+   no longer describes the visible one, so CSC dispatch raises. The CSR
+   path streams the projected window and works normally.
 
-Invalid values (e.g. `"auto"`, `"CSC"`) raise `ValueError`.
+Both subset cases are refusals, not silent fallbacks — the CSR default
+handles them, so reach for `prefer_format="csc"` before you subset, not
+after.
+
+Unknown values (e.g. `"CSC"`, `"bogus"`) raise `ValueError`. `"auto"`
+is accepted by `rank_genes_groups` / `pdex_ref` (and is their default);
+the other `prefer_format`-taking functions accept only `"csr"` / `"csc"`.
 
 ```python
 import pyscx
@@ -1492,14 +1582,15 @@ contiguous gene columns instead of decoding and projecting every row.
 > `prefer_format` are independent axes, and the GPU CSC-direct route is chosen
 > by the *route planner*, **not** by `prefer_format="csc"`:
 >
-> - **GPU-fast DE:** keep the **default `prefer_format="csr"`** and pass
->   `device="gpu"` (or `"auto"`). When the backed file has a CSC sidecar the
->   planner routes to `gpu_csc_v3` automatically; without one it uses
->   `gpu_csr_v3`. This is the intended GPU-fast entry point.
+> - **GPU-fast DE:** pass `device="gpu"` (or `"auto"`) with `prefer_format`
+>   left at its `"auto"` default (or set to `"csr"`) — both keep GPU on the
+>   planner-driven path. When the backed file has a CSC sidecar the planner
+>   routes to `gpu_csc_v3` automatically; without one it uses `gpu_csr_v3`. This
+>   is the intended GPU-fast entry point.
 > - `prefer_format="csc"` selects the **CPU** column-major streaming path
 >   (`cpu_csc`) — there is no GPU kernel behind that knob. With `device="auto"`
 >   it runs on CPU; combining it with an explicit `device="gpu"` raises a
->   `RuntimeError` that points you back to the default `prefer_format="csr"` +
+>   `RuntimeError` that points you back to `prefer_format="csr"`/`"auto"` +
 >   `device="gpu"` for GPU CSC-direct.
 >
 > In short: do **not** reach for `prefer_format="csc"` to get GPU speed — it is
@@ -1842,7 +1933,7 @@ pyscx.accel.leiden(adata, resolution=1.0)
 | `key_added` | `"leiden"` | Key in `adata.obs` for community labels |
 | `random_state` | 0 | Random seed for reproducibility |
 | `n_iterations` | 2 | **Unit differs by backend.** Rust-native (CPU): leidenalg-style outer iterations (default 2 is plenty — each is a full multilevel cycle). cuGraph (GPU): maps to cuGraph's `max_iter` (a *coarsening-pass* count). The leidenalg default of 2 would starve cuGraph's coarsening and produce a degenerate, over-partitioned result, so the cuGraph path uses cuGraph's own default of **100** whenever `n_iterations <= 2` (including the `-1`/`0` convergence sentinels); only values `> 2` are forwarded verbatim. The effective cap is recorded in `uns["leiden"]["params"]["max_iter"]`. |
-| `parallel` | `False` | Run the **Rust-native** Leiden in conflict-free batched mode. `False` (default) matches C++ leidenalg sequential moving. **Ignored on the cuGraph path** (warns when `True`). |
+| `parallel` | `False` | Run the **Rust-native** Leiden in conflict-free batched mode. `False` (default) reproduces C++ leidenalg's sequential move-node *ordering* (the refinement omits the paper's well-connectedness admissibility conditions). **Ignored on the cuGraph path** (warns when `True`). |
 | `device` | `"auto"` | `"auto"` (cuGraph if available, else Rust-native), `"cpu"` (Rust-native), `"gpu"` / `"gpu:N"` (cuGraph on CUDA device 0 or N — `gpu:N` pins via `cupy.cuda.Device(N)`). |
 | `theta` | 1.0 | cuGraph-only resolution scaling knob (forwarded to `cugraph.leiden(theta=...)`). **Ignored on the Rust-native path** (warns when non-default). |
 
@@ -1922,7 +2013,7 @@ pyscx.accel.leiden(adata)
 | `sigma` | `0.1` | Gaussian bandwidth for soft assignments. |
 | `lamb` | `None` | Ridge penalty. `None` enables dynamic estimation (`alpha × E[k,b]`). |
 | `max_iter` | `10` | Maximum Harmony outer iterations (cluster → correct rounds). |
-| `max_iter_kmeans` | `4` | Maximum k-means sub-iterations per Harmony iter. |
+| `max_iter_kmeans` | `6` | Maximum k-means sub-iterations per Harmony iter (must be ≥ 2×window_size so the convergence check can fire). |
 | `random_state` | `0` | RNG seed (`ChaCha8Rng` for determinism across runs). |
 | `device` | `"auto"` | `"cpu"` / `"gpu"` / `"auto"`. GPU path requires pyscx built with `--features gpu`. |
 
@@ -1990,9 +2081,11 @@ Returns a `numpy.ndarray` of length N and also writes the values to
 `adata.obs[f"lisi_{key}"]`.
 
 By default the implementation uses an exact brute-force kNN (per-row
-squared-norm expansion + per-cell top-k heap) to stay numerically in
-lockstep with the R `lisi` reference. On D1–D4 it is **~10× faster** than
-R `lisi::compute_lisi` with mean-LISI agreement within 0.8–2.4 %.
+squared-norm expansion + per-cell top-k heap) and follows the harmonypy /
+R `lisi` LISI formulation (raw-distance Gaussian kernel `exp(-D·β)`). On
+D1–D4 it is **~10× faster** than R `lisi::compute_lisi`; the previously
+reported mean-LISI agreement of 0.8–2.4 % predates the 2026-07 raw-distance
+kernel fix and is pending a benchmark recapture.
 Brute-force kNN is O(N²·d); above ~50k cells the exact path logs a hint
 to set `approximate_knn=True`, which swaps in an HNSW kNN for an
 order-of-magnitude speed-up at census scale (D5+) at the cost of small
@@ -2173,7 +2266,7 @@ df = sc.get.rank_genes_groups_df(adata, group="0")
 | `rankby_abs` | `False` | Sort genes by absolute z-score instead of signed score. `False` (default) matches scanpy's default: highest positive z-score first. `True` ranks by significance regardless of direction. |
 | `tie_correct` | `False` | Apply tie correction to the Wilcoxon rank-sum variance estimate. |
 | `gene_chunk_size` | `None` | Process genes in chunks of this size to limit memory. `None` processes all genes at once. |
-| `prefer_format` | `"csr"` | `"csr"` (default) or `"csc"` — selects the CPU column-major CSC streaming path when set to `"csc"`. |
+| `prefer_format` | `"auto"` | `"auto"` (default; CPU routes CSC-direct when a valid sidecar is present, else CSR), `"csr"`, or `"csc"`. |
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU routes to CSC-direct (`gpu_csc_v3`) when a sidecar is present, or CSR-direct (`gpu_csr_v3`) otherwise. |
 
 Benchmarked at 5.4s on 1M cells (3.2× faster than scanpy's 17.2s).
@@ -2201,7 +2294,7 @@ df = pyscx.accel.pdex_ref(adata, "perturbation", reference="non-targeting")
 | `epsilon` | `1e-9` | Finite-guard pseudocount on count-space means before fold-/percent-change (not CPM/MWU). Default keeps outputs finite; `0/0 → 0.0`. Pass `0.0` for legacy `±inf` on reference-undetected genes. |
 | `cpm_filter` | `None` | Optional CPM floor `T`: keep a gene iff `target_cpm > T` or `ref_cpm > T` (pooled arithmetic CPM, mode-independent); drops other rows, FDR recomputed over survivors. |
 | `gene_chunk_size` | `None` | Process genes in chunks to limit memory |
-| `prefer_format` | `"csr"` | `"csr"` or `"csc"` |
+| `prefer_format` | `"auto"` | `"auto"` (default), `"csr"`, or `"csc"` |
 | `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU takes the CSC-direct route (`gpu_csc_v3`) when a sidecar is present. |
 | `output` | `"polars"` | `"polars"` or `"pandas"` — output DataFrame type |
 
@@ -2312,6 +2405,12 @@ parametric trend fit + empirical-Bayes shrinkage + Wald inference). It is a
 DESeq2-*style* — **not** DESeq2-*identical* — estimator: the bar is ranking /
 effect-sign / significance parity, not bit-for-bit numerics. Keep PyDESeq2 when
 you need exact DESeq2 behaviour. There is **no GPU path** (no `device=` argument).
+
+By default it fits a fixed `[intercept, is_target]` design per non-reference level.
+Pass a `design=` **formula** (e.g. `"~ perturbation + donor"`) to fit a
+covariate-adjusted joint model instead — built via `formulaic` (the parser pydeseq2
+uses; needs the `nbglm` extra) with one shared-dispersion fit and per-level
+contrasts. See [docs/pseudobulk_nb_glm.md § Custom designs](pseudobulk_nb_glm.md#custom-designs-formula).
 
 Three entry points, all CPU-only:
 
@@ -2742,7 +2841,7 @@ parallelism — see [docs/multithreading.md](multithreading.md).
 | `pyscx.accel.pca` (CPU) | Rayon | Parallel covariance accumulation (thread-local matrices); streaming SpMM parallelizes inner products |
 | `pyscx.accel.neighbors` (CPU) | Rayon | Parallel kNN queries on HNSW index |
 | `pyscx.accel.umap` (CPU) | Single-threaded SGD | Edge updates are serial on CPU; GPU path uses CUDA kernel parallelism |
-| `pyscx.accel.leiden` | Opt-in rayon via `parallel=True` | Sequential by default (matches C++ leidenalg); parallel uses conflict-free graph coloring |
+| `pyscx.accel.leiden` | Opt-in rayon via `parallel=True` | Sequential by default (reproduces C++ leidenalg's move-node ordering); parallel uses conflict-free graph coloring |
 | `pyscx.accel.rank_genes_groups` | Rayon | Parallel Wilcoxon rank-sum across genes |
 | `pyscx.accel.pseudobulk_dex` | Rayon (aggregation) | Streaming aggregation is parallel; downstream `pydeseq2` testing runs single-threaded |
 | `pyscx.accel.highly_variable_genes` | Rayon (via streaming reader) | Parallelism comes from shard decode; the mean/var reduction itself is serial |
@@ -2762,6 +2861,94 @@ import os
 os.environ["RAYON_NUM_THREADS"] = "8"   # must be set before `import pyscx`
 import pyscx
 ```
+
+`RAYON_NUM_THREADS` sizes the process-wide rayon pool that most accelerators use.
+`SCX_ACCEL_NUM_THREADS` is a narrower ceiling for the accelerators' private rayon work —
+Harmony batch integration and both PCA covariance-accumulator paths (streaming and
+in-memory) — so you can cap those on a fat node without shrinking every op. It is read
+once at first use (set it before the first accelerator call); unset (the default) leaves
+today's behaviour unchanged, and the PCA memory-derived worker cap still applies on top of
+it. Other `SCX_ACCEL_*` knobs (`SCX_ACCEL_PREFETCH_DEPTH`,
+`SCX_ACCEL_REDUCTION_MODE`, `SCX_ACCEL_DE_MEMORY_BUDGET`) are documented in
+[performance.md](performance.md). `SCX_ACCEL_PREFETCH_DEPTH` bounds the
+decode-prefetch pipeline, which since Phase 4.2 also covers the backed
+aggregation kernels (QC, filtering, `col_*`, `normalize_total`'s row sums), their
+column-projected **CSR** and lazy/transformed twins, and GPU staging — so raising it
+raises peak memory (`depth` decoded shards in flight) across all of those, not
+just HVG.
+
+Three consequences worth knowing before you tune it:
+
+- **On a memory-tight GPU host, consider `SCX_ACCEL_PREFETCH_DEPTH=2`.** GPU
+  staging keeps host RSS low otherwise (1.7–4.5 GB in the Phase-4.2 capture), so
+  the extra `depth − 1` decoded shards are plainly visible there: **+19–46 %**
+  peak host RSS across every measured op. Depth 2 keeps most of the overlap at
+  roughly a third of the extra footprint. The default of 4 is tuned for
+  throughput, not for the tightest node.
+- **`RAYON_NUM_THREADS=1` now makes GPU staging fully sequential.** Before 4.2 it
+  had a dedicated `std::thread` that overlapped one shard ahead *unconditionally*;
+  the shared pipeline instead declines to engage on a single-thread pool (that
+  guard is what prevents a nested-call deadlock). If you pin
+  `RAYON_NUM_THREADS=1` for reproducibility, GPU HVG/DE will be **slower than
+  before 4.2**, not faster.
+- **`prefer_format="csc"` does not inherit the 4.2 speedups.** The CSC column
+  kernels reach their source through `&dyn ColumnShardSource` and still decode
+  serially; only the CSR paths are prefetched. They do benefit from the `col_*`
+  GIL release.
+
+Since Phase 4.5, `SCX_GPU_STAGING_MEMORY_BUDGET` (bytes) expresses the same
+bound in a unit that does not depend on the file: GPU staging derates the
+prefetch depth so `depth × per-shard-decoded-bytes` fits the budget, using the
+per-shard `nnz` the catalog already carries. Unset — the default — nothing is
+derated and the depth is exactly `SCX_ACCEL_PREFETCH_DEPTH`.
+
+### GPU DE device residency
+
+GPU DE's CSR route (`gpu_csr_v3`, the mandatory route for any file **without** a
+CSC sidecar) has no column-range prefilter, so before Phase 4.5 it walked every
+shard once **per gene chunk** — `n_gene_chunks × n_shards` host decodes and
+uploads. On a 61 497-gene file at the default 500-gene chunk that is 123 full
+passes over the matrix, and it made GPU DE almost entirely host-decode-bound.
+
+4.5 drains the source **once** into device-resident per-shard CSR buffers and
+serves every later chunk from VRAM, and narrows each row to the chunk's column
+window with a binary search instead of scanning the whole row and predicating
+per element. Neither changes what the kernels compute.
+
+The cost is device memory: one f32 value plus one i32 index per nonzero, so
+roughly `8 × nnz` bytes for the whole matrix on top of the per-chunk scratch.
+Two knobs:
+
+- **`SCX_GPU_DE_RESIDENT_MAX_FRAC`** (default `0.5`) — the fraction of *free*
+  VRAM the resident matrix may occupy. The remainder is what the per-chunk
+  gene-slab budget then sizes itself against, so a matrix that takes half the
+  card simply yields a smaller gene chunk rather than an OOM.
+- **`SCX_GPU_DE_RESIDENT=0`** — kill switch. Restores the pre-4.5 streaming
+  behaviour exactly.
+
+A third knob, `SCX_GPU_VALIDATE_PAR_MIN_NNZ`, sets the shard size above which
+the per-shard GPU-DE validation scan (strictly-increasing columns + finiteness)
+runs in parallel; default 65 536 nnz, and pinning it above any real shard's nnz
+restores the serial scan. It exists mainly so that choice stays measurable —
+the parallel scan is a **measured no-op** at current scales, because it runs on
+the consuming thread while the prefetch workers decode ahead and is therefore
+hidden behind decode.
+
+Residency is declined — silently and correctly — when the matrix does not fit
+the budget, or when there is only one gene chunk (streaming would run one pass
+anyway, so retaining the matrix would be pure cost). Because a declined run
+produces *identical output*, just slower, the only way to tell is the route
+stamp: `adata.uns["scx_accel"][<op>]["resident_csr"]` is `True` when residency
+engaged, `False` when the CSR route streamed, and `None` on a route with no
+residency decision to make (CPU, dense, or CSC-direct). A benchmark gate
+(`de_route_resident_csr`) floors it for exactly that reason.
+
+The CSC-direct route is unaffected: it already prefilters by column range and
+never re-decodes.
+
+The heavy accelerators, including `pyscx.accel.col_sums` and its siblings,
+release the GIL for their streaming scan, so they can be called concurrently
+from Python threads without serialising each other.
 
 The cloud runtime exposes its own knob:
 

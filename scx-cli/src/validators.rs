@@ -30,9 +30,49 @@ pub fn positive_usize(s: &str) -> Result<usize, String> {
     Ok(v)
 }
 
+/// Parse and validate that a string is a finite, non-negative `f64`.
+///
+/// Zero is allowed (a `--min-counts 0` no-op is meaningful); NaN and the
+/// infinities are not, because they silently produce an all-keep or all-drop
+/// mask rather than an error.
+///
+/// Use with `#[arg(value_parser = non_negative_f64)]`. Note that clap still
+/// treats a bare leading-hyphen token as a flag, so a user must write
+/// `--min-counts=-1` to reach this validator; the runtime guard in
+/// `run_convert` covers non-CLI callers.
+pub fn non_negative_f64(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|e| format!("invalid number '{s}': {e}"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!(
+            "value must be a finite non-negative number; got '{s}'"
+        ));
+    }
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_negative_f64_accepts_zero_and_positive() {
+        assert_eq!(non_negative_f64("0").unwrap(), 0.0);
+        assert_eq!(non_negative_f64("5").unwrap(), 5.0);
+        assert_eq!(non_negative_f64("12.5").unwrap(), 12.5);
+    }
+
+    #[test]
+    fn non_negative_f64_rejects_negative_nan_and_inf() {
+        for bad in ["-1", "-0.5", "nan", "inf", "-inf"] {
+            let err = non_negative_f64(bad).unwrap_err();
+            assert!(
+                err.contains("non-negative"),
+                "unhelpful message for {bad}: {err}"
+            );
+        }
+    }
 
     #[test]
     fn positive_u32_accepts_valid() {

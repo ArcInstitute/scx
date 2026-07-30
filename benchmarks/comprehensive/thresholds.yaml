@@ -96,6 +96,34 @@ absolute_floors:
     metric: wilcoxon_route_csc_direct
     min: 1.0
 
+  # GPU CSR device-residency gate (§9.11 / task 4.5). `accel_de.py` emits
+  # `de_route_resident_csr` **only on a `gpu_csr*` route**: 1.0 when the CSR
+  # route held the matrix device-resident across gene chunks, 0.0 when it
+  # silently fell back to re-decoding every shard for every chunk — the
+  # quadratic that made GPU DE 98.6 % host-decode-bound at census_500k.
+  #
+  # Emitted only on CSR because the CSC-direct route prefilters by column
+  # range and has no residency decision to make; scoring it would be
+  # meaningless rather than N/A. `check_absolute_floors` skips a triple whose
+  # metric is absent, so on a run that takes the CSC route these floors are
+  # simply inert — which is the same "no CSC fixture this run" shape the
+  # `*_csc_direct` gates above rely on, only mirrored.
+  #
+  # A 0.0 means one of: the VRAM pre-flight refused (the matrix outgrew
+  # `SCX_GPU_DE_RESIDENT_MAX_FRAC` of free memory — real, and worth knowing
+  # about at atlas scale), `SCX_GPU_DE_RESIDENT=0` leaked into the bench
+  # environment, or a dispatch regression. All three should fail the gate.
+  - benchmark: accel_de
+    format: accel_de__pyscx_pdex_ref_gpu
+    dataset: tabula_sapiens_100k
+    metric: de_route_resident_csr
+    min: 1.0
+  - benchmark: accel_de
+    format: accel_de__pyscx_wilcoxon_gpu
+    dataset: tabula_sapiens_100k
+    metric: de_route_resident_csr
+    min: 1.0
+
   # ── GPU pseudobulk NB-GLM (accel_de_nb_glm, route gpu_nb_glm_csr) ──────────
   # Three deterministic hard floors on the GPU variant, gated on the synthetic
   # stratified fixture `nb_glm_synth` (the only dataset that exercises the

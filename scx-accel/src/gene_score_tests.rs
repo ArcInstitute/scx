@@ -179,6 +179,46 @@ fn control_score_is_list_minus_control_mean() {
 }
 
 #[test]
+fn fused_weight_matches_two_accumulator_within_tolerance() {
+    // The score_genes fusion replaces the previous two-accumulator score
+    // `(Σ w_list·v) − (Σ w_ctrl·v)` with a single pass over the fused weight
+    // `w = w_list − w_ctrl`. The two agree only up to f64 re-association
+    // (one accumulator vs two subtracted once), so assert to a tight tolerance
+    // rather than byte-equality — this documents the numerical contract.
+    let rows = vec![
+        vec![10.0, 2.0, 3.0, 1.0, 5.0, 1.0],
+        vec![20.0, 4.0, 1.0, 1.0, 2.0, 8.0],
+        vec![5.0, 1.0, 9.0, 2.0, 1.0, 3.0],
+    ];
+    let n_vars = 6usize;
+    let src = source_from_dense_shards(&[&rows], n_vars);
+
+    // Disjoint list ({0,2}) and control ({1,4,5}) weight vectors.
+    let mut w_list = vec![0.0f64; n_vars];
+    for &g in &[0usize, 2] {
+        w_list[g] = 1.0 / 2.0;
+    }
+    let mut w_ctrl = vec![0.0f64; n_vars];
+    for &g in &[1usize, 4, 5] {
+        w_ctrl[g] = 1.0 / 3.0;
+    }
+
+    let two = streaming_weighted_row_sums(&src, &[w_list.clone(), w_ctrl.clone()]).unwrap();
+    let fused: Vec<f64> = w_list.iter().zip(&w_ctrl).map(|(a, b)| a - b).collect();
+    let one = streaming_weighted_row_sums(&src, std::slice::from_ref(&fused)).unwrap();
+
+    for i in 0..rows.len() {
+        let expected = two[0][i] - two[1][i];
+        assert!(
+            (one[0][i] - expected).abs() < 1e-12,
+            "cell {i}: fused {} vs two-accumulator {}",
+            one[0][i],
+            expected
+        );
+    }
+}
+
+#[test]
 fn control_selection_is_deterministic() {
     let means: Vec<f64> = (0..50).map(|i| i as f64).collect();
     let gene_list = [10u32, 25u32];

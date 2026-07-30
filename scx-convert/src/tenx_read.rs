@@ -5,7 +5,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
 
 use super::pipeline::ConvertError;
-use crate::h5ad::read::{read_f32_dataset, read_i32_dataset, read_i64_dataset};
+use crate::h5ad::read::{
+    read_f32_dataset, read_i32_dataset, read_i64_dataset, read_string_dataset,
+};
 
 pub struct TenXData {
     pub indptr: Vec<i64>,
@@ -24,8 +26,30 @@ pub struct TenXData {
 pub fn read_tenx_h5(file: &hdf5::File) -> Result<TenXData, ConvertError> {
     let matrix = file.group("matrix")?;
 
-    // Read shape: [n_genes, n_cells]
-    let shape: Vec<i64> = matrix.attr("shape")?.read_1d()?.to_vec();
+    // Read shape: [n_genes, n_cells].
+    //
+    // Real CellRanger (and CellBender) files write `/matrix/shape` as a
+    // *dataset*; some synthetic fixtures write it as an attribute. Accept
+    // either — reading only the attribute fails on real 10x output.
+    let shape: Vec<i64> = match matrix.dataset("shape") {
+        Ok(ds) => read_i64_dataset(&ds)?,
+        Err(_) => matrix
+            .attr("shape")
+            .map_err(|_| {
+                ConvertError::Other(
+                    "10x file has neither a `/matrix/shape` dataset nor a `shape` attribute"
+                        .to_string(),
+                )
+            })?
+            .read_1d()?
+            .to_vec(),
+    };
+    if shape.len() != 2 {
+        return Err(ConvertError::Other(format!(
+            "/matrix/shape must have 2 entries, found {}",
+            shape.len()
+        )));
+    }
     let n_genes = shape[0] as usize;
     let n_cells = shape[1] as usize;
 
@@ -38,8 +62,7 @@ pub fn read_tenx_h5(file: &hdf5::File) -> Result<TenXData, ConvertError> {
 
     // Build obs from barcodes
     let barcodes_ds = matrix.dataset("barcodes")?;
-    let barcodes: Vec<hdf5::types::VarLenUnicode> = barcodes_ds.read_1d()?.to_vec();
-    let barcode_strings: Vec<String> = barcodes.iter().map(|s| s.to_string()).collect();
+    let barcode_strings = read_string_dataset(&barcodes_ds)?;
     let obs_schema = Schema::new(vec![Field::new("barcode", DataType::Utf8, false)]);
     let obs = RecordBatch::try_new(
         Arc::new(obs_schema),
@@ -58,8 +81,7 @@ pub fn read_tenx_h5(file: &hdf5::File) -> Result<TenXData, ConvertError> {
 
     for col_name in &["id", "name", "feature_type"] {
         if let Ok(ds) = features.dataset(col_name) {
-            let data: Vec<hdf5::types::VarLenUnicode> = ds.read_1d()?.to_vec();
-            let strings: Vec<String> = data.iter().map(|s| s.to_string()).collect();
+            let strings = read_string_dataset(&ds)?;
             var_fields.push(Field::new(*col_name, DataType::Utf8, false));
             var_arrays.push(Arc::new(StringArray::from(
                 strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),

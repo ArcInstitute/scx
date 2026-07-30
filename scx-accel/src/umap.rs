@@ -167,6 +167,10 @@ pub fn compute_umap(
     let mut epoch_of_next_negative_sample: Vec<f64> = epochs_per_negative_sample.clone();
 
     let clip_val = 4.0_f64;
+    // `b` is a loop-invariant (set once from `find_ab_params`), so hoist `b - 1`
+    // out of the per-edge gradient. f64 subtraction of two invariants is
+    // deterministic → the SGD output is bit-identical to recomputing it inline.
+    let b_minus_1 = b - 1.0;
 
     for epoch in 0..n_epochs {
         let alpha = learning_rate * (1.0 - epoch as f64 / n_epochs as f64);
@@ -196,7 +200,7 @@ pub fn compute_umap(
             dist_sq = dist_sq.max(1e-10);
 
             // Gradient of attractive force
-            let grad_coeff = -2.0 * a * b * dist_sq.powf(b - 1.0) / (1.0 + a * dist_sq.powf(b));
+            let grad_coeff = -2.0 * a * b * dist_sq.powf(b_minus_1) / (1.0 + a * dist_sq.powf(b));
 
             for d in 0..n_components {
                 let grad = (grad_coeff * diff[d]).clamp(-clip_val, clip_val);
@@ -556,6 +560,28 @@ mod tests {
         assert_eq!(result.n_obs, 50);
         assert_eq!(result.n_components, 2);
         assert_eq!(result.embeddings.len(), 100);
+    }
+
+    #[test]
+    fn test_compute_umap_deterministic() {
+        // The serial SGD is deterministic: single seeded RNG stream + in-order
+        // edge iteration. Two runs with the same seed must produce byte-identical
+        // embeddings. This documents the determinism guarantee and guards the
+        // `b - 1` invariant hoist (and any future opt-in parallel work) against
+        // an accidental change to the serial numerics.
+        let (indptr, indices, data, n_obs) = test_graph();
+        let run = || {
+            compute_umap(
+                &indptr, &indices, &data, n_obs, 2, 100, 0.1, 1.0, 5, 1.0, 42, None,
+            )
+            .unwrap()
+        };
+        let a = run();
+        let b = run();
+        assert_eq!(a.embeddings.len(), b.embeddings.len());
+        for (x, y) in a.embeddings.iter().zip(&b.embeddings) {
+            assert_eq!(x.to_bits(), y.to_bits(), "UMAP output not deterministic");
+        }
     }
 
     #[test]

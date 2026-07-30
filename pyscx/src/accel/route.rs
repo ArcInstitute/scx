@@ -43,6 +43,7 @@ pub(crate) fn exec_info_to_pydict<'py>(
     d.set_item("device_id", info.device_id)?;
     d.set_item("bytes_uploaded", info.bytes_uploaded)?;
     d.set_item("n_shards_shufdelta_gpu", info.n_shards_shufdelta_gpu)?;
+    d.set_item("resident_csr", info.resident_csr)?;
     Ok(d)
 }
 

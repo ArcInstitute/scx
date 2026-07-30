@@ -63,7 +63,10 @@ from benchmarks.comprehensive.config import (
 )
 from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
 from benchmarks.comprehensive.rss import current_rss_mb as _get_rss_mb
-from benchmarks.comprehensive.runners.accel_runner import AcceleratorRunner
+from benchmarks.comprehensive.runners.accel_runner import (
+    AcceleratorRunner,
+    cpu_profile_capture,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -369,8 +372,12 @@ def run(
                 gc.collect()
                 rss_before = _get_rss_mb()
 
+                # 2.0 ranking oracle: capture the host-side decode/io breakdown
+                # the GPU-handoff load path pays (no-op unless SCX_CPU_PROFILE=1).
+                extras: dict[str, Any] = {}
                 t0 = time.perf_counter()
-                adata, info = _load()
+                with cpu_profile_capture(extras):
+                    adata, info = _load()
                 load_s = time.perf_counter() - t0
 
                 t1 = time.perf_counter()
@@ -381,12 +388,12 @@ def run(
                 rss_after = _get_rss_mb()
                 last_transfer_mode = info["transfer_mode"]
 
-                extras: dict[str, Any] = {
+                extras.update({
                     "load_to_gpu_s": load_s,
                     "pipeline_s": pipe_s,
                     "transfer_mode": info["transfer_mode"],
                     "bytes_uploaded": info["bytes_uploaded"],
-                }
+                })
                 if key == _SCX_DEVDECODE_KEY:
                     extras["scx_format_pipeline_devdecode_route"] = (
                         1.0 if info["transfer_mode"] == "scx_device_decode_gpu" else 0.0

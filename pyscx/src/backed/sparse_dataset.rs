@@ -190,6 +190,24 @@ impl ScxBackedSparseDataset {
         Some(backed_csc.as_ref() as &dyn scx_format_io::ColumnShardSource)
     }
 
+    /// [`Self::as_column_source`] as an **owned** handle, under the identical
+    /// gate.
+    ///
+    /// The borrowed form is tied to the `PyRef` it came from, so it cannot
+    /// cross a `py.detach(...)` boundary. Callers that release the GIL for the
+    /// streaming scan — `pyscx.accel.col_*` with `prefer_format="csc"` — take
+    /// this instead and get an `Arc` they can move into the detached closure.
+    ///
+    /// Keep the two gates in step: an `Arc` handed out here bypasses nothing,
+    /// but if the deletion-vector condition above ever grows a clause, this
+    /// must grow it too.
+    pub(crate) fn as_column_source_owned(&self) -> Option<Arc<BackedCscReader>> {
+        if self.kept_to_global.is_some() {
+            return None;
+        }
+        self.backed_csc.as_ref().map(Arc::clone)
+    }
+
     /// Set column projection on this dataset.
     /// `col_indices` are the original column indices to retain (will be sorted internally).
     /// Shape is adjusted: n_vars becomes col_indices.len().
@@ -282,6 +300,126 @@ impl ScxBackedSparseDataset {
             }
             None => csr,
         }
+    }
+
+    /// This handle's **view** as a streaming [`ShardSource`].
+    ///
+    /// `kept_to_global` and `col_projection` are folded in, and `n_obs` /
+    /// `n_vars` report the *visible* widths — so a kernel consuming this sees
+    /// exactly the matrix `adata.X` presents, and any per-cell / per-gene array
+    /// it produces lines up with `adata.obs` / `adata.var`.
+    ///
+    /// Reach for this, never for `&*self.backed`: the raw reader is *the file*,
+    /// not *the view*. It streams every on-disk row and column, silently
+    /// ignoring both fields — which is how PCA came to attribute each cell's
+    /// embedding to the wrong cell after a `filter_cells`.
+    ///
+    /// Mirrors [`crate::lazy_transform::ScxLazyTransformedDataset::as_shard_source`],
+    /// with an empty transform chain. Multi-pass kernels (out-of-core PCA)
+    /// should chain
+    /// [`with_cached_reads`](crate::lazy_transform::LazyShardSource::with_cached_reads)
+    /// to keep serving from the reader's decoded-shard LRU.
+    ///
+    /// `col_presentation` is **not** representable here (the source emits
+    /// columns in sorted-projection order). Callers must first reject a
+    /// presentation-ordered handle via
+    /// [`crate::accel::reject_preserve_var_order`].
+    pub(crate) fn as_shard_source(&self) -> crate::lazy_transform::LazyShardSource {
+        crate::lazy_transform::LazyShardSource::new(
+            Arc::clone(&self.backed),
+            Vec::new(),
+            self.kept_to_global.clone(),
+            self.col_projection.clone(),
+            self.shape_val.0,
+            self.shape_val.1,
+        )
+    }
+
+    /// Whether this handle is a strict *window* onto the file rather than the
+    /// whole of it — i.e. some axis has been subset.
+    ///
+    /// Lets a call site keep passing the raw reader in the (overwhelmingly
+    /// common) unsubset case, where the reader and the view are the same
+    /// matrix, and reach for [`Self::as_shard_source`] only when they differ.
+    /// That matters where the concrete reader type unlocks something a
+    /// `ShardSource` cannot express — GPU DE's CSC-direct route, which takes
+    /// `GpuDeShardInput::Backed { csr, csc }`.
+    ///
+    /// On that route the switch is **load-bearing**: the `csc` handed to
+    /// `Backed` is read straight off `backed_csc`, so it never passes through
+    /// `as_column_source()`'s deletion gate, and `csc_route_available` is not
+    /// consulted on GPU at all. Without this predicate a subset handle with a
+    /// sidecar runs the CSC-direct kernel against *on-disk* columns, and the
+    /// widths agree, so nothing catches it.
+    ///
+    /// Only the GPU DE dispatch needs this today — the CPU kernels are all
+    /// generic over `ShardSource` and take the view unconditionally.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    pub(crate) fn has_axis_view(&self) -> bool {
+        self.kept_to_global.is_some() || self.col_projection.is_some()
+    }
+
+    /// A second handle onto the same file, same window. O(1) — every heavy
+    /// field is behind an `Arc`.
+    pub(crate) fn clone_handle(&self) -> Self {
+        ScxBackedSparseDataset {
+            backed: Arc::clone(&self.backed),
+            backed_csc: self.backed_csc.clone(),
+            shape_val: self.shape_val,
+            n_shards: self.n_shards,
+            cache_shards: self.cache_shards,
+            kept_to_global: self.kept_to_global.clone(),
+            col_projection: self.col_projection.clone(),
+            col_presentation: self.col_presentation.clone(),
+            non_negative: self.non_negative,
+            modality_id: self.modality_id,
+            source_path: self.source_path.clone(),
+        }
+    }
+
+    /// A handle onto a sub-window of this one, composing rather than reading.
+    ///
+    /// Backs `anndata._core.index._subset`. `rows` / `cols` are positional
+    /// indices into the **visible** axes; `None` means "the whole axis". The
+    /// composed column map is in presentation order, so it goes in through
+    /// [`Self::set_col_projection_ordered`] — that is what keeps
+    /// `preserve_var_order` alive across `adata[:, idx]`.
+    pub(crate) fn subset_clone(
+        &self,
+        rows: Option<&[i64]>,
+        cols: Option<&[i64]>,
+    ) -> PyResult<Self> {
+        let mut out = self.clone_handle();
+        if let Some(rows) = rows {
+            let composed = crate::axis_align::compose_rows_positional(
+                self.kept_to_global.as_ref().map(|v| v.as_slice()),
+                rows,
+                self.shape_val.0,
+            )?;
+            // An identity map is not a subset. Installing one anyway would set
+            // `kept_to_global`, and *any* `kept_to_global` closes the CSC
+            // capability gate (`as_column_source` returns `None`) — permanently
+            // downgrading the `gpu_csc_v3` CSC-direct DE route on a file that
+            // was never really subset. The mutating ops guard this with an
+            // all-kept early return; this covers a caller that reaches
+            // `_subset` directly, e.g. `adata[np.arange(n_obs)]`.
+            if !crate::axis_align::is_identity_rows(
+                &composed,
+                self.shape_val.0,
+                self.kept_to_global.is_none(),
+            ) {
+                out.set_kept_to_global(composed);
+            }
+        }
+        if let Some(cols) = cols {
+            let base = self.visible_ondisk_in_presentation_order();
+            out.set_col_projection_ordered(crate::axis_align::compose_cols_positional(
+                base.as_deref(),
+                cols,
+                self.shape_val.1,
+            )?);
+        }
+        Ok(out)
     }
 
     /// Reorder a per-visible-column vector (in sorted-projection order) into
@@ -443,6 +581,13 @@ impl ScxBackedSparseDataset {
     }
 
     /// Copy — materializes the full matrix. Required by AnnData .copy().
+    ///
+    /// Deliberately *not* a lazy clone. `AnnData.copy()` on a view runs
+    /// `_subset(ref.X, idx).copy()`, so this is what makes the documented
+    /// `adata[mask].copy()` → "subset, materialize, then run scanpy" workflow
+    /// mean what it says. The in-place accelerators stay out-of-core by
+    /// building their replacement through `_mutated_copy(X=view.X, …)`, which
+    /// never calls `.copy()` on the matrix — see [`crate::axis_align`].
     pub(crate) fn copy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let mat = self.to_memory(py)?;
         mat.call_method0("copy")
@@ -1086,6 +1231,46 @@ impl ScxBackedSparseDataset {
         .map(|v| self.present_reorder(v))
     }
 
+    /// Fused column sums + nnz (`axis=0`), honoring column projection and
+    /// keep-mask. One shard scan in place of [`Self::col_sums_raw`] +
+    /// [`Self::col_nnz_raw`]; bit-identical to calling both.
+    pub(crate) fn col_sums_and_nnz_raw(&self) -> Result<(Vec<f64>, Vec<u32>), String> {
+        match (&self.col_projection, &self.kept_to_global) {
+            (Some(cols), Some(kept)) => {
+                projected_agg::col_sums_and_nnz_masked_projected(&self.backed, kept, cols)
+                    .map_err(|e| e.to_string())
+            }
+            (Some(cols), None) => projected_agg::col_sums_and_nnz_projected(&self.backed, cols)
+                .map_err(|e| e.to_string()),
+            (None, Some(kept)) => self
+                .backed
+                .col_sums_and_nnz_masked(kept)
+                .map_err(|e| e.to_string()),
+            (None, None) => self.backed.col_sums_and_nnz().map_err(|e| e.to_string()),
+        }
+        .map(|(sums, counts)| (self.present_reorder(sums), self.present_reorder(counts)))
+    }
+
+    /// Fused per-cell QC pass: row nnz, row sums and per-`qc_var` subset sums
+    /// over the visible columns, in a single shard scan.
+    ///
+    /// `qc_bits` is indexed by visible column (bit *k* ⇒ member of subset *k*);
+    /// see [`projected_agg::qc_row_pass`]. Row vectors are global-length —
+    /// apply [`Self::filter_row_results`] for the visible rows.
+    pub(crate) fn qc_row_pass_raw(
+        &self,
+        qc_bits: &[u64],
+        n_qc: usize,
+    ) -> Result<projected_agg::QcRowStats, String> {
+        projected_agg::qc_row_pass(
+            &self.backed,
+            self.col_projection.as_ref().map(|c| c.as_slice()),
+            qc_bits,
+            n_qc,
+        )
+        .map_err(|e| e.to_string())
+    }
+
     /// Per-row nnz counts (`axis=1`), honoring column projection.
     pub(crate) fn row_nnz_raw(&self) -> Result<Vec<i64>, String> {
         if let Some(ref cols) = self.col_projection {
@@ -1193,6 +1378,8 @@ impl ScxBackedSparseDataset {
                 op: op.to_string(),
                 threshold,
                 kept_to_global: self.kept_to_global.clone(),
+                col_projection: self.col_projection.clone(),
+                col_presentation: self.col_presentation.clone(),
                 non_negative: self.non_negative,
                 transforms: None,
             };

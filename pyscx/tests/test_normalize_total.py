@@ -107,17 +107,18 @@ class TestNormalizeTotalBacked:
         )
 
     def test_matches_scanpy_default_target(self, scx_file):
-        """Default target_sum=1e4 should match."""
+        """Default target_sum=None uses scanpy's median-of-positive-totals.
+        """
         import scanpy as sc
         import anndata
 
         path, X_ref = scx_file
 
         adata_ref = anndata.AnnData(X=X_ref.copy())
-        sc.pp.normalize_total(adata_ref, target_sum=1e4)
+        sc.pp.normalize_total(adata_ref)  # scanpy default: None → median
 
         adata = pyscx.open(path).to_anndata(backed=True)
-        pyscx.accel.normalize_total(adata)  # default target_sum
+        pyscx.accel.normalize_total(adata)  # new default: None → median
 
         lazy_X = adata.X.to_memory()
 
@@ -125,7 +126,27 @@ class TestNormalizeTotalBacked:
             lazy_X.toarray(),
             adata_ref.X.toarray(),
             atol=1e-3,
-            err_msg="default target_sum mismatch"
+            err_msg="default (None → median) mismatch vs scanpy default",
+        )
+
+    def test_default_differs_from_1e4(self, scx_file):
+        """Sanity: the new None-median default is NOT the old 1e4 behavior."""
+        path, X_ref = scx_file
+
+        orig_sums = np.asarray(X_ref.sum(axis=1)).ravel()
+        expected_median = float(np.median(orig_sums[orig_sums > 0]))
+        # Fixture median must be distinct from 1e4 for this test to be meaningful.
+        assert abs(expected_median - 1e4) > 1.0
+
+        adata = pyscx.open(path).to_anndata(backed=True)
+        pyscx.accel.normalize_total(adata)  # None → median
+        row_sums = np.asarray(adata.X.to_memory().sum(axis=1)).ravel()
+
+        nonzero = orig_sums > 0
+        # Non-zero rows now sum to the median, not 1e4.
+        np.testing.assert_allclose(
+            row_sums[nonzero], expected_median, rtol=1e-5,
+            err_msg="None default should scale nonzero rows to the median total",
         )
 
     def test_custom_target_sum(self, scx_file):
@@ -239,6 +260,26 @@ class TestNormalizeTotalScipy:
             adata_ref.X.toarray(),
             atol=1e-5,
             err_msg="scipy CSR fallback mismatch"
+        )
+
+    def test_scipy_fallback_none_median(self, scx_file):
+        """scipy path with default None forwards to scanpy's median default."""
+        import scanpy as sc
+        import anndata
+
+        _, X_ref = scx_file
+
+        adata = anndata.AnnData(X=X_ref.copy())
+        pyscx.accel.normalize_total(adata)  # None → scanpy median
+
+        adata_ref = anndata.AnnData(X=X_ref.copy())
+        sc.pp.normalize_total(adata_ref)  # scanpy default
+
+        np.testing.assert_allclose(
+            adata.X.toarray(),
+            adata_ref.X.toarray(),
+            atol=1e-5,
+            err_msg="scipy CSR fallback (None median) mismatch",
         )
 
 

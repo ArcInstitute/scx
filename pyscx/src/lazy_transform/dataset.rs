@@ -9,7 +9,7 @@ use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySlice, PyTuple};
 
-use scx_format_io::{BackedCscReader, BackedCsrReader};
+use scx_format_io::{prefetch, BackedCscReader, BackedCsrReader};
 use scx_sparse::ScxCsr;
 
 use crate::backed::detached;
@@ -178,6 +178,65 @@ impl ScxLazyTransformedDataset {
         self.col_projection.as_ref().map(|v| v.as_slice())
     }
 
+    /// A second handle onto the same window with the same transform chain.
+    ///
+    /// The per-row transform parameters are indexed by *global* row, so a
+    /// changed `kept_to_global` re-points the window without invalidating
+    /// them — which is why a row subset needs no transform surgery.
+    pub(crate) fn clone_handle(&self) -> Self {
+        Self {
+            backed: Arc::clone(&self.backed),
+            backed_csc: self.backed_csc.clone(),
+            shape_val: self.shape_val,
+            transforms: self.transforms.clone(),
+            kept_to_global: self.kept_to_global.clone(),
+            col_projection: self.col_projection.clone(),
+            non_negative: self.non_negative,
+            source_path: self.source_path.clone(),
+        }
+    }
+
+    /// The lazy twin of [`crate::backed::ScxBackedSparseDataset::subset_clone`].
+    ///
+    /// A lazy dataset has no `col_presentation`, so it cannot express a
+    /// column *reorder* — `set_col_projection` sorts. A composed order that is
+    /// not already ascending is therefore rejected rather than silently
+    /// permuted: `adata.var` would follow the request order while `X` followed
+    /// disk order, which is the silent-divergence class §9.18 exists to close.
+    /// A mask-derived subset (every `filter_genes` / HVG path) always composes
+    /// ascending and never hits this.
+    pub(crate) fn subset_clone(
+        &self,
+        rows: Option<&[i64]>,
+        cols: Option<&[i64]>,
+    ) -> PyResult<Self> {
+        let mut out = self.clone_handle();
+        if let Some(rows) = rows {
+            out.set_kept_to_global(crate::axis_align::compose_rows_positional(
+                self.kept_to_global.as_ref().map(|v| v.as_slice()),
+                rows,
+                self.shape_val.0,
+            )?);
+        }
+        if let Some(cols) = cols {
+            let composed = crate::axis_align::compose_cols_positional(
+                self.col_projection.as_ref().map(|v| v.as_slice()),
+                cols,
+                self.shape_val.1,
+            )?;
+            if composed.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(PyRuntimeError::new_err(
+                    "cannot reorder or repeat the columns of a lazily transformed X \
+                     (normalize_total / log1p / row_scale): the projection is stored \
+                     sorted, so var and X would disagree. Materialize first with \
+                     `adata.X = adata.X.to_memory()`.",
+                ));
+            }
+            out.set_col_projection(composed);
+        }
+        Ok(out)
+    }
+
     /// Apply all transforms in-place on a decoded CSR shard.
     ///
     /// `global_row_offset` is the starting global row index for this shard,
@@ -288,67 +347,63 @@ impl ScxLazyTransformedDataset {
     // when col_projection is active. See the doc comment on that method for
     // rationale.
 
-    /// Stream all shards, apply transforms, compute per-row sums.
+    /// Stream all shards, apply transforms, compute per-row sums over **every
+    /// on-disk column**, ignoring `col_projection`.
+    ///
+    /// The `_physical` suffix is load-bearing. Row statistics — unlike column
+    /// statistics — are *not* independent of the projection: a row sum over the
+    /// physical axis includes genes the caller cannot see. Anything user-facing
+    /// wants [`Self::streaming_row_sums`], which honors the projection; this
+    /// kernel exists only as that method's no-projection arm. Reaching for the
+    /// physical variant by accident is the §9.18 bug class (six call sites once
+    /// summed hidden genes into `X.sum(axis=1)` and `filter_cells` thresholds).
     ///
     /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
     /// it through `detached` with the GIL released.
-    pub(crate) fn streaming_row_sums(&self) -> Result<Vec<f64>, String> {
+    pub(crate) fn streaming_row_sums_physical(&self) -> Result<Vec<f64>, String> {
         let n_obs_global = self.backed.shape().0;
         let mut sums = vec![0.0f64; n_obs_global];
         let mut global_row = 0usize;
 
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
-            for row in 0..csr.n_rows() {
-                let s = csr.indptr[row] as usize;
-                let e = csr.indptr[row + 1] as usize;
-                sums[global_row + row] = csr.data[s..e].iter().map(|&v| v as f64).sum();
-            }
-            global_row += csr.n_rows();
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
+                for row in 0..csr.n_rows() {
+                    let s = csr.indptr[row] as usize;
+                    let e = csr.indptr[row + 1] as usize;
+                    sums[global_row + row] = csr.data[s..e].iter().map(|&v| v as f64).sum();
+                }
+                global_row += csr.n_rows();
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(sums)
     }
 
-    /// Stream all shards, apply transforms, compute per-row NNZ and sums in a single pass.
+    /// Stream all shards, apply transforms, compute per-row NNZ and sums over
+    /// the **visible** columns in a single pass.
     ///
-    /// Avoids the double I/O of calling `row_nnz()` + `streaming_row_sums()` separately.
-    /// NNZ is computed pre-transform (from indptr, which transforms don't change) while
-    /// sums are computed post-transform. Both use the same decoded shard.
+    /// Avoids the double I/O of `row_nnz_raw()` + `streaming_row_sums()`. Used
+    /// by `filter_cells` when both `min_genes` and `min_counts` are given.
     ///
-    /// Used by `filter_cells` when both `min_genes` and `min_counts` are specified.
+    /// Delegates to [`Self::streaming_qc_row_pass`] with an empty subset mask —
+    /// that kernel's `plain` branch *is* this computation, so there is one row
+    /// walk to keep correct rather than two. NNZ comes from the (projected)
+    /// `indptr`, which the value-wise transforms leave untouched.
+    ///
     /// Returns global-length vectors (NOT filtered through deletion vectors).
     ///
     /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
     /// it through `detached` with the GIL released.
     pub(crate) fn streaming_row_nnz_and_sums(&self) -> Result<(Vec<i64>, Vec<f64>), String> {
-        let n_obs_global = self.backed.shape().0;
-        let mut all_nnz = vec![0i64; n_obs_global];
-        let mut all_sums = vec![0.0f64; n_obs_global];
-        let mut global_row = 0usize;
-
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            // NNZ from indptr before transforms (transforms preserve sparsity pattern)
-            for row in 0..csr.n_rows() {
-                all_nnz[global_row + row] = csr.indptr[row + 1] - csr.indptr[row];
-            }
-            // Apply transforms then compute sums
-            self.apply_transforms(&mut csr, global_row);
-            for row in 0..csr.n_rows() {
-                let s = csr.indptr[row] as usize;
-                let e = csr.indptr[row + 1] as usize;
-                all_sums[global_row + row] = csr.data[s..e].iter().map(|&v| v as f64).sum();
-            }
-            global_row += csr.n_rows();
-        }
-        Ok((all_nnz, all_sums))
+        let stats = self.streaming_qc_row_pass(&[], 0)?;
+        Ok((stats.nnz, stats.sums))
     }
 
     /// Stream all shards, apply transforms, project to visible columns, compute per-row sums.
@@ -361,35 +416,69 @@ impl ScxLazyTransformedDataset {
     /// denominator), then calls `project_csr` to restrict to the projected gene subset
     /// before summing each row.
     ///
-    /// Falls back to `streaming_row_sums()` when no `col_projection` is active.
+    /// Falls back to [`Self::streaming_row_sums_physical`] when no
+    /// `col_projection` is active.
+    ///
+    /// **This is the row-sum kernel callers want.** It owns the unqualified
+    /// name deliberately: the projection-blind variant is
+    /// `streaming_row_sums_physical`, so picking the wrong one now requires
+    /// typing a suffix that says what it does.
     ///
     /// Returns a global-length vector (`n_obs_global`), NOT filtered through
     /// deletion vectors.
     ///
     /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
     /// it through `detached` with the GIL released.
-    pub(crate) fn streaming_row_sums_projected(&self) -> Result<Vec<f64>, String> {
-        let cols = match &self.col_projection {
-            Some(c) => c,
-            None => return self.streaming_row_sums(),
-        };
+    pub(crate) fn streaming_row_sums(&self) -> Result<Vec<f64>, String> {
+        match self.col_projection.clone() {
+            Some(cols) => self.streaming_row_sums_for_cols(&cols),
+            None => self.streaming_row_sums_physical(),
+        }
+    }
+
+    /// Stream all shards, apply transforms to the **full-width** shard, then
+    /// restrict to `cols` before summing each row.
+    ///
+    /// `cols` are indices into the underlying reader's column space (on-disk
+    /// columns), NOT the visible axis — a caller holding visible-space indices
+    /// must compose them through `col_projection` first.
+    ///
+    /// Transforms run before the projection so a prior `NormalizeTotal`
+    /// divides by the correct whole-row denominator; see
+    /// [`Self::streaming_row_sums`].
+    ///
+    /// Its only caller is [`Self::streaming_row_sums`], which passes
+    /// `self.col_projection` — already on-disk indices by construction, so the
+    /// composition caveat above does not apply there. Any *new* caller holding
+    /// visible-space indices must compose them itself; handing visible indices
+    /// straight to a reader is exactly the bug class this module's QC pass
+    /// exists to avoid.
+    ///
+    /// Returns a global-length vector (`n_obs_global`), NOT filtered through
+    /// deletion vectors.
+    pub(crate) fn streaming_row_sums_for_cols(&self, cols: &[u32]) -> Result<Vec<f64>, String> {
         let n_obs_global = self.backed.shape().0;
         let mut sums = vec![0.0f64; n_obs_global];
         let mut global_row = 0usize;
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
-            let projected = scx_engine::projection::project_csr(&csr, cols);
-            for row in 0..projected.n_rows() {
-                let s = projected.indptr[row] as usize;
-                let e = projected.indptr[row + 1] as usize;
-                sums[global_row + row] = projected.data[s..e].iter().map(|&v| v as f64).sum();
-            }
-            global_row += csr.n_rows();
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
+                let projected = scx_engine::projection::project_csr(&csr, cols);
+                for row in 0..projected.n_rows() {
+                    let s = projected.indptr[row] as usize;
+                    let e = projected.indptr[row + 1] as usize;
+                    sums[global_row + row] = projected.data[s..e].iter().map(|&v| v as f64).sum();
+                }
+                global_row += csr.n_rows();
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(sums)
     }
 
@@ -406,17 +495,22 @@ impl ScxLazyTransformedDataset {
         let mut sums = vec![0.0f64; n_vars];
         let mut global_row = 0usize;
 
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
-            for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-                sums[col as usize] += val as f64;
-            }
-            global_row += csr.n_rows();
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
+                for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                    sums[col as usize] += val as f64;
+                }
+                global_row += csr.n_rows();
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(sums)
     }
 
@@ -452,45 +546,50 @@ impl ScxLazyTransformedDataset {
         let mut col_nnz = vec![0usize; n_vars];
         let mut global_row = 0usize;
 
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
 
-            if let Some(ref kept) = self.kept_to_global {
-                let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
-                    Some(r) => r,
-                    None => {
-                        global_row += csr.n_rows();
-                        continue;
+                if let Some(ref kept) = self.kept_to_global {
+                    let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                        Some(r) => r,
+                        None => {
+                            global_row += csr.n_rows();
+                            return Ok(());
+                        }
+                    };
+                    let lo = kept.partition_point(|&r| r < s_start);
+                    let hi = kept.partition_point(|&r| r < s_end);
+                    for &g_row in &kept[lo..hi] {
+                        let local = (g_row - s_start) as usize;
+                        let s = csr.indptr[local] as usize;
+                        let e = csr.indptr[local + 1] as usize;
+                        for j in s..e {
+                            let c = csr.indices[j] as usize;
+                            let diff = csr.data[j] as f64 - col_means[c];
+                            sq_devs[c] += diff * diff;
+                            col_nnz[c] += 1;
+                        }
                     }
-                };
-                let lo = kept.partition_point(|&r| r < s_start);
-                let hi = kept.partition_point(|&r| r < s_end);
-                for &g_row in &kept[lo..hi] {
-                    let local = (g_row - s_start) as usize;
-                    let s = csr.indptr[local] as usize;
-                    let e = csr.indptr[local + 1] as usize;
-                    for j in s..e {
-                        let c = csr.indices[j] as usize;
-                        let diff = csr.data[j] as f64 - col_means[c];
+                } else {
+                    for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                        let c = col as usize;
+                        let diff = val as f64 - col_means[c];
                         sq_devs[c] += diff * diff;
                         col_nnz[c] += 1;
                     }
                 }
-            } else {
-                for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-                    let c = col as usize;
-                    let diff = val as f64 - col_means[c];
-                    sq_devs[c] += diff * diff;
-                    col_nnz[c] += 1;
-                }
-            }
 
-            global_row += csr.n_rows();
-        }
+                global_row += csr.n_rows();
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
 
         // Add contribution from implicit zeros
         let mut variances = vec![0.0f64; n_vars];
@@ -526,34 +625,224 @@ impl ScxLazyTransformedDataset {
             None => return self.streaming_col_sums(),
         };
 
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
 
-            let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
-                Some(r) => r,
-                None => {
-                    global_row += csr.n_rows();
-                    continue;
+                let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                    Some(r) => r,
+                    None => {
+                        global_row += csr.n_rows();
+                        return Ok(());
+                    }
+                };
+                let lo = kept.partition_point(|&r| r < s_start);
+                let hi = kept.partition_point(|&r| r < s_end);
+                for &g_row in &kept[lo..hi] {
+                    let local = (g_row - s_start) as usize;
+                    let s = csr.indptr[local] as usize;
+                    let e = csr.indptr[local + 1] as usize;
+                    for j in s..e {
+                        sums[csr.indices[j] as usize] += csr.data[j] as f64;
+                    }
                 }
-            };
-            let lo = kept.partition_point(|&r| r < s_start);
-            let hi = kept.partition_point(|&r| r < s_end);
-            for &g_row in &kept[lo..hi] {
-                let local = (g_row - s_start) as usize;
-                let s = csr.indptr[local] as usize;
-                let e = csr.indptr[local + 1] as usize;
-                for j in s..e {
-                    sums[csr.indices[j] as usize] += csr.data[j] as f64;
-                }
-            }
 
-            global_row += csr.n_rows();
-        }
+                global_row += csr.n_rows();
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(sums)
+    }
+
+    /// Fused per-cell QC pass through the transform chain: row nnz, row sums
+    /// and per-`qc_var` subset sums over the visible columns, in one scan.
+    ///
+    /// Lazy twin of [`crate::projected_agg::qc_row_pass`]. Transforms are
+    /// applied to the **full-width** shard before projection so a prior
+    /// `NormalizeTotal` divides by the denominator it was configured with; see
+    /// [`Self::streaming_row_sums`].
+    ///
+    /// nnz is counted **after** `apply_transforms`, from the projected
+    /// `indptr`. That is equivalent to counting it before: every [`Transform`]
+    /// variant rewrites `csr.data` only and none prunes entries, so the
+    /// sparsity pattern — and therefore the count — is unchanged. A future
+    /// transform that *does* change the pattern would have to revisit this and
+    /// count pre-transform. [`Self::streaming_row_nnz_and_sums`] delegates here
+    /// with an empty mask, so it inherits the same reasoning.
+    ///
+    /// Returns global-length vectors (NOT filtered through deletion vectors).
+    pub(crate) fn streaming_qc_row_pass(
+        &self,
+        qc_bits: &[u64],
+        n_qc: usize,
+    ) -> Result<crate::projected_agg::QcRowStats, String> {
+        let cols = self.col_projection.clone();
+        let n_visible = cols.as_deref().map_or(self.backed.shape().1, |c| c.len());
+        crate::projected_agg::ensure_qc_pass_args(n_qc, qc_bits, n_visible);
+        let mut out = crate::projected_agg::QcRowStats::zeroed(self.backed.shape().0, n_qc);
+        let mut global_row = 0usize;
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                let n_rows = csr.n_rows();
+                self.apply_transforms(&mut csr, global_row);
+                match cols.as_deref() {
+                    Some(c) => crate::projected_agg::accumulate_qc_rows_into(
+                        &scx_engine::projection::project_csr(&csr, c),
+                        global_row,
+                        qc_bits,
+                        &mut out,
+                    ),
+                    None => crate::projected_agg::accumulate_qc_rows_into(
+                        &csr, global_row, qc_bits, &mut out,
+                    ),
+                }
+                global_row += n_rows;
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        crate::projected_agg::ensure_full_row_coverage(global_row, self.backed.shape().0)
+            .map_err(|e| e.to_string())?;
+        Ok(out)
+    }
+
+    // --- Visible-space aggregation API ---
+    //
+    // The `*_raw` family is *the* aggregation surface for this type, mirroring
+    // `ScxBackedSparseDataset`'s. Every one of them speaks the **visible** axis:
+    // column vectors come back at `shape_val.1`, row vectors are global-length
+    // but summed only over projected columns (apply `filter_row_results` for the
+    // visible rows). Python entry points and accel ops should call these, never
+    // the `streaming_*` kernels underneath — that indirection is what keeps a
+    // caller from silently picking the physical-width variant (§9.18).
+
+    /// Per-row sums over the visible columns, through the transform chain.
+    /// Global-length; caller applies [`Self::filter_row_results`].
+    ///
+    /// Twin of `ScxBackedSparseDataset::row_sums_raw`.
+    pub(crate) fn row_sums_raw(&self) -> Result<Vec<f64>, String> {
+        self.streaming_row_sums()
+    }
+
+    /// Per-row nnz over the visible columns. Global-length; caller applies
+    /// [`Self::filter_row_results`].
+    ///
+    /// Reads the underlying backed reader rather than streaming through the
+    /// transform chain: nnz counts stored entries, and every [`Transform`]
+    /// rewrites values only. Twin of `ScxBackedSparseDataset::row_nnz_raw`.
+    pub(crate) fn row_nnz_raw(&self) -> Result<Vec<i64>, String> {
+        match &self.col_projection {
+            Some(cols) => crate::projected_agg::row_nnz_projected(&self.backed, cols)
+                .map_err(|e| e.to_string()),
+            None => self.backed.row_nnz().map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Fused per-row nnz + sums over the visible columns, in one scan.
+    /// Global-length; caller applies [`Self::filter_row_results`].
+    ///
+    /// The row-axis counterpart of [`Self::col_sums_and_nnz_raw`].
+    pub(crate) fn row_nnz_and_sums_raw(&self) -> Result<(Vec<i64>, Vec<f64>), String> {
+        self.streaming_row_nnz_and_sums()
+    }
+
+    /// Per-column sums through the transform chain, honoring column projection
+    /// and keep-mask. Length = `shape_val.1`.
+    ///
+    /// The visible-space wrapper over the physical-width `streaming_col_sums*`
+    /// kernels, mirroring `ScxBackedSparseDataset::col_sums_raw`. Prefer
+    /// [`Self::col_sums_and_nnz_raw`] when the caller also needs nnz — that is
+    /// one scan instead of two.
+    pub(crate) fn col_sums_raw(&self) -> Result<Vec<f64>, String> {
+        let physical = if self.kept_to_global.is_some() {
+            self.streaming_col_sums_masked()?
+        } else {
+            self.streaming_col_sums()?
+        };
+        Ok(self.apply_col_projection_to_vec(physical))
+    }
+
+    /// Fused per-column sums + nnz through the transform chain, honoring
+    /// column projection and keep-mask. Length = `shape_val.1`.
+    ///
+    /// One scan producing both statistics; the column-axis counterpart of
+    /// [`Self::streaming_qc_row_pass`]. NNZ counts stored entries, which the
+    /// value-wise transforms leave untouched, so it matches the raw reader's
+    /// `col_nnz`.
+    ///
+    /// The kept-row walk is inlined rather than delegating to
+    /// [`scx_format_io::BackedCsrReader::col_sums_and_nnz_masked`] because the
+    /// transform chain has to run on each decoded shard *before* the values are
+    /// accumulated — the backed kernel reads the untransformed shard.
+    pub(crate) fn col_sums_and_nnz_raw(&self) -> Result<(Vec<f64>, Vec<u32>), String> {
+        let n_vars = self.backed.shape().1; // physical width, projected below
+        let mut sums = vec![0.0f64; n_vars];
+        let mut counts = vec![0u32; n_vars];
+        let mut global_row = 0usize;
+
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                let n_rows = csr.n_rows();
+                self.apply_transforms(&mut csr, global_row);
+
+                match &self.kept_to_global {
+                    None => {
+                        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                            let c = col as usize;
+                            sums[c] += val as f64;
+                            counts[c] += 1;
+                        }
+                    }
+                    Some(kept) => {
+                        let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                            Some(r) => r,
+                            None => {
+                                global_row += n_rows;
+                                return Ok(());
+                            }
+                        };
+                        let lo = kept.partition_point(|&r| r < s_start);
+                        let hi = kept.partition_point(|&r| r < s_end);
+                        for &g_row in &kept[lo..hi] {
+                            let local = (g_row - s_start) as usize;
+                            let s = csr.indptr[local] as usize;
+                            let e = csr.indptr[local + 1] as usize;
+                            for j in s..e {
+                                let c = csr.indices[j] as usize;
+                                sums[c] += csr.data[j] as f64;
+                                counts[c] += 1;
+                            }
+                        }
+                    }
+                }
+                global_row += n_rows;
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+
+        let sums = self.apply_col_projection_to_vec(sums);
+        let counts = match &self.col_projection {
+            Some(cols) => cols.iter().map(|&c| counts[c as usize]).collect(),
+            None => counts,
+        };
+        Ok((sums, counts))
     }
 
     /// Materialize the full matrix with all transforms applied.
@@ -566,15 +855,20 @@ impl ScxLazyTransformedDataset {
         let mut global_row = 0usize;
         let mut all_slices = Vec::new();
 
-        for shard_idx in 0..self.backed.index().n_shards() {
-            let mut csr = self
-                .backed
-                .read_shard_uncached(shard_idx)
-                .map_err(|e| e.to_string())?;
-            self.apply_transforms(&mut csr, global_row);
-            global_row += csr.n_rows();
-            all_slices.push(csr);
-        }
+        prefetch::for_each_shard_ordered_uncached(
+            &*self.backed,
+            prefetch::prefetch_depth(),
+            |_shard_idx, csr| -> scx_format_io::Result<()> {
+                // The uncached read hands back a fresh refcount-1 Arc, so this
+                // unwraps for free; the transforms below need owned buffers.
+                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+                self.apply_transforms(&mut csr, global_row);
+                global_row += csr.n_rows();
+                all_slices.push(csr);
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
 
         // Concatenate all shards
         let full = concatenate_csr_vec(&all_slices, self.backed.n_vars());
@@ -946,8 +1240,11 @@ impl ScxLazyTransformedDataset {
     ///
     /// `axis=0` (column sums): streams in physical column space, then
     /// post-filters to projected columns via `apply_col_projection_to_vec()`.
-    /// `axis=1` (row sums): streams over full-width rows (transforms need all
-    /// columns), then filters to kept rows via `filter_row_results()`.
+    /// `axis=1` (row sums): [`Self::row_sums_raw`] applies transforms to the
+    /// full-width row (a prior `NormalizeTotal` needs the denominator it was
+    /// configured with) and *then* restricts to the projected columns, so the
+    /// result covers only genes the caller can see; `filter_row_results()`
+    /// selects the kept rows.
     #[pyo3(signature = (axis=None))]
     fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
@@ -969,14 +1266,14 @@ impl ScxLazyTransformedDataset {
             }
             Some(1) => {
                 let all_sums =
-                    detached(py, || self.streaming_row_sums()).map_err(PyRuntimeError::new_err)?;
+                    detached(py, || self.row_sums_raw()).map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_sums);
                 let arr = numpy::PyArray::from_vec(py, filtered);
                 arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
             }
             None => {
                 let all_sums =
-                    detached(py, || self.streaming_row_sums()).map_err(PyRuntimeError::new_err)?;
+                    detached(py, || self.row_sums_raw()).map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_sums);
                 let total: f64 = filtered.iter().sum();
                 Ok(total.into_pyobject(py)?.into_any())
@@ -987,8 +1284,10 @@ impl ScxLazyTransformedDataset {
 
     /// Mean along an axis, streaming through transforms.
     ///
-    /// Same column projection strategy as `sum()`: axis=0 computes in physical
-    /// column space, then post-filters via `apply_col_projection_to_vec()`.
+    /// Same projection strategy as `sum()`: axis=0 computes in physical column
+    /// space then post-filters via `apply_col_projection_to_vec()`; axis=1
+    /// sums only the visible columns via [`Self::row_sums_raw`], which is what
+    /// makes the `shape_val.1` denominator right.
     #[pyo3(signature = (axis=None))]
     fn mean<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
@@ -1011,7 +1310,7 @@ impl ScxLazyTransformedDataset {
             }
             Some(1) => {
                 let all_sums =
-                    detached(py, || self.streaming_row_sums()).map_err(PyRuntimeError::new_err)?;
+                    detached(py, || self.row_sums_raw()).map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_sums);
                 let n = self.shape_val.1 as f64;
                 let means: Vec<f64> = filtered.iter().map(|&s| s / n).collect();
@@ -1020,7 +1319,7 @@ impl ScxLazyTransformedDataset {
             }
             None => {
                 let all_sums =
-                    detached(py, || self.streaming_row_sums()).map_err(PyRuntimeError::new_err)?;
+                    detached(py, || self.row_sums_raw()).map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_sums);
                 let total: f64 = filtered.iter().sum();
                 let n = (self.shape_val.0 as f64) * (self.shape_val.1 as f64);
@@ -1040,6 +1339,8 @@ impl ScxLazyTransformedDataset {
     /// `axis=1` / `None`: Falls back to materialization — per-row variance across
     /// a column subset requires tracking which projected columns have stored
     /// entries per row, which the current streaming architecture doesn't support.
+    /// `to_memory()` is projection- and deletion-aware, so the fallback is
+    /// correct on the visible axes.
     #[pyo3(signature = (axis=None))]
     fn var<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
@@ -1055,24 +1356,30 @@ impl ScxLazyTransformedDataset {
                 // For row var and scalar var, materialize since per-row
                 // variance through transforms requires careful col-count
                 // handling per-row — fallback is simpler and correct.
+                //
+                // `Var(X) = E[X²] - E[X]²`. Squaring goes through `np.square`,
+                // not `.power(2)`: `.power` is a *scipy sparse* method, and the
+                // means here are an `np.matrix` (axis=1) or a Python float
+                // (axis=None), neither of which has it — squaring the mean used
+                // to raise `AttributeError` and made both arms unreachable.
+                let np = py.import("numpy")?;
                 let mat = self.to_memory(py)?;
-                match axis {
-                    Some(1) => {
-                        let np = py.import("numpy")?;
-                        let mean = mat.call_method1("mean", (1i32,))?;
-                        let mean_sq = mat
-                            .call_method1("power", (2,))?
-                            .call_method1("mean", (1i32,))?;
-                        np.call_method1("subtract", (&mean_sq, &mean.call_method1("power", (2,))?))
-                    }
-                    None => {
-                        let np = py.import("numpy")?;
-                        let mean = mat.call_method0("mean")?;
-                        let mean_sq = mat.call_method1("power", (2,))?.call_method0("mean")?;
-                        np.call_method1("subtract", (&mean_sq, &mean.call_method1("power", (2,))?))
-                    }
+                let (mean, mean_sq) = match axis {
+                    Some(1) => (
+                        mat.call_method1("mean", (1i32,))?,
+                        mat.call_method1("power", (2,))?
+                            .call_method1("mean", (1i32,))?,
+                    ),
+                    None => (
+                        mat.call_method0("mean")?,
+                        mat.call_method1("power", (2,))?.call_method0("mean")?,
+                    ),
                     _ => unreachable!(),
-                }
+                };
+                np.call_method1(
+                    "subtract",
+                    (&mean_sq, &np.call_method1("square", (&mean,))?),
+                )
             }
             Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
         }
@@ -1111,14 +1418,8 @@ impl ScxLazyTransformedDataset {
                 Ok(numpy::PyArray::from_vec(py, counts).into_any())
             }
             Some(1) => {
-                let all_nnz = if let Some(ref cols) = self.col_projection {
-                    crate::projected_agg::row_nnz_projected(&self.backed, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                } else {
-                    self.backed
-                        .row_nnz()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                };
+                let all_nnz =
+                    detached(py, || self.row_nnz_raw()).map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_nnz);
                 Ok(numpy::PyArray::from_vec(py, filtered).into_any())
             }
@@ -1706,6 +2007,7 @@ impl ScxLazyTransformedDataset {
                 op.to_string(),
                 threshold,
                 self.kept_to_global.clone(),
+                self.col_projection.clone(),
                 self.non_negative,
                 self.transforms.clone(),
             );

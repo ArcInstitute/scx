@@ -1,7 +1,18 @@
 //! HVG device-dispatched wrappers (behind the `gpu` feature).
 //!
-//! Thin dispatchers: forward to the CPU path for `device = "cpu"` (or on GPU
-//! init failure) and to the `scx-gpu` streaming kernels for `device = "gpu"`.
+//! Thin dispatchers: forward to the CPU path for `device = "cpu"` and to the
+//! `scx-gpu` streaming kernels for `device = "gpu"`. A requested GPU route that
+//! fails to initialize is a hard [`crate::error::AccelError::GpuInitFailed`],
+//! never a silent CPU fallback (§4.1).
+//!
+//! `device = "auto"` is resolved to CPU up front by the binding when **no GPU
+//! is visible** (`gpu_available()` is false). A GPU that is *visible* but whose
+//! context fails to initialize (compute-exclusive already claimed, ECC/XID,
+//! context-time OOM, driver/runtime mismatch) surfaces `GpuInitFailed` even
+//! under `auto` — a deliberate fail-loud choice: the op errors rather than
+//! silently returning a CPU result under a GPU route stamp. (Graceful
+//! auto-degradation on a broken context would be an untestable branch — it
+//! cannot be exercised on a healthy GPU — so it is intentionally not done here.)
 
 use scx_format_io::ShardSource;
 
@@ -31,9 +42,14 @@ use crate::error::Result;
 ///
 /// Only available with `feature = "gpu"`.
 ///
-/// Falls back to the CPU implementation if GPU initialization fails; callers
-/// who need strict GPU-only execution should check [`crate::gpu_available`]
-/// first.
+/// A GPU route was requested (`device = "gpu"`, or `"auto"` on a host with a
+/// visible GPU), so GPU init failure is a hard error
+/// ([`crate::error::AccelError::GpuInitFailed`]) — it does NOT silently fall
+/// back to the CPU kernel, which would run under a GPU route stamp (§4.1).
+/// Callers that want CPU on absent hardware pass `device = "cpu"` (or `"auto"`,
+/// which the binding resolves to CPU when [`crate::gpu_available`] is false).
+/// A *visible-but-broken-context* GPU under `auto` fails loud rather than
+/// degrading (see the module docs).
 pub fn streaming_mean_var_with_device<S: ShardSource + Sync>(
     source: &S,
     device: &str,
@@ -43,10 +59,8 @@ pub fn streaming_mean_var_with_device<S: ShardSource + Sync>(
         return streaming_mean_var(source);
     }
 
-    let dev = match scx_gpu::GpuDevice::new(device_id) {
-        Ok(d) => d,
-        Err(_) => return streaming_mean_var(source),
-    };
+    let dev = scx_gpu::GpuDevice::new(device_id)
+        .map_err(|e| crate::error::AccelError::GpuInitFailed(format!("device {device_id}: {e}")))?;
     let (means, variances) = scx_gpu::gpu_streaming_mean_var(&dev, source).map_err(|e| {
         crate::error::AccelError::LinAlg(format!("gpu_streaming_mean_var failed: {e}"))
     })?;
@@ -67,10 +81,8 @@ pub fn streaming_clip_square_sum_with_device<S: ShardSource + Sync>(
         return streaming_clip_square_sum(source, clip_val);
     }
 
-    let dev = match scx_gpu::GpuDevice::new(device_id) {
-        Ok(d) => d,
-        Err(_) => return streaming_clip_square_sum(source, clip_val),
-    };
+    let dev = scx_gpu::GpuDevice::new(device_id)
+        .map_err(|e| crate::error::AccelError::GpuInitFailed(format!("device {device_id}: {e}")))?;
     scx_gpu::gpu_streaming_clip_square_sum(&dev, source, clip_val).map_err(|e| {
         crate::error::AccelError::LinAlg(format!("gpu_streaming_clip_square_sum failed: {e}"))
     })
@@ -83,7 +95,9 @@ pub fn streaming_clip_square_sum_with_device<S: ShardSource + Sync>(
 /// per-batch and global Bessel-corrected statistics on the host (identical
 /// formula to the CPU function — see [`streaming_mean_var_batched`](super::cpu::streaming_mean_var_batched)).
 ///
-/// Falls back to the CPU implementation if GPU initialization fails.
+/// A requested GPU route that fails to initialize errors
+/// ([`crate::error::AccelError::GpuInitFailed`]); it does not silently fall back
+/// to CPU (§4.1).
 pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
     source: &S,
     cell_batch: &[i32],
@@ -95,10 +109,8 @@ pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
         return streaming_mean_var_batched(source, cell_batch, n_batches);
     }
 
-    let dev = match scx_gpu::GpuDevice::new(device_id) {
-        Ok(d) => d,
-        Err(_) => return streaming_mean_var_batched(source, cell_batch, n_batches),
-    };
+    let dev = scx_gpu::GpuDevice::new(device_id)
+        .map_err(|e| crate::error::AccelError::GpuInitFailed(format!("device {device_id}: {e}")))?;
 
     let n_vars = source.n_vars();
     let (batch_sum, batch_sum_sq, batch_counts) =
@@ -165,12 +177,8 @@ pub fn streaming_clip_square_sum_batched_with_device<S: ShardSource + Sync>(
         return streaming_clip_square_sum_batched(source, cell_batch, n_batches, clip_vals);
     }
 
-    let dev = match scx_gpu::GpuDevice::new(device_id) {
-        Ok(d) => d,
-        Err(_) => {
-            return streaming_clip_square_sum_batched(source, cell_batch, n_batches, clip_vals)
-        }
-    };
+    let dev = scx_gpu::GpuDevice::new(device_id)
+        .map_err(|e| crate::error::AccelError::GpuInitFailed(format!("device {device_id}: {e}")))?;
     scx_gpu::gpu_streaming_clip_square_sum_batched(&dev, source, cell_batch, n_batches, clip_vals)
         .map_err(|e| {
             crate::error::AccelError::LinAlg(format!("gpu_streaming_clip_square_sum_batched: {e}"))

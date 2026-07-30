@@ -35,6 +35,7 @@ from benchmarks.comprehensive.scripts.compare_against_baseline import (  # noqa:
 # Metrics introduced by section 4. Only violations of these fail this driver.
 _NEW_ROUTE_METRICS = {
     "de_route_csc_direct",
+    "de_route_resident_csr",
     "wilcoxon_route_gpu_correct",
     "wilcoxon_route_csc_direct",
     "csc_dispatch_correct",

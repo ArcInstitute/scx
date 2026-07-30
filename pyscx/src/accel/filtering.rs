@@ -4,8 +4,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::accel::preprocessing::clear_gpu_normalize_marker;
-use crate::backed::{detached, ScxBackedLayerDataset, ScxBackedSparseDataset};
+use crate::axis_align::{subset_obs_axis, subset_var_axis};
+use crate::backed::{detached, ScxBackedSparseDataset};
 use crate::lazy_transform::ScxLazyTransformedDataset;
 use crate::projected_agg;
 
@@ -167,131 +167,13 @@ pub(super) fn build_keep_mask(
     keep
 }
 
-/// Compose a new deletion vector from a boolean mask and an existing kept_to_global.
-pub(super) fn compose_kept_to_global(keep: &[bool], existing: Option<&[u64]>) -> Vec<u64> {
-    match existing {
-        Some(existing) => keep
-            .iter()
-            .enumerate()
-            .filter(|(_, &k)| k)
-            .map(|(i, _)| existing[i])
-            .collect(),
-        None => keep
-            .iter()
-            .enumerate()
-            .filter(|(_, &k)| k)
-            .map(|(i, _)| i as u64)
-            .collect(),
-    }
-}
-
-/// Slice `adata.obs` and `adata.obsm` to match a boolean keep-mask.
-pub(super) fn slice_obs_and_obsm<'py>(
-    py: Python<'py>,
-    adata: &Bound<'py, PyAny>,
-    keep: &[bool],
-) -> PyResult<()> {
-    let np = py.import("numpy")?;
-    let mask_arr = numpy::PyArray::from_vec(py, keep.to_vec());
-
-    // Slice obs — use _obs to bypass anndata's shape validation
-    // (X.shape is already updated via set_kept_to_global before this call)
-    let obs = adata.getattr("obs")?;
-    let filtered_obs = obs.getattr("loc")?.get_item(&mask_arr)?;
-    adata.setattr("_obs", filtered_obs)?;
-
-    // Slice obsm entries
-    let obsm = adata.getattr("obsm")?;
-    // obsm may be empty or a dict-like; get keys safely
-    let keys_result: PyResult<Vec<String>> = obsm
-        .call_method0("keys")?
-        .try_iter()?
-        .map(|k| k.and_then(|k| k.extract()))
-        .collect();
-    if let Ok(keys) = keys_result {
-        // Build numpy boolean array for indexing
-        let np_mask = np.call_method1("array", (mask_arr,))?;
-        for key in &keys {
-            let arr = obsm.get_item(key)?;
-            let sliced = arr.get_item(&np_mask)?;
-            obsm.set_item(key, sliced)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Update all backed layers with a new deletion vector.
-pub(super) fn update_layers_kept_to_global(
-    adata: &Bound<'_, PyAny>,
-    new_kept: &[u64],
-) -> PyResult<()> {
-    let layers = adata.getattr("layers")?;
-    let keys_result: PyResult<Vec<String>> = layers
-        .call_method0("keys")?
-        .try_iter()?
-        .map(|k| k.and_then(|k| k.extract()))
-        .collect();
-    if let Ok(keys) = keys_result {
-        for key in &keys {
-            let layer_obj = layers.get_item(key)?;
-            if let Ok(layer) = layer_obj.cast::<ScxBackedLayerDataset>() {
-                layer
-                    .borrow_mut()
-                    .inner
-                    .set_kept_to_global(new_kept.to_vec());
-            }
-            // ScxLazyTransformedDataset layers are unlikely but handle them
-            if let Ok(lazy_layer) = layer_obj.cast::<ScxLazyTransformedDataset>() {
-                lazy_layer
-                    .borrow_mut()
-                    .set_kept_to_global(new_kept.to_vec());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Update all backed layers with a new column projection.
-pub(super) fn update_layers_col_projection(
-    adata: &Bound<'_, PyAny>,
-    new_cols: &[u32],
-    preserve_order: bool,
-) -> PyResult<()> {
-    let layers = adata.getattr("layers")?;
-    let keys_result: PyResult<Vec<String>> = layers
-        .call_method0("keys")?
-        .try_iter()?
-        .map(|k| k.and_then(|k| k.extract()))
-        .collect();
-    if let Ok(keys) = keys_result {
-        for key in &keys {
-            let layer_obj = layers.get_item(key)?;
-            if let Ok(layer) = layer_obj.cast::<ScxBackedLayerDataset>() {
-                if preserve_order {
-                    layer
-                        .borrow_mut()
-                        .inner
-                        .set_col_projection_ordered(new_cols.to_vec());
-                } else {
-                    layer
-                        .borrow_mut()
-                        .inner
-                        .set_col_projection(new_cols.to_vec());
-                }
-            }
-            // ScxLazyTransformedDataset cannot carry a presentation reorder;
-            // it never coexists with an ordered X (lazy arithmetic on an
-            // ordered backed dataset materializes instead). Sorted projection.
-            if let Ok(lazy_layer) = layer_obj.cast::<ScxLazyTransformedDataset>() {
-                lazy_layer
-                    .borrow_mut()
-                    .set_col_projection(new_cols.to_vec());
-            }
-        }
-    }
-    Ok(())
-}
+// Axis mutation — composing the new projection, re-pointing X, slicing the
+// obs/var frames and every aligned member — lives in `crate::axis_align`
+// behind `subset_obs_axis` / `subset_var_axis`. It used to be three helpers
+// here (`compose_kept_to_global`, `slice_obs_and_obsm`,
+// `update_layers_{kept_to_global,col_projection}`) that between them handled
+// two of the five aligned members and reached them through the *validating*
+// property, which raises the moment X changes width. See §9.18.
 
 // ---------------------------------------------------------------------------
 // filter_cells
@@ -325,10 +207,6 @@ pub fn filter_cells(
     if min_genes.is_none() && max_genes.is_none() && min_counts.is_none() && max_counts.is_none() {
         return Ok(());
     }
-
-    // Filtering changes n_obs, invalidating any pending GPU normalize-fusion
-    // marker (its kept_to_global / n_obs no longer match adata).
-    clear_gpu_normalize_marker(adata)?;
 
     let x = adata.getattr("X")?;
     let need_nnz = min_genes.is_some() || max_genes.is_some();
@@ -374,19 +252,7 @@ pub fn filter_cells(
             max_counts,
         );
 
-        let new_kept = compose_kept_to_global(
-            &keep,
-            backed
-                .borrow()
-                .kept_to_global
-                .as_ref()
-                .map(|v| v.as_slice()),
-        );
-
-        backed.borrow_mut().set_kept_to_global(new_kept.clone());
-        slice_obs_and_obsm(py, adata, &keep)?;
-        update_layers_kept_to_global(adata, &new_kept)?;
-        return Ok(());
+        return subset_obs_axis(py, adata, &keep);
     }
 
     // Case 2: X is ScxLazyTransformedDataset
@@ -397,12 +263,18 @@ pub fn filter_cells(
         // Fused: when both NNZ and sums are needed, compute them in a single
         // shard scan. NNZ is transform-invariant but we compute it from the
         // same decoded shard to avoid double I/O.
+        //
+        // All three arms go through the visible-space `*_raw` API, so a column
+        // projection is honored: a `filter_genes → normalize_total →
+        // filter_cells` pipeline thresholds cells on totals over the *kept*
+        // genes, as scanpy does on the sliced object. The physical-width
+        // kernels these used to call summed the removed genes back in (§9.18).
         // Heavy shard scan + transforms run off the GIL (`detached`); rebind to a
         // plain `&Self` (Send) so the closure captures `l`, not the `!Send` PyRef.
         let l: &ScxLazyTransformedDataset = &lazy_ref;
         let (row_nnz, row_sums) = if need_nnz && need_sums {
             let (nnz, sums) = detached(py, || {
-                let (all_nnz, all_sums) = l.streaming_row_nnz_and_sums()?;
+                let (all_nnz, all_sums) = l.row_nnz_and_sums_raw()?;
                 Ok::<_, String>((
                     l.filter_row_results(&all_nnz),
                     l.filter_row_results(&all_sums),
@@ -414,7 +286,7 @@ pub fn filter_cells(
             let nnz = if need_nnz {
                 Some(
                     detached(py, || {
-                        let all_nnz = l.backed.row_nnz().map_err(|e| e.to_string())?;
+                        let all_nnz = l.row_nnz_raw()?;
                         Ok::<_, String>(l.filter_row_results(&all_nnz))
                     })
                     .map_err(PyRuntimeError::new_err)?,
@@ -425,7 +297,7 @@ pub fn filter_cells(
             let sums = if need_sums {
                 Some(
                     detached(py, || {
-                        let all_sums = l.streaming_row_sums()?;
+                        let all_sums = l.row_sums_raw()?;
                         Ok::<_, String>(l.filter_row_results(&all_sums))
                     })
                     .map_err(PyRuntimeError::new_err)?,
@@ -446,16 +318,9 @@ pub fn filter_cells(
             max_counts,
         );
 
-        let new_kept = compose_kept_to_global(
-            &keep,
-            lazy_ref.kept_to_global.as_ref().map(|v| v.as_slice()),
-        );
-
+        // Release the borrow before the funnel takes `borrow_mut` on the same X.
         drop(lazy_ref);
-        lazy.borrow_mut().set_kept_to_global(new_kept.clone());
-        slice_obs_and_obsm(py, adata, &keep)?;
-        update_layers_kept_to_global(adata, &new_kept)?;
-        return Ok(());
+        return subset_obs_axis(py, adata, &keep);
     }
 
     // Case 3: fallback to scanpy
@@ -514,10 +379,6 @@ pub fn filter_genes(
         return Ok(());
     }
 
-    // Filtering changes n_vars / col_projection, invalidating any pending GPU
-    // normalize-fusion marker.
-    clear_gpu_normalize_marker(adata)?;
-
     let x = adata.getattr("X")?;
     let need_nnz = min_cells.is_some() || max_cells.is_some();
     let need_sums = min_counts.is_some() || max_counts.is_some();
@@ -531,23 +392,29 @@ pub fn filter_genes(
         let (col_nnz, col_sums): (Option<Vec<i64>>, Option<Vec<f64>>) = {
             let bref = backed.borrow();
             let b: &ScxBackedSparseDataset = &bref;
-            let col_nnz = if need_nnz {
-                Some(
-                    detached(py, || backed_col_nnz(b))
-                        .map_err(PyRuntimeError::new_err)?
-                        .iter()
-                        .map(|&v| v as i64)
-                        .collect(),
-                )
-            } else {
-                None
-            };
-            let col_sums = if need_sums {
-                Some(detached(py, || backed_col_sums(b)).map_err(PyRuntimeError::new_err)?)
-            } else {
-                None
-            };
-            (col_nnz, col_sums)
+            match (need_nnz, need_sums) {
+                // Both thresholds: one fused scan instead of two full decodes.
+                (true, true) => {
+                    let (sums, nnz) = detached(py, || b.col_sums_and_nnz_raw())
+                        .map_err(PyRuntimeError::new_err)?;
+                    (Some(nnz.iter().map(|&v| v as i64).collect()), Some(sums))
+                }
+                (true, false) => (
+                    Some(
+                        detached(py, || backed_col_nnz(b))
+                            .map_err(PyRuntimeError::new_err)?
+                            .iter()
+                            .map(|&v| v as i64)
+                            .collect(),
+                    ),
+                    None,
+                ),
+                (false, true) => (
+                    None,
+                    Some(detached(py, || backed_col_sums(b)).map_err(PyRuntimeError::new_err)?),
+                ),
+                (false, false) => (None, None),
+            }
         };
 
         let keep = build_keep_mask(
@@ -560,48 +427,7 @@ pub fn filter_genes(
             max_counts,
         );
 
-        // Compose with the existing projection. `visible_ondisk_in_presentation_order`
-        // returns the on-disk index for each visible column in presentation order
-        // (or plain on-disk indices when no projection / no reorder is active), so
-        // the kept indices follow the same order as the (presentation-ordered) var
-        // rows the keep-mask was built against.
-        let preserve_order = backed.borrow().col_presentation_arc().is_some();
-        let visible_ondisk = backed.borrow().visible_ondisk_in_presentation_order();
-        let new_col_indices: Vec<u32> = match visible_ondisk {
-            Some(ondisk) => keep
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| ondisk[i])
-                .collect(),
-            None => keep
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| i as u32)
-                .collect(),
-        };
-
-        // Slice var BEFORE updating col_projection (AnnData validates
-        // shape consistency on .var setter, so we use ._var to bypass).
-        let mask_arr = numpy::PyArray::from_vec(py, keep);
-        let var = adata.getattr("var")?;
-        let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
-        // Use _var to skip shape validation (X.shape changes next)
-        adata.setattr("_var", filtered_var)?;
-
-        if preserve_order {
-            backed
-                .borrow_mut()
-                .set_col_projection_ordered(new_col_indices.clone());
-        } else {
-            backed
-                .borrow_mut()
-                .set_col_projection(new_col_indices.clone());
-        }
-
-        update_layers_col_projection(adata, &new_col_indices, preserve_order)?;
-        return Ok(());
+        return subset_var_axis(py, adata, &keep);
     }
 
     // Case 2: X is ScxLazyTransformedDataset
@@ -613,53 +439,42 @@ pub fn filter_genes(
         // (Send) so the closures capture `l`, not the `!Send` PyRef. `l`'s borrow
         // ends before the direct `lazy_ref` use / `drop(lazy_ref)` below.
         let l: &ScxLazyTransformedDataset = &lazy_ref;
-        // For lazy datasets, NNZ is transform-invariant: use underlying backed reader
-        // with the lazy dataset's col_projection and kept_to_global
-        let col_nnz: Option<Vec<i64>> = if need_nnz {
-            let counts: Vec<u32> = detached(py, || match (l.col_projection(), &l.kept_to_global) {
-                (Some(cols), Some(kept)) => {
-                    projected_agg::col_nnz_masked_projected(&l.backed, kept, cols)
-                        .map_err(|e| e.to_string())
-                }
-                (Some(cols), None) => {
-                    projected_agg::col_nnz_projected(&l.backed, cols).map_err(|e| e.to_string())
-                }
-                (None, Some(kept)) => l
-                    .backed
-                    .col_nnz_masked(kept)
-                    .map(|f| f.iter().map(|&v| v as u32).collect())
-                    .map_err(|e| e.to_string()),
-                (None, None) => l.backed.col_nnz().map_err(|e| e.to_string()),
-            })
-            .map_err(PyRuntimeError::new_err)?;
-            Some(counts.iter().map(|&v| v as i64).collect())
-        } else {
-            None
-        };
-
-        // Col sums through transforms (streaming).
-        // streaming_col_sums returns full-width (all original columns).
-        // When col_projection is active, extract only projected columns.
-        let col_sums = if need_sums {
-            let full_sums = detached(py, || {
-                if l.kept_to_global.is_some() {
-                    l.streaming_col_sums_masked()
-                } else {
-                    l.streaming_col_sums()
-                }
-            })
-            .map_err(PyRuntimeError::new_err)?;
-            if let Some(cols) = lazy_ref.col_projection() {
-                Some(
-                    cols.iter()
-                        .map(|&c| full_sums[c as usize])
-                        .collect::<Vec<f64>>(),
-                )
-            } else {
-                Some(full_sums)
+        let (col_nnz, col_sums): (Option<Vec<i64>>, Option<Vec<f64>>) = match (need_nnz, need_sums)
+        {
+            // Both thresholds: one fused scan through the transform chain,
+            // mirroring the backed arm above. Without this the lazy path stayed
+            // at two full decodes while backed dropped to one.
+            (true, true) => {
+                let (sums, nnz) =
+                    detached(py, || l.col_sums_and_nnz_raw()).map_err(PyRuntimeError::new_err)?;
+                (Some(nnz.iter().map(|&v| v as i64).collect()), Some(sums))
             }
-        } else {
-            None
+            // NNZ is transform-invariant, so the single-statistic arm reads the
+            // underlying backed reader with the lazy dataset's projection/mask.
+            (true, false) => {
+                let counts: Vec<u32> =
+                    detached(py, || match (l.col_projection(), &l.kept_to_global) {
+                        (Some(cols), Some(kept)) => {
+                            projected_agg::col_nnz_masked_projected(&l.backed, kept, cols)
+                                .map_err(|e| e.to_string())
+                        }
+                        (Some(cols), None) => projected_agg::col_nnz_projected(&l.backed, cols)
+                            .map_err(|e| e.to_string()),
+                        (None, Some(kept)) => l
+                            .backed
+                            .col_nnz_masked(kept)
+                            .map(|f| f.iter().map(|&v| v as u32).collect())
+                            .map_err(|e| e.to_string()),
+                        (None, None) => l.backed.col_nnz().map_err(|e| e.to_string()),
+                    })
+                    .map_err(PyRuntimeError::new_err)?;
+                (Some(counts.iter().map(|&v| v as i64).collect()), None)
+            }
+            (false, true) => (
+                None,
+                Some(detached(py, || l.col_sums_raw()).map_err(PyRuntimeError::new_err)?),
+            ),
+            (false, false) => (None, None),
         };
 
         let keep = build_keep_mask(
@@ -672,35 +487,9 @@ pub fn filter_genes(
             max_counts,
         );
 
-        let new_col_indices: Vec<u32> = match lazy_ref.col_projection() {
-            Some(existing) => keep
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| existing[i])
-                .collect(),
-            None => keep
-                .iter()
-                .enumerate()
-                .filter(|(_, &k)| k)
-                .map(|(i, _)| i as u32)
-                .collect(),
-        };
-
+        // Release the borrow before the funnel takes `borrow_mut` on the same X.
         drop(lazy_ref);
-
-        // Slice var BEFORE updating col_projection (AnnData validates
-        // shape consistency on .var setter, so we use ._var to bypass).
-        let mask_arr = numpy::PyArray::from_vec(py, keep);
-        let var = adata.getattr("var")?;
-        let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
-        adata.setattr("_var", filtered_var)?;
-
-        lazy.borrow_mut()
-            .set_col_projection(new_col_indices.clone());
-
-        update_layers_col_projection(adata, &new_col_indices, false)?;
-        return Ok(());
+        return subset_var_axis(py, adata, &keep);
     }
 
     // Case 3: fallback to scanpy
@@ -751,9 +540,6 @@ pub fn filter_genes(
 /// This differs from NumPy fancy indexing. Use a boolean mask if you need
 /// exact control over which rows are kept.
 ///
-/// Falls back to standard numpy/pandas subsetting for non-SCX data
-/// (materializes X via `adata._X = adata.X[mask]`).
-///
 /// Args:
 ///     adata: AnnData object
 ///     mask_or_indices: Boolean mask (length n_obs) or integer index array
@@ -764,116 +550,86 @@ pub fn subset_obs(
     adata: &Bound<'_, PyAny>,
     mask_or_indices: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
-    // Subsetting changes n_obs, invalidating any pending GPU normalize-fusion
-    // marker (its kept_to_global / n_obs no longer match adata).
-    clear_gpu_normalize_marker(adata)?;
+    let n_obs: usize = adata.getattr("shape")?.get_item(0)?.extract()?;
+    let keep = keep_mask_from_selector(py, mask_or_indices, n_obs, "n_obs")?;
+    subset_obs_axis(py, adata, &keep)
+}
 
+/// Subset genes (columns) by a boolean mask or an integer index array.
+///
+/// The var-axis twin of [`subset_obs`], and the general-purpose version of
+/// `filter_genes()`:
+///
+///     mask = adata.var["highly_variable"]
+///     pyscx.accel.subset_var(adata, mask)
+///
+/// Equivalent to `adata._inplace_subset_var(mask)`, which is also what
+/// `adata[:, mask].copy()` does — both keep a backed / lazy `X` out of core.
+/// The same set-membership caveat as [`subset_obs`] applies to integer
+/// indices; pass a boolean mask, or use `adata[:, indices]`, if you need
+/// ordered selection.
+///
+/// Args:
+///     adata: AnnData object
+///     mask_or_indices: Boolean mask (length n_vars) or integer index array
+#[pyfunction]
+#[pyo3(signature = (adata, mask_or_indices))]
+pub fn subset_var(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    mask_or_indices: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let n_vars: usize = adata.getattr("shape")?.get_item(1)?.extract()?;
+    let keep = keep_mask_from_selector(py, mask_or_indices, n_vars, "n_vars")?;
+    subset_var_axis(py, adata, &keep)
+}
+
+/// Normalize a boolean mask / integer index array into a keep mask of length
+/// `n`. Integer indices are set membership, not ordered selection — see
+/// [`subset_obs`].
+fn keep_mask_from_selector(
+    py: Python<'_>,
+    mask_or_indices: &Bound<'_, PyAny>,
+    n: usize,
+    axis_name: &str,
+) -> PyResult<Vec<bool>> {
     let np = py.import("numpy")?;
-
-    // Get n_obs from adata.shape[0]
-    let shape = adata.getattr("shape")?;
-    let n_obs: usize = shape.get_item(0)?.extract()?;
-
-    // Convert input to a numpy array to determine dtype
     let arr = np.call_method1("asarray", (mask_or_indices,))?;
-    let dtype_str: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
+    let kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
 
-    // Build boolean keep mask
-    let keep: Vec<bool> = match dtype_str.as_str() {
-        // Boolean mask
+    match kind.as_str() {
         "b" => {
             let bool_arr: numpy::PyReadonlyArray1<'_, bool> = arr.extract()?;
             let slice = bool_arr
                 .as_slice()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            if slice.len() != n_obs {
+            if slice.len() != n {
                 return Err(PyValueError::new_err(format!(
-                    "Boolean mask length ({}) does not match n_obs ({})",
+                    "Boolean mask length ({}) does not match {axis_name} ({n})",
                     slice.len(),
-                    n_obs
                 )));
             }
-            slice.to_vec()
+            Ok(slice.to_vec())
         }
-        // Integer indices
         "i" | "u" => {
             let idx_arr = arr.call_method1("astype", (np.getattr("int64")?,))?;
             let idx_ro: numpy::PyReadonlyArray1<'_, i64> = idx_arr.extract()?;
             let indices = idx_ro
                 .as_slice()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // Validate bounds
+            let mut mask = vec![false; n];
             for &idx in indices {
-                if idx < 0 || (idx as usize) >= n_obs {
+                if idx < 0 || (idx as usize) >= n {
                     return Err(PyValueError::new_err(format!(
-                        "Index {} is out of bounds for n_obs={}",
-                        idx, n_obs
+                        "Index {idx} is out of bounds for {axis_name}={n}"
                     )));
                 }
-            }
-
-            // Build boolean mask from indices
-            let mut mask = vec![false; n_obs];
-            for &idx in indices {
                 mask[idx as usize] = true;
             }
-            mask
+            Ok(mask)
         }
-        _ => {
-            return Err(PyValueError::new_err(
-                "mask_or_indices must be a boolean mask or integer index array",
-            ));
-        }
-    };
-
-    // Check if any rows are kept
-    let n_kept = keep.iter().filter(|&&k| k).count();
-    if n_kept == n_obs {
-        // All rows kept — nothing to do
-        return Ok(());
+        _ => Err(PyValueError::new_err(
+            "mask_or_indices must be a boolean mask or integer index array",
+        )),
     }
-
-    let x = adata.getattr("X")?;
-
-    // Case 1: X is ScxBackedSparseDataset
-    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
-        let new_kept = compose_kept_to_global(
-            &keep,
-            backed
-                .borrow()
-                .kept_to_global
-                .as_ref()
-                .map(|v| v.as_slice()),
-        );
-        backed.borrow_mut().set_kept_to_global(new_kept.clone());
-        slice_obs_and_obsm(py, adata, &keep)?;
-        update_layers_kept_to_global(adata, &new_kept)?;
-        return Ok(());
-    }
-
-    // Case 2: X is ScxLazyTransformedDataset
-    if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
-        let new_kept = compose_kept_to_global(
-            &keep,
-            lazy.borrow().kept_to_global.as_ref().map(|v| v.as_slice()),
-        );
-        lazy.borrow_mut().set_kept_to_global(new_kept.clone());
-        slice_obs_and_obsm(py, adata, &keep)?;
-        update_layers_kept_to_global(adata, &new_kept)?;
-        return Ok(());
-    }
-
-    // Case 3: Fallback for non-SCX data — materialize subset
-    let mask_arr = numpy::PyArray::from_vec(py, keep.clone());
-    let np_mask = np.call_method1("array", (mask_arr,))?;
-
-    // Slice X
-    let x_sliced = x.get_item(&np_mask)?;
-    adata.setattr("_X", x_sliced)?;
-
-    // Slice obs and obsm
-    slice_obs_and_obsm(py, adata, &keep)?;
-
-    Ok(())
 }

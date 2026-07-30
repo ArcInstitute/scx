@@ -61,6 +61,9 @@ pub fn pdex_ref_streaming_csc<S: ColumnShardSource + ?Sized>(
             source.n_vars()
         )));
     }
+    // Clamp the dense n_obs×chunk f32 scatter buffer to the CPU memory budget.
+    let gene_chunk_size =
+        crate::mem_budget::de_gene_chunk_or_err(gene_chunk_size, n_obs, "pdex_ref_streaming_csc")?;
 
     let mut combined: Option<PdexRefResult> = None;
 

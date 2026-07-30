@@ -24,6 +24,8 @@ pub mod deletion_vectors;
 pub mod distinct;
 pub mod encoder;
 pub mod mem;
+pub mod prefetch;
+pub mod profile;
 pub mod reader;
 pub mod shard_decode;
 pub mod shard_source;
@@ -52,6 +54,16 @@ pub use encoder::{
     encode_shard_framed, FramingConfig, DEFAULT_ROW_GROUP_ROWS,
 };
 pub use mem::MemoryBudget;
+pub use prefetch::{
+    accumulate_shards, clamp_prefetch_depth, col_means_and_sum_sq_prefetched,
+    for_each_csc_shard_ordered, for_each_shard_ordered, for_each_shard_ordered_uncached,
+    prefetch_depth, reduce_shards_budgeted, reduction_mode, PrefetchError, ReductionMode,
+    DEFAULT_PREFETCH_DEPTH,
+};
+pub use profile::{
+    record_decode_since, record_io_since, record_marshalling_since, record_reduction_since,
+    reduction_guard, CodecClass, CpuProfileSnapshot, ReductionGuard, StageStat,
+};
 pub use reader::{
     assemble_filtered_metadata, assemble_sharded_metadata, decode_arrow_ipc_schema, ScxReader,
 };
@@ -59,7 +71,7 @@ pub use shard_decode::{
     decode_shard_bytes, decode_shard_bytes_native, decode_shard_indptr_bytes,
     decode_shard_regions_native, decode_shard_regions_scipy,
 };
-pub use shard_source::{ColumnShardSource, ShardSource};
+pub use shard_source::{ColumnShardSource, ShardSizeHint, ShardSource};
 pub use writer::{
     assign_csr_shard_column_stats, chmod_to_umask, compute_shard_stats, fsync_parent_dir,
     make_sibling_tempfile, MajorAxis, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,

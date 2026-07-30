@@ -26,7 +26,6 @@ pub(super) fn extract_strata<'py>(
     let obs = adata.getattr("obs")?;
     let warnings = py.import("warnings")?;
     let pd = py.import("pandas")?;
-    let np = py.import("numpy")?;
 
     // Validate each stratify_by column exists and doesn't collide.
     for col in stratify_by {
@@ -110,7 +109,7 @@ pub(super) fn extract_strata<'py>(
         for &idx in indices {
             mask_vec[idx] = true;
         }
-        let mask = np.call_method1("array", (mask_vec,))?;
+        let mask = numpy::PyArray1::from_vec(py, mask_vec).into_any();
         masks.push(mask);
     }
 
@@ -137,6 +136,163 @@ pub(super) fn extract_strata<'py>(
 ///
 /// Returns the DiffExpResult from scx_accel.
 #[allow(clippy::too_many_arguments)]
+/// Resolve scanpy's `use_raw` / `layer` selection contract.
+///
+/// `use_raw=None` (the scanpy default) resolves to `True` iff `adata.raw` is
+/// present and no `layer` was requested; otherwise `False`. `use_raw=True` with
+/// a `layer` is rejected (mutually exclusive, matching scanpy). Returns the
+/// resolved boolean.
+fn resolve_use_raw(
+    adata: &Bound<'_, PyAny>,
+    use_raw: Option<bool>,
+    layer: Option<&str>,
+) -> PyResult<bool> {
+    if layer.is_some() && matches!(use_raw, Some(true)) {
+        return Err(PyValueError::new_err(
+            "Cannot specify both use_raw=True and layer=...; they are mutually exclusive.",
+        ));
+    }
+    let has_raw = !adata.getattr("raw")?.is_none();
+    Ok(match use_raw {
+        Some(v) => v,
+        None => has_raw && layer.is_none(),
+    })
+}
+
+/// Select the DE input matrix and its gene names per the resolved `use_raw` /
+/// `layer` contract. `use_raw` → `adata.raw.X` with `adata.raw.var.index`;
+/// `layer` → `adata.layers[layer]` with `adata.var.index`; otherwise `adata.X`
+/// with `adata.var.index`. The returned matrix flows through the same
+/// backed/lazy/scipy/dense dispatch as before — only the source object changes.
+fn select_de_matrix<'py>(
+    adata: &Bound<'py, PyAny>,
+    use_raw: bool,
+    layer: Option<&str>,
+) -> PyResult<(Bound<'py, PyAny>, Vec<String>)> {
+    let var_names_of = |frame: &Bound<'py, PyAny>| -> PyResult<Vec<String>> {
+        frame
+            .getattr("index")?
+            .call_method0("tolist")?
+            .extract::<Vec<String>>()
+    };
+    if use_raw {
+        let raw = adata.getattr("raw")?;
+        if raw.is_none() {
+            return Err(PyValueError::new_err("use_raw=True but adata.raw is None."));
+        }
+        let x = raw.getattr("X")?;
+        let gene_names = var_names_of(&raw.getattr("var")?)?;
+        Ok((x, gene_names))
+    } else if let Some(name) = layer {
+        let x = adata.getattr("layers")?.get_item(name).map_err(|_| {
+            PyValueError::new_err(format!("layer '{name}' not found in adata.layers"))
+        })?;
+        let gene_names = var_names_of(&adata.getattr("var")?)?;
+        Ok((x, gene_names))
+    } else {
+        let x = adata.getattr("X")?;
+        let gene_names = var_names_of(&adata.getattr("var")?)?;
+        Ok((x, gene_names))
+    }
+}
+
+/// Runtime CSC-sidecar availability probe for the `prefer_format="auto"` policy.
+///
+/// Mirrors the single capability-detection point (`as_column_source`): a valid
+/// CSC route needs a sidecar present, no active row-deletion vector, and — for a
+/// Refuse an explicit `prefer_format="csc"` on a **subset** backed handle.
+///
+/// The gene-major sidecar is written against the full axis and has no
+/// projection surface, so a subset handle reaches the CSC kernel with
+/// visible-width `gene_names` (or a row count the sidecar cannot express).
+/// The kernel does catch it, but as a bare
+/// `gene_names length 15 != source.n_vars() 30` — say what actually happened.
+///
+/// Only the *explicit* CSC request lands here; `prefer_format="auto"` never
+/// picks CSC for a subset handle (`csc_route_available` excludes a projected
+/// one, and any `kept_to_global` makes `as_column_source()` return `None`).
+fn reject_csc_on_subset(backed: &ScxBackedSparseDataset) -> PyResult<()> {
+    if backed.kept_to_global.is_some() {
+        return Err(PyRuntimeError::new_err(
+            "CSC requested but unavailable: a row deletion vector is active \
+             (this dataset has been subset along obs, e.g. by filter_cells). \
+             Use prefer_format='csr'.",
+        ));
+    }
+    if backed.col_projection_arc().is_some() {
+        return Err(PyRuntimeError::new_err(
+            "CSC requested but unavailable: a column projection is active \
+             (this dataset has been subset along var, e.g. by filter_genes or \
+             highly_variable_genes(subset=True)); the CSC sidecar is full-axis. \
+             Use prefer_format='csr'.",
+        ));
+    }
+    Ok(())
+}
+
+/// Runtime CSC-sidecar availability probe for the `prefer_format="auto"` policy.
+///
+/// Mirrors the single capability-detection point (`as_column_source`): a valid
+/// CSC route needs a sidecar present, no active row-deletion vector, and — for a
+/// lazy source — only column-local transforms. Never errors: a `false` result
+/// just routes `auto` to the CSR streamer. A materialized matrix (numpy/scipy,
+/// e.g. `use_raw`/`layer`) is not a backed/lazy SCX dataset → `false`.
+fn csc_route_available(x: &Bound<'_, PyAny>) -> bool {
+    if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        // `as_column_source` exposes the *full-axis* CSC reader and ignores an
+        // active column projection (a gene subset, e.g. `adata[:, highly_variable]`
+        // on a backed file that keeps its sidecar). Routing such a projected
+        // dataset to the CSC kernel would trip its `n_vars` guard and raise,
+        // where the CSR streamer read the projected columns fine. §5.2 lists
+        // "filtering" among the `auto` gates — so exclude projected backed
+        // datasets from CSC-direct (they fall back to CSR). The lazy path below
+        // does not need this: its CSC reader honours the projection.
+        return backed.col_projection_arc().is_none() && backed.as_column_source().is_some();
+    }
+    if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
+        // A materialized matrix (numpy/scipy from `use_raw`/`layer`) is neither
+        // a backed nor a lazy SCX dataset, so it never reaches here → CSR.
+        return lazy.as_column_source().is_some();
+    }
+    false
+}
+
+/// Resolve `prefer_format` to a concrete `"csr"` / `"csc"` route.
+///
+/// `"auto"` (the default since Phase-2 §5.2) picks the CSC-direct CPU route when
+/// a valid CSC sidecar is available and the op runs on CPU; on GPU it stays
+/// `"csr"` so the planner routes `gpu_csc_v3` from the CSR path when a sidecar
+/// is present. Explicit `"csr"` / `"csc"` pass through unchanged.
+fn resolve_de_format(
+    prefer_format: &str,
+    gpu_device_id: Option<usize>,
+    x: &Bound<'_, PyAny>,
+) -> &'static str {
+    match prefer_format {
+        "auto" => {
+            if gpu_device_id.is_some() {
+                "csr"
+            } else if csc_route_available(x) {
+                "csc"
+            } else {
+                "csr"
+            }
+        }
+        "csc" => "csc",
+        other => {
+            // Callers validate `"auto"|"csr"|"csc"` upstream; a stray value here
+            // means a new internal caller bypassed validation. Fail loud in debug,
+            // fall back to the safe CSR streamer in release.
+            debug_assert!(
+                other == "csr",
+                "resolve_de_format: unvalidated prefer_format {other:?}"
+            );
+            "csr"
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_rank_genes_groups_inner(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -148,6 +304,8 @@ fn run_rank_genes_groups_inner(
     prefer_format: &str,
     device: &str,
     gpu_device_id: Option<usize>,
+    use_raw: bool,
+    layer: Option<&str>,
 ) -> PyResult<(scx_accel::DiffExpResult, Vec<String>)> {
     let numpy = py.import("numpy")?;
     let scipy_sparse = py.import("scipy.sparse")?;
@@ -206,10 +364,15 @@ fn run_rank_genes_groups_inner(
         })?)
     };
 
-    // Get gene names.
-    let var = adata.getattr("var")?;
-    let var_names = var.getattr("index")?;
-    let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
+    // Select the input matrix + gene names per the use_raw/layer contract
+    // (adata.X by default; adata.raw.X with raw var names for use_raw; a named
+    // layer otherwise). The selected matrix flows through the same dispatch.
+    let (x, gene_names) = select_de_matrix(adata, use_raw, layer)?;
+
+    // Resolve the `"auto"` policy (§5.2) against the *selected* matrix: CSC-direct
+    // on CPU when a valid sidecar is present, else CSR; CSR on GPU (the planner
+    // routes gpu_csc_v3 from there). Explicit "csr"/"csc" pass through.
+    let prefer_format = resolve_de_format(prefer_format, gpu_device_id, &x);
 
     // Auto-detect whether data has been log-transformed (sc.pp.log1p sets
     // adata.uns["log1p"]). When true, logFC uses expm1 back-transform to
@@ -220,16 +383,12 @@ fn run_rank_genes_groups_inner(
         .map(|v| !v.is_none())
         .unwrap_or(false);
 
-    // Check if X is a ScxBackedSparseDataset / ScxLazyTransformedDataset
-    // for streaming path. CSC dispatch routes through `as_column_source()`.
-    let x = adata.getattr("X")?;
-
     if prefer_format == "csc" {
         if gpu_device_id.is_some() {
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' selects the CPU column-major path and has no \
                  GPU kernel, so it cannot be combined with device='gpu'. For GPU \
-                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 CSC-direct DE (route gpu_csc_v3), keep prefer_format='csr' \
                  with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
                  planner routes to gpu_csc_v3 automatically. For the CPU column-major \
                  path, use device='cpu'.",
@@ -244,11 +403,7 @@ fn run_rank_genes_groups_inner(
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
             // Validate CSC availability under the GIL, then clone the Arc so
             // the Rust kernel can run without holding the GIL.
-            if backed.kept_to_global.is_some() {
-                return Err(PyRuntimeError::new_err(
-                    "CSC requested but unavailable: a row deletion vector is active",
-                ));
-            }
+            reject_csc_on_subset(&backed)?;
             let csc_reader = backed
                 .backed_csc
                 .as_ref()
@@ -334,7 +489,18 @@ fn run_rank_genes_groups_inner(
         // Backed mode: stream shards with gene-chunked DE. Clone the Arc
         // so the kernel runs without holding the GIL.
         let chunk_size = gene_chunk_size.unwrap_or(500);
+        // The handle's *view*, not the file: `groups` is one label per
+        // *visible* cell and `gene_names` one per visible gene, so a subset
+        // handle has to stream its window. `with_cached_reads` because the
+        // kernel walks every shard once per gene chunk — the same LRU the raw
+        // reader served from.
+        let source = backed.as_shard_source().with_cached_reads();
+        // Only the GPU arm still needs the concrete reader (for the
+        // CSC-direct `Backed` input); the CPU arm runs entirely off `source`.
+        #[cfg(feature = "gpu")]
         let reader = std::sync::Arc::clone(&backed.backed);
+        #[cfg(feature = "gpu")]
+        let has_view = backed.has_axis_view();
         // If a CSC sidecar reader exists on the dataset, hand it to the GPU
         // streaming path so the default v3 route can dispatch to the
         // CSC-direct Wilcoxon driver. None falls through to the v3 CSR-direct
@@ -347,12 +513,31 @@ fn run_rank_genes_groups_inner(
             #[cfg(feature = "gpu")]
             Some(device_id) => py
                 .detach(|| {
-                    scx_accel::wilcoxon_rank_sum_gpu(
-                        device_id,
+                    // Load-bearing, not bookkeeping. Neither of the CSC
+                    // gates elsewhere protects this path: the `csc` below
+                    // comes straight off `backed.backed_csc`, bypassing
+                    // `as_column_source()`'s deletion check, and
+                    // `csc_route_available` is never consulted on GPU
+                    // (`resolve_de_format` short-circuits to "csr" whenever
+                    // `gpu_device_id.is_some()`). So a subset handle with a
+                    // sidecar would otherwise reach the CSC-direct kernel and
+                    // read *on-disk* columns under visible-width
+                    // `gene_names` — a silent wrong answer, since
+                    // `Backed::shape()` takes `n_vars` from `gene_names.len()`
+                    // and the widths agree. Route it to the generic `Lazy`
+                    // input; only an unsubset handle keeps `Backed` and with
+                    // it the CSC-direct `gpu_csc_v3` route.
+                    let input = if has_view {
+                        scx_accel::GpuDeShardInput::Lazy(&source)
+                    } else {
                         scx_accel::GpuDeShardInput::Backed {
                             csr: &reader,
                             csc: csc_reader.as_deref(),
-                        },
+                        }
+                    };
+                    scx_accel::wilcoxon_rank_sum_gpu(
+                        device_id,
+                        input,
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -369,7 +554,7 @@ fn run_rank_genes_groups_inner(
             None => py
                 .detach(|| {
                     scx_accel::wilcoxon_rank_sum_streaming(
-                        &reader,
+                        &source,
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -649,8 +834,23 @@ fn de_result_to_dataframe<'py>(
 /// when the input layout matches the op. Returns ``None`` (results live on
 /// ``adata.uns``); the stratified path (``stratify_by``) instead returns a
 /// concatenated pandas DataFrame and does not write route metadata.
+///
+/// ``use_raw`` / ``layer`` select the analyzed matrix (scanpy semantics):
+/// ``use_raw`` analyzes ``adata.raw.X`` (with ``adata.raw.var`` names),
+/// ``layer`` analyzes ``adata.layers[layer]``, and they are mutually exclusive.
+/// ``use_raw=None`` (default) resolves to ``True`` iff ``adata.raw`` exists and
+/// ``layer`` is None, else ``False``. The resolved ``use_raw`` and ``layer`` are
+/// written to ``adata.uns["rank_genes_groups"]["params"]``.
+///
+/// NOTE: the log-fold-change back-transform uses the ``adata.uns["log1p"]``
+/// flag, which describes ``X``. For the conventional case (``.raw`` /
+/// ``layer`` hold log-normalized data, like ``X``) this is correct; if ``.raw``
+/// holds raw counts while ``X`` is log1p-transformed, the logFC is computed as
+/// if the counts were log-space. Prefer ``pdex_ref`` (which exposes an explicit
+/// ``is_log1p`` override) when analyzing a matrix whose transform state differs
+/// from ``X``.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="csr", device="auto"))]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="auto", device="auto", use_raw=None, layer=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups(
     py: Python<'_>,
@@ -666,17 +866,29 @@ pub fn rank_genes_groups(
     tie_correct: bool,
     prefer_format: &str,
     device: &str,
+    use_raw: Option<bool>,
+    layer: Option<&str>,
 ) -> PyResult<Py<PyAny>> {
     if method != "wilcoxon" {
         return Err(PyRuntimeError::new_err(format!(
             "unsupported method '{method}': only 'wilcoxon' is currently supported"
         )));
     }
-    if !matches!(prefer_format, "csr" | "csc") {
+    if !matches!(prefer_format, "csr" | "csc" | "auto") {
         return Err(PyValueError::new_err(format!(
-            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
+            "Invalid prefer_format={prefer_format:?}; expected 'auto', 'csr', or 'csc'"
         )));
     }
+    // A presentation-ordered backed `X` (`preserve_var_order=True`) has no
+    // `ShardSource` spelling: the source emits columns in sorted on-disk order
+    // while `adata.var` — and so `gene_names` — stays in request order. Now
+    // that this op streams the handle's *view*, the two widths match, so the
+    // mismatch would be a silent gene/column permutation instead of a shape
+    // error. Refuse, as the other streaming accel ops do.
+    super::reject_preserve_var_order(adata, "rank_genes_groups")?;
+
+    // Resolve scanpy's use_raw/layer contract once (mutual-exclusion + default).
+    let resolved_use_raw = resolve_use_raw(adata, use_raw, layer)?;
     let resolved = super::gpu::resolve_device(device)?;
     #[cfg(feature = "gpu")]
     let gpu_device_id = resolved.gpu_id();
@@ -695,7 +907,7 @@ pub fn rank_genes_groups(
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' selects the CPU column-major path and has no \
                  GPU kernel, so it cannot be combined with device='gpu'. For GPU \
-                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 CSC-direct DE (route gpu_csc_v3), keep prefer_format='csr' \
                  with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
                  planner routes to gpu_csc_v3 automatically. For the CPU column-major \
                  path, use device='cpu'.",
@@ -708,7 +920,7 @@ pub fn rank_genes_groups(
                     "rank_genes_groups(device=\"auto\", prefer_format=\"csc\") runs on the \
                      CPU: prefer_format=\"csc\" pins the CPU column-major path even on a GPU \
                      host. For GPU CSC-direct DE (route gpu_csc_v3), drop prefer_format \
-                     (keep the default \"csr\") with device=\"auto\"/\"gpu\" — the planner \
+                     (pass \"csr\" explicitly) with device=\"auto\"/\"gpu\" — the planner \
                      routes to gpu_csc_v3 automatically when a CSC sidecar is present.",
                     py.get_type::<pyo3::exceptions::PyUserWarning>(),
                 ),
@@ -746,6 +958,8 @@ pub fn rank_genes_groups(
                 prefer_format,
                 device,
                 gpu_device_id,
+                resolved_use_raw,
+                layer,
             ) {
                 Ok((result, _unique)) => {
                     let df = de_result_to_dataframe(py, &result, n_genes)?;
@@ -795,10 +1009,21 @@ pub fn rank_genes_groups(
         prefer_format,
         device,
         gpu_device_id,
+        resolved_use_raw,
+        layer,
     )?;
 
     // Write results to adata.uns["rank_genes_groups"] in scanpy format.
-    write_de_to_adata(py, adata, &result, groupby, reference, n_genes)?;
+    write_de_to_adata(
+        py,
+        adata,
+        &result,
+        groupby,
+        reference,
+        n_genes,
+        resolved_use_raw,
+        layer,
+    )?;
 
     // Record the accelerator execution route: both inside the scanpy-style
     // rank_genes_groups dict (as `scx_accel_route`) and under the unified
@@ -826,6 +1051,7 @@ pub fn rank_genes_groups(
 /// Scanpy stores results as numpy structured arrays (rec.arrays) with one
 /// field per group. Each field contains gene names/scores/p-values sorted
 /// by the test statistic.
+#[allow(clippy::too_many_arguments)]
 fn write_de_to_adata(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -833,6 +1059,8 @@ fn write_de_to_adata(
     groupby: &str,
     reference: &str,
     n_genes: Option<usize>,
+    use_raw: bool,
+    layer: Option<&str>,
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
     // The builder closures below iterate `result.group_names` (length n_groups)
@@ -877,7 +1105,8 @@ fn write_de_to_adata(
     params.set_item("groupby", groupby)?;
     params.set_item("reference", reference)?;
     params.set_item("method", "wilcoxon")?;
-    params.set_item("use_raw", false)?;
+    params.set_item("use_raw", use_raw)?;
+    params.set_item("layer", layer)?;
 
     // Helper to build structured array (like scanpy's recarray format).
     // Scanpy stores e.g. names as a structured array with dtype like:
@@ -904,8 +1133,17 @@ fn write_de_to_adata(
             Ok(arr.unbind().into_bound(py))
         };
 
+    // One structured array per field, one column per group. `from_slice` hands
+    // numpy the f64 buffer directly; the pre-4.3 spelling copied the slice into
+    // a `Vec`, then pyo3 built a Python `list` of `PyFloat`s, then numpy parsed
+    // that back — n_groups × n_genes objects per field, so a 30-group ×
+    // 60k-gene run materialised millions of them purely in transit.
+    //
+    // The `names` builder above keeps its `PyList`: its field dtype is `U200`,
+    // which genuinely needs Python strings.
     let build_structured_f64 =
         |field_data: &[Vec<f64>], groups: &[String]| -> PyResult<Bound<'_, PyAny>> {
+            let t_marshal = scx_accel::cpu_profile::start();
             let dt_list = pyo3::types::PyList::empty(py);
             for gn in groups {
                 let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), "f8"])?;
@@ -916,10 +1154,13 @@ fn write_de_to_adata(
             let arr = numpy.call_method1("empty", (n_genes,))?;
             let arr = arr.call_method1("astype", (&dtype,))?;
             for (i, gn) in groups.iter().enumerate() {
-                let vals: Vec<f64> = field_data[i][..n_genes].to_vec();
-                let np_vals = numpy.call_method1("array", (vals,))?;
+                let np_vals = numpy::PyArray1::from_slice(py, &field_data[i][..n_genes]);
                 arr.set_item(gn.as_str(), np_vals)?;
             }
+            scx_accel::cpu_profile::record_marshalling_since(
+                t_marshal,
+                groups.len() * n_genes * std::mem::size_of::<f64>(),
+            );
             Ok(arr.unbind().into_bound(py))
         };
 
@@ -1342,6 +1583,8 @@ pub fn rank_genes_groups_df(
         "csr",
         device,
         gpu_device_id,
+        false, // use_raw: this cell-eval bridge is X-only
+        None,  // layer
     )?;
 
     // Record the accelerator execution route on adata.uns; the returned
@@ -1474,15 +1717,20 @@ fn run_pdex_ref_inner(
     prefer_format: &str,
     device: &str,
     gpu_device_id: Option<usize>,
+    use_raw: bool,
+    layer: Option<&str>,
 ) -> PyResult<scx_accel::PdexRefResult> {
     let numpy = py.import("numpy")?;
     let scipy_sparse = py.import("scipy.sparse")?;
 
     let (groups, unique_groups, ref_idx) = resolve_groups_and_reference(adata, groupby, reference)?;
 
-    let var = adata.getattr("var")?;
-    let var_names = var.getattr("index")?;
-    let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
+    // Select the input matrix + gene names per the use_raw/layer contract.
+    let (x, gene_names) = select_de_matrix(adata, use_raw, layer)?;
+
+    // Resolve the `"auto"` policy (§5.2): CSC-direct on CPU when a valid sidecar
+    // is present, else CSR; CSR on GPU (planner routes gpu_csc_v3 from there).
+    let prefer_format = resolve_de_format(prefer_format, gpu_device_id, &x);
 
     let resolved_log1p = match is_log1p {
         Some(v) => v,
@@ -1490,14 +1738,12 @@ fn run_pdex_ref_inner(
     };
     let mode = scx_accel::GeomMeanMode::from_flags(geometric_mean, resolved_log1p);
 
-    let x = adata.getattr("X")?;
-
     if prefer_format == "csc" {
         if gpu_device_id.is_some() {
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' selects the CPU column-major path and has no \
                  GPU kernel, so it cannot be combined with device='gpu'. For GPU \
-                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 CSC-direct DE (route gpu_csc_v3), keep prefer_format='csr' \
                  with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
                  planner routes to gpu_csc_v3 automatically. For the CPU column-major \
                  path, use device='cpu'.",
@@ -1506,11 +1752,7 @@ fn run_pdex_ref_inner(
         let chunk_size = gene_chunk_size.unwrap_or(500);
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-            if backed.kept_to_global.is_some() {
-                return Err(PyRuntimeError::new_err(
-                    "CSC requested but unavailable: a row deletion vector is active",
-                ));
-            }
+            reject_csc_on_subset(&backed)?;
             let csc_reader = backed
                 .backed_csc
                 .as_ref()
@@ -1590,7 +1832,14 @@ fn run_pdex_ref_inner(
 
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         let chunk_size = gene_chunk_size.unwrap_or(500);
+        // The handle's *view* — see the matching branch in
+        // `run_rank_genes_groups_inner` for why the raw reader is wrong here.
+        let source = backed.as_shard_source().with_cached_reads();
+        // GPU-only: the concrete reader backs the CSC-direct `Backed` input.
+        #[cfg(feature = "gpu")]
         let reader = std::sync::Arc::clone(&backed.backed);
+        #[cfg(feature = "gpu")]
+        let has_view = backed.has_axis_view();
         // G4.3: if a CSC sidecar reader exists on the dataset, hand it to
         // the GPU streaming path so the default v3 route can dispatch to
         // the CSC-direct driver. None falls through to the v3 CSR-direct
@@ -1603,12 +1852,22 @@ fn run_pdex_ref_inner(
             #[cfg(feature = "gpu")]
             Some(device_id) => py
                 .detach(|| {
-                    scx_accel::pdex_ref_gpu(
-                        device_id,
+                    // Subset handle → generic `Lazy`; unsubset → `Backed`,
+                    // preserving the CSC-direct `gpu_csc_v3` route. See the
+                    // matching branch in `run_rank_genes_groups_inner`: this
+                    // switch is what stops a subset handle running the
+                    // CSC-direct kernel against on-disk columns.
+                    let input = if has_view {
+                        scx_accel::GpuDeShardInput::Lazy(&source)
+                    } else {
                         scx_accel::GpuDeShardInput::Backed {
                             csr: &reader,
                             csc: csc_reader.as_deref(),
-                        },
+                        }
+                    };
+                    scx_accel::pdex_ref_gpu(
+                        device_id,
+                        input,
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -1625,7 +1884,7 @@ fn run_pdex_ref_inner(
             None => py
                 .detach(|| {
                     scx_accel::pdex_ref_streaming(
-                        &reader,
+                        &source,
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -1993,6 +2252,12 @@ fn pdex_ref_result_to_dataframe<'py>(
 ///     output: Return type — `"polars"` (default) or `"pandas"`. Columns are
 ///         identical either way; `"pandas"` builds a pandas DataFrame directly and
 ///         does not require polars. (A polars result also supports `.to_pandas()`.)
+///     use_raw: Analyze `adata.raw.X` (with `adata.raw.var` names) instead of
+///         `adata.X`. `None` (default) → `True` iff `adata.raw` is present and
+///         `layer` is None (scanpy semantics), else `False`. Mutually exclusive
+///         with `layer`. Recorded on `adata.uns["scx_accel"]["pdex_ref"]`.
+///     layer: Analyze `adata.layers[layer]` instead of `adata.X`. Mutually
+///         exclusive with `use_raw=True`.
 ///
 /// The accelerator execution route is recorded on
 /// ``adata.uns["scx_accel"]["pdex_ref"]`` (keys: ``route``,
@@ -2002,7 +2267,7 @@ fn pdex_ref_result_to_dataframe<'py>(
 /// fall back to ``"gpu_csr_v3"`` with ``fallback_reason == "no_csc_sidecar"``. Check
 /// ``route`` when comparing performance.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="csr", device="auto", output="polars"))]
+#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="auto", device="auto", output="polars", use_raw=None, layer=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref(
     py: Python<'_>,
@@ -2017,6 +2282,8 @@ pub fn pdex_ref(
     prefer_format: &str,
     device: &str,
     output: &str,
+    use_raw: Option<bool>,
+    layer: Option<&str>,
 ) -> PyResult<Py<PyAny>> {
     if epsilon < 0.0 || !epsilon.is_finite() {
         return Err(PyValueError::new_err(format!(
@@ -2043,16 +2310,26 @@ pub fn pdex_ref(
             )?;
         }
     }
-    if !matches!(prefer_format, "csr" | "csc") {
+    if !matches!(prefer_format, "csr" | "csc" | "auto") {
         return Err(PyValueError::new_err(format!(
-            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
+            "Invalid prefer_format={prefer_format:?}; expected 'auto', 'csr', or 'csc'"
         )));
     }
+    // A presentation-ordered backed `X` (`preserve_var_order=True`) has no
+    // `ShardSource` spelling: the source emits columns in sorted on-disk order
+    // while `adata.var` — and so `gene_names` — stays in request order. Now
+    // that this op streams the handle's *view*, the two widths match, so the
+    // mismatch would be a silent gene/column permutation instead of a shape
+    // error. Refuse, as the other streaming accel ops do.
+    super::reject_preserve_var_order(adata, "pdex_ref")?;
+
     if !matches!(output, "polars" | "pandas") {
         return Err(PyValueError::new_err(format!(
             "Invalid output={output:?}; expected 'polars' or 'pandas'"
         )));
     }
+    // Resolve scanpy's use_raw/layer contract once (mutual-exclusion + default).
+    let resolved_use_raw = resolve_use_raw(adata, use_raw, layer)?;
     let resolved = super::gpu::resolve_device(device)?;
     #[cfg(feature = "gpu")]
     let gpu_device_id = resolved.gpu_id();
@@ -2071,7 +2348,7 @@ pub fn pdex_ref(
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' selects the CPU column-major path and has no \
                  GPU kernel, so it cannot be combined with device='gpu'. For GPU \
-                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 CSC-direct DE (route gpu_csc_v3), keep prefer_format='csr' \
                  with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
                  planner routes to gpu_csc_v3 automatically. For the CPU column-major \
                  path, use device='cpu'.",
@@ -2084,7 +2361,7 @@ pub fn pdex_ref(
                     "pdex_ref(device=\"auto\", prefer_format=\"csc\") runs on the CPU: \
                      prefer_format=\"csc\" pins the CPU column-major path even on a GPU \
                      host. For GPU CSC-direct DE (route gpu_csc_v3), drop prefer_format \
-                     (keep the default \"csr\") with device=\"auto\"/\"gpu\" — the planner \
+                     (pass \"csr\" explicitly) with device=\"auto\"/\"gpu\" — the planner \
                      routes to gpu_csc_v3 automatically when a CSC sidecar is present.",
                     py.get_type::<pyo3::exceptions::PyUserWarning>(),
                 ),
@@ -2107,6 +2384,8 @@ pub fn pdex_ref(
         prefer_format,
         device,
         gpu_device_id,
+        resolved_use_raw,
+        layer,
     )?;
     // Record the accelerator execution route on adata.uns["scx_accel"]["pdex_ref"].
     // `result.exec_info` is already complete (route + reason) from the single
@@ -2114,6 +2393,17 @@ pub fn pdex_ref(
     super::route::announce_route(py, "pdex_ref", device, &result.exec_info);
     super::route::warn_materialized_csc_sidecar(py, "pdex_ref", device, adata, &result.exec_info);
     super::route::write_accel_route(py, adata, "pdex_ref", &result.exec_info)?;
+    // Record the resolved data-selection contract alongside the route so callers
+    // can see which matrix was analyzed (X / raw.X / a layer).
+    // Defensive: `get_item` with `?` would raise KeyError if either key is
+    // absent. `write_accel_route` just created both, but check both with
+    // `if let Ok(...)` so a missing route entry never crashes the op.
+    if let Ok(scx_accel) = adata.getattr("uns")?.get_item("scx_accel") {
+        if let Ok(entry) = scx_accel.get_item("pdex_ref") {
+            entry.set_item("use_raw", resolved_use_raw)?;
+            entry.set_item("layer", layer)?;
+        }
+    }
     let df = pdex_ref_result_to_dataframe(py, &result, output)?;
     Ok(df.unbind())
 }

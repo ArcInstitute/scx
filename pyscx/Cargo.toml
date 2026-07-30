@@ -1,6 +1,6 @@
 [package]
 name = "pyscx"
-version = "0.11.5"
+version = "0.11.7"
 edition = "2021"
 description = "Python bindings for SCX via PyO3"
 license.workspace = true
@@ -35,6 +35,9 @@ log = { workspace = true }
 pyo3-log = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 # `hdf5` gates `pyscx.from_h5ad` and the backed-AnnData auto-routing in

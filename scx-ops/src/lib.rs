@@ -4,6 +4,7 @@ pub mod checksum;
 pub mod compact;
 pub mod delete;
 pub mod error;
+pub mod external_layer;
 pub mod flock;
 pub mod group_plan;
 pub mod helpers;
@@ -31,6 +32,10 @@ pub use build_csc::run_build_csc;
 pub use compact::{compact, compact_with_index_options};
 pub use delete::mark_deleted;
 pub use error::{OpsError, Result};
+pub use external_layer::{
+    attach_external_layer, AttachLayerOptions, AttachLayerSummary, ColumnAxisMatch,
+    ColumnAxisPolicy, ExternalLayerData, ExtraRowPolicy, MissingRowPolicy, ShardRangeSource,
+};
 pub use group_plan::{plan_group_shards, GroupPlan, GroupRecord, Role};
 pub use merge::{merge, merge_with_index_options, merge_with_options};
 pub use merge_options::{MergeOptions, UnsPolicy};

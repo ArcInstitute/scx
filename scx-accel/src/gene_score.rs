@@ -71,7 +71,7 @@ fn ensure_finite(data: &[f32]) -> Result<()> {
 /// The inner loop touches every nonzero once and does `weights.len()` (1–2)
 /// lookups per nonzero — CSR is row-major so a column subset cannot be reached
 /// without scanning, matching scanpy's `X[:, genes].mean(axis=1)`.
-fn streaming_weighted_row_sums<S: ShardSource>(
+fn streaming_weighted_row_sums<S: ShardSource + Sync>(
     source: &S,
     weights: &[Vec<f64>],
 ) -> Result<Vec<Vec<f64>>> {
@@ -81,29 +81,37 @@ fn streaming_weighted_row_sums<S: ShardSource>(
         debug_assert_eq!(w.len(), n_vars);
     }
 
+    // Per-cell output is indexed by the global cell id (`row_base + r`), so the
+    // 2.1 decode-prefetch must be ordered (`for_each_shard_ordered`) to keep the
+    // `row_base` cursor valid; the write pattern is row-disjoint scatter.
     let mut out = vec![vec![0.0f64; n_obs]; weights.len()];
     let mut row_base = 0usize;
-    for shard_idx in 0..source.n_shards() {
-        let csr = source.read_shard(shard_idx)?;
-        ensure_finite(&csr.data)?;
-        let rows = csr.n_rows();
-        for r in 0..rows {
-            let start = csr.indptr[r] as usize;
-            let end = csr.indptr[r + 1] as usize;
-            let cell = row_base + r;
-            for nz in start..end {
-                let col = csr.indices[nz] as usize;
-                let v = csr.data[nz] as f64;
-                for (k, w) in weights.iter().enumerate() {
-                    let wc = w[col];
-                    if wc != 0.0 {
-                        out[k][cell] += wc * v;
+    crate::prefetch::for_each_shard_ordered(
+        source,
+        crate::prefetch::prefetch_depth(),
+        |_idx, csr| {
+            let _r = scx_format_io::reduction_guard();
+            ensure_finite(&csr.data)?;
+            let rows = csr.n_rows();
+            for r in 0..rows {
+                let start = csr.indptr[r] as usize;
+                let end = csr.indptr[r + 1] as usize;
+                let cell = row_base + r;
+                for nz in start..end {
+                    let col = csr.indices[nz] as usize;
+                    let v = csr.data[nz] as f64;
+                    for (k, w) in weights.iter().enumerate() {
+                        let wc = w[col];
+                        if wc != 0.0 {
+                            out[k][cell] += wc * v;
+                        }
                     }
                 }
             }
-        }
-        row_base += rows;
-    }
+            row_base += rows;
+            Ok(())
+        },
+    )?;
 
     if row_base != n_obs {
         return Err(AccelError::ShapeError(format!(
@@ -226,7 +234,7 @@ fn select_control_genes(
 /// Contract asymmetry: `gene_list` indices are hard-checked against `n_vars`
 /// (out-of-range is an error), but out-of-range `gene_pool` indices are silently
 /// filtered (they cannot be binned). Pass a pool that fits `0..n_vars`.
-pub fn score_genes<S: ShardSource>(
+pub fn score_genes<S: ShardSource + Sync>(
     source: &S,
     gene_list: &[u32],
     gene_pool: &[u32],
@@ -303,30 +311,31 @@ pub fn score_genes<S: ShardSource>(
                 *random_state,
             );
 
-            let mut w_list = vec![0.0f64; n_vars];
+            // Fuse the two weight vectors into one: +1/k_list on list genes,
+            // −1/|control| on control genes. This halves the per-nonzero inner
+            // work in `streaming_weighted_row_sums` (one weight vector, not two).
+            // Use `+=`/`-=` so the fused weight is `w_list[g] − w_ctrl[g]` even
+            // if a gene were in both sets (today they are disjoint — scanpy's
+            // `ctrl_as_ref=True` removes scored genes from the control set).
+            // Numerics: the score is `Σ(w_list − w_ctrl)·v` accumulated in one
+            // f64 pass, which matches the previous `(Σ w_list·v) − (Σ w_ctrl·v)`
+            // up to f64 re-association (single accumulator vs two subtracted
+            // once) — within the tolerance of the scanpy parity test.
+            let mut w = vec![0.0f64; n_vars];
             let inv_list = 1.0 / k_list;
             for &g in gene_list {
-                w_list[g as usize] = inv_list;
+                w[g as usize] += inv_list;
             }
-
-            let mut w_ctrl = vec![0.0f64; n_vars];
             if !control.is_empty() {
                 let inv_ctrl = 1.0 / control.len() as f64;
                 for &g in &control {
-                    w_ctrl[g as usize] = inv_ctrl;
+                    w[g as usize] -= inv_ctrl;
                 }
             }
 
-            let out = streaming_weighted_row_sums(source, &[w_list, w_ctrl])?;
-            let mut it = out.into_iter();
-            let list_means = it.next().unwrap();
-            let ctrl_means = it.next().unwrap();
-            // Empty control set → ctrl_means is all-zero, so score = mean(list).
-            Ok(list_means
-                .into_iter()
-                .zip(ctrl_means)
-                .map(|(a, b)| a - b)
-                .collect())
+            // Empty control set → no negative entries, so score = mean(list).
+            let out = streaming_weighted_row_sums(source, std::slice::from_ref(&w))?;
+            Ok(out.into_iter().next().unwrap())
         }
     }
 }

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pyscx"
-version = "0.11.5"
+version = "0.11.7"
 description = "Python bindings for SCX (Sparse Cell eXpression System)"
 license = {text = "MIT"}
 authors = [
@@ -23,6 +23,10 @@ dev = [
     "pytest>=7.0",
     "scanpy>=1.10",
     "python-dotenv",
+    # Required by the NB-GLM custom-`design` path (see the `nbglm` extra) and its
+    # tests; `polars` (in the `eval` extra) is needed by the pdex_nb_glm tests.
+    "formulaic>=1.0",
+    "polars>=1.0",
     # `maturin[patchelf]` bundles the `patchelf` binary so `maturin develop`
     # can set the libpyscx rpath. Without it `maturin develop` prints a
     # non-fatal "Failed to set rpath" warning on every build.
@@ -30,6 +34,13 @@ dev = [
 ]
 eval = [
     "polars>=1.0",
+]
+# Custom `design` formulas for the NB-GLM DE backend
+# (`pseudobulk_dex(backend="nb_glm", design=...)` / `pdex_nb_glm(design=...)`).
+# `formulaic` is the same design-matrix parser pydeseq2 uses; imported only when a
+# `design` is supplied, so the default NB-GLM path stays dependency-free.
+nbglm = [
+    "formulaic>=1.0",
 ]
 scvi = [
     "scvi-tools",

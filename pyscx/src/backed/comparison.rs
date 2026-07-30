@@ -26,6 +26,17 @@ pub struct ScxComparisonResult {
     pub(crate) op: String,
     pub(crate) threshold: f64,
     pub(crate) kept_to_global: Option<Arc<Vec<u64>>>,
+    /// Visible column subset, inherited from the parent dataset.
+    ///
+    /// Dropping this is what made `(X > 0).sum()` disagree with `X.getnnz()`
+    /// under a projection: the short-circuit arms below read the *physical*
+    /// axis while `shape_val` was already the visible one, so the result was
+    /// either silently over-counted or a reshape error. Same two-kernels /
+    /// wrong-one-is-ergonomic shape as the lazy row-sum bug (§9.18).
+    pub(crate) col_projection: Option<Arc<Vec<u32>>>,
+    /// Presentation permutation, when the parent was opened with
+    /// `preserve_var_order=True`.
+    pub(crate) col_presentation: Option<Arc<Vec<u32>>>,
     /// Inherited from the parent dataset — gates the getnnz short-circuit.
     pub(crate) non_negative: bool,
     /// When created from ScxLazyTransformedDataset, transforms to apply
@@ -39,12 +50,14 @@ impl ScxComparisonResult {
     /// The transforms will be applied during materialization,
     /// but the (X > 0).sum() → getnnz() short-circuit still works
     /// since NormalizeTotal/Log1p/RowScale preserve sparsity patterns.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_for_lazy(
         backed: Arc<BackedCsrReader>,
         shape_val: (usize, usize),
         op: String,
         threshold: f64,
         kept_to_global: Option<Arc<Vec<u64>>>,
+        col_projection: Option<Arc<Vec<u32>>>,
         non_negative: bool,
         transforms: Vec<Transform>,
     ) -> Self {
@@ -54,8 +67,21 @@ impl ScxComparisonResult {
             op,
             threshold,
             kept_to_global,
+            col_projection,
+            // A lazy dataset never carries a presentation permutation.
+            col_presentation: None,
             non_negative,
             transforms: Some(transforms),
+        }
+    }
+
+    /// Reorder a per-visible-column vector into presentation order. No-op
+    /// without `preserve_var_order`. Mirrors
+    /// `ScxBackedSparseDataset::present_reorder`.
+    fn present_reorder<T: Clone>(&self, values: Vec<T>) -> Vec<T> {
+        match &self.col_presentation {
+            Some(perm) => perm.iter().map(|&p| values[p as usize].clone()).collect(),
+            None => values,
         }
     }
 
@@ -67,7 +93,7 @@ impl ScxComparisonResult {
                 Arc::clone(&self.backed),
                 self.shape_val,
                 self.kept_to_global.clone(),
-                None,
+                self.col_projection.clone(),
                 transforms.clone(),
                 self.non_negative,
             );
@@ -86,13 +112,25 @@ impl ScxComparisonResult {
 
         // Standard path: read raw data. Decode the full matrix off the GIL (P1).
         let csr = detached(py, || {
-            if let Some(ref kept) = self.kept_to_global {
+            let full = if let Some(ref kept) = self.kept_to_global {
                 self.backed
                     .read_row_indices(kept)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?
             } else {
-                self.backed.read_all().map_err(|e| e.to_string())
-            }
+                self.backed.read_all().map_err(|e| e.to_string())?
+            };
+            // Restrict to the visible genes, so the fallback agrees with the
+            // short-circuit above and with `shape_val`.
+            Ok::<_, String>(match &self.col_projection {
+                Some(cols) => {
+                    let projected = scx_engine::projection::project_csr(&full, cols);
+                    match &self.col_presentation {
+                        Some(perm) => scx_engine::projection::reorder_csr_columns(&projected, perm),
+                        None => projected,
+                    }
+                }
+                None => full,
+            })
         })
         .map_err(PyRuntimeError::new_err)?;
         let mat = csr_to_scipy(py, csr)?;
@@ -189,27 +227,29 @@ impl ScxComparisonResult {
                     // shortcut agree with each other and with the materialized
                     // `(X>0).sum(axis)` fallback (scipy sums bools to int64).
                     // B2: decode the column nnz off the GIL.
-                    let counts: Vec<i64> = detached(py, || {
-                        let raw = match &self.kept_to_global {
-                            Some(kept) => self
-                                .backed
-                                .col_nnz_masked(kept)
-                                .map(|v| v.into_iter().map(|c| c as i64).collect::<Vec<i64>>()),
-                            None => self
-                                .backed
-                                .col_nnz()
-                                .map(|v| v.into_iter().map(|c| c as i64).collect::<Vec<i64>>()),
-                        };
-                        raw.map_err(|e| e.to_string())
+                    let cols = self.col_projection.as_deref().map(|c| c.as_slice());
+                    let kept = self.kept_to_global.as_deref().map(|k| k.as_slice());
+                    let counts = detached(py, || {
+                        crate::projected_agg::col_nnz_for(&self.backed, cols, kept)
+                            .map_err(|e| e.to_string())
                     })
                     .map_err(PyRuntimeError::new_err)?;
+                    let counts: Vec<i64> = self
+                        .present_reorder(counts)
+                        .into_iter()
+                        .map(|c| c as i64)
+                        .collect();
                     let arr = numpy::PyArray::from_vec(py, counts);
                     arr.call_method1("reshape", ((1i32, self.shape_val.1),))
                 }
                 Some(1) => {
                     // B2: decode row nnz off the GIL; keep-mask filter is cheap.
-                    let all_nnz = detached(py, || self.backed.row_nnz().map_err(|e| e.to_string()))
-                        .map_err(PyRuntimeError::new_err)?;
+                    let cols = self.col_projection.as_deref().map(|c| c.as_slice());
+                    let all_nnz = detached(py, || {
+                        crate::projected_agg::row_nnz_for(&self.backed, cols)
+                            .map_err(|e| e.to_string())
+                    })
+                    .map_err(PyRuntimeError::new_err)?;
                     let filtered = match &self.kept_to_global {
                         Some(mapping) => mapping.iter().map(|&g| all_nnz[g as usize]).collect(),
                         None => all_nnz,
@@ -218,8 +258,13 @@ impl ScxComparisonResult {
                     arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
                 }
                 None => {
-                    let total = detached(py, || self.backed.total_nnz().map_err(|e| e.to_string()))
-                        .map_err(PyRuntimeError::new_err)?;
+                    let cols = self.col_projection.as_deref().map(|c| c.as_slice());
+                    let kept = self.kept_to_global.as_deref().map(|k| k.as_slice());
+                    let total = detached(py, || {
+                        crate::projected_agg::total_nnz_for(&self.backed, cols, kept)
+                            .map_err(|e| e.to_string())
+                    })
+                    .map_err(PyRuntimeError::new_err)?;
                     // Return a numpy int64 scalar (not a bare Python int) so this
                     // shortcut matches the materialized fallback's scalar type.
                     let np = py.import("numpy")?;

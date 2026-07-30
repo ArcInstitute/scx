@@ -35,6 +35,14 @@ pub fn streaming_mean_var_csc<S: ColumnShardSource + ?Sized>(source: &S) -> Resu
     let n_shards = source.n_csc_shards();
     for shard_idx in 0..n_shards {
         let csc = source.read_csc_shard(shard_idx)?;
+        // NOTE: a full-shard CSC decode routes through `read_shard_from_entry`
+        // → the central io/decode hook, so its decode time IS captured. Only the
+        // framed/block-index CSC path (`decode_block_index_row_runs`) is not
+        // hooked. The guard below records this per-shard reduction.
+        let _r = scx_format_io::reduction_guard();
+        // Same finiteness contract as the CSR path (`crate::hvg::cpu`): a NaN
+        // would otherwise be silently absorbed as the clip value by `f64::min`.
+        crate::finite::ensure_finite_values(&csc.data, "HVG")?;
         let shard_n_cols = csc.n_cols();
         // Map shard-local column index → global column index using the
         // shard's reported col_range. Shards may not start at 0 (e.g.
@@ -97,6 +105,11 @@ pub fn streaming_clip_square_sum_csc<S: ColumnShardSource + ?Sized>(
     let n_shards = source.n_csc_shards();
     for shard_idx in 0..n_shards {
         let csc = source.read_csc_shard(shard_idx)?;
+        let _r = scx_format_io::reduction_guard();
+        // Same finiteness contract as the CSR path: a NaN clips to `clip_val`
+        // via `f64::min` (returns the non-NaN operand) and would silently
+        // poison the clipped sums.
+        crate::finite::ensure_finite_values(&csc.data, "HVG")?;
         let shard_n_cols = csc.n_cols();
         let (global_col_start, _) = source
             .csc_shard_col_range(shard_idx)
@@ -131,7 +144,11 @@ pub fn streaming_clip_square_sum_csc<S: ColumnShardSource + ?Sized>(
 // Mirror the CSR `streaming_*_with_device` wrappers in `crate::hvg`. The GPU
 // path runs the one-block-per-column CSC reduce kernel (no `atomicAdd`); it
 // requires `S: Sync` because the device source pipelines decode on a scoped
-// worker thread. Falls back to the CPU CSC kernel on GPU-init failure.
+// worker thread. A requested GPU route that fails to initialize errors
+// (`AccelError::GpuInitFailed`) rather than silently running the CPU CSC kernel
+// under a GPU route stamp (§4.1). This holds for `device="gpu"` and for
+// `device="auto"` on a host with a visible-but-broken-context GPU (fail-loud);
+// `auto` resolves to CPU up front only when no GPU is visible.
 // ---------------------------------------------------------------------------
 
 /// Device-dispatched [`streaming_mean_var_csc`].
@@ -144,10 +161,8 @@ pub fn streaming_mean_var_csc_with_device<S: ColumnShardSource + Sync>(
     if device != "gpu" {
         return streaming_mean_var_csc(source);
     }
-    let dev = match scx_gpu::GpuDevice::new(device_id) {
-        Ok(d) => d,
-        Err(_) => return streaming_mean_var_csc(source),
-    };
+    let dev = scx_gpu::GpuDevice::new(device_id)
+        .map_err(|e| crate::error::AccelError::GpuInitFailed(format!("device {device_id}: {e}")))?;
     let (means, variances) = scx_gpu::gpu_streaming_mean_var_csc(&dev, source).map_err(|e| {
         crate::error::AccelError::LinAlg(format!("gpu_streaming_mean_var_csc failed: {e}"))
     })?;
@@ -165,10 +180,8 @@ pub fn streaming_clip_square_sum_csc_with_device<S: ColumnShardSource + Sync>(
     if device != "gpu" {
         return streaming_clip_square_sum_csc(source, clip_val);
     }
-    let dev = match scx_gpu::GpuDevice::new(device_id) {
-        Ok(d) => d,
-        Err(_) => return streaming_clip_square_sum_csc(source, clip_val),
-    };
+    let dev = scx_gpu::GpuDevice::new(device_id)
+        .map_err(|e| crate::error::AccelError::GpuInitFailed(format!("device {device_id}: {e}")))?;
     scx_gpu::gpu_streaming_clip_square_sum_csc(&dev, source, clip_val).map_err(|e| {
         crate::error::AccelError::LinAlg(format!("gpu_streaming_clip_square_sum_csc failed: {e}"))
     })
@@ -233,6 +246,61 @@ mod tests {
                 "var[{j}] mismatch: csr={} csc={}",
                 csr_stats.variances[j],
                 csc_stats.variances[j]
+            );
+        }
+    }
+
+    /// In-memory CSC source that returns a hand-built shard verbatim, so a
+    /// test can inject a non-finite value without going through the codec
+    /// (Pcodec would not necessarily round-trip a NaN).
+    struct NanCscSource {
+        csc: scx_sparse::ScxCsc,
+    }
+
+    impl scx_format_io::ColumnShardSource for NanCscSource {
+        fn n_csc_shards(&self) -> usize {
+            1
+        }
+        fn n_obs(&self) -> usize {
+            self.csc.n_rows()
+        }
+        fn n_vars(&self) -> usize {
+            self.csc.n_cols()
+        }
+        fn read_csc_shard(&self, _idx: usize) -> scx_format_io::Result<scx_sparse::ScxCsc> {
+            Ok(self.csc.clone())
+        }
+        fn read_csc_columns(
+            &self,
+            _r: std::ops::Range<u32>,
+        ) -> scx_format_io::Result<scx_sparse::ScxCsc> {
+            Ok(self.csc.clone())
+        }
+        fn csc_shard_col_range(&self, _idx: usize) -> Option<(u32, u32)> {
+            Some((0, self.csc.n_cols() as u32))
+        }
+    }
+
+    /// The CSC kernels must reject non-finite input exactly like the CSR path,
+    /// rather than silently absorbing a NaN as the clip value (§4.2).
+    #[test]
+    fn streaming_csc_rejects_non_finite() {
+        // 3 rows × 2 cols; column 0 has one nonzero, poisoned with the bad value.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let csc = scx_sparse::ScxCsc::new_unchecked((3, 2), vec![0, 1, 1], vec![0], vec![bad]);
+            let src = NanCscSource { csc };
+
+            let err = streaming_mean_var_csc(&src).unwrap_err();
+            assert!(
+                matches!(err, crate::error::AccelError::InvalidInput(_)),
+                "mean_var must reject {bad}, got {err:?}"
+            );
+
+            let clip = vec![5.0_f64; 2];
+            let err = streaming_clip_square_sum_csc(&src, &clip).unwrap_err();
+            assert!(
+                matches!(err, crate::error::AccelError::InvalidInput(_)),
+                "clip_square_sum must reject {bad}, got {err:?}"
             );
         }
     }

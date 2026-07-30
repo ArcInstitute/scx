@@ -97,6 +97,11 @@ pub fn pca_neighbors(
         )));
     }
 
+    // Same reason as `pca`: a presentation-ordered backed `X` has no
+    // `ShardSource` representation, and the fused GPU path below would
+    // otherwise skip the guard `pca` applies on the delegating path.
+    super::reject_preserve_var_order(adata, "pca_neighbors")?;
+
     // In-VRAM `device="gpu"` fused PCA→kNN routes to a full rapids pipeline
     // (rsc.pp.pca → rsc.pp.neighbors) on an in-memory X. backed/lazy X stays on
     // the native device-resident fused path (>VRAM moat). Gated on the default
@@ -188,12 +193,18 @@ pub fn pca_neighbors(
             let x = adata.getattr("X")?;
 
             let ran = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-                let reader = &*backed.backed;
+                // The handle's *view*, not the raw reader — otherwise a
+                // subset backed `X` feeds PCA every on-disk row/column and
+                // the embedding misaligns against `adata.obs` (see `pca`).
+                // Uncached for the same reason as `pca`'s GPU arm: the GPU
+                // shard source stages through `read_shard`, so cached reads
+                // would deep-clone each shard instead of decoding fresh.
+                let source = backed.as_shard_source();
                 run_fused_gpu(
                     py,
                     adata,
                     device_id,
-                    reader,
+                    &source,
                     n_comps,
                     n_oversamples,
                     n_power_iterations,
@@ -313,6 +324,14 @@ pub fn pca_neighbors(
         false,     // allow_tf32
         "default", // spmm_policy
         None,      // memory_budget (default PCA cache ceiling)
+        // mask_var: this CPU/rapids fallback delegates to pca(), so mask_var=None
+        // auto-consumes adata.var["highly_variable"] if present (scanpy semantics).
+        // KNOWN LIMITATION: the native device-resident GPU fused path
+        // (run_fused_gpu) does NOT mask and analyzes all genes, so the fused
+        // PCA gene set is route-dependent when highly_variable is set. For a
+        // deterministic HVG-masked pipeline, run pca(mask_var=...) then
+        // neighbors()/umap() separately. Tracked for unification.
+        None,
     )?;
     super::neighbors::neighbors(
         py,
@@ -397,6 +416,9 @@ pub fn pca_neighbors_umap(
              {prefer_format:?}); PCA's SpMM path is row-major and CSC is not implemented."
         )));
     }
+
+    // See `pca_neighbors`.
+    super::reject_preserve_var_order(adata, "pca_neighbors_umap")?;
 
     // In-VRAM `device="gpu"` fused PCA→kNN→UMAP routes to a full rapids pipeline
     // (rsc.pp.pca → rsc.pp.neighbors → rsc.tl.umap) on an in-memory X.
@@ -485,6 +507,14 @@ pub fn pca_neighbors_umap(
         false,     // allow_tf32
         "default", // spmm_policy
         None,      // memory_budget (default PCA cache ceiling)
+        // mask_var: this CPU/rapids fallback delegates to pca(), so mask_var=None
+        // auto-consumes adata.var["highly_variable"] if present (scanpy semantics).
+        // KNOWN LIMITATION: the native device-resident GPU fused path
+        // (run_fused_gpu) does NOT mask and analyzes all genes, so the fused
+        // PCA gene set is route-dependent when highly_variable is set. For a
+        // deterministic HVG-masked pipeline, run pca(mask_var=...) then
+        // neighbors()/umap() separately. Tracked for unification.
+        None,
     )?;
     super::neighbors::neighbors(
         py,
@@ -554,8 +584,8 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     )
     .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
 
-    write_pca_to_adata(py, adata, &pca_res, "scx-gpu-cusparse")?;
-    super::neighbors::write_neighbors_to_adata(py, adata, &knn_res, n_neighbors, use_rep, "cagra")?;
+    write_pca_to_adata(py, adata, &pca_res, "scx-gpu-cusparse", None)?;
+    super::neighbors::write_neighbors_to_adata(py, adata, knn_res, n_neighbors, use_rep, "cagra")?;
     // Stamp the device-resident route on pca / neighbors / pca_neighbors,
     // carrying the Task 2.5 metadata (finding 5): `graph_replay` from the PCA
     // result and the math-mode / SpMM-policy knobs (the randomized path consumes
