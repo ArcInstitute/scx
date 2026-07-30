@@ -458,31 +458,20 @@ class FormatRunner(ABC):
         r = resource.getrusage(resource.RUSAGE_SELF)
         return r.ru_utime, r.ru_stime
 
-    _drop_caches_warned = False
-
     @classmethod
     def _drop_caches(cls) -> bool:
         """Attempt to drop OS page caches system-wide (requires root/sudo).
 
-        Returns True if successful.  Logs a warning on the first failure.
-        Prefer ``_drop_file_cache(path)`` on shared SLURM nodes without
-        root — it uses ``posix_fadvise(POSIX_FADV_DONTNEED)`` on the
-        specific file(s) and works unprivileged.
+        Returns True if successful. Delegates to
+        ``cache_control.drop_caches_root`` — which also owns the once-only
+        warning — so the two paths cannot drift. Prefer
+        ``_drop_file_cache(path)`` on shared SLURM nodes without root: it uses
+        ``posix_fadvise(POSIX_FADV_DONTNEED)`` on the specific file(s) and works
+        unprivileged.
         """
-        try:
-            subprocess.run(["sync"], check=False)
-            with open("/proc/sys/vm/drop_caches", "w") as f:
-                f.write("3\n")
-            return True
-        except (PermissionError, OSError):
-            if not cls._drop_caches_warned:
-                logger.warning(
-                    "Failed to drop page caches (requires root). "
-                    "Use `_drop_file_cache(path)` for per-file non-root cold "
-                    "reads via posix_fadvise."
-                )
-                cls._drop_caches_warned = True
-            return False
+        from benchmarks.comprehensive.cache_control import drop_caches_root
+
+        return drop_caches_root()
 
     @classmethod
     def _drop_file_cache(cls, path: str | Path) -> str:
@@ -504,35 +493,14 @@ class FormatRunner(ABC):
         ``fadvise`` only evicts CLEAN pages — any recent writes on the path
         must be ``fsync``'d first (benchmark reads don't write, so this
         isn't a concern for the read-path).
+
+        Implementation lives in ``benchmarks.comprehensive.cache_control`` so
+        benchmark modules (not just runners) can share it; this method
+        delegates to keep one code path.
         """
-        path = Path(path)
-        if not path.exists():
-            return "warm"
-        try:
-            subprocess.run(["sync"], check=False)  # best-effort — no error surfaced on failure
-            files: list[Path] = (
-                [path] if path.is_file()
-                else [p for p in path.rglob("*") if p.is_file()]
-            )
-            evicted = 0
-            for fp in files:
-                try:
-                    fd = os.open(str(fp), os.O_RDONLY)
-                except OSError:
-                    continue
-                try:
-                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                    evicted += 1
-                except (AttributeError, OSError):
-                    # AttributeError: pre-Py-3.3 or platform without
-                    # POSIX_FADV_DONTNEED (macOS, WSL1). OSError: kernel
-                    # refused the hint (rare).
-                    pass
-                finally:
-                    os.close(fd)
-            return "cold_fadvise" if evicted > 0 else "warm"
-        except Exception:  # noqa: BLE001 — cache-drop is best-effort
-            return "warm"
+        from benchmarks.comprehensive.cache_control import drop_file_cache
+
+        return drop_file_cache(path)
 
     @staticmethod
     def _gc_collect() -> None:

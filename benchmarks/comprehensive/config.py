@@ -138,6 +138,13 @@ class DatasetConfig:
         # cellstream stores are directories, not single files.
         return DATA_DIR / f"{self.name}.cellstream"
 
+    @property
+    def annbatch_path(self) -> Path:
+        # annbatch pre-shuffles into a sharded zarr DatasetCollection
+        # (directory). AnnLoader / scDataset read the source h5ad directly and
+        # therefore reuse `h5ad_path` (no dedicated fixture / conversion).
+        return DATA_DIR / f"{self.name}.annbatch.zarr"
+
     # Per-codec SCX paths for benchmark isolation
     @property
     def scx_auto_path(self) -> Path:
@@ -290,6 +297,11 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "slaf": "slaf_path",
     "shardad": "shardad_path",
     "cellstream": "cellstream_path",
+    # Data-load Phase 0 competitor loaders. annbatch has its own pre-shuffled
+    # zarr fixture; AnnLoader + scDataset read the source h5ad backed.
+    "annbatch": "annbatch_path",
+    "annloader": "h5ad_path",
+    "scdataset": "h5ad_path",
     "anndata_zarr_backed": "anndata_zarr_backed_path",
     # Phase K — multimodal format keys.
     "h5mu_uncompressed": "h5mu_path",
@@ -705,6 +717,20 @@ PRIMARY_FORMATS: list[FormatVariant] = [
 ]
 
 ADDITIONAL_FORMATS: list[FormatVariant] = [
+    # Data-load Phase 0 competitor loaders. Kept OUT of PRIMARY so they never
+    # enter the default cross-format sweep (they are loaders reading h5ad /
+    # pre-shuffled zarr, not storage formats — a `read_full`/`compression` run
+    # on them would just duplicate the h5ad rows). Only `ooc_loader` allow-lists
+    # them (SUPPORTED_FORMATS), and the Phase-0 capture selects them explicitly
+    # via `--benchmarks ooc_loader --formats annbatch annloader scdataset ...`.
+    # `--formats` resolves against ALL_FORMATS, so ADDITIONAL keys are
+    # selectable. annbatch pre-shuffles to sharded zarr (`annbatch_runner`);
+    # AnnLoader + scDataset read the source h5ad backed (`h5ad_runner` +
+    # `h5ad_path`, so Phase-A conversion is a no-op skip). BioNeMo-SCDL is
+    # deferred (isolated NeMo/CUDA env).
+    FormatVariant("annbatch", "annbatch", "additional", "annbatch_runner"),
+    FormatVariant("AnnLoader (backed)", "annloader", "additional", "h5ad_runner"),
+    FormatVariant("scDataset", "scdataset", "additional", "h5ad_runner"),
     FormatVariant("BPCells", "bpcells", "additional", "bpcells_runner"),
     FormatVariant("Parquet (zstd)", "parquet_zstd", "additional", "parquet_runner",
                   {"compression": "zstd"}),
@@ -1083,6 +1109,23 @@ def estimate_memory_gb(
             peak_mb = max(base_mb * 2, dense_mb * 1.3)
         else:
             peak_mb = max(base_mb * 2, dense_mb * 0.5)
+    elif benchmark == "ooc_loader":
+        # Same sizing model as ml_loader's streaming path: SCX/SOMA/annbatch/
+        # scDataset/AnnLoader hold a few batches + the source CSR resident; the
+        # `h5ad_none` full-RAM arm materializes the whole matrix. Sized to the
+        # sparse tier; the memory-constrained OOC regime deliberately UNDER-sizes
+        # this via SCX_BENCH_OOC_MEM_CAP_GB (applied after the safety margin).
+        peak_mb = max(base_mb * 2, dense_mb * 0.5)
+    elif benchmark == "cellset_gather":
+        # SCX-only S=64 gather: the shared shard cache holds a bounded working
+        # set + a few decoded batches. Bounded by the sparse footprint, not the
+        # dense matrix. Also subject to the OOC cap below.
+        peak_mb = max(base_mb, dense_mb * 0.3)
+    elif benchmark == "obs_open":
+        # Matrix-free obs open (SCX read_obs) or eager-obs h5ad backed. Peak is
+        # one obs table (+ per-file scratch across a manifest), never the X
+        # matrix — Python baseline dominates.
+        peak_mb = max(base_mb * 0.5, 4 * 1024)
     elif benchmark == "correctness":
         # Correctness keeps the scanpy-reference AnnData + SCX backed view
         # + SLAF round-trip materialization simultaneously while running
@@ -1223,6 +1266,26 @@ def estimate_memory_gb(
     # awkward request sizes.
     total = math.ceil(total / 8) * 8
     total = max(total, MEM_FLOOR_GB)
+    # Data-load Phase 0 out-of-core regime: to force genuine page-cache misses
+    # on datasets whose resident footprint would otherwise fit a big node,
+    # `SCX_BENCH_OOC_MEM_CAP_GB` caps the `ooc_loader` / `cellset_gather`
+    # request BELOW that footprint (the memory-constrained SLURM allocation the
+    # report calls for). Only these two benches honor it; everything else is
+    # sized for headroom as usual. The cap still respects MEM_FLOOR_GB.
+    if benchmark in ("ooc_loader", "cellset_gather"):
+        cap_raw = os.environ.get("SCX_BENCH_OOC_MEM_CAP_GB", "").strip()
+        if cap_raw:
+            try:
+                cap_gb = int(float(cap_raw))
+            except ValueError:
+                cap_gb = 0
+            if cap_gb >= MEM_FLOOR_GB and cap_gb < total:
+                logger.info(
+                    "estimate_memory_gb(%s/%s/%s): capping %d GB -> %d GB "
+                    "(SCX_BENCH_OOC_MEM_CAP_GB, forcing out-of-core)",
+                    benchmark, format_key, dataset.name, total, cap_gb,
+                )
+                return cap_gb
     # Clamp at the cluster's largest single-task allocation. Combinations
     # whose true footprint exceeds this (e.g. dense-h5ad read on census_5m)
     # would OOM either way; the cap keeps submitit from rejecting the job.
@@ -1370,6 +1433,15 @@ def estimate_time_minutes(
         # within 30 minutes even at Multiome's 144K-feature ATAC width.
         "multimodal_compression": 10,
         "multimodal_training":    30,
+        # Data-load Phase 0. `ooc_loader` drops the page cache before every
+        # timed epoch, so each run re-reads from disk (no warm reuse) across up
+        # to 6 loader arms × 2 scenarios × n_runs — generous base + a steeper
+        # cold-read slope below. `cellset_gather` is SCX-only, S=64 gather over
+        # scaled batch counts. `obs_open` is a fast open→read-one-column probe
+        # (its manifest scenario scales with file count, not n_obs).
+        "ooc_loader":             90,
+        "cellset_gather":         45,
+        "obs_open":               20,
     }
     base = base_minutes.get(benchmark, 15)
 
@@ -1378,6 +1450,11 @@ def estimate_time_minutes(
     slope_minutes_per_million = 8
     if benchmark in ("cloud_large_atlas",):
         slope_minutes_per_million = 30
+    elif benchmark == "ooc_loader":
+        # Cold-cache re-reads from disk every epoch; census_5m/10m cold reads
+        # dominate. Steeper than the 8/M default so the larger OOC tiers don't
+        # clip.
+        slope_minutes_per_million = 15
     elif benchmark in ("cloud_push", "cloud_pull", "cloud_read",
                         "cloud_reader_vs_pull", "cost_model"):
         slope_minutes_per_million = 12

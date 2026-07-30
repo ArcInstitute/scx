@@ -1968,6 +1968,190 @@ absolute_floors:
     metric: compression_ratio
     min: 6.0
 
+  # --- data-load Phase 0 floors (cold-cache) ---------------------------
+  # Captured on branch opt/data-loader (2026-07-23, baseline
+  # v0.11.5-dataload-phase0), all rows cache_policy=cold_fadvise under a
+  # 96 GB SLURM cap on census (forced out-of-core). SCX own-throughput at
+  # 0.85× the cold median; competitors at 0.5× median; obs-open per-file at
+  # 1.15× (lower is better). These are the pre-optimization reference the
+  # later phases must beat — cellset_gather especially (the raw-local gather
+  # is the Phase-1 target). census_5m cellset_gather is a known gap (scattered
+  # 5M-row gather read cold exceeds the wall limit; see deferred item 7).
+  - benchmark: ooc_loader
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: samples_per_sec__raw
+    min: 24501.2
+  - benchmark: ooc_loader
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: samples_per_sec__hvg_norm
+    min: 29917.5
+  - benchmark: ooc_loader
+    format: scx_auto
+    dataset: census_500k
+    metric: samples_per_sec__raw
+    min: 41468.1
+  - benchmark: ooc_loader
+    format: scx_auto
+    dataset: census_500k
+    metric: samples_per_sec__hvg_norm
+    min: 49632.3
+  - benchmark: ooc_loader
+    format: scx_auto
+    dataset: census_1m
+    metric: samples_per_sec__raw
+    min: 49125.8
+  - benchmark: ooc_loader
+    format: scx_auto
+    dataset: census_1m
+    metric: samples_per_sec__hvg_norm
+    min: 53643.5
+  - benchmark: ooc_loader
+    format: scx_auto
+    dataset: census_5m
+    metric: samples_per_sec__raw
+    min: 52998.3
+  - benchmark: ooc_loader
+    format: scx_auto
+    dataset: census_5m
+    metric: samples_per_sec__hvg_norm
+    min: 62940.8
+  - benchmark: ooc_loader
+    format: scx_fast
+    dataset: tabula_sapiens_100k
+    metric: samples_per_sec__raw
+    min: 28538.8
+  - benchmark: ooc_loader
+    format: scx_fast
+    dataset: census_500k
+    metric: samples_per_sec__raw
+    min: 36507.5
+  - benchmark: ooc_loader
+    format: annloader
+    dataset: census_500k
+    metric: samples_per_sec__raw
+    min: 3246.0
+  - benchmark: ooc_loader
+    format: scdataset
+    dataset: census_500k
+    metric: samples_per_sec__raw
+    min: 4793.5
+  - benchmark: ooc_loader
+    format: annbatch
+    dataset: census_500k
+    metric: samples_per_sec__raw
+    min: 7343.0
+  - benchmark: ooc_loader
+    format: h5ad_none
+    dataset: census_500k
+    metric: samples_per_sec__raw
+    min: 8579.5
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: cellsets_per_sec__gather_random
+    min: 4.08
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: cellsets_per_sec__gather_grouped
+    min: 5.61
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: census_500k
+    metric: cellsets_per_sec__gather_random
+    min: 5.61
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: census_500k
+    metric: cellsets_per_sec__gather_grouped
+    min: 14.96
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: census_1m
+    metric: cellsets_per_sec__gather_random
+    min: 5.865
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: census_1m
+    metric: cellsets_per_sec__gather_grouped
+    min: 13.175
+  # --- data-load Phase 0, second wave (2026-07-30, pyscx 0.11.7) ----------
+  # S=512 cell-set gather + the N=4 rank-scaling arm. Same conventions as the
+  # block above: SCX own-throughput at 0.85x the cold median. Captured under
+  # SCX_BENCH_OOC_MEM_CAP_GB=96 / SCX_BENCH_N_RANKS=4, every row cold_fadvise.
+  #
+  # The rank-efficiency floors are the load-bearing ones: efficiency is
+  # per-rank-rate-at-N / rate-at-1, so a drop below ~0.85 means concurrent ranks
+  # started contending on a shared resource — the P-1(c) regression this whole
+  # arm exists to catch. It cannot be inferred from the single-process rows.
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: cellsets_per_sec__gather_random_s512
+    min: 0.68
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: cellsets_per_sec__gather_grouped_s512
+    min: 1.19
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: rank_scaling_efficiency__gather_random_r4
+    min: 0.813
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: census_500k
+    metric: cellsets_per_sec__gather_random_s512
+    min: 0.765
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: census_500k
+    metric: cellsets_per_sec__gather_grouped_s512
+    min: 7.395
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: census_500k
+    metric: rank_scaling_efficiency__gather_random_r4
+    min: 0.852
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: census_1m
+    metric: cellsets_per_sec__gather_random_s512
+    min: 0.765
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: census_1m
+    metric: cellsets_per_sec__gather_grouped_s512
+    min: 5.185
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: census_1m
+    metric: rank_scaling_efficiency__gather_random_r4
+    min: 0.86
+  - benchmark: obs_open
+    format: scx_auto
+    dataset: census_500k
+    metric: obs_open_s_per_file__open_1file
+    max: 0.6181
+  - benchmark: obs_open
+    format: scx_auto
+    dataset: census_1m
+    metric: obs_open_s_per_file__open_1file
+    max: 1.5598
+  - benchmark: obs_open
+    format: scx_auto
+    dataset: census_5m
+    metric: obs_open_s_per_file__open_1file
+    max: 2.6239
+  - benchmark: obs_open
+    format: h5ad_none
+    dataset: census_500k
+    metric: obs_open_s_per_file__open_1file
+    max: 0.738
+
 # ---------------------------------------------------------------------------
 # Deferred floors — known gaps tracked here so operators can see what's
 # missing and why. Add entries above this block once the blockers below
@@ -2041,3 +2225,37 @@ absolute_floors:
 #    add a `discrimination_route_gpu_correct` floor mirroring the two above, plus
 #    an `accel_eval_metrics__pyscx_discrimination_score_gpu` variant. The
 #    `discrimination_score` op stamps only `cpu_*` routes today.
+#
+# 7. Data-load Phase 0 signals: ooc_loader / cellset_gather / obs_open
+#    NOW ACTIVE — 33 cold-cache floors, all live under `absolute_floors` above:
+#    24 captured 2026-07-23 (baseline v0.11.5-dataload-phase0; ooc_loader SCX +
+#    4 competitors, cellset_gather SCX, obs_open SCX + h5ad_none) plus 9 from the
+#    2026-07-30 second wave (S=512 gather x 3 datasets x 2 plan types, and the
+#    3 rank-scaling-efficiency floors). What remains DEFERRED:
+#      * cellset_gather / census_5m: the scattered 5M-row gather read cold
+#        exceeds the SLURM wall limit on the pre-optimization raw-local path
+#        (that slowness is the Phase-1 target). Re-enable a floor once the
+#        in-Rust gather assembly lands and the epoch fits the budget.
+#      * obs_open / h5ad_none / {census_1m,census_5m}: the eager-obs baseline
+#        wasn't run at census_1m/5m (Wave B was SCX-only to avoid the 60–80s
+#        per-file anndata cost dominating the job). Add the h5ad_none obs floor
+#        there when a competitor OOC wave is run, to quantify the Phase-1A win.
+#      * obs_open manifest scenario (`*__open_manifest`, `*__open_manifest_r4`):
+#        floor once the manifest fixture is a committed prep step in the tier
+#        flow. Until then a floor would synthesise a "missing metric" violation
+#        on every host that hasn't run `prep_manifest_fixture.py`. Measured
+#        2026-07-30 for the record: SCX 6.13 ms/file vs h5ad 115.5 ms/file over
+#        256 files (18.8x), and rank-scaling efficiency 1.78 at N=4 (SCX) vs
+#        1.03 (h5ad) — the SCX figure is cache sharing, since every rank walks
+#        the same files.
+#      * obs_open `open_only` / `open_only_unverified`: deliberately NOT floored.
+#        Both are sub-millisecond at tabula (0.09-0.10 ms) and the BLAKE3 verify
+#        term derived from them measured *negative* (-3.8 ms) at census_1m —
+#        i.e. below the run-to-run spread. A floor on a quantity smaller than its
+#        own noise floor fails on noise, which trains operators to ignore the
+#        gate. They stay as recorded diagnostics; the finding they support (obs
+#        read is 96-99.8% of per-file cost, so the open side is not worth
+#        optimizing) is in docs/performance.md.
+#    BioNeMo-SCDL ooc_loader row stays DEFERRED (isolated NeMo/CUDA env not yet
+#    added — see envs/scx-bench.yml note). Only AnnLoader + annbatch + scDataset
+#    are wired for Phase 0.
