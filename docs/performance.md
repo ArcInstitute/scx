@@ -1930,21 +1930,38 @@ cold: SCX `read_obs([col])` costs **6.3 ms/file** against **118 ms/file** for
 process. 167 s of one-time catalog build is not a bottleneck worth Rust work, and it is
 already the cheap side of a 19× gap.
 
-The sub-component breakdown redirects the *proposed remedy*, though, and this is the more
-useful finding. Per file on `pbmc10k`, cold:
+The sub-component breakdown settles which term is worth attacking. Per file at
+`tabula_sapiens_100k`, cold on a dedicated SLURM allocation:
 
 | term | s/file | share | how measured |
 |---|---|---|---|
-| open + mmap + header + catalog parse | 0.01382 | **87%** | `open_only_unverified` |
-| BLAKE3 catalog verify | 0.00032 | 2% | `open_only − open_only_unverified` |
-| obs read proper | 0.00173 | 11% | `open_1file − open_only` |
+| open + mmap + header + catalog parse | 0.00009 | 0.2% | `open_only_unverified` |
+| BLAKE3 catalog verify | 0.00001 | 0.02% | `open_only − open_only_unverified` |
+| **obs read proper** | **0.05381** | **99.8%** | `open_1file − open_only` |
 
-So P0.1b's headline proposal — a numpy `(codes, categories)` accessor — optimizes the
-**11%** term, and `open_unchecked` optimizes the **2%** term. The lever is catalog parse and
-file open, exactly as that item's own "measure it first" note suspected but could not show.
+**The open is essentially free and obs reading is the whole cost.** That settles P0.1b's
+internal argument in favour of its own proposal: its stated non-goal was a separate
+`ScxObsReader` that "opens without mmap-ing X", on the grounds that the mmap is lazy and the
+real cost is `File::open` + catalog parse + BLAKE3 — and that grounds is now measured to be
+**wrong**. Sub-millisecond opens mean neither `open_unchecked` nor catalog-size work is worth
+doing; a cheaper *obs* path (the numpy `(codes, categories)` accessor, skipping the
+pandas/pyarrow round-trip) is aimed at the ~99.8% term.
+
+Neither measurement needed a new pyscx API — `pyscx.open(path, verify=False)` already exists
+(`pyscx/src/lib.rs:144` → `ScxReader::open_unchecked`), contrary to an earlier note in the
+planning doc.
+
+> **A correction worth recording, because it inverted the conclusion.** An interactive
+> `pbmc10k` smoke of the same three scenarios read 13.8 ms open / 0.32 ms verify / 1.73 ms
+> obs — i.e. "87% open", the exact opposite split — and that number was briefly published
+> here. It was measurement noise: in a warm interactive shell the first `pyscx.open` absorbs
+> interpreter/pyo3 and first-touch costs that `posix_fadvise` does not evict, and 13.8 ms of
+> "open" on a 30 MB file was never physically plausible next to 0.09 ms on a 233 MB one. The
+> table above is from a cold, dedicated allocation. **One small-fixture smoke is not a
+> measurement**; the harness exists precisely so this class of claim comes from a capture.
+
 For the h5ad baseline the split is degenerate (48.0 ms open-only of 48.0 ms total, obs read
 0.03 ms): anndata builds the obs index during open, so *all* of its cost is the open.
-Neither of these needed a new pyscx API — `pyscx.open(path, verify=False)` already exists.
 
 **(b) Observational / pretraining at S=128–512 — NO.** STATE3's 0.6% figure is S=64, B=4,
 GPU-memory-ceilinged, so the larger-set regime was genuinely untested. Measured on
@@ -1963,22 +1980,36 @@ than the perturbation regime that already measured at 0.6% of step time — it m
 from the critical path, not closer. (Grouped beats random ~3× at both set sizes, which is
 the grouped-sharding locality win doing its job.)
 
-**(c) DDP multi-rank — NO on the evidence available, with a stated limit.** Measured by
-running the same per-rank gather in N spawned processes against one file and reporting
-`rank_scaling_efficiency` = median(per-rank rate at N) ÷ (rate at 1 rank); ≈1 means a rank
-is as fast with siblings as alone. On `pbmc10k` at N=2: **1.19 and 0.92 across two runs**
-(median ~1.05) — no measurable per-rank degradation. Three details make that number mean
-what it says: `spawn` rather than `fork` (a parent-constructed dataset used post-fork trips
-pyscx's PID guard); a barrier before the timed region (otherwise interpreter-startup skew
-makes the "concurrent" window partly serial and flatters the ratio); and a distinct seed per
-rank (identical seeds would have every rank touch the same shards, so the shared page cache
-would *help* and efficiency would read ≈1 for the wrong reason).
+**(c) DDP multi-rank — NO, for two different reasons on the two access patterns.** Measured
+by running the same per-rank workload in N spawned processes against the same file(s) and
+reporting `rank_scaling_efficiency` = median(per-rank rate at N) ÷ (rate at 1 rank); 1.0
+means a rank is as fast with siblings as alone, ~1/N means the ranks serialise.
+
+| arm | pattern | N | efficiency | reading |
+|---|---|---|---|---|
+| `open_manifest_r4` (tabula, 256-file manifest) | every rank walks **all** files | 4 | **1.70, 1.87** | ranks *help* each other |
+| `gather_random_r2` (pbmc10k) | distinct seed per rank | 2 | 1.19, 0.92 | no degradation |
+
+**Efficiency above 1 is not "no contention" — it is cache sharing, and the distinction
+matters.** In the manifest arm every rank reads the *same* 256 files (deliberately: each
+model process builds a global obs vocabulary from every file, so per-rank cost does not shrink
+with world size). The cache is dropped once before the arm, so whichever rank touches a file
+first warms it for the other three. Aggregate startup is therefore *sub*-linear in rank count
+— genuinely good news for the 26k-file case, but a claim about cache sharing, not about the
+absence of resource contention.
+
+The gather arm is the contention-honest one: it gives each rank a **distinct seed** precisely
+so ranks touch different shards and the page cache cannot flatter the result. There, 2 ranks
+are each as fast as one alone.
+
+Two further details make these numbers mean what they say: `spawn` rather than `fork` (a
+parent-constructed dataset used post-fork trips pyscx's PID guard), and a barrier before the
+timed region (otherwise interpreter-startup skew makes the "concurrent" window partly serial).
 
 **The limit, stated rather than buried:** N processes on one node measures shared page-cache,
 shared-filesystem and memory-bandwidth contention. It does **not** measure inter-node NCCL
-interaction or per-rank sampler cost under a real `DistributedSampler`. A negative finding
-here rules out the loader as a *shared-resource* bottleneck; it does not certify multi-node
-DDP.
+interaction or per-rank sampler cost under a real `DistributedSampler`. This rules out the
+loader as a *shared-resource* bottleneck on one node; it does not certify multi-node DDP.
 
 **(d) STACK — NO, and for a more basic reason.** `arc-stack` v0.1.3 (`~/dev/python/stack`)
 contains **zero `pyscx`/`scx` references**: it is not an SCX consumer. Its loader is pure
