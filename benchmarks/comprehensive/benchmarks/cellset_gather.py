@@ -2,10 +2,13 @@
 Cell-set gather-throughput benchmark (data-load Phase 0).
 
 The STATE/STATE3 hot path is *not* i.i.d. sequential batching — it is random
-gather of small covariate-grouped **cell sets** (``2026-07-22_DATA-LOAD-OPT.md``
-§0/§2). This benchmark measures exactly that, distinct from the
-``ml_loader``/``ooc_loader`` batch rate, by driving
-``pyscx.SparseCellSetDataset.iter_with_plans`` with fixed-size cell sets.
+gather of small covariate-grouped **cell sets**: 64–512 cells grouped by
+``(cell_type, perturbation)``, frequently spanning files, with paired controls and
+a per-set gene-panel subsample. This benchmark measures exactly that, distinct
+from the ``ml_loader``/``ooc_loader`` batch rate, by driving
+``pyscx.SparseCellSetDataset.iter_with_plans`` with fixed-size cell sets. Results
+and the premise-gate verdict live in ``docs/performance.md`` § "Out-of-core loader
+— cold-cache measurements and the P-1 premise gate".
 
 SCX-only (``format_variant.key`` in the SCX codec set) — returns ``None`` for
 every other format (gating pattern from ``index_plan`` / ``fragment_ops``).

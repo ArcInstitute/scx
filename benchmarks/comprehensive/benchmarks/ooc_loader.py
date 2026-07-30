@@ -2,9 +2,9 @@
 Out-of-core sequential-loader throughput benchmark (data-load Phase 0).
 
 The honest, cache-cold counterpart to ``ml_loader``. ``ml_loader`` reports a
-warm ``batches_per_sec`` that, on Census-1M, is largely a page-cache artifact
-(the report ``2026-07-22_DATA-LOAD-OPT.md`` §0 flags this). This benchmark
-instead:
+warm ``batches_per_sec`` that, on Census-1M, is largely a page-cache artifact —
+the same trap annbatch's paper documents inflating BioNeMo-SCDL from 2.5k to 110k
+samples/s purely through cache residency. This benchmark instead:
 
   * **drops the page cache before every timed epoch** via
     ``cache_control.drop_file_cache`` (unprivileged ``posix_fadvise`` — works on

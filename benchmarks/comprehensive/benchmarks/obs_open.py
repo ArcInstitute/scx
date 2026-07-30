@@ -1,13 +1,15 @@
 """
 Per-file obs-open cost microbench (data-load Phase 0).
 
-The report (§0/§2.3) identifies obs materialization as a first-class, hidden
-scaling cost: STATE3 hand-rolled ``_H5adFastBacked`` specifically to dodge
-``anndata``'s eager obs load (60–80 s + tens of GB per file), yet the ``.scx``
-path today still routes obs through ``read_obs``/``to_anndata``. At 26,453 files
-× workers × ranks the per-file open cost dominates. This microbench measures it
-directly, so Phase 1A's matrix-free ``obs_categorical`` reader has a before/after
-number.
+Obs materialization is a first-class, hidden *startup* cost for every virtual-cell
+model: each scans obs up front to build global vocab / one-hot maps. STATE3
+hand-rolled a `_H5adFastBacked` reader specifically to dodge ``anndata``'s eager
+obs load (60–80 s + tens of GB per file), and its manifests reach **26,453 files**,
+so per-file open cost is multiplied by files × workers × ranks. This microbench
+measures it directly. Results, including the finding that ~87% of SCX's per-file
+cost is open + catalog parse rather than obs reading, are in
+``docs/performance.md`` § "Out-of-core loader — cold-cache measurements and the
+P-1 premise gate".
 
 Two formats:
   * ``scx_auto``  — ``pyscx.open(path).read_obs([col])`` (matrix-free; no X mmap).

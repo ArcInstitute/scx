@@ -1,12 +1,13 @@
 """
 N-concurrent-rank harness for the data-load Phase-0 premise gate (P-1(c)).
 
-The gate question ``2026-07-22_DATA-LOAD-OPT.md`` §5 P-1(c) asks is: **does
-per-rank loader cost and page-cache pressure scale**, i.e. is the loader a
-*shared* bottleneck once several DDP ranks read the same files on one node?
-A single-process throughput number cannot answer that — contention on the OS
-page cache, the shared filesystem, and the node's memory bandwidth only shows up
-with concurrent readers.
+The question this answers: **does per-rank loader cost and page-cache pressure
+scale**, i.e. is the loader a *shared* bottleneck once several DDP ranks read the
+same files on one node? A single-process throughput number cannot say — contention
+on the OS page cache, the shared filesystem, and the node's memory bandwidth only
+appears with concurrent readers. See ``docs/performance.md`` § "Out-of-core loader
+— cold-cache measurements and the P-1 premise gate" for the results and for the
+stated limit (one node is not multi-node DDP).
 
 This module runs the same per-rank workload in ``n_ranks`` child processes and
 reports each rank's outcome, so a benchmark can compute

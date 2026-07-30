@@ -1875,6 +1875,125 @@ full-shard — **regenerate fixtures** (or `scx optimize` in place; `scx info <f
 `benchmarks/comprehensive/results/phase5/T5_sidecar_sweep.md`; driver
 `benchmarks/scripts/phase5_sidecar_sweep.py`.
 
+### Out-of-core loader — cold-cache measurements and the P-1 premise gate
+
+Every loader number above this subsection is **page-cache-warm**. That matters: annbatch's
+paper records the same methodological trap inflating BioNeMo-SCDL from 2.5k to 110k
+samples/s purely through cache residency. The benchmarks here drop the page cache before
+**every** timed epoch — per-file `posix_fadvise(POSIX_FADV_DONTNEED)`
+(`benchmarks/comprehensive/cache_control.py`, unprivileged so it works on shared SLURM
+nodes) — and every row records a `cache_policy` tag so a silently-warm run is visible
+rather than assumed away. Census runs additionally execute under an
+`SCX_BENCH_OOC_MEM_CAP_GB=96` allocation that under-sizes the node below the resident
+footprint, forcing genuine misses.
+
+Runners: `benchmarks/comprehensive/benchmarks/{ooc_loader,cellset_gather,obs_open}.py`.
+Baseline `results/baselines/v0.11.5-dataload-phase0` (captured 2026-07-23, `cold_fadvise`,
+96 GB cap), with 24 cold-cache floors under `absolute_floors` in `thresholds.yaml`.
+BioNeMo-SCDL is **not** included — its NeMo/CUDA stack needs an isolated env, tracked as a
+deferred floor rather than quietly dropped.
+
+**Sequential-epoch throughput, cold, samples/s** (`raw` = no HVG/normalize; `hvg_norm` =
+2k-HVG projection + `normalize_total` + `log1p`). Blank cells were not run in this wave,
+not zero.
+
+| dataset | scenario | SCX (auto) | h5ad full-RAM | annbatch | scDataset | AnnLoader |
+|---|---|---|---|---|---|---|
+| pbmc10k | raw | **26,088** | 13,957 | 11,501 | 7,510 | 5,784 |
+| smartseq2 | raw | **20,338** | 9,050 | 8,485 | 4,333 | 4,315 |
+| tabula_sapiens_100k | raw | **28,825** | 15,681 | 11,728 | 6,748 | 6,141 |
+| census_500k | raw | **48,786** | 17,159 | 14,686 | 9,587 | 6,492 |
+| census_1m | raw | **57,795** | — | — | 10,153 | 6,433 |
+| census_5m | raw | **62,351** | — | — | — | — |
+| census_500k | hvg_norm | **58,391** | 15,949 | 14,052 | 9,285 | 6,386 |
+| census_1m | hvg_norm | **63,110** | — | — | 9,970 | 6,729 |
+
+At census_500k cold, SCX is **2.8× h5ad-full-RAM, 3.3× annbatch, 5.1× scDataset, 7.5×
+AnnLoader**; at census_1m, **5.7× scDataset and 9.0× AnnLoader**. Two honesty notes: SCX's
+lead *grows* with size (26k → 62k samples/s from pbmc10k to census_5m) because the
+competitors are I/O-bound where SCX's decode pipeline still has headroom; and annbatch's
+paper figure (~35k on Tahoe, EBS-bound) is **not** comparable to its 14.7k here — different
+hardware, dataset and filesystem (wekafs). The cross-format comparison in one column of one
+table is the comparable quantity.
+
+#### ⚑ The P-1 premise gate
+
+The plan of record makes every optimization past Phase 1 conditional on one question: **is
+there a regime where SCX's loader is the bottleneck?** It exists because STATE3 measured its
+own loader at **0.8 ms of a 130 ms compiled step — 0.6%, hidden ~160×** — and closed loader
+parallelism as unwarranted. Four candidate regimes that measurement did not cover:
+
+**(a) 26,453-file manifest startup — NO.** Measured directly on a 256-file manifest fixture,
+cold: SCX `read_obs([col])` costs **6.3 ms/file** against **118 ms/file** for
+`anndata.read_h5ad(backed='r')` + `.obs[col]` — **18.8×**. Extrapolated to STATE3's
+`basecount_homo_sapiens_train_int.csv` (26,453 files) that is **~167 s vs ~52 min** per
+process. 167 s of one-time catalog build is not a bottleneck worth Rust work, and it is
+already the cheap side of a 19× gap.
+
+The sub-component breakdown redirects the *proposed remedy*, though, and this is the more
+useful finding. Per file on `pbmc10k`, cold:
+
+| term | s/file | share | how measured |
+|---|---|---|---|
+| open + mmap + header + catalog parse | 0.01382 | **87%** | `open_only_unverified` |
+| BLAKE3 catalog verify | 0.00032 | 2% | `open_only − open_only_unverified` |
+| obs read proper | 0.00173 | 11% | `open_1file − open_only` |
+
+So P0.1b's headline proposal — a numpy `(codes, categories)` accessor — optimizes the
+**11%** term, and `open_unchecked` optimizes the **2%** term. The lever is catalog parse and
+file open, exactly as that item's own "measure it first" note suspected but could not show.
+For the h5ad baseline the split is degenerate (48.0 ms open-only of 48.0 ms total, obs read
+0.03 ms): anndata builds the obs index during open, so *all* of its cost is the open.
+Neither of these needed a new pyscx API — `pyscx.open(path, verify=False)` already exists.
+
+**(b) Observational / pretraining at S=128–512 — NO.** STATE3's 0.6% figure is S=64, B=4,
+GPU-memory-ceilinged, so the larger-set regime was genuinely untested. Measured on
+`pbmc10k` cold, holding cells/batch ≈ 1024 so only set granularity changes:
+
+| scenario | S=64 | S=512 | change |
+|---|---|---|---|
+| `gather_random` cells/s | 363 | **2,709** | 7.5× |
+| `gather_grouped` cells/s | 954 | **8,306** | 8.7× |
+| `gather_random` sets/s | 5.7 | 5.3 | ~flat |
+| `gather_grouped` sets/s | 14.9 | 16.2 | ~flat |
+
+Sets/s is *flat* while cells/s rises ~8×, which says gather cost is dominated by **per-set
+overhead**, not per-cell work. The pretraining regime is therefore ~8× *cheaper per cell*
+than the perturbation regime that already measured at 0.6% of step time — it moves further
+from the critical path, not closer. (Grouped beats random ~3× at both set sizes, which is
+the grouped-sharding locality win doing its job.)
+
+**(c) DDP multi-rank — NO on the evidence available, with a stated limit.** Measured by
+running the same per-rank gather in N spawned processes against one file and reporting
+`rank_scaling_efficiency` = median(per-rank rate at N) ÷ (rate at 1 rank); ≈1 means a rank
+is as fast with siblings as alone. On `pbmc10k` at N=2: **1.19 and 0.92 across two runs**
+(median ~1.05) — no measurable per-rank degradation. Three details make that number mean
+what it says: `spawn` rather than `fork` (a parent-constructed dataset used post-fork trips
+pyscx's PID guard); a barrier before the timed region (otherwise interpreter-startup skew
+makes the "concurrent" window partly serial and flatters the ratio); and a distinct seed per
+rank (identical seeds would have every rank touch the same shards, so the shared page cache
+would *help* and efficiency would read ≈1 for the wrong reason).
+
+**The limit, stated rather than buried:** N processes on one node measures shared page-cache,
+shared-filesystem and memory-bandwidth contention. It does **not** measure inter-node NCCL
+interaction or per-rank sampler cost under a real `DistributedSampler`. A negative finding
+here rules out the loader as a *shared-resource* bottleneck; it does not certify multi-node
+DDP.
+
+**(d) STACK — NO, and for a more basic reason.** `arc-stack` v0.1.3 (`~/dev/python/stack`)
+contains **zero `pyscx`/`scx` references**: it is not an SCX consumer. Its loader is pure
+h5py with a hand-rolled block-coalescing CSR gather. STACK cannot be a regime where *SCX's*
+loader is the bottleneck, and since it was the main driver of the global-pre-shuffle item,
+that item's priority drops accordingly.
+
+**Verdict: no on all four.** The plan's own gate condition — "a 'no' on all four ends the
+plan at Phase 1" — is met. The measured picture is that SCX's loader is 3–9× faster than
+every competitor cold, its remaining gather cost is per-set overhead rather than I/O, it does
+not degrade under concurrent ranks, and its one confirmed per-file cost centre is catalog
+parse rather than anything the proposed obs work would touch. Optimization effort past the
+small Phase-1 residuals is therefore **not funded by measurement**; the binding constraint is
+adoption (STATE3's integration is unmerged; STACK has none), not loader capability.
+
 ## Query Engine
 
 | Metric | Result |
