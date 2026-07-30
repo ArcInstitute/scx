@@ -248,8 +248,16 @@ def test_s512_plan_packs_512_stride_offsets(phase0_env):
 _FROZEN_CELLSET_KEYS = (
     "cellsets_per_sec__gather_random",
     "cellsets_per_sec__gather_grouped",
+    "cellsets_per_sec__gather_random_s512",
+    "cellsets_per_sec__gather_grouped_s512",
 )
 _FROZEN_OBS_OPEN_KEYS = ("obs_open_s_per_file__open_1file",)
+
+# Floored, but only emitted when the rank arm is enabled (SCX_BENCH_N_RANKS > 1),
+# so they can't be asserted against a default-config run the way the always-on
+# keys above can. Listed separately so the guard-the-guard test below still
+# accounts for every Phase-0 floor in thresholds.yaml.
+_FROZEN_RANK_KEYS = ("rank_scaling_efficiency__gather_random_r4",)
 
 
 def test_frozen_floor_keys_still_emitted(phase0_env):
@@ -286,12 +294,25 @@ def test_thresholds_yaml_floor_keys_match_frozen_list():
         for f in floors
         if f.get("benchmark") in ("cellset_gather", "obs_open")
     }
-    frozen = set(_FROZEN_CELLSET_KEYS) | set(_FROZEN_OBS_OPEN_KEYS)
+    frozen = set(_FROZEN_CELLSET_KEYS) | set(_FROZEN_OBS_OPEN_KEYS) | set(_FROZEN_RANK_KEYS)
     missing = live - frozen
     assert not missing, (
         f"thresholds.yaml has Phase-0 floors not covered by the rename guard: "
         f"{sorted(missing)} — add them to _FROZEN_* above"
     )
+
+
+def test_rank_arm_emits_its_floored_key(phase0_env, monkeypatch: pytest.MonkeyPatch):
+    """`rank_scaling_efficiency__gather_random_r<N>` has a floor, so the arm must
+    actually emit it — under the same rank count the floors were captured at."""
+    import importlib
+
+    monkeypatch.setenv("SCX_BENCH_N_RANKS", "4")
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+    res = m.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+    keys = set().union(*(r.extra.keys() for r in res.runs))
+    for k in _FROZEN_RANK_KEYS:
+        assert k in keys, f"floored rank metric {k!r} not emitted at N=4"
 
 
 # ---------------------------------------------------------------------------

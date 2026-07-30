@@ -1924,83 +1924,115 @@ own loader at **0.8 ms of a 130 ms compiled step — 0.6%, hidden ~160×** — a
 parallelism as unwarranted. Four candidate regimes that measurement did not cover:
 
 **(a) 26,453-file manifest startup — NO.** Measured directly on a 256-file manifest fixture,
-cold: SCX `read_obs([col])` costs **6.3 ms/file** against **118 ms/file** for
+cold: SCX `read_obs([col])` costs **6.13 ms/file** against **115.5 ms/file** for
 `anndata.read_h5ad(backed='r')` + `.obs[col]` — **18.8×**. Extrapolated to STATE3's
-`basecount_homo_sapiens_train_int.csv` (26,453 files) that is **~167 s vs ~52 min** per
-process. 167 s of one-time catalog build is not a bottleneck worth Rust work, and it is
-already the cheap side of a 19× gap.
+`basecount_homo_sapiens_train_int.csv` (26,453 files) that is **~162 s vs ~51 min** per
+process. 162 s of one-time catalog build is not a bottleneck worth Rust work, and it is
+already the cheap side of a 19× gap. (Per-file cost here is *lower* than the single-file
+numbers below because the fixture shards one 100k-cell file into 256 small ones — the
+small-file regime, which is what a 26k-file manifest actually is.)
 
-The sub-component breakdown settles which term is worth attacking. Per file at
-`tabula_sapiens_100k`, cold on a dedicated SLURM allocation:
+The sub-component breakdown settles which term is worth attacking. Per file, cold, on
+dedicated SLURM allocations at three scales:
 
-| term | s/file | share | how measured |
-|---|---|---|---|
-| open + mmap + header + catalog parse | 0.00009 | 0.2% | `open_only_unverified` |
-| BLAKE3 catalog verify | 0.00001 | 0.02% | `open_only − open_only_unverified` |
-| **obs read proper** | **0.05381** | **99.8%** | `open_1file − open_only` |
+| dataset | open + mmap + header + catalog parse | BLAKE3 catalog verify | **obs read** | obs read share |
+|---|---|---|---|---|
+| tabula_sapiens_100k | 0.09 ms | 0.01 ms | **53.8 ms** | 99.8% |
+| census_500k | 18.5 ms | 1.2 ms | **498.8 ms** | 96.2% |
+| census_1m | 20.0 ms | *below noise* | **1251.2 ms** | 98.7% |
 
-**The open is essentially free and obs reading is the whole cost.** That settles P0.1b's
-internal argument in favour of its own proposal: its stated non-goal was a separate
-`ScxObsReader` that "opens without mmap-ing X", on the grounds that the mmap is lazy and the
-real cost is `File::open` + catalog parse + BLAKE3 — and that grounds is now measured to be
-**wrong**. Sub-millisecond opens mean neither `open_unchecked` nor catalog-size work is worth
-doing; a cheaper *obs* path (the numpy `(codes, categories)` accessor, skipping the
-pandas/pyarrow round-trip) is aimed at the ~99.8% term.
+Measured as `open_only_unverified` / (`open_only − open_only_unverified`) /
+(`open_1file − open_only`). The census_1m verify term came out **negative** (−3.8 ms), i.e.
+BLAKE3 catalog verification is cheaper than the run-to-run spread — reported as "below noise"
+rather than as a negative cost.
 
-Neither measurement needed a new pyscx API — `pyscx.open(path, verify=False)` already exists
-(`pyscx/src/lib.rs:144` → `ScxReader::open_unchecked`), contrary to an earlier note in the
-planning doc.
+**The open is cheap and obs reading is essentially the whole cost — 96–99.8% at every
+scale.** That settles P0.1b's internal argument in favour of its own proposal: its stated
+non-goal was a separate `ScxObsReader` that "opens without mmap-ing X", on the grounds that
+per-file cost is `File::open` + full-catalog parse + BLAKE3 verify. Measured, those three
+total 0.1–21 ms against a 54–1251 ms obs read. So neither `open_unchecked`, nor catalog-size
+reduction, nor a process-level catalog cache is worth building; the numpy
+`(codes, categories)` accessor — skipping the pandas/pyarrow round-trip — is aimed at the
+right term.
+
+Neither measurement needed a new pyscx API: `pyscx.open(path, verify=False)` already exists
+(`pyscx/src/lib.rs:144` → `ScxReader::open_unchecked`).
 
 > **A correction worth recording, because it inverted the conclusion.** An interactive
 > `pbmc10k` smoke of the same three scenarios read 13.8 ms open / 0.32 ms verify / 1.73 ms
-> obs — i.e. "87% open", the exact opposite split — and that number was briefly published
-> here. It was measurement noise: in a warm interactive shell the first `pyscx.open` absorbs
-> interpreter/pyo3 and first-touch costs that `posix_fadvise` does not evict, and 13.8 ms of
-> "open" on a 30 MB file was never physically plausible next to 0.09 ms on a 233 MB one. The
-> table above is from a cold, dedicated allocation. **One small-fixture smoke is not a
-> measurement**; the harness exists precisely so this class of claim comes from a capture.
+> obs — "87% open", the exact opposite split — and was briefly published here. It was
+> instrumentation: in a warm interactive shell the first `pyscx.open` absorbs interpreter and
+> pyo3 init plus page first-touch that `posix_fadvise` does not evict, and 13.8 ms of "open"
+> on a 30 MB file was never plausible beside 0.09 ms on a 233 MB one. **A small-fixture
+> interactive smoke is not a measurement** — a cost *ratio* between a first-touch-contaminated
+> term and a steady-state term can invert outright, and this one did.
 
-For the h5ad baseline the split is degenerate (48.0 ms open-only of 48.0 ms total, obs read
-0.03 ms): anndata builds the obs index during open, so *all* of its cost is the open.
+For the h5ad baseline the split is **not separable**: `open_only` and `open_1file` agree to
+within noise at every scale (the subtraction even goes slightly negative), because anndata
+builds the obs index during `read_h5ad(backed='r')`. Materializing one obs column on top of
+that costs nothing measurable — all of anndata's cost is the open.
 
 **(b) Observational / pretraining at S=128–512 — NO.** STATE3's 0.6% figure is S=64, B=4,
-GPU-memory-ceilinged, so the larger-set regime was genuinely untested. Measured on
-`pbmc10k` cold, holding cells/batch ≈ 1024 so only set granularity changes:
+GPU-memory-ceilinged, so the larger-set regime was genuinely untested. Measured cold, holding
+cells/batch ≈ 1024 so only set granularity changes:
 
-| scenario | S=64 | S=512 | change |
-|---|---|---|---|
-| `gather_random` cells/s | 363 | **2,709** | 7.5× |
-| `gather_grouped` cells/s | 954 | **8,306** | 8.7× |
-| `gather_random` sets/s | 5.7 | 5.3 | ~flat |
-| `gather_grouped` sets/s | 14.9 | 16.2 | ~flat |
+| dataset | plan | cells/s S=64 | cells/s S=512 | change | sets/s S=64 | sets/s S=512 |
+|---|---|---|---|---|---|---|
+| tabula_sapiens_100k | random | 329 | 426 | 1.3× | 5.1 | 0.8 |
+| census_500k | random | 423 | 443 | 1.0× | 6.6 | 0.9 |
+| census_1m | random | 446 | 467 | 1.0× | 7.0 | 0.9 |
+| tabula_sapiens_100k | **grouped** | 435 | 733 | **1.7×** | 6.8 | 1.4 |
+| census_500k | **grouped** | 1,028 | **4,446** | **4.3×** | 16.1 | 8.7 |
+| census_1m | **grouped** | 1,012 | **3,139** | **3.1×** | 15.8 | 6.1 |
 
-Sets/s is *flat* while cells/s rises ~8×, which says gather cost is dominated by **per-set
-overhead**, not per-cell work. The pretraining regime is therefore ~8× *cheaper per cell*
-than the perturbation regime that already measured at 0.6% of step time — it moves further
-from the critical path, not closer. (Grouped beats random ~3× at both set sizes, which is
-the grouped-sharding locality win doing its job.)
+The two plan types separate cleanly, and the mechanism is legible. **Random scatter** scales
+~linearly with cells: each of the S rows is an independent random row, so 8× the set size
+means ~8× the work — cells/s is flat and sets/s falls ~7.8×. **Covariate-grouped** gather
+amortizes shard decode across the set, because a group's cells cluster into few shards: 8×
+the set size costs only ~2.6× the time, so cells/s *improves* 3–4×.
 
-**(c) DDP multi-rank — NO, for two different reasons on the two access patterns.** Measured
-by running the same per-rank workload in N spawned processes against the same file(s) and
-reporting `rank_scaling_efficiency` = median(per-rank rate at N) ÷ (rate at 1 rank); 1.0
-means a rank is as fast with siblings as alone, ~1/N means the ranks serialise.
+Real models issue grouped sets, not uniform-random ones. In that regime **S=512 is 3–4×
+cheaper per cell than S=64**, so moving to the pretraining regime pushes the loader further
+from the critical path, not closer.
 
-| arm | pattern | N | efficiency | reading |
-|---|---|---|---|---|
-| `open_manifest_r4` (tabula, 256-file manifest) | every rank walks **all** files | 4 | **1.70, 1.87** | ranks *help* each other |
-| `gather_random_r2` (pbmc10k) | distinct seed per rank | 2 | 1.19, 0.92 | no degradation |
+> **Do not read these against STATE3's 4.55 steps/s.** These are cold-cache numbers with the
+> page cache dropped before every run — the epoch-start worst case. STATE3's steady state had
+> `scx_cache_shards=48` and a populated ~8 GB shard cache, which is precisely what amortizes
+> the per-shard decode measured here. Taken naively, 1,012 cells/s would put S=64×B=4 = 256
+> cells at 253 ms against a 130 ms step; that comparison is invalid in both directions. The
+> cold table answers "how does gather cost scale with set size", not "what does a training
+> step cost".
 
-**Efficiency above 1 is not "no contention" — it is cache sharing, and the distinction
-matters.** In the manifest arm every rank reads the *same* 256 files (deliberately: each
-model process builds a global obs vocabulary from every file, so per-rank cost does not shrink
-with world size). The cache is dropped once before the arm, so whichever rank touches a file
-first warms it for the other three. Aggregate startup is therefore *sub*-linear in rank count
-— genuinely good news for the 26k-file case, but a claim about cache sharing, not about the
-absence of resource contention.
+**(c) DDP multi-rank — NO.** Measured by running the same per-rank workload in N spawned
+processes against the same file(s) and reporting `rank_scaling_efficiency` = median(per-rank
+rate at N) ÷ (rate at 1 rank); 1.0 means a rank is as fast with siblings as alone, ~1/N means
+the ranks serialise.
 
-The gather arm is the contention-honest one: it gives each rank a **distinct seed** precisely
-so ranks touch different shards and the page cache cannot flatter the result. There, 2 ranks
-are each as fast as one alone.
+| arm | dataset | N | efficiency (2 runs) | aggregate sets/s | total peak RSS |
+|---|---|---|---|---|---|
+| `gather_random_r4` | census_1m | 4 | **1.013, 1.010** | 7.0 → **28.2** | 6.98 GB |
+| `gather_random_r4` | census_500k | 4 | **1.001, 1.004** | 6.6 → **26.2** | 4.44 GB |
+| `gather_random_r4` | tabula_sapiens_100k | 4 | 0.989, 0.925 | 4.9 → **19.2** | 2.43 GB |
+| `open_manifest_r4` (SCX) | tabula, 256 files | 4 | 1.70, 1.87 | — | — |
+| `open_manifest_r4` (h5ad) | tabula, 256 files | 4 | 1.03 | — | — |
+
+**The gather arm is the contention-honest one** — each rank gets a distinct seed, so ranks
+touch different shards and the page cache cannot flatter the result. At census scale
+efficiency is **1.00–1.01**: four concurrent ranks are each exactly as fast as one alone, and
+aggregate throughput scales ~4×. Peak RSS scales linearly (1.75 GB/rank at census_1m), which
+is worth noting given `SparseCellSetDataset` currently has no byte cap on its shard cache.
+
+**The manifest arm's 1.70–1.87 is cache sharing, not an absence of contention**, and the
+distinction matters. There every rank reads the *same* 256 files by design (each model process
+builds a global obs vocabulary from every file, so per-rank cost does not shrink with world
+size), so whichever rank touches a file first warms it for the other three. The h5ad arm's
+1.03 corroborates the mechanism from the other side: anndata's manifest cost is CPU-bound
+index building rather than I/O, so there is nothing for a sibling rank to inherit and it scales
+exactly linearly.
+
+Two further details make these numbers mean what they say: `spawn` rather than `fork` (a
+parent-constructed dataset used post-fork trips pyscx's PID guard), and a barrier before the
+timed region (otherwise interpreter-startup skew makes the "concurrent" window partly serial).
 
 Two further details make these numbers mean what they say: `spawn` rather than `fork` (a
 parent-constructed dataset used post-fork trips pyscx's PID guard), and a barrier before the
@@ -2018,12 +2050,23 @@ loader is the bottleneck, and since it was the main driver of the global-pre-shu
 that item's priority drops accordingly.
 
 **Verdict: no on all four.** The plan's own gate condition — "a 'no' on all four ends the
-plan at Phase 1" — is met. The measured picture is that SCX's loader is 3–9× faster than
-every competitor cold, its remaining gather cost is per-set overhead rather than I/O, it does
-not degrade under concurrent ranks, and its one confirmed per-file cost centre is catalog
-parse rather than anything the proposed obs work would touch. Optimization effort past the
-small Phase-1 residuals is therefore **not funded by measurement**; the binding constraint is
-adoption (STATE3's integration is unmerged; STACK has none), not loader capability.
+plan at Phase 1" — is met. The measured picture: SCX's sequential loader is 3–9× faster than
+every competitor cold and its lead grows with size; grouped cell-set gather gets *cheaper per
+cell* as sets grow, so the untested pretraining regime is further from the critical path than
+the one already measured at 0.6% of step time; four concurrent ranks each run at full speed;
+and per-file obs cost is 96–99.8% obs read, so the one Phase-1 obs item is aimed correctly
+while the open-side ideas are not worth building.
+
+Optimization effort past the small Phase-1 residuals is therefore **not funded by
+measurement**. The binding constraint is adoption — STATE3's integration is unmerged and
+STACK has none — not loader capability.
+
+**What this does not say.** These are cold-cache, single-node, CPU-side measurements. They do
+not certify multi-node DDP (no NCCL in the picture), they do not measure a real
+`DistributedSampler`'s per-rank sampler cost, and they say nothing about steady-state
+warm-cache training throughput, which is what STATE3's own 4.55 steps/s figure covers. A
+regime that shows up in any of those is not excluded by the table above — it is simply not
+evidenced today.
 
 ## Query Engine
 
