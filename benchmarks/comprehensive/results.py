@@ -178,6 +178,38 @@ class BenchmarkResult:
         return d
 
 
+def require_runs(result: BenchmarkResult, context: str = "") -> None:
+    """Raise when ``result`` recorded no runs at all.
+
+    Benchmarks that sweep several scenarios normally ``continue`` past a single
+    scenario's failure, so one bad arm doesn't discard the others. The cost is
+    that a *universal* failure returns a result with zero runs, which the
+    orchestrator serializes and reports as a **success** — and floors captured
+    from such a run are silently *absent*, which reads as a gate pass rather than
+    a failure. That is strictly worse than a wrong number.
+
+    This shipped as a private helper in ``cellset_gather`` and an inline check in
+    ``obs_open``, which left ``ooc_loader`` — the arm owning most of the
+    cold-cache floors — unguarded. Lives here so every benchmark shares one
+    implementation.
+
+    Real incident: a stale ``pyscx.pth`` pointing at a deleted worktree let the
+    repo-root ``pyscx/`` directory import as an empty namespace package, so every
+    scenario raised ``module 'pyscx' has no attribute 'open'`` and the wave still
+    reported "9 succeeded, 0 failed". Note that a bare ``import pyscx`` guard does
+    **not** catch this — the import succeeds.
+    """
+    if not result.runs:
+        raise RuntimeError(
+            f"{result.benchmark}: no runs recorded for "
+            f"{result.format}/{result.dataset}"
+            f"{f' ({context})' if context else ''} — every scenario failed. "
+            f"Check the job log for the per-scenario 'warmup failed' / 'run failed' "
+            f"lines; a result with zero runs must not be recorded as a successful "
+            f"capture."
+        )
+
+
 def _result_filename(benchmark: str, format_key: str, dataset: str) -> str:
     """Generate a consistent filename for a result JSON."""
     return f"{benchmark}__{format_key}__{dataset}.json"

@@ -458,31 +458,20 @@ class FormatRunner(ABC):
         r = resource.getrusage(resource.RUSAGE_SELF)
         return r.ru_utime, r.ru_stime
 
-    _drop_caches_warned = False
-
     @classmethod
     def _drop_caches(cls) -> bool:
         """Attempt to drop OS page caches system-wide (requires root/sudo).
 
-        Returns True if successful.  Logs a warning on the first failure.
-        Prefer ``_drop_file_cache(path)`` on shared SLURM nodes without
-        root — it uses ``posix_fadvise(POSIX_FADV_DONTNEED)`` on the
-        specific file(s) and works unprivileged.
+        Returns True if successful. Delegates to
+        ``cache_control.drop_caches_root`` — which also owns the once-only
+        warning — so the two paths cannot drift. Prefer
+        ``_drop_file_cache(path)`` on shared SLURM nodes without root: it uses
+        ``posix_fadvise(POSIX_FADV_DONTNEED)`` on the specific file(s) and works
+        unprivileged.
         """
-        try:
-            subprocess.run(["sync"], check=False)
-            with open("/proc/sys/vm/drop_caches", "w") as f:
-                f.write("3\n")
-            return True
-        except (PermissionError, OSError):
-            if not cls._drop_caches_warned:
-                logger.warning(
-                    "Failed to drop page caches (requires root). "
-                    "Use `_drop_file_cache(path)` for per-file non-root cold "
-                    "reads via posix_fadvise."
-                )
-                cls._drop_caches_warned = True
-            return False
+        from benchmarks.comprehensive.cache_control import drop_caches_root
+
+        return drop_caches_root()
 
     @classmethod
     def _drop_file_cache(cls, path: str | Path) -> str:

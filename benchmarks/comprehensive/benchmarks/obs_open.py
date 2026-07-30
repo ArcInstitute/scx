@@ -65,7 +65,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from benchmarks.comprehensive.cache_control import drop_file_cache
+from benchmarks.comprehensive.cache_control import COLD_FADVISE, WARM, drop_file_cache
 from benchmarks.comprehensive.config import DATA_DIR, DatasetConfig, FormatVariant
 from benchmarks.comprehensive.multirank import (
     rank_efficiency,
@@ -73,7 +73,7 @@ from benchmarks.comprehensive.multirank import (
     run_ranks,
     summarize_ranks,
 )
-from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.results import BenchmarkResult, require_runs
 from benchmarks.comprehensive.rss import PeakRssSampler
 
 logger = logging.getLogger(__name__)
@@ -204,7 +204,9 @@ def _manifest_paths(dataset: DatasetConfig, format_key: str) -> list[str] | None
         return None
     ext = ".scx" if format_key == "scx_auto" else ".h5ad"
     paths: list[str] = []
-    with open(manifest_csv) as f:
+    # Explicit encoding: the default is locale-dependent, and a manifest written
+    # on one host can carry non-ASCII paths/labels that fail to decode on another.
+    with open(manifest_csv, encoding="utf-8") as f:
         for row in csv.DictReader(f):
             p = row.get("path") or row.get(f"{format_key}_path") or ""
             if p and p.endswith(ext) and Path(p).exists():
@@ -317,6 +319,27 @@ def run(
     read_fn = _read_fn_for(format_variant.key)
     open_fn = _open_only_fn_for(format_variant.key)
 
+    def _evict_all(paths: list[str]) -> tuple[str, int]:
+        """Evict every path and return ``(policy, n_evicted)``.
+
+        Assigning ``cache_policy`` in a loop keeps only the **last** file's
+        status, so 255 evicted files plus one warm one reported as fully cold —
+        which would quietly undercut the cold-cache claim the whole benchmark
+        exists to make. The label is deliberately conservative: `cold_fadvise`
+        only when *every* file was evicted, and `n_evicted`/`n_files` are recorded
+        so a partial eviction is diagnosable instead of hidden behind either label.
+        """
+        n_evicted = sum(1 for p in paths if drop_file_cache(p) == COLD_FADVISE)
+        policy = COLD_FADVISE if n_evicted == len(paths) else WARM
+        if 0 < n_evicted < len(paths):
+            logger.warning(
+                "obs_open: only %d/%d files evicted — recording cache_policy=%s",
+                n_evicted,
+                len(paths),
+                policy,
+            )
+        return policy, n_evicted
+
     # Resolve the single-file path.
     if format_variant.key == "scx_auto":
         if converted_path is not None and Path(converted_path).exists():
@@ -377,10 +400,9 @@ def run(
         run_rss: list[float] = []
         run_per_file: list[float] = []
         for i in range(n_runs):
-            cache_policy = "warm"
+            cache_policy, n_evicted = (WARM, 0)
             if cold_cache:
-                for p in paths:
-                    cache_policy = drop_file_cache(p)
+                cache_policy, n_evicted = _evict_all(paths)
             try:
                 out = _timed_open(fn, paths)
             except Exception as e:  # noqa: BLE001
@@ -394,6 +416,7 @@ def run(
                 n_files=out.n_files,
                 n_obs_total=out.n_obs_total,
                 cache_policy=cache_policy,
+                n_evicted=n_evicted,
                 **{
                     f"obs_open_s__{scenario_name}": round(out.wall_s, 4),
                     f"obs_open_s_per_file__{scenario_name}": round(per_file, 5),
@@ -452,10 +475,9 @@ def run(
         rank_sc = f"open_manifest_r{n_ranks}"
         rank_effs: list[float] = []
         for i in range(_RANK_N_RUNS):
-            cache_policy = "warm"
+            cache_policy, n_evicted = (WARM, 0)
             if cold_cache:
-                for p in manifest_paths:
-                    cache_policy = drop_file_cache(p)
+                cache_policy, n_evicted = _evict_all(manifest_paths)
             try:
                 arm = _run_rank_arm(format_variant.key, manifest_paths, n_ranks)
             except Exception as e:  # noqa: BLE001
@@ -471,6 +493,7 @@ def run(
                 n_ranks=n_ranks,
                 n_ranks_reported=arm["n_ranks_reported"],
                 cache_policy=cache_policy,
+                n_evicted=n_evicted,
                 **{
                     f"obs_open_s_per_file__{rank_sc}": arm["s_per_file_at_n_ranks"],
                     f"files_per_sec__{rank_sc}": arm["aggregate_files_per_sec"],
@@ -500,15 +523,5 @@ def run(
             }
         gc.collect()
 
-    # Every scenario `continue`s past its own failure so one bad arm doesn't
-    # discard the others — but a *universal* failure would otherwise return an
-    # empty result that the orchestrator writes out and reports as success. See
-    # `cellset_gather._require_runs` for the incident that motivated this.
-    if not result.runs:
-        raise RuntimeError(
-            f"obs_open: no runs recorded for {format_variant.key}/{dataset.name} "
-            f"({single}) — every scenario failed. Check the job log for the "
-            f"per-scenario 'warmup failed' lines; a result with zero runs must not "
-            f"be recorded as a successful capture."
-        )
+    require_runs(result, single)
     return result

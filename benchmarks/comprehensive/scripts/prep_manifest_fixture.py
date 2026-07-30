@@ -114,7 +114,10 @@ def main() -> int:
         fieldnames.append("h5ad_none_path")
     if want_scx:
         fieldnames.append("scx_auto_path")
-    with open(manifest_csv, "w", newline="") as f:
+    # Explicit encoding to match the reader in `benchmarks/obs_open.py` — the
+    # default is locale-dependent, so a manifest written under one locale can fail
+    # to decode under another.
+    with open(manifest_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)

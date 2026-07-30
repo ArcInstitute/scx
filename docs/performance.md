@@ -1889,7 +1889,7 @@ footprint, forcing genuine misses.
 
 Runners: `benchmarks/comprehensive/benchmarks/{ooc_loader,cellset_gather,obs_open}.py`.
 Baseline `results/baselines/v0.11.5-dataload-phase0` (captured 2026-07-23, `cold_fadvise`,
-96 GB cap), with 24 cold-cache floors under `absolute_floors` in `thresholds.yaml`.
+96 GB cap), with **33** cold-cache floors under `absolute_floors` in `thresholds.yaml`.
 BioNeMo-SCDL is **not** included — its NeMo/CUDA stack needs an isolated env, tracked as a
 deferred floor rather than quietly dropped.
 
@@ -2029,10 +2029,6 @@ size), so whichever rank touches a file first warms it for the other three. The 
 1.03 corroborates the mechanism from the other side: anndata's manifest cost is CPU-bound
 index building rather than I/O, so there is nothing for a sibling rank to inherit and it scales
 exactly linearly.
-
-Two further details make these numbers mean what they say: `spawn` rather than `fork` (a
-parent-constructed dataset used post-fork trips pyscx's PID guard), and a barrier before the
-timed region (otherwise interpreter-startup skew makes the "concurrent" window partly serial).
 
 Two further details make these numbers mean what they say: `spawn` rather than `fork` (a
 parent-constructed dataset used post-fork trips pyscx's PID guard), and a barrier before the

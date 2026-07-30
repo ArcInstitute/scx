@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -57,8 +58,11 @@ def drop_file_cache(path: str | Path) -> str:
         return WARM
     try:
         subprocess.run(["sync"], check=False)  # best-effort — failure not surfaced
-        files: list[Path] = (
-            [path] if path.is_file() else [p for p in path.rglob("*") if p.is_file()]
+        # Generator, not a list: a Zarr/SOMA store can hold very many small files,
+        # and materializing every path before the first eviction spikes RSS inside
+        # a helper whose whole job is to make memory-bounded measurement honest.
+        files: Iterable[Path] = (
+            [path] if path.is_file() else (p for p in path.rglob("*") if p.is_file())
         )
         evicted = 0
         for fp in files:

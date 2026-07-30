@@ -181,11 +181,6 @@ def test_obs_open_h5ad_baseline(phase0_env):
 
 
 # ---------------------------------------------------------------------------
-# Competitor epoch fns (skipped when the lib is absent)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # S=512 arm (P-1(b))
 # ---------------------------------------------------------------------------
 
@@ -253,6 +248,14 @@ _FROZEN_CELLSET_KEYS = (
 )
 _FROZEN_OBS_OPEN_KEYS = ("obs_open_s_per_file__open_1file",)
 
+# `ooc_loader` carries 14 of the 33 Phase-0 floors — more than either other arm —
+# and was originally left out of this guard, so those metric names could have been
+# renamed into silent missing-metric gate passes.
+_FROZEN_OOC_LOADER_KEYS = (
+    "samples_per_sec__raw",
+    "samples_per_sec__hvg_norm",
+)
+
 # Floored, but only emitted when the rank arm is enabled (SCX_BENCH_N_RANKS > 1),
 # so they can't be asserted against a default-config run the way the always-on
 # keys above can. Listed separately so the guard-the-guard test below still
@@ -292,9 +295,14 @@ def test_thresholds_yaml_floor_keys_match_frozen_list():
     live = {
         f["metric"]
         for f in floors
-        if f.get("benchmark") in ("cellset_gather", "obs_open")
+        if f.get("benchmark") in ("cellset_gather", "obs_open", "ooc_loader")
     }
-    frozen = set(_FROZEN_CELLSET_KEYS) | set(_FROZEN_OBS_OPEN_KEYS) | set(_FROZEN_RANK_KEYS)
+    frozen = (
+        set(_FROZEN_CELLSET_KEYS)
+        | set(_FROZEN_OBS_OPEN_KEYS)
+        | set(_FROZEN_RANK_KEYS)
+        | set(_FROZEN_OOC_LOADER_KEYS)
+    )
     missing = live - frozen
     assert not missing, (
         f"thresholds.yaml has Phase-0 floors not covered by the rename guard: "
@@ -504,6 +512,76 @@ def test_zero_runs_raises(phase0_env, monkeypatch: pytest.MonkeyPatch):
     oo = importlib.import_module("benchmarks.comprehensive.benchmarks.obs_open")
     with pytest.raises(RuntimeError, match="no runs recorded"):
         oo.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+
+    # `ooc_loader` owns 14 of the 33 floors and was the arm left unguarded.
+    # Its `_HAS_PYSCX` probe is a bare `import pyscx`, which still succeeds under
+    # the namespace-package shadow that caused the original incident — so the
+    # guard, not the probe, is what has to catch this.
+    ol = importlib.import_module("benchmarks.comprehensive.benchmarks.ooc_loader")
+    monkeypatch.setattr(ol, "_run_scx_epoch", _broken)
+    with pytest.raises(RuntimeError, match="no runs recorded"):
+        ol.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+
+
+def test_missing_fixture_returns_none_not_raise(phase0_env):
+    """A fixture that was never converted is a clean skip on all three arms.
+
+    `cellset_gather` used to raise `FileNotFoundError`, which fails the whole
+    cohort SLURM job (several benchmark x dataset tasks share one job) over a
+    single absent file — and contradicted its own docstring. The absence still
+    surfaces: the triple's thresholds.yaml floors report a missing metric at gate
+    time.
+    """
+    import importlib
+
+    from benchmarks.comprehensive.config import DatasetConfig
+
+    absent = DatasetConfig(
+        id="P0X", name="phase0_absent", n_obs=100, n_vars=10,
+        protocol="synthetic", source="test", approx_h5ad_mb=1,
+    )
+    for mod in ("cellset_gather", "obs_open", "ooc_loader"):
+        m = importlib.import_module(f"benchmarks.comprehensive.benchmarks.{mod}")
+        assert m.run(absent, phase0_env["scx_fv"], n_runs=1, cold_cache=True) is None, mod
+
+
+def test_resolve_groups_drops_nan_codes(phase0_env, monkeypatch: pytest.MonkeyPatch):
+    """pandas encodes missing obs values as code -1.
+
+    Left in, every NaN row collapses into one spurious "group" of unrelated cells,
+    which the grouped arm would then measure as covariate locality that does not
+    exist.
+    """
+    import importlib
+
+    import pandas as pd
+
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+
+    class _FakeExp:
+        def obs_keys(self):
+            return ["mixed"]
+
+        def read_obs(self, cols):
+            # 6 rows: 3 real values, 3 NaN -> codes [0,1,2,-1,-1,-1]
+            return pd.DataFrame({"mixed": pd.Categorical(["a", "b", "c", None, None, None])})
+
+    import pyscx
+
+    monkeypatch.setattr(pyscx, "open", lambda *a, **k: _FakeExp())
+    groups = m._resolve_groups("ignored.scx", 6)
+    all_rows = np.concatenate(groups) if groups else np.array([], dtype=np.uint64)
+    assert set(all_rows.tolist()) == {0, 1, 2}, f"NaN rows leaked into groups: {all_rows}"
+    assert all(g.size > 0 for g in groups)
+
+
+def test_resolve_groups_empty_dataset(phase0_env):
+    """n_obs == 0 must yield no groups rather than crash the grouped plan
+    generator on `rng.integers(0, 0)`."""
+    import importlib
+
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+    assert m._resolve_groups("/nonexistent.scx", 0) == []
 
 
 def test_group_fallback_has_no_empty_groups(phase0_env):

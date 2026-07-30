@@ -64,7 +64,7 @@ from benchmarks.comprehensive.config import (
     QUERY_N_HVGS,
     RANDOM_SEED,
 )
-from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.results import BenchmarkResult, require_runs
 from benchmarks.comprehensive.rss import PeakRssSampler
 from benchmarks.comprehensive.runners import make_runner
 
@@ -215,6 +215,17 @@ def _apply_hvg_norm(X: np.ndarray, hvg: bool, normalize: bool) -> np.ndarray:
     if hvg and X.shape[1] > QUERY_N_HVGS:
         X = X[:, :QUERY_N_HVGS]
     if normalize:
+        # NOTE: library size is summed over the *projected* 2k genes, not the full
+        # transcriptome. That is deliberate — it mirrors `ml_loader`'s existing
+        # `_apply_hvg_norm` exactly, so the two benchmarks' `hvg_norm` numbers stay
+        # comparable. It does NOT match `scanpy.pp.normalize_total`, nor SCX's own
+        # loader, which computes depth pre-projection for scanpy parity.
+        #
+        # The asymmetry favours the competitors (summing 2k columns is less work
+        # than 36k), so it cannot inflate SCX's reported lead — it slightly
+        # understates it. Changing the order here would silently break
+        # comparability with every previously captured `ml_loader` number, which is
+        # why it stays as-is and is documented instead.
         row_sums = X.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1.0
         X = np.log1p(X / row_sums * 1e4)
@@ -292,11 +303,23 @@ def _run_scdataset_epoch(
     """`scdataset.scDataset` (block sampling + batched fetch, arXiv:2506.01883)
     over a backed h5ad, driven through a `DataLoader(batch_size=None)`."""
     import anndata
+    import torch
     import torch.utils.data as td
     from scdataset import BlockShuffling, scDataset
 
     data = anndata.read_h5ad(h5ad_path, backed="r")
-    strategy = BlockShuffling(block_size=_SCDATASET_BLOCK_SIZE)
+    # `seed` was previously accepted and dropped, so the reproducibility the
+    # signature implied was not delivered. BlockShuffling takes an optional
+    # generator; pass one when supported and fall back rather than failing the arm
+    # on an scdataset version that doesn't accept it.
+    try:
+        strategy = BlockShuffling(
+            block_size=_SCDATASET_BLOCK_SIZE,
+            generator=torch.Generator().manual_seed(seed),
+        )
+    except TypeError:
+        logger.debug("scdataset BlockShuffling has no `generator=`; epoch order unseeded")
+        strategy = BlockShuffling(block_size=_SCDATASET_BLOCK_SIZE)
 
     # A backed AnnData cannot be indexed view-of-view (scDataset's default
     # fetch→batch double-indexes), so materialize each fetched block into
@@ -551,4 +574,10 @@ def run(
         dataset.name,
         len(scenario_summary),
     )
+    # Every scenario `continue`s past its own failure, so a universal failure would
+    # otherwise return an empty result the orchestrator counts as success. This arm
+    # owns most of the cold-cache floors, and a `_HAS_PYSCX` probe cannot stand in
+    # for this check — it is a bare `import pyscx`, which still succeeds when the
+    # module resolves to an empty namespace package.
+    require_runs(result, str(data_path))
     return result

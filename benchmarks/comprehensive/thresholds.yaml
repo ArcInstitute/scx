@@ -2227,10 +2227,11 @@ absolute_floors:
 #    `discrimination_score` op stamps only `cpu_*` routes today.
 #
 # 7. Data-load Phase 0 signals: ooc_loader / cellset_gather / obs_open
-#    NOW ACTIVE — 24 cold-cache floors were captured (2026-07-23, baseline
-#    v0.11.5-dataload-phase0) and live under `absolute_floors` above
-#    (ooc_loader SCX + 4 competitors, cellset_gather SCX, obs_open SCX +
-#    h5ad_none). What remains DEFERRED:
+#    NOW ACTIVE — 33 cold-cache floors, all live under `absolute_floors` above:
+#    24 captured 2026-07-23 (baseline v0.11.5-dataload-phase0; ooc_loader SCX +
+#    4 competitors, cellset_gather SCX, obs_open SCX + h5ad_none) plus 9 from the
+#    2026-07-30 second wave (S=512 gather x 3 datasets x 2 plan types, and the
+#    3 rank-scaling-efficiency floors). What remains DEFERRED:
 #      * cellset_gather / census_5m: the scattered 5M-row gather read cold
 #        exceeds the SLURM wall limit on the pre-optimization raw-local path
 #        (that slowness is the Phase-1 target). Re-enable a floor once the

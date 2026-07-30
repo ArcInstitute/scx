@@ -86,7 +86,7 @@ from benchmarks.comprehensive.multirank import (
     run_ranks,
     summarize_ranks,
 )
-from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.results import BenchmarkResult, require_runs
 from benchmarks.comprehensive.rss import PeakRssSampler
 
 logger = logging.getLogger(__name__)
@@ -175,16 +175,25 @@ def _resolve_groups(scx_path: str, n_obs: int) -> list[np.ndarray]:
             codes = df[col].astype("category").cat.codes.to_numpy()
             if codes.size == 0:
                 continue
+            # pandas encodes NaN/missing as code -1. Left in, those rows collapse
+            # into a single spurious "group" of unrelated cells, which would be
+            # measured as covariate locality that doesn't exist. Drop them and keep
+            # the surviving rows' original positions.
+            valid = codes >= 0
+            if not valid.any():
+                continue
+            row_ids = np.flatnonzero(valid).astype(np.uint64)
+            codes = codes[valid]
             n_distinct = int(codes.max()) + 1
             # Require a modest, real covariate cardinality.
             if not (1 < n_distinct <= _MAX_GROUPS):
                 continue
             # O(n log n) group split: sort row indices by code, then cut at
             # the unique-value boundaries. No per-value scan.
-            order = np.argsort(codes, kind="stable").astype(np.uint64)
-            sorted_codes = codes[order.astype(np.int64)]
+            order = np.argsort(codes, kind="stable")
+            sorted_codes = codes[order]
             _, starts = np.unique(sorted_codes, return_index=True)
-            groups = [g for g in np.split(order, starts[1:]) if g.size > 0]
+            groups = [g for g in np.split(row_ids[order], starts[1:]) if g.size > 0]
             if len(groups) > 1:
                 logger.info("cellset grouping on obs[%r]: %d groups", col, len(groups))
                 return groups
@@ -196,6 +205,11 @@ def _resolve_groups(scx_path: str, n_obs: int) -> list[np.ndarray]:
     # unless no samples are taken", killing the whole grouped scenario. Filter
     # empties, then split a single bucket in half so "grouped" still means more
     # than one group on small fixtures.
+    if n_obs <= 0:
+        # Nothing to group. Returning [] would make `_grouped_plans` call
+        # `rng.integers(0, 0)`, which raises — an empty dataset should skip the
+        # scenario, not crash it.
+        return []
     n_groups = max(2, (n_obs + _LOCALITY_GROUP_SIZE - 1) // _LOCALITY_GROUP_SIZE)
     buckets = [
         np.arange(
@@ -396,28 +410,6 @@ def _run_rank_arm(
 # ---------------------------------------------------------------------------
 
 
-def _require_runs(result: BenchmarkResult, path: str) -> None:
-    """Fail loudly when every scenario failed.
-
-    Each scenario `continue`s past its own warmup/run failure so one bad arm
-    doesn't discard the others — but that means a *universal* failure (a broken
-    pyscx, a missing file) returns a result with zero runs, which the orchestrator
-    writes out and reports as **success**. That happened: a stale
-    `pyscx.pth` pointing at a deleted worktree let the repo-root `pyscx/`
-    directory import as an empty namespace package, so every scenario raised
-    `module 'pyscx' has no attribute 'open'` and the wave still reported
-    "9 succeeded, 0 failed". An empty capture must be a job failure, not a
-    silently empty baseline row.
-    """
-    if not result.runs:
-        raise RuntimeError(
-            f"{result.benchmark}: no runs recorded for {result.format}/{result.dataset} "
-            f"({path}) — every scenario failed. Check the job log for the per-scenario "
-            f"'warmup failed' / 'run failed' lines; a result with zero runs must not be "
-            f"recorded as a successful capture."
-        )
-
-
 @dataclass(frozen=True)
 class _Scenario:
     name: str
@@ -464,10 +456,20 @@ def run(
         except (ValueError, FileNotFoundError):
             p = None
         if p is None or not p.exists():
-            raise FileNotFoundError(
-                f"Missing converted SCX file for {dataset.name}. "
-                f"Run Phase A conversion first (--formats {format_variant.key})."
+            # Clean skip, matching this function's docstring and the sibling
+            # `ooc_loader` / `obs_open` modules — a raise here fails the whole
+            # cohort job (several benchmark × dataset tasks share one SLURM job)
+            # over a fixture that was simply never converted. The absence is not
+            # silent either way: the triple's `thresholds.yaml` floors then report
+            # a missing metric at gate time.
+            logger.warning(
+                "Skipping cellset_gather for %s/%s — no converted SCX fixture "
+                "(run Phase A conversion first: --formats %s)",
+                format_variant.key,
+                dataset.name,
+                format_variant.key,
             )
+            return None
         scx_path = str(p)
 
     n_obs = dataset.n_obs
@@ -501,6 +503,11 @@ def run(
 
     warmup = min(n_batches, _WARMUP_BATCHES)
     for sc in _SCENARIOS:
+        if sc.plan_kind == "grouped" and not groups:
+            logger.warning(
+                "  skipping %s — no usable covariate groups resolved", sc.name
+            )
+            continue
         plans = _plans_for(sc)
         # Warm code (tokio/rayon) with a tiny pass; timed reads are cold.
         try:
@@ -622,5 +629,5 @@ def run(
             }
         gc.collect()
 
-    _require_runs(result, scx_path)
+    require_runs(result, scx_path)
     return result
