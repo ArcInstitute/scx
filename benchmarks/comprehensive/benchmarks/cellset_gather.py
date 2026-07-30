@@ -473,6 +473,17 @@ def run(
         scx_path = str(p)
 
     n_obs = dataset.n_obs
+    if n_obs <= 0:
+        # Guarded here rather than per-plan-generator: `_random_plans` would raise
+        # on `rng.integers(0, 0)` and `_grouped_plans` on an empty group list, so a
+        # single early skip covers both instead of half-covering one.
+        logger.warning(
+            "Skipping cellset_gather for %s/%s — dataset reports n_obs=%d",
+            format_variant.key,
+            dataset.name,
+            n_obs,
+        )
+        return None
     n_batches = _n_batches_for(n_obs)
     n_runs = max(1, min(n_runs, _MAX_N_RUNS))
     groups = _resolve_groups(scx_path, n_obs)

@@ -279,6 +279,15 @@ def test_frozen_floor_keys_still_emitted(phase0_env):
         for k in _FROZEN_OBS_OPEN_KEYS:
             assert k in okeys, f"floor metric {k!r} disappeared for {fv.key}"
 
+    # `ooc_loader` carries 14 of the 33 floors — more than either other arm — and
+    # was covered only by the yaml-sync guard, not by an emission check.
+    ol = importlib.import_module("benchmarks.comprehensive.benchmarks.ooc_loader")
+    res_ol = ol.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+    assert res_ol is not None and res_ol.runs
+    olkeys = set().union(*(r.extra.keys() for r in res_ol.runs))
+    for k in _FROZEN_OOC_LOADER_KEYS:
+        assert k in olkeys, f"floor metric {k!r} disappeared — thresholds.yaml would break"
+
 
 def test_thresholds_yaml_floor_keys_match_frozen_list():
     """Guard the guard: if a new Phase-0 floor is added to thresholds.yaml, the

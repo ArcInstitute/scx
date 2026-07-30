@@ -45,6 +45,7 @@ isolated env; it's a deferred fast-follow (see thresholds.yaml deferred floors).
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 import statistics
@@ -76,7 +77,6 @@ from benchmarks.comprehensive.benchmarks.ml_loader import (
     _run_anndata_epoch,
     _run_scx_epoch,
     _run_soma_epoch,
-    _scx_memory_budget_mb,
 )
 
 logger = logging.getLogger(__name__)
@@ -241,10 +241,15 @@ def _run_annloader_epoch(
     from anndata.experimental import AnnLoader
 
     adata = anndata.read_h5ad(h5ad_path, backed="r")
-    loader = AnnLoader(adata, batch_size=batch_size, shuffle=True, use_default_converter=False)
     n_batches = 0
     n_cells = 0
+    # `AnnLoader(...)` is inside the try: constructing it can raise (dtype/converter
+    # rejections), and outside the try that would leak the backed h5py handle for
+    # the rest of the sweep.
     try:
+        loader = AnnLoader(
+            adata, batch_size=batch_size, shuffle=True, use_default_converter=False
+        )
         for batch in loader:
             X = _apply_hvg_norm(batch.X, hvg, normalize)
             n_batches += 1
@@ -287,13 +292,21 @@ def _run_annbatch_epoch(
     )
     n_batches = 0
     n_cells = 0
-    with ad.settings.override(remove_unused_categories=False):
-        loader = loader.use_collection(collection)
-        for batch in loader:
-            X = batch["X"] if isinstance(batch, dict) else batch
-            X = _apply_hvg_norm(X, hvg, normalize)
-            n_batches += 1
-            n_cells += X.shape[0] if X.ndim >= 1 else batch_size
+    try:
+        with ad.settings.override(remove_unused_categories=False):
+            loader = loader.use_collection(collection)
+            for batch in loader:
+                X = batch["X"] if isinstance(batch, dict) else batch
+                X = _apply_hvg_norm(X, hvg, normalize)
+                n_batches += 1
+                n_cells += X.shape[0] if X.ndim >= 1 else batch_size
+    finally:
+        # This arm runs once per (dataset × scenario × run), so a store left open
+        # accumulates across the sweep — and peak RSS is a reported metric here.
+        close = getattr(collection, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
     return _EpochResult(n_batches=n_batches, n_cells=n_cells)
 
 
@@ -303,23 +316,17 @@ def _run_scdataset_epoch(
     """`scdataset.scDataset` (block sampling + batched fetch, arXiv:2506.01883)
     over a backed h5ad, driven through a `DataLoader(batch_size=None)`."""
     import anndata
-    import torch
     import torch.utils.data as td
     from scdataset import BlockShuffling, scDataset
 
     data = anndata.read_h5ad(h5ad_path, backed="r")
-    # `seed` was previously accepted and dropped, so the reproducibility the
-    # signature implied was not delivered. BlockShuffling takes an optional
-    # generator; pass one when supported and fall back rather than failing the arm
-    # on an scdataset version that doesn't accept it.
-    try:
-        strategy = BlockShuffling(
-            block_size=_SCDATASET_BLOCK_SIZE,
-            generator=torch.Generator().manual_seed(seed),
-        )
-    except TypeError:
-        logger.debug("scdataset BlockShuffling has no `generator=`; epoch order unseeded")
-        strategy = BlockShuffling(block_size=_SCDATASET_BLOCK_SIZE)
+    # `seed` belongs on scDataset, not on the strategy: BlockShuffling's signature
+    # is (block_size, indices, drop_last) with no generator/seed, whereas
+    # scDataset takes `seed: int | None`. An earlier attempt passed
+    # `generator=` to BlockShuffling behind a `try/except TypeError` — which meant
+    # the except branch fired on every call and the seed stayed dropped, silently,
+    # because the fallback only logged at debug level.
+    strategy = BlockShuffling(block_size=_SCDATASET_BLOCK_SIZE)
 
     # A backed AnnData cannot be indexed view-of-view (scDataset's default
     # fetch→batch double-indexes), so materialize each fetched block into
@@ -333,6 +340,7 @@ def _run_scdataset_epoch(
         batch_size=batch_size,
         fetch_factor=_SCDATASET_FETCH_FACTOR,
         fetch_callback=_fetch_to_memory,
+        seed=seed,
     )
     loader = td.DataLoader(ds, batch_size=None, num_workers=0)
     n_batches = 0
