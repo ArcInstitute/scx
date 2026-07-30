@@ -450,6 +450,59 @@ def test_rank_arm_skipped_at_one_rank(phase0_env, monkeypatch: pytest.MonkeyPatc
 
 
 # ---------------------------------------------------------------------------
+# A universally-failing capture must fail the job, not record an empty result
+# ---------------------------------------------------------------------------
+
+
+def test_zero_runs_raises(phase0_env, monkeypatch: pytest.MonkeyPatch):
+    """Regression for the 2026-07-29 silent-empty-capture incident.
+
+    A stale `pyscx.pth` pointing at a deleted worktree let the repo-root
+    `pyscx/` directory import as an empty namespace package. Every scenario
+    raised `module 'pyscx' has no attribute 'open'`, each was swallowed by the
+    per-scenario `continue`, and the wave reported "9 succeeded, 0 failed" while
+    writing results with zero runs. Floors captured from that would have been
+    silently absent rather than wrong — the worse of the two failure modes.
+    """
+    import importlib
+
+    import pyscx
+
+    def _broken(*args, **kwargs):
+        raise AttributeError("module 'pyscx' has no attribute 'open'")
+
+    # Model "pyscx imports but is non-functional" — the actual symptom. Patching
+    # only `pyscx.open` is NOT enough: the random-plan scenarios don't need it,
+    # so they still record runs and the guard correctly stays quiet.
+    monkeypatch.setattr(pyscx, "SparseCellSetDataset", _broken)
+    cg = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+    with pytest.raises(RuntimeError, match="no runs recorded"):
+        cg.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+
+    monkeypatch.setattr(pyscx, "open", _broken)
+    oo = importlib.import_module("benchmarks.comprehensive.benchmarks.obs_open")
+    with pytest.raises(RuntimeError, match="no runs recorded"):
+        oo.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+
+
+def test_group_fallback_has_no_empty_groups(phase0_env):
+    """`rng.choice` on an empty group raises and kills the grouped scenario.
+
+    The index-bucket fallback forced `max(2, ...)` buckets, so any file with
+    `n_obs < _LOCALITY_GROUP_SIZE` (every small fixture) got one populated bucket
+    and one empty one.
+    """
+    import importlib
+
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+    for n_obs in (1, 2, 600, m._LOCALITY_GROUP_SIZE, m._LOCALITY_GROUP_SIZE + 1):
+        groups = m._resolve_groups("/nonexistent-so-the-fallback-runs.scx", n_obs)
+        assert groups, f"n_obs={n_obs} produced no groups"
+        assert all(g.size > 0 for g in groups), f"n_obs={n_obs} produced an empty group"
+        assert sum(int(g.size) for g in groups) == n_obs, f"n_obs={n_obs} lost/duplicated rows"
+
+
+# ---------------------------------------------------------------------------
 # Competitor epoch fns (skipped when the lib is absent)
 # ---------------------------------------------------------------------------
 

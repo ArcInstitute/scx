@@ -498,4 +498,15 @@ def run(
             }
         gc.collect()
 
+    # Every scenario `continue`s past its own failure so one bad arm doesn't
+    # discard the others — but a *universal* failure would otherwise return an
+    # empty result that the orchestrator writes out and reports as success. See
+    # `cellset_gather._require_runs` for the incident that motivated this.
+    if not result.runs:
+        raise RuntimeError(
+            f"obs_open: no runs recorded for {format_variant.key}/{dataset.name} "
+            f"({single}) — every scenario failed. Check the job log for the "
+            f"per-scenario 'warmup failed' lines; a result with zero runs must not "
+            f"be recorded as a successful capture."
+        )
     return result

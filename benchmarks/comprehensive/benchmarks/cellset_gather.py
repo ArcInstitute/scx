@@ -187,12 +187,26 @@ def _resolve_groups(scx_path: str, n_obs: int) -> list[np.ndarray]:
                 return groups
     except Exception as e:  # noqa: BLE001
         logger.info("obs grouping unavailable (%s); using index buckets", e)
-    # Fallback: contiguous index buckets.
+    # Fallback: contiguous index buckets. `max(2, ...)` forces at least two
+    # buckets, which for `n_obs < _LOCALITY_GROUP_SIZE` makes the second one
+    # empty — and `rng.choice` on an empty group raises "a cannot be empty
+    # unless no samples are taken", killing the whole grouped scenario. Filter
+    # empties, then split a single bucket in half so "grouped" still means more
+    # than one group on small fixtures.
     n_groups = max(2, (n_obs + _LOCALITY_GROUP_SIZE - 1) // _LOCALITY_GROUP_SIZE)
-    return [
-        np.arange(g * _LOCALITY_GROUP_SIZE, min((g + 1) * _LOCALITY_GROUP_SIZE, n_obs), dtype=np.uint64)
+    buckets = [
+        np.arange(
+            g * _LOCALITY_GROUP_SIZE,
+            min((g + 1) * _LOCALITY_GROUP_SIZE, n_obs),
+            dtype=np.uint64,
+        )
         for g in range(n_groups)
     ]
+    buckets = [b for b in buckets if b.size > 0]
+    if len(buckets) == 1 and buckets[0].size >= 2:
+        half = buckets[0].size // 2
+        buckets = [buckets[0][:half], buckets[0][half:]]
+    return buckets
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +391,28 @@ def _run_rank_arm(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def _require_runs(result: BenchmarkResult, path: str) -> None:
+    """Fail loudly when every scenario failed.
+
+    Each scenario `continue`s past its own warmup/run failure so one bad arm
+    doesn't discard the others — but that means a *universal* failure (a broken
+    pyscx, a missing file) returns a result with zero runs, which the orchestrator
+    writes out and reports as **success**. That happened: a stale
+    `pyscx.pth` pointing at a deleted worktree let the repo-root `pyscx/`
+    directory import as an empty namespace package, so every scenario raised
+    `module 'pyscx' has no attribute 'open'` and the wave still reported
+    "9 succeeded, 0 failed". An empty capture must be a job failure, not a
+    silently empty baseline row.
+    """
+    if not result.runs:
+        raise RuntimeError(
+            f"{result.benchmark}: no runs recorded for {result.format}/{result.dataset} "
+            f"({path}) — every scenario failed. Check the job log for the per-scenario "
+            f"'warmup failed' / 'run failed' lines; a result with zero runs must not be "
+            f"recorded as a successful capture."
+        )
 
 
 @dataclass(frozen=True)
@@ -583,4 +619,5 @@ def run(
             }
         gc.collect()
 
+    _require_runs(result, scx_path)
     return result
