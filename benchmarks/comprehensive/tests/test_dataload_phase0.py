@@ -185,6 +185,275 @@ def test_obs_open_h5ad_baseline(phase0_env):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# S=512 arm (P-1(b))
+# ---------------------------------------------------------------------------
+
+
+def test_cellset_gather_emits_both_set_sizes(phase0_env):
+    """S=64 and S=512 arms both record, and S=512 packs 512-stride sets."""
+    import importlib
+
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+    res = m.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+    assert res is not None
+    scenarios = {r.extra["scenario"] for r in res.runs}
+    assert {
+        "gather_random",
+        "gather_grouped",
+        "gather_random_s512",
+        "gather_grouped_s512",
+    } <= scenarios
+    by_scenario = {r.extra["scenario"]: r.extra for r in res.runs}
+    assert by_scenario["gather_random"]["set_size"] == 64
+    assert by_scenario["gather_random_s512"]["set_size"] == 512
+    assert res.metadata["set_sizes"]["gather_grouped_s512"] == 512
+
+
+def test_sets_per_batch_holds_cells_per_batch(phase0_env):
+    """Cells/batch is held ≈ ML_BATCH_SIZE across set sizes, so the S=64 and
+    S=512 arms differ in granularity rather than in batch volume."""
+    import importlib
+
+    from benchmarks.comprehensive.config import ML_BATCH_SIZE
+
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+    for set_size in (64, 512):
+        spb = m._sets_per_batch(set_size)
+        assert spb >= 1
+        assert spb * set_size == ML_BATCH_SIZE
+
+
+def test_s512_plan_packs_512_stride_offsets(phase0_env):
+    """The emitted plan really carries 512-cell sets, not 64-cell ones."""
+    import importlib
+
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+    spb = m._sets_per_batch(512)
+    plans = list(m._random_plans(600, 2, 512, spb, seed=0))
+    assert len(plans) == 2
+    for _file_ids, rows, _roles, offsets in plans:
+        assert np.all(np.diff(offsets) == 512)
+        assert rows.size == 512 * spb
+
+
+# ---------------------------------------------------------------------------
+# Frozen floor metric keys — the rename guard
+# ---------------------------------------------------------------------------
+
+# Metric keys with a live `absolute_floors` entry in thresholds.yaml. Renaming a
+# scenario silently converts each of these into a "missing metric" gate
+# violation instead of a regression signal, which reads as a *pass* on a chart
+# and a failure in the report. Both directions are wrong, so pin the names.
+_FROZEN_CELLSET_KEYS = (
+    "cellsets_per_sec__gather_random",
+    "cellsets_per_sec__gather_grouped",
+)
+_FROZEN_OBS_OPEN_KEYS = ("obs_open_s_per_file__open_1file",)
+
+
+def test_frozen_floor_keys_still_emitted(phase0_env):
+    import importlib
+
+    cg = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+    res = cg.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+    keys = set().union(*(r.extra.keys() for r in res.runs))
+    for k in _FROZEN_CELLSET_KEYS:
+        assert k in keys, f"floor metric {k!r} disappeared — thresholds.yaml would break"
+
+    oo = importlib.import_module("benchmarks.comprehensive.benchmarks.obs_open")
+    for fv in (phase0_env["scx_fv"], phase0_env["h5_fv"]):
+        r = oo.run(phase0_env["ds"], fv, n_runs=1, cold_cache=True)
+        okeys = set().union(*(x.extra.keys() for x in r.runs))
+        for k in _FROZEN_OBS_OPEN_KEYS:
+            assert k in okeys, f"floor metric {k!r} disappeared for {fv.key}"
+
+
+def test_thresholds_yaml_floor_keys_match_frozen_list():
+    """Guard the guard: if a new Phase-0 floor is added to thresholds.yaml, the
+    frozen list above must grow with it, or the rename guard silently stops
+    covering the new one."""
+    import yaml
+
+    from benchmarks.comprehensive.config import PROJECT_ROOT
+
+    spec = yaml.safe_load(
+        (PROJECT_ROOT / "benchmarks" / "comprehensive" / "thresholds.yaml").read_text()
+    )
+    floors = spec.get("absolute_floors", [])
+    live = {
+        f["metric"]
+        for f in floors
+        if f.get("benchmark") in ("cellset_gather", "obs_open")
+    }
+    frozen = set(_FROZEN_CELLSET_KEYS) | set(_FROZEN_OBS_OPEN_KEYS)
+    missing = live - frozen
+    assert not missing, (
+        f"thresholds.yaml has Phase-0 floors not covered by the rename guard: "
+        f"{sorted(missing)} — add them to _FROZEN_* above"
+    )
+
+
+# ---------------------------------------------------------------------------
+# obs_open open-cost breakdown (P-1(a) sharpening)
+# ---------------------------------------------------------------------------
+
+
+def test_obs_open_breakdown_scenarios(phase0_env):
+    """`open_only` (both formats) + `open_only_unverified` (SCX only), and the
+    derived per-file breakdown."""
+    import importlib
+
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.obs_open")
+
+    scx = m.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+    scx_scenarios = {r.extra["scenario"] for r in scx.runs}
+    assert {"open_1file", "open_only", "open_only_unverified"} <= scx_scenarios
+    bd = scx.metadata["open_cost_breakdown"]
+    assert "obs_read_s_per_file" in bd
+    assert "catalog_verify_s_per_file" in bd
+
+    h5 = m.run(phase0_env["ds"], phase0_env["h5_fv"], n_runs=1, cold_cache=True)
+    h5_scenarios = {r.extra["scenario"] for r in h5.runs}
+    assert "open_only" in h5_scenarios
+    # anndata has no "skip the integrity check" open — the arm must not appear,
+    # or the h5ad column of the breakdown table would be comparing nothing.
+    assert "open_only_unverified" not in h5_scenarios
+    assert "catalog_verify_s_per_file" not in h5.metadata.get("open_cost_breakdown", {})
+
+
+def test_open_scx_does_not_read_obs(phase0_env, monkeypatch: pytest.MonkeyPatch):
+    """`open_only` must not touch obs.
+
+    If it did, `open_1file − open_only` would be a difference of two identical
+    workloads — i.e. ~0 — and the breakdown would report "obs reads cost
+    nothing" while measuring nothing at all. That failure is invisible in the
+    numbers, so it needs its own assertion.
+
+    Uses an attribute spy rather than the reader's `ReaderDebugCounts`: those
+    counters increment only under `cfg(debug_assertions)`
+    (`scx-format-io/src/reader.rs`), so on the release `.so` every capture
+    actually uses they are compiled out and would prove nothing.
+    """
+    import importlib
+
+    import pyscx
+
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.obs_open")
+    path = str(phase0_env["scx_path"])
+    real_open = pyscx.open
+    seen: list[str] = []
+
+    class _Spy:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            seen.append(name)
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(
+        pyscx, "open", lambda p, verify=True: _Spy(real_open(p, verify=verify))
+    )
+
+    m._open_scx(path)
+    m._open_scx(path, verify=False)
+    assert "read_obs" not in seen
+    assert "obs_keys" not in seen
+    assert "n_obs_physical" in seen, "the open probe read nothing — is it a no-op?"
+
+    # Anti-tautology: prove the spy would have caught an obs read. Without this
+    # the assertions above pass just as happily against a broken spy.
+    seen.clear()
+    m._pick_and_read_scx(path)
+    assert "read_obs" in seen
+
+
+# ---------------------------------------------------------------------------
+# multirank helper + the N-rank arms (P-1(c))
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_n_ranks_defaults_off(monkeypatch: pytest.MonkeyPatch):
+    from benchmarks.comprehensive import multirank
+
+    monkeypatch.delenv(multirank.N_RANKS_ENV, raising=False)
+    # Off by default: turning the arm on unconditionally would multiply the wall
+    # time of every existing cellset_gather / obs_open run.
+    assert multirank.resolve_n_ranks() == 1
+    monkeypatch.setenv(multirank.N_RANKS_ENV, "4")
+    assert multirank.resolve_n_ranks() == 4
+    monkeypatch.setenv(multirank.N_RANKS_ENV, "not-a-number")
+    assert multirank.resolve_n_ranks(default=3) == 3
+    monkeypatch.setenv(multirank.N_RANKS_ENV, "0")
+    assert multirank.resolve_n_ranks() == 1
+
+
+def test_summarize_and_efficiency_pure():
+    from benchmarks.comprehensive.multirank import rank_efficiency, summarize_ranks
+
+    assert summarize_ranks([], "rate") is None
+    assert summarize_ranks([{"rank": 0, "error": "boom"}], "rate") is None
+
+    one = [{"rank": 0, "rate": 100.0, "wall_s": 1.0, "peak_rss_mb": 10.0}]
+    many = [
+        {"rank": 0, "rate": 50.0, "wall_s": 2.0, "peak_rss_mb": 10.0},
+        {"rank": 1, "rate": 50.0, "wall_s": 2.2, "peak_rss_mb": 12.0},
+    ]
+    s = summarize_ranks(many, "rate")
+    assert s["aggregate"] == 100.0  # node aggregate = sum, not mean
+    assert s["per_rank_median"] == 50.0
+    assert s["max_wall_s"] == 2.2  # slowest rank sets a synchronous step
+    assert s["total_peak_rss_mb"] == 22.0
+    # Perfectly serialising 2 ranks → efficiency 1/2.
+    assert rank_efficiency(one, many, "rate") == 0.5
+    # Perfect scaling → 1.0.
+    perfect = [dict(r, rate=100.0) for r in many]
+    assert rank_efficiency(one, perfect, "rate") == 1.0
+
+
+def test_cellset_gather_rank_arm(phase0_env, monkeypatch: pytest.MonkeyPatch):
+    import importlib
+
+    monkeypatch.setenv("SCX_BENCH_N_RANKS", "2")
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+    res = m.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+    assert res is not None
+    assert res.metadata["n_ranks"] == 2
+    rank_runs = [r for r in res.runs if r.extra["scenario"] == "gather_random_r2"]
+    assert rank_runs, "rank arm recorded no runs"
+    e = rank_runs[0].extra
+    assert e["n_ranks_reported"] == 2, "a rank failed to report — see the error log"
+    assert e["cellsets_per_sec__gather_random_r2"] > 0
+    assert e["cellsets_per_sec_1rank__gather_random_r2"] > 0
+    assert e["rank_scaling_efficiency__gather_random_r2"] is not None
+
+
+def test_obs_open_rank_arm_needs_manifest(phase0_env, monkeypatch: pytest.MonkeyPatch):
+    """No manifest fixture → no rank arm, and no crash."""
+    import importlib
+
+    monkeypatch.setenv("SCX_BENCH_N_RANKS", "2")
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.obs_open")
+    res = m.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+    assert res is not None
+    assert not any(r.extra["scenario"].startswith("open_manifest") for r in res.runs)
+
+
+def test_rank_arm_skipped_at_one_rank(phase0_env, monkeypatch: pytest.MonkeyPatch):
+    import importlib
+
+    monkeypatch.setenv("SCX_BENCH_N_RANKS", "1")
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+    res = m.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=True)
+    assert not any("_r1" in r.extra["scenario"] for r in res.runs)
+
+
+# ---------------------------------------------------------------------------
+# Competitor epoch fns (skipped when the lib is absent)
+# ---------------------------------------------------------------------------
+
+
 def test_annloader_epoch(phase0_env):
     import importlib
 

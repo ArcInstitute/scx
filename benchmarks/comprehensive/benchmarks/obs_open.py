@@ -14,14 +14,42 @@ Two formats:
   * ``h5ad_none`` — ``anndata.read_h5ad(path, backed='r')`` then ``.obs[col]``:
     the eager-obs cost STATE3 engineered around, as the comparison baseline.
 
-Scenarios:
-  * ``open_1file``  — open → read one categorical column → close, on the dataset's
-    own single file. Metrics ``obs_open_s``, ``obs_open_rss_mb``.
-  * ``open_manifest`` — iterate an N-file manifest fixture
+Scenarios
+---------
+``open_1file``
+    open → read one categorical column → close, on the dataset's own single
+    file. The end-to-end per-file cost. Metrics ``obs_open_s``,
+    ``obs_open_rss_mb``.
+``open_manifest``
+    iterate an N-file manifest fixture
     (``DATA_DIR/manifest_<dataset>/manifest.csv``, built by
     ``scripts/prep_manifest_fixture.py``); reports ``obs_open_s_per_file`` +
     total. Skipped cleanly when the manifest fixture is absent. Extrapolates the
     real 26k-file STATE3 manifest (which can't be committed).
+``open_only``
+    **Open only — obs never touched.** ``pyscx.open(path)`` /
+    ``anndata.read_h5ad(path, backed='r')``. On the SCX side this isolates
+    ``File::open`` + mmap + header parse + root catalog + full-catalog parse +
+    BLAKE3 catalog verify.
+``open_only_unverified``
+    **SCX only.** ``pyscx.open(path, verify=False)`` → ``ScxReader::open_unchecked``,
+    i.e. the same work minus the trailing BLAKE3 catalog verification.
+
+The last two exist so P0.1b's design argument is settled by measurement rather
+than assertion. Its stated non-goal is a separate ``ScxObsReader`` that "opens
+without mmap-ing X"; the counter-claim is that the mmap is lazy and free, and
+that per-file open cost is ``File::open`` + catalog parse + BLAKE3. Two
+subtractions on these scenarios decide it, and neither needed a new pyscx API —
+``pyscx.open(path, verify=False)`` already exists:
+
+    BLAKE3 catalog verify  =  open_only − open_only_unverified
+    obs read proper        =  open_1file − open_only
+
+``open_manifest_r<N>`` (opt-in via ``SCX_BENCH_N_RANKS``)
+    P-1(a) × ranks: the same manifest walk in ``N`` spawned processes, reporting
+    ``rank_scaling_efficiency``. This is the actual 26k-file × workers × ranks
+    startup cost — every model scans obs up front, once per process, and the
+    single-process number alone doesn't say whether those scans contend.
 """
 
 from __future__ import annotations
@@ -37,6 +65,12 @@ from typing import Any, Callable
 
 from benchmarks.comprehensive.cache_control import drop_file_cache
 from benchmarks.comprehensive.config import DATA_DIR, DatasetConfig, FormatVariant
+from benchmarks.comprehensive.multirank import (
+    rank_efficiency,
+    resolve_n_ranks,
+    run_ranks,
+    summarize_ranks,
+)
 from benchmarks.comprehensive.results import BenchmarkResult
 from benchmarks.comprehensive.rss import PeakRssSampler
 
@@ -44,6 +78,10 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto", "h5ad_none"})
 """SCX matrix-free obs open vs the anndata eager-obs baseline."""
+
+# The rank arm pays for (1 + N) manifest walks per run; the manifest walk is the
+# expensive scenario, so cap its runs harder than the single-file probes.
+_RANK_N_RUNS = 2
 
 
 def _have_pyscx() -> bool:
@@ -56,8 +94,29 @@ def _have_pyscx() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Per-file obs-open primitives (one open → read one categorical column → close)
+# Per-file primitives
+#
+# Split into open-only and open+read so the three SCX scenarios share one code
+# path and the subtraction above is between identical open implementations.
+# Each returns the obs row count so a caller can assert it read something.
 # ---------------------------------------------------------------------------
+
+
+def _open_scx(path: str, *, verify: bool = True) -> int:
+    """Open an SCX file and return ``n_obs`` from the header — obs NOT read.
+
+    ``n_obs_physical``, deliberately, not ``n_obs``/``shape``: the logical count
+    decodes the deletion-vector section on any file that has one
+    (`pyscx/src/experiment.rs:285`), which would fold a section read into a probe
+    whose whole purpose is to isolate open cost. The physical count comes
+    straight from the already-parsed header, so it adds no I/O — it exists only
+    to keep the open from being optimized away and to let the caller confirm the
+    open landed on a real file.
+    """
+    import pyscx
+
+    exp = pyscx.open(path, verify=verify)
+    return int(exp.n_obs_physical)
 
 
 def _pick_and_read_scx(path: str) -> int:
@@ -74,6 +133,23 @@ def _pick_and_read_scx(path: str) -> int:
         return int(len(df))
     df = exp.read_obs([col])
     return int(len(df))
+
+
+def _open_h5ad(path: str) -> int:
+    """Open an h5ad backed and return ``n_obs`` — obs columns NOT materialized.
+
+    anndata builds the obs *index* on open regardless, so this is not a pure
+    container open the way the SCX arm is; it is the honest floor for "the
+    cheapest thing anndata can do", which is what the comparison needs.
+    """
+    import anndata
+
+    adata = anndata.read_h5ad(path, backed="r")
+    try:
+        return int(adata.n_obs)
+    finally:
+        if getattr(adata, "isbacked", False) and adata.file is not None:
+            adata.file.close()
 
 
 def _pick_and_read_h5ad(path: str) -> int:
@@ -98,6 +174,18 @@ def _read_fn_for(format_key: str) -> Callable[[str], int]:
     if format_key == "h5ad_none":
         return _pick_and_read_h5ad
     raise ValueError(f"obs_open unsupported format {format_key!r}")
+
+
+def _open_only_fn_for(format_key: str) -> Callable[[str], int]:
+    if format_key == "scx_auto":
+        return _open_scx
+    if format_key == "h5ad_none":
+        return _open_h5ad
+    raise ValueError(f"obs_open unsupported format {format_key!r}")
+
+
+def _open_unverified_scx(path: str) -> int:
+    return _open_scx(path, verify=False)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +237,62 @@ def _timed_open(read_fn: Callable[[str], int], paths: list[str]) -> _OpenResult:
 
 
 # ---------------------------------------------------------------------------
+# Rank-arm worker — MUST stay module-level so `spawn` can pickle it by reference
+# ---------------------------------------------------------------------------
+
+
+def _rank_manifest_worker(
+    rank: int, n_ranks: int, format_key: str, paths: list[str]
+) -> dict[str, Any]:
+    """One rank's full manifest walk. Runs in a spawned child.
+
+    Every rank walks the **whole** manifest rather than a shard of it: each
+    model process builds a global obs vocabulary from every file (report §2.4),
+    so the per-rank cost does not shrink with world size. That makes this arm a
+    contention measurement, not a work-splitting one.
+    """
+    read_fn = _read_fn_for(format_key)
+    n_obs = 0
+    t0 = time.perf_counter()
+    for p in paths:
+        n_obs += read_fn(p)
+    wall_s = time.perf_counter() - t0
+    return {
+        "n_files": len(paths),
+        "n_obs_total": n_obs,
+        "manifest_wall_s": round(wall_s, 4),
+        "files_per_sec": round(len(paths) / wall_s, 4) if wall_s > 0 else 0.0,
+        "s_per_file": round(wall_s / len(paths), 6) if paths else None,
+    }
+
+
+def _run_rank_arm(
+    format_key: str, paths: list[str], n_ranks: int
+) -> dict[str, Any] | None:
+    """1-rank reference + N-rank arm, both through the spawned-child path."""
+    worker_args = (format_key, paths)
+    single = run_ranks(1, _rank_manifest_worker, worker_args)
+    many = run_ranks(n_ranks, _rank_manifest_worker, worker_args)
+    one_s = summarize_ranks(single, "files_per_sec")
+    many_s = summarize_ranks(many, "files_per_sec")
+    if one_s is None or many_s is None:
+        logger.error("obs_open rank arm produced no usable rate (1=%s, N=%s)", one_s, many_s)
+        return None
+    per_rank_median = many_s["per_rank_median"]
+    return {
+        "n_ranks": n_ranks,
+        "n_ranks_reported": many_s["n_ranks_reported"],
+        "aggregate_files_per_sec": many_s["aggregate"],
+        "per_rank_median_files_per_sec": per_rank_median,
+        "one_rank_files_per_sec": one_s["per_rank_median"],
+        "s_per_file_at_n_ranks": round(1.0 / per_rank_median, 6) if per_rank_median > 0 else None,
+        "rank_scaling_efficiency": rank_efficiency(single, many, "files_per_sec"),
+        "max_wall_s": many_s["max_wall_s"],
+        "total_peak_rss_mb": many_s["total_peak_rss_mb"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -169,6 +313,7 @@ def run(
         return None
 
     read_fn = _read_fn_for(format_variant.key)
+    open_fn = _open_only_fn_for(format_variant.key)
 
     # Resolve the single-file path.
     if format_variant.key == "scx_auto":
@@ -191,26 +336,37 @@ def run(
         )
         return None
 
+    n_ranks = resolve_n_ranks()
     result = BenchmarkResult(
         benchmark="obs_open",
         format=format_variant.key,
         dataset=dataset.name,
-        metadata={"cold_cache": cold_cache},
+        metadata={"cold_cache": cold_cache, "n_ranks": n_ranks},
     )
     if Path(single).is_file():
         result.file_size_bytes = Path(single).stat().st_size
 
     manifest_paths = _manifest_paths(dataset, format_variant.key)
 
-    scenarios: list[tuple[str, list[str]]] = [("open_1file", [single])]
+    # (scenario, paths, fn). `open_1file` / `open_manifest` names are FROZEN —
+    # four `thresholds.yaml` absolute floors key off
+    # `obs_open_s_per_file__open_1file`; renaming turns them into "missing
+    # metric" violations rather than a regression signal.
+    scenarios: list[tuple[str, list[str], Callable[[str], int]]] = [
+        ("open_1file", [single], read_fn),
+        ("open_only", [single], open_fn),
+    ]
+    if format_variant.key == "scx_auto":
+        # No h5ad analogue: anndata has no "skip the integrity check" open.
+        scenarios.append(("open_only_unverified", [single], _open_unverified_scx))
     if manifest_paths:
-        scenarios.append(("open_manifest", manifest_paths))
+        scenarios.append(("open_manifest", manifest_paths, read_fn))
         result.metadata["manifest_n_files"] = len(manifest_paths)
 
-    for scenario_name, paths in scenarios:
+    for scenario_name, paths, fn in scenarios:
         # Warm code path once (import + pyo3 init), untimed; timed reads are cold.
         try:
-            read_fn(paths[0])
+            fn(paths[0])
         except Exception as e:  # noqa: BLE001
             logger.error("  warmup failed for %s: %s", scenario_name, e)
             continue
@@ -224,7 +380,7 @@ def run(
                 for p in paths:
                     cache_policy = drop_file_cache(p)
             try:
-                out = _timed_open(read_fn, paths)
+                out = _timed_open(fn, paths)
             except Exception as e:  # noqa: BLE001
                 logger.error("  run %d/%d failed for %s: %s", i + 1, n_runs, scenario_name, e)
                 continue
@@ -261,6 +417,84 @@ def run(
                 "median_obs_open_s": round(statistics.median(run_s), 4),
                 "median_obs_open_s_per_file": round(statistics.median(run_per_file), 5),
                 "median_obs_open_rss_mb": round(statistics.median(run_rss), 1),
+            }
+        gc.collect()
+
+    # --- Derived breakdown ------------------------------------------------
+    # Recorded in metadata (not as a run metric) because they are subtractions
+    # of two medians, not a measured quantity — a floor on a difference of noisy
+    # terms would be a worse signal than floors on the terms themselves.
+    summary = result.metadata.get("scenario_summary", {})
+
+    def _median(name: str) -> float | None:
+        entry = summary.get(name)
+        return entry["median_obs_open_s_per_file"] if entry else None
+
+    per_file_total = _median("open_1file")
+    per_file_open = _median("open_only")
+    per_file_unverified = _median("open_only_unverified")
+    breakdown: dict[str, float | None] = {}
+    if per_file_total is not None and per_file_open is not None:
+        breakdown["obs_read_s_per_file"] = round(per_file_total - per_file_open, 6)
+    if per_file_open is not None and per_file_unverified is not None:
+        breakdown["catalog_verify_s_per_file"] = round(
+            per_file_open - per_file_unverified, 6
+        )
+        breakdown["open_minus_verify_s_per_file"] = round(per_file_unverified, 6)
+    if breakdown:
+        result.metadata["open_cost_breakdown"] = breakdown
+        logger.info("    open-cost breakdown (s/file): %s", breakdown)
+
+    # --- P-1(a) × ranks ---------------------------------------------------
+    if manifest_paths and n_ranks > 1:
+        rank_sc = f"open_manifest_r{n_ranks}"
+        rank_effs: list[float] = []
+        for i in range(_RANK_N_RUNS):
+            cache_policy = "warm"
+            if cold_cache:
+                for p in manifest_paths:
+                    cache_policy = drop_file_cache(p)
+            try:
+                arm = _run_rank_arm(format_variant.key, manifest_paths, n_ranks)
+            except Exception as e:  # noqa: BLE001
+                logger.error("  rank arm run %d/%d failed: %s", i + 1, _RANK_N_RUNS, e)
+                continue
+            if arm is None:
+                continue
+            result.add_run(
+                wall_s=arm["max_wall_s"] or 0.0,
+                peak_rss_mb=arm["total_peak_rss_mb"] or 0.0,
+                scenario=rank_sc,
+                n_files=len(manifest_paths),
+                n_ranks=n_ranks,
+                n_ranks_reported=arm["n_ranks_reported"],
+                cache_policy=cache_policy,
+                **{
+                    f"obs_open_s_per_file__{rank_sc}": arm["s_per_file_at_n_ranks"],
+                    f"files_per_sec__{rank_sc}": arm["aggregate_files_per_sec"],
+                    f"files_per_sec_per_rank__{rank_sc}": arm["per_rank_median_files_per_sec"],
+                    f"files_per_sec_1rank__{rank_sc}": arm["one_rank_files_per_sec"],
+                    f"rank_scaling_efficiency__{rank_sc}": arm["rank_scaling_efficiency"],
+                    f"total_peak_rss_mb__{rank_sc}": arm["total_peak_rss_mb"],
+                },
+            )
+            if arm["rank_scaling_efficiency"] is not None:
+                rank_effs.append(arm["rank_scaling_efficiency"])
+            logger.info(
+                "    %s: aggregate=%.2f files/s per_rank=%.2f 1rank=%.2f eff=%s s/file=%s cache=%s",
+                rank_sc,
+                arm["aggregate_files_per_sec"],
+                arm["per_rank_median_files_per_sec"],
+                arm["one_rank_files_per_sec"],
+                arm["rank_scaling_efficiency"],
+                arm["s_per_file_at_n_ranks"],
+                cache_policy,
+            )
+        if rank_effs:
+            result.metadata.setdefault("scenario_summary", {})[rank_sc] = {
+                "n_runs": len(rank_effs),
+                "n_ranks": n_ranks,
+                "median_rank_scaling_efficiency": round(statistics.median(rank_effs), 4),
             }
         gc.collect()
 
