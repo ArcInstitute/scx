@@ -1898,3 +1898,415 @@ fn test_open_with_shared_catalog_rejects_manifest_mismatch() {
         Ok(_) => panic!("manifest_sequence mismatch must surface as an error"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// 1C — obs_categorical / obs_categorical_many
+// ---------------------------------------------------------------------------
+
+/// Write a file whose obs is sharded with **disjoint per-shard categorical
+/// vocabularies**, optionally writing `plain_shards` as plain `Utf8` rather than
+/// `Dictionary` (the shape `append` produces).
+///
+/// `cell_type` sequence is A B A | B C A | C C B — every shard has a local
+/// vocabulary that differs from its siblings, so a broken local→global remap
+/// produces a correctly *shaped* result with wrong values.
+fn write_categorical_obs_fixture(
+    path: &std::path::Path,
+    plain_shards: &[usize],
+    with_nulls: bool,
+) -> usize {
+    use arrow::array::{DictionaryArray, Int64Array};
+    use arrow::datatypes::Int8Type;
+
+    let n_obs: usize = 9;
+    let n_vars: usize = 4;
+    let header = FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, 3, 0, 0);
+    let mut writer = ScxWriter::new(path, header).unwrap();
+
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    let cell_types = [["A", "B", "A"], ["B", "C", "A"], ["C", "C", "B"]];
+    for (shard_idx, types) in cell_types.iter().enumerate() {
+        let row_start = shard_idx * 3;
+        // With nulls, blank the middle row of shard 1 so a null sits mid-file
+        // rather than at a boundary the loop might special-case.
+        let rows: Vec<Option<&str>> = types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                if with_nulls && shard_idx == 1 && i == 1 {
+                    None
+                } else {
+                    Some(*t)
+                }
+            })
+            .collect();
+
+        let plain = plain_shards.contains(&shard_idx);
+        let ct_field = Field::new(
+            "cell_type",
+            if plain {
+                DataType::Utf8
+            } else {
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+            },
+            true,
+        );
+        let obs_schema = Arc::new(Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            ct_field,
+            Field::new("n_genes", DataType::Int64, false),
+        ]));
+
+        let ct: Arc<dyn arrow::array::Array> = if plain {
+            Arc::new(StringArray::from(rows.clone()))
+        } else {
+            Arc::new(rows.iter().copied().collect::<DictionaryArray<Int8Type>>())
+        };
+        let ids: Vec<String> = (row_start..row_start + 3)
+            .map(|i| format!("cell_{i}"))
+            .collect();
+        let batch = RecordBatch::try_new(
+            obs_schema,
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                ct,
+                Arc::new(Int64Array::from(
+                    (row_start..row_start + 3)
+                        .map(|i| (i as i64) * 10)
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        writer
+            .write_obs_shard(shard_idx as u32, row_start as u64, 3, n_obs as u64, &batch)
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    n_obs
+}
+
+/// Decode `(codes, categories)` back to strings so assertions read as data.
+fn decode_codes(codes: &[i32], cats: &[String]) -> Vec<Option<String>> {
+    codes
+        .iter()
+        .map(|&c| {
+            if c < 0 {
+                None
+            } else {
+                Some(cats[c as usize].clone())
+            }
+        })
+        .collect()
+}
+
+/// `obs_categorical` must agree with the assembled `read_obs()` on every row,
+/// across disjoint per-shard vocabularies.
+#[test]
+fn test_obs_categorical_matches_read_obs_on_sharded_dictionary() {
+    use arrow::array::Array;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cat_dict.scx");
+    write_categorical_obs_fixture(&path, &[], false);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let (codes, cats) = reader.obs_categorical("cell_type").unwrap();
+
+    // Ground truth from the materialising path.
+    let full = reader.read_obs().unwrap();
+    let expected = arrow::compute::cast(full.column_by_name("cell_type").unwrap(), &DataType::Utf8)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .clone();
+    let expected: Vec<Option<String>> = (0..expected.len())
+        .map(|i| {
+            if expected.is_null(i) {
+                None
+            } else {
+                Some(expected.value(i).to_string())
+            }
+        })
+        .collect();
+
+    assert_eq!(decode_codes(&codes, &cats), expected);
+    assert_eq!(codes.len(), 9, "one code per obs row");
+    let mut sorted = cats.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec!["A", "B", "C"], "one code per distinct value");
+}
+
+/// A file grown by `append` mixes `Dictionary` and plain `Utf8` shards on one
+/// column. Both must fold into one vocabulary — the read side's
+/// `reconcile_dictionary_representations` case, reached without a cast.
+#[test]
+fn test_obs_categorical_handles_mixed_dictionary_and_plain_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cat_mixed.scx");
+    // Shard 1 plain (as `append` writes), 0 and 2 dictionary-encoded.
+    write_categorical_obs_fixture(&path, &[1], false);
+
+    let reader = ScxReader::open(&path).unwrap();
+
+    // Premise: the mix must actually exist on disk. Without this the fixture
+    // could silently write every shard as Dictionary and the test below would
+    // still pass while exercising only one representation.
+    let ct_col = |shard: u32| -> DataType {
+        let schema = reader.read_obs_schema_physical().unwrap();
+        let idx = schema.index_of("cell_type").unwrap();
+        reader
+            .read_obs_shard_projected(shard, &[idx])
+            .unwrap()
+            .column(0)
+            .data_type()
+            .clone()
+    };
+    assert!(
+        matches!(ct_col(0), DataType::Dictionary(_, _)),
+        "shard 0 must be dictionary-encoded, got {:?}",
+        ct_col(0)
+    );
+    // Plain string shards land as `LargeUtf8`, not `Utf8`: `write_arrow_ipc`
+    // runs `upcast_to_large_types` on every batch. The projected read is the
+    // *raw* on-disk view (no `downcast_large_types`), so this is what the
+    // accumulator's plain arm actually receives.
+    assert_eq!(
+        ct_col(1),
+        DataType::LargeUtf8,
+        "shard 1 must be a plain string column (the shape `append` writes)"
+    );
+
+    let (codes, cats) = reader.obs_categorical("cell_type").unwrap();
+
+    assert_eq!(
+        decode_codes(&codes, &cats)
+            .into_iter()
+            .map(|v| v.unwrap())
+            .collect::<Vec<_>>(),
+        vec!["A", "B", "A", "B", "C", "A", "C", "C", "B"]
+    );
+    let mut sorted = cats.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec!["A", "B", "C"],
+        "mixed encodings must not duplicate categories"
+    );
+}
+
+/// Nulls are pandas-coded as `-1`, not as a synthetic trailing level.
+#[test]
+fn test_obs_categorical_codes_nulls_as_minus_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cat_null.scx");
+    write_categorical_obs_fixture(&path, &[], true);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let (codes, cats) = reader.obs_categorical("cell_type").unwrap();
+    assert_eq!(codes[4], -1, "the blanked row must code as -1");
+    assert!(
+        !cats.iter().any(|c| c == "NaN" || c.is_empty()),
+        "null must not create a category: {cats:?}"
+    );
+    assert_eq!(codes.len(), 9);
+}
+
+/// The legacy single-section obs layout must go through the same fold.
+#[test]
+fn test_obs_categorical_on_legacy_single_section_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cat_legacy.scx");
+    // `write_test_file` writes a legacy single-section obs via `write_obs`.
+    write_test_file(&dir, "cat_legacy.scx", 6, 4, 2, false);
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(
+        reader.obs_metadata_shard_count(),
+        0,
+        "premise: this fixture must be the legacy layout"
+    );
+    let (codes, cats) = reader.obs_categorical("cell_id").unwrap();
+    assert_eq!(codes.len(), 6);
+    // `cell_id` is unique per row, so every row gets its own category.
+    assert_eq!(cats.len(), 6);
+    assert_eq!(codes, vec![0, 1, 2, 3, 4, 5]);
+}
+
+/// `obs_categorical_many` must return one result per requested column, in order,
+/// and take **one** projected read per shard rather than one per column.
+#[test]
+fn test_obs_categorical_many_is_one_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cat_many.scx");
+    write_categorical_obs_fixture(&path, &[], false);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let before = reader
+        .debug_counts()
+        .read_obs_shard_projected
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let cols = vec!["cell_type".to_string(), "cell_id".to_string()];
+    let out = reader.obs_categorical_many(&cols).unwrap();
+    assert_eq!(out.len(), 2, "one result per requested column, in order");
+
+    let after = reader
+        .debug_counts()
+        .read_obs_shard_projected
+        .load(std::sync::atomic::Ordering::Relaxed);
+    // Debug-only counters: the `fetch_add` sites are `cfg(debug_assertions)`-gated,
+    // so only assert when they are compiled in.
+    if cfg!(debug_assertions) {
+        assert_eq!(
+            after - before,
+            3,
+            "3 obs shards ⇒ 3 projected reads for 2 columns, not 6"
+        );
+    }
+
+    // Results must match the single-column accessor.
+    let (ct_codes, ct_cats) = reader.obs_categorical("cell_type").unwrap();
+    assert_eq!(out[0].0, ct_codes);
+    assert_eq!(out[0].1, ct_cats);
+    assert_eq!(out[1].1.len(), 9, "cell_id is unique per row");
+
+    assert!(reader.obs_categorical_many(&[]).unwrap().is_empty());
+}
+
+/// The projected path must be *taken*, and the materialising ones avoided.
+///
+/// `read_obs == 0` alone is near-vacuous — `read_obs_keys` satisfies it too, and
+/// so does anything else column-scoped — so the positive counter is what makes
+/// this test mean something.
+#[test]
+fn test_obs_categorical_never_materialises_full_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cat_counts.scx");
+    write_categorical_obs_fixture(&path, &[], false);
+
+    let reader = ScxReader::open(&path).unwrap();
+    reader.obs_categorical("cell_type").unwrap();
+
+    let c = reader.debug_counts();
+    let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(load(&c.read_obs), 0, "full obs must never be assembled");
+    assert_eq!(load(&c.read_obs_shard), 0, "no whole-shard obs read either");
+    if cfg!(debug_assertions) {
+        assert_eq!(
+            load(&c.read_obs_shard_projected),
+            3,
+            "the projected path must actually be taken, once per shard"
+        );
+    }
+    // X must be untouched.
+    assert_eq!(load(&c.read_shard_from_entry), 0);
+}
+
+/// Arrow IPC projection must return columns in the **requested** order, not in
+/// ascending schema-index order — otherwise `obs_categorical_many` assigns each
+/// accumulator the wrong column and silently swaps two columns' codes.
+///
+/// Covered on the sharded path by the Python `obs_categorical_many` test; this
+/// pins the **legacy single-section** path, which goes through a different
+/// projected reader (`FileReaderBuilder::with_projection` over the whole `obs`
+/// section) and was otherwise only exercised with a single column.
+#[test]
+fn test_obs_categorical_many_preserves_request_order_on_legacy_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy_order.scx");
+
+    let n_obs: usize = 4;
+    let n_vars: usize = 4;
+    let header = FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, 4, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    // Legacy single-section obs (`write_obs`) with TWO string columns whose
+    // values are disjoint, so a projection swap cannot go unnoticed.
+    let obs_schema = Arc::new(Schema::new(vec![
+        Field::new("cell_type", DataType::Utf8, false),
+        Field::new("donor", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        obs_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["ct_a", "ct_b", "ct_a", "ct_c"])),
+            Arc::new(StringArray::from(vec!["dn_x", "dn_y", "dn_y", "dn_x"])),
+        ],
+    )
+    .unwrap();
+    writer.write_obs(&batch).unwrap();
+    writer.finish().unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(
+        reader.obs_metadata_shard_count(),
+        0,
+        "premise: this fixture must be the legacy single-section layout"
+    );
+
+    let solo_ct = reader.obs_categorical("cell_type").unwrap();
+    let solo_dn = reader.obs_categorical("donor").unwrap();
+    assert_eq!(solo_ct.1, vec!["ct_a", "ct_b", "ct_c"]);
+    assert_eq!(solo_dn.1, vec!["dn_x", "dn_y"]);
+
+    // `donor` is schema index 1 and `cell_type` index 0, so requesting
+    // [donor, cell_type] is the descending-index case that would break if the
+    // reader normalised the projection to ascending order.
+    let rev = reader
+        .obs_categorical_many(&["donor".to_string(), "cell_type".to_string()])
+        .unwrap();
+    assert_eq!(rev[0], solo_dn, "donor must land at request position 0");
+    assert_eq!(rev[1], solo_ct, "cell_type must land at request position 1");
+
+    let fwd = reader
+        .obs_categorical_many(&["cell_type".to_string(), "donor".to_string()])
+        .unwrap();
+    assert_eq!(fwd[0], solo_ct);
+    assert_eq!(fwd[1], solo_dn);
+}
+
+#[test]
+fn test_obs_categorical_rejects_numeric_and_unknown_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cat_reject.scx");
+    write_categorical_obs_fixture(&path, &[], false);
+    let reader = ScxReader::open(&path).unwrap();
+
+    let err = reader.obs_categorical("n_genes").unwrap_err().to_string();
+    assert!(err.contains("n_genes"), "must name the column: {err}");
+    assert!(
+        err.contains("string/categorical"),
+        "must say what is supported: {err}"
+    );
+
+    let err = reader.obs_categorical("nope").unwrap_err().to_string();
+    assert!(err.contains("nope"), "must name the column: {err}");
+}

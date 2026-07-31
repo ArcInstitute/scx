@@ -308,12 +308,20 @@ def _cache_hit_rate(ds: Any) -> float | None:
 
 
 def _run_gather(
-    scx_path: str, plans_factory: Callable[[], Iterator[tuple]]
+    scx_path: str,
+    plans_factory: Callable[[], Iterator[tuple]],
+    cache_shards: int | None = None,
+    max_memory_mb: int | None = None,
 ) -> _Outcome:
     import pyscx
 
     gc.collect()
-    ds = pyscx.SparseCellSetDataset([scx_path])
+    kwargs: dict[str, Any] = {}
+    if cache_shards is not None:
+        kwargs["cache_shards"] = cache_shards
+    if max_memory_mb is not None:
+        kwargs["max_memory_mb"] = max_memory_mb
+    ds = pyscx.SparseCellSetDataset([scx_path], **kwargs)
     n_sets = 0
     n_cells = 0
     ttfb_s = 0.0
@@ -336,6 +344,100 @@ def _run_gather(
         peak_rss_mb=sampler.peak_mb,
         shard_cache_hit_rate=_cache_hit_rate(ds),
     )
+
+
+# ---------------------------------------------------------------------------
+# data-load 1A: cache sizing
+# ---------------------------------------------------------------------------
+
+# What STATE3 was actually passing when it hit 143 s/batch. SCX's own default is
+# 128 and would have been fine; the pathology came from a *consumer-side*
+# default, which is why the fix is a diagnostic rather than a default change.
+_UNDERSIZED_CACHE_SHARDS = 16
+
+
+def _budget_mb_for(scx_path: str, cache_shards: int) -> int | None:
+    """``max_memory_mb`` that holds ``cache_shards`` average shards, +12% headroom.
+
+    Derived from the loader's own model (``memory_budget()['shard_decoded_bytes']``)
+    rather than guessed, so the "sized correctly" arm is configured the way the
+    warning tells a user to configure it. ``None`` ⇒ leave the budget adaptive.
+    """
+    try:
+        import pyscx
+
+        per_shard = int(
+            pyscx.SparseCellSetDataset([scx_path]).memory_budget()["shard_decoded_bytes"]
+        )
+        if per_shard <= 0:
+            return None
+        need_mb = (cache_shards * per_shard) // (1024 * 1024)
+        return max(64, need_mb + need_mb // 8)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("  could not derive a budget for %d shards: %s", cache_shards, e)
+        return None
+
+
+def _shard_count(scx_path: str) -> int | None:
+    """CSR shard count, for context on whether the sizing arm can say anything."""
+    try:
+        import pyscx
+
+        return int(pyscx.open(scx_path).shard_count)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _read_path_probe(scx_path: str, plans_factory: Callable[[], Iterator[tuple]]) -> dict:
+    """Which scattered-read path this process actually takes, from counters.
+
+    On a **framed** file (v4 default) a scattered gather routes through the
+    codec-agnostic block-index path, which decodes only the touched row-groups and
+    **never populates the whole-shard LRU** — `hits + misses == 0` and
+    `block_index_groups > 0`. `cache_shards` is then irrelevant by construction,
+    so a ~1.0× cache-sizing ratio means "the cache was bypassed", not "sizing
+    doesn't help". The distinction is measured here rather than inferred from the
+    file's framing, because the process-global `SCX_SCATTER_BLOCK_INDEX` switch
+    (read once per process via `OnceLock`) also decides it.
+    """
+    import pyscx
+
+    ds = pyscx.SparseCellSetDataset([scx_path], cache_shards=16)
+    for _ in ds.iter_with_plans(plans_factory()):
+        pass
+    m = ds.cache_metrics()
+    touched = int(m.get("hits", 0)) + int(m.get("misses", 0))
+    return {
+        "lru_consulted": touched > 0,
+        "hits_plus_misses": touched,
+        "full_shard_groups": int(m.get("full_shard_groups", 0)),
+        "block_index_groups": int(m.get("block_index_groups", 0)),
+    }
+
+
+def _suggested_cache_shards(scx_path: str, plans: list[tuple]) -> int | None:
+    """Max ``suggested_cache_shards`` over ``plans`` — the cache that would hold
+    the widest batch's working set, or ``None`` to skip the arm.
+
+    Returns ``None`` rather than raising on *any* failure: an older ``.so``
+    without the method, an unreadable fixture, a broken pyscx. This arm is
+    diagnostic, and a raise here would fail the whole cohort SLURM job (several
+    benchmark × dataset tasks share one) — and would also mask the
+    ``require_runs()`` guard, which is what must report a non-functional pyscx.
+    """
+    try:
+        import pyscx
+
+        probe = pyscx.SparseCellSetDataset([scx_path])
+        if not hasattr(probe, "suggested_cache_shards"):
+            return None
+        best = 0
+        for file_ids, rows, _roles, _offsets in plans:
+            best = max(best, int(probe.suggested_cache_shards(file_ids, rows)))
+        return best or None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("  cache-sizing arm unavailable: %s", e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +680,153 @@ def run(
                 "median_peak_rss_mb": round(statistics.median(run_rss), 1),
             }
         gc.collect()
+
+    # --- data-load 1A: cache sizing --------------------------------------
+    # Reproduces STATE3's pathology and measures what `suggested_cache_shards`
+    # buys: the same scattered S=64 plan run with the consumer-side
+    # `cache_shards=16` it was passing, then with the value the helper derives
+    # from the plan. Not a regression floor — it is an A/B whose *ratio* is the
+    # result, and its arms deliberately misconfigure one side.
+    sizing_sc = _SCENARIOS[0]  # gather_random @ S=64
+    sizing_plans = _plans_for(sizing_sc)
+    sample = list(sizing_plans(min(n_batches, 32)))
+    suggested = _suggested_cache_shards(scx_path, sample)
+    n_shards = _shard_count(scx_path)
+    try:
+        read_path = _read_path_probe(scx_path, lambda: sizing_plans(warmup))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("  read-path probe failed: %s", e)
+        read_path = {"lru_consulted": None}
+    if read_path.get("lru_consulted") is False:
+        logger.info(
+            "  cache-sizing arm: the whole-shard LRU is BYPASSED on this path "
+            "(block_index_groups=%d, hits+misses=0) — `cache_shards` cannot "
+            "affect throughput here. Run with SCX_SCATTER_BLOCK_INDEX=0 to "
+            "measure the legacy full-shard-decode regime.",
+            read_path.get("block_index_groups", 0),
+        )
+    if suggested is None:
+        logger.warning(
+            "  skipping cache-sizing arm — suggested_cache_shards unavailable "
+            "(stale pyscx .so?)"
+        )
+    elif suggested <= _UNDERSIZED_CACHE_SHARDS:
+        # A file with few shards cannot demonstrate anything here: a scattered
+        # plan touches ≤ the undersized cache, so both arms hold the whole
+        # working set and the ratio is 1.00× *by construction*. Recording the
+        # reason matters — a bare 1.00× reads as "the helper doesn't help",
+        # which would be the wrong conclusion drawn from the wrong fixture.
+        logger.info(
+            "  cache-sizing arm not applicable: plan touches %d shard(s) "
+            "(file has %s), at or below the undersized cache of %d — needs a "
+            "many-shard dataset (census_*) to be informative",
+            suggested,
+            n_shards if n_shards is not None else "?",
+            _UNDERSIZED_CACHE_SHARDS,
+        )
+        result.metadata["cache_sizing"] = {
+            "applicable": False,
+            "read_path": read_path,
+            "reason": "plan working set fits the undersized cache; fixture has too few shards",
+            "suggested_cache_shards": suggested,
+            "undersized_cache_shards": _UNDERSIZED_CACHE_SHARDS,
+            "file_shard_count": n_shards,
+        }
+    else:
+        # Following the advice means raising BOTH knobs. `suggested_cache_shards`
+        # is a count, but the byte budget also has to hold that many shards —
+        # census_500k wants 31 while the adaptive 4 GB cap affords only 22, so
+        # `cache_shards=31` alone would under-deliver and understate the win.
+        # This is exactly what the sizing warning tells a user to do.
+        suggested_mb = _budget_mb_for(scx_path, suggested)
+        logger.info(
+            "  cache sizing: suggested=%d shards (max_memory_mb=%s) vs undersized=%d",
+            suggested,
+            suggested_mb,
+            _UNDERSIZED_CACHE_SHARDS,
+        )
+        sizing_rates: dict[str, float] = {}
+        for arm_name, shards, budget_mb in (
+            ("cache_undersized", _UNDERSIZED_CACHE_SHARDS, None),
+            ("cache_suggested", suggested, suggested_mb),
+        ):
+            try:
+                _run_gather(scx_path, lambda: sizing_plans(warmup), shards, budget_mb)
+            except Exception as e:  # noqa: BLE001
+                logger.error("  warmup failed for %s: %s", arm_name, e)
+                continue
+            arm_sps: list[float] = []
+            arm_rss: list[float] = []
+            for i in range(n_runs):
+                cache_policy = drop_file_cache(scx_path) if cold_cache else "warm"
+                try:
+                    out = _run_gather(
+                        scx_path, lambda: sizing_plans(n_batches), shards, budget_mb
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.error("  run %d/%d failed for %s: %s", i + 1, n_runs, arm_name, e)
+                    continue
+                sps = out.n_sets / out.wall_s if out.wall_s > 0 else 0.0
+                result.add_run(
+                    wall_s=out.wall_s,
+                    peak_rss_mb=out.peak_rss_mb,
+                    scenario=arm_name,
+                    set_size=sizing_sc.set_size,
+                    n_sets=out.n_sets,
+                    n_cells=out.n_cells,
+                    cache_shards=shards,
+                    max_memory_mb=budget_mb,
+                    cache_policy=cache_policy,
+                    **{
+                        f"cellsets_per_sec__{arm_name}": round(sps, 1),
+                        f"peak_rss_mb__{arm_name}": round(out.peak_rss_mb, 1),
+                        f"shard_cache_hit_rate__{arm_name}": out.shard_cache_hit_rate,
+                    },
+                )
+                arm_sps.append(sps)
+                arm_rss.append(out.peak_rss_mb)
+                logger.info(
+                    "    %s (cache_shards=%d, budget=%s): sets/s=%.1f rss=%.1fMB hit_rate=%s",
+                    arm_name,
+                    shards,
+                    budget_mb,
+                    sps,
+                    out.peak_rss_mb,
+                    out.shard_cache_hit_rate,
+                )
+            if arm_sps:
+                sizing_rates[arm_name] = statistics.median(arm_sps)
+                result.metadata.setdefault("scenario_summary", {})[arm_name] = {
+                    "n_runs": len(arm_sps),
+                    "cache_shards": shards,
+                    "max_memory_mb": budget_mb,
+                    "median_cellsets_per_sec": round(statistics.median(arm_sps), 1),
+                    "median_peak_rss_mb": round(statistics.median(arm_rss), 1),
+                }
+            gc.collect()
+
+        if len(sizing_rates) == 2 and sizing_rates["cache_undersized"] > 0:
+            speedup = sizing_rates["cache_suggested"] / sizing_rates["cache_undersized"]
+            result.metadata["cache_sizing"] = {
+                # `applicable` says the arms RAN; `read_path.lru_consulted` says
+                # whether the knob under test was even on the critical path. A
+                # ~1.0× with lru_consulted=False is the cache being bypassed.
+                "applicable": True,
+                "read_path": read_path,
+                "file_shard_count": n_shards,
+                "suggested_cache_shards": suggested,
+                "suggested_max_memory_mb": suggested_mb,
+                "undersized_cache_shards": _UNDERSIZED_CACHE_SHARDS,
+                "undersized_cellsets_per_sec": round(sizing_rates["cache_undersized"], 1),
+                "suggested_cellsets_per_sec": round(sizing_rates["cache_suggested"], 1),
+                "speedup": round(speedup, 3),
+            }
+            logger.info(
+                "  cache sizing: %d→%d shards = %.2f×",
+                _UNDERSIZED_CACHE_SHARDS,
+                suggested,
+                speedup,
+            )
 
     # --- P-1(c): N concurrent ranks ---------------------------------------
     # Skipped at N=1: a "4 ranks vs 1 rank" ratio is undefined there, and the

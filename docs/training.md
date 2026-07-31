@@ -148,6 +148,41 @@ across 30–50 shards, requiring a large `cache_shards` setting and ~20+ GB RSS
 to avoid thrashing. With grouping each perturbation is in 1–2 shards, so the
 cache stays warm with far fewer entries.
 
+### Sizing the shard cache
+
+Don't guess `cache_shards` — measure what your plans touch:
+
+```python
+probe = pyscx.SparseCellSetDataset(paths)
+need = max(probe.suggested_cache_shards(fids, rows) for fids, rows, _, _ in plans[:64])
+ds = pyscx.SparseCellSetDataset(paths, cache_shards=need)
+```
+
+`suggested_cache_shards` counts the distinct `(file_id, shard)` pairs a plan
+touches, from the catalog's shard row ranges — no I/O and no decode.
+`IndexPlanDataset.suggested_cache_shards(plan)` is the paired-plan equivalent.
+
+Two things to know:
+
+- **Raise the byte budget too.** `cache_shards` is a count cap; `max_memory_mb`
+  is a byte cap, and both are enforced. A file with large shards can want more
+  bytes than the adaptive default affords (census_500k wants 31 shards while the
+  4 GB adaptive cap holds 22), so `cache_shards=31` alone under-delivers.
+  `memory_budget()` reports `affordable_cache_shards` so you can see it.
+- **On framed files (the v4 default) this mostly doesn't matter.** A scattered
+  gather routes through the row-group block-index path, which decodes only the
+  touched row-groups and never populates the whole-shard LRU — so `cache_shards`
+  is not on the critical path at all. It becomes load-bearing on unframed/legacy
+  layouts and when you pass `scatter_block_index=False`, where an undersized
+  cache is worth **269×** (measured; see
+  [performance.md § Shard-cache sizing](performance.md#shard-cache-sizing-on-the-gather-path-data-load-phase-1-1a)).
+
+Both gather loaders sample their cache counters while iterating and emit a
+one-shot `UserWarning` if the observed miss/eviction pattern indicates the
+working set exceeds the cache. `max_memory_mb=None` resolves to a **bounded**
+adaptive budget on all three loader classes (512 MB floor → 4 GB cap), so peak
+RSS is capped by default rather than open-ended.
+
 > [!TIP]
 > On cloud storage (S3 / GCS), each shard access is a separate HTTP
 > range-read request. Grouped sharding reduces ~120 round-trips per

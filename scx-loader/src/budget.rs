@@ -11,15 +11,191 @@
 //! at construction time. The auto-tune algorithms remain in the respective
 //! modules — only the breakdown shape and its Python representation are
 //! shared here.
+//!
+//! This module also owns the two **cache-sizing verdicts** the plan-driven
+//! loaders warn from — [`assess_cache_sizing`] (construction time, from the
+//! budget model) and [`assess_cache_thrash`] (runtime, from observed
+//! [`CacheMetrics`]). Both are deliberately pure so they can be unit-tested
+//! without a Python interpreter or a fixture file; only the `warnings.warn`
+//! call lives in `python.rs`.
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
 use pyo3::types::PyDict;
+use scx_format_io::CacheMetrics;
+use std::sync::atomic::Ordering;
 
 /// Constant Python/Arrow/numpy/threads overhead estimate (bytes). Both
 /// budget models add this to their per-component sum.
 pub const PYTHON_OVERHEAD_BYTES: usize = 50 * 1024 * 1024;
+
+/// Lower bound on the shard cache that a budget auto-tune may reach
+/// **silently**.
+///
+/// Below this, a gather batch whose rows land in more than a handful of shards
+/// re-decodes shards it just evicted — the 143 s/batch regime STATE3 hit
+/// (fixed by raising a consumer-side `cache_shards=16`, not by any SCX change).
+/// The auto-tune is still allowed to go lower, because refusing would turn
+/// configurations that work today into hard errors; it just may not do so
+/// without telling the caller. See [`assess_cache_sizing`].
+pub const MIN_CACHE_SHARDS: usize = 8;
+
+/// Minimum observed `misses` before [`assess_cache_thrash`] will return a
+/// verdict.
+///
+/// Every run begins with a cold cache, where misses are *expected* and carry no
+/// information about the working set. Sampling too early reports the warm-up as
+/// pathology.
+const THRASH_MIN_MISSES: u64 = 64;
+
+/// Miss rate above which the cache is not absorbing repeat access.
+const THRASH_MISS_RATE: f64 = 0.5;
+
+/// Evictions-per-miss above which misses are *displacing live entries* rather
+/// than filling empty slots. This is the term that separates thrash from a
+/// merely cold cache, and it is why the predicate needs both.
+const THRASH_EVICTIONS_PER_MISS: f64 = 0.5;
+
+/// Adaptive budget (MB) for a plan-driven loader whose caller passed
+/// `max_memory_mb=None`.
+///
+/// Mirrors the sequential path's `pipeline::adaptive_budget_mb` arithmetic —
+/// the requested configuration's own need, rounded up to whole MB with ~12 %
+/// headroom, clamped to `[floor_mb, ADAPTIVE_BUDGET_CAP_MB]` — so all three
+/// loader classes resolve a `None` budget the same way instead of each
+/// inventing a policy. Being clamped *up* to `floor_mb` means this never
+/// tightens a small file below the old default; being clamped down to the cap
+/// means a genuinely huge request still falls through to the auto-tune (and its
+/// warning) rather than reserving unbounded RSS.
+pub fn adaptive_budget_mb(requested_need_bytes: usize, floor_mb: usize) -> usize {
+    let need_mb = requested_need_bytes.div_ceil(1024 * 1024);
+    let with_headroom = need_mb.saturating_add(need_mb / 8);
+    let cap = crate::pipeline::ADAPTIVE_BUDGET_CAP_MB;
+    // `clamp` panics if min > max, so let an unusually high floor win.
+    with_headroom.clamp(floor_mb, cap.max(floor_mb))
+}
+
+/// Construction-time verdict: the memory budget could not hold the shard cache
+/// the caller asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheSizingVerdict {
+    /// What the caller asked for (explicitly or by default).
+    pub requested_cache_shards: usize,
+    /// What the budget actually affords.
+    pub effective_cache_shards: usize,
+    /// Average decoded bytes per shard, the model's per-shard unit.
+    pub shard_decoded_bytes: usize,
+    /// The budget that forced the reduction.
+    pub budget_mb: usize,
+    /// `max_memory_mb` that would have held `requested_cache_shards`.
+    pub budget_mb_for_requested: usize,
+    /// `effective_cache_shards < MIN_CACHE_SHARDS` — thrash is likely, not
+    /// merely possible.
+    pub below_floor: bool,
+}
+
+/// Returns a verdict iff the budget forced the shard cache below what was
+/// requested **and** the caller needs to know. `None` means silence.
+///
+/// `budget_was_explicit` is what keeps this from crying wolf. Under an
+/// *adaptive* budget the cap is deliberate — it is the whole point of bounding
+/// RSS — and a file with few large shards will routinely be "reduced" from the
+/// default 128 to a couple of dozen while running perfectly well (a real
+/// example: 194 MB shards ⇒ 21 shards fit the 4 GB cap, at 0.7 GB observed RSS).
+/// Warning there would fire on healthy default configurations, which is how a
+/// diagnostic gets filtered and stops working. So under an adaptive budget the
+/// verdict is withheld unless the affordable count falls below
+/// [`MIN_CACHE_SHARDS`], where thrash becomes likely rather than hypothetical.
+/// An **explicit** `max_memory_mb` that conflicts with an explicit
+/// `cache_shards` is always reported: the caller asked for two things that don't
+/// fit and only they can decide which one gives.
+///
+/// Pure: takes the already-computed model terms, so the auto-tune loops stay in
+/// their own modules and this stays unit-testable.
+pub fn assess_cache_sizing(
+    requested_cache_shards: usize,
+    effective_cache_shards: usize,
+    shard_decoded_bytes: usize,
+    budget_mb: usize,
+    non_cache_bytes: usize,
+    budget_was_explicit: bool,
+) -> Option<CacheSizingVerdict> {
+    if effective_cache_shards >= requested_cache_shards {
+        return None;
+    }
+    let below_floor = effective_cache_shards < MIN_CACHE_SHARDS;
+    if !budget_was_explicit && !below_floor {
+        return None;
+    }
+    let need = requested_cache_shards
+        .saturating_mul(shard_decoded_bytes)
+        .saturating_add(non_cache_bytes);
+    Some(CacheSizingVerdict {
+        requested_cache_shards,
+        effective_cache_shards,
+        shard_decoded_bytes,
+        budget_mb,
+        budget_mb_for_requested: need.div_ceil(1024 * 1024),
+        below_floor,
+    })
+}
+
+/// Runtime verdict: the observed cache counters are consistent with a working
+/// set larger than the cache.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThrashVerdict {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    /// `misses / (hits + misses)`.
+    pub miss_rate: f64,
+    /// `evictions / misses` — the term that distinguishes thrash from a cold
+    /// cache.
+    pub evictions_per_miss: f64,
+    /// The cache size in effect.
+    pub cache_shards: usize,
+}
+
+/// Returns a verdict iff `m` looks like working-set overflow, `None` otherwise.
+///
+/// Requires **three** conditions, and the third is the load-bearing one:
+///
+/// 1. `misses >= THRASH_MIN_MISSES` — past warm-up, so there is signal at all.
+/// 2. `miss_rate > THRASH_MISS_RATE` — the cache is not absorbing repeat access.
+/// 3. `evictions_per_miss > THRASH_EVICTIONS_PER_MISS` — each miss is
+///    *displacing a live entry*.
+///
+/// Without (3) this would fire on any cold sequential scan, where every read is
+/// a legitimate first touch: high miss rate, no evictions, no pathology. That
+/// distinction is the whole point of the diagnostic, so it is asserted by
+/// `cold_scan_is_not_thrash` rather than left to reviewer inspection.
+pub fn assess_cache_thrash(m: &CacheMetrics, cache_shards: usize) -> Option<ThrashVerdict> {
+    let hits = m.hits.load(Ordering::Relaxed);
+    let misses = m.misses.load(Ordering::Relaxed);
+    let evictions = m.evictions.load(Ordering::Relaxed);
+
+    if misses < THRASH_MIN_MISSES {
+        return None;
+    }
+    let total = hits.saturating_add(misses);
+    if total == 0 {
+        return None;
+    }
+    let miss_rate = misses as f64 / total as f64;
+    let evictions_per_miss = evictions as f64 / misses as f64;
+    if miss_rate <= THRASH_MISS_RATE || evictions_per_miss <= THRASH_EVICTIONS_PER_MISS {
+        return None;
+    }
+    Some(ThrashVerdict {
+        hits,
+        misses,
+        evictions,
+        miss_rate,
+        evictions_per_miss,
+        cache_shards,
+    })
+}
 
 /// Per-component memory breakdown produced by both budget paths so that
 /// callers (Python `memory_budget()` accessors, the benchmark harness, the
@@ -145,5 +321,149 @@ mod tests {
     fn breakdown_handles_overflow_safely() {
         let b = BudgetBreakdown::new(usize::MAX, 1, 0, 0, 0);
         assert_eq!(b.total_bytes, usize::MAX);
+    }
+
+    // ---- adaptive_budget_mb ------------------------------------------------
+
+    #[test]
+    fn adaptive_budget_never_drops_below_the_floor() {
+        // A tiny need must not tighten the budget below the historical default.
+        assert_eq!(adaptive_budget_mb(1024, 512), 512);
+    }
+
+    #[test]
+    fn adaptive_budget_raises_to_fit_a_large_request() {
+        // 1000 MB need + 12.5% headroom = 1125, above the 512 floor, below cap.
+        let mb = adaptive_budget_mb(1000 * 1024 * 1024, 512);
+        assert_eq!(mb, 1125);
+    }
+
+    #[test]
+    fn adaptive_budget_clamps_to_the_cap() {
+        let mb = adaptive_budget_mb(usize::MAX / 2, 512);
+        assert_eq!(mb, crate::pipeline::ADAPTIVE_BUDGET_CAP_MB);
+    }
+
+    #[test]
+    fn adaptive_budget_floor_above_cap_does_not_panic() {
+        // `clamp` panics when min > max; the floor must win instead.
+        let floor = crate::pipeline::ADAPTIVE_BUDGET_CAP_MB + 4096;
+        assert_eq!(adaptive_budget_mb(1024, floor), floor);
+    }
+
+    // ---- assess_cache_sizing ---------------------------------------------
+
+    #[test]
+    fn sizing_silent_when_request_is_honoured() {
+        assert!(assess_cache_sizing(128, 128, 1024, 512, 0, true).is_none());
+        // Defensive: an effective value *above* the request is still silence.
+        assert!(assess_cache_sizing(64, 128, 1024, 512, 0, true).is_none());
+    }
+
+    #[test]
+    fn sizing_silent_under_an_adaptive_budget_above_the_floor() {
+        // The false positive a preflight caught on real data: 194 MB shards mean
+        // the adaptive 4 GB cap affords 21 of 128, on a run whose observed RSS was
+        // 0.7 GB. That is the cap working, not a problem — warning there would
+        // fire on healthy default configurations.
+        assert!(
+            assess_cache_sizing(128, 21, 194 * 1024 * 1024, 4096, 0, false).is_none(),
+            "an adaptive budget's own cap must not warn while above the floor"
+        );
+        // The same numbers WITH an explicit budget are worth reporting: the
+        // caller asked for two things that don't fit.
+        assert!(assess_cache_sizing(128, 21, 194 * 1024 * 1024, 4096, 0, true).is_some());
+    }
+
+    #[test]
+    fn sizing_reports_below_floor_even_under_an_adaptive_budget() {
+        // Below MIN_CACHE_SHARDS thrash is likely rather than hypothetical, so
+        // the adaptive suppression lifts.
+        let v = assess_cache_sizing(128, 4, 1024 * 1024, 8, 0, false)
+            .expect("below the floor must be reported even when adaptive");
+        assert!(v.below_floor);
+    }
+
+    #[test]
+    fn sizing_reports_shrink_above_the_floor_without_flagging_the_floor() {
+        let v = assess_cache_sizing(128, 32, 1024 * 1024, 64, 0, true)
+            .expect("shrink must be reported");
+        assert_eq!(v.requested_cache_shards, 128);
+        assert_eq!(v.effective_cache_shards, 32);
+        assert!(
+            !v.below_floor,
+            "32 is above MIN_CACHE_SHARDS; the escalated wording must not fire"
+        );
+        // 128 shards × 1 MiB = 128 MB would have held the request.
+        assert_eq!(v.budget_mb_for_requested, 128);
+    }
+
+    #[test]
+    fn sizing_flags_below_floor() {
+        let v =
+            assess_cache_sizing(128, 4, 1024 * 1024, 8, 0, true).expect("shrink must be reported");
+        assert!(v.below_floor, "4 < MIN_CACHE_SHARDS must escalate");
+    }
+
+    #[test]
+    fn sizing_counts_non_cache_terms_in_the_suggested_budget() {
+        // The suggested budget must cover the batch buffers and Python overhead
+        // too, or following the advice still would not fit.
+        let v = assess_cache_sizing(16, 4, 1024 * 1024, 8, 100 * 1024 * 1024, true).unwrap();
+        assert_eq!(v.budget_mb_for_requested, 16 + 100);
+    }
+
+    // ---- assess_cache_thrash --------------------------------------------
+
+    fn metrics(hits: u64, misses: u64, evictions: u64) -> CacheMetrics {
+        let m = CacheMetrics::default();
+        m.hits.store(hits, Ordering::Relaxed);
+        m.misses.store(misses, Ordering::Relaxed);
+        m.evictions.store(evictions, Ordering::Relaxed);
+        m
+    }
+
+    #[test]
+    fn thrash_detected_when_misses_displace_live_entries() {
+        let v = assess_cache_thrash(&metrics(10, 1000, 900), 16).expect("thrash must be detected");
+        assert!(v.miss_rate > 0.9);
+        assert!(v.evictions_per_miss > 0.8);
+        assert_eq!(v.cache_shards, 16);
+    }
+
+    #[test]
+    fn cold_scan_is_not_thrash() {
+        // The load-bearing negative case. A cold sequential scan has a ~100%
+        // miss rate and *no* evictions: every read is a legitimate first touch.
+        // A predicate keyed on miss rate alone would fire here and cry wolf on
+        // every well-configured run.
+        assert!(
+            assess_cache_thrash(&metrics(0, 1000, 0), 128).is_none(),
+            "high miss rate with no evictions is a cold cache, not thrash"
+        );
+        // Still not thrash when a few evictions trickle in near the end.
+        assert!(assess_cache_thrash(&metrics(0, 1000, 100), 128).is_none());
+    }
+
+    #[test]
+    fn warm_cache_is_not_thrash() {
+        // Evictions can exceed misses on a healthy warm cache (a big entry
+        // displaces several small ones), so the eviction term alone is not
+        // sufficient either — the low miss rate must veto.
+        assert!(assess_cache_thrash(&metrics(10_000, 200, 400), 128).is_none());
+    }
+
+    #[test]
+    fn thrash_silent_below_the_warmup_floor() {
+        // Same ratios as the positive case, too few samples to trust.
+        assert!(assess_cache_thrash(&metrics(0, 63, 60), 4).is_none());
+        assert!(assess_cache_thrash(&metrics(0, 64, 60), 4).is_some());
+    }
+
+    #[test]
+    fn thrash_silent_on_zeroed_metrics() {
+        // `PrefetchEngine::new` installs a zeroed handle when no reader enabled
+        // metrics; that must read as "no signal", never as "no thrash proven".
+        assert!(assess_cache_thrash(&CacheMetrics::default(), 128).is_none());
     }
 }

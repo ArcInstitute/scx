@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use numpy::PyArray1;
 use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -576,12 +577,17 @@ impl PyCloudExperiment {
     /// cloud path, without touching X. Mirrors the local
     /// `Experiment.read_obs`. `columns` projects a subset by physical name.
     ///
-    /// Note: the obs metadata sections are fetched and assembled across shards;
-    /// `columns` projects the assembled batch (the network cost is the full
-    /// obs metadata regardless). The pandas index column (cell barcodes) is
-    /// always retained, so a projected frame keeps the same index as the
-    /// unprojected `read_obs()`. For enumerating a single categorical column's
-    /// distinct values, prefer `distinct_values()`.
+    /// `columns` is a genuine **pushdown**: each obs shard is fetched as a
+    /// projected range read, so the network cost is the requested columns' bytes
+    /// rather than the whole obs body. (Before this it projected the fully
+    /// assembled batch, which fetched everything regardless.) The pandas index
+    /// column (cell barcodes) is always retained, so a projected frame keeps the
+    /// same index as the unprojected `read_obs()`.
+    ///
+    /// Note the projected path does not populate the assembled-obs cache that
+    /// unprojected `read_obs()` fills and reuses. For a single categorical
+    /// column's distinct values prefer `distinct_values()`; for its codes prefer
+    /// `obs_categorical()`.
     #[pyo3(signature = (columns=None))]
     fn read_obs<'py>(
         &self,
@@ -589,33 +595,25 @@ impl PyCloudExperiment {
         columns: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let batch = py
-            .detach(|| self.rt.block_on(self.reader.read_obs()))
-            .map_err(cloud_to_pyerr)?;
-        let batch = match columns {
-            Some(cols) => {
-                // Retain the pandas index column(s) so the projected frame
-                // keeps its barcode index and pyarrow can restore it (parity
-                // with unprojected read_obs; avoids dropping the index the
-                // pandas envelope still advertises).
-                let schema = batch.schema();
-                let mut names: Vec<String> = Vec::new();
-                for idx_col in scx_format_io::pandas_index_columns(&schema) {
-                    if schema.index_of(&idx_col).is_ok() && !cols.contains(&idx_col) {
-                        names.push(idx_col);
+            .detach(|| match columns {
+                Some(cols) => self.rt.block_on(async {
+                    // Retain the pandas index column(s) so the projected frame
+                    // keeps its barcode index and pyarrow can restore it (parity
+                    // with unprojected read_obs; avoids dropping the index the
+                    // pandas envelope still advertises).
+                    let schema = self.reader.read_obs_schema().await?;
+                    let mut names: Vec<String> = Vec::new();
+                    for idx_col in scx_format_io::pandas_index_columns(&schema) {
+                        if schema.index_of(&idx_col).is_ok() && !cols.contains(&idx_col) {
+                            names.push(idx_col);
+                        }
                     }
-                }
-                names.extend(cols);
-                let indices = names
-                    .iter()
-                    .map(|c| schema.index_of(c))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                batch
-                    .project(&indices)
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?
-            }
-            None => batch,
-        };
+                    names.extend(cols);
+                    self.reader.read_obs_keys(&names).await
+                }),
+                None => self.rt.block_on(self.reader.read_obs()),
+            })
+            .map_err(cloud_to_pyerr)?;
         let table = crate::convert::record_batch_to_pyarrow(py, &batch)?;
         crate::convert::pyarrow_table_to_pandas(&table)
     }
@@ -637,6 +635,39 @@ impl PyCloudExperiment {
                 .block_on(self.reader.distinct_obs_values(col, limit, sort))
         })
         .map_err(cloud_to_pyerr)
+    }
+
+    /// `(codes, categories)` for a single string/categorical `obs` column over
+    /// the cloud path. Mirrors the local `Experiment.obs_categorical` exactly —
+    /// same `-1`-for-null, first-seen-order and unreferenced-level semantics.
+    ///
+    /// Each shard is a projected range read folded immediately, so neither the
+    /// full obs body nor the assembled table is ever fetched.
+    fn obs_categorical<'py>(
+        &self,
+        py: Python<'py>,
+        col: &str,
+    ) -> PyResult<crate::experiment::PyCategorical<'py>> {
+        let (codes, categories) = py
+            .detach(|| self.rt.block_on(self.reader.obs_categorical(col)))
+            .map_err(cloud_to_pyerr)?;
+        Ok((PyArray1::from_vec(py, codes), categories))
+    }
+
+    /// `obs_categorical` for several columns in one pass over the obs shards.
+    /// Mirrors the local `Experiment.obs_categorical_many`.
+    fn obs_categorical_many<'py>(
+        &self,
+        py: Python<'py>,
+        cols: Vec<String>,
+    ) -> PyResult<Vec<crate::experiment::PyCategorical<'py>>> {
+        let out = py
+            .detach(|| self.rt.block_on(self.reader.obs_categorical_many(&cols)))
+            .map_err(cloud_to_pyerr)?;
+        Ok(out
+            .into_iter()
+            .map(|(codes, cats)| (PyArray1::from_vec(py, codes), cats))
+            .collect())
     }
 
     /// Materialise a multimodal file as `mudata.MuData`.

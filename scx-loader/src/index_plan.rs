@@ -141,6 +141,10 @@ pub struct IndexPlanLoader {
     /// construction. Surfaced through `IndexPlanDataset.memory_budget()` for
     /// production sizing.
     budget_breakdown: BudgetBreakdown,
+    /// `Some` iff the auto-tune shrank the shard cache below the requested
+    /// `cache_shards`. Read once by `IndexPlanDataset::new` to emit the
+    /// caller-facing `UserWarning`; see [`crate::budget::assess_cache_sizing`].
+    cache_sizing: Option<crate::budget::CacheSizingVerdict>,
     /// Per-dataset escape hatch for the codec-agnostic row-group block-index
     /// path (default `true`). `set_scatter_block_index` propagates this to the
     /// backed reader, so `False` disables **both** the L2 prefetch skip **and**
@@ -326,11 +330,6 @@ impl IndexPlanLoader {
             obs_bytes.saturating_add(request_bytes)
         };
 
-        let budget_bytes = config
-            .max_memory_mb
-            .saturating_mul(1024)
-            .saturating_mul(1024);
-
         let mut effective_cache_shards = cache_shards;
         let mut effective_lookahead = lookahead;
 
@@ -345,11 +344,37 @@ impl IndexPlanLoader {
             )
         };
 
+        // `auto_memory_budget` (set by the Python binding when the caller passed
+        // no `max_memory_mb`) resolves the budget from the *requested* config's
+        // own need rather than a fixed 512 MB, so a file with large shards is not
+        // silently shrunk to `cache_shards = 1` to fit a default that was never
+        // chosen for it. Same policy and same arithmetic as the sequential path.
+        // `config.max_memory_mb` is rewritten to the resolved value so
+        // `max_memory_mb()` / `memory_budget()` report what is actually in force.
+        if config.auto_memory_budget {
+            config.max_memory_mb = crate::budget::adaptive_budget_mb(
+                breakdown(cache_shards, lookahead).total_bytes,
+                config.max_memory_mb,
+            );
+        }
+        let budget_bytes = config
+            .max_memory_mb
+            .saturating_mul(1024)
+            .saturating_mul(1024);
+
         // Reduce lookahead first (down to 1 — we want the iterator path to
         // remain functional even under tight memory; an explicit
         // `lookahead == 0` is preserved through the loop because the
         // `> 1` guard never decrements it). Then reduce cache_shards down
         // to 1.
+        //
+        // Shrinking `cache_shards` is *reported* (see `cache_sizing` below and
+        // the warning in `python.rs`) rather than silent: against the ~470 MB
+        // Pcodec shards STATE3 hit, the historical hard 512 MB default drove
+        // this loop to `cache_shards = 1` and manufactured the 143 s/batch
+        // thrash regime with no signal to the caller. The loop's *behaviour* is
+        // deliberately unchanged — it may still reach 1 — because refusing
+        // would turn configurations that work today into hard errors.
         while breakdown(effective_cache_shards, effective_lookahead).total_bytes > budget_bytes {
             if effective_lookahead > 1 {
                 effective_lookahead -= 1;
@@ -373,6 +398,25 @@ impl IndexPlanLoader {
             }
         }
         let budget_breakdown = breakdown(effective_cache_shards, effective_lookahead);
+
+        // Construction-time verdict for the caller-facing warning. `None` when
+        // the requested cache survived the auto-tune, which is the common case.
+        // The non-cache term is passed so the suggested `max_memory_mb` covers
+        // the batch buffers and Python overhead too — advice that only sized the
+        // cache would still not fit.
+        let cache_sizing = crate::budget::assess_cache_sizing(
+            cache_shards,
+            effective_cache_shards,
+            shard_decoded_bytes,
+            config.max_memory_mb,
+            budget_breakdown
+                .total_bytes
+                .saturating_sub(budget_breakdown.cache_bytes),
+            // An adaptive budget's reduction is by design; only an explicit
+            // `max_memory_mb` that conflicts with the requested cache is the
+            // caller's problem to resolve.
+            !config.auto_memory_budget,
+        );
 
         // Tighten the LRU's byte cap to match the auto-tune model, so the
         // cache can't overshoot `max_memory_mb` when actual shard sizes
@@ -445,6 +489,7 @@ impl IndexPlanLoader {
             max_plan_size,
             cache_metrics,
             budget_breakdown,
+            cache_sizing,
             // Default on; the Python layer overrides via
             // `set_scatter_block_index` when the caller passes the kwarg.
             scatter_block_index: true,
@@ -567,11 +612,41 @@ impl IndexPlanLoader {
         self.config.max_memory_mb
     }
 
+    /// `Some` iff the memory budget forced the shard cache below the requested
+    /// `cache_shards` at construction. Consumed by the Python constructor to
+    /// warn; `None` is the common case.
+    pub fn cache_sizing(&self) -> Option<crate::budget::CacheSizingVerdict> {
+        self.cache_sizing
+    }
+
+    /// Number of CSR shards in the file — the cap on distinct cache entries.
+    pub fn n_shards(&self) -> usize {
+        self.backed.index().n_shards()
+    }
+
     /// O(log n_shards) lookup of the shard containing `row`. Returns `None`
     /// for rows outside every shard's range (should not happen for valid
     /// `row < n_obs` on a well-formed file).
-    fn shard_of(&self, row: u64) -> Option<usize> {
+    pub fn shard_of(&self, row: u64) -> Option<usize> {
         self.backed.index().shard_for_row(row)
+    }
+
+    /// Number of distinct CSR shards a `(pert, ctrl)` plan touches — i.e. the
+    /// `cache_shards` that would let the whole plan stay resident for the
+    /// duration of one `process_plan` call.
+    ///
+    /// Pure index arithmetic via [`scx_format_io::backed::BackedCsrIndex::shards_for_indices`]
+    /// (which sorts + dedups internally); no I/O and no decode, so it is safe to
+    /// call on a plan before deciding how to size the cache. Deliberately *not*
+    /// routed through the prefetch path, which computes the same set but is
+    /// skipped entirely when `lookahead == 0`.
+    pub fn plan_shard_touch_count(&self, plan: &[(u64, u64)]) -> usize {
+        let mut rows: Vec<u64> = Vec::with_capacity(plan.len() * 2);
+        for &(p, c) in plan {
+            rows.push(p);
+            rows.push(c);
+        }
+        self.backed.index().shards_for_indices(&rows).len()
     }
 
     /// Process a single plan: validate, gather both sides, project, normalize,

@@ -95,7 +95,8 @@ GroupIndex (29)        — Condition/label-grouped sharding sidecar (one per
 - `read_obs_shard(idx)` / `read_var_shard(idx)` — Single metadata shard as Arrow RecordBatch
 - `obs_shards()` / `var_shards()` — Iterator over all metadata shards
 - `read_obs_assembled()` / `read_var_assembled()` — Reassemble all metadata shards into one Arrow RecordBatch (transparent on legacy single-section files)
-- `debug_counts()` — `ReaderDebugCounts` with `AtomicU64` I/O counters (`cfg(debug_assertions)` only)
+- `obs_categorical(col)` / `obs_categorical_many(&[cols])` — `(codes: Vec<i32>, categories: Vec<String>)` for string/categorical obs columns, folded **one shard at a time** into a running global dictionary (never concatenates the column, unlike `read_obs_keys`). Null → `-1` (pandas convention), so a literal `"NaN"` string stays a real category; category order is first-seen. Accepts both `Dictionary(_, Utf8|LargeUtf8)` (as `from_anndata` writes) and plain `Utf8`/`LargeUtf8` (as `append` writes), including a file mixing both across shards. `_many` costs **one** projected read per shard for N columns. See [Obs categorical codes](performance.md#obs-categorical-codes-without-pandas-data-load-phase-1-1c).
+- `debug_counts()` — `ReaderDebugCounts` with `AtomicU64` I/O counters (`cfg(debug_assertions)` only). `read_obs_shard_projected` counts column-scoped shard reads separately from `read_obs_shard`, so a test can assert the cheap path was *taken* rather than only that the materialising ones were avoided.
 - `read_obs_predicate_index_bytes()` / `read_var_predicate_index_bytes()` — Predicate index raw bytes
 - `read_deletion_vectors()` — Roaring Bitmap deletion vectors
 - `read_all_csr_shards_filtered()` — Full matrix with deletion vector filtering

@@ -18,6 +18,7 @@ use scx_sparse::{ScxCsc, ScxCsr};
 use rayon::prelude::*;
 
 use crate::catalog::{FullCatalog, FullCatalogEntry};
+use crate::categorical::GlobalCategoryAccum;
 use crate::checksum::blake3_hash;
 use crate::distinct::DistinctAccumulator;
 use crate::error::{Result, ScxError};
@@ -47,6 +48,16 @@ pub struct ReaderDebugCounts {
     /// materialisation) and that this count stays bounded by the surviving
     /// shards (I/O skip).
     pub read_obs_shard: AtomicU64,
+    /// Per-shard **projected** obs reads (`read_obs_shard_projected`), the
+    /// column-scoped path behind `read_obs_keys`, `distinct_obs_values`, and
+    /// `obs_categorical`.
+    ///
+    /// Counted separately from `read_obs_shard` so a test can assert the
+    /// projected path was *taken*, not merely that the materialising ones were
+    /// avoided: `read_obs == 0` alone is satisfied by every column-scoped path
+    /// and by several that do far more work, so on its own it is close to
+    /// vacuous.
+    pub read_obs_shard_projected: AtomicU64,
     /// Per-shard X (CSR) decodes via `read_shard_from_entry[_verified]`. The
     /// query `materialize` path increments this once per decoded shard; tests
     /// assert it stays bounded by the prefix needed to satisfy `.limit(N)`
@@ -914,6 +925,122 @@ impl ScxReader {
         Ok(acc.finish())
     }
 
+    /// `(codes, categories)` for a single **string/categorical** obs column,
+    /// computed shard-by-shard without assembling the full obs table.
+    ///
+    /// The numpy-level accessor every model's vocabulary/one-hot setup actually
+    /// wants: `codes[i]` is the global category code of obs row `i`, `-1` for
+    /// null (pandas convention), and `categories[code]` is its string value. X is
+    /// never touched.
+    ///
+    /// Unlike [`Self::read_obs_keys`] this never concatenates the column, so peak
+    /// memory is `n_obs × 4 B` plus the vocabulary rather than a full
+    /// materialised Arrow column. Accepts both `Dictionary(_, Utf8|LargeUtf8)`
+    /// (as `from_anndata` writes) and plain `Utf8`/`LargeUtf8` (as `append`
+    /// writes), including a file that carries both across its shards. See
+    /// [`GlobalCategoryAccum`] for the full ordering / null / unreferenced-level
+    /// semantics.
+    ///
+    /// # Physical row space
+    ///
+    /// `codes` is indexed in the **physical** obs row space — `codes.len()`
+    /// equals the header's `n_obs`, *not* the logical post-deletion count. On a
+    /// file with deletion vectors the two differ, and indexing `codes` with a
+    /// logical row id addresses the wrong cell: a correctly *shaped* array of
+    /// wrong rows, which is the worst failure mode available. Callers that work
+    /// in logical space must either filter with
+    /// [`Self::deletion_keep_mask`] first, or refuse such files outright (as
+    /// state3's `_ScxBackend` does). This matches [`Self::read_obs`] /
+    /// [`Self::read_obs_keys`], which are physical for the same reason.
+    ///
+    /// Errors with [`ScxError::UnsupportedColumnType`] for non-string columns and
+    /// [`ScxError::SectionNotFound`] for an unknown column name.
+    pub fn obs_categorical(&self, col: &str) -> Result<(Vec<i32>, Vec<String>)> {
+        Ok(self
+            .obs_categorical_many(std::slice::from_ref(&col.to_string()))?
+            .pop()
+            .expect("one column in ⇒ one column out"))
+    }
+
+    /// [`Self::obs_categorical`] for several columns in **one** shard pass.
+    ///
+    /// N columns cost one projected read per shard rather than N, which is the
+    /// difference that matters at manifest scale: a catalog build resolving four
+    /// covariate columns over 26k files does 26k reads, not 104k. Results are
+    /// returned in `cols` order.
+    pub fn obs_categorical_many(&self, cols: &[String]) -> Result<Vec<(Vec<i32>, Vec<String>)>> {
+        if cols.is_empty() {
+            return Ok(Vec::new());
+        }
+        let physical = self.read_obs_schema_physical()?;
+        let projection: Vec<usize> = cols
+            .iter()
+            .map(|name| {
+                physical
+                    .index_of(name)
+                    .map_err(|_| ScxError::SectionNotFound(format!("obs column '{name}'")))
+            })
+            .collect::<Result<_>>()?;
+
+        let n_obs_hint = self.header.n_obs as usize;
+        let mut accs: Vec<GlobalCategoryAccum> = cols
+            .iter()
+            .map(|c| GlobalCategoryAccum::new(c.clone(), n_obs_hint))
+            .collect();
+
+        if self.obs_metadata_shard_count() > 0 {
+            // Shard order is load-bearing: the accumulators append codes, so an
+            // out-of-order shard would misalign every subsequent code against its
+            // obs row — a correctly *shaped* result with wrong rows.
+            let mut shard_indices: Vec<u32> = self
+                .full_catalog
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.section_type == SectionType::ObsMetadataShard
+                        && e.name.starts_with("obs_metadata/shard_")
+                })
+                .filter_map(|e| e.name.strip_prefix("obs_metadata/shard_")?.parse().ok())
+                .collect();
+            shard_indices.sort_unstable();
+            for idx in shard_indices {
+                let batch = self.read_obs_shard_projected(idx, &projection)?;
+                for (i, acc) in accs.iter_mut().enumerate() {
+                    acc.push(batch.column(i))?;
+                }
+            }
+        } else {
+            let entry = self
+                .full_catalog
+                .get("obs")
+                .ok_or_else(|| ScxError::SectionNotFound("obs".to_string()))?;
+            let slice = self.section_bytes(entry)?;
+            let cursor = Cursor::new(slice);
+            let reader = arrow::ipc::reader::FileReaderBuilder::new()
+                .with_projection(projection)
+                .build(cursor)?;
+            for batch in reader {
+                let batch = batch.map_err(ScxError::Arrow)?;
+                for (i, acc) in accs.iter_mut().enumerate() {
+                    acc.push(batch.column(i))?;
+                }
+            }
+        }
+
+        // A shard-cover gap would silently truncate `codes` and misalign it
+        // against obs — cheap to catch here, expensive to debug downstream.
+        for (acc, col) in accs.iter().zip(cols.iter()) {
+            if acc.n_rows() != n_obs_hint {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "obs_categorical('{col}') folded {} rows but the header \
+                     declares n_obs = {n_obs_hint}; obs shards do not cover the axis",
+                    acc.n_rows()
+                )));
+            }
+        }
+        Ok(accs.into_iter().map(|a| a.finish()).collect())
+    }
+
     /// Read the var (variable/gene) metadata as an Arrow RecordBatch.
     /// Mirror of [`Self::read_obs`] for the var axis — same dual-layout
     /// handling, same memory cost caveat, and same streaming
@@ -986,6 +1113,10 @@ impl ScxReader {
         shard_idx: u32,
         projection: &[usize],
     ) -> Result<RecordBatch> {
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .read_obs_shard_projected
+            .fetch_add(1, Ordering::Relaxed);
         let key = format!("obs_metadata/shard_{shard_idx}");
         let entry = self
             .full_catalog
@@ -2586,7 +2717,7 @@ pub fn decode_arrow_ipc_schema(bytes: &[u8]) -> Result<arrow::datatypes::Schema>
 /// categoricals stored plain — a merge/append artifact — to compact codes);
 /// other columns are deep-copied. The shard's schema metadata (cover stamps
 /// `shard_idx`/`row_start`/…) is preserved for the assembler.
-fn compact_key_shard(batch: &RecordBatch) -> Result<RecordBatch> {
+pub fn compact_key_shard(batch: &RecordBatch) -> Result<RecordBatch> {
     use arrow::array::UInt32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     let schema = batch.schema();

@@ -40,11 +40,22 @@ class IndexPlanBatchIter:
 
     Yields paired batch dicts (`_IndexPlanBatchDict`-shaped) and raises
     `StopIteration` when the plan stream ends.
+
+    While draining, the shard-cache counters are sampled periodically; a
+    `UserWarning` is emitted **once** if they indicate the working set exceeds
+    `cache_shards` (see `IndexPlanDataset.suggested_cache_shards`).
     """
 
     def __iter__(self) -> "IndexPlanBatchIter": ...
     def __next__(self) -> _IndexPlanBatchDict: ...
     def __repr__(self) -> str: ...
+
+    def metrics(self) -> dict[str, dict[str, int]]:
+        """Cache- and prefetch-side counters as
+        ``{"cache": {...}, "prefetch": {...}}``. ``cache`` is
+        loader-cumulative (shared with `IndexPlanDataset.cache_metrics`);
+        ``prefetch`` is per-iter. Safe after exhaustion."""
+        ...
 
 
 class IndexPlanDataset:
@@ -88,12 +99,41 @@ class IndexPlanDataset:
 
     def effective_cache_shards(self) -> int:
         """Resolved `cache_shards` after memory-budget auto-tuning. May be
-        less than the user-requested value."""
+        less than the user-requested value — a reduction emits a
+        `UserWarning` at construction naming the budget that would hold the
+        request."""
         ...
 
     def effective_lookahead(self) -> int:
         """Resolved default lookahead after memory-budget auto-tuning. Used
         by `iter_with_plans` when the caller passes `lookahead=None`."""
+        ...
+
+    def cache_metrics(self) -> dict[str, int]:
+        """Cumulative shard-cache counters since construction: `hits`,
+        `misses`, `evictions`, `bytes_inserted`, `duplicate_waiters`,
+        `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups`."""
+        ...
+
+    def memory_budget(self) -> dict[str, int]:
+        """Per-component budget breakdown from the construction auto-tune,
+        plus `max_memory_mb` (the resolved value in force — adaptive when the
+        constructor was passed none), `effective_cache_shards`, and
+        `effective_lookahead`."""
+        ...
+
+    def suggested_cache_shards(self, plan: list[tuple[int, int]]) -> int:
+        """Distinct CSR shards `plan` touches — the `cache_shards` that would
+        let the whole plan stay resident for one gather.
+
+        Pure index arithmetic from the catalog's shard row ranges: no I/O, no
+        decode. Size the cache from the plans you will issue instead of
+        guessing::
+
+            probe = pyscx.IndexPlanDataset(path)
+            need = max(probe.suggested_cache_shards(p) for p in plans[:64])
+            ds = pyscx.IndexPlanDataset(path, cache_shards=need)
+        """
         ...
 
     def iter_with_plans(
@@ -137,11 +177,20 @@ class SparseCellSetBatchIter:
 
     Yields sparse batch dicts (`_SparseCellSetBatchDict`-shaped) and raises
     `StopIteration` when the plan stream ends.
+
+    While draining, the shard-cache counters are sampled periodically; a
+    `UserWarning` is emitted **once** if they indicate the working set exceeds
+    `cache_shards` (see `SparseCellSetDataset.suggested_cache_shards`).
     """
 
     def __iter__(self) -> "SparseCellSetBatchIter": ...
     def __next__(self) -> _SparseCellSetBatchDict: ...
     def __repr__(self) -> str: ...
+
+    def cache_metrics(self) -> dict[str, int]:
+        """Shared shard-cache counters — same keys as
+        `SparseCellSetDataset.cache_metrics`. Safe after exhaustion."""
+        ...
 
 
 class SparseCellSetDataset:
@@ -205,6 +254,30 @@ class SparseCellSetDataset:
         evictions, bytes, peak) — the multi-file sibling of
         `IndexPlanDataset.cache_metrics`. For runtime hit/miss/eviction
         observability."""
+        ...
+
+    def memory_budget(self) -> dict[str, int]:
+        """Resolved shard-cache budget: `max_memory_mb` (the value in force —
+        adaptive when the constructor was passed none), `cache_shards`,
+        `affordable_cache_shards`, `shard_decoded_bytes`.
+
+        Unlike `IndexPlanDataset.memory_budget` there is no batch-buffer term:
+        on the sparse path the shard cache *is* the budget."""
+        ...
+
+    def suggested_cache_shards(
+        self, file_ids: Sequence[int], rows: Sequence[int]
+    ) -> int:
+        """Distinct ``(file_id, shard)`` pairs a plan touches — the
+        `cache_shards` that would let the whole batch stay resident.
+
+        `file_ids` and `rows` are the first two elements of the plan tuple
+        `iter_with_plans` consumes. Pure index arithmetic: no I/O, no decode::
+
+            probe = pyscx.SparseCellSetDataset(paths)
+            need = max(probe.suggested_cache_shards(f, r) for f, r, _, _ in plans[:64])
+            ds = pyscx.SparseCellSetDataset(paths, cache_shards=need)
+        """
         ...
 
     def __repr__(self) -> str: ...
@@ -363,6 +436,33 @@ class Experiment:
     ) -> tuple[list[str], bool]:
         """Distinct values of a string/categorical obs column as
         `(values, has_more)`. Never decodes X."""
+        ...
+
+    def obs_categorical(self, col: str) -> tuple[np.ndarray, list[str]]:
+        """`(codes, categories)` for a string/categorical obs column.
+
+        `codes` is `int32`, one entry per obs row, `-1` for missing
+        (`pandas.Categorical.codes` convention); `categories[code]` is the
+        string value. Computed shard-by-shard and returned as numpy directly —
+        no Arrow-IPC round-trip, no pandas frame, X never touched.
+
+        Category order is **first-seen**, not lexicographic. Unreferenced
+        dictionary levels are retained (as pandas retains unused levels).
+        Raises `ValueError` for non-string columns.
+
+        Physical row space: `len(codes) == n_obs_physical`, not `n_obs`. On a
+        file with deletion vectors those differ and indexing by a logical row id
+        addresses the wrong cell (`read_obs` has the same contract).
+        """
+        ...
+
+    def obs_categorical_many(
+        self, cols: list[str]
+    ) -> list[tuple[np.ndarray, list[str]]]:
+        """`obs_categorical` for several columns in one shard pass.
+
+        Returns `(codes, categories)` per column in `cols` order. N columns
+        cost one projected read per obs shard instead of N."""
         ...
 
     def info(self) -> str:
@@ -615,6 +715,36 @@ class CloudExperiment:
     # the schema; the result is cached on this handle.
     def obs_keys(self) -> list[str]: ...
     def var_keys(self) -> list[str]: ...
+
+    def read_obs(self, columns: list[str] | None = ...) -> Any:
+        """Read obs as a pandas DataFrame over the cloud path.
+
+        `columns` is a genuine pushdown: each obs shard is fetched as a
+        projected range read, so the network cost is the requested columns'
+        bytes rather than the whole obs body. The pandas index column is always
+        retained. `columns=None` fetches and caches the full assembled table."""
+        ...
+
+    def distinct_values(
+        self, col: str, *, limit: int | None = ..., sort: bool = ...
+    ) -> tuple[list[str], bool]:
+        """Distinct values of a string/categorical obs column as
+        `(values, has_more)`. Mirrors `Experiment.distinct_values`."""
+        ...
+
+    def obs_categorical(self, col: str) -> tuple[np.ndarray, list[str]]:
+        """`(codes, categories)` over the cloud path. Mirrors
+        `Experiment.obs_categorical` — same `-1`-for-null, first-seen-order and
+        unreferenced-level semantics. Never fetches the full obs body."""
+        ...
+
+    def obs_categorical_many(
+        self, cols: list[str]
+    ) -> list[tuple[np.ndarray, list[str]]]:
+        """`obs_categorical` for several columns in one pass over the obs
+        shards. Mirrors `Experiment.obs_categorical_many`."""
+        ...
+
     def query(self, modality: str | None = None) -> Any:
         """Start a lazy cloud query pipeline.
 

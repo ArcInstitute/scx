@@ -39,9 +39,11 @@ pub enum ScxError {
     #[error("section not found: {0}")]
     SectionNotFound(String),
 
+    // Shared by `distinct_values` and `obs_categorical` — both require a
+    // string/categorical column — so the message names neither.
     #[error(
-        "distinct_values: column '{column}' has unsupported type {dtype}; only \
-         string/categorical columns (Utf8, LargeUtf8, Dictionary) are supported"
+        "column '{column}' has unsupported type {dtype}; only string/categorical \
+         columns (Utf8, LargeUtf8, Dictionary) are supported"
     )]
     UnsupportedColumnType { column: String, dtype: String },
 
