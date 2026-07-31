@@ -384,9 +384,8 @@ impl CloudReader {
     /// Each shard is fetched as a **projected** range read and folded
     /// immediately, so the network cost is the requested columns' bytes rather
     /// than the whole obs body — unlike [`Self::read_obs`], which assembles
-    /// everything (and whose `columns=` projection is presentational only).
-    /// Shards are read sequentially in index order because the fold is
-    /// order-dependent: the codes buffer is append-only.
+    /// everything. Shards are read sequentially in index order because the fold
+    /// is order-dependent: the codes buffer is append-only.
     pub async fn obs_categorical_many(
         &self,
         cols: &[String],
@@ -460,9 +459,9 @@ impl CloudReader {
     ///
     /// This is the cloud parity for `ScxReader::read_obs_keys`: the network cost
     /// is the requested columns' bytes per shard, not the whole obs body.
-    /// [`Self::read_obs`]`(columns=…)` on the pyo3 surface projects *after*
-    /// assembling, so it cannot avoid fetching everything (and caches the result);
-    /// this does not populate that cache.
+    /// `CloudExperiment.read_obs(columns=…)` routes here, so that surface is a
+    /// genuine pushdown too. Note this path does **not** populate the
+    /// assembled-obs cache that unprojected [`Self::read_obs`] fills and reuses.
     pub async fn read_obs_keys(&self, cols: &[String]) -> Result<RecordBatch> {
         let schema = self.read_obs_schema().await?;
         let mut projection = Vec::with_capacity(cols.len());

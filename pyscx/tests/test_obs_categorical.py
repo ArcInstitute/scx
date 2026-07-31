@@ -239,6 +239,12 @@ def test_obs_categorical_is_physical_row_space(tmp_dir):
     A consumer that indexes codes by a logical row id gets a correctly shaped
     array of wrong rows, which is the worst failure mode available, so the
     contract is pinned here rather than only documented.
+
+    Why it matters concretely: state3's `_ScxBackend` refuses files with deletion
+    vectors for exactly this reason — its catalog addresses cells by
+    `(file_idx, cell_idx)`, so physical-space columns against a logical `n_cells`
+    would make every index point at the wrong cell. Anything building a global
+    vocabulary from these codes needs the same guard.
     """
     cell_types = ["A", "B", "C", "D"]
     path = _write_sharded(tmp_dir / "del.scx", cell_types, shard_size=2)

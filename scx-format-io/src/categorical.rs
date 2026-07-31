@@ -40,6 +40,17 @@
 //!   folds them into one vocabulary without the
 //!   `reconcile_dictionary_representations` cast the assembling path needs.
 //!
+//! ## Cardinality is unbounded, by necessity
+//!
+//! The running vocabulary has no cap. Unlike [`crate::distinct`] — whose `limit`
+//! exists because enumerating *some* values is still a useful answer — a partial
+//! code mapping is not: every row needs a code, so truncating the vocabulary would
+//! silently mis-code rows. A pathological column (free text, or an accidentally
+//! non-categorical barcode) therefore costs O(distinct) memory here, the same
+//! exposure `read_obs` already has for that column. Callers that cannot trust a
+//! column's cardinality should probe it first with
+//! [`crate::reader::ScxReader::distinct_obs_values`], which *can* stop early.
+//!
 //! The interning strategy is lifted from `scx-convert`'s streaming h5ad
 //! categorical writer (`h5ad/write.rs`'s `CatAccum` / `local_categorical_view`),
 //! which solves the same problem on the write side. It is duplicated rather than

@@ -117,6 +117,27 @@ class TestBudgetReconciliation:
             "the adaptive budget must honour the requested cache on a small file"
         )
 
+    def test_memory_budget_reports_the_binding_constraint(self, multishard_path):
+        """`affordable_cache_shards` must reflect the BYTE cap when it binds.
+
+        Round-1 review (Cursor, P2): diagnostics on the sparse path were phrased
+        against the requested `cache_shards` while the byte budget is what caps
+        residency. On the regime this loader targets (~470 MB shards, adaptive
+        4 GB) the byte cap binds long before the count does, so naming
+        `cache_shards` sends the caller to raise a knob that cannot help.
+        """
+        ds = pyscx.SparseCellSetDataset(
+            [multishard_path], cache_shards=4096, max_memory_mb=1
+        )
+        b = ds.memory_budget()
+        assert b["cache_shards"] == 4096, "the request is reported unchanged"
+        assert b["affordable_cache_shards"] < 4096, (
+            "a 1 MB budget cannot afford 4096 shards"
+        )
+        # And it must be derived from the byte budget, not invented.
+        expected = min(4096, (1 * 1024 * 1024) // b["shard_decoded_bytes"])
+        assert b["affordable_cache_shards"] == expected
+
     def test_explicit_budget_is_respected(self, multishard_path):
         ds = pyscx.SparseCellSetDataset([multishard_path], max_memory_mb=64)
         assert ds.memory_budget()["max_memory_mb"] == 64
@@ -278,6 +299,45 @@ class TestThrashWarning:
             f"suggestion {suggested} must be actionable and <= the file's "
             f"{n_shards} shards"
         )
+
+    def test_message_names_the_byte_bound_count_not_the_request(
+        self, multishard_path
+    ):
+        """When the byte cap binds, the warning must quote the affordable count.
+
+        Round-1 review (Cursor, P2). A high `cache_shards` with a tight
+        `max_memory_mb` must not produce "exceeds cache_shards=4096" — that is the
+        knob the caller already set high, and raising it further cannot help.
+        """
+        ds = pyscx.SparseCellSetDataset(
+            [multishard_path], cache_shards=4096, max_memory_mb=1
+        )
+        affordable = ds.memory_budget()["affordable_cache_shards"]
+        assert affordable < 4096, "premise: this config must be byte-bound"
+
+        plans = [
+            (
+                np.zeros(40, dtype=np.uint32),
+                np.asarray(r, dtype=np.uint64),
+                np.zeros(40, dtype=np.int32),
+                np.array([0, 40], dtype=np.int64),
+            )
+            for r in [
+                np.random.default_rng(i).choice(200, size=40, replace=False)
+                for i in range(32)
+            ]
+        ]
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            for _ in ds.iter_with_plans(iter(plans)):
+                pass
+        msgs = [str(w.message) for w in rec if "shard-cache thrash" in str(w.message)]
+        if msgs:
+            assert f"cache_shards={affordable}" in msgs[0], (
+                f"must quote the affordable count {affordable}, not the "
+                f"request 4096: {msgs[0]}"
+            )
+            assert "cache_shards=4096" not in msgs[0]
 
     def test_short_run_below_the_warmup_floor_is_silent(self, multishard_path):
         """A cold cache is not thrash, and a few batches are not evidence."""

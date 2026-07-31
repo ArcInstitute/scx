@@ -2195,9 +2195,22 @@ covariate columns across a 26k-file manifest costs 26k projected reads rather th
 | tabula_sapiens_100k | 1 file | 0.0576 | **0.0242** | **2.38×** | 0.1995 | 0.1972 |
 | tabula_sapiens_100k | 256-file manifest | 0.00666 | **0.00576** | 1.16× | 0.1117 | 0.1128 |
 
-**1.8–2.4× at single-file scale**, and cross-format `obs_categorical` is **8.2×** h5ad's
-`.cat.codes` at tabula_sapiens_100k (0.0242 vs 0.1972) and 2.2× at census_500k. Two honest
-qualifications:
+**Multi-column, cold** — the shape state3's `_setup_global_maps` actually issues, and the
+measurement that validates the "one shard pass for N columns" claim rather than asserting it.
+4 columns, `obs_categorical_many` against N separate `obs_categorical` calls:
+
+| dataset | 4 × separate | `obs_categorical_many` | speedup |
+|---|---|---|---|
+| census_500k | 0.658 s | **0.245 s** | **2.69×** |
+| tabula_sapiens_100k | 0.015 s | **0.005 s** | 3.16× |
+
+Sub-linear in the column count, as intended: the per-shard projected read is paid once, not
+per column. (tabula's absolute numbers are small enough to be near the noise floor on a
+100k-cell file; census_500k is the solid figure.)
+
+**1.8–2.4× at single-file scale** for one column, and cross-format `obs_categorical` is
+**8.2×** h5ad's `.cat.codes` at tabula_sapiens_100k (0.0242 vs 0.1972) and 2.2× at
+census_500k. Two honest qualifications:
 
 - **The h5ad column shows ~1.0× because pandas is pandas.** Taking `.cat.codes` off an
   already-materialised `adata.obs` costs nothing extra — the expense was materialising it. The

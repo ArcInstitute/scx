@@ -173,8 +173,9 @@ Two things to know:
   gather routes through the row-group block-index path, which decodes only the
   touched row-groups and never populates the whole-shard LRU — so `cache_shards`
   is not on the critical path at all. It becomes load-bearing on unframed/legacy
-  layouts and when you pass `scatter_block_index=False`, where an undersized
-  cache is worth **269×** (measured; see
+  layouts and when you pass `scatter_block_index=False`, where sizing the cache
+  correctly is worth **2,486×** and halves peak RSS (cold capture; an earlier warm
+  probe of the same comparison gave 269× — see
   [performance.md § Shard-cache sizing](performance.md#shard-cache-sizing-on-the-gather-path-data-load-phase-1-1a)).
 
 Both gather loaders sample their cache counters while iterating and emit a

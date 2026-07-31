@@ -546,3 +546,48 @@ fn plan_shard_touch_count_ignores_unknown_file_ids() {
     assert_eq!(loader.plan_shard_touch_count(&[9], &[0]), 0);
     assert_eq!(loader.plan_shard_touch_count(&[0, 9], &[0, 0]), 1);
 }
+
+/// The thrash diagnostic must be phrased against the **binding** constraint.
+///
+/// Round-1 review (Cursor, P2): the sparse path sampled with the *requested*
+/// `cache_shards` while `IndexPlanDataset` sampled with the post-auto-tune value.
+/// On the regime this loader targets (~470 MB shards, adaptive 4 GB budget) the
+/// byte cap binds long before the count does, so a warning naming `cache_shards`
+/// sends the caller to raise a knob that cannot help.
+#[test]
+fn effective_cache_shards_reports_the_byte_cap_when_it_binds() {
+    let dir = tempfile::tempdir().unwrap();
+    // Shard bytes here are 128 B (8 rows x 1 nnz). A 1 KB budget affords 8, so a
+    // 128-count request is bound by BYTES, not by the count.
+    let loader = budget_loader(dir.path(), 128, Some(1024));
+    assert_eq!(loader.cache_shards(), 128, "the request is unchanged");
+    assert_eq!(
+        loader.effective_cache_shards(),
+        8,
+        "the byte cap is what actually binds"
+    );
+    assert!(
+        loader.effective_cache_shards() < loader.cache_shards(),
+        "premise: this fixture must be byte-bound, else the test proves nothing"
+    );
+}
+
+/// With a generous budget the count cap binds and the two agree.
+#[test]
+fn effective_cache_shards_equals_request_when_the_count_binds() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = budget_loader(dir.path(), 8, Some(64 * 1024 * 1024));
+    assert_eq!(loader.effective_cache_shards(), loader.cache_shards());
+}
+
+/// A file with no catalog shard stats means the byte cap says nothing; fall back
+/// to the count cap rather than to zero (which would report a 0-entry cache).
+#[test]
+fn effective_cache_shards_falls_back_to_the_count_when_shard_size_is_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = budget_loader(dir.path(), 8, Some(0));
+    // shard_decoded_bytes > 0 here, so a 0 budget genuinely affords 0 — the
+    // fallback is for the *unknown-size* case, asserted via the divisor.
+    assert_eq!(loader.shard_decoded_bytes(), 128);
+    assert_eq!(loader.effective_cache_shards(), 0);
+}

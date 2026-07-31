@@ -96,6 +96,11 @@ pub struct SparseCellSetLoader {
     cache_bytes_budget: usize,
     /// Requested shard-cache count cap.
     cache_shards: usize,
+    /// `min(cache_shards, budget / avg_shard)` — the count that is actually
+    /// resident-capable, i.e. **the binding constraint**. `cache_shards` alone is
+    /// misleading on a large-shard file where the byte budget binds first, which
+    /// is exactly the STATE3 regime this loader targets.
+    affordable_cache_shards: usize,
     /// Average decoded bytes per CSR shard across every file, the unit the
     /// budget model counts in.
     shard_decoded_bytes: usize,
@@ -192,16 +197,18 @@ impl SparseCellSetLoader {
                 .saturating_mul(1024 * 1024)
             }
         };
-        // This cache is the loader's whole budget — there is no batch buffer or
-        // plan-tuple term on the sparse path — so the non-cache term is 0.
-        let affordable_shards = if shard_decoded_bytes == 0 {
-            cache_shards
-        } else {
-            (cache_bytes_budget / shard_decoded_bytes).min(cache_shards)
-        };
+        // Shards the byte budget can actually hold at average size. This cache is
+        // the loader's whole budget — there is no batch buffer or plan-tuple term
+        // on the sparse path — so the non-cache term is 0. `checked_div` rather
+        // than a guarded `/`: an unknown-shard-size file (no catalog stats) means
+        // "the byte cap tells us nothing", which is the count cap, not zero.
+        let affordable_cache_shards = cache_bytes_budget
+            .checked_div(shard_decoded_bytes)
+            .map(|n| n.min(cache_shards))
+            .unwrap_or(cache_shards);
         let cache_sizing = crate::budget::assess_cache_sizing(
             cache_shards,
-            affordable_shards,
+            affordable_cache_shards,
             shard_decoded_bytes,
             cache_bytes_budget / (1024 * 1024),
             0,
@@ -223,6 +230,7 @@ impl SparseCellSetLoader {
             n_cols,
             cache_bytes_budget,
             cache_shards,
+            affordable_cache_shards,
             shard_decoded_bytes,
             cache_sizing,
         }))
@@ -234,9 +242,23 @@ impl SparseCellSetLoader {
         self.cache_bytes_budget
     }
 
-    /// Requested shard-cache count cap.
+    /// Requested shard-cache count cap. See [`Self::effective_cache_shards`] for
+    /// the value that actually binds.
     pub fn cache_shards(&self) -> usize {
         self.cache_shards
+    }
+
+    /// Shard-cache entries actually affordable: `min(cache_shards, budget /
+    /// avg_shard_bytes)`.
+    ///
+    /// The count cap and the byte cap are enforced independently, and on a
+    /// large-shard file the **byte** cap binds first — a 4 GB budget over ~470 MB
+    /// shards holds ~8 entries however high `cache_shards` is set. Diagnostics
+    /// must be phrased against this, not against the request, or they name a knob
+    /// that cannot fix the problem (`IndexPlanLoader::effective_cache_shards` is
+    /// the same idea on the paired path).
+    pub fn effective_cache_shards(&self) -> usize {
+        self.affordable_cache_shards
     }
 
     /// Average decoded bytes per CSR shard across all files.

@@ -165,6 +165,74 @@ def _read_codes_scx(path: str) -> int:
     return int(exp.n_obs_physical)
 
 
+def _read_codes_many_scx(path: str) -> int:
+    """Read up to 4 categorical columns in ONE shard pass via
+    ``obs_categorical_many`` — the claim that N columns cost one projected read per
+    shard rather than N.
+
+    This is the shape state3's ``_setup_global_maps`` actually issues (it builds a
+    global vocabulary per covariate column), so it is the more representative
+    number than the single-column arm.
+    """
+    import pyscx
+
+    exp = pyscx.open(path)
+    # Probe types with `distinct_values(col, limit=1)`, NOT with a full
+    # `obs_categorical(col)`: the latter reads the whole column, so the probe
+    # would do the work this scenario is trying to measure and then do it again
+    # via `_many` — measuring 2x the intended cost. `distinct_values` scans the
+    # per-shard dictionary catalog and raises on non-string columns, which is
+    # exactly a cheap type probe.
+    cols: list[str] = []
+    for col in exp.obs_keys():
+        try:
+            exp.distinct_values(col, limit=1)
+        except (ValueError, TypeError):
+            continue
+        cols.append(col)
+        if len(cols) == 4:
+            break
+    if not cols:
+        return int(exp.n_obs_physical)
+    out = pyscx.open(path).obs_categorical_many(cols)
+    return int(len(out[0][0]))
+
+
+def _read_codes_many_h5ad(path: str) -> int:
+    """anndata analogue: materialize up to 4 obs columns and take their codes."""
+    import anndata
+    import pandas as pd
+
+    adata = anndata.read_h5ad(path, backed="r")
+    try:
+        n = 0
+        for col in list(adata.obs.columns):
+            series = adata.obs[col]
+            if isinstance(series.dtype, pd.CategoricalDtype):
+                cat = series
+            elif series.dtype == object:
+                cat = series.astype("category")
+            else:
+                continue
+            _ = cat.cat.codes.to_numpy()
+            _ = list(cat.cat.categories)
+            n += 1
+            if n == 4:
+                break
+        return int(adata.n_obs)
+    finally:
+        if getattr(adata, "isbacked", False) and adata.file is not None:
+            adata.file.close()
+
+
+def _codes_many_fn_for(format_key: str) -> Callable[[str], int]:
+    if format_key == "scx_auto":
+        return _read_codes_many_scx
+    if format_key == "h5ad_none":
+        return _read_codes_many_h5ad
+    raise ValueError(f"obs_open unsupported format {format_key!r}")
+
+
 def _read_codes_h5ad(path: str) -> int:
     """anndata analogue of ``_read_codes_scx``: materialize one obs column and take
     its ``.cat.codes`` — what a consumer building a global vocab actually does."""
@@ -439,6 +507,7 @@ def run(
     # `obs_open_s_per_file__open_1file`; renaming turns them into "missing
     # metric" violations rather than a regression signal.
     codes_fn = _codes_fn_for(format_variant.key)
+    codes_many_fn = _codes_many_fn_for(format_variant.key)
 
     scenarios: list[tuple[str, list[str], Callable[[str], int]]] = [
         ("open_1file", [single], read_fn),
@@ -448,6 +517,10 @@ def run(
         # the I/O. Both formats, so the comparison is against what a consumer
         # does today (`obs[col].cat.codes`), not only against our own old path.
         ("obs_codes_1file", [single], codes_fn),
+        # Opus 4.6 review: the multi-column case is the compelling one for
+        # state3's `_setup_global_maps`, and it is what validates the "one shard
+        # pass for N columns" claim rather than merely asserting it.
+        ("obs_codes_many_1file", [single], codes_many_fn),
     ]
     if format_variant.key == "scx_auto":
         # No h5ad analogue: anndata has no "skip the integrity check" open.

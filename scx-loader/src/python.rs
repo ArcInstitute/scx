@@ -2043,7 +2043,11 @@ impl SparseCellSetDataset {
             cache_metrics: self.loader.cache_metrics(),
             thrash: ThrashSampler::new(
                 "SparseCellSetDataset",
-                self.loader.cache_shards(),
+                // The *affordable* count, not the requested one: on a large-shard
+                // file the byte budget binds first, and a warning that says
+                // "exceeds cache_shards=128" while the budget only holds 8 sends
+                // the caller to raise a knob that cannot help.
+                self.loader.effective_cache_shards(),
                 self.loader.total_shards(),
             ),
         })
@@ -2101,11 +2105,7 @@ impl SparseCellSetDataset {
         dict.set_item("cache_shards", self.loader.cache_shards())?;
         dict.set_item(
             "affordable_cache_shards",
-            if per_shard == 0 {
-                self.loader.cache_shards()
-            } else {
-                (budget / per_shard).min(self.loader.cache_shards())
-            },
+            self.loader.effective_cache_shards(),
         )?;
         dict.set_item("shard_decoded_bytes", per_shard)?;
         Ok(dict)

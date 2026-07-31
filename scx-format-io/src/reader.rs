@@ -966,8 +966,13 @@ impl ScxReader {
     ///
     /// N columns cost one projected read per shard rather than N, which is the
     /// difference that matters at manifest scale: a catalog build resolving four
-    /// covariate columns over 26k files does 26k reads, not 104k. Results are
-    /// returned in `cols` order.
+    /// covariate columns over 26k files does 26k reads, not 104k.
+    ///
+    /// **Result order is guaranteed to match `cols` positionally** — `out[i]`
+    /// is always `cols[i]`, independent of the columns' on-disk schema order.
+    /// Callers index the result by position, so this is contractual, not
+    /// incidental; pinned by
+    /// `test_obs_categorical_many_preserves_request_order_on_legacy_obs`.
     pub fn obs_categorical_many(&self, cols: &[String]) -> Result<Vec<(Vec<i32>, Vec<String>)>> {
         if cols.is_empty() {
             return Ok(Vec::new());
