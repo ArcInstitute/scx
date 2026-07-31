@@ -716,6 +716,167 @@ fn budget_below_floor_refuses_construction() {
     }
 }
 
+/// A cache reduction must be *reported*, not silent. This is the signal whose
+/// absence made STATE3's 143 s/batch a bisection exercise.
+#[test]
+fn budget_shrink_records_a_cache_sizing_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_dense_fixture(&dir.path().join("f.scx"), 1024, 4096, 8, 2048);
+    let mut config = LoaderConfig::default();
+    config.max_memory_mb = 96;
+    let loader = IndexPlanLoader::new(
+        &path, config, /*cache_shards*/ 16, /*sort_by_shard*/ true, /*lookahead*/ 4,
+        /*max_plan_size*/ 1024,
+    )
+    .unwrap();
+
+    let v = loader
+        .cache_sizing()
+        .expect("a cache_shards reduction must produce a verdict");
+    assert_eq!(v.requested_cache_shards, 16);
+    assert_eq!(v.effective_cache_shards, loader.effective_cache_shards());
+    assert!(v.effective_cache_shards < 16);
+    assert_eq!(v.budget_mb, 96);
+    // The suggested budget must actually hold the request — including the
+    // non-cache terms, or following the advice still would not fit.
+    assert!(
+        v.budget_mb_for_requested > 96,
+        "suggested budget {} must exceed the one that failed",
+        v.budget_mb_for_requested
+    );
+}
+
+/// The anti-tautology partner: a generous budget must stay silent. Without this
+/// a verdict that always fired would pass the test above.
+#[test]
+fn budget_generous_records_no_cache_sizing_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
+    let mut config = LoaderConfig::default();
+    config.max_memory_mb = 4096;
+    let loader = IndexPlanLoader::new(
+        &path, config, /*cache_shards*/ 8, /*sort_by_shard*/ true, /*lookahead*/ 4,
+        /*max_plan_size*/ 1024,
+    )
+    .unwrap();
+    assert!(
+        loader.cache_sizing().is_none(),
+        "the requested cache survived; there is nothing to warn about"
+    );
+}
+
+/// `auto_memory_budget` must prevent the shrink that the fixed 512 MB default
+/// causes on the same file — the defect that manufactured the thrash regime.
+#[test]
+fn auto_memory_budget_preserves_the_requested_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    // Keep the fixture cheap and make the *cache* the deciding term by
+    // requesting many shards rather than writing enormous ones: 64 rows/shard ×
+    // 512 nnz/row ⇒ shard_decoded ≈ 257 KB, so 2048 cache shards ≈ 538 MB while
+    // the batch buffer is only 2 × 1024 × 512 × 4 = 4 MB. Total ≈ 592 MB, which
+    // straddles the historical 512 MB default — the shape of STATE3's file,
+    // where the cache, not the batch buffer, was what did not fit.
+    let path = write_dense_fixture(&dir.path().join("f.scx"), 256, 512, 4, 512);
+    const CACHE_SHARDS: usize = 2048;
+    const MAX_PLAN: usize = 1024;
+
+    // Arm A: the historical hard default.
+    let mut fixed = LoaderConfig::default();
+    fixed.max_memory_mb = 512;
+    let fixed_loader = IndexPlanLoader::new(&path, fixed, CACHE_SHARDS, true, 4, MAX_PLAN).unwrap();
+
+    // Arm B: same file, same request, adaptive budget.
+    let mut auto = LoaderConfig::default();
+    auto.max_memory_mb = 512; // now the *floor*, not the ceiling
+    auto.auto_memory_budget = true;
+    let auto_loader = IndexPlanLoader::new(&path, auto, CACHE_SHARDS, true, 4, MAX_PLAN).unwrap();
+
+    assert!(
+        fixed_loader.effective_cache_shards() < CACHE_SHARDS,
+        "premise: the fixed 512 MB default must shrink this file's cache \
+         (got {}) — otherwise this test proves nothing",
+        fixed_loader.effective_cache_shards()
+    );
+    assert_eq!(
+        auto_loader.effective_cache_shards(),
+        CACHE_SHARDS,
+        "the adaptive budget must honour the requested cache"
+    );
+    assert!(auto_loader.cache_sizing().is_none());
+    assert!(
+        auto_loader.max_memory_mb() > 512,
+        "the resolved budget must be reported, not the floor: got {}",
+        auto_loader.max_memory_mb()
+    );
+}
+
+/// The adaptive budget is clamped, not unbounded: a request the cap cannot hold
+/// still gets tuned down — but *silently*, because the cap is the point.
+#[test]
+fn auto_memory_budget_is_capped_not_unbounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_dense_fixture(&dir.path().join("f.scx"), 256, 512, 4, 512);
+    let mut config = LoaderConfig::default();
+    config.auto_memory_budget = true;
+    // 65536 × ~257 KB ≈ 17 GB, far past ADAPTIVE_BUDGET_CAP_MB.
+    let loader = IndexPlanLoader::new(&path, config, 65536, true, 4, 1024).unwrap();
+    assert_eq!(
+        loader.max_memory_mb(),
+        crate::pipeline::ADAPTIVE_BUDGET_CAP_MB,
+        "adaptive budget must clamp to the cap"
+    );
+    assert!(
+        loader.effective_cache_shards() < 65536,
+        "the cap must still tune the cache down"
+    );
+    // Deliberately silent: the reduction is the cap doing its job, and the
+    // surviving cache is far above MIN_CACHE_SHARDS. Warning here would fire on
+    // healthy default configurations — a real preflight on 194 MB shards showed
+    // exactly that (128 → 21 affordable, 0.7 GB observed RSS).
+    assert!(
+        loader.cache_sizing().is_none(),
+        "an adaptive cap's reduction must not warn while above the floor; got {:?}",
+        loader.cache_sizing()
+    );
+}
+
+// The remaining branch — an *adaptive* budget landing below MIN_CACHE_SHARDS —
+// is covered at the predicate level by
+// `budget::tests::sizing_reports_below_floor_even_under_an_adaptive_budget`, not
+// here: reaching it through a real file needs an average shard above
+// `ADAPTIVE_BUDGET_CAP_MB / MIN_CACHE_SHARDS` = 512 MB, which is impractical as a
+// unit fixture (and rare in the wild). The reachable below-floor path is an
+// explicit tiny budget, covered by
+// `sparse_cellset_tests::very_tight_budget_flags_below_floor`.
+
+/// `plan_shard_touch_count` must count distinct shards with no I/O, and must
+/// dedup both within and across the pert/ctrl sides of the plan.
+#[test]
+fn plan_shard_touch_count_counts_distinct_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    // 32 rows over 4 shards ⇒ 8 rows per shard: shard 0 = rows 0..8, etc.
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
+    let loader = open_loader(&path, /*sort_by_shard*/ true);
+
+    // Both rows in shard 0.
+    assert_eq!(loader.plan_shard_touch_count(&[(0, 7)]), 1);
+    // Rows in shards 0 and 3.
+    assert_eq!(loader.plan_shard_touch_count(&[(0, 31)]), 2);
+    // Duplicates across pairs collapse to the same two shards.
+    assert_eq!(
+        loader.plan_shard_touch_count(&[(0, 31), (1, 30), (2, 29)]),
+        2
+    );
+    // One row per shard ⇒ every shard.
+    assert_eq!(
+        loader.plan_shard_touch_count(&[(0, 8), (16, 24)]),
+        4,
+        "a plan spanning all four shards must report 4"
+    );
+    // Empty plan touches nothing.
+    assert_eq!(loader.plan_shard_touch_count(&[]), 0);
+}
+
 /// Caller explicitly chooses lookahead=0 — honored when it fits the
 /// budget (no prefetch path activated).
 #[test]

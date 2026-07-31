@@ -91,17 +91,75 @@ pub struct SparseCellSetLoader {
     /// (remapped). Raw-local indices are file-local — consumers disambiguate via
     /// `file_ids`; `n_cols` is a nominal upper bound.
     n_cols: usize,
+    /// Resolved cache byte budget (bytes) actually handed to the shared cache.
+    /// Reported through `SparseCellSetDataset.memory_budget()`.
+    cache_bytes_budget: usize,
+    /// Requested shard-cache count cap.
+    cache_shards: usize,
+    /// `min(cache_shards, budget / avg_shard)` — the count that is actually
+    /// resident-capable, i.e. **the binding constraint**. `cache_shards` alone is
+    /// misleading on a large-shard file where the byte budget binds first, which
+    /// is exactly the STATE3 regime this loader targets.
+    affordable_cache_shards: usize,
+    /// Average decoded bytes per CSR shard across every file, the unit the
+    /// budget model counts in.
+    shard_decoded_bytes: usize,
+    /// `Some` iff `cache_bytes_budget` cannot hold `cache_shards` average
+    /// shards. Consumed by the Python constructor to warn; see
+    /// [`crate::budget::assess_cache_sizing`].
+    cache_sizing: Option<crate::budget::CacheSizingVerdict>,
+}
+
+/// Average decoded bytes per CSR shard across `readers`, from catalog stats
+/// only (no decode). Same per-shard model as `IndexPlanLoader`'s auto-tune and
+/// as `WeightedLruCache::estimate_bytes`: `nnz × 8` (i32 indices + f32 data) +
+/// `rows × 8` (i64 indptr).
+fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> usize {
+    let mut total_nnz = 0u64;
+    let mut total_rows = 0u64;
+    // Only shards that CONTRIBUTED to the totals may count toward the divisor.
+    // Counting stat-less shards in the denominator averages their 0 bytes into
+    // the result, *under*-estimating the per-shard size — which then
+    // *over*-estimates how many shards the byte budget affords and makes the
+    // sizing diagnostic under-warn on exactly the files whose catalogs are
+    // incomplete. Flagged independently by all three round-2 reviewers.
+    let mut n_counted = 0u64;
+    for r in readers {
+        for e in r.catalog().shards_sorted() {
+            if let Some(s) = e.stats.as_ref() {
+                total_nnz += s.nnz;
+                total_rows += s.row_end - s.row_start;
+                n_counted += 1;
+            }
+        }
+    }
+    // No shard carried stats ⇒ the size is genuinely unknown. Returning 0 is the
+    // signal `SparseCellSetLoader::new` reads as "the byte cap tells us nothing",
+    // falling back to the count cap rather than to a fabricated average.
+    total_nnz
+        .saturating_mul(8)
+        .saturating_add(total_rows.saturating_mul(8))
+        .checked_div(n_counted)
+        .unwrap_or(0) as usize
 }
 
 impl SparseCellSetLoader {
     /// Build a loader over `scx_readers` (one per `file_id`, in slice order),
     /// sharing one decoded-shard budget. `remap`/`n_global_genes` enable global
     /// remap (`n_global_genes` falls back to the tables' max+1 when `None`).
+    ///
+    /// `bytes_budget` is the shared shard cache's byte cap. `None` resolves it
+    /// **adaptively** — the requested cache's own need with headroom, clamped to
+    /// `[512 MB, ADAPTIVE_BUDGET_CAP_MB]` via
+    /// [`crate::budget::adaptive_budget_mb`] — rather than the historical
+    /// `usize::MAX`, which left peak RSS unbounded (STATE3 observed ~23 GB).
+    /// This matches how `TrainingDataset` and `IndexPlanDataset` resolve a
+    /// `None` budget, so all three loader classes share one policy.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         scx_readers: Vec<ScxReader>,
         cache_shards: usize,
-        bytes_budget: usize,
+        bytes_budget: Option<usize>,
         lookahead: usize,
         remap: Option<Vec<Vec<i32>>>,
         n_global_genes: Option<usize>,
@@ -135,8 +193,44 @@ impl SparseCellSetLoader {
                 .max()
                 .unwrap_or(0),
         };
-        let engine =
-            PrefetchEngine::from_scx_readers(scx_readers, cache_shards, bytes_budget, lookahead);
+        // Resolve the cache byte budget before the readers are moved into the
+        // engine: the adaptive path needs their catalog stats.
+        let shard_decoded_bytes = avg_shard_decoded_bytes(&scx_readers);
+        let cache_bytes_budget = match bytes_budget {
+            Some(b) => b,
+            None => {
+                let need = cache_shards.saturating_mul(shard_decoded_bytes);
+                crate::budget::adaptive_budget_mb(
+                    need,
+                    crate::pipeline::LoaderConfig::default().max_memory_mb,
+                )
+                .saturating_mul(1024 * 1024)
+            }
+        };
+        // Shards the byte budget can actually hold at average size. This cache is
+        // the loader's whole budget — there is no batch buffer or plan-tuple term
+        // on the sparse path — so the non-cache term is 0. `checked_div` rather
+        // than a guarded `/`: an unknown-shard-size file (no catalog stats) means
+        // "the byte cap tells us nothing", which is the count cap, not zero.
+        let affordable_cache_shards = cache_bytes_budget
+            .checked_div(shard_decoded_bytes)
+            .map(|n| n.min(cache_shards))
+            .unwrap_or(cache_shards);
+        let cache_sizing = crate::budget::assess_cache_sizing(
+            cache_shards,
+            affordable_cache_shards,
+            shard_decoded_bytes,
+            cache_bytes_budget / (1024 * 1024),
+            0,
+            bytes_budget.is_some(),
+        );
+
+        let engine = PrefetchEngine::from_scx_readers(
+            scx_readers,
+            cache_shards,
+            cache_bytes_budget,
+            lookahead,
+        );
         Ok(Arc::new(SparseCellSetLoader {
             engine,
             remap,
@@ -144,7 +238,73 @@ impl SparseCellSetLoader {
             log1p,
             target_sum,
             n_cols,
+            cache_bytes_budget,
+            cache_shards,
+            affordable_cache_shards,
+            shard_decoded_bytes,
+            cache_sizing,
         }))
+    }
+
+    /// Resolved shared-cache byte budget. With an explicit `max_memory_mb` this
+    /// is that value; otherwise the adaptive resolution.
+    pub fn cache_bytes_budget(&self) -> usize {
+        self.cache_bytes_budget
+    }
+
+    /// Requested shard-cache count cap. See [`Self::effective_cache_shards`] for
+    /// the value that actually binds.
+    pub fn cache_shards(&self) -> usize {
+        self.cache_shards
+    }
+
+    /// Shard-cache entries actually affordable: `min(cache_shards, budget /
+    /// avg_shard_bytes)`.
+    ///
+    /// The count cap and the byte cap are enforced independently, and on a
+    /// large-shard file the **byte** cap binds first — a 4 GB budget over ~470 MB
+    /// shards holds ~8 entries however high `cache_shards` is set. Diagnostics
+    /// must be phrased against this, not against the request, or they name a knob
+    /// that cannot fix the problem (`IndexPlanLoader::effective_cache_shards` is
+    /// the same idea on the paired path).
+    pub fn effective_cache_shards(&self) -> usize {
+        self.affordable_cache_shards
+    }
+
+    /// Average decoded bytes per CSR shard across all files.
+    pub fn shard_decoded_bytes(&self) -> usize {
+        self.shard_decoded_bytes
+    }
+
+    /// Total CSR shards across every file — the cap on distinct entries in the
+    /// shared cache, which is keyed `(file_id, shard)`.
+    pub fn total_shards(&self) -> usize {
+        (0..self.engine.n_readers())
+            .map(|fid| self.engine.reader(fid as u32).index().n_shards())
+            .sum()
+    }
+
+    /// `Some` iff the byte budget cannot hold `cache_shards` average shards.
+    pub fn cache_sizing(&self) -> Option<crate::budget::CacheSizingVerdict> {
+        self.cache_sizing
+    }
+
+    /// Number of distinct `(file_id, shard)` pairs a cell-set plan touches —
+    /// i.e. the `cache_shards` that would let the whole batch stay resident.
+    ///
+    /// Pure index arithmetic (`shards_for_indices` per file); no I/O, no decode.
+    /// Rows are grouped by `file_id` first because shard indices are per-file and
+    /// would otherwise collide across files.
+    pub fn plan_shard_touch_count(&self, file_ids: &[u32], rows: &[u64]) -> usize {
+        let mut by_file: HashMap<u32, Vec<u64>> = HashMap::new();
+        for (&f, &r) in file_ids.iter().zip(rows.iter()) {
+            by_file.entry(f).or_default().push(r);
+        }
+        by_file
+            .into_iter()
+            .filter(|(f, _)| (*f as usize) < self.engine.n_readers())
+            .map(|(f, rs)| self.engine.reader(f).index().shards_for_indices(&rs).len())
+            .sum()
     }
 
     /// Number of readers (`file_id` range).

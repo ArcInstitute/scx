@@ -18,6 +18,7 @@ pub mod arrow_compat;
 pub mod backed;
 #[cfg(feature = "deletion-vectors")]
 pub mod bitmap;
+pub mod categorical;
 pub mod csc_sidecar;
 #[cfg(feature = "deletion-vectors")]
 pub mod deletion_vectors;
@@ -47,6 +48,7 @@ pub use bitmap::{
     BITMAP_SHARD_VERSION,
 };
 #[cfg(feature = "deletion-vectors")]
+pub use categorical::GlobalCategoryAccum;
 pub use deletion_vectors::DeletionVectors;
 pub use distinct::DistinctAccumulator;
 pub use encoder::{
@@ -65,7 +67,8 @@ pub use profile::{
     reduction_guard, CodecClass, CpuProfileSnapshot, ReductionGuard, StageStat,
 };
 pub use reader::{
-    assemble_filtered_metadata, assemble_sharded_metadata, decode_arrow_ipc_schema, ScxReader,
+    assemble_filtered_metadata, assemble_sharded_metadata, compact_key_shard,
+    decode_arrow_ipc_schema, ScxReader,
 };
 pub use shard_decode::{
     decode_shard_bytes, decode_shard_bytes_native, decode_shard_indptr_bytes,

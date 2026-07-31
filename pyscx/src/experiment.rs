@@ -5,6 +5,10 @@ use std::sync::Arc;
 
 use arrow::array::Array;
 use numpy::{PyArray1, PyReadonlyArray1};
+
+/// One obs column's `(codes, categories)` as handed to Python: an `int32` numpy
+/// array plus the category strings. Shared by the local and cloud accessors.
+pub(crate) type PyCategorical<'py> = (Bound<'py, PyArray1<i32>>, Vec<String>);
 use pyo3::prelude::*;
 use scx_engine::QueryPipeline;
 use scx_format_io::backed::BackedCsrReader;
@@ -563,6 +567,66 @@ impl PyExperiment {
         // The Utf8-streaming path scans every row; release the GIL for it.
         py.detach(|| self.reader.distinct_obs_values(col, limit, sort))
             .map_err(to_pyerr)
+    }
+
+    /// `(codes, categories)` for a single **string/categorical** `obs` column —
+    /// the numpy-level accessor for building a global vocabulary or one-hot map.
+    ///
+    /// `codes` is an `int32` array with one entry per obs row (`-1` for missing,
+    /// the `pandas.Categorical.codes` convention); `categories[code]` is the
+    /// string value. Equivalent to
+    /// `read_obs(columns=[col])[col].cat.codes` / `.cat.categories`, but computed
+    /// shard-by-shard in Rust and returned as numpy directly — no Arrow-IPC byte
+    /// round-trip, no pyarrow table, no pandas frame. X is never touched.
+    ///
+    /// Prefer this over `read_obs(columns=[col])` when you want codes: that path
+    /// assembles and concatenates the column across shards, whereas this keeps
+    /// only the running vocabulary and the output codes.
+    ///
+    /// Semantics:
+    /// - **Category order is first-seen** across shards, not lexicographic. Sort
+    ///   `categories` yourself (and remap `codes`) if you need a stable order
+    ///   across files.
+    /// - **Unreferenced dictionary entries are retained**, matching pandas
+    ///   keeping unused levels and matching `distinct_values`' superset rule.
+    /// - Both on-disk encodings are accepted, including a file that mixes them
+    ///   (`from_anndata` writes dictionary-encoded shards, `append` writes plain
+    ///   string shards).
+    ///
+    /// **Physical row space.** `len(codes) == n_obs_physical`, *not* `n_obs`. On
+    /// a file with deletion vectors those differ, and indexing `codes` by a
+    /// logical row id addresses the wrong cell — a correctly shaped array of
+    /// wrong rows. Check `exp.n_obs == exp.n_obs_physical` before treating the
+    /// codes as logical, or filter them yourself. (`read_obs` has the same
+    /// contract, for the same reason.)
+    ///
+    /// Raises `ValueError` for non-string columns and a corrupt-file-class error
+    /// for an unknown column name.
+    fn obs_categorical<'py>(&self, py: Python<'py>, col: &str) -> PyResult<PyCategorical<'py>> {
+        let (codes, categories) = py
+            .detach(|| self.reader.obs_categorical(col))
+            .map_err(to_pyerr)?;
+        Ok((PyArray1::from_vec(py, codes), categories))
+    }
+
+    /// `obs_categorical` for several columns in **one** shard pass.
+    ///
+    /// Returns a list of `(codes, categories)` in `cols` order. N columns cost
+    /// one projected read per obs shard instead of N — the difference that
+    /// matters when a catalog build resolves several covariate columns over a
+    /// many-file manifest.
+    fn obs_categorical_many<'py>(
+        &self,
+        py: Python<'py>,
+        cols: Vec<String>,
+    ) -> PyResult<Vec<PyCategorical<'py>>> {
+        let out = py
+            .detach(|| self.reader.obs_categorical_many(&cols))
+            .map_err(to_pyerr)?;
+        Ok(out
+            .into_iter()
+            .map(|(codes, cats)| (PyArray1::from_vec(py, codes), cats))
+            .collect())
     }
 
     /// Codec / shard / format-version internals as a one-line string.

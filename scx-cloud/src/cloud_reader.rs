@@ -19,7 +19,7 @@ use object_store::ObjectStore;
 use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format_io::header::{FileHeader, HEADER_SIZE};
 use scx_format_io::section::SectionType;
-use scx_format_io::DistinctAccumulator;
+use scx_format_io::{DistinctAccumulator, GlobalCategoryAccum};
 
 use crate::backend::CloudLocation;
 use crate::error::{CloudError, Result};
@@ -364,6 +364,151 @@ impl CloudReader {
             acc.push(batch.column(0))?;
         }
         Ok(acc.finish())
+    }
+
+    /// `(codes, categories)` for a single **string/categorical** obs column over
+    /// the cloud read path. Parity with `ScxReader::obs_categorical`.
+    ///
+    /// Convenience wrapper over [`Self::obs_categorical_many`].
+    pub async fn obs_categorical(&self, col: &str) -> Result<(Vec<i32>, Vec<String>)> {
+        Ok(self
+            .obs_categorical_many(std::slice::from_ref(&col.to_string()))
+            .await?
+            .pop()
+            .expect("one column in ⇒ one column out"))
+    }
+
+    /// [`Self::obs_categorical`] for several columns in one pass over the obs
+    /// shards. Parity with `ScxReader::obs_categorical_many`.
+    ///
+    /// Each shard is fetched as a **projected** range read and folded
+    /// immediately, so the network cost is the requested columns' bytes rather
+    /// than the whole obs body — unlike [`Self::read_obs`], which assembles
+    /// everything. Shards are read sequentially in index order because the fold
+    /// is order-dependent: the codes buffer is append-only.
+    pub async fn obs_categorical_many(
+        &self,
+        cols: &[String],
+    ) -> Result<Vec<(Vec<i32>, Vec<String>)>> {
+        if cols.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = self.read_obs_schema().await?;
+        let mut projection = Vec::with_capacity(cols.len());
+        for col in cols {
+            projection.push(schema.index_of(col).map_err(|_| {
+                CloudError::Format(scx_format_io::ScxError::SectionNotFound(format!(
+                    "obs column '{col}'"
+                )))
+            })?);
+        }
+
+        let n_obs_hint = self.header.n_obs as usize;
+        let mut accs: Vec<GlobalCategoryAccum> = cols
+            .iter()
+            .map(|c| GlobalCategoryAccum::new(c.clone(), n_obs_hint))
+            .collect();
+
+        if self.obs_metadata_shard_count() > 0 {
+            let mut shards: Vec<(u32, &FullCatalogEntry)> = self
+                .catalog
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.section_type == SectionType::ObsMetadataShard
+                        && e.name.starts_with("obs_metadata/shard_")
+                })
+                .filter_map(|e| {
+                    let idx: u32 = e.name.strip_prefix("obs_metadata/shard_")?.parse().ok()?;
+                    Some((idx, e))
+                })
+                .collect();
+            shards.sort_by_key(|(idx, _)| *idx);
+            for (_, entry) in shards {
+                let bytes = self.read_section_for_entry(entry).await?;
+                let batch =
+                    decode_arrow_ipc_batch_projected(&bytes, projection.clone(), "obs_metadata")?;
+                for (i, acc) in accs.iter_mut().enumerate() {
+                    acc.push(batch.column(i))?;
+                }
+            }
+        } else {
+            let bytes = self.read_metadata_section("obs").await?;
+            let batch = decode_arrow_ipc_batch_projected(&bytes, projection, "obs")?;
+            for (i, acc) in accs.iter_mut().enumerate() {
+                acc.push(batch.column(i))?;
+            }
+        }
+
+        for (acc, col) in accs.iter().zip(cols.iter()) {
+            if acc.n_rows() != n_obs_hint {
+                return Err(CloudError::Format(scx_format_io::ScxError::InvalidCatalog(
+                    format!(
+                        "obs_categorical('{col}') folded {} rows but the header declares \
+                         n_obs = {n_obs_hint}; obs shards do not cover the axis",
+                        acc.n_rows()
+                    ),
+                )));
+            }
+        }
+        Ok(accs.into_iter().map(|a| a.finish()).collect())
+    }
+
+    /// Read only the named obs columns as a **projected** per-shard read, rather
+    /// than assembling the full obs table and projecting in memory.
+    ///
+    /// This is the cloud parity for `ScxReader::read_obs_keys`: the network cost
+    /// is the requested columns' bytes per shard, not the whole obs body.
+    /// `CloudExperiment.read_obs(columns=…)` routes here, so that surface is a
+    /// genuine pushdown too. Note this path does **not** populate the
+    /// assembled-obs cache that unprojected [`Self::read_obs`] fills and reuses.
+    pub async fn read_obs_keys(&self, cols: &[String]) -> Result<RecordBatch> {
+        let schema = self.read_obs_schema().await?;
+        let mut projection = Vec::with_capacity(cols.len());
+        for col in cols {
+            projection.push(schema.index_of(col).map_err(|_| {
+                CloudError::Format(scx_format_io::ScxError::SectionNotFound(format!(
+                    "obs column '{col}'"
+                )))
+            })?);
+        }
+
+        if self.obs_metadata_shard_count() == 0 {
+            let bytes = self.read_metadata_section("obs").await?;
+            let batch = decode_arrow_ipc_batch_projected(&bytes, projection, "obs")?;
+            return Ok(scx_format_io::downcast_large_types(&batch)?);
+        }
+
+        let mut shards: Vec<(u32, &FullCatalogEntry)> = self
+            .catalog
+            .entries
+            .iter()
+            .filter(|e| {
+                e.section_type == SectionType::ObsMetadataShard
+                    && e.name.starts_with("obs_metadata/shard_")
+            })
+            .filter_map(|e| {
+                let idx: u32 = e.name.strip_prefix("obs_metadata/shard_")?.parse().ok()?;
+                Some((idx, e))
+            })
+            .collect();
+        shards.sort_by_key(|(idx, _)| *idx);
+
+        let mut raw: Vec<(u32, RecordBatch)> = Vec::with_capacity(shards.len());
+        for (idx, entry) in shards {
+            let bytes = self.read_section_for_entry(entry).await?;
+            let batch =
+                decode_arrow_ipc_batch_projected(&bytes, projection.clone(), "obs_metadata")?;
+            // Compact each projected shard for the same reason the local path
+            // does: Arrow IPC projection hands back a zero-copy slice into the
+            // full message body, so a retained projected batch would pin every
+            // un-projected column for the lifetime of the assembly.
+            raw.push((idx, scx_format_io::compact_key_shard(&batch)?));
+        }
+        Ok(scx_format_io::assemble_sharded_metadata(
+            "obs_metadata",
+            raw,
+        )?)
     }
 
     /// Read var metadata as an Arrow RecordBatch. Mirror of

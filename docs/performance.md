@@ -2020,7 +2020,9 @@ the ranks serialise.
 touch different shards and the page cache cannot flatter the result. At census scale
 efficiency is **1.00–1.01**: four concurrent ranks are each exactly as fast as one alone, and
 aggregate throughput scales ~4×. Peak RSS scales linearly (1.75 GB/rank at census_1m), which
-is worth noting given `SparseCellSetDataset` currently has no byte cap on its shard cache.
+was worth noting when `SparseCellSetDataset` had no byte cap on its shard cache — since the
+Phase-1 1A work below it resolves `max_memory_mb=None` to a bounded adaptive budget, so
+per-rank RSS is now capped rather than open-ended.
 
 **The manifest arm's 1.70–1.87 is cache sharing, not an absence of contention**, and the
 distinction matters. There every rank reads the *same* 256 files by design (each model process
@@ -2063,6 +2065,187 @@ not certify multi-node DDP (no NCCL in the picture), they do not measure a real
 warm-cache training throughput, which is what STATE3's own 4.55 steps/s figure covers. A
 regime that shows up in any of those is not excluded by the table above — it is simply not
 evidenced today.
+
+### Shard-cache sizing on the gather path (data-load Phase 1, 1A)
+
+The pathology that motivated this work: STATE3 measured **143 s/batch** on a scattered
+perturbation gather, and fixed it entirely by raising a *consumer-side* `scx_cache_shards`
+from 16 to 48 — "config-only; the prefetch threads were never the cap". SCX's own default is
+128 and would have been fine. What SCX lacked was any way to *see* it: `cache_metrics()`
+already carried hits / misses / evictions and nothing interpreted them, so diagnosis was a
+bisection.
+
+**The headline result reframes the problem.** On **framed** files — row-group framing is the
+v4 default since F5 — a scattered cell-set gather **never touches the whole-shard LRU at
+all**. Captured cold on `census_500k_auto.scx` (31 CSR shards):
+
+| `cache_shards` | sets/s | peak RSS | hits+misses | `full_shard_groups` | `block_index_groups` |
+|---|---|---|---|---|---|
+| 16 (undersized) | 6.7 | 1,181 MB | **0** | 0 | 1,307 |
+| 31 (suggested) | 6.7 | 1,181 MB | **0** | 0 | 1,307 |
+
+Every request goes through the codec-agnostic block-index path, which decodes only the
+touched row-groups. `cache_shards` cannot matter, and a 16-vs-31 comparison returns 1.00×
+**by construction** — which is why the benchmark records `read_path.lru_consulted` alongside
+the ratio. A bare 1.00× would read as "sizing doesn't help"; the correct reading is "the
+cache was bypassed".
+
+**With the block-index path disabled** (`SCX_SCATTER_BLOCK_INDEX=0` — the legacy
+full-shard-decode regime STATE3 was actually in), the same file and the same plans, cold:
+
+| `cache_shards` | sets/s | peak RSS | `lru_consulted` | `full_shard_groups` |
+|---|---|---|---|---|
+| 16 (undersized) | **0.2** | 19,762 MB | yes (2,013 reads) | 1,307 |
+| 31 (suggested, `max_memory_mb=6415`) | **546.4** | 10,557 MB | yes | 1,307 |
+
+**2,486× throughput and half the peak RSS.** Thrash is not a speed/memory trade — it is
+worse on both axes, because a cache that cannot hold the working set spends the run
+allocating, decoding and freeing 193 MB shard buffers. The 19.8 GB figure is also close to
+the ~23 GB STATE3 reported, which is corroboration that this reproduces their regime rather
+than a synthetic one. (An earlier warm interactive probe of the same comparison gave 269×;
+the cold capture is the citable number — a warm smoke is not a measurement, least of all for
+a ratio.)
+
+The signature is exactly what the detector keys on: at 16 shards nearly every miss
+*displaces a live entry* (0.98–0.99 evictions/miss), whereas the well-sized cache evicts
+nothing. This is why the predicate requires `evictions ≈ misses` and not merely a high miss
+rate — a cold sequential scan also misses on ~100% of reads while evicting nothing, and is
+perfectly healthy. `suggested_cache_shards` derived the right number (31) from the plan
+alone, with **zero I/O**, via the pre-existing `BackedCsrIndex::shards_for_indices`.
+
+One more thing this shows, which was not the point of the experiment: at
+`cache_shards=31` the full-shard path reaches **546 sets/s against the block-index path's
+6.7** on the same file. Once the whole file is resident and decoded, every subsequent batch is
+served from RAM, whereas the block-index path re-decodes row-groups on each visit. That is
+**conditional on the working set fitting** — 31 × 193 MB fits the 6.4 GB budget granted here
+and would not at atlas scale — so it is not an argument for changing the default. It does mean
+the block-index path is not universally faster, and a caller with a small file and repeated
+scattered access has a real reason to pass `scatter_block_index=False` with a
+plan-sized cache.
+
+Two conclusions worth stating plainly:
+
+1. **F5 row-group framing already designed this pathology out of the default path.** The 1A
+   diagnostic's domain is unframed/legacy layouts and callers who pass
+   `scatter_block_index=False` — not modern default files.
+2. Following the advice means raising **both** knobs. `suggested_cache_shards` returns a
+   count, but the byte budget must also hold that many shards: census_500k wants 31 while
+   the adaptive 4 GB cap affords 22, so `cache_shards=31` alone under-delivers. The warning
+   text says so, and the benchmark's "sized correctly" arm sets both.
+
+**Capture provenance.** Two serialized SLURM jobs on one `cpu` node (16 CPU / 200 GB),
+`cold_fadvise` before every timed run, 3 runs per arm, chained
+`sbatch --dependency=afterany` so no two arms of a timing A/B were ever co-scheduled:
+`candidate_2026_07_30_dataload_phase1_{blockidx,fullshard}`. The `fullshard` job took
+**4 h 32 m** against the `blockidx` job's **35 m** — the wall-clock gap is itself the thrash
+signal. Not floored in `thresholds.yaml`: these arms deliberately *misconfigure* one side, so a
+floor on `cache_undersized` would gate on a number the code is trying to make impossible.
+
+**One caveat on the capture, stated rather than buried:** the runtime thrash *warning* emitted
+**zero** times during that 4.5-hour thrashing run, because the sampler checked every 32 batches
+while `cellset_gather` runs 30 — the diagnostic was silently dead on exactly the workload it
+was built for. Fixed (cadence 8, plus a 30-batch regression test) and re-verified interactively
+on the same census_500k fullshard configuration, where it now fires once with the correct
+diagnosis. The throughput A/B above is unaffected — it measures the two configurations, not the
+warning — but the warning's own evidence is the test suite plus that targeted re-run, not this
+capture. A second finding from the same re-run: the suggested size was derived from shard
+*requests* per batch, which overcounts under thrash (it advised 174 on a 31-shard file), and is
+now capped at the file's shard count.
+
+**Budget-default reconciliation.** The three loader classes had three policies —
+`TrainingDataset` adaptive (512 MB floor → 4 GB cap), `IndexPlanDataset` a hard 512 MB that
+silently shrank `cache_shards` toward 1, and `SparseCellSetDataset` no byte cap at all
+(`usize::MAX`; STATE3 observed ~23 GB RSS). All three now resolve `max_memory_mb=None`
+through the adaptive policy, so a `None` budget is bounded everywhere. The auto-tune's
+*behaviour* is deliberately unchanged — it may still reach `cache_shards=1` — because
+refusing would turn configurations that work today into hard errors. What changed is that a
+reduction is now reported.
+
+That report is deliberately quiet under an adaptive budget unless the surviving cache falls
+below 8 shards. A preflight on pbmc10k (≈194 MB shards) showed the first version warning that
+"max_memory_mb=4096 affords only 21 of 128" on a run whose observed peak RSS was 0.7 GB —
+i.e. firing on a healthy default configuration, which is how a diagnostic gets filtered and
+stops working. An *explicit* `max_memory_mb` that conflicts with an explicit `cache_shards`
+is always reported: the caller asked for two things that don't fit, and only they can decide
+which gives.
+
+### Obs categorical codes without pandas (data-load Phase 1, 1C)
+
+The Phase-0 cold breakdown put **96–99.8% of per-file obs cost in obs reading**, not in
+`File::open` / catalog parse / BLAKE3 (0.2–3.8% and at-or-below-noise respectively). The
+accessor aimed at that term is `obs_categorical(col) -> (codes, categories)`: what every
+model's vocabulary/one-hot setup actually wants, returned as an `int32` numpy array plus a
+list of strings.
+
+It differs from `read_obs(columns=[col])` in two ways that both matter at manifest scale.
+It skips the Arrow-IPC-bytes → pyarrow → `to_pandas()` round trip entirely; and it folds
+**one shard at a time** into a running global dictionary, so the column is never
+concatenated — peak memory is `n_obs × 4 B` plus the vocabulary, against a full materialised
+Arrow column for `read_obs_keys` → `concat_batches` → `unify_dictionary_columns`.
+`obs_categorical_many` runs N accumulators over **one** shard pass, so resolving four
+covariate columns across a 26k-file manifest costs 26k projected reads rather than 104k.
+
+**Per-file cost, cold, seconds/file** (one obs column; `read_obs` = `read_obs(columns=[col])`
+→ pandas, `obs_categorical` = the numpy accessor). h5ad's column is
+`adata.obs[col].cat.codes`, i.e. what a consumer writes today.
+
+| dataset | scale | SCX `read_obs` | SCX `obs_categorical` | speedup | h5ad `read_obs` | h5ad `.cat.codes` |
+|---|---|---|---|---|---|---|
+| census_500k | 1 file | 0.5546 | **0.3060** | **1.81×** | 0.6593 | 0.6962 |
+| tabula_sapiens_100k | 1 file | 0.0576 | **0.0242** | **2.38×** | 0.1995 | 0.1972 |
+| tabula_sapiens_100k | 256-file manifest | 0.00666 | **0.00576** | 1.16× | 0.1117 | 0.1128 |
+
+**Multi-column, cold** — the shape state3's `_setup_global_maps` actually issues, and the
+measurement that validates the "one shard pass for N columns" claim rather than asserting it.
+4 columns, `obs_categorical_many` against N separate `obs_categorical` calls:
+
+| dataset | 4 × separate | `obs_categorical_many` | speedup |
+|---|---|---|---|
+| census_500k | 0.658 s | **0.245 s** | **2.69×** |
+| tabula_sapiens_100k | 0.015 s | **0.005 s** | 3.16× |
+
+Sub-linear in the column count, as intended: the per-shard projected read is paid once, not
+per column. (tabula's absolute numbers are small enough to be near the noise floor on a
+100k-cell file; census_500k is the solid figure.)
+
+**1.8–2.4× at single-file scale** for one column, and cross-format `obs_categorical` is
+**8.2×** h5ad's `.cat.codes` at tabula_sapiens_100k (0.0242 vs 0.1972) and 2.2× at
+census_500k. Two honest qualifications:
+
+- **The h5ad column shows ~1.0× because pandas is pandas.** Taking `.cat.codes` off an
+  already-materialised `adata.obs` costs nothing extra — the expense was materialising it. The
+  SCX win comes from never building the frame at all, which is a choice only the SCX side can
+  make.
+- **The win shrinks to 1.16× at manifest scale**, where per-file fixed cost dominates: the
+  256-file fixture shards one 100k-cell file, so each file's obs is tiny and 0.0058 s/file is
+  mostly open + catalog. The accessor is aimed at the *per-column assembly* term, and that term
+  is only large when a file's obs is large. At census_500k — one file, 500k rows — it is 1.81×.
+
+Peak RSS moves modestly on these fixtures (751 vs 780 MB at census_500k; 480 vs 488 MB at
+tabula), because a single narrow column is not where the concatenation transient bites. The
+memory argument is structural rather than demonstrated here: the fold never holds more than one
+shard's projected column plus the running vocabulary, so it does not scale with `n_obs × width`
+the way `concat_batches` does.
+
+One contract worth stating loudly: `codes` is indexed in the **physical** obs row space, so
+`len(codes) == n_obs_physical`, not `n_obs`. On a file with deletion vectors those differ and
+indexing by a logical row id addresses the wrong cell — a correctly *shaped* array of wrong
+rows. `read_obs` has the same contract for the same reason; it is pinned by a test rather than
+left to the docstring.
+
+Semantics are pandas-compatible by choice: null → code `-1`, so a literal `"NaN"` *string*
+stays a real category. This deliberately differs from `scx_loader`'s training-internal
+`CategoryDict`, which appends a synthetic trailing `"NaN"` level and documents that it is
+not `pandas.Categorical.codes`-stable. Category order is **first-seen**, not lexicographic.
+Both on-disk encodings are accepted, including a file that carries both across its shards —
+`from_anndata` writes dictionary-encoded obs while `append` decodes to plain strings, so any
+appended file is mixed.
+
+On the cloud path the same pass lands, plus the projection half that was missing:
+`CloudExperiment.read_obs(columns=)` previously assembled the entire obs table and then
+projected it in memory (its own docstring conceded "the network cost is the full obs metadata
+regardless"). It is now a genuine per-shard pushdown, so the network cost is the requested
+columns' bytes.
 
 ## Query Engine
 

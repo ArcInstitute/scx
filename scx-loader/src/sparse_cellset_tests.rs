@@ -104,7 +104,7 @@ fn gather_single_file_sets_matches_reference_in_order() {
     let loader = SparseCellSetLoader::new(
         vec![open(&p0), open(&p1)],
         /*cache_shards*/ 8,
-        usize::MAX,
+        None,
         /*lookahead*/ 4,
         /*remap*/ None,
         /*n_global_genes*/ None,
@@ -160,18 +160,9 @@ fn empty_set_keeps_boundary_without_rows() {
     let dir = tempfile::tempdir().unwrap();
     let p0 = dir.path().join("f0.scx");
     write_fixture(&p0, 16, 8, 2);
-    let loader = SparseCellSetLoader::new(
-        vec![open(&p0)],
-        4,
-        usize::MAX,
-        2,
-        None,
-        None,
-        false,
-        false,
-        0.0,
-    )
-    .unwrap();
+    let loader =
+        SparseCellSetLoader::new(vec![open(&p0)], 4, None, 2, None, None, false, false, 0.0)
+            .unwrap();
     // set 0: two rows; set 1: empty; set 2: one row.
     let plan = SparseCellSetPlan {
         file_ids: vec![0, 0, 0],
@@ -215,7 +206,7 @@ fn gather_cross_file_set_concatenates_in_global_space() {
     let loader = SparseCellSetLoader::new(
         vec![open(&p0), open(&p1)],
         8,
-        usize::MAX,
+        None,
         4,
         Some(remap),
         /*n_global_genes*/ Some(108),
@@ -267,18 +258,7 @@ fn sparse_transforms_match_dense_reference() {
 fn malformed_plan_loader(dir: &std::path::Path) -> StdArc<SparseCellSetLoader> {
     let p0 = dir.join("f0.scx");
     write_fixture(&p0, 16, 8, 2);
-    SparseCellSetLoader::new(
-        vec![open(&p0)],
-        4,
-        usize::MAX,
-        2,
-        None,
-        None,
-        false,
-        false,
-        0.0,
-    )
-    .unwrap()
+    SparseCellSetLoader::new(vec![open(&p0)], 4, None, 2, None, None, false, false, 0.0).unwrap()
 }
 
 /// Run one plan and return the first batch's `Result`.
@@ -302,7 +282,7 @@ fn collate_gathered_emits_stacked_tensors_matching_kernel() {
     let loader = SparseCellSetLoader::new(
         vec![open(&p0)],
         8,
-        usize::MAX,
+        None,
         4,
         Some(vec![(0..8).collect::<Vec<i32>>()]),
         Some(8),
@@ -435,4 +415,226 @@ fn malformed_plan_row_out_of_range_raises_index_out_of_range() {
         run_one(loader, plan),
         Err(LoaderError::IndexOutOfRange { idx: 99, n_obs: 16 })
     ));
+}
+
+// ---------------------------------------------------------------------
+// 1A — cache sizing / budget policy on the sparse path
+// ---------------------------------------------------------------------
+
+/// Build a two-file loader with an explicit byte budget.
+fn budget_loader(
+    dir: &std::path::Path,
+    cache_shards: usize,
+    bytes_budget: Option<usize>,
+) -> StdArc<SparseCellSetLoader> {
+    let p0 = dir.join("b0.scx");
+    let p1 = dir.join("b1.scx");
+    write_fixture(&p0, 32, 8, 4);
+    write_fixture(&p1, 32, 8, 4);
+    SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        cache_shards,
+        bytes_budget,
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+    )
+    .unwrap()
+}
+
+/// `bytes_budget=None` must resolve to a *bounded* adaptive budget, not the
+/// historical `usize::MAX`. The unbounded default is what let STATE3 reach
+/// ~23 GB RSS with no ceiling anywhere in the stack.
+#[test]
+fn none_budget_resolves_to_a_bounded_adaptive_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = budget_loader(dir.path(), 128, None);
+    let budget = loader.cache_bytes_budget();
+    assert!(budget < usize::MAX, "the budget must be bounded");
+    // Small fixture ⇒ need is far below the floor, so the floor wins.
+    assert_eq!(
+        budget,
+        crate::pipeline::LoaderConfig::default().max_memory_mb * 1024 * 1024,
+        "a tiny file must keep the floor, never be tightened below it"
+    );
+    assert!(
+        loader.cache_sizing().is_none(),
+        "the floor comfortably holds 128 tiny shards; nothing to warn about"
+    );
+}
+
+/// An explicit budget too small for the requested cache must be reported.
+#[test]
+fn explicit_tight_budget_reports_a_sizing_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    // Each shard here is 8 rows × 1 nnz ⇒ (8 × 8) + (8 × 8) = 128 B.
+    // A 1 KB budget affords 8 shards, so a 128-shard request is cut.
+    let loader = budget_loader(dir.path(), 128, Some(1024));
+    let v = loader
+        .cache_sizing()
+        .expect("a budget that cannot hold the request must be reported");
+    assert_eq!(v.requested_cache_shards, 128);
+    assert_eq!(v.effective_cache_shards, 8);
+    assert!(
+        !v.below_floor,
+        "8 is exactly MIN_CACHE_SHARDS, which is not below it"
+    );
+    assert_eq!(v.shard_decoded_bytes, 128);
+}
+
+/// Below MIN_CACHE_SHARDS the verdict escalates, so the warning can say the
+/// stronger thing.
+#[test]
+fn very_tight_budget_flags_below_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = budget_loader(dir.path(), 128, Some(512)); // 4 shards
+    let v = loader.cache_sizing().expect("must be reported");
+    assert_eq!(v.effective_cache_shards, 4);
+    assert!(v.below_floor);
+}
+
+/// An explicit budget that comfortably holds the request stays silent — the
+/// anti-tautology partner for the two tests above.
+#[test]
+fn generous_explicit_budget_is_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = budget_loader(dir.path(), 8, Some(64 * 1024 * 1024));
+    assert!(loader.cache_sizing().is_none());
+}
+
+/// `plan_shard_touch_count` must group by `file_id` before counting, since shard
+/// indices are per-file: the same shard index in two files is two entries in the
+/// shared cache, which is keyed `(file_id, shard)`.
+#[test]
+fn plan_shard_touch_count_is_per_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = budget_loader(dir.path(), 8, None);
+    // 32 rows over 4 shards ⇒ 8 rows/shard.
+
+    // One shard, one file.
+    assert_eq!(loader.plan_shard_touch_count(&[0, 0], &[0, 7]), 1);
+    // Shard 0 of file 0 and shard 0 of file 1 are distinct cache entries.
+    assert_eq!(
+        loader.plan_shard_touch_count(&[0, 1], &[0, 0]),
+        2,
+        "same shard index in different files must count twice"
+    );
+    // All four shards of one file.
+    assert_eq!(
+        loader.plan_shard_touch_count(&[0, 0, 0, 0], &[0, 8, 16, 24]),
+        4
+    );
+    // Both files, all shards.
+    assert_eq!(
+        loader.plan_shard_touch_count(&[0, 0, 0, 0, 1, 1, 1, 1], &[0, 8, 16, 24, 0, 8, 16, 24]),
+        8
+    );
+    // Duplicate rows collapse.
+    assert_eq!(loader.plan_shard_touch_count(&[0, 0, 0], &[3, 3, 3]), 1);
+    assert_eq!(loader.plan_shard_touch_count(&[], &[]), 0);
+}
+
+/// An out-of-range `file_id` must not panic — the helper is called on
+/// caller-supplied plans before any validation has run.
+#[test]
+fn plan_shard_touch_count_ignores_unknown_file_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = budget_loader(dir.path(), 8, None);
+    assert_eq!(loader.plan_shard_touch_count(&[9], &[0]), 0);
+    assert_eq!(loader.plan_shard_touch_count(&[0, 9], &[0, 0]), 1);
+}
+
+/// The thrash diagnostic must be phrased against the **binding** constraint.
+///
+/// Round-1 review (Cursor, P2): the sparse path sampled with the *requested*
+/// `cache_shards` while `IndexPlanDataset` sampled with the post-auto-tune value.
+/// On the regime this loader targets (~470 MB shards, adaptive 4 GB budget) the
+/// byte cap binds long before the count does, so a warning naming `cache_shards`
+/// sends the caller to raise a knob that cannot help.
+#[test]
+fn effective_cache_shards_reports_the_byte_cap_when_it_binds() {
+    let dir = tempfile::tempdir().unwrap();
+    // Shard bytes here are 128 B (8 rows x 1 nnz). A 1 KB budget affords 8, so a
+    // 128-count request is bound by BYTES, not by the count.
+    let loader = budget_loader(dir.path(), 128, Some(1024));
+    assert_eq!(loader.cache_shards(), 128, "the request is unchanged");
+    assert_eq!(
+        loader.effective_cache_shards(),
+        8,
+        "the byte cap is what actually binds"
+    );
+    assert!(
+        loader.effective_cache_shards() < loader.cache_shards(),
+        "premise: this fixture must be byte-bound, else the test proves nothing"
+    );
+}
+
+/// With a generous budget the count cap binds and the two agree.
+#[test]
+fn effective_cache_shards_equals_request_when_the_count_binds() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = budget_loader(dir.path(), 8, Some(64 * 1024 * 1024));
+    assert_eq!(loader.effective_cache_shards(), loader.cache_shards());
+}
+
+/// A zero byte budget affords zero shards — the shard size here is *known*, so
+/// there is nothing to fall back to.
+///
+/// Round-2 review (Cursor, P2) caught that this test was previously named
+/// `..._falls_back_to_the_count_when_shard_size_is_unknown` while asserting
+/// `shard_decoded_bytes == 128` — i.e. the known-size case, the opposite of its
+/// name. The unknown-size fallback is covered by
+/// `avg_shard_decoded_bytes_returns_zero_when_no_shard_has_stats` +
+/// `effective_cache_shards_falls_back_to_the_count_when_size_is_unknown` below.
+#[test]
+fn effective_cache_shards_is_zero_under_a_zero_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = budget_loader(dir.path(), 8, Some(0));
+    assert_eq!(
+        loader.shard_decoded_bytes(),
+        128,
+        "premise: the shard size is KNOWN here"
+    );
+    assert_eq!(loader.effective_cache_shards(), 0);
+}
+
+/// Stat-less shards must not be averaged into the per-shard size.
+///
+/// Round-2 review, flagged independently by all three reviewers: counting a
+/// shard with no catalog stats in the divisor averages its 0 bytes in, so the
+/// per-shard estimate comes out low, the affordable count comes out high, and the
+/// sizing diagnostic under-warns on precisely the files with incomplete catalogs.
+#[test]
+fn avg_shard_decoded_bytes_ignores_stat_less_shards_in_the_divisor() {
+    // `write_fixture` emits stats for every shard, so build the arithmetic
+    // directly against the helper's contract: N shards with stats summing to S
+    // bytes must average S/N, independent of how many stat-less shards exist.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("s0.scx");
+    write_fixture(&p0, 32, 8, 4);
+    let one = avg_shard_decoded_bytes(&[open(&p0)]);
+    assert_eq!(one, 128, "8 rows x 1 nnz => (8*8 + 8*8)/1 per shard");
+
+    // Two identical files: twice the shards, twice the totals, same average.
+    let p1 = dir.path().join("s1.scx");
+    write_fixture(&p1, 32, 8, 4);
+    let two = avg_shard_decoded_bytes(&[open(&p0), open(&p1)]);
+    assert_eq!(
+        two, one,
+        "the average must be scale-invariant; a drift here means the divisor \
+         and the numerator are counting different shard sets"
+    );
+}
+
+/// No shard carries stats ⇒ size unknown ⇒ the byte cap says nothing, so the
+/// count cap is what binds (never a fabricated average, never 0 entries).
+#[test]
+fn effective_cache_shards_falls_back_to_the_count_when_size_is_unknown() {
+    // An empty reader set is the degenerate "no shards carry stats" case the
+    // helper must survive; `SparseCellSetLoader::new` rejects zero files, so the
+    // helper is exercised directly.
+    assert_eq!(avg_shard_decoded_bytes(&[]), 0);
 }

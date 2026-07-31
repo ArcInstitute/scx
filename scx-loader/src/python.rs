@@ -18,7 +18,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1};
@@ -1119,6 +1119,11 @@ impl IndexPlanDataset {
         if let Some(v) = max_memory_mb {
             config.max_memory_mb = v;
         }
+        // No explicit budget ⇒ size it from this file's own requested config
+        // (bounded, adaptive) instead of the fixed 512 MB default, which against
+        // large Pcodec shards drove the auto-tune to `cache_shards = 1` and
+        // manufactured cache thrash. `config.max_memory_mb` stays the floor.
+        config.auto_memory_budget = max_memory_mb.is_none();
 
         let cache_shards = cache_shards.unwrap_or(128);
         let sort_by_shard = sort_by_shard.unwrap_or(true);
@@ -1136,6 +1141,10 @@ impl IndexPlanDataset {
         )
         .map_err(loader_err_to_py)?;
         loader.set_scatter_block_index(scatter_block_index);
+
+        if let Some(v) = loader.cache_sizing() {
+            warn_cache_sizing(py, "IndexPlanDataset", &v)?;
+        }
 
         // Preflight: the scattered block-index fast path can only fire on
         // row-group-framed shards, and only when the process-global switch is on
@@ -1225,11 +1234,21 @@ impl IndexPlanDataset {
         let inner = Arc::clone(&self.loader).iter_with_plans(plan_stream, lookahead);
         let iter_metrics = inner.iter_metrics();
         let cache_metrics = self.loader.cache_metrics();
+        let thrash = ThrashSampler::new(
+            "IndexPlanDataset",
+            self.loader.effective_cache_shards(),
+            self.loader.n_shards(),
+            // The paired path's auto-tune reduces the count to fit the budget, so
+            // a reduction there IS byte-driven.
+            self.loader.effective_cache_shards() < self.loader.requested_cache_shards(),
+            self.loader.shard_decoded_bytes(),
+        );
         Ok(IndexPlanBatchIter {
             inner: Some(inner),
             lookahead,
             iter_metrics,
             cache_metrics,
+            thrash,
         })
     }
 
@@ -1237,6 +1256,22 @@ impl IndexPlanDataset {
     /// `max_memory_mb`. May be less than the user-requested `cache_shards`.
     fn effective_cache_shards(&self) -> usize {
         self.loader.effective_cache_shards()
+    }
+
+    /// Number of distinct CSR shards `plan` touches — the `cache_shards` that
+    /// would let the whole plan stay resident for one `process_plan` call.
+    ///
+    /// Pure index arithmetic from the catalog's shard row ranges: no I/O, no
+    /// decode, safe to call before iterating. Size the cache from the plans you
+    /// will actually issue rather than guessing:
+    ///
+    /// ```python
+    /// probe = pyscx.IndexPlanDataset(path)
+    /// need = max(probe.suggested_cache_shards(p) for p in plans[:64])
+    /// ds = pyscx.IndexPlanDataset(path, cache_shards=need)
+    /// ```
+    fn suggested_cache_shards(&self, py: Python<'_>, plan: Vec<(u64, u64)>) -> usize {
+        py.detach(|| self.loader.plan_shard_touch_count(&plan))
     }
 
     /// Effective default lookahead after auto-tuning to fit `max_memory_mb`.
@@ -1385,6 +1420,8 @@ pub struct IndexPlanBatchIter {
     /// Loader-level cache counters, cloned at construction for the same
     /// post-drain stability.
     cache_metrics: Arc<CacheMetrics>,
+    /// Samples `cache_metrics` as batches are yielded and warns once on thrash.
+    thrash: ThrashSampler,
 }
 
 #[pymethods]
@@ -1402,7 +1439,11 @@ impl IndexPlanBatchIter {
         // without contention.
         let next = py.detach(|| inner.next());
         match next {
-            Some(Ok(batch)) => Ok(Some(index_plan_batch_to_dict(py, batch)?)),
+            Some(Ok(batch)) => {
+                let dict = index_plan_batch_to_dict(py, batch)?;
+                self.thrash.observe(py, &self.cache_metrics);
+                Ok(Some(dict))
+            }
             Some(Err(e)) => Err(loader_err_to_py(e)),
             None => {
                 // Drop the inner iterator to release the plan-pull thread
@@ -1493,6 +1534,202 @@ fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bou
         m.prefetch_skipped_block_index.load(Ordering::Relaxed),
     )?;
     Ok(dict)
+}
+
+/// Emit the construction-time `UserWarning` for a shard cache the memory budget
+/// could not afford.
+///
+/// Follows the house style of the `scatter_block_index` preflight below: warn and
+/// continue (never refuse), name the observed numbers, name the knob, and name
+/// the exact value that would fix it. Deduping is left to CPython's
+/// `__warningregistry__`, which is correct here because the message text is
+/// fixed per `(dataset, requested, effective, budget)` — unlike the runtime
+/// thrash warning, whose counters vary every call and which therefore needs its
+/// own latch.
+fn warn_cache_sizing(
+    py: Python<'_>,
+    dataset: &str,
+    v: &crate::budget::CacheSizingVerdict,
+) -> PyResult<()> {
+    let warnings = py.import("warnings")?;
+    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    let consequence = if v.below_floor {
+        format!(
+            " That is below the {} shards a gather batch typically touches, so \
+             every batch will re-decode shards it just evicted (the pathology \
+             behind STATE3's 143 s/batch).",
+            crate::budget::MIN_CACHE_SHARDS
+        )
+    } else {
+        String::new()
+    };
+    let msg = format!(
+        "{dataset}: max_memory_mb={} affords only {} of the {} requested \
+         cache_shards (avg decoded shard = {} KB).{consequence} Pass \
+         max_memory_mb>={} to hold the requested cache, or lower cache_shards \
+         to {} to make the reduction explicit.",
+        v.budget_mb,
+        v.effective_cache_shards,
+        v.requested_cache_shards,
+        v.shard_decoded_bytes / 1024,
+        v.budget_mb_for_requested,
+        v.effective_cache_shards,
+    );
+    warnings.call_method1("warn", (msg, user_warning))?;
+    Ok(())
+}
+
+/// Samples cache counters while an iterator drains and warns once if they look
+/// like working-set overflow.
+///
+/// Lives on the iterator rather than the dataset because thrash is a property of
+/// the *plans being consumed*, not of the file: the same dataset can be
+/// well-sized for a consecutive-obs manifest and badly sized for a scattered
+/// perturbation gather (STATE3 measured 19× between those two on one file).
+struct ThrashSampler {
+    dataset: &'static str,
+    cache_shards: usize,
+    /// Total distinct cache entries the file(s) can ever hold — summed over
+    /// files, since the shared cache is keyed `(file_id, shard)`. Caps the
+    /// suggested size: under thrash the same shard is re-requested many times
+    /// per batch, so a requests-per-batch estimate *overcounts* the working set
+    /// (measured: 174 suggested on a 31-shard file). Caching more entries than
+    /// exist is meaningless, so this is both a correct bound and a tight one.
+    total_shards: usize,
+    /// `true` when the **byte** budget, not the count cap, is what limits
+    /// residency. Decides which knob the advice leads with: raising
+    /// `cache_shards` cannot help a byte-bound cache, so leading with it there is
+    /// a false primary diagnosis (round-2 review, Cursor P3).
+    byte_bound: bool,
+    /// Average decoded bytes per shard, so the advice can name a concrete
+    /// `max_memory_mb` rather than telling the caller to "raise" it.
+    shard_decoded_bytes: usize,
+    batches: u64,
+    /// One-shot: the message embeds live counters, so every call would be a
+    /// distinct message text and CPython's per-text dedupe would not suppress
+    /// it. Mirrors the `AtomicBool` latch in `pyscx/src/accel/rapids.rs`.
+    warned: AtomicBool,
+}
+
+/// Batch interval between thrash checks.
+///
+/// **Must be small enough to fire inside a short run.** A first version used 32
+/// and never sampled at all on the benchmark's own scattered-gather workload,
+/// which runs **30** batches (`cellset_gather::_n_batches_for` floors at
+/// `_MIN_N_BATCHES = 30` for census-scale files) — the diagnostic was silently
+/// dead on exactly the case it was built for. 8 gives three checks in a 30-batch
+/// run while still costing only three relaxed atomic loads per check, and
+/// premature verdicts are suppressed by `budget::THRASH_MIN_MISSES` rather than
+/// by the cadence: a scattered batch issues tens of shard reads, so 8 batches is
+/// already hundreds of samples.
+const THRASH_SAMPLE_EVERY: u64 = 8;
+
+impl ThrashSampler {
+    fn new(
+        dataset: &'static str,
+        cache_shards: usize,
+        total_shards: usize,
+        byte_bound: bool,
+        shard_decoded_bytes: usize,
+    ) -> Self {
+        ThrashSampler {
+            dataset,
+            cache_shards,
+            total_shards,
+            byte_bound,
+            shard_decoded_bytes,
+            batches: 0,
+            warned: AtomicBool::new(false),
+        }
+    }
+
+    /// Call once per yielded batch. Cheap until the sampling interval is hit,
+    /// and a no-op once it has warned.
+    fn observe(&mut self, py: Python<'_>, m: &CacheMetrics) {
+        self.batches += 1;
+        if !self.batches.is_multiple_of(THRASH_SAMPLE_EVERY) || self.warned.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let Some(v) = crate::budget::assess_cache_thrash(m, self.cache_shards) else {
+            return;
+        };
+        // Average shard *requests* per batch, capped at the number of shards
+        // that exist. The raw ratio overcounts badly under thrash (the same
+        // shard is re-requested after each eviction), and suggesting more
+        // entries than the file has is meaningless — so the cap is what makes
+        // this actionable rather than merely derived.
+        let per_batch = ((v.hits + v.misses).div_ceil(self.batches.max(1)) as usize)
+            .min(self.total_shards.max(1))
+            .max(self.cache_shards + 1);
+        // A warning must never break iteration: if emitting it raises (e.g. the
+        // caller turned UserWarning into an error via `simplefilter`), that is
+        // the caller's chosen behaviour for warnings, and propagating it from
+        // `__next__` would corrupt an otherwise healthy training loop. Record
+        // that we warned either way.
+        let _ = warn_cache_thrash(
+            py,
+            self.dataset,
+            &v,
+            per_batch,
+            self.byte_bound,
+            self.shard_decoded_bytes,
+            &self.warned,
+        );
+    }
+}
+
+/// Emit the runtime `UserWarning` for observed cache thrash. Latches so it fires
+/// at most once per iterator.
+fn warn_cache_thrash(
+    py: Python<'_>,
+    dataset: &str,
+    v: &crate::budget::ThrashVerdict,
+    suggested_cache_shards: usize,
+    byte_bound: bool,
+    shard_decoded_bytes: usize,
+    latch: &AtomicBool,
+) -> PyResult<()> {
+    if latch.swap(true, Ordering::Relaxed) {
+        return Ok(());
+    }
+    let warnings = py.import("warnings")?;
+    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    // Lead with the knob that can actually fix it. When the byte budget is the
+    // limiter, `cache_shards` is already at or above what is resident-capable and
+    // raising it changes nothing — advising it first is a false diagnosis even
+    // though the sentence is technically hedged.
+    let fix = if byte_bound {
+        let need_mb = suggested_cache_shards
+            .saturating_mul(shard_decoded_bytes)
+            .div_ceil(1024 * 1024)
+            .max(1);
+        format!(
+            "The BYTE budget is the limiter here, not the count: raise \
+             max_memory_mb to >={need_mb} (enough for ~{suggested_cache_shards} \
+             shards of ~{} KB). Raising cache_shards alone cannot help",
+            shard_decoded_bytes / 1024
+        )
+    } else {
+        format!(
+            "Try cache_shards>={suggested_cache_shards} (≈ the shards one batch \
+             touches, estimated from this run; `suggested_cache_shards(plan)` \
+             gives the exact count for a given plan), or raise max_memory_mb"
+        )
+    };
+    let msg = format!(
+        "{dataset}: shard-cache thrash detected — {:.0}% of {} shard reads missed \
+         and {:.2} entries were evicted per miss, so the working set exceeds the \
+         {}-entry cache. Throughput is likely dominated by re-decoding shards \
+         that were just evicted. {fix}. Suppress with \
+         warnings.filterwarnings('ignore', message='.*shard-cache thrash.*').",
+        v.miss_rate * 100.0,
+        v.hits + v.misses,
+        v.evictions_per_miss,
+        v.cache_shards,
+    );
+    warnings.call_method1("warn", (msg, user_warning))?;
+    Ok(())
 }
 
 /// Map `LoaderError` → Python exception, picking the most precise type.
@@ -1758,6 +1995,7 @@ impl SparseCellSetDataset {
         target_sum=None,
     ))]
     fn new(
+        py: Python<'_>,
         paths: Vec<String>,
         cache_shards: Option<usize>,
         max_memory_mb: Option<usize>,
@@ -1775,9 +2013,8 @@ impl SparseCellSetDataset {
         }
         let cache_shards = cache_shards.unwrap_or(128);
         let lookahead = lookahead.unwrap_or(4);
-        let bytes_budget = max_memory_mb
-            .map(|mb| mb.saturating_mul(1024 * 1024))
-            .unwrap_or(usize::MAX);
+        // `None` is now adaptive (bounded), not `usize::MAX` (unbounded).
+        let bytes_budget = max_memory_mb.map(|mb| mb.saturating_mul(1024 * 1024));
         let normalize = normalize.unwrap_or(false);
         let log1p = log1p.unwrap_or(false);
         let target_sum = target_sum.unwrap_or(1e4);
@@ -1802,6 +2039,10 @@ impl SparseCellSetDataset {
             target_sum,
         )
         .map_err(loader_err_to_py)?;
+
+        if let Some(v) = loader.cache_sizing() {
+            warn_cache_sizing(py, "SparseCellSetDataset", &v)?;
+        }
 
         Ok(Self {
             loader,
@@ -1846,7 +2087,79 @@ impl SparseCellSetDataset {
 
         let plan_stream = PySparseCellSetPlanIterator { py_iter };
         let inner = Arc::clone(&self.loader).iter_with_plans(plan_stream, lookahead);
-        Ok(SparseCellSetBatchIter { inner: Some(inner) })
+        Ok(SparseCellSetBatchIter {
+            inner: Some(inner),
+            cache_metrics: self.loader.cache_metrics(),
+            thrash: ThrashSampler::new(
+                "SparseCellSetDataset",
+                // The *affordable* count, not the requested one: on a large-shard
+                // file the byte budget binds first, and a warning that says
+                // "exceeds cache_shards=128" while the budget only holds 8 sends
+                // the caller to raise a knob that cannot help.
+                self.loader.effective_cache_shards(),
+                self.loader.total_shards(),
+                self.loader.effective_cache_shards() < self.loader.cache_shards(),
+                self.loader.shard_decoded_bytes(),
+            ),
+        })
+    }
+
+    /// Number of distinct `(file_id, shard)` pairs a cell-set plan touches — the
+    /// `cache_shards` that would let the whole batch stay resident.
+    ///
+    /// Pure index arithmetic from the catalogs' shard row ranges: no I/O, no
+    /// decode. `file_ids` and `rows` are the first two elements of the plan tuple
+    /// `iter_with_plans` consumes, so a caller can size the cache from the plans
+    /// it is about to issue:
+    ///
+    /// ```python
+    /// probe = pyscx.SparseCellSetDataset(paths)
+    /// need = max(probe.suggested_cache_shards(fids, rows) for fids, rows, _, _ in plans[:64])
+    /// ds = pyscx.SparseCellSetDataset(paths, cache_shards=need)
+    /// ```
+    ///
+    /// This is the measurement STATE3's 143 s/batch regime needed: its scattered
+    /// perturbation gather touched far more shards than the `cache_shards=16` it
+    /// was passing, and raising the cache to 48 was worth ~19×.
+    fn suggested_cache_shards(
+        &self,
+        py: Python<'_>,
+        file_ids: Vec<u32>,
+        rows: Vec<u64>,
+    ) -> PyResult<usize> {
+        if file_ids.len() != rows.len() {
+            return Err(PyValueError::new_err(format!(
+                "file_ids and rows must be the same length, got {} and {}",
+                file_ids.len(),
+                rows.len()
+            )));
+        }
+        Ok(py.detach(|| self.loader.plan_shard_touch_count(&file_ids, &rows)))
+    }
+
+    /// Resolved shard-cache budget:
+    ///
+    /// ```text
+    /// max_memory_mb           - byte budget in force (adaptive when not passed)
+    /// cache_shards            - requested count cap
+    /// affordable_cache_shards - shards the byte budget holds at average size
+    /// shard_decoded_bytes     - average decoded bytes per CSR shard
+    /// ```
+    ///
+    /// Unlike `IndexPlanDataset.memory_budget()` there is no batch-buffer or
+    /// plan-tuple term: on the sparse path the shard cache *is* the budget.
+    fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        let budget = self.loader.cache_bytes_budget();
+        let per_shard = self.loader.shard_decoded_bytes();
+        dict.set_item("max_memory_mb", budget / (1024 * 1024))?;
+        dict.set_item("cache_shards", self.loader.cache_shards())?;
+        dict.set_item(
+            "affordable_cache_shards",
+            self.loader.effective_cache_shards(),
+        )?;
+        dict.set_item("shard_decoded_bytes", per_shard)?;
+        Ok(dict)
     }
 
     /// Snapshot of the readers' shared shard-cache counters, cumulative since
@@ -1872,6 +2185,11 @@ impl SparseCellSetDataset {
 #[pyclass]
 pub struct SparseCellSetBatchIter {
     inner: Option<Box<dyn Iterator<Item = crate::error::Result<SparseCellSetBatch>> + Send + Sync>>,
+    /// Shared-cache counters, cloned at construction so sampling survives the
+    /// inner iterator being dropped on exhaustion.
+    cache_metrics: Arc<CacheMetrics>,
+    /// Samples `cache_metrics` as batches are yielded and warns once on thrash.
+    thrash: ThrashSampler,
 }
 
 #[pymethods]
@@ -1888,13 +2206,24 @@ impl SparseCellSetBatchIter {
         // worker can call __next__ on the user iterator without contention.
         let next = py.detach(|| inner.next());
         match next {
-            Some(Ok(batch)) => Ok(Some(sparse_cellset_batch_to_dict(py, batch)?)),
+            Some(Ok(batch)) => {
+                let dict = sparse_cellset_batch_to_dict(py, batch)?;
+                self.thrash.observe(py, &self.cache_metrics);
+                Ok(Some(dict))
+            }
             Some(Err(e)) => Err(loader_err_to_py(e)),
             None => {
                 self.inner = None;
                 Ok(None)
             }
         }
+    }
+
+    /// Snapshot of the shared shard-cache counters (same keys as
+    /// `SparseCellSetDataset.cache_metrics`). Present so this iterator is
+    /// symmetric with `IndexPlanBatchIter.metrics()`; safe after exhaustion.
+    fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        cache_metrics_to_pydict(py, &self.cache_metrics)
     }
 
     fn __repr__(&self) -> String {

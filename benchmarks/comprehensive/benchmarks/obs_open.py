@@ -137,6 +137,154 @@ def _pick_and_read_scx(path: str) -> int:
     return int(len(df))
 
 
+def _read_codes_scx(path: str) -> int:
+    """Open an SCX file and read one categorical column as ``(codes, categories)``
+    via ``obs_categorical`` — the data-load 1C accessor.
+
+    Compared against ``_pick_and_read_scx`` (``read_obs([col])``) this isolates the
+    saving from skipping the Arrow-IPC → pyarrow → pandas hop and the per-shard
+    column concat: same bytes off disk, different assembly. The Phase-0 cold split
+    put **99.8%** of per-file cost in obs reading, so this is the term 1C targets.
+    """
+    import pyscx
+
+    exp = pyscx.open(path)
+    keys = list(exp.obs_keys())
+    if not keys:
+        return int(exp.n_obs_physical)
+    # First column that is actually string/categorical — `obs_categorical`
+    # rejects numerics, and a dataset's first obs column is often `n_counts`.
+    for col in keys:
+        try:
+            codes, _cats = exp.obs_categorical(col)
+        except (ValueError, TypeError):
+            continue
+        return int(len(codes))
+    # Every column numeric: fall back to the bare open so the scenario still
+    # reports rather than silently producing no runs.
+    return int(exp.n_obs_physical)
+
+
+# Column-type probes are memoized per path so they land in the *warmup* call and
+# not in every timed run. Round-2 review (Cursor P3): the first draft probed types
+# by fully reading each column inside the timed function, so the scenario measured
+# the probe plus the work, roughly doubling it. `distinct_values(col, limit=1)`
+# scans only the per-shard dictionary catalog and raises on non-string columns, so
+# it is a cheap type probe — but even that belongs outside the measurement.
+_CATEGORICAL_COLS: dict[tuple[str, int], list[str]] = {}
+
+
+def _categorical_cols(path: str, limit: int) -> list[str]:
+    """Up to `limit` string/categorical obs column names. Memoized per path."""
+    key = (path, limit)
+    if key in _CATEGORICAL_COLS:
+        return _CATEGORICAL_COLS[key]
+    import pyscx
+
+    exp = pyscx.open(path)
+    cols: list[str] = []
+    for col in exp.obs_keys():
+        try:
+            exp.distinct_values(col, limit=1)
+        except (ValueError, TypeError):
+            continue
+        cols.append(col)
+        if len(cols) == limit:
+            break
+    _CATEGORICAL_COLS[key] = cols
+    return cols
+
+
+def _read_codes_many_scx(path: str) -> int:
+    """Read up to 4 categorical columns in ONE shard pass via
+    ``obs_categorical_many`` — the claim that N columns cost one projected read per
+    shard rather than N.
+
+    This is the shape state3's ``_setup_global_maps`` actually issues (it builds a
+    global vocabulary per covariate column), so it is the more representative
+    number than the single-column arm.
+    """
+    import pyscx
+
+    cols = _categorical_cols(path, limit=4)
+    if not cols:
+        import pyscx
+
+        return int(pyscx.open(path).n_obs_physical)
+    import pyscx
+
+    # One open, one `_many` call — nothing else in the timed region.
+    return int(len(pyscx.open(path).obs_categorical_many(cols)[0][0]))
+
+
+def _read_codes_many_h5ad(path: str) -> int:
+    """anndata analogue: materialize up to 4 obs columns and take their codes."""
+    import anndata
+    import pandas as pd
+
+    adata = anndata.read_h5ad(path, backed="r")
+    try:
+        n = 0
+        for col in list(adata.obs.columns):
+            series = adata.obs[col]
+            if isinstance(series.dtype, pd.CategoricalDtype):
+                cat = series
+            elif series.dtype == object:
+                cat = series.astype("category")
+            else:
+                continue
+            _ = cat.cat.codes.to_numpy()
+            _ = list(cat.cat.categories)
+            n += 1
+            if n == 4:
+                break
+        return int(adata.n_obs)
+    finally:
+        if getattr(adata, "isbacked", False) and adata.file is not None:
+            adata.file.close()
+
+
+def _codes_many_fn_for(format_key: str) -> Callable[[str], int]:
+    if format_key == "scx_auto":
+        return _read_codes_many_scx
+    if format_key == "h5ad_none":
+        return _read_codes_many_h5ad
+    raise ValueError(f"obs_open unsupported format {format_key!r}")
+
+
+def _read_codes_h5ad(path: str) -> int:
+    """anndata analogue of ``_read_codes_scx``: materialize one obs column and take
+    its ``.cat.codes`` — what a consumer building a global vocab actually does."""
+    import anndata
+    import pandas as pd
+
+    adata = anndata.read_h5ad(path, backed="r")
+    try:
+        for col in list(adata.obs.columns):
+            series = adata.obs[col]
+            if isinstance(series.dtype, pd.CategoricalDtype):
+                _ = series.cat.codes.to_numpy()
+                _ = list(series.cat.categories)
+                return int(adata.n_obs)
+            if series.dtype == object:
+                cat = series.astype("category")
+                _ = cat.cat.codes.to_numpy()
+                _ = list(cat.cat.categories)
+                return int(adata.n_obs)
+        return int(adata.n_obs)
+    finally:
+        if getattr(adata, "isbacked", False) and adata.file is not None:
+            adata.file.close()
+
+
+def _codes_fn_for(format_key: str) -> Callable[[str], int]:
+    if format_key == "scx_auto":
+        return _read_codes_scx
+    if format_key == "h5ad_none":
+        return _read_codes_h5ad
+    raise ValueError(f"obs_open unsupported format {format_key!r}")
+
+
 def _open_h5ad(path: str) -> int:
     """Open an h5ad backed and return ``n_obs`` — obs columns NOT materialized.
 
@@ -377,15 +525,28 @@ def run(
     # four `thresholds.yaml` absolute floors key off
     # `obs_open_s_per_file__open_1file`; renaming turns them into "missing
     # metric" violations rather than a regression signal.
+    codes_fn = _codes_fn_for(format_variant.key)
+    codes_many_fn = _codes_many_fn_for(format_variant.key)
+
     scenarios: list[tuple[str, list[str], Callable[[str], int]]] = [
         ("open_1file", [single], read_fn),
         ("open_only", [single], open_fn),
+        # data-load 1C: same column, `(codes, categories)` instead of a pandas
+        # frame. Paired with `open_1file` so the delta is the assembly cost, not
+        # the I/O. Both formats, so the comparison is against what a consumer
+        # does today (`obs[col].cat.codes`), not only against our own old path.
+        ("obs_codes_1file", [single], codes_fn),
+        # Opus 4.6 review: the multi-column case is the compelling one for
+        # state3's `_setup_global_maps`, and it is what validates the "one shard
+        # pass for N columns" claim rather than merely asserting it.
+        ("obs_codes_many_1file", [single], codes_many_fn),
     ]
     if format_variant.key == "scx_auto":
         # No h5ad analogue: anndata has no "skip the integrity check" open.
         scenarios.append(("open_only_unverified", [single], _open_unverified_scx))
     if manifest_paths:
         scenarios.append(("open_manifest", manifest_paths, read_fn))
+        scenarios.append(("obs_codes_manifest", manifest_paths, codes_fn))
         result.metadata["manifest_n_files"] = len(manifest_paths)
 
     for scenario_name, paths, fn in scenarios:
@@ -469,6 +630,24 @@ def run(
     if breakdown:
         result.metadata["open_cost_breakdown"] = breakdown
         logger.info("    open-cost breakdown (s/file): %s", breakdown)
+
+    # --- data-load 1C: obs_categorical vs read_obs(columns=) --------------
+    # A ratio of two medians, so metadata rather than a floored metric — same
+    # reasoning as the breakdown above. Reported per format so the h5ad arm shows
+    # what a consumer pays today, not just our own before/after.
+    per_file_codes = _median("obs_codes_1file")
+    if per_file_total and per_file_codes:
+        result.metadata["obs_codes_vs_read_obs"] = {
+            "read_obs_s_per_file": per_file_total,
+            "obs_categorical_s_per_file": per_file_codes,
+            "speedup": round(per_file_total / per_file_codes, 3),
+        }
+        logger.info(
+            "    1C obs_categorical vs read_obs: %.5fs → %.5fs (%.2f×)",
+            per_file_total,
+            per_file_codes,
+            per_file_total / per_file_codes,
+        )
 
     # --- P-1(a) × ranks ---------------------------------------------------
     if manifest_paths and n_ranks > 1:
