@@ -1238,6 +1238,10 @@ impl IndexPlanDataset {
             "IndexPlanDataset",
             self.loader.effective_cache_shards(),
             self.loader.n_shards(),
+            // The paired path's auto-tune reduces the count to fit the budget, so
+            // a reduction there IS byte-driven.
+            self.loader.effective_cache_shards() < self.loader.requested_cache_shards(),
+            self.loader.shard_decoded_bytes(),
         );
         Ok(IndexPlanBatchIter {
             inner: Some(inner),
@@ -1592,6 +1596,14 @@ struct ThrashSampler {
     /// (measured: 174 suggested on a 31-shard file). Caching more entries than
     /// exist is meaningless, so this is both a correct bound and a tight one.
     total_shards: usize,
+    /// `true` when the **byte** budget, not the count cap, is what limits
+    /// residency. Decides which knob the advice leads with: raising
+    /// `cache_shards` cannot help a byte-bound cache, so leading with it there is
+    /// a false primary diagnosis (round-2 review, Cursor P3).
+    byte_bound: bool,
+    /// Average decoded bytes per shard, so the advice can name a concrete
+    /// `max_memory_mb` rather than telling the caller to "raise" it.
+    shard_decoded_bytes: usize,
     batches: u64,
     /// One-shot: the message embeds live counters, so every call would be a
     /// distinct message text and CPython's per-text dedupe would not suppress
@@ -1613,11 +1625,19 @@ struct ThrashSampler {
 const THRASH_SAMPLE_EVERY: u64 = 8;
 
 impl ThrashSampler {
-    fn new(dataset: &'static str, cache_shards: usize, total_shards: usize) -> Self {
+    fn new(
+        dataset: &'static str,
+        cache_shards: usize,
+        total_shards: usize,
+        byte_bound: bool,
+        shard_decoded_bytes: usize,
+    ) -> Self {
         ThrashSampler {
             dataset,
             cache_shards,
             total_shards,
+            byte_bound,
+            shard_decoded_bytes,
             batches: 0,
             warned: AtomicBool::new(false),
         }
@@ -1647,7 +1667,15 @@ impl ThrashSampler {
         // the caller's chosen behaviour for warnings, and propagating it from
         // `__next__` would corrupt an otherwise healthy training loop. Record
         // that we warned either way.
-        let _ = warn_cache_thrash(py, self.dataset, &v, per_batch, &self.warned);
+        let _ = warn_cache_thrash(
+            py,
+            self.dataset,
+            &v,
+            per_batch,
+            self.byte_bound,
+            self.shard_decoded_bytes,
+            &self.warned,
+        );
     }
 }
 
@@ -1658,6 +1686,8 @@ fn warn_cache_thrash(
     dataset: &str,
     v: &crate::budget::ThrashVerdict,
     suggested_cache_shards: usize,
+    byte_bound: bool,
+    shard_decoded_bytes: usize,
     latch: &AtomicBool,
 ) -> PyResult<()> {
     if latch.swap(true, Ordering::Relaxed) {
@@ -1665,19 +1695,38 @@ fn warn_cache_thrash(
     }
     let warnings = py.import("warnings")?;
     let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    // Lead with the knob that can actually fix it. When the byte budget is the
+    // limiter, `cache_shards` is already at or above what is resident-capable and
+    // raising it changes nothing — advising it first is a false diagnosis even
+    // though the sentence is technically hedged.
+    let fix = if byte_bound {
+        let need_mb = suggested_cache_shards
+            .saturating_mul(shard_decoded_bytes)
+            .div_ceil(1024 * 1024)
+            .max(1);
+        format!(
+            "The BYTE budget is the limiter here, not the count: raise \
+             max_memory_mb to >={need_mb} (enough for ~{suggested_cache_shards} \
+             shards of ~{} KB). Raising cache_shards alone cannot help",
+            shard_decoded_bytes / 1024
+        )
+    } else {
+        format!(
+            "Try cache_shards>={suggested_cache_shards} (≈ the shards one batch \
+             touches, estimated from this run; `suggested_cache_shards(plan)` \
+             gives the exact count for a given plan), or raise max_memory_mb"
+        )
+    };
     let msg = format!(
         "{dataset}: shard-cache thrash detected — {:.0}% of {} shard reads missed \
-         and {:.2} entries were evicted per miss, so the working set exceeds \
-         cache_shards={}. Throughput is likely dominated by re-decoding shards \
-         that were just evicted. Try cache_shards>={} (≈ the shards one batch \
-         touches, estimated from this run; `suggested_cache_shards(plan)` gives \
-         the exact count for a given plan), or raise max_memory_mb. Suppress with \
+         and {:.2} entries were evicted per miss, so the working set exceeds the \
+         {}-entry cache. Throughput is likely dominated by re-decoding shards \
+         that were just evicted. {fix}. Suppress with \
          warnings.filterwarnings('ignore', message='.*shard-cache thrash.*').",
         v.miss_rate * 100.0,
         v.hits + v.misses,
         v.evictions_per_miss,
         v.cache_shards,
-        suggested_cache_shards,
     );
     warnings.call_method1("warn", (msg, user_warning))?;
     Ok(())
@@ -2049,6 +2098,8 @@ impl SparseCellSetDataset {
                 // the caller to raise a knob that cannot help.
                 self.loader.effective_cache_shards(),
                 self.loader.total_shards(),
+                self.loader.effective_cache_shards() < self.loader.cache_shards(),
+                self.loader.shard_decoded_bytes(),
             ),
         })
     }

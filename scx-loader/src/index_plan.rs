@@ -145,6 +145,12 @@ pub struct IndexPlanLoader {
     /// `cache_shards`. Read once by `IndexPlanDataset::new` to emit the
     /// caller-facing `UserWarning`; see [`crate::budget::assess_cache_sizing`].
     cache_sizing: Option<crate::budget::CacheSizingVerdict>,
+    /// The `cache_shards` the caller asked for, pre-auto-tune. Compared against
+    /// `effective_cache_shards` to tell a byte-driven reduction from none.
+    requested_cache_shards: usize,
+    /// Average decoded bytes per CSR shard — lets a diagnostic name a concrete
+    /// `max_memory_mb` instead of saying "raise it".
+    shard_decoded_bytes: usize,
     /// Per-dataset escape hatch for the codec-agnostic row-group block-index
     /// path (default `true`). `set_scatter_block_index` propagates this to the
     /// backed reader, so `False` disables **both** the L2 prefetch skip **and**
@@ -490,6 +496,8 @@ impl IndexPlanLoader {
             cache_metrics,
             budget_breakdown,
             cache_sizing,
+            requested_cache_shards: cache_shards,
+            shard_decoded_bytes,
             // Default on; the Python layer overrides via
             // `set_scatter_block_index` when the caller passes the kwarg.
             scatter_block_index: true,
@@ -617,6 +625,16 @@ impl IndexPlanLoader {
     /// warn; `None` is the common case.
     pub fn cache_sizing(&self) -> Option<crate::budget::CacheSizingVerdict> {
         self.cache_sizing
+    }
+
+    /// The `cache_shards` the caller requested, before the budget auto-tune.
+    pub fn requested_cache_shards(&self) -> usize {
+        self.requested_cache_shards
+    }
+
+    /// Average decoded bytes per CSR shard, as used by the budget model.
+    pub fn shard_decoded_bytes(&self) -> usize {
+        self.shard_decoded_bytes
     }
 
     /// Number of CSR shards in the file — the cap on distinct cache entries.

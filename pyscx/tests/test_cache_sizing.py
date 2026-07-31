@@ -53,6 +53,36 @@ def multishard_path(tmp_path):
     return path
 
 
+@pytest.fixture
+def bigshard_path(tmp_path):
+    """Unframed fixture with LARGE shards: 200 cells x 2000 genes, dense, 10 shards.
+
+    ~320 KB decoded per shard, so a 1 MB byte budget affords ~3 entries while a
+    scattered plan touches all 10 — the only shape in which the **byte** cap is
+    the binding constraint. The small `multishard_path` fixture cannot express
+    this: at ~6 KB/shard even a 1 MB budget holds the entire file, so nothing
+    thrashes however high `cache_shards` is set. (Round-2 review caught a test
+    that missed exactly this and asserted nothing as a result.)
+    """
+    import anndata
+
+    rng = np.random.default_rng(11)
+    n_obs, n_vars = 200, 2000
+    dense = rng.integers(1, 50, size=(n_obs, n_vars)).astype(np.float32)
+    obs = pd.DataFrame(
+        {"cell_id": [f"cell_{i}" for i in range(n_obs)]},
+        index=[f"cell_{i}" for i in range(n_obs)],
+    )
+    var = pd.DataFrame(
+        {"gene_id": [f"gene_{i}" for i in range(n_vars)]},
+        index=[f"gene_{i}" for i in range(n_vars)],
+    )
+    adata = anndata.AnnData(X=sp.csr_matrix(dense), obs=obs, var=var)
+    path = str(tmp_path / "bigshard.scx")
+    pyscx.from_anndata(adata, path, shard_size=20, row_group_rows=0)
+    return path
+
+
 class TestSuggestedCacheShards:
     """The measurement STATE3 lacked: how many shards does this plan touch?"""
 
@@ -214,7 +244,10 @@ class TestThrashWarning:
             f"{[str(w.message) for w in thrash]}"
         )
         msg = str(thrash[0].message)
-        assert "cache_shards=1" in msg, msg
+        assert "1-entry cache" in msg, f"must name the effective cache size: {msg}"
+        # Count-bound (an explicit cache_shards=1 with a generous budget), so the
+        # advice must lead with the count knob and name the sizing helper.
+        assert "Try cache_shards>=" in msg, f"must lead with the count knob: {msg}"
         assert "suggested_cache_shards" in msg, f"must name the tool: {msg}"
 
     def test_well_sized_cache_does_not_warn(self, multishard_path):
@@ -301,7 +334,7 @@ class TestThrashWarning:
         )
 
     def test_message_names_the_byte_bound_count_not_the_request(
-        self, multishard_path
+        self, bigshard_path
     ):
         """When the byte cap binds, the warning must quote the affordable count.
 
@@ -310,10 +343,14 @@ class TestThrashWarning:
         knob the caller already set high, and raising it further cannot help.
         """
         ds = pyscx.SparseCellSetDataset(
-            [multishard_path], cache_shards=4096, max_memory_mb=1
+            [bigshard_path], cache_shards=4096, max_memory_mb=1
         )
         affordable = ds.memory_budget()["affordable_cache_shards"]
-        assert affordable < 4096, "premise: this config must be byte-bound"
+        n_shards = pyscx.open(bigshard_path).shard_count
+        assert affordable < n_shards, (
+            f"premise: the byte cap must afford fewer ({affordable}) than the "
+            f"plan touches ({n_shards}), else nothing thrashes"
+        )
 
         plans = [
             (
@@ -332,12 +369,29 @@ class TestThrashWarning:
             for _ in ds.iter_with_plans(iter(plans)):
                 pass
         msgs = [str(w.message) for w in rec if "shard-cache thrash" in str(w.message)]
-        if msgs:
-            assert f"cache_shards={affordable}" in msgs[0], (
-                f"must quote the affordable count {affordable}, not the "
-                f"request 4096: {msgs[0]}"
-            )
-            assert "cache_shards=4096" not in msgs[0]
+        # Unconditional. Round-2 review (Cursor, P2) caught that this was
+        # originally guarded by `if msgs:` — which made the whole assertion
+        # vacuous: a run that never warned passed silently, so the test could not
+        # fail for the reason it exists. If this config stops thrashing, the test
+        # must break loudly and be re-pointed, not quietly stop checking.
+        assert msgs, (
+            f"premise: a {n_shards}-shard working set against a {affordable}-entry "
+            f"cache must thrash and warn"
+        )
+        m = msgs[0]
+        # The cache size named must be the affordable count, never the request.
+        assert f"{affordable}-entry cache" in m, (
+            f"must quote the affordable count {affordable}, not the request 4096: {m}"
+        )
+        assert "4096-entry" not in m
+        # And the advice must lead with the knob that can actually fix it
+        # (round-2 review, Cursor P3): raising `cache_shards` cannot help a
+        # byte-bound cache, so it must not be the primary suggestion.
+        assert "BYTE budget is the limiter" in m, f"must lead with the budget: {m}"
+        assert "raise max_memory_mb to >=" in m, f"must name a concrete budget: {m}"
+        assert "Try cache_shards>=" not in m, (
+            f"must NOT lead with the count knob when bytes bind: {m}"
+        )
 
     def test_short_run_below_the_warmup_floor_is_silent(self, multishard_path):
         """A cold cache is not thrash, and a few batches are not evidence."""

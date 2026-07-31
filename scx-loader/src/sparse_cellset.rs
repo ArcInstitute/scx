@@ -117,20 +117,30 @@ pub struct SparseCellSetLoader {
 fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> usize {
     let mut total_nnz = 0u64;
     let mut total_rows = 0u64;
-    let mut n_shards = 0usize;
+    // Only shards that CONTRIBUTED to the totals may count toward the divisor.
+    // Counting stat-less shards in the denominator averages their 0 bytes into
+    // the result, *under*-estimating the per-shard size — which then
+    // *over*-estimates how many shards the byte budget affords and makes the
+    // sizing diagnostic under-warn on exactly the files whose catalogs are
+    // incomplete. Flagged independently by all three round-2 reviewers.
+    let mut n_counted = 0u64;
     for r in readers {
         for e in r.catalog().shards_sorted() {
             if let Some(s) = e.stats.as_ref() {
                 total_nnz += s.nnz;
                 total_rows += s.row_end - s.row_start;
+                n_counted += 1;
             }
-            n_shards += 1;
         }
     }
-    if n_shards == 0 {
-        return 0;
-    }
-    ((total_nnz.saturating_mul(8) + total_rows.saturating_mul(8)) / n_shards as u64) as usize
+    // No shard carried stats ⇒ the size is genuinely unknown. Returning 0 is the
+    // signal `SparseCellSetLoader::new` reads as "the byte cap tells us nothing",
+    // falling back to the count cap rather than to a fabricated average.
+    total_nnz
+        .saturating_mul(8)
+        .saturating_add(total_rows.saturating_mul(8))
+        .checked_div(n_counted)
+        .unwrap_or(0) as usize
 }
 
 impl SparseCellSetLoader {

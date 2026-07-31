@@ -165,6 +165,36 @@ def _read_codes_scx(path: str) -> int:
     return int(exp.n_obs_physical)
 
 
+# Column-type probes are memoized per path so they land in the *warmup* call and
+# not in every timed run. Round-2 review (Cursor P3): the first draft probed types
+# by fully reading each column inside the timed function, so the scenario measured
+# the probe plus the work, roughly doubling it. `distinct_values(col, limit=1)`
+# scans only the per-shard dictionary catalog and raises on non-string columns, so
+# it is a cheap type probe — but even that belongs outside the measurement.
+_CATEGORICAL_COLS: dict[tuple[str, int], list[str]] = {}
+
+
+def _categorical_cols(path: str, limit: int) -> list[str]:
+    """Up to `limit` string/categorical obs column names. Memoized per path."""
+    key = (path, limit)
+    if key in _CATEGORICAL_COLS:
+        return _CATEGORICAL_COLS[key]
+    import pyscx
+
+    exp = pyscx.open(path)
+    cols: list[str] = []
+    for col in exp.obs_keys():
+        try:
+            exp.distinct_values(col, limit=1)
+        except (ValueError, TypeError):
+            continue
+        cols.append(col)
+        if len(cols) == limit:
+            break
+    _CATEGORICAL_COLS[key] = cols
+    return cols
+
+
 def _read_codes_many_scx(path: str) -> int:
     """Read up to 4 categorical columns in ONE shard pass via
     ``obs_categorical_many`` — the claim that N columns cost one projected read per
@@ -176,26 +206,15 @@ def _read_codes_many_scx(path: str) -> int:
     """
     import pyscx
 
-    exp = pyscx.open(path)
-    # Probe types with `distinct_values(col, limit=1)`, NOT with a full
-    # `obs_categorical(col)`: the latter reads the whole column, so the probe
-    # would do the work this scenario is trying to measure and then do it again
-    # via `_many` — measuring 2x the intended cost. `distinct_values` scans the
-    # per-shard dictionary catalog and raises on non-string columns, which is
-    # exactly a cheap type probe.
-    cols: list[str] = []
-    for col in exp.obs_keys():
-        try:
-            exp.distinct_values(col, limit=1)
-        except (ValueError, TypeError):
-            continue
-        cols.append(col)
-        if len(cols) == 4:
-            break
+    cols = _categorical_cols(path, limit=4)
     if not cols:
-        return int(exp.n_obs_physical)
-    out = pyscx.open(path).obs_categorical_many(cols)
-    return int(len(out[0][0]))
+        import pyscx
+
+        return int(pyscx.open(path).n_obs_physical)
+    import pyscx
+
+    # One open, one `_many` call — nothing else in the timed region.
+    return int(len(pyscx.open(path).obs_categorical_many(cols)[0][0]))
 
 
 def _read_codes_many_h5ad(path: str) -> int:

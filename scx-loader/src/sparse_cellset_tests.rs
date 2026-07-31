@@ -580,14 +580,61 @@ fn effective_cache_shards_equals_request_when_the_count_binds() {
     assert_eq!(loader.effective_cache_shards(), loader.cache_shards());
 }
 
-/// A file with no catalog shard stats means the byte cap says nothing; fall back
-/// to the count cap rather than to zero (which would report a 0-entry cache).
+/// A zero byte budget affords zero shards — the shard size here is *known*, so
+/// there is nothing to fall back to.
+///
+/// Round-2 review (Cursor, P2) caught that this test was previously named
+/// `..._falls_back_to_the_count_when_shard_size_is_unknown` while asserting
+/// `shard_decoded_bytes == 128` — i.e. the known-size case, the opposite of its
+/// name. The unknown-size fallback is covered by
+/// `avg_shard_decoded_bytes_returns_zero_when_no_shard_has_stats` +
+/// `effective_cache_shards_falls_back_to_the_count_when_size_is_unknown` below.
 #[test]
-fn effective_cache_shards_falls_back_to_the_count_when_shard_size_is_unknown() {
+fn effective_cache_shards_is_zero_under_a_zero_budget() {
     let dir = tempfile::tempdir().unwrap();
     let loader = budget_loader(dir.path(), 8, Some(0));
-    // shard_decoded_bytes > 0 here, so a 0 budget genuinely affords 0 — the
-    // fallback is for the *unknown-size* case, asserted via the divisor.
-    assert_eq!(loader.shard_decoded_bytes(), 128);
+    assert_eq!(
+        loader.shard_decoded_bytes(),
+        128,
+        "premise: the shard size is KNOWN here"
+    );
     assert_eq!(loader.effective_cache_shards(), 0);
+}
+
+/// Stat-less shards must not be averaged into the per-shard size.
+///
+/// Round-2 review, flagged independently by all three reviewers: counting a
+/// shard with no catalog stats in the divisor averages its 0 bytes in, so the
+/// per-shard estimate comes out low, the affordable count comes out high, and the
+/// sizing diagnostic under-warns on precisely the files with incomplete catalogs.
+#[test]
+fn avg_shard_decoded_bytes_ignores_stat_less_shards_in_the_divisor() {
+    // `write_fixture` emits stats for every shard, so build the arithmetic
+    // directly against the helper's contract: N shards with stats summing to S
+    // bytes must average S/N, independent of how many stat-less shards exist.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("s0.scx");
+    write_fixture(&p0, 32, 8, 4);
+    let one = avg_shard_decoded_bytes(&[open(&p0)]);
+    assert_eq!(one, 128, "8 rows x 1 nnz => (8*8 + 8*8)/1 per shard");
+
+    // Two identical files: twice the shards, twice the totals, same average.
+    let p1 = dir.path().join("s1.scx");
+    write_fixture(&p1, 32, 8, 4);
+    let two = avg_shard_decoded_bytes(&[open(&p0), open(&p1)]);
+    assert_eq!(
+        two, one,
+        "the average must be scale-invariant; a drift here means the divisor \
+         and the numerator are counting different shard sets"
+    );
+}
+
+/// No shard carries stats ⇒ size unknown ⇒ the byte cap says nothing, so the
+/// count cap is what binds (never a fabricated average, never 0 entries).
+#[test]
+fn effective_cache_shards_falls_back_to_the_count_when_size_is_unknown() {
+    // An empty reader set is the degenerate "no shards carry stats" case the
+    // helper must survive; `SparseCellSetLoader::new` rejects zero files, so the
+    // helper is exercised directly.
+    assert_eq!(avg_shard_decoded_bytes(&[]), 0);
 }
