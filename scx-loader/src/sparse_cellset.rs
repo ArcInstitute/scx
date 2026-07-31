@@ -6,10 +6,13 @@
 //! sets, delimited by `set_offsets`; each set's rows are gathered via one
 //! `read_rows_with` per reader (single-file fast path) into per-set CSR builders.
 //!
-//! Output is **raw-local CSR by default** — state3 applies its `local→global`
-//! remap, coalesce, clip, and downsampling in Python (downsampling has no Rust
-//! primitive). An **optional** per-file `local→global` remap (off by default)
-//! can emit global-vocab CSR for callers that want it (§4.3 item 3).
+//! Output is **raw-local CSR by default**; an **optional** per-file `local→global`
+//! remap (off by default) emits global-vocab CSR for callers that want it (§4.3
+//! item 3). With the remap on, this path owns the whole of the consumer's
+//! `finalize_csr_row` equivalent: remap, `-1` drop, sort, coalesce, the
+//! non-negativity clip, and — when configured — a seeded count downsample
+//! ([`crate::downsample`]). Only the *raw-local* configuration still leaves
+//! remap/coalesce to the caller.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -108,6 +111,15 @@ pub struct SparseCellSetLoader {
     /// shards. Consumed by the Python constructor to warn; see
     /// [`crate::budget::assess_cache_sizing`].
     cache_sizing: Option<crate::budget::CacheSizingVerdict>,
+    /// Optional seeded count-downsample applied per row in [`Self::transform_row`],
+    /// i.e. **before** the batch leaves Rust. Placement is load-bearing, not
+    /// convenience: consumers sample the decoder query from the gathered counts
+    /// (`counts > 0`) and then hand the *same* arrays to the collate kernel, so a
+    /// downsample applied later would draw the query from pre-downsample expressed
+    /// genes while the numerics used post-downsample counts — a silent divergence
+    /// from the Python reference, which downsamples inside `finalize_csr_row`
+    /// before task specification.
+    downsample: Option<crate::downsample::DownsampleConfig>,
 }
 
 /// Average decoded bytes per CSR shard across `readers`, from catalog stats
@@ -166,7 +178,20 @@ impl SparseCellSetLoader {
         normalize: bool,
         log1p: bool,
         target_sum: f64,
+        downsample: Option<crate::downsample::DownsampleConfig>,
     ) -> Result<Arc<Self>> {
+        if let Some(cfg) = &downsample {
+            cfg.validate()?;
+            if !cfg.file_identities.is_empty() && cfg.file_identities.len() != scx_readers.len() {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "downsample file_identities has {} entries but there are {} files",
+                        cfg.file_identities.len(),
+                        scx_readers.len()
+                    ),
+                });
+            }
+        }
         if let Some(tables) = &remap {
             if tables.len() != scx_readers.len() {
                 return Err(LoaderError::ConfigError {
@@ -243,6 +268,7 @@ impl SparseCellSetLoader {
             affordable_cache_shards,
             shard_decoded_bytes,
             cache_sizing,
+            downsample,
         }))
     }
 
@@ -434,7 +460,12 @@ impl SparseCellSetLoader {
                 let reader = engine.reader(fid);
                 reader
                     .read_rows_with(set_rows, |orig_pos, idx, dat| {
-                        per_row[orig_pos] = Some(self.transform_row(fid, idx, dat));
+                        // `orig_pos` is the position in `set_rows`, not the row id
+                        // — the scatter fires in shard-grouped order. The row id is
+                        // what keys the downsample RNG, so read it back through the
+                        // request array.
+                        per_row[orig_pos] =
+                            Some(self.transform_row(fid, set_rows[orig_pos], idx, dat));
                         Ok(())
                     })
                     .map_err(LoaderError::FormatError)?;
@@ -456,8 +487,9 @@ impl SparseCellSetLoader {
                     let rs: Vec<u64> = items.iter().map(|&(_, r)| r).collect();
                     reader
                         .read_rows_with(&rs, |orig_pos, idx, dat| {
-                            let within_set_pos = items[orig_pos].0;
-                            per_row[within_set_pos] = Some(self.transform_row(f, idx, dat));
+                            let (within_set_pos, src_row) = items[orig_pos];
+                            per_row[within_set_pos] =
+                                Some(self.transform_row(f, src_row, idx, dat));
                             Ok(())
                         })
                         .map_err(LoaderError::FormatError)?;
@@ -492,12 +524,36 @@ impl SparseCellSetLoader {
         })
     }
 
-    /// Apply the optional remap + value-only transforms to one gathered row.
-    fn transform_row(&self, fid: u32, idx: &[i32], dat: &[f32]) -> (Vec<i32>, Vec<f32>) {
-        let (out_idx, mut out_dat) = match &self.remap {
+    /// Apply the optional remap, the non-negativity clip, the optional seeded
+    /// downsample, and the value-only transforms to one gathered row.
+    ///
+    /// Stage order mirrors the Python reference's `finalize_csr_row`
+    /// (`state3/src/state3/data/dataset.py:107-121`) exactly:
+    /// remap → coalesce → **clip** → **downsample** → prune, then transforms.
+    ///
+    /// The clip lands **after** coalescing, not inside `remap_row`, because that is
+    /// where the reference puts it and the two disagree: a `+5` and a `−3` mapping
+    /// to the same global gene must coalesce to `2`, not to `5`.
+    ///
+    /// The clip runs unconditionally; the zero-prune does **not**. The reference
+    /// prunes only inside its downsample branch, so with downsampling off a clipped
+    /// `−1 → 0` stays an explicit zero and nnz is unchanged. Callers that count nnz
+    /// therefore see the same structure with and without the clip.
+    fn transform_row(&self, fid: u32, row: u64, idx: &[i32], dat: &[f32]) -> (Vec<i32>, Vec<f32>) {
+        let (mut out_idx, mut out_dat) = match &self.remap {
             Some(tables) => remap_row(idx, dat, &tables[fid as usize]),
             None => (idx.to_vec(), dat.to_vec()),
         };
+        crate::downsample::clip_negatives(&mut out_dat);
+        if let Some(cfg) = &self.downsample {
+            crate::downsample::downsample_row(
+                &mut out_idx,
+                &mut out_dat,
+                cfg,
+                cfg.identity_for(fid),
+                row,
+            );
+        }
         if self.normalize || self.log1p {
             apply_sparse_transforms(&mut out_dat, self.normalize, self.log1p, self.target_sum);
         }

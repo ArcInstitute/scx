@@ -23,6 +23,13 @@ crossbeam-channel = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
+# Binomial sampler for the seeded count-downsample primitive (downsample.rs).
+# Note rand_distr 0.4 has no multinomial — that path is sequential-conditional
+# binomials, matching numpy's own scheme.
+rand_distr = { workspace = true }
+# Stable per-file identity for the downsample RNG key (blake3 truncated-64 of the
+# canonical path), so a reordered manifest does not redraw every cell.
+blake3 = { workspace = true }
 arrow = { workspace = true }
 roaring = { workspace = true }
 log = { workspace = true }

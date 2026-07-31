@@ -218,7 +218,24 @@ class SparseCellSetDataset:
         normalize: bool | None = None,
         log1p: bool | None = None,
         target_sum: float | None = None,
-    ) -> None: ...
+        downsample_target_library_size: int | None = None,
+        downsample_method: str | None = None,
+        downsample_seed: int | None = None,
+    ) -> None:
+        """``downsample_target_library_size`` enables a seeded per-row count
+        downsample applied **inside the gather**, before the batch is returned —
+        which is what keeps a caller's query sampling (drawn from ``counts > 0``)
+        consistent with the counts the collate kernel then sees.
+
+        ``downsample_method`` is ``"multinomial"`` (default) or ``"binomial"``;
+        ``downsample_seed`` defaults to ``0``. The draw is keyed on
+        ``(seed, method, resolved path, row)``, so it is invariant to manifest
+        order and to scheduling, and reproducible across processes. Passing a
+        method or seed without a target is an error, not a silent no-op.
+
+        Enabling this rounds every cell's counts to integers (ties-to-even), even
+        cells already below target."""
+        ...
 
     @property
     def n_files(self) -> int: ...
@@ -678,11 +695,63 @@ def collate_cellset_gathered(
     n_genes_total: int,
     target_sum: float | None = None,
     lib_size_redef: bool | None = None,
+    pflog_alpha: float | None = None,
 ) -> dict[str, Any]:
     """Collate an already-gathered, **global-vocab** CSR batch (from
     `SparseCellSetDataset.iter_with_plans`) into stacked encoder/target tensors
     (state3 "3A hybrid"). Pure compute; releases the GIL. Returns a dict of flat
-    stacked arrays plus the shape scalars ``n_rows``/``k_enc``/``k_dec``."""
+    stacked arrays plus the shape scalars ``n_rows``/``k_enc``/``k_dec``.
+
+    ``pflog_alpha`` is required when ``mode="pflog_raw"`` (PFlog v4) and rejected
+    otherwise; estimate it once with ``pyscx.accel.pflog`` over the training
+    manifest. Note this kernel does **not** downsample — count-depth augmentation
+    belongs in the gather stage, ahead of query sampling; see
+    `SparseCellSetDataset`'s ``downsample_*`` arguments and
+    `downsample_counts_csr`."""
+    ...
+
+
+def downsample_file_identity(path: str) -> int:
+    """Stable 64-bit RNG-key identity for an ``.scx`` path (blake3 of the
+    canonical path).
+
+    Keyed on the *resolved* path rather than on manifest position, so a reordered
+    manifest — or a subset of it — draws the same counts for the same cells. Pass
+    these values as ``file_identities`` to `downsample_counts_csr` when you gather
+    your own CSR; `SparseCellSetDataset` derives them from ``paths`` for you."""
+    ...
+
+
+def downsample_counts_csr(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+    rows: np.ndarray,
+    file_identities: np.ndarray,
+    target_library_size: int,
+    method: str | None = None,
+    seed: int | None = None,
+) -> dict[str, Any]:
+    """Seeded per-row count downsample over an already-gathered CSR batch.
+
+    Returns a dict of ``indptr`` / ``indices`` / ``data``. **Rows shrink** —
+    counts that sample to zero are pruned — so the returned ``indptr`` differs
+    from the input's.
+
+    ``method`` is ``"multinomial"`` (default; hits ``target_library_size``
+    exactly) or ``"binomial"`` (hits it in expectation). Negatives are clipped and
+    counts are rounded ties-to-even before sampling, and a row already at or below
+    target is left alone apart from that rounding.
+
+    ``rows`` and ``file_identities`` are parallel to the batch's rows and supply
+    the RNG key; get the identities from `downsample_file_identity`. An empty
+    ``file_identities`` falls back to positional keying, which is
+    order-dependent.
+
+    Prefer `SparseCellSetDataset`'s ``downsample_*`` arguments when the loader is
+    doing the gather: applying the draw before the batch leaves Rust is what keeps
+    query sampling and the collated numerics consistent. Pure compute; releases
+    the GIL."""
     ...
 
 
@@ -778,9 +847,11 @@ def read_cloud(
     ...
 
 
-# Encoder-crop/mask/target contract version for `collate_cellset_gathered`.
-# Consumers (e.g. state3) assert this at rust_collate setup to fail loudly on
-# version skew. See scx-loader/src/sparse_cellset_collate.rs.
+# Contract version for the native cell-set path: the kernel's
+# encoder-crop/mask/target semantics, the accepted preprocess-mode strings, and
+# the gather stage's value contract (clip, downsample). Consumers (e.g. state3)
+# assert this at rust_collate setup to fail loudly on version skew. Currently 2.
+# See scx-loader/src/sparse_cellset_collate.rs for what it does and does not cover.
 COLLATE_CELLSET_CONTRACT_VERSION: int
 
 

@@ -50,6 +50,16 @@ Scenarios
     arm's absolute rate against ``gather_random``: the reference is the
     ``_r<N>`` arm's own 1-rank run, recorded alongside it.
 
+``downsample_python`` / ``downsample_rust`` (data-load 1B)
+    The same scattered S=64 plan with count-depth augmentation applied two ways:
+    gather-then-numpy-per-cell (the status quo, since the rust collate path never
+    ran ``finalize_csr_row`` and therefore refused downsampling), versus the draw
+    applied inside the gather. Both arms move the same cells, so the ratio
+    isolates the draw. Records ``applicable: False`` with a reason when the
+    installed pyscx predates the primitive or the fixture is shallower than the
+    target — in which case every row short-circuits and a bare ~1.0× would read
+    as "the primitive doesn't help".
+
 Per-run ``extra`` keys (sparse per-scenario):
     ``cellsets_per_sec__<sc>``  — sets/s (the STATE3-relevant throughput)
     ``cells_per_sec__gather__<sc>`` — cells/s
@@ -354,6 +364,161 @@ def _run_gather(
 # 128 and would have been fine; the pathology came from a *consumer-side*
 # default, which is why the fix is a diagnostic rather than a default change.
 _UNDERSIZED_CACHE_SHARDS = 16
+
+
+# ---------------------------------------------------------------------------
+# data-load 1B: native count downsample vs the Python per-cell equivalent
+# ---------------------------------------------------------------------------
+
+# STATE3's configured depth augmentation. Chosen well below any real cell's
+# library size so the sampler actually runs on every row; a target above the
+# fixture's depth takes the no-op branch and the arm would measure nothing.
+_DOWNSAMPLE_TARGET = 2_000
+_DOWNSAMPLE_SEED = 7
+_DOWNSAMPLE_METHOD = "multinomial"
+
+
+def _numpy_downsample_batch(batch: dict, rng_seed: int) -> int:
+    """The per-cell numpy draw the Rust primitive replaces.
+
+    Deliberately shaped like ``RawCountDownsampler`` + ``finalize_csr_row``'s
+    post-processing rather than a vectorised idealisation: a fresh
+    ``default_rng`` per cell (it seeds from ``(seed, path, cell_idx)``, so it
+    cannot be hoisted), ``np.rint`` to integer trials, the
+    ``library_size <= target`` short-circuit, and the positive-only prune. That
+    is the cost a consumer pays today, so it is the honest comparison arm.
+
+    Returns the surviving nnz so the caller cannot be optimised away.
+    """
+    indptr = batch["indptr"]
+    data = batch["data"]
+    kept = 0
+    for r in range(len(indptr) - 1):
+        lo, hi = int(indptr[r]), int(indptr[r + 1])
+        if hi <= lo:
+            continue
+        counts = data[lo:hi]
+        trials = np.rint(counts).astype(np.int64, copy=False)
+        library = int(trials.sum(dtype=np.int64))
+        if library <= 0 or library <= _DOWNSAMPLE_TARGET:
+            kept += int((trials > 0).sum())
+            continue
+        rng = np.random.default_rng(rng_seed + r)
+        if _DOWNSAMPLE_METHOD == "binomial":
+            sampled = rng.binomial(trials, _DOWNSAMPLE_TARGET / library)
+        else:
+            sampled = rng.multinomial(_DOWNSAMPLE_TARGET, trials / library)
+        kept += int((sampled > 0).sum())
+    return kept
+
+
+def _run_gather_python_downsample(
+    scx_path: str,
+    plans_factory: Callable[[], Iterator[tuple]],
+) -> _Outcome:
+    """Gather without downsampling, then downsample in Python — the status quo."""
+    import pyscx
+
+    gc.collect()
+    ds = pyscx.SparseCellSetDataset([scx_path])
+    n_sets = 0
+    n_cells = 0
+    ttfb_s = 0.0
+    with PeakRssSampler() as sampler:
+        t0 = time.perf_counter()
+        first = True
+        for batch in ds.iter_with_plans(plans_factory()):
+            if first:
+                ttfb_s = time.perf_counter() - t0
+                first = False
+            _numpy_downsample_batch(batch, _DOWNSAMPLE_SEED)
+            set_offsets = batch["set_offsets"]
+            n_sets += len(set_offsets) - 1
+            n_cells += int(batch["shape"][0])
+        wall_s = time.perf_counter() - t0
+    return _Outcome(
+        n_sets=n_sets,
+        n_cells=n_cells,
+        wall_s=wall_s,
+        ttfb_s=ttfb_s,
+        peak_rss_mb=sampler.peak_mb,
+        shard_cache_hit_rate=_cache_hit_rate(ds),
+    )
+
+
+def _run_gather_rust_downsample(
+    scx_path: str,
+    plans_factory: Callable[[], Iterator[tuple]],
+) -> _Outcome:
+    """Gather with the downsample applied inside Rust, before the batch returns."""
+    import pyscx
+
+    gc.collect()
+    ds = pyscx.SparseCellSetDataset(
+        [scx_path],
+        downsample_target_library_size=_DOWNSAMPLE_TARGET,
+        downsample_method=_DOWNSAMPLE_METHOD,
+        downsample_seed=_DOWNSAMPLE_SEED,
+    )
+    n_sets = 0
+    n_cells = 0
+    ttfb_s = 0.0
+    with PeakRssSampler() as sampler:
+        t0 = time.perf_counter()
+        first = True
+        for batch in ds.iter_with_plans(plans_factory()):
+            if first:
+                ttfb_s = time.perf_counter() - t0
+                first = False
+            set_offsets = batch["set_offsets"]
+            n_sets += len(set_offsets) - 1
+            n_cells += int(batch["shape"][0])
+        wall_s = time.perf_counter() - t0
+    return _Outcome(
+        n_sets=n_sets,
+        n_cells=n_cells,
+        wall_s=wall_s,
+        ttfb_s=ttfb_s,
+        peak_rss_mb=sampler.peak_mb,
+        shard_cache_hit_rate=_cache_hit_rate(ds),
+    )
+
+
+def _downsample_supported(scx_path: str, plan: tuple) -> tuple[bool, str | None]:
+    """Probe whether the installed pyscx downsamples natively, and whether the
+    fixture is deep enough for the arm to mean anything.
+
+    Returns ``(ok, reason_if_not)``. Never raises: a raise out of ``run`` fails
+    the whole cohort SLURM job, and this is one optional arm.
+    """
+    try:
+        import pyscx
+
+        if not hasattr(pyscx, "downsample_counts_csr"):
+            return False, "pyscx build predates the native downsampler (scx Phase 1B)"
+        plain = pyscx.SparseCellSetDataset([scx_path])
+        batch = next(iter(plain.iter_with_plans(iter([plan]))))
+        indptr = batch["indptr"]
+        data = batch["data"]
+        libs = [
+            float(data[int(indptr[r]) : int(indptr[r + 1])].sum())
+            for r in range(len(indptr) - 1)
+        ]
+        if not libs:
+            return False, "probe batch was empty"
+        median_lib = statistics.median(libs)
+        if median_lib <= _DOWNSAMPLE_TARGET:
+            # Every row would take the no-op branch, so the A/B would be timing a
+            # short-circuit. Recording the reason matters: a bare ~1.0× would read
+            # as "the Rust primitive doesn't help", which is the wrong conclusion
+            # drawn from the wrong fixture.
+            return False, (
+                f"fixture too shallow: median library size {median_lib:.0f} <= target "
+                f"{_DOWNSAMPLE_TARGET}, so every row short-circuits"
+            )
+        return True, None
+    except Exception as e:  # noqa: BLE001
+        return False, f"probe failed: {e}"
 
 
 def _budget_mb_for(scx_path: str, cache_shards: int) -> int | None:
@@ -827,6 +992,87 @@ def run(
                 suggested,
                 speedup,
             )
+
+    # --- data-load 1B: native downsample vs the Python per-cell draw -------
+    # The capability 1B ships is that `scx_rust_collate` and count-depth
+    # augmentation can finally coexist; this arm prices what moving the draw into
+    # the gather costs (or saves) against the status quo, which is gather-then-
+    # numpy-per-cell. Both arms move the same cells over the same plans, so the
+    # ratio isolates the draw. Not a regression floor.
+    ds_sc = _SCENARIOS[0]  # gather_random @ S=64
+    ds_plans = _plans_for(ds_sc)
+    ds_ok, ds_reason = _downsample_supported(scx_path, next(iter(ds_plans(1))))
+    if not ds_ok:
+        logger.info("  downsample arm not applicable: %s", ds_reason)
+        result.metadata["downsample"] = {"applicable": False, "reason": ds_reason}
+    else:
+        ds_rates: dict[str, float] = {}
+        for arm_name, runner in (
+            ("downsample_python", _run_gather_python_downsample),
+            ("downsample_rust", _run_gather_rust_downsample),
+        ):
+            try:
+                runner(scx_path, lambda: ds_plans(warmup))
+            except Exception as e:  # noqa: BLE001
+                logger.error("  warmup failed for %s: %s", arm_name, e)
+                continue
+            arm_sps: list[float] = []
+            arm_rss: list[float] = []
+            for i in range(n_runs):
+                cache_policy = drop_file_cache(scx_path) if cold_cache else "warm"
+                try:
+                    out = runner(scx_path, lambda: ds_plans(n_batches))
+                except Exception as e:  # noqa: BLE001
+                    logger.error(
+                        "  run %d/%d failed for %s: %s", i + 1, n_runs, arm_name, e
+                    )
+                    continue
+                sps = out.n_sets / out.wall_s if out.wall_s > 0 else 0.0
+                result.add_run(
+                    wall_s=out.wall_s,
+                    peak_rss_mb=out.peak_rss_mb,
+                    scenario=arm_name,
+                    set_size=ds_sc.set_size,
+                    n_sets=out.n_sets,
+                    n_cells=out.n_cells,
+                    downsample_target_library_size=_DOWNSAMPLE_TARGET,
+                    downsample_method=_DOWNSAMPLE_METHOD,
+                    cache_policy=cache_policy,
+                    **{
+                        f"cellsets_per_sec__{arm_name}": round(sps, 1),
+                        f"peak_rss_mb__{arm_name}": round(out.peak_rss_mb, 1),
+                    },
+                )
+                arm_sps.append(sps)
+                arm_rss.append(out.peak_rss_mb)
+                logger.info(
+                    "    %s: sets/s=%.1f rss=%.1fMB cache=%s",
+                    arm_name,
+                    sps,
+                    out.peak_rss_mb,
+                    cache_policy,
+                )
+            if arm_sps:
+                ds_rates[arm_name] = statistics.median(arm_sps)
+                result.metadata.setdefault("scenario_summary", {})[arm_name] = {
+                    "n_runs": len(arm_sps),
+                    "set_size": ds_sc.set_size,
+                    "median_cellsets_per_sec": round(statistics.median(arm_sps), 1),
+                    "median_peak_rss_mb": round(statistics.median(arm_rss), 1),
+                }
+            gc.collect()
+
+        if len(ds_rates) == 2 and ds_rates["downsample_python"] > 0:
+            speedup = ds_rates["downsample_rust"] / ds_rates["downsample_python"]
+            result.metadata["downsample"] = {
+                "applicable": True,
+                "target_library_size": _DOWNSAMPLE_TARGET,
+                "method": _DOWNSAMPLE_METHOD,
+                "python_cellsets_per_sec": round(ds_rates["downsample_python"], 1),
+                "rust_cellsets_per_sec": round(ds_rates["downsample_rust"], 1),
+                "speedup": round(speedup, 3),
+            }
+            logger.info("  downsample: rust vs python-per-cell = %.2f×", speedup)
 
     # --- P-1(c): N concurrent ranks ---------------------------------------
     # Skipped at N=1: a "4 ranks vs 1 rank" ratio is undefined there, and the

@@ -1993,6 +1993,9 @@ impl SparseCellSetDataset {
         normalize=None,
         log1p=None,
         target_sum=None,
+        downsample_target_library_size=None,
+        downsample_method=None,
+        downsample_seed=None,
     ))]
     fn new(
         py: Python<'_>,
@@ -2005,6 +2008,9 @@ impl SparseCellSetDataset {
         normalize: Option<bool>,
         log1p: Option<bool>,
         target_sum: Option<f64>,
+        downsample_target_library_size: Option<u64>,
+        downsample_method: Option<String>,
+        downsample_seed: Option<u64>,
     ) -> PyResult<Self> {
         if paths.is_empty() {
             return Err(PyRuntimeError::new_err(
@@ -2018,6 +2024,12 @@ impl SparseCellSetDataset {
         let normalize = normalize.unwrap_or(false);
         let log1p = log1p.unwrap_or(false);
         let target_sum = target_sum.unwrap_or(1e4);
+        let downsample = resolve_downsample(
+            &paths,
+            downsample_target_library_size,
+            downsample_method.as_deref(),
+            downsample_seed,
+        )?;
 
         let mut readers = Vec::with_capacity(paths.len());
         for p in &paths {
@@ -2037,6 +2049,7 @@ impl SparseCellSetDataset {
             normalize,
             log1p,
             target_sum,
+            downsample,
         )
         .map_err(loader_err_to_py)?;
 
@@ -2372,6 +2385,172 @@ pub fn collate_cellset_gathered<'py>(
         })
         .map_err(loader_err_to_py)?;
     collated_cellset_batch_to_dict(py, batch)
+}
+
+/// Resolve the three `downsample_*` kwargs into a config, or `None`.
+///
+/// Validation lives here — at the public entry, not at the routing site — so both
+/// Python surfaces reject the same shapes with the same message. Supplying a
+/// method or a seed without a target is a config error rather than a silent
+/// no-op: it is exactly the typo that would leave a training run un-augmented
+/// while looking configured.
+fn resolve_downsample(
+    paths: &[String],
+    target: Option<u64>,
+    method: Option<&str>,
+    seed: Option<u64>,
+) -> PyResult<Option<crate::downsample::DownsampleConfig>> {
+    let Some(target) = target else {
+        if method.is_some() || seed.is_some() {
+            return Err(PyValueError::new_err(
+                "downsample_method / downsample_seed require \
+                 downsample_target_library_size; without a target nothing is \
+                 downsampled",
+            ));
+        }
+        return Ok(None);
+    };
+    if target == 0 {
+        return Err(PyValueError::new_err(
+            "downsample_target_library_size must be > 0",
+        ));
+    }
+    // Default matches the Python reference's DownsampleConfig default.
+    let method = crate::downsample::DownsampleMethod::parse(method.unwrap_or("multinomial"))
+        .map_err(loader_err_to_py)?;
+    Ok(Some(crate::downsample::DownsampleConfig {
+        target_library_size: target,
+        method,
+        seed: seed.unwrap_or(0),
+        file_identities: paths
+            .iter()
+            .map(|p| crate::downsample::file_identity(p))
+            .collect(),
+    }))
+}
+
+/// Stable 64-bit RNG-key identity for an `.scx` path.
+///
+/// Exposed so a caller that gathers its own CSR (and therefore drives
+/// [`downsample_counts_csr`] directly) can key on the same identity the dataset
+/// path uses, and so a test can assert the two agree.
+#[pyfunction]
+pub fn downsample_file_identity(path: &str) -> u64 {
+    crate::downsample::file_identity(path)
+}
+
+/// Seeded per-row count downsample over an already-gathered CSR batch.
+///
+/// A standalone counterpart to the `downsample_*` kwargs on
+/// `SparseCellSetDataset`, for callers that gather their own CSR. Returns a new
+/// `(indptr, indices, data)` triple — rows shrink, because counts that sample to
+/// zero are pruned, so `indptr` is **not** preserved.
+///
+/// `rows` and `file_identities` are parallel to the batch's rows and supply the
+/// RNG key. `file_identities` are the values [`downsample_file_identity`]
+/// returns; passing an empty array falls back to `file_ids`-style positional
+/// keying, which is **order-dependent** (a reordered manifest redraws every
+/// cell) and is offered only for callers with no stable file identity.
+///
+/// Pure compute; releases the GIL.
+#[pyfunction]
+#[pyo3(signature = (
+    indptr, indices, data, rows, file_identities,
+    target_library_size, method=None, seed=None,
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn downsample_counts_csr<'py>(
+    py: Python<'py>,
+    indptr: PyReadonlyArray1<'py, i64>,
+    indices: PyReadonlyArray1<'py, i32>,
+    data: PyReadonlyArray1<'py, f32>,
+    rows: PyReadonlyArray1<'py, u64>,
+    file_identities: PyReadonlyArray1<'py, u64>,
+    target_library_size: u64,
+    method: Option<String>,
+    seed: Option<u64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    if target_library_size == 0 {
+        return Err(PyValueError::new_err("target_library_size must be > 0"));
+    }
+    let method =
+        crate::downsample::DownsampleMethod::parse(method.as_deref().unwrap_or("multinomial"))
+            .map_err(loader_err_to_py)?;
+
+    let err = |e| PyRuntimeError::new_err(format!("array not contiguous: {e}"));
+    let indptr = indptr.as_slice().map_err(err)?;
+    let indices = indices.as_slice().map_err(err)?;
+    let data = data.as_slice().map_err(err)?;
+    let rows = rows.as_slice().map_err(err)?;
+    let idents = file_identities.as_slice().map_err(err)?;
+
+    let n_rows = indptr.len().saturating_sub(1);
+    if rows.len() != n_rows {
+        return Err(PyValueError::new_err(format!(
+            "rows len {} != n_rows {n_rows}",
+            rows.len()
+        )));
+    }
+    if !idents.is_empty() && idents.len() != n_rows {
+        return Err(PyValueError::new_err(format!(
+            "file_identities len {} != n_rows {n_rows} (pass an empty array for \
+             positional keying)",
+            idents.len()
+        )));
+    }
+    if *indptr.last().unwrap_or(&0) as usize != data.len() || indices.len() != data.len() {
+        return Err(PyValueError::new_err(
+            "indptr/indices/data are inconsistent",
+        ));
+    }
+
+    let cfg = crate::downsample::DownsampleConfig {
+        target_library_size,
+        method,
+        seed: seed.unwrap_or(0),
+        // Identities arrive per row here, not per file, so the config's own table
+        // stays empty and each row's identity is passed explicitly below.
+        file_identities: Vec::new(),
+    };
+
+    // Per-row work is independent and each row's key is derived from its own
+    // identity, so this is safely parallel; `collect` restores row order before
+    // flattening, so the output is byte-identical regardless of scheduling.
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let out_rows: Vec<(Vec<i32>, Vec<f32>)> = py.detach(|| {
+        (0..n_rows)
+            .into_par_iter()
+            .map(|r| {
+                let lo = indptr[r] as usize;
+                let hi = indptr[r + 1] as usize;
+                let mut i = indices[lo..hi].to_vec();
+                let mut d = data[lo..hi].to_vec();
+                let ident = if idents.is_empty() {
+                    r as u64
+                } else {
+                    idents[r]
+                };
+                crate::downsample::downsample_row(&mut i, &mut d, &cfg, ident, rows[r]);
+                (i, d)
+            })
+            .collect()
+    });
+
+    let mut out_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+    let mut out_indices: Vec<i32> = Vec::new();
+    let mut out_data: Vec<f32> = Vec::new();
+    out_indptr.push(0);
+    for (i, d) in out_rows {
+        out_indices.extend_from_slice(&i);
+        out_data.extend_from_slice(&d);
+        out_indptr.push(out_indices.len() as i64);
+    }
+
+    let dict = PyDict::new(py);
+    dict.set_item("indptr", PyArray1::from_vec(py, out_indptr))?;
+    dict.set_item("indices", PyArray1::from_vec(py, out_indices))?;
+    dict.set_item("data", PyArray1::from_vec(py, out_data))?;
+    Ok(dict)
 }
 
 #[cfg(test)]

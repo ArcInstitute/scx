@@ -1,0 +1,259 @@
+{
+  "_comment": "Source of truth: scx-loader::downsample (Rust ChaCha8). Regenerate via `cargo test -p scx-loader regenerate_downsample_golden -- --ignored` and copy verbatim into state3/tests/data/. Keep both copies byte-identical, update GOLDEN_BLAKE3_PREFIX in both repos, and bump pyscx.COLLATE_CELLSET_CONTRACT_VERSION on any semantic change.",
+  "cases": [
+    {
+      "counts": [
+        10.0,
+        20.0,
+        30.0,
+        40.0,
+        50.0
+      ],
+      "expected_counts": [
+        3.0,
+        4.0,
+        3.0,
+        8.0,
+        16.0
+      ],
+      "expected_indices": [
+        1,
+        5,
+        9,
+        13,
+        17
+      ],
+      "file_identity": 2712847316,
+      "indices": [
+        1,
+        5,
+        9,
+        13,
+        17
+      ],
+      "method": "binomial",
+      "name": "binomial_basic",
+      "row": 7,
+      "seed": 1234,
+      "target_library_size": 30
+    },
+    {
+      "counts": [
+        10.0,
+        20.0,
+        30.0,
+        40.0,
+        50.0
+      ],
+      "expected_counts": [
+        1.0,
+        3.0,
+        6.0,
+        9.0,
+        11.0
+      ],
+      "expected_indices": [
+        1,
+        5,
+        9,
+        13,
+        17
+      ],
+      "file_identity": 2712847316,
+      "indices": [
+        1,
+        5,
+        9,
+        13,
+        17
+      ],
+      "method": "multinomial",
+      "name": "multinomial_exact_target",
+      "row": 7,
+      "seed": 1234,
+      "target_library_size": 30
+    },
+    {
+      "counts": [
+        5.0,
+        5.0,
+        5.0,
+        5.0,
+        5.0,
+        5.0,
+        5.0,
+        5.0
+      ],
+      "expected_counts": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "expected_indices": [
+        9,
+        15,
+        21
+      ],
+      "file_identity": 195948557,
+      "indices": [
+        0,
+        3,
+        6,
+        9,
+        12,
+        15,
+        18,
+        21
+      ],
+      "method": "multinomial",
+      "name": "multinomial_hard_squeeze_prunes",
+      "row": 0,
+      "seed": 99,
+      "target_library_size": 3
+    },
+    {
+      "counts": [
+        1.399999976158142,
+        2.5999999046325684
+      ],
+      "expected_counts": [
+        1.0,
+        3.0
+      ],
+      "expected_indices": [
+        2,
+        4
+      ],
+      "file_identity": 4369,
+      "indices": [
+        2,
+        4
+      ],
+      "method": "binomial",
+      "name": "below_target_is_a_noop_but_rints",
+      "row": 0,
+      "seed": 7,
+      "target_library_size": 1000
+    },
+    {
+      "counts": [
+        2.5,
+        3.5,
+        4.5
+      ],
+      "expected_counts": [
+        2.0,
+        4.0,
+        4.0
+      ],
+      "expected_indices": [
+        2,
+        4,
+        6
+      ],
+      "file_identity": 4369,
+      "indices": [
+        2,
+        4,
+        6
+      ],
+      "method": "multinomial",
+      "name": "ties_round_to_even",
+      "row": 0,
+      "seed": 7,
+      "target_library_size": 1000
+    },
+    {
+      "counts": [
+        -4.0,
+        8.0,
+        12.0
+      ],
+      "expected_counts": [
+        3.0,
+        3.0
+      ],
+      "expected_indices": [
+        2,
+        3
+      ],
+      "file_identity": 8738,
+      "indices": [
+        1,
+        2,
+        3
+      ],
+      "method": "binomial",
+      "name": "negative_is_clipped_then_pruned",
+      "row": 3,
+      "seed": 21,
+      "target_library_size": 5
+    },
+    {
+      "counts": [
+        0.0,
+        0.0
+      ],
+      "expected_counts": [],
+      "expected_indices": [],
+      "file_identity": 13107,
+      "indices": [
+        1,
+        2
+      ],
+      "method": "multinomial",
+      "name": "all_zero_row",
+      "row": 0,
+      "seed": 1,
+      "target_library_size": 10
+    },
+    {
+      "counts": [],
+      "expected_counts": [],
+      "expected_indices": [],
+      "file_identity": 13107,
+      "indices": [],
+      "method": "binomial",
+      "name": "empty_row",
+      "row": 0,
+      "seed": 1,
+      "target_library_size": 10
+    },
+    {
+      "counts": [
+        10.0,
+        20.0,
+        30.0,
+        40.0,
+        50.0
+      ],
+      "expected_counts": [
+        1.0,
+        4.0,
+        3.0,
+        11.0,
+        11.0
+      ],
+      "expected_indices": [
+        1,
+        5,
+        9,
+        13,
+        17
+      ],
+      "file_identity": 2712847316,
+      "indices": [
+        1,
+        5,
+        9,
+        13,
+        17
+      ],
+      "method": "multinomial",
+      "name": "same_cell_different_seed",
+      "row": 7,
+      "seed": 4321,
+      "target_library_size": 30
+    }
+  ]
+}
