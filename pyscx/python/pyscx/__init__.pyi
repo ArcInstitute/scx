@@ -745,8 +745,9 @@ def downsample_counts_csr(
 
     ``rows`` and ``file_identities`` are parallel to the batch's rows and supply
     the RNG key; get the identities from `downsample_file_identity`. An empty
-    ``file_identities`` falls back to positional keying, which is
-    order-dependent.
+    ``file_identities`` keys on ``(seed, method, row)`` alone — correct for a
+    single-file batch, ambiguous across files (two files' row 5 would share a
+    draw).
 
     Prefer `SparseCellSetDataset`'s ``downsample_*`` arguments when the loader is
     doing the gather: applying the draw before the batch leaves Rust is what keeps

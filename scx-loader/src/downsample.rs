@@ -185,11 +185,15 @@ fn row_seed(seed: u64, method: DownsampleMethod, file_identity: u64, row: u64) -
 /// the row contained. Note this does **not** prune the zeros it creates — the
 /// Python reference prunes only inside its downsample branch, and a caller reading
 /// nnz should see the same structure with and without a clip.
+///
+/// Uses `f32::max(0.0)` rather than a `< 0.0` test, and that is deliberate: `max`
+/// returns the non-NaN operand, so **NaN maps to 0** — exactly what the collate
+/// kernel's own `raw.max(0.0)` reads do. A `< 0.0` test leaves NaN untouched and
+/// would have left the two disagreeing about the row's contents for NaN inputs,
+/// which is the very thing this clip exists to fix.
 pub fn clip_negatives(data: &mut [f32]) {
     for v in data.iter_mut() {
-        if *v < 0.0 {
-            *v = 0.0;
-        }
+        *v = v.max(0.0);
     }
 }
 
@@ -202,6 +206,13 @@ pub fn clip_negatives(data: &mut [f32]) {
 ///
 /// Negatives are clipped first (see [`clip_negatives`]), so callers need not
 /// pre-clip; doing both is harmless.
+///
+/// Counts round-trip through `u64` and back to `f32`, so a sampled count above
+/// `2^24` would lose precision on the way out. That is the same bound the collate
+/// kernel already assumes for its `library_size` sum, and it is not reachable in
+/// practice: the *output* is capped at `target_library_size`, which is a
+/// per-cell sequencing depth (typically `1e3`–`1e5`). A caller who genuinely
+/// wants a `>2^24` target is outside this contract.
 pub fn downsample_row(
     indices: &mut Vec<i32>,
     data: &mut Vec<f32>,
@@ -215,11 +226,21 @@ pub fn downsample_row(
     }
 
     // Steps 1-2: clip, then integerise with ties-to-even (np.rint).
+    //
+    // Non-finite values are treated as 0, not propagated. NaN falls out of
+    // `max(0.0)` as 0 (matching the kernel); `+inf` is rejected explicitly because
+    // there is no meaningful trial count for it — `inf as u64` saturates to
+    // `u64::MAX`, which would hand the sampler a nonsense `n` and produce garbage
+    // rather than fail. An infinite count is corrupt input either way.
     let mut trials: Vec<u64> = Vec::with_capacity(data.len());
     let mut library_size: u64 = 0;
     for &v in data.iter() {
-        let clipped = if v < 0.0 { 0.0 } else { v };
-        let n = clipped.round_ties_even() as u64;
+        let clipped = v.max(0.0);
+        let n = if clipped.is_finite() {
+            clipped.round_ties_even() as u64
+        } else {
+            0
+        };
         library_size = library_size.saturating_add(n);
         trials.push(n);
     }

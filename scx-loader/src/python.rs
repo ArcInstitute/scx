@@ -2448,9 +2448,9 @@ pub fn downsample_file_identity(path: &str) -> u64 {
 ///
 /// `rows` and `file_identities` are parallel to the batch's rows and supply the
 /// RNG key. `file_identities` are the values [`downsample_file_identity`]
-/// returns; passing an empty array falls back to `file_ids`-style positional
-/// keying, which is **order-dependent** (a reordered manifest redraws every
-/// cell) and is offered only for callers with no stable file identity.
+/// returns. Passing an **empty** array keys on `(seed, method, row)` alone —
+/// correct for a single-file batch, but ambiguous across files, since two files'
+/// row 5 would then share a draw.
 ///
 /// Pure compute; releases the GIL.
 #[pyfunction]
@@ -2525,11 +2525,12 @@ pub fn downsample_counts_csr<'py>(
                 let hi = indptr[r + 1] as usize;
                 let mut i = indices[lo..hi].to_vec();
                 let mut d = data[lo..hi].to_vec();
-                let ident = if idents.is_empty() {
-                    r as u64
-                } else {
-                    idents[r]
-                };
+                // No identities supplied ⇒ key on `(seed, method, row)` alone.
+                // Falling back to `r` (the row's position in this batch) would be
+                // worse than useless: the same cell would draw differently
+                // depending on where it landed in the batch, which is exactly the
+                // scheduling dependence the per-row key exists to avoid.
+                let ident = if idents.is_empty() { 0 } else { idents[r] };
                 crate::downsample::downsample_row(&mut i, &mut d, &cfg, ident, rows[r]);
                 (i, d)
             })

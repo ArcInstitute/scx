@@ -637,3 +637,56 @@ fn regenerate_downsample_golden() {
     println!("wrote {path} ({} cases)", GOLDEN_CASES.len());
     println!("GOLDEN_BLAKE3_PREFIX = \"{}\"", &digest[..16]);
 }
+
+// --------------------------------------------------------------------------
+// Non-finite inputs — the clip's whole purpose is that the gather and the
+// collate kernel agree on what a row contains, so it has to agree on NaN too.
+// --------------------------------------------------------------------------
+
+#[test]
+fn clip_matches_the_kernels_max_semantics_on_nan() {
+    // The kernel reads every count as `raw.max(0.0)`, and `f32::max` returns the
+    // non-NaN operand — so the kernel sees 0 for a NaN. A `< 0.0` test (the
+    // obvious way to write a clip) leaves NaN untouched, which would have left the
+    // gather emitting NaN while the kernel computed with 0.
+    let mut d = vec![f32::NAN, -1.0, 2.0];
+    clip_negatives(&mut d);
+    assert_eq!(d[0], 0.0, "NaN must clip to 0, as `raw.max(0.0)` does");
+    assert_eq!(d[1], 0.0);
+    assert_eq!(d[2], 2.0);
+    // Premise: this is genuinely what the kernel's own expression yields.
+    assert_eq!(f32::NAN.max(0.0), 0.0);
+}
+
+#[test]
+fn non_finite_counts_are_treated_as_zero_not_saturated() {
+    // `inf as u64` saturates to u64::MAX in Rust, which would hand the sampler a
+    // nonsense trial count and quietly produce garbage. Treat it as corrupt input
+    // worth 0 instead.
+    let (i, d) = run(
+        &[1, 2, 3],
+        &[f32::INFINITY, f32::NAN, 6.0],
+        DownsampleMethod::Multinomial,
+        3,
+        1,
+        1,
+        0,
+    );
+    assert_eq!(i, vec![3], "only the finite entry should survive: {i:?}");
+    assert_eq!(d, vec![3.0]);
+}
+
+#[test]
+fn negative_infinity_clips_like_any_negative() {
+    let (i, d) = run(
+        &[1, 2],
+        &[f32::NEG_INFINITY, 8.0],
+        DownsampleMethod::Multinomial,
+        4,
+        1,
+        1,
+        0,
+    );
+    assert_eq!(i, vec![2]);
+    assert_eq!(d, vec![4.0]);
+}
