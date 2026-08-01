@@ -675,50 +675,31 @@ pub fn pseudobulk_dex(
     // Run DESeq2 per contrast and collect results.
     let mut all_results: Vec<Bound<'_, PyAny>> = Vec::new();
 
-    // Bound every thread/process pool pydeseq2 can spin up. Three multipliers
-    // stack on a many-core host (192 cores on a Chimera node) and OOM the job:
-    //   1. loky/joblib worker processes (one per core) — capped via
-    //      `DefaultInference(n_cpus=...)` below;
-    //   2. numba parallel threads, inside each worker *and* the main process;
-    //   3. the BLAS pool (OpenMP / MKL / OpenBLAS).
-    // `n_cpus` only governs (1); (2) and (3) read their own env vars, so we
-    // cap those too. The loky workers are spawned later (at `.deseq2()` /
-    // `.summary()`) and inherit this env, so the cap reaches each worker's
-    // numba/BLAS pools — that per-worker explosion was the residual OOM.
+    // Bound the loky/joblib worker *process* count — one interpreter per core on
+    // a 192-core node is ~58 GB of RSS and OOM-kills the job even for tiny
+    // inputs. That is this cap's whole job; it is applied via
+    // `DefaultInference(n_cpus=...)` just below.
+    //
+    // Deliberately NOT capped here: the per-worker numba and BLAS
+    // (OpenMP/MKL/OpenBLAS) thread pools. pydeseq2 already wraps every one of
+    // its `Parallel` calls in `parallel_backend(..., inner_max_num_threads=1)`,
+    // and joblib's `_prepare_worker_env` applies an explicit
+    // `inner_max_num_threads` to the *worker* environment while ignoring the
+    // parent's — so setting `NUMBA_NUM_THREADS` & co. here has no effect on the
+    // workers at all.
+    //
+    // It is also actively harmful. numba re-reads `NUMBA_NUM_THREADS` on every
+    // fresh compilation and raises if it disagrees with the already-launched
+    // pool, so mutating the parent's environment made every later numba compile
+    // in the process fail with "Cannot set NUMBA_NUM_THREADS to a different
+    // value once the threads have been launched" — one `pseudobulk_dex` call
+    // poisoned the rest of the session (79 tests across 21 files, and any
+    // scanpy step a user took afterwards). Same reasoning rules out
+    // `numba.set_num_threads` on the parent: it silently shrinks the caller's
+    // pool for the process lifetime. Leave process-global thread state alone.
+    //
+    // Regression coverage: `pyscx/tests/test_pseudobulk_thread_env.py`.
     let resolved_n_cpus = resolve_deseq_n_cpus(n_cpus);
-    {
-        let cap = resolved_n_cpus.to_string();
-        // `n_cpus` (via DefaultInference below) only bounds the loky *process*
-        // count; numba and the BLAS pool (OpenMP/MKL/OpenBLAS) read their own
-        // env vars. Set them through Python's `os.environ` under the GIL — never
-        // raw `std::env::set_var`, which races with `getenv` in background
-        // BLAS/OpenMP threads (and is `unsafe` on edition 2024). `setdefault`
-        // is a no-op when the operator already set a value, and CPython's
-        // `os.environ` calls `putenv`, so freshly-spawned loky workers inherit
-        // the cap.
-        //
-        // NB: this is process-sticky — the first `pseudobulk_dex` call's cap
-        // persists for the process lifetime and cannot be raised later via this
-        // API. Acceptable for OOM avoidance; pass a larger explicit `n_cpus`
-        // (and pre-set these env vars yourself) if you need a bigger pool.
-        let os_environ = py.import("os")?.getattr("environ")?;
-        for var in [
-            "NUMBA_NUM_THREADS",
-            "OMP_NUM_THREADS",
-            "OPENBLAS_NUM_THREADS",
-            "MKL_NUM_THREADS",
-        ] {
-            os_environ.call_method1("setdefault", (var, cap.as_str()))?;
-        }
-        // Best-effort: rein in numba in *this* process too. The env var only
-        // binds freshly-spawned workers; the main interpreter may already have
-        // imported numba (via scanpy / pydeseq2), so reduce its live pool. A
-        // BLAS pool already sized in the parent is not shrunk, but the loky
-        // workers (which inherit the env) are the actual OOM driver.
-        if let Ok(numba) = py.import("numba") {
-            let _ = numba.call_method1("set_num_threads", (resolved_n_cpus,));
-        }
-    }
     let inference = py
         .import("pydeseq2.default_inference")
         .map_err(|_| {
