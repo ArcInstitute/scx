@@ -1141,3 +1141,74 @@ fn gather_rejects_an_empty_identity_table_across_multiple_files() {
         "message should say why it matters: {err}"
     );
 }
+
+// ==========================================================================
+// CSR `indptr` validation
+//
+// The gap three reviewers converged on: `indptr.last() == nnz` is necessary but
+// not sufficient, and the failure mode is a panic (an out-of-bounds slice, or a
+// negative entry wrapping through `as usize`) rather than a wrong answer. Both
+// entry points take arbitrary caller-supplied arrays.
+// ==========================================================================
+
+#[test]
+fn validate_indptr_accepts_well_formed_input() {
+    assert!(validate_indptr(&[0, 2, 5], 5).is_ok());
+    assert!(validate_indptr(&[0], 0).is_ok());
+    // Empty rows in the middle are legal CSR.
+    assert!(validate_indptr(&[0, 3, 3, 3, 4], 4).is_ok());
+}
+
+#[test]
+fn validate_indptr_rejects_a_non_monotonic_array_whose_last_entry_looks_right() {
+    // The exact case reviewers named: `last == nnz` passes a naive check, then
+    // `indices[0..3]` panics on a 2-element slice.
+    let err = validate_indptr(&[0, 3, 2], 2).unwrap_err().to_string();
+    assert!(err.contains("non-decreasing"), "unhelpful: {err}");
+}
+
+#[test]
+fn validate_indptr_rejects_negatives_and_a_bad_start_and_a_bad_total() {
+    // A negative would wrap to an enormous index through `as usize`.
+    assert!(validate_indptr(&[0, -1, 2], 2).is_err());
+    // A non-zero start silently drops a prefix rather than erroring.
+    let err = validate_indptr(&[1, 3], 3).unwrap_err().to_string();
+    assert!(err.contains("indptr[0]"), "unhelpful: {err}");
+    // Totals that disagree with the data length.
+    assert!(validate_indptr(&[0, 2], 5).is_err());
+    assert!(validate_indptr(&[], 0).is_err());
+}
+
+#[test]
+fn collate_gathered_errors_rather_than_panicking_on_a_bad_indptr() {
+    // Before this check the call below panicked inside the rayon loop. An error
+    // is the crate convention for malformed input, and a panic here would cross
+    // the FFI boundary.
+    let scalars = CollateScalars {
+        k_enc: 2,
+        mode: PreprocessMode::PassThrough,
+        target_sum: 1e4,
+        pflog_alpha: None,
+        n_genes_total: 100,
+        lib_size_redef: false,
+    };
+    let err = collate_gathered(
+        &[0, 3, 2], // non-monotonic, last == nnz
+        &[1, 2],
+        &[1.0, 2.0],
+        &[0, 2],
+        vec![0, 1],
+        vec![0, 0],
+        vec![0, 0],
+        1,
+        &[1],
+        &[],
+        &[0, 0],
+        &[2],
+        &scalars,
+    )
+    .err()
+    .expect("a non-monotonic indptr must be an error, not a panic")
+    .to_string();
+    assert!(err.contains("non-decreasing"), "unhelpful: {err}");
+}

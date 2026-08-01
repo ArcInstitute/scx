@@ -45,7 +45,9 @@
 //! covers, exhaustively:
 //!
 //! 1. the encoder-crop, masking and target semantics in [`collate_cell`];
-//! 2. the accepted [`PreprocessMode`] strings and the meaning of each mode;
+//! 2. the accepted [`PreprocessMode`] strings, the parameters each mode
+//!    *requires* (e.g. `pflog_raw` requires `pflog_alpha`), and the meaning of
+//!    each mode;
 //! 3. the §4.4 gather-stage **value** contract — the non-negativity clip and the
 //!    optional seeded downsample in `sparse_cellset::SparseCellSetLoader`.
 //!

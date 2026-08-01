@@ -2498,11 +2498,23 @@ pub fn downsample_counts_csr<'py>(
             idents.len()
         )));
     }
-    if *indptr.last().unwrap_or(&0) as usize != data.len() || indices.len() != data.len() {
-        return Err(PyValueError::new_err(
-            "indptr/indices/data are inconsistent",
-        ));
+    if indices.len() != data.len() {
+        return Err(PyValueError::new_err(format!(
+            "indices len {} != data len {}",
+            indices.len(),
+            data.len()
+        )));
     }
+    // Not just `last == nnz`: the rayon map below slices `indices[lo..hi]` from
+    // these entries, so a non-monotonic or negative `indptr` panics across the FFI
+    // boundary instead of erroring. This is a public entry point taking arbitrary
+    // numpy arrays.
+    //
+    // Raised as `ValueError`, not the `loader_err_to_py` default of `RuntimeError`:
+    // every other argument check in this function raises `ValueError`, and a caller
+    // catching malformed input would otherwise miss exactly this one.
+    crate::sparse_cellset::validate_indptr(indptr, data.len())
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     let cfg = crate::downsample::DownsampleConfig {
         target_library_size,

@@ -610,3 +610,33 @@ def test_clip_keeps_nnz_when_downsampling_is_off(tmp_dir):
     assert np.all(dat >= 0.0), f"negative leaked into the emitted CSR: {dat}"
     assert len(idx) == 3, f"clip changed nnz: {idx}"
     np.testing.assert_array_equal(dat, np.array([5.0, 0.0, 7.0], dtype=np.float32))
+
+
+def test_malformed_indptr_raises_rather_than_panicking():
+    """A non-monotonic `indptr` whose last entry looks right used to panic.
+
+    `indptr.last() == nnz` is necessary but not sufficient: `[0, 3, 2]` over two
+    non-zeros passes that check and then slices out of bounds inside the rayon
+    map. A negative entry wraps through `as usize` and does the same. This is a
+    public entry point taking arbitrary numpy arrays, so it must raise.
+    """
+    import pyscx
+
+    indices = np.array([1, 2], dtype=np.int32)
+    data = np.array([1.0, 2.0], dtype=np.float32)
+
+    for label, indptr in [
+        ("non-monotonic, last == nnz", [0, 3, 2]),
+        ("negative entry", [0, -1, 2]),
+        ("does not start at 0", [1, 2]),
+    ]:
+        arr = np.array(indptr, dtype=np.int64)
+        with pytest.raises(ValueError, match="indptr"):
+            pyscx.downsample_counts_csr(
+                arr,
+                indices,
+                data,
+                np.zeros(len(arr) - 1, dtype=np.uint64),
+                np.array([], dtype=np.uint64),
+                5,
+            )

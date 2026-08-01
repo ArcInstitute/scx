@@ -634,6 +634,11 @@ pub fn collate_gathered(
     if indptr.len() != n_rows + 1 {
         return want("indptr", indptr.len(), n_rows + 1);
     }
+    // Shape alone is not enough: the rayon loop below slices `indices[lo..hi]`
+    // straight from these entries, so a non-monotonic or negative `indptr` panics
+    // rather than erroring. Pre-existing gap on this entry point, closed here
+    // because the check is shared with `downsample_counts_csr`.
+    validate_indptr(indptr, data.len())?;
     if query_gene_ids.len() != n_sets * k_dec {
         return want("query_gene_ids", query_gene_ids.len(), n_sets * k_dec);
     }
@@ -726,6 +731,44 @@ pub fn collate_gathered(
         k_enc,
         k_dec,
     })
+}
+
+/// Validate that `indptr` is a well-formed CSR row-pointer array over `nnz`
+/// non-zeros: non-negative, non-decreasing, starting at 0 and ending at `nnz`.
+///
+/// `indptr.last() == nnz` alone is necessary but **not** sufficient, and the gap
+/// is a panic rather than a wrong answer: `[0, 3, 2]` over 2 non-zeros passes a
+/// last-element check, then slices `indices[0..3]` out of bounds. Entries are also
+/// cast `i64 -> usize`, so a negative wraps to an enormous index and panics the
+/// same way. Callers on the Python boundary hand us arbitrary numpy arrays, and
+/// the crate's convention is to return an error on malformed input rather than
+/// panic across FFI.
+pub(crate) fn validate_indptr(indptr: &[i64], nnz: usize) -> Result<()> {
+    let bad = |reason: String| Err(LoaderError::ConfigError { reason });
+    match indptr.first() {
+        None => return bad("indptr is empty (expected at least one entry)".into()),
+        Some(&f) if f != 0 => {
+            return bad(format!("indptr[0] must be 0, got {f}"));
+        }
+        _ => {}
+    }
+    for (r, w) in indptr.windows(2).enumerate() {
+        if w[1] < w[0] {
+            return bad(format!(
+                "indptr must be non-decreasing: indptr[{}]={} < indptr[{r}]={}",
+                r + 1,
+                w[1],
+                w[0]
+            ));
+        }
+    }
+    let last = *indptr.last().unwrap_or(&0);
+    if last < 0 || last as usize != nnz {
+        return bad(format!(
+            "indptr's last entry {last} must equal the non-zero count {nnz}"
+        ));
+    }
+    Ok(())
 }
 
 /// Map local gene ids to global via `local_to_global` (`-1` = drop), then sort
