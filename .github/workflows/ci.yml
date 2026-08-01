@@ -199,12 +199,17 @@ jobs:
       # wheel on Linux pulls a >1 GB CUDA cascade (cuda_toolkit, cudnn,
       # cusparselt, nccl, nvshmem, triton) that has timed out mid-download
       # at PyPI in past runs and is wasted bandwidth on a CPU runner.
+      # `pydeseq2` is added so the `pseudobulk_dex` / `pdex_nb_glm` DESeq2 path
+      # actually runs here instead of being skipped. It previously had zero CI
+      # coverage, which is how a bug that mutated process-global
+      # NUMBA_NUM_THREADS (breaking every later numba compile) shipped green —
+      # see tests/test_pseudobulk_thread_env.py.
       - name: Install Python dependencies
         run: |
           python -m venv .venv
           . .venv/bin/activate
           pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.0;sys_platform=='linux'"
-          pip install maturin pytest numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv formulaic polars
+          pip install maturin pytest numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv formulaic polars pydeseq2
       # libhdf5 is needed by the `hdf5` pyscx feature, which exposes
       # `pyscx.from_h5ad` and the backed-AnnData → streaming router that
       # `tests/test_streaming_conversion.py` exercises.
