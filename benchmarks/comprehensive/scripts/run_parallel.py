@@ -98,6 +98,10 @@ _NO_CONVERSION = {
     # shardad_fidelity self-materializes the source + writes a temp .shad
     # in-process (synthetic datasets have no on-disk h5ad) — no Phase-A dep.
     "shardad_fidelity",
+    # shuffle_layout consumes the persistent per-codec `.scx` fixtures directly
+    # and writes its own shuffled copies in-process; it never needs a Phase-A
+    # h5ad conversion.
+    "shuffle_layout",
 }
 
 # Benchmarks that operate on multimodal h5mu sources. They expect

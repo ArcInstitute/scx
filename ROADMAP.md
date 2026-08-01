@@ -167,6 +167,7 @@ and parallel shard decode (highest-impact fixes from earlier benchmarks).
 - [x] Gene projection at decode time (HVG bitmap)
 - [x] Sparse-to-dense direct write into pinned tensors
 - [x] Quasi-random shard shuffle
+- [x] Global pre-shuffle — `scx sort --shuffle --seed N` / `pyscx.shuffle`. The two-level per-epoch shuffle is bounded by physical layout (level 2 only mixes rows already sharing a shard group), so a clustered file caps batch composition at `shard_group_size`. A seeded permutation of the obs axis, applied once on disk, removes that ceiling: measured on `tabula_sapiens_100k`, per-shard label divergence from the corpus mix drops 0.562 → 0.013 while cache-cold `TrainingDataset` throughput is unchanged (1.03×). Reuses the `scx sort` engine wholesale — one new pass-0 order producer. See [`docs/sharding.md` § Shuffling for training](docs/sharding.md#shuffling-for-training-scx-sort---shuffle).
 - [x] scVI DataModule integration (obs covariates in batch)
 - [ ] scGPT DataModule integration — **DEFERRED**
 - [x] Configurable memory budget (`max_loader_memory_mb`)

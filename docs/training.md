@@ -294,6 +294,39 @@ Each `for batch in dataset:` loop is one epoch. On each epoch:
 This two-level shuffle provides training randomization without random I/O.
 The same `seed` always produces the identical ordering for reproducibility.
 
+#### When two levels aren't enough: pre-shuffle the file
+
+Both levels are bounded by **physical layout**. Level 2 only mixes rows that
+already share a shard group, so if your file arrived clustered — cells grouped
+by donor, plate, or cell type, which is the normal case for a concatenated
+atlas — every batch is drawn from a handful of adjacent shards and inherits
+their composition. Raising `shard_group_size` widens the pool but costs memory
+linearly.
+
+The fix is to pay once, on disk:
+
+```bash
+scx sort --shuffle --seed 42 atlas.scx atlas.train.scx
+```
+```python
+pyscx.shuffle("atlas.scx", "atlas.train.scx", seed=42)
+```
+
+After that the row order carries no residual structure, so even
+`shard_group_size=1` gives batches that look like the corpus, and the loader's
+cheap level-1 shard permutation is all the per-epoch randomization you need.
+
+Two things to know before you run it: the output is the **inverse** of a sorted
+file for query purposes (it maximally scatters predicate-index shard ranges),
+and you should pass `--codec <the input's codec>` to hold its encoding —
+otherwise the adaptive `auto` codec re-selects per shard and the file can grow
+~2×. (`--codec scx1` is *not* the size-preserving answer on a `shufdelta`/`zstd`
+input; it is what `auto` flips to.) Pass `--shard-size <input's value>` too if
+the input is not at the 16,384 default, so the rewrite reorders without also
+re-sharding. Both are
+covered in
+[sharding.md § Shuffling for training](sharding.md#shuffling-for-training-scx-sort---shuffle).
+
 
 ## IndexPlanDataset
 

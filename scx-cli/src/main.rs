@@ -438,7 +438,8 @@ enum Commands {
         #[arg(long)]
         reshape_obs: bool,
     },
-    /// Globally reorder cells (obs axis) by an obs key for query locality
+    /// Globally reorder cells (obs axis) by an obs key for query locality, or
+    /// randomly with `--shuffle` for training-batch diversity
     Sort {
         /// Input SCX file (local path)
         input: PathBuf,
@@ -446,12 +447,30 @@ enum Commands {
         output: PathBuf,
         /// Comma-separated obs columns to sort by, lexicographic in order
         /// (the leading key gets the full X-read-locality benefit). Optional
-        /// when `--group-by` is given (which becomes the leading key).
+        /// when `--group-by` or `--shuffle` is given.
         #[arg(long, value_name = "CSV")]
         by: Option<String>,
-        /// Sort descending on all keys (ignored with `--group-by`).
+        /// Sort descending on all keys (ignored with `--group-by`, rejected
+        /// with `--shuffle`).
         #[arg(long)]
         reverse: bool,
+        /// Reorder cells by a seeded random permutation instead of by a key,
+        /// so a training loader gets i.i.d. batches at any `shard_group_size`.
+        /// Mutually exclusive with `--by`, `--group-by` and `--reverse`. Note
+        /// this is the *inverse* of a sort: it maximally scatters predicate-index
+        /// shard ranges. To keep the output's size, pin the INPUT's own codec
+        /// (`--codec zstd`, `--codec shufdelta`, …) — left at `auto` the adaptive
+        /// codec re-selects and X can grow ~2x. `--codec scx1` is not the
+        /// size-preserving choice unless the input is already scx1; it is what
+        /// `auto` tends to flip to. Pass `--shard-size` matching the input to
+        /// reorder without also re-sharding.
+        #[arg(long)]
+        shuffle: bool,
+        /// RNG seed for `--shuffle`. Recorded in the output's provenance, and
+        /// the only record of the permutation — the same seed on the same input
+        /// always reproduces the same file.
+        #[arg(long, default_value_t = 42, requires = "shuffle")]
+        seed: u64,
         /// Overwrite output if it exists
         #[arg(long)]
         force: bool,
@@ -1176,6 +1195,8 @@ fn main() {
             output,
             by,
             reverse,
+            shuffle,
+            seed,
             force,
             shard_size,
             codec,
@@ -1199,6 +1220,9 @@ fn main() {
             &output,
             parse_index_columns(by.as_deref()),
             reverse,
+            // Resolve `--seed`'s default here, so the engine's `Option` means
+            // "shuffle mode" and nothing else.
+            shuffle.then_some(seed),
             force,
             shard_size,
             &codec,

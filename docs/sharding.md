@@ -130,6 +130,91 @@ or a bounded-memory external partition sort otherwise. See
 [performance.md § Sort (physical layout)](performance.md#sort-physical-layout)
 for measured compression and locality numbers.
 
+### Shuffling for training (`scx sort --shuffle`)
+
+The same engine also runs the **opposite** reorder: a seeded random permutation
+of the obs axis, for training rather than for queries.
+
+```bash
+scx sort --shuffle --seed 42 atlas.scx atlas.shuffled.scx
+```
+
+```python
+pyscx.shuffle("atlas.scx", "atlas.shuffled.scx", seed=42)
+```
+
+**What it buys you.** `TrainingDataset` randomizes in two levels — it permutes
+shard order, then Fisher-Yates shuffles rows *within* each shard group (see
+[training.md § Epoch and shuffling](training.md#epoch-and-shuffling)).
+Both levels are bounded by physical layout, so on a file whose rows arrived
+clustered — by donor, plate, or cell type — batch composition is capped by
+`shard_group_size`, and widening it costs memory linearly. Permuting the rows
+once, on disk, moves that cost off the training loop: after a shuffle even
+`shard_group_size=1` yields batches that look like the corpus.
+
+**It is the inverse of a sort, and you cannot have both.** Sorting collapses
+each category's predicate-index `shard_ranges` into one contiguous run;
+shuffling scatters every category across every shard. `--shuffle` is therefore
+mutually exclusive with `--by`, `--group-by` and `--reverse` — the engine
+rejects the combination rather than silently preferring one. Shuffle the copy
+you train from; keep a sorted or indexed copy for querying.
+
+**Reproducibility.** The seed (default `42`, matching `TrainingDataset`) is
+recorded in the output's provenance and is the *only* record of the
+permutation — there is no key to re-derive it from. The same seed on the same
+input always reproduces the same file. Two caveats: the permutation runs over
+**live** rows, so a file carrying deletion vectors shuffles differently from the
+same file without them (deletions are materialized away, as in `sort`); and the
+row order is not stable across a `rand` crate upgrade, which is pinned by a test
+rather than promised by the format.
+
+**Output size: pin your codec.** Measured on `tabula_sapiens_100k` (100,000
+cells, 7 CSR shards), shuffling each per-codec fixture *at its own codec*, so
+the only variable is row order:
+
+| codec | X before | X after | delta |
+|-------|----------|---------|-------|
+| `scx1` | 413.3 MB | 413.3 MB | **1.000×** |
+| `lz4` | 342.6 MB | 343.2 MB | 1.002× |
+| `shufdelta` | 199.2 MB | 200.2 MB | 1.005× |
+| `zstd` | 314.2 MB | 333.0 MB | **1.060×** |
+| `pcodec` | 314.2 MB | 333.0 MB | 1.060× |
+| `auto` | 197.9 MB | 413.3 MB | **2.088×** |
+
+Reading it, in order of what dominates:
+
+1. **The `auto` row is a codec *flip*, not lost compression.** The per-shard
+   codec histogram moves `shufdelta ×7 → scx1 ×7`: the adaptive rule that picks
+   per shard reaches a different answer on the reordered data, and the whole
+   2.09× is that switch. This is the case to plan for, because `auto` is the
+   default.
+2. **`zstd` genuinely loses ~6%.** No flip — this is the cross-row redundancy a
+   whole-shard-stream codec really does depend on, and a random permutation
+   really does destroy some of it. Much smaller than the flip, but real.
+3. **`scx1` is exactly neutral**, as its design implies: each row's gene indices
+   are coded independently of row order, so a permutation just relocates
+   identically-sized blocks.
+
+**So pin the input's own codec** — `--codec shufdelta` on the file above keeps it
+at 1.005×. Note that `--codec scx1` is *not* the size-preserving choice on a
+`shufdelta`/`zstd` input: it is exactly what `auto` flips to, so it reproduces
+the 2.09× rewrite. Reach for `scx1` when you want a permutation-invariant
+encoding or the GPU device-decode route, not when you want to hold the file's
+size. `scx sort --shuffle` warns before the rewrite and names the pin. See
+[performance.md § Global pre-shuffle](performance.md#global-pre-shuffle-data-load-phase-1-1d)
+for the second dataset and the batch-mixing numbers.
+
+**Shard geometry is not preserved by default.** `--shard-size` defaults to 16,384
+(inherited from `sort`), so shuffling a file written with a different shard size
+re-shards it as well as reordering it — and shard size is exactly what quantises
+batch composition. Pass `--shard-size <input's value>` to reorder only; the
+command warns when the two differ.
+
+Everything else behaves exactly as a key sort: deletions are materialized away,
+the CSC sidecar and detection bitmap are dropped unless `--rebuild-csc` /
+`--bitmap` is passed, `adata.raw` is not preserved, obsm/obsp/layers are
+remapped, and multimodal inputs reorder every modality in lockstep.
+
 ## CLI commands
 
 ### Setting shard size during conversion

@@ -18,6 +18,7 @@ pub mod predicate_index;
 pub mod rebuild_csc;
 pub mod rewrite_helpers;
 pub mod rollback;
+pub mod shuffle_order;
 pub mod sort;
 pub mod sort_engine;
 
@@ -45,6 +46,7 @@ pub use predicate_index::PredicateIndexBuildSummary;
 pub use rebuild_csc::rebuild_csc_inplace;
 pub use rewrite_helpers::copy_auxiliary_sections;
 pub use rollback::{rollback, rollback_to};
+pub use shuffle_order::seeded_permutation;
 pub use sort::{ReferenceSpec, SortOptions, SortStrategy, SortSummary};
 pub use sort_engine::{
     compute_grouped_order, sort, sort_with_strategy, GroupedOrder, GROUP_BYTES_PER_NNZ,

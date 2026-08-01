@@ -14,6 +14,9 @@ pub fn run_sort(
     output: &Path,
     by: Vec<String>,
     reverse: bool,
+    // 1D: `Some(seed)` when `--shuffle` was passed. The dispatch layer resolves
+    // `--seed`'s default, so the engine only ever sees an explicit seed.
+    shuffle: Option<u64>,
     force: bool,
     shard_size: u32,
     codec: &str,
@@ -34,8 +37,14 @@ pub fn run_sort(
     group_write_block_bytes: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::cli_utils::validate_scx_file(input)?;
-    if by.is_empty() && group_by.is_none() {
-        return Err("scx sort requires --by with at least one obs column (or --group-by)".into());
+    // Three order sources: `--by`, `--group-by`, and 1D's `--shuffle`. The
+    // engine rejects any combination of them; this only catches the case of
+    // supplying none.
+    if by.is_empty() && group_by.is_none() && shuffle.is_none() {
+        return Err(
+            "scx sort requires --by with at least one obs column (or --group-by, or --shuffle)"
+                .into(),
+        );
     }
 
     if output.exists() {
@@ -117,16 +126,16 @@ pub fn run_sort(
             .template("{spinner:.green} {msg}")
             .expect("valid template"),
     );
-    pb.set_message(format!(
-        "Sorting {} by {}...",
-        input.display(),
-        by.join(",")
-    ));
+    pb.set_message(match shuffle {
+        Some(seed) => format!("Shuffling {} (seed {seed})...", input.display()),
+        None => format!("Sorting {} by {}...", input.display(), by.join(",")),
+    });
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     let opts = scx_ops::SortOptions {
         by,
         reverse,
+        shuffle,
         shard_target_rows: shard_size,
         codec,
         index_options: ConversionPredicateIndexOptions {
@@ -152,7 +161,11 @@ pub fn run_sort(
 
     let after_size = std::fs::metadata(output)?.len();
     println!(
-        "Sorted {} -> {} ({} -> {}, {} rows, {} shards, strategy {:?})",
+        "{} {} -> {} ({} -> {}, {} rows, {} shards, strategy {:?})",
+        match shuffle {
+            Some(seed) => format!("Shuffled (seed {seed})"),
+            None => "Sorted".to_string(),
+        },
         input.display(),
         output.display(),
         human_size(before_size),

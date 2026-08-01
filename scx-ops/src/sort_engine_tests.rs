@@ -2060,3 +2060,378 @@ fn grouped_fast_path_preserves_layers_and_obsp() {
         assert!(str_col(&qr.obs, "cell_type").iter().all(|c| *c == label));
     }
 }
+
+// ---------------------------------------------------------------------------
+// 1D — `scx sort --shuffle`: the seeded permutation as a third pass-0 producer
+// ---------------------------------------------------------------------------
+
+/// Shuffle-mode options. Note `by` stays empty — shuffle and `--by` are
+/// mutually exclusive order sources, not a key plus a modifier.
+fn shuffle_opts(seed: u64) -> SortOptions {
+    SortOptions {
+        by: Vec::new(),
+        shuffle: Some(seed),
+        shard_target_rows: 2,
+        ..Default::default()
+    }
+}
+
+/// The alignment test, and the one that matters most: a permutation that
+/// desyncs obs from X produces a correctly *shaped* file with every row
+/// mislabelled. Joining on `cell_id` is what catches it.
+#[test]
+fn shuffle_preserves_every_row_and_its_obs_alignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let out = dir.path().join("out.scx");
+    let summary = sort(&inp, &out, &shuffle_opts(42)).unwrap();
+
+    assert_eq!(summary.strategy, SortStrategy::InMemory);
+    assert_eq!(summary.n_obs, 12);
+
+    let (in_ids, in_rows) = content(&inp);
+    let (out_ids, out_rows) = content(&out);
+
+    // Row multiset identical: nothing gained, lost, or duplicated.
+    assert_eq!(
+        in_ids.iter().collect::<HashSet<_>>(),
+        out_ids.iter().collect::<HashSet<_>>()
+    );
+    assert_eq!(in_ids.len(), out_ids.len());
+
+    // ...and each cell still carries its own X row.
+    let in_map: HashMap<&String, &Vec<(i32, f32)>> = in_ids.iter().zip(&in_rows).collect();
+    for (id, row) in out_ids.iter().zip(&out_rows) {
+        assert_eq!(in_map[id], row, "X row for {id} must survive the shuffle");
+    }
+}
+
+/// The anti-tautology half of the round-trip test: every assertion above holds
+/// for the identity permutation too, so a shuffle that silently became a no-op
+/// would pass all of them.
+#[test]
+fn shuffle_actually_permutes() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let out = dir.path().join("out.scx");
+    sort(&inp, &out, &shuffle_opts(42)).unwrap();
+
+    assert_ne!(
+        col_of(&inp, "cell_id"),
+        col_of(&out, "cell_id"),
+        "shuffle must reorder rows, not just rewrite them"
+    );
+}
+
+/// The strategy-differential gate, 2-way. K-pass is excluded on purpose: it
+/// emits grouped by category and cannot express an arbitrary permutation
+/// (`shuffle_refuses_a_forced_kpass_strategy` pins the refusal).
+#[test]
+fn shuffle_strategy_differential_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let mut o = shuffle_opts(42);
+    o.memory_budget = Some(64); // forces the external path to actually partition
+
+    let mut results = Vec::new();
+    for strat in [SortStrategy::InMemory, SortStrategy::ExternalPartition] {
+        let out = dir.path().join(format!("out_{strat:?}.scx"));
+        let summary = sort_with_strategy(&inp, &out, &o, Some(strat)).unwrap();
+        assert_eq!(summary.strategy, strat);
+        results.push(content(&out));
+    }
+    assert_eq!(
+        results[0], results[1],
+        "in-memory vs external must produce the same shuffled file"
+    );
+}
+
+/// Auto-selection must never pick K-pass in shuffle mode — there is no
+/// categorical key for it to enumerate. A budget below the estimate is what
+/// makes K-pass a candidate for a key sort.
+#[test]
+fn shuffle_auto_selection_avoids_kpass() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let out = dir.path().join("out.scx");
+    let mut o = shuffle_opts(42);
+    o.memory_budget = Some(64);
+    let summary = sort(&inp, &out, &o).unwrap();
+    assert_eq!(summary.strategy, SortStrategy::ExternalPartition);
+}
+
+#[test]
+fn shuffle_refuses_a_forced_kpass_strategy() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let out = dir.path().join("out.scx");
+    let mut o = shuffle_opts(42);
+    o.memory_budget = Some(64);
+    let err = sort_with_strategy(&inp, &out, &o, Some(SortStrategy::KPassByCategory))
+        .expect_err("forced K-pass under --shuffle must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("K-pass") && msg.contains("random permutation"),
+        "message should name both the strategy and why it cannot work: {msg}"
+    );
+}
+
+#[test]
+fn shuffle_is_deterministic_at_a_fixed_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let a = dir.path().join("a.scx");
+    let b = dir.path().join("b.scx");
+    sort(&inp, &a, &shuffle_opts(1234)).unwrap();
+    sort(&inp, &b, &shuffle_opts(1234)).unwrap();
+    assert_eq!(content(&a), content(&b));
+}
+
+#[test]
+fn shuffle_seed_changes_the_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let a = dir.path().join("a.scx");
+    let b = dir.path().join("b.scx");
+    sort(&inp, &a, &shuffle_opts(1234)).unwrap();
+    sort(&inp, &b, &shuffle_opts(1235)).unwrap();
+    assert_ne!(col_of(&a, "cell_id"), col_of(&b, "cell_id"));
+}
+
+/// The seed is the *only* record of the permutation — there is no key to
+/// re-derive it from and no sidecar holding it — so a shuffled file that did
+/// not carry its seed in provenance would be unreproducible.
+#[test]
+fn shuffle_records_its_seed_in_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let out = dir.path().join("out.scx");
+    sort(&inp, &out, &shuffle_opts(7)).unwrap();
+
+    let prov = ScxReader::open(&out).unwrap().read_provenance().unwrap();
+    let entry = prov
+        .operations
+        .iter()
+        .rev()
+        .find(|e| e.action == "sort")
+        .expect("shuffle records a sort provenance entry");
+    let v: serde_json::Value = serde_json::from_str(&entry.params_json).unwrap();
+    assert_eq!(v["shuffle"]["seed"], serde_json::json!(7));
+    assert_eq!(v["by"], serde_json::json!([]));
+}
+
+// --- cross-flag rejections: reject, don't silently prefer one order source ---
+
+#[test]
+fn shuffle_rejects_a_sort_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let out = dir.path().join("out.scx");
+    let mut o = shuffle_opts(42);
+    o.by = vec!["cell_type".to_string()];
+    let msg = sort(&inp, &out, &o).expect_err("must reject").to_string();
+    assert!(msg.contains("--shuffle and --by"), "{msg}");
+}
+
+#[test]
+fn shuffle_rejects_group_by() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let out = dir.path().join("out.scx");
+    let mut o = shuffle_opts(42);
+    o.group_by = Some("cell_type".to_string());
+    let msg = sort(&inp, &out, &o).expect_err("must reject").to_string();
+    assert!(msg.contains("--shuffle and --group-by"), "{msg}");
+}
+
+#[test]
+fn shuffle_rejects_reverse() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let out = dir.path().join("out.scx");
+    let mut o = shuffle_opts(42);
+    o.reverse = true;
+    let msg = sort(&inp, &out, &o).expect_err("must reject").to_string();
+    assert!(msg.contains("--reverse is meaningless"), "{msg}");
+}
+
+// --- inherited engine behaviour, re-checked on the shuffle path -------------
+
+/// Deletions are materialized away, exactly as for a key sort. The consequence
+/// worth pinning: the permutation is over the *live* rows, so it cannot be
+/// compared against a shuffle of the undeleted file.
+#[test]
+fn shuffle_materializes_deletions_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let (inp, n_deleted) = fixture_deletion(&dir);
+    let out = dir.path().join("out.scx");
+    let summary = sort(&inp, &out, &shuffle_opts(42)).unwrap();
+    assert_eq!(summary.n_obs, (12 - n_deleted) as u64);
+
+    let clean = ScxReader::open(&out)
+        .unwrap()
+        .deletion_keep_mask()
+        .unwrap()
+        .map(|m| m.iter().all(|&k| k))
+        .unwrap_or(true);
+    assert!(clean, "shuffled output must be deletion-free");
+
+    let out_ids: HashSet<String> = col_of(&out, "cell_id").into_iter().collect();
+    let expected: HashSet<String> = (0..12)
+        .filter(|i| ![1usize, 3, 5].contains(i))
+        .map(|i| format!("cell_{i}"))
+        .collect();
+    assert_eq!(out_ids, expected);
+}
+
+#[test]
+fn shuffle_remaps_obsp_and_carries_layers() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_obsp_layers(&dir); // 8 obs; edge r -> (r+1)%8, data r+1; "raw" layer
+    let out = dir.path().join("out.scx");
+    sort(&inp, &out, &shuffle_opts(42)).unwrap();
+
+    let ro = ScxReader::open(&out).unwrap();
+    let out_ids = col_of(&out, "cell_id");
+    let np = new_pos_map(&out_ids, 8);
+
+    let obsp = ro.read_obsp("connectivities").unwrap();
+    let expected: HashSet<(i64, i64, u32)> = (0..8i64)
+        .map(|r| {
+            let c = (r + 1) % 8;
+            (np[r as usize], np[c as usize], (r + 1) as u32)
+        })
+        .collect();
+    let got: HashSet<(i64, i64, u32)> = obsp_edges(&obsp)
+        .into_iter()
+        .map(|(r, c, d)| (r, c, d as u32))
+        .collect();
+    assert_eq!(got, expected, "obsp edges remapped through the shuffle");
+
+    // The `raw` layer follows X.
+    let ri = ScxReader::open(&inp).unwrap();
+    let li = ri.read_layer("raw").unwrap();
+    let lo = ro.read_layer("raw").unwrap();
+    let in_ids = str_col(&ri.read_obs().unwrap(), "cell_id");
+    let in_map: HashMap<&String, Vec<(i32, f32)>> = in_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id, csr_row(&li.indptr, &li.indices, &li.data, i)))
+        .collect();
+    for (k, id) in out_ids.iter().enumerate() {
+        assert_eq!(csr_row(&lo.indptr, &lo.indices, &lo.data, k), in_map[id]);
+    }
+}
+
+/// Multimodal works because `sort_multimodal` consumes only `order_old` /
+/// `new_pos_of_old` and never the keys — but "works by construction" is what
+/// this test exists to disprove or confirm. The failure it guards is a
+/// per-modality desync, which yields correctly shaped modalities whose rows
+/// describe different cells.
+#[test]
+fn shuffle_reorders_every_modality_in_lockstep() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_multimodal(&dir); // 12 obs, rna(8) + adt(4)
+    let out = dir.path().join("out.scx");
+    sort(&inp, &out, &shuffle_opts(42)).unwrap();
+
+    let ri = ScxReader::open(&inp).unwrap();
+    let ro = ScxReader::open(&out).unwrap();
+    assert!(ro.is_multimodal());
+    assert_eq!(ro.n_modalities(), 2);
+
+    let in_ids = str_col(&ri.read_obs().unwrap(), "cell_id");
+    let out_ids = str_col(&ro.read_obs().unwrap(), "cell_id");
+    assert_ne!(in_ids, out_ids, "the shuffle must have done something");
+
+    for mid in [1u8, 2] {
+        let ci = ri.read_all_csr_shards_for(mid).unwrap();
+        let co = ro.read_all_csr_shards_for(mid).unwrap();
+        assert_eq!(ci.shape.1, co.shape.1, "modality {mid} n_vars preserved");
+        let in_map: HashMap<&String, Vec<(i32, f32)>> = in_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id, csr_row(&ci.indptr, &ci.indices, &ci.data, i)))
+            .collect();
+        for (k, id) in out_ids.iter().enumerate() {
+            assert_eq!(
+                csr_row(&co.indptr, &co.indices, &co.data, k),
+                in_map[id],
+                "modality {mid} X row for {id}"
+            );
+        }
+    }
+}
+
+/// A shuffle on a sharded-obs input drives the same projected/assembled obs
+/// path an atlas-scale file takes — and, unlike a key sort, reads *no* key
+/// columns at all. Re-shuffling a shuffled file is the cheapest way to build
+/// that input.
+#[test]
+fn shuffle_handles_a_sharded_obs_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let once = dir.path().join("once.scx");
+    sort(&inp, &once, &shuffle_opts(1)).unwrap();
+
+    let shard_count = ScxReader::open(&once).unwrap().obs_metadata_shard_count();
+    assert!(
+        shard_count >= 2,
+        "expected a multi-shard obs input, got {shard_count}"
+    );
+
+    // A large budget keeps obs on the in-memory path (a 64-byte budget cannot
+    // fit even one obs shard) while still letting a forced external X strategy
+    // run — the same split `sharded_obs_input_sorts_identically` uses.
+    let a = dir.path().join("a.scx");
+    let b = dir.path().join("b.scx");
+    let mut budgeted = shuffle_opts(2);
+    budgeted.memory_budget = Some(1 << 30);
+    sort(&once, &a, &shuffle_opts(2)).unwrap();
+    sort_with_strategy(&once, &b, &budgeted, Some(SortStrategy::ExternalPartition)).unwrap();
+    assert_eq!(content(&a), content(&b));
+
+    // And the twice-shuffled file still holds exactly the original cells.
+    assert_eq!(
+        col_of(&inp, "cell_id").into_iter().collect::<HashSet<_>>(),
+        col_of(&a, "cell_id").into_iter().collect::<HashSet<_>>()
+    );
+}
+
+/// The codec-mix probe behind the `--shuffle` size warning. Pinning the
+/// *decision* rather than the log line: the warning exists to tell a user, in
+/// advance of a multi-hour rewrite, that their file is in the class that grows.
+/// A probe that always answered "0 cross-row shards" would silence it forever
+/// and nothing else would notice.
+#[test]
+fn cross_row_codec_probe_distinguishes_scx1_from_zstd() {
+    use scx_codec::CodecSelection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+
+    for (codec, expect_cross_row) in [
+        (CodecId::Scx1, false),
+        (CodecId::Zstd, true),
+        (CodecId::ShufDeltaZstd, true),
+        (CodecId::None, false),
+    ] {
+        let out = dir.path().join(format!("out_{codec:?}.scx"));
+        let mut o = opts(&["cell_type"]);
+        o.codec = CodecSelection::Explicit(codec);
+        sort(&inp, &out, &o).unwrap();
+
+        let reader = ScxReader::open(&out).unwrap();
+        let (cross_row, total, dominant) = super::cross_row_coded_shard_counts(&reader).unwrap();
+        assert!(total > 0, "{codec:?}: fixture must have X shards");
+        if expect_cross_row {
+            assert_eq!(cross_row, total, "{codec:?} compresses across rows");
+        } else {
+            assert_eq!(cross_row, 0, "{codec:?} codes each row independently");
+        }
+        // The warning names this codec as the size-preserving `--codec` pin, so
+        // a wrong answer here sends the user to a flag that reproduces the very
+        // blowup being warned about.
+        assert_eq!(dominant, Some(codec), "dominant codec must be reported");
+    }
+}

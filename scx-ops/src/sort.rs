@@ -56,10 +56,23 @@ use crate::error::{OpsError, Result};
 #[derive(Debug, Clone)]
 pub struct SortOptions {
     /// obs columns to sort by, lexicographic in `--by` order (leading key
-    /// first). Empty is rejected at key-extractor construction.
+    /// first). Empty is rejected at key-extractor construction — except in
+    /// shuffle mode (see [`SortOptions::shuffle`]), which has no key at all.
     pub by: Vec<String>,
     /// Descending on all keys.
     pub reverse: bool,
+
+    /// 1D: replace the key-derived order with a **seeded random permutation** of
+    /// the live obs rows. `Some(seed)` engages shuffle mode; `None` (the
+    /// default) is a normal key sort.
+    ///
+    /// Modelled as one `Option<u64>` rather than a `bool` + a `seed` so
+    /// "shuffle without a seed" is unrepresentable — the permutation is
+    /// contractually reproducible from the recorded seed alone.
+    ///
+    /// Mutually exclusive with `by`, `reverse` and `group_by`; the engine
+    /// rejects the combinations rather than silently ignoring one side.
+    pub shuffle: Option<u64>,
     /// Output shard target rows.
     pub shard_target_rows: u32,
     /// Output codec selection (`Auto` defers per-shard selection to the
@@ -123,6 +136,7 @@ impl Default for SortOptions {
         Self {
             by: Vec::new(),
             reverse: false,
+            shuffle: None,
             shard_target_rows: DEFAULT_SHARD_TARGET_ROWS,
             codec: CodecSelection::Auto,
             index_options: ConversionPredicateIndexOptions::default(),
@@ -577,6 +591,7 @@ where
 /// Build the `sort` provenance entry (mirrors the `compact` entry shape). The
 /// caller supplies `timestamp` (Unix seconds) so tests stay deterministic;
 /// the Phase-4 caller passes `SystemTime::now()`.
+#[allow(clippy::too_many_arguments)]
 pub fn sort_provenance_entry(
     by: &[String],
     reverse: bool,
@@ -584,6 +599,7 @@ pub fn sort_provenance_entry(
     indexed_columns: &[String],
     timestamp: i64,
     grouping: Option<serde_json::Value>,
+    shuffle_seed: Option<u64>,
 ) -> ProvenanceEntry {
     let mut params = serde_json::json!({
         "by": by,
@@ -596,6 +612,13 @@ pub fn sort_provenance_entry(
     // it was produced).
     if let Some(g) = grouping {
         params["grouping"] = g;
+    }
+    // 1D: record the shuffle seed. Unlike `grouping`, this is not merely
+    // descriptive — the permutation is *only* recoverable from the seed (there
+    // is no key to re-derive it from and no sidecar recording it), so a
+    // shuffled file that did not carry its seed would be unreproducible.
+    if let Some(seed) = shuffle_seed {
+        params["shuffle"] = serde_json::json!({ "seed": seed });
     }
     ProvenanceEntry {
         timestamp,
