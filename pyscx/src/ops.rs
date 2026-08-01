@@ -930,10 +930,20 @@ pub fn sort(
 ///
 /// Two consequences worth knowing before a multi-hour rewrite:
 ///
-/// - **Size is not neutral.** A random permutation destroys the cross-row
-///   redundancy that `zstd` / `shufdelta` shards exploit, so X usually grows.
-///   `scx1` codes each row's gene indices independently of row order and is
-///   genuinely size-neutral under a permutation — the CLI's `--codec scx1`.
+/// - **Size is not neutral, and the fix is to pin the *input's own* codec.**
+///   Two effects grow the output. The dominant one is that `codec="auto"`
+///   RE-SELECTS per shard on reordered data and can flip to a bulkier encoding
+///   (measured 1.86-2.09x on X); the smaller one is a genuine loss of cross-row
+///   redundancy (6-12% for `zstd`, under 1% for `lz4`/`shufdelta`). So pass
+///   `codec="zstd"` / `codec="shufdelta"` / whatever the input already uses.
+///   `codec="scx1"` is size-neutral only relative to an `scx1` input — on a
+///   `shufdelta`/`zstd` file it *is* what `auto` flips to, so it reproduces the
+///   ~2x rewrite rather than avoiding it. Reach for it when you want a
+///   permutation-invariant encoding or the GPU device-decode route.
+/// - **Shard geometry is not preserved by default.** `shard_size=None` uses the
+///   16,384-row default, so a file written with a different shard size is
+///   re-sharded as well as reordered — and shard size is what quantises batch
+///   composition. Pass `shard_size=<the input's value>` to reorder only.
 /// - **It is the inverse of a sort for queries.** Sorting collapses each
 ///   category's predicate-index shard ranges to one contiguous run; shuffling
 ///   scatters every category across every shard.

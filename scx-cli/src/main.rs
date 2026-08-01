@@ -458,8 +458,12 @@ enum Commands {
         /// so a training loader gets i.i.d. batches at any `shard_group_size`.
         /// Mutually exclusive with `--by`, `--group-by` and `--reverse`. Note
         /// this is the *inverse* of a sort: it maximally scatters predicate-index
-        /// shard ranges, and on zstd/shufdelta-coded X it usually grows the file
-        /// (pass `--codec scx1` for a size-neutral shuffle).
+        /// shard ranges. To keep the output's size, pin the INPUT's own codec
+        /// (`--codec zstd`, `--codec shufdelta`, …) — left at `auto` the adaptive
+        /// codec re-selects and X can grow ~2x. `--codec scx1` is not the
+        /// size-preserving choice unless the input is already scx1; it is what
+        /// `auto` tends to flip to. Pass `--shard-size` matching the input to
+        /// reorder without also re-sharding.
         #[arg(long)]
         shuffle: bool,
         /// RNG seed for `--shuffle`. Recorded in the output's provenance, and

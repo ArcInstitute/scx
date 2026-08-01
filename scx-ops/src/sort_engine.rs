@@ -226,9 +226,16 @@ pub fn sort_with_strategy(
         if opts.codec == CodecSelection::Auto {
             let (cross_row, total, dominant) = cross_row_coded_shard_counts(&reader)?;
             if total > 0 && cross_row * 2 > total {
+                // This reaches Python too — pyscx installs `pyo3_log`, so a
+                // `pyscx.shuffle` caller sees this exact string. Name both
+                // spellings rather than sending them to a CLI flag they are
+                // not using.
                 let pin = dominant
-                    .map(|c| format!("--codec {}", codec_cli_name(c)))
-                    .unwrap_or_else(|| "--codec <the input's codec>".to_string());
+                    .map(|c| {
+                        let n = codec_cli_name(c);
+                        format!("`--codec {n}` (Python: `codec=\"{n}\"`)")
+                    })
+                    .unwrap_or_else(|| "`--codec <the input's codec>`".to_string());
                 log::warn!(
                     "scx sort --shuffle: {cross_row}/{total} X shards use a codec whose \
                      compression spans rows, and the output codec is `auto`. Two distinct \
@@ -237,7 +244,7 @@ pub fn sort_with_strategy(
                      codec — measured 1.86-2.09x on X, and it is the dominant term; (2) the \
                      permutation genuinely costs some cross-row redundancy — measured 6-12% \
                      for zstd, under 1% for lz4/shufdelta. To keep the input's size, pin the \
-                     input's own codec: `{pin}`. Pin `--codec scx1` only if you want a \
+                     input's own codec: {pin}. Pin `scx1` only if you want a \
                      permutation-invariant encoding or the GPU device-decode route — on a \
                      shufdelta/zstd input that is itself the ~2x rewrite described above. \
                      See docs/sharding.md and docs/performance.md."
@@ -259,8 +266,9 @@ pub fn sort_with_strategy(
                 "scx sort --shuffle: output shard size {} differs from the input's {} — the \
                  rewrite will re-shard as well as reorder, which changes how many cells share \
                  a shard and therefore what a `shard_group_size=1` batch contains. Pass \
-                 `--shard-size {}` to reorder only.",
+                 `--shard-size {}` (Python: `shard_size={}`) to reorder only.",
                 opts.shard_target_rows,
+                in_header.shard_target_rows,
                 in_header.shard_target_rows,
                 in_header.shard_target_rows
             );

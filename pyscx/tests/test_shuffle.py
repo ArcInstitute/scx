@@ -486,3 +486,17 @@ def test_shuffle_rejects_an_unknown_codec(clustered_adata, scx_from_adata, tmp_d
     src = scx_from_adata(clustered_adata, "src.scx")
     with pytest.raises(ValueError):
         pyscx.shuffle(src, str(tmp_dir / "out.scx"), codec="brotli")
+
+
+@pytest.mark.skipif(_scx_bin() is None, reason="scx CLI not on PATH")
+def test_cli_help_does_not_teach_the_wrong_codec_remediation():
+    """`scx sort --help` is the first surface many users meet, so it must not
+    contradict the runtime warning. It carried "pass `--codec scx1` for a
+    size-neutral shuffle" for one commit *after* the engine warning had been
+    rewritten to reject exactly that advice."""
+    out = subprocess.run(
+        [_scx_bin(), "sort", "--help"], capture_output=True, text=True, check=True
+    ).stdout
+    assert "--shuffle" in out
+    assert "scx1` for a size-neutral" not in out
+    assert "pin the INPUT's own codec" in out
