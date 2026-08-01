@@ -33,6 +33,31 @@
 //! update both implementations, regenerate the golden fixture, update the kernel
 //! tests, and bump `pyscx::COLLATE_CELLSET_CONTRACT_VERSION`** (which state3 asserts
 //! at `rust_collate` setup to fail loudly on version skew).
+//!
+//! ## What the version actually covers — and what it does not
+//!
+//! This comment used to say the version is bumped "on any contract change", which
+//! was not true: #356 changed the accepted preprocess-mode strings — PFlog v2
+//! (`pflog1ppf_raw`) to v4 (`pflog_raw` plus a required `pflog_alpha`), a
+//! genuinely different transform — and left the version at `1`, so the assertion
+//! reported agreement between implementations that disagreed. The claim is
+//! narrowed here to something enforceable. `COLLATE_CELLSET_CONTRACT_VERSION`
+//! covers, exhaustively:
+//!
+//! 1. the encoder-crop, masking and target semantics in [`collate_cell`];
+//! 2. the accepted [`PreprocessMode`] strings, the parameters each mode
+//!    *requires* (e.g. `pflog_raw` requires `pflog_alpha`), and the meaning of
+//!    each mode;
+//! 3. the §4.4 gather-stage **value** contract — the non-negativity clip and the
+//!    optional seeded downsample in `sparse_cellset::SparseCellSetLoader`.
+//!
+//! It does **not** cover the batch's array *shapes* or key names (a
+//! length-validation error surfaces those loudly at the first batch), nor the
+//! `pe_mask` omission noted on [`CellOut`], which is an agreed non-emission rather
+//! than a version-dependent behaviour.
+//!
+//! Version history: **v1** initial; **v2** = #356's mode strings (retroactively)
+//! + Phase 1B's clip and downsample.
 
 use std::collections::HashSet;
 

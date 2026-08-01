@@ -2247,6 +2247,66 @@ projected it in memory (its own docstring conceded "the network cost is the full
 regardless"). It is now a genuine per-shard pushdown, so the network cost is the requested
 columns' bytes.
 
+### Count-depth downsampling in the gather (data-load Phase 1, 1B)
+
+**The headline is a null result, and it is the useful one: moving the per-cell downsample draw
+from numpy into Rust is a wash.** Captured cold on `cellset_gather` / `scx_auto`, S=64 random
+plans, `target_library_size=2000`, multinomial, `n_runs=3` (per-run values were identical to
+the tenth across all three runs in every arm):
+
+| dataset | baseline, no downsample | gather + numpy per-cell draw | draw inside the gather | ratio |
+|---|---|---|---|---|
+| census_500k | 6.7 sets/s | 6.5 sets/s | 6.4 sets/s | **0.99×** |
+| tabula_sapiens_100k | 5.0–5.1 sets/s | 5.3 sets/s | 5.2–5.3 sets/s | **1.00×** |
+
+Both arms move the same cells over the same plans, so the ratio isolates the draw. The draw is
+not where the time goes: a scattered cell-set gather is decode-bound at 5–7 sets/s, and a
+per-cell multinomial over a ~1.4k-nonzero row is ~1% of that in either language. Downsampling
+*at all* costs about 4% (6.7 → 6.4 at census_500k); which implementation does it is noise-level,
+and the Rust side is if anything a hair slower — plausibly the per-row `Vec<u64>` trial buffer
+and a fresh ChaCha8 rekey per row against numpy's vectorised multinomial. **That 1% was not
+chased**, because a 1% term on a decode-bound path does not justify the complexity.
+
+**So what 1B buys is capability, not throughput** — and that is the claim to carry. Before it,
+a consumer using the native collate kernel could not downsample at all: the kernel's consumer
+owns query sampling, which reads the gathered counts, so the draw has to land upstream of it or
+the query is sampled from pre-downsample expressed genes while the numerics use post-downsample
+counts. state3 refused the combination outright rather than get that wrong. The number above
+says the refusal cost nothing to lift.
+
+Note what the table is *not*: it is not "what a consumer pays today". A consumer that wants
+downsampling today cannot use the native kernel at all and falls back to a Python collator,
+which is far more expensive than the draw. This arm deliberately isolates only the draw, so the
+comparison is honest about the one thing it measures.
+
+**The unconditional negative clip did not regress the gather.** 1B also clips negatives in the
+emitted CSR (previously they passed through while the collate kernel clipped them lazily per
+read, so the two disagreed about a row's contents). Against the Phase-0 numbers on the same
+fixture and plan shape: census_500k random S=64 **6.6 → 6.7 sets/s** (423 → 427 cells/s),
+grouped S=64 **16.1 → 18.0** (1,028 → 1,150 cells/s). Neither direction is claimed as a change
+— the point is that a per-nonzero pass added to every gathered row is not measurable beside the
+decode, and the existing `cellsets_per_sec__gather_random` floor (min 5.61 at census_500k)
+already gates that path if it ever becomes measurable.
+
+**No new `thresholds.yaml` floor**, deliberately, and the reason matters more than the omission:
+the ratio must never gate, because the `downsample_python` arm is a deliberate strawman whose
+job is to be slower; and the absolute `downsample_rust` rate has exactly one capture, so any
+threshold would be guesswork. The gather floors already cover the path the clip touches. This
+follows the Phase-0 convention of leaving a metric unfloored rather than setting a floor that
+fires on noise and trains operators to ignore the gate.
+
+The 1A cache-sizing arm re-ran in the same wave and reproduced its earlier result exactly
+(census_500k 6.7 vs 6.7 = 1.00×, `lru_consulted: false`); tabula_sapiens_100k recorded
+`applicable: false` because a scattered plan there touches 7 shards against the 16-shard
+undersized arm, so both arms hold the whole working set — the fixture cannot demonstrate the
+effect, which the metadata now says out loud rather than reporting a bare 1.00×.
+
+Reproducibility, for the record: the draw is keyed on
+`(seed, method, blake3-64(canonical path), row)`, so it is invariant to manifest order, to a
+manifest subset, and to I/O and thread scheduling — but it is **not** bit-reproducible against a
+numpy-based implementation (ChaCha8 vs PCG64 + BTPE), so counts from a previously downsampled
+run change when it moves onto this path. Distributions and target semantics do not.
+
 ## Query Engine
 
 | Metric | Result |

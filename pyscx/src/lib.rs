@@ -1150,12 +1150,24 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Native cell-set collation (state3 "3A hybrid")
     m.add_function(wrap_pyfunction!(scx_loader::collate_cellset_gathered, m)?)?;
-    // Encoder-crop/mask/target contract version for `collate_cellset_gathered`.
-    // Bump on ANY change to the kernel's encoder-crop, masking, or target
-    // semantics (mirrors state3's `_sparse_encoder_inputs`). Consumers (state3)
-    // assert this at `rust_collate` setup to fail loudly on version skew. See
-    // scx-loader/src/sparse_cellset_collate.rs.
-    m.add("COLLATE_CELLSET_CONTRACT_VERSION", 1u32)?;
+    // Seeded per-row count downsample (Phase 1B): the gather-stage primitive, plus
+    // the path-identity helper that keys its RNG.
+    m.add_function(wrap_pyfunction!(scx_loader::downsample_counts_csr, m)?)?;
+    m.add_function(wrap_pyfunction!(scx_loader::downsample_file_identity, m)?)?;
+    // Contract version for the native cell-set path. Bump on ANY change to what
+    // the consumer's mirrored implementation must match: the kernel's
+    // encoder-crop / masking / target semantics, **the accepted preprocess-mode
+    // strings**, and the gather stage's value contract (clip, downsample).
+    // Consumers (state3) assert this at `rust_collate` setup to fail loudly on
+    // version skew. See scx-loader/src/sparse_cellset_collate.rs.
+    //
+    // v1 -> v2 covers two changes, one of them retroactive:
+    //   * #356 moved the accepted mode strings from PFlog v2 (`pflog1ppf_raw`) to
+    //     v4 (`pflog_raw` + a required `pflog_alpha`) WITHOUT bumping this — a
+    //     different transform behind a version the assertion still called equal.
+    //   * Phase 1B added the gather-stage negative clip and the optional seeded
+    //     downsample, so the emitted CSR's values are no longer a pass-through.
+    m.add("COLLATE_CELLSET_CONTRACT_VERSION", 2u32)?;
 
     // Build profile ("release" / "debug"). Benchmarks MUST run against a
     // release build — a debug `.so` runs ~4-10x slower uniformly and silently

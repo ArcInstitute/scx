@@ -315,6 +315,22 @@ fn golden_vectors_match_state3_reference() {
     );
     let raw =
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read golden fixture {path}: {e}"));
+
+    // "Byte-identical in both repos" was enforced by nothing but discipline: this
+    // test and state3's `test_encoder_crop_golden` would each pass happily against
+    // a *different* fixture, which is the exact drift the golden exists to catch.
+    // Pin the digest so a one-sided regeneration fails loudly here. state3's
+    // generator has a `--check` mode that verifies both copies at once.
+    let digest = blake3::hash(raw.as_bytes()).to_hex().to_string();
+    assert_eq!(
+        &digest[..16],
+        ENCODER_GOLDEN_BLAKE3_PREFIX,
+        "encoder_crop_golden.json changed. If deliberate: regenerate with \
+         `python tests/_gen_encoder_crop_golden.py --scx-repo <scx>` in state3, verify both \
+         copies match (`--check`), update this constant, and bump \
+         pyscx::COLLATE_CELLSET_CONTRACT_VERSION."
+    );
+
     let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
     let as_i32 = |v: &serde_json::Value| -> Vec<i32> {
@@ -405,3 +421,7 @@ fn normalize_log1p_zero_library_uses_factor_one() {
     assert_eq!(b.pad[0], 0);
     assert_eq!(b.target, vec![0.0, 0.0, 0.0]); // log1p(0)=0 everywhere
 }
+
+/// blake3 prefix of `tests/data/encoder_crop_golden.json`. The state3 copy must be
+/// byte-identical; `state3/tests/_gen_encoder_crop_golden.py --check` verifies both.
+const ENCODER_GOLDEN_BLAKE3_PREFIX: &str = "e7b2ef4fceecf514";

@@ -111,6 +111,7 @@ fn gather_single_file_sets_matches_reference_in_order() {
         false,
         false,
         0.0,
+        /*downsample*/ None,
     )
     .unwrap();
 
@@ -160,9 +161,19 @@ fn empty_set_keeps_boundary_without_rows() {
     let dir = tempfile::tempdir().unwrap();
     let p0 = dir.path().join("f0.scx");
     write_fixture(&p0, 16, 8, 2);
-    let loader =
-        SparseCellSetLoader::new(vec![open(&p0)], 4, None, 2, None, None, false, false, 0.0)
-            .unwrap();
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        4,
+        None,
+        2,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+    )
+    .unwrap();
     // set 0: two rows; set 1: empty; set 2: one row.
     let plan = SparseCellSetPlan {
         file_ids: vec![0, 0, 0],
@@ -213,6 +224,7 @@ fn gather_cross_file_set_concatenates_in_global_space() {
         false,
         false,
         0.0,
+        /*downsample*/ None,
     )
     .unwrap();
 
@@ -258,7 +270,19 @@ fn sparse_transforms_match_dense_reference() {
 fn malformed_plan_loader(dir: &std::path::Path) -> StdArc<SparseCellSetLoader> {
     let p0 = dir.join("f0.scx");
     write_fixture(&p0, 16, 8, 2);
-    SparseCellSetLoader::new(vec![open(&p0)], 4, None, 2, None, None, false, false, 0.0).unwrap()
+    SparseCellSetLoader::new(
+        vec![open(&p0)],
+        4,
+        None,
+        2,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+    )
+    .unwrap()
 }
 
 /// Run one plan and return the first batch's `Result`.
@@ -289,6 +313,7 @@ fn collate_gathered_emits_stacked_tensors_matching_kernel() {
         false,
         false,
         0.0,
+        /*downsample*/ None,
     )
     .unwrap();
 
@@ -441,6 +466,7 @@ fn budget_loader(
         false,
         false,
         0.0,
+        /*downsample*/ None,
     )
     .unwrap()
 }
@@ -637,4 +663,552 @@ fn effective_cache_shards_falls_back_to_the_count_when_size_is_unknown() {
     // helper must survive; `SparseCellSetLoader::new` rejects zero files, so the
     // helper is exercised directly.
     assert_eq!(avg_shard_decoded_bytes(&[]), 0);
+}
+
+// ==========================================================================
+// Gather-stage clip + seeded downsample (Phase 1B)
+//
+// These sit at the gather level rather than in `downsample_tests.rs` because
+// what they assert is *placement*: that the clip and the draw happen before the
+// batch leaves Rust, and that the draw is keyed to the row's own identity rather
+// than to its position in the manifest or the batch.
+// ==========================================================================
+
+/// Multi-nonzero float fixture: row `r` has `nnz` entries at columns `0..nnz`
+/// with values large enough that downsampling to a small target actually bites.
+/// `negative_at` optionally forces one entry negative so the clip has something
+/// to do (the `Uint8` fixture above cannot represent one).
+fn write_float_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    n_vars: usize,
+    n_shards: usize,
+    nnz: usize,
+    negative_at: Option<(usize, usize)>,
+) {
+    assert!(n_obs.is_multiple_of(n_shards));
+    assert!(nnz <= n_vars);
+    let rows_per_shard = n_obs / n_shards;
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        n_obs as u64,
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+
+    let obs_schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+    let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    writer
+        .write_obs(
+            &arrow::record_batch::RecordBatch::try_new(
+                StdArc::new(obs_schema),
+                vec![StdArc::new(StringArray::from(
+                    cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let var_schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+    let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    writer
+        .write_var(
+            &arrow::record_batch::RecordBatch::try_new(
+                StdArc::new(var_schema),
+                vec![StdArc::new(StringArray::from(
+                    gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    for s in 0..n_shards {
+        let row_start = s * rows_per_shard;
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        for local in 0..rows_per_shard {
+            let row = row_start + local;
+            for c in 0..nnz {
+                indices.push(c as u32);
+                let mut v = (50 + (row * 7 + c * 3) % 50) as f32;
+                if negative_at == Some((row, c)) {
+                    v = -v;
+                }
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            indptr.push(*indptr.last().unwrap() + nnz as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &bytes,
+                CodecId::None,
+                ValueEncoding::Float32,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+}
+
+/// Gather one single-file set of `rows` from a loader.
+fn gather_rows(loader: Arc<SparseCellSetLoader>, fid: u32, rows: &[u64]) -> SparseCellSetBatch {
+    let n = rows.len();
+    let plan = SparseCellSetPlan {
+        file_ids: vec![fid; n],
+        rows: rows.to_vec(),
+        role_tags: vec![0; n],
+        set_offsets: vec![0, n as i64],
+    };
+    loader
+        .iter_with_plans(vec![Ok(plan)].into_iter(), 2)
+        .next()
+        .unwrap()
+        .unwrap()
+}
+
+fn ds_cfg(
+    target: u64,
+    method: crate::downsample::DownsampleMethod,
+    seed: u64,
+    identities: Vec<u64>,
+) -> crate::downsample::DownsampleConfig {
+    crate::downsample::DownsampleConfig {
+        target_library_size: target,
+        method,
+        seed,
+        file_identities: identities,
+    }
+}
+
+#[test]
+fn gather_clips_negatives_in_the_emitted_csr() {
+    // Before 1B a negative stored count travelled straight through the gather to
+    // the consumer, while the collate kernel clipped it lazily per read — so the
+    // two disagreed about what the row contained.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("neg.scx");
+    write_float_fixture(&p0, 8, 4, 2, 3, Some((5, 1)));
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        4,
+        None,
+        2,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+    )
+    .unwrap();
+
+    let b = gather_rows(loader.clone(), 0, &[5]);
+    let (idx, dat) = batch_row(&b, 0);
+    assert!(dat.iter().all(|&v| v >= 0.0), "negative leaked: {dat:?}");
+    // No downsample ⇒ no prune, so the clipped entry survives as an explicit
+    // zero and nnz is unchanged. Callers that count nnz must see this.
+    assert_eq!(idx.len(), 3, "clip must not change nnz: {idx:?}");
+    assert_eq!(dat[1], 0.0, "the clipped entry should be an explicit zero");
+}
+
+#[test]
+fn gather_clip_runs_after_coalescing_not_before() {
+    // Two local columns mapping to one global gene, one positive and one negative.
+    // Clipping before the coalesce would give 60; the reference clips after, which
+    // gives 60 - 57 = 3. Getting this backwards is silent and only shows up as a
+    // small systematic count inflation.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("dup.scx");
+    // Row 0, cols 0..2: values 50, 53, 56 by construction; force col 1 negative.
+    write_float_fixture(&p0, 4, 4, 1, 3, Some((0, 1)));
+    // locals 0 and 1 both -> global 0; local 2 -> global 1.
+    let remap = vec![vec![0i32, 0, 1, -1]];
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        4,
+        None,
+        2,
+        Some(remap),
+        Some(2),
+        false,
+        false,
+        0.0,
+        None,
+    )
+    .unwrap();
+
+    let b = gather_rows(loader.clone(), 0, &[0]);
+    let (idx, dat) = batch_row(&b, 0);
+    assert_eq!(idx, &[0, 1]);
+    // 50 + (-53) = -3 -> clipped to 0. Clipping first would have produced 50.
+    assert_eq!(
+        dat[0], 0.0,
+        "clip appears to run before the coalesce: {dat:?}"
+    );
+    assert_eq!(dat[1], 56.0);
+}
+
+#[test]
+fn gather_downsamples_to_the_target_with_multinomial() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("d0.scx");
+    write_float_fixture(&p0, 16, 8, 2, 6, None);
+    let ident = crate::downsample::file_identity(p0.to_str().unwrap());
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        4,
+        None,
+        2,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        Some(ds_cfg(
+            40,
+            crate::downsample::DownsampleMethod::Multinomial,
+            7,
+            vec![ident],
+        )),
+    )
+    .unwrap();
+
+    let b = gather_rows(loader.clone(), 0, &[0, 1, 2, 3, 4]);
+    for j in 0..5 {
+        let (_, dat) = batch_row(&b, j);
+        let lib: f32 = dat.iter().sum();
+        assert_eq!(lib, 40.0, "row {j} missed the target: {dat:?}");
+    }
+}
+
+#[test]
+fn gather_without_downsample_leaves_counts_untouched() {
+    // Anti-tautology for the test above: the fixture rows are well above the
+    // target, so if the downsample were a no-op the assertion there would be
+    // asserting nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("d0.scx");
+    write_float_fixture(&p0, 16, 8, 2, 6, None);
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        4,
+        None,
+        2,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+    )
+    .unwrap();
+    let (_, dat) = {
+        let b = gather_rows(loader.clone(), 0, &[0]);
+        let (i, d) = batch_row(&b, 0);
+        (i.to_vec(), d.to_vec())
+    };
+    let lib: f32 = dat.iter().sum();
+    assert!(
+        lib > 40.0,
+        "fixture too small to detect a downsample: {lib}"
+    );
+}
+
+#[test]
+fn gather_downsample_is_reproducible_across_loader_instances() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("d0.scx");
+    write_float_fixture(&p0, 16, 8, 2, 6, None);
+    let ident = crate::downsample::file_identity(p0.to_str().unwrap());
+
+    let build = || {
+        SparseCellSetLoader::new(
+            vec![open(&p0)],
+            4,
+            None,
+            2,
+            None,
+            None,
+            false,
+            false,
+            0.0,
+            Some(ds_cfg(
+                30,
+                crate::downsample::DownsampleMethod::Binomial,
+                11,
+                vec![ident],
+            )),
+        )
+        .unwrap()
+    };
+
+    let a = gather_rows(build(), 0, &[3, 7, 11]);
+    let b = gather_rows(build(), 0, &[3, 7, 11]);
+    assert_eq!(a.data, b.data);
+    assert_eq!(a.indices, b.indices);
+}
+
+#[test]
+fn gather_downsample_is_invariant_to_row_order_within_a_plan() {
+    // `read_rows_with` scatters in shard-grouped order, so the callback sees rows
+    // in a different order than the plan requests them. The draw must follow the
+    // row id, not the arrival order.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("d0.scx");
+    write_float_fixture(&p0, 16, 8, 4, 6, None);
+    let ident = crate::downsample::file_identity(p0.to_str().unwrap());
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        8,
+        None,
+        2,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        Some(ds_cfg(
+            25,
+            crate::downsample::DownsampleMethod::Multinomial,
+            3,
+            vec![ident],
+        )),
+    )
+    .unwrap();
+
+    let forward = gather_rows(loader.clone(), 0, &[1, 5, 9, 13]);
+    let reversed = gather_rows(loader.clone(), 0, &[13, 9, 5, 1]);
+    for (j, r) in [1usize, 5, 9, 13].iter().enumerate() {
+        let (_, fwd) = batch_row(&forward, j);
+        // Same row, opposite position in the batch.
+        let (_, rev) = batch_row(&reversed, 3 - j);
+        assert_eq!(fwd, rev, "row {r} drew differently by batch position");
+    }
+}
+
+#[test]
+fn gather_downsample_is_invariant_to_manifest_order() {
+    // THE test that justifies keying on the resolved path rather than on
+    // `file_id`. `file_id` is loader-construction order, so a reordered manifest —
+    // or a debugging subset — would silently redraw every cell under a `file_id`
+    // key while producing perfectly plausible output.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    write_float_fixture(&p0, 16, 8, 2, 6, None);
+    write_float_fixture(&p1, 16, 8, 2, 5, None);
+    let i0 = crate::downsample::file_identity(p0.to_str().unwrap());
+    let i1 = crate::downsample::file_identity(p1.to_str().unwrap());
+
+    let build = |paths: [&std::path::Path; 2], idents: Vec<u64>| {
+        SparseCellSetLoader::new(
+            vec![open(paths[0]), open(paths[1])],
+            8,
+            None,
+            2,
+            None,
+            None,
+            false,
+            false,
+            0.0,
+            Some(ds_cfg(
+                30,
+                crate::downsample::DownsampleMethod::Multinomial,
+                5,
+                idents,
+            )),
+        )
+        .unwrap()
+    };
+
+    // a.scx is file_id 0 here...
+    let ab = gather_rows(build([&p0, &p1], vec![i0, i1]), 0, &[2, 6]);
+    // ...and file_id 1 here. Same cells, same draw.
+    let ba = gather_rows(build([&p1, &p0], vec![i1, i0]), 1, &[2, 6]);
+    assert_eq!(
+        ab.data, ba.data,
+        "the draw moved when the manifest was reordered"
+    );
+
+    // And the two *files* must still differ from each other, or the identity is
+    // being ignored altogether.
+    let b_rows = gather_rows(build([&p0, &p1], vec![i0, i1]), 1, &[2, 6]);
+    assert_ne!(
+        ab.data, b_rows.data,
+        "both files drew identically — file identity is not reaching the key"
+    );
+}
+
+#[test]
+fn gather_rejects_an_invalid_downsample_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("d0.scx");
+    write_float_fixture(&p0, 8, 4, 2, 3, None);
+
+    let mk = |cfg: crate::downsample::DownsampleConfig| {
+        SparseCellSetLoader::new(
+            vec![open(&p0)],
+            4,
+            None,
+            2,
+            None,
+            None,
+            false,
+            false,
+            0.0,
+            Some(cfg),
+        )
+    };
+
+    // Zero target cannot sample.
+    assert!(mk(ds_cfg(
+        0,
+        crate::downsample::DownsampleMethod::Binomial,
+        1,
+        vec![7]
+    ))
+    .is_err());
+
+    // An identity table that does not cover the files is a silent
+    // wrong-cell-keyed bug waiting to happen, so it is rejected rather than
+    // padded.
+    let err = mk(ds_cfg(
+        10,
+        crate::downsample::DownsampleMethod::Binomial,
+        1,
+        vec![7, 8, 9],
+    ))
+    .err()
+    .expect("mismatched identities must be rejected")
+    .to_string();
+    assert!(err.contains("file_identities"), "unhelpful: {err}");
+
+    // A single file with no identities is fine — it keys on (seed, method, row).
+    assert!(mk(ds_cfg(
+        10,
+        crate::downsample::DownsampleMethod::Binomial,
+        1,
+        vec![]
+    ))
+    .is_ok());
+}
+
+#[test]
+fn gather_rejects_an_empty_identity_table_across_multiple_files() {
+    // Without identities, two files' row N would share a draw. The tempting
+    // fallback — key on `file_id` — is construction-order keying, the very scheme
+    // `gather_downsample_is_invariant_to_manifest_order` exists to rule out. So
+    // this is refused at construction rather than silently keyed.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    write_float_fixture(&p0, 8, 4, 2, 3, None);
+    write_float_fixture(&p1, 8, 4, 2, 3, None);
+
+    let err = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        4,
+        None,
+        2,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        Some(ds_cfg(
+            10,
+            crate::downsample::DownsampleMethod::Multinomial,
+            1,
+            vec![],
+        )),
+    )
+    .err()
+    .expect("multi-file downsample without identities must be rejected")
+    .to_string();
+    assert!(
+        err.contains("file_identities"),
+        "message should name the missing input: {err}"
+    );
+    assert!(
+        err.contains("share a draw"),
+        "message should say why it matters: {err}"
+    );
+}
+
+// ==========================================================================
+// CSR `indptr` validation
+//
+// The gap three reviewers converged on: `indptr.last() == nnz` is necessary but
+// not sufficient, and the failure mode is a panic (an out-of-bounds slice, or a
+// negative entry wrapping through `as usize`) rather than a wrong answer. Both
+// entry points take arbitrary caller-supplied arrays.
+// ==========================================================================
+
+#[test]
+fn validate_indptr_accepts_well_formed_input() {
+    assert!(validate_indptr(&[0, 2, 5], 5).is_ok());
+    assert!(validate_indptr(&[0], 0).is_ok());
+    // Empty rows in the middle are legal CSR.
+    assert!(validate_indptr(&[0, 3, 3, 3, 4], 4).is_ok());
+}
+
+#[test]
+fn validate_indptr_rejects_a_non_monotonic_array_whose_last_entry_looks_right() {
+    // The exact case reviewers named: `last == nnz` passes a naive check, then
+    // `indices[0..3]` panics on a 2-element slice.
+    let err = validate_indptr(&[0, 3, 2], 2).unwrap_err().to_string();
+    assert!(err.contains("non-decreasing"), "unhelpful: {err}");
+}
+
+#[test]
+fn validate_indptr_rejects_negatives_and_a_bad_start_and_a_bad_total() {
+    // A negative would wrap to an enormous index through `as usize`.
+    assert!(validate_indptr(&[0, -1, 2], 2).is_err());
+    // A non-zero start silently drops a prefix rather than erroring.
+    let err = validate_indptr(&[1, 3], 3).unwrap_err().to_string();
+    assert!(err.contains("indptr[0]"), "unhelpful: {err}");
+    // Totals that disagree with the data length.
+    assert!(validate_indptr(&[0, 2], 5).is_err());
+    assert!(validate_indptr(&[], 0).is_err());
+}
+
+#[test]
+fn collate_gathered_errors_rather_than_panicking_on_a_bad_indptr() {
+    // Before this check the call below panicked inside the rayon loop. An error
+    // is the crate convention for malformed input, and a panic here would cross
+    // the FFI boundary.
+    let scalars = CollateScalars {
+        k_enc: 2,
+        mode: PreprocessMode::PassThrough,
+        target_sum: 1e4,
+        pflog_alpha: None,
+        n_genes_total: 100,
+        lib_size_redef: false,
+    };
+    let err = collate_gathered(
+        &[0, 3, 2], // non-monotonic, last == nnz
+        &[1, 2],
+        &[1.0, 2.0],
+        &[0, 2],
+        vec![0, 1],
+        vec![0, 0],
+        vec![0, 0],
+        1,
+        &[1],
+        &[],
+        &[0, 0],
+        &[2],
+        &scalars,
+    )
+    .err()
+    .expect("a non-monotonic indptr must be an error, not a panic")
+    .to_string();
+    assert!(err.contains("non-decreasing"), "unhelpful: {err}");
 }

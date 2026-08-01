@@ -346,6 +346,86 @@ access (20K vs 189 cells/s). See [api.md § IndexPlanDataset](api.md#indexplanda
 for the full constructor reference, batch schema, and iterator semantics.
 
 
+## SparseCellSetDataset and the native collation kernel
+
+`SparseCellSetDataset` gathers multi-file, role-tagged **cell sets** as sparse
+CSR — the shape set-transformer models over cell populations consume. Pass
+per-file `remap_tables` to have the gather emit global-vocab CSR, in which case
+it owns the whole per-row finalisation: gene remap, dropping unmapped genes,
+sorting, coalescing duplicate mappings, the non-negativity clip, and — when
+configured — a seeded count downsample.
+
+`pyscx.collate_cellset_gathered` then turns a gathered batch into stacked
+encoder/target tensors: per-cell preprocessing (`pass_through` / `log1p_raw` /
+`pflog_raw` / `normalize_log1p`), the top-K encoder crop, drop-to-PAD encoder
+masking, the target gather at query positions, and `library_size`. The kernel is
+RNG-free by design — the decoder query gene ids and per-cell masks are supplied
+by the caller — which is what makes it cheap to hold byte-exact against a Python
+reference implementation.
+
+`pyscx.COLLATE_CELLSET_CONTRACT_VERSION` (currently `2`) pins that contract:
+the crop/mask/target semantics, the accepted preprocess-mode strings, and the
+gather stage's value contract. A consumer mirroring the kernel should assert it
+at setup so version skew fails loudly rather than mid-training.
+
+### Count-depth downsampling
+
+Downsampling every cell to a common library size is a standard depth
+augmentation. It runs **inside the gather**, not in the collator:
+
+```python
+ds = pyscx.SparseCellSetDataset(
+    paths,
+    remap_tables=remap_tables,
+    downsample_target_library_size=2000,
+    downsample_method="multinomial",   # or "binomial"
+    downsample_seed=42,
+)
+```
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `downsample_target_library_size` | `None` (off) | Counts per cell to keep. Cells already at or below it are not sampled. |
+| `downsample_method` | `"multinomial"` | `"multinomial"` hits the target **exactly**; `"binomial"` hits it in expectation (each gene drawn independently at `p = target / library_size`). |
+| `downsample_seed` | `0` | Seeds the per-row draw. |
+
+Passing a method or seed without a target is an error, not a silent no-op.
+
+Three properties worth knowing:
+
+- **The draw is keyed on `(seed, method, resolved file path, row)`**, not on
+  manifest position. So reordering `paths`, or running on a subset of them,
+  reproduces the same counts for the same cells — and because the key is derived
+  per row rather than drawn from a shared stream, the result is also invariant to
+  I/O and thread scheduling. `pyscx.downsample_file_identity(path)` exposes the
+  path component.
+- **Enabling it rounds every cell's counts to integers** (ties-to-even), not just
+  the cells above target — the counts are trial counts for a discrete sampler.
+- **It happens before the batch is returned**, which is deliberate. Callers
+  sample the decoder query from the gathered counts (`counts > 0`) and then hand
+  the same arrays to the collator; downsampling later would draw the query from
+  pre-downsample expressed genes while the numerics used post-downsample counts.
+
+`pyscx.downsample_counts_csr(...)` applies the same primitive to a CSR batch you
+gathered yourself. Prefer the loader arguments when the loader is doing the
+gather. Across several files, pass one `downsample_file_identity` value per row;
+the loader refuses a multi-file downsample without them rather than key on
+manifest position.
+
+> **`SparseCellSetBatch.data` is no longer a passthrough for signed or NaN
+> values.** Independently of downsampling, the gather now clips negatives (and
+> NaN) to zero, because the collate kernel was already doing so lazily on every
+> read and the two therefore disagreed about what a row contained. The number of
+> stored nonzeros is unchanged — a clipped entry stays as an explicit zero — but
+> the values are. Code relying on negatives reaching the consumer needs to read
+> them before the gather.
+
+Reproducibility caveat: this is a Rust-native ChaCha8 sampler, so runs
+downsampled by a numpy-based implementation are **not** bit-reproducible under it.
+What is contractual is the semantics above plus the golden fixture at
+`scx-loader/tests/data/downsample_golden.json`.
+
+
 ## MultimodalTrainingDataset
 
 For CITE-seq, 10x Multiome, or TEA-seq data stored in a single multimodal

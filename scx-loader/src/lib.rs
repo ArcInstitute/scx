@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod budget;
 pub mod decode_stage;
+pub mod downsample;
 pub mod error;
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -19,6 +20,9 @@ pub mod sparse_cellset_collate;
 pub use batch::{Batch, ObsColumn};
 pub use budget::{BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
 pub use decode_stage::{build_category_dicts, decode_stage, extract_obs_columns, CategoryDict};
+pub use downsample::{
+    clip_negatives, downsample_row, file_identity, DownsampleConfig, DownsampleMethod,
+};
 pub use error::{LoaderError, Result};
 pub use index_plan::{IndexPlanBatch, IndexPlanIter, IndexPlanLoader};
 pub use io_stage::{io_stage, ShardData, ShardGroup};
@@ -38,6 +42,6 @@ pub use sparse_cellset_collate::{collate_cell, CellIn, CellOut, CollateConfig, P
 
 #[cfg(feature = "python")]
 pub use python::{
-    collate_cellset_gathered, IndexPlanDataset, MultimodalTrainingDataset, SparseCellSetBatchIter,
-    SparseCellSetDataset, TrainingDataset,
+    collate_cellset_gathered, downsample_counts_csr, downsample_file_identity, IndexPlanDataset,
+    MultimodalTrainingDataset, SparseCellSetBatchIter, SparseCellSetDataset, TrainingDataset,
 };
