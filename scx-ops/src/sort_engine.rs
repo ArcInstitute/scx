@@ -214,20 +214,56 @@ pub fn sort_with_strategy(
         // would otherwise learn about the size growth hours later. Only when the
         // output codec is `Auto` — an explicit `--codec` is the user having
         // already made this call.
+        //
+        // The remediation this names matters, and an earlier draft got it
+        // exactly backwards. It said "pass --codec scx1 for a size-neutral
+        // shuffle", which is true only relative to an *scx1 input*. On the
+        // measured fixtures the auto-mode growth IS the adaptive codec flipping
+        // `shufdelta -> scx1`, so telling a shufdelta user to pin `scx1`
+        // reproduces the very blowup being warned about (tabula: 197.9 MB ->
+        // 413.3 MB either way). The size-preserving advice is to pin the
+        // *input's own* codec, so name it.
         if opts.codec == CodecSelection::Auto {
-            let (cross_row, total) = cross_row_coded_shard_counts(&reader)?;
+            let (cross_row, total, dominant) = cross_row_coded_shard_counts(&reader)?;
             if total > 0 && cross_row * 2 > total {
+                let pin = dominant
+                    .map(|c| format!("--codec {}", codec_cli_name(c)))
+                    .unwrap_or_else(|| "--codec <the input's codec>".to_string());
                 log::warn!(
-                    "scx sort --shuffle: {cross_row}/{total} X shards use a codec that \
-                     compresses across rows (zstd / shufdelta / lz4-shuffle). A random \
-                     permutation destroys the cross-row redundancy those codecs exploit, so \
-                     the output X will very likely be LARGER than the input — sorting a \
-                     149M-cell file by cell_type already grew X ~8%, and a shuffle is the \
-                     worst case rather than the best. Pass --codec scx1 for a size-neutral \
-                     shuffle (scx1 codes each row's gene indices independently of row order), \
-                     at the cost of a less compact file on high-median count data."
+                    "scx sort --shuffle: {cross_row}/{total} X shards use a codec whose \
+                     compression spans rows, and the output codec is `auto`. Two distinct \
+                     effects will grow the output, in this order of magnitude: (1) `auto` \
+                     RE-SELECTS per shard on the reordered data and can flip to a bulkier \
+                     codec — measured 1.86-2.09x on X, and it is the dominant term; (2) the \
+                     permutation genuinely costs some cross-row redundancy — measured 6-12% \
+                     for zstd, under 1% for lz4/shufdelta. To keep the input's size, pin the \
+                     input's own codec: `{pin}`. Pin `--codec scx1` only if you want a \
+                     permutation-invariant encoding or the GPU device-decode route — on a \
+                     shufdelta/zstd input that is itself the ~2x rewrite described above. \
+                     See docs/sharding.md and docs/performance.md."
                 );
             }
+        }
+
+        // The output's shard geometry is what a training loader's batch
+        // composition is quantised by, so a shuffle that silently re-shards is
+        // changing the very thing the user ran it to control. `--shard-size`
+        // defaults to DEFAULT_SHARD_TARGET_ROWS (inherited from `sort`), which
+        // on a file written with a different shard size is a second, unasked-for
+        // change. This is the same trap that fabricated a 5.97x throughput
+        // ratio in 1D's own benchmark before the arm threaded the input's
+        // geometry through.
+        if in_header.shard_target_rows != 0 && opts.shard_target_rows != in_header.shard_target_rows
+        {
+            log::warn!(
+                "scx sort --shuffle: output shard size {} differs from the input's {} — the \
+                 rewrite will re-shard as well as reorder, which changes how many cells share \
+                 a shard and therefore what a `shard_group_size=1` batch contains. Pass \
+                 `--shard-size {}` to reorder only.",
+                opts.shard_target_rows,
+                in_header.shard_target_rows,
+                in_header.shard_target_rows
+            );
         }
     }
 
@@ -2964,21 +3000,43 @@ fn x_value_encoding(reader: &ScxReader) -> Result<ValueEncoding> {
 /// Reads one shard header per shard; on the local mmap reader `section_bytes`
 /// is a zero-copy slice, the same access `widest_value_encoding` already makes
 /// for every shard on this path.
-fn cross_row_coded_shard_counts(reader: &ScxReader) -> Result<(usize, usize)> {
+fn cross_row_coded_shard_counts(reader: &ScxReader) -> Result<(usize, usize, Option<CodecId>)> {
+    use std::collections::HashMap;
+
     let shards = reader.catalog().shards_sorted();
     let mut cross_row = 0usize;
+    let mut histogram: HashMap<u8, usize> = HashMap::new();
     for entry in &shards {
         let section = reader.section_bytes(entry)?;
         if section.len() < SHARD_HEADER_SIZE {
             continue;
         }
         let sh = ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
+        *histogram.entry(sh.codec_id).or_insert(0) += 1;
         match CodecId::from_u8(sh.codec_id) {
             Some(CodecId::None) | Some(CodecId::Scx1) => {}
             _ => cross_row += 1,
         }
     }
-    Ok((cross_row, shards.len()))
+    // Most common codec, so the warning can name the pin that preserves size.
+    let dominant = histogram
+        .iter()
+        .max_by_key(|(_, n)| **n)
+        .and_then(|(id, _)| CodecId::from_u8(*id));
+    Ok((cross_row, shards.len(), dominant))
+}
+
+/// The `--codec` spelling for a [`CodecId`], so a warning can name a flag value
+/// the user can actually paste. Mirrors `CodecId::parse_cli`'s accepted names.
+fn codec_cli_name(c: CodecId) -> &'static str {
+    match c {
+        CodecId::None => "none",
+        CodecId::Scx1 => "scx1",
+        CodecId::Zstd => "zstd",
+        CodecId::Lz4Shuffle => "lz4",
+        CodecId::Pcodec => "pcodec",
+        CodecId::ShufDeltaZstd => "shufdelta",
+    }
 }
 
 /// Value encoding wide enough for a layer's whole sorted output (see

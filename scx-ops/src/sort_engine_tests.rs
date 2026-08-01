@@ -2422,12 +2422,16 @@ fn cross_row_codec_probe_distinguishes_scx1_from_zstd() {
         sort(&inp, &out, &o).unwrap();
 
         let reader = ScxReader::open(&out).unwrap();
-        let (cross_row, total) = super::cross_row_coded_shard_counts(&reader).unwrap();
+        let (cross_row, total, dominant) = super::cross_row_coded_shard_counts(&reader).unwrap();
         assert!(total > 0, "{codec:?}: fixture must have X shards");
         if expect_cross_row {
             assert_eq!(cross_row, total, "{codec:?} compresses across rows");
         } else {
             assert_eq!(cross_row, 0, "{codec:?} codes each row independently");
         }
+        // The warning names this codec as the size-preserving `--codec` pin, so
+        // a wrong answer here sends the user to a flag that reproduces the very
+        // blowup being warned about.
+        assert_eq!(dominant, Some(codec), "dominant codec must be reported");
     }
 }

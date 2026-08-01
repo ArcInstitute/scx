@@ -195,11 +195,20 @@ Reading it, in order of what dominates:
    are coded independently of row order, so a permutation just relocates
    identically-sized blocks.
 
-So: pass `--codec scx1` for a guaranteed-neutral shuffle, pass the input's own
-codec to isolate the compression effect, or leave `auto` and budget for the
-re-selection. See
+**So pin the input's own codec** — `--codec shufdelta` on the file above keeps it
+at 1.005×. Note that `--codec scx1` is *not* the size-preserving choice on a
+`shufdelta`/`zstd` input: it is exactly what `auto` flips to, so it reproduces
+the 2.09× rewrite. Reach for `scx1` when you want a permutation-invariant
+encoding or the GPU device-decode route, not when you want to hold the file's
+size. `scx sort --shuffle` warns before the rewrite and names the pin. See
 [performance.md § Global pre-shuffle](performance.md#global-pre-shuffle-data-load-phase-1-1d)
 for the second dataset and the batch-mixing numbers.
+
+**Shard geometry is not preserved by default.** `--shard-size` defaults to 16,384
+(inherited from `sort`), so shuffling a file written with a different shard size
+re-shards it as well as reordering it — and shard size is exactly what quantises
+batch composition. Pass `--shard-size <input's value>` to reorder only; the
+command warns when the two differ.
 
 Everything else behaves exactly as a key sort: deletions are materialized away,
 the CSC sidecar and detection bitmap are dropped unless `--rebuild-csc` /

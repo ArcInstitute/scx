@@ -356,13 +356,61 @@ def test_cli_warns_when_the_input_x_is_cross_row_coded(
             capture_output=True,
         )
 
-    needle = "compresses across rows"
+    needle = "compression spans rows"
     assert needle in _shuffle_stderr(zstd_src, str(tmp_dir / "z_out.scx"))
     assert needle not in _shuffle_stderr(scx1_src, str(tmp_dir / "s_out.scx"))
 
     # ...and an explicit --codec means the user already made the call.
     assert needle not in _shuffle_stderr(
         zstd_src, str(tmp_dir / "z_pinned.scx"), "--codec", "scx1"
+    )
+
+
+@pytest.mark.skipif(_scx_bin() is None, reason="scx CLI not on PATH")
+def test_cli_size_warning_names_the_inputs_own_codec(
+    clustered_adata, scx_from_adata, tmp_dir
+):
+    """The remediation the warning names must not *be* the failure mode.
+
+    An earlier draft said "pass --codec scx1 for a size-neutral shuffle", which
+    is true only relative to an scx1 input. On a shufdelta/zstd file the
+    auto-mode growth IS the adaptive codec flipping to scx1, so that advice
+    reproduces the blowup it warns about (tabula: 197.9 MB -> 413.3 MB either
+    way). The size-preserving pin is the input's own codec."""
+    src = scx_from_adata(clustered_adata, "src.scx")
+    zstd_src = str(tmp_dir / "zstd.scx")
+    subprocess.run(
+        [_scx_bin(), "sort", "--by", "cell_type", "--codec", "zstd", src, zstd_src],
+        check=True,
+        capture_output=True,
+    )
+    out = _shuffle_stderr(zstd_src, str(tmp_dir / "out.scx"))
+    assert "pin the input's own codec: `--codec zstd`" in out, out
+    # ...and it must not present scx1 as the size-preserving option.
+    assert "--codec scx1 for a size-neutral" not in out
+
+
+@pytest.mark.skipif(_scx_bin() is None, reason="scx CLI not on PATH")
+def test_cli_warns_when_the_shuffle_also_re_shards(
+    clustered_adata, scx_from_adata, tmp_dir
+):
+    """Shard geometry is what quantises batch composition, so a shuffle that
+    silently re-shards changes the very thing the user ran it to control.
+    `--shard-size` defaults to 16384 (inherited from `sort`); this is the same
+    trap that fabricated a 5.97x throughput ratio in 1D's own benchmark."""
+    src = scx_from_adata(clustered_adata, "src.scx")
+    sized = str(tmp_dir / "sized.scx")
+    subprocess.run(
+        [_scx_bin(), "sort", "--by", "cell_type", "--shard-size", "10",
+         "--codec", "scx1", src, sized],
+        check=True,
+        capture_output=True,
+    )
+    needle = "differs from the input's"
+    assert needle in _shuffle_stderr(sized, str(tmp_dir / "a.scx"))
+    # Carrying the geometry through silences it — the negative half.
+    assert needle not in _shuffle_stderr(
+        sized, str(tmp_dir / "b.scx"), "--shard-size", "10"
     )
 
 

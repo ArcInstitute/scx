@@ -308,6 +308,9 @@ The fix is to pay once, on disk:
 ```bash
 scx sort --shuffle --seed 42 atlas.scx atlas.train.scx
 ```
+```python
+pyscx.shuffle("atlas.scx", "atlas.train.scx", seed=42)
+```
 
 After that the row order carries no residual structure, so even
 `shard_group_size=1` gives batches that look like the corpus, and the loader's
@@ -315,8 +318,12 @@ cheap level-1 shard permutation is all the per-epoch randomization you need.
 
 Two things to know before you run it: the output is the **inverse** of a sorted
 file for query purposes (it maximally scatters predicate-index shard ranges),
-and you should pass `--codec` to hold the input's encoding — otherwise the
-adaptive `auto` codec re-selects per shard and the file can grow. Both are
+and you should pass `--codec <the input's codec>` to hold its encoding —
+otherwise the adaptive `auto` codec re-selects per shard and the file can grow
+~2×. (`--codec scx1` is *not* the size-preserving answer on a `shufdelta`/`zstd`
+input; it is what `auto` flips to.) Pass `--shard-size <input's value>` too if
+the input is not at the 16,384 default, so the rewrite reorders without also
+re-sharding. Both are
 covered in
 [sharding.md § Shuffling for training](sharding.md#shuffling-for-training-scx-sort---shuffle).
 
