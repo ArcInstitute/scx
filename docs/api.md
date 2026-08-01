@@ -1794,7 +1794,7 @@ Two properties are worth stating explicitly, because they are what the SCX-speci
 
 Members you added yourself — a numpy array, scipy matrix, or pandas DataFrame — are subset by anndata in the usual way.
 
-**Accelerators run on the subset, not the file.** After any of these ops, a backed `X` is a *window* onto the file: `kept_to_global` selects the visible rows, `col_projection` the visible columns. Every streaming `pyscx.accel.*` op reads through that window — `pca`, `pca_neighbors`, `highly_variable_genes`, `score_genes`, `pflog`, the `col_*` aggregations, `pseudobulk_means`, `pseudobulk_dex`, `rank_genes_groups` and `pdex_ref` all see exactly the matrix `adata.X` presents. Results are aligned to `adata.obs` / `adata.var`, and a `mask_var=` selection is resolved against the visible gene axis — so `filter_genes` → `highly_variable_genes` → `pca` masks the genes you filtered down to, not the on-disk ones at the same positions.
+**Accelerators run on the subset, not the file.** After any of these ops, a backed `X` is a *window* onto the file: `kept_to_global` selects the visible rows, `col_projection` the visible columns. Every streaming `pyscx.accel.*` op reads through that window — `normalize_total`, `log1p`, `calculate_qc_metrics`, `pca`, `pca_neighbors`, `neighbors`, `umap`, `leiden`, `harmony_integrate`, `highly_variable_genes`, `score_genes`, `pflog`, the `col_*` aggregations, `pseudobulk_means`, `pseudobulk_dex`, `rank_genes_groups`, `pdex_ref`, `pdex_nb_glm` and the perturbation-evaluation metrics all see exactly the matrix `adata.X` presents. Results are aligned to `adata.obs` / `adata.var`, and a `mask_var=` selection is resolved against the visible gene axis — so `filter_genes` → `highly_variable_genes` → `pca` masks the genes you filtered down to, not the on-disk ones at the same positions.
 
 The one thing the window cannot express is a **request-ordered** gene axis (`preserve_var_order=True`), because the source emits columns in sorted on-disk order. Every op above refuses that combination on a backed `X` rather than returning a silent gene/column permutation — the `preserve_var_order` entry under `Experiment.to_anndata` lists them.
 
@@ -1806,13 +1806,27 @@ A subset is **atomic**: anndata builds the replacement object and swaps it in, s
 > [!NOTE]
 > **`uns` is deep-copied by the subset.** anndata's replacement object carries a `deepcopy` of `uns`, so an entry that cannot be deep-copied — a lock, an open file handle, a live client object — makes the whole subset raise `TypeError`. The pre-4.0b backed path left `uns` alone and so tolerated these. Store non-copyable objects outside `uns`, or drop them before filtering. Everything the accelerators themselves put in `uns` (`scx_accel` route metadata, `pflog`, neighbors params) is plain data and copies fine.
 
-pyscx registers SCX handles with three private anndata `singledispatch` hooks to make this work (`as_view`, `_subset`, `to_memory`) and drives `_mutated_copy` / `_init_as_actual` directly. See [docs/compatibility-matrix.md § Private anndata APIs](compatibility-matrix.md#private-anndata-apis-pyscx-depends-on) for the supported versions and the compat test that fails loudly on an upgrade.
+pyscx registers SCX handles with three private anndata `singledispatch` hooks to make this work (`as_view`, `_subset`, `to_memory`), drives `_mutated_copy` / `_init_as_actual` directly, and reads `is_view` / `_adata_ref` to recognise a view. See [docs/compatibility-matrix.md § Private anndata APIs](compatibility-matrix.md#private-anndata-apis-pyscx-depends-on) for the supported versions and the compat test that fails loudly on an upgrade.
 
 **Plain anndata indexing works too.** `adata[:, mask]` builds a lazy view of a backed `X` (before, it raised `NotImplementedError`), `adata[mask].copy()` subsets and **materializes** — the documented "subset, then run scanpy" workflow — and `adata[mask].to_memory()` returns a fully in-memory AnnData. Use `pyscx.accel.subset_obs` / `subset_var` when you want the subset applied in place *without* materializing.
 
+**Accelerators on a view.** Handing that view straight to an accelerator also works: any `pyscx.accel.*` op that writes results back **rebuilds the view in place as a regular `AnnData` before it starts**, keeping `X` lazy, and emits an `ImplicitModificationWarning` saying so. Nothing is copied — the point of the rebuild is to avoid the copy. Two consequences to know about:
+
+- The object you passed in stops tracking its parent (`adata.is_view` becomes `False`), and the results land on it, not on the parent. That is the same end state anndata's own copy-on-write reaches; the difference is that copy-on-write gets there by calling `.copy()`, which **materializes** a backed `X`. On a 500k × 3k gene subset that was a 1.8 GB → 10.3 GB jump.
+- `pyscx.accel.subset_var` / `subset_obs` avoid the transition entirely — they subset in place and never produce a view. Prefer them in a pipeline you intend to keep out-of-core.
+
+The rebuild is declined, and anndata's copy-on-write left to do its normal job, when `X` is a plain scipy/dense matrix (there is no lazy handle to protect). One carve-out: a view whose index is not expressible as a window — a duplicated or descending selection such as `adata[[2, 2, 7]]` — already holds a materialized `X`, so the rebuild installs scipy. The op still succeeds; it just is not out-of-core any more.
+
 #### Accelerator route metadata
 
-Every `pyscx.accel.*` call records the execution route it actually took on `adata.uns["scx_accel"][<op>]`. `rank_genes_groups` additionally copies the route string to `adata.uns["rank_genes_groups"]["scx_accel_route"]`. The dict carries:
+Every `pyscx.accel.*` call records the execution route it actually took on `adata.uns["scx_accel"][<op>]`. `rank_genes_groups` additionally copies the route string to `adata.uns["rank_genes_groups"]["scx_accel_route"]`.
+
+> [!IMPORTANT]
+> **`adata.uns["scx_accel"][<op>]` is present if and only if that op completed.** An op that raises leaves no entry, so the key's presence is a usable "this ran" signal and not merely "this was attempted". If an earlier run of the same op had recorded an entry, a later failing run **restores that earlier entry unchanged** rather than deleting it — a bad re-run cannot erase a good stamp. A failing *first* accel op does not create `uns["scx_accel"]` at all.
+>
+> There is deliberately no `status` / `success` field: absence *is* the failure signal, and adding one would mean every consumer had to check it to avoid trusting a stamp from a crashed op.
+
+The dict carries:
 
 - `route` — the concrete path taken. One of `cpu_dense`, `cpu_csr`, `cpu_csc`, `cpu_nb_glm` (native pseudobulk NB-GLM DE — see [docs/pseudobulk_nb_glm.md](pseudobulk_nb_glm.md)), `gpu_nb_glm_csr` / `gpu_nb_glm_csc` (GPU-accelerated pseudobulk aggregation for NB-GLM), `gpu_csr_v3`, `gpu_csc_v3` (the column-major perf path), `gpu_csr` / `gpu_dense` (non-DE GPU routes — see **Non-DE ops** below), `rapids_singlecell_gpu` (in-VRAM ops routed to rapids-singlecell — see **Non-DE ops**), or `gpu_device_resident` (the fused PCA→kNN path keeps the embedding on the GPU between stages when running the native backed/lazy path; see **Fused device-resident route**).
 - `fallback_reason` — why the ideal route wasn't taken: `none`, `no_cuda`, `no_rapids`, `no_csc_sidecar`, `unsupported_dimensions`, `unsupported_input_layout`, `user_forced_cpu`, or `perf_policy`.

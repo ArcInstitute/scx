@@ -178,6 +178,43 @@ pub(crate) fn gpu_available() -> bool {
     }
 }
 
+/// Read `adata.uns["scx_accel"]` into a **fresh** dict, or an empty one.
+///
+/// Always a copy, never the live container — see [`store_accel_container`] for
+/// why the pair must be read-modify-write rather than an in-place mutation.
+fn load_accel_container<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    let uns = adata.getattr("uns")?;
+    if let Some(existing) = uns
+        .call_method1("get", ("scx_accel",))
+        .ok()
+        .filter(|o| !o.is_none())
+    {
+        if let Ok(existing) = existing.cast::<PyDict>() {
+            out.update(existing.as_mapping())?;
+        }
+    }
+    Ok(out)
+}
+
+/// Write the container back with a **top-level** `uns["scx_accel"] = …`.
+///
+/// The top level is load-bearing. On an anndata *view*, `uns` is a `DictView`
+/// that only overrides `__setitem__`, and it is a *shallow* copy — so mutating
+/// the nested `scx_accel` dict in place writes straight into the **parent's**
+/// `uns` and the view never sees the stamp. Setting the top-level key instead
+/// goes through `DictView.__setitem__`, which is the documented copy-on-write
+/// trigger. (Every accel op that writes back also runs
+/// [`crate::accel::prepare_target`] first, so a backed view is already an
+/// actual `AnnData` by the time we get here; this keeps the plain-scipy view
+/// case — deliberately left to anndata — correct too.)
+fn store_accel_container(adata: &Bound<'_, PyAny>, container: &Bound<'_, PyDict>) -> PyResult<()> {
+    adata.getattr("uns")?.set_item("scx_accel", container)
+}
+
 /// Merge `info` into `adata.uns["scx_accel"][op]`, creating the `scx_accel`
 /// dict if absent. Non-destructive across ops run on the same AnnData.
 pub(crate) fn write_accel_route(
@@ -186,25 +223,144 @@ pub(crate) fn write_accel_route(
     op: &str,
     info: &AccelExecutionInfo,
 ) -> PyResult<()> {
-    let uns = adata.getattr("uns")?;
-    let existing = uns.call_method1("get", ("scx_accel",)).ok();
-    let scx_accel: Bound<'_, PyDict> = match existing {
-        Some(obj) if !obj.is_none() => match obj.cast_into::<PyDict>() {
-            Ok(d) => d,
-            Err(_) => {
-                let d = PyDict::new(py);
-                uns.set_item("scx_accel", &d)?;
-                d
-            }
-        },
-        _ => {
-            let d = PyDict::new(py);
-            uns.set_item("scx_accel", &d)?;
-            d
+    let container = load_accel_container(py, adata)?;
+    container.set_item(op, exec_info_to_pydict(py, info)?)?;
+    store_accel_container(adata, &container)
+}
+
+/// Restores `uns["scx_accel"][op]` to its pre-op state unless committed.
+///
+/// # The contract it enforces
+///
+/// **`adata.uns["scx_accel"][op]` is present if and only if the op completed.**
+///
+/// Thirteen ops stamp their route *before* dispatch, deliberately: the route is
+/// planned up front and a long backed/atlas-scale run otherwise gives no
+/// in-flight signal (see [`announce_route`]). The cost was that a raise left
+/// the stamp behind, so the metadata claimed an op ran when it didn't — and a
+/// caller reading `uns["scx_accel"]` to confirm what happened got a false
+/// positive on a result that was never produced.
+///
+/// # Restore, don't delete
+///
+/// Rollback puts back whatever was there *before* this attempt. A failing
+/// re-run of an op that previously succeeded must not erase the good stamp, and
+/// a failing *first* accel op must leave `uns` byte-identical to before —
+/// including not creating the `scx_accel` container at all.
+///
+/// # Why `Drop` and not an explicit combinator
+///
+/// Thirteen sites with three to five exits apiece: a missed path is inevitable.
+/// Rolling back by default makes the failure mode *a missing stamp after a
+/// successful op*, which the ~20 existing `uns["scx_accel"]` assertions across
+/// the test suite catch loudly. The alternative fails silently.
+#[must_use = "an uncommitted RouteStamp rolls the route stamp back when dropped"]
+pub(crate) struct RouteStamp<'py> {
+    adata: Bound<'py, PyAny>,
+    op: &'static str,
+    /// `uns["scx_accel"][op]` as it was before this op stamped.
+    prior: Option<Bound<'py, PyAny>>,
+    /// `uns` carried no `"scx_accel"` key at all when we started.
+    container_was_absent: bool,
+    committed: std::cell::Cell<bool>,
+}
+
+impl<'py> RouteStamp<'py> {
+    /// Snapshot the current stamp without writing one.
+    ///
+    /// For ops whose first stamp goes through a helper that is called more than
+    /// once (`stamp_pca_route` re-stamps after GPU dispatch): open exactly one
+    /// guard, at the earliest stamp, and leave the re-stamps as plain
+    /// [`write_accel_route`] calls.
+    pub(crate) fn begin(adata: &Bound<'py, PyAny>, op: &'static str) -> PyResult<Self> {
+        let uns = adata.getattr("uns")?;
+        let container = uns
+            .call_method1("get", ("scx_accel",))
+            .ok()
+            .filter(|o| !o.is_none());
+        let container_was_absent = container.is_none();
+        let prior = container
+            .and_then(|c| c.cast_into::<PyDict>().ok())
+            .and_then(|c| c.get_item(op).ok().flatten());
+        Ok(Self {
+            adata: adata.clone(),
+            op,
+            prior,
+            container_was_absent,
+            committed: std::cell::Cell::new(false),
+        })
+    }
+
+    /// Snapshot, then stamp `info`.
+    pub(crate) fn write(
+        py: Python<'py>,
+        adata: &Bound<'py, PyAny>,
+        op: &'static str,
+        info: &AccelExecutionInfo,
+    ) -> PyResult<Self> {
+        let guard = Self::begin(adata, op)?;
+        write_accel_route(py, adata, op, info)?;
+        Ok(guard)
+    }
+
+    /// Keep the stamp. Takes `&self` so it can be called from any of several
+    /// early-return branches without moving the guard out.
+    pub(crate) fn commit(&self) {
+        self.committed.set(true);
+    }
+
+    /// [`commit`](Self::commit) iff `res` is `Ok`; returns `res` unchanged.
+    pub(crate) fn settle<T>(self, res: PyResult<T>) -> PyResult<T> {
+        if res.is_ok() {
+            self.commit();
         }
-    };
-    scx_accel.set_item(op, exec_info_to_pydict(py, info)?)?;
-    Ok(())
+        res
+    }
+}
+
+impl Drop for RouteStamp<'_> {
+    fn drop(&mut self) {
+        if self.committed.get() {
+            return;
+        }
+        // `Bound<'py>` carries the GIL token, so `Drop` can call Python
+        // directly — it can only run inside the `'py` scope. Never panics:
+        // every step is best-effort with a warning, because unwinding out of
+        // `Drop` while a `PyErr` is already propagating would lose the real
+        // error.
+        let py = self.adata.py();
+        if let Err(e) = self.rollback(py) {
+            log::warn!(
+                target: "pyscx.accel",
+                "{}: could not roll back the uns[\"scx_accel\"] route stamp after a failure \
+                 ({e}); the recorded route may describe an op that did not complete",
+                self.op,
+            );
+        }
+    }
+}
+
+impl RouteStamp<'_> {
+    fn rollback(&self, py: Python<'_>) -> PyResult<()> {
+        if self.container_was_absent {
+            // A failing first-ever accel op leaves `uns` exactly as it was.
+            self.adata
+                .getattr("uns")?
+                .call_method1("pop", ("scx_accel", py.None()))?;
+            return Ok(());
+        }
+        let container = load_accel_container(py, &self.adata)?;
+        match &self.prior {
+            Some(prior) => container.set_item(self.op, prior)?,
+            // Absent before, absent after. `del_item` raises `KeyError` when
+            // the op never got as far as stamping; that is a no-op, not a
+            // failure.
+            None => {
+                let _ = container.del_item(self.op);
+            }
+        }
+        store_accel_container(&self.adata, &container)
+    }
 }
 
 /// Copy an already-stamped op's route dict from `uns["scx_accel"][from_op]` to
@@ -212,23 +368,17 @@ pub(crate) fn write_accel_route(
 /// summary route should mirror what an underlying sequential op actually
 /// recorded, rather than re-synthesizing one. No-op if `from_op` is absent.
 pub(crate) fn copy_accel_route(
+    py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     from_op: &str,
     to_op: &str,
 ) -> PyResult<()> {
-    let uns = adata.getattr("uns")?;
-    let Some(scx_accel) = uns
-        .call_method1("get", ("scx_accel",))
-        .ok()
-        .filter(|o| !o.is_none())
-        .and_then(|o| o.cast_into::<PyDict>().ok())
-    else {
+    let container = load_accel_container(py, adata)?;
+    let Some(route) = container.get_item(from_op)? else {
         return Ok(());
     };
-    if let Some(route) = scx_accel.get_item(from_op)? {
-        scx_accel.set_item(to_op, route)?;
-    }
-    Ok(())
+    container.set_item(to_op, route)?;
+    store_accel_container(adata, &container)
 }
 
 /// Whether a planned route warrants a default-visible GPU→CPU fallback

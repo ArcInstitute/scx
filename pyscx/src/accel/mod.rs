@@ -81,3 +81,46 @@ pub(crate) fn reject_preserve_var_order(adata: &Bound<'_, PyAny>, op: &str) -> P
     }
     Ok(())
 }
+
+/// The prologue every `pyscx.accel.*` op that writes back to `adata` runs first.
+///
+/// Two jobs, in this order:
+/// 1. [`reject_preserve_var_order`] — a guard must refuse *before* the object
+///    is touched, so it comes first.
+/// 2. [`crate::axis_align::devirtualize_scx_view`] — rebuild an anndata view
+///    over a backed/lazy `X` as an actual `AnnData`, keeping `X` lazy.
+///
+/// # Ordering invariant
+///
+/// This must run **before the op's first mutation of `adata`** — `uns`
+/// (including the `uns["scx_accel"]` route stamp), `obs`, `var`, `obsm`, or
+/// `X`. On a view, the first write is what triggers anndata's copy-on-write,
+/// and copy-on-write materializes a backed `X`. In particular it must precede
+/// `write_accel_route` and `clear_gpu_normalize_marker`. Cheap argument
+/// validation (`prefer_format`, `method`, …) still belongs above both.
+///
+/// Ops that write only to `obsm` / `obs` and are indifferent to gene order
+/// (`neighbors`, `umap`, `leiden`, `harmony_integrate`, the eval metrics) do
+/// not reject `preserve_var_order` today; they call
+/// [`prepare_target_no_var_guard`] so this change adds no new rejections.
+pub(crate) fn prepare_target(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    op: &'static str,
+) -> PyResult<()> {
+    reject_preserve_var_order(adata, op)?;
+    crate::axis_align::devirtualize_scx_view(py, adata, op)?;
+    Ok(())
+}
+
+/// [`prepare_target`] without the `preserve_var_order` guard, for write-back
+/// ops that are indifferent to gene order (they consume `obsm` or write only
+/// `obs` / `obsp`). Same ordering invariant.
+pub(crate) fn prepare_target_no_var_guard(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    op: &'static str,
+) -> PyResult<()> {
+    crate::axis_align::devirtualize_scx_view(py, adata, op)?;
+    Ok(())
+}

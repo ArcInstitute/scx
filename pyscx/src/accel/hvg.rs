@@ -150,7 +150,7 @@ pub fn highly_variable_genes<'py>(
     // column projection (via build_shard_source), then writes them to
     // adata.var. A presentation-ordered backed X (preserve_var_order=True)
     // would misalign those stats against the request-ordered var — reject.
-    super::reject_preserve_var_order(adata, "highly_variable_genes")?;
+    super::prepare_target(py, adata, "highly_variable_genes")?;
 
     if prefer_format == "csc" {
         // Explicit CSC: single-batch seurat_v3 only. Reject mismatched
@@ -197,8 +197,16 @@ pub fn highly_variable_genes<'py>(
         // this stamp — a failed GPU init fails the op, never mislabels CPU.
         let info = super::route::hvg_exec_info(device, seurat_v3_family, true);
         super::route::announce_route(py, "highly_variable_genes", device, &info);
-        super::route::write_accel_route(py, adata, "highly_variable_genes", &info)?;
-        return hvg_seurat_v3_csc(py, adata, n_top_genes, span, subset, flavor, csc_device_id);
+        let route = super::route::RouteStamp::write(py, adata, "highly_variable_genes", &info)?;
+        return route.settle(hvg_seurat_v3_csc(
+            py,
+            adata,
+            n_top_genes,
+            span,
+            subset,
+            flavor,
+            csc_device_id,
+        ));
     }
     let resolved = super::gpu::resolve_device(device)?;
 
@@ -332,8 +340,8 @@ pub fn highly_variable_genes<'py>(
     {
         let info = super::route::hvg_exec_info(device, true, true);
         super::route::announce_route(py, "highly_variable_genes", device, &info);
-        super::route::write_accel_route(py, adata, "highly_variable_genes", &info)?;
-        return hvg_seurat_v3_csc(
+        let route = super::route::RouteStamp::write(py, adata, "highly_variable_genes", &info)?;
+        return route.settle(hvg_seurat_v3_csc(
             py,
             adata,
             n_top_genes,
@@ -341,7 +349,7 @@ pub fn highly_variable_genes<'py>(
             subset,
             flavor,
             effective_gpu_id,
-        );
+        ));
     }
 
     // Record the planned CSR route on
@@ -360,9 +368,16 @@ pub fn highly_variable_genes<'py>(
     // the recorded `gpu_csr` route always reflects the code that ran. If a
     // silent GPU→CPU runtime fallback is ever added, stamp *after* dispatch on
     // the branch that ran (see umap.rs) or this gate will false-pass.
+    //
+    // The invariant is about which *branch* the recorded route names; it is
+    // orthogonal to whether the op finished. `RouteStamp` covers the latter —
+    // the stamp is rolled back if any branch below raises, so a present entry
+    // means the route ran *and* completed.
     let info = super::route::hvg_exec_info(device, seurat_v3_family, false);
     super::route::announce_route(py, "highly_variable_genes", device, &info);
-    super::route::write_accel_route(py, adata, "highly_variable_genes", &info)?;
+    // Rolled back if any branch below raises (a loess singularity across every
+    // batch, a missing `batch_key`, …) — see RouteStamp.
+    let route = super::route::RouteStamp::write(py, adata, "highly_variable_genes", &info)?;
 
     // ── Try SCX backed dataset ──────────────────────────────────────────
     if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
@@ -375,7 +390,7 @@ pub fn highly_variable_genes<'py>(
         drop(backed_ref);
 
         let source = build_shard_source(&reader, &[], &kept, &col_proj, n_vars);
-        return hvg_on_source(
+        return route.settle(hvg_on_source(
             py,
             adata,
             &source,
@@ -388,7 +403,7 @@ pub fn highly_variable_genes<'py>(
             subset,
             n_bins,
             effective_gpu_id,
-        );
+        ));
     }
 
     // ── Try SCX lazy-transformed dataset ────────────────────────────────
@@ -403,7 +418,7 @@ pub fn highly_variable_genes<'py>(
         drop(lazy_ref);
 
         let source = build_shard_source(&reader, &transforms, &kept, &col_proj, n_vars);
-        return hvg_on_source(
+        return route.settle(hvg_on_source(
             py,
             adata,
             &source,
@@ -416,7 +431,7 @@ pub fn highly_variable_genes<'py>(
             subset,
             n_bins,
             effective_gpu_id,
-        );
+        ));
     }
 
     // ── In-memory scipy/dense X: run the native kernel ──────────────────
@@ -432,7 +447,7 @@ pub fn highly_variable_genes<'py>(
         let n_obs = csr.n_rows();
         let n_vars = csr.n_cols();
         let source = InMemoryCsrSource { csr: &csr };
-        return hvg_on_source(
+        return route.settle(hvg_on_source(
             py,
             adata,
             &source,
@@ -445,7 +460,7 @@ pub fn highly_variable_genes<'py>(
             subset,
             n_bins,
             effective_gpu_id,
-        );
+        ));
     }
 
     // ── Fallback to scanpy (cell_ranger / unsupported flavors only) ─────
@@ -491,6 +506,7 @@ pub fn highly_variable_genes<'py>(
     }
     sc.getattr("pp")?
         .call_method("highly_variable_genes", (adata,), Some(&kwargs))?;
+    route.commit();
     Ok(())
 }
 

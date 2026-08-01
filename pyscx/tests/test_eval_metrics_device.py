@@ -168,3 +168,32 @@ class TestEvalMetricsDeviceScaffolding:
         real, pred = _make_paired_adata()
         with pytest.raises((ValueError, RuntimeError)):
             pyscx.accel.perturbation_metrics(real, pred, device="tpu")
+
+
+class TestEvalMetricsRouteStampOnFailure:
+    """`scaffold_device_route` stamps before the compute — so it must roll back.
+
+    These three ops share one scaffold, so they share one failure mode: a raise
+    after the stamp used to leave `uns["scx_accel"][op]` behind, asserting a
+    route for a result that was never produced. Both triggers below reject an
+    unknown `metric`, which happens after the scaffold has already stamped.
+    """
+
+    def test_failing_discrimination_score_leaves_no_stamp(self):
+        real, pred = _make_paired_adata()
+        with pytest.raises(ValueError):
+            pyscx.accel.discrimination_score(real, pred, metric="bogus")
+        assert "discrimination_score" not in pred.uns.get("scx_accel", {})
+
+    def test_failing_clustering_agreement_leaves_no_stamp(self):
+        real, pred = _make_paired_adata()
+        with pytest.raises(ValueError):
+            pyscx.accel.clustering_agreement(real, pred, metric="bogus")
+        assert "clustering_agreement" not in pred.uns.get("scx_accel", {})
+
+    def test_a_failure_does_not_disturb_an_earlier_ops_stamp(self):
+        real, pred = _make_paired_adata()
+        pyscx.accel.perturbation_metrics(real, pred)
+        with pytest.raises(ValueError):
+            pyscx.accel.discrimination_score(real, pred, metric="bogus")
+        assert "perturbation_metrics" in pred.uns["scx_accel"]

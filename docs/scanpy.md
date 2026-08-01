@@ -1421,6 +1421,29 @@ Plain anndata indexing works on a backed `X` too: `adata[:, mask]` is a lazy vie
 fully in-memory AnnData. Full table in
 [docs/api.md § Axis subsetting and aligned members](api.md#axis-subsetting-and-aligned-members).
 
+Handing that view to an accelerator works as well, but it is not free: any
+`pyscx.accel.*` op that writes results back **rebuilds the view in place as a
+regular AnnData first**, keeping `X` lazy, and warns
+(`ImplicitModificationWarning`) that it did. Afterwards the object no longer
+tracks its parent and the results land on it, not on the parent. Nothing is
+copied — that is the point of the rebuild, since anndata's own copy-on-write
+would get to the same place by materializing the matrix. So the canonical
+scanpy ordering is safe out-of-core:
+
+```python
+adata = pyscx.open("atlas.scx").to_anndata(backed=True)
+pyscx.accel.highly_variable_genes(adata, n_top_genes=3000, flavor="seurat_v3")
+pyscx.accel.subset_var(adata, adata.var["highly_variable"].values)  # no view at all
+pyscx.accel.normalize_total(adata, target_sum=1e4)
+pyscx.accel.log1p(adata)
+pyscx.accel.pca(adata, n_comps=50)
+```
+
+`subset_var` / `subset_obs` are preferred over `adata[:, mask]` here because
+they subset in place and never produce a view, so there is no rebuild and no
+warning. Both keep `X` lazy; only the plain-indexing route has the detachment
+to explain.
+
 On a **lazy** `X` with an active column projection, `filter_cells` thresholds the
 visible-gene totals — the same numbers `adata.obs["total_counts"]` and
 `adata.X.sum(axis=1)` report, and what scanpy would compute on the sliced object.

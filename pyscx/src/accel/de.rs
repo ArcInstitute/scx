@@ -885,7 +885,7 @@ pub fn rank_genes_groups(
     // that this op streams the handle's *view*, the two widths match, so the
     // mismatch would be a silent gene/column permutation instead of a shape
     // error. Refuse, as the other streaming accel ops do.
-    super::reject_preserve_var_order(adata, "rank_genes_groups")?;
+    super::prepare_target(py, adata, "rank_genes_groups")?;
 
     // Resolve scanpy's use_raw/layer contract once (mutual-exclusion + default).
     let resolved_use_raw = resolve_use_raw(adata, use_raw, layer)?;
@@ -1530,6 +1530,11 @@ pub fn rank_genes_groups_df(
             "Invalid output={output:?}; expected 'polars' or 'pandas'"
         )));
     }
+
+    // After the cheap arg check, before the first write to `adata` (the
+    // compute mode below stamps `uns["scx_accel"]`): rebuild a view as actual
+    // so a backed X is not gathered by anndata's copy-on-write.
+    super::prepare_target_no_var_guard(py, adata, "rank_genes_groups_df")?;
 
     // Extraction mode (scanpy `sc.get.rank_genes_groups_df` alias): when
     // `group=` is given, read precomputed results from `adata.uns[key]` instead
@@ -2321,7 +2326,7 @@ pub fn pdex_ref(
     // that this op streams the handle's *view*, the two widths match, so the
     // mismatch would be a silent gene/column permutation instead of a shape
     // error. Refuse, as the other streaming accel ops do.
-    super::reject_preserve_var_order(adata, "pdex_ref")?;
+    super::prepare_target(py, adata, "pdex_ref")?;
 
     if !matches!(output, "polars" | "pandas") {
         return Err(PyValueError::new_err(format!(

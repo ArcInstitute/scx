@@ -563,3 +563,27 @@ class TestPcaNeighborsUmapSequentialFallback:
             adata.uns["scx_accel"]["pca_neighbors_umap"]["route"]
             != "gpu_device_resident"
         )
+
+
+def test_fused_keeps_the_completed_pca_stage_when_knn_fails(pca_adata):
+    """A fused op stamps one key per stage, and the keys are independent.
+
+    `pca_neighbors` runs PCA, then kNN. If kNN raises, PCA still *ran* — its
+    stamp is correct and must survive — while `neighbors` and the `pca_neighbors`
+    summary must not appear. That is the per-stage granularity the
+    present-iff-completed contract buys.
+    """
+    import pyscx
+
+    path, _ = pca_adata
+    adata = pyscx.open(str(path)).to_anndata(backed=True)
+
+    with pytest.raises(RuntimeError, match="exceeds n_obs"):
+        pyscx.accel.pca_neighbors(
+            adata, n_comps=5, n_neighbors=10_000, device="cpu"
+        )
+
+    stamps = adata.uns.get("scx_accel", {})
+    assert "pca" in stamps, "the PCA stage completed; its stamp must survive"
+    assert "neighbors" not in stamps
+    assert "pca_neighbors" not in stamps

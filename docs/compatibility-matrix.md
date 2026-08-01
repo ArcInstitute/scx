@@ -89,11 +89,14 @@ the declared bound would surface as an `AttributeError` or a
 | `AnnData._mutated_copy`, `._init_as_actual` | Build the subset object and swap it in, substituting the un-copied `view.X` for `AnnData.copy()`'s materializing `.copy()` |
 | `AnnData._inplace_subset_obs`, `._inplace_subset_var` | Delegate the whole subset for an in-memory `X` |
 | `AnnData._layers`, `._obsm`, `._varm`, `._obsp`, `._varp` | Detach the lazy mapping bridges for the duration of the subset, so reading them cannot decode a section off disk |
+| `AnnData.is_view`, `._adata_ref` | Spot an anndata *view* over a backed `X` before an accelerator writes to it, and reach the parent's un-subset `X` to decide, so the view can be rebuilt as an actual `AnnData` without materializing the matrix |
 
 `pyscx/tests/test_anndata_hooks_compat.py` asserts every name above resolves,
 that each hook is still a `singledispatch` with all four SCX handle classes
 registered, and that `AnnData.X` on a view still resolves through `_subset`
 without copying — one assertion per name, so an upgrade names its casualty.
+The two view attributes are asserted on a real view rather than on the class,
+since `is_view` is a property and `_adata_ref` exists only on a view.
 Verified across `0.11.4` / `0.12.10` / `0.12.16`.
 
 ## Known incompatibilities

@@ -105,6 +105,11 @@ pub fn harmony_integrate(
     random_state: u64,
     device: &str,
 ) -> PyResult<()> {
+    // Rebuild an AnnData view as actual before the first write below (obsm /
+    // uns), so a backed X is not gathered by anndata's copy-on-write. No
+    // var-order guard: this op reads obsm and is gene-order agnostic.
+    super::prepare_target_no_var_guard(py, adata, "harmony_integrate")?;
+
     // Resolve device. `_device.gpu_id()` is the CUDA index that GPU dispatch
     // forwards to `scx_accel::harmony_integrate_gpu(device_id, ...)`.
     let _device = resolve_device(device)?;

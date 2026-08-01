@@ -36,16 +36,21 @@ use super::util::{astype_no_copy, extract_csr_slices};
 ///
 /// Stamp on the AnnData the caller would inspect for the route — the prediction
 /// (`adata_pred`) for the pair metrics, the sole input for single-input ops.
-fn scaffold_device_route(
-    py: Python<'_>,
-    adata: &Bound<'_, PyAny>,
+///
+/// Returns the [`RouteStamp`](super::route::RouteStamp) guard: these ops stamp
+/// before their compute, so the caller must `commit()` on success or the stamp
+/// is rolled back — `uns["scx_accel"][op]` is present iff the op completed.
+#[must_use = "commit the returned RouteStamp on success, or the route stamp is rolled back"]
+fn scaffold_device_route<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
     op: &'static str,
     device: &str,
-) -> PyResult<()> {
+) -> PyResult<super::route::RouteStamp<'py>> {
     super::gpu::resolve_device(device)?;
     let info = super::route::cpu_only_exec_info(device);
     super::route::announce_route(py, op, device, &info);
-    super::route::write_accel_route(py, adata, op, &info)
+    super::route::RouteStamp::write(py, adata, op, &info)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -316,6 +321,10 @@ pub fn pseudobulk_means<'py>(
     // gpu_dense (route stamped GpuCsr either way — the op ran on GPU); CPU/auto-
     // on-CPU-host / non-gpu-build fall through to the CPU path.
     let resolved = super::gpu::resolve_device(device)?;
+    // Before the stamp below: on a view the stamp is what would trigger
+    // anndata's copy-on-write and gather a backed `X`. `_impl` repeats the
+    // var-order half of this for its internal callers, where it is a no-op.
+    super::prepare_target(py, adata, "pseudobulk_means")?;
     let info = super::route::simple_exec_info(
         device,
         cfg!(feature = "gpu"),
@@ -323,14 +332,21 @@ pub fn pseudobulk_means<'py>(
         scx_accel::route::AccelRoute::CpuCsr,
     );
     super::route::announce_route(py, "pseudobulk_means", device, &info);
-    super::route::write_accel_route(py, adata, "pseudobulk_means", &info)?;
+    // Rolled back if the aggregation below raises — see RouteStamp.
+    let route = super::route::RouteStamp::write(py, adata, "pseudobulk_means", &info)?;
     let gpu_id = if info.route.is_gpu() {
         eval_resolve_gpu_id(resolved)
     } else {
         None
     };
     let gpu_dev = eval_make_gpu_dev(gpu_id)?;
-    pseudobulk_means_impl(py, adata, groupby, min_cells_per_group, &gpu_dev)
+    route.settle(pseudobulk_means_impl(
+        py,
+        adata,
+        groupby,
+        min_cells_per_group,
+        &gpu_dev,
+    ))
 }
 
 /// Body of [`pseudobulk_means`] without the device/route scaffolding, so
@@ -1105,6 +1121,10 @@ pub fn perturbation_metrics<'py>(
     min_cells_per_group: usize,
     device: &str,
 ) -> PyResult<Py<PyAny>> {
+    // Rebuild an AnnData view as actual before the route stamp / result
+    // writes below, so a backed X is not gathered by anndata's
+    // copy-on-write. Gene-order agnostic, so no var-order guard.
+    super::prepare_target_no_var_guard(py, adata_pred, "perturbation_metrics")?;
     // Phase 2 GPU dispatch: the pseudobulk aggregation runs on the GPU (mirrors
     // pdex_nb_glm's skeleton); the five bulk metrics run on the host. `auto` on a
     // CPU host, `cpu`, and non-gpu builds fall through to the CPU path.
@@ -1495,6 +1515,10 @@ pub fn energy_distance<'py>(
     dtype: Option<&str>,
     device: &str,
 ) -> PyResult<f64> {
+    // Rebuild an AnnData view as actual before the route stamp / result
+    // writes below, so a backed X is not gathered by anndata's
+    // copy-on-write. Gene-order agnostic, so no var-order guard.
+    super::prepare_target_no_var_guard(py, adata_pred, "energy_distance")?;
     let (gpu_dev, info) = edist_device_dispatch(py, "energy_distance", device, metric, dtype)?;
     let result = run_energy_distance(
         py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype, &gpu_dev,
@@ -1545,6 +1569,10 @@ pub fn energy_distance_details<'py>(
     dtype: Option<&str>,
     device: &str,
 ) -> PyResult<Py<PyAny>> {
+    // Rebuild an AnnData view as actual before the route stamp / result
+    // writes below, so a backed X is not gathered by anndata's
+    // copy-on-write. Gene-order agnostic, so no var-order guard.
+    super::prepare_target_no_var_guard(py, adata_pred, "energy_distance_details")?;
     let (gpu_dev, info) =
         edist_device_dispatch(py, "energy_distance_details", device, metric, dtype)?;
     let result = run_energy_distance(
@@ -1623,7 +1651,11 @@ pub fn discrimination_score<'py>(
     min_cells_per_group: usize,
     device: &str,
 ) -> PyResult<Py<PyAny>> {
-    scaffold_device_route(py, adata_pred, "discrimination_score", device)?;
+    // Rebuild an AnnData view as actual before the route stamp / result
+    // writes below, so a backed X is not gathered by anndata's
+    // copy-on-write. Gene-order agnostic, so no var-order guard.
+    super::prepare_target_no_var_guard(py, adata_pred, "discrimination_score")?;
+    let route = scaffold_device_route(py, adata_pred, "discrimination_score", device)?;
 
     // Parse distance metric.
     let dist_metric = match metric.to_lowercase().as_str() {
@@ -1731,6 +1763,7 @@ pub fn discrimination_score<'py>(
         dict.set_item(pert_name.as_str(), result.scores[i])?;
     }
 
+    route.commit();
     Ok(dict.into_any().unbind())
 }
 
@@ -1775,7 +1808,11 @@ pub fn knockdown_efficiency<'py>(
     eps: f64,
     device: &str,
 ) -> PyResult<()> {
-    scaffold_device_route(py, adata, "knockdown_efficiency", device)?;
+    // Rebuild an AnnData view as actual before the route stamp / result
+    // writes below, so a backed X is not gathered by anndata's
+    // copy-on-write. Gene-order agnostic, so no var-order guard.
+    super::prepare_target_no_var_guard(py, adata, "knockdown_efficiency")?;
+    let route = scaffold_device_route(py, adata, "knockdown_efficiency", device)?;
     let np = py.import("numpy")?;
 
     // ── Extract perturbation labels ─────────────────────────────────
@@ -1907,6 +1944,7 @@ pub fn knockdown_efficiency<'py>(
     let fc_array = numpy::PyArray::from_vec(py, log_fc);
     obs.set_item("KnockDownGeneFC", fc_array)?;
 
+    route.commit();
     Ok(())
 }
 
@@ -1953,7 +1991,11 @@ pub fn clustering_agreement<'py>(
     min_cells_per_group: usize,
     device: &str,
 ) -> PyResult<f64> {
-    scaffold_device_route(py, adata_pred, "clustering_agreement", device)?;
+    // Rebuild an AnnData view as actual before the route stamp / result
+    // writes below, so a backed X is not gathered by anndata's
+    // copy-on-write. Gene-order agnostic, so no var-order guard.
+    super::prepare_target_no_var_guard(py, adata_pred, "clustering_agreement")?;
+    let route = scaffold_device_route(py, adata_pred, "clustering_agreement", device)?;
 
     // Native-Rust path: kNN graph + Leiden clustering live entirely in
     // `scx_accel`, so the entire hot path runs under `py.detach`.
@@ -2161,7 +2203,9 @@ pub fn clustering_agreement<'py>(
         Ok(best)
     });
 
-    best_score.map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    let best_score = best_score.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    route.commit();
+    Ok(best_score)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -100,7 +100,7 @@ pub fn pca_neighbors(
     // Same reason as `pca`: a presentation-ordered backed `X` has no
     // `ShardSource` representation, and the fused GPU path below would
     // otherwise skip the guard `pca` applies on the delegating path.
-    super::reject_preserve_var_order(adata, "pca_neighbors")?;
+    super::prepare_target(py, adata, "pca_neighbors")?;
 
     // In-VRAM `device="gpu"` fused PCA→kNN routes to a full rapids pipeline
     // (rsc.pp.pca → rsc.pp.neighbors) on an in-memory X. backed/lazy X stays on
@@ -350,7 +350,7 @@ pub fn pca_neighbors(
     // determines whether fusion happened) rather than synthesizing a summary —
     // this stays accurate when GPU PCA ran but kNN fell back to CPU HNSW (cuVS
     // missing), where a synthesized `cpu_csr` would wrongly imply a full-CPU run.
-    super::route::copy_accel_route(adata, "neighbors", "pca_neighbors")?;
+    super::route::copy_accel_route(py, adata, "neighbors", "pca_neighbors")?;
 
     Ok(())
 }
@@ -418,7 +418,7 @@ pub fn pca_neighbors_umap(
     }
 
     // See `pca_neighbors`.
-    super::reject_preserve_var_order(adata, "pca_neighbors_umap")?;
+    super::prepare_target(py, adata, "pca_neighbors_umap")?;
 
     // In-VRAM `device="gpu"` fused PCA→kNN→UMAP routes to a full rapids pipeline
     // (rsc.pp.pca → rsc.pp.neighbors → rsc.tl.umap) on an in-memory X.
@@ -541,7 +541,7 @@ pub fn pca_neighbors_umap(
 
     // Summary route: mirror the umap stage's recorded route (the last stage,
     // whose GPU-vs-CPU outcome determines whether the chain stayed on device).
-    super::route::copy_accel_route(adata, "umap", "pca_neighbors_umap")?;
+    super::route::copy_accel_route(py, adata, "umap", "pca_neighbors_umap")?;
 
     Ok(())
 }

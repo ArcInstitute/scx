@@ -42,6 +42,11 @@ pub fn neighbors(
     ef_search: usize,
     device: &str,
 ) -> PyResult<()> {
+    // Rebuild an AnnData view as actual before the first write below
+    // (obsm / obs / uns), so a backed X is not gathered by anndata's
+    // copy-on-write. No var-order guard: this op is gene-order agnostic.
+    super::prepare_target_no_var_guard(py, adata, "neighbors")?;
+
     let numpy = py.import("numpy")?;
 
     // Determine effective device
@@ -131,7 +136,8 @@ pub fn neighbors(
         scx_accel::AccelRoute::CpuCsr,
     );
     super::route::announce_route(py, "neighbors", device, &info);
-    super::route::write_accel_route(py, adata, "neighbors", &info)?;
+    // Rolled back if the kNN build below raises (e.g. n_neighbors > n_obs).
+    let route = super::route::RouteStamp::write(py, adata, "neighbors", &info)?;
 
     // Suppress unused variable warning when gpu feature is not enabled
     let _ = _device;
@@ -154,6 +160,7 @@ pub fn neighbors(
     // Write results to AnnData
     write_neighbors_to_adata(py, adata, result, n_neighbors, use_rep, "hnsw")?;
 
+    route.commit();
     Ok(())
 }
 

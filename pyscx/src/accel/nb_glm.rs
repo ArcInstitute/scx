@@ -1079,7 +1079,7 @@ pub fn pdex_nb_glm(
     // `ShardSource` spelling, and the shared pseudobulk aggregation now
     // streams the handle's view — so a request-ordered gene axis would be a
     // silent permutation against `adata.var` rather than a shape error.
-    super::reject_preserve_var_order(adata, "pdex_nb_glm")?;
+    super::prepare_target(py, adata, "pdex_nb_glm")?;
 
     // `stratify_by` is list-only; turn the opaque PyO3 `Can't extract 'str' to
     // 'Vec'` into an actionable message when a bare string slips through.
