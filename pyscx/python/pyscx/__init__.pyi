@@ -677,6 +677,60 @@ def optimize(
 ) -> None: ...
 
 
+def sort(
+    input: str,
+    output: str,
+    by: Sequence[str],
+    reverse: bool = ...,
+    shard_size: int | None = ...,
+    codec: str = ...,
+    index_obs: Sequence[str] | None = ...,
+    index_var: Sequence[str] | None = ...,
+    index_preset: str | None = ...,
+    index_auto_threshold: int | None = ...,
+    memory_budget: str | None = ...,
+    temp_dir: str | None = ...,
+    bitmap: str = ...,
+    rebuild_csc: bool = ...,
+    csc_cols_per_shard: int = ...,
+    csc_memory_limit: str = ...,
+    group_by: str | None = ...,
+    reference: str | Sequence[str] | dict[str, str] | None = ...,
+    group_target_bytes: int | str | None = ...,
+    group_max_bytes: int | str | None = ...,
+    group_write_block_bytes: int | str | None = ...,
+) -> None:
+    """Globally reorder cells (the obs axis) by an obs key, for X-read locality
+    and contiguous predicate-index shard ranges on the sort key. See
+    `shuffle` for the random-order counterpart."""
+    ...
+
+
+def shuffle(
+    input: str,
+    output: str,
+    seed: int = ...,
+    shard_size: int | None = ...,
+    codec: str = ...,
+    index_obs: Sequence[str] | None = ...,
+    index_var: Sequence[str] | None = ...,
+    index_preset: str | None = ...,
+    index_auto_threshold: int | None = ...,
+    memory_budget: str | None = ...,
+    temp_dir: str | None = ...,
+    bitmap: str = ...,
+    rebuild_csc: bool = ...,
+    csc_cols_per_shard: int = ...,
+    csc_memory_limit: str = ...,
+) -> None:
+    """Globally reorder cells (the obs axis) by a seeded random permutation, so
+    a training loader gets i.i.d. batches at any `shard_group_size`. `seed` is
+    recorded in provenance and is the only record of the permutation. X usually
+    grows on zstd/shufdelta-coded files; the row order is the inverse of what a
+    predicate index wants."""
+    ...
+
+
 def collate_cellset_gathered(
     indptr: np.ndarray,
     indices: np.ndarray,

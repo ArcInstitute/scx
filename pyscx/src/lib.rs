@@ -1482,6 +1482,7 @@ fn register_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::compact, m)?)?;
     m.add_function(wrap_pyfunction!(ops::optimize, m)?)?;
     m.add_function(wrap_pyfunction!(ops::sort, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::shuffle, m)?)?;
     m.add_function(wrap_pyfunction!(ops::build_csc, m)?)?;
     m.add_function(wrap_pyfunction!(ops::rollback, m)?)?;
     m.add_function(wrap_pyfunction!(ops::merge, m)?)?;

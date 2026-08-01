@@ -75,6 +75,13 @@ ALL_BENCHMARKS: list[str] = [
     # Data-load Phase 0 — per-file obs-open cost microbench (matrix-free SCX
     # read_obs vs anndata eager-obs baseline) at 1-file + manifest scale.
     "obs_open",
+    # Data-load Phase 1D — `scx sort --shuffle` global pre-shuffle: rewrite cost,
+    # the output-size delta swept across codec variants (the open question:
+    # scx1 codes row-independently and should be neutral, zstd/shufdelta should
+    # grow), cache-cold TrainingDataset throughput shuffled vs not, and an
+    # analytic batch-mixing metric. SCX-only; builds its own outputs, so it is
+    # in run_parallel's _NO_CONVERSION.
+    "shuffle_layout",
     # Cloud (GCP) — Phase C through F
     "cloud_push",
     "cloud_pull",

@@ -180,6 +180,7 @@ Most-used kwargs (shared across ingest entry points):
 obs to the sharded layout when `n_obs > shard_target_rows`),
 `scx build-csc <in> <out>` (add a CSC sidecar),
 `scx sort <in> <out> --by CSV` (reorder cells by obs key for query locality),
+`scx sort <in> <out> --shuffle --seed N` / `pyscx.shuffle` (seeded random reorder for training-batch diversity — the inverse of a sort; pin `--codec`),
 `scx set-uns <file> --uns JSON` (replace uns in place),
 `scx modify-metadata <file> --obs PARQUET --var PARQUET --obsm NAME=NPY ...
 --index-*` (replace metadata sections in place).

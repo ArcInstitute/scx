@@ -716,20 +716,6 @@ pub fn optimize(
         .map_err(ops_to_pyerr)
 }
 
-/// Globally reorder cells (the obs axis) of an SCX file by an obs key,
-/// writing a new file with X-read locality and contiguous predicate-index
-/// shard ranges for the sort key.
-///
-/// `by`: one or more obs columns, lexicographic in order (the leading key
-/// gets the full X-read-locality benefit). `reverse`: descending on all keys.
-/// Pass `memory_budget` (e.g. "4G") to force the bounded external partition
-/// sort; without it the in-memory path is used. The detection bitmap and CSC
-/// sidecar are dropped (the reorder invalidates them); pass `rebuild_csc=True`
-/// to re-emit the column-major sidecar. obsp/multimodal sort are not yet
-/// supported.
-///
-/// Example:
-///     pyscx.sort("atlas.scx", "atlas.sorted.scx", by=["cell_type"])
 /// Parse the `reference` kwarg of `sort` into a [`ReferenceSpec`].
 ///
 /// Accepts `None`, a `str` (single label), a `list[str]` (label set), or a
@@ -762,9 +748,72 @@ pub(crate) fn parse_reference_spec(
     ))
 }
 
+/// Parse a `codec=` kwarg into a [`CodecSelection`].
+///
+/// Both `sort` and `shuffle` hardcoded `Auto` before 1D, which left the Python
+/// surface unable to express something the CLI has always had — and unable to
+/// follow its *own* documented advice ("pin `--codec` if output size matters",
+/// `docs/sharding.md`). It bit the 1D size benchmark first: sweeping the
+/// per-codec fixtures produced byte-identical outputs for every variant,
+/// because the writer re-selected `auto` each time, so the sweep measured
+/// auto-reselection rather than whether a permutation grows that codec.
+fn parse_codec_selection(codec: &str) -> PyResult<CodecSelection> {
+    match CodecId::parse_cli(codec).map_err(PyValueError::new_err)? {
+        None => Ok(CodecSelection::Auto),
+        Some(c) => Ok(CodecSelection::Explicit(c)),
+    }
+}
+
+/// Run a built [`scx_ops::SortOptions`] off the GIL, then optionally rebuild
+/// the CSC sidecar off the GIL too.
+///
+/// Shared by `sort` and `shuffle` so the two cannot drift on the part that
+/// matters — GIL handling, error mapping, and the post-write CSC rebuild. The
+/// *option construction* stays in each pyfunction, because that is exactly
+/// where they legitimately differ.
+fn run_sort_engine(
+    py: Python<'_>,
+    input_path: &Path,
+    output_path: &Path,
+    opts: &scx_ops::SortOptions,
+    rebuild_csc: bool,
+    csc_cols_per_shard: usize,
+    csc_memory_limit: &str,
+) -> PyResult<()> {
+    py.detach(|| scx_ops::sort(input_path, output_path, opts))
+        .map_err(ops_to_pyerr)?;
+    if rebuild_csc {
+        // Run the heavy CSC rebuild off the GIL too. Its `Box<dyn Error>` is
+        // not `Send`, so map it to a `String` inside the closure to cross
+        // `py.detach`.
+        py.detach(|| {
+            scx_ops::rebuild_csc_inplace(output_path, csc_cols_per_shard, csc_memory_limit, None)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(PyRuntimeError::new_err)?;
+    }
+    Ok(())
+}
+
+/// Globally reorder cells (the obs axis) of an SCX file by an obs key,
+/// writing a new file with X-read locality and contiguous predicate-index
+/// shard ranges for the sort key.
+///
+/// `by`: one or more obs columns, lexicographic in order (the leading key
+/// gets the full X-read-locality benefit). `reverse`: descending on all keys.
+/// Pass `memory_budget` (e.g. "4G") to force the bounded external partition
+/// sort; without it the in-memory path is used. The detection bitmap and CSC
+/// sidecar are dropped (the reorder invalidates them); pass `rebuild_csc=True`
+/// to re-emit the column-major sidecar.
+///
+/// For a *random* reorder — training-batch diversity rather than query
+/// locality — see `pyscx.shuffle`.
+///
+/// Example:
+///     pyscx.sort("atlas.scx", "atlas.sorted.scx", by=["cell_type"])
 #[pyfunction]
 #[pyo3(signature = (
-    input, output, by, reverse=false, shard_size=None,
+    input, output, by, reverse=false, shard_size=None, codec="auto".to_string(),
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=false,
     csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
@@ -779,6 +828,7 @@ pub fn sort(
     by: Vec<String>,
     reverse: bool,
     shard_size: Option<i64>,
+    codec: String,
     index_obs: Option<Vec<String>>,
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
@@ -824,8 +874,9 @@ pub fn sort(
     let opts = scx_ops::SortOptions {
         by,
         reverse,
+        shuffle: None,
         shard_target_rows,
-        codec: CodecSelection::Auto,
+        codec: parse_codec_selection(&codec)?,
         index_options: ConversionPredicateIndexOptions {
             index_obs: index_obs.unwrap_or_default(),
             index_var: index_var.unwrap_or_default(),
@@ -845,19 +896,117 @@ pub fn sort(
         group_max_bytes,
         group_write_block_bytes,
     };
-    py.detach(|| scx_ops::sort(&input_path, &output_path, &opts))
-        .map_err(ops_to_pyerr)?;
-    if rebuild_csc {
-        // Run the heavy CSC rebuild off the GIL too. Its `Box<dyn Error>` is
-        // not `Send`, so map it to a `String` inside the closure to cross
-        // `py.detach`.
-        py.detach(|| {
-            scx_ops::rebuild_csc_inplace(&output_path, csc_cols_per_shard, &csc_memory_limit, None)
-                .map_err(|e| e.to_string())
-        })
-        .map_err(PyRuntimeError::new_err)?;
-    }
-    Ok(())
+    run_sort_engine(
+        py,
+        &input_path,
+        &output_path,
+        &opts,
+        rebuild_csc,
+        csc_cols_per_shard,
+        &csc_memory_limit,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 1D. pyscx.shuffle()
+// ---------------------------------------------------------------------------
+
+/// Globally reorder cells (the obs axis) of an SCX file by a **seeded random
+/// permutation**, writing a new file whose row order carries no residual
+/// structure.
+///
+/// This is the training-side counterpart of `pyscx.sort`. `TrainingDataset`
+/// randomizes in two levels — shard order, then a Fisher-Yates shuffle within
+/// each shard group — so on a file whose rows arrived clustered (by donor,
+/// plate, or cell type) batch composition is capped by `shard_group_size`, and
+/// widening it costs memory linearly. Permuting once, on disk, moves that cost
+/// off the training loop.
+///
+/// `seed` is recorded in the output's provenance and is the **only** record of
+/// the permutation: the same seed on the same input always reproduces the same
+/// file, and nothing else can. Note the permutation runs over *live* rows, so
+/// a file with deletion vectors shuffles differently from the same file without
+/// them (deletions are materialized away, as in `sort`).
+///
+/// Two consequences worth knowing before a multi-hour rewrite:
+///
+/// - **Size is not neutral.** A random permutation destroys the cross-row
+///   redundancy that `zstd` / `shufdelta` shards exploit, so X usually grows.
+///   `scx1` codes each row's gene indices independently of row order and is
+///   genuinely size-neutral under a permutation — the CLI's `--codec scx1`.
+/// - **It is the inverse of a sort for queries.** Sorting collapses each
+///   category's predicate-index shard ranges to one contiguous run; shuffling
+///   scatters every category across every shard.
+///
+/// Example:
+///     pyscx.shuffle("atlas.scx", "atlas.shuffled.scx", seed=42)
+#[pyfunction]
+#[pyo3(signature = (
+    input, output, seed=42, shard_size=None, codec="auto".to_string(),
+    index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+    memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=false,
+    csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn shuffle(
+    py: Python<'_>,
+    input: &str,
+    output: &str,
+    seed: u64,
+    shard_size: Option<i64>,
+    codec: String,
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: Option<usize>,
+    memory_budget: Option<String>,
+    temp_dir: Option<String>,
+    bitmap: String,
+    rebuild_csc: bool,
+    csc_cols_per_shard: usize,
+    csc_memory_limit: String,
+) -> PyResult<()> {
+    let input_path = PathBuf::from(input);
+    let output_path = PathBuf::from(output);
+    let memory_budget = match memory_budget {
+        Some(s) => Some(scx_format_io::MemoryBudget::parse(&s).map_err(PyValueError::new_err)?),
+        None => None,
+    };
+    let bitmap = scx_format_io::BitmapPolicy::parse(&bitmap).map_err(PyValueError::new_err)?;
+    let shard_target_rows = validate_shard_size(shard_size)?.get();
+    let opts = scx_ops::SortOptions {
+        // Shuffle is an order *source*, not a modifier: there is no key, and
+        // the engine rejects `by` / `group_by` / `reverse` alongside it. This
+        // surface simply does not expose them.
+        by: Vec::new(),
+        reverse: false,
+        shuffle: Some(seed),
+        shard_target_rows,
+        codec: parse_codec_selection(&codec)?,
+        index_options: ConversionPredicateIndexOptions {
+            index_obs: index_obs.unwrap_or_default(),
+            index_var: index_var.unwrap_or_default(),
+            index_preset,
+            index_auto_threshold: index_auto_threshold.unwrap_or(0),
+        },
+        memory_budget,
+        temp_dir: temp_dir.map(PathBuf::from),
+        bitmap,
+        group_by: None,
+        reference: None,
+        group_target_bytes: None,
+        group_max_bytes: None,
+        group_write_block_bytes: None,
+    };
+    run_sort_engine(
+        py,
+        &input_path,
+        &output_path,
+        &opts,
+        rebuild_csc,
+        csc_cols_per_shard,
+        &csc_memory_limit,
+    )
 }
 
 // ---------------------------------------------------------------------------

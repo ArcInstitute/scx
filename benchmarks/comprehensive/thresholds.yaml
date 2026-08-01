@@ -2259,3 +2259,28 @@ absolute_floors:
 #    BioNeMo-SCDL ooc_loader row stays DEFERRED (isolated NeMo/CUDA env not yet
 #    added — see envs/scx-bench.yml note). Only AnnLoader + annbatch + scDataset
 #    are wired for Phase 0.
+#
+# 8. Data-load Phase 1D: shuffle_layout (`scx sort --shuffle`)
+#    DEFERRED, and the reason differs per arm — this is not one blocker.
+#      * `x_size_ratio__<codec>` / `file_size_ratio__<codec>`: not floored
+#        because the quantity is a *property of the data and codec*, not of the
+#        implementation. `scx1` is size-neutral by construction (each row's gene
+#        indices are coded independently of row order); `zstd` / `shufdelta`
+#        move by whatever cross-row redundancy the corpus happened to carry, in
+#        either direction. A floor would fire on a fixture refresh rather than
+#        on a regression. The measured values live in docs/performance.md, which
+#        is where a data-dependent number belongs.
+#      * `samples_per_sec__train_{unshuffled,shuffled}`: single capture, and the
+#        arm's purpose is a *neutrality* check (~1.00x) rather than a throughput
+#        claim — the ratio must never gate, since the interesting direction is a
+#        regression and `ooc_loader`'s `samples_per_sec__raw` floors already
+#        cover TrainingDataset throughput on the same datasets. Revisit if a
+#        second capture shows the absolute rate is stable enough to floor.
+#      * `label_tv_block__after`: the honest candidate — a shuffle that stopped
+#        mixing would show up here and nowhere else. Deferred only because one
+#        capture cannot separate the sampling-noise floor (a function of shard
+#        size and label cardinality) from a real regression. Floor it after a
+#        second capture on the same fixtures.
+#      * `cells_per_sec__shuffle_write`: rewrite throughput is
+#        `compact`/`sort`-shaped and has no existing floor to sit beside;
+#        deferred with the rest until there is more than one observation.

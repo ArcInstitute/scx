@@ -228,6 +228,7 @@ fn provenance_entry_shape() {
         &["cell_type".to_string()],
         1_700_000_000,
         None,
+        None,
     );
     assert_eq!(entry.action, "sort");
     assert_eq!(entry.timestamp, 1_700_000_000);
@@ -241,6 +242,8 @@ fn provenance_entry_shape() {
     );
     // Non-grouped sorts record no grouping block.
     assert!(v.get("grouping").is_none());
+    // ...and a key sort records no shuffle block.
+    assert!(v.get("shuffle").is_none());
 
     // Grouped sorts record the grouping params.
     let grouped = sort_provenance_entry(
@@ -255,6 +258,7 @@ fn provenance_entry_shape() {
             "group_target_bytes": serde_json::Value::Null,
             "group_max_bytes": serde_json::Value::Null,
         })),
+        None,
     );
     let gv: serde_json::Value = serde_json::from_str(&grouped.params_json).unwrap();
     assert_eq!(gv["grouping"]["group_by"], "target_gene");
@@ -262,4 +266,19 @@ fn provenance_entry_shape() {
         gv["grouping"]["reference"]["labels"],
         serde_json::json!(["nt"])
     );
+
+    // 1D: a shuffle records its seed and an empty `by`. This is the *only*
+    // record of the permutation — there is no key to re-derive it from — so
+    // its presence is a contract, not a convenience.
+    let shuffled = sort_provenance_entry(&[], false, 16384, &[], 1_700_000_000, None, Some(7));
+    let sv: serde_json::Value = serde_json::from_str(&shuffled.params_json).unwrap();
+    assert_eq!(sv["shuffle"]["seed"], serde_json::json!(7));
+    assert_eq!(sv["by"], serde_json::json!([]));
+    assert!(sv.get("grouping").is_none());
+
+    // Seed 0 must still be recorded — `Option` carries the presence, so a
+    // falsy seed cannot be mistaken for "no shuffle".
+    let zero = sort_provenance_entry(&[], false, 16384, &[], 1_700_000_000, None, Some(0));
+    let zv: serde_json::Value = serde_json::from_str(&zero.params_json).unwrap();
+    assert_eq!(zv["shuffle"]["seed"], serde_json::json!(0));
 }

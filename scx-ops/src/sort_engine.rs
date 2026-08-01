@@ -152,6 +152,85 @@ pub fn sort_with_strategy(
         OpsError::InvalidInput(format!("scx sort: n_vars {n_vars} exceeds u32::MAX"))
     })?;
 
+    // ----- 1D: shuffle-mode option validation -----
+    // Shuffle replaces the *order source*, so every other order source is a
+    // contradiction rather than a modifier. Reject instead of silently
+    // preferring one: a user who wrote both has a wrong mental model, and
+    // ignoring half of it would produce a plausible file with the wrong layout.
+    if let Some(seed) = opts.shuffle {
+        if !opts.by.is_empty() {
+            return Err(OpsError::InvalidInput(
+                "scx sort: --shuffle and --by are mutually exclusive order sources; \
+                 --shuffle permutes rows randomly and has no sort key"
+                    .to_string(),
+            ));
+        }
+        if opts.group_by.is_some() {
+            return Err(OpsError::InvalidInput(
+                "scx sort: --shuffle and --group-by are mutually exclusive; grouping \
+                 clusters rows by label and shuffling scatters them"
+                    .to_string(),
+            ));
+        }
+        if opts.reverse {
+            return Err(OpsError::InvalidInput(
+                "scx sort: --reverse is meaningless with --shuffle (there is no key to \
+                 reverse); drop it, or change --seed for a different permutation"
+                    .to_string(),
+            ));
+        }
+        log::info!("scx sort: shuffle mode, seed {seed}");
+
+        // A global shuffle is the exact inverse of what a sort does to a
+        // predicate index: sorting collapses each category's shard_ranges to
+        // one contiguous run, shuffling scatters every category across every
+        // shard. Still allowed — a training file can legitimately want both —
+        // but the user should not discover it after the rewrite.
+        //
+        // The input's *existing* index matters as much as the request: the
+        // rebuild also picks up auto-detected columns, so a plain
+        // `scx sort --shuffle in.scx out.scx` on an indexed input still emits
+        // an index. Gating on the request alone left the warning silent in
+        // exactly the common case (observed on `pbmc10k_auto.scx`, which
+        // re-indexed `n_counts` with no index flags passed).
+        let input_has_obs_index = reader
+            .catalog()
+            .entries
+            .iter()
+            .any(|e| e.section_type == SectionType::ObsPredicateIndex);
+        if input_has_obs_index
+            || !opts.index_options.index_obs.is_empty()
+            || opts.index_options.index_preset.is_some()
+        {
+            log::warn!(
+                "scx sort --shuffle: building an obs predicate index on a shuffled file — a \
+                 random permutation maximally scatters each value's shard ranges, so the \
+                 index will be larger and far less selective than on a sorted (or even an \
+                 unsorted) file. This is expected, not a bug."
+            );
+        }
+
+        // Warn *before* the rewrite, not after: on an atlas-scale file the user
+        // would otherwise learn about the size growth hours later. Only when the
+        // output codec is `Auto` — an explicit `--codec` is the user having
+        // already made this call.
+        if opts.codec == CodecSelection::Auto {
+            let (cross_row, total) = cross_row_coded_shard_counts(&reader)?;
+            if total > 0 && cross_row * 2 > total {
+                log::warn!(
+                    "scx sort --shuffle: {cross_row}/{total} X shards use a codec that \
+                     compresses across rows (zstd / shufdelta / lz4-shuffle). A random \
+                     permutation destroys the cross-row redundancy those codecs exploit, so \
+                     the output X will very likely be LARGER than the input — sorting a \
+                     149M-cell file by cell_type already grew X ~8%, and a shuffle is the \
+                     worst case rather than the best. Pass --codec scx1 for a size-neutral \
+                     shuffle (scx1 codes each row's gene indices independently of row order), \
+                     at the cost of a less compact file on high-median count data."
+                );
+            }
+        }
+    }
+
     // ----- F1: grouped-sharding option validation + normalization -----
     if opts.reference.is_some() && opts.group_by.is_none() {
         return Err(OpsError::InvalidInput(
@@ -205,32 +284,49 @@ pub fn sort_with_strategy(
     // F1: also fetch the reference column when it is a separate obs column, so
     // the synthetic reference-first key can be built from the same filtered
     // batch.
-    let mut read_cols = opts.by.clone();
-    if let Some(crate::sort::ReferenceSpec::Column(col)) = &opts.reference {
-        if !read_cols.iter().any(|c| c == col) {
-            read_cols.push(col.clone());
+    //
+    // 1D: shuffle mode has no key, so it skips this read entirely — a random
+    // permutation is a function of `(seed, n_live)` alone. `live_keys` is then
+    // an empty batch that only the key-dependent selector inputs below consult,
+    // and each of those is guarded. Skipping is not merely an optimisation:
+    // `read_obs_keys(&[])` yields a zero-*row* batch, which would trip the
+    // "no live rows" guard on every shuffle.
+    let live_keys = if opts.shuffle.is_some() {
+        RecordBatch::new_empty(Arc::new(Schema::empty()))
+    } else {
+        let mut read_cols = opts.by.clone();
+        if let Some(crate::sort::ReferenceSpec::Column(col)) = &opts.reference {
+            if !read_cols.iter().any(|c| c == col) {
+                read_cols.push(col.clone());
+            }
         }
-    }
-    log::info!("scx sort: pass 0a reading sort-key columns {:?}", read_cols);
-    let key_batch = reader.read_obs_keys(&read_cols)?;
-    log::info!(
-        "scx sort: pass 0a key batch read ({} rows, {} cols, key dtype {:?})",
-        key_batch.num_rows(),
-        key_batch.num_columns(),
-        key_batch
-            .schema()
-            .fields()
-            .first()
-            .map(|f| f.data_type().clone())
-    );
-    let live_keys = match &keep_mask {
-        Some(mask) => {
-            let bool_arr = arrow::array::BooleanArray::from(mask.clone());
-            arrow::compute::filter_record_batch(&key_batch, &bool_arr)?
+        log::info!("scx sort: pass 0a reading sort-key columns {:?}", read_cols);
+        let key_batch = reader.read_obs_keys(&read_cols)?;
+        log::info!(
+            "scx sort: pass 0a key batch read ({} rows, {} cols, key dtype {:?})",
+            key_batch.num_rows(),
+            key_batch.num_columns(),
+            key_batch
+                .schema()
+                .fields()
+                .first()
+                .map(|f| f.data_type().clone())
+        );
+        match &keep_mask {
+            Some(mask) => {
+                let bool_arr = arrow::array::BooleanArray::from(mask.clone());
+                arrow::compute::filter_record_batch(&key_batch, &bool_arr)?
+            }
+            None => key_batch,
         }
-        None => key_batch,
     };
-    let n_live = live_keys.num_rows();
+    // In shuffle mode the key batch is empty, so the live row count comes from
+    // the deletion-filtered id list instead. Both sources count the same rows.
+    let n_live = if opts.shuffle.is_some() {
+        live_ids.len()
+    } else {
+        live_keys.num_rows()
+    };
     if n_live == 0 {
         return Err(OpsError::InvalidInput(
             "scx sort: input has no live rows to sort".to_string(),
@@ -364,6 +460,13 @@ pub fn sort_with_strategy(
             }
             grouped_reference_labels = go.reference_labels;
             (go.perm, Some(plan))
+        } else if let Some(seed) = opts.shuffle {
+            // 1D: the third pass-0 producer. Same shape and same `Vec<u64>`
+            // memory as `stable_argsort`, so every downstream consumer —
+            // in-memory take, spill-scatter routing, obsp remap, all three X
+            // emitters — is untouched.
+            log::info!("scx sort: pass 0a seeded permutation over {n_live} live rows");
+            (crate::shuffle_order::seeded_permutation(n_live, seed), None)
         } else {
             let extractor = SortKeyExtractor::new(&live_keys.schema(), &opts.by, opts.reverse)?;
             let rows = extractor.rows(&live_keys)?;
@@ -544,14 +647,22 @@ pub fn sort_with_strategy(
         .saturating_add(obsm_bytes);
 
     // Leading-key cardinality + single-categorical-key flag for selector / K-pass.
-    let leading_categorical = !is_numeric(
-        live_keys
-            .schema()
-            .field_with_name(&opts.by[0])
-            .map(|f| f.data_type().clone())
-            .unwrap_or(DataType::Utf8),
-    );
-    let single_key = opts.by.len() == 1;
+    //
+    // 1D: shuffle mode has no key at all, so all three of these are "not
+    // applicable" rather than false-by-accident. The guard is load-bearing:
+    // `opts.by[0]` would panic on the empty `by`, and it runs unconditionally.
+    // With `single_key = false` the selector routes InMemory / ExternalPartition
+    // and never considers K-pass — which is correct, since K-pass emits in
+    // category order and cannot express an arbitrary permutation.
+    let single_key = opts.shuffle.is_none() && opts.by.len() == 1;
+    let leading_categorical = opts.shuffle.is_none()
+        && !is_numeric(
+            live_keys
+                .schema()
+                .field_with_name(&opts.by[0])
+                .map(|f| f.data_type().clone())
+                .unwrap_or(DataType::Utf8),
+        );
     // K-pass derives its emit order from the non-null category enumeration and
     // cannot place null-key rows; only the in-memory / external paths (which
     // use the full `stable_argsort` order) handle nulls. Detect nulls in the
@@ -637,6 +748,21 @@ pub fn sort_with_strategy(
                 emit_x_in_memory(&reader, &mut writer, &mut x_emitter, &order_old)?;
             }
             SortStrategy::KPassByCategory => {
+                // 1D: auto-selection can never land here in shuffle mode
+                // (`single_key` is false), but `force_strategy` can. Refuse
+                // loudly rather than fall through to the `categories` unwrap
+                // below with a message about a categorical key that does not
+                // exist: `emit_x_kpass` scans the input once per category and
+                // is structurally incapable of emitting an arbitrary
+                // permutation, so this is a capability gap, not a config error.
+                if opts.shuffle.is_some() {
+                    return Err(OpsError::InvalidInput(
+                        "scx sort: the K-pass strategy cannot express a random permutation \
+                         (it emits rows grouped by category, in category order); --shuffle \
+                         runs on the in-memory or external-partition strategy"
+                            .to_string(),
+                    ));
+                }
                 if leading_key_has_nulls {
                     return Err(OpsError::InvalidInput(
                         "K-pass strategy cannot sort a key column containing nulls (it would drop \
@@ -860,6 +986,7 @@ pub fn sort_with_strategy(
         &indexed_columns,
         ts,
         grouping_provenance(opts),
+        opts.shuffle,
     ));
     writer.write_provenance(prov)?;
 
@@ -1107,6 +1234,7 @@ fn sort_multimodal(
         &[],
         ts,
         grouping_provenance(opts),
+        opts.shuffle,
     ));
     writer.write_provenance(prov)?;
     writer.finish()?;
@@ -2819,6 +2947,38 @@ fn max_grouped_shard_footprint(
 fn x_value_encoding(reader: &ScxReader) -> Result<ValueEncoding> {
     let shards = reader.catalog().shards_sorted();
     widest_value_encoding(reader, &shards)
+}
+
+/// `(cross_row_coded_shards, total_x_shards)` — how much of X is stored under a
+/// codec whose compression spans rows.
+///
+/// `Scx1` codes each row's gene indices independently of row order, so a
+/// permutation just relocates identically-sized per-row blocks (measured
+/// size-neutral on `tabula_sapiens_100k`); `None` is incompressible by
+/// definition. Everything else — `Zstd`, `ShufDeltaZstd`, `Lz4Shuffle`,
+/// `Pcodec` — compresses the shard's byte stream as a whole, so *which* rows
+/// share a shard changes the output size. `Pcodec` counts here because it
+/// models the value sequence, and a permutation reshuffles that sequence even
+/// though its index arrays go through zstd.
+///
+/// Reads one shard header per shard; on the local mmap reader `section_bytes`
+/// is a zero-copy slice, the same access `widest_value_encoding` already makes
+/// for every shard on this path.
+fn cross_row_coded_shard_counts(reader: &ScxReader) -> Result<(usize, usize)> {
+    let shards = reader.catalog().shards_sorted();
+    let mut cross_row = 0usize;
+    for entry in &shards {
+        let section = reader.section_bytes(entry)?;
+        if section.len() < SHARD_HEADER_SIZE {
+            continue;
+        }
+        let sh = ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
+        match CodecId::from_u8(sh.codec_id) {
+            Some(CodecId::None) | Some(CodecId::Scx1) => {}
+            _ => cross_row += 1,
+        }
+    }
+    Ok((cross_row, shards.len()))
 }
 
 /// Value encoding wide enough for a layer's whole sorted output (see

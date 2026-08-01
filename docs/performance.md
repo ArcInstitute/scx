@@ -2307,6 +2307,116 @@ manifest subset, and to I/O and thread scheduling — but it is **not** bit-repr
 numpy-based implementation (ChaCha8 vs PCG64 + BTPE), so counts from a previously downsampled
 run change when it moves onto this path. Distributions and target semantics do not.
 
+### Global pre-shuffle (data-load Phase 1, 1D)
+
+**`scx sort --shuffle` does what it exists to do and costs nothing to read: per-shard label
+divergence from the corpus mix collapses by 27–43×, while cache-cold `TrainingDataset`
+throughput is unchanged (1.01–1.03×). The one real cost is on disk, and on the default
+`codec="auto"` it is large — 1.86–2.09× on X.** Captured cold on `shuffle_layout` / `scx_auto`,
+`seed=42`, `n_runs=3` for the epochs and 2 for the rewrite, one job at a time
+(`--dependency=afterany`) on a 16-core / 200 GB `cpu` node.
+
+#### Batch mixing — the thing the feature is for
+
+`TrainingDataset` randomizes in two levels and both are bounded by physical layout, so on a
+clustered file batch composition is capped by `shard_group_size`. The metric below is the
+**total-variation distance between one CSR shard's `cell_type` mix and the corpus mix** — the
+composition a `shard_group_size=1` batch would inherit. It is computed analytically from
+`obs_categorical` codes plus the shard row ranges: no X decode, no RNG, no sampling error.
+
+| dataset | levels | block | per-shard TV | pooled 8-shard TV |
+|---|---|---|---|---|
+| tabula_sapiens_100k | 33 | 14,286 rows | 0.562 → **0.013** (43×) | n/a — 7 shards |
+| census_500k | 885 | 16,130 rows | 0.625 → **0.023** (27×) | 0.257 → **0.007** (36×) |
+
+The pooled figure is deliberately **withheld** for `tabula_sapiens_100k`: with 7 shards,
+pooling 8 blocks *is* the whole corpus, so the answer is 0.0 by construction on any row order —
+including a maximally clustered one. Reporting it would have said "perfectly mixed" about the
+file the feature had not yet touched.
+
+The `census_500k` pair is the more informative one. Even at the loader's default
+`shard_group_size=8`, an unshuffled file's groups sit at TV 0.257 from the corpus; after the
+pre-shuffle they sit at 0.007, i.e. at the sampling floor. That is the ceiling the pre-shuffle
+removes.
+
+#### Read throughput — a neutrality check, not a speedup
+
+| dataset | unshuffled | shuffled | ratio |
+|---|---|---|---|
+| tabula_sapiens_100k | 11 911 samples/s | 12 296 samples/s | 1.032× |
+| census_500k | 14 515 samples/s | 14 650 samples/s | 1.009× |
+
+**Read ~1.0× as the arm passing.** A shuffled file is still streamed sequentially, so
+neutrality is the expected and desired result; what this arm exists to catch is a *regression*,
+evidence that the permutation cost the sequential read something. It did not. The throughput a
+pre-shuffle actually buys is downstream — a consumer can drop `shard_group_size` and its memory
+budget without losing batch diversity — and is not measured here.
+
+#### Output size — pin your codec
+
+X-section bytes only (obs, var and the predicate index all move under a reorder too; isolating
+X is what makes this a statement about *compression*). Each variant is shuffled **at its own
+codec and its own shard geometry**, so the only variable is row order:
+
+| codec | tabula_sapiens_100k | census_500k | codec flipped? |
+|---|---|---|---|
+| `scx1` | 1.000× | 1.001× | no |
+| `lz4` | 1.002× | 1.008× | no |
+| `shufdelta` | 1.005× | 1.011× | no |
+| `zstd` | **1.060×** | **1.121×** | no |
+| `pcodec` | 1.060× | 1.121× | no |
+| **`auto`** (the default) | **2.088×** | **1.857×** | **yes — `shufdelta` → `scx1`** |
+
+Three separate findings, and conflating them is the easy mistake:
+
+1. **The `auto` row is an adaptive-codec flip, not lost compression.** The per-shard codec
+   histogram is recorded before and after, and it moves `shufdelta ×N → scx1 ×N` on both
+   datasets: the per-shard heuristic reaches a different answer on reordered data, and the
+   entire 1.86–2.09× is that switch. Pass `--codec` to hold the input's encoding.
+2. **`zstd` genuinely loses cross-row redundancy — 6% at 100k cells, 12% at 500k.** No flip;
+   this is the real effect, and it grows with shard occupancy, which is what the mechanism
+   predicts. It is also an order of magnitude smaller than the flip.
+3. **`scx1` is exactly neutral**, as its design implies: each row's gene indices are coded
+   independently of row order, so a permutation relocates identically-sized blocks. This is the
+   guaranteed-neutral setting.
+
+The methodology matters more than usual here, because two earlier versions of this measurement
+were wrong in ways that looked plausible. Shuffling at the writer's *default* shard size turned
+a 6-shard input into a 1-shard output, so the "size ratio" was measuring re-sharding and the
+throughput arm reported a spurious 5.97×. And leaving the output codec at `auto` re-encoded
+every variant identically — all six landed on byte-identical output — so the "codec sweep"
+measured auto-reselection rather than the codec. Both are now controlled and asserted
+(`shard_geometry_matched`, `codec_flipped` in the recorded metadata).
+
+#### Rewrite cost
+
+| dataset | wall | throughput | peak RSS | output |
+|---|---|---|---|---|
+| tabula_sapiens_100k | 5.6 s | ~18.0k cells/s | 3.2 GB | 446.8 MB |
+| census_500k | 21.1 s | ~23.4k cells/s | 9.5 GB | 1 833.1 MB |
+
+One-off, and it is the in-memory strategy (no `--memory-budget`), which gathers the whole X.
+Pass `--memory-budget` for the bounded external-partition path on files that do not fit.
+
+**No new `thresholds.yaml` floor, and the reasons differ per arm** — recorded in that file's
+deferred-floors block rather than left implicit. The size ratios are a property of the *data
+and codec*, not of the implementation, so a floor would fire on a fixture refresh rather than
+on a regression. The throughput arm must never gate on its ratio, since the interesting
+direction is a regression and `ooc_loader`'s `samples_per_sec__raw` floors already cover
+`TrainingDataset` throughput on these same datasets. `label_tv_block__after` is the honest
+candidate — a shuffle that stopped mixing would show up there and nowhere else — but one
+capture cannot separate the sampling-noise floor (a function of shard size and label
+cardinality) from a real regression; floor it after a second capture on the same fixtures.
+
+Reproducibility, for the record: the permutation is a Fisher–Yates shuffle over the **live**
+rows seeded by `splitmix64(splitmix64(seed) ^ SHUFFLE_DOMAIN_TAG)`, and the seed is written to
+provenance because it is the only record of the order — there is no key to re-derive it from.
+The domain tag exists so a `seed=42` shuffle is uncorrelated with the training loader's
+`(seed=42, epoch=0)` shard permutation, `42` being the default on both surfaces. Deletions are
+materialized away first, so the same seed yields a different order on a file with deletion
+vectors than on the same file without them. The order is **not** stable across a `rand` crate
+upgrade; that is pinned by a literal-permutation test rather than promised by the format.
+
 ## Query Engine
 
 | Metric | Result |

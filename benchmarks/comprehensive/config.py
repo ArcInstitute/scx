@@ -1126,6 +1126,15 @@ def estimate_memory_gb(
         # one obs table (+ per-file scratch across a manifest), never the X
         # matrix — Python baseline dominates.
         peak_mb = max(base_mb * 0.5, 4 * 1024)
+    elif benchmark == "shuffle_layout":
+        # The rewrite dominates. `scx sort` without a --memory-budget takes the
+        # in-memory strategy, which gathers the whole X (nnz*8 + indptr) plus
+        # obsm/layers — the same footprint `grouped_sort` sizes for, minus the
+        # grouped reference-shard buffer. The TrainingDataset epochs are
+        # streaming and bounded well below that. NOT capped by
+        # SCX_BENCH_OOC_MEM_CAP_GB: under-sizing the request here would OOM the
+        # rewrite rather than force an interesting out-of-core regime.
+        peak_mb = max(base_mb * 2, dense_mb * 0.5)
     elif benchmark == "correctness":
         # Correctness keeps the scanpy-reference AnnData + SCX backed view
         # + SLAF round-trip materialization simultaneously while running
@@ -1442,6 +1451,11 @@ def estimate_time_minutes(
         "ooc_loader":             90,
         "cellset_gather":         45,
         "obs_open":               20,
+        # Data-load Phase 1D. Up to seven full file rewrites (two timed
+        # `shuffle_write` reps + one per codec variant in the size sweep) plus
+        # cache-cold TrainingDataset epochs on two files. The rewrite count is
+        # what makes the base generous; see the steep slope below.
+        "shuffle_layout":         60,
     }
     base = base_minutes.get(benchmark, 15)
 
@@ -1455,6 +1469,12 @@ def estimate_time_minutes(
         # dominate. Steeper than the 8/M default so the larger OOC tiers don't
         # clip.
         slope_minutes_per_million = 15
+    elif benchmark == "shuffle_layout":
+        # Every arm is O(nnz): each rewrite decodes and re-encodes the whole
+        # matrix, and the size sweep does that once per codec variant. Steeper
+        # than ooc_loader's cold-read slope because a rewrite is read + encode,
+        # not read alone.
+        slope_minutes_per_million = 25
     elif benchmark in ("cloud_push", "cloud_pull", "cloud_read",
                         "cloud_reader_vs_pull", "cost_model"):
         slope_minutes_per_million = 12

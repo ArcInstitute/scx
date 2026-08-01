@@ -1922,6 +1922,9 @@ fn convert_then_sort_grouped(
     let sort_opts = scx_ops::SortOptions {
         by,
         reverse: false,
+        // Convert-time grouping is a key sort by construction; 1D's shuffle is
+        // exposed only on `scx sort` / `pyscx.shuffle`.
+        shuffle: None,
         shard_target_rows: opts.shard_target_rows,
         codec: match opts.codec {
             Some(c) => scx_codec::CodecSelection::Explicit(c),
