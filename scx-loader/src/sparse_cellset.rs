@@ -182,6 +182,22 @@ impl SparseCellSetLoader {
     ) -> Result<Arc<Self>> {
         if let Some(cfg) = &downsample {
             cfg.validate()?;
+            // An empty table means "no stable per-file identity", which keys on
+            // `(seed, method, row)` alone. That is fine for one file and ambiguous
+            // for several — two files' row 5 would share a draw. Refuse it rather
+            // than fall back to `file_id`, which would be construction-order
+            // keying: a reordered manifest or a debugging subset silently redrawing
+            // every cell while producing perfectly plausible output.
+            if cfg.file_identities.is_empty() && scx_readers.len() > 1 {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "downsample over {} files requires file_identities (one stable \
+                         per-file id, e.g. scx_loader::downsample::file_identity(path)); \
+                         without them two files' row N would share a draw",
+                        scx_readers.len()
+                    ),
+                });
+            }
             if !cfg.file_identities.is_empty() && cfg.file_identities.len() != scx_readers.len() {
                 return Err(LoaderError::ConfigError {
                     reason: format!(

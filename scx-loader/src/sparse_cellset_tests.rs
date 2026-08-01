@@ -1089,4 +1089,55 @@ fn gather_rejects_an_invalid_downsample_config() {
     .expect("mismatched identities must be rejected")
     .to_string();
     assert!(err.contains("file_identities"), "unhelpful: {err}");
+
+    // A single file with no identities is fine — it keys on (seed, method, row).
+    assert!(mk(ds_cfg(
+        10,
+        crate::downsample::DownsampleMethod::Binomial,
+        1,
+        vec![]
+    ))
+    .is_ok());
+}
+
+#[test]
+fn gather_rejects_an_empty_identity_table_across_multiple_files() {
+    // Without identities, two files' row N would share a draw. The tempting
+    // fallback — key on `file_id` — is construction-order keying, the very scheme
+    // `gather_downsample_is_invariant_to_manifest_order` exists to rule out. So
+    // this is refused at construction rather than silently keyed.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    write_float_fixture(&p0, 8, 4, 2, 3, None);
+    write_float_fixture(&p1, 8, 4, 2, 3, None);
+
+    let err = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        4,
+        None,
+        2,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        Some(ds_cfg(
+            10,
+            crate::downsample::DownsampleMethod::Multinomial,
+            1,
+            vec![],
+        )),
+    )
+    .err()
+    .expect("multi-file downsample without identities must be rejected")
+    .to_string();
+    assert!(
+        err.contains("file_identities"),
+        "message should name the missing input: {err}"
+    );
+    assert!(
+        err.contains("share a draw"),
+        "message should say why it matters: {err}"
+    );
 }

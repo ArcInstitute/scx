@@ -2493,8 +2493,8 @@ pub fn downsample_counts_csr<'py>(
     }
     if !idents.is_empty() && idents.len() != n_rows {
         return Err(PyValueError::new_err(format!(
-            "file_identities len {} != n_rows {n_rows} (pass an empty array for \
-             positional keying)",
+            "file_identities len {} != n_rows {n_rows} (pass an empty array to key on \
+             (seed, method, row) alone, which is correct for a single-file batch)",
             idents.len()
         )));
     }

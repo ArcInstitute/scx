@@ -111,14 +111,23 @@ pub struct DownsampleConfig {
 }
 
 impl DownsampleConfig {
-    /// Identity for `file_id`, or `file_id` itself if the table is short (which a
-    /// caller that supplied no paths accepts as order-dependent).
+    /// Identity for `file_id`, or `0` when no table was supplied.
+    ///
+    /// The fallback is a **constant**, not `file_id`. Falling back to `file_id`
+    /// would reintroduce construction-order keying — the exact scheme this module
+    /// rejects, because a reordered manifest or a debugging subset then silently
+    /// redraws every cell. A constant instead keys on `(seed, method, row)` alone:
+    /// correct for a single file, and ambiguous across files, which is why
+    /// [`crate::sparse_cellset::SparseCellSetLoader::new`] refuses an empty table
+    /// when there is more than one file rather than letting the ambiguity ship.
+    /// This matches the standalone `downsample_counts_csr` convention exactly, so
+    /// the two entry points cannot disagree.
     #[inline]
     pub fn identity_for(&self, file_id: u32) -> u64 {
         self.file_identities
             .get(file_id as usize)
             .copied()
-            .unwrap_or(file_id as u64)
+            .unwrap_or(0)
     }
 
     /// Reject a configuration that cannot sample.
@@ -160,6 +169,10 @@ pub fn file_identity(path: &str) -> u64 {
 /// `(seed + 1, row)` and `(seed, row + 1)` land on the same stream. With three
 /// components plus a method tag that is not acceptable, so this is deliberately a
 /// new convention in the crate.
+///
+/// **This is a mixer, not a KDF.** The goal is that distinct key tuples land on
+/// independent-looking streams; there is no secrecy or preimage-resistance claim,
+/// and nothing here should be reused where one is needed.
 #[inline]
 fn splitmix64(x: u64) -> u64 {
     let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);

@@ -394,7 +394,13 @@ fn the_draw_is_independent_of_batch_position() {
 }
 
 #[test]
-fn identity_for_falls_back_to_file_id_when_the_table_is_short() {
+fn identity_for_falls_back_to_a_constant_never_to_file_id() {
+    // The fallback must NOT be `file_id`. That would be construction-order keying
+    // — the scheme this module exists to avoid — and an earlier revision of this
+    // test pinned exactly that footgun. A constant keys on `(seed, method, row)`
+    // alone, matching the standalone `downsample_counts_csr` convention so the two
+    // entry points cannot disagree; the loader refuses an empty table outright
+    // when there is more than one file.
     let cfg = DownsampleConfig {
         target_library_size: 10,
         method: DownsampleMethod::Binomial,
@@ -402,8 +408,27 @@ fn identity_for_falls_back_to_file_id_when_the_table_is_short() {
         file_identities: vec![0xDEAD],
     };
     assert_eq!(cfg.identity_for(0), 0xDEAD);
-    // Out of range -> the file_id itself, documented as order-dependent.
-    assert_eq!(cfg.identity_for(3), 3);
+    assert_eq!(cfg.identity_for(3), 0, "must not fall back to the file_id");
+    assert_eq!(
+        cfg.identity_for(7),
+        0,
+        "fallback must be constant across ids"
+    );
+}
+
+#[test]
+fn multinomial_never_empties_a_row_that_had_counts() {
+    // `target >= 1` is validated, and on the sampling path `library_size > target`,
+    // so exactly `target` counts are redistributed — at least one survives the
+    // zero-prune. Worth pinning because "the sampler emptied a cell" is the failure
+    // a caller would notice last: the row simply looks unexpressed downstream.
+    let idx: Vec<i32> = (0..40).collect();
+    let dat: Vec<f32> = vec![25.0; 40];
+    for row in 0..40u64 {
+        let (i, d) = run(&idx, &dat, DownsampleMethod::Multinomial, 1, 3, 5, row);
+        assert!(!i.is_empty(), "row {row} emptied at target=1");
+        assert_eq!(lib(&d), 1, "row {row} did not conserve the target");
+    }
 }
 
 // --------------------------------------------------------------------------

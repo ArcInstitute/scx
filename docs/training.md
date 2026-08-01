@@ -408,7 +408,17 @@ Three properties worth knowing:
 
 `pyscx.downsample_counts_csr(...)` applies the same primitive to a CSR batch you
 gathered yourself. Prefer the loader arguments when the loader is doing the
-gather.
+gather. Across several files, pass one `downsample_file_identity` value per row;
+the loader refuses a multi-file downsample without them rather than key on
+manifest position.
+
+> **`SparseCellSetBatch.data` is no longer a passthrough for signed or NaN
+> values.** Independently of downsampling, the gather now clips negatives (and
+> NaN) to zero, because the collate kernel was already doing so lazily on every
+> read and the two therefore disagreed about what a row contained. The number of
+> stored nonzeros is unchanged — a clipped entry stays as an explicit zero — but
+> the values are. Code relying on negatives reaching the consumer needs to read
+> them before the gather.
 
 Reproducibility caveat: this is a Rust-native ChaCha8 sampler, so runs
 downsampled by a numpy-based implementation are **not** bit-reproducible under it.

@@ -12,7 +12,7 @@ Other pyscx symbols re-exported via `from .pyscx import *` are typed as
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
-from typing import Any, Tuple, TypedDict
+from typing import Any, Literal, Tuple, TypedDict
 
 import numpy as np
 
@@ -219,7 +219,7 @@ class SparseCellSetDataset:
         log1p: bool | None = None,
         target_sum: float | None = None,
         downsample_target_library_size: int | None = None,
-        downsample_method: str | None = None,
+        downsample_method: Literal["binomial", "multinomial"] | None = None,
         downsample_seed: int | None = None,
     ) -> None:
         """``downsample_target_library_size`` enables a seeded per-row count
@@ -729,7 +729,7 @@ def downsample_counts_csr(
     rows: np.ndarray,
     file_identities: np.ndarray,
     target_library_size: int,
-    method: str | None = None,
+    method: Literal["binomial", "multinomial"] | None = None,
     seed: int | None = None,
 ) -> dict[str, Any]:
     """Seeded per-row count downsample over an already-gathered CSR batch.
