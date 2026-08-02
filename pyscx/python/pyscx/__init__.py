@@ -463,6 +463,166 @@ def to_h5ad(path, out, **kwargs):
     return _to_h5ad_native(src, _coerce_path(out), **kwargs)
 
 
+def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
+                   on_ambiguous_key="error", overwrite=False, **kwargs):
+    """Export one h5ad per batch, ready to run a per-sample tool on.
+
+    Doublet callers are in-memory, single-sample tools, so the export is N
+    per-batch files rather than one. That is the moat rather than a cost: the
+    pooled atlas is never materialized and peak RSS is one library.
+
+    **What this adds over the loop you would write yourself** is the key check.
+    A tool sees only the h5ad it is handed, so if two of that file's cells carry
+    the same key there is nothing to join its answers back on — and the failure
+    only shows up much later, as a duplicate-key error at import time or, worse,
+    as scores silently landing on the wrong cell. Measured on a real
+    CELLxGENE-derived atlas, one batch in 1,086 had a duplicated index and it
+    held 15.5% of the file's cells.
+
+    Args:
+        path: Source SCX file (str, os.PathLike, or an open Experiment).
+        out_dir: Directory for the per-batch h5ad files; created if absent.
+        batch_key: obs column to split on (e.g. "donor_id", "sample_id").
+        key: The join key the tool's output will carry back. None resolves it
+            with `diagnose_obs_key`, the same way `obs_import` would.
+        batches: Restrict to these batch values. None exports every batch.
+        on_ambiguous_key: What to do with a batch whose key is not unique
+            *within that batch* — "error" (default) refuses before writing
+            anything, "skip" omits it and records why, "warn" exports it
+            anyway. Only choose "warn" if you have another way to rejoin.
+        overwrite: Overwrite existing per-batch files. Off by default.
+        **kwargs: Passed through to `pyscx.to_h5ad` (e.g. `min_counts`).
+
+    Returns:
+        dict with `key`, `key_is_globally_unique`, `out_dir`, `n_batches`,
+        `n_cells_exported`, and `batches` — a list of per-batch dicts carrying
+        `batch`, `path`, `n_cells`, `key_unique_within_batch` and, for anything
+        not written, `skipped_reason`.
+
+    Note:
+        `key_is_globally_unique` is the one to read before planning the import.
+        When it is True you can concatenate every tool output and import once,
+        which is what you want because `overwrite` **replaces** rather than
+        merges. When it is False the keys only distinguish cells inside their
+        own batch, so you must import with a composite key that includes
+        `batch_key`.
+
+    Example:
+        r = pyscx.export_batches("atlas.scx", "batches/", batch_key="donor_id")
+        assert r["key_is_globally_unique"]      # else import per batch
+        # ... run the tool on each r["batches"][i]["path"] ...
+        pyscx.doublet_import("atlas.scx", "all_calls.csv", tool="scrublet")
+    """
+    import pathlib as _pathlib
+
+    if on_ambiguous_key not in ("error", "skip", "warn"):
+        raise ValueError(
+            "on_ambiguous_key must be 'error', 'skip' or 'warn'; got "
+            f"{on_ambiguous_key!r}"
+        )
+
+    src = _coerce_path(path)
+    out_dir = _pathlib.Path(_coerce_path(out_dir, allow_experiment=False))
+
+    # Resolve to a key that actually *works* rather than to whatever the plain
+    # fallback order lands on: on a merged atlas the fallback is usually the
+    # obs index, which is exactly the column that turns out to be duplicated.
+    # The chosen key comes back in the result so the import can be given the
+    # same one -- `obs_import` / `doublet_import` auto-resolve by fallback
+    # order, so if the two differ the caller must pass `key=` there too.
+    no_unique_candidate = ""
+    if key is None:
+        diag = diagnose_obs_key(src)
+        key = diag.get("suggestion") or diag.get("resolved_key")
+        if key is None:
+            raise ValueError(
+                "no obs column could serve as a join key: " + diag["summary"]
+            )
+        if not diag.get("suggestion"):
+            # Fell back rather than found a unique column. Carried into the
+            # per-batch refusal below so its remedy does not promise a key the
+            # file does not have.
+            no_unique_candidate = " " + diag["summary"]
+
+    exp = _open_native(src)
+    obs = exp.read_obs()
+    # `read_obs()` returns PHYSICAL rows, which is exactly the row space
+    # `to_h5ad(obs_mask=)` wants. It also *includes* logically deleted rows, so
+    # the per-batch counts below can overcount; `to_h5ad` ANDs with the
+    # deletion keep mask, so the exports themselves stay right.
+    if batch_key not in obs.columns:
+        raise ValueError(
+            f"batch_key {batch_key!r} is not an obs column; columns are "
+            f"{list(obs.columns)}"
+        )
+    if key in obs.columns:
+        key_values = obs[key]
+    elif obs.index.name == key or key in ("index", "_index", "__index_level_0__"):
+        key_values = obs.index.to_series()
+    else:
+        raise ValueError(
+            f"key {key!r} is neither an obs column nor the obs index; columns "
+            f"are {list(obs.columns)}"
+        )
+
+    globally_unique = bool(key_values.is_unique)
+
+    # Plan every batch before writing any of them, so an "error" verdict costs
+    # nothing rather than leaving a half-finished directory behind.
+    plan = []
+    values = obs[batch_key]
+    wanted = list(batches) if batches is not None else list(values.drop_duplicates())
+    for b in wanted:
+        mask = (values == b).to_numpy()
+        if not mask.any():
+            raise ValueError(f"batch {b!r} matches no rows in {batch_key!r}")
+        unique = bool(key_values[mask].is_unique)
+        plan.append({"batch": b, "mask": mask, "n_cells": int(mask.sum()),
+                     "key_unique_within_batch": unique})
+
+    bad = [p["batch"] for p in plan if not p["key_unique_within_batch"]]
+    if bad and on_ambiguous_key == "error":
+        n = sum(p["n_cells"] for p in plan if not p["key_unique_within_batch"])
+        raise ValueError(
+            f"key {key!r} is not unique within {len(bad)} of {len(plan)} "
+            f"batches ({n} cells): {bad[:5]}{' ...' if len(bad) > 5 else ''}. "
+            "A tool run on those files could not tell two cells apart, so its "
+            "output could not be joined back. Pass a key that is unique within "
+            "each batch (pyscx.diagnose_obs_key lists the candidates), or "
+            "on_ambiguous_key='skip' to export the rest." + no_unique_candidate
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results, exported = [], 0
+    for p in plan:
+        entry = {"batch": p["batch"], "n_cells": p["n_cells"],
+                 "key_unique_within_batch": p["key_unique_within_batch"]}
+        if not p["key_unique_within_batch"] and on_ambiguous_key == "skip":
+            entry["path"] = None
+            entry["skipped_reason"] = f"key {key!r} is not unique within this batch"
+            results.append(entry)
+            continue
+        dest = out_dir / f"{p['batch']}.h5ad"
+        if dest.exists() and not overwrite:
+            raise FileExistsError(
+                f"{dest} already exists; pass overwrite=True to replace it"
+            )
+        to_h5ad(src, str(dest), obs_mask=p["mask"], **kwargs)
+        entry["path"] = str(dest)
+        results.append(entry)
+        exported += p["n_cells"]
+
+    return {
+        "key": key,
+        "key_is_globally_unique": globally_unique,
+        "batch_key": batch_key,
+        "out_dir": str(out_dir),
+        "n_batches": sum(1 for r in results if r.get("path")),
+        "n_cells_exported": exported,
+        "batches": results,
+    }
+
+
 def obs_import(path, table, *, key=None, **kwargs):
     """Import a delimited annotation table (CSV/TSV) as `obs` columns, in place.
 

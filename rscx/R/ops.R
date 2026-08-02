@@ -186,3 +186,99 @@ scx_merge <- function(inputs, output, index_obs = NULL, index_var = NULL,
 }
 
 
+
+#' Attach a data.frame of per-cell annotations to an SCX file, in place
+#'
+#' The R end of the doublet-caller interop. scDblFinder, DoubletFinder and scds
+#' all run directly on an rscx-loaded object, so on this path there is no
+#' intermediate file in either direction: the caller hands the tool's
+#' \code{data.frame} straight back to the SCX file.
+#'
+#' The join is **by key string, never by row position**. A caller returns rows
+#' in whatever order it pleased, and a positional attach would put every score
+#' on the wrong cell while still producing a correctly-shaped column. Target
+#' rows the \code{data.frame} does not cover become \code{NA}, never a
+#' fabricated \code{0}.
+#'
+#' In place via the same harness \code{scx_append} uses: X, layers, var, the
+#' CSC sidecar, .raw, deletion vectors and predicate indexes are preserved, and
+#' \code{scx_rollback(path)} undoes the whole attach.
+#'
+#' @param path Path to the SCX file (modified in place).
+#' @param df A \code{data.frame} of annotations. Each column becomes an obs
+#'   column; a \code{factor} is preserved as a categorical.
+#' @param key Character vector with one key per row of \code{df} — usually
+#'   \code{rownames(df)}. Supplying \code{NULL} or an empty vector is an error
+#'   rather than a silent fall-through: \code{rownames()} returns \code{NULL}
+#'   on an object with no names, and joining on nothing would match nothing.
+#'   Omit the argument entirely to resolve a key column from \code{df} instead.
+#' @param key_columns Columns **of \code{df}** to fuse into a composite key,
+#'   joined against target obs columns of the same names — the right answer for
+#'   a multi-library merge where \code{sample_id} + \code{barcode} is unique but
+#'   neither is alone. Mutually exclusive with \code{key}.
+#' @param key_column Target obs column to join \code{key} against.
+#'   \code{NULL} auto-resolves it.
+#' @param prefix Prepended to every attached column name.
+#' @param status_column Obs column recording \code{"present"}/\code{"absent"}
+#'   per row. \code{NULL} omits it.
+#' @param uns_key \code{uns} key for the run metadata. \code{NULL} omits it.
+#' @param overwrite Replace colliding columns. **Replaces, never merges** — so
+#'   attaching several per-batch results in turn keeps only the last. Combine
+#'   them into one \code{data.frame} and attach once.
+#' @param on_missing_rows \code{"zero"} (default) marks uncovered target rows
+#'   absent; \code{"error"} refuses.
+#' @param on_extra_rows \code{"warn"} (default) skips source rows the target
+#'   lacks; \code{"error"} refuses.
+#' @param dry_run Run every validation and the join, then return the summary
+#'   without writing.
+#' @return A named list with \code{n_obs}, \code{n_matched},
+#'   \code{n_target_rows_absent}, \code{n_source_rows_absent},
+#'   \code{obs_key_column} and \code{obs_columns_added}.
+#' @export
+#' @examples
+#' \dontrun{
+#' library(scDblFinder)
+#'
+#' exp <- scx_open("library_A.scx")
+#' sce <- collect(scx_query(exp))$to_sce()
+#' sce <- scDblFinder(sce)
+#'
+#' # colData() carries the cell keys as ROWNAMES, not as a column.
+#' df <- as.data.frame(colData(sce)[, c("scDblFinder.score", "scDblFinder.class")])
+#' scx_attach_obs("library_A.scx", df, key = rownames(df))
+#' }
+scx_attach_obs <- function(path, df, key, key_columns = NULL,
+                           key_column = NULL, prefix = "",
+                           status_column = NULL, uns_key = NULL,
+                           overwrite = FALSE, on_missing_rows = "zero",
+                           on_extra_rows = "warn", dry_run = FALSE) {
+  # `key` supplied but empty is the rownames(df) == NULL trap: an SCE built
+  # from a file whose obs carries barcodes only as a named column has NULL
+  # colnames, so rownames(colData(sce)) is NULL too. Joining on nothing would
+  # match nothing and look like the tool covered no cells.
+  if (!missing(key) && (is.null(key) || length(key) == 0L)) {
+    stop("`key` was supplied but is NULL/empty — rownames(df) is NULL when the ",
+         "object has no cell names. Give the keys explicitly, or use ",
+         "`key_columns=` to join on columns of `df`.", call. = FALSE)
+  }
+  if (missing(key)) key <- character(0)
+  if (!is.null(key_columns) && length(key) > 0L) {
+    stop("pass either `key` or `key_columns`, not both.", call. = FALSE)
+  }
+
+  .Call(
+    wrap__scx_attach_obs,
+    path,
+    df,
+    as.character(key),
+    .scx_chr_or_empty(key_columns),
+    if (is.null(key_column)) NULL else as.character(key_column),
+    as.character(prefix),
+    if (is.null(status_column)) NULL else as.character(status_column),
+    if (is.null(uns_key)) NULL else as.character(uns_key),
+    as.logical(overwrite),
+    as.character(on_missing_rows),
+    as.character(on_extra_rows),
+    as.logical(dry_run)
+  )
+}

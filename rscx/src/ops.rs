@@ -455,6 +455,286 @@ fn scx_validate_impl(path: &str) -> Result<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// Attach external obs
+// ---------------------------------------------------------------------------
+
+/// Attach an R `data.frame` of per-cell annotations to an SCX file, in place.
+///
+/// The R end of the doublet-caller interop. scDblFinder, DoubletFinder and
+/// scds all run directly on an rscx-loaded object, so on this path there is no
+/// export file in either direction — the caller hands back a `data.frame` and
+/// it lands on the file.
+///
+/// @param path Path to the SCX file (modified in place).
+/// @param df The annotations. Columns become obs columns; an R factor arrives
+///   as a dictionary and is preserved as one.
+/// @param key Character vector of one key per row of `df` — usually
+///   `rownames(df)`. Empty means "resolve a key column from `df` instead".
+/// @param key_columns Columns **of `df`** to fuse into a composite key,
+///   joined against target obs columns of the same names. Mutually exclusive
+///   with `key`.
+/// @param key_column Target obs column to join on when `key` is given.
+///   `NULL` auto-resolves it.
+/// @param prefix Prepended to every imported column name.
+/// @param status_column Obs column recording "present"/"absent" per row.
+/// @param uns_key `uns` key for the run metadata.
+/// @param overwrite Replace colliding columns. REPLACES, never merges.
+/// @param on_missing_rows `"zero"` or `"error"`.
+/// @param on_extra_rows `"warn"` or `"error"`.
+/// @param dry_run Validate and join without writing.
+/// @return Named list summarising the join.
+///
+/// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn scx_attach_obs(
+    path: &str,
+    df: Robj,
+    key: Strings,
+    key_columns: Strings,
+    key_column: Nullable<String>,
+    prefix: &str,
+    status_column: Nullable<String>,
+    uns_key: Nullable<String>,
+    overwrite: bool,
+    on_missing_rows: &str,
+    on_extra_rows: &str,
+    dry_run: bool,
+) -> Robj {
+    crate::util::throw_on_err(scx_attach_obs_impl(
+        path,
+        df,
+        key,
+        key_columns,
+        key_column,
+        prefix,
+        status_column,
+        uns_key,
+        overwrite,
+        on_missing_rows,
+        on_extra_rows,
+        dry_run,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scx_attach_obs_impl(
+    path: &str,
+    df: Robj,
+    key: Strings,
+    key_columns: Strings,
+    key_column: Nullable<String>,
+    prefix: &str,
+    status_column: Nullable<String>,
+    uns_key: Nullable<String>,
+    overwrite: bool,
+    on_missing_rows: &str,
+    on_extra_rows: &str,
+    dry_run: bool,
+) -> Result<Robj> {
+    use scx_ops::{
+        attach_external_obs, build_composite_key, obs_key_values, resolve_obs_key_column,
+        AttachObsOptions, ExternalObsData, ExtraRowPolicy, MissingRowPolicy, ObsJoinKey,
+    };
+
+    let missing = match on_missing_rows {
+        "zero" => MissingRowPolicy::ZeroFill,
+        "error" => MissingRowPolicy::Error,
+        other => {
+            return Err(Error::Other(format!(
+                "on_missing_rows must be \"zero\" or \"error\"; got \"{other}\""
+            )))
+        }
+    };
+    let extra = match on_extra_rows {
+        "warn" => ExtraRowPolicy::WarnSkip,
+        "error" => ExtraRowPolicy::Error,
+        other => {
+            return Err(Error::Other(format!(
+                "on_extra_rows must be \"warn\" or \"error\"; got \"{other}\""
+            )))
+        }
+    };
+
+    let batch = crate::interop::dataframe_to_record_batch(&df)?;
+    let n_rows = batch.num_rows();
+    if n_rows == 0 {
+        return Err(Error::Other(
+            "the data.frame has no rows; there is nothing to attach".into(),
+        ));
+    }
+
+    let explicit_keys: Vec<String> = key.iter().map(|s| s.to_string()).collect();
+    let key_cols: Vec<String> = key_columns.iter().map(|s| s.to_string()).collect();
+    if !explicit_keys.is_empty() && !key_cols.is_empty() {
+        return Err(Error::Other(
+            "pass either `key` (one value per row) or `key_columns` (columns of \
+             `df` to fuse), not both"
+                .into(),
+        ));
+    }
+
+    // Both sides of the join are built by the same ops-crate helpers the CSV
+    // reader uses, so an R-attached table and an imported CSV cannot disagree
+    // about what a key is. `drop` names the columns of `df` consumed by the
+    // key — decided here rather than re-derived later, so the two can never
+    // disagree about which columns the annotations keep.
+    let (row_keys, join_key, drop): (Vec<String>, ObsJoinKey, Vec<String>) =
+        if !explicit_keys.is_empty() {
+            if explicit_keys.len() != n_rows {
+                return Err(Error::Other(format!(
+                    "`key` has {} values but `df` has {n_rows} rows",
+                    explicit_keys.len()
+                )));
+            }
+            let target = match key_column {
+                Nullable::NotNull(c) => ObsJoinKey::Column(c),
+                Nullable::Null => ObsJoinKey::Auto,
+            };
+            // The keys came from outside `df`, so every column is an annotation.
+            (explicit_keys, target, Vec::new())
+        } else if key_cols.len() > 1 {
+            for c in &key_cols {
+                if batch.schema().field_with_name(c).is_err() {
+                    return Err(Error::Other(format!(
+                        "key column \"{c}\" is not in `df`; columns are {:?}",
+                        column_names(&batch)
+                    )));
+                }
+            }
+            let fused = build_composite_key(&batch, &key_cols).map_err(to_r_err)?;
+            (
+                fused,
+                ObsJoinKey::Composite {
+                    columns: key_cols.clone(),
+                },
+                key_cols.clone(),
+            )
+        } else {
+            // One named column of `df`, or auto-resolve one the same way the
+            // delimited-table reader does.
+            let col = if key_cols.len() == 1 {
+                if batch.schema().field_with_name(&key_cols[0]).is_err() {
+                    return Err(Error::Other(format!(
+                        "key column \"{}\" is not in `df`; columns are {:?}",
+                        key_cols[0],
+                        column_names(&batch)
+                    )));
+                }
+                key_cols[0].clone()
+            } else {
+                resolve_obs_key_column(&batch, None).map_err(to_r_err)?
+            };
+            let values = obs_key_values(&batch, &col).map_err(to_r_err)?;
+            let drop = vec![col.clone()];
+            (values, ObsJoinKey::Column(col), drop)
+        };
+
+    // The key columns are already on the target's obs axis — that is what the
+    // join matched against — so re-importing them would only duplicate them.
+    //
+    // `__index_level_0__` goes with them: `dataframe_to_record_batch`
+    // synthesises it from `rownames(df)`, which in the flagship recipe *is*
+    // the key. Keeping it would collide with the target's own index column on
+    // every attach, and it is the same rule the delimited reader follows for
+    // the pandas index it renames.
+    let mut drop = drop;
+    drop.push("__index_level_0__".to_string());
+    let annotations = drop_columns(&batch, drop, prefix)?;
+
+    let data = ExternalObsData {
+        row_keys,
+        row_annotations: annotations,
+        row_embeddings: Vec::new(),
+        uns: None,
+        source_checksum: None,
+        source_name: Some("<R data.frame>".to_string()),
+    };
+
+    let opts = AttachObsOptions {
+        join_key,
+        missing_row_policy: missing,
+        extra_row_policy: extra,
+        status_column: match status_column {
+            Nullable::NotNull(s) => Some(s),
+            Nullable::Null => None,
+        },
+        uns_key: match uns_key {
+            Nullable::NotNull(s) => Some(s),
+            Nullable::Null => None,
+        },
+        overwrite,
+        provenance_action: "scx_attach_obs".to_string(),
+        dry_run,
+        ..Default::default()
+    };
+
+    let s = attach_external_obs(Path::new(path), &data, &opts).map_err(to_r_err)?;
+
+    Ok(list!(
+        n_obs = s.n_obs as f64,
+        n_matched = s.n_matched as f64,
+        n_target_rows_absent = s.n_target_rows_absent as f64,
+        n_source_rows_absent = s.n_source_rows_absent as f64,
+        obs_key_column = s.obs_key_column,
+        obs_columns_added = s.obs_columns_added,
+        obsm_keys_added = s.obsm_keys_added,
+        obs_index_dropped = s.obs_index_dropped,
+        dry_run = dry_run
+    )
+    .into())
+}
+
+fn column_names(batch: &arrow::array::RecordBatch) -> Vec<String> {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect()
+}
+
+/// `scx_ops::OpsError` carries the key diagnosis in its message, so surfacing
+/// the string verbatim is what makes a duplicate-key failure actionable in R.
+fn to_r_err(e: scx_ops::OpsError) -> Error {
+    Error::Other(e.to_string())
+}
+
+/// Drop the join-key columns and apply `prefix` to what remains.
+fn drop_columns(
+    batch: &arrow::array::RecordBatch,
+    drop: Vec<String>,
+    prefix: &str,
+) -> Result<arrow::array::RecordBatch> {
+    use arrow::datatypes::{Field, Schema};
+    use std::sync::Arc;
+
+    let schema = batch.schema();
+    let mut fields = Vec::new();
+    let mut arrays = Vec::new();
+    for (i, f) in schema.fields().iter().enumerate() {
+        if drop.iter().any(|d| d == f.name()) {
+            continue;
+        }
+        // Nullable regardless: the attach op scatters nulls into every target
+        // row this table does not cover.
+        fields.push(Field::new(
+            format!("{prefix}{}", f.name()),
+            f.data_type().clone(),
+            true,
+        ));
+        arrays.push(Arc::clone(batch.column(i)));
+    }
+    if fields.is_empty() {
+        return Err(Error::Other(
+            "no columns left to attach after removing the key column(s)".into(),
+        ));
+    }
+    arrow::array::RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        .map_err(|e| Error::Other(format!("failed to build annotation columns: {e}")))
+}
+
+// ---------------------------------------------------------------------------
 // Module registration — used by lib.rs extendr_module! via `use ops;`
 // ---------------------------------------------------------------------------
 
@@ -467,4 +747,5 @@ extendr_module! {
     fn scx_merge;
     fn scx_info;
     fn scx_validate;
+    fn scx_attach_obs;
 }
