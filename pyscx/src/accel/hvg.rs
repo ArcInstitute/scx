@@ -570,8 +570,9 @@ fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
 /// `batch_key` (e.g. a per-dataset id) can produce dozens of tiny, singular
 /// batches — emitting one warning each buries the signal under verbatim
 /// copies (user-report F10). Instead we coalesce into one warning that reports
-/// the failed/total count and a representative first failure (index + cell
-/// count + the upstream error string), then lists the remedies. The full
+/// the failed/total count and a representative first failure (index + the
+/// `batch_key` category label + cell count + the upstream error string), then
+/// lists the remedies. The full
 /// per-batch index/size detail is preserved on `adata.uns` by the caller.
 ///
 /// Each failing batch is excluded from the per-batch normalised-variance
@@ -585,17 +586,30 @@ fn emit_hvg_loess_singularity_warning(
     py: Python<'_>,
     failed: &[(usize, usize, String)],
     n_total: usize,
+    batch_key: Option<&str>,
+    batch_labels: Option<&[String]>,
 ) -> PyResult<()> {
     if failed.is_empty() {
         return Ok(());
     }
     let warnings = py.import("warnings")?;
     let (first_idx, first_n, first_err) = &failed[0];
+    // Name the batch, not just its position. `batches` drops empty groups, so
+    // the index is not an index into `batch_key`'s categories and cannot be
+    // looked up by the user (user-report F4). The index is still printed —
+    // it is what `uns["hvg"]["loess_failed_batches"]` is keyed by.
+    let first_detail = match (batch_key, batch_labels) {
+        (Some(bk), Some(labels)) => labels
+            .get(*first_idx)
+            .map(|l| format!("({bk}={l:?}, n={first_n} cells)"))
+            .unwrap_or_else(|| format!("(n={first_n} cells)")),
+        _ => format!("(n={first_n} cells)"),
+    };
     let msg = format!(
         "highly_variable_genes(flavor=\"seurat_v3\"): skmisc.loess fit failed on \
          {n_failed} of {n_total} batches — these batches are excluded from the \
          per-batch HVG ranking; the remaining {n_valid} proceed normally. First \
-         failure: batch index {first_idx} (n={first_n} cells) — {first_err}. \
+         failure: batch index {first_idx} {first_detail} — {first_err}. \
          Common causes: very small batches, near-collinear log-mean / log-variance, \
          or many zero-variance genes within a batch. To avoid this, prefer \
          dropping or coarsening batch_key (a high-cardinality key such as a \
@@ -614,8 +628,10 @@ fn emit_hvg_loess_singularity_warning(
 }
 
 /// Record the per-batch loess-failure detail on
-/// `adata.uns["hvg"]["loess_failed_batches"]` as a list of `[batch_idx, n_cells]`
-/// pairs (the summary UserWarning only names the first failure). Mirrors scanpy
+/// `adata.uns["hvg"]["loess_failed_batches"]` as a list of
+/// `[batch_idx, n_cells, label]` triples — `[batch_idx, n_cells]` pairs when
+/// there is no `batch_key` to label with. (The summary UserWarning names only
+/// the first failure.) Mirrors scanpy
 /// storing HVG metadata under `uns["hvg"]`.
 ///
 /// Called **once per batched seurat_v3 run**, with `failed` possibly empty.
@@ -631,6 +647,7 @@ fn record_hvg_loess_failed_batches(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     failed: &[(usize, usize, String)],
+    batch_labels: Option<&[String]>,
 ) -> PyResult<()> {
     let uns = adata.getattr("uns")?;
     let hvg_dict = match uns.get_item("hvg") {
@@ -643,7 +660,17 @@ fn record_hvg_loess_failed_batches(
     };
     let failed_list = pyo3::types::PyList::empty(py);
     for (idx, n, _err) in failed {
-        failed_list.append(pyo3::types::PyList::new(py, [*idx, *n])?)?;
+        // `[batch_idx, n_cells, label]` — the label is what the user can
+        // actually act on (`batch_idx` indexes the non-empty batch list, not
+        // `batch_key`'s categories). Omitted when there is no `batch_key`,
+        // leaving the historical `[batch_idx, n_cells]` pair.
+        let entry = pyo3::types::PyList::empty(py);
+        entry.append(*idx)?;
+        entry.append(*n)?;
+        if let Some(label) = batch_labels.and_then(|l| l.get(*idx)) {
+            entry.append(label)?;
+        }
+        failed_list.append(entry)?;
     }
     hvg_dict.set_item("loess_failed_batches", failed_list)?;
     uns.set_item("hvg", hvg_dict)?;
@@ -714,6 +741,9 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
     );
 
     // ── 1. Determine batches ────────────────────────────────────────────
+    // Category label per batch, in the same order as `batches`. `None` when
+    // there is no `batch_key` (one implicit batch covering every cell).
+    let mut batch_labels: Option<Vec<String>> = None;
     let batches: Vec<Vec<usize>> = match batch_key {
         Some(bk) => {
             let obs = adata.getattr("obs")?;
@@ -735,7 +765,34 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
                     groups[code as usize].push(i);
                 }
             }
-            groups.into_iter().filter(|g| !g.is_empty()).collect()
+            // Keep each group's category label with it. Empty groups are
+            // dropped below, so a batch's position in `batches` is NOT an
+            // index into `cat.categories` — which is exactly why reporting a
+            // bare index in the loess-failure warning was unactionable
+            // (user-report F4). Carrying the label is the only way to name
+            // the batch afterwards.
+            let labels: Vec<String> = cat
+                .getattr("categories")?
+                .call_method0("tolist")?
+                .extract::<Vec<Bound<'_, PyAny>>>()?
+                .iter()
+                .map(|v| v.str().map(|s| s.to_string_lossy().into_owned()))
+                .collect::<PyResult<Vec<String>>>()?;
+            let kept: Vec<(String, Vec<usize>)> = groups
+                .into_iter()
+                .enumerate()
+                .filter(|(_, g)| !g.is_empty())
+                .map(|(i, g)| {
+                    let label = labels
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("<code {i}>"));
+                    (label, g)
+                })
+                .collect();
+            let (labels, groups): (Vec<String>, Vec<Vec<usize>>) = kept.into_iter().unzip();
+            batch_labels = Some(labels);
+            groups
         }
         None => vec![(0..n_obs).collect()],
     };
@@ -905,9 +962,15 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
     // than clobbers) any pre-existing uns["hvg"]. The summary warning stays
     // guarded by a non-empty list, and is emitted before the all-failed check
     // below so the diagnostic survives even that error.
-    record_hvg_loess_failed_batches(py, adata, &loess_failed)?;
+    record_hvg_loess_failed_batches(py, adata, &loess_failed, batch_labels.as_deref())?;
     if !loess_failed.is_empty() {
-        emit_hvg_loess_singularity_warning(py, &loess_failed, n_batches_actual)?;
+        emit_hvg_loess_singularity_warning(
+            py,
+            &loess_failed,
+            n_batches_actual,
+            batch_key,
+            batch_labels.as_deref(),
+        )?;
     }
 
     // Surviving batches (per-batch loess fit succeeded). If all batches

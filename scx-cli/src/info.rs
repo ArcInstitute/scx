@@ -281,10 +281,25 @@ fn render_text(model: &InfoModel) -> CliResult<()> {
     // for exploded directories, which have no single file and no orphans.
     if let Some(orphaned) = model.orphaned {
         if orphaned > 0 {
-            println!(
-                "Orphaned bytes: ~{} (run 'scx compact' to reclaim)",
-                human_size(orphaned)
-            );
+            // The count is always reported; the `scx compact` hint is not.
+            // Sections are 8-byte aligned, so every file carries a few bytes
+            // of inter-section padding that compaction cannot reclaim —
+            // ~152 B on a freshly converted 864 MB file. Printing a
+            // remediation next to that reads as "your brand-new file is
+            // already degraded" and trains users to ignore the line
+            // (user-report E3). Suggest compaction only when it would
+            // actually recover something: at least 64 KiB, and at least 1%
+            // of the file.
+            let worth_compacting =
+                orphaned >= 64 * 1024 && orphaned.saturating_mul(100) >= model.file_size;
+            if worth_compacting {
+                println!(
+                    "Orphaned bytes: ~{} (run 'scx compact' to reclaim)",
+                    human_size(orphaned)
+                );
+            } else {
+                println!("Orphaned bytes: ~{}", human_size(orphaned));
+            }
         }
     }
 

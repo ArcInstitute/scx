@@ -448,6 +448,23 @@ class Experiment:
         without materializing X. `columns=None` reads the full obs table."""
         ...
 
+    def read_var(
+        self, columns: list[str] | None = ..., *, modality: str | None = ...
+    ) -> Any:
+        """Read var as a pandas DataFrame, without materializing X.
+
+        The var-axis mirror of `read_obs`. Unlike `read_obs`, `columns` is a
+        convenience projection applied after the decode rather than pushed
+        into the reader: `var` is sized by `n_vars` (a few MB even on an
+        atlas), so there is nothing to save at the I/O layer. The pandas index
+        column (gene names) is always retained; an unknown column raises
+        `KeyError` naming what is available.
+
+        On a multimodal file pass `modality=<name>` for that modality's var;
+        omitting it reads the global/single-modality var. Unknown name →
+        `KeyError`."""
+        ...
+
     def distinct_values(
         self, col: str, *, limit: int | None = ..., sort: bool = ...
     ) -> tuple[list[str], bool]:

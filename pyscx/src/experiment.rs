@@ -78,6 +78,49 @@ impl PyExperiment {
     }
 }
 
+/// Project a decoded batch down to `cols`, keeping the pandas index column(s).
+///
+/// The index columns are retained for the same reason `read_obs`'s pushed-down
+/// projection retains them: dropping them loses the frame's index, and the
+/// schema's pandas envelope still advertises an `index_columns` entry that
+/// pyarrow would then fail to resolve.
+///
+/// An unknown column name is a `KeyError` naming what is available, rather
+/// than a silently narrower frame.
+fn project_batch_columns(
+    batch: &arrow::record_batch::RecordBatch,
+    cols: &[String],
+) -> PyResult<arrow::record_batch::RecordBatch> {
+    let schema = batch.schema();
+    let mut indices: Vec<usize> = Vec::new();
+    for idx_col in scx_format_io::pandas_index_columns(&schema) {
+        if let Ok(i) = schema.index_of(&idx_col) {
+            if !cols.contains(&idx_col) {
+                indices.push(i);
+            }
+        }
+    }
+    for name in cols {
+        let i = schema.index_of(name).map_err(|_| {
+            let available = schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            pyo3::exceptions::PyKeyError::new_err(format!(
+                "column '{name}' not found; available columns: {available}"
+            ))
+        })?;
+        if !indices.contains(&i) {
+            indices.push(i);
+        }
+    }
+    batch.project(&indices).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("column projection failed: {e}"))
+    })
+}
+
 /// Phase 5b: open a fresh `BackedCsrReader` for the requested modality
 /// from a file path. `modality = None` → modality_id 0 (the unimodal /
 /// global X) on non-multimodal files; on multimodal files we require an
@@ -531,6 +574,45 @@ impl PyExperiment {
                 None => self.reader.read_obs(),
             })
             .map_err(to_pyerr)?;
+        let table = convert::record_batch_to_pyarrow(py, &batch)?;
+        convert::pyarrow_table_to_pandas(&table)
+    }
+
+    /// Read the `var` (gene metadata) table as a pandas DataFrame **without
+    /// touching X** — the var-axis mirror of [`read_obs`](Self::read_obs).
+    ///
+    /// `columns` selects a subset by **physical** column name (matching
+    /// `var_keys()`); the pandas index column (gene names) is always retained,
+    /// so a projected frame keeps the same index as the unprojected
+    /// `read_var()`.
+    ///
+    /// Unlike `read_obs`, the projection is applied **after** the decode
+    /// rather than pushed into the reader. `var` is one section sized by
+    /// `n_vars` (a few MB even on an atlas — 5.5 MB for a 61k-gene Census
+    /// file), where `obs` scales with `n_obs` and is worth projecting at the
+    /// I/O layer. So `columns` here is a convenience, not a memory
+    /// optimisation; it does not read less off disk.
+    ///
+    /// On a multimodal file pass `modality=<name>` to read that modality's
+    /// `var`. Omitting it reads the global / single-modality `var`, which on a
+    /// multimodal file is not what you usually want — each modality has its
+    /// own gene axis.
+    #[pyo3(signature = (columns=None, *, modality=None))]
+    fn read_var<'py>(
+        &self,
+        py: Python<'py>,
+        columns: Option<Vec<String>>,
+        modality: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let modality_id = self.resolve_uns_modality(modality)?;
+        // Decode off the GIL; only the pyarrow/pandas conversion needs Python.
+        let batch = py
+            .detach(|| self.reader.read_var_for(modality_id))
+            .map_err(to_pyerr)?;
+        let batch = match columns {
+            None => batch,
+            Some(cols) => project_batch_columns(&batch, &cols)?,
+        };
         let table = convert::record_batch_to_pyarrow(py, &batch)?;
         convert::pyarrow_table_to_pandas(&table)
     }
