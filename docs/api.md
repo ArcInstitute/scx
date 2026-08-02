@@ -1813,6 +1813,7 @@ pyscx registers SCX handles with three private anndata `singledispatch` hooks to
 **Accelerators on a view.** Handing that view straight to an accelerator also works: any `pyscx.accel.*` op that writes results back **rebuilds the view in place as a regular `AnnData` before it starts**, keeping `X` lazy, and emits an `ImplicitModificationWarning` saying so. Nothing is copied — the point of the rebuild is to avoid the copy. Two consequences to know about:
 
 - The object you passed in stops tracking its parent (`adata.is_view` becomes `False`), and the results land on it, not on the parent. That is the same end state anndata's own copy-on-write reaches; the difference is that copy-on-write gets there by calling `.copy()`, which **materializes** a backed `X`. On a 500k × 3k gene subset that was a 1.8 GB → 10.3 GB jump.
+- The rebuild happens on **entry**, before the op runs, so it is not conditional on the op succeeding: if the call then raises, `is_view` has still flipped to `False`. The rebuild has to precede the first write, and by then it is too late to know whether the op will finish.
 - `pyscx.accel.subset_var` / `subset_obs` avoid the transition entirely — they subset in place and never produce a view. Prefer them in a pipeline you intend to keep out-of-core.
 
 The rebuild is declined, and anndata's copy-on-write left to do its normal job, when `X` is a plain scipy/dense matrix (there is no lazy handle to protect). One carve-out: a view whose index is not expressible as a window — a duplicated or descending selection such as `adata[[2, 2, 7]]` — already holds a materialized `X`, so the rebuild installs scipy. The op still succeeds; it just is not out-of-core any more.
@@ -1822,7 +1823,9 @@ The rebuild is declined, and anndata's copy-on-write left to do its normal job, 
 Every `pyscx.accel.*` call records the execution route it actually took on `adata.uns["scx_accel"][<op>]`. `rank_genes_groups` additionally copies the route string to `adata.uns["rank_genes_groups"]["scx_accel_route"]`.
 
 > [!IMPORTANT]
-> **`adata.uns["scx_accel"][<op>]` is present if and only if that op completed.** An op that raises leaves no entry, so the key's presence is a usable "this ran" signal and not merely "this was attempted". If an earlier run of the same op had recorded an entry, a later failing run **restores that earlier entry unchanged** rather than deleting it — a bad re-run cannot erase a good stamp. A failing *first* accel op does not create `uns["scx_accel"]` at all.
+> **Once a call returns, `adata.uns["scx_accel"][<op>]` is present if and only if that op completed.** An op that raises leaves no entry, so the key's presence is a usable "this ran" signal and not merely "this was attempted". If an earlier run of the same op had recorded an entry, a later failing run **restores that earlier entry unchanged** rather than deleting it — a bad re-run cannot erase a good stamp. A failing *first* accel op does not create `uns["scx_accel"]` at all.
+>
+> The "once a call returns" qualifier is real but narrow: thirteen ops stamp their route *before* dispatch, so the route is inspectable while a long backed run is still in flight, and the rollback happens as the call unwinds. Anything that reads `uns["scx_accel"]` from another thread, or from a debugger paused mid-call, can therefore see a stamp for an op that has not finished yet.
 >
 > There is deliberately no `status` / `success` field: absence *is* the failure signal, and adding one would mean every consumer had to check it to avoid trusting a stamp from a crashed op.
 

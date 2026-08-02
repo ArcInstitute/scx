@@ -1124,6 +1124,11 @@ pub fn perturbation_metrics<'py>(
     // Rebuild an AnnData view as actual before the route stamp / result
     // writes below, so a backed X is not gathered by anndata's
     // copy-on-write. Gene-order agnostic, so no var-order guard.
+    //
+    // `adata_pred` only: it is the one this op writes to (the stamp and, for
+    // the ops that have one, the result column). If a future change starts
+    // writing into `adata_real`, that argument needs the same call or a view
+    // handed in as `adata_real` will silently gather.
     super::prepare_target_no_var_guard(py, adata_pred, "perturbation_metrics")?;
     // Phase 2 GPU dispatch: the pseudobulk aggregation runs on the GPU (mirrors
     // pdex_nb_glm's skeleton); the five bulk metrics run on the host. `auto` on a
@@ -1523,6 +1528,10 @@ pub fn energy_distance<'py>(
     let result = run_energy_distance(
         py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype, &gpu_dev,
     )?;
+    // Stamped after the compute, so there is nothing to roll back — a raise
+    // above never reaches this line. If this ever moves to a pre-dispatch
+    // stamp (as the thirteen progress-reporting ops did), it must switch to
+    // `RouteStamp::write` or it will leave a stamp behind on failure.
     super::route::write_accel_route(py, adata_pred, "energy_distance", &info)?;
     Ok(result.correlation)
 }

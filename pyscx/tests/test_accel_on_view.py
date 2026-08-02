@@ -108,6 +108,30 @@ def _backed(path):
     return pyscx.open(str(path)).to_anndata(backed=True)
 
 
+def _with_pca(op):
+    """Run `op` on a view after seeding `X_pca` — for the obsm consumers.
+
+    PCA is itself in the parametrize list, so it is already covered; here it is
+    only setup, and it runs on the *view* so the op under test still receives a
+    view (PCA de-views it, which is the point — the op must cope either way).
+    """
+
+    def run(adata):
+        pyscx.accel.pca(adata, n_comps=5, device="cpu")
+        return op(adata)
+
+    return run
+
+
+def _with_neighbors(op):
+    def run(adata):
+        pyscx.accel.pca(adata, n_comps=5, device="cpu")
+        pyscx.accel.neighbors(adata, n_neighbors=5, use_rep="X_pca", device="cpu")
+        return op(adata)
+
+    return run
+
+
 def _hvg_view(path, n_top_genes=10):
     """The exact dogfood repro shape: backed → HVG → gene-subset view.
 
@@ -233,6 +257,29 @@ def test_second_op_on_the_same_view_still_works(scx_path):
         ),
         pytest.param(lambda a: pyscx.accel.filter_genes(a, min_cells=1), id="filter_genes"),
         pytest.param(lambda a: pyscx.accel.filter_cells(a, min_genes=1), id="filter_cells"),
+        pytest.param(
+            lambda a: pyscx.accel.score_genes(a, gene_list=["g0", "g2", "g4"], device="cpu"),
+            id="score_genes",
+        ),
+        pytest.param(lambda a: pyscx.accel.pflog(a, n_components=5), id="pflog"),
+        pytest.param(
+            lambda a: pyscx.accel.pseudobulk_means(a, "pert"), id="pseudobulk_means"
+        ),
+        # obsm consumers: seed X_pca first, then run the op that reads it.
+        pytest.param(_with_pca(lambda a: pyscx.accel.neighbors(a, n_neighbors=5, device="cpu")),
+                     id="neighbors"),
+        pytest.param(_with_neighbors(lambda a: pyscx.accel.umap(a, device="cpu")), id="umap"),
+        pytest.param(_with_neighbors(lambda a: pyscx.accel.leiden(a, device="cpu")), id="leiden"),
+        pytest.param(
+            _with_pca(lambda a: pyscx.accel.harmony_integrate(a, "donor")),
+            id="harmony_integrate",
+        ),
+        pytest.param(
+            _with_neighbors(
+                lambda a: pyscx.accel.compute_lisi(a, key="donor", perplexity=5.0)
+            ),
+            id="compute_lisi",
+        ),
     ],
 )
 @pytest.mark.parametrize("axis", ["var", "obs"])
@@ -240,7 +287,10 @@ def test_write_back_ops_accept_a_view_without_gathering(scx_path, op, axis):
     """Locks the prologue's coverage list.
 
     An op missing the prologue shows up here either as a raise or as an X that
-    stopped being an SCX handle.
+    stopped being an SCX handle. `compute_lisi` is in this list because it was
+    the one write-back op the first cut of the prologue missed — it *returns*
+    the LISI vector, which reads as a pure function, but also writes
+    `obs["lisi_<key>"]`.
     """
     adata = _backed(scx_path)
     view = adata[:, COL_KEEP] if axis == "var" else adata[ROW_KEEP]
@@ -267,13 +317,18 @@ def test_composed_row_and_col_view(scx_path, counts, obs_cols, var_names):
 
 
 def test_deview_emits_implicit_modification_warning(scx_path):
+    """The notice is one-shot *per op, per process*.
+
+    So this must use an op no other test in this file de-views, or it passes or
+    fails on collection order. `pca_neighbors` is the only write-back op used
+    nowhere else here — do not add it to the parametrize list above.
+    """
     import anndata as ad
 
-    # One-shot per op process-wide, so use an op the other tests don't de-view.
     adata = _backed(scx_path)
     view = adata[:, COL_KEEP]
     with pytest.warns(ad.ImplicitModificationWarning, match="No data was copied"):
-        pyscx.accel.score_genes(view, gene_list=["g0", "g2", "g4"], device="cpu")
+        pyscx.accel.pca_neighbors(view, n_comps=5, n_neighbors=5, device="cpu")
 
 
 # --------------------------------------------------------------------------

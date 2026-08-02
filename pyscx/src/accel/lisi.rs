@@ -97,6 +97,12 @@ pub fn compute_lisi<'py>(
         return Err(PyValueError::new_err("perplexity must be > 0"));
     }
 
+    // Returns the LISI vector *and* writes it to `adata.obs[f"lisi_{key}"]`
+    // below, which makes this a write-back op: on a view that `obs` write goes
+    // through anndata's copy-on-write and gathers a backed `X`. No var-order
+    // guard — this op reads `obsm` and never touches the gene axis.
+    super::prepare_target_no_var_guard(py, adata, "compute_lisi")?;
+
     // --- Embeddings (N x d, f32 row-major) ---
     let obsm = adata.getattr("obsm")?;
     let emb_obj = obsm.get_item(basis).map_err(|_| {
