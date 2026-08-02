@@ -25,6 +25,14 @@ mod hdf_dtype;
 #[cfg(feature = "hdf5")]
 mod tenx_read;
 
+// Ungated: a delimited-table reader must not require libhdf5, or `scx
+// obs-import` would be unavailable in a no-hdf5 build.
+mod annotation_table;
+pub use annotation_table::{read_annotation_table, AnnotationTableInfo, AnnotationTableOptions};
+
+// Shared by the gated cellbender reader and the ungated table reader.
+mod file_checksum;
+
 #[cfg(feature = "hdf5")]
 mod cellbender;
 #[cfg(feature = "hdf5")]

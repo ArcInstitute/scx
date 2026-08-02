@@ -97,6 +97,7 @@ const DIAGNOSIS_MAX_PAIRS: usize = 3;
 /// Externally-computed per-cell annotations, keyed by string.
 ///
 /// The obs-only sibling of `ExternalLayerData`: no matrix, no column axis.
+#[derive(Debug, Clone)]
 pub struct ExternalObsData {
     /// One key per source row. `len == row_annotations.num_rows()`.
     ///
@@ -326,6 +327,25 @@ pub fn build_composite_key(batch: &RecordBatch, columns: &[String]) -> Result<Ve
         out.push(key);
     }
     Ok(out)
+}
+
+/// Resolve an obs-style join-key column with the same preference order the
+/// attach ops use: the pandas index column, then `OBS_KEY_FALLBACKS`.
+///
+/// Exported for readers that build the **source** side of a join (e.g.
+/// `scx_convert::read_annotation_table`). Both sides must resolve keys
+/// identically — if a reader picked `barcode` while the op picked `_index`, a
+/// file that should have joined would fail with zero overlap and no obvious
+/// cause.
+pub fn resolve_obs_key_column(batch: &RecordBatch, requested: Option<&str>) -> Result<String> {
+    resolve_key_column("obs", batch, requested)
+}
+
+/// Materialize a column as owned `String`s, resolving dictionaries. Exported
+/// alongside [`resolve_obs_key_column`] so a reader can build single-column
+/// keys the same way the op does.
+pub fn obs_key_values(batch: &RecordBatch, column: &str) -> Result<Vec<String>> {
+    string_column(batch, column)
 }
 
 /// Resolve the target-side keys for `join_key`, returning `(spec, keys)`.

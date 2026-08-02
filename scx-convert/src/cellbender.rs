@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use scx_ops::ExternalLayerData;
 
+use crate::file_checksum::blake3_of_file;
 use crate::h5ad::read::{read_f32_dataset, read_i64_dataset, read_string_dataset};
 use crate::pipeline::ConvertError;
 use crate::warnings::{ConvertWarning, WarningSink};
@@ -778,21 +779,6 @@ fn build_uns(
         "global_latents": global,
         "metadata": metadata,
     })
-}
-
-fn blake3_of_file(path: &Path) -> std::io::Result<[u8; 32]> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 1 << 16];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]
