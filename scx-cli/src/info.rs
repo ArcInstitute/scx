@@ -5,6 +5,14 @@ use std::path::Path;
 use crate::format::human_size;
 use scx_codec::{CodecId, ValueEncoding};
 
+use scx_format_io::catalog::FullCatalog;
+use scx_format_io::deletion_vectors::DeletionVectors;
+use scx_format_io::header::FileHeader;
+use scx_format_io::modality::{ModalityTable, ModalityType};
+use scx_format_io::provenance::Provenance;
+use scx_format_io::reader::ScxReader;
+use scx_format_io::section::SectionType;
+
 /// Whether `scx info` should suggest `scx compact` for this much dead space.
 ///
 /// Sections are 8-byte aligned, so every file carries a little inter-section
@@ -66,13 +74,6 @@ mod worth_compacting_tests {
         assert!(worth_compacting(u64::MAX, u64::MAX));
     }
 }
-use scx_format_io::catalog::FullCatalog;
-use scx_format_io::deletion_vectors::DeletionVectors;
-use scx_format_io::header::FileHeader;
-use scx_format_io::modality::{ModalityTable, ModalityType};
-use scx_format_io::provenance::Provenance;
-use scx_format_io::reader::ScxReader;
-use scx_format_io::section::SectionType;
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 

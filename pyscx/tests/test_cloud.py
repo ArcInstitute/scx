@@ -1046,16 +1046,18 @@ class TestCloudReadVar:
             exploded = os.path.join(tmpdir, "mm.scxd")
             pyscx.explode(scx_path, exploded)
 
-            ce = pyscx.open_cloud(exploded)
-            rna = ce.read_var(modality="rna")
-            adt = ce.read_var(modality="adt")
-            assert len(rna) == 12
-            assert len(adt) == 4
-            assert list(rna.index) == [f"g{i}" for i in range(12)]
+            # Both layouts, since the comment above claims both.
+            for source in (exploded, scx_path):
+                ce = pyscx.open_cloud(source)
+                rna = ce.read_var(modality="rna")
+                adt = ce.read_var(modality="adt")
+                assert len(rna) == 12, source
+                assert len(adt) == 4, source
+                assert list(rna.index) == [f"g{i}" for i in range(12)], source
 
-            # Agrees with the local reader on the same file.
-            local_rna = pyscx.open(scx_path).read_var(modality="rna")
-            assert list(local_rna.index) == list(rna.index)
+                # Agrees with the local reader on the same file.
+                local_rna = pyscx.open(scx_path).read_var(modality="rna")
+                assert list(local_rna.index) == list(rna.index), source
 
-            with pytest.raises(KeyError, match="unknown modality"):
-                ce.read_var(modality="atac")
+                with pytest.raises(KeyError, match="unknown modality"):
+                    ce.read_var(modality="atac")

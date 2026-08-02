@@ -63,8 +63,8 @@ impl PyExperiment {
         ))
     }
 
-    /// Resolve the optional `modality` kwarg shared by `uns_keys` and
-    /// `read_uns` to a `modality_id`. `None` → 0 (global uns). A name
+    /// Resolve the optional `modality` kwarg shared by `uns_keys`,
+    /// `read_uns` and `read_var` to a `modality_id`. `None` → 0 (global uns). A name
     /// that does not appear in the modality table raises `KeyError`,
     /// which also covers the "named modality on a non-multimodal file"
     /// case (the modality table is empty there).

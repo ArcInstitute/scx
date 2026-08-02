@@ -73,8 +73,13 @@ def test_read_var_columns_preserves_requested_order(scx_path):
 
 def test_read_var_unknown_column_names_what_is_available(scx_path):
     """A bare pyarrow KeyError would not say what the user could have asked for."""
-    with pytest.raises(KeyError, match="feature_name"):
+    with pytest.raises(KeyError) as excinfo:
         pyscx.open(str(scx_path)).read_var(columns=["not_a_column"])
+    msg = str(excinfo.value)
+    assert "feature_name" in msg
+    # The pandas index column is retained automatically and is often an
+    # internal name, so suggesting it would be noise.
+    assert "__index_level_0__" not in msg
 
 
 def test_read_var_agrees_with_var_keys(scx_path):

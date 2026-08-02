@@ -281,7 +281,8 @@ impl PyCloudExperiment {
     /// `read_uns` to a `modality_id`. `None` → 0 (global uns). A name that
     /// does not appear in the cached modality table raises `KeyError`, which
     /// also covers the "named modality on a non-multimodal file" case (the
-    /// table is `None` there). Mirrors `PyExperiment::resolve_uns_modality`.
+    /// table is `None` there). Shared by `uns_keys` / `read_uns` / `read_var`.
+    /// Mirrors `PyExperiment::resolve_uns_modality`.
     fn resolve_uns_modality(&self, modality: Option<&str>) -> PyResult<u8> {
         match modality {
             None => Ok(0),
