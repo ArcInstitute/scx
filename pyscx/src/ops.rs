@@ -1761,7 +1761,8 @@ fn key_diagnosis_dict<'py>(
 #[pyo3(signature = (
     path, table, *, key=None, columns=None, rename=None, prefix="",
     keep_key_columns=false, delimiter=None, status_column=None, uns_key=None,
-    overwrite=false, on_missing_rows="zero", on_extra_rows="warn", dry_run=false
+    uns_keys=None, overwrite=false, on_missing_rows="zero", on_extra_rows="warn",
+    dry_run=false
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn obs_import(
@@ -1776,11 +1777,13 @@ pub fn obs_import(
     delimiter: Option<&str>,
     status_column: Option<&str>,
     uns_key: Option<&str>,
+    uns_keys: Option<Vec<String>>,
     overwrite: bool,
     on_missing_rows: &str,
     on_extra_rows: &str,
     dry_run: bool,
 ) -> PyResult<Py<PyDict>> {
+    let uns_keys = uns_keys.unwrap_or_default();
     let delimiter_byte = match delimiter {
         None => None,
         Some(s) => {
@@ -1823,8 +1826,8 @@ pub fn obs_import(
     // Both halves return `OpsError`, so one mapping covers read-then-attach —
     // a malformed CSV surfaces as a clean `ValueError`, not a panic.
     let (summary, info, diagnosis) = py.detach(|| -> PyResult<_> {
-        let (data, info) =
-            scx_convert::read_annotation_table(&table_path, &read_opts).map_err(ops_to_pyerr)?;
+        let (data, info) = scx_convert::read_obs_source(&table_path, &read_opts, &uns_keys)
+            .map_err(ops_to_pyerr)?;
         let summary =
             scx_ops::attach_external_obs(&scx_path, &data, &attach_opts).map_err(ops_to_pyerr)?;
         // Only on a dry run: the diagnosis costs a pass per obs column, which
@@ -1839,7 +1842,9 @@ pub fn obs_import(
 
     let d = PyDict::new(py);
     d.set_item("n_rows_in_source", info.n_rows)?;
-    d.set_item("delimiter", (info.delimiter as char).to_string())?;
+    d.set_item("format", info.format.as_str())?;
+    d.set_item("delimiter", info.delimiter.map(|b| (b as char).to_string()))?;
+    d.set_item("uns_keys_imported", info.uns_keys_imported)?;
     d.set_item("renamed_index_column", info.renamed_index_column)?;
     d.set_item("source_key_columns", info.key_columns)?;
     d.set_item("columns_in_source", info.columns_imported)?;
@@ -1886,8 +1891,8 @@ pub fn obs_import(
 #[pyo3(signature = (
     path, table, *, tool, key=None, key_added=None, score_column=None,
     call_column=None, call_true=None, call_false=None, keep_native_columns=true,
-    delimiter=None, overwrite=false, on_missing_rows="zero", on_extra_rows="warn",
-    dry_run=false
+    delimiter=None, uns_keys=None, overwrite=false, on_missing_rows="zero",
+    on_extra_rows="warn", dry_run=false
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn doublet_import(
@@ -1903,6 +1908,7 @@ pub fn doublet_import(
     call_false: Option<&str>,
     keep_native_columns: bool,
     delimiter: Option<&str>,
+    uns_keys: Option<Vec<String>>,
     overwrite: bool,
     on_missing_rows: &str,
     on_extra_rows: &str,
@@ -1941,6 +1947,7 @@ pub fn doublet_import(
         keep_native_columns,
         key_columns,
         delimiter: delimiter_byte,
+        uns_keys: uns_keys.unwrap_or_default(),
     };
     let attach_opts = scx_ops::AttachObsOptions {
         join_key,
@@ -1982,7 +1989,12 @@ pub fn doublet_import(
     d.set_item("native_columns", info.native_columns)?;
     d.set_item("dropped_alias_columns", info.dropped_alias_columns)?;
     d.set_item("n_rows_in_source", info.table.n_rows)?;
-    d.set_item("delimiter", (info.table.delimiter as char).to_string())?;
+    d.set_item("format", info.table.format.as_str())?;
+    d.set_item(
+        "delimiter",
+        info.table.delimiter.map(|b| (b as char).to_string()),
+    )?;
+    d.set_item("uns_keys_imported", info.table.uns_keys_imported)?;
     d.set_item("renamed_index_column", info.table.renamed_index_column)?;
     d.set_item("source_key_columns", info.table.key_columns)?;
     d.set_item("dry_run", dry_run)?;

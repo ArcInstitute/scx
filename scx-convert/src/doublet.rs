@@ -1,4 +1,4 @@
-//! Doublet-caller wrapper over [`crate::read_annotation_table`].
+//! Doublet-caller wrapper over [`crate::read_obs_source`].
 //!
 //! Every popular doublet caller emits a continuous score and a binary call, and
 //! every one of them names those two things differently. This module is the one
@@ -24,7 +24,16 @@
 //! it dispatches on the array's **runtime** type rather than on the profile, so
 //! it does not depend on which type arrow's inference happened to pick. That
 //! matters: `True`/`False` from `obs.to_csv()` infers as `Boolean`, but the same
-//! column with one `NA` in it may not.
+//! column with one `NA` in it may not — and from an h5ad the same values arrive
+//! as an integer or, for a pandas Categorical, dictionary-encoded.
+//!
+//! # Two source formats, one derivation
+//!
+//! The source is read through [`crate::read_obs_source`], so a delimited table
+//! and an h5ad's `/obs` reach the code below identically. That is the point: a
+//! tool that writes its calls back into the h5ad needs no CSV detour, and the
+//! two routes cannot drift into producing different answers from the same
+//! values.
 //!
 //! # What it refuses to guess
 //!
@@ -49,7 +58,7 @@ use serde_json::json;
 
 use scx_ops::{ExternalObsData, OpsError, Result};
 
-use crate::annotation_table::{read_annotation_table, AnnotationTableInfo, AnnotationTableOptions};
+use crate::annotation_table::{read_obs_source, AnnotationTableInfo, AnnotationTableOptions};
 
 // ---------------------------------------------------------------------------
 // Profiles
@@ -226,6 +235,10 @@ pub struct DoubletImportOptions {
     /// Join key column(s) in the source table. Empty auto-resolves.
     pub key_columns: Vec<String>,
     pub delimiter: Option<u8>,
+    /// `/uns` keys to carry across from an h5ad source, nested under the
+    /// wrapper's own record as `uns["<K>"]["source_uns"]`. Empty imports none;
+    /// meaningless for a delimited table, which carries no uns.
+    pub uns_keys: Vec<String>,
 }
 
 impl Default for DoubletImportOptions {
@@ -240,6 +253,7 @@ impl Default for DoubletImportOptions {
             keep_native_columns: true,
             key_columns: Vec::new(),
             delimiter: None,
+            uns_keys: Vec::new(),
         }
     }
 }
@@ -346,12 +360,31 @@ fn resolve_column(
 // Value derivation
 // ---------------------------------------------------------------------------
 
+/// Decode a dictionary-encoded column to its plain value array.
+///
+/// A pandas Categorical arrives from an h5ad's `obs` as
+/// `Dictionary(Int32, Utf8)` — and a class / prediction column is exactly the
+/// kind pandas stores that way. The derivation has to see through the encoding
+/// rather than reject it, or the same values would import from a CSV and fail
+/// from an h5ad. Non-dictionary columns pass through untouched.
+fn undictionary(col: &ArrayRef, name: &str, role: &str) -> Result<ArrayRef> {
+    match col.data_type() {
+        DataType::Dictionary(_, value) => arrow::compute::cast(col.as_ref(), value).map_err(|e| {
+            OpsError::InvalidInput(format!(
+                "could not decode categorical {role} column '{name}' to {value:?}: {e}"
+            ))
+        }),
+        _ => Ok(Arc::clone(col)),
+    }
+}
+
 /// Narrow a score column to the canonical `f32`.
 ///
 /// A non-numeric column is rejected rather than cast: `Utf8` → `Float32` would
 /// succeed and null every row, which reads downstream as "the tool covered no
 /// cells" rather than "you pointed at the wrong column".
 fn coerce_score(col: &ArrayRef, name: &str) -> Result<ArrayRef> {
+    let col = &undictionary(col, name, "score")?;
     if !col.data_type().is_numeric() {
         return Err(OpsError::InvalidInput(format!(
             "score column '{name}' has type {:?}, which is not numeric. A text score \
@@ -369,8 +402,9 @@ fn coerce_score(col: &ArrayRef, name: &str) -> Result<ArrayRef> {
 ///
 /// Dispatches on the array's runtime type, not on the profile, so the same
 /// profile works whether arrow inferred `Boolean`, an integer, or `Utf8` for
-/// the column. Nulls stay null throughout: a cell the tool did not call is not
-/// a singlet.
+/// the column — and, after [`undictionary`], whether the source stored it as a
+/// pandas Categorical. Nulls stay null throughout: a cell the tool did not call
+/// is not a singlet.
 fn coerce_call(
     col: &ArrayRef,
     name: &str,
@@ -378,6 +412,7 @@ fn coerce_call(
     true_override: Option<&str>,
     false_override: Option<&str>,
 ) -> Result<ArrayRef> {
+    let col = &undictionary(col, name, "call")?;
     match col.data_type() {
         DataType::Boolean => Ok(Arc::clone(col)),
 
@@ -491,25 +526,14 @@ pub fn read_doublet_table(
         opts.key_added.clone()
     };
 
-    // Phase 5 owns the h5ad obs reader. Refusing here rather than in each
-    // surface means the CLI and Python get the same message from one place.
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext = ext.to_ascii_lowercase();
-        if ext == "h5ad" || ext == "h5mu" || ext == "h5" {
-            return Err(OpsError::InvalidInput(format!(
-                "'{}' is an HDF5 file; reading a doublet call directly out of an h5ad's \
-                 obs is not implemented yet. Write the columns to a table first, e.g. \
-                 `adata.obs[[\"doublet_score\", \"predicted_doublet\"]].to_csv(\"calls.csv\")`, \
-                 and import that.",
-                path.display()
-            )));
-        }
-    }
-
     // Read everything raw: no selection, no rename, no prefix. Resolving the
     // profile's columns against the parsed batch (rather than teaching the
     // reader about profiles) means prefix matching sees the real schema.
-    let (mut data, table_info) = read_annotation_table(
+    //
+    // Via `read_obs_source`, so a delimited table and an h5ad's /obs both reach
+    // the same derivation — a tool that writes its calls back into the h5ad
+    // needs no CSV detour.
+    let (mut data, table_info) = read_obs_source(
         path,
         &AnnotationTableOptions {
             key_columns: opts.key_columns.clone(),
@@ -520,7 +544,11 @@ pub fn read_doublet_table(
             keep_key_columns: false,
             infer_max_records: None,
         },
+        &opts.uns_keys,
     )?;
+    // Whatever the source reader put in `uns` is the tool's own metadata; the
+    // wrapper's record is built below and must not silently replace it.
+    let source_uns = data.uns.take();
 
     let batch = &data.row_annotations;
 
@@ -607,15 +635,23 @@ pub fn read_doublet_table(
     data.row_annotations = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| OpsError::InvalidInput(format!("failed to build doublet columns: {e}")))?;
 
-    data.uns = Some(json!({
+    let mut record = json!({
         "tool": profile.name,
         "key_added": key_added,
         "source_file": data.source_name,
+        "source_format": table_info.format.as_str(),
         "source_score_column": score_source,
         "source_call_column": call_source,
         "n_rows_in_source": table_info.n_rows,
         "join_key_columns": table_info.key_columns,
-    }));
+    });
+    // Nested rather than merged: the tool's own uns keys keep their source
+    // names, and none of them can collide with the fields above however the
+    // caller spelled `key_added`.
+    if let Some(src) = source_uns {
+        record["source_uns"] = src;
+    }
+    data.uns = Some(record);
 
     let info = DoubletTableInfo {
         tool: profile.name.to_string(),

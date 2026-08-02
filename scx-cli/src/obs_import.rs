@@ -60,6 +60,7 @@ pub fn run_obs_import(
     delimiter: Option<&str>,
     status_column: Option<&str>,
     uns_key: Option<&str>,
+    uns_keys: &[String],
     overwrite: bool,
     on_missing_rows: &str,
     on_extra_rows: &str,
@@ -125,12 +126,16 @@ pub fn run_obs_import(
         ..Default::default()
     };
 
-    let (data, info) = scx_convert::read_annotation_table(table, &read_opts)?;
+    let (data, info) = scx_convert::read_obs_source(table, &read_opts, uns_keys)?;
     println!(
-        "Table: {} ({} rows, delimiter {:?}, key {:?}{})",
+        "Source: {} ({}, {} rows{}, key {:?}{})",
         table.display(),
+        info.format.as_str(),
         info.n_rows,
-        info.delimiter as char,
+        match info.delimiter {
+            Some(d) => format!(", delimiter {:?}", d as char),
+            None => String::new(),
+        },
         info.key_columns,
         if info.renamed_index_column {
             ", unnamed index column renamed to '_index'"
@@ -139,6 +144,9 @@ pub fn run_obs_import(
         }
     );
     println!("Columns to import: {:?}", info.columns_imported);
+    if !info.uns_keys_imported.is_empty() {
+        println!("uns keys to import: {:?}", info.uns_keys_imported);
+    }
 
     let s = scx_ops::attach_external_obs(input, &data, &attach_opts)?;
     println!(

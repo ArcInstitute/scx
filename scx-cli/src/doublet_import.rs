@@ -47,6 +47,7 @@ pub fn run_doublet_import(
     call_false: Option<&str>,
     drop_native_columns: bool,
     delimiter: Option<&str>,
+    uns_keys: &[String],
     overwrite: bool,
     on_missing_rows: &str,
     on_extra_rows: &str,
@@ -102,6 +103,7 @@ pub fn run_doublet_import(
         keep_native_columns: !drop_native_columns,
         key_columns,
         delimiter: delimiter_byte,
+        uns_keys: uns_keys.to_vec(),
     };
 
     let attach_opts = AttachObsOptions {
@@ -118,10 +120,14 @@ pub fn run_doublet_import(
 
     let (data, info) = scx_convert::read_doublet_table(table, &read_opts)?;
     println!(
-        "Table: {} ({} rows, delimiter {:?}, key {:?}{})",
+        "Source: {} ({}, {} rows{}, key {:?}{})",
         table.display(),
+        info.table.format.as_str(),
         info.table.n_rows,
-        info.table.delimiter as char,
+        match info.table.delimiter {
+            Some(d) => format!(", delimiter {:?}", d as char),
+            None => String::new(),
+        },
         info.table.key_columns,
         if info.table.renamed_index_column {
             ", unnamed index column renamed to '_index'"
@@ -140,6 +146,12 @@ pub fn run_doublet_import(
             "Note: no call column, so '{}_predicted' is not written. Threshold \
              '{}_score' yourself — the importer will not choose a cutoff for you.",
             info.key_added, info.key_added
+        );
+    }
+    if !info.table.uns_keys_imported.is_empty() {
+        println!(
+            "uns keys carried across: {:?} (nested under uns['{}']['source_uns'])",
+            info.table.uns_keys_imported, info.key_added
         );
     }
     if !info.dropped_alias_columns.is_empty() {

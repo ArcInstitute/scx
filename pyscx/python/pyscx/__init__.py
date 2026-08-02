@@ -481,7 +481,9 @@ def obs_import(path, table, *, key=None, **kwargs):
 
     Args:
         path: Target SCX file (str, os.PathLike, or an open Experiment).
-        table: Source .csv / .tsv / .txt (str or os.PathLike).
+        table: Source .csv / .tsv / .txt, or an .h5ad whose `/obs` holds the
+            columns (str or os.PathLike). The h5ad route needs a build with
+            HDF5 support; without it the error says to write a CSV instead.
         key: Join key. None auto-resolves with the same preference order the
             target side uses (pandas index, then `barcode`/`cell_id`/…). A str
             names one column. A list of str builds a composite key — the right
@@ -498,6 +500,11 @@ def obs_import(path, table, *, key=None, **kwargs):
             (`.csv` / `.tsv` / `.tab`), then from the header line.
         status_column: Obs column recording "present"/"absent" per row.
         uns_key: `uns` key to merge the table's metadata under.
+        uns_keys: `/uns` keys to carry across from an h5ad source. Opt-in --
+            `/uns` routinely holds large arrays and types the reader skips, so
+            nothing comes across unless named. A key that is not there is an
+            error. Meaningless for a delimited table, and requesting one is an
+            error rather than a silent no-op.
         overwrite: **Replaces, never merges.** A colliding column is dropped and
             rebuilt from this table alone, so importing several per-batch tables
             one after another keeps only the last. Concatenate them and import
@@ -512,8 +519,9 @@ def obs_import(path, table, *, key=None, **kwargs):
     Returns:
         dict with `n_obs`, `n_matched`, `n_target_rows_absent`,
         `n_source_rows_absent`, `obs_key_column`, `obs_columns_added`,
-        `obs_index_dropped`, the source's `delimiter` / `n_rows_in_source`, and
-        (on a dry run) `key_diagnosis`.
+        `obs_index_dropped`, the source's `format` / `delimiter` (None for
+        h5ad) / `n_rows_in_source` / `uns_keys_imported`, and (on a dry run)
+        `key_diagnosis`.
 
     Example:
         # Look before you leap on a large file.
@@ -584,6 +592,11 @@ def doublet_import(path, table, *, tool, key=None, **kwargs):
         keep_native_columns: Keep every other source column as `<K>_<native>`.
             True by default.
         delimiter: One-character override; None sniffs from the extension.
+            Ignored for an h5ad source.
+        uns_keys: `/uns` keys to carry across from an h5ad source, nested under
+            `uns["<K>"]["source_uns"]` so the tool's own metadata keeps its
+            names and cannot collide with the wrapper's record. Opt-in; a key
+            that is not there is an error.
         overwrite: **Replaces, never merges.** Re-importing per-batch tables one
             after another keeps only the last — concatenate them and import once.
         on_missing_rows: "zero" (default) marks uncovered cells absent; "error"
@@ -596,7 +609,8 @@ def doublet_import(path, table, *, tool, key=None, **kwargs):
     Returns:
         dict with the `obs_import` join fields plus `tool`, `key_added`,
         `score_source_column`, `call_source_column`, `canonical_columns`,
-        `native_columns` and `dropped_alias_columns`.
+        `native_columns`, `dropped_alias_columns`, `format` ("table" or
+        "h5ad") and `uns_keys_imported`.
 
     Note:
         A tool that emits no call column never gets a `<K>_predicted`. The

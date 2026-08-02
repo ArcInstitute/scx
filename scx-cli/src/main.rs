@@ -975,6 +975,10 @@ enum Commands {
         /// uns key to merge the table's metadata under
         #[arg(long)]
         uns_key: Option<String>,
+        /// uns key to carry across from an h5ad source. Repeatable; ignored
+        /// for a delimited table, which carries no uns.
+        #[arg(long = "uns-key-from-source")]
+        uns_keys: Vec<String>,
         /// Replace existing columns. REPLACES, never merges: importing several
         /// per-batch tables in turn keeps only the last. Concatenate first.
         #[arg(long)]
@@ -1036,6 +1040,10 @@ enum Commands {
         /// One-byte delimiter override (default: sniff by extension, then header)
         #[arg(long)]
         delimiter: Option<String>,
+        /// uns key to carry across from an h5ad source. Repeatable; ignored
+        /// for a delimited table, which carries no uns.
+        #[arg(long = "uns-key-from-source")]
+        uns_keys: Vec<String>,
         /// Replace existing columns. REPLACES, never merges: importing several
         /// per-batch tables in turn keeps only the last. Concatenate first.
         #[arg(long)]
@@ -1231,6 +1239,7 @@ fn main() {
             delimiter,
             status_column,
             uns_key,
+            uns_keys,
             overwrite,
             on_missing_rows,
             on_extra_rows,
@@ -1246,6 +1255,7 @@ fn main() {
             delimiter.as_deref(),
             status_column.as_deref(),
             uns_key.as_deref(),
+            &uns_keys,
             overwrite,
             &on_missing_rows,
             &on_extra_rows,
@@ -1263,6 +1273,7 @@ fn main() {
             call_false,
             drop_native_columns,
             delimiter,
+            uns_keys,
             overwrite,
             on_missing_rows,
             on_extra_rows,
@@ -1279,6 +1290,7 @@ fn main() {
             call_false.as_deref(),
             drop_native_columns,
             delimiter.as_deref(),
+            &uns_keys,
             overwrite,
             &on_missing_rows,
             &on_extra_rows,

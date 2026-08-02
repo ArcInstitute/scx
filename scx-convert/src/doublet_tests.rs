@@ -445,15 +445,45 @@ fn unknown_tool_errors_listing_the_valid_set() {
     }
 }
 
+#[cfg(not(feature = "hdf5"))]
 #[test]
-fn h5ad_source_errors_with_the_convert_hint() {
+fn an_h5ad_source_without_the_feature_says_what_to_do_instead() {
+    // Phase 5 made h5ad a real source, so the blanket "not implemented yet"
+    // refusal is gone. In a build with no HDF5 the refusal remains, and still
+    // has to name the route that does work here.
     let dir = tempfile::tempdir().unwrap();
-    // Content is irrelevant: the extension is refused before any read.
     let p = write(&dir, "scrublet_out.h5ad", "not really hdf5");
     let e = read_doublet_table(&p, &opts("scrublet")).unwrap_err();
     let m = e.to_string();
     assert!(m.contains("to_csv"), "{m}");
-    assert!(m.contains("not implemented yet"), "{m}");
+    assert!(m.contains("no HDF5 support"), "{m}");
+}
+
+#[cfg(feature = "hdf5")]
+#[test]
+fn an_h5ad_source_is_read_rather_than_refused_on_its_extension() {
+    // The extension no longer decides the outcome; the file's contents do.
+    // This one is not HDF5 at all, so it fails as an unreadable file rather
+    // than as an unsupported format.
+    let dir = tempfile::tempdir().unwrap();
+    let p = write(&dir, "scrublet_out.h5ad", "not really hdf5");
+    let e = read_doublet_table(&p, &opts("scrublet")).unwrap_err();
+    let m = e.to_string();
+    assert!(m.contains("as HDF5"), "{m}");
+    assert!(
+        !m.contains("not implemented"),
+        "the Phase-4 deferral message must be gone: {m}"
+    );
+}
+
+#[test]
+fn an_h5mu_source_is_refused_with_the_modality_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write(&dir, "atlas.h5mu", "not really hdf5");
+    let e = read_doublet_table(&p, &opts("scrublet")).unwrap_err();
+    let m = e.to_string();
+    assert!(m.contains("multimodal"), "{m}");
+    assert!(m.contains("--modality"), "{m}");
 }
 
 // ---------------------------------------------------------------------------
@@ -655,6 +685,87 @@ fn profile_has_call_column_reflects_the_table() {
     assert!(!profile_has_call_column(
         doublet_profile("generic").unwrap()
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Categorical (dictionary-encoded) columns
+//
+// An h5ad's obs stores a pandas Categorical as `Dictionary(Int32, Utf8)`, and a
+// class / prediction column is exactly the kind pandas keeps that way. These
+// pin the derivation at the `coerce_*` level so the guard holds independently
+// of whether the hdf5 feature — or any h5ad file — is in play.
+// ---------------------------------------------------------------------------
+
+fn dict_utf8(values: &[Option<&str>]) -> ArrayRef {
+    let arr: arrow::array::DictionaryArray<arrow::datatypes::Int32Type> =
+        values.iter().copied().collect();
+    Arc::new(arr) as ArrayRef
+}
+
+#[test]
+fn a_categorical_call_column_derives_like_a_plain_one() {
+    let cat = dict_utf8(&[Some("singlet"), Some("doublet"), None]);
+    assert!(
+        matches!(cat.data_type(), DataType::Dictionary(_, _)),
+        "fixture must actually be dictionary-encoded: {:?}",
+        cat.data_type()
+    );
+
+    let tokens = Some(CallTokens {
+        doublet: "doublet",
+        singlet: "singlet",
+    });
+    let got = coerce_call(&cat, "scDblFinder.class", tokens, None, None).unwrap();
+    let got = got.as_any().downcast_ref::<BooleanArray>().unwrap();
+
+    assert_eq!(
+        (0..got.len())
+            .map(|i| (!got.is_null(i)).then(|| got.value(i)))
+            .collect::<Vec<_>>(),
+        [Some(false), Some(true), None]
+    );
+}
+
+#[test]
+fn an_unknown_token_in_a_categorical_call_still_errors() {
+    // The dictionary arm decodes; it must not weaken the strictness that the
+    // plain-text arm enforces.
+    let cat = dict_utf8(&[Some("singlet"), Some("ambiguous")]);
+    let tokens = Some(CallTokens {
+        doublet: "doublet",
+        singlet: "singlet",
+    });
+    let e = coerce_call(&cat, "scDblFinder.class", tokens, None, None).unwrap_err();
+    assert!(e.to_string().contains("ambiguous"), "{e}");
+}
+
+#[test]
+fn a_categorical_score_column_decodes_to_f32() {
+    // Unusual but legal: a numeric column stored as a Categorical.
+    let arr: arrow::array::DictionaryArray<arrow::datatypes::Int32Type> =
+        vec![Some("0.25"), Some("0.75")].into_iter().collect();
+    let dict: ArrayRef = Arc::new(arr);
+    // Utf8 values are still not a numeric score -- the decode must not turn the
+    // non-numeric rejection into a silent all-null column.
+    let e = coerce_score(&dict, "score").unwrap_err();
+    assert!(e.to_string().contains("not numeric"), "{e}");
+
+    let keys = arrow::array::Int32Array::from(vec![0, 1, 0]);
+    let values = arrow::array::Float64Array::from(vec![0.25_f64, 0.75]);
+    let numeric: ArrayRef = Arc::new(
+        arrow::array::DictionaryArray::<arrow::datatypes::Int32Type>::try_new(
+            keys,
+            Arc::new(values),
+        )
+        .unwrap(),
+    );
+    let got = coerce_score(&numeric, "score").unwrap();
+    assert_eq!(got.data_type(), &DataType::Float32);
+    let got = got.as_any().downcast_ref::<Float32Array>().unwrap();
+    assert_eq!(
+        (0..got.len()).map(|i| got.value(i)).collect::<Vec<_>>(),
+        [0.25, 0.75, 0.25]
+    );
 }
 
 #[test]

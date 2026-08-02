@@ -352,12 +352,17 @@ def test_unknown_tool_errors_listing_the_valid_set(tmp_path):
     assert "scdblfinder" in msg and "doubletdetection" in msg, msg
 
 
-def test_h5ad_source_errors_with_the_convert_hint(tmp_path):
+def test_an_h5ad_is_read_rather_than_refused_on_its_extension(tmp_path):
+    # Phase 5 made h5ad a real source, so the blanket deferral is gone. This
+    # file is not HDF5 at all, so it fails as unreadable rather than as an
+    # unsupported format.
     scx = _fixture(tmp_path)
     h5 = _write(tmp_path, "scrublet_out.h5ad", "not really hdf5")
     with pytest.raises(ValueError) as e:
         pyscx.doublet_import(str(scx), str(h5), tool="scrublet")
-    assert "to_csv" in str(e.value)
+    msg = str(e.value)
+    assert "as HDF5" in msg, msg
+    assert "not implemented" not in msg, f"the Phase-4 deferral must be gone: {msg}"
 
 
 def test_a_rejected_import_leaves_the_file_byte_identical(tmp_path):
@@ -462,3 +467,150 @@ def test_doublet_tools_matches_what_the_importer_accepts(tmp_path):
             )
         except ValueError as e:
             assert "unknown doublet tool" not in str(e), (t, str(e))
+
+
+# ---------------------------------------------------------------------------
+# h5ad sources (Phase 5)
+#
+# The scanpy-resident tools write their results back into an h5ad in place, so
+# these use files `anndata` actually wrote rather than hand-built ones. The
+# assertion that matters is *equivalence*: the h5ad route must be a way to the
+# same place as the CSV route, not a second implementation with its own quirks.
+# ---------------------------------------------------------------------------
+
+
+def _scrublet_shaped_h5ad(tmp_path, name="scrublet_out.h5ad", categorical=False):
+    """What `sc.pp.scrublet(adata)` leaves behind: results in obs, in place."""
+    obs = pd.DataFrame(
+        {
+            "doublet_score": [0.03, 0.71, 0.05],
+            "predicted_doublet": [False, True, False],
+        },
+        index=["AAAC-1", "AAAG-1", "AAAT-1"],
+    )
+    if categorical:
+        # pandas stores this as a Categorical, which lands as an arrow
+        # dictionary -- the shape the derivation had to learn to see through.
+        obs["scDblFinder.class"] = pd.Categorical(["singlet", "doublet", "singlet"])
+    X = sparse.csr_matrix(np.arange(len(obs) * 3, dtype=np.float32).reshape(len(obs), 3))
+    var = pd.DataFrame(index=[f"g{i}" for i in range(3)])
+    p = tmp_path / name
+    anndata.AnnData(X=X, obs=obs, var=var).write_h5ad(p)
+    return p
+
+
+def test_h5ad_source_imports_without_a_csv_detour(tmp_path):
+    scx = _fixture(tmp_path)
+    h5 = _scrublet_shaped_h5ad(tmp_path)
+
+    r = pyscx.doublet_import(str(scx), str(h5), tool="scrublet")
+    assert r["format"] == "h5ad"
+    assert r["delimiter"] is None, "there is no delimiter in an HDF5 file"
+    assert r["score_source_column"] == "doublet_score"
+    assert r["n_matched"] == 3
+
+    obs = pyscx.open(str(scx)).read_obs()
+    assert obs["scrublet_score"].tolist()[:3] == pytest.approx([0.03, 0.71, 0.05])
+    assert _calls(obs, "scrublet_predicted") == [False, True, False, None]
+    assert obs["scrublet_status"].tolist()[3] == "absent"
+
+
+def test_h5ad_and_csv_paths_agree_exactly(tmp_path):
+    """The exit criterion: two routes, one result."""
+    h5 = _scrublet_shaped_h5ad(tmp_path)
+    # The same values, via the CSV route the user had to take before.
+    src = anndata.read_h5ad(h5).obs[["doublet_score", "predicted_doublet"]]
+    csv = tmp_path / "calls.csv"
+    src.to_csv(csv)
+
+    from_h5ad = _fixture(tmp_path, name="a.scx")
+    from_csv = _fixture(tmp_path, name="b.scx")
+    r_h5 = pyscx.doublet_import(str(from_h5ad), str(h5), tool="scrublet")
+    r_csv = pyscx.doublet_import(str(from_csv), str(csv), tool="scrublet")
+
+    assert r_h5["n_matched"] == r_csv["n_matched"]
+    assert r_h5["canonical_columns"] == r_csv["canonical_columns"]
+    assert r_h5["score_source_column"] == r_csv["score_source_column"]
+
+    a = pyscx.open(str(from_h5ad)).read_obs()
+    b = pyscx.open(str(from_csv)).read_obs()
+    # `Series.equals` rather than `==`: an uncovered cell is NaN on both sides,
+    # and `nan == nan` is False, which would fail a comparison that is in fact
+    # holding. Positional NaN equality is exactly the semantics wanted here.
+    for col in ["scrublet_score", "scrublet_predicted", "scrublet_status"]:
+        assert a[col].equals(b[col]), (
+            f"{col} differs between the h5ad and CSV routes:\n"
+            f"  h5ad: {a[col].tolist()}\n  csv : {b[col].tolist()}"
+        )
+
+
+def test_h5ad_categorical_class_column_derives(tmp_path):
+    """A pandas Categorical arrives dictionary-encoded; it must still derive."""
+    scx = _fixture(tmp_path)
+    h5 = _scrublet_shaped_h5ad(tmp_path, name="sce.h5ad", categorical=True)
+
+    r = pyscx.doublet_import(
+        str(scx), str(h5), tool="scdblfinder", score_column="doublet_score"
+    )
+    assert r["call_source_column"] == "scDblFinder.class"
+    obs = pyscx.open(str(scx)).read_obs()
+    assert _calls(obs, "scdblfinder_predicted") == [False, True, False, None]
+
+
+def test_h5ad_uns_key_is_opt_in_and_nested(tmp_path):
+    scx = _fixture(tmp_path)
+    h5 = _scrublet_shaped_h5ad(tmp_path)
+    ad = anndata.read_h5ad(h5)
+    ad.uns["scrublet"] = {"threshold": 0.35}
+    ad.write_h5ad(h5)
+
+    # Nothing by default: /uns routinely holds things worth not importing.
+    r = pyscx.doublet_import(str(scx), str(h5), tool="scrublet")
+    assert r["uns_keys_imported"] == []
+
+    pyscx.rollback(str(scx))
+    r = pyscx.doublet_import(
+        str(scx), str(h5), tool="scrublet", uns_keys=["scrublet"]
+    )
+    assert r["uns_keys_imported"] == ["scrublet"]
+
+
+def test_a_missing_uns_key_errors_naming_what_is_present(tmp_path):
+    scx = _fixture(tmp_path)
+    h5 = _scrublet_shaped_h5ad(tmp_path)
+    ad = anndata.read_h5ad(h5)
+    ad.uns["scrublet"] = {"threshold": 0.35}
+    ad.write_h5ad(h5)
+
+    with pytest.raises(ValueError) as e:
+        pyscx.doublet_import(
+            str(scx), str(h5), tool="scrublet", uns_keys=["scdblfinder"]
+        )
+    msg = str(e.value)
+    assert "scdblfinder" in msg and "scrublet" in msg, msg
+
+
+def test_uns_keys_on_a_csv_source_error_rather_than_being_ignored(tmp_path):
+    scx = _fixture(tmp_path)
+    csv = _write(tmp_path, "calls.csv", "barcode,doublet_score\nAAAC-1,0.5\n")
+    with pytest.raises(ValueError, match="carries no uns"):
+        pyscx.doublet_import(str(scx), str(csv), tool="scrublet", uns_keys=["x"])
+
+
+def test_obs_import_also_reads_an_h5ad(tmp_path):
+    """The generic importer gained the same route, not just the wrapper."""
+    scx = _fixture(tmp_path)
+    h5 = _scrublet_shaped_h5ad(tmp_path)
+
+    r = pyscx.obs_import(str(scx), str(h5))
+    assert r["format"] == "h5ad"
+    obs = pyscx.open(str(scx)).read_obs()
+    assert obs["doublet_score"].tolist()[:3] == pytest.approx([0.03, 0.71, 0.05])
+
+
+def test_h5mu_source_is_refused_with_the_modality_route(tmp_path):
+    scx = _fixture(tmp_path)
+    fake = _write(tmp_path, "atlas.h5mu", "not really hdf5")
+    with pytest.raises(ValueError) as e:
+        pyscx.doublet_import(str(scx), str(fake), tool="scrublet")
+    assert "--modality" in str(e.value)

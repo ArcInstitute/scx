@@ -70,7 +70,7 @@ fn reads_a_minimal_barcode_score_call_table() {
 
     let (data, info) = read_annotation_table(&p, &opts()).unwrap();
     assert_eq!(info.n_rows, 2);
-    assert_eq!(info.delimiter, b',');
+    assert_eq!(info.delimiter, Some(b','));
     assert_eq!(info.key_columns, vec!["barcode".to_string()]);
     assert_eq!(data.row_keys, vec!["AAAC-1", "AAAG-1"]);
     // The key column is consumed, not duplicated into the annotations.
@@ -89,8 +89,8 @@ fn tsv_and_csv_both_parse() {
 
     let (c, ci) = read_annotation_table(&csv, &opts()).unwrap();
     let (t, ti) = read_annotation_table(&tsv, &opts()).unwrap();
-    assert_eq!(ci.delimiter, b',');
-    assert_eq!(ti.delimiter, b'\t');
+    assert_eq!(ci.delimiter, Some(b','));
+    assert_eq!(ti.delimiter, Some(b'\t'));
     assert_eq!(c.row_keys, t.row_keys);
     assert_eq!(col_names(&c), col_names(&t));
 }
@@ -105,7 +105,7 @@ fn txt_delimiter_is_sniffed_from_the_header() {
         "barcode\tscore\tcall\nAAAC-1\t0.5\tsinglet\n",
     );
     let (_, info) = read_annotation_table(&tabbed, &opts()).unwrap();
-    assert_eq!(info.delimiter, b'\t');
+    assert_eq!(info.delimiter, Some(b'\t'));
 
     let commaed = write_file(
         dir.path(),
@@ -113,7 +113,7 @@ fn txt_delimiter_is_sniffed_from_the_header() {
         "barcode,score,call\nAAAC-1,0.5,singlet\n",
     );
     let (_, info) = read_annotation_table(&commaed, &opts()).unwrap();
-    assert_eq!(info.delimiter, b',');
+    assert_eq!(info.delimiter, Some(b','));
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn an_explicit_delimiter_overrides_the_extension() {
         },
     )
     .unwrap();
-    assert_eq!(info.delimiter, b'\t');
+    assert_eq!(info.delimiter, Some(b'\t'));
     assert_eq!(data.row_keys, vec!["AAAC-1"]);
 }
 
@@ -591,4 +591,91 @@ fn the_literal_r_write_csv_shape_parses() {
         "NA is missing, not the literal text 'NA'"
     );
     assert!(origin.is_valid(1));
+}
+
+// ---------------------------------------------------------------------------
+// Source dispatch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sniff_routes_by_extension() {
+    use std::path::Path;
+    assert_eq!(
+        sniff_obs_source(Path::new("calls.csv")),
+        ObsSourceFormat::Table
+    );
+    assert_eq!(
+        sniff_obs_source(Path::new("calls.tsv")),
+        ObsSourceFormat::Table
+    );
+    // No extension at all is still a table — that is the common case for a
+    // pipeline writing to a bare filename, and the delimiter sniffer copes.
+    assert_eq!(sniff_obs_source(Path::new("calls")), ObsSourceFormat::Table);
+    assert_eq!(
+        sniff_obs_source(Path::new("out.h5ad")),
+        ObsSourceFormat::H5ad
+    );
+    // Case-insensitive: an uppercase extension is the same file.
+    assert_eq!(
+        sniff_obs_source(Path::new("OUT.H5AD")),
+        ObsSourceFormat::H5ad
+    );
+}
+
+#[test]
+fn read_obs_source_reads_a_table_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_file(
+        dir.path(),
+        "calls.csv",
+        "barcode,score\nAAAC-1,0.5\nAAAG-1,0.9\n",
+    );
+
+    let (data, info) = read_obs_source(&p, &AnnotationTableOptions::default(), &[]).unwrap();
+    assert_eq!(info.format, ObsSourceFormat::Table);
+    assert_eq!(info.delimiter, Some(b','));
+    assert_eq!(data.row_keys, ["AAAC-1", "AAAG-1"]);
+    assert!(info.uns_keys_imported.is_empty());
+}
+
+#[test]
+fn uns_keys_on_a_table_source_error_rather_than_being_ignored() {
+    // Silently dropping the request would leave the caller believing the
+    // metadata came across.
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_file(dir.path(), "calls.csv", "barcode,score\nAAAC-1,0.5\n");
+
+    let e = read_obs_source(
+        &p,
+        &AnnotationTableOptions::default(),
+        &["scrublet".to_string()],
+    )
+    .unwrap_err();
+    let m = e.to_string();
+    assert!(m.contains("scrublet"), "{m}");
+    assert!(m.contains("carries no uns"), "{m}");
+}
+
+#[test]
+fn an_h5mu_source_is_refused_with_the_modality_route() {
+    // obs lives at /mod/<name>/obs there, so there is no single table to read.
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_file(dir.path(), "atlas.h5mu", "not really hdf5");
+
+    let e = read_obs_source(&p, &AnnotationTableOptions::default(), &[]).unwrap_err();
+    let m = e.to_string();
+    assert!(m.contains("multimodal"), "{m}");
+    assert!(m.contains("--modality"), "{m}");
+}
+
+#[cfg(not(feature = "hdf5"))]
+#[test]
+fn an_h5ad_source_without_the_feature_says_what_to_do_instead() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_file(dir.path(), "out.h5ad", "not really hdf5");
+
+    let e = read_obs_source(&p, &AnnotationTableOptions::default(), &[]).unwrap_err();
+    let m = e.to_string();
+    assert!(m.contains("no HDF5 support"), "{m}");
+    assert!(m.contains("to_csv"), "{m}");
 }

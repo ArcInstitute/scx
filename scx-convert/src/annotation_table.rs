@@ -93,16 +93,41 @@ pub struct AnnotationTableOptions {
     pub infer_max_records: Option<usize>,
 }
 
+/// Which reader handled a source file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObsSourceFormat {
+    /// Delimited text, read by [`read_annotation_table`].
+    Table,
+    /// An h5ad's `/obs`, read by `read_h5ad_obs` (requires the `hdf5` feature).
+    H5ad,
+}
+
+impl ObsSourceFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ObsSourceFormat::Table => "table",
+            ObsSourceFormat::H5ad => "h5ad",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AnnotationTableInfo {
     pub n_rows: usize,
-    pub delimiter: u8,
+    pub format: ObsSourceFormat,
+    /// Field delimiter, for a delimited source. `None` for h5ad, where the
+    /// concept does not exist — reporting a fabricated `,` would be a small lie
+    /// in the one line users read to confirm the file parsed as they meant.
+    pub delimiter: Option<u8>,
     /// The resolved key column(s), in order.
     pub key_columns: Vec<String>,
     /// Final (post-rename, post-prefix) names of the appended columns.
     pub columns_imported: Vec<String>,
-    /// Whether a leading unnamed column was renamed to `_index`.
+    /// Whether a leading unnamed column was renamed to `_index`. Always false
+    /// for h5ad, where the index arrives properly named.
     pub renamed_index_column: bool,
+    /// `/uns` keys pulled across, in request order. Always empty for a table.
+    pub uns_keys_imported: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -324,10 +349,12 @@ pub fn read_annotation_table(
 
     let info = AnnotationTableInfo {
         n_rows: table.num_rows(),
-        delimiter,
+        format: ObsSourceFormat::Table,
+        delimiter: Some(delimiter),
         key_columns: key_columns.clone(),
         columns_imported,
         renamed_index_column,
+        uns_keys_imported: Vec::new(),
     };
 
     Ok((
@@ -344,7 +371,11 @@ pub fn read_annotation_table(
 }
 
 /// Select, rename and prefix the columns that become obs annotations.
-fn project_annotations(
+///
+/// Shared with the h5ad reader on purpose: the doublet wrapper consumes this
+/// batch whichever source produced it, so the two paths must agree exactly on
+/// what "import these columns under this prefix" means.
+pub(crate) fn project_annotations(
     table: &RecordBatch,
     key_columns: &[String],
     opts: &AnnotationTableOptions,
@@ -425,6 +456,98 @@ fn project_annotations(
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| OpsError::InvalidInput(format!("failed to build annotation columns: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Source dispatch
+// ---------------------------------------------------------------------------
+
+/// Classify a source file by extension.
+///
+/// Extension rather than content sniffing: the caller named this file, and a
+/// mis-typed extension should produce "that is not a table" rather than a
+/// reader silently disagreeing with what the user thinks they passed.
+pub fn sniff_obs_source(path: &Path) -> ObsSourceFormat {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("h5ad") | Some("h5") => ObsSourceFormat::H5ad,
+        _ => ObsSourceFormat::Table,
+    }
+}
+
+/// Read per-cell annotations from a delimited table **or** an h5ad's `/obs`.
+///
+/// The single entry point both `obs_import` and `doublet_import` go through, so
+/// a new source format reaches every surface at once. `uns_keys` is honoured
+/// only by the h5ad reader; a delimited table carries no `uns`.
+pub fn read_obs_source(
+    path: &Path,
+    opts: &AnnotationTableOptions,
+    uns_keys: &[String],
+) -> Result<(ExternalObsData, AnnotationTableInfo)> {
+    // An h5mu keeps obs per modality at `/mod/<name>/obs`, so there is no one
+    // `/obs` to read. Rejected with the extraction route rather than supported
+    // behind a `--modality` flag that would mean something for exactly one
+    // source format — and a doublet caller is run per modality anyway.
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("h5mu"))
+    {
+        return Err(OpsError::InvalidInput(format!(
+            "'{}' is multimodal: its obs lives at /mod/<modality>/obs, so there is no \
+             single obs table to import. Extract one modality first — \
+             `scx subset --modality rna` — or read the modality in Python and write \
+             its obs to a CSV.",
+            path.display()
+        )));
+    }
+
+    match sniff_obs_source(path) {
+        ObsSourceFormat::Table => {
+            if !uns_keys.is_empty() {
+                return Err(OpsError::InvalidInput(format!(
+                    "uns keys {uns_keys:?} were requested, but '{}' is a delimited table \
+                     and carries no uns. Drop the request, or import from the h5ad the \
+                     tool wrote.",
+                    path.display()
+                )));
+            }
+            read_annotation_table(path, opts)
+        }
+        ObsSourceFormat::H5ad => read_h5ad_obs_dispatch(path, opts, uns_keys),
+    }
+}
+
+#[cfg(feature = "hdf5")]
+fn read_h5ad_obs_dispatch(
+    path: &Path,
+    opts: &AnnotationTableOptions,
+    uns_keys: &[String],
+) -> Result<(ExternalObsData, AnnotationTableInfo)> {
+    crate::h5ad_obs::read_h5ad_obs(path, opts, uns_keys)
+}
+
+/// Without `hdf5` there is no reader, but the failure must still tell the user
+/// what to do instead — the CSV path works in this build and produces the same
+/// result.
+#[cfg(not(feature = "hdf5"))]
+fn read_h5ad_obs_dispatch(
+    path: &Path,
+    _opts: &AnnotationTableOptions,
+    _uns_keys: &[String],
+) -> Result<(ExternalObsData, AnnotationTableInfo)> {
+    Err(OpsError::InvalidInput(format!(
+        "'{}' is an HDF5 file, but this build has no HDF5 support (the 'hdf5' feature \
+         is off). Write the columns to a table first, e.g. \
+         `adata.obs[[\"doublet_score\", \"predicted_doublet\"]].to_csv(\"calls.csv\")`, \
+         and import that.",
+        path.display()
+    )))
 }
 
 #[cfg(test)]
