@@ -1427,8 +1427,9 @@ regular AnnData first**, keeping `X` lazy, and warns
 (`ImplicitModificationWarning`) that it did. Afterwards the object no longer
 tracks its parent and the results land on it, not on the parent. Nothing is
 copied — that is the point of the rebuild, since anndata's own copy-on-write
-would get to the same place by materializing the matrix. So the canonical
-scanpy ordering is safe out-of-core:
+would get to the same place by materializing the matrix. The rebuild happens on
+entry, so `is_view` flips to `False` even if the op then raises. So the
+canonical scanpy ordering is safe out-of-core:
 
 ```python
 adata = pyscx.open("atlas.scx").to_anndata(backed=True)

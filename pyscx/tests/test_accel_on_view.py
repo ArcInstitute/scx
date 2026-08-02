@@ -108,28 +108,23 @@ def _backed(path):
     return pyscx.open(str(path)).to_anndata(backed=True)
 
 
-def _with_pca(op):
-    """Run `op` on a view after seeding `X_pca` — for the obsm consumers.
+def _seed(adata, needs):
+    """Put `X_pca` / the kNN graph on the **parent**, before it is sliced.
 
-    PCA is itself in the parametrize list, so it is already covered; here it is
-    only setup, and it runs on the *view* so the op under test still receives a
-    view (PCA de-views it, which is the point — the op must cope either way).
+    Seeding must not happen on the view. `pca` and `neighbors` are themselves
+    write-back ops, so running them on the view de-views it, and the op under
+    test would then receive an ordinary in-memory-backed AnnData — where
+    writing `obs` / `obsm` / `obsp` cannot gather a lazy `X` no matter what.
+    The test would pass whether or not the op had the prologue.
+
+    That is not hypothetical: the first cut of this file seeded on the view,
+    and with `compute_lisi`'s prologue deleted the whole parametrized test
+    still passed 34/34.
     """
-
-    def run(adata):
+    if needs in ("pca", "neighbors"):
         pyscx.accel.pca(adata, n_comps=5, device="cpu")
-        return op(adata)
-
-    return run
-
-
-def _with_neighbors(op):
-    def run(adata):
-        pyscx.accel.pca(adata, n_comps=5, device="cpu")
+    if needs == "neighbors":
         pyscx.accel.neighbors(adata, n_neighbors=5, use_rep="X_pca", device="cpu")
-        return op(adata)
-
-    return run
 
 
 def _hvg_view(path, n_top_genes=10):
@@ -233,57 +228,70 @@ def test_second_op_on_the_same_view_still_works(scx_path):
 
 
 @pytest.mark.parametrize(
-    "op",
+    ("op", "needs"),
     [
-        pytest.param(lambda a: pyscx.accel.normalize_total(a, device="cpu"), id="normalize_total"),
-        pytest.param(lambda a: pyscx.accel.log1p(a, device="cpu"), id="log1p"),
-        pytest.param(lambda a: pyscx.accel.calculate_qc_metrics(a), id="calculate_qc_metrics"),
+        pytest.param(lambda a: pyscx.accel.normalize_total(a, device="cpu"), None, id="normalize_total"),
+        pytest.param(lambda a: pyscx.accel.log1p(a, device="cpu"), None, id="log1p"),
+        pytest.param(lambda a: pyscx.accel.calculate_qc_metrics(a), None, id="calculate_qc_metrics"),
         pytest.param(
             lambda a: pyscx.accel.highly_variable_genes(
                 a, n_top_genes=5, flavor="seurat_v3", device="cpu"
             ),
+            None,
             id="highly_variable_genes",
         ),
-        pytest.param(lambda a: pyscx.accel.pca(a, n_comps=4, device="cpu"), id="pca"),
+        pytest.param(lambda a: pyscx.accel.pca(a, n_comps=4, device="cpu"), None, id="pca"),
         pytest.param(
             lambda a: pyscx.accel.rank_genes_groups(
                 a, groupby="pert", method="wilcoxon", device="cpu"
             ),
+            None,
             id="rank_genes_groups",
         ),
         pytest.param(
             lambda a: pyscx.accel.pdex_ref(a, groupby="pert", reference="ctrl", device="cpu"),
+            None,
             id="pdex_ref",
         ),
-        pytest.param(lambda a: pyscx.accel.filter_genes(a, min_cells=1), id="filter_genes"),
-        pytest.param(lambda a: pyscx.accel.filter_cells(a, min_genes=1), id="filter_cells"),
+        pytest.param(lambda a: pyscx.accel.filter_genes(a, min_cells=1), None, id="filter_genes"),
+        pytest.param(lambda a: pyscx.accel.filter_cells(a, min_genes=1), None, id="filter_cells"),
         pytest.param(
             lambda a: pyscx.accel.score_genes(a, gene_list=["g0", "g2", "g4"], device="cpu"),
+            None,
             id="score_genes",
         ),
-        pytest.param(lambda a: pyscx.accel.pflog(a, n_components=5), id="pflog"),
+        pytest.param(lambda a: pyscx.accel.pflog(a, n_components=5), None, id="pflog"),
         pytest.param(
-            lambda a: pyscx.accel.pseudobulk_means(a, "pert"), id="pseudobulk_means"
+            lambda a: pyscx.accel.pseudobulk_means(a, "pert"), None, id="pseudobulk_means"
         ),
-        # obsm consumers: seed X_pca first, then run the op that reads it.
-        pytest.param(_with_pca(lambda a: pyscx.accel.neighbors(a, n_neighbors=5, device="cpu")),
-                     id="neighbors"),
-        pytest.param(_with_neighbors(lambda a: pyscx.accel.umap(a, device="cpu")), id="umap"),
-        pytest.param(_with_neighbors(lambda a: pyscx.accel.leiden(a, device="cpu")), id="leiden"),
+        # obsm / obsp consumers — prerequisites are seeded on the PARENT (see
+        # `_seed`), so the op under test is the first thing to touch the view.
         pytest.param(
-            _with_pca(lambda a: pyscx.accel.harmony_integrate(a, "donor")),
-            id="harmony_integrate",
+            lambda a: pyscx.accel.neighbors(a, n_neighbors=5, device="cpu"),
+            "pca",
+            id="neighbors",
+        ),
+        pytest.param(lambda a: pyscx.accel.umap(a, device="cpu"), "neighbors", id="umap"),
+        pytest.param(lambda a: pyscx.accel.leiden(a, device="cpu"), "neighbors", id="leiden"),
+        pytest.param(
+            lambda a: pyscx.accel.harmony_integrate(a, "donor"), "pca", id="harmony_integrate"
         ),
         pytest.param(
-            _with_neighbors(
-                lambda a: pyscx.accel.compute_lisi(a, key="donor", perplexity=5.0)
-            ),
+            lambda a: pyscx.accel.compute_lisi(a, key="donor", perplexity=5.0),
+            "neighbors",
             id="compute_lisi",
+        ),
+        pytest.param(
+            lambda a: pyscx.accel.pseudobulk_dex(
+                a, groupby=["pert", "donor"], test_col="pert", reference="ctrl"
+            ),
+            None,
+            id="pseudobulk_dex",
         ),
     ],
 )
 @pytest.mark.parametrize("axis", ["var", "obs"])
-def test_write_back_ops_accept_a_view_without_gathering(scx_path, op, axis):
+def test_write_back_ops_accept_a_view_without_gathering(scx_path, op, needs, axis):
     """Locks the prologue's coverage list.
 
     An op missing the prologue shows up here either as a raise or as an X that
@@ -293,8 +301,9 @@ def test_write_back_ops_accept_a_view_without_gathering(scx_path, op, axis):
     `obs["lisi_<key>"]`.
     """
     adata = _backed(scx_path)
+    _seed(adata, needs)
     view = adata[:, COL_KEEP] if axis == "var" else adata[ROW_KEEP]
-    assert view.is_view
+    assert view.is_view, "the op under test must be the first thing to touch the view"
 
     op(view)
 
