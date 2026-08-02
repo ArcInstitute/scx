@@ -87,7 +87,7 @@ impl PyExperiment {
 ///
 /// An unknown column name is a `KeyError` naming what is available, rather
 /// than a silently narrower frame.
-fn project_batch_columns(
+pub(crate) fn project_batch_columns(
     batch: &arrow::record_batch::RecordBatch,
     cols: &[String],
 ) -> PyResult<arrow::record_batch::RecordBatch> {
@@ -102,10 +102,16 @@ fn project_batch_columns(
     }
     for name in cols {
         let i = schema.index_of(name).map_err(|_| {
+            // List only the columns a caller could meaningfully ask for. The
+            // pandas index column is retained unconditionally and is often an
+            // internal name (`__index_level_0__`), so offering it as a
+            // suggestion is noise.
+            let index_cols = scx_format_io::pandas_index_columns(&schema);
             let available = schema
                 .fields()
                 .iter()
                 .map(|f| f.name().as_str())
+                .filter(|n| !index_cols.iter().any(|ic| ic == n))
                 .collect::<Vec<_>>()
                 .join(", ");
             pyo3::exceptions::PyKeyError::new_err(format!(

@@ -866,6 +866,21 @@ class CloudExperiment:
         retained. `columns=None` fetches and caches the full assembled table."""
         ...
 
+    def read_var(
+        self, columns: list[str] | None = ..., *, modality: str | None = ...
+    ) -> Any:
+        """Read var as a pandas DataFrame over the cloud path.
+
+        Mirror of the local `Experiment.read_var`. Unlike this class's
+        `read_obs`, `columns` is **not** a network pushdown — it is a
+        projection applied after the fetch, because `var` is one section sized
+        by `n_vars` and there is no per-column range read to save. The pandas
+        index column (gene names) is always retained.
+
+        `modality=<name>` selects one modality's gene axis; unknown name →
+        `KeyError`."""
+        ...
+
     def distinct_values(
         self, col: str, *, limit: int | None = ..., sort: bool = ...
     ) -> tuple[list[str], bool]:

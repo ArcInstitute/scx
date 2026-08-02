@@ -618,6 +618,41 @@ impl PyCloudExperiment {
         crate::convert::pyarrow_table_to_pandas(&table)
     }
 
+    /// Read `var` (gene metadata) as a pandas DataFrame over the cloud path.
+    ///
+    /// Mirror of the local [`Experiment::read_var`]. Without it, a cloud
+    /// caller who wants gene symbols has to `to_anndata()` the whole matrix
+    /// over the network — the same asymmetry that motivated adding `read_var`
+    /// locally, one layer over.
+    ///
+    /// As locally, `columns` is a convenience projection applied **after** the
+    /// fetch, not a pushdown: `var` is one section sized by `n_vars` (a few MB
+    /// even on an atlas), so there is no per-column range read to save. This
+    /// differs from `CloudExperiment.read_obs`, where `columns` *is* a genuine
+    /// network pushdown because `obs` scales with `n_obs`. The pandas index
+    /// column (gene names) is always retained.
+    ///
+    /// `modality=<name>` selects one modality's gene axis on a multimodal
+    /// file; unknown name → `KeyError`.
+    #[pyo3(signature = (columns=None, *, modality=None))]
+    fn read_var<'py>(
+        &self,
+        py: Python<'py>,
+        columns: Option<Vec<String>>,
+        modality: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let modality_id = self.resolve_uns_modality(modality)?;
+        let batch = py
+            .detach(|| self.rt.block_on(self.reader.read_var_for(modality_id)))
+            .map_err(cloud_to_pyerr)?;
+        let batch = match columns {
+            None => batch,
+            Some(cols) => crate::experiment::project_batch_columns(&batch, &cols)?,
+        };
+        let table = crate::convert::record_batch_to_pyarrow(py, &batch)?;
+        crate::convert::pyarrow_table_to_pandas(&table)
+    }
+
     /// Distinct values of a single string/categorical `obs` column over the
     /// cloud path, returned as `(values, has_more)`. Mirrors the local
     /// `Experiment.distinct_values` (same dictionary-superset / null / `limit`
