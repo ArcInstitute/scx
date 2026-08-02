@@ -1678,3 +1678,202 @@ pub fn cellbender_import(
 pub fn is_cellbender_h5(path: &str) -> bool {
     scx_convert::is_cellbender_h5(std::path::Path::new(path))
 }
+
+// ---------------------------------------------------------------------------
+// Generic external obs import (CSV / TSV annotation tables)
+// ---------------------------------------------------------------------------
+
+/// Shared option parsing, so the CLI and Python surfaces cannot drift on the
+/// enum spellings. Ungated, unlike the CellBender pair above — a delimited
+/// table reader has no business requiring libhdf5.
+pub fn parse_obs_missing_rows(s: &str) -> PyResult<scx_ops::MissingRowPolicy> {
+    match s {
+        "zero" => Ok(scx_ops::MissingRowPolicy::ZeroFill),
+        "error" => Ok(scx_ops::MissingRowPolicy::Error),
+        other => Err(PyValueError::new_err(format!(
+            "on_missing_rows must be 'zero' or 'error'; got '{other}'"
+        ))),
+    }
+}
+
+pub fn parse_obs_extra_rows(s: &str) -> PyResult<scx_ops::ExtraRowPolicy> {
+    match s {
+        "warn" => Ok(scx_ops::ExtraRowPolicy::WarnSkip),
+        "error" => Ok(scx_ops::ExtraRowPolicy::Error),
+        other => Err(PyValueError::new_err(format!(
+            "on_extra_rows must be 'warn' or 'error'; got '{other}'"
+        ))),
+    }
+}
+
+/// Turn the caller's `key` into the reader's column list and the op's join-key
+/// spec, built from the **same** names so both sides of the join agree.
+fn resolve_join_key(key: Option<Vec<String>>) -> (Vec<String>, scx_ops::ObsJoinKey) {
+    match key {
+        None => (Vec::new(), scx_ops::ObsJoinKey::Auto),
+        Some(cols) if cols.is_empty() => (Vec::new(), scx_ops::ObsJoinKey::Auto),
+        Some(cols) if cols.len() == 1 => {
+            (cols.clone(), scx_ops::ObsJoinKey::Column(cols[0].clone()))
+        }
+        Some(cols) => (
+            cols.clone(),
+            scx_ops::ObsJoinKey::Composite { columns: cols },
+        ),
+    }
+}
+
+fn key_diagnosis_dict<'py>(
+    py: Python<'py>,
+    d: &scx_ops::KeyDiagnosis,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("n_obs", d.n_obs)?;
+    out.set_item("resolved_key", d.resolved_key.clone())?;
+    out.set_item("resolved_cardinality", d.resolved_cardinality)?;
+    out.set_item("unique_columns", d.unique_columns.clone())?;
+    let pairs: Vec<(String, String)> = d.unique_pairs.clone();
+    out.set_item("unique_pairs", pairs)?;
+    out.set_item("pair_search_capped", d.pair_search_capped)?;
+    out.set_item("suggestion", d.suggestion.clone())?;
+    out.set_item("summary", d.describe())?;
+    Ok(out)
+}
+
+/// Import a delimited annotation table (CSV / TSV) as `obs` columns.
+///
+/// Reads `table` and lands its columns on `path`, **in place**, joined to the
+/// target's own obs axis by key. X, layers, `var`, the CSC sidecar, `.raw`,
+/// deletion vectors and predicate indexes are preserved; the whole import is
+/// undoable with `pyscx.rollback`.
+///
+/// The join is always by key string, never by position — a doublet caller run
+/// per library returns rows in whatever order it pleased, and a positional
+/// import would put every score on the wrong cell while still producing a
+/// correctly-shaped column.
+///
+/// **`overwrite` replaces, it does not merge.** Importing several per-batch
+/// tables one after another would keep only the last; concatenate them and
+/// import once.
+///
+/// Returns a dict summarising the read and the join — inspect `n_matched`
+/// before trusting the result, and prefer `dry_run=True` on a large file.
+#[pyfunction]
+#[pyo3(signature = (
+    path, table, *, key=None, columns=None, rename=None, prefix="",
+    keep_key_columns=false, delimiter=None, status_column=None, uns_key=None,
+    overwrite=false, on_missing_rows="zero", on_extra_rows="warn", dry_run=false
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn obs_import(
+    py: Python<'_>,
+    path: &str,
+    table: &str,
+    key: Option<Vec<String>>,
+    columns: Option<Vec<String>>,
+    rename: Option<std::collections::HashMap<String, String>>,
+    prefix: &str,
+    keep_key_columns: bool,
+    delimiter: Option<&str>,
+    status_column: Option<&str>,
+    uns_key: Option<&str>,
+    overwrite: bool,
+    on_missing_rows: &str,
+    on_extra_rows: &str,
+    dry_run: bool,
+) -> PyResult<Py<PyDict>> {
+    let delimiter_byte = match delimiter {
+        None => None,
+        Some(s) => {
+            let bytes = s.as_bytes();
+            if bytes.len() != 1 {
+                return Err(PyValueError::new_err(format!(
+                    "delimiter must be exactly one byte; got {s:?}"
+                )));
+            }
+            Some(bytes[0])
+        }
+    };
+
+    let (key_columns, join_key) = resolve_join_key(key);
+
+    let read_opts = scx_convert::AnnotationTableOptions {
+        key_columns,
+        delimiter: delimiter_byte,
+        columns,
+        rename: rename.unwrap_or_default(),
+        prefix: prefix.to_string(),
+        keep_key_columns,
+        infer_max_records: None,
+    };
+    let attach_opts = scx_ops::AttachObsOptions {
+        join_key,
+        missing_row_policy: parse_obs_missing_rows(on_missing_rows)?,
+        extra_row_policy: parse_obs_extra_rows(on_extra_rows)?,
+        status_column: status_column.map(str::to_string),
+        uns_key: uns_key.map(str::to_string),
+        overwrite,
+        provenance_action: "obs_import".to_string(),
+        dry_run,
+        ..Default::default()
+    };
+
+    let scx_path = PathBuf::from(path);
+    let table_path = PathBuf::from(table);
+
+    // Both halves return `OpsError`, so one mapping covers read-then-attach —
+    // a malformed CSV surfaces as a clean `ValueError`, not a panic.
+    let (summary, info, diagnosis) = py.detach(|| -> PyResult<_> {
+        let (data, info) =
+            scx_convert::read_annotation_table(&table_path, &read_opts).map_err(ops_to_pyerr)?;
+        let summary =
+            scx_ops::attach_external_obs(&scx_path, &data, &attach_opts).map_err(ops_to_pyerr)?;
+        // Only on a dry run: the diagnosis costs a pass per obs column, which
+        // is not something a successful import should pay for.
+        let diagnosis = if dry_run {
+            scx_ops::diagnose_obs_key(&scx_path, Some(&attach_opts.join_key)).ok()
+        } else {
+            None
+        };
+        Ok((summary, info, diagnosis))
+    })?;
+
+    let d = PyDict::new(py);
+    d.set_item("n_rows_in_source", info.n_rows)?;
+    d.set_item("delimiter", (info.delimiter as char).to_string())?;
+    d.set_item("renamed_index_column", info.renamed_index_column)?;
+    d.set_item("source_key_columns", info.key_columns)?;
+    d.set_item("columns_in_source", info.columns_imported)?;
+    d.set_item("dry_run", dry_run)?;
+    d.set_item("n_obs", summary.n_obs)?;
+    d.set_item("n_matched", summary.n_matched)?;
+    d.set_item("n_target_rows_absent", summary.n_target_rows_absent)?;
+    d.set_item("n_source_rows_absent", summary.n_source_rows_absent)?;
+    d.set_item("obs_key_column", summary.obs_key_column)?;
+    d.set_item("obs_columns_added", summary.obs_columns_added)?;
+    d.set_item("obsm_keys_added", summary.obsm_keys_added)?;
+    d.set_item("obs_index_dropped", summary.obs_index_dropped)?;
+    if let Some(diag) = diagnosis {
+        d.set_item("key_diagnosis", key_diagnosis_dict(py, &diag)?)?;
+    }
+    Ok(d.into())
+}
+
+/// Report which obs columns could serve as a join key for `obs_import`.
+///
+/// Read-only. Useful when an import fails on a duplicated key: on a merged
+/// atlas the obvious candidates are often *not* unique and the one that is may
+/// be a column no fallback list would guess.
+#[pyfunction]
+#[pyo3(signature = (path, key=None))]
+pub fn diagnose_obs_key(
+    py: Python<'_>,
+    path: &str,
+    key: Option<Vec<String>>,
+) -> PyResult<Py<PyDict>> {
+    let (_, join_key) = resolve_join_key(key);
+    let scx_path = PathBuf::from(path);
+    let diag = py
+        .detach(|| scx_ops::diagnose_obs_key(&scx_path, Some(&join_key)))
+        .map_err(ops_to_pyerr)?;
+    Ok(key_diagnosis_dict(py, &diag)?.into())
+}

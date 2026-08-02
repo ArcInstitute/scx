@@ -1,0 +1,170 @@
+//! `scx obs-import` — land a delimited annotation table as `obs` columns on an
+//! existing SCX file.
+//!
+//! The generic half of the doublet-caller workflow: run a tool externally, have
+//! it write `barcode,score,call`, import. Nothing here is doublet-specific.
+//!
+//! Ungated, unlike `cellbender-import` — a CSV importer has no business
+//! requiring libhdf5, and this command must exist in a no-default-features
+//! build.
+//!
+//! As with the CellBender importer, the real risk is the join, not the write:
+//! if the keys don't line up the result is a plausible-looking but empty
+//! column. Hence `--dry-run`, which runs every validation and the join, prints
+//! the match counts *and* a key diagnosis, and touches nothing.
+
+use std::path::Path;
+
+use scx_convert::AnnotationTableOptions;
+use scx_ops::{AttachObsOptions, ExtraRowPolicy, MissingRowPolicy, ObsJoinKey};
+
+type CmdResult = Result<(), Box<dyn std::error::Error>>;
+
+/// Split `--key a,b` into components. Empty (or absent) means auto-resolve.
+fn parse_key(key: Option<&str>) -> Vec<String> {
+    key.map(|k| {
+        k.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn parse_rename(
+    pairs: &[String],
+) -> Result<std::collections::HashMap<String, String>, Box<dyn std::error::Error>> {
+    let mut out = std::collections::HashMap::new();
+    for p in pairs {
+        let (src, dst) = p
+            .split_once('=')
+            .ok_or_else(|| format!("--rename expects SRC=DST; got '{p}'"))?;
+        if src.is_empty() || dst.is_empty() {
+            return Err(format!("--rename expects a non-empty SRC and DST; got '{p}'").into());
+        }
+        out.insert(src.to_string(), dst.to_string());
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_obs_import(
+    input: &Path,
+    table: &Path,
+    key: Option<&str>,
+    columns: Option<&str>,
+    rename: &[String],
+    prefix: &str,
+    keep_key_columns: bool,
+    delimiter: Option<&str>,
+    status_column: Option<&str>,
+    uns_key: Option<&str>,
+    overwrite: bool,
+    on_missing_rows: &str,
+    on_extra_rows: &str,
+    dry_run: bool,
+) -> CmdResult {
+    let missing = match on_missing_rows {
+        "zero" => MissingRowPolicy::ZeroFill,
+        "error" => MissingRowPolicy::Error,
+        other => return Err(format!("--on-missing-rows must be zero|error; got '{other}'").into()),
+    };
+    let extra = match on_extra_rows {
+        "warn" => ExtraRowPolicy::WarnSkip,
+        "error" => ExtraRowPolicy::Error,
+        other => return Err(format!("--on-extra-rows must be warn|error; got '{other}'").into()),
+    };
+    let delimiter_byte = match delimiter {
+        None => None,
+        Some(s) => {
+            let b = s.as_bytes();
+            if b.len() != 1 {
+                return Err(format!("--delimiter must be one byte; got '{s}'").into());
+            }
+            Some(b[0])
+        }
+    };
+
+    // Both sides of the join are built from the same names, so the reader and
+    // the op cannot disagree about what the key is.
+    let key_columns = parse_key(key);
+    let join_key = match key_columns.len() {
+        0 => ObsJoinKey::Auto,
+        1 => ObsJoinKey::Column(key_columns[0].clone()),
+        _ => ObsJoinKey::Composite {
+            columns: key_columns.clone(),
+        },
+    };
+
+    let read_opts = AnnotationTableOptions {
+        key_columns,
+        delimiter: delimiter_byte,
+        columns: columns.map(|c| {
+            c.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        }),
+        rename: parse_rename(rename)?,
+        prefix: prefix.to_string(),
+        keep_key_columns,
+        infer_max_records: None,
+    };
+
+    let attach_opts = AttachObsOptions {
+        join_key,
+        missing_row_policy: missing,
+        extra_row_policy: extra,
+        status_column: status_column.map(str::to_string),
+        uns_key: uns_key.map(str::to_string),
+        overwrite,
+        provenance_action: "obs_import".to_string(),
+        dry_run,
+        ..Default::default()
+    };
+
+    let (data, info) = scx_convert::read_annotation_table(table, &read_opts)?;
+    println!(
+        "Table: {} ({} rows, delimiter {:?}, key {:?}{})",
+        table.display(),
+        info.n_rows,
+        info.delimiter as char,
+        info.key_columns,
+        if info.renamed_index_column {
+            ", unnamed index column renamed to '_index'"
+        } else {
+            ""
+        }
+    );
+    println!("Columns to import: {:?}", info.columns_imported);
+
+    let s = scx_ops::attach_external_obs(input, &data, &attach_opts)?;
+    println!(
+        "Join: {}/{} target rows matched on {} ({} target rows absent, \
+         {} source rows skipped)",
+        s.n_matched, s.n_obs, s.obs_key_column, s.n_target_rows_absent, s.n_source_rows_absent,
+    );
+
+    if dry_run {
+        // The join succeeded, but "succeeded" is not the same as "is the key
+        // you wanted" — report the alternatives while nothing is committed.
+        if let Ok(diag) = scx_ops::diagnose_obs_key(input, Some(&attach_opts.join_key)) {
+            println!("Key diagnosis: {}", diag.describe());
+        }
+        println!("Dry run: nothing written.");
+        return Ok(());
+    }
+
+    println!("Wrote obs columns {:?}", s.obs_columns_added);
+    if s.obs_index_dropped {
+        println!(
+            "Note: the obs predicate index was dropped — this import overwrote a \
+             column it covered, so query pushdown on that column is gone until \
+             the index is rebuilt."
+        );
+    }
+    println!("Undo with: scx rollback {}", input.display());
+    Ok(())
+}

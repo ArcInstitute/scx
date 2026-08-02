@@ -102,6 +102,8 @@ import os as _os                                   # noqa: E402
 from .pyscx import open as _open_native            # noqa: E402
 from .pyscx import validate as _validate_native    # noqa: E402
 from .pyscx import from_anndata as _from_anndata_native  # noqa: E402
+from .pyscx import obs_import as _obs_import_native  # noqa: E402
+from .pyscx import diagnose_obs_key as _diagnose_obs_key_native  # noqa: E402
 
 # N3-2026-05-21-Tier2: hdf5-gated entry points. The Rust side registers
 # these four symbols under `#[cfg(feature = "hdf5")]` (pyscx/src/lib.rs).
@@ -458,6 +460,86 @@ def to_h5ad(path, out, **kwargs):
     src = _coerce_path(path)
     _warn_if_deletions(src, "h5ad")
     return _to_h5ad_native(src, _coerce_path(out), **kwargs)
+
+
+def obs_import(path, table, *, key=None, **kwargs):
+    """Import a delimited annotation table (CSV/TSV) as `obs` columns, in place.
+
+    The generic importer behind the doublet-caller workflow: run a tool
+    externally, have it write `barcode,score,call`, and land those columns on
+    an existing SCX file. Nothing here is doublet-specific.
+
+    Joins **by key string, never by row position** — a tool run per library
+    returns rows in its own order, and a positional import would put every
+    value on the wrong cell while still producing a correctly-shaped column.
+    Target rows the table does not cover get `null`, never a fabricated `0`.
+
+    In place via the same harness `append` uses: `X`, layers, `var`, the CSC
+    sidecar, `.raw`, deletion vectors and predicate indexes are preserved, and
+    `pyscx.rollback(path)` undoes the whole import.
+
+    Args:
+        path: Target SCX file (str, os.PathLike, or an open Experiment).
+        table: Source .csv / .tsv / .txt (str or os.PathLike).
+        key: Join key. None auto-resolves with the same preference order the
+            target side uses (pandas index, then `barcode`/`cell_id`/…). A str
+            names one column. A list of str builds a composite key — the right
+            answer for a multi-library merge where `sample_id` + `barcode` is
+            unique but neither is alone. Both sides are built by the same code,
+            so the fusing separator is internal and not configurable.
+        columns: Import only these source columns. None imports every non-key
+            column.
+        rename: `{source_name: new_name}`, applied before `prefix`.
+        prefix: Prepended to every imported column name.
+        keep_key_columns: Also import the key column(s) as ordinary annotations.
+            Off by default — the key is usually already in obs.
+        delimiter: One-character override. None sniffs from the extension
+            (`.csv` / `.tsv` / `.tab`), then from the header line.
+        status_column: Obs column recording "present"/"absent" per row.
+        uns_key: `uns` key to merge the table's metadata under.
+        overwrite: **Replaces, never merges.** A colliding column is dropped and
+            rebuilt from this table alone, so importing several per-batch tables
+            one after another keeps only the last. Concatenate them and import
+            once. Without this, a collision is an error.
+        on_missing_rows: "zero" (default) marks uncovered target rows absent;
+            "error" refuses.
+        on_extra_rows: "warn" (default) skips source rows the target lacks;
+            "error" refuses.
+        dry_run: Run every validation and the join, then return the summary
+            without writing. Also attaches a `key_diagnosis` to the result.
+
+    Returns:
+        dict with `n_obs`, `n_matched`, `n_target_rows_absent`,
+        `n_source_rows_absent`, `obs_key_column`, `obs_columns_added`,
+        `obs_index_dropped`, the source's `delimiter` / `n_rows_in_source`, and
+        (on a dry run) `key_diagnosis`.
+
+    Example:
+        # Look before you leap on a large file.
+        r = pyscx.obs_import("atlas.scx", "calls.csv", dry_run=True)
+        print(r["n_matched"], "of", r["n_obs"], "cells matched")
+        pyscx.obs_import("atlas.scx", "calls.csv", status_column="dbl_status")
+    """
+    if key is not None:
+        key = [key] if isinstance(key, str) else [str(k) for k in key]
+    return _obs_import_native(_coerce_path(path), _coerce_path(table, allow_experiment=False),
+                              key=key, **kwargs)
+
+
+def diagnose_obs_key(path, key=None):
+    """Report which obs columns could serve as an `obs_import` join key.
+
+    Read-only. Reach for this when an import fails on a duplicated key: on a
+    merged atlas the obvious candidates are often not unique, and the column
+    that is may be one no fallback list would guess (on a CELLxGENE-derived
+    file it is `soma_joinid`, with the obs index 10x-duplicated).
+
+    Returns a dict with `resolved_key`, `resolved_cardinality`,
+    `unique_columns`, `unique_pairs`, `suggestion` and a printable `summary`.
+    """
+    if key is not None:
+        key = [key] if isinstance(key, str) else [str(k) for k in key]
+    return _diagnose_obs_key_native(_coerce_path(path), key)
 
 
 def from_h5mu(path, out, **kwargs):
