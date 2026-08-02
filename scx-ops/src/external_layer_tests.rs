@@ -915,3 +915,126 @@ fn shape_mismatches_are_caught_before_any_write() {
         "a rejected import must leave the file byte-identical"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Predicate index
+// ---------------------------------------------------------------------------
+
+/// A fixture whose obs carries a real predicate index over `cell_type`.
+fn fixture_with_obs_index(dir: &Path, name: &str) -> PathBuf {
+    let n_obs = 4usize;
+    let n_vars = 2usize;
+    let obs = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("barcode", DataType::Utf8, false),
+            Field::new("cell_type", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                (0..n_obs).map(|i| format!("cell_{i}")).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec!["T", "B", "T", "B"])),
+        ],
+    )
+    .unwrap();
+
+    let path = dir.join(name);
+    let header =
+        FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, n_obs as u32, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&var_batch(n_vars)).unwrap();
+    let indptr: Vec<u64> = vec![0u64; n_obs + 1];
+    writer
+        .write_csr_shard(&indptr, &[], &[], CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+
+    let build_opts = scx_engine::PredicateIndexBuildOptions {
+        forced_columns: vec!["cell_type".to_string()],
+        preset_columns: Vec::new(),
+        auto_threshold: 1000,
+        high_cardinality_threshold: 100_000,
+    };
+    let mut outcomes = Vec::new();
+    let mut named = Vec::new();
+    let bytes = scx_engine::build_obs_predicate_index_bytes(
+        &obs,
+        &[(0u64, n_obs as u64)],
+        &build_opts,
+        &mut outcomes,
+        &mut named,
+    )
+    .unwrap()
+    .expect("cell_type must be indexable");
+    writer.write_obs_predicate_index(&bytes).unwrap();
+    writer
+        .write_uns(&serde_json::json!({"state": "v0"}))
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+fn has_obs_index(path: &Path) -> bool {
+    ScxReader::open(path)
+        .unwrap()
+        .catalog()
+        .entries
+        .iter()
+        .any(|e| e.section_type == SectionType::ObsPredicateIndex)
+}
+
+/// A pure add cannot invalidate an index keyed on other columns, so pushdown
+/// must survive — dropping it here would be a silent performance cliff on every
+/// CellBender import.
+#[test]
+fn layer_import_keeps_the_obs_predicate_index_on_a_pure_add() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture_with_obs_index(dir.path(), "a.scx");
+    assert!(has_obs_index(&path));
+
+    let data = diagonal_data(keys("cell_", 4), keys("g", 2), |i| (i + 1) as f32);
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
+
+    assert!(has_obs_index(&path));
+}
+
+/// The converse: overwriting a column the index covers leaves its entries
+/// describing values that no longer exist, so the index must go. Without this
+/// the index would still map "T"/"B" to shard ranges whose rows now read "NK",
+/// and `query().filter_obs("cell_type == 'T'")` would return them.
+#[test]
+fn layer_import_drops_a_stale_obs_predicate_index_on_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture_with_obs_index(dir.path(), "a.scx");
+    assert!(has_obs_index(&path));
+
+    let mut data = diagonal_data(keys("cell_", 4), keys("g", 2), |i| (i + 1) as f32);
+    data.row_annotations = Some(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "cell_type",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["NK", "NK", "NK", "NK"]))],
+        )
+        .unwrap(),
+    );
+
+    attach_external_layer(
+        &path,
+        &data,
+        &AttachLayerOptions {
+            layer_name: "cb".to_string(),
+            overwrite: true,
+            provenance_action: "test_import".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !has_obs_index(&path),
+        "the index still covers 'cell_type', whose values were just replaced"
+    );
+}

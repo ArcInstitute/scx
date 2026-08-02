@@ -5,6 +5,7 @@ pub mod compact;
 pub mod delete;
 pub mod error;
 pub mod external_layer;
+pub mod external_obs;
 pub mod flock;
 pub mod group_plan;
 pub mod helpers;
@@ -36,6 +37,10 @@ pub use error::{OpsError, Result};
 pub use external_layer::{
     attach_external_layer, AttachLayerOptions, AttachLayerSummary, ColumnAxisMatch,
     ColumnAxisPolicy, ExternalLayerData, ExtraRowPolicy, MissingRowPolicy, ShardRangeSource,
+};
+pub use external_obs::{
+    attach_external_obs, build_composite_key, diagnose_obs_key, AttachObsOptions, AttachObsSummary,
+    ExternalObsData, KeyDiagnosis, ObsJoinKey, COMPOSITE_KEY_SEPARATOR,
 };
 pub use group_plan::{plan_group_shards, GroupPlan, GroupRecord, Role};
 pub use merge::{merge, merge_with_index_options, merge_with_options};
