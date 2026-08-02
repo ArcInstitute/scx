@@ -512,3 +512,89 @@ def test_clean_rerun_clears_stale_loess_failed_batches(
 
     # Stale failures cleared; the key reflects the current (clean) run.
     assert list(adata.uns["hvg"]["loess_failed_batches"]) == []
+
+
+def test_warning_names_the_batch_by_label_not_just_index(
+    synthetic_adata, scx_from_adata, monkeypatch
+):
+    """The failing batch must be identified by its `batch_key` value.
+
+    `batch index 0` is not actionable: `batches` drops empty groups before
+    indexing, so the number is not even an index into the column's categories
+    and cannot be looked up. A user who hits this on a Census file with a
+    per-dataset `batch_key` needs the dataset id to decide whether to drop or
+    coarsen the key — which is the remedy the same warning recommends
+    (user-report F4).
+    """
+    import re
+
+    import pyscx
+
+    path = scx_from_adata(synthetic_adata, "hvg_loess_label.scx")
+    adata = pyscx.open(path).to_anndata(backed=True)
+    _patch_loess_to_raise_on_first_batch(monkeypatch)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pyscx.accel.highly_variable_genes(
+            adata,
+            n_top_genes=10,
+            flavor="seurat_v3",
+            batch_key="batch",
+            device="cpu",
+        )
+
+    msg = next(
+        str(w.message) for w in caught if "skmisc.loess fit failed on" in str(w.message)
+    )
+    # The index stays (it is what `loess_failed_batches` is keyed by) …
+    m = re.search(r"batch index (\d+)", msg)
+    assert m is not None, msg
+    failed_idx = int(m.group(1))
+    # … and the label is now there too, named after the batch_key column.
+    categories = list(adata.obs["batch"].cat.categories)
+    assert "batch=" in msg, f"warning does not name the batch_key value: {msg}"
+    named = [c for c in categories if f'batch="{c}"' in msg]
+    assert len(named) == 1, f"expected exactly one category named in: {msg}"
+
+    # The uns record carries the same label, so following the warning's own
+    # pointer to `loess_failed_batches` also yields something actionable.
+    failed = adata.uns["hvg"]["loess_failed_batches"]
+    assert len(failed) == 1
+    entry = list(failed[0])
+    assert entry[0] == failed_idx
+    assert entry[2] == named[0], f"uns label {entry!r} disagrees with the warning"
+
+
+def test_no_batch_key_still_reports_without_a_label(
+    synthetic_adata, scx_from_adata, monkeypatch
+):
+    """With one implicit batch there is no label to print — and no crash."""
+    import re
+
+    import pyscx
+
+    path = scx_from_adata(synthetic_adata, "hvg_loess_nobatch.scx")
+    adata = pyscx.open(path).to_anndata(backed=True)
+    _patch_loess_to_raise_on_first_batch(monkeypatch)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        # One implicit batch, and it is the one patched to fail — so this is
+        # the all-batches-failed hard error. The summary warning is still
+        # emitted first, and it is the warning this test is about.
+        with pytest.raises(RuntimeError, match="all 1 batches failed"):
+            pyscx.accel.highly_variable_genes(
+                adata, n_top_genes=10, flavor="seurat_v3", device="cpu"
+            )
+
+    msg = next(
+        str(w.message) for w in caught if "skmisc.loess fit failed on" in str(w.message)
+    )
+    assert "batch index 0" in msg
+    # No batch_key → the cell count and nothing else. In particular no
+    # invented label and no dangling `key=` fragment.
+    detail = msg.split("batch index 0 (")[1].split(")")[0]
+    assert re.fullmatch(r"n=\d+ cells", detail), f"unexpected detail {detail!r}"
+    entry = list(adata.uns["hvg"]["loess_failed_batches"][0])
+    assert len(entry) == 2, f"no batch_key → no label element, got {entry!r}"

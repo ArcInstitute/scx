@@ -943,3 +943,121 @@ class TestCloudModalityQuery:
             )
             assert adata.n_vars == 12
             assert adata.n_obs > 0
+
+
+class TestCloudReadVar:
+    """`CloudExperiment.read_var` — parity with the local `Experiment`.
+
+    `read_obs` existed on both handles; `read_var` was added locally first,
+    which just moved the original dogfood F2 asymmetry one layer over: a
+    cloud caller still had to `to_anndata()` the whole matrix over the network
+    to get gene symbols. Exercised against a local exploded `.scxd`, which
+    goes through the same `CloudReader` as a `gs://` URL.
+    """
+
+    def test_read_var_over_the_cloud_reader(self):
+        import tempfile
+
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "t.scx")
+            _create_test_scx(scx_path, n_obs=30, n_vars=10)
+            exploded = os.path.join(tmpdir, "t.scxd")
+            pyscx.explode(scx_path, exploded)
+
+            var = pyscx.open_cloud(exploded).read_var()
+            assert len(var) == 10
+            assert "gene_id" in var.columns
+            assert list(var["gene_id"]) == [f"gene_{i}" for i in range(10)]
+
+    def test_read_var_projection_keeps_the_index(self):
+        import tempfile
+
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "t.scx")
+            _create_test_scx(scx_path, n_obs=30, n_vars=10)
+            exploded = os.path.join(tmpdir, "t.scxd")
+            pyscx.explode(scx_path, exploded)
+
+            ce = pyscx.open_cloud(exploded)
+            full = ce.read_var()
+            sub = ce.read_var(columns=["gene_id"])
+            assert list(sub.columns) == ["gene_id"]
+            assert list(sub.index) == list(full.index)
+
+    def test_read_var_matches_the_local_reader(self):
+        """The cloud and local paths must agree on the same file."""
+        import tempfile
+
+        import pandas as pd
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "t.scx")
+            _create_test_scx(scx_path, n_obs=30, n_vars=10)
+            exploded = os.path.join(tmpdir, "t.scxd")
+            pyscx.explode(scx_path, exploded)
+
+            local = pyscx.open(scx_path).read_var()
+            cloud = pyscx.open_cloud(exploded).read_var()
+            assert list(local.index) == list(cloud.index)
+            assert set(local.columns) == set(cloud.columns)
+            for col in local.columns:
+                pd.testing.assert_series_equal(
+                    local[col], cloud[col], check_dtype=False, check_categorical=False
+                )
+
+    def test_read_var_unknown_column_is_actionable(self):
+        import tempfile
+
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "t.scx")
+            _create_test_scx(scx_path, n_obs=30, n_vars=10)
+            exploded = os.path.join(tmpdir, "t.scxd")
+            pyscx.explode(scx_path, exploded)
+
+            with pytest.raises(KeyError) as excinfo:
+                pyscx.open_cloud(exploded).read_var(columns=["nope"])
+            msg = str(excinfo.value)
+            assert "gene_id" in msg
+            # The pandas index column is retained automatically and is often an
+            # internal name — suggesting it would be noise.
+            assert "__index_level_0__" not in msg
+
+    def test_read_var_scopes_to_modality_over_the_cloud_reader(self):
+        """Per-modality `var` routing is its own cloud code path.
+
+        The cloud reader resolves `var/<modality>` sections over both packed
+        and exploded layouts, so the modality kwarg is worth exercising here
+        and not only against the local reader.
+        """
+        import tempfile
+
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "mm.scx")
+            _create_multimodal_scx(scx_path, n_obs=40, rna_vars=12, adt_vars=4)
+            exploded = os.path.join(tmpdir, "mm.scxd")
+            pyscx.explode(scx_path, exploded)
+
+            # Both layouts, since the comment above claims both.
+            for source in (exploded, scx_path):
+                ce = pyscx.open_cloud(source)
+                rna = ce.read_var(modality="rna")
+                adt = ce.read_var(modality="adt")
+                assert len(rna) == 12, source
+                assert len(adt) == 4, source
+                assert list(rna.index) == [f"g{i}" for i in range(12)], source
+
+                # Agrees with the local reader on the same file.
+                local_rna = pyscx.open(scx_path).read_var(modality="rna")
+                assert list(local_rna.index) == list(rna.index), source
+
+                with pytest.raises(KeyError, match="unknown modality"):
+                    ce.read_var(modality="atac")

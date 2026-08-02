@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::format::human_size;
 use scx_codec::{CodecId, ValueEncoding};
+
 use scx_format_io::catalog::FullCatalog;
 use scx_format_io::deletion_vectors::DeletionVectors;
 use scx_format_io::header::FileHeader;
@@ -11,6 +12,68 @@ use scx_format_io::modality::{ModalityTable, ModalityType};
 use scx_format_io::provenance::Provenance;
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::SectionType;
+
+/// Whether `scx info` should suggest `scx compact` for this much dead space.
+///
+/// Sections are 8-byte aligned, so every file carries a little inter-section
+/// padding that compaction cannot reclaim — ~152 B on a freshly converted
+/// 864 MB file. Printing a remediation next to that reads as "your brand-new
+/// file is already degraded" and trains users to ignore the line entirely
+/// (user-report E3).
+///
+/// The two arms are deliberately `||`, not `&&`. A single relative threshold
+/// stays quiet about tens of MB of reclaimable space on a multi-GB atlas
+/// (`append` / `set-uns` leave whole superseded sections behind), and a single
+/// absolute one nags about a few hundred KB on a small file where it is most
+/// of the file. So: hint when the waste is large in its own right (≥ 1 MiB),
+/// or when it is a large fraction of the file (≥ 1%).
+fn worth_compacting(orphaned: u64, file_size: u64) -> bool {
+    const ABSOLUTE_FLOOR: u64 = 1024 * 1024;
+    if orphaned == 0 {
+        // The caller already guards on this, but the relative arm would
+        // otherwise answer `true` for a zero-byte file (`0 >= 0`).
+        return false;
+    }
+    orphaned >= ABSOLUTE_FLOOR || orphaned.saturating_mul(100) >= file_size
+}
+
+#[cfg(test)]
+mod worth_compacting_tests {
+    use super::worth_compacting;
+
+    /// The reported case: 8-byte section padding on a freshly written file.
+    #[test]
+    fn fresh_convert_padding_is_silent() {
+        assert!(!worth_compacting(152, 863_700_000));
+        assert!(!worth_compacting(19, 47_000_000));
+    }
+
+    /// The case an `&&` of both thresholds would have hidden: a real orphaned
+    /// section on an atlas, well under 1% but worth many MB.
+    #[test]
+    fn large_absolute_orphan_on_a_huge_file_still_hints() {
+        assert!(worth_compacting(64 * 1024 * 1024, 100_000_000_000));
+    }
+
+    /// …and the converse: proportionally large on a small file.
+    #[test]
+    fn large_relative_orphan_on_a_small_file_still_hints() {
+        assert!(worth_compacting(300 * 1024, 1_000_000));
+    }
+
+    /// Observed after three in-place `set-uns` rewrites — 783 KB of 48 MB.
+    /// Under the 1 MiB floor, over the 1% share.
+    #[test]
+    fn repeated_in_place_edits_hint() {
+        assert!(worth_compacting(783 * 1024, 48_200_000));
+    }
+
+    #[test]
+    fn degenerate_sizes_do_not_panic() {
+        assert!(!worth_compacting(0, 0));
+        assert!(worth_compacting(u64::MAX, u64::MAX));
+    }
+}
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -281,10 +344,15 @@ fn render_text(model: &InfoModel) -> CliResult<()> {
     // for exploded directories, which have no single file and no orphans.
     if let Some(orphaned) = model.orphaned {
         if orphaned > 0 {
-            println!(
-                "Orphaned bytes: ~{} (run 'scx compact' to reclaim)",
-                human_size(orphaned)
-            );
+            // The count is always reported; the `scx compact` hint is not.
+            if worth_compacting(orphaned, model.file_size) {
+                println!(
+                    "Orphaned bytes: ~{} (run 'scx compact' to reclaim)",
+                    human_size(orphaned)
+                );
+            } else {
+                println!("Orphaned bytes: ~{}", human_size(orphaned));
+            }
         }
     }
 

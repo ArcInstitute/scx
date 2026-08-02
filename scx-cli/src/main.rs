@@ -169,23 +169,33 @@ enum Commands {
         /// custom.
         #[arg(long, value_name = "NAME:TYPE,...")]
         modality_types: Option<String>,
-        /// Phase 5a: comma-separated obs columns to force-index at
-        /// conversion time. Missing or unsupported columns fail the
-        /// convert.
+        /// Comma-separated obs columns to force-index at conversion time.
+        /// Missing or unsupported columns fail the convert.
+        ///
+        /// Supplying this (or `--index-var` / `--index-preset`) replaces
+        /// auto-detection; see `--index-auto-threshold`.
         #[arg(long, value_name = "CSV")]
         index_obs: Option<String>,
-        /// Phase 5a: comma-separated var columns to force-index at
-        /// conversion time. Missing or unsupported columns fail the
-        /// convert.
+        /// Comma-separated var columns to force-index at conversion time.
+        /// Missing or unsupported columns fail the convert.
         #[arg(long, value_name = "CSV")]
         index_var: Option<String>,
-        /// Phase 5a: named column preset
-        /// (`cellxgene` | `perturbseq` | `training`). Missing preset
-        /// columns warn but don't fail.
+        /// Named column preset (`cellxgene` | `perturbseq` | `training`).
+        /// Missing preset columns warn but don't fail.
+        ///
+        /// This *narrows* indexing rather than enabling it: with no
+        /// `--index-*` flag at all, every categorical obs column with
+        /// cardinality <= `--index-auto-threshold` is auto-indexed, so a
+        /// preset usually indexes FEWER columns than the default — a smaller
+        /// index, a smaller file, and a faster open. Columns outside the
+        /// preset then fall back to a full obs scan when queried.
         #[arg(long, value_name = "NAME")]
         index_preset: Option<String>,
-        /// Phase 5a: cardinality cap for auto-detected index columns
-        /// when no explicit columns or preset are supplied.
+        /// Cardinality cap for auto-detected index columns.
+        ///
+        /// Applies only when no `--index-obs` / `--index-var` /
+        /// `--index-preset` is supplied: in that default case every
+        /// categorical obs column at or under this cap is indexed.
         #[arg(long, default_value_t = 1000)]
         index_auto_threshold: usize,
         /// Detection-bitmap shard generation.
@@ -516,29 +526,29 @@ enum Commands {
         /// Transpose memory budget for the `--rebuild-csc` pass (default 4G).
         #[arg(long, default_value = "4G")]
         csc_memory_limit: String,
-        /// F1: obs column whose label clusters rows into shards (condition /
+        /// Obs column whose label clusters rows into shards (condition /
         /// perturbation grouping). Forced to be the leading sort key; engages
         /// the byte-budget group planner and writes a `group_index` sidecar.
         /// `--reverse` is ignored when set. Restricted to single-modality
         /// inputs in v1.
         #[arg(long, value_name = "COL")]
         group_by: Option<String>,
-        /// F1: which rows are reference cells (e.g. "non-targeting"), packed
+        /// Which rows are reference cells (e.g. "non-targeting"), packed
         /// first / isolated in shard 0. A comma-separated label list, or
         /// `col:NAME` (alias `column:NAME`) for a boolean obs column. Requires
         /// `--group-by`.
         #[arg(long, value_name = "LABELS|col:NAME")]
         reference: Option<String>,
-        /// F1: byte budget per shard for the group bin-packer (binary suffix
+        /// Byte budget per shard for the group bin-packer (binary suffix
         /// `K`/`M`/`G`/`T`). Without it the planner packs by `--shard-size`
         /// rows. Only with `--group-by`.
         #[arg(long, value_name = "SIZE")]
         group_target_bytes: Option<String>,
-        /// F1: oversize threshold — a single group exceeding it gets its own
+        /// Oversize threshold — a single group exceeding it gets its own
         /// shard plus a warning. Defaults to a multiple of the target.
         #[arg(long, value_name = "SIZE")]
         group_max_bytes: Option<String>,
-        /// F6: byte cap on the emitter's per-shard accumulation buffer in grouped
+        /// Byte cap on the emitter's per-shard accumulation buffer in grouped
         /// mode (binary suffix `K`/`M`/`G`/`T`). When the accumulated CSR of the
         /// current shard reaches this, it is sub-flushed as a standalone shard
         /// *within* a group — bounding grouped-write peak memory at one block
