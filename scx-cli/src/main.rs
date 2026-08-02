@@ -9,6 +9,7 @@ mod cellbender;
 mod cli_utils;
 mod cloud_url;
 mod compact;
+mod doublet_import;
 mod index_warnings;
 mod obs_import;
 use scx_convert as convert;
@@ -988,6 +989,67 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Import a doublet caller's output as canonical obs columns, in place.
+    ///
+    /// The doublet-specific wrapper over `obs-import`: every caller names its
+    /// score and call differently, and this maps them onto `<K>_score` /
+    /// `<K>_predicted` so downstream code never branches on the tool. Joins by
+    /// key string, never by row position; undo with `scx rollback`.
+    ///
+    /// A tool that emits no call column (scds) gets no `<K>_predicted` —
+    /// thresholding a score is a decision this importer does not make for you.
+    DoubletImport {
+        /// Target SCX file (mutated in place).
+        input: PathBuf,
+        /// The caller's output table (.csv / .tsv). An .h5ad source is not
+        /// supported yet; write `adata.obs[[...]].to_csv(...)` and import that.
+        table: PathBuf,
+        /// Which tool produced the table
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
+            scx_convert::DOUBLET_PROFILE_NAMES))]
+        tool: String,
+        /// Join key column(s), comma-separated for a composite key.
+        /// Omitted auto-resolves (pandas index, then barcode/cell_id/...).
+        #[arg(long)]
+        key: Option<String>,
+        /// Canonical column prefix. Defaults to the tool name, so two tools
+        /// land side by side without colliding.
+        #[arg(long)]
+        key_added: Option<String>,
+        /// Override the profile's score column (required for --tool generic)
+        #[arg(long)]
+        score_column: Option<String>,
+        /// Override the profile's call column. Also how a score-only tool
+        /// (scds) opts into a `<K>_predicted`.
+        #[arg(long)]
+        call_column: Option<String>,
+        /// Override the text token meaning "doublet"
+        #[arg(long)]
+        call_true: Option<String>,
+        /// Override the text token meaning "singlet"
+        #[arg(long)]
+        call_false: Option<String>,
+        /// Import only the canonical columns, discarding every other source
+        /// column instead of keeping it as `<K>_<native>`
+        #[arg(long)]
+        drop_native_columns: bool,
+        /// One-byte delimiter override (default: sniff by extension, then header)
+        #[arg(long)]
+        delimiter: Option<String>,
+        /// Replace existing columns. REPLACES, never merges: importing several
+        /// per-batch tables in turn keeps only the last. Concatenate first.
+        #[arg(long)]
+        overwrite: bool,
+        /// Target rows with no matching source row: zero-fill or fail
+        #[arg(long, default_value = "zero", value_parser = ["zero", "error"])]
+        on_missing_rows: String,
+        /// Source rows absent from the target: warn and skip, or fail
+        #[arg(long, default_value = "warn", value_parser = ["warn", "error"])]
+        on_extra_rows: String,
+        /// Validate and report the join (plus a key diagnosis) without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Restore the default `SIGPIPE` disposition (`SIG_DFL`).
@@ -1184,6 +1246,39 @@ fn main() {
             delimiter.as_deref(),
             status_column.as_deref(),
             uns_key.as_deref(),
+            overwrite,
+            &on_missing_rows,
+            &on_extra_rows,
+            dry_run,
+        ),
+        Commands::DoubletImport {
+            input,
+            table,
+            tool,
+            key,
+            key_added,
+            score_column,
+            call_column,
+            call_true,
+            call_false,
+            drop_native_columns,
+            delimiter,
+            overwrite,
+            on_missing_rows,
+            on_extra_rows,
+            dry_run,
+        } => doublet_import::run_doublet_import(
+            &input,
+            &table,
+            &tool,
+            key.as_deref(),
+            key_added.as_deref(),
+            score_column.as_deref(),
+            call_column.as_deref(),
+            call_true.as_deref(),
+            call_false.as_deref(),
+            drop_native_columns,
+            delimiter.as_deref(),
             overwrite,
             &on_missing_rows,
             &on_extra_rows,

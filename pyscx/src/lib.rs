@@ -1491,6 +1491,8 @@ fn register_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Ungated: a delimited-table import must not require libhdf5.
     m.add_function(wrap_pyfunction!(ops::obs_import, m)?)?;
     m.add_function(wrap_pyfunction!(ops::diagnose_obs_key, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::doublet_import, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::doublet_tools, m)?)?;
     #[cfg(feature = "hdf5")]
     {
         m.add_function(wrap_pyfunction!(ops::cellbender_import, m)?)?;

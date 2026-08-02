@@ -104,6 +104,7 @@ from .pyscx import validate as _validate_native    # noqa: E402
 from .pyscx import from_anndata as _from_anndata_native  # noqa: E402
 from .pyscx import obs_import as _obs_import_native  # noqa: E402
 from .pyscx import diagnose_obs_key as _diagnose_obs_key_native  # noqa: E402
+from .pyscx import doublet_import as _doublet_import_native  # noqa: E402
 
 # N3-2026-05-21-Tier2: hdf5-gated entry points. The Rust side registers
 # these four symbols under `#[cfg(feature = "hdf5")]` (pyscx/src/lib.rs).
@@ -540,6 +541,80 @@ def diagnose_obs_key(path, key=None):
     if key is not None:
         key = [key] if isinstance(key, str) else [str(k) for k in key]
     return _diagnose_obs_key_native(_coerce_path(path), key)
+
+
+def doublet_import(path, table, *, tool, key=None, **kwargs):
+    """Import a doublet caller's output, normalised to canonical obs columns.
+
+    The doublet-specific wrapper over `obs_import`. Same in-place, key-joined,
+    `pyscx.rollback`-able import — plus the one thing that needs per-tool
+    knowledge: every caller names its score and call differently, and consensus
+    code downstream should not have to branch on which tool ran.
+
+    Writes, for `key_added="<K>"` (default: the tool name):
+
+        obs["<K>_score"]      f32,  nullable   higher = more doublet-like
+        obs["<K>_predicted"]  bool, nullable   omitted when the tool has no call
+        obs["<K>_status"]     str              "present" / "absent"
+        obs["<K>_<native>"]   ...              every other source column
+        uns["<K>"]                             tool, source columns, join report
+
+    These names match what a native SCX doublet run writes, so an imported
+    result and a native one are drop-in comparable.
+
+    Args:
+        path: Target SCX file (str, os.PathLike, or an open Experiment).
+        table: The caller's output .csv / .tsv. An `.h5ad` source is not
+            supported yet — write `adata.obs[[...]].to_csv(...)` and import that.
+        tool: One of `pyscx.doublet_tools()`: "scdblfinder", "scrublet",
+            "doubletfinder", "doubletdetection", "solo", "scds", "generic".
+        key: Join key, exactly as for `obs_import`. None auto-resolves; a str
+            names one column; a list builds a composite — the right answer for a
+            multi-library merge where `sample_id` + `barcode` is unique but
+            neither is alone.
+        key_added: Canonical prefix `<K>`. Defaults to `tool`, so two tools land
+            side by side without colliding.
+        score_column: Override the profile's score column. Required for
+            `tool="generic"`.
+        call_column: Override the profile's call column. Supplying one is also
+            how you opt a score-only tool (scds) into a `<K>_predicted`.
+        call_true / call_false: Override the text tokens meaning doublet and
+            singlet. Needed when a tool version renames its classes. With only
+            `call_true`, anything else non-null is treated as a singlet.
+        keep_native_columns: Keep every other source column as `<K>_<native>`.
+            True by default.
+        delimiter: One-character override; None sniffs from the extension.
+        overwrite: **Replaces, never merges.** Re-importing per-batch tables one
+            after another keeps only the last — concatenate them and import once.
+        on_missing_rows: "zero" (default) marks uncovered cells absent; "error"
+            refuses.
+        on_extra_rows: "warn" (default) skips source rows the target lacks;
+            "error" refuses.
+        dry_run: Validate and join without writing; also returns a
+            `key_diagnosis`.
+
+    Returns:
+        dict with the `obs_import` join fields plus `tool`, `key_added`,
+        `score_source_column`, `call_source_column`, `canonical_columns`,
+        `native_columns` and `dropped_alias_columns`.
+
+    Note:
+        A tool that emits no call column never gets a `<K>_predicted`. The
+        importer will not threshold a score on your behalf — that is a
+        scientific decision it does not own.
+
+    Example:
+        # Look first: on a merged atlas the obvious key is often not unique.
+        r = pyscx.doublet_import("atlas.scx", "calls.csv",
+                                 tool="scdblfinder", dry_run=True)
+        print(r["n_matched"], "of", r["n_obs"], "cells matched")
+        pyscx.doublet_import("atlas.scx", "calls.csv", tool="scdblfinder")
+    """
+    if key is not None:
+        key = [key] if isinstance(key, str) else [str(k) for k in key]
+    return _doublet_import_native(_coerce_path(path),
+                                  _coerce_path(table, allow_experiment=False),
+                                  tool=tool, key=key, **kwargs)
 
 
 def from_h5mu(path, out, **kwargs):

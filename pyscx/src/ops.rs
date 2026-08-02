@@ -1858,6 +1858,156 @@ pub fn obs_import(
     Ok(d.into())
 }
 
+// ---------------------------------------------------------------------------
+// Doublet-caller wrapper
+// ---------------------------------------------------------------------------
+
+/// Import a doublet caller's output table, normalising it to canonical columns.
+///
+/// The doublet-specific wrapper over [`obs_import`]. Everything the generic
+/// importer does — key-joined, in place, `pyscx.rollback`-able, `null` for cells
+/// the tool did not cover — plus the one thing that needs per-tool knowledge:
+/// each caller names its score and call differently, and downstream consensus
+/// code should not have to branch on which tool ran.
+///
+/// Emits, for `key_added="<K>"` (defaulting to the tool name):
+///
+/// * `obs["<K>_score"]` — f32, nullable, higher = more doublet-like
+/// * `obs["<K>_predicted"]` — bool, nullable; **omitted** for a tool that emits
+///   no call (scds), because thresholding a score is a scientific decision this
+///   importer does not own
+/// * `obs["<K>_status"]` — `"present"` / `"absent"`
+/// * `obs["<K>_<native>"]` — every other source column, unchanged
+/// * `uns["<K>"]` — tool, resolved source columns, join report
+///
+/// The canonical names match what a native SCX doublet run would write, so an
+/// imported result and a native one are drop-in comparable.
+#[pyfunction]
+#[pyo3(signature = (
+    path, table, *, tool, key=None, key_added=None, score_column=None,
+    call_column=None, call_true=None, call_false=None, keep_native_columns=true,
+    delimiter=None, overwrite=false, on_missing_rows="zero", on_extra_rows="warn",
+    dry_run=false
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn doublet_import(
+    py: Python<'_>,
+    path: &str,
+    table: &str,
+    tool: &str,
+    key: Option<Vec<String>>,
+    key_added: Option<&str>,
+    score_column: Option<&str>,
+    call_column: Option<&str>,
+    call_true: Option<&str>,
+    call_false: Option<&str>,
+    keep_native_columns: bool,
+    delimiter: Option<&str>,
+    overwrite: bool,
+    on_missing_rows: &str,
+    on_extra_rows: &str,
+    dry_run: bool,
+) -> PyResult<Py<PyDict>> {
+    let delimiter_byte = match delimiter {
+        None => None,
+        Some(s) => {
+            let bytes = s.as_bytes();
+            if bytes.len() != 1 {
+                return Err(PyValueError::new_err(format!(
+                    "delimiter must be exactly one byte; got {s:?}"
+                )));
+            }
+            Some(bytes[0])
+        }
+    };
+
+    // Resolve the profile up front so a typo'd tool name fails before any I/O,
+    // and so `key_added` can default to the profile's own name.
+    let profile = scx_convert::doublet_profile(tool).map_err(ops_to_pyerr)?;
+    let resolved_key_added = key_added
+        .filter(|s| !s.is_empty())
+        .unwrap_or(profile.name)
+        .to_string();
+
+    let (key_columns, join_key) = resolve_join_key(key);
+
+    let read_opts = scx_convert::DoubletImportOptions {
+        tool: tool.to_string(),
+        key_added: resolved_key_added.clone(),
+        score_column: score_column.map(str::to_string),
+        call_column: call_column.map(str::to_string),
+        call_true: call_true.map(str::to_string),
+        call_false: call_false.map(str::to_string),
+        keep_native_columns,
+        key_columns,
+        delimiter: delimiter_byte,
+    };
+    let attach_opts = scx_ops::AttachObsOptions {
+        join_key,
+        missing_row_policy: parse_obs_missing_rows(on_missing_rows)?,
+        extra_row_policy: parse_obs_extra_rows(on_extra_rows)?,
+        // Both are part of the canonical contract rather than knobs: `_status`
+        // says which cells the tool actually covered, and `uns` records what it
+        // was. `obs_import` remains the surface where they are optional.
+        status_column: Some(format!("{resolved_key_added}_status")),
+        uns_key: Some(resolved_key_added.clone()),
+        overwrite,
+        provenance_action: "doublet_import".to_string(),
+        dry_run,
+        ..Default::default()
+    };
+
+    let scx_path = PathBuf::from(path);
+    let table_path = PathBuf::from(table);
+
+    let (summary, info, diagnosis) = py.detach(|| -> PyResult<_> {
+        let (data, info) =
+            scx_convert::read_doublet_table(&table_path, &read_opts).map_err(ops_to_pyerr)?;
+        let summary =
+            scx_ops::attach_external_obs(&scx_path, &data, &attach_opts).map_err(ops_to_pyerr)?;
+        let diagnosis = if dry_run {
+            scx_ops::diagnose_obs_key(&scx_path, Some(&attach_opts.join_key)).ok()
+        } else {
+            None
+        };
+        Ok((summary, info, diagnosis))
+    })?;
+
+    let d = PyDict::new(py);
+    d.set_item("tool", info.tool)?;
+    d.set_item("key_added", info.key_added)?;
+    d.set_item("score_source_column", info.score_source_column)?;
+    d.set_item("call_source_column", info.call_source_column)?;
+    d.set_item("canonical_columns", info.canonical_columns)?;
+    d.set_item("native_columns", info.native_columns)?;
+    d.set_item("dropped_alias_columns", info.dropped_alias_columns)?;
+    d.set_item("n_rows_in_source", info.table.n_rows)?;
+    d.set_item("delimiter", (info.table.delimiter as char).to_string())?;
+    d.set_item("renamed_index_column", info.table.renamed_index_column)?;
+    d.set_item("source_key_columns", info.table.key_columns)?;
+    d.set_item("dry_run", dry_run)?;
+    d.set_item("n_obs", summary.n_obs)?;
+    d.set_item("n_matched", summary.n_matched)?;
+    d.set_item("n_target_rows_absent", summary.n_target_rows_absent)?;
+    d.set_item("n_source_rows_absent", summary.n_source_rows_absent)?;
+    d.set_item("obs_key_column", summary.obs_key_column)?;
+    d.set_item("obs_columns_added", summary.obs_columns_added)?;
+    d.set_item("obs_index_dropped", summary.obs_index_dropped)?;
+    if let Some(diag) = diagnosis {
+        d.set_item("key_diagnosis", key_diagnosis_dict(py, &diag)?)?;
+    }
+    Ok(d.into())
+}
+
+/// The valid `tool=` values for [`doublet_import`], in table order.
+#[pyfunction]
+pub fn doublet_tools() -> Vec<String> {
+    scx_convert::DOUBLET_PROFILE_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Report which obs columns could serve as a join key for `obs_import`.
 ///
 /// Read-only. Useful when an import fails on a duplicated key: on a merged
