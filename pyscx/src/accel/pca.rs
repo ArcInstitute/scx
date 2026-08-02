@@ -608,7 +608,7 @@ pub fn pca(
     // on-disk order while `adata.var` is in request order, so `varm["PCs"]`
     // would silently misalign against the gene names. Same guard the other
     // streaming accel ops already apply.
-    super::reject_preserve_var_order(adata, "pca")?;
+    super::prepare_target(py, adata, "pca")?;
 
     let backend: &str;
 
@@ -709,6 +709,11 @@ pub fn pca(
     // If a silent GPU→CPU runtime fallback is ever added here, switch to
     // stamping *after* dispatch on the branch that actually ran (see umap.rs),
     // or this gate will false-pass.
+    //
+    // The invariant is about which *branch* the recorded route names; it is
+    // orthogonal to whether the op finished. `RouteStamp` covers the latter —
+    // the stamp is rolled back if any branch below raises, so a present entry
+    // means the route ran *and* completed.
     #[cfg(feature = "gpu")]
     let pca_gpu_eligible = scx_accel::cusparse_modern_abi_available();
     #[cfg(not(feature = "gpu"))]
@@ -716,6 +721,10 @@ pub fn pca(
     // Pre-dispatch stamp records the route only; the tuning knobs + graph_replay
     // are filled by the per-branch re-stamp after GPU dispatch (and only for the
     // randomized route that actually uses them).
+    // One guard for the whole op, opened at the earliest stamp: the GPU
+    // branches re-stamp after dispatch, and a failure after that must still
+    // restore whatever a previous successful pca recorded.
+    let route = super::route::RouteStamp::begin(adata, "pca")?;
     stamp_pca_route(py, adata, device, pca_gpu_eligible, None, None, None)?;
 
     // ------- GPU path -------
@@ -807,6 +816,7 @@ pub fn pca(
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
             stamp(result.graph_replayed, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
+            route.commit();
             return Ok(());
         }
 
@@ -846,6 +856,7 @@ pub fn pca(
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
             stamp(result.graph_replayed, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
+            route.commit();
             return Ok(());
         }
 
@@ -894,6 +905,7 @@ pub fn pca(
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
             stamp(result.graph_replayed, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
+            route.commit();
             return Ok(());
         }
 
@@ -934,6 +946,7 @@ pub fn pca(
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
         stamp(result.graph_replayed, m)?;
         write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
+        route.commit();
         return Ok(());
     }
 
@@ -1083,6 +1096,7 @@ pub fn pca(
 
     write_pca_to_adata(py, adata, &result, backend, Some(&write_params))?;
 
+    route.commit();
     Ok(())
 }
 

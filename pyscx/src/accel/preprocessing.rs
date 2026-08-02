@@ -137,7 +137,7 @@ pub fn normalize_total(
     // A presentation-ordered backed X (preserve_var_order=True) would have its
     // request-ordered var misaligned against the sorted-projection lazy X this
     // op produces — reject rather than silently mis-order.
-    super::reject_preserve_var_order(adata, "normalize_total")?;
+    super::prepare_target(py, adata, "normalize_total")?;
 
     // Any prior fusion marker is now stale: this normalize call supersedes it.
     // The GPU success path will stash a fresh marker; CPU / scipy-fallback
@@ -182,7 +182,9 @@ pub fn normalize_total(
         }
     }
 
-    super::route::write_accel_route(
+    // The stamp is rolled back if anything below raises, so a present
+    // `uns["scx_accel"]["normalize_total"]` always means the op completed.
+    let route = super::route::RouteStamp::write(
         py,
         adata,
         "normalize_total",
@@ -196,7 +198,9 @@ pub fn normalize_total(
 
     #[cfg(feature = "gpu")]
     if let Some(device_id) = _device.gpu_id() {
-        return gpu_normalize_total(py, adata, target_sum, device_id, device);
+        return route.settle(gpu_normalize_total(
+            py, adata, target_sum, device_id, device,
+        ));
     }
 
     let x = adata.getattr("X")?;
@@ -253,6 +257,7 @@ pub fn normalize_total(
         // Drop the borrow before setattr to avoid RefCell borrow conflict
         drop(backed_ref);
         adata.setattr("X", Bound::new(py, lazy)?)?;
+        route.commit();
         return Ok(());
     }
 
@@ -283,6 +288,7 @@ pub fn normalize_total(
             row_sums: Arc::new(sums),
             target_sum: target,
         });
+        route.commit();
         return Ok(());
     }
 
@@ -292,6 +298,7 @@ pub fn normalize_total(
     kwargs.set_item("target_sum", target_sum)?;
     sc.getattr("pp")?
         .call_method("normalize_total", (adata,), Some(&kwargs))?;
+    route.commit();
     Ok(())
 }
 
@@ -327,8 +334,9 @@ pub fn normalize_total(
 pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult<()> {
     let _device = validate_device_or_default(device)?;
 
-    // See normalize_total: a presentation-ordered backed X would misalign.
-    super::reject_preserve_var_order(adata, "log1p")?;
+    // See normalize_total: a presentation-ordered backed X would misalign, and
+    // a view must be rebuilt as actual before the first `uns` write below.
+    super::prepare_target(py, adata, "log1p")?;
 
     // Record the planned route. The GPU kernel runs when a normalize+log1p
     // fusion marker is present (re-runs over the ORIGINAL source) or when X is
@@ -370,7 +378,8 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
         }
     }
 
-    super::route::write_accel_route(
+    // Rolled back if anything below raises — see RouteStamp.
+    let route = super::route::RouteStamp::write(
         py,
         adata,
         "log1p",
@@ -384,7 +393,7 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
 
     #[cfg(feature = "gpu")]
     if let Some(device_id) = _device.gpu_id() {
-        return gpu_log1p_dispatch(py, adata, device_id, device);
+        return route.settle(gpu_log1p_dispatch(py, adata, device_id, device));
     }
 
     // CPU log1p invalidates any pending GPU fusion: a later log1p(device="gpu")
@@ -415,6 +424,7 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
         // Drop the borrow before setattr to avoid RefCell borrow conflict
         drop(backed_ref);
         adata.setattr("X", Bound::new(py, lazy)?)?;
+        route.commit();
         return Ok(());
     }
 
@@ -422,12 +432,14 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
     if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let mut lazy_ref = lazy.borrow_mut();
         lazy_ref.transforms.push(Transform::Log1p);
+        route.commit();
         return Ok(());
     }
 
     // Case 3: X is a regular scipy sparse or dense — delegate to scanpy
     let sc = py.import("scanpy")?;
     sc.getattr("pp")?.call_method1("log1p", (adata,))?;
+    route.commit();
     Ok(())
 }
 
@@ -512,7 +524,7 @@ pub fn calculate_qc_metrics<'py>(
 
     // Per-gene QC metrics are computed over the sorted projection and written to
     // adata.var; a presentation-ordered backed X would misalign them.
-    super::reject_preserve_var_order(adata, "calculate_qc_metrics")?;
+    super::prepare_target(py, adata, "calculate_qc_metrics")?;
 
     // Record the planned route. QC metrics have no GPU kernel; the only route
     // choice is the gene-axis layout — cpu_csc when prefer_format="csc" (reads
@@ -523,7 +535,9 @@ pub fn calculate_qc_metrics<'py>(
     } else {
         scx_accel::AccelRoute::CpuCsr
     };
-    super::route::write_accel_route(
+    // Rolled back if anything below raises — notably the `prefer_format="csc"`
+    // rejection on a scipy X, which happens after this point.
+    let route = super::route::RouteStamp::write(
         py,
         adata,
         "calculate_qc_metrics",
@@ -559,9 +573,11 @@ pub fn calculate_qc_metrics<'py>(
         if !qc_vars.is_empty() {
             kwargs.set_item("qc_vars", &qc_vars)?;
         }
-        return sc
-            .getattr("pp")?
-            .call_method("calculate_qc_metrics", (adata,), Some(&kwargs));
+        return route.settle(sc.getattr("pp")?.call_method(
+            "calculate_qc_metrics",
+            (adata,),
+            Some(&kwargs),
+        ));
     }
 
     // --- Streaming path for SCX-backed / lazy data ---
@@ -728,10 +744,12 @@ pub fn calculate_qc_metrics<'py>(
             let values = var_df.get_item(col.as_str())?;
             adata_var.set_item(col.as_str(), &values)?;
         }
+        route.commit();
         Ok(py.None().into_bound(py))
     } else {
         // Return (obs_df, var_df) tuple
         let tuple = pyo3::types::PyTuple::new(py, &[obs_df, var_df])?;
+        route.commit();
         Ok(tuple.into_any())
     }
 }

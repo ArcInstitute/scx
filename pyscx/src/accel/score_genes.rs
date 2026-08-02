@@ -65,7 +65,7 @@ pub fn score_genes<'py>(
     // gene_list is resolved against var_names (presentation order) but the
     // ShardSource gathers in sorted-projection order — a presentation-ordered
     // backed X would score the wrong physical columns. Reject loudly.
-    super::reject_preserve_var_order(adata, "score_genes")?;
+    super::prepare_target(py, adata, "score_genes")?;
 
     // ── Parse the scoring method ────────────────────────────────────────
     let method_enum = match method {

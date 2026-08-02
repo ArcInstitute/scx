@@ -46,6 +46,11 @@ pub fn umap(
     random_state: u64,
     device: &str,
 ) -> PyResult<()> {
+    // Rebuild an AnnData view as actual before the first write below
+    // (obsm / obs / uns), so a backed X is not gathered by anndata's
+    // copy-on-write. No var-order guard: this op is gene-order agnostic.
+    super::prepare_target_no_var_guard(py, adata, "umap")?;
+
     let numpy = py.import("numpy")?;
 
     // Determine effective device

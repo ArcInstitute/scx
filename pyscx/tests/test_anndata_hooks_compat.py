@@ -34,6 +34,19 @@ ANNDATA_METHODS = [
     "_init_as_actual",
 ]
 
+# The view internals `axis_align::devirtualize_scx_view` reads to decide whether
+# the AnnData it was handed is a view over a backed `X`. One entry per name, so
+# an anndata upgrade names its own casualty.
+ANNDATA_VIEW_ATTRS = [
+    # Truthy on a view. Without it every accel op would try to detect a view by
+    # catching the `TypeError` from anndata's X-setter.
+    "is_view",
+    # The parent a view was sliced from. Probed instead of `adata.X` because on
+    # a view of an in-memory parent, reading `adata.X` performs a real
+    # submatrix copy for a case the prologue then declines.
+    "_adata_ref",
+]
+
 # Every SCX handle that can appear as `X`, a layer, or an aligned value.
 HANDLE_CLASS_NAMES = [
     "ScxBackedSparseDataset",
@@ -101,6 +114,26 @@ def test_anndata_method_exists(method):
     assert hasattr(AnnData, method), (
         f"AnnData.{method} is gone; pyscx.accel.filter_cells / filter_genes / "
         "subset_obs / subset_var drive it directly"
+    )
+
+
+@pytest.mark.parametrize("attr", ANNDATA_VIEW_ATTRS)
+def test_anndata_view_attr_exists(attr, scx_hooks_path):
+    """Asserted on an actual view, not on the class.
+
+    `is_view` is a property and `_adata_ref` is only set on a view, so
+    `hasattr(AnnData, ...)` would pass vacuously for one and fail spuriously
+    for the other.
+    """
+    import numpy as np
+    import pyscx
+
+    adata = pyscx.open(scx_hooks_path).to_anndata(backed=True)
+    view = adata[np.arange(adata.n_obs) % 2 == 0]
+    assert hasattr(view, attr), (
+        f"AnnData view has no {attr}; pyscx.accel's prologue "
+        "(axis_align::devirtualize_scx_view) uses it to spot a view over a "
+        "backed X before an accel op writes to it"
     )
 
 

@@ -38,7 +38,8 @@
 //! `col_projection` X ended up with rather than a parallel computation that
 //! could drift from it.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -174,6 +175,14 @@ fn subset_axis(
     axis: Axis,
     keep: &[bool],
 ) -> PyResult<()> {
+    // Subsetting a *view* in place is not expressible — `_init_as_actual`
+    // would detach it from the parent it is supposed to track. Rebuild it as
+    // an actual AnnData first, keeping `X` lazy. This one call covers
+    // `filter_cells` / `filter_genes` / `subset_obs` / `subset_var` and HVG
+    // `subset=True`, and must precede the marker clear below: `uns.pop` on a
+    // view's transient `DictView` copy is silently lost.
+    devirtualize_scx_view(py, adata, "subset")?;
+
     // Any axis subset invalidates a pending GPU normalize-fusion marker: its
     // `kept_to_global` / `n_obs` / `n_vars` no longer describe `adata`. Doing
     // it here rather than per-op is what covers HVG `subset=True`, which never
@@ -272,10 +281,28 @@ fn rebuild_via_anndata(
         Axis::Var => adata.get_item((PySlice::full(py), &idx))?,
     };
 
+    reinit_as_actual_keeping_handles(py, adata, &view)
+}
+
+/// `view._mutated_copy(X=view.X, …)` → `target._init_as_actual(new)`.
+///
+/// The substitution over `AnnData.copy()` described on [`rebuild_via_anndata`]:
+/// `X` and the aligned mappings go over **un-copied**, so an SCX handle stays
+/// lazy instead of being gathered.
+///
+/// `target` and `view` are distinct when a caller builds the view itself
+/// ([`rebuild_via_anndata`]) and the *same object* when de-viewing a view in
+/// place ([`devirtualize_scx_view`]) — `_init_as_actual` mutates the target,
+/// which is exactly what anndata's own copy-on-write does to a view.
+fn reinit_as_actual_keeping_handles(
+    py: Python<'_>,
+    target: &Bound<'_, PyAny>,
+    view: &Bound<'_, PyAny>,
+) -> PyResult<()> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("X", view.getattr("X")?)?;
     for name in ["layers", "obsm", "varm", "obsp", "varp"] {
-        kwargs.set_item(name, subset_mapping_keeping_handles(py, &view, name)?)?;
+        kwargs.set_item(name, subset_mapping_keeping_handles(py, view, name)?)?;
     }
     // `raw` for the same reason as `X`. Left to `_mutated_copy`'s fallback it
     // becomes `self.raw.copy()` → `Raw.copy()` → `.copy()` on the handle, which
@@ -289,8 +316,127 @@ fn rebuild_via_anndata(
         kwargs.set_item("raw", raw)?;
     }
     let new = view.call_method("_mutated_copy", (), Some(&kwargs))?;
-    adata.call_method1("_init_as_actual", (new,))?;
+    target.call_method1("_init_as_actual", (new,))?;
     Ok(())
+}
+
+/// One-shot-per-op registry for the de-view notice, so a per-gene / per-batch
+/// loop over a view doesn't flood the user with duplicates.
+static DEVIEW_WARNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+
+/// Rebuild an anndata **view** over a backed/lazy `X` as an actual `AnnData`,
+/// without materializing the matrix. Returns whether a rebuild happened.
+///
+/// # Why every write-back accelerator calls this first
+///
+/// An accelerator writes its result onto `adata` — `X`, `obs`, `var`, `obsm`,
+/// or just the `uns["scx_accel"]` route stamp. On a view every one of those
+/// goes through anndata's copy-on-write, and copy-on-write is
+/// `adata.copy()` → `_subset(ref.X, idx).copy()` → **the whole matrix in RAM**.
+/// That is the wrong answer for a handle whose entire purpose is to stay on
+/// disk (a 500k × 3k gene subset went 1.8 GB → 10.3 GB), and on the one path
+/// where copy-on-write does *not* fire — a nested `uns` write, when
+/// `uns["scx_accel"]` already exists — the object stays a view and the
+/// subsequent `adata.X = …` dies inside anndata with
+/// `'ScxBackedSparseDataset' object does not support item assignment`.
+///
+/// So we reach the same end state anndata's copy-on-write would (an actual
+/// `AnnData`, detached from its parent, results landing on it and not on the
+/// parent) via [`reinit_as_actual_keeping_handles`], which keeps `X` lazy.
+///
+/// # When it declines
+///
+/// - `adata` is not a view → nothing to do.
+/// - The parent's `X` is not an SCX handle → a plain scipy/dense `X` has no
+///   lazy handle to protect, anndata's own copy-on-write is correct and cheap
+///   there, and de-viewing anyway would suppress the
+///   `ImplicitModificationWarning` scanpy users expect.
+/// - `adata` is not an `AnnData` at all (a `MuData` modality, a duck type) →
+///   every probe is `.ok()`-guarded, so this is a no-op rather than an
+///   `AttributeError`.
+///
+/// The parent's `X` is probed via `_adata_ref`, never `adata.X`: on a view of
+/// an *in-memory* parent, reading `adata.X` performs a real submatrix copy —
+/// pure waste for a case we then decline.
+///
+/// # Known carve-out
+///
+/// A view whose index is not expressible as a window (a duplicated or
+/// descending selection, e.g. `adata[[2, 2, 7]]` — see
+/// [`crate::anndata_hooks`]) already holds a materialized `view.X`. The rebuild
+/// then installs scipy, exactly as anndata's copy-on-write would. Nothing to
+/// special-case; it is documented in `docs/api.md`.
+pub(crate) fn devirtualize_scx_view(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    op: &'static str,
+) -> PyResult<bool> {
+    let is_view = adata
+        .getattr("is_view")
+        .ok()
+        .and_then(|v| v.is_truthy().ok())
+        .unwrap_or(false);
+    if !is_view {
+        return Ok(false);
+    }
+    let Some(parent_x) = adata
+        .getattr("_adata_ref")
+        .ok()
+        .and_then(|parent| parent.getattr("X").ok())
+    else {
+        return Ok(false);
+    };
+    if !is_scx_handle(&parent_x) {
+        return Ok(false);
+    }
+    // `view.X` below goes through the `_subset` hook. Without the hooks
+    // registered anndata would materialize it behind our back, which is the
+    // one outcome this function exists to prevent.
+    if !crate::anndata_hooks::hooks_registered() {
+        return Err(crate::anndata_hooks::missing_hooks_error());
+    }
+
+    reinit_as_actual_keeping_handles(py, adata, adata)?;
+
+    log::info!(
+        target: "pyscx.accel",
+        "{op}: rebuilt an AnnData view as actual in place; X stays lazy",
+    );
+    let first_time = {
+        let set = DEVIEW_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(op)
+    };
+    if first_time {
+        // anndata emits `ImplicitModificationWarning` for the same transition,
+        // so staying silent would *lose* signal about the detachment. What the
+        // message adds is the part anndata's does not say: no data was copied.
+        let msg = format!(
+            "pyscx.accel.{op}: the AnnData passed in was a view (e.g. adata[:, mask]); it has \
+             been rebuilt in place as a regular AnnData so the result can be written to it. \
+             No data was copied — X stays lazy — but the object no longer tracks the parent it \
+             was sliced from, and the result lands on it, not on the parent. Use \
+             pyscx.accel.subset_var / subset_obs to subset a backed AnnData in place and avoid \
+             the transition."
+        );
+        let warned = py
+            .import("anndata")
+            .and_then(|m| m.getattr("ImplicitModificationWarning"))
+            .and_then(|cls| {
+                py.import("warnings")?
+                    .call_method1("warn", (msg.as_str(), cls))
+            })
+            .is_ok();
+        if !warned {
+            if let Ok(warnings) = py.import("warnings") {
+                let _ = warnings.call_method1(
+                    "warn",
+                    (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
+                );
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// `AlignedMapping.copy()`, except SCX handles are passed through un-copied.

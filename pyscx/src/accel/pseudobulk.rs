@@ -383,7 +383,7 @@ pub fn pseudobulk_dex(
     // that this op streams the handle's *view*, the two widths match, so the
     // mismatch would be a silent gene/column permutation instead of a shape
     // error. Refuse, as the other streaming accel ops do.
-    super::reject_preserve_var_order(adata, "pseudobulk_dex")?;
+    super::prepare_target(py, adata, "pseudobulk_dex")?;
 
     if !matches!(backend, "pydeseq2" | "nb_glm") {
         return Err(PyValueError::new_err(format!(
@@ -426,7 +426,8 @@ pub fn pseudobulk_dex(
     } else {
         scx_accel::AccelRoute::CpuCsr
     };
-    super::route::write_accel_route(
+    // Rolled back if anything below raises — see RouteStamp.
+    let route = super::route::RouteStamp::write(
         py,
         adata,
         "pseudobulk_dex",
@@ -501,6 +502,7 @@ pub fn pseudobulk_dex(
             }),
         )?;
 
+        route.commit();
         return Ok(combined.unbind());
     }
 
@@ -579,6 +581,7 @@ pub fn pseudobulk_dex(
         } else {
             super::nb_glm::fit_targets_pandas(py, &result, test_col_idx, reference, &nb_opts, None)?
         };
+        route.commit();
         return Ok(df.unbind());
     }
 
@@ -790,5 +793,6 @@ pub fn pseudobulk_dex(
         }),
     )?;
 
+    route.commit();
     Ok(combined.unbind())
 }

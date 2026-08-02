@@ -157,3 +157,105 @@ def test_pca_gpu_randomized_records_tuned_knobs():
     assert info["route"] == "gpu_csr"
     assert info["math_mode"] == "allow_tf32"
     assert info["spmm_policy"] == "deterministic"
+
+
+# ---------------------------------------------------------------------------
+# The stamp means "this op completed"
+# ---------------------------------------------------------------------------
+#
+# Thirteen ops stamp their route *before* dispatch, so the route is known while
+# a long backed run is still in flight. The cost, until `RouteStamp`, was that a
+# raise left the stamp behind and `uns["scx_accel"]` claimed an op had run when
+# it hadn't. Found by dogfooding v0.11.8: `normalize_total` raised on a backed
+# view, `pca` then happily ran on the un-normalized counts, and the metadata
+# asserted the normalize had happened on `cpu_csr`.
+#
+# The contract these pin: `uns["scx_accel"][op]` is present **iff** the op
+# completed — and a failing re-run *restores* the entry an earlier successful
+# run left, rather than deleting it.
+#
+# Each trigger below raises strictly *after* its op's stamp. That is the whole
+# point, so it is worth being explicit about where: `calculate_qc_metrics`
+# rejects `prefer_format="csc"` on a scipy X only once it has seen `adata.X`;
+# `pca` and `neighbors` fail inside the scx-accel kernels. (A pre-stamp raise —
+# `neighbors(use_rep="X_missing")`, say — would pass these tests vacuously.)
+
+
+def _scx_accel(adata):
+    return adata.uns.get("scx_accel", {})
+
+
+def test_failing_op_does_not_create_the_container():
+    adata = _random_count_adata(n_obs=60, n_vars=25, density=0.4, seed=11)
+    assert "scx_accel" not in adata.uns
+
+    with pytest.raises(RuntimeError, match="requires adata.X"):
+        pyscx.accel.calculate_qc_metrics(adata, prefer_format="csc")
+
+    assert "scx_accel" not in adata.uns, (
+        "a failing first accel op must leave uns exactly as it found it"
+    )
+
+
+def test_failing_op_restores_the_previous_stamp():
+    """Restore, don't delete: a bad re-run must not erase a good stamp.
+
+    600 genes because the *successful* call delegates to scanpy on a scipy X,
+    and scanpy's default `percent_top=[50, 100, 200, 500]` requires at least
+    500 columns.
+    """
+    adata = _random_count_adata(n_obs=60, n_vars=600, density=0.1, seed=12)
+    pyscx.accel.calculate_qc_metrics(adata)
+    good = dict(_route(adata, "calculate_qc_metrics"))
+
+    with pytest.raises(RuntimeError, match="requires adata.X"):
+        pyscx.accel.calculate_qc_metrics(adata, prefer_format="csc")
+
+    assert dict(_route(adata, "calculate_qc_metrics")) == good
+
+
+def test_failing_hvg_leaves_no_stamp():
+    adata = _random_count_adata(n_obs=60, n_vars=25, density=0.4, seed=13)
+    with pytest.raises(KeyError):
+        pyscx.accel.highly_variable_genes(
+            adata, n_top_genes=5, flavor="seurat_v3", batch_key="does_not_exist"
+        )
+    assert "highly_variable_genes" not in _scx_accel(adata)
+
+
+def test_failing_pca_leaves_no_stamp():
+    adata = _random_count_adata(n_obs=100, n_vars=50, density=0.4, seed=14)
+    with pytest.raises(RuntimeError, match="exceeds matrix rank bound"):
+        pyscx.accel.pca(adata, n_comps=200, device="cpu")
+    assert "pca" not in _scx_accel(adata)
+
+
+def test_failing_pca_restores_the_earlier_pca_stamp():
+    """Covers `stamp_pca_route`, which stamps pre-dispatch and re-stamps after."""
+    adata = _random_count_adata(n_obs=100, n_vars=50, density=0.4, seed=15)
+    pyscx.accel.pca(adata, n_comps=5, device="cpu")
+    good = dict(_route(adata, "pca"))
+
+    with pytest.raises(RuntimeError, match="exceeds matrix rank bound"):
+        pyscx.accel.pca(adata, n_comps=200, device="cpu")
+
+    assert dict(_route(adata, "pca")) == good
+
+
+def test_failing_neighbors_leaves_no_stamp():
+    adata = _random_count_adata(n_obs=100, n_vars=50, density=0.4, seed=16)
+    pyscx.accel.pca(adata, n_comps=5, device="cpu")
+    with pytest.raises(RuntimeError, match="exceeds n_obs"):
+        pyscx.accel.neighbors(adata, n_neighbors=1000, use_rep="X_pca", device="cpu")
+    assert "neighbors" not in _scx_accel(adata)
+
+
+def test_a_neighbours_failure_does_not_disturb_other_ops_stamps():
+    adata = _random_count_adata(n_obs=100, n_vars=50, density=0.4, seed=17)
+    pyscx.accel.pca(adata, n_comps=5, device="cpu")
+
+    with pytest.raises(RuntimeError, match="exceeds n_obs"):
+        pyscx.accel.neighbors(adata, n_neighbors=1000, use_rep="X_pca", device="cpu")
+
+    assert "pca" in _scx_accel(adata), "an unrelated op's stamp must survive"
+    assert "neighbors" not in _scx_accel(adata)

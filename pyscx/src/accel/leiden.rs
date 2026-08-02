@@ -76,6 +76,11 @@ pub fn leiden(
     parallel: bool,
     theta: f64,
 ) -> PyResult<()> {
+    // Rebuild an AnnData view as actual before the first write below
+    // (obsm / obs / uns), so a backed X is not gathered by anndata's
+    // copy-on-write. No var-order guard: this op is gene-order agnostic.
+    super::prepare_target_no_var_guard(py, adata, "leiden")?;
+
     let resolved = resolve_device(device)?;
     let use_gpu = resolved.is_gpu();
 
