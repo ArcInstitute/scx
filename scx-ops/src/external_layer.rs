@@ -80,7 +80,7 @@ use crate::in_place::{
 /// `barcode` earns its place because `scx convert --from 10x` writes obs as a
 /// bare `barcode` column with no pandas index metadata — exactly the files most
 /// likely to be an import target.
-const OBS_KEY_FALLBACKS: &[&str] = &[
+pub(crate) const OBS_KEY_FALLBACKS: &[&str] = &[
     "barcode",
     "barcodes",
     "cell_id",
@@ -108,7 +108,7 @@ const RESERVED_LAYER_NAMES: &[&str] = &["X", "raw"];
 
 /// How many example keys to show when a join fails, so a mismatch is
 /// diagnosable in one shot rather than one round trip per guess.
-const KEY_EXAMPLES: usize = 3;
+pub(crate) const KEY_EXAMPLES: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -369,6 +369,11 @@ pub fn attach_external_layer(
     // --- Collision checks ---------------------------------------------------
     let obs_new_columns = planned_obs_columns(data, opts);
     let var_new_columns = planned_var_columns(data);
+    // A pure column *add* leaves the obs predicate index valid — it keys on
+    // column name and the indexed columns are untouched. An overwrite of an
+    // indexed column does not: the index would describe values that no longer
+    // exist and pushdown would silently return wrong rows.
+    let drop_obs_index = crate::external_obs::obs_index_would_go_stale(&reader, &obs_new_columns)?;
     if !opts.overwrite {
         check_collisions(
             &reader,
@@ -552,7 +557,7 @@ pub fn attach_external_layer(
         .old_catalog
         .entries
         .into_iter()
-        .filter(|e| !should_drop_old_entry(e, opts, &obsm_batches))
+        .filter(|e| !should_drop_old_entry(e, opts, drop_obs_index, &obsm_batches))
         .collect();
     entries.extend(new_section_entries);
     entries.push(FullCatalogEntry {
@@ -706,7 +711,7 @@ fn validate_values_finite_nonnegative(values: &[f32]) -> Result<()> {
 // Key resolution and joins
 // ---------------------------------------------------------------------------
 
-fn is_string_column(dt: &DataType) -> bool {
+pub(crate) fn is_string_column(dt: &DataType) -> bool {
     match dt {
         DataType::Utf8 | DataType::LargeUtf8 => true,
         DataType::Dictionary(_, v) => matches!(**v, DataType::Utf8 | DataType::LargeUtf8),
@@ -714,8 +719,44 @@ fn is_string_column(dt: &DataType) -> bool {
     }
 }
 
+/// Whether an **explicitly requested** key column can serve as a join key.
+///
+/// Wider than [`is_string_column`] because both sides of the join go through
+/// [`string_column`], which casts to `Utf8` — so an integer key fuses
+/// identically on both sides and joins exactly.
+///
+/// This matters for the case the feature exists for: on a merged
+/// CELLxGENE-derived atlas the obs index is duplicated and `soma_joinid` — an
+/// `Int64` — is the *only* unique column. `diagnose_obs_key` suggests it, and
+/// before this a user following that suggestion hit "column 'soma_joinid' has
+/// type Int64, which is not a string column". The diagnosis pointed at a key
+/// the join then refused.
+///
+/// Floats stay rejected: `f64 → Utf8` formatting is not guaranteed to agree
+/// between two independently-produced sides, so a float key could silently
+/// half-match. Auto-resolution is also unchanged — guessing that a numeric
+/// column is the identity is a different and worse risk than honouring an
+/// explicit request.
+pub(crate) fn is_joinable_key_column(dt: &DataType) -> bool {
+    if is_string_column(dt) {
+        return true;
+    }
+    match dt {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => true,
+        DataType::Dictionary(_, v) => is_joinable_key_column(v),
+        _ => false,
+    }
+}
+
 /// Resolve the join key column, never falling back to positional.
-fn resolve_key_column(
+pub(crate) fn resolve_key_column(
     axis: &'static str,
     batch: &RecordBatch,
     requested: Option<&str>,
@@ -730,11 +771,16 @@ fn resolve_key_column(
 
     if let Some(name) = requested {
         return match schema.field_with_name(name) {
-            Ok(f) if is_string_column(f.data_type()) => Ok(name.to_string()),
+            // An explicit request accepts any type that fuses identically on
+            // both sides — see `is_joinable_key_column`.
+            Ok(f) if is_joinable_key_column(f.data_type()) => Ok(name.to_string()),
             Ok(f) => Err(OpsError::KeyColumnUnresolved {
                 axis,
                 detail: format!(
-                    "column '{name}' has type {:?}, which is not a string column",
+                    "column '{name}' has type {:?}, which cannot be a join key. \
+                     Strings and integers work (both sides are fused as text); \
+                     floats are refused because their text form is not \
+                     guaranteed to agree across two independently written sides",
                     f.data_type()
                 ),
             }),
@@ -779,7 +825,7 @@ fn resolve_key_column(
 /// Used to retry the column join when the preferred key has no overlap: a
 /// target converted from 10x carries both Ensembl `id` and symbol `name`, and
 /// the external tool may have keyed on the other one.
-fn candidate_key_columns(axis: &'static str, batch: &RecordBatch) -> Vec<String> {
+pub(crate) fn candidate_key_columns(axis: &'static str, batch: &RecordBatch) -> Vec<String> {
     let schema = batch.schema();
     let fallbacks = if axis == "obs" {
         OBS_KEY_FALLBACKS
@@ -798,7 +844,7 @@ fn candidate_key_columns(axis: &'static str, batch: &RecordBatch) -> Vec<String>
 }
 
 /// Materialize a string column as owned `String`s, resolving dictionaries.
-fn string_column(batch: &RecordBatch, name: &str) -> Result<Vec<String>> {
+pub(crate) fn string_column(batch: &RecordBatch, name: &str) -> Result<Vec<String>> {
     let col = batch
         .column_by_name(name)
         .ok_or_else(|| OpsError::InvalidInput(format!("column '{name}' disappeared")))?;
@@ -831,11 +877,11 @@ struct RowJoin {
     n_source_absent_nonzero: u64,
 }
 
-fn examples(keys: &[String]) -> Vec<&str> {
+pub(crate) fn examples(keys: &[String]) -> Vec<&str> {
     keys.iter().take(KEY_EXAMPLES).map(|s| s.as_str()).collect()
 }
 
-fn first_duplicates(keys: &[String]) -> Vec<&str> {
+pub(crate) fn first_duplicates(keys: &[String]) -> Vec<&str> {
     let mut seen = std::collections::HashSet::new();
     let mut dups = Vec::new();
     for k in keys {
@@ -1374,17 +1420,25 @@ fn check_collisions(
 
 /// Whether an old catalog entry is superseded and must be dropped.
 ///
-/// Deliberately narrow. In particular the predicate indexes are **kept**: they
-/// key on column name and CSR shard range with no schema hash, and this op only
-/// adds columns and never touches CSR shards, so dropping them (as
-/// `modify_metadata` must) would silently kill query pushdown.
+/// Deliberately narrow. The predicate indexes are **kept** whenever this import
+/// only *adds* columns: they key on column name and CSR shard range with no
+/// schema hash, and this op never touches CSR shards, so dropping them (as
+/// `modify_metadata` must) would silently kill query pushdown. The exception is
+/// `drop_obs_index` — an overwrite of a column the obs index covers, where
+/// keeping it would leave pushdown reading values that no longer exist.
 fn should_drop_old_entry(
     e: &FullCatalogEntry,
     opts: &AttachLayerOptions,
+    drop_obs_index: bool,
     obsm: &[(String, RecordBatch)],
 ) -> bool {
     use SectionType::*;
     if e.section_type == Provenance {
+        return true;
+    }
+    // The one case where the index is NOT safe to keep: this import overwrites
+    // an obs column the index covers, so its entries now describe stale values.
+    if drop_obs_index && e.section_type == ObsPredicateIndex {
         return true;
     }
     if e.section_type == UnsBlob && e.modality_id == 0 {

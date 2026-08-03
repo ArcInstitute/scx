@@ -25,6 +25,30 @@ mod hdf_dtype;
 #[cfg(feature = "hdf5")]
 mod tenx_read;
 
+// Ungated: a delimited-table reader must not require libhdf5, or `scx
+// obs-import` would be unavailable in a no-hdf5 build.
+mod annotation_table;
+pub use annotation_table::{
+    read_annotation_table, read_obs_source, sniff_obs_source, AnnotationTableInfo,
+    AnnotationTableOptions, ObsSourceFormat,
+};
+
+// The h5ad `/obs` reader behind `read_obs_source`'s H5ad arm. Gated like every
+// other h5ad path; the dispatcher keeps a clear error without it.
+#[cfg(feature = "hdf5")]
+mod h5ad_obs;
+#[cfg(feature = "hdf5")]
+pub use h5ad_obs::read_h5ad_obs;
+
+mod doublet;
+pub use doublet::{
+    doublet_profile, profile_has_call_column, read_doublet_table, CallTokens, DoubletImportOptions,
+    DoubletProfile, DoubletTableInfo, DOUBLET_PROFILE_NAMES,
+};
+
+// Shared by the gated cellbender reader and the ungated table reader.
+mod file_checksum;
+
 #[cfg(feature = "hdf5")]
 mod cellbender;
 #[cfg(feature = "hdf5")]

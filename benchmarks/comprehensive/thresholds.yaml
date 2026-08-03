@@ -300,6 +300,129 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: correctness_n_failed
     max: 0
+  # --- doublet_interop: the plumbing tier ------------------------------
+  #
+  # `doublet_interop.py` runs external doublet callers, imports their results
+  # through `pyscx.doublet_import`, then reads the canonical obs columns back
+  # and compares them with each tool's own output **joined by key**. These
+  # three floors gate that round trip, and only that: they are deterministic
+  # (an exact value comparison and two counts), so they can be set from first
+  # principles rather than calibrated.
+  #
+  # `roundtrip_call_disagreements` is the load-bearing one. A *positional*
+  # import — the failure mode this whole interop exists to prevent — passes
+  # every row-count and column-presence check and shows up here and nowhere
+  # else, as every call landing on the wrong cell. `import_matched_frac` at
+  # 1.0 catches the opposite failure: a join that silently matched nothing.
+  #
+  # `check_absolute_floors` skips a triple whose metric is absent, so these are
+  # no-ops on a run where no tool env was available (the metrics are only
+  # emitted when at least one tool actually ran).
+  #
+  # The SCIENCE tier — AUROC against injected truth, pairwise kappa, score-rank
+  # Spearman — is floored separately below, and only after a capture showed
+  # repeat runs are bit-identical. Those are distributional, so a guessed bound
+  # would either fire on noise or pass anything; the values there are
+  # calibrated from observed numbers with a margin. What remains deferred is
+  # listed in the "Deferred floors" note at the end of this file.
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: roundtrip_call_disagreements
+    max: 0
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: roundtrip_max_score_delta
+    max: 1.0e-5
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: import_matched_frac
+    min: 1.0
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: pbmc3k
+    metric: roundtrip_call_disagreements
+    max: 0
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: pbmc3k
+    metric: roundtrip_max_score_delta
+    max: 1.0e-5
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: pbmc3k
+    metric: import_matched_frac
+    min: 1.0
+
+  # --- doublet_interop: the science tier -------------------------------
+  #
+  # Calibrated 2026-08-03 from the first captures, after confirming the run is
+  # **bit-identical across two invocations** (all 19 emitted metrics) — the
+  # injection seed, the tool seeds and scDblFinder's `set.seed` carry all the
+  # way through, so these are not noisy quantities and a floor is meaningful.
+  #
+  # Observed / floor:
+  #   pbmc3k              scdblfinder AUROC 0.979 / 0.90   scrublet 0.785 / 0.70
+  #   tabula_sapiens_100k scdblfinder AUROC 0.912 / 0.85   scrublet 0.841 / 0.75
+  #   kappa               0.482 / 0.459  ->  0.35 both
+  #   score Spearman      0.280 / 0.369  ->  0.20 both
+  #
+  # The margins are deliberately wide (~0.05-0.09). These floors exist as a
+  # REGRESSION TRIPWIRE — if a change to the import path silently corrupted
+  # scores, AUROC would collapse and this catches it. They are NOT an accuracy
+  # claim about the tools: the truth is computational injection
+  # (DOUBLET-DETECTION.md Category D), so the absolute numbers are a property
+  # of summed count vectors as much as of the caller. A scDblFinder or Scrublet
+  # version bump may legitimately move these; re-calibrate rather than assume a
+  # regression.
+  #
+  # Raw agreement is floored nowhere on purpose. It reads 0.953 / 0.966 here,
+  # which sounds excellent and means little: at a ~7% doublet rate two tools
+  # that both call almost nothing agree ~95% by construction. Kappa on the same
+  # comparison is 0.48 / 0.46, and that is the number worth gating.
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: pbmc3k
+    metric: scdblfinder_auroc
+    min: 0.90
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: pbmc3k
+    metric: scrublet_auroc
+    min: 0.70
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: pbmc3k
+    metric: agreement_kappa__scdblfinder__scrublet
+    min: 0.35
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: pbmc3k
+    metric: score_spearman__scdblfinder__scrublet
+    min: 0.20
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: scdblfinder_auroc
+    min: 0.85
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: scrublet_auroc
+    min: 0.75
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: agreement_kappa__scdblfinder__scrublet
+    min: 0.35
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: score_spearman__scdblfinder__scrublet
+    min: 0.20
+
   - benchmark: cloud_read
     format: scx_auto
     dataset: tabula_sapiens_100k
@@ -2284,3 +2407,23 @@ absolute_floors:
 #      * `cells_per_sec__shuffle_write`: rewrite throughput is
 #        `compact`/`sort`-shaped and has no existing floor to sit beside;
 #        deferred with the rest until there is more than one observation.
+#
+# 9. doublet_interop: what is still deferred
+#    The plumbing AND science floors are both live above (calibrated
+#    2026-08-03 against bit-identical repeat captures). What remains deferred:
+#      * `<tool>_recall` / `<tool>_precision`: these move with the tool's own
+#        threshold, which is a scientific choice each caller makes and revises
+#        between versions — unlike AUROC, which is threshold-free and so
+#        actually measures whether the scores still separate. Recall IS
+#        recorded per doublet kind, and the stratification is where the signal
+#        is: on tabula_sapiens_100k scDblFinder recalls 0.484 of heterotypic
+#        but 0.188 of homotypic injections, and Scrublet 0.286 / 0.000. A
+#        pooled recall floor would hide exactly that.
+#      * `consensus_auroc`: 0.842 / 0.744, BELOW either tool alone. Not a bug —
+#        "majority" of two voters is an AND, and the metric ranks by an integer
+#        vote count (0/1/2) with massive ties. It is recorded because it is
+#        worth knowing; flooring a number whose meaning depends on the tool
+#        count would break the moment a third tool is added.
+#      * `n_tools_ran`: cannot floor at 2 while Solo has no environment on this
+#        cluster; a floor would turn a legitimate optional-tool skip into a
+#        gate failure. The run records `tools_skipped` with a reason instead.

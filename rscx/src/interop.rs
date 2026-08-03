@@ -829,7 +829,7 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
 /// This is the reverse of `record_batch_to_dataframe`.
 /// Extracts column names and values, creating Utf8 columns for character vectors
 /// and Float64 columns for numeric vectors.
-fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
+pub(crate) fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
     use arrow::array::{BooleanArray, DictionaryArray, Float64Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use std::collections::HashMap;

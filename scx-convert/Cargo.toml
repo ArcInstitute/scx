@@ -23,6 +23,9 @@ half = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 blake3 = { workspace = true }
 chrono = "0.4"
+# Null-token regex for the annotation-table reader. Already in the lock file
+# via arrow-csv, so this adds no new crate to the build.
+regex = "1"
 scx-format-io = { path = "../scx-format-io" }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }

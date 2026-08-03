@@ -50,6 +50,12 @@ dependencies:
   - fsspec=2026.2.0
   - gcsfs=2026.2.0
 
+  # Doublet-caller baselines (`doublet_interop` benchmark).
+  # `sc.pp.scrublet` imports skimage only on its automatic-thresholding path
+  # — i.e. exactly the mode a baseline should be measured in — so without this
+  # the scrublet arm fails at run time rather than at import.
+  - scikit-image=0.26.0
+
   # Analysis (for accelerator comparisons against scanpy)
   - scikit-learn=1.8.0
   - umap-learn=0.5.11

@@ -9,7 +9,9 @@ mod cellbender;
 mod cli_utils;
 mod cloud_url;
 mod compact;
+mod doublet_import;
 mod index_warnings;
+mod obs_import;
 use scx_convert as convert;
 mod delete;
 mod format;
@@ -935,6 +937,128 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Import a delimited annotation table (CSV/TSV) as obs columns on an
+    /// existing SCX file, in place.
+    ///
+    /// The generic importer behind the doublet-caller workflow: run a tool
+    /// externally, have it write `barcode,score,call`, import. Joins by key
+    /// string, never by row position. X, layers, var, the CSC sidecar, .raw,
+    /// deletion vectors and predicate indexes are preserved; undo with
+    /// `scx rollback`.
+    ObsImport {
+        /// Target SCX file (mutated in place).
+        input: PathBuf,
+        /// Source .csv / .tsv / .txt
+        table: PathBuf,
+        /// Join key column(s), comma-separated for a composite key.
+        /// Omitted auto-resolves (pandas index, then barcode/cell_id/...).
+        #[arg(long)]
+        key: Option<String>,
+        /// Import only these source columns (comma-separated)
+        #[arg(long)]
+        columns: Option<String>,
+        /// Rename a source column: SRC=DST. Repeatable.
+        #[arg(long)]
+        rename: Vec<String>,
+        /// Prefix for the emitted obs columns
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Also import the key column(s) as ordinary annotations
+        #[arg(long)]
+        keep_key_columns: bool,
+        /// One-byte delimiter override (default: sniff by extension, then header)
+        #[arg(long)]
+        delimiter: Option<String>,
+        /// obs column recording "present"/"absent" per row
+        #[arg(long)]
+        status_column: Option<String>,
+        /// uns key to merge the table's metadata under
+        #[arg(long)]
+        uns_key: Option<String>,
+        /// uns key to carry across from an h5ad source. Repeatable; ignored
+        /// for a delimited table, which carries no uns.
+        #[arg(long = "uns-key-from-source")]
+        uns_keys: Vec<String>,
+        /// Replace existing columns. REPLACES, never merges: importing several
+        /// per-batch tables in turn keeps only the last. Concatenate first.
+        #[arg(long)]
+        overwrite: bool,
+        /// Target rows with no matching source row: leave them NULL (not 0) or fail
+        #[arg(long, default_value = "null", value_parser = ["null", "zero", "error"])]
+        on_missing_rows: String,
+        /// Source rows absent from the target: warn and skip, or fail
+        #[arg(long, default_value = "warn", value_parser = ["warn", "error"])]
+        on_extra_rows: String,
+        /// Validate and report the join (plus a key diagnosis) without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Import a doublet caller's output as canonical obs columns, in place.
+    ///
+    /// The doublet-specific wrapper over `obs-import`: every caller names its
+    /// score and call differently, and this maps them onto `<K>_score` /
+    /// `<K>_predicted` so downstream code never branches on the tool. Joins by
+    /// key string, never by row position; undo with `scx rollback`.
+    ///
+    /// A tool that emits no call column (scds) gets no `<K>_predicted` —
+    /// thresholding a score is a decision this importer does not make for you.
+    DoubletImport {
+        /// Target SCX file (mutated in place).
+        input: PathBuf,
+        /// The caller's output table (.csv / .tsv), or an .h5ad whose /obs
+        /// holds the columns -- what the scanpy-resident tools write. The
+        /// h5ad route needs a build with the hdf5 feature.
+        table: PathBuf,
+        /// Which tool produced the table
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
+            scx_convert::DOUBLET_PROFILE_NAMES))]
+        tool: String,
+        /// Join key column(s), comma-separated for a composite key.
+        /// Omitted auto-resolves (pandas index, then barcode/cell_id/...).
+        #[arg(long)]
+        key: Option<String>,
+        /// Canonical column prefix. Defaults to the tool name, so two tools
+        /// land side by side without colliding.
+        #[arg(long)]
+        key_added: Option<String>,
+        /// Override the profile's score column (required for --tool generic)
+        #[arg(long)]
+        score_column: Option<String>,
+        /// Override the profile's call column. Also how a score-only tool
+        /// (scds) opts into a `<K>_predicted`.
+        #[arg(long)]
+        call_column: Option<String>,
+        /// Override the text token meaning "doublet"
+        #[arg(long)]
+        call_true: Option<String>,
+        /// Override the text token meaning "singlet"
+        #[arg(long)]
+        call_false: Option<String>,
+        /// Import only the canonical columns, discarding every other source
+        /// column instead of keeping it as `<K>_<native>`
+        #[arg(long)]
+        drop_native_columns: bool,
+        /// One-byte delimiter override (default: sniff by extension, then header)
+        #[arg(long)]
+        delimiter: Option<String>,
+        /// uns key to carry across from an h5ad source. Repeatable; ignored
+        /// for a delimited table, which carries no uns.
+        #[arg(long = "uns-key-from-source")]
+        uns_keys: Vec<String>,
+        /// Replace existing columns. REPLACES, never merges: importing several
+        /// per-batch tables in turn keeps only the last. Concatenate first.
+        #[arg(long)]
+        overwrite: bool,
+        /// Target rows with no matching source row: leave them NULL (not 0) or fail
+        #[arg(long, default_value = "null", value_parser = ["null", "zero", "error"])]
+        on_missing_rows: String,
+        /// Source rows absent from the target: warn and skip, or fail
+        #[arg(long, default_value = "warn", value_parser = ["warn", "error"])]
+        on_extra_rows: String,
+        /// Validate and report the join (plus a key diagnosis) without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Restore the default `SIGPIPE` disposition (`SIG_DFL`).
@@ -1103,6 +1227,74 @@ fn main() {
             &on_extra_rows,
             &gene_axis,
             latent_embedding,
+            dry_run,
+        ),
+        Commands::ObsImport {
+            input,
+            table,
+            key,
+            columns,
+            rename,
+            prefix,
+            keep_key_columns,
+            delimiter,
+            status_column,
+            uns_key,
+            uns_keys,
+            overwrite,
+            on_missing_rows,
+            on_extra_rows,
+            dry_run,
+        } => obs_import::run_obs_import(
+            &input,
+            &table,
+            key.as_deref(),
+            columns.as_deref(),
+            &rename,
+            &prefix,
+            keep_key_columns,
+            delimiter.as_deref(),
+            status_column.as_deref(),
+            uns_key.as_deref(),
+            &uns_keys,
+            overwrite,
+            &on_missing_rows,
+            &on_extra_rows,
+            dry_run,
+        ),
+        Commands::DoubletImport {
+            input,
+            table,
+            tool,
+            key,
+            key_added,
+            score_column,
+            call_column,
+            call_true,
+            call_false,
+            drop_native_columns,
+            delimiter,
+            uns_keys,
+            overwrite,
+            on_missing_rows,
+            on_extra_rows,
+            dry_run,
+        } => doublet_import::run_doublet_import(
+            &input,
+            &table,
+            &tool,
+            key.as_deref(),
+            key_added.as_deref(),
+            score_column.as_deref(),
+            call_column.as_deref(),
+            call_true.as_deref(),
+            call_false.as_deref(),
+            drop_native_columns,
+            delimiter.as_deref(),
+            &uns_keys,
+            overwrite,
+            &on_missing_rows,
+            &on_extra_rows,
             dry_run,
         ),
         Commands::Info {

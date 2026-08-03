@@ -2555,3 +2555,101 @@ mod streaming_obs_hdf5 {
         );
     }
 }
+
+/// The regression: an obs section written **without** the pandas envelope,
+/// whose index field is not field 0.
+///
+/// Until the `unify_dict_columns` fix, every in-place obs write
+/// (`append` / `merge` / `modify_metadata` / `attach_external_obs`) rebuilt the
+/// schema with `Schema::new(...)` and dropped the envelope. The exporter then
+/// fell back to "field 0 is the index" — true of CLI-converted obs, false here,
+/// where pyarrow put the index last. The result was an h5ad in which every cell
+/// had been renamed to its `cell_type`, silently.
+///
+/// Files written before that fix still have no envelope, so the exporter has to
+/// cope on its own. It does, via `scx_format_io::resolve_index_columns`.
+#[test]
+fn export_finds_the_index_without_a_pandas_envelope() {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{Field, Schema};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5_path = dir.path().join("obs.h5");
+    let file = hdf5::File::create(&h5_path).unwrap();
+    let root = file.as_group().unwrap();
+
+    // No schema metadata at all, and `cell_type` sits at field 0.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("cell_type", DataType::Utf8, false),
+        Field::new("__index_level_0__", DataType::Utf8, false),
+    ]));
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["T cell", "B cell"])),
+            Arc::new(StringArray::from(vec!["AAACCT-1", "AAAGGT-1"])),
+        ],
+    )
+    .unwrap();
+
+    crate::h5ad::write::write_dataframe_group_at(&root, "obs", &batch, &mut WarningSink::log())
+        .unwrap();
+    drop(file);
+
+    let file = hdf5::File::open(&h5_path).unwrap();
+    let obs = file.group("obs").unwrap();
+
+    // The index landed under anndata's `_index`, carrying the barcodes.
+    let idx_name: VarLenUnicode = obs.attr("_index").unwrap().read_scalar().unwrap();
+    assert_eq!(idx_name.as_str(), "_index");
+    let idx: Vec<VarLenUnicode> = obs.dataset("_index").unwrap().read_raw().unwrap();
+    let idx: Vec<&str> = idx.iter().map(|s| s.as_str()).collect();
+    assert_eq!(idx, vec!["AAACCT-1", "AAAGGT-1"]);
+
+    // ...and `cell_type` stayed an ordinary column rather than becoming the
+    // index. Before the fix these two assertions were exactly inverted.
+    let col_order: Vec<VarLenUnicode> = obs.attr("column-order").unwrap().read_raw().unwrap();
+    let col_order: Vec<&str> = col_order.iter().map(|s| s.as_str()).collect();
+    assert_eq!(col_order, vec!["cell_type"]);
+}
+
+/// The field-0 fallback must survive for the shape it was written for: obs from
+/// the CLI convert path, which has no envelope *and* no literal index field, and
+/// where field 0 genuinely is the index.
+#[test]
+fn export_still_falls_back_to_field_zero_for_cli_obs() {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{Field, Schema};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5_path = dir.path().join("obs.h5");
+    let file = hdf5::File::create(&h5_path).unwrap();
+    let root = file.as_group().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("barcode", DataType::Utf8, false),
+        Field::new("cell_type", DataType::Utf8, false),
+    ]));
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["AAACCT-1", "AAAGGT-1"])),
+            Arc::new(StringArray::from(vec!["T cell", "B cell"])),
+        ],
+    )
+    .unwrap();
+
+    crate::h5ad::write::write_dataframe_group_at(&root, "obs", &batch, &mut WarningSink::log())
+        .unwrap();
+    drop(file);
+
+    let file = hdf5::File::open(&h5_path).unwrap();
+    let obs = file.group("obs").unwrap();
+    let idx_name: VarLenUnicode = obs.attr("_index").unwrap().read_scalar().unwrap();
+    assert_eq!(idx_name.as_str(), "barcode");
+    let col_order: Vec<VarLenUnicode> = obs.attr("column-order").unwrap().read_raw().unwrap();
+    assert_eq!(col_order.len(), 1);
+    assert_eq!(col_order[0].as_str(), "cell_type");
+}

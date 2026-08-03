@@ -102,6 +102,9 @@ import os as _os                                   # noqa: E402
 from .pyscx import open as _open_native            # noqa: E402
 from .pyscx import validate as _validate_native    # noqa: E402
 from .pyscx import from_anndata as _from_anndata_native  # noqa: E402
+from .pyscx import obs_import as _obs_import_native  # noqa: E402
+from .pyscx import diagnose_obs_key as _diagnose_obs_key_native  # noqa: E402
+from .pyscx import doublet_import as _doublet_import_native  # noqa: E402
 
 # N3-2026-05-21-Tier2: hdf5-gated entry points. The Rust side registers
 # these four symbols under `#[cfg(feature = "hdf5")]` (pyscx/src/lib.rs).
@@ -458,6 +461,811 @@ def to_h5ad(path, out, **kwargs):
     src = _coerce_path(path)
     _warn_if_deletions(src, "h5ad")
     return _to_h5ad_native(src, _coerce_path(out), **kwargs)
+
+
+def _safe_batch_filename(batch) -> str:
+    """Make an obs batch label safe to use as a filename.
+
+    Batch labels are data, not identifiers: a `donor_id` of `../x` or `a/b`
+    would otherwise place the export outside `out_dir`. Anything that is not
+    alphanumeric, dash, dot or underscore becomes an underscore, and a label
+    that reduces to nothing (or to a bare dot run) gets a positional fallback.
+    """
+    import re as _re
+
+    text = _re.sub(r"[^A-Za-z0-9._-]", "_", str(batch))
+    return text if text.strip("._") else "batch"
+
+
+def _plan_batch_filenames(batches) -> dict:
+    """Map each batch label to a unique filename stem.
+
+    Sanitising alone is not enough: `batch/1`, `batch\\1` and `batch_1` all
+    reduce to `batch_1`. Left unchecked that is a `FileExistsError` about a
+    file this very call just wrote (with `overwrite=False`) or, worse, one
+    batch silently overwriting another's export (`overwrite=True`) — the
+    second batch's cells then never reach a tool and the first's results are
+    gone. Disambiguate with an index suffix, which keeps the common case
+    (labels that need no sanitising) unchanged.
+    """
+    stems, seen = {}, {}
+    for i, b in enumerate(batches):
+        stem = _safe_batch_filename(b)
+        if stem in seen:
+            stem = f"{stem}__{i}"
+        seen[stem] = True
+        stems[b] = stem
+    return stems
+
+
+def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
+                   on_ambiguous_key="error", overwrite=False, **kwargs):
+    """Export one h5ad per batch, ready to run a per-sample tool on.
+
+    Doublet callers are in-memory, single-sample tools, so the export is N
+    per-batch files rather than one. That is the moat rather than a cost: the
+    pooled atlas is never materialized and peak RSS is one library.
+
+    **What this adds over the loop you would write yourself** is the key check.
+    A tool sees only the h5ad it is handed, so if two of that file's cells carry
+    the same key there is nothing to join its answers back on — and the failure
+    only shows up much later, as a duplicate-key error at import time or, worse,
+    as scores silently landing on the wrong cell. Measured on a real
+    CELLxGENE-derived atlas, one batch in 1,086 had a duplicated index and it
+    held 15.5% of the file's cells.
+
+    **Two identities are checked, not one.** The tools read `obs_names` —
+    Scrublet writes `barcode = adata.obs_names`, scDblFinder uses
+    `colnames(sce)` — while the *import* joins on the resolved `key`. Those are
+    the same column in the ordinary case, but not when auto-resolution picks a
+    unique non-index column over a duplicated index. Checking only `key` would
+    then pass a batch whose `obs_names` a tool cannot tell apart, which is the
+    exact failure this guard exists to prevent, so both must be unique within a
+    batch. `key_is_obs_index` in the result says whether they coincided.
+
+    Args:
+        path: Source SCX file (str, os.PathLike, or an open Experiment).
+        out_dir: Directory for the per-batch h5ad files; created if absent.
+        batch_key: obs column to split on (e.g. "donor_id", "sample_id").
+        key: The join key the tool's output will carry back. None resolves it
+            with `diagnose_obs_key`, the same way `obs_import` would.
+        batches: Restrict to these batch values. None exports every batch.
+        on_ambiguous_key: What to do with a batch whose key is not unique
+            *within that batch* — "error" (default) refuses before writing
+            anything, "skip" omits it and records why, "warn" exports it
+            anyway. Only choose "warn" if you have another way to rejoin.
+        overwrite: Overwrite existing per-batch files. Off by default.
+        **kwargs: Passed through to `pyscx.to_h5ad` (e.g. `min_counts`).
+
+    Returns:
+        dict with `key`, `key_is_globally_unique`, `out_dir`, `n_batches`,
+        `n_cells_exported`, and `batches` — a list of per-batch dicts carrying
+        `batch`, `path`, `n_cells`, `key_unique_within_batch` and, for anything
+        not written, `skipped_reason`.
+
+    Note:
+        `key_is_globally_unique` is the one to read before planning the import.
+        When it is True you can concatenate every tool output and import once,
+        which is what you want because `overwrite` **replaces** rather than
+        merges. When it is False the keys only distinguish cells inside their
+        own batch, so you must import with a composite key that includes
+        `batch_key`.
+
+    Example:
+        r = pyscx.export_batches("atlas.scx", "batches/", batch_key="donor_id")
+        assert r["key_is_globally_unique"]      # else import per batch
+        # ... run the tool on each r["batches"][i]["path"] ...
+        pyscx.doublet_import("atlas.scx", "all_calls.csv", tool="scrublet")
+    """
+    import pathlib as _pathlib
+
+    if on_ambiguous_key not in ("error", "skip", "warn"):
+        raise ValueError(
+            "on_ambiguous_key must be 'error', 'skip' or 'warn'; got "
+            f"{on_ambiguous_key!r}"
+        )
+
+    src = _coerce_path(path)
+    out_dir = _pathlib.Path(_coerce_path(out_dir, allow_experiment=False))
+
+    # Resolve to a key that actually *works* rather than to whatever the plain
+    # fallback order lands on: on a merged atlas the fallback is usually the
+    # obs index, which is exactly the column that turns out to be duplicated.
+    # The chosen key comes back in the result so the import can be given the
+    # same one -- `obs_import` / `doublet_import` auto-resolve by fallback
+    # order, so if the two differ the caller must pass `key=` there too.
+    no_unique_candidate = ""
+    if key is None:
+        diag = diagnose_obs_key(src)
+        suggestion = diag.get("suggestion")
+        # A comma-joined suggestion is a *composite* — `diagnose_obs_key`
+        # offers one when no single column is unique. It cannot be used here:
+        # the exported h5ad identifies its rows by `obs_names` alone, so a
+        # tool's output can only ever carry one component back. Falling
+        # through to `resolved_key` means the per-batch guard below does the
+        # refusing, with the full diagnosis attached — which is the accurate
+        # message. Using the composite as a column name would fail with
+        # "key 'a,b' is neither an obs column nor the obs index", which
+        # explains nothing.
+        if suggestion and "," in suggestion:
+            suggestion = None
+        # Prefer the obs index whenever it is itself unique, even if the
+        # diagnosis suggests some other unique column. The index is what the
+        # tools hand back (`adata.obs_names` / `colnames(sce)`), so choosing it
+        # makes the tool's identity and the import's join key the same thing
+        # and removes the export/import asymmetry entirely. The suggestion only
+        # wins when the index genuinely cannot serve.
+        unique_cols = diag.get("unique_columns", ()) or ()
+        for index_spelling in ("__index_level_0__", "_index"):
+            if index_spelling in unique_cols:
+                suggestion = index_spelling
+                break
+        key = suggestion or diag.get("resolved_key")
+        if key is None:
+            raise ValueError(
+                "no obs column could serve as a join key: " + diag["summary"]
+            )
+        if not suggestion:
+            # Fell back rather than found a unique column. Carried into the
+            # per-batch refusal below so its remedy does not promise a key the
+            # file does not have.
+            no_unique_candidate = " " + diag["summary"]
+
+    exp = _open_native(src)
+    obs = exp.read_obs()
+    # `read_obs()` returns PHYSICAL rows, which is exactly the row space
+    # `to_h5ad(obs_mask=)` wants. It also *includes* logically deleted rows, so
+    # the per-batch counts below can overcount; `to_h5ad` ANDs with the
+    # deletion keep mask, so the exports themselves stay right.
+    if batch_key not in obs.columns:
+        raise ValueError(
+            f"batch_key {batch_key!r} is not an obs column; columns are "
+            f"{list(obs.columns)}"
+        )
+    if key in obs.columns:
+        key_values = obs[key]
+    elif obs.index.name == key or key in ("index", "_index", "__index_level_0__"):
+        key_values = obs.index.to_series()
+    else:
+        raise ValueError(
+            f"key {key!r} is neither an obs column nor the obs index; columns "
+            f"are {list(obs.columns)}"
+        )
+
+    globally_unique = bool(key_values.is_unique)
+
+    # The identity the TOOLS see is the exported h5ad's `obs_names` — Scrublet
+    # writes `barcode = adata.obs_names`, scDblFinder uses `colnames(sce)` —
+    # and that is the obs index, not necessarily the resolved `key`. Checking
+    # only `key` lets a batch through whose obs_names are duplicated, which is
+    # precisely the silent wrong-join this helper exists to prevent: on a file
+    # with a duplicated index but a unique `cell_uid`, auto-resolution picks
+    # `cell_uid`, every batch passes, and the tool is handed a file whose rows
+    # it cannot tell apart.
+    #
+    # So both are checked. `key` uniqueness is what the *import* needs;
+    # obs_names uniqueness is what the *tool* needs, and a batch failing either
+    # is unusable.
+    index_values = obs.index.to_series()
+    key_is_index = key_values.equals(index_values)
+
+    # Plan every batch before writing any of them, so an "error" verdict costs
+    # nothing rather than leaving a half-finished directory behind.
+    plan = []
+    values = obs[batch_key]
+    wanted = list(batches) if batches is not None else list(values.drop_duplicates())
+    for b in wanted:
+        mask = (values == b).to_numpy()
+        if not mask.any():
+            raise ValueError(f"batch {b!r} matches no rows in {batch_key!r}")
+        key_unique = bool(key_values[mask].is_unique)
+        names_unique = bool(index_values[mask].is_unique)
+        plan.append({"batch": b, "mask": mask, "n_cells": int(mask.sum()),
+                     "key_unique_within_batch": key_unique and names_unique,
+                     "obs_names_unique_within_batch": names_unique})
+
+    bad = [p["batch"] for p in plan if not p["key_unique_within_batch"]]
+    if bad and on_ambiguous_key == "error":
+        n = sum(p["n_cells"] for p in plan if not p["key_unique_within_batch"])
+        # Name whichever identity actually failed. "key X is not unique" is
+        # actively misleading when X is unique and it was obs_names that
+        # collided — the user would go looking for a better key and find that
+        # the one they have is already fine.
+        names_bad = [p["batch"] for p in plan
+                     if not p["obs_names_unique_within_batch"]]
+        detail = f"key {key!r} is not unique"
+        if names_bad and not key_is_index:
+            detail = (
+                f"the exported obs_names are not unique (the resolved key "
+                f"{key!r} is a different column, and a tool reads obs_names)"
+            )
+        raise ValueError(
+            f"{detail} within {len(bad)} of {len(plan)} "
+            f"batches ({n} cells): {bad[:5]}{' ...' if len(bad) > 5 else ''}. "
+            "A tool run on those files could not tell two cells apart, so its "
+            "output could not be joined back. Pass a key that is unique within "
+            "each batch (pyscx.diagnose_obs_key lists the candidates), or "
+            "on_ambiguous_key='skip' to export the rest." + no_unique_candidate
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stems = _plan_batch_filenames([p["batch"] for p in plan])
+    results, exported = [], 0
+    for p in plan:
+        entry = {"batch": p["batch"], "n_cells": p["n_cells"],
+                 "key_unique_within_batch": p["key_unique_within_batch"],
+                 "obs_names_unique_within_batch": p["obs_names_unique_within_batch"]}
+        if not p["key_unique_within_batch"] and on_ambiguous_key == "skip":
+            entry["path"] = None
+            entry["skipped_reason"] = (
+                f"key {key!r} is not unique within this batch"
+                if p["obs_names_unique_within_batch"]
+                else "the exported obs_names are not unique within this batch"
+            )
+            results.append(entry)
+            continue
+        # The batch label comes from obs data, so it can contain a path
+        # separator or `..`; joining it raw would write outside out_dir, and
+        # two labels can sanitise to the same stem (see _plan_batch_filenames).
+        dest = out_dir / f"{stems[p['batch']]}.h5ad"
+        if dest.exists() and not overwrite:
+            raise FileExistsError(
+                f"{dest} already exists; pass overwrite=True to replace it"
+            )
+        to_h5ad(src, str(dest), obs_mask=p["mask"], **kwargs)
+        entry["path"] = str(dest)
+        results.append(entry)
+        exported += p["n_cells"]
+
+    return {
+        "key": key,
+        "key_is_globally_unique": globally_unique,
+        # False means the tools will return obs_names while the import joins on
+        # a different column — see the `key_is_index` note in the docstring.
+        "key_is_obs_index": key_is_index,
+        "batch_key": batch_key,
+        "out_dir": str(out_dir),
+        "n_batches": sum(1 for r in results if r.get("path")),
+        "n_cells_exported": exported,
+        "batches": results,
+    }
+
+
+def obs_import(path, table, *, key=None, **kwargs):
+    """Import a delimited annotation table (CSV/TSV) as `obs` columns, in place.
+
+    The generic importer behind the doublet-caller workflow: run a tool
+    externally, have it write `barcode,score,call`, and land those columns on
+    an existing SCX file. Nothing here is doublet-specific.
+
+    Joins **by key string, never by row position** — a tool run per library
+    returns rows in its own order, and a positional import would put every
+    value on the wrong cell while still producing a correctly-shaped column.
+    Target rows the table does not cover get `null`, never a fabricated `0`.
+
+    In place via the same harness `append` uses: `X`, layers, `var`, the CSC
+    sidecar, `.raw`, deletion vectors and predicate indexes are preserved, and
+    `pyscx.rollback(path)` undoes the whole import.
+
+    Args:
+        path: Target SCX file (str, os.PathLike, or an open Experiment).
+        table: Source .csv / .tsv / .txt, or an .h5ad whose `/obs` holds the
+            columns (str or os.PathLike). The h5ad route needs a build with
+            HDF5 support; without it the error says to write a CSV instead.
+        key: Join key. None auto-resolves with the same preference order the
+            target side uses (pandas index, then `barcode`/`cell_id`/…). A str
+            names one column. A list of str builds a composite key — the right
+            answer for a multi-library merge where `sample_id` + `barcode` is
+            unique but neither is alone. Both sides are built by the same code,
+            so the fusing separator is internal and not configurable.
+        columns: Import only these source columns. None imports every non-key
+            column.
+        rename: `{source_name: new_name}`, applied before `prefix`.
+        prefix: Prepended to every imported column name.
+        keep_key_columns: Also import the key column(s) as ordinary annotations.
+            Off by default — the key is usually already in obs.
+        delimiter: One-character override. None sniffs from the extension
+            (`.csv` / `.tsv` / `.tab`), then from the header line.
+        status_column: Obs column recording "present"/"absent" per row.
+        uns_key: `uns` key to merge the table's metadata under.
+        uns_keys: `/uns` keys to carry across from an h5ad source. Opt-in --
+            `/uns` routinely holds large arrays and types the reader skips, so
+            nothing comes across unless named. A key that is not there is an
+            error. Meaningless for a delimited table, and requesting one is an
+            error rather than a silent no-op.
+        overwrite: **Replaces, never merges.** A colliding column is dropped and
+            rebuilt from this table alone, so importing several per-batch tables
+            one after another keeps only the last. Concatenate them and import
+            once. Without this, a collision is an error.
+        on_missing_rows: "zero" (default) marks uncovered target rows absent;
+            "error" refuses.
+        on_extra_rows: "warn" (default) skips source rows the target lacks;
+            "error" refuses.
+        dry_run: Run every validation and the join, then return the summary
+            without writing. Also attaches a `key_diagnosis` to the result.
+
+    Returns:
+        dict with `n_obs`, `n_matched`, `n_target_rows_absent`,
+        `n_source_rows_absent`, `obs_key_column`, `obs_columns_added`,
+        `obs_index_dropped`, the source's `format` / `delimiter` (None for
+        h5ad) / `n_rows_in_source` / `uns_keys_imported`, and (on a dry run)
+        `key_diagnosis`.
+
+    Example:
+        # Look before you leap on a large file.
+        r = pyscx.obs_import("atlas.scx", "calls.csv", dry_run=True)
+        print(r["n_matched"], "of", r["n_obs"], "cells matched")
+        pyscx.obs_import("atlas.scx", "calls.csv", status_column="dbl_status")
+    """
+    if key is not None:
+        key = [key] if isinstance(key, str) else [str(k) for k in key]
+    return _obs_import_native(_coerce_path(path), _coerce_path(table, allow_experiment=False),
+                              key=key, **kwargs)
+
+
+def diagnose_obs_key(path, key=None):
+    """Report which obs columns could serve as an `obs_import` join key.
+
+    Read-only. Reach for this when an import fails on a duplicated key: on a
+    merged atlas the obvious candidates are often not unique, and the column
+    that is may be one no fallback list would guess (on a CELLxGENE-derived
+    file it is `soma_joinid`, with the obs index 10x-duplicated).
+
+    Returns a dict with `resolved_key`, `resolved_cardinality`,
+    `unique_columns`, `unique_pairs`, `suggestion` and a printable `summary`.
+    """
+    if key is not None:
+        key = [key] if isinstance(key, str) else [str(k) for k in key]
+    return _diagnose_obs_key_native(_coerce_path(path), key)
+
+
+def doublet_import(path, table, *, tool, key=None, **kwargs):
+    """Import a doublet caller's output, normalised to canonical obs columns.
+
+    The doublet-specific wrapper over `obs_import`. Same in-place, key-joined,
+    `pyscx.rollback`-able import — plus the one thing that needs per-tool
+    knowledge: every caller names its score and call differently, and consensus
+    code downstream should not have to branch on which tool ran.
+
+    Writes, for `key_added="<K>"` (default: the tool name):
+
+        obs["<K>_score"]      f32,  nullable   higher = more doublet-like
+        obs["<K>_predicted"]  bool, nullable   omitted when the tool has no call
+        obs["<K>_status"]     str              "present" / "absent"
+        obs["<K>_<native>"]   ...              every other source column
+        uns["<K>"]                             tool, source columns, join report
+
+    These names match what a native SCX doublet run writes, so an imported
+    result and a native one are drop-in comparable.
+
+    Args:
+        path: Target SCX file (str, os.PathLike, or an open Experiment).
+        table: The caller's output .csv / .tsv, or an `.h5ad` whose `/obs`
+            holds the columns — which is what the scanpy-resident tools write,
+            since `sc.pp.scrublet(adata)` sets `adata.obs` in place. The h5ad
+            route needs a build with HDF5 support; without it the error says to
+            write a CSV instead.
+        tool: One of `pyscx.doublet_tools()`: "scdblfinder", "scrublet",
+            "doubletfinder", "doubletdetection", "solo", "scds", "generic".
+        key: Join key, exactly as for `obs_import`. None auto-resolves; a str
+            names one column; a list builds a composite — the right answer for a
+            multi-library merge where `sample_id` + `barcode` is unique but
+            neither is alone.
+        key_added: Canonical prefix `<K>`. Defaults to `tool`, so two tools land
+            side by side without colliding.
+        score_column: Override the profile's score column. Required for
+            `tool="generic"`.
+        call_column: Override the profile's call column. Supplying one is also
+            how you opt a score-only tool (scds) into a `<K>_predicted`.
+        call_true / call_false: Override the text tokens meaning doublet and
+            singlet. Needed when a tool version renames its classes. With only
+            `call_true`, anything else non-null is treated as a singlet.
+        keep_native_columns: Keep every other source column as `<K>_<native>`.
+            True by default.
+        delimiter: One-character override; None sniffs from the extension.
+            Ignored for an h5ad source.
+        uns_keys: `/uns` keys to carry across from an h5ad source, nested under
+            `uns["<K>"]["source_uns"]` so the tool's own metadata keeps its
+            names and cannot collide with the wrapper's record. Opt-in; a key
+            that is not there is an error.
+        overwrite: **Replaces, never merges.** Re-importing per-batch tables one
+            after another keeps only the last — concatenate them and import once.
+        on_missing_rows: "zero" (default) marks uncovered cells absent; "error"
+            refuses.
+        on_extra_rows: "warn" (default) skips source rows the target lacks;
+            "error" refuses.
+        dry_run: Validate and join without writing; also returns a
+            `key_diagnosis`.
+
+    Returns:
+        dict with the `obs_import` join fields plus `tool`, `key_added`,
+        `score_source_column`, `call_source_column`, `canonical_columns`,
+        `native_columns`, `dropped_alias_columns`, `format` ("table" or
+        "h5ad") and `uns_keys_imported`.
+
+    Note:
+        A tool that emits no call column never gets a `<K>_predicted`. The
+        importer will not threshold a score on your behalf — that is a
+        scientific decision it does not own.
+
+    Example:
+        # Look first: on a merged atlas the obvious key is often not unique.
+        r = pyscx.doublet_import("atlas.scx", "calls.csv",
+                                 tool="scdblfinder", dry_run=True)
+        print(r["n_matched"], "of", r["n_obs"], "cells matched")
+        pyscx.doublet_import("atlas.scx", "calls.csv", tool="scdblfinder")
+    """
+    if key is not None:
+        key = [key] if isinstance(key, str) else [str(k) for k in key]
+    return _doublet_import_native(_coerce_path(path),
+                                  _coerce_path(table, allow_experiment=False),
+                                  tool=tool, key=key, **kwargs)
+
+
+_DOUBLET_CONSENSUS_METHODS = ("majority", "any", "all", "mean_rank")
+
+
+def _consensus_calls(obs, column):
+    """Normalise a canonical `<K>_predicted` column to (voted, called) arrays.
+
+    **A null is not a vote.** That is the whole reason the importer refuses to
+    fabricate a `0.0` for a cell a tool never saw, and the distinction has to
+    survive to here: `voted` is False for those rows, so they neither support
+    nor oppose a call. Collapsing them to False — which is what a plain
+    `sum(...) >= k` over a nullable column does — would silently turn "no
+    information" into "every tool said singlet".
+
+    Accepts every dtype the round trip produces: object holding `True`/`False`/
+    `None` (what `doublet_import` writes), pandas nullable `boolean` (what a
+    previous `doublet_consensus` writes), plain `bool`, and a strict 0/1
+    numeric column — the same tokens `scx_convert::doublet::coerce_call`
+    accepts, so the two ends of the pipeline cannot drift on what a call is.
+    """
+    import numpy as _np
+    import pandas as _pd
+
+    col = obs[column]
+    voted = ~_pd.isna(col).to_numpy()
+    called = _np.zeros(len(col), dtype=bool)
+    if not voted.any():
+        return voted, called
+
+    present = col.to_numpy(dtype=object)[voted]
+    uniq = _pd.unique(present)
+
+    if all(isinstance(v, (bool, _np.bool_)) for v in uniq):
+        called[voted] = present.astype(bool)
+        return voted, called
+
+    # Strict 0/1 only. A column of arbitrary numbers is a score that was named
+    # like a call, and thresholding it here is a scientific decision this
+    # helper does not own.
+    numeric = all(
+        isinstance(v, (int, float, _np.integer, _np.floating))
+        and not isinstance(v, bool)
+        for v in uniq
+    )
+    if numeric and {float(v) for v in uniq} <= {0.0, 1.0}:
+        called[voted] = present.astype("float64") == 1.0
+        return voted, called
+
+    bad = next(v for v in uniq if not isinstance(v, (bool, _np.bool_)))
+    raise ValueError(
+        f"obs[{column!r}] holds {bad!r}, which is not a doublet call. A "
+        "canonical `<key>_predicted` column is a nullable boolean (or a strict "
+        "0/1). A value like 'doublet' means `keys` names a tool's own source "
+        "column rather than the canonical one the importer derives — pass the "
+        "`key_added` you imported under (default: the tool name), not the "
+        "tool's native column."
+    )
+
+
+def _consensus_scores(obs, column):
+    """Read a canonical `<K>_score` column as float64 with NaN for null."""
+    import numpy as _np
+    import pandas as _pd
+
+    try:
+        numeric = _pd.to_numeric(obs[column], errors="raise")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"obs[{column!r}] is not numeric, so it cannot be ranked; "
+            f"method='mean_rank' needs every key's score column. ({exc})"
+        ) from exc
+    return numeric.to_numpy(dtype="float64", na_value=_np.nan)
+
+
+def _resolve_consensus_keys(obs, keys, method, key_added):
+    """Resolve and validate the `keys` list against what is actually on obs."""
+    suffix = "_score" if method == "mean_rank" else "_predicted"
+    available = sorted(
+        c[: -len(suffix)] for c in obs.columns
+        if c.endswith(suffix) and len(c) > len(suffix)
+    )
+    available = [k for k in available if k != key_added]
+
+    if keys is None:
+        if not available:
+            raise ValueError(
+                f"no `<key>{suffix}` columns on obs, so there is nothing to "
+                "reach a consensus over. Run `pyscx.doublet_import` for each "
+                "tool first; obs columns present are "
+                f"{list(obs.columns)}"
+            )
+        return available
+
+    if isinstance(keys, str):
+        keys = [keys]
+    keys = [str(k) for k in keys]
+    if not keys:
+        raise ValueError("`keys` is empty; name at least one imported tool")
+    if len(set(keys)) != len(keys):
+        dup = sorted({k for k in keys if keys.count(k) > 1})
+        raise ValueError(
+            f"`keys` repeats {dup}; a tool listed twice would vote twice"
+        )
+    if key_added in keys:
+        raise ValueError(
+            f"key_added={key_added!r} is also in `keys`, so the consensus would "
+            "read its own output. Pick a different key_added."
+        )
+
+    for k in keys:
+        if f"{k}{suffix}" in obs.columns:
+            continue
+        if method != "mean_rank" and f"{k}_score" in obs.columns:
+            # scds and friends: a score with no call. Dropping it from the vote
+            # silently would change the answer, so say what the options are.
+            raise ValueError(
+                f"obs has {k!r}'s score but no {f'{k}_predicted'!r}, so it "
+                "cannot vote on a call. That tool emits no call column — drop "
+                f"{k!r} from `keys`, use method='mean_rank' to combine scores "
+                "instead, or re-import it with `call_column=` to derive a call."
+            )
+        raise ValueError(
+            f"obs has no {f'{k}{suffix}'!r} column. Keys available for "
+            f"method={method!r}: {available or 'none'}"
+        )
+    return keys
+
+
+def doublet_consensus(target, *, keys=None, method="majority",
+                      key_added="doublet", quantile=None, overwrite=False,
+                      index_obs=None, index_preset=None):
+    """Combine several doublet callers' imported calls into one consensus.
+
+    Once N tools' results are canonical obs columns on one file, the consensus
+    is arithmetic — no tool-specific knowledge left. This is the last step of
+    the interop, and it is pure Python: nothing here knows what a doublet is.
+
+    **Null-aware throughout.** A tool that never saw a cell does not vote on
+    it, and a cell no tool voted on comes out `null` — never `False`. Those are
+    different facts, and the importer preserved the difference precisely so it
+    could be honoured here.
+
+    Writes, for `key_added="<K>"`:
+
+        obs["<K>_predicted"]         bool, nullable   null where nothing voted
+        obs["<K>_n_tools_calling"]   int32            how many said doublet
+        obs["<K>_n_tools_voting"]    int32            how many had an opinion
+        obs["<K>_score"]             f32              mean_rank only
+        uns["<K>_consensus"]                          inputs, rule and counts
+
+    Read `<K>_n_tools_voting` before trusting a `False`: a 0 there means the
+    cell was never assessed, which is why `<K>_predicted` is null beside it.
+
+    Args:
+        target: An SCX file (str, os.PathLike, or an open Experiment) — written
+            in place, one atomic commit, undone by `pyscx.rollback(path)` — or
+            an in-memory `AnnData`, mutated directly.
+        keys: The `key_added` values the tools were imported under (default:
+            the tool names). None discovers every key on obs that carries the
+            column this `method` needs, and records what it found.
+        method: How votes combine.
+            "majority" — more than half of the voting tools said doublet. An
+                even split is not a majority, so it is False, not null: the
+                tools disagreed, which is information, unlike no vote at all.
+            "any" — at least one voting tool said doublet.
+            "all" — every voting tool said doublet. Tools that did not cover
+                the cell are not counted against it.
+            "mean_rank" — ignores the calls and combines the *scores*: each
+                tool's score is ranked within the cells that tool covered and
+                normalised to [0, 1], then averaged. Needs `quantile`.
+        key_added: Prefix `<K>` for the written columns.
+        quantile: For "mean_rank" only, and required there: the fraction of
+            assessed cells to call doublets (e.g. 0.06 for an expected 6%
+            doublet rate). Required rather than defaulted because picking a
+            cutoff is a scientific decision this helper does not own — if you
+            want the tools' own thresholds to decide, use "majority".
+        overwrite: Replace existing `<K>_*` columns. Without it a collision is
+            an error, so a second run cannot silently rewrite the first.
+        index_obs / index_preset: Rebuild an obs predicate index over these
+            columns as part of the same commit. Relevant only for a file
+            target: replacing obs drops any existing obs predicate index, so
+            pass these if the file had one (`scx info` lists it).
+
+    Returns:
+        The same dict written to `uns["<K>_consensus"]`: `method`, `keys`,
+        `key_added`, `n_obs`, `n_predicted_doublet`, `n_predicted_singlet`,
+        `n_no_vote`, `columns_added`, `per_key` counts, and for "mean_rank"
+        the `quantile` and the `threshold` it resolved to.
+
+    Note:
+        A tool with no call column (scds) has no `<K>_predicted` and cannot
+        vote on a call — naming it in `keys` for a call-based method is an
+        error rather than a silent omission, since dropping a voter changes
+        the result. It works fine under "mean_rank".
+
+    Example:
+        pyscx.doublet_import("atlas.scx", "scdbl.csv", tool="scdblfinder")
+        pyscx.doublet_import("atlas.scx", "scrub.csv", tool="scrublet")
+        r = pyscx.doublet_consensus("atlas.scx",
+                                    keys=["scdblfinder", "scrublet"])
+        print(r["n_predicted_doublet"], "doublets;", r["n_no_vote"], "unassessed")
+    """
+    import numpy as _np
+    import pandas as _pd
+
+    if method not in _DOUBLET_CONSENSUS_METHODS:
+        raise ValueError(
+            f"method must be one of {list(_DOUBLET_CONSENSUS_METHODS)}; got "
+            f"{method!r}"
+        )
+    if not key_added:
+        raise ValueError("key_added must be a non-empty string")
+    if method == "mean_rank":
+        if quantile is None:
+            raise ValueError(
+                "method='mean_rank' needs `quantile` — the fraction of "
+                "assessed cells to call doublets (e.g. quantile=0.06). It has "
+                "no default because a score cutoff is a scientific decision; "
+                "use method='majority' to let each tool's own call decide."
+            )
+        if not 0.0 < float(quantile) < 1.0:
+            raise ValueError(
+                f"quantile must be strictly between 0 and 1; got {quantile!r}"
+            )
+    elif quantile is not None:
+        raise ValueError(
+            f"`quantile` only applies to method='mean_rank'; got method="
+            f"{method!r}. Its calls come from each tool's own threshold."
+        )
+
+    # An AnnData is mutated in place; anything path-like is read, computed and
+    # written back. Checked before `_coerce_path` because an AnnData has no
+    # __fspath__ and would otherwise fall through to its generic TypeError.
+    is_adata = (
+        not isinstance(target, str)
+        and not hasattr(target, "__fspath__")
+        and hasattr(target, "obs")
+        and hasattr(target, "uns")
+    )
+    if is_adata:
+        obs = target.obs
+    else:
+        path = _coerce_path(target)
+        exp = _open_native(path)
+        # PHYSICAL rows — the row space `modify_metadata` validates against,
+        # and the one logically-deleted rows still occupy.
+        obs = exp.read_obs()
+
+    keys = _resolve_consensus_keys(obs, keys, method, key_added)
+
+    n = len(obs)
+    n_voting = _np.zeros(n, dtype=_np.int32)
+    n_calling = _np.zeros(n, dtype=_np.int32)
+    per_key = {}
+
+    # `n_tools_calling` always counts tools whose own call was True, whatever
+    # the method — so it stays a fact about the tools rather than about the
+    # rule. `n_tools_voting` counts what fed *this* method's decision, which
+    # for mean_rank is a score rather than a call.
+    for k in keys:
+        entry = {}
+        if f"{k}_predicted" in obs.columns:
+            voted, called = _consensus_calls(obs, f"{k}_predicted")
+            entry["predicted_column"] = f"{k}_predicted"
+            entry["n_calling"] = int(called.sum())
+            n_calling += called
+            if method != "mean_rank":
+                entry["n_voting"] = int(voted.sum())
+                n_voting += voted
+        if method == "mean_rank":
+            entry["score_column"] = f"{k}_score"
+            covered = ~_np.isnan(_consensus_scores(obs, f"{k}_score"))
+            entry["n_voting"] = int(covered.sum())
+            n_voting += covered
+        per_key[k] = entry
+
+    voted_any = n_voting > 0
+    record = {
+        "method": method,
+        "keys": list(keys),
+        "key_added": key_added,
+        "n_obs": int(n),
+        "per_key": per_key,
+    }
+
+    # Columns are held as bare arrays, never Series, so assignment is
+    # positional and never goes through index alignment. These values were
+    # computed from these very rows, in this order, so alignment could only
+    # ever be a no-op or a bug — and a merged atlas's obs index is routinely
+    # duplicated (10x over on the CELLxGENE-derived file this work was
+    # validated against), where pandas only tolerates alignment while the two
+    # indexes compare equal.
+    columns = {}
+    if method == "mean_rank":
+        # Rank within each tool's own covered cells, so a tool that scored
+        # 3,000 cells and one that scored 300,000 contribute on the same [0, 1]
+        # scale rather than the larger run dominating the average.
+        ranks = _np.full((len(keys), n), _np.nan, dtype="float64")
+        for i, k in enumerate(keys):
+            s = _pd.Series(_consensus_scores(obs, f"{k}_score"))
+            ranks[i] = s.rank(pct=True, method="average").to_numpy(dtype="float64")
+        # Mean over the tools that scored each cell. Done by hand rather than
+        # with nanmean because an all-NaN row — a cell no tool scored — is
+        # expected here, and is the "no vote" case rather than a warning.
+        covered_count = (~_np.isnan(ranks)).sum(axis=0)
+        assessed = covered_count > 0
+        mean_rank = _np.where(
+            assessed,
+            _np.nansum(ranks, axis=0) / _np.maximum(covered_count, 1),
+            _np.nan,
+        )
+        if assessed.any():
+            threshold = float(
+                _np.quantile(mean_rank[assessed], 1.0 - float(quantile))
+            )
+            predicted = assessed & (mean_rank >= threshold)
+        else:
+            threshold = None
+            predicted = _np.zeros(n, dtype=bool)
+        columns[f"{key_added}_score"] = mean_rank.astype("float32")
+        record["quantile"] = float(quantile)
+        record["threshold"] = threshold
+    elif method == "any":
+        predicted = n_calling >= 1
+    elif method == "all":
+        predicted = (n_calling == n_voting) & voted_any
+    else:  # majority — strictly more than half, so a tie is not a majority
+        predicted = (n_calling * 2) > n_voting
+
+    # The single line the whole design exists to make possible: a row nothing
+    # voted on is null, not False.
+    call = _pd.array(_np.asarray(predicted, dtype=bool), dtype="boolean")
+    call[~voted_any] = _pd.NA
+    columns[f"{key_added}_predicted"] = call
+    columns[f"{key_added}_n_tools_calling"] = n_calling
+    columns[f"{key_added}_n_tools_voting"] = n_voting
+
+    existing = [c for c in columns if c in obs.columns]
+    if existing and not overwrite:
+        raise ValueError(
+            f"obs already has {existing}; pass overwrite=True to replace them, "
+            "or a different key_added to keep both."
+        )
+
+    record["n_predicted_doublet"] = int((predicted & voted_any).sum())
+    record["n_predicted_singlet"] = int((~predicted & voted_any).sum())
+    record["n_no_vote"] = int((~voted_any).sum())
+    record["columns_added"] = list(columns)
+
+    if is_adata:
+        for name, values in columns.items():
+            target.obs[name] = values
+        target.uns[f"{key_added}_consensus"] = record
+        return record
+
+    for name, values in columns.items():
+        obs[name] = values
+    uns = exp.read_uns()
+    uns = dict(uns) if uns else {}
+    uns[f"{key_added}_consensus"] = record
+    # obs and uns in ONE commit, so `pyscx.rollback` undoes the whole thing.
+    # Two calls would leave a file that had been half-rolled-back.
+    modify_metadata(path, obs=obs, uns=uns,
+                    index_obs=index_obs, index_preset=index_preset)
+    return record
 
 
 def from_h5mu(path, out, **kwargs):

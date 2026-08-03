@@ -3557,6 +3557,7 @@ dependencies = [
  "log",
  "ndarray",
  "rayon",
+ "regex",
  "scx-codec",
  "scx-engine",
  "scx-format-io",

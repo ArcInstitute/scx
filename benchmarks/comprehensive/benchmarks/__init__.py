@@ -56,6 +56,13 @@ ALL_BENCHMARKS: list[str] = [
     # Cell-eval / arc-bench parity perf — SCX-only (gated on scx_auto).
     # Requires the scx-bench-eval conda env (cell_eval / arc_bench / pdex).
     "cell_eval_parity_perf",
+    # Doublet-caller interop: export per batch → run scDblFinder / Scrublet in
+    # their own conda envs → doublet_import → doublet_consensus → score. Two
+    # tiers of metric: a deterministic round-trip check (the tool's own numbers
+    # must survive the key-joined import, and that gates) plus agreement and
+    # injected-truth accuracy (calibrated floors). SCX-only, and gated on a
+    # DOUBLET_SPEC entry inside the module. See doublet_interop.py.
+    "doublet_interop",
     # SCX-only fragment / manifest operations
     "fragment_ops",
     # SCX-only grouped sharding: sort --group-by + convert-time grouping

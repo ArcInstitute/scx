@@ -604,7 +604,7 @@ impl PyCloudExperiment {
                     // pandas envelope still advertises).
                     let schema = self.reader.read_obs_schema().await?;
                     let mut names: Vec<String> = Vec::new();
-                    for idx_col in scx_format_io::pandas_index_columns(&schema) {
+                    for idx_col in scx_format_io::resolve_index_columns(&schema) {
                         if schema.index_of(&idx_col).is_ok() && !cols.contains(&idx_col) {
                             names.push(idx_col);
                         }

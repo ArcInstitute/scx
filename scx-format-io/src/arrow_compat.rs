@@ -380,6 +380,33 @@ pub fn pandas_index_columns(schema: &Schema) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Field names that carry the frame's index, tolerating a missing envelope.
+///
+/// [`pandas_index_columns`] reads only the authoritative `pandas` schema
+/// metadata. That envelope is absent on two kinds of file: those written by
+/// the CLI convert path, and — until the `unify_dict_columns` fix — any file
+/// whose obs was rewritten in place by `append` / `merge` / `modify_metadata` /
+/// `attach_external_obs`, all of which rebuilt the schema without it.
+///
+/// So consumers that need to *identify* the index (rather than merely honour a
+/// declared one) fall back to the literal names pyarrow and anndata use.
+/// `__index_level_0__` is probed before `_index` so pyarrow's spelling wins on
+/// a round-tripped frame that somehow carries both.
+///
+/// Returns empty when neither is present — a frame with no index column is a
+/// real state, and inventing one would be worse than reporting none.
+pub fn resolve_index_columns(schema: &Schema) -> Vec<String> {
+    let declared = pandas_index_columns(schema);
+    if !declared.is_empty() {
+        return declared;
+    }
+    ["__index_level_0__", "_index"]
+        .iter()
+        .find(|name| schema.field_with_name(name).is_ok())
+        .map(|s| vec![s.to_string()])
+        .unwrap_or_default()
+}
+
 /// Defensive: ensure the schema's `pandas` metadata envelope identifies
 /// the index column when the batch carries a literal `__index_level_0__`
 /// or `_index` field but no metadata. anndata 0.10+ hard-rejects any
@@ -393,22 +420,18 @@ pub fn pandas_index_columns(schema: &Schema) -> Vec<String> {
 /// Behaviour:
 /// - If `pandas_index_columns` already returns a non-empty list →
 ///   return `batch.clone()` (no-op).
-/// - Else scan `schema.fields()` for the first match of
-///   `"__index_level_0__"`, then `"_index"`. pyarrow's name wins so a
-///   round-tripped envelope stays canonical.
+/// - Else take [`resolve_index_columns`]'s literal-field fallback
+///   (`__index_level_0__`, then `_index`).
 /// - If neither is present → return `batch.clone()` (no spurious
 ///   metadata for files that legitimately have no index column).
 pub fn ensure_pandas_index_metadata(batch: &RecordBatch) -> RecordBatch {
     if !pandas_index_columns(batch.schema_ref()).is_empty() {
         return batch.clone();
     }
-    let candidates = ["__index_level_0__", "_index"];
     let schema = batch.schema();
-    let idx_name: Option<String> = candidates
-        .iter()
-        .find(|name| schema.field_with_name(name).is_ok())
-        .map(|s| s.to_string());
-    let Some(idx_name) = idx_name else {
+    // Same probe as `resolve_index_columns`, single-sourced: what this stamps
+    // and what the export/projection paths resolve must never disagree.
+    let Some(idx_name) = resolve_index_columns(schema.as_ref()).into_iter().next() else {
         return batch.clone();
     };
     let mut metadata = schema.metadata().clone();
@@ -747,6 +770,92 @@ mod tests {
         assert_eq!(downcast.schema().metadata(), &schema_md);
         assert_eq!(downcast.schema().field(0).metadata(), &field_md);
         assert_eq!(downcast.schema().field(0).data_type(), &DataType::Utf8);
+    }
+
+    // -------------------------------------------------------------
+    // resolve_index_columns: envelope first, literal field as fallback
+    // -------------------------------------------------------------
+
+    #[test]
+    fn resolve_index_columns_prefers_the_declared_envelope() {
+        use std::collections::HashMap;
+        // A frame whose envelope names `barcode` while a literal
+        // `__index_level_0__` field also exists. The declaration wins: it is
+        // authoritative, and guessing over it would override a caller who
+        // deliberately named a different index.
+        let mut md = HashMap::new();
+        md.insert(
+            "pandas".to_string(),
+            r#"{"index_columns":["barcode"]}"#.to_string(),
+        );
+        let a1: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let a2: ArrayRef = Arc::new(StringArray::from(vec!["c", "d"]));
+        let schema = Arc::new(
+            Schema::new(vec![
+                Field::new("barcode", DataType::Utf8, true),
+                Field::new("__index_level_0__", DataType::Utf8, true),
+            ])
+            .with_metadata(md),
+        );
+        let batch = RecordBatch::try_new(schema, vec![a1, a2]).unwrap();
+        assert_eq!(
+            resolve_index_columns(batch.schema_ref()),
+            vec!["barcode".to_string()]
+        );
+    }
+
+    /// The case that matters for already-written files: no envelope (an obs
+    /// rewritten in place before the `unify_dict_columns` fix), and the index
+    /// field is NOT field 0 — pyarrow puts it last. Falling back to field 0
+    /// here is what renamed every exported cell to its cell type.
+    #[test]
+    fn resolve_index_columns_finds_the_literal_field_without_an_envelope() {
+        let a1: ArrayRef = Arc::new(StringArray::from(vec!["T", "B"]));
+        let a2: ArrayRef = Arc::new(StringArray::from(vec!["c0", "c1"]));
+        let batch = batch_from(vec![
+            ("cell_type", DataType::Utf8, a1),
+            ("__index_level_0__", DataType::Utf8, a2),
+        ]);
+        assert!(pandas_index_columns(batch.schema_ref()).is_empty());
+        assert_eq!(
+            resolve_index_columns(batch.schema_ref()),
+            vec!["__index_level_0__".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_index_columns_accepts_the_anndata_spelling() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let batch = batch_from(vec![("_index", DataType::Utf8, arr)]);
+        assert_eq!(
+            resolve_index_columns(batch.schema_ref()),
+            vec!["_index".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_index_columns_prefers_pyarrows_spelling_over_anndatas() {
+        let a1: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let a2: ArrayRef = Arc::new(StringArray::from(vec!["c", "d"]));
+        let batch = batch_from(vec![
+            ("_index", DataType::Utf8, a1),
+            ("__index_level_0__", DataType::Utf8, a2),
+        ]);
+        assert_eq!(
+            resolve_index_columns(batch.schema_ref()),
+            vec!["__index_level_0__".to_string()]
+        );
+    }
+
+    /// A frame with genuinely no index column must report none. Inventing one
+    /// would be worse than reporting nothing: the export's field-0 fallback is
+    /// correct for exactly this shape (CLI-converted obs), and a fabricated
+    /// answer here would override it.
+    #[test]
+    fn resolve_index_columns_reports_none_when_there_is_no_index() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let batch = batch_from(vec![("cell_id", DataType::Utf8, arr)]);
+        assert!(resolve_index_columns(batch.schema_ref()).is_empty());
     }
 
     // -------------------------------------------------------------

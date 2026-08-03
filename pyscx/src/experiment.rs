@@ -93,7 +93,7 @@ pub(crate) fn project_batch_columns(
 ) -> PyResult<arrow::record_batch::RecordBatch> {
     let schema = batch.schema();
     let mut indices: Vec<usize> = Vec::new();
-    for idx_col in scx_format_io::pandas_index_columns(&schema) {
+    for idx_col in scx_format_io::resolve_index_columns(&schema) {
         if let Ok(i) = schema.index_of(&idx_col) {
             if !cols.contains(&idx_col) {
                 indices.push(i);
@@ -106,7 +106,10 @@ pub(crate) fn project_batch_columns(
             // pandas index column is retained unconditionally and is often an
             // internal name (`__index_level_0__`), so offering it as a
             // suggestion is noise.
-            let index_cols = scx_format_io::pandas_index_columns(&schema);
+            // Same resolver as the retention loop above, so a file with no
+            // envelope does not offer `__index_level_0__` as a suggestion
+            // here while silently retaining it there.
+            let index_cols = scx_format_io::resolve_index_columns(&schema);
             let available = schema
                 .fields()
                 .iter()
@@ -569,7 +572,7 @@ impl PyExperiment {
                     // otherwise drop (e.g. `scx convert`-produced files).
                     let schema = self.reader.read_obs_schema_physical()?;
                     let mut proj: Vec<String> = Vec::new();
-                    for idx_col in scx_format_io::pandas_index_columns(&schema) {
+                    for idx_col in scx_format_io::resolve_index_columns(&schema) {
                         if schema.index_of(&idx_col).is_ok() && !cols.contains(&idx_col) {
                             proj.push(idx_col);
                         }
