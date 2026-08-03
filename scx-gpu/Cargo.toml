@@ -1,6 +1,6 @@
 [package]
 name = "scx-gpu"
-version = "0.11.8"
+version = "0.12.0"
 edition = "2021"
 description = "GPU-accelerated codec decoding, cuSPARSE interop, and GPUDirect Storage for SCX"
 license.workspace = true
