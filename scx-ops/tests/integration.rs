@@ -4496,3 +4496,162 @@ fn compact_reshape_multimodal_streams_sharded_obs() {
         assert_eq!(csr.shape.0, 10, "modality {modality_id} row count");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pandas index envelope survives in-place obs writes
+// ---------------------------------------------------------------------------
+
+/// Obs shaped the way a pandas round trip leaves it: a categorical column at
+/// field 0 (so `unify_dict_columns` has work to do), the index field last, and
+/// the schema-level `pandas` envelope naming it.
+fn obs_with_envelope_and_categorical(n: usize) -> arrow::array::RecordBatch {
+    use arrow::array::Array;
+    use std::collections::HashMap;
+
+    let ids: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
+    let types: Vec<&str> = (0..n)
+        .map(|i| if i % 2 == 0 { "T cell" } else { "B cell" })
+        .collect();
+    let dict: DictionaryArray<Int8Type> = types.into_iter().collect();
+
+    let mut md = HashMap::new();
+    md.insert(
+        "pandas".to_string(),
+        r#"{"index_columns":["__index_level_0__"]}"#.to_string(),
+    );
+    let schema = Schema::new(vec![
+        Field::new("cell_type", dict.data_type().clone(), true),
+        Field::new("__index_level_0__", DataType::Utf8, false),
+    ])
+    .with_metadata(md);
+
+    arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(dict),
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+fn obs_envelope_on_disk(path: &std::path::Path) -> Option<String> {
+    let reader = ScxReader::open(path).unwrap();
+    let obs = reader.read_obs().unwrap();
+    obs.schema().metadata().get("pandas").cloned()
+}
+
+/// The regression, at the layer that matters: not "does the helper preserve
+/// metadata" but "does the envelope still exist in the file afterwards".
+///
+/// A unit test on `unify_dict_columns` alone would pass on a writer that
+/// stripped the envelope later; this reads it back off disk. Without the fix
+/// the envelope is gone, and `to_h5ad` then renames every cell to its
+/// `cell_type` — the first string column — because the exporter falls back to
+/// "field 0 is the index".
+#[test]
+fn modify_metadata_keeps_the_pandas_index_envelope() {
+    let dir = TempDir::new().unwrap();
+    let path = write_test_file(&dir, "t.scx", 8, 4, 2);
+
+    let patch = scx_ops::MetadataPatch {
+        obs: Some(obs_with_envelope_and_categorical(8)),
+        ..Default::default()
+    };
+    scx_ops::modify_metadata(&path, &patch).unwrap();
+
+    assert_eq!(
+        obs_envelope_on_disk(&path).as_deref(),
+        Some(r#"{"index_columns":["__index_level_0__"]}"#),
+        "modify_metadata dropped the pandas index envelope",
+    );
+}
+
+/// `append` runs the same `unify_dict_columns` over both the old and the new
+/// obs, so it shares the bug and needs its own coverage — only
+/// `modify_metadata` was in the original report.
+#[test]
+fn append_keeps_the_pandas_index_envelope() {
+    let dir = TempDir::new().unwrap();
+    let path = write_test_file(&dir, "target.scx", 8, 4, 2);
+
+    // Give the target obs the envelope + categorical shape first.
+    let patch = scx_ops::MetadataPatch {
+        obs: Some(obs_with_envelope_and_categorical(8)),
+        ..Default::default()
+    };
+    scx_ops::modify_metadata(&path, &patch).unwrap();
+
+    // The appended obs carries the same envelope + categorical shape.
+    let (indptr, indices, values) = sample_shard_data(4, 4);
+    scx_ops::append(
+        &path,
+        &obs_with_envelope_and_categorical(4),
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        &AppendOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        obs_envelope_on_disk(&path).as_deref(),
+        Some(r#"{"index_columns":["__index_level_0__"]}"#),
+        "append dropped the pandas index envelope",
+    );
+}
+
+/// `scx.categorical.ordered` lives on the very fields `unify_dict_columns`
+/// rebuilds, so an ordered categorical came back unordered from every in-place
+/// obs write. Same root cause, different casualty.
+#[test]
+fn modify_metadata_keeps_the_ordered_categorical_flag() {
+    use arrow::array::Array;
+    use std::collections::HashMap;
+
+    let dir = TempDir::new().unwrap();
+    let path = write_test_file(&dir, "t.scx", 4, 4, 1);
+
+    let mut field_md = HashMap::new();
+    field_md.insert(
+        scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+        "true".to_string(),
+    );
+    let dict: DictionaryArray<Int8Type> = vec!["low", "high", "low", "high"].into_iter().collect();
+    let schema = Schema::new(vec![
+        Field::new("level", dict.data_type().clone(), true).with_metadata(field_md),
+        Field::new("__index_level_0__", DataType::Utf8, false),
+    ]);
+    let obs = arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(dict),
+            Arc::new(StringArray::from(vec!["c0", "c1", "c2", "c3"])),
+        ],
+    )
+    .unwrap();
+
+    let patch = scx_ops::MetadataPatch {
+        obs: Some(obs),
+        ..Default::default()
+    };
+    scx_ops::modify_metadata(&path, &patch).unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    let back = reader.read_obs().unwrap();
+    let flag = back
+        .schema()
+        .field_with_name("level")
+        .unwrap()
+        .metadata()
+        .get(scx_format_io::CATEGORICAL_ORDERED_KEY)
+        .cloned();
+    assert_eq!(
+        flag.as_deref(),
+        Some("true"),
+        "modify_metadata dropped scx.categorical.ordered",
+    );
+}

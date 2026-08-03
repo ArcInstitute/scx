@@ -245,11 +245,19 @@ pub(crate) fn write_dataframe_group_at(
 /// Returns `(index_field_name, on_disk_index)` for the caller's per-column
 /// loop. The index field is probed as: (1) the `pandas` schema metadata's
 /// `index_columns` (the authoritative source — `pyarrow.Table.from_pandas`
-/// stamps it; covers named and unnamed indexes), else (2) `schema.field(0)`
-/// (the CLI path where obs/var come from disk without pandas metadata, and
-/// field 0 already IS the index). pyarrow's canonical `__index_level_0__`
-/// (unnamed pandas index) is renamed to anndata's `_index` literal on disk;
-/// named indexes keep their original name.
+/// stamps it; covers named and unnamed indexes), else (2) a literal
+/// `__index_level_0__` / `_index` field, else (3) `schema.field(0)`.
+/// pyarrow's canonical `__index_level_0__` (unnamed pandas index) is renamed
+/// to anndata's `_index` literal on disk; named indexes keep their original
+/// name.
+///
+/// Step (2) exists because step (3)'s premise — "field 0 already IS the index",
+/// true of the CLI convert path — is **false for a file whose obs was rewritten
+/// in place**. There, field order is whatever the caller's DataFrame had, and
+/// pyarrow puts the index last. Files written before the `unify_dict_columns`
+/// metadata fix carry no envelope at all, so without (2) their export silently
+/// renamed every cell to the value of the first string column. (3) survives
+/// only for genuinely envelope-less, index-field-less CLI output.
 fn write_dataframe_header(
     group: &hdf5::Group,
     schema: &Schema,
@@ -263,8 +271,7 @@ fn write_dataframe_header(
         .create("encoding-version")?
         .write_scalar(&vlu("0.2.0"))?;
 
-    let pandas_idx_cols = scx_format_io::pandas_index_columns(schema);
-    let index_field_name: Option<String> = pandas_idx_cols
+    let index_field_name: Option<String> = scx_format_io::resolve_index_columns(schema)
         .into_iter()
         .find(|n| schema.field_with_name(n).is_ok())
         .or_else(|| schema.fields().first().map(|f| f.name().clone()));
