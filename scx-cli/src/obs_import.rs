@@ -67,7 +67,9 @@ pub fn run_obs_import(
     dry_run: bool,
 ) -> CmdResult {
     let missing = match on_missing_rows {
-        "zero" => MissingRowPolicy::ZeroFill,
+        // "null" is what actually happens on the obs paths (Arrow
+        // nulls, not zeros); "zero" stays accepted for back-compat.
+        "null" | "zero" => MissingRowPolicy::ZeroFill,
         "error" => MissingRowPolicy::Error,
         other => return Err(format!("--on-missing-rows must be zero|error; got '{other}'").into()),
     };

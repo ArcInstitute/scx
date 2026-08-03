@@ -477,6 +477,27 @@ def _safe_batch_filename(batch) -> str:
     return text if text.strip("._") else "batch"
 
 
+def _plan_batch_filenames(batches) -> dict:
+    """Map each batch label to a unique filename stem.
+
+    Sanitising alone is not enough: `batch/1`, `batch\\1` and `batch_1` all
+    reduce to `batch_1`. Left unchecked that is a `FileExistsError` about a
+    file this very call just wrote (with `overwrite=False`) or, worse, one
+    batch silently overwriting another's export (`overwrite=True`) — the
+    second batch's cells then never reach a tool and the first's results are
+    gone. Disambiguate with an index suffix, which keeps the common case
+    (labels that need no sanitising) unchanged.
+    """
+    stems, seen = {}, {}
+    for i, b in enumerate(batches):
+        stem = _safe_batch_filename(b)
+        if stem in seen:
+            stem = f"{stem}__{i}"
+        seen[stem] = True
+        stems[b] = stem
+    return stems
+
+
 def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
                    on_ambiguous_key="error", overwrite=False, **kwargs):
     """Export one h5ad per batch, ready to run a per-sample tool on.
@@ -574,8 +595,11 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
         # makes the tool's identity and the import's join key the same thing
         # and removes the export/import asymmetry entirely. The suggestion only
         # wins when the index genuinely cannot serve.
-        if "__index_level_0__" in diag.get("unique_columns", ()):
-            suggestion = "__index_level_0__"
+        unique_cols = diag.get("unique_columns", ()) or ()
+        for index_spelling in ("__index_level_0__", "_index"):
+            if index_spelling in unique_cols:
+                suggestion = index_spelling
+                break
         key = suggestion or diag.get("resolved_key")
         if key is None:
             raise ValueError(
@@ -665,6 +689,7 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
         )
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    stems = _plan_batch_filenames([p["batch"] for p in plan])
     results, exported = [], 0
     for p in plan:
         entry = {"batch": p["batch"], "n_cells": p["n_cells"],
@@ -680,9 +705,9 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
             results.append(entry)
             continue
         # The batch label comes from obs data, so it can contain a path
-        # separator or `..`; joining it raw would write outside out_dir.
-        safe = _safe_batch_filename(p["batch"])
-        dest = out_dir / f"{safe}.h5ad"
+        # separator or `..`; joining it raw would write outside out_dir, and
+        # two labels can sanitise to the same stem (see _plan_batch_filenames).
+        dest = out_dir / f"{stems[p['batch']]}.h5ad"
         if dest.exists() and not overwrite:
             raise FileExistsError(
                 f"{dest} already exists; pass overwrite=True to replace it"

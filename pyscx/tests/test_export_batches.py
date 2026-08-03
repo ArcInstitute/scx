@@ -390,3 +390,35 @@ def test_a_batch_label_cannot_escape_the_output_directory(tmp_path):
     for b in r["batches"]:
         written = pathlib.Path(b["path"]).resolve()
         assert written.parent == out.resolve(), written
+
+
+def test_labels_that_sanitise_alike_get_distinct_files(tmp_path):
+    """`batch/1` and `batch_1` both sanitise to `batch_1`.
+
+    Left unchecked that is a FileExistsError about a file this very call just
+    wrote (overwrite=False) or, worse, one batch silently overwriting the
+    other's export (overwrite=True) — the second batch's cells would never
+    reach a tool and the first's results would be gone.
+    """
+    obs = pd.DataFrame(
+        {"donor_id": ["batch/1", "batch/1", "batch_1", "batch_1"]},
+        index=[f"c{i}" for i in range(4)],
+    )
+    scx = _fixture(tmp_path, obs)
+
+    r = pyscx.export_batches(str(scx), str(tmp_path / "out"), batch_key="donor_id")
+
+    paths = [b["path"] for b in r["batches"]]
+    assert len(set(paths)) == len(paths) == 2, paths
+    assert r["n_cells_exported"] == 4
+    # Each file really holds its own batch's cells.
+    for b in r["batches"]:
+        assert anndata.read_h5ad(b["path"]).n_obs == 2
+
+
+def test_a_named_index_is_also_preferred_when_unique(tmp_path):
+    """The preference must cover anndata's `_index` spelling, not only
+    pyarrow's `__index_level_0__`."""
+    scx = _fixture(tmp_path, _clean_obs())
+    r = pyscx.export_batches(str(scx), str(tmp_path / "b"), batch_key="donor_id")
+    assert r["key_is_obs_index"] is True

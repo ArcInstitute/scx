@@ -260,6 +260,14 @@ def _run_in(pyscx, dataset, spec, workdir: Path, converted_path, t_start):
 _SYNTHETIC_BATCH = "_doublet_bench_batch"
 
 
+def _safe_name(value) -> str:
+    """Make an obs batch label safe as a filename component."""
+    import re
+
+    text = re.sub(r"[^A-Za-z0-9._-]", "_", str(value))
+    return text if text.strip("._") else "batch"
+
+
 def _needs_h5ad(spec) -> bool:
     return any(INPUT_KIND.get(t) == "h5ad" for t in spec.tools)
 
@@ -375,7 +383,9 @@ def _run_one_tool(pyscx, tool, spec, scx_path, export_dir, export_report,
 
     tables, records, wall, peak = [], [], 0.0, 0.0
     for batch in batches:
-        out_csv = workdir / f"{tool}_{batch}.csv"
+        # The batch label is obs data: a `donor/1` would make this a path into
+        # a directory that does not exist, and the runner would fail on write.
+        out_csv = workdir / f"{tool}_{_safe_name(batch)}.csv"
         kwargs = {"out_csv": out_csv, "batch": str(batch),
                   "seed": spec.inject.seed if spec.inject else 0}
         if INPUT_KIND[tool] == "scx":

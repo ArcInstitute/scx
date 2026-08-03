@@ -984,7 +984,7 @@ enum Commands {
         #[arg(long)]
         overwrite: bool,
         /// Target rows with no matching source row: leave them NULL (not 0) or fail
-        #[arg(long, default_value = "zero", value_parser = ["zero", "error"])]
+        #[arg(long, default_value = "null", value_parser = ["null", "zero", "error"])]
         on_missing_rows: String,
         /// Source rows absent from the target: warn and skip, or fail
         #[arg(long, default_value = "warn", value_parser = ["warn", "error"])]
@@ -1050,7 +1050,7 @@ enum Commands {
         #[arg(long)]
         overwrite: bool,
         /// Target rows with no matching source row: leave them NULL (not 0) or fail
-        #[arg(long, default_value = "zero", value_parser = ["zero", "error"])]
+        #[arg(long, default_value = "null", value_parser = ["null", "zero", "error"])]
         on_missing_rows: String,
         /// Source rows absent from the target: warn and skip, or fail
         #[arg(long, default_value = "warn", value_parser = ["warn", "error"])]

@@ -1688,10 +1688,16 @@ pub fn is_cellbender_h5(path: &str) -> bool {
 /// table reader has no business requiring libhdf5.
 pub fn parse_obs_missing_rows(s: &str) -> PyResult<scx_ops::MissingRowPolicy> {
     match s {
-        "zero" => Ok(scx_ops::MissingRowPolicy::ZeroFill),
+        // The obs paths scatter Arrow *nulls*, not zeros, and null-aware
+        // consensus depends on that — so "null" is the accurate spelling.
+        // "zero" stays accepted: it is the name the CellBender-era policy
+        // enum carries and what earlier callers pass.
+        "null" | "zero" => Ok(scx_ops::MissingRowPolicy::ZeroFill),
         "error" => Ok(scx_ops::MissingRowPolicy::Error),
         other => Err(PyValueError::new_err(format!(
-            "on_missing_rows must be 'zero' or 'error'; got '{other}'"
+            "on_missing_rows must be 'null' (leave uncovered rows NULL, the \
+             default), 'zero' (a legacy alias for the same thing) or 'error'; \
+             got '{other}'"
         ))),
     }
 }

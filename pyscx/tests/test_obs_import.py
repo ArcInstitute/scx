@@ -350,3 +350,27 @@ def test_a_float_key_column_is_still_refused(tmp_path, synthetic_adata):
     )
     with pytest.raises(ValueError, match="cannot be a join key|floats are refused"):
         pyscx.obs_import(path, str(table), key="ratio")
+
+
+def test_on_missing_rows_accepts_null_as_well_as_zero(tmp_path, synthetic_adata):
+    """The help says uncovered rows are left NULL, so `null` has to be a token
+    a user can actually pass. `zero` stays accepted — it is the name the
+    policy enum carries and what earlier callers wrote."""
+    import pandas as pd
+
+    n = synthetic_adata.n_obs
+    for token in ("null", "zero"):
+        path = str(tmp_path / f"{token}.scx")
+        pyscx.from_anndata(synthetic_adata, path)
+        table = tmp_path / f"{token}.csv"
+        pd.DataFrame({
+            "cell_id": list(synthetic_adata.obs["cell_id"])[: n // 2],
+            "score": [0.5] * (n // 2),
+        }).to_csv(table, index=False)
+
+        r = pyscx.obs_import(path, str(table), key="cell_id",
+                             on_missing_rows=token)
+        assert r["n_matched"] == n // 2
+        back = pyscx.open(path).read_obs()
+        # Uncovered rows are NULL, which is what both spellings mean.
+        assert back["score"].isna().sum() == n - n // 2

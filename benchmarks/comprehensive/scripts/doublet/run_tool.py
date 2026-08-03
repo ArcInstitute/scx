@@ -95,13 +95,23 @@ def run_tool(
     else:
         cmd = [str(env.interpreter), str(script)]
 
-    proc = subprocess.run(
-        cmd,
-        input=json.dumps(config),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=json.dumps(config),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Same shape as the failure path below: a bare TimeoutExpired names
+        # neither the tool nor the environment, and on a multi-hour capture
+        # that is the whole diagnosis.
+        raise RuntimeError(
+            f"{tool} runner timed out after {timeout}s in env "
+            f"{env.env_name!r}"
+            + (f", batch {batch!r}" if batch is not None else "")
+        ) from exc
 
     record = _last_json_object(proc.stdout)
 
