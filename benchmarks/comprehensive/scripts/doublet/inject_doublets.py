@@ -166,12 +166,19 @@ def inject_doublets(
     real_obs[TRUTH_SOURCE_A] = ""
     real_obs[TRUTH_SOURCE_B] = ""
 
-    synth_obs = pd.DataFrame(index=pd.Index(synth_names, name=real_obs.index.name))
-    for col in adata.obs.columns:
-        # Inherit the first parent's metadata so batch/donor/cell-type columns
-        # stay populated — a synthetic row with a NaN batch would be dropped by
-        # the per-batch export and never scored at all.
-        synth_obs[col] = np.asarray(adata.obs[col].astype(object))[idx_a]
+    # Inherit the first parent's whole obs row, so batch/donor/cell-type stay
+    # populated — a synthetic row with a NaN batch would be dropped by the
+    # per-batch export and never scored at all.
+    #
+    # Taken as a positional row slice rather than column by column: casting
+    # each column through `object` (the obvious way to index it) turns a
+    # numeric column like `n_counts` into Python floats, `pd.concat` then makes
+    # the merged column object-dtype, and anndata writes object columns as
+    # variable-length strings — which fails with "Can't implicitly convert
+    # non-string objects to strings" only at write time, on the first real
+    # dataset that has a numeric obs column. `.iloc` preserves every dtype.
+    synth_obs = adata.obs.iloc[idx_a].copy()
+    synth_obs.index = pd.Index(synth_names, name=real_obs.index.name)
     synth_obs[TRUTH_LABEL] = DOUBLET
     synth_obs[TRUTH_KIND] = kinds
     synth_obs[TRUTH_SOURCE_A] = names[idx_a]

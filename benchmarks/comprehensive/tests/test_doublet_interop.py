@@ -215,6 +215,13 @@ def _tiny_adata(n_obs=60, n_vars=40, seed=0, with_types=True):
     if with_types:
         obs["cell_type"] = np.repeat(["T", "B", "NK"], n_obs // 3)[:n_obs]
     obs["donor_id"] = np.where(np.arange(n_obs) < n_obs // 2, "d1", "d2")
+    # A NUMERIC and a CATEGORICAL column, not just strings. Real obs carries
+    # both (`n_counts` on pbmc3k, `cell_type` on the atlas), and a fixture of
+    # pure strings hid a dtype bug in the injection until it reached a real
+    # dataset — the inherited rows became object-dtype and anndata refused to
+    # write them as vlen strings.
+    obs["n_counts"] = np.asarray(X.sum(axis=1)).ravel().astype("float64")
+    obs["lane"] = pd.Categorical(np.where(np.arange(n_obs) % 2 == 0, "L1", "L2"))
     var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
     return ad.AnnData(X=X, obs=obs, var=var)
 
@@ -770,3 +777,25 @@ def test_a_tool_that_reports_unavailable_at_run_time_is_a_skip(bench_env):
     assert result.runs[0].extra["n_tools_ran"] == 0
     # No tool ran, so there is nothing to claim passed.
     assert result.overall_passed is False
+
+
+def test_injection_preserves_obs_column_dtypes(tmp_path):
+    # The bug this pins reached a real capture: inheriting the parent row
+    # column-by-column through `object` turned `n_counts` into Python floats,
+    # the concatenated column became object-dtype, and anndata then tried to
+    # write it as variable-length strings. It failed at h5ad-write time, long
+    # after the injection "succeeded".
+    import anndata as ad
+
+    mod = _inject_mod()
+    src = _tiny_adata()
+    out = tmp_path / "inj.h5ad"
+    mod.inject_doublets(src, out, mod.InjectionSpec(rate=0.2, seed=0),
+                        cell_type_key="cell_type")
+
+    got = ad.read_h5ad(out).obs
+    assert got["n_counts"].dtype.kind == "f", got["n_counts"].dtype
+    assert str(got["lane"].dtype) == "category"
+    # And the inherited values are the first parent's, not nulls.
+    assert got["n_counts"].isna().sum() == 0
+    assert got["lane"].isna().sum() == 0

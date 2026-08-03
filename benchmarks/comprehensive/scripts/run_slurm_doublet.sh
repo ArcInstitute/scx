@@ -84,6 +84,26 @@ for ds in "${DATASETS[@]}"; do
     --mem-gb "$MEM_GB" \
     --skip-smoke
   rc=$?
+
+  # `run_parallel.py` exits 0 even when every job it submitted failed — it
+  # reports "0 succeeded, 1 failed" and returns success. Trusting the exit
+  # code turns a capture that produced nothing into a green run, which is the
+  # worst outcome available: the numbers are simply absent and nobody looks.
+  # Check for the artifact instead.
+  if ! python - "$ds" <<'PY'
+import sys, pathlib
+from benchmarks.comprehensive.config import RESULTS_DIR
+ds = sys.argv[1]
+hits = sorted(pathlib.Path(RESULTS_DIR).rglob(f"doublet_interop__*__{ds}.json"))
+if not hits:
+    sys.exit(f"no doublet_interop result JSON was written for {ds}")
+print(f"  result: {hits[-1]}")
+PY
+  then
+    echo "  !! $ds produced no result — treating as failure regardless of exit code"
+    rc=1
+  fi
+
   echo "=== $ds — finished $(date), exit=$rc ==="
   # Keep going on failure: a dataset whose tool env is missing should not
   # strand the rest, which is the same reasoning as `--dependency=afterany`.
