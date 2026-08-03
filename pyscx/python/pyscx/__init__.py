@@ -732,8 +732,11 @@ def doublet_import(path, table, *, tool, key=None, **kwargs):
 
     Args:
         path: Target SCX file (str, os.PathLike, or an open Experiment).
-        table: The caller's output .csv / .tsv. An `.h5ad` source is not
-            supported yet — write `adata.obs[[...]].to_csv(...)` and import that.
+        table: The caller's output .csv / .tsv, or an `.h5ad` whose `/obs`
+            holds the columns — which is what the scanpy-resident tools write,
+            since `sc.pp.scrublet(adata)` sets `adata.obs` in place. The h5ad
+            route needs a build with HDF5 support; without it the error says to
+            write a CSV instead.
         tool: One of `pyscx.doublet_tools()`: "scdblfinder", "scrublet",
             "doubletfinder", "doubletdetection", "solo", "scds", "generic".
         key: Join key, exactly as for `obs_import`. None auto-resolves; a str
@@ -789,6 +792,372 @@ def doublet_import(path, table, *, tool, key=None, **kwargs):
     return _doublet_import_native(_coerce_path(path),
                                   _coerce_path(table, allow_experiment=False),
                                   tool=tool, key=key, **kwargs)
+
+
+_DOUBLET_CONSENSUS_METHODS = ("majority", "any", "all", "mean_rank")
+
+
+def _consensus_calls(obs, column):
+    """Normalise a canonical `<K>_predicted` column to (voted, called) arrays.
+
+    **A null is not a vote.** That is the whole reason the importer refuses to
+    fabricate a `0.0` for a cell a tool never saw, and the distinction has to
+    survive to here: `voted` is False for those rows, so they neither support
+    nor oppose a call. Collapsing them to False — which is what a plain
+    `sum(...) >= k` over a nullable column does — would silently turn "no
+    information" into "every tool said singlet".
+
+    Accepts every dtype the round trip produces: object holding `True`/`False`/
+    `None` (what `doublet_import` writes), pandas nullable `boolean` (what a
+    previous `doublet_consensus` writes), plain `bool`, and a strict 0/1
+    numeric column — the same tokens `scx_convert::doublet::coerce_call`
+    accepts, so the two ends of the pipeline cannot drift on what a call is.
+    """
+    import numpy as _np
+    import pandas as _pd
+
+    col = obs[column]
+    voted = ~_pd.isna(col).to_numpy()
+    called = _np.zeros(len(col), dtype=bool)
+    if not voted.any():
+        return voted, called
+
+    present = col.to_numpy(dtype=object)[voted]
+    uniq = _pd.unique(present)
+
+    if all(isinstance(v, (bool, _np.bool_)) for v in uniq):
+        called[voted] = present.astype(bool)
+        return voted, called
+
+    # Strict 0/1 only. A column of arbitrary numbers is a score that was named
+    # like a call, and thresholding it here is a scientific decision this
+    # helper does not own.
+    numeric = all(
+        isinstance(v, (int, float, _np.integer, _np.floating))
+        and not isinstance(v, bool)
+        for v in uniq
+    )
+    if numeric and {float(v) for v in uniq} <= {0.0, 1.0}:
+        called[voted] = present.astype("float64") == 1.0
+        return voted, called
+
+    bad = next(v for v in uniq if not isinstance(v, (bool, _np.bool_)))
+    raise ValueError(
+        f"obs[{column!r}] holds {bad!r}, which is not a doublet call. A "
+        "canonical `<key>_predicted` column is a nullable boolean (or a strict "
+        "0/1). A value like 'doublet' means `keys` names a tool's own source "
+        "column rather than the canonical one the importer derives — pass the "
+        "`key_added` you imported under (default: the tool name), not the "
+        "tool's native column."
+    )
+
+
+def _consensus_scores(obs, column):
+    """Read a canonical `<K>_score` column as float64 with NaN for null."""
+    import numpy as _np
+    import pandas as _pd
+
+    try:
+        numeric = _pd.to_numeric(obs[column], errors="raise")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"obs[{column!r}] is not numeric, so it cannot be ranked; "
+            f"method='mean_rank' needs every key's score column. ({exc})"
+        ) from exc
+    return numeric.to_numpy(dtype="float64", na_value=_np.nan)
+
+
+def _resolve_consensus_keys(obs, keys, method, key_added):
+    """Resolve and validate the `keys` list against what is actually on obs."""
+    suffix = "_score" if method == "mean_rank" else "_predicted"
+    available = sorted(
+        c[: -len(suffix)] for c in obs.columns
+        if c.endswith(suffix) and len(c) > len(suffix)
+    )
+    available = [k for k in available if k != key_added]
+
+    if keys is None:
+        if not available:
+            raise ValueError(
+                f"no `<key>{suffix}` columns on obs, so there is nothing to "
+                "reach a consensus over. Run `pyscx.doublet_import` for each "
+                "tool first; obs columns present are "
+                f"{list(obs.columns)}"
+            )
+        return available
+
+    if isinstance(keys, str):
+        keys = [keys]
+    keys = [str(k) for k in keys]
+    if not keys:
+        raise ValueError("`keys` is empty; name at least one imported tool")
+    if len(set(keys)) != len(keys):
+        dup = sorted({k for k in keys if keys.count(k) > 1})
+        raise ValueError(
+            f"`keys` repeats {dup}; a tool listed twice would vote twice"
+        )
+    if key_added in keys:
+        raise ValueError(
+            f"key_added={key_added!r} is also in `keys`, so the consensus would "
+            "read its own output. Pick a different key_added."
+        )
+
+    for k in keys:
+        if f"{k}{suffix}" in obs.columns:
+            continue
+        if method != "mean_rank" and f"{k}_score" in obs.columns:
+            # scds and friends: a score with no call. Dropping it from the vote
+            # silently would change the answer, so say what the options are.
+            raise ValueError(
+                f"obs has {k!r}'s score but no {f'{k}_predicted'!r}, so it "
+                "cannot vote on a call. That tool emits no call column — drop "
+                f"{k!r} from `keys`, use method='mean_rank' to combine scores "
+                "instead, or re-import it with `call_column=` to derive a call."
+            )
+        raise ValueError(
+            f"obs has no {f'{k}{suffix}'!r} column. Keys available for "
+            f"method={method!r}: {available or 'none'}"
+        )
+    return keys
+
+
+def doublet_consensus(target, *, keys=None, method="majority",
+                      key_added="doublet", quantile=None, overwrite=False,
+                      index_obs=None, index_preset=None):
+    """Combine several doublet callers' imported calls into one consensus.
+
+    Once N tools' results are canonical obs columns on one file, the consensus
+    is arithmetic — no tool-specific knowledge left. This is the last step of
+    the interop, and it is pure Python: nothing here knows what a doublet is.
+
+    **Null-aware throughout.** A tool that never saw a cell does not vote on
+    it, and a cell no tool voted on comes out `null` — never `False`. Those are
+    different facts, and the importer preserved the difference precisely so it
+    could be honoured here.
+
+    Writes, for `key_added="<K>"`:
+
+        obs["<K>_predicted"]         bool, nullable   null where nothing voted
+        obs["<K>_n_tools_calling"]   int32            how many said doublet
+        obs["<K>_n_tools_voting"]    int32            how many had an opinion
+        obs["<K>_score"]             f32              mean_rank only
+        uns["<K>_consensus"]                          inputs, rule and counts
+
+    Read `<K>_n_tools_voting` before trusting a `False`: a 0 there means the
+    cell was never assessed, which is why `<K>_predicted` is null beside it.
+
+    Args:
+        target: An SCX file (str, os.PathLike, or an open Experiment) — written
+            in place, one atomic commit, undone by `pyscx.rollback(path)` — or
+            an in-memory `AnnData`, mutated directly.
+        keys: The `key_added` values the tools were imported under (default:
+            the tool names). None discovers every key on obs that carries the
+            column this `method` needs, and records what it found.
+        method: How votes combine.
+            "majority" — more than half of the voting tools said doublet. An
+                even split is not a majority, so it is False, not null: the
+                tools disagreed, which is information, unlike no vote at all.
+            "any" — at least one voting tool said doublet.
+            "all" — every voting tool said doublet. Tools that did not cover
+                the cell are not counted against it.
+            "mean_rank" — ignores the calls and combines the *scores*: each
+                tool's score is ranked within the cells that tool covered and
+                normalised to [0, 1], then averaged. Needs `quantile`.
+        key_added: Prefix `<K>` for the written columns.
+        quantile: For "mean_rank" only, and required there: the fraction of
+            assessed cells to call doublets (e.g. 0.06 for an expected 6%
+            doublet rate). Required rather than defaulted because picking a
+            cutoff is a scientific decision this helper does not own — if you
+            want the tools' own thresholds to decide, use "majority".
+        overwrite: Replace existing `<K>_*` columns. Without it a collision is
+            an error, so a second run cannot silently rewrite the first.
+        index_obs / index_preset: Rebuild an obs predicate index over these
+            columns as part of the same commit. Relevant only for a file
+            target: replacing obs drops any existing obs predicate index, so
+            pass these if the file had one (`scx info` lists it).
+
+    Returns:
+        The same dict written to `uns["<K>_consensus"]`: `method`, `keys`,
+        `key_added`, `n_obs`, `n_predicted_doublet`, `n_predicted_singlet`,
+        `n_no_vote`, `columns_added`, `per_key` counts, and for "mean_rank"
+        the `quantile` and the `threshold` it resolved to.
+
+    Note:
+        A tool with no call column (scds) has no `<K>_predicted` and cannot
+        vote on a call — naming it in `keys` for a call-based method is an
+        error rather than a silent omission, since dropping a voter changes
+        the result. It works fine under "mean_rank".
+
+    Example:
+        pyscx.doublet_import("atlas.scx", "scdbl.csv", tool="scdblfinder")
+        pyscx.doublet_import("atlas.scx", "scrub.csv", tool="scrublet")
+        r = pyscx.doublet_consensus("atlas.scx",
+                                    keys=["scdblfinder", "scrublet"])
+        print(r["n_predicted_doublet"], "doublets;", r["n_no_vote"], "unassessed")
+    """
+    import numpy as _np
+    import pandas as _pd
+
+    if method not in _DOUBLET_CONSENSUS_METHODS:
+        raise ValueError(
+            f"method must be one of {list(_DOUBLET_CONSENSUS_METHODS)}; got "
+            f"{method!r}"
+        )
+    if not key_added:
+        raise ValueError("key_added must be a non-empty string")
+    if method == "mean_rank":
+        if quantile is None:
+            raise ValueError(
+                "method='mean_rank' needs `quantile` — the fraction of "
+                "assessed cells to call doublets (e.g. quantile=0.06). It has "
+                "no default because a score cutoff is a scientific decision; "
+                "use method='majority' to let each tool's own call decide."
+            )
+        if not 0.0 < float(quantile) < 1.0:
+            raise ValueError(
+                f"quantile must be strictly between 0 and 1; got {quantile!r}"
+            )
+    elif quantile is not None:
+        raise ValueError(
+            f"`quantile` only applies to method='mean_rank'; got method="
+            f"{method!r}. Its calls come from each tool's own threshold."
+        )
+
+    # An AnnData is mutated in place; anything path-like is read, computed and
+    # written back. Checked before `_coerce_path` because an AnnData has no
+    # __fspath__ and would otherwise fall through to its generic TypeError.
+    is_adata = (
+        not isinstance(target, str)
+        and not hasattr(target, "__fspath__")
+        and hasattr(target, "obs")
+        and hasattr(target, "uns")
+    )
+    if is_adata:
+        obs = target.obs
+    else:
+        path = _coerce_path(target)
+        exp = _open_native(path)
+        # PHYSICAL rows — the row space `modify_metadata` validates against,
+        # and the one logically-deleted rows still occupy.
+        obs = exp.read_obs()
+
+    keys = _resolve_consensus_keys(obs, keys, method, key_added)
+
+    n = len(obs)
+    n_voting = _np.zeros(n, dtype=_np.int32)
+    n_calling = _np.zeros(n, dtype=_np.int32)
+    per_key = {}
+
+    # `n_tools_calling` always counts tools whose own call was True, whatever
+    # the method — so it stays a fact about the tools rather than about the
+    # rule. `n_tools_voting` counts what fed *this* method's decision, which
+    # for mean_rank is a score rather than a call.
+    for k in keys:
+        entry = {}
+        if f"{k}_predicted" in obs.columns:
+            voted, called = _consensus_calls(obs, f"{k}_predicted")
+            entry["predicted_column"] = f"{k}_predicted"
+            entry["n_calling"] = int(called.sum())
+            n_calling += called
+            if method != "mean_rank":
+                entry["n_voting"] = int(voted.sum())
+                n_voting += voted
+        if method == "mean_rank":
+            entry["score_column"] = f"{k}_score"
+            covered = ~_np.isnan(_consensus_scores(obs, f"{k}_score"))
+            entry["n_voting"] = int(covered.sum())
+            n_voting += covered
+        per_key[k] = entry
+
+    voted_any = n_voting > 0
+    record = {
+        "method": method,
+        "keys": list(keys),
+        "key_added": key_added,
+        "n_obs": int(n),
+        "per_key": per_key,
+    }
+
+    # Columns are held as bare arrays, never Series, so assignment is
+    # positional and never goes through index alignment. These values were
+    # computed from these very rows, in this order, so alignment could only
+    # ever be a no-op or a bug — and a merged atlas's obs index is routinely
+    # duplicated (10x over on the CELLxGENE-derived file this work was
+    # validated against), where pandas only tolerates alignment while the two
+    # indexes compare equal.
+    columns = {}
+    if method == "mean_rank":
+        # Rank within each tool's own covered cells, so a tool that scored
+        # 3,000 cells and one that scored 300,000 contribute on the same [0, 1]
+        # scale rather than the larger run dominating the average.
+        ranks = _np.full((len(keys), n), _np.nan, dtype="float64")
+        for i, k in enumerate(keys):
+            s = _pd.Series(_consensus_scores(obs, f"{k}_score"))
+            ranks[i] = s.rank(pct=True, method="average").to_numpy(dtype="float64")
+        # Mean over the tools that scored each cell. Done by hand rather than
+        # with nanmean because an all-NaN row — a cell no tool scored — is
+        # expected here, and is the "no vote" case rather than a warning.
+        covered_count = (~_np.isnan(ranks)).sum(axis=0)
+        assessed = covered_count > 0
+        mean_rank = _np.where(
+            assessed,
+            _np.nansum(ranks, axis=0) / _np.maximum(covered_count, 1),
+            _np.nan,
+        )
+        if assessed.any():
+            threshold = float(
+                _np.quantile(mean_rank[assessed], 1.0 - float(quantile))
+            )
+            predicted = assessed & (mean_rank >= threshold)
+        else:
+            threshold = None
+            predicted = _np.zeros(n, dtype=bool)
+        columns[f"{key_added}_score"] = mean_rank.astype("float32")
+        record["quantile"] = float(quantile)
+        record["threshold"] = threshold
+    elif method == "any":
+        predicted = n_calling >= 1
+    elif method == "all":
+        predicted = (n_calling == n_voting) & voted_any
+    else:  # majority — strictly more than half, so a tie is not a majority
+        predicted = (n_calling * 2) > n_voting
+
+    # The single line the whole design exists to make possible: a row nothing
+    # voted on is null, not False.
+    call = _pd.array(_np.asarray(predicted, dtype=bool), dtype="boolean")
+    call[~voted_any] = _pd.NA
+    columns[f"{key_added}_predicted"] = call
+    columns[f"{key_added}_n_tools_calling"] = n_calling
+    columns[f"{key_added}_n_tools_voting"] = n_voting
+
+    existing = [c for c in columns if c in obs.columns]
+    if existing and not overwrite:
+        raise ValueError(
+            f"obs already has {existing}; pass overwrite=True to replace them, "
+            "or a different key_added to keep both."
+        )
+
+    record["n_predicted_doublet"] = int((predicted & voted_any).sum())
+    record["n_predicted_singlet"] = int((~predicted & voted_any).sum())
+    record["n_no_vote"] = int((~voted_any).sum())
+    record["columns_added"] = list(columns)
+
+    if is_adata:
+        for name, values in columns.items():
+            target.obs[name] = values
+        target.uns[f"{key_added}_consensus"] = record
+        return record
+
+    for name, values in columns.items():
+        obs[name] = values
+    uns = exp.read_uns()
+    uns = dict(uns) if uns else {}
+    uns[f"{key_added}_consensus"] = record
+    # obs and uns in ONE commit, so `pyscx.rollback` undoes the whole thing.
+    # Two calls would leave a file that had been half-rolled-back.
+    modify_metadata(path, obs=obs, uns=uns,
+                    index_obs=index_obs, index_preset=index_preset)
+    return record
 
 
 def from_h5mu(path, out, **kwargs):
