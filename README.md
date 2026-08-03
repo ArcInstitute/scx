@@ -800,7 +800,7 @@ SCX is a Rust workspace with 16 crates:
 |-------|---------|
 | `scx-format` | Pure on-disk layout/spec: header, catalog, shard structs, checksums (no I/O) |
 | `scx-format-io` | Runtime reader/writer, backed/streaming access, shard codec dispatch, sidecars |
-| `scx-codec` | Domain-specific codecs: Rice, FOR-BP, Delta-Golomb, Zstd |
+| `scx-codec` | Domain-specific codecs: Rice, FOR-BP, Delta-Golomb, Zstd, LZ4+shuffle, Pcodec, byte-shuffle |
 | `scx-sparse` | CSR matrix type (scipy-compatible) |
 | `scx-ops` | Append, delete, compact, merge, rollback |
 | `scx-engine` | Lazy query engine with predicate pushdown |
@@ -808,10 +808,12 @@ SCX is a Rust workspace with 16 crates:
 | `scx-accel` | Rust-native analysis accelerators: PCA, kNN, UMAP, DE, pseudobulk |
 | `scx-gpu` | CUDA-accelerated codec decoding, cuSPARSE interop, GPU sparse-to-dense |
 | `scx-cloud` | Cloud access: push, pull, explode, pack, CloudReader |
+| `scx-convert` | External format ↔ SCX conversion (h5ad, h5mu, MTX, 10x) |
 | `scx-mtx` | Matrix Market (MTX) I/O: Cell Ranger directory read/write |
 | `scx-cli` | CLI tool |
 | `pyscx` | Python bindings (PyO3) |
 | `rscx` | R bindings (extendr) |
+| `scx-integration-tests` | Cross-crate integration tests: golden files, conformance vectors, lifecycle |
 
 For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/format.md`](docs/format.md), [`docs/codec.md`](docs/codec.md), [`docs/api.md`](docs/api.md), [`docs/sharding.md`](docs/sharding.md), [`docs/multithreading.md`](docs/multithreading.md), [`docs/cloud.md`](docs/cloud.md), and [`docs/scanpy.md`](docs/scanpy.md). For agent-oriented install and usage workflows in Claude Code, see [`skills/scx-usage/SKILL.md`](skills/scx-usage/SKILL.md).
 

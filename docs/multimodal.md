@@ -240,9 +240,8 @@ On a multimodal file `modality=` is **required**: omitting it raises
 `ValueError` (there is no unambiguous default axis), and an unknown name
 raises `KeyError`. On a single-modality / v1 file omit `modality=` (the
 default global axis; passing a name errors). A file carrying deletion
-vectors rejects a modality query with a clear error — compact it first
-(`scx compact`) to apply the deletions (per-modality deletion vectors are a
-follow-on). Modality-scoped queries run over the **cloud** reader too —
+vectors applies global-obs deletion vectors (`modality_id = 0`) automatically during
+a modality query, dropping deleted cells from the requested modality's X. Modality-scoped queries run over the **cloud** reader too —
 `open_cloud(url).query(modality="rna")`, `read_cloud(url, modality="rna")`, and
 `scx query <url> --modality rna` — for both packed and exploded `.scxd/`
 layouts. (`open_cloud(...).to_mudata()` over cloud remains a separate follow-on.)
@@ -441,9 +440,8 @@ are resolved.
   decoded, no full-modality materialisation. The Level-2 predicate-index
   fast path is disabled for modality-scoped queries (the index's shard ids
   are keyed to the flattened all-modality shard order); Level-1
-  catalog-stats pruning still runs per modality. A file with deletion
-  vectors rejects a modality query (DV shard keys are global-flattened;
-  compact first). See § 3.4.
+  catalog-stats pruning still runs per modality. Global deletion vectors (`modality_id = 0`)
+  are automatically applied during modality-scoped queries. See § 3.4.
 - **MAE sampleMap with non-aligned cells**: `from_mae` raises rather
   than NA-padding. Users should `intersectColumns()` upfront. Future
   work could lift this by emitting NA values into the mismatched cells

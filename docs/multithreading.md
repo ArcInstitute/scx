@@ -276,6 +276,7 @@ locks degrade gracefully — readers are never blocked.
 
 > [!TIP]
 > Unlike HDF5's mandatory POSIX locks, SCX's advisory locks never cause
+> `errno 37` ("No locks available") on NFS/Lustre/GPFS.
 
 ## Streaming conversion (parallel ingest and export)
 

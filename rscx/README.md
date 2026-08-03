@@ -101,6 +101,36 @@ scx_info("experiment.scx")
 scx_validate("experiment.scx")
 ```
 
+### Attaching annotations computed in R
+
+`scx_attach_obs()` lands a `data.frame` of per-cell annotations onto an
+existing file as obs columns, in place. scDblFinder / DoubletFinder / scds run
+directly on an rscx-loaded object, so on this path there is no intermediate
+file in either direction:
+
+```r
+library(rscx)
+library(scDblFinder)
+
+sce <- collect(scx_query(scx_open("library_A.scx")))$to_sce()
+sce <- scDblFinder(sce)
+
+# colData() carries the cell keys as ROWNAMES, not as a column.
+df <- as.data.frame(colData(sce)[, c("scDblFinder.score", "scDblFinder.class")])
+scx_attach_obs("library_A.scx", df, key = rownames(df))
+
+# Multi-library file: barcodes repeat across samples, so join on a composite.
+scx_attach_obs("atlas.scx", df, key_columns = c("sample_id", "barcode"))
+```
+
+The join is **by key string, never by row position** — a caller returns rows in
+whatever order it pleased, and a positional attach would put every score on the
+wrong cell while still producing a correctly-shaped column. Target rows the
+`data.frame` does not cover become `NA`, never a fabricated `0`. X, layers,
+var, the CSC sidecar, `.raw`, deletion vectors and predicate indexes are
+preserved, and `scx_rollback(path)` undoes the whole attach. Pass
+`dry_run = TRUE` to run every validation and the join without writing.
+
 `scx_merge` / `scx_compact` / `scx_append` accept the same option set as pyscx
 (predicate-index columns via `index_obs`/`index_var`/`index_preset`, `uns_policy`
 and `assume_identical_var`/`sort_by` on merge, `codec`/`shard_size`/`modality` on

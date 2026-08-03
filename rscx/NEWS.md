@@ -28,6 +28,20 @@
   silently corrupting the file. Extract a modality with
   `scx subset --modality NAME`, append to the single-modality file, then re-merge.
 
+### New features
+
+- **`scx_attach_obs()`** — attach a `data.frame` of per-cell annotations to an
+  existing SCX file as obs columns, in place. The R end of the doublet-caller
+  interop: scDblFinder / DoubletFinder / scds run directly on an rscx-loaded
+  object, so there is no intermediate file in either direction. Joins **by key
+  string, never by row position** (`key = rownames(df)`, or
+  `key_columns = c("sample_id", "barcode")` for a multi-library composite);
+  target rows the `data.frame` does not cover become `NA`, never a fabricated
+  `0`. X, layers, var, the CSC sidecar, `.raw`, deletion vectors and predicate
+  indexes are preserved, and `scx_rollback()` undoes the attach. A `NULL` or
+  empty `key` is an error rather than a silent join-on-nothing, since
+  `rownames()` returns `NULL` on an object with no names.
+
 ### Improvements
 
 - `scx_delete()` accepts numeric (double) cell indices, so indices above

@@ -4,10 +4,16 @@
 \alias{scx_query}
 \title{Start a query pipeline from an ScxExperiment}
 \usage{
-scx_query(exp)
+scx_query(exp, modality = NULL)
 }
 \arguments{
 \item{exp}{An ScxExperiment object (from \code{scx_open()}).}
+
+\item{modality}{Optional modality NAME to scope the query to one modality of
+a multimodal file (X / \code{select_genes} / \code{filter_var} resolve
+against that modality's var; the obs predicate stays on the shared global
+obs axis). On a multimodal file a modality is required (omitting it errors);
+an unknown name errors. Omit (\code{NULL}) on single-modality files.}
 }
 \value{
 An RQueryPipeline object.
@@ -29,5 +35,11 @@ result <- scx_open("experiment.scx") |>
 dgc <- result$to_dgcmatrix()
 seu <- result$to_seurat()
 sce <- result$to_sce()
+
+# Multimodal: scope to one modality.
+rna <- scx_open("cite.scx") |>
+  scx_query(modality = "rna") |>
+  filter_obs("cell_type == 'T cell'") |>
+  collect()
 }
 }

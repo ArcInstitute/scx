@@ -13,7 +13,7 @@ details, see [docs/format.md](format.md). For sharding details, see
 | **delete** (`mark_deleted`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged |
 | **modify_metadata** / **set_uns** | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`) | Replaced if supplied (same `n_vars`) | **Preserved** | Dropped for the replaced obs/var axis unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild; untouched otherwise |
 | **compact** | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **optimize** | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | **Preserved** (rows + shard boundaries unchanged) |
+| **optimize** | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | **Preserved** (rows + shard boundaries unchanged) |
 | **merge** | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
 | **subset** | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** (rebuild via `scx convert --index-obs ...` on the output) |
 | **sort** | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
@@ -26,7 +26,7 @@ details, see [docs/format.md](format.md). For sharding details, see
 When a mutating operation drops the CSC sidecar, it emits a warning:
 
 ```
-UserWarning: CSC sidecar dropped by append; rebuild with `scx build-csc` or pass --rebuild-csc
+log::warn!("append dropped 1 CSC shards from experiment.scx: rerun `scx build-csc` (or pass --rebuild-csc) to restore the column-major sidecar")
 ```
 
 To restore:
@@ -39,10 +39,10 @@ scx build-csc experiment.scx experiment_with_csc.scx
 scx compact experiment.scx compacted.scx --rebuild-csc
 ```
 
-The Python wrappers do not expose a standalone `build_csc` function — use
-`scx build-csc` on the CLI, or set `csc="always"` at conversion time via
-`pyscx.from_anndata(..., csc="always")` to emit the sidecar during the
-initial write.
+The Python API exposes `pyscx.build_csc(input, output, memory_limit="4G", force=False, csc_cols_per_shard=5000)`
+for standalone rebuilds. Alternatively, set `csc="always"` at conversion time
+via `pyscx.from_anndata(..., csc="always")` to emit the sidecar during the
+initial write, or pass `rebuild_csc=True` to mutating operations like `pyscx.sort(..., rebuild_csc=True)`.
 
 ## Append Complexity
 
@@ -137,7 +137,7 @@ historical file size.
 `scx optimize <input> <output>` upgrades an existing **single-modality**
 file in place: it decodes → `canonicalize_csr` → re-encodes and row-group-frames
 every CSR-backed shard (`X`, layers, and obs×obs `obsp` CSR graphs), stamping
-`format_version=4` — without a full reconvert. This is how an older file gains the
+`format_version=4` when framed (or `format_version=3` if unframed via `--row-group-rows 0`) — without a full reconvert. This is how an older file gains the
 row-group random-access substrate and GPU device-decode benefits: framed Scx1
 shards keep the GPU device-decode route (decoding group-by-group in VRAM). No
 decode sidecar is written (see [scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis)).

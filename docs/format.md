@@ -460,8 +460,8 @@ correctly populated `n_csc_shards` count + `has_csc` flag.
 The **decode metadata sidecar** (`decode_metadata_shard`, section type 26) was a
 per-row / per-Rice-block index that gave the Scx1 codec bit-level random access
 and fed the GPU decode handoff. It has been **removed**: row-group framing (the
-`BlockIndex`, `format_version` 4 / `shard_format_version` 2 — see [§ 11 CSR Shard
-Format](#11-csr-shard-format) and [codec.md § Row-group framing](codec.md)) is now
+`BlockIndex`, `format_version` 4 / `shard_format_version` 2 — see [§ 4 CSR Shard
+Internal Layout](#4-csr-shard-internal-layout) and [codec.md § Row-group framing](codec.md#row-group-framing-v4-file--shard-v2--random-access-safe)) is now
 the default write layout and provides codec-agnostic sub-shard random access for
 *all* codecs, and framed Scx1 shards decode group-by-group in VRAM directly — so
 the sidecar became pure redundancy.

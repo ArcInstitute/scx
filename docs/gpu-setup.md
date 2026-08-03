@@ -17,8 +17,8 @@ and the ML training loader. All ops are accessed through the same
 | NVIDIA driver | 525+ | 535+ | Must support CUDA ≥ 12.0 (`nvidia-smi` shows max CUDA version) |
 | CUDA Toolkit | 12.0 | 12.2–12.6 | Provides `nvcc` for kernel compilation |
 | rapids-singlecell | 0.12+ | latest | In-VRAM PCA/kNN/UMAP/preprocess — **most important GPU dep** |
-| cuGraph | 24.10+ | 24.12+ | GPU Leiden clustering (optional — CPU fallback available) |
-| cuVS | 24.10+ | 24.12+ | Device-resident CAGRA kNN in fused `pca_neighbors` only (optional) |
+| cuGraph | 25.10+ | 25.12+ | GPU Leiden clustering (optional — CPU fallback available) |
+| cuVS | 25.10+ | 25.12+ | Device-resident CAGRA kNN in fused `pca_neighbors` only (optional) |
 | Rust toolchain | 1.78+ | stable | For building scx-gpu crate |
 | Python | 3.11+ | 3.12–3.13 | For pyscx bindings |
 

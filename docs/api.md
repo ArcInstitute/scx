@@ -1069,7 +1069,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.open(path, verify=True) -> Experiment` — Open SCX file (local), returning a lazy `Experiment` handle.
 - `pyscx.read(path, *, verify=True, **kwargs) -> AnnData` — One-liner read mirroring `sc.read_h5ad`: shorthand for `pyscx.open(path).to_anndata(**kwargs)`. `**kwargs` forward to [`Experiment.to_anndata`](#experiment) (`backed=`, `var_names=`, `obs_filter=`, `layers=`, `container=`, `data_dtype=`, `index_dtype=`, `allow_lossy=`, …).
 - `pyscx.write(adata, path, **kwargs)` — One-liner write mirroring `AnnData.write_h5ad`: shorthand for `pyscx.from_anndata(adata, path, **kwargs)`.
-- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", force_legacy_metadata=False, memory_budget=None)` — Write AnnData to SCX. A float64 `X` is downcast to float32 with a `UserWarning`.
+- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc=None, csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", memory_budget=None, force_legacy_metadata=False, sort_by=None, reverse=False, row_group_rows=256, row_group_target_nnz=None)` — Write AnnData to SCX. A float64 `X` is downcast to float32 with a `UserWarning`. `csc=None` resolves to `"off"` unless `index_preset` implies `"auto"` (see `resolve_csc_policy`).
   Persists `X`, `obs`, `var`, `layers`, `obsm`, `varm`, `uns`, and the sparse
   pairwise slots `obsp` / `varp`. Pairwise matrices are stored as float32 COO
   Arrow IPC; higher-precision inputs are downcast on write. `in_place=True`
@@ -1091,7 +1091,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   row count for both `X` and the obs/var metadata shards. Obsm, varm,
   obsp, and varp are extracted and written one key at a time (incremental,
   not collected).
-- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4, obs_override=None, var_override=None, uns_override=None)` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
+- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc=None, csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4, sort_by=None, reverse=False, group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None, group_pass="auto", obs_override=None, var_override=None, uns_override=None, row_group_rows=256, row_group_target_nnz=None)` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust. `csc=None` resolves to `"off"` unless `index_preset` implies `"auto"`.
   Bounded peak memory: `shard_target_rows × n_vars × density × ~16` bytes
   per X shard, plus `shard_target_rows × k × 4` bytes per `obsm` / `varm` /
   `obsp` / `varp` matrix (each is now hyperslab-read and emitted as
@@ -1187,14 +1187,14 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   uses, so the result is semantically equivalent to the obs / var that
   `anndata.read_h5ad` would have returned — without the obsm allocation
   cost. `strict_uns=True` mirrors `from_h5ad`'s strict-uns semantics.
-- `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5mu file to a multimodal SCX v2 file. Mirrors `from_h5ad` for h5mu inputs; per-modality `n_vars`/`nnz` come from `/mod/{name}/X` attributes so there is no pre-pass materialisation. `reader_threads`/`writer_queue_depth` carry the same semantics as `from_h5ad` — each modality runs through the same dispatcher independently.
+- `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc=None, csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4, row_group_rows=256)` — Stream an h5mu file to a multimodal SCX v2 file. `csc=None` resolves to `"off"` unless `index_preset` implies `"auto"`. Mirrors `from_h5ad` for h5mu inputs; per-modality `n_vars`/`nnz` come from `/mod/{name}/X` attributes so there is no pre-pass materialisation. `reader_threads`/`writer_queue_depth` carry the same semantics as `from_h5ad` — each modality runs through the same dispatcher independently.
   - `modalities`: optional list of modality names to keep
     (case-sensitive). Unknown names raise `ValueError` with the
     available list.
   - `modality_types`: optional dict `{name: "rna" | "protein" | "atac"
     | "spatial" | "methylation" | "custom"}`. Modalities not listed
     fall back to name inference and emit `ModalityTypeInferred`.
-- `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", memory_budget=None, force_legacy_metadata=False)` — 10x HDF5 to SCX.
+- `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", memory_budget=None, force_legacy_metadata=False, row_group_rows=256, row_group_target_nnz=None)` — 10x HDF5 to SCX.
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
 - `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
 - `pyscx.cellbender_import(path, cellbender_h5, *, layer="cellbender", obs_key=None, var_key=None, prefix="cellbender_", uns_key="cellbender", overwrite=False, on_missing_rows="zero", on_extra_rows="warn", gene_axis="identical", latent_embedding=False, dry_run=False)` —
@@ -1204,6 +1204,80 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   [docs/operations.md § CellBender import](operations.md#cellbender-import).
 - `pyscx.is_cellbender_h5(path)` — True when a `.h5` looks like a CellBender
   `remove-background` output rather than a plain 10x CellRanger matrix.
+- `pyscx.obs_import(path, table, *, key=None, columns=None, rename=None, prefix="", keep_key_columns=False, delimiter=None, status_column=None, uns_key=None, uns_keys=None, overwrite=False, on_missing_rows="zero", on_extra_rows="warn", dry_run=False)` —
+  Import a delimited annotation table (CSV/TSV) — or an `.h5ad` whose `/obs`
+  holds the columns, on an `hdf5`-feature build — as obs columns on an existing
+  file, **in place**. The join is by key string, never by row position; target
+  rows the table does not cover get `null`, never a fabricated `0.0`. `path`
+  accepts a str, `os.PathLike`, or an open `Experiment`; `key` accepts a str
+  (one column) or a list (length > 1 builds a composite key — the right answer
+  for a multi-library merge where `sample_id` + `barcode` is unique but neither
+  is alone). `on_missing_rows`
+  accepts `"null"`, `"zero"` or `"error"`; `"null"` and `"zero"` are the **same
+  policy** (leave the row NULL) — `zero` is the spelling the shared
+  `MissingRowPolicy` enum carries from the CellBender importer, where a missing
+  *matrix* row genuinely is zeros, and it stays the Python default for
+  compatibility. The CLI spells the same default `--on-missing-rows null`.
+  **`overwrite` replaces, it does not merge** — importing several
+  per-batch tables in turn keeps only the last. Returns a summary dict
+  (`n_obs`, `n_matched`, `n_target_rows_absent`, `n_source_rows_absent`,
+  `obs_key_column`, `obs_columns_added`, `obs_index_dropped`, and a
+  `key_diagnosis` on failure or `dry_run`); inspect `n_matched`, or run with
+  `dry_run=True`, before trusting the result. Undone by `pyscx.rollback`. See
+  [docs/operations.md § External obs import](operations.md#external-obs-import).
+- `pyscx.diagnose_obs_key(path, key=None)` — Read-only. Report which obs columns
+  could serve as a join key: `n_obs`, `resolved_key`, `resolved_cardinality`,
+  `unique_columns`, `unique_pairs` (two-column composites that are unique),
+  `pair_search_capped`, `suggestion`, `summary`. Worth running before an import
+  onto a merged atlas, where the obvious candidates are often not unique and the
+  one that is may be a column no fallback list would guess.
+- `pyscx.doublet_import(path, table, *, tool, key=None, key_added=None, score_column=None, call_column=None, call_true=None, call_false=None, keep_native_columns=True, delimiter=None, uns_keys=None, overwrite=False, on_missing_rows="zero", on_extra_rows="warn", dry_run=False)` —
+  The doublet-caller wrapper over `obs_import`: each tool names its score and
+  call differently, and this maps them onto canonical columns so downstream code
+  never branches on which tool ran. For `key_added="K"` (defaulting to the tool
+  name) it writes `obs["K_score"]` (f32, nullable), `obs["K_predicted"]` (bool,
+  nullable), `obs["K_status"]`, `obs["K_<native>"]` for every other source
+  column, and `uns["K"]`. A tool that emits no call (`scds`) gets **no**
+  `K_predicted` — thresholding a score is a decision the importer does not make
+  for you; pass `call_column=` to opt in. `tool="generic"` requires
+  `score_column=`. Pass `keep_native_columns=False` when the source is an h5ad
+  exported from the target file, or every original obs column is re-imported
+  under the tool prefix.
+- `pyscx.doublet_tools()` — The valid `tool=` values, in table order:
+  `scdblfinder`, `scrublet`, `doubletfinder`, `doubletdetection`, `solo`,
+  `scds`, `generic`.
+- `pyscx.doublet_consensus(target, *, keys=None, method="majority", key_added="doublet", quantile=None, overwrite=False, index_obs=None, index_preset=None)` —
+  Combine several callers' imported columns into one consensus. `target` is an
+  SCX file (written in place, one commit, `pyscx.rollback`-able) or an in-memory
+  `AnnData` (mutated directly). Writes `obs["K_predicted"]` (nullable boolean),
+  `obs["K_n_tools_calling"]`, `obs["K_n_tools_voting"]` (both int32),
+  `obs["K_score"]` (`mean_rank` only) and `uns["K_consensus"]`, and returns that
+  same dict. **Null-aware throughout**: a tool that never saw a cell does not
+  vote on it, and a cell nobody voted on comes out `null`, not `False` — read
+  `K_n_tools_voting` before trusting a `False`. `method` is `"majority"` (more
+  than half the *voting* tools; an even split is `False`, not null), `"any"`,
+  `"all"`, or `"mean_rank"` (ignores the calls, rank-normalises each tool's
+  scores within the cells it covered and averages; requires an explicit
+  `quantile`, since a score cutoff is a scientific decision this helper does not
+  own). `keys=None` discovers every key on obs carrying the column the method
+  needs. Pure Python — nothing in it knows what a doublet is.
+- `pyscx.export_batches(path, out_dir, *, batch_key, key=None, batches=None, on_ambiguous_key="error", overwrite=False, **kwargs)` —
+  Write one h5ad per batch, ready to run a per-sample tool on, without
+  materialising the pooled file (peak RSS is one library). `**kwargs` pass
+  through to `pyscx.to_h5ad`. What it adds over the loop you would write
+  yourself is the key check: a tool sees only the h5ad it is handed, so two
+  cells sharing a key inside one batch leave nothing to join its answers back
+  on. **Two identities are checked** — the tools read `obs_names`, the import
+  joins on the resolved `key`, and those diverge exactly when auto-resolution
+  picks a unique non-index column over a duplicated index; both must be unique
+  within a batch. `on_ambiguous_key` is `"error"` (refuses before writing
+  anything), `"skip"` or `"warn"`. Returns `key`, `key_is_obs_index`,
+  `key_is_globally_unique`, `out_dir`, `n_batches`, `n_cells_exported` and a
+  per-batch list. Read `key_is_globally_unique` before planning the import: when
+  True, concatenate every tool output and import once (which is what you want,
+  since `overwrite` replaces rather than merges); when False the keys only
+  distinguish cells inside their own batch, so import with a composite key that
+  includes `batch_key`.
 - `pyscx.to_h5ad(path, out, stream=True, modality=None, reader_threads=None, writer_queue_depth=4, memory_budget=None, obs_mask=None, min_counts=None)` — Stream SCX → h5ad
   without materialising `X` in memory. Mirror of `pyscx.from_h5ad` in the
   opposite direction. Bounded peak memory: one shard's worth of CSR
@@ -1380,10 +1454,12 @@ the repr onto `Experiment.info() -> str`.
       `data_dtype=` lowers peak RSS. (The `obs_filter` query path and eager
       `layers` still cast post-assembly.)
   - Returns `obsm` (dense), `varm` (dense), `obsp` (scipy CSR), and
-    `varp` (scipy CSR) when present in the file. `obsp` / `varp` are
-    not subject to deletion-vector row filtering — when cells are
-    logically deleted, the pairwise matrices still cover the full
-    original axis; `compact` resolves this by rebuilding from scratch.
+    `varp` (scipy CSR) when present in the file. When cells are
+    logically deleted, `obsp` is subset to the kept rows and columns
+    when the entry is decoded (via `filter_coo_obsp_by_kept_rows`), so
+    the in-memory AnnData stays shape-consistent. `varp` and `varm`
+    are unaffected (var axis has no deletion vector). The on-disk
+    section retains the original axis until `compact` rebuilds the file.
 - `to_mudata(backed=False, cache_shards=4, container=None, data_dtype=None, index_dtype=None, allow_lossy=False)` — Materialise a multimodal file as `mudata.MuData`
   - Eager (`backed=False`): per-modality scipy CSR AnnData sharing the
     global obs. Raises on single-modality files.
@@ -2345,6 +2421,11 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 - `scx subset <input> [output] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4|pcodec]` — Extract a subset of cells and/or genes into a new SCX file (`output` is optional with `--dry-run`)
 - `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data. `--memory-limit` accepts the same size forms as `--memory-budget` (see [Memory budgets](#memory-budgets)).
 - `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest **unframed** format version (v3). Does not add row-group framing, so it does not reach v4 — use `scx optimize --row-group-rows N` for the framed v4 layout.
+
+### External annotation import
+- `scx cellbender-import <target.scx> <cellbender_out.h5> [--layer NAME] [--obs-key NAME] [--var-key NAME] [--prefix P] [--uns-key K] [--overwrite] [--on-missing-rows zero|error] [--on-extra-rows warn|error] [--gene-axis identical|reorder|subset] [--latent-embedding] [--dry-run]` — Attach a CellBender `remove-background` output as a layer, in place, joined by barcode. `--gene-axis` defaults to `identical`: a silent gene permutation is biologically wrong, so reordering must be opted into. Needs `--features hdf5`. See [docs/operations.md § CellBender import](operations.md#cellbender-import).
+- `scx obs-import <target.scx> <table.csv> [--key CSV] [--columns CSV] [--rename SRC=DST]... [--prefix P] [--keep-key-columns] [--delimiter C] [--status-column NAME] [--uns-key K] [--uns-key-from-source K]... [--overwrite] [--on-missing-rows null|zero|error] [--on-extra-rows warn|error] [--dry-run]` — Import a delimited annotation table (CSV/TSV) as obs columns, in place. Joins by key string, never by row position; uncovered target rows get `null`, not `0`. `--key a,b` is a composite key. Ungated — a delimited-table reader needs no libhdf5; an `.h5ad` source does (`--features hdf5`). `--dry-run` runs the join and a key diagnosis and writes nothing. Undo with `scx rollback`. See [docs/operations.md § External obs import](operations.md#external-obs-import).
+- `scx doublet-import <target.scx> <table.csv> --tool {scdblfinder|scrublet|doubletfinder|doubletdetection|solo|scds|generic} [--key CSV] [--key-added K] [--score-column NAME] [--call-column NAME] [--call-true TOK] [--call-false TOK] [--drop-native-columns] [--delimiter C] [--uns-key-from-source K]... [--overwrite] [--on-missing-rows null|zero|error] [--on-extra-rows warn|error] [--dry-run]` — The doublet wrapper over `obs-import`, normalising each tool's spellings onto `<K>_score` / `<K>_predicted` / `<K>_status` (+ `uns["<K>"]`). `--tool scds` emits no call column, so no `<K>_predicted` unless `--call-column` opts in; `--tool generic` requires `--score-column`. Use `--drop-native-columns` when the source is an h5ad exported from the target file.
 
 ### Cloud operations (`--features cloud`)
 - `scx cloud-optimize <input> [--output <path>]`

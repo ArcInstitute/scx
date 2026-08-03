@@ -136,6 +136,7 @@ SCX includes a high-performance training data loader that replaces PyTorch
 needed — I/O, decompression, and normalization all happen in compiled Rust.
 
 ```python
+import numpy as np
 import pyscx
 import torch
 

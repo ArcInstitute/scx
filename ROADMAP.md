@@ -412,6 +412,52 @@ header flag (bit 7) is wired through writers and readers.
 - [x] Documentation: API reference, architecture, format spec, codec spec, sharding, multithreading, cloud, scanpy integration, performance, testing, GPU setup — see `docs/`
 - [x] Benchmark suite: comprehensive multi-format regression harness in `benchmarks/comprehensive/` — see §5
 
+### 3.6 External-tool obs interop — SHIPPED
+
+Land per-cell annotations computed *outside* SCX back onto a file. Plumbing,
+not algorithms: SCX reimplements none of these tools, it removes the reason to
+round-trip a whole atlas through h5ad to use them. The layer-side sibling is
+`cellbender-import` (`scx_ops::attach_external_layer`), which lands a corrected
+count *matrix*; this is the obs-column half.
+
+- [x] `scx_ops::attach_external_obs` — in place via
+  `prepare_in_place`/`commit_in_place`, so X, layers, var, the CSC sidecar,
+  `.raw`, deletion vectors and bitmaps are preserved and `scx rollback` undoes
+  the whole import. Joins **by key string, never row position**; uncovered
+  target rows get `null`, never a fabricated `0.0`. Predicate indexes survive a
+  pure column add (`obs_index_would_go_stale` decides precisely) and drop only
+  when `overwrite` rewrites an indexed column.
+- [x] `scx_convert::read_annotation_table` (CSV/TSV, **ungated** — a delimited
+  reader has no business needing libhdf5) and `read_h5ad_obs` (`hdf5` feature),
+  behind one `read_obs_source` asserted to produce identical obs from identical
+  values.
+- [x] `pyscx.obs_import` / `pyscx.diagnose_obs_key` and `scx obs-import`. The
+  key diagnosis is load-bearing rather than a nicety: on a real 1M-cell merged
+  atlas the obs index is a 10×-duplicated stringified `RangeIndex`, no batch
+  composite resolves it, and the only unique column is one no fallback list
+  would guess. Composite keys (`--key sample_id,barcode`) cover the rest.
+- [x] Doublet wrapper — `pyscx.doublet_import` / `scx doublet-import --tool`
+  over a seven-profile table (`scdblfinder`, `scrublet`, `doubletfinder`,
+  `doubletdetection`, `solo`, `scds`, `generic`), normalising each caller's
+  spellings onto `<K>_score` / `<K>_predicted` / `<K>_status` + `uns["<K>"]`. A
+  score-only tool gets no `<K>_predicted`: thresholding is a scientific
+  decision the importer does not make.
+- [x] `rscx::scx_attach_obs` — an R `data.frame` straight onto the file, so
+  scDblFinder / scds need no intermediate file in either direction.
+- [x] `pyscx.export_batches` — one h5ad per batch without materialising the
+  pool, guarding **both** identities a tool and the import rely on (`obs_names`
+  and the resolved key) for uniqueness *within* each batch.
+- [x] `pyscx.doublet_consensus` — `majority` / `any` / `all` / `mean_rank`
+  across N imported tools, null-aware throughout: a tool that never saw a cell
+  does not vote, and a cell nobody voted on stays `null` rather than `False`.
+- [x] `doublet_interop` in `benchmarks/comprehensive/` — runs the callers in
+  their own conda envs, imports and scores them against injected truth, and
+  gates the round trip. **Truth is computational injection**, which is exact but
+  does not reproduce capture or ambient-RNA artifacts; it establishes that the
+  plumbing did not corrupt the science, not agreement with published rates.
+- [ ] Scoring against a **hashing- or genotype-labelled** dataset — the
+  manifest fields exist for one to drop in; none is on hand.
+
 ### Deliverable
 Production-ready v1.0 release. GPU-accelerated training loader (CPU path;
 GDS deferred). R bindings. Full documentation. Multimodal deferred.
@@ -652,7 +698,7 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 
 | Component | Rust Crate / Library | Purpose |
 |-----------|---------------------|---------|
-| HDF5 reading | `hdf5` (crates.io; repo: `aldanor/hdf5-rust`) | h5ad conversion |
+| HDF5 reading | `hdf5-metno` (metno fork of `aldanor/hdf5-rust`; v0.9.4) | h5ad conversion |
 | Arrow IPC | `arrow-rs` | Metadata read/write |
 | Async I/O | `tokio` | Stage 1 of loader pipeline |
 | Parallelism | `rayon` | CPU-parallel shard processing |

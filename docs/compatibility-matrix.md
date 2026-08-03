@@ -37,6 +37,7 @@ Optional extras follow the same convention:
 | `cloud` | `azure-storage-blob` | `>=12.0` | Azure Blob backend |
 | `scvi` | `scvi-tools` | unpinned | `pyscx.scvi_*` helpers |
 | `eval` | `polars` | `>=1.0` | `pyscx.eval` (cell-eval parity) |
+| `nbglm` | `formulaic` | `>=1.0` | `pseudobulk_dex(backend="nb_glm", design=...)` |
 
 ## Tested combinations
 

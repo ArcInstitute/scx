@@ -268,7 +268,7 @@ Full lazy pipeline (open -> QC filter -> normalize -> log1p -> HVG -> PCA -> kNN
 
 The lazy preprocessing peak (~3.5 GB) covers QC through streaming PCA; kNN graph
 construction and UMAP dominate the remaining RSS in the full pipeline (~10.9 GB).
-Source: `BENCHMARK_REPORT.md` §12 (Lazy Preprocessing & Out-of-Core Pipeline).
+Source: `benchmarks/comprehensive/results/reports/phase5A_ooc_rss.md` and `benchmarks/comprehensive/results/raw/memory__scx_auto__census_1m.json`.
 
 ### Read iteration: streaming vs in-memory
 

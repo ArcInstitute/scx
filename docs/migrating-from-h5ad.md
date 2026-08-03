@@ -416,6 +416,44 @@ pyscx.to_h5ad("data.scx", "data.h5ad",
               reader_threads=4, memory_budget="8G")
 ```
 
+#### Doublet detection after conversion
+
+If your pipeline currently calls a doublet caller inline —
+`sc.pp.scrublet(adata)`, `doubletdetection`, `solo`, or scDblFinder in R — that
+still works: load the file into memory and call the tool exactly as before.
+Nothing about conversion changes it.
+
+What changes is what happens when the file stops fitting in memory. Every
+doublet caller is an in-memory, single-sample tool, so the pooled-atlas
+`sc.pp.scrublet(adata)` was never really the right shape anyway — it was one
+library's worth of tool applied to a merged file. SCX gives you the per-sample
+split without materialising the pool, and a way to land the answers back:
+
+```python
+r = pyscx.export_batches("data.scx", "batches/", batch_key="donor_id")
+# ... run the tool on each r["batches"][i]["path"] ...
+pyscx.doublet_import("data.scx", "all_calls.csv", tool="scrublet")
+```
+
+Three things differ from the inline version and are worth knowing before you
+switch:
+
+- **The join is by key, not row position.** A tool's output can come back in any
+  order and it will still land correctly — but the key has to be unique. Run
+  `pyscx.diagnose_obs_key("data.scx")` first; on a merged atlas the obs index is
+  often *not* unique and you will need `key=["sample_id", "barcode"]`.
+- **Uncovered cells are `null`, not `0.0`.** Inline scanpy leaves every cell
+  scored because every cell was passed to the tool. Here, a cell no tool saw
+  keeps a null score — which is what makes `pyscx.doublet_consensus` able to
+  distinguish "unassessed" from "all tools said singlet".
+- **The columns are canonical, not tool-native.** `doublet_import` maps each
+  tool's spelling onto `<K>_score` / `<K>_predicted`, so code downstream of it
+  never branches on which caller ran. The native columns are kept alongside as
+  `<K>_<native>` unless you pass `keep_native_columns=False`.
+
+Full workflow: [docs/scanpy.md § Landing external per-cell
+annotations](scanpy.md#landing-external-per-cell-annotations-doublet-detection).
+
 ## What changes when you convert
 
 - **`X` is stored as float32 CSR.** A float64 source matrix is downcast (a

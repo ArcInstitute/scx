@@ -290,11 +290,19 @@ size during the rebuild.
 
 Limitations:
 
-- The on-disk `X` must be CSR or absent — CSC-on-disk and dense `X`
-  are rejected with a clear error. Pre-convert upstream or use the
-  non-streaming `from_anndata` path with enough RAM.
-- `obsp` / `varp` are silently skipped (no on-disk readers yet — same
-  gap the non-streaming CLI converter has had).
+- `obsp` / `varp` ingest comes through only when the on-disk h5ad has them
+  in a form anndata exposes (matches the non-streaming CLI converter).
+
+Source-layout handling:
+
+- **CSR-on-disk**: native streaming path.
+- **Dense-on-disk**: row-slab streaming with per-shard sparsification
+  (zero-drop). Use `dense_zero_epsilon` to threshold near-zero values;
+  default `0.0` matches scipy's `csr_matrix(dense)` behavior.
+- **CSC-on-disk**: in-memory transpose when the file fits `memory_budget`;
+  otherwise an external bucketed transpose to `temp_dir` (scipy
+  `sum_duplicates` semantics on duplicate coordinates).
+
 
 ### Backed AnnData — auto-streams via `from_anndata`
 
@@ -417,6 +425,188 @@ pyscx.to_h5ad("citeseq.scx", "rna.h5ad", modality="rna")
 # materialising path.
 pyscx.to_h5ad("dataset.scx", "dataset.h5ad", stream=False)
 ```
+
+## Landing external per-cell annotations (doublet detection)
+
+Doublet callers are in-memory, single-sample tools that live in four different
+ecosystems — scDblFinder and scds in R, Scrublet and DoubletDetection in
+scanpy, Solo in scvi-tools. SCX does not reimplement any of them. It gives you
+the plumbing to run them where they already live and land the results back on
+the file: export per batch, run the tool, import by key.
+
+Nothing in this path is doublet-specific except one lookup table of column
+names. `pyscx.obs_import` lands any per-cell annotation table; `doublet_import`
+is a thin wrapper that normalises each tool's spellings.
+
+### Settle the join key first
+
+This is the step worth doing before anything else, because everything
+downstream joins on it. A tool sees only the file you hand it and returns rows
+in whatever order it pleased, so the key is the only thing tying its answers
+back to your cells.
+
+```python
+d = pyscx.diagnose_obs_key("atlas.scx")
+print(d["summary"])          # what would be resolved, and whether it is unique
+print(d["unique_columns"])   # columns that ARE unique
+print(d["unique_pairs"])     # two-column composites that are
+```
+
+On a single library the obs index is usually unique and there is nothing to
+think about. On a merged atlas it often is not: measured on a real
+CELLxGENE-derived 1M-cell file, the obs index was a 10×-duplicated stringified
+`RangeIndex`, no batch-column composite rescued it, and the only unique column
+was `soma_joinid` — a name no fallback list would have guessed. Two ways out:
+
+```python
+# A column that is unique file-wide.
+pyscx.obs_import("atlas.scx", "calls.csv", key=["soma_joinid"])
+
+# Or a composite: barcodes repeat across libraries but are unique within one.
+pyscx.obs_import("atlas.scx", "calls.csv", key=["sample_id", "barcode"])
+```
+
+A composite key needs both columns on both sides, so the tool's output table
+has to carry `sample_id` too. `export_batches` writes the batch column into
+each per-batch h5ad for exactly this reason.
+
+### Export one file per batch
+
+```python
+r = pyscx.export_batches("atlas.scx", "batches/", batch_key="donor_id")
+r["key"]                    # the key that was resolved
+r["key_is_globally_unique"] # decides how you import, below
+for b in r["batches"]:
+    b["path"], b["n_cells"]
+```
+
+The pooled matrix is never materialised — peak RSS is one library. The check
+this adds over the loop you would write yourself is on the key: two cells
+sharing a key *inside one batch* leave the tool's output with nothing to join
+on, and that surfaces much later as a duplicate-key error at import time or,
+worse, as scores landing on the wrong cell. Both the resolved key and
+`obs_names` must be unique within a batch, since the tools read `obs_names`
+while the import joins on the key. `on_ambiguous_key="error"` (the default)
+refuses before writing anything; `"skip"` omits the batch and records why.
+
+### Run the tool, then import
+
+```python
+# scanpy-side, per batch. Take the paths from the result rather than
+# reconstructing them — the filenames are sanitised from the batch values.
+import scanpy as sc
+
+for b in r["batches"]:
+    adata = sc.read_h5ad(b["path"])
+    sc.pp.scrublet(adata)
+    # The unnamed index column this writes is obs_names, and the import
+    # resolves it as the join key.
+    adata.obs[["doublet_score", "predicted_doublet"]].to_csv(
+        f"calls/{b['batch']}.csv")
+```
+
+```r
+# R-side — no intermediate file in either direction: read one batch straight
+# out of SCX, run the tool, hand the data.frame back.
+library(rscx)
+library(scDblFinder)
+
+res <- scx_open("atlas.scx") |>
+  scx_query() |>
+  filter_obs("donor_id == 'A'") |>   # a STRING expression, not NSE
+  collect()
+sce <- scDblFinder(res$to_sce())
+
+# colData() carries the cell keys as ROWNAMES, not as a column.
+df <- as.data.frame(colData(sce)[, c("scDblFinder.score", "scDblFinder.class")])
+
+# One batch at a time would keep only the last, same as on the Python side.
+# rbind() the per-batch data.frames and attach once.
+scx_attach_obs("atlas.scx", df, key = rownames(df))
+```
+
+Then import. **`overwrite` replaces, it never merges**, so how you batch the
+import depends on the key:
+
+```python
+import pandas as pd
+
+if r["key_is_globally_unique"]:
+    # Concatenate every batch's output and import ONCE.
+    pd.concat([pd.read_csv(f"calls/{b['batch']}.csv") for b in r["batches"]]
+              ).to_csv("all.csv", index=False)
+    pyscx.doublet_import("atlas.scx", "all.csv", tool="scrublet")
+else:
+    # Keys only distinguish cells inside their own batch, so join on a
+    # composite — which means the CSV above has to carry those columns too:
+    #     adata.obs[["donor_id", "barcode",
+    #                "doublet_score", "predicted_doublet"]].to_csv(...)
+    # export_batches writes the batch column into each per-batch h5ad so they
+    # are there to select.
+    for b in r["batches"]:
+        pyscx.doublet_import("atlas.scx", f"calls/{b['batch']}.csv",
+                             tool="scrublet",
+                             key=["donor_id", "barcode"], overwrite=True)
+```
+
+Importing several per-batch tables one after another *without* a composite key
+keeps only the last — the second import replaces the first's columns rather
+than filling in the rows it did not cover.
+
+Cells the tool never saw come back `null`, never `0.0`. That distinction is
+load-bearing: it is what lets the consensus step below tell "no tool assessed
+this cell" apart from "every tool called it a singlet".
+
+### If the tool wrote back into an h5ad
+
+The scanpy-resident tools mutate `adata.obs` in place, so the h5ad itself is a
+valid source — no CSV step:
+
+```python
+# One batch's h5ad, written back in place by the tool.
+pyscx.doublet_import("atlas.scx", r["batches"][0]["path"], tool="scrublet",
+                     keep_native_columns=False)
+```
+
+The same batching rule applies here as above: an h5ad holds one batch, so
+importing each in turn without a composite key would keep only the last. With a
+globally unique key, go through a concatenated CSV instead.
+
+**Pass `keep_native_columns=False` on this route.** An h5ad exported from the
+target file carries the *whole* original obs, and the default (`True`)
+re-imports every one of those columns under the tool prefix — a real run wrote
+32 obs columns (`scrublet_soma_joinid`, `scrublet_tissue`, …) where three were
+wanted. Nothing is lost and nothing is wrong, but it is a lot of duplicated
+metadata. The CSV route does not have this problem because you choose the
+columns when you write the CSV. The h5ad source needs a pyscx built with the
+`hdf5` feature; the CSV route does not.
+
+### Combine several callers
+
+Once N tools' results are canonical obs columns on one file, the consensus is
+arithmetic:
+
+```python
+pyscx.doublet_import("atlas.scx", "scdbl.csv",   tool="scdblfinder")
+pyscx.doublet_import("atlas.scx", "scrublet.csv", tool="scrublet")
+
+cons = pyscx.doublet_consensus("atlas.scx", keys=["scdblfinder", "scrublet"])
+cons["n_predicted_doublet"], cons["n_no_vote"]
+```
+
+This writes `obs["doublet_predicted"]` (nullable boolean),
+`obs["doublet_n_tools_calling"]` and `obs["doublet_n_tools_voting"]`. Read the
+voting count before trusting a `False`: a `0` there means no tool assessed the
+cell, which is why `doublet_predicted` is null beside it. `method="majority"`
+(default) needs more than half of the *voting* tools; `"any"` / `"all"` are
+also available, and `"mean_rank"` ignores the calls and combines the scores,
+requiring an explicit `quantile` because a score cutoff is a scientific
+decision the helper does not own.
+
+Every one of these ops is in place and undoable — `pyscx.rollback("atlas.scx")`
+reverts the last one. `X`, layers, `var`, the CSC sidecar, `.raw` and deletion
+vectors are never touched. Full behaviour and the predicate-index interaction:
+[docs/operations.md § External obs import](operations.md#external-obs-import).
 
 ## Validating files after write or transfer
 
