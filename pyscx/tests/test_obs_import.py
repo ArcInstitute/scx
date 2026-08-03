@@ -282,3 +282,71 @@ def test_diagnose_obs_key_reports_unique_columns(tmp_path):
     assert "cell_uid" in d["unique_columns"]
     assert d["suggestion"] == "cell_uid"
     assert "cell_uid" in d["summary"]
+
+
+def test_an_integer_key_column_can_be_joined_on(tmp_path, synthetic_adata):
+    """`diagnose_obs_key` suggests the only unique column; the join must accept it.
+
+    On the merged CELLxGENE-derived atlas this feature exists for, the obs
+    index is duplicated and `soma_joinid` — an Int64 — is the *only* unique
+    column. The diagnosis names it, so refusing it as "not a string column"
+    sent users down a dead end with no alternative key on that file. Both
+    sides fuse through the same cast, so an integer key joins exactly.
+    """
+    import numpy as np
+    import pandas as pd
+
+    import anndata as ad
+    import scipy.sparse as sp
+
+    # Built explicitly rather than from the shared fixture, which already has a
+    # unique `cell_id` — the point here is a file where the ONLY unique column
+    # is the integer one, which is the measured census_1m shape.
+    n = 6
+    obs = pd.DataFrame(
+        {"soma_joinid": np.arange(n, dtype=np.int64),
+         "donor": ["d1"] * n},
+        index=["DUP"] * n,
+    )
+    X = sp.csr_matrix(np.arange(n * 3, dtype=np.float32).reshape(n, 3))
+    path = str(tmp_path / "atlas.scx")
+    pyscx.from_anndata(
+        ad.AnnData(X=X, obs=obs, var=pd.DataFrame(index=list("abc"))), path
+    )
+
+    diag = pyscx.diagnose_obs_key(path)
+    assert diag["unique_columns"] == ["soma_joinid"]
+    assert diag["suggestion"] == "soma_joinid"
+
+    table = tmp_path / "calls.csv"
+    pd.DataFrame({
+        "soma_joinid": np.arange(n, dtype=np.int64),
+        "score": np.linspace(0, 1, n),
+    }).to_csv(table, index=False)
+
+    # The key the diagnosis pointed at must actually work.
+    r = pyscx.obs_import(path, str(table), key="soma_joinid")
+    assert r["n_matched"] == n
+
+    back = pyscx.open(path).read_obs()
+    assert np.allclose(back["score"].astype(float), np.linspace(0, 1, n))
+
+
+def test_a_float_key_column_is_still_refused(tmp_path, synthetic_adata):
+    """Integers are exact through the text form both sides fuse on; floats are
+    not guaranteed to be, so a float key could silently half-match."""
+    import numpy as np
+    import pandas as pd
+
+    n = synthetic_adata.n_obs
+    adata = synthetic_adata.copy()
+    adata.obs["ratio"] = np.linspace(0.1, 0.9, n).astype(np.float64)
+    path = str(tmp_path / "f.scx")
+    pyscx.from_anndata(adata, path)
+
+    table = tmp_path / "t.csv"
+    pd.DataFrame({"ratio": np.linspace(0.1, 0.9, n), "score": np.zeros(n)}).to_csv(
+        table, index=False
+    )
+    with pytest.raises(ValueError, match="cannot be a join key|floats are refused"):
+        pyscx.obs_import(path, str(table), key="ratio")

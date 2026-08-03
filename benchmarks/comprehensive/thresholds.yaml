@@ -320,10 +320,11 @@ absolute_floors:
   # emitted when at least one tool actually ran).
   #
   # The SCIENCE tier — AUROC against injected truth, pairwise kappa, score-rank
-  # Spearman — is deliberately NOT floored here yet. Those are distributional
-  # and depend on the injection rate and the tools' own thresholds; guessing a
-  # bound would either fire on noise or pass anything. See the "Deferred
-  # floors" note at the end of this file.
+  # Spearman — is floored separately below, and only after a capture showed
+  # repeat runs are bit-identical. Those are distributional, so a guessed bound
+  # would either fire on noise or pass anything; the values there are
+  # calibrated from observed numbers with a margin. What remains deferred is
+  # listed in the "Deferred floors" note at the end of this file.
   - benchmark: doublet_interop
     format: scx_auto
     dataset: tabula_sapiens_100k

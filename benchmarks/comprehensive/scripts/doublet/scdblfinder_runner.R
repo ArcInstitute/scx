@@ -88,8 +88,22 @@ exp <- tryCatch(
 
 q <- rscx::scx_query(exp)
 if (!is.null(config$batch_key) && !is.null(config$batch)) {
-  # filter_obs takes a STRING expression, not NSE (Phase 4).
-  expr <- sprintf("%s == '%s'", config$batch_key, config$batch)
+  # filter_obs takes a STRING expression, not NSE (Phase 4), and the batch
+  # value is interpolated into it. The engine's lexer
+  # (scx-engine/src/predicate.rs) scans a string literal to the next matching
+  # quote and supports NO escape sequences, so a label containing the quote
+  # character would terminate the literal early — selecting the wrong rows or
+  # failing to parse. It does accept either quote, so pick the one the label
+  # does not contain, and refuse outright when it contains both.
+  batch_str <- as.character(config$batch)
+  if (grepl("'", batch_str, fixed = TRUE) && grepl('"', batch_str, fixed = TRUE)) {
+    emit_error(sprintf(
+      "batch label %s contains both quote characters; the filter expression
+       has no escape syntax, so it cannot be selected by name", batch_str))
+  }
+  quote_char <- if (grepl("'", batch_str, fixed = TRUE)) '"' else "'"
+  expr <- sprintf("%s == %s%s%s", config$batch_key,
+                  quote_char, batch_str, quote_char)
   q <- rscx::filter_obs(q, expr)
 }
 

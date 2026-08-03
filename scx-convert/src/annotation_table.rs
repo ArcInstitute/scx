@@ -60,7 +60,14 @@ use crate::file_checksum::blake3_of_file;
 /// alphabet is ACGT but sample prefixes are arbitrary) is not silently nulled.
 /// Covers R (`NA`), pandas (`NaN`, `nan`, `None`, empty), and SQL-ish exports
 /// (`NULL`, `null`).
-const NULL_TOKENS: &str = r"^(|NA|N/A|n/a|NaN|nan|None|NULL|null|Inf|-Inf)$";
+///
+/// `Inf` / `-Inf` are deliberately **not** here. They are how R and pandas
+/// write real IEEE infinities, which are values rather than absences — a
+/// score column legitimately containing `Inf` should arrive as an infinity,
+/// not be silently turned into a null the way a genuinely missing entry is.
+/// pandas' own `read_csv` parses them as floats, and diverging from that here
+/// would quietly drop outliers.
+const NULL_TOKENS: &str = r"^(|NA|N/A|n/a|NaN|nan|None|NULL|null)$";
 
 /// Name given to a leading unnamed column, chosen because it is already in the
 /// ops crate's key-fallback list.

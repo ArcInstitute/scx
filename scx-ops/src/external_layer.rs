@@ -719,6 +719,42 @@ pub(crate) fn is_string_column(dt: &DataType) -> bool {
     }
 }
 
+/// Whether an **explicitly requested** key column can serve as a join key.
+///
+/// Wider than [`is_string_column`] because both sides of the join go through
+/// [`string_column`], which casts to `Utf8` — so an integer key fuses
+/// identically on both sides and joins exactly.
+///
+/// This matters for the case the feature exists for: on a merged
+/// CELLxGENE-derived atlas the obs index is duplicated and `soma_joinid` — an
+/// `Int64` — is the *only* unique column. `diagnose_obs_key` suggests it, and
+/// before this a user following that suggestion hit "column 'soma_joinid' has
+/// type Int64, which is not a string column". The diagnosis pointed at a key
+/// the join then refused.
+///
+/// Floats stay rejected: `f64 → Utf8` formatting is not guaranteed to agree
+/// between two independently-produced sides, so a float key could silently
+/// half-match. Auto-resolution is also unchanged — guessing that a numeric
+/// column is the identity is a different and worse risk than honouring an
+/// explicit request.
+pub(crate) fn is_joinable_key_column(dt: &DataType) -> bool {
+    if is_string_column(dt) {
+        return true;
+    }
+    match dt {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => true,
+        DataType::Dictionary(_, v) => is_joinable_key_column(v),
+        _ => false,
+    }
+}
+
 /// Resolve the join key column, never falling back to positional.
 pub(crate) fn resolve_key_column(
     axis: &'static str,
@@ -735,11 +771,16 @@ pub(crate) fn resolve_key_column(
 
     if let Some(name) = requested {
         return match schema.field_with_name(name) {
-            Ok(f) if is_string_column(f.data_type()) => Ok(name.to_string()),
+            // An explicit request accepts any type that fuses identically on
+            // both sides — see `is_joinable_key_column`.
+            Ok(f) if is_joinable_key_column(f.data_type()) => Ok(name.to_string()),
             Ok(f) => Err(OpsError::KeyColumnUnresolved {
                 axis,
                 detail: format!(
-                    "column '{name}' has type {:?}, which is not a string column",
+                    "column '{name}' has type {:?}, which cannot be a join key. \
+                     Strings and integers work (both sides are fused as text); \
+                     floats are refused because their text form is not \
+                     guaranteed to agree across two independently written sides",
                     f.data_type()
                 ),
             }),

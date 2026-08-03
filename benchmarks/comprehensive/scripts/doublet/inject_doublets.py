@@ -111,6 +111,17 @@ def inject_doublets(
 
     if not 0.0 < spec.rate < 1.0:
         raise ValueError(f"injection rate must be in (0, 1); got {spec.rate}")
+    if spec.heterotypic_only and cell_type_key is None:
+        # Without types there is nothing to make a pair heterotypic *by*, so
+        # honouring the request is impossible. Silently ignoring it would hand
+        # back an unconstrained mix labelled `kind="unknown"` — the caller
+        # would believe they had measured the easy half of the problem and in
+        # fact have measured an unknown blend of both.
+        raise ValueError(
+            "heterotypic_only=True needs a cell_type_key to tell the kinds "
+            "apart; without one no pair can be constrained and every "
+            "injection would be recorded as kind 'unknown'"
+        )
 
     rng = np.random.default_rng(spec.seed)
 

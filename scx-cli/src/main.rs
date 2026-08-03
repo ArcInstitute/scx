@@ -983,7 +983,7 @@ enum Commands {
         /// per-batch tables in turn keeps only the last. Concatenate first.
         #[arg(long)]
         overwrite: bool,
-        /// Target rows with no matching source row: zero-fill or fail
+        /// Target rows with no matching source row: leave them NULL (not 0) or fail
         #[arg(long, default_value = "zero", value_parser = ["zero", "error"])]
         on_missing_rows: String,
         /// Source rows absent from the target: warn and skip, or fail
@@ -1005,8 +1005,9 @@ enum Commands {
     DoubletImport {
         /// Target SCX file (mutated in place).
         input: PathBuf,
-        /// The caller's output table (.csv / .tsv). An .h5ad source is not
-        /// supported yet; write `adata.obs[[...]].to_csv(...)` and import that.
+        /// The caller's output table (.csv / .tsv), or an .h5ad whose /obs
+        /// holds the columns -- what the scanpy-resident tools write. The
+        /// h5ad route needs a build with the hdf5 feature.
         table: PathBuf,
         /// Which tool produced the table
         #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
@@ -1048,7 +1049,7 @@ enum Commands {
         /// per-batch tables in turn keeps only the last. Concatenate first.
         #[arg(long)]
         overwrite: bool,
-        /// Target rows with no matching source row: zero-fill or fail
+        /// Target rows with no matching source row: leave them NULL (not 0) or fail
         #[arg(long, default_value = "zero", value_parser = ["zero", "error"])]
         on_missing_rows: String,
         /// Source rows absent from the target: warn and skip, or fail

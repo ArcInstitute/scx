@@ -83,8 +83,17 @@ def test_the_join_key_survives_into_the_exported_file(tmp_path):
 def test_key_defaults_to_what_the_importer_would_resolve(tmp_path):
     scx = _fixture(tmp_path, _clean_obs())
     r = pyscx.export_batches(str(scx), str(tmp_path / "b"), batch_key="donor_id")
-    # Same resolution the importer performs, so the two cannot disagree.
-    assert r["key"] == pyscx.diagnose_obs_key(str(scx))["suggestion"]
+
+    # Deliberately NOT `diagnose_obs_key(...)["suggestion"]`, which on this
+    # fixture is `cell_uid` — both it and the index are unique and the
+    # diagnosis names the column, not the index. The export prefers the index
+    # because that is what the tools hand back AND what the importer's own
+    # fallback order resolves to, so export and import genuinely cannot
+    # disagree here. Asserting against the suggestion would re-enshrine the
+    # asymmetry this preference removes.
+    resolved = pyscx.diagnose_obs_key(str(scx))["resolved_key"]
+    assert r["key"] == resolved == "__index_level_0__"
+    assert r["key_is_obs_index"] is True
 
 
 def test_batches_can_be_restricted(tmp_path):
@@ -138,19 +147,34 @@ def _ambiguous_obs():
     )
 
 
-def test_auto_resolution_prefers_a_key_that_actually_works(tmp_path):
-    """Given a duplicated index and a unique column, it picks the unique one.
+def test_auto_resolution_prefers_the_index_when_it_is_unique(tmp_path):
+    """A unique obs index wins over any other unique column.
 
-    This is why the helper resolves through `diagnose_obs_key`'s *suggestion*
-    rather than the plain fallback order: the fallback would land on the index,
-    which is exactly the column that cannot be joined on.
+    The index is what the tools hand back (`adata.obs_names` /
+    `colnames(sce)`), so picking it makes the tool's identity and the import's
+    join key the same column — no `key=` to remember at import time.
     """
-    scx = _fixture(tmp_path, _ambiguous_obs())
+    scx = _fixture(tmp_path, _clean_obs())
     r = pyscx.export_batches(str(scx), str(tmp_path / "b"), batch_key="donor_id")
 
-    assert r["key"] == "cell_uid"
+    assert r["key"] == "__index_level_0__"
+    assert r["key_is_obs_index"] is True
     assert r["n_batches"] == 2
-    assert all(b["key_unique_within_batch"] for b in r["batches"])
+
+
+def test_a_unique_column_cannot_rescue_a_duplicated_index(tmp_path):
+    """Previously this exported happily and was asserted to.
+
+    Resolution picks `cell_uid` (the only unique column), but the exported
+    h5ad still identifies its rows by the duplicated index, so batch d2 hands
+    a tool two cells it cannot tell apart. Checking the resolved key alone
+    certified exactly the wrong-join this helper exists to prevent.
+    """
+    scx = _fixture(tmp_path, _ambiguous_obs())
+
+    with pytest.raises(ValueError) as e:
+        pyscx.export_batches(str(scx), str(tmp_path / "b"), batch_key="donor_id")
+    assert "obs_names" in str(e.value)
 
 
 def test_an_explicitly_duplicated_key_refuses_before_writing(tmp_path):
@@ -179,12 +203,14 @@ def test_the_refusal_names_a_key_that_would_work(tmp_path):
         )
     assert "diagnose_obs_key" in str(e.value)
 
-    # And the key it points at does work.
-    r = pyscx.export_batches(
-        str(scx), str(tmp_path / "b2"), batch_key="donor_id", key="cell_uid",
-    )
-    assert r["n_batches"] == 2
-    assert all(b["key_unique_within_batch"] for b in r["batches"])
+    # `cell_uid` is unique, but naming it does NOT rescue the export: the h5ad
+    # still identifies rows by the duplicated index, which is what a tool reads
+    # back. Both identities have to work, not either one.
+    with pytest.raises(ValueError) as e2:
+        pyscx.export_batches(
+            str(scx), str(tmp_path / "b2"), batch_key="donor_id", key="cell_uid",
+        )
+    assert "obs_names" in str(e2.value)
 
 
 def test_a_file_with_no_usable_key_at_all_says_so(tmp_path):
@@ -316,3 +342,51 @@ def test_accepts_pathlib_and_an_experiment_handle(tmp_path):
         exp, str(tmp_path / "b2"), batch_key="donor_id"
     )
     assert r["n_batches"] == 2
+
+
+# ---------------------------------------------------------------------------
+# The exported identity, not just the resolved key
+# ---------------------------------------------------------------------------
+
+
+def test_the_report_says_whether_the_key_is_the_index(tmp_path):
+    scx = _fixture(tmp_path, _clean_obs())
+    r = pyscx.export_batches(str(scx), str(tmp_path / "out"), batch_key="donor_id")
+    # Clean fixture: auto-resolution lands on the index, so a tool's obs_names
+    # and the import's join key are the same thing.
+    assert r["key_is_obs_index"] is True
+    assert all(b["obs_names_unique_within_batch"] for b in r["batches"])
+
+
+def test_skip_reports_which_identity_collided(tmp_path):
+    obs = pd.DataFrame(
+        {"donor_id": ["d1", "d1", "d2", "d2"],
+         "cell_uid": ["u0", "u1", "u2", "u3"]},
+        index=["A-1", "B-1", "DUP", "DUP"],
+    )
+    scx = _fixture(tmp_path, obs)
+
+    r = pyscx.export_batches(str(scx), str(tmp_path / "out"),
+                             batch_key="donor_id", on_ambiguous_key="skip")
+
+    by_batch = {b["batch"]: b for b in r["batches"]}
+    assert by_batch["d1"]["path"] is not None
+    assert by_batch["d2"]["path"] is None
+    assert "obs_names" in by_batch["d2"]["skipped_reason"]
+
+
+def test_a_batch_label_cannot_escape_the_output_directory(tmp_path):
+    """Batch labels are obs data, not identifiers: `../x` would otherwise write
+    outside out_dir."""
+    obs = pd.DataFrame(
+        {"donor_id": ["../evil", "../evil", "ok/slash", "ok/slash"]},
+        index=[f"c{i}" for i in range(4)],
+    )
+    scx = _fixture(tmp_path, obs)
+    out = tmp_path / "out"
+
+    r = pyscx.export_batches(str(scx), str(out), batch_key="donor_id")
+
+    for b in r["batches"]:
+        written = pathlib.Path(b["path"]).resolve()
+        assert written.parent == out.resolve(), written

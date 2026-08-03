@@ -463,6 +463,20 @@ def to_h5ad(path, out, **kwargs):
     return _to_h5ad_native(src, _coerce_path(out), **kwargs)
 
 
+def _safe_batch_filename(batch) -> str:
+    """Make an obs batch label safe to use as a filename.
+
+    Batch labels are data, not identifiers: a `donor_id` of `../x` or `a/b`
+    would otherwise place the export outside `out_dir`. Anything that is not
+    alphanumeric, dash, dot or underscore becomes an underscore, and a label
+    that reduces to nothing (or to a bare dot run) gets a positional fallback.
+    """
+    import re as _re
+
+    text = _re.sub(r"[^A-Za-z0-9._-]", "_", str(batch))
+    return text if text.strip("._") else "batch"
+
+
 def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
                    on_ambiguous_key="error", overwrite=False, **kwargs):
     """Export one h5ad per batch, ready to run a per-sample tool on.
@@ -478,6 +492,15 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
     as scores silently landing on the wrong cell. Measured on a real
     CELLxGENE-derived atlas, one batch in 1,086 had a duplicated index and it
     held 15.5% of the file's cells.
+
+    **Two identities are checked, not one.** The tools read `obs_names` —
+    Scrublet writes `barcode = adata.obs_names`, scDblFinder uses
+    `colnames(sce)` — while the *import* joins on the resolved `key`. Those are
+    the same column in the ordinary case, but not when auto-resolution picks a
+    unique non-index column over a duplicated index. Checking only `key` would
+    then pass a batch whose `obs_names` a tool cannot tell apart, which is the
+    exact failure this guard exists to prevent, so both must be unique within a
+    batch. `key_is_obs_index` in the result says whether they coincided.
 
     Args:
         path: Source SCX file (str, os.PathLike, or an open Experiment).
@@ -545,6 +568,14 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
         # explains nothing.
         if suggestion and "," in suggestion:
             suggestion = None
+        # Prefer the obs index whenever it is itself unique, even if the
+        # diagnosis suggests some other unique column. The index is what the
+        # tools hand back (`adata.obs_names` / `colnames(sce)`), so choosing it
+        # makes the tool's identity and the import's join key the same thing
+        # and removes the export/import asymmetry entirely. The suggestion only
+        # wins when the index genuinely cannot serve.
+        if "__index_level_0__" in diag.get("unique_columns", ()):
+            suggestion = "__index_level_0__"
         key = suggestion or diag.get("resolved_key")
         if key is None:
             raise ValueError(
@@ -579,6 +610,21 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
 
     globally_unique = bool(key_values.is_unique)
 
+    # The identity the TOOLS see is the exported h5ad's `obs_names` — Scrublet
+    # writes `barcode = adata.obs_names`, scDblFinder uses `colnames(sce)` —
+    # and that is the obs index, not necessarily the resolved `key`. Checking
+    # only `key` lets a batch through whose obs_names are duplicated, which is
+    # precisely the silent wrong-join this helper exists to prevent: on a file
+    # with a duplicated index but a unique `cell_uid`, auto-resolution picks
+    # `cell_uid`, every batch passes, and the tool is handed a file whose rows
+    # it cannot tell apart.
+    #
+    # So both are checked. `key` uniqueness is what the *import* needs;
+    # obs_names uniqueness is what the *tool* needs, and a batch failing either
+    # is unusable.
+    index_values = obs.index.to_series()
+    key_is_index = key_values.equals(index_values)
+
     # Plan every batch before writing any of them, so an "error" verdict costs
     # nothing rather than leaving a half-finished directory behind.
     plan = []
@@ -588,15 +634,29 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
         mask = (values == b).to_numpy()
         if not mask.any():
             raise ValueError(f"batch {b!r} matches no rows in {batch_key!r}")
-        unique = bool(key_values[mask].is_unique)
+        key_unique = bool(key_values[mask].is_unique)
+        names_unique = bool(index_values[mask].is_unique)
         plan.append({"batch": b, "mask": mask, "n_cells": int(mask.sum()),
-                     "key_unique_within_batch": unique})
+                     "key_unique_within_batch": key_unique and names_unique,
+                     "obs_names_unique_within_batch": names_unique})
 
     bad = [p["batch"] for p in plan if not p["key_unique_within_batch"]]
     if bad and on_ambiguous_key == "error":
         n = sum(p["n_cells"] for p in plan if not p["key_unique_within_batch"])
+        # Name whichever identity actually failed. "key X is not unique" is
+        # actively misleading when X is unique and it was obs_names that
+        # collided — the user would go looking for a better key and find that
+        # the one they have is already fine.
+        names_bad = [p["batch"] for p in plan
+                     if not p["obs_names_unique_within_batch"]]
+        detail = f"key {key!r} is not unique"
+        if names_bad and not key_is_index:
+            detail = (
+                f"the exported obs_names are not unique (the resolved key "
+                f"{key!r} is a different column, and a tool reads obs_names)"
+            )
         raise ValueError(
-            f"key {key!r} is not unique within {len(bad)} of {len(plan)} "
+            f"{detail} within {len(bad)} of {len(plan)} "
             f"batches ({n} cells): {bad[:5]}{' ...' if len(bad) > 5 else ''}. "
             "A tool run on those files could not tell two cells apart, so its "
             "output could not be joined back. Pass a key that is unique within "
@@ -608,13 +668,21 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
     results, exported = [], 0
     for p in plan:
         entry = {"batch": p["batch"], "n_cells": p["n_cells"],
-                 "key_unique_within_batch": p["key_unique_within_batch"]}
+                 "key_unique_within_batch": p["key_unique_within_batch"],
+                 "obs_names_unique_within_batch": p["obs_names_unique_within_batch"]}
         if not p["key_unique_within_batch"] and on_ambiguous_key == "skip":
             entry["path"] = None
-            entry["skipped_reason"] = f"key {key!r} is not unique within this batch"
+            entry["skipped_reason"] = (
+                f"key {key!r} is not unique within this batch"
+                if p["obs_names_unique_within_batch"]
+                else "the exported obs_names are not unique within this batch"
+            )
             results.append(entry)
             continue
-        dest = out_dir / f"{p['batch']}.h5ad"
+        # The batch label comes from obs data, so it can contain a path
+        # separator or `..`; joining it raw would write outside out_dir.
+        safe = _safe_batch_filename(p["batch"])
+        dest = out_dir / f"{safe}.h5ad"
         if dest.exists() and not overwrite:
             raise FileExistsError(
                 f"{dest} already exists; pass overwrite=True to replace it"
@@ -627,6 +695,9 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
     return {
         "key": key,
         "key_is_globally_unique": globally_unique,
+        # False means the tools will return obs_names while the import joins on
+        # a different column — see the `key_is_index` note in the docstring.
+        "key_is_obs_index": key_is_index,
         "batch_key": batch_key,
         "out_dir": str(out_dir),
         "n_batches": sum(1 for r in results if r.get("path")),

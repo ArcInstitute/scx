@@ -799,3 +799,16 @@ def test_injection_preserves_obs_column_dtypes(tmp_path):
     # And the inherited values are the first parent's, not nulls.
     assert got["n_counts"].isna().sum() == 0
     assert got["lane"].isna().sum() == 0
+
+
+def test_heterotypic_only_without_cell_types_is_refused(tmp_path):
+    """Asking for heterotypic-only with nothing to define a type by cannot be
+    honoured, and silently ignoring the constraint would hand back an
+    unconstrained mix labelled kind='unknown' — the caller would believe they
+    measured the easy half of the problem and have measured an unknown blend."""
+    mod = _inject_mod()
+    with pytest.raises(ValueError, match="cell_type_key"):
+        mod.inject_doublets(
+            _tiny_adata(with_types=False), tmp_path / "x.h5ad",
+            mod.InjectionSpec(rate=0.2, seed=0, heterotypic_only=True),
+        )
