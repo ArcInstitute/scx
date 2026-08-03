@@ -365,6 +365,57 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 | GPU benchmark workers (auto-routed) | `scx-bench-gpu` | per-job, via `_env_for_format` |
 | BPCells benchmark workers (auto-routed) | `scx-bench-r` | per-job, via `_env_for_format` |
 | SLAF benchmark workers (auto-routed) | `scx-bench-slaf` | per-job, via `_env_for_format` |
+| `doublet_interop` tool runners | `rscx` (scDblFinder), `scx-bench` (Scrublet) | per-tool subprocess, via `scripts/doublet/_tool_env.py` |
+
+
+#### Doublet-caller benchmarks (`doublet_interop`)
+
+External doublet callers each live in a different environment, and
+`_env_for_format` routes by **format key**, not benchmark name — so an SCX-only
+benchmark always lands in `scx-bench`, which has R scDblFinder nowhere in
+sight. Rather than teach the shared orchestrator about one benchmark,
+`doublet_interop` invokes each tool as a **subprocess into the env that owns
+it** (the same shape `bpcells_runner.py` uses to reach R):
+
+| Tool | Environment | Entry point | Input |
+|------|-------------|-------------|-------|
+| scDblFinder | `rscx` | `scripts/doublet/scdblfinder_runner.R` | the `.scx` file, read through rscx |
+| Scrublet | `scx-bench` | `scripts/doublet/scrublet_runner.py` | the per-batch h5ad from `export_batches` |
+| Solo | `scx-bench-gpu` (optional) | `scripts/doublet/solo_runner.py` | per-batch h5ad; skips when scVI is absent |
+
+Override any of them with `SCX_DOUBLET_<TOOL>_PREFIX=/path/to/env`. Each run
+records the resolved interpreter and package versions under
+`metadata.tool_environments`, so which environment produced a number is a fact
+read off the interpreter rather than a claim in a log.
+
+R takes the `.scx` directly because the `rscx` env has no h5ad reader
+(no zellkonverter, no anndata) and reading SCX through rscx is the shorter path
+anyway; Python takes the exported h5ad. Both are the ecosystem's real entry
+point, which is the thing worth benchmarking.
+
+> [!IMPORTANT]
+> **Submit these ONE AT A TIME**, chained with `--dependency=afterany` —
+> `scripts/run_slurm_doublet.sh` does it for you:
+>
+> ```bash
+> conda activate scx-bench
+> bash benchmarks/comprehensive/scripts/run_slurm_doublet.sh
+> ```
+>
+> It is an **orchestrator, not a job** — run it in the foreground; it submits
+> the SLURM work itself, one dataset at a time, and blocks on each.
+>
+> Two reasons, both from `CLAUDE.local.md`. Every job here *imports* pyscx from
+> the single editable `.so` in the repo, so any concurrent `maturin develop`
+> invalidates a job that never builds anything. And Slurm will co-schedule two
+> of your jobs on one node, which biases a timing comparison unevenly across
+> its arms — worse than noise, because it looks like a result.
+>
+> The wrapper also overrides the default sizing: left alone the orchestrator
+> sizes this benchmark at **15 minutes on `cpu_preemptible`**, which is shorter
+> than scDblFinder needs and on a partition that can starve for most of a day.
+> It submits to `cpu` with an 8-hour ceiling instead, and preflights every tool
+> environment before spending any of it.
 
 **Legacy scripts** (`scripts/`) still reference the dev `.venv/` (CPU) and the `scx-gpu` conda env (GPU), and are preserved as-is.
 

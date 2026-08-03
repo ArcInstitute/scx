@@ -300,6 +300,46 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: correctness_n_failed
     max: 0
+  # --- doublet_interop: the plumbing tier ------------------------------
+  #
+  # `doublet_interop.py` runs external doublet callers, imports their results
+  # through `pyscx.doublet_import`, then reads the canonical obs columns back
+  # and compares them with each tool's own output **joined by key**. These
+  # three floors gate that round trip, and only that: they are deterministic
+  # (an exact value comparison and two counts), so they can be set from first
+  # principles rather than calibrated.
+  #
+  # `roundtrip_call_disagreements` is the load-bearing one. A *positional*
+  # import — the failure mode this whole interop exists to prevent — passes
+  # every row-count and column-presence check and shows up here and nowhere
+  # else, as every call landing on the wrong cell. `import_matched_frac` at
+  # 1.0 catches the opposite failure: a join that silently matched nothing.
+  #
+  # `check_absolute_floors` skips a triple whose metric is absent, so these are
+  # no-ops on a run where no tool env was available (the metrics are only
+  # emitted when at least one tool actually ran).
+  #
+  # The SCIENCE tier — AUROC against injected truth, pairwise kappa, score-rank
+  # Spearman — is deliberately NOT floored here yet. Those are distributional
+  # and depend on the injection rate and the tools' own thresholds; guessing a
+  # bound would either fire on noise or pass anything. See the "Deferred
+  # floors" note at the end of this file.
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: roundtrip_call_disagreements
+    max: 0
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: roundtrip_max_score_delta
+    max: 1.0e-5
+  - benchmark: doublet_interop
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: import_matched_frac
+    min: 1.0
+
   - benchmark: cloud_read
     format: scx_auto
     dataset: tabula_sapiens_100k
@@ -2284,3 +2324,27 @@ absolute_floors:
 #      * `cells_per_sec__shuffle_write`: rewrite throughput is
 #        `compact`/`sort`-shaped and has no existing floor to sit beside;
 #        deferred with the rest until there is more than one observation.
+#
+# 9. doublet_interop: the science tier
+#    DEFERRED until the first real capture, on purpose. The PLUMBING floors
+#    (`roundtrip_call_disagreements`, `roundtrip_max_score_delta`,
+#    `import_matched_frac`) are live above and are deterministic. These are not:
+#      * `<tool>_auroc` / `<tool>_recall` / `<tool>_precision` against injected
+#        truth: the value depends on the injection rate, the heterotypic/
+#        homotypic mix, and each tool's own threshold. It is also Category-D
+#        truth (`tasks/DOUBLET-DETECTION.md`) — exact labels, but summed count
+#        vectors do not reproduce capture or ambient artifacts, so an absolute
+#        accuracy bar here would be a claim about the injection, not the tool.
+#        Floor `scdblfinder_auroc` a margin below the first observed value once
+#        there is one.
+#      * `agreement_kappa__*` / `agreement_raw__*` / `score_spearman__*`:
+#        between-tool agreement is a property of the tools, not of scx. Worth
+#        a floor only as a *regression* tripwire on a fixed fixture, and that
+#        needs a capture to calibrate against. Raw agreement in particular must
+#        never be floored on its own — at a few percent doublet rate two tools
+#        that call almost nothing agree ~95% by construction, which is why the
+#        module reports kappa beside it.
+#      * `n_tools_ran`: cannot floor at 2 while Solo has no environment and
+#        Scrublet needs scikit-image in `scx-bench`; a floor here would turn a
+#        legitimate optional-tool skip into a gate failure. The run records
+#        `tools_skipped` with a reason instead.

@@ -533,12 +533,24 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
     no_unique_candidate = ""
     if key is None:
         diag = diagnose_obs_key(src)
-        key = diag.get("suggestion") or diag.get("resolved_key")
+        suggestion = diag.get("suggestion")
+        # A comma-joined suggestion is a *composite* — `diagnose_obs_key`
+        # offers one when no single column is unique. It cannot be used here:
+        # the exported h5ad identifies its rows by `obs_names` alone, so a
+        # tool's output can only ever carry one component back. Falling
+        # through to `resolved_key` means the per-batch guard below does the
+        # refusing, with the full diagnosis attached — which is the accurate
+        # message. Using the composite as a column name would fail with
+        # "key 'a,b' is neither an obs column nor the obs index", which
+        # explains nothing.
+        if suggestion and "," in suggestion:
+            suggestion = None
+        key = suggestion or diag.get("resolved_key")
         if key is None:
             raise ValueError(
                 "no obs column could serve as a join key: " + diag["summary"]
             )
-        if not diag.get("suggestion"):
+        if not suggestion:
             # Fell back rather than found a unique column. Carried into the
             # per-batch refusal below so its remedy does not promise a key the
             # file does not have.
