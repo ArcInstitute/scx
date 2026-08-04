@@ -806,3 +806,71 @@ def test_doublet_profiles_matches_the_docs_table():
         assert expected in last_cell.lower(), (
             f"{tool}: the emits-a-call cell is {last_cell!r}, must say {expected!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# One dtype for the call column, whichever surface reads it (F5)
+# ---------------------------------------------------------------------------
+#
+# `_calls` above is deliberately dtype-agnostic, which is exactly why the drift
+# these tests pin went unnoticed: `obs["<K>_predicted"]` came back `object` on a
+# partially-covered import, numpy `bool` on a fully-covered one, and pandas
+# `boolean` after a to_h5ad round trip -- three dtypes for one documented
+# contract, chosen by whether some row happened to be uncovered.
+
+
+@pytest.mark.parametrize("coverage", ["partial", "full"])
+def test_predicted_is_nullable_boolean_regardless_of_coverage(tmp_path, coverage):
+    scx = _fixture(tmp_path)
+    rows = BARCODES[:2] if coverage == "partial" else BARCODES
+    body = "barcode,doublet_score,predicted_doublet\n" + "".join(
+        f"{b},0.{i + 1},{'True' if i == 0 else 'False'}\n" for i, b in enumerate(rows)
+    )
+    pyscx.doublet_import(str(scx), str(_write(tmp_path, "s.csv", body)),
+                         tool="scrublet")
+
+    obs = pyscx.open(str(scx)).read_obs()
+    assert str(obs["scrublet_predicted"].dtype) == "boolean", (
+        "the dtype must follow the schema, not the data: a script that works on "
+        "a fully-covered file has to work on a partially-covered one"
+    )
+    # `<K>_status` stays object -- it is a non-nullable Utf8, and strings always
+    # are. Asserted so the asymmetry reads as deliberate.
+    assert obs["scrublet_status"].dtype == object
+
+
+def test_read_obs_and_the_h5ad_round_trip_agree_on_the_dtype(tmp_path):
+    """The divergence this closes: the same column, two surfaces, two dtypes."""
+    scx = _fixture(tmp_path)
+    body = "barcode,doublet_score,predicted_doublet\nAAAC-1,0.9,True\nAAAT-1,0.1,False\n"
+    pyscx.doublet_import(str(scx), str(_write(tmp_path, "s.csv", body)),
+                         tool="scrublet")
+
+    direct = pyscx.open(str(scx)).read_obs()["scrublet_predicted"]
+    h5ad = tmp_path / "rt.h5ad"
+    pyscx.to_h5ad(str(scx), str(h5ad))
+    roundtripped = anndata.read_h5ad(h5ad).obs["scrublet_predicted"]
+
+    assert str(direct.dtype) == str(roundtripped.dtype) == "boolean"
+    assert _calls(pd.DataFrame({"c": direct}), "c") == _calls(
+        pd.DataFrame({"c": roundtripped}), "c"
+    )
+
+
+def test_uncovered_rows_no_longer_coerce_silently_to_false(tmp_path):
+    """A consequence worth pinning rather than discovering.
+
+    On the old `object` column `.astype(bool)` mapped an uncovered cell to
+    `False` -- "never scored" silently becoming "not a doublet", which is the
+    error the null-awareness design exists to prevent. With a real nullable
+    dtype it raises, and `.fillna(False)` is the explicit form.
+    """
+    scx = _fixture(tmp_path)
+    body = "barcode,doublet_score,predicted_doublet\nAAAC-1,0.9,True\n"
+    pyscx.doublet_import(str(scx), str(_write(tmp_path, "s.csv", body)),
+                         tool="scrublet")
+    col = pyscx.open(str(scx)).read_obs()["scrublet_predicted"]
+
+    with pytest.raises((ValueError, TypeError)):
+        col.astype(bool)
+    assert col.fillna(False).astype(bool).tolist() == [True, False, False, False]

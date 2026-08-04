@@ -476,9 +476,19 @@ back to your cells.
 ```python
 d = pyscx.diagnose_obs_key("atlas.scx")
 print(d["summary"])          # what would be resolved, and whether it is unique
-print(d["unique_columns"])   # columns that ARE unique
+print(d["unique_columns"])   # usable keys that ARE unique, best first
 print(d["unique_pairs"])     # two-column composites that are
+print(d["unusable_unique_columns"])   # unique, but refused as a key
 ```
+
+Every name it reports is one you can paste straight into `key=` — including
+`obs_names` for the obs index. `unique_columns` is ordered best-candidate-first
+(obs index, then `barcode`/`cell_id`-style names, then other strings, then
+integers), and it lists only columns that can actually key a join. A unique
+column the join would *refuse* is reported separately under
+`unusable_unique_columns`: a float score column is often unique per row, but two
+independently written sides are not guaranteed to format the same float
+identically, so joining on one could silently half-match.
 
 On a single library the obs index is usually unique and there is nothing to
 think about. On a merged atlas it often is not: measured on a real
@@ -494,9 +504,25 @@ pyscx.obs_import("atlas.scx", "calls.csv", key=["soma_joinid"])
 pyscx.obs_import("atlas.scx", "calls.csv", key=["sample_id", "barcode"])
 ```
 
-A composite key needs both columns on both sides, so the tool's output table
+A composite key needs both components on both sides, so the tool's output table
 has to carry `sample_id` too. `export_batches` writes the batch column into
 each per-batch h5ad for exactly this reason.
+
+The two sides may *name* them differently. `source_key=` gives the source-side
+column for each `key` component, pairing positionally like pandas
+`left_on` / `right_on` — which is what a merged atlas usually needs, since its
+identity is (`sample_id`, obs index) while the tool wrote a `barcode` column:
+
+```python
+pyscx.obs_import("atlas.scx", "calls.csv",
+                 key=["sample_id", "obs_names"],
+                 source_key=["sample_id", "barcode"])
+```
+
+`obs_names` is how you name the obs index anywhere a key is accepted, and it is
+the spelling `diagnose_obs_key` reports — the underlying pyarrow field is called
+`__index_level_0__`, but `read_obs()` hands it back as the frame's *unnamed*
+index, so that name is not something you can address.
 
 ### Export one file per batch
 
@@ -622,7 +648,7 @@ cons = pyscx.doublet_consensus("atlas.scx", keys=["scdblfinder", "scrublet"])
 cons["n_predicted_doublet"], cons["n_no_vote"]
 ```
 
-This writes `obs["doublet_predicted"]` (nullable boolean),
+This writes `obs["doublet_predicted"]` (pandas nullable `boolean`),
 `obs["doublet_n_tools_calling"]` and `obs["doublet_n_tools_voting"]`. Read the
 voting count before trusting a `False`: a `0` there means no tool assessed the
 cell, which is why `doublet_predicted` is null beside it. `method="majority"`

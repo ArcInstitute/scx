@@ -440,3 +440,139 @@ fn column_selection_rename_and_prefix_apply() {
         "--columns must exclude unlisted columns"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `obs_names` in, `obs_names` out (F1) and per-side key names (F3)
+// ---------------------------------------------------------------------------
+
+/// A pyarrow-shaped obs: the index is a physical `__index_level_0__` field,
+/// which is what any `from_anndata`- or h5ad-converted file carries.
+///
+/// `index` is passed in because the two things being tested need opposite
+/// shapes: a unique index to key on directly, and a duplicated one where only
+/// (`sample_id`, index) identifies a row.
+fn indexed_fixture(dir: &Path, name: &str, index: Vec<&str>) -> PathBuf {
+    let obs = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("sample_id", DataType::Utf8, false),
+            Field::new("__index_level_0__", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["s1", "s1", "s2", "s2"])),
+            Arc::new(StringArray::from(index)),
+        ],
+    )
+    .unwrap();
+    write_fixture(dir, name, obs, 2)
+}
+
+#[test]
+fn the_join_report_names_the_obs_index_as_obs_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = indexed_fixture(
+        dir.path(),
+        "t.scx",
+        vec!["AAAC-1", "AAAG-1", "AAAT-1", "AAAA-1"],
+    );
+    let csv = write_text(dir.path(), "calls.csv", "barcode,score\nAAAC-1,0.5\n");
+
+    let out = scx()
+        .args([
+            "obs-import",
+            scx_path.to_str().unwrap(),
+            csv.to_str().unwrap(),
+            "--key",
+            "obs_names",
+            "--source-key",
+            "barcode",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("matched on obs_names"), "{stdout}");
+    assert!(
+        !stdout.contains("__index_level_0__"),
+        "the physical field name is not a column a user can address: {stdout}"
+    );
+
+    let obs = read_obs(&scx_path);
+    assert_eq!(f64_col(&obs, "score").value(0), 0.5);
+}
+
+#[test]
+fn a_composite_key_can_name_different_columns_per_side() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = indexed_fixture(
+        dir.path(),
+        "t.scx",
+        vec!["AAAC-1", "AAAG-1", "AAAC-1", "AAAG-1"],
+    );
+    // Target identity is (sample_id, obs-index); the tool keyed on
+    // (sample_id, barcode). Out of order, so a positional import would show.
+    let csv = write_text(
+        dir.path(),
+        "ml.csv",
+        "sample_id,barcode,score\n\
+         s2,AAAG-1,0.4\ns1,AAAC-1,0.1\ns2,AAAC-1,0.3\ns1,AAAG-1,0.2\n",
+    );
+
+    let out = scx()
+        .args([
+            "obs-import",
+            scx_path.to_str().unwrap(),
+            csv.to_str().unwrap(),
+            "--key",
+            "sample_id,obs_names",
+            "--source-key",
+            "sample_id,barcode",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("4/4 target rows matched"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let obs = read_obs(&scx_path);
+    let score = f64_col(&obs, "score");
+    // File order, not CSV order.
+    for (i, want) in [0.1, 0.2, 0.3, 0.4].iter().enumerate() {
+        assert_eq!(score.value(i), *want, "row {i}");
+    }
+}
+
+#[test]
+fn source_key_without_key_is_refused_with_the_remedy() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = simple_fixture(dir.path(), "t.scx");
+    let csv = write_text(dir.path(), "calls.csv", "barcode,score\nAAAC-1,0.5\n");
+
+    let out = scx()
+        .args([
+            "obs-import",
+            scx_path.to_str().unwrap(),
+            csv.to_str().unwrap(),
+            "--source-key",
+            "barcode",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--source-key needs --key"), "{stderr}");
+    assert!(
+        stderr.contains("--key obs_names"),
+        "the message must name the likely intent: {stderr}"
+    );
+}

@@ -84,16 +84,17 @@ def test_key_defaults_to_what_the_importer_would_resolve(tmp_path):
     scx = _fixture(tmp_path, _clean_obs())
     r = pyscx.export_batches(str(scx), str(tmp_path / "b"), batch_key="donor_id")
 
-    # Deliberately NOT `diagnose_obs_key(...)["suggestion"]`, which on this
-    # fixture is `cell_uid` — both it and the index are unique and the
-    # diagnosis names the column, not the index. The export prefers the index
-    # because that is what the tools hand back AND what the importer's own
-    # fallback order resolves to, so export and import genuinely cannot
-    # disagree here. Asserting against the suggestion would re-enshrine the
-    # asymmetry this preference removes.
-    resolved = pyscx.diagnose_obs_key(str(scx))["resolved_key"]
-    assert r["key"] == resolved == "__index_level_0__"
+    # The asymmetry this used to work around is gone: `diagnose_obs_key` now
+    # ranks the obs index first among usable keys, so its *suggestion* — not
+    # just its `resolved_key` — is what the export picks. Both are asserted,
+    # because agreement between the two is the property that matters: the key
+    # the export hands to a tool has to be one the import will resolve to.
+    diag = pyscx.diagnose_obs_key(str(scx))
+    assert r["key"] == diag["resolved_key"] == diag["suggestion"] == "obs_names"
     assert r["key_is_obs_index"] is True
+    # And it is a name `obs_import` accepts — a display name the resolver
+    # rejected would just be a new dead end.
+    assert "cell_uid" in diag["unique_columns"], "the other unique column is still offered"
 
 
 def test_batches_can_be_restricted(tmp_path):
@@ -157,7 +158,10 @@ def test_auto_resolution_prefers_the_index_when_it_is_unique(tmp_path):
     scx = _fixture(tmp_path, _clean_obs())
     r = pyscx.export_batches(str(scx), str(tmp_path / "b"), batch_key="donor_id")
 
-    assert r["key"] == "__index_level_0__"
+    # Reported as `obs_names`, not the physical `__index_level_0__`: that is a
+    # pyarrow serialization name, and `read_obs()` hands the field back as the
+    # frame's unnamed index, so `obs["__index_level_0__"]` is a KeyError.
+    assert r["key"] == "obs_names"
     assert r["key_is_obs_index"] is True
     assert r["n_batches"] == 2
 

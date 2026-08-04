@@ -374,3 +374,186 @@ def test_on_missing_rows_accepts_null_as_well_as_zero(tmp_path, synthetic_adata)
         back = pyscx.open(path).read_obs()
         # Uncovered rows are NULL, which is what both spellings mean.
         assert back["score"].isna().sum() == n - n // 2
+
+
+# ---------------------------------------------------------------------------
+# The obs index is addressable, under the name the tooling prints (F1)
+# ---------------------------------------------------------------------------
+
+
+def test_the_obs_index_is_reported_as_obs_names(tmp_path):
+    """`__index_level_0__` is pyarrow's serialization name, not a column.
+
+    `read_obs()` hands that field back as the frame's *unnamed index*, so
+    following a diagnostic that named it literally — `obs["__index_level_0__"]`
+    — is a KeyError. Every field the diagnosis returns has to be a name the
+    import accepts.
+    """
+    obs = pd.DataFrame({"donor": ["d1", "d1", "d2", "d2"]},
+                       index=["AAAC-1", "AAAG-1", "AAAT-1", "AAAA-1"])
+    scx = _fixture(tmp_path, obs=obs)
+
+    d = pyscx.diagnose_obs_key(str(scx))
+    blob = repr(d)
+    assert "__index_level_0__" not in blob, blob
+    assert d["resolved_key"] == "obs_names"
+    assert d["suggestion"] == "obs_names"
+    assert "obs_names" in d["summary"]
+
+
+def test_obs_names_is_accepted_as_a_key(tmp_path):
+    scx = _fixture(tmp_path)
+    csv = _write(tmp_path, "calls.csv",
+                 "barcode,score\nAAAT-1,0.30\nAAAC-1,0.10\n")
+
+    r = pyscx.obs_import(str(scx), str(csv), key="obs_names",
+                         source_key="barcode")
+    assert r["n_matched"] == 2
+    assert r["obs_key_column"] == "obs_names", "reported back in the same vocabulary"
+
+    # File order (AAAC, AAAG, AAAT, AAAA), not CSV order.
+    obs = pyscx.open(str(scx)).read_obs()
+    assert obs["score"].iloc[0] == pytest.approx(0.10)
+    assert obs["score"].iloc[2] == pytest.approx(0.30)
+    assert pd.isna(obs["score"].iloc[1])
+
+
+def test_the_suggested_key_always_joins(tmp_path):
+    """The invariant behind F1 and F2: whatever the diagnosis names, works.
+
+    Same property `test_an_integer_key_column_can_be_joined_on` pins for the
+    Int64 case — a suggestion the join then refuses is worse than no suggestion.
+    """
+    scx = _fixture(tmp_path)
+    suggestion = pyscx.diagnose_obs_key(str(scx))["suggestion"]
+    csv = _write(tmp_path, "calls.csv", "barcode,score\nAAAC-1,0.5\n")
+    r = pyscx.obs_import(str(scx), str(csv), key=suggestion, source_key="barcode")
+    assert r["n_matched"] == 1
+
+
+def test_the_physical_index_name_still_works(tmp_path):
+    """Back-compat: anything that hard-coded the old spelling keeps running."""
+    scx = _fixture(tmp_path)
+    csv = _write(tmp_path, "calls.csv", "barcode,score\nAAAC-1,0.5\n")
+    r = pyscx.obs_import(str(scx), str(csv), key="__index_level_0__",
+                         source_key="barcode")
+    assert r["n_matched"] == 1
+
+
+# ---------------------------------------------------------------------------
+# A float is never offered as a key (F2)
+# ---------------------------------------------------------------------------
+
+
+def test_a_unique_float_column_is_not_suggested(tmp_path):
+    """The shape a file takes after two doublet imports on a merged atlas.
+
+    The obs index repeats and the only per-row-unique columns are float scores —
+    which `obs_import` refuses (see `test_a_float_key_column_is_still_refused`),
+    so naming one is a guaranteed dead end.
+    """
+    obs = pd.DataFrame(
+        {"scrublet_score": np.array([0.11, 0.22, 0.33, 0.44], dtype=np.float32),
+         "donor": ["d1", "d1", "d2", "d2"]},
+        index=["DUP"] * 4,
+    )
+    scx = _fixture(tmp_path, obs=obs)
+
+    d = pyscx.diagnose_obs_key(str(scx))
+    assert d["suggestion"] != "scrublet_score"
+    assert "scrublet_score" not in d["unique_columns"]
+    # Set aside and named, not silently dropped: "nothing is unique" is false.
+    assert d["unusable_unique_columns"] == ["scrublet_score"]
+    assert "floats are refused" in d["summary"]
+
+
+# ---------------------------------------------------------------------------
+# Per-side key names (F3)
+# ---------------------------------------------------------------------------
+
+
+def _merged_atlas(tmp_path):
+    """Two libraries whose barcodes collide; identity is (sample_id, barcode)."""
+    obs = pd.DataFrame(
+        {"sample_id": ["s1", "s1", "s2", "s2"]},
+        index=["AAAC-1", "AAAG-1", "AAAC-1", "AAAG-1"],
+    )
+    return _fixture(tmp_path, obs=obs)
+
+
+def test_a_composite_key_can_name_different_columns_per_side(tmp_path):
+    """The reported failure: target identity is (sample_id, obs-index), the
+    tool's output is keyed (sample_id, barcode). Before `source_key=` this
+    needed a rename in pandas first."""
+    scx = _merged_atlas(tmp_path)
+    csv = _write(
+        tmp_path,
+        "ml.csv",
+        "sample_id,barcode,score\n"
+        "s2,AAAG-1,0.4\ns1,AAAC-1,0.1\ns2,AAAC-1,0.3\ns1,AAAG-1,0.2\n",
+    )
+
+    r = pyscx.obs_import(str(scx), str(csv),
+                         key=["sample_id", "obs_names"],
+                         source_key=["sample_id", "barcode"])
+    assert r["n_matched"] == 4
+
+    obs = pyscx.open(str(scx)).read_obs()
+    # File order, not CSV order — proving the composite joined by key.
+    assert obs["score"].tolist() == pytest.approx([0.1, 0.2, 0.3, 0.4])
+
+
+def test_source_key_needs_key(tmp_path):
+    scx = _fixture(tmp_path)
+    csv = _write(tmp_path, "calls.csv", "barcode,score\nAAAC-1,0.5\n")
+    with pytest.raises(ValueError, match="source_key= needs key="):
+        pyscx.obs_import(str(scx), str(csv), source_key="barcode")
+
+
+def test_source_key_must_have_the_same_arity_as_key(tmp_path):
+    scx = _merged_atlas(tmp_path)
+    csv = _write(tmp_path, "ml.csv", "sample_id,barcode,score\ns1,AAAC-1,0.1\n")
+    with pytest.raises(ValueError, match="pair up positionally"):
+        pyscx.obs_import(str(scx), str(csv),
+                         key=["sample_id", "obs_names"], source_key=["barcode"])
+
+
+def test_a_single_key_can_differ_across_sides(tmp_path):
+    """Not just composites — a named single key could not differ either."""
+    obs = pd.DataFrame({"cell_uid": ["u0", "u1", "u2", "u3"]},
+                       index=["AAAC-1", "AAAG-1", "AAAT-1", "AAAA-1"])
+    scx = _fixture(tmp_path, obs=obs)
+    csv = _write(tmp_path, "calls.csv", "tool_cell,score\nu2,0.3\nu0,0.1\n")
+
+    r = pyscx.obs_import(str(scx), str(csv), key="cell_uid",
+                         source_key="tool_cell")
+    assert r["n_matched"] == 2
+    obs_back = pyscx.open(str(scx)).read_obs()
+    assert obs_back["score"].tolist()[:3] == pytest.approx([0.1, np.nan, 0.3],
+                                                          nan_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# on_missing_rows spelling (F4)
+# ---------------------------------------------------------------------------
+
+
+def test_on_missing_rows_defaults_to_null(tmp_path):
+    """The default spells what actually happens. "zero" stays an accepted alias
+    — it names the shared policy enum, whose `zero` is literal only on
+    `cellbender_import`, where a missing *matrix* row really is zeros."""
+    # The default lives on the pyo3 function; the Python wrapper forwards
+    # **kwargs, so `inspect.signature` on it would not see the parameter.
+    assert 'on_missing_rows="null"' in pyscx._obs_import_native.__text_signature__
+    assert 'on_missing_rows="null"' in pyscx._doublet_import_native.__text_signature__
+    # ...and cellbender keeps "zero", where a missing matrix row really IS zeros:
+    # an unmatched target row gets an all-zero CSR row, not a null.
+    assert ('on_missing_rows="zero"'
+            in pyscx.cellbender_import.__text_signature__)
+
+    scx = _fixture(tmp_path)
+    csv = _write(tmp_path, "calls.csv", "barcode,score\nAAAC-1,0.5\n")
+    r = pyscx.obs_import(str(scx), str(csv), on_missing_rows="zero")
+    assert r["n_matched"] == 1
+    obs = pyscx.open(str(scx)).read_obs()
+    assert pd.isna(obs["score"].iloc[1]), "'zero' still means null, not 0.0"

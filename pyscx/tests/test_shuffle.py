@@ -367,16 +367,24 @@ def test_cli_warns_when_the_input_x_is_cross_row_coded(
 
 
 @pytest.mark.skipif(_scx_bin() is None, reason="scx CLI not on PATH")
-def test_cli_size_warning_names_the_inputs_own_codec(
+def test_cli_size_warning_recommends_no_codec_pin(
     clustered_adata, scx_from_adata, tmp_dir
 ):
-    """The remediation the warning names must not *be* the failure mode.
+    """The warning must describe the real effect and recommend no pin.
 
-    An earlier draft said "pass --codec scx1 for a size-neutral shuffle", which
-    is true only relative to an scx1 input. On a shufdelta/zstd file the
-    auto-mode growth IS the adaptive codec flipping to scx1, so that advice
-    reproduces the blowup it warns about (tabula: 197.9 MB -> 413.3 MB either
-    way). The size-preserving pin is the input's own codec."""
+    This assertion has inverted twice, so the history is worth keeping. Draft 1
+    said "pass --codec scx1 for a size-neutral shuffle" -- true only relative to
+    an scx1 input, and on a shufdelta/zstd file that advice reproduced the very
+    blowup it warned about. Draft 2 therefore said to pin the *input's* own
+    codec. But the ~2x growth both drafts reacted to was never a property of
+    shuffling: every derived-file op built a framing config whose `decode_target`
+    was None -- the `fast` profile -- so `auto` on a rewrite ran the
+    single-encode heuristic and never re-adopted ShufDeltaZstd. With that fixed,
+    `auto` is the right answer and pinning holds nothing.
+
+    What survives is the genuine, much smaller effect: a permutation costs
+    cross-row redundancy for codecs whose compression spans rows. So the warning
+    still fires on a zstd input, and must now recommend no pin at all."""
     src = scx_from_adata(clustered_adata, "src.scx")
     zstd_src = str(tmp_dir / "zstd.scx")
     subprocess.run(
@@ -385,9 +393,12 @@ def test_cli_size_warning_names_the_inputs_own_codec(
         capture_output=True,
     )
     out = _shuffle_stderr(zstd_src, str(tmp_dir / "out.scx"))
-    assert "pin the input's own codec: `--codec zstd`" in out, out
-    # ...and it must not present scx1 as the size-preserving option.
+    # It still fires, and still names the real mechanism.
+    assert "cross-row redundancy" in out, out
+    assert "`zstd`-coded" in out, out
+    # Neither obsolete remediation may come back.
     assert "--codec scx1 for a size-neutral" not in out
+    assert "pin the input's own codec" not in out.lower()
 
 
 @pytest.mark.skipif(_scx_bin() is None, reason="scx CLI not on PATH")
@@ -491,12 +502,18 @@ def test_shuffle_rejects_an_unknown_codec(clustered_adata, scx_from_adata, tmp_d
 @pytest.mark.skipif(_scx_bin() is None, reason="scx CLI not on PATH")
 def test_cli_help_does_not_teach_the_wrong_codec_remediation():
     """`scx sort --help` is the first surface many users meet, so it must not
-    contradict the runtime warning. It carried "pass `--codec scx1` for a
-    size-neutral shuffle" for one commit *after* the engine warning had been
-    rewritten to reject exactly that advice."""
+    contradict the runtime warning.
+
+    It has drifted from that warning twice now, each time by one commit: it
+    carried "pass `--codec scx1` for a size-neutral shuffle" after the warning
+    dropped it, then "pin the INPUT's own codec" after the derived-file codec bug
+    that motivated *that* was fixed. Hence the negative assertions -- both dead
+    remediations are named, so neither can quietly return."""
     out = subprocess.run(
         [_scx_bin(), "sort", "--help"], capture_output=True, text=True, check=True
     ).stdout
     assert "--shuffle" in out
     assert "scx1` for a size-neutral" not in out
-    assert "pin the INPUT's own codec" in out
+    assert "pin the input's own codec" not in out.lower()
+    # What it must say instead: leave the codec alone.
+    assert "Leave `--codec` at `auto`" in out

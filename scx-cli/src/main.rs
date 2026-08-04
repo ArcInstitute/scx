@@ -498,12 +498,13 @@ enum Commands {
         /// so a training loader gets i.i.d. batches at any `shard_group_size`.
         /// Mutually exclusive with `--by`, `--group-by` and `--reverse`. Note
         /// this is the *inverse* of a sort: it maximally scatters predicate-index
-        /// shard ranges. To keep the output's size, pin the INPUT's own codec
-        /// (`--codec zstd`, `--codec shufdelta`, …) — left at `auto` the adaptive
-        /// codec re-selects and X can grow ~2x. `--codec scx1` is not the
-        /// size-preserving choice unless the input is already scx1; it is what
-        /// `auto` tends to flip to. Pass `--shard-size` matching the input to
-        /// reorder without also re-sharding.
+        /// shard ranges. Leave `--codec` at `auto`: it runs the same adaptive
+        /// per-shard selection `scx convert` does, so pinning a codec chooses an
+        /// encoding rather than holding the file's size. A permutation does
+        /// inherently cost some cross-row redundancy for codecs whose
+        /// compression spans rows — ~6-12% for `zstd`, under 1% for
+        /// `lz4`/`shufdelta`. Pass `--shard-size` matching the input to reorder
+        /// without also re-sharding.
         #[arg(long)]
         shuffle: bool,
         /// RNG seed for `--shuffle`. Recorded in the output's provenance, and
@@ -996,10 +997,17 @@ enum Commands {
         input: PathBuf,
         /// Source .csv / .tsv / .txt
         table: PathBuf,
-        /// Join key column(s), comma-separated for a composite key.
-        /// Omitted auto-resolves (pandas index, then barcode/cell_id/...).
+        /// Target-side join key column(s), comma-separated for a composite
+        /// key. `obs_names` keys on the obs index. Omitted auto-resolves
+        /// (obs index, then barcode/cell_id/...).
         #[arg(long)]
         key: Option<String>,
+        /// Source-side column(s) for the same key, when the table spells it
+        /// differently: `--key sample_id,obs_names --source-key
+        /// sample_id,barcode`. Pairs positionally with --key, so the counts
+        /// must match. Omitted means both sides use the --key names.
+        #[arg(long)]
+        source_key: Option<String>,
         /// Import only these source columns (comma-separated)
         #[arg(long)]
         columns: Option<String>,
@@ -1059,10 +1067,17 @@ enum Commands {
         #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(
             scx_convert::DOUBLET_PROFILE_NAMES))]
         tool: String,
-        /// Join key column(s), comma-separated for a composite key.
-        /// Omitted auto-resolves (pandas index, then barcode/cell_id/...).
+        /// Target-side join key column(s), comma-separated for a composite
+        /// key. `obs_names` keys on the obs index. Omitted auto-resolves
+        /// (obs index, then barcode/cell_id/...).
         #[arg(long)]
         key: Option<String>,
+        /// Source-side column(s) for the same key, when the table spells it
+        /// differently: `--key sample_id,obs_names --source-key
+        /// sample_id,barcode`. Pairs positionally with --key, so the counts
+        /// must match. Omitted means both sides use the --key names.
+        #[arg(long)]
+        source_key: Option<String>,
         /// Canonical column prefix. Defaults to the tool name, so two tools
         /// land side by side without colliding.
         #[arg(long)]
@@ -1279,6 +1294,7 @@ fn main() {
             input,
             table,
             key,
+            source_key,
             columns,
             rename,
             prefix,
@@ -1295,6 +1311,7 @@ fn main() {
             &input,
             &table,
             key.as_deref(),
+            source_key.as_deref(),
             columns.as_deref(),
             &rename,
             &prefix,
@@ -1313,6 +1330,7 @@ fn main() {
             table,
             tool,
             key,
+            source_key,
             key_added,
             score_column,
             call_column,
@@ -1330,6 +1348,7 @@ fn main() {
             &table,
             &tool,
             key.as_deref(),
+            source_key.as_deref(),
             key_added.as_deref(),
             score_column.as_deref(),
             call_column.as_deref(),

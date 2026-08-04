@@ -65,7 +65,9 @@ use scx_format_io::writer::ScxWriter;
 use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::external_layer::{
-    examples, first_duplicates, resolve_key_column, string_column, ExtraRowPolicy, MissingRowPolicy,
+    display_key_name, examples, first_duplicates, is_joinable_key_column, is_string_column,
+    resolve_key_alias, resolve_key_column, string_column, ExtraRowPolicy, MissingRowPolicy,
+    OBS_KEY_FALLBACKS,
 };
 use crate::in_place::{commit_in_place, entry_matches_key, prepare_in_place, read_provenance_ops};
 
@@ -198,6 +200,10 @@ pub struct AttachObsSummary {
     pub n_target_rows_absent: u64,
     pub n_source_rows_absent: u64,
     /// The resolved key, or the comma-joined composite spec.
+    ///
+    /// The **physical** column name, so the provenance entry records what
+    /// actually keyed the join on disk. Consumers that show it to a user pass it
+    /// through [`crate::display_key_name`] first — do not translate it here.
     pub obs_key_column: String,
     pub obs_columns_added: Vec<String>,
     pub obsm_keys_added: Vec<String>,
@@ -218,10 +224,26 @@ pub struct KeyDiagnosis {
     pub resolved_key: Option<String>,
     /// Distinct values of `resolved_key`. Less than `n_obs` means it cannot join.
     pub resolved_cardinality: Option<usize>,
-    /// Obs columns whose values are unique across all rows — the actionable list.
+    /// Obs columns whose values are unique across all rows **and can serve as a
+    /// join key** — the actionable list, best candidate first.
+    ///
+    /// Ordered: the obs index, then the [`OBS_KEY_FALLBACKS`] barcode spellings,
+    /// then other string columns, then integers. Schema order is only the
+    /// tiebreak — it used to be the whole ranking, which on a file carrying
+    /// imported float score columns put a `*_score` first and the obs index last.
     pub unique_columns: Vec<String>,
     /// Unique 2-column composites, searched only when no single column is unique.
     pub unique_pairs: Vec<(String, String)>,
+    /// Columns that are unique but cannot be a join key — in practice floats,
+    /// plus any other type [`is_joinable_key_column`] rejects. (A nested column
+    /// never reaches here: `distinct_count` cannot encode one, so it is dropped
+    /// from the analysis entirely.)
+    ///
+    /// Reported separately rather than folded into [`Self::unique_columns`]:
+    /// `resolve_key_column` refuses them, so offering one as the key to try is a
+    /// dead end. Named rather than counted so a user who expected their unique
+    /// float column to work learns which one was set aside.
+    pub unusable_unique_columns: Vec<String>,
     /// Whether the pair search was capped (see [`DIAGNOSIS_PAIR_SEARCH_TOP_K`]).
     pub pair_search_capped: bool,
     /// A ready-to-paste key spec, when one exists.
@@ -239,8 +261,11 @@ impl KeyDiagnosis {
             ));
         }
         if !self.unique_columns.is_empty() {
+            // "unique AND can key" rather than just "unique", because the list
+            // is now filtered to keys the join accepts — a float column is
+            // often unique per row and is deliberately absent from it.
             s.push_str(&format!(
-                "Obs columns that ARE unique: {:?}. ",
+                "Obs columns that ARE unique and can key a join: {:?}. ",
                 self.unique_columns
             ));
         } else if !self.unique_pairs.is_empty() {
@@ -260,6 +285,18 @@ impl KeyDiagnosis {
                 } else {
                     " or 2-column composite"
                 }
+            ));
+        }
+        // Without this the previous sentence reads as "nothing is unique" on a
+        // file whose only unique column is a float, which is both false and
+        // unactionable.
+        if !self.unusable_unique_columns.is_empty() {
+            s.push_str(&format!(
+                "Unique but unusable as a key: {:?} — strings and integers work \
+                 (both sides are fused as text), floats are refused because their \
+                 text form is not guaranteed to agree across two independently \
+                 written sides. ",
+                self.unusable_unique_columns
             ));
         }
         if let Some(sug) = &self.suggestion {
@@ -284,22 +321,36 @@ pub fn build_composite_key(batch: &RecordBatch, columns: &[String]) -> Result<Ve
             "composite join key needs at least one column".into(),
         ));
     }
-    if columns.len() == 1 {
-        return string_column(batch, &columns[0]);
-    }
-
-    let mut parts: Vec<Vec<String>> = Vec::with_capacity(columns.len());
-    for name in columns {
+    // Every component goes through the same alias resolution a single key does,
+    // so `["sample_id", "obs_names"]` works and a composite can never disagree
+    // with `ObsJoinKey::Column` about what a name means.
+    let schema = batch.schema();
+    let resolved: Vec<String> = columns
+        .iter()
+        .map(|c| resolve_key_alias("obs", &schema, c))
+        .collect();
+    for (name, requested) in resolved.iter().zip(columns) {
         if batch.column_by_name(name).is_none() {
-            let schema = batch.schema();
-            let present: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            let present: Vec<String> = schema
+                .fields()
+                .iter()
+                .map(|f| display_key_name("obs", f.name()))
+                .collect();
             return Err(OpsError::KeyColumnUnresolved {
                 axis: "obs",
                 detail: format!(
-                    "composite key column '{name}' not found; columns present are {present:?}"
+                    "composite key column '{requested}' not found; columns present are {present:?}"
                 ),
             });
         }
+    }
+
+    if resolved.len() == 1 {
+        return string_column(batch, &resolved[0]);
+    }
+
+    let mut parts: Vec<Vec<String>> = Vec::with_capacity(resolved.len());
+    for name in &resolved {
         parts.push(string_column(batch, name)?);
     }
 
@@ -363,7 +414,15 @@ fn resolve_target_keys(obs: &RecordBatch, join_key: &ObsJoinKey) -> Result<(Stri
         }
         ObsJoinKey::Composite { columns } => {
             let keys = build_composite_key(obs, columns)?;
-            Ok((columns.join(","), keys))
+            // Report the physical spec, not what the caller typed, so
+            // `AttachObsSummary::obs_key_column` and the provenance entry stay
+            // in the on-disk vocabulary even when the caller used `obs_names`.
+            let schema = obs.schema();
+            let physical: Vec<String> = columns
+                .iter()
+                .map(|c| resolve_key_alias("obs", &schema, c))
+                .collect();
+            Ok((physical.join(","), keys))
         }
     }
 }
@@ -409,19 +468,56 @@ fn diagnose_from_obs(obs: &RecordBatch, resolved: Option<(&str, &[String])>) -> 
         None => (None, None),
     };
 
-    // Per-column cardinality, cheapest signal first.
+    // Per-column cardinality, cheapest signal first. Non-joinable columns
+    // (floats) stay out of the candidate lists entirely — `resolve_key_column`
+    // refuses them, so naming one as the key to try is a guaranteed dead end —
+    // but a *unique* one is kept aside for the summary, because "no unique
+    // column was found" would otherwise be a false statement about the file.
     let mut cardinalities: Vec<(String, usize)> = Vec::new();
+    let mut unusable: Vec<String> = Vec::new();
     for (i, f) in schema.fields().iter().enumerate() {
-        if let Some(c) = distinct_count(&[obs.column(i).clone()]) {
+        let Some(c) = distinct_count(&[obs.column(i).clone()]) else {
+            continue;
+        };
+        if is_joinable_key_column(f.data_type()) {
             cardinalities.push((f.name().clone(), c));
+        } else if c == n_obs && n_obs > 0 {
+            unusable.push(f.name().clone());
         }
     }
+    unusable.truncate(DIAGNOSIS_MAX_COLUMNS);
+
+    // The axis index sorts first among usable keys: it is the identity every
+    // external tool hands back, so preferring it is what lets `export_batches`
+    // and `obs_import` agree on a key without either hard-coding one.
+    let index_col = scx_format_io::resolve_index_columns(&schema)
+        .into_iter()
+        .next();
+    let rank = |name: &str| -> (u8, usize) {
+        if index_col.as_deref() == Some(name) {
+            return (0, 0);
+        }
+        if let Some(pos) = OBS_KEY_FALLBACKS.iter().position(|c| *c == name) {
+            return (1, pos);
+        }
+        let is_str = schema
+            .field_with_name(name)
+            .map(|f| is_string_column(f.data_type()))
+            .unwrap_or(false);
+        if is_str {
+            (2, 0)
+        } else {
+            (3, 0)
+        }
+    };
 
     let mut unique_columns: Vec<String> = cardinalities
         .iter()
         .filter(|(_, c)| *c == n_obs && n_obs > 0)
         .map(|(n, _)| n.clone())
         .collect();
+    // Stable, so schema order remains the tiebreak inside a tier.
+    unique_columns.sort_by_key(|n| rank(n));
     unique_columns.truncate(DIAGNOSIS_MAX_COLUMNS);
 
     let mut unique_pairs = Vec::new();
@@ -454,6 +550,19 @@ fn diagnose_from_obs(obs: &RecordBatch, resolved: Option<(&str, &[String])>) -> 
         }
     }
 
+    // Everything below is user-facing, so the physical index field name is
+    // translated to `obs_names` here — the one place it can be done for the
+    // Python dict, the CLI print and every error `describe()` feeds at once.
+    // `resolve_key_column` accepts `obs_names` back, so each name reported is a
+    // name that can be pasted into `key=`.
+    let disp = |n: &String| display_key_name("obs", n);
+    let unique_columns: Vec<String> = unique_columns.iter().map(disp).collect();
+    let unique_pairs: Vec<(String, String)> = unique_pairs
+        .iter()
+        .map(|(a, b)| (disp(a), disp(b)))
+        .collect();
+    let unusable_unique_columns: Vec<String> = unusable.iter().map(disp).collect();
+
     let suggestion = unique_columns
         .first()
         .cloned()
@@ -461,10 +570,11 @@ fn diagnose_from_obs(obs: &RecordBatch, resolved: Option<(&str, &[String])>) -> 
 
     KeyDiagnosis {
         n_obs,
-        resolved_key,
+        resolved_key: resolved_key.as_ref().map(disp),
         resolved_cardinality,
         unique_columns,
         unique_pairs,
+        unusable_unique_columns,
         pair_search_capped,
         suggestion,
     }
@@ -512,7 +622,8 @@ fn build_obs_row_join(
         return Err(OpsError::DuplicateJoinKey {
             axis: "obs",
             detail: format!(
-                "target obs key '{key_spec}' contains duplicates: {dups:?}. {}",
+                "target obs key '{}' contains duplicates: {dups:?}. {}",
+                display_key_name("obs", key_spec),
                 diag.describe()
             ),
         });
@@ -554,9 +665,10 @@ fn build_obs_row_join(
         return Err(OpsError::AxisMismatch {
             axis: "obs",
             detail: format!(
-                "no target row key matched any source row key on '{key_spec}'. Target \
+                "no target row key matched any source row key on '{}'. Target \
                  examples: {:?}; source examples: {:?}. Check for a sample-name prefix \
                  or a '-1' suffix difference. {}",
+                display_key_name("obs", key_spec),
                 examples(target_keys),
                 examples(source_keys),
                 diag.describe()
@@ -585,9 +697,10 @@ fn build_obs_row_join(
     }
     if (n_matched as usize) * 2 < target_keys.len() {
         log::warn!(
-            "external obs join matched only {n_matched} of {} target rows on '{key_spec}'; \
+            "external obs join matched only {n_matched} of {} target rows on '{}'; \
              target examples {:?}, source examples {:?}",
             target_keys.len(),
+            display_key_name("obs", key_spec),
             examples(target_keys),
             examples(source_keys),
         );

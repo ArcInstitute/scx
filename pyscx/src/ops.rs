@@ -1744,20 +1744,50 @@ pub fn parse_obs_extra_rows(s: &str) -> PyResult<scx_ops::ExtraRowPolicy> {
     }
 }
 
-/// Turn the caller's `key` into the reader's column list and the op's join-key
-/// spec, built from the **same** names so both sides of the join agree.
-fn resolve_join_key(key: Option<Vec<String>>) -> (Vec<String>, scx_ops::ObsJoinKey) {
-    match key {
-        None => (Vec::new(), scx_ops::ObsJoinKey::Auto),
-        Some(cols) if cols.is_empty() => (Vec::new(), scx_ops::ObsJoinKey::Auto),
-        Some(cols) if cols.len() == 1 => {
-            (cols.clone(), scx_ops::ObsJoinKey::Column(cols[0].clone()))
-        }
-        Some(cols) => (
-            cols.clone(),
-            scx_ops::ObsJoinKey::Composite { columns: cols },
-        ),
+/// Turn the caller's `key` / `source_key` into the reader's column list and the
+/// op's join-key spec.
+///
+/// Without `source_key` both sides are built from the same names, which is the
+/// common case and the only one expressible before: a target obs keyed on
+/// (`sample_id`, obs index) could not be joined to a tool output keyed on
+/// (`sample_id`, `barcode`) without renaming a column in pandas first. The two
+/// lists pair up **positionally**, mirroring pandas `left_on` / `right_on`.
+///
+/// Nothing downstream needs to know the names differ: `build_composite_key`
+/// fuses each side from its own columns in the given order and the fused key
+/// never carries a column name.
+fn resolve_join_key(
+    key: Option<Vec<String>>,
+    source_key: Option<Vec<String>>,
+) -> PyResult<(Vec<String>, scx_ops::ObsJoinKey)> {
+    let target = key.unwrap_or_default();
+    let source = source_key.unwrap_or_default();
+    if !source.is_empty() && target.is_empty() {
+        return Err(PyValueError::new_err(
+            "source_key= needs key=: it names the source-side column for each \
+             target-side key component, positionally. To key on the target's obs \
+             index, pass key=\"obs_names\".",
+        ));
     }
+    if !source.is_empty() && source.len() != target.len() {
+        return Err(PyValueError::new_err(format!(
+            "key= has {} component(s) but source_key= has {}; they pair up \
+             positionally, so the counts must match",
+            target.len(),
+            source.len()
+        )));
+    }
+    let join_key = match target.len() {
+        0 => scx_ops::ObsJoinKey::Auto,
+        1 => scx_ops::ObsJoinKey::Column(target[0].clone()),
+        _ => scx_ops::ObsJoinKey::Composite {
+            columns: target.clone(),
+        },
+    };
+    // Absent `source_key`, the reader gets the target names — the historical
+    // behaviour, and still what makes the two sides impossible to desync.
+    let source_columns = if source.is_empty() { target } else { source };
+    Ok((source_columns, join_key))
 }
 
 fn key_diagnosis_dict<'py>(
@@ -1769,6 +1799,10 @@ fn key_diagnosis_dict<'py>(
     out.set_item("resolved_key", d.resolved_key.clone())?;
     out.set_item("resolved_cardinality", d.resolved_cardinality)?;
     out.set_item("unique_columns", d.unique_columns.clone())?;
+    // Unique, but refused as a key — a float, or any other type that is not
+    // guaranteed to render identically on two independently written sides. Kept
+    // out of `unique_columns` so nothing in that list is a key the join rejects.
+    out.set_item("unusable_unique_columns", d.unusable_unique_columns.clone())?;
     let pairs: Vec<(String, String)> = d.unique_pairs.clone();
     out.set_item("unique_pairs", pairs)?;
     out.set_item("pair_search_capped", d.pair_search_capped)?;
@@ -1797,9 +1831,9 @@ fn key_diagnosis_dict<'py>(
 /// before trusting the result, and prefer `dry_run=True` on a large file.
 #[pyfunction]
 #[pyo3(signature = (
-    path, table, *, key=None, columns=None, rename=None, prefix="",
+    path, table, *, key=None, source_key=None, columns=None, rename=None, prefix="",
     keep_key_columns=false, delimiter=None, status_column=None, uns_key=None,
-    uns_keys=None, overwrite=false, on_missing_rows="zero", on_extra_rows="warn",
+    uns_keys=None, overwrite=false, on_missing_rows="null", on_extra_rows="warn",
     dry_run=false
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -1808,6 +1842,7 @@ pub fn obs_import(
     path: &str,
     table: &str,
     key: Option<Vec<String>>,
+    source_key: Option<Vec<String>>,
     columns: Option<Vec<String>>,
     rename: Option<std::collections::HashMap<String, String>>,
     prefix: &str,
@@ -1835,7 +1870,7 @@ pub fn obs_import(
         }
     };
 
-    let (key_columns, join_key) = resolve_join_key(key);
+    let (key_columns, join_key) = resolve_join_key(key, source_key)?;
 
     let read_opts = scx_convert::AnnotationTableOptions {
         key_columns,
@@ -1891,7 +1926,10 @@ pub fn obs_import(
     d.set_item("n_matched", summary.n_matched)?;
     d.set_item("n_target_rows_absent", summary.n_target_rows_absent)?;
     d.set_item("n_source_rows_absent", summary.n_source_rows_absent)?;
-    d.set_item("obs_key_column", summary.obs_key_column)?;
+    d.set_item(
+        "obs_key_column",
+        scx_ops::display_key_name("obs", &summary.obs_key_column),
+    )?;
     d.set_item("obs_columns_added", summary.obs_columns_added)?;
     d.set_item("obsm_keys_added", summary.obsm_keys_added)?;
     d.set_item("obs_index_dropped", summary.obs_index_dropped)?;
@@ -1927,9 +1965,9 @@ pub fn obs_import(
 /// imported result and a native one are drop-in comparable.
 #[pyfunction]
 #[pyo3(signature = (
-    path, table, *, tool, key=None, key_added=None, score_column=None,
+    path, table, *, tool, key=None, source_key=None, key_added=None, score_column=None,
     call_column=None, call_true=None, call_false=None, keep_native_columns=true,
-    delimiter=None, uns_keys=None, overwrite=false, on_missing_rows="zero",
+    delimiter=None, uns_keys=None, overwrite=false, on_missing_rows="null",
     on_extra_rows="warn", dry_run=false
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -1939,6 +1977,7 @@ pub fn doublet_import(
     table: &str,
     tool: &str,
     key: Option<Vec<String>>,
+    source_key: Option<Vec<String>>,
     key_added: Option<&str>,
     score_column: Option<&str>,
     call_column: Option<&str>,
@@ -1973,7 +2012,7 @@ pub fn doublet_import(
         .unwrap_or(profile.name)
         .to_string();
 
-    let (key_columns, join_key) = resolve_join_key(key);
+    let (key_columns, join_key) = resolve_join_key(key, source_key)?;
 
     let read_opts = scx_convert::DoubletImportOptions {
         tool: tool.to_string(),
@@ -2109,7 +2148,10 @@ pub fn doublet_import(
     d.set_item("n_matched", summary.n_matched)?;
     d.set_item("n_target_rows_absent", summary.n_target_rows_absent)?;
     d.set_item("n_source_rows_absent", summary.n_source_rows_absent)?;
-    d.set_item("obs_key_column", summary.obs_key_column)?;
+    d.set_item(
+        "obs_key_column",
+        scx_ops::display_key_name("obs", &summary.obs_key_column),
+    )?;
     d.set_item("obs_columns_added", summary.obs_columns_added)?;
     d.set_item("obs_index_dropped", summary.obs_index_dropped)?;
     if let Some(diag) = diagnosis {
@@ -2165,7 +2207,7 @@ pub fn diagnose_obs_key(
     path: &str,
     key: Option<Vec<String>>,
 ) -> PyResult<Py<PyDict>> {
-    let (_, join_key) = resolve_join_key(key);
+    let (_, join_key) = resolve_join_key(key, None)?;
     let scx_path = PathBuf::from(path);
     let diag = py
         .detach(|| scx_ops::diagnose_obs_key(&scx_path, Some(&join_key)))

@@ -1204,20 +1204,24 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   [docs/operations.md § CellBender import](operations.md#cellbender-import).
 - `pyscx.is_cellbender_h5(path)` — True when a `.h5` looks like a CellBender
   `remove-background` output rather than a plain 10x CellRanger matrix.
-- `pyscx.obs_import(path, table, *, key=None, columns=None, rename=None, prefix="", keep_key_columns=False, delimiter=None, status_column=None, uns_key=None, uns_keys=None, overwrite=False, on_missing_rows="zero", on_extra_rows="warn", dry_run=False)` —
+- `pyscx.obs_import(path, table, *, key=None, source_key=None, columns=None, rename=None, prefix="", keep_key_columns=False, delimiter=None, status_column=None, uns_key=None, uns_keys=None, overwrite=False, on_missing_rows="null", on_extra_rows="warn", dry_run=False)` —
   Import a delimited annotation table (CSV/TSV) — or an `.h5ad` whose `/obs`
   holds the columns, on an `hdf5`-feature build — as obs columns on an existing
   file, **in place**. The join is by key string, never by row position; target
   rows the table does not cover get `null`, never a fabricated `0.0`. `path`
   accepts a str, `os.PathLike`, or an open `Experiment`; `key` accepts a str
-  (one column) or a list (length > 1 builds a composite key — the right answer
-  for a multi-library merge where `sample_id` + `barcode` is unique but neither
-  is alone). `on_missing_rows`
-  accepts `"null"`, `"zero"` or `"error"`; `"null"` and `"zero"` are the **same
-  policy** (leave the row NULL) — `zero` is the spelling the shared
-  `MissingRowPolicy` enum carries from the CellBender importer, where a missing
-  *matrix* row genuinely is zeros, and it stays the Python default for
-  compatibility. The CLI spells the same default `--on-missing-rows null`.
+  (one column), `"obs_names"` (the obs index), or a list (length > 1 builds a
+  composite key — the right answer for a multi-library merge where `sample_id` +
+  `barcode` is unique but neither is alone). `source_key` names the **source**
+  side's column for each `key` component when the table spells the key
+  differently, pairing positionally like pandas `left_on` / `right_on`:
+  `key=["sample_id", "obs_names"], source_key=["sample_id", "barcode"]`. Omitted,
+  both sides use the `key` names. `on_missing_rows`
+  accepts `"null"` (the default), `"zero"` or `"error"`; `"null"` and `"zero"`
+  are the **same policy** (leave the row NULL) — `zero` is the spelling the
+  shared `MissingRowPolicy` enum carries from the CellBender importer, where a
+  missing *matrix* row genuinely is zeros, so `cellbender_import` still spells
+  its default `"zero"` and rejects `"null"`.
   **`overwrite` replaces, it does not merge** — importing several
   per-batch tables in turn keeps only the last. Returns a summary dict
   (`n_obs`, `n_matched`, `n_target_rows_absent`, `n_source_rows_absent`,
@@ -1227,17 +1231,27 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   [docs/operations.md § External obs import](operations.md#external-obs-import).
 - `pyscx.diagnose_obs_key(path, key=None)` — Read-only. Report which obs columns
   could serve as a join key: `n_obs`, `resolved_key`, `resolved_cardinality`,
-  `unique_columns`, `unique_pairs` (two-column composites that are unique),
-  `pair_search_capped`, `suggestion`, `summary`. Worth running before an import
-  onto a merged atlas, where the obvious candidates are often not unique and the
-  one that is may be a column no fallback list would guess.
-- `pyscx.doublet_import(path, table, *, tool, key=None, key_added=None, score_column=None, call_column=None, call_true=None, call_false=None, keep_native_columns=True, delimiter=None, uns_keys=None, overwrite=False, on_missing_rows="zero", on_extra_rows="warn", dry_run=False)` —
+  `unique_columns`, `unusable_unique_columns`, `unique_pairs` (two-column
+  composites that are unique), `pair_search_capped`, `suggestion`, `summary`.
+  Worth running before an import onto a merged atlas, where the obvious
+  candidates are often not unique and the one that is may be a column no
+  fallback list would guess. Every name reported is one `obs_import(key=...)`
+  accepts, including `"obs_names"` for the obs index — the physical
+  `__index_level_0__` field is never surfaced, because `read_obs()` hands it back
+  as the frame's *unnamed index*. `unique_columns` is ordered
+  best-candidate-first (obs index, then `barcode`/`cell_id`-style names, then
+  other strings, then integers) and holds only columns that can actually key a
+  join; a unique column the join would refuse — a float, whose text form is not
+  guaranteed to agree across two independently written sides — is listed
+  separately under `unusable_unique_columns` rather than offered.
+- `pyscx.doublet_import(path, table, *, tool, key=None, source_key=None, key_added=None, score_column=None, call_column=None, call_true=None, call_false=None, keep_native_columns=True, delimiter=None, uns_keys=None, overwrite=False, on_missing_rows="null", on_extra_rows="warn", dry_run=False)` —
   The doublet-caller wrapper over `obs_import`: each tool names its score and
   call differently, and this maps them onto canonical columns so downstream code
   never branches on which tool ran. For `key_added="K"` (defaulting to the tool
-  name) it writes `obs["K_score"]` (f32, nullable), `obs["K_predicted"]` (bool,
-  nullable), `obs["K_status"]`, `obs["K_<native>"]` for every other source
-  column, and `uns["K"]`. A tool that emits no call (`scds`) gets **no**
+  name) it writes `obs["K_score"]` (`float32`), `obs["K_predicted"]` (pandas
+  nullable `boolean`), `obs["K_status"]` (`object`, "present"/"absent"),
+  `obs["K_<native>"]` for every other source column, and `uns["K"]`. A tool that
+  emits no call (`scds`) gets **no**
   `K_predicted` — thresholding a score is a decision the importer does not make
   for you; pass `call_column=` to opt in. `tool="generic"` requires
   `score_column=`. When a profile *does* declare a call column and the table
@@ -1362,7 +1376,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.set_uns(path, uns)` — Replace the whole `uns` block in place, **without re-encoding `X`** (cost O(uns bytes)). Replace semantics, not merge. The CSC sidecar and `data_generation` are preserved. Rollback-able via `pyscx.rollback`. **`set_uns` is a strict subset of `modify_metadata`** — `pyscx.modify_metadata(path, uns=...)` does the same thing and also reaches `obs`/`var`/`obsm`/`varm`; prefer `modify_metadata` unless you only need the one-arg `uns` convenience.
 - `pyscx.modify_metadata(path, *, uns=None, obs=None, var=None, obsm=None, varm=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, modality=None)` — Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) in place without touching `X`. `obs`/`var` accept a pandas `DataFrame` (or pyarrow `Table`) and must match `n_obs` / `n_vars` (wrong shape → `ValueError`); `obsm`/`varm` accept `dict[str, np.ndarray]`. Any omitted arg is left untouched. `index_*` kwargs rebuild predicate indexes over a replaced `obs`/`var` (otherwise the stale index is dropped). Replace semantics, not merge; for a shallow `uns` merge, read-modify-write (`adata = pyscx.open(path).to_anndata(); adata.uns[...] = ...; pyscx.set_uns(path, dict(adata.uns))`). Only the global modality is supported today (`modality != 0` → error).
 - `pyscx.sort(input, output, by, reverse=False, shard_size=None, codec="auto", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, memory_budget=None, temp_dir=None, bitmap="off", rebuild_csc=False, csc_cols_per_shard=5000, csc_memory_limit="4G", group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None, group_write_block_bytes=None)` — Globally reorder cells by an obs key for X-read locality and contiguous predicate-index shard ranges. `codec` (`auto`/`none`/`scx1`/`zstd`/`lz4`/`pcodec`/`shufdelta`) pins the output encoding — without it the writer re-selects per shard, so a reorder can change file size for reasons unrelated to the reorder. Pass `memory_budget` (e.g. `"4G"`) to force the bounded external partition sort. Drops the CSC sidecar and detection bitmap (`rebuild_csc=True` / `bitmap=` to re-emit); `adata.raw` is not preserved; deletions are materialized away. See [sharding.md § Sorting for read locality](sharding.md#sorting-for-read-locality-scx-sort).
-- `pyscx.shuffle(input, output, seed=42, shard_size=None, codec="auto", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, memory_budget=None, temp_dir=None, bitmap="off", rebuild_csc=False, csc_cols_per_shard=5000, csc_memory_limit="4G")` — Globally reorder cells by a **seeded random permutation** (`scx sort --shuffle`), so a training loader gets i.i.d. batches at any `shard_group_size`. Same engine and same drop semantics as `sort`, minus the key arguments — shuffle is an order *source*, not a modifier, so `by` / `reverse` / `group_by` are not offered. `seed` is recorded in provenance and is the only record of the permutation; the same seed on the same input always reproduces the same file. The permutation runs over **live** rows, so a file with deletion vectors shuffles differently from the same file without them. Two consequences worth knowing: the output is the inverse of a sorted file for queries (it maximally scatters predicate-index shard ranges), and leaving `codec="auto"` lets the adaptive codec re-select — measured as the entire cause of a 1.86–2.09x X growth. Pin the **input's own** codec to hold its size (`scx1` is neutral only relative to an `scx1` input; on a `shufdelta`/`zstd` file it is what `auto` flips *to*). The provenance entry's `action` stays `"sort"` — the seed lives at `params.shuffle.seed`, so a consumer looking for `action == "shuffle"` will not find it. See [sharding.md § Shuffling for training](sharding.md#shuffling-for-training-scx-sort---shuffle).
+- `pyscx.shuffle(input, output, seed=42, shard_size=None, codec="auto", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, memory_budget=None, temp_dir=None, bitmap="off", rebuild_csc=False, csc_cols_per_shard=5000, csc_memory_limit="4G")` — Globally reorder cells by a **seeded random permutation** (`scx sort --shuffle`), so a training loader gets i.i.d. batches at any `shard_group_size`. Same engine and same drop semantics as `sort`, minus the key arguments — shuffle is an order *source*, not a modifier, so `by` / `reverse` / `group_by` are not offered. `seed` is recorded in provenance and is the only record of the permutation; the same seed on the same input always reproduces the same file. The permutation runs over **live** rows, so a file with deletion vectors shuffles differently from the same file without them. Two consequences worth knowing: the output is the inverse of a sorted file for queries (it maximally scatters predicate-index shard ranges), and a permutation inherently costs some cross-row redundancy for codecs whose compression spans rows — ~6–12% for `zstd`, under 1% for `lz4`/`shufdelta`. **Leave `codec="auto"`**: it runs the same adaptive per-shard selection `scx convert` does. (Earlier releases told you to pin the input's own codec because `auto` grew X 1.86–2.09×. That was a derived-file bug, not a property of shuffling, and is fixed — pinning now selects a specific encoding, it does not hold size. See [sharding.md § Shuffling for training](sharding.md#shuffling-for-training-scx-sort---shuffle).) The provenance entry's `action` stays `"sort"` — the seed lives at `params.shuffle.seed`, so a consumer looking for `action == "shuffle"` will not find it. See [sharding.md § Shuffling for training](sharding.md#shuffling-for-training-scx-sort---shuffle).
 - `pyscx.merge(inputs, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, assume_identical_var=False, assume_identical_obs=False, uns_policy=None, sort_by=None, reverse=False)` — Merge multiple files. `index_*` kwargs rebuild predicate indexes against the merged output — without them, pushdown silently regresses to a full obs scan on the merged file. `assume_identical_var` (default `False`) validates var identity (index, column names, values) across all inputs; set `True` to check only `n_vars` (breaking change from pre-branch where var was unchecked). `assume_identical_obs` (default `False`) validates each input's obs schema (column names + dtypes) against input 0; set `True` to skip. `uns_policy` controls conflicting uns sections: `None` / `"first"` (keep first input), `"require-equal"` (error on difference), `"namespace"` (prefix keys with input filename), `"summary"` (keep first input and record a `_scx_uns_conflicts` array). `sort_by` / `reverse` optionally sort the merged obs by a column. Merge streams obs shard-by-shard and builds predicate indexes incrementally from the shard stream.
 
 ### Cloud operations (requires `--features cloud`)
@@ -1384,7 +1398,7 @@ header followed by indented `obs:` / `var:` / `uns:` / `obsm:` / `varm:` /
 `layers:` key lists. On-disk codec / shard / format-version internals moved off
 the repr onto `Experiment.info() -> str`.
 
-- `read_obs(columns=None)` / `read_var(columns=None, *, modality=None)` — Read the cell / gene metadata table as a pandas DataFrame **without touching `X`**. Reach for these instead of `to_anndata().obs` / `.var` when you only want the metadata: on a 500k × 61k Census file `read_var()` is ~0.05 s against ~1.4 s and ~10 GB peak for the full materialisation. Both always retain the pandas index column (barcodes / gene names), so a projected frame indexes the same as an unprojected one, and an unknown column name raises `KeyError` listing what is available.
+- `read_obs(columns=None)` / `read_var(columns=None, *, modality=None)` — Read the cell / gene metadata table as a pandas DataFrame **without touching `X`**. Reach for these instead of `to_anndata().obs` / `.var` when you only want the metadata: on a 500k × 61k Census file `read_var()` is ~0.05 s against ~1.4 s and ~10 GB peak for the full materialisation. Both always retain the pandas index column (barcodes / gene names), so a projected frame indexes the same as an unprojected one, and an unknown column name raises `KeyError` listing what is available. Boolean columns come back as the pandas nullable `boolean` dtype whether or not they contain nulls, so the dtype follows the schema rather than the data and agrees with what a `to_h5ad` round trip returns. On a column with nulls that means `.astype(bool)` raises — deliberately, since coercing "not covered" to `False` is the mistake nullability exists to prevent — and `.fillna(False)` is the explicit form.
   - `read_obs`'s `columns` is a genuine **pushdown** — unselected columns are never materialised, which matters because `obs` scales with `n_obs`.
   - `read_var`'s `columns` is a convenience projection applied **after** the decode. `var` is one section sized by `n_vars` (5.5 MB for 61k genes), so there is nothing to save at the I/O layer; it does not read less off disk.
   - `read_var(modality=…)` selects one modality's gene axis on a multimodal file. Omitting it reads the global / single-modality `var`, which on a multimodal file is usually not what you want. Unknown name → `KeyError`.
@@ -2444,8 +2458,8 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 
 ### External annotation import
 - `scx cellbender-import <target.scx> <cellbender_out.h5> [--layer NAME] [--obs-key NAME] [--var-key NAME] [--prefix P] [--uns-key K] [--overwrite] [--on-missing-rows zero|error] [--on-extra-rows warn|error] [--gene-axis identical|reorder|subset] [--latent-embedding] [--dry-run]` — Attach a CellBender `remove-background` output as a layer, in place, joined by barcode. `--gene-axis` defaults to `identical`: a silent gene permutation is biologically wrong, so reordering must be opted into. Needs `--features hdf5`. See [docs/operations.md § CellBender import](operations.md#cellbender-import).
-- `scx obs-import <target.scx> <table.csv> [--key CSV] [--columns CSV] [--rename SRC=DST]... [--prefix P] [--keep-key-columns] [--delimiter C] [--status-column NAME] [--uns-key K] [--uns-key-from-source K]... [--overwrite] [--on-missing-rows null|zero|error] [--on-extra-rows warn|error] [--dry-run]` — Import a delimited annotation table (CSV/TSV) as obs columns, in place. Joins by key string, never by row position; uncovered target rows get `null`, not `0`. `--key a,b` is a composite key. Ungated — a delimited-table reader needs no libhdf5; an `.h5ad` source does (`--features hdf5`). `--dry-run` runs the join and a key diagnosis and writes nothing. Undo with `scx rollback`. See [docs/operations.md § External obs import](operations.md#external-obs-import).
-- `scx doublet-import <target.scx> <table.csv> --tool {scdblfinder|scrublet|doubletfinder|doubletdetection|solo|scds|generic} [--key CSV] [--key-added K] [--score-column NAME] [--call-column NAME] [--call-true TOK] [--call-false TOK] [--drop-native-columns] [--delimiter C] [--uns-key-from-source K]... [--overwrite] [--on-missing-rows null|zero|error] [--on-extra-rows warn|error] [--dry-run]` — The doublet wrapper over `obs-import`, normalising each tool's spellings onto `<K>_score` / `<K>_predicted` / `<K>_status` (+ `uns["<K>"]`). `--tool scds` emits no call column, so no `<K>_predicted` unless `--call-column` opts in; `--tool generic` requires `--score-column`. Use `--drop-native-columns` when the source is an h5ad exported from the target file.
+- `scx obs-import <target.scx> <table.csv> [--key CSV] [--source-key CSV] [--columns CSV] [--rename SRC=DST]... [--prefix P] [--keep-key-columns] [--delimiter C] [--status-column NAME] [--uns-key K] [--uns-key-from-source K]... [--overwrite] [--on-missing-rows null|zero|error] [--on-extra-rows warn|error] [--dry-run]` — Import a delimited annotation table (CSV/TSV) as obs columns, in place. Joins by key string, never by row position; uncovered target rows get `null`, not `0`. `--key a,b` is a composite key, and `--key obs_names` keys on the obs index. `--source-key` names the source side per component when the table spells the key differently (`--key sample_id,obs_names --source-key sample_id,barcode`), pairing positionally. Ungated — a delimited-table reader needs no libhdf5; an `.h5ad` source does (`--features hdf5`). `--dry-run` runs the join and a key diagnosis and writes nothing. Undo with `scx rollback`. See [docs/operations.md § External obs import](operations.md#external-obs-import).
+- `scx doublet-import <target.scx> <table.csv> --tool {scdblfinder|scrublet|doubletfinder|doubletdetection|solo|scds|generic} [--key CSV] [--source-key CSV] [--key-added K] [--score-column NAME] [--call-column NAME] [--call-true TOK] [--call-false TOK] [--drop-native-columns] [--delimiter C] [--uns-key-from-source K]... [--overwrite] [--on-missing-rows null|zero|error] [--on-extra-rows warn|error] [--dry-run]` — The doublet wrapper over `obs-import`, normalising each tool's spellings onto `<K>_score` / `<K>_predicted` / `<K>_status` (+ `uns["<K>"]`). `--tool scds` emits no call column, so no `<K>_predicted` unless `--call-column` opts in; `--tool generic` requires `--score-column`. Use `--drop-native-columns` when the source is an h5ad exported from the target file.
 
 ### Cloud operations (`--features cloud`)
 - `scx cloud-optimize <input> [--output <path>]`

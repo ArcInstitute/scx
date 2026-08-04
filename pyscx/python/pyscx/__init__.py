@@ -528,7 +528,11 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
         out_dir: Directory for the per-batch h5ad files; created if absent.
         batch_key: obs column to split on (e.g. "donor_id", "sample_id").
         key: The join key the tool's output will carry back. None resolves it
-            with `diagnose_obs_key`, the same way `obs_import` would.
+            with `diagnose_obs_key`, the same way `obs_import` would — which
+            prefers the obs index when it is unique, so the returned `key` is
+            usually `"obs_names"`. That is the name to pass straight back to
+            `obs_import(key=...)`; the physical `__index_level_0__` field is not
+            a column you can address.
         batches: Restrict to these batch values. None exports every batch.
         on_ambiguous_key: What to do with a batch whose key is not unique
             *within that batch* — "error" (default) refuses before writing
@@ -589,17 +593,12 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
         # explains nothing.
         if suggestion and "," in suggestion:
             suggestion = None
-        # Prefer the obs index whenever it is itself unique, even if the
-        # diagnosis suggests some other unique column. The index is what the
-        # tools hand back (`adata.obs_names` / `colnames(sce)`), so choosing it
-        # makes the tool's identity and the import's join key the same thing
-        # and removes the export/import asymmetry entirely. The suggestion only
-        # wins when the index genuinely cannot serve.
-        unique_cols = diag.get("unique_columns", ()) or ()
-        for index_spelling in ("__index_level_0__", "_index"):
-            if index_spelling in unique_cols:
-                suggestion = index_spelling
-                break
+        # The obs index no longer needs a preference hard-coded here:
+        # `diagnose_obs_key` ranks it first among usable keys, so the suggestion
+        # already is the index whenever the index is unique. That is the right
+        # place for the rule -- the index is what the tools hand back
+        # (`adata.obs_names` / `colnames(sce)`), so export and import agree on a
+        # key by construction instead of by two lists that could drift.
         key = suggestion or diag.get("resolved_key")
         if key is None:
             raise ValueError(
@@ -624,7 +623,12 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
         )
     if key in obs.columns:
         key_values = obs[key]
-    elif obs.index.name == key or key in ("index", "_index", "__index_level_0__"):
+    elif obs.index.name == key or key in (
+        "obs_names",
+        "index",
+        "_index",
+        "__index_level_0__",
+    ):
         key_values = obs.index.to_series()
     else:
         raise ValueError(
@@ -731,7 +735,19 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
     }
 
 
-def obs_import(path, table, *, key=None, **kwargs):
+def _coerce_key(key):
+    """Normalise a `key=` / `source_key=` argument to a list of str, or None.
+
+    A bare str is one component; any other iterable is a sequence of them. The
+    native layer takes `Option<Vec<String>>`, so None must stay None -- it is
+    what selects auto-resolution rather than an empty composite.
+    """
+    if key is None:
+        return None
+    return [key] if isinstance(key, str) else [str(k) for k in key]
+
+
+def obs_import(path, table, *, key=None, source_key=None, **kwargs):
     """Import a delimited annotation table (CSV/TSV) as `obs` columns, in place.
 
     The generic importer behind the doublet-caller workflow: run a tool
@@ -752,12 +768,21 @@ def obs_import(path, table, *, key=None, **kwargs):
         table: Source .csv / .tsv / .txt, or an .h5ad whose `/obs` holds the
             columns (str or os.PathLike). The h5ad route needs a build with
             HDF5 support; without it the error says to write a CSV instead.
-        key: Join key. None auto-resolves with the same preference order the
-            target side uses (pandas index, then `barcode`/`cell_id`/…). A str
-            names one column. A list of str builds a composite key — the right
-            answer for a multi-library merge where `sample_id` + `barcode` is
-            unique but neither is alone. Both sides are built by the same code,
-            so the fusing separator is internal and not configurable.
+        key: Target-side join key. None auto-resolves with the same preference
+            order the target side uses (obs index, then `barcode`/`cell_id`/…).
+            A str names one column; `"obs_names"` names the obs index. A list of
+            str builds a composite key — the right answer for a multi-library
+            merge where `sample_id` + `barcode` is unique but neither is alone.
+            The fusing separator is internal and not configurable.
+        source_key: Source-side column(s) for the same key, when the table
+            spells it differently. Pairs **positionally** with `key`, mirroring
+            pandas `left_on` / `right_on`, so the two must have equal length::
+
+                obs_import(t, "ml.csv", key=["sample_id", "obs_names"],
+                           source_key=["sample_id", "barcode"])
+
+            None means the source uses the `key` names, which is the common
+            case and keeps the two sides impossible to desync.
         columns: Import only these source columns. None imports every non-key
             column.
         rename: `{source_name: new_name}`, applied before `prefix`.
@@ -777,8 +802,11 @@ def obs_import(path, table, *, key=None, **kwargs):
             rebuilt from this table alone, so importing several per-batch tables
             one after another keeps only the last. Concatenate them and import
             once. Without this, a collision is an error.
-        on_missing_rows: "zero" (default) marks uncovered target rows absent;
-            "error" refuses.
+        on_missing_rows: "null" (default) leaves uncovered target rows NULL and
+            marks them absent; "error" refuses. "zero" is an accepted alias for
+            "null" — it names the shared policy enum, whose `zero` is literal
+            only on `cellbender_import`, where a missing *matrix* row really is
+            zeros.
         on_extra_rows: "warn" (default) skips source rows the target lacks;
             "error" refuses.
         dry_run: Run every validation and the join, then return the summary
@@ -797,10 +825,10 @@ def obs_import(path, table, *, key=None, **kwargs):
         print(r["n_matched"], "of", r["n_obs"], "cells matched")
         pyscx.obs_import("atlas.scx", "calls.csv", status_column="dbl_status")
     """
-    if key is not None:
-        key = [key] if isinstance(key, str) else [str(k) for k in key]
+    key = _coerce_key(key)
+    source_key = _coerce_key(source_key)
     return _obs_import_native(_coerce_path(path), _coerce_path(table, allow_experiment=False),
-                              key=key, **kwargs)
+                              key=key, source_key=source_key, **kwargs)
 
 
 def diagnose_obs_key(path, key=None):
@@ -811,15 +839,21 @@ def diagnose_obs_key(path, key=None):
     that is may be one no fallback list would guess (on a CELLxGENE-derived
     file it is `soma_joinid`, with the obs index 10x-duplicated).
 
+    Every name reported -- `resolved_key`, `unique_columns`, `suggestion` -- is
+    one `obs_import(key=...)` accepts, including `"obs_names"` for the obs index.
+    `unique_columns` is ordered best-candidate-first and holds only columns that
+    can actually serve as a key; a unique column the join would refuse (a float,
+    whose text form is not guaranteed to agree across two independently written
+    sides) is listed separately under `unusable_unique_columns`.
+
     Returns a dict with `resolved_key`, `resolved_cardinality`,
-    `unique_columns`, `unique_pairs`, `suggestion` and a printable `summary`.
+    `unique_columns`, `unusable_unique_columns`, `unique_pairs`, `suggestion`
+    and a printable `summary`.
     """
-    if key is not None:
-        key = [key] if isinstance(key, str) else [str(k) for k in key]
-    return _diagnose_obs_key_native(_coerce_path(path), key)
+    return _diagnose_obs_key_native(_coerce_path(path), _coerce_key(key))
 
 
-def doublet_import(path, table, *, tool, key=None, **kwargs):
+def doublet_import(path, table, *, tool, key=None, source_key=None, **kwargs):
     """Import a doublet caller's output, normalised to canonical obs columns.
 
     The doublet-specific wrapper over `obs_import`. Same in-place, key-joined,
@@ -829,9 +863,9 @@ def doublet_import(path, table, *, tool, key=None, **kwargs):
 
     Writes, for `key_added="<K>"` (default: the tool name):
 
-        obs["<K>_score"]      f32,  nullable   higher = more doublet-like
-        obs["<K>_predicted"]  bool, nullable   omitted when the tool has no call
-        obs["<K>_status"]     str              "present" / "absent"
+        obs["<K>_score"]      float32              higher = more doublet-like
+        obs["<K>_predicted"]  boolean (nullable)   omitted when the tool has no call
+        obs["<K>_status"]     object (str)         "present" / "absent"
         obs["<K>_<native>"]   ...              every other source column
         uns["<K>"]                             tool, source columns, join report
 
@@ -847,10 +881,14 @@ def doublet_import(path, table, *, tool, key=None, **kwargs):
             write a CSV instead.
         tool: One of `pyscx.doublet_tools()`: "scdblfinder", "scrublet",
             "doubletfinder", "doubletdetection", "solo", "scds", "generic".
-        key: Join key, exactly as for `obs_import`. None auto-resolves; a str
+        key: Target-side join key, exactly as for `obs_import`. None
+            auto-resolves; `"obs_names"` names the obs index; a str
             names one column; a list builds a composite — the right answer for a
             multi-library merge where `sample_id` + `barcode` is unique but
             neither is alone.
+        source_key: Source-side column(s) for the same key, exactly as for
+            `obs_import` — use it when the caller's output spells the key
+            differently from the target obs.
         key_added: Canonical prefix `<K>`. Defaults to `tool`, so two tools land
             side by side without colliding.
         score_column: Override the profile's score column. Required for
@@ -870,7 +908,8 @@ def doublet_import(path, table, *, tool, key=None, **kwargs):
             that is not there is an error.
         overwrite: **Replaces, never merges.** Re-importing per-batch tables one
             after another keeps only the last — concatenate them and import once.
-        on_missing_rows: "zero" (default) marks uncovered cells absent; "error"
+        on_missing_rows: "null" (default) leaves uncovered cells NULL and marks
+            them absent ("zero" is an accepted alias for the same policy); "error"
             refuses.
         on_extra_rows: "warn" (default) skips source rows the target lacks;
             "error" refuses.
@@ -895,11 +934,10 @@ def doublet_import(path, table, *, tool, key=None, **kwargs):
         print(r["n_matched"], "of", r["n_obs"], "cells matched")
         pyscx.doublet_import("atlas.scx", "calls.csv", tool="scdblfinder")
     """
-    if key is not None:
-        key = [key] if isinstance(key, str) else [str(k) for k in key]
     return _doublet_import_native(_coerce_path(path),
                                   _coerce_path(table, allow_experiment=False),
-                                  tool=tool, key=key, **kwargs)
+                                  tool=tool, key=_coerce_key(key),
+                                  source_key=_coerce_key(source_key), **kwargs)
 
 
 _DOUBLET_CONSENSUS_METHODS = ("majority", "any", "all", "mean_rank")
@@ -915,11 +953,13 @@ def _consensus_calls(obs, column):
     `sum(...) >= k` over a nullable column does — would silently turn "no
     information" into "every tool said singlet".
 
-    Accepts every dtype the round trip produces: object holding `True`/`False`/
-    `None` (what `doublet_import` writes), pandas nullable `boolean` (what a
-    previous `doublet_consensus` writes), plain `bool`, and a strict 0/1
-    numeric column — the same tokens `scx_convert::doublet::coerce_call`
-    accepts, so the two ends of the pipeline cannot drift on what a call is.
+    Accepts every dtype the round trip produces. `read_obs()` now returns pandas
+    nullable `boolean` for any arrow boolean, which is also what
+    `doublet_consensus` writes — but object holding `True`/`False`/`None`, plain
+    `bool` and a strict 0/1 numeric column stay accepted, because a file written
+    before that change, or a hand-built AnnData, still carries them. Those are
+    the same tokens `scx_convert::doublet::coerce_call` accepts, so the two ends
+    of the pipeline cannot drift on what a call is.
     """
     import numpy as _np
     import pandas as _pd

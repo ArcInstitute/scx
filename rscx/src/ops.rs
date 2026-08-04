@@ -543,11 +543,15 @@ fn scx_attach_obs_impl(
     };
 
     let missing = match on_missing_rows {
-        "zero" => MissingRowPolicy::ZeroFill,
+        // "null" is what actually happens here (Arrow nulls, so NA in R), and is
+        // the default. "zero" stays accepted: it names the shared
+        // `MissingRowPolicy` enum, whose `zero` is literal only on the layer /
+        // CellBender path, where a missing *matrix* row really is zeros.
+        "null" | "zero" => MissingRowPolicy::ZeroFill,
         "error" => MissingRowPolicy::Error,
         other => {
             return Err(Error::Other(format!(
-                "on_missing_rows must be \"zero\" or \"error\"; got \"{other}\""
+                "on_missing_rows must be \"null\", \"zero\" or \"error\"; got \"{other}\""
             )))
         }
     };

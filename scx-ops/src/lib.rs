@@ -37,8 +37,9 @@ pub use compact::{compact, compact_with_index_options, compact_with_options, Com
 pub use delete::mark_deleted;
 pub use error::{OpsError, Result};
 pub use external_layer::{
-    attach_external_layer, AttachLayerOptions, AttachLayerSummary, ColumnAxisMatch,
-    ColumnAxisPolicy, ExternalLayerData, ExtraRowPolicy, MissingRowPolicy, ShardRangeSource,
+    attach_external_layer, axis_index_alias, display_key_name, AttachLayerOptions,
+    AttachLayerSummary, ColumnAxisMatch, ColumnAxisPolicy, ExternalLayerData, ExtraRowPolicy,
+    MissingRowPolicy, ShardRangeSource,
 };
 pub use external_obs::{
     attach_external_obs, build_composite_key, diagnose_obs_key, obs_key_values,
