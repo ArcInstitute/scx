@@ -539,3 +539,79 @@ fn a_csc_rebuild_carrying_decode_target_does_override_the_codec() {
         "and it adopts the adaptive pick"
     );
 }
+
+/// The *other* way a CSC rebuild can damage the file it is extending: passing
+/// `None`, which rewrites CSR + CSC unframed and strips row-group framing from
+/// the X that was just written.
+///
+/// `framing_for_csc_rebuild` exists because this rule has been got wrong in both
+/// directions — `subset`/`convert --csc` passed the rewrite framing (codec
+/// override, pinned above), and pyscx's `sort`/`shuffle`/`from_anndata` passed
+/// `None` (this downgrade). Asserting both halves keeps the helper from being
+/// "simplified" back into either mistake.
+#[test]
+fn framing_for_csc_rebuild_preserves_v4_and_re_selects_nothing() {
+    let d = tmp();
+    let framed = d.path().join("framed.scx");
+    write_input(&framed, true);
+    let (before, _) = x_codecs_and_bytes(&framed);
+
+    let chosen = scx_ops::framing_for_csc_rebuild(&framed)
+        .expect("a v4 target must keep framing, not fall back to None");
+    assert!(
+        chosen.decode_target.is_none() && !chosen.trial,
+        "it must not authorise codec re-selection"
+    );
+
+    let out = d.path().join("csc.scx");
+    scx_ops::build_csc::run_build_csc(&framed, &out, "4G", false, 5000, Some(chosen)).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(
+        reader.header().format_version,
+        CURRENT_FORMAT_VERSION,
+        "passing `None` here is what silently downgraded a framed file to v3"
+    );
+    let (after, _) = x_codecs_and_bytes(&out);
+    assert_eq!(before, after, "and the CSR codecs are untouched");
+
+    // An unframed input has nothing to preserve, so `None` is right there.
+    let unframed = d.path().join("v3.scx");
+    write_input(&unframed, false);
+    assert!(scx_ops::framing_for_csc_rebuild(&unframed).is_none());
+}
+
+/// The other half of merge's raw-copy gate: `compact` must turn the fast path
+/// OFF and actually re-encode.
+///
+/// Flagged twice in review as the missing twin. `raw_copy_csr_eligible` has unit
+/// coverage, but only the `auto`-keeps-raw-copy side was pinned end to end —
+/// so a change that disabled raw-copy for every profile, or enabled it for
+/// `compact`, would have gone unnoticed here. Note this passes
+/// `force_slow_path: false`: the point is that the *codec intent alone* decides,
+/// with nothing else forcing the re-encode.
+#[test]
+fn merge_compact_disables_raw_copy_and_re_encodes() {
+    let d = tmp();
+    let a = d.path().join("a.scx");
+    let b = d.path().join("b.scx");
+    write_input(&a, true);
+    write_input(&b, true);
+    let (before, _) = x_codecs_and_bytes(&a);
+    assert_eq!(
+        before[0],
+        CodecId::Zstd as u8,
+        "fixture must start at the heuristic pick"
+    );
+
+    let out = d.path().join("out.scx");
+    merge_with(&[a, b], &out, "compact", false);
+
+    // Raw-copy would have carried Zstd through untouched, as the `auto` twin
+    // asserts. `compact` adopts on ties, so every shard must have moved.
+    assert_all_x_codec(
+        &out,
+        CodecId::ShufDeltaZstd,
+        "merge --codec compact (must re-encode, not raw-copy)",
+    );
+}

@@ -42,10 +42,9 @@ pub fn validate_scx_file(path: &Path) -> CliResult<()> {
 /// while `write_shard_inner` ignored `decode_target`, a silent codec override
 /// once it honoured it.
 pub fn framing_for_file(path: &Path) -> Option<scx_format_io::FramingConfig> {
-    ScxReader::open(path)
-        .ok()
-        .filter(|r| r.header().format_version >= scx_format_io::CURRENT_FORMAT_VERSION)
-        .map(|_| scx_format_io::FramingConfig::default())
+    // Delegates so the CLI, pyscx and convert cannot drift apart on this rule
+    // again -- see `scx_ops::framing_for_csc_rebuild`.
+    scx_ops::framing_for_csc_rebuild(path)
 }
 
 /// Validate that every input file reports the same file-level `n_vars`,

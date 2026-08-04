@@ -12,6 +12,26 @@ use scx_format_io::FramingConfig;
 
 use crate::build_csc;
 
+/// Framing for a CSC-sidecar rebuild on `path`: keep the file's existing layout
+/// and re-select nothing.
+///
+/// A framed (v4) target keeps framing; an unframed (≤v3) one stays unframed.
+/// `decode_target` is deliberately `None`, because `run_build_csc` re-writes each
+/// CSR shard at the codec read off that shard's own header and
+/// `decode_target: Some(_)` would let the writer override it.
+///
+/// One implementation for every surface — CLI, pyscx and convert — because this
+/// rule has now been got wrong twice in two different directions: `subset` and
+/// `convert --csc` passed the rewrite framing (codec override), and pyscx's
+/// `sort`/`shuffle`/`from_anndata` passed `None` (framing downgrade). Returns
+/// `None` if `path` cannot be opened; the rebuild itself surfaces any real error.
+pub fn framing_for_csc_rebuild(path: &Path) -> Option<FramingConfig> {
+    scx_format_io::ScxReader::open(path)
+        .ok()
+        .filter(|r| r.header().format_version >= scx_format_io::CURRENT_FORMAT_VERSION)
+        .map(|_| FramingConfig::default())
+}
+
 /// Rebuild the CSC sidecar on `target` in place via temp-file + rename.
 ///
 /// `target` must exist and contain CSR shards. `csc_cols_per_shard`
@@ -19,9 +39,17 @@ use crate::build_csc;
 /// (5000 cols/shard, 4G memory budget).
 ///
 /// `framing`: forwarded to [`build_csc::run_build_csc`] — `Some` re-writes CSR +
-/// CSC framed (v4), `None` unframed (v3). Mutating-op callers that don't thread
-/// row-group framing pass `None`; the streaming-convert `--csc` rebuild passes
-/// `opts.framing()` so `--row-group-rows` is honored on the CSC sidecar too.
+/// CSC framed (v4), `None` unframed (v3).
+///
+/// **Derive it with [`framing_for_csc_rebuild`], not by hand.** Both ends of the
+/// range are wrong: `None` on a v4 target strips row-group framing from the X
+/// that was just written, and a framing carrying `decode_target: Some(_)`
+/// authorises the writer to *re-select* each CSR shard's codec (see
+/// `FramingConfig`'s contract) — the opposite of the preservation a sidecar
+/// rebuild needs. The streaming-convert `--csc` path is the one exception: it
+/// passes `ConvertOptions::framing_preserving_codec()` so a custom
+/// `--row-group-rows` is honoured on the sidecar too, with `decode_target`
+/// stripped for the same reason.
 pub fn rebuild_csc_inplace(
     target: &Path,
     csc_cols_per_shard: usize,
