@@ -946,16 +946,17 @@ pub fn sort(
 ///
 /// Two consequences worth knowing before a multi-hour rewrite:
 ///
-/// - **Size is not neutral, and the fix is to pin the *input's own* codec.**
-///   Two effects grow the output. The dominant one is that `codec="auto"`
-///   RE-SELECTS per shard on reordered data and can flip to a bulkier encoding
-///   (measured 1.86-2.09x on X); the smaller one is a genuine loss of cross-row
-///   redundancy (6-12% for `zstd`, under 1% for `lz4`/`shufdelta`). So pass
-///   `codec="zstd"` / `codec="shufdelta"` / whatever the input already uses.
-///   `codec="scx1"` is size-neutral only relative to an `scx1` input — on a
-///   `shufdelta`/`zstd` file it *is* what `auto` flips to, so it reproduces the
-///   ~2x rewrite rather than avoiding it. Reach for it when you want a
-///   permutation-invariant encoding or the GPU device-decode route.
+/// - **Size is not quite neutral, and `codec="auto"` is still the right
+///   choice.** A permutation genuinely loses some cross-row redundancy for
+///   codecs whose compression spans rows — 6-12% for `zstd`, under 1% for
+///   `lz4`/`shufdelta`. That is inherent to shuffling. `auto` runs the same
+///   adaptive per-shard selection `scx convert` does, so pinning a codec
+///   *chooses an encoding* rather than holding the file's size; reach for
+///   `codec="scx1"` when you want a permutation-invariant layout or the GPU
+///   device-decode route. (This used to say `auto` re-selects and grows X
+///   1.86-2.09x, and to pin the input's own codec. That growth was a bug in
+///   every derived-file op — `FramingConfig::default()` meant the `fast`
+///   profile — not a property of shuffling, and it is fixed.)
 /// - **Shard geometry is not preserved by default.** `shard_size=None` uses the
 ///   16,384-row default, so a file written with a different shard size is
 ///   re-sharded as well as reordered — and shard size is what quantises batch

@@ -34,6 +34,13 @@ pub fn validate_scx_file(path: &Path) -> CliResult<()> {
 /// to re-select it (see `FramingConfig`'s contract), silently defeating the
 /// preservation. Do not "make this consistent" with the derived-file ops.
 /// Pinned by `scx-ops/tests/codec_adaptive.rs::build_csc_preserves_per_shard_codec`.
+///
+/// **Every `rebuild_csc_inplace` caller must get its framing from here** (or, in
+/// `scx-convert`, from `ConvertOptions::framing_preserving_codec`) — never from
+/// the framing used for the surrounding rewrite. `subset` and `convert --csc`
+/// both passed the rewrite framing until this was caught in review: harmless
+/// while `write_shard_inner` ignored `decode_target`, a silent codec override
+/// once it honoured it.
 pub fn framing_for_file(path: &Path) -> Option<scx_format_io::FramingConfig> {
     ScxReader::open(path)
         .ok()

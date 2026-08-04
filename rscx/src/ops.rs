@@ -484,7 +484,8 @@ fn scx_validate_impl(path: &str) -> Result<bool> {
 /// @param status_column Obs column recording "present"/"absent" per row.
 /// @param uns_key `uns` key for the run metadata.
 /// @param overwrite Replace colliding columns. REPLACES, never merges.
-/// @param on_missing_rows `"zero"` or `"error"`.
+/// @param on_missing_rows `"null"` (default), `"zero"` (an accepted alias for
+///   the same policy) or `"error"`.
 /// @param on_extra_rows `"warn"` or `"error"`.
 /// @param dry_run Validate and join without writing.
 /// @return Named list summarising the join.
@@ -685,7 +686,9 @@ fn scx_attach_obs_impl(
         n_matched = s.n_matched as f64,
         n_target_rows_absent = s.n_target_rows_absent as f64,
         n_source_rows_absent = s.n_source_rows_absent as f64,
-        obs_key_column = s.obs_key_column,
+        // Display spelling, matching pyscx and the CLI: the physical
+        // `__index_level_0__` is not a column an R user can address either.
+        obs_key_column = scx_ops::display_key_name("obs", &s.obs_key_column),
         obs_columns_added = s.obs_columns_added,
         obsm_keys_added = s.obsm_keys_added,
         obs_index_dropped = s.obs_index_dropped,

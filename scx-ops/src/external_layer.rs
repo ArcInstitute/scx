@@ -120,6 +120,7 @@ const INDEX_FIELD_NAMES: &[&str] = &["__index_level_0__", "_index"];
 /// Those two halves must ship together. Printing a name the resolver rejects
 /// is the same dead end as suggesting a float key: the tooling names a key it
 /// then refuses.
+///
 /// `axis` is the same two-valued string [`resolve_key_column`] takes — `"obs"`
 /// or `"var"`. Asserted rather than left to an `else` branch because
 /// [`candidate_key_columns`] defaults the *other* way, so a third spelling
@@ -183,7 +184,7 @@ fn index_field_for_alias(axis: &str, schema: &Schema, requested: &str) -> Option
 /// field bears the requested name. Returns the input unchanged when neither
 /// resolves, so the caller's own not-found error still quotes what the user
 /// typed rather than a rewritten form of it.
-pub(crate) fn resolve_key_alias(axis: &str, schema: &Schema, requested: &str) -> String {
+pub fn resolve_key_alias(axis: &str, schema: &Schema, requested: &str) -> String {
     if schema.field_with_name(requested).is_ok() {
         return requested.to_string();
     }

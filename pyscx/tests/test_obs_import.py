@@ -557,3 +557,45 @@ def test_on_missing_rows_defaults_to_null(tmp_path):
     assert r["n_matched"] == 1
     obs = pyscx.open(str(scx)).read_obs()
     assert pd.isna(obs["score"].iloc[1]), "'zero' still means null, not 0.0"
+
+
+def test_source_key_arity_is_checked_in_both_directions(tmp_path):
+    """A longer `source_key` must error, not silently drop the extras.
+
+    Raised in review as a possible truncation-by-zip hazard. The arity check
+    already covers it — `source.len() != target.len()` is direction-agnostic —
+    but only the shorter case was pinned, so the guard could have been narrowed
+    later without a test noticing.
+    """
+    scx = _merged_atlas(tmp_path)
+    csv = _write(tmp_path, "ml.csv",
+                 "sample_id,barcode,score\ns1,AAAC-1,0.1\n")
+    # source longer than key
+    with pytest.raises(ValueError, match="pair up positionally"):
+        pyscx.obs_import(str(scx), str(csv), key="sample_id",
+                         source_key=["sample_id", "barcode"])
+    # source shorter than key
+    with pytest.raises(ValueError, match="pair up positionally"):
+        pyscx.obs_import(str(scx), str(csv),
+                         key=["sample_id", "obs_names"], source_key=["barcode"])
+
+
+def test_obs_names_resolves_on_the_source_side_too(tmp_path):
+    """`obs_names` must work as a *source* key, not just a target key.
+
+    The docs say every name the diagnosis reports is paste-able into `key=`.
+    That was only true target-side: the table readers did a literal schema
+    lookup, so a tool table whose key is its own unnamed index — written by a
+    plain `DataFrame.to_csv()`, which the reader renames to `_index` — could not
+    be named without a `source_key=`.
+    """
+    scx = _fixture(tmp_path)
+    # No `barcode` header: the index column is unnamed, exactly what
+    # `df.to_csv()` produces for an index-keyed tool output.
+    csv = _write(tmp_path, "calls.csv", ",score\nAAAT-1,0.30\nAAAC-1,0.10\n")
+
+    r = pyscx.obs_import(str(scx), str(csv), key="obs_names")
+    assert r["n_matched"] == 2
+    obs = pyscx.open(str(scx)).read_obs()
+    assert obs["score"].iloc[0] == pytest.approx(0.10)
+    assert obs["score"].iloc[2] == pytest.approx(0.30)

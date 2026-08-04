@@ -192,9 +192,14 @@ pub fn run_subset(
 
     println!("Wrote {}", output.display());
 
-    // Re-emit the CSC sidecar against the projected output, preserving framing.
+    // Re-emit the CSC sidecar against the projected output. NOT the rewrite
+    // `framing` above: under `--codec auto` that carries `decode_target:
+    // Some(_)`, which authorises the writer to re-select each shard's codec and
+    // so defeats the preservation a CSC rebuild depends on. `framing_for_file`
+    // is the one correct source here — see its contract.
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing)?;
+        let csc_framing = crate::cli_utils::framing_for_file(output);
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, csc_framing)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 
@@ -654,7 +659,10 @@ fn extract_modality(
     }
 
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing)?;
+        // See the note on the sibling site above: the rewrite framing would
+        // re-authorise codec selection on the sidecar.
+        let csc_framing = crate::cli_utils::framing_for_file(output);
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, csc_framing)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
     Ok(())

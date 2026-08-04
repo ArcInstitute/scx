@@ -1212,7 +1212,8 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   accepts a str, `os.PathLike`, or an open `Experiment`; `key` accepts a str
   (one column), `"obs_names"` (the obs index), or a list (length > 1 builds a
   composite key — the right answer for a multi-library merge where `sample_id` +
-  `barcode` is unique but neither is alone). `source_key` names the **source**
+  `barcode` is unique but neither is alone). `"obs_names"` resolves on **both** sides, so a table keyed on its own unnamed
+  index needs no `source_key`. `source_key` names the **source**
   side's column for each `key` component when the table spells the key
   differently, pairing positionally like pandas `left_on` / `right_on`:
   `key=["sample_id", "obs_names"], source_key=["sample_id", "barcode"]`. Omitted,

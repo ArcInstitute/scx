@@ -738,13 +738,21 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
 def _coerce_key(key):
     """Normalise a `key=` / `source_key=` argument to a list of str, or None.
 
-    A bare str is one component; any other iterable is a sequence of them. The
-    native layer takes `Option<Vec<String>>`, so None must stay None -- it is
-    what selects auto-resolution rather than an empty composite.
+    A bare str is one component; any other iterable is a sequence of them. A
+    non-str scalar (e.g. an int column label) is also one component -- iterating
+    it would raise "'int' object is not iterable", which says nothing about the
+    argument that was wrong. The native layer takes `Option<Vec<String>>`, so
+    None must stay None: it is what selects auto-resolution rather than an empty
+    composite.
     """
     if key is None:
         return None
-    return [key] if isinstance(key, str) else [str(k) for k in key]
+    if isinstance(key, str):
+        return [key]
+    try:
+        return [str(k) for k in key]
+    except TypeError:
+        return [str(key)]
 
 
 def obs_import(path, table, *, key=None, source_key=None, **kwargs):
@@ -1015,6 +1023,11 @@ def _consensus_scores(obs, column):
     return numeric.to_numpy(dtype="float64", na_value=_np.nan)
 
 
+# Suffix of the column `doublet_consensus` writes for every method, used as the
+# primary signal that a key is a consensus output rather than a caller (see
+# `_consensus_output_columns`). Assumes nothing else writes it: a hand-built obs
+# column named `<K>_n_tools_voting` would exclude `<K>` from `keys=None`
+# discovery. Naming the key explicitly still works, and warns.
 _CONSENSUS_VOTING_MARKER = "_n_tools_voting"
 
 

@@ -490,3 +490,52 @@ fn build_csc_preserves_per_shard_csr_codec() {
         "build_csc must preserve each CSR shard's codec byte-for-byte"
     );
 }
+
+/// The hazard `framing_for_file()` exists to prevent — pinned so the
+/// preservation test above is not vacuous.
+///
+/// If a caller hands the *rewrite* framing to a CSC rebuild, the writer
+/// re-selects each shard's codec instead of honouring the source header. Both
+/// `scx subset --rebuild-csc` and `scx convert --csc` did exactly that until it
+/// was caught in review: harmless while `write_shard_inner` ignored
+/// `decode_target`, a silent override once it honoured it. This test asserts the
+/// override is real, so "preserve" and "re-select" cannot quietly become the
+/// same thing.
+#[test]
+fn a_csc_rebuild_carrying_decode_target_does_override_the_codec() {
+    let d = tmp();
+    let inp = d.path().join("in.scx");
+    write_input(&inp, true);
+    let (before, _) = x_codecs_and_bytes(&inp);
+    assert_eq!(
+        before[0],
+        CodecId::Zstd as u8,
+        "fixture must start at the heuristic pick, else this proves nothing"
+    );
+
+    // What the buggy sites passed: the rewrite framing under `--codec auto`.
+    let rewrite_framing = scx_ops::framing_for_rewrite(ResolvedCodec::AUTO, true, "the input")
+        .unwrap()
+        .expect("framed output");
+    assert!(
+        rewrite_framing.decode_target.is_some(),
+        "the whole point of this fixture is that the rewrite framing carries it"
+    );
+
+    let out = d.path().join("csc_overridden.scx");
+    scx_ops::build_csc::run_build_csc(&inp, &out, "4G", false, 5000, Some(rewrite_framing))
+        .unwrap();
+
+    let (after, _) = x_codecs_and_bytes(&out);
+    assert_ne!(
+        before, after,
+        "a CSC rebuild given `decode_target: Some(_)` re-selects the CSR codec — \
+         which is why every `rebuild_csc_inplace` caller must route through \
+         `framing_for_file()` / `framing_preserving_codec()` instead"
+    );
+    assert_eq!(
+        after[0],
+        CodecId::ShufDeltaZstd as u8,
+        "and it adopts the adaptive pick"
+    );
+}

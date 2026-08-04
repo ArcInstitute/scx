@@ -519,8 +519,16 @@ pyscx.obs_import("atlas.scx", "calls.csv",
                  source_key=["sample_id", "barcode"])
 ```
 
-`obs_names` is how you name the obs index anywhere a key is accepted, and it is
-the spelling `diagnose_obs_key` reports — the underlying pyarrow field is called
+`obs_names` is how you name the obs index anywhere a key is accepted — on the
+target *and* on the source, so a tool table whose key is its own unnamed index
+(what a plain `df.to_csv()` writes) needs no `source_key=`:
+
+```python
+pyscx.obs_import("atlas.scx", "scrublet.csv", key="obs_names")
+```
+
+It is also the spelling `diagnose_obs_key` reports, so whatever it suggests can
+be pasted straight back. The underlying pyarrow field is called
 `__index_level_0__`, but `read_obs()` hands it back as the frame's *unnamed*
 index, so that name is not something you can address.
 

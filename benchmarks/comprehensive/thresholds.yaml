@@ -2445,3 +2445,13 @@ absolute_floors:
 #    coverage. `scx-ops/tests/bench_ops.rs::compact_after_3_appends` already
 #    emits `compact_vs_fresh`, but on a 20K-cell fixture too small to floor.
 #    Recorded rather than left silent, per the no-silent-caps rule above.
+#
+#    Tracking, so this note is not the only record: the remaining ~1.30x on a
+#    mixed-width file comes from `scx_ops::helpers::widest_value_encoding`
+#    widening `mixed (uint16, uint32)` to a uniform `uint32` on any rewrite —
+#    measured on census_500k and tabulated in `docs/sharding.md` § Output size
+#    ("A rewrite still costs ~1.3x on a mixed-width file, for a different
+#    reason"). It is a separate axis from the codec bug above: `sort --by` on an
+#    ALREADY-sorted key costs the same 1.301x, so it is not reordering. Closing
+#    it means preserving each shard's value encoding through
+#    compact/merge/sort/subset, which is why it is not folded into the codec fix.

@@ -60,6 +60,23 @@ pub fn framing_for_rewrite(
             DEFAULT_ROW_GROUP_ROWS,
         )));
     }
+    // `auto` on an unframed output *can* proceed, but it cannot adapt: the adopt
+    // comparison needs row groups. Say so once per op rather than quietly
+    // delivering `fast` under the name `auto` — silent codec degradation is the
+    // bug class this module exists to remove, and it is the same reason the
+    // doublet importer warns instead of shrugging when a declared call column is
+    // missing. Reaching here means a profile, since an explicit force carries no
+    // `decode_target` and `compact` already errored above.
+    if codec.decode_target.is_some() && !output_framed {
+        log::warn!(
+            "--codec {} cannot select per shard because {what} is unframed \
+             (format_version < {}), so the single-encode heuristic is used instead — \
+             an already-compact input may come back larger. `scx optimize` frames a \
+             file if you want the adaptive path.",
+            codec.profile,
+            scx_format_io::CURRENT_FORMAT_VERSION,
+        );
+    }
     Ok(output_framed.then_some(FramingConfig {
         row_group_rows: DEFAULT_ROW_GROUP_ROWS,
         target_nnz: None,
