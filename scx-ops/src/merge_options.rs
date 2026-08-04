@@ -5,6 +5,7 @@
 //! conflict handling, and shard-target overrides.
 
 use scx_engine::ConversionPredicateIndexOptions;
+use scx_format_io::ResolvedCodec;
 
 /// Top-level merge configuration. Default skips predicate-index
 /// construction, validates var and obs identity strictly, and keeps
@@ -46,6 +47,15 @@ pub struct MergeOptions {
     /// surface upstream.
     pub assume_identical_obs: bool,
 
+    /// Codec intent for shards merge re-encodes. Defaults to `auto` (the
+    /// adaptive profile, matching `scx convert`). Note the raw-copy fast path
+    /// preserves a source shard's codec byte-for-byte under `auto`/`fast`, so
+    /// this only takes effect on the decode-encode path (an eligibility miss,
+    /// `assume_identical_var`, or `--sort-by`) and on layers, which are always
+    /// re-encoded. Before this field existed merge hardcoded the `select_codec`
+    /// heuristic on those paths, i.e. it silently ran `fast`.
+    pub codec: ResolvedCodec,
+
     /// Policy for combining `uns` (unstructured metadata) across
     /// inputs. Default [`UnsPolicy::First`] = today's behaviour.
     /// `uns` is free-form (preprocessing parameters, model metadata,
@@ -83,6 +93,7 @@ impl Default for MergeOptions {
             },
             assume_identical_var: false,
             assume_identical_obs: false,
+            codec: ResolvedCodec::AUTO,
             uns_policy: UnsPolicy::default(),
             shard_target_rows: None,
             sort_by: Vec::new(),
@@ -101,6 +112,7 @@ impl MergeOptions {
             index_options,
             assume_identical_var: false,
             assume_identical_obs: false,
+            codec: ResolvedCodec::AUTO,
             uns_policy: UnsPolicy::First,
             shard_target_rows: None,
             sort_by: Vec::new(),

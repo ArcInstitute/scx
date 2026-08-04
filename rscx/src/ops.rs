@@ -377,6 +377,11 @@ fn scx_merge_impl(
         index_options: index_options(index_obs, index_var, index_preset, index_auto_threshold),
         assume_identical_var,
         assume_identical_obs,
+        // `scx_format_io::ResolvedCodec::AUTO` — the adaptive default, spelled
+        // via `Default` so this file needs no new import. rscx's `scx_merge()`
+        // exposes no `codec` argument yet; add one alongside the R docs when it
+        // does, mirroring `pyscx.merge(codec=...)`.
+        codec: Default::default(),
         uns_policy: uns,
         shard_target_rows: None,
         sort_by: sort_by.iter().map(|s| s.to_string()).collect(),

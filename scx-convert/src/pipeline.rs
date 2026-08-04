@@ -1926,9 +1926,20 @@ fn convert_then_sort_grouped(
         // exposed only on `scx sort` / `pyscx.shuffle`.
         shuffle: None,
         shard_target_rows: opts.shard_target_rows,
-        codec: match opts.codec {
-            Some(c) => scx_codec::CodecSelection::Explicit(c),
-            None => scx_codec::CodecSelection::Auto,
+        // Carry this convert's own codec intent into the grouping sort, so
+        // `scx convert --group-by --codec auto` gets the same adaptive
+        // per-shard selection as the ungrouped path. Reconstructed from the
+        // fields `resolve_codec` populated on `ConvertOptions` rather than
+        // collapsed to Auto-or-explicit, which is what dropped `decode_target`
+        // and left the grouped path on the `fast` heuristic.
+        codec: scx_format_io::ResolvedCodec {
+            explicit_codec: opts.codec,
+            codec_trial: opts.codec_trial,
+            decode_target: opts.decode_target,
+            // Framing was already validated for this convert; the sort inherits
+            // the output's framing rather than deciding it.
+            requires_framing: false,
+            profile: "auto",
         },
         index_options: ConversionPredicateIndexOptions {
             index_obs: opts.index_obs.clone(),

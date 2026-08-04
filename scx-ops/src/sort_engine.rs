@@ -81,9 +81,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use rayon::prelude::*;
-use scx_codec::{CodecId, CodecSelection, ValueEncoding};
-use scx_format_io::codec_select::select_codec;
-use scx_format_io::encoder::FramingConfig;
+use scx_codec::{CodecId, ValueEncoding};
+use scx_format_io::ResolvedCodec;
+
+use crate::codec_intent::{framing_for_rewrite, seed_codec};
 use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
@@ -212,42 +213,35 @@ pub fn sort_with_strategy(
 
         // Warn *before* the rewrite, not after: on an atlas-scale file the user
         // would otherwise learn about the size growth hours later. Only when the
-        // output codec is `Auto` — an explicit `--codec` is the user having
+        // output codec is `auto` — an explicit `--codec` is the user having
         // already made this call.
         //
-        // The remediation this names matters, and an earlier draft got it
-        // exactly backwards. It said "pass --codec scx1 for a size-neutral
-        // shuffle", which is true only relative to an *scx1 input*. On the
-        // measured fixtures the auto-mode growth IS the adaptive codec flipping
-        // `shufdelta -> scx1`, so telling a shufdelta user to pin `scx1`
-        // reproduces the very blowup being warned about (tabula: 197.9 MB ->
-        // 413.3 MB either way). The size-preserving advice is to pin the
-        // *input's own* codec, so name it.
-        if opts.codec == CodecSelection::Auto {
+        // NARROWED: this warning used to lead with "`auto` RE-SELECTS per shard
+        // and can flip to a bulkier codec — measured 1.86-2.09x, and it is the
+        // dominant term", and told the user to pin the input's own codec. That
+        // WAS the derived-file codec bug (`FramingConfig::default()` meant
+        // `fast`, so `auto` never adopted ShufDeltaZstd on the rewrite). Now that
+        // `auto` is genuinely adaptive here, the flip is gone and pinning the
+        // input codec is the wrong advice. What survives is the real, much
+        // smaller effect: a permutation costs cross-row redundancy for codecs
+        // whose compression spans rows — measured 6-12% for zstd, under 1% for
+        // lz4/shufdelta — so only warn when the dominant input codec is one of
+        // those, and do not recommend pinning anything.
+        if opts.codec.decode_target.is_some() && opts.codec.explicit_codec.is_none() {
             let (cross_row, total, dominant) = cross_row_coded_shard_counts(&reader)?;
-            if total > 0 && cross_row * 2 > total {
+            let dominant_is_cross_row_sensitive =
+                matches!(dominant, Some(CodecId::Zstd) | Some(CodecId::Pcodec));
+            if total > 0 && cross_row * 2 > total && dominant_is_cross_row_sensitive {
                 // This reaches Python too — pyscx installs `pyo3_log`, so a
-                // `pyscx.shuffle` caller sees this exact string. Name both
-                // spellings rather than sending them to a CLI flag they are
-                // not using.
-                let pin = dominant
-                    .map(|c| {
-                        let n = codec_cli_name(c);
-                        format!("`--codec {n}` (Python: `codec=\"{n}\"`)")
-                    })
-                    .unwrap_or_else(|| "`--codec <the input's codec>`".to_string());
+                // `pyscx.shuffle` caller sees this exact string.
+                let name = dominant.map(codec_cli_name).unwrap_or("zstd");
                 log::warn!(
-                    "scx sort --shuffle: {cross_row}/{total} X shards use a codec whose \
-                     compression spans rows, and the output codec is `auto`. Two distinct \
-                     effects will grow the output, in this order of magnitude: (1) `auto` \
-                     RE-SELECTS per shard on the reordered data and can flip to a bulkier \
-                     codec — measured 1.86-2.09x on X, and it is the dominant term; (2) the \
-                     permutation genuinely costs some cross-row redundancy — measured 6-12% \
-                     for zstd, under 1% for lz4/shufdelta. To keep the input's size, pin the \
-                     input's own codec: {pin}. Pin `scx1` only if you want a \
-                     permutation-invariant encoding or the GPU device-decode route — on a \
-                     shufdelta/zstd input that is itself the ~2x rewrite described above. \
-                     See docs/sharding.md and docs/performance.md."
+                    "scx sort --shuffle: {cross_row}/{total} X shards are `{name}`-coded, whose \
+                     compression spans rows, so a random permutation genuinely costs some \
+                     cross-row redundancy — measured 6-12% for zstd, under 1% for \
+                     lz4/shufdelta. This is inherent to shuffling, not a codec regression: \
+                     the output codec is `auto`, which re-runs the same adaptive selection \
+                     `scx convert` uses. See docs/sharding.md."
                 );
             }
         }
@@ -628,9 +622,7 @@ pub fn sort_with_strategy(
     };
     let mut writer = ScxWriter::new(output, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
-    if output_framed {
-        writer.set_framing(Some(FramingConfig::default()));
-    }
+    writer.set_framing(framing_for_rewrite(opts.codec, output_framed, "the input")?);
 
     // ----- obs (sorted, re-sharded) + var -----
     // In-memory: slice the materialized sorted obs. Spill: scatter input obs
@@ -1105,9 +1097,7 @@ fn sort_multimodal(
     };
     let mut writer = ScxWriter::new(output, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
-    if output_framed {
-        writer.set_framing(Some(FramingConfig::default()));
-    }
+    writer.set_framing(framing_for_rewrite(opts.codec, output_framed, "the input")?);
 
     write_obs_sharded(&mut writer, sorted_obs, opts.shard_target_rows)?;
 
@@ -1392,7 +1382,7 @@ struct CsrEmitter {
     target: EmitTarget,
     modality_id: Option<u8>,
     shard_target: u64,
-    codec: CodecSelection,
+    codec: ResolvedCodec,
     value_encoding: ValueEncoding,
     n_vars: u32,
     bitmap: BitmapPolicy,
@@ -1423,7 +1413,7 @@ impl CsrEmitter {
         target: EmitTarget,
         modality_id: Option<u8>,
         shard_target: u32,
-        codec: CodecSelection,
+        codec: ResolvedCodec,
         value_encoding: ValueEncoding,
         n_vars: u32,
         bitmap: BitmapPolicy,
@@ -1505,7 +1495,7 @@ impl CsrEmitter {
         if self.acc_row_count == 0 {
             return Ok(());
         }
-        let codec = resolve_codec(self.codec, &self.acc_values, self.value_encoding);
+        let codec = seed_codec(self.codec, &self.acc_values, self.value_encoding);
         let row_start = self.emitted_rows;
         let n_rows = self.acc_row_count;
         let nnz = self.acc_indices.len();
@@ -1578,13 +1568,6 @@ impl CsrEmitter {
 
     fn finish(&mut self, writer: &mut ScxWriter) -> Result<()> {
         self.flush(writer)
-    }
-}
-
-fn resolve_codec(sel: CodecSelection, values: &[u8], enc: ValueEncoding) -> CodecId {
-    match sel {
-        CodecSelection::Auto => select_codec(values, enc),
-        CodecSelection::Explicit(c) => c,
     }
 }
 
@@ -1709,7 +1692,7 @@ fn emit_x_in_memory_grouped_fast(
     plan: &crate::group_plan::GroupPlan,
     value_encoding: ValueEncoding,
     n_vars_u32: u32,
-    codec: CodecSelection,
+    codec: ResolvedCodec,
     bitmap: BitmapPolicy,
     block_byte_cap: u64,
     memory_budget: Option<u64>,
@@ -1769,10 +1752,7 @@ fn emit_x_in_memory_grouped_fast(
     //    block cap) on top of the resident source CSR, independent of block count.
     //    Output is byte-identical to the serial `CsrEmitter`: same blocks, same
     //    order, same `X_shard_{global_idx}` naming.
-    let explicit_codec = match codec {
-        CodecSelection::Auto => None,
-        CodecSelection::Explicit(c) => Some(c),
-    };
+    let explicit_codec = codec.explicit_codec;
     // CSR index dtype from the minor (var) axis bound, matching `write_shard_inner`.
     let index_dtype: u8 = if (n_vars_u32 as u64).saturating_sub(1) <= u16::MAX as u64 {
         0

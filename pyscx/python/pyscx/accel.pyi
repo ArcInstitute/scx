@@ -72,9 +72,14 @@ def rank_genes_groups_df(
     (``names, scores, logfoldchanges, pvals, pvals_adj``; a leading ``group``
     column when ``group`` is a list). ``pval_cutoff``/``log2fc_min``/
     ``log2fc_max`` are scanpy-style row filters for the extraction path.
-    ``n_genes`` is a pyscx extension (scanpy's extractor has none): top-N before
-    the filters. ``device`` is ignored in extract mode. To extract all groups,
-    pass ``group=list(adata.uns[key]["names"].dtype.names)``.
+    ``n_genes`` is a pyscx extension (scanpy's extractor has none): top-N per
+    group, before the filters. ``device`` is ignored in extract mode.
+
+    ``group=None`` (or omitting it) with no ``groupby=`` extracts **every** group
+    in ``adata.uns[key]``, with a leading ``group`` column — matching
+    ``sc.get.rank_genes_groups_df``'s "All groups are returned if group is
+    None". Note both modes return a **polars** DataFrame by default; pass
+    ``output="pandas"`` for scanpy-shaped ergonomics (``.map``, ``df[col] = …``).
     """
     ...
 

@@ -38,12 +38,13 @@ use arrow::array::{Array, ArrayRef, Float64Array, RecordBatch, StringArray};
 use arrow::compute::SortOptions as ArrowSortOptions;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::row::{Row, RowConverter, Rows, SortField};
-use scx_codec::CodecSelection;
 use scx_engine::{
     build_and_write_conversion_predicate_indexes_streaming, ConversionPredicateIndexOptions,
     ConversionPredicateIndexResult,
 };
-use scx_format_io::{BitmapPolicy, ProvenanceEntry, ScxWriter, DEFAULT_SHARD_TARGET_ROWS};
+use scx_format_io::{
+    BitmapPolicy, ProvenanceEntry, ResolvedCodec, ScxWriter, DEFAULT_SHARD_TARGET_ROWS,
+};
 
 use crate::error::{OpsError, Result};
 
@@ -75,9 +76,13 @@ pub struct SortOptions {
     pub shuffle: Option<u64>,
     /// Output shard target rows.
     pub shard_target_rows: u32,
-    /// Output codec selection (`Auto` defers per-shard selection to the
-    /// writer; `Explicit(c)` forces codec `c`).
-    pub codec: CodecSelection,
+    /// Output codec intent. `auto` (the default) defers per-shard selection to
+    /// the writer's adaptive dual-encode, matching `scx convert`; `fast` pins the
+    /// single-encode heuristic; an explicit codec forces that codec. Before this
+    /// was a `ResolvedCodec` it could only say Auto-or-explicit, and "Auto" was
+    /// wired to the `fast` heuristic — so a sort of a `shufdelta` file flipped
+    /// every integer shard and roughly doubled X.
+    pub codec: ResolvedCodec,
     /// Predicate-index rebuild options for the output. The sort key is
     /// auto-added to `index_obs` by [`rebuild_obs_predicate_index_streaming`].
     pub index_options: ConversionPredicateIndexOptions,
@@ -138,7 +143,7 @@ impl Default for SortOptions {
             reverse: false,
             shuffle: None,
             shard_target_rows: DEFAULT_SHARD_TARGET_ROWS,
-            codec: CodecSelection::Auto,
+            codec: ResolvedCodec::AUTO,
             index_options: ConversionPredicateIndexOptions::default(),
             memory_budget: None,
             temp_dir: None,

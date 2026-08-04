@@ -975,24 +975,125 @@ def _consensus_scores(obs, column):
     return numeric.to_numpy(dtype="float64", na_value=_np.nan)
 
 
-def _resolve_consensus_keys(obs, keys, method, key_added):
-    """Resolve and validate the `keys` list against what is actually on obs."""
+_CONSENSUS_VOTING_MARKER = "_n_tools_voting"
+
+
+def _consensus_output_columns(obs, uns):
+    """obs columns a *previous* `doublet_consensus` wrote.
+
+    A consensus writes `<K>_predicted` (and `<K>_score` for `mean_rank`), which
+    are exactly the columns discovery scans for — so without this, `keys=None`
+    counts an earlier consensus as an extra voting "tool". That silently
+    double-weights whichever callers fed it: with three callers where two agree,
+    a stale 2-tool consensus voting as a 4th tool turned 10 of 50 cells from
+    doublet to singlet, and reported `n_tools_voting = 4` for a 3-tool run.
+
+    Two independent signals, union'd:
+
+    * **`<K>_n_tools_voting`** — written *only* by `doublet_consensus`, for every
+      method, and never by any `DoubletProfile`. This is the load-bearing one: it
+      needs no `uns`, so it still works when another op dropped or rewrote uns,
+      on a hand-built AnnData, and on files already polluted by the bug (no
+      migration needed). It also covers both suffixes at once, catching a prior
+      `mean_rank` consensus's `<K>_score` that a `_predicted`-only check misses.
+    * **`columns_added` from each `uns["<X>_consensus"]` record** —
+      authoritative when present, and stated in the same vocabulary discovery
+      uses (obs column names) rather than inferred from key-name arithmetic.
+      Matched on a positive consensus signature, so a tool legitimately imported
+      under `key_added="foo_consensus"` is not mistaken for one. A partial or
+      pre-fix record that fails that match is covered by the marker signal
+      above — which is the reason this one need not guess.
+    """
+    derived = set()
+
+    if isinstance(uns, dict):
+        for name, rec in uns.items():
+            if not (isinstance(name, str) and name.endswith("_consensus")):
+                continue
+            if not isinstance(rec, dict):
+                continue
+            k = name[: -len("_consensus")]
+            # Match on a POSITIVE consensus signature, not just the key name. A
+            # *tool* imported as `key_added="foo_consensus"` also lands at
+            # `uns["foo_consensus"]` (doublet_import writes `uns["<K>"]`), and
+            # treating that as a consensus would wrongly exclude the real tool
+            # `foo` from discovery. A consensus record always carries `method`,
+            # `key_added` and a non-empty `columns_added`; an import record
+            # carries `tool` / `source_call_column` and none of those.
+            cols = rec.get("columns_added")
+            if not (
+                rec.get("key_added") == k
+                and isinstance(rec.get("method"), str)
+                and isinstance(cols, (list, tuple))
+                and cols
+            ):
+                continue
+            derived.update(str(c) for c in cols)
+
+    m = _CONSENSUS_VOTING_MARKER
+    for c in obs.columns:
+        if isinstance(c, str) and c.endswith(m) and len(c) > len(m):
+            k = c[: -len(m)]
+            derived.update({f"{k}_predicted", f"{k}_score"})
+    return derived
+
+
+def _resolve_consensus_keys(obs, uns, keys, method, key_added):
+    """Resolve and validate the `keys` list against what is actually on obs.
+
+    Returns `(keys, excluded, are_consensus)`: the resolved caller keys, the
+    consensus keys discovery skipped (empty on the explicit-`keys` path), and
+    the subset of `keys` that are themselves consensus outputs (empty on the
+    discovery path, since those are excluded there).
+    """
+    import warnings as _warnings
+
     suffix = "_score" if method == "mean_rank" else "_predicted"
-    available = sorted(
+    all_suffixed = sorted(
         c[: -len(suffix)] for c in obs.columns
         if c.endswith(suffix) and len(c) > len(suffix)
     )
-    available = [k for k in available if k != key_added]
+    derived = _consensus_output_columns(obs, uns)
+    # Two complementary guards. The `!= key_added` scalar check covers the FIRST
+    # run under a given `key_added` (no `<key_added>_consensus` record and no
+    # `<key_added>_n_tools_voting` column exist yet, so neither signal fires);
+    # `derived` covers every *other* consensus already on the file. Dropping
+    # either one reopens the bug for one of those two cases.
+    excluded = [
+        k for k in all_suffixed
+        if k != key_added and f"{k}{suffix}" in derived
+    ]
+    available = [
+        k for k in all_suffixed
+        if k != key_added and f"{k}{suffix}" not in derived
+    ]
 
     if keys is None:
         if not available:
+            why = (
+                f" The only `<key>{suffix}` columns on obs are previous consensus "
+                f"outputs ({excluded}), which are derived from callers rather "
+                "than callers themselves."
+                if excluded
+                else ""
+            )
             raise ValueError(
                 f"no `<key>{suffix}` columns on obs, so there is nothing to "
-                "reach a consensus over. Run `pyscx.doublet_import` for each "
-                "tool first; obs columns present are "
+                f"reach a consensus over.{why} Run `pyscx.doublet_import` for "
+                "each tool first; obs columns present are "
                 f"{list(obs.columns)}"
             )
-        return available
+        if excluded:
+            _warnings.warn(
+                f"doublet_consensus(keys=None) discovered {available} and "
+                f"skipped {excluded}, which are previous consensus outputs "
+                "rather than callers — counting one would double-weight the "
+                "tools that fed it and inflate `n_tools_voting`. Pass "
+                "`keys=[...]` explicitly to override.",
+                UserWarning,
+                stacklevel=3,
+            )
+        return available, excluded, []
 
     if isinstance(keys, str):
         keys = [keys]
@@ -1014,19 +1115,83 @@ def _resolve_consensus_keys(obs, keys, method, key_added):
         if f"{k}{suffix}" in obs.columns:
             continue
         if method != "mean_rank" and f"{k}_score" in obs.columns:
-            # scds and friends: a score with no call. Dropping it from the vote
-            # silently would change the answer, so say what the options are.
+            # A score with no call. There are TWO reasons for that and they need
+            # different remedies, so read `uns["<K>"]["call_column_status"]`
+            # (written by `doublet_import`) instead of asserting one. The old
+            # message claimed "That tool emits no call column" unconditionally,
+            # which is false for any profile that declares one — e.g.
+            # doubletdetection's `doublet_label` — and sent the user to the wrong
+            # three fixes.
+            rec = uns.get(k) if isinstance(uns, dict) else None
+            rec = rec if isinstance(rec, dict) else {}
+            status = rec.get("call_column_status")
+            tool = rec.get("tool")
+            expected = list(rec.get("expected_call_columns") or [])
+            prefix = rec.get("expected_call_prefix")
+            named = f"{tool!r}" if tool else f"{k!r}"
+            common = (
+                f"drop {k!r} from `keys`, use method='mean_rank' to combine "
+                "scores instead, or re-import it with `call_column=` to derive "
+                "a call."
+            )
+            if status == "declared_but_absent":
+                want = f"one of {expected}" if expected else "a call column"
+                if prefix:
+                    want += f" or a column starting with {prefix!r}"
+                raise ValueError(
+                    f"obs has {k!r}'s score but no {f'{k}_predicted'!r}, so it "
+                    f"cannot vote on a call. The {named} profile DOES emit a "
+                    f"call column — it expects {want} — but the table you "
+                    "imported carried none of those names, so the import wrote "
+                    f"a score only (uns[{k!r}]['call_column_status'] == "
+                    f"'declared_but_absent'). Re-import with `call_column=` "
+                    "naming the column your table actually uses, or " + common
+                )
+            if status == "not_declared":
+                raise ValueError(
+                    f"obs has {k!r}'s score but no {f'{k}_predicted'!r}, so it "
+                    f"cannot vote on a call. That tool ({named}) emits no call "
+                    "column — " + common
+                )
+            # Unknown: imported by an older pyscx, uns dropped, or a hand-built
+            # AnnData. Assert NEITHER cause rather than guess wrong.
             raise ValueError(
                 f"obs has {k!r}'s score but no {f'{k}_predicted'!r}, so it "
-                "cannot vote on a call. That tool emits no call column — drop "
-                f"{k!r} from `keys`, use method='mean_rank' to combine scores "
-                "instead, or re-import it with `call_column=` to derive a call."
+                "cannot vote on a call. Either that tool emits no call column "
+                "(scds), or the imported table did not carry the call column "
+                f"its profile expects — uns[{k!r}]['call_column_status'] "
+                "records which, for imports done by pyscx 0.12.1+. " + common
             )
+        hint = (
+            f" ({excluded} are previous consensus outputs, not callers, so "
+            "discovery skips them; naming one explicitly is allowed.)"
+            if excluded
+            else ""
+        )
         raise ValueError(
             f"obs has no {f'{k}{suffix}'!r} column. Keys available for "
-            f"method={method!r}: {available or 'none'}"
+            f"method={method!r}: {available or 'none'}{hint}"
         )
-    return keys
+
+    # Naming another consensus explicitly is a coherent operation (reconciling
+    # two disjoint tool panels, then combining), so allow it — but say what it
+    # costs, because the common way to arrive here is hand-rolling discovery
+    # from `read_obs().columns` and reproducing the bug by hand.
+    are_consensus = [k for k in keys if f"{k}{suffix}" in derived]
+    for k in are_consensus:
+        sub = None
+        if isinstance(uns, dict) and isinstance(uns.get(f"{k}_consensus"), dict):
+            sub = uns[f"{k}_consensus"].get("keys")
+        over = f", which is itself a consensus over {list(sub)}" if sub else ""
+        _warnings.warn(
+            f"`keys` names {k!r}{over} rather than a caller. Those tools "
+            f"effectively vote twice, and `{key_added}_n_tools_voting` counts "
+            f"{k!r} as one tool. Pass only caller keys, or keep this if a "
+            "consensus-of-consensuses is what you intend.",
+            UserWarning,
+            stacklevel=3,
+        )
+    return keys, [], are_consensus
 
 
 def doublet_consensus(target, *, keys=None, method="majority",
@@ -1142,14 +1307,26 @@ def doublet_consensus(target, *, keys=None, method="majority",
     )
     if is_adata:
         obs = target.obs
+        # Guaranteed present: the `is_adata` duck-type above requires it.
+        uns = target.uns
     else:
         path = _coerce_path(target)
         exp = _open_native(path)
+        # Read uns HERE, before discovery, rather than after the compute: key
+        # resolution needs it to tell a previous consensus's columns from a
+        # caller's. `read_uns` is a metadata-only read (it does not touch obs,
+        # var, obsm or X) and returns None when the file has no uns section.
+        # This replaces the later read, so it is one fewer, not one more — and
+        # the file is not mutated between here and `modify_metadata` below.
+        uns = exp.read_uns()
+        uns = dict(uns) if uns else {}
         # PHYSICAL rows — the row space `modify_metadata` validates against,
         # and the one logically-deleted rows still occupy.
         obs = exp.read_obs()
 
-    keys = _resolve_consensus_keys(obs, keys, method, key_added)
+    keys, keys_excluded, keys_are_consensus = _resolve_consensus_keys(
+        obs, uns, keys, method, key_added
+    )
 
     n = len(obs)
     n_voting = _np.zeros(n, dtype=_np.int32)
@@ -1184,6 +1361,14 @@ def doublet_consensus(target, *, keys=None, method="majority",
         "key_added": key_added,
         "n_obs": int(n),
         "per_key": per_key,
+        # What discovery narrowed, so the file itself records it. Empty unless
+        # `keys=None` skipped a previous consensus output.
+        "keys_excluded": list(keys_excluded),
+        # The subset of the final `keys` that are themselves consensus outputs.
+        # Non-empty only when the caller explicitly opted in, so an unusual
+        # choice is visible to whoever inherits the file, not just to the
+        # transient Python warning.
+        "keys_that_are_consensus": list(keys_are_consensus),
     }
 
     # Columns are held as bare arrays, never Series, so assignment is
@@ -1258,8 +1443,8 @@ def doublet_consensus(target, *, keys=None, method="majority",
 
     for name, values in columns.items():
         obs[name] = values
-    uns = exp.read_uns()
-    uns = dict(uns) if uns else {}
+    # `uns` was already read (and defaulted to {}) before key resolution, and
+    # nothing has mutated the file since, so reuse it rather than re-reading.
     uns[f"{key_added}_consensus"] = record
     # obs and uns in ONE commit, so `pyscx.rollback` undoes the whole thing.
     # Two calls would leave a file that had been half-rolled-back.

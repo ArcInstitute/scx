@@ -567,7 +567,7 @@ pub fn mark_deleted(path: &str, cell_indices: Vec<i64>) -> PyResult<u64> {
 #[pyo3(signature = (
     input, output,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
-    reshape_obs=false,
+    reshape_obs=false, codec="auto",
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn compact(
@@ -579,18 +579,23 @@ pub fn compact(
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
     reshape_obs: bool,
+    codec: &str,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
+    let resolved_codec = parse_codec_intent(codec)?;
     match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
         Some(index_opts) => {
             let summary = py
                 .detach(|| {
-                    scx_ops::compact_with_index_options(
+                    scx_ops::compact_with_options(
                         &input_path,
                         &output_path,
-                        &index_opts,
-                        reshape_obs,
+                        &scx_ops::CompactOptions {
+                            index_options: index_opts,
+                            reshape_obs,
+                            codec: resolved_codec,
+                        },
                     )
                 })
                 .map_err(ops_to_pyerr)?;
@@ -602,21 +607,35 @@ pub fn compact(
         // bare `compact()`, while still migrating obs to sharded
         // sections. Mirrors `scx-cli/src/compact.rs`.
         None if reshape_obs => {
-            let sentinel = ConversionPredicateIndexOptions {
-                index_obs: Vec::new(),
-                index_var: Vec::new(),
-                index_preset: None,
-                index_auto_threshold: 0,
-            };
             let summary = py
                 .detach(|| {
-                    scx_ops::compact_with_index_options(&input_path, &output_path, &sentinel, true)
+                    scx_ops::compact_with_options(
+                        &input_path,
+                        &output_path,
+                        &scx_ops::CompactOptions {
+                            reshape_obs: true,
+                            codec: resolved_codec,
+                            ..Default::default()
+                        },
+                    )
                 })
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)
         }
+        // Still the options path so a lone `codec=` is not silently dropped;
+        // `CompactOptions::default()` reproduces bare `compact()`.
         None => py
-            .detach(|| scx_ops::compact(&input_path, &output_path))
+            .detach(|| {
+                scx_ops::compact_with_options(
+                    &input_path,
+                    &output_path,
+                    &scx_ops::CompactOptions {
+                        codec: resolved_codec,
+                        ..Default::default()
+                    },
+                )
+            })
+            .map(|_| ())
             .map_err(ops_to_pyerr),
     }
 }
@@ -757,11 +776,8 @@ pub(crate) fn parse_reference_spec(
 /// per-codec fixtures produced byte-identical outputs for every variant,
 /// because the writer re-selected `auto` each time, so the sweep measured
 /// auto-reselection rather than whether a permutation grows that codec.
-fn parse_codec_selection(codec: &str) -> PyResult<CodecSelection> {
-    match CodecId::parse_cli(codec).map_err(PyValueError::new_err)? {
-        None => Ok(CodecSelection::Auto),
-        Some(c) => Ok(CodecSelection::Explicit(c)),
-    }
+fn parse_codec_intent(codec: &str) -> PyResult<scx_format_io::ResolvedCodec> {
+    scx_format_io::resolve_codec(Some(codec)).map_err(PyValueError::new_err)
 }
 
 /// Run a built [`scx_ops::SortOptions`] off the GIL, then optionally rebuild
@@ -876,7 +892,7 @@ pub fn sort(
         reverse,
         shuffle: None,
         shard_target_rows,
-        codec: parse_codec_selection(&codec)?,
+        codec: parse_codec_intent(&codec)?,
         index_options: ConversionPredicateIndexOptions {
             index_obs: index_obs.unwrap_or_default(),
             index_var: index_var.unwrap_or_default(),
@@ -992,7 +1008,7 @@ pub fn shuffle(
         reverse: false,
         shuffle: Some(seed),
         shard_target_rows,
-        codec: parse_codec_selection(&codec)?,
+        codec: parse_codec_intent(&codec)?,
         index_options: ConversionPredicateIndexOptions {
             index_obs: index_obs.unwrap_or_default(),
             index_var: index_var.unwrap_or_default(),
@@ -1181,7 +1197,7 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
     inputs, output,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     assume_identical_var=false, assume_identical_obs=false, uns_policy=None,
-    sort_by=None, reverse=false,
+    sort_by=None, reverse=false, codec="auto",
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn merge(
@@ -1197,7 +1213,9 @@ pub fn merge(
     uns_policy: Option<String>,
     sort_by: Option<Vec<String>>,
     reverse: bool,
+    codec: &str,
 ) -> PyResult<()> {
+    let resolved_codec = parse_codec_intent(codec)?;
     if inputs.len() < 2 {
         return Err(PyValueError::new_err(
             "merge requires at least 2 input files",
@@ -1232,6 +1250,7 @@ pub fn merge(
                 index_options: index_opts,
                 assume_identical_var,
                 assume_identical_obs,
+                codec: resolved_codec,
                 uns_policy: uns_policy_parsed,
                 shard_target_rows: None,
                 sort_by,
@@ -1252,6 +1271,7 @@ pub fn merge(
                 },
                 assume_identical_var,
                 assume_identical_obs,
+                codec: resolved_codec,
                 uns_policy: uns_policy_parsed,
                 shard_target_rows: None,
                 sort_by,
@@ -1262,8 +1282,20 @@ pub fn merge(
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)
         }
+        // Still the options path so a lone `codec=` is not silently dropped;
+        // `MergeOptions::default()` reproduces the bare `merge` wrapper.
         None => py
-            .detach(|| scx_ops::merge(&input_refs, &output_path))
+            .detach(|| {
+                scx_ops::merge_with_options(
+                    &input_refs,
+                    &output_path,
+                    &scx_ops::MergeOptions {
+                        codec: resolved_codec,
+                        ..Default::default()
+                    },
+                )
+            })
+            .map(|_| ())
             .map_err(ops_to_pyerr),
     }
 }
@@ -1986,11 +2018,80 @@ pub fn doublet_import(
         Ok((summary, info, diagnosis))
     })?;
 
+    // The profile declares a call column and the table carried none of its
+    // spellings, so `<K>_predicted` was NOT written even though this tool does
+    // emit a call. Warn HERE (after `py.detach` closes — `warnings.warn` is
+    // unreachable inside it) rather than leave the user to discover it at
+    // `doublet_consensus`, which is where the dogfood run found it, under the
+    // false claim that the tool emits no call column. In-module pattern: see
+    // `process_index_summary`.
+    if let Some(m) = &info.call_column_missing {
+        // `m.expected` already renders aliases AND prefix in one phrase
+        // (built by `resolve_column`), so do not re-append the prefix.
+        let expected = &m.expected;
+        // A near-miss is usually the user having named the wrong `--tool`, so
+        // point at the actual column when exactly one unconsumed column is a
+        // declared call spelling of some other profile.
+        let candidates: Vec<String> = m
+            .present_columns
+            .iter()
+            .filter(|c| {
+                scx_convert::DOUBLET_PROFILE_NAMES.iter().any(|t| {
+                    scx_convert::doublet_profile(t)
+                        .map(|p| p.call_columns.contains(&c.as_str()))
+                        .unwrap_or(false)
+                })
+            })
+            .cloned()
+            .collect();
+        let suggestion = if candidates.len() == 1 {
+            format!(
+                " The table does carry {:?}, which is another tool's call column — \
+                 pass call_column={:?} if that is your call.",
+                candidates[0], candidates[0]
+            )
+        } else {
+            String::new()
+        };
+        let key = &info.key_added;
+        let msg = format!(
+            "doublet_import: tool={:?} declares a call column ({expected}) but the table has \
+             none of those names — columns present are {:?}. Imported SCORE ONLY: \
+             obs[{:?}] was written, obs[{:?}] was NOT, so this tool cannot vote on a call in \
+             pyscx.doublet_consensus. The unmatched column is preserved verbatim under the \
+             {:?} prefix.{suggestion} Re-import with call_column=<your column>, or pass the \
+             tool= whose profile matches this table.",
+            info.tool,
+            m.present_columns,
+            format!("{key}_score"),
+            format!("{key}_predicted"),
+            key,
+        );
+        py.import("warnings")?.call_method1("warn", (msg,))?;
+    }
+
     let d = PyDict::new(py);
-    d.set_item("tool", info.tool)?;
-    d.set_item("key_added", info.key_added)?;
+    d.set_item("tool", &info.tool)?;
+    d.set_item("key_added", &info.key_added)?;
     d.set_item("score_source_column", info.score_source_column)?;
-    d.set_item("call_source_column", info.call_source_column)?;
+    d.set_item("call_source_column", &info.call_source_column)?;
+    // Lets a script branch without parsing the warning string. Mirrors the
+    // `call_column_status` recorded in `uns["<K>"]`.
+    d.set_item(
+        "call_column_status",
+        match (&info.call_source_column, &info.call_column_missing) {
+            (Some(_), _) => "resolved",
+            (None, None) => "not_declared",
+            (None, Some(_)) => "declared_but_absent",
+        },
+    )?;
+    d.set_item(
+        "expected_call_columns",
+        info.call_column_missing
+            .as_ref()
+            .map(|m| m.expected_columns.clone())
+            .unwrap_or_default(),
+    )?;
     d.set_item("canonical_columns", info.canonical_columns)?;
     d.set_item("native_columns", info.native_columns)?;
     d.set_item("dropped_alias_columns", info.dropped_alias_columns)?;
@@ -2024,6 +2125,32 @@ pub fn doublet_tools() -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// Every `tool=` profile's column vocabulary, straight from the definitions.
+///
+/// Exists so the per-tool table in `docs/scanpy.md` is machine-checkable rather
+/// than hand-maintained, and so a user surprised by an import can look up what
+/// their `--tool` actually expects from a REPL instead of reading Rust. That
+/// lookup being unavailable is what made a call-column name mismatch a
+/// silent score-only import.
+#[pyfunction]
+pub fn doublet_profiles(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let out = PyDict::new(py);
+    for name in scx_convert::DOUBLET_PROFILE_NAMES {
+        let p = scx_convert::doublet_profile(name).map_err(ops_to_pyerr)?;
+        let d = PyDict::new(py);
+        d.set_item("score_columns", p.score_columns.to_vec())?;
+        d.set_item("score_prefix", p.score_prefix)?;
+        d.set_item("call_columns", p.call_columns.to_vec())?;
+        d.set_item("call_prefix", p.call_prefix)?;
+        d.set_item("call_tokens", p.call_tokens.map(|t| (t.doublet, t.singlet)))?;
+        // `!call_columns.is_empty() || call_prefix.is_some()` — the one fact
+        // that decides whether `<K>_predicted` can exist at all.
+        d.set_item("emits_call", scx_convert::profile_has_call_column(p))?;
+        out.set_item(*name, d)?;
+    }
+    Ok(out.into())
 }
 
 /// Report which obs columns could serve as a join key for `obs_import`.

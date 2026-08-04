@@ -1313,7 +1313,7 @@ fn de_result_to_cell_eval_dataframe<'py>(
 fn extract_rank_genes_groups_df<'py>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
-    group: &Bound<'py, PyAny>,
+    group: Option<&Bound<'py, PyAny>>,
     key: &str,
     n_genes: Option<usize>,
     pval_cutoff: Option<f64>,
@@ -1321,23 +1321,6 @@ fn extract_rank_genes_groups_df<'py>(
     log2fc_max: Option<f64>,
     output: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    // `group` is a single name (no `group` column, matching scanpy) or a list
-    // of names (with a `group` column).
-    let (groups, multi): (Vec<String>, bool) = if let Ok(s) = group.extract::<String>() {
-        (vec![s], false)
-    } else if let Ok(v) = group.extract::<Vec<String>>() {
-        if v.is_empty() {
-            return Err(PyValueError::new_err(
-                "group must be a non-empty group name (str) or list of names",
-            ));
-        }
-        (v, true)
-    } else {
-        return Err(PyValueError::new_err(
-            "group must be a group name (str) or a list of group names",
-        ));
-    };
-
     let rgg = adata.getattr("uns")?.get_item(key).map_err(|_| {
         PyValueError::new_err(format!(
             "adata.uns[{key:?}] not found — run pyscx.accel.rank_genes_groups(adata, groupby=...) \
@@ -1346,12 +1329,50 @@ fn extract_rank_genes_groups_df<'py>(
     })?;
 
     // Available group names are the structured-array field names of `names`.
+    // Resolved before the `group` decision below so `group=None` can expand to
+    // all of them without a second enumeration site.
     let names_arr = rgg.get_item("names")?;
     let available: Vec<String> = names_arr
         .getattr("dtype")?
         .getattr("names")?
         .extract()
         .unwrap_or_default();
+
+    // `group` is None (every group, with a `group` column — scanpy's
+    // "All groups are returned if group is None"), a single name (no `group`
+    // column, also matching scanpy), or a list of names (with a `group` column).
+    let (groups, multi): (Vec<String>, bool) = match group {
+        None => {
+            if available.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "adata.uns[{key:?}][\"names\"] has no structured-array fields, so there \
+                     are no groups to extract — run \
+                     pyscx.accel.rank_genes_groups(adata, groupby=...) to populate it, or \
+                     pass groupby= to compute DE here"
+                )));
+            }
+            // NOT sorted: `dtype.names` is the order `rank_genes_groups` wrote
+            // and the order scanpy's own all-groups path iterates. Sorting here
+            // would silently diverge from scanpy's row order.
+            (available.clone(), true)
+        }
+        Some(g) => {
+            if let Ok(s) = g.extract::<String>() {
+                (vec![s], false)
+            } else if let Ok(v) = g.extract::<Vec<String>>() {
+                if v.is_empty() {
+                    return Err(PyValueError::new_err(
+                        "group must be a non-empty group name (str) or list of names",
+                    ));
+                }
+                (v, true)
+            } else {
+                return Err(PyValueError::new_err(
+                    "group must be a group name (str) or a list of group names",
+                ));
+            }
+        }
+    };
     for g in &groups {
         if !available.contains(g) {
             return Err(PyValueError::new_err(format!(
@@ -1406,6 +1427,12 @@ fn extract_rank_genes_groups_df<'py>(
             )));
         }
         let n = n_genes.unwrap_or(full).min(full);
+        // `group=None` now makes the all-groups build the DEFAULT, so this loop
+        // runs n_groups x n_genes times on real shapes (49 groups x 61,497 genes
+        // is ~3M rows). Record the row count before the inner loop and extend
+        // `col_group` once per group afterwards, instead of cloning the group
+        // name per row.
+        let rows_before = names.len();
         for i in 0..n {
             // scanpy-style row filters (only applied when set). Positive
             // comparisons mean NaN rows fail the predicate and are dropped,
@@ -1417,14 +1444,14 @@ fn extract_rank_genes_groups_df<'py>(
             if !keep {
                 continue;
             }
-            if multi {
-                col_group.push(g.clone());
-            }
             names.push(g_names[i].clone());
             scores.push(g_scores[i]);
             logfoldchanges.push(g_lfc[i]);
             pvals.push(g_pvals[i]);
             pvals_adj.push(g_padj[i]);
+        }
+        if multi {
+            col_group.extend(std::iter::repeat_n(g.clone(), names.len() - rows_before));
         }
     }
 
@@ -1476,10 +1503,13 @@ fn extract_rank_genes_groups_df<'py>(
 /// (`names, scores, logfoldchanges, pvals, pvals_adj`), with a leading `group`
 /// column when `group` is a list. Optional scanpy filters `pval_cutoff` /
 /// `log2fc_min` / `log2fc_max` apply. (`gene_symbols=` var-name remapping is not
-/// supported yet.) Pass either `groupby=` or `group=`, not both. To extract
-/// **all** groups, pass the list of names
-/// (`group=list(adata.uns[key]["names"].dtype.names)`); `group=None` routes to
-/// the compute path.
+/// supported yet.) Pass either `groupby=` or `group=`, not both.
+///
+/// **`group=None` (or an omitted `group=`) with no `groupby=` extracts every
+/// group** in `adata.uns[key]`, leading `group` column included — matching
+/// `sc.get.rank_genes_groups_df`'s "All groups are returned if `group` is
+/// `None`". With `groupby=` set, `group=None` still routes to the compute path.
+/// With neither and no `uns[key]`, it is an error naming both remedies.
 ///
 /// Args:
 ///     adata: AnnData object with X and obs[groupby]
@@ -1495,8 +1525,8 @@ fn extract_rank_genes_groups_df<'py>(
 ///     output: `"polars"` (default) or `"pandas"`. Identical columns either way;
 ///         `"pandas"` does not require polars.
 ///     device: compute-mode only; ignored in extract (`group=`) mode.
-///     group: extraction mode — a group name (str) or list of names to pull from
-///         `adata.uns[key]`.
+///     group: extraction mode — a group name (str), a list of names, or `None` /
+///         omitted to pull every group in `adata.uns[key]`.
 ///     key: uns key to extract from (default: `"rank_genes_groups"`).
 ///     pval_cutoff / log2fc_min / log2fc_max: scanpy-style row filters (extraction
 ///         mode only): keep rows with `pvals_adj < pval_cutoff`,
@@ -1536,11 +1566,29 @@ pub fn rank_genes_groups_df(
     // so a backed X is not gathered by anndata's copy-on-write.
     super::prepare_target_no_var_guard(py, adata, "rank_genes_groups_df")?;
 
-    // Extraction mode (scanpy `sc.get.rank_genes_groups_df` alias): when
-    // `group=` is given, read precomputed results from `adata.uns[key]` instead
-    // of recomputing. Mutually exclusive with the compute path's `groupby=`.
-    if let Some(group) = group {
-        if groupby.is_some() {
+    // Extraction mode (scanpy `sc.get.rank_genes_groups_df` alias): read
+    // precomputed results from `adata.uns[key]` instead of recomputing.
+    //
+    // scanpy's extractor returns EVERY group for `group=None` ("All groups are
+    // returned if group is None"). An explicit Python `group=None` and an
+    // omitted `group=` both arrive here as Rust `None` — pyo3 cannot tell them
+    // apart — so route on the object instead of the argument: a precomputed
+    // `uns[key]` means extract-all, and its absence with no `groupby=` is the
+    // "got neither" case the error below names.
+    //
+    // The `groupby.is_none()` conjunct is load-bearing: without it,
+    // `rank_genes_groups_df(adata, groupby="batch")` on an adata that already
+    // carries `uns["rank_genes_groups"]` — the normal pipeline shape — would
+    // silently switch from compute to extract.
+    let extract_all = group.is_none()
+        && groupby.is_none()
+        && adata
+            .getattr("uns")
+            .and_then(|u| u.contains(key))
+            .unwrap_or(false);
+
+    if group.is_some() || extract_all {
+        if group.is_some() && groupby.is_some() {
             return Err(PyValueError::new_err(
                 "pass either groupby= (compute DE) or group= (extract precomputed \
                  adata.uns[...]), not both",
@@ -1561,10 +1609,13 @@ pub fn rank_genes_groups_df(
     }
 
     let groupby = groupby.ok_or_else(|| {
-        PyValueError::new_err(
+        PyValueError::new_err(format!(
             "rank_genes_groups_df needs groupby= (to compute DE) or group= (to extract \
-             precomputed adata.uns[\"rank_genes_groups\"]); got neither",
-        )
+             precomputed adata.uns[{key:?}]); got neither, and adata.uns[{key:?}] does not \
+             exist so there is nothing to extract. Run \
+             pyscx.accel.rank_genes_groups(adata, groupby=...) first, then call this with no \
+             arguments to get every group."
+        ))
     })?;
 
     let resolved = super::gpu::resolve_device(device)?;

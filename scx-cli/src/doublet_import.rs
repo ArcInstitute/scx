@@ -141,14 +141,37 @@ pub fn run_doublet_import(
         "Tool: {} (score from {:?}, call from {:?})",
         info.tool, info.score_source_column, info.call_source_column
     );
-    if info.call_source_column.is_none() {
-        // Say so explicitly rather than let the missing column be discovered
-        // later: for scds this is by design, not a failed resolution.
-        println!(
-            "Note: no call column, so '{}_predicted' is not written. Threshold \
-             '{}_score' yourself — the importer will not choose a cutoff for you.",
-            info.key_added, info.key_added
-        );
+    // Two very different reasons there is no call column, and the note used to
+    // treat them identically — asserting "by design" even when the real cause
+    // was that the table spelled the call something the profile does not know.
+    match (&info.call_source_column, &info.call_column_missing) {
+        (None, None) => {
+            // scds / generic: by design, not a failed resolution.
+            println!(
+                "Note: no call column, so '{}_predicted' is not written. Threshold \
+                 '{}_score' yourself — the importer will not choose a cutoff for you.",
+                info.key_added, info.key_added
+            );
+        }
+        (None, Some(m)) => {
+            // `m.expected` already renders aliases AND prefix in one phrase.
+            let expected = &m.expected;
+            println!(
+                "Note: '{}_predicted' was NOT written — see the warning below.",
+                info.key_added
+            );
+            // stderr, matching the CLI's established warning channel, so it
+            // stays visible when stdout is piped to a log.
+            eprintln!(
+                "warning: --tool {} declares a call column ({expected}) but the table has none \
+                 of those names — columns present are {:?}. Imported score only, so this tool \
+                 cannot vote on a call in a later consensus. Re-run with \
+                 --call-column <your column>, or pass the --tool whose profile matches this \
+                 table.",
+                info.tool, m.present_columns
+            );
+        }
+        _ => {}
     }
     if !info.table.uns_keys_imported.is_empty() {
         println!(

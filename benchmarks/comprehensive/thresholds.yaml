@@ -2427,3 +2427,21 @@ absolute_floors:
 #      * `n_tools_ran`: cannot floor at 2 while Solo has no environment on this
 #        cluster; a floor would turn a legitimate optional-tool skip into a
 #        gate failure. The run records `tools_skipped` with a reason instead.
+#
+# 10. derived-file output size (compact / merge / subset / sort): no gate yet
+#    The v0.12.0 dogfood found `scx compact` GROWING an 864 MiB file by 5.1%
+#    while claiming to reclaim 562 MB of orphaned bytes, and `scx sort --by`
+#    turning it into 1.7 GiB. Root cause: every derived-file op built a framing
+#    config whose `decode_target` was `None` — precisely the `fast` profile — so
+#    `auto` on a rewrite never re-adopted ShufDeltaZstd. Fixed, with per-shard
+#    codec + byte-total assertions in `scx-ops/tests/codec_adaptive.rs`.
+#
+#    It reached a release because **nothing in this harness watches a derived
+#    file's size**: `compression` and `multimodal_compression` are convert-path
+#    only, and there is no `compact` / `merge` / `subset` benchmark at all. The
+#    gate that belongs here — an `output_size_ratio_vs_input` ceiling near 1.02
+#    on compact — is deferred because it needs a producing benchmark script
+#    first; adding the threshold alone would be an inert entry that reads as
+#    coverage. `scx-ops/tests/bench_ops.rs::compact_after_3_appends` already
+#    emits `compact_vs_fresh`, but on a 20K-cell fixture too small to floor.
+#    Recorded rather than left silent, per the no-silent-caps rule above.

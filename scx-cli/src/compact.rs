@@ -21,9 +21,14 @@ pub fn run_compact(
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
     reshape_obs: bool,
+    codec: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate input exists
     crate::cli_utils::validate_scx_file(input)?;
+
+    // Resolve before any work: an unknown codec should fail immediately, not
+    // after the rewrite has started.
+    let resolved_codec = scx_format_io::resolve_codec(Some(codec))?;
 
     // Check output
     if output.exists() && !force {
@@ -75,11 +80,28 @@ pub fn run_compact(
                 index_auto_threshold: 0,
             }
         };
-        let summary =
-            scx_ops::compact_with_index_options(input, output, &index_options, reshape_obs)?;
+        let summary = scx_ops::compact_with_options(
+            input,
+            output,
+            &scx_ops::CompactOptions {
+                index_options,
+                reshape_obs,
+                codec: resolved_codec,
+            },
+        )?;
         emit_index_summary("compact", &summary);
     } else {
-        scx_ops::compact(input, output)?;
+        // Still the options path, so a lone `--codec` is not silently dropped:
+        // the default index options carry the `index_auto_threshold = 0`
+        // sentinel, which reproduces bare `compact()` exactly.
+        scx_ops::compact_with_options(
+            input,
+            output,
+            &scx_ops::CompactOptions {
+                codec: resolved_codec,
+                ..Default::default()
+            },
+        )?;
     }
 
     pb.finish_and_clear();

@@ -696,11 +696,101 @@ class TestRankGenesGroupsDfExtract:
         with pytest.raises(ValueError, match="field lengths differ"):
             pyscx.accel.rank_genes_groups_df(adata, group="A")
 
+    def test_extract_group_none_returns_all_groups(self, synthetic_adata):
+        """B2: scanpy documents "All groups are returned if group is None"."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        df = pyscx.accel.rank_genes_groups_df(adata, group=None, output="pandas")
+
+        groups = list(adata.uns["rank_genes_groups"]["names"].dtype.names)
+        assert self._cols(df) == ["group"] + self.SCANPY_COLS
+        assert len(df) == len(groups) * adata.n_vars
+        # Group ORDER must follow `dtype.names`, not sorted() — that is the
+        # order rank_genes_groups wrote and the order scanpy iterates.
+        assert list(dict.fromkeys(df["group"])) == groups
+
+    def test_extract_group_none_equals_the_explicit_list(self, synthetic_adata):
+        import pandas as pd
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        groups = list(adata.uns["rank_genes_groups"]["names"].dtype.names)
+        auto = pyscx.accel.rank_genes_groups_df(adata, output="pandas")
+        expl = pyscx.accel.rank_genes_groups_df(adata, group=groups, output="pandas")
+        pd.testing.assert_frame_equal(auto, expl)
+
+    def test_extract_explicit_none_matches_omitted(self, synthetic_adata):
+        """pyo3 cannot distinguish an explicit `group=None` from an omitted
+        `group=`, so both must mean the same thing."""
+        import pandas as pd
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        pd.testing.assert_frame_equal(
+            pyscx.accel.rank_genes_groups_df(adata, group=None, output="pandas"),
+            pyscx.accel.rank_genes_groups_df(adata, output="pandas"),
+        )
+
+    def test_group_none_with_groupby_still_computes(self, synthetic_adata):
+        """Guards the load-bearing `groupby.is_none()` conjunct: an adata that
+        already carries uns["rank_genes_groups"] is the NORMAL pipeline shape, so
+        an explicit groupby= must not silently switch to extraction."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, groupby="batch", group=None, output="pandas"
+        )
+        assert "target" in df.columns and "feature" in df.columns
+        assert "names" not in df.columns
+
+    def test_extract_all_applies_n_genes_per_group(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        groups = list(adata.uns["rank_genes_groups"]["names"].dtype.names)
+        df = pyscx.accel.rank_genes_groups_df(adata, n_genes=5, output="pandas")
+        assert len(df) == 5 * len(groups)
+        assert df.groupby("group", observed=True).size().unique().tolist() == [5]
+
+    def test_extract_all_on_empty_dtype_names_errors(self, synthetic_adata):
+        """A non-structured `names` array has no groups to expand to."""
+        import numpy as np
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        adata.uns["rank_genes_groups"]["names"] = np.arange(3)
+        with pytest.raises(ValueError, match="no structured-array fields"):
+            pyscx.accel.rank_genes_groups_df(adata)
+
+    def test_extract_all_matches_scanpy(self, synthetic_adata):
+        """The contract the docs claim: a drop-in for sc.get.rank_genes_groups_df."""
+        sc = pytest.importorskip("scanpy")
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        mine = pyscx.accel.rank_genes_groups_df(adata, output="pandas")
+        theirs = sc.get.rank_genes_groups_df(adata, group=None)
+        assert list(mine.columns) == list(theirs.columns)
+        assert mine.shape == theirs.shape
+        assert list(dict.fromkeys(mine["group"])) == list(dict.fromkeys(theirs["group"]))
+
     def test_neither_group_nor_groupby_errors(self, synthetic_adata):
         import pyscx
 
         adata = synthetic_adata.copy()
         with pytest.raises(ValueError, match="got neither"):
+            pyscx.accel.rank_genes_groups_df(adata)
+        # Message must name both remedies and say the uns key is absent.
+        with pytest.raises(ValueError, match="does not exist"):
             pyscx.accel.rank_genes_groups_df(adata)
 
     def test_compute_path_unchanged(self, synthetic_adata):

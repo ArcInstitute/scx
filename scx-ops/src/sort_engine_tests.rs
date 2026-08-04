@@ -2405,8 +2405,6 @@ fn shuffle_handles_a_sharded_obs_input() {
 /// and nothing else would notice.
 #[test]
 fn cross_row_codec_probe_distinguishes_scx1_from_zstd() {
-    use scx_codec::CodecSelection;
-
     let dir = tempfile::tempdir().unwrap();
     let inp = fixture_plain(&dir);
 
@@ -2418,7 +2416,9 @@ fn cross_row_codec_probe_distinguishes_scx1_from_zstd() {
     ] {
         let out = dir.path().join(format!("out_{codec:?}.scx"));
         let mut o = opts(&["cell_type"]);
-        o.codec = CodecSelection::Explicit(codec);
+        o.codec = crate::codec_intent::intent_from_codec_selection(
+            scx_codec::CodecSelection::Explicit(codec),
+        );
         sort(&inp, &out, &o).unwrap();
 
         let reader = ScxReader::open(&out).unwrap();

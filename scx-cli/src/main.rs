@@ -50,6 +50,24 @@ struct Cli {
     command: Commands,
 }
 
+/// Accepted `--codec` spellings for the ops that expose the full intent axis
+/// (`convert`, `compact`, `merge`, `subset`, `sort`). One list so the
+/// subcommands cannot drift apart; `scx_format_io::resolve_codec` remains the
+/// semantic authority. `optimize` keeps a narrower list — it genuinely rejects
+/// the codecs omitted there.
+const CODEC_INTENT_VALUES: [&str; 10] = [
+    "auto",
+    "fast",
+    "compact",
+    "compact-trial",
+    "none",
+    "scx1",
+    "zstd",
+    "lz4",
+    "pcodec",
+    "shufdelta",
+];
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
@@ -406,6 +424,16 @@ enum Commands {
         /// Overwrite output if it exists
         #[arg(long)]
         force: bool,
+        /// Codec / intent profile for the rewritten shards. `auto` (default):
+        /// cost-aware adaptive, per integer shard it adopts ShufDeltaZstd when
+        /// smaller by a margin — the same selection `scx convert` runs.
+        /// `fast`: decode-speed-max single-encode heuristic. `compact`: size-max
+        /// (adopts on ties, needs a framed v4 input). `compact-trial` and the
+        /// codec names are explicit forces. Leaving this at `auto` keeps a
+        /// `shufdelta` input's size; before this flag existed the rewrite
+        /// silently ran `fast` and could roughly double X.
+        #[arg(long, default_value = "auto", value_parser = CODEC_INTENT_VALUES)]
+        codec: String,
         /// Rebuild the CSC sidecar on the compacted output (drops +
         /// re-emits via `scx build-csc`). Without this flag, compact
         /// drops the CSC sidecar with a warning — the row layout no
@@ -489,8 +517,12 @@ enum Commands {
         /// Target rows per shard in the output file
         #[arg(long, default_value_t = scx_format_io::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
         shard_size: u32,
-        /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec, shufdelta
-        #[arg(long, default_value = "auto")]
+        /// Codec / intent profile for output. `auto` (default): cost-aware
+        /// adaptive, the same per-shard selection `scx convert` runs — leave it
+        /// here to keep a `shufdelta` input's size. `fast`: decode-max
+        /// single-encode heuristic. `compact`: size-max (needs a framed v4
+        /// input). `compact-trial` and the codec names are explicit forces.
+        #[arg(long, default_value = "auto", value_parser = CODEC_INTENT_VALUES)]
         codec: String,
         /// Comma-separated obs columns to also index on the output (the sort
         /// key is always indexed so its shard ranges are contiguous).
@@ -622,6 +654,16 @@ enum Commands {
         /// would otherwise be read as another input.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Codec / intent profile for the rewritten shards. `auto` (default):
+        /// cost-aware adaptive, per integer shard it adopts ShufDeltaZstd when
+        /// smaller by a margin — the same selection `scx convert` runs.
+        /// `fast`: decode-speed-max single-encode heuristic. `compact`: size-max
+        /// (adopts on ties, needs a framed v4 input). `compact-trial` and the
+        /// codec names are explicit forces. Leaving this at `auto` keeps a
+        /// `shufdelta` input's size; before this flag existed the rewrite
+        /// silently ran `fast` and could roughly double X.
+        #[arg(long, default_value = "auto", value_parser = CODEC_INTENT_VALUES)]
+        codec: String,
         /// Rebuild the CSC sidecar on the merged output (drops +
         /// re-emits via `scx build-csc`). Without this flag, merge
         /// drops any input CSC sidecars with a warning.
@@ -859,8 +901,12 @@ enum Commands {
         /// Target rows per shard in the output file
         #[arg(long, default_value_t = scx_format_io::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
         shard_size: u32,
-        /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec, shufdelta
-        #[arg(long, default_value = "auto")]
+        /// Codec / intent profile for output. `auto` (default): cost-aware
+        /// adaptive, the same per-shard selection `scx convert` runs — leave it
+        /// here to keep a `shufdelta` input's size. `fast`: decode-max
+        /// single-encode heuristic. `compact`: size-max (needs a framed v4
+        /// input). `compact-trial` and the codec names are explicit forces.
+        #[arg(long, default_value = "auto", value_parser = CODEC_INTENT_VALUES)]
         codec: String,
         /// Rebuild the CSC sidecar on the subset output (drops +
         /// re-emits via `scx build-csc` against the projected CSR).
@@ -1379,6 +1425,7 @@ fn main() {
             index_preset,
             index_auto_threshold,
             reshape_obs,
+            codec,
         } => compact::run_compact(
             &input,
             &output,
@@ -1391,6 +1438,7 @@ fn main() {
             index_preset.filter(|s| !s.trim().is_empty()),
             index_auto_threshold,
             reshape_obs,
+            &codec,
         ),
         Commands::Sort {
             input,
@@ -1486,6 +1534,7 @@ fn main() {
             uns_policy,
             sort_by,
             sort_reverse,
+            codec,
         } => match output {
             Some(output) => merge::run_merge(
                 &inputs,
@@ -1502,6 +1551,7 @@ fn main() {
                 uns_policy,
                 parse_index_columns(sort_by.as_deref()),
                 sort_reverse,
+                &codec,
             ),
             // Unlike `scx convert`, the merged output is passed via `--output`,
             // not positionally — `inputs` is variadic, so a trailing path is

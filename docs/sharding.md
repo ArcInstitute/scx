@@ -88,8 +88,11 @@ auto-codec re-selection make the sorted X a few percent larger *or* smaller
 because regrouping which cells share a shard changes cross-row compressibility.
 On the 149M-cell `drug.scx` (`mixed scx1/zstd`, uint32), sorting by `cell_type`
 grew the file ~6% — all in the X matrix (value encoding, predicate index, and
-CSC were unchanged). Pin `--codec` or run a follow-up `scx compact` if size
-matters; the point of `sort` is read locality, not compression. See
+CSC were unchanged). Leave `--codec` at `auto` (it re-runs the same adaptive
+selection `scx convert` does) and pin one only if you want a specific encoding;
+the point of `sort` is read locality, not compression. Note `scx compact` is not
+a size remedy for this — it re-encodes under the same intent axis, so it will
+land where `sort` did. See
 [performance.md § Sort (physical layout)](performance.md#sort-physical-layout).
 
 ### Three ways to sort
@@ -168,9 +171,9 @@ same file without them (deletions are materialized away, as in `sort`); and the
 row order is not stable across a `rand` crate upgrade, which is pinned by a test
 rather than promised by the format.
 
-**Output size: pin your codec.** Measured on `tabula_sapiens_100k` (100,000
-cells, 7 CSR shards), shuffling each per-codec fixture *at its own codec*, so
-the only variable is row order:
+**Output size.** Measured on `tabula_sapiens_100k` (100,000 cells, 7 CSR
+shards), shuffling each per-codec fixture *at its own codec*, so the only
+variable is row order:
 
 | codec | X before | X after | delta |
 |-------|----------|---------|-------|
@@ -179,28 +182,51 @@ the only variable is row order:
 | `shufdelta` | 199.2 MB | 200.2 MB | 1.005× |
 | `zstd` | 314.2 MB | 333.0 MB | **1.060×** |
 | `pcodec` | 314.2 MB | 333.0 MB | 1.060× |
-| `auto` | 197.9 MB | 413.3 MB | **2.088×** |
 
 Reading it, in order of what dominates:
 
-1. **The `auto` row is a codec *flip*, not lost compression.** The per-shard
-   codec histogram moves `shufdelta ×7 → scx1 ×7`: the adaptive rule that picks
-   per shard reaches a different answer on the reordered data, and the whole
-   2.09× is that switch. This is the case to plan for, because `auto` is the
-   default.
-2. **`zstd` genuinely loses ~6%.** No flip — this is the cross-row redundancy a
+1. **`zstd` genuinely loses ~6%.** This is the cross-row redundancy a
    whole-shard-stream codec really does depend on, and a random permutation
-   really does destroy some of it. Much smaller than the flip, but real.
-3. **`scx1` is exactly neutral**, as its design implies: each row's gene indices
+   really does destroy some of it. Small, but real, and inherent to shuffling.
+2. **`scx1` is exactly neutral**, as its design implies: each row's gene indices
    are coded independently of row order, so a permutation just relocates
-   identically-sized blocks.
+   identically-sized blocks. `lz4` and `shufdelta` are near-neutral for the same
+   reason.
 
-**So pin the input's own codec** — `--codec shufdelta` on the file above keeps it
-at 1.005×. Note that `--codec scx1` is *not* the size-preserving choice on a
-`shufdelta`/`zstd` input: it is exactly what `auto` flips to, so it reproduces
-the 2.09× rewrite. Reach for `scx1` when you want a permutation-invariant
-encoding or the GPU device-decode route, not when you want to hold the file's
-size. `scx sort --shuffle` warns before the rewrite and names the pin. See
+**Historical note — the `auto` row is gone because it was a bug.** This table
+used to carry an `auto` row reading 197.9 MB → 413.3 MB (**2.088×**), described
+as a codec *flip* (`shufdelta ×7 → scx1 ×7`) that you were told to avoid by
+pinning the input's own codec. That flip was not a property of shuffling: every
+derived-file op built a framing config whose `decode_target` was `None` — which
+is precisely the `fast` profile — so `auto` on a rewrite silently ran the
+single-encode heuristic and never re-adopted `ShufDeltaZstd`. The same bug made
+`scx compact` *grow* a file it was asked to shrink. `auto` now runs the same
+adaptive per-shard selection on `sort`/`subset`/`merge`/`compact` that
+`scx convert` does, so **leave `--codec` at `auto`** — pin a codec only when you
+want that specific encoding (e.g. `scx1` for a permutation-invariant layout or
+the GPU device-decode route), not to hold the file's size.
+
+**A rewrite still costs ~1.3× on a mixed-width file, for a different reason.**
+Measured on `census_500k` (500,000 cells, 782,470,575 nnz, 863.7 MiB, input
+`shufdelta` with `mixed (uint16, uint32)` value encoding), `sort --by cell_type`:
+
+| `--codec` | output | ratio | output codec |
+|-----------|--------|-------|--------------|
+| `auto` | 1175.6 MB | **1.298×** | `shufdelta` |
+| `shufdelta` (explicit pin) | 1175.6 MB | **1.298×** | `shufdelta` |
+| `fast` | 1867.2 MB | 2.062× | `scx1` |
+| `auto`, sorting by an already-sorted key | 1177.8 MB | 1.301× | `shufdelta` |
+
+Three things to read off it. `auto` is now byte-identical to an explicit
+`shufdelta` pin, so the codec axis is doing exactly what it should. `fast`
+reproduces the old 2× flip, which is what the bug above was. And the residual
+1.3× is **not** reordering: sorting by a key the file is *already* sorted by
+costs the same 1.301×, so it is the rewrite itself. The cause is the value
+encoding — the input's `mixed (uint16, uint32)` comes back as a uniform
+`uint32`, because the ops widen to a single file-wide encoding
+(`scx_ops::helpers::widest_value_encoding`) instead of preserving each shard's.
+That is a separate, still-open issue from the codec flip; if output size on a
+mixed-width file matters, budget for it. See
 [performance.md § Global pre-shuffle](performance.md#global-pre-shuffle-data-load-phase-1-1d)
 for the second dataset and the batch-mixing numbers.
 

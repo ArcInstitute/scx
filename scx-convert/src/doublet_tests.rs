@@ -236,6 +236,107 @@ fn scds_profile_omits_the_call_column() {
 }
 
 #[test]
+fn a_declared_call_column_absent_is_reported_not_silent() {
+    // B3, the dogfood repro: a table using SCRUBLET's column names imported as
+    // doubletdetection. The read must SUCCEED (score-only is valid) while
+    // reporting exactly why there is no call, so the binding can warn instead of
+    // letting the user discover it much later in `doublet_consensus`.
+    let dir = tempfile::tempdir().unwrap();
+    let p = write(
+        &dir,
+        "dd.csv",
+        "barcode,doublet_score,predicted_doublet\n         AAAC-1,0.12,True\n",
+    );
+
+    let (data, info) = read_doublet_table(&p, &opts("doubletdetection")).unwrap();
+
+    assert_eq!(info.call_source_column, None);
+    assert_eq!(info.canonical_columns, ["doubletdetection_score"]);
+    let m = info
+        .call_column_missing
+        .as_ref()
+        .expect("a declared-but-absent call column must be reported");
+    assert_eq!(m.expected_columns, ["doublet_label"]);
+    assert_eq!(m.expected_prefix, None);
+    assert!(m.expected.contains("doublet_label"), "{}", m.expected);
+    // The "but what did I have?" half — this is what makes the message useful.
+    assert!(m.present_columns.contains(&"predicted_doublet".to_string()));
+    // No data is lost: the unmatched column survives verbatim, so the user can
+    // fix forward with `call_column=` and not re-run the caller.
+    assert_eq!(info.native_columns, ["doubletdetection_predicted_doublet"]);
+    assert!(!col_names(&data.row_annotations).contains(&"doubletdetection_predicted".to_string()));
+}
+
+#[test]
+fn a_profile_with_no_call_column_reports_nothing_missing() {
+    // The assertion whose absence IS B3: scds and doubletdetection both end up
+    // with `call_source_column == None`, and only this field tells them apart.
+    let dir = tempfile::tempdir().unwrap();
+    let p = write(&dir, "scds.csv", "barcode,hybrid_score\nAAAC-1,0.31\n");
+    let (_, info) = read_doublet_table(&p, &opts("scds")).unwrap();
+    assert_eq!(info.call_source_column, None);
+    assert!(
+        info.call_column_missing.is_none(),
+        "scds declares no call column, so nothing is *missing*"
+    );
+}
+
+#[test]
+fn a_prefix_declared_call_column_absent_reports_the_prefix() {
+    // doubletfinder declares its call by PREFIX, not by alias, so the
+    // diagnostic has to carry the prefix rather than an empty alias list.
+    let dir = tempfile::tempdir().unwrap();
+    let p = write(&dir, "df.csv", "barcode,pANN_0.25_0.03_100\nAAAC-1,0.4\n");
+    let (_, info) = read_doublet_table(&p, &opts("doubletfinder")).unwrap();
+    let m = info.call_column_missing.as_ref().expect("reported");
+    assert_eq!(m.expected_prefix.as_deref(), Some("DF.classifications_"));
+    assert!(m.expected_columns.is_empty());
+    assert!(m.expected.contains("DF.classifications_"), "{}", m.expected);
+}
+
+#[test]
+fn an_explicit_call_column_that_is_absent_still_errors() {
+    // An explicit override must stay a hard error for both roles — the 3-state
+    // refactor must not soften it into a warning.
+    let dir = tempfile::tempdir().unwrap();
+    let p = write(&dir, "x.csv", "barcode,doublet_score\nAAAC-1,0.1\n");
+    let mut o = opts("scrublet");
+    o.call_column = Some("nope".to_string());
+    let e = read_doublet_table(&p, &o).unwrap_err();
+    assert!(e.to_string().contains("nope"), "{e}");
+}
+
+#[test]
+fn a_declared_call_column_absent_still_imports_the_score_and_records_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write(
+        &dir,
+        "dd.csv",
+        "barcode,doublet_score,predicted_doublet\nAAAC-1,0.12,True\n",
+    );
+    let (data, _) = read_doublet_table(&p, &opts("doubletdetection")).unwrap();
+    let uns = data.uns.as_ref().expect("uns record");
+    assert_eq!(uns["call_column_status"], "declared_but_absent");
+    assert_eq!(uns["expected_call_columns"][0], "doublet_label");
+
+    // And the other two statuses, so all three are pinned in one place.
+    let p2 = write(&dir, "scds.csv", "barcode,hybrid_score\nAAAC-1,0.3\n");
+    let (d2, _) = read_doublet_table(&p2, &opts("scds")).unwrap();
+    assert_eq!(
+        d2.uns.as_ref().unwrap()["call_column_status"],
+        "not_declared"
+    );
+
+    let p3 = write(
+        &dir,
+        "ok.csv",
+        "barcode,doublet_score,doublet_label\nAAAC-1,0.12,1\n",
+    );
+    let (d3, _) = read_doublet_table(&p3, &opts("doubletdetection")).unwrap();
+    assert_eq!(d3.uns.as_ref().unwrap()["call_column_status"], "resolved");
+}
+
+#[test]
 fn scds_gains_a_call_column_when_one_is_named() {
     let dir = tempfile::tempdir().unwrap();
     let p = write(

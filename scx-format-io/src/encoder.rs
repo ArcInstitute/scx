@@ -220,78 +220,16 @@ pub fn encode_one_shard_from_bytes(
     //     ShufDeltaZstd} per shard.
     let n_major = (shard_indptr.len() - 1) as u32;
     let nnz = *shard_indptr.last().unwrap_or(&0);
-    let (encoded, block_index, shard_version) = match framing {
-        Some(fc) if fc.row_group_rows > 0 => {
-            let frame = |codec: CodecId| {
-                encode_shard_framed(
-                    shard_indptr,
-                    shard_indices,
-                    shard_values_bytes,
-                    codec,
-                    shard_value_encoding,
-                    index_dtype_u16,
-                    fc.row_group_rows,
-                    fc.target_nnz,
-                )
-            };
-            // Decide whether to trial-encode ShufDeltaZstd as a second candidate.
-            // The adaptive `decode_target` (`auto`/`compact`) takes precedence over
-            // `trial` (compact-trial): the adaptive profiles trial only integer
-            // shards (`pick_codec_v2` biases the pick by target); compact-trial
-            // trials any non-ShufDeltaZstd heuristic. In all cases both candidates
-            // are row-group-framed (shard v2) with codec-agnostic BlockIndex access.
-            let is_integer = shard_value_encoding.is_integer();
-            let pick_mode: Option<FramedPick> = if shard_codec == CodecId::ShufDeltaZstd {
-                None
-            } else if let Some(dt) = fc.decode_target {
-                is_integer.then_some(FramedPick::V2(dt))
-            } else if fc.trial {
-                Some(FramedPick::Trial)
-            } else {
-                None
-            };
-            match pick_mode {
-                Some(mode) => {
-                    let (e_h, bi_h) = frame(shard_codec)?;
-                    let (e_s, bi_s) = frame(CodecId::ShufDeltaZstd)?;
-                    let (size_h, size_s) = (framed_size(&e_h), framed_size(&e_s));
-                    let pick_shufdelta = match mode {
-                        FramedPick::Trial => size_s < size_h,
-                        FramedPick::V2(dt) => {
-                            pick_codec_v2(shard_codec, dt, size_h, size_s, true)
-                                == CodecId::ShufDeltaZstd
-                        }
-                    };
-                    let (framed_codec, framed_enc, framed_bi) = if pick_shufdelta {
-                        (CodecId::ShufDeltaZstd, e_s, bi_s)
-                    } else {
-                        (shard_codec, e_h, bi_h)
-                    };
-                    shard_codec = framed_codec;
-                    (framed_enc, framed_bi, CURRENT_SHARD_FORMAT_VERSION)
-                }
-                None => {
-                    let (enc, bi) = frame(shard_codec)?;
-                    (enc, bi, CURRENT_SHARD_FORMAT_VERSION)
-                }
-            }
-        }
-        _ => {
-            let enc = encode_shard(
-                shard_indptr,
-                shard_indices,
-                shard_values_bytes,
-                shard_codec,
-                shard_value_encoding,
-                index_dtype_u16,
-            )?;
-            (
-                enc,
-                BlockIndex::for_shard(n_major, shard_indptr)?,
-                DEFAULT_WRITE_SHARD_FORMAT_VERSION,
-            )
-        }
-    };
+    let (encoded, block_index, shard_version, chosen_codec) = encode_shard_adaptive(
+        shard_indptr,
+        shard_indices,
+        shard_values_bytes,
+        shard_codec,
+        shard_value_encoding,
+        index_dtype_u16,
+        framing,
+    )?;
+    shard_codec = chosen_codec;
     let mut block_index_bytes = Vec::new();
     block_index.write_to(&mut block_index_bytes)?;
 
@@ -422,6 +360,20 @@ pub fn encode_one_shard_from_bytes(
 /// single-encode (`fast`, or an explicit codec — no ShufDeltaZstd trial).
 /// `decode_target` takes precedence over `trial` (the CLI/pyscx layers keep them
 /// mutually exclusive).
+///
+/// # Contract: `decode_target = Some(_)` authorises codec re-selection
+///
+/// Setting `decode_target` (or `trial`) grants every write path that consumes
+/// this config — [`encode_one_shard`] *and* [`crate::ScxWriter::write_csr_shard`]
+/// — permission to **override the `codec_id` the caller passed in** for integer
+/// shards, via the dual-encode in [`encode_shard_adaptive`].
+///
+/// Callers that mean to **preserve** a source shard's codec (rather than pick a
+/// new one) MUST therefore pass `decode_target: None` — i.e.
+/// `FramingConfig::default()`. `scx_ops::build_csc` and
+/// `scx_ops::rewrite_helpers::copy_layers` both rely on this: they re-write
+/// shards at the codec read off the source header, and re-selection would
+/// silently defeat that.
 #[derive(Debug, Clone, Copy)]
 pub struct FramingConfig {
     pub row_group_rows: u32,
@@ -455,6 +407,115 @@ impl Default for FramingConfig {
 /// Total encoded size of a shard's three sub-streams (trial-encode comparison key).
 fn framed_size(e: &EncodedShard) -> usize {
     e.indptr_bytes.len() + e.indices_bytes.len() + e.values_bytes.len()
+}
+
+/// Encode one shard and report the codec actually used.
+///
+/// This is the **single place the per-shard codec is finalised**, shared by
+/// [`encode_one_shard_from_bytes`] and [`crate::ScxWriter::write_csr_shard`] (via
+/// `write_shard_inner`) so both honour the codec intent axis identically. Two
+/// layouts, unchanged from the pre-extraction behaviour:
+///
+/// - **Unframed** (`framing` is `None` or `row_group_rows == 0`): monolithic
+///   per-stream encode plus a single whole-shard [`BlockIndex`] entry (or a
+///   `≤MAX_BLOCK_ROWS` split) with zero byte offsets — byte-identical to the
+///   legacy layout; shard v1.
+/// - **Row-group-framed**: each row group is encoded independently and the
+///   multi-entry [`BlockIndex`] records per-group byte offsets, enabling
+///   codec-agnostic sub-shard random access; shard v2.
+///
+/// `seed_codec` is a *candidate*, not a decision: the heuristic winner or an
+/// explicit force. When the framing config carries `decode_target` (the
+/// `auto` / `compact` intent profiles) or `trial` (`compact-trial`), an integer
+/// shard is dual-encoded against `ShufDeltaZstd` and **the returned codec may
+/// differ from `seed_codec`**. With `decode_target: None` and `trial: false` —
+/// the `fast` profile, and every explicit codec — the returned codec always
+/// equals `seed_codec`.
+///
+/// Callers MUST stamp the returned codec into the shard header rather than the
+/// one they passed in; it is what the reader dispatches on.
+pub fn encode_shard_adaptive(
+    indptr: &[u64],
+    indices: &[u32],
+    values_bytes: &[u8],
+    seed_codec: CodecId,
+    value_encoding: ValueEncoding,
+    index_dtype_u16: bool,
+    framing: Option<FramingConfig>,
+) -> Result<(EncodedShard, BlockIndex, u8, CodecId), ScxError> {
+    let n_major = (indptr.len().saturating_sub(1)) as u32;
+    match framing {
+        Some(fc) if fc.row_group_rows > 0 => {
+            let frame = |codec: CodecId| {
+                encode_shard_framed(
+                    indptr,
+                    indices,
+                    values_bytes,
+                    codec,
+                    value_encoding,
+                    index_dtype_u16,
+                    fc.row_group_rows,
+                    fc.target_nnz,
+                )
+            };
+            // Decide whether to trial-encode ShufDeltaZstd as a second candidate.
+            // The adaptive `decode_target` (`auto`/`compact`) takes precedence over
+            // `trial` (compact-trial): the adaptive profiles trial only integer
+            // shards (`pick_codec_v2` biases the pick by target); compact-trial
+            // trials any non-ShufDeltaZstd heuristic. In all cases both candidates
+            // are row-group-framed (shard v2) with codec-agnostic BlockIndex access.
+            let is_integer = value_encoding.is_integer();
+            let pick_mode: Option<FramedPick> = if seed_codec == CodecId::ShufDeltaZstd {
+                None
+            } else if let Some(dt) = fc.decode_target {
+                is_integer.then_some(FramedPick::V2(dt))
+            } else if fc.trial {
+                Some(FramedPick::Trial)
+            } else {
+                None
+            };
+            match pick_mode {
+                Some(mode) => {
+                    let (e_h, bi_h) = frame(seed_codec)?;
+                    let (e_s, bi_s) = frame(CodecId::ShufDeltaZstd)?;
+                    let (size_h, size_s) = (framed_size(&e_h), framed_size(&e_s));
+                    let pick_shufdelta = match mode {
+                        FramedPick::Trial => size_s < size_h,
+                        FramedPick::V2(dt) => {
+                            pick_codec_v2(seed_codec, dt, size_h, size_s, true)
+                                == CodecId::ShufDeltaZstd
+                        }
+                    };
+                    let (codec, enc, bi) = if pick_shufdelta {
+                        (CodecId::ShufDeltaZstd, e_s, bi_s)
+                    } else {
+                        (seed_codec, e_h, bi_h)
+                    };
+                    Ok((enc, bi, CURRENT_SHARD_FORMAT_VERSION, codec))
+                }
+                None => {
+                    let (enc, bi) = frame(seed_codec)?;
+                    Ok((enc, bi, CURRENT_SHARD_FORMAT_VERSION, seed_codec))
+                }
+            }
+        }
+        _ => {
+            let enc = encode_shard(
+                indptr,
+                indices,
+                values_bytes,
+                seed_codec,
+                value_encoding,
+                index_dtype_u16,
+            )?;
+            Ok((
+                enc,
+                BlockIndex::for_shard(n_major, indptr)?,
+                DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+                seed_codec,
+            ))
+        }
+    }
 }
 
 /// Encode a shard **row-group-framed** (F5-b):

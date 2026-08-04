@@ -438,6 +438,34 @@ Nothing in this path is doublet-specific except one lookup table of column
 names. `pyscx.obs_import` lands any per-cell annotation table; `doublet_import`
 is a thin wrapper that normalises each tool's spellings.
 
+### The per-tool column table
+
+This is that lookup table. Read it before writing the import, not after it
+surprises you: `--tool` selects which spellings the importer looks for, so a
+table whose call column is named something else imports **score-only** and the
+tool cannot vote on a call in `doublet_consensus`. (It warns when that happens,
+names what it expected, and preserves your column under the `<K>_` prefix — so
+the fix is `call_column=`, not re-running the caller.)
+
+| `--tool` | score columns | score prefix | call columns | call prefix | doublet / singlet tokens | emits a call? |
+|---|---|---|---|---|---|---|
+| `scdblfinder` | `scDblFinder.score` | — | `scDblFinder.class` | — | `doublet` / `singlet` | yes |
+| `scrublet` | `doublet_score` | — | `predicted_doublet` | — | `true` / `false` | yes |
+| `doubletfinder` | — | `pANN_` | — | `DF.classifications_` | `Doublet` / `Singlet` | yes |
+| `doubletdetection` | `doublet_score` | — | `doublet_label` | — | numeric `0`/`1` | yes |
+| `solo` | `softmax_score`, `score` | — | `prediction` | — | `doublet` / `singlet` | yes |
+| `scds` | `hybrid_score`, `cxds_score`, `bcds_score` | — | *(none)* | — | — | **no** |
+| `generic` | *(caller-supplied)* | — | *(caller-supplied)* | — | *(caller-supplied)* | **no** — only via `call_column=` |
+
+Score/call aliases are tried in the order listed, first match wins. A prefix
+match must land on **exactly one** column — DoubletFinder run twice with
+different `pK` leaves two `pANN_*` columns behind, and picking one silently
+would be a coin flip. `generic` requires an explicit `score_column=`.
+
+Rather than trusting this table to stay in sync with the code, read it from
+Python: `pyscx.doublet_profiles()` returns the same rows straight from the
+profile definitions, and a test asserts the two agree.
+
 ### Settle the join key first
 
 This is the step worth doing before anything else, because everything
@@ -2926,7 +2954,12 @@ df = pyscx.accel.rank_genes_groups_df(
 Useful when you want SCX's faster Wilcoxon rank-sum but cell-eval's DE metrics
 downstream (overlap@N, precision@N, pr_auc, etc.).
 
-> **`group=` is the scanpy extractor alias.** Calling it the scanpy way —
+> **`group=` is the scanpy extractor alias**, and `group=None` (or omitting it,
+> with no `groupby=`) extracts **every** group — matching
+> `sc.get.rank_genes_groups_df`'s "All groups are returned if group is None".
+> Both modes return a **polars** DataFrame; pass `output="pandas"` (or
+> `.to_pandas()`) for scanpy-shaped ergonomics such as `.map` and
+> `df[col] = ...`. Calling it the scanpy way —
 > `pyscx.accel.rank_genes_groups_df(adata, group="0")` — does **not** recompute;
 > it extracts the precomputed `adata.uns["rank_genes_groups"]` and returns
 > scanpy's columns (`names, scores, logfoldchanges, pvals, pvals_adj`), a

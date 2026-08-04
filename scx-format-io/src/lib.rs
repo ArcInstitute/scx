@@ -29,6 +29,7 @@ pub mod prefetch;
 pub mod profile;
 pub mod reader;
 pub mod shard_decode;
+pub mod shard_report;
 pub mod shard_source;
 pub mod typed_read;
 pub(crate) mod validated_section;
@@ -53,7 +54,7 @@ pub use deletion_vectors::DeletionVectors;
 pub use distinct::DistinctAccumulator;
 pub use encoder::{
     encode_one_shard, encode_one_shard_from_bytes, encode_one_shard_with_value_encoding,
-    encode_shard_framed, FramingConfig, DEFAULT_ROW_GROUP_ROWS,
+    encode_shard_adaptive, encode_shard_framed, FramingConfig, DEFAULT_ROW_GROUP_ROWS,
 };
 pub use mem::MemoryBudget;
 pub use prefetch::{
@@ -74,6 +75,7 @@ pub use shard_decode::{
     decode_shard_bytes, decode_shard_bytes_native, decode_shard_indptr_bytes,
     decode_shard_regions_native, decode_shard_regions_scipy,
 };
+pub use shard_report::{codec_id_histogram, distinct_sorted_shard_field, total_shard_bytes};
 pub use shard_source::{ColumnShardSource, ShardSizeHint, ShardSource};
 pub use writer::{
     assign_csr_shard_column_stats, chmod_to_umask, compute_shard_stats, fsync_parent_dir,

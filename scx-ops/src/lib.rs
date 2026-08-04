@@ -1,6 +1,7 @@
 pub mod append;
 pub mod build_csc;
 pub mod checksum;
+pub mod codec_intent;
 pub mod compact;
 pub mod delete;
 pub mod error;
@@ -31,7 +32,8 @@ pub use append::{
     AppendOptions,
 };
 pub use build_csc::run_build_csc;
-pub use compact::{compact, compact_with_index_options};
+pub use codec_intent::{framing_for_rewrite, intent_from_codec_selection, seed_codec};
+pub use compact::{compact, compact_with_index_options, compact_with_options, CompactOptions};
 pub use delete::mark_deleted;
 pub use error::{OpsError, Result};
 pub use external_layer::{

@@ -614,3 +614,195 @@ def test_h5mu_source_is_refused_with_the_modality_route(tmp_path):
     with pytest.raises(ValueError) as e:
         pyscx.doublet_import(str(scx), str(fake), tool="scrublet")
     assert "--modality" in str(e.value)
+
+
+# ---------------------------------------------------------------------------
+# B3: a declared-but-absent call column must not degrade silently
+# ---------------------------------------------------------------------------
+
+
+def test_a_declared_call_column_absent_warns(tmp_path):
+    """The dogfood repro: a scrublet-shaped table imported as doubletdetection.
+
+    It still imports (score-only is valid and loses no data), but it must say so
+    — the failure otherwise surfaces much later in `doublet_consensus`.
+    """
+    path = _fixture(tmp_path)
+    table = _write(
+        tmp_path,
+        "dd.csv",
+        "barcode,doublet_score,predicted_doublet\n"
+        "AAAC-1,0.10,True\nAAAG-1,0.20,False\n"
+        "AAAT-1,0.30,False\nAAAA-1,0.40,False\n",
+    )
+
+    with pytest.warns(UserWarning, match="doublet_label"):
+        r = pyscx.doublet_import(str(path), str(table), tool="doubletdetection")
+
+    assert r["call_source_column"] is None
+    assert r["call_column_status"] == "declared_but_absent"
+    assert r["expected_call_columns"] == ["doublet_label"]
+    assert r["canonical_columns"] == ["doubletdetection_score"]
+
+    obs = pyscx.open(str(path)).read_obs()
+    assert "doubletdetection_score" in obs.columns
+    assert "doubletdetection_predicted" not in obs.columns
+    # No data lost — the unmatched column survives verbatim.
+    assert "doubletdetection_predicted_doublet" in obs.columns
+
+
+def test_the_warning_names_the_column_the_table_actually_has(tmp_path):
+    """A near-miss is usually the wrong `tool=`, so the message should point at
+    the real column rather than leave the user to diff two vocabularies."""
+    path = _fixture(tmp_path)
+    table = _write(
+        tmp_path,
+        "dd.csv",
+        "barcode,doublet_score,predicted_doublet\n"
+        "AAAC-1,0.10,True\nAAAG-1,0.20,False\n"
+        "AAAT-1,0.30,False\nAAAA-1,0.40,False\n",
+    )
+    with pytest.warns(UserWarning, match=r'call_column="predicted_doublet"'):
+        pyscx.doublet_import(str(path), str(table), tool="doubletdetection")
+
+
+def test_a_score_only_profile_does_not_warn(tmp_path):
+    """Guards against over-warning: scds declares no call column, so its absence
+    is by design and a warning there would make the real one worthless."""
+    import warnings
+
+    path = _fixture(tmp_path)
+    table = _write(
+        tmp_path,
+        "scds.csv",
+        "barcode,hybrid_score\nAAAC-1,0.10\nAAAG-1,0.20\n"
+        "AAAT-1,0.30\nAAAA-1,0.40\n",
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        r = pyscx.doublet_import(str(path), str(table), tool="scds")
+    assert r["call_column_status"] == "not_declared"
+    assert r["expected_call_columns"] == []
+
+
+def test_the_uns_record_says_why_there_is_no_call_column(tmp_path):
+    path = _fixture(tmp_path)
+    table = _write(
+        tmp_path,
+        "dd.csv",
+        "barcode,doublet_score,predicted_doublet\n"
+        "AAAC-1,0.10,True\nAAAG-1,0.20,False\n"
+        "AAAT-1,0.30,False\nAAAA-1,0.40,False\n",
+    )
+    with pytest.warns(UserWarning):
+        pyscx.doublet_import(str(path), str(table), tool="doubletdetection")
+    rec = pyscx.open(str(path)).read_uns()["doubletdetection"]
+    assert rec["call_column_status"] == "declared_but_absent"
+    assert rec["expected_call_columns"] == ["doublet_label"]
+
+
+def test_call_column_recovers_the_call_and_clears_the_status(tmp_path):
+    """The documented remedy must actually work and must stop warning."""
+    import warnings
+
+    path = _fixture(tmp_path)
+    table = _write(
+        tmp_path,
+        "dd.csv",
+        "barcode,doublet_score,predicted_doublet\n"
+        "AAAC-1,0.10,True\nAAAG-1,0.20,False\n"
+        "AAAT-1,0.30,False\nAAAA-1,0.40,False\n",
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        r = pyscx.doublet_import(
+            str(path), str(table), tool="doubletdetection",
+            call_column="predicted_doublet",
+        )
+    assert r["call_column_status"] == "resolved"
+    assert "doubletdetection_predicted" in r["canonical_columns"]
+
+
+def test_consensus_diagnoses_a_declared_but_unmatched_call_column(tmp_path):
+    """The whole B3 loop end to end.
+
+    The two halves are individually plausible and only wrong together: the import
+    quietly drops the call, and the consensus then blames the tool's profile. This
+    is the test that catches that pair.
+    """
+    path = _fixture(tmp_path)
+    table = _write(
+        tmp_path,
+        "dd.csv",
+        "barcode,doublet_score,predicted_doublet\n"
+        "AAAC-1,0.10,True\nAAAG-1,0.20,False\n"
+        "AAAT-1,0.30,False\nAAAA-1,0.40,False\n",
+    )
+    with pytest.warns(UserWarning):
+        pyscx.doublet_import(str(path), str(table), tool="doubletdetection")
+
+    with pytest.raises(ValueError) as e:
+        pyscx.doublet_consensus(str(path), keys=["doubletdetection"],
+                                method="majority")
+    msg = str(e.value)
+    # Names the real cause and the real fix...
+    assert "doublet_label" in msg
+    assert "declared_but_absent" in msg
+    # ...and no longer asserts the false one.
+    assert "emits no call column" not in msg
+
+
+def test_consensus_still_says_a_score_only_tool_emits_no_call(tmp_path):
+    """The other branch: for scds the old wording was correct, so keep it."""
+    path = _fixture(tmp_path)
+    table = _write(
+        tmp_path,
+        "scds.csv",
+        "barcode,hybrid_score\nAAAC-1,0.10\nAAAG-1,0.20\n"
+        "AAAT-1,0.30\nAAAA-1,0.40\n",
+    )
+    pyscx.doublet_import(str(path), str(table), tool="scds")
+    with pytest.raises(ValueError, match="emits no call column"):
+        pyscx.doublet_consensus(str(path), keys=["scds"], method="majority")
+
+
+def test_doublet_profiles_matches_the_docs_table():
+    """The per-tool table in docs/scanpy.md must not drift from the profiles.
+
+    D2: that table not existing anywhere user-facing is what turned a
+    call-column name mismatch into a silent score-only import — the only way to
+    learn `doubletdetection` wants `doublet_label` was to read the Rust source.
+    A hand-maintained table would drift, so pin it.
+    """
+    import pathlib
+    import re
+
+    profiles = pyscx.doublet_profiles()
+    assert set(profiles) == set(pyscx.doublet_tools())
+
+    doc = (
+        pathlib.Path(__file__).resolve().parents[2] / "docs" / "scanpy.md"
+    ).read_text()
+    section = doc.split("### The per-tool column table", 1)[1].split("###", 1)[0]
+    rows = {
+        m.group(1): m.group(0)
+        for m in re.finditer(r"^\| `([a-z]+)` \|.*$", section, re.M)
+    }
+    assert set(rows) == set(profiles), "every tool needs a documented row"
+
+    for tool, spec in profiles.items():
+        row = rows[tool]
+        for col in spec["score_columns"] + spec["call_columns"]:
+            assert col in row, f"{tool}: {col} missing from the docs row"
+        for pre in (spec["score_prefix"], spec["call_prefix"]):
+            if pre:
+                assert pre in row, f"{tool}: prefix {pre} missing from the docs row"
+        # The load-bearing column: whether `<K>_predicted` can exist at all.
+        # Check the LAST cell specifically — a substring search over the whole
+        # row would match the "no" inside scds's "*(none)*" call cell and pass
+        # for the wrong reason.
+        last_cell = [c.strip() for c in row.strip().strip("|").split("|")][-1]
+        expected = "yes" if spec["emits_call"] else "no"
+        assert expected in last_cell.lower(), (
+            f"{tool}: the emits-a-call cell is {last_cell!r}, must say {expected!r}"
+        )

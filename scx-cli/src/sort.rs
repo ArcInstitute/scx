@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressStyle};
-use scx_codec::{CodecId, CodecSelection};
 use scx_engine::ConversionPredicateIndexOptions;
 
 use crate::format::human_size;
@@ -63,10 +62,11 @@ pub fn run_sort(
         std::fs::remove_file(output)?;
     }
 
-    let codec = match CodecId::parse_cli(codec)? {
-        None => CodecSelection::Auto,
-        Some(c) => CodecSelection::Explicit(c),
-    };
+    // Full intent axis (`auto`/`fast`/`compact`/`compact-trial` + explicit
+    // codecs), not just `CodecId::parse_cli`'s explicit set. `auto` here now
+    // means what it means in `scx convert`; it previously resolved to the
+    // single-encode heuristic, which is what let `sort --by` roughly double X.
+    let codec = scx_format_io::resolve_codec(Some(codec))?;
     let bitmap = scx_format_io::BitmapPolicy::parse(bitmap)?;
     let memory_budget = match memory_budget {
         Some(s) => Some(scx_format_io::MemoryBudget::parse(&s)?),
