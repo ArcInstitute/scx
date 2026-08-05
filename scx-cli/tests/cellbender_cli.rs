@@ -183,9 +183,6 @@ fn setup(dir: &Path, n_cells: usize, n_genes: usize) -> (PathBuf, PathBuf) {
             "convert",
             "--from",
             "10x",
-            // 10x ingest is not a streaming direction; the CLI's `--stream`
-            // default of true is rejected for it.
-            "--stream=false",
             tenx.to_str().unwrap(),
             scx_path.to_str().unwrap(),
         ])
@@ -306,7 +303,6 @@ fn convert_redirects_a_cellbender_file_to_the_import_command() {
             "convert",
             "--from",
             "10x",
-            "--stream=false",
             cb.to_str().unwrap(),
             out_path.to_str().unwrap(),
         ])

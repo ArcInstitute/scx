@@ -38,9 +38,86 @@ pub fn determine_convert_direction(
     }
 }
 
+/// Every direction [`determine_convert_direction`] can return.
+///
+/// Single source of truth for the vocabulary. The directions are plain
+/// `&'static str` rather than an enum, so the compiler cannot force a new one
+/// to be classified everywhere it matters; the paired tests below stand in for
+/// that, locking this array to the resolver's image *and* requiring every
+/// member to be classified by [`direction_supports_streaming`]. Adding an
+/// eighth direction fails the first test until this array is updated, which
+/// then fails the second until someone decides whether it streams.
+pub const ALL_CONVERT_DIRECTIONS: [&str; 7] = [
+    "mtx_to_scx",
+    "h5ad_to_scx",
+    "h5mu_to_scx",
+    "tenx_to_scx",
+    "scx_to_mtx",
+    "scx_to_h5ad",
+    "scx_to_h5mu",
+];
+
+/// Whether `direction` has a streaming (bounded peak-RSS) implementation.
+pub fn direction_supports_streaming(direction: &str) -> bool {
+    match direction {
+        // h5ad → scx (Phase 0/1/2), h5mu → scx (Phase 3), and scx → h5ad /
+        // h5mu (Phase 8) each have a shard-at-a-time path alongside the
+        // legacy materializing one, selected by the resolved flag.
+        "h5ad_to_scx" | "h5mu_to_scx" | "scx_to_h5ad" | "scx_to_h5mu" => true,
+        // Single materializing path, so there is nothing to select: scx-mtx
+        // reads the whole MTX directory into memory (`read_mtx_directory`),
+        // `write_scx_to_mtx` assembles the whole CSR, and the `tenx_to_scx`
+        // dispatch arm never consults the flag at all.
+        "mtx_to_scx" | "tenx_to_scx" | "scx_to_mtx" => false,
+        _ => false,
+    }
+}
+
+/// Resolve the effective streaming mode for `direction`.
+///
+/// `requested` is the `--stream` flag as the user gave it: `None` when the flag
+/// was absent, `Some(v)` when it was passed. Absent means "do whatever this
+/// direction does natively", which is why the flag must not carry a clap
+/// default — a default `true` cannot be told apart from an explicit one, and
+/// rejecting on it makes every non-streaming direction unreachable.
+///
+/// `Some(false)` is always honoured: on a non-streaming direction the request
+/// is already satisfied, so it resolves to `false` rather than erroring. Only
+/// `Some(true)` on a direction with no streaming path is an error, because that
+/// is the one request the pipeline cannot fulfil.
+pub fn resolve_stream(requested: Option<bool>, direction: &str) -> Result<bool, String> {
+    let supported = direction_supports_streaming(direction);
+    match requested {
+        None => Ok(supported),
+        Some(false) => Ok(false),
+        Some(true) if supported => Ok(true),
+        Some(true) => Err(format!(
+            "--stream is not supported for direction '{direction}'. Streaming is implemented \
+             only for h5ad → scx, h5mu → scx, scx → h5ad and scx → h5mu; mtx ↔ scx and \
+             10x → scx have a single materializing path. Re-run without --stream — the flag \
+             is not needed for this direction."
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    /// The canonical `--from` / `--to` spelling for each direction.
+    const DIRECTION_FLAGS: [(Option<&str>, Option<&str>, &str); 7] = [
+        (Some("mtx"), None, "mtx_to_scx"),
+        (Some("h5ad"), None, "h5ad_to_scx"),
+        (Some("h5mu"), None, "h5mu_to_scx"),
+        (Some("10x"), None, "tenx_to_scx"),
+        (None, Some("mtx"), "scx_to_mtx"),
+        (None, Some("h5ad"), "scx_to_h5ad"),
+        (None, Some("h5mu"), "scx_to_h5mu"),
+    ];
+
+    const STREAMING_DIRECTIONS: [&str; 4] =
+        ["h5ad_to_scx", "h5mu_to_scx", "scx_to_h5ad", "scx_to_h5mu"];
 
     #[test]
     fn explicit_from_h5ad_with_scx_extension() {
@@ -203,5 +280,88 @@ mod tests {
         let p = Path::new("input.scx");
         let err = determine_convert_direction(None, Some("parquet"), p).unwrap_err();
         assert!(err.contains("Unknown --to value"));
+    }
+
+    // --- `--stream` resolution -------------------------------------------
+    //
+    // The first two tests are the drift lock described on
+    // `ALL_CONVERT_DIRECTIONS`: an eighth direction breaks
+    // `every_direction_is_reachable_from_flags` until the array is updated,
+    // and updating the array then breaks
+    // `streaming_capability_is_total_over_all_directions` until it is
+    // classified. Neither can be silently skipped.
+
+    #[test]
+    fn every_direction_is_reachable_from_flags() {
+        let p = Path::new("input.bin");
+        let mut reached = BTreeSet::new();
+        for (from, to, expected) in DIRECTION_FLAGS {
+            let got = determine_convert_direction(from, to, p).unwrap();
+            assert_eq!(got, expected, "--from {from:?} --to {to:?}");
+            reached.insert(got);
+        }
+        let all: BTreeSet<&str> = ALL_CONVERT_DIRECTIONS.into_iter().collect();
+        assert_eq!(
+            reached, all,
+            "ALL_CONVERT_DIRECTIONS must be exactly the set determine_convert_direction returns"
+        );
+    }
+
+    #[test]
+    fn streaming_capability_is_total_over_all_directions() {
+        let streaming: BTreeSet<&str> = ALL_CONVERT_DIRECTIONS
+            .into_iter()
+            .filter(|d| direction_supports_streaming(d))
+            .collect();
+        let expected: BTreeSet<&str> = STREAMING_DIRECTIONS.into_iter().collect();
+        assert_eq!(
+            streaming, expected,
+            "every direction must be classified; a new one defaults to non-streaming, \
+             so decide deliberately and update STREAMING_DIRECTIONS if it streams"
+        );
+    }
+
+    #[test]
+    fn resolve_stream_absent_follows_direction() {
+        for direction in ALL_CONVERT_DIRECTIONS {
+            let expected = STREAMING_DIRECTIONS.contains(&direction);
+            assert_eq!(
+                resolve_stream(None, direction).unwrap(),
+                expected,
+                "absent --stream on '{direction}'"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_stream_explicit_true_rejected_on_non_streaming() {
+        for direction in ALL_CONVERT_DIRECTIONS {
+            let result = resolve_stream(Some(true), direction);
+            if STREAMING_DIRECTIONS.contains(&direction) {
+                assert!(result.unwrap(), "--stream on '{direction}' should stream");
+            } else {
+                let err = result.unwrap_err();
+                assert!(err.contains("--stream"), "{err}");
+                assert!(err.contains(direction), "{err}");
+                assert!(
+                    err.contains("Re-run without"),
+                    "the message must name the remedy: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_stream_explicit_false_is_always_accepted() {
+        // Deliberate: on a non-streaming direction `--stream=false` is already
+        // satisfied, so it is a no-op rather than an error. Scripts written
+        // against the older CLI (which rejected the *default* `true` and so
+        // forced users to pass `--stream=false`) keep working.
+        for direction in ALL_CONVERT_DIRECTIONS {
+            assert!(
+                !resolve_stream(Some(false), direction).unwrap(),
+                "--stream=false on '{direction}'"
+            );
+        }
     }
 }

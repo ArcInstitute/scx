@@ -234,7 +234,10 @@ scx convert <input> <output> [--from h5ad|10x|h5mu|mtx|scx] [--to h5ad|h5mu|scx]
     [--sort-by CSV] [--sort-reverse]
     [--obs-override PATH] [--var-override PATH] [--uns-override PATH]
 ```
-- `--stream` (default true) bounds peak memory; supported h5ad ↔ SCX and h5mu ↔ SCX both directions.
+- `--stream` bounds peak memory. It applies to h5ad ↔ SCX and h5mu ↔ SCX in both
+  directions, which stream by default. MTX ↔ SCX and 10x → SCX have a single
+  materialising path: omit the flag (an explicit `--stream` there is an error;
+  `--stream=false` is accepted as a no-op). A value needs the `=` form.
 - On ingest, `--csc always` (or `--csc auto` over a dataset above the size
   thresholds) does the two-pass CSR-then-rebuild write.
 - For multimodal SCX → h5ad, combine `--to h5ad --modality NAME`.
