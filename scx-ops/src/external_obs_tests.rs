@@ -1365,3 +1365,114 @@ fn diagnoses_a_real_atlas_whose_index_is_not_a_key() {
     );
     assert!(d.suggestion.is_some());
 }
+
+// ---------------------------------------------------------------------------
+// E2 — a partial-coverage import must not read like a failed join
+// ---------------------------------------------------------------------------
+
+/// Panics if the closure is called, so a test can prove the coverage branch
+/// never pays for (or prints) the key examples.
+fn examples_must_not_be_needed() -> (Vec<String>, Vec<String>) {
+    panic!("the coverage branch must not extract key examples");
+}
+
+fn some_examples() -> (Vec<String>, Vec<String>) {
+    (
+        vec!["0".to_string(), "1".to_string()],
+        vec!["374584".to_string(), "374585".to_string()],
+    )
+}
+
+/// The report's exact case: the documented per-batch workflow imported 6 of 116
+/// `dataset_id` batches — 186,649 of 500,000 target rows — with every source row
+/// matched. That is a perfect join over a deliberate subset, and it was reported
+/// with the word "only" plus a target/source example pair, which is the standard
+/// shape of a key-format-mismatch diagnostic.
+#[test]
+fn partial_coverage_reports_coverage_at_info_without_examples() {
+    let (level, msg) = obs_join_coverage_report(
+        186_649,
+        500_000,
+        313_351,
+        0, // every source row matched
+        "obs_names",
+        examples_must_not_be_needed,
+    )
+    .expect("below half, so something must be reported");
+
+    assert_eq!(
+        level,
+        log::Level::Info,
+        "a deliberate partial import is information, not a warning"
+    );
+    assert!(
+        !msg.contains("only"),
+        "\"only\" frames a correct join as a shortfall: {msg}"
+    );
+    assert!(
+        !msg.contains("examples"),
+        "both example lists are valid keys from the same space; showing them \
+         side by side reads as evidence of divergence: {msg}"
+    );
+    // What it must say instead: the arithmetic, and that nothing is wrong.
+    for needle in ["coverage", "186649", "500000", "313351", "left null"] {
+        assert!(msg.contains(needle), "must mention {needle:?}: {msg}");
+    }
+    assert!(
+        msg.contains("not a key mismatch"),
+        "must say outright that this is not the failure it resembles: {msg}"
+    );
+}
+
+/// A genuine mismatch keeps every diagnostic it had: the "only" framing, the
+/// example pair, and the hard-won prefix / `-1`-suffix hint.
+#[test]
+fn unmatched_source_rows_still_warn_with_examples() {
+    let (level, msg) = obs_join_coverage_report(10, 100, 90, 40, "barcode", some_examples)
+        .expect("below half, so something must be reported");
+
+    assert_eq!(level, log::Level::Warn);
+    assert!(msg.contains("only"), "{msg}");
+    assert!(
+        msg.contains("40 source rows matched no target row"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("-1") && msg.contains("prefix"),
+        "the domain hint must survive: {msg}"
+    );
+    assert!(msg.contains("374584"), "source examples must appear: {msg}");
+    assert!(msg.contains("barcode"), "the key name must appear: {msg}");
+}
+
+/// Above half, nothing is reported at all — the pre-existing threshold, kept so
+/// this change alters the *shape* of the message and not how often it appears.
+#[test]
+fn high_coverage_reports_nothing() {
+    assert!(
+        obs_join_coverage_report(50, 100, 50, 0, "obs_names", examples_must_not_be_needed)
+            .is_none(),
+        "exactly half is not below half"
+    );
+    assert!(
+        obs_join_coverage_report(99, 100, 1, 20, "obs_names", examples_must_not_be_needed)
+            .is_none(),
+        "high coverage stays silent even with unmatched source rows"
+    );
+}
+
+/// The discriminator is `n_source_absent`, not the match fraction: two joins with
+/// identical coverage must be reported differently based only on whether source
+/// rows failed to land.
+#[test]
+fn identical_coverage_splits_on_unmatched_source_rows_alone() {
+    let coverage =
+        obs_join_coverage_report(10, 100, 90, 0, "k", examples_must_not_be_needed).unwrap();
+    let mismatch = obs_join_coverage_report(10, 100, 90, 5, "k", some_examples).unwrap();
+    assert_eq!(coverage.0, log::Level::Info);
+    assert_eq!(mismatch.0, log::Level::Warn);
+    assert_ne!(
+        coverage.1, mismatch.1,
+        "same coverage, different cause — the messages must differ"
+    );
+}

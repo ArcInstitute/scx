@@ -136,7 +136,7 @@ Most-used kwargs (shared across ingest entry points):
   CPU analysis (Scx1 has GPU in-VRAM decode + ~1.3–1.8× faster CPU decode);
   use `"compact-trial"` for storage-constrained archival or cloud hosting
   (1.3–2.1× smaller on integer counts, retains random access via framing).
-  See [docs/codec.md § Codec tradeoff summary](../docs/codec.md#codec-tradeoff-summary--scx1-vs-shufdeltazstd)
+  See [docs/codec.md § Codec tradeoff summary](../../docs/codec.md#codec-tradeoff-summary--scx1-vs-shufdeltazstd)
   for the full comparison.
 - `index_obs=[...]` / `index_var=[...]` / `index_preset="cellxgene"|"perturbseq"|"training"`
   — **materialize predicate indexes at write time** so a later

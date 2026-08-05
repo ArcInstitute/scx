@@ -128,14 +128,24 @@ schema** as the pydeseq2 path, so existing consumers need no changes, and it has
 ```python
 df = pyscx.accel.pseudobulk_dex(
     adata,
+    # The columns that define a pseudobulk SAMPLE — condition + replicate.
+    # `sample_cols=` / `sample_key=` are aliases named for this role; see below.
     groupby=["perturbation", "donor"],
-    test_col="perturbation",
+    test_col="perturbation",    # the column actually compared
     reference="control",
     backend="nb_glm",           # default is "pydeseq2"
 )
 # columns: gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj,
 #          target, reference
 ```
+
+> **`groupby` does not mean here what it means in `rank_genes_groups`.** There
+> (and in scanpy) it is the compared column; in `pseudobulk_dex` it is the set of
+> columns defining a pseudobulk sample, and `test_col` is the compared one.
+> Passing only the condition column gives one sample per condition — no
+> replication, which the NB-GLM then refuses (see [Replicate
+> requirement](#replicate-requirement)). `sample_cols=` and `sample_key=` are
+> accepted as aliases for `groupby`; pass exactly one of the three.
 
 ## Replicate requirement
 

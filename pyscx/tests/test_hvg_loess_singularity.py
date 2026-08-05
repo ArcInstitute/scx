@@ -566,12 +566,23 @@ def test_warning_names_the_batch_by_label_not_just_index(
     assert entry[2] == named[0], f"uns label {entry!r} disagrees with the warning"
 
 
-def test_no_batch_key_still_reports_without_a_label(
+def test_no_batch_key_reports_as_one_fit_not_as_one_batch(
     synthetic_adata, scx_from_adata, monkeypatch
 ):
-    """With one implicit batch there is no label to print — and no crash."""
-    import re
+    """With no `batch_key` the failure must be described as the single fit it is.
 
+    This test previously asserted the *old* contract — a `RuntimeError` reading
+    "all 1 batches failed", a warning reading "skmisc.loess fit failed on 1 of 1
+    batches", and a "batch index 0 (n=… cells)" clause. Dogfood E3 is precisely
+    that those are wrong when the caller passed no `batch_key`: they lead with
+    advice about a parameter that was never supplied, count batches nobody asked
+    for, and bury the remedy that works (`filter_genes(min_cells=10)`, which on
+    the reported case cut 61,497 genes to 9,998 and made the fit succeed) at the
+    end, phrased as a limitation.
+
+    Retained from the original intent: no invented batch label, no dangling
+    `key=` fragment, and the `uns` record still omits the label element.
+    """
     import pyscx
 
     path = scx_from_adata(synthetic_adata, "hvg_loess_nobatch.scx")
@@ -580,21 +591,89 @@ def test_no_batch_key_still_reports_without_a_label(
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        # One implicit batch, and it is the one patched to fail — so this is
-        # the all-batches-failed hard error. The summary warning is still
-        # emitted first, and it is the warning this test is about.
-        with pytest.raises(RuntimeError, match="all 1 batches failed"):
+        # The single implicit fit is the one patched to fail, so this is also the
+        # nothing-survived hard error. The summary warning is emitted first and
+        # is what this test is about.
+        with pytest.raises(RuntimeError) as exc:
             pyscx.accel.highly_variable_genes(
                 adata, n_top_genes=10, flavor="seurat_v3", device="cpu"
             )
+    err = str(exc.value)
+    assert "batches failed" not in err, (
+        f"the unbatched error must not count batches the caller never asked "
+        f"for: {err}"
+    )
+    assert "no variance trend to rank genes against" in err, err
 
     msg = next(
-        str(w.message) for w in caught if "skmisc.loess fit failed on" in str(w.message)
+        str(w.message) for w in caught if "skmisc.loess fit failed" in str(w.message)
     )
-    assert "batch index 0" in msg
-    # No batch_key → the cell count and nothing else. In particular no
-    # invented label and no dangling `key=` fragment.
-    detail = msg.split("batch index 0 (")[1].split(")")[0]
-    assert re.fullmatch(r"n=\d+ cells", detail), f"unexpected detail {detail!r}"
+    # No batch_key → no batch_key advice, and no batch bookkeeping.
+    assert "batch_key" not in msg, f"inapplicable advice: {msg}"
+    for noise in ["1 of 1", "batch index", "per-batch"]:
+        assert noise not in msg, f"{noise!r} is noise for a single fit: {msg}"
+    # Never the "filter_genes only helps the global fit" limitation phrasing —
+    # this *is* the global fit.
+    assert "only helps" not in msg, f"phrased as a limitation: {msg}"
+    # Whichever remedy applies, it must be one that can actually work on THIS
+    # input. Every gene in the fixture is non-constant, so there is nothing for
+    # `filter_genes` to drop and it must not be offered — the same
+    # "advice that cannot apply" defect E3 is about, one level down.
+    n_vars = adata.n_vars
+    assert f"{n_vars} of {n_vars} genes" in msg, (
+        f"the fixture has no constant genes, so the fit-point count should equal "
+        f"n_vars ({n_vars}): {msg}"
+    )
+    assert "filtering cannot add points" in msg, msg
+    assert "filter_genes" not in msg, (
+        f"with 0 constant genes, filter_genes removes nothing: {msg}"
+    )
+    # uns keeps the historical no-label shape.
     entry = list(adata.uns["hvg"]["loess_failed_batches"][0])
     assert len(entry) == 2, f"no batch_key → no label element, got {entry!r}"
+
+
+def test_no_batch_key_with_constant_genes_leads_with_filter_genes(
+    scx_from_adata, monkeypatch
+):
+    """The other unbatched branch: when genes *are* constant, offer the fix.
+
+    This is the reported shape — 42,267 of 61,497 genes expressed in no cell —
+    where `filter_genes(min_cells=10)` is what makes the fit well-conditioned.
+    Its sibling above covers the case where nothing is constant and the same
+    advice would be useless.
+    """
+    import anndata as ad
+    import numpy as np
+    import scipy.sparse as sp
+
+    import pyscx
+
+    rng = np.random.default_rng(11)
+    n_obs, n_vars, expressed = 40, 200, 30
+    dense = np.zeros((n_obs, n_vars), dtype=np.float32)
+    dense[:, :expressed] = rng.poisson(3.0, (n_obs, expressed)).astype(np.float32)
+    src = ad.AnnData(X=sp.csr_matrix(dense))
+    src.obs_names = [f"c{i}" for i in range(n_obs)]
+    src.var_names = [f"g{i}" for i in range(n_vars)]
+
+    path = scx_from_adata(src, "hvg_loess_constant_genes.scx")
+    adata = pyscx.open(path).to_anndata(backed=True)
+    _patch_loess_to_raise_on_first_batch(monkeypatch)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(RuntimeError):
+            pyscx.accel.highly_variable_genes(
+                adata, n_top_genes=5, flavor="seurat_v3", device="cpu"
+            )
+    msg = next(
+        str(w.message) for w in caught if "skmisc.loess fit failed" in str(w.message)
+    )
+    assert f"{expressed} of {n_vars} genes" in msg, msg
+    assert f"other {n_vars - expressed} are constant" in msg, msg
+    assert "filter_genes(min_cells=10)" in msg, (
+        f"with {n_vars - expressed} constant genes this IS the remedy: {msg}"
+    )
+    # And it must come before the fallback, not after it.
+    assert msg.index("filter_genes") < msg.index('flavor="seurat"'), msg

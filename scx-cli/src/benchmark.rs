@@ -122,10 +122,13 @@ pub fn run_benchmark(
         println!("SCX Benchmark Results");
         println!("=====================");
         println!();
+        // Route through the shared formatter rather than repeating the 1024²
+        // math with a decimal label (F10) — one source for every size the CLI
+        // prints in binary units.
         println!(
-            "File: {} ({:.1} MB)",
+            "File: {} ({})",
             file.display(),
-            file_size as f64 / 1024.0 / 1024.0
+            crate::format::human_size(file_size)
         );
         println!(
             "Data: {} cells x {} genes, {} nnz, {} shards",

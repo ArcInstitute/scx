@@ -1261,3 +1261,973 @@ fn test_optimize_rejects_invalid_shard_obs() {
         "clap value_parser must reject an invalid --shard-obs value"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `scx build-csc` — in-place form (dogfood F9) + framing preservation
+// ---------------------------------------------------------------------------
+
+/// Write a **framed** (v4 / shard-v2) test file, so the framing-preservation
+/// assertions below have something to preserve. `write_test_file` produces an
+/// unframed v3 file, against which "output is still v4" is vacuous.
+fn write_framed_test_file(
+    dir: &tempfile::TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let mut header = sample_header(n_obs as u64, n_vars as u64, (n_obs * 2) as u64);
+    header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.set_framing(Some(scx_format_io::FramingConfig {
+        row_group_rows: 4,
+        ..Default::default()
+    }));
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Zstd,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// F9: `scx build-csc <INPUT>` with no `<OUTPUT>` adds the sidecar to the input
+/// in place. The CSC store is described everywhere as a sidecar *on* a file, and
+/// its in-place neighbours (`obs-import` / `doublet-import` /
+/// `cellbender-import`) all mutate; requiring an `<OUTPUT>` here read as a
+/// missing argument rather than a design choice.
+#[test]
+fn test_build_csc_in_place_adds_sidecar_to_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "in_place.scx", 8, 6);
+
+    // Anti-vacuous: the fixture must NOT already have a sidecar, or "has_csc"
+    // afterwards would prove nothing.
+    assert!(
+        !ScxReader::open(&input).unwrap().header().has_csc(),
+        "fixture precondition: input must start without a CSC sidecar"
+    );
+
+    let out = scx_cli()
+        .args(["build-csc", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build-csc with no <OUTPUT> must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The *same path* now carries the sidecar — that is what "in place" means.
+    let reader = ScxReader::open(&input).unwrap();
+    assert!(
+        reader.header().has_csc(),
+        "in-place build-csc must set has_csc on the input path"
+    );
+    assert!(
+        reader.header().n_csc_shards > 0,
+        "in-place build-csc must emit CSC shards"
+    );
+    assert_eq!(reader.header().n_obs, 8, "obs axis must be unchanged");
+    assert_eq!(reader.header().n_vars, 6, "var axis must be unchanged");
+
+    // No stray staging file: `rebuild_csc_inplace` writes `*.rebuild_csc.tmp`
+    // beside the target and must always clean it up.
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "in-place build-csc leaked staging files: {leftovers:?}"
+    );
+}
+
+/// `build-csc` flattens every CSR shard against the single top-level shape, so a
+/// multimodal input must be refused. `pyscx.build_csc` had guarded this since it
+/// was written; the CLI reached `read_var()` and failed with an opaque
+/// `section not found: var`. The guard now lives in `scx_ops::run_build_csc`, so
+/// **both** CLI forms report it — and the in-place form must additionally leave
+/// the target untouched and leak no staging file.
+#[test]
+fn test_build_csc_rejects_multimodal_on_both_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_multimodal_test_file(&dir, "cite.scx", 8, 6, 3);
+    let before = std::fs::read(&input).unwrap();
+
+    for args in [
+        vec!["build-csc", input.to_str().unwrap()],
+        vec![
+            "build-csc",
+            input.to_str().unwrap(),
+            dir.path().join("out.scx").to_str().unwrap(),
+        ],
+    ] {
+        let out = scx_cli().args(&args).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "build-csc {args:?} must refuse a multimodal input"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("multimodal"),
+            "the error must name the actual problem, not `section not found: \
+             var`; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("--modality"),
+            "and must name the way out (`scx subset --modality NAME`); got: {stderr}"
+        );
+    }
+
+    // The in-place attempt must be a true no-op.
+    assert_eq!(
+        std::fs::read(&input).unwrap(),
+        before,
+        "a refused in-place build-csc must leave the target byte-identical"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a refused in-place build-csc leaked staging files: {leftovers:?}"
+    );
+}
+
+/// In place does **not** imply undoable, and `docs/operations.md` now says so —
+/// pin it so the claim cannot silently go stale in either direction.
+///
+/// `rebuild_csc_inplace` stages a wholly new file via `run_build_csc` and renames
+/// it over the target, so it carries no prior catalog and does not go through the
+/// `prepare_in_place` / `commit_in_place` manifest chain the import ops use.
+#[test]
+fn test_build_csc_in_place_is_not_rollback_able() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "no_rollback.scx", 8, 6);
+
+    let out = scx_cli()
+        .args(["build-csc", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(ScxReader::open(&input).unwrap().header().has_csc());
+
+    let rb = scx_cli()
+        .args(["rollback", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !rb.status.success(),
+        "an in-place build-csc leaves no prior catalog, so rollback must fail \
+         loudly rather than appear to succeed and change nothing"
+    );
+    let stderr = String::from_utf8_lossy(&rb.stderr);
+    assert!(
+        stderr.contains("no previous catalog"),
+        "the failure must say why, got: {stderr}"
+    );
+    // And the file is unchanged by the refused rollback.
+    assert!(
+        ScxReader::open(&input).unwrap().header().has_csc(),
+        "a refused rollback must not have modified the file"
+    );
+}
+
+/// Both forms must preserve row-group framing. The copy-out arm used to pass
+/// `framing = None`, which routes through
+/// `rewrite_output_format_version(&[4], 1) == 3` and silently downgraded a
+/// framed v4 input to unframed v3 — so adding the in-place form without fixing
+/// it would have put two framing behaviours on one subcommand.
+#[test]
+fn test_build_csc_preserves_v4_framing_both_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let in_place = write_framed_test_file(&dir, "framed_in_place.scx", 12, 6);
+    let copy_src = write_framed_test_file(&dir, "framed_src.scx", 12, 6);
+    let copy_out = dir.path().join("framed_out.scx");
+
+    for args in [
+        vec!["build-csc", in_place.to_str().unwrap()],
+        vec![
+            "build-csc",
+            copy_src.to_str().unwrap(),
+            copy_out.to_str().unwrap(),
+        ],
+    ] {
+        let out = scx_cli().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "build-csc {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    for (label, path) in [("in-place", &in_place), ("copy-out", &copy_out)] {
+        let reader = ScxReader::open(path).unwrap();
+        assert_eq!(
+            reader.header().format_version,
+            scx_format_io::header::CURRENT_FORMAT_VERSION,
+            "{label} build-csc on a v4 input must stay v4, not downgrade to v3"
+        );
+        assert!(
+            reader.header().has_csc(),
+            "{label} build-csc must emit the sidecar"
+        );
+        for entry in &reader.catalog().shards(SectionType::CsrShard) {
+            let sh = reader.read_shard_header(entry).unwrap();
+            assert!(
+                sh.shard_format_version > 1,
+                "{label}: CSR shard '{}' must stay framed v2, got v{}",
+                entry.name,
+                sh.shard_format_version
+            );
+        }
+    }
+}
+
+/// `--force` overwrites an `<OUTPUT>`; there is no output to overwrite in the
+/// in-place form. Refuse rather than ignore — silently accepting it would imply
+/// a guard that does not exist.
+#[test]
+fn test_build_csc_in_place_rejects_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "force_no_output.scx", 6, 4);
+
+    let out = scx_cli()
+        .args(["build-csc", input.to_str().unwrap(), "--force"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--force without <OUTPUT> must be rejected, not silently ignored"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--force"),
+        "the error must name the offending flag, got: {stderr}"
+    );
+
+    // And it must not have half-run: no sidecar, no staging file.
+    assert!(
+        !ScxReader::open(&input).unwrap().header().has_csc(),
+        "a rejected invocation must not have modified the input"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `scx subset --index-*` — query-ready subsets (dogfood F7)
+// ---------------------------------------------------------------------------
+
+/// Write a multi-shard file whose `cell_type` is **clustered** (one value per
+/// contiguous run) rather than cycled.
+///
+/// Clustering is what makes Level-1 pruning observable at all: the catalog's
+/// per-shard category bitsets can only eliminate a shard when the queried value
+/// is absent from it. With `sample_obs`'s T/B/NK cycle every shard holds every
+/// value, so "0 shards eliminated" would be correct with or without an index and
+/// the assertion below would be vacuous.
+fn write_clustered_test_file(
+    dir: &tempfile::TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+    shard_rows: usize,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let mut header = sample_header(n_obs as u64, n_vars as u64, (n_obs * 2) as u64);
+    header.shard_target_rows = shard_rows as u32;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    // 4 contiguous cell_type runs; `disease` splits the file in half so a
+    // filter-subset retains a contiguous prefix spanning 2 of the 4 runs.
+    let quarter = n_obs / 4;
+    let half = n_obs / 2;
+    let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    let cell_types: Vec<&str> = (0..n_obs)
+        .map(|i| match i / quarter {
+            0 => "T cell",
+            1 => "B cell",
+            2 => "NK cell",
+            _ => "monocyte",
+        })
+        .collect();
+    let diseases: Vec<&str> = (0..n_obs)
+        .map(|i| if i < half { "normal" } else { "covid" })
+        .collect();
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("cell_type", DataType::Utf8, true),
+        Field::new("disease", DataType::Utf8, true),
+    ]);
+    let obs = arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(cell_types)),
+            Arc::new(StringArray::from(diseases)),
+        ],
+    )
+    .unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    // One CSR shard per `shard_rows` rows, so the output has several shards to
+    // prune among.
+    let mut row = 0usize;
+    while row < n_obs {
+        let rows = std::cmp::min(shard_rows, n_obs - row);
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for r in row..row + rows {
+            indices.push((r % n_vars) as u32);
+            values.push(((r % 200) + 1) as u8);
+            indptr.push(indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row as u64,
+            )
+            .unwrap();
+        row += rows;
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// F7 end-to-end: `scx subset --index-obs` makes the subset query-ready.
+///
+/// Asserts the *user-visible* property, not merely that a section exists —
+/// `--explain`'s Level-1 shard elimination, measured against the identical
+/// subset built without the flag. Without an obs predicate index the engine has
+/// no category dictionary, so a `Utf8` equality predicate cannot resolve to the
+/// catalog's per-shard category bitsets and nothing prunes.
+#[test]
+fn test_subset_index_preset_makes_output_query_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_clustered_test_file(&dir, "atlas.scx", 400, 20, 50);
+    let no_index = dir.path().join("subset_plain.scx");
+    let indexed = dir.path().join("subset_indexed.scx");
+
+    for (out, extra) in [
+        (&no_index, Vec::new()),
+        (&indexed, vec!["--index-obs", "cell_type"]),
+    ] {
+        let mut args = vec![
+            "subset",
+            input.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--filter",
+            "disease == 'normal'",
+            "--shard-size",
+            "25",
+        ];
+        args.extend(extra);
+        let res = scx_cli().args(&args).output().unwrap();
+        assert!(
+            res.status.success(),
+            "subset failed: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+    }
+
+    // The section itself: absent without the flag, present with it.
+    assert!(
+        ScxReader::open(&no_index)
+            .unwrap()
+            .read_obs_predicate_index_bytes()
+            .unwrap()
+            .is_none(),
+        "no --index-* flag must leave the subset unindexed"
+    );
+    assert!(
+        ScxReader::open(&indexed)
+            .unwrap()
+            .read_obs_predicate_index_bytes()
+            .unwrap()
+            .is_some(),
+        "--index-obs must write an obs predicate index"
+    );
+
+    // And what it buys: pushdown.
+    let explain = |path: &PathBuf| -> String {
+        let out = scx_cli()
+            .args([
+                "query",
+                path.to_str().unwrap(),
+                "--filter",
+                "cell_type == 'T cell'",
+                "--count",
+                "--explain",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "query failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // `--explain` goes to stderr, the count to stdout; return both.
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        )
+    };
+
+    let plain = explain(&no_index);
+    let with_index = explain(&indexed);
+
+    // Correctness first: both must return the same rows. A pruning win that
+    // changed the answer would be a catastrophe, not an optimisation.
+    let matched = |s: &str| {
+        s.lines()
+            .find_map(|l| l.trim().strip_prefix("matched rows: "))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| panic!("no `matched rows:` line in explain output:\n{s}"))
+    };
+    assert_eq!(
+        matched(&plain),
+        matched(&with_index),
+        "indexing must not change which rows match"
+    );
+
+    let eliminated = |s: &str| -> (u32, u32) {
+        let line = s
+            .lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("Level 1 (catalog-stats) eliminated: ")
+            })
+            .unwrap_or_else(|| panic!("no Level-1 line in explain output:\n{s}"));
+        let (num, den) = line.trim().split_once('/').expect("N/M form");
+        (num.parse().unwrap(), den.parse().unwrap())
+    };
+    let (plain_elim, plain_total) = eliminated(&plain);
+    let (idx_elim, idx_total) = eliminated(&with_index);
+
+    assert_eq!(
+        plain_total, idx_total,
+        "both subsets must have the same shard count, or the comparison is unfair"
+    );
+    assert_eq!(
+        plain_elim, 0,
+        "without an obs predicate index there is no category dictionary, so a \
+         Utf8 equality predicate cannot prune any shard (got {plain_elim}/{plain_total})"
+    );
+    assert!(
+        idx_elim > 0,
+        "the whole point of --index-obs on a subset: the rebuilt index must let \
+         Level 1 eliminate shards (got {idx_elim}/{idx_total})"
+    );
+}
+
+/// The drop warning must name the remedy. Before F7 it said only "predicate
+/// indices dropped (invalid after subsetting)", which left the user with no
+/// one-step way to get a query-ready subset — and the docs pointed at
+/// `scx convert --index-obs`, which cannot take an `.scx` input at all.
+#[test]
+fn test_subset_index_drop_warning_names_the_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_clustered_test_file(&dir, "atlas_warn.scx", 200, 10, 50);
+
+    // Give the input an index to drop, via a first indexed subset.
+    let indexed_input = dir.path().join("indexed_input.scx");
+    let res = scx_cli()
+        .args([
+            "subset",
+            input.to_str().unwrap(),
+            indexed_input.to_str().unwrap(),
+            "--filter",
+            "disease == 'normal'",
+            "--index-obs",
+            "cell_type",
+        ])
+        .output()
+        .unwrap();
+    assert!(res.status.success());
+
+    // Now subset THAT without any --index-* flag: the warning must fire and
+    // must name the flags.
+    let out = dir.path().join("dropped.scx");
+    let res = scx_cli()
+        .args([
+            "subset",
+            indexed_input.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'T cell'",
+        ])
+        .output()
+        .unwrap();
+    assert!(res.status.success());
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("predicate indices dropped"),
+        "the drop must still be reported, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--index-obs") && stderr.contains("--index-preset"),
+        "the warning must name the flags that rebuild the index, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("scx convert"),
+        "must not point at `scx convert`, which cannot read an .scx input: {stderr}"
+    );
+
+    // Control: with a flag, no drop warning — the outcome is reported instead.
+    let out2 = dir.path().join("rebuilt.scx");
+    let res = scx_cli()
+        .args([
+            "subset",
+            indexed_input.to_str().unwrap(),
+            out2.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'T cell'",
+            "--index-obs",
+            "cell_type",
+        ])
+        .output()
+        .unwrap();
+    assert!(res.status.success());
+    let stderr2 = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        !stderr2.contains("predicate indices dropped"),
+        "a requested rebuild must not also warn about dropping, got: {stderr2}"
+    );
+    assert!(
+        String::from_utf8_lossy(&res.stdout).contains("indexed obs columns: cell_type"),
+        "the rebuild must report what it indexed, got: {}",
+        String::from_utf8_lossy(&res.stdout)
+    );
+}
+
+/// `--index-preset cellxgene` on a file lacking the preset's columns must warn
+/// per column through the shared renderer, not fail — matching `merge` /
+/// `compact` / `append`, whose wording comes from the same `emit_index_summary`.
+#[test]
+fn test_subset_index_preset_missing_columns_warns_like_siblings() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_clustered_test_file(&dir, "atlas_preset.scx", 200, 10, 50);
+    let out = dir.path().join("preset.scx");
+
+    let res = scx_cli()
+        .args([
+            "subset",
+            input.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--filter",
+            "disease == 'normal'",
+            "--index-preset",
+            "cellxgene",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "a preset with missing columns must warn, not fail: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("subset: preset obs index column"),
+        "preset skips must be attributed to `subset` via the shared renderer, \
+         got: {stderr}"
+    );
+    // The preset's `cell_type` / `disease` DO exist here, so they must land.
+    assert!(
+        ScxReader::open(&out)
+            .unwrap()
+            .read_obs_predicate_index_bytes()
+            .unwrap()
+            .is_some(),
+        "the columns the preset did find must still be indexed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `scx query` on an empty result — category-miss note (dogfood E1)
+// ---------------------------------------------------------------------------
+
+/// Write a file whose `cell_type` is a **dictionary-encoded** categorical
+/// declaring a value no row uses.
+///
+/// That unused value is the load-bearing half of E1: querying it is a *genuine*
+/// zero and must stay silent, while a value outside the vocabulary is a typo and
+/// must be called out. A fixture with only used categories cannot tell a
+/// correct implementation from one that flags every empty result.
+fn write_categorical_test_file(dir: &tempfile::TempDir, filename: &str) -> PathBuf {
+    use arrow::array::{ArrayRef, DictionaryArray, Int32Array};
+    use arrow::datatypes::Int32Type;
+
+    let path = dir.path().join(filename);
+    let n_obs = 6usize;
+    let n_vars = 4usize;
+    let mut header = sample_header(n_obs as u64, n_vars as u64, (n_obs * 2) as u64);
+    header.shard_target_rows = 16384;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    // Vocabulary: 3 values; keys only ever reference 0 and 1, so "monocyte" is
+    // declared-but-unused.
+    let keys = Int32Array::from(vec![0, 1, 0, 1, 0, 1]);
+    let values = StringArray::from(vec!["B cell", "NK cell", "monocyte"]);
+    let cell_type: ArrayRef =
+        Arc::new(DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap());
+    let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    let obs = arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new(
+                "cell_type",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            cell_type,
+        ],
+    )
+    .unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// Run `scx query --count` and return (stderr, stdout).
+fn query_count(path: &std::path::Path, filter: &str) -> (String, String) {
+    let out = scx_cli()
+        .args([
+            "query",
+            path.to_str().unwrap(),
+            "--filter",
+            filter,
+            "--count",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "query {filter:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// E1: a `0` from a mistyped category and a `0` from an empty slice used to look
+/// identical, which is the single most likely way to silently mis-slice an atlas.
+#[test]
+fn test_query_empty_match_names_the_missing_category() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_categorical_test_file(&dir, "cats.scx");
+
+    // (a) Outside the vocabulary → a note naming the value, the column, the
+    // vocabulary size, and the near-match.
+    let (stderr, stdout) = query_count(&path, "cell_type == 'B cel'");
+    assert_eq!(stdout.trim(), "0");
+    assert!(
+        stderr.contains("no category"),
+        "a mistyped category must be called out, got: {stderr}"
+    );
+    for needle in ["B cel", "cell_type", "3 known categories", "B cell"] {
+        assert!(
+            stderr.contains(needle),
+            "the note must mention {needle:?}, got: {stderr}"
+        );
+    }
+
+    // (b) Declared but unused → a GENUINE zero. Silence here is the whole point:
+    // the note must mean "you mistyped", not "your query returned nothing".
+    let (stderr, stdout) = query_count(&path, "cell_type == 'monocyte'");
+    assert_eq!(stdout.trim(), "0");
+    assert!(
+        !stderr.contains("no category"),
+        "'monocyte' IS a declared category with zero rows — a genuine empty \
+         result, which must not be reported as a typo: {stderr}"
+    );
+
+    // (c) A non-empty result must never carry the note.
+    let (stderr, stdout) = query_count(&path, "cell_type == 'B cell'");
+    assert_eq!(stdout.trim(), "3");
+    assert!(!stderr.contains("no category"), "got: {stderr}");
+}
+
+/// The note is not gated behind `--explain`: a bare `--count` prints the same
+/// misleading `0`, and a user with no reason to suspect a typo has no reason to
+/// reach for a flag. It must also survive alongside `--explain` and `--json`.
+#[test]
+fn test_query_category_note_is_not_gated_behind_explain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_categorical_test_file(&dir, "cats_flags.scx");
+
+    for extra in [
+        vec![],
+        vec!["--explain"],
+        vec!["--json"],
+        vec!["--explain", "--json"],
+    ] {
+        let mut args = vec![
+            "query",
+            path.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'B cel'",
+            "--count",
+        ];
+        args.extend(extra.iter().copied());
+        let out = scx_cli().args(&args).output().unwrap();
+        assert!(out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("no category"),
+            "the note must appear with flags {extra:?}, got: {stderr}"
+        );
+    }
+}
+
+/// The collect path (no `--count`) reports it too — `collect()` consumes the
+/// pipeline, so this arm re-opens the source, and that plumbing is easy to get
+/// wrong in only one of the two paths.
+#[test]
+fn test_query_category_note_on_the_collect_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_categorical_test_file(&dir, "cats_collect.scx");
+    let out_path = dir.path().join("empty_out.scx");
+
+    let out = scx_cli()
+        .args([
+            "query",
+            path.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'B cel'",
+            "--output",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "an empty query must still succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no category") && stderr.contains("B cell"),
+        "the collect path must carry the same note, got: {stderr}"
+    );
+}
+
+/// No predicate at all: an empty file is not a mis-slice, and there is no
+/// literal to have mistyped. Must stay silent rather than emit a bare note.
+#[test]
+fn test_query_no_filter_gets_no_category_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_categorical_test_file(&dir, "cats_nofilter.scx");
+
+    let out = scx_cli()
+        .args(["query", path.to_str().unwrap(), "--count"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("no category"), "got: {stderr}");
+}
+
+/// `build-csc` keeps the predicate index **sections** but loses the **pushdown**
+/// they enable. Both halves are pinned, because a doc asserting either one alone is
+/// wrong — and the matrix asserted one of them until this test was written.
+///
+/// Review (Cursor Agent - Grok 4.5 High Fast) correctly pointed out that the
+/// original "Dropped" cell contradicted the code: `copy_auxiliary_sections` →
+/// `copy_predicate_indices` copies both sections verbatim, and the copies stay
+/// *valid* because shard boundaries and row ranges are unchanged. But "Preserved"
+/// would have been just as wrong from the user's side: `run_build_csc` re-encodes
+/// shards through its own path and never re-derives the per-shard catalog
+/// `column_stats`, and Level-1 pruning resolves a categorical predicate against
+/// those stats' `CategoryBitset`. So the section is there and the pruning is gone.
+///
+/// This is a **pre-existing** `build_csc` defect, not one this PR introduced — the
+/// only change here to `build_csc.rs` is the multimodal guard. Pinned rather than
+/// fixed so the gap is visible and cannot be "resolved" by editing the docs; the
+/// fix belongs in its own change (wire `apply_obs_shard_column_stats` into the
+/// re-emit, as `merge` does).
+#[test]
+fn test_build_csc_preserves_predicate_index_sections_but_not_pushdown() {
+    let dir = tempfile::tempdir().unwrap();
+    // `write_clustered_test_file` gives obs a `cell_type` / `disease` to index.
+    let input = write_clustered_test_file(&dir, "indexed_for_csc.scx", 200, 10, 50);
+
+    // Build an indexed source by subsetting with --index-preset (F7's own path).
+    let indexed = dir.path().join("indexed.scx");
+    let out = scx_cli()
+        .args([
+            "subset",
+            input.to_str().unwrap(),
+            indexed.to_str().unwrap(),
+            "--filter",
+            "disease == 'normal'",
+            // Small enough to force several output shards: Level-1 pruning is
+            // unobservable on a single shard, so a default shard size would make
+            // the pushdown assertion below vacuous.
+            "--shard-size",
+            "25",
+            "--index-obs",
+            "cell_type",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fixture setup failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let before = ScxReader::open(&indexed)
+        .unwrap()
+        .read_obs_predicate_index_bytes()
+        .unwrap()
+        .map(<[u8]>::to_vec);
+    assert!(
+        before.is_some(),
+        "fixture precondition: the input must carry an obs predicate index"
+    );
+
+    // Copy-out form.
+    let copied = dir.path().join("csc_copy.scx");
+    let out = scx_cli()
+        .args([
+            "build-csc",
+            indexed.to_str().unwrap(),
+            copied.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // In-place form.
+    let in_place = dir.path().join("csc_in_place.scx");
+    std::fs::copy(&indexed, &in_place).unwrap();
+    let out = scx_cli()
+        .args(["build-csc", in_place.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for (label, path) in [("copy-out", &copied), ("in-place", &in_place)] {
+        let reader = ScxReader::open(path).unwrap();
+        assert!(
+            reader.header().has_csc(),
+            "{label}: the sidecar must have been built"
+        );
+        let after = reader
+            .read_obs_predicate_index_bytes()
+            .unwrap()
+            .map(<[u8]>::to_vec);
+        assert_eq!(
+            after, before,
+            "{label} build-csc must carry the obs predicate index through \
+             byte-for-byte; docs/operations.md's build-csc row states this"
+        );
+    }
+
+    // The other half: pruning. Section bytes surviving is necessary but not
+    // sufficient — and here it is not sufficient, which is the pre-existing gap.
+    let pruned = |path: &std::path::Path| -> (u32, String) {
+        let out = scx_cli()
+            .args([
+                "query",
+                path.to_str().unwrap(),
+                "--filter",
+                "cell_type == 'T cell'",
+                "--count",
+                "--explain",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let n: u32 = stderr
+            .lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("Level 1 (catalog-stats) eliminated: ")
+            })
+            .and_then(|v| v.split_once('/'))
+            .map(|(n, _)| n.parse().unwrap())
+            .unwrap_or_else(|| panic!("no Level-1 line:\n{stderr}"));
+        let matched = stderr
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("matched rows: "))
+            .unwrap_or("?")
+            .to_string();
+        (n, matched)
+    };
+
+    let (before_elim, before_matched) = pruned(&indexed);
+    assert!(
+        before_elim > 0,
+        "fixture precondition: the indexed input must prune, or the comparison \
+         below proves nothing (got {before_elim})"
+    );
+    let (after_elim, after_matched) = pruned(&copied);
+    assert_eq!(
+        after_elim, 0,
+        "documented gap: build-csc does not re-derive the per-shard column stats \
+         that Level-1 pruning needs, so pruning stops even though the index \
+         section survives. If this now prunes, the gap was fixed — update \
+         docs/operations.md's build-csc row and this assertion together."
+    );
+    // Correctness is unaffected: a full scan, not a wrong answer.
+    assert_eq!(
+        before_matched, after_matched,
+        "losing pruning must not change which rows match"
+    );
+}

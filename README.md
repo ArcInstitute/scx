@@ -131,7 +131,7 @@ sparse-to-dense conversion, and normalization happen in compiled Rust.
 | 1M cells (batches/sec) | **1,405** | 16.3 | 17.1 | 4.4 |
 | vs SCX | — | 86× slower | 82× slower | 319× slower |
 
-> _batch_size=1024, HVG=2000, normalize+log1p (hvg_norm scenario). See [detailed results](#training-loader-batchessec-batch_size1024-hvg2000-normalizelog1p) below._
+> _batch_size=1024, HVG=2000, normalize+log1p (hvg_norm scenario). See [detailed results](#benchmarks) below._
 
 ```python
 # GPU-saturating training loader — no num_workers needed
@@ -238,9 +238,9 @@ per matrix. R support covers Seurat v5 multi-assay (`exp$to_seurat()`)
 and Bioconductor `MultiAssayExperiment` round-trips.
 
 See [docs/multimodal.md](docs/multimodal.md) for the full Python / R /
-CLI surface, the format model ([format.md § 13](docs/format.md#13-multimodal-extension)),
+CLI surface, the format model ([format.md § 13](docs/format.md#13-multimodal-extension-optional)),
 and per-modality codec defaults
-([codec.md § Per-modality codec defaults](docs/codec.md#per-modality-codec-defaults)).
+([codec.md § Per-modality codec defaults](docs/codec.md#8a-per-modality-codec-defaults)).
 
 ### Your data lives in the cloud
 

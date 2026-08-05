@@ -322,16 +322,109 @@ pub(super) fn aggregate_pseudobulk(
     Ok(result)
 }
 
+/// Coerce one alias value to a column list, accepting a bare string.
+///
+/// Both new spellings take `str`-or-list. pyo3 refuses `str` → `Vec<String>`
+/// (correctly — it would otherwise char-split), but the resulting
+/// `TypeError: argument 'sample_cols': Can't extract 'str' to 'Vec'` names
+/// neither the fix nor the sibling kwarg, which is precisely the unhelpful
+/// landing F8 exists to remove. So both aliases go through here instead of
+/// being typed `Vec<String>`.
+fn coerce_column_list(name: &str, value: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    if let Ok(one) = value.extract::<String>() {
+        return Ok(vec![one]);
+    }
+    value.extract::<Vec<String>>().map_err(|_| {
+        PyValueError::new_err(format!(
+            "{name} must be an obs column name (str) or a list of obs column names; \
+             got {}",
+            value
+                .get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| "an unknown type".to_string())
+        ))
+    })
+}
+
+/// Resolve `groupby` / `sample_cols` / `sample_key` down to the one list of obs
+/// columns that defines a pseudobulk sample (dogfood F8).
+///
+/// These are three spellings of one parameter, so supplying more than one is a
+/// user error rather than something to merge. The two aliases accept a bare
+/// string as well as a list — `sample_key="donor_id"` is the exact spelling a
+/// user reaching for the replicate role types, so neither may raise on it.
+/// `groupby` keeps its pre-existing list-only typing.
+fn resolve_sample_columns(
+    groupby: Option<Vec<String>>,
+    sample_cols: Option<&Bound<'_, PyAny>>,
+    sample_key: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Vec<String>> {
+    let mut supplied: Vec<&str> = Vec::new();
+    if groupby.is_some() {
+        supplied.push("groupby");
+    }
+    if sample_cols.is_some() {
+        supplied.push("sample_cols");
+    }
+    if sample_key.is_some() {
+        supplied.push("sample_key");
+    }
+    if supplied.len() > 1 {
+        return Err(PyValueError::new_err(format!(
+            "pass only one of groupby / sample_cols / sample_key (got {}); they are three \
+             spellings of the same parameter — the obs columns that together define a \
+             pseudobulk sample",
+            supplied.join(", ")
+        )));
+    }
+
+    if let Some(cols) = groupby {
+        return Ok(cols);
+    }
+    if let Some(v) = sample_cols {
+        return coerce_column_list("sample_cols", v);
+    }
+    if let Some(v) = sample_key {
+        return coerce_column_list("sample_key", v);
+    }
+
+    // The role contrast belongs here, in the message a user hits when they
+    // guessed wrong, not only in the docs they did not open.
+    Err(PyValueError::new_err(
+        "pseudobulk_dex requires the obs columns that define a pseudobulk sample — pass \
+         groupby=, sample_cols=, or sample_key=. These are condition PLUS replicate, e.g. \
+         groupby=[\"disease\", \"donor_id\"] with test_col=\"disease\". Note this is the \
+         opposite of rank_genes_groups(groupby=...), where `groupby` IS the compared \
+         column; here the compared column is `test_col`, and the replicate column \
+         (batch/donor/well) is what supplies the replication.",
+    ))
+}
+
 /// Pseudobulk differential expression via Rust aggregation + pydeseq2.
 ///
+/// **`groupby` here does not mean what it means in `rank_genes_groups`.** In
+/// `accel.rank_genes_groups` (and throughout scanpy) `groupby` names the column
+/// whose levels are compared. In `pseudobulk_dex` it names the columns that
+/// together define one pseudobulk *sample* — condition **plus** replicate, e.g.
+/// `["disease", "donor_id"]` — and the column being compared is `test_col`.
+/// Passing only the condition column yields one sample per condition and so no
+/// replication, which is why the replicate-role spellings `sample_cols=` /
+/// `sample_key=` are accepted as aliases for `groupby`.
+///
 /// Aggregates single-cell counts into pseudobulk samples by grouping cells
-/// according to metadata columns (e.g., `["perturbation", "donor"]`), then
-/// uses `pydeseq2` for negative binomial GLM testing.
+/// according to those columns, then uses `pydeseq2` for negative binomial GLM
+/// testing.
 ///
 /// Args:
-///     adata: AnnData object with X and obs columns for groupby
-///     groupby: List of obs column names to group by (e.g., ["perturbation", "donor"])
-///     test_col: Column in groupby that contains the condition to test
+///     adata: AnnData object with X and the obs columns named below
+///     groupby: Obs columns defining a pseudobulk sample — condition + replicate
+///         (e.g. ["disease", "donor_id"]). NOT the compared column; see above.
+///     sample_cols: Alias for `groupby`, named for the role it plays. Pass one
+///         of `groupby` / `sample_cols` / `sample_key`, not several.
+///     sample_key: Single-column alias for `groupby`; accepts a bare string
+///         (e.g. sample_key="donor_id") and wraps it in a one-element list.
+///     test_col: Which of those columns holds the condition to compare
 ///     reference: Reference level in test_col (e.g., "control")
 ///     design: DESeq2 design formula (default: auto-generated as "~ test_col")
 ///     aggr_method: "sum" (default) or "mean"
@@ -353,14 +446,19 @@ pub(super) fn aggregate_pseudobulk(
 ///     pandas DataFrame with columns: gene, baseMean, log2FoldChange,
 ///     lfcSE, stat, pvalue, padj, target, reference
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None, n_cpus=None, backend="pydeseq2", nbglm_options=None))]
+#[pyo3(signature = (adata, groupby=None, test_col=None, reference=None, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None, n_cpus=None, backend="pydeseq2", nbglm_options=None, *, sample_cols=None, sample_key=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pseudobulk_dex(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
-    groupby: Vec<String>,
-    test_col: &str,
-    reference: &str,
+    // `groupby` / `test_col` / `reference` are semantically required, but pyo3
+    // cannot express a required positional *after* an optional one — and adding
+    // the `sample_cols` / `sample_key` aliases makes `groupby` optional. So the
+    // requirement is re-imposed below with messages that carry more than the
+    // stock `TypeError: missing required argument` did.
+    groupby: Option<Vec<String>>,
+    test_col: Option<&str>,
+    reference: Option<&str>,
     design: Option<&str>,
     aggr_method: &str,
     min_cells_per_group: usize,
@@ -371,7 +469,26 @@ pub fn pseudobulk_dex(
     n_cpus: Option<usize>,
     backend: &str,
     nbglm_options: Option<&Bound<'_, PyDict>>,
+    sample_cols: Option<&Bound<'_, PyAny>>,
+    sample_key: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
+    // Resolve the three semantically-required arguments before any work, then
+    // shadow them as non-Option for the rest of the body.
+    let groupby = resolve_sample_columns(groupby, sample_cols, sample_key)?;
+    let test_col = test_col.ok_or_else(|| {
+        PyValueError::new_err(
+            "pseudobulk_dex requires test_col: which of the `groupby` columns holds the \
+             condition being compared (e.g. test_col=\"disease\" for \
+             groupby=[\"disease\", \"donor_id\"])",
+        )
+    })?;
+    let reference = reference.ok_or_else(|| {
+        PyValueError::new_err(
+            "pseudobulk_dex requires reference: the level of test_col to compare against \
+             (e.g. reference=\"normal\")",
+        )
+    })?;
+
     if !matches!(prefer_format, "csr" | "csc") {
         return Err(PyValueError::new_err(format!(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
@@ -452,12 +569,15 @@ pub fn pseudobulk_dex(
             let sub_adata = sub_adata.call_method0("copy")?;
 
             // Run pseudobulk_dex on the subset (recursive call without stratify).
+            // Pass the *resolved* column list, never the raw aliases — the
+            // recursion must not re-run alias resolution (and `sample_cols` /
+            // `sample_key` are already folded into `groupby` at this point).
             match pseudobulk_dex(
                 py,
                 &sub_adata,
-                groupby.clone(),
-                test_col,
-                reference,
+                Some(groupby.clone()),
+                Some(test_col),
+                Some(reference),
                 design,
                 aggr_method,
                 min_cells_per_group,
@@ -468,6 +588,8 @@ pub fn pseudobulk_dex(
                 n_cpus,
                 backend,
                 nbglm_options,
+                None, // sample_cols: already resolved into `groupby`
+                None, // sample_key: ditto
             ) {
                 Ok(result_obj) => {
                     let result_df = result_obj.bind(py);

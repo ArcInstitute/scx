@@ -34,6 +34,51 @@ fn format_level2_eliminations(candidate_shard_rows: usize, matched_rows: usize) 
     ))
 }
 
+/// On a zero-row result, say whether the predicate named a category that does
+/// not exist (dogfood E1).
+///
+/// A `0` from a typo and a `0` from a genuinely empty slice look identical, and
+/// mistaking the first for the second silently mis-slices an atlas. Emitted
+/// whenever the match count is zero — *not* gated behind `--explain`, because a
+/// bare `--count` prints the same misleading `0` and the user has no reason to
+/// suspect a flag would help.
+///
+/// Re-opens the source rather than borrowing the caller's pipeline: `collect()`
+/// consumes it, and the alternative — diagnosing up front and reporting later —
+/// would put an obs read on *every* query to explain the rare empty one. This
+/// runs only on a dead-end query the user is already about to investigate.
+///
+/// Deliberately best-effort throughout: failing to *explain* an empty result
+/// must never turn a successful query into an error, so every failure path
+/// degrades silently to today's bare `0`.
+fn explain_empty_match(
+    source: &str,
+    modality: Option<&str>,
+    filter: Option<&str>,
+    matched_rows: usize,
+) {
+    if matched_rows > 0 {
+        return;
+    }
+    let Some(expr) = filter else {
+        return; // no predicate — an empty file, not a mis-slice
+    };
+    let Ok(opened) = open_pipeline_for(source, modality) else {
+        return;
+    };
+    let Ok(pipeline) = opened.pipeline.filter_obs(expr) else {
+        return;
+    };
+    match scx_engine::diagnose_category_misses(pipeline.reader(), pipeline.obs_predicates()) {
+        Ok(misses) => {
+            for miss in misses {
+                eprintln!("note: {} — 0 rows matched.", miss.render());
+            }
+        }
+        Err(e) => log::debug!("empty-match diagnosis unavailable: {e}"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_query(
     source: &str,
@@ -88,6 +133,7 @@ pub fn run_query(
              {} of {} candidate-shard rows matched (Level 2 index/row-eval)",
             c.skipped_shards, c.total_shards, c.matched_rows, c.candidate_shard_rows,
         );
+        explain_empty_match(source, modality, filter, c.matched_rows);
         if explain {
             eprintln!("Query plan (explain):");
             eprintln!("  source: {source}");
@@ -150,6 +196,7 @@ pub fn run_query(
         result.matched_rows,
         result.candidate_shard_rows,
     );
+    explain_empty_match(source, modality, filter, result.matched_rows);
 
     // F3-2026-05-20-Tier2: minimal --explain block. Prints the parsed
     // filter expression plus the Level 1 / Level 2 breakdown so power-
@@ -406,7 +453,12 @@ fn write_query_result(
     // whose values are wider than any single source shard's encoding is
     // written losslessly, and normalize/log1p float results auto-route to
     // Float32.
-    crate::subset::write_csr_shards_auto(
+    //
+    // The returned shard row ranges are discarded: unlike `scx subset`, this
+    // path has no `--index-*` flags, so it writes no predicate index for them
+    // to key. If it grows them, feed these ranges to
+    // `build_and_write_conversion_predicate_indexes` exactly as `subset` does.
+    let _output_shard_row_ranges = crate::subset::write_csr_shards_auto(
         &mut writer,
         &result.x.indptr,
         &result.x.indices,

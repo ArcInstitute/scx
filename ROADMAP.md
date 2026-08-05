@@ -279,7 +279,7 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [x] GPU sparse-to-dense (CSR→dense) scatter kernel — serves the **analysis** paths (GPU DE `gpu_de_scatter_shard_to_dense`, `to_gpu_anndata` device handoff). **Not** wired into the CPU training loader, whose decode + dense-scatter stay on host (`scx-loader` `io_stage`/`decode_stage`). Loader-side device decode (Phase D) was profiled (D0, 2026-07-09) and **deferred**: post-SIMD ShufDeltaZstd CPU decode is only ~9% over Scx1, loader back-pressure ≈ 0, and GPU util ≈ 0% — host-bounce is not the measured training ceiling. A `gpu`-gated `scx-loader → scx-gpu` feature edge (D1) exists as scaffolding.
 
 ### 3.2 scx-cli (extended) — COMPLETE
-- [x] `scx build-csc input.scx output.scx` — streaming transpose. **Fully integrated** end-to-end: write-time CSC at `scx convert --csc=always` / `pyscx.from_anndata(csc="always")` / 10x / MTX import; multi-shard CSC (`--csc-cols-per-shard`, default 5000); column-major streaming via `BackedCscReader` + `ColumnShardSource` trait; consumer dispatch via `prefer_format="csc"` on HVG / DE / pseudobulk / QC / col_aggs; `scx info` per-shard layout; `scx validate` BLAKE3 coverage; mutating ops drop CSC by default with `--rebuild-csc` opt-in. See [docs/sharding.md § CSC sharding](docs/sharding.md#csc-sharding) and [docs/scanpy.md § prefer_format](docs/scanpy.md#prefer_formatcsrcsc-explicit-column-major-dispatch).
+- [x] `scx build-csc input.scx output.scx` — streaming transpose. **Fully integrated** end-to-end: write-time CSC at `scx convert --csc=always` / `pyscx.from_anndata(csc="always")` / 10x / MTX import; multi-shard CSC (`--csc-cols-per-shard`, default 5000); column-major streaming via `BackedCscReader` + `ColumnShardSource` trait; consumer dispatch via `prefer_format="csc"` on HVG / DE / pseudobulk / QC / col_aggs; `scx info` per-shard layout; `scx validate` BLAKE3 coverage; mutating ops drop CSC by default with `--rebuild-csc` opt-in. See [docs/sharding.md § CSC sharding](docs/sharding.md#csc-sharding) and [docs/scanpy.md § prefer_format](docs/scanpy.md#prefer_formatautocsrcsc-column-major-dispatch).
 - [x] `scx benchmark experiment.scx` — I/O + pipeline benchmarks
 - [x] `scx subset` — extract cell/gene subsets to new file
 - [x] `scx upgrade input.scx output.scx` — rewrite to latest format version (docs/format.md (Versioning))
@@ -387,7 +387,7 @@ are not exposed in R and are tracked here rather than implemented:
 10x Multiome / TEA-seq round-trip through `pyscx.from_mudata` /
 `pyscx.MultimodalTrainingDataset` and Seurat v5 / MAE via rscx. See
 [docs/multimodal.md](docs/multimodal.md) for the user-facing guide
-and [docs/format.md § 13](docs/format.md#13-multimodal-extension) for
+and [docs/format.md § 13](docs/format.md#13-multimodal-extension-optional) for
 the on-disk layout. Section ids 15 = `ModalityTable`, 16 = `LayerCscShard`, 17–25 =
 embedding / sharded metadata extensions are now allocated; id 26 is
 reserved (formerly `DecodeMetadataShard`, removed); ids 27–31 are reserved for further multimodal/spatial

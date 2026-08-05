@@ -986,8 +986,78 @@ struct RowJoin {
     n_source_absent_nonzero: u64,
 }
 
+/// How to report a join in which fewer than half the target rows matched, or
+/// `None` when coverage needs no comment. The layer-side twin of
+/// `external_obs::obs_join_coverage_report` — see it for the full E2 rationale.
+///
+/// Partial coverage is the *normal* shape here, not an edge case: CellBender's
+/// `_filtered.h5` holds only the droplets it called as cells, while the target is
+/// the raw all-droplet file. Reporting that as a failed join, complete with a
+/// target/source example pair that looks like evidence of divergence, sends the
+/// user hunting a barcode-format bug that does not exist.
+fn layer_join_coverage_report(
+    n_matched: u64,
+    n_target_total: u64,
+    n_target_absent: u64,
+    n_source_absent: u64,
+    n_source_absent_nonzero: u64,
+    examples: impl FnOnce() -> (Vec<String>, Vec<String>),
+) -> Option<(log::Level, String)> {
+    if n_matched * 2 >= n_target_total {
+        return None;
+    }
+    if n_source_absent == 0 {
+        return Some((
+            log::Level::Info,
+            format!(
+                "external layer join coverage: {n_matched} of {n_target_total} target \
+                 rows matched; {n_target_absent} rows left to the missing-row policy. \
+                 Every source row matched, so this is a partial-coverage import \
+                 (expected when the source is a cell-called subset of an all-droplet \
+                 target), not a key mismatch."
+            ),
+        ));
+    }
+    let (target_examples, source_examples) = examples();
+    Some((
+        log::Level::Warn,
+        format!(
+            "external layer join matched only {n_matched} of {n_target_total} target \
+             rows, and {n_source_absent} source rows matched no target row \
+             ({n_source_absent_nonzero} of them carry counts) — check for a sample-name \
+             prefix or a '-1' suffix difference; target examples {target_examples:?}, \
+             source examples {source_examples:?}"
+        ),
+    ))
+}
+
 pub(crate) fn examples(keys: &[String]) -> Vec<&str> {
     keys.iter().take(KEY_EXAMPLES).map(|s| s.as_str()).collect()
+}
+
+/// Example keys drawn from the ones that did **not** match, falling back to the
+/// head when everything matched.
+///
+/// The whole point of showing examples next to a partial-mismatch warning is to
+/// let the user *see* the difference — a target `"100000"` beside a source
+/// `"100000-1"` names the `-1` suffix instantly. Head examples cannot do that:
+/// on a source whose first 100k keys match and whose last 150k carry a stray
+/// suffix, `examples()` returns the matching prefix and both lists print
+/// identically, which is the "both lists are valid keys from the same space"
+/// confusion the dogfood report flagged (E2).
+pub(crate) fn unmatched_examples<'a>(keys: &'a [String], matched: &[bool]) -> Vec<&'a str> {
+    let picked: Vec<&str> = keys
+        .iter()
+        .zip(matched.iter())
+        .filter(|(_, &m)| !m)
+        .map(|(k, _)| k.as_str())
+        .take(KEY_EXAMPLES)
+        .collect();
+    if picked.is_empty() {
+        examples(keys)
+    } else {
+        picked
+    }
 }
 
 pub(crate) fn first_duplicates(keys: &[String]) -> Vec<&str> {
@@ -1091,14 +1161,25 @@ fn build_row_join(
             ),
         });
     }
-    if (n_matched as usize) * 2 < target_keys.len() {
-        log::warn!(
-            "external layer join matched only {n_matched} of {} target rows; \
-             target examples {:?}, source examples {:?}",
-            target_keys.len(),
-            examples(target_keys),
-            examples(source_keys),
-        );
+    if let Some((level, msg)) = layer_join_coverage_report(
+        n_matched,
+        target_keys.len() as u64,
+        n_target_absent,
+        n_source_absent,
+        n_source_absent_nonzero,
+        || {
+            // Unmatched keys, for the same reason as the obs sibling: a
+            // CellBender barcode that found no raw droplet is what shows the
+            // format difference, not one that matched.
+            let own = |v: Vec<&str>| v.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let target_matched: Vec<bool> = source_of_target.iter().map(|s| s.is_some()).collect();
+            (
+                own(unmatched_examples(target_keys, &target_matched)),
+                own(unmatched_examples(source_keys, &used)),
+            )
+        },
+    ) {
+        log::log!(level, "{msg}");
     }
 
     Ok(RowJoin {

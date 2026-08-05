@@ -61,6 +61,25 @@ pub fn run_build_csc(
         return Err("Input file has no CSR shards".into());
     }
 
+    // This function is not modality-aware — it flattens every CSR shard against
+    // the single top-level n_obs × n_vars shape, which would corrupt the sidecar
+    // on a multimodal input. `pyscx.build_csc` has guarded this since it was
+    // written; the CLI did not, and reached `reader.read_var()` to fail with an
+    // opaque `section not found: var`. The guard belongs here so every caller —
+    // `scx build-csc` in both its forms, `rebuild_csc_inplace`, and the pyscx
+    // wrapper — gets the same actionable message.
+    if reader.is_multimodal() {
+        return Err(format!(
+            "build-csc does not support multimodal files ({} has {} modalities); \
+             extract a single modality first with \
+             `scx subset {} out.scx --modality NAME`",
+            input.display(),
+            in_header.n_modalities,
+            input.display(),
+        )
+        .into());
+    }
+
     // SCX-005: build-csc re-emits CSR shards without re-canonicalizing them, so
     // it must not *raise* the format version's canonicality claim above what
     // the input already guarantees. Framing (v4) structurally requires the v3

@@ -1038,3 +1038,97 @@ fn layer_import_drops_a_stale_obs_predicate_index_on_overwrite() {
         "the index still covers 'cell_type', whose values were just replaced"
     );
 }
+
+// ---------------------------------------------------------------------------
+// E2 (layer twin) — a cell-called subset of an all-droplet target is normal
+// ---------------------------------------------------------------------------
+
+/// CellBender's `_filtered.h5` holds only the droplets it called as cells, so a
+/// partial match against the raw all-droplet target is the *expected* shape, not
+/// a defect. It must not be reported with the example pair that signals a
+/// barcode-format mismatch.
+#[test]
+fn layer_partial_coverage_reports_coverage_at_info() {
+    let (level, msg) = super::layer_join_coverage_report(
+        8_000,
+        50_000,
+        42_000,
+        0, // every CellBender row matched a raw droplet
+        0,
+        || panic!("the coverage branch must not extract key examples"),
+    )
+    .expect("below half, so something must be reported");
+
+    assert_eq!(level, log::Level::Info);
+    assert!(!msg.contains("only"), "{msg}");
+    assert!(!msg.contains("examples"), "{msg}");
+    assert!(msg.contains("coverage") && msg.contains("8000"), "{msg}");
+    assert!(msg.contains("not a key mismatch"), "{msg}");
+}
+
+/// Unmatched source rows are a real signal here — a CellBender row with no raw
+/// droplet means the barcodes disagree — and the count that *carries counts* is
+/// the load-bearing number, so it must survive.
+#[test]
+fn layer_unmatched_source_rows_warn_with_the_nonzero_count() {
+    let (level, msg) = super::layer_join_coverage_report(100, 1000, 900, 50, 37, || {
+        (vec!["AAACCC-1".to_string()], vec!["AAACCC".to_string()])
+    })
+    .expect("below half, so something must be reported");
+
+    assert_eq!(level, log::Level::Warn);
+    assert!(msg.contains("only"), "{msg}");
+    assert!(
+        msg.contains("37 of them carry counts"),
+        "the nonzero-source count is the load-bearing detail: {msg}"
+    );
+    assert!(msg.contains("AAACCC"), "examples must appear: {msg}");
+}
+
+#[test]
+fn layer_high_coverage_reports_nothing() {
+    assert!(
+        super::layer_join_coverage_report(500, 1000, 500, 0, 0, || panic!("must not be called"))
+            .is_none()
+    );
+}
+
+/// Examples must come from the keys that did **not** match.
+///
+/// The scenario is the report's: a source whose first N keys match and whose
+/// remainder carry a stray `-1` suffix. Head examples print two identical
+/// matching keys — "both lists are valid keys drawn from the same space", which
+/// is what made the pair actively confusing. Unmatched examples put `"c100"`
+/// beside `"c100-1"` and the suffix is self-evident.
+#[test]
+fn unmatched_examples_shows_the_keys_that_failed() {
+    use super::{examples, unmatched_examples};
+
+    let keys: Vec<String> = (0..6).map(|i| format!("c{i}")).collect();
+    let matched = vec![true, true, true, false, false, false];
+
+    assert_eq!(
+        unmatched_examples(&keys, &matched),
+        vec!["c3", "c4", "c5"],
+        "must pick the failures, not the head"
+    );
+    // Anti-vacuous: the head examples this replaces are the *matching* keys, so
+    // the two functions must genuinely differ on this input.
+    assert_ne!(
+        unmatched_examples(&keys, &matched),
+        examples(&keys),
+        "if these agree the change is a no-op on the case it targets"
+    );
+}
+
+/// When everything matched there is nothing to show, so fall back to the head
+/// rather than printing an empty list.
+#[test]
+fn unmatched_examples_falls_back_when_all_matched() {
+    use super::{examples, unmatched_examples};
+
+    let keys: Vec<String> = (0..4).map(|i| format!("c{i}")).collect();
+    let all = vec![true; 4];
+    assert_eq!(unmatched_examples(&keys, &all), examples(&keys));
+    assert!(!unmatched_examples(&keys, &all).is_empty());
+}

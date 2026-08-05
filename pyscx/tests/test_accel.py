@@ -1259,6 +1259,195 @@ class TestPseudobulkDex:
             )
 
 
+class TestPseudobulkDexSampleColumnAliases:
+    """`sample_cols=` / `sample_key=` as aliases for `groupby` (dogfood F8).
+
+    `groupby` means opposite things in two functions of one module: in
+    `rank_genes_groups` (and all of scanpy) it is the compared column; in
+    `pseudobulk_dex` it is the set of columns defining a pseudobulk *sample*,
+    and the compared column is `test_col`. A user reaching for the replicate
+    role typed `sample_key="donor_id"` and got a bare
+    `TypeError: unexpected keyword argument`.
+    """
+
+    @pytest.fixture
+    def replicate_adata(self):
+        """60 cells × 20 genes, 2 conditions × 3 donors, 10 cells per pair.
+
+        `backend="nb_glm"` throughout so these tests do not depend on pydeseq2
+        being installed — the subject here is argument resolution, not numerics.
+        """
+        import anndata
+        import pandas as pd
+
+        rng = np.random.default_rng(7)
+        n_obs, n_vars = 60, 20
+        X = rng.poisson(6.0, size=(n_obs, n_vars)).astype(np.float32)
+        obs = pd.DataFrame(
+            {
+                "perturbation": ["drug"] * 30 + ["control"] * 30,
+                "donor": (["d1"] * 10 + ["d2"] * 10 + ["d3"] * 10) * 2,
+            },
+            index=[f"cell_{i}" for i in range(n_obs)],
+        )
+        adata = anndata.AnnData(X=sp.csr_matrix(X), obs=obs)
+        adata.var_names = [f"gene_{i}" for i in range(n_vars)]
+        return adata
+
+    def _common(self):
+        return dict(
+            test_col="perturbation",
+            reference="control",
+            backend="nb_glm",
+            min_cells_per_group=1,
+        )
+
+    def test_sample_cols_is_an_alias_for_groupby(self, replicate_adata):
+        """Same columns under either spelling must give the same frame.
+
+        Compared value-by-value, not just by shape — an alias that silently
+        reordered or dropped a column would still match on shape.
+        """
+        import pandas as pd
+
+        import pyscx
+
+        via_groupby = pyscx.accel.pseudobulk_dex(
+            replicate_adata.copy(),
+            groupby=["perturbation", "donor"],
+            **self._common(),
+        )
+        via_sample_cols = pyscx.accel.pseudobulk_dex(
+            replicate_adata.copy(),
+            sample_cols=["perturbation", "donor"],
+            **self._common(),
+        )
+        assert len(via_groupby) > 0, "fixture must produce fittable contrasts"
+        pd.testing.assert_frame_equal(via_groupby, via_sample_cols)
+
+    def test_sample_key_accepts_a_bare_string(self, replicate_adata):
+        """`sample_key="perturbation"` must resolve, not raise on the type.
+
+        This is the exact spelling the dogfood session reached for. A
+        single-column sample definition has no replication, so the NB-GLM
+        refuses it downstream — a `RuntimeError` from the *model* is proof the
+        alias resolved; a `ValueError`/`TypeError` would mean it did not.
+        """
+        import pyscx
+
+        with pytest.raises(RuntimeError, match="replicate|contrast"):
+            pyscx.accel.pseudobulk_dex(
+                replicate_adata.copy(), sample_key="perturbation", **self._common()
+            )
+
+    @pytest.mark.parametrize("alias", ["sample_cols", "sample_key"])
+    def test_both_aliases_take_str_or_list(self, replicate_adata, alias):
+        """Neither new alias may have a type trap.
+
+        pyo3 refuses ``str`` -> ``Vec<String>`` (rightly — it would char-split),
+        but the resulting ``TypeError: Can't extract 'str' to 'Vec'`` names
+        neither the fix nor the sibling kwarg. That unhelpful landing is exactly
+        what F8 exists to remove, so both aliases coerce a bare string instead.
+        """
+        import pandas as pd
+
+        import pyscx
+
+        via_groupby = pyscx.accel.pseudobulk_dex(
+            replicate_adata.copy(),
+            groupby=["perturbation", "donor"],
+            **self._common(),
+        )
+        via_alias = pyscx.accel.pseudobulk_dex(
+            replicate_adata.copy(),
+            **{alias: ["perturbation", "donor"]},
+            **self._common(),
+        )
+        pd.testing.assert_frame_equal(via_groupby, via_alias)
+
+        # The bare-string form must resolve (a single sample column has no
+        # replication, so the NB-GLM refuses it downstream — a RuntimeError from
+        # the *model* proves resolution happened; a TypeError would mean it did
+        # not).
+        with pytest.raises(RuntimeError, match="replicate|contrast"):
+            pyscx.accel.pseudobulk_dex(
+                replicate_adata.copy(), **{alias: "perturbation"}, **self._common()
+            )
+
+        # And a genuinely wrong type gets a message naming the parameter, not
+        # pyo3's extraction internals.
+        with pytest.raises(ValueError, match=alias):
+            pyscx.accel.pseudobulk_dex(
+                replicate_adata.copy(), **{alias: 42}, **self._common()
+            )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"groupby": ["perturbation", "donor"], "sample_cols": ["perturbation"]},
+            {"groupby": ["perturbation", "donor"], "sample_key": "donor"},
+            {"sample_cols": ["perturbation"], "sample_key": "donor"},
+        ],
+    )
+    def test_two_spellings_at_once_is_rejected(self, replicate_adata, kwargs):
+        """They are one parameter, so supplying two is an error, not a merge."""
+        import pyscx
+
+        with pytest.raises(ValueError, match="only one of groupby"):
+            pyscx.accel.pseudobulk_dex(
+                replicate_adata.copy(), **kwargs, **self._common()
+            )
+        # The message must name what was actually passed, so the user can see
+        # which two to drop.
+        with pytest.raises(ValueError) as exc:
+            pyscx.accel.pseudobulk_dex(
+                replicate_adata.copy(), **kwargs, **self._common()
+            )
+        for name in kwargs:
+            assert name in str(exc.value)
+
+    def test_omitting_all_three_names_the_role_contrast(self, replicate_adata):
+        """The error a wrong guess lands on must carry the contrast itself.
+
+        This is the deliverable of F8: the reason `groupby` is confusing here is
+        that it means the opposite of `rank_genes_groups(groupby=...)`, so that
+        sentence has to be in the message, not only in docs the user did not
+        open.
+        """
+        import pyscx
+
+        with pytest.raises(ValueError) as exc:
+            pyscx.accel.pseudobulk_dex(replicate_adata.copy(), **self._common())
+        msg = str(exc.value)
+        assert "rank_genes_groups" in msg, (
+            "the no-columns error must name the contrast against "
+            f"rank_genes_groups; got: {msg}"
+        )
+        assert "test_col" in msg, "and must say which argument IS the compared column"
+        for spelling in ("groupby", "sample_cols", "sample_key"):
+            assert spelling in msg, f"the error must list the {spelling} spelling"
+
+    @pytest.mark.parametrize("missing", ["test_col", "reference"])
+    def test_missing_test_col_or_reference_still_reports_clearly(
+        self, replicate_adata, missing
+    ):
+        """Dropping pyo3's arity check must not degrade these two.
+
+        `test_col` / `reference` became `Option` only so `groupby` could, so
+        each needs its own explicit message where pyo3's `TypeError` used to be.
+        """
+        import pyscx
+
+        kwargs = self._common()
+        kwargs.pop(missing)
+        with pytest.raises(ValueError, match=missing):
+            pyscx.accel.pseudobulk_dex(
+                replicate_adata.copy(),
+                groupby=["perturbation", "donor"],
+                **kwargs,
+            )
+
+
 class TestStratifiedDE:
     """Test stratified differential expression for both single-cell and pseudobulk."""
 

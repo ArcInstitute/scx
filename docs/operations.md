@@ -7,19 +7,36 @@ details, see [docs/format.md](format.md). For sharding details, see
 
 ## Operations Matrix
 
-| Operation | Matrix shards | Obs metadata | Var metadata | CSC sidecar | Predicate indexes |
-|-----------|---------------|--------------|--------------|-------------|-------------------|
-| **append** | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows |
-| **delete** (`mark_deleted`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged |
-| **modify_metadata** / **set_uns** | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`) | Replaced if supplied (same `n_vars`) | **Preserved** | Dropped for the replaced obs/var axis unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild; untouched otherwise |
-| **compact** | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **optimize** | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | **Preserved** (rows + shard boundaries unchanged) |
-| **merge** | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **subset** | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** (rebuild via `scx convert --index-obs ...` on the output) |
-| **sort** | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **sort `--shuffle`** | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them |
-| **cellbender-import** (`attach_external_layer`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | **Preserved** (only columns are added; CSR shard ranges are untouched, and the index carries no schema hash) |
-| **rollback** | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored |
+The **Writes** column is the one worth reading first: it says whether an
+operation mutates its input or produces a separate file, which determines
+whether you need an `<OUTPUT>` argument at all. Every in-place op stages a temp
+file and `rename`s it over the target, so an interrupted run leaves the input
+intact.
+
+In-place does **not** imply undoable. `scx rollback` works only on the ops that
+commit through the manifest chain (`prepare_in_place` / `commit_in_place`) and so
+leave the previous catalog in the file — the import ops, `delete`,
+`modify_metadata` / `set_uns`, `append`. **`build-csc --in-place` is not among
+them**: it stages a wholly new file via `run_build_csc` and renames it over the
+target, carrying no prior catalog, so a subsequent `scx rollback` fails with
+`no previous catalog available for rollback`. Copy out first if you want a way
+back.
+
+| Operation | Writes | Matrix shards | Obs metadata | Var metadata | CSC sidecar | Predicate indexes |
+|-----------|--------|---------------|--------------|--------------|-------------|-------------------|
+| **append** | In place (`<TARGET> <SOURCE>`) | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows |
+| **delete** (`mark_deleted`) | In place (`<FILE>`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged |
+| **modify_metadata** / **set_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`) | Replaced if supplied (same `n_vars`) | **Preserved** | Dropped for the replaced obs/var axis unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild; untouched otherwise |
+| **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | **Preserved** (rows + shard boundaries unchanged) |
+| **merge** | New file (`<OUTPUT>` required) | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **subset** | New file (`<OUTPUT>` required, optional with `--dry-run`) | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **sort** | New file (`<OUTPUT>` required) | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **sort `--shuffle`** | New file (`<OUTPUT>` required) | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them |
+| **build-csc** | In place, or a new file with `<OUTPUT>` | **Re-emitted** (not re-encoded or canonicalized); row-group framing is preserved from the input | **Preserved** | **Preserved** | **Built** (this is the op that creates it) | Sections **copied verbatim** (shard boundaries are unchanged, so their `ShardRange`s stay valid), but the per-shard catalog **column stats are not re-derived** — so **Level-1** shard pruning stops firing. See the note below |
+| **obs-import** / **doublet-import** | In place (`<FILE> <SOURCE>`) | **Unchanged** (never read or rewritten) | Replaced (same `n_obs`, plus the new columns) | **Preserved** | **Preserved** (X untouched) | **Preserved** on a pure column *add*; dropped only when `--overwrite` rewrites an indexed column (`obs_index_would_go_stale` decides) |
+| **cellbender-import** (`attach_external_layer`) | In place (`<FILE> <CELLBENDER_H5>`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | **Preserved** (only columns are added; CSR shard ranges are untouched, and the index carries no schema hash) |
+| **rollback** | In place (`<FILE>`) | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored |
 
 ### Restoring CSC after a mutating operation
 
@@ -32,17 +49,54 @@ log::warn!("append dropped 1 CSC shards from experiment.scx: rerun `scx build-cs
 To restore:
 
 ```bash
-# Standalone rebuild — writes a new file with CSR + CSC shards
+# Standalone rebuild, in place — omit <OUTPUT>. Staged via a temp file +
+# atomic rename, so a failure leaves experiment.scx untouched.
+scx build-csc experiment.scx
+
+# Or write a copy, leaving the input alone
 scx build-csc experiment.scx experiment_with_csc.scx
 
 # Or pass --rebuild-csc to the mutating operation
 scx compact experiment.scx compacted.scx --rebuild-csc
 ```
 
-The Python API exposes `pyscx.build_csc(input, output, memory_limit="4G", force=False, csc_cols_per_shard=5000)`
-for standalone rebuilds. Alternatively, set `csc="always"` at conversion time
+The Python API exposes `pyscx.build_csc(input, output=None, memory_limit="4G", force=False, csc_cols_per_shard=5000)`
+for standalone rebuilds — `output=None` (the default) rebuilds in place, and a
+path writes a copy. Alternatively, set `csc="always"` at conversion time
 via `pyscx.from_anndata(..., csc="always")` to emit the sidecar during the
 initial write, or pass `rebuild_csc=True` to mutating operations like `pyscx.sort(..., rebuild_csc=True)`.
+
+Either form preserves the input's row-group framing: a framed (v4) input yields
+a framed output. Both derive it from `scx_ops::framing_for_csc_rebuild`, which
+is the only correct source — see the note on `rebuild_csc_inplace` for why both
+`None` and a `decode_target`-carrying `FramingConfig` are wrong here.
+
+> **Known gap: `build-csc` keeps the predicate index but loses Level-1 pruning.**
+> `copy_auxiliary_sections` copies `obs_predicate_index` / `var_predicate_index`
+> byte-for-byte, and the copy stays *valid* — shard boundaries and row ranges are
+> unchanged. But `run_build_csc` re-encodes each shard through its own path and
+> does not re-derive the per-shard catalog `column_stats`, and **Level-1** pruning
+> resolves a categorical predicate against those stats' `CategoryBitset`.
+>
+> Scope matters, because the index drives two independent pushdown paths:
+>
+> - **Level-1** (catalog-stats shard pruning) **stops.** Measured on a
+>   200-cell / 8-shard file indexed on a clustered `cell_type`: `Level 1
+>   eliminated 6/8` before `build-csc`, `0/8` after — same correct row count.
+> - **Level-2** (row-set pushdown) reads the copied `PredicateIndex` directly and
+>   does **not** consult `column_stats`, so it is unaffected. It has its own
+>   precondition — row-sharded obs metadata — so on a single-section-obs file,
+>   where Level-2 is inactive regardless, the query does degrade to a full obs
+>   scan.
+>
+> Correctness is never affected either way: the same rows match, just without the
+> pruning. The real fix is to derive the stats on re-emit
+> (`scx_engine::apply_obs_shard_column_stats`, as `merge` does). Until then, if
+> you need Level-1 pruning back, rebuild the index with an op that derives stats
+> — e.g. `scx sort --by <col> --index-preset …`. Prefer that over `scx compact`,
+> which re-runs `codec=auto` and can grow the file; and note `scx convert` cannot
+> take an `.scx` input at all. Pinned by
+> `scx-cli/tests/cli_ops_integration.rs::test_build_csc_preserves_predicate_index_sections_but_not_pushdown`.
 
 ## Append Complexity
 
@@ -220,6 +274,105 @@ appended with the source file's BLAKE3 in `input_checksums`.
 
 Known interaction: `scx subset` currently drops layers, so subset before
 importing rather than after.
+
+## External obs import
+
+`scx obs-import <target.scx> <table.csv>` / `pyscx.obs_import` land per-cell
+annotations computed outside SCX — doublet scores, cell-type calls, anything with
+one value per cell — onto an existing file as `obs` columns. `scx doublet-import`
+/ `pyscx.doublet_import` are the doublet-caller wrapper over the same machinery,
+and `rscx::scx_attach_obs` takes an R `data.frame` directly. The delimited-table
+reader is **ungated** (no libhdf5); an `.h5ad` source needs `--features hdf5`.
+
+For the analyst-facing walkthrough — which caller writes which column, how to
+export per-batch h5ads, how to combine several tools — see
+[docs/scanpy.md § Landing external per-cell annotations](scanpy.md#landing-external-per-cell-annotations-doublet-detection).
+This section covers the operational invariants.
+
+### In place, via the same harness as append
+
+The import writes through `prepare_in_place` / `commit_in_place`: new sections
+are appended at EOF and the catalog is repointed, exactly as `append`,
+`modify_metadata` and `cellbender-import` do. `X` and its layers are never read
+or rewritten, so the CSC sidecar, `.raw`, deletion vectors and detection bitmaps
+all survive, `data_generation` / `csc_build_generation` are unchanged, and cost
+is O(obs) rather than O(nnz).
+
+The obs block *is* rewritten in full each time, because obs is a single logical
+section that must cover every cell. On an 864 MB / 500k-cell atlas that is
+~160–250 MB of superseded bytes orphaned **per import** — roughly 100× the
+payload of the columns being added. `scx info` reports the orphaned total; see
+[§ Compact](#compact) to reclaim it, and prefer one import of a concatenated
+table over a loop of per-batch imports.
+
+### The join is by key string, never by row position
+
+The external tool's row order is its own business. A caller run per library
+against a merged atlas returns rows in whatever order it pleased, and a
+positional import would attach every cell's score to the wrong cell while
+producing a perfectly well-shaped column. So:
+
+- `--key`/`key=` names one obs column, `--key a,b` a composite (fused with an
+  ASCII unit separator that no barcode can contain), and `obs_names` names the
+  obs index. Omitted, the key is auto-resolved: the obs index, then a fallback
+  list of barcode-style names.
+- The two sides may spell the key differently. `--source-key` / `source_key=`
+  pairs source columns to `key=` components **positionally**, like pandas
+  `left_on` / `right_on`.
+- A duplicated key on either side is an error, never a silent first-wins.
+- Every key failure carries a key diagnosis naming the columns that *are*
+  unique. `pyscx.diagnose_obs_key(path)` runs that diagnosis on its own — worth
+  doing first on a merged atlas, where the obs index is often not unique and the
+  one column that is may be one no fallback list would guess.
+
+`--dry-run` runs the join and the diagnosis and writes nothing.
+
+### Uncovered rows get `null`, never `0.0`
+
+A target row the source does not cover has no value, and `0.0` would be a
+scientific claim the tool never made — a doublet score of zero says "definitely a
+singlet". So `on_missing_rows` defaults to **`"null"`** on every obs surface
+(`"zero"` is accepted as an alias for the same policy, inherited from the
+CellBender importer where a missing *matrix* row genuinely is zeros). `"error"`
+refuses a partial import outright.
+
+Partial coverage is a supported workflow, not a degraded one: run a caller on 6
+of 116 batches, concatenate, import once, and the other 110 batches' cells stay
+`null`. Downstream consumers are null-aware — `doublet_consensus` does not let a
+tool vote on a cell it never saw, and a cell nobody voted on stays `null` rather
+than becoming a singlet by default. A join whose every source row matched is
+reported as *coverage* at `info` level; the "matched only …" warning with example
+keys is reserved for the case where source rows genuinely failed to land, which
+is the only case where a key-format mismatch is plausible.
+
+If a `--status-column` is requested, covered rows get `"present"` and uncovered
+rows `"absent"`, so the distinction survives a round-trip through h5ad even for
+callers whose score column is legitimately zero-valued.
+
+### When a predicate index survives
+
+A pure column **add** leaves an obs predicate index valid: the index keys on
+column name, and the columns it covers are untouched. An **overwrite** of an
+indexed column does not — the index would describe values that no longer exist,
+and `filter_obs` pushdown would silently return the wrong rows.
+
+`obs_index_would_go_stale` decides precisely, comparing the columns this import
+will write against the columns the on-disk index actually covers. It is
+deliberately precise rather than conservative: dropping the index on every import
+would kill pushdown for the overwhelmingly common add-only case. The result is
+reported as `obs_index_dropped` in the import summary — check it if pushdown
+performance changes after an import.
+
+Note `--overwrite` **replaces rather than merges** a colliding column. Importing
+N per-batch tables one after another keeps only the last one's values.
+
+### Rollback granularity is one import
+
+Each import is one manifest version, so `scx rollback` undoes exactly the most
+recent one and leaves earlier imports standing. Three successive imports then one
+rollback leaves the first two sets of columns in place, with queries and pushdown
+still working against them. There is no way to undo an import from the middle of
+that chain.
 
 ## Rollback
 
