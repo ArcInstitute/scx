@@ -55,27 +55,56 @@ def _tracked_markdown(root: Path) -> list[Path]:
     except (OSError, subprocess.CalledProcessError):
         pass
 
-    skip_dirs = {".git", "target", "node_modules", ".venv", "__pycache__"}
-    walked: list[Path] = []
-    for path in root.rglob("*.md"):
-        if skip_dirs.isdisjoint(path.parts) and not _is_scratch_doc(path, root):
-            walked.append(path)
-    return walked
+    return [p for p in root.rglob("*.md") if _in_walk_allowlist(p, root)]
 
 
-def _is_scratch_doc(path: Path, root: Path) -> bool:
-    """Untracked scratch markdown, matched by the repo's own naming convention.
+# The fallback walk's scope: the **hand-written prose trees**, as an allowlist.
+#
+# This is deliberately *narrower* than `git ls-files`, and it is not trying to
+# match it. Approximating `.gitignore` by hand is a losing game — gitignored
+# markdown turns up in `tasks/` (~134 planning docs), `.claude/plans/`, `learn/`,
+# `.probe_venv/`, `.pytest_cache/`, vendored `dist-info/LICENSE.md`, and
+# `benchmarks/**/results/` (which also holds 18 *tracked* files, so it cannot even
+# be skipped wholesale).
+#
+# So the fallback is an explicit reduced-coverage safety net: if git disappears the
+# check still runs over the docs whose anchors are contracts — every referrer in
+# the D1 finding lives in these trees — rather than silently passing.
+# `test_the_two_enumeration_paths_agree` pins both halves of that claim: the walk
+# never includes untracked files, and it does cover the core prose trees.
+_WALK_INCLUDE_PREFIXES: tuple[str, ...] = (
+    "docs/",
+    "skills/",
+    ".claude/skills/",
+)
 
-    Repo-root docs that are dated (`2026-08-03_DOGFOOD.md`) or all-caps
-    (`*-CODE-REVIEW.md`) are ephemeral and gitignored/untracked by convention;
-    `README` / `ROADMAP` / `AGENTS` / `CLAUDE` are the tracked exceptions.
-    """
-    if path.parent != root:
+# Repo-root markdown that IS tracked. Everything else at the root is scratch by
+# convention — dated reports (`2026-08-03_DOGFOOD.md`), all-caps working docs, and
+# `CLAUDE.local.md` (gitignored, and neither dated nor all-caps).
+_TRACKED_ROOT_DOCS = frozenset({"README.md", "ROADMAP.md", "AGENTS.md", "CLAUDE.md"})
+
+# Never walk into these, whatever the prefix rule says.
+_WALK_SKIP_PARTS = frozenset(
+    {
+        ".git",
+        ".venv",
+        ".probe_venv",
+        "__pycache__",
+        ".pytest_cache",
+        "node_modules",
+        "target",
+    }
+)
+
+
+def _in_walk_allowlist(path: Path, root: Path) -> bool:
+    """Whether the fallback walk should enumerate `path`."""
+    if not _WALK_SKIP_PARTS.isdisjoint(path.parts):
         return False
-    stem = path.stem
-    if stem in {"README", "ROADMAP", "AGENTS", "CLAUDE"}:
-        return False
-    return bool(re.match(r"^\d{4}-\d{2}-\d{2}[_-]", stem)) or stem.isupper()
+    rel = path.relative_to(root).as_posix()
+    if "/" not in rel:
+        return rel in _TRACKED_ROOT_DOCS
+    return rel.startswith(_WALK_INCLUDE_PREFIXES)
 
 
 def _slug(heading: str) -> str:
@@ -188,3 +217,58 @@ def test_the_d1_anchor_specifically_resolves():
             f"{rel} no longer links to the section; if the link was removed on "
             "purpose, drop it from this list"
         )
+
+
+def test_the_two_enumeration_paths_agree():
+    """The no-git fallback must enumerate what `git ls-files` does.
+
+    Review finding: the first fallback was a bare `rglob("*.md")` with only a few
+    build dirs skipped, so it picked up gitignored `tasks/` (~134 planning docs)
+    and `CLAUDE.local.md` — 309 files against git's 58. A fallback that scans five
+    times the surface can fail on scratch content CI never sees, which turns a
+    guard into a liability.
+
+    Skipped rather than approximated when git is missing: there is nothing to
+    compare against, and the fallback is then the only answer available.
+    """
+    root = _repo_root()
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "*.md", "**/*.md"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("git unavailable — nothing to compare the fallback against")
+
+    tracked = {(root / line).resolve() for line in out.splitlines() if line}
+    walked = {p.resolve() for p in root.rglob("*.md") if _in_walk_allowlist(p, root)}
+
+    # The dangerous direction: the walk must never hand the anchor sweep a file
+    # git does not track. Links in scratch docs are nobody's contract, and failing
+    # the suite on one would make the guard a liability.
+    extra = sorted(str(p.relative_to(root)) for p in walked - tracked)
+    assert not extra, (
+        "the fallback walk includes files git does not track; narrow "
+        f"_WALK_INCLUDE_PREFIXES or extend _WALK_SKIP_PARTS:\n  " + "\n  ".join(extra)
+    )
+
+    # The other direction is allowed to be smaller — the fallback is a
+    # reduced-coverage net, not a git replacement — but it must still cover the
+    # prose trees where anchor contracts live, including every D1 referrer.
+    core = {
+        p
+        for p in tracked
+        if p.parent == root
+        or p.relative_to(root).as_posix().startswith(("docs/", "skills/"))
+    }
+    uncovered = sorted(str(p.relative_to(root)) for p in core - walked)
+    assert not uncovered, (
+        f"the fallback misses {len(uncovered)} core prose file(s), so it would not "
+        f"catch a D1-class regression without git:\n  " + "\n  ".join(uncovered[:10])
+    )
+    assert len(walked) > 25, (
+        f"the fallback only found {len(walked)} files — too few to be a meaningful "
+        "safety net"
+    )

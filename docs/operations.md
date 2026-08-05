@@ -33,7 +33,7 @@ back.
 | **subset** | New file (`<OUTPUT>` required, optional with `--dry-run`) | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
 | **sort** | New file (`<OUTPUT>` required) | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
 | **sort `--shuffle`** | New file (`<OUTPUT>` required) | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them |
-| **build-csc** | In place, or a new file with `<OUTPUT>` | **Re-emitted** (not re-encoded or canonicalized); row-group framing is preserved from the input | **Preserved** | **Preserved** | **Built** (this is the op that creates it) | Sections **copied verbatim** (shard boundaries are unchanged, so their `ShardRange`s stay valid), but the per-shard catalog **column stats are not re-derived** — so Level-1 pruning stops firing and `filter_obs` falls back to a full scan. See the note below |
+| **build-csc** | In place, or a new file with `<OUTPUT>` | **Re-emitted** (not re-encoded or canonicalized); row-group framing is preserved from the input | **Preserved** | **Preserved** | **Built** (this is the op that creates it) | Sections **copied verbatim** (shard boundaries are unchanged, so their `ShardRange`s stay valid), but the per-shard catalog **column stats are not re-derived** — so **Level-1** shard pruning stops firing. See the note below |
 | **obs-import** / **doublet-import** | In place (`<FILE> <SOURCE>`) | **Unchanged** (never read or rewritten) | Replaced (same `n_obs`, plus the new columns) | **Preserved** | **Preserved** (X untouched) | **Preserved** on a pure column *add*; dropped only when `--overwrite` rewrites an indexed column (`obs_index_would_go_stale` decides) |
 | **cellbender-import** (`attach_external_layer`) | In place (`<FILE> <CELLBENDER_H5>`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | **Preserved** (only columns are added; CSR shard ranges are untouched, and the index carries no schema hash) |
 | **rollback** | In place (`<FILE>`) | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored |
@@ -71,19 +71,31 @@ a framed output. Both derive it from `scx_ops::framing_for_csc_rebuild`, which
 is the only correct source — see the note on `rebuild_csc_inplace` for why both
 `None` and a `decode_target`-carrying `FramingConfig` are wrong here.
 
-> **Known gap: `build-csc` keeps the predicate index but loses its pushdown.**
+> **Known gap: `build-csc` keeps the predicate index but loses Level-1 pruning.**
 > `copy_auxiliary_sections` copies `obs_predicate_index` / `var_predicate_index`
 > byte-for-byte, and the copy stays *valid* — shard boundaries and row ranges are
 > unchanged. But `run_build_csc` re-encodes each shard through its own path and
-> does not re-derive the per-shard catalog `column_stats`, and Level-1 pruning
-> resolves a categorical predicate against those stats' `CategoryBitset`. So the
-> index section is present and the pruning it enables is gone.
+> does not re-derive the per-shard catalog `column_stats`, and **Level-1** pruning
+> resolves a categorical predicate against those stats' `CategoryBitset`.
 >
-> Measured on a 200-cell / 8-shard file indexed on a clustered `cell_type`:
-> `Level 1 eliminated 6/8` before `build-csc`, `0/8` after — same correct row
-> count, full scan instead of pruning. Rebuild the index (`scx compact
-> --index-obs …`, or re-run the op that created it) if you need pushdown back.
-> Pinned by
+> Scope matters, because the index drives two independent pushdown paths:
+>
+> - **Level-1** (catalog-stats shard pruning) **stops.** Measured on a
+>   200-cell / 8-shard file indexed on a clustered `cell_type`: `Level 1
+>   eliminated 6/8` before `build-csc`, `0/8` after — same correct row count.
+> - **Level-2** (row-set pushdown) reads the copied `PredicateIndex` directly and
+>   does **not** consult `column_stats`, so it is unaffected. It has its own
+>   precondition — row-sharded obs metadata — so on a single-section-obs file,
+>   where Level-2 is inactive regardless, the query does degrade to a full obs
+>   scan.
+>
+> Correctness is never affected either way: the same rows match, just without the
+> pruning. The real fix is to derive the stats on re-emit
+> (`scx_engine::apply_obs_shard_column_stats`, as `merge` does). Until then, if
+> you need Level-1 pruning back, rebuild the index with an op that derives stats
+> — e.g. `scx sort --by <col> --index-preset …`. Prefer that over `scx compact`,
+> which re-runs `codec=auto` and can grow the file; and note `scx convert` cannot
+> take an `.scx` input at all. Pinned by
 > `scx-cli/tests/cli_ops_integration.rs::test_build_csc_preserves_predicate_index_sections_but_not_pushdown`.
 
 ## Append Complexity
