@@ -83,10 +83,18 @@ pub fn read_h5ad_obs(
     let key_columns: Vec<String> = if opts.key_columns.is_empty() {
         vec![resolve_obs_key_column(&obs, None)?]
     } else {
+        // See `annotation_table.rs`: the axis-index alias resolves on the
+        // source side too, so `key="obs_names"` works against an h5ad's own
+        // obs index without a `source_key=`.
+        let mut resolved = Vec::with_capacity(opts.key_columns.len());
         for k in &opts.key_columns {
-            if schema.field_with_name(k).is_err() {
-                let present: Vec<&str> =
-                    schema.fields().iter().map(|f| f.name().as_str()).collect();
+            let physical = scx_ops::resolve_key_alias("obs", &schema, k);
+            if schema.field_with_name(&physical).is_err() {
+                let present: Vec<String> = schema
+                    .fields()
+                    .iter()
+                    .map(|f| scx_ops::display_key_name("obs", f.name()))
+                    .collect();
                 return Err(OpsError::KeyColumnUnresolved {
                     axis: "obs",
                     detail: format!(
@@ -96,8 +104,9 @@ pub fn read_h5ad_obs(
                     ),
                 });
             }
+            resolved.push(physical);
         }
-        opts.key_columns.clone()
+        resolved
     };
 
     let row_keys = if key_columns.len() == 1 {

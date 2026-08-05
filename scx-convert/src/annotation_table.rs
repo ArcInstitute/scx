@@ -299,10 +299,20 @@ pub fn read_annotation_table(
     let key_columns: Vec<String> = if opts.key_columns.is_empty() {
         vec![resolve_obs_key_column(&header_batch, None)?]
     } else {
+        // `obs_names` resolves here too, not just on the target side: an
+        // unnamed CSV index column is renamed to `_index` above, and the
+        // diagnosis tells users every name it reports is paste-able into
+        // `key=`. Resolving per component keeps that promise for a source table
+        // whose key IS its index. The error still quotes what the user typed.
+        let mut resolved = Vec::with_capacity(opts.key_columns.len());
         for k in &opts.key_columns {
-            if schema.field_with_name(k).is_err() {
-                let present: Vec<&str> =
-                    schema.fields().iter().map(|f| f.name().as_str()).collect();
+            let physical = scx_ops::resolve_key_alias("obs", &schema, k);
+            if schema.field_with_name(&physical).is_err() {
+                let present: Vec<String> = schema
+                    .fields()
+                    .iter()
+                    .map(|f| scx_ops::display_key_name("obs", f.name()))
+                    .collect();
                 return Err(OpsError::KeyColumnUnresolved {
                     axis: "obs",
                     detail: format!(
@@ -311,8 +321,9 @@ pub fn read_annotation_table(
                     ),
                 });
             }
+            resolved.push(physical);
         }
-        opts.key_columns.clone()
+        resolved
     };
 
     // --- Real read ----------------------------------------------------------

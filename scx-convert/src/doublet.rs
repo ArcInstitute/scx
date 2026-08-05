@@ -259,6 +259,19 @@ impl Default for DoubletImportOptions {
 }
 
 #[derive(Debug, Clone)]
+pub struct MissingCallColumn {
+    /// Rendered expectation, ready to print: `one of ["doublet_label"]`.
+    pub expected: String,
+    /// The profile's declared call spellings, machine-readable. Empty for a
+    /// prefix-only profile (doubletfinder).
+    pub expected_columns: Vec<String>,
+    /// The profile's declared call prefix, if any (`DF.classifications_`).
+    pub expected_prefix: Option<String>,
+    /// The table's schema — the "but what did I have?" half of the diagnostic.
+    pub present_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct DoubletTableInfo {
     pub tool: String,
     pub key_added: String,
@@ -266,6 +279,12 @@ pub struct DoubletTableInfo {
     pub score_source_column: String,
     /// Source column the canonical call came from, if any.
     pub call_source_column: Option<String>,
+    /// Set when the tool's profile declares a call column and the table carried
+    /// none of its spellings — so `<K>_predicted` was NOT written even though
+    /// this tool does emit a call. `None` both when the call resolved and when
+    /// the profile declares none (scds), which are the two cases a bare
+    /// `call_source_column == None` cannot tell apart.
+    pub call_column_missing: Option<MissingCallColumn>,
     /// `<K>_score`, and `<K>_predicted` when a call column was resolved.
     pub canonical_columns: Vec<String>,
     /// Passed-through source columns, under their final `<K>_<native>` names.
@@ -291,20 +310,52 @@ fn present_columns(batch: &RecordBatch) -> Vec<String> {
         .collect()
 }
 
+/// Outcome of resolving one of a profile's columns.
+///
+/// This used to be `Option<String>`, which conflated two different facts: "this
+/// profile declares no such column" (scds, generic) and "it declares one and the
+/// table carries none of the spellings". Worse, the sentence explaining the
+/// second case — the one thing a user needs — was built only on the error path
+/// and thrown away when the column was optional. So a `doubletdetection` import
+/// of a table spelling its call `predicted_doublet` (scrublet's name) silently
+/// produced a score-only import, and the failure surfaced much later in
+/// `doublet_consensus` under the false claim "That tool emits no call column".
+///
+/// Both facts, and the sentence, now reach the caller, which decides whether
+/// either is fatal.
+enum ColumnMatch {
+    Found(String),
+    /// Nothing to look for: no aliases, no prefix, no explicit override. This is
+    /// `!profile_has_call_column(profile)` for the call role.
+    NotDeclared {
+        expected: String,
+        present: Vec<String>,
+    },
+    /// Declared, and absent from this table.
+    DeclaredButAbsent {
+        expected: String,
+        present: Vec<String>,
+    },
+}
+
 /// Resolve one of a profile's columns: explicit override, then aliases, then a
 /// prefix search that must land on exactly one column.
 ///
-/// `required` distinguishes the score (always needed) from the call (absent for
-/// scds by design), so a missing optional column returns `None` while a missing
-/// required one is an error naming what the table actually has.
+/// Returns [`ColumnMatch`] rather than `Option`, so a caller can tell a
+/// by-design absence from a name mismatch. An explicit override that is absent
+/// is still a hard error for every role — that is unambiguous user error and
+/// must not degrade to a warning.
+///
+/// Deliberately takes `aliases`/`prefix` rather than a `&DoubletProfile`, so it
+/// stays profile-agnostic and a caller-supplied `call_column=` correctly flips
+/// the answer from `NotDeclared` to `Found`/an error.
 fn resolve_column(
     batch: &RecordBatch,
     role: &str,
     explicit: Option<&str>,
     aliases: &[&str],
     prefix: Option<&str>,
-    required: bool,
-) -> Result<Option<String>> {
+) -> Result<ColumnMatch> {
     let present = present_columns(batch);
 
     if let Some(name) = explicit {
@@ -313,19 +364,19 @@ fn resolve_column(
                 "{role} column '{name}' is not in the table; columns present are {present:?}"
             )));
         }
-        return Ok(Some(name.to_string()));
+        return Ok(ColumnMatch::Found(name.to_string()));
     }
 
     for a in aliases {
         if let Some(hit) = present.iter().find(|p| p.as_str() == *a) {
-            return Ok(Some(hit.clone()));
+            return Ok(ColumnMatch::Found(hit.clone()));
         }
     }
 
     if let Some(pre) = prefix {
         let hits: Vec<&String> = present.iter().filter(|p| p.starts_with(pre)).collect();
         match hits.len() {
-            1 => return Ok(Some(hits[0].clone())),
+            1 => return Ok(ColumnMatch::Found(hits[0].clone())),
             0 => {}
             // Two `pANN_*` columns means the tool was run twice with different
             // parameters. Either is defensible; choosing for the user is not.
@@ -340,20 +391,38 @@ fn resolve_column(
         }
     }
 
-    if !required {
-        return Ok(None);
-    }
-
+    // Built unconditionally now: it is the diagnostic for BOTH the hard-error
+    // (score) and the warn-only (call) cases, and discarding it on the latter is
+    // what made the score-only degradation silent.
     let expected = match (aliases.is_empty(), prefix) {
         (false, Some(p)) => format!("one of {aliases:?} or a column starting with '{p}'"),
         (false, None) => format!("one of {aliases:?}"),
         (true, Some(p)) => format!("a column starting with '{p}'"),
         (true, None) => "an explicitly named column".to_string(),
     };
-    Err(OpsError::InvalidInput(format!(
-        "no {role} column found: expected {expected}, but the columns present are \
-         {present:?}"
-    )))
+    if aliases.is_empty() && prefix.is_none() {
+        Ok(ColumnMatch::NotDeclared { expected, present })
+    } else {
+        Ok(ColumnMatch::DeclaredButAbsent { expected, present })
+    }
+}
+
+/// The error a *required* column's non-`Found` outcome becomes.
+///
+/// One place, so the score role keeps its exact pre-existing message shape
+/// (pinned by `missing_expected_column_errors_naming_present_columns` and
+/// `generic_requires_a_score_column`).
+fn missing_required_column(role: &str, m: &ColumnMatch) -> OpsError {
+    let (expected, present) = match m {
+        ColumnMatch::Found(_) => unreachable!("caller checked for Found"),
+        ColumnMatch::NotDeclared { expected, present }
+        | ColumnMatch::DeclaredButAbsent { expected, present } => {
+            (expected.clone(), present.clone())
+        }
+    };
+    OpsError::InvalidInput(format!(
+        "no {role} column found: expected {expected}, but the columns present are {present:?}"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -552,24 +621,45 @@ pub fn read_doublet_table(
 
     let batch = &data.row_annotations;
 
-    let score_source = resolve_column(
+    // The score is required: both non-`Found` outcomes are a hard error, with
+    // the pre-existing message shape.
+    let score_source = match resolve_column(
         batch,
         "score",
         opts.score_column.as_deref(),
         profile.score_columns,
         profile.score_prefix,
-        true,
-    )?
-    .expect("a required column resolves to Some or errors");
+    )? {
+        ColumnMatch::Found(name) => name,
+        other => return Err(missing_required_column("score", &other)),
+    };
 
-    let call_source = resolve_column(
+    // The call is optional, but the two ways it can be absent mean very
+    // different things and only one of them is by design.
+    let (call_source, call_column_missing) = match resolve_column(
         batch,
         "call",
         opts.call_column.as_deref(),
         profile.call_columns,
         profile.call_prefix,
-        false,
-    )?;
+    )? {
+        ColumnMatch::Found(name) => (Some(name), None),
+        // scds / generic: no call to look for. Omitting `<K>_predicted` is the
+        // documented behaviour, so say nothing.
+        ColumnMatch::NotDeclared { .. } => (None, None),
+        // This profile DOES emit a call and the table did not carry it under any
+        // spelling the profile knows. Carry the diagnostic out so the binding can
+        // warn and `uns` can record why there is no `<K>_predicted`.
+        ColumnMatch::DeclaredButAbsent { expected, present } => (
+            None,
+            Some(MissingCallColumn {
+                expected,
+                expected_columns: profile.call_columns.iter().map(|s| s.to_string()).collect(),
+                expected_prefix: profile.call_prefix.map(|s| s.to_string()),
+                present_columns: present,
+            }),
+        ),
+    };
 
     let score_name = format!("{key_added}_score");
     let call_name = format!("{key_added}_predicted");
@@ -642,6 +732,22 @@ pub fn read_doublet_table(
         "source_format": table_info.format.as_str(),
         "source_score_column": score_source,
         "source_call_column": call_source,
+        // Three-way, because a bare `source_call_column: null` cannot say WHY.
+        // `not_declared` is a positive statement ("this tool emits scores only")
+        // that the consensus error needs in order to stop asserting it for every
+        // tool. Read by `_resolve_consensus_keys` in pyscx.
+        "call_column_status": match (&call_source, &call_column_missing) {
+            (Some(_), _) => "resolved",
+            (None, None) => "not_declared",
+            (None, Some(_)) => "declared_but_absent",
+        },
+        "expected_call_columns": call_column_missing
+            .as_ref()
+            .map(|m| m.expected_columns.clone())
+            .unwrap_or_default(),
+        "expected_call_prefix": call_column_missing
+            .as_ref()
+            .and_then(|m| m.expected_prefix.clone()),
         "n_rows_in_source": table_info.n_rows,
         "join_key_columns": table_info.key_columns,
     });
@@ -658,6 +764,7 @@ pub fn read_doublet_table(
         key_added,
         score_source_column: score_source,
         call_source_column: call_source,
+        call_column_missing,
         canonical_columns,
         native_columns,
         dropped_alias_columns,

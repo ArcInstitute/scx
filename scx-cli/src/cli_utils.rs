@@ -26,11 +26,25 @@ pub fn validate_scx_file(path: &Path) -> CliResult<()> {
 /// silently downgrades a v4 file back to v3 — undoing the framing that
 /// compact/sort/merge/append/subset just preserved. Returns `None` (unframed)
 /// if the file can't be opened; the CSC rebuild surfaces any real error.
+///
+/// **Deliberately `FramingConfig::default()` — i.e. `decode_target: None`.**
+/// This is the one framing site where the `fast` profile is correct rather than
+/// a bug: a CSC rebuild re-writes each CSR shard at the codec read off the
+/// source shard header, and `decode_target: Some(_)` would authorise the writer
+/// to re-select it (see `FramingConfig`'s contract), silently defeating the
+/// preservation. Do not "make this consistent" with the derived-file ops.
+/// Pinned by `scx-ops/tests/codec_adaptive.rs::build_csc_preserves_per_shard_codec`.
+///
+/// **Every `rebuild_csc_inplace` caller must get its framing from here** (or, in
+/// `scx-convert`, from `ConvertOptions::framing_preserving_codec`) — never from
+/// the framing used for the surrounding rewrite. `subset` and `convert --csc`
+/// both passed the rewrite framing until this was caught in review: harmless
+/// while `write_shard_inner` ignored `decode_target`, a silent codec override
+/// once it honoured it.
 pub fn framing_for_file(path: &Path) -> Option<scx_format_io::FramingConfig> {
-    ScxReader::open(path)
-        .ok()
-        .filter(|r| r.header().format_version >= scx_format_io::CURRENT_FORMAT_VERSION)
-        .map(|_| scx_format_io::FramingConfig::default())
+    // Delegates so the CLI, pyscx and convert cannot drift apart on this rule
+    // again -- see `scx_ops::framing_for_csc_rebuild`.
+    scx_ops::framing_for_csc_rebuild(path)
 }
 
 /// Validate that every input file reports the same file-level `n_vars`,

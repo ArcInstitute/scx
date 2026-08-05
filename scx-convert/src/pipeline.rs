@@ -444,6 +444,26 @@ impl ConvertOptions {
             })
     }
 
+    /// [`Self::framing`] with codec re-selection switched **off**, for a pass
+    /// that must preserve each shard's existing codec rather than pick one.
+    ///
+    /// The CSC sidecar rebuild is the case: `scx_ops::rebuild_csc_inplace`
+    /// re-writes every CSR shard at the codec read off that shard's own header,
+    /// and `decode_target: Some(_)` authorises `write_shard_inner` to override
+    /// it (see `FramingConfig`'s contract). Passing `framing()` there was
+    /// harmless only while `write_shard_inner` ignored the field; now that it
+    /// honours it, the sidecar rebuild would re-decide a codec the just-written
+    /// X had already settled. Same rule as `scx-cli`'s
+    /// `cli_utils::framing_for_file`, expressed locally because `scx-convert`
+    /// does not depend on the CLI.
+    pub fn framing_preserving_codec(&self) -> Option<scx_format_io::FramingConfig> {
+        self.framing().map(|f| scx_format_io::FramingConfig {
+            trial: false,
+            decode_target: None,
+            ..f
+        })
+    }
+
     /// Codec-selection intent for the provenance `params_json` (`codec_selection`
     /// key): the resolved profile (`auto`/`fast`/`compact`/`compact-trial` or an
     /// explicit codec name). The realized per-shard codecs are reported read-side
@@ -1868,8 +1888,13 @@ pub fn h5ad_to_scx_streaming(
     if opts.csc.should_build_csc(n_obs as u64, n_vars as u64) {
         // Pass framing so `--csc <policy> --row-group-rows N` produces a framed
         // CSC sidecar (and keeps X framed) instead of silently downgrading to v3.
-        scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G", opts.framing())
-            .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
+        scx_ops::rebuild_csc_inplace(
+            output,
+            opts.csc_cols_per_shard,
+            "4G",
+            opts.framing_preserving_codec(),
+        )
+        .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
     }
 
     Ok(())
@@ -1926,9 +1951,20 @@ fn convert_then_sort_grouped(
         // exposed only on `scx sort` / `pyscx.shuffle`.
         shuffle: None,
         shard_target_rows: opts.shard_target_rows,
-        codec: match opts.codec {
-            Some(c) => scx_codec::CodecSelection::Explicit(c),
-            None => scx_codec::CodecSelection::Auto,
+        // Carry this convert's own codec intent into the grouping sort, so
+        // `scx convert --group-by --codec auto` gets the same adaptive
+        // per-shard selection as the ungrouped path. Reconstructed from the
+        // fields `resolve_codec` populated on `ConvertOptions` rather than
+        // collapsed to Auto-or-explicit, which is what dropped `decode_target`
+        // and left the grouped path on the `fast` heuristic.
+        codec: scx_format_io::ResolvedCodec {
+            explicit_codec: opts.codec,
+            codec_trial: opts.codec_trial,
+            decode_target: opts.decode_target,
+            // Framing was already validated for this convert; the sort inherits
+            // the output's framing rather than deciding it.
+            requires_framing: false,
+            profile: "auto",
         },
         index_options: ConversionPredicateIndexOptions {
             index_obs: opts.index_obs.clone(),
@@ -1959,8 +1995,13 @@ fn convert_then_sort_grouped(
         let (n_obs, n_vars) = (reader.n_obs(), reader.n_vars());
         drop(reader);
         if opts.csc.should_build_csc(n_obs, n_vars) {
-            scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G", opts.framing())
-                .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
+            scx_ops::rebuild_csc_inplace(
+                output,
+                opts.csc_cols_per_shard,
+                "4G",
+                opts.framing_preserving_codec(),
+            )
+            .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
         }
     }
     Ok(())

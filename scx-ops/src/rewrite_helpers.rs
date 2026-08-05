@@ -3,12 +3,13 @@
 // Used by build_csc and upgrade to avoid duplicating layer/obsm/uns/
 // predicate-index/provenance copy logic.
 
-use scx_codec::{CodecId, CodecSelection, ValueEncoding};
+use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::catalog::{FullCatalogEntry, ShardStats};
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
 use scx_format_io::shard::{ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE};
 use scx_format_io::writer::ScxWriter;
+use scx_format_io::ResolvedCodec;
 use scx_format_io::{compute_shard_stats, MajorAxis, ScxReader};
 
 use crate::error::{OpsError, Result as OpsResult};
@@ -31,21 +32,32 @@ use crate::error::{OpsError, Result as OpsResult};
 /// framed shard under a header a pre-framing reader accepts, which then
 /// mis-decodes the per-group local-rebased indptr as global; byte-copying a v1
 /// shard into a v4 file would advertise sub-shard random access it cannot honor.
+/// **Codec gate.** A byte-copy preserves the source shard's codec exactly, so
+/// whether it is eligible depends on what the caller's intent asked for:
+///
+/// | intent | raw-copy | why |
+/// |---|---|---|
+/// | explicit codec | only if `sh.codec_id` already matches | the copy would ignore the force |
+/// | `auto` / `fast` | **yes** | preserving the source codec is size-neutral and free; re-encoding to "re-decide" a codec the source already chose adaptively is pure cost |
+/// | `compact` / `compact-trial` | **no** | the caller explicitly asked for a size-max re-encode; a byte-copy would silently ignore it |
 pub(crate) fn raw_copy_csr_eligible(
     sh: &ShardHeader,
     target_index_dtype: u8,
     target_n_vars: u64,
-    codec: CodecSelection,
+    codec: ResolvedCodec,
     output_framed: bool,
 ) -> bool {
     let shard_framed = sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION;
+    let codec_ok = match codec.explicit_codec {
+        Some(c) => sh.codec_id == c as u8,
+        // `compact`/`compact-trial` request a size-max re-encode; honour it.
+        // `auto`/`fast` are satisfied by keeping what the source already has.
+        None => !codec.requires_framing && !codec.codec_trial,
+    };
     shard_framed == output_framed
         && sh.index_dtype == target_index_dtype
         && (sh.n_minor as u64) == target_n_vars
-        && match codec {
-            CodecSelection::Auto => true,
-            CodecSelection::Explicit(c) => sh.codec_id == c as u8,
-        }
+        && codec_ok
 }
 
 /// Build the patched section bytes + stats for a raw-copied CSR shard,
@@ -317,20 +329,20 @@ mod tests {
         );
         // Unframed (v1) shard: eligible ONLY into unframed output.
         assert!(
-            raw_copy_csr_eligible(&v1, 0, 10, CodecSelection::Auto, false),
+            raw_copy_csr_eligible(&v1, 0, 10, ResolvedCodec::AUTO, false),
             "unframed v1 shard must be eligible into unframed output"
         );
         assert!(
-            !raw_copy_csr_eligible(&v1, 0, 10, CodecSelection::Auto, true),
+            !raw_copy_csr_eligible(&v1, 0, 10, ResolvedCodec::AUTO, true),
             "unframed v1 shard must NOT be raw-copy eligible into framed output"
         );
         // Framed (v2) shard: eligible ONLY into framed (v4) output.
         assert!(
-            !raw_copy_csr_eligible(&v2, 0, 10, CodecSelection::Auto, false),
+            !raw_copy_csr_eligible(&v2, 0, 10, ResolvedCodec::AUTO, false),
             "framed v2 shard must NOT be raw-copy eligible into unframed output"
         );
         assert!(
-            raw_copy_csr_eligible(&v2, 0, 10, CodecSelection::Auto, true),
+            raw_copy_csr_eligible(&v2, 0, 10, ResolvedCodec::AUTO, true),
             "framed v2 shard must be raw-copy eligible into framed output"
         );
     }

@@ -474,6 +474,13 @@ fn a_wrong_profile_refuses_naming_the_columns_present() {
     );
 }
 
+/// Only meaningful in a build with no HDF5: there, an `.h5ad` source is refused
+/// with the "write a CSV instead" hint. With `--features hdf5` the extension no
+/// longer decides — the file's contents do — so this fixture (which is not HDF5
+/// at all) fails as an unreadable file instead. The unit-test sibling in
+/// `scx-convert/src/doublet_tests.rs` has always been gated this way; this test
+/// was not, so `cargo test -p scx-cli --features hdf5` failed on it.
+#[cfg(not(feature = "hdf5"))]
 #[test]
 fn an_h5ad_source_is_refused_with_the_convert_hint() {
     let dir = tempfile::tempdir().unwrap();
@@ -497,6 +504,80 @@ fn an_h5ad_source_is_refused_with_the_convert_hint() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(msg.contains("to_csv"), "{msg}");
+}
+
+/// The `--features hdf5` counterpart: a file named `.h5ad` that is not HDF5
+/// fails as an unreadable file, naming the format it tried.
+#[cfg(feature = "hdf5")]
+#[test]
+fn a_non_hdf5_h5ad_source_fails_as_an_unreadable_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = simple_fixture(dir.path(), "t.scx");
+    let h5 = write_text(dir.path(), "scrublet_out.h5ad", "not really hdf5");
+
+    let out = scx()
+        .args([
+            "doublet-import",
+            scx_path.to_str().unwrap(),
+            h5.to_str().unwrap(),
+            "--tool",
+            "scrublet",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(msg.contains("as HDF5"), "{msg}");
+}
+
+#[test]
+fn a_declared_call_column_absent_warns_and_still_imports() {
+    // B3: a scrublet-shaped table imported as doubletdetection. Exit 0 (a
+    // score-only import is valid), but the two-case note must say WHICH case.
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = simple_fixture(dir.path(), "t.scx");
+    let table = write_text(
+        dir.path(),
+        "dd.csv",
+        "barcode,doublet_score,predicted_doublet\n\
+         AAAC-1,0.10,True\nAAAG-1,0.20,False\n\
+         AAAT-1,0.30,False\nAAAA-1,0.40,False\n",
+    );
+
+    let out = scx()
+        .args([
+            "doublet-import",
+            scx_path.to_str().unwrap(),
+            table.to_str().unwrap(),
+            "--tool",
+            "doubletdetection",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "score-only import must still succeed");
+    let msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        msg.contains("doublet_label"),
+        "names what it expected: {msg}"
+    );
+    assert!(msg.contains("--call-column"), "names the remedy: {msg}");
+    assert!(
+        msg.contains("predicted_doublet"),
+        "names what the table had: {msg}"
+    );
+    // Must NOT claim the by-design wording that belongs to scds.
+    assert!(
+        !msg.contains("will not choose a cutoff"),
+        "that note is for a profile with no call column: {msg}"
+    );
 }
 
 #[test]

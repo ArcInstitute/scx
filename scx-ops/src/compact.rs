@@ -8,14 +8,14 @@ use scx_engine::{
     build_and_write_conversion_predicate_indexes,
     build_and_write_conversion_predicate_indexes_streaming, ConversionPredicateIndexOptions,
 };
-use scx_format_io::codec_select::select_codec;
-use scx_format_io::encoder::FramingConfig;
 use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
+use scx_format_io::ResolvedCodec;
 use scx_format_io::ScxReader;
 
+use crate::codec_intent::{framing_for_rewrite, seed_codec};
 use crate::error::Result;
 use crate::flock::SharedFileLock;
 use crate::helpers::{encode_value, widest_value_encoding};
@@ -23,27 +23,66 @@ use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
 };
 
+/// Configuration for [`compact_with_options`].
+///
+/// `Default` is "no predicate index, no obs reshape, `codec="auto"`" — the
+/// adaptive profile, matching `scx convert`. Before this struct existed compact
+/// hardcoded the `select_codec` heuristic and built `FramingConfig::default()`,
+/// i.e. it silently ran `fast`; on a `shufdelta` input that flipped every
+/// integer shard and made compact *grow* the file it was asked to shrink.
+#[derive(Debug, Clone)]
+pub struct CompactOptions {
+    /// Predicate-index build configuration for the compacted output. Defaults
+    /// to "do nothing" via the `index_auto_threshold = 0` sentinel.
+    pub index_options: ConversionPredicateIndexOptions,
+    /// Write the output's obs metadata as row-sharded `ObsMetadataShard`
+    /// sections instead of one legacy `ObsMetadata` section.
+    pub reshape_obs: bool,
+    /// Codec intent for the rewritten X / layer / obsp shards.
+    pub codec: ResolvedCodec,
+}
+
+impl Default for CompactOptions {
+    fn default() -> Self {
+        Self {
+            // See `merge` for the `index_auto_threshold = 0` sentinel rationale.
+            index_options: ConversionPredicateIndexOptions {
+                index_obs: Vec::new(),
+                index_var: Vec::new(),
+                index_preset: None,
+                index_auto_threshold: 0,
+            },
+            reshape_obs: false,
+            codec: ResolvedCodec::AUTO,
+        }
+    }
+}
+
+impl CompactOptions {
+    /// Reproduce a legacy `compact_with_index_options(...)` call, so the
+    /// back-compat wrappers don't change behaviour beyond the codec default.
+    pub fn legacy_with_index_options(
+        index_options: ConversionPredicateIndexOptions,
+        reshape_obs: bool,
+    ) -> Self {
+        Self {
+            index_options,
+            reshape_obs,
+            ..Default::default()
+        }
+    }
+}
+
 /// Compact an SCX file: removes deleted rows, stale catalogs, and produces
 /// a clean single-catalog file.
 ///
 /// Drops any input predicate indexes — the row layout is re-sharded
 /// against the post-deletion row count, so per-shard row ranges in the
 /// input index are stale. Use [`compact_with_index_options`] to rebuild
-/// predicate indexes against the compacted output in the same pass.
+/// predicate indexes against the compacted output in the same pass, or
+/// [`compact_with_options`] to also pick a codec intent.
 pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
-    // See `merge` for the `index_auto_threshold = 0` sentinel rationale.
-    compact_with_index_options(
-        input_path,
-        output_path,
-        &ConversionPredicateIndexOptions {
-            index_obs: Vec::new(),
-            index_var: Vec::new(),
-            index_preset: None,
-            index_auto_threshold: 0,
-        },
-        false,
-    )
-    .map(|_| ())
+    compact_with_options(input_path, output_path, &CompactOptions::default()).map(|_| ())
 }
 
 /// Compact an SCX file and optionally rebuild predicate indexes on the
@@ -61,6 +100,22 @@ pub fn compact_with_index_options(
     index_options: &ConversionPredicateIndexOptions,
     reshape_obs: bool,
 ) -> Result<PredicateIndexBuildSummary> {
+    compact_with_options(
+        input_path,
+        output_path,
+        &CompactOptions::legacy_with_index_options(index_options.clone(), reshape_obs),
+    )
+}
+
+/// Compact an SCX file with full control over predicate indexes, obs reshaping
+/// and the codec intent. See [`CompactOptions`].
+pub fn compact_with_options(
+    input_path: &Path,
+    output_path: &Path,
+    opts: &CompactOptions,
+) -> Result<PredicateIndexBuildSummary> {
+    let index_options = &opts.index_options;
+    let reshape_obs = opts.reshape_obs;
     // Acquire shared lock to prevent concurrent writers from modifying the
     // file while we read it. The lock is held until `_lock` is dropped.
     let _lock = SharedFileLock::acquire(input_path)?;
@@ -92,7 +147,14 @@ pub fn compact_with_index_options(
         // warning.
         let multimodal_skip =
             user_wants_index(index_options).then(|| requested_columns(index_options));
-        compact_multimodal(reader, in_header, input_path, output_path, reshape_obs)?;
+        compact_multimodal(
+            reader,
+            in_header,
+            input_path,
+            output_path,
+            reshape_obs,
+            opts.codec,
+        )?;
         return Ok(PredicateIndexBuildSummary {
             result: None,
             multimodal_skip,
@@ -217,9 +279,7 @@ pub fn compact_with_index_options(
     // defaults to 0 (no CSC emitted); any stale sidecar would mismatch.
     let mut writer = ScxWriter::new(output_path, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
-    if output_framed {
-        writer.set_framing(Some(FramingConfig::default()));
-    }
+    writer.set_framing(framing_for_rewrite(opts.codec, output_framed, "the input")?);
     if let Some(ref filtered_obs) = eager_filtered_obs {
         write_obs_section(
             &mut writer,
@@ -302,7 +362,7 @@ pub fn compact_with_index_options(
             if acc_row_count >= shard_target as u64 {
                 let shard_row_start = emitted_rows;
                 // Auto-select optimal codec for this shard's data
-                let shard_codec = select_codec(&acc_values, value_encoding);
+                let shard_codec = seed_codec(opts.codec, &acc_values, value_encoding);
                 writer.write_csr_shard(
                     &acc_indptr,
                     &acc_indices,
@@ -325,7 +385,7 @@ pub fn compact_with_index_options(
     if acc_row_count > 0 {
         let shard_row_start = emitted_rows;
         // Auto-select optimal codec for remaining shard
-        let shard_codec = select_codec(&acc_values, value_encoding);
+        let shard_codec = seed_codec(opts.codec, &acc_values, value_encoding);
         writer.write_csr_shard(
             &acc_indptr,
             &acc_indices,
@@ -405,7 +465,7 @@ pub fn compact_with_index_options(
             layer_row_count += 1;
 
             if layer_row_count >= shard_target as u64 {
-                let layer_shard_codec = select_codec(&layer_values, layer_value_encoding);
+                let layer_shard_codec = seed_codec(opts.codec, &layer_values, layer_value_encoding);
                 writer.write_layer_csr_shard(
                     &layer_indptr,
                     &layer_indices,
@@ -426,7 +486,7 @@ pub fn compact_with_index_options(
         }
 
         if layer_row_count > 0 {
-            let layer_shard_codec = select_codec(&layer_values, layer_value_encoding);
+            let layer_shard_codec = seed_codec(opts.codec, &layer_values, layer_value_encoding);
             writer.write_layer_csr_shard(
                 &layer_indptr,
                 &layer_indices,
@@ -877,6 +937,7 @@ fn compact_multimodal(
     input_path: &Path,
     output_path: &Path,
     reshape_obs: bool,
+    codec_intent: ResolvedCodec,
 ) -> Result<()> {
     let dv = reader.read_deletion_vectors()?;
 
@@ -967,9 +1028,11 @@ fn compact_multimodal(
     // bump the data generation; the new file emits no CSC here.
     let mut writer = ScxWriter::new(output_path, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
-    if output_framed {
-        writer.set_framing(Some(FramingConfig::default()));
-    }
+    writer.set_framing(framing_for_rewrite(
+        codec_intent,
+        output_framed,
+        "the input",
+    )?);
     if let Some(ref filtered_obs) = eager_filtered_obs {
         write_obs_section(
             &mut writer,
@@ -1055,7 +1118,7 @@ fn compact_multimodal(
                 acc_rows += 1;
 
                 if acc_rows >= shard_target as u64 {
-                    let codec = select_codec(&acc_values, value_encoding);
+                    let codec = seed_codec(codec_intent, &acc_values, value_encoding);
                     writer.write_csr_shard_for(
                         out_modality_id,
                         &acc_indptr,
@@ -1075,7 +1138,7 @@ fn compact_multimodal(
         }
 
         if acc_rows > 0 {
-            let codec = select_codec(&acc_values, value_encoding);
+            let codec = seed_codec(codec_intent, &acc_values, value_encoding);
             writer.write_csr_shard_for(
                 out_modality_id,
                 &acc_indptr,
@@ -1226,7 +1289,7 @@ fn compact_multimodal(
                     l_rows += 1;
 
                     if l_rows >= shard_target as u64 {
-                        let codec = select_codec(&l_values, layer_value_encoding);
+                        let codec = seed_codec(codec_intent, &l_values, layer_value_encoding);
                         writer.write_layer_csr_shard_for(
                             out_modality_id,
                             &layer_name,
@@ -1248,7 +1311,7 @@ fn compact_multimodal(
                 }
             }
             if l_rows > 0 {
-                let codec = select_codec(&l_values, layer_value_encoding);
+                let codec = seed_codec(codec_intent, &l_values, layer_value_encoding);
                 writer.write_layer_csr_shard_for(
                     out_modality_id,
                     &layer_name,

@@ -32,6 +32,46 @@ fn parse_key(key: Option<&str>) -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// Split `--key` / `--source-key` into the source-side column list and the
+/// target-side join spec.
+///
+/// `--source-key` is how a join whose two sides name the key differently is
+/// expressed — `--key sample_id,obs_names --source-key sample_id,barcode`.
+/// Without it both sides use the same names, which stays the common case.
+pub(crate) fn resolve_key_pair(
+    key: Option<&str>,
+    source_key: Option<&str>,
+) -> Result<(Vec<String>, ObsJoinKey), Box<dyn std::error::Error>> {
+    let target = parse_key(key);
+    let source = parse_key(source_key);
+    if !source.is_empty() && target.is_empty() {
+        return Err(
+            "--source-key needs --key: it names the source-side column for each \
+                    target-side key component, positionally. To key on the target's obs \
+                    index, pass --key obs_names."
+                .into(),
+        );
+    }
+    if !source.is_empty() && source.len() != target.len() {
+        return Err(format!(
+            "--key has {} component(s) but --source-key has {}; they pair up \
+             positionally, so the counts must match",
+            target.len(),
+            source.len()
+        )
+        .into());
+    }
+    let join_key = match target.len() {
+        0 => ObsJoinKey::Auto,
+        1 => ObsJoinKey::Column(target[0].clone()),
+        _ => ObsJoinKey::Composite {
+            columns: target.clone(),
+        },
+    };
+    let source_columns = if source.is_empty() { target } else { source };
+    Ok((source_columns, join_key))
+}
+
 fn parse_rename(
     pairs: &[String],
 ) -> Result<std::collections::HashMap<String, String>, Box<dyn std::error::Error>> {
@@ -53,6 +93,7 @@ pub fn run_obs_import(
     input: &Path,
     table: &Path,
     key: Option<&str>,
+    source_key: Option<&str>,
     columns: Option<&str>,
     rename: &[String],
     prefix: &str,
@@ -71,7 +112,9 @@ pub fn run_obs_import(
         // nulls, not zeros); "zero" stays accepted for back-compat.
         "null" | "zero" => MissingRowPolicy::ZeroFill,
         "error" => MissingRowPolicy::Error,
-        other => return Err(format!("--on-missing-rows must be zero|error; got '{other}'").into()),
+        other => {
+            return Err(format!("--on-missing-rows must be null|zero|error; got '{other}'").into())
+        }
     };
     let extra = match on_extra_rows {
         "warn" => ExtraRowPolicy::WarnSkip,
@@ -89,16 +132,10 @@ pub fn run_obs_import(
         }
     };
 
-    // Both sides of the join are built from the same names, so the reader and
-    // the op cannot disagree about what the key is.
-    let key_columns = parse_key(key);
-    let join_key = match key_columns.len() {
-        0 => ObsJoinKey::Auto,
-        1 => ObsJoinKey::Column(key_columns[0].clone()),
-        _ => ObsJoinKey::Composite {
-            columns: key_columns.clone(),
-        },
-    };
+    // Each side resolves its own names, so a source table that spells the key
+    // differently joins without a rename — but by default both sides use the
+    // same names and cannot disagree about what the key is.
+    let (key_columns, join_key) = resolve_key_pair(key, source_key)?;
 
     let read_opts = AnnotationTableOptions {
         key_columns,
@@ -154,7 +191,11 @@ pub fn run_obs_import(
     println!(
         "Join: {}/{} target rows matched on {} ({} target rows absent, \
          {} source rows skipped)",
-        s.n_matched, s.n_obs, s.obs_key_column, s.n_target_rows_absent, s.n_source_rows_absent,
+        s.n_matched,
+        s.n_obs,
+        scx_ops::display_key_name("obs", &s.obs_key_column),
+        s.n_target_rows_absent,
+        s.n_source_rows_absent,
     );
 
     if dry_run {

@@ -17,7 +17,7 @@ use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
 use crate::modality::{ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES};
 use crate::section::{align_to_8, SectionType};
-use crate::shard::{derive_shard_type, BlockIndex, ShardHeader, SHARD_HEADER_SIZE};
+use crate::shard::{derive_shard_type, ShardHeader, SHARD_HEADER_SIZE};
 
 use crate::provenance::{Provenance, ProvenanceEntry};
 
@@ -920,6 +920,12 @@ impl ScxWriter {
     /// via `write_csr_shard`). `None` restores the legacy unframed layout. The
     /// caller bumps the file `format_version` to v4 when framing (the convert
     /// path does this alongside setting this).
+    ///
+    /// A config whose `decode_target` is `Some` (or whose `trial` is set)
+    /// authorises this writer to **re-select the per-shard integer codec**,
+    /// overriding the `codec_id` passed to `write_csr_shard`. Pass
+    /// `FramingConfig::default()` (`decode_target: None`) when the intent is to
+    /// preserve a source codec. See `FramingConfig`'s contract section.
     pub fn set_framing(&mut self, framing: Option<crate::encoder::FramingConfig>) {
         self.framing = framing;
     }
@@ -1104,35 +1110,24 @@ impl ScxWriter {
         // layers, obsp — is emitted row-group-framed (shard v2) for
         // codec-agnostic sub-shard random access; else the monolithic layout
         // (shard v1, byte-identical to legacy).
-        let (encoded, block_index, shard_version) = match self.framing {
-            Some(fc) if fc.row_group_rows > 0 => {
-                let (e, bi) = crate::encoder::encode_shard_framed(
-                    indptr,
-                    indices,
-                    values,
-                    codec_id,
-                    value_encoding,
-                    index_dtype_u16,
-                    fc.row_group_rows,
-                    fc.target_nnz,
-                )?;
-                (e, bi, crate::shard::CURRENT_SHARD_FORMAT_VERSION)
-            }
-            _ => {
-                let e = scx_codec::encode_shard(
-                    indptr,
-                    indices,
-                    values,
-                    codec_id,
-                    value_encoding,
-                    index_dtype_u16,
-                )?;
-                // Single whole-shard block (or ≤MAX_BLOCK_ROWS split for oversized
-                // shards) with zero byte offsets — byte-identical to legacy.
-                let bi = BlockIndex::for_shard(n_major, indptr)?;
-                (e, bi, crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION)
-            }
-        };
+        //
+        // `codec_id` is the caller's *candidate*. When `self.framing` carries a
+        // `decode_target` (`auto`/`compact`) or `trial`, an integer shard is
+        // dual-encoded against ShufDeltaZstd and `chosen_codec` may differ — see
+        // `encode_shard_adaptive`. Before that call existed this path ignored
+        // both fields, so every shard written through here (layers, the CSC
+        // sidecar, multimodal X) silently got the `fast` heuristic even when the
+        // caller asked for `auto`.
+        let (encoded, block_index, shard_version, chosen_codec) =
+            crate::encoder::encode_shard_adaptive(
+                indptr,
+                indices,
+                values,
+                codec_id,
+                value_encoding,
+                index_dtype_u16,
+                self.framing,
+            )?;
         let mut block_index_bytes = Vec::new();
         block_index.write_to(&mut block_index_bytes)?;
 
@@ -1171,7 +1166,9 @@ impl ScxWriter {
             magic: crate::shard::SHARD_MAGIC,
             shard_format_version: shard_version,
             shard_type: derive_shard_type(section_type),
-            codec_id: codec_id as u8,
+            // The adaptively-chosen codec, NOT the caller's candidate — the
+            // reader dispatches on this byte.
+            codec_id: chosen_codec as u8,
             value_encoding: value_encoding as u8,
             index_dtype: shard_index_dtype,
             reserved_flags: [0; 3],

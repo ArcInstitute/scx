@@ -1,6 +1,7 @@
 pub mod append;
 pub mod build_csc;
 pub mod checksum;
+pub mod codec_intent;
 pub mod compact;
 pub mod delete;
 pub mod error;
@@ -31,12 +32,14 @@ pub use append::{
     AppendOptions,
 };
 pub use build_csc::run_build_csc;
-pub use compact::{compact, compact_with_index_options};
+pub use codec_intent::{framing_for_rewrite, intent_from_codec_selection, seed_codec};
+pub use compact::{compact, compact_with_index_options, compact_with_options, CompactOptions};
 pub use delete::mark_deleted;
 pub use error::{OpsError, Result};
 pub use external_layer::{
-    attach_external_layer, AttachLayerOptions, AttachLayerSummary, ColumnAxisMatch,
-    ColumnAxisPolicy, ExternalLayerData, ExtraRowPolicy, MissingRowPolicy, ShardRangeSource,
+    attach_external_layer, axis_index_alias, display_key_name, resolve_key_alias,
+    AttachLayerOptions, AttachLayerSummary, ColumnAxisMatch, ColumnAxisPolicy, ExternalLayerData,
+    ExtraRowPolicy, MissingRowPolicy, ShardRangeSource,
 };
 pub use external_obs::{
     attach_external_obs, build_composite_key, diagnose_obs_key, obs_key_values,
@@ -49,7 +52,7 @@ pub use merge_options::{MergeOptions, UnsPolicy};
 pub use modify_metadata::{modify_metadata, set_uns, MetadataPatch};
 pub use optimize::{optimize, optimize_with_framing, OptimizeStats};
 pub use predicate_index::PredicateIndexBuildSummary;
-pub use rebuild_csc::rebuild_csc_inplace;
+pub use rebuild_csc::{framing_for_csc_rebuild, rebuild_csc_inplace};
 pub use rewrite_helpers::copy_auxiliary_sections;
 pub use rollback::{rollback, rollback_to};
 pub use shuffle_order::seeded_permutation;

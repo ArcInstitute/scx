@@ -65,7 +65,8 @@ pub(crate) fn record_batch_to_pyarrow<'py>(
 ///   verbatim through the SCX on-disk round-trip) → plain
 ///   `Table.to_pandas()`. pyarrow natively restores the index name,
 ///   multi-level indexes, and pandas-extension dtypes (`Int64`,
-///   `boolean`, `Categorical`, …) from the envelope.
+///   `boolean`, `Categorical`, …) — but only for the columns the envelope
+///   lists, which never includes one appended later by `attach_external_obs`.
 /// - **Minimal envelope** `{"index_columns": [...]}` (stamped by
 ///   `scx-convert/src/h5ad/read.rs::read_dataframe_group` and
 ///   `scx_format_io::ensure_pandas_index_metadata`) → `Table.to_pandas()`
@@ -73,6 +74,10 @@ pub(crate) fn record_batch_to_pyarrow<'py>(
 ///   key first, then `set_index(drop=True, inplace=True)` manually.
 ///   The `__index_level_0__` sentinel becomes `df.index.name = None`
 ///   to match anndata semantics for an unnamed index.
+///
+/// Two per-column fixups then run regardless of branch, because neither survives
+/// `to_pandas()` on its own: ordered categoricals ([`apply_categorical_ordered`])
+/// and the nullable `boolean` dtype ([`apply_nullable_boolean`]).
 pub(crate) fn pyarrow_table_to_pandas<'py>(
     table: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
@@ -84,6 +89,9 @@ pub(crate) fn pyarrow_table_to_pandas<'py>(
     // stamped by the h5ad reader) BEFORE conversion — `self_destruct` frees the
     // Arrow buffers as columns convert — then restore the bit on the DataFrame.
     let ordered_cols = ordered_categorical_columns(table)?;
+    // Same "collect before `self_destruct`" reason as above: the Arrow schema
+    // is gone once the columns convert.
+    let bool_cols = boolean_columns(table)?;
 
     let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("self_destruct", true)?;
@@ -113,7 +121,72 @@ pub(crate) fn pyarrow_table_to_pandas<'py>(
     };
 
     apply_categorical_ordered(&df, &ordered_cols)?;
+    apply_nullable_boolean(&df, &bool_cols)?;
     Ok(df)
+}
+
+/// Names of Arrow `Boolean` columns. Must be called before a `self_destruct`
+/// `to_pandas()`, for the same reason as [`ordered_categorical_columns`].
+pub(crate) fn boolean_columns(table: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let py = table.py();
+    let schema = table.getattr("schema")?;
+    let names: Vec<String> = schema.getattr("names")?.extract()?;
+    let is_boolean = py.import("pyarrow.types")?.getattr("is_boolean")?;
+    let mut out = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let field = schema.call_method1("field", (i,))?;
+        if is_boolean
+            .call1((field.getattr("type")?,))?
+            .extract::<bool>()
+            .unwrap_or(false)
+        {
+            out.push(name.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Give every Arrow `Boolean` column the pandas nullable `boolean` dtype.
+///
+/// Without this, pyarrow's default mapping picks the dtype from the *data*:
+/// numpy `bool` when `null_count == 0`, Python `object` when it isn't (there is
+/// no NaN-bearing numpy bool). So `obs["<K>_predicted"]` came back `object` on a
+/// partially-covered `doublet_import` and `bool` on a fully-covered one, while
+/// the same column read back through `to_h5ad` → `anndata.read_h5ad` was
+/// `boolean` — three dtypes for one documented contract, decided by whether some
+/// row happened to be uncovered.
+///
+/// `boolean` is the one that can represent every case, is what the h5ad export
+/// already produces (it writes anndata's `nullable-boolean` encoding
+/// unconditionally) and is what `doublet_consensus` writes directly. Note the
+/// consequence on a column with nulls: `.astype(bool)` now raises instead of
+/// silently mapping null → `False`. That is the point — "never scored" is not
+/// "not a doublet" — and `.fillna(False)` is the explicit form.
+pub(crate) fn apply_nullable_boolean(df: &Bound<'_, PyAny>, bool_cols: &[String]) -> PyResult<()> {
+    if bool_cols.is_empty() {
+        return Ok(());
+    }
+    let columns = df.getattr("columns")?;
+    for col in bool_cols {
+        // Skips the column that became the frame's index, exactly as
+        // `apply_categorical_ordered` does.
+        if !columns.contains(col)? {
+            continue;
+        }
+        let series = df.get_item(col)?;
+        let dtype_name: String = series.getattr("dtype")?.getattr("name")?.extract()?;
+        if dtype_name == "boolean" {
+            continue; // a full pyarrow envelope already restored it
+        }
+        let cast = series.call_method1("astype", ("boolean",))?;
+        let pos: usize = columns
+            .call_method1("get_loc", (col.as_str(),))?
+            .extract()?;
+        // `isetitem`, not `df[col] = ...`: same dtype-change and
+        // Copy-on-Write-warning reasons as `apply_categorical_ordered`.
+        df.call_method1("isetitem", (pos, cast))?;
+    }
+    Ok(())
 }
 
 /// Names of dictionary columns whose Arrow `Field` metadata flags them as

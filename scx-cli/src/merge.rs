@@ -25,7 +25,11 @@ pub fn run_merge(
     uns_policy: Option<String>,
     sort_by: Vec<String>,
     sort_reverse: bool,
+    codec: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve before any work: an unknown codec should fail immediately.
+    let resolved_codec = scx_format_io::resolve_codec(Some(codec))?;
+
     // Validate at least 2 inputs
     if inputs.len() < 2 {
         return Err("at least 2 files required for merge".into());
@@ -89,6 +93,7 @@ pub fn run_merge(
             index_options,
             assume_identical_var,
             assume_identical_obs,
+            codec: resolved_codec,
             uns_policy,
             shard_target_rows: None,
             sort_by,
@@ -97,7 +102,13 @@ pub fn run_merge(
         let summary = scx_ops::merge_with_options(&input_refs, output, &merge_opts)?;
         emit_index_summary("merge", &summary);
     } else {
-        scx_ops::merge(&input_refs, output)?;
+        // Still the options path, so a lone `--codec` is not silently dropped.
+        // `MergeOptions::default()` reproduces the bare `merge` wrapper.
+        let merge_opts = MergeOptions {
+            codec: resolved_codec,
+            ..Default::default()
+        };
+        scx_ops::merge_with_options(&input_refs, output, &merge_opts)?;
     }
 
     pb.finish_and_clear();

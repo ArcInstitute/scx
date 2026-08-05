@@ -318,12 +318,13 @@ cheap level-1 shard permutation is all the per-epoch randomization you need.
 
 Two things to know before you run it: the output is the **inverse** of a sorted
 file for query purposes (it maximally scatters predicate-index shard ranges),
-and you should pass `--codec <the input's codec>` to hold its encoding —
-otherwise the adaptive `auto` codec re-selects per shard and the file can grow
-~2×. (`--codec scx1` is *not* the size-preserving answer on a `shufdelta`/`zstd`
-input; it is what `auto` flips to.) Pass `--shard-size <input's value>` too if
-the input is not at the 16,384 default, so the rewrite reorders without also
-re-sharding. Both are
+and a permutation inherently costs some cross-row redundancy for codecs whose
+compression spans rows (~6–12% for `zstd`, under 1% for `lz4`/`shufdelta`).
+Leave `--codec` at `auto`: it runs the same adaptive per-shard selection
+`scx convert` does. (This used to say to pass the input's own codec because
+`auto` grew the file ~2× — that was a bug in every derived-file op, since fixed.)
+Pass `--shard-size <input's value>` if the input is not at the 16,384 default, so
+the rewrite reorders without also re-sharding. Both are
 covered in
 [sharding.md § Shuffling for training](sharding.md#shuffling-for-training-scx-sort---shuffle).
 

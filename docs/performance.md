@@ -2369,21 +2369,31 @@ codec and its own shard geometry**, so the only variable is row order:
 
 Three separate findings, and conflating them is the easy mistake:
 
-1. **The `auto` row is an adaptive-codec flip, not lost compression.** The per-shard codec
-   histogram is recorded before and after, and it moves `shufdelta ×N → scx1 ×N` on both
-   datasets: the per-shard heuristic reaches a different answer on reordered data, and the
-   entire 1.86–2.09× is that switch. Pass `--codec` to hold the input's encoding.
+1. **The `auto` row measured a bug, since fixed — it is no longer reproducible.** The
+   per-shard codec histogram is recorded before and after, and it moved `shufdelta ×N →
+   scx1 ×N` on both datasets, the entire 1.86–2.09× being that switch. The cause was not
+   the reorder: every derived-file op built a `FramingConfig` whose `decode_target` was
+   `None`, which *is* the `fast` profile, so `auto` on any rewrite ran the single-encode
+   heuristic and never re-adopted `ShufDeltaZstd`. The same bug made `scx compact` grow a
+   file it was asked to shrink. Post-fix, `auto` on `sort`/`subset`/`merge`/`compact` runs
+   the same adaptive per-shard selection `scx convert` does; a re-measurement on
+   `census_500k` is in [sharding.md § Shuffling for training](sharding.md#shuffling-for-training-scx-sort---shuffle).
+   The rows below were captured before that fix and are kept as the record of it.
 2. **`zstd` genuinely loses cross-row redundancy — 6% at 100k cells, 12% at 500k.** No flip;
    this is the real effect, and it grows with shard occupancy, which is what the mechanism
    predicts. It is also an order of magnitude smaller than the flip.
 3. **`scx1` is exactly neutral**, as its design implies: each row's gene indices are coded
    independently of row order, so a permutation relocates identically-sized blocks.
 
-**The remediation is "pin the input's own codec", not "pin `scx1`".** `scx1` is neutral
-*relative to an `scx1` input*; on the `shufdelta` files above it is precisely what `auto` flips
-to, so pinning it reproduces the 2.09× rewrite rather than avoiding it. Pin `scx1` when you
-want a permutation-invariant encoding or the GPU device-decode route. The pre-rewrite warning
-names the input's dominant codec for this reason.
+**The remediation, twice revised, is now "no pin at all".** The first version said to pin
+`scx1`, which is neutral only *relative to an `scx1` input*; on the `shufdelta` files above it
+is precisely what `auto` flipped to, so that advice reproduced the 2.09× rewrite rather than
+avoiding it. The second said to pin the input's own codec — correct against the bug, but
+obsolete once the bug was fixed, and worse than `auto` on a `zstd` input that `auto` would now
+re-encode smaller. Leave `--codec` at `auto`; pin a codec only to *choose* an encoding (`scx1`
+for a permutation-invariant layout or the GPU device-decode route), never to hold size. The
+pre-rewrite warning was narrowed to match: it now fires only for codecs whose compression
+spans rows, states the inherent 6–12% zstd cost, and recommends nothing.
 
 Reproduce with `benchmarks/comprehensive/benchmarks/shuffle_layout.py` (SCX-only, `scx_auto`
 trigger, `_NO_CONVERSION`); the capture harness is `/scratch/…/scx-1d-capture/`.

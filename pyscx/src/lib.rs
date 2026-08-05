@@ -1493,6 +1493,7 @@ fn register_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::diagnose_obs_key, m)?)?;
     m.add_function(wrap_pyfunction!(ops::doublet_import, m)?)?;
     m.add_function(wrap_pyfunction!(ops::doublet_tools, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::doublet_profiles, m)?)?;
     #[cfg(feature = "hdf5")]
     {
         m.add_function(wrap_pyfunction!(ops::cellbender_import, m)?)?;

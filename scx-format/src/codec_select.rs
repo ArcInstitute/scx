@@ -100,6 +100,27 @@ pub struct ResolvedCodec {
     pub profile: &'static str,
 }
 
+impl ResolvedCodec {
+    /// The default intent: cost-aware adaptive (`codec="auto"`).
+    ///
+    /// A `const` so option structs can spell their default without calling the
+    /// string parser. Pinned equal to `resolve_codec(None)` by
+    /// `resolved_codec_auto_const_matches_parser`, so the two cannot drift.
+    pub const AUTO: Self = Self {
+        explicit_codec: None,
+        codec_trial: false,
+        decode_target: Some(DecodeTarget::Auto),
+        requires_framing: false,
+        profile: "auto",
+    };
+}
+
+impl Default for ResolvedCodec {
+    fn default() -> Self {
+        Self::AUTO
+    }
+}
+
 /// Resolve a user-facing `codec=` string into [`ResolvedCodec`].
 ///
 /// Intent axis: `auto` (default, cost-aware adaptive), `fast` (decode-max
@@ -344,6 +365,16 @@ mod tests {
                 CodecId::Pcodec
             );
         }
+    }
+
+    #[test]
+    fn resolved_codec_auto_const_matches_parser() {
+        // `ResolvedCodec::AUTO` exists so option structs can default without
+        // calling the parser. If the two ever diverge, every derived-file op
+        // silently writes a different profile than `--codec auto` asks for.
+        assert_eq!(ResolvedCodec::AUTO, resolve_codec(None).unwrap());
+        assert_eq!(ResolvedCodec::AUTO, resolve_codec(Some("auto")).unwrap());
+        assert_eq!(ResolvedCodec::default(), ResolvedCodec::AUTO);
     }
 
     #[test]

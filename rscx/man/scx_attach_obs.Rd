@@ -14,7 +14,7 @@ scx_attach_obs(
   status_column = NULL,
   uns_key = NULL,
   overwrite = FALSE,
-  on_missing_rows = "zero",
+  on_missing_rows = "null",
   on_extra_rows = "warn",
   dry_run = FALSE
 )
@@ -50,8 +50,10 @@ per row. \code{NULL} omits it.}
 attaching several per-batch results in turn keeps only the last. Combine
 them into one \code{data.frame} and attach once.}
 
-\item{on_missing_rows}{\code{"zero"} (default) marks uncovered target rows
-absent; \code{"error"} refuses.}
+\item{on_missing_rows}{\code{"null"} (default) leaves uncovered target rows
+\code{NA} and marks them absent; \code{"error"} refuses. \code{"zero"} is
+an accepted alias for \code{"null"} — it names the shared policy enum,
+whose \code{zero} is literal only for a matrix layer.}
 
 \item{on_extra_rows}{\code{"warn"} (default) skips source rows the target
 lacks; \code{"error"} refuses.}

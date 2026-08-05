@@ -15,7 +15,7 @@ use scx_format_io::provenance::{Provenance, ProvenanceEntry};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::{write_alignment_padding, SectionType};
 use scx_format_io::shard::{
-    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, CURRENT_SHARD_FORMAT_VERSION,
+    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader,
     DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
 use scx_format_io::writer::ScxWriter;
@@ -440,7 +440,7 @@ pub fn append_from_reader_with_index_options(
             &sh,
             target_index_dtype,
             prep.target_n_vars,
-            options.codec,
+            crate::codec_intent::intent_from_codec_selection(options.codec),
             output_framed,
         ) && sh.n_major <= options.shard_target_rows.get();
 
@@ -833,19 +833,24 @@ fn write_csr_chunk(
     // `guard_no_legacy_shard_in_v4` — would write an unframed v1 shard into a v4
     // file (invalid). A ≤v3 base keeps the legacy monolithic v1 layout.
     let output_framed = prep.header.format_version >= CURRENT_FORMAT_VERSION;
-    let (encoded, block_index, shard_format_version) = if output_framed {
+    let (encoded, block_index, shard_format_version, shard_codec) = if output_framed {
+        // Routed through the shared adaptive encoder so this third copy of the
+        // framed encode honours the codec intent axis identically to
+        // `encode_one_shard` and `ScxWriter::write_csr_shard`. `framing` here
+        // carries `decode_target: None`, so today the returned codec always
+        // equals `shard_codec` — this is the seam for threading
+        // `AppendOptions.codec` as an intent later.
         let fc = scx_format_io::FramingConfig::default();
-        let (enc, bi) = scx_format_io::encode_shard_framed(
+        let (enc, bi, ver, chosen) = scx_format_io::encode_shard_adaptive(
             shard_indptr,
             shard_indices,
             shard_values,
             shard_codec,
             value_encoding,
             index_dtype_u16,
-            fc.row_group_rows,
-            fc.target_nnz,
+            Some(fc),
         )?;
-        (enc, bi, CURRENT_SHARD_FORMAT_VERSION)
+        (enc, bi, ver, chosen)
     } else {
         let enc = scx_codec::encode_shard(
             shard_indptr,
@@ -865,7 +870,7 @@ fn write_csr_chunk(
                 shard_nnz,
             )?],
         };
-        (enc, bi, DEFAULT_WRITE_SHARD_FORMAT_VERSION)
+        (enc, bi, DEFAULT_WRITE_SHARD_FORMAT_VERSION, shard_codec)
     };
     let mut block_index_bytes = Vec::new();
     block_index.write_to(&mut block_index_bytes)?;

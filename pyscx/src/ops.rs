@@ -567,7 +567,7 @@ pub fn mark_deleted(path: &str, cell_indices: Vec<i64>) -> PyResult<u64> {
 #[pyo3(signature = (
     input, output,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
-    reshape_obs=false,
+    reshape_obs=false, codec="auto",
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn compact(
@@ -579,18 +579,23 @@ pub fn compact(
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
     reshape_obs: bool,
+    codec: &str,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
+    let resolved_codec = parse_codec_intent(codec)?;
     match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
         Some(index_opts) => {
             let summary = py
                 .detach(|| {
-                    scx_ops::compact_with_index_options(
+                    scx_ops::compact_with_options(
                         &input_path,
                         &output_path,
-                        &index_opts,
-                        reshape_obs,
+                        &scx_ops::CompactOptions {
+                            index_options: index_opts,
+                            reshape_obs,
+                            codec: resolved_codec,
+                        },
                     )
                 })
                 .map_err(ops_to_pyerr)?;
@@ -602,21 +607,35 @@ pub fn compact(
         // bare `compact()`, while still migrating obs to sharded
         // sections. Mirrors `scx-cli/src/compact.rs`.
         None if reshape_obs => {
-            let sentinel = ConversionPredicateIndexOptions {
-                index_obs: Vec::new(),
-                index_var: Vec::new(),
-                index_preset: None,
-                index_auto_threshold: 0,
-            };
             let summary = py
                 .detach(|| {
-                    scx_ops::compact_with_index_options(&input_path, &output_path, &sentinel, true)
+                    scx_ops::compact_with_options(
+                        &input_path,
+                        &output_path,
+                        &scx_ops::CompactOptions {
+                            reshape_obs: true,
+                            codec: resolved_codec,
+                            ..Default::default()
+                        },
+                    )
                 })
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)
         }
+        // Still the options path so a lone `codec=` is not silently dropped;
+        // `CompactOptions::default()` reproduces bare `compact()`.
         None => py
-            .detach(|| scx_ops::compact(&input_path, &output_path))
+            .detach(|| {
+                scx_ops::compact_with_options(
+                    &input_path,
+                    &output_path,
+                    &scx_ops::CompactOptions {
+                        codec: resolved_codec,
+                        ..Default::default()
+                    },
+                )
+            })
+            .map(|_| ())
             .map_err(ops_to_pyerr),
     }
 }
@@ -757,11 +776,8 @@ pub(crate) fn parse_reference_spec(
 /// per-codec fixtures produced byte-identical outputs for every variant,
 /// because the writer re-selected `auto` each time, so the sweep measured
 /// auto-reselection rather than whether a permutation grows that codec.
-fn parse_codec_selection(codec: &str) -> PyResult<CodecSelection> {
-    match CodecId::parse_cli(codec).map_err(PyValueError::new_err)? {
-        None => Ok(CodecSelection::Auto),
-        Some(c) => Ok(CodecSelection::Explicit(c)),
-    }
+fn parse_codec_intent(codec: &str) -> PyResult<scx_format_io::ResolvedCodec> {
+    scx_format_io::resolve_codec(Some(codec)).map_err(PyValueError::new_err)
 }
 
 /// Run a built [`scx_ops::SortOptions`] off the GIL, then optionally rebuild
@@ -786,9 +802,18 @@ fn run_sort_engine(
         // Run the heavy CSC rebuild off the GIL too. Its `Box<dyn Error>` is
         // not `Send`, so map it to a `String` inside the closure to cross
         // `py.detach`.
+        // NOT `None`: on a v4 output that would rewrite CSR + CSC unframed and
+        // strip the row-group framing the sort just wrote. See
+        // `scx_ops::framing_for_csc_rebuild`.
+        let csc_framing = scx_ops::framing_for_csc_rebuild(output_path);
         py.detach(|| {
-            scx_ops::rebuild_csc_inplace(output_path, csc_cols_per_shard, csc_memory_limit, None)
-                .map_err(|e| e.to_string())
+            scx_ops::rebuild_csc_inplace(
+                output_path,
+                csc_cols_per_shard,
+                csc_memory_limit,
+                csc_framing,
+            )
+            .map_err(|e| e.to_string())
         })
         .map_err(PyRuntimeError::new_err)?;
     }
@@ -876,7 +901,7 @@ pub fn sort(
         reverse,
         shuffle: None,
         shard_target_rows,
-        codec: parse_codec_selection(&codec)?,
+        codec: parse_codec_intent(&codec)?,
         index_options: ConversionPredicateIndexOptions {
             index_obs: index_obs.unwrap_or_default(),
             index_var: index_var.unwrap_or_default(),
@@ -930,16 +955,17 @@ pub fn sort(
 ///
 /// Two consequences worth knowing before a multi-hour rewrite:
 ///
-/// - **Size is not neutral, and the fix is to pin the *input's own* codec.**
-///   Two effects grow the output. The dominant one is that `codec="auto"`
-///   RE-SELECTS per shard on reordered data and can flip to a bulkier encoding
-///   (measured 1.86-2.09x on X); the smaller one is a genuine loss of cross-row
-///   redundancy (6-12% for `zstd`, under 1% for `lz4`/`shufdelta`). So pass
-///   `codec="zstd"` / `codec="shufdelta"` / whatever the input already uses.
-///   `codec="scx1"` is size-neutral only relative to an `scx1` input — on a
-///   `shufdelta`/`zstd` file it *is* what `auto` flips to, so it reproduces the
-///   ~2x rewrite rather than avoiding it. Reach for it when you want a
-///   permutation-invariant encoding or the GPU device-decode route.
+/// - **Size is not quite neutral, and `codec="auto"` is still the right
+///   choice.** A permutation genuinely loses some cross-row redundancy for
+///   codecs whose compression spans rows — 6-12% for `zstd`, under 1% for
+///   `lz4`/`shufdelta`. That is inherent to shuffling. `auto` runs the same
+///   adaptive per-shard selection `scx convert` does, so pinning a codec
+///   *chooses an encoding* rather than holding the file's size; reach for
+///   `codec="scx1"` when you want a permutation-invariant layout or the GPU
+///   device-decode route. (This used to say `auto` re-selects and grows X
+///   1.86-2.09x, and to pin the input's own codec. That growth was a bug in
+///   every derived-file op — `FramingConfig::default()` meant the `fast`
+///   profile — not a property of shuffling, and it is fixed.)
 /// - **Shard geometry is not preserved by default.** `shard_size=None` uses the
 ///   16,384-row default, so a file written with a different shard size is
 ///   re-sharded as well as reordered — and shard size is what quantises batch
@@ -992,7 +1018,7 @@ pub fn shuffle(
         reverse: false,
         shuffle: Some(seed),
         shard_target_rows,
-        codec: parse_codec_selection(&codec)?,
+        codec: parse_codec_intent(&codec)?,
         index_options: ConversionPredicateIndexOptions {
             index_obs: index_obs.unwrap_or_default(),
             index_var: index_var.unwrap_or_default(),
@@ -1181,7 +1207,7 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
     inputs, output,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     assume_identical_var=false, assume_identical_obs=false, uns_policy=None,
-    sort_by=None, reverse=false,
+    sort_by=None, reverse=false, codec="auto",
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn merge(
@@ -1197,7 +1223,9 @@ pub fn merge(
     uns_policy: Option<String>,
     sort_by: Option<Vec<String>>,
     reverse: bool,
+    codec: &str,
 ) -> PyResult<()> {
+    let resolved_codec = parse_codec_intent(codec)?;
     if inputs.len() < 2 {
         return Err(PyValueError::new_err(
             "merge requires at least 2 input files",
@@ -1232,6 +1260,7 @@ pub fn merge(
                 index_options: index_opts,
                 assume_identical_var,
                 assume_identical_obs,
+                codec: resolved_codec,
                 uns_policy: uns_policy_parsed,
                 shard_target_rows: None,
                 sort_by,
@@ -1252,6 +1281,7 @@ pub fn merge(
                 },
                 assume_identical_var,
                 assume_identical_obs,
+                codec: resolved_codec,
                 uns_policy: uns_policy_parsed,
                 shard_target_rows: None,
                 sort_by,
@@ -1262,8 +1292,20 @@ pub fn merge(
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)
         }
+        // Still the options path so a lone `codec=` is not silently dropped;
+        // `MergeOptions::default()` reproduces the bare `merge` wrapper.
         None => py
-            .detach(|| scx_ops::merge(&input_refs, &output_path))
+            .detach(|| {
+                scx_ops::merge_with_options(
+                    &input_refs,
+                    &output_path,
+                    &scx_ops::MergeOptions {
+                        codec: resolved_codec,
+                        ..Default::default()
+                    },
+                )
+            })
+            .map(|_| ())
             .map_err(ops_to_pyerr),
     }
 }
@@ -1712,20 +1754,50 @@ pub fn parse_obs_extra_rows(s: &str) -> PyResult<scx_ops::ExtraRowPolicy> {
     }
 }
 
-/// Turn the caller's `key` into the reader's column list and the op's join-key
-/// spec, built from the **same** names so both sides of the join agree.
-fn resolve_join_key(key: Option<Vec<String>>) -> (Vec<String>, scx_ops::ObsJoinKey) {
-    match key {
-        None => (Vec::new(), scx_ops::ObsJoinKey::Auto),
-        Some(cols) if cols.is_empty() => (Vec::new(), scx_ops::ObsJoinKey::Auto),
-        Some(cols) if cols.len() == 1 => {
-            (cols.clone(), scx_ops::ObsJoinKey::Column(cols[0].clone()))
-        }
-        Some(cols) => (
-            cols.clone(),
-            scx_ops::ObsJoinKey::Composite { columns: cols },
-        ),
+/// Turn the caller's `key` / `source_key` into the reader's column list and the
+/// op's join-key spec.
+///
+/// Without `source_key` both sides are built from the same names, which is the
+/// common case and the only one expressible before: a target obs keyed on
+/// (`sample_id`, obs index) could not be joined to a tool output keyed on
+/// (`sample_id`, `barcode`) without renaming a column in pandas first. The two
+/// lists pair up **positionally**, mirroring pandas `left_on` / `right_on`.
+///
+/// Nothing downstream needs to know the names differ: `build_composite_key`
+/// fuses each side from its own columns in the given order and the fused key
+/// never carries a column name.
+fn resolve_join_key(
+    key: Option<Vec<String>>,
+    source_key: Option<Vec<String>>,
+) -> PyResult<(Vec<String>, scx_ops::ObsJoinKey)> {
+    let target = key.unwrap_or_default();
+    let source = source_key.unwrap_or_default();
+    if !source.is_empty() && target.is_empty() {
+        return Err(PyValueError::new_err(
+            "source_key= needs key=: it names the source-side column for each \
+             target-side key component, positionally. To key on the target's obs \
+             index, pass key=\"obs_names\".",
+        ));
     }
+    if !source.is_empty() && source.len() != target.len() {
+        return Err(PyValueError::new_err(format!(
+            "key= has {} component(s) but source_key= has {}; they pair up \
+             positionally, so the counts must match",
+            target.len(),
+            source.len()
+        )));
+    }
+    let join_key = match target.len() {
+        0 => scx_ops::ObsJoinKey::Auto,
+        1 => scx_ops::ObsJoinKey::Column(target[0].clone()),
+        _ => scx_ops::ObsJoinKey::Composite {
+            columns: target.clone(),
+        },
+    };
+    // Absent `source_key`, the reader gets the target names — the historical
+    // behaviour, and still what makes the two sides impossible to desync.
+    let source_columns = if source.is_empty() { target } else { source };
+    Ok((source_columns, join_key))
 }
 
 fn key_diagnosis_dict<'py>(
@@ -1737,6 +1809,10 @@ fn key_diagnosis_dict<'py>(
     out.set_item("resolved_key", d.resolved_key.clone())?;
     out.set_item("resolved_cardinality", d.resolved_cardinality)?;
     out.set_item("unique_columns", d.unique_columns.clone())?;
+    // Unique, but refused as a key — a float, or any other type that is not
+    // guaranteed to render identically on two independently written sides. Kept
+    // out of `unique_columns` so nothing in that list is a key the join rejects.
+    out.set_item("unusable_unique_columns", d.unusable_unique_columns.clone())?;
     let pairs: Vec<(String, String)> = d.unique_pairs.clone();
     out.set_item("unique_pairs", pairs)?;
     out.set_item("pair_search_capped", d.pair_search_capped)?;
@@ -1765,9 +1841,9 @@ fn key_diagnosis_dict<'py>(
 /// before trusting the result, and prefer `dry_run=True` on a large file.
 #[pyfunction]
 #[pyo3(signature = (
-    path, table, *, key=None, columns=None, rename=None, prefix="",
+    path, table, *, key=None, source_key=None, columns=None, rename=None, prefix="",
     keep_key_columns=false, delimiter=None, status_column=None, uns_key=None,
-    uns_keys=None, overwrite=false, on_missing_rows="zero", on_extra_rows="warn",
+    uns_keys=None, overwrite=false, on_missing_rows="null", on_extra_rows="warn",
     dry_run=false
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -1776,6 +1852,7 @@ pub fn obs_import(
     path: &str,
     table: &str,
     key: Option<Vec<String>>,
+    source_key: Option<Vec<String>>,
     columns: Option<Vec<String>>,
     rename: Option<std::collections::HashMap<String, String>>,
     prefix: &str,
@@ -1803,7 +1880,7 @@ pub fn obs_import(
         }
     };
 
-    let (key_columns, join_key) = resolve_join_key(key);
+    let (key_columns, join_key) = resolve_join_key(key, source_key)?;
 
     let read_opts = scx_convert::AnnotationTableOptions {
         key_columns,
@@ -1859,7 +1936,10 @@ pub fn obs_import(
     d.set_item("n_matched", summary.n_matched)?;
     d.set_item("n_target_rows_absent", summary.n_target_rows_absent)?;
     d.set_item("n_source_rows_absent", summary.n_source_rows_absent)?;
-    d.set_item("obs_key_column", summary.obs_key_column)?;
+    d.set_item(
+        "obs_key_column",
+        scx_ops::display_key_name("obs", &summary.obs_key_column),
+    )?;
     d.set_item("obs_columns_added", summary.obs_columns_added)?;
     d.set_item("obsm_keys_added", summary.obsm_keys_added)?;
     d.set_item("obs_index_dropped", summary.obs_index_dropped)?;
@@ -1895,9 +1975,9 @@ pub fn obs_import(
 /// imported result and a native one are drop-in comparable.
 #[pyfunction]
 #[pyo3(signature = (
-    path, table, *, tool, key=None, key_added=None, score_column=None,
+    path, table, *, tool, key=None, source_key=None, key_added=None, score_column=None,
     call_column=None, call_true=None, call_false=None, keep_native_columns=true,
-    delimiter=None, uns_keys=None, overwrite=false, on_missing_rows="zero",
+    delimiter=None, uns_keys=None, overwrite=false, on_missing_rows="null",
     on_extra_rows="warn", dry_run=false
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -1907,6 +1987,7 @@ pub fn doublet_import(
     table: &str,
     tool: &str,
     key: Option<Vec<String>>,
+    source_key: Option<Vec<String>>,
     key_added: Option<&str>,
     score_column: Option<&str>,
     call_column: Option<&str>,
@@ -1941,7 +2022,7 @@ pub fn doublet_import(
         .unwrap_or(profile.name)
         .to_string();
 
-    let (key_columns, join_key) = resolve_join_key(key);
+    let (key_columns, join_key) = resolve_join_key(key, source_key)?;
 
     let read_opts = scx_convert::DoubletImportOptions {
         tool: tool.to_string(),
@@ -1986,11 +2067,80 @@ pub fn doublet_import(
         Ok((summary, info, diagnosis))
     })?;
 
+    // The profile declares a call column and the table carried none of its
+    // spellings, so `<K>_predicted` was NOT written even though this tool does
+    // emit a call. Warn HERE (after `py.detach` closes — `warnings.warn` is
+    // unreachable inside it) rather than leave the user to discover it at
+    // `doublet_consensus`, which is where the dogfood run found it, under the
+    // false claim that the tool emits no call column. In-module pattern: see
+    // `process_index_summary`.
+    if let Some(m) = &info.call_column_missing {
+        // `m.expected` already renders aliases AND prefix in one phrase
+        // (built by `resolve_column`), so do not re-append the prefix.
+        let expected = &m.expected;
+        // A near-miss is usually the user having named the wrong `--tool`, so
+        // point at the actual column when exactly one unconsumed column is a
+        // declared call spelling of some other profile.
+        let candidates: Vec<String> = m
+            .present_columns
+            .iter()
+            .filter(|c| {
+                scx_convert::DOUBLET_PROFILE_NAMES.iter().any(|t| {
+                    scx_convert::doublet_profile(t)
+                        .map(|p| p.call_columns.contains(&c.as_str()))
+                        .unwrap_or(false)
+                })
+            })
+            .cloned()
+            .collect();
+        let suggestion = if candidates.len() == 1 {
+            format!(
+                " The table does carry {:?}, which is another tool's call column — \
+                 pass call_column={:?} if that is your call.",
+                candidates[0], candidates[0]
+            )
+        } else {
+            String::new()
+        };
+        let key = &info.key_added;
+        let msg = format!(
+            "doublet_import: tool={:?} declares a call column ({expected}) but the table has \
+             none of those names — columns present are {:?}. Imported SCORE ONLY: \
+             obs[{:?}] was written, obs[{:?}] was NOT, so this tool cannot vote on a call in \
+             pyscx.doublet_consensus. The unmatched column is preserved verbatim under the \
+             {:?} prefix.{suggestion} Re-import with call_column=<your column>, or pass the \
+             tool= whose profile matches this table.",
+            info.tool,
+            m.present_columns,
+            format!("{key}_score"),
+            format!("{key}_predicted"),
+            key,
+        );
+        py.import("warnings")?.call_method1("warn", (msg,))?;
+    }
+
     let d = PyDict::new(py);
-    d.set_item("tool", info.tool)?;
-    d.set_item("key_added", info.key_added)?;
+    d.set_item("tool", &info.tool)?;
+    d.set_item("key_added", &info.key_added)?;
     d.set_item("score_source_column", info.score_source_column)?;
-    d.set_item("call_source_column", info.call_source_column)?;
+    d.set_item("call_source_column", &info.call_source_column)?;
+    // Lets a script branch without parsing the warning string. Mirrors the
+    // `call_column_status` recorded in `uns["<K>"]`.
+    d.set_item(
+        "call_column_status",
+        match (&info.call_source_column, &info.call_column_missing) {
+            (Some(_), _) => "resolved",
+            (None, None) => "not_declared",
+            (None, Some(_)) => "declared_but_absent",
+        },
+    )?;
+    d.set_item(
+        "expected_call_columns",
+        info.call_column_missing
+            .as_ref()
+            .map(|m| m.expected_columns.clone())
+            .unwrap_or_default(),
+    )?;
     d.set_item("canonical_columns", info.canonical_columns)?;
     d.set_item("native_columns", info.native_columns)?;
     d.set_item("dropped_alias_columns", info.dropped_alias_columns)?;
@@ -2008,7 +2158,10 @@ pub fn doublet_import(
     d.set_item("n_matched", summary.n_matched)?;
     d.set_item("n_target_rows_absent", summary.n_target_rows_absent)?;
     d.set_item("n_source_rows_absent", summary.n_source_rows_absent)?;
-    d.set_item("obs_key_column", summary.obs_key_column)?;
+    d.set_item(
+        "obs_key_column",
+        scx_ops::display_key_name("obs", &summary.obs_key_column),
+    )?;
     d.set_item("obs_columns_added", summary.obs_columns_added)?;
     d.set_item("obs_index_dropped", summary.obs_index_dropped)?;
     if let Some(diag) = diagnosis {
@@ -2026,6 +2179,32 @@ pub fn doublet_tools() -> Vec<String> {
         .collect()
 }
 
+/// Every `tool=` profile's column vocabulary, straight from the definitions.
+///
+/// Exists so the per-tool table in `docs/scanpy.md` is machine-checkable rather
+/// than hand-maintained, and so a user surprised by an import can look up what
+/// their `--tool` actually expects from a REPL instead of reading Rust. That
+/// lookup being unavailable is what made a call-column name mismatch a
+/// silent score-only import.
+#[pyfunction]
+pub fn doublet_profiles(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let out = PyDict::new(py);
+    for name in scx_convert::DOUBLET_PROFILE_NAMES {
+        let p = scx_convert::doublet_profile(name).map_err(ops_to_pyerr)?;
+        let d = PyDict::new(py);
+        d.set_item("score_columns", p.score_columns.to_vec())?;
+        d.set_item("score_prefix", p.score_prefix)?;
+        d.set_item("call_columns", p.call_columns.to_vec())?;
+        d.set_item("call_prefix", p.call_prefix)?;
+        d.set_item("call_tokens", p.call_tokens.map(|t| (t.doublet, t.singlet)))?;
+        // `!call_columns.is_empty() || call_prefix.is_some()` — the one fact
+        // that decides whether `<K>_predicted` can exist at all.
+        d.set_item("emits_call", scx_convert::profile_has_call_column(p))?;
+        out.set_item(*name, d)?;
+    }
+    Ok(out.into())
+}
+
 /// Report which obs columns could serve as a join key for `obs_import`.
 ///
 /// Read-only. Useful when an import fails on a duplicated key: on a merged
@@ -2038,7 +2217,7 @@ pub fn diagnose_obs_key(
     path: &str,
     key: Option<Vec<String>>,
 ) -> PyResult<Py<PyDict>> {
-    let (_, join_key) = resolve_join_key(key);
+    let (_, join_key) = resolve_join_key(key, None)?;
     let scx_path = PathBuf::from(path);
     let diag = py
         .detach(|| scx_ops::diagnose_obs_key(&scx_path, Some(&join_key)))

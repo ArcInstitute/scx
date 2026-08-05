@@ -366,6 +366,103 @@ def test_discovery_ignores_its_own_previous_output():
     assert r["keys"] == ["one"]
 
 
+def test_discovery_skips_another_consensus_key():
+    """B1: `keys=None` must not count a *different* consensus as a voting tool.
+
+    The dogfood repro: three callers where A and C agree on cells 0-4 and B
+    disagrees. An earlier 2-tool consensus voting as a 4th tool drives
+    majority-of-4 to False on exactly the cells 2 of 3 real callers call
+    doublets.
+    """
+    a = _adata(
+        {
+            "scrublet": [T, T, T, T, T, F],
+            "scdblfinder": [F, F, F, F, F, F],
+            "doubletdetection": [T, T, T, T, T, F],
+        }
+    )
+    pyscx.doublet_consensus(a, keys=["scrublet", "scdblfinder"],
+                            method="majority", key_added="early")
+    assert int(a.obs["early_predicted"].fillna(False).sum()) == 0  # even split
+
+    with pytest.warns(UserWarning, match="early"):
+        auto = pyscx.doublet_consensus(a, method="majority", key_added="auto")
+    expl = pyscx.doublet_consensus(
+        a, keys=["scrublet", "scdblfinder", "doubletdetection"],
+        method="majority", key_added="expl",
+    )
+
+    assert auto["keys"] == ["doubletdetection", "scdblfinder", "scrublet"]
+    assert auto["keys_excluded"] == ["early"]
+    assert set(a.obs["auto_n_tools_voting"]) == {3}
+    assert auto["n_predicted_doublet"] == expl["n_predicted_doublet"] == 5
+    assert list(a.obs["auto_predicted"]) == list(a.obs["expl_predicted"])
+
+
+def test_discovery_skips_a_mean_rank_consensus_score():
+    """A prior `mean_rank` consensus writes `<K>_score`, so a `_predicted`-only
+    exclusion would miss it. This is the case the obs `_n_tools_voting` marker
+    catches and the uns record alone would not."""
+    a = _adata(
+        {"one": [T, F], "two": [F, T]},
+        scores={"one": [0.9, 0.1], "two": [0.2, 0.8]},
+    )
+    pyscx.doublet_consensus(a, method="mean_rank", quantile=0.5, key_added="mr")
+    assert "mr_score" in a.obs.columns
+
+    with pytest.warns(UserWarning, match="mr"):
+        r = pyscx.doublet_consensus(
+            a, method="mean_rank", quantile=0.5, key_added="mr2"
+        )
+    assert r["keys"] == ["one", "two"]
+    assert r["keys_excluded"] == ["mr"]
+
+
+def test_discovery_survives_a_dropped_uns():
+    """The exclusion must not depend on uns: another op can drop or rewrite it,
+    and files written before the fix have no record at all."""
+    a = _adata({"one": [T, F], "two": [F, T]})
+    pyscx.doublet_consensus(a, keys=["one", "two"], method="any", key_added="c1")
+    a.uns.clear()
+
+    with pytest.warns(UserWarning, match="c1"):
+        r = pyscx.doublet_consensus(a, method="any", key_added="c2")
+    assert r["keys"] == ["one", "two"]
+    assert r["keys_excluded"] == ["c1"]
+
+
+def test_a_tool_named_like_a_consensus_is_still_discovered():
+    """`doublet_import(key_added="foo_consensus")` writes `uns["foo_consensus"]`,
+    which must not be mistaken for a consensus record over key `foo`."""
+    a = _adata({"foo": [T, F], "bar": [F, T]})
+    a.uns["foo_consensus"] = {"tool": "scrublet", "source_call_column": "x"}
+    r = pyscx.doublet_consensus(a, method="any")
+    assert r["keys"] == ["bar", "foo"]
+    assert r["keys_excluded"] == []
+
+
+def test_a_file_carrying_only_consensus_columns_says_why():
+    a = _adata({"one": [T, F]})
+    pyscx.doublet_consensus(a, keys=["one"], method="any", key_added="c1")
+    del a.obs["one_predicted"]
+    with pytest.raises(ValueError, match="previous consensus outputs"):
+        pyscx.doublet_consensus(a, method="any", key_added="c2")
+
+
+def test_an_explicit_consensus_key_is_allowed_but_warned():
+    """Combining two consensus panels is coherent, so allow it — but say what it
+    costs, and record the unusual choice in the file."""
+    a = _adata({"one": [T, F], "two": [F, T]})
+    pyscx.doublet_consensus(a, keys=["one", "two"], method="any", key_added="c1")
+
+    with pytest.warns(UserWarning, match="itself a consensus over"):
+        r = pyscx.doublet_consensus(a, keys=["one", "c1"], method="any",
+                                    key_added="c2")
+    assert r["keys"] == ["one", "c1"]
+    assert r["keys_that_are_consensus"] == ["c1"]
+    assert set(a.obs["c2_n_tools_voting"]) == {2}
+
+
 def test_discovery_with_nothing_to_discover_says_so():
     a = _adata({}, extra={"donor": ["d1", "d2"]})
     with pytest.raises(ValueError, match="nothing to reach a consensus over"):

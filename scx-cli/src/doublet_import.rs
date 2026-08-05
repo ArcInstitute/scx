@@ -18,21 +18,9 @@
 use std::path::Path;
 
 use scx_convert::DoubletImportOptions;
-use scx_ops::{AttachObsOptions, ExtraRowPolicy, MissingRowPolicy, ObsJoinKey};
+use scx_ops::{AttachObsOptions, ExtraRowPolicy, MissingRowPolicy};
 
 type CmdResult = Result<(), Box<dyn std::error::Error>>;
-
-/// Split `--key a,b` into components. Empty (or absent) means auto-resolve.
-fn parse_key(key: Option<&str>) -> Vec<String> {
-    key.map(|k| {
-        k.split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect()
-    })
-    .unwrap_or_default()
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_doublet_import(
@@ -40,6 +28,7 @@ pub fn run_doublet_import(
     table: &Path,
     tool: &str,
     key: Option<&str>,
+    source_key: Option<&str>,
     key_added: Option<&str>,
     score_column: Option<&str>,
     call_column: Option<&str>,
@@ -58,7 +47,9 @@ pub fn run_doublet_import(
         // nulls, not zeros); "zero" stays accepted for back-compat.
         "null" | "zero" => MissingRowPolicy::ZeroFill,
         "error" => MissingRowPolicy::Error,
-        other => return Err(format!("--on-missing-rows must be zero|error; got '{other}'").into()),
+        other => {
+            return Err(format!("--on-missing-rows must be null|zero|error; got '{other}'").into())
+        }
     };
     let extra = match on_extra_rows {
         "warn" => ExtraRowPolicy::WarnSkip,
@@ -84,16 +75,10 @@ pub fn run_doublet_import(
         .unwrap_or(profile.name)
         .to_string();
 
-    // Both sides of the join are built from the same names, so the reader and
-    // the op cannot disagree about what the key is.
-    let key_columns = parse_key(key);
-    let join_key = match key_columns.len() {
-        0 => ObsJoinKey::Auto,
-        1 => ObsJoinKey::Column(key_columns[0].clone()),
-        _ => ObsJoinKey::Composite {
-            columns: key_columns.clone(),
-        },
-    };
+    // Each side resolves its own names, so a caller output that spells the key
+    // differently joins without a rename — but by default both sides use the
+    // same names and cannot disagree about what the key is.
+    let (key_columns, join_key) = crate::obs_import::resolve_key_pair(key, source_key)?;
 
     let read_opts = DoubletImportOptions {
         tool: tool.to_string(),
@@ -141,14 +126,37 @@ pub fn run_doublet_import(
         "Tool: {} (score from {:?}, call from {:?})",
         info.tool, info.score_source_column, info.call_source_column
     );
-    if info.call_source_column.is_none() {
-        // Say so explicitly rather than let the missing column be discovered
-        // later: for scds this is by design, not a failed resolution.
-        println!(
-            "Note: no call column, so '{}_predicted' is not written. Threshold \
-             '{}_score' yourself — the importer will not choose a cutoff for you.",
-            info.key_added, info.key_added
-        );
+    // Two very different reasons there is no call column, and the note used to
+    // treat them identically — asserting "by design" even when the real cause
+    // was that the table spelled the call something the profile does not know.
+    match (&info.call_source_column, &info.call_column_missing) {
+        (None, None) => {
+            // scds / generic: by design, not a failed resolution.
+            println!(
+                "Note: no call column, so '{}_predicted' is not written. Threshold \
+                 '{}_score' yourself — the importer will not choose a cutoff for you.",
+                info.key_added, info.key_added
+            );
+        }
+        (None, Some(m)) => {
+            // `m.expected` already renders aliases AND prefix in one phrase.
+            let expected = &m.expected;
+            println!(
+                "Note: '{}_predicted' was NOT written — see the warning below.",
+                info.key_added
+            );
+            // stderr, matching the CLI's established warning channel, so it
+            // stays visible when stdout is piped to a log.
+            eprintln!(
+                "warning: --tool {} declares a call column ({expected}) but the table has none \
+                 of those names — columns present are {:?}. Imported score only, so this tool \
+                 cannot vote on a call in a later consensus. Re-run with \
+                 --call-column <your column>, or pass the --tool whose profile matches this \
+                 table.",
+                info.tool, m.present_columns
+            );
+        }
+        _ => {}
     }
     if !info.table.uns_keys_imported.is_empty() {
         println!(
@@ -167,7 +175,11 @@ pub fn run_doublet_import(
     println!(
         "Join: {}/{} target rows matched on {} ({} target rows absent, \
          {} source rows skipped)",
-        s.n_matched, s.n_obs, s.obs_key_column, s.n_target_rows_absent, s.n_source_rows_absent,
+        s.n_matched,
+        s.n_obs,
+        scx_ops::display_key_name("obs", &s.obs_key_column),
+        s.n_target_rows_absent,
+        s.n_source_rows_absent,
     );
 
     if dry_run {

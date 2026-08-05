@@ -438,6 +438,34 @@ Nothing in this path is doublet-specific except one lookup table of column
 names. `pyscx.obs_import` lands any per-cell annotation table; `doublet_import`
 is a thin wrapper that normalises each tool's spellings.
 
+### The per-tool column table
+
+This is that lookup table. Read it before writing the import, not after it
+surprises you: `--tool` selects which spellings the importer looks for, so a
+table whose call column is named something else imports **score-only** and the
+tool cannot vote on a call in `doublet_consensus`. (It warns when that happens,
+names what it expected, and preserves your column under the `<K>_` prefix — so
+the fix is `call_column=`, not re-running the caller.)
+
+| `--tool` | score columns | score prefix | call columns | call prefix | doublet / singlet tokens | emits a call? |
+|---|---|---|---|---|---|---|
+| `scdblfinder` | `scDblFinder.score` | — | `scDblFinder.class` | — | `doublet` / `singlet` | yes |
+| `scrublet` | `doublet_score` | — | `predicted_doublet` | — | `true` / `false` | yes |
+| `doubletfinder` | — | `pANN_` | — | `DF.classifications_` | `Doublet` / `Singlet` | yes |
+| `doubletdetection` | `doublet_score` | — | `doublet_label` | — | numeric `0`/`1` | yes |
+| `solo` | `softmax_score`, `score` | — | `prediction` | — | `doublet` / `singlet` | yes |
+| `scds` | `hybrid_score`, `cxds_score`, `bcds_score` | — | *(none)* | — | — | **no** |
+| `generic` | *(caller-supplied)* | — | *(caller-supplied)* | — | *(caller-supplied)* | **no** — only via `call_column=` |
+
+Score/call aliases are tried in the order listed, first match wins. A prefix
+match must land on **exactly one** column — DoubletFinder run twice with
+different `pK` leaves two `pANN_*` columns behind, and picking one silently
+would be a coin flip. `generic` requires an explicit `score_column=`.
+
+Rather than trusting this table to stay in sync with the code, read it from
+Python: `pyscx.doublet_profiles()` returns the same rows straight from the
+profile definitions, and a test asserts the two agree.
+
 ### Settle the join key first
 
 This is the step worth doing before anything else, because everything
@@ -448,9 +476,19 @@ back to your cells.
 ```python
 d = pyscx.diagnose_obs_key("atlas.scx")
 print(d["summary"])          # what would be resolved, and whether it is unique
-print(d["unique_columns"])   # columns that ARE unique
+print(d["unique_columns"])   # usable keys that ARE unique, best first
 print(d["unique_pairs"])     # two-column composites that are
+print(d["unusable_unique_columns"])   # unique, but refused as a key
 ```
+
+Every name it reports is one you can paste straight into `key=` — including
+`obs_names` for the obs index. `unique_columns` is ordered best-candidate-first
+(obs index, then `barcode`/`cell_id`-style names, then other strings, then
+integers), and it lists only columns that can actually key a join. A unique
+column the join would *refuse* is reported separately under
+`unusable_unique_columns`: a float score column is often unique per row, but two
+independently written sides are not guaranteed to format the same float
+identically, so joining on one could silently half-match.
 
 On a single library the obs index is usually unique and there is nothing to
 think about. On a merged atlas it often is not: measured on a real
@@ -466,9 +504,33 @@ pyscx.obs_import("atlas.scx", "calls.csv", key=["soma_joinid"])
 pyscx.obs_import("atlas.scx", "calls.csv", key=["sample_id", "barcode"])
 ```
 
-A composite key needs both columns on both sides, so the tool's output table
+A composite key needs both components on both sides, so the tool's output table
 has to carry `sample_id` too. `export_batches` writes the batch column into
 each per-batch h5ad for exactly this reason.
+
+The two sides may *name* them differently. `source_key=` gives the source-side
+column for each `key` component, pairing positionally like pandas
+`left_on` / `right_on` — which is what a merged atlas usually needs, since its
+identity is (`sample_id`, obs index) while the tool wrote a `barcode` column:
+
+```python
+pyscx.obs_import("atlas.scx", "calls.csv",
+                 key=["sample_id", "obs_names"],
+                 source_key=["sample_id", "barcode"])
+```
+
+`obs_names` is how you name the obs index anywhere a key is accepted — on the
+target *and* on the source, so a tool table whose key is its own unnamed index
+(what a plain `df.to_csv()` writes) needs no `source_key=`:
+
+```python
+pyscx.obs_import("atlas.scx", "scrublet.csv", key="obs_names")
+```
+
+It is also the spelling `diagnose_obs_key` reports, so whatever it suggests can
+be pasted straight back. The underlying pyarrow field is called
+`__index_level_0__`, but `read_obs()` hands it back as the frame's *unnamed*
+index, so that name is not something you can address.
 
 ### Export one file per batch
 
@@ -594,7 +656,7 @@ cons = pyscx.doublet_consensus("atlas.scx", keys=["scdblfinder", "scrublet"])
 cons["n_predicted_doublet"], cons["n_no_vote"]
 ```
 
-This writes `obs["doublet_predicted"]` (nullable boolean),
+This writes `obs["doublet_predicted"]` (pandas nullable `boolean`),
 `obs["doublet_n_tools_calling"]` and `obs["doublet_n_tools_voting"]`. Read the
 voting count before trusting a `False`: a `0` there means no tool assessed the
 cell, which is why `doublet_predicted` is null beside it. `method="majority"`
@@ -2926,7 +2988,12 @@ df = pyscx.accel.rank_genes_groups_df(
 Useful when you want SCX's faster Wilcoxon rank-sum but cell-eval's DE metrics
 downstream (overlap@N, precision@N, pr_auc, etc.).
 
-> **`group=` is the scanpy extractor alias.** Calling it the scanpy way —
+> **`group=` is the scanpy extractor alias**, and `group=None` (or omitting it,
+> with no `groupby=`) extracts **every** group — matching
+> `sc.get.rank_genes_groups_df`'s "All groups are returned if group is None".
+> Both modes return a **polars** DataFrame; pass `output="pandas"` (or
+> `.to_pandas()`) for scanpy-shaped ergonomics such as `.map` and
+> `df[col] = ...`. Calling it the scanpy way —
 > `pyscx.accel.rank_genes_groups_df(adata, group="0")` — does **not** recompute;
 > it extracts the precomputed `adata.uns["rank_genes_groups"]` and returns
 > scanpy's columns (`names, scores, logfoldchanges, pvals, pvals_adj`), a

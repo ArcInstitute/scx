@@ -525,6 +525,246 @@ fn diagnose_obs_key_reports_unique_columns_and_a_suggestion() {
     assert_eq!(d.suggestion.as_deref(), Some("soma_joinid"));
 }
 
+// ---------------------------------------------------------------------------
+// The obs index is reported as `obs_names`, and accepted back under that name
+// ---------------------------------------------------------------------------
+
+/// A pyarrow-written obs: the index is a physical `__index_level_0__` field,
+/// which is what every `from_anndata` / h5ad-converted file actually carries.
+fn obs_with_pyarrow_index() -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new("cell_uid", DataType::Utf8, false),
+        Field::new("donor", DataType::Utf8, false),
+        // Appended last, exactly as `Table.from_pandas` emits it — which is why
+        // schema order alone used to rank it behind every data column.
+        Field::new("__index_level_0__", DataType::Utf8, false),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(vec!["u0", "u1", "u2", "u3"])),
+            Arc::new(StringArray::from(vec!["d1", "d1", "d2", "d2"])),
+            Arc::new(StringArray::from(vec!["AAAC", "AAAG", "AAAT", "AAAA"])),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_diagnosis_never_leaks_the_physical_index_field_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture_with_obs(dir.path(), "a.scx", obs_with_pyarrow_index(), 2, 1);
+
+    // `Some(Auto)`, not `None` — that is what the pyscx wrapper passes for a
+    // bare `diagnose_obs_key(path)`, and it is the only form that reports what
+    // auto-resolution would land on.
+    let d = diagnose_obs_key(&path, Some(&ObsJoinKey::Auto)).unwrap();
+    let rendered = format!("{d:?} {}", d.describe());
+    assert!(
+        !rendered.contains("__index_level_0__"),
+        "`__index_level_0__` is pyarrow's serialization name; `read_obs()` hands \
+         that field back as the frame's UNNAMED index, so following the \
+         diagnosis literally is a KeyError: {rendered}"
+    );
+    assert_eq!(d.resolved_key.as_deref(), Some("obs_names"));
+    assert_eq!(d.suggestion.as_deref(), Some("obs_names"));
+    // The index outranks the other unique column, but does not hide it.
+    assert_eq!(
+        d.unique_columns,
+        vec!["obs_names".to_string(), "cell_uid".to_string()],
+        "the obs index ranks first: it is the identity a tool hands back"
+    );
+}
+
+#[test]
+fn obs_names_joins_and_records_the_physical_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture_with_obs(dir.path(), "a.scx", obs_with_pyarrow_index(), 2, 1);
+    let data = score_data(vec!["AAAC".into(), "AAAT".into()], |i| i as f32 + 1.0);
+
+    let s = attach_external_obs(
+        &path,
+        &data,
+        &AttachObsOptions {
+            join_key: ObsJoinKey::Column("obs_names".into()),
+            ..opts()
+        },
+    )
+    .unwrap();
+
+    // Anything the diagnosis names must be a name the join accepts — the same
+    // invariant that made an Int64 `soma_joinid` suggestion usable.
+    assert_eq!(s.n_matched, 2);
+    // ...but the summary keeps the PHYSICAL name, because it is what the
+    // provenance entry records about the file on disk.
+    assert_eq!(s.obs_key_column, "__index_level_0__");
+    assert_eq!(display_key_name("obs", &s.obs_key_column), "obs_names");
+}
+
+#[test]
+fn the_physical_index_name_is_still_accepted_as_a_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture_with_obs(dir.path(), "a.scx", obs_with_pyarrow_index(), 2, 1);
+    let data = score_data(vec!["AAAC".into()], |_| 1.0);
+
+    let s = attach_external_obs(
+        &path,
+        &data,
+        &AttachObsOptions {
+            join_key: ObsJoinKey::Column("__index_level_0__".into()),
+            ..opts()
+        },
+    )
+    .unwrap();
+    assert_eq!(s.n_matched, 1, "the old spelling must keep working");
+}
+
+#[test]
+fn a_failed_join_names_the_index_as_obs_names() {
+    // The report called out "every join-failure message", not just the
+    // diagnosis: a zero-overlap error quotes the key it joined on, and quoting
+    // `__index_level_0__` there sends the reader to a column they cannot look at.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture_with_obs(dir.path(), "a.scx", obs_with_pyarrow_index(), 2, 1);
+    let data = score_data(vec!["nope-1".into(), "nope-2".into()], |i| i as f32);
+
+    let err = attach_external_obs(
+        &path,
+        &data,
+        &AttachObsOptions {
+            join_key: ObsJoinKey::Column("obs_names".into()),
+            ..opts()
+        },
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, OpsError::AxisMismatch { .. }), "{msg}");
+    assert!(msg.contains("on 'obs_names'"), "{msg}");
+    assert!(!msg.contains("__index_level_0__"), "{msg}");
+}
+
+#[test]
+fn a_duplicate_key_error_names_the_index_as_obs_names() {
+    let dir = tempfile::tempdir().unwrap();
+    // Same shape as a merged atlas: the pyarrow index repeats.
+    let obs = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("cell_uid", DataType::Utf8, false),
+            Field::new("__index_level_0__", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["u0", "u1", "u2", "u3"])),
+            Arc::new(StringArray::from(vec!["DUP", "DUP", "DUP", "DUP"])),
+        ],
+    )
+    .unwrap();
+    let path = write_fixture_with_obs(dir.path(), "a.scx", obs, 2, 1);
+    let data = score_data(vec!["DUP".into()], |_| 1.0);
+
+    let err = attach_external_obs(
+        &path,
+        &data,
+        &AttachObsOptions {
+            join_key: ObsJoinKey::Column("obs_names".into()),
+            ..opts()
+        },
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, OpsError::DuplicateJoinKey { .. }), "{msg}");
+    assert!(msg.contains("'obs_names'"), "{msg}");
+    assert!(!msg.contains("__index_level_0__"), "{msg}");
+    assert!(
+        msg.contains("cell_uid"),
+        "and it still names the column that would work: {msg}"
+    );
+}
+
+#[test]
+fn a_real_column_named_index_wins_over_the_alias() {
+    // `obs_census_shaped` has a literal `index` column holding "0","1","0","1".
+    // Treating `index` as an alias for the axis index would silently change
+    // which column a caller keyed on.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture_with_obs(dir.path(), "a.scx", obs_census_shaped(), 2, 1);
+
+    let d = diagnose_obs_key(&path, Some(&ObsJoinKey::Column("index".into()))).unwrap();
+    assert_eq!(d.resolved_key.as_deref(), Some("index"));
+    assert_eq!(
+        d.resolved_cardinality,
+        Some(2),
+        "the literal column, whose values repeat — not some resolved index"
+    );
+}
+
+#[test]
+fn a_composite_component_can_be_the_obs_index_alias() {
+    let batch = obs_with_pyarrow_index();
+    let aliased = build_composite_key(&batch, &["donor".into(), "obs_names".into()]).unwrap();
+    let physical =
+        build_composite_key(&batch, &["donor".into(), "__index_level_0__".into()]).unwrap();
+    assert_eq!(
+        aliased, physical,
+        "a composite component resolves the alias exactly as a single key does"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A suggested key must be one the join accepts (F2)
+// ---------------------------------------------------------------------------
+
+/// The shape a file takes after two `doublet_import`s: the obs index repeats
+/// (a merged atlas), and the only per-row-unique columns are float scores.
+fn obs_with_unique_float_scores() -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new("scrublet_score", DataType::Float32, false),
+        Field::new("scdblfinder_score", DataType::Float32, false),
+        Field::new("__index_level_0__", DataType::Utf8, false),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Float32Array::from(vec![0.11, 0.22, 0.33, 0.44])),
+            Arc::new(Float32Array::from(vec![0.51, 0.62, 0.73, 0.84])),
+            Arc::new(StringArray::from(vec!["DUP", "DUP", "DUP", "DUP"])),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_unique_float_column_is_never_suggested_as_a_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture_with_obs(dir.path(), "a.scx", obs_with_unique_float_scores(), 2, 1);
+
+    let d = diagnose_obs_key(&path, None).unwrap();
+    assert!(
+        d.unique_columns.is_empty(),
+        "every unique column here is a float, and `resolve_key_column` refuses \
+         floats — offering one is a guaranteed dead end: {:?}",
+        d.unique_columns
+    );
+    assert_ne!(d.suggestion.as_deref(), Some("scrublet_score"));
+    assert!(
+        d.unique_pairs.is_empty(),
+        "a composite of two refused columns is equally unusable: {:?}",
+        d.unique_pairs
+    );
+    // Set aside, not silently dropped: "nothing is unique" would be false here.
+    assert_eq!(
+        d.unusable_unique_columns,
+        vec![
+            "scrublet_score".to_string(),
+            "scdblfinder_score".to_string()
+        ]
+    );
+    let summary = d.describe();
+    assert!(
+        summary.contains("scrublet_score") && summary.contains("floats are refused"),
+        "the summary must name what was set aside and why: {summary}"
+    );
+}
+
 #[test]
 fn diagnose_obs_key_finds_a_unique_pair_when_no_single_column_is_unique() {
     let dir = tempfile::tempdir().unwrap();

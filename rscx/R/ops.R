@@ -225,8 +225,10 @@ scx_merge <- function(inputs, output, index_obs = NULL, index_var = NULL,
 #' @param overwrite Replace colliding columns. **Replaces, never merges** — so
 #'   attaching several per-batch results in turn keeps only the last. Combine
 #'   them into one \code{data.frame} and attach once.
-#' @param on_missing_rows \code{"zero"} (default) marks uncovered target rows
-#'   absent; \code{"error"} refuses.
+#' @param on_missing_rows \code{"null"} (default) leaves uncovered target rows
+#'   \code{NA} and marks them absent; \code{"error"} refuses. \code{"zero"} is
+#'   an accepted alias for \code{"null"} — it names the shared policy enum,
+#'   whose \code{zero} is literal only for a matrix layer.
 #' @param on_extra_rows \code{"warn"} (default) skips source rows the target
 #'   lacks; \code{"error"} refuses.
 #' @param dry_run Run every validation and the join, then return the summary
@@ -250,7 +252,7 @@ scx_merge <- function(inputs, output, index_obs = NULL, index_var = NULL,
 scx_attach_obs <- function(path, df, key, key_columns = NULL,
                            key_column = NULL, prefix = "",
                            status_column = NULL, uns_key = NULL,
-                           overwrite = FALSE, on_missing_rows = "zero",
+                           overwrite = FALSE, on_missing_rows = "null",
                            on_extra_rows = "warn", dry_run = FALSE) {
   # `key` supplied but empty is the rownames(df) == NULL trap: an SCE built
   # from a file whose obs carries barcodes only as a named column has NULL

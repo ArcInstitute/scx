@@ -103,6 +103,94 @@ const VAR_KEY_FALLBACKS: &[&str] = &[
     "index",
 ];
 
+/// Physical arrow field names that carry a frame's index. Kept in step with
+/// the literal probe in [`scx_format_io::resolve_index_columns`].
+const INDEX_FIELD_NAMES: &[&str] = &["__index_level_0__", "_index"];
+
+/// The user-facing spelling of an axis's index, and the alias a caller may pass
+/// to name it.
+///
+/// The physical field is `__index_level_0__` (pyarrow's serialization name for
+/// a DataFrame index) or anndata's `_index` sentinel. Neither is addressable by
+/// a user: `Experiment.read_obs()` hands that field back as the frame's
+/// *unnamed index*, so `obs["__index_level_0__"]` is a `KeyError`. Diagnostics
+/// and join messages print this spelling instead, and [`resolve_key_column`]
+/// accepts it back.
+///
+/// Those two halves must ship together. Printing a name the resolver rejects
+/// is the same dead end as suggesting a float key: the tooling names a key it
+/// then refuses.
+///
+/// `axis` is the same two-valued string [`resolve_key_column`] takes — `"obs"`
+/// or `"var"`. Asserted rather than left to an `else` branch because
+/// [`candidate_key_columns`] defaults the *other* way, so a third spelling
+/// would silently disagree between the two.
+pub fn axis_index_alias(axis: &str) -> &'static str {
+    debug_assert!(
+        axis == "obs" || axis == "var",
+        "unknown axis {axis:?}: expected \"obs\" or \"var\""
+    );
+    if axis == "var" {
+        "var_names"
+    } else {
+        "obs_names"
+    }
+}
+
+/// Render a resolved key column — or a comma-joined composite spec — for
+/// display, translating the physical index field to [`axis_index_alias`].
+///
+/// Composite specs are translated component-wise, so
+/// `sample_id,__index_level_0__` reads `sample_id,obs_names`.
+pub fn display_key_name(axis: &str, spec: &str) -> String {
+    let alias = axis_index_alias(axis);
+    spec.split(',')
+        .map(|c| {
+            if INDEX_FIELD_NAMES.contains(&c) {
+                alias
+            } else {
+                c
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// [`display_key_name`] over a list of column names, for the "columns present
+/// are …" lists that error messages print.
+fn display_columns(axis: &str, cols: &[&str]) -> Vec<String> {
+    cols.iter().map(|c| display_key_name(axis, c)).collect()
+}
+
+/// Resolve an axis-index alias (`obs_names` / `var_names`, or the bare `index`
+/// spelling) to the physical field that carries the index.
+///
+/// Consulted only when no field literally bears the requested name, so a real
+/// column called `index` — or, absurdly, `obs_names` — still wins over the
+/// alias. Returns `None` when the frame has no index field, letting the caller
+/// fall through to its own not-found error.
+fn index_field_for_alias(axis: &str, schema: &Schema, requested: &str) -> Option<String> {
+    if requested != axis_index_alias(axis) && requested != "index" {
+        return None;
+    }
+    scx_format_io::resolve_index_columns(schema)
+        .into_iter()
+        .next()
+}
+
+/// Map a requested key name to the physical field it names.
+///
+/// The literal name always wins; the axis-index alias is consulted only when no
+/// field bears the requested name. Returns the input unchanged when neither
+/// resolves, so the caller's own not-found error still quotes what the user
+/// typed rather than a rewritten form of it.
+pub fn resolve_key_alias(axis: &str, schema: &Schema, requested: &str) -> String {
+    if schema.field_with_name(requested).is_ok() {
+        return requested.to_string();
+    }
+    index_field_for_alias(axis, schema, requested).unwrap_or_else(|| requested.to_string())
+}
+
 /// Layer names that would collide with reserved section naming.
 const RESERVED_LAYER_NAMES: &[&str] = &["X", "raw"];
 
@@ -769,7 +857,11 @@ pub(crate) fn resolve_key_column(
         .map(|f| f.name().as_str())
         .collect();
 
-    if let Some(name) = requested {
+    if let Some(requested_name) = requested {
+        // `obs_names` / `var_names` name the axis index, whose physical field is
+        // `__index_level_0__` or `_index`.
+        let resolved = resolve_key_alias(axis, &schema, requested_name);
+        let name = resolved.as_str();
         return match schema.field_with_name(name) {
             // An explicit request accepts any type that fuses identically on
             // both sides — see `is_joinable_key_column`.
@@ -777,16 +869,23 @@ pub(crate) fn resolve_key_column(
             Ok(f) => Err(OpsError::KeyColumnUnresolved {
                 axis,
                 detail: format!(
-                    "column '{name}' has type {:?}, which cannot be a join key. \
+                    "column '{}' has type {:?}, which cannot be a join key. \
                      Strings and integers work (both sides are fused as text); \
                      floats are refused because their text form is not \
                      guaranteed to agree across two independently written sides",
+                    display_key_name(axis, name),
                     f.data_type()
                 ),
             }),
+            // The listed columns are display names, so an index field shows up
+            // as `obs_names` — which is both the spelling to pass back and, on
+            // its own, all the hint this needs.
             Err(_) => Err(OpsError::KeyColumnUnresolved {
                 axis,
-                detail: format!("column '{name}' not found; string columns are {string_cols:?}"),
+                detail: format!(
+                    "column '{requested_name}' not found; string columns are {:?}",
+                    display_columns(axis, &string_cols),
+                ),
             }),
         };
     }
@@ -808,16 +907,26 @@ pub(crate) fn resolve_key_column(
         .copied()
         .filter(|c| string_cols.contains(c))
         .collect();
-    present
-        .first()
-        .map(|c| c.to_string())
-        .ok_or_else(|| OpsError::KeyColumnUnresolved {
+    present.first().map(|c| c.to_string()).ok_or_else(|| {
+        // The fallback list is printed without its three index spellings.
+        // They are one concept the user knows as `obs_names`, and naming the
+        // physical fields invites keying on something `read_obs()` does not
+        // expose as a column. Reaching here means no index field is present
+        // either, so there is no alias worth suggesting.
+        let named: Vec<&str> = fallbacks
+            .iter()
+            .copied()
+            .filter(|c| !INDEX_FIELD_NAMES.contains(c) && *c != "index")
+            .collect();
+        OpsError::KeyColumnUnresolved {
             axis,
             detail: format!(
-                "no pandas index and none of {fallbacks:?} present; string columns \
-                 are {string_cols:?}. Pass an explicit key column."
+                "no {axis} index and none of {named:?} present; string columns \
+                     are {:?}. Pass an explicit key column.",
+                display_columns(axis, &string_cols)
             ),
-        })
+        }
+    })
 }
 
 /// Every candidate key column for an axis, in preference order.

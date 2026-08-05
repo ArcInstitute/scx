@@ -26,6 +26,10 @@ pub fn decode_codec_id(byte: u8) -> CliResult<CodecId> {
 /// Read every shard header in `shards`, project one byte field via
 /// `extract`, and return the distinct values sorted ascending. Used by
 /// `info` to summarize per-shard value-encoding / codec mixes.
+///
+/// Thin shim over `scx_format_io::distinct_sorted_shard_field`, which is where
+/// the implementation lives so `scx-ops` tests (which cannot import this
+/// bin-only crate) can share it.
 pub fn distinct_sorted_shard_field<F>(
     reader: &ScxReader,
     shards: &[&scx_format_io::catalog::FullCatalogEntry],
@@ -34,13 +38,9 @@ pub fn distinct_sorted_shard_field<F>(
 where
     F: Fn(&ShardHeader) -> u8,
 {
-    let mut bytes: Vec<u8> = shards
-        .iter()
-        .map(|e| reader.read_shard_header(e).map(|h| extract(&h)))
-        .collect::<Result<Vec<_>, _>>()?;
-    bytes.sort_unstable();
-    bytes.dedup();
-    Ok(bytes)
+    Ok(scx_format_io::distinct_sorted_shard_field(
+        reader, shards, extract,
+    )?)
 }
 
 /// Per-`codec_id` shard count across `shards`, sorted ascending by codec id.
@@ -48,14 +48,11 @@ where
 /// Surfaces what an adaptive `codec="auto"` write actually chose per shard
 /// (predominantly ShufDeltaZstd, mixed with Scx1 for low-median shards) rather
 /// than a single "the codec". Reads each shard's 76-byte header.
+///
+/// Thin shim over `scx_format_io::codec_id_histogram` — see above.
 pub fn codec_id_histogram(
     reader: &ScxReader,
     shards: &[&scx_format_io::catalog::FullCatalogEntry],
 ) -> CliResult<Vec<(u8, u64)>> {
-    let mut counts: std::collections::BTreeMap<u8, u64> = std::collections::BTreeMap::new();
-    for e in shards {
-        let h = reader.read_shard_header(e)?;
-        *counts.entry(h.codec_id).or_insert(0) += 1;
-    }
-    Ok(counts.into_iter().collect())
+    Ok(scx_format_io::codec_id_histogram(reader, shards)?)
 }

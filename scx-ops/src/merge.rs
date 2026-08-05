@@ -3,10 +3,8 @@
 use std::path::Path;
 
 use arrow::array::RecordBatch;
-use scx_codec::{CodecId, CodecSelection, ValueEncoding};
+use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::ConversionPredicateIndexOptions;
-use scx_format_io::codec_select::select_codec;
-use scx_format_io::encoder::FramingConfig;
 use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
@@ -14,6 +12,7 @@ use scx_format_io::writer::ScxWriter;
 use scx_format_io::ScxReader;
 
 use crate::append::unify_dict_columns;
+use crate::codec_intent::{framing_for_rewrite, seed_codec};
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
 use crate::helpers::{encode_value, widest_value_encoding};
@@ -272,9 +271,11 @@ pub fn merge_with_options(
         + 1;
     let mut writer =
         ScxWriter::new(output_path, out_header)?.with_data_generation(merged_data_generation);
-    if output_framed {
-        writer.set_framing(Some(FramingConfig::default()));
-    }
+    writer.set_framing(framing_for_rewrite(
+        options.codec,
+        output_framed,
+        "at least one input",
+    )?);
 
     // ---------------------------------------------------------------
     // Phase 2: streaming obs across all inputs.
@@ -526,7 +527,7 @@ pub fn merge_with_options(
                 &sh,
                 target_index_dtype,
                 n_vars,
-                CodecSelection::Auto,
+                options.codec,
                 output_framed,
             ) && !options.assume_identical_var;
             if raw_copy_ok {
@@ -559,7 +560,7 @@ pub fn merge_with_options(
             }
 
             // Auto-select optimal codec for this shard's data
-            let shard_codec = select_codec(&values_bytes, shard_value_encoding);
+            let shard_codec = seed_codec(options.codec, &values_bytes, shard_value_encoding);
 
             writer.write_csr_shard(
                 &indptr_u64,
@@ -685,7 +686,8 @@ pub fn merge_with_options(
                     layer_row_count += 1;
 
                     if layer_row_count >= shard_target as u64 {
-                        let layer_shard_codec = select_codec(&layer_values, layer_value_encoding);
+                        let layer_shard_codec =
+                            seed_codec(options.codec, &layer_values, layer_value_encoding);
                         writer.write_layer_csr_shard(
                             &layer_indptr,
                             &layer_indices,
@@ -710,7 +712,7 @@ pub fn merge_with_options(
         // Flush remaining layer rows
         if layer_row_count > 0 {
             // Auto-select codec for remaining layer shard
-            let layer_shard_codec = select_codec(&layer_values, layer_value_encoding);
+            let layer_shard_codec = seed_codec(options.codec, &layer_values, layer_value_encoding);
             writer.write_layer_csr_shard(
                 &layer_indptr,
                 &layer_indices,
@@ -933,9 +935,11 @@ fn merge_multimodal(
         + 1;
     let mut writer =
         ScxWriter::new(output_path, out_header)?.with_data_generation(merged_data_generation);
-    if output_framed {
-        writer.set_framing(Some(FramingConfig::default()));
-    }
+    writer.set_framing(framing_for_rewrite(
+        options.codec,
+        output_framed,
+        "at least one input",
+    )?);
 
     // Validate global obs schema across all inputs before any output
     // bytes are written. Mirrors the single-modality call site.
@@ -1043,7 +1047,7 @@ fn merge_multimodal(
                     &sh,
                     target_index_dtype,
                     modality_n_vars,
-                    CodecSelection::Auto,
+                    options.codec,
                     output_framed,
                 ) && !options.assume_identical_var;
                 if raw_copy_ok {
@@ -1071,7 +1075,7 @@ fn merge_multimodal(
                 for &v in &data {
                     encode_value(&mut values_bytes, v, shard_value_encoding)?;
                 }
-                let shard_codec = select_codec(&values_bytes, shard_value_encoding);
+                let shard_codec = seed_codec(options.codec, &values_bytes, shard_value_encoding);
                 writer.write_csr_shard_for(
                     modality_id,
                     &indptr_u64,
@@ -1198,7 +1202,7 @@ fn merge_multimodal(
                         l_rows += 1;
 
                         if l_rows >= shard_target as u64 {
-                            let codec = select_codec(&l_values, layer_value_encoding);
+                            let codec = seed_codec(options.codec, &l_values, layer_value_encoding);
                             writer.write_layer_csr_shard_for(
                                 modality_id,
                                 layer_name,
@@ -1222,7 +1226,7 @@ fn merge_multimodal(
             }
 
             if l_rows > 0 {
-                let codec = select_codec(&l_values, layer_value_encoding);
+                let codec = seed_codec(options.codec, &l_values, layer_value_encoding);
                 writer.write_layer_csr_shard_for(
                     modality_id,
                     layer_name,

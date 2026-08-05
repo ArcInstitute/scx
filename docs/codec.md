@@ -492,8 +492,41 @@ Single-modality writers (`pyscx.from_anndata`, `scx convert --from h5ad`,
 delegates to the §8 heuristic — output is bit-identical to v1 / earlier
 files written before per-modality routing. Multimodal-aware ops in `scx-ops` (`scx append`, `compact`,
 `merge` working on already-written SCX files) currently still use the
-modality-blind `select_codec`; modality-aware routing through ops is
-a follow-on (modality-aware routing through ops is not yet implemented).
+modality-blind `select_codec` **to pick the seed codec**; modality-aware routing
+through ops is a follow-on. Note this is now only about the *seed*: those ops do
+run the adaptive adoption step on top of it (see the intent axis below), so an
+ATAC/Protein shard gets the RNA heuristic as its starting candidate and then
+still adopts `ShufDeltaZstd` where it wins — better than before, not yet right.
+
+### Where the intent axis applies
+
+`resolve_codec`'s profiles (`auto` / `fast` / `compact` / `compact-trial`) reach
+**every** write path: `scx convert` (X, layers, the CSC sidecar, and multimodal
+h5mu X), `scx optimize`, and the derived-file ops `scx compact`, `merge`,
+`subset` and `sort`. `auto` therefore means the same adaptive per-shard decision
+everywhere.
+
+That was not always true. The adopt step is gated on a framing config carrying a
+`decode_target`, and both `FramingConfig::default()` and
+`ScxWriter::write_shard_inner` used to omit it — so the derived-file ops, plus
+convert's own layer / CSC / h5mu paths, silently ran `fast` while reporting
+`auto`. On a `shufdelta` input that flipped every integer shard to the
+`Scx1`/`Zstd` heuristic at roughly 2× the bytes per nnz, which is why
+`scx compact` could grow a file it was asked to shrink. Regression coverage:
+`scx-ops/tests/codec_adaptive.rs`.
+
+Measured after the fix on `census_500k` (863.7 MiB, `shufdelta`): `scx compact`
+on a file with 562 MB of orphaned bytes goes 1669.7 MB → 1069.0 MB (0.640×,
+previously 1.051×), and `sort --by --codec auto` produces a file byte-identical
+to an explicit `--codec shufdelta` pin. A separate, still-open issue accounts for
+the residual ~1.3× a rewrite costs on a **mixed-width** file: the ops widen the
+value encoding to one file-wide width rather than preserving each shard's — see
+[docs/sharding.md § Output size](sharding.md#three-ways-to-sort).
+
+One deliberate exception: a CSC rebuild (`scx build-csc`, and the
+`--rebuild-csc` pass of the ops) re-writes each CSR shard *at the codec read off
+the source header*, so it passes `decode_target: None` on purpose — re-selection
+would defeat the preservation. See `FramingConfig`'s contract docs.
 
 ## 9. Limitations & Pitfalls
 

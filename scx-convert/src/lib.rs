@@ -43,7 +43,7 @@ pub use h5ad_obs::read_h5ad_obs;
 mod doublet;
 pub use doublet::{
     doublet_profile, profile_has_call_column, read_doublet_table, CallTokens, DoubletImportOptions,
-    DoubletProfile, DoubletTableInfo, DOUBLET_PROFILE_NAMES,
+    DoubletProfile, DoubletTableInfo, MissingCallColumn, DOUBLET_PROFILE_NAMES,
 };
 
 // Shared by the gated cellbender reader and the ungated table reader.
