@@ -111,10 +111,12 @@ _ARM = textwrap.dedent(
             "route": info["route"],
             "resident_csr": info["resident_csr"],
             "chunk_size": info["chunk_size"],
-            "feature": [str(v) for v in df["feature"].to_list()],
-            "p_value": [float(v) for v in df["p_value"].to_list()],
-            "fold_change": [float(v) for v in df["fold_change"].to_list()],
-            "target_mean": [float(v) for v in df["target_mean"].to_list()],
+            # Iterate the Series directly: `pdex_ref` defaults to pandas (F6)
+            # and pandas spells `.to_list()` as `.tolist()`.
+            "feature": [str(v) for v in df["feature"]],
+            "p_value": [float(v) for v in df["p_value"]],
+            "fold_change": [float(v) for v in df["fold_change"]],
+            "target_mean": [float(v) for v in df["target_mean"]],
         }}
     print("@@JSON@@" + json.dumps(out))
     """

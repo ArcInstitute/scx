@@ -56,7 +56,7 @@ def rank_genes_groups_df(
     rankby_abs: bool = False,
     tie_correct: bool = False,
     device: str = "auto",
-    output: str = "polars",
+    output: str = "pandas",
     *,
     group: str | list[str] | None = None,
     key: str = "rank_genes_groups",
@@ -78,8 +78,8 @@ def rank_genes_groups_df(
     ``group=None`` (or omitting it) with no ``groupby=`` extracts **every** group
     in ``adata.uns[key]``, with a leading ``group`` column — matching
     ``sc.get.rank_genes_groups_df``'s "All groups are returned if group is
-    None". Note both modes return a **polars** DataFrame by default; pass
-    ``output="pandas"`` for scanpy-shaped ergonomics (``.map``, ``df[col] = …``).
+    None". Both modes return a **pandas** DataFrame by default; pass
+    ``output="polars"`` for the polars frame ``cell_eval`` consumes.
     """
     ...
 
@@ -128,7 +128,7 @@ def pdex_ref(
     gene_chunk_size: int | None = None,
     prefer_format: DePreferFormat = "auto",
     device: str = "auto",
-    output: str = "polars",
+    output: str = "pandas",
     use_raw: bool | None = None,
     layer: str | None = None,
 ) -> Any: ...

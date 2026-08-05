@@ -1186,10 +1186,12 @@ fn write_de_to_adata(
 /// Build a DataFrame of the given `columns` in `column_order`, as either a
 /// polars or a pandas DataFrame depending on `output`.
 ///
-/// `output="polars"` (default) requires polars; `output="pandas"` builds a
-/// pandas DataFrame directly and does **not** import polars, so pandas-only
-/// callers can use the DE DataFrame helpers without installing polars. Column
-/// schema is identical across both.
+/// `output="pandas"` (the default) builds a pandas DataFrame directly and does
+/// **not** import polars — pandas is a hard dependency via anndata, so the
+/// default path needs nothing beyond a base `pip install pyscx`. `output="polars"`
+/// requires polars, which lives in the optional `eval` extra; it is the opt-in
+/// for cell-eval, whose `DEResults.data` is typed `pl.DataFrame`. Column schema
+/// is identical across both.
 pub(super) fn build_de_dataframe<'py>(
     py: Python<'py>,
     columns: &Bound<'py, PyDict>,
@@ -1201,9 +1203,9 @@ pub(super) fn build_de_dataframe<'py>(
         "polars" => {
             let pl = py.import("polars").map_err(|_| {
                 PyRuntimeError::new_err(
-                    "output='polars' requires polars. Install it \
-                     (pip install 'pyscx[eval]' or pip install polars), \
-                     or pass output='pandas'.",
+                    "output='polars' requires polars, which is optional \
+                     (pip install 'pyscx[eval]' or pip install polars). \
+                     The default output='pandas' needs no extra.",
                 )
             })?;
             let df = pl.call_method1("DataFrame", (columns,))?;
@@ -1225,7 +1227,7 @@ pub(super) fn build_de_dataframe<'py>(
 }
 
 /// Convert a DiffExpResult into a DataFrame matching cell-eval's `DEResults`
-/// schema, as polars or pandas per `output`.
+/// schema, as pandas (the default) or polars per `output`.
 fn de_result_to_cell_eval_dataframe<'py>(
     py: Python<'py>,
     result: &scx_accel::DiffExpResult,
@@ -1483,12 +1485,13 @@ fn extract_rank_genes_groups_df<'py>(
 /// Differential-expression DataFrame — **two modes**, selected by which kwarg
 /// you pass.
 ///
-/// **Compute (`groupby=`)** — re-runs Wilcoxon rank-sum DE and returns a polars
-/// (or pandas) DataFrame in cell-eval's `DEResults` format. This is the format
-/// bridge between SCX's Wilcoxon DE and cell-eval's DE metric pipeline; the
-/// frame can be fed directly into `cell_eval.data.DEResults` /
-/// `cell_eval.data.DEComparison`. The accelerator execution route is recorded
-/// on `adata.uns["scx_accel"]["rank_genes_groups_df"]`. Columns:
+/// **Compute (`groupby=`)** — re-runs Wilcoxon rank-sum DE and returns a
+/// DataFrame in cell-eval's `DEResults` column format. This is the format bridge
+/// between SCX's Wilcoxon DE and cell-eval's DE metric pipeline — but **pass
+/// `output="polars"` to feed it to cell-eval**, whose `DEResults.data` is typed
+/// `pl.DataFrame`; the default pandas frame is rejected there. The accelerator
+/// execution route is recorded on
+/// `adata.uns["scx_accel"]["rank_genes_groups_df"]`. Columns:
 ///   - `target` (str): perturbation/group name
 ///   - `feature` (str): gene name
 ///   - `fold_change` (f64): linear fold change (2^log2FC)
@@ -1522,8 +1525,9 @@ fn extract_rank_genes_groups_df<'py>(
 ///         internally for sparse/backed inputs)
 ///     rankby_abs: Sort genes by |score| instead of signed score (default: False)
 ///     tie_correct: Apply tie correction in the Wilcoxon test (default: False)
-///     output: `"polars"` (default) or `"pandas"`. Identical columns either way;
-///         `"pandas"` does not require polars.
+///     output: `"pandas"` (default) or `"polars"`. Identical columns either way.
+///         `"pandas"` needs no optional dependency; `"polars"` requires the
+///         `eval` extra and is what cell-eval consumes.
 ///     device: compute-mode only; ignored in extract (`group=`) mode.
 ///     group: extraction mode — a group name (str), a list of names, or `None` /
 ///         omitted to pull every group in `adata.uns[key]`.
@@ -1535,8 +1539,9 @@ fn extract_rank_genes_groups_df<'py>(
 /// Example:
 ///     de_df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")  # compute
 ///     ex = pyscx.accel.rank_genes_groups_df(adata, group="0")          # extract (scanpy-style)
+///     ce = pyscx.accel.rank_genes_groups_df(adata, "perturbation", output="polars")  # cell-eval
 #[pyfunction]
-#[pyo3(signature = (adata, groupby=None, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=false, tie_correct=false, device="auto", output="polars", *, group=None, key="rank_genes_groups", pval_cutoff=None, log2fc_min=None, log2fc_max=None))]
+#[pyo3(signature = (adata, groupby=None, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=false, tie_correct=false, device="auto", output="pandas", *, group=None, key="rank_genes_groups", pval_cutoff=None, log2fc_min=None, log2fc_max=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups_df(
     py: Python<'_>,
@@ -2268,7 +2273,8 @@ fn pdex_ref_result_to_dataframe<'py>(
 }
 
 /// pdex `mode="ref"` differential expression on an SCX-backed or in-memory
-/// AnnData, returned as a polars DataFrame matching pdex's row schema.
+/// AnnData, returned as a pandas DataFrame matching pdex's row schema
+/// (`output="polars"` for the polars frame upstream pdex itself returns).
 ///
 /// This is the SCX-native equivalent of `pdex.pdex(adata, groupby, mode="ref")`:
 /// per (group, gene), reports pseudobulk means in natural (count) space, log2
@@ -2305,9 +2311,10 @@ fn pdex_ref_result_to_dataframe<'py>(
 ///         never reported. None (default) disables filtering.
 ///     gene_chunk_size: Genes per chunk for sparse/backed streaming
 ///         (default: 500). Ignored for dense input.
-///     output: Return type — `"polars"` (default) or `"pandas"`. Columns are
+///     output: Return type — `"pandas"` (default) or `"polars"`. Columns are
 ///         identical either way; `"pandas"` builds a pandas DataFrame directly and
-///         does not require polars. (A polars result also supports `.to_pandas()`.)
+///         needs no optional dependency. `"polars"` requires the `eval` extra and
+///         matches what upstream `pdex` and cell-eval use.
 ///     use_raw: Analyze `adata.raw.X` (with `adata.raw.var` names) instead of
 ///         `adata.X`. `None` (default) → `True` iff `adata.raw` is present and
 ///         `layer` is None (scanpy semantics), else `False`. Mutually exclusive
@@ -2323,7 +2330,7 @@ fn pdex_ref_result_to_dataframe<'py>(
 /// fall back to ``"gpu_csr_v3"`` with ``fallback_reason == "no_csc_sidecar"``. Check
 /// ``route`` when comparing performance.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="auto", device="auto", output="polars", use_raw=None, layer=None))]
+#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="auto", device="auto", output="pandas", use_raw=None, layer=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref(
     py: Python<'_>,

@@ -622,7 +622,7 @@ class TestRankGenesGroupsDfExtract:
 
         adata = synthetic_adata.copy()
         pyscx.accel.rank_genes_groups(adata, "batch")
-        df = pyscx.accel.rank_genes_groups_df(adata, group="A", output="pandas")
+        df = pyscx.accel.rank_genes_groups_df(adata, group="A")
 
         # Single str group → scanpy columns, no leading `group` column.
         assert self._cols(df) == self.SCANPY_COLS
@@ -639,9 +639,7 @@ class TestRankGenesGroupsDfExtract:
 
         adata = synthetic_adata.copy()
         pyscx.accel.rank_genes_groups(adata, "batch")
-        df = pyscx.accel.rank_genes_groups_df(
-            adata, group=["A", "B"], output="pandas"
-        )
+        df = pyscx.accel.rank_genes_groups_df(adata, group=["A", "B"])
 
         assert self._cols(df) == ["group"] + self.SCANPY_COLS
         assert len(df) == 2 * adata.n_vars
@@ -652,9 +650,9 @@ class TestRankGenesGroupsDfExtract:
 
         adata = synthetic_adata.copy()
         pyscx.accel.rank_genes_groups(adata, "batch")
-        full = pyscx.accel.rank_genes_groups_df(adata, group="A", output="pandas")
+        full = pyscx.accel.rank_genes_groups_df(adata, group="A")
         filtered = pyscx.accel.rank_genes_groups_df(
-            adata, group="A", pval_cutoff=0.5, output="pandas"
+            adata, group="A", pval_cutoff=0.5
         )
         assert len(filtered) <= len(full)
         assert np.all(filtered["pvals_adj"] < 0.5)
@@ -702,7 +700,7 @@ class TestRankGenesGroupsDfExtract:
 
         adata = synthetic_adata.copy()
         pyscx.accel.rank_genes_groups(adata, "batch")
-        df = pyscx.accel.rank_genes_groups_df(adata, group=None, output="pandas")
+        df = pyscx.accel.rank_genes_groups_df(adata, group=None)
 
         groups = list(adata.uns["rank_genes_groups"]["names"].dtype.names)
         assert self._cols(df) == ["group"] + self.SCANPY_COLS
@@ -718,8 +716,8 @@ class TestRankGenesGroupsDfExtract:
         adata = synthetic_adata.copy()
         pyscx.accel.rank_genes_groups(adata, "batch")
         groups = list(adata.uns["rank_genes_groups"]["names"].dtype.names)
-        auto = pyscx.accel.rank_genes_groups_df(adata, output="pandas")
-        expl = pyscx.accel.rank_genes_groups_df(adata, group=groups, output="pandas")
+        auto = pyscx.accel.rank_genes_groups_df(adata)
+        expl = pyscx.accel.rank_genes_groups_df(adata, group=groups)
         pd.testing.assert_frame_equal(auto, expl)
 
     def test_extract_explicit_none_matches_omitted(self, synthetic_adata):
@@ -731,8 +729,8 @@ class TestRankGenesGroupsDfExtract:
         adata = synthetic_adata.copy()
         pyscx.accel.rank_genes_groups(adata, "batch")
         pd.testing.assert_frame_equal(
-            pyscx.accel.rank_genes_groups_df(adata, group=None, output="pandas"),
-            pyscx.accel.rank_genes_groups_df(adata, output="pandas"),
+            pyscx.accel.rank_genes_groups_df(adata, group=None),
+            pyscx.accel.rank_genes_groups_df(adata),
         )
 
     def test_group_none_with_groupby_still_computes(self, synthetic_adata):
@@ -744,7 +742,7 @@ class TestRankGenesGroupsDfExtract:
         adata = synthetic_adata.copy()
         pyscx.accel.rank_genes_groups(adata, "batch")
         df = pyscx.accel.rank_genes_groups_df(
-            adata, groupby="batch", group=None, output="pandas"
+            adata, groupby="batch", group=None
         )
         assert "target" in df.columns and "feature" in df.columns
         assert "names" not in df.columns
@@ -755,7 +753,7 @@ class TestRankGenesGroupsDfExtract:
         adata = synthetic_adata.copy()
         pyscx.accel.rank_genes_groups(adata, "batch")
         groups = list(adata.uns["rank_genes_groups"]["names"].dtype.names)
-        df = pyscx.accel.rank_genes_groups_df(adata, n_genes=5, output="pandas")
+        df = pyscx.accel.rank_genes_groups_df(adata, n_genes=5)
         assert len(df) == 5 * len(groups)
         assert df.groupby("group", observed=True).size().unique().tolist() == [5]
 
@@ -777,7 +775,7 @@ class TestRankGenesGroupsDfExtract:
 
         adata = synthetic_adata.copy()
         pyscx.accel.rank_genes_groups(adata, "batch")
-        mine = pyscx.accel.rank_genes_groups_df(adata, output="pandas")
+        mine = pyscx.accel.rank_genes_groups_df(adata)
         theirs = sc.get.rank_genes_groups_df(adata, group=None)
         assert list(mine.columns) == list(theirs.columns)
         assert mine.shape == theirs.shape
@@ -798,7 +796,7 @@ class TestRankGenesGroupsDfExtract:
         import pyscx
 
         adata = synthetic_adata.copy()
-        df = pyscx.accel.rank_genes_groups_df(adata, "batch", output="pandas")
+        df = pyscx.accel.rank_genes_groups_df(adata, "batch")
         assert list(df.columns) == [
             "target",
             "feature",
@@ -808,6 +806,120 @@ class TestRankGenesGroupsDfExtract:
             "log2_fold_change",
             "abs_log2_fold_change",
         ]
+
+
+class TestDeFrameDefaultContainer:
+    """F6: pandas is the default container on every DE-frame surface, polars is
+    the opt-in, and the default asks for no optional dependency."""
+
+    @staticmethod
+    def _adata():
+        import numpy as np
+        import anndata as ad
+        import pandas as pd
+        import scipy.sparse as sp
+
+        rng = np.random.default_rng(0)
+        n_obs, n_vars = 60, 12
+        x = rng.poisson(4.0, size=(n_obs, n_vars)).astype(np.float32)
+        obs = pd.DataFrame(
+            {
+                "pert": ["control"] * 20 + ["ko_a"] * 20 + ["ko_b"] * 20,
+                "donor": [f"d{i % 3}" for i in range(n_obs)],
+            },
+            index=[f"c{i}" for i in range(n_obs)],
+        )
+        var = pd.DataFrame(index=[f"g{j}" for j in range(n_vars)])
+        return ad.AnnData(X=sp.csr_matrix(x), obs=obs, var=var)
+
+    def test_both_modes_default_to_pandas(self):
+        import pandas as pd
+        import pyscx
+
+        adata = self._adata()
+        # Compute mode.
+        assert isinstance(
+            pyscx.accel.rank_genes_groups_df(adata, "pert"), pd.DataFrame
+        )
+        # Extract mode (the documented sc.get.rank_genes_groups_df drop-in).
+        pyscx.accel.rank_genes_groups(adata, "pert")
+        assert isinstance(
+            pyscx.accel.rank_genes_groups_df(adata, group=None), pd.DataFrame
+        )
+        assert isinstance(
+            pyscx.accel.rank_genes_groups_df(adata, group="ko_a"), pd.DataFrame
+        )
+        assert isinstance(
+            pyscx.accel.pdex_ref(adata, "pert", reference="control"), pd.DataFrame
+        )
+
+    def test_polars_opt_in_carries_identical_values(self):
+        import pandas as pd
+        import pyscx
+
+        pl = pytest.importorskip("polars")
+        adata = self._adata()
+
+        for kwargs in ({"groupby": "pert"}, {"group": None}, {"group": "ko_a"}):
+            if "group" in kwargs and "rank_genes_groups" not in adata.uns:
+                pyscx.accel.rank_genes_groups(adata, "pert")
+            got_pd = pyscx.accel.rank_genes_groups_df(adata, **kwargs)
+            got_pl = pyscx.accel.rank_genes_groups_df(
+                adata, output="polars", **kwargs
+            )
+            assert isinstance(got_pl, pl.DataFrame), kwargs
+            assert list(got_pd.columns) == list(got_pl.columns), kwargs
+            pd.testing.assert_frame_equal(
+                got_pd.reset_index(drop=True),
+                got_pl.to_pandas().reset_index(drop=True),
+                check_dtype=False,
+            )
+
+    def test_the_default_needs_no_polars(self, monkeypatch):
+        """The regression F6 actually was: on a base `pip install pyscx` polars is
+        absent (it lives in the `eval` extra), so a polars-returning default made
+        the documented scanpy drop-in raise. Blocking the import proves the
+        default path never reaches for it — every local env has polars from the
+        `dev` extra, so nothing else here would catch a relapse.
+        """
+        import sys
+
+        import pandas as pd
+        import pyscx
+
+        adata = self._adata()
+        pyscx.accel.rank_genes_groups(adata, "pert")
+
+        # `None` in sys.modules makes any later `import polars` raise ImportError,
+        # including pyo3's `py.import("polars")`. monkeypatch restores it.
+        monkeypatch.setitem(sys.modules, "polars", None)
+        with pytest.raises(ImportError):
+            import polars  # noqa: F401
+
+        assert isinstance(
+            pyscx.accel.rank_genes_groups_df(adata, "pert"), pd.DataFrame
+        )
+        assert isinstance(
+            pyscx.accel.rank_genes_groups_df(adata, group=None), pd.DataFrame
+        )
+        assert isinstance(
+            pyscx.accel.pdex_ref(adata, "pert", reference="control"), pd.DataFrame
+        )
+        assert isinstance(
+            pyscx.accel.pdex_nb_glm(
+                adata,
+                "pert",
+                "control",
+                stratify_by=["donor"],
+                min_cells_per_group=1,
+                min_cells_per_stratum=1,
+            ),
+            pd.DataFrame,
+        )
+
+        # An explicit polars request still fails loudly, naming the extra.
+        with pytest.raises(RuntimeError, match=r"pyscx\[eval\]"):
+            pyscx.accel.rank_genes_groups_df(adata, "pert", output="polars")
 
 
 class TestStreamingDE:

@@ -2552,8 +2552,9 @@ Benchmarked at 5.4s on 1M cells (3.2× faster than scanpy's 17.2s).
 Perturbation DE in reference mode — computes Wilcoxon rank-sum fold changes
 for each non-reference group against the reference (e.g. `"non-targeting"`
 or `"control"`). Designed for Perturb-seq experiments where you compare each
-perturbation against a common control population. Returns a polars or pandas
-DataFrame in cell-eval's `DEResults` schema.
+perturbation against a common control population. Returns a **pandas**
+DataFrame in cell-eval's `DEResults` column schema; pass `output="polars"` for
+the polars frame `cell_eval` (and upstream `pdex`) use.
 
 ```python
 df = pyscx.accel.pdex_ref(adata, "perturbation", reference="non-targeting")
@@ -2572,7 +2573,7 @@ df = pyscx.accel.pdex_ref(adata, "perturbation", reference="non-targeting")
 | `gene_chunk_size` | `None` | Process genes in chunks to limit memory |
 | `prefer_format` | `"auto"` | `"auto"` (default), `"csr"`, or `"csc"` |
 | `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU takes the CSC-direct route (`gpu_csc_v3`) when a sidecar is present. |
-| `output` | `"polars"` | `"polars"` or `"pandas"` — output DataFrame type |
+| `output` | `"pandas"` | `"pandas"` (needs no extra) or `"polars"` (needs the `eval` extra; what `cell_eval` consumes) |
 
 ### Pseudobulk Differential Expression (`pyscx.accel.pseudobulk_dex`)
 
@@ -2700,10 +2701,11 @@ df = pyscx.accel.pseudobulk_dex(
     backend="nb_glm",                       # no pydeseq2 needed
 )
 
-# 2. pdex_nb_glm — cell-eval/pdex polars schema, from an AnnData.
+# 2. pdex_nb_glm — cell-eval/pdex column schema, from an AnnData.
 df = pyscx.accel.pdex_nb_glm(
     adata, "perturbation", "control",
     stratify_by=["donor"],                  # forms pseudobulk REPLICATES (required)
+    # output="polars",                      # opt in when feeding cell_eval
 )
 # columns: target, feature, fold_change, p_value, fdr, log2_fold_change,
 #          abs_log2_fold_change  (byte-compatible with pdex_ref / rank_genes_groups_df)
@@ -2973,13 +2975,14 @@ ari01 = pyscx.accel.adjusted_rand_index(labels_a, labels_b, rescaled=True)  # ce
 
 #### DE result format bridge (`pyscx.accel.rank_genes_groups_df`)
 
-Same computation as `rank_genes_groups()` but returns a **polars DataFrame**
-in cell-eval's `DEResults` schema — ready to feed into
-`cell_eval.initialize_de_comparison()` and `MetricPipeline(profile="de")`:
+Same computation as `rank_genes_groups()` but returns a DataFrame in cell-eval's
+`DEResults` column schema. It defaults to **pandas**; pass `output="polars"` to
+feed `cell_eval.initialize_de_comparison()` and `MetricPipeline(profile="de")`,
+whose `DEResults.data` is typed `pl.DataFrame` and rejects a pandas frame:
 
 ```python
 df = pyscx.accel.rank_genes_groups_df(
-    adata, "perturbation", reference="control",
+    adata, "perturbation", reference="control", output="polars",
 )
 # Columns: target, feature, fold_change, p_value, fdr,
 #          log2_fold_change, abs_log2_fold_change
@@ -2991,9 +2994,9 @@ downstream (overlap@N, precision@N, pr_auc, etc.).
 > **`group=` is the scanpy extractor alias**, and `group=None` (or omitting it,
 > with no `groupby=`) extracts **every** group — matching
 > `sc.get.rank_genes_groups_df`'s "All groups are returned if group is None".
-> Both modes return a **polars** DataFrame; pass `output="pandas"` (or
-> `.to_pandas()`) for scanpy-shaped ergonomics such as `.map` and
-> `df[col] = ...`. Calling it the scanpy way —
+> Both modes return a **pandas** DataFrame, so scanpy-shaped idioms such as
+> `.map` and `df[col] = ...` work directly; pass `output="polars"` for the polars
+> frame `cell_eval` consumes (it needs the `eval` extra). Calling it the scanpy way —
 > `pyscx.accel.rank_genes_groups_df(adata, group="0")` — does **not** recompute;
 > it extracts the precomputed `adata.uns["rank_genes_groups"]` and returns
 > scanpy's columns (`names, scores, logfoldchanges, pvals, pvals_adj`), a

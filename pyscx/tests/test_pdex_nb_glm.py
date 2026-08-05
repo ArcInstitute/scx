@@ -73,23 +73,49 @@ def _perturb_adata(seed: int = 0, n_genes: int = 50, n_donors: int = 6, cells_pe
 
 
 def test_pdex_nb_glm_schema():
-    pl = pytest.importorskip("polars")
+    """The cell-eval column schema, in the default container (pandas, F6)."""
     adata = _perturb_adata()
     df = pyscx.accel.pdex_nb_glm(
         adata, "perturbation", REFERENCE, stratify_by=["donor"], min_cells_per_group=1
     )
-    assert isinstance(df, pl.DataFrame)
-    assert df.columns == CELL_EVAL_COLUMNS
+    assert isinstance(df, pd.DataFrame)
+    assert list(df.columns) == CELL_EVAL_COLUMNS
     # Three non-reference targets, each with all genes.
-    assert set(df["target"].to_list()) == {"ko_a", "ko_b", "ko_c"}
-    assert df.height == 3 * adata.n_vars
+    assert set(df["target"]) == {"ko_a", "ko_b", "ko_c"}
+    assert len(df) == 3 * adata.n_vars
     # fold_change == 2 ** log2_fold_change (finite rows).
-    sub = df.filter(pl.col("log2_fold_change").is_finite())
+    sub = df[np.isfinite(df["log2_fold_change"])]
     np.testing.assert_allclose(
         sub["fold_change"].to_numpy(),
         2.0 ** sub["log2_fold_change"].to_numpy(),
         rtol=1e-6,
     )
+
+
+def test_pdex_nb_glm_output_polars():
+    """F6: polars is the opt-in for cell-eval, and both containers carry
+    identical columns and values."""
+    pl = pytest.importorskip("polars")
+    adata = _perturb_adata()
+    kw = dict(stratify_by=["donor"], min_cells_per_group=1)
+
+    df_default = pyscx.accel.pdex_nb_glm(adata, "perturbation", REFERENCE, **kw)
+    df_pl = pyscx.accel.pdex_nb_glm(
+        adata, "perturbation", REFERENCE, output="polars", **kw
+    )
+
+    assert isinstance(df_default, pd.DataFrame)
+    assert isinstance(df_pl, pl.DataFrame)
+    assert list(df_pl.columns) == CELL_EVAL_COLUMNS
+    pd.testing.assert_frame_equal(
+        df_default.reset_index(drop=True),
+        df_pl.to_pandas().reset_index(drop=True),
+    )
+    # A typo is rejected up front, before the fit is paid for.
+    with pytest.raises(ValueError, match="expected 'polars' or 'pandas'"):
+        pyscx.accel.pdex_nb_glm(
+            adata, "perturbation", REFERENCE, output="bogus", **kw
+        )
 
 
 def test_pdex_nb_glm_requires_stratifier():
@@ -120,7 +146,6 @@ def test_pdex_nb_glm_rejects_log1p():
 
 
 def test_pdex_nb_glm_stamps_route():
-    pytest.importorskip("polars")  # pdex_nb_glm emits the polars cell-eval schema
     adata = _perturb_adata()
     # Explicit device="cpu" is host-independent: route=cpu_nb_glm, the planner
     # records the deliberate CPU choice as user_forced_cpu. (With the default
@@ -332,9 +357,8 @@ def test_pseudobulk_dex_nbglm_design_requires_formulaic(monkeypatch):
 
 def test_pdex_nb_glm_design_smoke():
     """pdex_nb_glm(design=...) fits a covariate-adjusted model and emits the
-    cell-eval polars schema."""
+    cell-eval column schema."""
     pytest.importorskip("formulaic")
-    pytest.importorskip("polars")
     adata = _perturb_adata()
     df = pyscx.accel.pdex_nb_glm(
         adata,
@@ -345,7 +369,7 @@ def test_pdex_nb_glm_design_smoke():
         design="~ perturbation + donor",
     )
     assert list(df.columns) == CELL_EVAL_COLUMNS
-    assert set(df["target"].unique().to_list()) == {"ko_a", "ko_b", "ko_c"}
+    assert set(df["target"].unique()) == {"ko_a", "ko_b", "ko_c"}
     # A custom design runs on CPU (the GPU kernel is p ≤ 8), so the route stamp
     # must honestly say cpu_nb_glm rather than over-claiming a GPU route.
     assert adata.uns["scx_accel"]["pdex_nb_glm"]["route"] == "cpu_nb_glm"
@@ -452,16 +476,15 @@ def test_nb_glm_rejects_fractional_counts():
 
 
 def test_pdex_nb_glm_spearman_parity_vs_pdex_ref():
-    pl = pytest.importorskip("polars")
     spearmanr = pytest.importorskip("scipy.stats").spearmanr
     adata = _perturb_adata()
 
     nb = pyscx.accel.pdex_nb_glm(
         adata, "perturbation", REFERENCE, stratify_by=["donor"], min_cells_per_group=1
-    ).to_pandas()
+    )
     ref = pyscx.accel.pdex_ref(
-        adata, "perturbation", reference=REFERENCE, is_log1p=False, output="polars"
-    ).to_pandas()
+        adata, "perturbation", reference=REFERENCE, is_log1p=False
+    )
 
     key = ["target", "feature"]
     merged = nb.merge(ref, on=key, suffixes=("_nb", "_ref"))
@@ -483,7 +506,6 @@ def test_pdex_nb_glm_spearman_parity_vs_pdex_ref():
 
 def test_pdex_nb_glm_gpu_route_stamped():
     """device="gpu" on a GPU host records the gpu_nb_glm_csr route."""
-    pytest.importorskip("polars")
     if not pyscx.accel.gpu_available():
         pytest.skip("no CUDA GPU available")
     adata = _perturb_adata()
@@ -502,7 +524,6 @@ def test_pdex_nb_glm_gpu_route_stamped():
 
 def test_pdex_nb_glm_cpu_gpu_agreement():
     """GPU matches CPU within per-quantity relative tolerances + rank concordance."""
-    pytest.importorskip("polars")
     spearmanr = pytest.importorskip("scipy.stats").spearmanr
     if not pyscx.accel.gpu_available():
         pytest.skip("no CUDA GPU available")
@@ -511,11 +532,11 @@ def test_pdex_nb_glm_cpu_gpu_agreement():
     cpu = pyscx.accel.pdex_nb_glm(
         adata, "perturbation", REFERENCE, stratify_by=["donor"],
         min_cells_per_group=1, device="cpu",
-    ).to_pandas()
+    )
     gpu = pyscx.accel.pdex_nb_glm(
         adata, "perturbation", REFERENCE, stratify_by=["donor"],
         min_cells_per_group=1, device="gpu",
-    ).to_pandas()
+    )
 
     key = ["target", "feature"]
     m = cpu.merge(gpu, on=key, suffixes=("_cpu", "_gpu"))

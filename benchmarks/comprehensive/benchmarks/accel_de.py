@@ -462,19 +462,28 @@ def _wilcoxon_pvals_by_gene(adata: Any) -> dict[str, dict[str, float]] | None:
 
 
 def _pdex_pvals_by_gene(df: Any) -> dict[str, dict[str, float]] | None:
-    """Extract per-(target, feature) p-values from a `pdex_ref` polars DataFrame."""
+    """Extract per-(target, feature) p-values from a `pdex_ref` DataFrame.
+
+    Container-agnostic on purpose. `pdex_ref` returns **pandas** by default
+    (polars only on `output="polars"`), and both callers below sit inside a
+    `try/except Exception → logger.warning`, so a container assumption here would
+    not fail the run — it would silently drop `de_pval_agreement_vs_cpu` /
+    `de_top_gene_overlap_vs_cpu` from every GPU triple, i.e. lose the CPU-vs-GPU
+    correctness signal without saying so. Iterating columns works on either
+    frame and needs no polars import (which previously scored the metric `nan`
+    in a polars-less env).
+    """
     if df is None:
         return None
     try:
-        import polars as pl  # noqa: F401
-    except ImportError:
+        targets = list(df["target"])
+        features = list(df["feature"])
+        pvals = list(df["p_value"])
+    except Exception:
         return None
-    rows = df.select(["target", "feature", "p_value"]).to_dicts()
     out: dict[str, dict[str, float]] = {}
-    for row in rows:
-        tgt = str(row["target"])
-        feat = str(row["feature"])
-        out.setdefault(tgt, {})[feat] = float(row["p_value"])
+    for tgt, feat, pv in zip(targets, features, pvals):
+        out.setdefault(str(tgt), {})[str(feat)] = float(pv)
     return out
 
 

@@ -26,6 +26,21 @@ N_GROUPS = 3
 REFERENCE = "non-targeting"
 
 
+def as_polars(df):
+    """Coerce a DE frame to polars, whatever container it arrived in.
+
+    The DE accelerators return **pandas** by default (F6) and polars only on
+    `output="polars"`, while upstream `pdex` always returns polars. Parity
+    helpers compare column-wise with `pl` casts, so exactly one side needs
+    converting — this is that conversion, in one place. Polars is imported
+    lazily so this module stays polars-free at import time (see the module
+    docstring): only a caller that actually compares frames pays for it.
+    """
+    import polars as pl
+
+    return df if isinstance(df, pl.DataFrame) else pl.from_pandas(df)
+
+
 def _make_adata(seed: int = SEED) -> ad.AnnData:
     """Synthetic count-style AnnData with three groups (one is the reference).
 

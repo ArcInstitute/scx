@@ -38,6 +38,7 @@ from _pdex_fixtures import (  # noqa: E402
     REFERENCE,
     _make_adata,
     _make_adata_special_genes,
+    as_polars,
 )
 
 
@@ -76,8 +77,10 @@ def _compare_gpu_to_cpu(
         device="gpu",
     )
 
-    cpu_df = cpu_df.sort(["target", "feature"])
-    gpu_df = gpu_df.sort(["target", "feature"])
+    # Both sides are `pdex_ref` output, which now defaults to pandas; compare in
+    # polars so every cast below is unchanged.
+    cpu_df = as_polars(cpu_df).sort(["target", "feature"])
+    gpu_df = as_polars(gpu_df).sort(["target", "feature"])
     assert cpu_df.shape == gpu_df.shape, f"shape mismatch: cpu={cpu_df.shape}, gpu={gpu_df.shape}"
 
     # String + integer columns must match exactly.
@@ -182,4 +185,4 @@ def test_pdex_ref_gpu_device_string_variants() -> None:
     adata = _make_adata()
     for dev_str in ("auto", "gpu", "gpu:0"):
         df = pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE, device=dev_str)
-        assert df.height > 0, f"device={dev_str!r} produced empty result"
+        assert len(df) > 0, f"device={dev_str!r} produced empty result"

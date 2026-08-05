@@ -83,10 +83,8 @@ def test_rank_genes_groups_records_route_both_places():
 
 
 def test_rank_genes_groups_df_records_route():
-    # rank_genes_groups_df returns a polars DataFrame, so it requires polars
-    # (the optional `[eval]` extra). Skip cleanly where it isn't installed
-    # (e.g. the cloud/hdf5 CI job), matching the other polars-returning tests.
-    pytest.importorskip("polars")
+    # No polars guard: `rank_genes_groups_df` defaults to pandas (F6), which is a
+    # hard dependency via anndata, so this runs everywhere pyscx imports.
     adata = _make_adata()
     adata.X = sp.csr_matrix(adata.X)
     pyscx.accel.rank_genes_groups_df(adata, GROUPBY, reference="rest", device="cpu")

@@ -23,7 +23,7 @@ import anndata as ad  # noqa: E402
 
 import pyscx  # noqa: E402
 
-from _pdex_fixtures import _make_adata, REFERENCE  # noqa: E402
+from _pdex_fixtures import _make_adata, REFERENCE, as_polars  # noqa: E402
 
 
 pytestmark = pytest.mark.skipif(
@@ -46,8 +46,10 @@ def _route(adata: ad.AnnData) -> str | None:
 
 
 def _compare(cpu_df, gpu_df) -> None:
-    cpu_df = cpu_df.sort(["target", "feature"])
-    gpu_df = gpu_df.sort(["target", "feature"])
+    # Both sides are `pdex_ref` output, which now defaults to pandas; compare in
+    # polars so every cast below is unchanged.
+    cpu_df = as_polars(cpu_df).sort(["target", "feature"])
+    gpu_df = as_polars(gpu_df).sort(["target", "feature"])
     assert cpu_df.shape == gpu_df.shape, f"shape mismatch: cpu={cpu_df.shape}, gpu={gpu_df.shape}"
     for col in ("target", "feature"):
         assert (cpu_df[col] == gpu_df[col]).all(), f"column '{col}' mismatch"

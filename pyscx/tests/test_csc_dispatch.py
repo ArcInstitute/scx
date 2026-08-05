@@ -35,6 +35,15 @@ def small_adata():
     return adata
 
 
+def _sorted(df):
+    """Row-order a DE frame for value comparison.
+
+    `pdex_ref` returns pandas by default (F6), so this is `sort_values` + a
+    positional reindex rather than polars' `.sort`.
+    """
+    return df.sort_values(["target", "feature"]).reset_index(drop=True)
+
+
 def _open_with_csc(path, adata):
     """Round-trip ``adata`` through a CSC-equipped SCX file."""
     import pyscx
@@ -198,7 +207,6 @@ def test_rank_genes_groups_csc_raises_on_csr_only(small_adata, tmp_path):
 
 
 def test_pdex_ref_csc_matches_csr(small_adata, tmp_path):
-    pytest.importorskip("polars")  # pdex_ref() returns a polars DataFrame
     import pyscx
 
     a_csr = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
@@ -217,11 +225,11 @@ def test_pdex_ref_csc_matches_csr(small_adata, tmp_path):
     assert a_csc.uns["scx_accel"]["pdex_ref"]["route"] == "cpu_csc"
 
     # Order rows the same way before comparing values.
-    df_csr = df_csr.sort(["target", "feature"])
-    df_csc = df_csc.sort(["target", "feature"])
+    df_csr = _sorted(df_csr)
+    df_csc = _sorted(df_csc)
 
-    assert df_csr["target"].to_list() == df_csc["target"].to_list()
-    assert df_csr["feature"].to_list() == df_csc["feature"].to_list()
+    assert list(df_csr["target"]) == list(df_csc["target"])
+    assert list(df_csr["feature"]) == list(df_csc["feature"])
     for col in ("target_mean", "ref_mean", "log2_fold_change", "p_value", "statistic", "fdr"):
         np.testing.assert_allclose(
             df_csc[col].to_numpy(), df_csr[col].to_numpy(),
@@ -250,7 +258,6 @@ def test_pdex_ref_invalid_prefer_format(small_adata, tmp_path):
 def test_pdex_ref_auto_routes_csc_when_sidecar_present(small_adata, tmp_path):
     """`prefer_format="auto"` (the default) on a CPU file *with* a CSC sidecar
     takes the CSC-direct route and matches the explicit CSC result."""
-    pytest.importorskip("polars")
     import pyscx
 
     a_auto = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
@@ -265,8 +272,8 @@ def test_pdex_ref_auto_routes_csc_when_sidecar_present(small_adata, tmp_path):
         gene_chunk_size=4, prefer_format="csc", device="cpu",
     )
     assert a_auto.uns["scx_accel"]["pdex_ref"]["route"] == "cpu_csc"
-    df_auto = df_auto.sort(["target", "feature"])
-    df_csc = df_csc.sort(["target", "feature"])
+    df_auto = _sorted(df_auto)
+    df_csc = _sorted(df_csc)
     for col in ("target_mean", "ref_mean", "log2_fold_change", "p_value", "statistic", "fdr"):
         np.testing.assert_allclose(
             df_auto[col].to_numpy(), df_csc[col].to_numpy(), atol=1e-9, rtol=1e-6, err_msg=col,
@@ -276,7 +283,6 @@ def test_pdex_ref_auto_routes_csc_when_sidecar_present(small_adata, tmp_path):
 def test_pdex_ref_auto_falls_back_to_csr_without_sidecar(small_adata, tmp_path):
     """`prefer_format="auto"` on a CSR-only file falls back to the CSR streamer
     (no error) and records `cpu_csr` + `csc_available=False`."""
-    pytest.importorskip("polars")
     import pyscx
 
     a_auto = _open_csr_only(tmp_path / "csr_only.scx", small_adata)
@@ -292,8 +298,8 @@ def test_pdex_ref_auto_falls_back_to_csr_without_sidecar(small_adata, tmp_path):
     info = a_auto.uns["scx_accel"]["pdex_ref"]
     assert info["route"] == "cpu_csr"
     assert info["csc_available"] is False
-    df_auto = df_auto.sort(["target", "feature"])
-    df_csr = df_csr.sort(["target", "feature"])
+    df_auto = _sorted(df_auto)
+    df_csr = _sorted(df_csr)
     for col in ("target_mean", "ref_mean", "log2_fold_change", "p_value", "statistic", "fdr"):
         np.testing.assert_allclose(
             df_auto[col].to_numpy(), df_csr[col].to_numpy(), atol=1e-9, rtol=1e-6, err_msg=col,
@@ -355,7 +361,6 @@ def test_rank_genes_groups_auto_gene_subset_backed_does_not_error(small_adata, t
 def test_pdex_ref_csc_with_device_auto_falls_back_to_cpu(small_adata, tmp_path):
     """`device="auto"` + `prefer_format="csc"` must not error on GPU hosts;
     CSC has no GPU kernel in v1 so we silently fall back to CPU."""
-    pytest.importorskip("polars")
     import pyscx
 
     a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
@@ -364,7 +369,7 @@ def test_pdex_ref_csc_with_device_auto_falls_back_to_cpu(small_adata, tmp_path):
         a_csc, "group", reference="A", geometric_mean=False,
         gene_chunk_size=4, prefer_format="csc",
     )
-    assert df.height > 0
+    assert len(df) > 0
 
 
 def test_pdex_ref_csc_with_explicit_gpu_raises(small_adata, tmp_path):

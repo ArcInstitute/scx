@@ -5,8 +5,9 @@
 //!   * [`nb_glm`] — direct DESeq2-replacement on already-pseudobulked matrices,
 //!     returning a pandas DataFrame with PyDESeq2-style column names.
 //!   * [`pdex_nb_glm`] — pseudobulk-from-AnnData with a replicate stratifier,
-//!     emitting the cell-eval/pdex polars schema so `cell-eval-scx` consumes it
-//!     with zero changes (spec §4.4, §10).
+//!     emitting the cell-eval/pdex column schema so `cell-eval-scx` consumes it
+//!     with zero changes (spec §4.4, §10). Defaults to pandas; `output="polars"`
+//!     is the container `cell_eval` itself requires.
 //!
 //! `pseudobulk_dex(backend="nb_glm")` also routes through [`fit_targets_pandas`].
 
@@ -1033,10 +1034,12 @@ pub fn nb_glm_profile_reset() -> PyResult<()> {
 ///
 /// Aggregates `groupby × stratify_by` pseudobulk **replicates** from `adata`,
 /// fits one Rust-native NB-GLM per non-reference perturbation vs `reference`, and
-/// returns the cell-eval `DEResults` **polars** schema (`target, feature,
+/// returns the cell-eval `DEResults` column schema (`target, feature,
 /// fold_change, p_value, fdr, log2_fold_change, abs_log2_fold_change`) — the same
-/// schema as `rank_genes_groups_df` / `pdex_ref`, so it drops into `cell_eval`
-/// unchanged. `device="auto"|"cpu"|"gpu"|"gpu:N"` selects the fitter (GPU =
+/// schema as `rank_genes_groups_df` / `pdex_ref`. `output="pandas"` (the default)
+/// needs no optional dependency; **pass `output="polars"` to feed `cell_eval`**,
+/// whose `DEResults.data` is typed `pl.DataFrame` and rejects a pandas frame.
+/// `device="auto"|"cpu"|"gpu"|"gpu:N"` selects the fitter (GPU =
 /// Stage-A host-fed dense kernel); records the planned route on
 /// `adata.uns["scx_accel"]["pdex_nb_glm"]` (`gpu_nb_glm_csr` / `cpu_nb_glm`).
 ///
@@ -1058,7 +1061,7 @@ pub fn nb_glm_profile_reset() -> PyResult<()> {
 /// explicit `nbglm_options["contrast"]` is rejected here (the cell-eval schema is
 /// keyed by perturbation name — use `pseudobulk_dex`/`accel.nb_glm` for that).
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference, stratify_by=None, min_cells_per_group=10, min_cells_per_stratum=50, is_log1p=None, nbglm_options=None, gene_chunk_size=None, prefer_format="csr", device="auto", design=None))]
+#[pyo3(signature = (adata, groupby, reference, stratify_by=None, min_cells_per_group=10, min_cells_per_stratum=50, is_log1p=None, nbglm_options=None, gene_chunk_size=None, prefer_format="csr", device="auto", design=None, output="pandas"))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_nb_glm(
     py: Python<'_>,
@@ -1074,7 +1077,16 @@ pub fn pdex_nb_glm(
     prefer_format: &str,
     device: &str,
     design: Option<&str>,
+    output: &str,
 ) -> PyResult<Py<PyAny>> {
+    // Validated up front, mirroring `rank_genes_groups_df` / `pdex_ref`: a typo
+    // must not cost a full NB-GLM fit before it is reported.
+    if !matches!(output, "polars" | "pandas") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid output={output:?}; expected 'polars' or 'pandas'"
+        )));
+    }
+
     // A presentation-ordered backed `X` (`preserve_var_order=True`) has no
     // `ShardSource` spelling, and the shared pseudobulk aggregation now
     // streams the handle's view — so a request-ordered gene axis would be a
@@ -1143,7 +1155,7 @@ pub fn pdex_nb_glm(
     // §3.11: `pdex_nb_glm` honors a `design` FORMULA (covariate-adjusted joint fit,
     // per-perturbation contrasts). An explicit `nbglm_options["contrast"]` is NOT
     // accepted here: its single arbitrary contrast has no perturbation-name `target`,
-    // and the cell-eval polars schema this returns is keyed by perturbation name — a
+    // and the cell-eval schema this returns is keyed by perturbation name — a
     // coefficient-name target would silently fail the downstream join.
     let (contrast_override, options_dict) = take_contrast_override(nbglm_options)?;
     if contrast_override.is_some() {
@@ -1294,7 +1306,7 @@ pub fn pdex_nb_glm(
                 "log2_fold_change",
                 "abs_log2_fold_change",
             ],
-            "polars",
+            output,
         )?
     };
     Ok(df.unbind())

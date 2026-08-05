@@ -30,10 +30,11 @@ from _pdex_fixtures import (  # noqa: E402
     _csr_with_descending_indices,
     _make_adata,
     _make_adata_special_genes,
+    as_polars,
 )
 
 
-def _normalize_frame(df: pl.DataFrame) -> pl.DataFrame:
+def _normalize_frame(df) -> pl.DataFrame:
     """Sort by (target, feature) and select only the parity-checked columns.
 
     pdex emits rows grouped by target; pdex_ref emits rows grouped by target.
@@ -50,6 +51,10 @@ def _normalize_frame(df: pl.DataFrame) -> pl.DataFrame:
     frames carry the canonical column and the parity check actually compares
     fold changes rather than silently dropping the column.
     """
+    # `pdex_ref` defaults to pandas, upstream `pdex` returns polars; normalise
+    # the container here so every comparison below stays a polars cast, and the
+    # tests still call `pdex_ref` the way a user does (no `output=`).
+    df = as_polars(df)
     if "log2_fold_change" not in df.columns and "fold_change" in df.columns:
         df = df.with_columns(pl.col("fold_change").alias("log2_fold_change"))
     keep = [
@@ -70,7 +75,7 @@ def _normalize_frame(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _assert_frames_close(
-    scx: pl.DataFrame, pdx: pl.DataFrame, atol: float = 1e-4, rtol: float = 1e-4
+    scx, pdx, atol: float = 1e-4, rtol: float = 1e-4
 ) -> None:
     scx = _normalize_frame(scx)
     pdx = _normalize_frame(pdx)
@@ -464,7 +469,7 @@ def test_pdex_ref_cpm_filter_drops_all_genes():
     scx_df = pyscx.accel.pdex_ref(
         adata, "target", reference=REFERENCE, cpm_filter=1e12
     )
-    assert scx_df.height == 0
+    assert len(scx_df) == 0
     for col in (
         "target",
         "feature",
@@ -489,23 +494,30 @@ def test_pdex_ref_cpm_filter_negative_x_warns():
         pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE, cpm_filter=5.0)
 
 
-def test_pdex_ref_output_pandas():
-    """F6: pdex_ref supports output='pandas' — a pandas DataFrame with
-    identical columns/values to the polars default; bad output errors."""
+def test_pdex_ref_defaults_to_pandas():
+    """F6: pandas is the default container, polars is the opt-in, and the two
+    carry identical columns and values."""
     import pandas as pd
 
     adata = _make_adata()
 
+    df_default = pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE)
     df_pl = pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE, output="polars")
     df_pd = pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE, output="pandas")
 
+    # The default is pandas — not merely "pandas is reachable".
+    assert isinstance(df_default, pd.DataFrame)
+    assert isinstance(df_pl, pl.DataFrame)
     assert isinstance(df_pd, pd.DataFrame)
     # Same column names + order.
     assert list(df_pd.columns) == list(df_pl.columns)
-    # Values identical to the polars result.
+    # Values identical across containers.
     pd.testing.assert_frame_equal(
         df_pd.reset_index(drop=True),
         df_pl.to_pandas().reset_index(drop=True),
+    )
+    pd.testing.assert_frame_equal(
+        df_default.reset_index(drop=True), df_pd.reset_index(drop=True)
     )
     # Unknown output value is rejected.
     with pytest.raises(ValueError):

@@ -144,6 +144,12 @@ def _time(fn, reps: int) -> tuple[float, object]:
     return statistics.median(times), result
 
 
+def _to_pandas(df):
+    """Coerce a polars (or pandas) DataFrame to pandas."""
+    to_pd = getattr(df, "to_pandas", None)
+    return to_pd() if callable(to_pd) else df
+
+
 def _spearman(a: np.ndarray, b: np.ndarray) -> float | None:
     try:
         from scipy.stats import spearmanr
@@ -283,8 +289,10 @@ def bench_gpu_size(n_perts, n_donors, n_genes, cells_per, reps) -> dict:
 
     rho = None
     try:
-        merged = cpu_df.to_pandas().merge(
-            gpu_df.to_pandas(), on=["target", "feature"], suffixes=("_cpu", "_gpu")
+        # `pdex_nb_glm` returns pandas by default (polars only on
+        # output="polars"), so coerce rather than assume `.to_pandas()` exists.
+        merged = _to_pandas(cpu_df).merge(
+            _to_pandas(gpu_df), on=["target", "feature"], suffixes=("_cpu", "_gpu")
         )
         if len(merged):
             rho = _spearman(
@@ -448,14 +456,12 @@ def main() -> None:
         print("WARNING: --gpu=on but no CUDA GPU detected; the GPU sweep will fall back to CPU.")
     gpu_rows = []
     if run_gpu:
-        try:
-            __import__("polars")  # pdex_nb_glm emits the polars cell-eval schema
-            gpu_sizes = GPU_SMOKE_SIZES if args.smoke else GPU_SIZES
-            for sz in gpu_sizes:
-                print(f"gpu size {sz} ...", flush=True)
-                gpu_rows.append(bench_gpu_size(*sz, reps=args.reps))
-        except ImportError:
-            print("polars not installed — skipping the GPU pdex_nb_glm sweep.")
+        # No polars guard: pdex_nb_glm now emits the cell-eval schema as pandas
+        # by default, so the sweep runs on a base install.
+        gpu_sizes = GPU_SMOKE_SIZES if args.smoke else GPU_SIZES
+        for sz in gpu_sizes:
+            print(f"gpu size {sz} ...", flush=True)
+            gpu_rows.append(bench_gpu_size(*sz, reps=args.reps))
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     md = generate_report(rows, fitter_rows)
