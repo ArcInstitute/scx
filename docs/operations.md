@@ -248,6 +248,105 @@ appended with the source file's BLAKE3 in `input_checksums`.
 Known interaction: `scx subset` currently drops layers, so subset before
 importing rather than after.
 
+## External obs import
+
+`scx obs-import <target.scx> <table.csv>` / `pyscx.obs_import` land per-cell
+annotations computed outside SCX — doublet scores, cell-type calls, anything with
+one value per cell — onto an existing file as `obs` columns. `scx doublet-import`
+/ `pyscx.doublet_import` are the doublet-caller wrapper over the same machinery,
+and `rscx::scx_attach_obs` takes an R `data.frame` directly. The delimited-table
+reader is **ungated** (no libhdf5); an `.h5ad` source needs `--features hdf5`.
+
+For the analyst-facing walkthrough — which caller writes which column, how to
+export per-batch h5ads, how to combine several tools — see
+[docs/scanpy.md § Landing external per-cell annotations](scanpy.md#landing-external-per-cell-annotations-doublet-detection).
+This section covers the operational invariants.
+
+### In place, via the same harness as append
+
+The import writes through `prepare_in_place` / `commit_in_place`: new sections
+are appended at EOF and the catalog is repointed, exactly as `append`,
+`modify_metadata` and `cellbender-import` do. `X` and its layers are never read
+or rewritten, so the CSC sidecar, `.raw`, deletion vectors and detection bitmaps
+all survive, `data_generation` / `csc_build_generation` are unchanged, and cost
+is O(obs) rather than O(nnz).
+
+The obs block *is* rewritten in full each time, because obs is a single logical
+section that must cover every cell. On an 864 MB / 500k-cell atlas that is
+~160–250 MB of superseded bytes orphaned **per import** — roughly 100× the
+payload of the columns being added. `scx info` reports the orphaned total; see
+[§ Compact](#compact) to reclaim it, and prefer one import of a concatenated
+table over a loop of per-batch imports.
+
+### The join is by key string, never by row position
+
+The external tool's row order is its own business. A caller run per library
+against a merged atlas returns rows in whatever order it pleased, and a
+positional import would attach every cell's score to the wrong cell while
+producing a perfectly well-shaped column. So:
+
+- `--key`/`key=` names one obs column, `--key a,b` a composite (fused with an
+  ASCII unit separator that no barcode can contain), and `obs_names` names the
+  obs index. Omitted, the key is auto-resolved: the obs index, then a fallback
+  list of barcode-style names.
+- The two sides may spell the key differently. `--source-key` / `source_key=`
+  pairs source columns to `key=` components **positionally**, like pandas
+  `left_on` / `right_on`.
+- A duplicated key on either side is an error, never a silent first-wins.
+- Every key failure carries a key diagnosis naming the columns that *are*
+  unique. `pyscx.diagnose_obs_key(path)` runs that diagnosis on its own — worth
+  doing first on a merged atlas, where the obs index is often not unique and the
+  one column that is may be one no fallback list would guess.
+
+`--dry-run` runs the join and the diagnosis and writes nothing.
+
+### Uncovered rows get `null`, never `0.0`
+
+A target row the source does not cover has no value, and `0.0` would be a
+scientific claim the tool never made — a doublet score of zero says "definitely a
+singlet". So `on_missing_rows` defaults to **`"null"`** on every obs surface
+(`"zero"` is accepted as an alias for the same policy, inherited from the
+CellBender importer where a missing *matrix* row genuinely is zeros). `"error"`
+refuses a partial import outright.
+
+Partial coverage is a supported workflow, not a degraded one: run a caller on 6
+of 116 batches, concatenate, import once, and the other 110 batches' cells stay
+`null`. Downstream consumers are null-aware — `doublet_consensus` does not let a
+tool vote on a cell it never saw, and a cell nobody voted on stays `null` rather
+than becoming a singlet by default. A join whose every source row matched is
+reported as *coverage* at `info` level; the "matched only …" warning with example
+keys is reserved for the case where source rows genuinely failed to land, which
+is the only case where a key-format mismatch is plausible.
+
+If a `--status-column` is requested, covered rows get `"present"` and uncovered
+rows `"absent"`, so the distinction survives a round-trip through h5ad even for
+callers whose score column is legitimately zero-valued.
+
+### When a predicate index survives
+
+A pure column **add** leaves an obs predicate index valid: the index keys on
+column name, and the columns it covers are untouched. An **overwrite** of an
+indexed column does not — the index would describe values that no longer exist,
+and `filter_obs` pushdown would silently return the wrong rows.
+
+`obs_index_would_go_stale` decides precisely, comparing the columns this import
+will write against the columns the on-disk index actually covers. It is
+deliberately precise rather than conservative: dropping the index on every import
+would kill pushdown for the overwhelmingly common add-only case. The result is
+reported as `obs_index_dropped` in the import summary — check it if pushdown
+performance changes after an import.
+
+Note `--overwrite` **replaces rather than merges** a colliding column. Importing
+N per-batch tables one after another keeps only the last one's values.
+
+### Rollback granularity is one import
+
+Each import is one manifest version, so `scx rollback` undoes exactly the most
+recent one and leaves earlier imports standing. Three successive imports then one
+rollback leaves the first two sets of columns in place, with queries and pushdown
+still working against them. There is no way to undo an import from the middle of
+that chain.
+
 ## Rollback
 
 `scx rollback` is a single header `pwrite()` that repoints

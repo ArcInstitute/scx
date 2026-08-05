@@ -1865,3 +1865,207 @@ fn test_subset_index_preset_missing_columns_warns_like_siblings() {
         "the columns the preset did find must still be indexed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `scx query` on an empty result — category-miss note (dogfood E1)
+// ---------------------------------------------------------------------------
+
+/// Write a file whose `cell_type` is a **dictionary-encoded** categorical
+/// declaring a value no row uses.
+///
+/// That unused value is the load-bearing half of E1: querying it is a *genuine*
+/// zero and must stay silent, while a value outside the vocabulary is a typo and
+/// must be called out. A fixture with only used categories cannot tell a
+/// correct implementation from one that flags every empty result.
+fn write_categorical_test_file(dir: &tempfile::TempDir, filename: &str) -> PathBuf {
+    use arrow::array::{ArrayRef, DictionaryArray, Int32Array};
+    use arrow::datatypes::Int32Type;
+
+    let path = dir.path().join(filename);
+    let n_obs = 6usize;
+    let n_vars = 4usize;
+    let mut header = sample_header(n_obs as u64, n_vars as u64, (n_obs * 2) as u64);
+    header.shard_target_rows = 16384;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    // Vocabulary: 3 values; keys only ever reference 0 and 1, so "monocyte" is
+    // declared-but-unused.
+    let keys = Int32Array::from(vec![0, 1, 0, 1, 0, 1]);
+    let values = StringArray::from(vec!["B cell", "NK cell", "monocyte"]);
+    let cell_type: ArrayRef =
+        Arc::new(DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap());
+    let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    let obs = arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new(
+                "cell_type",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            cell_type,
+        ],
+    )
+    .unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// Run `scx query --count` and return (stderr, stdout).
+fn query_count(path: &std::path::Path, filter: &str) -> (String, String) {
+    let out = scx_cli()
+        .args([
+            "query",
+            path.to_str().unwrap(),
+            "--filter",
+            filter,
+            "--count",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "query {filter:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// E1: a `0` from a mistyped category and a `0` from an empty slice used to look
+/// identical, which is the single most likely way to silently mis-slice an atlas.
+#[test]
+fn test_query_empty_match_names_the_missing_category() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_categorical_test_file(&dir, "cats.scx");
+
+    // (a) Outside the vocabulary → a note naming the value, the column, the
+    // vocabulary size, and the near-match.
+    let (stderr, stdout) = query_count(&path, "cell_type == 'B cel'");
+    assert_eq!(stdout.trim(), "0");
+    assert!(
+        stderr.contains("no category"),
+        "a mistyped category must be called out, got: {stderr}"
+    );
+    for needle in ["B cel", "cell_type", "3 known categories", "B cell"] {
+        assert!(
+            stderr.contains(needle),
+            "the note must mention {needle:?}, got: {stderr}"
+        );
+    }
+
+    // (b) Declared but unused → a GENUINE zero. Silence here is the whole point:
+    // the note must mean "you mistyped", not "your query returned nothing".
+    let (stderr, stdout) = query_count(&path, "cell_type == 'monocyte'");
+    assert_eq!(stdout.trim(), "0");
+    assert!(
+        !stderr.contains("no category"),
+        "'monocyte' IS a declared category with zero rows — a genuine empty \
+         result, which must not be reported as a typo: {stderr}"
+    );
+
+    // (c) A non-empty result must never carry the note.
+    let (stderr, stdout) = query_count(&path, "cell_type == 'B cell'");
+    assert_eq!(stdout.trim(), "3");
+    assert!(!stderr.contains("no category"), "got: {stderr}");
+}
+
+/// The note is not gated behind `--explain`: a bare `--count` prints the same
+/// misleading `0`, and a user with no reason to suspect a typo has no reason to
+/// reach for a flag. It must also survive alongside `--explain` and `--json`.
+#[test]
+fn test_query_category_note_is_not_gated_behind_explain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_categorical_test_file(&dir, "cats_flags.scx");
+
+    for extra in [
+        vec![],
+        vec!["--explain"],
+        vec!["--json"],
+        vec!["--explain", "--json"],
+    ] {
+        let mut args = vec![
+            "query",
+            path.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'B cel'",
+            "--count",
+        ];
+        args.extend(extra.iter().copied());
+        let out = scx_cli().args(&args).output().unwrap();
+        assert!(out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("no category"),
+            "the note must appear with flags {extra:?}, got: {stderr}"
+        );
+    }
+}
+
+/// The collect path (no `--count`) reports it too — `collect()` consumes the
+/// pipeline, so this arm re-opens the source, and that plumbing is easy to get
+/// wrong in only one of the two paths.
+#[test]
+fn test_query_category_note_on_the_collect_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_categorical_test_file(&dir, "cats_collect.scx");
+    let out_path = dir.path().join("empty_out.scx");
+
+    let out = scx_cli()
+        .args([
+            "query",
+            path.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'B cel'",
+            "--output",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "an empty query must still succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no category") && stderr.contains("B cell"),
+        "the collect path must carry the same note, got: {stderr}"
+    );
+}
+
+/// No predicate at all: an empty file is not a mis-slice, and there is no
+/// literal to have mistyped. Must stay silent rather than emit a bare note.
+#[test]
+fn test_query_no_filter_gets_no_category_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_categorical_test_file(&dir, "cats_nofilter.scx");
+
+    let out = scx_cli()
+        .args(["query", path.to_str().unwrap(), "--count"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("no category"), "got: {stderr}");
+}

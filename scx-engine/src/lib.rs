@@ -1,3 +1,4 @@
+pub mod category_diagnosis;
 pub mod collect;
 pub mod error;
 pub mod fused_ops;
@@ -10,6 +11,7 @@ pub mod pushdown;
 pub mod reader;
 pub mod rowset;
 
+pub use category_diagnosis::{diagnose_category_misses, CategoryMiss};
 pub use collect::filter_csr_rows;
 pub use error::{EngineError, Result};
 pub use fused_ops::{

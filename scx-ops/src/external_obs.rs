@@ -66,8 +66,8 @@ use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::external_layer::{
     display_key_name, examples, first_duplicates, is_joinable_key_column, is_string_column,
-    resolve_key_alias, resolve_key_column, string_column, ExtraRowPolicy, MissingRowPolicy,
-    OBS_KEY_FALLBACKS,
+    resolve_key_alias, resolve_key_column, string_column, unmatched_examples, ExtraRowPolicy,
+    MissingRowPolicy, OBS_KEY_FALLBACKS,
 };
 use crate::in_place::{commit_in_place, entry_matches_key, prepare_in_place, read_provenance_ops};
 
@@ -695,15 +695,25 @@ fn build_obs_row_join(
             ),
         });
     }
-    if (n_matched as usize) * 2 < target_keys.len() {
-        log::warn!(
-            "external obs join matched only {n_matched} of {} target rows on '{}'; \
-             target examples {:?}, source examples {:?}",
-            target_keys.len(),
-            display_key_name("obs", key_spec),
-            examples(target_keys),
-            examples(source_keys),
-        );
+    if let Some((level, msg)) = obs_join_coverage_report(
+        n_matched,
+        target_keys.len() as u64,
+        n_target_absent,
+        n_source_absent,
+        &display_key_name("obs", key_spec),
+        || {
+            // Examples from the keys that did NOT match — a target "100000"
+            // beside a source "100000-1" names the suffix instantly, where head
+            // examples would print two identical matching keys.
+            let own = |v: Vec<&str>| v.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let target_matched: Vec<bool> = source_of_target.iter().map(|s| s.is_some()).collect();
+            (
+                own(unmatched_examples(target_keys, &target_matched)),
+                own(unmatched_examples(source_keys, &used)),
+            )
+        },
+    ) {
+        log::log!(level, "{msg}");
     }
 
     Ok(ObsRowJoin {
@@ -712,6 +722,59 @@ fn build_obs_row_join(
         n_target_absent,
         n_source_absent,
     })
+}
+
+/// How to report a join in which fewer than half the target rows matched, or
+/// `None` when coverage is high enough to need no comment (dogfood E2).
+///
+/// An intentionally partial import and a broken join both leave most target rows
+/// unmatched, but they are not the same event and must not read the same. The
+/// discriminator is **`n_source_absent`**: when it is zero, every source row
+/// found a home, so the source simply covers a subset of the target — the
+/// documented per-batch workflow (run a caller on 6 of 116 batches, concatenate,
+/// import once), and exactly what the user asked for.
+///
+/// That case reports *coverage* at `Info`, and deliberately **omits the
+/// target/source example pair**. Both lists are valid keys drawn from the same
+/// space, so presenting them side by side — the standard shape of a
+/// key-format-mismatch diagnostic — reads as evidence of divergence and sends
+/// the user hunting a bug that does not exist. The examples stay on the branch
+/// where source rows genuinely failed to land, which is the branch where a
+/// prefix / `-1`-suffix difference is actually plausible.
+///
+/// `examples` is a closure so the (allocating) example extraction is skipped
+/// entirely on the coverage branch and on the no-report path.
+fn obs_join_coverage_report(
+    n_matched: u64,
+    n_target_total: u64,
+    n_target_absent: u64,
+    n_source_absent: u64,
+    key_name: &str,
+    examples: impl FnOnce() -> (Vec<String>, Vec<String>),
+) -> Option<(log::Level, String)> {
+    if n_matched * 2 >= n_target_total {
+        return None;
+    }
+    if n_source_absent == 0 {
+        return Some((
+            log::Level::Info,
+            format!(
+                "external obs join coverage: {n_matched} of {n_target_total} target rows \
+                 matched on '{key_name}'; {n_target_absent} rows left null. Every source \
+                 row matched, so this is a partial-coverage import, not a key mismatch."
+            ),
+        ));
+    }
+    let (target_examples, source_examples) = examples();
+    Some((
+        log::Level::Warn,
+        format!(
+            "external obs join matched only {n_matched} of {n_target_total} target rows \
+             on '{key_name}', and {n_source_absent} source rows matched no target row — \
+             check for a sample-name prefix or a '-1' suffix difference; target examples \
+             {target_examples:?}, source examples {source_examples:?}"
+        ),
+    ))
 }
 
 /// Scatter a source-row-indexed array onto the target row axis, `null` for

@@ -48,7 +48,7 @@ cargo fmt --check
 
 `rscx` is excluded from `default-members` because it requires the R toolchain
 and extendr. Build it explicitly with `cargo build -p rscx` (see
-[R bindings](#r-binding-build) below).
+[R bindings](#r-binding-build-rscx) below).
 
 ### HDF5 feature build
 

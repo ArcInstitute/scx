@@ -130,7 +130,7 @@ GroupIndex (29)        — Condition/label-grouped sharding sidecar (one per
 
 v2 SCX files carry multiple modalities (RNA + ADT + ATAC + …) routed
 via a 1-byte `modality_id` stamped on each catalog entry. See
-[docs/format.md § 13](format.md#13-multimodal-extension) for the
+[docs/format.md § 13](format.md#13-multimodal-extension-optional) for the
 on-disk layout and [docs/multimodal.md](multimodal.md) for the
 end-to-end usage guide.
 
@@ -1096,7 +1096,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   per X shard, plus `shard_target_rows × k × 4` bytes per `obsm` / `varm` /
   `obsp` / `varp` matrix (each is now hyperslab-read and emitted as
   row-sharded sections — see [§ Sharded obsm/varm/obsp/varp in the
-  format spec](format.md#sharded-layout-section-types-20-23)), plus the
+  format spec](format.md#sharded-layout-section-types-2023)), plus the
   always-resident `indptr` (`(n_obs + 1) × 8` bytes). Recommended
   entry point for files larger than RAM. `csc="always"` performs a
   two-pass write (streaming CSR → `rebuild_csc_inplace` on the
@@ -1572,7 +1572,7 @@ stream (integer counts as `u32`, floats as `f32`) and cast straight into a
 full-matrix buffer *of the target dtype*, so the intermediate f32 CSR is never
 allocated. A narrow `data_dtype="uint16"` read therefore **lowers** peak RSS
 (2 B/nnz for the value buffer, not 4 B/nnz + a narrow copy) — see
-[performance.md § Full read → AnnData](performance.md#full-read--anndata). Two
+[performance.md § Full read → AnnData](performance.md#full-read--anndata-wall-s--peak-rss-mb). Two
 paths still cast post-assembly (correct, no RSS win): the `obs_filter` **query**
 path (it assembles f32 after predicate pushdown) and eagerly-materialized
 **layers**. `to_gpu_anndata` is unchanged (f32-native device path).
