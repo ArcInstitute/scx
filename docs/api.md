@@ -1800,7 +1800,7 @@ for the full dispatch rules and requirements.
 CSC sidecars are the column-major substrate for column (gene-axis)
 algorithms. Build one at conversion time with `csc="auto"` / `csc="always"`
 (`pyscx.from_anndata` / `from_h5ad` / `from_10x`) or `scx convert --csc=auto`,
-or after the fact with `scx build-csc` / `pyscx.build_csc(input, output)`.
+or after the fact with `scx build-csc` / `pyscx.build_csc(input, output=None)` (omit `output` to rebuild in place).
 `csc="auto"` builds a sidecar only
 when the dataset is large enough to benefit — `n_obs ≥ 50000` **and**
 `n_vars ≥ 5000` by default, tunable via `SCX_CSC_AUTO_OBS_THRESHOLD` /

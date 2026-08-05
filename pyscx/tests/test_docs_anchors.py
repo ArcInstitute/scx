@@ -30,11 +30,17 @@ def _repo_root() -> Path:
 
 
 def _tracked_markdown(root: Path) -> list[Path]:
-    """Tracked `.md` files only.
+    """Tracked `.md` files, preferring git and falling back to a directory walk.
 
     Untracked scratch markdown in the repo root (dogfood reports, planning docs)
-    is deliberately excluded: it is never committed, so its links are nobody's
-    contract — and a stale one there must not fail the suite.
+    is deliberately excluded when git is available: it is never committed, so its
+    links are nobody's contract, and a stale one there must not fail the suite.
+
+    **Falls back rather than skipping.** An earlier version called
+    `pytest.skip()` when git was unavailable, which would have let this check
+    silently no-op in any environment without git — and a guard that can vanish
+    without saying so is the same class of problem the check exists to catch. The
+    walk excludes the same scratch files by name so both paths agree.
     """
     try:
         out = subprocess.run(
@@ -43,9 +49,33 @@ def _tracked_markdown(root: Path) -> list[Path]:
             text=True,
             check=True,
         ).stdout
-    except (OSError, subprocess.CalledProcessError) as e:  # pragma: no cover
-        pytest.skip(f"git not available to enumerate tracked markdown: {e}")
-    return [root / line for line in out.splitlines() if line]
+        files = [root / line for line in out.splitlines() if line]
+        if files:
+            return files
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+    skip_dirs = {".git", "target", "node_modules", ".venv", "__pycache__"}
+    walked: list[Path] = []
+    for path in root.rglob("*.md"):
+        if skip_dirs.isdisjoint(path.parts) and not _is_scratch_doc(path, root):
+            walked.append(path)
+    return walked
+
+
+def _is_scratch_doc(path: Path, root: Path) -> bool:
+    """Untracked scratch markdown, matched by the repo's own naming convention.
+
+    Repo-root docs that are dated (`2026-08-03_DOGFOOD.md`) or all-caps
+    (`*-CODE-REVIEW.md`) are ephemeral and gitignored/untracked by convention;
+    `README` / `ROADMAP` / `AGENTS` / `CLAUDE` are the tracked exceptions.
+    """
+    if path.parent != root:
+        return False
+    stem = path.stem
+    if stem in {"README", "ROADMAP", "AGENTS", "CLAUDE"}:
+        return False
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}[_-]", stem)) or stem.isupper()
 
 
 def _slug(heading: str) -> str:

@@ -599,13 +599,13 @@ pub(crate) struct LoessFailure {
 /// limitation. Leading with inapplicable advice costs the user the one thing
 /// that would have worked.
 fn hvg_loess_singularity_message(
-    failed: &[LoessFailure],
+    first: &LoessFailure,
+    n_failed: usize,
     n_total: usize,
     n_vars: usize,
     batch_key: Option<&str>,
     batch_labels: Option<&[String]>,
 ) -> String {
-    let first = &failed[0];
     let n_zero_var = n_vars.saturating_sub(first.n_fit_points);
 
     // No batch_key → one global fit. Say so in those terms and lead with the
@@ -657,7 +657,7 @@ fn hvg_loess_singularity_message(
     };
     // "the remaining 0 proceed normally" is a false statement, and it is exactly
     // what the all-failed case used to print immediately before raising.
-    let n_valid = n_total.saturating_sub(failed.len());
+    let n_valid = n_total.saturating_sub(n_failed);
     let survivors = if n_valid == 0 {
         "no batch survived, so there is no variance trend to rank against".to_string()
     } else {
@@ -676,7 +676,6 @@ fn hvg_loess_singularity_message(
          flavor=\"seurat\" post-normalize. Note pyscx.accel.filter_genes(min_cells=10) \
          only helps the no-batch_key global fit, not the per-batch singularity. \
          (Full per-batch detail is recorded in adata.uns[\"hvg\"][\"loess_failed_batches\"].)",
-        n_failed = failed.len(),
         first_idx = first.batch_idx,
         n_fit_points = first.n_fit_points,
         error = first.error,
@@ -696,10 +695,21 @@ fn emit_hvg_loess_singularity_warning(
     batch_key: Option<&str>,
     batch_labels: Option<&[String]>,
 ) -> PyResult<()> {
-    if failed.is_empty() {
+    // `first()` rather than `failed[0]`: the emptiness check and the indexing
+    // are the same expression, so `hvg_loess_singularity_message` can take a
+    // `&LoessFailure` and the empty case becomes unrepresentable there rather
+    // than something a future caller could trip over.
+    let Some(first) = failed.first() else {
         return Ok(());
-    }
-    let msg = hvg_loess_singularity_message(failed, n_total, n_vars, batch_key, batch_labels);
+    };
+    let msg = hvg_loess_singularity_message(
+        first,
+        failed.len(),
+        n_total,
+        n_vars,
+        batch_key,
+        batch_labels,
+    );
     py.import("warnings")?.call_method1(
         "warn",
         (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
@@ -1777,7 +1787,7 @@ mod tests {
     /// the remedy that actually worked at the end, phrased as a limitation.
     #[test]
     fn unbatched_leads_with_filter_genes_and_never_mentions_batch_key() {
-        let msg = hvg_loess_singularity_message(&one_failure(19_230), 1, 61_497, None, None);
+        let msg = hvg_loess_singularity_message(&one_failure(19_230)[0], 1, 1, 61_497, None, None);
 
         assert!(
             !msg.contains("batch_key"),
@@ -1820,7 +1830,7 @@ mod tests {
     /// first version of this message still said "try filter_genes".
     #[test]
     fn unbatched_with_no_constant_genes_does_not_recommend_filter_genes() {
-        let msg = hvg_loess_singularity_message(&one_failure(8), 1, 8, None, None);
+        let msg = hvg_loess_singularity_message(&one_failure(8)[0], 1, 1, 8, None, None);
         assert!(
             !msg.contains("filter_genes"),
             "with 0 constant genes filtering removes nothing and cannot help: {msg}"
@@ -1848,7 +1858,14 @@ mod tests {
                 error: "ValueError: b'svddc failed in l2fit.'".to_string(),
             })
             .collect();
-        let msg = hvg_loess_singularity_message(&failed, 6, 5000, Some("dataset_id"), None);
+        let msg = hvg_loess_singularity_message(
+            &failed[0],
+            failed.len(),
+            6,
+            5000,
+            Some("dataset_id"),
+            None,
+        );
         assert!(
             !msg.contains("remaining 0 proceed normally"),
             "claiming 0 batches proceed normally is false: {msg}"
@@ -1858,7 +1875,7 @@ mod tests {
             "must state the actual outcome: {msg}"
         );
         // And the partial case still reports survivors.
-        let partial = hvg_loess_singularity_message(&failed[..1], 6, 5000, Some("d"), None);
+        let partial = hvg_loess_singularity_message(&failed[0], 1, 6, 5000, Some("d"), None);
         assert!(
             partial.contains("the remaining 5 proceed normally"),
             "{partial}"
@@ -1872,7 +1889,8 @@ mod tests {
     fn batched_keeps_the_batch_key_remedy_and_the_filter_genes_caveat() {
         let labels = vec!["dataset_7".to_string()];
         let msg = hvg_loess_singularity_message(
-            &one_failure(1_500),
+            &one_failure(1_500)[0],
+            1,
             92,
             61_497,
             Some("dataset_id"),
@@ -1903,8 +1921,14 @@ mod tests {
     /// printed — it is what `uns["hvg"]["loess_failed_batches"]` is keyed by.
     #[test]
     fn batched_without_labels_still_reports_the_index_and_cell_count() {
-        let msg =
-            hvg_loess_singularity_message(&one_failure(1_500), 4, 61_497, Some("batch"), None);
+        let msg = hvg_loess_singularity_message(
+            &one_failure(1_500)[0],
+            1,
+            4,
+            61_497,
+            Some("batch"),
+            None,
+        );
         assert!(msg.contains("batch index 0"), "{msg}");
         assert!(msg.contains("n=1104 cells"), "{msg}");
     }
@@ -1913,7 +1937,7 @@ mod tests {
     /// `n_vars - n_fit_points` subtraction.
     #[test]
     fn zero_fit_points_does_not_underflow() {
-        let msg = hvg_loess_singularity_message(&one_failure(0), 1, 10, None, None);
+        let msg = hvg_loess_singularity_message(&one_failure(0)[0], 1, 1, 10, None, None);
         assert!(msg.contains("0 of 10"), "{msg}");
         assert!(msg.contains("other 10 are constant"), "{msg}");
         assert!(

@@ -1779,7 +1779,7 @@ raises `RuntimeError` with a message naming the missing capability:
 
 1. The file has a CSC sidecar (`pyscx.from_anndata(csc="always"|"auto")`,
    `scx convert --csc=always|auto`, `scx build-csc`, or the standalone
-   `pyscx.build_csc(input, output)` to add one to an existing file).
+   `pyscx.build_csc(path)` to add one to an existing file in place, or pass an `output` to write a copy).
 2. The transform chain on `adata.X` contains only column-local
    operations. `Log1p` is column-local; `NormalizeTotal` and
    `RowScale` are not (per-row state). The common `normalize_total →

@@ -62,7 +62,7 @@ fn collects_string_equality_through_and_or_not() {
     )
     .unwrap();
     let mut terms = Vec::new();
-    string_equality_terms(&pred, &mut terms);
+    string_equality_terms(&pred, false, &mut terms);
     assert_eq!(
         terms,
         vec![
@@ -71,8 +71,10 @@ fn collects_string_equality_through_and_or_not() {
                 "European".to_string()
             ),
             ("cell_type".to_string(), "B cell".to_string()),
-            ("cell_type".to_string(), "Q cell".to_string()),
-        ]
+        ],
+        "the `not (cell_type == 'Q cell')` term must NOT be collected: under \
+         negation it matches every row, so it can never be why the query \
+         returned nothing (review finding — see `a_term_under_not_is_not_collected`)"
     );
 }
 
@@ -81,7 +83,7 @@ fn collects_every_member_of_an_in_list() {
     let schema = obs_batch().schema();
     let pred = parse_predicate("cell_type in ['B cell', 'Q cell']", &schema, "obs").unwrap();
     let mut terms = Vec::new();
-    string_equality_terms(&pred, &mut terms);
+    string_equality_terms(&pred, false, &mut terms);
     assert_eq!(
         terms,
         vec![
@@ -105,7 +107,7 @@ fn ignores_ne_and_numeric_comparisons() {
     ] {
         let pred = parse_predicate(expr, &schema, "obs").unwrap();
         let mut terms = Vec::new();
-        string_equality_terms(&pred, &mut terms);
+        string_equality_terms(&pred, false, &mut terms);
         assert!(
             terms.is_empty(),
             "{expr} must not be collected, got {terms:?}"
@@ -395,5 +397,108 @@ fn reports_each_distinct_miss_once() {
             ("cell_type", "Q cell"),
             ("self_reported_ethnicity", "European"),
         ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Polarity: a typo under `not` cannot be why a query matched zero
+// ---------------------------------------------------------------------------
+
+/// Review finding (Antigravity - Gemini 3.6 Flash). The module already documented
+/// that `Ne` is out of scope because a typo'd `!=` returns *every* row and so can
+/// never explain an empty result — then recursed into `Not`, which is the same
+/// predicate spelled differently. Reporting a negated term under a "0 rows
+/// matched" note points the user at a red herring.
+#[test]
+fn a_term_under_not_is_not_collected() {
+    let schema = obs_batch().schema();
+    for expr in [
+        "not (cell_type == 'Q cell')",
+        "not (cell_type in ['Q cell', 'Z cell'])",
+        "self_reported_ethnicity == 'European American' and not (cell_type == 'Q cell')",
+    ] {
+        let pred = parse_predicate(expr, &schema, "obs").unwrap();
+        let mut terms = Vec::new();
+        string_equality_terms(&pred, false, &mut terms);
+        assert!(
+            !terms.iter().any(|(_, v)| v == "Q cell" || v == "Z cell"),
+            "{expr} put a negated term in {terms:?}"
+        );
+    }
+}
+
+/// Polarity is *tracked*, not merely stopped at the first `not`: a double
+/// negation is a positive assertion again and must be collected. This is why the
+/// fix threads a `negated` flag rather than returning early on `Not`.
+#[test]
+fn a_double_negation_is_positive_again() {
+    let schema = obs_batch().schema();
+    let pred = parse_predicate("not (not (cell_type == 'Q cell'))", &schema, "obs").unwrap();
+    let mut terms = Vec::new();
+    string_equality_terms(&pred, false, &mut terms);
+    assert_eq!(
+        terms,
+        vec![("cell_type".to_string(), "Q cell".to_string())],
+        "`not not (x == y)` asserts x == y, so a typo there CAN cause 0 rows"
+    );
+}
+
+/// End-to-end: the negated typo must produce no note at all.
+#[test]
+fn diagnose_stays_silent_on_a_negated_typo() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(&dir);
+    let reader = scx_format_io::reader::ScxReader::open(&path).unwrap();
+    let schema = obs_batch().schema();
+
+    let pred = parse_predicate("not (cell_type == 'B cel')", &schema, "obs").unwrap();
+    assert!(
+        diagnose_category_misses(&reader, std::slice::from_ref(&pred))
+            .unwrap()
+            .is_empty(),
+        "a typo under `not` matches every row and cannot explain an empty result"
+    );
+
+    // Anti-vacuous: the same typo asserted positively IS reported, so the
+    // silence above comes from polarity and not from the fixture.
+    let positive = parse_predicate("cell_type == 'B cel'", &schema, "obs").unwrap();
+    assert_eq!(
+        diagnose_category_misses(&reader, std::slice::from_ref(&positive))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LargeUtf8 dictionary values
+// ---------------------------------------------------------------------------
+
+/// Review finding (Cursor Agent - Grok 4.5 High Fast). `Dictionary(_, LargeUtf8)`
+/// used to fall through to `None`, silently skipping the diagnosis — the exact
+/// failure mode this module exists to remove. SCX writes `Utf8`, but a silent skip
+/// is not an acceptable response to an unexpected width.
+#[test]
+fn reads_categories_from_a_large_utf8_dictionary() {
+    use arrow::array::LargeStringArray;
+
+    let keys = Int32Array::from(vec![0, 1, 0]);
+    let values = LargeStringArray::from(vec!["alpha", "beta", "gamma"]);
+    let col: ArrayRef =
+        Arc::new(DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap());
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "wide",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeUtf8)),
+            true,
+        )])),
+        vec![col],
+    )
+    .unwrap();
+
+    assert_eq!(
+        column_categories(&batch, "wide").unwrap(),
+        cats(&["alpha", "beta", "gamma"]),
+        "a LargeUtf8 dictionary must be read, including the unused 'gamma'"
     );
 }

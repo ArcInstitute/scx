@@ -19,6 +19,15 @@
 //! This module answers the question only when it is worth asking — the caller
 //! runs it after a query has already matched **zero** rows, so the obs read it
 //! may perform is off the hot path. See [`diagnose_category_misses`].
+//!
+//! # Wiring status
+//!
+//! Only `scx query` calls this today, because that is the surface the report's
+//! repro used. `pyscx.open(…).query().filter_obs(…).count()` / `.collect()` still
+//! return a bare `0` with no note. Nothing here is CLI-specific — the entry point
+//! takes a `SectionReader` and a `&[Predicate]`, both of which the Python path
+//! already has — so wiring it there is a follow-up, not a redesign. Stated so the
+//! gap reads as scoped rather than as an oversight.
 
 use std::collections::BTreeSet;
 
@@ -72,17 +81,23 @@ impl CategoryMiss {
     }
 }
 
-/// Collect every `(column, literal)` pair that a **string equality** in
-/// `predicates` tests, walking `and` / `or` / `not`.
+/// Collect every `(column, literal)` pair that a **positively-asserted** string
+/// equality in `predicates` tests, walking `and` / `or` / `not`.
 ///
-/// `Eq` and `In` only. A typo'd `Ne` mis-slices too, but by returning *every*
-/// row rather than none — it can never be the reason a query matched zero, which
-/// is the only condition under which this module runs. Diagnosing it needs a
-/// different trigger, so promising it here would be a lie.
-fn string_equality_terms(pred: &Predicate, out: &mut Vec<(String, String)>) {
+/// `Eq` and `In` only, and only at **positive polarity**. A typo'd `Ne` mis-slices
+/// too, but by returning *every* row rather than none — it can never be the reason
+/// a query matched zero, which is the only condition under which this module runs.
+/// Diagnosing it needs a different trigger, so promising it here would be a lie.
+///
+/// `not (x == 'typo')` is that same predicate spelled differently: it matches
+/// every row, so it cannot be why the result was empty either. `negated` tracks
+/// polarity through nesting rather than just skipping `Not`, so a double negation
+/// — `not (not (x == 'typo'))`, which *is* a positive assertion — is still
+/// collected.
+fn string_equality_terms(pred: &Predicate, negated: bool, out: &mut Vec<(String, String)>) {
     match pred {
-        Predicate::Eq(col, ScalarValue::Utf8(v)) => out.push((col.clone(), v.clone())),
-        Predicate::In(col, values) => {
+        Predicate::Eq(col, ScalarValue::Utf8(v)) if !negated => out.push((col.clone(), v.clone())),
+        Predicate::In(col, values) if !negated => {
             for v in values {
                 if let ScalarValue::Utf8(s) = v {
                     out.push((col.clone(), s.clone()));
@@ -90,10 +105,10 @@ fn string_equality_terms(pred: &Predicate, out: &mut Vec<(String, String)>) {
             }
         }
         Predicate::And(a, b) | Predicate::Or(a, b) => {
-            string_equality_terms(a, out);
-            string_equality_terms(b, out);
+            string_equality_terms(a, negated, out);
+            string_equality_terms(b, negated, out);
         }
-        Predicate::Not(inner) => string_equality_terms(inner, out),
+        Predicate::Not(inner) => string_equality_terms(inner, !negated, out),
         _ => {}
     }
 }
@@ -147,7 +162,15 @@ fn column_categories(batch: &arrow::array::RecordBatch, column: &str) -> Option<
         // Dictionary-encoded (the common on-disk shape for a categorical): read
         // the *values* child, not the decoded rows — the whole vocabulary is
         // right there, including categories no surviving row uses.
-        DataType::Dictionary(key, value) if matches!(**value, DataType::Utf8) => {
+        //
+        // Both string widths for the values child. `Utf8` is what SCX writes, but
+        // a `LargeUtf8` dictionary reaching here would silently skip the
+        // diagnosis — and a silent skip is exactly the failure mode E1 exists to
+        // remove, so it is worth the extra arm rather than a "not in the wild"
+        // assumption.
+        DataType::Dictionary(key, value)
+            if matches!(**value, DataType::Utf8 | DataType::LargeUtf8) =>
+        {
             let values = match **key {
                 DataType::Int8 => col.as_dictionary::<arrow::datatypes::Int8Type>().values(),
                 DataType::Int16 => col.as_dictionary::<arrow::datatypes::Int16Type>().values(),
@@ -159,8 +182,18 @@ fn column_categories(batch: &arrow::array::RecordBatch, column: &str) -> Option<
                 DataType::UInt64 => col.as_dictionary::<arrow::datatypes::UInt64Type>().values(),
                 _ => return None,
             };
-            for v in values.as_string::<i32>().iter().flatten() {
-                out.insert(v.to_string());
+            match values.data_type() {
+                DataType::Utf8 => {
+                    for v in values.as_string::<i32>().iter().flatten() {
+                        out.insert(v.to_string());
+                    }
+                }
+                DataType::LargeUtf8 => {
+                    for v in values.as_string::<i64>().iter().flatten() {
+                        out.insert(v.to_string());
+                    }
+                }
+                _ => return None,
             }
         }
         _ => return None,
@@ -201,7 +234,7 @@ pub fn diagnose_category_misses(
 ) -> Result<Vec<CategoryMiss>> {
     let mut terms: Vec<(String, String)> = Vec::new();
     for p in predicates {
-        string_equality_terms(p, &mut terms);
+        string_equality_terms(p, false, &mut terms);
     }
     terms.dedup();
     if terms.is_empty() {

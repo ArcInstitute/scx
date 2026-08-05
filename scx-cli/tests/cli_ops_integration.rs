@@ -2069,3 +2069,165 @@ fn test_query_no_filter_gets_no_category_note() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains("no category"), "got: {stderr}");
 }
+
+/// `build-csc` keeps the predicate index **sections** but loses the **pushdown**
+/// they enable. Both halves are pinned, because a doc asserting either one alone is
+/// wrong — and the matrix asserted one of them until this test was written.
+///
+/// Review (Cursor Agent - Grok 4.5 High Fast) correctly pointed out that the
+/// original "Dropped" cell contradicted the code: `copy_auxiliary_sections` →
+/// `copy_predicate_indices` copies both sections verbatim, and the copies stay
+/// *valid* because shard boundaries and row ranges are unchanged. But "Preserved"
+/// would have been just as wrong from the user's side: `run_build_csc` re-encodes
+/// shards through its own path and never re-derives the per-shard catalog
+/// `column_stats`, and Level-1 pruning resolves a categorical predicate against
+/// those stats' `CategoryBitset`. So the section is there and the pruning is gone.
+///
+/// This is a **pre-existing** `build_csc` defect, not one this PR introduced — the
+/// only change here to `build_csc.rs` is the multimodal guard. Pinned rather than
+/// fixed so the gap is visible and cannot be "resolved" by editing the docs; the
+/// fix belongs in its own change (wire `apply_obs_shard_column_stats` into the
+/// re-emit, as `merge` does).
+#[test]
+fn test_build_csc_preserves_predicate_index_sections_but_not_pushdown() {
+    let dir = tempfile::tempdir().unwrap();
+    // `write_clustered_test_file` gives obs a `cell_type` / `disease` to index.
+    let input = write_clustered_test_file(&dir, "indexed_for_csc.scx", 200, 10, 50);
+
+    // Build an indexed source by subsetting with --index-preset (F7's own path).
+    let indexed = dir.path().join("indexed.scx");
+    let out = scx_cli()
+        .args([
+            "subset",
+            input.to_str().unwrap(),
+            indexed.to_str().unwrap(),
+            "--filter",
+            "disease == 'normal'",
+            // Small enough to force several output shards: Level-1 pruning is
+            // unobservable on a single shard, so a default shard size would make
+            // the pushdown assertion below vacuous.
+            "--shard-size",
+            "25",
+            "--index-obs",
+            "cell_type",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fixture setup failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let before = ScxReader::open(&indexed)
+        .unwrap()
+        .read_obs_predicate_index_bytes()
+        .unwrap()
+        .map(<[u8]>::to_vec);
+    assert!(
+        before.is_some(),
+        "fixture precondition: the input must carry an obs predicate index"
+    );
+
+    // Copy-out form.
+    let copied = dir.path().join("csc_copy.scx");
+    let out = scx_cli()
+        .args([
+            "build-csc",
+            indexed.to_str().unwrap(),
+            copied.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // In-place form.
+    let in_place = dir.path().join("csc_in_place.scx");
+    std::fs::copy(&indexed, &in_place).unwrap();
+    let out = scx_cli()
+        .args(["build-csc", in_place.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for (label, path) in [("copy-out", &copied), ("in-place", &in_place)] {
+        let reader = ScxReader::open(path).unwrap();
+        assert!(
+            reader.header().has_csc(),
+            "{label}: the sidecar must have been built"
+        );
+        let after = reader
+            .read_obs_predicate_index_bytes()
+            .unwrap()
+            .map(<[u8]>::to_vec);
+        assert_eq!(
+            after, before,
+            "{label} build-csc must carry the obs predicate index through \
+             byte-for-byte; docs/operations.md's build-csc row states this"
+        );
+    }
+
+    // The other half: pruning. Section bytes surviving is necessary but not
+    // sufficient — and here it is not sufficient, which is the pre-existing gap.
+    let pruned = |path: &std::path::Path| -> (u32, String) {
+        let out = scx_cli()
+            .args([
+                "query",
+                path.to_str().unwrap(),
+                "--filter",
+                "cell_type == 'T cell'",
+                "--count",
+                "--explain",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let n: u32 = stderr
+            .lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("Level 1 (catalog-stats) eliminated: ")
+            })
+            .and_then(|v| v.split_once('/'))
+            .map(|(n, _)| n.parse().unwrap())
+            .unwrap_or_else(|| panic!("no Level-1 line:\n{stderr}"));
+        let matched = stderr
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("matched rows: "))
+            .unwrap_or("?")
+            .to_string();
+        (n, matched)
+    };
+
+    let (before_elim, before_matched) = pruned(&indexed);
+    assert!(
+        before_elim > 0,
+        "fixture precondition: the indexed input must prune, or the comparison \
+         below proves nothing (got {before_elim})"
+    );
+    let (after_elim, after_matched) = pruned(&copied);
+    assert_eq!(
+        after_elim, 0,
+        "documented gap: build-csc does not re-derive the per-shard column stats \
+         that Level-1 pruning needs, so pruning stops even though the index \
+         section survives. If this now prunes, the gap was fixed — update \
+         docs/operations.md's build-csc row and this assertion together."
+    );
+    // Correctness is unaffected: a full scan, not a wrong answer.
+    assert_eq!(
+        before_matched, after_matched,
+        "losing pruning must not change which rows match"
+    );
+}
