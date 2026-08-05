@@ -53,7 +53,6 @@ def _random_count_adata(n_obs: int, n_vars: int, density: float, seed: int):
 
 def test_pdex_ref_cpu_dense_route():
     adata = _make_adata()  # dense numpy X
-    pytest.importorskip("polars")
     pyscx.accel.pdex_ref(adata, GROUPBY, reference=REFERENCE, device="cpu")
     info = _route(adata, "pdex_ref")
     assert info["route"] == "cpu_dense"
@@ -63,7 +62,6 @@ def test_pdex_ref_cpu_dense_route():
 def test_pdex_ref_cpu_csr_route():
     adata = _make_adata()
     adata.X = sp.csr_matrix(adata.X)  # in-memory CSR
-    pytest.importorskip("polars")
     pyscx.accel.pdex_ref(adata, GROUPBY, reference=REFERENCE, device="cpu")
     info = _route(adata, "pdex_ref")
     assert info["route"] == "cpu_csr"
@@ -96,7 +94,6 @@ def test_scx_accel_dict_accumulates_ops():
     """Running two ops on the same adata leaves both route entries intact."""
     adata = _make_adata()
     adata.X = sp.csr_matrix(adata.X)
-    pytest.importorskip("polars")
     pyscx.accel.pdex_ref(adata, GROUPBY, reference=REFERENCE, device="cpu")
     pyscx.accel.rank_genes_groups(adata, GROUPBY, reference="rest", device="cpu")
     assert "pdex_ref" in adata.uns["scx_accel"]

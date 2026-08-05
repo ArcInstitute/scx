@@ -475,20 +475,30 @@ def _pdex_pvals_by_gene(df: Any) -> dict[str, dict[str, float]] | None:
     """
     if df is None:
         return None
-    # Narrow on purpose: a missing/renamed column (KeyError) or a non-frame
-    # (TypeError) is the only thing worth degrading to None here. A broad
-    # `except Exception` would re-open the silent-loss hole described above for
-    # any *other* bug in this extractor.
+    # Narrow on purpose: a missing/renamed column (KeyError), a non-frame
+    # (TypeError) or an unparseable value (ValueError) is all that is worth
+    # degrading to None. A broad `except Exception` would re-open the silent-loss
+    # hole described above for any *other* bug in this extractor.
+    #
+    # The whole extraction — including the loop — is inside the guard. A null
+    # p-value listifies to None, and `float(None)` raises TypeError; with the
+    # loop outside, that one escaped to the caller's own
+    # `except Exception -> logger.warning`, which is the silent metric loss this
+    # helper exists to prevent. A null p-value has nothing to correlate, so it
+    # becomes NaN — `_pval_agreement` already drops non-finite pairs — rather
+    # than discarding every other gene's value with it.
     try:
         targets = list(df["target"])
         features = list(df["feature"])
         pvals = list(df["p_value"])
-    except (KeyError, TypeError):
+        out: dict[str, dict[str, float]] = {}
+        for tgt, feat, pv in zip(targets, features, pvals):
+            out.setdefault(str(tgt), {})[str(feat)] = (
+                float("nan") if pv is None else float(pv)
+            )
+        return out
+    except (KeyError, TypeError, ValueError):
         return None
-    out: dict[str, dict[str, float]] = {}
-    for tgt, feat, pv in zip(targets, features, pvals):
-        out.setdefault(str(tgt), {})[str(feat)] = float(pv)
-    return out
 
 
 def _spearman(a: np.ndarray, b: np.ndarray) -> float:
