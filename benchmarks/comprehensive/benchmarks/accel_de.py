@@ -462,20 +462,43 @@ def _wilcoxon_pvals_by_gene(adata: Any) -> dict[str, dict[str, float]] | None:
 
 
 def _pdex_pvals_by_gene(df: Any) -> dict[str, dict[str, float]] | None:
-    """Extract per-(target, feature) p-values from a `pdex_ref` polars DataFrame."""
+    """Extract per-(target, feature) p-values from a `pdex_ref` DataFrame.
+
+    Container-agnostic on purpose. `pdex_ref` returns **pandas** by default
+    (polars only on `output="polars"`), and both callers below sit inside a
+    `try/except Exception → logger.warning`, so a container assumption here would
+    not fail the run — it would silently drop `de_pval_agreement_vs_cpu` /
+    `de_top_gene_overlap_vs_cpu` from every GPU triple, i.e. lose the CPU-vs-GPU
+    correctness signal without saying so. Iterating columns works on either
+    frame and needs no polars import (which previously scored the metric `nan`
+    in a polars-less env).
+    """
     if df is None:
         return None
+    # Narrow on purpose: a missing/renamed column (KeyError), a non-frame
+    # (TypeError) or an unparseable value (ValueError) is all that is worth
+    # degrading to None. A broad `except Exception` would re-open the silent-loss
+    # hole described above for any *other* bug in this extractor.
+    #
+    # The whole extraction — including the loop — is inside the guard. A null
+    # p-value listifies to None, and `float(None)` raises TypeError; with the
+    # loop outside, that one escaped to the caller's own
+    # `except Exception -> logger.warning`, which is the silent metric loss this
+    # helper exists to prevent. A null p-value has nothing to correlate, so it
+    # becomes NaN — `_pval_agreement` already drops non-finite pairs — rather
+    # than discarding every other gene's value with it.
     try:
-        import polars as pl  # noqa: F401
-    except ImportError:
+        targets = list(df["target"])
+        features = list(df["feature"])
+        pvals = list(df["p_value"])
+        out: dict[str, dict[str, float]] = {}
+        for tgt, feat, pv in zip(targets, features, pvals):
+            out.setdefault(str(tgt), {})[str(feat)] = (
+                float("nan") if pv is None else float(pv)
+            )
+        return out
+    except (KeyError, TypeError, ValueError):
         return None
-    rows = df.select(["target", "feature", "p_value"]).to_dicts()
-    out: dict[str, dict[str, float]] = {}
-    for row in rows:
-        tgt = str(row["target"])
-        feat = str(row["feature"])
-        out.setdefault(tgt, {})[feat] = float(row["p_value"])
-    return out
 
 
 def _spearman(a: np.ndarray, b: np.ndarray) -> float:

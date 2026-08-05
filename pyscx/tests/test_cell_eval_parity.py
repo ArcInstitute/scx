@@ -861,11 +861,13 @@ class TestDEBridgeParity:
     """Verify DE result format bridge."""
 
     def test_de_dataframe_format(self):
-        """Verify output DataFrame schema matches cell-eval's DEResults."""
+        """Verify the polars DataFrame cell-eval consumes matches its DEResults
+        schema. `output="polars"` is explicit: pandas is the default container
+        (F6) but `DEResults.data` is typed `pl.DataFrame`."""
         adata_real, _ = _make_cell_eval_adata(n_obs=200, n_vars=50, n_perts=4)
 
         df = pyscx.accel.rank_genes_groups_df(
-            adata_real, "perturbation", reference="control",
+            adata_real, "perturbation", reference="control", output="polars",
         )
 
         required_cols = {
@@ -882,19 +884,24 @@ class TestDEBridgeParity:
         for col in ["fold_change", "p_value", "fdr", "log2_fold_change", "abs_log2_fold_change"]:
             assert df[col].dtype == pl.Float64, f"{col} should be Float64, got {df[col].dtype}"
 
-    def test_de_dataframe_output_pandas(self):
-        """F6: rank_genes_groups_df supports output='pandas' — a pandas
-        DataFrame with identical columns/values to the polars default."""
+    def test_de_dataframe_defaults_to_pandas(self):
+        """F6: pandas is the default container and polars the opt-in, with
+        identical columns and values either way."""
         import pandas as pd
 
         adata_real, _ = _make_cell_eval_adata(n_obs=200, n_vars=50, n_perts=4)
 
+        df_default = pyscx.accel.rank_genes_groups_df(
+            adata_real, "perturbation", reference="control",
+        )
         df_pl = pyscx.accel.rank_genes_groups_df(
             adata_real, "perturbation", reference="control", output="polars",
         )
         df_pd = pyscx.accel.rank_genes_groups_df(
             adata_real, "perturbation", reference="control", output="pandas",
         )
+        assert isinstance(df_default, pd.DataFrame)
+        assert isinstance(df_pl, pl.DataFrame)
         assert isinstance(df_pd, pd.DataFrame)
         # Same column names + order.
         assert list(df_pd.columns) == list(df_pl.columns)
@@ -917,12 +924,15 @@ class TestDEBridgeParity:
         """
         adata_real, adata_pred = _make_cell_eval_adata(n_obs=200, n_vars=50, n_perts=4)
 
-        # Compute DE via SCX for both real and pred
+        # Compute DE via SCX for both real and pred. `output="polars"` is
+        # required, not stylistic: `cell_eval`'s DEResults.data is typed
+        # `pl.DataFrame` and its __post_init__ runs `pl.col(...)` expressions, so
+        # the default pandas frame is rejected there (F6).
         df_real = pyscx.accel.rank_genes_groups_df(
-            adata_real, "perturbation", reference="control",
+            adata_real, "perturbation", reference="control", output="polars",
         )
         df_pred = pyscx.accel.rank_genes_groups_df(
-            adata_pred, "perturbation", reference="control",
+            adata_pred, "perturbation", reference="control", output="polars",
         )
 
         # Feed into cell-eval's DE initialization

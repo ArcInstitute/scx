@@ -1943,13 +1943,17 @@ class TestClusteringAgreement:
 
 
 # Guard: skip entire class if polars not installed (optional eval dependency).
+# These tests pin `output="polars"` deliberately: the accelerator now *defaults*
+# to pandas (F6), but the polars frame is what `cell_eval.DEResults` accepts, so
+# the polars schema is precisely this class's subject. The default container is
+# covered in test_accel.py.
 pl = pytest.importorskip("polars", reason="polars required for DE format bridge tests")
 
 
 class TestRankGenesGroupsDf:
-    """Test pyscx.accel.rank_genes_groups_df() — DE result format bridge.
+    """Test pyscx.accel.rank_genes_groups_df(output="polars") — DE format bridge.
 
-    Verifies that the output polars DataFrame matches cell-eval's DEResults
+    Verifies that the polars DataFrame cell-eval consumes matches its DEResults
     schema: (target, feature, fold_change, p_value, fdr, log2_fold_change,
     abs_log2_fold_change).
     """
@@ -1989,7 +1993,9 @@ class TestRankGenesGroupsDf:
 
 
         adata = self._make_adata()
-        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", output="polars"
+        )
         assert isinstance(df, pl.DataFrame), f"Expected polars DataFrame, got {type(df)}"
 
     def test_required_columns_present(self):
@@ -1998,7 +2004,9 @@ class TestRankGenesGroupsDf:
 
 
         adata = self._make_adata()
-        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", output="polars"
+        )
 
         required_cols = {
             "target", "feature", "fold_change",
@@ -2014,7 +2022,9 @@ class TestRankGenesGroupsDf:
 
 
         adata = self._make_adata()
-        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", output="polars"
+        )
 
         # String columns
         assert df["target"].dtype == pl.Utf8
@@ -2029,7 +2039,9 @@ class TestRankGenesGroupsDf:
         import pyscx
 
         adata = self._make_adata(n_vars=50, n_groups=4)
-        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", output="polars"
+        )
 
         n_groups = len(adata.obs["perturbation"].unique())
         n_vars = adata.n_vars
@@ -2042,7 +2054,9 @@ class TestRankGenesGroupsDf:
         import pyscx
 
         adata = self._make_adata(n_vars=50, n_groups=4)
-        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation", n_genes=10)
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", n_genes=10, output="polars"
+        )
 
         n_groups = len(adata.obs["perturbation"].unique())
         assert len(df) == n_groups * 10, (
@@ -2054,7 +2068,9 @@ class TestRankGenesGroupsDf:
         import pyscx
 
         adata = self._make_adata()
-        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", output="polars"
+        )
 
         log2fc = df["log2_fold_change"].to_numpy()
         fc = df["fold_change"].to_numpy()
@@ -2072,7 +2088,9 @@ class TestRankGenesGroupsDf:
         import pyscx
 
         adata = self._make_adata()
-        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", output="polars"
+        )
 
         log2fc = df["log2_fold_change"].to_numpy()
         abs_log2fc = df["abs_log2_fold_change"].to_numpy()
@@ -2087,7 +2105,9 @@ class TestRankGenesGroupsDf:
         import pyscx
 
         adata = self._make_adata()
-        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", output="polars"
+        )
 
         pvals = df["p_value"].to_numpy()
         fdrs = df["fdr"].to_numpy()
@@ -2106,7 +2126,9 @@ class TestRankGenesGroupsDf:
         import pyscx
 
         adata = self._make_adata(n_groups=4)
-        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", output="polars"
+        )
 
         unique_targets = set(df["target"].to_list())
         expected_groups = set(adata.obs["perturbation"].unique())
@@ -2120,7 +2142,7 @@ class TestRankGenesGroupsDf:
 
         adata = self._make_adata(n_groups=4)
         df = pyscx.accel.rank_genes_groups_df(
-            adata, "perturbation", reference="control"
+            adata, "perturbation", reference="control", output="polars"
         )
 
         unique_targets = set(df["target"].to_list())
@@ -2136,7 +2158,9 @@ class TestRankGenesGroupsDf:
         adata = self._make_adata()
         adata.X = adata.X.toarray()
 
-        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", output="polars"
+        )
         assert isinstance(df, pl.DataFrame)
         assert "target" in df.columns
 
@@ -2148,7 +2172,9 @@ class TestRankGenesGroupsDf:
         adata_copy = adata.copy()
 
         # Run the new DataFrame-returning function
-        df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, "perturbation", output="polars"
+        )
 
         # Run the existing adata.uns-writing function
         pyscx.accel.rank_genes_groups(adata_copy, "perturbation")
@@ -2321,7 +2347,7 @@ class TestEndToEndPipeline:
 
         # ── 6. DE result format bridge ──
         de_df = pyscx.accel.rank_genes_groups_df(
-            adata_real, "perturbation", reference="control"
+            adata_real, "perturbation", reference="control", output="polars"
         )
 
         assert isinstance(de_df, pl.DataFrame)
@@ -2381,7 +2407,7 @@ class TestEndToEndPipeline:
 
         # Identical data → DE bridge should produce valid output
         de_df = pyscx.accel.rank_genes_groups_df(
-            adata_real, "perturbation", reference="control"
+            adata_real, "perturbation", reference="control", output="polars"
         )
 
         assert isinstance(de_df, pl.DataFrame)

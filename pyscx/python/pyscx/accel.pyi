@@ -56,7 +56,7 @@ def rank_genes_groups_df(
     rankby_abs: bool = False,
     tie_correct: bool = False,
     device: str = "auto",
-    output: str = "polars",
+    output: str = "pandas",
     *,
     group: str | list[str] | None = None,
     key: str = "rank_genes_groups",
@@ -78,8 +78,8 @@ def rank_genes_groups_df(
     ``group=None`` (or omitting it) with no ``groupby=`` extracts **every** group
     in ``adata.uns[key]``, with a leading ``group`` column — matching
     ``sc.get.rank_genes_groups_df``'s "All groups are returned if group is
-    None". Note both modes return a **polars** DataFrame by default; pass
-    ``output="pandas"`` for scanpy-shaped ergonomics (``.map``, ``df[col] = …``).
+    None". Both modes return a **pandas** DataFrame by default; pass
+    ``output="polars"`` for the polars frame ``cell_eval`` consumes.
     """
     ...
 
@@ -128,10 +128,34 @@ def pdex_ref(
     gene_chunk_size: int | None = None,
     prefer_format: DePreferFormat = "auto",
     device: str = "auto",
-    output: str = "polars",
+    output: str = "pandas",
     use_raw: bool | None = None,
     layer: str | None = None,
 ) -> Any: ...
+
+
+def pdex_nb_glm(
+    adata: Any,
+    groupby: str,
+    reference: str,
+    stratify_by: list[str] | None = None,
+    min_cells_per_group: int = 10,
+    min_cells_per_stratum: int = 50,
+    is_log1p: bool | None = None,
+    nbglm_options: dict[str, Any] | None = None,
+    gene_chunk_size: int | None = None,
+    prefer_format: str = "csr",
+    device: str = "auto",
+    design: str | None = None,
+    output: str = "pandas",
+) -> Any:
+    """Pseudobulk NB-GLM DE in the cell-eval ``DEResults`` column schema.
+
+    ``stratify_by`` is **required** in practice (it forms the pseudobulk
+    replicates) and must be a list, not a bare string. Returns pandas by
+    default; pass ``output="polars"`` for the container ``cell_eval`` consumes.
+    """
+    ...
 
 
 # ---------------------------------------------------------------------------

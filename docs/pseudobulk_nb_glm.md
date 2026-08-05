@@ -80,8 +80,10 @@ df = pyscx.accel.nb_glm(
 ### 2. `pyscx.accel.pdex_nb_glm` — cell-eval / pdex path (from AnnData)
 
 Builds pseudobulk **replicates** straight from an AnnData and emits the
-**cell-eval/pdex polars schema**, so it is a drop-in DE method for
-[`cell-eval`](https://github.com/arcinstitute/cell-eval). A **stratifier is
+**cell-eval/pdex column schema**, so it is a drop-in DE method for
+[`cell-eval`](https://github.com/arcinstitute/cell-eval) — pass
+`output="polars"` when handing the frame to `cell_eval`, whose `DEResults.data`
+is typed `pl.DataFrame` (the default is pandas). A **stratifier is
 required** (it forms the replicates), passed as a **list** of obs column names —
 e.g. `stratify_by=["donor"]`; a bare string is rejected with a clear error.
 
@@ -93,16 +95,27 @@ df = pyscx.accel.pdex_nb_glm(
     stratify_by=["donor"],      # forms pseudobulk REPLICATES (required)
     min_cells_per_group=10,
     is_log1p=None,              # auto-detected from adata.uns["log1p"]
+    # output="polars",          # opt in when feeding cell_eval
 )
-# polars columns (cell-eval DEResults schema):
+# columns (cell-eval DEResults schema):
 #   target, feature, fold_change, p_value, fdr, log2_fold_change,
 #   abs_log2_fold_change
 ```
 
-The output schema is byte-compatible with `pyscx.accel.pdex_ref` /
-`rank_genes_groups_df`, so it feeds straight into `cell_eval.data.DEComparison`.
-On the `cell-eval-scx` side this is a one-line `ScxDeMethod` addition
-(`de_method="nb_glm"`).
+The output *column* schema is byte-compatible with `pyscx.accel.pdex_ref` /
+`rank_genes_groups_df`, so with `output="polars"` it feeds straight into
+`cell_eval.data.DEComparison`.
+
+> **The container is no longer drop-in — this is a downstream release gate.**
+> All three DE frames default to **pandas**, and `cell_eval`'s `DEResults.data`
+> is typed `pl.DataFrame` (its `__post_init__` evaluates `pl.col(...)`), so a
+> pandas frame is rejected there. `cell-eval-scx`'s `run_scx_de` calls
+> `rank_genes_groups_df` / `pdex_ref` / `pdex_nb_glm` with no `output=` and
+> annotates the return as `pl.DataFrame`; its DE benchmark wrappers
+> (`benchmarks/_lib/accel.py`) do the same. Those calls need
+> `output="polars"` **before** `cell-eval-scx` bumps its `pyscx` pin past this
+> change — the column-schema addition on that side is still one line
+> (`de_method="nb_glm"`), but the container is not free.
 
 ### 3. `pseudobulk_dex(backend="nb_glm")` — alongside the PyDESeq2 bridge
 

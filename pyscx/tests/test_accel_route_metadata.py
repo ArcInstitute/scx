@@ -53,7 +53,6 @@ def _random_count_adata(n_obs: int, n_vars: int, density: float, seed: int):
 
 def test_pdex_ref_cpu_dense_route():
     adata = _make_adata()  # dense numpy X
-    pytest.importorskip("polars")
     pyscx.accel.pdex_ref(adata, GROUPBY, reference=REFERENCE, device="cpu")
     info = _route(adata, "pdex_ref")
     assert info["route"] == "cpu_dense"
@@ -63,7 +62,6 @@ def test_pdex_ref_cpu_dense_route():
 def test_pdex_ref_cpu_csr_route():
     adata = _make_adata()
     adata.X = sp.csr_matrix(adata.X)  # in-memory CSR
-    pytest.importorskip("polars")
     pyscx.accel.pdex_ref(adata, GROUPBY, reference=REFERENCE, device="cpu")
     info = _route(adata, "pdex_ref")
     assert info["route"] == "cpu_csr"
@@ -83,10 +81,8 @@ def test_rank_genes_groups_records_route_both_places():
 
 
 def test_rank_genes_groups_df_records_route():
-    # rank_genes_groups_df returns a polars DataFrame, so it requires polars
-    # (the optional `[eval]` extra). Skip cleanly where it isn't installed
-    # (e.g. the cloud/hdf5 CI job), matching the other polars-returning tests.
-    pytest.importorskip("polars")
+    # No polars guard: `rank_genes_groups_df` defaults to pandas (F6), which is a
+    # hard dependency via anndata, so this runs everywhere pyscx imports.
     adata = _make_adata()
     adata.X = sp.csr_matrix(adata.X)
     pyscx.accel.rank_genes_groups_df(adata, GROUPBY, reference="rest", device="cpu")
@@ -98,7 +94,6 @@ def test_scx_accel_dict_accumulates_ops():
     """Running two ops on the same adata leaves both route entries intact."""
     adata = _make_adata()
     adata.X = sp.csr_matrix(adata.X)
-    pytest.importorskip("polars")
     pyscx.accel.pdex_ref(adata, GROUPBY, reference=REFERENCE, device="cpu")
     pyscx.accel.rank_genes_groups(adata, GROUPBY, reference="rest", device="cpu")
     assert "pdex_ref" in adata.uns["scx_accel"]
