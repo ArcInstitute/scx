@@ -1725,7 +1725,7 @@ visible-gene totals — the same numbers `adata.obs["total_counts"]` and
 | `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`, `approximate_knn`        | —                                              |
 | `rank_genes_groups`      | ✓   | ✓   | `groupby`, `reference`, `n_genes`, `method`                           | `gene_chunk_size`, `stratify_by`, `prefer_format`, `tie_correct`, `rankby_abs`, `device` |
 | `pdex_ref`               | ✓   | ✓   | `groupby`, `reference`                                                | `is_log1p`, `geometric_mean`, `epsilon`, `cpm_filter`, `gene_chunk_size`, `prefer_format`, `device`, `output` |
-| `pseudobulk_dex`         | ✓   | —   | `groupby`, `design`, `reference`                                      | `test_col`, `aggr_method`, `stratify_by`, `prefer_format`, `backend`, `nbglm_options`, `gene_indices`, `n_cpus` |
+| `pseudobulk_dex`         | ✓   | —   | `design`, `reference` (**`groupby` is spelled the same but means the opposite** — sample-defining columns, not the compared one) | `test_col`, `sample_cols`/`sample_key` (aliases for `groupby`), `aggr_method`, `stratify_by`, `prefer_format`, `backend`, `nbglm_options`, `gene_indices`, `n_cpus` |
 | `nb_glm`                 | ✓   | —   | — (no scanpy equivalent)                                             | `counts`, `design`, `contrast`                 |
 | `pdex_nb_glm`            | ✓   | —   | — (no scanpy equivalent)                                             | `groupby`, `reference`, `stratify_by`          |
 | `pseudobulk_means`       | ✓   | ✓   | — (no scanpy equivalent)                                             | `groupby`, `min_cells_per_group`, `device`     |
@@ -2581,6 +2581,18 @@ Streaming pseudobulk aggregation in Rust + negative binomial GLM testing via
 [pydeseq2](https://pydeseq2.readthedocs.io/). Designed for perturbation
 sequencing (Perturb-seq) experiments with biological replicates.
 
+> **`groupby` means the opposite of what it means in `rank_genes_groups`.**
+> In `accel.rank_genes_groups` — and everywhere in scanpy — `groupby` names the
+> column whose levels are compared. In `pseudobulk_dex` it names the columns
+> that together define one pseudobulk **sample**: condition *plus* replicate,
+> e.g. `["disease", "donor_id"]`. The column being compared is `test_col`.
+>
+> Passing only the condition column produces one pseudobulk sample per
+> condition and therefore no replication. Because that mistake is easy to make
+> and quiet, the replicate-role spellings **`sample_cols=`** and
+> **`sample_key=`** are accepted as aliases for `groupby` (`sample_key` also
+> takes a bare string). Pass exactly one of the three.
+
 The aggregation phase streams shards from `BackedCsrReader` without
 materializing the full matrix — peak memory is one shard plus the pseudobulk
 count matrix (n_groups × n_vars).
@@ -2590,11 +2602,12 @@ import pyscx
 
 adata = pyscx.open("perturb_seq.scx").to_anndata(backed=True)
 
-# Run pseudobulk DE: drug vs control, grouped by (perturbation, donor)
+# Run pseudobulk DE: drug vs control. The pseudobulk sample is
+# (perturbation, donor) — donor is the replicate that makes the test possible.
 result = pyscx.accel.pseudobulk_dex(
     adata,
-    groupby=["perturbation", "donor"],
-    test_col="perturbation",
+    groupby=["perturbation", "donor"],   # or sample_cols=[...] — same thing
+    test_col="perturbation",             # the column actually compared
     reference="control",
 )
 
@@ -2605,8 +2618,10 @@ print(result.sort_values("padj").head(20))
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `groupby` | (required) | List of obs columns to group cells by |
-| `test_col` | (required) | Column in `groupby` containing the condition variable |
+| `groupby` | (required) | Obs columns defining a pseudobulk sample — condition **plus** replicate (e.g. `["disease", "donor_id"]`). **Not** the compared column |
+| `sample_cols` | `None` | Alias for `groupby`, named for the role it plays |
+| `sample_key` | `None` | Single-column alias for `groupby`; accepts a bare string (`sample_key="donor_id"`) |
+| `test_col` | (required) | Which of those columns holds the condition to compare |
 | `reference` | (required) | Reference level in `test_col` (e.g., `"control"`) |
 | `design` | `"~ test_col"` | DESeq2 design formula (auto-generated if not specified) |
 | `aggr_method` | `"sum"` | Aggregation method: `"sum"` or `"mean"` |

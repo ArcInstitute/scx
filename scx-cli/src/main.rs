@@ -855,18 +855,26 @@ enum Commands {
         parallelism: usize,
     },
     /// Build CSC (column-major) shards from existing CSR data
+    ///
+    /// Omit <OUTPUT> to add the sidecar to <INPUT> **in place** (staged via a
+    /// temp file + atomic rename, so a failure leaves the input untouched) —
+    /// the CSC store is a sidecar *on* a file, and the neighbouring
+    /// `obs-import` / `doublet-import` / `cellbender-import` all mutate in
+    /// place. Pass <OUTPUT> to leave the input alone and write a copy.
     BuildCsc {
         /// Input SCX file (must have CSR shards)
         input: PathBuf,
-        /// Output SCX file (will contain both CSR and CSC shards)
-        output: PathBuf,
+        /// Output SCX file (gets both CSR and CSC shards). Omit to add the
+        /// CSC sidecar to <INPUT> in place.
+        output: Option<PathBuf>,
         /// Maximum memory for the transpose working set (default: 4G).
         /// Accepts a bare byte count or a binary-prefixed size —
         /// `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024);
         /// decimal `KB`/`MB`/`GB`/`TB` is rejected as ambiguous.
         #[arg(long, default_value = "4G")]
         memory_limit: String,
-        /// Overwrite output if it exists
+        /// Overwrite output if it exists. Not applicable to the in-place form
+        /// (no <OUTPUT>), which always rewrites <INPUT>.
         #[arg(long)]
         force: bool,
         /// Maximum columns per emitted CSC shard (default: 5000).
@@ -926,6 +934,28 @@ enum Commands {
         /// decimal `KB`/`MB`/`GB` is rejected. Ignored without `--rebuild-csc`.
         #[arg(long, default_value = "4G")]
         csc_memory_limit: String,
+        /// Comma-separated obs columns to force-index on the subset output.
+        /// Mirrors `scx convert --index-obs`.
+        ///
+        /// An input's predicate index CANNOT be carried over — row / column
+        /// projection invalidates every shard range in it — so without any
+        /// `--index-*` flag the subset has NO predicate-index sections and
+        /// query-time `filter_obs` pushdown falls back to a full obs scan.
+        /// Pass these to rebuild the index against the subset instead.
+        #[arg(long, value_name = "CSV")]
+        index_obs: Option<String>,
+        /// Comma-separated var columns to force-index on the subset output.
+        #[arg(long, value_name = "CSV")]
+        index_var: Option<String>,
+        /// Named column preset (`cellxgene` | `perturbseq` | `training`).
+        #[arg(long, value_name = "NAME")]
+        index_preset: Option<String>,
+        /// Cardinality cap for auto-detected index columns. Pass this flag
+        /// alone to ask the engine to auto-detect low-cardinality categorical
+        /// columns at the given threshold; omit all `--index-*` flags to leave
+        /// the subset without predicate indexes (current default).
+        #[arg(long, value_name = "N")]
+        index_auto_threshold: Option<usize>,
     },
     /// Upgrade an SCX file to the latest format version
     Upgrade {
@@ -1640,14 +1670,39 @@ fn main() {
             memory_limit,
             force,
             csc_cols_per_shard,
-        } => scx_ops::run_build_csc(
-            &input,
-            &output,
-            &memory_limit,
-            force,
-            csc_cols_per_shard,
-            None,
-        ),
+        } => {
+            // Framing must come from `framing_for_csc_rebuild` on BOTH arms.
+            // Both ends of the range are wrong (see its contract): `None`
+            // strips row-group framing off a v4 input — via
+            // `rewrite_output_format_version(&[4], 1) == 3`, which is what the
+            // copy-out arm used to do, silently downgrading a framed file — and
+            // a `FramingConfig` carrying `decode_target: Some(_)` would
+            // re-authorise per-shard codec re-selection, the opposite of what a
+            // sidecar rebuild needs.
+            let framing = scx_ops::framing_for_csc_rebuild(&input);
+            match output {
+                Some(output) => scx_ops::run_build_csc(
+                    &input,
+                    &output,
+                    &memory_limit,
+                    force,
+                    csc_cols_per_shard,
+                    framing,
+                ),
+                // In place, so there is no output to overwrite. Refuse
+                // `--force` rather than ignore it: silently accepting it would
+                // imply a guard that does not exist.
+                None if force => Err("--force applies only when writing to an <OUTPUT>; the \
+                                      in-place form (no <OUTPUT>) always rewrites <INPUT>"
+                    .into()),
+                None => {
+                    scx_ops::rebuild_csc_inplace(&input, csc_cols_per_shard, &memory_limit, framing)
+                        .map(|()| {
+                            println!("Built CSC sidecar on {} (in place)", input.display());
+                        })
+                }
+            }
+        }
         Commands::Subset {
             input,
             output,
@@ -1660,6 +1715,10 @@ fn main() {
             rebuild_csc,
             csc_cols_per_shard,
             csc_memory_limit,
+            index_obs,
+            index_var,
+            index_preset,
+            index_auto_threshold,
         } => subset::run_subset(
             &input,
             output.as_deref(),
@@ -1672,6 +1731,15 @@ fn main() {
             rebuild_csc,
             csc_cols_per_shard,
             &csc_memory_limit,
+            // 0 = no auto-detection, so the flags are the only way to request an
+            // index — matching `merge` / `compact`, where an omitted `--index-*`
+            // means "no predicate index on the output".
+            &scx_engine::ConversionPredicateIndexOptions {
+                index_obs: parse_index_columns(index_obs.as_deref()),
+                index_var: parse_index_columns(index_var.as_deref()),
+                index_preset,
+                index_auto_threshold: index_auto_threshold.unwrap_or(0),
+            },
         ),
         Commands::Upgrade {
             input,

@@ -232,6 +232,65 @@ def test_build_csc_rejects_same_input_output(small_adata, tmp_path):
     with pytest.raises(ValueError, match="different files"):
         pyscx.build_csc(str(src), str(src), force=True)
 
+    # The error must point at the in-place spelling that now exists, not at
+    # `sort(rebuild_csc=True)` (which is what it said before F9).
+    with pytest.raises(ValueError, match="output=None"):
+        pyscx.build_csc(str(src), str(src), force=True)
+
+
+def test_build_csc_in_place_default(small_adata, tmp_path):
+    """F9: `output=None` (the default) adds the sidecar to `input` in place.
+
+    The CSC store is a sidecar *on* a file everywhere it is documented, and the
+    neighbouring in-place ops (`obs_import` / `doublet_import` /
+    `cellbender_import`) all mutate — so requiring a distinct `output` read as a
+    missing argument rather than a design choice.
+    """
+    import pyscx
+
+    src = tmp_path / "csr_only.scx"
+    pyscx.from_anndata(small_adata, str(src))
+    # Anti-vacuous: no sidecar to begin with.
+    assert pyscx.open(str(src)).has_csc is False
+
+    before = pyscx.accel.col_sums(
+        pyscx.open(str(src)).to_anndata(backed=True).X, prefer_format="csr"
+    )
+
+    pyscx.build_csc(str(src), csc_cols_per_shard=4)
+
+    # Same path now carries the sidecar, and the axes are unchanged.
+    exp = pyscx.open(str(src))
+    assert exp.has_csc is True
+    assert (exp.n_obs, exp.n_vars) == (small_adata.n_obs, small_adata.n_vars)
+
+    # No staging file left beside the target.
+    assert not list(tmp_path.glob("*.tmp")), "in-place build_csc leaked a temp file"
+
+    # CSC-direct now works on the rebuilt file and agrees with the CSR path.
+    adata = exp.to_anndata(backed=True)
+    np.testing.assert_allclose(
+        pyscx.accel.col_sums(adata.X, prefer_format="csc"), before, atol=1e-9
+    )
+
+
+def test_build_csc_in_place_rejects_force(small_adata, tmp_path):
+    """`force` overwrites an `output`; there is none in the in-place form.
+
+    Refused rather than ignored — accepting it silently would imply a guard
+    that does not exist.
+    """
+    import pyscx
+
+    src = tmp_path / "csr_only.scx"
+    pyscx.from_anndata(small_adata, str(src))
+
+    with pytest.raises(ValueError, match="force"):
+        pyscx.build_csc(str(src), force=True)
+
+    # A rejected call must not have half-run.
+    assert pyscx.open(str(src)).has_csc is False
+
 
 def test_build_csc_rejects_multimodal(tmp_path):
     """build_csc is not modality-aware; a multimodal input is rejected."""

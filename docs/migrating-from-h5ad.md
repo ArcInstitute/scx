@@ -381,10 +381,17 @@ If you converted without `--csc` / `csc=`, you can build the sidecar later. See
 [docs/sharding.md § CSC sharding](sharding.md#csc-sharding) for layout details.
 
 ```bash
+# In place (temp file + atomic rename — a failure leaves data.scx intact)
+scx build-csc data.scx --memory-limit 8G
+
+# Or write a copy, leaving the input alone
 scx build-csc data.scx data_with_csc.scx --memory-limit 8G
 ```
 
 ```python
+pyscx.build_csc("data.scx", memory_limit="8G", csc_cols_per_shard=10000)
+
+# Or copy out:
 pyscx.build_csc("data.scx", "data_with_csc.scx",
                 memory_limit="8G", csc_cols_per_shard=10000)
 ```

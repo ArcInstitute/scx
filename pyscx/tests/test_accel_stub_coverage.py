@@ -63,6 +63,10 @@ def test_user_facing_accelerators_have_stubs():
         # pinned here so the stub cannot be dropped again.
         "pdex_nb_glm",
         "rank_genes_groups_df",
+        # F8: carries the `sample_cols=` / `sample_key=` aliases and the
+        # rank_genes_groups role contrast in its docstring — the stub is where a
+        # user's editor surfaces both, so it must not be dropped.
+        "pseudobulk_dex",
     }
     missing = sorted(required - _stub_names())
     assert not missing, f"user-facing accelerators missing type stubs in accel.pyi: {missing}"

@@ -3,12 +3,48 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use scx_engine::QueryPipeline;
+use scx_engine::{ConversionPredicateIndexOptions, ConversionPredicateIndexResult, QueryPipeline};
 use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::FramingConfig;
+
+/// Render a completed predicate-index build: the per-column outcomes through
+/// the shared `merge` / `append` / `compact` renderer (so a missing preset
+/// column reads identically across all four ops), then a summary of what was
+/// actually indexed — mirroring `scx sort`'s line.
+// Takes the result by value because `ConversionPredicateIndexResult` is not
+// `Clone` and `PredicateIndexBuildSummary` owns its copy. Both callers are done
+// with it by this point (provenance is written before `finish()`).
+fn report_index_outcome(index_result: Option<ConversionPredicateIndexResult>) {
+    if index_result.is_none() {
+        return;
+    }
+    // `multimodal_skip` is None on both subset paths: the predicate-index
+    // sections are unimodal-only and both outputs are single-modality files.
+    let summary = scx_ops::PredicateIndexBuildSummary {
+        result: index_result,
+        multimodal_skip: None,
+    };
+    crate::index_warnings::emit_index_summary("subset", &summary);
+    let result = summary
+        .result
+        .as_ref()
+        .expect("populated from the early-return guard above");
+    if !result.obs_indexed_columns.is_empty() {
+        println!(
+            "  indexed obs columns: {}",
+            result.obs_indexed_columns.join(", ")
+        );
+    }
+    if !result.var_indexed_columns.is_empty() {
+        println!(
+            "  indexed var columns: {}",
+            result.var_indexed_columns.join(", ")
+        );
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_subset(
@@ -23,6 +59,7 @@ pub fn run_subset(
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
     csc_memory_limit: &str,
+    index_options: &ConversionPredicateIndexOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Pure modality extraction (no filter / no genes). The output is a
     // single-modality v2 file containing just the chosen modality's
@@ -54,6 +91,7 @@ pub fn run_subset(
             rebuild_csc,
             csc_cols_per_shard,
             csc_memory_limit,
+            index_options,
         );
     }
 
@@ -126,6 +164,16 @@ pub fn run_subset(
         n_output_cells, in_header.n_obs, n_output_genes, in_header.n_vars, output_nnz,
     );
 
+    // Validate any forced `--index-obs` / `--index-var` column against the
+    // schemas the output will actually carry, BEFORE writing — so a typo costs
+    // an error, not a half-written file. Runs on the dry-run path too: the
+    // whole point of `--dry-run` is to learn what a real run would do.
+    scx_ops::predicate_index::validate_forced_columns(
+        index_options,
+        result.obs.schema().as_ref(),
+        result.var.schema().as_ref(),
+    )?;
+
     if dry_run {
         println!("(dry run — no output written)");
         return Ok(());
@@ -147,8 +195,22 @@ pub fn run_subset(
              recompute downstream, or keep the full dataset and subset in Python)"
         );
     }
-    if has_obs_pred_idx || has_var_pred_idx {
-        eprintln!("Warning: predicate indices dropped (invalid after subsetting)");
+    // An input index cannot be carried over verbatim — row / column projection
+    // invalidates every `ShardRange` in it. It CAN be rebuilt against the
+    // output, which is what the `--index-*` flags do; say so, since without a
+    // remedy this warning left "index once, hand out subsets" with no one-step
+    // form (F7). Suppressed when a rebuild was requested — the outcome is
+    // reported instead.
+    if (has_obs_pred_idx || has_var_pred_idx)
+        && !scx_ops::predicate_index::user_wants_index(index_options)
+    {
+        eprintln!(
+            "Warning: predicate indices dropped (their shard ranges are invalid \
+             after subsetting) — query-time `filter_obs` pushdown on {output} \
+             falls back to a full obs scan. Pass --index-obs / --index-var / \
+             --index-preset to rebuild them against the subset.",
+            output = output.map(|p| p.display().to_string()).unwrap_or_default()
+        );
     }
     // CSC sidecars are dropped on subset: row / column projection
     // changes the global index space, so input CSC `indices` arrays
@@ -179,7 +241,7 @@ pub fn run_subset(
         "the input",
     )?;
     let output = output.unwrap();
-    write_subset_scx(
+    let index_result = write_subset_scx(
         output,
         &result,
         shard_size,
@@ -188,9 +250,11 @@ pub fn run_subset(
         gene_indices.as_deref(),
         uns.as_ref(),
         framing,
+        index_options,
     )?;
 
     println!("Wrote {}", output.display());
+    report_index_outcome(index_result);
 
     // Re-emit the CSC sidecar against the projected output. NOT the rewrite
     // `framing` above: under `--codec auto` that carries `decode_target:
@@ -343,6 +407,12 @@ fn resolve_gene_names(
 /// wider than the input file's first-shard encoding still writes a valid file
 /// (B3). `index_dtype` (the file-wide gene-index width) is threaded through so
 /// every shard header agrees with the file header.
+///
+/// Returns the emitted shards' `(row_start, row_end_exclusive)` ranges, in
+/// ascending order — the convention `scx-ops`'s rewrite ops use for
+/// `obs_row_ranges`. Predicate-index builders key `ShardRange.shard_id` to
+/// these **output** CSR shards, so they must come from the write loop rather
+/// than be re-derived from the input's layout.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_csr_shards_auto(
     writer: &mut ScxWriter,
@@ -355,7 +425,7 @@ pub(crate) fn write_csr_shards_auto(
     explicit_codec: Option<scx_codec::CodecId>,
     modality_type: scx_format_io::ModalityType,
     framing: Option<scx_format_io::FramingConfig>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Vec<(u64, u64)>, Box<dyn std::error::Error>> {
     let shard_target = shard_size as usize;
     debug_assert!(shard_target > 0, "shard_size must be greater than 0");
     // `indptr.len() - 1` would underflow on an empty indptr; `saturating_sub`
@@ -364,6 +434,7 @@ pub(crate) fn write_csr_shards_auto(
     let total_rows = indptr.len().saturating_sub(1);
     let mut row_offset = 0usize;
     let mut shard_idx = 0usize;
+    let mut row_ranges: Vec<(u64, u64)> = Vec::new();
     while row_offset < total_rows {
         let shard_rows = std::cmp::min(shard_target, total_rows - row_offset);
         let shard_indptr_start = indptr[row_offset];
@@ -400,10 +471,11 @@ pub(crate) fn write_csr_shards_auto(
         )?;
         writer.write_preencoded_shard(pre)?;
 
+        row_ranges.push((row_offset as u64, (row_offset + shard_rows) as u64));
         row_offset += shard_rows;
         shard_idx += 1;
     }
-    Ok(())
+    Ok(row_ranges)
 }
 
 /// `scx subset --modality NAME [--filter ... --genes ...]`.
@@ -430,6 +502,7 @@ fn extract_modality(
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
     csc_memory_limit: &str,
+    index_options: &ConversionPredicateIndexOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::array::Array;
 
@@ -571,6 +644,16 @@ fn extract_modality(
         );
     }
 
+    // Validate any forced `--index-obs` / `--index-var` column against the
+    // schemas the output will actually carry, BEFORE writing — so a typo costs
+    // an error, not a half-written file. Runs on the dry-run path too: the
+    // whole point of `--dry-run` is to learn what a real run would do.
+    scx_ops::predicate_index::validate_forced_columns(
+        index_options,
+        filtered_obs.schema().as_ref(),
+        projected_var.schema().as_ref(),
+    )?;
+
     if dry_run {
         println!("(dry run — no output written)");
         return Ok(());
@@ -599,7 +682,7 @@ fn extract_modality(
     writer.write_obs(&filtered_obs)?;
     writer.write_var(&projected_var)?;
 
-    write_csr_shards_auto(
+    let output_shard_row_ranges = write_csr_shards_auto(
         &mut writer,
         &projected_csr.indptr,
         &projected_csr.indices,
@@ -621,7 +704,24 @@ fn extract_modality(
         writer.write_uns(u)?;
     }
 
-    let (action, params) = if is_pure_extract {
+    // Predicate indexes (F7). Safe to write here even though the *input* is
+    // multimodal: the output is a single-modality v2 file, and it is the output
+    // being unimodal that the predicate-index sections require (see
+    // `PredicateIndexBuildSummary::multimodal_skip`).
+    let index_result = if scx_ops::predicate_index::user_wants_index(index_options) {
+        Some(scx_engine::build_and_write_conversion_predicate_indexes(
+            &mut writer,
+            &filtered_obs,
+            &projected_var,
+            &output_shard_row_ranges,
+            n_vars_out as usize,
+            index_options,
+        )?)
+    } else {
+        None
+    };
+
+    let (action, mut params) = if is_pure_extract {
         (
             "modality_extract",
             serde_json::json!({ "modality": modality_name }),
@@ -636,6 +736,13 @@ fn extract_modality(
             }),
         )
     };
+    if let Some(ref result) = index_result {
+        params["predicate_index"] = serde_json::json!({
+            "obs_columns": result.obs_indexed_columns,
+            "var_columns": result.var_indexed_columns,
+            "preset": index_options.index_preset,
+        });
+    }
     writer.write_provenance(vec![scx_format_io::ProvenanceEntry {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -657,6 +764,7 @@ fn extract_modality(
     } else {
         println!("Wrote {}", output.display());
     }
+    report_index_outcome(index_result);
 
     if rebuild_csc {
         // See the note on the sibling site above: the rewrite framing would
@@ -679,7 +787,8 @@ fn write_subset_scx(
     gene_indices: Option<&[u32]>,
     uns: Option<&serde_json::Value>,
     framing: Option<FramingConfig>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    index_options: &ConversionPredicateIndexOptions,
+) -> Result<Option<ConversionPredicateIndexResult>, Box<dyn std::error::Error>> {
     let n_obs = result.x.n_rows() as u64;
     let n_vars = result.x.n_cols() as u64;
 
@@ -702,7 +811,7 @@ fn write_subset_scx(
     // Write X as row-major shards. Value encoding is auto-detected per shard
     // from the projected f32 values (so retained values wider than the input
     // file's first-shard encoding are handled — B3).
-    write_csr_shards_auto(
+    let output_shard_row_ranges = write_csr_shards_auto(
         &mut writer,
         &result.x.indptr,
         &result.x.indices,
@@ -720,18 +829,49 @@ fn write_subset_scx(
         writer.write_uns(uns_data)?;
     }
 
-    // Build provenance params
-    let mut params = String::from("{");
+    // Predicate indexes (F7): built against the *subset* obs/var and the shard
+    // ranges just emitted, so `ShardRange.shard_id` addresses output shards.
+    // Both batches are already in memory here (the query engine assembled
+    // them), so the eager builder is the right entry point — no re-read.
+    // Requested only via an explicit `--index-*` flag, matching `merge` /
+    // `compact` / `sort`; `user_wants_index` also treats a non-zero
+    // `--index-auto-threshold` as a request.
+    let index_result = if scx_ops::predicate_index::user_wants_index(index_options) {
+        Some(scx_engine::build_and_write_conversion_predicate_indexes(
+            &mut writer,
+            &result.obs,
+            &result.var,
+            &output_shard_row_ranges,
+            n_vars as usize,
+            index_options,
+        )?)
+    } else {
+        None
+    };
+
+    // Build provenance params. `serde_json` rather than hand-rolled string
+    // concatenation so the added `predicate_index` key cannot desync the
+    // comma placement (and so a filter expression containing a quote is
+    // escaped by the serializer rather than by hand).
+    let mut params = serde_json::Map::new();
     if let Some(f) = filter_expr {
-        params.push_str(&format!("\"filter\":\"{}\"", f.replace('\"', "\\\"")));
+        params.insert("filter".to_string(), serde_json::json!(f));
     }
     if let Some(genes) = gene_indices {
-        if filter_expr.is_some() {
-            params.push(',');
-        }
-        params.push_str(&format!("\"n_genes\":{}", genes.len()));
+        params.insert("n_genes".to_string(), serde_json::json!(genes.len()));
     }
-    params.push('}');
+    // Record which columns were actually indexed, mirroring the convert /
+    // compact / sort entries, so a query-ready subset is self-describing.
+    if let Some(ref result) = index_result {
+        params.insert(
+            "predicate_index".to_string(),
+            serde_json::json!({
+                "obs_columns": result.obs_indexed_columns,
+                "var_columns": result.var_indexed_columns,
+                "preset": index_options.index_preset,
+            }),
+        );
+    }
 
     // Write provenance
     writer.write_provenance(vec![scx_format_io::ProvenanceEntry {
@@ -741,12 +881,12 @@ fn write_subset_scx(
             .as_secs() as i64,
         action: "subset".to_string(),
         tool: format!("scx-cli {}", env!("CARGO_PKG_VERSION")),
-        params_json: params,
+        params_json: serde_json::Value::Object(params).to_string(),
         input_checksums: vec![],
     }])?;
 
     writer.finish()?;
-    Ok(())
+    Ok(index_result)
 }
 
 #[cfg(test)]
@@ -754,6 +894,60 @@ mod tests {
     use super::*;
     use crate::test_utils::write_test_file;
     use scx_codec::{CodecId, ValueEncoding};
+
+    /// No `--index-*` flag was passed: `index_auto_threshold: 0` disables
+    /// auto-detection too, so `user_wants_index` is false and the output carries
+    /// no predicate-index sections. This is the CLI default.
+    fn no_index() -> ConversionPredicateIndexOptions {
+        ConversionPredicateIndexOptions {
+            index_obs: Vec::new(),
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 0,
+        }
+    }
+
+    /// `--index-obs a,b` (and optionally `--index-var`).
+    fn forced_index(obs: &[&str], var: &[&str]) -> ConversionPredicateIndexOptions {
+        ConversionPredicateIndexOptions {
+            index_obs: obs.iter().map(|s| s.to_string()).collect(),
+            index_var: var.iter().map(|s| s.to_string()).collect(),
+            index_preset: None,
+            index_auto_threshold: 0,
+        }
+    }
+
+    /// Names of the columns an on-disk obs predicate index actually covers.
+    /// Reads the section back rather than trusting the build summary, so the
+    /// assertions below are about the file a user would query.
+    fn indexed_obs_columns(path: &std::path::Path) -> Vec<String> {
+        let reader = ScxReader::open(path).unwrap();
+        let Some(bytes) = reader.read_obs_predicate_index_bytes().unwrap() else {
+            return Vec::new();
+        };
+        predicate_index_columns(bytes)
+    }
+
+    fn indexed_var_columns(path: &std::path::Path) -> Vec<String> {
+        let reader = ScxReader::open(path).unwrap();
+        let Some(bytes) = reader.read_var_predicate_index_bytes().unwrap() else {
+            return Vec::new();
+        };
+        predicate_index_columns(bytes)
+    }
+
+    fn predicate_index_columns(bytes: &[u8]) -> Vec<String> {
+        let index =
+            scx_engine::PredicateIndex::read_from(&mut std::io::Cursor::new(bytes)).unwrap();
+        index
+            .columns
+            .iter()
+            .map(|c| match c {
+                scx_engine::index::IndexedColumn::Categorical(cat) => cat.column_name.clone(),
+                scx_engine::index::IndexedColumn::Numeric(num) => num.column_name.clone(),
+            })
+            .collect()
+    }
 
     /// Write a gene index file for testing.
     fn write_gene_file(dir: &tempfile::TempDir, indices: &[u32]) -> std::path::PathBuf {
@@ -849,6 +1043,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -888,6 +1083,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -918,6 +1114,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -947,6 +1144,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -976,6 +1174,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -1003,6 +1202,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
         // Should succeed without writing any file
@@ -1026,6 +1226,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         );
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
@@ -1050,6 +1251,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         );
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
@@ -1082,6 +1284,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -1109,6 +1312,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         );
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
@@ -1175,6 +1379,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -1294,6 +1499,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -1341,6 +1547,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -1376,6 +1583,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -1419,6 +1627,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -1454,6 +1663,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .unwrap();
 
@@ -1581,6 +1791,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .expect("subset must succeed (pre-fix this returned `out of range for uint16`)");
 
@@ -1627,6 +1838,7 @@ mod tests {
             false,
             5000,
             "4G",
+            &no_index(),
         )
         .expect("0-row subset must not panic or error");
 
@@ -1634,5 +1846,376 @@ mod tests {
         assert_eq!(reader.header().n_obs, 0, "no rows should match");
         let csr = reader.read_all_csr_shards().unwrap();
         assert_eq!(csr.indptr.last().copied().unwrap_or(0), 0, "empty matrix");
+    }
+
+    // -----------------------------------------------------------------------
+    // F7 — `--index-obs` / `--index-var` / `--index-preset` on the subset output
+    // -----------------------------------------------------------------------
+
+    /// The pair that matters: the same fixture and the same predicate, once
+    /// without any `--index-*` flag and once with one. Only the contrast is
+    /// evidence — asserting presence alone would also pass on a build that
+    /// wrote an index unconditionally, and asserting absence alone would pass
+    /// on a build that never writes one.
+    #[test]
+    fn test_subset_index_obs_is_written_only_when_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 9, 5);
+
+        let without = dir.path().join("no_index.scx");
+        run_subset(
+            &input,
+            Some(without.as_path()),
+            Some("cell_type == 'T cell'"),
+            None,
+            None,
+            false,
+            10000,
+            "auto",
+            false,
+            5000,
+            "4G",
+            &no_index(),
+        )
+        .unwrap();
+        assert!(
+            indexed_obs_columns(&without).is_empty(),
+            "no --index-* flag must leave the subset without predicate indexes \
+             (parity with merge / compact / sort)"
+        );
+
+        let with = dir.path().join("with_index.scx");
+        run_subset(
+            &input,
+            Some(with.as_path()),
+            Some("cell_type == 'T cell'"),
+            None,
+            None,
+            false,
+            10000,
+            "auto",
+            false,
+            5000,
+            "4G",
+            &forced_index(&["cell_type"], &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            indexed_obs_columns(&with),
+            vec!["cell_type".to_string()],
+            "--index-obs cell_type must write an obs predicate index covering it"
+        );
+    }
+
+    /// A `--genes` projection re-keys the gene axis, so a var index must be
+    /// built against the *projected* var — not carried over from the input.
+    #[test]
+    fn test_subset_index_var_keyed_to_projected_genes() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 6, 5);
+        let gene_file = write_gene_file(&dir, &[0, 2]);
+        let output = dir.path().join("var_indexed.scx");
+
+        run_subset(
+            &input,
+            Some(output.as_path()),
+            None,
+            Some(gene_file.as_path()),
+            None,
+            false,
+            10000,
+            "auto",
+            false,
+            5000,
+            "4G",
+            &forced_index(&[], &["gene_id"]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            indexed_var_columns(&output),
+            vec!["gene_id".to_string()],
+            "--index-var must write a var predicate index"
+        );
+
+        // The index must describe the 2 retained genes, not the input's 5.
+        let reader = ScxReader::open(&output).unwrap();
+        let bytes = reader.read_var_predicate_index_bytes().unwrap().unwrap();
+        let index =
+            scx_engine::PredicateIndex::read_from(&mut std::io::Cursor::new(bytes)).unwrap();
+        let scx_engine::index::IndexedColumn::Categorical(cat) = &index.columns[0] else {
+            panic!("gene_id is a string column, so it must index as categorical");
+        };
+        let values: Vec<&str> = cat.entries.iter().map(|e| e.value.as_str()).collect();
+        assert_eq!(
+            values,
+            vec!["gene_0", "gene_2"],
+            "the var index must cover the projected genes only"
+        );
+    }
+
+    /// `ShardRange.shard_id` addresses **output** CSR shards, so the ranges fed
+    /// to the builder have to come from the write loop. A single-shard output
+    /// cannot distinguish a correct id from a hardcoded 0, so force two.
+    #[test]
+    fn test_subset_index_shard_ranges_follow_output_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        // 9 rows, every 3rd is "T cell" -> 3 retained rows; shard_size 2 splits
+        // them across 2 output shards.
+        let input = write_test_file(&dir, 9, 5);
+        let output = dir.path().join("multishard_index.scx");
+
+        run_subset(
+            &input,
+            Some(output.as_path()),
+            Some("cell_type == 'T cell'"),
+            None,
+            None,
+            false,
+            2,
+            "auto",
+            false,
+            5000,
+            "4G",
+            &forced_index(&["cell_id"], &[]),
+        )
+        .unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+        let n_csr_shards = reader.catalog().shards(SectionType::CsrShard).len();
+        assert!(
+            n_csr_shards >= 2,
+            "fixture precondition: shard_size=2 must produce >=2 output shards, got {n_csr_shards}"
+        );
+
+        let bytes = reader.read_obs_predicate_index_bytes().unwrap().unwrap();
+        let index =
+            scx_engine::PredicateIndex::read_from(&mut std::io::Cursor::new(bytes)).unwrap();
+        let scx_engine::index::IndexedColumn::Categorical(cat) = &index.columns[0] else {
+            panic!("cell_id is a string column");
+        };
+        // Every referenced shard id must be a real output shard, and the set
+        // must span more than one — proving the ranges track the write loop
+        // rather than collapsing onto shard 0.
+        let mut seen: Vec<u32> = cat
+            .entries
+            .iter()
+            .flat_map(|e| e.shard_ranges.iter().map(|r| r.shard_id))
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert!(
+            seen.iter().all(|&id| (id as usize) < n_csr_shards),
+            "shard ids {seen:?} must all address output CSR shards (n={n_csr_shards})"
+        );
+        assert!(
+            seen.len() >= 2,
+            "the 3 retained cells span 2 output shards, so the index must \
+             reference both; got {seen:?}"
+        );
+    }
+
+    /// A typo'd forced column must fail before anything is written — that is
+    /// what the upfront `validate_forced_columns` call buys over the engine's
+    /// post-write `ForcedColumnError` outcome.
+    #[test]
+    fn test_subset_missing_forced_index_column_errors_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 9, 5);
+        let output = dir.path().join("never_written.scx");
+
+        let err = run_subset(
+            &input,
+            Some(output.as_path()),
+            Some("cell_type == 'T cell'"),
+            None,
+            None,
+            false,
+            10000,
+            "auto",
+            false,
+            5000,
+            "4G",
+            &forced_index(&["nonexistent_column"], &[]),
+        );
+        assert!(err.is_err(), "a missing --index-obs column must error");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("nonexistent_column"),
+            "the error must name the missing column, got: {msg}"
+        );
+        assert!(
+            !output.exists(),
+            "the output must not exist after a rejected --index-obs column"
+        );
+    }
+
+    /// Same check on `--dry-run`: learning what a real run would do is the
+    /// point of the flag, so the column typo has to surface there too.
+    #[test]
+    fn test_subset_dry_run_validates_forced_index_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 9, 5);
+
+        let err = run_subset(
+            &input,
+            None,
+            Some("cell_type == 'T cell'"),
+            None,
+            None,
+            true,
+            10000,
+            "auto",
+            false,
+            5000,
+            "4G",
+            &forced_index(&["nonexistent_column"], &[]),
+        );
+        assert!(
+            err.is_err(),
+            "--dry-run must report a bad --index-obs column rather than \
+             reporting success and failing on the real run"
+        );
+        assert!(format!("{}", err.unwrap_err()).contains("nonexistent_column"));
+
+        // Control: the same dry run with a valid column still succeeds.
+        run_subset(
+            &input,
+            None,
+            Some("cell_type == 'T cell'"),
+            None,
+            None,
+            true,
+            10000,
+            "auto",
+            false,
+            5000,
+            "4G",
+            &forced_index(&["cell_type"], &[]),
+        )
+        .unwrap();
+    }
+
+    /// `--modality NAME` writes a single-modality output, which is exactly the
+    /// condition the predicate-index sections require — so the extraction path
+    /// can index too, even though its *input* is multimodal.
+    #[test]
+    fn test_subset_modality_extract_writes_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_multimodal_test_file(&dir, None, None);
+        let output = dir.path().join("rna_indexed.scx");
+
+        run_subset(
+            &input,
+            Some(output.as_path()),
+            None,
+            None,
+            Some("rna"),
+            false,
+            10000,
+            "none",
+            false,
+            5000,
+            "4G",
+            &forced_index(&["cell_type"], &[]),
+        )
+        .unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+        assert!(!reader.is_multimodal(), "output is single-modality v2");
+        drop(reader);
+        assert_eq!(
+            indexed_obs_columns(&output),
+            vec!["cell_type".to_string()],
+            "a modality extraction must be able to carry a predicate index"
+        );
+    }
+
+    /// `--index-auto-threshold N` **alone**, with no forced column and no
+    /// preset, must still build an index.
+    ///
+    /// Worth its own test because this exact combination was historically a
+    /// silent no-op on `compact` (its `user_wants_index` call site carries a
+    /// comment recording the bug). `subset` routes through the same helper, so
+    /// pin the behaviour here rather than inherit it on trust.
+    #[test]
+    fn test_subset_index_auto_threshold_alone_builds_an_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 9, 5);
+        let output = dir.path().join("auto_threshold.scx");
+
+        run_subset(
+            &input,
+            Some(output.as_path()),
+            Some("cell_type == 'T cell'"),
+            None,
+            None,
+            false,
+            10000,
+            "auto",
+            false,
+            5000,
+            "4G",
+            &ConversionPredicateIndexOptions {
+                index_obs: Vec::new(),
+                index_var: Vec::new(),
+                index_preset: None,
+                index_auto_threshold: 100,
+            },
+        )
+        .unwrap();
+
+        let columns = indexed_obs_columns(&output);
+        assert!(
+            !columns.is_empty(),
+            "--index-auto-threshold alone must auto-detect low-cardinality obs \
+             columns, not silently no-op"
+        );
+        assert!(
+            columns.iter().any(|c| c == "cell_type"),
+            "cell_type is low-cardinality and should be auto-detected; got {columns:?}"
+        );
+    }
+
+    /// The indexed columns are recorded in provenance, mirroring convert /
+    /// compact / sort, so a query-ready subset is self-describing.
+    #[test]
+    fn test_subset_records_indexed_columns_in_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 9, 5);
+        let output = dir.path().join("prov_index.scx");
+
+        run_subset(
+            &input,
+            Some(output.as_path()),
+            Some("cell_type == 'T cell'"),
+            None,
+            None,
+            false,
+            10000,
+            "auto",
+            false,
+            5000,
+            "4G",
+            &forced_index(&["cell_type"], &[]),
+        )
+        .unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+        let prov = reader.read_provenance().unwrap();
+        let entry = prov
+            .operations
+            .iter()
+            .find(|e| e.action == "subset")
+            .expect("subset must record a provenance entry");
+        let params: serde_json::Value = serde_json::from_str(&entry.params_json).unwrap();
+        assert_eq!(
+            params["predicate_index"]["obs_columns"],
+            serde_json::json!(["cell_type"]),
+            "provenance must record which obs columns were indexed; got {}",
+            entry.params_json
+        );
+        // The pre-existing keys must survive the switch to serde_json.
+        assert_eq!(params["filter"], "cell_type == 'T cell'");
     }
 }

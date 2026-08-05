@@ -272,6 +272,13 @@ scx append atlas.scx new_batch.scx --shard-size 5000
 # Extract T cells with a custom shard size in the output file
 scx subset experiment.scx t_cells.scx \
     --filter "cell_type == 'T cell'" --shard-size 8000
+
+# Keep the subset query-ready: the input's predicate index cannot be carried
+# over (row/column projection invalidates its shard ranges), so rebuild it
+# against the output. Without an --index-* flag the subset has no predicate
+# index and `filter_obs` pushdown falls back to a full obs scan.
+scx subset experiment.scx t_cells.scx \
+    --filter "cell_type == 'T cell'" --index-preset cellxgene
 ```
 
 ### Inspecting shard information
@@ -796,12 +803,13 @@ per shard**. Pass `0` for no cap (single CSC shard, memory permitting
 `--memory-limit` budget).
 
 To add a CSC sidecar to a file you already have, use the standalone
-`pyscx.build_csc(input, output, memory_limit="4G", force=False,
-csc_cols_per_shard=5000)` — the Python equivalent of `scx build-csc`. It
-reads `input`'s CSR shards and writes both the CSR shards and the new CSC
-sidecar to `output`. For an in-place rebuild use
-`pyscx.sort(..., rebuild_csc=True)`; to emit the sidecar at write time use
-`pyscx.from_anndata(..., csc="always")`.
+`pyscx.build_csc(input, output=None, memory_limit="4G", force=False,
+csc_cols_per_shard=5000)` — the Python equivalent of `scx build-csc`. It reads
+`input`'s CSR shards and re-emits them alongside the new CSC sidecar.
+`output=None` (the default) does that **in place** via a temp file + atomic
+rename; passing a path writes a copy and leaves `input` alone. `force` applies
+only to the copy-out form. Either form preserves the input's row-group framing.
+To emit the sidecar at write time use `pyscx.from_anndata(..., csc="always")`.
 
 ### Why multi-shard CSC
 
@@ -846,9 +854,10 @@ The sidecar moves through four stages over a file's life:
 
 1. **Creation.** At conversion time via the `csc` policy (`auto` / `always`
    on `pyscx.from_anndata` / `from_h5ad` / `from_10x` / `scx convert`), or
-   after the fact with `scx build-csc input.scx output.scx`. Both paths run
-   the memory-bounded streaming CSR→CSC transpose and set the `has_csc`
-   header flag.
+   after the fact with `scx build-csc input.scx` (in place) or
+   `scx build-csc input.scx output.scx` (copy out). All paths run the
+   memory-bounded streaming CSR→CSC transpose and set the `has_csc` header
+   flag.
 2. **Consumption.** Column algorithms opt into the sidecar with
    `prefer_format="csc"` (CPU) or, for GPU `pdex_ref` / `rank_genes_groups`,
    the `gpu_csc_v3` route (the default GPU DE route when a CSC sidecar is

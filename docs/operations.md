@@ -7,19 +7,36 @@ details, see [docs/format.md](format.md). For sharding details, see
 
 ## Operations Matrix
 
-| Operation | Matrix shards | Obs metadata | Var metadata | CSC sidecar | Predicate indexes |
-|-----------|---------------|--------------|--------------|-------------|-------------------|
-| **append** | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows |
-| **delete** (`mark_deleted`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged |
-| **modify_metadata** / **set_uns** | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`) | Replaced if supplied (same `n_vars`) | **Preserved** | Dropped for the replaced obs/var axis unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild; untouched otherwise |
-| **compact** | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **optimize** | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | **Preserved** (rows + shard boundaries unchanged) |
-| **merge** | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **subset** | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** (rebuild via `scx convert --index-obs ...` on the output) |
-| **sort** | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **sort `--shuffle`** | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them |
-| **cellbender-import** (`attach_external_layer`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | **Preserved** (only columns are added; CSR shard ranges are untouched, and the index carries no schema hash) |
-| **rollback** | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored |
+The **Writes** column is the one worth reading first: it says whether an
+operation mutates its input or produces a separate file, which determines
+whether you need an `<OUTPUT>` argument at all. Every in-place op stages a temp
+file and `rename`s it over the target, so an interrupted run leaves the input
+intact.
+
+In-place does **not** imply undoable. `scx rollback` works only on the ops that
+commit through the manifest chain (`prepare_in_place` / `commit_in_place`) and so
+leave the previous catalog in the file — the import ops, `delete`,
+`modify_metadata` / `set_uns`, `append`. **`build-csc --in-place` is not among
+them**: it stages a wholly new file via `run_build_csc` and renames it over the
+target, carrying no prior catalog, so a subsequent `scx rollback` fails with
+`no previous catalog available for rollback`. Copy out first if you want a way
+back.
+
+| Operation | Writes | Matrix shards | Obs metadata | Var metadata | CSC sidecar | Predicate indexes |
+|-----------|--------|---------------|--------------|--------------|-------------|-------------------|
+| **append** | In place (`<TARGET> <SOURCE>`) | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows |
+| **delete** (`mark_deleted`) | In place (`<FILE>`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged |
+| **modify_metadata** / **set_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`) | Replaced if supplied (same `n_vars`) | **Preserved** | Dropped for the replaced obs/var axis unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild; untouched otherwise |
+| **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | **Preserved** (rows + shard boundaries unchanged) |
+| **merge** | New file (`<OUTPUT>` required) | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **subset** | New file (`<OUTPUT>` required, optional with `--dry-run`) | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **sort** | New file (`<OUTPUT>` required) | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **sort `--shuffle`** | New file (`<OUTPUT>` required) | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them |
+| **build-csc** | In place, or a new file with `<OUTPUT>` | **Re-emitted** (not re-encoded or canonicalized); row-group framing is preserved from the input | **Preserved** | **Preserved** | **Built** (this is the op that creates it) | **Dropped** (not carried by either form) |
+| **obs-import** / **doublet-import** | In place (`<FILE> <SOURCE>`) | **Unchanged** (never read or rewritten) | Replaced (same `n_obs`, plus the new columns) | **Preserved** | **Preserved** (X untouched) | **Preserved** on a pure column *add*; dropped only when `--overwrite` rewrites an indexed column (`obs_index_would_go_stale` decides) |
+| **cellbender-import** (`attach_external_layer`) | In place (`<FILE> <CELLBENDER_H5>`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | **Preserved** (only columns are added; CSR shard ranges are untouched, and the index carries no schema hash) |
+| **rollback** | In place (`<FILE>`) | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored |
 
 ### Restoring CSC after a mutating operation
 
@@ -32,17 +49,27 @@ log::warn!("append dropped 1 CSC shards from experiment.scx: rerun `scx build-cs
 To restore:
 
 ```bash
-# Standalone rebuild — writes a new file with CSR + CSC shards
+# Standalone rebuild, in place — omit <OUTPUT>. Staged via a temp file +
+# atomic rename, so a failure leaves experiment.scx untouched.
+scx build-csc experiment.scx
+
+# Or write a copy, leaving the input alone
 scx build-csc experiment.scx experiment_with_csc.scx
 
 # Or pass --rebuild-csc to the mutating operation
 scx compact experiment.scx compacted.scx --rebuild-csc
 ```
 
-The Python API exposes `pyscx.build_csc(input, output, memory_limit="4G", force=False, csc_cols_per_shard=5000)`
-for standalone rebuilds. Alternatively, set `csc="always"` at conversion time
+The Python API exposes `pyscx.build_csc(input, output=None, memory_limit="4G", force=False, csc_cols_per_shard=5000)`
+for standalone rebuilds — `output=None` (the default) rebuilds in place, and a
+path writes a copy. Alternatively, set `csc="always"` at conversion time
 via `pyscx.from_anndata(..., csc="always")` to emit the sidecar during the
 initial write, or pass `rebuild_csc=True` to mutating operations like `pyscx.sort(..., rebuild_csc=True)`.
+
+Either form preserves the input's row-group framing: a framed (v4) input yields
+a framed output. Both derive it from `scx_ops::framing_for_csc_rebuild`, which
+is the only correct source — see the note on `rebuild_csc_inplace` for why both
+`None` and a `decode_target`-carrying `FramingConfig` are wrong here.
 
 ## Append Complexity
 

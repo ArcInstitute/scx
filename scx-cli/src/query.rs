@@ -406,7 +406,12 @@ fn write_query_result(
     // whose values are wider than any single source shard's encoding is
     // written losslessly, and normalize/log1p float results auto-route to
     // Float32.
-    crate::subset::write_csr_shards_auto(
+    //
+    // The returned shard row ranges are discarded: unlike `scx subset`, this
+    // path has no `--index-*` flags, so it writes no predicate index for them
+    // to key. If it grows them, feed these ranges to
+    // `build_and_write_conversion_predicate_indexes` exactly as `subset` does.
+    let _output_shard_row_ranges = crate::subset::write_csr_shards_auto(
         &mut writer,
         &result.x.indptr,
         &result.x.indices,

@@ -674,11 +674,18 @@ def validate(path: Any, deep: bool = ...) -> list[tuple[str, bool]]: ...
 
 def build_csc(
     input: Any,
-    output: Any,
+    output: Any | None = ...,
     memory_limit: str = ...,
     force: bool = ...,
     csc_cols_per_shard: int = ...,
-) -> None: ...
+) -> None:
+    """Add a CSC (column-major) sidecar built from `input`'s CSR shards.
+
+    ``output=None`` (the default) rebuilds `input` **in place** via temp file +
+    atomic rename; pass a path to write a copy instead. ``force`` applies only
+    to the copy-out form and is rejected with ``output=None``.
+    """
+    ...
 
 
 def mark_deleted(path: str, cell_indices: Sequence[int]) -> int:

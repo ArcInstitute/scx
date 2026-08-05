@@ -100,9 +100,9 @@ def highly_variable_genes(
 
 def pseudobulk_dex(
     adata: Any,
-    groupby: list[str],
-    test_col: str,
-    reference: str,
+    groupby: list[str] | None = None,
+    test_col: str | None = None,
+    reference: str | None = None,
     design: str | None = None,
     aggr_method: str = "sum",
     min_cells_per_group: int = 10,
@@ -113,7 +113,25 @@ def pseudobulk_dex(
     n_cpus: int | None = None,
     backend: Literal["pydeseq2", "nb_glm"] = "pydeseq2",
     nbglm_options: dict[str, Any] | None = None,
-) -> Any: ...
+    *,
+    sample_cols: str | list[str] | None = None,
+    sample_key: str | list[str] | None = None,
+) -> Any:
+    """Pseudobulk DE: Rust aggregation + PyDESeq2 or the Rust-native NB-GLM.
+
+    ``groupby`` here is **not** what it is in ``rank_genes_groups``. There (and
+    throughout scanpy) ``groupby`` names the column whose levels are compared;
+    here it names the columns that together define one pseudobulk *sample* —
+    condition **plus** replicate, e.g. ``["disease", "donor_id"]`` — and the
+    compared column is ``test_col``. ``sample_cols=`` and ``sample_key=`` are
+    aliases named for that role; both accept a bare string as well as a list.
+    Pass exactly one of the three.
+
+    ``groupby`` / ``test_col`` / ``reference`` are all semantically required —
+    they are typed optional only because the aliases make ``groupby`` optional
+    and a required positional cannot follow an optional one.
+    """
+    ...
 
 
 def pdex_ref(

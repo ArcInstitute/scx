@@ -1051,32 +1051,38 @@ pub fn shuffle(
 
 /// Build a CSC (column-major) sidecar from an existing file's CSR shards.
 ///
-/// Standalone equivalent of the `scx build-csc` CLI command: reads CSR
-/// shards from `input` and writes both the CSR shards and a freshly built
-/// CSC sidecar to `output`. CSC sidecars are the column-major substrate for
-/// DE / HVG / per-gene QC / pseudobulk and the GPU `pdex_ref` CSC-direct
-/// route.
+/// Standalone equivalent of the `scx build-csc` CLI command. CSC sidecars are
+/// the column-major substrate for DE / HVG / per-gene QC / pseudobulk and the
+/// GPU `pdex_ref` CSC-direct route.
 ///
-/// For an in-place rebuild use `pyscx.sort(..., rebuild_csc=True)`; to emit
-/// a sidecar at write time use `pyscx.from_anndata(..., csc="always")`.
+/// `output=None` (the default) adds the sidecar to `input` **in place**, staged
+/// via a temp file + atomic rename so a failure leaves `input` untouched — the
+/// CSC store is a sidecar *on* a file, which is how the rest of the API
+/// describes it. Pass an `output` path to leave `input` alone and write a copy
+/// carrying CSR + the new CSC shards.
+///
+/// To emit a sidecar at write time use `pyscx.from_anndata(..., csc="always")`.
 ///
 /// Parameters:
 ///   input              — SCX file containing CSR shards.
 ///   output             — destination file (gets CSR + the new CSC shards).
+///                        `None` (default) rebuilds `input` in place.
 ///   memory_limit       — transpose working-set budget; accepts binary-
 ///                        prefixed sizes (`"4G"`, `"512MiB"`). Default "4G".
-///   force              — overwrite `output` if it already exists.
+///   force              — overwrite `output` if it already exists. Rejected
+///                        with `output=None`, which always rewrites `input`.
 ///   csc_cols_per_shard — max columns per emitted CSC shard (0 = single
 ///                        shard, memory permitting). Default 5000.
 ///
 /// Example:
-///     pyscx.build_csc("counts.scx", "counts_csc.scx")
+///     pyscx.build_csc("counts.scx")                      # in place
+///     pyscx.build_csc("counts.scx", "counts_csc.scx")    # copy out
 #[pyfunction]
-#[pyo3(signature = (input, output, memory_limit="4G".to_string(), force=false, csc_cols_per_shard=5000))]
+#[pyo3(signature = (input, output=None, memory_limit="4G".to_string(), force=false, csc_cols_per_shard=5000))]
 pub fn build_csc(
     py: Python<'_>,
     input: &str,
-    output: &str,
+    output: Option<&str>,
     memory_limit: String,
     force: bool,
     csc_cols_per_shard: usize,
@@ -1086,27 +1092,41 @@ pub fn build_csc(
     // two cannot drift.
     scx_format_io::MemoryBudget::parse(&memory_limit).map_err(PyValueError::new_err)?;
     let input_path = PathBuf::from(input);
-    let output_path = PathBuf::from(output);
 
-    // Guard against `input == output`: run_build_csc removes `output` (when
-    // `force`) before opening `input`, so an aliased path would delete the
-    // source and then fail to open it. Compare canonicalized paths when both
-    // resolve, falling back to a literal string compare for a not-yet-created
-    // output.
-    let same_file = match (
-        std::fs::canonicalize(&input_path),
-        std::fs::canonicalize(&output_path),
-    ) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => input_path == output_path,
+    // `output=None` is now the in-place spelling, so an `output` that aliases
+    // `input` is a mistake with an obvious fix rather than an unsupported
+    // operation. (Still an error: `run_build_csc` removes `output` when `force`
+    // before opening `input`, so an aliased path would delete the source.)
+    let output_path = match output {
+        Some(out) => {
+            let output_path = PathBuf::from(out);
+            let same_file = match (
+                std::fs::canonicalize(&input_path),
+                std::fs::canonicalize(&output_path),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => input_path == output_path,
+            };
+            if same_file {
+                return Err(PyValueError::new_err(
+                    "input and output must be different files; pass output=None \
+                     to add the CSC sidecar to `input` in place, or give a \
+                     distinct output path to write a copy",
+                ));
+            }
+            Some(output_path)
+        }
+        // In place, so there is nothing to overwrite. Refuse `force` rather
+        // than ignore it: accepting it silently would imply a guard that does
+        // not exist.
+        None if force => {
+            return Err(PyValueError::new_err(
+                "force=True applies only when writing to an `output` path; \
+                 output=None always rewrites `input`",
+            ));
+        }
+        None => None,
     };
-    if same_file {
-        return Err(PyValueError::new_err(
-            "input and output must be different files; build_csc writes the \
-             CSR + new CSC sidecar to `output` (use a distinct path, or \
-             sort(..., rebuild_csc=True) for an in-place rebuild)",
-        ));
-    }
 
     // `run_build_csc` is not modality-aware — it flattens every CSR shard
     // against the single top-level n_obs × n_vars shape, which would corrupt
@@ -1121,18 +1141,34 @@ pub fn build_csc(
     }
     drop(input_reader);
 
-    // `run_build_csc` returns `Box<dyn Error>` (not `Send`), so stringify the
+    // Framing must come from `framing_for_csc_rebuild` on BOTH arms. Both ends
+    // of the range are wrong (see its contract): `None` strips row-group
+    // framing off a v4 input — via `rewrite_output_format_version(&[4], 1) == 3`
+    // — and a `FramingConfig` carrying `decode_target: Some(_)` would
+    // re-authorise per-shard codec re-selection, the opposite of what a sidecar
+    // rebuild needs.
+    let framing = scx_ops::framing_for_csc_rebuild(&input_path);
+
+    // Both entry points return `Box<dyn Error>` (not `Send`), so stringify the
     // error inside the closure to cross `py.detach`, mirroring sort()'s CSC
     // rebuild path.
     py.detach(|| {
-        scx_ops::run_build_csc(
-            &input_path,
-            &output_path,
-            &memory_limit,
-            force,
-            csc_cols_per_shard,
-            None,
-        )
+        match output_path {
+            Some(output_path) => scx_ops::run_build_csc(
+                &input_path,
+                &output_path,
+                &memory_limit,
+                force,
+                csc_cols_per_shard,
+                framing,
+            ),
+            None => scx_ops::rebuild_csc_inplace(
+                &input_path,
+                csc_cols_per_shard,
+                &memory_limit,
+                framing,
+            ),
+        }
         .map_err(|e| e.to_string())
     })
     .map_err(PyRuntimeError::new_err)?;
