@@ -38,39 +38,52 @@ pub fn determine_convert_direction(
     }
 }
 
-/// Every direction [`determine_convert_direction`] can return.
+/// Every direction [`determine_convert_direction`] can return, paired with
+/// whether it has a streaming (bounded peak-RSS) implementation.
 ///
-/// Single source of truth for the vocabulary. The directions are plain
-/// `&'static str` rather than an enum, so the compiler cannot force a new one
-/// to be classified everywhere it matters; the paired tests below stand in for
-/// that, locking this array to the resolver's image *and* requiring every
-/// member to be classified by [`direction_supports_streaming`]. Adding an
-/// eighth direction fails the first test until this array is updated, which
-/// then fails the second until someone decides whether it streams.
-pub const ALL_CONVERT_DIRECTIONS: [&str; 7] = [
-    "mtx_to_scx",
-    "h5ad_to_scx",
-    "h5mu_to_scx",
-    "tenx_to_scx",
-    "scx_to_mtx",
-    "scx_to_h5ad",
-    "scx_to_h5mu",
+/// Deliberately **one** table rather than a list of names plus a separate
+/// `match`: that way registering a direction *structurally* forces the
+/// streaming decision, because there is no way to add a row without writing
+/// its `bool`. An earlier shape — a names-only array plus a `match` with a
+/// `_ => false` arm — could not do that: a new name simply fell through the
+/// catch-all and was silently classified as non-streaming, and no test could
+/// tell that apart from a deliberate `false`.
+///
+/// `true` = h5ad → scx (Phase 0/1/2), h5mu → scx (Phase 3) and scx → h5ad /
+/// h5mu (Phase 8), which each have a shard-at-a-time path alongside the legacy
+/// materializing one, selected by the resolved `--stream`. `false` = a single
+/// materializing path with nothing to select: `scx-mtx` reads the whole MTX
+/// directory into memory (`read_mtx_directory`), `write_scx_to_mtx` assembles
+/// the whole CSR, and the `tenx_to_scx` dispatch arm never consults the flag.
+///
+/// **Limitation, stated precisely.** Rust cannot reflect over the match arms
+/// of [`determine_convert_direction`], so a new arm there that is never
+/// registered *here* is invisible to this table and to the tests below — they
+/// keep this table and the flag spellings mutually consistent, they do not
+/// detect an unregistered arm. Closing that last gap needs a
+/// `ConvertDirection` enum, which would make every direction guard a
+/// compiler-checked `match`.
+pub const CONVERT_DIRECTIONS: [(&str, bool); 7] = [
+    ("mtx_to_scx", false),
+    ("h5ad_to_scx", true),
+    ("h5mu_to_scx", true),
+    ("tenx_to_scx", false),
+    ("scx_to_mtx", false),
+    ("scx_to_h5ad", true),
+    ("scx_to_h5mu", true),
 ];
 
 /// Whether `direction` has a streaming (bounded peak-RSS) implementation.
 pub fn direction_supports_streaming(direction: &str) -> bool {
-    match direction {
-        // h5ad → scx (Phase 0/1/2), h5mu → scx (Phase 3), and scx → h5ad /
-        // h5mu (Phase 8) each have a shard-at-a-time path alongside the
-        // legacy materializing one, selected by the resolved flag.
-        "h5ad_to_scx" | "h5mu_to_scx" | "scx_to_h5ad" | "scx_to_h5mu" => true,
-        // Single materializing path, so there is nothing to select: scx-mtx
-        // reads the whole MTX directory into memory (`read_mtx_directory`),
-        // `write_scx_to_mtx` assembles the whole CSR, and the `tenx_to_scx`
-        // dispatch arm never consults the flag at all.
-        "mtx_to_scx" | "tenx_to_scx" | "scx_to_mtx" => false,
-        _ => false,
-    }
+    CONVERT_DIRECTIONS
+        .iter()
+        .find_map(|&(name, streams)| (name == direction).then_some(streams))
+        // An unregistered direction is conservatively materializing. This is
+        // reachable only via the limitation documented on CONVERT_DIRECTIONS;
+        // materializing is the safe answer because every direction has a
+        // materializing path, whereas claiming a streaming path that does not
+        // exist would route into a `None` branch downstream.
+        .unwrap_or(false)
 }
 
 /// Resolve the effective streaming mode for `direction`.
@@ -284,12 +297,19 @@ mod tests {
 
     // --- `--stream` resolution -------------------------------------------
     //
-    // The first two tests are the drift lock described on
-    // `ALL_CONVERT_DIRECTIONS`: an eighth direction breaks
-    // `every_direction_is_reachable_from_flags` until the array is updated,
-    // and updating the array then breaks
-    // `streaming_capability_is_total_over_all_directions` until it is
-    // classified. Neither can be silently skipped.
+    // What is enforced where, so the guarantee is not overstated:
+    //
+    //   * That every registered direction has a streaming decision is
+    //     *structural* — `CONVERT_DIRECTIONS` pairs each name with its bool,
+    //     so a row cannot be added without making the call. No test needed.
+    //   * That the table matches the flags users actually type is enforced by
+    //     `every_direction_is_reachable_from_flags` below.
+    //   * That the bools are the *right* bools is pinned by
+    //     `streaming_classification_matches_the_implementations`.
+    //
+    // Not enforced by any of this: a new arm in `determine_convert_direction`
+    // that is never registered in `CONVERT_DIRECTIONS`. Rust cannot reflect
+    // over match arms; that gap needs a `ConvertDirection` enum.
 
     #[test]
     fn every_direction_is_reachable_from_flags() {
@@ -300,30 +320,45 @@ mod tests {
             assert_eq!(got, expected, "--from {from:?} --to {to:?}");
             reached.insert(got);
         }
-        let all: BTreeSet<&str> = ALL_CONVERT_DIRECTIONS.into_iter().collect();
+        let registered: BTreeSet<&str> = CONVERT_DIRECTIONS.iter().map(|&(n, _)| n).collect();
         assert_eq!(
-            reached, all,
-            "ALL_CONVERT_DIRECTIONS must be exactly the set determine_convert_direction returns"
+            reached, registered,
+            "CONVERT_DIRECTIONS must be exactly the set determine_convert_direction returns \
+             for the canonical --from/--to spellings"
         );
     }
 
     #[test]
-    fn streaming_capability_is_total_over_all_directions() {
-        let streaming: BTreeSet<&str> = ALL_CONVERT_DIRECTIONS
-            .into_iter()
-            .filter(|d| direction_supports_streaming(d))
+    fn streaming_classification_matches_the_implementations() {
+        // A value pin, not a totality lock: totality is structural (see the
+        // note above). This catches a bool flipped in the table by mistake.
+        let streaming: BTreeSet<&str> = CONVERT_DIRECTIONS
+            .iter()
+            .filter(|&&(_, streams)| streams)
+            .map(|&(n, _)| n)
             .collect();
         let expected: BTreeSet<&str> = STREAMING_DIRECTIONS.into_iter().collect();
         assert_eq!(
             streaming, expected,
-            "every direction must be classified; a new one defaults to non-streaming, \
-             so decide deliberately and update STREAMING_DIRECTIONS if it streams"
+            "only h5ad/h5mu ↔ scx have a streaming path; if that changed, \
+             update STREAMING_DIRECTIONS deliberately"
         );
     }
 
     #[test]
+    fn direction_supports_streaming_reads_the_table() {
+        for (name, streams) in CONVERT_DIRECTIONS {
+            assert_eq!(direction_supports_streaming(name), streams, "{name}");
+        }
+        // An unregistered direction is conservatively non-streaming rather
+        // than a panic — `direction_supports_streaming` is `pub` and takes an
+        // arbitrary `&str`.
+        assert!(!direction_supports_streaming("zarr_to_scx"));
+    }
+
+    #[test]
     fn resolve_stream_absent_follows_direction() {
-        for direction in ALL_CONVERT_DIRECTIONS {
+        for (direction, _) in CONVERT_DIRECTIONS {
             let expected = STREAMING_DIRECTIONS.contains(&direction);
             assert_eq!(
                 resolve_stream(None, direction).unwrap(),
@@ -335,7 +370,7 @@ mod tests {
 
     #[test]
     fn resolve_stream_explicit_true_rejected_on_non_streaming() {
-        for direction in ALL_CONVERT_DIRECTIONS {
+        for (direction, _) in CONVERT_DIRECTIONS {
             let result = resolve_stream(Some(true), direction);
             if STREAMING_DIRECTIONS.contains(&direction) {
                 assert!(result.unwrap(), "--stream on '{direction}' should stream");
@@ -357,7 +392,7 @@ mod tests {
         // satisfied, so it is a no-op rather than an error. Scripts written
         // against the older CLI (which rejected the *default* `true` and so
         // forced users to pass `--stream=false`) keep working.
-        for direction in ALL_CONVERT_DIRECTIONS {
+        for (direction, _) in CONVERT_DIRECTIONS {
             assert!(
                 !resolve_stream(Some(false), direction).unwrap(),
                 "--stream=false on '{direction}'"

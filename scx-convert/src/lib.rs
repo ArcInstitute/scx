@@ -5,8 +5,7 @@
 
 mod direction;
 pub use direction::{
-    determine_convert_direction, direction_supports_streaming, resolve_stream,
-    ALL_CONVERT_DIRECTIONS,
+    determine_convert_direction, direction_supports_streaming, resolve_stream, CONVERT_DIRECTIONS,
 };
 
 // Per-format ingest/export submodule directories (T5.9): `h5ad/` owns the
