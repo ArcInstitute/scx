@@ -59,6 +59,10 @@ def test_user_facing_accelerators_have_stubs():
         "rank_genes_groups",
         "highly_variable_genes",
         "pdex_ref",
+        # F6: gained a public `output=` kwarg, so it needs a typed surface —
+        # pinned here so the stub cannot be dropped again.
+        "pdex_nb_glm",
+        "rank_genes_groups_df",
     }
     missing = sorted(required - _stub_names())
     assert not missing, f"user-facing accelerators missing type stubs in accel.pyi: {missing}"

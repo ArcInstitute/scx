@@ -475,11 +475,15 @@ def _pdex_pvals_by_gene(df: Any) -> dict[str, dict[str, float]] | None:
     """
     if df is None:
         return None
+    # Narrow on purpose: a missing/renamed column (KeyError) or a non-frame
+    # (TypeError) is the only thing worth degrading to None here. A broad
+    # `except Exception` would re-open the silent-loss hole described above for
+    # any *other* bug in this extractor.
     try:
         targets = list(df["target"])
         features = list(df["feature"])
         pvals = list(df["p_value"])
-    except Exception:
+    except (KeyError, TypeError):
         return None
     out: dict[str, dict[str, float]] = {}
     for tgt, feat, pv in zip(targets, features, pvals):

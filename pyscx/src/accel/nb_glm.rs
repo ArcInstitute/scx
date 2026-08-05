@@ -5,9 +5,10 @@
 //!   * [`nb_glm`] — direct DESeq2-replacement on already-pseudobulked matrices,
 //!     returning a pandas DataFrame with PyDESeq2-style column names.
 //!   * [`pdex_nb_glm`] — pseudobulk-from-AnnData with a replicate stratifier,
-//!     emitting the cell-eval/pdex column schema so `cell-eval-scx` consumes it
-//!     with zero changes (spec §4.4, §10). Defaults to pandas; `output="polars"`
-//!     is the container `cell_eval` itself requires.
+//!     emitting the cell-eval/pdex *column* schema (spec §4.4, §10). The
+//!     container is **not** drop-in for `cell_eval`: this defaults to pandas and
+//!     `cell_eval`'s `DEResults.data` is typed `pl.DataFrame`, so a consumer must
+//!     pass `output="polars"`. See docs/pseudobulk_nb_glm.md.
 //!
 //! `pseudobulk_dex(backend="nb_glm")` also routes through [`fit_targets_pandas`].
 

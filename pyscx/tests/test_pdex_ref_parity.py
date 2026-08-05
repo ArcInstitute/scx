@@ -512,9 +512,13 @@ def test_pdex_ref_defaults_to_pandas():
     # Same column names + order.
     assert list(df_pd.columns) == list(df_pl.columns)
     # Values identical across containers.
+    # check_dtype=False: polars' to_pandas() maps Utf8 to object or
+    # string[pyarrow] depending on version, which is polars' business, not this
+    # assertion's subject (the values).
     pd.testing.assert_frame_equal(
         df_pd.reset_index(drop=True),
         df_pl.to_pandas().reset_index(drop=True),
+        check_dtype=False,
     )
     pd.testing.assert_frame_equal(
         df_default.reset_index(drop=True), df_pd.reset_index(drop=True)

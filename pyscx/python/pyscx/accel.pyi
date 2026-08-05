@@ -134,6 +134,30 @@ def pdex_ref(
 ) -> Any: ...
 
 
+def pdex_nb_glm(
+    adata: Any,
+    groupby: str,
+    reference: str,
+    stratify_by: list[str] | None = None,
+    min_cells_per_group: int = 10,
+    min_cells_per_stratum: int = 50,
+    is_log1p: bool | None = None,
+    nbglm_options: dict[str, Any] | None = None,
+    gene_chunk_size: int | None = None,
+    prefer_format: str = "csr",
+    device: str = "auto",
+    design: str | None = None,
+    output: str = "pandas",
+) -> Any:
+    """Pseudobulk NB-GLM DE in the cell-eval ``DEResults`` column schema.
+
+    ``stratify_by`` is **required** in practice (it forms the pseudobulk
+    replicates) and must be a list, not a bare string. Returns pandas by
+    default; pass ``output="polars"`` for the container ``cell_eval`` consumes.
+    """
+    ...
+
+
 # ---------------------------------------------------------------------------
 # Preprocessing
 # ---------------------------------------------------------------------------

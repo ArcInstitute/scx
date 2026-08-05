@@ -85,12 +85,14 @@ if op == "wilcoxon":
 else:
     df = pyscx.accel.pdex_ref(adata, "grp", reference="a", device="gpu")
     info = adata.uns["scx_accel"]["pdex_ref"]
+    # Iterate the Series directly: `pdex_ref` defaults to pandas, whose
+    # listification is `.tolist()`. Matches test_gpu_de_resident.py.
     payload = {
-        "feature":     [str(v)   for v in df["feature"].to_list()],
-        "p_value":     [float(v) for v in df["p_value"].to_list()],
-        "statistic":   [float(v) for v in df["statistic"].to_list()],
-        "target_mean": [float(v) for v in df["target_mean"].to_list()],
-        "lfc":         [float(v) for v in df["log2_fold_change"].to_list()],
+        "feature":     [str(v)   for v in df["feature"]],
+        "p_value":     [float(v) for v in df["p_value"]],
+        "statistic":   [float(v) for v in df["statistic"]],
+        "target_mean": [float(v) for v in df["target_mean"]],
+        "lfc":         [float(v) for v in df["log2_fold_change"]],
     }
 
 payload["_route"] = info["route"]

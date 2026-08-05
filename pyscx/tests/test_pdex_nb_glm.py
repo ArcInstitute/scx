@@ -107,9 +107,12 @@ def test_pdex_nb_glm_output_polars():
     assert isinstance(df_default, pd.DataFrame)
     assert isinstance(df_pl, pl.DataFrame)
     assert list(df_pl.columns) == CELL_EVAL_COLUMNS
+    # check_dtype=False for the same reason as test_pdex_ref_parity: the
+    # polars->pandas dtype mapping is version-dependent; values are the subject.
     pd.testing.assert_frame_equal(
         df_default.reset_index(drop=True),
         df_pl.to_pandas().reset_index(drop=True),
+        check_dtype=False,
     )
     # A typo is rejected up front, before the fit is paid for.
     with pytest.raises(ValueError, match="expected 'polars' or 'pandas'"):
