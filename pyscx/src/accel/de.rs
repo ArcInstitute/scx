@@ -1778,22 +1778,31 @@ fn detect_is_log1p(
         // Catalog-only: O(shards), no payload read, no materialization.
         // A superset bound (the file, not a row/column view onto it) is fine
         // here — the heuristic only asks whether values reach counts scale.
-        if let Some(max_val) = backed.catalog_int_value_max() {
-            return Ok((max_val as f64) < LOG1P_MAX_VALUE_HEURISTIC);
+        match backed.catalog_int_value_max() {
+            // An empty matrix has no values, so neither answer is evidence —
+            // and `0 < 30` would silently claim "log1p". The in-memory arm
+            // raises here too (numpy cannot reduce an empty array), so falling
+            // through to the refusal below is what keeps the two layouts
+            // agreeing. `Some(0)` can only mean empty: a positive max returns
+            // above.
+            Some(0) => {}
+            Some(max_val) => return Ok((max_val as f64) < LOG1P_MAX_VALUE_HEURISTIC),
+            None => {}
         }
-        // The catalog could not bound the values — float-encoded shards write
-        // `value_max = 0` by design, and a shard may carry no stats at all.
-        // Which of the two it is cannot be told from here, so the message must
-        // not assert one. Guessing is what made backed and in-memory disagree.
+        // No usable bound: float-encoded shards write `value_max = 0` by
+        // design, a shard may carry no stats at all, or the matrix is empty.
+        // Which one cannot be told apart here, so the message must not assert
+        // any of them. Guessing is what made backed and in-memory disagree.
         return Err(PyValueError::new_err(
             "pdex_ref: cannot auto-detect whether this matrix is log1p-transformed. \
              adata.uns['log1p'] is absent and the SCX catalog cannot bound this file's \
-             value range (float-encoded shards record no range, and a shard may carry no \
-             statistics at all) — so the max-value heuristic used for an in-memory matrix \
-             has nothing to read, and guessing would make the backed result disagree with \
-             the in-memory one. Pass is_log1p=True for log-space data or is_log1p=False \
-             for raw counts. To apply the heuristic yourself: \
-             `is_log1p=adata.X.max() < 30` (a streaming max, no materialization).",
+             value range — its shards are float-encoded (the format records no range for \
+             those), carry no statistics, or hold no values at all. The max-value \
+             heuristic used for an in-memory matrix therefore has nothing to read, and \
+             guessing would make the backed result disagree with the in-memory one. \
+             Pass is_log1p=True for log-space data or is_log1p=False for raw counts. \
+             To apply the heuristic yourself: `is_log1p=adata.X.max() < 30` \
+             (a streaming max, no materialization).",
         ));
     }
 

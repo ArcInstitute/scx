@@ -354,7 +354,7 @@ def test_rank_genes_groups_rest_excludes_unlabelled_cells():
         )
 
 
-def test_rank_genes_groups_rest_with_unlabelled_matches_scanpy():
+def test_rank_genes_groups_rest_with_unlabelled_matches_scanpy_on_log1p():
     """End-to-end oracle: scanpy on the filtered matrix.
 
     Runs on log1p data deliberately. scanpy's `rank_genes_groups` applies

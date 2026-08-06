@@ -295,3 +295,28 @@ def test_rescaling_chain_without_log1p_refuses_to_guess(tmp_path):
     )
     pyscx.accel.log1p(backed)
     pyscx.accel.pdex_ref(backed, GROUPBY, reference=REFERENCE, device="cpu")
+
+
+def test_empty_backed_matrix_refuses_rather_than_claiming_log1p(tmp_path):
+    """An empty matrix is not evidence of anything, and must not read as log1p.
+
+    The catalog can legitimately prove `value_max == 0` when `nnz == 0` — but
+    "the maximum is 0" is a fact about an absent value set, not a measurement of
+    one, and letting it flow into the `< 30` heuristic would answer
+    `is_log1p=True` on no evidence. The in-memory arm raises here too (numpy
+    cannot reduce an empty array), so refusing is what keeps the two layouts
+    agreeing on this pathological input.
+    """
+    adata = _counts_adata()
+    x = adata.X.tocsr()
+    x.data[:] = 0.0
+    x.eliminate_zeros()
+    adata.X = x
+    assert adata.X.nnz == 0
+
+    path = str(tmp_path / "empty.scx")
+    pyscx.from_anndata(adata, path)
+    backed = pyscx.open(path).to_anndata(backed=True)
+
+    with pytest.raises(ValueError, match="is_log1p"):
+        pyscx.accel.pdex_ref(backed, GROUPBY, reference=REFERENCE, device="cpu")

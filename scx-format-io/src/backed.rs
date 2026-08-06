@@ -2139,11 +2139,12 @@ impl BackedCsrReader {
     ///   and `m` is the true maximum.
     /// * `Some(0)` — the matrix is empty (`nnz == 0`), so `0` *is* the maximum
     ///   and the catalog proves it.
-    /// * `None` — a nonempty matrix whose maximum the catalog cannot bound:
-    ///   the shards are float-encoded, or they carry no stats. The two are
-    ///   indistinguishable from here, so callers must not report either as the
-    ///   cause; `None` means *unknown*, and a caller that needs a real answer
-    ///   has to stream ([`Self::col_max`]) or ask the user.
+    /// * `None` — a matrix whose maximum the catalog cannot bound: the shards
+    ///   are float-encoded, or they carry no stats (or, vanishingly, the `nnz`
+    ///   lookup itself failed). Those are indistinguishable from here, so
+    ///   callers must not report any one as the cause; `None` means *unknown*,
+    ///   and a caller that needs a real answer has to stream
+    ///   ([`Self::col_max`]) or ask the user.
     ///
     /// Covers X shards when this reader targets X, layer shards otherwise —
     /// the same entry set as [`Self::total_nnz`].
