@@ -289,6 +289,76 @@ fn convert_stream_csc_always_emits_sidecar() {
 /// Attach a dense `/layers/{name}` group to an existing h5ad fixture.
 /// `open_layer_streaming` rejects dense layers; this lets us exercise
 /// the warn-and-skip path through the CLI surface.
+/// A minimal 10x CellRanger-v3 matrix (`shape` as a dataset, as real
+/// CellRanger writes it). Mirrors `cellbender_cli.rs::create_tenx`; kept local
+/// so this file has no cross-test-binary dependency.
+fn create_test_tenx(path: &Path, n_cells: usize, n_genes: usize) {
+    fn write_strings(group: &hdf5::Group, name: &str, values: &[String]) {
+        let v: Vec<VarLenUnicode> = values.iter().map(|s| vlu(s)).collect();
+        group
+            .new_dataset::<VarLenUnicode>()
+            .shape([v.len()])
+            .create(name)
+            .unwrap()
+            .write(&v)
+            .unwrap();
+    }
+
+    let file = hdf5::File::create(path).unwrap();
+    let matrix = file.create_group("matrix").unwrap();
+
+    // CSC on disk: 10x stores genes × cells, one nonzero per cell.
+    let mut indptr = vec![0i64];
+    let (mut indices, mut data) = (Vec::<i32>::new(), Vec::<f32>::new());
+    for cell in 0..n_cells {
+        indices.push((cell % n_genes) as i32);
+        data.push((cell + 1) as f32);
+        indptr.push(indices.len() as i64);
+    }
+    matrix
+        .new_dataset::<i32>()
+        .shape([2])
+        .create("shape")
+        .unwrap()
+        .write(&[n_genes as i32, n_cells as i32])
+        .unwrap();
+    matrix
+        .new_dataset::<i64>()
+        .shape([indptr.len()])
+        .create("indptr")
+        .unwrap()
+        .write(&indptr)
+        .unwrap();
+    matrix
+        .new_dataset::<i32>()
+        .shape([indices.len()])
+        .create("indices")
+        .unwrap()
+        .write(&indices)
+        .unwrap();
+    matrix
+        .new_dataset::<f32>()
+        .shape([data.len()])
+        .create("data")
+        .unwrap()
+        .write(&data)
+        .unwrap();
+
+    let barcodes: Vec<String> = (0..n_cells).map(|i| format!("cell_{i}")).collect();
+    write_strings(&matrix, "barcodes", &barcodes);
+    let features = matrix.create_group("features").unwrap();
+    write_strings(
+        &features,
+        "id",
+        &(0..n_genes).map(|i| format!("g{i}")).collect::<Vec<_>>(),
+    );
+    write_strings(
+        &features,
+        "name",
+        &(0..n_genes).map(|i| format!("GENE{i}")).collect::<Vec<_>>(),
+    );
+}
+
 fn attach_dense_layer(h5ad: &Path, layer_name: &str, n_obs: usize, n_vars: usize) {
     let file = hdf5::File::open_rw(h5ad).unwrap();
     let layers = match file.group("layers") {
@@ -601,13 +671,82 @@ fn convert_index_flags_rejected_on_mtx_to_scx() {
 }
 
 #[test]
-fn convert_stream_rejects_h5mu_direction() {
-    // We don't need a valid h5mu file — `--from h5mu` selects the
-    // direction before any input is opened, and the `--stream`
-    // guard runs first.
+fn bare_stream_flag_does_not_swallow_the_input_path() {
+    // Replaces a former `convert_stream_rejects_h5mu_direction`, whose premise
+    // was false — `h5mu_to_scx` *is* an allowed streaming direction, so the
+    // direction guard could never be what failed it. It passed only because
+    // clap's value-swallow error happened to contain both "--stream" and
+    // ".h5mu".
+    //
+    // That swallow is the real bug: `--stream` declared `num_args = 0..=1`
+    // without `require_equals` consumed the following positional, so
+    // `--stream <input>` died with "invalid value '<input>' for '--stream'".
+    // It escaped notice because every other call site puts `--stream` last or
+    // before another flag. Assert the natural flags-before-positionals order
+    // now works.
     let dir = tempfile::tempdir().unwrap();
-    let dummy = dir.path().join("in.h5mu");
-    std::fs::write(&dummy, b"not actually h5mu").unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let scx_path = dir.path().join("out.scx");
+    create_test_h5ad(&h5ad, 16, 4);
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    let output = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--stream",
+            h5ad.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scx convert --stream failed to spawn");
+    assert!(
+        output.status.success(),
+        "a bare --stream before the positionals must not consume the input path; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(ScxReader::open(&scx_path).unwrap().header().n_obs, 16);
+}
+
+#[test]
+fn convert_tenx_to_scx_succeeds_with_no_flags() {
+    // 10x → SCX is a headline ingest path and had no default-flag CLI test:
+    // the only tests that reached it hard-coded the `--stream=false`
+    // workaround for the flag's rejected default.
+    let dir = tempfile::tempdir().unwrap();
+    let tenx = dir.path().join("raw.h5");
+    let scx_path = dir.path().join("out.scx");
+    create_test_tenx(&tenx, 8, 3);
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    let output = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "10x",
+            tenx.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scx convert failed to spawn");
+    assert!(
+        output.status.success(),
+        "10x → scx must work with no flags; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let hdr = reader.header();
+    assert_eq!(hdr.n_obs, 8);
+    assert_eq!(hdr.n_vars, 3);
+}
+
+#[test]
+fn convert_stream_true_rejected_on_tenx() {
+    // Resolution precedes file I/O, so a nonexistent input is enough.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("absent.h5");
     let out = dir.path().join("out.scx");
 
     let scx_bin = env!("CARGO_BIN_EXE_scx");
@@ -615,23 +754,25 @@ fn convert_stream_rejects_h5mu_direction() {
         .args([
             "convert",
             "--from",
-            "h5mu",
-            "--to",
-            "scx",
+            "10x",
             "--stream",
-            dummy.to_str().unwrap(),
+            missing.to_str().unwrap(),
             out.to_str().unwrap(),
         ])
         .output()
-        .expect("scx convert --stream failed to spawn");
+        .expect("scx convert failed to spawn");
     assert!(
         !output.status.success(),
-        "scx convert --from h5mu --stream should have failed"
+        "an explicit --stream on 10x → scx must be rejected"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--stream") && stderr.contains("h5mu"),
-        "expected error mentioning --stream and h5mu, got: {stderr}"
+        stderr.contains("--stream") && stderr.contains("tenx_to_scx"),
+        "expected a --stream rejection naming the direction; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("Re-run without"),
+        "the message must name the remedy; got: {stderr}"
     );
 }
 

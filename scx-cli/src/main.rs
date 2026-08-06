@@ -138,20 +138,30 @@ enum Commands {
         /// export path.
         #[arg(long, value_name = "N", value_parser = validators::non_negative_f64)]
         min_counts: Option<f64>,
-        /// Stream the conversion without materializing the full X
-        /// matrix in memory. Defaults to true — pass `--stream=false`
-        /// to opt into the legacy materializing path. Supported for
-        /// h5ad ↔ SCX and h5mu ↔ SCX; combine with `--csc always` on
-        /// h5ad → SCX to emit a CSC sidecar via a two-pass rebuild
-        /// after the streaming write completes.
+        /// Stream the conversion instead of materializing the full X
+        /// matrix in memory.
+        ///
+        /// Only h5ad ↔ SCX and h5mu ↔ SCX have a streaming
+        /// implementation, and those directions stream by default;
+        /// MTX ↔ SCX and 10x → SCX have a single materializing path.
+        /// Omit the flag to get the right behavior for your direction.
+        ///
+        /// `--stream=false` opts into the legacy materializing path on
+        /// a streaming direction, and is accepted as a no-op elsewhere.
+        /// `--stream` / `--stream=true` on a non-streaming direction is
+        /// an error rather than a silent no-op. A value requires the
+        /// `=` form. Combine with `--csc always` on h5ad → SCX to emit
+        /// a CSC sidecar via a two-pass rebuild after the streaming
+        /// write completes.
         #[arg(
             long,
-            default_value_t = true,
+            value_name = "BOOL",
             num_args = 0..=1,
+            require_equals = true,
             default_missing_value = "true",
             action = clap::ArgAction::Set,
         )]
-        stream: bool,
+        stream: Option<bool>,
         /// Memory budget for slab-sizing heuristics (Phase 1 dense
         /// streaming, Phase 2 transpose buffers, Phase 8c worker
         /// derate). Accepts a bare byte count or a binary-prefixed
@@ -1800,7 +1810,9 @@ fn run_convert(
     row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
     min_counts: Option<f64>,
-    stream: bool,
+    // `--stream` as the user gave it: `None` when absent. Resolved against the
+    // direction by `convert::resolve_stream` in the body.
+    stream: Option<bool>,
     memory_budget: Option<&str>,
     strict_uns: bool,
     dense_zero_epsilon: f32,
@@ -1866,31 +1878,25 @@ fn run_convert(
         .into());
     }
 
-    // `--stream` is supported for h5ad → scx (Phase 0/1/2), h5mu →
-    // scx (Phase 3), and scx → h5ad / h5mu (Phase 8). Reject for
-    // other directions so the user gets a clear error rather than a
-    // confusing downstream failure.
-    if stream
-        && !matches!(
-            direction,
-            "h5ad_to_scx" | "h5mu_to_scx" | "scx_to_h5ad" | "scx_to_h5mu"
-        )
-    {
-        return Err(format!(
-            "--stream is only supported for h5ad → scx, h5mu → scx, scx → h5ad, and \
-             scx → h5mu; got direction '{direction}'."
-        )
-        .into());
-    }
+    // Resolve `--stream` against the direction. `None` (flag absent) means
+    // "whatever this direction does natively": streaming for h5ad / h5mu ↔
+    // scx, materializing for mtx ↔ scx and 10x → scx. Only an *explicit*
+    // `--stream` / `--stream=true` on a non-streaming direction is rejected —
+    // the flag carries no clap default precisely so that a value the user
+    // never passed can never make a direction unreachable. Everything below
+    // this point sees the resolved `bool`.
+    let stream_requested = stream;
+    let stream = convert::resolve_stream(stream_requested, direction)?;
     if (modalities.is_some() || modality_types.is_some()) && direction != "h5mu_to_scx" {
         return Err(format!(
             "--modalities / --modality-types only apply to h5mu → scx; got direction '{direction}'."
         )
         .into());
     }
-    // `--min-counts` is an export-side row filter. Check it before the
-    // `--stream` guard below so a user who passes both gets the specific
-    // message rather than the generic direction complaint.
+    // `--min-counts` is an export-side row filter. The `--stream` resolution
+    // above only rejects an *explicit* flag, so a user who passes both
+    // `--min-counts` and a wrong direction reaches this specific message
+    // rather than a generic direction complaint.
     if let Some(mc) = min_counts {
         if direction != "scx_to_h5ad" {
             return Err(format!(
@@ -1899,6 +1905,8 @@ fn run_convert(
             )
             .into());
         }
+        // `scx_to_h5ad` streams by default (checked just above), so a resolved
+        // `false` here can only have come from an explicit `--stream=false`.
         if !stream {
             return Err(
                 "--min-counts requires the streaming export path; drop --stream=false. \

@@ -680,12 +680,13 @@ For an end-to-end walkthrough, see the [scanpy tutorial notebook](notebooks/scx_
 SCX supports **roundtrip conversion** with h5ad, 10x HDF5, and Cell Ranger MTX formats —
 convert in, work with SCX, convert back out.
 
-All ingestion and export paths **stream by default** — peak RSS is
+The h5ad ↔ SCX and h5mu ↔ SCX paths **stream by default** — peak RSS is
 bounded by one shard's worth of CSR per matrix (and one shard's worth
 of obs/var per column when the source carries `ObsMetadataShard` /
 `VarMetadataShard` sections) regardless of total file size. Pass
 `--stream=false` (CLI) or `stream=False` (Python) to opt into the
-legacy materialising paths.
+legacy materialising paths. MTX ↔ SCX and 10x → SCX have a single
+materialising path; just omit `--stream` and they do the right thing.
 
 ```bash
 # h5ad ↔ SCX (roundtrip, streaming by default)

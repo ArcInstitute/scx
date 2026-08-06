@@ -4,7 +4,9 @@
 // can build without libhdf5.
 
 mod direction;
-pub use direction::determine_convert_direction;
+pub use direction::{
+    determine_convert_direction, direction_supports_streaming, resolve_stream, CONVERT_DIRECTIONS,
+};
 
 // Per-format ingest/export submodule directories (T5.9): `h5ad/` owns the
 // AnnData reader/writer/stream files plus the dense/CSC stream helpers and the
