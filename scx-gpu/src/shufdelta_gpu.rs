@@ -21,7 +21,7 @@ use cudarc::driver::safe::{
 use cudarc::driver::PushKernelArg;
 
 use scx_codec::{zstd_decompress_bounded, RowGroupSpan, ValueEncoding};
-use scx_format_io::shard::{resolve_block_index, ShardHeader};
+use scx_format_io::shard::{clamped_reserve, resolve_block_index, ShardHeader};
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -332,8 +332,10 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     // Precompute per-group nnz offsets + the full global indptr on the host
     // (tiny; the large index/value frames go to the device). Offsets let the
     // GPU consumer place each group independently, so producers can run ahead
-    // and out of order.
-    let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+    // and out of order. `n_rows` is untrusted header data, so the reservation
+    // goes through `clamped_reserve` (`Vec::with_capacity` aborts on failure).
+    let mut combined_indptr: Vec<i64> =
+        Vec::with_capacity(clamped_reserve(n_rows + 1, indptr_bytes.len(), 8));
     combined_indptr.push(0);
     let t_indptr = profile::start();
     let (offsets, nnz_final) = prescan_framed_group_indptr(
@@ -751,8 +753,10 @@ pub fn decode_framed_shufdelta_gpu_nvcomp(
 ) -> Result<PipelinedCsr, GpuError> {
     let value_width = value_encoding.byte_width();
 
-    // Host-decode the tiny indptr per group + per-group nnz offsets.
-    let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+    // Host-decode the tiny indptr per group + per-group nnz offsets. Untrusted
+    // `n_rows`, so clamp the reservation (see the pipelined path above).
+    let mut combined_indptr: Vec<i64> =
+        Vec::with_capacity(clamped_reserve(n_rows + 1, indptr_bytes.len(), 8));
     combined_indptr.push(0);
     let t_indptr = profile::start();
     let (offsets, nnz_final) = prescan_framed_group_indptr(

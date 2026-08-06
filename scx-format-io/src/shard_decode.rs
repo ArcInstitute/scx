@@ -16,7 +16,9 @@ use scx_codec::{CodecId, EncodedShardRef, ShardValuesNative, ValueEncoding};
 
 use crate::catalog::FullCatalogEntry;
 use crate::error::{Result, ScxError};
-use crate::shard::{resolve_block_index, ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION};
+use crate::shard::{
+    clamped_reserve, resolve_block_index, ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+};
 use crate::validated_section::ValidatedSection;
 
 /// Decode a single CSR shard from its on-disk bytes.
@@ -163,10 +165,16 @@ fn decode_framed_shard_scipy(
     let n_major = sh.n_major as usize;
     let nnz = sh.nnz as usize;
 
-    let mut indptr = Vec::with_capacity(n_major + 1);
+    // `n_major` / `nnz` come straight off the untrusted header, so reserve
+    // through `clamped_reserve` rather than trusting them: `Vec::with_capacity`
+    // aborts the process on allocation failure, and a ~100-byte file can declare
+    // `nnz = u32::MAX`. Honest shards are unaffected (the declared count wins);
+    // a hostile one under-reserves and then fails in `decode_row_group` below,
+    // which length-checks every frame against its own bytes.
+    let mut indptr = Vec::with_capacity(clamped_reserve(n_major + 1, indptr_bytes.len(), 8));
     indptr.push(0i64);
-    let mut indices = Vec::with_capacity(nnz);
-    let mut data = Vec::with_capacity(nnz);
+    let mut indices = Vec::with_capacity(clamped_reserve(nnz, indices_bytes.len(), 4));
+    let mut data = Vec::with_capacity(clamped_reserve(nnz, values_bytes.len(), 4));
     let mut running: i64 = 0;
 
     for span in &spans {
@@ -306,18 +314,20 @@ fn decode_framed_shard_native(
     let n_major = sh.n_major as usize;
     let nnz = sh.nnz as usize;
 
-    let mut indptr = Vec::with_capacity(n_major + 1);
+    // Same untrusted-header clamp as `decode_framed_shard_scipy` — see there.
+    let mut indptr = Vec::with_capacity(clamped_reserve(n_major + 1, indptr_bytes.len(), 8));
     indptr.push(0i64);
-    let mut indices = Vec::with_capacity(nnz);
+    let mut indices = Vec::with_capacity(clamped_reserve(nnz, indices_bytes.len(), 4));
+    let values_reserve = clamped_reserve(nnz, values_bytes.len(), 4);
     let mut values_u32: Vec<u32> = if value_encoding.is_integer() {
-        Vec::with_capacity(nnz)
+        Vec::with_capacity(values_reserve)
     } else {
         Vec::new()
     };
     let mut values_f32: Vec<f32> = if value_encoding.is_integer() {
         Vec::new()
     } else {
-        Vec::with_capacity(nnz)
+        Vec::with_capacity(values_reserve)
     };
     let mut running: i64 = 0;
 
@@ -384,7 +394,14 @@ pub fn decode_shard_indptr_bytes(
         // indices/values frames are never touched.
         let block_index_bytes = vs.subslice(sh.block_index_rel_offset, sh.block_index_length)?;
         let spans = resolve_block_index(&sh, block_index_bytes)?;
-        let mut indptr = Vec::with_capacity(sh.n_major as usize + 1);
+        // Untrusted `n_major`: clamp the reservation (see
+        // `decode_framed_shard_scipy`). A block index of only ~45 KB can declare
+        // 134M rows, which is a 1 GB `Vec<i64>` before any frame is decoded.
+        let mut indptr = Vec::with_capacity(clamped_reserve(
+            sh.n_major as usize + 1,
+            indptr_bytes.len(),
+            8,
+        ));
         indptr.push(0i64);
         let mut running: i64 = 0;
         for span in &spans {

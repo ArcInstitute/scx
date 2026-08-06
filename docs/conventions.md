@@ -19,6 +19,19 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
 - Readers must return errors (not panic) on malformed input — especially
   bitstream exhaustion.
 - Validate magic bytes, endianness, and format version on file/shard open.
+- **Never size an allocation directly from an untrusted count.**
+  `Vec::with_capacity` calls `handle_alloc_error`, which *aborts* — it cannot be
+  caught, so a header field is a remote kill switch wherever it reaches a
+  reservation unfiltered. Where a sound bound exists, validate against it
+  (`scx_format::validate_allocation` for uncompressed structures,
+  `scx_codec`'s `bound_capacity` for the Scx1 bit-level floor). Where none does
+  — anything behind a general-purpose compressor — **clamp** the reservation
+  instead (`scx_format::clamped_reserve`) and let real, length-checked data drive
+  the growth; rejecting on a guessed compression ratio makes valid files
+  unreadable. Test it by measuring the allocation, not by asserting `is_err()`:
+  under Linux overcommit a multi-GB reservation succeeds and the decode returns
+  the error the assertion wanted (see
+  `scx-format-io/tests/framed_decode_allocation.rs`).
 
 ## Checksums
 
