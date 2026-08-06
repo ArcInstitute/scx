@@ -590,8 +590,9 @@ fn wilcoxon_chunk_gpu_sequence_v3(
     is_ref_mode: bool,
 ) -> Result<()> {
     // Pool slab is pre-populated by the shard pass; sort + tie on it. The pool
-    // is the reference group in ref-mode or all cells in 1-vs-rest; either way
-    // `scratch.ref_slab` holds it and `scratch.tie_term` holds its tie term.
+    // is the reference group in ref-mode or the labelled cells in 1-vs-rest;
+    // either way `scratch.ref_slab` holds it and `scratch.tie_term` holds its
+    // tie term.
     gpu_de_block_sort(
         dev,
         &mut scratch.ref_slab,
@@ -884,7 +885,7 @@ fn pdex_ref_gpu_chunked_v3_csr(
     }
 
     let n_groups = group_names.len();
-    let (group_indices, _oor) = bucket_cells_by_group(groups, n_groups);
+    let group_indices = super::groups::partition_by_group(groups, n_groups).group_indices;
     let ref_cells = &group_indices[reference];
     let n_ref = ref_cells.len();
     if n_ref == 0 {
@@ -1337,7 +1338,7 @@ fn pdex_ref_gpu_chunked_v3_csc(
     let need_arith_pass = compute_cpm && cpm_mode != mode;
 
     let n_groups = group_names.len();
-    let (group_indices, _oor) = bucket_cells_by_group(groups, n_groups);
+    let group_indices = super::groups::partition_by_group(groups, n_groups).group_indices;
     let ref_cells = &group_indices[reference];
     let n_ref = ref_cells.len();
     if n_ref == 0 {
@@ -1706,9 +1707,9 @@ fn pdex_ref_gpu_chunked_v3_csc(
 ///   original group id (for reading per-group sums back).
 /// - **Pool tables** (`pool_group_dev` / `pool_pos_dev`): map every pool cell
 ///   to `group_id = 0`. In ref-mode the pool is the reference group; in
-///   1-vs-rest the pool is *all* cells, which overlaps the test groups and so
-///   cannot share the main table. Used only for the `group_id = 0` pool
-///   scatter into `ref_slab`.
+///   1-vs-rest the pool is every *labelled* cell, which overlaps the test
+///   groups and so cannot share the main table. Used only for the
+///   `group_id = 0` pool scatter into `ref_slab`.
 struct WilcoxonV3Prep {
     cell_to_group_dev: CudaSlice<i32>,
     cell_to_pos_dev: CudaSlice<i32>,
@@ -1733,22 +1734,37 @@ fn prepare_wilcoxon_v3(
     reference: Option<usize>,
 ) -> Result<WilcoxonV3Prep> {
     let n_groups = group_names.len();
-    let (group_indices, _oor) = bucket_cells_by_group(groups, n_groups);
+    // Destructured rather than cloned: `group_indices` is moved into the
+    // returned prep, and at atlas scale the clone was a second copy of one
+    // index per labelled cell for no reason.
+    let super::groups::GroupPartition {
+        labelled,
+        group_indices,
+        ..
+    } = super::groups::partition_by_group(groups, n_groups);
     let is_ref_mode = reference.is_some();
     let test_groups: Vec<usize> = match reference {
         Some(r) => (0..n_groups).filter(|&g| g != r).collect(),
         None => (0..n_groups).collect(),
     };
 
-    // Pool permutation: reference cells (ref-mode) or all cells (1-vs-rest).
+    // Pool permutation: reference cells (ref-mode) or every *labelled* cell
+    // (1-vs-rest). An unlabelled cell is in no group, so it is neither "rest"
+    // nor a rank competitor — see `super::groups`. `pool_len` is therefore the
+    // rank-pool size and the base of the rest denominator below.
     let pool_host: Vec<i32> = match reference {
         Some(r) => group_indices[r].iter().map(|&c| c as i32).collect(),
-        None => (0..n_obs as i32).collect(),
+        None => labelled.iter().map(|&c| c as i32).collect(),
     };
     let pool_len = pool_host.len();
     if pool_len == 0 {
         return Err(AccelError::InvalidInput(
-            "Wilcoxon GPU v3: empty comparison pool (reference group has zero cells)".to_string(),
+            if is_ref_mode {
+                "Wilcoxon GPU v3: empty comparison pool (reference group has zero cells)"
+            } else {
+                "Wilcoxon GPU v3: empty comparison pool (no cell carries a group label)"
+            }
+            .to_string(),
         ));
     }
     let pool_offsets: Vec<i32> = vec![0, checked_offset_i32(pool_len, "Wilcoxon v3 pool offsets")?];
@@ -2049,7 +2065,9 @@ where
                     .iter()
                     .map(|&r| r - n1d * (n1d + 1.0) / 2.0)
                     .collect();
-                (u_host, pool_tie_host.clone(), n_g, n_obs - n_g)
+                // `pool_len` is the labelled-cell count in 1-vs-rest, not
+                // `n_obs`: unlabelled cells are outside the pool.
+                (u_host, pool_tie_host.clone(), n_g, pool_len - n_g)
             };
 
             let (scores, pvals) =
@@ -2068,8 +2086,12 @@ where
                         }
                     }
                     None => {
+                        // `total_gene_sum` sums the labelled groups only, so the
+                        // denominator must be the labelled pool (`pool_len`) minus
+                        // this group — not `n_obs`, which counts unlabelled cells
+                        // the numerator never saw.
                         let rest_sum = total_gene_sum[var] - group_gene_sums[g][var];
-                        let rest_n = n_obs - n_g;
+                        let rest_n = pool_len - n_g;
                         if rest_n == 0 {
                             f64::NAN
                         } else {
@@ -2163,7 +2185,7 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csc(
             source
                 .for_each_gpu_csc_shard_in_range(c0 as u32..c1 as u32, &mut |_idx, csc_view| {
                     shards += 1;
-                    // group_id = 0 is the pool (ref cells / all cells); 1..=n_test
+                    // group_id = 0 is the pool (ref cells / labelled cells); 1..=n_test
                     // are the per-test-group slabs.
                     gpu_de_scatter_csc_to_gene_major(
                         dev,
@@ -2568,19 +2590,6 @@ fn resolve_chunk_size(dev: &GpuDevice, n_obs: usize, user: Option<usize>, n_vars
             .min(n_vars)
             .max(1),
     }
-}
-
-fn bucket_cells_by_group(groups: &[usize], n_groups: usize) -> (Vec<Vec<usize>>, usize) {
-    let mut indices: Vec<Vec<usize>> = vec![vec![]; n_groups];
-    let mut oor = 0usize;
-    for (i, &g) in groups.iter().enumerate() {
-        if g < n_groups {
-            indices[g].push(i);
-        } else {
-            oor += 1;
-        }
-    }
-    (indices, oor)
 }
 
 /// Mode-id encoding for `gpu_de_pseudobulk_all_groups`. Must match the

@@ -2126,6 +2126,66 @@ impl BackedCsrReader {
         Ok(total as usize)
     }
 
+    /// Largest stored value across this reader's shards, **when the catalog
+    /// can prove one** — `None` when it cannot.
+    ///
+    /// Walks the catalog only (O(shards), no payload reads, no decode), which
+    /// is the whole point: it answers "how big do the values get?" without
+    /// touching the data. `ShardStats::value_max` is exact for the integer
+    /// value encodings and is written as `0` for `Float32`/`Float16`, where
+    /// a `u32` field cannot represent the statistic — so:
+    ///
+    /// * `Some(m)` with `m > 0` — every contributing shard is integer-encoded
+    ///   and `m` is the true maximum.
+    /// * `Some(0)` — the matrix is empty (`nnz == 0`), so `0` *is* the maximum
+    ///   and the catalog proves it.
+    /// * `None` — a matrix whose maximum the catalog cannot bound: the shards
+    ///   are float-encoded, or they carry no stats (or, vanishingly, the `nnz`
+    ///   lookup itself failed). Those are indistinguishable from here, so
+    ///   callers must not report any one as the cause; `None` means *unknown*,
+    ///   and a caller that needs a real answer has to stream
+    ///   ([`Self::col_max`]) or ask the user.
+    ///
+    /// Covers X shards when this reader targets X, layer shards otherwise —
+    /// the same entry set as [`Self::total_nnz`].
+    pub fn catalog_int_value_max(&self) -> Option<u32> {
+        let want_layer = self.layer_name.is_some();
+        let modality = self.modality_id();
+        // Hoisted out of the filter: otherwise every catalog entry pays a
+        // `format!` allocation just to be compared against.
+        let layer_prefix = self.layer_name.as_ref().map(|n| format!("{n}_shard_"));
+        let max = self
+            .reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| {
+                e.modality_id == modality
+                    && if want_layer {
+                        e.section_type == SectionType::LayerCsrShard
+                            && layer_prefix
+                                .as_ref()
+                                .is_some_and(|prefix| e.name.starts_with(prefix))
+                    } else {
+                        e.section_type == SectionType::CsrShard
+                    }
+            })
+            .filter_map(|e| e.stats.as_ref())
+            .map(|s| s.value_max)
+            .max()
+            .unwrap_or(0);
+        if max > 0 {
+            return Some(max);
+        }
+        // `value_max == 0` is ambiguous between "float-encoded / no stats" and
+        // "there are no values". `nnz` disambiguates: an empty matrix really
+        // does max to 0, and saying so beats making the caller refuse.
+        match self.total_nnz() {
+            Ok(0) => Some(0),
+            _ => None,
+        }
+    }
+
     /// Compute per-row sum of squared values without materializing the full matrix.
     ///
     /// Iterates shards in order, computes row sum-of-squares from each shard's

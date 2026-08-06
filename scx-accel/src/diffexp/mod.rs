@@ -3,10 +3,17 @@
 //! [`cpu`] holds the host implementations and the parity oracle; [`gpu`]
 //! (behind the `gpu` feature) holds the GPU orchestration that drives the
 //! `scx-gpu` device primitives. Routing is decided by `crate::route`.
+//!
+//! [`groups`] owns the one definition of "which cells take part" — every
+//! kernel, CPU or GPU, dense or sparse, derives its rest denominator and rank
+//! pool from it rather than from `n_obs`.
 
 pub mod cpu;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod groups;
+
+pub use groups::{partition_by_group, GroupPartition};
 
 pub use cpu::{
     finalize_pdex, merge_diff_exp_results, pdex_ref, pdex_ref_core, pdex_ref_sparse,

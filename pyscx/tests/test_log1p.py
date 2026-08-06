@@ -684,3 +684,50 @@ def test_no_marker_for_scipy_normalize_then_gpu_log1p_falls_back():
     np.testing.assert_allclose(
         a_gpu.X.toarray(), a_ref.X.toarray(), rtol=1e-5, atol=1e-6
     )
+
+
+class TestLog1pUnsStamp:
+    """`uns["log1p"]` is the annotation everything downstream keys off."""
+
+    def test_backed_arm_stamps_uns_log1p(self, scx_file):
+        """The backed → lazy arm must annotate like `sc.pp.log1p` does.
+
+        Without it the SCX-native path is the only one whose log1p is invisible:
+        `rank_genes_groups` skips its `expm1` logFC branch, `pdex_ref` picks the
+        raw-counts mean mode, and `pdex_nb_glm` happily fits log-space data as
+        if it were counts.
+        """
+        path, _ = scx_file
+        adata = pyscx.open(path).to_anndata(backed=True)
+        assert "log1p" not in adata.uns
+
+        pyscx.accel.log1p(adata)
+
+        assert "log1p" in adata.uns
+        assert adata.uns["log1p"] == {"base": None}
+
+    def test_lazy_append_arm_stamps_uns_log1p(self, scx_file):
+        """Same for log1p appended onto an existing transform chain."""
+        path, _ = scx_file
+        adata = pyscx.open(path).to_anndata(backed=True)
+        pyscx.accel.normalize_total(adata, target_sum=1e4)
+        assert type(adata.X).__name__ == "ScxLazyTransformedDataset"
+        assert "log1p" not in adata.uns
+
+        pyscx.accel.log1p(adata)
+
+        assert adata.uns["log1p"] == {"base": None}
+
+    def test_matches_scanpy_annotation(self, scx_file):
+        """The stamp is the same object scanpy writes, not a look-alike."""
+        import anndata
+        import scanpy as sc
+
+        path, X_ref = scx_file
+        backed = pyscx.open(path).to_anndata(backed=True)
+        in_memory = anndata.AnnData(X=X_ref.copy())
+
+        pyscx.accel.log1p(backed)
+        sc.pp.log1p(in_memory)
+
+        assert backed.uns["log1p"] == in_memory.uns["log1p"]

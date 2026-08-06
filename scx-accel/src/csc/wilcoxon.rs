@@ -153,14 +153,14 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
 /// `block` is sorted ascending by value; `offset` is the count of cells sorted
 /// *before* this block (0 for negatives; `n_neg + n_zero` for positives). Global
 /// 1-based rank of a tie run at within-block positions `[i, j)` is
-/// `offset + (i + 1 + j) / 2`, identical to `rank_with_ties`' mid-rank. Entries
-/// whose group is out-of-range (unknown-group cells) still occupy sorted
-/// positions (so tie mid-ranks and the correction match the dense ranking) but
-/// contribute to no group's rank-sum — they are "rest" for every group.
+/// `offset + (i + 1 + j) / 2`, identical to `rank_with_ties`' mid-rank.
+///
+/// Every entry here belongs to a real group: the caller drops unlabelled cells
+/// before building the blocks, because they are not in the comparison pool at
+/// all (see `crate::diffexp::groups`).
 fn assign_block_ranks(
     block: &[(f64, usize)],
     offset: usize,
-    n_groups: usize,
     rank_sum: &mut [f64],
     tie_correction: &mut f64,
 ) {
@@ -173,10 +173,7 @@ fn assign_block_ranks(
         }
         let mid_rank = (2 * offset + i + 1 + j) as f64 / 2.0;
         for entry in &block[i..j] {
-            let g = entry.1;
-            if g < n_groups {
-                rank_sum[g] += mid_rank;
-            }
+            rank_sum[entry.1] += mid_rank;
         }
         let t = (j - i) as f64;
         if t > 1.0 {
@@ -188,9 +185,17 @@ fn assign_block_ranks(
 
 /// Per-gene 1-vs-rest Wilcoxon `(score, pval, logfc)` for every group, computed
 /// from a single gene's nonzeros (`rows`/`vals`) plus the implicit-zero block —
-/// the exact sparse analogue of the dense kernel's per-gene arm. `total_sum`
-/// (for logFC's reference mean) **excludes** unknown-group cells, and `n2`
-/// **includes** them, matching `wilcoxon_rank_sum`'s 1-vs-rest arm exactly.
+/// the exact sparse analogue of the dense kernel's per-gene arm.
+///
+/// The comparison pool is the **labelled** cells (`n_labelled`), never `n_obs`:
+/// an unlabelled cell contributes to no group sum, to no rest denominator, and
+/// to no rank — its nonzeros never enter the sorted blocks and it is not part
+/// of the implicit-zero block. Same rule as `wilcoxon_rank_sum`'s 1-vs-rest
+/// arm; see `crate::diffexp::groups`.
+///
+/// `n_obs` survives as the **data-dimension** bound only — CSC row indices are
+/// global, so it is what an out-of-range row is checked against. It is not a
+/// statistical parameter here; `n_labelled` is.
 #[allow(clippy::too_many_arguments)]
 fn gene_stats_nnz(
     rows: &[i32],
@@ -198,6 +203,7 @@ fn gene_stats_nnz(
     groups: &[usize],
     group_cell_counts: &[usize],
     n_obs: usize,
+    n_labelled: usize,
     n_groups: usize,
     tie_correct: bool,
     log_transformed: bool,
@@ -213,16 +219,16 @@ fn gene_stats_nnz(
         if row >= n_obs {
             continue;
         }
-        let v = v32 as f64;
         let g = groups[row];
-        if g < n_groups {
-            // Dense parity: `total` and the per-group sums exclude unknown-group
-            // cells; those cells still count toward `n2` via `group_cell_counts`.
-            total_sum += v;
-            group_sum[g] += v;
-            if v != 0.0 {
-                nonzero_in_g[g] += 1;
-            }
+        if g >= n_groups {
+            // Unlabelled: outside the comparison pool entirely.
+            continue;
+        }
+        let v = v32 as f64;
+        total_sum += v;
+        group_sum[g] += v;
+        if v != 0.0 {
+            nonzero_in_g[g] += 1;
         }
         if v < 0.0 {
             neg.push((v, g));
@@ -235,14 +241,15 @@ fn gene_stats_nnz(
     let n_neg = neg.len();
     let n_pos = pos.len();
     // Each stored entry is one distinct cell (one entry per (cell,gene) in CSC),
-    // and out-of-range rows are dropped above, so nonzeros never exceed n_obs.
-    // A corrupt sidecar with duplicate rows in a column would break this.
+    // and out-of-range rows plus unlabelled cells are dropped above, so the
+    // pooled nonzeros never exceed n_labelled. A corrupt sidecar with duplicate
+    // rows in a column would break this.
     debug_assert!(
-        n_neg + n_pos <= n_obs,
-        "nnz ({}) exceeds n_obs ({n_obs}) — duplicate rows in a CSC column?",
+        n_neg + n_pos <= n_labelled,
+        "pooled nnz ({}) exceeds n_labelled ({n_labelled}) — duplicate rows in a CSC column?",
         n_neg + n_pos
     );
-    let n_zero_total = n_obs - n_neg - n_pos;
+    let n_zero_total = n_labelled - n_neg - n_pos;
     // Mid-rank of the zero tie-block spanning 1-based ranks [n_neg+1 .. n_neg+n_zero].
     let zero_mid = n_neg as f64 + (n_zero_total as f64 + 1.0) / 2.0;
 
@@ -250,7 +257,7 @@ fn gene_stats_nnz(
     let mut tie_correction = 0.0f64;
 
     neg.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-    assign_block_ranks(&neg, 0, n_groups, &mut rank_sum, &mut tie_correction);
+    assign_block_ranks(&neg, 0, &mut rank_sum, &mut tie_correction);
 
     if n_zero_total > 1 {
         let t = n_zero_total as f64;
@@ -261,7 +268,6 @@ fn gene_stats_nnz(
     assign_block_ranks(
         &pos,
         n_neg + n_zero_total,
-        n_groups,
         &mut rank_sum,
         &mut tie_correction,
     );
@@ -275,14 +281,14 @@ fn gene_stats_nnz(
     let mut out = Vec::with_capacity(n_groups);
     for g in 0..n_groups {
         let n1 = group_cell_counts[g];
-        if n1 == 0 || n1 == n_obs {
+        if n1 == 0 || n1 == n_labelled {
             out.push((f64::NAN, 1.0, f64::NAN));
             continue;
         }
         let tc = if tie_correct { tie_correction } else { 0.0 };
-        let (score, pval) = wilcoxon_stats_from_rank_sum(rank_sum[g], n1, n_obs, tc);
+        let (score, pval) = wilcoxon_stats_from_rank_sum(rank_sum[g], n1, n_labelled, tc);
         let mean_group = group_sum[g] / n1 as f64;
-        let mean_ref = (total_sum - group_sum[g]) / (n_obs - n1) as f64;
+        let mean_ref = (total_sum - group_sum[g]) / (n_labelled - n1) as f64;
         let logfc = compute_logfc(mean_group, mean_ref, log_transformed);
         out.push((score, pval, logfc));
     }
@@ -309,14 +315,15 @@ fn wilcoxon_rank_sum_nnz_csc<S: ColumnShardSource + ?Sized>(
     let n_vars = gene_names.len();
     let n_groups = group_names.len();
 
-    // Per-group cell counts (unknown-group cells excluded), matching the dense
-    // kernel's `group_indices[g].len()`.
-    let mut group_cell_counts = vec![0usize; n_groups];
-    for &g in groups {
-        if g < n_groups {
-            group_cell_counts[g] += 1;
-        }
-    }
+    // Per-group cell counts and the labelled-pool size, from the one shared
+    // partition the dense and GPU kernels also use.
+    let partition = crate::diffexp::partition_by_group(groups, n_groups);
+    let n_labelled = partition.n_labelled();
+    let group_cell_counts: Vec<usize> = partition
+        .group_indices
+        .iter()
+        .map(|cells| cells.len())
+        .collect();
 
     // per_gene[gene][group] = (score, pval, logfc).
     let mut per_gene: Vec<Vec<(f64, f64, f64)>> = vec![Vec::new(); n_vars];
@@ -345,6 +352,7 @@ fn wilcoxon_rank_sum_nnz_csc<S: ColumnShardSource + ?Sized>(
                     groups,
                     &group_cell_counts,
                     n_obs,
+                    n_labelled,
                     n_groups,
                     tie_correct,
                     log_transformed,
@@ -885,7 +893,7 @@ mod tests {
     }
 
     /// End-to-end integration: the nnz CSC kernel matches the CSR streaming
-    /// path on a real backed SCX file (codec round-trip) with an unknown-group
+    /// path on a real backed SCX file (codec round-trip) with an unlabelled
     /// cell class present.
     #[test]
     fn nnz_csc_matches_csr_streaming_on_file() {
@@ -896,7 +904,7 @@ mod tests {
 
         let gene_names: Vec<String> = (0..n_vars).map(|j| format!("g{j}")).collect();
         let group_names = vec!["A".to_string(), "B".to_string(), "C".to_string()];
-        // Cycle 0,1,2,3 → index 3 is the unknown-group sentinel (n_groups == 3).
+        // Cycle 0,1,2,3 → index 3 is the unlabelled sentinel (n_groups == 3).
         let groups: Vec<usize> = (0..n_obs).map(|i| i % 4).collect();
 
         let csr_reader = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
@@ -943,8 +951,15 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
         /// The exact sparse-nnz 1-vs-rest path matches the dense kernel on random
-        /// small matrices with negatives, explicit + implicit zeros, unknown-group
+        /// small matrices with negatives, explicit + implicit zeros, unlabelled
         /// cells, and both tie-correction settings — the §5.3 exactness contract.
+        ///
+        /// Both arms are also checked against a **third, independent** result:
+        /// the dense kernel run on the matrix with the unlabelled rows physically
+        /// removed. Agreement between two implementations only proves they agree
+        /// — and they did, on the wrong answer, for as long as both counted
+        /// unlabelled cells in the rest denominator. The physical subset is the
+        /// oracle; nnz-vs-dense is the parity check.
         #[test]
         fn nnz_matches_dense_wilcoxon(
             seed in any::<u64>(),
@@ -956,8 +971,9 @@ mod tests {
         ) {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-            // Group per cell in 0..=n_groups; `n_groups` is the unknown-group
-            // sentinel (dense drops it from all groups, keeps it in "rest").
+            // Group per cell in 0..=n_groups; `n_groups` is the unlabelled
+            // sentinel — such a cell belongs to no group and is outside the
+            // comparison pool entirely.
             let groups: Vec<usize> = (0..n_obs).map(|_| rng.gen_range(0..=n_groups)).collect();
 
             // Dense buffer + verbatim CSC columns. ~55% density; values are small
@@ -988,16 +1004,46 @@ mod tests {
                 &src, &gene_names, &groups, &group_names, 3, log_transformed, tie_correct,
             ).unwrap();
 
+            // Oracle: the same matrix with the unlabelled rows physically gone.
+            let mut sub_dense = Vec::new();
+            let mut sub_groups = Vec::new();
+            for (row, &g) in groups.iter().enumerate() {
+                if g < n_groups {
+                    sub_dense.extend_from_slice(&dense[row * n_vars..(row + 1) * n_vars]);
+                    sub_groups.push(g);
+                }
+            }
+            let sub_n_obs = sub_groups.len();
+            // A group with no cells yields NaN scores in both arms; that is
+            // already covered by the parity assertions, and the oracle run needs
+            // at least one labelled cell to be meaningful.
+            let oracle_res = if sub_n_obs > 0 {
+                Some(wilcoxon_rank_sum(
+                    &sub_dense, sub_n_obs, n_vars, &gene_names, &sub_groups, &group_names,
+                    None, log_transformed, false, tie_correct, 0,
+                ).unwrap())
+            } else {
+                None
+            };
+
             prop_assert_eq!(&dense_res.group_names, &nnz_res.group_names);
             for gi in 0..group_names.len() {
                 let dmap = group_map(&dense_res, gi);
                 let nmap = group_map(&nnz_res, gi);
+                let omap = oracle_res.as_ref().map(|r| group_map(r, gi));
                 for (name, &(ds, dp, dpa, dl)) in &dmap {
                     let &(ns, np, npa, nl) = nmap.get(name).unwrap();
                     prop_assert!(close(ds, ns), "score g{} {}: {} vs {}", gi, name, ds, ns);
                     prop_assert!(close(dp, np), "pval g{} {}: {} vs {}", gi, name, dp, np);
                     prop_assert!(close(dpa, npa), "padj g{} {}: {} vs {}", gi, name, dpa, npa);
                     prop_assert!(close(dl, nl), "logfc g{} {}: {} vs {}", gi, name, dl, nl);
+                    if let Some(omap) = &omap {
+                        let &(os, op, opa, ol) = omap.get(name).unwrap();
+                        prop_assert!(close(ds, os), "score vs subset g{} {}: {} vs {}", gi, name, ds, os);
+                        prop_assert!(close(dp, op), "pval vs subset g{} {}: {} vs {}", gi, name, dp, op);
+                        prop_assert!(close(dpa, opa), "padj vs subset g{} {}: {} vs {}", gi, name, dpa, opa);
+                        prop_assert!(close(dl, ol), "logfc vs subset g{} {}: {} vs {}", gi, name, dl, ol);
+                    }
                 }
             }
         }

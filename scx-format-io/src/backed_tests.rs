@@ -2197,3 +2197,96 @@ fn shard_size_hint_defaults_to_none() {
         "the trait default must be None, not Some(zero)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// catalog_int_value_max
+// ---------------------------------------------------------------------------
+
+/// Integer-encoded shards: the catalog carries the exact maximum, and reading
+/// it costs no decode.
+///
+/// This is the value the `pdex_ref` log1p probe applies its `< 30` heuristic
+/// to, so a wrong answer here silently changes which `GeomMeanMode` a backed
+/// DE run picks.
+#[test]
+fn catalog_int_value_max_reports_exact_max_for_integer_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, full) = write_test_file_and_open(&dir, 40, 8, 4, 4);
+
+    let expected = full.data.iter().fold(0.0f32, |a, &b| a.max(b)).round() as u32;
+    assert!(expected > 0, "fixture must contain nonzero values");
+    assert_eq!(backed.catalog_int_value_max(), Some(expected));
+}
+
+/// Float-encoded shards record `value_max = 0` by design, so the catalog can
+/// prove nothing about a nonempty float matrix — `None` means *unknown*, and
+/// callers must not read it as "the max is 0".
+#[test]
+fn catalog_int_value_max_is_none_for_float_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("float.scx");
+    let (n_obs, n_vars) = (12usize, 5usize);
+    let header = sample_header(n_obs as u64, n_vars as u64, (n_obs * 2) as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    // Two fractional values per row — well above the heuristic's threshold, so
+    // a caller that mistook `None` for "max is 0" would answer "log1p" here.
+    let mut indptr: Vec<u64> = vec![0];
+    let mut indices: Vec<u32> = Vec::new();
+    let mut values: Vec<u8> = Vec::new();
+    for row in 0..n_obs {
+        indices.push((row % n_vars) as u32);
+        indices.push(((row + 1) % n_vars) as u32);
+        values.extend_from_slice(&(100.5f32).to_le_bytes());
+        values.extend_from_slice(&(200.25f32).to_le_bytes());
+        indptr.push(indptr.last().unwrap() + 2);
+    }
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Float32,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 2);
+    assert_eq!(
+        backed.catalog_int_value_max(),
+        None,
+        "float shards record no value range; None must mean unknown, not zero"
+    );
+}
+
+/// An empty matrix is the one case where `value_max == 0` is not ambiguous —
+/// `nnz == 0` proves it, so the method answers instead of refusing.
+#[test]
+fn catalog_int_value_max_reports_zero_for_an_empty_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty.scx");
+    let (n_obs, n_vars) = (6usize, 3usize);
+    let header = sample_header(n_obs as u64, n_vars as u64, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    writer
+        .write_csr_shard(
+            &vec![0u64; n_obs + 1],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 2);
+    assert_eq!(backed.total_nnz().unwrap(), 0);
+    assert_eq!(backed.catalog_int_value_max(), Some(0));
+}

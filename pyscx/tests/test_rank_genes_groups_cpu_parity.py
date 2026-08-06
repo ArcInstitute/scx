@@ -13,7 +13,10 @@ swapping `pdex_ref` for `rank_genes_groups`.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
+import pytest
 
 import anndata as ad
 import pandas as pd
@@ -281,4 +284,124 @@ def test_rank_genes_groups_cpu_drops_unknown_group_labels():
                 f"DE for {key} differs after appending NaN-label cells — they "
                 f"were folded into a real group instead of being dropped"
             ),
+        )
+
+
+def _make_unlabelled_fixture(n_unlabelled: int = 30):
+    """The 3-group fixture with `n_unlabelled` extra cells carrying a NaN label.
+
+    Returns `(with_nan, filtered)` — the same expression matrix twice, once with
+    the unlabelled rows present and once with them physically removed. Any
+    correct definition of "rest" makes those two runs identical.
+    """
+    cats = ["non-targeting", "ko_a", "ko_b"]
+    base = _make_adata()
+    base.obs["target"] = pd.Categorical(base.obs["target"], categories=cats)
+    base.X = sp.csr_matrix(base.X)
+
+    rng = np.random.default_rng(7)
+    extra_counts = rng.poisson(4.0, size=(n_unlabelled, base.n_vars)).astype(
+        np.float32
+    )
+    extra = ad.AnnData(
+        X=sp.csr_matrix(extra_counts),
+        obs=pd.DataFrame(
+            {"target": pd.Categorical([np.nan] * n_unlabelled, categories=cats)},
+            index=[f"unlabelled_{i}" for i in range(n_unlabelled)],
+        ),
+        var=base.var.copy(),
+    )
+    with_nan = ad.concat([base.copy(), extra], join="outer")
+    with_nan.obs["target"] = pd.Categorical(with_nan.obs["target"], categories=cats)
+    with_nan.X = sp.csr_matrix(with_nan.X)
+
+    filtered = base.copy()
+    return with_nan, filtered
+
+
+def test_rank_genes_groups_rest_excludes_unlabelled_cells():
+    """1-vs-rest DE must not count unlabelled cells in "rest".
+
+    `reference="rest"` is the arm the existing unknown-label test above does not
+    reach — it runs pairwise against a named reference, which gathers only
+    `group ∪ ref` and was always correct.
+
+    In 1-vs-rest the rest *numerator* summed only labelled cells while the rest
+    *denominator* was `n_obs`, so every logFC in every group came out inflated
+    by `log2(n_obs − n1) − log2(n_labelled − n1)`; the rank pool kept the
+    unlabelled cells as competitors, so the z-scores were off too. The oracle is
+    the same matrix with those rows physically deleted.
+    """
+    with_nan, filtered = _make_unlabelled_fixture()
+    assert with_nan.n_obs > filtered.n_obs
+
+    pyscx.accel.rank_genes_groups(with_nan, "target", reference="rest", device="cpu")
+    pyscx.accel.rank_genes_groups(filtered, "target", reference="rest", device="cpu")
+
+    got = _scores_and_pvals_by_gene(with_nan)
+    want = _scores_and_pvals_by_gene(filtered)
+    assert got.keys() == want.keys()
+    for key in want:
+        np.testing.assert_allclose(
+            got[key],
+            want[key],
+            rtol=1e-9,
+            atol=1e-12,
+            err_msg=(
+                f"1-vs-rest DE for {key} differs from the physically-filtered "
+                f"run — unlabelled cells are leaking into 'rest' or the rank pool"
+            ),
+        )
+
+
+def test_rank_genes_groups_rest_with_unlabelled_matches_scanpy_on_log1p():
+    """End-to-end oracle: scanpy on the filtered matrix.
+
+    Runs on log1p data deliberately. scanpy's `rank_genes_groups` applies
+    `expm1` to the group means unconditionally (the `uns["log1p"]["base"]` entry
+    only rescales it), so its logFC is only comparable to ours on log-space
+    input — on raw counts scanpy warns and the two formulas legitimately differ.
+    `sc.tl.rank_genes_groups` drops NaN-label cells itself via
+    `obs[groupby].isin(groups_order)`, so scanpy-on-filtered is the same
+    computation scanpy-on-NaN would do.
+    """
+    sc = pytest.importorskip("scanpy")
+
+    with_nan, filtered = _make_unlabelled_fixture()
+    sc.pp.log1p(with_nan)
+    sc.pp.log1p(filtered)
+
+    pyscx.accel.rank_genes_groups(with_nan, "target", reference="rest", device="cpu")
+    sc.tl.rank_genes_groups(filtered, "target", method="wilcoxon")
+
+    got = _scores_and_pvals_by_gene(with_nan)
+    want = _scores_and_pvals_by_gene(filtered)
+    assert got.keys() == want.keys()
+    # Looser than the self-parity test above (1e-9/1e-12), which compares two
+    # runs of the same kernel. Here the two sides are different implementations:
+    # scanpy accumulates its means and its tie correction in a different order
+    # and partly in float32, so agreement is to float tolerance, not to the bit.
+    for key in want:
+        np.testing.assert_allclose(
+            got[key], want[key], rtol=1e-5, atol=1e-6,
+            err_msg=f"scanpy parity broken for {key}",
+        )
+
+
+def test_rank_genes_groups_warns_about_unlabelled_cells():
+    """Dropping rows silently is the part that made this invisible."""
+    with_nan, _ = _make_unlabelled_fixture(n_unlabelled=12)
+    with pytest.warns(UserWarning, match=r"12 of \d+ cells have no group label"):
+        pyscx.accel.rank_genes_groups(
+            with_nan, "target", reference="rest", device="cpu"
+        )
+
+
+def test_rank_genes_groups_fully_labelled_emits_no_unlabelled_warning():
+    """The warning must not fire on ordinary, fully-annotated input."""
+    _, filtered = _make_unlabelled_fixture()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        pyscx.accel.rank_genes_groups(
+            filtered, "target", reference="rest", device="cpu"
         )
