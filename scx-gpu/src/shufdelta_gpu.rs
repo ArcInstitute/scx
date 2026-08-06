@@ -269,12 +269,30 @@ enum HostPlaneBuf {
 }
 
 impl HostPlaneBuf {
-    fn new(dev: &GpuDevice, cap: usize) -> Self {
+    /// `cap` is `max(span.nnz) × element_width` — derived from the **untrusted**
+    /// block index, so the pageable fallback must be fallible. `vec![0u8; cap]`
+    /// aborts through `handle_alloc_error` on a hostile `nnz`, the same remote
+    /// kill switch [`clamped_reserve`] closes on the reassembly buffers, and it
+    /// is reached *before* the fallible `alloc_zeros` staging allocations below.
+    /// Clamping is not an option here — [`Self::stage`] indexes `v[..src.len()]`,
+    /// so the buffer must actually hold `cap` — hence `try_reserve_exact`, which
+    /// returns instead of aborting.
+    fn new(dev: &GpuDevice, cap: usize) -> Result<Self, GpuError> {
+        let cap = cap.max(1);
         // SAFETY: `alloc_pinned` is unsafe only in that the buffer is
         // uninitialized; we fully overwrite the used prefix before every upload.
-        match unsafe { dev.context().alloc_pinned::<u8>(cap.max(1)) } {
-            Ok(p) => HostPlaneBuf::Pinned(p),
-            Err(_) => HostPlaneBuf::Pageable(vec![0u8; cap.max(1)]),
+        match unsafe { dev.context().alloc_pinned::<u8>(cap) } {
+            Ok(p) => Ok(HostPlaneBuf::Pinned(p)),
+            Err(_) => {
+                let mut v: Vec<u8> = Vec::new();
+                v.try_reserve_exact(cap).map_err(|e| {
+                    GpuError::OutOfMemory(format!(
+                        "pageable host staging buffer of {cap} bytes (pinned alloc failed): {e}"
+                    ))
+                })?;
+                v.resize(cap, 0);
+                Ok(HostPlaneBuf::Pageable(v))
+            }
         }
     }
 
@@ -380,12 +398,12 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     // 2-slot rings: pinned host staging + device staging, one entry per stream
     // in flight. Upload(g+1) into the other slot overlaps compute(g).
     let mut pinned_idx = [
-        HostPlaneBuf::new(dev, max_idx_bytes),
-        HostPlaneBuf::new(dev, max_idx_bytes),
+        HostPlaneBuf::new(dev, max_idx_bytes)?,
+        HostPlaneBuf::new(dev, max_idx_bytes)?,
     ];
     let mut pinned_val = [
-        HostPlaneBuf::new(dev, max_val_bytes),
-        HostPlaneBuf::new(dev, max_val_bytes),
+        HostPlaneBuf::new(dev, max_val_bytes)?,
+        HostPlaneBuf::new(dev, max_val_bytes)?,
     ];
     let mut dev_idx = [
         dev.alloc_zeros::<u8>(max_idx_bytes.max(1))?,
