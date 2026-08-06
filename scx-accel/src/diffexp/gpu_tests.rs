@@ -1218,3 +1218,226 @@ fn test_gpu_lazy_entry_points_match_dense_reference() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unlabelled cells on the GPU 1-vs-rest path
+// ---------------------------------------------------------------------------
+
+/// Same gate as `require_gpu_or_skip!`, but `SCX_REQUIRE_GPU=1` turns the skip
+/// into a hard failure and a run prints a marker.
+///
+/// Most of this suite passes green while doing nothing on a CPU host, so a new
+/// GPU regression is worth exactly as much as the proof that it executed. The
+/// marker line is what the sbatch log is grepped for.
+macro_rules! require_gpu_or_skip_loud {
+    ($name:expr) => {
+        match scx_gpu::GpuDevice::new(0) {
+            Ok(_) => {
+                eprintln!("SCX_GPU_TEST_RAN: {}", $name);
+            }
+            Err(e) => {
+                if std::env::var("SCX_REQUIRE_GPU").as_deref() == Ok("1") {
+                    panic!("SCX_REQUIRE_GPU=1 but no CUDA device for {}: {e}", $name);
+                }
+                eprintln!("CUDA not available — skipping {}", $name);
+                return;
+            }
+        }
+    };
+}
+
+/// **The oracle for unlabelled-cell semantics on the GPU**, mirroring
+/// `diffexp::cpu_tests::test_one_vs_rest_unlabelled_cells_equal_physical_subset`.
+///
+/// GPU 1-vs-rest over a matrix containing unlabelled cells (group label
+/// `>= n_groups`) must equal GPU 1-vs-rest over the same matrix with those rows
+/// physically removed. The v3 driver used to build its rank pool from
+/// `0..n_obs` and derive `rest_n = n_obs - n_g` while the pseudobulk sums it
+/// subtracted covered labelled groups only — the same numerator/denominator
+/// mismatch the CPU kernels had, replicated deliberately for parity.
+#[test]
+fn test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset() {
+    require_gpu_or_skip_loud!("wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset");
+
+    let n_groups = 3usize;
+    let n_vars = 6usize;
+    let per_group = 20usize;
+    let n_obs = n_groups * per_group;
+
+    let mut groups: Vec<usize> = (0..n_obs).map(|i| i / per_group).collect();
+    for (i, g) in groups.iter_mut().enumerate() {
+        if i % 6 == 0 {
+            *g = n_groups; // unlabelled sentinel
+        }
+    }
+    let mut data = vec![0.0f32; n_obs * n_vars];
+    for cell in 0..n_obs {
+        for var in 0..n_vars {
+            data[cell * n_vars + var] = ((cell * 7 + var * 13 + cell % 5) % 23) as f32;
+        }
+    }
+
+    let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    let group_names: Vec<String> = (0..n_groups).map(|g| format!("grp_{g}")).collect();
+
+    let mut sub_data = Vec::new();
+    let mut sub_groups = Vec::new();
+    for (cell, &g) in groups.iter().enumerate() {
+        if g < n_groups {
+            sub_data.extend_from_slice(&data[cell * n_vars..(cell + 1) * n_vars]);
+            sub_groups.push(g);
+        }
+    }
+    let sub_n_obs = sub_groups.len();
+    assert!(sub_n_obs < n_obs, "fixture must contain unlabelled cells");
+
+    let with_sentinel = wilcoxon_rank_sum_gpu_dense(
+        0,
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        None,
+        false,
+        false,
+        true,
+    )
+    .expect("GPU wilcoxon (with unlabelled cells) failed");
+
+    let physically_subset = wilcoxon_rank_sum_gpu_dense(
+        0,
+        &sub_data,
+        sub_n_obs,
+        n_vars,
+        &gene_names,
+        &sub_groups,
+        &group_names,
+        None,
+        false,
+        false,
+        true,
+    )
+    .expect("GPU wilcoxon (physical subset) failed");
+
+    use std::collections::HashMap;
+    let to_map = |res: &DiffExpResult, g: usize| -> HashMap<String, (f64, f64, f64)> {
+        res.names[g]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    n.clone(),
+                    (res.scores[g][i], res.pvals[g][i], res.logfoldchanges[g][i]),
+                )
+            })
+            .collect()
+    };
+
+    for g in 0..group_names.len() {
+        let a = to_map(&with_sentinel, g);
+        let b = to_map(&physically_subset, g);
+        for gene in &gene_names {
+            let (sa, pa, la) = a[gene];
+            let (sb, pb, lb) = b[gene];
+            assert!(
+                (sa - sb).abs() < 1e-6,
+                "score mismatch group={} gene={gene}: sentinel={sa}, subset={sb}",
+                group_names[g]
+            );
+            assert!(
+                (pa - pb).abs() < 1e-9 || (pa - pb).abs() / pa.abs().max(1e-12) < 1e-6,
+                "pval mismatch group={} gene={gene}: sentinel={pa}, subset={pb}",
+                group_names[g]
+            );
+            assert!(
+                (la - lb).abs() < 1e-6,
+                "logFC mismatch group={} gene={gene}: sentinel={la}, subset={lb}",
+                group_names[g]
+            );
+        }
+    }
+}
+
+/// The GPU 1-vs-rest arm must also agree with the *CPU* kernel when unlabelled
+/// cells are present — the cross-device parity the CPU-only fix would break.
+#[test]
+fn test_wilcoxon_gpu_unlabelled_matches_cpu() {
+    require_gpu_or_skip_loud!("wilcoxon_gpu_unlabelled_matches_cpu");
+
+    let n_groups = 3usize;
+    let n_vars = 5usize;
+    let per_group = 18usize;
+    let n_obs = n_groups * per_group;
+    let mut groups: Vec<usize> = (0..n_obs).map(|i| i / per_group).collect();
+    for (i, g) in groups.iter_mut().enumerate() {
+        if i % 5 == 0 {
+            *g = n_groups;
+        }
+    }
+    let mut data = vec![0.0f32; n_obs * n_vars];
+    for cell in 0..n_obs {
+        for var in 0..n_vars {
+            data[cell * n_vars + var] = ((cell * 3 + var * 11) % 19) as f32;
+        }
+    }
+    let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    let group_names: Vec<String> = (0..n_groups).map(|g| format!("grp_{g}")).collect();
+
+    let cpu = wilcoxon_rank_sum(
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        None,
+        false,
+        false,
+        true,
+        0,
+    )
+    .expect("CPU wilcoxon failed");
+    let gpu = wilcoxon_rank_sum_gpu_dense(
+        0,
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        None,
+        false,
+        false,
+        true,
+    )
+    .expect("GPU wilcoxon failed");
+
+    use std::collections::HashMap;
+    let to_map = |res: &DiffExpResult, g: usize| -> HashMap<String, (f64, f64)> {
+        res.names[g]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), (res.scores[g][i], res.logfoldchanges[g][i])))
+            .collect()
+    };
+    for g in 0..group_names.len() {
+        let c = to_map(&cpu, g);
+        let d = to_map(&gpu, g);
+        for gene in &gene_names {
+            let (sc, lc) = c[gene];
+            let (sg, lg) = d[gene];
+            assert!(
+                (sc - sg).abs() < 1e-6,
+                "score mismatch group={} gene={gene}: cpu={sc}, gpu={sg}",
+                group_names[g]
+            );
+            assert!(
+                (lc - lg).abs() < 1e-6,
+                "logFC mismatch group={} gene={gene}: cpu={lc}, gpu={lg}",
+                group_names[g]
+            );
+        }
+    }
+}

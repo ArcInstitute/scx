@@ -97,6 +97,10 @@ pub(crate) fn de_rank_cmp(
 /// * `n_vars` — Number of variables (genes).
 /// * `gene_names` — Gene names, length `n_vars`.
 /// * `groups` — Group label per cell, length `n_obs`, encoded as indices `0..n_groups`.
+///   A label `>= n_groups` marks an **unlabelled** cell (NaN / empty / off-category
+///   upstream); such cells take part in nothing — not the group sums, not "rest",
+///   not the rank pool — matching scanpy, which subsets them out of the matrix
+///   before ranking. See [`super::groups`].
 /// * `group_names` — Unique group names, length `n_groups`.
 /// * `reference` — If `Some(idx)`, compare every other group against group `idx`.
 ///   If `None`, 1-vs-rest.
@@ -136,13 +140,12 @@ pub fn wilcoxon_rank_sum(
     // Finiteness is a contract at the DE accelerator boundary (ACC10).
     ensure_finite_de_input(data)?;
 
-    // Pre-compute cell indices per group.
-    let mut group_indices: Vec<Vec<usize>> = vec![vec![]; n_groups];
-    for (i, &g) in groups.iter().enumerate() {
-        if g < n_groups {
-            group_indices[g].push(i);
-        }
-    }
+    // Pre-compute the labelled pool and the per-group cell lists. Cells whose
+    // label is out of range take part in nothing — see `diffexp::groups`.
+    let partition = super::groups::partition_by_group(groups, n_groups);
+    let group_indices = &partition.group_indices;
+    let pool_pos = &partition.pool_pos;
+    let n_labelled = partition.n_labelled();
 
     // Determine which groups to test and what they compare against.
     let test_groups: Vec<usize> = match reference {
@@ -181,34 +184,42 @@ pub fn wilcoxon_rank_sum(
 
                 match reference {
                     None => {
-                        // 1-vs-rest: rank all n_obs values once, reuse across groups.
+                        // 1-vs-rest: rank the labelled pool once, reuse across groups.
+                        // The pool is `partition.labelled`, not `0..n_obs` — an
+                        // unlabelled cell is in no group, so it is neither "rest" nor
+                        // a rank competitor (scanpy subsets it out of the matrix
+                        // before ranking; see `diffexp::groups`). With every cell
+                        // labelled the gather below walks `0..n_obs` in order and this
+                        // arm is bit-identical to one that never compacted.
+                        //
                         // Fuse the per-group value sum into the gather (cells walked in
                         // ascending order → per-group sums match the `group_indices`
                         // order). The 1-vs-rest reference sum is then O(1) per group:
                         // `total - group_sum_buf[g]`, with `total` summed in group order.
                         group_sum_buf[..n_groups].iter_mut().for_each(|s| *s = 0.0);
-                        for i in 0..n_obs {
+                        for (p, &i) in partition.labelled.iter().enumerate() {
                             let v = data[i * n_vars + var_idx] as f64;
-                            values_buf[i] = v;
-                            let g = groups[i];
-                            if g < n_groups {
-                                group_sum_buf[g] += v;
-                            }
+                            values_buf[p] = v;
+                            group_sum_buf[groups[i]] += v;
                         }
                         let total: f64 = group_sum_buf[..n_groups].iter().sum();
-                        let raw_tc = rank_with_ties(&values_buf[..n_obs], index_buf, ranks_buf);
+                        let raw_tc =
+                            rank_with_ties(&values_buf[..n_labelled], index_buf, ranks_buf);
                         let tc = if tie_correct { raw_tc } else { 0.0 };
 
                         for &g in &test_groups {
                             let n1 = group_indices[g].len();
-                            if n1 == 0 || n1 == n_obs {
+                            if n1 == 0 || n1 == n_labelled {
                                 group_results.push((f64::NAN, 1.0, f64::NAN));
                                 continue;
                             }
-                            let n2 = n_obs - n1;
+                            let n2 = n_labelled - n1;
 
+                            // Ranks are indexed by pool position, so the group's
+                            // cells are addressed through `pool_pos`, not their
+                            // global row ids.
                             let (score, pval) =
-                                wilcoxon_from_ranks(ranks_buf, &group_indices[g], n_obs, tc);
+                                wilcoxon_from_ranks(ranks_buf, &pool_pos[g], n_labelled, tc);
 
                             let mean_group = group_sum_buf[g] / n1 as f64;
                             let rest_sum = total - group_sum_buf[g];

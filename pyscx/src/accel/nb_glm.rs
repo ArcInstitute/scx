@@ -1143,7 +1143,7 @@ pub fn pdex_nb_glm(
     // NB-GLM needs raw counts; refuse log1p-normalized input.
     let is_log1p = match is_log1p {
         Some(b) => b,
-        None => adata.getattr("uns")?.contains("log1p").unwrap_or(false),
+        None => super::util::uns_log1p_present(adata),
     };
     if is_log1p {
         return Err(PyValueError::new_err(

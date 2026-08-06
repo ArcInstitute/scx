@@ -424,6 +424,10 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
         // Drop the borrow before setattr to avoid RefCell borrow conflict
         drop(backed_ref);
         adata.setattr("X", Bound::new(py, lazy)?)?;
+        // Same annotation `sc.pp.log1p` writes (Case 3 below gets it for free
+        // by delegating). Without it the SCX-native path is the only one whose
+        // log1p is invisible to every downstream `uns["log1p"]` consumer.
+        super::util::stamp_uns_log1p(py, adata)?;
         route.commit();
         return Ok(());
     }
@@ -432,6 +436,8 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
     if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let mut lazy_ref = lazy.borrow_mut();
         lazy_ref.transforms.push(Transform::Log1p);
+        drop(lazy_ref);
+        super::util::stamp_uns_log1p(py, adata)?;
         route.commit();
         return Ok(());
     }
@@ -1033,6 +1039,7 @@ fn gpu_log1p_dispatch(
 
             let scipy_csr = scx_csr_to_scipy(py, csr)?;
             adata.setattr("X", scipy_csr)?;
+            super::util::stamp_uns_log1p(py, adata)?;
 
             // Invalidate marker after consuming it.
             uns.call_method1("pop", (GPU_NORMALIZE_MARKER_KEY,))?;
@@ -1056,6 +1063,7 @@ fn gpu_log1p_dispatch(
         drop(gs);
         let scipy_csr = scx_csr_to_scipy(py, csr)?;
         adata.setattr("X", scipy_csr)?;
+        super::util::stamp_uns_log1p(py, adata)?;
         if was_lazy {
             emit_laziness_break_warning(py)?;
         }

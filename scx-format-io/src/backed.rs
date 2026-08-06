@@ -2126,6 +2126,52 @@ impl BackedCsrReader {
         Ok(total as usize)
     }
 
+    /// Largest stored value across this reader's shards, **when the catalog
+    /// can prove one** — `None` when it cannot.
+    ///
+    /// Walks the catalog only (O(shards), no payload reads, no decode), which
+    /// is the whole point: it answers "how big do the values get?" without
+    /// touching the data. `ShardStats::value_max` is exact for the integer
+    /// value encodings and is written as `0` for `Float32`/`Float16`, where
+    /// a `u32` field cannot represent the statistic — so:
+    ///
+    /// * `Some(m)` with `m > 0` — every contributing shard is integer-encoded
+    ///   and `m` is the true maximum.
+    /// * `None` — either the shards are float-encoded, or they carry no stats,
+    ///   or every stored value really is `0`. The three are indistinguishable
+    ///   from the catalog, so callers must not read `None` as "the max is 0";
+    ///   it means *unknown*, and a caller that needs a real answer has to
+    ///   stream ([`Self::col_max`]) or ask the user.
+    ///
+    /// Covers X shards when this reader targets X, layer shards otherwise —
+    /// the same entry set as [`Self::total_nnz`].
+    pub fn catalog_int_value_max(&self) -> Option<u32> {
+        let want_layer = self.layer_name.is_some();
+        let modality = self.modality_id();
+        let max = self
+            .reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| {
+                e.modality_id == modality
+                    && if want_layer {
+                        e.section_type == SectionType::LayerCsrShard
+                            && self
+                                .layer_name
+                                .as_ref()
+                                .is_some_and(|n| e.name.starts_with(&format!("{n}_shard_")))
+                    } else {
+                        e.section_type == SectionType::CsrShard
+                    }
+            })
+            .filter_map(|e| e.stats.as_ref())
+            .map(|s| s.value_max)
+            .max()
+            .unwrap_or(0);
+        (max > 0).then_some(max)
+    }
+
     /// Compute per-row sum of squared values without materializing the full matrix.
     ///
     /// Iterates shards in order, computes row sum-of-squares from each shard's

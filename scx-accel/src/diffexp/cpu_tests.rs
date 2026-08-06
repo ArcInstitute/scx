@@ -1723,3 +1723,273 @@ fn test_pdex_ref_rejects_invalid_inputs() {
     )
     .is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Unlabelled cells (group label >= n_groups)
+// ---------------------------------------------------------------------------
+
+/// Build a deterministic dense fixture plus a group vector in which every
+/// `unlabel_every`-th cell carries the unlabelled sentinel `n_groups`.
+///
+/// Returns `(data, groups, n_obs)`. Values vary by cell and gene so no two
+/// groups share a mean and the ranking is not degenerate.
+fn unlabelled_fixture(
+    n_groups: usize,
+    n_vars: usize,
+    per_group: usize,
+    unlabel_every: usize,
+) -> (Vec<f32>, Vec<usize>, usize) {
+    let n_obs = n_groups * per_group;
+    let mut groups: Vec<usize> = (0..n_obs).map(|i| i / per_group).collect();
+    for (i, g) in groups.iter_mut().enumerate() {
+        if i % unlabel_every == 0 {
+            *g = n_groups; // the out-of-range sentinel pyscx emits for NaN labels
+        }
+    }
+    let mut data = vec![0.0f32; n_obs * n_vars];
+    for cell in 0..n_obs {
+        for var in 0..n_vars {
+            data[cell * n_vars + var] = ((cell * 7 + var * 13 + cell % 5) % 23) as f32;
+        }
+    }
+    (data, groups, n_obs)
+}
+
+/// Physically drop the unlabelled rows, returning `(data, groups, n_obs)` for
+/// the same matrix with no sentinel in it.
+fn drop_unlabelled(
+    data: &[f32],
+    groups: &[usize],
+    n_vars: usize,
+    n_groups: usize,
+) -> (Vec<f32>, Vec<usize>, usize) {
+    let mut sub_data = Vec::new();
+    let mut sub_groups = Vec::new();
+    for (cell, &g) in groups.iter().enumerate() {
+        if g < n_groups {
+            sub_data.extend_from_slice(&data[cell * n_vars..(cell + 1) * n_vars]);
+            sub_groups.push(g);
+        }
+    }
+    let n_obs = sub_groups.len();
+    (sub_data, sub_groups, n_obs)
+}
+
+/// **The oracle for unlabelled-cell semantics.** 1-vs-rest DE over a matrix
+/// containing unlabelled cells must equal 1-vs-rest DE over the same matrix
+/// with those rows physically removed — scores, p-values and logFC alike. That
+/// is exactly what scanpy computes: `rank_genes_groups` subsets to
+/// `obs[groupby].isin(groups_order)` before it ranks anything.
+///
+/// Regression for the review's §7.1: `total` excluded unlabelled cells while
+/// `n2 = n_obs - n1` counted them, inflating every logFC in every group by
+/// `log2(n_obs − n1) − log2(n_labelled − n1)`, and the rank pool kept them as
+/// competitors so the z-score diverged too.
+#[test]
+fn test_one_vs_rest_unlabelled_cells_equal_physical_subset() {
+    let n_groups = 4usize;
+    let n_vars = 6usize;
+    let per_group = 15usize;
+    let (data, groups, n_obs) = unlabelled_fixture(n_groups, n_vars, per_group, 7);
+    let n_unlabelled = groups.iter().filter(|&&g| g >= n_groups).count();
+    assert!(n_unlabelled > 0, "fixture must contain unlabelled cells");
+
+    let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    let group_names: Vec<String> = (0..n_groups).map(|g| format!("grp_{g}")).collect();
+
+    let (sub_data, sub_groups, sub_n_obs) = drop_unlabelled(&data, &groups, n_vars, n_groups);
+    assert_eq!(sub_n_obs, n_obs - n_unlabelled);
+
+    for &tie_correct in &[false, true] {
+        let with_sentinel = wilcoxon_rank_sum(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            false,
+            false,
+            tie_correct,
+            0,
+        )
+        .unwrap();
+        let physically_subset = wilcoxon_rank_sum(
+            &sub_data,
+            sub_n_obs,
+            n_vars,
+            &gene_names,
+            &sub_groups,
+            &group_names,
+            None,
+            false,
+            false,
+            tie_correct,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(with_sentinel.group_names, physically_subset.group_names);
+        for row in 0..with_sentinel.group_names.len() {
+            assert_eq!(
+                with_sentinel.names[row], physically_subset.names[row],
+                "gene order diverged for group {}",
+                with_sentinel.group_names[row]
+            );
+            for col in 0..n_vars {
+                let (a, b) = (
+                    with_sentinel.scores[row][col],
+                    physically_subset.scores[row][col],
+                );
+                assert!(
+                    (a - b).abs() < 1e-12,
+                    "score mismatch (tie_correct={tie_correct}) for {}/{}: {a} vs {b}",
+                    with_sentinel.group_names[row],
+                    with_sentinel.names[row][col]
+                );
+                let (a, b) = (
+                    with_sentinel.pvals[row][col],
+                    physically_subset.pvals[row][col],
+                );
+                assert!(
+                    (a - b).abs() < 1e-12,
+                    "pval mismatch (tie_correct={tie_correct}) for {}/{}: {a} vs {b}",
+                    with_sentinel.group_names[row],
+                    with_sentinel.names[row][col]
+                );
+                let (a, b) = (
+                    with_sentinel.logfoldchanges[row][col],
+                    physically_subset.logfoldchanges[row][col],
+                );
+                assert!(
+                    (a - b).abs() < 1e-12,
+                    "logFC mismatch (tie_correct={tie_correct}) for {}/{}: {a} vs {b}",
+                    with_sentinel.group_names[row],
+                    with_sentinel.names[row][col]
+                );
+            }
+        }
+    }
+}
+
+/// The brute-force rest-sum oracle, but with unlabelled cells present: the rest
+/// denominator is `n_labelled − n1`, never `n_obs − n1`. Sibling of
+/// `test_one_vs_rest_logfc_matches_bruteforce_restsum`, whose `i / per_group`
+/// fixture leaves no cell unassigned and so pins nothing here.
+#[test]
+fn test_one_vs_rest_rest_denominator_excludes_unlabelled() {
+    let n_groups = 5usize;
+    let n_vars = 3usize;
+    let per_group = 9usize;
+    let (data, groups, n_obs) = unlabelled_fixture(n_groups, n_vars, per_group, 4);
+    let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    let group_names: Vec<String> = (0..n_groups).map(|g| format!("grp_{g}")).collect();
+
+    let result = wilcoxon_rank_sum(
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        None,
+        false,
+        false,
+        false,
+        0,
+    )
+    .unwrap();
+
+    let n_labelled = groups.iter().filter(|&&g| g < n_groups).count();
+    assert!(n_labelled < n_obs, "fixture must contain unlabelled cells");
+
+    let mut group_gene_sums = vec![vec![0.0f64; n_vars]; n_groups];
+    let mut group_sizes = vec![0usize; n_groups];
+    for (cell, &g) in groups.iter().enumerate() {
+        if g >= n_groups {
+            continue;
+        }
+        group_sizes[g] += 1;
+        for var in 0..n_vars {
+            group_gene_sums[g][var] += data[cell * n_vars + var] as f64;
+        }
+    }
+
+    for (g, gname) in group_names.iter().enumerate() {
+        let row = result.group_names.iter().position(|n| n == gname).unwrap();
+        let n1 = group_sizes[g] as f64;
+        let n2 = (n_labelled - group_sizes[g]) as f64;
+        for (var, vname) in gene_names.iter().enumerate() {
+            let mean_group = group_gene_sums[g][var] / n1;
+            let rest_sum: f64 = (0..n_groups)
+                .filter(|&gg| gg != g)
+                .map(|gg| group_gene_sums[gg][var])
+                .sum();
+            let expected = compute_logfc(mean_group, rest_sum / n2, false);
+            let col = result.names[row].iter().position(|n| n == vname).unwrap();
+            let got = result.logfoldchanges[row][col];
+            assert!(
+                (got - expected).abs() < 1e-9,
+                "logFC mismatch for {gname}/{vname}: got {got}, expected {expected}"
+            );
+        }
+    }
+}
+
+/// A fully-labelled fixture must be untouched by the pool compaction: with no
+/// sentinel present, `labelled` is `0..n_obs` and the gather walks cells in the
+/// same order as before, so the result is **bit-identical** to the recorded
+/// pre-fix values rather than merely close.
+#[test]
+fn test_fully_labelled_is_unaffected_by_pool_compaction() {
+    let n_groups = 3usize;
+    let n_vars = 4usize;
+    let per_group = 12usize;
+    let (data, mut groups, n_obs) = unlabelled_fixture(n_groups, n_vars, per_group, 7);
+    // Re-label every sentinel cell — the pool becomes the whole matrix.
+    for (i, g) in groups.iter_mut().enumerate() {
+        if *g >= n_groups {
+            *g = i / per_group;
+        }
+    }
+    let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    let group_names: Vec<String> = (0..n_groups).map(|g| format!("grp_{g}")).collect();
+
+    let result = wilcoxon_rank_sum(
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        None,
+        false,
+        false,
+        false,
+        0,
+    )
+    .unwrap();
+
+    // The rest mean of a fully-labelled matrix is over exactly n_obs - n1 cells.
+    let mut group_gene_sums = vec![vec![0.0f64; n_vars]; n_groups];
+    for (cell, &g) in groups.iter().enumerate() {
+        for var in 0..n_vars {
+            group_gene_sums[g][var] += data[cell * n_vars + var] as f64;
+        }
+    }
+    for (g, gname) in group_names.iter().enumerate() {
+        let row = result.group_names.iter().position(|n| n == gname).unwrap();
+        let n1 = per_group as f64;
+        let n2 = (n_obs - per_group) as f64;
+        for (var, vname) in gene_names.iter().enumerate() {
+            let rest_sum: f64 = (0..n_groups)
+                .filter(|&gg| gg != g)
+                .map(|gg| group_gene_sums[gg][var])
+                .sum();
+            let expected = compute_logfc(group_gene_sums[g][var] / n1, rest_sum / n2, false);
+            let col = result.names[row].iter().position(|n| n == vname).unwrap();
+            assert!((result.logfoldchanges[row][col] - expected).abs() < 1e-9);
+        }
+    }
+}

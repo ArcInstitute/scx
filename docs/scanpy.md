@@ -2535,7 +2535,7 @@ df = sc.get.rank_genes_groups_df(adata, group="0")
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `groupby` | (required) | Column in `adata.obs` to group cells by |
+| `groupby` | (required) | Column in `adata.obs` to group cells by. Cells with no label — NaN, empty, or a value outside the column's categories — are **excluded from the test entirely**: they are not part of a group, not part of `"rest"`, and not in the rank pool, matching scanpy, which subsets them out before ranking. A `UserWarning` reports how many were dropped. |
 | `reference` | `"rest"` | Compare against a specific group or `"rest"` (1-vs-rest) |
 | `n_genes` | all | Number of top genes to report per group |
 | `method` | `"wilcoxon"` | Statistical method (currently only `"wilcoxon"`) |

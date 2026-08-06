@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::backed::ScxBackedSparseDataset;
+use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 
 /// A single stratum: the composite key values and a boolean mask over adata.obs.
 pub(super) struct Stratum {
@@ -341,17 +342,8 @@ fn run_rank_genes_groups_inner(
     // Unknown groups (NaN / empty after astype("str") → "nan" / "") map to a
     // sentinel >= n_groups so the Wilcoxon kernels drop them, instead of
     // contaminating group 0. Mirrors resolve_groups_and_reference.
-    let oor = unique_groups.len();
-    let groups: Vec<usize> = group_labels
-        .iter()
-        .map(|label| {
-            if label.is_empty() || label == "nan" {
-                oor
-            } else {
-                *group_name_to_idx.get(label.as_str()).unwrap_or(&oor)
-            }
-        })
-        .collect();
+    let groups = encode_group_labels(&group_labels, &group_name_to_idx, unique_groups.len());
+    warn_unlabelled_cells(py, &groups, unique_groups.len(), groupby);
 
     // Resolve reference.
     let ref_idx: Option<usize> = if reference == "rest" {
@@ -375,13 +367,11 @@ fn run_rank_genes_groups_inner(
     let prefer_format = resolve_de_format(prefer_format, gpu_device_id, &x);
 
     // Auto-detect whether data has been log-transformed (sc.pp.log1p sets
-    // adata.uns["log1p"]). When true, logFC uses expm1 back-transform to
-    // match scanpy's formula.
-    let log_transformed = adata
-        .getattr("uns")?
-        .call_method1("get", ("log1p",))
-        .map(|v| !v.is_none())
-        .unwrap_or(false);
+    // adata.uns["log1p"], and so does pyscx.accel.log1p). When true, logFC uses
+    // the expm1 back-transform to match scanpy's formula. Deliberately the
+    // annotation alone, with no value heuristic: scanpy keys off `uns` too, so
+    // adding one here would create a divergence rather than close one.
+    let log_transformed = super::util::uns_log1p_present(adata);
 
     if prefer_format == "csc" {
         if gpu_device_id.is_some() {
@@ -581,8 +571,7 @@ fn run_rank_genes_groups_inner(
         // ScxLazyTransformedDataset (non-CSC GPU path) — route
         // through `wilcoxon_rank_sum_gpu` with `GpuDeShardInput::Lazy`
         // (device-resident shard
-        // pipeline) before falling through to the scipy/numpy paths.
-        // CPU lazy without CSC keeps the scipy/numpy fallback.
+        // pipeline) before falling through to the CPU lazy streamer.
         #[cfg(feature = "gpu")]
         {
             if let Some(device_id) = gpu_device_id {
@@ -613,6 +602,45 @@ fn run_rank_genes_groups_inner(
                     return Ok((result, unique_groups));
                 }
             }
+        }
+
+        // CPU lazy: stream the transformed shards, exactly as the backed arm
+        // streams untransformed ones. Without this the chain falls through to
+        // the scipy/numpy branch below, which cannot coerce a lazy dataset —
+        // `open(...) → accel.log1p → rank_genes_groups(device="cpu")` died on
+        // `ValueError: setting an array element with a sequence` rather than
+        // running. (A lazy X with a usable CSC sidecar was already served by
+        // the `prefer_format="csc"` branch above; this is the CSR case.)
+        if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
+            let chunk_size = gene_chunk_size.unwrap_or(500);
+            let lazy_src = lazy.as_shard_source().with_cached_reads();
+            drop(lazy);
+            let result = py
+                .detach(|| {
+                    scx_accel::wilcoxon_rank_sum_streaming(
+                        &lazy_src,
+                        &gene_names,
+                        &groups,
+                        &unique_groups,
+                        ref_idx,
+                        chunk_size,
+                        log_transformed,
+                        rankby_abs,
+                        tie_correct,
+                    )
+                })
+                .map(|mut r| {
+                    r.exec_info = super::route::cpu_exec_info(
+                        device,
+                        scx_accel::InputLayout::LazyCsr,
+                        true,
+                        false,
+                        Some(chunk_size),
+                    );
+                    r
+                })
+                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+            return Ok((result, unique_groups));
         }
 
         let is_sparse = scipy_sparse
@@ -1669,29 +1697,109 @@ pub fn rank_genes_groups_df(
 // pdex `mode="ref"` accelerator binding
 // ---------------------------------------------------------------------------
 
-/// Auto-detect whether `adata.X` looks log1p-transformed.
+/// pdex's heuristic threshold: log1p-transformed counts rarely exceed ~30.
+const LOG1P_MAX_VALUE_HEURISTIC: f64 = 30.0;
+
+/// Name a lazy transform chain for an error message, e.g. `normalize_total → scale`.
+fn describe_transform_chain(transforms: &[Transform]) -> String {
+    transforms
+        .iter()
+        .map(|t| match t {
+            Transform::NormalizeTotal { .. } => "normalize_total",
+            Transform::Log1p => "log1p",
+            Transform::RowScale { .. } => "row_scale",
+            Transform::Scale { .. } => "scale",
+        })
+        .collect::<Vec<_>>()
+        .join(" → ")
+}
+
+/// Auto-detect whether the DE input matrix looks log1p-transformed.
 ///
-/// Mirrors `pdex._utils._detect_is_log1p` and the existing
-/// `adata.uns["log1p"]` probe used by `rank_genes_groups`.  Prefers the
-/// explicit annotation when present.
-fn detect_is_log1p(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<bool> {
-    if let Ok(uns) = adata.getattr("uns") {
-        if let Ok(v) = uns.call_method1("get", ("log1p",)) {
-            if !v.is_none() {
-                return Ok(true);
-            }
+/// Mirrors `pdex._utils._detect_is_log1p`, preferring the explicit
+/// `uns["log1p"]` annotation and falling back to a max-value heuristic. The
+/// answer must not depend on how `X` happens to be stored: an in-memory matrix
+/// and the backed handle onto the identical data have to agree, or `pdex_ref`
+/// silently picks a different [`GeomMeanMode`] for each and their means differ
+/// by orders of magnitude (`mean(expm1(x))` vs `mean(x)`).
+///
+/// `x` is the matrix `select_de_matrix` chose — not `adata.X`, which is a
+/// different matrix under `use_raw=True` / `layer=`.
+///
+/// Resolution order:
+/// 1. `uns["log1p"]` present → yes.
+/// 2. Lazy dataset → the transform chain is the ground truth. A `Log1p` in it
+///    means yes. Any other non-empty chain rescales the values away from what
+///    the catalog recorded, so the probe refuses rather than read stale stats.
+/// 3. Backed dataset (or an empty chain) → the catalog's integer `value_max`,
+///    which needs no decode. Exact for integer-encoded shards.
+/// 4. Float-encoded shards → refuse rather than guess (see below).
+/// 5. In-memory scipy / dense → the max-value heuristic, unchanged.
+fn detect_is_log1p(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    x: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    if super::util::uns_log1p_present(adata) {
+        return Ok(true);
+    }
+
+    // Lazy: ask the chain, then fall through to its source file.
+    let backed_arc = if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
+        let transforms = lazy.transforms();
+        if transforms.iter().any(|t| matches!(t, Transform::Log1p)) {
+            return Ok(true);
         }
+        if !transforms.is_empty() {
+            // A rescaling chain (normalize_total, row_scale, scale) leaves the
+            // data not-log1p, but it also detaches the values from the file's
+            // catalog stats — `normalize_total(target_sum=1e4)` over small
+            // counts lands nowhere near the counts the shards recorded. The
+            // heuristic would then read the wrong numbers, and read them
+            // differently from the in-memory arm. Refuse instead.
+            return Err(PyValueError::new_err(format!(
+                "pdex_ref: cannot auto-detect whether this matrix is log1p-transformed. \
+                 adata.uns['log1p'] is absent and adata.X carries a lazy transform chain \
+                 ({}) that rescales the stored values, so the SCX catalog's recorded value \
+                 range no longer describes them. This chain contains no log1p, so \
+                 is_log1p=False is almost certainly what you want; pass it explicitly \
+                 (or is_log1p=True if the file itself already held log-space values).",
+                describe_transform_chain(transforms)
+            )));
+        }
+        Some(std::sync::Arc::clone(&lazy.backed))
+    } else {
+        x.extract::<PyRef<ScxBackedSparseDataset>>()
+            .ok()
+            .map(|b| std::sync::Arc::clone(&b.backed))
+    };
+
+    if let Some(backed) = backed_arc {
+        // Catalog-only: O(shards), no payload read, no materialization.
+        // A superset bound (the file, not a row/column view onto it) is fine
+        // here — the heuristic only asks whether values reach counts scale.
+        if let Some(max_val) = backed.catalog_int_value_max() {
+            return Ok((max_val as f64) < LOG1P_MAX_VALUE_HEURISTIC);
+        }
+        // Float-encoded shards write `value_max = 0` by design, so the catalog
+        // cannot bound them. Guessing here is what made backed and in-memory
+        // disagree; say so instead.
+        return Err(PyValueError::new_err(
+            "pdex_ref: cannot auto-detect whether this matrix is log1p-transformed. \
+             adata.uns['log1p'] is absent and the SCX file stores float-encoded values, \
+             whose range the catalog does not record — so the max-value heuristic used \
+             for an in-memory matrix has nothing to read, and guessing would make the \
+             backed result disagree with the in-memory one. Pass is_log1p=True for \
+             log-space data or is_log1p=False for raw counts. To apply the heuristic \
+             yourself: `is_log1p=adata.X.max() < 30` (a streaming max, no materialization).",
+        ));
     }
-    // Fall back to a max-value heuristic on adata.X, matching pdex's default.
-    // Skip the probe for backed datasets — touching X here would force a load.
-    let x = adata.getattr("X")?;
-    if x.extract::<PyRef<ScxBackedSparseDataset>>().is_ok() {
-        return Ok(false);
-    }
+
+    // In-memory scipy sparse / dense.
     let np = py.import("numpy")?;
     let scipy_sparse = py.import("scipy.sparse")?;
     let is_sparse = scipy_sparse
-        .call_method1("issparse", (&x,))?
+        .call_method1("issparse", (x,))?
         .extract::<bool>()
         .unwrap_or(false);
     let max_val: f64 = if is_sparse {
@@ -1702,8 +1810,7 @@ fn detect_is_log1p(py: Python<'_>, adata: &Bound<'_, PyAny>) -> PyResult<bool> {
         let m = np.call_method1("max", (x,))?;
         m.extract::<f64>().unwrap_or(f64::NAN)
     };
-    // pdex's heuristic: log1p-transformed counts rarely exceed ~30.
-    Ok(max_val.is_finite() && max_val < 30.0)
+    Ok(max_val.is_finite() && max_val < LOG1P_MAX_VALUE_HEURISTIC)
 }
 
 /// Resolve group encoding and reference index, mirroring
@@ -1747,8 +1854,26 @@ fn resolve_groups_and_reference(
     // Unknown groups (NaN / empty strings after astype("str") become "nan" /
     // "") get mapped to a sentinel that exceeds n_groups, so pdex_ref drops
     // them. Use `unique_groups.len()` as the out-of-range marker.
-    let oor = unique_groups.len();
-    let groups: Vec<usize> = group_labels
+    let groups = encode_group_labels(&group_labels, &group_name_to_idx, unique_groups.len());
+    warn_unlabelled_cells(adata.py(), &groups, unique_groups.len(), groupby);
+
+    Ok((groups, unique_groups, ref_idx))
+}
+
+/// Map string labels onto group indices, sending anything unrecognised to the
+/// out-of-range sentinel `oor = n_groups`.
+///
+/// `pandas` renders a missing categorical value as `"nan"` and an empty string
+/// as `""` once `astype("str")` has run; both mean "this cell was never
+/// annotated". The kernels treat any index `>= n_groups` as unlabelled and
+/// leave those cells out of the comparison entirely (see
+/// `scx_accel::diffexp::groups`).
+fn encode_group_labels(
+    group_labels: &[String],
+    group_name_to_idx: &std::collections::HashMap<&str, usize>,
+    oor: usize,
+) -> Vec<usize> {
+    group_labels
         .iter()
         .map(|label| {
             if label.is_empty() || label == "nan" {
@@ -1757,9 +1882,35 @@ fn resolve_groups_and_reference(
                 *group_name_to_idx.get(label.as_str()).unwrap_or(&oor)
             }
         })
-        .collect();
+        .collect()
+}
 
-    Ok((groups, unique_groups, ref_idx))
+/// Tell the caller when cells were dropped for having no group label.
+///
+/// Silently excluding rows changes what "rest" means, and an `obs` column with
+/// a handful of unannotated cells looks exactly like one without. scanpy makes
+/// the same exclusion; nothing anywhere reported it.
+fn warn_unlabelled_cells(py: Python<'_>, groups: &[usize], n_groups: usize, groupby: &str) {
+    let n_unlabelled = groups.iter().filter(|&&g| g >= n_groups).count();
+    if n_unlabelled == 0 {
+        return;
+    }
+    if let Ok(warnings) = py.import("warnings") {
+        let _ = warnings.call_method1(
+            "warn",
+            (
+                format!(
+                    "{n_unlabelled} of {} cells have no group label in obs['{groupby}'] \
+                     (NaN, empty, or a value outside the column's categories). They are \
+                     excluded from the test entirely — they are not part of 'rest' and not \
+                     part of the rank pool — matching scanpy, which subsets them out before \
+                     ranking. Drop or label them to silence this.",
+                    groups.len()
+                ),
+                py.get_type::<pyo3::exceptions::PyUserWarning>(),
+            ),
+        );
+    }
 }
 
 /// Run pdex `mode="ref"` against an AnnData, dispatching to the SCX-backed
@@ -1795,7 +1946,7 @@ fn run_pdex_ref_inner(
 
     let resolved_log1p = match is_log1p {
         Some(v) => v,
-        None => detect_is_log1p(py, adata)?,
+        None => detect_is_log1p(py, adata, &x)?,
     };
     let mode = scx_accel::GeomMeanMode::from_flags(geometric_mean, resolved_log1p);
 
@@ -1971,8 +2122,7 @@ fn run_pdex_ref_inner(
     }
 
     // G1.8: ScxLazyTransformedDataset (non-CSC GPU path). See the matching
-    // branch in `run_rank_genes_groups_inner`. CPU lazy without CSC still
-    // falls through to scipy-CSR / numpy materialisation below.
+    // branch in `run_rank_genes_groups_inner`.
     #[cfg(feature = "gpu")]
     if let Some(device_id) = gpu_device_id {
         if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
@@ -1996,6 +2146,42 @@ fn run_pdex_ref_inner(
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
         }
+    }
+
+    // CPU lazy: stream the transformed shards, as the backed arm above does
+    // for untransformed ones. See the matching branch in
+    // `run_rank_genes_groups_inner` — without it the review's own §7.2 repro
+    // (`open(...) → accel.log1p → pdex_ref`) raised out of numpy instead of
+    // producing a number to compare.
+    if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
+        let chunk_size = gene_chunk_size.unwrap_or(500);
+        let lazy_src = lazy.as_shard_source().with_cached_reads();
+        drop(lazy);
+        return py
+            .detach(|| {
+                scx_accel::pdex_ref_streaming(
+                    &lazy_src,
+                    &gene_names,
+                    &groups,
+                    &unique_groups,
+                    ref_idx,
+                    chunk_size,
+                    mode,
+                    epsilon,
+                    cpm_filter,
+                )
+            })
+            .map(|mut r| {
+                r.exec_info = super::route::cpu_exec_info(
+                    device,
+                    scx_accel::InputLayout::LazyCsr,
+                    true,
+                    false,
+                    Some(chunk_size),
+                );
+                r
+            })
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
     }
 
     let is_sparse = scipy_sparse
