@@ -65,12 +65,30 @@ impl GroupPartition {
 /// per-group global cell lists, and the per-group pool positions.
 ///
 /// A label `>= n_groups` is unlabelled and appears in none of the three.
-/// Everything is built in one ascending pass, so both index lists are ascending
-/// and the f64 accumulation order of any sum driven by them is deterministic.
+/// The filling pass walks `groups` in ascending order, so both index lists come
+/// out ascending and the f64 accumulation order of any sum driven by them is
+/// deterministic.
+///
+/// A counting pass runs first so every vector is allocated at its exact size.
+/// At atlas scale the growth-doubling alternative transiently holds roughly
+/// twice the final footprint across `2·n_groups + 1` vectors, and the extra
+/// read over `groups` is far cheaper than that.
 pub fn partition_by_group(groups: &[usize], n_groups: usize) -> GroupPartition {
-    let mut labelled = Vec::with_capacity(groups.len());
-    let mut group_indices: Vec<Vec<usize>> = vec![Vec::new(); n_groups];
-    let mut pool_pos: Vec<Vec<usize>> = vec![Vec::new(); n_groups];
+    let mut group_sizes = vec![0usize; n_groups];
+    let mut n_labelled = 0usize;
+    for &g in groups {
+        if g < n_groups {
+            group_sizes[g] += 1;
+            n_labelled += 1;
+        }
+    }
+
+    let mut labelled = Vec::with_capacity(n_labelled);
+    let mut group_indices: Vec<Vec<usize>> =
+        group_sizes.iter().map(|&n| Vec::with_capacity(n)).collect();
+    let mut pool_pos: Vec<Vec<usize>> =
+        group_sizes.iter().map(|&n| Vec::with_capacity(n)).collect();
+
     for (i, &g) in groups.iter().enumerate() {
         if g < n_groups {
             group_indices[g].push(i);

@@ -164,7 +164,7 @@ pub fn wilcoxon_rank_sum(
     let n_test_groups = test_groups.len();
 
     // --- Pre-rank approach: rank once per gene, then derive per-group statistics ---
-    // For 1-vs-rest: rank all n_obs values once per gene (10× fewer sorts).
+    // For 1-vs-rest: rank the labelled pool once per gene (10× fewer sorts).
     // For pairwise: rank (group + ref) cells per test group per gene.
     let gene_group_results: Vec<Vec<(f64, f64, f64)>> = (0..n_vars)
         .into_par_iter()

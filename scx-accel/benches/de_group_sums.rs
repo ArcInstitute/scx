@@ -43,6 +43,12 @@ fn make_fixture(n_obs: usize, n_vars: usize, n_groups: usize) -> Fixture {
     // Deterministic, varied non-negative counts; balanced ascending groups
     // (cell i → group i % n_groups), so group_indices[g] is ascending — matching
     // the production `group_indices` build and OPT-3.3's bit-identity assumption.
+    //
+    // Every cell is labelled here, which is why the `n2 = n_obs - n1` below is
+    // numerically fine. **Do not copy that expression into a kernel**: the
+    // production rest denominator is `n_labelled - n1`, and conflating the two
+    // is exactly the defect `diffexp::groups` exists to prevent. This file
+    // measures the cost of the summation shape, not its semantics.
     let mut data = vec![0.0f32; n_obs * n_vars];
     for cell in 0..n_obs {
         let g = cell % n_groups;

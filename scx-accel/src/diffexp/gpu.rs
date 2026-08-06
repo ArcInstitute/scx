@@ -590,8 +590,9 @@ fn wilcoxon_chunk_gpu_sequence_v3(
     is_ref_mode: bool,
 ) -> Result<()> {
     // Pool slab is pre-populated by the shard pass; sort + tie on it. The pool
-    // is the reference group in ref-mode or all cells in 1-vs-rest; either way
-    // `scratch.ref_slab` holds it and `scratch.tie_term` holds its tie term.
+    // is the reference group in ref-mode or the labelled cells in 1-vs-rest;
+    // either way `scratch.ref_slab` holds it and `scratch.tie_term` holds its
+    // tie term.
     gpu_de_block_sort(
         dev,
         &mut scratch.ref_slab,
@@ -1733,8 +1734,14 @@ fn prepare_wilcoxon_v3(
     reference: Option<usize>,
 ) -> Result<WilcoxonV3Prep> {
     let n_groups = group_names.len();
-    let partition = super::groups::partition_by_group(groups, n_groups);
-    let group_indices = partition.group_indices.clone();
+    // Destructured rather than cloned: `group_indices` is moved into the
+    // returned prep, and at atlas scale the clone was a second copy of one
+    // index per labelled cell for no reason.
+    let super::groups::GroupPartition {
+        labelled,
+        group_indices,
+        ..
+    } = super::groups::partition_by_group(groups, n_groups);
     let is_ref_mode = reference.is_some();
     let test_groups: Vec<usize> = match reference {
         Some(r) => (0..n_groups).filter(|&g| g != r).collect(),
@@ -1747,7 +1754,7 @@ fn prepare_wilcoxon_v3(
     // rank-pool size and the base of the rest denominator below.
     let pool_host: Vec<i32> = match reference {
         Some(r) => group_indices[r].iter().map(|&c| c as i32).collect(),
-        None => partition.labelled.iter().map(|&c| c as i32).collect(),
+        None => labelled.iter().map(|&c| c as i32).collect(),
     };
     let pool_len = pool_host.len();
     if pool_len == 0 {
@@ -2178,7 +2185,7 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csc(
             source
                 .for_each_gpu_csc_shard_in_range(c0 as u32..c1 as u32, &mut |_idx, csc_view| {
                     shards += 1;
-                    // group_id = 0 is the pool (ref cells / all cells); 1..=n_test
+                    // group_id = 0 is the pool (ref cells / labelled cells); 1..=n_test
                     // are the per-test-group slabs.
                     gpu_de_scatter_csc_to_gene_major(
                         dev,

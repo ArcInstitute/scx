@@ -163,9 +163,13 @@ def test_backed_counts_agree_with_in_memory_counts(tmp_path):
 
 
 def test_backed_low_max_counts_agree_with_in_memory(tmp_path):
-    """The heuristic's `< 30` side, which a fixture whose max lands at 30–31
-    never exercises — and that near-miss is why the existing backed-vs-in-memory
-    comparisons passed while the probe was hard-coded to `False`.
+    """Exercise the branch where the data *does* look log1p on a backed file.
+
+    The backed arm must reach `is_log1p=True` from the catalog exactly where the
+    in-memory arm reaches it from `max(X)`. This is the side of the threshold the
+    pre-existing backed-vs-in-memory comparisons never touched: their fixture
+    lands at a max of 30–31, so the in-memory heuristic returned `False` and
+    matched the hard-coded backed `False` by luck rather than by agreement.
     """
     adata = _counts_adata()
     # Squash the range so every stored value is below the threshold.

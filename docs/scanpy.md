@@ -2566,7 +2566,7 @@ df = pyscx.accel.pdex_ref(adata, "perturbation", reference="non-targeting")
 |-----------|---------|-------------|
 | `groupby` | (required) | Column in `adata.obs` containing perturbation labels |
 | `reference` | `"non-targeting"` | Control group label |
-| `is_log1p` | `None` | Whether input X is log1p-transformed. `None` auto-detects. |
+| `is_log1p` | `None` | Whether input X is log1p-transformed. `None` auto-detects, layout-independently — a backed handle and an in-memory `AnnData` over the same data resolve the same mode. Order: `adata.uns["log1p"]` → a lazy `X`'s `Log1p` transform → a backed `X`'s catalog `value_max` against a `< 30` heuristic (catalog-only, no decode) → in-memory `max(X) < 30`. **Two cases raise `ValueError` instead of guessing**: a backed file whose shards are float-encoded (the format records no value range for those), and a lazy `X` carrying a rescaling-only chain such as `normalize_total` (which detaches the values from the recorded range). Pass `True`/`False` to resolve either — or run `pyscx.accel.log1p`, which stamps `uns["log1p"]` and settles it. |
 | `geometric_mean` | `True` | Use geometric mean for fold-change computation |
 | `epsilon` | `1e-9` | Finite-guard pseudocount on count-space means before fold-/percent-change (not CPM/MWU). Default keeps outputs finite; `0/0 → 0.0`. Pass `0.0` for legacy `±inf` on reference-undetected genes. |
 | `cpm_filter` | `None` | Optional CPM floor `T`: keep a gene iff `target_cpm > T` or `ref_cpm > T` (pooled arithmetic CPM, mode-independent); drops other rows, FDR recomputed over survivors. |

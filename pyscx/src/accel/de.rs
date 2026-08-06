@@ -1781,17 +1781,19 @@ fn detect_is_log1p(
         if let Some(max_val) = backed.catalog_int_value_max() {
             return Ok((max_val as f64) < LOG1P_MAX_VALUE_HEURISTIC);
         }
-        // Float-encoded shards write `value_max = 0` by design, so the catalog
-        // cannot bound them. Guessing here is what made backed and in-memory
-        // disagree; say so instead.
+        // The catalog could not bound the values — float-encoded shards write
+        // `value_max = 0` by design, and a shard may carry no stats at all.
+        // Which of the two it is cannot be told from here, so the message must
+        // not assert one. Guessing is what made backed and in-memory disagree.
         return Err(PyValueError::new_err(
             "pdex_ref: cannot auto-detect whether this matrix is log1p-transformed. \
-             adata.uns['log1p'] is absent and the SCX file stores float-encoded values, \
-             whose range the catalog does not record — so the max-value heuristic used \
-             for an in-memory matrix has nothing to read, and guessing would make the \
-             backed result disagree with the in-memory one. Pass is_log1p=True for \
-             log-space data or is_log1p=False for raw counts. To apply the heuristic \
-             yourself: `is_log1p=adata.X.max() < 30` (a streaming max, no materialization).",
+             adata.uns['log1p'] is absent and the SCX catalog cannot bound this file's \
+             value range (float-encoded shards record no range, and a shard may carry no \
+             statistics at all) — so the max-value heuristic used for an in-memory matrix \
+             has nothing to read, and guessing would make the backed result disagree with \
+             the in-memory one. Pass is_log1p=True for log-space data or is_log1p=False \
+             for raw counts. To apply the heuristic yourself: \
+             `is_log1p=adata.X.max() < 30` (a streaming max, no materialization).",
         ));
     }
 
@@ -1895,6 +1897,14 @@ fn warn_unlabelled_cells(py: Python<'_>, groups: &[usize], n_groups: usize, grou
     if n_unlabelled == 0 {
         return;
     }
+    // Also on the Rust log, so a batch pipeline running under
+    // `-W ignore` / `warnings.simplefilter("ignore")` still leaves a record
+    // that rows were dropped.
+    log::warn!(
+        "DE on obs['{groupby}']: {n_unlabelled} of {} cells have no group label and are \
+         excluded from the test",
+        groups.len()
+    );
     if let Ok(warnings) = py.import("warnings") {
         let _ = warnings.call_method1(
             "warn",

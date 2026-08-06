@@ -377,6 +377,10 @@ def test_rank_genes_groups_rest_with_unlabelled_matches_scanpy():
     got = _scores_and_pvals_by_gene(with_nan)
     want = _scores_and_pvals_by_gene(filtered)
     assert got.keys() == want.keys()
+    # Looser than the self-parity test above (1e-9/1e-12), which compares two
+    # runs of the same kernel. Here the two sides are different implementations:
+    # scanpy accumulates its means and its tie correction in a different order
+    # and partly in float32, so agreement is to float tolerance, not to the bit.
     for key in want:
         np.testing.assert_allclose(
             got[key], want[key], rtol=1e-5, atol=1e-6,

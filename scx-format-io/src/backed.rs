@@ -2137,17 +2137,22 @@ impl BackedCsrReader {
     ///
     /// * `Some(m)` with `m > 0` — every contributing shard is integer-encoded
     ///   and `m` is the true maximum.
-    /// * `None` — either the shards are float-encoded, or they carry no stats,
-    ///   or every stored value really is `0`. The three are indistinguishable
-    ///   from the catalog, so callers must not read `None` as "the max is 0";
-    ///   it means *unknown*, and a caller that needs a real answer has to
-    ///   stream ([`Self::col_max`]) or ask the user.
+    /// * `Some(0)` — the matrix is empty (`nnz == 0`), so `0` *is* the maximum
+    ///   and the catalog proves it.
+    /// * `None` — a nonempty matrix whose maximum the catalog cannot bound:
+    ///   the shards are float-encoded, or they carry no stats. The two are
+    ///   indistinguishable from here, so callers must not report either as the
+    ///   cause; `None` means *unknown*, and a caller that needs a real answer
+    ///   has to stream ([`Self::col_max`]) or ask the user.
     ///
     /// Covers X shards when this reader targets X, layer shards otherwise —
     /// the same entry set as [`Self::total_nnz`].
     pub fn catalog_int_value_max(&self) -> Option<u32> {
         let want_layer = self.layer_name.is_some();
         let modality = self.modality_id();
+        // Hoisted out of the filter: otherwise every catalog entry pays a
+        // `format!` allocation just to be compared against.
+        let layer_prefix = self.layer_name.as_ref().map(|n| format!("{n}_shard_"));
         let max = self
             .reader
             .catalog()
@@ -2157,10 +2162,9 @@ impl BackedCsrReader {
                 e.modality_id == modality
                     && if want_layer {
                         e.section_type == SectionType::LayerCsrShard
-                            && self
-                                .layer_name
+                            && layer_prefix
                                 .as_ref()
-                                .is_some_and(|n| e.name.starts_with(&format!("{n}_shard_")))
+                                .is_some_and(|prefix| e.name.starts_with(prefix))
                     } else {
                         e.section_type == SectionType::CsrShard
                     }
@@ -2169,7 +2173,16 @@ impl BackedCsrReader {
             .map(|s| s.value_max)
             .max()
             .unwrap_or(0);
-        (max > 0).then_some(max)
+        if max > 0 {
+            return Some(max);
+        }
+        // `value_max == 0` is ambiguous between "float-encoded / no stats" and
+        // "there are no values". `nnz` disambiguates: an empty matrix really
+        // does max to 0, and saying so beats making the caller refuse.
+        match self.total_nnz() {
+            Ok(0) => Some(0),
+            _ => None,
+        }
     }
 
     /// Compute per-row sum of squared values without materializing the full matrix.

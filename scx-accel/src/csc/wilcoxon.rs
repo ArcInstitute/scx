@@ -192,6 +192,10 @@ fn assign_block_ranks(
 /// to no rank — its nonzeros never enter the sorted blocks and it is not part
 /// of the implicit-zero block. Same rule as `wilcoxon_rank_sum`'s 1-vs-rest
 /// arm; see `crate::diffexp::groups`.
+///
+/// `n_obs` survives as the **data-dimension** bound only — CSC row indices are
+/// global, so it is what an out-of-range row is checked against. It is not a
+/// statistical parameter here; `n_labelled` is.
 #[allow(clippy::too_many_arguments)]
 fn gene_stats_nnz(
     rows: &[i32],
