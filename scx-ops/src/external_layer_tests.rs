@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Array, Float32Array, RecordBatch, StringArray};
+use arrow::array::{Array, Float32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::header::FileHeader;
@@ -928,29 +928,40 @@ fn fixture_with_obs_index(dir: &Path, name: &str) -> PathBuf {
         Arc::new(Schema::new(vec![
             Field::new("barcode", DataType::Utf8, false),
             Field::new("cell_type", DataType::Utf8, false),
+            Field::new("n_counts", DataType::Int64, false),
         ])),
         vec![
             Arc::new(StringArray::from(
                 (0..n_obs).map(|i| format!("cell_{i}")).collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(vec!["T", "B", "T", "B"])),
+            Arc::new(Int64Array::from(vec![10i64, 20, 30, 40])),
         ],
     )
     .unwrap();
 
     let path = dir.join(name);
-    let header =
-        FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, n_obs as u32, 0, 0);
+    let header = FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, 2, 0, 0);
     let mut writer = ScxWriter::new(&path, header).unwrap();
     writer.write_obs(&obs).unwrap();
     writer.write_var(&var_batch(n_vars)).unwrap();
-    let indptr: Vec<u64> = vec![0u64; n_obs + 1];
-    writer
-        .write_csr_shard(&indptr, &[], &[], CodecId::None, ValueEncoding::Uint8, 0)
-        .unwrap();
+    let ranges: Vec<(u64, u64)> = vec![(0, 2), (2, 4)];
+    for (start, _) in &ranges {
+        let indptr: Vec<u64> = vec![0u64; 3];
+        writer
+            .write_csr_shard(
+                &indptr,
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                *start,
+            )
+            .unwrap();
+    }
 
     let build_opts = scx_engine::PredicateIndexBuildOptions {
-        forced_columns: vec!["cell_type".to_string()],
+        forced_columns: vec!["cell_type".to_string(), "n_counts".to_string()],
         preset_columns: Vec::new(),
         auto_threshold: 1000,
         high_cardinality_threshold: 100_000,
@@ -959,7 +970,7 @@ fn fixture_with_obs_index(dir: &Path, name: &str) -> PathBuf {
     let mut named = Vec::new();
     let bytes = scx_engine::build_obs_predicate_index_bytes(
         &obs,
-        &[(0u64, n_obs as u64)],
+        &ranges,
         &build_opts,
         &mut outcomes,
         &mut named,
@@ -967,6 +978,10 @@ fn fixture_with_obs_index(dir: &Path, name: &str) -> PathBuf {
     .unwrap()
     .expect("cell_type must be indexable");
     writer.write_obs_predicate_index(&bytes).unwrap();
+    // The per-shard catalog stats the index implies. Level-1 pruning reads these,
+    // not the index section, so a fixture without them cannot observe a stale
+    // bound at all — see the matching note in `external_obs_tests.rs`.
+    scx_engine::apply_obs_shard_column_stats(&mut writer, &bytes, ranges.len()).unwrap();
     writer
         .write_uns(&serde_json::json!({"state": "v0"}))
         .unwrap();
@@ -1036,6 +1051,86 @@ fn layer_import_drops_a_stale_obs_predicate_index_on_overwrite() {
     assert!(
         !has_obs_index(&path),
         "the index still covers 'cell_type', whose values were just replaced"
+    );
+}
+
+/// Column names that still have per-shard catalog stats on some CSR shard —
+/// what Level-1 pushdown actually prunes on.
+fn columns_with_shard_stats(path: &Path, candidates: &[&str]) -> Vec<String> {
+    use scx_format_io::column_name_hash;
+    let reader = ScxReader::open(path).unwrap();
+    let live: Vec<u64> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CsrShard)
+        .filter_map(|e| e.stats.as_ref())
+        .flat_map(|s| s.column_stats.iter().map(|cs| cs.column_name_hash()))
+        .collect();
+    candidates
+        .iter()
+        .filter(|c| live.contains(&column_name_hash(c)))
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+/// Dropping the stale index is only half of it: the catalog's per-shard
+/// `ColumnStat`s are what Level-1 pruning reads, and the numeric `MinMax` arm
+/// never consults the index at all. An overwrite that leaves them behind
+/// excludes shards on bounds describing values CellBender just replaced.
+///
+/// Scoped to the overwritten column — `cell_type` keeps its stats, because a
+/// CellBender import joins by barcode and does not touch it.
+#[test]
+fn layer_import_clears_shard_column_stats_for_the_overwritten_column_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture_with_obs_index(dir.path(), "a.scx");
+    assert_eq!(
+        columns_with_shard_stats(&path, &["cell_type", "n_counts"]),
+        vec!["cell_type".to_string(), "n_counts".to_string()],
+        "fixture must start with stats for both indexed columns"
+    );
+
+    let mut data = diagonal_data(keys("cell_", 4), keys("g", 2), |i| (i + 1) as f32);
+    data.row_annotations = Some(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "n_counts",
+                DataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![100i64, 200, 300, 400]))],
+        )
+        .unwrap(),
+    );
+
+    attach_external_layer(
+        &path,
+        &data,
+        &AttachLayerOptions {
+            layer_name: "cb".to_string(),
+            overwrite: true,
+            provenance_action: "test_import".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        columns_with_shard_stats(&path, &["cell_type", "n_counts"]),
+        vec!["cell_type".to_string()],
+        "the overwritten column's stats must go, and only that column's"
+    );
+    let n = scx_engine::QueryPipeline::open(&path)
+        .unwrap()
+        .filter_obs("n_counts > 150")
+        .unwrap()
+        .count()
+        .unwrap()
+        .matched_rows;
+    assert_eq!(
+        n, 3,
+        "200/300/400 match; the pre-import bounds (10–40) would exclude every shard"
     );
 }
 

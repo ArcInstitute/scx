@@ -2884,6 +2884,97 @@ pub fn assign_csr_shard_column_stats(
     Ok(())
 }
 
+/// Drop the per-shard column statistics for **every** indexed obs column from
+/// the CSR shard entries in `entries`. Returns the number of entries changed.
+///
+/// The counterpart to [`assign_csr_shard_column_stats`], and the invariant they
+/// jointly maintain: a `ColumnStat` must never outlive the obs values it
+/// describes. `scx_engine`'s Level-1 pushdown prunes a shard straight from
+/// `stats.column_stats` and consults the `ObsPredicateIndex` only for the
+/// *categorical* arm's value dictionary — so an in-place op that replaces obs
+/// and merely drops the index section leaves the numeric `MinMax` bounds live
+/// and authoritative. Every shard is then excluded on a predicate the new values
+/// satisfy, and the query returns a short row set with no error.
+///
+/// Clearing costs Level-1 pruning (a slower query) until an index rebuild
+/// re-derives the stats; keeping a stale one costs rows. Use
+/// [`clear_csr_shard_column_stats_for`] when only some columns are rewritten.
+///
+/// Deliberately **broader** than `assign_csr_shard_column_stats`, which addresses
+/// modality-0 entries only: this spans every modality. Clearing is a pure safety
+/// operation with no case where retaining a stale stat is preferable, and
+/// nothing writes CSR column stats for a non-zero modality today (every writer
+/// routes through `assign_csr_shard_column_stats`), so the wider scope is a
+/// no-op now and correct the day multimodal indexing ships.
+pub fn clear_all_csr_shard_column_stats(entries: &mut [FullCatalogEntry]) -> usize {
+    clear_csr_shard_column_stats_inner(entries, None)
+}
+
+/// Drop the per-shard column statistics for `columns` only, leaving every other
+/// indexed column's stats intact. Returns the number of entries changed.
+///
+/// For ops that rewrite *named* obs columns by key join — `obs_import`,
+/// `doublet_import`, `cellbender_import` — and never reorder rows: an untouched
+/// column's `MinMax` / `CategoryBitset` is still true of the file, and clearing
+/// it would silently disable Level-1 pruning on, say, a headline `cell_type`
+/// index every time someone lands doublet calls on an atlas.
+///
+/// Matching is by [`crate::catalog::column_name_hash`], the same hash
+/// `scx_engine::derive_shard_column_stats` writes into each stat. Naming a
+/// column the file has no stats for is a no-op, so callers may pass the whole
+/// planned-column list unconditionally — in particular **without** first
+/// checking whether an `ObsPredicateIndex` exists. It need not: a file whose
+/// index was already dropped by an earlier op can still be carrying that op's
+/// stats, and gating on the index is what lets those survive a second rewrite.
+pub fn clear_csr_shard_column_stats_for(
+    entries: &mut [FullCatalogEntry],
+    columns: &[String],
+) -> usize {
+    if columns.is_empty() {
+        return 0;
+    }
+    let hashes: Vec<u64> = columns
+        .iter()
+        .map(|name| crate::catalog::column_name_hash(name))
+        .collect();
+    clear_csr_shard_column_stats_inner(entries, Some(&hashes))
+}
+
+/// `None` clears every column; `Some(hashes)` clears only those.
+///
+/// `n_indexed_columns` is rewritten from `column_stats.len()` rather than
+/// decremented: `LazyShardStats` uses the count to decide whether to retain the
+/// variable-length tail at all, so the two drifting apart is a decode bug.
+fn clear_csr_shard_column_stats_inner(
+    entries: &mut [FullCatalogEntry],
+    hashes: Option<&[u64]>,
+) -> usize {
+    let mut changed = 0usize;
+    for entry in entries.iter_mut() {
+        if entry.section_type != SectionType::CsrShard {
+            continue;
+        }
+        let Some(stats) = entry.stats.as_mut() else {
+            continue;
+        };
+        if stats.column_stats.is_empty() {
+            continue;
+        }
+        let before = stats.column_stats.len();
+        match hashes {
+            None => stats.column_stats.clear(),
+            Some(h) => stats
+                .column_stats
+                .retain(|cs| !h.contains(&cs.column_name_hash())),
+        }
+        if stats.column_stats.len() != before {
+            changed += 1;
+        }
+        stats.n_indexed_columns = stats.column_stats.len() as u8;
+    }
+    changed
+}
+
 /// Compute shard statistics from raw value bytes.
 ///
 /// `major_kind` distinguishes row-major (CSR/Layer/Obsp) and

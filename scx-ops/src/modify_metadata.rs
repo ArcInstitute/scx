@@ -362,8 +362,51 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
         modality_id: 0,
         stats: None,
     });
-    if let Some(per_shard) = per_shard_obs_stats {
-        scx_format_io::assign_csr_shard_column_stats(&mut entries, per_shard)?;
+    // Per-shard `column_stats` describe obs values, and `scx_engine`'s Level-1
+    // pushdown prunes straight from them — for the numeric `MinMax` arm without
+    // consulting the predicate index at all. Dropping the stale `ObsPredicateIndex`
+    // (see `should_drop_old_entry`) is therefore only half the invariant: leave the
+    // stats behind and every shard is excluded on a predicate the *new* values
+    // satisfy, silently returning a short row set.
+    //
+    // `assign_csr_shard_column_stats` rewrites every modality-0 CSR entry, so it
+    // is already total and needs no pre-clear. It is reached only when a rebuild
+    // was requested AND produced index bytes AND the CSR ranges cover [0, n_obs);
+    // the `None` arm is what closes the other three routes to a replaced obs.
+    match per_shard_obs_stats {
+        Some(per_shard) => scx_format_io::assign_csr_shard_column_stats(&mut entries, per_shard)?,
+        None if patch.obs.is_some() => {
+            let cleared = scx_format_io::clear_all_csr_shard_column_stats(&mut entries);
+            if cleared > 0 {
+                log::warn!(
+                    "modify_metadata replaced obs without rebuilding the predicate index: \
+                     dropped stale per-shard column statistics on {cleared} CSR shards of \
+                     {}. Level-1 shard pruning is off until an index is rebuilt — pass \
+                     --index-obs / --index-preset (or index_obs=/index_preset= in pyscx) \
+                     to re-derive it.",
+                    path.display()
+                );
+            }
+        }
+        // A var-only or uns-only patch leaves every obs value intact, so the
+        // stats stay true and the file keeps its pushdown.
+        None => {}
+    }
+
+    // `write_obsm` does not set the header flag, and `commit_in_place`
+    // deliberately writes the header verbatim without `sync_from_catalog`.
+    // Without this, a first-ever in-place obsm silently disappears on the next
+    // `compact` or `subset`, both of which gate obsm copying on
+    // `header.has_obsm()` — and `build_csc` drops it the same way. The two
+    // external-import ops stamp it by hand for the same reason; the durable
+    // alternative is to have `commit_in_place` call `sync_from_catalog`, which
+    // would subsume all three sites but changes header derivation for `append`
+    // and `delete` too.
+    //
+    // `varm` needs no counterpart: it has no header flag and `compact` copies it
+    // unconditionally.
+    if patch.obsm.as_ref().is_some_and(|v| !v.is_empty()) {
+        prep.header.set_obsm();
     }
 
     let new_catalog = FullCatalog {

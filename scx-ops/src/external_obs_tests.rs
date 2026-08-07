@@ -1068,16 +1068,37 @@ fn a_row_count_mismatch_is_caught_before_any_write() {
 // Predicate index
 // ---------------------------------------------------------------------------
 
-/// A file whose obs carries a real predicate index over `cell_type`.
+/// A file whose obs carries a real predicate index over `cell_type` **and**
+/// `n_counts`, plus the per-shard catalog `column_stats` that index implies.
 ///
 /// Built at creation time rather than bolted on afterwards, so the index is a
 /// genuine `build_obs_predicate_index_bytes` product rather than a stub.
+///
+/// The `apply_obs_shard_column_stats` call is load-bearing. Without it the
+/// fixture has an index section but no column stats, and every assertion below
+/// about pushdown surviving or being invalidated would be about the section
+/// alone — which is exactly how a whole class of staleness bug stayed invisible:
+/// Level-1 pruning reads the *stats*, and for the numeric `MinMax` arm never
+/// consults the index at all.
+///
+/// Two CSR shards, so pruning is observable: rows 0..2 hold `n_counts` 10/20,
+/// rows 2..4 hold 30/40.
 fn fixture_with_obs_index(dir: &Path, name: &str) -> PathBuf {
+    fixture_with_obs_stats(dir, name, true)
+}
+
+/// `write_index = false` yields a file with per-shard column stats and **no**
+/// `ObsPredicateIndex` section. Not a contrived state: it is exactly what a
+/// `modify_metadata` obs replace used to leave behind, and the reason the stats
+/// clear cannot be gated on `obs_index_would_go_stale` (which short-circuits to
+/// `false` when there is no index to read).
+fn fixture_with_obs_stats(dir: &Path, name: &str, write_index: bool) -> PathBuf {
     let n_obs = 4usize;
     let n_vars = 2usize;
     let schema = Schema::new(vec![
         Field::new("barcode", DataType::Utf8, false),
         Field::new("cell_type", DataType::Utf8, false),
+        Field::new("n_counts", DataType::Int64, false),
     ]);
     let obs = RecordBatch::try_new(
         Arc::new(schema),
@@ -1086,23 +1107,33 @@ fn fixture_with_obs_index(dir: &Path, name: &str) -> PathBuf {
                 (0..n_obs).map(|i| format!("cell_{i}")).collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(vec!["T", "B", "T", "B"])),
+            Arc::new(Int64Array::from(vec![10i64, 20, 30, 40])),
         ],
     )
     .unwrap();
 
     let path = dir.join(name);
-    let header =
-        FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, n_obs as u32, 0, 0);
+    let header = FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, 2, 0, 0);
     let mut writer = ScxWriter::new(&path, header).unwrap();
     writer.write_obs(&obs).unwrap();
     writer.write_var(&var_batch(n_vars)).unwrap();
-    let indptr: Vec<u64> = vec![0u64; n_obs + 1];
-    writer
-        .write_csr_shard(&indptr, &[], &[], CodecId::None, ValueEncoding::Uint8, 0)
-        .unwrap();
+    let ranges: Vec<(u64, u64)> = vec![(0, 2), (2, 4)];
+    for (start, _) in &ranges {
+        let indptr: Vec<u64> = vec![0u64; 3];
+        writer
+            .write_csr_shard(
+                &indptr,
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                *start,
+            )
+            .unwrap();
+    }
 
     let opts = scx_engine::PredicateIndexBuildOptions {
-        forced_columns: vec!["cell_type".to_string()],
+        forced_columns: vec!["cell_type".to_string(), "n_counts".to_string()],
         preset_columns: Vec::new(),
         auto_threshold: 1000,
         high_cardinality_threshold: 100_000,
@@ -1111,15 +1142,18 @@ fn fixture_with_obs_index(dir: &Path, name: &str) -> PathBuf {
     let mut named = Vec::new();
     let bytes = scx_engine::build_obs_predicate_index_bytes(
         &obs,
-        &[(0u64, n_obs as u64)],
+        &ranges,
         &opts,
         &mut outcomes,
         &mut named,
     )
     .unwrap()
     .expect("cell_type must be indexable");
-    assert_eq!(named, vec!["cell_type".to_string()]);
-    writer.write_obs_predicate_index(&bytes).unwrap();
+    assert_eq!(named, vec!["cell_type".to_string(), "n_counts".to_string()]);
+    if write_index {
+        writer.write_obs_predicate_index(&bytes).unwrap();
+    }
+    scx_engine::apply_obs_shard_column_stats(&mut writer, &bytes, ranges.len()).unwrap();
 
     writer
         .write_uns(&serde_json::json!({"state": "v0"}))
@@ -1202,6 +1236,157 @@ fn has_obs_index(path: &Path) -> bool {
         .entries
         .iter()
         .any(|e| e.section_type == SectionType::ObsPredicateIndex)
+}
+
+/// Column names (by hash) that still have per-shard catalog stats on some CSR
+/// shard. These are what Level-1 pushdown actually prunes on.
+fn columns_with_shard_stats(path: &Path, candidates: &[&str]) -> Vec<String> {
+    use scx_format_io::column_name_hash;
+    let reader = ScxReader::open(path).unwrap();
+    let live: Vec<u64> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CsrShard)
+        .filter_map(|e| e.stats.as_ref())
+        .flat_map(|s| s.column_stats.iter().map(|cs| cs.column_name_hash()))
+        .collect();
+    candidates
+        .iter()
+        .filter(|c| live.contains(&column_name_hash(c)))
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+/// Overwriting a column the catalog has stats for must drop **that column's**
+/// stats, whether or not an index section happens to still be present.
+///
+/// Level-1 pruning reads the stats directly — for `MinMax` it never looks at the
+/// index — so keeping them would leave shards excluded on bounds describing
+/// values the import just replaced.
+#[test]
+fn overwriting_an_indexed_column_clears_its_shard_column_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture_with_obs_index(dir.path(), "a.scx");
+    assert_eq!(
+        columns_with_shard_stats(&path, &["cell_type", "n_counts"]),
+        vec!["cell_type".to_string(), "n_counts".to_string()],
+        "fixture must start with stats for both indexed columns"
+    );
+
+    // Replace `n_counts` with values an order of magnitude larger.
+    let schema = Schema::new(vec![Field::new("n_counts", DataType::Int64, true)]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Int64Array::from(vec![100i64, 200, 300, 400]))],
+    )
+    .unwrap();
+    let data = ExternalObsData {
+        row_keys: keys("cell_", 4),
+        row_annotations: batch,
+        row_embeddings: Vec::new(),
+        uns: None,
+        source_checksum: None,
+        source_name: None,
+    };
+    crate::attach_external_obs(
+        &path,
+        &data,
+        &AttachObsOptions {
+            overwrite: true,
+            status_column: None,
+            ..opts()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        columns_with_shard_stats(&path, &["cell_type", "n_counts"]),
+        vec!["cell_type".to_string()],
+        "the overwritten column's stats must go — and ONLY that column's. \
+         Clearing wholesale would silently disable Level-1 pruning on a \
+         cell_type index every time someone lands doublet calls."
+    );
+
+    // The rows are actually reachable again.
+    let n = scx_engine::QueryPipeline::open(&path)
+        .unwrap()
+        .filter_obs("n_counts > 150")
+        .unwrap()
+        .count()
+        .unwrap()
+        .matched_rows;
+    assert_eq!(
+        n, 3,
+        "200/300/400 match; stale bounds would exclude all four"
+    );
+}
+
+/// A pure *add* invalidates nothing, so every column keeps its stats. This is
+/// the case that makes the scoped clear worth having.
+#[test]
+fn adding_a_new_column_keeps_every_shard_column_stat() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture_with_obs_index(dir.path(), "a.scx");
+
+    let data = score_data(keys("cell_", 4), |i| i as f32);
+    crate::attach_external_obs(&path, &data, &opts()).unwrap();
+
+    assert_eq!(
+        columns_with_shard_stats(&path, &["cell_type", "n_counts"]),
+        vec!["cell_type".to_string(), "n_counts".to_string()],
+        "adding a column cannot invalidate stats for columns it did not touch"
+    );
+}
+
+/// The compounding case. `obs_index_would_go_stale` returns `false` early when
+/// there is no index section — but a file can carry stats with no index (that is
+/// precisely what a `modify_metadata` obs replace used to leave behind). Gating
+/// the stats clear on that flag would let the stale bounds survive a second
+/// rewrite, so the clear is unconditional.
+#[test]
+fn overwriting_clears_stats_even_when_the_index_section_is_already_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture_with_obs_stats(dir.path(), "a.scx", false);
+    assert!(!has_obs_index(&path), "precondition: no index section");
+    assert!(
+        columns_with_shard_stats(&path, &["n_counts"]).contains(&"n_counts".to_string()),
+        "precondition: stats outlived the index section"
+    );
+
+    let schema = Schema::new(vec![Field::new("n_counts", DataType::Int64, true)]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Int64Array::from(vec![100i64, 200, 300, 400]))],
+    )
+    .unwrap();
+    let data = ExternalObsData {
+        row_keys: keys("cell_", 4),
+        row_annotations: batch,
+        row_embeddings: Vec::new(),
+        uns: None,
+        source_checksum: None,
+        source_name: None,
+    };
+    let s = crate::attach_external_obs(
+        &path,
+        &data,
+        &AttachObsOptions {
+            overwrite: true,
+            status_column: None,
+            ..opts()
+        },
+    )
+    .unwrap();
+    assert!(
+        !s.obs_index_dropped,
+        "there was no index to drop — the stats clear must not depend on this"
+    );
+
+    assert!(
+        columns_with_shard_stats(&path, &["n_counts"]).is_empty(),
+        "stats that outlived their index must still be cleared on overwrite"
+    );
 }
 
 // ---------------------------------------------------------------------------

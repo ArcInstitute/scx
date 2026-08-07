@@ -456,6 +456,50 @@ fn obsm_replace_by_name() {
     assert_eq!(got.num_rows(), 12);
 }
 
+/// A first-ever in-place `obsm` must survive the next `compact`.
+///
+/// `commit_in_place` deliberately skips `sync_from_catalog`, so an in-place op
+/// has to stamp `has_obsm` by hand — and `compact` gates the whole obsm block on
+/// that flag, not on the catalog. Reading the embedding back from the *compacted*
+/// file is the assertion that matters; `has_obsm()` alone would pass against a
+/// fix that sets the bit while the section still went missing.
+#[test]
+fn in_place_obsm_survives_a_later_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("obsm_compact.scx");
+    write_base(&path, 12, 4, None);
+    assert!(
+        !ScxReader::open(&path).unwrap().header().has_obsm(),
+        "fixture must start with no obsm, or the flag is already set for us"
+    );
+
+    let schema = Schema::new(vec![Field::new("c0", DataType::Float32, false)]);
+    let emb = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Float32Array::from(
+            (0..12).map(|i| i as f32).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obsm: Some(vec![("X_umap".to_string(), emb)]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let out = dir.path().join("compacted.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let got = ScxReader::open(&out)
+        .unwrap()
+        .read_obsm_for(0, "X_umap")
+        .expect("obsm written in place must survive compact");
+    assert_eq!(got.num_rows(), 12);
+}
+
 #[test]
 fn empty_patch_is_rejected() {
     let dir = tempfile::tempdir().unwrap();

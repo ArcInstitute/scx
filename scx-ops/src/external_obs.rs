@@ -1212,6 +1212,24 @@ pub fn attach_external_obs(
         stats: None,
     });
 
+    // The other half of `drop_obs_index`: the catalog also carries a per-shard
+    // `ColumnStat` for each indexed obs column, and `scx_engine`'s Level-1
+    // pushdown prunes from those directly — the numeric `MinMax` arm never looks
+    // at the index section. Overwriting a column whose stats exist would leave
+    // bounds describing values that are gone, and shards holding matching rows
+    // would be silently excluded.
+    //
+    // Scoped to the rewritten columns, not wholesale: this op joins by key and
+    // leaves every other obs column byte-identical, so their stats stay true.
+    // Clearing them all would quietly disable pruning on a `cell_type` index
+    // every time someone lands doublet calls.
+    //
+    // Unconditional, NOT gated on `drop_obs_index`: that flag is false when the
+    // file has no index section, and a file can carry stats with no index (what
+    // `modify_metadata` leaves behind). Gating here is what would let those
+    // survive a second rewrite.
+    scx_format_io::clear_csr_shard_column_stats_for(&mut entries, &summary.obs_columns_added);
+
     // `write_obsm` does not set the header flag, and `commit_in_place` writes
     // the header verbatim without `sync_from_catalog`. Without this, a
     // first-ever in-place obsm silently disappears on the next `compact` or

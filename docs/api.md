@@ -879,6 +879,16 @@ QueryPipeline::open("file.scx")?
 
 - Schema validation at construction time (fail-fast)
 - Two-level predicate pushdown: catalog shard pruning + index row pruning
+- **Level-1 stats are dropped, never silently reused, when obs is rewritten.**
+  Catalog shard pruning reads a per-shard `MinMax` / `CategoryBitset` for each
+  indexed obs column — for the numeric arm without consulting the predicate index
+  at all. So the in-place ops that rewrite obs values (`modify_metadata(obs=…)`,
+  `obs_import` / `doublet_import`, `cellbender_import`) clear the stats for the
+  columns they replace, in step with dropping the stale index. The cost is a
+  slower query, never a short result. Rebuild them with
+  `modify_metadata(..., index_obs=[…])` or a copy-out `sort` / `compact` with
+  `--index-obs` / `--index-preset`. Full per-op table in
+  [docs/operations.md § Per-shard column stats and the in-place ops](operations.md#per-shard-column-stats-and-the-in-place-ops).
 - Fused normalize+log1p in single CSR row scan
 - Parallel shard processing via rayon
 - **Bounded obs memory on row-sharded files.** `filter_obs` / `count`

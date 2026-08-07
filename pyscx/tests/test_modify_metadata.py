@@ -46,6 +46,110 @@ def test_modify_metadata_obs_replace(synthetic_adata, scx_from_adata):
     assert obs["donor"].iloc[0] == "donor_Z"
 
 
+def _indexed_multi_shard(tmp_dir, name="indexed.scx", n=400, shard=100):
+    """400 cells over 4 CSR shards, obs predicate index over `n_counts` (100…499).
+
+    `index_obs=` is what makes the catalog carry a per-shard `MinMax` for
+    `n_counts`, and `shard_size=` is what makes there be more than one shard to
+    prune. Without both, shard pruning is unobservable and any assertion about it
+    is vacuous.
+    """
+    import anndata
+    import scipy.sparse as sp
+
+    x = sp.csr_matrix(np.eye(n, 8, dtype=np.float32))
+    obs = pd.DataFrame(
+        {
+            "cell_id": [f"cell_{i}" for i in range(n)],
+            "n_counts": np.arange(100, 100 + n, dtype=np.int64),
+        },
+        index=[f"cell_{i}" for i in range(n)],
+    )
+    var = pd.DataFrame(
+        {"gene_id": [f"g{i}" for i in range(8)]},
+        index=[f"g{i}" for i in range(8)],
+    )
+    adata = anndata.AnnData(X=x, obs=obs, var=var)
+    path = str(tmp_dir / name)
+    pyscx.from_anndata(adata, path, shard_size=shard, index_obs=["n_counts"])
+    return path, adata
+
+
+def _matching(path, expr):
+    p = pyscx.open(path).query()
+    p.filter_obs(expr)
+    return p.collect().n_obs
+
+
+def test_modify_metadata_obs_replace_does_not_strand_rows_behind_stale_shard_stats(
+    tmp_dir,
+):
+    """Replacing obs must not leave the catalog pruning on the old values.
+
+    The catalog records a per-shard `[min, max]` for every indexed obs column,
+    and query-time Level-1 pruning reads those *directly* — for a numeric column
+    it never consults the predicate index at all. So dropping the now-stale index
+    is only half the job: leave the stats behind and every shard is excluded on a
+    predicate the replaced values satisfy, and the query comes back empty with no
+    error.
+
+    Ground truth is pandas on the frame that was written, not a second query.
+    """
+    path, _ = _indexed_multi_shard(tmp_dir)
+
+    # Before: nothing exceeds 1500, and that empty answer is the correct one.
+    assert _matching(path, "n_counts > 1500") == 0
+
+    new_obs = pyscx.open(path).read_obs()
+    new_obs["n_counts"] = new_obs["n_counts"] * 10
+    pyscx.modify_metadata(path, obs=new_obs)
+
+    want = int((new_obs["n_counts"] > 1500).sum())
+    assert want == 349
+    assert _matching(path, "n_counts > 1500") == want
+    # The rows really are the right ones, not merely the right count.
+    p = pyscx.open(path).query()
+    p.filter_obs("n_counts > 1500")
+    got = p.collect().to_anndata().obs
+    assert got["n_counts"].min() > 1500
+
+
+def test_modify_metadata_obs_replace_with_index_rebuild_keeps_pruning(tmp_dir):
+    """The fix must not make a replaced-obs file permanently unprunable.
+
+    Asking for the index back re-derives the shard stats, so Level-1 pruning
+    returns — against the new values.
+    """
+    path, _ = _indexed_multi_shard(tmp_dir)
+    new_obs = pyscx.open(path).read_obs()
+    new_obs["n_counts"] = new_obs["n_counts"] * 10
+    pyscx.modify_metadata(path, obs=new_obs, index_obs=["n_counts"])
+
+    assert _matching(path, "n_counts > 1500") == int((new_obs["n_counts"] > 1500).sum())
+    assert _matching(path, "n_counts > 3000") == int((new_obs["n_counts"] > 3000).sum())
+
+
+def test_modify_metadata_obsm_survives_a_later_compact(tmp_dir):
+    """A first-ever in-place obsm must not vanish on the next compact.
+
+    In-place ops write the header verbatim, so `modify_metadata` has to stamp
+    `has_obsm` itself — and `compact` gates the whole obsm block on that flag
+    rather than on the catalog. Reading the embedding back from the *compacted*
+    file is the assertion that matters.
+    """
+    path, _ = _indexed_multi_shard(tmp_dir, name="obsm.scx", n=20, shard=10)
+    assert "X_umap" not in pyscx.open(path).obsm_keys()
+
+    emb = pd.DataFrame(
+        np.arange(40, dtype=np.float32).reshape(20, 2), columns=["c0", "c1"]
+    )
+    pyscx.modify_metadata(path, obsm={"X_umap": emb})
+
+    out = str(tmp_dir / "obsm_compacted.scx")
+    pyscx.compact(path, out)
+    assert "X_umap" in pyscx.open(out).obsm_keys()
+
+
 def test_modify_metadata_obs_wrong_shape_raises(synthetic_adata, scx_from_adata):
     path = scx_from_adata(synthetic_adata)
     n = synthetic_adata.n_obs
