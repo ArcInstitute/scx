@@ -1503,6 +1503,13 @@ def test_obs_filter_grammar_parity_common_ground(tmp_dir, expr):
     operators (`and` / `or` / `not`), `in [...]` against a bracket-delimited
     list literal, and parenthesised sub-expressions. Divergences are
     documented in docs/scanpy.md (see "Filter Expression Compatibility").
+
+    NOTE: this fixture has **no missing values**, and that is load-bearing for
+    the `!=` / `not (...)` cases. Those two operators parse in both grammars
+    but do NOT select the same rows once a column has nulls — the engine
+    follows SQL (UNKNOWN, so a NULL row does not match) while pandas is
+    two-valued. `test_obs_filter_grammar_parity_with_null_categorical` is the
+    null-bearing counterpart and deliberately omits them.
     """
     import warnings as warnings_mod
 

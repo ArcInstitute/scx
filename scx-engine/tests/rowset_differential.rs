@@ -526,6 +526,11 @@ fn rowset_path_matches_legacy_path() {
                         got.len(),
                         want.len()
                     );
+                    assert!(
+                        got.len() <= n,
+                        "limit={n} but got {} rows for `{expr}`",
+                        got.len()
+                    );
                 }
             }
             checked += 1;

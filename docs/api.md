@@ -902,7 +902,15 @@ QueryPipeline::open("file.scx")?
   clause.** A comparison against a NULL cell is UNKNOWN, not `false`.
   `and` / `or` combine UNKNOWN accordingly — **`null OR true` is `true`**
   and `null AND false` is `false` — `not` propagates UNKNOWN, and only the
-  final mask turns a surviving UNKNOWN into "not matched". So
+  final mask turns a surviving UNKNOWN into "not matched". In full:
+
+  | | `and` | `or` |
+  |---|---|---|
+  | `TRUE` ∘ `UNKNOWN` | `UNKNOWN` | **`TRUE`** |
+  | `FALSE` ∘ `UNKNOWN` | **`FALSE`** | `UNKNOWN` |
+  | `UNKNOWN` ∘ `UNKNOWN` | `UNKNOWN` | `UNKNOWN` |
+
+  with `not UNKNOWN = UNKNOWN`, and a top-level `UNKNOWN` → not matched. So
   `filter_obs("cell_type == 'B cell' or n_genes > 5000")` returns a cell
   with an unannotated `cell_type` and 9000 genes; pandas, polars and SQL
   agree. The same rules apply to `filter_var`, and to every other surface
