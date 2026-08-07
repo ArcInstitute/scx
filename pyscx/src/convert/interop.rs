@@ -569,7 +569,7 @@ fn err_str<E: std::fmt::Display>(e: E) -> PyErr {
 ///
 /// Safe to call with the GIL held: the closure is pure Rust and never touches
 /// the interpreter, so there is no re-entry and no deadlock.
-fn par_to_vec<T>(src: &[T]) -> Vec<T>
+pub(crate) fn par_to_vec<T>(src: &[T]) -> Vec<T>
 where
     T: Copy + Default + Send + Sync,
 {
@@ -583,7 +583,11 @@ where
     if std::mem::size_of_val(src) < PAR_THRESHOLD_BYTES {
         return src.to_vec();
     }
-    let chunk = (CHUNK_BYTES / std::mem::size_of::<T>()).max(1);
+    // `.max(1)` on the element size, not just on the chunk: a zero-sized `T`
+    // would otherwise divide by zero. It cannot reach here today — a ZST slice
+    // has `size_of_val == 0` and takes the early return above — but the guard
+    // is one token and does not depend on that ordering surviving an edit.
+    let chunk = (CHUNK_BYTES / std::mem::size_of::<T>().max(1)).max(1);
     let mut out = vec![T::default(); src.len()];
     out.par_chunks_mut(chunk)
         .zip(src.par_chunks(chunk))

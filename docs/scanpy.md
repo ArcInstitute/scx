@@ -3282,15 +3282,22 @@ The heavy accelerators, including `pyscx.accel.col_sums` and its siblings,
 release the GIL for their streaming scan, so they can be called concurrently
 from Python threads without serialising each other.
 
-An accelerator that releases the GIL works from an **owned snapshot** of `X`,
-taken before the release. Mutating `adata.X` from another thread during a call
-is therefore safe: the in-flight result reflects the matrix as it was when the
-call started, never a half-updated blend. On an **in-memory** `X` that snapshot
-is a copy; it is taken in parallel, so it costs rather less than `X.copy()`
-(measured 14 ms for a 192 MB dense matrix, against 119 ms for `np.copy`), and
-`pseudobulk_means` warns once it exceeds 1 GB. A **backed or lazy** `X` needs no
-copy at all: it streams shard by shard from the file, which is the cheaper way
-to run these ops on a large matrix regardless.
+A CPU accelerator that releases the GIL works from an **owned snapshot** of `X`,
+taken before the release: the in-flight result reflects the matrix as it was
+when the kernel started, never a half-updated blend. On an **in-memory** `X`
+that snapshot is a copy; it is taken in parallel, so it costs rather less than
+`X.copy()` (measured 14 ms for a 192 MB dense matrix, against 119 ms for
+`np.copy`), and `pseudobulk_means` warns once it exceeds 1 GB. A **backed or
+lazy** `X` needs no copy at all: it streams shard by shard from the file, which
+is the cheaper way to run these ops on a large matrix regardless.
+
+That is a statement about those kernels, not a general licence to mutate `X`
+from another thread mid-call. The GPU in-VRAM fast lane reads `X`'s buffers
+directly and is safe only because it holds the GIL throughout — nothing is
+snapshotted — and conversion (`pyscx.from_anndata`) makes several passes over
+`X` that are not guaranteed to see one consistent state. Mutating a matrix
+while any scx call is reading it remains unsupported; what changed is that a
+detached kernel can no longer read a buffer out from under you.
 
 The cloud runtime exposes its own knob:
 

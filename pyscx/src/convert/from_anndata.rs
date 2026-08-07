@@ -215,13 +215,24 @@ pub(crate) struct CscInput {
 /// allocations the transpose always made; they are hoisted out of the detached
 /// region, not added to it. The row-sorting pass that used to follow them stays
 /// on the detached side, where it only touches owned memory.
+///
+/// All three fills run on rayon. This is the one copy in the crate that holds
+/// the GIL for its whole duration, so its cost is a stall for every other
+/// Python thread — and a fresh-allocation copy is page-fault bound, which
+/// parallelizes (see [`crate::convert::par_to_vec`]). Rayon is safe under the
+/// GIL here: nothing in these closures re-enters the interpreter.
 pub(crate) fn csc_input_from_csr_slices(
     indptr: &[i64],
     indices: &[i32],
     data: &[f32],
 ) -> Result<CscInput, scx_format_io::ScxError> {
+    // `try_fold`/`try_reduce` would be the pure-rayon spelling, but a plain
+    // parallel map-collect over `Result` is clearer and short-circuits the same
+    // way. The reported value on a malformed input may differ from the
+    // sequential version's first-in-index-order pick; any negative entry is an
+    // equally valid diagnostic and no test pins the message.
     let indptr_u64: Vec<u64> = indptr
-        .iter()
+        .par_iter()
         .map(|&v| {
             if v < 0 {
                 Err(scx_format_io::ScxError::InvalidCatalog(format!(
@@ -233,7 +244,7 @@ pub(crate) fn csc_input_from_csr_slices(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let indices_u32: Vec<u32> = indices
-        .iter()
+        .par_iter()
         .map(|&v| {
             if v < 0 {
                 Err(scx_format_io::ScxError::InvalidCatalog(format!(
@@ -247,7 +258,7 @@ pub(crate) fn csc_input_from_csr_slices(
     Ok(CscInput {
         indptr: indptr_u64,
         indices: indices_u32,
-        values: data.to_vec(),
+        values: super::par_to_vec(data),
     })
 }
 
@@ -485,17 +496,20 @@ where
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    // Fast path: scipy CSR with `has_canonical_format == True` (the common
-    // case) needs no sort/dedup/zero-drop, so pass the borrowed numpy buffer
-    // through with no f32 copy. Only materialize + canonicalize when the input
-    // is actually non-canonical.
-    if scx_sparse::is_canonical_csr(&indptr_u64, &indices_u32, data_slice) {
-        f(&indptr_u64, &indices_u32, data_slice)
-    } else {
-        let mut data_vec = data_slice.to_vec();
+    // `data` is copied like `indptr` / `indices` already are, rather than
+    // handed through as a borrow on the canonical fast path.
+    //
+    // Every caller wraps `f` in `py.detach` (`convert/scx_to_scx.rs`, three
+    // sites), so a borrowed numpy slice reaching `f` is finding §10.1 all over
+    // again — the callers happen to pass per-shard `__getitem__` temps today,
+    // which is a property of the callers, not of this `pub(crate)` signature.
+    // The non-canonical branch always paid this copy; now the contract is
+    // uniform, and `par_to_vec` keeps the added cost off the critical path.
+    let mut data_vec = super::par_to_vec(data_slice);
+    if !scx_sparse::is_canonical_csr(&indptr_u64, &indices_u32, &data_vec) {
         canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut data_vec);
-        f(&indptr_u64, &indices_u32, &data_vec)
     }
+    f(&indptr_u64, &indices_u32, &data_vec)
 }
 
 /// Build a fresh `FileHeader` template for an SCX → SCX rewrite.
