@@ -226,11 +226,13 @@ pub(crate) fn csc_input_from_csr_slices(
     indices: &[i32],
     data: &[f32],
 ) -> Result<CscInput, scx_format_io::ScxError> {
-    // `try_fold`/`try_reduce` would be the pure-rayon spelling, but a plain
-    // parallel map-collect over `Result` is clearer and short-circuits the same
-    // way. The reported value on a malformed input may differ from the
-    // sequential version's first-in-index-order pick; any negative entry is an
-    // equally valid diagnostic and no test pins the message.
+    // A plain parallel map-collect over `Result` reads better than the
+    // `try_fold`/`try_reduce` spelling. Two differences from the sequential
+    // version, both harmless here: rayon may do more work before reducing to
+    // `Err` (it does not abandon in-flight chunks the way `?` abandons the rest
+    // of an iterator), and *which* negative entry is reported is no longer
+    // first-in-index-order. Any negative entry is an equally valid diagnostic
+    // and no test pins the message.
     let indptr_u64: Vec<u64> = indptr
         .par_iter()
         .map(|&v| {

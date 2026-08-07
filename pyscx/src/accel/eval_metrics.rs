@@ -239,8 +239,19 @@ fn agg_inmemory(
 /// embeddings the caller downcasts, so GPU/CPU parity on the `embed_key` path
 /// is at the f32 bar (~1e-4), not the 1e-6 of the sparse gene-space paths.
 ///
-/// `data` must be **Rust-owned**, not a numpy borrow: the CPU arm releases the
-/// GIL. `crate::convert::owned_dense2_f32` is how callers get one.
+/// The CPU arm releases the GIL, so `data` must not be a borrow of a buffer
+/// Python can still reach. `crate::convert::owned_dense2_f32` is how callers
+/// get one, and the in-memory dense arm of `pseudobulk_means` uses it.
+///
+/// `compute_obsm_pseudobulk`'s `#[cfg(feature = "gpu")]` branch is the one
+/// caller that passes a borrow, and it is sound for two independent reasons:
+/// the array it borrows is freshly allocated (`astype("float32")` defaults to
+/// `copy=True`, so it aliases nothing the caller can name), and the GPU arm
+/// returns above the `py.detach` below. Either alone would suffice; both would
+/// have to be broken at once for it to matter. Routing that branch through
+/// `owned_dense2_f32` as well would make the rule hold by construction rather
+/// than by argument — deferred only because it is GPU-gated code that cannot be
+/// exercised on a CPU host.
 #[allow(clippy::too_many_arguments)]
 fn agg_dense(
     py: Python<'_>,

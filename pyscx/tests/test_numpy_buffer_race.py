@@ -37,7 +37,28 @@ The mutator writes **in-range values only**. Writing an out-of-range column
 index into a buffer a broken build still reads is undefined behaviour that
 would segfault the pytest process instead of failing a test.
 
-**What is deliberately not tested here.** `Experiment.gather_rows_sparse` has
+**What is deliberately not tested here.** `from_anndata`'s CSC-sidecar block and
+`decompose_scipy_csr_with` are fixed sites with no race test: both sit inside a
+long write path where the mutation window is a small fraction of the call, so a
+reproduction would be unreliable rather than informative. They are covered by
+`test_csc_convert.py` / `test_csc_lifecycle.py` / `test_golden_files.py` for
+*correctness*, and by code review for the borrow itself.
+
+There is also no `indices` counterpart to the `knockdown_efficiency` test,
+though `indices` is the more dangerous array. It was written, and it **fails on
+the fixed build** — for a reason worth recording. Unlike `pseudobulk_means`,
+that op runs its input through `ensure_csr` first, and a flipper that rewrites
+column indices makes the matrix unsorted. `scipy.sparse.csr_matrix(x)` returns
+a *new* object (verified: `csr_matrix(x) is x` -> `False`), so
+`has_sorted_indices` is recomputed rather than read from `x`'s cache, comes
+back `False`, and `ensure_csr` takes its `.sorted_indices()` branch — whose
+internal 38 MB copy is exactly the kind of large numpy copy measured above as
+torn 27 % of the time. The blend the test then sees originates in *scipy's*
+copy, not in the snapshot under test. **An op that may re-canonicalize its
+input cannot be tested with an index flipper.** `pseudobulk_means` can, because
+`owned_csr` never re-sorts.
+
+`Experiment.gather_rows_sparse` has
 the same defect in its `rows` argument — bounds-checked under the GIL, then
 read detached, so the documented `IndexError` is a TOCTOU — but it is not
 reproducible this way and no test pretending otherwise belongs here.

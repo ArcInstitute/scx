@@ -597,8 +597,17 @@ where
 
 /// Emit a Python `UserWarning` when a defensive copy is large enough to notice.
 ///
-/// `warn_label` is the user-facing operation name; `None` suppresses the
-/// warning entirely (internal callers whose input is already Rust-owned).
+/// `warn_label` is the user-facing operation name; `None` suppresses it.
+///
+/// **`None` is the common case, deliberately.** The warning marks copies this
+/// change *introduced* — `pseudobulk_means` and `knockdown_efficiency`, which
+/// used to borrow. The in-memory `pca` / `hvg` / `score_genes` / `pflog` / fused
+/// paths pass `None` because they already materialised a full owned CSR before
+/// it (through a slower route), so warning there would be new noise about
+/// long-standing behaviour rather than news. The docs name the two ops that
+/// warn rather than claiming coverage of every copy. Wiring labels through the
+/// rest is a defensible follow-up, but it is a user-visible change to paths this
+/// fix did not otherwise touch.
 fn warn_large_copy(
     py: Python<'_>,
     warn_label: Option<&str>,

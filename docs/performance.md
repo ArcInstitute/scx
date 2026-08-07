@@ -917,16 +917,18 @@ sites and wrong that the absolute mattered.
 
 ### Owned snapshots at the numpy boundary (finding §10.1)
 
-Six `py.detach(...)` closures in `pyscx` read Rust `&[T]` slices *borrowed* from live,
+Seven `py.detach(...)` call paths in `pyscx` read Rust `&[T]` slices *borrowed* from live,
 Python-reachable numpy buffers. rust-numpy borrows are not GIL-bound, do not clear numpy's
 `WRITEABLE` flag, and carry no synchronization; `astype(..., copy=False)` and
 `scipy.sparse.csr_matrix(A)` on an already-CSR `A` are identity operations, so those slices
 *were* `adata.X.data` / `adata.X.indices`. Each now takes an owned snapshot under the GIL
 first. Sites: `pseudobulk_means` (sparse and dense in-memory arms, and the lazy arm, which
 now skips the scipy round-trip entirely by using the `ScxCsr` `to_memory_py` already builds),
-`knockdown_efficiency`, `Experiment.gather_rows_sparse`, and `from_anndata`'s CSC-sidecar
-block. The same change folded three near-duplicate scipy→`ScxCsr` materializers into one,
-`convert::owned_csr`.
+`knockdown_efficiency`, `Experiment.gather_rows_sparse`, `from_anndata`'s CSC-sidecar
+block, and — found in PR review — `decompose_scipy_csr_with`, which already copied
+`indptr` / `indices` but handed `data` through as a borrow on its canonical fast path
+while all three of its callers wrapped the callback in `py.detach`. The same change folded
+three near-duplicate scipy→`ScxCsr` materializers into one, `convert::owned_csr`.
 
 **Measured.** Single node, `cargo` release build, medians of 3–5 runs; sparse fixture
 200k × 600 at density 0.08 (9.6M nnz), dense fixture 40k × 1 200 f32 (192 MB). The middle
