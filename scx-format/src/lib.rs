@@ -58,9 +58,10 @@ pub use obs_shard_policy::ObsShardPolicy;
 pub use provenance::{Provenance, ProvenanceEntry};
 pub use section::{align_to_8, SectionType};
 pub use shard::{
-    derive_shard_type, resolve_block_index, BlockIndex, BlockIndexEntry, ShardHeader,
-    BLOCK_INDEX_ENTRY_SIZE, CURRENT_SHARD_FORMAT_VERSION, DEFAULT_WRITE_SHARD_FORMAT_VERSION,
-    SHARD_HEADER_SIZE, SHARD_MAGIC,
+    clamped_reserve, derive_shard_type, resolve_block_index, BlockIndex, BlockIndexEntry,
+    ShardHeader, BLOCK_INDEX_ENTRY_SIZE, CURRENT_SHARD_FORMAT_VERSION,
+    DEFAULT_WRITE_SHARD_FORMAT_VERSION, MAX_ELEMENTS_PER_ENCODED_BYTE, MAX_RESERVE_BYTES,
+    MIN_RESERVE_ELEMENTS, SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
 pub use versioned::VersionedSection;
 

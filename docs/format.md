@@ -371,10 +371,30 @@ statistics use `u64` because they address global rows (billions of cells).
   range in each sub-stream is `[offset[g], offset[g+1])` (last group ends at the
   sub-stream length). `resolve_block_index` (`scx-format/src/shard.rs`) validates
   the whole index (sorted, contiguous, coverage `== n_major`, monotonic in-bounds
-  offsets, `Σ nnz_in_block == header.nnz`) and resolves each entry to a byte-range
-  span; `scx_codec::decode_row_group` decodes one group codec-agnostically. This
+  offsets, `nnz_in_block <= n_rows * header.n_minor`, `Σ nnz_in_block ==
+  header.nnz`) and resolves each entry to a byte-range span;
+  `scx_codec::decode_row_group` decodes one group codec-agnostically. This
   is what gives every codec (not just Scx1) O(touched-rows) random access. Applies
   to CSR/layer/obsp and CSC sidecar shards (row-group ≡ gene-group for CSC).
+
+  The group-capacity rule (`nnz_in_block <= n_rows * n_minor`) follows from the
+  [v3 canonical CSR invariant](#v3-canonical-csr-invariant): indices are strictly
+  increasing within a row and every index lies in `[0, n_minor)`, so a group
+  cannot store more entries than it has cells. Framing exists only in v4 files
+  and v4 ⊇ v3, so it holds for every framed shard.
+
+**Reader requirement — reassembly must not pre-allocate from the header.**
+`header.nnz`, `header.n_major` and every `nnz_in_block` are unauthenticated (the
+catalog's BLAKE3 covers catalog bytes, not shard payloads), so a conforming
+reader must not size its reassembly buffers directly from them: a single-entry
+index declaring `nnz_in_block = u32::MAX` passes every check above and would
+otherwise demand tens of GB from a ~100-byte file. Note that no bound can be
+*validated* here — the elements-per-encoded-byte ratio has no codec-agnostic
+floor (the 8:1 figure that holds for Scx1 is the information-theoretic floor of
+Rice/Golomb coding and does not apply to the zstd-family codecs), so the ratio
+must clamp the reservation rather than reject the shard. `scx-format`'s
+`clamped_reserve` does this; correctness rests on each group's decode
+length-checking its own frames before anything is appended.
 
 ### Shard sizing defaults
 

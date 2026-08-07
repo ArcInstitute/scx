@@ -12,7 +12,8 @@ use scx_codec::delta_golomb::delta_golomb_decode;
 use scx_codec::rice::B_VAL;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::shard::{
-    resolve_block_index, ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE,
+    clamped_reserve, resolve_block_index, ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+    SHARD_HEADER_SIZE,
 };
 
 use crate::cast_gpu::{cast_u32_to_f32_gpu, cast_u32_to_i32_gpu};
@@ -434,8 +435,12 @@ fn decode_framed_scx1_gpu(
     // Combined nnz-sized device buffers, filled per group at the running offset.
     let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
     let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
-    // Host-assembled global indptr (tiny: n_rows + 1 elements).
-    let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+    // Host-assembled global indptr (tiny: n_rows + 1 elements). `n_rows` is
+    // untrusted header data, so reserve through `clamped_reserve` — a ~45 KB
+    // block index can declare 134M rows, and `Vec::with_capacity` aborts on
+    // allocation failure instead of returning.
+    let mut combined_indptr: Vec<i64> =
+        Vec::with_capacity(clamped_reserve(n_rows + 1, indptr_bytes.len(), 8));
     combined_indptr.push(0);
 
     // Pass 1: host-assemble the global indptr + per-group nnz base offsets
@@ -628,7 +633,11 @@ fn decode_framed_shufdelta_gpu(
 
     let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
     let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
-    let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+    // Untrusted `n_rows` — clamp as above. (The device buffers keep the exact
+    // `nnz`: groups are placed at computed offsets, and `alloc_zeros` surfaces
+    // an over-large request as a `Result`, not a process abort.)
+    let mut combined_indptr: Vec<i64> =
+        Vec::with_capacity(clamped_reserve(n_rows + 1, indptr_bytes.len(), 8));
     combined_indptr.push(0);
 
     let mut host_uploaded_bytes: u64 = 0;

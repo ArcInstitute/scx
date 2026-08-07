@@ -21,7 +21,7 @@ use cudarc::driver::safe::{
 use cudarc::driver::PushKernelArg;
 
 use scx_codec::{zstd_decompress_bounded, RowGroupSpan, ValueEncoding};
-use scx_format_io::shard::{resolve_block_index, ShardHeader};
+use scx_format_io::shard::{clamped_reserve, resolve_block_index, ShardHeader};
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -269,12 +269,30 @@ enum HostPlaneBuf {
 }
 
 impl HostPlaneBuf {
-    fn new(dev: &GpuDevice, cap: usize) -> Self {
+    /// `cap` is `max(span.nnz) × element_width` — derived from the **untrusted**
+    /// block index, so the pageable fallback must be fallible. `vec![0u8; cap]`
+    /// aborts through `handle_alloc_error` on a hostile `nnz`, the same remote
+    /// kill switch [`clamped_reserve`] closes on the reassembly buffers, and it
+    /// is reached *before* the fallible `alloc_zeros` staging allocations below.
+    /// Clamping is not an option here — [`Self::stage`] indexes `v[..src.len()]`,
+    /// so the buffer must actually hold `cap` — hence `try_reserve_exact`, which
+    /// returns instead of aborting.
+    fn new(dev: &GpuDevice, cap: usize) -> Result<Self, GpuError> {
+        let cap = cap.max(1);
         // SAFETY: `alloc_pinned` is unsafe only in that the buffer is
         // uninitialized; we fully overwrite the used prefix before every upload.
-        match unsafe { dev.context().alloc_pinned::<u8>(cap.max(1)) } {
-            Ok(p) => HostPlaneBuf::Pinned(p),
-            Err(_) => HostPlaneBuf::Pageable(vec![0u8; cap.max(1)]),
+        match unsafe { dev.context().alloc_pinned::<u8>(cap) } {
+            Ok(p) => Ok(HostPlaneBuf::Pinned(p)),
+            Err(_) => {
+                let mut v: Vec<u8> = Vec::new();
+                v.try_reserve_exact(cap).map_err(|e| {
+                    GpuError::OutOfMemory(format!(
+                        "pageable host staging buffer of {cap} bytes (pinned alloc failed): {e}"
+                    ))
+                })?;
+                v.resize(cap, 0);
+                Ok(HostPlaneBuf::Pageable(v))
+            }
         }
     }
 
@@ -332,8 +350,10 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     // Precompute per-group nnz offsets + the full global indptr on the host
     // (tiny; the large index/value frames go to the device). Offsets let the
     // GPU consumer place each group independently, so producers can run ahead
-    // and out of order.
-    let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+    // and out of order. `n_rows` is untrusted header data, so the reservation
+    // goes through `clamped_reserve` (`Vec::with_capacity` aborts on failure).
+    let mut combined_indptr: Vec<i64> =
+        Vec::with_capacity(clamped_reserve(n_rows + 1, indptr_bytes.len(), 8));
     combined_indptr.push(0);
     let t_indptr = profile::start();
     let (offsets, nnz_final) = prescan_framed_group_indptr(
@@ -378,12 +398,12 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     // 2-slot rings: pinned host staging + device staging, one entry per stream
     // in flight. Upload(g+1) into the other slot overlaps compute(g).
     let mut pinned_idx = [
-        HostPlaneBuf::new(dev, max_idx_bytes),
-        HostPlaneBuf::new(dev, max_idx_bytes),
+        HostPlaneBuf::new(dev, max_idx_bytes)?,
+        HostPlaneBuf::new(dev, max_idx_bytes)?,
     ];
     let mut pinned_val = [
-        HostPlaneBuf::new(dev, max_val_bytes),
-        HostPlaneBuf::new(dev, max_val_bytes),
+        HostPlaneBuf::new(dev, max_val_bytes)?,
+        HostPlaneBuf::new(dev, max_val_bytes)?,
     ];
     let mut dev_idx = [
         dev.alloc_zeros::<u8>(max_idx_bytes.max(1))?,
@@ -751,8 +771,10 @@ pub fn decode_framed_shufdelta_gpu_nvcomp(
 ) -> Result<PipelinedCsr, GpuError> {
     let value_width = value_encoding.byte_width();
 
-    // Host-decode the tiny indptr per group + per-group nnz offsets.
-    let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+    // Host-decode the tiny indptr per group + per-group nnz offsets. Untrusted
+    // `n_rows`, so clamp the reservation (see the pipelined path above).
+    let mut combined_indptr: Vec<i64> =
+        Vec::with_capacity(clamped_reserve(n_rows + 1, indptr_bytes.len(), 8));
     combined_indptr.push(0);
     let t_indptr = profile::start();
     let (offsets, nnz_final) = prescan_framed_group_indptr(

@@ -370,6 +370,70 @@ impl BlockIndex {
     }
 }
 
+/// Elements-per-encoded-byte ratio used to size an *initial* reservation for a
+/// framed shard's reassembly buffers. See [`clamped_reserve`].
+///
+/// Measured on real framed fixtures (parsing their 76-byte shard headers and
+/// taking `max(nnz / indices_length, nnz / values_length,
+/// (n_major + 1) / indptr_length)` over every shard):
+///
+/// | fixture | codec | indices | values |
+/// |---|---|---|---|
+/// | `census_1m_auto` (62 shards) | ShufDeltaZstd | 1.71 | 3.79 |
+/// | `census_1m_compact_trial_g512` (62) | ShufDeltaZstd | 1.70 | 3.78 |
+/// | `replogle_k562_compact_trial` (5) | ShufDeltaZstd | 2.76 | 1.23 |
+/// | `tabula_sapiens_100k_fast` (7) | Scx1 | 0.60 | 2.55 |
+/// | `pbmc10k_scx1` (1) | Scx1 | 0.94 | 2.18 |
+///
+/// 32 leaves 8.4× headroom over the worst observed stream, so honest shards
+/// always reserve their exact size and the clamp is a no-op on the hot path.
+pub const MAX_ELEMENTS_PER_ENCODED_BYTE: usize = 32;
+
+/// Reservation floor, so a small shard still reserves in one go rather than
+/// growth-doubling from zero. See [`clamped_reserve`].
+pub const MIN_RESERVE_ELEMENTS: usize = 1 << 16;
+
+/// Absolute ceiling on a single untrusted reservation, in bytes. The ratio term
+/// alone still scales with file size (a 100 MB hostile sub-stream would permit
+/// 25 GB); this closes that. See [`clamped_reserve`].
+pub const MAX_RESERVE_BYTES: usize = 1 << 30;
+
+/// Clamp an untrusted element count down to a reservation that cannot abort the
+/// process.
+///
+/// `declared_elements` comes from the shard header / block index and is
+/// **unauthenticated** — the catalog's BLAKE3 covers catalog bytes, not shard
+/// payloads. `Vec::with_capacity` calls `handle_alloc_error` on failure, which
+/// aborts rather than unwinding, so a header declaring `nnz = u32::MAX` from a
+/// ~100-byte file would kill the process before a single payload byte was
+/// examined. `encoded_bytes` is the sub-stream the decode will actually draw
+/// from and `elem_size` the decoded element width.
+///
+/// # This never rejects
+///
+/// It returns a *capacity*, not a `Result`. There is no codec-agnostic
+/// elements-per-byte floor to reject against: the 8-elements-per-byte bound in
+/// `scx_codec`'s `bound_capacity` is the information-theoretic floor of
+/// Rice/Golomb coding (≥1 bit per element) and is therefore sound only on the
+/// **Scx1** paths where it is applied. The zstd-family codecs have no such
+/// floor — real files already reach 3.79 elements/byte (see
+/// [`MAX_ELEMENTS_PER_ENCODED_BYTE`]), leaving an 8:1 hard reject barely 2×
+/// of margin before a legitimately dense dataset became permanently unreadable.
+///
+/// Under-reserving is free: the buffer grows. Safety comes from the per-group
+/// decode, which validates every sub-stream against *its own* bytes
+/// (`le_bytes_to_*` exact-length checks, `zstd_decode_bounded`'s streaming cap,
+/// `expect_exact_len`, and the local-rebase check `indptr.last() == span.nnz`)
+/// before anything is appended. A hostile header still fails on the first
+/// group; it just no longer reserves tens of GB on the way there.
+pub fn clamped_reserve(declared_elements: usize, encoded_bytes: usize, elem_size: usize) -> usize {
+    let by_ratio = encoded_bytes
+        .saturating_mul(MAX_ELEMENTS_PER_ENCODED_BYTE)
+        .max(MIN_RESERVE_ELEMENTS);
+    let by_ceiling = MAX_RESERVE_BYTES / elem_size.max(1);
+    declared_elements.min(by_ratio).min(by_ceiling)
+}
+
 /// Parse **and fully validate** a framed shard's `BlockIndex`, resolving each
 /// entry into a [`RowGroupSpan`] with inferred per-sub-stream byte ranges.
 ///
@@ -386,6 +450,7 @@ impl BlockIndex {
 ///   every inferred range within the sub-stream length;
 /// - indptr range non-empty for every group; indices/values ranges non-empty
 ///   whenever `nnz_in_block > 0`;
+/// - `nnz_in_block <= n_rows * header.n_minor` (a group's cell count);
 /// - `Σ nnz_in_block == header.nnz`.
 ///
 /// Only call on framed shards (`shard_format_version >= 2`); legacy single-entry
@@ -419,6 +484,20 @@ pub fn resolve_block_index(
         }
         if e.n_rows == 0 {
             return Err(inval(format!("entry {i}: n_rows == 0")));
+        }
+        // A canonical-CSR row group spans `n_rows × n_minor` cells and cannot
+        // store more entries than that: indices are strictly increasing within
+        // a row and every index lies in `[0, n_minor)` (docs/format.md § v3
+        // canonical CSR invariant). Framing exists only in v4 files and v4 ⊇ v3,
+        // so this holds for every shard that reaches here. Real groups sit ~1500×
+        // under it, so it can only fire on corrupt or hostile input.
+        let group_cells = e.n_rows as u64 * header.n_minor as u64;
+        if e.nnz_in_block as u64 > group_cells {
+            return Err(inval(format!(
+                "entry {i}: nnz_in_block {} exceeds group capacity {group_cells} \
+                 ({} rows × {} columns)",
+                e.nnz_in_block, e.n_rows, header.n_minor
+            )));
         }
         if i == 0 {
             if e.indptr_byte_offset != 0 || e.indices_byte_offset != 0 || e.values_byte_offset != 0
@@ -705,6 +784,73 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].indptr, 0..48);
         assert_eq!(spans[0].values, 0..32);
+    }
+
+    /// A group cannot store more entries than it has cells. Accept exactly
+    /// `n_rows * n_minor`, reject one more — with `Σ nnz == header.nnz` kept
+    /// consistent in both arms so the geometry check is what decides.
+    #[test]
+    fn resolve_block_index_bounds_nnz_by_group_geometry() {
+        let (mut h, _) = framed_fixture();
+        h.n_minor = 3;
+        h.n_major = 2;
+        h.nnz = 6; // exactly 2 rows × 3 columns
+
+        let bi = BlockIndex {
+            entries: vec![BlockIndexEntry::new(0, 2, 0, 0, 0, 6).unwrap()],
+        };
+        let mut bytes = Vec::new();
+        bi.write_to(&mut bytes).unwrap();
+        let spans = resolve_block_index(&h, &bytes).expect("a fully dense group is valid");
+        assert_eq!(spans[0].nnz, 6);
+
+        // One entry beyond capacity, header.nnz raised to match so the Σ check
+        // still passes and only the geometry check can reject.
+        h.nnz = 7;
+        let err = resolve_err(&h, vec![BlockIndexEntry::new(0, 2, 0, 0, 0, 7).unwrap()]);
+        assert!(
+            matches!(&err, ScxError::InvalidBlockIndex(m) if m.contains("exceeds group capacity")),
+            "expected a group-capacity rejection, got {err:?}"
+        );
+    }
+
+    /// The clamp must be invisible on honest input and binding on hostile input,
+    /// with each of the three terms demonstrated as the one that binds.
+    #[test]
+    fn clamped_reserve_clamps_without_rejecting() {
+        // Honest shard: census_1m's worst stream is 3.79 elements/byte, far
+        // under the ratio, so `declared` wins and the reservation stays exact.
+        assert_eq!(clamped_reserve(2_500_000, 660_000, 4), 2_500_000);
+        // Ratio binds: the review's repro declares u32::MAX from a 1-byte
+        // stream. 1 × 32 is under the floor, so the floor is what lands.
+        assert_eq!(
+            clamped_reserve(u32::MAX as usize, 1, 4),
+            MIN_RESERVE_ELEMENTS
+        );
+        // Ratio binds above the floor: 1 MiB of indices cannot decode to 2^31
+        // elements, so we reserve 32 per byte rather than the declared count.
+        assert_eq!(
+            clamped_reserve(1 << 31, 1 << 20, 4),
+            MAX_ELEMENTS_PER_ENCODED_BYTE << 20
+        );
+        // Ceiling binds: a large hostile sub-stream would otherwise let the
+        // ratio scale the reservation without limit.
+        assert_eq!(
+            clamped_reserve(usize::MAX, 1 << 30, 4),
+            MAX_RESERVE_BYTES / 4
+        );
+        // Wider elements get proportionally fewer of them under the ceiling.
+        assert_eq!(
+            clamped_reserve(usize::MAX, 1 << 30, 8),
+            MAX_RESERVE_BYTES / 8
+        );
+        // Degenerate inputs stay total: no panic, no overflow.
+        assert_eq!(clamped_reserve(0, 0, 4), 0);
+        assert_eq!(clamped_reserve(10, 0, 0), 10);
+        assert_eq!(
+            clamped_reserve(usize::MAX, usize::MAX, 4),
+            MAX_RESERVE_BYTES / 4
+        );
     }
 
     #[test]
