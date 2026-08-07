@@ -55,7 +55,6 @@ use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::to_pyerr;
 
 use super::hvg::build_shard_source;
-use super::util::extract_materialized_csr;
 
 /// Default guard for the in-memory dense layer (`n_obs · n_vars` elements).
 const DEFAULT_DENSE_MAX_ELEMS: usize = 200_000_000;
@@ -263,7 +262,7 @@ pub fn pflog(
     }
 
     // In-memory scipy/dense X → build the delta CSR directly, one shard.
-    let raw = extract_materialized_csr(py, &x)?;
+    let raw = crate::convert::owned_csr(py, &x, None)?;
     let meta = resolve_alpha(alpha, &SingleShardSource { csr: &raw })?;
     let delta = delta_from_raw_csr(&raw, 4.0 * meta.alpha)?;
     let source = SingleShardSource { csr: &delta };

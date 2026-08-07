@@ -12,7 +12,9 @@ use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::ScxLazyTransformedDataset;
 
 use super::gpu::resolve_device;
-use super::util::extract_materialized_csr;
+
+#[cfg(feature = "gpu")]
+use super::util::astype_no_copy;
 
 /// Default RAM ceiling for the out-of-core backed-PCA shard cache when the
 /// caller passes no `memory_budget`. Large enough to hold the working set for
@@ -20,9 +22,6 @@ use super::util::extract_materialized_csr;
 /// reader (whose byte budget is otherwise unbounded). Raise via `memory_budget`
 /// for atlas-scale matrices that exceed this.
 pub(super) const DEFAULT_PCA_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
-#[cfg(feature = "gpu")]
-use super::util::{extract_csr_slices, CsrSlices};
 
 /// Floor on the share of `memory_budget` the decoded-shard LRU keeps.
 ///
@@ -98,19 +97,22 @@ pub(crate) use scx_format_io::shard_source::SingleShardSource as ScxCsrSource;
 /// Single-shard `ShardSource` adapter over **borrowed** numpy slices
 /// (Phase 10).
 ///
-/// `extract_materialized_csr` + [`ScxCsrSource`] performs two full host
-/// copies of `indptr` / `indices` / `data`: one when `extract::<Vec<T>>`
-/// converts numpy → Rust `Vec`, and a second when `read_shard` clones
-/// the resulting `ScxCsr` for dispatch. For 1M × 2K HVGs that doubles
-/// host RSS during upload.
+/// [`crate::convert::owned_csr`] + [`ScxCsrSource`] performs two full host
+/// copies of `indptr` / `indices` / `data`: one when the numpy buffers are
+/// copied into Rust `Vec`s, and a second when `read_shard` clones the
+/// resulting `ScxCsr` for dispatch. For 1M × 2K HVGs that doubles host RSS
+/// during upload.
 ///
 /// `BorrowedCsrSource` skips the first copy by holding `&[T]` views into
-/// numpy buffers (kept alive by the [`CsrSlices`] handle held by the
+/// numpy buffers (kept alive by the [`GilHeldCsrSlices`] handle held by the
 /// caller). `read_shard` is invoked exactly once by the GPU shard loader
 /// for a single-shard source, so `slice.to_vec()` here replaces *both* the
-/// original `extract::<Vec>`
-/// step and the `ScxCsrSource::read_shard` clone — net one memcpy per
-/// dispatch instead of two.
+/// owned-copy step and the `ScxCsrSource::read_shard` clone — net one memcpy
+/// per dispatch instead of two.
+///
+/// This is the **only** sanctioned borrowed-buffer path in pyscx, and it is
+/// sound only because the GPU dispatch below holds the GIL for its entire
+/// duration. See [`GilHeldCsrSlices`].
 #[cfg(feature = "gpu")]
 pub(crate) struct BorrowedCsrSource<'a> {
     pub(crate) indptr: &'a [i64],
@@ -149,18 +151,104 @@ impl ShardSource for BorrowedCsrSource<'_> {
     }
 }
 
+/// Borrowed CSR array slices over a scipy CSR matrix's live numpy buffers.
+///
+/// # Invariant — the caller must hold the GIL for as long as it reads these
+///
+/// rust-numpy borrows are **not** GIL-bound, do **not** clear numpy's
+/// `WRITEABLE` flag, and provide no synchronization
+/// (`numpy-0.28.0/src/borrow/mod.rs:141-145`). Since `astype(copy=False)` and
+/// `scipy.sparse.csr_matrix(A)` on an already-CSR `A` are identity operations,
+/// these slices are frequently `adata.X.data` / `adata.X.indices` themselves.
+/// Releasing the GIL while holding them lets any other Python thread rewrite
+/// the buffers mid-read: a data race, and — for `indices`, which is consumed
+/// as a column index — a wrong or out-of-range lookup.
+///
+/// The two sanctioned consumers are `gpu_pca_dispatch_unwind_safe` below and
+/// `accel/fused.rs`'s GPU pipeline. Both hold the GIL for their entire
+/// dispatch (`GpuDevice` is `!Send`, so they structurally cannot detach).
+/// **Everything else must use [`crate::convert::owned_csr`]**, which copies.
+/// This type is `#[cfg(feature = "gpu")]`-gated precisely so the default CPU
+/// build cannot name it, and a CI guard keeps it in this file.
+#[cfg(feature = "gpu")]
+pub(super) struct GilHeldCsrSlices<'py> {
+    _indptr: numpy::PyReadonlyArray1<'py, i64>,
+    _indices: numpy::PyReadonlyArray1<'py, i32>,
+    _data: numpy::PyReadonlyArray1<'py, f32>,
+}
+
+#[cfg(feature = "gpu")]
+impl<'py> GilHeldCsrSlices<'py> {
+    pub(super) fn indptr(&self) -> &[i64] {
+        // SAFETY: contiguity was checked in `borrow_csr_slices_gil_held`.
+        self._indptr.as_slice().unwrap()
+    }
+    pub(super) fn indices(&self) -> &[i32] {
+        self._indices.as_slice().unwrap()
+    }
+    pub(super) fn data(&self) -> &[f32] {
+        self._data.as_slice().unwrap()
+    }
+}
+
+/// Borrow a scipy CSR's `indptr` / `indices` / `data` without copying.
+///
+/// Read the invariant on [`GilHeldCsrSlices`] before adding a caller: the
+/// result must never outlive the GIL, and must never be captured by a
+/// `py.detach` closure.
+#[cfg(feature = "gpu")]
+fn borrow_csr_slices_gil_held<'py>(
+    py: Python<'py>,
+    np: &Bound<'py, PyModule>,
+    csr: &Bound<'py, PyAny>,
+) -> PyResult<GilHeldCsrSlices<'py>> {
+    fn not_contiguous(what: &str, e: impl std::fmt::Display) -> PyErr {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "CSR {what} is not C-contiguous ({e}); pass a canonical scipy CSR \
+             (try `X = X.tocsr(); X.sort_indices()`) or re-run \
+             `pyscx.from_anndata(...)` to rewrite it"
+        ))
+    }
+
+    let indptr_arr = np.call_method1("asarray", (&csr.getattr("indptr")?,))?;
+    let indptr_arr = astype_no_copy(py, &indptr_arr, "int64")?;
+    let indptr_ro: numpy::PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
+    indptr_ro
+        .as_slice()
+        .map_err(|e| not_contiguous("indptr", e))?;
+
+    let indices_arr = np.call_method1("asarray", (&csr.getattr("indices")?,))?;
+    let indices_arr = astype_no_copy(py, &indices_arr, "int32")?;
+    let indices_ro: numpy::PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
+    indices_ro
+        .as_slice()
+        .map_err(|e| not_contiguous("indices", e))?;
+
+    let data_arr = np.call_method1("asarray", (&csr.getattr("data")?,))?;
+    let data_arr = astype_no_copy(py, &data_arr, "float32")?;
+    let data_ro: numpy::PyReadonlyArray1<'_, f32> = data_arr.extract()?;
+    data_ro.as_slice().map_err(|e| not_contiguous("data", e))?;
+
+    Ok(GilHeldCsrSlices {
+        _indptr: indptr_ro,
+        _indices: indices_ro,
+        _data: data_ro,
+    })
+}
+
 /// Try to obtain borrowed `&[T]` views over a materialised scipy / dense `X`
 /// for the GPU PCA fast-lane.
 ///
-/// Returns `Ok(Some(...))` on success — caller holds the [`CsrSlices`] for
-/// the duration of dispatch so the underlying numpy buffers stay alive.
-/// Returns `Ok(None)` if `X` cannot be presented as a scipy CSR (e.g. a type
-/// scipy refuses to convert); callers fall through to the owned-`Vec` path.
+/// Returns `Ok(Some(...))` on success — caller holds the [`GilHeldCsrSlices`]
+/// for the duration of dispatch, **with the GIL held throughout**; see that
+/// type's invariant. Returns `Ok(None)` if `X` cannot be presented as a scipy
+/// CSR (e.g. a type scipy refuses to convert); callers fall through to the
+/// owned-`Vec` path.
 #[cfg(feature = "gpu")]
 pub(super) fn try_extract_borrowed_csr<'py>(
     py: Python<'py>,
     x: &Bound<'py, PyAny>,
-) -> PyResult<Option<(CsrSlices<'py>, (usize, usize))>> {
+) -> PyResult<Option<(GilHeldCsrSlices<'py>, (usize, usize))>> {
     let scipy_sparse = py.import("scipy.sparse")?;
     let csr_py = match scipy_sparse.call_method1("csr_matrix", (x,)) {
         Ok(v) => v,
@@ -168,7 +256,7 @@ pub(super) fn try_extract_borrowed_csr<'py>(
     };
     let shape: (usize, usize) = csr_py.getattr("shape")?.extract()?;
     let np = py.import("numpy")?;
-    let slices = extract_csr_slices(py, &np, &csr_py, "pca(device=\"gpu\")", 0)?;
+    let slices = borrow_csr_slices_gil_held(py, &np, &csr_py)?;
     Ok(Some((slices, shape)))
 }
 
@@ -910,7 +998,7 @@ pub fn pca(
         }
 
         // Fallback: owned-Vec path (e.g. exotic X types scipy can't view).
-        let csr = extract_materialized_csr(py, &x)?;
+        let csr = crate::convert::owned_csr(py, &x, None)?;
         let source = ScxCsrSource { csr: &csr };
         let n_vars = source.n_vars();
         let m = resolve_gpu_method(method, mask_cols.map(|c| c.len()).unwrap_or(n_vars))?;
@@ -1071,7 +1159,7 @@ pub fn pca(
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else {
         backend = "scx-accel-cpu";
-        let csr0 = extract_materialized_csr(py, &x)?;
+        let csr0 = crate::convert::owned_csr(py, &x, None)?;
         // Materialized in-memory path: project columns directly (no streaming
         // source needed) so `mask_var` works identically here.
         let csr = match mask_cols {

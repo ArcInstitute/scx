@@ -115,6 +115,35 @@ jobs:
             echo "::error::Hand-spelled FileHeader literal found — use FileHeader::new_single_modality(...) or FileHeader { .., ..Default::default() }."
             exit 1
           fi
+      # §10.1: a numpy borrow is not GIL-bound and does not clear numpy's
+      # WRITEABLE flag, so a `&[T]` taken from one must never be read after the
+      # GIL is released. `GilHeldCsrSlices` is the single borrowed-buffer
+      # escape hatch; it is sound only because the GPU PCA / fused dispatch
+      # holds the GIL throughout, and it is `#[cfg(feature = "gpu")]`-gated so
+      # a CPU build cannot even name it. Keep it in the one file that can
+      # honour that invariant — every other caller uses `convert::owned_csr`.
+      # Deliberately strict: this fires on a *mention* too, so referring to the
+      # type by name from another Rust file's comment trips it. Say "the GPU
+      # borrowed-CSR path" there instead, or add the file to the allowlist.
+      - name: Borrowed-CSR machinery stays in the one GIL-held file
+        run: |
+          if grep -rEn --include='*.rs' \
+               'GilHeldCsrSlices|borrow_csr_slices_gil_held' . \
+               | grep -v 'pyscx/src/accel/pca.rs'; then
+            echo "::error::Borrowed numpy CSR slices outside pyscx/src/accel/pca.rs — use crate::convert::owned_csr() (see docs/conventions.md § Python Bindings)."
+            exit 1
+          fi
+      # The same fix folded three near-duplicate scipy→ScxCsr materializers
+      # into `convert::owned_csr`. Two of them copied twice (an `astype`
+      # copy plus a pyo3 sequence extraction that allocated one Python object
+      # per nonzero); resurrecting either re-opens both the duplication and the
+      # question of which one is safe across `detach`.
+      - name: No revived duplicate CSR materializers
+        run: |
+          if grep -rEn --include='*.rs' 'fn (extract_materialized_csr|scipy_to_scxcsr)\b' .; then
+            echo "::error::Duplicate scipy→ScxCsr materializer — use crate::convert::owned_csr()."
+            exit 1
+          fi
 
   feature-check:
     name: Feature matrix (cargo check)

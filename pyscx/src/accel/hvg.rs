@@ -9,8 +9,6 @@ use pyo3::types::PyDict;
 use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 
-use super::util::extract_materialized_csr;
-
 /// Single-shard [`scx_format_io::ShardSource`] adapter over a borrowed in-memory
 /// [`scx_sparse::ScxCsr`].
 ///
@@ -443,7 +441,7 @@ pub fn highly_variable_genes<'py>(
     // (per-batch loess on a high-cardinality `batch_key`). Only flavors the
     // native kernel doesn't implement (e.g. `cell_ranger`) fall through.
     if matches!(flavor, "seurat_v3" | "seurat_v3_paper" | "seurat") {
-        let csr = extract_materialized_csr(py, &x)?;
+        let csr = crate::convert::owned_csr(py, &x, None)?;
         let n_obs = csr.n_rows();
         let n_vars = csr.n_cols();
         let source = InMemoryCsrSource { csr: &csr };

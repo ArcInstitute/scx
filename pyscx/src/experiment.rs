@@ -1756,7 +1756,13 @@ impl PyExperiment {
         modality: Option<&str>,
         cache_shards: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let rows = rows.as_slice()?;
+        // Snapshot the row ids while the GIL is held. A `PyReadonlyArray`
+        // borrow is not GIL-bound and does not clear numpy's WRITEABLE flag,
+        // so reading it inside the `py.detach` below would race any other
+        // Python thread that touches the caller's array — and would defeat
+        // the bounds check two statements down, which is the whole reason
+        // this method can promise an `IndexError`.
+        let rows: Vec<u64> = rows.as_slice()?.to_vec();
         let n_rows = rows.len();
         let backed = open_backed_csr(&self.path, modality, cache_shards)?;
         let n_vars = backed.n_vars();
@@ -1773,7 +1779,7 @@ impl PyExperiment {
         // Scatter each row's CSR into its request position (GIL released).
         let mut per_row: Vec<Option<(Vec<i32>, Vec<f32>)>> = (0..n_rows).map(|_| None).collect();
         py.detach(|| {
-            backed.read_rows_with(rows, |orig_pos, indices, data| {
+            backed.read_rows_with(&rows, |orig_pos, indices, data| {
                 per_row[orig_pos] = Some((indices.to_vec(), data.to_vec()));
                 Ok(())
             })

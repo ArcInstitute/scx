@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use scx_format_io::ScxReader;
 
 use crate::to_pyerr;
@@ -550,56 +551,209 @@ fn err_str<E: std::fmt::Display>(e: E) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
-/// Rebuild an owned `ScxCsr` from a Python `scipy.sparse` matrix.
+// ---------------------------------------------------------------------------
+// Owned matrix extraction — the only sanctioned way into a detached kernel
+// ---------------------------------------------------------------------------
+
+/// Copy a slice into an owned `Vec`, in parallel above a size threshold.
 ///
-/// The matrix is normalized to CSR (skipping `.tocsr()` when it already is one);
-/// `data` is read as `f32`, `indices` as `i32`, `indptr` as `i64` (scipy may
-/// store either int32 or int64 for these, so we `astype` to the canonical widths
-/// — cheap, and only on the non-default read path). Column indices are always
-/// `< n_vars < 2³¹` and so fit `i32`; `indptr` uses `i64` for large-matrix
-/// headroom. A non-sparse input (e.g. a dense ndarray) is rejected with a clear
-/// error rather than a confusing `AttributeError` on the missing `.data` view.
-fn scipy_to_scxcsr(mat: &Bound<'_, PyAny>) -> PyResult<scx_sparse::ScxCsr> {
+/// A defensive snapshot of a large matrix is **page-fault bound, not memcpy
+/// bound**: the destination is a fresh allocation, so every 4 KB page is
+/// touched for the first time as it is written. Measured on the dev host,
+/// `np.copy()` of a 192 MB array takes 119 ms — ~1.6 GB/s, an order of
+/// magnitude below the machine's memcpy rate. First-touch faults parallelize,
+/// so filling from a rayon pool recovers most of that.
+///
+/// `vec![T::default(); n]` gets its pages from `alloc_zeroed` (lazy, unfaulted),
+/// so the faults land inside the parallel region rather than before it.
+///
+/// Safe to call with the GIL held: the closure is pure Rust and never touches
+/// the interpreter, so there is no re-entry and no deadlock.
+pub(crate) fn par_to_vec<T>(src: &[T]) -> Vec<T>
+where
+    T: Copy + Default + Send + Sync,
+{
+    // Below this the rayon split costs more than the faults it saves; a small
+    // obsm embedding or a short indptr should not pay for a thread pool.
+    const PAR_THRESHOLD_BYTES: usize = 4 << 20;
+    // One chunk per ~2 MB keeps the task count sane on an atlas-scale matrix
+    // while still oversubscribing enough for the pool to balance.
+    const CHUNK_BYTES: usize = 2 << 20;
+
+    if std::mem::size_of_val(src) < PAR_THRESHOLD_BYTES {
+        return src.to_vec();
+    }
+    // `.max(1)` on the element size, not just on the chunk: a zero-sized `T`
+    // would otherwise divide by zero. It cannot reach here today — a ZST slice
+    // has `size_of_val == 0` and takes the early return above — but the guard
+    // is one token and does not depend on that ordering surviving an edit.
+    let chunk = (CHUNK_BYTES / std::mem::size_of::<T>().max(1)).max(1);
+    let mut out = vec![T::default(); src.len()];
+    out.par_chunks_mut(chunk)
+        .zip(src.par_chunks(chunk))
+        .for_each(|(dst, s)| dst.copy_from_slice(s));
+    out
+}
+
+/// Emit a Python `UserWarning` when a defensive copy is large enough to notice.
+///
+/// `warn_label` is the user-facing operation name; `None` suppresses it.
+///
+/// **`None` is the common case, deliberately.** The warning marks copies this
+/// change *introduced* — `pseudobulk_means` and `knockdown_efficiency`, which
+/// used to borrow. The in-memory `pca` / `hvg` / `score_genes` / `pflog` / fused
+/// paths pass `None` because they already materialised a full owned CSR before
+/// it (through a slower route), so warning there would be new noise about
+/// long-standing behaviour rather than news. The docs name the two ops that
+/// warn rather than claiming coverage of every copy. Wiring labels through the
+/// rest is a defensible follow-up, but it is a user-visible change to paths this
+/// fix did not otherwise touch.
+fn warn_large_copy(
+    py: Python<'_>,
+    warn_label: Option<&str>,
+    bytes: usize,
+    threshold: usize,
+    what: &str,
+) -> PyResult<()> {
+    let Some(label) = warn_label else {
+        return Ok(());
+    };
+    if bytes <= threshold {
+        return Ok(());
+    }
+    let gb = bytes as f64 / 1e9;
+    py.import("warnings")?.call_method1(
+        "warn",
+        (format!(
+            "{label}: copying {what} ({gb:.1} GB) so the kernel can run with the GIL \
+             released — a numpy borrow is not safe to read once other Python threads \
+             can run. To avoid the copy, pass a sparse `X`, or open the file backed \
+             (`pyscx.open(path).to_anndata(backed=True)`) and let the op stream it."
+        ),),
+    )?;
+    Ok(())
+}
+
+/// Copy a Python matrix — scipy sparse of any format, or dense — into an owned
+/// [`scx_sparse::ScxCsr`].
+///
+/// # Invariant
+///
+/// The returned buffers are **Rust-owned**, so they may be read after the GIL
+/// is released. A `PyReadonlyArray*` borrow may not: rust-numpy documents that
+/// its borrows are not GIL-bound, do not clear numpy's `WRITEABLE` flag, and
+/// provide no synchronization (`numpy-0.28.0/src/borrow/mod.rs:141-145`). Since
+/// `astype(..., copy=False)` and `scipy.sparse.csr_matrix(A)` on an already-CSR
+/// `A` are identity operations, such a borrow *is* `adata.X.data` /
+/// `adata.X.indices`, and another Python thread can rewrite it mid-kernel.
+///
+/// This is the only sanctioned way to get matrix buffers into a detached
+/// kernel from pyscx. The one exception —
+/// [`crate::accel::pca`]'s GPU fast-lane — is `#[cfg(feature = "gpu")]`-gated
+/// and holds the GIL for its entire dispatch; see the invariant note there.
+///
+/// `data` is read as `f32`, `indices` as `i32`, `indptr` as `i64`. Column
+/// indices are always `< n_vars < 2³¹` and so fit `i32`; `indptr` uses `i64`
+/// for large-matrix headroom.
+pub(crate) fn owned_csr(
+    py: Python<'_>,
+    x: &Bound<'_, PyAny>,
+    warn_label: Option<&str>,
+) -> PyResult<scx_sparse::ScxCsr> {
     use numpy::PyReadonlyArray1;
 
-    if !mat.hasattr("tocsr")? {
-        return Err(PyValueError::new_err(
-            "expected a scipy.sparse matrix for container/dtype materialization; \
-             got a non-sparse object",
-        ));
-    }
-    // `.tocsr()` is a no-op copy on a matrix that is already CSR — skip it.
-    let already_csr = matches!(
-        mat.getattr("format").and_then(|f| f.extract::<String>()),
-        Ok(ref f) if f == "csr"
-    );
-    let csr = if already_csr {
-        mat.clone()
-    } else {
-        mat.call_method0("tocsr")?
-    };
+    let np = py.import("numpy")?;
+    let scipy_sparse = py.import("scipy.sparse")?;
+    // Handles dense ndarrays and every sparse format; a no-op view when the
+    // input is already CSR (which is exactly why the borrow was unsafe).
+    let csr = scipy_sparse.call_method1("csr_matrix", (x,))?;
     let shape: (usize, usize) = csr.getattr("shape")?.extract()?;
 
-    let data_arr = csr.getattr("data")?.call_method1("astype", ("float32",))?;
-    let data = data_arr
-        .extract::<PyReadonlyArray1<f32>>()?
-        .as_slice()?
-        .to_vec();
+    let nnz: usize = csr.getattr("nnz")?.extract()?;
+    // 4 bytes of data + 4 bytes of index per nonzero; indptr is negligible.
+    warn_large_copy(py, warn_label, nnz * 8, 2_000_000_000, "a sparse matrix")?;
 
-    let idx_arr = csr.getattr("indices")?.call_method1("astype", ("int32",))?;
-    let indices = idx_arr
-        .extract::<PyReadonlyArray1<i32>>()?
-        .as_slice()?
-        .to_vec();
-
-    let indptr_arr = csr.getattr("indptr")?.call_method1("astype", ("int64",))?;
+    // `astype_if_needed` returns the array untouched when the width already
+    // matches, so the common case is exactly one memcpy per array. A width
+    // mismatch (scipy stores int32 indptr on a matrix that fits) costs the
+    // numpy conversion on top — as it always did.
+    let indptr_arr = super::astype_if_needed(&csr.getattr("indptr")?, &np, "int64")?;
     let indptr = indptr_arr
         .extract::<PyReadonlyArray1<i64>>()?
-        .as_slice()?
-        .to_vec();
+        .as_slice()
+        .map_err(|e| not_contiguous("indptr", e))
+        .map(par_to_vec)?;
+
+    let indices_arr = super::astype_if_needed(&csr.getattr("indices")?, &np, "int32")?;
+    let indices = indices_arr
+        .extract::<PyReadonlyArray1<i32>>()?
+        .as_slice()
+        .map_err(|e| not_contiguous("indices", e))
+        .map(par_to_vec)?;
+
+    let data_arr = super::astype_if_needed(&csr.getattr("data")?, &np, "float32")?;
+    let data = data_arr
+        .extract::<PyReadonlyArray1<f32>>()?
+        .as_slice()
+        .map_err(|e| not_contiguous("data", e))
+        .map(par_to_vec)?;
 
     Ok(scx_sparse::ScxCsr::new_unchecked(
         shape, indptr, indices, data,
+    ))
+}
+
+/// Copy a dense 2-D Python array into an owned row-major `Vec<f32>`.
+///
+/// Same invariant as [`owned_csr`]: the result is Rust-owned and safe to read
+/// with the GIL released.
+///
+/// The coercion (`asarray` → `float32` → C-contiguous) already materializes a
+/// fresh array for `float64`, Fortran-order, and non-array inputs, so for those
+/// the copy here is the *only* one. An already-`float32`-C-contiguous input is
+/// the case that pays a genuinely extra `n_obs × n_vars × 4` bytes — and is
+/// also the only case where the borrow would have aliased the caller's buffer.
+pub(crate) fn owned_dense2_f32(
+    py: Python<'_>,
+    x: &Bound<'_, PyAny>,
+    warn_label: Option<&str>,
+) -> PyResult<(Vec<f32>, (usize, usize))> {
+    let np = py.import("numpy")?;
+    let arr = if x.hasattr("toarray")? {
+        x.call_method0("toarray")?
+    } else {
+        np.call_method1("asarray", (x,))?
+    };
+    let arr = super::astype_if_needed(&arr, &np, "float32")?;
+    // Guarantees row-major layout for the row-major Rust kernels; a no-op when
+    // the array is already C-contiguous.
+    let arr = np.call_method1("ascontiguousarray", (&arr,))?;
+    use numpy::PyUntypedArrayMethods;
+    let arr_ro: numpy::PyReadonlyArray2<'_, f32> = arr.extract()?;
+    let dims = arr_ro.shape();
+    let shape = (dims[0], dims[1]);
+
+    warn_large_copy(
+        py,
+        warn_label,
+        shape.0.saturating_mul(shape.1).saturating_mul(4),
+        1_000_000_000,
+        "a dense matrix",
+    )?;
+
+    let data = arr_ro
+        .as_slice()
+        .map_err(|e| not_contiguous("dense X", e))
+        .map(par_to_vec)?;
+    Ok((data, shape))
+}
+
+/// Shared "this numpy array isn't contiguous" error, naming the remedy.
+fn not_contiguous(what: &str, e: impl std::fmt::Display) -> PyErr {
+    PyValueError::new_err(format!(
+        "{what} is not C-contiguous ({e}); pass a canonical scipy CSR \
+         (try `X = X.tocsr(); X.sort_indices()`) or re-run \
+         `pyscx.from_anndata(...)` to rewrite it"
     ))
 }
 
@@ -610,8 +764,8 @@ fn scipy_to_scxcsr(mat: &Bound<'_, PyAny>) -> PyResult<scx_sparse::ScxCsr> {
 /// invoke this when `plan.is_default_csr_f32()` is `false`, so the default read
 /// path never re-extracts or copies.
 ///
-/// This re-extracts the scipy CSR back into an owned `ScxCsr` (three `astype`
-/// copies) before casting — the price of applying the plan *after* assembly. The
+/// This re-extracts the scipy CSR back into an owned `ScxCsr` (one memcpy per
+/// array) before casting — the price of applying the plan *after* assembly. The
 /// query path (`query_result_to_anndata_with_plan`) is leaner: it owns the
 /// `ScxCsr` and threads the plan straight into `csr_to_scipy_typed` (one
 /// materialization). Phase 2 (push-dtype-into-decode) removes this round-trip for
@@ -624,7 +778,15 @@ pub(crate) fn retype_matrix<'py>(
     if plan.is_default_csr_f32() {
         return Ok(mat);
     }
-    let csr = scipy_to_scxcsr(&mat)?;
+    // Reject a dense input with a clear error rather than letting `owned_csr`
+    // silently densify-then-sparsify it, which is not what this path wants.
+    if !mat.hasattr("tocsr")? {
+        return Err(PyValueError::new_err(
+            "expected a scipy.sparse matrix for container/dtype materialization; \
+             got a non-sparse object",
+        ));
+    }
+    let csr = owned_csr(py, &mat, None)?;
     csr_to_scipy_typed(py, csr, plan)
 }
 

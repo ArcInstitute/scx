@@ -28,7 +28,6 @@ use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::ScxLazyTransformedDataset;
 
 use super::hvg::build_shard_source;
-use super::util::extract_materialized_csr;
 
 /// Score a set of genes per cell, writing the result to `adata.obs[score_name]`.
 ///
@@ -207,7 +206,7 @@ pub fn score_genes<'py>(
     }
 
     // In-memory scipy/dense X → wrap the materialized CSR as a single shard.
-    let csr = extract_materialized_csr(py, &x)?;
+    let csr = crate::convert::owned_csr(py, &x, None)?;
     let source = SingleShardSource { csr: &csr };
     score_on_source(
         py,

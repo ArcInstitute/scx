@@ -87,6 +87,27 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   AnnData slots.
 - Optional Python deps (e.g. `pydeseq2`) imported at runtime with clear
   `ImportError` if missing.
+- **Never hold a numpy borrow past the coercion.** `PyReadonlyArray*` is a
+  *view* into a buffer Python can still write: rust-numpy borrows are not
+  GIL-bound, do not clear numpy's `WRITEABLE` flag, and carry no
+  synchronization. Coerce (`asarray` / `astype` / `ascontiguousarray`), copy
+  into an owned `Vec` / `Arc<[T]>`, and drop the guard — then hand the owned
+  buffer to the kernel. `crate::convert::owned_csr` (scipy or dense → owned
+  `ScxCsr`) and `crate::convert::owned_dense2_f32` are the sanctioned entry
+  points; a one-off array is `ro.as_slice()?.to_vec()`. For a matrix-sized copy
+  use `convert::interop::par_to_vec` rather than `to_vec` — a fresh allocation
+  is page-fault bound (~1.6 GB/s serial), and the faults parallelize. Rayon is
+  safe to call with the GIL held: the closure never re-enters the interpreter.
+  The rule is phrased
+  against the *coercion*, not against `py.detach`, deliberately: on
+  free-threaded CPython there is no GIL to release and every held borrow is
+  hazardous. Keeping the guard alive is not a fix — it keeps the object alive,
+  not the values still.
+  The one exception is `pyscx/src/accel/pca.rs`'s `GilHeldCsrSlices`, used by
+  the GPU PCA / fused dispatch, which holds the GIL throughout (`GpuDevice` is
+  `!Send`, so it structurally cannot detach). It is `#[cfg(feature = "gpu")]`-gated
+  so a CPU build cannot name it, and CI's `dedup-guard` job keeps it in that
+  one file.
 
 ## R Bindings (rscx)
 
