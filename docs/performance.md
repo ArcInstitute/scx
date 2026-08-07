@@ -915,6 +915,87 @@ oracle ranked marshalling negligible and both 2.4 and this capture agree; §9.5'
 "largest remaining marshalling cost" was right about the *ordering* among marshalling
 sites and wrong that the absolute mattered.
 
+### Owned snapshots at the numpy boundary (finding §10.1)
+
+Six `py.detach(...)` closures in `pyscx` read Rust `&[T]` slices *borrowed* from live,
+Python-reachable numpy buffers. rust-numpy borrows are not GIL-bound, do not clear numpy's
+`WRITEABLE` flag, and carry no synchronization; `astype(..., copy=False)` and
+`scipy.sparse.csr_matrix(A)` on an already-CSR `A` are identity operations, so those slices
+*were* `adata.X.data` / `adata.X.indices`. Each now takes an owned snapshot under the GIL
+first. Sites: `pseudobulk_means` (sparse and dense in-memory arms, and the lazy arm, which
+now skips the scipy round-trip entirely by using the `ScxCsr` `to_memory_py` already builds),
+`knockdown_efficiency`, `Experiment.gather_rows_sparse`, and `from_anndata`'s CSC-sidecar
+block. The same change folded three near-duplicate scipy→`ScxCsr` materializers into one,
+`convert::owned_csr`.
+
+**Measured.** Single node, `cargo` release build, medians of 3–5 runs; sparse fixture
+200k × 600 at density 0.08 (9.6M nnz), dense fixture 40k × 1 200 f32 (192 MB). The middle
+column is the naive form of the fix — a serial `to_vec()` — and is shown because it is where
+this nearly landed:
+
+| op | before | serial copy | **parallel copy** | net |
+|---|--:|--:|--:|---|
+| `pca`, in-memory CSR, `n_comps=10` | 1 213 ms | 342 ms | **307 ms** | **4.0× faster** |
+| `highly_variable_genes`, in-memory, `seurat_v3` | 1 090 ms | 208 ms | **189 ms** | **5.8× faster** |
+| `pseudobulk_means`, in-memory sparse | 38 ms | 86 ms | **47 ms** | 1.2× slower |
+| `pseudobulk_means`, in-memory dense f64 | 128 ms | 248 ms | **138 ms** | 1.08× slower |
+| `pseudobulk_means`, in-memory dense f32 | 23 ms | 132 ms | **37 ms** | 1.6× slower |
+
+The speedups are the fold, and they are the larger effect. `extract_materialized_csr` — on
+the in-memory `pca` / `hvg` / `score_genes` / `pflog` / fused paths — reached numpy through
+`extract::<Vec<i64>>()`, which is **not** a memcpy: pyo3's `Vec<T>` extraction fast-paths
+only `u8` from bytes (`pyo3-0.28.3/src/conversions/std/vec.rs:74-84`) and otherwise falls to
+`extract_sequence`, one Python object per element. Those paths also paid an `astype(copy=True)`
+on top. One memcpy replaces both.
+
+**The defensive copy is page-fault bound, not memcpy bound, and that is the whole story of
+the third column.** A serial `to_vec()` of the 192 MB dense array cost 109 ms — matching the
+119 ms `np.copy()` measures on the same array, i.e. ~1.6 GB/s, an order of magnitude below
+the machine's memcpy rate. The destination is a fresh allocation, so the cost is first-touch
+faulting one 4 KB page at a time, and that parallelizes: `convert::interop::par_to_vec` fills
+from a rayon pool above a 4 MB threshold and takes the same copy to ~14 ms. Rayon is safe to
+call with the GIL held here — the closure is pure Rust and never re-enters the interpreter.
+
+What remains is small enough to leave alone. Dense f64 is within 8 % of baseline (its
+`astype` was always the dominant copy); sparse is within 23 %; dense f32 pays the most at
+1.6×, and is the one case where nothing was being copied before —
+`astype`/`ascontiguousarray` are both no-ops on an already-f32 C-contiguous array, which is
+precisely why the borrow aliased `adata.X` there. Passing a sparse `X`, or a backed / lazy
+handle (which streams and never materializes), avoids the copy entirely;
+`pseudobulk_means` emits a `UserWarning` naming both escape hatches once the copy exceeds
+1 GB dense / 2 GB sparse.
+
+Two follow-ons are recorded rather than taken, both now marginal: skipping the copy when the
+coercion already produced a provably-unaliased array (`np.may_share_memory(coerced, x) is
+False`), worth ~10 ms on the dense-f64 row; and a chunked dense accumulator in `scx-accel`,
+which would bound the extra peak memory rather than the time. `from_anndata`'s CSC block
+needed neither — the transpose already allocated all three owned buffers as its first act,
+inside the detached region, so splitting it into `csc_input_from_csr_slices` (GIL held, copy
+only) + `write_csc_shards_from_owned` (detached, sort + write) is byte-for-byte RSS-neutral.
+
+`pyscx/tests/test_numpy_buffer_race.py` measures the property rather than the symptom: a
+mutator thread flips `X` between two states for the duration of the op, and a correct
+implementation must return exactly one of the two results, never a blend. "Mutate and assert
+the answer is unchanged" is unsound in both directions — it passes on broken code by timing
+luck, and *fails on correct code* when the mutator lands before the snapshot. All four tests
+were observed red on 8 of 8 runs against unmodified source, and green on 8 of 8 after.
+
+Two properties of the *mutator* turn out to be load-bearing, both found by watching a test
+fail on correct code:
+
+- **numpy releases the GIL inside a large array assignment.** Measured with a concurrent
+  reader comparing the two ends of the buffer, a 9.6M-element `arr[:] = other` is observed
+  torn in **3 076 100 of 11 357 806** checks (27 %); a 480-element strided write is torn
+  **0 times in 3 347 462**. A torn mutation is a third state, so the two-state premise fails
+  and a correct implementation looks broken. The mutation has to stay under numpy's
+  threading threshold — and strided, so the touched elements are spread across the read
+  order rather than sitting in a handful of adjacent rows.
+- **The op has to consult enough independent values for a blend to be possible at all.**
+  `knockdown_efficiency` reduces each targeted gene's control cells to one baseline scalar;
+  with four target genes and roughly one spiked value per gene, each baseline lands wholly
+  in one state and the result matches A or B by construction. That version passed on the
+  unfixed build. Two hundred target genes make an all-one-way outcome vanishingly unlikely.
+
 ### Graph-layout refactors (Phase-2 task 2.5)
 
 These are **result-preserving** layout/allocation refactors of the UMAP connectivity

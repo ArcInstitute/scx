@@ -18,7 +18,6 @@ use super::pca::{
     write_pca_to_adata, BorrowedCsrSource, ScxCsrSource,
 };
 #[cfg(feature = "gpu")]
-use super::util::extract_materialized_csr;
 #[cfg(feature = "gpu")]
 use crate::backed::ScxBackedSparseDataset;
 #[cfg(feature = "gpu")]
@@ -261,7 +260,7 @@ pub fn pca_neighbors(
                 )?;
                 true
             } else {
-                let csr = extract_materialized_csr(py, &x)?;
+                let csr = crate::convert::owned_csr(py, &x, None)?;
                 let source = ScxCsrSource { csr: &csr };
                 run_fused_gpu(
                     py,

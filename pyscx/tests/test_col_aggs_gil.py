@@ -20,8 +20,6 @@ host, because a loaded machine delays the monitor under *both* behaviours.
 
 from __future__ import annotations
 
-import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -29,6 +27,8 @@ import pytest
 import scipy.sparse as sp
 
 import pyscx
+
+from _gil_probe import largest_gap_during
 
 # Sized from measurement, not guessed: at 40k x 400 the single-pass ops
 # finished in ~7 ms and skipped themselves as unmeasurable. At 300k x 800
@@ -64,43 +64,10 @@ def backed_x(tmp_path_factory):
     return pyscx.open(str(path)).to_anndata(backed=True).X
 
 
-def _largest_gap_during(op) -> tuple[float, float]:
-    """Run `op`, returning `(op_duration, largest monitor-thread stall)`."""
-    stamps: list[float] = []
-    stop = threading.Event()
-
-    def monitor():
-        while not stop.is_set():
-            stamps.append(time.perf_counter())
-            time.sleep(0.001)
-
-    t = threading.Thread(target=monitor, daemon=True)
-    t.start()
-    # Let the monitor establish a baseline cadence before the op starts.
-    time.sleep(0.02)
-    start = time.perf_counter()
-    op()
-    duration = time.perf_counter() - start
-    stop.set()
-    t.join(timeout=5)
-
-    during = [s for s in stamps if s >= start]
-    if len(during) < 2:
-        # The monitor produced no samples inside the window at all — that is
-        # itself the failure the test is looking for.
-        return duration, duration
-    gaps = np.diff(np.asarray(during))
-    # The stall that matters is measured from the last pre-op stamp, so a
-    # monitor frozen for the entire op is caught rather than showing zero gaps.
-    before = [s for s in stamps if s < start]
-    leading = during[0] - (before[-1] if before else start)
-    return duration, float(max(gaps.max(), leading))
-
-
 @pytest.mark.parametrize("op_name", ["col_sums", "col_var", "col_nnz"])
 def test_col_aggs_release_the_gil(backed_x, op_name):
     fn = getattr(pyscx.accel, op_name)
-    duration, largest_gap = _largest_gap_during(lambda: fn(backed_x))
+    duration, largest_gap = largest_gap_during(lambda: fn(backed_x))
 
     if duration < MIN_MEASURABLE_S:
         pytest.skip(

@@ -3282,6 +3282,16 @@ The heavy accelerators, including `pyscx.accel.col_sums` and its siblings,
 release the GIL for their streaming scan, so they can be called concurrently
 from Python threads without serialising each other.
 
+An accelerator that releases the GIL works from an **owned snapshot** of `X`,
+taken before the release. Mutating `adata.X` from another thread during a call
+is therefore safe: the in-flight result reflects the matrix as it was when the
+call started, never a half-updated blend. On an **in-memory** `X` that snapshot
+is a copy; it is taken in parallel, so it costs rather less than `X.copy()`
+(measured 14 ms for a 192 MB dense matrix, against 119 ms for `np.copy`), and
+`pseudobulk_means` warns once it exceeds 1 GB. A **backed or lazy** `X` needs no
+copy at all: it streams shard by shard from the file, which is the cheaper way
+to run these ops on a large matrix regardless.
+
 The cloud runtime exposes its own knob:
 
 ```python

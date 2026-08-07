@@ -196,26 +196,31 @@ pub(crate) fn build_and_write_predicate_indexes_inline(
     Ok(())
 }
 
-/// Streaming CSR → CSC transpose over the in-memory `(indptr, indices,
-/// data)` arrays, writing each emitted chunk as one CSC shard.
+/// Owned, width-converted CSR buffers on their way to the CSC transpose.
 ///
-/// Mirrors `scx-cli::convert::write_csc_shards_from_csr` so the two
-/// import paths produce structurally identical CSC sidecars (same
-/// `csc_cols_per_shard`, same encoder).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_csc_shards_from_csr(
-    writer: &mut ScxWriter,
+/// Exists so the numpy-borrowed half of the work can be separated from the
+/// long half: [`csc_input_from_csr_slices`] fills these under the GIL,
+/// [`write_csc_shards_from_owned`] canonicalizes and writes them detached.
+pub(crate) struct CscInput {
+    indptr: Vec<u64>,
+    indices: Vec<u32>,
+    values: Vec<f32>,
+}
+
+/// Copy borrowed CSR arrays into the owned buffers the CSC transpose needs.
+///
+/// **Runs under the GIL, and does no more than it has to.** The three input
+/// slices may be borrowed from live numpy buffers, so they are consumed here —
+/// before any `py.detach` — and never escape. These are the same three
+/// allocations the transpose always made; they are hoisted out of the detached
+/// region, not added to it. The row-sorting pass that used to follow them stays
+/// on the detached side, where it only touches owned memory.
+pub(crate) fn csc_input_from_csr_slices(
     indptr: &[i64],
     indices: &[i32],
     data: &[f32],
-    n_obs: usize,
-    n_vars: usize,
-    value_encoding: ValueEncoding,
-    codec_id: CodecId,
-    csc_cols_per_shard: usize,
-    framing: Option<scx_format_io::FramingConfig>,
-) -> Result<(), scx_format_io::ScxError> {
-    let mut indptr_u64: Vec<u64> = indptr
+) -> Result<CscInput, scx_format_io::ScxError> {
+    let indptr_u64: Vec<u64> = indptr
         .iter()
         .map(|&v| {
             if v < 0 {
@@ -227,7 +232,7 @@ pub(crate) fn write_csc_shards_from_csr(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut indices_u32: Vec<u32> = indices
+    let indices_u32: Vec<u32> = indices
         .iter()
         .map(|&v| {
             if v < 0 {
@@ -239,12 +244,45 @@ pub(crate) fn write_csc_shards_from_csr(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut values = data.to_vec();
-    canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut values);
+    Ok(CscInput {
+        indptr: indptr_u64,
+        indices: indices_u32,
+        values: data.to_vec(),
+    })
+}
+
+/// Streaming CSR → CSC transpose over **owned** buffers, writing each emitted
+/// chunk as one CSC shard.
+///
+/// Safe to call with the GIL released: every buffer it reads is Rust-owned.
+/// There is deliberately no borrowed-slice entry point next to this one — the
+/// pair `csc_input_from_csr_slices` + `write_csc_shards_from_owned` exists so
+/// the copy cannot end up on the wrong side of a `py.detach`.
+///
+/// Together the pair mirrors `scx-cli::convert::write_csc_shards_from_csr`, so
+/// the two import paths produce structurally identical CSC sidecars (same
+/// `csc_cols_per_shard`, same encoder).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_csc_shards_from_owned(
+    writer: &mut ScxWriter,
+    input: CscInput,
+    n_obs: usize,
+    n_vars: usize,
+    value_encoding: ValueEncoding,
+    codec_id: CodecId,
+    csc_cols_per_shard: usize,
+    framing: Option<scx_format_io::FramingConfig>,
+) -> Result<(), scx_format_io::ScxError> {
+    let CscInput {
+        mut indptr,
+        mut indices,
+        mut values,
+    } = input;
+    canonicalize_csr(&mut indptr, &mut indices, &mut values);
     let csr = scx_sparse::ScxCsr::new_unchecked(
         (n_obs, n_vars),
-        indptr_u64.iter().map(|&v| v as i64).collect(),
-        indices_u32.iter().map(|&v| v as i32).collect(),
+        indptr.iter().map(|&v| v as i64).collect(),
+        indices.iter().map(|&v| v as i32).collect(),
         values,
     );
 
@@ -1289,13 +1327,20 @@ pub fn from_anndata_impl(
     // Optional CSC sidecar — streaming transpose over the in-memory
     // CSR view of X. Layers are CSR-only (no layer-CSC support yet —
     // a `LayerCscShard` section type would need to land first).
+    //
+    // The `*_slice` bindings are borrowed from `adata.X`'s numpy buffers
+    // (`ensure_csr` returns the input unchanged when it is already sorted
+    // CSR), so they are copied into owned buffers **under the GIL**; only
+    // those cross `detach`. The transpose always made these three
+    // allocations — they were simply made on the wrong side of the GIL
+    // release, which is why this is RSS-neutral.
     if csc_build {
+        let csc_input =
+            csc_input_from_csr_slices(indptr_slice, indices_slice, data_slice).map_err(to_pyerr)?;
         py.detach(|| -> Result<(), scx_format_io::ScxError> {
-            write_csc_shards_from_csr(
+            write_csc_shards_from_owned(
                 &mut writer,
-                indptr_slice,
-                indices_slice,
-                data_slice,
+                csc_input,
                 n_obs as usize,
                 n_vars as usize,
                 first_encoding,

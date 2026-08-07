@@ -452,6 +452,7 @@ and launch geometry it saw while streaming. See
 | `QueryPipeline` | `Send` | Built on one thread, executed on another. Not shared. |
 | `TrainingPipeline` | `Send` | Owns its tokio runtime and thread handles. Called from one thread at a time. |
 | `FileLock` | `Send` | Lock transferred to a single owner. Released on drop. |
+| `numpy::PyReadonlyArray*` | **No** | A *view* into a buffer Python can still write. The borrow is not GIL-bound and does not clear numpy's `WRITEABLE` flag, so its `&[T]` must never be read after the GIL is released — copy into an owned `Vec` / `Arc<[T]>` first (`crate::convert::owned_csr`). See [Coding conventions § Python Bindings](conventions.md#python-bindings-pyscx). |
 
 ### Why mutable reader state stays per-instance
 

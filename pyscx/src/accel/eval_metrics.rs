@@ -1,15 +1,12 @@
 //! Perturbation evaluation metrics — pseudobulk means, perturbation_metrics,
 //! energy_distance, discrimination_score, knockdown_efficiency, clustering_agreement.
 
-use numpy::PyUntypedArrayMethods;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::ScxLazyTransformedDataset;
-
-use super::util::{astype_no_copy, extract_csr_slices};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // device scaffolding (Phase 0 of CELL-EVAL-SCX-GPU-ACC.md)
@@ -186,15 +183,20 @@ fn agg_streaming<S: scx_format_io::ShardSource + Sync>(
     })
 }
 
-/// In-memory CSR-slice pseudobulk means — GPU when `gpu_dev` is `Some`, else CPU.
-#[allow(clippy::too_many_arguments)]
-fn agg_from_slices(
+/// In-memory CSR pseudobulk means — GPU when `gpu_dev` is `Some`, else CPU.
+///
+/// Takes an **owned** [`scx_sparse::ScxCsr`], never numpy-borrowed slices:
+/// the CPU arm releases the GIL, and a numpy borrow is not safe to read once
+/// other Python threads can run. `crate::convert::owned_csr` is how callers
+/// get one.
+///
+/// `pseudobulk_aggregate_inmemory` is the line-for-line twin of the
+/// `…_from_slices` entry point this replaced — same accumulation order, so
+/// results are bit-identical.
+fn agg_inmemory(
     py: Python<'_>,
     gpu_dev: &EvalGpuDev,
-    shape: (usize, usize),
-    indptr: &[i64],
-    indices: &[i32],
-    data: &[f32],
+    csr: &scx_sparse::ScxCsr,
     obs_groups: &[Vec<String>],
     groupby_columns: &[String],
     gene_names: &[String],
@@ -205,10 +207,10 @@ fn agg_from_slices(
         if let Some(dev) = gpu_dev {
             return scx_accel::pseudobulk_means_gpu_from_slices(
                 dev,
-                shape,
-                indptr,
-                indices,
-                data,
+                csr.shape,
+                &csr.indptr,
+                &csr.indices,
+                &csr.data,
                 obs_groups,
                 groupby_columns,
                 gene_names,
@@ -221,11 +223,8 @@ fn agg_from_slices(
         let _ = gpu_dev;
     }
     py.detach(|| {
-        scx_accel::pseudobulk_aggregate_from_slices(
-            shape,
-            indptr,
-            indices,
-            data,
+        scx_accel::pseudobulk_aggregate_inmemory(
+            csr,
             obs_groups,
             groupby_columns,
             gene_names,
@@ -239,6 +238,9 @@ fn agg_from_slices(
 /// `gpu_dev` is `Some`, else CPU. Note the GPU dense kernel is f32; for f64
 /// embeddings the caller downcasts, so GPU/CPU parity on the `embed_key` path
 /// is at the f32 bar (~1e-4), not the 1e-6 of the sparse gene-space paths.
+///
+/// `data` must be **Rust-owned**, not a numpy borrow: the CPU arm releases the
+/// GIL. `crate::convert::owned_dense2_f32` is how callers get one.
 #[allow(clippy::too_many_arguments)]
 fn agg_dense(
     py: Python<'_>,
@@ -368,8 +370,6 @@ fn pseudobulk_means_impl<'py>(
     // error. Refuse, as the other streaming accel ops do.
     super::reject_preserve_var_order(adata, "pseudobulk_means")?;
 
-    let np = py.import("numpy")?;
-
     // Extract groupby column from adata.obs as Vec<String>.
     let obs = adata.getattr("obs")?;
     let col = obs.get_item(groupby).map_err(|_| {
@@ -391,9 +391,11 @@ fn pseudobulk_means_impl<'py>(
     let gene_names: Vec<String> = var_names.call_method0("tolist")?.extract()?;
 
     // Perform aggregation with Mean method: backed, lazy-transformed, or in-memory.
-    // Each branch releases the GIL around the Rust kernel. `PyReadonlyArray1`
-    // guards are held in the branch's outer scope (keeping numpy buffers alive);
-    // only the plain `&[T]` slices cross `detach`.
+    // Each branch releases the GIL around the Rust kernel, so each branch first
+    // puts the matrix into Rust-owned buffers. Keeping a `PyReadonlyArray`
+    // guard alive is *not* enough: it keeps the numpy object alive but leaves it
+    // writable from every other Python thread, and rust-numpy borrows carry no
+    // synchronization. See `crate::convert::owned_csr`.
     let x = adata.getattr("X")?;
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         // The handle's *view* — `obs_groups` / `gene_names` came off
@@ -412,43 +414,27 @@ fn pseudobulk_means_impl<'py>(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         // Lazy-transformed datasets: materialize through the transform pipeline
-        // (normalize, log1p, etc.) to get a scipy CSR, then aggregate in-memory.
-        let scipy_csr = lazy.to_memory_py(py)?;
-        let shape: (usize, usize) = scipy_csr.getattr("shape")?.extract()?;
+        // (normalize, log1p, etc.), then aggregate in-memory.
+        //
+        // `materialize_csr` is what `to_memory_py` runs before wrapping the
+        // result in a scipy object, so going to it directly skips the whole
+        // numpy round-trip — cheaper than the previous borrow-the-scipy-arrays
+        // path, and Rust-owned by construction.
+        //
+        // The decode stays detached, exactly as `to_memory_py` had it: a
+        // `PyRef` cannot cross `detach`, but the `&ScxLazyTransformedDataset`
+        // behind it can, and dropping that release here would have been a
+        // silent regression on every lazy `pseudobulk_means`.
+        let lazy_ref: &ScxLazyTransformedDataset = &lazy;
+        let csr = py
+            .detach(|| lazy_ref.materialize_csr())
+            .map_err(PyRuntimeError::new_err)?;
+        drop(lazy);
 
-        // Use astype with copy=False to avoid redundant copies when dtypes match,
-        // then borrow via PyReadonlyArray1 for zero-copy slice access.
-        let indptr_obj = scipy_csr.getattr("indptr")?;
-        let indptr_arr = np.call_method1("asarray", (&indptr_obj,))?;
-        let indptr_arr = astype_no_copy(py, &indptr_arr, "int64")?;
-        let indptr_ro: numpy::PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
-        let indptr_slice = indptr_ro
-            .as_slice()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let indices_obj = scipy_csr.getattr("indices")?;
-        let indices_arr = np.call_method1("asarray", (&indices_obj,))?;
-        let indices_arr = astype_no_copy(py, &indices_arr, "int32")?;
-        let indices_ro: numpy::PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
-        let indices_slice = indices_ro
-            .as_slice()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let data_obj = scipy_csr.getattr("data")?;
-        let data_arr = np.call_method1("asarray", (&data_obj,))?;
-        let data_arr = astype_no_copy(py, &data_arr, "float32")?;
-        let data_ro: numpy::PyReadonlyArray1<'_, f32> = data_arr.extract()?;
-        let data_slice = data_ro
-            .as_slice()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        agg_from_slices(
+        agg_inmemory(
             py,
             gpu_dev,
-            shape,
-            indptr_slice,
-            indices_slice,
-            data_slice,
+            &csr,
             &obs_groups,
             &groupby_columns,
             &gene_names,
@@ -467,30 +453,21 @@ fn pseudobulk_means_impl<'py>(
             .extract::<bool>()?;
 
         if !is_sparse {
-            // Dense path: extract a contiguous f32 PyReadonlyArray2 and run
+            // Dense path: copy into an owned row-major f32 buffer and run
             // pseudobulk_aggregate_dense directly.
-            let arr = if x.hasattr("toarray")? {
-                x.call_method0("toarray")?
-            } else {
-                np.call_method1("asarray", (&x,))?
-            };
-            // Force C-contiguous f32. `astype_no_copy` skips the copy when
-            // dtype already matches; `ascontiguousarray` guarantees row-major
-            // layout for the row-major Rust kernel (also a no-op when the
-            // array is already C-contiguous).
-            let arr = astype_no_copy(py, &arr, "float32")?;
-            let arr = np.call_method1("ascontiguousarray", (&arr,))?;
-            let arr_ro: numpy::PyReadonlyArray2<'_, f32> = arr.extract()?;
-            let shape_ndarray = arr_ro.shape();
-            let shape: (usize, usize) = (shape_ndarray[0], shape_ndarray[1]);
-            let data_slice = arr_ro
-                .as_slice()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            //
+            // The coercion inside `owned_dense2_f32` already materializes a
+            // fresh array for f64, Fortran-order and non-array inputs, so only
+            // an already-f32-C-contiguous `X` pays an extra copy — and that is
+            // exactly the case where a borrow would have aliased `adata.X`.
+            // The temporaries are dropped before `agg_dense`, so peak is
+            // `X + copy`, not `X + astype-temp + copy`.
+            let (data, shape) = crate::convert::owned_dense2_f32(py, &x, Some("pseudobulk_means"))?;
 
             agg_dense(
                 py,
                 gpu_dev,
-                data_slice,
+                &data,
                 shape,
                 &obs_groups,
                 &groupby_columns,
@@ -499,50 +476,20 @@ fn pseudobulk_means_impl<'py>(
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         } else {
-            // True sparse input: extract scipy CSR → zero-copy slices.
-            let csr_obj = scipy_sparse.call_method1("csr_matrix", (&x,))?;
+            // True sparse input. `csr_matrix(adata.X)` is an identity op on an
+            // already-CSR `X`, so a borrow here would be `adata.X.data` /
+            // `.indices` themselves — copy instead.
+            let csr = crate::convert::owned_csr(py, &x, Some("pseudobulk_means"))?;
 
-            let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
-
-            // Use astype with copy=False to avoid redundant copies when dtypes match,
-            // then borrow via PyReadonlyArray1 for zero-copy slice access.
-            let indptr_obj = csr_obj.getattr("indptr")?;
-            let indptr_arr = np.call_method1("asarray", (&indptr_obj,))?;
-            let indptr_arr = astype_no_copy(py, &indptr_arr, "int64")?;
-            let indptr_ro: numpy::PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
-            let indptr_slice = indptr_ro
-                .as_slice()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let indices_obj = csr_obj.getattr("indices")?;
-            let indices_arr = np.call_method1("asarray", (&indices_obj,))?;
-            let indices_arr = astype_no_copy(py, &indices_arr, "int32")?;
-            let indices_ro: numpy::PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
-            let indices_slice = indices_ro
-                .as_slice()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let data_obj = csr_obj.getattr("data")?;
-            let data_arr = np.call_method1("asarray", (&data_obj,))?;
-            let data_arr = astype_no_copy(py, &data_arr, "float32")?;
-            let data_ro: numpy::PyReadonlyArray1<'_, f32> = data_arr.extract()?;
-            let data_slice = data_ro
-                .as_slice()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            py.detach(|| {
-                scx_accel::pseudobulk_aggregate_from_slices(
-                    shape,
-                    indptr_slice,
-                    indices_slice,
-                    data_slice,
-                    &obs_groups,
-                    &groupby_columns,
-                    &gene_names,
-                    scx_accel::AggregationMethod::Mean,
-                    min_cells_per_group,
-                )
-            })
+            agg_inmemory(
+                py,
+                gpu_dev,
+                &csr,
+                &obs_groups,
+                &groupby_columns,
+                &gene_names,
+                min_cells_per_group,
+            )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         }
     };
@@ -1890,14 +1837,16 @@ pub fn knockdown_efficiency<'py>(
         )));
     }
 
-    // ── Extract CSR arrays as zero-copy slices ──────────────────────
-    let slices = extract_csr_slices(py, &np, &csr_obj, "knockdown_efficiency", 1)?;
-    // Lift the slice references out of `slices` (keeps `slices` alive as the
-    // numpy-buffer anchor) so the closures are Ungil+Send — `CsrSlices` itself
-    // holds `PyReadonlyArray1`, which is GIL-bound and cannot cross detach.
-    let indptr = slices.indptr();
-    let indices = slices.indices();
-    let data = slices.data();
+    // ── Copy the CSR arrays into Rust-owned buffers ─────────────────
+    // `ensure_csr` above returns the input unchanged when it is already sorted
+    // CSR, so these arrays can be `adata.X`'s own. The kernels below run with
+    // the GIL released, and a numpy borrow is not safe to read there: it is not
+    // GIL-bound, does not clear numpy's WRITEABLE flag, and a raced `indices`
+    // value is consumed as a column index. See `crate::convert::owned_csr`.
+    let csr = crate::convert::owned_csr(py, &csr_obj, Some("knockdown_efficiency"))?;
+    let indptr = csr.indptr.as_slice();
+    let indices = csr.indices.as_slice();
+    let data = csr.data.as_slice();
 
     // ── Compute control baseline + knockdown efficiency + log deviation ──
     // Release the GIL for all three kernels. The log-transform allocations
