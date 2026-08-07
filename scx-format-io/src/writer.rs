@@ -2945,6 +2945,16 @@ pub fn clear_csr_shard_column_stats_for(
 /// `n_indexed_columns` is rewritten from `column_stats.len()` rather than
 /// decremented: `LazyShardStats` uses the count to decide whether to retain the
 /// variable-length tail at all, so the two drifting apart is a decode bug.
+///
+/// The `as u8` cannot truncate, and deliberately does not become a `try_from`
+/// that panics — this crate returns errors rather than panicking, and there is
+/// no error to return. `clear`/`retain` only ever *shrink* the vector, and the
+/// pre-clear length is already ≤ `u8::MAX` from both of its only two producers:
+/// [`ShardStats::read_from`] pushes exactly the `u8` count it read off the wire,
+/// and [`assign_csr_shard_column_stats`] rejects anything longer with
+/// [`ScxError::ColumnStatsOverflow`] (as does `ShardStats::write_to`, so an
+/// over-long vector could never have been serialised in the first place). The
+/// `debug_assert` pins that reasoning where it is used.
 fn clear_csr_shard_column_stats_inner(
     entries: &mut [FullCatalogEntry],
     hashes: Option<&[u64]>,
@@ -2970,6 +2980,11 @@ fn clear_csr_shard_column_stats_inner(
         if stats.column_stats.len() != before {
             changed += 1;
         }
+        debug_assert!(
+            stats.column_stats.len() <= u8::MAX as usize,
+            "column_stats longer than the u8 wire count could never have been \
+             written or read — see the note on this function"
+        );
         stats.n_indexed_columns = stats.column_stats.len() as u8;
     }
     changed

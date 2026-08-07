@@ -1238,25 +1238,7 @@ fn has_obs_index(path: &Path) -> bool {
         .any(|e| e.section_type == SectionType::ObsPredicateIndex)
 }
 
-/// Column names (by hash) that still have per-shard catalog stats on some CSR
-/// shard. These are what Level-1 pushdown actually prunes on.
-fn columns_with_shard_stats(path: &Path, candidates: &[&str]) -> Vec<String> {
-    use scx_format_io::column_name_hash;
-    let reader = ScxReader::open(path).unwrap();
-    let live: Vec<u64> = reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::CsrShard)
-        .filter_map(|e| e.stats.as_ref())
-        .flat_map(|s| s.column_stats.iter().map(|cs| cs.column_name_hash()))
-        .collect();
-    candidates
-        .iter()
-        .filter(|c| live.contains(&column_name_hash(c)))
-        .map(|c| (*c).to_string())
-        .collect()
-}
+use crate::test_utils::columns_with_shard_stats;
 
 /// Overwriting a column the catalog has stats for must drop **that column's**
 /// stats, whether or not an index section happens to still be present.

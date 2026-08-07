@@ -1054,25 +1054,7 @@ fn layer_import_drops_a_stale_obs_predicate_index_on_overwrite() {
     );
 }
 
-/// Column names that still have per-shard catalog stats on some CSR shard —
-/// what Level-1 pushdown actually prunes on.
-fn columns_with_shard_stats(path: &Path, candidates: &[&str]) -> Vec<String> {
-    use scx_format_io::column_name_hash;
-    let reader = ScxReader::open(path).unwrap();
-    let live: Vec<u64> = reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::CsrShard)
-        .filter_map(|e| e.stats.as_ref())
-        .flat_map(|s| s.column_stats.iter().map(|cs| cs.column_name_hash()))
-        .collect();
-    candidates
-        .iter()
-        .filter(|c| live.contains(&column_name_hash(c)))
-        .map(|c| (*c).to_string())
-        .collect()
-}
+use crate::test_utils::columns_with_shard_stats;
 
 /// Dropping the stale index is only half of it: the catalog's per-shard
 /// `ColumnStat`s are what Level-1 pruning reads, and the numeric `MinMax` arm

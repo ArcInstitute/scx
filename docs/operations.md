@@ -138,6 +138,20 @@ To get Level-1 pruning back after a clear, rebuild the index with an op that
 derives stats: `pyscx.modify_metadata(f, obs=…, index_obs=[…])`, or a copy-out
 `scx sort` / `scx compact` with `--index-obs` / `--index-preset`.
 
+> **Files rewritten in place before this shipped are not repaired by upgrading.**
+> The clears stop *new* files being poisoned; they do not touch a file that
+> already carries stats describing obs values that were replaced. If an indexed
+> file went through `modify_metadata(obs=…)` or an `overwrite` import on an
+> earlier build and a query since came back suspiciously short, re-derive its
+> stats with any of the rebuild paths above — `scx info` will not flag it, because
+> a stale bound is indistinguishable from a live one.
+
+**Adding an obs column: prefer `obs_import` over `modify_metadata`.** A
+`modify_metadata(obs=…)` replaces the whole frame, so it clears every column's
+stats even when the indexed columns' *values* are untouched — the op cannot tell.
+`obs_import` joins by key and clears only what it writes, so an unrelated
+`cell_type` index keeps its pruning. Both are correct; the second is cheaper.
+
 ## Append Complexity
 
 Append writes new data at EOF without rewriting existing matrix shards.

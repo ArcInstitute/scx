@@ -345,6 +345,99 @@ fn obs_replacement_with_an_unindexable_rebuild_request_still_clears() {
     assert_stats_counts_agree(&path);
 }
 
+/// The third route, and the least obvious: a rebuild that *does* produce index
+/// bytes, but whose CSR ranges do not tile `[0, n_obs)`.
+///
+/// `modify_metadata` then finishes the index over the **obs-shard** ranges
+/// instead (`use_csr == false`) and deliberately skips the derive, because
+/// `derive_shard_column_stats` would be addressing a different shard space. So a
+/// fresh `ObsPredicateIndex` is written and `per_shard_obs_stats` stays `None` —
+/// a file that looks freshly indexed while still carrying the previous obs's
+/// bounds. Only the `None` arm's clear catches this one.
+///
+/// The fixture under-covers on purpose (3 shards of 100 for `n_obs = 400`),
+/// which is the shape the production comment describes as "some shards missing
+/// stats on older files".
+#[test]
+fn obs_replacement_clears_when_csr_ranges_do_not_cover_the_obs_axis() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("undercovered.scx");
+    let header =
+        FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, SHARD_ROWS as u32, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    let obs = obs_frame(n_counts_before);
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&var_frame()).unwrap();
+
+    // Three shards for four shards' worth of obs rows.
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for start in (0..N_OBS - SHARD_ROWS).step_by(SHARD_ROWS) {
+        let (indptr, indices, values) = shard_csr(SHARD_ROWS);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                start as u64,
+            )
+            .unwrap();
+        ranges.push((start as u64, (start + SHARD_ROWS) as u64));
+    }
+    assert_eq!(ranges.len(), 3, "deliberately under-covering n_obs = 400");
+
+    let opts = scx_engine::PredicateIndexBuildOptions {
+        forced_columns: vec!["n_counts".to_string()],
+        preset_columns: Vec::new(),
+        auto_threshold: 1000,
+        high_cardinality_threshold: 100_000,
+    };
+    let bytes = scx_engine::build_obs_predicate_index_bytes(
+        &obs,
+        &ranges,
+        &opts,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .unwrap()
+    .expect("n_counts must be indexable");
+    writer.write_obs_predicate_index(&bytes).unwrap();
+    scx_engine::apply_obs_shard_column_stats(&mut writer, &bytes, ranges.len()).unwrap();
+    writer.finish().unwrap();
+
+    assert!(!csr_column_stats(&path).is_empty());
+
+    // Rebuild requested and satisfiable — but the CSR ranges cover 300 of 400
+    // rows, so the derive is skipped and `per_shard_obs_stats` comes back `None`.
+    replace_obs(
+        &path,
+        ConversionPredicateIndexOptions {
+            index_obs: vec!["n_counts".to_string()],
+            index_var: vec![],
+            index_preset: None,
+            index_auto_threshold: 1000,
+        },
+    );
+
+    assert!(
+        ScxReader::open(&path)
+            .unwrap()
+            .catalog()
+            .entries
+            .iter()
+            .any(|e| e.section_type == SectionType::ObsPredicateIndex),
+        "a fresh index IS written on this path — which is what makes the stale \
+         stats so easy to miss"
+    );
+    assert!(
+        csr_column_stats(&path).is_empty(),
+        "index written over obs-shard ranges, stats not re-derived — the old \
+         bounds must not survive"
+    );
+    assert_stats_counts_agree(&path);
+}
+
 /// A rebuild that *does* produce an index re-derives the stats, so pushdown
 /// comes back rather than being disabled forever. Without this the fix would be
 /// a permanent performance regression dressed up as a correctness fix.
