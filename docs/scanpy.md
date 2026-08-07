@@ -1084,6 +1084,29 @@ assert that both paths select identical rows for the entries above.
 | Arithmetic on obs columns (e.g. `n_counts + n_genes > 100`) | ❌ not supported | ✅ accepted |
 | String-method calls (e.g. `cell_type.str.startswith('T')`) | ❌ not supported | ✅ accepted |
 
+**Nulls: the one *semantic* divergence.** Everything above is about which
+expressions parse. This one is about what an expression that parses in both
+grammars *means* when the column has missing values — an unannotated
+`cell_type`, an obs column added by a join that didn't cover every cell.
+
+The SCX engine uses three-valued (Kleene) logic, like SQL: a comparison
+against a NULL cell is UNKNOWN, and only the final mask turns a surviving
+UNKNOWN into "not matched". pandas is two-valued — `NaN == 'v'` is `False`
+and `NaN != 'v'` is `True`. The two agree on `and`, `or` and `in`, and part
+company on `!=` and `not`:
+
+| For a row whose `cell_type` is NULL | SCX engine | pandas |
+|---|---|---|
+| `cell_type == 'B cell' or n_counts > 50` (and `n_counts` is 90) | ✅ matches | ✅ matches |
+| `cell_type == 'B cell'` | ❌ | ❌ |
+| `cell_type != 'B cell'` | ❌ UNKNOWN → not matched | ✅ matches |
+| `not (cell_type == 'B cell')` | ❌ UNKNOWN → not matched | ✅ matches |
+
+So a filter using `!=` or `not` on a null-bearing column selects a different
+set of cells under `backed=True` than under the default path. Prefer the
+positive form (`cell_type in [...]`) on columns that may have missing values,
+or do the selection in Python where you can be explicit about `NaN`.
+
 When `preserve_slots=True` is used with an `obs_filter`, `to_anndata()` emits
 a `UserWarning` noting that the filter was evaluated via pandas.eval — this
 surfaces in notebook output so the grammar shift is visible without reading

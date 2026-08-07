@@ -712,7 +712,6 @@ fn try_rowset_mask(
         index,
         shard_row_ranges: &csr_shard_ranges,
         n_obs: n_obs as u64,
-        obs_schema: pipeline.obs_schema(),
     };
     let (indexed, residual) = partition_obs_predicates(&plan.obs_predicates, &ctx);
     // Nothing resolved from the index (including a no-filter query) → legacy
