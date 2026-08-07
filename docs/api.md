@@ -898,6 +898,29 @@ QueryPipeline::open("file.scx")?
   dictionary — standard AnnData/pandas behavior. Downstream code that
   compares `.cat.categories` against the source file (e.g. plotting that
   assumes a fixed palette) should re-derive categories from the result.
+- **Null semantics — three-valued (Kleene) logic, like a SQL `WHERE`
+  clause.** A comparison against a NULL cell is UNKNOWN, not `false`.
+  `and` / `or` combine UNKNOWN accordingly — **`null OR true` is `true`**
+  and `null AND false` is `false` — `not` propagates UNKNOWN, and only the
+  final mask turns a surviving UNKNOWN into "not matched". In full:
+
+  | | `and` | `or` |
+  |---|---|---|
+  | `TRUE` ∘ `UNKNOWN` | `UNKNOWN` | **`TRUE`** |
+  | `FALSE` ∘ `UNKNOWN` | **`FALSE`** | `UNKNOWN` |
+  | `UNKNOWN` ∘ `UNKNOWN` | `UNKNOWN` | `UNKNOWN` |
+
+  with `not UNKNOWN = UNKNOWN`, and a top-level `UNKNOWN` → not matched. So
+  `filter_obs("cell_type == 'B cell' or n_genes > 5000")` returns a cell
+  with an unannotated `cell_type` and 9000 genes; pandas, polars and SQL
+  agree. The same rules apply to `filter_var`, and to every other surface
+  driven by this evaluator: `scx delete --filter`, `scx subset --filter`,
+  and `to_anndata(obs_filter=...)` on the non-backed default path.
+  **Divergence from pandas on `!=` / `not`:** the engine leaves a NULL cell
+  UNKNOWN, so a NULL row does *not* match `x != 'v'`; pandas is two-valued
+  (`NaN != 'v'` is `True`) and returns it. This matters when the same filter
+  string is reused across `backed=True` (pandas) and the default path
+  (engine) — see [Filter Expression Compatibility](scanpy.md#filter-expression-compatibility).
 
 ### Grouped reads (condition/label-grouped sharding)
 

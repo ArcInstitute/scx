@@ -594,6 +594,10 @@ fn apply_residual(
             let arr = evaluate(pred, &batch)?;
             for (i, m) in local.iter_mut().enumerate() {
                 if *m {
+                    // `evaluate` has already coalesced any surviving UNKNOWN to
+                    // false, so `is_valid` is belt-and-braces, not the null
+                    // policy — that lives in `evaluate` (three-valued Kleene,
+                    // UNKNOWN → not matched only at the top level).
                     *m = arr.is_valid(i) && arr.value(i);
                 }
             }
@@ -712,7 +716,6 @@ fn try_rowset_mask(
         index,
         shard_row_ranges: &csr_shard_ranges,
         n_obs: n_obs as u64,
-        obs_schema: pipeline.obs_schema(),
     };
     let (indexed, residual) = partition_obs_predicates(&plan.obs_predicates, &ctx);
     // Nothing resolved from the index (including a no-filter query) → legacy

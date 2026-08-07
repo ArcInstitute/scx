@@ -1503,6 +1503,13 @@ def test_obs_filter_grammar_parity_common_ground(tmp_dir, expr):
     operators (`and` / `or` / `not`), `in [...]` against a bracket-delimited
     list literal, and parenthesised sub-expressions. Divergences are
     documented in docs/scanpy.md (see "Filter Expression Compatibility").
+
+    NOTE: this fixture has **no missing values**, and that is load-bearing for
+    the `!=` / `not (...)` cases. Those two operators parse in both grammars
+    but do NOT select the same rows once a column has nulls — the engine
+    follows SQL (UNKNOWN, so a NULL row does not match) while pandas is
+    two-valued. `test_obs_filter_grammar_parity_with_null_categorical` is the
+    null-bearing counterpart and deliberately omits them.
     """
     import warnings as warnings_mod
 
@@ -1523,6 +1530,108 @@ def test_obs_filter_grammar_parity_common_ground(tmp_dir, expr):
     assert list(eager.obs.index) == list(preserved.obs.index), (
         f"obs index mismatch for {expr!r}: "
         f"engine={list(eager.obs.index)} pandas={list(preserved.obs.index)}"
+    )
+
+
+def _adata_for_null_parity():
+    """8×2 AnnData whose `cell_type` is missing on rows c1 and c5.
+
+    The shared grammar-parity fixture has no nulls, which is why it never
+    caught the engine returning fewer rows than pandas for `or`: with every
+    cell annotated, no operand is ever UNKNOWN. c1 is the load-bearing row —
+    NULL `cell_type` *and* `n_counts` above every threshold below.
+    """
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    x = sp.csr_matrix(np.eye(8, 2, dtype=np.float32))
+    obs = pd.DataFrame(
+        {
+            "cell_type": pd.Categorical(
+                [
+                    "T cell",
+                    None,
+                    "T cell",
+                    "NK cell",
+                    "B cell",
+                    None,
+                    "NK cell",
+                    "B cell",
+                ]
+            ),
+            "n_counts": np.array([10, 90, 70, 30, 50, 20, 80, 40], dtype=np.int64),
+        },
+        index=[f"c{i}" for i in range(8)],
+    )
+    var = pd.DataFrame(index=[f"g{i}" for i in range(2)])
+    return anndata.AnnData(X=x, obs=obs, var=var)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # The headline case: c1 has a NULL cell_type and n_counts=90, so the
+        # right operand alone should select it.
+        "(n_counts > 50) or (cell_type == 'NK cell')",
+        "(cell_type == 'NK cell') or (n_counts > 50)",  # order-independent
+        "cell_type == 'B cell' or n_counts > 60",
+        # AND and IN over the same null-bearing column, for contrast.
+        "n_counts > 30 and cell_type == 'T cell'",
+        "cell_type in ['T cell', 'B cell']",
+        "cell_type == 'T cell'",
+    ],
+)
+def test_obs_filter_grammar_parity_with_null_categorical(tmp_dir, expr):
+    """Engine and pandas must agree even when an operand column has nulls.
+
+    Restricted to `and` / `or` / `in` / bare comparisons on purpose. `!=` and
+    `not (...)` genuinely diverge on a NULL cell — the engine follows SQL
+    (UNKNOWN, so the row does not match) while pandas is two-valued
+    (`NaN != 'x'` is True, so it does) — and that divergence is documented in
+    docs/scanpy.md rather than asserted away here.
+    """
+    import warnings as warnings_mod
+
+    import pyscx
+
+    adata = _adata_for_null_parity()
+    path = str(tmp_dir / "null_parity.scx")
+    pyscx.from_anndata(adata, path)
+
+    eager = pyscx.open(path).to_anndata(obs_filter=expr, preserve_slots=False)
+    with warnings_mod.catch_warnings():
+        warnings_mod.simplefilter("ignore")
+        preserved = pyscx.open(path).to_anndata(obs_filter=expr, preserve_slots=True)
+
+    assert list(eager.obs.index) == list(preserved.obs.index), (
+        f"obs index mismatch for {expr!r}: "
+        f"engine={list(eager.obs.index)} pandas={list(preserved.obs.index)}"
+    )
+
+
+def test_obs_filter_or_includes_row_whose_other_operand_is_null(tmp_dir):
+    """Ground truth, not just parity: `null OR true` is true.
+
+    Stated against a hand-computed expected set so the check survives even if
+    both paths were to regress together.
+    """
+    import pyscx
+
+    adata = _adata_for_null_parity()
+    path = str(tmp_dir / "null_or_truth.scx")
+    pyscx.from_anndata(adata, path)
+
+    got = list(
+        pyscx.open(path)
+        .to_anndata(obs_filter="cell_type == 'B cell' or n_counts > 60", preserve_slots=False)
+        .obs.index
+    )
+    # n_counts > 60: c1 (90), c2 (70), c6 (80).  cell_type == 'B cell': c4, c7.
+    # c1's cell_type is NULL, and it is the row the non-Kleene `or` dropped.
+    assert got == ["c1", "c2", "c4", "c6", "c7"], (
+        f"expected c1 (NULL cell_type, n_counts=90) to match via the right "
+        f"operand; got {got}"
     )
 
 

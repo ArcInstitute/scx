@@ -1068,6 +1068,174 @@ fn test_delete_dry_run() {
 }
 
 // ---------------------------------------------------------------------------
+// `or` with a NULL operand — the destructive surfaces
+// ---------------------------------------------------------------------------
+
+/// 6 cells. `cell_type` is NULL on rows 0 and 3; `n_genes` is non-null and
+/// exceeds 500 on rows 0, 1 and 4. Row 0 is the interesting one: NULL
+/// `cell_type` **and** a matching `n_genes`.
+fn write_null_bearing_file(dir: &tempfile::TempDir, filename: &str) -> PathBuf {
+    use arrow::array::Int64Array;
+
+    let n_obs = 6usize;
+    let n_vars = 4usize;
+    let path = dir.path().join(filename);
+    let mut writer = ScxWriter::new(
+        &path,
+        sample_header(n_obs as u64, n_vars as u64, (n_obs * 2) as u64),
+    )
+    .unwrap();
+
+    let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    let cell_type = vec![
+        None,
+        Some("B cell"),
+        Some("T cell"),
+        None,
+        Some("T cell"),
+        Some("B cell"),
+    ];
+    let n_genes = vec![900i64, 700, 100, 200, 800, 300];
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("cell_type", DataType::Utf8, true),
+        Field::new("n_genes", DataType::Int64, false),
+    ]);
+    let obs = arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(cell_type)),
+            Arc::new(Int64Array::from(n_genes)),
+        ],
+    )
+    .unwrap();
+
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// `scx delete --filter` runs the same predicate evaluator as the query engine,
+/// so the non-Kleene `or` under-deleted: a cell whose `cell_type` is NULL was
+/// spared even when the *other* operand matched it. Under-deleting is the
+/// dangerous direction — the operator believes those cells are gone.
+///
+/// `cell_type == 'B cell' or n_genes > 500` must match rows 0 (NULL, 900),
+/// 1 ('B cell', 700), 4 (800) and 5 ('B cell'). Row 0 is what regressed.
+#[test]
+fn test_delete_or_matches_rows_with_a_null_operand() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_null_bearing_file(&dir, "delete_null_or.scx");
+
+    let output = scx_cli()
+        .args([
+            "delete",
+            path.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'B cell' or n_genes > 500",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "delete --dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("4 cells"),
+        "`or` with a NULL operand must match 4 cells (rows 0,1,4,5), not 3 — \
+         row 0 has a NULL cell_type and n_genes=900. Got: {stdout}"
+    );
+
+    // Each operand alone, so the count above cannot be an accident of the
+    // fixture: 'B cell' matches rows 1 and 5; n_genes > 500 matches 0, 1, 4.
+    for (expr, want) in [
+        ("cell_type == 'B cell'", "2 cells"),
+        ("n_genes > 500", "3 cells"),
+    ] {
+        let out = scx_cli()
+            .args([
+                "delete",
+                path.to_str().unwrap(),
+                "--filter",
+                expr,
+                "--dry-run",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains(want), "`{expr}` should match {want}; got: {s}");
+    }
+}
+
+/// The copy-out sibling of the delete case: `scx subset --filter` writes a new
+/// file containing the matching cells, so the non-Kleene `or` silently produced
+/// a *smaller* subset than asked for — cells whose `cell_type` was NULL were
+/// left out even when `n_genes` matched them. Unlike `--dry-run` delete, this
+/// asserts against the bytes actually written.
+#[test]
+fn test_subset_or_keeps_rows_with_a_null_operand() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_null_bearing_file(&dir, "subset_null_or.scx");
+    let out = dir.path().join("subset_null_or_out.scx");
+
+    let res = scx_cli()
+        .args([
+            "subset",
+            path.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'B cell' or n_genes > 500",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "subset failed: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(
+        reader.header().n_obs,
+        4,
+        "`or` with a NULL operand must keep 4 cells (rows 0,1,4,5); row 0 has a \
+         NULL cell_type and n_genes=900"
+    );
+
+    // Identity, not just cardinality: the NULL-cell_type row must be present.
+    let obs = reader.read_obs().unwrap();
+    let idx = obs.schema().index_of("cell_id").unwrap();
+    let ids = arrow::compute::cast(obs.column(idx), &DataType::Utf8).unwrap();
+    let ids = ids
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(|s| s.unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["cell_0", "cell_1", "cell_4", "cell_5"]);
+}
+
+// ---------------------------------------------------------------------------
 // Query --limit
 // ---------------------------------------------------------------------------
 

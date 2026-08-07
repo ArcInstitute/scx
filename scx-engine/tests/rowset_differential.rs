@@ -1,20 +1,30 @@
-//! Differential correctness oracle for row-set predicate pushdown.
+//! Ground-truth correctness oracle for the obs predicate engine, plus a
+//! differential check of the two evaluation paths against each other.
 //!
-//! The row-set fast path (resolve indexed obs predicates directly from the
-//! predicate index, no obs-shard decode) MUST return results byte-identical to
-//! the legacy full-decode-and-mask path for every predicate. This test builds a
-//! sharded-obs fixture with a predicate index and runs a large batch of random
-//! predicates twice — once with the row-set path enabled (default) and once
-//! with `SCX_DISABLE_ROWSET_PUSHDOWN` forcing the legacy path — asserting the
-//! two results are identical (X, obs, var, count, exists), across a range of
-//! `limit` values.
+//! Every generated predicate is checked **three** ways:
 //!
-//! The fixture deliberately includes: a null-bearing categorical (exercising
-//! the null/complement reasoning that keeps `Ne`/`Not` on the residual path),
-//! an absent categorical value, a non-indexed column and a numeric column (both
+//! 1. against an independent per-row three-valued (Kleene) evaluator written in
+//!    this file, which never calls `scx-engine` — the ground truth;
+//! 2. on the row-set fast path (resolve indexed obs predicates straight from
+//!    the predicate index, no obs-shard decode); and
+//! 3. on the legacy full-decode-and-mask path, forced with
+//!    `SCX_DISABLE_ROWSET_PUSHDOWN`.
+//!
+//! Layers 2 and 3 must agree with each other (X, obs, var, count, exists,
+//! across a range of `limit` values) *and* with layer 1. The differential half
+//! alone can only prove path-parity, and that is not enough: measured on the
+//! commit before this one, layers 2 and 3 agreed on every generated predicate
+//! while both dropped rows where `null OR true` should have matched — the
+//! row-set evaluator had been deliberately restricted (`Or` refused on any
+//! nullable column) so the fast path would reproduce the slow path's wrong
+//! answer. The independent oracle is what catches a bug that lives in BOTH.
+//!
+//! The fixture deliberately includes: a null-bearing categorical (`cell_type`
+//! is NULL on every 7th row — the `null OR true` case, and the
+//! null/complement reasoning that keeps `Ne`/`Not` on the residual path), an
+//! absent categorical value, a non-indexed column and a numeric column (both
 //! forcing the residual path), and obs/CSR shard boundaries that COINCIDE (the
-//! atlas case). A handful of hand-computed expectations cross-check both paths
-//! against ground truth, catching a bug that might exist in BOTH.
+//! atlas case).
 //!
 //! NOTE: this file intentionally contains a single `#[test]` so the
 //! process-global `SCX_DISABLE_ROWSET_PUSHDOWN` env var is toggled without
@@ -224,50 +234,150 @@ const CELL_TYPES: &[&str] = &["T cell", "B cell", "NK cell", "Ghost"]; // Ghost 
 const TISSUES: &[&str] = &["blood", "brain", "bone", "Nowhere"]; // Nowhere absent
 const QUALITIES: &[&str] = &["hi", "lo", "mid"]; // mid absent; non-indexed col
 
-/// A leaf comparison over one of the columns. Mixes indexed (cell_type, tissue,
-/// n_genes) and non-indexed (quality) columns, plus `Ne` and numeric ops that
-/// route to the residual path.
-fn gen_leaf(rng: &mut Lcg) -> String {
-    match rng.below(6) {
-        0 => format!(
-            "cell_type == '{}'",
-            CELL_TYPES[rng.below(CELL_TYPES.len() as u64)]
-        ),
-        1 => {
-            let a = TISSUES[rng.below(TISSUES.len() as u64)];
-            let b = TISSUES[rng.below(TISSUES.len() as u64)];
-            format!("tissue in ['{a}', '{b}']")
+/// A generated predicate, rendered two ways: to the engine's expression syntax
+/// (`render`) and to a per-row truth value (`eval`). Keeping one AST behind
+/// both means the oracle and the engine are always asked the same question.
+#[derive(Clone)]
+enum Expr {
+    /// Indexed nullable categorical — `null` on every 7th row.
+    CellTypeEq(&'static str),
+    /// Indexed non-null categorical, via `in [...]`.
+    TissueIn(&'static str, &'static str),
+    /// Non-indexed non-null categorical → residual path.
+    QualityEq(&'static str),
+    /// Non-null numeric → residual path.
+    NGenesGt(i64),
+    NGenesLe(i64),
+    /// `Ne` on the nullable categorical → residual path.
+    CellTypeNe(&'static str),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    Not(Box<Expr>),
+}
+
+impl Expr {
+    fn render(&self) -> String {
+        match self {
+            Self::CellTypeEq(v) => format!("cell_type == '{v}'"),
+            Self::TissueIn(a, b) => format!("tissue in ['{a}', '{b}']"),
+            Self::QualityEq(v) => format!("quality == '{v}'"),
+            Self::NGenesGt(n) => format!("n_genes > {n}"),
+            Self::NGenesLe(n) => format!("n_genes <= {n}"),
+            Self::CellTypeNe(v) => format!("cell_type != '{v}'"),
+            Self::And(a, b) => format!("({}) and ({})", a.render(), b.render()),
+            Self::Or(a, b) => format!("({}) or ({})", a.render(), b.render()),
+            Self::Not(a) => format!("not ({})", a.render()),
         }
-        2 => format!(
-            "quality == '{}'",
-            QUALITIES[rng.below(QUALITIES.len() as u64)]
-        ),
-        3 => format!("n_genes > {}", 100 + rng.below(900) as u64),
-        4 => format!(
-            "cell_type != '{}'",
-            CELL_TYPES[rng.below(CELL_TYPES.len() as u64)]
-        ),
-        _ => format!("n_genes <= {}", 100 + rng.below(900) as u64),
+    }
+
+    /// Three-valued (Kleene / SQL) truth of this expression for obs row `i`,
+    /// computed straight from the fixture's ground-truth column functions.
+    /// `None` is UNKNOWN: a comparison against a NULL cell.
+    ///
+    /// This is a deliberately independent implementation — it must not call
+    /// into `scx-engine`, or it would only prove the engine agrees with itself.
+    fn eval(&self, i: usize) -> Option<bool> {
+        match self {
+            Self::CellTypeEq(v) => cell_type_at(i).map(|c| c == *v),
+            Self::CellTypeNe(v) => cell_type_at(i).map(|c| c != *v),
+            Self::TissueIn(a, b) => {
+                let t = tissue_at(i);
+                Some(t == *a || t == *b)
+            }
+            Self::QualityEq(v) => Some(quality_at(i) == *v),
+            Self::NGenesGt(n) => Some(n_genes_at(i) > *n),
+            Self::NGenesLe(n) => Some(n_genes_at(i) <= *n),
+            // AND is FALSE as soon as either side is FALSE, even if the other
+            // is UNKNOWN; TRUE only when both are TRUE.
+            Self::And(a, b) => match (a.eval(i), b.eval(i)) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            },
+            // OR is TRUE as soon as either side is TRUE, even if the other is
+            // UNKNOWN — this is the case the non-Kleene kernel got wrong.
+            Self::Or(a, b) => match (a.eval(i), b.eval(i)) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
+            Self::Not(a) => a.eval(i).map(|v| !v),
+        }
+    }
+
+    /// Truth of this expression for row `i` under arrow's **non-Kleene**
+    /// kernels — the pre-fix behaviour, where `and`/`or` return UNKNOWN
+    /// whenever *either* operand is UNKNOWN. Leaves and `not` are identical to
+    /// [`Self::eval`]; only the two combinators differ.
+    ///
+    /// This exists solely so the generator's coverage canary can measure the
+    /// thing that actually matters — expressions the two semantics answer
+    /// *differently* — rather than the much weaker "expression happens to match
+    /// a row that has a NULL somewhere in it".
+    fn eval_non_kleene(&self, i: usize) -> Option<bool> {
+        match self {
+            Self::And(a, b) => match (a.eval_non_kleene(i), b.eval_non_kleene(i)) {
+                (Some(x), Some(y)) => Some(x && y),
+                _ => None,
+            },
+            Self::Or(a, b) => match (a.eval_non_kleene(i), b.eval_non_kleene(i)) {
+                (Some(x), Some(y)) => Some(x || y),
+                _ => None,
+            },
+            Self::Not(a) => a.eval_non_kleene(i).map(|v| !v),
+            leaf => leaf.eval(i),
+        }
+    }
+
+    /// True if Kleene and non-Kleene disagree about whether *any* row matches —
+    /// i.e. this expression would have been answered wrong before the fix.
+    fn is_kleene_sensitive(&self) -> bool {
+        (0..N_OBS as usize)
+            .any(|i| (self.eval(i) == Some(true)) != (self.eval_non_kleene(i) == Some(true)))
     }
 }
 
-fn gen_expr(rng: &mut Lcg, depth: u32) -> String {
+/// The rows a `filter_obs(expr)` must return: UNKNOWN is not a match (the
+/// top-level `WHERE`-clause coalesce), and deleted rows never surface.
+fn expected_ids(e: &Expr) -> Vec<String> {
+    (0..N_OBS as usize)
+        .filter(|&i| e.eval(i) == Some(true) && !is_deleted(i))
+        .map(|i| format!("cell_{i}"))
+        .collect()
+}
+
+/// A leaf comparison over one of the columns. Mixes indexed (cell_type, tissue,
+/// n_genes) and non-indexed (quality) columns, plus `Ne` and numeric ops that
+/// route to the residual path.
+fn gen_leaf(rng: &mut Lcg) -> Expr {
+    match rng.below(6) {
+        0 => Expr::CellTypeEq(CELL_TYPES[rng.below(CELL_TYPES.len() as u64)]),
+        1 => Expr::TissueIn(
+            TISSUES[rng.below(TISSUES.len() as u64)],
+            TISSUES[rng.below(TISSUES.len() as u64)],
+        ),
+        2 => Expr::QualityEq(QUALITIES[rng.below(QUALITIES.len() as u64)]),
+        3 => Expr::NGenesGt(100 + rng.below(900) as i64),
+        4 => Expr::CellTypeNe(CELL_TYPES[rng.below(CELL_TYPES.len() as u64)]),
+        _ => Expr::NGenesLe(100 + rng.below(900) as i64),
+    }
+}
+
+fn gen_expr(rng: &mut Lcg, depth: u32) -> Expr {
     if depth == 0 {
         return gen_leaf(rng);
     }
     match rng.below(5) {
         0 | 1 => gen_leaf(rng),
-        2 => format!(
-            "({}) and ({})",
-            gen_expr(rng, depth - 1),
-            gen_expr(rng, depth - 1)
+        2 => Expr::And(
+            Box::new(gen_expr(rng, depth - 1)),
+            Box::new(gen_expr(rng, depth - 1)),
         ),
-        3 => format!(
-            "({}) or ({})",
-            gen_expr(rng, depth - 1),
-            gen_expr(rng, depth - 1)
+        3 => Expr::Or(
+            Box::new(gen_expr(rng, depth - 1)),
+            Box::new(gen_expr(rng, depth - 1)),
         ),
-        _ => format!("not ({})", gen_expr(rng, depth - 1)),
+        _ => Expr::Not(Box::new(gen_expr(rng, depth - 1))),
     }
 }
 
@@ -354,9 +464,22 @@ fn rowset_path_matches_legacy_path() {
     let limits = [None, Some(1usize), Some(5), Some(13), Some(1000)];
     let mut rng = Lcg(0xDEAD_BEEF_1234_5678);
     let mut checked = 0u32;
+    let mut null_sensitive = 0u32;
 
     for _ in 0..600 {
-        let expr = gen_expr(&mut rng, 3);
+        let ast = gen_expr(&mut rng, 3);
+        let expr = ast.render();
+        // Ground truth from the independent Kleene evaluator.
+        let want = expected_ids(&ast);
+        // How many generated expressions this oracle would answer differently
+        // under the two semantics — i.e. how many actually exercise the bug.
+        // Deliberately NOT "matches a row that has a NULL somewhere": a bare
+        // `n_genes > 100` matching row 0 satisfies that while being completely
+        // insensitive to null handling, so such a counter could stay green even
+        // if `Or`-over-`cell_type` generation disappeared entirely.
+        if ast.is_kleene_sensitive() {
+            null_sensitive += 1;
+        }
 
         for &limit in &limits {
             // Row-set path (default).
@@ -372,6 +495,44 @@ fn rowset_path_matches_legacy_path() {
                 fast, slow,
                 "row-set vs legacy mismatch for `{expr}` limit={limit:?}"
             );
+
+            // ...and both must match ground truth, not merely each other.
+            let got: Vec<String> = fast.cell_ids.iter().flatten().cloned().collect();
+            match limit {
+                None => {
+                    assert_eq!(got, want, "ground-truth mismatch for `{expr}`");
+                    assert_eq!(
+                        fast.matched_rows,
+                        want.len(),
+                        "matched_rows mismatch for `{expr}`"
+                    );
+                }
+                // A limit truncates the (ascending) match list; it must never
+                // reorder it or admit a row ground truth excludes.
+                Some(n) => {
+                    assert_eq!(
+                        got,
+                        want[..got.len().min(want.len())],
+                        "limited result is not a prefix of ground truth for `{expr}` limit={limit:?}"
+                    );
+                    // A prefix check alone would let an empty result pass
+                    // vacuously — `[]` is a prefix of everything. A non-empty
+                    // ground truth with a non-zero limit must return rows, and
+                    // at least min(limit, |want|) of them.
+                    assert!(
+                        got.len() >= n.min(want.len()),
+                        "limit={n} returned {} rows but ground truth has {} \
+                         for `{expr}`",
+                        got.len(),
+                        want.len()
+                    );
+                    assert!(
+                        got.len() <= n,
+                        "limit={n} but got {} rows for `{expr}`",
+                        got.len()
+                    );
+                }
+            }
             checked += 1;
         }
 
@@ -388,6 +549,12 @@ fn rowset_path_matches_legacy_path() {
             fc > 0,
             "exists() inconsistent with count() for `{expr}`"
         );
+        assert_eq!(fc, want.len(), "count() vs ground truth for `{expr}`");
+        assert_eq!(
+            fe,
+            !want.is_empty(),
+            "exists() vs ground truth for `{expr}`"
+        );
 
         checked += 1;
     }
@@ -395,5 +562,11 @@ fn rowset_path_matches_legacy_path() {
     assert!(
         checked > 3000,
         "expected a substantial number of comparisons"
+    );
+    assert!(
+        null_sensitive > 50,
+        "only {null_sensitive} generated expressions are answered differently by \
+         Kleene vs non-Kleene logic; the semantics this oracle exists to pin \
+         would be barely exercised"
     );
 }

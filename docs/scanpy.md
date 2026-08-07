@@ -1063,15 +1063,23 @@ accept the pandas-only forms below, while the default non-backed path and
 "n_counts > 50"
 "n_counts >= 50 and cell_type == 'T cell'"
 "cell_type in ['T cell', 'B cell']"           # bracket-delimited list
-"not (cell_type == 'NK cell')"
 "(n_counts > 50) or (cell_type == 'NK cell')"
+
+# Parse in both, but select DIFFERENT rows when the column has nulls —
+# see "Nulls: the one semantic divergence" below.
+"not (cell_type == 'NK cell')"
+"cell_type != 'NK cell'"
 ```
 
 This subset uses comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`),
 keyword-form boolean operators (`and`, `or`, `not`), the `in` operator
 against a `[...]` list literal, and parenthesised sub-expressions. Tests in
-`pyscx/tests/test_to_anndata_integration.py` (`test_obs_filter_grammar_parity_common_ground`)
-assert that both paths select identical rows for the entries above.
+`pyscx/tests/test_to_anndata_integration.py` assert that both paths select
+identical rows for the entries above — `test_obs_filter_grammar_parity_common_ground`
+on a fixture with **no** missing values, and
+`test_obs_filter_grammar_parity_with_null_categorical` on one with nulls. The
+null-bearing test deliberately omits `!=` and `not (...)`, which is the
+divergence spelled out below.
 
 **Divergences (work in one grammar only)** — the "pandas" column covers both
 `backed=True` (`.query()`) and `preserve_slots=True` (`.eval()`):
@@ -1084,12 +1092,37 @@ assert that both paths select identical rows for the entries above.
 | Arithmetic on obs columns (e.g. `n_counts + n_genes > 100`) | ❌ not supported | ✅ accepted |
 | String-method calls (e.g. `cell_type.str.startswith('T')`) | ❌ not supported | ✅ accepted |
 
+**Nulls: the one *semantic* divergence.** Everything above is about which
+expressions parse. This one is about what an expression that parses in both
+grammars *means* when the column has missing values — an unannotated
+`cell_type`, an obs column added by a join that didn't cover every cell.
+
+The SCX engine uses three-valued (Kleene) logic, like SQL: a comparison
+against a NULL cell is UNKNOWN, and only the final mask turns a surviving
+UNKNOWN into "not matched". pandas is two-valued — `NaN == 'v'` is `False`
+and `NaN != 'v'` is `True`. The two agree on `and`, `or` and `in`, and part
+company on `!=` and `not`:
+
+| For a row whose `cell_type` is NULL | SCX engine | pandas |
+|---|---|---|
+| `cell_type == 'B cell' or n_counts > 50` (and `n_counts` is 90) | ✅ matches | ✅ matches |
+| `cell_type == 'B cell'` | ❌ | ❌ |
+| `cell_type != 'B cell'` | ❌ UNKNOWN → not matched | ✅ matches |
+| `not (cell_type == 'B cell')` | ❌ UNKNOWN → not matched | ✅ matches |
+
+So a filter using `!=` or `not` on a null-bearing column selects a different
+set of cells under `backed=True` than under the default path. Prefer the
+positive form (`cell_type in [...]`) on columns that may have missing values,
+or do the selection in Python where you can be explicit about `NaN`.
+
 When `preserve_slots=True` is used with an `obs_filter`, `to_anndata()` emits
 a `UserWarning` noting that the filter was evaluated via pandas.eval — this
 surfaces in notebook output so the grammar shift is visible without reading
 this section.
 
-**Recommendation:** write filters in the portable subset above. If a filter
+**Recommendation:** write filters in the portable subset above, and on a
+column that may have missing values prefer the positive forms — `!=` and
+`not (...)` parse everywhere but do not select the same rows. If a filter
 truly needs pandas-only syntax, do the row selection in Python after
 `to_anndata()` instead of inside `obs_filter` — that keeps the SCX call site
 portable across `preserve_slots`, `backed=True`, and cloud selective pulls.

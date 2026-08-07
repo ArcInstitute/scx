@@ -90,9 +90,20 @@ impl Predicate {
 //
 // v1 exactness scope: categorical `Eq` / `In` and `And` / `Or` of those. `Ne`,
 // `Not`, and all numeric comparisons return `None` (residual) — see the module
-// docs in `collect.rs` and the staleness/null reasoning in the plan: the
-// categorical index omits null rows, so complementing it (for `Ne`/`Not`) would
-// wrongly re-include nulls, and numeric B+ tree leaves are conservative.
+// docs in `collect.rs`: the categorical index omits null rows, so complementing
+// it (for `Ne`/`Not`) would wrongly re-include them, and numeric B+ tree leaves
+// are conservative.
+//
+// **Why the set algebra is exact.** Each leaf resolves to the rows where that
+// leaf is TRUE (the index skips nulls). Kleene `AND` is TRUE iff both operands
+// are TRUE and Kleene `OR` is TRUE iff either is, so `RowSet::intersect` /
+// `RowSet::union` compute precisely the Kleene TRUE-set — which, after
+// `evaluate`'s top-level UNKNOWN→false coalesce, is precisely the mask. This
+// holds for nullable columns too, and it holds *only* because no subtree is
+// ever evaluated under a negation: `Ne` and `Not` are residual here, and
+// `partition_obs_predicates` splits only top-level `And` conjuncts. Keep that
+// precondition — under a negation the TRUE-set is no longer sufficient (you
+// would need the FALSE-set, which is not the complement when nulls exist).
 // ---------------------------------------------------------------------------
 
 use crate::index::PredicateIndex;
@@ -110,26 +121,6 @@ pub struct RowSetCtx<'a> {
     pub index: &'a PredicateIndex,
     pub shard_row_ranges: &'a [(u32, u64, u64)],
     pub n_obs: u64,
-    /// The obs schema, used to check column nullability. The legacy mask
-    /// evaluator uses Arrow's non-Kleene `or` (`null OR true = null → false`),
-    /// so an `Or` over a nullable column would diverge from the row-set union
-    /// (which would include such rows). `Or` is therefore index-resolvable only
-    /// when every referenced column is non-nullable — see [`eval_rowset`].
-    pub obs_schema: &'a Schema,
-}
-
-impl RowSetCtx<'_> {
-    /// True if every column referenced by `pred` is non-nullable in the obs
-    /// schema. A column missing from the schema is treated as nullable
-    /// (conservative → residual).
-    fn all_columns_non_nullable(&self, pred: &Predicate) -> bool {
-        pred.columns().iter().all(|c| {
-            self.obs_schema
-                .field_with_name(c)
-                .map(|f| !f.is_nullable())
-                .unwrap_or(false)
-        })
-    }
 }
 
 impl RowSetCtx<'_> {
@@ -182,20 +173,9 @@ pub fn eval_rowset(pred: &Predicate, ctx: &RowSetCtx) -> Option<RowSet> {
         }
         Predicate::Or(a, b) => {
             // An Or with a residual side can match rows in ANY shard, so it is
-            // not narrowable: both sides must resolve exactly.
-            //
-            // Null semantics: the legacy mask evaluator uses Arrow's non-Kleene
-            // `or`, where `null OR x = null → false`. So a row whose left
-            // operand is null but whose right operand is true is EXCLUDED by the
-            // legacy path, whereas the row-set union would INCLUDE it. They
-            // diverge only when an operand column is nullable, so resolve `Or`
-            // from the index only when every referenced column is non-nullable
-            // (then no operand can be null and union == legacy). Otherwise fall
-            // back to the residual path, which preserves the exact legacy
-            // semantics.
-            if !ctx.all_columns_non_nullable(a) || !ctx.all_columns_non_nullable(b) {
-                return None;
-            }
+            // not narrowable: both sides must resolve exactly. That is the only
+            // restriction — nullable operand columns are fine, because the
+            // union is exactly the Kleene TRUE-set (see the module header).
             let ra = eval_rowset(a, ctx)?;
             let rb = eval_rowset(b, ctx)?;
             Some(ra.union(&rb))
@@ -718,8 +698,16 @@ pub fn parse_predicate(expr: &str, schema: &Schema, axis: &str) -> Result<Predic
 
 /// Evaluate a predicate against an Arrow RecordBatch, returning a boolean mask.
 ///
-/// Null values produce `false` (not matched). Nulls propagate through AND/OR/NOT
-/// and are coalesced to false at the end.
+/// **Null semantics: three-valued (Kleene) logic, coalesced to `false` at the
+/// top level** — i.e. a SQL `WHERE` clause. A comparison against a NULL cell is
+/// UNKNOWN, not `false`; `and` / `or` combine UNKNOWN per Kleene
+/// (`null OR true = true`, `null AND false = false`), `not` propagates it, and
+/// only the final mask turns a surviving UNKNOWN into "not matched". pandas,
+/// polars and SQL agree on `or`; see `docs/api.md` § QueryPipeline.
+///
+/// Getting this wrong is silent: combining with arrow's *non*-Kleene
+/// `boolean::or` makes `null OR true` null, and the top-level coalesce then
+/// drops a row that every other engine returns.
 pub fn evaluate(predicate: &Predicate, batch: &RecordBatch) -> Result<BooleanArray> {
     let mask = eval_inner(predicate, batch)?;
     // Coalesce nulls to false at the top level
@@ -749,13 +737,17 @@ fn eval_inner(predicate: &Predicate, batch: &RecordBatch) -> Result<BooleanArray
         Predicate::Le(col, val) => eval_comparison(batch, col, val, CmpOp::Le),
         Predicate::Ge(col, val) => eval_comparison(batch, col, val, CmpOp::Ge),
         Predicate::In(col, vals) => {
-            // OR of individual Eq comparisons
+            // OR of individual Eq comparisons. Every operand compares the SAME
+            // column, and the comparison helpers propagate null purely from the
+            // input cell (independent of the scalar), so all operands share one
+            // null pattern and the Kleene and non-Kleene kernels agree here.
+            // `or_kleene` is used anyway so the whole evaluator has one rule.
             let mut result: Option<BooleanArray> = None;
             for val in vals {
                 let mask = eval_comparison(batch, col, val, CmpOp::Eq)?;
                 result = Some(match result {
                     None => mask,
-                    Some(prev) => compute::kernels::boolean::or(&prev, &mask)?,
+                    Some(prev) => compute::kernels::boolean::or_kleene(&prev, &mask)?,
                 });
             }
             // If vals is empty, return all-false
@@ -764,16 +756,26 @@ fn eval_inner(predicate: &Predicate, batch: &RecordBatch) -> Result<BooleanArray
         Predicate::And(a, b) => {
             let left = eval_inner(a, batch)?;
             let right = eval_inner(b, batch)?;
-            Ok(compute::kernels::boolean::and(&left, &right)?)
+            // `and_kleene`, not `and`: `null AND false` is FALSE (no value of
+            // the unknown operand makes the conjunction true). At the top level
+            // that is indistinguishable from arrow's non-Kleene `and` — both
+            // land on "not matched" — but under a `Not` it is the difference
+            // between `not (null AND false)` being true (correct) and false.
+            Ok(compute::kernels::boolean::and_kleene(&left, &right)?)
         }
         Predicate::Or(a, b) => {
             let left = eval_inner(a, batch)?;
             let right = eval_inner(b, batch)?;
-            Ok(compute::kernels::boolean::or(&left, &right)?)
+            // `or_kleene`, not `or`: `null OR true` is TRUE. Arrow's non-Kleene
+            // `or` returns null whenever either side is null, which the
+            // top-level coalesce turns into `false` — silently dropping a row
+            // whose other operand matched.
+            Ok(compute::kernels::boolean::or_kleene(&left, &right)?)
         }
         Predicate::Not(inner) => {
             let mask = eval_inner(inner, batch)?;
-            // Arrow's `not` preserves nulls: null stays null, true→false, false→true
+            // Arrow's `not` is already Kleene-correct: null stays null (NOT
+            // UNKNOWN is UNKNOWN), true→false, false→true.
             Ok(compute::kernels::boolean::not(&mask)?)
         }
     }
@@ -1582,6 +1584,74 @@ mod tests {
     }
 
     #[test]
+    fn eval_or_with_null_operand_matches_sql_semantics() {
+        // `name` is NULL at row 2, whose `age` is 40:
+        //
+        //   name == 'Alice'  ->  [true,  false, null, false, false]
+        //   age  >  30       ->  [false, true,  true, true,  false]
+        //
+        // In three-valued logic `null OR true` is TRUE — no assignment of the
+        // unknown left operand can make the disjunction false — so row 2
+        // matches. pandas, polars, scanpy and SQL all return it.
+        let batch = test_batch();
+        let pred = Predicate::Or(
+            Box::new(Predicate::Eq(
+                "name".into(),
+                ScalarValue::Utf8("Alice".into()),
+            )),
+            Box::new(Predicate::Gt("age".into(), ScalarValue::Int64(30))),
+        );
+        let mask = evaluate(&pred, &batch).unwrap();
+        let got: Vec<bool> = (0..mask.len()).map(|i| mask.value(i)).collect();
+        assert_eq!(got, vec![true, true, true, true, false]);
+        assert!(
+            mask.value(2),
+            "row 2 has a NULL `name` and age=40; `null OR true` is true, not false"
+        );
+    }
+
+    #[test]
+    fn eval_or_with_nulls_is_operand_order_independent() {
+        let batch = test_batch();
+        let a = Predicate::Eq("name".into(), ScalarValue::Utf8("Alice".into()));
+        let b = Predicate::Gt("age".into(), ScalarValue::Int64(30));
+        let collect = |p: &Predicate| -> Vec<bool> {
+            let m = evaluate(p, &batch).unwrap();
+            (0..m.len()).map(|i| m.value(i)).collect()
+        };
+        assert_eq!(
+            collect(&Predicate::Or(Box::new(a.clone()), Box::new(b.clone()))),
+            collect(&Predicate::Or(Box::new(b), Box::new(a))),
+        );
+    }
+
+    #[test]
+    fn eval_not_of_and_with_null_operand_matches_sql_semantics() {
+        // The `and` half of the same fix. At the top level Kleene and
+        // non-Kleene `AND` agree (a null conjunct lands on false either way),
+        // so only a negated `AND` can tell them apart:
+        //
+        //   name == 'Alice'  ->  [true, false, null,  false, false]
+        //   age  <  30       ->  [true, false, false, false, true ]
+        //
+        // `null AND false` is FALSE in three-valued logic, so `not (...)` is
+        // TRUE at row 2.
+        let batch = test_batch();
+        let pred = Predicate::Not(Box::new(Predicate::And(
+            Box::new(Predicate::Eq(
+                "name".into(),
+                ScalarValue::Utf8("Alice".into()),
+            )),
+            Box::new(Predicate::Lt("age".into(), ScalarValue::Int64(30))),
+        )));
+        let mask = evaluate(&pred, &batch).unwrap();
+        let expected = [false, true, true, true, true];
+        for (i, &exp) in expected.iter().enumerate() {
+            assert_eq!(mask.value(i), exp, "row {i}");
+        }
+    }
+
+    #[test]
     fn eval_not() {
         let batch = test_batch();
         let pred = Predicate::Not(Box::new(Predicate::Eq(
@@ -1686,27 +1756,11 @@ mod tests {
             vec![(0, 0, 10), (1, 10, 20)]
         }
 
-        /// Schema with cell_type/tissue/donor_id all NON-nullable so `Or` is
-        /// index-resolvable (the nullable-Or case is exercised separately).
-        fn test_schema() -> arrow::datatypes::Schema {
-            use arrow::datatypes::{DataType, Field};
-            arrow::datatypes::Schema::new(vec![
-                Field::new("cell_type", DataType::Utf8, false),
-                Field::new("tissue", DataType::Utf8, false),
-                Field::new("donor_id", DataType::Utf8, false),
-            ])
-        }
-
-        fn mk<'a>(
-            index: &'a PredicateIndex,
-            ranges: &'a [(u32, u64, u64)],
-            schema: &'a arrow::datatypes::Schema,
-        ) -> RowSetCtx<'a> {
+        fn mk<'a>(index: &'a PredicateIndex, ranges: &'a [(u32, u64, u64)]) -> RowSetCtx<'a> {
             RowSetCtx {
                 index,
                 shard_row_ranges: ranges,
                 n_obs: 20,
-                obs_schema: schema,
             }
         }
 
@@ -1718,8 +1772,7 @@ mod tests {
         fn eq_categorical_resolves_to_global_rowset() {
             let index = idx();
             let ranges = ctx_ranges();
-            let schema = test_schema();
-            let ctx = mk(&index, &ranges, &schema);
+            let ctx = mk(&index, &ranges);
             let rs = eval_rowset(&eq("cell_type", "B cell"), &ctx).unwrap();
             // shard0 [0,5) + shard1 global [10,13)
             assert_eq!(
@@ -1735,8 +1788,7 @@ mod tests {
         fn eq_absent_value_is_exact_empty() {
             let index = idx();
             let ranges = ctx_ranges();
-            let schema = test_schema();
-            let ctx = mk(&index, &ranges, &schema);
+            let ctx = mk(&index, &ranges);
             let rs = eval_rowset(&eq("cell_type", "NK cell"), &ctx).unwrap();
             assert!(rs.is_empty());
         }
@@ -1745,8 +1797,7 @@ mod tests {
         fn non_indexed_column_is_residual() {
             let index = idx();
             let ranges = ctx_ranges();
-            let schema = test_schema();
-            let ctx = mk(&index, &ranges, &schema);
+            let ctx = mk(&index, &ranges);
             assert!(eval_rowset(&eq("donor_id", "d1"), &ctx).is_none());
         }
 
@@ -1754,8 +1805,7 @@ mod tests {
         fn in_list_unions() {
             let index = idx();
             let ranges = ctx_ranges();
-            let schema = test_schema();
-            let ctx = mk(&index, &ranges, &schema);
+            let ctx = mk(&index, &ranges);
             let p = Predicate::In(
                 "cell_type".into(),
                 vec![
@@ -1772,8 +1822,7 @@ mod tests {
         fn and_intersects_or_unions() {
             let index = idx();
             let ranges = ctx_ranges();
-            let schema = test_schema();
-            let ctx = mk(&index, &ranges, &schema);
+            let ctx = mk(&index, &ranges);
             // cell_type==B cell AND tissue==blood -> [0,5) (shard1 not in blood)
             let and = Predicate::And(
                 Box::new(eq("cell_type", "B cell")),
@@ -1784,7 +1833,7 @@ mod tests {
                 &[RowRange { start: 0, end: 5 }]
             );
 
-            // cell_type==T cell OR tissue==blood -> [0,10) (both columns non-nullable)
+            // cell_type==T cell OR tissue==blood -> [0,10)
             let or = Predicate::Or(
                 Box::new(eq("cell_type", "T cell")),
                 Box::new(eq("tissue", "blood")),
@@ -1796,31 +1845,32 @@ mod tests {
         }
 
         #[test]
-        fn or_over_nullable_column_is_residual() {
-            // When an Or operand references a NULLABLE column, the legacy
-            // non-Kleene `or` (null OR true = false) diverges from the row-set
-            // union, so the Or must fall back to residual.
-            use arrow::datatypes::{DataType, Field};
+        fn or_resolves_from_index_regardless_of_column_nullability() {
+            // `Or` used to be refused whenever any operand column was nullable
+            // — not because the union was wrong, but so the fast path would
+            // reproduce the mask path's non-Kleene `null OR true = false` bug.
+            // With `or_kleene` the union IS the mask, so the refusal is gone
+            // and a nullable categorical (the common case on an atlas: a
+            // `cell_type` with unannotated cells) gets pushdown.
             let index = idx();
             let ranges = ctx_ranges();
-            let schema = arrow::datatypes::Schema::new(vec![
-                Field::new("cell_type", DataType::Utf8, true), // nullable
-                Field::new("tissue", DataType::Utf8, false),
-            ]);
-            let ctx = mk(&index, &ranges, &schema);
+            let ctx = mk(&index, &ranges);
             let or = Predicate::Or(
                 Box::new(eq("cell_type", "T cell")),
                 Box::new(eq("tissue", "blood")),
             );
-            assert!(eval_rowset(&or, &ctx).is_none());
+            assert_eq!(
+                eval_rowset(&or, &ctx).unwrap().ranges(),
+                &[RowRange { start: 0, end: 10 }],
+                "an Or over a nullable categorical must resolve from the index"
+            );
         }
 
         #[test]
         fn and_with_residual_side_is_residual() {
             let index = idx();
             let ranges = ctx_ranges();
-            let schema = test_schema();
-            let ctx = mk(&index, &ranges, &schema);
+            let ctx = mk(&index, &ranges);
             let and = Predicate::And(
                 Box::new(eq("cell_type", "B cell")),
                 Box::new(eq("donor_id", "d1")), // not indexed
@@ -1832,8 +1882,7 @@ mod tests {
         fn ne_not_numeric_are_residual() {
             let index = idx();
             let ranges = ctx_ranges();
-            let schema = test_schema();
-            let ctx = mk(&index, &ranges, &schema);
+            let ctx = mk(&index, &ranges);
             assert!(eval_rowset(
                 &Predicate::Ne("cell_type".into(), ScalarValue::Utf8("B cell".into())),
                 &ctx
