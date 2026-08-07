@@ -59,6 +59,60 @@ pub struct MetadataPatch {
     pub modality_id: u8,
 }
 
+/// Why an obs replacement could not re-derive the per-shard column statistics.
+///
+/// Only used to word the warning, but the wording matters: two of these three are
+/// *not* fixed by passing `--index-obs`, and an earlier message told every caller
+/// to do exactly that. On an under-covering file that advice loops forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoStatsReason {
+    /// No index rebuild was requested, so there was nothing to derive from.
+    NoRebuildRequested,
+    /// A rebuild ran and an index was written — but over the obs-shard ranges,
+    /// because the CSR shards do not tile `[0, n_obs)`. `derive_shard_column_stats`
+    /// would then be addressing a different shard space, so it is skipped.
+    CsrRangesUnderCoverObsAxis,
+    /// A rebuild was requested but no requested column could be indexed (a
+    /// missing column, or an unsupported dtype such as `Boolean`).
+    NoColumnWasIndexable,
+}
+
+impl NoStatsReason {
+    fn what_happened(self) -> &'static str {
+        match self {
+            Self::NoRebuildRequested => "obs was replaced without an index rebuild",
+            Self::CsrRangesUnderCoverObsAxis => {
+                "the predicate index was rebuilt, but this file's CSR shards do not cover \
+                 every obs row, so the index could not be mapped onto them"
+            }
+            Self::NoColumnWasIndexable => {
+                "an index rebuild was requested but no requested column could be indexed \
+                 (missing, or an unsupported dtype)"
+            }
+        }
+    }
+
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::NoRebuildRequested => {
+                "pass --index-obs / --index-preset (or index_obs=/index_preset= in pyscx) \
+                 to re-derive them."
+            }
+            // Deliberately NOT "--index-obs": that is what was just done, and on a
+            // file with this shape it will skip the derive again.
+            Self::CsrRangesUnderCoverObsAxis => {
+                "another in-place rebuild will not help; rewrite the file with `scx sort` \
+                 or `scx compact` plus --index-obs / --index-preset, which re-shards the \
+                 matrix so its CSR shards cover the whole obs axis."
+            }
+            Self::NoColumnWasIndexable => {
+                "name a column the index supports (a categorical or numeric obs column) \
+                 in --index-obs / --index-preset."
+            }
+        }
+    }
+}
+
 impl MetadataPatch {
     fn is_empty(&self) -> bool {
         self.uns.is_none()
@@ -203,6 +257,11 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
     let mut per_shard_obs_stats: Option<Vec<Vec<ColumnStat>>> = None;
     let mut indexed_obs_cols: Vec<String> = Vec::new();
     let mut indexed_var_cols: Vec<String> = Vec::new();
+    // Why the per-shard column stats could not be re-derived, for the warning
+    // below. The three arms are genuinely different remedies, and telling a user
+    // to "pass --index-obs" when they just did — and when doing it again cannot
+    // help — sends them round in a circle.
+    let mut no_stats_reason = NoStatsReason::NoRebuildRequested;
 
     if let Some(obs) = &patch.obs {
         // Unify dictionary columns to their value type, matching the obs
@@ -255,16 +314,24 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
             let obs_bytes = builder
                 .finish(ranges, &mut outcomes, &mut indexed_obs_cols)
                 .map_err(OpsError::Engine)?;
-            if let Some(bytes) = obs_bytes {
-                writer.write_obs_predicate_index(&bytes)?;
-                if use_csr {
-                    let index = scx_engine::PredicateIndex::read_from(&mut Cursor::new(&bytes))
-                        .map_err(OpsError::Engine)?;
-                    per_shard_obs_stats = Some(scx_engine::derive_shard_column_stats(
-                        &index,
-                        csr_ranges.len(),
-                    ));
+            match obs_bytes {
+                Some(bytes) => {
+                    writer.write_obs_predicate_index(&bytes)?;
+                    if use_csr {
+                        let index = scx_engine::PredicateIndex::read_from(&mut Cursor::new(&bytes))
+                            .map_err(OpsError::Engine)?;
+                        per_shard_obs_stats = Some(scx_engine::derive_shard_column_stats(
+                            &index,
+                            csr_ranges.len(),
+                        ));
+                    } else {
+                        // An index WAS written, over the obs-shard ranges. Another
+                        // in-place rebuild will land here again — the file's shape
+                        // is the problem, not the request.
+                        no_stats_reason = NoStatsReason::CsrRangesUnderCoverObsAxis;
+                    }
                 }
+                None => no_stats_reason = NoStatsReason::NoColumnWasIndexable,
             }
         }
     }
@@ -379,12 +446,12 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
             let cleared = scx_format_io::clear_all_csr_shard_column_stats(&mut entries);
             if cleared > 0 {
                 log::warn!(
-                    "modify_metadata replaced obs without rebuilding the predicate index: \
-                     dropped stale per-shard column statistics on {cleared} CSR shards of \
-                     {}. Level-1 shard pruning is off until an index is rebuilt — pass \
-                     --index-obs / --index-preset (or index_obs=/index_preset= in pyscx) \
-                     to re-derive it.",
-                    path.display()
+                    "modify_metadata dropped stale per-shard column statistics on {cleared} \
+                     CSR shards of {}: {}. Level-1 shard pruning is off until they are \
+                     re-derived — {}",
+                    path.display(),
+                    no_stats_reason.what_happened(),
+                    no_stats_reason.remedy()
                 );
             }
         }
@@ -555,5 +622,46 @@ mod tests {
         assert!(!entry_matches_key("varm/pca", "obsm", "pca"));
         assert!(!entry_matches_key("varm/pca_shard_0", "obsm", "pca"));
         assert!(entry_matches_key("varm/pca_shard_0", "varm", "pca"));
+    }
+
+    /// The under-covering route rebuilt the index already, so telling the caller
+    /// to pass `--index-obs` sends them round a loop that cannot terminate: the
+    /// next in-place rebuild hits the same `use_csr == false` branch and skips
+    /// the derive again. Only a copy-out rewrite that re-shards the matrix helps.
+    ///
+    /// This is the exact wording bug this test exists to prevent, so it asserts
+    /// on the property (does not offer an in-place rebuild; does name the
+    /// copy-out ops) rather than on the sentence.
+    #[test]
+    fn the_under_covering_remedy_does_not_recommend_another_in_place_rebuild() {
+        use super::NoStatsReason::*;
+
+        let remedy = CsrRangesUnderCoverObsAxis.remedy();
+        assert!(
+            remedy.contains("sort") && remedy.contains("compact"),
+            "must point at the copy-out rewrite that re-shards the matrix: {remedy}"
+        );
+        assert!(
+            !remedy.starts_with("pass --index-obs"),
+            "an in-place rebuild is what just failed here: {remedy}"
+        );
+
+        // The other two ARE fixed in place, and must keep saying so.
+        assert!(NoRebuildRequested.remedy().contains("--index-obs"));
+        assert!(NoColumnWasIndexable.remedy().contains("--index-obs"));
+
+        // All three describe different situations — a copy-paste that collapsed
+        // two of them would defeat the point.
+        let all = [
+            NoRebuildRequested,
+            CsrRangesUnderCoverObsAxis,
+            NoColumnWasIndexable,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.what_happened(), b.what_happened());
+                assert_ne!(a.remedy(), b.remedy());
+            }
+        }
     }
 }

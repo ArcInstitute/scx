@@ -122,7 +122,7 @@ The three in-place ops therefore clear what they invalidate:
 
 | op | scope of the clear |
 |---|---|
-| `modify_metadata` with `obs=` | **all** columns — obs is replaced wholesale. Re-derived instead of cleared when `--index-obs` / `--index-preset` requests a rebuild. |
+| `modify_metadata` with `obs=` | **all** columns — obs is replaced wholesale. Re-derived instead of cleared when `--index-obs` / `--index-preset` requests a rebuild **and** that rebuild can be mapped onto the CSR shards (see below). |
 | `obs-import` / `doublet-import` | only the columns the import writes. It joins by key and never reorders rows, so an untouched column's stats stay true. |
 | `cellbender-import` | the same, over `status_column` / row annotations / `row_sum_column`. |
 
@@ -137,6 +137,18 @@ pre-append shards' stats remain true and the appended shards carry none.
 To get Level-1 pruning back after a clear, rebuild the index with an op that
 derives stats: `pyscx.modify_metadata(f, obs=…, index_obs=[…])`, or a copy-out
 `scx sort` / `scx compact` with `--index-obs` / `--index-preset`.
+
+**Requesting a rebuild does not always restore pruning**, and the warning
+`modify_metadata` emits says which case you are in. `modify_metadata` derives the
+stats only when the index it builds is keyed to the CSR shards, which needs those
+shards to tile `[0, n_obs)`. On a file whose CSR shards under-cover the obs axis,
+the index is built over the *obs-shard* ranges instead — a different shard space —
+and the derive is skipped. The file then has a freshly written `ObsPredicateIndex`
+and no column stats, and repeating the in-place rebuild lands in the same branch.
+The fix there is a copy-out `scx sort` / `scx compact` with `--index-obs`, which
+re-shards the matrix so the two spaces line up. A rebuild that names no indexable
+column (a missing column, or an unsupported dtype such as `Boolean`) likewise
+writes nothing to derive from.
 
 > **Files rewritten in place before this shipped are not repaired by upgrading.**
 > The clears stop *new* files being poisoned; they do not touch a file that
