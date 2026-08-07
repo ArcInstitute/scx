@@ -511,6 +511,32 @@ pub fn fixture_deletion(dir: &tempfile::TempDir) -> (PathBuf, usize) {
     (dv_path, deleted.len())
 }
 
+/// Which of `candidates` still have per-shard catalog column stats on some CSR
+/// shard — i.e. which columns Level-1 pushdown can still prune on.
+///
+/// Shared by the `external_obs` and `external_layer` test modules, which assert
+/// the same invariant from two call sites: an in-place import must clear the
+/// stats for the columns it rewrites and leave every other column's alone.
+#[allow(dead_code)]
+pub fn columns_with_shard_stats(path: &std::path::Path, candidates: &[&str]) -> Vec<String> {
+    use scx_format_io::column_name_hash;
+    use scx_format_io::section::SectionType;
+    let reader = scx_format_io::ScxReader::open(path).unwrap();
+    let live: Vec<u64> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CsrShard)
+        .filter_map(|e| e.stats.as_ref())
+        .flat_map(|s| s.column_stats.iter().map(|cs| cs.column_name_hash()))
+        .collect();
+    candidates
+        .iter()
+        .filter(|c| live.contains(&column_name_hash(c)))
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod fixture_smoke {
     //! Sort-fixture smoke test: every sort fixture builds and

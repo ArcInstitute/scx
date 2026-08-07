@@ -106,6 +106,146 @@ fn bulk_csr_shard_column_stats_assigns_by_sorted_position() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// clear_*_csr_shard_column_stats
+// ---------------------------------------------------------------------------
+
+/// Catalog entries covering every case the clear helpers must distinguish: two
+/// CSR shards carrying stats for two columns, a CSR shard with no stats at all,
+/// and a non-CSR entry that happens to carry stats of its own.
+fn entries_for_clearing() -> Vec<crate::catalog::FullCatalogEntry> {
+    use crate::catalog::{column_name_hash, ColumnStat, FullCatalogEntry, ShardStats};
+
+    let stats_with = |row_start: u64| {
+        let mut s = ShardStats::row_range_only(row_start, 10);
+        s.column_stats = vec![
+            ColumnStat::MinMax {
+                column_name_hash: column_name_hash("n_counts"),
+                min: row_start as f64,
+                max: row_start as f64 + 9.0,
+            },
+            ColumnStat::CategoryBitset {
+                column_name_hash: column_name_hash("cell_type"),
+                bitset: vec![0b0000_0011],
+            },
+        ];
+        s.n_indexed_columns = s.column_stats.len() as u8;
+        s
+    };
+    let entry = |name: &str, section_type, stats| FullCatalogEntry {
+        name: name.to_string(),
+        offset: 0,
+        length: 0,
+        section_type,
+        checksum: [0u8; 32],
+        modality_id: 0,
+        stats,
+    };
+    vec![
+        entry("X_shard_0", SectionType::CsrShard, Some(stats_with(0))),
+        entry("X_shard_1", SectionType::CsrShard, Some(stats_with(10))),
+        // No stats: must be skipped rather than panicking or counted.
+        entry("X_shard_2", SectionType::CsrShard, None),
+        // A layer shard's stats are not obs stats and must not be touched.
+        entry(
+            "counts_shard_0",
+            SectionType::LayerCsrShard,
+            Some(stats_with(0)),
+        ),
+    ]
+}
+
+fn stats_len(entries: &[crate::catalog::FullCatalogEntry], name: &str) -> usize {
+    let e = entries.iter().find(|e| e.name == name).unwrap();
+    e.stats.as_ref().map_or(0, |s| s.column_stats.len())
+}
+
+/// `n_indexed_columns` and `column_stats.len()` must agree after any clear:
+/// `LazyShardStats` trusts the count to decide whether to decode the tail.
+fn assert_counts_agree(entries: &[crate::catalog::FullCatalogEntry]) {
+    for e in entries {
+        if let Some(s) = e.stats.as_ref() {
+            assert_eq!(
+                s.n_indexed_columns as usize,
+                s.column_stats.len(),
+                "n_indexed_columns drifted from column_stats on '{}'",
+                e.name
+            );
+        }
+    }
+}
+
+#[test]
+fn clear_all_drops_every_csr_column_stat_and_leaves_other_sections_alone() {
+    let mut entries = entries_for_clearing();
+    let changed = crate::writer::clear_all_csr_shard_column_stats(&mut entries);
+
+    assert_eq!(
+        changed, 2,
+        "only the two CSR entries that had stats changed"
+    );
+    assert_eq!(stats_len(&entries, "X_shard_0"), 0);
+    assert_eq!(stats_len(&entries, "X_shard_1"), 0);
+    assert_eq!(
+        stats_len(&entries, "counts_shard_0"),
+        2,
+        "a layer shard's stats are not obs column stats"
+    );
+    assert_counts_agree(&entries);
+}
+
+/// The whole point of the scoped variant: a column that was not rewritten keeps
+/// its stats, so an `obs_import` that lands one new column does not silently
+/// disable Level-1 pruning on an unrelated `cell_type` index.
+#[test]
+fn clear_for_columns_drops_only_the_named_column() {
+    use crate::catalog::{column_name_hash, ColumnStat};
+
+    let mut entries = entries_for_clearing();
+    let changed =
+        crate::writer::clear_csr_shard_column_stats_for(&mut entries, &["n_counts".to_string()]);
+
+    assert_eq!(changed, 2);
+    for name in ["X_shard_0", "X_shard_1"] {
+        let e = entries.iter().find(|e| e.name == name).unwrap();
+        let cs = &e.stats.as_ref().unwrap().column_stats;
+        assert_eq!(cs.len(), 1, "{name}");
+        assert!(
+            matches!(cs[0], ColumnStat::CategoryBitset { column_name_hash: h, .. }
+                     if h == column_name_hash("cell_type")),
+            "the untouched column's stat must survive: {cs:?}"
+        );
+    }
+    assert_counts_agree(&entries);
+}
+
+/// Naming a column the file has no stats for is a no-op, which is what lets the
+/// import ops pass their whole planned-column list unconditionally.
+#[test]
+fn clear_for_columns_is_a_noop_for_unknown_or_empty_column_lists() {
+    let mut entries = entries_for_clearing();
+    assert_eq!(
+        crate::writer::clear_csr_shard_column_stats_for(&mut entries, &[]),
+        0
+    );
+    assert_eq!(
+        crate::writer::clear_csr_shard_column_stats_for(&mut entries, &["not_indexed".to_string()]),
+        0
+    );
+    assert_eq!(stats_len(&entries, "X_shard_0"), 2);
+    assert_counts_agree(&entries);
+
+    // And clearing twice reports zero the second time.
+    assert_eq!(
+        crate::writer::clear_all_csr_shard_column_stats(&mut entries),
+        2
+    );
+    assert_eq!(
+        crate::writer::clear_all_csr_shard_column_stats(&mut entries),
+        0
+    );
+}
+
 /// Wrong per-shard length is rejected (guards against shard_id/range
 /// misalignment — the bug class that left pushdown non-functional).
 #[test]

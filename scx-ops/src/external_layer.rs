@@ -658,6 +658,14 @@ pub fn attach_external_layer(
         stats: None,
     });
 
+    // The other half of `drop_obs_index` — see the matching comment in
+    // `external_obs.rs`. The catalog's per-shard `ColumnStat`s are what Level-1
+    // pushdown actually prunes on (the numeric `MinMax` arm never reads the index
+    // section), so an overwrite has to clear them or shards holding matching rows
+    // are silently excluded. Scoped to the rewritten columns, and unconditional
+    // rather than gated on `drop_obs_index`, for the reasons given there.
+    scx_format_io::clear_csr_shard_column_stats_for(&mut entries, &summary.obs_columns_added);
+
     // `write_obsm` does not set the header flag, and `commit_in_place` writes
     // the header verbatim without `sync_from_catalog`. Without this, a
     // first-ever in-place obsm silently disappears on the next `compact` or
