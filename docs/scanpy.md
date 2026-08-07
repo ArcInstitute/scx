@@ -1063,15 +1063,23 @@ accept the pandas-only forms below, while the default non-backed path and
 "n_counts > 50"
 "n_counts >= 50 and cell_type == 'T cell'"
 "cell_type in ['T cell', 'B cell']"           # bracket-delimited list
-"not (cell_type == 'NK cell')"
 "(n_counts > 50) or (cell_type == 'NK cell')"
+
+# Parse in both, but select DIFFERENT rows when the column has nulls —
+# see "Nulls: the one semantic divergence" below.
+"not (cell_type == 'NK cell')"
+"cell_type != 'NK cell'"
 ```
 
 This subset uses comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`),
 keyword-form boolean operators (`and`, `or`, `not`), the `in` operator
 against a `[...]` list literal, and parenthesised sub-expressions. Tests in
-`pyscx/tests/test_to_anndata_integration.py` (`test_obs_filter_grammar_parity_common_ground`)
-assert that both paths select identical rows for the entries above.
+`pyscx/tests/test_to_anndata_integration.py` assert that both paths select
+identical rows for the entries above — `test_obs_filter_grammar_parity_common_ground`
+on a fixture with **no** missing values, and
+`test_obs_filter_grammar_parity_with_null_categorical` on one with nulls. The
+null-bearing test deliberately omits `!=` and `not (...)`, which is the
+divergence spelled out below.
 
 **Divergences (work in one grammar only)** — the "pandas" column covers both
 `backed=True` (`.query()`) and `preserve_slots=True` (`.eval()`):
@@ -1112,7 +1120,9 @@ a `UserWarning` noting that the filter was evaluated via pandas.eval — this
 surfaces in notebook output so the grammar shift is visible without reading
 this section.
 
-**Recommendation:** write filters in the portable subset above. If a filter
+**Recommendation:** write filters in the portable subset above, and on a
+column that may have missing values prefer the positive forms — `!=` and
+`not (...)` parse everywhere but do not select the same rows. If a filter
 truly needs pandas-only syntax, do the row selection in Python after
 `to_anndata()` instead of inside `obs_filter` — that keeps the SCX call site
 portable across `preserve_slots`, `backed=True`, and cloud selective pulls.

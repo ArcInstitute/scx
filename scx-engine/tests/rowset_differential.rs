@@ -304,6 +304,37 @@ impl Expr {
             Self::Not(a) => a.eval(i).map(|v| !v),
         }
     }
+
+    /// Truth of this expression for row `i` under arrow's **non-Kleene**
+    /// kernels — the pre-fix behaviour, where `and`/`or` return UNKNOWN
+    /// whenever *either* operand is UNKNOWN. Leaves and `not` are identical to
+    /// [`Self::eval`]; only the two combinators differ.
+    ///
+    /// This exists solely so the generator's coverage canary can measure the
+    /// thing that actually matters — expressions the two semantics answer
+    /// *differently* — rather than the much weaker "expression happens to match
+    /// a row that has a NULL somewhere in it".
+    fn eval_non_kleene(&self, i: usize) -> Option<bool> {
+        match self {
+            Self::And(a, b) => match (a.eval_non_kleene(i), b.eval_non_kleene(i)) {
+                (Some(x), Some(y)) => Some(x && y),
+                _ => None,
+            },
+            Self::Or(a, b) => match (a.eval_non_kleene(i), b.eval_non_kleene(i)) {
+                (Some(x), Some(y)) => Some(x || y),
+                _ => None,
+            },
+            Self::Not(a) => a.eval_non_kleene(i).map(|v| !v),
+            leaf => leaf.eval(i),
+        }
+    }
+
+    /// True if Kleene and non-Kleene disagree about whether *any* row matches —
+    /// i.e. this expression would have been answered wrong before the fix.
+    fn is_kleene_sensitive(&self) -> bool {
+        (0..N_OBS as usize)
+            .any(|i| (self.eval(i) == Some(true)) != (self.eval_non_kleene(i) == Some(true)))
+    }
 }
 
 /// The rows a `filter_obs(expr)` must return: UNKNOWN is not a match (the
@@ -440,11 +471,13 @@ fn rowset_path_matches_legacy_path() {
         let expr = ast.render();
         // Ground truth from the independent Kleene evaluator.
         let want = expected_ids(&ast);
-        // How many of these expressions actually depend on a NULL cell: an
-        // expression whose truth changes when UNKNOWN is treated as FALSE
-        // instead of propagated. If this count were 0 the oracle would be
-        // vacuous for the null semantics it exists to pin.
-        if (0..N_OBS as usize).any(|i| cell_type_at(i).is_none() && ast.eval(i) == Some(true)) {
+        // How many generated expressions this oracle would answer differently
+        // under the two semantics — i.e. how many actually exercise the bug.
+        // Deliberately NOT "matches a row that has a NULL somewhere": a bare
+        // `n_genes > 100` matching row 0 satisfies that while being completely
+        // insensitive to null handling, so such a counter could stay green even
+        // if `Or`-over-`cell_type` generation disappeared entirely.
+        if ast.is_kleene_sensitive() {
             null_sensitive += 1;
         }
 
@@ -476,11 +509,24 @@ fn rowset_path_matches_legacy_path() {
                 }
                 // A limit truncates the (ascending) match list; it must never
                 // reorder it or admit a row ground truth excludes.
-                Some(_) => assert_eq!(
-                    got,
-                    want[..got.len().min(want.len())],
-                    "limited result is not a prefix of ground truth for `{expr}` limit={limit:?}"
-                ),
+                Some(n) => {
+                    assert_eq!(
+                        got,
+                        want[..got.len().min(want.len())],
+                        "limited result is not a prefix of ground truth for `{expr}` limit={limit:?}"
+                    );
+                    // A prefix check alone would let an empty result pass
+                    // vacuously — `[]` is a prefix of everything. A non-empty
+                    // ground truth with a non-zero limit must return rows, and
+                    // at least min(limit, |want|) of them.
+                    assert!(
+                        got.len() >= n.min(want.len()),
+                        "limit={n} returned {} rows but ground truth has {} \
+                         for `{expr}`",
+                        got.len(),
+                        want.len()
+                    );
+                }
             }
             checked += 1;
         }
@@ -514,7 +560,8 @@ fn rowset_path_matches_legacy_path() {
     );
     assert!(
         null_sensitive > 50,
-        "only {null_sensitive} generated expressions match a NULL-`cell_type` row; \
-         the null semantics this oracle exists to pin would be barely exercised"
+        "only {null_sensitive} generated expressions are answered differently by \
+         Kleene vs non-Kleene logic; the semantics this oracle exists to pin \
+         would be barely exercised"
     );
 }

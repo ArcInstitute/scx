@@ -1186,6 +1186,55 @@ fn test_delete_or_matches_rows_with_a_null_operand() {
     }
 }
 
+/// The copy-out sibling of the delete case: `scx subset --filter` writes a new
+/// file containing the matching cells, so the non-Kleene `or` silently produced
+/// a *smaller* subset than asked for — cells whose `cell_type` was NULL were
+/// left out even when `n_genes` matched them. Unlike `--dry-run` delete, this
+/// asserts against the bytes actually written.
+#[test]
+fn test_subset_or_keeps_rows_with_a_null_operand() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_null_bearing_file(&dir, "subset_null_or.scx");
+    let out = dir.path().join("subset_null_or_out.scx");
+
+    let res = scx_cli()
+        .args([
+            "subset",
+            path.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'B cell' or n_genes > 500",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "subset failed: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(
+        reader.header().n_obs,
+        4,
+        "`or` with a NULL operand must keep 4 cells (rows 0,1,4,5); row 0 has a \
+         NULL cell_type and n_genes=900"
+    );
+
+    // Identity, not just cardinality: the NULL-cell_type row must be present.
+    let obs = reader.read_obs().unwrap();
+    let idx = obs.schema().index_of("cell_id").unwrap();
+    let ids = arrow::compute::cast(obs.column(idx), &DataType::Utf8).unwrap();
+    let ids = ids
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(|s| s.unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["cell_0", "cell_1", "cell_4", "cell_5"]);
+}
+
 // ---------------------------------------------------------------------------
 // Query --limit
 // ---------------------------------------------------------------------------
