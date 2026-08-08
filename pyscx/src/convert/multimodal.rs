@@ -7,7 +7,6 @@ use pyo3::prelude::*;
 use std::sync::Arc;
 
 use scx_format_io::section::SectionType;
-use scx_format_io::ScxReader;
 
 use crate::to_pyerr;
 
@@ -33,7 +32,7 @@ pub fn build_backed_anndata_for_modality<'py>(
 
     // Meta reader for var / obsm / modality_info introspection.
     let meta =
-        ScxReader::open_with_shared_catalog(path, Arc::clone(shared_catalog)).map_err(to_pyerr)?;
+        crate::open_handle_reader_shared(path, Arc::clone(shared_catalog)).map_err(to_pyerr)?;
     let info = meta.modality_info(modality_id).ok_or_else(|| {
         PyRuntimeError::new_err(format!(
             "modality_info({modality_id}) returned None — modality table is corrupt"
@@ -43,7 +42,7 @@ pub fn build_backed_anndata_for_modality<'py>(
 
     // Per-modality backed X (CSR).
     let csr_reader =
-        ScxReader::open_with_shared_catalog(path, Arc::clone(shared_catalog)).map_err(to_pyerr)?;
+        crate::open_handle_reader_shared(path, Arc::clone(shared_catalog)).map_err(to_pyerr)?;
     let backed_csr = Arc::new(BackedCsrReader::for_modality(
         csr_reader,
         modality_id,
@@ -52,8 +51,8 @@ pub fn build_backed_anndata_for_modality<'py>(
 
     // Per-modality backed CSC sidecar (optional).
     let backed_csc = if has_csc {
-        let csc_reader = ScxReader::open_with_shared_catalog(path, Arc::clone(shared_catalog))
-            .map_err(to_pyerr)?;
+        let csc_reader =
+            crate::open_handle_reader_shared(path, Arc::clone(shared_catalog)).map_err(to_pyerr)?;
         Some(Arc::new(
             scx_format_io::BackedCscReader::for_modality(csc_reader, modality_id, cache_shards)
                 .map_err(to_pyerr)?,
@@ -116,7 +115,7 @@ pub fn to_anndata_backed_for_modality<'py>(
     modality: &str,
     cache_shards: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let reader = ScxReader::open(path).map_err(to_pyerr)?;
+    let reader = crate::open_handle_reader(path).map_err(to_pyerr)?;
     let modality_id = reader.modality_id(modality).ok_or_else(|| {
         pyo3::exceptions::PyKeyError::new_err(format!(
             "unknown modality '{modality}' (available: {:?})",

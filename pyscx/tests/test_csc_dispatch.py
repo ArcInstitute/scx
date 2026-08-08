@@ -52,6 +52,20 @@ def _open_with_csc(path, adata):
     return pyscx.open(str(path)).to_anndata(backed=True)
 
 
+def _reopen(path):
+    """A second independent backed handle on a file `_open_*` already wrote.
+
+    Deliberately not a second `_open_with_csc(path, ...)`: that call *rewrites*
+    the file, and the rewrite renames a fresh inode into place, so the handle
+    the first call returned is left mapping an unlinked file. Both arms of a
+    parity assertion then have to be identical for the comparison to mean
+    anything — which is exactly the assumption the parity test exists to check.
+    """
+    import pyscx
+
+    return pyscx.open(str(path)).to_anndata(backed=True)
+
+
 def _open_csr_only(path, adata):
     import pyscx
 
@@ -123,7 +137,7 @@ def test_hvg_csc_matches_csr(small_adata, tmp_path):
 
     pytest.importorskip("skmisc")  # loess fit dependency
     a_csr = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
-    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    a_csc = _reopen(tmp_path / "with_csc.scx")
 
     pyscx.accel.highly_variable_genes(a_csr, n_top_genes=8, flavor="seurat_v3")
     pyscx.accel.highly_variable_genes(
@@ -170,7 +184,7 @@ def test_rank_genes_groups_csc_matches_csr(small_adata, tmp_path):
     import pyscx
 
     a_csr = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
-    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    a_csc = _reopen(tmp_path / "with_csc.scx")
 
     # Pin the CSR arm explicitly: the file has a sidecar, so the "auto" default
     # (post Phase-2 §5.2) would otherwise route this side to CSC too, making the
@@ -210,7 +224,7 @@ def test_pdex_ref_csc_matches_csr(small_adata, tmp_path):
     import pyscx
 
     a_csr = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
-    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    a_csc = _reopen(tmp_path / "with_csc.scx")
 
     # Pin CSR explicitly — the sidecar file would otherwise auto-route to CSC.
     df_csr = pyscx.accel.pdex_ref(
@@ -261,7 +275,7 @@ def test_pdex_ref_auto_routes_csc_when_sidecar_present(small_adata, tmp_path):
     import pyscx
 
     a_auto = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
-    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    a_csc = _reopen(tmp_path / "with_csc.scx")
 
     df_auto = pyscx.accel.pdex_ref(
         a_auto, "group", reference="A", geometric_mean=False, gene_chunk_size=4,
@@ -286,7 +300,7 @@ def test_pdex_ref_auto_falls_back_to_csr_without_sidecar(small_adata, tmp_path):
     import pyscx
 
     a_auto = _open_csr_only(tmp_path / "csr_only.scx", small_adata)
-    a_csr = _open_csr_only(tmp_path / "csr_only.scx", small_adata)
+    a_csr = _reopen(tmp_path / "csr_only.scx")
 
     df_auto = pyscx.accel.pdex_ref(
         a_auto, "group", reference="A", geometric_mean=False, gene_chunk_size=4, device="cpu",
@@ -312,7 +326,7 @@ def test_rank_genes_groups_auto_routes_csc_when_sidecar_present(small_adata, tmp
     import pyscx
 
     a_auto = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
-    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    a_csc = _reopen(tmp_path / "with_csc.scx")
 
     pyscx.accel.rank_genes_groups(a_auto, "group", device="cpu")  # auto default
     pyscx.accel.rank_genes_groups(a_csc, "group", prefer_format="csc", device="cpu")
@@ -343,7 +357,7 @@ def test_rank_genes_groups_auto_gene_subset_backed_does_not_error(small_adata, t
     import pyscx
 
     a_auto = _open_with_csc(tmp_path / "sub.scx", small_adata)
-    a_csr = _open_with_csc(tmp_path / "sub.scx", small_adata)
+    a_csr = _reopen(tmp_path / "sub.scx")
     # Project to a gene subset (keeps the sidecar on the backed dataset).
     sub_auto = a_auto[:, :8]
     sub_csr = a_csr[:, :8]
@@ -423,7 +437,7 @@ def test_qc_metrics_csc_matches_csr(small_adata, tmp_path):
     import pyscx
 
     a_csr = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
-    a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
+    a_csc = _reopen(tmp_path / "with_csc.scx")
 
     pyscx.accel.calculate_qc_metrics(a_csr)
     pyscx.accel.calculate_qc_metrics(a_csc, prefer_format="csc")

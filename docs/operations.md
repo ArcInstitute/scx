@@ -22,6 +22,15 @@ target, carrying no prior catalog, so a subsequent `scx rollback` fails with
 `no previous catalog available for rollback`. Copy out first if you want a way
 back.
 
+> **Every op in this table invalidates a `pyscx` handle that is already open on
+> the file.** The in-place ops append and rewrite the header; the copy-out ops
+> rename a new file into place. Either way an open `Experiment`, backed
+> `AnnData`, or `query()` pipeline is left mapping the previous contents, and
+> reading through it raises rather than answering. Call `Experiment.reload()`,
+> or re-derive from a fresh `pyscx.open(...)`. Mutating *through* a handle
+> (`pyscx.obs_import(exp, ...)`, `exp.mark_deleted(...)`) reloads it for you.
+> See [docs/api.md § Handles and files that change underneath them](api.md#handles-and-files-that-change-underneath-them).
+
 | Operation | Writes | Matrix shards | Obs metadata | Var metadata | CSC sidecar | Predicate indexes |
 |-----------|--------|---------------|--------------|--------------|-------------|-------------------|
 | **append** | In place (`<TARGET> <SOURCE>`) | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows |

@@ -294,7 +294,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
 
     let lazy_reader: Option<Arc<ScxReader>> = if need_lazy {
         Some(Arc::new(
-            ScxReader::open_with_shared_catalog(path, reader.catalog_arc()).map_err(to_pyerr)?,
+            crate::open_handle_reader_shared(path, reader.catalog_arc()).map_err(to_pyerr)?,
         ))
     } else {
         None
@@ -870,7 +870,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     use std::sync::Arc;
 
     let anndata_mod = py.import("anndata")?;
-    let reader = ScxReader::open(path).map_err(to_pyerr)?;
+    let reader = crate::open_handle_reader(path).map_err(to_pyerr)?;
     // Share one parsed `FullCatalog` across the N+3 `ScxReader`
     // instances this function constructs (main reader + X CSR + CSC
     // sidecar + one per backed layer). The catalog is bytes-identical
@@ -975,7 +975,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
 
     // --- X: backed ---
     let x_reader =
-        ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog)).map_err(to_pyerr)?;
+        crate::open_handle_reader_shared(path, Arc::clone(&shared_catalog)).map_err(to_pyerr)?;
     let has_csc = x_reader.header().has_csc();
     let x_backed = Arc::new(BackedCsrReader::new(x_reader, cache_shards));
     let x_backed_csc: Option<Arc<scx_format_io::BackedCscReader>> = if has_csc {
@@ -984,7 +984,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
         // mmap and per-shard catalog, but no shards decode until we
         // actually call read_csc_shard(). Catalog parse is skipped via
         // the shared `Arc<FullCatalog>`.
-        let csc_reader = ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog))
+        let csc_reader = crate::open_handle_reader_shared(path, Arc::clone(&shared_catalog))
             .map_err(to_pyerr)?;
         Some(Arc::new(
             scx_format_io::BackedCscReader::new(csc_reader, cache_shards).map_err(to_pyerr)?,
@@ -1062,7 +1062,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
 
     let lazy_obsm = if use_backed_obsm {
         let obsm_reader = Arc::new(
-            ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog))
+            crate::open_handle_reader_shared(path, Arc::clone(&shared_catalog))
                 .map_err(to_pyerr)?,
         );
         // obs_filter is None here, so kept_to_global == dv_kept_to_global
@@ -1099,7 +1099,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     let need_lazy_aligned = has_obsp || has_varp || has_varm;
     let lazy_reader: Option<Arc<ScxReader>> = if need_lazy_aligned {
         Some(Arc::new(
-            ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog))
+            crate::open_handle_reader_shared(path, Arc::clone(&shared_catalog))
                 .map_err(to_pyerr)?,
         ))
     } else {
@@ -1141,7 +1141,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
                 continue;
             }
         }
-        let l_reader = ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog))
+        let l_reader = crate::open_handle_reader_shared(path, Arc::clone(&shared_catalog))
             .map_err(to_pyerr)?;
         let l_backed = Arc::new(BackedCsrReader::new_for_layer(l_reader, name, cache_shards));
         let mut l_dataset = match &kept_to_global {

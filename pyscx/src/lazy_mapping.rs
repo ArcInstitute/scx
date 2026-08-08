@@ -584,7 +584,7 @@ impl ScxLazyObsmMapping {
                 // Backed row-gather: open a sibling reader (shared catalog)
                 // and wrap a per-key BackedDenseReader.
                 let r =
-                    ScxReader::open_with_shared_catalog(&cfg.path, Arc::clone(&cfg.shared_catalog))
+                    crate::open_handle_reader_shared(&cfg.path, Arc::clone(&cfg.shared_catalog))
                         .map_err(to_pyerr)?;
                 let backed = Arc::new(
                     scx_format_io::BackedDenseReader::new_obsm(r, key, cfg.cache_shards)

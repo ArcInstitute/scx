@@ -83,6 +83,25 @@ pub enum ScxError {
         data_generation: u64,
     },
 
+    /// A handle that was opened with change-watching enabled was asked to read
+    /// a file that has changed since it was opened.
+    ///
+    /// Nothing is wrong with either file — the handle's mapping is intact and
+    /// still perfectly readable. That is precisely the problem: it maps the
+    /// *previous* contents (an in-place op appends and rewrites the header) or
+    /// an unlinked inode (a copy-out op renames a new file into place), so
+    /// every answer it gives is right about a file that is no longer there.
+    ///
+    /// Only handed to callers that opted in via `ScxReader::open_watched`; the
+    /// ops / CLI / loader paths open readers around their own mutations and
+    /// never see this.
+    #[error(
+        "'{path}' {detail}. This handle still maps the file as it was when it was opened, \
+         so its answers describe contents that are no longer on disk — re-open the file to \
+         read the current ones (in pyscx: `Experiment.reload()`)"
+    )]
+    FileChangedOnDisk { path: String, detail: String },
+
     #[error("block n_rows {0} exceeds u16::MAX (65535)")]
     BlockRowsOverflow(u32),
 
@@ -266,8 +285,15 @@ impl ScxError {
             | ScxError::InvalidBlockIndex(_)
             | ScxError::ColumnStatsShardCountMismatch { .. } => ScxErrorClass::CorruptFile,
             ScxError::Io(io_err) => ScxErrorClass::Io(io_err.kind()),
+            // Deliberately NOT `CorruptFile`: both files are intact. The
+            // handle is simply looking at the older one, and the binding's
+            // "appears corrupt; re-run conversion" suffix would send the
+            // caller to fix a file that has nothing wrong with it. `Other`
+            // maps to a plain `RuntimeError`, which is what a "your handle
+            // is out of date" condition is.
+            ScxError::FileChangedOnDisk { .. }
             // Wrapped lower-level errors and genuine runtime failures.
-            ScxError::WriterAlreadyFinished
+            | ScxError::WriterAlreadyFinished
             | ScxError::CscTranspose(_)
             | ScxError::Csr(_)
             | ScxError::Codec(_)

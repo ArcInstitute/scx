@@ -75,6 +75,17 @@ pub struct ReaderDebugCounts {
 
 pub struct ScxReader {
     mmap: Mmap,
+    /// The path this reader was opened from. Kept unconditionally: it is what
+    /// [`Self::watching`] stamps against, and it lets errors name the file
+    /// without every caller threading the path back in alongside the reader.
+    path: std::path::PathBuf,
+    /// `Some` only when the caller opted in via [`Self::watching`]. Every
+    /// [`Self::section_bytes`] then re-checks that the file at `path` is still
+    /// the one that was opened — see [`crate::freshness`]. `None` (the
+    /// default) makes the check compile down to a single null test, which is
+    /// what keeps `scx-ops` — whose readers deliberately bracket its own
+    /// mutations — and the training loader's hot path unaffected.
+    freshness: Option<crate::freshness::FreshnessGuard>,
     header: FileHeader,
     root_catalog: RootCatalog,
     /// Stored as `Arc<FullCatalog>` so the same parsed catalog can
@@ -234,6 +245,8 @@ impl ScxReader {
 
         Ok(ScxReader {
             mmap,
+            path: path.to_path_buf(),
+            freshness: None,
             header,
             root_catalog,
             full_catalog: Arc::new(full_catalog),
@@ -277,7 +290,8 @@ impl ScxReader {
         path: impl AsRef<Path>,
         catalog: Arc<FullCatalog>,
     ) -> Result<Self> {
-        let file = File::open(path.as_ref())?;
+        let path = path.as_ref();
+        let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
         #[cfg(unix)]
@@ -346,12 +360,72 @@ impl ScxReader {
 
         Ok(ScxReader {
             mmap,
+            path: path.to_path_buf(),
+            freshness: None,
             header,
             root_catalog,
             full_catalog: catalog,
             modality_table,
             debug_counts: ReaderDebugCounts::default(),
         })
+    }
+
+    /// Opt this reader into detecting that its file changed on disk.
+    ///
+    /// Stamps the file's current identity (see [`crate::freshness`]) and makes
+    /// every subsequent [`Self::section_bytes`] verify it first, so a read
+    /// after an in-place or copy-out mutation raises
+    /// [`ScxError::FileChangedOnDisk`] instead of quietly answering from the
+    /// mapping of a file that no longer exists at that path.
+    ///
+    /// Deliberately a separate, explicit step rather than a variant of every
+    /// constructor: the readers that must *not* watch (`scx-ops` brackets its
+    /// own mutations with them, and the loader's hot path opens thousands)
+    /// outnumber the ones that must, so opting in is greppable and opting out
+    /// is the default.
+    ///
+    /// Costs one `open` + `stat` here, then two syscalls (`stat` + a 256-byte
+    /// `pread`) per section read — see [`crate::freshness`] for why the stat
+    /// alone will not do. Chains off any constructor:
+    ///
+    /// ```no_run
+    /// # use scx_format_io::ScxReader;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let reader = ScxReader::open("cells.scx")?.watching()?;
+    /// # Ok(()) }
+    /// ```
+    pub fn watching(mut self) -> Result<Self> {
+        self.freshness = Some(crate::freshness::FreshnessGuard::stamp(
+            &self.path,
+            &self.header,
+        )?);
+        Ok(self)
+    }
+
+    /// The path this reader was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether this reader was opted into change detection via
+    /// [`Self::watching`].
+    pub fn is_watching(&self) -> bool {
+        self.freshness.is_some()
+    }
+
+    /// `Ok(())` unless this is a watched reader whose file has changed since it
+    /// was opened. Always `Ok(())` for an unwatched reader.
+    ///
+    /// [`Self::section_bytes`] calls this itself, so it covers every section
+    /// read in the workspace from one site. Call it directly only for answers
+    /// that never touch a section — `n_obs`, `shape`, `has_csc` and the rest
+    /// come from the parsed header or catalog and would otherwise stay
+    /// silently stale after an `append`.
+    pub fn check_fresh(&self) -> Result<()> {
+        match &self.freshness {
+            Some(guard) => guard.check(),
+            None => Ok(()),
+        }
     }
 
     /// Per-instance counters for whole-batch reader entry points
@@ -3606,7 +3680,14 @@ impl ScxReader {
     // -----------------------------------------------------------------------
 
     /// Get the raw bytes for a catalog entry from the mmap.
+    ///
+    /// The single point at which section payload bytes leave the mapping —
+    /// every other read in the workspace, in this crate and outside it, comes
+    /// through here. That is why the freshness check lives at this line rather
+    /// than at the ~230 handle methods above it: a read path added tomorrow
+    /// inherits it without anyone remembering to ask.
     pub fn section_bytes(&self, entry: &FullCatalogEntry) -> Result<&[u8]> {
+        self.check_fresh()?;
         let start = entry.offset as usize;
         let end = start
             .checked_add(entry.length as usize)

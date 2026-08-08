@@ -1657,8 +1657,76 @@ the repr onto `Experiment.info() -> str`.
 
   `to_gpu_anndata` accepts `container` / `data_dtype` / `index_dtype` / `allow_lossy` for signature parity with `to_anndata`, but the device path is **f32-native**: a non-default request raises `ValueError`. To obtain a narrow/dense matrix, materialize it on the host with `to_anndata(container=..., data_dtype=...)`.
 - `info() -> str` — One-line codec / shard / format-version internals (kept off the AnnData-style `repr`).
-- Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `index_dtype`, `path`, `has_csc`, `has_deletions`.
+- `reload()` — Re-open the file, picking up anything written since the handle was opened. See **Handles and files that change underneath them** below.
+- `close()` — Release the file mapping. Idempotent; reads afterwards raise. Also available as a context manager (`with pyscx.open(p) as exp:`).
+- Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `index_dtype`, `path`, `has_csc`, `has_deletions`, `closed`.
 - List-returning accessors — callable **methods** (not properties): `layer_names()`, and the AnnData-style key accessors `obs_keys()`, `var_keys()`, `obsm_keys()`, `varm_keys()`, `uns_keys()` (all cheap — schema/catalog reads, no matrix decode; `obs_keys()`/`var_keys()` exclude the pandas index column).
+
+#### Handles and files that change underneath them
+
+An `Experiment` maps the file it was opened from, and no SCX write path ever
+edits bytes a reader is looking at — an in-place op (`obs_import`,
+`doublet_import`, `modify_metadata`, `set_uns`, `mark_deleted`, `build_csc`,
+`rollback`) appends and rewrites the header, and a copy-out op (`compact`,
+`sort`, `merge`, `subset`) renames a new file into place. Either way the
+mapping stays intact and readable while describing a file state that is no
+longer on disk.
+
+Reading through such a handle **raises** rather than answering:
+
+```python
+exp = pyscx.open("atlas.scx")
+pyscx.obs_import("atlas.scx", "calls.csv", key="obs_names")
+
+exp.read_obs()
+# RuntimeError: 'atlas.scx' changed on disk since it was opened
+# (manifest_sequence 1 → 2). This handle still maps the file as it was
+# when it was opened … re-open the file to read the current ones
+# (in pyscx: `Experiment.reload()`)
+
+exp.reload()
+exp.read_obs()      # now carries the imported columns
+```
+
+The rules, in full:
+
+- **It covers the objects the handle hands out, not just the handle.**
+  `adata = pyscx.open(p).to_anndata(backed=True)` drops the `Experiment` on the
+  same line, and the backed `X` / `obsm` / layers, a `query()` pipeline, and a
+  backed MuData each hold their own reader. All of them refuse a changed file.
+- **`reload()` does not reach them.** It refreshes the `Experiment` only;
+  re-derive anything taken out of it (`exp.to_anndata(backed=True)` again).
+  Reviving them in place would silently mix arrays from two file versions.
+- **Mutating *through* a handle is fine.** `pyscx.obs_import(exp, "calls.csv")`
+  and `exp.mark_deleted(mask)` reload the handle for you.
+- **`path`, `closed`, `close()`, `reload()` and `repr()` never raise** — a
+  stale handle reprs as `<Experiment 'atlas.scx' [stale: …]>`. Everything else
+  on the class does.
+- **Only pyscx handles are watched.** `scx-ops`, the CLI and the ML training
+  loader open readers around their own writes and are unaffected; the check
+  costs them nothing.
+- **Cloud handles are not covered.** `open_cloud` has no local mapping and no
+  inode to compare; detecting a changed object would need a request per read.
+- **Timestamps are not the signal.** The check compares the file's inode and
+  its catalog pointer, so `touch`, a metadata-preserving copy, or a backup pass
+  does not invalidate a handle — and, in the other direction, a mutation that
+  leaves size and mtime untouched is still caught. (Both happen: Linux updates
+  inode timestamps from a coarse clock, so a fast open→mutate sequence can land
+  with an *identical* `st_mtime_ns`.)
+
+`close()` releases the mapping without waiting for the garbage collector, which
+is what you want before rewriting a file in place, and is required on Windows,
+where a mapped file cannot be replaced at all:
+
+```python
+with pyscx.open("atlas.scx") as exp:
+    obs = exp.read_obs()
+pyscx.compact("atlas.scx", "atlas.scx")   # mapping already released
+```
+
+Objects taken out of a `with` block keep their own readers and stay usable
+after it exits; closing the handle you opened them from does not close them.
+
 
 ### Container and dtype materialization
 

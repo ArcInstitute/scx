@@ -24,6 +24,7 @@ pub mod csc_sidecar;
 pub mod deletion_vectors;
 pub mod distinct;
 pub mod encoder;
+pub mod freshness;
 pub mod mem;
 pub mod prefetch;
 pub mod profile;

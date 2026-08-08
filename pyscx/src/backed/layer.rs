@@ -66,9 +66,13 @@ impl ScxBackedLayerDataset {
 
 #[pymethods]
 impl ScxBackedLayerDataset {
+    /// Delegates to the inner dataset's guarded getter rather than reading
+    /// `inner.shape_val` — the cached scalar never reaches `section_bytes`, so
+    /// reading it directly is how a layer handle would keep reporting the row
+    /// count the file had before an `append`.
     #[getter]
-    fn shape(&self) -> (usize, usize) {
-        self.inner.shape_val
+    fn shape(&self) -> PyResult<(usize, usize)> {
+        self.inner.shape()
     }
 
     #[getter]
@@ -96,8 +100,8 @@ impl ScxBackedLayerDataset {
         &self.layer_name
     }
 
-    fn __len__(&self) -> usize {
-        self.inner.shape_val.0
+    fn __len__(&self) -> PyResult<usize> {
+        self.inner.__len__()
     }
 
     fn __repr__(&self) -> String {
