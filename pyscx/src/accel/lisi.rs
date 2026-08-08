@@ -100,8 +100,10 @@ pub fn compute_lisi<'py>(
     // *un*mixed", the most confident wrong answer this metric can give — with no
     // error. See `scx_accel::lisi::compute_lisi`, which is the load-bearing one.
     if !perplexity.is_finite() || perplexity <= 0.0 {
+        // `{:?}` so a finite-but-absurd `-1e300` does not render as a
+        // 302-character message; `Display` for f64 never uses exponent notation.
         return Err(PyValueError::new_err(format!(
-            "perplexity must be a finite positive number (got {perplexity})"
+            "perplexity must be a finite positive number (got {perplexity:?})"
         )));
     }
 

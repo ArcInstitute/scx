@@ -123,8 +123,12 @@ pub fn compute_lisi(
     //
     // Neither raised, warned, or logged.
     if !config.perplexity.is_finite() || config.perplexity <= 0.0 {
+        // `{:?}`, not `{}`, for the same reason `util::reject_reason` uses it in
+        // rscx: `Display` for f64 never uses exponent notation, so a finite but
+        // absurd `-1e300` (which trips the `<= 0.0` arm) would render as a
+        // 302-character message. `Debug` gives `-1e300`.
         return Err(AccelError::InvalidInput(format!(
-            "perplexity must be a finite positive number (got {})",
+            "perplexity must be a finite positive number (got {:?})",
             config.perplexity
         )));
     }

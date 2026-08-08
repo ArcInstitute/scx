@@ -78,8 +78,10 @@ fn scx_compute_lisi_impl(
     // which carries the load-bearing copy of this guard). Kept here too so the
     // message names the R-facing argument rather than a downstream crate's.
     if !perplexity.is_finite() || perplexity <= 0.0 {
+        // `{:?}` so a finite-but-absurd `-1e300` does not render as a
+        // 302-character message; `Display` for f64 never uses exponent notation.
         return Err(Error::Other(format!(
-            "perplexity must be a finite positive number (got {perplexity})"
+            "perplexity must be a finite positive number (got {perplexity:?})"
         )));
     }
 

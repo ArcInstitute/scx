@@ -121,7 +121,8 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
 - **Never cast an R `f64` to an index or count with a bare `as u64` /
   `as usize`** — the cast *saturates* (`-1.0 → 0`, `NaN → 0`) and truncates
   fractions, so a bad index silently reads row 0 instead of erroring. Route
-  every one through `rscx::util::r_whole_u64` / `r_whole_u64_slice`, which
+  every one through `crate::util::r_whole_u64` / `r_whole_u64_slice` (the
+  module is private to the crate — there is no `rscx::util` public path), which
   reject non-finite, negative, fractional, and >2⁵³ values. Note extendr
   rejects R's `NA` for a **scalar** `f64` parameter but *not* inside a
   `Vec<f64>` (`try_from_robj.rs` still carries a `// TODO: check NAs`), so

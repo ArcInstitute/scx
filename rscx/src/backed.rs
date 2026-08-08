@@ -58,7 +58,9 @@ impl RBackedSparse {
         // pre-allocates a `HashMap` of that capacity — `cache_shards = 1e9`
         // would reserve tens of gigabytes and abort the R session with no
         // catchable error. A cache larger than the shard count is useless
-        // anyway, so the file's own shard count is the natural ceiling.
+        // anyway, so the shard count is the natural ceiling — but floored at
+        // the documented default, so the ceiling only binds above 128. See
+        // `crate::util::clamp_cache_shards`.
         let n_shards = reader.header().n_csr_shards as usize;
         let cache_shards = crate::util::clamp_cache_shards(cache_shards, n_shards);
         let backed = BackedCsrReader::new(reader, cache_shards);

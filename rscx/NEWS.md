@@ -66,6 +66,10 @@
   table of that capacity — tens of gigabytes, killing the R session with an
   allocation abort rather than a catchable error. Negative, `NaN` and fractional
   values are now rejected instead of silently becoming 1.
+- `scx_delete()` now also rejects cell indices above 2^53, where consecutive
+  integers are no longer distinguishable as doubles. Previously such a value was
+  truncated to whatever the cast produced. Same validator as the row-index
+  methods, so the rejection classes are now identical across both surfaces.
 - `[` on `ScxBackedSparse` / `ScxLazyTransformed` now rejects non-finite row
   indices and truncates fractional ones, matching `dgCMatrix` (`M[1.9, ]` is
   row 1). The column index was already handed to Matrix, so one call

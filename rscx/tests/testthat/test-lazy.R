@@ -137,4 +137,11 @@ test_that("lazy raw read methods reject indices `f64 as u64` would saturate", {
   # `[` still truncates like a dgCMatrix, and the identity chain is a no-op.
   expect_equal(as.matrix(lt[1.9, ]), as.matrix(eager[1, , drop = FALSE]))
   expect_error(lt[Inf, ], "finite")
+
+  # Mirror of the backed pin: `[.ScxLazyTransformed` is a *separate copy* of the
+  # dispatcher, so the `trunc(i)`-before-contiguity ordering has to be held here
+  # independently or an edit to one file alone would silently lose it.
+  # `diff(c(1.5, 2.5)) == 1`, so this takes the range branch and would reach the
+  # strict Rust layer as read_rows(0.5, 2.5) without the truncation.
+  expect_equal(as.matrix(lt[c(1.5, 2.5), ]), as.matrix(eager[1:2, , drop = FALSE]))
 })
