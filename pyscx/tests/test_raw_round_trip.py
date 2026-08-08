@@ -423,12 +423,15 @@ def test_lazy_x_route_warns_when_dropping_raw(tmp_dir):
         pyscx.from_anndata(backed, str(tmp_dir / "lazy_out.scx"))
 
 
-@pytest.mark.parametrize("raw_n_vars", [65_535, 65_536])
+@pytest.mark.parametrize("raw_n_vars", [65_535, 65_536, 65_537])
 def test_raw_index_dtype_boundary(tmp_dir, raw_n_vars):
-    """Exactly at the u16 ceiling and one past it.
+    """Around the `raw_n_vars <= 65535` branch.
 
-    The wide test above uses 70k, comfortably clear of the `<= 65535`
-    branch; these two pin the branch itself.
+    65537 is the arm that carries the weight: it is the first width whose
+    highest column index (65536) does not fit u16, so a wrongly-narrow
+    `index_dtype` fails here. At exactly 65536 the branch flips but the
+    highest index is still 65535, so that arm is not observable through the
+    public API — it is kept to document the flip point, not as evidence.
     """
     import anndata
     import pandas as pd

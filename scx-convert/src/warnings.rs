@@ -174,12 +174,23 @@ pub enum ConvertWarning {
     /// query, or backed mode). The on-disk raw sections are preserved;
     /// only this particular reconstruction omits raw.
     DroppedRaw { raw_n_vars: usize },
-    /// The source file carries an `adata.raw` matrix that the file being
-    /// written will NOT carry. Distinct from [`Self::DroppedRaw`], which is
-    /// a read-side notice whose "the on-disk raw sections are preserved"
+    /// The source carries an `adata.raw` matrix that the file being written
+    /// will NOT carry. Distinct from [`Self::DroppedRaw`], which is a
+    /// read-side notice whose "the on-disk raw sections are preserved"
     /// reassurance is true of the source and says nothing about an output
     /// file — on this path raw is gone from the new file for good.
-    DroppedRawOnWrite { raw_n_vars: usize },
+    ///
+    /// `reason` is supplied per call site and carries the cause **and** the
+    /// remedy, because the doors differ: the SCX → SCX rewrite loses raw
+    /// because the in-memory AnnData does not hold it, while a
+    /// reorder-on-convert loses it because raw is streamed unpermuted. A
+    /// single hard-coded remedy would be wrong on one of them — telling a
+    /// `from_h5ad(..., sort_by=…)` caller to "convert from the h5ad" is the
+    /// same class of misdirection this variant exists to end.
+    DroppedRawOnWrite {
+        raw_n_vars: usize,
+        reason: &'static str,
+    },
     /// `adata.raw.varm` was present but is not representable: SCX's raw
     /// section family stores `raw/X` and `raw/var` only. Raw's own var-axis
     /// mappings are dropped on both h5ad ingest and the in-memory write.
@@ -278,13 +289,10 @@ impl fmt::Display for ConvertWarning {
                  deletion-vectors-active file) cannot reproduce raw's obs-axis filtering. \
                  The on-disk raw sections are preserved."
             ),
-            Self::DroppedRawOnWrite { raw_n_vars } => write!(
+            Self::DroppedRawOnWrite { raw_n_vars, reason } => write!(
                 f,
-                "the source file carries an adata.raw matrix ({raw_n_vars} genes) that this \
-                 write does not carry forward, so the output file will have no raw. This \
-                 path writes the sections the in-memory AnnData holds, and backed \
-                 reconstruction sets .raw to None. To keep raw, convert from the h5ad \
-                 (pyscx.from_h5ad) or from an in-memory AnnData whose .raw is set."
+                "the source carries an adata.raw matrix ({raw_n_vars} genes) that this write \
+                 does not carry forward, so the output file will have no raw: {reason}"
             ),
             Self::DroppedRawVarm { keys } => write!(
                 f,

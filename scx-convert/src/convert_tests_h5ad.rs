@@ -353,6 +353,60 @@ fn raw_varm_is_dropped_with_a_warning_on_both_ingest_paths() {
     }
 }
 
+/// Reorder-on-convert drops raw. That is a **write** producing a file with
+/// no raw, so it must use `DroppedRawOnWrite` — and the text must fit *this*
+/// door, not the SCX → SCX one. Both wrong messages are asserted absent: the
+/// read-side reassurance (raw is not preserved anywhere the user can reach it
+/// in the output) and the SCX → SCX remedy (this caller is already converting
+/// from the h5ad, so "convert from the h5ad" is nonsense here).
+#[test]
+fn reorder_on_convert_reports_a_write_side_raw_drop_worded_for_this_door() {
+    use super::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (8, 10, 17);
+    let h5ad_path = dir.path().join("reorder_raw.h5ad");
+    create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
+    add_raw_group(&h5ad_path, n_obs, raw_n_vars);
+
+    let opts = ConvertOptions {
+        sort_by: vec!["n_counts".to_string()],
+        ..ConvertOptions::default()
+    };
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink_seen = std::sync::Arc::clone(&seen);
+    let mut sink = WarningSink::with_handler(move |w| {
+        sink_seen.lock().unwrap().push(format!("{w}"));
+    });
+
+    h5ad_to_scx_streaming(
+        &h5ad_path,
+        &dir.path().join("reorder_raw.scx"),
+        &opts,
+        &StreamingOverrides::default(),
+        &mut sink,
+    )
+    .unwrap();
+
+    assert_eq!(sink.counts().get("dropped_raw_on_write"), Some(&1));
+    assert_eq!(sink.counts().get("dropped_raw"), None);
+
+    let msgs = seen.lock().unwrap();
+    let msg = msgs
+        .iter()
+        .find(|m| m.contains("adata.raw"))
+        .expect("a raw-drop message");
+    assert!(
+        !msg.contains("on-disk raw sections are preserved"),
+        "read-side reassurance on a write: {msg}"
+    );
+    assert!(
+        !msg.contains("convert from the h5ad"),
+        "SCX -> SCX remedy on the h5ad door: {msg}"
+    );
+    assert!(msg.contains("--sort-by"), "no cause named: {msg}");
+}
+
 /// The companion negative, in the two shapes that differ.
 ///
 /// `no_group` is the common case and guards only the outer `Ok(varm)` arm.

@@ -3092,9 +3092,18 @@ fn ingest_raw_streaming(
     // `DroppedRawOnWrite`, not `DroppedRaw`: this is a conversion producing an
     // output file with no raw, so the read-side variant's "the on-disk raw
     // sections are preserved" would describe the h5ad input while the user is
-    // asking about the SCX file being written.
+    // asking about the SCX file being written. The reason is supplied here
+    // rather than baked into the variant — this caller is already converting
+    // *from* the h5ad, so the SCX → SCX door's "convert from the h5ad" remedy
+    // would be nonsense.
     if !opts.sort_by.is_empty() || opts.group_by.is_some() {
-        sink.emit(ConvertWarning::DroppedRawOnWrite { raw_n_vars });
+        sink.emit(ConvertWarning::DroppedRawOnWrite {
+            raw_n_vars,
+            reason: "reorder-on-convert (--sort-by / --group-by) permutes X, obs, obsm and \
+                     layers, but raw is streamed in source order, so carrying it would leave \
+                     raw's rows attached to the wrong cells. Convert without the reorder to \
+                     keep raw",
+        });
         return Ok(());
     }
 

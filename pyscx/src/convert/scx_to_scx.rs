@@ -31,6 +31,10 @@ fn warn_source_raw_dropped(py: Python<'_>, src_reader: &ScxReader) -> PyResult<(
             py,
             &scx_convert::ConvertWarning::DroppedRawOnWrite {
                 raw_n_vars: src_reader.raw_n_vars().unwrap_or(0),
+                reason: "this path writes the sections the in-memory AnnData holds, and \
+                         backed reconstruction leaves .raw unset. Convert from the h5ad \
+                         (pyscx.from_h5ad), or from an in-memory AnnData whose .raw is set, \
+                         to keep raw",
             },
         )?;
     }
