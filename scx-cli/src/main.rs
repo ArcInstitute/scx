@@ -639,10 +639,12 @@ enum Commands {
         /// (repeatable). Rows must equal n_vars.
         #[arg(long, value_name = "NAME=PATH.npy")]
         varm: Vec<String>,
-        /// Comma-separated obs columns to force-index when obs is replaced.
+        /// Comma-separated obs columns to index when obs is replaced. Omit to
+        /// carry the file's existing obs index forward over its own columns.
         #[arg(long, value_name = "CSV")]
         index_obs: Option<String>,
-        /// Comma-separated var columns to force-index when var is replaced.
+        /// Comma-separated var columns to index when var is replaced. Omit to
+        /// carry the file's existing var index forward over its own columns.
         #[arg(long, value_name = "CSV")]
         index_var: Option<String>,
         /// Named column preset (`cellxgene` | `perturbseq` | `training`).

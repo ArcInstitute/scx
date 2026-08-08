@@ -1297,10 +1297,14 @@ def doublet_consensus(target, *, keys=None, method="majority",
             want the tools' own thresholds to decide, use "majority".
         overwrite: Replace existing `<K>_*` columns. Without it a collision is
             an error, so a second run cannot silently rewrite the first.
-        index_obs / index_preset: Rebuild an obs predicate index over these
-            columns as part of the same commit. Relevant only for a file
-            target: replacing obs drops any existing obs predicate index, so
-            pass these if the file had one (`scx info` lists it).
+        index_obs / index_preset: Index the obs predicate index over these
+            columns as part of the same commit, instead of the columns the file
+            already indexes. Relevant only for a file target, and rarely
+            needed: writing the consensus replaces obs, and a replaced obs
+            carries its existing index forward, so pushdown survives this call
+            untouched. Naming columns here *narrows* the index to them, and any
+            column the file indexed that this list omits is reported as a
+            `UserWarning`.
 
     Returns:
         The same dict written to `uns["<K>_consensus"]`: `method`, `keys`,

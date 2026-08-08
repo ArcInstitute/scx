@@ -920,17 +920,31 @@ fn validate_shape(data: &ExternalObsData) -> Result<()> {
 /// import would silently kill query pushdown for callers who only ever *add*
 /// columns, which is the overwhelmingly common case.
 pub(crate) fn obs_index_would_go_stale(reader: &ScxReader, planned: &[String]) -> Result<bool> {
-    let Some(bytes) = reader.read_obs_predicate_index_bytes()? else {
-        return Ok(false);
+    let existing = indexed_column_names(reader.read_obs_predicate_index_bytes()?)?;
+    Ok(existing.iter().any(|name| planned.contains(name)))
+}
+
+/// The column names a serialised predicate index covers, in index order.
+/// `None` bytes (no such section) yield an empty list.
+///
+/// Shared by [`obs_index_would_go_stale`] — which asks whether an import would
+/// invalidate one — and `modify_metadata`, which asks what to rebuild so a
+/// replaced axis keeps the index it had. Both need exactly this walk, and the
+/// two drifting on which `IndexedColumn` arms carry a name is a silent
+/// correctness bug on either side.
+pub(crate) fn indexed_column_names(bytes: Option<&[u8]>) -> Result<Vec<String>> {
+    let Some(bytes) = bytes else {
+        return Ok(Vec::new());
     };
     let index = scx_engine::PredicateIndex::read_from(&mut std::io::Cursor::new(bytes))?;
-    Ok(index.columns.iter().any(|c| {
-        let name = match c {
-            scx_engine::index::IndexedColumn::Categorical(cat) => &cat.column_name,
-            scx_engine::index::IndexedColumn::Numeric(num) => &num.column_name,
-        };
-        planned.contains(name)
-    }))
+    Ok(index
+        .columns
+        .iter()
+        .map(|c| match c {
+            scx_engine::index::IndexedColumn::Categorical(cat) => cat.column_name.clone(),
+            scx_engine::index::IndexedColumn::Numeric(num) => num.column_name.clone(),
+        })
+        .collect())
 }
 
 fn check_collisions(

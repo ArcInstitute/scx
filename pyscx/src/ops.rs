@@ -1518,9 +1518,15 @@ pub fn set_uns(py: Python<'_>, path: &str, uns: &Bound<'_, PyAny>) -> PyResult<(
 /// **Replace semantics, not merge.** A supplied `obs`/`var` fully replaces
 /// the section and `num_rows` must match the file's `n_obs` / `n_vars`
 /// (changing cell/gene count is out of scope — use `append` / `subset`).
-/// `obsm` / `varm` replace only the named matrices. Predicate indexes over a
-/// replaced `obs`/`var` are dropped unless `index_obs` / `index_var` /
-/// `index_preset` request a rebuild.
+/// `obsm` / `varm` replace only the named matrices.
+///
+/// **A replaced axis keeps the predicate index it had.** The old section
+/// describes values that are gone, so it is rebuilt over the same columns the
+/// file already indexed — which also re-derives the per-shard column stats, so
+/// `filter_obs` pushdown survives an ordinary obs edit. Naming `index_obs` /
+/// `index_var` / `index_preset` overrides that; a column the file indexed and
+/// the new request does not is reported as a `UserWarning` rather than dropped
+/// in silence.
 ///
 /// Args:
 ///     path: target `.scx` file.
@@ -1529,7 +1535,8 @@ pub fn set_uns(py: Python<'_>, path: &str, uns: &Bound<'_, PyAny>) -> PyResult<(
 ///         equal `n_obs` / `n_vars`.
 ///     obsm / varm: `dict[str, np.ndarray]` of named dense matrices.
 ///     index_obs / index_var / index_preset / index_auto_threshold:
-///         predicate-index rebuild policy (only consulted when obs/var change).
+///         predicate-index policy (only consulted when obs/var change).
+///         Omitted, the file's existing index is carried forward.
 ///     modality: integer modality id (only `0` / global is supported today).
 #[pyfunction]
 #[pyo3(signature = (
@@ -1586,8 +1593,68 @@ pub fn modify_metadata(
         modality_id,
     };
     let path_buf = PathBuf::from(path);
-    py.detach(|| scx_ops::modify_metadata(&path_buf, &patch))
+    let summary = py
+        .detach(|| scx_ops::modify_metadata(&path_buf, &patch))
         .map_err(ops_to_pyerr)?;
+    report_modify_metadata_index(py, summary)
+}
+
+/// Surface what the op did to the file's predicate indexes.
+///
+/// Two channels, one warning per column and no doubling between them:
+///
+/// * `process_index_summary` reports every per-column build outcome with its
+///   precise reason — which on the carry-forward path is every column that
+///   could not be carried.
+/// * The remaining `*_columns_not_carried` entries are the explicit-request
+///   path, where the builder knows nothing about the index the file had and so
+///   emits no outcome for a column the caller simply did not name.
+fn report_modify_metadata_index(
+    py: Python<'_>,
+    summary: scx_ops::ModifyMetadataSummary,
+) -> PyResult<()> {
+    let unreported = |columns: &[String], outcomes: &[BuildOutcome]| -> Vec<String> {
+        columns
+            .iter()
+            .filter(|c| {
+                !outcomes.iter().any(|o| {
+                    let named = match o {
+                        BuildOutcome::ForcedColumnError { column, .. } => column,
+                        BuildOutcome::PresetSkipped { column, .. } => column,
+                    };
+                    named == *c
+                })
+            })
+            .cloned()
+            .collect()
+    };
+    let (obs_unreported, var_unreported) = match summary.index.result.as_ref() {
+        Some(r) => (
+            unreported(&summary.obs_columns_not_carried, &r.obs_outcomes),
+            unreported(&summary.var_columns_not_carried, &r.var_outcomes),
+        ),
+        None => (
+            summary.obs_columns_not_carried.clone(),
+            summary.var_columns_not_carried.clone(),
+        ),
+    };
+
+    process_index_summary(py, summary.index)?;
+
+    for (axis, columns) in [("obs", obs_unreported), ("var", var_unreported)] {
+        if columns.is_empty() {
+            continue;
+        }
+        py.import("warnings")?.call_method1(
+            "warn",
+            (format!(
+                "the {axis} predicate index no longer covers {columns:?}: this file indexed \
+                 {axis} on them, and the index_{axis} / index_preset passed to this call does \
+                 not. Queries on those columns fall back to a full scan. Include them to keep \
+                 the pushdown, or omit index_* entirely to carry the file's own index forward."
+            ),),
+        )?;
+    }
     Ok(())
 }
 

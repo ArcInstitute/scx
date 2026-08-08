@@ -2,8 +2,9 @@
 // of an SCX file in place, without re-encoding X.
 //
 // obs/var are read from Parquet; obsm/varm from 2D `.npy` (float32 or
-// float64, cast to f32). Predicate indexes over a replaced obs/var are
-// dropped unless --index-* requests a rebuild. Multimodal is deferred.
+// float64, cast to f32). A replaced obs/var keeps the predicate index it had
+// (rebuilt over the same columns) unless --index-* names a different set.
+// Multimodal is deferred.
 
 use std::io::Cursor;
 use std::path::Path;
@@ -78,13 +79,48 @@ pub fn run_modify_metadata(
         modality_id: 0,
     };
 
-    scx_ops::modify_metadata(file, &patch)?;
+    let summary = scx_ops::modify_metadata(file, &patch)?;
     println!(
         "Updated metadata on {} (O(replaced sections), no matrix re-encode). \
          Run 'scx compact' to reclaim orphaned sections.",
         file.display()
     );
+    report_index_outcome(&summary);
     Ok(())
+}
+
+/// Say what happened to the file's predicate indexes. Silent when there were
+/// none — the common `--uns`-only case — and explicit otherwise, because the
+/// alternative is a user discovering months later that their queries went back
+/// to a full obs scan.
+fn report_index_outcome(summary: &scx_ops::ModifyMetadataSummary) {
+    if let Some(result) = summary.index.result.as_ref() {
+        for (axis, columns) in [
+            ("obs", &result.obs_indexed_columns),
+            ("var", &result.var_indexed_columns),
+        ] {
+            if columns.is_empty() {
+                continue;
+            }
+            let how = if summary.carried_forward {
+                "carried forward"
+            } else {
+                "rebuilt"
+            };
+            println!("  {axis} predicate index {how} over {columns:?}");
+        }
+    }
+    for (axis, columns) in [
+        ("obs", &summary.obs_columns_not_carried),
+        ("var", &summary.var_columns_not_carried),
+    ] {
+        if !columns.is_empty() {
+            eprintln!(
+                "  warning: the {axis} predicate index no longer covers {columns:?}; \
+                 queries on those columns fall back to a full scan"
+            );
+        }
+    }
 }
 
 fn read_json(p: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {

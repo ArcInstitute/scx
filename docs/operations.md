@@ -26,7 +26,7 @@ back.
 |-----------|--------|---------------|--------------|--------------|-------------|-------------------|
 | **append** | In place (`<TARGET> <SOURCE>`) | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows |
 | **delete** (`mark_deleted`) | In place (`<FILE>`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged |
-| **modify_metadata** / **set_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`); a supplied `obsm` sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | Dropped for the replaced obs/var axis unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild; untouched otherwise. Replacing obs **also clears the per-shard catalog column stats** (rebuilt when an index rebuild is requested) — see the note below |
+| **modify_metadata** / **set_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`); a supplied `obsm` sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | **Carried forward** for the replaced axis — rebuilt over the columns the file already indexed, which also re-derives the per-shard column stats. `--index-obs` / `--index-var` / `--index-preset` override the column set; a previously indexed column the new set omits is *reported*, not silently dropped. Untouched when only `uns` / `obsm` / `varm` change — see the note below |
 | **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
 | **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | Sections **preserved** (rows + shard boundaries unchanged), but like `build-csc` the re-emit does not re-derive the per-shard column stats, so **Level-1** pruning stops firing. See the note below |
 | **merge** | New file (`<OUTPUT>` required) | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
@@ -122,33 +122,40 @@ The three in-place ops therefore clear what they invalidate:
 
 | op | scope of the clear |
 |---|---|
-| `modify_metadata` with `obs=` | **all** columns — obs is replaced wholesale. Re-derived instead of cleared when `--index-obs` / `--index-preset` requests a rebuild **and** that rebuild can be mapped onto the CSR shards (see below). |
+| `modify_metadata` with `obs=` | **all** columns — obs is replaced wholesale and the op cannot tell an added column from a rewritten one. Re-derived instead of cleared whenever an index is built — which now includes the carry-forward, so an indexed file keeps its pruning — **and** that build can be mapped onto the CSR shards (see below). |
 | `obs-import` / `doublet-import` | only the columns the import writes. It joins by key and never reorders rows, so an untouched column's stats stay true. |
 | `cellbender-import` | the same, over `status_column` / row annotations / `row_sum_column`. |
 
 The scoped clears are **not** conditional on whether an `ObsPredicateIndex` is
-still present: a file can carry stats with no index (that is exactly what a
-`modify_metadata` obs replace leaves behind), and gating on the index would let
-those bounds survive a second rewrite.
+still present: a file can carry stats with no index — a `modify_metadata` obs
+replace that could carry nothing forward leaves exactly that — and gating on the
+index would let those bounds survive a second rewrite.
 
 `append` needs none of this — it adds rows and never edits existing ones, so the
 pre-append shards' stats remain true and the appended shards carry none.
+
+**On an indexed file, `modify_metadata(obs=…)` no longer clears at all.** It
+carries the file's own index forward — rebuilds it over the same columns — and
+re-deriving the index re-derives the stats, so Level-1 pruning survives an
+ordinary obs edit. The clear below is what happens when that carry cannot
+complete, and to a file that had no index to carry.
 
 To get Level-1 pruning back after a clear, rebuild the index with an op that
 derives stats: `pyscx.modify_metadata(f, obs=…, index_obs=[…])`, or a copy-out
 `scx sort` / `scx compact` with `--index-obs` / `--index-preset`.
 
-**Requesting a rebuild does not always restore pruning**, and the warning
-`modify_metadata` emits says which case you are in. `modify_metadata` derives the
-stats only when the index it builds is keyed to the CSR shards, which needs those
+**Neither a carry nor an explicit rebuild always restores pruning**, and the
+warning `modify_metadata` emits says which case you are in. The stats are derived
+only when the index being built is keyed to the CSR shards, which needs those
 shards to tile `[0, n_obs)`. On a file whose CSR shards under-cover the obs axis,
 the index is built over the *obs-shard* ranges instead — a different shard space —
 and the derive is skipped. The file then has a freshly written `ObsPredicateIndex`
 and no column stats, and repeating the in-place rebuild lands in the same branch.
 The fix there is a copy-out `scx sort` / `scx compact` with `--index-obs`, which
-re-shards the matrix so the two spaces line up. A rebuild that names no indexable
-column (a missing column, or an unsupported dtype such as `Boolean`) likewise
-writes nothing to derive from.
+re-shards the matrix so the two spaces line up. A build that lands no indexable
+column (missing, or an unsupported dtype such as `Boolean`) likewise writes
+nothing to derive from — including a carry whose columns the new frame dropped,
+which is reported as a warning naming each one.
 
 > **Files rewritten in place before this shipped are not repaired by upgrading.**
 > The clears stop *new* files being poisoned; they do not touch a file that
@@ -158,11 +165,13 @@ writes nothing to derive from.
 > stats with any of the rebuild paths above — `scx info` will not flag it, because
 > a stale bound is indistinguishable from a live one.
 
-**Adding an obs column: prefer `obs_import` over `modify_metadata`.** A
-`modify_metadata(obs=…)` replaces the whole frame, so it clears every column's
-stats even when the indexed columns' *values* are untouched — the op cannot tell.
-`obs_import` joins by key and clears only what it writes, so an unrelated
-`cell_type` index keeps its pruning. Both are correct; the second is cheaper.
+**Adding an obs column: `obs_import` is still the cheaper route.** Both keep an
+unrelated `cell_type` index pruning, but they get there differently.
+`obs_import` joins by key, knows exactly which columns it writes, and clears
+nothing else — O(new columns). `modify_metadata(obs=…)` replaces the whole frame
+and cannot tell an add from a rewrite, so it re-earns the index by rebuilding it,
+which is O(n_obs) over the indexed columns on top of the obs write it was already
+doing. Prefer `obs_import` when the shape of the edit allows it.
 
 ## Append Complexity
 
@@ -228,7 +237,7 @@ re-encode all of `X`.
 | **`obsm` / `varm`** | O(replaced matrices) | Only the named matrices are rewritten; other keys pass through. |
 | **`obsp` / `varp`** | O(1) | Not replaceable here — existing sections (`ObspEmbedding` / `VarpEmbedding` and their shards) pass through unchanged. |
 | **CSC sidecar** | **Preserved** | `data_generation` / `csc_build_generation` are left unchanged, so a pre-existing CSC sidecar stays valid — no `--rebuild-csc` needed. |
-| **Predicate indexes** | O(n_obs)/O(n_vars) when rebuilt | A predicate index over a replaced `obs`/`var` is dropped (its values are now stale); pass `--index-obs` / `--index-var` / `--index-preset` to rebuild. Untouched when only `uns`/`obsm`/`varm` change. |
+| **Predicate indexes** | O(n_obs)/O(n_vars) when the axis is replaced and indexed | The old section describes values that are gone, so it is rebuilt over the columns the file already indexed — the replaced axis keeps its pushdown rather than silently losing it. `--index-obs` / `--index-var` / `--index-preset` name a different set instead. Untouched (O(1)) when only `uns`/`obsm`/`varm` change, or when the axis had no index. |
 
 **Invariants (validated, never changed)**: `n_obs`, `n_vars`, `nnz`,
 `n_csr_shards`, `HAS_CSC`. A shape mismatch (`obs.num_rows() != n_obs`, etc.) is

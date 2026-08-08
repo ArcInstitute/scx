@@ -643,3 +643,35 @@ def test_mean_rank_over_imported_scores_on_a_file(tmp_path):
     assert obs["doublet_predicted"].notna().all()
     assert r["threshold"] is not None
     assert r["columns_added"][0] == "doublet_score"
+
+
+# ---------------------------------------------------------------------------
+# The obs predicate index must survive the last step of the workflow
+# ---------------------------------------------------------------------------
+
+
+def test_consensus_on_a_file_keeps_the_obs_predicate_index(tmp_path):
+    """The reported bug, end to end.
+
+    `doublet_import` joins by key and knows which columns it writes, so it
+    preserves the index. `doublet_consensus` replaces obs wholesale and used to
+    take the index with it — silently reverting `query().filter_obs(...)` to a
+    full obs scan on the LAST step of the documented workflow, with no warning
+    and nothing in provenance to say it had happened.
+    """
+    a = _adata({"one": [T, F, T, F]},
+               extra={"grp": pd.Categorical(["A", "B", "A", "B"])})
+    path = str(tmp_path / "atlas.scx")
+    pyscx.from_anndata(a, path, index_obs=["grp"])
+
+    def sections():
+        return [name for name, _ in pyscx.open(path).validate()]
+
+    assert "obs_predicate_index" in sections()
+
+    pyscx.doublet_consensus(path, keys=["one"], method="any")
+
+    assert "obs_predicate_index" in sections()
+    q = pyscx.open(path).query()
+    q.filter_obs("grp == 'A'")
+    assert q.collect().n_obs == 2
