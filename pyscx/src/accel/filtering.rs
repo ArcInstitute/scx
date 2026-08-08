@@ -7,6 +7,7 @@ use pyo3::types::PyDict;
 use crate::axis_align::{subset_obs_axis, subset_var_axis};
 use crate::backed::{detached, ScxBackedSparseDataset};
 use crate::lazy_transform::ScxLazyTransformedDataset;
+use crate::optional_deps::{import_optional_with_hint, BACKED_ESCAPE_HATCH, EXTRA_SCANPY};
 use crate::projected_agg;
 
 // ---------------------------------------------------------------------------
@@ -324,7 +325,14 @@ pub fn filter_cells(
     }
 
     // Case 3: fallback to scanpy
-    let sc = py.import("scanpy")?;
+    let sc = import_optional_with_hint(
+        py,
+        "scanpy",
+        EXTRA_SCANPY,
+        "pyscx.accel.filter_cells()",
+        "scanpy",
+        Some(BACKED_ESCAPE_HATCH),
+    )?;
     let kwargs = PyDict::new(py);
     if let Some(v) = min_genes {
         kwargs.set_item("min_genes", v)?;
@@ -493,7 +501,14 @@ pub fn filter_genes(
     }
 
     // Case 3: fallback to scanpy
-    let sc = py.import("scanpy")?;
+    let sc = import_optional_with_hint(
+        py,
+        "scanpy",
+        EXTRA_SCANPY,
+        "pyscx.accel.filter_genes()",
+        "scanpy",
+        Some(BACKED_ESCAPE_HATCH),
+    )?;
     let kwargs = PyDict::new(py);
     if let Some(v) = min_cells {
         kwargs.set_item("min_cells", v)?;

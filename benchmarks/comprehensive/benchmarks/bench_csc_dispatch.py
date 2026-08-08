@@ -65,6 +65,16 @@ except ImportError:
 # this from SLURM_CPUS_PER_TASK by default; passed explicitly for determinism.
 _PSEUDOBULK_N_CPUS = pseudobulk_n_cpus_cap()
 
+# Pinned, not left to the default. This variant exists to catch a silent
+# CSC→CSR dispatch fallback, and it does so by reading
+# `uns["scx_accel"]["pseudobulk_dex"]["route"]` and expecting `cpu_csc` /
+# `cpu_csr`. Since v0.13 the default backend is `"nb_glm"`, whose route string
+# names the *engine* (`cpu_nb_glm`) rather than the layout — leaving the gate
+# comparing `cpu_nb_glm` against `cpu_nb_glm` for both arms, which can never
+# fail. (The layout is still reported on that route, in `csc_available`; this
+# pin keeps the gate measuring the same thing it always did.)
+_PSEUDOBULK_BACKEND = "pydeseq2"
+
 # Per-dataset cache for the converted CSC-equipped SCX file. Keyed by
 # `(dataset.name, csc_cols_per_shard)`.
 _csc_path_cache: dict[tuple[str, int], Path] = {}
@@ -251,6 +261,7 @@ def _run_pseudobulk(adata: Any, prefer: str) -> None:
             prefer_format="csc",
             gene_indices=gene_indices,
             n_cpus=_PSEUDOBULK_N_CPUS,
+            backend=_PSEUDOBULK_BACKEND,
         )
     else:
         pyscx.accel.pseudobulk_dex(
@@ -260,6 +271,7 @@ def _run_pseudobulk(adata: Any, prefer: str) -> None:
             reference,
             prefer_format="csr",
             n_cpus=_PSEUDOBULK_N_CPUS,
+            backend=_PSEUDOBULK_BACKEND,
         )
 
 

@@ -56,6 +56,13 @@ logger = logging.getLogger(__name__)
 # the worker env is propagated, and never exceeds 8.
 _PSEUDOBULK_N_CPUS = pseudobulk_n_cpus_cap()
 
+# Every pseudobulk check here validates pyscx against a *manual pydeseq2*
+# reference, so the engine is pinned rather than inherited from the default
+# (which became "nb_glm" in v0.13). NB-GLM is DESeq2-style, not
+# DESeq2-identical, so leaving it to the default would turn these into
+# cross-engine comparisons that are expected to disagree.
+_PSEUDOBULK_BACKEND = "pydeseq2"
+
 
 # ---------------------------------------------------------------------------
 # Data preparation
@@ -464,6 +471,9 @@ def check_pseudobulk_dex(adata_raw) -> ValidationCheck:
             reference=reference,
             min_cells_per_group=5,
             n_cpus=_PSEUDOBULK_N_CPUS,
+            # This check compares against a manual pydeseq2 run, so it must
+            # pin the pydeseq2 engine; the default is NB-GLM since v0.13.
+            backend=_PSEUDOBULK_BACKEND,
         )
     except Exception as e:
         return ValidationCheck(
@@ -532,6 +542,8 @@ def check_pseudobulk_dex_stratified(adata_raw) -> ValidationCheck:
             min_cells_per_group=3,
             min_cells_per_stratum=10,
             n_cpus=_PSEUDOBULK_N_CPUS,
+            # `stratify_by` is pydeseq2-only since the default flipped.
+            backend=_PSEUDOBULK_BACKEND,
         )
 
         # Manual per-stratum loop
@@ -549,6 +561,9 @@ def check_pseudobulk_dex_stratified(adata_raw) -> ValidationCheck:
                     reference=reference,
                     min_cells_per_group=3,
                     n_cpus=_PSEUDOBULK_N_CPUS,
+                    # Same engine as the stratified arm above, or the
+                    # comparison measures the engines, not the stratification.
+                    backend=_PSEUDOBULK_BACKEND,
                 )
                 if res is not None and len(res) > 0:
                     res["stratum"] = stratum

@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::RecordBatch;
-use pyo3::exceptions::{PyImportError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use scx_codec::CodecId;
@@ -41,12 +41,13 @@ use crate::to_pyerr;
 /// missing. The dependency is optional — pyscx as a whole works
 /// without it; only the multimodal API requires it.
 fn import_mudata(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
-    py.import("mudata").map_err(|_| {
-        PyImportError::new_err(
-            "the `mudata` package is required for pyscx multimodal I/O. \
-             Install it with `pip install mudata`.",
-        )
-    })
+    crate::optional_deps::import_optional(
+        py,
+        "mudata",
+        crate::optional_deps::EXTRA_MUDATA,
+        "pyscx multimodal I/O (from_mudata / to_mudata)",
+        "mudata",
+    )
 }
 
 /// Convenience: same heuristic as the CLI's `h5mu/pipeline.rs` but

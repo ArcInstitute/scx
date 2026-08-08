@@ -127,8 +127,10 @@ uv venv .venv
 # `maturin[patchelf]` bundles the `patchelf` binary; without it, every
 # `maturin develop` prints "Failed to set rpath for libpyscx.so" as a
 # non-fatal warning.
+# `scikit-misc` and `pydeseq2` are optional at runtime but the test suite
+# imports both (the seurat_v3 HVG loess and the pydeseq2 DE backend).
 uv pip install 'maturin[patchelf]' pytest numpy scipy pyarrow anndata scanpy \
-    scikit-learn leidenalg python-dotenv
+    scikit-misc pydeseq2 scikit-learn leidenalg python-dotenv
 
 # Put the venv's bin/ on PATH so `maturin develop` (invoked below via the
 # explicit `.venv/bin/maturin` path) can find the `patchelf` binary that

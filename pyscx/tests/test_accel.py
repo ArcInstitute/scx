@@ -918,7 +918,8 @@ class TestDeFrameDefaultContainer:
         )
 
         # An explicit polars request still fails loudly, naming the extra.
-        with pytest.raises(RuntimeError, match=r"pyscx\[eval\]"):
+        # ImportError-derived, so `except ImportError` catches it.
+        with pytest.raises(ImportError, match=r"pyscx\[eval\]"):
             pyscx.accel.rank_genes_groups_df(adata, "pert", output="polars")
 
 
@@ -1095,22 +1096,19 @@ class TestPseudobulkDex:
                     f"Expected 10 cells for {pert}/{donor}, got {mask.sum()}"
                 )
 
-        # Now run pseudobulk_dex (which calls Rust aggregation internally)
-        try:
-            result = pyscx.accel.pseudobulk_dex(
-                adata,
-                groupby=["perturbation", "donor"],
-                test_col="perturbation",
-                reference="control",
-                min_cells_per_group=1,
-            )
-            # If pydeseq2 succeeded, result is a DataFrame
-            assert len(result) > 0
-            assert "gene" in result.columns
-        except RuntimeError as e:
-            if "pydeseq2" in str(e).lower():
-                pytest.skip("pydeseq2 not installed")
-            raise
+        # Now run pseudobulk_dex (which calls Rust aggregation internally).
+        # The default backend is the dependency-free NB-GLM, so this no
+        # longer needs a pydeseq2 escape hatch — and the assertions were
+        # always about the Rust aggregation, not the DE engine.
+        result = pyscx.accel.pseudobulk_dex(
+            adata,
+            groupby=["perturbation", "donor"],
+            test_col="perturbation",
+            reference="control",
+            min_cells_per_group=1,
+        )
+        assert len(result) > 0
+        assert "gene" in result.columns
 
     def test_full_pipeline(self, perturbation_adata):
         """Full pseudobulk DE pipeline should produce correct results."""
@@ -1129,6 +1127,10 @@ class TestPseudobulkDex:
             test_col="perturbation",
             reference="control",
             min_cells_per_group=1,
+            # Pinned: this is the pydeseq2 bridge's end-to-end test, and
+            # the skip above promises that is what runs. Without the pin
+            # it would gate on pydeseq2 while exercising NB-GLM.
+            backend="pydeseq2",
         )
 
         # Should be a DataFrame with expected columns
@@ -1163,12 +1165,11 @@ class TestPseudobulkDex:
         assert (result["pvalue"] <= 1).all()
 
     def test_backed_mode(self, perturbation_adata, scx_from_adata):
-        """Pseudobulk DE should work from backed SCX (streaming aggregation)."""
-        try:
-            import pydeseq2  # noqa: F401
-        except ImportError:
-            pytest.skip("pydeseq2 not installed")
+        """Pseudobulk DE should work from backed SCX (streaming aggregation).
 
+        Runs on the default backend: this is a test of the streaming
+        aggregation, which is shared by both DE engines.
+        """
         import pyscx
 
         path = scx_from_adata(perturbation_adata, "perturbation.scx")
@@ -1191,12 +1192,11 @@ class TestPseudobulkDex:
         assert gene0["log2FoldChange"].values[0] > 0
 
     def test_backed_matches_inmemory(self, perturbation_adata, scx_from_adata):
-        """Backed streaming aggregation should produce same DE results as in-memory."""
-        try:
-            import pydeseq2  # noqa: F401
-        except ImportError:
-            pytest.skip("pydeseq2 not installed")
+        """Backed streaming aggregation should produce same DE results as in-memory.
 
+        Runs on the default backend — the claim is agreement between two
+        input layouts, which is engine-independent.
+        """
         import pyscx
 
         path = scx_from_adata(perturbation_adata, "perturbation_cmp.scx")
@@ -1697,6 +1697,9 @@ class TestStratifiedDE:
                 test_col="perturbation",
                 reference="control",
                 stratify_by=["perturbation"],  # collides with test_col
+                # stratify_by is pydeseq2-only; without this the nb_glm
+                # default rejects the call before the collision check runs.
+                backend="pydeseq2",
             )
 
     def test_stratified_pseudobulk_dex_matches_manual(self):
@@ -1746,6 +1749,9 @@ class TestStratifiedDE:
             min_cells_per_group=1,
             stratify_by=["cell_type"],
             min_cells_per_stratum=10,
+            # The stratified path is the pydeseq2 backend's; nb_glm (now the
+            # default) takes replicates as rows of one design instead.
+            backend="pydeseq2",
         )
 
         assert "cell_type" in result.columns
@@ -1768,6 +1774,10 @@ class TestStratifiedDE:
                 test_col="perturbation",
                 reference="control",
                 min_cells_per_group=1,
+                # Must match the stratified arm above: the claim is that
+                # `stratify_by` equals a manual per-stratum loop, which only
+                # means anything when both run the same DE engine.
+                backend="pydeseq2",
             )
             df["cell_type"] = ct
             manual_frames.append(df)

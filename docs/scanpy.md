@@ -2664,9 +2664,9 @@ print(result.sort_values("padj").head(20))
 | `test_col` | (required) | Which of those columns holds the condition to compare |
 | `reference` | (required) | Reference level in `test_col` (e.g., `"control"`) |
 | `design` | `"~ test_col"` | DESeq2 design formula (auto-generated if not specified) |
-| `aggr_method` | `"sum"` | Aggregation method: `"sum"` or `"mean"` |
+| `aggr_method` | `"sum"` | Aggregation method: `"sum"` or `"mean"`. `"mean"` requires `backend="pydeseq2"` — the negative-binomial count model is defined on summed replicate counts |
 | `min_cells_per_group` | 10 | Groups with fewer cells are excluded |
-| `backend` | `"pydeseq2"` | DE engine: `"pydeseq2"` or `"nb_glm"` (Rust-native NB-GLM, no pydeseq2 dependency — see [§ NB-GLM backend](#nb-glm-backend-rust-native-pseudobulk-de)). Both emit the same column schema. |
+| `backend` | `"nb_glm"` | DE engine: `"nb_glm"` (Rust-native NB-GLM, no optional dependency — see [§ NB-GLM backend](#nb-glm-backend-rust-native-pseudobulk-de)) or `"pydeseq2"` (exact DESeq2 numerics; needs `pip install 'pyscx[pydeseq2]'`). Both emit the same column schema. Defaulted to `"pydeseq2"` through v0.12. |
 
 ### Stratified Differential Expression
 
@@ -2724,10 +2724,11 @@ not collide with `groupby` or `test_col`.
 > writes to `adata.uns["rank_genes_groups"]` as usual and returns `None`.
 
 > [!NOTE]
-> `pydeseq2` is an **optional** runtime dependency. Install with
-> `pip install pydeseq2` before calling `pseudobulk_dex()` with the default
-> `backend="pydeseq2"`. The `backend="nb_glm"` path (below) has **no** pydeseq2
-> dependency.
+> `pydeseq2` is an **optional** runtime dependency, and since v0.13 it is no
+> longer on the default path: `pseudobulk_dex()` defaults to `backend="nb_glm"`
+> (below), which needs nothing extra. Reach for `backend="pydeseq2"` when you
+> need exact DESeq2 numerics, `stratify_by=`, or `aggr_method="mean"` — and
+> install it with `pip install 'pyscx[pydeseq2]'`.
 
 ### NB-GLM backend (Rust-native pseudobulk DE)
 

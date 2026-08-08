@@ -8,6 +8,7 @@ use pyo3::types::PyDict;
 
 use crate::backed::{detached, ScxBackedSparseDataset};
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
+use crate::optional_deps::{import_optional_with_hint, BACKED_ESCAPE_HATCH, EXTRA_SCANPY};
 use crate::projected_agg;
 
 // Fusion marker key stashed on `adata.uns` by `normalize_total(device="gpu")`
@@ -293,7 +294,14 @@ pub fn normalize_total(
     }
 
     // Case 3: X is a regular scipy sparse or dense — delegate to scanpy
-    let sc = py.import("scanpy")?;
+    let sc = import_optional_with_hint(
+        py,
+        "scanpy",
+        EXTRA_SCANPY,
+        "pyscx.accel.normalize_total()",
+        "scanpy",
+        Some(BACKED_ESCAPE_HATCH),
+    )?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("target_sum", target_sum)?;
     sc.getattr("pp")?
@@ -443,7 +451,14 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
     }
 
     // Case 3: X is a regular scipy sparse or dense — delegate to scanpy
-    let sc = py.import("scanpy")?;
+    let sc = import_optional_with_hint(
+        py,
+        "scanpy",
+        EXTRA_SCANPY,
+        "pyscx.accel.log1p()",
+        "scanpy",
+        Some(BACKED_ESCAPE_HATCH),
+    )?;
     sc.getattr("pp")?.call_method1("log1p", (adata,))?;
     route.commit();
     Ok(())
@@ -572,7 +587,14 @@ pub fn calculate_qc_metrics<'py>(
                  or ScxLazyTransformedDataset (got scipy/dense)",
             ));
         }
-        let sc = py.import("scanpy")?;
+        let sc = import_optional_with_hint(
+            py,
+            "scanpy",
+            EXTRA_SCANPY,
+            "pyscx.accel.calculate_qc_metrics()",
+            "scanpy",
+            Some(BACKED_ESCAPE_HATCH),
+        )?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("inplace", inplace)?;
         kwargs.set_item("log1p", log1p)?;
@@ -930,7 +952,14 @@ fn gpu_normalize_total(
         // fallback so the silent-fallback regression that the 2026-05-21
         // dogfood report flagged (B4) cannot recur.
         emit_gpu_normalize_fallback_warning(py, device)?;
-        let sc = py.import("scanpy")?;
+        let sc = import_optional_with_hint(
+            py,
+            "scanpy",
+            EXTRA_SCANPY,
+            "pyscx.accel.normalize_total()",
+            "scanpy",
+            Some(BACKED_ESCAPE_HATCH),
+        )?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("target_sum", target_sum)?;
         sc.getattr("pp")?
@@ -1073,7 +1102,14 @@ fn gpu_log1p_dispatch(
     // 3) Scipy/dense X: GPU dispatch is slower than CPU here (H→D + D→H
     //    copies dominate log1p's trivial math). Warn and fall back to scanpy.
     emit_gpu_log1p_fallback_warning(py, device)?;
-    let sc = py.import("scanpy")?;
+    let sc = import_optional_with_hint(
+        py,
+        "scanpy",
+        EXTRA_SCANPY,
+        "pyscx.accel.log1p()",
+        "scanpy",
+        Some(BACKED_ESCAPE_HATCH),
+    )?;
     sc.getattr("pp")?.call_method1("log1p", (adata,))?;
     Ok(())
 }
