@@ -8,6 +8,8 @@ Validates:
 - Error cases
 """
 
+import re
+
 import numpy as np
 import pytest
 
@@ -949,6 +951,230 @@ def test_from_anndata_uns_indirect_cycle_raises(tmp_dir):
 
     with pytest.raises(ValueError, match=r"circular reference detected"):
         pyscx.from_anndata(adata, str(tmp_dir / "cyclic_indirect.scx"))
+
+
+# --------------------------------------------------------------------------
+# uns nesting depth
+#
+# Cycle detection is by object identity, which says nothing about a merely
+# *deep* tree: `[[[[...]]]]` passes the cycle guard and then recurses until the
+# Rust stack is gone. That is a SIGSEGV, not a Python exception, so nothing
+# below can be written as a plain in-process assertion until the cap exists.
+#
+# A second, quieter half of the same defect needs no crash at all: serde_json's
+# serializer has no depth limit while its parser stops at 127 levels, so an
+# uncapped writer emits `uns` sections that no reader can ever take back.
+# Measured before the fix, on this fixture: 125 nested lists round-tripped,
+# 126 wrote successfully and then failed to read with "recursion limit
+# exceeded"; in tagged mode, where each tuple costs two JSON levels, the
+# boundary was 62 tuples.
+# --------------------------------------------------------------------------
+
+
+def _nested_lists(depth):
+    """Exactly `depth` nested lists around a scalar leaf."""
+    cur = "leaf"
+    for _ in range(depth):
+        cur = [cur]
+    return cur
+
+
+def _nested_tuples(depth):
+    """Exactly `depth` nested tuples around a scalar leaf.
+
+    The worst case for the cap: under `uns_format="tagged"` a tuple is written
+    as `{"__scx_type__": "tuple", "data": [...]}`, so one Python container
+    costs *two* JSON levels and the parser's ceiling is reached twice as fast.
+    """
+    cur = "leaf"
+    for _ in range(depth):
+        cur = (cur,)
+    return cur
+
+
+def _uns_depth(value):
+    """Container levels in a decoded `uns` value."""
+    if isinstance(value, dict):
+        return 1 + max((_uns_depth(v) for v in value.values()), default=0)
+    if isinstance(value, (list, tuple)):
+        return 1 + max((_uns_depth(v) for v in value), default=0)
+    return 0
+
+
+def _probe_max_uns_depth(tmp_dir):
+    """The cap, read back out of the error message.
+
+    Deliberately not a literal. `MAX_UNS_DEPTH` lives in Rust, and a test that
+    hardcoded 60 here would go on asserting 60 after someone raised it —
+    passing while pinning the wrong boundary.
+    """
+    import pyscx
+
+    adata = _adata_with_uns({"probe": _nested_lists(500)})
+    with pytest.raises(ValueError) as exc:
+        pyscx.from_anndata(adata, str(tmp_dir / "probe.scx"))
+    match = re.search(r"maximum of (\d+) levels", str(exc.value))
+    assert match, f"depth error must name its limit, got: {exc.value}"
+    return int(match.group(1))
+
+
+def test_from_anndata_uns_deeply_nested_raises(tmp_dir):
+    """Deep-but-acyclic `uns` raises ValueError instead of overflowing.
+
+    Before the cap this wrote without complaint at this depth (the overflow
+    needs ~20k+, and killed the interpreter rather than raising), leaving a
+    file whose `uns` section no reader could parse.
+    """
+    import pyscx
+
+    adata = _adata_with_uns({"top": {"bomb": _nested_lists(1000)}})
+
+    with pytest.raises(ValueError, match=r"deeper than the maximum of \d+ levels"):
+        pyscx.from_anndata(adata, str(tmp_dir / "deep.scx"))
+
+
+def test_from_anndata_uns_depth_error_names_the_key_path(tmp_dir):
+    """The error locates the offending key, not just the fact of a depth."""
+    import pyscx
+
+    adata = _adata_with_uns({"harmless": 1, "guilty": _nested_lists(1000)})
+
+    with pytest.raises(ValueError, match=r"uns\['guilty'\]"):
+        pyscx.from_anndata(adata, str(tmp_dir / "deep_path.scx"))
+
+
+def test_uns_at_max_depth_round_trips_but_one_deeper_raises(tmp_dir):
+    """The cap admits exactly what the reader can take back.
+
+    The load-bearing test for the *value* of `MAX_UNS_DEPTH`: nested tuples in
+    tagged mode are the 2x-amplifying worst case, so if the cap were set from
+    the Python depth alone (the review suggested ~256) this write would
+    succeed and the read would fail with "recursion limit exceeded".
+    """
+    import pyscx
+
+    cap = _probe_max_uns_depth(tmp_dir)
+
+    # The `uns` dict is itself container level 1, so the deepest legal payload
+    # is `cap - 1` tuples below it.
+    ok = _adata_with_uns({"deep": _nested_tuples(cap - 1)})
+    path = str(tmp_dir / "at_cap.scx")
+    pyscx.from_anndata(ok, path, uns_format="tagged")
+    back = pyscx.open(path).to_anndata()
+    assert _uns_depth(back.uns["deep"]) == cap - 1
+
+    too_deep = _adata_with_uns({"deep": _nested_tuples(cap)})
+    with pytest.raises(ValueError, match=r"deeper than the maximum"):
+        pyscx.from_anndata(too_deep, str(tmp_dir / "over_cap.scx"), uns_format="tagged")
+
+
+def test_from_anndata_uns_object_array_of_deep_list_raises(tmp_dir):
+    """An object-dtype ndarray reaches a *different* walker, also capped.
+
+    `encode_ndarray_tagged` hands object arrays to `pylist_to_string_json_array`,
+    which never passes through `normalize_uns_value`'s guard — so a cap on the
+    container recursion alone leaves this path overflowing. Verified pre-fix:
+    this shape SIGSEGV'd at depth 50000 exactly like the plain-list one.
+    """
+    import pyscx
+
+    arr = np.empty(1, dtype=object)
+    arr[0] = _nested_lists(1000)
+    adata = _adata_with_uns({"objarr": arr})
+
+    with pytest.raises(ValueError, match=r"deeper than the maximum"):
+        pyscx.from_anndata(adata, str(tmp_dir / "deep_objarr.scx"), uns_format="tagged")
+
+
+def test_structured_array_object_field_holding_a_deep_list_raises(tmp_dir):
+    """Third walker: `pylist_to_json_leaf`, reached only via a recarray.
+
+    A structured dtype with an object field routes each field through
+    `pylist_to_json_leaf` rather than `pylist_to_string_json_array`, so neither
+    the container guard nor the object-ndarray test above covers it. Added
+    after a review credited the test matrix with covering every walker — it
+    did not, and this is one of the three it missed.
+    """
+    import pyscx
+
+    arr = np.empty(1, dtype=[("names", "O"), ("score", "f4")])
+    arr["names"][0] = _nested_lists(1000)
+    adata = _adata_with_uns({"rec": arr})
+
+    with pytest.raises(ValueError, match=r"deeper than the maximum"):
+        pyscx.from_anndata(adata, str(tmp_dir / "deep_recarray.scx"), uns_format="tagged")
+
+
+def test_deeply_nested_structured_dtype_raises(tmp_dir):
+    """Fourth walker: `pytuple_descr_to_json`, over `dtype.descr`.
+
+    numpy will happily nest sub-record dtypes arbitrarily deep, and the descr
+    walk is recursive over that nesting — independent of how much *data* the
+    array holds. A 1-element array is enough to blow it up.
+    """
+    import pyscx
+
+    dtype = np.dtype([("leaf", "i4")])
+    for i in range(80):
+        dtype = np.dtype([(f"l{i}", dtype)])
+    adata = _adata_with_uns({"nested_dt": np.zeros(1, dtype=dtype)})
+
+    with pytest.raises(ValueError, match=r"deeper than the maximum"):
+        pyscx.from_anndata(adata, str(tmp_dir / "deep_dtype.scx"), uns_format="tagged")
+
+
+def test_set_uns_rejects_deep_nesting(tmp_dir):
+    """The in-place uns surfaces are capped too.
+
+    `set_uns` takes a raw user dict with no AnnData in between, so it reaches
+    the same walker with the fewest steps of anything in the API.
+    """
+    import pyscx
+
+    path = str(tmp_dir / "set_uns.scx")
+    pyscx.from_anndata(_adata_with_uns({"ok": 1}), path)
+
+    with pytest.raises(ValueError, match=r"deeper than the maximum"):
+        pyscx.set_uns(path, {"bomb": _nested_lists(1000)})
+
+
+def test_from_h5ad_deep_uns_group_chain_does_not_crash(tmp_dir):
+    """An h5ad someone else wrote cannot take the process down.
+
+    This arm involves no pyscx write path at all: `scx-convert`'s h5ad reader
+    builds its JSON straight from the HDF5 group tree, so serde_json's parser
+    limit never applies. Verified pre-fix: a 30000-deep `/uns` chain SIGSEGV'd
+    `read_h5ad_metadata` before any conversion started.
+
+    The depth error travels the ordinary `strict_uns` route, so the default is
+    a skipped key with a warning rather than a refused file — one pathological
+    key should not make an otherwise fine dataset unconvertible.
+    """
+    import anndata
+    import h5py
+    import pyscx
+    import scipy.sparse as sp
+
+    h5_path = str(tmp_dir / "deep_uns.h5ad")
+    anndata.AnnData(
+        X=sp.csr_matrix(np.zeros((2, 2), dtype=np.float32))
+    ).write_h5ad(h5_path)
+    with h5py.File(h5_path, "a") as f:
+        group = f.require_group("uns").require_group("bomb")
+        for i in range(500):
+            group = group.require_group(f"g{i}")
+        group.create_dataset("leaf", data=np.int64(1))
+
+    cap = _probe_max_uns_depth(tmp_dir)
+
+    meta = pyscx.read_h5ad_metadata(h5_path)
+    assert _uns_depth(meta.uns) <= cap
+
+    out = str(tmp_dir / "deep_uns.scx")
+    pyscx.from_h5ad(h5_path, out)
+    # The truncated tree must still be readable — the point of tying the
+    # ingest cap to the same constant the writer uses.
+    assert _uns_depth(pyscx.open(out).to_anndata().uns) <= cap
 
 
 def test_from_anndata_uns_oversized_int_raises(tmp_dir):

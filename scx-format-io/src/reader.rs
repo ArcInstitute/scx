@@ -1978,7 +1978,7 @@ impl ScxReader {
             .get(&section_name)
             .ok_or_else(|| ScxError::SectionNotFound(section_name))?;
         let bytes = self.section_bytes(entry)?;
-        Ok(serde_json::from_slice(bytes)?)
+        scx_format::parse_uns_json(bytes)
     }
 
     fn modality_name_for_id(&self, modality_id: u8) -> Result<String> {
@@ -3195,7 +3195,7 @@ impl ScxReader {
             .get("uns")
             .ok_or_else(|| ScxError::SectionNotFound("uns".to_string()))?;
         let slice = self.section_bytes(entry)?;
-        Ok(serde_json::from_slice(slice)?)
+        scx_format::parse_uns_json(slice)
     }
 
     // -----------------------------------------------------------------------
