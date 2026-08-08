@@ -657,6 +657,10 @@ impl ScxWriter {
 
     /// Write the uns (unstructured) section as JSON.
     pub fn write_uns(&mut self, json: &serde_json::Value) -> Result<()> {
+        // Last gate before the bytes exist: `serde_json::to_vec` has no depth
+        // limit while the parser stops at 127 levels, so without this a caller
+        // could store a section no reader — including ours — can take back.
+        scx_format::validate_uns_depth(json)?;
         let data = serde_json::to_vec(json)?;
         self.write_section_bytes("uns", SectionType::UnsBlob, &data, None)
     }
@@ -2086,6 +2090,7 @@ impl ScxWriter {
     pub fn write_uns_for(&mut self, modality_id: u8, json: &serde_json::Value) -> Result<()> {
         let mname = self.modality_name_for(modality_id)?;
         let name = format!("uns/{mname}");
+        scx_format::validate_uns_depth(json)?;
         let data = serde_json::to_vec(json)?;
         self.with_modality(modality_id, |this| {
             this.write_section_bytes(name, SectionType::UnsBlob, &data, None)

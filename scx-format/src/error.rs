@@ -226,7 +226,14 @@ impl ScxError {
             | ScxError::ColumnStatsOverflow(_)
             | ScxError::UnsupportedColumnType { .. }
             | ScxError::DuplicateSection { .. }
-            | ScxError::ObsLayoutConflict { .. } => ScxErrorClass::Validation,
+            | ScxError::ObsLayoutConflict { .. }
+            // Deliberately NOT `CorruptFile`: the file is intact and was
+            // written by an *older*, uncapped SCX, so the binding's
+            // "appears corrupt or was written by an incompatible version;
+            // re-run conversion" suffix would contradict this variant's own
+            // (accurate) guidance. A writer-side inconsistency, which is what
+            // `Validation` is for.
+            | ScxError::UnsTooDeep { .. } => ScxErrorClass::Validation,
             // File is corrupt or was written by an incompatible/newer SCX:
             // bad magic/version/endian/checksum/catalog, an unknown on-disk
             // codec / value-encoding / section / shard-type byte, or an
@@ -251,7 +258,6 @@ impl ScxError {
             | ScxError::SectionOutOfBounds { .. }
             | ScxError::AllocationTooLarge { .. }
             | ScxError::InvalidBlockIndex(_)
-            | ScxError::UnsTooDeep { .. }
             | ScxError::ColumnStatsShardCountMismatch { .. } => ScxErrorClass::CorruptFile,
             ScxError::Io(io_err) => ScxErrorClass::Io(io_err.kind()),
             // Wrapped lower-level errors and genuine runtime failures.

@@ -1101,6 +1101,77 @@ fn deep_uns_group_chain_is_bounded_not_a_stack_overflow() {
 }
 
 #[test]
+fn scx_uns_between_the_write_cap_and_the_read_ceiling_still_exports_to_h5ad() {
+    // The producer/consumer asymmetry, exercised end to end rather than only
+    // at the constant layer. `pyscx` writers stop at MAX_UNS_DEPTH (60), but a
+    // file written by an older uncapped SCX — or by `scx-ops` merge, whose
+    // `Namespace` policy wraps each input in one extra level — can legally sit
+    // above it and still parse. Binding the *exporter* to the producer cap
+    // would make such a file suddenly unexportable, so it stops at
+    // SERDE_JSON_MAX_NESTING (127) instead. 100 is in that window.
+    use scx_format_io::writer::ScxWriter;
+    use scx_format_io::{FileHeader, MAX_UNS_DEPTH, SERDE_JSON_MAX_NESTING};
+
+    let nest = |n: usize| {
+        let mut v = serde_json::json!("leaf");
+        for i in 0..n {
+            v = serde_json::json!({ format!("g{i}"): v });
+        }
+        serde_json::json!({ "deep": v })
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let scx = dir.path().join("deep_uns.scx");
+    let n_obs = 4usize;
+
+    let depth = 100;
+    assert!(depth > MAX_UNS_DEPTH && depth < SERDE_JSON_MAX_NESTING);
+
+    let mut w = ScxWriter::new(&scx, FileHeader::new_single_modality(4, 2, 0, 4, 0, 0)).unwrap();
+    w.write_uns(&nest(depth - 1)).unwrap();
+    w.write_csr_shard(
+        &vec![0u64; n_obs + 1],
+        &[],
+        &[],
+        CodecId::None,
+        ValueEncoding::Uint8,
+        0,
+    )
+    .unwrap();
+    w.finish().unwrap();
+
+    // It reads back...
+    let reader = ScxReader::open(&scx).unwrap();
+    reader.read_uns().expect("a sub-127 uns must parse");
+    drop(reader);
+
+    // ...and it exports.
+    let h5ad = dir.path().join("deep_uns.h5ad");
+    crate::h5ad::write::write_scx_to_h5ad(&scx, &h5ad, &mut WarningSink::log())
+        .expect("an uns above the write cap but below the read ceiling must still export");
+    {
+        let f = hdf5::File::open(&h5ad).unwrap();
+        assert!(f.group("uns/deep/g98").is_ok(), "the chain must survive");
+    }
+
+    // And the writer refuses to store what no reader could take back, which is
+    // what keeps the exporter's 127 a safe ceiling rather than a hopeful one.
+    let too_deep = nest(SERDE_JSON_MAX_NESTING + 50);
+    let mut w2 = ScxWriter::new(
+        &dir.path().join("over.scx"),
+        FileHeader::new_single_modality(4, 2, 0, 4, 0, 0),
+    )
+    .unwrap();
+    let err = w2
+        .write_uns(&too_deep)
+        .expect_err("write_uns must reject an unreadable uns");
+    assert!(
+        format!("{err}").contains("nests deeper"),
+        "expected an uns depth error, got: {err}"
+    );
+}
+
+#[test]
 fn phase1_streaming_dense_determinism() {
     // Re-running the streaming dense pipeline on the same fixture
     // must produce byte-identical output.

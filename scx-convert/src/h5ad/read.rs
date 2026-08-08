@@ -1827,7 +1827,9 @@ pub fn read_uns(
     for name in &member_names {
         // Depth 1: the `/uns` group itself is the first container level, so
         // the budget here matches the one `pyscx` spends on the `uns` dict.
-        match read_uns_entry(&uns_group, name, strict_uns, sink, 1) {
+        // `key_path` accumulates `bomb/g0/g1/...` so a depth error names the
+        // top-level key the user can actually act on, not just the leaf group.
+        match read_uns_entry(&uns_group, name, strict_uns, sink, 1, name) {
             Ok(value) => {
                 map.insert(name.clone(), value);
             }
@@ -2012,6 +2014,7 @@ fn read_uns_entry(
     strict_uns: bool,
     sink: &mut WarningSink,
     depth: usize,
+    key_path: &str,
 ) -> Result<serde_json::Value, ConvertError> {
     // Try reading as dataset first
     if let Ok(ds) = group.dataset(name) {
@@ -2236,14 +2239,15 @@ fn read_uns_entry(
         // a failed conversion.
         if depth >= MAX_UNS_DEPTH {
             return Err(ConvertError::UnsTooDeep {
-                path: name.to_string(),
+                path: key_path.to_string(),
                 max_depth: MAX_UNS_DEPTH,
             });
         }
         let sub_members = subgroup.member_names()?;
         let mut sub_map = serde_json::Map::new();
         for sub_name in &sub_members {
-            match read_uns_entry(&subgroup, sub_name, strict_uns, sink, depth + 1) {
+            let sub_path = format!("{key_path}/{sub_name}");
+            match read_uns_entry(&subgroup, sub_name, strict_uns, sink, depth + 1, &sub_path) {
                 Ok(v) => {
                     sub_map.insert(sub_name.clone(), v);
                 }
@@ -2252,7 +2256,7 @@ fn read_uns_entry(
                         return Err(e);
                     }
                     sink.emit(ConvertWarning::SkippedUnsKey {
-                        key: format!("{name}/{sub_name}"),
+                        key: sub_path.clone(),
                         reason: e.to_string(),
                     });
                 }

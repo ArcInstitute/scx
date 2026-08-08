@@ -1086,6 +1086,43 @@ def test_from_anndata_uns_object_array_of_deep_list_raises(tmp_dir):
         pyscx.from_anndata(adata, str(tmp_dir / "deep_objarr.scx"), uns_format="tagged")
 
 
+def test_structured_array_object_field_holding_a_deep_list_raises(tmp_dir):
+    """Third walker: `pylist_to_json_leaf`, reached only via a recarray.
+
+    A structured dtype with an object field routes each field through
+    `pylist_to_json_leaf` rather than `pylist_to_string_json_array`, so neither
+    the container guard nor the object-ndarray test above covers it. Added
+    after a review credited the test matrix with covering every walker — it
+    did not, and this is one of the three it missed.
+    """
+    import pyscx
+
+    arr = np.empty(1, dtype=[("names", "O"), ("score", "f4")])
+    arr["names"][0] = _nested_lists(1000)
+    adata = _adata_with_uns({"rec": arr})
+
+    with pytest.raises(ValueError, match=r"deeper than the maximum"):
+        pyscx.from_anndata(adata, str(tmp_dir / "deep_recarray.scx"), uns_format="tagged")
+
+
+def test_deeply_nested_structured_dtype_raises(tmp_dir):
+    """Fourth walker: `pytuple_descr_to_json`, over `dtype.descr`.
+
+    numpy will happily nest sub-record dtypes arbitrarily deep, and the descr
+    walk is recursive over that nesting — independent of how much *data* the
+    array holds. A 1-element array is enough to blow it up.
+    """
+    import pyscx
+
+    dtype = np.dtype([("leaf", "i4")])
+    for i in range(80):
+        dtype = np.dtype([(f"l{i}", dtype)])
+    adata = _adata_with_uns({"nested_dt": np.zeros(1, dtype=dtype)})
+
+    with pytest.raises(ValueError, match=r"deeper than the maximum"):
+        pyscx.from_anndata(adata, str(tmp_dir / "deep_dtype.scx"), uns_format="tagged")
+
+
 def test_set_uns_rejects_deep_nesting(tmp_dir):
     """The in-place uns surfaces are capped too.
 
