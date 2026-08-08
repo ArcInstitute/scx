@@ -275,6 +275,32 @@ def test_modify_metadata_index_var_does_not_switch_off_the_obs_carry(tmp_dir):
     assert _matching(path, "grp == 'A'") == 200
 
 
+def test_modify_metadata_both_axes_replaced_both_carry(tmp_dir):
+    """Both axes replaced, neither named — both must carry independently.
+
+    The sibling test pins the *mixed* case (one carried, one explicitly
+    rebuilt). This is the other half: with per-axis policy, nothing should make
+    replacing var disturb the obs carry or vice versa.
+    """
+    path, _ = _indexed_multi_shard(
+        tmp_dir, index_obs=["grp", "n_counts"], index_var=["gene_id"]
+    )
+    exp = pyscx.open(path)
+    obs, var = exp.read_obs(), exp.read_var()
+
+    pyscx.modify_metadata(path, obs=obs, var=var)
+
+    sections = _sections(path)
+    assert "obs_predicate_index" in sections
+    assert "var_predicate_index" in sections
+    params = json.loads(pyscx.open(path).provenance()[-1]["params_json"])
+    assert params["predicate_index"]["obs_carried_forward"] is True
+    assert params["predicate_index"]["var_carried_forward"] is True
+    assert params["predicate_index"]["obs_columns"] == ["grp", "n_counts"]
+    assert params["predicate_index"]["var_columns"] == ["gene_id"]
+    assert _matching(path, "n_counts > 300") == 199
+
+
 def test_modify_metadata_accepts_a_pathlike(tmp_dir):
     """Every other path-taking entry point coerces `os.PathLike`; these two did
     not, so a `pathlib.Path` raised `TypeError: 'PosixPath' object is not an
