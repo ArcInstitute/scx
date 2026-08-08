@@ -60,10 +60,12 @@
   perplexity calibration loop never iterated, because every comparison against
   `NaN` is false. LISI of 1.0 means "perfectly unmixed", so the failure looked
   like a real batch-integration result. `perplexity` must now be finite.
-- `cache_shards` is clamped to the file's shard count. A large value
+- `cache_shards` is now clamped to `[1, max(<file's shard count>, 128)]` — the
+  default is never derated, so the ceiling only binds above 128. A large value
   (`cache_shards = 1e9`) reached `LruCache::new`, which pre-allocates a hash
   table of that capacity — tens of gigabytes, killing the R session with an
-  allocation abort rather than a catchable error.
+  allocation abort rather than a catchable error. Negative, `NaN` and fractional
+  values are now rejected instead of silently becoming 1.
 - `[` on `ScxBackedSparse` / `ScxLazyTransformed` now rejects non-finite row
   indices and truncates fractional ones, matching `dgCMatrix` (`M[1.9, ]` is
   row 1). The column index was already handed to Matrix, so one call

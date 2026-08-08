@@ -29,9 +29,11 @@ pub(crate) fn throw_on_err<T: Into<Robj>>(r: Result<T>) -> Robj {
     }
 }
 
-/// Largest `f64` below which every integer is exactly representable (2^53).
-/// Above it, consecutive integers are not distinguishable as doubles, so a
-/// value that large is a mistake rather than an addressable row.
+/// Largest integer, 2^53, up to and *including* which every integer is exactly
+/// representable as an `f64` (2^53 + 1 is the first that is not). Above it,
+/// consecutive integers are indistinguishable as doubles, so a value that large
+/// is a mistake rather than an addressable row — hence the guard is `v > this`,
+/// which accepts 2^53 itself.
 const MAX_EXACT_F64_INT: f64 = 9_007_199_254_740_992.0;
 
 /// Why `v` cannot be used as a whole, non-negative index or count — or `None`

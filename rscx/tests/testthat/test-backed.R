@@ -136,6 +136,32 @@ test_that("raw read methods reject indices `f64 as u64` would saturate", {
   expect_equal(nrow(bsd$read_rows(0, 0)), 0L)
 })
 
+test_that("cache_shards is validated and clamped rather than cast", {
+  path <- skip_if_no_fixture()
+  eager <- scx_open(path)$x_matrix()
+
+  # Negative / NaN / fractional used to saturate to 0 and then clamp to 1 --
+  # harmless but silent. Now they are errors.
+  expect_error(scx_backed_sparse(path, cache_shards = -1), "negative")
+  expect_error(scx_backed_sparse(path, cache_shards = NaN), "NA or NaN")
+  expect_error(scx_backed_sparse(path, cache_shards = 1.5), "non-integer")
+  expect_error(scx_open(path)$x_backed(cache_shards = -1), "negative")
+  expect_error(scx_lazy_transform(path, cache_shards = NaN), "NA or NaN")
+
+  # The one that mattered: an absurd request reached `LruCache::new`, which
+  # pre-allocates a hash table of that capacity -- tens of gigabytes, an
+  # allocation abort rather than a catchable R error. It is clamped, not
+  # rejected, and still reads correctly.
+  big <- scx_backed_sparse(path, cache_shards = 1e9)
+  expect_equal(as.matrix(big[1:5, ]), as.matrix(eager[1:5, , drop = FALSE]))
+
+  # 0 stays a legal "minimal cache" request (clamped up to 1), as documented.
+  expect_equal(
+    as.matrix(scx_backed_sparse(path, cache_shards = 0)[1:3, ]),
+    as.matrix(eager[1:3, , drop = FALSE])
+  )
+})
+
 test_that("`[` keeps Matrix's fractional-subscript semantics", {
   path <- skip_if_no_fixture()
   exp <- scx_open(path)
@@ -147,8 +173,14 @@ test_that("`[` keeps Matrix's fractional-subscript semantics", {
   # the column path truncated, one call would error on `i` and silently truncate
   # `j`. `[` therefore truncates; the raw `$read_*` methods stay strict.
   expect_equal(as.matrix(bsd[1.9, ]), as.matrix(eager[1, , drop = FALSE]))
-  expect_equal(as.matrix(bsd[c(1.9, 2.9, 3.9), ]), as.matrix(eager[1:3, , drop = FALSE]))
   expect_equal(as.matrix(bsd[c(1.2, 2.9), ]), as.matrix(eager[1:2, , drop = FALSE]))
+
+  # These two are the ones that pin `trunc(i)` running BEFORE the contiguity
+  # check. Both have `diff(i) == 1` exactly (verified: 2.9 - 1.9 is 1 in IEEE),
+  # so they take the range branch; untruncated they would reach the now-strict
+  # Rust layer as read_rows(0.9, 3.9) and raise "non-integer".
+  expect_equal(as.matrix(bsd[c(1.9, 2.9, 3.9), ]), as.matrix(eager[1:3, , drop = FALSE]))
+  expect_equal(as.matrix(bsd[c(1.5, 2.5), ]), as.matrix(eager[1:2, , drop = FALSE]))
   expect_equal(as.matrix(bsd[2.5, 1.9]), as.matrix(eager[2, 1, drop = FALSE]))
 
   # Non-finite subscripts are rejected in R, with R's spelling of Inf.
