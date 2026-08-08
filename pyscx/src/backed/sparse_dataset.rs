@@ -442,9 +442,13 @@ impl ScxBackedSparseDataset {
         self.set_col_projection(col_indices);
     }
 
+    /// Answered from a scalar cached at construction, so it never reaches
+    /// `section_bytes` and would otherwise keep reporting the row count the
+    /// file had before an `append` or a `mark_deleted`.
     #[getter]
-    pub(crate) fn shape(&self) -> (usize, usize) {
-        self.shape_val
+    pub(crate) fn shape(&self) -> PyResult<(usize, usize)> {
+        self.backed.check_fresh().map_err(crate::to_pyerr)?;
+        Ok(self.shape_val)
     }
 
     /// Phase B.5: optional modality_id tag. `None` for legacy
@@ -489,8 +493,9 @@ impl ScxBackedSparseDataset {
         self.non_negative
     }
 
-    pub(crate) fn __len__(&self) -> usize {
-        self.shape_val.0
+    pub(crate) fn __len__(&self) -> PyResult<usize> {
+        self.backed.check_fresh().map_err(crate::to_pyerr)?;
+        Ok(self.shape_val.0)
     }
 
     pub(crate) fn __repr__(&self) -> String {

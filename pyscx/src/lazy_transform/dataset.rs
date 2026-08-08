@@ -897,9 +897,13 @@ impl ScxLazyTransformedDataset {
 
 #[pymethods]
 impl ScxLazyTransformedDataset {
+    /// Guarded: the cached scalar never reaches `section_bytes`, so without
+    /// this a lazy handle would keep reporting the row count the file had
+    /// before an `append` or a `mark_deleted`.
     #[getter]
-    fn shape(&self) -> (usize, usize) {
-        self.shape_val
+    fn shape(&self) -> PyResult<(usize, usize)> {
+        self.backed.check_fresh().map_err(crate::to_pyerr)?;
+        Ok(self.shape_val)
     }
 
     #[getter]
@@ -929,8 +933,9 @@ impl ScxLazyTransformedDataset {
         self.non_negative
     }
 
-    fn __len__(&self) -> usize {
-        self.shape_val.0
+    fn __len__(&self) -> PyResult<usize> {
+        self.backed.check_fresh().map_err(crate::to_pyerr)?;
+        Ok(self.shape_val.0)
     }
 
     fn __repr__(&self) -> String {

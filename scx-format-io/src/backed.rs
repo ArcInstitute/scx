@@ -889,6 +889,17 @@ pub struct BackedCsrReader {
 }
 
 impl BackedCsrReader {
+    /// `Ok(())` unless this reader is watching its file and the file has
+    /// changed since it was opened. See [`ScxReader::check_fresh`].
+    ///
+    /// Section reads are already covered — they funnel through
+    /// `ScxReader::section_bytes`. This exists for the answers that never
+    /// touch a section: the cached `shape` / shard-count scalars a caller
+    /// reads straight off the index.
+    pub fn check_fresh(&self) -> Result<()> {
+        self.reader.check_fresh()
+    }
+
     /// Create a new backed reader for X shards with a count-only cache cap.
     ///
     /// `cache_shards`: number of decoded shards to cache (0 = no cache).
@@ -1845,6 +1856,11 @@ impl BackedCsrReader {
     /// leader's decode fails (or panics — see [`LeaderGuard`]), waiters
     /// loop and the next claimant becomes a fresh leader.
     pub fn read_shard_cached_arc(&self, shard_idx: usize) -> Result<Arc<ScxCsr>> {
+        // A cache hit never reaches `section_bytes`, so the freshness check
+        // has to be here too — otherwise a shard read once before a mutation
+        // keeps being served from the LRU afterwards, which is the *most*
+        // likely way to read stale data, not the least.
+        self.check_fresh()?;
         // The shared cache owns the hit/singleflight/insert orchestration,
         // keyed by `(file_id, shard_idx)`; this reader owns the decode (it is
         // mmap/catalog-specific).
@@ -2923,6 +2939,17 @@ impl CscCache {
 }
 
 impl BackedCscReader {
+    /// `Ok(())` unless this reader is watching its file and the file has
+    /// changed since it was opened. See [`ScxReader::check_fresh`].
+    ///
+    /// Section reads are already covered — they funnel through
+    /// `ScxReader::section_bytes`. This exists for the answers that never
+    /// touch a section: the cached `shape` / shard-count scalars a caller
+    /// reads straight off the index.
+    pub fn check_fresh(&self) -> Result<()> {
+        self.reader.check_fresh()
+    }
+
     /// Create a new backed CSC reader from an [`ScxReader`], scoped
     /// to the global / single-modality CSC shards
     /// (`modality_id == 0`). Convenience wrapper around
@@ -3081,6 +3108,9 @@ impl BackedCscReader {
     /// `Arc<ScxCsc>`. On cache hit increments `metrics.hits`; on miss
     /// (or no cache) increments `metrics.misses` and decodes.
     pub fn read_shard_cached(&self, shard_idx: usize) -> Result<Arc<ScxCsc>> {
+        // See `BackedCsrReader::read_shard_cached_arc`: a cache hit bypasses
+        // `section_bytes` entirely.
+        self.check_fresh()?;
         if let Some(ref cache_mutex) = self.cache {
             let mut cache = cache_mutex.lock().unwrap();
             if let Some(cached) = cache.get(&shard_idx) {
@@ -3417,6 +3447,17 @@ pub struct BackedDenseReader {
 }
 
 impl BackedDenseReader {
+    /// `Ok(())` unless this reader is watching its file and the file has
+    /// changed since it was opened. See [`ScxReader::check_fresh`].
+    ///
+    /// Section reads are already covered — they funnel through
+    /// `ScxReader::section_bytes`. This exists for the answers that never
+    /// touch a section: the cached `shape` / shard-count scalars a caller
+    /// reads straight off the index.
+    pub fn check_fresh(&self) -> Result<()> {
+        self.reader.check_fresh()
+    }
+
     /// Open a backed dense reader over `obsm/<name>` with a count-only
     /// cache cap (`cache_shards` decoded shards; 0 = no cache).
     pub fn new_obsm(reader: ScxReader, name: &str, cache_shards: usize) -> Result<Self> {
@@ -3552,6 +3593,9 @@ impl BackedDenseReader {
     /// Decode + cache one dense shard, returning a shared `Arc`. Same
     /// singleflight contract as [`BackedCsrReader::read_shard_cached_arc`].
     fn read_shard_cached_arc(&self, shard_idx: usize) -> Result<Arc<DenseShard>> {
+        // See `BackedCsrReader::read_shard_cached_arc`: a cache hit bypasses
+        // `section_bytes` entirely.
+        self.check_fresh()?;
         loop {
             if let Some(ref cache_mutex) = self.cache {
                 let mut cache = cache_mutex.lock().unwrap();

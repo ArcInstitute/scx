@@ -235,9 +235,13 @@ impl ScxBackedObsmDataset {
 
 #[pymethods]
 impl ScxBackedObsmDataset {
+    /// Cached at construction, so it never reaches `section_bytes` and would
+    /// otherwise keep reporting the row count the file had before an `append`
+    /// or a `mark_deleted`.
     #[getter]
-    fn shape(&self) -> (usize, usize) {
-        self.shape_val
+    fn shape(&self) -> PyResult<(usize, usize)> {
+        self.backed.check_fresh().map_err(crate::to_pyerr)?;
+        Ok(self.shape_val)
     }
 
     #[getter]
@@ -269,8 +273,9 @@ impl ScxBackedObsmDataset {
         np.call_method1("dtype", (name,))
     }
 
-    fn __len__(&self) -> usize {
-        self.shape_val.0
+    fn __len__(&self) -> PyResult<usize> {
+        self.backed.check_fresh().map_err(crate::to_pyerr)?;
+        Ok(self.shape_val.0)
     }
 
     fn __repr__(&self) -> String {

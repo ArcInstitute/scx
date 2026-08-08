@@ -23,7 +23,11 @@ use crate::to_pyerr;
 /// Provides metadata accessors and methods to convert to AnnData.
 #[pyclass(name = "Experiment")]
 pub struct PyExperiment {
-    reader: ScxReader,
+    /// `None` after `close()`. Private and only reachable through
+    /// [`Self::reader`], which is what makes the closed / stale checks
+    /// structural: a read method added later cannot get at the mapping
+    /// without going past them.
+    reader: Option<ScxReader>,
     pub(crate) path: PathBuf,
     /// Memoized deletion-vector popcount (live-count complement). Computed once
     /// on the first `n_obs`/repr access for deletion-bearing files so repeated
@@ -40,21 +44,76 @@ pub struct PyExperiment {
 
 impl PyExperiment {
     /// Construct from an already-opened ScxReader and its path (Rust-only).
+    ///
+    /// The reader should have been opened with `ScxReader::watching()` — see
+    /// [`Self::reader`]. Passing an unwatched one is not an error; it just
+    /// means this handle will not notice the file changing underneath it.
     pub fn new(reader: ScxReader, path: PathBuf) -> Self {
         Self {
-            reader,
+            reader: Some(reader),
             path,
             n_deleted: std::sync::OnceLock::new(),
             grouped_pipeline: std::sync::OnceLock::new(),
         }
     }
 
+    /// The open reader, refusing if the handle is closed or if the file has
+    /// changed since it was opened.
+    ///
+    /// Every read on this class goes through here. The freshness half is
+    /// redundant for section reads — `ScxReader::section_bytes` checks too —
+    /// but not for the many answers that come straight off the parsed header
+    /// or catalog (`n_obs` after an `append` is the obvious one), and paying
+    /// for one extra `stat` on the section paths is worth not having to
+    /// remember which is which.
+    fn reader(&self) -> PyResult<&ScxReader> {
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Experiment for '{}' is closed; re-open it with pyscx.open()",
+                self.path.display()
+            ))
+        })?;
+        reader.check_fresh().map_err(to_pyerr)?;
+        Ok(reader)
+    }
+
+    /// Re-open the file and drop every cache that snapshots it.
+    ///
+    /// Shared by the public `reload()` and by `mark_deleted`, which mutates
+    /// through this same handle — two copies of this would be two chances for
+    /// one of them to forget a cache.
+    fn reopen(&mut self) -> PyResult<()> {
+        self.reader = Some(
+            ScxReader::open(&self.path)
+                .and_then(|r| r.watching())
+                .map_err(to_pyerr)?,
+        );
+        // Both snapshot the pre-mutation file: the grouped pipeline holds its
+        // own reader and deletion-vector view, and the deleted count is a
+        // memoized popcount.
+        self.grouped_pipeline = std::sync::OnceLock::new();
+        self.n_deleted = std::sync::OnceLock::new();
+        Ok(())
+    }
+
     /// The shared grouped-read pipeline, opening it once on first use.
     fn grouped_pipeline(&self) -> PyResult<Arc<QueryPipeline>> {
+        // Opened lazily, so a first use *after* a mutation would stamp the new
+        // file and quietly serve it while `read_obs` on the same handle
+        // refuses. Gate on this handle's own view before either branch.
+        self.reader()?;
         if let Some(p) = self.grouped_pipeline.get() {
             return Ok(Arc::clone(p));
         }
-        let p = Arc::new(QueryPipeline::open(&self.path).map_err(engine_to_pyerr)?);
+        // Watched, like every other reader handed to Python: this pipeline
+        // is cached on the Experiment and reused across grouped reads, so it
+        // outlives any mutation just as the Experiment itself does.
+        let p = Arc::new(
+            QueryPipeline::from_reader(Box::new(
+                crate::open_handle_reader(&self.path).map_err(to_pyerr)?,
+            ))
+            .map_err(engine_to_pyerr)?,
+        );
         let _ = self.grouped_pipeline.set(p);
         Ok(Arc::clone(
             self.grouped_pipeline
@@ -71,7 +130,7 @@ impl PyExperiment {
     fn resolve_uns_modality(&self, modality: Option<&str>) -> PyResult<u8> {
         match modality {
             None => Ok(0),
-            Some(name) => self.reader.modality_id(name).ok_or_else(|| {
+            Some(name) => self.reader()?.modality_id(name).ok_or_else(|| {
                 pyo3::exceptions::PyKeyError::new_err(format!("unknown modality '{name}'"))
             }),
         }
@@ -139,7 +198,7 @@ fn open_backed_csr(
     modality: Option<&str>,
     cache_shards: usize,
 ) -> PyResult<BackedCsrReader> {
-    let opened = ScxReader::open(path).map_err(to_pyerr)?;
+    let opened = crate::open_handle_reader(path).map_err(to_pyerr)?;
     if !opened.is_multimodal() {
         return Ok(BackedCsrReader::new(opened, cache_shards));
     }
@@ -338,15 +397,15 @@ impl PyExperiment {
     /// popcount. Best-effort — falls back to the physical count when the file
     /// has no deletion vectors or the deletion section can't be read, so it
     /// never panics (the `n_obs` getter and repr must always render).
-    fn logical_n_obs(&self) -> u64 {
-        let physical = self.reader.n_obs();
-        if !self.reader.header().has_deletion_vectors() {
+    fn logical_n_obs_of(&self, reader: &ScxReader) -> u64 {
+        let physical = reader.n_obs();
+        if !reader.header().has_deletion_vectors() {
             return physical;
         }
         // Decode the deletion section at most once per Experiment (best-effort:
         // a failed read memoizes 0, matching the pre-cache physical fallback).
         let deleted = *self.n_deleted.get_or_init(|| {
-            self.reader
+            reader
                 .read_deletion_vectors()
                 .ok()
                 .flatten()
@@ -364,41 +423,42 @@ impl PyExperiment {
     /// `to_anndata().n_obs` and `query().count()` after `mark_deleted`. See
     /// [`Self::n_obs_physical`] for the raw, pre-deletion header count.
     #[getter]
-    fn n_obs(&self) -> u64 {
-        self.logical_n_obs()
+    fn n_obs(&self) -> PyResult<u64> {
+        Ok(self.logical_n_obs_of(self.reader()?))
     }
 
     /// Physical (pre-deletion) row count straight from the file header. Equals
     /// [`Self::n_obs`] when the file has no deletion vectors; larger when rows
     /// have been logically deleted via `mark_deleted` (until `compact`).
     #[getter]
-    fn n_obs_physical(&self) -> u64 {
-        self.reader.n_obs()
+    fn n_obs_physical(&self) -> PyResult<u64> {
+        Ok(self.reader()?.n_obs())
     }
 
     /// Number of variables (genes).
     #[getter]
-    fn n_vars(&self) -> u64 {
-        self.reader.n_vars()
+    fn n_vars(&self) -> PyResult<u64> {
+        Ok(self.reader()?.n_vars())
     }
 
     /// `(n_obs, n_vars)` — mirrors `anndata.AnnData.shape`. `n_obs` is the
     /// logical (post-deletion) row count.
     #[getter]
-    fn shape(&self) -> (u64, u64) {
-        (self.logical_n_obs(), self.reader.n_vars())
+    fn shape(&self) -> PyResult<(u64, u64)> {
+        let reader = self.reader()?;
+        Ok((self.logical_n_obs_of(reader), reader.n_vars()))
     }
 
     /// Total number of non-zero entries.
     #[getter]
-    fn nnz(&self) -> u64 {
-        self.reader.nnz()
+    fn nnz(&self) -> PyResult<u64> {
+        Ok(self.reader()?.nnz())
     }
 
     /// Number of CSR shards in the file.
     #[getter]
-    fn shard_count(&self) -> u32 {
-        self.reader.header().n_csr_shards
+    fn shard_count(&self) -> PyResult<u32> {
+        Ok(self.reader()?.header().n_csr_shards)
     }
 
     /// Number of `ObsMetadataShard` sections in the catalog. Zero on
@@ -406,21 +466,21 @@ impl PyExperiment {
     /// `>= 1` on Phase 2 / 4 sharded files written by merge, append, or
     /// `from_anndata` when `n_obs > shard_target_rows`.
     #[getter]
-    fn obs_metadata_shard_count(&self) -> usize {
-        self.reader.obs_metadata_shard_count()
+    fn obs_metadata_shard_count(&self) -> PyResult<usize> {
+        Ok(self.reader()?.obs_metadata_shard_count())
     }
 
     /// Number of `VarMetadataShard` sections. Mirror of
     /// [`Self::obs_metadata_shard_count`].
     #[getter]
-    fn var_metadata_shard_count(&self) -> usize {
-        self.reader.var_metadata_shard_count()
+    fn var_metadata_shard_count(&self) -> PyResult<usize> {
+        Ok(self.reader()?.var_metadata_shard_count())
     }
 
     /// Format version (currently 1).
     #[getter]
-    fn format_version(&self) -> u16 {
-        self.reader.header().format_version
+    fn format_version(&self) -> PyResult<u16> {
+        Ok(self.reader()?.header().format_version)
     }
 
     /// Filesystem path the experiment was opened from. Returned as a
@@ -439,15 +499,15 @@ impl PyExperiment {
     /// must consult `ShardHeader.codec_id` rather than this value when
     /// decoding individual shards.
     #[getter]
-    fn codec_id(&self) -> u8 {
-        self.reader.header().codec_id
+    fn codec_id(&self) -> PyResult<u8> {
+        Ok(self.reader()?.header().codec_id)
     }
 
     /// File-header index dtype (`0=u16`, `1=u32`). Used for testing the
     /// SCX → SCX writer's projection-aware index-dtype selection.
     #[getter]
-    fn index_dtype(&self) -> u8 {
-        self.reader.header().index_dtype
+    fn index_dtype(&self) -> PyResult<u8> {
+        Ok(self.reader()?.header().index_dtype)
     }
 
     /// Names of the layers in the file.
@@ -455,8 +515,8 @@ impl PyExperiment {
     /// Callable method (`exp.layer_names()`), consistent with the
     /// `obs_keys()` / `var_keys()` / `obsm_keys()` / `varm_keys()` /
     /// `uns_keys()` accessor family (F7).
-    fn layer_names(&self) -> Vec<String> {
-        self.reader.layer_names()
+    fn layer_names(&self) -> PyResult<Vec<String>> {
+        Ok(self.reader()?.layer_names())
     }
 
     /// Column names in `obs` (the cell metadata), excluding the pandas
@@ -466,7 +526,10 @@ impl PyExperiment {
     /// Callable method (e.g. `exp.obs_keys()`) to match AnnData's
     /// `adata.obs_keys()`, not a property.
     fn obs_keys(&self) -> PyResult<Vec<String>> {
-        let schema = self.reader.read_obs_schema_physical().map_err(to_pyerr)?;
+        let schema = self
+            .reader()?
+            .read_obs_schema_physical()
+            .map_err(to_pyerr)?;
         Ok(schema_data_columns(Some(schema)))
     }
 
@@ -477,20 +540,23 @@ impl PyExperiment {
     /// Callable method (e.g. `exp.var_keys()`) to match AnnData's
     /// `adata.var_keys()`, not a property.
     fn var_keys(&self) -> PyResult<Vec<String>> {
-        let schema = self.reader.read_var_schema_physical().map_err(to_pyerr)?;
+        let schema = self
+            .reader()?
+            .read_var_schema_physical()
+            .map_err(to_pyerr)?;
         Ok(schema_data_columns(Some(schema)))
     }
 
     /// Keys of the `obsm` cell-embedding mappings. Pure catalog scan.
     /// Callable method (`exp.obsm_keys()`) to match AnnData.
-    fn obsm_keys(&self) -> Vec<String> {
-        self.reader.list_obsm()
+    fn obsm_keys(&self) -> PyResult<Vec<String>> {
+        Ok(self.reader()?.list_obsm())
     }
 
     /// Keys of the `varm` gene-embedding mappings. Pure catalog scan.
     /// Callable method (`exp.varm_keys()`) to match AnnData.
-    fn varm_keys(&self) -> Vec<String> {
-        self.reader.list_varm()
+    fn varm_keys(&self) -> PyResult<Vec<String>> {
+        Ok(self.reader()?.list_varm())
     }
 
     /// Top-level keys of the unstructured `uns` mapping. Reads the small
@@ -503,7 +569,7 @@ impl PyExperiment {
     #[pyo3(signature = (modality=None))]
     fn uns_keys(&self, modality: Option<&str>) -> PyResult<Vec<String>> {
         let modality_id = self.resolve_uns_modality(modality)?;
-        match self.reader.read_uns_for(modality_id) {
+        match self.reader()?.read_uns_for(modality_id) {
             Ok(serde_json::Value::Object(map)) => Ok(map.keys().cloned().collect()),
             Ok(_) => Ok(Vec::new()),
             Err(scx_format_io::ScxError::SectionNotFound(_)) => Ok(Vec::new()),
@@ -531,7 +597,7 @@ impl PyExperiment {
         modality: Option<&str>,
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
         let modality_id = self.resolve_uns_modality(modality)?;
-        convert::uns::read_uns_as_pyobject(py, &self.reader, modality_id)
+        convert::uns::read_uns_as_pyobject(py, self.reader()?, modality_id)
     }
 
     /// Read the `obs` (cell metadata) table as a pandas DataFrame **without
@@ -561,6 +627,7 @@ impl PyExperiment {
         columns: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         // Decode off the GIL; only the pyarrow/pandas conversion needs Python.
+        let reader = self.reader()?;
         let batch = py
             .detach(|| match columns {
                 Some(cols) => {
@@ -570,7 +637,7 @@ impl PyExperiment {
                     // pyarrow KeyError when the schema's pandas envelope still
                     // advertises an `index_columns` entry the projection would
                     // otherwise drop (e.g. `scx convert`-produced files).
-                    let schema = self.reader.read_obs_schema_physical()?;
+                    let schema = reader.read_obs_schema_physical()?;
                     let mut proj: Vec<String> = Vec::new();
                     for idx_col in scx_format_io::resolve_index_columns(&schema) {
                         if schema.index_of(&idx_col).is_ok() && !cols.contains(&idx_col) {
@@ -578,9 +645,9 @@ impl PyExperiment {
                         }
                     }
                     proj.extend(cols);
-                    self.reader.read_obs_keys(&proj)
+                    reader.read_obs_keys(&proj)
                 }
-                None => self.reader.read_obs(),
+                None => reader.read_obs(),
             })
             .map_err(to_pyerr)?;
         let table = convert::record_batch_to_pyarrow(py, &batch)?;
@@ -615,8 +682,9 @@ impl PyExperiment {
     ) -> PyResult<Bound<'py, PyAny>> {
         let modality_id = self.resolve_uns_modality(modality)?;
         // Decode off the GIL; only the pyarrow/pandas conversion needs Python.
+        let reader = self.reader()?;
         let batch = py
-            .detach(|| self.reader.read_var_for(modality_id))
+            .detach(|| reader.read_var_for(modality_id))
             .map_err(to_pyerr)?;
         let batch = match columns {
             None => batch,
@@ -656,7 +724,8 @@ impl PyExperiment {
         sort: bool,
     ) -> PyResult<(Vec<String>, bool)> {
         // The Utf8-streaming path scans every row; release the GIL for it.
-        py.detach(|| self.reader.distinct_obs_values(col, limit, sort))
+        let reader = self.reader()?;
+        py.detach(|| reader.distinct_obs_values(col, limit, sort))
             .map_err(to_pyerr)
     }
 
@@ -694,8 +763,9 @@ impl PyExperiment {
     /// Raises `ValueError` for non-string columns and a corrupt-file-class error
     /// for an unknown column name.
     fn obs_categorical<'py>(&self, py: Python<'py>, col: &str) -> PyResult<PyCategorical<'py>> {
+        let reader = self.reader()?;
         let (codes, categories) = py
-            .detach(|| self.reader.obs_categorical(col))
+            .detach(|| reader.obs_categorical(col))
             .map_err(to_pyerr)?;
         Ok((PyArray1::from_vec(py, codes), categories))
     }
@@ -711,8 +781,9 @@ impl PyExperiment {
         py: Python<'py>,
         cols: Vec<String>,
     ) -> PyResult<Vec<PyCategorical<'py>>> {
+        let reader = self.reader()?;
         let out = py
-            .detach(|| self.reader.obs_categorical_many(&cols))
+            .detach(|| reader.obs_categorical_many(&cols))
             .map_err(to_pyerr)?;
         Ok(out
             .into_iter()
@@ -724,33 +795,34 @@ impl PyExperiment {
     ///
     /// The AnnData-style `repr` lists the obs/var/obsm/uns keys a scanpy
     /// user expects; the on-disk encoding details live here instead.
-    fn info(&self) -> String {
-        let h = self.reader.header();
-        format!(
+    fn info(&self) -> PyResult<String> {
+        let reader = self.reader()?;
+        let h = reader.header();
+        Ok(format!(
             "SCX file: format_version={}, codec_id={}, index_dtype={}, \
              csr_shards={}, nnz={}, has_csc={}, path={}",
             h.format_version,
             h.codec_id,
             h.index_dtype,
             h.n_csr_shards,
-            self.reader.nnz(),
+            reader.nnz(),
             h.has_csc(),
             self.path.display(),
-        )
+        ))
     }
 
     /// `True` when the file has a CSC sidecar (gene-major shards).
     #[getter]
-    fn has_csc(&self) -> bool {
-        self.reader.header().has_csc()
+    fn has_csc(&self) -> PyResult<bool> {
+        Ok(self.reader()?.header().has_csc())
     }
 
     /// `True` when the file carries logical deletion vectors — i.e. some
     /// rows are marked deleted and will be dropped (row count shrinks) on
     /// `to_anndata` / `to_h5ad` export.
     #[getter]
-    fn has_deletions(&self) -> bool {
-        self.reader.header().has_deletion_vectors()
+    fn has_deletions(&self) -> PyResult<bool> {
+        Ok(self.reader()?.header().has_deletion_vectors())
     }
 
     /// Read the provenance chain as a list of dicts:
@@ -763,7 +835,7 @@ impl PyExperiment {
     fn provenance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
         use pyo3::types::{PyDict, PyList};
         let list = PyList::empty(py);
-        let prov = match self.reader.read_provenance() {
+        let prov = match self.reader()?.read_provenance() {
             Ok(p) => p,
             Err(scx_format_io::ScxError::SectionNotFound(_)) => return Ok(list),
             Err(e) => return Err(to_pyerr(e)),
@@ -805,25 +877,29 @@ impl PyExperiment {
         // Resolve the modality name → 1-based id (0 = global) using the
         // already-open reader (mirrors `open_backed_csr`). On a multimodal file
         // a modality is required; on a single-modality file it must be omitted.
+        let reader = self.reader()?;
         let modality_id: u8 = match modality {
             None => {
-                if self.reader.is_multimodal() {
+                if reader.is_multimodal() {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
                         "file is multimodal; pass modality=... (one of {:?})",
-                        self.reader.modality_names()
+                        reader.modality_names()
                     )));
                 }
                 0
             }
-            Some(name) => self.reader.modality_id(name).ok_or_else(|| {
+            Some(name) => reader.modality_id(name).ok_or_else(|| {
                 pyo3::exceptions::PyKeyError::new_err(format!(
                     "unknown modality '{name}'; available: {:?}",
-                    self.reader.modality_names()
+                    reader.modality_names()
                 ))
             })?,
         };
-        let pipeline = QueryPipeline::open_for_modality(&self.path, modality_id)
-            .map_err(crate::query::engine_to_pyerr)?;
+        let pipeline = QueryPipeline::from_reader_for_modality(
+            Box::new(crate::open_handle_reader(&self.path).map_err(to_pyerr)?),
+            modality_id,
+        )
+        .map_err(crate::query::engine_to_pyerr)?;
         Ok(PyQueryPipeline::from_pipeline(pipeline))
     }
 
@@ -894,7 +970,7 @@ impl PyExperiment {
             .as_slice()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-        let expected = self.reader.n_obs() as usize;
+        let expected = self.reader()?.n_obs() as usize;
         if mask_slice.len() != expected {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "mask length {} does not match n_obs {}",
@@ -914,18 +990,71 @@ impl PyExperiment {
         let total = scx_ops::mark_deleted(&self.path, &indices)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-        // Re-open reader so subsequent reads see the updated file (finding 9.6).
-        self.reader = ScxReader::open(&self.path)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-        // Invalidate caches that snapshot the pre-deletion file. The grouped
-        // pipeline holds its own ScxReader + deletion-vector snapshot, so a
-        // grouped read populated before this mutation would otherwise still
-        // return just-deleted rows; the cached deleted-count is likewise stale.
-        self.grouped_pipeline = std::sync::OnceLock::new();
-        self.n_deleted = std::sync::OnceLock::new();
+        // This handle just mutated its own file, so re-open it rather than
+        // leaving it to fail the freshness check on the next read (finding
+        // 9.6). Shared with `reload()`.
+        self.reopen()?;
 
         Ok(total)
+    }
+
+    /// Re-open the file, picking up anything written since this handle was
+    /// opened.
+    ///
+    /// The way back from a `RuntimeError: '…' changed on disk`. The handle
+    /// keeps its identity — anything holding a reference to it sees the new
+    /// contents — but every object it handed out earlier (a backed `AnnData`,
+    /// a `query()` pipeline) has its own reader and is *not* reloaded by this;
+    /// re-derive those from the reloaded handle.
+    ///
+    /// Never raises for being stale; that is what it is for. It can still
+    /// raise if the file is now unreadable or gone.
+    ///
+    /// Example:
+    ///     exp = pyscx.open("atlas.scx")
+    ///     pyscx.obs_import("atlas.scx", "calls.csv", key="obs_names")
+    ///     exp.reload()
+    ///     exp.read_obs()          # now carries the imported columns
+    fn reload(&mut self) -> PyResult<()> {
+        self.reopen()
+    }
+
+    /// Release the file mapping. Idempotent.
+    ///
+    /// Reads afterwards raise instead of answering. Worth calling before
+    /// rewriting the file in place — and required on Windows, where a mapped
+    /// file cannot be replaced at all. Dropping the last reference does the
+    /// same thing, but on the interpreter's schedule rather than yours.
+    ///
+    /// Objects this handle handed out (a backed `AnnData`, a `query()`
+    /// pipeline) hold their own readers and keep working after it: closing the
+    /// handle you opened them from does not close them.
+    fn close(&mut self) {
+        self.reader = None;
+        self.grouped_pipeline = std::sync::OnceLock::new();
+        self.n_deleted = std::sync::OnceLock::new();
+    }
+
+    /// Whether [`close`](Self::close) has been called.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.reader.is_none()
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &mut self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        self.close();
+        // Never swallow an exception raised inside the block.
+        false
     }
 
     /// Convert this SCX file to an AnnData object.
@@ -1072,7 +1201,7 @@ impl PyExperiment {
             let adata = convert::to_anndata_filtered(
                 py,
                 &self.path,
-                &self.reader,
+                self.reader()?,
                 var_names.as_deref(),
                 obs_filter,
                 layers.as_deref(),
@@ -1097,7 +1226,7 @@ impl PyExperiment {
             // round-trip when it does not — so a sidecar-less file can never carry
             // a leftover `True` that would trigger a misleading warning.
             let uns = adata.getattr("uns")?;
-            if self.has_csc() {
+            if self.has_csc()? {
                 uns.set_item("scx_source_has_csc_sidecar", true)?;
             } else if uns.contains("scx_source_has_csc_sidecar").unwrap_or(false) {
                 let _ = uns.del_item("scx_source_has_csc_sidecar");
@@ -1119,7 +1248,7 @@ impl PyExperiment {
                 // contract; the exact `>2²⁴` layer read awaits the Phase-5 typed
                 // layer reader.
                 convert::guard_decode_loss(
-                    convert::layer_csr_max_value(&self.reader, 0),
+                    convert::layer_csr_max_value(self.reader()?, 0),
                     plan.allow_lossy,
                 )?;
                 let layers_obj = adata.getattr("layers")?;
@@ -1180,6 +1309,9 @@ impl PyExperiment {
         index_dtype: Option<&str>,
         allow_lossy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Before the feature gate: a stale handle is stale regardless of how
+        // this build was compiled.
+        self.reader()?;
         // F3 Phase 1: the device path is f32-native. Accept the kwargs for API
         // parity with `to_anndata`, but reject a non-default plan (host-side
         // narrowing before device upload is a later phase).
@@ -1221,12 +1353,12 @@ impl PyExperiment {
             // PCA wall). Any var_names / obs_filter / layer projection, a deletion
             // vector, or a multimodal source falls back to the host-assemble path
             // below — on-device filtered decode is Phase 4 format work.
-            let n_csr_shards = self.reader.csr_shard_count_for(0) as usize;
+            let n_csr_shards = self.reader()?.csr_shard_count_for(0) as usize;
             let fast_path = var_names.is_none()
                 && obs_filter.is_none()
                 && layers.is_none()
-                && !self.reader.is_multimodal()
-                && !self.reader.header().has_deletion_vectors()
+                && !self.reader()?.is_multimodal()
+                && !self.reader()?.header().has_deletion_vectors()
                 && n_csr_shards > 0;
 
             let (adata, holder, n_rows, n_cols, bytes_uploaded, transfer_mode, n_shufdelta_gpu): (
@@ -1243,7 +1375,7 @@ impl PyExperiment {
                 let adata = convert::to_anndata_filtered(
                     py,
                     &self.path,
-                    &self.reader,
+                    self.reader()?,
                     None,
                     None,
                     None,
@@ -1272,7 +1404,7 @@ impl PyExperiment {
                 let mut max_value_width: u64 = 1;
                 for i in 0..n_csr_shards {
                     let bytes = self
-                        .reader
+                        .reader()?
                         .read_raw_csr_shard_bytes_for(0, i)
                         .map_err(|e| PyRuntimeError::new_err(format!("read CSR shard {i}: {e}")))?;
                     let header = scx_format_io::shard::ShardHeader::read_from(
@@ -1383,7 +1515,7 @@ impl PyExperiment {
                 let adata = convert::to_anndata_filtered(
                     py,
                     &self.path,
-                    &self.reader,
+                    self.reader()?,
                     var_names.as_deref(),
                     obs_filter,
                     layers.as_deref(),
@@ -1534,11 +1666,12 @@ impl PyExperiment {
     /// Returns a list of (section_name, passed) tuples.
     #[pyo3(signature = (deep=false))]
     fn validate(&self, py: Python<'_>, deep: bool) -> PyResult<Vec<(String, bool)>> {
-        let mut results = self.reader.validate().map_err(to_pyerr)?;
+        let reader = self.reader()?;
+        let mut results = reader.validate().map_err(to_pyerr)?;
         if deep {
             // Deep validation re-decodes every shard (CPU-bound, pure Rust) —
             // run it off the GIL so other Python threads aren't blocked.
-            py.detach(|| crate::deep_validate_into(&self.reader, &mut results));
+            py.detach(|| crate::deep_validate_into(reader, &mut results));
         }
         Ok(results)
     }
@@ -1546,33 +1679,34 @@ impl PyExperiment {
     /// True if this file is multimodal (Phase B / v2 with
     /// `n_modalities > 0`). Mirrors `header.has_modalities()`.
     #[getter]
-    fn is_multimodal(&self) -> bool {
-        self.reader.is_multimodal()
+    fn is_multimodal(&self) -> PyResult<bool> {
+        Ok(self.reader()?.is_multimodal())
     }
 
     /// Number of registered modalities (0 for v1 files and
     /// single-modality v2 files).
     #[getter]
-    fn n_modalities(&self) -> u32 {
-        self.reader.n_modalities()
+    fn n_modalities(&self) -> PyResult<u32> {
+        Ok(self.reader()?.n_modalities())
     }
 
     /// Ordered list of modality names (empty for single-modality
     /// files). The position in the list maps 1:1 to the 1-based
     /// modality_id (`names[i] -> modality_id = i + 1`).
     #[getter]
-    fn modality_names(&self) -> Vec<String> {
-        self.reader
+    fn modality_names(&self) -> PyResult<Vec<String>> {
+        Ok(self
+            .reader()?
             .modality_names()
             .iter()
             .map(|s| s.to_string())
-            .collect()
+            .collect())
     }
 
     /// Resolve a modality name to its 1-based `modality_id`.
     /// Returns `None` for unknown names or single-modality files.
-    fn modality_id(&self, name: &str) -> Option<u8> {
-        self.reader.modality_id(name)
+    fn modality_id(&self, name: &str) -> PyResult<Option<u8>> {
+        Ok(self.reader()?.modality_id(name))
     }
 
     /// Per-modality information block for the given 1-based
@@ -1587,7 +1721,7 @@ impl PyExperiment {
         modality_id: u8,
     ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
         use pyo3::types::PyDict;
-        let info = match self.reader.modality_info(modality_id) {
+        let info = match self.reader()?.modality_info(modality_id) {
             Some(i) => i,
             None => return Ok(None),
         };
@@ -1644,11 +1778,11 @@ impl PyExperiment {
                      backed multimodal X is lazily f32-native",
                 ));
             }
-            crate::mudata::to_mudata_backed(py, &self.path, &self.reader, cache_shards)
+            crate::mudata::to_mudata_backed(py, &self.path, self.reader()?, cache_shards)
         } else {
             crate::mudata::to_mudata(
                 py,
-                &self.reader,
+                self.reader()?,
                 container.as_ref(),
                 data_dtype.as_ref(),
                 index_dtype.as_ref(),
@@ -1685,6 +1819,10 @@ impl PyExperiment {
                 "detection_counts: only axis='var' is supported (got '{axis}')"
             )));
         }
+        // Re-opens from `self.path`, and a fresh reader is fresh by definition
+        // — so without this the handle would answer here while refusing
+        // everywhere else. Gate on *this* handle's view first.
+        self.reader()?;
         let backed = open_backed_csr(&self.path, modality, 4)?;
         let counts: Vec<i64> = py
             .detach(|| backed.gene_detection_counts())
@@ -1707,6 +1845,10 @@ impl PyExperiment {
         gene: &Bound<'_, PyAny>,
         modality: Option<&str>,
     ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        // Re-opens from `self.path`, and a fresh reader is fresh by definition
+        // — so without this the handle would answer here while refusing
+        // everywhere else. Gate on *this* handle's view first.
+        self.reader()?;
         let backed = open_backed_csr(&self.path, modality, 4)?;
         // Resolve gene → gene_idx. Integer fast path; string falls
         // through to a var.index lookup.
@@ -1718,7 +1860,7 @@ impl PyExperiment {
                     "gene must be an integer index or a string name",
                 )
             })?;
-            resolve_gene_name(&self.reader, modality, &name)?
+            resolve_gene_name(self.reader()?, modality, &name)?
         };
         let rows = py
             .detach(|| backed.cells_expressing_gene(gene_idx))
@@ -1764,6 +1906,10 @@ impl PyExperiment {
         // this method can promise an `IndexError`.
         let rows: Vec<u64> = rows.as_slice()?.to_vec();
         let n_rows = rows.len();
+        // Re-opens from `self.path`, and a fresh reader is fresh by definition
+        // — so without this the handle would answer here while refusing
+        // everywhere else. Gate on *this* handle's view first.
+        self.reader()?;
         let backed = open_backed_csr(&self.path, modality, cache_shards)?;
         let n_vars = backed.n_vars();
         let n_obs = backed.n_obs() as u64;
@@ -1807,29 +1953,54 @@ impl PyExperiment {
         convert::csr_to_scipy(py, csr)
     }
 
+    /// Never raises. A repr that throws turns every later traceback into a
+    /// second, unrelated error — precisely when the state it would have
+    /// described is what you needed to see. So a closed or stale handle
+    /// renders as such rather than refusing.
     fn __repr__(&self) -> String {
+        let Some(reader) = self.reader.as_ref() else {
+            return format!("<Experiment '{}' [closed]>", self.path.display());
+        };
+        if let Err(e) = reader.check_fresh() {
+            return format!(
+                "<Experiment '{}' [stale: {}]>",
+                self.path.display(),
+                stale_repr_detail(&e),
+            );
+        }
         // Best-effort: the repr must always render, so a failed schema read
         // degrades to an empty key list here (the public `obs_keys` /
         // `var_keys` getters surface the error loudly instead).
         format_anndata_repr(
             "Experiment",
-            self.logical_n_obs(),
-            self.reader.n_vars(),
+            self.logical_n_obs_of(reader),
+            reader.n_vars(),
             &[
                 (
                     "obs",
-                    schema_data_columns(self.reader.read_obs_schema_physical().ok()),
+                    schema_data_columns(reader.read_obs_schema_physical().ok()),
                 ),
                 (
                     "var",
-                    schema_data_columns(self.reader.read_var_schema_physical().ok()),
+                    schema_data_columns(reader.read_var_schema_physical().ok()),
                 ),
                 ("uns", self.uns_keys(None).unwrap_or_default()),
-                ("obsm", self.obsm_keys()),
-                ("varm", self.varm_keys()),
-                ("layers", self.layer_names()),
+                ("obsm", self.obsm_keys().unwrap_or_default()),
+                ("varm", self.varm_keys().unwrap_or_default()),
+                ("layers", self.layer_names().unwrap_or_default()),
             ],
         )
+    }
+}
+
+/// The one-clause "why" out of a `FileChangedOnDisk`, for the repr.
+///
+/// The full message ends with the how-to-recover sentence, which is right for
+/// an exception and noise inside `<Experiment '…' [stale: …]>`.
+fn stale_repr_detail(e: &scx_format_io::ScxError) -> String {
+    match e {
+        scx_format_io::ScxError::FileChangedOnDisk { detail, .. } => detail.clone(),
+        other => other.to_string(),
     }
 }
 

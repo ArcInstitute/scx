@@ -59,7 +59,7 @@ impl ScxBackedMuDataset {
     #[pyo3(signature = (path, cache_shards=None))]
     fn new(path: &str, cache_shards: Option<usize>) -> PyResult<Self> {
         let path_buf = std::path::PathBuf::from(path);
-        let reader = ScxReader::open(&path_buf)
+        let reader = crate::open_handle_reader(&path_buf)
             .map_err(|e| PyRuntimeError::new_err(format!("ScxReader::open: {e}")))?;
         if !reader.is_multimodal() {
             return Err(PyRuntimeError::new_err(format!(
@@ -81,17 +81,20 @@ impl ScxBackedMuDataset {
     }
 
     #[getter]
-    fn n_modalities(&self) -> u32 {
-        self.meta_reader.n_modalities()
+    fn n_modalities(&self) -> PyResult<u32> {
+        self.meta_reader.check_fresh().map_err(crate::to_pyerr)?;
+        Ok(self.meta_reader.n_modalities())
     }
 
     #[getter]
-    fn modality_names(&self) -> Vec<String> {
-        self.meta_reader
+    fn modality_names(&self) -> PyResult<Vec<String>> {
+        self.meta_reader.check_fresh().map_err(crate::to_pyerr)?;
+        Ok(self
+            .meta_reader
             .modality_names()
             .iter()
             .map(|s| s.to_string())
-            .collect()
+            .collect())
     }
 
     fn modality_id(&self, name: &str) -> Option<u8> {
@@ -154,7 +157,7 @@ impl ScxBackedMuDataset {
             py,
             ScxBackedMuModality {
                 path: self.path.clone(),
-                modality_names: self.modality_names(),
+                modality_names: self.modality_names()?,
                 cache_shards: self.cache_shards,
             },
         )
@@ -170,7 +173,14 @@ impl ScxBackedMuDataset {
     }
 
     fn __repr__(&self) -> String {
-        let names: Vec<String> = self.modality_names();
+        // Never raises: a repr that throws hides the state it was called to
+        // show. Reads the names straight off the reader, guard bypassed.
+        let names: Vec<String> = self
+            .meta_reader
+            .modality_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         format!(
             "ScxBackedMuDataset(n_obs={}, modalities={:?})",
             self.meta_reader.n_obs(),
@@ -200,7 +210,7 @@ pub struct ScxBackedMuModality {
 impl ScxBackedMuModality {
     fn __getitem__(&self, py: Python<'_>, name: &str) -> PyResult<Py<ScxBackedSparseDataset>> {
         // Resolve name → modality_id via a cheap meta reader.
-        let meta = ScxReader::open(&self.path)
+        let meta = crate::open_handle_reader(&self.path)
             .map_err(|e| PyRuntimeError::new_err(format!("ScxReader::open: {e}")))?;
         let modality_id = meta.modality_id(name).ok_or_else(|| {
             pyo3::exceptions::PyKeyError::new_err(format!(
@@ -215,7 +225,7 @@ impl ScxBackedMuModality {
         drop(meta);
 
         // Build per-modality CSR reader.
-        let csr_reader = ScxReader::open(&self.path)
+        let csr_reader = crate::open_handle_reader(&self.path)
             .map_err(|e| PyRuntimeError::new_err(format!("ScxReader::open: {e}")))?;
         let backed_csr = Arc::new(BackedCsrReader::for_modality(
             csr_reader,
@@ -225,7 +235,7 @@ impl ScxBackedMuModality {
 
         // Optional per-modality CSC reader.
         let backed_csc = if has_csc {
-            let csc_reader = ScxReader::open(&self.path)
+            let csc_reader = crate::open_handle_reader(&self.path)
                 .map_err(|e| PyRuntimeError::new_err(format!("ScxReader::open: {e}")))?;
             let r = BackedCscReader::for_modality(csc_reader, modality_id, self.cache_shards)
                 .map_err(|e| {

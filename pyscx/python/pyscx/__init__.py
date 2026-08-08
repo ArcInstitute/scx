@@ -244,6 +244,24 @@ def _coerce_path(p, *, allow_experiment: bool = True):
     return fspath.decode() if isinstance(fspath, bytes) else fspath
 
 
+def _reload_if_experiment(p):
+    """Refresh an `Experiment` we just mutated *through*.
+
+    `_coerce_path` reduces an `Experiment` argument to its path string, so a
+    mutating call given a live handle changes the file out from under the
+    caller's own handle and leaves it reading the previous contents. Every
+    other way of hitting that is the caller's own doing; this one is the
+    documented, blessed spelling (`pyscx.obs_import(exp, "calls.csv")`), so it
+    is on us to leave the handle usable.
+
+    Duck-typed rather than `isinstance`: the Experiment type is a native
+    extension class, and `_coerce_path` already identifies it the same way.
+    """
+    reload = getattr(p, "reload", None)
+    if callable(reload) and isinstance(getattr(p, "path", None), str):
+        reload()
+
+
 def open(path, verify=True):  # noqa: A001 — intentional shadowing of builtins.open within the pyscx namespace
     """Open an SCX file as an `Experiment`. Accepts str or
     `os.PathLike` (e.g. `pathlib.Path`)."""
@@ -305,7 +323,12 @@ def write(adata, path, **kwargs):
         import pyscx
         pyscx.write(adata, "data.scx")
     """
-    return _from_anndata_native(adata, _coerce_path(path), **kwargs)
+    result = _from_anndata_native(adata, _coerce_path(path), **kwargs)
+    # `path` is documented as str | os.PathLike, but `_coerce_path` accepts an
+    # Experiment like every other entry point, and writing over the file one is
+    # open on is the same trap as the in-place mutators.
+    _reload_if_experiment(path)
+    return result
 
 
 def modify_metadata(path, **kwargs):
@@ -321,7 +344,9 @@ def modify_metadata(path, **kwargs):
         **kwargs: Forwarded to the native `modify_metadata` (`uns=`, `obs=`,
             `var=`, `obsm=`, `varm=`, `index_obs=`, …).
     """
-    return _modify_metadata_native(_coerce_path(path), **kwargs)
+    result = _modify_metadata_native(_coerce_path(path), **kwargs)
+    _reload_if_experiment(path)
+    return result
 
 
 def set_uns(path, uns):
@@ -331,7 +356,9 @@ def set_uns(path, uns):
         path: Target SCX file (str, os.PathLike, or an open Experiment).
         uns: dict replacing the whole `uns` block (replace, not merge).
     """
-    return _set_uns_native(_coerce_path(path), uns)
+    result = _set_uns_native(_coerce_path(path), uns)
+    _reload_if_experiment(path)
+    return result
 
 
 def from_h5ad(path, out, **kwargs):
@@ -863,8 +890,10 @@ def obs_import(path, table, *, key=None, source_key=None, **kwargs):
     """
     key = _coerce_key(key)
     source_key = _coerce_key(source_key)
-    return _obs_import_native(_coerce_path(path), _coerce_path(table, allow_experiment=False),
-                              key=key, source_key=source_key, **kwargs)
+    result = _obs_import_native(_coerce_path(path), _coerce_path(table, allow_experiment=False),
+                                key=key, source_key=source_key, **kwargs)
+    _reload_if_experiment(path)
+    return result
 
 
 def diagnose_obs_key(path, key=None):
@@ -970,10 +999,12 @@ def doublet_import(path, table, *, tool, key=None, source_key=None, **kwargs):
         print(r["n_matched"], "of", r["n_obs"], "cells matched")
         pyscx.doublet_import("atlas.scx", "calls.csv", tool="scdblfinder")
     """
-    return _doublet_import_native(_coerce_path(path),
-                                  _coerce_path(table, allow_experiment=False),
-                                  tool=tool, key=_coerce_key(key),
-                                  source_key=_coerce_key(source_key), **kwargs)
+    result = _doublet_import_native(_coerce_path(path),
+                                    _coerce_path(table, allow_experiment=False),
+                                    tool=tool, key=_coerce_key(key),
+                                    source_key=_coerce_key(source_key), **kwargs)
+    _reload_if_experiment(path)
+    return result
 
 
 _DOUBLET_CONSENSUS_METHODS = ("majority", "any", "all", "mean_rank")

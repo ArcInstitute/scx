@@ -22,12 +22,40 @@ use pyo3::prelude::*;
 
 use experiment::{PyExperiment, PyGroupShard};
 use query::{PyQueryPipeline, PyQueryResult};
-use scx_format_io::{ScxError, ScxErrorClass};
+use scx_format_io::{ScxError, ScxErrorClass, ScxReader};
 
 /// Convert an ScxError into the most appropriate Python exception.
 ///
 /// User-input format errors → ValueError; missing files → FileNotFoundError;
 /// permission errors → PermissionError; everything else → RuntimeError.
+/// Open a reader for a handle that will be **handed to Python** and outlive
+/// this call — an `Experiment`, a backed dataset, a lazy mapping, a query
+/// pipeline.
+///
+/// Always watched, so a read after the file is mutated behind the handle's
+/// back raises instead of answering from a mapping of what the file used to
+/// be. Its counterpart is a bare `ScxReader::open`, which is right for the
+/// readers that live and die inside one call — `scx-ops` bracketing its own
+/// mutation, a one-shot `validate`, a single GPU shard fetch — and which must
+/// stay unwatched or those ops would fail against themselves.
+///
+/// Calling this rather than `ScxReader::open(..)?.watching()?` at each site is
+/// the point: which of the two a site wants is a real decision, and it should
+/// be greppable rather than a suffix someone can leave off.
+pub(crate) fn open_handle_reader(path: impl AsRef<std::path::Path>) -> Result<ScxReader, ScxError> {
+    ScxReader::open(path)?.watching()
+}
+
+/// [`open_handle_reader`], reusing an already-parsed `FullCatalog`. Same
+/// contract; see `ScxReader::open_with_shared_catalog` for why the sharing
+/// exists.
+pub(crate) fn open_handle_reader_shared(
+    path: impl AsRef<std::path::Path>,
+    catalog: std::sync::Arc<scx_format_io::FullCatalog>,
+) -> Result<ScxReader, ScxError> {
+    ScxReader::open_with_shared_catalog(path, catalog)?.watching()
+}
+
 pub(crate) fn to_pyerr(e: ScxError) -> PyErr {
     use std::io::ErrorKind;
     let msg = e.to_string();
@@ -149,6 +177,11 @@ fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
     } else {
         scx_format_io::ScxReader::open_unchecked(path)
     }
+    // Watch the file: an `Experiment` outlives the call that made it, and the
+    // module-level mutators (`obs_import`, `compact`, `append`, …) take a path
+    // and cannot reach it. Without this the handle answers from a mapping of
+    // whatever the file used to be. See `scx_format_io::freshness`.
+    .and_then(|r| r.watching())
     .map_err(to_pyerr)?;
     Ok(PyExperiment::new(reader, std::path::PathBuf::from(path)))
 }
