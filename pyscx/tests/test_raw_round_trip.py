@@ -219,6 +219,10 @@ def test_scx_backed_route_warns_when_dropping_raw(tmp_dir):
     msg = str(rec[0].message)
     assert "on-disk raw sections are preserved" not in msg
     assert "the output file will have no raw" in msg
+    # And it must be THIS door's remedy. Without this, swapping the two
+    # sites' `reason` strings would fail the Rust sort-path test but stay
+    # green here, so the cross-door check would only be half-closed.
+    assert "convert from the h5ad" in msg.lower()
 
     assert pyscx.open(out_path).to_anndata().raw is None
 

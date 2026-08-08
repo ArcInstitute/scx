@@ -365,46 +365,61 @@ fn reorder_on_convert_reports_a_write_side_raw_drop_worded_for_this_door() {
 
     let dir = tempfile::tempdir().unwrap();
     let (n_obs, n_vars, raw_n_vars) = (8, 10, 17);
-    let h5ad_path = dir.path().join("reorder_raw.h5ad");
-    create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
-    add_raw_group(&h5ad_path, n_obs, raw_n_vars);
 
-    let opts = ConvertOptions {
-        sort_by: vec!["n_counts".to_string()],
-        ..ConvertOptions::default()
-    };
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let sink_seen = std::sync::Arc::clone(&seen);
-    let mut sink = WarningSink::with_handler(move |w| {
-        sink_seen.lock().unwrap().push(format!("{w}"));
-    });
+    // Both arms of `!sort_by.is_empty() || group_by.is_some()`.
+    for mode in ["sort_by", "group_by"] {
+        let h5ad_path = dir.path().join(format!("reorder_raw_{mode}.h5ad"));
+        create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
+        add_raw_group(&h5ad_path, n_obs, raw_n_vars);
 
-    h5ad_to_scx_streaming(
-        &h5ad_path,
-        &dir.path().join("reorder_raw.scx"),
-        &opts,
-        &StreamingOverrides::default(),
-        &mut sink,
-    )
-    .unwrap();
+        let opts = if mode == "sort_by" {
+            ConvertOptions {
+                sort_by: vec!["n_counts".to_string()],
+                ..ConvertOptions::default()
+            }
+        } else {
+            ConvertOptions {
+                group_by: Some("n_counts".to_string()),
+                ..ConvertOptions::default()
+            }
+        };
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink_seen = std::sync::Arc::clone(&seen);
+        let mut sink = WarningSink::with_handler(move |w| {
+            sink_seen.lock().unwrap().push(format!("{w}"));
+        });
 
-    assert_eq!(sink.counts().get("dropped_raw_on_write"), Some(&1));
-    assert_eq!(sink.counts().get("dropped_raw"), None);
+        h5ad_to_scx_streaming(
+            &h5ad_path,
+            &dir.path().join(format!("reorder_raw_{mode}.scx")),
+            &opts,
+            &StreamingOverrides::default(),
+            &mut sink,
+        )
+        .unwrap();
 
-    let msgs = seen.lock().unwrap();
-    let msg = msgs
-        .iter()
-        .find(|m| m.contains("adata.raw"))
-        .expect("a raw-drop message");
-    assert!(
-        !msg.contains("on-disk raw sections are preserved"),
-        "read-side reassurance on a write: {msg}"
-    );
-    assert!(
-        !msg.contains("convert from the h5ad"),
-        "SCX -> SCX remedy on the h5ad door: {msg}"
-    );
-    assert!(msg.contains("--sort-by"), "no cause named: {msg}");
+        assert_eq!(
+            sink.counts().get("dropped_raw_on_write"),
+            Some(&1),
+            "{mode}: a write that drops raw must say so as a write"
+        );
+        assert_eq!(sink.counts().get("dropped_raw"), None, "{mode}");
+
+        let msgs = seen.lock().unwrap();
+        let msg = msgs
+            .iter()
+            .find(|m| m.contains("adata.raw"))
+            .unwrap_or_else(|| panic!("{mode}: a raw-drop message"));
+        assert!(
+            !msg.contains("on-disk raw sections are preserved"),
+            "{mode}: read-side reassurance on a write: {msg}"
+        );
+        assert!(
+            !msg.contains("convert from the h5ad"),
+            "{mode}: SCX -> SCX remedy on the h5ad door: {msg}"
+        );
+        assert!(msg.contains("--sort-by"), "{mode}: no cause named: {msg}");
+    }
 }
 
 /// The companion negative, in the two shapes that differ.

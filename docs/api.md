@@ -534,7 +534,7 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 | `EagerAssemblyMemoryHigh { estimated_bytes, budget_bytes }` | `Experiment.to_anndata` | Estimated eager assembly footprint exceeds `memory_budget` (default 8 GiB). Warn-only, does not block. |
 | `Hdf5NotThreadsafe` | Parallel streaming reader fallback | libhdf5 was not built thread-safe; parallel streaming fell back to the sequential coordinator. |
 | `DroppedRaw { raw_n_vars }` | `Experiment.to_anndata` | The file carries an `adata.raw` matrix but the current reconstruction mode (obs-filtered query, backed mode, or deletion-vectors active) cannot reproduce raw's obs-axis filtering, so raw is omitted. The on-disk raw sections are preserved. |
-| `DroppedRawOnWrite { raw_n_vars }` | `pyscx.from_anndata` with SCX-backed / lazy `X` | The **source** file carries raw that the file being written will not. Distinct from `DroppedRaw`: its "on-disk raw sections are preserved" reassurance is true of the source and says nothing about the output, where raw is gone for good. Convert from the h5ad, or from an in-memory AnnData whose `.raw` is set. |
+| `DroppedRawOnWrite { raw_n_vars, reason }` | `pyscx.from_anndata` with SCX-backed / lazy `X`; `from_h5ad` / `scx convert` with `--sort-by` / `--group-by` | The **source** carries raw that the file being written will not. Distinct from `DroppedRaw`: its "on-disk raw sections are preserved" reassurance is true of the source and says nothing about the output, where raw is gone for good. `reason` is supplied **per call site**, because the doors differ — the SCX → SCX rewrite loses raw because the in-memory AnnData does not hold it (convert from the h5ad instead), while reorder-on-convert loses it because raw streams unpermuted (convert without the reorder instead). A single baked-in remedy would be wrong on one of them. |
 | `DroppedRawVarm { keys }` | h5ad ingest and `pyscx.from_anndata` | `adata.raw.varm` is not representable — the raw section family stores `raw/X` and `raw/var` only — so raw's own var-axis mappings are dropped. `raw.X` / `raw.var` are unaffected. |
 
 ## Round-trip fidelity
@@ -559,7 +559,7 @@ is lost *silently*.
 | **dense** `obsp` / `varp` | lossy | — | Ingested as nonzero **float32 COO** (only nonzeros stored); both `to_anndata` and `to_h5ad` re-emit it as a **sparse** matrix (a dense input becomes sparse; values identical). |
 | CSR `obsp` / `varp` | lossy | — | Round-trips `h5ad → scx → h5ad` (and via `to_anndata`) as **float32 CSR**; values downcast to `f32`. Under deletion vectors, `obsp` is filtered on both axes; `varp` (var axis) is never obs-deleted. |
 | CSC / unsupported `obsp` / `varp` | dropped | `DroppedObsp` | CSC and other non-CSR/non-dense pairwise layouts are dropped on ingest. |
-| `adata.raw` | preserved² | `DroppedRaw` / `DroppedRawOnWrite` (some modes) | Round-trips raw counts bit-exact with the wider var axis through **both** write doors — `h5ad → scx → h5ad` and in-memory `pyscx.from_anndata` / `pyscx.write`. ² Dropped, with a warning, under obs-filtered `to_anndata`, backed mode, and deletion-vector-active files, and on the SCX-backed / lazy-`X` rewrite. See [`adata.raw`](#adataraw). |
+| `adata.raw` | preserved² | `DroppedRaw` / `DroppedRawOnWrite` (some modes) | Round-trips raw counts bit-exact with the wider var axis through **both** write doors — `h5ad → scx → h5ad` and in-memory `pyscx.from_anndata` / `pyscx.write`. ² Dropped, with a warning, under obs-filtered `to_anndata`, backed mode, and deletion-vector-active files, on the SCX-backed / lazy-`X` rewrite, and under reorder-on-convert (`--sort-by` / `--group-by`). See [`adata.raw`](#adataraw). |
 | `adata.raw.varm` | dropped | `DroppedRawVarm` | Raw's own var-axis mappings have no section in the raw family (`raw/X` + `raw/var` only). `raw.X` and `raw.var` are unaffected. |
 | `uns` scalars / 1-D & 2-D numeric arrays / nested dicts | preserved | — | Round-trip through the `uns` JSON representation. |
 | `uns` pandas **DataFrame** | lossy | `FlattenedUnsDataframe` | Preserved as a nested dict (per-column values + `_index`); **not** reconstructed as a `pd.DataFrame` (column order / categorical dtypes not restored). |
@@ -620,14 +620,22 @@ axis intact. Raw is **dropped with a `DroppedRaw` warning** under obs-filtered
 `to_anndata`, backed mode, and deletion-vector-active files (those modes do not yet
 re-filter raw's obs axis).
 
-Two write paths still cannot carry raw and say so rather than dropping it in silence:
+Three write paths still cannot carry raw and say so rather than dropping it in silence.
+The first two warn with `DroppedRawOnWrite`, whose `reason` is supplied per call site —
+they lose raw for different causes, so a single baked-in remedy would misdirect one of
+them:
 
 - **SCX-backed / lazy `X` rewrite.** `pyscx.from_anndata` writes the sections the
   in-memory AnnData holds, and backed reconstruction sets `.raw` to `None`, so a
-  `pyscx.open(f).to_anndata(backed=True)` → `from_anndata` round-trip loses raw. It
-  warns `DroppedRawOnWrite`, keyed off the *source* file rather than the object —
-  `DroppedRaw`'s "the on-disk raw sections are preserved" would be misleading here,
-  since the file being written has none.
+  `pyscx.open(f).to_anndata(backed=True)` → `from_anndata` round-trip loses raw. Keyed
+  off the *source* file rather than the object — `DroppedRaw`'s "the on-disk raw
+  sections are preserved" would be misleading here, since the file being written has
+  none. Remedy: convert from the h5ad, or from an in-memory AnnData whose `.raw` is set.
+- **Reorder-on-convert** (`from_h5ad(..., sort_by=…)` / `scx convert --sort-by` /
+  `--group-by`). The permutation is applied to `X` / `obs` / `obsm` / `layers` while raw
+  is streamed in source order, so carrying it would leave raw's rows attached to the
+  wrong cells. Remedy: convert without the reorder. (`from_anndata(sort_by=…)` on an
+  in-memory AnnData is rejected outright, so it cannot reach this.)
 - **`merge` / `compact` / `sort` / `append` / `preprocess`**, which need raw's obs axis
   filtered in lockstep with `X`. The first four warn; `append` and `preprocess` refuse.
 

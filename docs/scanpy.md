@@ -361,9 +361,12 @@ reconstructs `adata.raw`, and `to_h5ad` re-emits `/raw/X` + `/raw/var`, so
 `from_anndata(adata)` / `write(adata, path)` path writes the same section family from
 `adata.raw.X` + `adata.raw.var`, so both doors preserve raw identically. Raw is dropped
 (with a `DroppedRaw` warning) under obs-filtered `to_anndata`, backed mode, and
-deletion-vector-active files, and (with `DroppedRawOnWrite`) on the SCX-backed /
-lazy-`X` rewrite, where the in-memory AnnData's `.raw` is `None`. `adata.raw.varm` has
-no section and is dropped with `DroppedRawVarm`.
+deletion-vector-active files, and (with `DroppedRawOnWrite`) on two write paths: the
+SCX-backed / lazy-`X` rewrite, where the in-memory AnnData's `.raw` is `None`, and
+reorder-on-convert (`--sort-by` / `--group-by`), where raw streams unpermuted and would
+end up attached to the wrong cells. That warning's remedy is per call site — convert
+from the h5ad for the first, convert without the reorder for the second.
+`adata.raw.varm` has no section and is dropped with `DroppedRawVarm`.
 See [docs/api.md § `adata.raw`](api.md#adataraw).
 
 ### Exporting back to MTX

@@ -106,9 +106,13 @@ shard-by-shard on `stream=True`, the default) and the in-memory
 `to_h5ad` re-emits `/raw/X` + `/raw/var`. Caveats: raw
 is dropped with a `DroppedRaw` warning under obs-filtered `to_anndata`, backed mode,
 and deletion-vector-active files (those paths don't yet re-filter raw's obs axis),
-and with `DroppedRawOnWrite` on the SCX-backed / lazy-`X` rewrite
+and with `DroppedRawOnWrite` on two write paths: the SCX-backed / lazy-`X` rewrite
 (`pyscx.open(f).to_anndata(backed=True)` → `from_anndata`), where backed
-reconstruction leaves `.raw` unset — convert from the h5ad to keep raw there.
+reconstruction leaves `.raw` unset — convert from the h5ad to keep raw there — and
+reorder-on-convert (`from_h5ad(..., sort_by=…)` / `scx convert --sort-by` /
+`--group-by`), where raw streams in source order while X/obs/obsm/layers are
+permuted, so keeping it would misalign raw's rows — convert without the reorder to
+keep raw. The warning carries a per-call-site remedy for exactly this reason.
 `adata.raw.varm` has no section in the raw family and is dropped with
 `DroppedRawVarm` on both ingest doors. A raw whose `X` row count disagrees with
 `n_obs` is rejected rather than written.
