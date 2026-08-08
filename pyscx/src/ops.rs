@@ -1629,31 +1629,12 @@ fn report_modify_metadata_index(
     py: Python<'_>,
     summary: scx_ops::ModifyMetadataSummary,
 ) -> PyResult<()> {
-    let unreported = |columns: &[String], outcomes: &[BuildOutcome]| -> Vec<String> {
-        columns
-            .iter()
-            .filter(|c| {
-                !outcomes.iter().any(|o| {
-                    let named = match o {
-                        BuildOutcome::ForcedColumnError { column, .. } => column,
-                        BuildOutcome::PresetSkipped { column, .. } => column,
-                    };
-                    named == *c
-                })
-            })
-            .cloned()
-            .collect()
-    };
-    let (obs_unreported, var_unreported) = match summary.index.result.as_ref() {
-        Some(r) => (
-            unreported(&summary.obs_columns_not_carried, &r.obs_outcomes),
-            unreported(&summary.var_columns_not_carried, &r.var_outcomes),
-        ),
-        None => (
-            summary.obs_columns_not_carried.clone(),
-            summary.var_columns_not_carried.clone(),
-        ),
-    };
+    // Computed before `process_index_summary` consumes the summary. The filter
+    // lives in `scx-ops` so this and the CLI cannot drift on it — the CLI
+    // rendering both channels unfiltered is exactly how one column came to be
+    // warned about twice.
+    let obs_unreported = summary.obs_not_carried_unreported();
+    let var_unreported = summary.var_not_carried_unreported();
 
     process_index_summary(py, summary.index)?;
 

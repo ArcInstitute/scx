@@ -125,9 +125,12 @@ fn report_index_outcome(summary: &scx_ops::ModifyMetadataSummary) {
             println!("  {axis} predicate index {how} over {columns:?}");
         }
     }
+    // `*_not_carried_unreported`, not the raw lists: on the carry path
+    // `emit_index_summary` above has already named every column that could not
+    // be carried, and printing the raw list too warns twice about one column.
     for (axis, columns) in [
-        ("obs", &summary.obs_columns_not_carried),
-        ("var", &summary.var_columns_not_carried),
+        ("obs", summary.obs_not_carried_unreported()),
+        ("var", summary.var_not_carried_unreported()),
     ] {
         if !columns.is_empty() {
             eprintln!(

@@ -436,6 +436,79 @@ fn an_explicit_request_reports_the_index_columns_it_drops() {
     );
 }
 
+/// The two report channels overlap, and a front end rendering both raw warns
+/// twice about one column.
+///
+/// On the carry path every column that could not be carried also has a
+/// `PresetSkipped` outcome naming it; on the explicit-request path the builder
+/// never sees the old index and emits nothing. `*_not_carried_unreported` is the
+/// difference, and it lives in `scx-ops` so pyscx and the CLI cannot drift —
+/// the CLI double-warned the moment it started rendering outcomes at all.
+#[test]
+fn the_two_report_channels_do_not_both_name_the_same_column() {
+    let dir = TempDir::new().unwrap();
+
+    // Carry path: `n_counts` comes back as an unindexable dtype, so the builder
+    // emits a `PresetSkipped` for it AND it lands in `obs_columns_not_carried`.
+    let path = write_indexed_fixture(&dir, "carry.scx");
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("n_counts", DataType::Boolean, false),
+    ]);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                (0..N_OBS).map(|i| format!("cell_{i}")).collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                (0..N_OBS).map(|i| i % 2 == 0).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let carried = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs),
+            index: no_index_rebuild(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        carried.obs_columns_not_carried,
+        vec!["n_counts".to_string()]
+    );
+    assert!(
+        carried.obs_not_carried_unreported().is_empty(),
+        "the builder already emitted a PresetSkipped naming this column"
+    );
+
+    // Explicit path: the builder is handed only what the caller named, so it
+    // says nothing about `n_counts` and this channel is the only one that can.
+    let path = write_indexed_fixture(&dir, "explicit.scx");
+    let explicit = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_frame(n_counts_after)),
+            index: ConversionPredicateIndexOptions {
+                index_obs: vec!["cell_id".to_string()],
+                index_var: vec![],
+                index_preset: None,
+                index_auto_threshold: 0,
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        explicit.obs_not_carried_unreported(),
+        vec!["n_counts".to_string()],
+        "nothing else names it, so filtering it out would silence the loss"
+    );
+}
+
 /// Naming an index column on ONE axis must not change the other axis's policy.
 ///
 /// `user_wants_index` is a whole-patch question — true if any index knob is set

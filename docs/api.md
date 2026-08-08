@@ -929,7 +929,13 @@ recorded in provenance and is the only record of the permutation. See
 ### `scx_ops::modify_metadata(path, patch: &MetadataPatch) → Result<ModifyMetadataSummary>`
 Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) of an existing file **in place, without re-encoding `X`**. Appends only the replaced section bytes at EOF and atomically repoints the catalog — cost is O(replaced sections), the matrix shards are never read or rewritten. The CSC sidecar and `data_generation` are preserved (no `--rebuild-csc`). Any `None` field on `MetadataPatch` is left untouched. **A replaced `obs`/`var` keeps the predicate index it had**: the old section describes values that are gone, so it is rebuilt over the same columns (which re-derives the per-shard column stats, so pushdown survives the edit); `patch.index` names a different set instead. `n_obs` / `n_vars` are invariants — a shape mismatch is rejected before any write (`OpsError::ShapeMismatch`). Replace semantics, not merge. Multimodal (`modality_id != 0`) returns `OpsError::MultimodalUnsupported`. Advisory flock; rollback-able via the catalog chain.
 
-The returned `ModifyMetadataSummary` carries the per-column build outcomes (in the same shape every other rewrite op reports them) plus `obs_columns_not_carried` / `var_columns_not_carried` — the columns the file indexed that the new index does not — so a caller can surface the loss instead of leaving it silent. `set_uns` discards it: a `uns`-only patch touches no axis.
+The returned `ModifyMetadataSummary` carries the per-column build outcomes (in the same shape every other rewrite op reports them) plus:
+
+- `obs_columns_not_carried` / `var_columns_not_carried` — the columns the file indexed that the new index does not, so a caller can surface the loss instead of leaving it silent. Render these through `obs_not_carried_unreported()` / `var_not_carried_unreported()`, which drop the columns a build outcome already names: the two channels overlap on the carry path, and a front end printing both raw warns twice about one column.
+- `obs_carried_forward` / `var_carried_forward` — per axis, and **success-gated**: true only when that axis was carried *and* the rebuild produced an index. A carry whose every column turned out unindexable reports `false` here and `true` in `obs_predicate_index_dropped`, rather than both at once.
+- `obs_predicate_index_dropped` / `var_predicate_index_dropped` — the file had an index on that axis and the output has none.
+
+`set_uns` discards the summary: a `uns`-only patch touches no axis.
 
 ### `scx_ops::set_uns(path, uns: &serde_json::Value) → Result<()>`
 Convenience wrapper over `modify_metadata` for the headline case — replace the whole `uns` block (O(uns bytes)).

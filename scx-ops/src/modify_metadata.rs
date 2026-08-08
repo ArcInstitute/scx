@@ -33,7 +33,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use serde_json::Value;
 
-use scx_engine::{ConversionPredicateIndexOptions, ConversionPredicateIndexResult};
+use scx_engine::{BuildOutcome, ConversionPredicateIndexOptions, ConversionPredicateIndexResult};
 use scx_format_io::catalog::{ColumnStat, FullCatalog, FullCatalogEntry};
 use scx_format_io::checksum::blake3_hash;
 use scx_format_io::provenance::{Provenance, ProvenanceEntry};
@@ -174,6 +174,53 @@ pub struct ModifyMetadataSummary {
     pub obs_predicate_index_dropped: bool,
     /// True when the file had a var predicate index and the output has none.
     pub var_predicate_index_dropped: bool,
+}
+
+impl ModifyMetadataSummary {
+    /// [`Self::obs_columns_not_carried`] minus the columns a build outcome
+    /// already names — i.e. the ones a caller must report itself.
+    ///
+    /// The two channels overlap by construction: on the carry path every
+    /// column that could not be carried also has a `PresetSkipped` outcome
+    /// carrying the precise reason, while on the explicit-request path the
+    /// builder never sees the old index and emits nothing. A front end that
+    /// renders both without this filter warns twice about one column — which
+    /// is what the CLI did the moment it started rendering outcomes at all.
+    /// Living here rather than in each front end is what keeps pyscx and the
+    /// CLI from drifting on it.
+    pub fn obs_not_carried_unreported(&self) -> Vec<String> {
+        self.unreported(&self.obs_columns_not_carried, |r| &r.obs_outcomes)
+    }
+
+    /// The var-axis counterpart of [`Self::obs_not_carried_unreported`].
+    pub fn var_not_carried_unreported(&self) -> Vec<String> {
+        self.unreported(&self.var_columns_not_carried, |r| &r.var_outcomes)
+    }
+
+    fn unreported(
+        &self,
+        columns: &[String],
+        pick: fn(&ConversionPredicateIndexResult) -> &[BuildOutcome],
+    ) -> Vec<String> {
+        let Some(result) = self.index.result.as_ref() else {
+            return columns.to_vec();
+        };
+
+        let outcomes = pick(result);
+        columns
+            .iter()
+            .filter(|c| {
+                !outcomes.iter().any(|o| {
+                    let named = match o {
+                        BuildOutcome::ForcedColumnError { column, .. } => column,
+                        BuildOutcome::PresetSkipped { column, .. } => column,
+                    };
+                    named == *c
+                })
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 impl MetadataPatch {
@@ -505,8 +552,8 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
     // --- What survived the replacement -------------------------------------
     // Computed from what the builder actually indexed rather than from what was
     // requested, so it stays true on every route into this function — including
-    // the pre-existing quirk where `index_var=[…]` alone puts a replaced obs on
-    // the auto-detect path.
+    // the `index_preset` / `index_auto_threshold` routes, where the columns that
+    // end up indexed are not a list the caller wrote down anywhere.
     let not_carried = |existing: &[String], indexed: &[String]| -> Vec<String> {
         existing
             .iter()
