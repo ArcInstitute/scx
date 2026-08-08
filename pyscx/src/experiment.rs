@@ -1404,7 +1404,7 @@ impl PyExperiment {
                 let mut max_value_width: u64 = 1;
                 for i in 0..n_csr_shards {
                     let bytes = self
-                        .reader
+                        .reader()?
                         .read_raw_csr_shard_bytes_for(0, i)
                         .map_err(|e| PyRuntimeError::new_err(format!("read CSR shard {i}: {e}")))?;
                     let header = scx_format_io::shard::ShardHeader::read_from(
