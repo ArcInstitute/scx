@@ -15,6 +15,28 @@ use crate::to_pyerr;
 
 use super::*;
 
+/// Warn that a source file's `adata.raw` will not reach the output.
+///
+/// The SCX → SCX routes write the sections the in-memory AnnData holds,
+/// and `to_anndata(backed=True)` sets `.raw` to `None` — so raw is absent
+/// from the object, not deliberately dropped by the caller. Silence here
+/// would be the worst case: the read side already told the user "the
+/// on-disk raw sections are preserved", which is true of the *source* and
+/// says nothing about the file being written. Hence
+/// [`ConvertWarning::DroppedRawOnWrite`] rather than the read-side
+/// `DroppedRaw`, whose reassurance would be actively wrong here.
+fn warn_source_raw_dropped(py: Python<'_>, src_reader: &ScxReader) -> PyResult<()> {
+    if src_reader.header().has_raw() {
+        warn_python_convert(
+            py,
+            &scx_convert::ConvertWarning::DroppedRawOnWrite {
+                raw_n_vars: src_reader.raw_n_vars().unwrap_or(0),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// Route an AnnData with `adata.X = ScxBackedSparseDataset` through
 /// an SCX → SCX streaming writer.
 ///
@@ -60,6 +82,9 @@ pub(crate) fn route_scx_backed_to_scx(
     let src_path_owned = src_path.to_path_buf();
 
     let src_reader = ScxReader::open(&src_path_owned).map_err(to_pyerr)?;
+    // Before any write path is chosen — passthrough and decode-encode both
+    // drop raw, so the notice belongs here rather than in either branch.
+    warn_source_raw_dropped(py, &src_reader)?;
     let src_header = src_reader.header().clone();
     let src_n_obs = src_header.n_obs;
     let src_n_vars = src_header.n_vars;
@@ -421,13 +446,15 @@ pub(crate) fn route_scx_lazy_to_scx(
     // per-shard re-encode applies value transforms only (no column reorder),
     // so it preserves a canonical source but cannot canonicalize a pre-v3
     // one — gate the v3 stamp on the source version.
-    let src_header_meta: Option<(Option<CodecId>, u16)> = lazy.source_path().and_then(|p| {
-        ScxReader::open(p).ok().map(|r| {
-            (
-                CodecId::from_u8(r.header().codec_id),
-                r.header().format_version,
-            )
-        })
+    let src_reader = lazy.source_path().and_then(|p| ScxReader::open(p).ok());
+    if let Some(ref r) = src_reader {
+        warn_source_raw_dropped(py, r)?;
+    }
+    let src_header_meta: Option<(Option<CodecId>, u16)> = src_reader.as_ref().map(|r| {
+        (
+            CodecId::from_u8(r.header().codec_id),
+            r.header().format_version,
+        )
     });
     let src_codec: Option<CodecId> = src_header_meta.and_then(|(c, _)| c);
     let src_format_version: u16 = src_header_meta

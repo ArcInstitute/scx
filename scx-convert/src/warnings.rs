@@ -174,6 +174,16 @@ pub enum ConvertWarning {
     /// query, or backed mode). The on-disk raw sections are preserved;
     /// only this particular reconstruction omits raw.
     DroppedRaw { raw_n_vars: usize },
+    /// The source file carries an `adata.raw` matrix that the file being
+    /// written will NOT carry. Distinct from [`Self::DroppedRaw`], which is
+    /// a read-side notice whose "the on-disk raw sections are preserved"
+    /// reassurance is true of the source and says nothing about an output
+    /// file — on this path raw is gone from the new file for good.
+    DroppedRawOnWrite { raw_n_vars: usize },
+    /// `adata.raw.varm` was present but is not representable: SCX's raw
+    /// section family stores `raw/X` and `raw/var` only. Raw's own var-axis
+    /// mappings are dropped on both h5ad ingest and the in-memory write.
+    DroppedRawVarm { keys: usize },
     /// `--group-target-bytes` (byte-budget grouped sharding) was
     /// requested on a dense or CSC-on-disk `/X`, which has no cheap per-row nnz
     /// to size shards by encoded width. The convert fell back to row-count
@@ -213,6 +223,8 @@ impl ConvertWarning {
             Self::CoercedNulls { .. } => "coerced_nulls",
             Self::UnsupportedExportColumn { .. } => "unsupported_export_column",
             Self::DroppedRaw { .. } => "dropped_raw",
+            Self::DroppedRawOnWrite { .. } => "dropped_raw_on_write",
+            Self::DroppedRawVarm { .. } => "dropped_raw_varm",
             Self::GroupByteModeUnsupported { .. } => "group_byte_mode_unsupported",
         }
     }
@@ -265,6 +277,21 @@ impl fmt::Display for ConvertWarning {
                  reconstruction; the mode in use (obs-filtered query, backed mode, or \
                  deletion-vectors-active file) cannot reproduce raw's obs-axis filtering. \
                  The on-disk raw sections are preserved."
+            ),
+            Self::DroppedRawOnWrite { raw_n_vars } => write!(
+                f,
+                "the source file carries an adata.raw matrix ({raw_n_vars} genes) that this \
+                 write does not carry forward, so the output file will have no raw. This \
+                 path writes the sections the in-memory AnnData holds, and backed \
+                 reconstruction sets .raw to None. To keep raw, convert from the h5ad \
+                 (pyscx.from_h5ad) or from an in-memory AnnData whose .raw is set."
+            ),
+            Self::DroppedRawVarm { keys } => write!(
+                f,
+                "adata.raw.varm carries {keys} key(s), which SCX's raw section family \
+                 cannot store (it holds raw/X and raw/var only) — they are dropped. \
+                 raw.X and raw.var are unaffected; move anything you need onto \
+                 raw.var columns, or keep it in adata.varm."
             ),
             Self::EagerAssemblyMemoryHigh {
                 estimated_bytes,

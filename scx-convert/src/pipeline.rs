@@ -3064,6 +3064,8 @@ fn ingest_raw_streaming(
         return Ok(());
     }
 
+    crate::h5ad::read::warn_raw_varm_if_present(file, sink);
+
     let raw_format = super::detect::detect_matrix_format_at(file, "raw/X", sink)?;
     let mut raw_reader: Box<dyn CsrShardStream> = match raw_format {
         MatrixFormat::Csr => Box::new(open_x_streaming(file, "raw/X", raw_format, sink)?),

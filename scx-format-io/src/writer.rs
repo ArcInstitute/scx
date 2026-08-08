@@ -1510,11 +1510,14 @@ impl ScxWriter {
             }
             // `RawCsrShard` (and metadata sections) deliberately bump no
             // counter: raw must not perturb the main matrix's
-            // `n_csr_shards`/`total_nnz`. `raw_csr_shard_count` (which
-            // only names `raw/X_shard_<idx>` in `write_raw_csr_shard`) is
-            // not advanced here because no current caller feeds a raw
-            // shard through this pre-encoded path; a future one that needs
-            // sequential raw names must bump `self.raw_csr_shard_count`.
+            // `n_csr_shards`/`total_nnz`, and `has_raw` is derived from the
+            // catalog by `FileHeader::sync_from_catalog` rather than from a
+            // counter. `raw_csr_shard_count` is not advanced either, and does
+            // not need to be: it exists only to name `raw/X_shard_<idx>` in
+            // `write_raw_csr_shard`, whereas every caller on this path
+            // (`pipeline::ingest_raw_streaming` via the streaming
+            // coordinator, and pyscx's in-memory `from_anndata` raw write)
+            // names its own shards from its own shard index before encoding.
             _ => {}
         }
 

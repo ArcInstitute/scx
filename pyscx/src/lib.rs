@@ -234,7 +234,8 @@ pub(crate) fn deep_validate_into(
 /// floats serialize as JSON numbers either way, and the in-array NaN/Inf
 /// case is only handled by the base64 path under `"tagged"`.
 ///
-/// By default `from_anndata()` does not mutate `adata.X` or `adata.layers`.
+/// By default `from_anndata()` does not mutate `adata.X`, `adata.layers`,
+/// or `adata.raw.X`.
 /// CSR inputs with unsorted indices are copied via
 /// `scipy.sparse.csr_matrix.sorted_indices()` so the caller's matrices are
 /// untouched. Pass `in_place=True` to allow in-place index sorting on the
