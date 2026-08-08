@@ -42,6 +42,34 @@
   empty `key` is an error rather than a silent join-on-nothing, since
   `rownames()` returns `NULL` on an object with no names.
 
+### Bug fixes
+
+- **Negative, `NA`/`NaN` and fractional row indices silently returned the wrong
+  cells.** `ScxBackedSparse$read_rows()` / `$read_row_indices()` and their
+  `ScxLazyTransformed` twins cast R doubles to `u64` with a bare `as`, which
+  *saturates* in Rust: `-1` and `NaN` both become `0`, and fractions truncate.
+  The bounds checks that followed only rejected values above `n_obs`, so a
+  saturated index was always in range. `bs$read_rows(-1, 10)` returned rows
+  1–10 and `bs$read_row_indices(c(NA, 3, -2))` returned rows 1, 4, 1 — no error,
+  no warning, wrong data. All four now validate before converting. These are
+  exported `$`-methods that bypass `[`'s R-side guards, so they were reachable
+  with no `[` involved.
+- **`scx_compute_lisi(perplexity = NaN)` returned a vector of exactly 1.0**
+  instead of erroring. `NaN <= 0` is false, so `NaN` slipped past the
+  positivity guard; the derived neighbour count collapsed to 1 and the
+  perplexity calibration loop never iterated, because every comparison against
+  `NaN` is false. LISI of 1.0 means "perfectly unmixed", so the failure looked
+  like a real batch-integration result. `perplexity` must now be finite.
+- `cache_shards` is clamped to the file's shard count. A large value
+  (`cache_shards = 1e9`) reached `LruCache::new`, which pre-allocates a hash
+  table of that capacity — tens of gigabytes, killing the R session with an
+  allocation abort rather than a catchable error.
+- `[` on `ScxBackedSparse` / `ScxLazyTransformed` now rejects non-finite row
+  indices and truncates fractional ones, matching `dgCMatrix` (`M[1.9, ]` is
+  row 1). The column index was already handed to Matrix, so one call
+  could previously have erred on `i` while truncating `j`. Note the deliberate
+  asymmetry: `[` truncates, the raw `$read_*` methods are strict.
+
 ### Improvements
 
 - `scx_delete()` accepts numeric (double) cell indices, so indices above

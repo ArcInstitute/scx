@@ -30,7 +30,16 @@ column index selects genes (applied to the returned matrix). Rows are
 returned in the requested order.
 }
 \details{
-Positive-integer and logical row indices are supported. Negative and
-character row indices are not (they raise an error); subset by computing the
-positive indices yourself, e.g. \code{bsd[setdiff(seq_len(nrow(bsd)), drop), ]}.
+Positive-integer and logical row indices are supported. Negative, character,
+\code{NA} and non-finite row indices are not (they raise an error); subset by
+computing the positive indices yourself, e.g.
+\code{bsd[setdiff(seq_len(nrow(bsd)), drop), ]}. Fractional indices are
+truncated, matching a \code{dgCMatrix} (\code{M[1.9, ]} is row 1) — the
+column index \code{j} is handed to \pkg{Matrix}'s own \code{[}, so both axes
+behave the same way in one call.
+
+The \code{$read_rows(start, end)} / \code{$read_row_indices(idx)} methods
+underneath are \strong{0-based} (\code{end} is an exclusive bound) and, unlike
+\code{[}, strict: fractional, negative, \code{NaN} and non-finite values raise
+rather than being coerced.
 }

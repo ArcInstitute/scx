@@ -111,6 +111,51 @@ test_that("out-of-bounds row index raises a clean error", {
   expect_error(bsd$read_rows(5, 2), "start") # start > end guard
 })
 
+test_that("raw read methods reject indices `f64 as u64` would saturate", {
+  path <- skip_if_no_fixture()
+  bsd <- scx_open(path)$x_backed()
+
+  # `$read_rows()` / `$read_row_indices()` are exported and bypass `[`'s guards.
+  # Rust's `f64 as u64` saturates (-1 -> 0, NaN -> 0) and truncates fractions, so
+  # every one of these silently returned the WRONG CELLS before the fix rather
+  # than erroring: read_rows(-1, 10) was identical to read_rows(0, 10).
+  expect_error(bsd$read_rows(-1, 10), "negative")
+  expect_error(bsd$read_rows(NaN, 10), "NA or NaN")
+  expect_error(bsd$read_rows(1.5, 3), "non-integer")
+  expect_error(bsd$read_rows(0, Inf), "non-finite")
+  expect_error(bsd$read_row_indices(c(NA, 3, -2)), "NA or NaN")
+  expect_error(bsd$read_row_indices(c(0, -1)), "negative")
+  expect_error(bsd$read_row_indices(c(0, 1.5)), "non-integer")
+
+  # The offending element is named by 1-based position, not just by value.
+  expect_error(bsd$read_row_indices(c(0, 1, -2)), "position 3")
+
+  # Valid boundary values must keep working: `end == n_obs` is a legal half-open
+  # bound (not an index), and 0 is a legal 0-based row.
+  expect_equal(nrow(bsd$read_rows(0, 20)), 20L)
+  expect_equal(nrow(bsd$read_rows(0, 0)), 0L)
+})
+
+test_that("`[` keeps Matrix's fractional-subscript semantics", {
+  path <- skip_if_no_fixture()
+  exp <- scx_open(path)
+  eager <- exp$x_matrix()
+  bsd <- exp$x_backed()
+
+  # A dgCMatrix truncates fractional subscripts (`M[1.9, ]` is row 1), and
+  # `bsd[i, j]` hands `j` to Matrix's own `[`. If the row path went strict while
+  # the column path truncated, one call would error on `i` and silently truncate
+  # `j`. `[` therefore truncates; the raw `$read_*` methods stay strict.
+  expect_equal(as.matrix(bsd[1.9, ]), as.matrix(eager[1, , drop = FALSE]))
+  expect_equal(as.matrix(bsd[c(1.9, 2.9, 3.9), ]), as.matrix(eager[1:3, , drop = FALSE]))
+  expect_equal(as.matrix(bsd[c(1.2, 2.9), ]), as.matrix(eager[1:2, , drop = FALSE]))
+  expect_equal(as.matrix(bsd[2.5, 1.9]), as.matrix(eager[2, 1, drop = FALSE]))
+
+  # Non-finite subscripts are rejected in R, with R's spelling of Inf.
+  expect_error(bsd[Inf, ], "finite")
+  expect_error(bsd[c(1, Inf), ], "finite")
+})
+
 test_that("backed + lazy read correctly across multiple shards", {
   path <- skip_if_no_fixture()
   tmp <- tempfile(fileext = ".scx")

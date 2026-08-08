@@ -105,7 +105,12 @@ impl RLazyTransformed {
     pub(crate) fn open_impl(path: &str, cache_shards: usize) -> Result<Self> {
         let reader = ScxReader::open(path)
             .map_err(|e| Error::Other(format!("failed to open SCX file '{}': {}", path, e)))?;
-        let backed = BackedCsrReader::new(reader, cache_shards.max(1));
+        // Clamped on both ends — see `crate::util::clamp_cache_shards`; the
+        // upper bound stops an enormous request from pre-allocating a HashMap
+        // of that capacity inside `LruCache::new`.
+        let n_shards = reader.header().n_csr_shards as usize;
+        let cache_shards = crate::util::clamp_cache_shards(cache_shards, n_shards);
+        let backed = BackedCsrReader::new(reader, cache_shards);
         let (n_obs, n_vars) = backed.shape();
         Ok(Self {
             backed: Arc::new(backed),
@@ -248,7 +253,10 @@ impl RLazyTransformed {
     /// Open a lazy-transform handle (empty chain) over an SCX file's X matrix.
     #[allow(clippy::new_ret_no_self)]
     fn new(path: &str, cache_shards: f64) -> Robj {
-        throw_on_err(Self::open_impl(path, cache_shards as usize))
+        throw_on_err((|| -> Result<Self> {
+            let cache_shards = crate::util::r_whole_usize(cache_shards, "cache_shards")?;
+            Self::open_impl(path, cache_shards)
+        })())
     }
 
     /// Number of observations (cells). R numeric (f64) to allow >2B cells.
@@ -303,15 +311,26 @@ impl RLazyTransformed {
     }
 
     /// Read a contiguous 0-based, half-open `[start, end)` row range as a
-    /// transformed dgCMatrix.
+    /// transformed dgCMatrix. Validated before the cast, exactly as in
+    /// [`crate::backed::RBackedSparse::read_rows`] — `f64 as u64` saturates.
     fn read_rows(&self, start: f64, end: f64) -> Robj {
-        throw_on_err(self.read_rows_impl(start as u64, end as u64))
+        throw_on_err((|| -> Result<Robj> {
+            let start = crate::util::r_whole_u64(start, "0-based row range start")?;
+            let end = crate::util::r_whole_u64(end, "0-based row range end")?;
+            self.read_rows_impl(start, end)
+        })())
     }
 
     /// Read arbitrary 0-based rows (in the given order) as a transformed dgCMatrix.
+    ///
+    /// Sharper here than on the backed handle: `idx0` is also the `global_rows`
+    /// slice that indexes `row_sums` / `factors` in `apply_transforms`, so a
+    /// saturated index would silently apply the wrong cell's scaling factor.
     fn read_row_indices(&self, indices: Vec<f64>) -> Robj {
-        let idx0: Vec<u64> = indices.iter().map(|&r| r as u64).collect();
-        throw_on_err(self.read_row_indices_impl(&idx0))
+        throw_on_err((|| -> Result<Robj> {
+            let idx0 = crate::util::r_whole_u64_slice(&indices, "0-based row index")?;
+            self.read_row_indices_impl(&idx0)
+        })())
     }
 
     /// Per-row sums over the transformed data (streamed, no full materialize).

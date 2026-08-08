@@ -25,6 +25,9 @@ A transformed \code{dgCMatrix} (cells x genes).
 \description{
 Reads the requested rows (cells) from disk, applies the transform chain, and
 returns a transformed \code{dgCMatrix} of cells x genes. Same indexing rules
-as \code{\link{[.ScxBackedSparse}}: positive-integer and logical row indices;
-an optional column index is applied to the returned matrix.
+as \code{\link{[.ScxBackedSparse}}: positive-integer and logical row indices,
+fractional ones truncated as a \code{dgCMatrix} does, \code{NA} / non-finite
+rejected; an optional column index is applied to the returned matrix. The
+underlying \code{$read_rows()} / \code{$read_row_indices()} methods are
+0-based and strict.
 }

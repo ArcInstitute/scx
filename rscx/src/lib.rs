@@ -363,7 +363,10 @@ impl ScxExperiment {
     ///
     /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
     fn x_backed(&self, cache_shards: f64) -> Robj {
-        util::throw_on_err(self.x_backed_impl(cache_shards as usize))
+        util::throw_on_err((|| -> Result<backed::RBackedSparse> {
+            let cache_shards = util::r_whole_usize(cache_shards, "cache_shards")?;
+            self.x_backed_impl(cache_shards)
+        })())
     }
 
     /// Open a lazy-transform view of X (no data read, no transforms yet).
@@ -374,7 +377,10 @@ impl ScxExperiment {
     ///
     /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
     fn x_lazy(&self, cache_shards: f64) -> Robj {
-        util::throw_on_err(self.x_lazy_impl(cache_shards as usize))
+        util::throw_on_err((|| -> Result<lazy::RLazyTransformed> {
+            let cache_shards = util::r_whole_usize(cache_shards, "cache_shards")?;
+            self.x_lazy_impl(cache_shards)
+        })())
     }
 
     /// Phase I.1: True if this file has a registered modality table.

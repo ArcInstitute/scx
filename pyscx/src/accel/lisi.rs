@@ -93,8 +93,14 @@ pub fn compute_lisi<'py>(
     n_neighbors: Option<usize>,
     approximate_knn: bool,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    if perplexity <= 0.0 {
-        return Err(PyValueError::new_err("perplexity must be > 0"));
+    // `is_finite` first: NaN compares false against everything, so a lone
+    // `perplexity <= 0.0` passed it through and produced a full-length vector
+    // of exactly 1.0 — "perfectly mixed" — with no error. See the same guard in
+    // `scx_accel::lisi::compute_lisi`, which is the load-bearing one.
+    if !perplexity.is_finite() || perplexity <= 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "perplexity must be a finite positive number (got {perplexity})"
+        )));
     }
 
     // Returns the LISI vector *and* writes it to `adata.obs[f"lisi_{key}"]`

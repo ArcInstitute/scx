@@ -117,3 +117,24 @@ test_that("nnz is preserved across transforms; out-of-bounds slices error", {
   expect_error(lt[0, ], "1-based")          # 0 rejected (1-based)
   expect_error(lt$read_rows(5, 2), "start") # start > end guard
 })
+
+test_that("lazy raw read methods reject indices `f64 as u64` would saturate", {
+  path <- skip_if_no_fixture()
+  eager <- scx_open(path)$x_matrix()
+  lt <- scx_lazy_transform(path)
+
+  # Same defect as the backed handle (see test-backed.R): every one of these
+  # returned the wrong rows silently, because the bounds checks that follow the
+  # cast only reject values ABOVE n_obs, never a saturated 0.
+  expect_error(lt$read_rows(-1, 10), "negative")
+  expect_error(lt$read_rows(NaN, 10), "NA or NaN")
+  expect_error(lt$read_rows(1.5, 3), "non-integer")
+  expect_error(lt$read_rows(0, Inf), "non-finite")
+  expect_error(lt$read_row_indices(c(NA, 3, -2)), "NA or NaN")
+  expect_error(lt$read_row_indices(c(0, -1)), "negative")
+  expect_error(lt$read_row_indices(c(0, 1.5)), "non-integer")
+
+  # `[` still truncates like a dgCMatrix, and the identity chain is a no-op.
+  expect_equal(as.matrix(lt[1.9, ]), as.matrix(eager[1, , drop = FALSE]))
+  expect_error(lt[Inf, ], "finite")
+})

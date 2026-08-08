@@ -189,20 +189,13 @@ fn scx_delete(path: &str, cell_indices: Vec<f64>) -> Robj {
 }
 
 fn scx_delete_impl(path: &str, cell_indices: Vec<f64>) -> Result<Robj> {
-    let indices: Vec<u64> = cell_indices
-        .into_iter()
-        .map(|v| {
-            if !v.is_finite() {
-                Err(Error::Other(format!("non-finite cell index: {v}")))
-            } else if v < 0.0 {
-                Err(Error::Other(format!("negative cell index: {v}")))
-            } else if v.fract() != 0.0 {
-                Err(Error::Other(format!("non-integer cell index: {v}")))
-            } else {
-                Ok(v as u64)
-            }
-        })
-        .collect::<Result<Vec<u64>>>()?;
+    // This validation used to be inlined here — the crate's only correct
+    // `f64 -> index` conversion, reused by nothing, while four row-index sites
+    // in `backed.rs`/`lazy.rs` cast bare. It now lives in `crate::util` so
+    // there is one implementation. Not labelled "0-based": the public
+    // `scx_delete()` wrapper is 1-based and subtracts 1 before calling in, so
+    // a 0-based label here would name a number the user never typed.
+    let indices = crate::util::r_whole_u64_slice(&cell_indices, "cell index")?;
 
     let p = Path::new(path);
     let total = scx_ops::mark_deleted(p, &indices).map_err(|e| Error::Other(e.to_string()))?;

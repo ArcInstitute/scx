@@ -86,8 +86,11 @@ dim.ScxLazyTransformed <- function(x) {
 #'
 #' Reads the requested rows (cells) from disk, applies the transform chain, and
 #' returns a transformed \code{dgCMatrix} of cells x genes. Same indexing rules
-#' as \code{\link{[.ScxBackedSparse}}: positive-integer and logical row indices;
-#' an optional column index is applied to the returned matrix.
+#' as \code{\link{[.ScxBackedSparse}}: positive-integer and logical row indices,
+#' fractional ones truncated as a \code{dgCMatrix} does, \code{NA} / non-finite
+#' rejected; an optional column index is applied to the returned matrix. The
+#' underlying \code{$read_rows()} / \code{$read_row_indices()} methods are
+#' 0-based and strict.
 #'
 #' @param x An \code{ScxLazyTransformed}.
 #' @param i Row (cell) selector: positive integers or a logical vector of length
@@ -119,12 +122,19 @@ dim.ScxLazyTransformed <- function(x) {
       if (anyNA(i)) {
         stop("NA row indices are not supported for ScxLazyTransformed", call. = FALSE)
       }
+      if (length(i) && !all(is.finite(i))) {
+        stop("row indices must be finite; Inf / -Inf are not supported for ScxLazyTransformed",
+             call. = FALSE)
+      }
       # R is 1-based; reject 0 and negatives (0 would underflow to -1 below and
       # surface as a confusing out-of-bounds error from the Rust core).
       if (length(i) && any(i < 1)) {
         stop("row indices must be >= 1 (1-based); 0 / negative indices are not supported for ScxLazyTransformed",
              call. = FALSE)
       }
+      # Truncate fractional subscripts to match a dgCMatrix; see
+      # `[.ScxBackedSparse` for why this must precede the contiguity check.
+      i <- trunc(i)
     }
 
     if (length(i) == 0) {

@@ -14,8 +14,14 @@
 //! `n_obs`/`n_vars`/`nnz` are returned, so files with >2^31 cells stay
 //! addressable. The R-side `[` method converts 1-based R indices to the 0-based
 //! forms the core expects; the Rust layer here treats indices as already
-//! 0-based and bounds-checks them so an out-of-range request raises a clean
-//! error instead of silently truncating.
+//! 0-based.
+//!
+//! Every index is run through [`crate::util::r_whole_u64`] **before** the cast
+//! to `u64`, and only then bounds-checked. Both halves are needed: the bounds
+//! check alone rejects values above `n_obs`, but `f64 as u64` saturates, so
+//! `-1.0` and `NaN` arrive as `0` — in range, and silently the wrong cells.
+//! `$read_rows()` / `$read_row_indices()` are exported `$`-methods that bypass
+//! `[`'s R-side guards entirely, so this layer is the only check they get.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,8 +53,14 @@ impl RBackedSparse {
         let path_buf = PathBuf::from(path);
         let reader = ScxReader::open(&path_buf)
             .map_err(|e| Error::Other(format!("failed to open SCX file '{}': {}", path, e)))?;
-        // A cache of zero shards would defeat the LRU; clamp to at least one.
-        let cache_shards = cache_shards.max(1);
+        // Clamp on both ends. Zero would defeat the LRU; the upper bound is
+        // load-bearing because `cache_shards` flows into `LruCache::new`, which
+        // pre-allocates a `HashMap` of that capacity — `cache_shards = 1e9`
+        // would reserve tens of gigabytes and abort the R session with no
+        // catchable error. A cache larger than the shard count is useless
+        // anyway, so the file's own shard count is the natural ceiling.
+        let n_shards = reader.header().n_csr_shards as usize;
+        let cache_shards = crate::util::clamp_cache_shards(cache_shards, n_shards);
         let backed = BackedCsrReader::new(reader, cache_shards);
         let (n_obs, n_vars) = backed.shape();
         Ok(Self {
@@ -113,7 +125,10 @@ impl RBackedSparse {
     /// `ScxExperiment` constructor does (see B3 / `crate::util::throw_on_err`).
     #[allow(clippy::new_ret_no_self)]
     fn new(path: &str, cache_shards: f64) -> Robj {
-        throw_on_err(Self::open_impl(path, cache_shards as usize))
+        throw_on_err((|| -> Result<Self> {
+            let cache_shards = crate::util::r_whole_usize(cache_shards, "cache_shards")?;
+            Self::open_impl(path, cache_shards)
+        })())
     }
 
     /// Number of observations (cells). R numeric (f64) to allow >2B cells.
@@ -138,14 +153,26 @@ impl RBackedSparse {
 
     /// Read a contiguous 0-based, half-open `[start, end)` row range as a
     /// dgCMatrix. The R `[` method converts from 1-based indices.
+    ///
+    /// Both arguments are validated before the cast: `f64 as u64` saturates, so
+    /// an unchecked `-1` or `NaN` would read row 0 and return the wrong cells.
     fn read_rows(&self, start: f64, end: f64) -> Robj {
-        throw_on_err(self.read_rows_impl(start as u64, end as u64))
+        throw_on_err((|| -> Result<Robj> {
+            let start = crate::util::r_whole_u64(start, "0-based row range start")?;
+            let end = crate::util::r_whole_u64(end, "0-based row range end")?;
+            self.read_rows_impl(start, end)
+        })())
     }
 
     /// Read arbitrary 0-based rows (in the given order) as a dgCMatrix.
+    ///
+    /// The `Vec<f64>` form is where validation matters most: extendr rejects
+    /// `NA` for a scalar `f64` argument, but not for an element of a vector.
     fn read_row_indices(&self, indices: Vec<f64>) -> Robj {
-        let idx0: Vec<u64> = indices.iter().map(|&r| r as u64).collect();
-        throw_on_err(self.read_row_indices_impl(&idx0))
+        throw_on_err((|| -> Result<Robj> {
+            let idx0 = crate::util::r_whole_u64_slice(&indices, "0-based row index")?;
+            self.read_row_indices_impl(&idx0)
+        })())
     }
 
     /// Per-row sums over all genes (streamed shard-by-shard, no full decode).
