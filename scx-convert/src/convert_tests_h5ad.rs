@@ -296,6 +296,170 @@ fn test_h5ad_raw_round_trip() {
     }
 }
 
+/// `/raw/varm` has no home in the raw section family (`raw/X` + `raw/var`
+/// only), so it is dropped — but not silently, and not on only one of the
+/// two ingest paths. The streaming path does not go through
+/// `read_raw_group`, so a check placed there alone would leave the default
+/// (`stream=True`) door mute, which is the one most users take.
+#[test]
+fn raw_varm_is_dropped_with_a_warning_on_both_ingest_paths() {
+    use super::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (8, 10, 17);
+    let opts = ConvertOptions::default();
+
+    for streaming in [false, true] {
+        let tag = if streaming { "stream" } else { "eager" };
+        let h5ad_path = dir.path().join(format!("rawvarm_{tag}.h5ad"));
+        create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
+        add_raw_group(&h5ad_path, n_obs, raw_n_vars);
+        {
+            let f = hdf5::File::open_rw(&h5ad_path).unwrap();
+            let varm = f.group("raw").unwrap().create_group("varm").unwrap();
+            let pcs = ndarray::Array2::<f32>::zeros((raw_n_vars, 3));
+            varm.new_dataset::<f32>()
+                .shape([raw_n_vars, 3])
+                .create("PCs")
+                .unwrap()
+                .write(&pcs)
+                .unwrap();
+        }
+
+        let scx_path = dir.path().join(format!("rawvarm_{tag}.scx"));
+        let mut sink = WarningSink::log();
+        if streaming {
+            h5ad_to_scx_streaming(
+                &h5ad_path,
+                &scx_path,
+                &opts,
+                &StreamingOverrides::default(),
+                &mut sink,
+            )
+            .unwrap();
+        } else {
+            h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
+        }
+
+        assert_eq!(
+            sink.counts().get("dropped_raw_varm"),
+            Some(&1),
+            "{tag}: raw/varm must be reported, not dropped in silence"
+        );
+        // The matrix itself is untouched by the varm drop.
+        let reader = ScxReader::open(&scx_path).unwrap();
+        assert!(reader.has_raw(), "{tag}: raw/X still written");
+        assert_eq!(reader.raw_n_vars(), Some(raw_n_vars), "{tag}: raw n_vars");
+    }
+}
+
+/// Reorder-on-convert drops raw. That is a **write** producing a file with
+/// no raw, so it must use `DroppedRawOnWrite` — and the text must fit *this*
+/// door, not the SCX → SCX one. Both wrong messages are asserted absent: the
+/// read-side reassurance (raw is not preserved anywhere the user can reach it
+/// in the output) and the SCX → SCX remedy (this caller is already converting
+/// from the h5ad, so "convert from the h5ad" is nonsense here).
+#[test]
+fn reorder_on_convert_reports_a_write_side_raw_drop_worded_for_this_door() {
+    use super::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (8, 10, 17);
+
+    // Both arms of `!sort_by.is_empty() || group_by.is_some()`.
+    for mode in ["sort_by", "group_by"] {
+        let h5ad_path = dir.path().join(format!("reorder_raw_{mode}.h5ad"));
+        create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
+        add_raw_group(&h5ad_path, n_obs, raw_n_vars);
+
+        let opts = if mode == "sort_by" {
+            ConvertOptions {
+                sort_by: vec!["n_counts".to_string()],
+                ..ConvertOptions::default()
+            }
+        } else {
+            ConvertOptions {
+                group_by: Some("n_counts".to_string()),
+                ..ConvertOptions::default()
+            }
+        };
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink_seen = std::sync::Arc::clone(&seen);
+        let mut sink = WarningSink::with_handler(move |w| {
+            sink_seen.lock().unwrap().push(format!("{w}"));
+        });
+
+        h5ad_to_scx_streaming(
+            &h5ad_path,
+            &dir.path().join(format!("reorder_raw_{mode}.scx")),
+            &opts,
+            &StreamingOverrides::default(),
+            &mut sink,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sink.counts().get("dropped_raw_on_write"),
+            Some(&1),
+            "{mode}: a write that drops raw must say so as a write"
+        );
+        assert_eq!(sink.counts().get("dropped_raw"), None, "{mode}");
+
+        let msgs = seen.lock().unwrap();
+        let msg = msgs
+            .iter()
+            .find(|m| m.contains("adata.raw"))
+            .unwrap_or_else(|| panic!("{mode}: a raw-drop message"));
+        assert!(
+            !msg.contains("on-disk raw sections are preserved"),
+            "{mode}: read-side reassurance on a write: {msg}"
+        );
+        assert!(
+            !msg.contains("convert from the h5ad"),
+            "{mode}: SCX -> SCX remedy on the h5ad door: {msg}"
+        );
+        assert!(msg.contains("--sort-by"), "{mode}: no cause named: {msg}");
+    }
+}
+
+/// The companion negative, in the two shapes that differ.
+///
+/// `no_group` is the common case and guards only the outer `Ok(varm)` arm.
+/// `empty_group` is the one that exercises the `keys > 0` check itself —
+/// anndata writes an empty `/raw/varm` group for a raw with no varm — and
+/// is what makes this test discriminating: with `no_group` alone the
+/// warning could be emitted unconditionally inside the group arm and still
+/// pass, since that arm is never entered.
+#[test]
+fn raw_without_varm_entries_emits_no_varm_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (8, 10, 17);
+
+    for shape in ["no_group", "empty_group"] {
+        let h5ad_path = dir.path().join(format!("rawnovarm_{shape}.h5ad"));
+        create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
+        add_raw_group(&h5ad_path, n_obs, raw_n_vars);
+        if shape == "empty_group" {
+            let f = hdf5::File::open_rw(&h5ad_path).unwrap();
+            f.group("raw").unwrap().create_group("varm").unwrap();
+        }
+
+        let mut sink = WarningSink::log();
+        h5ad_to_scx(
+            &h5ad_path,
+            &dir.path().join(format!("rawnovarm_{shape}.scx")),
+            &ConvertOptions::default(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            sink.counts().get("dropped_raw_varm"),
+            None,
+            "{shape}: nothing was dropped, so nothing should be reported"
+        );
+    }
+}
+
 #[test]
 fn test_tenx_to_scx() {
     let dir = tempfile::tempdir().unwrap();

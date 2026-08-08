@@ -139,6 +139,22 @@ pub fn read_x_matrix_at(
     }
 }
 
+/// Warn when `/raw/varm` carries anything, since SCX's raw section family
+/// stores `raw/X` and `raw/var` only and it is therefore dropped.
+///
+/// Shared by the eager ([`read_raw_group`]) and streaming
+/// (`pipeline::ingest_raw_streaming`) ingest paths — the streaming one does
+/// not go through `read_raw_group`, so the check has to be callable on its
+/// own or one of the two doors stays silent.
+pub fn warn_raw_varm_if_present(file: &hdf5::File, sink: &mut WarningSink) {
+    if let Ok(varm) = file.group("raw/varm") {
+        let keys = varm.member_names().map(|m| m.len()).unwrap_or(0);
+        if keys > 0 {
+            sink.emit(ConvertWarning::DroppedRawVarm { keys });
+        }
+    }
+}
+
 /// Read the AnnData `/raw` group (`raw/X` + `raw/var`) if present.
 ///
 /// Returns the raw CSR arrays (always obs×raw_n_vars, canonicalized) and
@@ -159,6 +175,8 @@ pub fn read_raw_group(
     if file.group("raw/X").is_err() && file.dataset("raw/X").is_err() {
         return Ok(None);
     }
+
+    warn_raw_varm_if_present(file, sink);
 
     let format = detect_matrix_format_at(file, "raw/X", sink)?;
     let (indptr, indices, mut data, n_obs, raw_n_vars) = read_x_matrix_at(file, "raw/X", format)?;

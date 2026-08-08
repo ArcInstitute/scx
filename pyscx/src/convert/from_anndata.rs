@@ -547,7 +547,8 @@ pub(crate) fn build_output_header(
 /// Implementation of from_anndata: extract data from AnnData and write SCX.
 ///
 /// `in_place`: when true, allow [`ensure_csr`] to sort caller-owned CSR
-/// indices in place (mutates `adata.X` / `adata.layers[*]`). When false
+/// indices in place (mutates `adata.X`, `adata.layers[*]`, and
+/// `adata.raw.X`). When false
 /// (default), unsorted CSR inputs are copied via `.sorted_indices()` so
 /// the caller's matrices are untouched.
 #[allow(clippy::too_many_arguments)]
@@ -1340,6 +1341,21 @@ pub fn from_anndata_impl(
         }
     }
 
+    // Optional `adata.raw` count matrix → the raw section family
+    // (`RawCsrShard` + `raw/var`), mirroring what the h5ad ingest path
+    // writes so both doors into SCX preserve raw identically.
+    write_raw_from_anndata(
+        py,
+        adata,
+        &mut writer,
+        &np,
+        n_obs,
+        in_place,
+        explicit_codec,
+        shard_rows,
+        framing,
+    )?;
+
     // Optional CSC sidecar — streaming transpose over the in-memory
     // CSR view of X. Layers are CSR-only (no layer-CSC support yet —
     // a `LayerCscShard` section type would need to land first).
@@ -1405,6 +1421,162 @@ pub fn from_anndata_impl(
         .map_err(to_pyerr)?;
 
     writer.finish().map_err(to_pyerr)?;
+    Ok(())
+}
+
+/// Write `adata.raw` (if present) as the raw section family:
+/// `RawCsrShard` row shards named `raw/X_shard_<idx>` plus the `raw/var`
+/// Arrow IPC section. The in-memory counterpart of
+/// `scx_convert::pipeline`'s h5ad raw ingest, so `from_anndata` and
+/// `from_h5ad` produce the same layout from the same dataset.
+///
+/// Raw shares X's obs axis but has its OWN, usually wider, column count.
+/// Three things therefore key off `raw_n_vars` rather than X's `n_vars`:
+/// the shard headers' minor-axis extent, the CSR index validation bound,
+/// and `index_dtype` (per-shard, so a raw axis crossing 65535 widens raw's
+/// indices without touching X's). Codec and value encoding are likewise
+/// selected independently — raw holds counts while X may hold normalized
+/// floats.
+///
+/// `ScxWriter::set_raw_n_vars` is deliberately NOT called: it feeds only
+/// the eager `write_raw_csr_shard` path's header stamping, whereas
+/// pre-encoded shards carry the extent passed to `encode_one_shard`.
+/// `has_raw` needs no call either — `FileHeader::sync_from_catalog`
+/// derives it at `finish()` from the presence of a `RawCsrShard` entry.
+#[allow(clippy::too_many_arguments)]
+fn write_raw_from_anndata(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    writer: &mut ScxWriter,
+    np: &Bound<'_, pyo3::types::PyModule>,
+    n_obs: u64,
+    in_place: bool,
+    explicit_codec: Option<CodecId>,
+    shard_rows: usize,
+    framing: Option<scx_format_io::FramingConfig>,
+) -> PyResult<()> {
+    // Duck-typed AnnData-likes may omit `raw` entirely; a missing attr is
+    // treated the same as `raw = None`.
+    let Some(raw) = adata.getattr("raw").ok().filter(|r| !r.is_none()) else {
+        return Ok(());
+    };
+
+    let raw_x = raw.getattr("X")?;
+    // Read the shape off `raw.X`, NEVER off `raw`: anndata's `Raw.shape`
+    // reports the parent's `n_obs`, so a raw whose rows do not line up with
+    // X looks correct from Python and would be written silently misaligned.
+    let (raw_n_obs, raw_n_vars): (u64, u64) = raw_x.getattr("shape")?.extract()?;
+    if raw_n_obs != n_obs {
+        return Err(PyValueError::new_err(format!(
+            "adata.raw.X has {raw_n_obs} rows but X has {n_obs}; adata.raw must share \
+             the obs axis. (Note that adata.raw.shape reports X's row count, not \
+             adata.raw.X's — compare adata.raw.X.shape[0].)"
+        )));
+    }
+    if raw_n_vars > u32::MAX as u64 {
+        return Err(PyRuntimeError::new_err(format!(
+            "adata.raw n_vars ({raw_n_vars}) exceeds u32::MAX; SCX format requires \
+             n_vars <= {}",
+            u32::MAX
+        )));
+    }
+
+    // SCX's raw section family stores `raw/X` and `raw/var` only.
+    if let Ok(varm) = raw.getattr("varm") {
+        if let Ok(keys) = varm.len() {
+            if keys > 0 {
+                warn_python_convert(py, &scx_convert::ConvertWarning::DroppedRawVarm { keys })?;
+            }
+        }
+    }
+
+    let (raw_csr, raw_validated) = ensure_csr(py, &raw_x, in_place)?;
+
+    let r_indptr_obj = raw_csr.getattr("indptr")?;
+    let r_indptr_arr = astype_if_needed(&r_indptr_obj, np, "int64")?;
+    let r_indptr: PyReadonlyArray1<'_, i64> = r_indptr_arr.extract()?;
+    let r_indptr_slice = r_indptr
+        .as_slice()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    let expected_indptr_len = (n_obs as usize) + 1;
+    if r_indptr_slice.len() != expected_indptr_len {
+        return Err(PyValueError::new_err(format!(
+            "adata.raw.X indptr has length {}, expected n_obs + 1 = {}",
+            r_indptr_slice.len(),
+            expected_indptr_len
+        )));
+    }
+
+    let r_indices_obj = raw_csr.getattr("indices")?;
+    let r_indices_arr = astype_if_needed(&r_indices_obj, np, "int32")?;
+    let r_indices: PyReadonlyArray1<'_, i32> = r_indices_arr.extract()?;
+    let r_indices_slice = r_indices
+        .as_slice()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    let r_data_obj = raw_csr.getattr("data")?;
+    let r_data_arr = astype_if_needed(&r_data_obj, np, "float32")?;
+    let r_data: PyReadonlyArray1<'_, f32> = r_data_arr.extract()?;
+    let r_data_slice = r_data
+        .as_slice()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    if raw_validated {
+        scx_sparse::validate_csr_arrays(r_indptr_slice, r_indices_slice, raw_n_vars)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    }
+
+    // Per-shard index width, resolved against raw's own column count.
+    let raw_index_dtype: u8 = if raw_n_vars <= 65535 { 0 } else { 1 };
+
+    let n_obs_usize = n_obs as usize;
+    let mut boundaries = Vec::new();
+    let mut row_start: usize = 0;
+    let mut shard_idx: u32 = 0;
+    while row_start < n_obs_usize {
+        let row_end = (row_start + shard_rows).min(n_obs_usize);
+        let base = r_indptr_slice[row_start];
+        if !raw_validated && base < 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "adata.raw.X: negative indptr value {base} at row {row_start}"
+            )));
+        }
+        boundaries.push(ShardBoundary {
+            row_start,
+            row_end,
+            nnz_start: base as usize,
+            nnz_end: r_indptr_slice[row_end] as usize,
+            indptr_base: base,
+            shard_idx,
+        });
+        row_start = row_end;
+        shard_idx += 1;
+    }
+
+    let pre_encoded = parallel_encode_csr_shards(
+        py,
+        r_indptr_slice,
+        r_indices_slice,
+        r_data_slice,
+        &boundaries,
+        raw_validated,
+        explicit_codec,
+        raw_index_dtype,
+        raw_n_vars as u32,
+        SectionType::RawCsrShard,
+        "raw/X",
+        framing,
+    )?;
+    for section in pre_encoded {
+        writer.write_preencoded_shard(section).map_err(to_pyerr)?;
+    }
+
+    let raw_var_df = raw.getattr("var")?;
+    let raw_var_batch = pandas_to_record_batch(py, &raw_var_df)?;
+    py.detach(|| writer.write_raw_var(&raw_var_batch))
+        .map_err(to_pyerr)?;
+
     Ok(())
 }
 

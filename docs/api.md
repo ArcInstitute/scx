@@ -534,6 +534,8 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 | `EagerAssemblyMemoryHigh { estimated_bytes, budget_bytes }` | `Experiment.to_anndata` | Estimated eager assembly footprint exceeds `memory_budget` (default 8 GiB). Warn-only, does not block. |
 | `Hdf5NotThreadsafe` | Parallel streaming reader fallback | libhdf5 was not built thread-safe; parallel streaming fell back to the sequential coordinator. |
 | `DroppedRaw { raw_n_vars }` | `Experiment.to_anndata` | The file carries an `adata.raw` matrix but the current reconstruction mode (obs-filtered query, backed mode, or deletion-vectors active) cannot reproduce raw's obs-axis filtering, so raw is omitted. The on-disk raw sections are preserved. |
+| `DroppedRawOnWrite { raw_n_vars, reason }` | `pyscx.from_anndata` with SCX-backed / lazy `X`; `from_h5ad` / `scx convert` with `--sort-by` / `--group-by` | The **source** carries raw that the file being written will not. Distinct from `DroppedRaw`: its "on-disk raw sections are preserved" reassurance is true of the source and says nothing about the output, where raw is gone for good. `reason` is supplied **per call site**, because the doors differ — the SCX → SCX rewrite loses raw because the in-memory AnnData does not hold it (convert from the h5ad instead), while reorder-on-convert loses it because raw streams unpermuted (convert without the reorder instead). A single baked-in remedy would be wrong on one of them. |
+| `DroppedRawVarm { keys }` | h5ad ingest and `pyscx.from_anndata` | `adata.raw.varm` is not representable — the raw section family stores `raw/X` and `raw/var` only — so raw's own var-axis mappings are dropped. `raw.X` / `raw.var` are unaffected. |
 
 ## Round-trip fidelity
 
@@ -557,7 +559,8 @@ is lost *silently*.
 | **dense** `obsp` / `varp` | lossy | — | Ingested as nonzero **float32 COO** (only nonzeros stored); both `to_anndata` and `to_h5ad` re-emit it as a **sparse** matrix (a dense input becomes sparse; values identical). |
 | CSR `obsp` / `varp` | lossy | — | Round-trips `h5ad → scx → h5ad` (and via `to_anndata`) as **float32 CSR**; values downcast to `f32`. Under deletion vectors, `obsp` is filtered on both axes; `varp` (var axis) is never obs-deleted. |
 | CSC / unsupported `obsp` / `varp` | dropped | `DroppedObsp` | CSC and other non-CSR/non-dense pairwise layouts are dropped on ingest. |
-| `adata.raw` | preserved² | `DroppedRaw` (some modes) | `h5ad → scx → h5ad` round-trips raw counts bit-exact with the wider var axis. ² Dropped under obs-filtered `to_anndata`, backed mode, and deletion-vector-active files; `pyscx.from_anndata(adata)` does not yet write raw. See [`adata.raw`](#adataraw). |
+| `adata.raw` | preserved² | `DroppedRaw` / `DroppedRawOnWrite` (some modes) | Round-trips raw counts bit-exact with the wider var axis through **both** write doors — `h5ad → scx → h5ad` and in-memory `pyscx.from_anndata` / `pyscx.write`. ² Dropped, with a warning, under obs-filtered `to_anndata`, backed mode, and deletion-vector-active files, on the SCX-backed / lazy-`X` rewrite, and under reorder-on-convert (`--sort-by` / `--group-by`). See [`adata.raw`](#adataraw). |
+| `adata.raw.varm` | dropped | `DroppedRawVarm` | Raw's own var-axis mappings have no section in the raw family (`raw/X` + `raw/var` only). `raw.X` and `raw.var` are unaffected. |
 | `uns` scalars / 1-D & 2-D numeric arrays / nested dicts | preserved | — | Round-trip through the `uns` JSON representation. |
 | `uns` pandas **DataFrame** | lossy | `FlattenedUnsDataframe` | Preserved as a nested dict (per-column values + `_index`); **not** reconstructed as a `pd.DataFrame` (column order / categorical dtypes not restored). |
 | `uns` scipy-sparse matrix | lossy | `FlattenedUnsSparse` | Preserved as a nested dict of `data` / `indices` / `indptr` arrays; **not** reconstructed as a sparse matrix (the sparse type tag is not restored). Data survives. |
@@ -603,13 +606,44 @@ section; see [docs/format.md § raw section family](format.md#adataraw-raw-secti
 On the streaming convert path (`stream=True`, the default) `raw/X` is read and
 written shard-by-shard through the same coordinator as `/X`, so peak RSS stays
 bounded; the materializing path (`stream=False`) reads it eagerly.
+The in-memory `pyscx.from_anndata(adata)` / `pyscx.write(adata, path)` path writes the
+same section family from `adata.raw.X` + `adata.raw.var`, so both doors into SCX
+preserve raw identically. It is materialized eagerly (the AnnData is already
+resident), unlike the h5ad streaming ingest. Raw keeps its own column count: the raw
+shards' `index_dtype`, minor-axis extent, and codec are all resolved against
+`raw_n_vars`, independent of `X`.
+
 `pyscx.open(...).to_anndata()` reconstructs `adata.raw` (an AnnData with raw `X` +
 `var`), and `pyscx.to_h5ad` re-emits `/raw/X` + `/raw/var`, so
 `h5ad → scx → h5ad` round-trips raw with integer counts bit-exact and the wider var
 axis intact. Raw is **dropped with a `DroppedRaw` warning** under obs-filtered
 `to_anndata`, backed mode, and deletion-vector-active files (those modes do not yet
-re-filter raw's obs axis). The in-memory `pyscx.from_anndata(adata)` path does not
-yet write raw.
+re-filter raw's obs axis).
+
+Three write paths still cannot carry raw and say so rather than dropping it in silence.
+The first two warn with `DroppedRawOnWrite`, whose `reason` is supplied per call site —
+they lose raw for different causes, so a single baked-in remedy would misdirect one of
+them:
+
+- **SCX-backed / lazy `X` rewrite.** `pyscx.from_anndata` writes the sections the
+  in-memory AnnData holds, and backed reconstruction sets `.raw` to `None`, so a
+  `pyscx.open(f).to_anndata(backed=True)` → `from_anndata` round-trip loses raw. Keyed
+  off the *source* file rather than the object — `DroppedRaw`'s "the on-disk raw
+  sections are preserved" would be misleading here, since the file being written has
+  none. Remedy: convert from the h5ad, or from an in-memory AnnData whose `.raw` is set.
+- **Reorder-on-convert** (`from_h5ad(..., sort_by=…)` / `scx convert --sort-by` /
+  `--group-by`). The permutation is applied to `X` / `obs` / `obsm` / `layers` while raw
+  is streamed in source order, so carrying it would leave raw's rows attached to the
+  wrong cells. Remedy: convert without the reorder. (`from_anndata(sort_by=…)` on an
+  in-memory AnnData is rejected outright, so it cannot reach this.)
+- **`merge` / `compact` / `sort` / `append` / `preprocess`**, which need raw's obs axis
+  filtered in lockstep with `X`. The first four warn; `append` and `preprocess` refuse.
+
+`adata.raw.varm` is not stored — the raw family holds `raw/X` and `raw/var` only — and
+is dropped with a `DroppedRawVarm` warning on both the h5ad ingest and the in-memory
+write. A raw whose `X` row count disagrees with `adata.n_obs` is **rejected**, not
+written: `adata.raw.shape` reports the parent's `n_obs` rather than
+`adata.raw.X.shape[0]`, so a misaligned raw looks correct from Python.
 
 ## Memory budgets
 
