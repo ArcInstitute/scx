@@ -40,8 +40,8 @@ def _write(tmp_dir, adata, name="f3nd.scx"):
 # raw now narrows in-decode (Phase-3 new behavior)
 # --------------------------------------------------------------------------
 #
-# `from_anndata` (in-memory) does not persist `adata.raw`; the file-ingest path
-# (`from_h5ad`) does — mirror `test_raw_round_trip.py`'s fixture.
+# Both write paths persist `adata.raw`. These fixtures go through the
+# file-ingest path (`from_h5ad`) — mirror `test_raw_round_trip.py`'s fixture.
 
 
 def _write_with_raw(tmp_dir, name="raw_narrow"):

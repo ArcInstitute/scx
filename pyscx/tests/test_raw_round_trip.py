@@ -254,29 +254,74 @@ def test_from_anndata_writes_non_csr_raw(tmp_dir, raw_format):
     np.testing.assert_array_equal(raw_dense, _dense(out.raw.X))
 
 
-def test_from_anndata_rejects_raw_with_mismatched_obs_axis(tmp_dir):
-    """anndata accepts a misaligned raw and then misreports its shape.
+class _RawOverride:
+    """An AnnData-like that forwards everything except `.raw`.
 
-    `adata.raw.shape` returns `adata.n_obs`, not `raw.X.shape[0]`, so a raw
-    whose rows do not line up with X looks correct from Python. Writing it
-    would produce a file whose raw rows silently belong to different cells.
+    Needed because whether `adata.raw = <misaligned>` is even constructible
+    depends on the anndata version: 0.12.10 accepts it (and then reports
+    `raw.shape[0]` as the parent's `n_obs`, hiding the mismatch), while the
+    version CI pins rejects it in `Raw.__init__`. Going through a duck-typed
+    wrapper — a shape `from_anndata` already supports — reaches the pyscx
+    guard on both, instead of testing which anndata happens to be installed.
     """
-    import anndata
+
+    def __init__(self, adata, raw):
+        self._adata = adata
+        self.raw = raw
+
+    def __getattr__(self, name):
+        return getattr(self._adata, name)
+
+
+class _RawLike:
+    """The minimal surface `write_raw_from_anndata` touches on `.raw`."""
+
+    def __init__(self, X, var):
+        self.X = X
+        self.var = var
+        self.varm = {}
+
+
+def test_from_anndata_rejects_raw_with_mismatched_obs_axis(tmp_dir):
+    """A raw whose rows don't line up with X must never reach disk.
+
+    Writing one would produce a file whose raw rows silently belong to
+    different cells — and `adata.raw.shape` cannot be used to notice, since
+    it reports the parent's `n_obs` rather than `raw.X.shape[0]`.
+    """
     import pandas as pd
     import scipy.sparse as sp
     import pyscx
 
     src, _ = _adata_with_raw(20, 12, 30)
     short = sp.csr_matrix(np.ones((17, 30), dtype=np.float32))
-    src.raw = anndata.AnnData(
-        X=short, var=pd.DataFrame(index=[f"raw_gene_{i}" for i in range(30)])
+    bad = _RawOverride(
+        src,
+        _RawLike(short, pd.DataFrame(index=[f"raw_gene_{i}" for i in range(30)])),
     )
-    # anndata reports the misaligned raw as if it matched X.
-    assert src.raw.shape[0] == 20
-    assert src.raw.X.shape[0] == 17
 
-    with pytest.raises(ValueError, match="17"):
-        pyscx.from_anndata(src, str(tmp_dir / "bad.scx"))
+    with pytest.raises(ValueError, match=r"17 rows but X has 20"):
+        pyscx.from_anndata(bad, str(tmp_dir / "bad.scx"))
+
+
+def test_raw_override_wrapper_is_a_faithful_stand_in(tmp_dir):
+    """Guard the guard: the wrapper above must otherwise behave normally.
+
+    If `_RawOverride` silently broke some attribute `from_anndata` needs,
+    the rejection test would pass for the wrong reason.
+    """
+    import pyscx
+
+    src, raw_dense = _adata_with_raw(20, 12, 30)
+    wrapped = _RawOverride(src, src.raw)
+
+    scx_path = str(tmp_dir / "wrapped.scx")
+    pyscx.from_anndata(wrapped, scx_path)
+
+    out = pyscx.open(scx_path).to_anndata()
+    assert out.raw is not None
+    assert out.shape == (20, 12)
+    np.testing.assert_array_equal(raw_dense, _dense(out.raw.X))
 
 
 def test_from_anndata_without_raw_writes_no_raw_sections(tmp_dir):
@@ -353,6 +398,114 @@ def test_raw_index_dtype_is_keyed_off_raws_own_var_axis(tmp_dir):
     assert out.n_vars == n_vars
     np.testing.assert_array_equal(np.sort(out.raw.X[0].indices), cols)
     np.testing.assert_array_equal(_dense(out.raw.X), _dense(raw))
+
+
+def test_lazy_x_route_warns_when_dropping_raw(tmp_dir):
+    """`warn_source_raw_dropped` has two call sites; cover the other one.
+
+    The backed and lazy rewrites share the helper, so a regression that
+    skipped only the lazy arm would otherwise stay green.
+    """
+    import pyscx
+
+    src, _ = _adata_with_raw(20, 12, 30)
+    h5ad_in = str(tmp_dir / "in.h5ad")
+    src.write_h5ad(h5ad_in)
+    scx_path = str(tmp_dir / "raw.scx")
+    pyscx.from_h5ad(h5ad_in, scx_path)
+
+    with pytest.warns(UserWarning, match="dropped_raw"):
+        backed = pyscx.open(scx_path).to_anndata(backed=True)
+    pyscx.accel.normalize_total(backed, target_sum=1e4)
+    assert type(backed.X).__name__ == "ScxLazyTransformedDataset"
+
+    with pytest.warns(UserWarning, match="dropped_raw_on_write"):
+        pyscx.from_anndata(backed, str(tmp_dir / "lazy_out.scx"))
+
+
+@pytest.mark.parametrize("raw_n_vars", [65_535, 65_536])
+def test_raw_index_dtype_boundary(tmp_dir, raw_n_vars):
+    """Exactly at the u16 ceiling and one past it.
+
+    The wide test above uses 70k, comfortably clear of the `<= 65535`
+    branch; these two pin the branch itself.
+    """
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+    import pyscx
+
+    n_obs, n_vars = 3, 5
+    src = anndata.AnnData(
+        X=sp.csr_matrix(np.ones((n_obs, n_vars), dtype=np.float32)),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_obs)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(n_vars)]),
+    )
+    highest = raw_n_vars - 1  # 65534 (fits u16) / 65535 (the u16 ceiling)
+    raw = sp.csr_matrix(
+        (
+            np.ones(n_obs, dtype=np.float32),
+            np.full(n_obs, highest, dtype=np.int32),
+            np.arange(n_obs + 1, dtype=np.int64),
+        ),
+        shape=(n_obs, raw_n_vars),
+    )
+    src.raw = anndata.AnnData(
+        X=raw, var=pd.DataFrame(index=[f"r{i}" for i in range(raw_n_vars)])
+    )
+
+    scx_path = str(tmp_dir / f"boundary_{raw_n_vars}.scx")
+    pyscx.from_anndata(src, scx_path)
+
+    out = pyscx.open(scx_path).to_anndata()
+    assert out.raw.shape == (n_obs, raw_n_vars)
+    np.testing.assert_array_equal(out.raw.X[0].indices, np.array([highest]))
+
+
+def test_raw_with_multiple_layers(tmp_dir):
+    """Raw is written after the layers loop; confirm they do not interfere."""
+    import pyscx
+
+    n_obs, n_vars, raw_n_vars = 20, 12, 30
+    src, raw_dense = _adata_with_raw(n_obs, n_vars, raw_n_vars)
+    x_dense = _dense(src.X)
+    src.layers["counts"] = src.X.copy()
+    src.layers["scaled"] = src.X.copy()
+
+    scx_path = str(tmp_dir / "raw_layers.scx")
+    pyscx.from_anndata(src, scx_path)
+
+    out = pyscx.open(scx_path).to_anndata()
+    assert sorted(out.layers.keys()) == ["counts", "scaled"]
+    np.testing.assert_array_equal(raw_dense, _dense(out.raw.X))
+    np.testing.assert_array_equal(x_dense, _dense(out.X))
+    for key in ("counts", "scaled"):
+        np.testing.assert_array_equal(x_dense, _dense(out.layers[key]))
+
+
+def test_empty_raw_matrix_round_trips(tmp_dir):
+    """An all-zero raw has no nonzeros to encode; it must still round-trip."""
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+    import pyscx
+
+    n_obs, n_vars, raw_n_vars = 6, 4, 9
+    src, _ = _adata_with_raw(n_obs, n_vars, raw_n_vars)
+    src.raw = anndata.AnnData(
+        X=sp.csr_matrix((n_obs, raw_n_vars), dtype=np.float32),
+        var=pd.DataFrame(index=[f"r{i}" for i in range(raw_n_vars)]),
+    )
+    assert src.raw.X.nnz == 0
+
+    scx_path = str(tmp_dir / "emptyraw.scx")
+    pyscx.from_anndata(src, scx_path)
+
+    out = pyscx.open(scx_path).to_anndata()
+    assert out.raw is not None, "an all-zero raw is still a raw"
+    assert out.raw.shape == (n_obs, raw_n_vars)
+    assert out.raw.X.nnz == 0
+    assert list(out.raw.var_names) == [f"r{i}" for i in range(raw_n_vars)]
 
 
 def test_in_place_contract_extends_to_raw(tmp_dir):

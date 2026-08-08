@@ -3088,8 +3088,13 @@ fn ingest_raw_streaming(
     // drop it (with a visible warning) under any obs-axis reorder (--sort-by or
     // --group-by), mirroring the standalone `scx sort` engine which also drops
     // raw.
+    //
+    // `DroppedRawOnWrite`, not `DroppedRaw`: this is a conversion producing an
+    // output file with no raw, so the read-side variant's "the on-disk raw
+    // sections are preserved" would describe the h5ad input while the user is
+    // asking about the SCX file being written.
     if !opts.sort_by.is_empty() || opts.group_by.is_some() {
-        sink.emit(ConvertWarning::DroppedRaw { raw_n_vars });
+        sink.emit(ConvertWarning::DroppedRawOnWrite { raw_n_vars });
         return Ok(());
     }
 

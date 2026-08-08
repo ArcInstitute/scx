@@ -357,10 +357,14 @@ mis-orientation.
 `adata.raw` (pre-normalization counts on its own, usually wider, var axis) is
 preserved. `from_h5ad` ingests the h5ad `/raw` group, `pyscx.open(...).to_anndata()`
 reconstructs `adata.raw`, and `to_h5ad` re-emits `/raw/X` + `/raw/var`, so
-`h5ad → scx → h5ad` round-trips raw with integer counts bit-exact. Raw is dropped
+`h5ad → scx → h5ad` round-trips raw with integer counts bit-exact. The in-memory
+`from_anndata(adata)` / `write(adata, path)` path writes the same section family from
+`adata.raw.X` + `adata.raw.var`, so both doors preserve raw identically. Raw is dropped
 (with a `DroppedRaw` warning) under obs-filtered `to_anndata`, backed mode, and
-deletion-vector-active files; the in-memory `from_anndata(adata)` path does not yet
-write raw. See [docs/api.md § `adata.raw`](api.md#adataraw).
+deletion-vector-active files, and (with `DroppedRawOnWrite`) on the SCX-backed /
+lazy-`X` rewrite, where the in-memory AnnData's `.raw` is `None`. `adata.raw.varm` has
+no section and is dropped with `DroppedRawVarm`.
+See [docs/api.md § `adata.raw`](api.md#adataraw).
 
 ### Exporting back to MTX
 

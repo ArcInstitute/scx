@@ -99,13 +99,19 @@ allocation). Returns attributes `obs` (DataFrame), `var` (DataFrame), `uns`
 ### adata.raw
 
 `adata.raw` (pre-normalization counts on its own, usually wider, var axis) round-trips
-end-to-end on the **file** path: `from_h5ad` ingests the `/raw` group (streamed
-shard-by-shard on `stream=True`, the default), `pyscx.open(...).to_anndata()`
-reconstructs `adata.raw`, and `to_h5ad` re-emits `/raw/X` + `/raw/var`. Caveats: raw
+end-to-end on **both** write paths: `from_h5ad` ingests the `/raw` group (streamed
+shard-by-shard on `stream=True`, the default) and the in-memory
+`from_anndata(adata)` / `write(adata, path)` writes it from `adata.raw.X` +
+`adata.raw.var`; `pyscx.open(...).to_anndata()` reconstructs `adata.raw`, and
+`to_h5ad` re-emits `/raw/X` + `/raw/var`. Caveats: raw
 is dropped with a `DroppedRaw` warning under obs-filtered `to_anndata`, backed mode,
 and deletion-vector-active files (those paths don't yet re-filter raw's obs axis),
-and the in-memory `from_anndata(adata)` path does not yet write raw — round-trip raw
-via h5ad (`adata.write_h5ad(...)` → `from_h5ad`).
+and with `DroppedRawOnWrite` on the SCX-backed / lazy-`X` rewrite
+(`pyscx.open(f).to_anndata(backed=True)` → `from_anndata`), where backed
+reconstruction leaves `.raw` unset — convert from the h5ad to keep raw there.
+`adata.raw.varm` has no section in the raw family and is dropped with
+`DroppedRawVarm` on both ingest doors. A raw whose `X` row count disagrees with
+`n_obs` is rejected rather than written.
 
 ## Shared kwarg semantics
 
