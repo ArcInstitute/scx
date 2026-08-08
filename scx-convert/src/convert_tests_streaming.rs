@@ -1098,6 +1098,13 @@ fn deep_uns_group_chain_is_bounded_not_a_stack_overflow() {
         msg.contains("nesting is deeper than"),
         "expected an uns depth error, got: {msg}"
     );
+    // The full key path, not just the leaf group. Reverting to the leaf name
+    // would still satisfy the assertion above, so the top-level key — the only
+    // part of `bomb/g0/.../g58` a user can act on — needs pinning separately.
+    assert!(
+        msg.contains("bomb/g"),
+        "depth error must name the full key path, got: {msg}"
+    );
 }
 
 #[test]

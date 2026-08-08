@@ -261,6 +261,11 @@ two-level tagged tuple.
 Readers SHOULD accept up to 127 levels rather than 60, so that a file written
 before this bound existed still opens if it is parseable at all.
 
+Writers MUST reject a tree deeper than 127 at the point the section is
+serialised, independently of whatever produced it. The 60-level bound is a
+property of the tools that build `uns`; this one is a property of the file, and
+it is what lets a reader assume any `uns_blob` it encounters is parseable.
+
 ### Per-shard statistics
 
 Present when `section_type ∈ {csr_shard, csc_shard, layer_csr_shard, obsp_csr_shard}`:

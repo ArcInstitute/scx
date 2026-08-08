@@ -227,7 +227,11 @@ mod uns_depth_tests {
         let deep = format!("{}1{}", "[".repeat(500), "]".repeat(500));
         let err = parse_uns_json(deep.as_bytes()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("uns section nests deeper"), "got: {msg}");
+        assert!(msg.contains("uns nests deeper"), "got: {msg}");
+        // Must stay true on both sides: the same variant is now raised by
+        // `validate_uns_depth` before any file exists, so wording that claims
+        // a pre-existing file would be wrong there.
+        assert!(!msg.contains("This file was written"), "got: {msg}");
         assert!(
             msg.contains(&SERDE_JSON_MAX_NESTING.to_string()),
             "got: {msg}"

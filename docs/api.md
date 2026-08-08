@@ -588,6 +588,12 @@ Readers stop at 127 instead, so a file written before the cap existed still
 opens if its `uns` is parseable; one written deeper than 127 raises a message
 saying so rather than `serde_json`'s bare `recursion limit exceeded`.
 
+Underneath both sits a storage gate at 127: the section writer itself refuses
+an `uns` tree deeper than the reader will parse, whatever built it. That is
+what makes "an SCX file always has a readable `uns`" true for paths with no
+Python or h5ad in them — `scx merge`, `scx subset`, and any Rust caller
+handing the writer a tree it assembled itself.
+
 ## `adata.raw`
 
 `adata.raw` (pre-normalization counts on its own, usually wider, var axis) is

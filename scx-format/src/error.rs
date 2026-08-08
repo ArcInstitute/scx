@@ -140,17 +140,23 @@ pub enum ScxError {
 
     /// The `uns` section nests deeper than the JSON reader will parse.
     ///
-    /// Only reachable on files written before `uns` nesting was capped: the
-    /// JSON *serializer* has no depth limit while the deserializer stops at
-    /// [`crate::SERDE_JSON_MAX_NESTING`], so an uncapped writer could emit a
-    /// section that no reader can take back. Split out from
+    /// Raised on **both** sides of the section, which is why the message names
+    /// neither a file nor a write:
+    ///
+    /// - [`crate::validate_uns_depth`], refusing to *store* a tree no reader
+    ///   could take back — before any file exists;
+    /// - [`crate::parse_uns_json`], on a file written before `uns` depth was
+    ///   capped, when an uncapped writer could still emit one.
+    ///
+    /// Both exist because the JSON *serializer* has no depth limit while the
+    /// deserializer stops at [`crate::SERDE_JSON_MAX_NESTING`]. Split out from
     /// [`ScxError::Json`] because the bare `recursion limit exceeded` that
-    /// `serde_json` produces names neither the section nor the cause, and
-    /// this is the one JSON error a user can act on.
+    /// `serde_json` produces names neither the section nor the cause, and this
+    /// is the one JSON error a user can act on.
     #[error(
-        "uns section nests deeper than the {max_nesting}-level limit of the JSON reader, so it \
-         cannot be parsed. This file was written before uns nesting was capped; rewrite it from \
-         its source with flatter uns metadata"
+        "uns nests deeper than the {max_nesting} levels the JSON reader accepts, so it can \
+         neither be stored nor read back — flatten the metadata, or, for an existing file \
+         written before uns depth was capped, rewrite it from its source"
     )]
     UnsTooDeep { max_nesting: usize },
 
@@ -227,11 +233,11 @@ impl ScxError {
             | ScxError::UnsupportedColumnType { .. }
             | ScxError::DuplicateSection { .. }
             | ScxError::ObsLayoutConflict { .. }
-            // Deliberately NOT `CorruptFile`: the file is intact and was
-            // written by an *older*, uncapped SCX, so the binding's
-            // "appears corrupt or was written by an incompatible version;
-            // re-run conversion" suffix would contradict this variant's own
-            // (accurate) guidance. A writer-side inconsistency, which is what
+            // Deliberately NOT `CorruptFile`. On the write path no file exists
+            // yet; on the read path the file is intact and was written by an
+            // *older*, uncapped SCX. The binding's "appears corrupt or was
+            // written by an incompatible version; re-run conversion" suffix is
+            // wrong on both. A writer-side inconsistency, which is what
             // `Validation` is for.
             | ScxError::UnsTooDeep { .. } => ScxErrorClass::Validation,
             // File is corrupt or was written by an incompatible/newer SCX:
