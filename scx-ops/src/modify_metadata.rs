@@ -14,6 +14,14 @@
 //! Replace semantics, **not merge**: a supplied field fully replaces the
 //! existing section. For a shallow `uns` merge, read-modify-write in the caller.
 //!
+//! A replaced axis **keeps the predicate index it had**: the old section can
+//! never survive verbatim (its shard ranges describe values that are gone), so
+//! the op rebuilds one over the same columns the file already indexed unless the
+//! caller names their own. Before that, replacing obs dropped the index and the
+//! per-shard column stats with it — silently reverting `filter_obs` pushdown to
+//! a full scan on the last step of the doublet workflow, which is a wholesale
+//! obs replacement.
+//!
 //! Multimodal (`modality_id != 0`) is not yet supported and returns
 //! [`OpsError::MultimodalUnsupported`]; per-modality metadata replace is a
 //! focused follow-on.
@@ -25,17 +33,21 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use serde_json::Value;
 
-use scx_engine::ConversionPredicateIndexOptions;
+use scx_engine::{BuildOutcome, ConversionPredicateIndexOptions, ConversionPredicateIndexResult};
 use scx_format_io::catalog::{ColumnStat, FullCatalog, FullCatalogEntry};
 use scx_format_io::checksum::blake3_hash;
 use scx_format_io::provenance::{Provenance, ProvenanceEntry};
+use scx_format_io::reader::ScxReader;
 use scx_format_io::section::{write_alignment_padding, SectionType};
 use scx_format_io::writer::ScxWriter;
 
 use crate::append::{predicate_index_build_options_for_obs, unify_dict_columns};
 use crate::error::{OpsError, Result};
+use crate::external_obs::indexed_column_names;
 use crate::in_place::{commit_in_place, entry_matches_key, prepare_in_place, read_provenance_ops};
-use crate::predicate_index::{user_wants_index, validate_forced_columns};
+use crate::predicate_index::{
+    user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
+};
 
 /// A set of metadata replacements to apply atomically. Any `None` field is left
 /// untouched (its existing catalog entries pass through verbatim). `obsm` /
@@ -53,6 +65,11 @@ pub struct MetadataPatch {
     /// Replace named varm matrices; each `num_rows` must equal `n_vars`.
     pub varm: Option<Vec<(String, RecordBatch)>>,
     /// Predicate-index rebuild policy (only consulted when `obs`/`var` change).
+    ///
+    /// Empty means "keep what the file already indexes" — the replaced axis's
+    /// index is rebuilt over its own columns. Naming columns here overrides
+    /// that, and narrowing the set is reported rather than silent
+    /// ([`ModifyMetadataSummary::obs_columns_not_carried`]).
     pub index: ConversionPredicateIndexOptions,
     /// Modality to target. `0` = global / single-modality. Non-zero is not yet
     /// supported.
@@ -66,7 +83,10 @@ pub struct MetadataPatch {
 /// to do exactly that. On an under-covering file that advice loops forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoStatsReason {
-    /// No index rebuild was requested, so there was nothing to derive from.
+    /// No index was built, so there was nothing to derive from. Since a
+    /// replaced axis carries its existing index forward, this now means the
+    /// file had no index on that axis to carry — not merely that the caller
+    /// omitted `--index-obs`.
     NoRebuildRequested,
     /// A rebuild ran and an index was written — but over the obs-shard ranges,
     /// because the CSR shards do not tile `[0, n_obs)`. `derive_shard_column_stats`
@@ -80,7 +100,9 @@ enum NoStatsReason {
 impl NoStatsReason {
     fn what_happened(self) -> &'static str {
         match self {
-            Self::NoRebuildRequested => "obs was replaced without an index rebuild",
+            Self::NoRebuildRequested => {
+                "obs was replaced and this file has no obs predicate index to carry forward"
+            }
             Self::CsrRangesUnderCoverObsAxis => {
                 "the predicate index was rebuilt, but this file's CSR shards do not cover \
                  every obs row, so the index could not be mapped onto them"
@@ -113,6 +135,94 @@ impl NoStatsReason {
     }
 }
 
+/// What [`modify_metadata`] did to the file's predicate indexes.
+///
+/// Replacing an axis wholesale used to drop its index outright and say nothing,
+/// because the op cannot tell an *added* column from a *rewritten* one. It now
+/// carries the index forward — rebuilds it over the columns it already covered —
+/// and hands back what it could and could not carry, so the loss stops being
+/// silent on the paths where one is unavoidable.
+#[derive(Debug, Default)]
+pub struct ModifyMetadataSummary {
+    /// Per-column build outcomes in the same shape every other rewrite op
+    /// reports them, so a caller can reuse one handler
+    /// (`ForcedColumnError` → error, `PresetSkipped` → warning).
+    pub index: PredicateIndexBuildSummary,
+    /// Obs columns the file's index covered that the new index does not.
+    ///
+    /// On the carry-forward path each of these also has a `PresetSkipped`
+    /// outcome carrying the precise reason; on the explicit-request path the
+    /// builder knows nothing about the old index, so this list is the only
+    /// signal. Callers that report both should skip a column already named by
+    /// an outcome rather than warn about it twice.
+    pub obs_columns_not_carried: Vec<String>,
+    /// The var-axis counterpart of [`Self::obs_columns_not_carried`].
+    pub var_columns_not_carried: Vec<String>,
+    /// True when this op rebuilt the obs index the caller did not ask for,
+    /// purely to keep the one the file already had, **and that rebuild
+    /// produced an index**.
+    ///
+    /// Success-gated, and per axis, for two reasons a single attempted-carry
+    /// flag got wrong: a carry whose every column turned out unindexable would
+    /// report `carried_forward` beside `obs_predicate_index_dropped` on the
+    /// same provenance entry, and one axis carrying while the other is
+    /// explicitly rebuilt is reachable now that "explicit" is decided per axis.
+    pub obs_carried_forward: bool,
+    /// The var-axis counterpart of [`Self::obs_carried_forward`].
+    pub var_carried_forward: bool,
+    /// True when the file had an obs predicate index and the output has none.
+    pub obs_predicate_index_dropped: bool,
+    /// True when the file had a var predicate index and the output has none.
+    pub var_predicate_index_dropped: bool,
+}
+
+impl ModifyMetadataSummary {
+    /// [`Self::obs_columns_not_carried`] minus the columns a build outcome
+    /// already names — i.e. the ones a caller must report itself.
+    ///
+    /// The two channels overlap by construction: on the carry path every
+    /// column that could not be carried also has a `PresetSkipped` outcome
+    /// carrying the precise reason, while on the explicit-request path the
+    /// builder never sees the old index and emits nothing. A front end that
+    /// renders both without this filter warns twice about one column — which
+    /// is what the CLI did the moment it started rendering outcomes at all.
+    /// Living here rather than in each front end is what keeps pyscx and the
+    /// CLI from drifting on it.
+    pub fn obs_not_carried_unreported(&self) -> Vec<String> {
+        self.unreported(&self.obs_columns_not_carried, |r| &r.obs_outcomes)
+    }
+
+    /// The var-axis counterpart of [`Self::obs_not_carried_unreported`].
+    pub fn var_not_carried_unreported(&self) -> Vec<String> {
+        self.unreported(&self.var_columns_not_carried, |r| &r.var_outcomes)
+    }
+
+    fn unreported(
+        &self,
+        columns: &[String],
+        pick: fn(&ConversionPredicateIndexResult) -> &[BuildOutcome],
+    ) -> Vec<String> {
+        let Some(result) = self.index.result.as_ref() else {
+            return columns.to_vec();
+        };
+
+        let outcomes = pick(result);
+        columns
+            .iter()
+            .filter(|c| {
+                !outcomes.iter().any(|o| {
+                    let named = match o {
+                        BuildOutcome::ForcedColumnError { column, .. } => column,
+                        BuildOutcome::PresetSkipped { column, .. } => column,
+                    };
+                    named == *c
+                })
+            })
+            .cloned()
+            .collect()
+    }
+}
+
 impl MetadataPatch {
     fn is_empty(&self) -> bool {
         self.uns.is_none()
@@ -126,7 +236,7 @@ impl MetadataPatch {
 /// Apply `patch` to the file at `path` in place. O(size of replaced sections);
 /// `X`/CSR shards are never read or rewritten. Atomic: a single header write
 /// commits, and the change is rollback-able via the catalog chain.
-pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
+pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetadataSummary> {
     if patch.is_empty() {
         return Err(OpsError::InvalidInput(
             "modify_metadata: empty patch (set at least one of uns/obs/var/obsm/varm)".to_string(),
@@ -195,12 +305,63 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
         }
     }
 
-    // Predicate indexes are rebuilt only when the underlying axis is replaced
-    // AND the caller asked for an index. A stale index over changed values is
-    // always dropped (see `should_drop_old_entry`).
-    let rebuild_obs_index = patch.obs.is_some() && user_wants_index(&patch.index);
-    let rebuild_var_index = patch.var.is_some() && user_wants_index(&patch.index);
-    if rebuild_obs_index || rebuild_var_index {
+    // --- What does the file already index? ---------------------------------
+    // Only when an axis is actually being replaced: a `uns`-only patch is the
+    // headline cheap case and must not pay for an mmap + index parse.
+    //
+    // The reader takes no lock of its own; we only ever append, never truncate,
+    // so holding it across the transaction is safe (same reasoning as
+    // `attach_external_obs`).
+    let (existing_obs_index, existing_var_index) = if patch.obs.is_some() || patch.var.is_some() {
+        let reader = ScxReader::open(path)?;
+        let obs = match patch.obs {
+            Some(_) => indexed_column_names(reader.read_obs_predicate_index_bytes()?)?,
+            None => Vec::new(),
+        };
+        let var = match patch.var {
+            Some(_) => indexed_column_names(reader.read_var_predicate_index_bytes()?)?,
+            None => Vec::new(),
+        };
+        (obs, var)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    // A replaced axis always invalidates its old index section (its ranges
+    // describe values that are gone — see `should_drop_old_entry`), so keeping
+    // the file's pushdown means *rebuilding* over the same columns, not
+    // preserving bytes. An explicit `index_*` request still wins outright: it is
+    // the caller naming what they want indexed, and narrowing it is allowed.
+    //
+    // "Explicit" is decided PER AXIS. `user_wants_index` is a whole-patch
+    // question — true if *any* index knob is set — and using it here would let
+    // `index_var=[…]` silently switch the obs axis off carry-forward and onto
+    // auto-detect, which under the new "omit index_* to carry" contract is a
+    // footgun rather than a quirk. `index_preset` and `index_auto_threshold`
+    // genuinely span both axes, so they still count for both.
+    let cross_axis = patch.index.index_preset.is_some() || patch.index.index_auto_threshold > 0;
+    let explicit_obs = cross_axis || !patch.index.index_obs.is_empty();
+    let explicit_var = cross_axis || !patch.index.index_var.is_empty();
+    let carry_obs = !explicit_obs && !existing_obs_index.is_empty();
+    let carry_var = !explicit_var && !existing_var_index.is_empty();
+    let rebuild_obs_index = patch.obs.is_some() && (explicit_obs || carry_obs);
+    let rebuild_var_index = patch.var.is_some() && (explicit_var || carry_var);
+
+    // Carried columns enter as *preset*, never *forced*: a preset column the new
+    // frame no longer has is a `PresetSkipped` warning, where a forced one is a
+    // hard error. Forcing them would make an ordinary `doublet_consensus` start
+    // raising on a file whose indexed column an earlier edit had dropped.
+    let carried_build_options = |columns: &[String]| scx_engine::PredicateIndexBuildOptions {
+        forced_columns: Vec::new(),
+        preset_columns: columns.to_vec(),
+        // Belt and braces. A non-empty `preset_columns` already turns
+        // auto-detection off; pinning this to 0 keeps a future refactor from
+        // silently indexing columns the file never had.
+        auto_threshold: 0,
+        high_cardinality_threshold: 100_000,
+    };
+
+    if user_wants_index(&patch.index) && (rebuild_obs_index || rebuild_var_index) {
         let mut vopts = patch.index.clone();
         if patch.obs.is_none() {
             vopts.index_obs.clear();
@@ -255,8 +416,7 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
     }
 
     let mut per_shard_obs_stats: Option<Vec<Vec<ColumnStat>>> = None;
-    let mut indexed_obs_cols: Vec<String> = Vec::new();
-    let mut indexed_var_cols: Vec<String> = Vec::new();
+    let mut index_result = ConversionPredicateIndexResult::default();
     // Why the per-shard column stats could not be re-derived, for the warning
     // below. The three arms are genuinely different remedies, and telling a user
     // to "pass --index-obs" when they just did — and when doing it again cannot
@@ -268,12 +428,14 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
         // sharding the append/merge paths perform.
         let unified = unify_dict_columns(obs)?;
         let mut builder = if rebuild_obs_index {
+            let opts = if carry_obs {
+                carried_build_options(&existing_obs_index)
+            } else {
+                predicate_index_build_options_for_obs(&patch.index)
+            };
             Some(
-                scx_engine::ObsPredicateIndexBuilder::new(
-                    unified.schema(),
-                    &predicate_index_build_options_for_obs(&patch.index),
-                )
-                .map_err(OpsError::Engine)?,
+                scx_engine::ObsPredicateIndexBuilder::new(unified.schema(), &opts)
+                    .map_err(OpsError::Engine)?,
             )
         } else {
             None
@@ -310,9 +472,12 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
             } else {
                 &obs_shard_ranges
             };
-            let mut outcomes = Vec::new();
             let obs_bytes = builder
-                .finish(ranges, &mut outcomes, &mut indexed_obs_cols)
+                .finish(
+                    ranges,
+                    &mut index_result.obs_outcomes,
+                    &mut index_result.obs_indexed_columns,
+                )
                 .map_err(OpsError::Engine)?;
             match obs_bytes {
                 Some(bytes) => {
@@ -341,25 +506,28 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
             .var
             .as_ref()
             .expect("rebuild_var_index implies patch.var is Some");
-        let preset_var = match patch.index.index_preset.as_deref() {
-            Some(name) => scx_engine::index_preset_columns(name)
-                .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
-                .unwrap_or_default(),
-            None => Vec::new(),
+        let var_build_opts = if carry_var {
+            carried_build_options(&existing_var_index)
+        } else {
+            let preset_var = match patch.index.index_preset.as_deref() {
+                Some(name) => scx_engine::index_preset_columns(name)
+                    .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            scx_engine::PredicateIndexBuildOptions {
+                forced_columns: patch.index.index_var.clone(),
+                preset_columns: preset_var,
+                auto_threshold: patch.index.index_auto_threshold,
+                high_cardinality_threshold: 100_000,
+            }
         };
-        let var_build_opts = scx_engine::PredicateIndexBuildOptions {
-            forced_columns: patch.index.index_var.clone(),
-            preset_columns: preset_var,
-            auto_threshold: patch.index.index_auto_threshold,
-            high_cardinality_threshold: 100_000,
-        };
-        let mut outcomes = Vec::new();
         let var_bytes = scx_engine::build_var_predicate_index_bytes(
             var,
             &[(0, prep.target_n_vars)],
             &var_build_opts,
-            &mut outcomes,
-            &mut indexed_var_cols,
+            &mut index_result.var_outcomes,
+            &mut index_result.var_indexed_columns,
         )?;
         if let Some(bytes) = var_bytes {
             writer.write_var_predicate_index(&bytes)?;
@@ -381,8 +549,41 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
     drop(file);
     lock.seek(SeekFrom::Start(new_offset))?;
 
+    // --- What survived the replacement -------------------------------------
+    // Computed from what the builder actually indexed rather than from what was
+    // requested, so it stays true on every route into this function — including
+    // the `index_preset` / `index_auto_threshold` routes, where the columns that
+    // end up indexed are not a list the caller wrote down anywhere.
+    let not_carried = |existing: &[String], indexed: &[String]| -> Vec<String> {
+        existing
+            .iter()
+            .filter(|c| !indexed.contains(c))
+            .cloned()
+            .collect()
+    };
+    let summary = ModifyMetadataSummary {
+        obs_columns_not_carried: not_carried(
+            &existing_obs_index,
+            &index_result.obs_indexed_columns,
+        ),
+        var_columns_not_carried: not_carried(
+            &existing_var_index,
+            &index_result.var_indexed_columns,
+        ),
+        obs_carried_forward: carry_obs && !index_result.obs_indexed_columns.is_empty(),
+        var_carried_forward: carry_var && !index_result.var_indexed_columns.is_empty(),
+        obs_predicate_index_dropped: !existing_obs_index.is_empty()
+            && index_result.obs_indexed_columns.is_empty(),
+        var_predicate_index_dropped: !existing_var_index.is_empty()
+            && index_result.var_indexed_columns.is_empty(),
+        index: PredicateIndexBuildSummary {
+            result: Some(index_result),
+            multimodal_skip: None,
+        },
+    };
+
     // --- Append provenance (manual, mirrors finalize_append) ---------------
-    let params = build_params_json(patch, &indexed_obs_cols, &indexed_var_cols);
+    let params = build_params_json(patch, &summary);
     prov_ops.push(ProvenanceEntry {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -437,9 +638,12 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
     // satisfy, silently returning a short row set.
     //
     // `assign_csr_shard_column_stats` rewrites every modality-0 CSR entry, so it
-    // is already total and needs no pre-clear. It is reached only when a rebuild
-    // was requested AND produced index bytes AND the CSR ranges cover [0, n_obs);
-    // the `None` arm is what closes the other three routes to a replaced obs.
+    // is already total and needs no pre-clear. It is reached only when an index
+    // was built (requested OR carried forward) AND produced index bytes AND the
+    // CSR ranges cover [0, n_obs); the `None` arm is what closes the other three
+    // routes to a replaced obs. Carrying the index forward is therefore also
+    // what keeps Level-1 pruning alive across an ordinary obs edit — before it,
+    // every `modify_metadata(obs=…)` landed in the `None` arm.
     match per_shard_obs_stats {
         Some(per_shard) => scx_format_io::assign_csr_shard_column_stats(&mut entries, per_shard)?,
         None if patch.obs.is_some() => {
@@ -487,10 +691,13 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
     };
 
     commit_in_place(&mut lock, &mut prep.header, &new_catalog, mt_off, mt_len)?;
-    Ok(())
+    Ok(summary)
 }
 
 /// Convenience wrapper: replace the whole `uns` block.
+///
+/// A uns-only patch touches no axis, so there is no index to carry and nothing
+/// in the summary to report — hence the `()`.
 pub fn set_uns(path: &Path, uns: &Value) -> Result<()> {
     modify_metadata(
         path,
@@ -498,7 +705,8 @@ pub fn set_uns(path: &Path, uns: &Value) -> Result<()> {
             uns: Some(uns.clone()),
             ..Default::default()
         },
-    )
+    )?;
+    Ok(())
 }
 
 /// Whether an old catalog entry is superseded by `patch` and must be dropped
@@ -517,9 +725,11 @@ fn should_drop_old_entry(e: &FullCatalogEntry, patch: &MetadataPatch) -> bool {
     if patch.uns.is_some() && e.section_type == UnsBlob && e.modality_id == 0 {
         return true;
     }
-    // obs/var changed → drop their metadata sections AND any predicate index
-    // (the index covers now-stale values; a fresh one is re-emitted when the
-    // caller requests a rebuild).
+    // obs/var changed → drop their metadata sections AND any predicate index.
+    // The old section's shard ranges describe values that are gone, so it can
+    // never be kept verbatim; carrying the index forward means writing a fresh
+    // one over the same columns, which the caller above has already done by the
+    // time this runs.
     if patch.var.is_some()
         && matches!(
             e.section_type,
@@ -557,8 +767,20 @@ fn should_drop_old_entry(e: &FullCatalogEntry, patch: &MetadataPatch) -> bool {
     false
 }
 
-/// Provenance params recording which fields changed + any indexed columns.
-fn build_params_json(patch: &MetadataPatch, obs_cols: &[String], var_cols: &[String]) -> Value {
+/// Provenance params recording which fields changed + what happened to the
+/// predicate indexes.
+///
+/// `obs_predicate_index_dropped` deliberately reuses the field name
+/// `attach_external_obs` already stamps, so one `scx info` grep answers the
+/// same question on either op.
+fn build_params_json(patch: &MetadataPatch, summary: &ModifyMetadataSummary) -> Value {
+    let (obs_cols, var_cols) = match summary.index.result.as_ref() {
+        Some(r) => (
+            r.obs_indexed_columns.as_slice(),
+            r.var_indexed_columns.as_slice(),
+        ),
+        None => (&[] as &[String], &[] as &[String]),
+    };
     let mut changed: Vec<&str> = Vec::new();
     if patch.uns.is_some() {
         changed.push("uns");
@@ -576,10 +798,24 @@ fn build_params_json(patch: &MetadataPatch, obs_cols: &[String], var_cols: &[Str
         changed.push("varm");
     }
     let mut params = serde_json::json!({ "changed": changed });
-    if !obs_cols.is_empty() || !var_cols.is_empty() {
+    if patch.obs.is_some() {
+        params["obs_predicate_index_dropped"] = summary.obs_predicate_index_dropped.into();
+    }
+    if patch.var.is_some() {
+        params["var_predicate_index_dropped"] = summary.var_predicate_index_dropped.into();
+    }
+    if !obs_cols.is_empty()
+        || !var_cols.is_empty()
+        || !summary.obs_columns_not_carried.is_empty()
+        || !summary.var_columns_not_carried.is_empty()
+    {
         params["predicate_index"] = serde_json::json!({
             "obs_columns": obs_cols,
             "var_columns": var_cols,
+            "obs_carried_forward": summary.obs_carried_forward,
+            "var_carried_forward": summary.var_carried_forward,
+            "obs_columns_not_carried": summary.obs_columns_not_carried,
+            "var_columns_not_carried": summary.var_columns_not_carried,
         });
     }
     params

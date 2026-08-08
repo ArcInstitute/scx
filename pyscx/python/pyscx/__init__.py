@@ -105,6 +105,8 @@ from .pyscx import from_anndata as _from_anndata_native  # noqa: E402
 from .pyscx import obs_import as _obs_import_native  # noqa: E402
 from .pyscx import diagnose_obs_key as _diagnose_obs_key_native  # noqa: E402
 from .pyscx import doublet_import as _doublet_import_native  # noqa: E402
+from .pyscx import modify_metadata as _modify_metadata_native  # noqa: E402
+from .pyscx import set_uns as _set_uns_native      # noqa: E402
 
 # N3-2026-05-21-Tier2: hdf5-gated entry points. The Rust side registers
 # these four symbols under `#[cfg(feature = "hdf5")]` (pyscx/src/lib.rs).
@@ -304,6 +306,32 @@ def write(adata, path, **kwargs):
         pyscx.write(adata, "data.scx")
     """
     return _from_anndata_native(adata, _coerce_path(path), **kwargs)
+
+
+def modify_metadata(path, **kwargs):
+    """Replace metadata sections in place, without re-encoding `X`.
+
+    Thin `os.PathLike`-accepting wrapper; see the native docstring
+    (`help(pyscx.pyscx.modify_metadata)`) for the full contract. Every other
+    path-taking entry point coerces, and this one did not — a `pathlib.Path`
+    raised `TypeError: 'PosixPath' object is not an instance of 'str'`.
+
+    Args:
+        path: Target SCX file (str, os.PathLike, or an open Experiment).
+        **kwargs: Forwarded to the native `modify_metadata` (`uns=`, `obs=`,
+            `var=`, `obsm=`, `varm=`, `index_obs=`, …).
+    """
+    return _modify_metadata_native(_coerce_path(path), **kwargs)
+
+
+def set_uns(path, uns):
+    """Replace the whole `uns` block in place. `os.PathLike`-accepting wrapper.
+
+    Args:
+        path: Target SCX file (str, os.PathLike, or an open Experiment).
+        uns: dict replacing the whole `uns` block (replace, not merge).
+    """
+    return _set_uns_native(_coerce_path(path), uns)
 
 
 def from_h5ad(path, out, **kwargs):
@@ -1297,10 +1325,14 @@ def doublet_consensus(target, *, keys=None, method="majority",
             want the tools' own thresholds to decide, use "majority".
         overwrite: Replace existing `<K>_*` columns. Without it a collision is
             an error, so a second run cannot silently rewrite the first.
-        index_obs / index_preset: Rebuild an obs predicate index over these
-            columns as part of the same commit. Relevant only for a file
-            target: replacing obs drops any existing obs predicate index, so
-            pass these if the file had one (`scx info` lists it).
+        index_obs / index_preset: Index the obs predicate index over these
+            columns as part of the same commit, instead of the columns the file
+            already indexes. Relevant only for a file target, and rarely
+            needed: writing the consensus replaces obs, and a replaced obs
+            carries its existing index forward, so pushdown survives this call
+            untouched. Naming columns here *narrows* the index to them, and any
+            column the file indexed that this list omits is reported as a
+            `UserWarning`.
 
     Returns:
         The same dict written to `uns["<K>_consensus"]`: `method`, `keys`,

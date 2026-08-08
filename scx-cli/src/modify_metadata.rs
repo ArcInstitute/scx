@@ -2,8 +2,9 @@
 // of an SCX file in place, without re-encoding X.
 //
 // obs/var are read from Parquet; obsm/varm from 2D `.npy` (float32 or
-// float64, cast to f32). Predicate indexes over a replaced obs/var are
-// dropped unless --index-* requests a rebuild. Multimodal is deferred.
+// float64, cast to f32). A replaced obs/var keeps the predicate index it had
+// (rebuilt over the same columns) unless --index-* names a different set.
+// Multimodal is deferred.
 
 use std::io::Cursor;
 use std::path::Path;
@@ -13,6 +14,8 @@ use arrow::array::{ArrayRef, Float32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_engine::ConversionPredicateIndexOptions;
 use scx_ops::MetadataPatch;
+
+use crate::index_warnings::emit_index_summary;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_modify_metadata(
@@ -53,19 +56,17 @@ pub fn run_modify_metadata(
     let obsm_batches = read_named_npy(obsm, "obsm")?;
     let varm_batches = read_named_npy(varm, "varm")?;
 
-    let any_index = !index_obs.is_empty()
-        || !index_var.is_empty()
-        || index_preset.is_some()
-        || index_auto_threshold.is_some();
-    let index = if any_index {
-        ConversionPredicateIndexOptions {
-            index_obs,
-            index_var,
-            index_preset,
-            index_auto_threshold: index_auto_threshold.unwrap_or(1000),
-        }
-    } else {
-        ConversionPredicateIndexOptions::default()
+    // `index_auto_threshold` is NOT defaulted to 1000 when some other index flag
+    // is set, unlike the conversion commands. This op reads a non-zero threshold
+    // as "auto-detect on both axes", so defaulting it would make
+    // `--index-var gene_id --obs obs.parquet` silently take the obs axis off
+    // carry-forward and onto auto-detect. `0` means "no auto unless asked", which
+    // is what an omitted flag means.
+    let index = ConversionPredicateIndexOptions {
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold: index_auto_threshold.unwrap_or(0),
     };
 
     let patch = MetadataPatch {
@@ -78,13 +79,66 @@ pub fn run_modify_metadata(
         modality_id: 0,
     };
 
-    scx_ops::modify_metadata(file, &patch)?;
+    let summary = scx_ops::modify_metadata(file, &patch)?;
     println!(
         "Updated metadata on {} (O(replaced sections), no matrix re-encode). \
          Run 'scx compact' to reclaim orphaned sections.",
         file.display()
     );
+    report_index_outcome(&summary);
     Ok(())
+}
+
+/// Say what happened to the file's predicate indexes. Silent when there were
+/// none — the common `--uns`-only case — and explicit otherwise, because the
+/// alternative is a user discovering months later that their queries went back
+/// to a full obs scan.
+fn report_index_outcome(summary: &scx_ops::ModifyMetadataSummary) {
+    // Per-column build outcomes go through the shared emitter every other
+    // index-writing command uses, so a `PresetSkipped` / `ForcedColumnError`
+    // reads the same here as under `merge` / `compact` / `append`.
+    emit_index_summary("modify-metadata", &summary.index);
+
+    if let Some(result) = summary.index.result.as_ref() {
+        // Per axis: with "explicit" decided per axis, one side can be carried
+        // while the other is rebuilt from the caller's own column list.
+        for (axis, columns, carried) in [
+            (
+                "obs",
+                &result.obs_indexed_columns,
+                summary.obs_carried_forward,
+            ),
+            (
+                "var",
+                &result.var_indexed_columns,
+                summary.var_carried_forward,
+            ),
+        ] {
+            if columns.is_empty() {
+                continue;
+            }
+            let how = if carried {
+                "carried forward"
+            } else {
+                "rebuilt"
+            };
+            println!("  {axis} predicate index {how} over {columns:?}");
+        }
+    }
+    // `*_not_carried_unreported`, not the raw lists: on the carry path
+    // `emit_index_summary` above has already named every column that could not
+    // be carried, and printing the raw list too warns twice about one column.
+    for (axis, columns) in [
+        ("obs", summary.obs_not_carried_unreported()),
+        ("var", summary.var_not_carried_unreported()),
+    ] {
+        if !columns.is_empty() {
+            eprintln!(
+                "  warning: the {axis} predicate index no longer covers {columns:?}; \
+                 queries on those columns fall back to a full scan"
+            );
+        }
+    }
 }
 
 fn read_json(p: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {

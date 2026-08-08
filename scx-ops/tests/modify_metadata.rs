@@ -4,7 +4,7 @@
 //! Covers:
 //! - `uns` round-trip with the matrix (CSR shards) proven byte-identical;
 //! - generation invariants + CSC sidecar still validating (the key win vs append);
-//! - `obs` replace with predicate-index drop vs. rebuild;
+//! - `obs` replace with predicate-index carry-forward vs. explicit rebuild;
 //! - shape rejection leaving the file untouched;
 //! - rollback restoring the prior `uns`;
 //! - empty-patch rejection.
@@ -318,7 +318,7 @@ fn obs_replace_changes_values_keeps_matrix() {
 }
 
 #[test]
-fn obs_replace_index_rebuild_then_drop() {
+fn obs_replace_index_rebuild_then_carry_forward() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("obs_idx.scx");
     write_base(&path, 30, 5, None);
@@ -337,9 +337,13 @@ fn obs_replace_index_rebuild_then_drop() {
         has_section(&path, SectionType::ObsPredicateIndex),
         "predicate index rebuilt when requested"
     );
+    assert_eq!(indexed_donor_values(&path), vec!["donor_A".to_string()]);
 
-    // Replace obs again WITHOUT index flags → stale index dropped.
-    modify_metadata(
+    // Replace obs again WITHOUT index flags. The old section cannot survive
+    // verbatim — its ranges describe `donor_A`, which is gone — so the op
+    // rebuilds over the same column rather than dropping the index and leaving
+    // the file unprunable.
+    let summary = modify_metadata(
         &path,
         &MetadataPatch {
             obs: Some(obs_batch(30, "donor_B")),
@@ -347,10 +351,40 @@ fn obs_replace_index_rebuild_then_drop() {
         },
     )
     .unwrap();
+
+    assert!(summary.obs_carried_forward);
+    assert!(!summary.obs_predicate_index_dropped);
     assert!(
-        !has_section(&path, SectionType::ObsPredicateIndex),
-        "stale predicate index dropped when not rebuilt"
+        has_section(&path, SectionType::ObsPredicateIndex),
+        "the index the file had must be carried forward, not dropped"
     );
+    // Carried, and not stale: it describes the values that are actually there.
+    assert_eq!(
+        indexed_donor_values(&path),
+        vec!["donor_B".to_string()],
+        "a carried index describing the replaced values would be worse than none"
+    );
+}
+
+/// The `donor` categorical values the file's obs predicate index covers.
+fn indexed_donor_values(path: &Path) -> Vec<String> {
+    let reader = ScxReader::open(path).unwrap();
+    let bytes = reader
+        .read_obs_predicate_index_bytes()
+        .unwrap()
+        .expect("file must carry an obs predicate index");
+    let index = scx_engine::PredicateIndex::read_from(&mut std::io::Cursor::new(bytes)).unwrap();
+    index
+        .columns
+        .iter()
+        .filter_map(|c| match c {
+            scx_engine::index::IndexedColumn::Categorical(cat) if cat.column_name == "donor" => {
+                Some(cat.entries.iter().map(|e| e.value.clone()))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 #[test]

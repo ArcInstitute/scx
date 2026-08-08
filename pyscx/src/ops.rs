@@ -1518,9 +1518,20 @@ pub fn set_uns(py: Python<'_>, path: &str, uns: &Bound<'_, PyAny>) -> PyResult<(
 /// **Replace semantics, not merge.** A supplied `obs`/`var` fully replaces
 /// the section and `num_rows` must match the file's `n_obs` / `n_vars`
 /// (changing cell/gene count is out of scope — use `append` / `subset`).
-/// `obsm` / `varm` replace only the named matrices. Predicate indexes over a
-/// replaced `obs`/`var` are dropped unless `index_obs` / `index_var` /
-/// `index_preset` request a rebuild.
+/// `obsm` / `varm` replace only the named matrices.
+///
+/// **A replaced axis keeps the predicate index it had.** The old section
+/// describes values that are gone, so it is rebuilt over the same columns the
+/// file already indexed — which also re-derives the per-shard column stats, so
+/// `filter_obs` pushdown survives an ordinary obs edit. Naming `index_obs` /
+/// `index_var` / `index_preset` overrides that; a column the file indexed and
+/// the new request does not is reported as a `UserWarning` rather than dropped
+/// in silence.
+///
+/// The override is **per axis**: `index_obs` changes only the obs axis's column
+/// set, and a var replacement in the same call still carries its own index
+/// forward. `index_preset` and `index_auto_threshold` genuinely span both axes
+/// and so override both.
 ///
 /// Args:
 ///     path: target `.scx` file.
@@ -1529,7 +1540,8 @@ pub fn set_uns(py: Python<'_>, path: &str, uns: &Bound<'_, PyAny>) -> PyResult<(
 ///         equal `n_obs` / `n_vars`.
 ///     obsm / varm: `dict[str, np.ndarray]` of named dense matrices.
 ///     index_obs / index_var / index_preset / index_auto_threshold:
-///         predicate-index rebuild policy (only consulted when obs/var change).
+///         predicate-index policy (only consulted when obs/var change).
+///         Omitted, the file's existing index is carried forward.
 ///     modality: integer modality id (only `0` / global is supported today).
 #[pyfunction]
 #[pyo3(signature = (
@@ -1573,8 +1585,19 @@ pub fn modify_metadata(
         None => None,
     };
     let modality_id = resolve_modality_id(modality)?;
-    let index = build_index_options(index_obs, index_var, index_preset, index_auto_threshold)
-        .unwrap_or_default();
+    // Built here rather than via `build_index_options`, which defaults
+    // `index_auto_threshold` to 1000 whenever *any* index kwarg is set. That
+    // default is right for the conversion ops, and wrong here: this op reads
+    // `index_auto_threshold > 0` as "the caller wants auto-detection on both
+    // axes", so `modify_metadata(obs=…, index_var=[…])` would silently take the
+    // obs axis off carry-forward and onto auto-detect. `0` means "no auto
+    // unless you asked for it", which is what an omitted kwarg means.
+    let index = ConversionPredicateIndexOptions {
+        index_obs: index_obs.unwrap_or_default(),
+        index_var: index_var.unwrap_or_default(),
+        index_preset,
+        index_auto_threshold: index_auto_threshold.unwrap_or(0),
+    };
 
     let patch = scx_ops::MetadataPatch {
         uns: uns_json,
@@ -1586,8 +1609,49 @@ pub fn modify_metadata(
         modality_id,
     };
     let path_buf = PathBuf::from(path);
-    py.detach(|| scx_ops::modify_metadata(&path_buf, &patch))
+    let summary = py
+        .detach(|| scx_ops::modify_metadata(&path_buf, &patch))
         .map_err(ops_to_pyerr)?;
+    report_modify_metadata_index(py, summary)
+}
+
+/// Surface what the op did to the file's predicate indexes.
+///
+/// Two channels, one warning per column and no doubling between them:
+///
+/// * `process_index_summary` reports every per-column build outcome with its
+///   precise reason — which on the carry-forward path is every column that
+///   could not be carried.
+/// * The remaining `*_columns_not_carried` entries are the explicit-request
+///   path, where the builder knows nothing about the index the file had and so
+///   emits no outcome for a column the caller simply did not name.
+fn report_modify_metadata_index(
+    py: Python<'_>,
+    summary: scx_ops::ModifyMetadataSummary,
+) -> PyResult<()> {
+    // Computed before `process_index_summary` consumes the summary. The filter
+    // lives in `scx-ops` so this and the CLI cannot drift on it — the CLI
+    // rendering both channels unfiltered is exactly how one column came to be
+    // warned about twice.
+    let obs_unreported = summary.obs_not_carried_unreported();
+    let var_unreported = summary.var_not_carried_unreported();
+
+    process_index_summary(py, summary.index)?;
+
+    for (axis, columns) in [("obs", obs_unreported), ("var", var_unreported)] {
+        if columns.is_empty() {
+            continue;
+        }
+        py.import("warnings")?.call_method1(
+            "warn",
+            (format!(
+                "the {axis} predicate index no longer covers {columns:?}: this file indexed \
+                 {axis} on them, and the index_{axis} / index_preset passed to this call does \
+                 not. Queries on those columns fall back to a full scan. Include them to keep \
+                 the pushdown, or omit index_* entirely to carry the file's own index forward."
+            ),),
+        )?;
+    }
     Ok(())
 }
 

@@ -268,11 +268,300 @@ fn obs_replacement_does_not_leave_stale_column_stats_pruning_matching_shards() {
     );
 
     // And the mechanism, not just the symptom: nothing stale is left behind.
+    //
+    // "Not stale" no longer means "absent". The file was indexed on `n_counts`,
+    // so the replacement carries that index forward and re-derives the bounds —
+    // which is the stronger outcome, since Level-1 pruning survives the edit
+    // instead of being switched off. What must not survive is a bound describing
+    // the values that were replaced.
+    let stats = csr_column_stats(&path);
+    assert!(
+        !stats.is_empty(),
+        "the carried-forward index must re-derive the stats, not leave the file unprunable"
+    );
+    for stat in &stats {
+        match stat {
+            ColumnStat::MinMax { min, max, .. } => assert!(
+                *min >= n_counts_after(0) as f64 && *max <= n_counts_after(N_OBS - 1) as f64,
+                "MinMax [{min}, {max}] does not describe the post-replacement values \
+                 [{}, {}] — a stale bound survived",
+                n_counts_after(0),
+                n_counts_after(N_OBS - 1),
+            ),
+            other => panic!("unexpected stat for an Int64 column: {other:?}"),
+        }
+    }
+    assert_stats_counts_agree(&path);
+}
+
+/// The carry-forward itself, from the section's own direction: an obs
+/// replacement that names no `index_*` must leave the file indexed on the
+/// columns it was already indexed on.
+///
+/// `pyscx.doublet_consensus` is exactly this call — a wholesale obs replacement
+/// with no index kwargs — so before the carry it silently reverted
+/// `query().filter_obs(...)` to a full obs scan on the last step of the
+/// documented doublet workflow.
+#[test]
+fn an_obs_replacement_carries_the_existing_index_forward() {
+    let dir = TempDir::new().unwrap();
+    let path = write_indexed_fixture(&dir, "atlas.scx");
+    assert!(has_obs_index(&path), "fixture must start with an index");
+
+    let summary = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_frame(n_counts_after)),
+            index: no_index_rebuild(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(summary.obs_carried_forward);
+    assert!(!summary.obs_predicate_index_dropped);
+    assert!(summary.obs_columns_not_carried.is_empty());
+    assert_eq!(
+        summary
+            .index
+            .result
+            .as_ref()
+            .map(|r| r.obs_indexed_columns.clone()),
+        Some(vec!["n_counts".to_string()]),
+    );
+    assert!(
+        has_obs_index(&path),
+        "the file was indexed on n_counts and must still be"
+    );
+}
+
+/// The carry can fail, and when it does the stats must go with it.
+///
+/// Replacing `n_counts` with a `Boolean` column of the same name leaves the
+/// carried column present but unindexable, so the builder emits no bytes — the
+/// `obs_bytes == None` route, reached here without any `index_*` request at all.
+/// This is the branch the carry-forward *added*, and the one that would
+/// otherwise leave the pre-replacement bounds standing.
+#[test]
+fn a_carry_that_indexes_nothing_still_clears_the_stats() {
+    let dir = TempDir::new().unwrap();
+    let path = write_indexed_fixture(&dir, "atlas.scx");
+
+    // Same column name, unindexable dtype.
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("n_counts", DataType::Boolean, false),
+    ]);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                (0..N_OBS).map(|i| format!("cell_{i}")).collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                (0..N_OBS).map(|i| i % 2 == 0).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+
+    let summary = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs),
+            index: no_index_rebuild(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(summary.obs_predicate_index_dropped);
+    assert_eq!(
+        summary.obs_columns_not_carried,
+        vec!["n_counts".to_string()]
+    );
+    assert!(
+        !summary.obs_carried_forward,
+        "a carry that indexed nothing carried nothing forward — reporting this true \
+         beside obs_predicate_index_dropped on one provenance entry is how a consumer \
+         grepping for the carry misreads a dropped index as a kept one"
+    );
+    assert!(!has_obs_index(&path));
     assert!(
         csr_column_stats(&path).is_empty(),
-        "stats derived from the replaced obs must be dropped, not kept"
+        "a carry that indexed nothing must not leave the pre-replacement bounds standing"
     );
     assert_stats_counts_agree(&path);
+}
+
+/// An explicit request stays authoritative, and the narrowing is reported.
+///
+/// The builder is handed only what the caller named, so it emits no outcome for
+/// a column the file indexed and the request omits — `obs_columns_not_carried`
+/// is the only channel that can name it, and without it the loss is silent.
+#[test]
+fn an_explicit_request_reports_the_index_columns_it_drops() {
+    let dir = TempDir::new().unwrap();
+    let path = write_indexed_fixture(&dir, "atlas.scx");
+
+    // The fixture indexes `n_counts`; ask for `cell_id` instead.
+    let summary = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_frame(n_counts_after)),
+            index: ConversionPredicateIndexOptions {
+                index_obs: vec!["cell_id".to_string()],
+                index_var: vec![],
+                index_preset: None,
+                index_auto_threshold: 0,
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !summary.obs_carried_forward,
+        "the caller named their own columns"
+    );
+    assert_eq!(
+        summary.obs_columns_not_carried,
+        vec!["n_counts".to_string()]
+    );
+    // Rows stay correct either way — the point is that pushdown on `n_counts`
+    // is gone and the caller was told.
+    assert_eq!(
+        query(&path, "n_counts > 1500").matched_rows,
+        expected_gt(n_counts_after, 1500)
+    );
+}
+
+/// The two report channels overlap, and a front end rendering both raw warns
+/// twice about one column.
+///
+/// On the carry path every column that could not be carried also has a
+/// `PresetSkipped` outcome naming it; on the explicit-request path the builder
+/// never sees the old index and emits nothing. `*_not_carried_unreported` is the
+/// difference, and it lives in `scx-ops` so pyscx and the CLI cannot drift —
+/// the CLI double-warned the moment it started rendering outcomes at all.
+#[test]
+fn the_two_report_channels_do_not_both_name_the_same_column() {
+    let dir = TempDir::new().unwrap();
+
+    // Carry path: `n_counts` comes back as an unindexable dtype, so the builder
+    // emits a `PresetSkipped` for it AND it lands in `obs_columns_not_carried`.
+    let path = write_indexed_fixture(&dir, "carry.scx");
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("n_counts", DataType::Boolean, false),
+    ]);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                (0..N_OBS).map(|i| format!("cell_{i}")).collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                (0..N_OBS).map(|i| i % 2 == 0).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let carried = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs),
+            index: no_index_rebuild(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        carried.obs_columns_not_carried,
+        vec!["n_counts".to_string()]
+    );
+    assert!(
+        carried.obs_not_carried_unreported().is_empty(),
+        "the builder already emitted a PresetSkipped naming this column"
+    );
+
+    // Explicit path: the builder is handed only what the caller named, so it
+    // says nothing about `n_counts` and this channel is the only one that can.
+    let path = write_indexed_fixture(&dir, "explicit.scx");
+    let explicit = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_frame(n_counts_after)),
+            index: ConversionPredicateIndexOptions {
+                index_obs: vec!["cell_id".to_string()],
+                index_var: vec![],
+                index_preset: None,
+                index_auto_threshold: 0,
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        explicit.obs_not_carried_unreported(),
+        vec!["n_counts".to_string()],
+        "nothing else names it, so filtering it out would silence the loss"
+    );
+}
+
+/// Naming an index column on ONE axis must not change the other axis's policy.
+///
+/// `user_wants_index` is a whole-patch question — true if any index knob is set
+/// — so reading it per axis let `index_var=[…]` take the obs axis off
+/// carry-forward and onto auto-detect. Under the "omit `index_*` to carry"
+/// contract that is a footgun: the caller said nothing about obs.
+#[test]
+fn an_index_request_on_one_axis_leaves_the_other_axis_carrying() {
+    let dir = TempDir::new().unwrap();
+    let path = write_indexed_fixture(&dir, "atlas.scx");
+
+    let summary = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_frame(n_counts_after)),
+            var: Some(var_frame()),
+            index: ConversionPredicateIndexOptions {
+                index_obs: vec![],
+                index_var: vec!["gene_id".to_string()],
+                index_preset: None,
+                index_auto_threshold: 0,
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        summary.obs_carried_forward,
+        "naming only index_var must leave obs on carry-forward"
+    );
+    assert!(summary.obs_columns_not_carried.is_empty());
+    assert_eq!(
+        summary
+            .index
+            .result
+            .as_ref()
+            .map(|r| r.obs_indexed_columns.clone()),
+        Some(vec!["n_counts".to_string()]),
+        "obs must be indexed on the file's own column, not auto-detected"
+    );
+    assert!(has_obs_index(&path));
+    // …and the var axis took the caller's explicit list, so it is not a carry.
+    assert!(!summary.var_carried_forward);
+}
+
+fn has_obs_index(path: &Path) -> bool {
+    ScxReader::open(path)
+        .unwrap()
+        .catalog()
+        .entries
+        .iter()
+        .any(|e| e.section_type == SectionType::ObsPredicateIndex)
 }
 
 /// `Gt` is not the only arm that prunes from a stale bound: `Eq` and `In` skip a
