@@ -72,8 +72,17 @@ fn scx_compute_lisi_impl(
             "embeddings matrix is empty ({n_obs}x{n_dims})",
         )));
     }
-    if perplexity <= 0.0 {
-        return Err(Error::Other("perplexity must be > 0".into()));
+    // `is_finite` first: NaN compares false against everything, so a lone
+    // `perplexity <= 0.0` passed it through and the computation degenerated to
+    // an all-1.0 result with no error (see `scx_accel::lisi::compute_lisi`,
+    // which carries the load-bearing copy of this guard). Kept here too so the
+    // message names the R-facing argument rather than a downstream crate's.
+    if !perplexity.is_finite() || perplexity <= 0.0 {
+        // `{:?}` so a finite-but-absurd `-1e300` does not render as a
+        // 302-character message; `Display` for f64 never uses exponent notation.
+        return Err(Error::Other(format!(
+            "perplexity must be a finite positive number (got {perplexity:?})"
+        )));
     }
 
     let label_strs: Vec<String> = labels.iter().map(|s| s.to_string()).collect();

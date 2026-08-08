@@ -315,8 +315,13 @@ LRU thrashing across modalities.
   - `dim()` / `nrow()` / `ncol()`; `bsd[i, ]` / `bsd[i, j]` return a `dgCMatrix`
     of the selected cells (rows) × genes (columns), rows in requested order.
     Row indices are 1-based; positive-integer and logical indices are supported
-    (negative/character raise). Contiguous ascending `i` uses a single range
-    read; arbitrary/reordered `i` uses a fancy gather.
+    (negative/character/non-finite raise). Fractional indices truncate, matching
+    a `dgCMatrix` (`M[1.9, ]` is row 1). Contiguous ascending `i` uses a single
+    range read; arbitrary/reordered `i` uses a fancy gather.
+  - `bsd$read_rows(start, end)` / `bsd$read_row_indices(idx)` are the raw
+    methods underneath `[`. They are **0-based** (`end` is an exclusive bound)
+    and, unlike `[`, strict: negative, `NaN`, fractional, and non-finite values
+    raise rather than being coerced.
   - `bsd$row_sums()` / `bsd$col_sums()` / `bsd$nnz()` — streamed aggregations
     with no full decode; `bsd$to_dgcmatrix()` / `as(bsd, "dgCMatrix")` to
     materialise the whole matrix.

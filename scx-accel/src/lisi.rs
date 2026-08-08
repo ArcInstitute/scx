@@ -104,8 +104,33 @@ pub fn compute_lisi(
             n_obs
         )));
     }
-    if config.perplexity <= 0.0 {
-        return Err(AccelError::InvalidInput("perplexity must be > 0".into()));
+    // The `is_finite` half is load-bearing and must come first: every
+    // comparison against NaN is false, so a lone `perplexity <= 0.0` let NaN
+    // straight through, and the computation then degenerated *silently* in two
+    // different ways depending on the caller:
+    //
+    //   * `target_logu = NaN.ln()` is NaN, so `hbeta_weights`' convergence test
+    //     `(h - target_logu).abs() > tol` is false on the very first check. The
+    //     binary search never iterates, beta keeps its initial 1.0, and the
+    //     non-convergence warning never fires either — so the result is an
+    //     arbitrary fixed-bandwidth kernel yielding ordinary-looking LISI
+    //     values (measured ~2.8 on a 3-label fixture).
+    //   * Callers that derive the neighbour count from perplexity — rscx's and
+    //     pyscx's `compute_lisi` both use `ceil(3 * perplexity)` — get 0, which
+    //     the `.max(1)` just below turns into k = 1, giving LISI of exactly 1.0
+    //     for every cell: "perfectly unmixed", the most confident wrong answer
+    //     this metric can produce.
+    //
+    // Neither raised, warned, or logged.
+    if !config.perplexity.is_finite() || config.perplexity <= 0.0 {
+        // `{:?}`, not `{}`, for the same reason `util::reject_reason` uses it in
+        // rscx: `Display` for f64 never uses exponent notation, so a finite but
+        // absurd `-1e300` (which trips the `<= 0.0` arm) would render as a
+        // 302-character message. `Debug` gives `-1e300`.
+        return Err(AccelError::InvalidInput(format!(
+            "perplexity must be a finite positive number (got {:?})",
+            config.perplexity
+        )));
     }
     let k = config.n_neighbors.max(1);
     if k >= n_obs {
@@ -510,6 +535,56 @@ mod tests {
         for &v in &result.lisi {
             assert!((v - 1.0).abs() < 1e-6, "expected LISI=1, got {v}");
         }
+    }
+
+    #[test]
+    fn test_non_finite_perplexity_is_rejected_not_silently_degenerate() {
+        // A NaN perplexity used to slip past `perplexity <= 0.0`, because every
+        // comparison against NaN is false. Both surviving code paths returned a
+        // plausible answer rather than an error -- verified by reverting the
+        // guard: with an explicit `n_neighbors` the calibration loop never
+        // iterates and LISI comes back around 2.8 on this 3-label fixture
+        // (ordinary-looking), while the k = 1 case below returns exactly 1.0
+        // for every cell, which is indistinguishable from the genuine
+        // single-label result asserted in the test above.
+        let n = 60;
+        let d = 4;
+        let emb = random_emb(n, d, 3);
+        let labels: Vec<u32> = (0..n as u32).map(|i| i % 3).collect();
+
+        // k = 1 mirrors what the rscx / pyscx bindings derive for a NaN
+        // perplexity: `ceil(3 * NaN) as usize` is 0, clamped up to 1.
+        for k in [20usize, 1] {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -5.0] {
+                let config = LisiConfig {
+                    perplexity: bad,
+                    n_neighbors: k,
+                    ..Default::default()
+                };
+                let err = compute_lisi(&emb, n, d, &labels, &config)
+                    .expect_err("perplexity must be rejected")
+                    .to_string();
+                assert!(
+                    err.contains("perplexity"),
+                    "error for {bad} (k={k}) should name perplexity, got: {err}"
+                );
+            }
+        }
+
+        // A fractional perplexity remains valid -- the derived neighbour count
+        // is `ceil(3 * perplexity)`, so this must not be swept up by the guard.
+        let config = LisiConfig {
+            perplexity: 5.5,
+            n_neighbors: 20,
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_lisi(&emb, n, d, &labels, &config)
+                .unwrap()
+                .lisi
+                .len(),
+            n
+        );
     }
 
     #[test]

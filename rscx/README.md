@@ -185,9 +185,17 @@ cell_totals <- bsd$row_sums()
 ```
 
 Row indices are 1-based (R convention); positive-integer and logical indices are
-supported (negative/character row indices are not). A column index is applied to
-the returned `dgCMatrix`. Use `bsd$to_dgcmatrix()` / `as(bsd, "dgCMatrix")` to
-materialise the full matrix when you do want it all in memory.
+supported (negative, character, `NA` and non-finite row indices are not).
+Fractional indices truncate, as they do for a `dgCMatrix` — `bsd[1.9, ]` is row
+1 — which keeps `i` and `j` consistent, since the column index is handed to
+Matrix's own `[`. A column index is applied to the returned `dgCMatrix`. Use
+`bsd$to_dgcmatrix()` / `as(bsd, "dgCMatrix")` to materialise the full matrix
+when you do want it all in memory.
+
+The `bsd$read_rows(start, end)` and `bsd$read_row_indices(idx)` methods
+underneath `[` are **0-based** (`end` is an exclusive bound) and stricter: they
+reject fractional, negative, `NaN` and non-finite values outright rather than
+coercing them.
 
 ### Lazy transform chains
 

@@ -112,3 +112,32 @@ class TestLisiErrors:
 
         with pytest.raises(Exception):
             pyscx.accel.compute_lisi(lisi_adata, "batch", perplexity=-1.0)
+
+    def test_nan_perplexity_rejected_not_silently_all_ones(self, lisi_adata):
+        """NaN slipped past `perplexity <= 0.0` and produced a plausible answer.
+
+        `NaN <= 0.0` is false, so the guard passed. Downstream,
+        `(NaN * 3).ceil() as usize` is 0 -> clamped to k = 1, and
+        `target_logu = NaN.ln()` makes the calibration loop's `abs() > tol`
+        false so it never iterates. The result was a full-length vector of
+        exactly 1.0 -- i.e. "perfectly unmixed", which is a meaningful-looking
+        batch-integration verdict, returned with no error and no warning.
+        """
+        import pyscx
+
+        with pytest.raises(ValueError, match="finite"):
+            pyscx.accel.compute_lisi(
+                lisi_adata, "batch", perplexity=float("nan")
+            )
+
+        # +Inf did error before, but only by saturating to usize::MAX and
+        # tripping an unrelated neighbour-count bound; pin the real message.
+        with pytest.raises(ValueError, match="finite"):
+            pyscx.accel.compute_lisi(
+                lisi_adata, "batch", perplexity=float("inf")
+            )
+
+        # A fractional perplexity is legitimate -- the derived neighbour count
+        # is ceil(3 * perplexity) -- and must keep working.
+        lisi = pyscx.accel.compute_lisi(lisi_adata, "batch", perplexity=10.5)
+        assert lisi.shape == (lisi_adata.n_obs,)

@@ -93,8 +93,18 @@ pub fn compute_lisi<'py>(
     n_neighbors: Option<usize>,
     approximate_knn: bool,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    if perplexity <= 0.0 {
-        return Err(PyValueError::new_err("perplexity must be > 0"));
+    // `is_finite` first: NaN compares false against everything, so a lone
+    // `perplexity <= 0.0` passed it through. With `n_neighbors=None` the derived
+    // count `ceil(3 * NaN)` collapses to k = 1 and every cell comes back as
+    // exactly 1.0 — LISI 1.0 means a single local category, i.e. "perfectly
+    // *un*mixed", the most confident wrong answer this metric can give — with no
+    // error. See `scx_accel::lisi::compute_lisi`, which is the load-bearing one.
+    if !perplexity.is_finite() || perplexity <= 0.0 {
+        // `{:?}` so a finite-but-absurd `-1e300` does not render as a
+        // 302-character message; `Display` for f64 never uses exponent notation.
+        return Err(PyValueError::new_err(format!(
+            "perplexity must be a finite positive number (got {perplexity:?})"
+        )));
     }
 
     // Returns the LISI vector *and* writes it to `adata.obs[f"lisi_{key}"]`

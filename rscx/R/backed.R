@@ -55,9 +55,18 @@ dim.ScxBackedSparse <- function(x) {
 #' column index selects genes (applied to the returned matrix). Rows are
 #' returned in the requested order.
 #'
-#' Positive-integer and logical row indices are supported. Negative and
-#' character row indices are not (they raise an error); subset by computing the
-#' positive indices yourself, e.g. \code{bsd[setdiff(seq_len(nrow(bsd)), drop), ]}.
+#' Positive-integer and logical row indices are supported. Negative, character,
+#' \code{NA} and non-finite row indices are not (they raise an error); subset by
+#' computing the positive indices yourself, e.g.
+#' \code{bsd[setdiff(seq_len(nrow(bsd)), drop), ]}. Fractional indices are
+#' truncated, matching a \code{dgCMatrix} (\code{M[1.9, ]} is row 1) — the
+#' column index \code{j} is handed to \pkg{Matrix}'s own \code{[}, so both axes
+#' behave the same way in one call.
+#'
+#' The \code{$read_rows(start, end)} / \code{$read_row_indices(idx)} methods
+#' underneath are \strong{0-based} (\code{end} is an exclusive bound) and, unlike
+#' \code{[}, strict: fractional, negative, \code{NaN} and non-finite values raise
+#' rather than being coerced.
 #'
 #' @param x An \code{ScxBackedSparse}.
 #' @param i Row (cell) selector: positive integers or a logical vector of length
@@ -90,12 +99,23 @@ dim.ScxBackedSparse <- function(x) {
       if (anyNA(i)) {
         stop("NA row indices are not supported for ScxBackedSparse", call. = FALSE)
       }
+      if (length(i) && !all(is.finite(i))) {
+        stop("row indices must be finite; Inf / -Inf are not supported for ScxBackedSparse",
+             call. = FALSE)
+      }
       # R is 1-based; reject 0 and negatives (0 would underflow to -1 below and
       # surface as a confusing out-of-bounds error from the Rust core).
       if (length(i) && any(i < 1)) {
         stop("row indices must be >= 1 (1-based); 0 / negative indices are not supported for ScxBackedSparse",
              call. = FALSE)
       }
+      # Truncate fractional subscripts, as a dgCMatrix does (`M[1.9, ]` is row
+      # 1). `bsd[i, j]` hands `j` to Matrix's own `[` below, so without this the
+      # same call would error on a fractional `i` while silently truncating a
+      # fractional `j`. Must happen before the contiguity check: c(1.5, 2.5) has
+      # diff == 1 exactly and would otherwise take the range branch and reach
+      # the (strict) Rust layer as 0.5 / 2.5.
+      i <- trunc(i)
     }
 
     if (length(i) == 0) {

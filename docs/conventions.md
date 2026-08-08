@@ -114,8 +114,26 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
 - `extendr` v0.8.x for Rust ↔ R FFI.
 - SCX CSR (row-major) must be transposed to dgCMatrix (CSC, column-major)
   for R/Matrix interop.
-- R has no unsigned integers — use `i32` for all integer arguments from
-  R, convert internally.
+- R has no unsigned integers. Take small integer arguments as `i32` and
+  convert internally; take **row/cell indices and other values that may
+  exceed 2³¹ as `f64`** (R's numeric), since an `i32` vector would truncate
+  them to `NA`.
+- **Never cast an R `f64` to an index or count with a bare `as u64` /
+  `as usize`** — the cast *saturates* (`-1.0 → 0`, `NaN → 0`) and truncates
+  fractions, so a bad index silently reads row 0 instead of erroring. Route
+  every one through `crate::util::r_whole_u64` / `r_whole_u64_slice` (the
+  module is private to the crate — there is no `rscx::util` public path), which
+  reject non-finite, negative, fractional, and >2⁵³ values. Note extendr
+  rejects R's `NA` for a **scalar** `f64` parameter but *not* inside a
+  `Vec<f64>` (`try_from_robj.rs` still carries a `// TODO: check NAs`), so
+  the vector form is the one that needs the guard most.
+- A count that becomes an allocation size needs an **upper** clamp too, not
+  just a lower one: `cache_shards` reaches `LruCache::new`, which
+  pre-allocates a `HashMap` of that capacity.
+- Validate in R with 1-based wording where a user-facing wrapper exists
+  (`R/ops.R`, `R/query.R`), and keep the Rust guard as defense-in-depth —
+  the `$`-methods on `ScxBackedSparse` / `ScxLazyTransformed` are exported
+  and bypass every R-side check.
 
 ## GPU (scx-gpu)
 
