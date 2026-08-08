@@ -138,6 +138,22 @@ pub enum ScxError {
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// The `uns` section nests deeper than the JSON reader will parse.
+    ///
+    /// Only reachable on files written before `uns` nesting was capped: the
+    /// JSON *serializer* has no depth limit while the deserializer stops at
+    /// [`crate::SERDE_JSON_MAX_NESTING`], so an uncapped writer could emit a
+    /// section that no reader can take back. Split out from
+    /// [`ScxError::Json`] because the bare `recursion limit exceeded` that
+    /// `serde_json` produces names neither the section nor the cause, and
+    /// this is the one JSON error a user can act on.
+    #[error(
+        "uns section nests deeper than the {max_nesting}-level limit of the JSON reader, so it \
+         cannot be parsed. This file was written before uns nesting was capped; rewrite it from \
+         its source with flatter uns metadata"
+    )]
+    UnsTooDeep { max_nesting: usize },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
@@ -235,6 +251,7 @@ impl ScxError {
             | ScxError::SectionOutOfBounds { .. }
             | ScxError::AllocationTooLarge { .. }
             | ScxError::InvalidBlockIndex(_)
+            | ScxError::UnsTooDeep { .. }
             | ScxError::ColumnStatsShardCountMismatch { .. } => ScxErrorClass::CorruptFile,
             ScxError::Io(io_err) => ScxErrorClass::Io(io_err.kind()),
             // Wrapped lower-level errors and genuine runtime failures.

@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use std::collections::HashSet;
 
-use scx_format_io::ScxReader;
+use scx_format_io::{ScxReader, MAX_UNS_DEPTH, SERDE_JSON_MAX_NESTING};
 
 use crate::to_pyerr;
 
@@ -201,6 +201,14 @@ pub(crate) fn normalize_uns_value<'py>(
         )));
     }
 
+    // `visiting` is inserted on entry to a container and removed on exit just
+    // below, so its length *is* the number of containers currently on the
+    // recursion stack — i.e. the current depth. Checking it here rather than
+    // threading a second counter alongside means there is no way for the two
+    // to drift out of sync.
+    if ctx.visiting.len() >= MAX_UNS_DEPTH {
+        return Err(too_deep_err(key_path));
+    }
     let id = obj.as_ptr() as usize;
     if !ctx.visiting.insert(id) {
         return Err(PyValueError::new_err(format!(
@@ -210,6 +218,21 @@ pub(crate) fn normalize_uns_value<'py>(
     let result = normalize_container(obj, key_path, ctx);
     ctx.visiting.remove(&id);
     result
+}
+
+/// The one depth-limit message, shared by every `uns` walker on the write side
+/// so the wording cannot drift between them.
+///
+/// Names the key path because that is the only handle a user has on *where* in
+/// a large `uns` the depth blew out, and suggests a fix because — unlike the
+/// oversized-int or non-finite-float errors — there is no way to spell this
+/// value in the format at all.
+fn too_deep_err(key_path: &str) -> PyErr {
+    PyValueError::new_err(format!(
+        "uns at {key_path}: nesting is deeper than the maximum of {MAX_UNS_DEPTH} levels. \
+         Deeply nested metadata cannot be stored in the uns section; flatten it, or move \
+         the payload to obsm/varm/layers"
+    ))
 }
 
 /// Container / fallback dispatch — split out so `normalize_uns_value` can
@@ -331,8 +354,14 @@ pub(crate) fn encode_np_scalar_tagged<'py>(
 pub(crate) fn encode_ndarray_tagged<'py>(
     obj: &Bound<'py, PyAny>,
     key_path: &str,
-    _ctx: &mut UnsWriteCtx<'_, 'py>,
+    ctx: &mut UnsWriteCtx<'_, 'py>,
 ) -> PyResult<serde_json::Value> {
+    // The three walkers below are separate recursions that never re-enter
+    // `normalize_uns_value`, so they cannot consult `ctx.visiting` themselves.
+    // Seeding them from it here keeps the depth budget *global*: an ndarray
+    // reached 40 containers deep gets 40 fewer levels of its own, rather than
+    // a fresh allowance that would let the two families sum past the cap.
+    let depth = ctx.visiting.len();
     let dtype = obj.getattr("dtype")?;
     let kind: String = dtype.getattr("kind")?.extract()?;
     let shape: Vec<usize> = obj.getattr("shape")?.extract()?;
@@ -366,7 +395,7 @@ pub(crate) fn encode_ndarray_tagged<'py>(
         }
         "O" | "U" | "S" => {
             let lst = obj.call_method0("tolist")?;
-            let data = pylist_to_string_json_array(&lst, key_path)?;
+            let data = pylist_to_string_json_array(&lst, key_path, depth)?;
             // For O the payload is a JSON list of pickled-Python-strings, so
             // the byte-order prefix in `dtype.str` ("|O") would be misleading;
             // we keep the explicit "object" sentinel. For U/S the `dtype.str`
@@ -392,7 +421,7 @@ pub(crate) fn encode_ndarray_tagged<'py>(
         "V" => {
             // Structured ndarray (recarray-like). Save descr + data.
             let descr_py = dtype.getattr("descr")?;
-            let descr_json = pytuple_descr_to_json(&descr_py, key_path)?;
+            let descr_json = pytuple_descr_to_json(&descr_py, key_path, depth)?;
             let mut env = serde_json::Map::new();
             env.insert(
                 SCX_TYPE_KEY.to_string(),
@@ -412,7 +441,7 @@ pub(crate) fn encode_ndarray_tagged<'py>(
                 for name in &names {
                     let sub = obj.get_item(name.as_str())?;
                     let lst = sub.call_method0("tolist")?;
-                    let val = pylist_to_json_leaf(&lst, &format!("{key_path}.{name}"))?;
+                    let val = pylist_to_json_leaf(&lst, &format!("{key_path}.{name}"), depth)?;
                     fields_map.insert(name.clone(), val);
                 }
                 env.insert(
@@ -443,15 +472,26 @@ pub(crate) fn encode_ndarray_tagged<'py>(
 /// Walk a Python list-of-strings (possibly nested for multi-dim arrays) into
 /// a JSON array, asserting that every leaf is a `str`. Used for object/string
 /// dtype ndarrays in tagged mode.
+///
+/// `depth` is the container depth already consumed by the caller; see
+/// [`encode_ndarray_tagged`]. For a well-formed array this bottoms out at
+/// `ndim`, but an *object*-dtype array's elements are arbitrary Python
+/// objects, so `.tolist()` can hand back lists nested to any depth —
+/// `a = np.empty(1, object); a[0] = deep` reaches here without ever passing
+/// through [`normalize_uns_value`]'s guard.
 pub(crate) fn pylist_to_string_json_array<'py>(
     obj: &Bound<'py, PyAny>,
     key_path: &str,
+    depth: usize,
 ) -> PyResult<serde_json::Value> {
     if let Ok(lst) = obj.cast::<PyList>() {
+        if depth >= MAX_UNS_DEPTH {
+            return Err(too_deep_err(key_path));
+        }
         let mut arr = Vec::with_capacity(lst.len());
         for (i, item) in lst.iter().enumerate() {
             let new_path = format!("{key_path}[{i}]");
-            arr.push(pylist_to_string_json_array(&item, &new_path)?);
+            arr.push(pylist_to_string_json_array(&item, &new_path, depth + 1)?);
         }
         return Ok(serde_json::Value::Array(arr));
     }
@@ -504,11 +544,19 @@ pub(crate) fn structured_has_object_field(dtype: &Bound<'_, PyAny>) -> PyResult<
 pub(crate) fn pylist_to_json_leaf<'py>(
     obj: &Bound<'py, PyAny>,
     key_path: &str,
+    depth: usize,
 ) -> PyResult<serde_json::Value> {
     if let Ok(lst) = obj.cast::<PyList>() {
+        if depth >= MAX_UNS_DEPTH {
+            return Err(too_deep_err(key_path));
+        }
         let mut arr = Vec::with_capacity(lst.len());
         for (i, item) in lst.iter().enumerate() {
-            arr.push(pylist_to_json_leaf(&item, &format!("{key_path}[{i}]"))?);
+            arr.push(pylist_to_json_leaf(
+                &item,
+                &format!("{key_path}[{i}]"),
+                depth + 1,
+            )?);
         }
         return Ok(serde_json::Value::Array(arr));
     }
@@ -549,7 +597,11 @@ pub(crate) fn pylist_to_json_leaf<'py>(
 pub(crate) fn pytuple_descr_to_json<'py>(
     descr: &Bound<'py, PyAny>,
     key_path: &str,
+    depth: usize,
 ) -> PyResult<serde_json::Value> {
+    if depth >= MAX_UNS_DEPTH {
+        return Err(too_deep_err(key_path));
+    }
     let lst = descr.cast::<PyList>().map_err(|_| {
         PyValueError::new_err(format!(
             "uns at {key_path}: structured dtype.descr is not a list"
@@ -576,7 +628,7 @@ pub(crate) fn pytuple_descr_to_json<'py>(
                 row.push(serde_json::Value::Array(inner));
             } else if let Ok(l) = el.cast::<PyList>() {
                 // Nested descr for sub-record (recursive).
-                let nested = pytuple_descr_to_json(l.as_any(), key_path)?;
+                let nested = pytuple_descr_to_json(l.as_any(), key_path, depth + 1)?;
                 row.push(nested);
             } else {
                 let type_name: String = el.get_type().getattr("__name__")?.extract()?;
@@ -724,6 +776,8 @@ pub(crate) struct UnsReadCtx<'py> {
     py: Python<'py>,
     np: Bound<'py, PyModule>,
     pd_lazy: Option<Bound<'py, PyModule>>,
+    /// Container levels currently on the rebuild stack; see [`json_to_py`].
+    depth: usize,
 }
 
 impl<'py> UnsReadCtx<'py> {
@@ -732,6 +786,7 @@ impl<'py> UnsReadCtx<'py> {
             py,
             np: py.import("numpy")?,
             pd_lazy: None,
+            depth: 0,
         })
     }
 
@@ -751,7 +806,50 @@ impl<'py> UnsReadCtx<'py> {
 /// the object is built as a `dict` and recurses over its values. Replaces
 /// a previous `serde_json::to_string` → `json.loads` → tree-walk pipeline
 /// that paid for two intermediate traversals.
+///
+/// Depth is bounded at [`SERDE_JSON_MAX_NESTING`] rather than at
+/// [`MAX_UNS_DEPTH`]. The two limits answer different questions: the write cap
+/// is what *this* library will accept into a file, while the read guard only
+/// has to stop unbounded recursion, and every tree that reaches here is either
+/// a tree some writer produced or one `serde_json` already parsed. Binding it
+/// to the parser's own ceiling means this guard can never be the thing that
+/// rejects a readable file — including one written by a future version with a
+/// larger write cap, or a pandas envelope, whose `categories` / `codes` nest
+/// one level deeper on read than the single `visiting` entry they cost on
+/// write.
+///
+/// The bound is *not* redundant with the parser's. `uns_json_to_py` is also
+/// fed by `scx-convert`'s h5ad reader, which builds its `serde_json::Value`
+/// straight from an HDF5 group tree with no parser in the path.
 pub(crate) fn json_to_py<'py>(
+    val: &serde_json::Value,
+    ctx: &mut UnsReadCtx<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // Scalars cost no depth, so the cap counts container levels — the same
+    // thing `ctx.visiting` counts on the write side. Bracketing the single
+    // recursive descent here mirrors the write side's insert/call/remove and
+    // means no `?` path can leak an unbalanced counter.
+    if !matches!(
+        val,
+        serde_json::Value::Array(_) | serde_json::Value::Object(_)
+    ) {
+        return json_to_py_inner(val, ctx);
+    }
+    if ctx.depth >= SERDE_JSON_MAX_NESTING {
+        return Err(PyValueError::new_err(format!(
+            "uns: nesting is deeper than the maximum of {SERDE_JSON_MAX_NESTING} levels"
+        )));
+    }
+    ctx.depth += 1;
+    let out = json_to_py_inner(val, ctx);
+    ctx.depth -= 1;
+    out
+}
+
+/// Value dispatch for [`json_to_py`], split out so the depth guard has exactly
+/// one place to bracket. Every recursive path in the reader — including the
+/// envelope decoders — re-enters through `json_to_py`, never through here.
+fn json_to_py_inner<'py>(
     val: &serde_json::Value,
     ctx: &mut UnsReadCtx<'py>,
 ) -> PyResult<Bound<'py, PyAny>> {
@@ -1026,8 +1124,9 @@ pub(crate) fn decode_recarray_envelope<'py>(
         "base64le" => {
             let descr = require_value_json(map, "descr")?;
             let pybytes = decode_base64_bytes_json(ctx.py, map)?;
+            let depth = ctx.depth;
             let np = &ctx.np;
-            let dtype = build_structured_dtype_from_json(np, descr)?;
+            let dtype = build_structured_dtype_from_json(np, descr, depth)?;
             let arr = np.call_method1("frombuffer", (pybytes, dtype))?;
             let shape_tup = pyo3::types::PyTuple::new(ctx.py, shape.iter().map(|s| *s as i64))?;
             let reshaped = arr.call_method1("reshape", (shape_tup,))?;
@@ -1053,8 +1152,9 @@ pub(crate) fn decode_recarray_envelope<'py>(
                 field_pys.push((name.clone(), py_val));
             }
             let descr = require_value_json(map, "descr")?;
+            let depth = ctx.depth;
             let np = &ctx.np;
-            let dtype = build_structured_dtype_from_json(np, descr)?;
+            let dtype = build_structured_dtype_from_json(np, descr, depth)?;
             let shape_tup = pyo3::types::PyTuple::new(ctx.py, shape.iter().map(|s| *s as i64))?;
             let out = np.call_method1("empty", (&shape_tup, &dtype))?;
             for (name, py_val) in &field_pys {
@@ -1086,10 +1186,21 @@ pub(crate) fn decode_recarray_envelope<'py>(
 /// `[name, fmt]` or `[name, fmt, [shape...]]` entries; fmt may itself be a
 /// nested descr list, in which case the sub-list's first element is also a
 /// list — that's how we distinguish sub-descr from a shape tuple).
+///
+/// `depth` bounds the sub-descr recursion. It is its own walk — it never
+/// re-enters `json_to_py` — so it needs its own counter, seeded from
+/// `ctx.depth` by the caller to keep the budget shared.
 pub(crate) fn build_structured_dtype_from_json<'py>(
     np: &Bound<'py, PyModule>,
     descr: &serde_json::Value,
+    depth: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
+    if depth >= SERDE_JSON_MAX_NESTING {
+        return Err(PyValueError::new_err(format!(
+            "uns recarray: descr nesting is deeper than the maximum of \
+             {SERDE_JSON_MAX_NESTING} levels"
+        )));
+    }
     let entries = match descr {
         serde_json::Value::Array(a) => a,
         _ => return Err(PyValueError::new_err("uns recarray: descr is not a list")),
@@ -1117,7 +1228,7 @@ pub(crate) fn build_structured_dtype_from_json<'py>(
                     // empty shape tuple — matches the pre-refactor behavior.
                     let first_is_list = matches!(inner.first(), Some(serde_json::Value::Array(_)));
                     if first_is_list {
-                        tup_items.push(build_structured_dtype_from_json(np, el)?);
+                        tup_items.push(build_structured_dtype_from_json(np, el, depth + 1)?);
                     } else {
                         let mut shape_items: Vec<i64> = Vec::with_capacity(inner.len());
                         for d in inner {

@@ -68,6 +68,19 @@ pub enum ConvertError {
     #[error("format mismatch: expected {expected}, got {got}")]
     FormatMismatch { expected: String, got: String },
 
+    /// An `uns` tree nests deeper than the format can carry. Raised by the
+    /// h5ad reader on a deep `/uns` group chain and by the h5ad writer on a
+    /// deep JSON tree. Without it, both walk the tree with unbounded
+    /// recursion and abort the process on a stack overflow — which is not a
+    /// catchable error in any binding.
+    ///
+    /// Reached through the ordinary `strict_uns` channel on the read side, so
+    /// the default is a [`ConvertWarning::SkippedUnsKey`] naming the key
+    /// rather than a failed conversion: one pathological key in someone
+    /// else's h5ad should not make the file unconvertible.
+    #[error("uns/{path}: nesting is deeper than the maximum of {max_depth} levels")]
+    UnsTooDeep { path: String, max_depth: usize },
+
     #[error("streaming unsupported: {0}")]
     StreamingUnsupported(String),
 

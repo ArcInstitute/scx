@@ -1029,6 +1029,78 @@ fn phase1_streaming_strict_uns_errors_on_unsupported_key() {
 }
 
 #[test]
+fn deep_uns_group_chain_is_bounded_not_a_stack_overflow() {
+    // `read_uns_entry` recurses over `/uns` subgroups, and an h5ad's group
+    // tree can nest arbitrarily deep. Uncapped, this overflowed the stack and
+    // aborted the process — verified before the fix: a 30000-deep chain
+    // SIGSEGV'd `pyscx.read_h5ad_metadata`. Nothing here is a pyscx *write*:
+    // the crash was on reading a file someone else produced.
+    //
+    // Observed red on unmodified source: 500 is already past what a Rust test
+    // thread's 2 MB stack survives, so this test did not merely fail — it
+    // aborted the whole `scx-convert` test binary with
+    // "has overflowed its stack ... (signal: 6, SIGABRT)". That is the defect
+    // stated as plainly as it can be: a depth no assertion ever got to judge.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("deep_uns.h5ad");
+    create_test_h5ad(&h5ad, 4, 3, "csr", false);
+    {
+        let file = hdf5::File::open_rw(&h5ad).unwrap();
+        let mut group = file
+            .create_group("uns")
+            .unwrap()
+            .create_group("bomb")
+            .unwrap();
+        for i in 0..500 {
+            group = group.create_group(&format!("g{i}")).unwrap();
+        }
+        group
+            .new_dataset::<i64>()
+            .shape(())
+            .create("leaf")
+            .unwrap()
+            .write_scalar(&1i64)
+            .unwrap();
+    }
+
+    // Lenient (the default): the depth error travels the same `strict_uns`
+    // route as any other unrepresentable key, so the file still converts and
+    // the truncated subtree is reported rather than dropped in silence.
+    let scx = dir.path().join("deep_uns_lenient.scx");
+    let mut sink = WarningSink::log();
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &streaming_opts(8),
+        &StreamingOverrides::default(),
+        &mut sink,
+    )
+    .expect("lenient mode must convert a file with an over-deep uns key");
+    assert!(sink.counts().get("skipped_uns_key").copied().unwrap_or(0) >= 1);
+
+    // And what survived must be readable: the ingest cap is the same constant
+    // the writer enforces, so a truncated tree can never be too deep to parse.
+    let reader = ScxReader::open(&scx).unwrap();
+    assert!(reader.read_uns().is_ok(), "truncated uns must parse back");
+
+    let mut opts_strict = streaming_opts(8);
+    opts_strict.strict_uns = true;
+    let err = h5ad_to_scx_streaming(
+        &h5ad,
+        &dir.path().join("deep_uns_strict.scx"),
+        &opts_strict,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect_err("strict mode must refuse an over-deep uns key");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("nesting is deeper than"),
+        "expected an uns depth error, got: {msg}"
+    );
+}
+
+#[test]
 fn phase1_streaming_dense_determinism() {
     // Re-running the streaming dense pipeline on the same fixture
     // must produce byte-identical output.

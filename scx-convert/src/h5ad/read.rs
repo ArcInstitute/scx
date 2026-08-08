@@ -8,6 +8,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use hdf5::types::TypeDescriptor;
+use scx_format_io::MAX_UNS_DEPTH;
 use std::sync::Arc;
 
 use super::csc_transpose::csc_to_csr;
@@ -1824,7 +1825,9 @@ pub fn read_uns(
     let mut map = serde_json::Map::new();
 
     for name in &member_names {
-        match read_uns_entry(&uns_group, name, strict_uns, sink) {
+        // Depth 1: the `/uns` group itself is the first container level, so
+        // the budget here matches the one `pyscx` spends on the `uns` dict.
+        match read_uns_entry(&uns_group, name, strict_uns, sink, 1) {
             Ok(value) => {
                 map.insert(name.clone(), value);
             }
@@ -2008,6 +2011,7 @@ fn read_uns_entry(
     name: &str,
     strict_uns: bool,
     sink: &mut WarningSink,
+    depth: usize,
 ) -> Result<serde_json::Value, ConvertError> {
     // Try reading as dataset first
     if let Ok(ds) = group.dataset(name) {
@@ -2223,10 +2227,23 @@ fn read_uns_entry(
             });
         }
 
+        // `depth` counts the container levels already committed to, so this
+        // subgroup is level `depth + 1`. Refuse before descending: an h5ad's
+        // `/uns` group tree can nest arbitrarily deep, this walk is recursive,
+        // and a stack overflow aborts the process rather than raising. The
+        // error travels the same `strict_uns` route as any other unsupported
+        // key, so the default outcome is one skipped key with a warning, not
+        // a failed conversion.
+        if depth >= MAX_UNS_DEPTH {
+            return Err(ConvertError::UnsTooDeep {
+                path: name.to_string(),
+                max_depth: MAX_UNS_DEPTH,
+            });
+        }
         let sub_members = subgroup.member_names()?;
         let mut sub_map = serde_json::Map::new();
         for sub_name in &sub_members {
-            match read_uns_entry(&subgroup, sub_name, strict_uns, sink) {
+            match read_uns_entry(&subgroup, sub_name, strict_uns, sink, depth + 1) {
                 Ok(v) => {
                     sub_map.insert(sub_name.clone(), v);
                 }

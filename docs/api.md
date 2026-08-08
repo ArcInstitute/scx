@@ -562,6 +562,31 @@ is lost *silently*.
 | `uns` pandas **DataFrame** | lossy | `FlattenedUnsDataframe` | Preserved as a nested dict (per-column values + `_index`); **not** reconstructed as a `pd.DataFrame` (column order / categorical dtypes not restored). |
 | `uns` scipy-sparse matrix | lossy | `FlattenedUnsSparse` | Preserved as a nested dict of `data` / `indices` / `indptr` arrays; **not** reconstructed as a sparse matrix (the sparse type tag is not restored). Data survives. |
 | `uns` pickled / unrepresentable entry | dropped | `SkippedUnsKey` | Skipped under default `strict_uns=false`; `strict_uns=true` errors on the first occurrence. |
+| `uns` nested more than 60 levels deep | rejected / truncated | `SkippedUnsKey` (h5ad ingest) | See [`uns` nesting depth](#uns-nesting-depth). Writing raises `ValueError` naming the key path; an over-deep h5ad `/uns` group chain is truncated at the limit with the warning (or errors under `strict_uns=true`). |
+
+### `uns` nesting depth
+
+`uns` container nesting — dicts, lists, tuples, and nested h5ad `/uns` groups —
+is capped at **60 levels**. Real metadata is nowhere near this: scanpy's deepest
+standard structure, `rank_genes_groups`, is 3 deep.
+
+The cap exists because the walk is recursive on every path (Python→JSON,
+h5ad→JSON, JSON→Python, JSON→h5ad), and exceeding the stack **aborts the
+process** rather than raising — a `SIGSEGV` no `try`/`except` can catch. Cycle
+detection does not help: it works by object identity, and a merely-deep tree
+contains no repeated object.
+
+The specific value is derived, not chosen. `serde_json`'s serializer has no
+depth limit but its parser stops at 127 levels, so before the cap the writer
+could emit an `uns` section that no reader — including SCX's own — could ever
+parse back. Under `uns_format="tagged"` a tuple is stored as
+`{"__scx_type__": "tuple", "data": [...]}`, two JSON levels per Python
+container, so 60 containers is the worst case that still fits.
+
+Writers (`from_anndata`, `set_uns`, `modify_metadata`, h5ad ingest) enforce 60.
+Readers stop at 127 instead, so a file written before the cap existed still
+opens if its `uns` is parseable; one written deeper than 127 raises a message
+saying so rather than `serde_json`'s bare `recursion limit exceeded`.
 
 ## `adata.raw`
 

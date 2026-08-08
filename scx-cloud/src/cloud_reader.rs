@@ -931,10 +931,10 @@ impl CloudReader {
             return Ok(None);
         }
         let bytes = self.read_section(&section_name).await?;
-        // `CloudError` has no direct `From<serde_json::Error>`; route the
-        // parse error through `ScxError` (which does), lifting it to
+        // `CloudError` has no direct `From<serde_json::Error>`; the shared
+        // uns parser already returns `ScxError`, which lifts to
         // `CloudError::Format` via `?`.
-        let val = serde_json::from_slice(&bytes).map_err(scx_format_io::ScxError::from)?;
+        let val = scx_format_io::parse_uns_json(&bytes)?;
         Ok(Some(val))
     }
 
