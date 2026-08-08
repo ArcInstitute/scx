@@ -15,6 +15,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use scx_engine::ConversionPredicateIndexOptions;
 use scx_ops::MetadataPatch;
 
+use crate::index_warnings::emit_index_summary;
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_modify_metadata(
     file: &Path,
@@ -54,19 +56,17 @@ pub fn run_modify_metadata(
     let obsm_batches = read_named_npy(obsm, "obsm")?;
     let varm_batches = read_named_npy(varm, "varm")?;
 
-    let any_index = !index_obs.is_empty()
-        || !index_var.is_empty()
-        || index_preset.is_some()
-        || index_auto_threshold.is_some();
-    let index = if any_index {
-        ConversionPredicateIndexOptions {
-            index_obs,
-            index_var,
-            index_preset,
-            index_auto_threshold: index_auto_threshold.unwrap_or(1000),
-        }
-    } else {
-        ConversionPredicateIndexOptions::default()
+    // `index_auto_threshold` is NOT defaulted to 1000 when some other index flag
+    // is set, unlike the conversion commands. This op reads a non-zero threshold
+    // as "auto-detect on both axes", so defaulting it would make
+    // `--index-var gene_id --obs obs.parquet` silently take the obs axis off
+    // carry-forward and onto auto-detect. `0` means "no auto unless asked", which
+    // is what an omitted flag means.
+    let index = ConversionPredicateIndexOptions {
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold: index_auto_threshold.unwrap_or(0),
     };
 
     let patch = MetadataPatch {
@@ -94,15 +94,30 @@ pub fn run_modify_metadata(
 /// alternative is a user discovering months later that their queries went back
 /// to a full obs scan.
 fn report_index_outcome(summary: &scx_ops::ModifyMetadataSummary) {
+    // Per-column build outcomes go through the shared emitter every other
+    // index-writing command uses, so a `PresetSkipped` / `ForcedColumnError`
+    // reads the same here as under `merge` / `compact` / `append`.
+    emit_index_summary("modify-metadata", &summary.index);
+
     if let Some(result) = summary.index.result.as_ref() {
-        for (axis, columns) in [
-            ("obs", &result.obs_indexed_columns),
-            ("var", &result.var_indexed_columns),
+        // Per axis: with "explicit" decided per axis, one side can be carried
+        // while the other is rebuilt from the caller's own column list.
+        for (axis, columns, carried) in [
+            (
+                "obs",
+                &result.obs_indexed_columns,
+                summary.obs_carried_forward,
+            ),
+            (
+                "var",
+                &result.var_indexed_columns,
+                summary.var_carried_forward,
+            ),
         ] {
             if columns.is_empty() {
                 continue;
             }
-            let how = if summary.carried_forward {
+            let how = if carried {
                 "carried forward"
             } else {
                 "rebuilt"

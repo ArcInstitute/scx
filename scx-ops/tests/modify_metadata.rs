@@ -352,7 +352,7 @@ fn obs_replace_index_rebuild_then_carry_forward() {
     )
     .unwrap();
 
-    assert!(summary.carried_forward);
+    assert!(summary.obs_carried_forward);
     assert!(!summary.obs_predicate_index_dropped);
     assert!(
         has_section(&path, SectionType::ObsPredicateIndex),

@@ -83,7 +83,10 @@ pub struct MetadataPatch {
 /// to do exactly that. On an under-covering file that advice loops forever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoStatsReason {
-    /// No index rebuild was requested, so there was nothing to derive from.
+    /// No index was built, so there was nothing to derive from. Since a
+    /// replaced axis carries its existing index forward, this now means the
+    /// file had no index on that axis to carry — not merely that the caller
+    /// omitted `--index-obs`.
     NoRebuildRequested,
     /// A rebuild ran and an index was written — but over the obs-shard ranges,
     /// because the CSR shards do not tile `[0, n_obs)`. `derive_shard_column_stats`
@@ -97,7 +100,9 @@ enum NoStatsReason {
 impl NoStatsReason {
     fn what_happened(self) -> &'static str {
         match self {
-            Self::NoRebuildRequested => "obs was replaced without an index rebuild",
+            Self::NoRebuildRequested => {
+                "obs was replaced and this file has no obs predicate index to carry forward"
+            }
             Self::CsrRangesUnderCoverObsAxis => {
                 "the predicate index was rebuilt, but this file's CSR shards do not cover \
                  every obs row, so the index could not be mapped onto them"
@@ -153,9 +158,18 @@ pub struct ModifyMetadataSummary {
     pub obs_columns_not_carried: Vec<String>,
     /// The var-axis counterpart of [`Self::obs_columns_not_carried`].
     pub var_columns_not_carried: Vec<String>,
-    /// True when this op rebuilt an index the caller did not ask for, purely to
-    /// keep the one the file already had.
-    pub carried_forward: bool,
+    /// True when this op rebuilt the obs index the caller did not ask for,
+    /// purely to keep the one the file already had, **and that rebuild
+    /// produced an index**.
+    ///
+    /// Success-gated, and per axis, for two reasons a single attempted-carry
+    /// flag got wrong: a carry whose every column turned out unindexable would
+    /// report `carried_forward` beside `obs_predicate_index_dropped` on the
+    /// same provenance entry, and one axis carrying while the other is
+    /// explicitly rebuilt is reachable now that "explicit" is decided per axis.
+    pub obs_carried_forward: bool,
+    /// The var-axis counterpart of [`Self::obs_carried_forward`].
+    pub var_carried_forward: bool,
     /// True when the file had an obs predicate index and the output has none.
     pub obs_predicate_index_dropped: bool,
     /// True when the file had a var predicate index and the output has none.
@@ -271,11 +285,20 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
     // the file's pushdown means *rebuilding* over the same columns, not
     // preserving bytes. An explicit `index_*` request still wins outright: it is
     // the caller naming what they want indexed, and narrowing it is allowed.
-    let explicit = user_wants_index(&patch.index);
-    let carry_obs = !explicit && !existing_obs_index.is_empty();
-    let carry_var = !explicit && !existing_var_index.is_empty();
-    let rebuild_obs_index = patch.obs.is_some() && (explicit || carry_obs);
-    let rebuild_var_index = patch.var.is_some() && (explicit || carry_var);
+    //
+    // "Explicit" is decided PER AXIS. `user_wants_index` is a whole-patch
+    // question — true if *any* index knob is set — and using it here would let
+    // `index_var=[…]` silently switch the obs axis off carry-forward and onto
+    // auto-detect, which under the new "omit index_* to carry" contract is a
+    // footgun rather than a quirk. `index_preset` and `index_auto_threshold`
+    // genuinely span both axes, so they still count for both.
+    let cross_axis = patch.index.index_preset.is_some() || patch.index.index_auto_threshold > 0;
+    let explicit_obs = cross_axis || !patch.index.index_obs.is_empty();
+    let explicit_var = cross_axis || !patch.index.index_var.is_empty();
+    let carry_obs = !explicit_obs && !existing_obs_index.is_empty();
+    let carry_var = !explicit_var && !existing_var_index.is_empty();
+    let rebuild_obs_index = patch.obs.is_some() && (explicit_obs || carry_obs);
+    let rebuild_var_index = patch.var.is_some() && (explicit_var || carry_var);
 
     // Carried columns enter as *preset*, never *forced*: a preset column the new
     // frame no longer has is a `PresetSkipped` warning, where a forced one is a
@@ -291,7 +314,7 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
         high_cardinality_threshold: 100_000,
     };
 
-    if explicit && (rebuild_obs_index || rebuild_var_index) {
+    if user_wants_index(&patch.index) && (rebuild_obs_index || rebuild_var_index) {
         let mut vopts = patch.index.clone();
         if patch.obs.is_none() {
             vopts.index_obs.clear();
@@ -500,7 +523,8 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
             &existing_var_index,
             &index_result.var_indexed_columns,
         ),
-        carried_forward: carry_obs || carry_var,
+        obs_carried_forward: carry_obs && !index_result.obs_indexed_columns.is_empty(),
+        var_carried_forward: carry_var && !index_result.var_indexed_columns.is_empty(),
         obs_predicate_index_dropped: !existing_obs_index.is_empty()
             && index_result.obs_indexed_columns.is_empty(),
         var_predicate_index_dropped: !existing_var_index.is_empty()
@@ -741,7 +765,8 @@ fn build_params_json(patch: &MetadataPatch, summary: &ModifyMetadataSummary) -> 
         params["predicate_index"] = serde_json::json!({
             "obs_columns": obs_cols,
             "var_columns": var_cols,
-            "carried_forward": summary.carried_forward,
+            "obs_carried_forward": summary.obs_carried_forward,
+            "var_carried_forward": summary.var_carried_forward,
             "obs_columns_not_carried": summary.obs_columns_not_carried,
             "var_columns_not_carried": summary.var_columns_not_carried,
         });

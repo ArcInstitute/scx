@@ -318,7 +318,7 @@ fn an_obs_replacement_carries_the_existing_index_forward() {
     )
     .unwrap();
 
-    assert!(summary.carried_forward);
+    assert!(summary.obs_carried_forward);
     assert!(!summary.obs_predicate_index_dropped);
     assert!(summary.obs_columns_not_carried.is_empty());
     assert_eq!(
@@ -380,6 +380,12 @@ fn a_carry_that_indexes_nothing_still_clears_the_stats() {
         summary.obs_columns_not_carried,
         vec!["n_counts".to_string()]
     );
+    assert!(
+        !summary.obs_carried_forward,
+        "a carry that indexed nothing carried nothing forward — reporting this true \
+         beside obs_predicate_index_dropped on one provenance entry is how a consumer \
+         grepping for the carry misreads a dropped index as a kept one"
+    );
     assert!(!has_obs_index(&path));
     assert!(
         csr_column_stats(&path).is_empty(),
@@ -415,7 +421,7 @@ fn an_explicit_request_reports_the_index_columns_it_drops() {
     .unwrap();
 
     assert!(
-        !summary.carried_forward,
+        !summary.obs_carried_forward,
         "the caller named their own columns"
     );
     assert_eq!(
@@ -428,6 +434,52 @@ fn an_explicit_request_reports_the_index_columns_it_drops() {
         query(&path, "n_counts > 1500").matched_rows,
         expected_gt(n_counts_after, 1500)
     );
+}
+
+/// Naming an index column on ONE axis must not change the other axis's policy.
+///
+/// `user_wants_index` is a whole-patch question — true if any index knob is set
+/// — so reading it per axis let `index_var=[…]` take the obs axis off
+/// carry-forward and onto auto-detect. Under the "omit `index_*` to carry"
+/// contract that is a footgun: the caller said nothing about obs.
+#[test]
+fn an_index_request_on_one_axis_leaves_the_other_axis_carrying() {
+    let dir = TempDir::new().unwrap();
+    let path = write_indexed_fixture(&dir, "atlas.scx");
+
+    let summary = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_frame(n_counts_after)),
+            var: Some(var_frame()),
+            index: ConversionPredicateIndexOptions {
+                index_obs: vec![],
+                index_var: vec!["gene_id".to_string()],
+                index_preset: None,
+                index_auto_threshold: 0,
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        summary.obs_carried_forward,
+        "naming only index_var must leave obs on carry-forward"
+    );
+    assert!(summary.obs_columns_not_carried.is_empty());
+    assert_eq!(
+        summary
+            .index
+            .result
+            .as_ref()
+            .map(|r| r.obs_indexed_columns.clone()),
+        Some(vec!["n_counts".to_string()]),
+        "obs must be indexed on the file's own column, not auto-detected"
+    );
+    assert!(has_obs_index(&path));
+    // …and the var axis took the caller's explicit list, so it is not a carry.
+    assert!(!summary.var_carried_forward);
 }
 
 fn has_obs_index(path: &Path) -> bool {

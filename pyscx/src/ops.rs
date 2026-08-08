@@ -1528,6 +1528,11 @@ pub fn set_uns(py: Python<'_>, path: &str, uns: &Bound<'_, PyAny>) -> PyResult<(
 /// the new request does not is reported as a `UserWarning` rather than dropped
 /// in silence.
 ///
+/// The override is **per axis**: `index_obs` changes only the obs axis's column
+/// set, and a var replacement in the same call still carries its own index
+/// forward. `index_preset` and `index_auto_threshold` genuinely span both axes
+/// and so override both.
+///
 /// Args:
 ///     path: target `.scx` file.
 ///     uns: dict replacing the whole `uns` block.
@@ -1580,8 +1585,19 @@ pub fn modify_metadata(
         None => None,
     };
     let modality_id = resolve_modality_id(modality)?;
-    let index = build_index_options(index_obs, index_var, index_preset, index_auto_threshold)
-        .unwrap_or_default();
+    // Built here rather than via `build_index_options`, which defaults
+    // `index_auto_threshold` to 1000 whenever *any* index kwarg is set. That
+    // default is right for the conversion ops, and wrong here: this op reads
+    // `index_auto_threshold > 0` as "the caller wants auto-detection on both
+    // axes", so `modify_metadata(obs=…, index_var=[…])` would silently take the
+    // obs axis off carry-forward and onto auto-detect. `0` means "no auto
+    // unless you asked for it", which is what an omitted kwarg means.
+    let index = ConversionPredicateIndexOptions {
+        index_obs: index_obs.unwrap_or_default(),
+        index_var: index_var.unwrap_or_default(),
+        index_preset,
+        index_auto_threshold: index_auto_threshold.unwrap_or(0),
+    };
 
     let patch = scx_ops::MetadataPatch {
         uns: uns_json,

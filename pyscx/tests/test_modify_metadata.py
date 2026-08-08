@@ -4,6 +4,8 @@ These wrap scx_ops::set_uns / modify_metadata — replace SCX metadata sections
 (uns / obs / var / obsm / varm) without re-encoding X.
 """
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -197,8 +199,6 @@ def test_modify_metadata_carry_forward_records_itself_in_provenance(tmp_dir):
     `obs_import` already stamps `obs_predicate_index_dropped`; this is the same
     field on the same question, so one `scx info` grep answers it for either op.
     """
-    import json
-
     path, _ = _indexed_multi_shard(tmp_dir, index_obs=["grp", "n_counts"])
     pyscx.modify_metadata(path, obs=pyscx.open(path).read_obs())
 
@@ -206,7 +206,7 @@ def test_modify_metadata_carry_forward_records_itself_in_provenance(tmp_dir):
     assert entry["action"] == "modify_metadata"
     params = json.loads(entry["params_json"])
     assert params["obs_predicate_index_dropped"] is False
-    assert params["predicate_index"]["carried_forward"] is True
+    assert params["predicate_index"]["obs_carried_forward"] is True
     assert params["predicate_index"]["obs_columns"] == ["grp", "n_counts"]
 
 
@@ -245,6 +245,47 @@ def test_modify_metadata_explicit_index_obs_wins_and_reports_the_narrowing(tmp_d
     assert _matching(path, "n_counts > 300") == 199
     # `grp` is no longer indexed, but a full obs scan still answers it.
     assert _matching(path, "grp == 'A'") == 200
+
+
+def test_modify_metadata_index_var_does_not_switch_off_the_obs_carry(tmp_dir):
+    """An index request on ONE axis must not silently change the other's policy.
+
+    `user_wants_index` is a whole-patch question — true if any index knob is set
+    — so reading it per axis let `index_var=[...]` take the obs axis off
+    carry-forward and onto auto-detect. Under the "omit index_* to carry"
+    contract that is a footgun, not a quirk: the caller said nothing about obs.
+    """
+    path, _ = _indexed_multi_shard(
+        tmp_dir, index_obs=["grp", "n_counts"], index_var=["gene_id"]
+    )
+    exp = pyscx.open(path)
+    obs, var = exp.read_obs(), exp.read_var()
+
+    # Names var only. obs must still be carried over its OWN two columns.
+    pyscx.modify_metadata(path, obs=obs, var=var, index_var=["gene_id"])
+
+    assert "obs_predicate_index" in _sections(path)
+    entry = pyscx.open(path).provenance()[-1]
+    params = json.loads(entry["params_json"])
+    assert params["predicate_index"]["obs_columns"] == ["grp", "n_counts"]
+    assert params["predicate_index"]["obs_carried_forward"] is True
+    # …while var took the caller's explicit list, so it is a rebuild, not a carry.
+    assert params["predicate_index"]["var_carried_forward"] is False
+    assert _matching(path, "n_counts > 300") == 199
+    assert _matching(path, "grp == 'A'") == 200
+
+
+def test_modify_metadata_accepts_a_pathlike(tmp_dir):
+    """Every other path-taking entry point coerces `os.PathLike`; these two did
+    not, so a `pathlib.Path` raised `TypeError: 'PosixPath' object is not an
+    instance of 'str'`."""
+    import pathlib
+
+    path, _ = _indexed_multi_shard(tmp_dir)
+    p = pathlib.Path(path)
+    pyscx.modify_metadata(p, obs=pyscx.open(path).read_obs())
+    pyscx.set_uns(p, {"state": "set-via-pathlib"})
+    assert pyscx.open(path).read_uns()["state"] == "set-via-pathlib"
 
 
 def test_modify_metadata_without_an_index_stays_without_one(tmp_dir):
