@@ -195,7 +195,9 @@ impl RQueryPipeline {
     }
 
     /// Execute the pipeline and return an RQueryResult.
-    /// The pipeline is consumed — further calls will error.
+    /// A *successful* collect consumes the pipeline — further calls then
+    /// error. A failed one does not: the pipeline stays usable so the caller
+    /// can correct the offending step and re-collect.
     /// Returns `Robj` and throws via `throw_on_err` (see `filter_obs`).
     fn collect(&mut self) -> Robj {
         crate::util::throw_on_err((|| -> Result<RQueryResult> {

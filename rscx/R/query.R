@@ -125,7 +125,9 @@ limit <- function(pipeline, n) {
 #' Execute the query pipeline and collect results
 #'
 #' @param pipeline An RQueryPipeline object.
-#' @return An RQueryResult object.
+#' @return An RQueryResult object. A successful collect consumes the pipeline —
+#'   further calls on it error. A failed collect does not: the pipeline is left
+#'   unchanged and can be corrected and re-collected.
 #' @export
 collect <- function(pipeline) {
   pipeline$collect()

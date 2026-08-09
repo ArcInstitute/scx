@@ -114,7 +114,11 @@ test_that("a failed collect() leaves the pipeline usable", {
   pipe <- scx_open(path) |> scx_query()
 
   # Out-of-range gene indices are only detected during execution, so this
-  # fails inside collect() rather than in the builder.
+  # fails inside collect() rather than in the builder. Note the failure is
+  # currently a *panic* from arrow's `take` (an unchecked index — a separate
+  # pre-existing defect, mirrored by pyscx's BaseException harness), not a
+  # clean Err. What is asserted here is only that the failure, however it
+  # arrives, does not take the pipeline with it.
   pipe2 <- select_genes(pipe, 10000L)
   expect_error(collect(pipe2))
 

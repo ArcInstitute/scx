@@ -10,7 +10,9 @@ collect(pipeline)
 \item{pipeline}{An RQueryPipeline object.}
 }
 \value{
-An RQueryResult object.
+An RQueryResult object. A successful collect consumes the pipeline —
+further calls on it error. A failed collect does not: the pipeline is left
+unchanged and can be corrected and re-collected.
 }
 \description{
 Execute the query pipeline and collect results
