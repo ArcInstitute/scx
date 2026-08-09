@@ -1229,13 +1229,14 @@ pub(super) fn build_de_dataframe<'py>(
     let order = pyo3::types::PyList::new(py, column_order)?;
     match output {
         "polars" => {
-            let pl = py.import("polars").map_err(|_| {
-                PyRuntimeError::new_err(
-                    "output='polars' requires polars, which is optional \
-                     (pip install 'pyscx[eval]' or pip install polars). \
-                     The default output='pandas' needs no extra.",
-                )
-            })?;
+            let pl = crate::optional_deps::import_optional_with_hint(
+                py,
+                "polars",
+                crate::optional_deps::EXTRA_EVAL,
+                "output=\"polars\"",
+                "polars",
+                Some("The default output=\"pandas\" needs no extra."),
+            )?;
             let df = pl.call_method1("DataFrame", (columns,))?;
             // Enforce column order regardless of dict iteration / constructor.
             df.call_method1("select", (order,))

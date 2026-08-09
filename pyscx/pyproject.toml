@@ -22,6 +22,12 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "scanpy>=1.10",
+    # The suite imports both: `test_hvg_loess_singularity.py` monkeypatches
+    # `skmisc.loess`, and several `test_accel.py` / `test_pseudobulk_thread_env.py`
+    # tests exercise the pydeseq2 backend. Without these, `pip install -e '.[dev]'`
+    # produced an environment that could not run the tests the extra exists for.
+    "scikit-misc>=0.5",
+    "pydeseq2>=0.5",
     "python-dotenv",
     # Required by the NB-GLM custom-`design` path (see the `nbglm` extra) and its
     # tests; `polars` (in the `eval` extra) is needed by the pdex_nb_glm tests.
@@ -63,6 +69,27 @@ cloud = [
 # `read_10x_h5` reader. Optional — only required if calling `from_10x`.
 "10x" = [
     "scanpy>=1.10",
+]
+# The accel ops that delegate to scanpy when `adata.X` is an in-memory
+# scipy/dense matrix: `normalize_total`, `log1p`, `calculate_qc_metrics`,
+# `filter_cells`, `filter_genes`, plus `highly_variable_genes` for the flavors
+# scx has no native kernel for (`cell_ranger`, and batched `seurat`). None of
+# these need scanpy on a backed or lazy X, where the scx-native streaming
+# kernels run instead.
+scanpy = [
+    "scanpy>=1.10",
+]
+# `highly_variable_genes(flavor="seurat_v3")` — the default flavor — regresses
+# variance on mean with a loess, and scikit-misc is the only implementation
+# scanpy and scx both use. Required on *every* X kind (backed, lazy and
+# in-memory), because the loess lives in the shared native kernel.
+hvg = [
+    "scikit-misc>=0.5",
+]
+# `pseudobulk_dex(backend="pydeseq2")` — exact DESeq2 numerics. Not needed for
+# the default `backend="nb_glm"`, which is Rust-native.
+pydeseq2 = [
+    "pydeseq2>=0.5",
 ]
 
 # `hdf5` is included by default so a bare

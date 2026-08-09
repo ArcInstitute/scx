@@ -5,12 +5,105 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::backed::ScxBackedSparseDataset;
+use crate::optional_deps::{import_optional, EXTRA_PYDESEQ2};
 
 use super::de::extract_strata;
 
 /// Upper bound for the env-derived / auto-probed worker count. An explicit
 /// `n_cpus` argument bypasses this so callers can opt into larger pools.
 const DESEQ_DEFAULT_MAX_CPUS: usize = 8;
+
+/// The DE engine `pseudobulk_dex` uses when the caller does not name one.
+///
+/// Was `"pydeseq2"` through v0.12. pydeseq2 is an *optional* dependency that no
+/// extra installed, so the flagship pseudobulk surface raised on a base install
+/// while the Rust-native NB-GLM — which needs nothing — sat behind an opt-in.
+const DEFAULT_BACKEND: &str = "nb_glm";
+
+/// How to refer to the backend in a guard message. A caller who never typed
+/// `backend=` must not be told their kwarg is at fault.
+fn backend_phrase(explicit: bool) -> &'static str {
+    if explicit {
+        "backend=\"nb_glm\""
+    } else {
+        "the default backend (\"nb_glm\", which replaced \"pydeseq2\" as the default)"
+    }
+}
+
+/// The escape hatch, appended only when the caller did not choose the backend —
+/// someone who explicitly asked for NB-GLM is not looking for a way back to
+/// pydeseq2.
+fn pydeseq2_way_back(explicit: bool) -> &'static str {
+    if explicit {
+        ""
+    } else {
+        " To keep the previous behaviour pass backend=\"pydeseq2\" \
+         (pip install 'pyscx[pydeseq2]')."
+    }
+}
+
+/// Set once the transition warning below has been emitted, so "once per
+/// process" is a latch rather than a hope.
+///
+/// Python's own dedup keys on the *caller's* module and line, and `warnings`
+/// filters are user-controlled (`simplefilter("always")` in notebooks and in
+/// this project's own tests), so leaving it to the warnings machinery would make
+/// a call in a loop warn on every iteration. Mirrors `NO_RAPIDS_WARNED` in
+/// `rapids.rs`.
+static DEFAULT_BACKEND_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Warn, once per process, that a default-backend call would previously have run
+/// pydeseq2 and now runs NB-GLM.
+///
+/// Deliberately gated on pydeseq2 being **importable**: that is exactly the set
+/// of callers whose numbers move under them. A base install has nothing to be
+/// warned about — its previous behaviour was a `RuntimeError` — and telling a
+/// new user that a default they never saw has changed is pure noise.
+///
+/// `find_spec` rather than a real import: importing pydeseq2 costs seconds and
+/// pulls in statsmodels, which would be an absurd price for a warning check.
+///
+/// **Infallible by construction, and that is the contract, not an oversight.**
+/// Returns `()`, so there is no `?` to add later. `warnings.warn` *raises* under
+/// `-W error` / `simplefilter("error")` — a common pytest and CI setting — so a
+/// `?` anywhere on this path makes a courtesy notice about a default change
+/// abort the caller's DE run. Every step is therefore ignored on failure.
+fn warn_default_backend_changed(py: Python<'_>) {
+    if DEFAULT_BACKEND_WARNED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // `find_spec` can itself raise (a missing parent package, a module whose
+    // `__spec__` is None, a custom meta-path finder). Treat "cannot tell" as
+    // "not available" and stay quiet.
+    let available = py
+        .import("importlib.util")
+        .and_then(|m| m.call_method1("find_spec", ("pydeseq2",)))
+        .map(|spec| !spec.is_none())
+        .unwrap_or(false);
+    if !available {
+        // Deliberately not latched: a caller can install pydeseq2 and re-run in
+        // the same process (a notebook), and they should still hear about it.
+        return;
+    }
+    if DEFAULT_BACKEND_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(warnings) = py.import("warnings") {
+        let _ = warnings.call_method1(
+            "warn",
+            (
+                "pseudobulk_dex() now defaults to backend=\"nb_glm\" (the Rust-native \
+                 negative-binomial GLM); it defaulted to \"pydeseq2\" through v0.12. \
+                 NB-GLM is DESeq2-*style*, not DESeq2-identical, and applies Cook's / \
+                 independent filtering by default, so padj can be NaN for outlier and \
+                 low-base-mean genes. Pass backend=\"pydeseq2\" to keep the previous \
+                 numerics, or backend=\"nb_glm\" to silence this.",
+                py.get_type::<pyo3::exceptions::PyUserWarning>(),
+            ),
+        );
+    }
+}
 
 /// Resolve a safe worker cap for pydeseq2's loky inference backend.
 ///
@@ -436,9 +529,14 @@ fn resolve_sample_columns(
 ///         backend from forking one worker process per core on many-core
 ///         hosts (each a full Python interpreter), which OOMs the job.
 ///
-///     backend: DE engine — "pydeseq2" (default) or "nb_glm" (Rust-native
-///         negative-binomial GLM, no pydeseq2 dependency). Both emit the same
-///         column schema.
+///     backend: DE engine — "nb_glm" (default; Rust-native negative-binomial
+///         GLM, no optional dependency) or "pydeseq2" (exact DESeq2 numerics,
+///         needs `pip install 'pyscx[pydeseq2]'`). Both emit the same column
+///         schema. The default was "pydeseq2" through v0.12; it changed because
+///         pydeseq2 is an optional dependency, so the default path did not run
+///         on a base install. NB-GLM is DESeq2-*style*, not DESeq2-identical —
+///         pin backend="pydeseq2" when you need the exact numerics, and note
+///         that `stratify_by` and `aggr_method="mean"` are pydeseq2-only.
 ///     nbglm_options: Optional dict of NB-GLM tuning knobs (only used when
 ///         backend="nb_glm"; see pyscx.accel.nb_glm). Ignored for pydeseq2.
 ///
@@ -446,7 +544,7 @@ fn resolve_sample_columns(
 ///     pandas DataFrame with columns: gene, baseMean, log2FoldChange,
 ///     lfcSE, stat, pvalue, padj, target, reference
 #[pyfunction]
-#[pyo3(signature = (adata, groupby=None, test_col=None, reference=None, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None, n_cpus=None, backend="pydeseq2", nbglm_options=None, *, sample_cols=None, sample_key=None))]
+#[pyo3(signature = (adata, groupby=None, test_col=None, reference=None, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None, n_cpus=None, backend=None, nbglm_options=None, *, sample_cols=None, sample_key=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pseudobulk_dex(
     py: Python<'_>,
@@ -467,7 +565,10 @@ pub fn pseudobulk_dex(
     prefer_format: &str,
     gene_indices: Option<Vec<u32>>,
     n_cpus: Option<usize>,
-    backend: &str,
+    // `None` means "the caller did not choose", which is not the same as an
+    // explicit `backend="nb_glm"`: the guards below and the transition warning
+    // both need to tell those apart so they never blame a kwarg nobody typed.
+    backend: Option<&str>,
     nbglm_options: Option<&Bound<'_, PyDict>>,
     sample_cols: Option<&Bound<'_, PyAny>>,
     sample_key: Option<&Bound<'_, PyAny>>,
@@ -502,6 +603,8 @@ pub fn pseudobulk_dex(
     // error. Refuse, as the other streaming accel ops do.
     super::prepare_target(py, adata, "pseudobulk_dex")?;
 
+    let backend_was_explicit = backend.is_some();
+    let backend = backend.unwrap_or(DEFAULT_BACKEND);
     if !matches!(backend, "pydeseq2" | "nb_glm") {
         return Err(PyValueError::new_err(format!(
             "Invalid backend={backend:?}; expected 'pydeseq2' or 'nb_glm'"
@@ -512,44 +615,65 @@ pub fn pseudobulk_dex(
     // recursion below — each stratum would yield one sample per condition and the
     // fit would degenerate. Reject the combination with actionable guidance.
     if backend == "nb_glm" && stratify_by.is_some() {
-        return Err(PyValueError::new_err(
-            "pseudobulk_dex(backend=\"nb_glm\") does not support stratify_by: NB-GLM \
+        return Err(PyValueError::new_err(format!(
+            "pseudobulk_dex(stratify_by=…) is not supported by {}: NB-GLM \
              treats replicates as rows of a single design, so put the replicate column \
              (batch/donor/well) directly in `groupby`, or use pyscx.accel.pdex_nb_glm \
-             (which merges groupby + stratify_by for you).",
-        ));
+             (which merges groupby + stratify_by for you).{}",
+            backend_phrase(backend_was_explicit),
+            pydeseq2_way_back(backend_was_explicit),
+        )));
+    }
+    // Reject a value that is not an aggregation method at all *before* the
+    // backend guard below. Otherwise `aggr_method="tpyo"` is answered with a
+    // paragraph about the negative-binomial count model, which is true and
+    // completely beside the point.
+    if !matches!(aggr_method, "sum" | "mean") {
+        return Err(PyRuntimeError::new_err(format!(
+            "unsupported aggr_method '{aggr_method}': use 'sum' or 'mean'"
+        )));
     }
     // §2.5: the NB count likelihood requires replicate-level *summed* counts.
     // Fractional aggregates (mean/median) are not valid inputs to the model, so
     // the count backend accepts only aggr_method="sum".
     if backend == "nb_glm" && aggr_method != "sum" {
         return Err(PyValueError::new_err(format!(
-            "pseudobulk_dex(backend=\"nb_glm\") requires aggr_method=\"sum\" (got \
+            "pseudobulk_dex requires aggr_method=\"sum\" under {} (got \
              {aggr_method:?}): the negative-binomial count model is defined on summed \
-             replicate counts, not fractional {aggr_method} aggregates."
+             replicate counts, not fractional {aggr_method} aggregates.{}",
+            backend_phrase(backend_was_explicit),
+            pydeseq2_way_back(backend_was_explicit),
         )));
+    }
+    if backend == "nb_glm" && !backend_was_explicit {
+        warn_default_backend_changed(py);
     }
 
     // Record the planned route on adata.uns["scx_accel"]["pseudobulk_dex"].
-    // Pseudobulk aggregation + pydeseq2 is CPU-only; the only dispatch choice is
-    // the gene-axis layout — cpu_csc when prefer_format="csc" (reads the
-    // gene-major sidecar), cpu_csr otherwise. Stamped on the top-level adata
-    // before the stratified branch (which recurses on discarded sub_adata
-    // copies). This is the route the CSC dispatch gate asserts.
-    let pb_route = if backend == "nb_glm" {
-        scx_accel::AccelRoute::CpuNbGlm
-    } else if prefer_format == "csc" {
-        scx_accel::AccelRoute::CpuCsc
-    } else {
-        scx_accel::AccelRoute::CpuCsr
-    };
+    // Pseudobulk DE is CPU-only; the only dispatch choice is the gene-axis
+    // layout — cpu_csc when prefer_format="csc" (reads the gene-major sidecar),
+    // cpu_csr otherwise. Stamped on the top-level adata before the stratified
+    // branch (which recurses on discarded sub_adata copies). This is the route
+    // the CSC dispatch gate asserts.
+    //
+    // The NB-GLM backend reports its engine (`cpu_nb_glm`) rather than the
+    // layout, because the engine is the bigger fact about the run. Aggregation
+    // still honours `prefer_format` on that route, so the layout is carried
+    // separately in `csc_available` — without it, flipping the default would
+    // have made CSC dispatch invisible on the path most callers now take.
+    let mut info = scx_accel::AccelExecutionInfo::new(
+        if backend == "nb_glm" {
+            scx_accel::AccelRoute::CpuNbGlm
+        } else if prefer_format == "csc" {
+            scx_accel::AccelRoute::CpuCsc
+        } else {
+            scx_accel::AccelRoute::CpuCsr
+        },
+        scx_accel::FallbackReason::None,
+    );
+    info.csc_available = Some(prefer_format == "csc");
     // Rolled back if anything below raises — see RouteStamp.
-    let route = super::route::RouteStamp::write(
-        py,
-        adata,
-        "pseudobulk_dex",
-        &scx_accel::AccelExecutionInfo::new(pb_route, scx_accel::FallbackReason::None),
-    )?;
+    let route = super::route::RouteStamp::write(py, adata, "pseudobulk_dex", &info)?;
 
     // --- Stratified path ---
     if let Some(ref strat_cols) = stratify_by {
@@ -586,7 +710,11 @@ pub fn pseudobulk_dex(
                 prefer_format,
                 gene_indices.clone(),
                 n_cpus,
-                backend,
+                // The *resolved* backend, never the raw argument: the recursion
+                // must not re-resolve a `None` (and re-warn once per stratum).
+                // Only reachable with "pydeseq2" — nb_glm + stratify_by is
+                // rejected above.
+                Some(backend),
                 nbglm_options,
                 None, // sample_cols: already resolved into `groupby`
                 None, // sample_key: ditto
@@ -637,15 +765,19 @@ pub fn pseudobulk_dex(
         )));
     }
 
+    // Already validated up front (before the backend guards), so the catch-all
+    // here is unreachable rather than a second error message to keep in sync.
+    // Asserted rather than assumed: if that guard is ever moved or removed, an
+    // unrecognised `aggr_method` would silently become `Mean` instead of
+    // erroring, which is the kind of default nobody would notice.
+    debug_assert!(
+        matches!(aggr_method, "sum" | "mean"),
+        "aggr_method {aggr_method:?} reached the dispatch match — the up-front \
+         validation guard is gone or was bypassed"
+    );
     let method = match aggr_method {
         "sum" => scx_accel::AggregationMethod::Sum,
-        "mean" => scx_accel::AggregationMethod::Mean,
-        _ => {
-            return Err(PyRuntimeError::new_err(format!(
-                "unsupported aggr_method '{}': use 'sum' or 'mean'",
-                aggr_method
-            )))
-        }
+        _ => scx_accel::AggregationMethod::Mean,
     };
 
     let result = aggregate_pseudobulk(
@@ -754,20 +886,23 @@ pub fn pseudobulk_dex(
         }),
     )?;
 
-    // Import pydeseq2 at runtime.
-    let pydeseq2 = py.import("pydeseq2.dds").map_err(|_| {
-        PyRuntimeError::new_err(
-            "pydeseq2 is required for pseudobulk DE but is not installed.\n\
-             Install with: pip install pydeseq2\n\
-             Or: uv pip install pydeseq2",
-        )
-    })?;
-    let pydeseq2_stats = py.import("pydeseq2.ds").map_err(|_| {
-        PyRuntimeError::new_err(
-            "pydeseq2.ds module not found. Ensure pydeseq2 is properly installed.\n\
-             Install with: pip install pydeseq2",
-        )
-    })?;
+    // Import pydeseq2 at runtime. Only reached on an explicit
+    // `backend="pydeseq2"` since the default flipped to `"nb_glm"`, which needs
+    // no optional dependency at all.
+    let pydeseq2 = import_optional(
+        py,
+        "pydeseq2.dds",
+        EXTRA_PYDESEQ2,
+        "pyscx.accel.pseudobulk_dex(backend=\"pydeseq2\")",
+        "pydeseq2",
+    )?;
+    let pydeseq2_stats = import_optional(
+        py,
+        "pydeseq2.ds",
+        EXTRA_PYDESEQ2,
+        "pyscx.accel.pseudobulk_dex(backend=\"pydeseq2\")",
+        "pydeseq2",
+    )?;
 
     // Design formula.
     let _design_str = design
@@ -825,23 +960,22 @@ pub fn pseudobulk_dex(
     //
     // Regression coverage: `pyscx/tests/test_pseudobulk_thread_env.py`.
     let resolved_n_cpus = resolve_deseq_n_cpus(n_cpus);
-    let inference = py
-        .import("pydeseq2.default_inference")
-        .map_err(|_| {
-            PyRuntimeError::new_err(
-                "pydeseq2.default_inference module not found. Ensure pydeseq2 is properly installed.\n\
-                 Install with: pip install pydeseq2",
-            )
-        })?
-        .call_method(
-            "DefaultInference",
-            (),
-            Some(&{
-                let kw = PyDict::new(py);
-                kw.set_item("n_cpus", resolved_n_cpus)?;
-                kw
-            }),
-        )?;
+    let inference = import_optional(
+        py,
+        "pydeseq2.default_inference",
+        EXTRA_PYDESEQ2,
+        "pyscx.accel.pseudobulk_dex(backend=\"pydeseq2\")",
+        "pydeseq2",
+    )?
+    .call_method(
+        "DefaultInference",
+        (),
+        Some(&{
+            let kw = PyDict::new(py);
+            kw.set_item("n_cpus", resolved_n_cpus)?;
+            kw
+        }),
+    )?;
 
     // Create DeseqDataSet.
     let dds = pydeseq2.call_method(

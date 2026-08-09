@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::f64::consts::LN_2;
 
 use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyImportError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -698,14 +698,14 @@ pub(super) fn fit_targets_nbglm_with_design(
     let metadata_df = pd.call_method("DataFrame", (meta_dict,), Some(&df_kw))?;
 
     // --- Build the numeric design matrix via formulaic (pydeseq2's parser). ---
-    let formulaic = py.import("formulaic").map_err(|_| {
-        // ImportError-derived so callers can `except ImportError`.
-        PyImportError::new_err(
-            "formulaic is required to honor a `design` formula for the NB-GLM backend \
-             but is not installed. It ships with pydeseq2 — install with: pip install \
-             formulaic. Or omit `design` to use the fixed intercept + target design.",
-        )
-    })?;
+    let formulaic = crate::optional_deps::import_optional_with_hint(
+        py,
+        "formulaic",
+        crate::optional_deps::EXTRA_NBGLM,
+        "a `design=` formula on the NB-GLM backend",
+        "formulaic",
+        Some("Omit `design` to use the fixed intercept + target design, which needs no extra."),
+    )?;
     let x = formulaic.call_method1("model_matrix", (design_formula, &metadata_df))?;
     // A one-sided formula (`~ rhs`) yields a single ModelMatrix (DataFrame-like); a
     // two-sided / multi-part formula yields a `ModelMatrices` with no `.columns`.

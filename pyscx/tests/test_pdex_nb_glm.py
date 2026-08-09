@@ -346,7 +346,7 @@ def test_pseudobulk_dex_nbglm_design_requires_formulaic(monkeypatch):
     adata = _perturb_adata()
     # Poison the import so `py.import("formulaic")` raises ImportError.
     monkeypatch.setitem(sys.modules, "formulaic", None)
-    with pytest.raises(ImportError, match="formulaic is required"):
+    with pytest.raises(ImportError, match=r"requires the `formulaic` package"):
         pyscx.accel.pseudobulk_dex(
             adata,
             groupby=["perturbation", "donor"],

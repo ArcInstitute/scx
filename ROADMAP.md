@@ -512,7 +512,8 @@ full scverse pipeline works via AnnData from the format / codec / bridge work.
 - [x] **kNN graph**: HNSW via `instant-distance`, UMAP-style connectivities
 - [x] **UMAP**: SGD embedding with spectral initialization
 - [x] **DE (Wilcoxon rank-sum)**: parallel rank-sum with rayon, in-memory + gene-chunked streaming
-- [x] **Pseudobulk DE**: streaming aggregation via `BackedCsrReader` + `pydeseq2`
+- [x] **Pseudobulk DE**: streaming aggregation via `BackedCsrReader` + the
+      Rust-native NB-GLM (default) or `pydeseq2` (`backend="pydeseq2"`)
 - [x] **Stratified DE**: per-stratum execution for both Wilcoxon rank-sum and pseudobulk
 
 ### 4c. GPU Accelerators — COMPLETE (rapids-singlecell transition done)

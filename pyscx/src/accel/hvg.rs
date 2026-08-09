@@ -8,6 +8,7 @@ use pyo3::types::PyDict;
 
 use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
+use crate::optional_deps::{import_optional, import_optional_with_hint, EXTRA_HVG, EXTRA_SCANPY};
 
 /// Single-shard [`scx_format_io::ShardSource`] adapter over a borrowed in-memory
 /// [`scx_sparse::ScxCsr`].
@@ -489,7 +490,20 @@ pub fn highly_variable_genes<'py>(
     let msg = format!("{core}{fragility_tail}");
     warnings.call_method1("warn", (msg, user_warning))?;
 
-    let sc = py.import("scanpy")?;
+    let sc = import_optional_with_hint(
+        py,
+        "scanpy",
+        EXTRA_SCANPY,
+        &format!("pyscx.accel.highly_variable_genes(flavor={flavor:?})"),
+        "scanpy",
+        // Not the backed hatch: this flavor has no scx-native kernel at all, so
+        // backing X would not help. Point at the flavors that do.
+        Some(
+            "flavor=\"seurat_v3\", \"seurat_v3_paper\" and \"seurat\" run the \
+             scx-native kernel and need no scanpy (\"seurat_v3\" needs \
+             `pip install 'pyscx[hvg]'` for its loess).",
+        ),
+    )?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("n_top_genes", n_top_genes)?;
     kwargs.set_item("flavor", flavor)?;
@@ -941,7 +955,13 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
     // or broken `skmisc.loess` fails fast with its real type
     // (`ModuleNotFoundError` / `AttributeError`) instead of getting
     // swallowed by the narrow `PyValueError` catch in the closure below.
-    let loess_mod = py.import("skmisc.loess")?;
+    let loess_mod = import_optional(
+        py,
+        "skmisc.loess",
+        EXTRA_HVG,
+        "pyscx.accel.highly_variable_genes(flavor=\"seurat_v3\")",
+        "scikit-misc",
+    )?;
     let loess_cls = loess_mod.getattr("loess")?;
 
     for (b, batch_cells) in batches.iter().enumerate() {
@@ -1354,7 +1374,20 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
 ) -> PyResult<()> {
     // For batched seurat, fall back to scanpy (complex aggregation logic)
     if batch_key.is_some() {
-        let sc = py.import("scanpy")?;
+        let sc = import_optional_with_hint(
+            py,
+            "scanpy",
+            EXTRA_SCANPY,
+            "pyscx.accel.highly_variable_genes(flavor=\"seurat\", batch_key=...)",
+            "scanpy",
+            // The single-batch seurat kernel is scx-native; only the cross-batch
+            // aggregation is delegated.
+            Some(
+                "Only the batched `seurat` flavor is delegated — \
+                 flavor=\"seurat\" without `batch_key`, and flavor=\"seurat_v3\" \
+                 with or without it, run the scx-native kernel.",
+            ),
+        )?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("n_top_genes", n_top_genes)?;
         kwargs.set_item("flavor", "seurat")?;
@@ -1510,7 +1543,13 @@ fn csc_loess_estimat_var(
     if x_vals.len() >= 3 {
         let x_arr = numpy::PyArray::from_vec(py, x_vals);
         let y_arr = numpy::PyArray::from_vec(py, y_vals);
-        let loess_mod = py.import("skmisc.loess")?;
+        let loess_mod = import_optional(
+            py,
+            "skmisc.loess",
+            EXTRA_HVG,
+            "pyscx.accel.highly_variable_genes(flavor=\"seurat_v3\")",
+            "scikit-misc",
+        )?;
         let loess_cls = loess_mod.getattr("loess")?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("span", span)?;

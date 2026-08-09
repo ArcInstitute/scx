@@ -111,7 +111,7 @@ def pseudobulk_dex(
     prefer_format: PreferFormat = "csr",
     gene_indices: list[int] | None = None,
     n_cpus: int | None = None,
-    backend: Literal["pydeseq2", "nb_glm"] = "pydeseq2",
+    backend: Literal["pydeseq2", "nb_glm"] | None = None,
     nbglm_options: dict[str, Any] | None = None,
     *,
     sample_cols: str | list[str] | None = None,
@@ -130,6 +130,12 @@ def pseudobulk_dex(
     ``groupby`` / ``test_col`` / ``reference`` are all semantically required —
     they are typed optional only because the aliases make ``groupby`` optional
     and a required positional cannot follow an optional one.
+
+    ``backend=None`` resolves to ``"nb_glm"``, the Rust-native NB-GLM, which
+    needs no optional dependency. It defaulted to ``"pydeseq2"`` through v0.12;
+    that engine is still available as ``backend="pydeseq2"`` (``pip install
+    'pyscx[pydeseq2]'``) and is required for ``stratify_by`` and for
+    ``aggr_method`` other than ``"sum"``.
     """
     ...
 

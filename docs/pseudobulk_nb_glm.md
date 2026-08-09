@@ -13,8 +13,8 @@ pydeseq2.
 > **Cook's-distance outlier filtering** and **base-mean independent filtering** —
 > but it does **not** reproduce DESeq2 bit-for-bit. It still omits apeglm/ashr LFC
 > shrinkage. The bar is **ranking / effect-sign / significance parity**, not
-> numerical equality. If you need exact DESeq2 behaviour, keep using PyDESeq2
-> (`backend="pydeseq2"`, the default).
+> numerical equality. If you need exact DESeq2 behaviour, use PyDESeq2
+> (`backend="pydeseq2"`, plus `pip install 'pyscx[pydeseq2]'`).
 
 > **Behavior change.** Cook's-distance outlier filtering and base-mean
 > independent filtering are **on by default** (matching DESeq2 `results()`). Versus
@@ -44,7 +44,7 @@ stratifier is supplied (see [§ Replicate requirement](#replicate-requirement)).
 |---|---|
 | ≥ 2 pseudobulk replicates per condition, want DESeq2-style NB-GLM | `nb_glm` / `pdex_nb_glm` / `pseudobulk_dex(backend="nb_glm")` |
 | One profile per condition (no replicates) | `pdex_ref` / `rank_genes_groups` (per-cell) |
-| Need exact DESeq2 numerics | `pseudobulk_dex(backend="pydeseq2")` (default) |
+| Need exact DESeq2 numerics | `pseudobulk_dex(backend="pydeseq2")` (needs `pip install 'pyscx[pydeseq2]'`) |
 
 ## Three entry points
 
@@ -117,13 +117,32 @@ The output *column* schema is byte-compatible with `pyscx.accel.pdex_ref` /
 > change — the column-schema addition on that side is still one line
 > (`de_method="nb_glm"`), but the container is not free.
 
-### 3. `pseudobulk_dex(backend="nb_glm")` — alongside the PyDESeq2 bridge
+### 3. `pseudobulk_dex(backend="nb_glm")` — the default, alongside the PyDESeq2 bridge
 
-`pyscx.accel.pseudobulk_dex` gains a `backend` argument
-(`"pydeseq2"` default, or `"nb_glm"`). The NB-GLM backend emits the **same pandas
-schema** as the pydeseq2 path, so existing consumers need no changes, and it has
-**no pydeseq2 dependency** (a custom `design=` formula additionally needs
+`pyscx.accel.pseudobulk_dex` takes a `backend` argument: `"nb_glm"` (the
+default) or `"pydeseq2"`. The NB-GLM backend emits the **same pandas schema** as
+the pydeseq2 path, so existing consumers need no changes, and it has **no
+pydeseq2 dependency** (a custom `design=` formula additionally needs
 `formulaic`; see [Custom designs](#custom-designs-formula)).
+
+> **Default change in v0.13.** `pseudobulk_dex` defaulted to `"pydeseq2"` through
+> v0.12. pydeseq2 is an *optional* dependency that no extra installed, so the
+> flagship pseudobulk call raised `RuntimeError: pydeseq2 is required` on a base
+> `pip install pyscx`, while the shipped Rust-native engine sat behind an opt-in.
+>
+> Three things to know when upgrading:
+>
+> - **The numbers move.** NB-GLM is DESeq2-*style*, not DESeq2-identical, and
+>   applies Cook's / independent filtering by default, so `padj` can be `NaN` for
+>   outlier and low-base-mean genes. Pass `backend="pydeseq2"` (with
+>   `pip install 'pyscx[pydeseq2]'`) to keep the previous numerics.
+> - **`stratify_by=` and `aggr_method="mean"` are pydeseq2-only.** NB-GLM treats
+>   replicates as rows of a single design, so put the replicate column directly
+>   in `groupby` — or pass `backend="pydeseq2"`. Both raise with that guidance
+>   rather than silently changing what they compute.
+> - **A one-time `UserWarning`** fires on a default-backend call, but only when
+>   pydeseq2 is importable — i.e. only for callers whose results actually change.
+>   Passing `backend="nb_glm"` explicitly silences it.
 
 ```python
 df = pyscx.accel.pseudobulk_dex(
@@ -133,7 +152,8 @@ df = pyscx.accel.pseudobulk_dex(
     groupby=["perturbation", "donor"],
     test_col="perturbation",    # the column actually compared
     reference="control",
-    backend="nb_glm",           # default is "pydeseq2"
+    backend="nb_glm",           # the default since v0.13; pass it to silence
+                                # the one-time transition warning
 )
 # columns: gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj,
 #          target, reference
@@ -292,7 +312,8 @@ df = pyscx.accel.pseudobulk_dex(
   `{target, reference}` pair separately): with a formula the median-of-ratios size
   factors, `baseMean`, Cook's cutoff, and independent-filtering are all computed over
   the full sample set, and p-values come from the pooled fit. This is DESeq2-*style*
-  (not -*identical*) — for exact DESeq2 numerics use `backend="pydeseq2"`.
+  (not -*identical*) — for exact DESeq2 numerics use `backend="pydeseq2"`
+  (`pip install 'pyscx[pydeseq2]'`).
 - If `test_col` appears **inside an interaction** (`~ perturbation * donor`), the
   extracted `perturbation[T.<target>]` is the effect **at the base level of the other
   factor**, but the row is still labelled `target`/`reference` like a marginal effect

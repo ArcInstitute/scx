@@ -10,6 +10,7 @@ pub(crate) mod lazy_mapping;
 pub(crate) mod lazy_transform;
 pub(crate) mod mudata;
 mod ops;
+pub(crate) mod optional_deps;
 mod preprocess;
 pub(crate) mod projected_agg;
 mod query;
@@ -714,25 +715,15 @@ fn from_10x(
     row_group_rows: u32,
     row_group_target_nnz: Option<u64>,
 ) -> PyResult<()> {
-    let scanpy = py.import("scanpy").map_err(|e| {
-        // Only rewrite when scanpy itself is the missing module — if scanpy
-        // is installed but one of its transitive deps fails to import, we
-        // must propagate the original error so users can diagnose it.
-        if e.is_instance_of::<pyo3::exceptions::PyModuleNotFoundError>(py) {
-            let missing = e
-                .value(py)
-                .getattr("name")
-                .ok()
-                .and_then(|n| n.extract::<String>().ok());
-            if missing.as_deref() == Some("scanpy") {
-                return pyo3::exceptions::PyModuleNotFoundError::new_err(
-                    "pyscx.from_10x() requires scanpy. Install it with: \
-                     pip install 'pyscx[10x]'",
-                );
-            }
-        }
-        e
-    })?;
+    // The "only rewrite when scanpy itself is missing, otherwise propagate"
+    // logic this site pioneered now lives in `optional_deps::import_optional`.
+    let scanpy = optional_deps::import_optional(
+        py,
+        "scanpy",
+        optional_deps::EXTRA_10X,
+        "pyscx.from_10x()",
+        "scanpy",
+    )?;
     let adata = scanpy.call_method1("read_10x_h5", (h5_path,))?;
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     convert::from_anndata_impl(
