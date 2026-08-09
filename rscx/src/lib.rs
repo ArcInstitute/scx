@@ -52,10 +52,13 @@ impl ScxExperiment {
     }
 
     /// Fallible body of `obs` (see B3 / `throw_on_err`).
+    ///
+    /// Deletion-filtered, so `$obs()` has exactly as many rows as
+    /// `$x_matrix()` has cells and both agree with `scx_query()`.
     fn obs_impl(&self) -> Result<Robj> {
         let batch = self
             .reader
-            .read_obs()
+            .read_obs_filtered()
             .map_err(|e| Error::Other(e.to_string()))?;
         interop::record_batch_to_dataframe(&batch)
     }
@@ -72,9 +75,12 @@ impl ScxExperiment {
     /// Fallible body of `x_matrix` (see B3 / `throw_on_err`).
     fn x_matrix_impl(&self, allow_lossy: bool) -> Result<Robj> {
         guard::guard_decode_loss(guard::csr_max_value(&self.reader, None), allow_lossy)?;
+        // Deletion-aware: `scx_delete()` marks cells logically deleted, and a
+        // materialising read must honour that or rscx contradicts its own
+        // `scx_query()` on the same file.
         let csr = self
             .reader
-            .read_all_csr_shards()
+            .read_all_csr_shards_filtered()
             .map_err(|e| Error::Other(e.to_string()))?;
         interop::csr_to_dgcmatrix(&csr)
     }
@@ -84,7 +90,7 @@ impl ScxExperiment {
         guard::guard_decode_loss(guard::layer_max_value(&self.reader, name), allow_lossy)?;
         let csr = self
             .reader
-            .read_layer(name)
+            .read_layer_filtered(name)
             .map_err(|e| Error::Other(e.to_string()))?;
         interop::csr_to_dgcmatrix(&csr)
     }
@@ -205,13 +211,16 @@ impl ScxExperiment {
             // the silent u32→f32 decode loss before decoding.
             let max_value = guard::csr_max_value(&self.reader, None);
             guard::guard_decode_loss(max_value, allow_lossy)?;
+            // X and obs are filtered by the same deletion mask, and must be:
+            // an obs frame longer than the matrix is worse than either half
+            // being stale on its own.
             let csr = self
                 .reader
-                .read_all_csr_shards()
+                .read_all_csr_shards_filtered()
                 .map_err(|e| Error::Other(e.to_string()))?;
             let obs = self
                 .reader
-                .read_obs()
+                .read_obs_filtered()
                 .map_err(|e| Error::Other(e.to_string()))?;
             let var = self
                 .reader
@@ -293,7 +302,8 @@ impl ScxExperiment {
     /// SCX stores CSR (row-major, cells × genes).
     /// R's dgCMatrix is CSC (column-major).
     /// Conversion steps:
-    ///   1. Read all CSR shards via reader.read_all_csr_shards()
+    ///   1. Read all CSR shards via reader.read_all_csr_shards_filtered()
+    ///      (logically deleted cells are excluded)
     ///   2. Transpose CSR → CSC (indptr_csc, indices_csc, data_csc)
     ///   3. Cast: indptr i64→i32 (safe for <2B nnz), data f32→f64 (lossless widening)
     ///   4. Construct dgCMatrix via new("dgCMatrix", i=, p=, x=, Dim=)

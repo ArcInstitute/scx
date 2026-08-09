@@ -1825,8 +1825,10 @@ pub fn to_seurat_multimodal(reader: &ScxReader, allow_lossy: bool) -> Result<Rob
         .iter()
         .map(|s| s.to_string())
         .collect();
+    // Deletion-filtered in lockstep with every modality's X below: deletion is
+    // whole-cell, so all modalities and the shared obs axis drop the same rows.
     let obs_batch = reader
-        .read_obs()
+        .read_obs_filtered()
         .map_err(|e| Error::Other(format!("read_obs failed: {}", e)))?;
     let obs_df = record_batch_to_dataframe(&obs_batch)?;
 
@@ -1852,7 +1854,7 @@ pub fn to_seurat_multimodal(reader: &ScxReader, allow_lossy: bool) -> Result<Rob
             allow_lossy,
         )?;
         let csr = reader
-            .read_all_csr_shards_for(mid)
+            .read_all_csr_shards_for_filtered(mid)
             .map_err(|e| Error::Other(format!("read_all_csr_shards_for({name}): {}", e)))?;
         let dgc = csr_to_dgcmatrix(&csr)?;
         let var_batch = reader
@@ -2240,8 +2242,10 @@ pub fn to_mae(reader: &ScxReader, allow_lossy: bool) -> Result<Robj> {
         "MultiAssayExperiment is required for to_mae() but is not installed; \
          install it (BiocManager::install(\"MultiAssayExperiment\")) and retry",
     )?;
+    // Deletion-filtered in lockstep with every modality's X below: deletion is
+    // whole-cell, so all modalities and the shared obs axis drop the same rows.
     let obs_batch = reader
-        .read_obs()
+        .read_obs_filtered()
         .map_err(|e| Error::Other(format!("read_obs failed: {}", e)))?;
     let obs_df = record_batch_to_dataframe(&obs_batch)?;
     // Cell ids (global obs index) become each SCE's colnames so they align
@@ -2262,7 +2266,7 @@ pub fn to_mae(reader: &ScxReader, allow_lossy: bool) -> Result<Robj> {
             allow_lossy,
         )?;
         let csr = reader
-            .read_all_csr_shards_for(mid)
+            .read_all_csr_shards_for_filtered(mid)
             .map_err(|e| Error::Other(format!("read_all_csr_shards_for({name}): {e}")))?;
         let dgc = csr_to_dgcmatrix(&csr)?;
         let var_batch = reader

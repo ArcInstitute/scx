@@ -30,6 +30,13 @@ lt <- scx_lazy_transform("atlas.scx") |>
 lt[1:100, ]            # transformed dgCMatrix (cells x genes)
 }
 }
+\section{Files with deleted cells}{
+Like \code{\link{scx_backed_sparse}}, lazy handles address rows by physical
+index, so opening a file that carries deletion vectors \strong{errors} instead
+of returning deleted cells. Run \code{scx compact} first, or use
+\code{\link{scx_query}}.
+}
+
 \seealso{
 \code{\link{scx_backed_sparse}} (untransformed backed access);
 \code{scx_normalize_total}, \code{scx_log1p}, \code{scx_row_scale}.
