@@ -22,11 +22,18 @@ use crate::error::MtxError;
 /// - `matrix.mtx.gz` — sparse matrix in COO format
 /// - `barcodes.tsv.gz` — cell barcodes
 /// - `features.tsv.gz` — gene/feature metadata
+///
+/// Logically deleted cells are **excluded**. MatrixMarket has no notion of a
+/// deletion vector, so unlike an SCX→SCX rewrite there is nothing to carry the
+/// deletion in — the only faithful export is one that leaves the rows out. X and
+/// obs are filtered by the same mask and must stay that way: `barcodes.tsv.gz`
+/// with more lines than the matrix has columns is a directory Cell Ranger and
+/// Scanpy both reject.
 pub fn write_scx_to_mtx(scx_path: &Path, output_dir: &Path) -> Result<(), MtxError> {
     std::fs::create_dir_all(output_dir)?;
 
     let reader = ScxReader::open(scx_path)?;
-    let csr = reader.read_all_csr_shards()?;
+    let csr = reader.read_all_csr_shards_filtered()?;
     let n_obs = csr.shape.0;
     let n_vars = csr.shape.1;
     let nnz = csr.nnz();
@@ -45,7 +52,7 @@ pub fn write_scx_to_mtx(scx_path: &Path, output_dir: &Path) -> Result<(), MtxErr
     // Write barcodes.tsv.gz. Synthetic barcodes are a fallback for *genuinely
     // absent* obs only; a decode/checksum failure is corruption and must abort
     // rather than silently emit fabricated `cell_i` IDs (SCX-009).
-    match reader.read_obs() {
+    match reader.read_obs_filtered() {
         Ok(obs) => write_barcodes_tsv(output_dir, &obs)?,
         Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {
             write_synthetic_barcodes(output_dir, n_obs)?;
@@ -288,4 +295,153 @@ fn write_synthetic_features(dir: &Path, n_vars: usize) -> Result<(), MtxError> {
 
     w.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use scx_codec::{CodecId, ValueEncoding};
+    use scx_format_io::deletion_vectors::DeletionVectors;
+    use scx_format_io::header::FileHeader;
+    use scx_format_io::writer::ScxWriter;
+    use std::io::Read;
+    use std::sync::Arc;
+
+    /// A 6×4 file, one nnz per row, with rows 1 and 4 logically deleted.
+    fn write_fixture(dir: &tempfile::TempDir, deleted: &[u32]) -> std::path::PathBuf {
+        let (n_obs, n_vars) = (6usize, 4usize);
+        let path = dir.path().join("in.scx");
+        let mut w = ScxWriter::new(
+            &path,
+            FileHeader {
+                n_obs: n_obs as u64,
+                n_vars: n_vars as u64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let obs = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "cell_id",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(
+                (0..n_obs).map(|i| format!("cell_{i}")).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        w.write_obs(&obs).unwrap();
+        let var = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("gene_id", DataType::Utf8, false),
+                Field::new("gene_name", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(
+                    (0..n_vars).map(|i| format!("ENSG{i}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    (0..n_vars).map(|i| format!("Gene{i}")).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        w.write_var(&var).unwrap();
+
+        let mut indptr = vec![0u64];
+        let (mut indices, mut values) = (Vec::new(), Vec::new());
+        for row in 0..n_obs {
+            indices.push((row % n_vars) as u32);
+            values.push((row + 1) as u8);
+            indptr.push(indptr.last().unwrap() + 1);
+        }
+        w.write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+        if !deleted.is_empty() {
+            let mut dv = DeletionVectors::new();
+            dv.insert_global(deleted.iter().copied());
+            w.write_deletion_vectors(&dv).unwrap();
+        }
+        w.finish().unwrap();
+        path
+    }
+
+    fn read_gz(path: &Path) -> String {
+        let f = std::fs::File::open(path).unwrap();
+        let mut s = String::new();
+        flate2::read::GzDecoder::new(f)
+            .read_to_string(&mut s)
+            .unwrap();
+        s
+    }
+
+    /// MTX cannot represent a logical deletion, so the export has to apply it.
+    ///
+    /// The barcode count is asserted against the matrix size line rather than
+    /// against a constant: a version of this bug that filtered X but not obs
+    /// would still produce "6 barcodes", and would be the worse failure — an
+    /// internally inconsistent directory rather than a merely stale one.
+    #[test]
+    fn mtx_export_omits_deleted_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_fixture(&dir, &[1, 4]);
+        let out = dir.path().join("mtx");
+        write_scx_to_mtx(&src, &out).unwrap();
+
+        let barcodes: Vec<String> = read_gz(&out.join("barcodes.tsv.gz"))
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            barcodes,
+            vec!["cell_0", "cell_2", "cell_3", "cell_5"],
+            "the deleted cells must not appear, and the survivors keep their order"
+        );
+
+        // Size line is "n_vars n_obs nnz" (features × barcodes, Cell Ranger's
+        // orientation — SCX-010).
+        let mtx = read_gz(&out.join("matrix.mtx.gz"));
+        let size_line = mtx
+            .lines()
+            .find(|l| !l.starts_with('%'))
+            .expect("size line");
+        let parts: Vec<usize> = size_line
+            .split_whitespace()
+            .map(|t| t.parse().unwrap())
+            .collect();
+        assert_eq!(parts[0], 4, "n_vars unchanged");
+        assert_eq!(
+            parts[1],
+            barcodes.len(),
+            "matrix column count must equal the barcode count"
+        );
+        assert_eq!(parts[2], 4, "one nnz per surviving row");
+    }
+
+    /// The no-deletions path must be untouched by the filter.
+    #[test]
+    fn mtx_export_without_deletions_writes_every_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_fixture(&dir, &[]);
+        let out = dir.path().join("mtx");
+        write_scx_to_mtx(&src, &out).unwrap();
+        assert_eq!(
+            read_gz(&out.join("barcodes.tsv.gz")).lines().count(),
+            6,
+            "no deletion vector: every cell is exported"
+        );
+    }
 }

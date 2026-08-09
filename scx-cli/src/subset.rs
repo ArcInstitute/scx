@@ -533,7 +533,7 @@ fn extract_modality(
     // Read the global obs and apply the optional filter.
     let obs = reader.read_obs()?;
     let n_obs_global = reader.header().n_obs as usize;
-    let row_mask: Option<Vec<bool>> = if let Some(expr) = filter {
+    let mut row_mask: Option<Vec<bool>> = if let Some(expr) = filter {
         let schema = obs.schema();
         let pred = scx_engine::parse_predicate(expr, &schema, "obs")?;
         let bool_arr = scx_engine::evaluate(&pred, &obs)?;
@@ -547,6 +547,28 @@ fn extract_modality(
     } else {
         None
     };
+
+    // Intersect the deletion keep mask, never substitute for it: a subset is
+    // building a new row space, so deletions are applied here rather than
+    // carried, and a logically deleted cell must not come back just because it
+    // matched `--filter`. This path assembles from the physical readers instead
+    // of going through the query engine, so — unlike the single-modality subset
+    // — nothing else applies the mask for it.
+    if let Some(keep) = reader.deletion_keep_mask()? {
+        match &mut row_mask {
+            Some(mask) => {
+                for (slot, &live) in mask.iter_mut().zip(keep.iter()) {
+                    *slot &= live;
+                }
+            }
+            None => row_mask = Some(keep),
+        }
+    }
+
+    // A deletion-bearing input is not a pure extract even without `--filter`:
+    // rows are being dropped, so the run should say so and record itself as a
+    // `subset` rather than a `modality_extract`.
+    let is_pure_extract = is_pure_extract && row_mask.is_none();
 
     // Parse the optional gene list (resolved against the modality var).
     let var = reader.read_var_for(modality_id)?;
@@ -1603,6 +1625,57 @@ mod tests {
             prov.operations.iter().any(|e| e.action == "subset"),
             "filter path must record a `subset` provenance action"
         );
+    }
+
+    /// `subset --modality` builds a new row space out of the *physical*
+    /// readers, so nothing else applies the deletion mask for it — unlike the
+    /// single-modality subset, which goes through the query engine.
+    ///
+    /// Both arms matter: without `--filter` the deletion mask is the only row
+    /// mask there is, and with `--filter` it has to be intersected rather than
+    /// replaced, or a deleted cell comes back the moment it matches a predicate.
+    #[test]
+    fn subset_modality_applies_deletions() {
+        for filter in [None, Some("cell_type != 'NK cell'")] {
+            let dir = tempfile::tempdir().unwrap();
+            let input = write_multimodal_test_file(&dir, None, None);
+            // sample_obs cycles T/B/NK over the 3 cells; delete the T cell,
+            // which is one of the two the filter arm matches.
+            scx_ops::mark_deleted(&input, &[0]).unwrap();
+
+            let output = dir.path().join("subset_dv.scx");
+            run_subset(
+                &input,
+                Some(output.as_path()),
+                filter,
+                None,
+                Some("rna"),
+                false,
+                10000,
+                "none",
+                false,
+                5000,
+                "4G",
+                &no_index(),
+            )
+            .unwrap();
+
+            let reader = ScxReader::open(&output).unwrap();
+            let expected = if filter.is_some() { 1 } else { 2 };
+            assert_eq!(
+                reader.header().n_obs,
+                expected,
+                "filter={filter:?}: the deleted cell must not be in the subset"
+            );
+            assert_eq!(reader.read_obs().unwrap().num_rows(), expected as usize);
+            assert_eq!(
+                reader.read_all_csr_shards().unwrap().shape.0,
+                expected as usize,
+                "filter={filter:?}: X and obs must drop the same rows"
+            );
+            // Deletions were applied, so the output carries none of its own.
+            assert!(!reader.header().has_deletion_vectors());
+        }
     }
 
     /// Phase 6: `scx subset --modality NAME --genes ...` extracts the
