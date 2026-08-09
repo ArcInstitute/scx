@@ -230,13 +230,18 @@ def test_chained_predicates(query_adata, scx_from_adata):
 
 
 def test_invalid_column_raises_valueerror(query_adata, scx_from_adata):
-    """Invalid column name raises ValueError (not RuntimeError)."""
+    """Invalid column name raises ValueError (not RuntimeError).
+
+    The assertion is deliberately narrow: an over-broad
+    `(ValueError, RuntimeError)` here is what hid the pipeline-poisoning bug
+    below, because the RuntimeError the *second* call raised looked acceptable.
+    """
     import pyscx
 
     path = scx_from_adata(query_adata, "query.scx")
     p = pyscx.open(path).query()
 
-    with pytest.raises((ValueError, RuntimeError)):
+    with pytest.raises(ValueError):
         p.filter_obs("nonexistent_col == 'foo'")
 
 
@@ -288,3 +293,150 @@ def test_sequential_call_syntax(query_adata, scx_from_adata):
     result = p.collect()
 
     assert result.n_obs == 40
+
+
+# ───────────────────────────────────────────────────────────────────────
+# A failed builder step must not poison the pipeline
+#
+# Regression: each builder used to move the pipeline into the engine's
+# consuming builder, which drops it on Err. A failed step therefore left the
+# Python object permanently empty, and the *next* call raised
+# "Pipeline already consumed by collect()" — blaming an operation that never
+# ran. Builders now mutate in place, so an error changes nothing.
+# ───────────────────────────────────────────────────────────────────────
+
+
+def test_filter_obs_parse_error_leaves_pipeline_usable(query_adata, scx_from_adata):
+    """A predicate typo raises, and the pipeline is still usable afterwards."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "query.scx")
+    p = pyscx.open(path).query()
+
+    with pytest.raises(ValueError):
+        p.filter_obs("cell_type ==== 'T cell'")
+
+    # Same object, corrected predicate — and the rejected one did not
+    # half-apply (40 T cells, not 0).
+    p.filter_obs("cell_type == 'T cell'")
+    assert p.count() == 40
+    assert p.collect().n_obs == 40
+
+
+def test_filter_obs_schema_error_leaves_pipeline_usable(query_adata, scx_from_adata):
+    """An unknown obs column raises ValueError; the pipeline survives."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "query.scx")
+    p = pyscx.open(path).query()
+
+    with pytest.raises(ValueError):
+        p.filter_obs("nonexistent_col == 'foo'")
+
+    p.filter_obs("tissue == 'lung'")
+    assert p.collect().n_obs == 60
+
+
+def test_filter_var_error_leaves_pipeline_usable(query_adata, scx_from_adata):
+    """An unknown var column raises ValueError; the pipeline survives."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "query.scx")
+    p = pyscx.open(path).query()
+
+    with pytest.raises(ValueError):
+        p.filter_var("nonexistent_col == 1")
+
+    p.filter_obs("cell_type == 'B cell'")
+    assert p.collect().n_obs == 40
+
+
+def test_select_genes_unknown_name_leaves_pipeline_usable(query_adata, scx_from_adata):
+    """An unknown gene name raises KeyError; the pipeline survives.
+
+    This branch used to restore the pipeline by hand while its siblings did
+    not; pin the behaviour now that the restore is gone (nothing is taken out
+    in the first place).
+    """
+    import pyscx
+
+    path = scx_from_adata(query_adata, "query.scx")
+    p = pyscx.open(path).query()
+
+    with pytest.raises(KeyError):
+        p.select_genes(["not_a_gene"])
+
+    p.select_genes([0, 1, 2])
+    assert p.collect().n_vars == 3
+
+
+def test_select_genes_bad_selector_leaves_pipeline_usable(query_adata, scx_from_adata):
+    """Selectors rejected before the engine is reached also leave it usable."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "query.scx")
+    p = pyscx.open(path).query()
+
+    with pytest.raises((ValueError, TypeError)):
+        p.select_genes([object()])
+    with pytest.raises((ValueError, OverflowError)):
+        p.select_genes([-1])
+
+    p.select_genes(["gene_5", 2])
+    assert p.collect().n_vars == 2
+
+
+def test_failed_collect_does_not_consume_pipeline(query_adata, scx_from_adata):
+    """A failed collect() leaves the pipeline usable so the caller can retry.
+
+    Out-of-range gene indices are documented as "handled at collect time", so
+    they fail inside the engine rather than in the builder — the reachable way
+    to make collect() fail without an I/O fault.
+
+    `BaseException` rather than `Exception` because an out-of-range index
+    currently surfaces as a `pyo3_runtime.PanicException` from arrow's `take`
+    (an unchecked index, separate pre-existing defect — `select_genes` should
+    reject it or the projection should return an error). What is asserted here
+    is only the property this test exists for: whatever collect() raises, it
+    does not take the pipeline with it.
+    """
+    import pyscx
+
+    path = scx_from_adata(query_adata, "query.scx")
+    p = pyscx.open(path).query()
+    p.select_genes([10**6])
+
+    with pytest.raises(BaseException):  # noqa: B017,PT011 — see docstring
+        p.collect()
+
+    # Alive: the borrowing collect never took the pipeline.
+    assert p.count() == 120
+    p.select_genes([0, 1])  # overwrite the bad selection
+    assert p.collect().n_vars == 2
+
+
+def test_collect_consumes_pipeline_on_success(query_adata, scx_from_adata):
+    """The contract we keep: a *successful* collect() consumes the pipeline,
+    and every later call says so — accurately, now that nothing else can empty
+    it."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "query.scx")
+    p = pyscx.open(path).query()
+    p.filter_obs("cell_type == 'T cell'")
+    assert p.collect().n_obs == 40
+    assert repr(p) == "PyQueryPipeline(consumed)"
+
+    for call in (
+        lambda: p.filter_obs("tissue == 'lung'"),
+        lambda: p.filter_var("gene_id == 'gene_1'"),
+        lambda: p.select_genes([0]),
+        lambda: p.with_normalize(),
+        lambda: p.with_log1p(),
+        lambda: p.limit(5),
+        lambda: p.count(),
+        lambda: p.exists(),
+        lambda: p.collect(),
+    ):
+        with pytest.raises(RuntimeError, match="consumed by a successful collect"):
+            call()
