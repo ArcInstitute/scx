@@ -199,8 +199,15 @@ impl RQueryPipeline {
     /// Returns `Robj` and throws via `throw_on_err` (see `filter_obs`).
     fn collect(&mut self) -> Robj {
         crate::util::throw_on_err((|| -> Result<RQueryResult> {
-            let p = self.take_inner()?;
-            let result = p.collect().map_err(|e| Error::Other(e.to_string()))?;
+            // Run on a borrow, like pyscx: a failed execution (engine error,
+            // out-of-range gene index) must leave the pipeline usable so the
+            // caller can correct the offending step and re-collect. Only a
+            // successful collect consumes it.
+            let result = {
+                let p = self.inner_ref()?;
+                p.collect_ref().map_err(|e| Error::Other(e.to_string()))?
+            };
+            self.inner = None;
             Ok(RQueryResult::from_result(result))
         })())
     }
