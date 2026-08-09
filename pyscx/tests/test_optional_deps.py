@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import contextlib
 import re
+import subprocess
 import sys
+import textwrap
 import tomllib
 import warnings
 from pathlib import Path
@@ -511,34 +513,147 @@ def test_an_explicit_nb_glm_stratify_by_error_does_not_blame_the_default(adata):
     assert "default" not in str(excinfo.value)
 
 
-def test_the_default_flip_warns_only_where_results_would_change(adata):
-    """pydeseq2 installed → the numbers move under you, so say so once.
-    pydeseq2 absent → there is nothing to warn about; the call simply works."""
+@pytest.mark.parametrize(
+    "arm,expect_warning",
+    [
+        ("default", True),
+        ("explicit_nb_glm", False),
+        ("pydeseq2_blocked", False),
+    ],
+)
+def test_the_default_flip_warns_only_where_results_would_change(arm, expect_warning):
+    """pydeseq2 installed → the numbers move under you, so say so.
+    Explicitly asking for nb_glm, or not having pydeseq2 at all → nothing to say.
+
+    One subprocess per arm, and that is load-bearing rather than tidiness: the
+    warning is latched per process, so an in-process version of this test passes
+    or fails on which other test ran first.
+    """
     pytest.importorskip("pydeseq2")
-    common = dict(
-        groupby=["cond", "donor"],
-        test_col="cond",
-        reference="ctrl",
-        min_cells_per_group=1,
+    # Two substitution points, both at a known column: a top-level prelude and a
+    # single call expression indented into the `with` block.
+    _BLOCK_PYDESEQ2 = textwrap.dedent(
+        """
+        import sys
+        class _NoPydeseq2:
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] == "pydeseq2":
+                    raise ModuleNotFoundError("no pydeseq2", name=name)
+                return None
+        for _k in [m for m in sys.modules if m.split(".")[0] == "pydeseq2"]:
+            del sys.modules[_k]
+        sys.meta_path.insert(0, _NoPydeseq2())
+        """
+    ).strip()
+    prelude, call = {
+        "default": ("", "pyscx.accel.pseudobulk_dex(mk(), **common)"),
+        "explicit_nb_glm": (
+            "",
+            'pyscx.accel.pseudobulk_dex(mk(), backend="nb_glm", **common)',
+        ),
+        "pydeseq2_blocked": (
+            _BLOCK_PYDESEQ2,
+            "pyscx.accel.pseudobulk_dex(mk(), **common)",
+        ),
+    }[arm]
+    script = (
+        textwrap.dedent(
+            """
+            import warnings
+            import numpy as np, scipy.sparse as sp, anndata as ad, pyscx
+            rng = np.random.default_rng(0)
+            def mk():
+                a = ad.AnnData(sp.csr_matrix(rng.poisson(2.0, size=(60, 20)).astype(np.float32)))
+                a.obs["cond"] = ["ctrl"] * 30 + ["trt"] * 30
+                a.obs["donor"] = [f"d{i % 3}" for i in range(60)]
+                return a
+            common = dict(groupby=["cond", "donor"], test_col="cond",
+                          reference="ctrl", min_cells_per_group=1)
+            """
+        )
+        + prelude
+        + "\nwith warnings.catch_warnings(record=True) as caught:\n"
+        + "    warnings.simplefilter('always')\n"
+        + f"    {call}\n"
+        + 'hits = [w for w in caught if "defaults to backend" in str(w.message)]\n'
+        + 'print(f"WARNED={bool(hits)}")\n'
     )
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        pyscx.accel.pseudobulk_dex(adata.copy(), **common)
-    assert [w for w in caught if "nb_glm" in str(w.message)], "no transition warning"
+    out = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=300
+    )
+    assert out.returncode == 0, out.stderr[-1500:]
+    assert f"WARNED={expect_warning}" in out.stdout, out.stdout
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        pyscx.accel.pseudobulk_dex(adata.copy(), backend="nb_glm", **common)
-    assert not [w for w in caught if "nb_glm" in str(w.message)], (
-        "an explicit backend=nb_glm should not warn"
-    )
 
-    with blocked("pydeseq2"), warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        pyscx.accel.pseudobulk_dex(adata.copy(), **common)
-    assert not [w for w in caught if "nb_glm" in str(w.message)], (
-        "warned on a machine that could not have used pydeseq2 anyway"
+def test_the_transition_warning_cannot_fail_the_call(adata):
+    """`warnings.warn` *raises* under `-W error`, which pytest configs and CI
+    setups commonly set. A courtesy notice about a changed default must not be
+    able to abort the caller's DE run — so every step of the warn path is
+    ignored on failure rather than `?`-propagated.
+
+    Run in a subprocess because `-W error` has to be in force at interpreter
+    level for `simplefilter("error")` to reproduce the original failure faithfully.
+    """
+    script = textwrap.dedent(
+        """
+        import warnings
+        warnings.simplefilter("error")
+        import numpy as np, scipy.sparse as sp, anndata as ad, pyscx
+        rng = np.random.default_rng(0)
+        a = ad.AnnData(sp.csr_matrix(rng.poisson(2.0, size=(60, 20)).astype(np.float32)))
+        a.obs["cond"] = ["ctrl"] * 30 + ["trt"] * 30
+        a.obs["donor"] = [f"d{i % 3}" for i in range(60)]
+        df = pyscx.accel.pseudobulk_dex(
+            a, groupby=["cond", "donor"], test_col="cond",
+            reference="ctrl", min_cells_per_group=1,
+        )
+        assert len(df) > 0
+        print("OK")
+        """
     )
+    out = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=300
+    )
+    assert out.returncode == 0, (
+        f"pseudobulk_dex failed under warnings-as-errors:\n{out.stderr[-1500:]}"
+    )
+    assert "OK" in out.stdout
+
+
+def test_the_transition_warning_fires_at_most_once_per_process(adata):
+    """The docstring says "once per process", so it has to be a latch.
+
+    Python's own dedup keys on the caller's module and line, and this very test
+    sets `simplefilter("always")` — under which the warnings machinery alone
+    would emit on every call.
+    """
+    pytest.importorskip("pydeseq2")
+    script = textwrap.dedent(
+        """
+        import warnings
+        import numpy as np, scipy.sparse as sp, anndata as ad, pyscx
+        rng = np.random.default_rng(0)
+        def mk():
+            a = ad.AnnData(sp.csr_matrix(rng.poisson(2.0, size=(60, 20)).astype(np.float32)))
+            a.obs["cond"] = ["ctrl"] * 30 + ["trt"] * 30
+            a.obs["donor"] = [f"d{i % 3}" for i in range(60)]
+            return a
+        common = dict(groupby=["cond", "donor"], test_col="cond",
+                      reference="ctrl", min_cells_per_group=1)
+        seen = 0
+        for _ in range(3):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                pyscx.accel.pseudobulk_dex(mk(), **common)
+            seen += len([w for w in caught if "defaults to backend" in str(w.message)])
+        print(f"COUNT={seen}")
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=300
+    )
+    assert out.returncode == 0, out.stderr[-1500:]
+    assert "COUNT=1" in out.stdout, f"expected exactly one warning, got: {out.stdout!r}"
 
 
 def test_the_csc_layout_is_visible_under_the_default_backend(tmp_path):

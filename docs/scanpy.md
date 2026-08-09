@@ -2666,7 +2666,7 @@ print(result.sort_values("padj").head(20))
 | `design` | `"~ test_col"` | DESeq2 design formula (auto-generated if not specified) |
 | `aggr_method` | `"sum"` | Aggregation method: `"sum"` or `"mean"`. `"mean"` requires `backend="pydeseq2"` — the negative-binomial count model is defined on summed replicate counts |
 | `min_cells_per_group` | 10 | Groups with fewer cells are excluded |
-| `backend` | `"nb_glm"` | DE engine: `"nb_glm"` (Rust-native NB-GLM, no optional dependency — see [§ NB-GLM backend](#nb-glm-backend-rust-native-pseudobulk-de)) or `"pydeseq2"` (exact DESeq2 numerics; needs `pip install 'pyscx[pydeseq2]'`). Both emit the same column schema. Defaulted to `"pydeseq2"` through v0.12. |
+| `backend` | `None` → `"nb_glm"` | DE engine: `"nb_glm"` (Rust-native NB-GLM, no optional dependency — see [§ NB-GLM backend](#nb-glm-backend-rust-native-pseudobulk-de)) or `"pydeseq2"` (exact DESeq2 numerics; needs `pip install 'pyscx[pydeseq2]'`). Both emit the same column schema. Defaulted to `"pydeseq2"` through v0.12. |
 
 ### Stratified Differential Expression
 

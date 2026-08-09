@@ -42,7 +42,18 @@ fn pydeseq2_way_back(explicit: bool) -> &'static str {
     }
 }
 
-/// Warn, once per session, that a default-backend call would previously have run
+/// Set once the transition warning below has been emitted, so "once per
+/// process" is a latch rather than a hope.
+///
+/// Python's own dedup keys on the *caller's* module and line, and `warnings`
+/// filters are user-controlled (`simplefilter("always")` in notebooks and in
+/// this project's own tests), so leaving it to the warnings machinery would make
+/// a call in a loop warn on every iteration. Mirrors `NO_RAPIDS_WARNED` in
+/// `rapids.rs`.
+static DEFAULT_BACKEND_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Warn, once per process, that a default-backend call would previously have run
 /// pydeseq2 and now runs NB-GLM.
 ///
 /// Deliberately gated on pydeseq2 being **importable**: that is exactly the set
@@ -52,35 +63,46 @@ fn pydeseq2_way_back(explicit: bool) -> &'static str {
 ///
 /// `find_spec` rather than a real import: importing pydeseq2 costs seconds and
 /// pulls in statsmodels, which would be an absurd price for a warning check.
-fn warn_default_backend_changed(py: Python<'_>) -> PyResult<()> {
-    // Both the import and the probe are fallible-but-ignored. `find_spec` can
-    // raise (a missing parent package, a module whose `__spec__` is None, a
-    // custom meta-path finder), and while `importlib.util` is stdlib, a `?` here
-    // would contradict the whole point of this function: a courtesy warning must
-    // never be able to fail a DE run. Treat "cannot tell" as "not available".
+///
+/// **Infallible by construction, and that is the contract, not an oversight.**
+/// Returns `()`, so there is no `?` to add later. `warnings.warn` *raises* under
+/// `-W error` / `simplefilter("error")` — a common pytest and CI setting — so a
+/// `?` anywhere on this path makes a courtesy notice about a default change
+/// abort the caller's DE run. Every step is therefore ignored on failure.
+fn warn_default_backend_changed(py: Python<'_>) {
+    if DEFAULT_BACKEND_WARNED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    // `find_spec` can itself raise (a missing parent package, a module whose
+    // `__spec__` is None, a custom meta-path finder). Treat "cannot tell" as
+    // "not available" and stay quiet.
     let available = py
         .import("importlib.util")
         .and_then(|m| m.call_method1("find_spec", ("pydeseq2",)))
         .map(|spec| !spec.is_none())
         .unwrap_or(false);
     if !available {
-        return Ok(());
+        // Deliberately not latched: a caller can install pydeseq2 and re-run in
+        // the same process (a notebook), and they should still hear about it.
+        return;
     }
-    let warnings = py.import("warnings")?;
-    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
-    warnings.call_method1(
-        "warn",
-        (
-            "pseudobulk_dex() now defaults to backend=\"nb_glm\" (the Rust-native \
-             negative-binomial GLM); it defaulted to \"pydeseq2\" through v0.12. \
-             NB-GLM is DESeq2-*style*, not DESeq2-identical, and applies Cook's / \
-             independent filtering by default, so padj can be NaN for outlier and \
-             low-base-mean genes. Pass backend=\"pydeseq2\" to keep the previous \
-             numerics, or backend=\"nb_glm\" to silence this.",
-            user_warning,
-        ),
-    )?;
-    Ok(())
+    if DEFAULT_BACKEND_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(warnings) = py.import("warnings") {
+        let _ = warnings.call_method1(
+            "warn",
+            (
+                "pseudobulk_dex() now defaults to backend=\"nb_glm\" (the Rust-native \
+                 negative-binomial GLM); it defaulted to \"pydeseq2\" through v0.12. \
+                 NB-GLM is DESeq2-*style*, not DESeq2-identical, and applies Cook's / \
+                 independent filtering by default, so padj can be NaN for outlier and \
+                 low-base-mean genes. Pass backend=\"pydeseq2\" to keep the previous \
+                 numerics, or backend=\"nb_glm\" to silence this.",
+                py.get_type::<pyo3::exceptions::PyUserWarning>(),
+            ),
+        );
+    }
 }
 
 /// Resolve a safe worker cap for pydeseq2's loky inference backend.
@@ -624,7 +646,7 @@ pub fn pseudobulk_dex(
         )));
     }
     if backend == "nb_glm" && !backend_was_explicit {
-        warn_default_backend_changed(py)?;
+        warn_default_backend_changed(py);
     }
 
     // Record the planned route on adata.uns["scx_accel"]["pseudobulk_dex"].

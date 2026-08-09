@@ -265,6 +265,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # `[tool.maturin] features` includes `hdf5`, which links dynamically
+      # against libhdf5 — same reason the `python` and `feature-check` jobs
+      # install this. Building without it fails in `hdf5-metno-sys`'s build
+      # script ("Unable to locate HDF5 root directory and/or headers"), which is
+      # invisible on a dev box that already has the headers.
+      - name: Install hdf5 dev headers
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
       - name: Build the wheel
         run: |
           python -m venv .build-venv
