@@ -55,9 +55,10 @@ correct answers, and the column above records which each op has:
 
 - **Carried.** The op preserves the global obs row space 1:1, so it copies the
   deletion-vector section through unchanged. The output still has every physical
-  row; `query()`, `to_anndata()`, `scx info` and the R/Python readers all still
-  report the smaller live count. Nothing is lost, and `compact` can still reclaim
-  the space later.
+  row, and `query()`, `to_anndata()` and the R/Python readers all still report
+  the smaller live count. (`scx info` is the exception: its header line reports
+  the *physical* `n_obs`, with the deletions on a separate "Deletion vectors:"
+  line.) Nothing is lost, and `compact` can still reclaim the space later.
 - **Applied.** The op is building a new row space anyway (`compact`, `sort`,
   `subset`), so the deleted rows are dropped and the output carries no deletion
   vector. `n_obs` shrinks. The deleted cells are gone for good.

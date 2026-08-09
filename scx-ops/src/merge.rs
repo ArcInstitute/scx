@@ -898,7 +898,10 @@ fn remap_deletion_vectors(
     let sorted_map: Option<Vec<Vec<u64>>> = match order {
         None => None,
         Some(order) => {
-            let mut cursors = vec![0usize; readers.len()];
+            // The per-input cursor is implicit: each input is consumed in
+            // strict row order, so pushing onto `map[input]` puts output row
+            // `out_row` at exactly that input's next row index. `map[i][row]`
+            // is therefore the output row of input `i`'s row `row`.
             let mut map: Vec<Vec<u64>> = readers
                 .iter()
                 .map(|r| Vec::with_capacity(r.n_obs() as usize))
@@ -912,7 +915,6 @@ fn remap_deletion_vectors(
                     ))
                 })?;
                 slot.push(out_row as u64);
-                cursors[input] += 1;
             }
             Some(map)
         }

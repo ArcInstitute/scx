@@ -483,12 +483,16 @@ pub(crate) fn write_csr_shards_auto(
 /// Extract a single modality from a multimodal SCX file into a new
 /// single-modality v2 file, optionally applying a row predicate and/or
 /// gene projection in the same pass. Cells (obs) are global across
-/// modalities, so without a filter the output's obs matches the input's.
+/// modalities, so on an input with no deletions and no filter the output's
+/// obs matches the input's.
 ///
-/// With neither `--filter` nor `--genes` this is a pure modality
-/// extraction and records a `modality_extract` provenance action; with
-/// either, it applies the row mask / gene projection and records a
-/// `subset` action with the predicate and gene parameters.
+/// **Deletions are applied**, not carried: a subset materialises a new row
+/// space, so logically deleted cells are dropped, intersected with `--filter`
+/// rather than substituted for it. A deletion-bearing input therefore is *not*
+/// a pure extraction even without `--filter` — it records a `subset`
+/// provenance action, because rows are in fact being removed. With neither
+/// `--filter`, `--genes`, nor deletions this is a pure modality extraction and
+/// records `modality_extract`.
 #[allow(clippy::too_many_arguments)]
 fn extract_modality(
     input: &Path,
@@ -554,7 +558,14 @@ fn extract_modality(
     // matched `--filter`. This path assembles from the physical readers instead
     // of going through the query engine, so — unlike the single-modality subset
     // — nothing else applies the mask for it.
-    if let Some(keep) = reader.deletion_keep_mask()? {
+    // `_for(modality_id)`, not the global mask: the v2 format defines a
+    // modality's live rows as `global(0) || scoped(modality_id)`, and merge
+    // already remaps every bitmap rather than just the global one. No shipped
+    // writer emits scoped deletions yet, so today the two are equal — which is
+    // precisely why the call should name the modality now, while the surface is
+    // being written, rather than becoming a resurrection bug the day scoped
+    // deletion is exposed.
+    if let Some(keep) = reader.deletion_keep_mask_for(modality_id)? {
         // Both masks are sized from the same `n_obs`, so a mismatch is
         // impossible on a well-formed file — which is exactly why it must not
         // be a silent `zip`. A short `keep` would leave the tail of the filter
