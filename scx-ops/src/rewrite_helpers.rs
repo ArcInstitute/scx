@@ -159,8 +159,20 @@ pub(crate) fn build_raw_copied_csr_section(
     Ok((section_data, stats))
 }
 
-/// Copy all auxiliary sections (layers, obsm, uns, predicate indices) from
-/// reader to writer, then append a new provenance entry.
+/// Copy all auxiliary sections (layers, obsm, uns, predicate indices, deletion
+/// vectors) from reader to writer, then append a new provenance entry.
+///
+/// **Only valid for a rewrite that preserves the global obs row space 1:1** —
+/// its two callers, `build_csc` and `scx upgrade`, both do. The deletion-vector
+/// carry below is what makes that a requirement: v2 vectors store global obs row
+/// indices, so they stay valid exactly as long as the row order does. An op that
+/// drops or reorders rows must apply the mask instead (see `compact` / `sort`).
+///
+/// Still **not** carried by this helper, and therefore dropped by both callers:
+/// detection bitmaps, `varm`/`obsp`/`varp`, `adata.raw`, and the grouped-sort
+/// group index. The list is an allowlist, so a section type added to the format
+/// is dropped here silently until someone adds it — that is the shape of the
+/// bug this carry was written to fix.
 pub fn copy_auxiliary_sections(
     reader: &ScxReader,
     writer: &mut ScxWriter,
@@ -171,7 +183,26 @@ pub fn copy_auxiliary_sections(
     copy_obsm(reader, writer)?;
     copy_uns(reader, writer)?;
     copy_predicate_indices(reader, writer)?;
+    copy_deletion_vectors(reader, writer)?;
     append_provenance(reader, writer, action, params_json)?;
+    Ok(())
+}
+
+/// Carry the deletion-vector section through a 1:1 rewrite.
+///
+/// Without this the rows come back. The output header is built by copying the
+/// input's flags, so the `has_deletion_vectors` bit looks preserved — but
+/// `FileHeader::sync_from_catalog` re-derives every flag from the sections that
+/// were actually written, finds no deletion-vector section, and clears it. The
+/// result is a file that has silently forgotten which cells were deleted, with
+/// no dangling flag to notice it by.
+fn copy_deletion_vectors(
+    reader: &ScxReader,
+    writer: &mut ScxWriter,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(dv) = reader.read_deletion_vectors()? {
+        writer.write_deletion_vectors(&dv)?;
+    }
     Ok(())
 }
 

@@ -123,6 +123,24 @@ fn write_preprocess_provenance(
     Ok(())
 }
 
+/// Carry the deletion-vector section into a preprocessed output.
+///
+/// Both streaming rewrites re-emit every shard at the source's `row_start` and
+/// change only the *values*, so the global obs row indices a v2 deletion vector
+/// stores stay valid verbatim — the same 1:1 argument `scx optimize` makes.
+/// Without this the deleted cells come back: `build_output_header` starts from
+/// `..Default::default()`, so the flag is not inherited, and no section is
+/// written for `sync_from_catalog` to re-derive it from.
+fn carry_deletion_vectors(
+    reader: &scx_format_io::ScxReader,
+    writer: &mut scx_format_io::ScxWriter,
+) -> crate::Result<()> {
+    if let Some(dv) = reader.read_deletion_vectors()? {
+        writer.write_deletion_vectors(&dv)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Public streaming pipelines
 // ---------------------------------------------------------------------------
@@ -133,9 +151,11 @@ fn write_preprocess_provenance(
 /// normalize+log1p operations, and writes the result to a new SCX file.
 ///
 /// **Preserved sections:** `obs`, `var`, `obsm`, and `uns` are copied from the
-/// source; a fresh provenance entry is added. **Not preserved:** `adata.raw`,
-/// layers, CSC sidecars, `varm`/`obsp`/`varp`, predicate indexes, detection
-/// bitmaps, and deletion vectors are *not* carried over. Inputs carrying
+/// source, and the deletion-vector section is carried through unchanged (the
+/// rewrite is 1:1 in obs row space, so its global row indices stay valid); a
+/// fresh provenance entry is added. **Not preserved:** `adata.raw`,
+/// layers, CSC sidecars, `varm`/`obsp`/`varp`, predicate indexes and detection
+/// bitmaps are *not* carried over. Inputs carrying
 /// `adata.raw`, and multimodal inputs, are rejected (see SCX-002) rather than
 /// silently dropped or corrupted — extract the modality of interest first, or
 /// run the transform before attaching raw.
@@ -273,6 +293,7 @@ pub fn streaming_preprocess(
         "streaming_preprocess",
         &format!("{{\"ops\":\"{ops_desc}\"}}"),
     )?;
+    carry_deletion_vectors(&reader, &mut writer)?;
 
     writer.finish()?;
 
@@ -281,13 +302,14 @@ pub fn streaming_preprocess(
 
 /// Streaming shard-by-shard save-as-layer pipeline.
 ///
-/// Copies `obs`, `var`, the original `X`, `obsm`, and `uns` from the source
-/// SCX file to a new file, then adds the transformed X data as a named layer
-/// (`LayerCsrShard` entries) plus a fresh provenance entry.
+/// Copies `obs`, `var`, the original `X`, `obsm`, `uns` and the deletion-vector
+/// section from the source SCX file to a new file, then adds the transformed X
+/// data as a named layer (`LayerCsrShard` entries) plus a fresh provenance
+/// entry.
 ///
 /// **Not preserved:** pre-existing layers, `adata.raw`, CSC sidecars,
-/// `varm`/`obsp`/`varp`, predicate indexes, detection bitmaps, and deletion
-/// vectors are *not* carried over. Inputs carrying `adata.raw`, and multimodal
+/// `varm`/`obsp`/`varp`, predicate indexes and detection
+/// bitmaps are *not* carried over. Inputs carrying `adata.raw`, and multimodal
 /// inputs, are rejected (see SCX-002) rather than silently dropped or
 /// corrupted.
 ///
@@ -396,6 +418,7 @@ pub fn streaming_save_layer(
         "streaming_save_layer",
         &format!("{{\"layer_name\":\"{layer_name}\"}}"),
     )?;
+    carry_deletion_vectors(&reader, &mut writer)?;
 
     writer.finish()?;
 
@@ -440,6 +463,132 @@ fn encode_f32_values(data: &[f32], encoding: scx_codec::ValueEncoding) -> crate:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 6×4 file with rows 1 and 4 logically deleted.
+    ///
+    /// The deletion vector is written directly rather than via
+    /// `scx_ops::mark_deleted` because `scx-ops` depends on this crate, not the
+    /// other way round. Same approach as `scx-ops`'s
+    /// `optimize_preserves_deletion_vectors`.
+    fn write_deleted_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        use arrow::array::{RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use scx_codec::{CodecId, ValueEncoding};
+        use scx_format_io::deletion_vectors::DeletionVectors;
+        use std::sync::Arc;
+
+        let (n_obs, n_vars) = (6usize, 4usize);
+        let path = dir.path().join("deleted.scx");
+        let header = scx_format_io::header::FileHeader {
+            n_obs: n_obs as u64,
+            n_vars: n_vars as u64,
+            ..Default::default()
+        };
+        let mut writer = scx_format_io::ScxWriter::new(&path, header).unwrap();
+
+        let obs = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "cell_id",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(
+                (0..n_obs).map(|i| format!("cell_{i}")).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        writer.write_obs(&obs).unwrap();
+        let var = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "gene_id",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(
+                (0..n_vars).map(|i| format!("gene_{i}")).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        writer.write_var(&var).unwrap();
+        // Two nnz per row so every row survives normalize_total.
+        let mut indptr = vec![0u64];
+        let (mut indices, mut values) = (Vec::new(), Vec::new());
+        for row in 0..n_obs {
+            indices.push((row % n_vars) as u32);
+            indices.push(((row + 1) % n_vars) as u32);
+            values.push((row + 1) as u8);
+            values.push((row + 2) as u8);
+            indptr.push(indptr.last().unwrap() + 2);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let mut dv = DeletionVectors::new();
+        dv.insert_global([1u32, 4]);
+        writer.write_deletion_vectors(&dv).unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    fn assert_carries_two_deletions(path: &std::path::Path, what: &str) {
+        let out = scx_format_io::ScxReader::open(path).unwrap();
+        assert!(
+            out.header().has_deletion_vectors(),
+            "{what}: deletion-vector flag must survive"
+        );
+        let dv = out
+            .read_deletion_vectors()
+            .unwrap()
+            .unwrap_or_else(|| panic!("{what}: deletion-vector section present"));
+        assert_eq!(dv.total_deleted(), 2, "{what}");
+        assert!(dv.is_deleted_global(1) && dv.is_deleted_global(4), "{what}");
+        // Carried, not applied — the transform is 1:1 in row space.
+        assert_eq!(out.n_obs(), 6, "{what}");
+        assert_eq!(
+            out.read_all_csr_shards_filtered().unwrap().shape.0,
+            4,
+            "{what}: a deletion-aware read sees 6 - 2 rows"
+        );
+    }
+
+    /// `pyscx.preprocess` rewrites values, never the row space — so dropping the
+    /// deletion vector on the way out silently un-deletes cells, and the output
+    /// looks perfectly well-formed while doing it.
+    #[test]
+    fn streaming_preprocess_carries_deletion_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_deleted_fixture(&dir);
+        let out = dir.path().join("pp.scx");
+        let config = PreprocessConfig {
+            normalize_target_sum: Some(1e4),
+            log1p: true,
+        };
+        streaming_preprocess(&src, &out, &config).unwrap();
+        assert_carries_two_deletions(&out, "streaming_preprocess");
+    }
+
+    /// `pyscx.save_layer` keeps the original X byte-for-byte and adds a
+    /// transformed layer beside it, so it is even more obviously 1:1.
+    #[test]
+    fn streaming_save_layer_carries_deletion_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_deleted_fixture(&dir);
+        let out = dir.path().join("layered.scx");
+        let config = PreprocessConfig {
+            normalize_target_sum: Some(1e4),
+            log1p: true,
+        };
+        streaming_save_layer(&src, &out, "normalized", &config).unwrap();
+        assert_carries_two_deletions(&out, "streaming_save_layer");
+    }
 
     /// Helper: create a test CSR matrix.
     ///

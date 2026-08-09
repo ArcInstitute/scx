@@ -12,6 +12,7 @@ ScxExperiment$new <- function(path) {
   self <- new.env(parent = emptyenv())
   self$.ptr <- ptr
   self$n_obs <- function() .Call(wrap__ScxExperiment__n_obs, self$.ptr)
+  self$n_obs_physical <- function() .Call(wrap__ScxExperiment__n_obs_physical, self$.ptr)
   self$n_vars <- function() .Call(wrap__ScxExperiment__n_vars, self$.ptr)
   self$nnz <- function() .Call(wrap__ScxExperiment__nnz, self$.ptr)
   self$shard_count <- function() .Call(wrap__ScxExperiment__shard_count, self$.ptr)

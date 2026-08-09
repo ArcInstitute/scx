@@ -449,7 +449,12 @@ impl PyExperiment {
         Ok((self.logical_n_obs_of(reader), reader.n_vars()))
     }
 
-    /// Total number of non-zero entries.
+    /// Total number of non-zero entries — **physical**, unlike [`Self::n_obs`].
+    ///
+    /// Entries in logically deleted rows are still counted: this comes from the
+    /// per-shard catalog stats, and excluding them would mean decoding the
+    /// matrix. So on a file with deletions this exceeds `to_anndata().X.nnz`;
+    /// `compact` makes the two agree.
     #[getter]
     fn nnz(&self) -> PyResult<u64> {
         Ok(self.reader()?.nnz())

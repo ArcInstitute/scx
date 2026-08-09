@@ -253,3 +253,33 @@ mod tests {
             .contains("NA or NaN"));
     }
 }
+
+/// Refuse to open a backed / lazy handle over a file that carries deletion
+/// vectors.
+///
+/// The backed handles are a *physical* row-space API: `read_rows(start, end)`
+/// and `read_row_indices(idx)` take global row ids and bounds-check them against
+/// the header's `n_obs`. Honouring deletions properly needs a kept→global index
+/// translation on every read (pyscx has one; rscx does not), and filtering only
+/// the whole-matrix `to_dgcmatrix()` would leave two different row spaces inside
+/// one object — a partial fix that reads as a working one.
+///
+/// So this fails loud instead, with the two ways forward. It is a narrow case:
+/// the file must actually have cells marked deleted, and every non-backed rscx
+/// read path applies the mask.
+pub fn reject_backed_on_deletions(reader: &scx_format_io::ScxReader, path: &str) -> Result<()> {
+    let n_deleted = reader
+        .read_deletion_vectors()
+        .map_err(|e| Error::Other(e.to_string()))?
+        .map(|dv| dv.total_deleted())
+        .unwrap_or(0);
+    if n_deleted == 0 {
+        return Ok(());
+    }
+    Err(Error::Other(format!(
+        "'{path}' has {n_deleted} logically deleted cell(s), which backed and lazy \
+         handles cannot yet address (their row indices are physical, so they would \
+         hand back deleted cells). Use scx_open(path)$x_matrix() / scx_query(), which \
+         apply deletions, or run `scx compact` to materialize them away first."
+    )))
+}

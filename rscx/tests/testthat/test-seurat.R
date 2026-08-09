@@ -285,3 +285,20 @@ test_that("from_seurat/from_sce/from_mae raise clean errors (not panics) on bad 
     expect_match(msg, "Unknown codec")
   }
 })
+
+test_that("to_seurat dimensions match the live cell count on a deleted file", {
+  skip_if_no_seurat()
+  path <- skip_if_no_fixture()
+  tmp <- tempfile(fileext = ".scx")
+  on.exit(unlink(tmp), add = TRUE)
+  file.copy(path, tmp)
+  scx_delete(tmp, c(1L, 5L))
+
+  exp <- scx_open(tmp)
+  seu <- exp$to_seurat()
+  # The `ncol(seu) == exp$n_obs()` invariant asserted above has to survive a
+  # deletion: to_seurat() filters the deleted rows out, so n_obs() must too.
+  expect_equal(ncol(seu), exp$n_obs())
+  expect_equal(ncol(seu), 18)
+  expect_equal(nrow(seu), exp$n_vars())
+})

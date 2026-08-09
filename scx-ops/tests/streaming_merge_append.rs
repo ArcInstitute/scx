@@ -2421,6 +2421,54 @@ fn sorted_merge_orders_globally_and_preserves_rows() {
     assert_eq!(read_cell_tags(&r), vec![0, 1, 2, 3, 4, 5]);
 }
 
+/// A sorted merge moves rows by a permutation, not an offset, so the carried
+/// deletion vector has to follow the same permutation.
+///
+/// `read_cell_tags` recovers each output row's source cell, which is what makes
+/// this checkable: the assertion is that the *same cells* are still deleted
+/// after the reorder, not that the same row indices are.
+#[test]
+fn sorted_merge_carries_deletion_vectors_through_the_permutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    let out = dir.path().join("merged.scx");
+    write_sorted_run(&p0, &[("A", 0), ("A", 1), ("C", 4)]);
+    write_sorted_run(&p1, &[("B", 2), ("B", 3), ("D", 5)]);
+
+    // Cell 4 is input 0's last row; cell 2 is input 1's first. Under the global
+    // ct sort they end up at output rows 4 and 2 — neither of which equals the
+    // input row index they came from (2 and 0), so a verbatim copy fails here.
+    scx_ops::mark_deleted(&p0, &[2]).unwrap();
+    scx_ops::mark_deleted(&p1, &[0]).unwrap();
+
+    scx_ops::merge_with_options(
+        &[p0.as_path(), p1.as_path()],
+        &out,
+        &sorted_merge_opts(&["ct"], false, false),
+    )
+    .unwrap();
+
+    let r = ScxReader::open(&out).unwrap();
+    assert_eq!(r.n_obs(), 6, "carried, not applied");
+    let tags = read_cell_tags(&r);
+    assert_eq!(tags, vec![0, 1, 2, 3, 4, 5]);
+
+    let dv = r
+        .read_deletion_vectors()
+        .unwrap()
+        .expect("sorted merge carries a deletion-vector section");
+    let deleted_cells: Vec<u32> = (0..tags.len())
+        .filter(|&row| dv.is_deleted_global(row as u32))
+        .map(|row| tags[row])
+        .collect();
+    assert_eq!(
+        deleted_cells,
+        vec![2, 4],
+        "the same source cells stay deleted across the reorder"
+    );
+}
+
 #[test]
 fn sorted_merge_is_deterministic() {
     let dir = tempfile::tempdir().unwrap();

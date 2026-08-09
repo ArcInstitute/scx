@@ -483,12 +483,16 @@ pub(crate) fn write_csr_shards_auto(
 /// Extract a single modality from a multimodal SCX file into a new
 /// single-modality v2 file, optionally applying a row predicate and/or
 /// gene projection in the same pass. Cells (obs) are global across
-/// modalities, so without a filter the output's obs matches the input's.
+/// modalities, so on an input with no deletions and no filter the output's
+/// obs matches the input's.
 ///
-/// With neither `--filter` nor `--genes` this is a pure modality
-/// extraction and records a `modality_extract` provenance action; with
-/// either, it applies the row mask / gene projection and records a
-/// `subset` action with the predicate and gene parameters.
+/// **Deletions are applied**, not carried: a subset materialises a new row
+/// space, so logically deleted cells are dropped, intersected with `--filter`
+/// rather than substituted for it. A deletion-bearing input therefore is *not*
+/// a pure extraction even without `--filter` — it records a `subset`
+/// provenance action, because rows are in fact being removed. With neither
+/// `--filter`, `--genes`, nor deletions this is a pure modality extraction and
+/// records `modality_extract`.
 #[allow(clippy::too_many_arguments)]
 fn extract_modality(
     input: &Path,
@@ -533,7 +537,7 @@ fn extract_modality(
     // Read the global obs and apply the optional filter.
     let obs = reader.read_obs()?;
     let n_obs_global = reader.header().n_obs as usize;
-    let row_mask: Option<Vec<bool>> = if let Some(expr) = filter {
+    let mut row_mask: Option<Vec<bool>> = if let Some(expr) = filter {
         let schema = obs.schema();
         let pred = scx_engine::parse_predicate(expr, &schema, "obs")?;
         let bool_arr = scx_engine::evaluate(&pred, &obs)?;
@@ -547,6 +551,52 @@ fn extract_modality(
     } else {
         None
     };
+
+    // Intersect the deletion keep mask, never substitute for it: a subset is
+    // building a new row space, so deletions are applied here rather than
+    // carried, and a logically deleted cell must not come back just because it
+    // matched `--filter`. This path assembles from the physical readers instead
+    // of going through the query engine, so — unlike the single-modality subset
+    // — nothing else applies the mask for it.
+    // `_for(modality_id)`, not the global mask: the v2 format defines a
+    // modality's live rows as `global(0) || scoped(modality_id)`, and merge
+    // already remaps every bitmap rather than just the global one. No shipped
+    // writer emits scoped deletions yet, so today the two are equal — which is
+    // precisely why the call should name the modality now, while the surface is
+    // being written, rather than becoming a resurrection bug the day scoped
+    // deletion is exposed.
+    if let Some(keep) = reader.deletion_keep_mask_for(modality_id)? {
+        // Both masks are sized from the same `n_obs`, so a mismatch is
+        // impossible on a well-formed file — which is exactly why it must not
+        // be a silent `zip`. A short `keep` would leave the tail of the filter
+        // mask un-ANDed and resurrect the deleted rows it covers: the failure
+        // this whole change exists to stop, reintroduced by the fix for it.
+        // `filter_batch_by_keep_mask` refuses the same class for the same
+        // reason.
+        if keep.len() != n_obs_global {
+            return Err(format!(
+                "deletion keep mask has {} entries but the file declares n_obs={}; \
+                 refusing to subset '{modality_name}' against a mask that does not \
+                 cover every row",
+                keep.len(),
+                n_obs_global
+            )
+            .into());
+        }
+        match &mut row_mask {
+            Some(mask) => {
+                for (slot, &live) in mask.iter_mut().zip(keep.iter()) {
+                    *slot &= live;
+                }
+            }
+            None => row_mask = Some(keep),
+        }
+    }
+
+    // A deletion-bearing input is not a pure extract even without `--filter`:
+    // rows are being dropped, so the run should say so and record itself as a
+    // `subset` rather than a `modality_extract`.
+    let is_pure_extract = is_pure_extract && row_mask.is_none();
 
     // Parse the optional gene list (resolved against the modality var).
     let var = reader.read_var_for(modality_id)?;
@@ -1603,6 +1653,57 @@ mod tests {
             prov.operations.iter().any(|e| e.action == "subset"),
             "filter path must record a `subset` provenance action"
         );
+    }
+
+    /// `subset --modality` builds a new row space out of the *physical*
+    /// readers, so nothing else applies the deletion mask for it — unlike the
+    /// single-modality subset, which goes through the query engine.
+    ///
+    /// Both arms matter: without `--filter` the deletion mask is the only row
+    /// mask there is, and with `--filter` it has to be intersected rather than
+    /// replaced, or a deleted cell comes back the moment it matches a predicate.
+    #[test]
+    fn subset_modality_applies_deletions() {
+        for filter in [None, Some("cell_type != 'NK cell'")] {
+            let dir = tempfile::tempdir().unwrap();
+            let input = write_multimodal_test_file(&dir, None, None);
+            // sample_obs cycles T/B/NK over the 3 cells; delete the T cell,
+            // which is one of the two the filter arm matches.
+            scx_ops::mark_deleted(&input, &[0]).unwrap();
+
+            let output = dir.path().join("subset_dv.scx");
+            run_subset(
+                &input,
+                Some(output.as_path()),
+                filter,
+                None,
+                Some("rna"),
+                false,
+                10000,
+                "none",
+                false,
+                5000,
+                "4G",
+                &no_index(),
+            )
+            .unwrap();
+
+            let reader = ScxReader::open(&output).unwrap();
+            let expected = if filter.is_some() { 1 } else { 2 };
+            assert_eq!(
+                reader.header().n_obs,
+                expected,
+                "filter={filter:?}: the deleted cell must not be in the subset"
+            );
+            assert_eq!(reader.read_obs().unwrap().num_rows(), expected as usize);
+            assert_eq!(
+                reader.read_all_csr_shards().unwrap().shape.0,
+                expected as usize,
+                "filter={filter:?}: X and obs must drop the same rows"
+            );
+            // Deletions were applied, so the output carries none of its own.
+            assert!(!reader.header().has_deletion_vectors());
+        }
     }
 
     /// Phase 6: `scx subset --modality NAME --genes ...` extracts the

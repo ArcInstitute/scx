@@ -33,6 +33,15 @@ subset <- bsd[c(5, 1, 3), 1:10]
 gene_totals <- bsd$col_sums()  # streamed, no full materialization
 }
 }
+\section{Files with deleted cells}{
+Backed handles address rows by \emph{physical} index and have no
+kept-to-global translation, so opening a file that carries deletion vectors
+(\code{\link{scx_delete}}) would hand back cells that are supposed to be gone.
+Rather than do that silently, this \strong{errors}. Use
+\code{scx_open(path)$x_matrix()} or \code{\link{scx_query}}, which apply
+deletions, or run \code{scx compact} to materialize them away first.
+}
+
 \seealso{
 \code{\link{scx_open}}; the \code{$x_backed()} method on an
 \code{ScxExperiment} is the equivalent accessor for an already-open file.

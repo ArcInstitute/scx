@@ -1977,7 +1977,10 @@ fn test_merge_with_deletion_vectors() {
     // Delete some cells from path1
     scx_ops::mark_deleted(&path1, &[0, 3]).unwrap();
 
-    // Compact path1 first (merge doesn't handle DVs directly — compact resolves them)
+    // Compacting first materializes the deletions away, so the merged output
+    // carries no deletion vector. (Merge also carries deletions through
+    // untouched — see `merge_carries_deletion_vectors_with_row_offsets` — but
+    // this test is about the compact-then-merge composition.)
     let compacted1 = dir.path().join("dvm1_compact.scx");
     scx_ops::compact(&path1, &compacted1).unwrap();
 
@@ -1991,6 +1994,54 @@ fn test_merge_with_deletion_vectors() {
     let csr = reader.read_all_csr_shards().unwrap();
     assert_eq!(csr.shape.0, 8);
     assert_eq!(csr.nnz(), 16); // 8 rows * 2 nnz
+}
+
+/// Merge concatenates row spaces, so a carried deletion vector has to move with
+/// the rows it refers to.
+///
+/// The fixture is built so that forgetting the offset is *visible*: input 2's
+/// deleted row is its row 1, which in the merged file is row 7. A merge that
+/// copied the bitmap verbatim would mark row 1 — a live cell from input 1 —
+/// instead, so this asserts both that row 7 is deleted and that row 1 is not.
+#[test]
+fn merge_carries_deletion_vectors_with_row_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path1 = write_test_file(&dir, "off1.scx", 6, 10, 1);
+    let path2 = write_test_file(&dir, "off2.scx", 4, 10, 1);
+
+    scx_ops::mark_deleted(&path1, &[0, 3]).unwrap();
+    scx_ops::mark_deleted(&path2, &[1]).unwrap();
+
+    let output = dir.path().join("off_merged.scx");
+    scx_ops::merge(&[path1.as_path(), path2.as_path()], &output).unwrap();
+
+    let reader = ScxReader::open(&output).unwrap();
+    // Carried, not applied: all 10 physical rows are present.
+    assert_eq!(reader.n_obs(), 10);
+    assert_eq!(reader.read_all_csr_shards().unwrap().shape.0, 10);
+
+    assert!(reader.header().has_deletion_vectors());
+    let dv = reader
+        .read_deletion_vectors()
+        .unwrap()
+        .expect("merged output carries a deletion-vector section");
+    assert_eq!(dv.total_deleted(), 3);
+    assert!(
+        dv.is_deleted_global(0) && dv.is_deleted_global(3),
+        "input 1"
+    );
+    assert!(
+        dv.is_deleted_global(7),
+        "input 2's row 1 must land at 6 + 1; deletions: {:?}",
+        dv.global_deleted().map(|b| b.iter().collect::<Vec<_>>())
+    );
+    assert!(
+        !dv.is_deleted_global(1),
+        "row 1 is a live cell of input 1 — marking it means the offset was dropped"
+    );
+
+    // And the deletion-aware read agrees: 10 - 3.
+    assert_eq!(reader.read_all_csr_shards_filtered().unwrap().shape.0, 7);
 }
 
 /// Task 7: rollback on fresh file with no previous catalog should error

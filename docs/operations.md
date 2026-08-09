@@ -31,21 +31,62 @@ back.
 > (`pyscx.obs_import(exp, ...)`, `exp.mark_deleted(...)`) reloads it for you.
 > See [docs/api.md § Handles and files that change underneath them](api.md#handles-and-files-that-change-underneath-them).
 
-| Operation | Writes | Matrix shards | Obs metadata | Var metadata | CSC sidecar | Predicate indexes |
-|-----------|--------|---------------|--------------|--------------|-------------|-------------------|
-| **append** | In place (`<TARGET> <SOURCE>`) | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows |
-| **delete** (`mark_deleted`) | In place (`<FILE>`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged |
-| **modify_metadata** / **set_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`); a supplied `obsm` sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | **Carried forward** for the replaced axis — rebuilt over the columns the file already indexed, which also re-derives the per-shard column stats. `--index-obs` / `--index-var` override that axis's column set (`--index-preset` / `--index-auto-threshold` override both); a previously indexed column the new set omits is *reported*, not silently dropped. Untouched when only `uns` / `obsm` / `varm` change — see the note below |
-| **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | Sections **preserved** (rows + shard boundaries unchanged), but like `build-csc` the re-emit does not re-derive the per-shard column stats, so **Level-1** pruning stops firing. See the note below |
-| **merge** | New file (`<OUTPUT>` required) | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **subset** | New file (`<OUTPUT>` required, optional with `--dry-run`) | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **sort** | New file (`<OUTPUT>` required) | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **sort `--shuffle`** | New file (`<OUTPUT>` required) | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them |
-| **build-csc** | In place, or a new file with `<OUTPUT>` | **Re-emitted** (not re-encoded or canonicalized); row-group framing is preserved from the input | **Preserved** | **Preserved** | **Built** (this is the op that creates it) | Sections **copied verbatim** (shard boundaries are unchanged, so their `ShardRange`s stay valid), but the per-shard catalog **column stats are not re-derived** — so **Level-1** shard pruning stops firing. See the note below |
-| **obs-import** / **doublet-import** | In place (`<FILE> <SOURCE>`) | **Unchanged** (never read or rewritten) | Replaced (same `n_obs`, plus the new columns) | **Preserved** | **Preserved** (X untouched) | **Preserved** on a pure column *add*; dropped only when `--overwrite` rewrites an indexed column (`obs_index_would_go_stale` decides). The per-shard catalog column stats are cleared **per rewritten column** — see the note below |
-| **cellbender-import** (`attach_external_layer`) | In place (`<FILE> <CELLBENDER_H5>`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | Same as **obs-import**: preserved on a pure column *add*, dropped when `overwrite` rewrites an indexed obs column, and the column stats cleared per rewritten column |
-| **rollback** | In place (`<FILE>`) | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored |
+| Operation | Writes | Matrix shards | Obs metadata | Var metadata | CSC sidecar | Predicate indexes | Deletion vectors |
+|-----------|--------|---------------|--------------|--------------|-------------|-------------------|-------------------|
+| **append** | In place (`<TARGET> <SOURCE>`) | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows | **Preserved** (deleted rows keep their global indices; appended rows are live) |
+| **delete** (`mark_deleted`) | In place (`<FILE>`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged | **Written** (this is the op that creates them) |
+| **modify_metadata** / **set_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`); a supplied `obsm` sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | **Carried forward** for the replaced axis — rebuilt over the columns the file already indexed, which also re-derives the per-shard column stats. `--index-obs` / `--index-var` override that axis's column set (`--index-preset` / `--index-auto-threshold` override both); a previously indexed column the new set omits is *reported*, not silently dropped. Untouched when only `uns` / `obsm` / `varm` change — see the note below | **Preserved** (X and its row space are untouched) |
+| **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deleted rows are dropped and no vector is emitted. This is the op that materializes deletions |
+| **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | Sections **preserved** (rows + shard boundaries unchanged), but like `build-csc` the re-emit does not re-derive the per-shard column stats, so **Level-1** pruning stops firing. See the note below | **Carried** verbatim (rows are 1:1, so the global row indices stay valid) |
+| **merge** | New file (`<OUTPUT>` required) | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Carried**, with each input's rows offset into the merged row space (a sorted merge follows the merge permutation). Physical rows are all retained — run `compact` to reclaim them |
+| **subset** | New file (`<OUTPUT>` required, optional with `--dry-run`) | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — a subset builds a new row space, so deleted cells are excluded (whether or not `--filter` is given, and intersected with it when it is) |
+| **sort** | New file (`<OUTPUT>` required) | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deletions are materialized away by the reorder |
+| **sort `--shuffle`** | New file (`<OUTPUT>` required) | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them | **Applied** — as for `sort` |
+| **build-csc** | In place, or a new file with `<OUTPUT>` | **Re-emitted** (not re-encoded or canonicalized); row-group framing is preserved from the input | **Preserved** | **Preserved** | **Built** (this is the op that creates it) | Sections **copied verbatim** (shard boundaries are unchanged, so their `ShardRange`s stay valid), but the per-shard catalog **column stats are not re-derived** — so **Level-1** shard pruning stops firing. See the note below | **Carried** verbatim (a 1:1 re-emit; the CSC sidecar is built over the physical rows, which the vector still indexes correctly) |
+| **obs-import** / **doublet-import** | In place (`<FILE> <SOURCE>`) | **Unchanged** (never read or rewritten) | Replaced (same `n_obs`, plus the new columns) | **Preserved** | **Preserved** (X untouched) | **Preserved** on a pure column *add*; dropped only when `--overwrite` rewrites an indexed column (`obs_index_would_go_stale` decides). The per-shard catalog column stats are cleared **per rewritten column** — see the note below | **Preserved** (X untouched) |
+| **cellbender-import** (`attach_external_layer`) | In place (`<FILE> <CELLBENDER_H5>`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | Same as **obs-import**: preserved on a pure column *add*, dropped when `overwrite` rewrites an indexed obs column, and the column stats cleared per rewritten column | **Preserved** (X untouched) |
+| **rollback** | In place (`<FILE>`) | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored | Restored (as of the previous catalog) |
+
+### Deletion vectors: carried vs. applied
+
+`mark_deleted` is a *logical* delete — the rows stay on disk and readers filter
+them out — so every op has to say what it does with them. There are exactly two
+correct answers, and the column above records which each op has:
+
+- **Carried.** The op preserves the global obs row space 1:1, so it copies the
+  deletion-vector section through unchanged. The output still has every physical
+  row, and `query()`, `to_anndata()` and the R/Python readers all still report
+  the smaller live count. (`scx info` is the exception: its header line reports
+  the *physical* `n_obs`, with the deletions on a separate "Deletion vectors:"
+  line.) Nothing is lost, and `compact` can still reclaim the space later.
+- **Applied.** The op is building a new row space anyway (`compact`, `sort`,
+  `subset`), so the deleted rows are dropped and the output carries no deletion
+  vector. `n_obs` shrinks. The deleted cells are gone for good.
+
+Exports to formats with no deletion concept — `scx convert --to h5ad / h5mu /
+mtx` — necessarily apply. So do the materialising reads (`pyscx` `to_anndata`,
+`rscx` `$x_matrix()` / `$obs()` / `to_seurat()`), which is why they agree with
+`query()` on the same file.
+
+Two consequences worth knowing:
+
+- A **carried** deletion is not visible in the header's `n_obs`, which is the
+  *physical* row count. `scx info` reports the vector separately ("Deletion
+  vectors: … N cells deleted"). Both bindings expose the logical count as the
+  default and the physical one under an explicit name: `Experiment.n_obs` /
+  `Experiment.n_obs_physical` in `pyscx`, `$n_obs()` / `$n_obs_physical()` in
+  `rscx`. `nnz` is **physical** on both — it comes from catalog stats, and
+  excluding deleted rows would mean decoding the matrix — so on a file with
+  deletions it exceeds the nnz of what a read returns.
+- Because `build-csc --in-place` writes a wholly new file with no prior catalog,
+  it is **not** rollback-able. It carries deletions rather than applying them
+  precisely so that `mark_deleted` → `build-csc` — the documented way to restore
+  a sidecar a mutating op dropped — cannot irrecoverably un-delete anything.
+
+`rscx`'s backed and lazy handles (`scx_backed_sparse()`, `scx_lazy_transform()`)
+address rows by physical index and have no kept→global translation, so they
+**refuse** to open a file that carries deletions rather than silently handing
+back deleted rows. Use `$x_matrix()` / `scx_query()`, or `scx compact` first.
 
 ### Restoring CSC after a mutating operation
 

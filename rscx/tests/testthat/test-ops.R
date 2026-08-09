@@ -213,3 +213,59 @@ test_that("scx_append rejects a bad codec and a modality on a single-modality fi
   expect_error(scx_append(tmp, path, codec = "bogus"))
   expect_error(scx_append(tmp, path, modality = "rna"), "modality")
 })
+
+# --- Deleted cells must not come back through a read ------
+# rscx exposes scx_delete(), so it has to honour its own deletions: a
+# materialising read that returned them would disagree with scx_query() on the
+# very same file.
+
+test_that("materialising reads exclude logically deleted cells", {
+  path <- skip_if_no_fixture()
+  tmp <- tempfile(fileext = ".scx")
+  on.exit(unlink(tmp), add = TRUE)
+  file.copy(path, tmp)
+
+  exp0 <- scx_open(tmp)
+  n_before <- nrow(exp0$obs())
+  expect_equal(n_before, 20)
+
+  scx_delete(tmp, c(1L, 6L, 11L))
+
+  exp <- scx_open(tmp)
+  # X, obs, the size accessor and the query engine must ALL agree on the live
+  # cell count. $n_obs() is the one that matters most here: a handle reporting
+  # 20 while every read returns 17 is worse than the resurrection bug it
+  # replaced, because it is internally inconsistent rather than uniformly
+  # stale -- a caller sizing a buffer from it gets a plausible wrong answer.
+  expect_equal(nrow(exp$x_matrix()), 17)
+  expect_equal(nrow(exp$obs()), 17)
+  expect_equal(exp$n_obs(), 17)
+  expect_equal(scx_query(exp) |> collect() |> (\(r) r$n_obs())(), 17)
+
+  # The physical count is still reachable, and is what shrinks on compact.
+  expect_equal(exp$n_obs_physical(), 20)
+
+  # nnz stays physical (it comes from catalog stats, not a decode), matching
+  # pyscx's Experiment.nnz. Documented, not a bug -- pinned so a later change
+  # to either side is a deliberate one.
+  expect_equal(exp$nnz(), scx_open(path)$nnz())
+
+  # var is on the other axis and is untouched by a cell deletion.
+  expect_equal(nrow(exp$var()), 10)
+})
+
+test_that("backed and lazy handles refuse a file with deletions", {
+  path <- skip_if_no_fixture()
+  tmp <- tempfile(fileext = ".scx")
+  on.exit(unlink(tmp), add = TRUE)
+  file.copy(path, tmp)
+
+  # Both open fine before any deletion...
+  expect_s3_class(scx_backed_sparse(tmp), "ScxBackedSparse")
+  scx_delete(tmp, c(2L))
+
+  # ...and refuse loudly afterwards rather than handing back deleted rows,
+  # because their row indices are physical and rscx has no kept->global map.
+  expect_error(scx_backed_sparse(tmp), regexp = "logically deleted")
+  expect_error(scx_lazy_transform(tmp), regexp = "logically deleted")
+})

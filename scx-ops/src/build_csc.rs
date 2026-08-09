@@ -207,11 +207,7 @@ pub fn run_build_csc(
         ..Default::default()
     };
 
-    // 10. Read all metadata from input
-    let obs = reader.read_obs()?;
-    let var = reader.read_var()?;
-
-    // 11. Create writer and write metadata
+    // 10. Create writer and write metadata
     pb.set_message("Writing output file...");
     // build-csc does NOT change the CSR data — it only adds the column-major
     // sidecar. Preserve the source data generation (no bump) so the freshly
@@ -223,10 +219,32 @@ pub fn run_build_csc(
     // F5-b: frame the re-written CSR shards and the CSC sidecar (both go through
     // `write_shard_inner`, which consults the writer's framing). No-op when None.
     writer.set_framing(framing);
-    writer.write_obs(&obs)?;
-    writer.write_var(&var)?;
+    // obs/var pass through 1:1, so a row-sharded input must come out row-sharded.
+    // `read_obs()` + `write_obs()` would assemble every `ObsMetadataShard` into
+    // one in-memory batch and emit it as a single legacy section — peak RSS
+    // O(n_obs) (the OOM the sharded layout exists to prevent) and, because
+    // Level-2 row-set pushdown requires sharded obs, a silent loss of predicate
+    // pushdown on exactly the atlas-scale files where it earns its keep. Same
+    // streaming helpers `optimize` uses; `keep_mask = None` because build-csc
+    // never drops rows. Legacy single-section input has no per-shard reader and
+    // falls through to the materialising path, which is what it already was.
+    if reader.obs_metadata_shard_count() > 0 {
+        crate::compact::write_obs_shards_streaming(
+            &reader,
+            &mut writer,
+            None,
+            in_header.n_obs as usize,
+        )?;
+    } else {
+        writer.write_obs(&reader.read_obs()?)?;
+    }
+    if reader.var_metadata_shard_count() > 0 {
+        crate::optimize::write_var_shards_streaming(&reader, &mut writer, in_header.n_vars)?;
+    } else {
+        writer.write_var(&reader.read_var()?)?;
+    }
 
-    // 12. Re-write CSR shards from input (decode + re-encode, per-shard codec)
+    // 11. Re-write CSR shards from input (decode + re-encode, per-shard codec)
     for shard_entry in &csr_entries {
         let sh = reader.read_shard_header(shard_entry)?;
         let ve = ValueEncoding::from_u8(sh.value_encoding)
@@ -362,6 +380,118 @@ mod tests {
 
         writer.finish().unwrap();
         path
+    }
+
+    /// build-csc is documented as preserving obs metadata, and a row-sharded
+    /// layout is part of what "preserved" has to mean.
+    ///
+    /// Collapsing an `ObsMetadataShard` input into one legacy `ObsMetadata`
+    /// section costs peak RSS O(n_obs) — precisely the OOM the sharded layout
+    /// exists to avoid — and destroys the precondition Level-2 row-set pushdown
+    /// depends on, on the atlas files where pushdown matters most.
+    #[test]
+    fn build_csc_preserves_sharded_obs_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("sharded.scx");
+        let (n_obs, n_vars) = (6usize, 4usize);
+        {
+            let mut w = ScxWriter::new(&input, sample_header(n_obs as u64, n_vars as u64)).unwrap();
+            let obs = sample_obs(n_obs);
+            for shard_idx in 0u32..2 {
+                let row_start = shard_idx as usize * 3;
+                let slice = obs.slice(row_start, 3);
+                w.write_obs_shard(shard_idx, row_start as u64, 3, n_obs as u64, &slice)
+                    .unwrap();
+            }
+            w.write_var(&sample_var(n_vars)).unwrap();
+            let mut indptr = vec![0u64];
+            let (mut indices, mut values) = (Vec::new(), Vec::new());
+            for row in 0..n_obs {
+                indices.push(((row * 2) % n_vars) as u32);
+                indices.push(((row * 2 + 1) % n_vars) as u32);
+                values.push(((row + 1) % 256) as u8);
+                values.push(((row + 2) % 256) as u8);
+                indptr.push(indptr.last().unwrap() + 2);
+            }
+            w.write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            w.finish().unwrap();
+        }
+
+        let output = dir.path().join("out.scx");
+        run_build_csc(&input, &output, "4G", false, 5000, None).unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+        assert_eq!(
+            reader.obs_metadata_shard_count(),
+            2,
+            "sharded obs must stay sharded through build-csc"
+        );
+        assert!(
+            !reader
+                .catalog()
+                .entries
+                .iter()
+                .any(|e| e.section_type == scx_format_io::section::SectionType::ObsMetadata),
+            "no collapsed single-section obs may be emitted"
+        );
+        // ...and the content still round-trips.
+        assert_eq!(reader.read_obs().unwrap().num_rows(), n_obs);
+        assert!(reader.header().has_csc());
+    }
+
+    /// build-csc adds a sidecar; it must not un-delete anything on the way.
+    ///
+    /// The in-place form is the dangerous one: it renames a wholly new file
+    /// over the target carrying no prior catalog, so `scx rollback` cannot
+    /// recover a deletion it dropped. And it is the documented way to restore a
+    /// sidecar another op dropped, which puts `mark_deleted` → `build-csc`
+    /// directly on the happy path.
+    #[test]
+    fn build_csc_carries_deletion_vectors() {
+        for in_place in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let input = write_test_input(&dir, 6, 4);
+            crate::mark_deleted(&input, &[1, 4]).unwrap();
+
+            let read_path = if in_place {
+                crate::rebuild_csc::rebuild_csc_inplace(&input, 5000, "4G", None).unwrap();
+                input.clone()
+            } else {
+                let output = dir.path().join("output.scx");
+                run_build_csc(&input, &output, "4G", false, 5000, None).unwrap();
+                output
+            };
+
+            let reader = ScxReader::open(&read_path).unwrap();
+            assert!(
+                reader.header().has_deletion_vectors(),
+                "in_place={in_place}: deletion-vector flag must survive build-csc"
+            );
+            let dv = reader
+                .read_deletion_vectors()
+                .unwrap()
+                .expect("deletion-vector section present after build-csc");
+            assert_eq!(dv.total_deleted(), 2, "in_place={in_place}");
+            assert!(dv.is_deleted_global(1) && dv.is_deleted_global(4));
+
+            // Carried, not applied: build-csc is a 1:1 re-emit, so the physical
+            // rows (and the row-indexed CSC sidecar built over them) stay put.
+            assert_eq!(reader.n_obs(), 6, "in_place={in_place}");
+            assert_eq!(reader.read_obs().unwrap().num_rows(), 6);
+            assert_eq!(
+                reader.read_all_csr_shards_filtered().unwrap().shape.0,
+                4,
+                "in_place={in_place}: a deletion-aware read sees 6 - 2 rows"
+            );
+        }
     }
 
     #[test]

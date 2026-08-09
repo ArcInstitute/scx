@@ -392,7 +392,7 @@ pub fn optimize_with_framing(
 /// compact's [`write_obs_shards_streaming`](crate::compact::write_obs_shards_streaming)
 /// for the var axis; optimize applies no deletions, so (unlike the obs helper)
 /// it takes no `keep_mask` and renumbers output shards over the non-empty inputs.
-fn write_var_shards_streaming(
+pub(crate) fn write_var_shards_streaming(
     reader: &ScxReader,
     writer: &mut ScxWriter,
     n_vars_total: u64,
