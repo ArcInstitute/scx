@@ -2697,7 +2697,9 @@ result = pyscx.accel.rank_genes_groups(
 )
 # Returns DataFrame with both cell_type and tissue columns
 
-# Pseudobulk DE stratified by cell type:
+# Pseudobulk DE stratified by cell type. `stratify_by` is pydeseq2-only —
+# the default NB-GLM backend takes replicates as rows of one design, so it
+# rejects stratification (put the replicate column in `groupby` instead).
 result = pyscx.accel.pseudobulk_dex(
     adata,
     groupby=["perturbation", "donor"],
@@ -2705,6 +2707,7 @@ result = pyscx.accel.pseudobulk_dex(
     reference="control",
     stratify_by=["cell_type"],
     min_cells_per_stratum=50,
+    backend="pydeseq2",                     # required for stratify_by
 )
 # Returns DataFrame with cell_type column added
 ```

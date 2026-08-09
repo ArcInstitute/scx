@@ -66,7 +66,14 @@ class _Blocker:
 
 @contextlib.contextmanager
 def blocked(*names: str):
-    """Make `names` un-importable for the duration of the block."""
+    """Make `names` un-importable for the duration of the block.
+
+    Not thread-safe: it mutates `sys.modules` and `sys.meta_path`, which are
+    interpreter-global. Fine under serial pytest, but these tests must not be
+    run under a threaded runner (`pytest-parallel` and friends) — process-level
+    parallelism such as `pytest-xdist` is fine, since each worker is its own
+    interpreter.
+    """
     blocker = _Blocker(names)
     saved = {k: v for k, v in sys.modules.items() if blocker._blocks(k)}
     for k in saved:
@@ -79,23 +86,30 @@ def blocked(*names: str):
         sys.modules.update(saved)
 
 
+# The blocker self-tests deliberately use a *hard* dependency and the stdlib,
+# never an optional package: they also run in the `base-install` CI job, where
+# scanpy and scikit-misc are absent by design, and "the blocker works" must not
+# depend on the thing it exists to pretend is missing.
+
+
 def test_the_blocker_actually_blocks():
     """The premise of every other test in this file.
 
     Without this, a bug in `blocked` turns the whole module into a suite that
     passes because nothing was ever blocked.
     """
-    with blocked("scanpy"):
+    with blocked("pyarrow"):
         with pytest.raises(ModuleNotFoundError):
-            __import__("scanpy")
-    __import__("scanpy")  # restored
+            __import__("pyarrow")
+    __import__("pyarrow")  # restored
 
 
 def test_the_blocker_is_submodule_precise():
-    with blocked("skmisc.loess"):
-        __import__("skmisc")  # parent still importable
+    with blocked("email.mime"):
+        __import__("email")  # parent still importable
         with pytest.raises(ModuleNotFoundError):
-            __import__("skmisc.loess")
+            __import__("email.mime")
+    __import__("email.mime")  # restored
 
 
 # ---------------------------------------------------------------------------

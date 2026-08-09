@@ -93,6 +93,12 @@ pyscx.accel.pseudobulk_dex(
     test_col="perturbation",
     reference=REFERENCE,
     min_cells_per_group=1,
+    # Pinned. The bug this file guards is pydeseq2-specific (loky /
+    # DefaultInference mutating parent process env), and the default backend
+    # became "nb_glm" in v0.13 — which never touches loky, so an unpinned
+    # call would leave the whole file importorskip-ing pydeseq2 while
+    # testing something that cannot exhibit the bug.
+    backend="pydeseq2",
 )
 
 result = {

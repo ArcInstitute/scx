@@ -246,6 +246,49 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
       - run: . .venv/bin/activate && cd pyscx && maturin develop --features cloud,hdf5 && pytest --ignore=tests/test_scvi_integration.py
 
+  # The `python` job above hand-installs every optional package, so it has never
+  # exercised what `pip install pyscx` actually produces. That gap is exactly how
+  # eight default paths shipped broken with no extra that would fix them.
+  #
+  # `tests/test_optional_deps.py` simulates a base install with a `sys.meta_path`
+  # blocker, which covers the *code* — but a blocker cannot catch a pyproject
+  # typo that ships a wheel whose extras don't resolve, or an extra that pins the
+  # wrong distribution. Only a real wheel in a real empty venv can. Hence this
+  # job installs the built wheel with no extras at all and runs the
+  # `test_base_install_*` subset plus the packaging assertions.
+  base-install:
+    name: Base install (no extras)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build the wheel
+        run: |
+          python -m venv .build-venv
+          . .build-venv/bin/activate
+          pip install maturin
+          cd pyscx && maturin build --release --out ../dist
+      # A separate interpreter with ONLY pyscx's declared hard dependencies —
+      # whatever the wheel itself resolves. Nothing is installed by name here on
+      # purpose: naming a package would recreate the blind spot this job exists
+      # to close.
+      - name: Install into an empty venv and run the base-install suite
+        run: |
+          python -m venv .base-venv
+          . .base-venv/bin/activate
+          pip install dist/*.whl pytest
+          python - <<'EOF'
+          import importlib.util as u
+          for m in ("scanpy", "skmisc", "pydeseq2", "polars", "formulaic", "mudata"):
+              assert u.find_spec(m) is None, f"{m} leaked into the base venv — this job is not testing a base install"
+          print("confirmed: no optional package present")
+          EOF
+          cd pyscx && pytest tests/test_optional_deps.py -v \
+            -k "base_install or advertised_extra or extras_pin or dev_extra or blocker"
+
   # NOTE: the fork-safety tests should also run on Linux aarch64 in
   # addition to x86_64 — aarch64 + glibc fork semantics differ subtly
   # enough to be worth covering. GitHub's `ubuntu-24.04-arm` runners

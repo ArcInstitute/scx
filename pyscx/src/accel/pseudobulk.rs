@@ -53,15 +53,16 @@ fn pydeseq2_way_back(explicit: bool) -> &'static str {
 /// `find_spec` rather than a real import: importing pydeseq2 costs seconds and
 /// pulls in statsmodels, which would be an absurd price for a warning check.
 fn warn_default_backend_changed(py: Python<'_>) -> PyResult<()> {
-    let importlib = py.import("importlib.util")?;
-    // `find_spec` can itself raise (a missing parent package, a module whose
-    // `__spec__` is None, a custom meta-path finder). Treat "cannot tell" as
-    // "not available" and stay quiet — a courtesy warning must never be able to
-    // fail a DE run.
-    let available = match importlib.call_method1("find_spec", ("pydeseq2",)) {
-        Ok(spec) => !spec.is_none(),
-        Err(_) => false,
-    };
+    // Both the import and the probe are fallible-but-ignored. `find_spec` can
+    // raise (a missing parent package, a module whose `__spec__` is None, a
+    // custom meta-path finder), and while `importlib.util` is stdlib, a `?` here
+    // would contradict the whole point of this function: a courtesy warning must
+    // never be able to fail a DE run. Treat "cannot tell" as "not available".
+    let available = py
+        .import("importlib.util")
+        .and_then(|m| m.call_method1("find_spec", ("pydeseq2",)))
+        .map(|spec| !spec.is_none())
+        .unwrap_or(false);
     if !available {
         return Ok(());
     }
@@ -744,6 +745,14 @@ pub fn pseudobulk_dex(
 
     // Already validated up front (before the backend guards), so the catch-all
     // here is unreachable rather than a second error message to keep in sync.
+    // Asserted rather than assumed: if that guard is ever moved or removed, an
+    // unrecognised `aggr_method` would silently become `Mean` instead of
+    // erroring, which is the kind of default nobody would notice.
+    debug_assert!(
+        matches!(aggr_method, "sum" | "mean"),
+        "aggr_method {aggr_method:?} reached the dispatch match — the up-front \
+         validation guard is gone or was bypassed"
+    );
     let method = match aggr_method {
         "sum" => scx_accel::AggregationMethod::Sum,
         _ => scx_accel::AggregationMethod::Mean,
@@ -929,23 +938,22 @@ pub fn pseudobulk_dex(
     //
     // Regression coverage: `pyscx/tests/test_pseudobulk_thread_env.py`.
     let resolved_n_cpus = resolve_deseq_n_cpus(n_cpus);
-    let inference = py
-        .import("pydeseq2.default_inference")
-        .map_err(|_| {
-            PyRuntimeError::new_err(
-                "pydeseq2.default_inference module not found. Ensure pydeseq2 is properly installed.\n\
-                 Install with: pip install pydeseq2",
-            )
-        })?
-        .call_method(
-            "DefaultInference",
-            (),
-            Some(&{
-                let kw = PyDict::new(py);
-                kw.set_item("n_cpus", resolved_n_cpus)?;
-                kw
-            }),
-        )?;
+    let inference = import_optional(
+        py,
+        "pydeseq2.default_inference",
+        EXTRA_PYDESEQ2,
+        "pyscx.accel.pseudobulk_dex(backend=\"pydeseq2\")",
+        "pydeseq2",
+    )?
+    .call_method(
+        "DefaultInference",
+        (),
+        Some(&{
+            let kw = PyDict::new(py);
+            kw.set_item("n_cpus", resolved_n_cpus)?;
+            kw
+        }),
+    )?;
 
     // Create DeseqDataSet.
     let dds = pydeseq2.call_method(
