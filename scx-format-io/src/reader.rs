@@ -3024,6 +3024,26 @@ pub fn assemble_filtered_metadata(
     )?)
 }
 
+/// Drop the rows of an obs-axis batch that a deletion keep mask marks deleted
+/// (`true` = keep), preserving row order.
+///
+/// The single implementation of a filter that four call sites had each
+/// open-coded. Errors rather than truncating when `keep` and the batch disagree
+/// on length: a mask sized against `header.n_obs` silently applied to a shard
+/// would drop the wrong cells.
+pub fn filter_batch_by_keep_mask(batch: &RecordBatch, keep: &[bool]) -> Result<RecordBatch> {
+    if keep.len() != batch.num_rows() {
+        return Err(arrow::error::ArrowError::InvalidArgumentError(format!(
+            "deletion keep mask has {} entries but the batch has {} rows",
+            keep.len(),
+            batch.num_rows()
+        ))
+        .into());
+    }
+    let mask = arrow::array::BooleanArray::from(keep.to_vec());
+    Ok(arrow::compute::filter_record_batch(batch, &mask)?)
+}
+
 /// Concatenate a list of CSC shards along the column axis.
 ///
 /// Each shard contributes its columns in order; the result's indptr is
@@ -3335,8 +3355,6 @@ impl ScxReader {
     // Deletion vectors
     // -----------------------------------------------------------------------
 
-    /// Read deletion vectors if present. Returns `Ok(None)` if the file has no DV flag set.
-    #[cfg(feature = "deletion-vectors")]
     /// Phase 5b: read a single detection-bitmap shard by index, scoped
     /// to a modality (`modality_id == 0` for unimodal files). Shards
     /// are ordered by `row_start`, matching the CSR shard order.
@@ -3371,6 +3389,9 @@ impl ScxReader {
             .len()
     }
 
+    /// Read deletion vectors if present. Returns `Ok(None)` if the file has no
+    /// DV flag set. A legacy v1 (per-shard) section is folded to v2 global
+    /// obs-row indices here, so callers only ever see v2.
     pub fn read_deletion_vectors(
         &self,
     ) -> Result<Option<crate::deletion_vectors::DeletionVectors>> {
@@ -3433,6 +3454,25 @@ impl ScxReader {
             return Ok(None);
         }
         Ok(Some(dv.build_keep_mask(self.n_obs() as usize, modality_id)))
+    }
+
+    /// Read obs metadata with deletion vectors applied — the obs half of
+    /// [`Self::read_all_csr_shards_filtered`], and the counterpart every caller
+    /// that materializes a matrix for a user needs.
+    ///
+    /// [`Self::read_obs`] is *physical*: it returns `header.n_obs` rows whether
+    /// or not any are logically deleted. Pairing it with a filtered CSR yields
+    /// an obs frame longer than the matrix, which is worse than either half
+    /// being wrong alone — so the two must always move together. When the file
+    /// has no deletion vectors (or nothing is deleted) this returns exactly what
+    /// `read_obs()` returns, with no copy.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn read_obs_filtered(&self) -> Result<RecordBatch> {
+        let obs = self.read_obs()?;
+        match self.deletion_keep_mask()? {
+            Some(mask) => filter_batch_by_keep_mask(&obs, &mask),
+            None => Ok(obs),
+        }
     }
 
     /// Read all CSR shards with deletion vectors applied.
