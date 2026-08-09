@@ -1165,9 +1165,13 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
 }
 
 /// Execute a query, materialising the full [`QueryResult`].
-pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
-    let pm = plan_and_mask(&pipeline)?;
-    materialize(&pipeline, pm)
+///
+/// Borrows the pipeline — execution is read-only, so it is repeatable and a
+/// failure leaves the pipeline intact. See
+/// [`QueryPipeline::collect_ref`](crate::pipeline::QueryPipeline::collect_ref).
+pub fn execute(pipeline: &QueryPipeline) -> Result<QueryResult> {
+    let pm = plan_and_mask(pipeline)?;
+    materialize(pipeline, pm)
 }
 
 /// Count matching rows without decoding `X` (CLI2). Ignores `limit` entirely,

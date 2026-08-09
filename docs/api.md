@@ -1881,13 +1881,27 @@ any JSON tool. Example for a `float32` array:
 - `with_log1p()` — Log1p transformation
 - `limit(n)` — Row limit
 - `collect() -> PyQueryResult` — Execute pipeline
-- `count() -> int` — Convenience: matching cell count
+- `count() -> int` — Matching cell count, without decoding `X` (ignores `limit`)
+- `exists() -> bool` — Whether any cell matches, without decoding `X`
+
+**Consumption semantics.** Builder steps mutate the pipeline in place and return it, so both
+`p.filter_obs(...).limit(5)` and the statement form work on one object. A **failed builder step
+leaves the pipeline unchanged and usable** — a bad predicate (`ValueError`) or an unknown gene name
+(`KeyError`) neither applies partially nor invalidates the object, so an interactive typo can simply
+be retyped. `count()` and `exists()` borrow. `collect()` consumes the pipeline **only when it
+succeeds**; a failed `collect()` leaves it usable, so the offending step can be corrected and
+re-collected. After a successful `collect()` every method raises `RuntimeError` — build a new
+pipeline with `Experiment.query()`.
 
 ### PyQueryResult
 
 - `to_anndata(container="csr", data_dtype=None, index_dtype=None, allow_lossy=False)` — Convert result to AnnData. The default is a zero-copy CSR; the four kwargs have the same semantics as [`Experiment.to_anndata`](#experiment) (`"dense"` container, narrow `data_dtype`/`index_dtype`, fail-loud `allow_lossy` gate). Any non-default request forgoes zero-copy (a cast/copy of `X`).
 - `to_csr(container="csr", data_dtype=None, index_dtype=None, allow_lossy=False)` — Return just the scipy CSR matrix (or a dense `numpy.ndarray` for `container="dense"`), with the same dtype kwargs.
 - Properties: `n_obs`, `n_vars`, `nnz`, `skipped_shards`, `total_shards`
+
+Both conversions consume the result (zero-copy hand-off), but only on success: a **tripped
+`allow_lossy` guard leaves the result intact**, so the retry the error message recommends
+(`result.to_anndata(allow_lossy=True)`) works on the same object.
 
 ### CloudExperiment
 

@@ -137,6 +137,31 @@ def test_query_result_allow_lossy_escapes(tmp_dir):
     assert x.data.dtype == np.float32
 
 
+def test_query_result_tripped_guard_is_retryable(tmp_dir):
+    """A tripped guard must leave the QueryResult intact.
+
+    The guard's own message tells the caller to pass `allow_lossy=True`; that
+    retry has to work on the *same* object. Previously both methods consumed
+    the result before the guard ran, so the recommended retry raised
+    "QueryResult already consumed by to_anndata() or to_csr()" instead.
+    """
+    path = _write(tmp_dir, _big_count_adata())
+    exp = pyscx.open(path)
+
+    result = exp.query().filter_obs("batch == 'a'").collect()
+    with pytest.raises(ValueError, match="allow_lossy"):
+        result.to_anndata()
+    rt = result.to_anndata(allow_lossy=True)  # same object
+    assert rt.X.max() == pytest.approx(float(np.float32(BIG)))
+
+    result2 = exp.query().filter_obs("batch == 'a'").collect()
+    with pytest.raises(ValueError, match="allow_lossy"):
+        result2.to_csr()
+    x = result2.to_csr(allow_lossy=True)  # same object
+    assert sp.issparse(x)
+    assert x.max() == pytest.approx(float(np.float32(BIG)))
+
+
 def test_experiment_obs_filter_fails_loud(tmp_dir):
     path = _write(tmp_dir, _big_count_adata())
     with pytest.raises(ValueError, match="allow_lossy"):

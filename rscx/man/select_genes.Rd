@@ -15,7 +15,9 @@ the \code{[} operator). For example, obtain them from
 \code{>= 1}; \code{0} / negatives raise an error.}
 }
 \value{
-A new RQueryPipeline object (for pipe chaining).
+A new RQueryPipeline object (for pipe chaining). The input pipeline is
+handed on to the returned object; on error nothing is handed on and the
+input pipeline is left unchanged and still usable.
 }
 \description{
 Select specific gene indices for projection

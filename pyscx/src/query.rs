@@ -118,12 +118,29 @@ pub(crate) fn query_result_to_anndata_with_plan<'py>(
 /// `.select_genes()`, `.with_normalize()`, `.with_log1p()`, `.limit()`,
 /// then `.collect()` to execute.
 ///
-/// After `.collect()` the pipeline is consumed and further calls will
-/// raise RuntimeError.
+/// A failed builder step leaves the pipeline unchanged and still usable —
+/// a bad predicate or an unknown gene name does not invalidate the object.
+/// Only a *successful* `.collect()` consumes it; after that every method
+/// raises RuntimeError.
 #[pyclass]
 pub struct PyQueryPipeline {
+    /// `None` iff a **successful** `collect()` took the pipeline.
+    ///
+    /// Nothing else may empty this field. Builder steps mutate in place via
+    /// `QueryPipeline::*_mut`, which leaves the pipeline untouched on error,
+    /// and `collect()` runs on a borrow and takes only once it has succeeded.
+    /// That is what makes [`CONSUMED_MSG`] true wherever it is raised: the
+    /// previous take-then-rebuild shape dropped the pipeline inside the
+    /// engine's consuming builder on any error, so a predicate typo left the
+    /// object permanently dead while blaming a `collect()` that never ran.
     pipeline: Option<QueryPipeline>,
 }
+
+/// Raised when a method is called on a pipeline that a successful `collect()`
+/// already consumed. Shared by every accessor so the three former copies of
+/// this string cannot drift.
+const CONSUMED_MSG: &str = "pipeline was consumed by a successful collect(); \
+                            call Experiment.query() to start a new pipeline";
 
 impl PyQueryPipeline {
     /// Create from an already-opened QueryPipeline (Rust-only).
@@ -133,16 +150,18 @@ impl PyQueryPipeline {
         }
     }
 
-    /// Take the inner pipeline, returning an error if already consumed.
-    fn take_pipeline(&mut self) -> PyResult<QueryPipeline> {
+    /// Borrow the inner pipeline, or raise if a successful `collect()` took it.
+    fn pipeline_ref(&self) -> PyResult<&QueryPipeline> {
         self.pipeline
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("Pipeline already consumed by collect()"))
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err(CONSUMED_MSG))
     }
 
-    /// Store a pipeline back after a builder step.
-    fn put_pipeline(&mut self, p: QueryPipeline) {
-        self.pipeline = Some(p);
+    /// Mutably borrow the inner pipeline for an in-place builder step.
+    fn pipeline_mut(&mut self) -> PyResult<&mut QueryPipeline> {
+        self.pipeline
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err(CONSUMED_MSG))
     }
 }
 
@@ -159,9 +178,10 @@ impl PyQueryPipeline {
     fn filter_obs<'py>(slf: Bound<'py, Self>, expr: &str) -> PyResult<Bound<'py, Self>> {
         {
             let mut inner = slf.borrow_mut();
-            let p = inner.take_pipeline()?;
-            let p = p.filter_obs(expr).map_err(engine_to_pyerr)?;
-            inner.put_pipeline(p);
+            inner
+                .pipeline_mut()?
+                .filter_obs_mut(expr)
+                .map_err(engine_to_pyerr)?;
         }
         Ok(slf)
     }
@@ -174,9 +194,10 @@ impl PyQueryPipeline {
     fn filter_var<'py>(slf: Bound<'py, Self>, expr: &str) -> PyResult<Bound<'py, Self>> {
         {
             let mut inner = slf.borrow_mut();
-            let p = inner.take_pipeline()?;
-            let p = p.filter_var(expr).map_err(engine_to_pyerr)?;
-            inner.put_pipeline(p);
+            inner
+                .pipeline_mut()?
+                .filter_var_mut(expr)
+                .map_err(engine_to_pyerr)?;
         }
         Ok(slf)
     }
@@ -201,14 +222,19 @@ impl PyQueryPipeline {
             .collect::<PyResult<Vec<_>>>()?;
         {
             let mut inner = slf.borrow_mut();
-            let p = inner.take_pipeline()?;
+            let p = inner.pipeline_mut()?;
+            // Hoisted so only one shared reborrow of `p` is live across the
+            // `read_var_for` call; `read_var_for` returns an owned RecordBatch,
+            // so the reborrow ends with the statement and `p` is free for the
+            // mutating `select_genes_mut` below.
+            let modality_id = p.modality_id();
             // Read var only when at least one name needs resolving. Scope to the
             // pipeline's modality so names resolve against the modality's var
             // (a multimodal file has no global `var` section).
             let var_batch = if genes.iter().any(|g| matches!(g, GeneRef::Name(_))) {
                 Some(
                     p.reader()
-                        .read_var_for(p.modality_id())
+                        .read_var_for(modality_id)
                         .map_err(engine_to_pyerr)?,
                 )
             } else {
@@ -222,20 +248,18 @@ impl PyQueryPipeline {
                         let vb = var_batch.as_ref().expect("var read when names present");
                         match crate::experiment::lookup_gene_in_batch(vb, &name) {
                             Some(idx) => indices.push(idx),
+                            // Nothing was moved out of `inner`, so returning
+                            // here leaves the pipeline untouched and usable.
                             None => {
-                                // p is untouched (select_genes not yet called);
-                                // restore it so the pipeline stays usable.
-                                inner.put_pipeline(p);
                                 return Err(PyKeyError::new_err(format!(
                                     "gene name '{name}' not found in var index"
-                                )));
+                                )))
                             }
                         }
                     }
                 }
             }
-            let p = p.select_genes(indices);
-            inner.put_pipeline(p);
+            p.select_genes_mut(indices);
         }
         Ok(slf)
     }
@@ -249,9 +273,7 @@ impl PyQueryPipeline {
     fn with_normalize(slf: Bound<'_, Self>, target_sum: f64) -> PyResult<Bound<'_, Self>> {
         {
             let mut inner = slf.borrow_mut();
-            let p = inner.take_pipeline()?;
-            let p = p.with_normalize(target_sum);
-            inner.put_pipeline(p);
+            inner.pipeline_mut()?.with_normalize_mut(target_sum);
         }
         Ok(slf)
     }
@@ -261,9 +283,7 @@ impl PyQueryPipeline {
     fn with_log1p(slf: Bound<'_, Self>) -> PyResult<Bound<'_, Self>> {
         {
             let mut inner = slf.borrow_mut();
-            let p = inner.take_pipeline()?;
-            let p = p.with_log1p();
-            inner.put_pipeline(p);
+            inner.pipeline_mut()?.with_log1p_mut();
         }
         Ok(slf)
     }
@@ -273,22 +293,28 @@ impl PyQueryPipeline {
     fn limit(slf: Bound<'_, Self>, n: usize) -> PyResult<Bound<'_, Self>> {
         {
             let mut inner = slf.borrow_mut();
-            let p = inner.take_pipeline()?;
-            let p = p.limit(n);
-            inner.put_pipeline(p);
+            inner.pipeline_mut()?.limit_mut(n);
         }
         Ok(slf)
     }
 
     /// Execute the pipeline and return a `PyQueryResult`.
     ///
-    /// This is where all I/O and computation occurs. The pipeline is
-    /// consumed — further method calls will raise RuntimeError.
+    /// This is where all I/O and computation occurs. A *successful* collect
+    /// consumes the pipeline — further method calls then raise RuntimeError.
+    /// A failed one does not: the pipeline stays usable so the caller can fix
+    /// the offending step (e.g. an out-of-range gene index) and re-collect.
     /// The GIL is released during execution.
     fn collect(&mut self, py: Python<'_>) -> PyResult<PyQueryResult> {
-        let pipeline = self.take_pipeline()?;
-        // Note: pipeline is NOT put back — collect() consumes it
-        let result = py.detach(|| pipeline.collect()).map_err(engine_to_pyerr)?;
+        // Run on a borrow (`collect_ref`) rather than moving the pipeline into
+        // the engine, so an error leaves it recoverable. Consuming on success
+        // is a deliberate binding-layer policy, not a Rust-ownership artifact.
+        let result = {
+            let pipeline = self.pipeline_ref()?;
+            py.detach(|| pipeline.collect_ref())
+                .map_err(engine_to_pyerr)?
+        };
+        self.pipeline = None;
         Ok(PyQueryResult::from_result(result))
     }
 
@@ -299,10 +325,7 @@ impl PyQueryPipeline {
     /// pipeline — it stays usable for a later `collect()`. The GIL is released
     /// during execution.
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        let pipeline = self
-            .pipeline
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Pipeline already consumed by collect()"))?;
+        let pipeline = self.pipeline_ref()?;
         let result = py.detach(|| pipeline.count()).map_err(engine_to_pyerr)?;
         Ok(result.matched_rows)
     }
@@ -313,10 +336,7 @@ impl PyQueryPipeline {
     /// (non-indexed) predicates it decodes only the narrowed obs shards. Borrows
     /// the pipeline — it stays usable for a later `collect()`.
     fn exists(&self, py: Python<'_>) -> PyResult<bool> {
-        let pipeline = self
-            .pipeline
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Pipeline already consumed by collect()"))?;
+        let pipeline = self.pipeline_ref()?;
         py.detach(|| pipeline.exists()).map_err(engine_to_pyerr)
     }
 
@@ -371,6 +391,17 @@ impl PyQueryResult {
             PyRuntimeError::new_err("QueryResult already consumed by to_anndata() or to_csr()")
         })
     }
+
+    /// Peek the decode-loss `value_max` without consuming the result, so the
+    /// guard can fire *before* `take_result()`. That keeps a tripped guard
+    /// non-destructive: the caller can retry the same object with
+    /// `allow_lossy=True`, which is exactly what the guard's message tells them
+    /// to do. Mirrors `rscx`'s `RQueryResult::peek_max_value`. Returns 0 once
+    /// consumed (the guard then passes and `take_result()` surfaces the
+    /// "already consumed" error).
+    fn peek_max_value(&self) -> u32 {
+        self.result.as_ref().map(|r| r.max_value).unwrap_or(0)
+    }
 }
 
 #[pymethods]
@@ -391,6 +422,11 @@ impl PyQueryResult {
         allow_lossy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let plan = convert::build_plan(py, container, data_dtype, index_dtype, allow_lossy)?;
+        // Guard before taking: a tripped decode-loss guard must leave the
+        // result intact so the retry it recommends (`allow_lossy=True`) works
+        // on the same object. `query_result_to_anndata_with_plan` re-checks for
+        // the callers that reach it directly (`pyscx.read_cloud`).
+        convert::guard_decode_loss(self.peek_max_value(), plan.allow_lossy)?;
         let result = self.take_result()?;
         query_result_to_anndata_with_plan(py, result, &plan)
     }
@@ -408,8 +444,9 @@ impl PyQueryResult {
         allow_lossy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let plan = convert::build_plan(py, container, data_dtype, index_dtype, allow_lossy)?;
+        // Guard before taking — see `to_anndata`.
+        convert::guard_decode_loss(self.peek_max_value(), plan.allow_lossy)?;
         let result = self.take_result()?;
-        convert::guard_decode_loss(result.max_value, plan.allow_lossy)?;
         convert::csr_to_scipy_typed(py, result.x, &plan)
     }
 

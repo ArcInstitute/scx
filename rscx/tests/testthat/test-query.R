@@ -87,6 +87,56 @@ test_that("select_genes rejects 0 / negative / non-integer indices (1-based guar
   expect_error(select_genes(pipe, 1.5), regexp = "non-integer")
 })
 
+# --- A failed step must not poison the pipeline -----------
+# The engine's consuming builders drop the pipeline on Err, so a binding that
+# take()s before applying loses it for good: the next call then reports
+# "already consumed" for an operation that never ran.
+
+test_that("a failed builder step leaves the pipeline usable", {
+  path <- skip_if_no_fixture()
+  pipe <- scx_open(path) |> scx_query()
+
+  # A predicate typo is rejected by the engine...
+  expect_error(filter_obs(pipe, "batch ==== 'A'"))
+  # ...and the very same object still works, with nothing half-applied.
+  result <- pipe |> filter_obs("batch == 'A'") |> collect()
+  expect_true(result$n_obs() > 0)
+  expect_true(result$n_obs() < 20)
+
+  # Same for a rejected gene index.
+  pipe2 <- scx_open(path) |> scx_query()
+  expect_error(select_genes(pipe2, 0L), regexp = "1-based")
+  expect_equal(select_genes(pipe2, c(1L, 2L))$collect()$n_vars(), 2)
+})
+
+test_that("a failed collect() leaves the pipeline usable", {
+  path <- skip_if_no_fixture()
+  pipe <- scx_open(path) |> scx_query()
+
+  # Out-of-range gene indices are only detected during execution, so this
+  # fails inside collect() rather than in the builder. Note the failure is
+  # currently a *panic* from arrow's `take` (an unchecked index — a separate
+  # pre-existing defect, mirrored by pyscx's BaseException harness), not a
+  # clean Err. What is asserted here is only that the failure, however it
+  # arrives, does not take the pipeline with it.
+  pipe2 <- select_genes(pipe, 10000L)
+  expect_error(collect(pipe2))
+
+  # The pipeline survived the failed execution: the bad selection can be
+  # replaced and the query re-run on the same object.
+  result <- select_genes(pipe2, c(1L, 2L)) |> collect()
+  expect_equal(result$n_vars(), 2)
+})
+
+test_that("a successful collect() consumes the pipeline", {
+  path <- skip_if_no_fixture()
+  pipe <- scx_open(path) |> scx_query()
+
+  expect_equal(collect(pipe)$n_obs(), 20)
+  expect_error(count(pipe), regexp = "already consumed")
+  expect_error(collect(pipe), regexp = "already consumed")
+})
+
 # --- Multimodal-scoped query -----------
 # Builds a multimodal SCX on the fly via from_seurat (like test-multimodal.R),
 # then scopes the query to one modality. Skips cleanly without Seurat/Matrix.

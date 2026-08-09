@@ -12,7 +12,9 @@ filter_var(pipeline, expr)
 \item{expr}{Character string predicate.}
 }
 \value{
-A new RQueryPipeline object (for pipe chaining).
+A new RQueryPipeline object (for pipe chaining). The input pipeline is
+handed on to the returned object; on error nothing is handed on and the
+input pipeline is left unchanged and still usable.
 }
 \description{
 Filter variables (genes) by a predicate expression

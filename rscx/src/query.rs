@@ -3,9 +3,13 @@
 // Wraps scx-engine::QueryPipeline and QueryResult for R.
 // Uses the Option<T>::take() pattern to handle Rust move semantics
 // in R (which has no ownership model). Each builder method takes
-// &mut self, .take()s the inner pipeline, applies the operation,
-// and returns a new RQueryPipeline. After collect() the pipeline
-// is consumed and further calls return an error.
+// &mut self, applies the operation **in place** via the engine's
+// `*_mut` API, then .take()s the inner pipeline into a new
+// RQueryPipeline. Order matters: the engine's consuming builders drop
+// the pipeline on Err, so applying after the take would leave both the
+// caller's object and the new one dead on any error. Applying first
+// means a failed step changes nothing and the caller can retry.
+// After collect() the pipeline is consumed and further calls error.
 
 use arrow::array::RecordBatch;
 use std::path::PathBuf;
@@ -24,8 +28,11 @@ use scx_engine::GroupShardHandle;
 /// `$select_genes()`, `$with_normalize()`, `$with_log1p()`, `$limit()`,
 /// then `$collect()` to execute.
 ///
-/// After `$collect()` the pipeline is consumed and further calls will
-/// raise an error.
+/// Each builder step hands the pipeline on to the object it returns, so
+/// carry the result forward (`p <- filter_obs(p, ...)` or `|>`). A step that
+/// *fails* hands nothing on: the pipeline stays in the object it was called
+/// on, unchanged and still usable. After `$collect()` the pipeline is consumed
+/// and further calls will raise an error.
 #[extendr]
 pub struct RQueryPipeline {
     inner: Option<QueryPipeline>,
@@ -55,9 +62,28 @@ impl RQueryPipeline {
     fn take_inner(&mut self) -> Result<QueryPipeline> {
         self.inner
             .take()
-            .ok_or_else(|| Error::Other("Pipeline already consumed by collect()".into()))
+            .ok_or_else(|| Error::Other(CONSUMED_MSG.into()))
+    }
+
+    /// Borrow the inner pipeline, returning an error if already consumed.
+    fn inner_ref(&self) -> Result<&QueryPipeline> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| Error::Other(CONSUMED_MSG.into()))
+    }
+
+    /// Mutably borrow the inner pipeline for an in-place builder step.
+    fn inner_mut(&mut self) -> Result<&mut QueryPipeline> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| Error::Other(CONSUMED_MSG.into()))
     }
 }
+
+/// Raised when a method is called on a pipeline that has already been passed
+/// on (a builder step moved it into the returned object) or consumed by
+/// `$collect()`. One string, so the two former spellings cannot drift.
+const CONSUMED_MSG: &str = "pipeline already consumed; start a new one with scx_query()";
 
 #[extendr]
 impl RQueryPipeline {
@@ -76,11 +102,16 @@ impl RQueryPipeline {
     /// masking the real message behind "User function panicked". See B3/B7.
     fn filter_obs(&mut self, expr: &str) -> Robj {
         crate::util::throw_on_err((|| -> Result<RQueryPipeline> {
-            let p = self.take_inner()?;
-            let p = p
-                .filter_obs(expr)
+            // Apply in place first: the engine's consuming `filter_obs` drops
+            // the pipeline on a predicate error, which would leave *both* this
+            // object and the caller's dead. `filter_obs_mut` changes nothing on
+            // error, so only a successful step moves the pipeline on.
+            self.inner_mut()?
+                .filter_obs_mut(expr)
                 .map_err(|e| Error::Other(e.to_string()))?;
-            Ok(RQueryPipeline { inner: Some(p) })
+            Ok(RQueryPipeline {
+                inner: Some(self.take_inner()?),
+            })
         })())
     }
 
@@ -88,11 +119,13 @@ impl RQueryPipeline {
     /// Returns `Robj` and throws via `throw_on_err` (see `filter_obs`).
     fn filter_var(&mut self, expr: &str) -> Robj {
         crate::util::throw_on_err((|| -> Result<RQueryPipeline> {
-            let p = self.take_inner()?;
-            let p = p
-                .filter_var(expr)
+            // In place first — see `filter_obs`.
+            self.inner_mut()?
+                .filter_var_mut(expr)
                 .map_err(|e| Error::Other(e.to_string()))?;
-            Ok(RQueryPipeline { inner: Some(p) })
+            Ok(RQueryPipeline {
+                inner: Some(self.take_inner()?),
+            })
         })())
     }
 
@@ -103,7 +136,8 @@ impl RQueryPipeline {
     /// Returns `Robj` and throws via `throw_on_err` (see `filter_obs`).
     fn select_genes(&mut self, indices: Vec<i32>) -> Robj {
         crate::util::throw_on_err((|| -> Result<RQueryPipeline> {
-            let p = self.take_inner()?;
+            // Validate before taking, so a rejected index leaves the caller's
+            // pipeline usable — see `filter_obs`.
             let u32_indices: Vec<u32> = indices
                 .into_iter()
                 .map(|i| {
@@ -114,8 +148,10 @@ impl RQueryPipeline {
                     }
                 })
                 .collect::<Result<Vec<u32>>>()?;
-            let p = p.select_genes(u32_indices);
-            Ok(RQueryPipeline { inner: Some(p) })
+            self.inner_mut()?.select_genes_mut(u32_indices);
+            Ok(RQueryPipeline {
+                inner: Some(self.take_inner()?),
+            })
         })())
     }
 
@@ -123,9 +159,12 @@ impl RQueryPipeline {
     /// Returns `Robj` and throws via `throw_on_err` (see `filter_obs`).
     fn with_normalize(&mut self, target_sum: f64) -> Robj {
         crate::util::throw_on_err((|| -> Result<RQueryPipeline> {
-            let p = self.take_inner()?;
-            let p = p.with_normalize(target_sum);
-            Ok(RQueryPipeline { inner: Some(p) })
+            // In place then take, like the fallible builders — one shape for
+            // all six, so the next one added inherits the safe order.
+            self.inner_mut()?.with_normalize_mut(target_sum);
+            Ok(RQueryPipeline {
+                inner: Some(self.take_inner()?),
+            })
         })())
     }
 
@@ -133,9 +172,10 @@ impl RQueryPipeline {
     /// Returns `Robj` and throws via `throw_on_err` (see `filter_obs`).
     fn with_log1p(&mut self) -> Robj {
         crate::util::throw_on_err((|| -> Result<RQueryPipeline> {
-            let p = self.take_inner()?;
-            let p = p.with_log1p();
-            Ok(RQueryPipeline { inner: Some(p) })
+            self.inner_mut()?.with_log1p_mut();
+            Ok(RQueryPipeline {
+                inner: Some(self.take_inner()?),
+            })
         })())
     }
 
@@ -143,22 +183,33 @@ impl RQueryPipeline {
     /// Returns `Robj` and throws via `throw_on_err` (see `filter_obs`).
     fn limit(&mut self, n: i32) -> Robj {
         crate::util::throw_on_err((|| -> Result<RQueryPipeline> {
-            let p = self.take_inner()?;
+            // Validate before taking — see `filter_obs`.
             if n < 0 {
                 return Err(Error::Other(format!("negative limit: {}", n)));
             }
-            let p = p.limit(n as usize);
-            Ok(RQueryPipeline { inner: Some(p) })
+            self.inner_mut()?.limit_mut(n as usize);
+            Ok(RQueryPipeline {
+                inner: Some(self.take_inner()?),
+            })
         })())
     }
 
     /// Execute the pipeline and return an RQueryResult.
-    /// The pipeline is consumed — further calls will error.
+    /// A *successful* collect consumes the pipeline — further calls then
+    /// error. A failed one does not: the pipeline stays usable so the caller
+    /// can correct the offending step and re-collect.
     /// Returns `Robj` and throws via `throw_on_err` (see `filter_obs`).
     fn collect(&mut self) -> Robj {
         crate::util::throw_on_err((|| -> Result<RQueryResult> {
-            let p = self.take_inner()?;
-            let result = p.collect().map_err(|e| Error::Other(e.to_string()))?;
+            // Run on a borrow, like pyscx: a failed execution (engine error,
+            // out-of-range gene index) must leave the pipeline usable so the
+            // caller can correct the offending step and re-collect. Only a
+            // successful collect consumes it.
+            let result = {
+                let p = self.inner_ref()?;
+                p.collect_ref().map_err(|e| Error::Other(e.to_string()))?
+            };
+            self.inner = None;
             Ok(RQueryResult::from_result(result))
         })())
     }
@@ -172,10 +223,7 @@ impl RQueryPipeline {
     /// Returns `Robj` and throws via `throw_on_err` (see `filter_obs`).
     fn count(&self) -> Robj {
         crate::util::throw_on_err((|| -> Result<Robj> {
-            let p = self
-                .inner
-                .as_ref()
-                .ok_or_else(|| Error::Other("pipeline already consumed".into()))?;
+            let p = self.inner_ref()?;
             let c = p.count().map_err(|e| Error::Other(e.to_string()))?;
             Ok(Robj::from(c.matched_rows as f64))
         })())
