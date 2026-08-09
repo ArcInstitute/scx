@@ -99,7 +99,9 @@ GroupIndex (29)        — Condition/label-grouped sharding sidecar (one per
 - `debug_counts()` — `ReaderDebugCounts` with `AtomicU64` I/O counters (`cfg(debug_assertions)` only). `read_obs_shard_projected` counts column-scoped shard reads separately from `read_obs_shard`, so a test can assert the cheap path was *taken* rather than only that the materialising ones were avoided.
 - `read_obs_predicate_index_bytes()` / `read_var_predicate_index_bytes()` — Predicate index raw bytes
 - `read_deletion_vectors()` — Roaring Bitmap deletion vectors
-- `read_all_csr_shards_filtered()` — Full matrix with deletion vector filtering
+- `deletion_keep_mask()` / `deletion_keep_mask_for(modality_id)` — `Option<Vec<bool>>` (`true` = keep); `None` when nothing is deleted
+- `read_all_csr_shards_filtered()` / `read_all_csr_shards_for_filtered(modality_id)` / `read_layer_filtered(name)` — Matrix reads with deletion vectors applied
+- `read_obs_filtered()` — The obs half of the above. `read_obs()` is *physical* (`header.n_obs` rows regardless of deletions), so any caller materialising a matrix for a user needs both halves and must move them together — an obs frame longer than its matrix is worse than either being stale alone
 - `read_shard_header()` / `read_raw_shard_bytes()` / `read_shard_from_entry()` — Low-level shard access
 - `mmap()` — Direct mmap access to the underlying file
 
@@ -1482,8 +1484,8 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   semantics as `to_h5ad`; each modality runs through the same
   dispatcher independently.
 - `pyscx.iter_chunks(adata, chunk_size="shard")` — Shard-aligned or fixed-size chunk iterator
-- `pyscx.preprocess(source, target, ops, target_sum=None)` — Streaming shard-by-shard preprocessing. Preserves obs/var/obsm/uns only; **rejects multimodal and `adata.raw`-bearing inputs** (would otherwise corrupt X / drop raw) — extract a single modality first, or transform before attaching raw.
-- `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as a layer. Preserves obs/var/original-X/obsm/uns only (pre-existing layers, raw, CSC, varm/obsp/varp, indexes, bitmaps, deletion vectors are not carried over); same multimodal/raw rejection as `preprocess`.
+- `pyscx.preprocess(source, target, ops, target_sum=None)` — Streaming shard-by-shard preprocessing. Preserves obs/var/obsm/uns and carries the deletion-vector section through (the rewrite is 1:1 in obs row space, so deleted cells stay deleted — see [Operations § Deletion vectors](operations.md#deletion-vectors-carried-vs-applied)); **rejects multimodal and `adata.raw`-bearing inputs** (would otherwise corrupt X / drop raw) — extract a single modality first, or transform before attaching raw.
+- `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as a layer. Preserves obs/var/original-X/obsm/uns and the deletion-vector section (pre-existing layers, raw, CSC, varm/obsp/varp, indexes and bitmaps are not carried over); same multimodal/raw rejection as `preprocess`.
 
 ### File operations
 - `pyscx.append(target, input, codec=None, shard_size=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, modality=None)` — Streaming append from SCX file (reads one shard at a time; raw-copy fast path when codec/encoding match). **Append into a multimodal target is deferred** — it raises `ValueError` (`MultimodalUnsupported`); a single-modality append would leave sibling modalities under-covering the shared obs axis. Extract a modality with `scx subset --modality`, append to that single-modality file, then re-merge. Single-modality append is unaffected. `index_*` kwargs rebuild predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps). Appending categorical `obs`/`var` onto a **row-sharded** base reassembles the existing metadata through the shared canonical assembler (`scx_format_io::assemble_sharded_metadata`), so disjoint/duplicate per-shard categorical vocabularies and a mixed `Dictionary`/plain-string shard layout are reconciled rather than failing to read back. A genuinely corrupt/gapped obs/var shard cover (non-contiguous `row_start` stamps) is now rejected with a clear error instead of being silently mis-assembled.
@@ -1616,6 +1618,17 @@ the repr onto `Experiment.info() -> str`.
 - `to_mudata(backed=False, cache_shards=4, container=None, data_dtype=None, index_dtype=None, allow_lossy=False)` — Materialise a multimodal file as `mudata.MuData`
   - Eager (`backed=False`): per-modality scipy CSR AnnData sharing the
     global obs. Raises on single-modality files.
+  - ⚠️ **Deletion vectors are not applied** — unlike `to_anndata()`, `query()`
+    and every other materialising read, `to_mudata()` returns *physical* rows,
+    so cells marked by `mark_deleted` are present. This is deliberate: every
+    modality's X has to stay in lockstep with the single shared global obs, and
+    the per-modality typed reader is unfiltered for that reason
+    (`scx_format_io::read_all_csr_shards_for_typed`). Run `scx compact` first if
+    you need the deletions materialised. `Experiment.has_deletions` tells you
+    whether a given file is affected (and `n_obs` vs `n_obs_physical` by how
+    much). See also
+    [docs/multimodal.md](multimodal.md) and
+    [Operations § Deletion vectors](operations.md#deletion-vectors-carried-vs-applied).
   - **Per-modality in-decode narrow.** `container` / `data_dtype` /
     `index_dtype` each accept **either a scalar** (applied to every modality)
     **or a dict keyed by modality name** — e.g.
