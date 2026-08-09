@@ -37,7 +37,9 @@ scx_query <- function(exp, modality = NULL) {
 #'
 #' @param pipeline An RQueryPipeline object.
 #' @param expr Character string predicate, e.g. \code{"tissue == 'lung'"}.
-#' @return A new RQueryPipeline object (for pipe chaining).
+#' @return A new RQueryPipeline object (for pipe chaining). The input pipeline is
+#'   handed on to the returned object; on error nothing is handed on and the
+#'   input pipeline is left unchanged and still usable.
 #' @export
 filter_obs <- function(pipeline, expr) {
   pipeline$filter_obs(expr)
@@ -47,7 +49,9 @@ filter_obs <- function(pipeline, expr) {
 #'
 #' @param pipeline An RQueryPipeline object.
 #' @param expr Character string predicate.
-#' @return A new RQueryPipeline object (for pipe chaining).
+#' @return A new RQueryPipeline object (for pipe chaining). The input pipeline is
+#'   handed on to the returned object; on error nothing is handed on and the
+#'   input pipeline is left unchanged and still usable.
 #' @export
 filter_var <- function(pipeline, expr) {
   pipeline$filter_var(expr)
@@ -60,7 +64,9 @@ filter_var <- function(pipeline, expr) {
 #'   the \code{[} operator). For example, obtain them from
 #'   \code{which(scx_highly_variable_genes(...)$highly_variable)}. Indices must be
 #'   \code{>= 1}; \code{0} / negatives raise an error.
-#' @return A new RQueryPipeline object (for pipe chaining).
+#' @return A new RQueryPipeline object (for pipe chaining). The input pipeline is
+#'   handed on to the returned object; on error nothing is handed on and the
+#'   input pipeline is left unchanged and still usable.
 #' @export
 select_genes <- function(pipeline, indices) {
   indices <- as.numeric(indices)
@@ -85,7 +91,9 @@ select_genes <- function(pipeline, indices) {
 #'
 #' @param pipeline An RQueryPipeline object.
 #' @param target_sum Target sum for normalization (e.g. 1e4).
-#' @return A new RQueryPipeline object (for pipe chaining).
+#' @return A new RQueryPipeline object (for pipe chaining). The input pipeline is
+#'   handed on to the returned object; on error nothing is handed on and the
+#'   input pipeline is left unchanged and still usable.
 #' @export
 with_normalize <- function(pipeline, target_sum) {
   pipeline$with_normalize(target_sum)
@@ -94,7 +102,9 @@ with_normalize <- function(pipeline, target_sum) {
 #' Enable log1p transformation
 #'
 #' @param pipeline An RQueryPipeline object.
-#' @return A new RQueryPipeline object (for pipe chaining).
+#' @return A new RQueryPipeline object (for pipe chaining). The input pipeline is
+#'   handed on to the returned object; on error nothing is handed on and the
+#'   input pipeline is left unchanged and still usable.
 #' @export
 with_log1p <- function(pipeline) {
   pipeline$with_log1p()
@@ -104,7 +114,9 @@ with_log1p <- function(pipeline) {
 #'
 #' @param pipeline An RQueryPipeline object.
 #' @param n Maximum number of cells to return.
-#' @return A new RQueryPipeline object (for pipe chaining).
+#' @return A new RQueryPipeline object (for pipe chaining). The input pipeline is
+#'   handed on to the returned object; on error nothing is handed on and the
+#'   input pipeline is left unchanged and still usable.
 #' @export
 limit <- function(pipeline, n) {
   pipeline$limit(n)

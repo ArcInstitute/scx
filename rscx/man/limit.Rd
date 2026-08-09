@@ -12,7 +12,9 @@ limit(pipeline, n)
 \item{n}{Maximum number of cells to return.}
 }
 \value{
-A new RQueryPipeline object (for pipe chaining).
+A new RQueryPipeline object (for pipe chaining). The input pipeline is
+handed on to the returned object; on error nothing is handed on and the
+input pipeline is left unchanged and still usable.
 }
 \description{
 Limit the number of returned cells

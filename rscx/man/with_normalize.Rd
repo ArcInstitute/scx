@@ -12,7 +12,9 @@ with_normalize(pipeline, target_sum)
 \item{target_sum}{Target sum for normalization (e.g. 1e4).}
 }
 \value{
-A new RQueryPipeline object (for pipe chaining).
+A new RQueryPipeline object (for pipe chaining). The input pipeline is
+handed on to the returned object; on error nothing is handed on and the
+input pipeline is left unchanged and still usable.
 }
 \description{
 Enable total-count normalization
