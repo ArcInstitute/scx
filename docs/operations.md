@@ -16,11 +16,11 @@ intact.
 In-place does **not** imply undoable. `scx rollback` works only on the ops that
 commit through the manifest chain (`prepare_in_place` / `commit_in_place`) and so
 leave the previous catalog in the file — the import ops, `delete`,
-`modify_metadata` / `set_uns`, `append`. **`build-csc --in-place` is not among
-them**: it stages a wholly new file via `run_build_csc` and renames it over the
-target, carrying no prior catalog, so a subsequent `scx rollback` fails with
-`no previous catalog available for rollback`. Copy out first if you want a way
-back.
+`modify_metadata` / `set_uns`, `append`. **`build-csc --in-place` and
+`upgrade --in-place` are not among them**: each stages a wholly new file and
+renames it over the target, carrying no prior catalog, so a subsequent
+`scx rollback` fails with `no previous catalog available for rollback`. Copy out
+first if you want a way back.
 
 > **Every op in this table invalidates a `pyscx` handle that is already open on
 > the file.** The in-place ops append and rewrite the header; the copy-out ops
@@ -38,6 +38,7 @@ back.
 | **modify_metadata** / **set_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`); a supplied `obsm` sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | **Carried forward** for the replaced axis — rebuilt over the columns the file already indexed, which also re-derives the per-shard column stats. `--index-obs` / `--index-var` override that axis's column set (`--index-preset` / `--index-auto-threshold` override both); a previously indexed column the new set omits is *reported*, not silently dropped. Untouched when only `uns` / `obsm` / `varm` change — see the note below | **Preserved** (X and its row space are untouched) |
 | **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deleted rows are dropped and no vector is emitted. This is the op that materializes deletions |
 | **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | Sections **preserved** (rows + shard boundaries unchanged), but like `build-csc` the re-emit does not re-derive the per-shard column stats, so **Level-1** pruning stops firing. See the note below | **Carried** verbatim (rows are 1:1, so the global row indices stay valid) |
+| **upgrade** | New file, or in place (`--in-place`, temp + rename) — **not** rollback-able | Decoded and re-emitted **unframed** (per-shard codec preserved); a file already newer than the target (v4) is **declined**, see below | **Preserved** (rows 1:1; a sharded layout stays sharded) | **Preserved** | **Preserved** — the one op that carries the sidecar through rather than dropping it (re-emitted via `catalog.csc_shards_sorted()`) | Sections **copied verbatim** by `copy_auxiliary_sections`, but the per-shard catalog **column stats are not re-derived** — so **Level-1** shard pruning stops firing, exactly as for `build-csc`. See the note below | **Carried** verbatim (a 1:1 re-emit, so the global row indices stay valid) |
 | **merge** | New file (`<OUTPUT>` required) | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Carried**, with each input's rows offset into the merged row space (a sorted merge follows the merge permutation). Physical rows are all retained — run `compact` to reclaim them |
 | **subset** | New file (`<OUTPUT>` required, optional with `--dry-run`) | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — a subset builds a new row space, so deleted cells are excluded (whether or not `--filter` is given, and intersected with it when it is) |
 | **sort** | New file (`<OUTPUT>` required) | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deletions are materialized away by the reorder |
@@ -87,6 +88,32 @@ Two consequences worth knowing:
 address rows by physical index and have no kept→global translation, so they
 **refuse** to open a file that carries deletions rather than silently handing
 back deleted rows. Use `$x_matrix()` / `scx_query()`, or `scx compact` first.
+
+### `scx upgrade` declines a file newer than its target
+
+`scx upgrade` rewrites to the newest **unframed** version (v3). It does not add
+row-group framing, so it cannot reach v4 — that is `scx optimize
+--row-group-rows N`'s job.
+
+Handed a file that is *already* v4 it declines and exits 0, rather than
+"upgrading" it downwards. The rewrite is not a no-op on such a file: it decodes
+every shard and re-emits it unframed, so a v4 input would silently lose its
+row-group framing and the sub-shard random access v4 exists to provide, while
+reporting `Upgraded … v4 → v3`. On `--in-place` that is unrecoverable — the
+rename lands a wholly new file carrying no prior catalog, so `scx rollback` has
+nothing to return to.
+
+```
+$ scx upgrade atlas.scx --in-place
+File is at format version 4, which is newer than the version `scx upgrade`
+targets (v3, unframed). Rewriting it here would strip row-group framing and its
+sub-shard random access, and `--in-place` is not rollback-able. Nothing to do;
+use `scx optimize --row-group-rows N` to re-frame.
+```
+
+Since `scx convert` and `pyscx.from_anndata` frame by default, a file written by
+either is v4 and lands in this branch. There is deliberately no
+`--allow-downgrade`: `scx optimize` owns framing in both directions.
 
 ### Restoring CSC after a mutating operation
 

@@ -971,7 +971,10 @@ encrypted section types. For PHI datasets, use filesystem-level encryption
   that only handle 256-byte headers detect a larger `header_length` and exit
   gracefully.
 - **Migration**: `scx upgrade input.scx output.scx` rewrites a file to the
-  latest format version.
+  latest **unframed** version (v3). It does not add row-group framing, so it
+  does not reach v4, and it declines a file that is already v4 rather than
+  re-emitting its shards unframed — use `scx optimize --row-group-rows N` to
+  frame or re-frame.
 
 ## 11. Concurrent Read Safety
 
