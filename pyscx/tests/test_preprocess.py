@@ -190,3 +190,36 @@ def test_preprocess_invalid_op(synthetic_adata, tmp_dir):
     pyscx.from_anndata(synthetic_adata, source)
     with pytest.raises(RuntimeError, match="Unknown operation"):
         pyscx.preprocess(source, target, ["invalid_op"])
+
+
+def test_preprocess_and_save_layer_keep_cells_deleted(synthetic_adata, tmp_dir):
+    """A cell deleted before preprocessing must still be deleted after it.
+
+    Both ops rewrite values while leaving the obs row space alone, so they carry
+    the deletion-vector section rather than applying it: `n_obs_physical` is
+    unchanged and `n_obs` — the count every read actually honours — is not.
+    Dropping the section instead would silently resurrect the cells, with the
+    output looking perfectly well-formed.
+    """
+    import pyscx
+
+    source = str(tmp_dir / "src.scx")
+    pyscx.from_anndata(synthetic_adata, source)
+    n_obs = synthetic_adata.n_obs
+    pyscx.mark_deleted(source, [1, 3])
+
+    for op, target in (
+        ("preprocess", str(tmp_dir / "pp.scx")),
+        ("save_layer", str(tmp_dir / "layer.scx")),
+    ):
+        if op == "preprocess":
+            pyscx.preprocess(source, target, ["normalize_total", "log1p"])
+        else:
+            pyscx.save_layer(source, target, "normalized", ["log1p"])
+
+        exp = pyscx.open(target)
+        assert exp.has_deletions, f"{op}: the deletion vector must survive"
+        assert exp.n_obs_physical == n_obs, f"{op}: carried, not applied"
+        assert exp.n_obs == n_obs - 2, f"{op}: two cells stay deleted"
+        # And the materialised view agrees with the logical count.
+        assert pyscx.open(target).to_anndata().n_obs == n_obs - 2, op
