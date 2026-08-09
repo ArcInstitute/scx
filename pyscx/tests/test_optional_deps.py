@@ -272,6 +272,11 @@ def test_a_transitive_import_failure_is_not_relabelled_as_not_installed(adata):
     reinstall a package they already have, and hides the only line that says what
     is actually wrong.
     """
+    # The premise is "scikit-misc IS installed but its submodule fails". Without
+    # this, a machine that simply lacks scikit-misc takes the *rewrite* branch
+    # (correctly — the package really is missing) and the test fails claiming a
+    # bug that is not there. Verified: it fails exactly this way in a base venv.
+    pytest.importorskip("skmisc")
     with blocked("skmisc.loess"), warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with pytest.raises(ModuleNotFoundError) as excinfo:
@@ -594,9 +599,15 @@ def test_the_transition_warning_cannot_fail_the_call(adata):
     Run in a subprocess because `-W error` has to be in force at interpreter
     level for `simplefilter("error")` to reproduce the original failure faithfully.
     """
+    pytest.importorskip("pydeseq2")
     script = textwrap.dedent(
         """
-        import warnings
+        import warnings, importlib.util
+        # Belt and braces with the importorskip above: the warn path is gated on
+        # pydeseq2 being importable, so without it this test would pass having
+        # exercised nothing at all. Assert the precondition rather than assume it.
+        assert importlib.util.find_spec("pydeseq2") is not None, \\
+            "pydeseq2 absent - the warn path cannot fire, so this proves nothing"
         warnings.simplefilter("error")
         import numpy as np, scipy.sparse as sp, anndata as ad, pyscx
         rng = np.random.default_rng(0)
