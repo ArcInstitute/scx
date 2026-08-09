@@ -227,14 +227,47 @@ impl QueryPipeline {
         self.modality_id
     }
 
+    // -- Builders ----------------------------------------------------------
+    //
+    // Each builder comes in two forms: an in-place `*_mut(&mut self)` primitive
+    // that carries the implementation, and the fluent consuming form that
+    // delegates to it. The `_mut` forms exist for bindings that own the
+    // pipeline behind an `Option` (pyscx `PyQueryPipeline`, rscx
+    // `RQueryPipeline`): the consuming form moves `self` into the call and
+    // drops it on `Err`, so a failed step there leaves the binding with a
+    // permanently empty `Option`. Mutating in place cannot lose the pipeline —
+    // a rejected predicate leaves it unchanged and still usable. Keep `_mut`
+    // as the primitive; the reverse direction would need a dummy
+    // `QueryPipeline` to `mem::replace` with.
+
+    /// Filter observations (cells) by a predicate expression, in place.
+    ///
+    /// The `&mut` form of [`filter_obs`](Self::filter_obs). On a parse/schema
+    /// error the pipeline is **unchanged and still usable** — nothing is
+    /// half-applied.
+    pub fn filter_obs_mut(&mut self, expr: &str) -> Result<()> {
+        let pred = parse_predicate(expr, &self.obs_schema, "obs")?;
+        self.obs_predicates.push(pred);
+        Ok(())
+    }
+
     /// Filter observations (cells) by a predicate expression.
     ///
     /// The predicate is validated against the obs schema immediately.
     /// Multiple calls accumulate predicates with AND semantics.
     pub fn filter_obs(mut self, expr: &str) -> Result<Self> {
-        let pred = parse_predicate(expr, &self.obs_schema, "obs")?;
-        self.obs_predicates.push(pred);
+        self.filter_obs_mut(expr)?;
         Ok(self)
+    }
+
+    /// Filter variables (genes) by a predicate expression, in place.
+    ///
+    /// The `&mut` form of [`filter_var`](Self::filter_var); see
+    /// [`filter_obs_mut`](Self::filter_obs_mut) for why it exists.
+    pub fn filter_var_mut(&mut self, expr: &str) -> Result<()> {
+        let pred = parse_predicate(expr, &self.var_schema, "var")?;
+        self.var_predicates.push(pred);
+        Ok(())
     }
 
     /// Filter variables (genes) by a predicate expression.
@@ -242,35 +275,67 @@ impl QueryPipeline {
     /// The predicate is validated against the var schema immediately.
     /// Multiple calls accumulate predicates with AND semantics.
     pub fn filter_var(mut self, expr: &str) -> Result<Self> {
-        let pred = parse_predicate(expr, &self.var_schema, "var")?;
-        self.var_predicates.push(pred);
+        self.filter_var_mut(expr)?;
         Ok(self)
+    }
+
+    /// Select specific gene indices for projection, in place.
+    pub fn select_genes_mut(&mut self, gene_indices: Vec<u32>) {
+        self.gene_indices = Some(gene_indices);
     }
 
     /// Select specific gene indices for projection.
     ///
     /// Out-of-range indices are handled at collect time.
     pub fn select_genes(mut self, gene_indices: Vec<u32>) -> Self {
-        self.gene_indices = Some(gene_indices);
+        self.select_genes_mut(gene_indices);
         self
+    }
+
+    /// Enable normalize-total with the given target sum, in place.
+    pub fn with_normalize_mut(&mut self, target_sum: f64) {
+        self.normalize = Some(NormalizeConfig { target_sum });
     }
 
     /// Enable normalize-total with the given target sum.
     pub fn with_normalize(mut self, target_sum: f64) -> Self {
-        self.normalize = Some(NormalizeConfig { target_sum });
+        self.with_normalize_mut(target_sum);
         self
+    }
+
+    /// Enable log1p transformation, in place.
+    pub fn with_log1p_mut(&mut self) {
+        self.log1p = true;
     }
 
     /// Enable log1p transformation.
     pub fn with_log1p(mut self) -> Self {
-        self.log1p = true;
+        self.with_log1p_mut();
         self
+    }
+
+    /// Limit the number of returned cells, in place.
+    pub fn limit_mut(&mut self, n: usize) {
+        self.limit = Some(n);
     }
 
     /// Limit the number of returned cells.
     pub fn limit(mut self, n: usize) -> Self {
-        self.limit = Some(n);
+        self.limit_mut(n);
         self
+    }
+
+    /// Execute the pipeline and return the query result **without consuming
+    /// it**.
+    ///
+    /// Execution only ever reads the pipeline (`plan_and_mask(&self)` +
+    /// `materialize(&self, …)`), so a failed or repeated run is harmless.
+    /// Bindings that hand a long-lived pipeline object to a user call this so
+    /// that a failed `collect()` cannot destroy the caller's object; consuming
+    /// on success is then a binding-layer policy rather than a consequence of
+    /// Rust ownership.
+    pub fn collect_ref(&self) -> Result<QueryResult> {
+        crate::collect::execute(self)
     }
 
     /// Execute the pipeline and return the query result.
@@ -279,7 +344,7 @@ impl QueryPipeline {
     /// Delegates to `collect::execute()` which implements the full
     /// pipeline: pushdown → decode → projection → filter → fused ops.
     pub fn collect(self) -> Result<QueryResult> {
-        crate::collect::execute(self)
+        self.collect_ref()
     }
 
     /// Count matching rows without decoding the X matrix (CLI2).
@@ -741,6 +806,107 @@ mod tests {
         let pipeline = QueryPipeline::open(&path).unwrap();
         let err = pipeline.filter_obs("nonexistent == 'x'").unwrap_err();
         assert!(matches!(err, EngineError::SchemaError { .. }));
+    }
+
+    /// The `_mut` builder leaves the pipeline usable after a rejected
+    /// predicate — the property the consuming form structurally cannot offer
+    /// (it drops `self` on `Err`). pyscx/rscx hold the pipeline behind an
+    /// `Option`, so without this a predicate typo emptied it permanently.
+    #[test]
+    fn filter_obs_mut_error_leaves_pipeline_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 10, 5);
+        let mut pipeline = QueryPipeline::open(&path).unwrap();
+
+        let err = pipeline.filter_obs_mut("nonexistent == 'x'").unwrap_err();
+        assert!(matches!(err, EngineError::SchemaError { .. }));
+        assert_eq!(
+            pipeline.obs_predicates().len(),
+            0,
+            "a rejected predicate must not half-apply"
+        );
+
+        pipeline.filter_obs_mut("cell_type == 'T cell'").unwrap();
+        assert_eq!(pipeline.obs_predicates().len(), 1);
+        // cell_type cycles T/B/NK, so 10 rows => rows 0, 3, 6, 9.
+        assert_eq!(pipeline.collect().unwrap().x.n_rows(), 4);
+    }
+
+    #[test]
+    fn filter_var_mut_error_leaves_pipeline_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        // n_vars > 2 * n_obs so `sample_shard_data`'s column pairs never wrap:
+        // a wrapped row is unsorted and `project_csr_row` rejects it.
+        let path = write_test_file(&dir, 10, 20);
+        let mut pipeline = QueryPipeline::open(&path).unwrap();
+
+        let err = pipeline.filter_var_mut("nonexistent == 'x'").unwrap_err();
+        assert!(matches!(err, EngineError::SchemaError { .. }));
+        assert_eq!(pipeline.var_predicates().len(), 0);
+
+        pipeline.filter_var_mut("gene_id == 'gene_1'").unwrap();
+        assert_eq!(pipeline.var_predicates().len(), 1);
+        assert_eq!(pipeline.collect().unwrap().x.n_cols(), 1);
+    }
+
+    /// The `_mut` family and the fluent consuming family build the same
+    /// pipeline — the delegation is a refactor, not a second implementation.
+    #[test]
+    fn mut_builders_match_consuming() {
+        let dir = tempfile::tempdir().unwrap();
+        // Wide enough that no row's column pair wraps — see
+        // `filter_var_mut_error_leaves_pipeline_usable`.
+        let path = write_test_file(&dir, 10, 20);
+
+        let mut a = QueryPipeline::open(&path).unwrap();
+        a.filter_obs_mut("cell_type == 'T cell'").unwrap();
+        a.select_genes_mut(vec![0, 1, 2]);
+        a.with_normalize_mut(1e4);
+        a.with_log1p_mut();
+        a.limit_mut(5);
+
+        let b = QueryPipeline::open(&path)
+            .unwrap()
+            .filter_obs("cell_type == 'T cell'")
+            .unwrap()
+            .select_genes(vec![0, 1, 2])
+            .with_normalize(1e4)
+            .with_log1p()
+            .limit(5);
+
+        assert_eq!(a.obs_predicates().len(), b.obs_predicates().len());
+        assert_eq!(a.gene_indices(), b.gene_indices());
+        assert_eq!(a.normalize_target_sum(), b.normalize_target_sum());
+        assert_eq!(a.log1p(), b.log1p());
+        assert_eq!(a.limit_value(), b.limit_value());
+
+        let (ra, rb) = (a.collect().unwrap(), b.collect().unwrap());
+        assert_eq!(ra.x.shape, rb.x.shape);
+        assert_eq!(ra.x.indptr, rb.x.indptr);
+        assert_eq!(ra.x.indices, rb.x.indices);
+        assert_eq!(ra.x.data, rb.x.data);
+    }
+
+    /// `collect_ref` borrows: it is repeatable, and the pipeline survives for a
+    /// later consuming `collect()`. This is what lets a binding run a collect
+    /// that might fail without destroying the caller's object.
+    #[test]
+    fn collect_ref_does_not_consume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 10, 5);
+        let pipeline = QueryPipeline::open(&path)
+            .unwrap()
+            .filter_obs("cell_type == 'T cell'")
+            .unwrap();
+
+        let a = pipeline.collect_ref().unwrap();
+        let b = pipeline.collect_ref().unwrap();
+        assert_eq!(a.x.shape, b.x.shape);
+        assert_eq!(a.x.data, b.x.data);
+
+        let c = pipeline.collect().unwrap();
+        assert_eq!(a.x.shape, c.x.shape);
+        assert_eq!(a.x.data, c.x.data);
     }
 
     #[test]
