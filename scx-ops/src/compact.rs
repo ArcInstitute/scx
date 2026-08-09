@@ -898,9 +898,18 @@ fn filtered_obs_shards<'a>(
 /// shard's `n_rows_total`). When every row is deleted, a single empty obs
 /// section keeps the file well-formed.
 ///
-/// `pub(crate)` so `scx optimize` can reuse it (with `keep_mask = None`) to
-/// preserve a sharded obs layout instead of collapsing it via `read_obs()`.
-pub(crate) fn write_obs_shards_streaming(
+/// Exported so every rewriting op can preserve a sharded obs layout instead of
+/// collapsing it via `read_obs()` + `write_obs()`, which assembles the whole
+/// axis into one in-memory batch and emits one legacy `ObsMetadata` section:
+/// peak RSS O(n_obs) — the OOM the sharded layout exists to prevent — plus the
+/// silent loss of the row-sharded-obs precondition Level-2 row-set pushdown
+/// depends on. `compact` filters with a `keep_mask`; the 1:1 rewrites
+/// (`optimize`, `build_csc`, `scx upgrade` in `scx-cli`) pass `None`.
+///
+/// **`keep_mask = None` is only valid for a rewrite that preserves the obs row
+/// space 1:1.** An op that drops or reorders rows must pass its mask, or the
+/// shard `row_start`s it writes will not describe the rows it wrote.
+pub fn write_obs_shards_streaming(
     reader: &ScxReader,
     writer: &mut ScxWriter,
     keep_mask: Option<&[bool]>,

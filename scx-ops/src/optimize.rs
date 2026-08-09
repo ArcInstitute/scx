@@ -390,9 +390,13 @@ pub fn optimize_with_framing(
 /// per non-empty input shard. Peak memory is one shard — `read_var()` (which
 /// assembles every `VarMetadataShard` into one batch) is never called. Mirror of
 /// compact's [`write_obs_shards_streaming`](crate::compact::write_obs_shards_streaming)
-/// for the var axis; optimize applies no deletions, so (unlike the obs helper)
-/// it takes no `keep_mask` and renumbers output shards over the non-empty inputs.
-pub(crate) fn write_var_shards_streaming(
+/// for the var axis; no op deletes columns, so (unlike the obs helper) it takes
+/// no `keep_mask` and renumbers output shards over the non-empty inputs.
+///
+/// Exported for the same reason as its obs twin: `optimize`, `build_csc` and
+/// `scx upgrade` (in `scx-cli`) all preserve the var axis 1:1 and must not
+/// collapse a sharded layout into one legacy `VarMetadata` section.
+pub fn write_var_shards_streaming(
     reader: &ScxReader,
     writer: &mut ScxWriter,
     n_vars_total: u64,

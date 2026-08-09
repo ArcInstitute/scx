@@ -33,7 +33,10 @@ pub use append::{
 };
 pub use build_csc::run_build_csc;
 pub use codec_intent::{framing_for_rewrite, intent_from_codec_selection, seed_codec};
-pub use compact::{compact, compact_with_index_options, compact_with_options, CompactOptions};
+pub use compact::{
+    compact, compact_with_index_options, compact_with_options, write_obs_shards_streaming,
+    CompactOptions,
+};
 pub use delete::mark_deleted;
 pub use error::{OpsError, Result};
 pub use external_layer::{
@@ -50,7 +53,7 @@ pub use group_plan::{plan_group_shards, GroupPlan, GroupRecord, Role};
 pub use merge::{merge, merge_with_index_options, merge_with_options};
 pub use merge_options::{MergeOptions, UnsPolicy};
 pub use modify_metadata::{modify_metadata, set_uns, MetadataPatch, ModifyMetadataSummary};
-pub use optimize::{optimize, optimize_with_framing, OptimizeStats};
+pub use optimize::{optimize, optimize_with_framing, write_var_shards_streaming, OptimizeStats};
 pub use predicate_index::PredicateIndexBuildSummary;
 pub use rebuild_csc::{framing_for_csc_rebuild, rebuild_csc_inplace};
 pub use rewrite_helpers::copy_auxiliary_sections;
