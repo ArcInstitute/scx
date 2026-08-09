@@ -69,10 +69,14 @@ mtx` — necessarily apply. So do the materialising reads (`pyscx` `to_anndata`,
 
 Two consequences worth knowing:
 
-- A **carried** deletion is not visible in `n_obs`, which is the *physical* row
-  count. `scx info` reports the vector separately ("Deletion vectors: … N cells
-  deleted"); `Experiment.n_obs` in `pyscx` is the logical count and will be
-  smaller.
+- A **carried** deletion is not visible in the header's `n_obs`, which is the
+  *physical* row count. `scx info` reports the vector separately ("Deletion
+  vectors: … N cells deleted"). Both bindings expose the logical count as the
+  default and the physical one under an explicit name: `Experiment.n_obs` /
+  `Experiment.n_obs_physical` in `pyscx`, `$n_obs()` / `$n_obs_physical()` in
+  `rscx`. `nnz` is **physical** on both — it comes from catalog stats, and
+  excluding deleted rows would mean decoding the matrix — so on a file with
+  deletions it exceeds the nnz of what a read returns.
 - Because `build-csc --in-place` writes a wholly new file with no prior catalog,
   it is **not** rollback-able. It carries deletions rather than applying them
   precisely so that `mark_deleted` → `build-csc` — the documented way to restore

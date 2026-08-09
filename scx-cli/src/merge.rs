@@ -140,7 +140,7 @@ pub fn run_merge(
             "  {} of those cells are logically deleted (carried from the inputs); \
              {} live. Run `scx compact` to reclaim them.",
             n_deleted,
-            total_obs - n_deleted,
+            total_obs.saturating_sub(n_deleted),
         );
     }
     drop(out_reader);

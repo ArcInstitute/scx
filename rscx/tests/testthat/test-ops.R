@@ -232,10 +232,23 @@ test_that("materialising reads exclude logically deleted cells", {
   scx_delete(tmp, c(1L, 6L, 11L))
 
   exp <- scx_open(tmp)
-  # X, obs and the query engine must all agree on the live cell count.
+  # X, obs, the size accessor and the query engine must ALL agree on the live
+  # cell count. $n_obs() is the one that matters most here: a handle reporting
+  # 20 while every read returns 17 is worse than the resurrection bug it
+  # replaced, because it is internally inconsistent rather than uniformly
+  # stale -- a caller sizing a buffer from it gets a plausible wrong answer.
   expect_equal(nrow(exp$x_matrix()), 17)
   expect_equal(nrow(exp$obs()), 17)
+  expect_equal(exp$n_obs(), 17)
   expect_equal(scx_query(exp) |> collect() |> (\(r) r$n_obs())(), 17)
+
+  # The physical count is still reachable, and is what shrinks on compact.
+  expect_equal(exp$n_obs_physical(), 20)
+
+  # nnz stays physical (it comes from catalog stats, not a decode), matching
+  # pyscx's Experiment.nnz. Documented, not a bug -- pinned so a later change
+  # to either side is a deliberate one.
+  expect_equal(exp$nnz(), scx_open(path)$nnz())
 
   # var is on the other axis and is untouched by a cell deletion.
   expect_equal(nrow(exp$var()), 10)

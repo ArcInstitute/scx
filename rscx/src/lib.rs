@@ -51,6 +51,25 @@ impl ScxExperiment {
         })
     }
 
+    /// Live (post-deletion) row count — the physical header count minus the
+    /// deletion vector's entries.
+    ///
+    /// Every materialising read on this object filters deleted rows out, so
+    /// this is the number that has to back `$n_obs()`. Reporting the physical
+    /// count there while `$obs()` and `$x_matrix()` return fewer rows would be
+    /// worse than the resurrection bug it replaced: internally inconsistent
+    /// rather than uniformly stale, so a caller sizing a buffer or asserting
+    /// `ncol(seu) == exp$n_obs()` gets a plausible wrong answer.
+    fn logical_n_obs(&self) -> Result<u64> {
+        let deleted = self
+            .reader
+            .read_deletion_vectors()
+            .map_err(|e| Error::Other(e.to_string()))?
+            .map(|dv| dv.total_deleted())
+            .unwrap_or(0);
+        Ok(self.reader.n_obs().saturating_sub(deleted))
+    }
+
     /// Fallible body of `obs` (see B3 / `throw_on_err`).
     ///
     /// Deletion-filtered, so `$obs()` has exactly as many rows as
@@ -258,9 +277,23 @@ impl ScxExperiment {
         crate::util::throw_on_err(Self::open_impl(path))
     }
 
-    /// Number of observations (cells).
+    /// Number of observations (cells), reflecting **live** rows — the physical
+    /// row count minus any deletion-vector entries.
+    ///
+    /// This is the count every materialising read on this object actually
+    /// returns: `nrow($obs())`, `nrow($x_matrix())`, `ncol($to_seurat())` and
+    /// `collect(scx_query(exp))$n_obs()` all agree with it. Mirrors pyscx's
+    /// `Experiment.n_obs`; see `$n_obs_physical()` for the raw header count.
+    ///
     /// Returns R numeric (f64) to handle >2B cells without i32 overflow.
     fn n_obs(&self) -> Robj {
+        crate::util::throw_on_err(self.logical_n_obs().map(|n| Robj::from(n as f64)))
+    }
+
+    /// Physical (pre-deletion) row count straight from the file header. Equal
+    /// to `$n_obs()` on a file with no deletions, larger once cells have been
+    /// marked deleted via `scx_delete()` and until `scx compact` reclaims them.
+    fn n_obs_physical(&self) -> Robj {
         Robj::from(self.reader.n_obs() as f64)
     }
 
@@ -269,7 +302,12 @@ impl ScxExperiment {
         Robj::from(self.reader.n_vars() as f64)
     }
 
-    /// Total non-zero entries.
+    /// Total non-zero entries, **physical**: entries in logically deleted rows
+    /// are still counted, because the catalog records nnz per shard and
+    /// excluding them would mean decoding the matrix. Matches pyscx's
+    /// `Experiment.nnz`, which is physical for the same reason. On a file with
+    /// deletions this therefore exceeds `sum($x_matrix() != 0)`; run
+    /// `scx compact` if you need the two to agree.
     fn nnz(&self) -> Robj {
         Robj::from(self.reader.nnz() as f64)
     }

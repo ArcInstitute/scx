@@ -555,6 +555,23 @@ fn extract_modality(
     // of going through the query engine, so — unlike the single-modality subset
     // — nothing else applies the mask for it.
     if let Some(keep) = reader.deletion_keep_mask()? {
+        // Both masks are sized from the same `n_obs`, so a mismatch is
+        // impossible on a well-formed file — which is exactly why it must not
+        // be a silent `zip`. A short `keep` would leave the tail of the filter
+        // mask un-ANDed and resurrect the deleted rows it covers: the failure
+        // this whole change exists to stop, reintroduced by the fix for it.
+        // `filter_batch_by_keep_mask` refuses the same class for the same
+        // reason.
+        if keep.len() != n_obs_global {
+            return Err(format!(
+                "deletion keep mask has {} entries but the file declares n_obs={}; \
+                 refusing to subset '{modality_name}' against a mask that does not \
+                 cover every row",
+                keep.len(),
+                n_obs_global
+            )
+            .into());
+        }
         match &mut row_mask {
             Some(mask) => {
                 for (slot, &live) in mask.iter_mut().zip(keep.iter()) {
