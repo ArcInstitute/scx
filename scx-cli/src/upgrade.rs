@@ -4,7 +4,8 @@
 // newest unframed version (DEFAULT_WRITE_FORMAT_VERSION). It intentionally does
 // NOT add row-group framing, so it does not reach CURRENT_FORMAT_VERSION (v4) —
 // use `scx optimize --row-group-rows N` for the framed v4 layout. If the file
-// is already at the unframed target, this is a no-op. See SCX-013.
+// is already at the unframed target — or already *past* it, at v4 — this is a
+// no-op. See SCX-013.
 
 use std::path::Path;
 
@@ -28,6 +29,26 @@ pub fn run_upgrade(
 
     // `scx upgrade` re-writes to the newest **unframed** version (v4 requires
     // row-group framing, which upgrade does not add).
+    //
+    // A file *newer* than that target is declined rather than rewritten. The
+    // rewrite is not a no-op on such a file: it re-emits every shard unframed
+    // and stamps v3, so a v4 input silently loses the row-group framing — and
+    // with it the sub-shard random access v4 exists to provide — while printing
+    // "Upgraded ... v4 -> v3". On `--in-place` that is unrecoverable: the rename
+    // lands a wholly new file carrying no prior catalog, so `scx rollback` has
+    // nothing to roll back to. There is deliberately no `--allow-downgrade`:
+    // nothing asks for one, and `scx optimize` is the op that owns framing in
+    // both directions.
+    if old_version > DEFAULT_WRITE_FORMAT_VERSION {
+        println!(
+            "File is at format version {old_version}, which is newer than the version \
+             `scx upgrade` targets (v{DEFAULT_WRITE_FORMAT_VERSION}, unframed). Rewriting \
+             it here would strip row-group framing and its sub-shard random access, and \
+             `--in-place` is not rollback-able. Nothing to do; use `scx optimize \
+             --row-group-rows N` to re-frame."
+        );
+        return Ok(());
+    }
     if old_version == DEFAULT_WRITE_FORMAT_VERSION {
         println!(
             "File is already at format version {} (newest unframed version; \
@@ -104,14 +125,30 @@ fn rewrite_with_current_version(
         ..Default::default()
     };
 
-    // Read metadata
-    let obs = reader.read_obs()?;
-    let var = reader.read_var()?;
-
     // Create writer
     let mut writer = ScxWriter::new(output, out_header)?;
-    writer.write_obs(&obs)?;
-    writer.write_var(&var)?;
+
+    // obs/var pass through 1:1, so a row-sharded input must come out
+    // row-sharded. `read_obs()` + `write_obs()` would assemble every
+    // `ObsMetadataShard` into one in-memory batch and emit it as a single
+    // legacy section — peak RSS O(n_obs) (the OOM the sharded layout exists to
+    // prevent) and, because Level-2 row-set pushdown requires sharded obs, a
+    // silent loss of predicate pushdown on exactly the atlas-scale files where
+    // it earns its keep. Same streaming helpers `optimize` and `build-csc` use;
+    // `keep_mask = None` because an upgrade never drops rows — which is also
+    // what licenses `copy_auxiliary_sections`' deletion-vector carry below.
+    // Legacy single-section input has no per-shard reader and falls through to
+    // the materialising path, which is what it already was.
+    if reader.obs_metadata_shard_count() > 0 {
+        scx_ops::write_obs_shards_streaming(reader, &mut writer, None, in_header.n_obs as usize)?;
+    } else {
+        writer.write_obs(&reader.read_obs()?)?;
+    }
+    if reader.var_metadata_shard_count() > 0 {
+        scx_ops::write_var_shards_streaming(reader, &mut writer, in_header.n_vars)?;
+    } else {
+        writer.write_var(&reader.read_var()?)?;
+    }
 
     // Re-write CSR shards (per-shard codec)
     for shard_entry in &csr_entries {
@@ -172,6 +209,7 @@ mod tests {
     use super::*;
     use crate::test_utils::write_test_file;
     use scx_codec::{CodecId, ValueEncoding};
+    use std::path::PathBuf;
 
     /// A format upgrade is a 1:1 rewrite, so the deletion-vector section has to
     /// come with it. `rewrite_with_current_version` copies `in_header.flags`
@@ -428,5 +466,215 @@ mod tests {
         let out_csc = out_reader.read_all_csc_shards().unwrap();
         assert_eq!(out_csc.shape, (n_rows, n_cols));
         assert_eq!(out_csc.to_dense().unwrap(), dense);
+    }
+
+    /// A real v4 file, built the way users get one: framed shards, sharded obs.
+    /// `optimize` is the op that produces the framed layout, and
+    /// `ObsShardPolicy::Always` gives us the sharded obs at test scale.
+    fn write_framed_v4_file(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> PathBuf {
+        let base = write_test_file(dir, n_obs, n_vars);
+        let v4 = dir.path().join("framed_v4.scx");
+        scx_ops::optimize_with_framing(
+            &base,
+            &v4,
+            None,
+            scx_format_io::ObsShardPolicy::Always,
+            Some(scx_format_io::FramingConfig::default()),
+        )
+        .unwrap();
+
+        let r = ScxReader::open(&v4).unwrap();
+        assert_eq!(
+            r.header().format_version,
+            scx_format_io::header::CURRENT_FORMAT_VERSION,
+            "fixture must actually be v4, or the test proves nothing"
+        );
+        assert!(
+            r.obs_metadata_shard_count() > 0,
+            "fixture must actually have sharded obs"
+        );
+        v4
+    }
+
+    /// `scx upgrade` targets the newest **unframed** version (v3). Handed
+    /// something newer it must decline, not "upgrade" it downwards.
+    ///
+    /// The rewrite is not a no-op on a v4 input: it re-emits every shard
+    /// unframed and stamps v3, silently destroying the sub-shard random access
+    /// v4 exists to provide — and it collapses the sharded obs layout on the
+    /// way past. Nothing in the CLI help or `docs/api.md` says it does either.
+    #[test]
+    fn upgrade_declines_a_framed_v4_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_framed_v4_file(&dir, 8, 5);
+        let output = dir.path().join("upgraded.scx");
+
+        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+
+        assert!(
+            !output.exists(),
+            "a file newer than the upgrade target must be left alone, not \
+             rewritten downwards into a new file"
+        );
+        let r = ScxReader::open(&input).unwrap();
+        assert_eq!(
+            r.header().format_version,
+            scx_format_io::header::CURRENT_FORMAT_VERSION
+        );
+    }
+
+    /// The `--in-place` variant of the above, which is the irrecoverable one:
+    /// it renames a wholly new file over the target carrying no prior catalog,
+    /// so `scx rollback` cannot undo it.
+    #[test]
+    fn upgrade_in_place_leaves_a_v4_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_framed_v4_file(&dir, 8, 5);
+
+        let before = ScxReader::open(&input).unwrap();
+        let (version, obs_shards, csr_entries) = (
+            before.header().format_version,
+            before.obs_metadata_shard_count(),
+            before.catalog().csr_shards_sorted().len(),
+        );
+        let framed_before = before
+            .read_shard_header(before.catalog().csr_shards_sorted()[0])
+            .unwrap()
+            .shard_format_version;
+        assert_eq!(framed_before, 2, "fixture's shards must actually be framed");
+        drop(before);
+
+        run_upgrade(&input, None, true).unwrap();
+
+        let after = ScxReader::open(&input).unwrap();
+        assert_eq!(after.header().format_version, version, "version changed");
+        assert_eq!(
+            after.obs_metadata_shard_count(),
+            obs_shards,
+            "obs layout changed"
+        );
+        assert_eq!(after.catalog().csr_shards_sorted().len(), csr_entries);
+        assert_eq!(
+            after
+                .read_shard_header(after.catalog().csr_shards_sorted()[0])
+                .unwrap()
+                .shard_format_version,
+            framed_before,
+            "row-group framing was stripped in place, and this is the path \
+             `scx rollback` cannot undo"
+        );
+    }
+
+    /// obs and var pass through an upgrade 1:1, so a row-sharded input must
+    /// come out row-sharded.
+    ///
+    /// `read_obs()` + `write_obs()` assembles every `ObsMetadataShard` into one
+    /// in-memory batch and emits it as a single legacy section: peak RSS
+    /// O(n_obs) — the OOM the sharded layout exists to prevent — and a silent
+    /// loss of the row-sharded-obs precondition Level-2 row-set pushdown
+    /// depends on. Same defect `build-csc` had.
+    ///
+    /// The fixture is stamped pre-v3 so it reaches the rewrite at all: sharded
+    /// obs sets no version floor (`rewrite_output_format_version` clamps into
+    /// `[feature_floor, 3]` and nothing raises the floor for section types
+    /// 24/25), so a merge or append over pre-v3 inputs yields exactly this —
+    /// an old file with sharded obs, which is what `scx upgrade` is *for*.
+    #[test]
+    fn upgrade_preserves_sharded_obs_and_var_layout() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use scx_format_io::section::SectionType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("legacy_sharded.scx");
+        let (n_obs, n_vars) = (6usize, 4usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+
+        let obs = sample_obs(n_obs);
+        for shard_idx in 0u32..2 {
+            let row_start = shard_idx as usize * 3;
+            w.write_obs_shard(
+                shard_idx,
+                row_start as u64,
+                3,
+                n_obs as u64,
+                &obs.slice(row_start, 3),
+            )
+            .unwrap();
+        }
+        let var = sample_var(n_vars);
+        for shard_idx in 0u32..2 {
+            let col_start = shard_idx as usize * 2;
+            w.write_var_shard(
+                shard_idx,
+                col_start as u64,
+                2,
+                n_vars as u64,
+                &var.slice(col_start, 2),
+            )
+            .unwrap();
+        }
+
+        let mut indptr = vec![0u64];
+        let (mut indices, mut values) = (Vec::new(), Vec::new());
+        for row in 0..n_obs {
+            indices.push(((row * 2) % n_vars) as u32);
+            indices.push(((row * 2 + 1) % n_vars) as u32);
+            values.push(((row + 1) % 256) as u8);
+            values.push(((row + 2) % 256) as u8);
+            indptr.push(indptr.last().unwrap() + 2);
+        }
+        w.write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        // The gate has to let this through, or the test proves nothing.
+        let src = ScxReader::open(&input).unwrap();
+        assert_eq!(src.header().format_version, 1);
+        assert_eq!(src.obs_metadata_shard_count(), 2);
+        assert_eq!(src.var_metadata_shard_count(), 2);
+        drop(src);
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        assert_eq!(
+            out.header().format_version,
+            DEFAULT_WRITE_FORMAT_VERSION,
+            "the upgrade itself must still have happened"
+        );
+        assert_eq!(
+            out.obs_metadata_shard_count(),
+            2,
+            "sharded obs must stay sharded through an upgrade"
+        );
+        assert_eq!(
+            out.var_metadata_shard_count(),
+            2,
+            "sharded var must stay sharded through an upgrade"
+        );
+        for collapsed in [SectionType::ObsMetadata, SectionType::VarMetadata] {
+            assert!(
+                !out.catalog()
+                    .entries
+                    .iter()
+                    .any(|e| e.section_type == collapsed),
+                "no collapsed single-section {collapsed:?} may be emitted"
+            );
+        }
+        // ...and the content still round-trips.
+        assert_eq!(out.read_obs().unwrap().num_rows(), n_obs);
+        assert_eq!(out.read_var().unwrap().num_rows(), n_vars);
+        assert_eq!(out.read_all_csr_shards().unwrap().shape, (n_obs, n_vars));
     }
 }
