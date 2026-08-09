@@ -118,6 +118,16 @@ pub fn run_merge(
     let total_obs = out_reader.header().n_obs;
     let total_shards = out_reader.header().n_csr_shards;
 
+    // `n_obs` is the physical row count. When the inputs carried deletions the
+    // merge carries them too (remapped into the merged row space), so say so —
+    // otherwise "40 cells" reads exactly like the resurrection bug this
+    // carry-through exists to prevent.
+    let n_deleted = out_reader
+        .read_deletion_vectors()
+        .ok()
+        .flatten()
+        .map(|dv| dv.total_deleted())
+        .unwrap_or(0);
     println!(
         "Merged {} files into {} ({} cells, {} shards)",
         inputs.len(),
@@ -125,6 +135,14 @@ pub fn run_merge(
         total_obs,
         total_shards,
     );
+    if n_deleted > 0 {
+        println!(
+            "  {} of those cells are logically deleted (carried from the inputs); \
+             {} live. Run `scx compact` to reclaim them.",
+            n_deleted,
+            total_obs - n_deleted,
+        );
+    }
     drop(out_reader);
 
     // Re-emit the CSC sidecar against the merged output, preserving its framing

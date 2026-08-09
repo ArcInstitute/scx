@@ -173,6 +173,37 @@ mod tests {
     use crate::test_utils::write_test_file;
     use scx_codec::{CodecId, ValueEncoding};
 
+    /// A format upgrade is a 1:1 rewrite, so the deletion-vector section has to
+    /// come with it. `rewrite_with_current_version` copies `in_header.flags`
+    /// forward, which *looks* like it preserves the flag — but the writer
+    /// re-derives every flag from the sections actually written, so without the
+    /// carry the deletions silently vanish and the cells come back.
+    #[test]
+    fn upgrade_carries_deletion_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 8, 5);
+        scx_ops::mark_deleted(&input, &[2, 6]).unwrap();
+        let output = dir.path().join("upgraded.scx");
+
+        let reader = ScxReader::open(&input).unwrap();
+        rewrite_with_current_version(&reader, &output).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        assert!(
+            out.header().has_deletion_vectors(),
+            "deletion-vector flag must survive an upgrade"
+        );
+        let dv = out
+            .read_deletion_vectors()
+            .unwrap()
+            .expect("deletion-vector section present after upgrade");
+        assert_eq!(dv.total_deleted(), 2);
+        assert!(dv.is_deleted_global(2) && dv.is_deleted_global(6));
+        // Carried, not applied — the rows are still physically there.
+        assert_eq!(out.n_obs(), 8);
+        assert_eq!(out.read_all_csr_shards_filtered().unwrap().shape.0, 6);
+    }
+
     #[test]
     fn test_upgrade_preserves_data() {
         let dir = tempfile::tempdir().unwrap();

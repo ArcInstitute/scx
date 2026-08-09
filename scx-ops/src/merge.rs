@@ -194,6 +194,13 @@ pub fn merge_with_options(
 
     let first_header = readers[0].header();
 
+    // Merge concatenates every input's rows, so a deleted cell must stay
+    // deleted in the merged row space — see `remap_deletion_vectors`, called
+    // before `finish()` on both the sorted and the concatenating path. Carried
+    // rather than applied: merge is not a compaction, and the reasoning
+    // `optimize` documents applies here too — the caller runs `scx compact` when
+    // they want the rows physically gone.
+
     // CSC sidecars are dropped on merge: row layout is
     // re-concatenated across inputs, so any per-input CSC `indices`
     // arrays would reference stale row indices in the merged output.
@@ -452,6 +459,10 @@ pub fn merge_with_options(
                 .collect(),
         });
         writer.write_provenance(all_prov_entries)?;
+
+        if let Some(dv) = remap_deletion_vectors(&readers, Some(&order))? {
+            writer.write_deletion_vectors(&dv)?;
+        }
 
         writer.finish()?;
         return Ok(PredicateIndexBuildSummary {
@@ -829,11 +840,124 @@ pub fn merge_with_options(
     });
     writer.write_provenance(all_prov_entries)?;
 
+    if let Some(dv) = remap_deletion_vectors(&readers, None)? {
+        writer.write_deletion_vectors(&dv)?;
+    }
+
     writer.finish()?;
     Ok(PredicateIndexBuildSummary {
         result: index_result,
         multimodal_skip: None,
     })
+}
+
+/// Union the inputs' deletion vectors into the merged output's row space, or
+/// `Ok(None)` when no input has any.
+///
+/// Deletion vectors are obs-row-indexed, so merging them is the same
+/// index-remapping problem the obs rows themselves pose, and the answer has to
+/// match whichever way the rows were laid out:
+///
+/// * `order = None` — plain concatenation. Input `i` occupies the output rows
+///   `[Σ_{j<i} n_obs_j, …)`, so a deleted row moves by that prefix sum.
+/// * `order = Some(order)` — sorted k-way merge. `order[out_row]` names the
+///   contributing input, and each input is consumed strictly in its own row
+///   order, so replaying it with per-input forward cursors reconstructs the
+///   (input, input row) → output row map. This is the same replay
+///   `merge_sorted::emit_sorted` performs over the same slice.
+///
+/// Every bitmap is remapped, not just the global one: scoped (`modality_id >=
+/// 1`) bitmaps are reserved and unpopulated by shipped writers, but they are
+/// obs-row-indexed too, so treating them uniformly is both correct and one less
+/// special case to get wrong later.
+fn remap_deletion_vectors(
+    readers: &[ScxReader],
+    order: Option<&[u32]>,
+) -> Result<Option<scx_format_io::deletion_vectors::DeletionVectors>> {
+    use scx_format_io::deletion_vectors::DeletionVectors;
+
+    let input_dvs: Vec<Option<DeletionVectors>> = readers
+        .iter()
+        .map(|r| r.read_deletion_vectors())
+        .collect::<std::result::Result<_, _>>()?;
+    if input_dvs.iter().all(|dv| dv.is_none()) {
+        return Ok(None);
+    }
+
+    // out_rows[input][input_row] — built once, then reused for every bitmap of
+    // that input. For the concatenation case this is just an offset, so only the
+    // sorted case materializes a map.
+    let offsets: Vec<u64> = readers
+        .iter()
+        .scan(0u64, |acc, r| {
+            let start = *acc;
+            *acc += r.n_obs();
+            Some(start)
+        })
+        .collect();
+    let sorted_map: Option<Vec<Vec<u64>>> = match order {
+        None => None,
+        Some(order) => {
+            let mut cursors = vec![0usize; readers.len()];
+            let mut map: Vec<Vec<u64>> = readers
+                .iter()
+                .map(|r| Vec::with_capacity(r.n_obs() as usize))
+                .collect();
+            for (out_row, &input) in order.iter().enumerate() {
+                let input = input as usize;
+                let slot = map.get_mut(input).ok_or_else(|| {
+                    OpsError::InvalidInput(format!(
+                        "merge order names input {input} but only {} inputs were opened",
+                        readers.len()
+                    ))
+                })?;
+                slot.push(out_row as u64);
+                cursors[input] += 1;
+            }
+            Some(map)
+        }
+    };
+
+    let mut out = DeletionVectors::new();
+    let mut any = false;
+    for (i, dv) in input_dvs.iter().enumerate() {
+        let Some(dv) = dv else { continue };
+        for (&modality_id, bitmap) in &dv.deletions {
+            let mut rows: Vec<u32> = Vec::with_capacity(bitmap.len() as usize);
+            for row in bitmap.iter() {
+                let out_row = match &sorted_map {
+                    Some(map) => *map[i].get(row as usize).ok_or_else(|| {
+                        OpsError::InvalidInput(format!(
+                            "input {i} marks row {row} deleted but the merge order only \
+                             placed {} of its rows",
+                            map[i].len()
+                        ))
+                    })?,
+                    None => offsets[i] + row as u64,
+                };
+                // Roaring bitmaps are u32-keyed while `n_obs` is u64. Refuse
+                // rather than wrap: a wrapped index would mark an unrelated cell
+                // deleted, which is the failure this whole change exists to stop.
+                rows.push(u32::try_from(out_row).map_err(|_| {
+                    OpsError::InvalidInput(format!(
+                        "merged obs row {out_row} exceeds the u32 range a deletion vector \
+                         can address; compact the inputs to materialize their deletions \
+                         before merging"
+                    ))
+                })?);
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            any = true;
+            out.deletions
+                .entry(modality_id)
+                .or_default()
+                .extend(rows.iter().copied());
+        }
+    }
+
+    Ok(any.then_some(out))
 }
 
 /// Phase 6: merge multimodal SCX files with matching modality
@@ -1301,6 +1425,12 @@ fn merge_multimodal(
             .collect(),
     });
     writer.write_provenance(all_prov)?;
+    // Deletion is whole-cell and the obs axis is shared across modalities, so
+    // the multimodal concatenation moves rows by exactly the same per-input
+    // offsets the single-modality path uses.
+    if let Some(dv) = remap_deletion_vectors(readers, None)? {
+        writer.write_deletion_vectors(&dv)?;
+    }
     writer.finish()?;
     Ok(())
 }
