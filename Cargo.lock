@@ -3464,7 +3464,6 @@ dependencies = [
  "scx-sparse",
  "tempfile",
  "thiserror 2.0.18",
- "thread_local",
 ]
 
 [[package]]
