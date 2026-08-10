@@ -2616,8 +2616,9 @@ fn unify_dictionary_columns(batch: &RecordBatch) -> Result<RecordBatch> {
 /// (key narrowed via [`min_dictionary_key_type`]) for string value types, or
 /// `None` for any shape that should take the decode/re-encode fallback
 /// (non-Int32 keys — not produced by the assembler's `widen_dictionary_keys` —
-/// or non-string value types). Categoricals are strings, so the fast path
-/// covers all real cases.
+/// or a value type with neither a fast path nor a hand-packing arm).
+/// `Utf8` / `LargeUtf8` cover the common categorical, and `Boolean` has its
+/// own arm because arrow cannot pack it at all.
 fn dedup_dictionary_column(
     col: &arrow::array::ArrayRef,
     value_type: &arrow::datatypes::DataType,
@@ -2648,6 +2649,16 @@ fn dedup_dictionary_column(
                 .ok_or_else(|| ScxError::InvalidCatalog("dictionary value type mismatch".into()))?;
             Ok(Some(dedup_string_dict::<i32>(keys, v, value_type)?))
         }
+        // Not an optimization like the string arms — a *requirement*. Arrow
+        // cannot pack a `Boolean` array into a dictionary, so the
+        // decode/re-encode fallback raises on this value type.
+        DataType::Boolean => {
+            let v = values
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .ok_or_else(|| ScxError::InvalidCatalog("dictionary value type mismatch".into()))?;
+            Ok(Some(dedup_boolean_dict(keys, v, value_type)?))
+        }
         _ => Ok(None),
     }
 }
@@ -2660,8 +2671,7 @@ fn dedup_string_dict<O: arrow::array::OffsetSizeTrait>(
     values: &arrow::array::GenericStringArray<O>,
     value_type: &arrow::datatypes::DataType,
 ) -> Result<(arrow::array::ArrayRef, arrow::datatypes::DataType)> {
-    use arrow::array::{Array, DictionaryArray, GenericStringArray, Int32Array};
-    use arrow::datatypes::{DataType, Int32Type};
+    use arrow::array::{Array, GenericStringArray};
 
     let mut interner: HashMap<Option<&str>, u32> = HashMap::new();
     let mut old_to_new: Vec<u32> = Vec::with_capacity(values.len());
@@ -2684,12 +2694,67 @@ fn dedup_string_dict<O: arrow::array::OffsetSizeTrait>(
     }
     let n_distinct = unified.len();
 
-    // Remap keys (O(n_obs) integer gather; null keys preserved). Each key must
-    // index into the source dictionary; a malformed file with an out-of-range
-    // (or negative) key is rejected rather than panicking on the slice index
-    // (readers return errors on malformed input — see docs/conventions.md).
-    let new_keys: Int32Array = keys
-        .iter()
+    let new_keys = remap_dictionary_keys(keys, &old_to_new)?;
+    let unified_values: arrow::array::ArrayRef = Arc::new(GenericStringArray::<O>::from(unified));
+    finish_deduped_dictionary(new_keys, unified_values, n_distinct, value_type)
+}
+
+/// Core of [`dedup_dictionary_column`] for a `Boolean` value type.
+///
+/// Booleans need their own arm because arrow's dictionary *packing* does not
+/// support them, so the generic decode→re-encode fallback below raises
+/// `Unsupported output type for dictionary packing: Boolean` — which made
+/// `read_obs()` fail outright on a row-sharded file carrying a
+/// `pd.Categorical([True, False])` column. Deduplicating here keeps the
+/// column a categorical, so a sharded file reads back with the same pandas
+/// dtype an unsharded one does.
+///
+/// There are at most three distinct entries (`true` / `false` / null), so
+/// the interner is a fixed three-slot lookup rather than a hash map.
+fn dedup_boolean_dict(
+    keys: &arrow::array::Int32Array,
+    values: &arrow::array::BooleanArray,
+    value_type: &arrow::datatypes::DataType,
+) -> Result<(arrow::array::ArrayRef, arrow::datatypes::DataType)> {
+    use arrow::array::{Array, BooleanArray};
+
+    // Slot order is first-occurrence over the values array, matching
+    // `dedup_string_dict`. As there, all null dictionary entries collapse
+    // to a single unified slot.
+    let mut slots: [Option<u32>; 3] = [None; 3]; // [false, true, null]
+    let mut old_to_new: Vec<u32> = Vec::with_capacity(values.len());
+    let mut unified: Vec<Option<bool>> = Vec::new();
+    for i in 0..values.len() {
+        let v = (!values.is_null(i)).then(|| values.value(i));
+        let slot = match v {
+            Some(false) => 0,
+            Some(true) => 1,
+            None => 2,
+        };
+        let code = *slots[slot].get_or_insert_with(|| {
+            let c = unified.len() as u32;
+            unified.push(v);
+            c
+        });
+        old_to_new.push(code);
+    }
+    let n_distinct = unified.len();
+
+    let new_keys = remap_dictionary_keys(keys, &old_to_new)?;
+    let unified_values: arrow::array::ArrayRef = Arc::new(BooleanArray::from(unified));
+    finish_deduped_dictionary(new_keys, unified_values, n_distinct, value_type)
+}
+
+/// Remap a dictionary's keys through `old_to_new` (an O(n_obs) integer
+/// gather; null keys preserved). Each key must index into the source
+/// dictionary; a malformed file with an out-of-range (or negative) key is
+/// rejected rather than panicking on the slice index (readers return errors
+/// on malformed input — see docs/conventions.md).
+fn remap_dictionary_keys(
+    keys: &arrow::array::Int32Array,
+    old_to_new: &[u32],
+) -> Result<arrow::array::Int32Array> {
+    keys.iter()
         .map(|k| {
             k.map(|k| {
                 let idx = usize::try_from(k).ok().filter(|&i| i < old_to_new.len());
@@ -2703,10 +2768,21 @@ fn dedup_string_dict<O: arrow::array::OffsetSizeTrait>(
             })
             .transpose()
         })
-        .collect::<Result<Int32Array>>()?;
-    let unified_values: arrow::array::ArrayRef = Arc::new(GenericStringArray::<O>::from(unified));
-    let wide = DictionaryArray::<Int32Type>::try_new(new_keys, unified_values)?;
+        .collect::<Result<arrow::array::Int32Array>>()
+}
 
+/// Assemble the deduplicated `(keys, values)` into a dictionary array whose
+/// key type is the minimal fit for `n_distinct`.
+fn finish_deduped_dictionary(
+    new_keys: arrow::array::Int32Array,
+    unified_values: arrow::array::ArrayRef,
+    n_distinct: usize,
+    value_type: &arrow::datatypes::DataType,
+) -> Result<(arrow::array::ArrayRef, arrow::datatypes::DataType)> {
+    use arrow::array::DictionaryArray;
+    use arrow::datatypes::{DataType, Int32Type};
+
+    let wide = DictionaryArray::<Int32Type>::try_new(new_keys, unified_values)?;
     let key_type = min_dictionary_key_type(n_distinct);
     let is_int32 = key_type == DataType::Int32;
     let final_dt = DataType::Dictionary(Box::new(key_type), Box::new(value_type.clone()));
@@ -2714,6 +2790,8 @@ fn dedup_string_dict<O: arrow::array::OffsetSizeTrait>(
         Arc::new(wide)
     } else {
         // Narrows keys only (values untouched) — no full-column materialization.
+        // `cast` on a dictionary only re-keys, so it is safe for value types
+        // that cannot be dictionary-*packed* from a plain array.
         arrow::compute::cast(&wide, &final_dt)?
     };
     Ok((arr, final_dt))

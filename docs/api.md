@@ -694,12 +694,39 @@ conversions → `pyscx.merge(..., index_obs=[...])`).
 Behaviour:
 
 - Force-listed columns (`--index-obs`/`--index-var`) **hard-error** if
-  the column is missing or has an unsupported dtype.
+  the column is missing or has an unsupported dtype. Unsupported means
+  anything that is neither a string nor a number: `Boolean`, and
+  equally a boolean-valued pandas `Categorical`
+  (`Dictionary(_, Boolean)`), which is a dictionary-encoded `Boolean`
+  and no more indexable than the plain column.
 - Preset columns warn (`MissingPresetIndexColumn` /
   `UnsupportedIndexColumn`) and are skipped without aborting the
   conversion.
 - Auto-indexing picks up categorical-like columns with cardinality
   `≤ index_auto_threshold` (default `1000`).
+- **The cardinality caps apply to the batch builder only.** The in-memory
+  path (`pyscx.from_anndata` on a small file) runs every column through
+  `index_auto_threshold` / the high-cardinality threshold before choosing a
+  categorical or numeric index, so a high-cardinality **numeric** column is
+  skipped with a reported outcome. Conversion (`scx convert`,
+  `pyscx.from_anndata`) uses that batch builder, so it is capped. The
+  **streaming** builder — used by `sort` and streaming `compact`, with `merge`
+  and `append` running equivalent incremental builders — applies the cap to
+  categorical columns only and always materialises a numeric index, whatever
+  its cardinality. This is long-standing behaviour for plain numeric
+  columns; integer-valued categoricals now inherit it. It matters because a
+  numeric index is per-row, not per-category (see the size note below), so
+  force-listing a high-cardinality integer column on an atlas-scale streaming
+  build produces a large index where the in-memory path would have refused.
+- **A column is classified by what it holds, not by how it is stored.**
+  pandas writes every `Categorical` as an Arrow dictionary, whatever the
+  categories are, so the dictionary's *value* type decides:
+  `pd.Categorical(["A", "B"])` → the categorical index (Level-1
+  `CategoryBitset` pruning + Level-2 row-set pushdown), while
+  `pd.Categorical([1, 2, 3])` → the **numeric** index, exactly as the
+  plain integer column it holds (Level-1 `MinMax` pruning; numeric
+  operators are residual at Level 2, so no row-set pushdown). Query
+  syntax follows the value type too: `batch == 3`, not `batch == '3'`.
 - Multimodal inputs emit `PredicateIndexSkippedMultimodal` and skip
   predicate-index emission entirely — the read path is unimodal-only
   today. The same skip-with-warning applies to multimodal

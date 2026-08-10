@@ -514,6 +514,78 @@ fn test_sharded_read_strips_shard_metadata() {
     );
 }
 
+/// Regression: a boolean-valued pandas `Categorical`
+/// (`pd.Categorical([True, False])` → `Dictionary(_, Boolean)`) made a
+/// **row-sharded** file's `read_obs()` fail outright with *"Unsupported
+/// output type for dictionary packing: Boolean"* — arrow cannot re-encode a
+/// `Boolean` array into a dictionary, and both the key-widening and the
+/// dedup step went through decode→re-encode.
+///
+/// The write side never complained and the same column in an *unsharded*
+/// file read back fine, so this only appeared at the scale where obs is
+/// sharded — the regime the sharded layout exists for.
+#[test]
+fn test_assemble_handles_a_boolean_valued_categorical() {
+    use arrow::array::{Array, AsArray, BooleanArray, DictionaryArray, Int8Array};
+    use arrow::datatypes::Int8Type;
+
+    let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Boolean));
+    // Two shards, each with its own two-entry [true, false] dictionary —
+    // which is exactly the duplicate-categories shape the dedup step exists
+    // to collapse, so this exercises both halves.
+    let raw_batches: Vec<(u32, RecordBatch)> = (0..2u32)
+        .map(|shard_idx| {
+            let keys = Int8Array::from(vec![Some(0), Some(1), None]);
+            let values: arrow::array::ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
+            let dict: arrow::array::ArrayRef =
+                Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap());
+            let metadata = std::collections::HashMap::from([
+                ("shard_idx".to_string(), shard_idx.to_string()),
+                ("row_start".to_string(), (shard_idx * 3).to_string()),
+                ("n_shard_rows".to_string(), "3".to_string()),
+                ("n_rows_total".to_string(), "6".to_string()),
+            ]);
+            let schema = Arc::new(
+                Schema::new(vec![Field::new("flag", dict_dt.clone(), true)])
+                    .with_metadata(metadata),
+            );
+            (shard_idx, RecordBatch::try_new(schema, vec![dict]).unwrap())
+        })
+        .collect();
+
+    let merged = assemble_sharded_metadata("obs", raw_batches).unwrap();
+    assert_eq!(merged.num_rows(), 6);
+
+    // Decode whatever representation survived (dictionary or plain) and
+    // assert the values, so the test pins the data rather than the encoding.
+    let col = merged.column(0);
+    let plain = arrow::compute::cast(col, &DataType::Boolean).unwrap();
+    let plain = plain.as_any().downcast_ref::<BooleanArray>().unwrap();
+    let got: Vec<Option<bool>> = (0..plain.len())
+        .map(|i| (!plain.is_null(i)).then(|| plain.value(i)))
+        .collect();
+    assert_eq!(
+        got,
+        vec![Some(true), Some(false), None, Some(true), Some(false), None]
+    );
+
+    // If it stayed a dictionary, its categories must be unique — otherwise
+    // `to_pandas()` raises "Categorical categories must be unique".
+    if let DataType::Dictionary(_, _) = col.data_type() {
+        let dict = col.as_any_dictionary_opt().unwrap();
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(
+            values.len() <= 2,
+            "duplicate boolean categories survived: {} entries",
+            values.len()
+        );
+    }
+}
+
 /// Regression: when every shard carries the *same* categorical value,
 /// Arrow's `concat` appends each shard's one-element dictionary, yielding
 /// `["batch1", "batch1", "batch1", "batch1"]`. `to_pandas()` then raises

@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use arrow::array::{Array, AsArray, BooleanArray, RecordBatch};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, RecordBatch};
 use arrow::compute;
 use arrow::datatypes::{DataType, Schema};
 
@@ -156,13 +156,23 @@ pub fn eval_rowset(pred: &Predicate, ctx: &RowSetCtx) -> Option<RowSet> {
             if ctx.index.indexed_kind(col) != Some(crate::index::IndexKind::Categorical) {
                 return None;
             }
+            // Every member must be resolvable, or the whole predicate is
+            // residual. A non-string member against a string-valued
+            // categorical index is *unknown*, not provably absent: skipping
+            // it and returning the union of the members that did resolve
+            // silently narrows the result. That is not hypothetical — a file
+            // written by an earlier version indexed an integer-valued
+            // categorical as an entry-less `CategoricalIndex`, so
+            // `batch in [1, 2]` resolved to an exact **empty** row set.
+            if vals.iter().any(|v| !matches!(v, ScalarValue::Utf8(_))) {
+                return None;
+            }
             let mut acc = RowSet::empty();
             for v in vals {
                 if let ScalarValue::Utf8(s) = v {
                     let ranges = ctx.index.categorical_eq(col, s)?;
                     acc = acc.union(&ctx.shard_ranges_to_rowset(ranges)?);
                 }
-                // non-string members can't match a string categorical → skip
             }
             Some(acc)
         }
@@ -494,21 +504,26 @@ impl<'a> Parser<'a> {
     }
 
     /// Check value–column type compatibility and coerce if necessary.
+    ///
+    /// A `Dictionary(_, V)` column validates as `V`. Dictionary encoding is
+    /// how pandas stores every `Categorical` — of strings, but equally of
+    /// integers, floats and bools — so the *value* type is what a literal
+    /// has to match. Hardcoding `Utf8` here made an integer-valued
+    /// categorical reject both `batch == 1` and `batch == '1'`, leaving the
+    /// column unreachable from the query engine.
     fn validate_type(
         &self,
         col: &str,
         col_type: &DataType,
         value: &ScalarValue,
     ) -> Result<ScalarValue> {
+        // Look through dictionary encoding and validate against the values.
+        if let DataType::Dictionary(_, value_type) = col_type {
+            return self.validate_type(col, value_type.as_ref(), value);
+        }
         match (col_type, value) {
             // String columns accept string values
             (DataType::Utf8 | DataType::LargeUtf8, ScalarValue::Utf8(_)) => Ok(value.clone()),
-            // Dictionary columns: compare against dictionary values (typically strings)
-            (DataType::Dictionary(_, value_type), ScalarValue::Utf8(_))
-                if matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
-            {
-                Ok(value.clone())
-            }
             // String column with numeric literal → type mismatch
             (
                 DataType::Utf8 | DataType::LargeUtf8,
@@ -538,6 +553,35 @@ impl<'a> Parser<'a> {
                 | DataType::Float64,
                 ScalarValue::Int64(_) | ScalarValue::Float64(_),
             ) => Ok(value.clone()),
+            // Numeric column with a quoted literal → the mirror of the
+            // string-column case above. Worth its own arm rather than the
+            // catch-all: quoting the value is the first thing a user tries
+            // on an integer-valued categorical, and the generic message
+            // answers with a raw Arrow `DataType` instead of the two types
+            // that actually disagree.
+            (
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float32
+                | DataType::Float64,
+                ScalarValue::Utf8(_),
+            ) => Err(EngineError::SchemaError {
+                column: col.to_string(),
+                reason: format!(
+                    "type mismatch: column is {} but value is a string — drop the quotes",
+                    if matches!(col_type, DataType::Float32 | DataType::Float64) {
+                        "float"
+                    } else {
+                        "integer"
+                    }
+                ),
+            }),
             // Boolean column with bool value
             (DataType::Boolean, ScalarValue::Bool(_)) => Ok(value.clone()),
             // Everything else is a type mismatch
@@ -802,7 +846,18 @@ fn eval_comparison(
         .schema()
         .index_of(col_name)
         .map_err(EngineError::ArrowError)?;
-    let column = batch.column(col_idx);
+    eval_comparison_on_array(col_name, batch.column(col_idx), value, op)
+}
+
+/// The type-dispatch half of [`eval_comparison`], over an array rather than
+/// a batch column. Split out so the dictionary arm can decode to its value
+/// array and re-enter here; `col_name` is carried only for error messages.
+fn eval_comparison_on_array(
+    col_name: &str,
+    column: &ArrayRef,
+    value: &ScalarValue,
+    op: CmpOp,
+) -> Result<BooleanArray> {
     let dtype = column.data_type();
 
     match dtype {
@@ -840,11 +895,27 @@ fn eval_comparison(
         }
         DataType::Boolean => eval_boolean(column.as_boolean(), value, op),
         DataType::Dictionary(_, value_type) => match value_type.as_ref() {
+            // Strings keep the zero-decode path: compare against the (small)
+            // dictionary values and gather through the keys.
             DataType::Utf8 | DataType::LargeUtf8 => eval_dictionary_utf8(column, value, op),
-            _ => Err(EngineError::SchemaError {
-                column: col_name.to_string(),
-                reason: format!("unsupported dictionary value type: {value_type:?}"),
-            }),
+            // Any other value type — an integer / float / bool pandas
+            // `Categorical` — decodes to its value array and re-enters the
+            // primitive arms above, so a dictionary-encoded column compares
+            // exactly like the plain column it holds. Decoding
+            // costs one pass; `Predicate::In` is an OR of `Eq` and so decodes
+            // once per member, which is fine at categorical cardinality.
+            _ => {
+                let decoded = arrow::compute::cast(column, value_type.as_ref()).map_err(|e| {
+                    EngineError::SchemaError {
+                        column: col_name.to_string(),
+                        reason: format!(
+                            "could not decode dictionary column with value type \
+                                 {value_type:?}: {e}"
+                        ),
+                    }
+                })?;
+                eval_comparison_on_array(col_name, &decoded, value, op)
+            }
         },
         _ => Err(EngineError::SchemaError {
             column: col_name.to_string(),
@@ -1186,7 +1257,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{DictionaryArray, Int32Array, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, DictionaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use std::sync::Arc;
 
@@ -1530,6 +1601,136 @@ mod tests {
         .unwrap()
     }
 
+    // -----------------------------------------------------------------------
+    // Dictionary value types other than string
+    // -----------------------------------------------------------------------
+
+    /// `pd.Categorical([...])` over integers / bools / floats, keyed
+    /// `Int32` as `widen_dictionary_keys` normalises them on disk.
+    fn dict_batch() -> RecordBatch {
+        use arrow::array::Float64Array;
+
+        let batch_keys = Int32Array::from(vec![0, 1, 2, 0, 1]);
+        let batch_values: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, 30]));
+        let batch_col: ArrayRef =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(batch_keys, batch_values).unwrap());
+
+        let flag_keys = Int32Array::from(vec![Some(0), Some(1), None, Some(0), Some(1)]);
+        let flag_values: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
+        let flag_col: ArrayRef =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(flag_keys, flag_values).unwrap());
+
+        let score_keys = Int32Array::from(vec![0, 1, 0, 1, 0]);
+        let score_values: ArrayRef = Arc::new(Float64Array::from(vec![1.5f64, 2.5]));
+        let score_col: ArrayRef =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(score_keys, score_values).unwrap());
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("batch", batch_col.data_type().clone(), true),
+            Field::new("flag", flag_col.data_type().clone(), true),
+            Field::new("score", score_col.data_type().clone(), true),
+        ]));
+        RecordBatch::try_new(schema, vec![batch_col, flag_col, score_col]).unwrap()
+    }
+
+    fn dict_schema() -> Schema {
+        (*dict_batch().schema()).clone()
+    }
+
+    /// The core case: `batch == 20` must parse **and** select the
+    /// right rows. A test that only asserts `parse_predicate(...).is_ok()`
+    /// would pass against a version that returns every row, or none.
+    #[test]
+    fn integer_categorical_accepts_an_integer_literal() {
+        let schema = dict_schema();
+        let pred = parse_predicate("batch == 20", &schema, "obs").expect("must parse");
+        assert_eq!(pred, Predicate::Eq("batch".into(), ScalarValue::Int64(20)));
+        let mask = evaluate(&pred, &dict_batch()).unwrap();
+        // dictionary values [10, 20, 30], keys [0, 1, 2, 0, 1]
+        let expected = [false, true, false, false, true];
+        for (i, &exp) in expected.iter().enumerate() {
+            assert_eq!(mask.value(i), exp, "row {i}");
+        }
+    }
+
+    /// Ordering operators have to work too — the numeric arm is reached
+    /// only after the dictionary is decoded to its value type.
+    #[test]
+    fn integer_categorical_supports_ordering_and_in() {
+        let schema = dict_schema();
+        let batch = dict_batch();
+
+        let gt = parse_predicate("batch > 15", &schema, "obs").unwrap();
+        let mask = evaluate(&gt, &batch).unwrap();
+        for (i, &exp) in [false, true, true, false, true].iter().enumerate() {
+            assert_eq!(mask.value(i), exp, "gt row {i}");
+        }
+
+        let in_pred = parse_predicate("batch in [10, 30]", &schema, "obs").unwrap();
+        let mask = evaluate(&in_pred, &batch).unwrap();
+        for (i, &exp) in [true, false, true, true, false].iter().enumerate() {
+            assert_eq!(mask.value(i), exp, "in row {i}");
+        }
+    }
+
+    /// A float-valued categorical is the same shape one type over.
+    #[test]
+    fn float_categorical_accepts_a_float_literal() {
+        let schema = dict_schema();
+        let pred = parse_predicate("score > 2.0", &schema, "obs").unwrap();
+        let mask = evaluate(&pred, &dict_batch()).unwrap();
+        for (i, &exp) in [false, true, false, true, false].iter().enumerate() {
+            assert_eq!(mask.value(i), exp, "row {i}");
+        }
+    }
+
+    /// A boolean-valued categorical must behave exactly as the plain
+    /// `Boolean` column it decodes to, nulls included.
+    #[test]
+    fn boolean_categorical_evaluates_like_a_plain_bool() {
+        let schema = dict_schema();
+        let pred = parse_predicate("flag == true", &schema, "obs").unwrap();
+        let mask = evaluate(&pred, &dict_batch()).unwrap();
+        // keys [0, 1, null, 0, 1] over values [true, false];
+        // the null key coalesces to false at the top level.
+        for (i, &exp) in [true, false, false, true, false].iter().enumerate() {
+            assert_eq!(mask.value(i), exp, "row {i}");
+        }
+    }
+
+    /// The mirror of the existing "column is string but value is
+    /// integer" message. This is the error a user meets after guessing
+    /// the wrong syntax for an integer categorical, so it has to name
+    /// both sides rather than print a raw Arrow `DataType`.
+    #[test]
+    fn string_literal_against_a_numeric_column_names_both_types() {
+        let schema = test_schema();
+        let err = parse_predicate("n_genes == '200'", &schema, "obs").unwrap_err();
+        let msg = err.to_string();
+        let low = msg.to_lowercase();
+        assert!(
+            low.contains("integer") && low.contains("string"),
+            "expected both types named, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Int64"),
+            "should not leak the raw Arrow dtype: {msg}"
+        );
+    }
+
+    /// And the same for an integer-valued categorical, which is the
+    /// column an analyst actually has.
+    #[test]
+    fn string_literal_against_an_integer_categorical_is_rejected() {
+        let schema = dict_schema();
+        let err = parse_predicate("batch == '20'", &schema, "obs").unwrap_err();
+        let low = err.to_string().to_lowercase();
+        assert!(
+            low.contains("integer") && low.contains("string"),
+            "expected both types named, got: {err}"
+        );
+    }
+
     #[test]
     fn eval_eq_string() {
         let batch = test_batch();
@@ -1766,6 +1967,54 @@ mod tests {
 
         fn eq(col: &str, v: &str) -> Predicate {
             Predicate::Eq(col.into(), ScalarValue::Utf8(v.into()))
+        }
+
+        /// A non-string `In` member cannot be *resolved* against a
+        /// string-valued categorical index — it is unknown, not
+        /// provably absent. Skipping it and returning the narrowed set
+        /// silently drops rows; the whole predicate must go residual.
+        ///
+        /// Reachable since integer literals started validating against
+        /// integer-valued categoricals: a file written
+        /// before that fix carries an entry-less `CategoricalIndex` for
+        /// such a column, so `batch in [1, 2]` would resolve to an
+        /// exact **empty** row set.
+        #[test]
+        fn in_with_a_non_string_member_is_residual() {
+            let index = idx();
+            let ranges = ctx_ranges();
+            let ctx = mk(&index, &ranges);
+            let pred = Predicate::In(
+                "cell_type".into(),
+                vec![ScalarValue::Utf8("B cell".into()), ScalarValue::Int64(1)],
+            );
+            assert!(
+                eval_rowset(&pred, &ctx).is_none(),
+                "an unresolvable member must make the predicate residual, \
+                 not narrow it to the members that happened to resolve"
+            );
+        }
+
+        /// The same hazard in its purest form: an index whose column
+        /// carries no entries at all (what earlier versions wrote for every
+        /// integer categorical) must not answer "no rows anywhere".
+        #[test]
+        fn in_over_an_entry_less_categorical_is_residual() {
+            let index = PredicateIndex {
+                version: 1,
+                columns: vec![IndexedColumn::Categorical(CategoricalIndex {
+                    column_name: "batch".into(),
+                    entries: vec![],
+                })],
+            };
+            let ranges = ctx_ranges();
+            let ctx = mk(&index, &ranges);
+            let pred = Predicate::In("batch".into(), vec![ScalarValue::Int64(1)]);
+            assert!(
+                eval_rowset(&pred, &ctx).is_none(),
+                "an entry-less legacy index must fall back to a scan, not \
+                 return an exact empty row set"
+            );
         }
 
         #[test]

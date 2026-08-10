@@ -1785,7 +1785,18 @@ impl ObsPredicateIndexBuilder {
                     // it — `values.len()` is the row count, not the
                     // distinct count (numeric accumulators don't
                     // dedupe), so a cardinality check here would be
-                    // misleading anyway. Matches batch-mode behaviour.
+                    // misleading anyway.
+                    //
+                    // NOTE: this does **not** match batch-mode behaviour.
+                    // `build_predicate_index_bytes_inner` applies
+                    // `high_cardinality_threshold` to every column before
+                    // the categorical/numeric split, so a high-cardinality
+                    // numeric column is skipped there and indexed here.
+                    // Pre-existing for plain numeric columns; integer-valued
+                    // categoricals now inherit it. Unifying the two changes
+                    // behaviour for existing numeric columns on the
+                    // streaming path, so it is left alone and documented
+                    // (docs/api.md) rather than changed here.
                     let _ = matches!(selection, ColumnSelection::Named)
                         && values.len() > self.options.high_cardinality_threshold;
                     indexed.push(IndexedColumn::Numeric(numeric_index_from_values(
@@ -2417,8 +2428,12 @@ fn estimate_unique_values(col: &ArrayRef) -> usize {
 }
 
 /// True when two Arrow dtypes are interchangeable for predicate-index
-/// purposes: both categorical (any of `Utf8` / `LargeUtf8` /
-/// `Dictionary(_, _)`) or both numeric. Used by
+/// purposes: both categorical (`Utf8` / `LargeUtf8`, or a dictionary over
+/// one of those) or both numeric (a numeric type, or a dictionary over
+/// one). Classification goes through [`logical_type`], so a
+/// `Dictionary(_, V)` shard and a plain `V` shard are interchangeable —
+/// which matters because `append` writes some columns plain where
+/// `from_anndata` writes them dictionary-encoded. Used by
 /// [`ObsPredicateIndexBuilder::push_shard`] to accept shards whose
 /// per-shard upcast widens columns to `LargeUtf8` while the builder
 /// was initialised with the input file's narrow `Utf8` schema.
@@ -2428,18 +2443,41 @@ fn column_class_compatible(a: &DataType, b: &DataType) -> bool {
         || a == b
 }
 
-/// Check if a data type is categorical (string or dictionary).
-fn is_categorical_type(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(_, _)
-    )
+/// The type a column *logically* holds: a dictionary's value type, or the
+/// type itself. Dictionary encoding is a storage detail — pandas writes
+/// every `Categorical` that way regardless of what the categories are — so
+/// classification must look through it. Both [`is_categorical_type`] and
+/// [`is_numeric_type`] go through this, which is what keeps
+/// `Dictionary(_, Int64)` and plain `Int64` from drifting into different
+/// classes (see [`column_class_compatible`]).
+fn logical_type(dt: &DataType) -> &DataType {
+    match dt {
+        DataType::Dictionary(_, value_type) => value_type.as_ref(),
+        other => other,
+    }
 }
 
-/// Check if a data type is numeric.
+/// Check if a data type is categorical: a string, or a dictionary **whose
+/// values are strings**.
+///
+/// The value type matters. A `Dictionary(_, Int64)` — what
+/// `pd.Categorical([1, 2, 3])` becomes — is not categorical for index
+/// purposes, because `build_categorical_index` can only extract string
+/// values from a dictionary. Accepting it wrote an index with zero entries
+/// and no outcome, leaving the column unreachable from the query engine.
+/// Such a column routes to the numeric index instead;
+/// a non-string, non-numeric value type (e.g. `Boolean`) is reported as an
+/// unsupported dtype, exactly as the equivalent plain column already is.
+fn is_categorical_type(dt: &DataType) -> bool {
+    matches!(logical_type(dt), DataType::Utf8 | DataType::LargeUtf8)
+}
+
+/// Check if a data type is numeric, looking through dictionary encoding
+/// so an integer- or float-valued pandas `Categorical` is indexed as the
+/// numbers it holds.
 fn is_numeric_type(dt: &DataType) -> bool {
     matches!(
-        dt,
+        logical_type(dt),
         DataType::Int8
             | DataType::Int16
             | DataType::Int32
@@ -2474,37 +2512,85 @@ fn extract_string_value(col: &ArrayRef, row: usize) -> Option<String> {
             }
         }
         DataType::Dictionary(_, _) => {
-            // Cast to StringArray view of dictionary values
-            if let Some(dict) = col.as_any_dictionary_opt() {
-                let keys = dict.keys();
-                let values = dict.values();
-                if keys.is_null(row) {
-                    return None;
-                }
-                let key = keys
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int32Array>()
-                    .map(|k| k.value(row) as usize)
-                    .or_else(|| {
-                        keys.as_any()
-                            .downcast_ref::<arrow::array::Int8Array>()
-                            .map(|k| k.value(row) as usize)
-                    })
-                    .or_else(|| {
-                        keys.as_any()
-                            .downcast_ref::<arrow::array::Int16Array>()
-                            .map(|k| k.value(row) as usize)
-                    })?;
-                values
+            let dict = col.as_any_dictionary_opt()?;
+            let key = dictionary_key_at(dict, row)?;
+            let values = dict.values();
+            match values.data_type() {
+                DataType::Utf8 => values
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
-                    .map(|str_arr| str_arr.value(key).to_string())
-            } else {
-                None
+                    .filter(|a| !a.is_null(key))
+                    .map(|a| a.value(key).to_string()),
+                DataType::LargeUtf8 => values
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                    .filter(|a| !a.is_null(key))
+                    .map(|a| a.value(key).to_string()),
+                _ => None,
             }
         }
         _ => None,
     }
+}
+
+/// Resolve the dictionary key at `row` to an index into `values()`, for any
+/// Arrow key width. `None` for a null key, a negative one, or one past the
+/// end of `values()` (a malformed file must not panic on the values index —
+/// see docs/conventions.md).
+///
+/// Shared by [`extract_string_value`] and [`extract_numeric_value`] so the
+/// two cannot disagree about which key widths decode. The string path used
+/// to hand-roll `Int32`/`Int8`/`Int16` only and silently returned `None` —
+/// an *empty index* — for the rest; `widen_dictionary_keys` normalises
+/// on-disk keys to `Int32`, but the builders also run on caller-supplied
+/// batches, where `Int64` and unsigned keys occur.
+///
+/// **This must stay O(1).** It is called once per non-null row by both the
+/// batch and the streaming index builders, so anything that touches the
+/// whole key column here is quadratic in `n_obs`. `AnyDictionaryArray`
+/// offers `normalized_keys()`, which looks like the tidy way to cover every
+/// key width in one line and is not: it allocates and fills a
+/// `Vec<usize>` over the entire column on **every call**, so an index build
+/// that was linear became quadratic (measured end to end at 16k / 32k / 64k
+/// rows: 0.080 s / 0.269 s / 1.067 s — ~4x per 2x rows). Dispatch on the key
+/// type instead; a `downcast_ref` is a type-id check, not a scan.
+fn dictionary_key_at(dict: &dyn arrow::array::AnyDictionaryArray, row: usize) -> Option<usize> {
+    use arrow::array::PrimitiveArray;
+    use arrow::datatypes::{
+        Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    };
+
+    let keys = dict.keys();
+    if keys.is_null(row) {
+        return None;
+    }
+    macro_rules! key_as_i128 {
+        ($t:ty) => {
+            keys.as_any()
+                .downcast_ref::<PrimitiveArray<$t>>()
+                .map(|k| k.value(row) as i128)
+        };
+    }
+    // Widen through i128 so every key width — including UInt64 — is compared
+    // in a domain that can hold it, and a negative key fails the conversion
+    // below rather than wrapping to a huge index.
+    let key = match keys.data_type() {
+        DataType::Int8 => key_as_i128!(Int8Type),
+        DataType::Int16 => key_as_i128!(Int16Type),
+        DataType::Int32 => key_as_i128!(Int32Type),
+        DataType::Int64 => key_as_i128!(Int64Type),
+        DataType::UInt8 => key_as_i128!(UInt8Type),
+        DataType::UInt16 => key_as_i128!(UInt16Type),
+        DataType::UInt32 => key_as_i128!(UInt32Type),
+        DataType::UInt64 => key_as_i128!(UInt64Type),
+        _ => None,
+    }?;
+    let key = usize::try_from(key).ok()?;
+    // Bounds check is belt-and-braces: `DictionaryArray::try_new` rejects an
+    // out-of-range key at construction, so this can only fire on an array
+    // that reached memory another way. It costs one comparison and turns a
+    // would-be panic on the values index into a skipped row.
+    (key < dict.values().len()).then_some(key)
 }
 
 /// Extract a numeric value from an Arrow array as f64.
@@ -2553,6 +2639,14 @@ fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
             .as_any()
             .downcast_ref::<Float64Array>()
             .map(|a| a.value(row)),
+        // A numeric-valued pandas `Categorical` (`pd.Categorical([1, 2, 3])`
+        // → `Dictionary(_, Int64)`). Resolve the key and recurse into the
+        // values array, which is one of the arms above.
+        DataType::Dictionary(_, _) => {
+            let dict = col.as_any_dictionary_opt()?;
+            let key = dictionary_key_at(dict, row)?;
+            extract_numeric_value(dict.values(), key)
+        }
         _ => None,
     }
 }

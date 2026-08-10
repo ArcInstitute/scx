@@ -24,10 +24,10 @@
 //! narrow and wide variants; downstream string-consumers that cannot
 //! tolerate `LargeUtf8` are documented per-call.
 
-use arrow::array::{ArrayRef, LargeBinaryArray, LargeStringArray, RecordBatch};
+use arrow::array::{Array, ArrayRef, AsArray, LargeBinaryArray, LargeStringArray, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 
-use crate::error::Result;
+use crate::error::{Result, ScxError};
 
 /// Upcast `Utf8 → LargeUtf8` and `Binary → LargeBinary` (including
 /// `Dictionary(_, Utf8|Binary)` value types) so Arrow IPC uses 64-bit
@@ -83,18 +83,109 @@ pub fn downcast_large_types_schema(schema: &Schema) -> Schema {
     Schema::new(new_fields).with_metadata(schema.metadata().clone())
 }
 
+/// Encode `col` as `Dictionary(Int32, value_type)`.
+///
+/// `arrow::compute::cast` does this for most value types, but its dictionary
+/// *packing* has no `Boolean` support and fails with *"Unsupported output
+/// type for dictionary packing: Boolean"*. That is the same limitation
+/// [`widen_dictionary_keys`] sidesteps by casting keys, and it is reachable
+/// here by an ordinary `append`: the base shards keep their
+/// `Dictionary(_, Boolean)` while the appended obs shard lands as plain
+/// `Boolean`, so [`reconcile_dictionary_representations`] has to encode the
+/// plain side — and the whole assembled read (`read_obs`, `to_anndata`,
+/// filtered collect) died there.
+///
+/// A `Boolean` column has at most three states, so it is packed by hand,
+/// nulls preserved as null keys. Packing by hand rather than degrading the
+/// column to a plain `bool` array keeps it a categorical, so an `append`
+/// does not silently change a column's pandas dtype.
+///
+/// Only the values **actually present** are installed, in first-occurrence
+/// order. Unconditionally emitting `[false, true]` is the obvious shortcut
+/// and is wrong: it *invents* a category. A column whose declared vocabulary
+/// is `[True]` came back as `CategoricalDtype(categories=[True, False])`
+/// after an append — visible in `.cat.categories`, in dtype equality, in
+/// `groupby(observed=False)`, and in any categorical encoder. The dictionary
+/// shards on the other side of the reconcile contribute their own declared
+/// categories, and the later concat + dedup unions the two, so nothing is
+/// lost by packing only what this shard holds.
+fn encode_to_dictionary(col: &ArrayRef, value_type: &DataType) -> Result<ArrayRef> {
+    use std::sync::Arc;
+
+    if !matches!(value_type, DataType::Boolean) {
+        return Ok(arrow::compute::cast(
+            col,
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(value_type.clone())),
+        )?);
+    }
+
+    // Decode to plain Boolean first: `col` may itself be a dictionary with a
+    // key width other than Int32, which is the other half of the mixed case.
+    let plain = if matches!(col.data_type(), DataType::Dictionary(_, _)) {
+        arrow::compute::cast(col, &DataType::Boolean)?
+    } else {
+        col.clone()
+    };
+    let plain = plain
+        .as_any()
+        .downcast_ref::<arrow::array::BooleanArray>()
+        .ok_or_else(|| {
+            ScxError::InvalidCatalog(
+                "column declared Boolean but failed downcast while encoding a dictionary".into(),
+            )
+        })?;
+
+    // First-occurrence order, matching the dedup helpers in `reader.rs`.
+    let mut present: Vec<bool> = Vec::with_capacity(2);
+    for i in 0..plain.len() {
+        if !plain.is_null(i) {
+            let v = plain.value(i);
+            if !present.contains(&v) {
+                present.push(v);
+                if present.len() == 2 {
+                    break;
+                }
+            }
+        }
+    }
+    let keys: arrow::array::Int32Array = (0..plain.len())
+        .map(|i| {
+            (!plain.is_null(i)).then(|| {
+                present
+                    .iter()
+                    .position(|&p| p == plain.value(i))
+                    .expect("every non-null value was interned above") as i32
+            })
+        })
+        .collect();
+    let values: ArrayRef = Arc::new(arrow::array::BooleanArray::from(present));
+    Ok(Arc::new(arrow::array::DictionaryArray::<
+        arrow::datatypes::Int32Type,
+    >::try_new(keys, values)?))
+}
+
 /// Cast every `Dictionary(K, V)` column's key (index) type to `Int32` so that
 /// concatenating per-shard categoricals during sharded-metadata assembly cannot
 /// overflow a narrow per-shard key (`Int8`/`Int16`) once the combined vocabulary
 /// across shards exceeds that key's range. The value type `V` is preserved;
 /// non-dictionary (and already-`Int32`-keyed) columns pass through unchanged.
 ///
-/// Implemented as decode→re-encode (`cast` to the value type, then `cast` to
-/// `Dictionary(Int32, V)`) — the same cast pattern `unify_dictionary_columns`
-/// relies on, robust across arrow key-type combinations. `Int32` is always wide
-/// enough: the combined pre-dedup dictionary length is bounded by the total row
-/// count, far below `i32::MAX`. Field- and schema-level metadata (notably the
-/// `pandas` index envelope) are preserved.
+/// Implemented by casting the **keys** array and rebuilding the dictionary
+/// over the same values. `Int32` is always wide enough: the combined pre-dedup
+/// dictionary length is bounded by the total row count, far below `i32::MAX`.
+/// Field- and schema-level metadata (notably the `pandas` index envelope) are
+/// preserved.
+///
+/// This deliberately does **not** go through decode→re-encode
+/// (`cast` to `V`, then `cast` to `Dictionary(Int32, V)`). Arrow's dictionary
+/// *packing* supports only some value types — `Boolean` is not among them — so
+/// re-encoding raised `Unsupported output type for dictionary packing:
+/// Boolean` on a `pd.Categorical([True, False])` column. Since this function
+/// runs inside [`crate::reader::assemble_sharded_metadata`], that made
+/// `read_obs()` fail outright on any **row-sharded** file carrying a boolean
+/// categorical, while the same column in an unsharded file read back fine.
+/// Casting keys is also cheaper (no `n_obs`-length transient) and preserves
+/// the dictionary exactly, including entries no row references.
 pub fn widen_dictionary_keys(batch: &RecordBatch) -> Result<RecordBatch> {
     let schema = batch.schema();
     let needs = schema.fields().iter().any(
@@ -109,9 +200,29 @@ pub fn widen_dictionary_keys(batch: &RecordBatch) -> Result<RecordBatch> {
         let col = batch.column(i);
         match field.data_type() {
             DataType::Dictionary(k, value_type) if k.as_ref() != &DataType::Int32 => {
-                let values = arrow::compute::cast(col, value_type.as_ref())?;
+                let dict = col.as_any_dictionary_opt().ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "column '{}' declared Dictionary but failed downcast",
+                        field.name()
+                    ))
+                })?;
+                let wide_keys = arrow::compute::cast(dict.keys(), &DataType::Int32)?;
+                let wide_keys = wide_keys
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .ok_or_else(|| {
+                        ScxError::InvalidCatalog(format!(
+                            "column '{}': dictionary keys did not cast to Int32",
+                            field.name()
+                        ))
+                    })?
+                    .clone();
                 let wide_dt = DataType::Dictionary(Box::new(DataType::Int32), value_type.clone());
-                new_columns.push(arrow::compute::cast(&values, &wide_dt)?);
+                new_columns.push(std::sync::Arc::new(arrow::array::DictionaryArray::<
+                    arrow::datatypes::Int32Type,
+                >::try_new(
+                    wide_keys, dict.values().clone()
+                )?));
                 new_fields.push(
                     Field::new(field.name(), wide_dt, field.is_nullable())
                         .with_metadata(field.metadata().clone()),
@@ -228,7 +339,7 @@ pub fn reconcile_dictionary_representations(batches: Vec<RecordBatch>) -> Result
                     let cast_col = if col.data_type() == &target_dt {
                         col.clone()
                     } else {
-                        arrow::compute::cast(col, &target_dt)?
+                        encode_to_dictionary(col, value_type.as_ref())?
                     };
                     new_columns.push(cast_col);
                     // Inherit the captured dictionary field's metadata (categorical
@@ -496,6 +607,179 @@ mod tests {
             .map(|i| values.value(keys.value(i) as usize))
             .collect();
         assert_eq!(decoded, vec!["a", "b", "a", "c"]);
+    }
+
+    /// `pd.Categorical([True, False])` reaches Arrow as
+    /// `Dictionary(Int8, Boolean)`. Widening its keys must not depend on
+    /// re-encoding the values: arrow's dictionary packing has no `Boolean`
+    /// support, so the decode→re-encode round trip raised *"Unsupported
+    /// output type for dictionary packing: Boolean"* — and because this
+    /// runs inside `assemble_sharded_metadata`, that made `read_obs()`
+    /// fail outright on any **row-sharded** file carrying a boolean
+    /// categorical. The file wrote without complaint; only reading it back
+    /// failed, and only at the scale where obs is sharded.
+    #[test]
+    fn widen_dictionary_keys_handles_non_packable_value_types() {
+        use arrow::array::{Array, BooleanArray};
+        use arrow::datatypes::Int32Type;
+
+        let keys = arrow::array::Int8Array::from(vec![Some(0), Some(1), None, Some(0)]);
+        let values: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
+        let dict: ArrayRef = Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap());
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Boolean));
+        let batch = batch_from(vec![("flag", dict_dt, dict)]);
+
+        let widened = widen_dictionary_keys(&batch).expect("boolean categorical must widen");
+        assert_eq!(
+            widened.schema().field(0).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Boolean))
+        );
+        let got = widened
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let values = got
+            .values()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let decoded: Vec<Option<bool>> = (0..got.len())
+            .map(|i| (!got.keys().is_null(i)).then(|| values.value(got.keys().value(i) as usize)))
+            .collect();
+        assert_eq!(
+            decoded,
+            vec![Some(true), Some(false), None, Some(true)],
+            "values and nulls must survive the key widening"
+        );
+    }
+
+    /// Regression: the mixed dictionary/plain shape `append` creates.
+    ///
+    /// `append` raw-copies the base `Dictionary(_, Boolean)` shards while the
+    /// appended obs shard lands as plain `Boolean`, so reconcile has to encode
+    /// the plain side — and `arrow::compute::cast` cannot pack a `Boolean`
+    /// into a dictionary. Fixing only `widen_dictionary_keys` and the dedup
+    /// arm left this third site raising the same error on `read_obs()` after
+    /// an ordinary append.
+    #[test]
+    fn reconcile_handles_a_mixed_boolean_dictionary_and_plain_column() {
+        use arrow::array::{Array, BooleanArray};
+        use arrow::datatypes::Int32Type;
+
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Boolean));
+        let keys = arrow::array::Int32Array::from(vec![Some(0), Some(1), None]);
+        let values: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
+        let dict: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+        let plain: ArrayRef = Arc::new(BooleanArray::from(vec![Some(false), Some(true)]));
+
+        let out = reconcile_dictionary_representations(vec![
+            batch_from(vec![("flag", dict_dt.clone(), dict)]),
+            batch_from(vec![("flag", DataType::Boolean, plain)]),
+        ])
+        .expect("a mixed boolean column must reconcile");
+
+        // Both batches must end up on the same dtype, or `concat` rejects them.
+        assert_eq!(out[0].schema().field(0).data_type(), &dict_dt);
+        assert_eq!(out[1].schema().field(0).data_type(), &dict_dt);
+
+        // And the values must survive on the encoded side.
+        let decoded = arrow::compute::cast(out[1].column(0), &DataType::Boolean).unwrap();
+        let decoded = decoded.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(
+            (0..decoded.len())
+                .map(|i| (!decoded.is_null(i)).then(|| decoded.value(i)))
+                .collect::<Vec<_>>(),
+            vec![Some(false), Some(true)]
+        );
+
+        // The pair must actually concatenate — the failure this guards is a
+        // read that dies while assembling a sharded axis — and the merged
+        // column must decode to the right values. "concat succeeded" alone
+        // would let a key-remapping regression hide: the two sides intern
+        // their values in different orders (`[true, false]` vs `[false]`),
+        // so a naive concat that kept both key spaces would silently invert
+        // the appended rows.
+        let schema = out[0].schema();
+        let merged =
+            arrow::compute::concat_batches(&schema, &out).expect("reconciled batches must concat");
+        let decoded = arrow::compute::cast(merged.column(0), &DataType::Boolean).unwrap();
+        let decoded = decoded.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(
+            (0..decoded.len())
+                .map(|i| (!decoded.is_null(i)).then(|| decoded.value(i)))
+                .collect::<Vec<_>>(),
+            vec![Some(true), Some(false), None, Some(false), Some(true)],
+            "merged column must preserve every row's value across both key spaces"
+        );
+    }
+
+    /// The hand-packed encoder must not **invent** a category. Emitting
+    /// `[false, true]` unconditionally is the obvious shortcut and turns a
+    /// column whose declared vocabulary is `[True]` into `[True, False]` —
+    /// visible in `.cat.categories`, dtype equality, and
+    /// `groupby(observed=False)`.
+    #[test]
+    fn boolean_encoding_installs_only_the_values_present() {
+        use arrow::array::BooleanArray;
+        use arrow::datatypes::Int32Type;
+
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Boolean));
+        let keys = arrow::array::Int32Array::from(vec![Some(0), Some(0)]);
+        let values: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+        let dict: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+        // The plain side holds only `true` — so must `false` stay out of the
+        // vocabulary.
+        let plain: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), Some(true)]));
+
+        let out = reconcile_dictionary_representations(vec![
+            batch_from(vec![("flag", dict_dt, dict)]),
+            batch_from(vec![("flag", DataType::Boolean, plain)]),
+        ])
+        .unwrap();
+
+        let encoded = out[1].column(0).as_any_dictionary_opt().unwrap();
+        let vocab = encoded
+            .values()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(
+            (0..vocab.len()).map(|i| vocab.value(i)).collect::<Vec<_>>(),
+            vec![true],
+            "only the values actually present may be installed"
+        );
+    }
+
+    /// An all-null Boolean column has no values to intern at all. The
+    /// encoder must still produce a well-formed dictionary rather than
+    /// panicking or inventing a vocabulary for rows that have none.
+    #[test]
+    fn boolean_encoding_handles_an_all_null_column() {
+        use arrow::array::BooleanArray;
+        use arrow::datatypes::Int32Type;
+
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Boolean));
+        let keys = arrow::array::Int32Array::from(vec![Some(0)]);
+        let values: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+        let dict: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+        let plain: ArrayRef = Arc::new(BooleanArray::from(vec![None, None] as Vec<Option<bool>>));
+
+        let out = reconcile_dictionary_representations(vec![
+            batch_from(vec![("flag", dict_dt.clone(), dict)]),
+            batch_from(vec![("flag", DataType::Boolean, plain)]),
+        ])
+        .expect("an all-null boolean column must reconcile");
+        let schema = out[0].schema();
+        let merged = arrow::compute::concat_batches(&schema, &out).unwrap();
+        let decoded = arrow::compute::cast(merged.column(0), &DataType::Boolean).unwrap();
+        let decoded = decoded.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(
+            (0..decoded.len())
+                .map(|i| (!decoded.is_null(i)).then(|| decoded.value(i)))
+                .collect::<Vec<_>>(),
+            vec![Some(true), None, None]
+        );
     }
 
     #[test]
