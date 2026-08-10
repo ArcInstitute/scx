@@ -708,10 +708,12 @@ Behaviour:
   path (`pyscx.from_anndata` on a small file) runs every column through
   `index_auto_threshold` / the high-cardinality threshold before choosing a
   categorical or numeric index, so a high-cardinality **numeric** column is
-  skipped with a reported outcome. The **streaming** builder — the one
-  `merge` / `append` / `compact` / `sort` and sharded conversion use — applies
-  the cap to categorical columns only and always materialises a numeric index,
-  whatever its cardinality. This is long-standing behaviour for plain numeric
+  skipped with a reported outcome. Conversion (`scx convert`,
+  `pyscx.from_anndata`) uses that batch builder, so it is capped. The
+  **streaming** builder — used by `sort` and streaming `compact`, with `merge`
+  and `append` running equivalent incremental builders — applies the cap to
+  categorical columns only and always materialises a numeric index, whatever
+  its cardinality. This is long-standing behaviour for plain numeric
   columns; integer-valued categoricals now inherit it. It matters because a
   numeric index is per-row, not per-category (see the size note below), so
   force-listing a high-cardinality integer column on an atlas-scale streaming

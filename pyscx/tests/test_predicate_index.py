@@ -207,3 +207,61 @@ def test_append_does_not_invent_a_boolean_category(tmp_dir, levels, ordered):
     assert after.cat.ordered == ordered
     assert len(after) == 300
     assert bool((after.astype(bool) == levels[0]).all())
+
+
+@pytest.mark.parametrize(
+    "base_level, appended_level, dtype",
+    [
+        (True, False, "bool"),
+        ("A", "B", "str"),
+        (1, 2, "int"),
+    ],
+)
+def test_append_drops_an_unobserved_level_uniformly_across_value_types(
+    tmp_dir, base_level, appended_level, dtype
+):
+    """Characterisation: `append` does not carry the appended shard's
+    *declared* vocabulary, for **any** categorical value type.
+
+    `scx-ops/src/append.rs` casts the appended obs column to its plain value
+    type, which erases the declared dictionary before the sharded-metadata
+    assembler ever sees it. A level the appended frame declared but no row
+    used is therefore gone after the append — for booleans, strings and
+    integers alike.
+
+    This is pre-existing debt in `append`, not a property of any one encoder,
+    and it is pinned here so that a future attempt to "preserve" it for one
+    value type by *inventing* categories (which is what emitting
+    ``[false, true]`` unconditionally did) shows up as a failure of the
+    other two arms rather than as a silent asymmetry.
+    """
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    def make(n, offset, values, categories):
+        obs = pd.DataFrame(
+            {"c": pd.Categorical(values, categories=categories)},
+            index=[f"x{offset + i}" for i in range(n)],
+        )
+        X = sp.random(n, 5, density=0.2, format="csr", dtype="float32", random_state=0)
+        return anndata.AnnData(X, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(5)]))
+
+    base, addition = tmp_dir / f"unobs_{dtype}_base.scx", tmp_dir / f"unobs_{dtype}_add.scx"
+    pyscx.from_anndata(make(100, 0, [base_level] * 100, [base_level]), str(base), shard_size=25)
+    # The addition declares `appended_level` but every row is null.
+    pyscx.from_anndata(
+        make(50, 100, [None] * 50, [appended_level]), str(addition), shard_size=25
+    )
+
+    pyscx.append(str(base), str(addition))
+    after = pyscx.open(str(base)).read_obs()["c"]
+
+    assert len(after) == 150
+    assert list(after.cat.categories) == [base_level], (
+        "append does not carry the appended shard's declared-but-unused level; "
+        "if that changes, it must change for every value type at once"
+    )
+    # The rows themselves are intact — this is a vocabulary question only.
+    assert list(after[:100]) == [base_level] * 100
+    assert after[100:].isna().all()
