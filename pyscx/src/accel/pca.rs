@@ -1159,6 +1159,17 @@ pub fn pca(
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?
     } else {
         backend = "scx-accel-cpu";
+        // Sort the indices before anything downstream sees them. `owned_csr`
+        // calls `scipy.sparse.csr_matrix(x)`, which is a no-op *view* on an
+        // input that is already CSR — unsorted indices included — and two
+        // consumers below require canonical rows: `project_csr`'s merge scan
+        // (documented on `scx_engine::project_csr_row`, enforced only by a
+        // `debug_assert`, so an unsorted `mask_var=` run silently produced the
+        // wrong columns in a release build), and the partitioned covariance
+        // kernel, which would otherwise fall back to a serial accumulation.
+        // `ensure_csr` short-circuits on `has_sorted_indices`, so the common
+        // case costs one attribute read.
+        let (x, _) = crate::convert::ensure_csr(py, &x, false)?;
         let csr0 = crate::convert::owned_csr(py, &x, None)?;
         // Materialized in-memory path: project columns directly (no streaming
         // source needed) so `mask_var` works identically here.
