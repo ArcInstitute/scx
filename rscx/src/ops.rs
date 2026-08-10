@@ -685,6 +685,10 @@ fn scx_attach_obs_impl(
         obs_columns_added = s.obs_columns_added,
         obsm_keys_added = s.obsm_keys_added,
         obs_index_dropped = s.obs_index_dropped,
+        // Whether the obs rewrite streamed shard-by-shard or assembled the
+        // whole table (which a legacy single-section obs forces). Not
+        // recoverable from the output: both paths write a sharded obs.
+        obs_streamed = s.obs_streamed,
         dry_run = dry_run
     )
     .into())

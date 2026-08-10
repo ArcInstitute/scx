@@ -22,6 +22,17 @@
 //! error has a second benefit — the CLI and Python surfaces map **one** error
 //! type across read-then-attach instead of two.
 //!
+//! # Memory: this reader is whole-file
+//!
+//! Type inference is bounded to the first `DEFAULT_INFER_RECORDS` rows, but the read that
+//! follows is not: every batch is collected and `concat_batches`-ed into one
+//! table, so peak is the table plus the transient copy the concat makes. That is
+//! inherent rather than lazy — [`scx_ops::ExternalObsData`] holds every key and
+//! every annotation, because the join is by key and the source's row order is
+//! its own business — and it is the bargain the whole feature rests on: the
+//! annotation table is the *small* side. The target-side cost, which is the one
+//! that scales with an atlas, is bounded shard-by-shard in `scx_ops`.
+//!
 //! # Two real-world shapes that need explicit handling
 //!
 //! * **`NA` poisons type inference.** arrow's default null rule treats only the

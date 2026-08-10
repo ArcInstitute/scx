@@ -94,6 +94,22 @@ pub fn run_cellbender_import(
         s.n_source_rows_absent_nonzero,
     );
 
+    // Printed before the dry-run return on purpose: a preview whose whole job
+    // is "should I run this on the atlas" must say which memory path it would
+    // take. (Round-2 finding: Grok, Gemini, codex.)
+    println!(
+        "Obs rewrite: {} (peak memory {})",
+        if s.obs_streamed {
+            "streamed shard-by-shard"
+        } else {
+            "whole table materialized"
+        },
+        if s.obs_streamed {
+            "one obs shard"
+        } else {
+            "the entire obs table \u{2014} run `scx optimize` to shard it"
+        },
+    );
     if dry_run {
         println!("Dry run: nothing written.");
         return Ok(());

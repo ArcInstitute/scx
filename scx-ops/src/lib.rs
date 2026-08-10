@@ -44,7 +44,7 @@ pub use external_layer::{
 pub use external_obs::{
     attach_external_obs, build_composite_key, diagnose_obs_key, obs_key_values,
     resolve_obs_key_column, AttachObsOptions, AttachObsSummary, ExternalObsData, KeyDiagnosis,
-    ObsJoinKey, COMPOSITE_KEY_SEPARATOR,
+    ObsJoinKey, ObsRewrite, COMPOSITE_KEY_SEPARATOR,
 };
 pub use group_plan::{plan_group_shards, GroupPlan, GroupRecord, Role};
 pub use merge::{merge, merge_with_index_options, merge_with_options};

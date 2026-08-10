@@ -44,6 +44,33 @@
 //! query pushdown would silently return wrong rows. [`obs_index_would_go_stale`]
 //! decides precisely, so pushdown survives every import that does not actually
 //! invalidate it.
+//!
+//! # Memory
+//!
+//! The point of this op is landing a *small* annotation on a *large* file, so
+//! the target side must not scale with the target. On a file whose obs is
+//! sharded — every atlas — it does not: the schema is read from the Arrow IPC
+//! footer, the join reads only the key column(s) through
+//! [`ScxReader::read_obs_keys`], and the rewrite runs one obs shard at a time.
+//! Peak is one obs shard plus the join arrays (one `Option<u32>` and one key
+//! string per target row).
+//!
+//! Three things are still unbounded, deliberately:
+//!
+//! * **A legacy single-section `ObsMetadata` target.** One Arrow IPC section is
+//!   one batch and there is no per-shard reader, so the whole table is
+//!   assembled. The op warns and names `scx optimize` as the fix;
+//!   [`AttachObsSummary::obs_streamed`] reports which path ran.
+//! * **The key diagnosis on a failed join** ([`KeyDiagnosis`]) reads every obs
+//!   column. Only reached when the import is already failing.
+//! * **`obsm` embeddings**, which `write_obsm` emits as one `n_obs`-row
+//!   section. Not reached unless the caller supplies them — no doublet caller
+//!   does, but `cellbender_import(latent_embedding=True)` builds one, so this
+//!   is reachable on the layer op.
+//!
+//! The **source** side is resident in full by construction —
+//! [`ExternalObsData`] holds every key and every annotation — which is the
+//! bargain the op is built on: the source is the small side.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom, Write};
@@ -211,6 +238,11 @@ pub struct AttachObsSummary {
     /// overwrote a column it covered. `true` means query pushdown on those
     /// columns is gone until the index is rebuilt.
     pub obs_index_dropped: bool,
+    /// `true` when the obs axis was rewritten shard by shard (peak memory one
+    /// shard); `false` when it had to be assembled whole, which is forced by a
+    /// legacy single-section `ObsMetadata` and by nothing else. See
+    /// [`ObsRewrite`].
+    pub obs_streamed: bool,
 }
 
 /// What a key looks like on this file, and what would actually work.
@@ -389,7 +421,7 @@ pub fn build_composite_key(batch: &RecordBatch, columns: &[String]) -> Result<Ve
 /// file that should have joined would fail with zero overlap and no obvious
 /// cause.
 pub fn resolve_obs_key_column(batch: &RecordBatch, requested: Option<&str>) -> Result<String> {
-    resolve_key_column("obs", batch, requested)
+    resolve_key_column("obs", &batch.schema(), requested)
 }
 
 /// Materialize a column as owned `String`s, resolving dictionaries. Exported
@@ -399,32 +431,90 @@ pub fn obs_key_values(batch: &RecordBatch, column: &str) -> Result<Vec<String>> 
     string_column(batch, column)
 }
 
-/// Resolve the target-side keys for `join_key`, returning `(spec, keys)`.
-fn resolve_target_keys(obs: &RecordBatch, join_key: &ObsJoinKey) -> Result<(String, Vec<String>)> {
+/// Resolve `join_key` against the obs **schema**, returning the spec to report
+/// and the physical column(s) the keys are built from.
+///
+/// Split out from key materialization so the op can name the columns it needs
+/// before deciding how to read them: with the physical names in hand it can ask
+/// [`ScxReader::read_obs_keys`] for those columns alone instead of assembling
+/// the whole obs table to reach one of them.
+///
+/// The reported spec is the physical name, not what the caller typed, so
+/// `AttachObsSummary::obs_key_column` and the provenance entry stay in the
+/// on-disk vocabulary even when the caller used `obs_names`.
+fn resolve_target_key_spec(
+    schema: &Schema,
+    join_key: &ObsJoinKey,
+) -> Result<(String, Vec<String>)> {
     match join_key {
         ObsJoinKey::Auto => {
-            let col = resolve_key_column("obs", obs, None)?;
-            let keys = string_column(obs, &col)?;
-            Ok((col, keys))
+            let col = resolve_key_column("obs", schema, None)?;
+            Ok((col.clone(), vec![col]))
         }
         ObsJoinKey::Column(c) => {
-            let col = resolve_key_column("obs", obs, Some(c))?;
-            let keys = string_column(obs, &col)?;
-            Ok((col, keys))
+            let col = resolve_key_column("obs", schema, Some(c))?;
+            Ok((col.clone(), vec![col]))
         }
         ObsJoinKey::Composite { columns } => {
-            let keys = build_composite_key(obs, columns)?;
-            // Report the physical spec, not what the caller typed, so
-            // `AttachObsSummary::obs_key_column` and the provenance entry stay
-            // in the on-disk vocabulary even when the caller used `obs_names`.
-            let schema = obs.schema();
+            if columns.is_empty() {
+                return Err(OpsError::InvalidInput(
+                    "composite join key needs at least one column".into(),
+                ));
+            }
+            // Every component goes through the same alias resolution a single
+            // key does, so `["sample_id", "obs_names"]` works — see
+            // `build_composite_key`, which repeats this on the batch it is
+            // handed and must not be able to disagree with it.
             let physical: Vec<String> = columns
                 .iter()
-                .map(|c| resolve_key_alias("obs", &schema, c))
+                .map(|c| resolve_key_alias("obs", schema, c))
                 .collect();
-            Ok((physical.join(","), keys))
+            // Existence is checked here, against the caller's own spelling.
+            // `build_composite_key` also checks, but by the time it runs the
+            // batch has been projected to `physical`, so its message would
+            // quote a name the user never typed — and on the streaming path it
+            // never runs at all, because the projected read fails first with a
+            // bare "obs column not found". Single-column keys get this from
+            // `resolve_key_column`; composites had nowhere else to get it.
+            for (name, requested) in physical.iter().zip(columns) {
+                if schema.field_with_name(name).is_err() {
+                    let present: Vec<String> = schema
+                        .fields()
+                        .iter()
+                        .map(|f| display_key_name("obs", f.name()))
+                        .collect();
+                    return Err(OpsError::KeyColumnUnresolved {
+                        axis: "obs",
+                        detail: format!(
+                            "composite key column '{requested}' not found; \
+                             columns present are {present:?}"
+                        ),
+                    });
+                }
+            }
+            Ok((physical.join(","), physical))
         }
     }
+}
+
+/// Build the target-side key strings from a batch already projected to
+/// `physical` (or from the full obs table — either works, the columns are
+/// addressed by name).
+fn materialize_target_keys(batch: &RecordBatch, physical: &[String]) -> Result<Vec<String>> {
+    if physical.len() == 1 {
+        string_column(batch, &physical[0])
+    } else {
+        build_composite_key(batch, physical)
+    }
+}
+
+/// Resolve the target-side keys for `join_key` from a materialized obs table,
+/// returning `(spec, keys)`. Used by [`diagnose_obs_key`], which needs the whole
+/// table anyway.
+fn resolve_target_keys(obs: &RecordBatch, join_key: &ObsJoinKey) -> Result<(String, Vec<String>)> {
+    let (spec, physical) = resolve_target_key_spec(&obs.schema(), join_key)?;
+    let keys = materialize_target_keys(obs, &physical)?;
+    Ok((spec, keys))
 }
 
 // ---------------------------------------------------------------------------
@@ -609,8 +699,28 @@ struct ObsRowJoin {
     n_source_absent: u64,
 }
 
+/// The failure-path [`KeyDiagnosis`] text, read from `reader` on demand.
+///
+/// The diagnosis — "here are the columns that *would* work as a key" — is the
+/// feature that stops a merged atlas with a duplicated obs index stranding the
+/// user, so it is worth the whole obs table. But it needs every column and runs
+/// a `RowConverter` + `HashSet` pass per column, so it must not be paid for on a
+/// successful import. Calling it only from the arms that print it is what keeps
+/// the read off the happy path, and it is the one unbounded read left in either
+/// import.
+///
+/// Returns an empty string when obs cannot be read: a failed read must not
+/// replace the join error the user actually needs with an I/O error raised by
+/// the code trying to explain it.
+fn describe_key_diagnosis(reader: &ScxReader, resolved: Option<(&str, &[String])>) -> String {
+    match reader.read_obs() {
+        Ok(obs) => diagnose_from_obs(&obs, resolved).describe(),
+        Err(_) => String::new(),
+    }
+}
+
 fn build_obs_row_join(
-    obs: &RecordBatch,
+    reader: &ScxReader,
     key_spec: &str,
     target_keys: &[String],
     source_keys: &[String],
@@ -618,13 +728,12 @@ fn build_obs_row_join(
 ) -> Result<ObsRowJoin> {
     let dups = first_duplicates(target_keys);
     if !dups.is_empty() {
-        let diag = diagnose_from_obs(obs, Some((key_spec, target_keys)));
+        let diag = describe_key_diagnosis(reader, Some((key_spec, target_keys)));
         return Err(OpsError::DuplicateJoinKey {
             axis: "obs",
             detail: format!(
-                "target obs key '{}' contains duplicates: {dups:?}. {}",
+                "target obs key '{}' contains duplicates: {dups:?}. {diag}",
                 display_key_name("obs", key_spec),
-                diag.describe()
             ),
         });
     }
@@ -661,17 +770,16 @@ fn build_obs_row_join(
     }
 
     if n_matched == 0 {
-        let diag = diagnose_from_obs(obs, Some((key_spec, target_keys)));
+        let diag = describe_key_diagnosis(reader, Some((key_spec, target_keys)));
         return Err(OpsError::AxisMismatch {
             axis: "obs",
             detail: format!(
                 "no target row key matched any source row key on '{}'. Target \
                  examples: {:?}; source examples: {:?}. Check for a sample-name prefix \
-                 or a '-1' suffix difference. {}",
+                 or a '-1' suffix difference. {diag}",
                 display_key_name("obs", key_spec),
                 examples(target_keys),
                 examples(source_keys),
-                diag.describe()
             ),
         });
     }
@@ -777,11 +885,22 @@ fn obs_join_coverage_report(
     ))
 }
 
-/// Scatter a source-row-indexed array onto the target row axis, `null` for
-/// unmatched rows. `null`, not a zero: a score of `0.0` on a cell the tool never
-/// saw is a claim it never made.
-fn scatter(col: &ArrayRef, join: &ObsRowJoin) -> Result<ArrayRef> {
-    let take_idx: UInt32Array = join.source_of_target.iter().copied().collect();
+/// Scatter a source-row-indexed array onto target rows `[row_start, row_end)`,
+/// `null` for unmatched rows. `null`, not a zero: a score of `0.0` on a cell the
+/// tool never saw is a claim it never made.
+///
+/// The row window is what lets the whole build run one obs shard at a time: the
+/// output is shard-length, not `n_obs`-length.
+fn scatter(
+    col: &ArrayRef,
+    join: &ObsRowJoin,
+    row_start: usize,
+    row_end: usize,
+) -> Result<ArrayRef> {
+    let take_idx: UInt32Array = join.source_of_target[row_start..row_end]
+        .iter()
+        .copied()
+        .collect();
     arrow::compute::take(col.as_ref(), &take_idx, None)
         .map_err(|e| OpsError::InvalidInput(format!("failed to scatter annotation column: {e}")))
 }
@@ -805,12 +924,30 @@ fn planned_obs_columns(data: &ExternalObsData, opts: &AttachObsOptions) -> Vec<S
     cols
 }
 
+/// Append the import's columns to `obs`, which covers global obs rows
+/// `[row_start, row_start + obs.num_rows())`.
+///
+/// `row_start` is the only thing that distinguishes the streaming path from the
+/// materializing one: the latter passes the whole table at `row_start = 0`. One
+/// implementation, two callers — the alternative is two builders that agree
+/// until one of them is edited.
 fn build_new_obs(
     obs: &RecordBatch,
     data: &ExternalObsData,
     opts: &AttachObsOptions,
     join: &ObsRowJoin,
+    row_start: usize,
 ) -> Result<RecordBatch> {
+    let row_end = row_start + obs.num_rows();
+    if row_end > join.source_of_target.len() {
+        return Err(OpsError::ShapeMismatch {
+            detail: format!(
+                "obs rows [{row_start}, {row_end}) overrun the {}-row join built \
+                 from the header's n_obs",
+                join.source_of_target.len()
+            ),
+        });
+    }
     let mut fields: Vec<Field> = obs
         .schema()
         .fields()
@@ -834,8 +971,7 @@ fn build_new_obs(
         .collect();
 
     if let Some(name) = &opts.status_column {
-        let arr: StringArray = join
-            .source_of_target
+        let arr: StringArray = join.source_of_target[row_start..row_end]
             .iter()
             .map(|o| Some(if o.is_some() { "present" } else { "absent" }))
             .collect();
@@ -844,7 +980,7 @@ fn build_new_obs(
     }
 
     for (i, f) in data.row_annotations.schema().fields().iter().enumerate() {
-        let scattered = scatter(data.row_annotations.column(i), join)?;
+        let scattered = scatter(data.row_annotations.column(i), join, row_start, row_end)?;
         // Unmatched rows become null, so the field must admit nulls regardless
         // of how the source declared it.
         fields.push(Field::new(f.name(), f.data_type().clone(), true));
@@ -854,6 +990,194 @@ fn build_new_obs(
     let schema = Arc::new(Schema::new(fields).with_metadata(obs.schema().metadata().clone()));
     RecordBatch::try_new(schema, columns)
         .map_err(|e| OpsError::InvalidInput(format!("failed to build new obs: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// The obs rewrite
+// ---------------------------------------------------------------------------
+
+/// Read the join key column(s) and validate the obs shard cover in one pass,
+/// before anything is written.
+///
+/// [`ScxReader::read_obs_keys`] on its own is not enough, and the gap is narrow
+/// enough to be worth spelling out. It walks the *stamps* — so a gap, a
+/// reordering, or a total that disagrees with `n_obs` is refused — but it never
+/// compares a shard's stamp with the number of rows that shard actually
+/// carries. Those two agree on every file a writer produces, and they can
+/// disagree in a way nothing downstream notices when the errors **cancel**: a
+/// shard stamped 6 rows carrying 4, beside one stamped 4 carrying 6, tiles
+/// `[0, 10)` by stamps and sums to 10 by payload. The caller's
+/// `n_obs`-vs-header check passes, and the only thing left that would catch it
+/// used to live inside the write loop — after the dry-run return, and after the
+/// first bytes had been appended.
+///
+/// That made `dry_run` a liar on exactly this input: it reported a clean join
+/// and the real import then failed. Doing the check here restores the contract
+/// three separate surfaces promise — "`--dry-run` runs every validation", "a
+/// rejected import leaves the file byte-identical" — at no extra I/O, because
+/// this pass is the projected read the join needed anyway.
+pub(crate) fn read_obs_keys_validated(
+    reader: &ScxReader,
+    obs_schema: &Schema,
+    key_columns: &[String],
+    n_obs: u64,
+) -> Result<RecordBatch> {
+    let n_shards = reader.obs_metadata_shard_count();
+    if n_shards == 0 {
+        // A legacy single section has no per-shard stamps to contradict, so
+        // there is nothing extra to check — and no per-shard reader either.
+        return Ok(reader.read_obs_keys(key_columns)?);
+    }
+
+    let projection: Vec<usize> = key_columns
+        .iter()
+        .map(|name| {
+            obs_schema.index_of(name).map_err(|_| {
+                OpsError::InvalidInput(format!("obs column '{name}' disappeared before the read"))
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    let mut cover = crate::compact::ShardCoverCheck::default();
+    let mut shards: Vec<(u32, RecordBatch)> = Vec::with_capacity(n_shards);
+    for idx in 0..n_shards as u32 {
+        let projected = reader.read_obs_shard_projected(idx, &projection)?;
+        cover.visit("obs_metadata", &projected)?;
+        // Arrow IPC column projection hands back a zero-copy slice into the
+        // shard's whole message body, so retaining it would keep every
+        // un-projected column resident and the projection would save nothing.
+        // `compact_key_shard` rebuilds into fresh buffers — the same move
+        // `read_obs_keys` makes, and the reason this loop is not a memory
+        // regression over it.
+        shards.push((idx, scx_format_io::compact_key_shard(&projected)?));
+    }
+    cover.finish("obs_metadata", n_obs)?;
+    Ok(scx_format_io::assemble_sharded_metadata(
+        "obs_metadata",
+        shards,
+    )?)
+}
+
+/// How the target's obs axis was rewritten. Reported on both attach summaries
+/// and recorded in provenance, so "did this import hold the whole obs table"
+/// is answerable after the fact rather than inferred from the file's layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObsRewrite {
+    /// One output shard per input shard; peak memory is one shard. Requires a
+    /// sharded input — the only layout with a per-shard reader.
+    Streamed,
+    /// The whole obs table was assembled, appended to, and re-sharded. The only
+    /// option for a legacy single-section `ObsMetadata`: one Arrow IPC section
+    /// is one batch, so there is nothing to stream.
+    Materialized,
+}
+
+/// Rewrite the target's obs axis one shard at a time, appending the columns
+/// `build` produces for each shard's global row range.
+///
+/// Shared by both external imports so they cannot drift on how the row offset
+/// is derived — the running cursor here is the whole reason a shard's
+/// annotations land on its own rows.
+///
+/// Emits one output shard per input shard, preserving the input's boundaries
+/// rather than re-deriving them from `header.shard_target_rows`. That matches
+/// `compact` and `optimize`, and it is what makes the rewrite streamable at all.
+///
+/// [`crate::compact::ShardCoverCheck`] runs here as well as in
+/// [`read_obs_keys_validated`], which is what actually refuses a bad axis
+/// before any byte is written. Keeping it in the write loop is not redundancy
+/// for its own sake: this is the loop that derives each output shard's range
+/// from the rows it can *see*, so it is the one place where a stamp the payload
+/// does not honour turns into a well-formed file whose obs is bound to
+/// different matrix rows than the input claimed. The pre-write pass makes that
+/// unreachable; this makes it unreachable even if a future caller forgets the
+/// pre-write pass.
+pub(crate) fn write_obs_shards_appending<F>(
+    reader: &ScxReader,
+    writer: &mut ScxWriter,
+    n_obs: u64,
+    mut build: F,
+) -> Result<()>
+where
+    F: FnMut(&RecordBatch, usize) -> Result<RecordBatch>,
+{
+    let mut cover = crate::compact::ShardCoverCheck::default();
+    let mut row_start = 0usize;
+    for (out_idx, res) in reader.obs_shards().enumerate() {
+        let out_idx = out_idx as u32;
+        let shard = res?;
+        cover.visit("obs_metadata", &shard)?;
+        let n = shard.num_rows();
+        let built = build(&shard, row_start)?;
+        // Matches the materializing path exactly: the cast to the dictionary's
+        // value type is what both paths write, so the two produce the same
+        // bytes. See the note on `unify_dict_columns` — it is not the
+        // deduplication its name suggests here, since a shard read straight off
+        // disk was never concatenated.
+        let built = unify_dict_columns(&built)?;
+        writer.write_obs_shard(out_idx, row_start as u64, n as u64, n_obs, &built)?;
+        row_start += n;
+    }
+    cover.finish("obs_metadata", n_obs)?;
+    Ok(())
+}
+
+/// Write an already-assembled obs table as shards of `shard_target_rows`.
+/// The legacy single-section path, kept byte-compatible with what both imports
+/// have always emitted.
+///
+/// The row count is checked here rather than at each call site. `n_obs` is
+/// stamped into every output shard as `n_rows_total`, so a short `obs` would
+/// emit shards covering fewer rows than they claim — a malformed axis produced
+/// by the code meant to preserve one. `build_new_obs`'s own bound catches an
+/// over-run; this is the other direction, and putting it in the shared writer is
+/// what stops the two ops from disagreeing about whether it is checked at all.
+pub(crate) fn write_obs_shards_from_whole(
+    writer: &mut ScxWriter,
+    obs: &RecordBatch,
+    n_obs: u64,
+    shard_target_rows: usize,
+) -> Result<()> {
+    let n = obs.num_rows();
+    if n as u64 != n_obs {
+        return Err(OpsError::ShapeMismatch {
+            detail: format!("obs has {n} rows but the header declares n_obs = {n_obs}"),
+        });
+    }
+    // Both call sites already `.max(1)` the header value, so this is not
+    // reachable today — but the loop below advances its cursor by `take`, so a
+    // zero would hang rather than fail, and hanging is the one outcome a caller
+    // cannot diagnose. Cheap insurance on new `pub(crate)` surface.
+    // (Round-2 finding: Grok, Gemini.)
+    if shard_target_rows == 0 {
+        return Err(OpsError::InvalidInput(
+            "shard_target_rows must be non-zero to write obs shards".into(),
+        ));
+    }
+    let mut cursor = 0usize;
+    let mut idx = 0u32;
+    while cursor < n {
+        let take = std::cmp::min(shard_target_rows, n - cursor);
+        writer.write_obs_shard(
+            idx,
+            cursor as u64,
+            take as u64,
+            n_obs,
+            &obs.slice(cursor, take),
+        )?;
+        idx += 1;
+        cursor += take;
+    }
+    Ok(())
+}
+
+/// Warn once when a target's obs cannot be streamed, naming the remedy.
+pub(crate) fn warn_unstreamable_obs(op: &str, n_obs: u64) {
+    log::warn!(
+        "{op}: the target's obs is a single legacy section ({n_obs} rows), which has no \
+         per-shard reader — the whole obs table is held in memory for this import. \
+         Run `scx optimize` on the file first to migrate it to the sharded layout."
+    );
 }
 
 fn build_new_uns(mut uns: Value, data: &ExternalObsData, opts: &AttachObsOptions) -> Value {
@@ -869,14 +1193,21 @@ fn build_new_uns(mut uns: Value, data: &ExternalObsData, opts: &AttachObsOptions
     uns
 }
 
+/// Scatter the source embeddings onto the full target row axis.
+///
+/// Unlike obs, this is **not** bounded: `write_obsm` emits one section, so the
+/// batch has to be `n_obs` rows. Only reached when the caller supplies
+/// embeddings — no doublet caller does — and bounding it needs sharded
+/// `ObsmEmbeddingShard` writes.
 fn build_obsm(data: &ExternalObsData, join: &ObsRowJoin) -> Result<Vec<(String, RecordBatch)>> {
+    let n_obs = join.source_of_target.len();
     let mut out = Vec::new();
     for (name, batch) in &data.row_embeddings {
         let mut fields = Vec::new();
         let mut columns = Vec::new();
         for (i, f) in batch.schema().fields().iter().enumerate() {
             fields.push(Field::new(f.name(), f.data_type().clone(), true));
-            columns.push(scatter(batch.column(i), join)?);
+            columns.push(scatter(batch.column(i), join, 0, n_obs)?);
         }
         let schema = Arc::new(Schema::new(fields));
         let scattered = RecordBatch::try_new(schema, columns)
@@ -949,13 +1280,12 @@ pub(crate) fn indexed_column_names(bytes: Option<&[u8]>) -> Result<Vec<String>> 
 
 fn check_collisions(
     reader: &ScxReader,
-    obs: &RecordBatch,
+    obs_schema: &Schema,
     uns: &Value,
     data: &ExternalObsData,
     opts: &AttachObsOptions,
     obs_new: &[String],
 ) -> Result<()> {
-    let obs_schema = obs.schema();
     for name in obs_new {
         if obs_schema.field_with_name(name).is_ok() {
             return Err(OpsError::InvalidInput(format!(
@@ -973,9 +1303,12 @@ fn check_collisions(
         }
     }
     if !data.row_embeddings.is_empty() {
-        let existing = reader.read_all_obsm().unwrap_or_default();
+        // Names only — `read_all_obsm` would decode every existing embedding
+        // just to look at its key, which on an atlas is the largest thing this
+        // op touches. `list_obsm` is a catalog scan. (Round-1 finding: codex.)
+        let existing = reader.list_obsm();
         for (name, _) in &data.row_embeddings {
-            if existing.iter().any(|(k, _)| k == name) {
+            if existing.iter().any(|k| k == name) {
                 return Err(OpsError::InvalidInput(format!(
                     "obsm key '{name}' already exists; pass overwrite=true to replace it"
                 )));
@@ -1034,6 +1367,11 @@ fn build_params_json(
         "obs_columns": s.obs_columns_added,
         "obsm_keys": s.obsm_keys_added,
         "obs_predicate_index_dropped": s.obs_index_dropped,
+        // Whether the obs rewrite streamed shard-by-shard or assembled the
+        // whole table. Recorded because it is not recoverable from the output:
+        // both paths produce a sharded obs, so a file that cost its own obs
+        // table in RAM looks exactly like one that did not.
+        "obs_streamed": s.obs_streamed,
         "uns_key": opts.uns_key,
         "overwrite": opts.overwrite,
     });
@@ -1052,12 +1390,60 @@ fn build_params_json(
 /// Attach `data` to the SCX file at `path` as obs columns plus optional
 /// `obsm` / `uns`, joined to the target's own obs axis by key.
 ///
-/// Every validation runs before the first byte is written, so a rejected import
-/// leaves the file byte-identical. `X`, layers, the CSC sidecar, `.raw`,
-/// deletion vectors, detection bitmaps and `var` are never read or rewritten;
-/// the whole import is undoable with `scx rollback`.
+/// # What is checked before the first byte is written
+///
+/// The shape, the join, and the obs shard cover — the last via
+/// [`read_obs_keys_validated`], during the join's projected key read. That
+/// placement is load-bearing rather than incidental: the same check inside the
+/// write loop would sit past the `dry_run` return, so a preview could report a
+/// clean join for a file the real import then refuses.
+///
+/// **The preflight reads only the key column(s).** Arrow IPC projection skips
+/// decoding the rest, so a *non-key* obs column that fails to decode, or a
+/// per-shard schema that disagrees with shard 0's, is not seen until the write
+/// pass — where it aborts with obs shards already appended at EOF. The catalog
+/// is only swapped by `commit_in_place`, so the file still reads as it did and
+/// `scx compact` reclaims the orphans; but a `dry_run` cannot promise that case
+/// away. Note such a file is already unreadable through `read_obs()`, whose
+/// `concat_batches` needs one shared schema — this op declines to be the thing
+/// that discovers it. Making the preflight total would mean decoding every
+/// column of every shard twice per import; that trade is deliberately not made
+/// here. (Round-2 finding: codex.)
+///
+/// `X`, layers, the CSC sidecar, `.raw`, deletion vectors, detection bitmaps
+/// and `var` are never read or rewritten; the whole import is undoable with
+/// `scx rollback`.
 pub fn attach_external_obs(
     path: &Path,
+    data: &ExternalObsData,
+    opts: &AttachObsOptions,
+) -> Result<AttachObsSummary> {
+    attach_external_obs_inner(path, None, data, opts)
+}
+
+/// [`attach_external_obs`] against a caller-supplied reader, so a test can hold
+/// the reader the op actually used and assert on its
+/// [`ScxReader::debug_counts`] — the only way to prove the whole obs table was
+/// never assembled.
+///
+/// Test-only because the ordering differs: production opens the reader *after*
+/// `prepare_in_place` has taken the exclusive lock, so the mmap cannot be stale
+/// with respect to a concurrent appender. A caller that opens first gives that
+/// up, which is fine in a single-process test and is not something to offer
+/// callers generally.
+#[cfg(test)]
+pub(crate) fn attach_external_obs_with_reader(
+    path: &Path,
+    reader: &ScxReader,
+    data: &ExternalObsData,
+    opts: &AttachObsOptions,
+) -> Result<AttachObsSummary> {
+    attach_external_obs_inner(path, Some(reader), data, opts)
+}
+
+fn attach_external_obs_inner(
+    path: &Path,
+    injected_reader: Option<&ScxReader>,
     data: &ExternalObsData,
     opts: &AttachObsOptions,
 ) -> Result<AttachObsSummary> {
@@ -1085,36 +1471,63 @@ pub fn attach_external_obs(
 
     // The reader takes no lock of its own; we only ever append, never truncate,
     // so holding it across the transaction is safe.
-    let reader = ScxReader::open(path)?;
-    let obs = reader.read_obs()?;
+    let owned_reader;
+    let reader = match injected_reader {
+        Some(r) => r,
+        None => {
+            owned_reader = ScxReader::open(path)?;
+            &owned_reader
+        }
+    };
     let uns = reader.read_uns().unwrap_or_else(|_| serde_json::json!({}));
 
+    // A single legacy `ObsMetadata` section is one Arrow IPC batch with no
+    // per-shard reader, so there is nothing to stream and the whole table has
+    // to be assembled. Decided once, here, and reported on the summary.
+    let obs_rewrite = if reader.obs_metadata_shard_count() > 0 {
+        ObsRewrite::Streamed
+    } else {
+        ObsRewrite::Materialized
+    };
+
     let n_obs = prep.old_n_obs;
-    if obs.num_rows() as u64 != n_obs {
+
+    // --- Resolve the join key and build the join ---------------------------
+    //
+    // Only the key column(s) are read: `read_obs_keys` projects each obs shard
+    // to them and compacts it, so peak memory is the key data rather than the
+    // whole table. It also runs the same contiguous-cover validation
+    // `read_obs()` did, which is what keeps the op's "every validation runs
+    // before the first byte is written" contract intact — including the
+    // n_obs-vs-header shape check below.
+    let obs_schema = reader.read_obs_schema_physical()?;
+    let (key_spec, key_columns) = resolve_target_key_spec(&obs_schema, &opts.join_key)?;
+    let key_batch = read_obs_keys_validated(reader, &obs_schema, &key_columns, n_obs)?;
+    if key_batch.num_rows() as u64 != n_obs {
         return Err(OpsError::ShapeMismatch {
             detail: format!(
                 "obs has {} rows but the header declares n_obs = {n_obs}",
-                obs.num_rows()
+                key_batch.num_rows()
             ),
         });
     }
-
-    // --- Resolve the join key and build the join ---------------------------
-    let (key_spec, target_keys) = resolve_target_keys(&obs, &opts.join_key)?;
-    let row_join = build_obs_row_join(&obs, &key_spec, &target_keys, &data.row_keys, opts)?;
+    let target_keys = materialize_target_keys(&key_batch, &key_columns)?;
+    // The key diagnosis costs the whole obs table, so `build_obs_row_join`
+    // takes the reader and pays for it only on the arms that print it.
+    let row_join = build_obs_row_join(reader, &key_spec, &target_keys, &data.row_keys, opts)?;
+    drop(key_batch);
+    drop(target_keys);
 
     // --- Collision checks ---------------------------------------------------
     if !opts.overwrite {
-        check_collisions(&reader, &obs, &uns, data, opts, &planned_obs)?;
+        check_collisions(reader, &obs_schema, &uns, data, opts, &planned_obs)?;
     }
 
     // --- Would this invalidate the obs predicate index? ---------------------
-    let drop_obs_index = obs_index_would_go_stale(&reader, &planned_obs)?;
+    let drop_obs_index = obs_index_would_go_stale(reader, &planned_obs)?;
 
-    // --- Build the new sections in memory ----------------------------------
+    // --- Build the sections that are not the obs axis -----------------------
     let rewrote_uns = opts.uns_key.is_some() && data.uns.is_some();
-    let new_obs = build_new_obs(&obs, data, opts, &row_join)?;
-    let new_obs = unify_dict_columns(&new_obs)?;
     let new_uns = build_new_uns(uns, data, opts);
     let obsm_batches = build_obsm(data, &row_join)?;
 
@@ -1136,6 +1549,7 @@ pub fn attach_external_obs(
         obs_columns_added: planned_obs,
         obsm_keys_added: obsm_batches.iter().map(|(k, _)| k.clone()).collect(),
         obs_index_dropped: drop_obs_index,
+        obs_streamed: obs_rewrite == ObsRewrite::Streamed,
     };
 
     if opts.dry_run {
@@ -1145,6 +1559,21 @@ pub fn attach_external_obs(
         // construction.
         return Ok(summary);
     }
+
+    // On the materializing path the obs table is read and rebuilt *here*,
+    // before the writer exists, so a failure still leaves the file untouched.
+    // (After the dry-run return, though — a preview should not pay for it.)
+    // The streaming path builds inside the write loop by construction.
+    let materialized_obs = match obs_rewrite {
+        ObsRewrite::Streamed => None,
+        ObsRewrite::Materialized => {
+            warn_unstreamable_obs("obs import", n_obs);
+            let obs = reader.read_obs()?;
+            let built = unify_dict_columns(&build_new_obs(&obs, data, opts, &row_join, 0)?)?;
+            drop(obs);
+            Some(built)
+        }
+    };
 
     let mut prov_ops = read_provenance_ops(&mut lock, &prep.old_catalog)?;
 
@@ -1158,20 +1587,13 @@ pub fn attach_external_obs(
         writer.write_uns(&new_uns)?;
     }
 
-    let n = new_obs.num_rows();
-    let mut cursor = 0usize;
-    let mut idx = 0u32;
-    while cursor < n {
-        let take = std::cmp::min(shard_target_rows, n - cursor);
-        writer.write_obs_shard(
-            idx,
-            cursor as u64,
-            take as u64,
-            n_obs,
-            &new_obs.slice(cursor, take),
-        )?;
-        idx += 1;
-        cursor += take;
+    match &materialized_obs {
+        None => write_obs_shards_appending(reader, &mut writer, n_obs, |shard, row_start| {
+            build_new_obs(shard, data, opts, &row_join, row_start)
+        })?,
+        Some(new_obs) => {
+            write_obs_shards_from_whole(&mut writer, new_obs, n_obs, shard_target_rows)?
+        }
     }
 
     for (name, batch) in &obsm_batches {

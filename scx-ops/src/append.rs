@@ -1642,8 +1642,17 @@ fn effective_type(dt: &arrow::datatypes::DataType) -> &arrow::datatypes::DataTyp
 ///
 /// Arrow's `concat_batches` concatenates dictionaries without deduplication,
 /// which produces invalid categoricals for pandas. Casting dictionary → value
-/// type (e.g. Utf8) removes duplicates. Arrow IPC will re-encode them as
-/// dictionaries on the next write.
+/// type (e.g. Utf8) removes duplicates.
+///
+/// **The cast is one-way.** An earlier version of this comment claimed "Arrow
+/// IPC will re-encode them as dictionaries on the next write"; it does not —
+/// `ScxWriter::write_arrow_ipc` serialises whatever it is handed. So every op
+/// that runs this over an obs table permanently converts that table's
+/// categoricals to plain strings, and a `cell_type` column comes back from
+/// `read_obs()` as `object` rather than `category`. That is a real defect and
+/// it is not this function's alone — `append` writes obs categoricals as `Utf8`
+/// by a different route — so it wants one fix across that family rather than a
+/// per-caller patch. Recorded here so the next reader is not misled twice.
 ///
 /// **Metadata is carried across unchanged**, at both the schema and the field
 /// level, because none of it is this function's business to edit. Two things

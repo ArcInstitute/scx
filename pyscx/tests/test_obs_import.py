@@ -599,3 +599,103 @@ def test_obs_names_resolves_on_the_source_side_too(tmp_path):
     obs = pyscx.open(str(scx)).read_obs()
     assert obs["score"].iloc[0] == pytest.approx(0.10)
     assert obs["score"].iloc[2] == pytest.approx(0.30)
+
+
+# ---------------------------------------------------------------------------
+# Sharded obs
+#
+# Everything above builds a target of a handful of cells, which lands as one
+# `ObsMetadata` section — the layout that has no per-shard reader, so the import
+# assembles the whole obs table. These force the sharded layout, which is what
+# every real atlas has and what the streaming rewrite is for.
+# ---------------------------------------------------------------------------
+
+
+def _sharded_fixture(tmp_path, n=10, shard_size=4, name="sharded.scx"):
+    """An SCX file whose obs is written as several `ObsMetadataShard` sections."""
+    bc = [f"CELL{i:03d}-1" for i in range(n)]
+    obs = pd.DataFrame(
+        {"cell_type": pd.Categorical(["A", "B"] * (n // 2))},
+        index=bc,
+    )
+    X = sparse.csr_matrix(np.arange(n * 3, dtype=np.float32).reshape(n, 3))
+    var = pd.DataFrame(index=[f"g{i}" for i in range(3)])
+    path = tmp_path / name
+    pyscx.from_anndata(
+        anndata.AnnData(X=X, obs=obs, var=var), str(path), shard_size=shard_size
+    )
+    return path, bc
+
+
+def test_obs_import_on_a_sharded_file_joins_by_key(tmp_path):
+    """Every annotation must land on the cell whose barcode it was keyed to,
+    across shard boundaries — a per-shard rewrite that mis-derives a shard's
+    global row offset produces a correctly-shaped column of wrong values."""
+    scx, bc = _sharded_fixture(tmp_path)
+    assert pyscx.open(str(scx)).obs_metadata_shard_count > 1, "fixture is not sharded"
+
+    # Reversed relative to the file, and each score encodes its own target row.
+    rows = "\n".join(f"{b},{i / 100:.2f}" for i, b in reversed(list(enumerate(bc))))
+    csv = _write(tmp_path, "calls.csv", f"barcode,score\n{rows}\n")
+
+    r = pyscx.obs_import(str(scx), str(csv), status_column="dbl_status")
+    assert r["n_matched"] == len(bc)
+
+    obs = pyscx.open(str(scx)).read_obs()
+    assert obs.index.tolist() == bc
+    assert obs["score"].tolist() == [i / 100 for i in range(len(bc))]
+    assert obs["dbl_status"].tolist() == ["present"] * len(bc)
+    # The pre-existing column survives untouched.
+    assert obs["cell_type"].tolist() == ["A", "B"] * (len(bc) // 2)
+
+
+def test_sharded_and_single_section_imports_agree(tmp_path):
+    """The streaming and materialising paths are one builder seen from two
+    angles: same obs content, same source, same result."""
+    n = 10
+    sharded, bc = _sharded_fixture(tmp_path, n=n, shard_size=4, name="sharded.scx")
+    single, _ = _sharded_fixture(tmp_path, n=n, shard_size=n * 10, name="single.scx")
+    assert pyscx.open(str(sharded)).obs_metadata_shard_count > 1
+    assert pyscx.open(str(single)).obs_metadata_shard_count in (0, 1)
+
+    rows = "\n".join(f"{b},{i / 100:.2f}" for i, b in enumerate(bc))
+    csv = _write(tmp_path, "calls.csv", f"barcode,score\n{rows}\n")
+
+    for target in (sharded, single):
+        pyscx.obs_import(str(target), str(csv), status_column="dbl_status")
+
+    a = pyscx.open(str(sharded)).read_obs()
+    b = pyscx.open(str(single)).read_obs()
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_obs_streamed_reports_which_rewrite_path_ran(tmp_path):
+    """Both layouts produce a sharded obs on disk, so the summary is the only
+    place the target-side memory cost is visible after the fact."""
+    sharded, bc = _sharded_fixture(tmp_path, n=10, shard_size=4, name="sharded.scx")
+    single, _ = _sharded_fixture(tmp_path, n=10, shard_size=100, name="single.scx")
+
+    rows = "\n".join(f"{b},{i / 100:.2f}" for i, b in enumerate(bc))
+    csv = _write(tmp_path, "calls.csv", f"barcode,score\n{rows}\n")
+
+    assert pyscx.obs_import(str(sharded), str(csv))["obs_streamed"] is True
+    assert pyscx.obs_import(str(single), str(csv))["obs_streamed"] is False
+    # Both end up sharded, which is exactly why the flag is not inferable.
+    assert pyscx.open(str(sharded)).obs_metadata_shard_count > 0
+    assert pyscx.open(str(single)).obs_metadata_shard_count > 0
+
+
+def test_dry_run_reports_the_obs_rewrite_path(tmp_path):
+    """A preview whose job is "should I run this on the atlas" has to say which
+    memory path it would take — that is the decision it exists to inform."""
+    sharded, bc = _sharded_fixture(tmp_path, n=10, shard_size=4, name="sharded.scx")
+    rows = "\n".join(f"{b},{i / 100:.2f}" for i, b in enumerate(bc))
+    csv = _write(tmp_path, "calls.csv", f"barcode,score\n{rows}\n")
+
+    r = pyscx.obs_import(
+        str(sharded), str(csv), key="obs_names", source_key="barcode", dry_run=True
+    )
+    assert r["dry_run"] is True
+    assert r["obs_streamed"] is True, "dry run must report the path it would take"
+    # And nothing was written.
+    assert "score" not in pyscx.open(str(sharded)).read_obs().columns

@@ -462,9 +462,10 @@ the wrong barcode while still producing a correctly-shaped layer. Target rows
 absent from the CellBender output become empty layer rows marked
 `cellbender_status = "absent"`, with `null` (not `0.0`) diagnostics.
 
-Because the join is the whole risk surface, `--dry-run` runs every validation
-and the join, prints the match counts, and writes nothing. Use it before
-importing onto a large file.
+Because the join is the whole risk surface, `--dry-run` runs the join and every
+validation that does not require decoding a non-key obs column (see the memory
+section below for that one gap), prints the match counts and the obs rewrite
+path, and writes nothing. Use it before importing onto a large file.
 
 Emitted alongside the layer: `obs` gets `cellbender_status`,
 `cellbender_cell_probability`, `cellbender_cell_size`,
@@ -476,6 +477,14 @@ appended with the source file's BLAKE3 in `input_checksums`.
 
 Known interaction: `scx subset` currently drops layers, so subset before
 importing rather than after.
+
+Memory behaves as it does for `obs-import` — see
+[§ Memory: bounded on the target, resident on the source](#memory-bounded-on-the-target-resident-on-the-source)
+below. The CellBender-specific addition is the source: `read_cellbender_h5` is
+not streaming and does not honour `--memory-budget`, because the barcode-keyed
+join reorders rows arbitrarily and the matrix has to be resident. Bounded in
+practice by `total_droplets_included` (default 25k, heuristic cap 70k), but a
+full all-droplet output on a very wide feature axis still costs several GB.
 
 ## External obs import
 
@@ -506,6 +515,50 @@ section that must cover every cell. On an 864 MB / 500k-cell atlas that is
 payload of the columns being added. `scx info` reports the orphaned total; see
 [§ Compact](#compact) to reclaim it, and prefer one import of a concatenated
 table over a loop of per-batch imports.
+
+### Memory: bounded on the target, resident on the source
+
+Rewriting obs in full is a *bytes-on-disk* cost, not a memory one. On a file
+whose obs is sharded — anything `from_anndata` wrote above `shard_target_rows`,
+and anything `merge` or `append` produced — neither import holds the obs table:
+the schema comes from the Arrow IPC footer, the join reads only the key
+column(s), and the rewrite runs one obs shard at a time. Peak is one obs shard
+plus the join arrays (one row index and one key string per target cell).
+
+**The input's obs shard boundaries are preserved**, not re-derived from
+`header.shard_target_rows` — one output shard per input shard, as with `compact`
+and `optimize`. This is a change: an import used to normalise them. It shows up
+only on a target whose shards do *not* already match `shard_target_rows`, which
+in practice means one grown by `append`. Nothing downstream depends on the
+boundaries (the obs predicate index keys on CSR shards, not obs-metadata
+shards), so this is a layout note rather than a compatibility one.
+
+These paths are still unbounded:
+
+| Path | Cost | What to do |
+|---|---|---|
+| A legacy single-section `obs` target | the whole obs table | Run [`scx optimize`](#optimize) first to migrate obs to the sharded layout. The import warns and reports `obs_streamed = false`. It also *writes* obs back as shards, so a second import on the same file streams — but the first one has already paid the cost, which is why `optimize` is the answer on a file big enough to care. |
+| A failed join's key diagnosis | the whole obs table, plus a pass per column | Only reached when the import is already failing. |
+| `obsm` embeddings supplied by the caller | one `n_obs`-row section | Reachable: `cellbender-import --latent-embedding` / `cellbender_import(latent_embedding=True)` builds one. Leave it off unless you want the latents. |
+| The source table | resident in full | Inherent: the join is by key, so the source's row order is its own business. The source is the small side — that is the premise the feature rests on. |
+
+The import summary reports `obs_streamed`, and all three CLI subcommands print
+it, so which target-side path ran is answerable after the fact rather than
+inferred from the file's layout. `cellbender-import` additionally reads `var`
+whole — that is the gene axis, so it does not scale with the atlas.
+
+The shape, the join and the obs shard cover are all validated before the first
+byte is written, so `--dry-run` reaches the same verdict the real import would
+on every one of them, and a rejected import leaves the file byte-identical.
+
+The preflight reads only the **key** column(s), though — Arrow IPC projection
+skips the rest. A non-key obs column that fails to decode, or a per-shard schema
+that disagrees with the first shard's, is therefore not seen until the write
+pass, which aborts with obs shards already appended at EOF. The catalog is only
+swapped at commit, so the file still reads as it did and `scx compact` reclaims
+the orphans — but `--dry-run` cannot promise that case away. Such a file is
+already unreadable through a normal obs read (its shards cannot be concatenated),
+so the import is not what breaks it.
 
 ### The join is by key string, never by row position
 

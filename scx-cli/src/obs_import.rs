@@ -10,7 +10,8 @@
 //!
 //! As with the CellBender importer, the real risk is the join, not the write:
 //! if the keys don't line up the result is a plausible-looking but empty
-//! column. Hence `--dry-run`, which runs every validation and the join, prints
+//! column. Hence `--dry-run`, which runs the join and every validation that
+//! does not need a non-key obs column decoded (see `attach_external_obs`), prints
 //! the match counts *and* a key diagnosis, and touches nothing.
 
 use std::path::Path;
@@ -198,6 +199,22 @@ pub fn run_obs_import(
         s.n_source_rows_absent,
     );
 
+    // Printed before the dry-run return on purpose: a preview whose whole job
+    // is "should I run this on the atlas" must say which memory path it would
+    // take. (Round-2 finding: Grok, Gemini, codex.)
+    println!(
+        "Obs rewrite: {} (peak memory {})",
+        if s.obs_streamed {
+            "streamed shard-by-shard"
+        } else {
+            "whole table materialized"
+        },
+        if s.obs_streamed {
+            "one obs shard"
+        } else {
+            "the entire obs table \u{2014} run `scx optimize` to shard it"
+        },
+    );
     if dry_run {
         // The join succeeded, but "succeeded" is not the same as "is the key
         // you wanted" — report the alternatives while nothing is committed.

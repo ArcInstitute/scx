@@ -48,6 +48,28 @@ fn var_batch(n: usize) -> RecordBatch {
     RecordBatch::try_new(Arc::new(schema), vec![Arc::new(StringArray::from(ids))]).unwrap()
 }
 
+/// How a fixture lays out its obs axis on disk.
+///
+/// The two layouts are not interchangeable at read time: a `Single` section is
+/// one Arrow IPC batch with no per-shard reader, so the op has nothing to stream
+/// and falls back to materialising. Every fixture in this file was `Single`
+/// before the streaming rewrite, which meant the streaming path had no coverage
+/// at all — so the core behaviours are now run over both.
+#[derive(Clone, Copy, Debug)]
+enum ObsLayout {
+    /// One legacy `ObsMetadata` section.
+    Single,
+    /// `ObsMetadataShard` sections with exactly these per-shard row counts.
+    ///
+    /// Spelled out rather than derived from a shard size on purpose: a test
+    /// needs to be able to make the obs shard boundaries *disagree* with
+    /// `header.shard_target_rows`, which is what tells a rewrite that preserves
+    /// the input layout apart from one that re-derives it. Unequal counts are
+    /// also what catch a driver that computes each shard's global row start as
+    /// `shard_idx * shard_target_rows` instead of a running cursor.
+    Shards(&'static [usize]),
+}
+
 /// An SCX file with `n_shards` X shards tiling `[0, n_obs)`. X itself is empty
 /// (the op never reads it), but its shards and `var` must survive untouched.
 fn write_fixture_with_obs(
@@ -57,13 +79,46 @@ fn write_fixture_with_obs(
     n_vars: usize,
     n_shards: usize,
 ) -> PathBuf {
+    write_fixture_with_layout(dir, name, obs, n_vars, n_shards, ObsLayout::Single)
+}
+
+fn write_fixture_with_layout(
+    dir: &Path,
+    name: &str,
+    obs: RecordBatch,
+    n_vars: usize,
+    n_shards: usize,
+    obs_layout: ObsLayout,
+) -> PathBuf {
     let n_obs = obs.num_rows();
     let path = dir.join(name);
     let rows_per = n_obs.div_ceil(n_shards);
     let header =
         FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, rows_per as u32, 0, 0);
     let mut writer = ScxWriter::new(&path, header).unwrap();
-    writer.write_obs(&obs).unwrap();
+    match obs_layout {
+        ObsLayout::Single => writer.write_obs(&obs).unwrap(),
+        ObsLayout::Shards(rows) => {
+            assert_eq!(
+                rows.iter().sum::<usize>(),
+                n_obs,
+                "obs shard row counts must tile the obs axis"
+            );
+            let mut start = 0usize;
+            for (idx, take) in rows.iter().enumerate() {
+                writer
+                    .write_obs_shard(
+                        idx as u32,
+                        start as u64,
+                        *take as u64,
+                        n_obs as u64,
+                        &obs.slice(start, *take),
+                    )
+                    .unwrap();
+                start += take;
+            }
+        }
+    }
     writer.write_var(&var_batch(n_vars)).unwrap();
 
     let mut start = 0usize;
@@ -433,6 +488,42 @@ fn composite_key_disambiguates_duplicate_barcodes_across_batches() {
     let scores = f32_col(&obs, "dbl_score");
     for i in 0..4 {
         assert_eq!(scores.value(i), i as f32 * 100.0);
+    }
+}
+
+/// A composite naming a column the target does not have must say so in the
+/// caller's own spelling, and must say it on both obs layouts.
+///
+/// Single-column keys get this from `resolve_key_column`; a composite has no
+/// equivalent, and on the streaming path the projected key read would otherwise
+/// fail first with a bare "obs column not found" that neither lists the columns
+/// that *are* present nor quotes what the user typed.
+#[test]
+fn a_composite_naming_a_missing_column_names_it_and_lists_the_alternatives() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, layout) in [
+        ("single.scx", ObsLayout::Single),
+        ("sharded.scx", ObsLayout::Shards(&[2, 2])),
+    ] {
+        let path = write_fixture_with_layout(dir.path(), name, obs_two_libraries(), 2, 1, layout);
+        let data = score_data(vec!["x".into(), "y".into()], |i| i as f32);
+        let err = attach_external_obs(
+            &path,
+            &data,
+            &AttachObsOptions {
+                join_key: ObsJoinKey::Composite {
+                    columns: vec!["sample_id".into(), "no_such_column".into()],
+                },
+                ..opts()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no_such_column") && msg.contains("barcode"),
+            "on {name}, the error must quote the missing column and list what is \
+             present, got: {msg}"
+        );
     }
 }
 
@@ -1453,7 +1544,7 @@ fn multimodal_file_at_modality_zero_succeeds_and_nonzero_is_rejected() {
 
     let n_obs = ScxReader::open(&path).unwrap().n_obs() as usize;
     let obs = ScxReader::open(&path).unwrap().read_obs().unwrap();
-    let key_col = super::resolve_key_column("obs", &obs, None).unwrap();
+    let key_col = super::resolve_key_column("obs", &obs.schema(), None).unwrap();
     let row_keys = super::string_column(&obs, &key_col).unwrap();
     assert_eq!(row_keys.len(), n_obs);
 
@@ -1642,4 +1733,377 @@ fn identical_coverage_splits_on_unmatched_source_rows_alone() {
         coverage.1, mismatch.1,
         "same coverage, different cause — the messages must differ"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sharded obs — the streaming rewrite
+//
+// Every other fixture in this file writes a single legacy `ObsMetadata`
+// section, which has no per-shard reader and therefore exercises only the
+// materialising fallback. These pin the streaming path: that it is taken, that
+// it lands each annotation on the right global row across unequal shards, that
+// it preserves the input's shard boundaries, and that it still refuses a
+// malformed obs axis rather than normalising one into a well-formed file.
+// ---------------------------------------------------------------------------
+
+/// 4/2/4 over 10 rows, deliberately not `header.shard_target_rows` (which the
+/// fixture sets from `n_shards`). Cumulative starts are 0/4/6; a driver that
+/// derived them as `shard_idx * shard_target_rows` would get 0/4/8 and shift
+/// every annotation in the last shard.
+const UNEVEN: &[usize] = &[4, 2, 4];
+
+fn sharded_fixture(dir: &Path, name: &str) -> PathBuf {
+    write_fixture_with_layout(dir, name, obs_batch(10), 3, 2, ObsLayout::Shards(UNEVEN))
+}
+
+/// Scores that encode their own target row index, so a row-range error in the
+/// per-shard driver shows up as a wrong *value*, not a wrong row count.
+fn positional_probe(n: usize) -> ExternalObsData {
+    let mut row_keys = keys("cell_", n);
+    row_keys.reverse(); // permuted: a positional join cannot accidentally pass
+    let scores: Vec<f32> = row_keys
+        .iter()
+        .map(|k| k.trim_start_matches("cell_").parse::<f32>().unwrap() * 10.0)
+        .collect();
+    let schema = Schema::new(vec![Field::new("dbl_score", DataType::Float32, true)]);
+    let batch =
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Float32Array::from(scores))]).unwrap();
+    ExternalObsData {
+        row_keys,
+        row_annotations: batch,
+        row_embeddings: Vec::new(),
+        uns: None,
+        source_checksum: None,
+        source_name: None,
+    }
+}
+
+#[test]
+fn join_lands_on_the_right_cell_across_uneven_obs_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+
+    attach_external_obs(&path, &positional_probe(10), &opts()).unwrap();
+
+    let obs = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+    let scores = f32_col(&obs, "dbl_score");
+    for i in 0..10 {
+        assert_eq!(
+            scores.value(i),
+            i as f32 * 10.0,
+            "row {i} got the value for row {} — the per-shard driver used the \
+             wrong global row offset",
+            scores.value(i) / 10.0
+        );
+    }
+}
+
+/// The op must not assemble the whole obs table on a sharded target. Asserted
+/// on the reader the op actually used, via the injectable entry point.
+///
+/// `read_obs == 0` alone is close to vacuous — a path that did nothing at all
+/// satisfies it — so the projected counter must also have moved.
+#[test]
+fn sharded_obs_import_never_materializes_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    let data = score_data(keys("cell_", 10), |i| i as f32 + 0.5);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let s = attach_external_obs_with_reader(&path, &reader, &data, &opts()).unwrap();
+    assert!(
+        s.obs_streamed,
+        "a sharded target must take the streaming path"
+    );
+
+    use std::sync::atomic::Ordering;
+    assert_eq!(
+        reader.debug_counts().read_obs.load(Ordering::Relaxed),
+        0,
+        "the streaming import must not assemble the full obs table"
+    );
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            reader
+                .debug_counts()
+                .read_obs_shard_projected
+                .load(Ordering::Relaxed)
+                > 0,
+            "the join must have gone through the projected key read — otherwise \
+             `read_obs == 0` only proves nothing happened"
+        );
+        // Sanity: the counter this test relies on does move when read_obs is called.
+        let _ = reader.read_obs().unwrap();
+        assert_eq!(reader.debug_counts().read_obs.load(Ordering::Relaxed), 1);
+    }
+}
+
+/// The rewrite emits one output shard per input shard, preserving boundaries the
+/// header's `shard_target_rows` does not describe.
+#[test]
+fn obs_shard_boundaries_survive_an_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    let data = score_data(keys("cell_", 10), |i| i as f32);
+
+    attach_external_obs(&path, &data, &opts()).unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), UNEVEN.len());
+    for (idx, expected) in UNEVEN.iter().enumerate() {
+        assert_eq!(
+            reader.read_obs_shard(idx as u32).unwrap().num_rows(),
+            *expected,
+            "obs shard {idx} was re-sharded"
+        );
+    }
+}
+
+/// A legacy single-section target has nothing to stream; it must say so rather
+/// than silently reporting the streamed path.
+#[test]
+fn legacy_single_section_obs_is_reported_as_not_streamed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 6, 3, 2);
+    let data = score_data(keys("cell_", 6), |i| i as f32);
+
+    let s = attach_external_obs(&path, &data, &opts()).unwrap();
+    assert!(
+        !s.obs_streamed,
+        "single-section obs has no per-shard reader — it cannot be streamed"
+    );
+}
+
+/// A sharded obs axis with a hole must be refused, not normalised.
+///
+/// End-to-end property, not a test of any one layer: the refusal comes from the
+/// cover walk inside `read_obs_keys`, which is why this stays green even with
+/// the driver's own `ShardCoverCheck` removed. The check that *is* load-bearing
+/// in the driver is pinned by
+/// `a_shard_stamped_longer_than_its_payload_is_rejected` below.
+#[test]
+fn a_gapped_obs_axis_is_rejected_not_normalized() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gap.scx");
+    let obs = obs_batch(10);
+
+    // Shards 0 and 1 stamped at row_start 0 and 6 — rows 4..6 are covered by
+    // nothing, so the axis does not tile [0, 10).
+    let header = FileHeader::new_single_modality(10, 3, 0, 5, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer
+        .write_obs_shard(0, 0, 4, 10, &obs.slice(0, 4))
+        .unwrap();
+    writer
+        .write_obs_shard(1, 6, 4, 10, &obs.slice(6, 4))
+        .unwrap();
+    writer.write_var(&var_batch(3)).unwrap();
+    writer
+        .write_csr_shard(
+            &[0u64; 11],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let data = score_data(keys("cell_", 10), |i| i as f32);
+    let err = attach_external_obs(&path, &data, &opts()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("row_start") || msg.contains("cover"),
+        "a gapped obs axis must be refused by name, got: {msg}"
+    );
+}
+
+/// A dry run must reach the same verdict the real import will.
+///
+/// Round-1 finding (codex): every `--dry-run` surface promises it "runs every
+/// validation", and the payload-vs-stamp check used to live inside the write
+/// loop — past the dry-run return. On the cancelling fixture below the dry run
+/// reported a clean join of 10 rows and the real import then failed, which is
+/// the one way a preview can be worse than useless.
+#[test]
+fn a_dry_run_rejects_what_the_real_import_would_reject() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mis-stamped.scx");
+    let obs = obs_batch(10);
+
+    // Stamps tile [0, 10) and payloads sum to 10; only the per-shard pairing is
+    // wrong, so nothing but the payload-vs-stamp check can see it.
+    let header = FileHeader::new_single_modality(10, 3, 0, 5, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer
+        .write_obs_shard(0, 0, 6, 10, &obs.slice(0, 4))
+        .unwrap();
+    writer
+        .write_obs_shard(1, 6, 4, 10, &obs.slice(4, 6))
+        .unwrap();
+    writer.write_var(&var_batch(3)).unwrap();
+    writer
+        .write_csr_shard(
+            &[0u64; 11],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let before = std::fs::read(&path).unwrap();
+    let data = score_data(keys("cell_", 10), |i| i as f32);
+    let dry = AttachObsOptions {
+        dry_run: true,
+        ..opts()
+    };
+    let err = attach_external_obs(&path, &data, &dry).unwrap_err();
+    assert!(
+        err.to_string().contains("carries"),
+        "a dry run must refuse what the real import refuses, got: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a rejected dry run must leave the file byte-identical"
+    );
+}
+
+/// The two paths are one implementation seen from two angles. Same source, same
+/// obs content, one sharded target and one single-section twin: the resulting
+/// obs must agree on values, schema and the reported join counts.
+#[test]
+fn sharded_and_single_section_imports_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let sharded = write_fixture_with_layout(
+        dir.path(),
+        "sharded.scx",
+        obs_batch(10),
+        3,
+        2,
+        ObsLayout::Shards(UNEVEN),
+    );
+    let single = write_fixture_with_obs(dir.path(), "single.scx", obs_batch(10), 3, 2);
+
+    let data = score_data(keys("cell_", 10), |i| i as f32 + 0.25);
+    let a = attach_external_obs(&sharded, &data, &opts()).unwrap();
+    let b = attach_external_obs(&single, &data, &opts()).unwrap();
+
+    assert_eq!(a.n_matched, b.n_matched);
+    assert_eq!(a.n_target_rows_absent, b.n_target_rows_absent);
+    assert_eq!(a.n_source_rows_absent, b.n_source_rows_absent);
+    assert_eq!(a.obs_key_column, b.obs_key_column);
+    assert_eq!(a.obs_columns_added, b.obs_columns_added);
+
+    let oa = ScxReader::open(&sharded).unwrap().read_obs().unwrap();
+    let ob = ScxReader::open(&single).unwrap().read_obs().unwrap();
+    assert_eq!(oa.schema(), ob.schema(), "the two paths disagree on schema");
+    assert_eq!(oa.num_rows(), ob.num_rows());
+    for i in 0..oa.num_columns() {
+        assert_eq!(
+            oa.column(i),
+            ob.column(i),
+            "column '{}' differs between the streaming and materialising paths",
+            oa.schema().field(i).name()
+        );
+    }
+}
+
+/// Stamps that tile `[0, n_obs)` while the payloads they travel with do not
+/// match them. The total still comes to `n_obs`, so neither the header shape
+/// check nor `read_obs_keys`' cover walk notices — only the per-shard
+/// payload-vs-stamp check does.
+///
+/// Left unchecked, the rewrite silently *normalises* this: it derives each
+/// output shard's range from the rows it can see, so the file comes out
+/// well-formed with obs rows bound to different matrix rows than the input
+/// claimed. Rejecting beats laundering.
+#[test]
+fn a_shard_stamped_longer_than_its_payload_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mis-stamped.scx");
+    let obs = obs_batch(10);
+
+    let header = FileHeader::new_single_modality(10, 3, 0, 5, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    // Stamped 6 rows, carries 4.
+    writer
+        .write_obs_shard(0, 0, 6, 10, &obs.slice(0, 4))
+        .unwrap();
+    // Stamped 4 rows, carries 6 — so the payloads still total 10.
+    writer
+        .write_obs_shard(1, 6, 4, 10, &obs.slice(4, 6))
+        .unwrap();
+    writer.write_var(&var_batch(3)).unwrap();
+    writer
+        .write_csr_shard(
+            &[0u64; 11],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let data = score_data(keys("cell_", 10), |i| i as f32);
+    let err = attach_external_obs(&path, &data, &opts()).unwrap_err();
+    assert!(
+        err.to_string().contains("carries"),
+        "a shard whose payload contradicts its stamp must be refused, got: {err}"
+    );
+}
+
+/// A composite key on a sharded target goes through a path a single-column key
+/// does not: two columns are projected out of each shard and `compact_key_shard`
+/// dictionary-encodes them, so the batch `build_composite_key` fuses is
+/// `Dictionary(Int32, Utf8)` rather than the plain `Utf8` the whole-table read
+/// produced. The fused key has to come out identical either way, or every row
+/// misses.
+#[test]
+fn a_composite_key_joins_across_obs_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture_with_layout(
+        dir.path(),
+        "a.scx",
+        obs_two_libraries(),
+        2,
+        1,
+        ObsLayout::Shards(&[3, 1]),
+    );
+
+    let cols = vec!["sample_id".to_string(), "barcode".to_string()];
+    let row_keys = build_composite_key(&obs_two_libraries(), &cols).unwrap();
+    let data = score_data(row_keys, |i| i as f32 * 100.0);
+
+    let s = attach_external_obs(
+        &path,
+        &data,
+        &AttachObsOptions {
+            join_key: ObsJoinKey::Composite { columns: cols },
+            ..opts()
+        },
+    )
+    .unwrap();
+    assert_eq!(s.n_matched, 4);
+    assert!(s.obs_streamed);
+    assert_eq!(s.obs_key_column, "sample_id,barcode");
+
+    let obs = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    let scores = f32_col(&obs, "dbl_score");
+    for i in 0..4 {
+        assert_eq!(
+            scores.value(i),
+            i as f32 * 100.0,
+            "row {i} got another library's score — the composite key did not \
+             survive the projected, dictionary-encoded shard read"
+        );
+    }
 }
