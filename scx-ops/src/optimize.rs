@@ -393,18 +393,27 @@ pub fn optimize_with_framing(
 /// for the var axis; no op deletes columns, so (unlike the obs helper) it takes
 /// no `keep_mask` and renumbers output shards over the non-empty inputs.
 ///
-/// Exported for the same reason as its obs twin: `optimize`, `build_csc` and
-/// `scx upgrade` (in `scx-cli`) all preserve the var axis 1:1 and must not
-/// collapse a sharded layout into one legacy `VarMetadata` section.
-pub fn write_var_shards_streaming(
+/// `pub(crate)` like its obs twin, and reached from outside the crate through
+/// [`crate::rewrite_helpers::copy_obs_var_preserving_layout`] — `n_vars_total`
+/// is stamped into every output shard, so a caller that passes the wrong one
+/// writes a file whose var cover disagrees with its own stamp.
+pub(crate) fn write_var_shards_streaming(
     reader: &ScxReader,
     writer: &mut ScxWriter,
     n_vars_total: u64,
 ) -> Result<()> {
     let mut out_idx = 0u32;
     let mut row_start = 0u64;
+    let mut cover = crate::compact::ShardCoverCheck::default();
+    let n_shards = reader.var_metadata_shard_count();
     for res in reader.var_shards() {
         let batch = res?;
+        // Same cover validation `read_var()` performs while assembling, which
+        // the streaming path would otherwise trade away — see `ShardCoverCheck`.
+        cover.visit("var_metadata", &batch)?;
+        if cover.seen as usize == n_shards {
+            cover.finish("var_metadata")?;
+        }
         let n = batch.num_rows() as u64;
         if n == 0 {
             continue;

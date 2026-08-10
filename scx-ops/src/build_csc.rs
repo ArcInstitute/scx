@@ -219,30 +219,10 @@ pub fn run_build_csc(
     // F5-b: frame the re-written CSR shards and the CSC sidecar (both go through
     // `write_shard_inner`, which consults the writer's framing). No-op when None.
     writer.set_framing(framing);
-    // obs/var pass through 1:1, so a row-sharded input must come out row-sharded.
-    // `read_obs()` + `write_obs()` would assemble every `ObsMetadataShard` into
-    // one in-memory batch and emit it as a single legacy section — peak RSS
-    // O(n_obs) (the OOM the sharded layout exists to prevent) and, because
-    // Level-2 row-set pushdown requires sharded obs, a silent loss of predicate
-    // pushdown on exactly the atlas-scale files where it earns its keep. Same
-    // streaming helpers `optimize` uses; `keep_mask = None` because build-csc
-    // never drops rows. Legacy single-section input has no per-shard reader and
-    // falls through to the materialising path, which is what it already was.
-    if reader.obs_metadata_shard_count() > 0 {
-        crate::compact::write_obs_shards_streaming(
-            &reader,
-            &mut writer,
-            None,
-            in_header.n_obs as usize,
-        )?;
-    } else {
-        writer.write_obs(&reader.read_obs()?)?;
-    }
-    if reader.var_metadata_shard_count() > 0 {
-        crate::optimize::write_var_shards_streaming(&reader, &mut writer, in_header.n_vars)?;
-    } else {
-        writer.write_var(&reader.read_var()?)?;
-    }
+    // obs/var pass through 1:1, so a row-sharded input must come out
+    // row-sharded — see `copy_obs_var_preserving_layout` for what collapsing it
+    // would cost. build-csc never drops rows, so it takes no keep mask.
+    crate::rewrite_helpers::copy_obs_var_preserving_layout(&reader, &mut writer)?;
 
     // 11. Re-write CSR shards from input (decode + re-encode, per-shard codec)
     for shard_entry in &csr_entries {
@@ -317,7 +297,17 @@ pub fn run_build_csc(
     let params_json = format!(
         "{{\"memory_limit\":\"{memory_limit}\",\"csc_cols_per_shard\":{csc_cols_per_shard}}}"
     );
-    rewrite_helpers::copy_auxiliary_sections(&reader, &mut writer, "build-csc", &params_json)?;
+    // `canonicalize = false`: build-csc clamps its output `format_version` to the
+    // source's rather than claiming v3 (SCX-005), precisely so it does not have
+    // to canonicalize — and re-emitting a layer with different nnz would
+    // contradict its contract of leaving the matrix data unchanged.
+    rewrite_helpers::copy_auxiliary_sections(
+        &reader,
+        &mut writer,
+        "build-csc",
+        &params_json,
+        false,
+    )?;
 
     // 15. Finalize
     writer.finish()?;
