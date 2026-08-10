@@ -24,10 +24,10 @@
 //! narrow and wide variants; downstream string-consumers that cannot
 //! tolerate `LargeUtf8` are documented per-call.
 
-use arrow::array::{ArrayRef, LargeBinaryArray, LargeStringArray, RecordBatch};
+use arrow::array::{Array, ArrayRef, AsArray, LargeBinaryArray, LargeStringArray, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 
-use crate::error::Result;
+use crate::error::{Result, ScxError};
 
 /// Upcast `Utf8 → LargeUtf8` and `Binary → LargeBinary` (including
 /// `Dictionary(_, Utf8|Binary)` value types) so Arrow IPC uses 64-bit
@@ -89,12 +89,22 @@ pub fn downcast_large_types_schema(schema: &Schema) -> Schema {
 /// across shards exceeds that key's range. The value type `V` is preserved;
 /// non-dictionary (and already-`Int32`-keyed) columns pass through unchanged.
 ///
-/// Implemented as decode→re-encode (`cast` to the value type, then `cast` to
-/// `Dictionary(Int32, V)`) — the same cast pattern `unify_dictionary_columns`
-/// relies on, robust across arrow key-type combinations. `Int32` is always wide
-/// enough: the combined pre-dedup dictionary length is bounded by the total row
-/// count, far below `i32::MAX`. Field- and schema-level metadata (notably the
-/// `pandas` index envelope) are preserved.
+/// Implemented by casting the **keys** array and rebuilding the dictionary
+/// over the same values. `Int32` is always wide enough: the combined pre-dedup
+/// dictionary length is bounded by the total row count, far below `i32::MAX`.
+/// Field- and schema-level metadata (notably the `pandas` index envelope) are
+/// preserved.
+///
+/// This deliberately does **not** go through decode→re-encode
+/// (`cast` to `V`, then `cast` to `Dictionary(Int32, V)`). Arrow's dictionary
+/// *packing* supports only some value types — `Boolean` is not among them — so
+/// re-encoding raised `Unsupported output type for dictionary packing:
+/// Boolean` on a `pd.Categorical([True, False])` column. Since this function
+/// runs inside [`crate::reader::assemble_sharded_metadata`], that made
+/// `read_obs()` fail outright on any **row-sharded** file carrying a boolean
+/// categorical, while the same column in an unsharded file read back fine.
+/// Casting keys is also cheaper (no `n_obs`-length transient) and preserves
+/// the dictionary exactly, including entries no row references.
 pub fn widen_dictionary_keys(batch: &RecordBatch) -> Result<RecordBatch> {
     let schema = batch.schema();
     let needs = schema.fields().iter().any(
@@ -109,9 +119,29 @@ pub fn widen_dictionary_keys(batch: &RecordBatch) -> Result<RecordBatch> {
         let col = batch.column(i);
         match field.data_type() {
             DataType::Dictionary(k, value_type) if k.as_ref() != &DataType::Int32 => {
-                let values = arrow::compute::cast(col, value_type.as_ref())?;
+                let dict = col.as_any_dictionary_opt().ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "column '{}' declared Dictionary but failed downcast",
+                        field.name()
+                    ))
+                })?;
+                let wide_keys = arrow::compute::cast(dict.keys(), &DataType::Int32)?;
+                let wide_keys = wide_keys
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .ok_or_else(|| {
+                        ScxError::InvalidCatalog(format!(
+                            "column '{}': dictionary keys did not cast to Int32",
+                            field.name()
+                        ))
+                    })?
+                    .clone();
                 let wide_dt = DataType::Dictionary(Box::new(DataType::Int32), value_type.clone());
-                new_columns.push(arrow::compute::cast(&values, &wide_dt)?);
+                new_columns.push(std::sync::Arc::new(arrow::array::DictionaryArray::<
+                    arrow::datatypes::Int32Type,
+                >::try_new(
+                    wide_keys, dict.values().clone()
+                )?));
                 new_fields.push(
                     Field::new(field.name(), wide_dt, field.is_nullable())
                         .with_metadata(field.metadata().clone()),
@@ -496,6 +526,51 @@ mod tests {
             .map(|i| values.value(keys.value(i) as usize))
             .collect();
         assert_eq!(decoded, vec!["a", "b", "a", "c"]);
+    }
+
+    /// `pd.Categorical([True, False])` reaches Arrow as
+    /// `Dictionary(Int8, Boolean)`. Widening its keys must not depend on
+    /// re-encoding the values: arrow's dictionary packing has no `Boolean`
+    /// support, so the decode→re-encode round trip raised *"Unsupported
+    /// output type for dictionary packing: Boolean"* — and because this
+    /// runs inside `assemble_sharded_metadata`, that made `read_obs()`
+    /// fail outright on any **row-sharded** file carrying a boolean
+    /// categorical. The file wrote without complaint; only reading it back
+    /// failed, and only at the scale where obs is sharded.
+    #[test]
+    fn widen_dictionary_keys_handles_non_packable_value_types() {
+        use arrow::array::{Array, BooleanArray};
+        use arrow::datatypes::Int32Type;
+
+        let keys = arrow::array::Int8Array::from(vec![Some(0), Some(1), None, Some(0)]);
+        let values: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
+        let dict: ArrayRef = Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap());
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Boolean));
+        let batch = batch_from(vec![("flag", dict_dt, dict)]);
+
+        let widened = widen_dictionary_keys(&batch).expect("boolean categorical must widen");
+        assert_eq!(
+            widened.schema().field(0).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Boolean))
+        );
+        let got = widened
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let values = got
+            .values()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let decoded: Vec<Option<bool>> = (0..got.len())
+            .map(|i| (!got.keys().is_null(i)).then(|| values.value(got.keys().value(i) as usize)))
+            .collect();
+        assert_eq!(
+            decoded,
+            vec![Some(true), Some(false), None, Some(true)],
+            "values and nulls must survive the key widening"
+        );
     }
 
     #[test]
