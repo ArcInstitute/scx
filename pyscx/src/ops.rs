@@ -1809,6 +1809,10 @@ pub fn cellbender_import(
         d.set_item("obs_columns_added", s.obs_columns_added)?;
         d.set_item("var_columns_added", s.var_columns_added)?;
         d.set_item("obsm_keys_added", s.obsm_keys_added)?;
+        // Whether the obs rewrite streamed shard-by-shard or had to assemble
+        // the whole table (which a legacy single-section obs forces). Not
+        // inferable from the output file: both paths write a sharded obs.
+        d.set_item("obs_streamed", s.obs_streamed)?;
     }
     Ok(d.into())
 }
@@ -2043,6 +2047,10 @@ pub fn obs_import(
     d.set_item("obs_columns_added", summary.obs_columns_added)?;
     d.set_item("obsm_keys_added", summary.obsm_keys_added)?;
     d.set_item("obs_index_dropped", summary.obs_index_dropped)?;
+    // Whether the obs rewrite streamed shard-by-shard or had to assemble the
+    // whole table (which a legacy single-section obs forces). Not inferable
+    // from the output file: both paths write a sharded obs.
+    d.set_item("obs_streamed", summary.obs_streamed)?;
     if let Some(diag) = diagnosis {
         d.set_item("key_diagnosis", key_diagnosis_dict(py, &diag)?)?;
     }
@@ -2264,6 +2272,9 @@ pub fn doublet_import(
     )?;
     d.set_item("obs_columns_added", summary.obs_columns_added)?;
     d.set_item("obs_index_dropped", summary.obs_index_dropped)?;
+    // See `obs_import`: which obs rewrite path ran is not inferable from the
+    // output file, because both write a sharded obs.
+    d.set_item("obs_streamed", summary.obs_streamed)?;
     if let Some(diag) = diagnosis {
         d.set_item("key_diagnosis", key_diagnosis_dict(py, &diag)?)?;
     }

@@ -41,15 +41,59 @@ fn var_batch(n: usize) -> RecordBatch {
     RecordBatch::try_new(Arc::new(schema), vec![Arc::new(StringArray::from(ids))]).unwrap()
 }
 
+/// How a fixture lays out its obs axis. See the twin in `external_obs_tests.rs`
+/// — a `Single` section has no per-shard reader, so it exercises the
+/// materialising fallback and nothing else.
+#[derive(Clone, Copy, Debug)]
+enum ObsLayout {
+    Single,
+    /// `ObsMetadataShard` sections with exactly these per-shard row counts.
+    Shards(&'static [usize]),
+}
+
 /// An SCX file with `n_shards` X shards tiling `[0, n_obs)`. X itself is empty
 /// (the op never reads it) but the shard *ranges* are what the layer must copy.
 fn write_fixture(dir: &Path, name: &str, n_obs: usize, n_vars: usize, n_shards: usize) -> PathBuf {
+    write_fixture_with_layout(dir, name, n_obs, n_vars, n_shards, ObsLayout::Single)
+}
+
+fn write_fixture_with_layout(
+    dir: &Path,
+    name: &str,
+    n_obs: usize,
+    n_vars: usize,
+    n_shards: usize,
+    obs_layout: ObsLayout,
+) -> PathBuf {
     let path = dir.join(name);
     let rows_per = n_obs.div_ceil(n_shards);
     let header =
         FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, rows_per as u32, 0, 0);
     let mut writer = ScxWriter::new(&path, header).unwrap();
-    writer.write_obs(&obs_batch(n_obs)).unwrap();
+    let obs = obs_batch(n_obs);
+    match obs_layout {
+        ObsLayout::Single => writer.write_obs(&obs).unwrap(),
+        ObsLayout::Shards(rows) => {
+            assert_eq!(
+                rows.iter().sum::<usize>(),
+                n_obs,
+                "obs shard row counts must tile the obs axis"
+            );
+            let mut start = 0usize;
+            for (idx, take) in rows.iter().enumerate() {
+                writer
+                    .write_obs_shard(
+                        idx as u32,
+                        start as u64,
+                        *take as u64,
+                        n_obs as u64,
+                        &obs.slice(start, *take),
+                    )
+                    .unwrap();
+                start += take;
+            }
+        }
+    }
     writer.write_var(&var_batch(n_vars)).unwrap();
 
     let mut start = 0usize;
@@ -1208,4 +1252,187 @@ fn unmatched_examples_falls_back_when_all_matched() {
     let all = vec![true; 4];
     assert_eq!(unmatched_examples(&keys, &all), examples(&keys));
     assert!(!unmatched_examples(&keys, &all).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Sharded obs — the streaming rewrite
+//
+// Every other fixture here writes a single legacy `ObsMetadata` section, which
+// has no per-shard reader and so exercises only the materialising fallback.
+// These pin the streaming path. See the twin block in `external_obs_tests.rs`.
+// ---------------------------------------------------------------------------
+
+/// 4/2/4 over 10 rows, deliberately not `header.shard_target_rows`. Cumulative
+/// starts are 0/4/6; a driver deriving them as `shard_idx * shard_target_rows`
+/// would get 0/4/8 and shift everything in the last shard.
+const UNEVEN: &[usize] = &[4, 2, 4];
+
+fn sharded_fixture(dir: &Path, name: &str) -> PathBuf {
+    write_fixture_with_layout(dir, name, 10, 3, 2, ObsLayout::Shards(UNEVEN))
+}
+
+/// Reverse-ordered source whose per-row annotation and row-sum both encode the
+/// row's own target index, so a row-range error in the per-shard driver shows up
+/// as a wrong *value* rather than a wrong row count.
+fn positional_probe(n: usize) -> ExternalLayerData {
+    let rev: Vec<String> = (0..n).rev().map(|i| format!("cell_{i}")).collect();
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    let mut probs = Vec::new();
+    for key in &rev {
+        let target: usize = key.strip_prefix("cell_").unwrap().parse().unwrap();
+        indices.push((target % 3) as u32);
+        values.push(100.0 + target as f32);
+        probs.push(target as f32);
+        indptr.push(indices.len() as u64);
+    }
+    let schema = Schema::new(vec![Field::new("cb_prob", DataType::Float32, true)]);
+    let ann =
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Float32Array::from(probs))]).unwrap();
+    ExternalLayerData {
+        row_keys: rev,
+        col_keys: keys("g", 3),
+        indptr,
+        indices,
+        values,
+        row_annotations: Some(ann),
+        row_embeddings: Vec::new(),
+        col_annotations: None,
+        uns: None,
+        source_checksum: None,
+        source_name: None,
+    }
+}
+
+fn f32_col(batch: &RecordBatch, name: &str) -> Float32Array {
+    batch
+        .column_by_name(name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn layer_obs_columns_land_on_the_right_cell_across_uneven_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+
+    let mut o = opts("cb");
+    o.row_sum_column = Some("cb_sum".to_string());
+    attach_external_layer(&path, &positional_probe(10), &o).unwrap();
+
+    let obs = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+    let probs = f32_col(&obs, "cb_prob");
+    let sums = f32_col(&obs, "cb_sum");
+    for i in 0..10 {
+        assert_eq!(
+            probs.value(i),
+            i as f32,
+            "row {i} got the annotation for row {}",
+            probs.value(i)
+        );
+        assert_eq!(
+            sums.value(i),
+            100.0 + i as f32,
+            "row {i} got the row sum for row {}",
+            sums.value(i) - 100.0
+        );
+    }
+}
+
+/// The op must not assemble the whole obs table on a sharded target. Asserted on
+/// the reader the op actually used.
+#[test]
+fn sharded_layer_import_never_materializes_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    let data = diagonal_data(keys("cell_", 10), keys("g", 3), |i| (i + 1) as f32);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let s = attach_external_layer_with_reader(&path, &reader, &data, &opts("cb")).unwrap();
+    assert!(
+        s.obs_streamed,
+        "a sharded target must take the streaming path"
+    );
+
+    use std::sync::atomic::Ordering;
+    assert_eq!(
+        reader.debug_counts().read_obs.load(Ordering::Relaxed),
+        0,
+        "the streaming import must not assemble the full obs table"
+    );
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            reader
+                .debug_counts()
+                .read_obs_shard_projected
+                .load(Ordering::Relaxed)
+                > 0,
+            "the join must have gone through the projected key read"
+        );
+        let _ = reader.read_obs().unwrap();
+        assert_eq!(reader.debug_counts().read_obs.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn layer_import_preserves_obs_shard_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    let data = diagonal_data(keys("cell_", 10), keys("g", 3), |i| (i + 1) as f32);
+
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), UNEVEN.len());
+    for (idx, expected) in UNEVEN.iter().enumerate() {
+        assert_eq!(
+            reader.read_obs_shard(idx as u32).unwrap().num_rows(),
+            *expected,
+            "obs shard {idx} was re-sharded"
+        );
+    }
+}
+
+/// One implementation seen from two angles: same source, same obs content, one
+/// sharded target and one single-section twin.
+#[test]
+fn sharded_and_single_section_layer_imports_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let sharded = write_fixture_with_layout(
+        dir.path(),
+        "sharded.scx",
+        10,
+        3,
+        2,
+        ObsLayout::Shards(UNEVEN),
+    );
+    let single = write_fixture(dir.path(), "single.scx", 10, 3, 2);
+
+    let mut o = opts("cb");
+    o.row_sum_column = Some("cb_sum".to_string());
+    let data = positional_probe(10);
+    let a = attach_external_layer(&sharded, &data, &o).unwrap();
+    let b = attach_external_layer(&single, &data, &o).unwrap();
+
+    assert_eq!(a.n_matched, b.n_matched);
+    assert_eq!(a.layer_nnz, b.layer_nnz);
+    assert_eq!(a.obs_columns_added, b.obs_columns_added);
+    assert!(a.obs_streamed && !b.obs_streamed);
+
+    let oa = ScxReader::open(&sharded).unwrap().read_obs().unwrap();
+    let ob = ScxReader::open(&single).unwrap().read_obs().unwrap();
+    assert_eq!(oa.schema(), ob.schema(), "the two paths disagree on schema");
+    for i in 0..oa.num_columns() {
+        assert_eq!(
+            oa.column(i),
+            ob.column(i),
+            "column '{}' differs between the streaming and materialising paths",
+            oa.schema().field(i).name()
+        );
+    }
 }
