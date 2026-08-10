@@ -412,7 +412,7 @@ pub(crate) fn write_var_shards_streaming(
         // the streaming path would otherwise trade away — see `ShardCoverCheck`.
         cover.visit("var_metadata", &batch)?;
         if cover.seen as usize == n_shards {
-            cover.finish("var_metadata")?;
+            cover.finish("var_metadata", n_vars_total)?;
         }
         let n = batch.num_rows() as u64;
         if n == 0 {

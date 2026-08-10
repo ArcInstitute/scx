@@ -27,6 +27,27 @@ pub fn run_upgrade(
     let reader = ScxReader::open(input)?;
     let old_version = reader.header().format_version;
 
+    // Multimodal is v2, so it sits squarely in the pre-v3 branch this command
+    // still rewrites — but nothing here is modality-aware. `csr_shards_sorted()`
+    // returns every modality's shards, the loop below writes them through the
+    // single-modality `write_csr_shard`, and the output header's
+    // `..Default::default()` zeroes `n_modalities` and the modality-table
+    // pointers. A valid CITE-seq or Multiome file would come out nominally
+    // single-modality with overlapping global row ranges and no per-modality
+    // var — and on `--in-place`, over the top of the original. `optimize` and
+    // `build_csc` both refuse; this is the third op of the three, and the only
+    // one that did not.
+    if reader.is_multimodal() {
+        return Err(format!(
+            "scx upgrade does not support multimodal files yet: {} carries a modality \
+             table, and this rewrite would flatten it into a single-modality file. \
+             Extract a modality with `scx subset --modality NAME`, or use \
+             `scx compact` / `scx optimize`, which handle multimodal inputs.",
+            input.display()
+        )
+        .into());
+    }
+
     // `scx upgrade` re-writes to the newest **unframed** version (v4 requires
     // row-group framing, which upgrade does not add).
     //
@@ -160,6 +181,8 @@ fn rewrite_with_current_version(
     // (SCX-005). `upgrade` did neither — it stamped v3 over whatever it was
     // handed. Clamping is not an option here, because producing v3 is the whole
     // point of the command, so it canonicalizes, like `optimize`.
+    // Set when canonicalization actually changed a shard — see the CSC block.
+    let mut csr_was_rewritten = false;
     for shard_entry in &csr_entries {
         let sh = reader.read_shard_header(shard_entry)?;
         let ve = crate::shard_utils::decode_value_encoding(sh.value_encoding)?;
@@ -170,7 +193,10 @@ fn rewrite_with_current_version(
 
         let mut indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
         let mut indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
-        scx_sparse::canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut data);
+        if !scx_sparse::is_canonical_csr(&indptr_u64, &indices_u32, &data) {
+            scx_sparse::canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut data);
+            csr_was_rewritten = true;
+        }
         let raw_values = ve.encode_f32_batch(&data)?;
 
         writer.write_csr_shard(
@@ -186,7 +212,35 @@ fn rewrite_with_current_version(
     // Re-write CSC shards (if present, per-shard codec). Sorted by
     // major_start() (= col_start for CSC entries via the axis-overload
     // in ShardStats; on-disk fields are unchanged).
+    //
+    // Unless canonicalizing above actually rewrote a shard. The sidecar is a
+    // second representation of the same matrix, built against the *old* CSR:
+    // summing a duplicate coordinate or dropping an explicit zero changes X's
+    // structure and its nnz, so carrying the old CSC forward leaves the file
+    // holding two matrices that disagree. That is not a stale-sidecar
+    // annoyance — `write_csc_shard` stamps `csc_build_generation` from the
+    // writer's `data_generation`, so the freshness guard would bless it, and a
+    // consumer on the CSC path (`prefer_format="csc"`, GPU CSC-direct DE) would
+    // silently read different numbers than one on CSR. `optimize` faces the
+    // same choice and drops unconditionally.
+    //
+    // Dropped only when it would actually be wrong, because carrying CSC is the
+    // one thing `upgrade` does that its siblings don't, and an already-canonical
+    // input — every file any current writer produces — keeps it.
     let csc_entries = reader.catalog().csc_shards_sorted();
+    if csr_was_rewritten && !csc_entries.is_empty() {
+        log::warn!(
+            "scx upgrade: canonicalizing the CSR matrix changed its structure, so the \
+             CSC sidecar built against the old matrix is no longer a faithful second \
+             view of it and has been dropped. Rerun `scx build-csc` to rebuild the \
+             column-major sidecar against the upgraded file."
+        );
+    }
+    let csc_entries: Vec<_> = if csr_was_rewritten {
+        Vec::new()
+    } else {
+        csc_entries
+    };
 
     for csc_entry in &csc_entries {
         let sh = reader.read_shard_header(csc_entry)?;
@@ -213,7 +267,7 @@ fn rewrite_with_current_version(
     // header would carry the same false claim. It also warns about the section
     // families this helper does not carry, which matters here because
     // `--in-place` renames over the target with no prior catalog to roll back to.
-    scx_ops::copy_auxiliary_sections(reader, &mut writer, "upgrade", "{}", true)?;
+    scx_ops::copy_auxiliary_sections_canonicalizing(reader, &mut writer, "upgrade", "{}", true)?;
 
     writer.finish()?;
     Ok(())
@@ -577,6 +631,174 @@ mod tests {
             framed_before,
             "row-group framing was stripped in place, and this is the path \
              `scx rollback` cannot undo"
+        );
+    }
+
+    /// A CSC sidecar is a second representation of the same matrix. If
+    /// canonicalizing X changes its structure, the sidecar built against the old
+    /// matrix is no longer a view of the new one — and carrying it forward means
+    /// the file holds two matrices that disagree, with `write_csc_shard`
+    /// stamping `csc_build_generation` from the writer's `data_generation` so
+    /// the freshness guard blesses it. A reader on `prefer_format="csc"` or the
+    /// GPU CSC-direct DE route would silently get different numbers than one on
+    /// CSR.
+    ///
+    /// So it is dropped — but only when canonicalization actually changed
+    /// something. Carrying CSC is the one thing `upgrade` does that `optimize`
+    /// and `build-csc` do not, and an already-canonical input (every file any
+    /// current writer produces) keeps it. `test_upgrade_preserves_csc_multi_shard`
+    /// covers that side.
+    #[test]
+    fn upgrade_drops_csc_when_canonicalizing_rewrites_the_matrix() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use scx_format_io::section::SectionType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("noncanonical_with_csc.scx");
+        let (n_obs, n_vars) = (2usize, 4usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        // Row 0 repeats column 1 (2 + 3 = 5) — canonicalizing drops one nnz.
+        w.write_csr_shard(
+            &[0u64, 3, 4],
+            &[1u32, 1, 3, 0],
+            &[2u8, 3, 7, 4],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        // A CSC sidecar built against that pre-canonicalization matrix.
+        w.write_csc_shard(
+            &[0u64, 1, 3, 3, 4],
+            &[1u32, 0, 0, 0],
+            &[4u8, 2, 3, 7],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let src = ScxReader::open(&input).unwrap();
+        assert!(src.header().has_csc(), "fixture must carry a CSC sidecar");
+        drop(src);
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        assert!(
+            !out.header().has_csc(),
+            "a CSC sidecar that no longer matches the canonicalized CSR must be \
+             dropped, not carried forward and stamped fresh"
+        );
+        assert_eq!(
+            out.catalog()
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::CscShard)
+                .count(),
+            0,
+            "no CSC section may survive"
+        );
+        // The CSR really was rewritten — otherwise the drop above is vacuous.
+        let got = out.read_all_csr_shards().unwrap();
+        assert_eq!(got.data, vec![5.0, 7.0, 4.0]);
+    }
+
+    /// Multimodal is v2, so it lands in the branch this command still rewrites —
+    /// and nothing here is modality-aware: `csr_shards_sorted()` returns every
+    /// modality's shards and the loop writes them through the single-modality
+    /// API, while `..Default::default()` zeroes the modality table. `optimize`
+    /// and `build_csc` both refuse; `upgrade` was the one that did not.
+    #[test]
+    fn upgrade_refuses_a_multimodal_file() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use scx_format_io::modality::ModalityType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("legacy_mm.scx");
+        let (n_obs, rna_vars, adt_vars) = (6usize, 4usize, 3usize);
+
+        // The shared multimodal fixture stamps v3, which the version gate
+        // declines before the multimodal guard is reached — so it would pass
+        // this test while exercising nothing. v2 is the multimodal feature
+        // floor, and a multimodal file assembled from pre-v3 sources carries it
+        // (`rewrite_output_format_version` clamps into `[2, 3]`), so that is the
+        // shape the guard actually has to catch.
+        let mut header = sample_header(n_obs as u64, rna_vars.max(adt_vars) as u64);
+        header.format_version = 2;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        let rna = w
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt = w
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        w.write_var_for(rna, &sample_var(rna_vars)).unwrap();
+        w.write_var_for(adt, &sample_var(adt_vars)).unwrap();
+        w.set_modality_n_vars(rna, rna_vars as u64).unwrap();
+        w.set_modality_n_vars(adt, adt_vars as u64).unwrap();
+        for (id, m_vars) in [(rna, rna_vars), (adt, adt_vars)] {
+            let mut indptr = vec![0u64];
+            let (mut indices, mut values) = (Vec::new(), Vec::new());
+            for r in 0..n_obs {
+                indices.push((r % m_vars) as u32);
+                values.push(((r + 1) % 256) as u8);
+                indptr.push(indptr.last().unwrap() + 1);
+            }
+            w.write_csr_shard_for(
+                id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+
+        // Only meaningful if the fixture actually reaches the rewrite branch.
+        let src = ScxReader::open(&input).unwrap();
+        assert!(src.is_multimodal());
+        let version = src.header().format_version;
+        drop(src);
+
+        let output = dir.path().join("upgraded.scx");
+        let err = run_upgrade(&input, Some(output.as_path()), false)
+            .expect_err("a multimodal file must be refused, not flattened");
+        assert!(
+            err.to_string().contains("multimodal"),
+            "error should name the reason, got: {err}"
+        );
+        assert!(!output.exists(), "nothing may be written on refusal");
+
+        // And if the version gate would have caught it anyway, this test proves
+        // nothing — so pin that it would not have.
+        assert!(
+            version < DEFAULT_WRITE_FORMAT_VERSION,
+            "fixture is v{version}, which the version gate already declines — the \
+             multimodal guard would be untested"
         );
     }
 

@@ -908,6 +908,21 @@ impl ShardCoverCheck {
         let (shard_idx, row_start) = (get("shard_idx")?, get("row_start")?);
         let (n_shard_rows, n_rows_total) = (get("n_shard_rows")?, get("n_rows_total")?);
 
+        // The stamp must describe the payload it travels with. Walking only the
+        // stamps proves they tile a range; it does not prove each shard carries
+        // the rows it claims. A shard stamped six rows but holding five passes a
+        // stamp-only walk, and the streaming writer then derives the output
+        // range from the five rows it can see while the stamps say six — turning
+        // a detectable input into a malformed output.
+        if n_shard_rows != batch.num_rows() as u64 {
+            return Err(scx_format_io::ScxError::InvalidCatalog(format!(
+                "{logical}: shard {shard_idx} is stamped n_shard_rows={n_shard_rows} but \
+                 carries {} rows",
+                batch.num_rows()
+            ))
+            .into());
+        }
+
         if shard_idx != self.seen as u64 {
             return Err(scx_format_io::ScxError::InvalidCatalog(format!(
                 "{logical}: shard at position {} has shard_idx={shard_idx} (expected {})",
@@ -937,13 +952,31 @@ impl ShardCoverCheck {
         Ok(())
     }
 
-    /// Final cover must equal the last shard's stamped total. A no-op when the
-    /// axis had no shards (the caller is on the legacy single-section path).
-    pub(crate) fn finish(&self, logical: &str) -> std::result::Result<(), scx_engine::EngineError> {
-        if self.seen > 0 && self.next_row_start != self.prev_n_rows_total {
+    /// Final cover must equal the last shard's stamped total **and** the axis
+    /// length the file header declares. The stamps agreeing among themselves
+    /// only proves they are self-consistent; `expected` is what ties them to the
+    /// rest of the file, and without it a sharded axis tiling a different range
+    /// than `n_obs` / `n_vars` passes. A no-op when the axis had no shards (the
+    /// caller is on the legacy single-section path).
+    pub(crate) fn finish(
+        &self,
+        logical: &str,
+        expected: u64,
+    ) -> std::result::Result<(), scx_engine::EngineError> {
+        if self.seen == 0 {
+            return Ok(());
+        }
+        if self.next_row_start != self.prev_n_rows_total {
             return Err(scx_format_io::ScxError::InvalidCatalog(format!(
                 "{logical}: shards cover {} rows but the last shard's n_rows_total is {}",
                 self.next_row_start, self.prev_n_rows_total
+            ))
+            .into());
+        }
+        if self.next_row_start != expected {
+            return Err(scx_format_io::ScxError::InvalidCatalog(format!(
+                "{logical}: shards cover {} rows but the file header declares {expected}",
+                self.next_row_start
             ))
             .into());
         }
@@ -961,11 +994,12 @@ fn filtered_obs_shards<'a>(
     let mut filtered_offset = 0u64; // cumulative kept rows so far
     let mut cover = ShardCoverCheck::default();
     let n_shards = reader.obs_metadata_shard_count();
+    let n_obs = reader.header().n_obs;
     reader.obs_shards().map(move |res| {
         let batch = res?;
         cover.visit("obs_metadata", &batch)?;
         if cover.seen as usize == n_shards {
-            cover.finish("obs_metadata")?;
+            cover.finish("obs_metadata", n_obs)?;
         }
         let n = batch.num_rows();
         let filtered = match keep_mask {
@@ -1021,6 +1055,17 @@ pub(crate) fn write_obs_shards_streaming(
     total_kept: usize,
 ) -> Result<()> {
     if total_kept == 0 {
+        // Every row deleted. The output is one empty legacy section, but the
+        // *input* still has to be well-formed: this path used to return before
+        // touching the validating iterator, so a compact that deleted everything
+        // was the one way to launder a malformed sharded axis through without
+        // anyone looking at it. Walk it first, discarding the batches.
+        let mut cover = ShardCoverCheck::default();
+        for res in reader.obs_shards() {
+            cover.visit("obs_metadata", &res?)?;
+        }
+        cover.finish("obs_metadata", reader.header().n_obs)?;
+
         // Footer-only schema read (no batch decode); see streaming branch in
         // `compact_with_index_options`.
         let schema = std::sync::Arc::new(reader.read_obs_schema_physical()?);

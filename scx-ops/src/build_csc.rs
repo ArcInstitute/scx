@@ -297,17 +297,12 @@ pub fn run_build_csc(
     let params_json = format!(
         "{{\"memory_limit\":\"{memory_limit}\",\"csc_cols_per_shard\":{csc_cols_per_shard}}}"
     );
-    // `canonicalize = false`: build-csc clamps its output `format_version` to the
-    // source's rather than claiming v3 (SCX-005), precisely so it does not have
-    // to canonicalize — and re-emitting a layer with different nnz would
-    // contradict its contract of leaving the matrix data unchanged.
-    rewrite_helpers::copy_auxiliary_sections(
-        &reader,
-        &mut writer,
-        "build-csc",
-        &params_json,
-        false,
-    )?;
+    // The non-canonicalizing (four-argument) form: build-csc clamps its output
+    // `format_version` to the source's rather than claiming v3 (SCX-005),
+    // precisely so it does not have to canonicalize — and re-emitting a layer
+    // with different nnz would contradict its contract of leaving matrix data
+    // unchanged.
+    rewrite_helpers::copy_auxiliary_sections(&reader, &mut writer, "build-csc", &params_json)?;
 
     // 15. Finalize
     writer.finish()?;

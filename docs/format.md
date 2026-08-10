@@ -499,6 +499,15 @@ while preserving CSC sidecars: the CSR rewrite loop calls
 identical CSC content (byte-equal under the same codec) and a
 correctly populated `n_csc_shards` count + `has_csc` flag.
 
+**Unless canonicalizing rewrote the matrix.** `upgrade` stamps v3, whose
+contract is canonical CSR, so it canonicalizes what it re-emits — and summing a
+duplicate coordinate or dropping an explicit zero changes `nnz`, leaving a
+sidecar built against the old matrix describing something the file no longer
+contains. In that case the sidecar is dropped with a warning naming
+`scx build-csc`, rather than carried forward and stamped fresh. Every file a
+current writer produces is already canonical, so this only fires on a
+genuinely non-canonical pre-v3 input.
+
 ## 4.2 Decode Metadata Sidecar (removed — section id 26 reserved)
 
 The **decode metadata sidecar** (`decode_metadata_shard`, section type 26) was a

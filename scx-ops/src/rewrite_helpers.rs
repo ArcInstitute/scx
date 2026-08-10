@@ -222,6 +222,10 @@ const DROPPED_SECTION_FAMILIES: &[(SectionType, &str)] = &[
     (SectionType::RawCsrShard, "adata.raw"),
     (SectionType::RawVarMetadata, "adata.raw"),
     (SectionType::GroupIndex, "grouped-sort group index"),
+    (
+        SectionType::LayerCscShard,
+        "layer CSC sidecars (rebuild: scx build-csc)",
+    ),
 ];
 
 /// Warn, once per family, about input sections this rewrite is about to drop.
@@ -234,10 +238,17 @@ const DROPPED_SECTION_FAMILIES: &[(SectionType, &str)] = &[
 fn warn_dropped_sections(reader: &ScxReader, action: &str) {
     let dropped = dropped_section_labels(reader);
     if !dropped.is_empty() {
+        // No rollback clause: this helper does not know whether the caller is
+        // writing to a separate output (where the input is untouched) or
+        // renaming over it. Stating the loss and the remedy is true of both;
+        // claiming irreversibility on the copy-out form would be the same wrong
+        // rationale for a right warning that `run_upgrade`'s decline message
+        // had. The in-place hazard is documented in docs/operations.md.
         log::warn!(
             "scx {action}: the output will not carry {} — this rewrite copies only \
-             layers, obsm, uns, predicate indexes and deletion vectors, and it is \
-             not rollback-able. Copy the input aside first if you need them.",
+             layers, obsm, uns, predicate indexes and deletion vectors. Copy them \
+             across from the input if you need them, or use `scx optimize`, which \
+             carries obsm / varm / obsp / varp.",
             dropped.join(", ")
         );
     }
@@ -291,6 +302,22 @@ pub(crate) fn dropped_section_labels(reader: &ScxReader) -> Vec<&'static str> {
 ///
 /// [`DEFAULT_WRITE_FORMAT_VERSION`]: scx_format_io::header::DEFAULT_WRITE_FORMAT_VERSION
 pub fn copy_auxiliary_sections(
+    reader: &ScxReader,
+    writer: &mut ScxWriter,
+    action: &str,
+    params_json: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    copy_auxiliary_sections_canonicalizing(reader, writer, action, params_json, false)
+}
+
+/// [`copy_auxiliary_sections`] with control over layer canonicalization.
+///
+/// Split out rather than added as a fifth parameter to the existing function:
+/// `canonicalize` is wanted by exactly one of the two callers, and widening a
+/// published signature to say so would source-break every downstream caller for
+/// a choice none of them are making. `false` is what the four-argument form has
+/// always done.
+pub fn copy_auxiliary_sections_canonicalizing(
     reader: &ScxReader,
     writer: &mut ScxWriter,
     action: &str,
