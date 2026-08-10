@@ -4,7 +4,8 @@
 // newest unframed version (DEFAULT_WRITE_FORMAT_VERSION). It intentionally does
 // NOT add row-group framing, so it does not reach CURRENT_FORMAT_VERSION (v4) —
 // use `scx optimize --row-group-rows N` for the framed v4 layout. If the file
-// is already at the unframed target, this is a no-op. See SCX-013.
+// is already at the unframed target — or already *past* it, at v4 — this is a
+// no-op. See SCX-013.
 
 use std::path::Path;
 
@@ -28,6 +29,35 @@ pub fn run_upgrade(
 
     // `scx upgrade` re-writes to the newest **unframed** version (v4 requires
     // row-group framing, which upgrade does not add).
+    //
+    // A file *newer* than that target is declined rather than rewritten. The
+    // rewrite is not a no-op on such a file: it re-emits every shard unframed
+    // and stamps v3, so a v4 input silently loses the row-group framing — and
+    // with it the sub-shard random access v4 exists to provide — while printing
+    // "Upgraded ... v4 -> v3". On `--in-place` that is unrecoverable: the rename
+    // lands a wholly new file carrying no prior catalog, so `scx rollback` has
+    // nothing to roll back to. There is deliberately no `--allow-downgrade`:
+    // nothing asks for one, and `scx optimize` is the op that owns framing in
+    // both directions.
+    if old_version > DEFAULT_WRITE_FORMAT_VERSION {
+        // The rollback clause is true only of the rename path; on the copy-out
+        // form the input is never touched, so saying it there would be a wrong
+        // rationale for a right refusal.
+        let irreversible = if in_place {
+            " and `--in-place` is not rollback-able"
+        } else {
+            ""
+        };
+        println!(
+            "File is at format version {old_version}, which is newer than the version \
+             `scx upgrade` targets (v{DEFAULT_WRITE_FORMAT_VERSION}, unframed). Rewriting \
+             it here would strip row-group framing and its sub-shard random access{irreversible}. \
+             Nothing to do. Use `scx optimize --row-group-rows N` to re-frame, or \
+             `scx optimize --row-group-rows 0` if you genuinely need an unframed v3 \
+             file for an older reader."
+        );
+        return Ok(());
+    }
     if old_version == DEFAULT_WRITE_FORMAT_VERSION {
         println!(
             "File is already at format version {} (newest unframed version; \
@@ -35,6 +65,32 @@ pub fn run_upgrade(
             DEFAULT_WRITE_FORMAT_VERSION
         );
         return Ok(());
+    }
+
+    // Only now: nothing here is modality-aware, so a multimodal file that would
+    // actually be rewritten must be refused. `csr_shards_sorted()` returns every
+    // modality's shards, the loop below writes them through the single-modality
+    // `write_csr_shard`, and the output header's `..Default::default()` zeroes
+    // `n_modalities` and the modality-table pointers — a CITE-seq file would come
+    // out nominally single-modality with overlapping global row ranges and no
+    // per-modality var, on `--in-place` over the top of the original. Multimodal
+    // only requires v2, so it reaches here.
+    //
+    // **After** the version gates, deliberately. Placing it first also turned a
+    // multimodal *v3 or v4* file — which is never rewritten and was a harmless
+    // exit-0 "nothing to do" — into a hard error, contradicting this module's
+    // own contract and `docs/api.md`. Refuse what would be damaged, not what
+    // would be left alone.
+    if reader.is_multimodal() {
+        return Err(format!(
+            "scx upgrade does not support multimodal files yet: {} carries a modality \
+             table, and this rewrite would flatten it into a single-modality file. \
+             Extract a modality with `scx subset {} out.scx --modality NAME`, or use \
+             `scx compact`, which handles multimodal inputs.",
+            input.display(),
+            input.display()
+        )
+        .into());
     }
 
     // 3. Determine output path
@@ -104,26 +160,56 @@ fn rewrite_with_current_version(
         ..Default::default()
     };
 
-    // Read metadata
-    let obs = reader.read_obs()?;
-    let var = reader.read_var()?;
-
     // Create writer
     let mut writer = ScxWriter::new(output, out_header)?;
-    writer.write_obs(&obs)?;
-    writer.write_var(&var)?;
 
-    // Re-write CSR shards (per-shard codec)
+    // obs/var pass through 1:1, so a row-sharded input must come out
+    // row-sharded rather than collapsed into one legacy section — see
+    // `copy_obs_var_preserving_layout` for what that costs. An upgrade never
+    // drops rows, which is also what licenses the deletion-vector carry in
+    // `copy_auxiliary_sections` below.
+    scx_ops::copy_obs_var_preserving_layout(reader, &mut writer)?;
+
+    // Re-write CSR shards (per-shard codec), canonicalizing each one.
+    //
+    // The output header stamps `DEFAULT_WRITE_FORMAT_VERSION`, and v3's contract
+    // *is* canonical row-major CSR: indices sorted within each row, duplicate
+    // coordinates summed, no explicit zeros. A pre-v3 source carries no such
+    // guarantee — that is exactly why `rewrite_output_format_version` refuses to
+    // promote one — so re-emitting its rows unchanged under a v3 header would
+    // make the file claim an invariant it does not hold, and `scx validate
+    // --deep` would rightly reject it.
+    //
+    // The three rewriting ops split on this and only two got it right:
+    // `optimize` canonicalizes and so legitimately stamps v3; `build_csc` does
+    // not canonicalize and so clamps its output version to the source's
+    // (SCX-005). `upgrade` did neither — it stamped v3 over whatever it was
+    // handed. Clamping is not an option here, because producing v3 is the whole
+    // point of the command, so it canonicalizes, like `optimize`.
+    // Set when canonicalization actually changed a shard — see the CSC block.
+    let mut csr_was_rewritten = false;
     for shard_entry in &csr_entries {
         let sh = reader.read_shard_header(shard_entry)?;
         let ve = crate::shard_utils::decode_value_encoding(sh.value_encoding)?;
         let ci = crate::shard_utils::decode_codec_id(sh.codec_id)?;
 
-        let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
+        let (indptr, indices, mut data) = reader.read_shard_from_entry(shard_entry)?;
         let shard_row_start = shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
 
-        let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
-        let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
+        let mut indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        let mut indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
+        // Canonicalizing sums duplicate coordinates, so a value can outgrow the
+        // width the source chose for the values it held. Re-encoding through the
+        // old width either refuses outright (`Uint8` rejects 200 + 200 = 400,
+        // failing on exactly the input this op exists to repair) or, for
+        // `Float16`, silently yields infinity. Widen to what the result needs.
+        let ve = if !scx_sparse::is_canonical_csr(&indptr_u64, &indices_u32, &data) {
+            scx_sparse::canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut data);
+            csr_was_rewritten = true;
+            scx_ops::encoding_for_canonicalized(ve, &data)
+        } else {
+            ve
+        };
         let raw_values = ve.encode_f32_batch(&data)?;
 
         writer.write_csr_shard(
@@ -139,7 +225,35 @@ fn rewrite_with_current_version(
     // Re-write CSC shards (if present, per-shard codec). Sorted by
     // major_start() (= col_start for CSC entries via the axis-overload
     // in ShardStats; on-disk fields are unchanged).
+    //
+    // Unless canonicalizing above actually rewrote a shard. The sidecar is a
+    // second representation of the same matrix, built against the *old* CSR:
+    // summing a duplicate coordinate or dropping an explicit zero changes X's
+    // structure and its nnz, so carrying the old CSC forward leaves the file
+    // holding two matrices that disagree. That is not a stale-sidecar
+    // annoyance — `write_csc_shard` stamps `csc_build_generation` from the
+    // writer's `data_generation`, so the freshness guard would bless it, and a
+    // consumer on the CSC path (`prefer_format="csc"`, GPU CSC-direct DE) would
+    // silently read different numbers than one on CSR. `optimize` faces the
+    // same choice and drops unconditionally.
+    //
+    // Dropped only when it would actually be wrong, because carrying CSC is the
+    // one thing `upgrade` does that its siblings don't, and an already-canonical
+    // input — every file any current writer produces — keeps it.
     let csc_entries = reader.catalog().csc_shards_sorted();
+    if csr_was_rewritten && !csc_entries.is_empty() {
+        log::warn!(
+            "scx upgrade: canonicalizing the CSR matrix changed its structure, so the \
+             CSC sidecar built against the old matrix is no longer a faithful second \
+             view of it and has been dropped. Rerun `scx build-csc` to rebuild the \
+             column-major sidecar against the upgraded file."
+        );
+    }
+    let csc_entries: Vec<_> = if csr_was_rewritten {
+        Vec::new()
+    } else {
+        csc_entries
+    };
 
     for csc_entry in &csc_entries {
         let sh = reader.read_shard_header(csc_entry)?;
@@ -160,8 +274,13 @@ fn rewrite_with_current_version(
         writer.write_csc_shard(&indptr_u64, &indices_u32, &raw_values, ci, ve, col_start)?;
     }
 
-    // Copy auxiliary sections (layers, obsm, uns, predicate indices, provenance)
-    scx_ops::copy_auxiliary_sections(reader, &mut writer, "upgrade", "{}")?;
+    // Copy auxiliary sections (layers, obsm, uns, predicate indices, deletion
+    // vectors, provenance). `canonicalize = true` for the same reason the X loop
+    // above canonicalizes: a layer CSR shard re-emitted verbatim under a v3
+    // header would carry the same false claim. It also warns about the section
+    // families this helper does not carry, which matters here because
+    // `--in-place` renames over the target with no prior catalog to roll back to.
+    scx_ops::copy_auxiliary_sections_canonicalizing(reader, &mut writer, "upgrade", "{}", true)?;
 
     writer.finish()?;
     Ok(())
@@ -172,6 +291,7 @@ mod tests {
     use super::*;
     use crate::test_utils::write_test_file;
     use scx_codec::{CodecId, ValueEncoding};
+    use std::path::PathBuf;
 
     /// A format upgrade is a 1:1 rewrite, so the deletion-vector section has to
     /// come with it. `rewrite_with_current_version` copies `in_header.flags`
@@ -428,5 +548,683 @@ mod tests {
         let out_csc = out_reader.read_all_csc_shards().unwrap();
         assert_eq!(out_csc.shape, (n_rows, n_cols));
         assert_eq!(out_csc.to_dense().unwrap(), dense);
+    }
+
+    /// A real v4 file, built the way users get one: framed shards, sharded obs.
+    /// `optimize` is the op that produces the framed layout, and
+    /// `ObsShardPolicy::Always` gives us the sharded obs at test scale.
+    fn write_framed_v4_file(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> PathBuf {
+        let base = write_test_file(dir, n_obs, n_vars);
+        let v4 = dir.path().join("framed_v4.scx");
+        scx_ops::optimize_with_framing(
+            &base,
+            &v4,
+            None,
+            scx_format_io::ObsShardPolicy::Always,
+            Some(scx_format_io::FramingConfig::default()),
+        )
+        .unwrap();
+
+        let r = ScxReader::open(&v4).unwrap();
+        assert_eq!(
+            r.header().format_version,
+            scx_format_io::header::CURRENT_FORMAT_VERSION,
+            "fixture must actually be v4, or the test proves nothing"
+        );
+        assert!(
+            r.obs_metadata_shard_count() > 0,
+            "fixture must actually have sharded obs"
+        );
+        v4
+    }
+
+    /// `scx upgrade` targets the newest **unframed** version (v3). Handed
+    /// something newer it must decline, not "upgrade" it downwards.
+    ///
+    /// The rewrite is not a no-op on a v4 input: it re-emits every shard
+    /// unframed and stamps v3, silently destroying the sub-shard random access
+    /// v4 exists to provide — and it collapses the sharded obs layout on the
+    /// way past. Nothing in the CLI help or `docs/api.md` says it does either.
+    #[test]
+    fn upgrade_declines_a_framed_v4_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_framed_v4_file(&dir, 8, 5);
+        let output = dir.path().join("upgraded.scx");
+
+        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+
+        assert!(
+            !output.exists(),
+            "a file newer than the upgrade target must be left alone, not \
+             rewritten downwards into a new file"
+        );
+        let r = ScxReader::open(&input).unwrap();
+        assert_eq!(
+            r.header().format_version,
+            scx_format_io::header::CURRENT_FORMAT_VERSION
+        );
+    }
+
+    /// The `--in-place` variant of the above, which is the irrecoverable one:
+    /// it renames a wholly new file over the target carrying no prior catalog,
+    /// so `scx rollback` cannot undo it.
+    #[test]
+    fn upgrade_in_place_leaves_a_v4_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_framed_v4_file(&dir, 8, 5);
+
+        let before = ScxReader::open(&input).unwrap();
+        let (version, obs_shards, csr_entries) = (
+            before.header().format_version,
+            before.obs_metadata_shard_count(),
+            before.catalog().csr_shards_sorted().len(),
+        );
+        let framed_before = before
+            .read_shard_header(before.catalog().csr_shards_sorted()[0])
+            .unwrap()
+            .shard_format_version;
+        assert_eq!(framed_before, 2, "fixture's shards must actually be framed");
+        drop(before);
+
+        run_upgrade(&input, None, true).unwrap();
+
+        let after = ScxReader::open(&input).unwrap();
+        assert_eq!(after.header().format_version, version, "version changed");
+        assert_eq!(
+            after.obs_metadata_shard_count(),
+            obs_shards,
+            "obs layout changed"
+        );
+        assert_eq!(after.catalog().csr_shards_sorted().len(), csr_entries);
+        assert_eq!(
+            after
+                .read_shard_header(after.catalog().csr_shards_sorted()[0])
+                .unwrap()
+                .shard_format_version,
+            framed_before,
+            "row-group framing was stripped in place, and this is the path \
+             `scx rollback` cannot undo"
+        );
+    }
+
+    /// A CSC sidecar is a second representation of the same matrix. If
+    /// canonicalizing X changes its structure, the sidecar built against the old
+    /// matrix is no longer a view of the new one — and carrying it forward means
+    /// the file holds two matrices that disagree, with `write_csc_shard`
+    /// stamping `csc_build_generation` from the writer's `data_generation` so
+    /// the freshness guard blesses it. A reader on `prefer_format="csc"` or the
+    /// GPU CSC-direct DE route would silently get different numbers than one on
+    /// CSR.
+    ///
+    /// So it is dropped — but only when canonicalization actually changed
+    /// something. Carrying CSC is the one thing `upgrade` does that `optimize`
+    /// and `build-csc` do not, and an already-canonical input (every file any
+    /// current writer produces) keeps it. `test_upgrade_preserves_csc_multi_shard`
+    /// covers that side.
+    #[test]
+    fn upgrade_drops_csc_when_canonicalizing_rewrites_the_matrix() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use scx_format_io::section::SectionType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("noncanonical_with_csc.scx");
+        let (n_obs, n_vars) = (2usize, 4usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        // Row 0 repeats column 1 (2 + 3 = 5) — canonicalizing drops one nnz.
+        w.write_csr_shard(
+            &[0u64, 3, 4],
+            &[1u32, 1, 3, 0],
+            &[2u8, 3, 7, 4],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        // A CSC sidecar built against that pre-canonicalization matrix.
+        w.write_csc_shard(
+            &[0u64, 1, 3, 3, 4],
+            &[1u32, 0, 0, 0],
+            &[4u8, 2, 3, 7],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let src = ScxReader::open(&input).unwrap();
+        assert!(src.header().has_csc(), "fixture must carry a CSC sidecar");
+        drop(src);
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        assert!(
+            !out.header().has_csc(),
+            "a CSC sidecar that no longer matches the canonicalized CSR must be \
+             dropped, not carried forward and stamped fresh"
+        );
+        assert_eq!(
+            out.catalog()
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::CscShard)
+                .count(),
+            0,
+            "no CSC section may survive"
+        );
+        // The CSR really was rewritten — otherwise the drop above is vacuous.
+        let got = out.read_all_csr_shards().unwrap();
+        assert_eq!(got.data, vec![5.0, 7.0, 4.0]);
+    }
+
+    /// Multimodal is v2, so it lands in the branch this command still rewrites —
+    /// and nothing here is modality-aware: `csr_shards_sorted()` returns every
+    /// modality's shards and the loop writes them through the single-modality
+    /// API, while `..Default::default()` zeroes the modality table. `optimize`
+    /// and `build_csc` both refuse; `upgrade` was the one that did not.
+    #[test]
+    fn upgrade_refuses_a_multimodal_file() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use scx_format_io::modality::ModalityType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("legacy_mm.scx");
+        let (n_obs, rna_vars, adt_vars) = (6usize, 4usize, 3usize);
+
+        // The shared multimodal fixture stamps v3, which the version gate
+        // declines before the multimodal guard is reached — so it would pass
+        // this test while exercising nothing. v2 is the multimodal feature
+        // floor, and a multimodal file assembled from pre-v3 sources carries it
+        // (`rewrite_output_format_version` clamps into `[2, 3]`), so that is the
+        // shape the guard actually has to catch.
+        let mut header = sample_header(n_obs as u64, rna_vars.max(adt_vars) as u64);
+        header.format_version = 2;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        let rna = w
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt = w
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        w.write_var_for(rna, &sample_var(rna_vars)).unwrap();
+        w.write_var_for(adt, &sample_var(adt_vars)).unwrap();
+        w.set_modality_n_vars(rna, rna_vars as u64).unwrap();
+        w.set_modality_n_vars(adt, adt_vars as u64).unwrap();
+        for (id, m_vars) in [(rna, rna_vars), (adt, adt_vars)] {
+            let mut indptr = vec![0u64];
+            let (mut indices, mut values) = (Vec::new(), Vec::new());
+            for r in 0..n_obs {
+                indices.push((r % m_vars) as u32);
+                values.push(((r + 1) % 256) as u8);
+                indptr.push(indptr.last().unwrap() + 1);
+            }
+            w.write_csr_shard_for(
+                id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+
+        // Only meaningful if the fixture actually reaches the rewrite branch.
+        let src = ScxReader::open(&input).unwrap();
+        assert!(src.is_multimodal());
+        let version = src.header().format_version;
+        drop(src);
+
+        let output = dir.path().join("upgraded.scx");
+        let err = run_upgrade(&input, Some(output.as_path()), false)
+            .expect_err("a multimodal file must be refused, not flattened");
+        assert!(
+            err.to_string().contains("multimodal"),
+            "error should name the reason, got: {err}"
+        );
+        assert!(!output.exists(), "nothing may be written on refusal");
+
+        // And if the version gate would have caught it anyway, this test proves
+        // nothing — so pin that it would not have.
+        assert!(
+            version < DEFAULT_WRITE_FORMAT_VERSION,
+            "fixture is v{version}, which the version gate already declines — the \
+             multimodal guard would be untested"
+        );
+    }
+
+    /// Canonicalizing **sums** duplicate coordinates, so a value can outgrow the
+    /// width the source picked for the values it actually held. Re-encoding
+    /// through the old width fails two ways, and the quiet one is worse:
+    /// `Uint8::encode_f32` refuses `200 + 200 = 400` outright — so the upgrade
+    /// errors on exactly the non-canonical input it exists to repair — while
+    /// `Float16` is unchecked and `f16::from_f32` maps anything past 65504 to
+    /// **infinity**, reporting success.
+    #[test]
+    fn upgrade_widens_the_value_encoding_when_canonicalizing_overflows_it() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("uint8_overflow.scx");
+        let (n_obs, n_vars) = (1usize, 3usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        // Column 1 duplicated: 200 + 200 = 400, past what Uint8 can hold.
+        w.write_csr_shard(
+            &[0u64, 2],
+            &[1u32, 1],
+            &[200u8, 200],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false)
+            .expect("a duplicate summing past the source width must not fail the upgrade");
+
+        let out = ScxReader::open(&output).unwrap();
+        let got = out.read_all_csr_shards().unwrap();
+        assert_eq!(
+            got.data,
+            vec![400.0],
+            "the summed value must survive intact, not saturate or error"
+        );
+    }
+
+    /// The unit-level statement of the same rule, including the `Float16` arm —
+    /// which cannot be exercised end-to-end here (no CLI path writes f16 counts)
+    /// but is the one that fails *silently*.
+    #[test]
+    fn canonicalized_encoding_widens_only_when_the_sums_need_it() {
+        use scx_codec::ValueEncoding::*;
+        // Fits: unchanged.
+        assert_eq!(scx_ops::encoding_for_canonicalized(Uint8, &[255.0]), Uint8);
+        assert_eq!(
+            scx_ops::encoding_for_canonicalized(Uint16, &[65535.0]),
+            Uint16
+        );
+        assert_eq!(
+            scx_ops::encoding_for_canonicalized(Float16, &[65504.0]),
+            Float16
+        );
+        // Overflows: widened, and only one step where one step suffices.
+        assert_eq!(scx_ops::encoding_for_canonicalized(Uint8, &[400.0]), Uint16);
+        assert_eq!(
+            scx_ops::encoding_for_canonicalized(Uint8, &[70000.0]),
+            Uint32,
+            "a Uint8 sum past u16 must go all the way to u32, not stop at u16"
+        );
+        assert_eq!(
+            scx_ops::encoding_for_canonicalized(Float16, &[70000.0]),
+            Float32,
+            "f16 saturates to infinity past 65504 without complaining"
+        );
+    }
+
+    /// Switching obs/var to the streaming writers must not quietly trade away
+    /// the shard-cover validation `read_obs()` / `read_var()` performed on the
+    /// way to assembling the axis.
+    ///
+    /// That check is what stands between a malformed sharded axis and a
+    /// *plausible* output: the streaming writer re-derives each output shard's
+    /// `row_start` from batch lengths, so a gapped input is not merely copied
+    /// through — it is normalised into a well-formed file whose metadata now
+    /// describes different matrix rows than it did. An error is the only
+    /// acceptable answer, and it is the one the assembling path already gave.
+    #[test]
+    fn upgrade_rejects_a_gapped_obs_shard_cover() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("gapped.scx");
+        let (n_obs, n_vars) = (6usize, 4usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        let obs = sample_obs(n_obs);
+        // Shard 0 covers rows [0, 3). Shard 1 claims to start at row 4, leaving
+        // row 3 described by nothing — the cover no longer tiles [0, n_obs).
+        w.write_obs_shard(0, 0, 3, n_obs as u64, &obs.slice(0, 3))
+            .unwrap();
+        w.write_obs_shard(1, 4, 3, n_obs as u64, &obs.slice(3, 3))
+            .unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+
+        let mut indptr = vec![0u64];
+        let (mut indices, mut values) = (Vec::new(), Vec::new());
+        for row in 0..n_obs {
+            indices.push(((row * 2) % n_vars) as u32);
+            values.push(((row + 1) % 256) as u8);
+            indptr.push(indptr.last().unwrap() + 1);
+        }
+        w.write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        // The assembling path rejects this — that is the behaviour being kept.
+        let src = ScxReader::open(&input).unwrap();
+        assert!(
+            src.read_obs().is_err(),
+            "fixture must be malformed enough for read_obs() to reject it"
+        );
+        drop(src);
+
+        let output = dir.path().join("upgraded.scx");
+        let err = run_upgrade(&input, Some(output.as_path()), false)
+            .expect_err("a gapped obs cover must not upgrade to a well-formed file");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("row_start") && msg.contains("obs_metadata"),
+            "the error should name the axis and what was wrong, got: {msg}"
+        );
+    }
+
+    /// A multimodal file at or past the target version is never rewritten, so
+    /// there is nothing to protect it from — it must stay the exit-0 "nothing to
+    /// do" it always was. Placing the refusal before the version gates turned
+    /// that into a hard error for the common modern case, contradicting the
+    /// module contract and `docs/api.md`.
+    #[test]
+    fn upgrade_leaves_an_at_target_multimodal_file_alone() {
+        use crate::test_utils::write_multimodal_test_file;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_multimodal_test_file(&dir, 6, 4, 3);
+        let src = ScxReader::open(&input).unwrap();
+        assert!(src.is_multimodal());
+        assert_eq!(
+            src.header().format_version,
+            DEFAULT_WRITE_FORMAT_VERSION,
+            "fixture must be at the target version for this to test the ordering"
+        );
+        drop(src);
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false)
+            .expect("an already-at-target multimodal file must be a no-op, not an error");
+        assert!(!output.exists(), "a no-op writes nothing");
+    }
+
+    /// A shard whose stamp disagrees with the payload it carries. Walking the
+    /// stamps alone proves they tile a range; it does not prove each shard holds
+    /// the rows it claims, and the streaming writer derives the output range from
+    /// the payload — so this turns a detectable input into a malformed output.
+    #[test]
+    fn upgrade_rejects_a_shard_whose_stamp_disagrees_with_its_payload() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("stamp_mismatch.scx");
+        let (n_obs, n_vars) = (6usize, 4usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        let obs = sample_obs(n_obs);
+        // Stamped 3 rows, carries 2. The stamps still tile [0, 6).
+        w.write_obs_shard(0, 0, 3, n_obs as u64, &obs.slice(0, 2))
+            .unwrap();
+        w.write_obs_shard(1, 3, 3, n_obs as u64, &obs.slice(3, 3))
+            .unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        let mut indptr = vec![0u64];
+        let (mut indices, mut values) = (Vec::new(), Vec::new());
+        for row in 0..n_obs {
+            indices.push(((row * 2) % n_vars) as u32);
+            values.push(((row + 1) % 256) as u8);
+            indptr.push(indptr.last().unwrap() + 1);
+        }
+        w.write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let output = dir.path().join("upgraded.scx");
+        let err = run_upgrade(&input, Some(output.as_path()), false)
+            .expect_err("a shard whose stamp overstates its payload must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("n_shard_rows") && msg.contains("carries"),
+            "the error should say the stamp and the payload disagree, got: {msg}"
+        );
+    }
+
+    /// An upgrade stamps v3, and v3's contract *is* canonical CSR — indices
+    /// sorted within each row, duplicate coordinates summed, no explicit zeros.
+    /// A pre-v3 source carries no such guarantee, which is exactly why
+    /// `rewrite_output_format_version` refuses to promote one.
+    ///
+    /// So the output must actually *be* canonical, not merely claim it. This
+    /// feeds a v1 file whose single row has unsorted indices, a duplicate
+    /// coordinate and an explicit zero, and asserts the upgraded file satisfies
+    /// the invariant its own header advertises. The sharded-layout fixture next
+    /// door cannot catch this — its rows are already canonical, so it passes
+    /// whether or not anything canonicalizes.
+    #[test]
+    fn upgrade_canonicalizes_before_claiming_v3() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("legacy_noncanonical.scx");
+        let (n_obs, n_vars) = (2usize, 6usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+
+        // Row 0: descending indices, column 2 repeated (3 + 4 = 7), and an
+        // explicit zero at column 5. Row 1: already canonical, so the test also
+        // shows canonicalization leaves a well-formed row alone.
+        let indptr: Vec<u64> = vec![0, 4, 5];
+        let indices: Vec<u32> = vec![4, 2, 2, 5, 1];
+        let values: Vec<u8> = vec![9, 3, 4, 0, 8];
+        w.write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        // The fixture really is non-canonical, or the assertion below is empty.
+        let src = ScxReader::open(&input).unwrap();
+        assert_eq!(src.header().format_version, 1);
+        let s = src.read_all_csr_shards().unwrap();
+        assert!(
+            !scx_sparse::is_canonical_csr(
+                &s.indptr.iter().map(|&v| v as u64).collect::<Vec<_>>(),
+                &s.indices.iter().map(|&v| v as u32).collect::<Vec<_>>(),
+                &s.data
+            ),
+            "fixture must be non-canonical or this test cannot fail"
+        );
+        drop(src);
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        assert_eq!(
+            out.header().format_version,
+            DEFAULT_WRITE_FORMAT_VERSION,
+            "the upgrade must still have happened"
+        );
+        let got = out.read_all_csr_shards().unwrap();
+        let (ip, ix): (Vec<u64>, Vec<u32>) = (
+            got.indptr.iter().map(|&v| v as u64).collect(),
+            got.indices.iter().map(|&v| v as u32).collect(),
+        );
+        assert!(
+            scx_sparse::is_canonical_csr(&ip, &ix, &got.data),
+            "a v3 header claims canonical CSR; the output must hold that invariant. \
+             got indptr={ip:?} indices={ix:?} data={:?}",
+            got.data
+        );
+        // Sorted, the duplicate summed, the explicit zero dropped — and the
+        // values are the ones the input meant, not merely *a* canonical shape.
+        assert_eq!(ix, vec![2, 4, 1]);
+        assert_eq!(got.data, vec![7.0, 9.0, 8.0]);
+        assert_eq!(ip, vec![0, 2, 3]);
+    }
+
+    /// obs and var pass through an upgrade 1:1, so a row-sharded input must
+    /// come out row-sharded.
+    ///
+    /// `read_obs()` + `write_obs()` assembles every `ObsMetadataShard` into one
+    /// in-memory batch and emits it as a single legacy section: peak RSS
+    /// O(n_obs) — the OOM the sharded layout exists to prevent — and a silent
+    /// loss of the row-sharded-obs precondition Level-2 row-set pushdown
+    /// depends on. Same defect `build-csc` had.
+    ///
+    /// The fixture is stamped pre-v3 so it reaches the rewrite at all: sharded
+    /// obs sets no version floor (`rewrite_output_format_version` clamps into
+    /// `[feature_floor, 3]` and nothing raises the floor for section types
+    /// 24/25), so a merge or append over pre-v3 inputs yields exactly this —
+    /// an old file with sharded obs, which is what `scx upgrade` is *for*.
+    #[test]
+    fn upgrade_preserves_sharded_obs_and_var_layout() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use scx_format_io::section::SectionType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("legacy_sharded.scx");
+        let (n_obs, n_vars) = (6usize, 4usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+
+        let obs = sample_obs(n_obs);
+        for shard_idx in 0u32..2 {
+            let row_start = shard_idx as usize * 3;
+            w.write_obs_shard(
+                shard_idx,
+                row_start as u64,
+                3,
+                n_obs as u64,
+                &obs.slice(row_start, 3),
+            )
+            .unwrap();
+        }
+        let var = sample_var(n_vars);
+        for shard_idx in 0u32..2 {
+            let col_start = shard_idx as usize * 2;
+            w.write_var_shard(
+                shard_idx,
+                col_start as u64,
+                2,
+                n_vars as u64,
+                &var.slice(col_start, 2),
+            )
+            .unwrap();
+        }
+
+        let mut indptr = vec![0u64];
+        let (mut indices, mut values) = (Vec::new(), Vec::new());
+        for row in 0..n_obs {
+            indices.push(((row * 2) % n_vars) as u32);
+            indices.push(((row * 2 + 1) % n_vars) as u32);
+            values.push(((row + 1) % 256) as u8);
+            values.push(((row + 2) % 256) as u8);
+            indptr.push(indptr.last().unwrap() + 2);
+        }
+        w.write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        // The gate has to let this through, or the test proves nothing.
+        let src = ScxReader::open(&input).unwrap();
+        assert_eq!(src.header().format_version, 1);
+        assert_eq!(src.obs_metadata_shard_count(), 2);
+        assert_eq!(src.var_metadata_shard_count(), 2);
+        drop(src);
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        assert_eq!(
+            out.header().format_version,
+            DEFAULT_WRITE_FORMAT_VERSION,
+            "the upgrade itself must still have happened"
+        );
+        assert_eq!(
+            out.obs_metadata_shard_count(),
+            2,
+            "sharded obs must stay sharded through an upgrade"
+        );
+        assert_eq!(
+            out.var_metadata_shard_count(),
+            2,
+            "sharded var must stay sharded through an upgrade"
+        );
+        for collapsed in [SectionType::ObsMetadata, SectionType::VarMetadata] {
+            assert!(
+                !out.catalog()
+                    .entries
+                    .iter()
+                    .any(|e| e.section_type == collapsed),
+                "no collapsed single-section {collapsed:?} may be emitted"
+            );
+        }
+        // ...and the content still round-trips.
+        assert_eq!(out.read_obs().unwrap().num_rows(), n_obs);
+        assert_eq!(out.read_var().unwrap().num_rows(), n_vars);
+        assert_eq!(out.read_all_csr_shards().unwrap().shape, (n_obs, n_vars));
     }
 }

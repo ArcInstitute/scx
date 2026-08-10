@@ -861,6 +861,129 @@ pub(crate) fn write_obs_section(
 /// Items are `scx_engine::EngineError`-typed so the iterator feeds
 /// [`build_and_write_conversion_predicate_indexes_streaming`] directly; the
 /// write pass converts to `OpsError` via `?` (`OpsError: From<EngineError>`).
+/// Incremental version of the shard-cover check `assemble_sharded_metadata`
+/// runs, for callers that stream shards instead of concatenating them.
+///
+/// `read_obs()` / `read_var()` validate the cover as a side effect of
+/// assembling it: first shard must be `shard_idx = 0` at `row_start = 0`, each
+/// subsequent shard must continue the previous one's range in `shard_idx`
+/// order, `n_rows_total` must be monotonically non-decreasing (an append-grown
+/// file's older shards carry smaller stamps), and the final cover must equal
+/// the last shard's `n_rows_total`. A rewrite that switched to the streaming
+/// path silently traded that check away — and worse than merely losing it, it
+/// then *re-derives* each output shard's offset from batch lengths, so a
+/// malformed axis is normalised into a well-formed file with metadata bound to
+/// different matrix rows than it described. Any op reading a file it did not
+/// write needs the check, so it lives with the shared iterator rather than in
+/// one caller.
+///
+/// Reads the same stamps `parse_shard_metadata` does, from the batch's Arrow
+/// schema metadata.
+#[derive(Default)]
+pub(crate) struct ShardCoverCheck {
+    pub(crate) seen: u32,
+    next_row_start: u64,
+    prev_n_rows_total: u64,
+}
+
+impl ShardCoverCheck {
+    pub(crate) fn visit(
+        &mut self,
+        logical: &str,
+        batch: &arrow::array::RecordBatch,
+    ) -> std::result::Result<(), scx_engine::EngineError> {
+        let md = batch.schema_ref().metadata().clone();
+        let get = |key: &str| -> std::result::Result<u64, scx_engine::EngineError> {
+            let raw = md.get(key).ok_or_else(|| {
+                scx_engine::EngineError::from(scx_format_io::ScxError::InvalidCatalog(format!(
+                    "{logical}: shard schema missing '{key}'"
+                )))
+            })?;
+            raw.parse::<u64>().map_err(|_| {
+                scx_engine::EngineError::from(scx_format_io::ScxError::InvalidCatalog(format!(
+                    "{logical}: shard schema '{key}'='{raw}' is not a u64"
+                )))
+            })
+        };
+        let (shard_idx, row_start) = (get("shard_idx")?, get("row_start")?);
+        let (n_shard_rows, n_rows_total) = (get("n_shard_rows")?, get("n_rows_total")?);
+
+        // The stamp must describe the payload it travels with. Walking only the
+        // stamps proves they tile a range; it does not prove each shard carries
+        // the rows it claims. A shard stamped six rows but holding five passes a
+        // stamp-only walk, and the streaming writer then derives the output
+        // range from the five rows it can see while the stamps say six — turning
+        // a detectable input into a malformed output.
+        if n_shard_rows != batch.num_rows() as u64 {
+            return Err(scx_format_io::ScxError::InvalidCatalog(format!(
+                "{logical}: shard {shard_idx} is stamped n_shard_rows={n_shard_rows} but \
+                 carries {} rows",
+                batch.num_rows()
+            ))
+            .into());
+        }
+
+        if shard_idx != self.seen as u64 {
+            return Err(scx_format_io::ScxError::InvalidCatalog(format!(
+                "{logical}: shard at position {} has shard_idx={shard_idx} (expected {})",
+                self.seen, self.seen
+            ))
+            .into());
+        }
+        if row_start != self.next_row_start {
+            return Err(scx_format_io::ScxError::InvalidCatalog(format!(
+                "{logical}: shard {shard_idx} has row_start={row_start} (expected {})",
+                self.next_row_start
+            ))
+            .into());
+        }
+        if n_rows_total < self.prev_n_rows_total {
+            return Err(scx_format_io::ScxError::InvalidCatalog(format!(
+                "{logical}: shard {shard_idx} has n_rows_total={n_rows_total} which contracts \
+                 the prior shard's stamp of {} — append-grown metadata must stamp \
+                 monotonically non-decreasing totals",
+                self.prev_n_rows_total
+            ))
+            .into());
+        }
+        self.seen += 1;
+        self.next_row_start = self.next_row_start.saturating_add(n_shard_rows);
+        self.prev_n_rows_total = n_rows_total;
+        Ok(())
+    }
+
+    /// Final cover must equal the last shard's stamped total **and** the axis
+    /// length the file header declares. The stamps agreeing among themselves
+    /// only proves they are self-consistent; `expected` is what ties them to the
+    /// rest of the file, and without it a sharded axis tiling a different range
+    /// than `n_obs` / `n_vars` passes. A no-op when the axis had no shards (the
+    /// caller is on the legacy single-section path).
+    pub(crate) fn finish(
+        &self,
+        logical: &str,
+        expected: u64,
+    ) -> std::result::Result<(), scx_engine::EngineError> {
+        if self.seen == 0 {
+            return Ok(());
+        }
+        if self.next_row_start != self.prev_n_rows_total {
+            return Err(scx_format_io::ScxError::InvalidCatalog(format!(
+                "{logical}: shards cover {} rows but the last shard's n_rows_total is {}",
+                self.next_row_start, self.prev_n_rows_total
+            ))
+            .into());
+        }
+        if self.next_row_start != expected {
+            return Err(scx_format_io::ScxError::InvalidCatalog(format!(
+                "{logical}: shards cover {} rows but the file header declares {expected}",
+                self.next_row_start
+            ))
+            .into());
+        }
+        Ok(())
+    }
+}
+
 fn filtered_obs_shards<'a>(
     reader: &'a ScxReader,
     keep_mask: Option<&'a [bool]>,
@@ -869,18 +992,36 @@ fn filtered_obs_shards<'a>(
 > + 'a {
     let mut input_cursor = 0usize; // global input obs row
     let mut filtered_offset = 0u64; // cumulative kept rows so far
+    let mut cover = ShardCoverCheck::default();
+    let n_shards = reader.obs_metadata_shard_count();
+    let n_obs = reader.header().n_obs;
     reader.obs_shards().map(move |res| {
         let batch = res?;
+        cover.visit("obs_metadata", &batch)?;
+        if cover.seen as usize == n_shards {
+            cover.finish("obs_metadata", n_obs)?;
+        }
         let n = batch.num_rows();
         let filtered = match keep_mask {
             None => batch,
             Some(mask) => {
                 // Slice the keep-mask for this shard's row range in one shot
-                // (avoids per-element bounds checks on wide obs shards). Panics
-                // on a malformed file whose shards sum past `n_obs`; the
-                // `build_keep_mask(n_obs, ...)` invariant rules that out.
-                let bool_array =
-                    arrow::array::BooleanArray::from(mask[input_cursor..input_cursor + n].to_vec());
+                // (avoids per-element bounds checks on wide obs shards). The
+                // range is checked rather than assumed: `build_keep_mask(n_obs,
+                // ...)` sizes the mask against the header, so a file whose
+                // shards sum past `n_obs` would otherwise panic here on a slice
+                // out of range — and this iterator runs over files the op did
+                // not write.
+                let end = input_cursor + n;
+                if end > mask.len() {
+                    return Err(scx_format_io::ScxError::InvalidCatalog(format!(
+                        "obs_metadata: shards cover at least {end} rows but the file's \
+                         n_obs is {} — the obs shards overrun the header",
+                        mask.len()
+                    ))
+                    .into());
+                }
+                let bool_array = arrow::array::BooleanArray::from(mask[input_cursor..end].to_vec());
                 compute::filter_record_batch(&batch, &bool_array)?
             }
         };
@@ -898,8 +1039,15 @@ fn filtered_obs_shards<'a>(
 /// shard's `n_rows_total`). When every row is deleted, a single empty obs
 /// section keeps the file well-formed.
 ///
-/// `pub(crate)` so `scx optimize` can reuse it (with `keep_mask = None`) to
-/// preserve a sharded obs layout instead of collapsing it via `read_obs()`.
+/// **`keep_mask = None` is only valid for a rewrite that preserves the obs row
+/// space 1:1.** An op that drops or reorders rows must pass its mask, or the
+/// shard `row_start`s it writes will not describe the rows it wrote.
+///
+/// Deliberately `pub(crate)`: neither `keep_mask` nor `total_kept` is checkable
+/// from in here against what the caller meant, and `total_kept` is stamped into
+/// every output shard. Rewrites outside this crate go through
+/// [`crate::rewrite_helpers::copy_obs_var_preserving_layout`], which takes
+/// neither and derives them from the reader.
 pub(crate) fn write_obs_shards_streaming(
     reader: &ScxReader,
     writer: &mut ScxWriter,
@@ -907,6 +1055,17 @@ pub(crate) fn write_obs_shards_streaming(
     total_kept: usize,
 ) -> Result<()> {
     if total_kept == 0 {
+        // Every row deleted. The output is one empty legacy section, but the
+        // *input* still has to be well-formed: this path used to return before
+        // touching the validating iterator, so a compact that deleted everything
+        // was the one way to launder a malformed sharded axis through without
+        // anyone looking at it. Walk it first, discarding the batches.
+        let mut cover = ShardCoverCheck::default();
+        for res in reader.obs_shards() {
+            cover.visit("obs_metadata", &res?)?;
+        }
+        cover.finish("obs_metadata", reader.header().n_obs)?;
+
         // Footer-only schema read (no batch decode); see streaming branch in
         // `compact_with_index_options`.
         let schema = std::sync::Arc::new(reader.read_obs_schema_physical()?);

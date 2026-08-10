@@ -159,6 +159,151 @@ pub(crate) fn build_raw_copied_csr_section(
     Ok((section_data, stats))
 }
 
+/// Copy obs and var through a rewrite that preserves **both axes 1:1**,
+/// keeping a row-sharded layout sharded.
+///
+/// This is the safe front door to `compact::write_obs_shards_streaming` /
+/// `optimize::write_var_shards_streaming`, and the reason they are not exported
+/// directly. The obs helper takes a `keep_mask` and a `total_kept`, and neither
+/// is checkable from inside it: a mask shorter than the shards it is applied to
+/// panics on the slice in `filtered_obs_shards`, and a wrong `total_kept` is
+/// stamped into every output shard, producing a file whose own `n_rows_total`
+/// disagrees with its cover. Both are fine for the in-crate callers that derive
+/// them from `build_keep_mask(n_obs, …)`; neither is something a downstream
+/// caller should have to know. So the filtering primitive stays crate-private
+/// and this — the only case a rewrite outside `scx-ops` needs — takes no
+/// arguments beyond the two files and derives the totals from the reader.
+///
+/// The alternative each caller reaches for otherwise is `read_obs()` +
+/// `write_obs()`, which assembles the whole axis into one in-memory batch and
+/// emits a single legacy section: peak RSS O(n_obs) — the OOM the sharded
+/// layout exists to prevent — plus the silent loss of the row-sharded-obs
+/// precondition Level-2 row-set pushdown depends on. `build_csc` and
+/// `scx upgrade` had both written that by hand; this is the shared version.
+///
+/// A legacy single-section input has no per-shard reader and falls through to
+/// the materialising path, which is what it already was.
+pub fn copy_obs_var_preserving_layout(
+    reader: &ScxReader,
+    writer: &mut ScxWriter,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (n_obs, n_vars) = (reader.header().n_obs, reader.header().n_vars);
+    if reader.obs_metadata_shard_count() > 0 {
+        crate::compact::write_obs_shards_streaming(reader, writer, None, n_obs as usize)?;
+    } else {
+        writer.write_obs(&reader.read_obs()?)?;
+    }
+    if reader.var_metadata_shard_count() > 0 {
+        crate::optimize::write_var_shards_streaming(reader, writer, n_vars)?;
+    } else {
+        writer.write_var(&reader.read_var()?)?;
+    }
+    Ok(())
+}
+
+/// The value encoding to re-emit canonicalized values under, given the one the
+/// source shard used.
+///
+/// Canonicalization **sums duplicate coordinates**, so it can produce a value
+/// larger than any the source held — and the source's encoding was chosen to fit
+/// the source's values. Re-encoding through it has two failure modes, and the
+/// quiet one is the dangerous one: `Uint8` refuses `200 + 200 = 400` outright, so
+/// the upgrade fails on exactly the non-canonical input it exists to repair,
+/// while `Float16` is unchecked — `f16::from_f32` maps anything past 65504 to
+/// **infinity** and the op reports success.
+///
+/// So widen to the narrowest encoding that actually holds the result. Integers
+/// stay integers (canonicalizing sums counts; it never makes them fractional)
+/// and floats stay floats. Returns the source encoding unchanged whenever it
+/// still fits, which is the overwhelmingly common case — this only widens for a
+/// shard canonicalization actually rewrote.
+pub fn encoding_for_canonicalized(source: ValueEncoding, data: &[f32]) -> ValueEncoding {
+    let max = data.iter().copied().fold(0.0f32, f32::max);
+    match source {
+        // f16's finite ceiling. Past it `from_f32` yields inf, silently.
+        ValueEncoding::Float16 if max > 65504.0 => ValueEncoding::Float32,
+        ValueEncoding::Uint8 if max > 255.0 => {
+            encoding_for_canonicalized(ValueEncoding::Uint16, data)
+        }
+        ValueEncoding::Uint16 if max > 65535.0 => ValueEncoding::Uint32,
+        // Uint32 saturates the integer ladder; a sum past u32::MAX would need
+        // f32 and is not reachable from counts that fit u32 in a real matrix.
+        other => other,
+    }
+}
+
+/// Section families this file's copy helpers do **not** carry, checked against
+/// the input so the loss can be reported rather than discovered later.
+///
+/// The list mirrors what `copy_auxiliary_sections` actually copies; keep the
+/// two in step. Bitmaps and `.raw` are recoverable by re-running the op that
+/// built them, but `varm` / `obsp` / `varp` are user data with no rebuild path.
+const DROPPED_SECTION_FAMILIES: &[(SectionType, &str)] = &[
+    (
+        SectionType::BitmapShard,
+        "detection bitmaps (rebuild: --bitmap)",
+    ),
+    (SectionType::VarmEmbedding, "varm"),
+    (SectionType::VarmEmbeddingShard, "varm"),
+    (SectionType::ObspCsrShard, "obsp"),
+    (SectionType::ObspEmbedding, "obsp"),
+    (SectionType::ObspEmbeddingShard, "obsp"),
+    (SectionType::VarpEmbedding, "varp"),
+    (SectionType::VarpEmbeddingShard, "varp"),
+    (SectionType::RawCsrShard, "adata.raw"),
+    (SectionType::RawVarMetadata, "adata.raw"),
+    (SectionType::GroupIndex, "grouped-sort group index"),
+    (
+        SectionType::LayerCscShard,
+        "layer CSC sidecars (rebuild: scx build-csc)",
+    ),
+];
+
+/// Warn, once per family, about input sections this rewrite is about to drop.
+///
+/// `copy_auxiliary_sections` is an allowlist, so anything it does not name is
+/// dropped — silently, until now. Both its callers rename a wholly new file
+/// over the target with no prior catalog, so `scx rollback` cannot recover
+/// what goes missing; a user who is not told loses `varm` / `obsp` / `varp`
+/// with no way back and no record that it happened.
+fn warn_dropped_sections(reader: &ScxReader, action: &str) {
+    let dropped = dropped_section_labels(reader);
+    if !dropped.is_empty() {
+        // No rollback clause: this helper does not know whether the caller is
+        // writing to a separate output (where the input is untouched) or
+        // renaming over it. Stating the loss and the remedy is true of both;
+        // claiming irreversibility on the copy-out form would be the same wrong
+        // rationale for a right warning that `run_upgrade`'s decline message
+        // had. The in-place hazard is documented in docs/operations.md.
+        log::warn!(
+            "scx {action}: the output will not carry {} — this rewrite copies only \
+             layers, obsm, uns, predicate indexes and deletion vectors. Copy them \
+             across from the input if you need them, or use `scx optimize`, which \
+             carries obsm / varm / obsp / varp.",
+            dropped.join(", ")
+        );
+    }
+}
+
+/// The distinct family labels this rewrite would drop from `reader`, in
+/// [`DROPPED_SECTION_FAMILIES`] order. Split out from [`warn_dropped_sections`]
+/// so the set can be asserted directly — a warning is only worth documenting if
+/// it names the right things.
+pub(crate) fn dropped_section_labels(reader: &ScxReader) -> Vec<&'static str> {
+    let mut seen: Vec<&'static str> = Vec::new();
+    for entry in &reader.catalog().entries {
+        if let Some((_, label)) = DROPPED_SECTION_FAMILIES
+            .iter()
+            .find(|(ty, _)| *ty == entry.section_type)
+        {
+            if !seen.contains(label) {
+                seen.push(label);
+            }
+        }
+    }
+    seen
+}
+
 /// Copy all auxiliary sections (layers, obsm, uns, predicate indices, deletion
 /// vectors) from reader to writer, then append a new provenance entry.
 ///
@@ -172,14 +317,49 @@ pub(crate) fn build_raw_copied_csr_section(
 /// detection bitmaps, `varm`/`obsp`/`varp`, `adata.raw`, and the grouped-sort
 /// group index. The list is an allowlist, so a section type added to the format
 /// is dropped here silently until someone adds it — that is the shape of the
-/// bug this carry was written to fix.
+/// bug this carry was written to fix. A drop is unrecoverable on the in-place
+/// form of either caller (a rename over the target, carrying no prior catalog),
+/// so [`warn_dropped_sections`] reports it rather than leaving the user to
+/// discover it: see [`DROPPED_SECTION_FAMILIES`], which must be kept in step
+/// with what is actually copied below.
+///
+/// Layers are re-emitted as they are. For the canonicalizing variant — which
+/// `scx upgrade` needs and `build_csc` must not have — see
+/// [`copy_auxiliary_sections_canonicalizing`].
 pub fn copy_auxiliary_sections(
     reader: &ScxReader,
     writer: &mut ScxWriter,
     action: &str,
     params_json: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    copy_layers(reader, writer)?;
+    copy_auxiliary_sections_canonicalizing(reader, writer, action, params_json, false)
+}
+
+/// [`copy_auxiliary_sections`] with control over layer canonicalization.
+///
+/// `canonicalize` re-sorts, dedup-sums and zero-drops every layer CSR shard
+/// before re-encoding, widening the value encoding if the sums need it
+/// ([`encoding_for_canonicalized`]). The two callers legitimately differ:
+/// `scx upgrade` stamps the output `DEFAULT_WRITE_FORMAT_VERSION`, whose
+/// contract *is* canonical CSR, so it must canonicalize what it re-emits;
+/// `build_csc` deliberately clamps its output version to the source's
+/// (SCX-005) precisely so it does **not** have to, and passing `true` there
+/// would change the nnz of a file it promises to re-emit unchanged.
+///
+/// Split out rather than added as a fifth parameter to the existing function:
+/// `canonicalize` is wanted by exactly one of the two callers, and widening a
+/// published signature to say so would source-break every downstream caller for
+/// a choice none of them are making. `false` is what the four-argument form has
+/// always done.
+pub fn copy_auxiliary_sections_canonicalizing(
+    reader: &ScxReader,
+    writer: &mut ScxWriter,
+    action: &str,
+    params_json: &str,
+    canonicalize: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    warn_dropped_sections(reader, action);
+    copy_layers(reader, writer, canonicalize)?;
     copy_obsm(reader, writer)?;
     copy_uns(reader, writer)?;
     copy_predicate_indices(reader, writer)?;
@@ -207,9 +387,14 @@ fn copy_deletion_vectors(
 }
 
 /// Copy all layer CSR shards from reader to writer, preserving per-shard codec.
+///
+/// `canonicalize` sorts each row's column indices, sums duplicate coordinates
+/// and drops explicit zeros before re-encoding — the v3 canonical-CSR contract.
+/// See [`copy_auxiliary_sections`] for why it is the caller's choice.
 fn copy_layers(
     reader: &ScxReader,
     writer: &mut ScxWriter,
+    canonicalize: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let layer_names = reader.layer_names();
     for layer_name in &layer_names {
@@ -233,10 +418,18 @@ fn copy_layers(
             let ci =
                 CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
 
-            let (indptr, indices, data) = reader.read_shard_from_entry(entry)?;
+            let (indptr, indices, mut data) = reader.read_shard_from_entry(entry)?;
             let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
-            let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
-            let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+            let mut indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
+            let mut indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+            // Canonicalizing sums duplicates, which can exceed what the source
+            // encoding holds — see `encoding_for_canonicalized`.
+            let ve = if canonicalize {
+                scx_sparse::canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut data);
+                encoding_for_canonicalized(ve, &data)
+            } else {
+                ve
+            };
             let mut raw_values = Vec::new();
             for &v in &data {
                 ve.encode_f32(&mut raw_values, v)?;
@@ -376,5 +569,71 @@ mod tests {
             raw_copy_csr_eligible(&v2, 0, 10, ResolvedCodec::AUTO, true),
             "framed v2 shard must be raw-copy eligible into framed output"
         );
+    }
+
+    /// `copy_auxiliary_sections` is an allowlist, so what it does not name is
+    /// dropped — and both its callers rename over the target with no prior
+    /// catalog, so the drop cannot be rolled back. The warning is the only
+    /// notice a user gets, which makes "does it name the right families?" worth
+    /// asserting rather than assuming: a stale [`DROPPED_SECTION_FAMILIES`]
+    /// produces a *confidently wrong* warning, which is worse than none.
+    #[test]
+    fn dropped_families_are_detected_on_a_file_that_has_them() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use arrow::array::{Float32Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with_varm.scx");
+        let (n_obs, n_vars) = (4usize, 3usize);
+        let mut w = ScxWriter::new(&path, sample_header(n_obs as u64, n_vars as u64)).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        let varm = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "pc1",
+                DataType::Float32,
+                false,
+            )])),
+            vec![Arc::new(Float32Array::from(vec![0.1f32, 0.2, 0.3]))],
+        )
+        .unwrap();
+        w.write_varm("loadings", &varm).unwrap();
+        w.write_csr_shard(
+            &vec![0u64; n_obs + 1],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let reader = ScxReader::open(&path).unwrap();
+        assert_eq!(
+            dropped_section_labels(&reader),
+            vec!["varm"],
+            "a file carrying varm must be reported as losing varm, and nothing else"
+        );
+
+        // And a file with none of them must warn about nothing — otherwise the
+        // warning fires on every ordinary upgrade and stops being read.
+        let plain = dir.path().join("plain.scx");
+        let mut w = ScxWriter::new(&plain, sample_header(n_obs as u64, n_vars as u64)).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        w.write_csr_shard(
+            &vec![0u64; n_obs + 1],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+        assert!(dropped_section_labels(&ScxReader::open(&plain).unwrap()).is_empty());
     }
 }

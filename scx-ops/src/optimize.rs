@@ -390,8 +390,13 @@ pub fn optimize_with_framing(
 /// per non-empty input shard. Peak memory is one shard — `read_var()` (which
 /// assembles every `VarMetadataShard` into one batch) is never called. Mirror of
 /// compact's [`write_obs_shards_streaming`](crate::compact::write_obs_shards_streaming)
-/// for the var axis; optimize applies no deletions, so (unlike the obs helper)
-/// it takes no `keep_mask` and renumbers output shards over the non-empty inputs.
+/// for the var axis; no op deletes columns, so (unlike the obs helper) it takes
+/// no `keep_mask` and renumbers output shards over the non-empty inputs.
+///
+/// `pub(crate)` like its obs twin, and reached from outside the crate through
+/// [`crate::rewrite_helpers::copy_obs_var_preserving_layout`] — `n_vars_total`
+/// is stamped into every output shard, so a caller that passes the wrong one
+/// writes a file whose var cover disagrees with its own stamp.
 pub(crate) fn write_var_shards_streaming(
     reader: &ScxReader,
     writer: &mut ScxWriter,
@@ -399,8 +404,16 @@ pub(crate) fn write_var_shards_streaming(
 ) -> Result<()> {
     let mut out_idx = 0u32;
     let mut row_start = 0u64;
+    let mut cover = crate::compact::ShardCoverCheck::default();
+    let n_shards = reader.var_metadata_shard_count();
     for res in reader.var_shards() {
         let batch = res?;
+        // Same cover validation `read_var()` performs while assembling, which
+        // the streaming path would otherwise trade away — see `ShardCoverCheck`.
+        cover.visit("var_metadata", &batch)?;
+        if cover.seen as usize == n_shards {
+            cover.finish("var_metadata", n_vars_total)?;
+        }
         let n = batch.num_rows() as u64;
         if n == 0 {
             continue;

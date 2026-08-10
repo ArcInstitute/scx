@@ -969,7 +969,12 @@ enum Commands {
         #[arg(long, value_name = "N")]
         index_auto_threshold: Option<usize>,
     },
-    /// Upgrade an SCX file to the latest format version
+    /// Upgrade an SCX file to the latest unframed format version (v3)
+    ///
+    /// Does not add row-group framing, so it does not reach v4 — use
+    /// `scx optimize --row-group-rows N` for that. A file already at v3, or
+    /// already at v4, is left untouched: re-emitting a v4 file here would strip
+    /// its framing, and `--in-place` is not rollback-able.
     Upgrade {
         /// Input SCX file
         input: PathBuf,
