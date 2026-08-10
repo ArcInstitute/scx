@@ -185,8 +185,9 @@ def _unsorted_copy(adata):
     return out
 
 
+@pytest.mark.parametrize("method", ["covariance", "randomized"])
 @pytest.mark.parametrize("masked", [False, True])
-def test_an_unsorted_csr_gives_the_same_answer(masked):
+def test_an_unsorted_csr_gives_the_same_answer(masked, method):
     """Unsorted input must not change the result.
 
     `owned_csr` calls `scipy.sparse.csr_matrix(x)`, which is a no-op *view* when
@@ -211,10 +212,10 @@ def test_an_unsorted_csr_gives_the_same_answer(masked):
     kwargs = {"mask_var": mask} if masked else {}
 
     a = adata.copy()
-    pyscx.accel.pca(a, n_comps=5, method="covariance", device="cpu", **kwargs)
+    pyscx.accel.pca(a, n_comps=5, method=method, device="cpu", **kwargs)
 
     b = _unsorted_copy(adata)
-    pyscx.accel.pca(b, n_comps=5, method="covariance", device="cpu", **kwargs)
+    pyscx.accel.pca(b, n_comps=5, method=method, device="cpu", **kwargs)
 
     np.testing.assert_array_equal(
         np.asarray(a.obsm["X_pca"]),
@@ -243,21 +244,22 @@ X = sp.csr_matrix((offsets[None, :] + noise).astype(np.float32))
 X.sort_indices()
 a = anndata.AnnData(X=X, obs=pd.DataFrame(index=[f"c{i}" for i in range(n_obs)]),
                     var=pd.DataFrame(index=[f"g{i}" for i in range(n_vars)]))
-pyscx.accel.pca(a, n_comps=10, method="covariance", device="cpu")
+pyscx.accel.pca(a, n_comps=10, method=sys.argv[4], device="cpu")
 np.save(sys.argv[3], np.asarray(a.obsm["X_pca"]))
 """
 
 
-def _pca_under(threads, mode, out):
+def _pca_under(threads, mode, out, method):
     subprocess.run(
-        [sys.executable, "-c", _SUBPROCESS, str(threads), mode, out],
+        [sys.executable, "-c", _SUBPROCESS, str(threads), mode, out, method],
         check=True,
         capture_output=True,
     )
     return np.load(out)
 
 
-def test_pinned_linalg_makes_pca_identical_across_thread_counts():
+@pytest.mark.parametrize("method", ["covariance", "randomized"])
+def test_pinned_linalg_makes_pca_identical_across_thread_counts(method):
     """`SCX_ACCEL_DETERMINISTIC_LINALG=1` is what buys cross-configuration identity.
 
     Subprocesses because `RAYON_NUM_THREADS` is read when the pool is first
@@ -272,8 +274,8 @@ def test_pinned_linalg_makes_pca_identical_across_thread_counts():
     directly rather than inferred from a pool width.
     """
     with tempfile.TemporaryDirectory() as d:
-        one = _pca_under(1, "pinned", os.path.join(d, "one.npy"))
-        many = _pca_under(8, "pinned", os.path.join(d, "many.npy"))
+        one = _pca_under(1, "pinned", os.path.join(d, "one.npy"), method)
+        many = _pca_under(8, "pinned", os.path.join(d, "many.npy"), method)
     assert np.array_equal(one, many), (
         "with SCX_ACCEL_DETERMINISTIC_LINALG=1, PCA must not depend on "
         f"RAYON_NUM_THREADS — max |delta| {np.max(np.abs(one - many))}"

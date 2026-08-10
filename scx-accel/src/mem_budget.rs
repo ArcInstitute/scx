@@ -50,12 +50,14 @@ fn parse_accel_num_threads(raw: Option<String>) -> Option<usize> {
 /// `None` — in which case callers keep their own default, so an unset knob
 /// preserves today's behaviour exactly. Cached on first read.
 ///
-/// This is a shared *policy* knob, not one literal pool object: it caps the two
-/// private rayon pools the accelerators build — Harmony's integration pool and
-/// the PCA covariance-accumulator pool. The PCA pool's memory-derived worker
-/// cap still applies; this only lowers it further (a single shared pool could
-/// not also honour that per-accumulator RAM bound). Ambient global-pool sizing
-/// for the many `rayon::current_num_threads()` callers stays controlled by
+/// This is a shared *policy* knob, not one literal pool object. It caps Harmony's
+/// private integration pool, and — since PCA's reductions started partitioning
+/// their output — the number of column blocks those reductions split into
+/// (`scx_accel::pca::colblocks::block_count`) plus PCA's decode-prefetch depth.
+/// PCA no longer builds a private pool or a per-accumulator RAM cap: there is
+/// one shared accumulator, so on that op this knob bounds speed and memory only
+/// and provably cannot change the numbers. Ambient global-pool sizing for the
+/// many `rayon::current_num_threads()` callers stays controlled by
 /// `RAYON_NUM_THREADS`.
 pub fn accel_num_threads() -> Option<usize> {
     static N: OnceLock<Option<usize>> = OnceLock::new();

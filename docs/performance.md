@@ -832,7 +832,7 @@ is lower allocation counts and one shared thread-control knob, with no regressio
   `accumulate_covariance_streaming` pool and the in-memory
   `sparse_outer_product_accumulate_par` fold-segment count), whose memory-derived worker
   cap still applies — the env only lowers it further. Unset (the default) → behaviour is
-  identical to before. *(Both named PCA functions were removed in v0.13 along with the
+  identical to before. *(Both named PCA functions are internal, and were removed after v0.13.0 along with the
   private pool and the memory-derived cap; the knob now bounds how many column blocks the
   PCA reductions split their output into. Still speed-and-memory only — more so than
   before, since the block count provably cannot change the numbers.)* It does **not** resize the ambient global rayon pool the many
@@ -1065,7 +1065,7 @@ decode spawns queue behind it. Entering a parallel region *from inside* `consume
 opposite, and is safe: outstanding decode tasks never exceed `depth` and the channel
 capacity **is** `depth`, so a decode worker always completes its `tx.send` rather than
 parking, and PCA's private covariance pool is a disjoint set of OS threads from the global
-pool the decodes run on. *(v0.13 removed that private pool: with one shared accumulator
+pool the decodes run on. *(Removed after v0.13.0: with one shared accumulator
 there is nothing left to bound, and the covariance build now enters the global pool from
 inside `consume` exactly as the embeddings pass already did.)* Streaming CPU PCA is only ever entered from `py.detach` on the
 calling Python thread, never from a worker.

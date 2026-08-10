@@ -952,6 +952,16 @@ pub fn pca(
         // buffers via PyReadonlyArray1 instead of copying them into owned
         // `Vec`s (halves the host RSS spike during dispatch). Falls back to
         // the owned-Vec path if scipy cannot produce a CSR view.
+        //
+        // Sort first, for the same reason the CPU in-memory arm below does:
+        // both of the arms that follow wrap their source in a
+        // `ProjectedShardSource` under `mask_var=`, and `project_csr`'s merge
+        // scan walks a monotonic pointer that silently selects the wrong
+        // columns from an unsorted row in a release build. `x_sorted` must
+        // outlive the borrowed slices below, so it is bound here rather than
+        // inside the `if let`.
+        let (x_sorted, _) = crate::convert::ensure_csr(py, &x, false)?;
+        let x = x_sorted;
         if let Some((slices, shape)) = try_extract_borrowed_csr(py, &x)? {
             let source = BorrowedCsrSource {
                 indptr: slices.indptr(),

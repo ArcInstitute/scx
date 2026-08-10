@@ -137,6 +137,20 @@ fn mat_to_row_major_buf(mat: &Mat<f64>) -> Vec<f64> {
 /// Makes no assumption about index order within a row, which is what lets it be
 /// both the bit-exact oracle for [`accumulate_covariance_into`] and its fallback
 /// on a non-canonical CSR.
+///
+/// # Duplicate coordinates
+///
+/// A row may legally list the same column twice (scipy's `has_canonical_format
+/// == False`), in which case the cell's value is the *sum* of the entries. The
+/// pair loop handles that without materialising the sum: for `c1 == c2` the
+/// coalesced diagonal is `(v1 + v2)² = v1² + v2² + 2·v1·v2`, so the cross term
+/// counts twice — once for each ordering — where a genuine off-diagonal pair
+/// counts once. Off-diagonal entries need no special case: every duplicate
+/// contributes its own product, and those already sum to the coalesced value.
+///
+/// Missing that doubling is a wrong *answer*, not a rounding difference: a row
+/// holding column 0 twice with values 1 and 2 must give `(XᵀX)[0,0] = 9`, and
+/// counting the cross term once gives 7.
 fn accumulate_covariance_serial(
     csr: &ScxCsr,
     cov: &mut [f64],
@@ -157,6 +171,11 @@ fn accumulate_covariance_serial(
                 let c2 = csr.indices[j] as usize;
                 let v2 = csr.data[j] as f64;
                 let prod = v1 * v2;
+                if c1 == c2 {
+                    // Duplicate coordinate: both orderings land on the diagonal.
+                    cov[c1 * n_vars + c1] += prod + prod;
+                    continue;
+                }
                 // Write the lower-triangle entry only (row >= col).
                 let (lo, hi) = if c1 < c2 { (c1, c2) } else { (c2, c1) };
                 cov[lo * n_vars + hi] += prod;
@@ -339,11 +358,20 @@ fn parse_deterministic_linalg(raw: Option<String>) -> bool {
 /// # Why it is set once and never restored
 ///
 /// faer's parallelism lives in a process-wide `AtomicUsize`, so setting it around
-/// each call and restoring it afterwards would race every other faer user in the
-/// process (kNN's exact-gemm path, Harmony, the distance kernels). Reading the
-/// knob once and applying it once is the only form of this that is not a data
-/// race — and it means the setting is process-wide, not PCA-scoped. That is
-/// deliberate: a caller who wants reproducible PCA wants reproducible kNN too.
+/// each call and restoring it afterwards would race any other faer user in the
+/// process. Reading the knob once and applying it once is the only form of this
+/// that is not a data race.
+///
+/// # What it does and does not reach
+///
+/// It is initialised from the five CPU PCA / PFlog entry points, and the
+/// guarantee is scoped to those. Writing the global does not make every faer
+/// user sequential: `scx-accel`'s other faer call sites — the exact-kNN gemm
+/// (`neighbors/cpu.rs`) and the eval-metrics distance gemm
+/// (`eval_metrics/distances.rs`) — pass an **explicit** `Par::rayon(0)` and
+/// therefore ignore the global entirely. Harmony does not go through faer's
+/// global either; it builds its own rayon pool. So this knob is a CPU PCA/PFlog
+/// contract, not an accelerator-wide one, and the docs say so.
 fn pin_linalg_if_requested() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -1634,24 +1662,20 @@ pub fn covariance_pca_inmemory(
         mc
     });
 
-    for r in 0..n_obs {
-        let start = csr.indptr[r] as usize;
-        let end = csr.indptr[r + 1] as usize;
-        let e_offset = r * n_components;
-        for idx in start..end {
-            let c = csr.indices[idx] as usize;
-            let val = csr.data[idx] as f64;
-            let v_offset = c * n_components;
-            for pc in 0..n_components {
-                embeddings[e_offset + pc] += val * v_rm[v_offset + pc];
-            }
-        }
-        if let Some(ref mc) = mean_correction {
-            for pc in 0..n_components {
-                embeddings[e_offset + pc] -= mc[pc];
-            }
-        }
-    }
+    // Same `Y = (X - μ) @ M` the streaming route runs, through the same kernel
+    // rather than a hand-inlined copy of it — output rows are disjoint and each
+    // row's nonzeros are still consumed in index order, so this is bit-identical
+    // to the loop it replaces (`covariance_embeddings_kernel_matches_the_inlined_scatter_bitwise`
+    // is that oracle). The difference is that `spmm_forward_into` parallelises
+    // across rows above its work threshold, where this pass was single-threaded.
+    spmm_forward_into(
+        csr,
+        &v_rm,
+        n_components,
+        &mut embeddings,
+        0,
+        mean_correction.as_deref(),
+    );
 
     Ok(PcaResult {
         embeddings,
@@ -2774,6 +2798,69 @@ mod tests {
         assert_bits_eq(&got_sums, &want_sums, "unsorted col_sums");
     }
 
+    /// A duplicate coordinate is a *value* question, not an ordering one, so it
+    /// needs a value oracle: densify the row with duplicates summed — scipy's
+    /// own semantics — and compare `XᵀX` against that.
+    ///
+    /// The predicate test elsewhere only asserts duplicates are *rejected* by
+    /// `rows_strictly_increasing`, which says nothing about what the fallback
+    /// they are routed to then computes. Before the `c1 == c2` doubling this
+    /// returned 7 where the answer is 9.
+    #[test]
+    fn duplicate_coordinates_accumulate_to_their_coalesced_value() {
+        let n_vars = 3usize;
+        // Row 0: column 0 twice (1 + 2 = 3) and column 2 once.
+        // Row 1: column 1 three times (0.5 + 0.25 + 1.25 = 2.0).
+        let csr = ScxCsr::new_unchecked(
+            (2, n_vars),
+            vec![0, 3, 6],
+            vec![0, 0, 2, 1, 1, 1],
+            vec![1.0, 2.0, 4.0, 0.5, 0.25, 1.25],
+        );
+        assert!(
+            !colblocks::rows_strictly_increasing(&csr),
+            "premise: the fixture must carry duplicate coordinates"
+        );
+
+        // Oracle: coalesce to dense, then a plain Xᵀ X.
+        let mut dense = vec![0.0f64; 2 * n_vars];
+        for r in 0..2 {
+            let (s, e) = (csr.indptr[r] as usize, csr.indptr[r + 1] as usize);
+            for idx in s..e {
+                dense[r * n_vars + csr.indices[idx] as usize] += csr.data[idx] as f64;
+            }
+        }
+        let mut want = vec![0.0f64; n_vars * n_vars];
+        let mut want_sums = vec![0.0f64; n_vars];
+        for r in 0..2 {
+            for c in 0..n_vars {
+                want_sums[c] += dense[r * n_vars + c];
+            }
+            for lo in 0..n_vars {
+                for hi in lo..n_vars {
+                    want[lo * n_vars + hi] += dense[r * n_vars + lo] * dense[r * n_vars + hi];
+                }
+            }
+        }
+
+        let mut got = vec![0.0f64; n_vars * n_vars];
+        let mut got_sums = vec![0.0f64; n_vars];
+        accumulate_covariance_into(&csr, &mut got, &mut got_sums, n_vars);
+
+        for lo in 0..n_vars {
+            for hi in lo..n_vars {
+                let (g, w) = (got[lo * n_vars + hi], want[lo * n_vars + hi]);
+                assert!(
+                    (g - w).abs() <= 1e-12 * w.abs().max(1.0),
+                    "cov[{hi},{lo}]: got {g}, coalesced oracle says {w}"
+                );
+            }
+        }
+        for c in 0..n_vars {
+            assert!((got_sums[c] - want_sums[c]).abs() <= 1e-12);
+        }
+    }
+
     /// Run `f` inside a private rayon pool of exactly `threads` threads.
     fn in_pool<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
         rayon::ThreadPoolBuilder::new()
@@ -2799,7 +2886,8 @@ mod tests {
     /// that isolates *our* reduction, which is what this test is about. The
     /// whole-op claim across thread counts needs
     /// `SCX_ACCEL_DETERMINISTIC_LINALG=1` and lives in
-    /// `tests/pca_determinism.rs`; without it the guarantee is per-thread-count,
+    /// `tests/pca_linalg_parallelism.rs`; without it the guarantee is
+    /// per-thread-count,
     /// which is `covariance_pca_is_bit_identical_run_to_run` below.
     #[test]
     fn covariance_reduction_is_bit_identical_across_thread_counts() {

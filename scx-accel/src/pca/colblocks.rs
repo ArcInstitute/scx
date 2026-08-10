@@ -44,10 +44,13 @@ pub(crate) fn plan_blocks(weights: &[u64], n_blocks: usize) -> Vec<Range<usize>>
     let total: u128 = weights.iter().map(|&w| u128::from(w)).sum();
     if total == 0 {
         // Nothing to balance: even column counts.
+        // u128 for the same reason the weighted split below uses it: `n * b`
+        // is the one place here that could overflow `usize`.
         return (0..n_blocks)
             .map(|b| {
-                let lo = n * b / n_blocks;
-                let hi = n * (b + 1) / n_blocks;
+                let (n, nb) = (n as u128, n_blocks as u128);
+                let lo = (n * b as u128 / nb) as usize;
+                let hi = (n * (b as u128 + 1) / nb) as usize;
                 lo..hi
             })
             .collect();
