@@ -10,7 +10,8 @@
 //!
 //! As with the CellBender importer, the real risk is the join, not the write:
 //! if the keys don't line up the result is a plausible-looking but empty
-//! column. Hence `--dry-run`, which runs every validation and the join, prints
+//! column. Hence `--dry-run`, which runs the join and every validation that
+//! does not need a non-key obs column decoded (see `attach_external_obs`), prints
 //! the match counts *and* a key diagnosis, and touches nothing.
 
 use std::path::Path;
@@ -198,17 +199,9 @@ pub fn run_obs_import(
         s.n_source_rows_absent,
     );
 
-    if dry_run {
-        // The join succeeded, but "succeeded" is not the same as "is the key
-        // you wanted" — report the alternatives while nothing is committed.
-        if let Ok(diag) = scx_ops::diagnose_obs_key(input, Some(&attach_opts.join_key)) {
-            println!("Key diagnosis: {}", diag.describe());
-        }
-        println!("Dry run: nothing written.");
-        return Ok(());
-    }
-
-    println!("Wrote obs columns {:?}", s.obs_columns_added);
+    // Printed before the dry-run return on purpose: a preview whose whole job
+    // is "should I run this on the atlas" must say which memory path it would
+    // take. (Round-2 finding: Grok, Gemini, codex.)
     println!(
         "Obs rewrite: {} (peak memory {})",
         if s.obs_streamed {
@@ -222,6 +215,17 @@ pub fn run_obs_import(
             "the entire obs table \u{2014} run `scx optimize` to shard it"
         },
     );
+    if dry_run {
+        // The join succeeded, but "succeeded" is not the same as "is the key
+        // you wanted" — report the alternatives while nothing is committed.
+        if let Ok(diag) = scx_ops::diagnose_obs_key(input, Some(&attach_opts.join_key)) {
+            println!("Key diagnosis: {}", diag.describe());
+        }
+        println!("Dry run: nothing written.");
+        return Ok(());
+    }
+
+    println!("Wrote obs columns {:?}", s.obs_columns_added);
     if s.obs_index_dropped {
         println!(
             "Note: the obs predicate index was dropped — this import overwrote a \

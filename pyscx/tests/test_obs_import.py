@@ -683,3 +683,19 @@ def test_obs_streamed_reports_which_rewrite_path_ran(tmp_path):
     # Both end up sharded, which is exactly why the flag is not inferable.
     assert pyscx.open(str(sharded)).obs_metadata_shard_count > 0
     assert pyscx.open(str(single)).obs_metadata_shard_count > 0
+
+
+def test_dry_run_reports_the_obs_rewrite_path(tmp_path):
+    """A preview whose job is "should I run this on the atlas" has to say which
+    memory path it would take — that is the decision it exists to inform."""
+    sharded, bc = _sharded_fixture(tmp_path, n=10, shard_size=4, name="sharded.scx")
+    rows = "\n".join(f"{b},{i / 100:.2f}" for i, b in enumerate(bc))
+    csv = _write(tmp_path, "calls.csv", f"barcode,score\n{rows}\n")
+
+    r = pyscx.obs_import(
+        str(sharded), str(csv), key="obs_names", source_key="barcode", dry_run=True
+    )
+    assert r["dry_run"] is True
+    assert r["obs_streamed"] is True, "dry run must report the path it would take"
+    # And nothing was written.
+    assert "score" not in pyscx.open(str(sharded)).read_obs().columns

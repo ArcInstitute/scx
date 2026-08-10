@@ -397,15 +397,17 @@ pub struct AttachLayerSummary {
 
 /// Attach `data` to the SCX file at `path` as a new layer plus annotations.
 ///
-/// Every validation runs before the first byte is written, so a rejected import
-/// leaves the file byte-identical — including the obs shard cover, which
-/// [`crate::external_obs::read_obs_keys_validated`] checks during the join's
+/// The shape, both joins, and the obs shard cover are checked before the first
+/// byte is written — the last via
+/// [`crate::external_obs::read_obs_keys_validated`], during the join's
 /// projected key read rather than during the write.
 ///
-/// The one thing that can still fail mid-write is an encode error on a layer
-/// shard. That leaves trailing bytes at EOF, but the catalog is only swapped by
-/// `commit_in_place`, so the file still reads as it did and `scx compact`
-/// reclaims the orphans.
+/// Two things can still fail mid-write: an encode error on a layer shard, and
+/// the non-key obs decode described on
+/// [`crate::external_obs::attach_external_obs`]. This op writes `uns` and `var`
+/// before the obs loop, so either leaves more trailing bytes than the obs-only
+/// sibling would. The catalog is only swapped by `commit_in_place`, so the file
+/// still reads as it did and `scx compact` reclaims the orphans.
 pub fn attach_external_layer(
     path: &Path,
     data: &ExternalLayerData,

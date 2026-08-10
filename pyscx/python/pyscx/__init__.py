@@ -872,7 +872,8 @@ def obs_import(path, table, *, key=None, source_key=None, **kwargs):
             zeros.
         on_extra_rows: "warn" (default) skips source rows the target lacks;
             "error" refuses.
-        dry_run: Run every validation and the join, then return the summary
+        dry_run: Run the join and every validation that does not require
+            decoding a non-key obs column, then return the summary
             without writing. Also attaches a `key_diagnosis` to the result.
 
     Returns:

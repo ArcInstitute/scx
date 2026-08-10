@@ -1144,6 +1144,16 @@ pub(crate) fn write_obs_shards_from_whole(
             detail: format!("obs has {n} rows but the header declares n_obs = {n_obs}"),
         });
     }
+    // Both call sites already `.max(1)` the header value, so this is not
+    // reachable today — but the loop below advances its cursor by `take`, so a
+    // zero would hang rather than fail, and hanging is the one outcome a caller
+    // cannot diagnose. Cheap insurance on new `pub(crate)` surface.
+    // (Round-2 finding: Grok, Gemini.)
+    if shard_target_rows == 0 {
+        return Err(OpsError::InvalidInput(
+            "shard_target_rows must be non-zero to write obs shards".into(),
+        ));
+    }
     let mut cursor = 0usize;
     let mut idx = 0u32;
     while cursor < n {
@@ -1380,12 +1390,25 @@ fn build_params_json(
 /// Attach `data` to the SCX file at `path` as obs columns plus optional
 /// `obsm` / `uns`, joined to the target's own obs axis by key.
 ///
-/// Every validation runs before the first byte is written, so a rejected import
-/// leaves the file byte-identical — including the obs shard cover, which
-/// [`read_obs_keys_validated`] checks during the join's projected key read.
-/// That placement is load-bearing rather than incidental: the same check inside
-/// the write loop would sit past the `dry_run` return, so a preview could
-/// report a clean join for a file the real import then refuses.
+/// # What is checked before the first byte is written
+///
+/// The shape, the join, and the obs shard cover — the last via
+/// [`read_obs_keys_validated`], during the join's projected key read. That
+/// placement is load-bearing rather than incidental: the same check inside the
+/// write loop would sit past the `dry_run` return, so a preview could report a
+/// clean join for a file the real import then refuses.
+///
+/// **The preflight reads only the key column(s).** Arrow IPC projection skips
+/// decoding the rest, so a *non-key* obs column that fails to decode, or a
+/// per-shard schema that disagrees with shard 0's, is not seen until the write
+/// pass — where it aborts with obs shards already appended at EOF. The catalog
+/// is only swapped by `commit_in_place`, so the file still reads as it did and
+/// `scx compact` reclaims the orphans; but a `dry_run` cannot promise that case
+/// away. Note such a file is already unreadable through `read_obs()`, whose
+/// `concat_batches` needs one shared schema — this op declines to be the thing
+/// that discovers it. Making the preflight total would mean decoding every
+/// column of every shard twice per import; that trade is deliberately not made
+/// here. (Round-2 finding: codex.)
 ///
 /// `X`, layers, the CSC sidecar, `.raw`, deletion vectors, detection bitmaps
 /// and `var` are never read or rewritten; the whole import is undoable with
