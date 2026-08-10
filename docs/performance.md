@@ -832,7 +832,10 @@ is lower allocation counts and one shared thread-control knob, with no regressio
   `accumulate_covariance_streaming` pool and the in-memory
   `sparse_outer_product_accumulate_par` fold-segment count), whose memory-derived worker
   cap still applies — the env only lowers it further. Unset (the default) → behaviour is
-  identical to before. It does **not** resize the ambient global rayon pool the many
+  identical to before. *(Both named PCA functions were removed in v0.13 along with the
+  private pool and the memory-derived cap; the knob now bounds how many column blocks the
+  PCA reductions split their output into. Still speed-and-memory only — more so than
+  before, since the block count provably cannot change the numbers.)* It does **not** resize the ambient global rayon pool the many
   `current_num_threads()` callers use — that stays governed by `RAYON_NUM_THREADS`.
 
 ### Marshalling & GIL hygiene at the Python boundary (Phase-4 task 4.3)
@@ -1062,7 +1065,9 @@ decode spawns queue behind it. Entering a parallel region *from inside* `consume
 opposite, and is safe: outstanding decode tasks never exceed `depth` and the channel
 capacity **is** `depth`, so a decode worker always completes its `tx.send` rather than
 parking, and PCA's private covariance pool is a disjoint set of OS threads from the global
-pool the decodes run on. Streaming CPU PCA is only ever entered from `py.detach` on the
+pool the decodes run on. *(v0.13 removed that private pool: with one shared accumulator
+there is nothing left to bound, and the covariance build now enters the global pool from
+inside `consume` exactly as the embeddings pass already did.)* Streaming CPU PCA is only ever entered from `py.detach` on the
 calling Python thread, never from a worker.
 
 Six loops now prefetch: the fused column-means pass (`col_means_and_sum_sq_prefetched`,
@@ -1153,16 +1158,19 @@ shard outside the cache, so worst-case live bytes go from `B + s` to
 `depth = 1`, which is what keeps the off arm byte-for-byte the old behaviour. That the
 decode counts did not move is the direct evidence the smaller LRU cost no hit rate.
 
-**Equivalence splits, and the split is a finding.** PCA's parallel reductions fold into
-`ThreadLocal` accumulators whose row→thread assignment is decided by work-stealing and whose
-merge order is `ThreadLocal::iter_mut()`. Five consecutive `method="covariance"` runs on a
-cancelling-pair fixture produce five different results; `method="randomized"` produces one.
-The diff shows both the accumulator declaration and the merge loop unchanged, so this
-predates decode-prefetch. Exact f64 bit patterns are therefore claimed only where they are
-earned — the forward SpMM, the embeddings-kernel swap, `col_means_and_sum_sq_prefetched`
-against the trait default it replaces, and randomized PCA end-to-end on the deterministic
-branch — with a relative bar for the covariance build and the transpose SpMM's parallel
-branch, and a premise assertion on each fixture pinning which branch it reaches.
+**Equivalence splits, and the split was a finding — since fixed.** The streaming PCA
+reductions used to fold into `ThreadLocal` accumulators whose row→thread assignment was
+decided by work-stealing and whose merge order was `ThreadLocal::iter_mut()`. Five
+consecutive `method="covariance"` runs on a cancelling-pair fixture produced five different
+results; `method="randomized"` produced one. The diff showed both the accumulator
+declaration and the merge loop unchanged, so it predated decode-prefetch — this capture
+found it, it did not cause it.
+
+Both reductions now partition their **output** instead of their input rows, so the schedule
+cannot reach the result and exact f64 bit patterns are claimed everywhere on the CPU PCA
+paths, not only where the pre-fix code happened to earn them. See
+[docs/scanpy.md § PCA reproducibility](scanpy.md#reproducibility). The rewrite was also
+**2.0–2.5× faster** — see [PCA reduction partitioning](#pca-reduction-partitioning-covariance-route) below.
 
 The fixture rule inverts between the two, which is worth stating because it reads as a
 contradiction. A pure *reduction* needs a cancelling ±1e16 pair or a lost ordering shows up
@@ -1173,8 +1181,35 @@ cancelling fixture would only drown that signal.
 
 Because "the pipeline silently declined to engage" is invisible in every result, three
 tests measure it rather than infer it: `GaugedSource` counts concurrent decodes and demands
-more than one for the covariance build (the private-pool case), for both SpMM passes and
-for the two whole ops, while `depth_one_never_overlaps` pins the other side.
+more than one for the covariance build, for both SpMM passes and for the two whole ops,
+while `depth_one_never_overlaps` pins the other side.
+
+### PCA reduction partitioning (covariance route)
+
+Making the CPU PCA reductions deterministic made them faster, which was not the point but is
+the larger effect. The covariance build used to give each worker a private `n_vars × n_vars`
+accumulator and merge them at the end; it now gives each worker a disjoint *column range* of
+one shared accumulator. Two things follow: the per-worker merge disappears, and each worker's
+write set drops from the whole matrix (32 MB at 2K vars) to its own slice (~2 MB), which fits
+cache.
+
+`cargo bench -p scx-accel --bench covariance_pca`, 12 cores, 8 shards × 25 K rows:
+
+| Fixture | Before | After | Speedup |
+|---|---|---|---|
+| 2 000 vars, 5 % dense | 2.589 s | **1.057 s** | **2.45×** |
+| 5 000 vars, 3 % dense | 14.769 s | **7.230 s** | **2.04×** |
+
+Peak memory falls with it: one accumulator rather than one per worker, which is why
+`SCX_PCA_COV_MEMORY_BUDGET` no longer has anything to cap. The transpose SpMM got the same
+treatment, dropping `n_vars × k` per worker to one shared buffer.
+
+The remaining thread-count sensitivity is faer's, not SCX's: its dense QR and
+eigendecomposition block by the ambient rayon width. They are stable run to run at a fixed
+width — the contract numpy/scipy give — and `SCX_ACCEL_DETERMINISTIC_LINALG=1` pins them for
+callers who need identity across thread counts, measured at ~2.3× slower on the covariance
+route's eigendecomposition (n_vars = 2000) and ~1.65× *faster* on the randomized route's thin
+QR (200 K × 60).
 
 ### QC / filtering pass fusion (Phase-4 task 4.1)
 
