@@ -1054,6 +1054,42 @@ fn streaming_builder_agrees_on_dictionary_value_types() {
     assert!(n_entries > 0, "streaming numeric index must not be empty");
 }
 
+/// Index construction over a dictionary column must be linear in rows.
+///
+/// `dictionary_key_at` is called once per non-null row by both builders, so
+/// resolving a key by any means that touches the whole key column makes the
+/// build quadratic. `AnyDictionaryArray::normalized_keys()` is exactly such
+/// a means — it allocates and fills a `Vec<usize>` over the entire column on
+/// every call — and using it regressed *every* string categorical, not only
+/// the newly supported numeric ones (measured 0.080 s / 0.269 s / 1.067 s at
+/// 16k / 32k / 64k rows).
+///
+/// A wall-clock ratio would be flaky, so this asserts an absolute bound at a
+/// row count where the two curves are orders of magnitude apart: linear is
+/// milliseconds, while quadratic extrapolates to ~17 s from the numbers
+/// above. Ten seconds separates them with room for a slow machine.
+#[test]
+fn dictionary_index_build_is_not_quadratic_in_rows() {
+    use arrow::array::DictionaryArray;
+    use arrow::datatypes::Int32Type;
+
+    const N: usize = 256_000;
+    let keys = Int32Array::from_iter_values((0..N).map(|i| (i % 4) as i32));
+    let values: ArrayRef = Arc::new(StringArray::from(vec!["A", "B", "C", "D"]));
+    let col: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+
+    let start = std::time::Instant::now();
+    let cat = build_categorical_index(&col, "ct", &[(0u64, N as u64)]);
+    let elapsed = start.elapsed();
+
+    assert_eq!(cat.entries.len(), 4, "all four categories must be indexed");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "building a {N}-row dictionary index took {elapsed:?}; a per-row scan of \
+         the key column makes this quadratic"
+    );
+}
+
 /// `widen_dictionary_keys` normalises on-disk keys to `Int32`, but the
 /// builders also run on caller-supplied batches. Every Arrow key width
 /// must decode; the string extractor used to handle only

@@ -2519,9 +2519,9 @@ fn extract_string_value(col: &ArrayRef, row: usize) -> Option<String> {
 }
 
 /// Resolve the dictionary key at `row` to an index into `values()`, for any
-/// Arrow key width. `None` for a null key or an out-of-range one (a
-/// malformed file must not panic on the values index — see
-/// docs/conventions.md).
+/// Arrow key width. `None` for a null key, a negative one, or one past the
+/// end of `values()` (a malformed file must not panic on the values index —
+/// see docs/conventions.md).
 ///
 /// Shared by [`extract_string_value`] and [`extract_numeric_value`] so the
 /// two cannot disagree about which key widths decode. The string path used
@@ -2529,14 +2529,52 @@ fn extract_string_value(col: &ArrayRef, row: usize) -> Option<String> {
 /// an *empty index* — for the rest; `widen_dictionary_keys` normalises
 /// on-disk keys to `Int32`, but the builders also run on caller-supplied
 /// batches, where `Int64` and unsigned keys occur.
+///
+/// **This must stay O(1).** It is called once per non-null row by both the
+/// batch and the streaming index builders, so anything that touches the
+/// whole key column here is quadratic in `n_obs`. `AnyDictionaryArray`
+/// offers `normalized_keys()`, which looks like the tidy way to cover every
+/// key width in one line and is not: it allocates and fills a
+/// `Vec<usize>` over the entire column on **every call**, so an index build
+/// that was linear became quadratic (measured end to end at 16k / 32k / 64k
+/// rows: 0.080 s / 0.269 s / 1.067 s — ~4x per 2x rows). Dispatch on the key
+/// type instead; a `downcast_ref` is a type-id check, not a scan.
 fn dictionary_key_at(dict: &dyn arrow::array::AnyDictionaryArray, row: usize) -> Option<usize> {
+    use arrow::array::PrimitiveArray;
+    use arrow::datatypes::{
+        Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    };
+
     let keys = dict.keys();
     if keys.is_null(row) {
         return None;
     }
-    // `normalized_keys` is defined for every key width and already maps to
-    // `usize`, so this needs no per-type downcast chain at all.
-    let key = *dict.normalized_keys().get(row)?;
+    macro_rules! key_as_i128 {
+        ($t:ty) => {
+            keys.as_any()
+                .downcast_ref::<PrimitiveArray<$t>>()
+                .map(|k| k.value(row) as i128)
+        };
+    }
+    // Widen through i128 so every key width — including UInt64 — is compared
+    // in a domain that can hold it, and a negative key fails the conversion
+    // below rather than wrapping to a huge index.
+    let key = match keys.data_type() {
+        DataType::Int8 => key_as_i128!(Int8Type),
+        DataType::Int16 => key_as_i128!(Int16Type),
+        DataType::Int32 => key_as_i128!(Int32Type),
+        DataType::Int64 => key_as_i128!(Int64Type),
+        DataType::UInt8 => key_as_i128!(UInt8Type),
+        DataType::UInt16 => key_as_i128!(UInt16Type),
+        DataType::UInt32 => key_as_i128!(UInt32Type),
+        DataType::UInt64 => key_as_i128!(UInt64Type),
+        _ => None,
+    }?;
+    let key = usize::try_from(key).ok()?;
+    // Bounds check is belt-and-braces: `DictionaryArray::try_new` rejects an
+    // out-of-range key at construction, so this can only fire on an array
+    // that reached memory another way. It costs one comparison and turns a
+    // would-be panic on the values index into a skipped row.
     (key < dict.values().len()).then_some(key)
 }
 

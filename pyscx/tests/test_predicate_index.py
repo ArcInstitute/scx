@@ -130,3 +130,35 @@ def test_boolean_categorical_survives_a_row_sharded_write(tmp_dir):
     obs = pyscx.open(str(out)).read_obs()
     assert len(obs) == adata.n_obs
     assert list(obs["flag"].astype(bool)) == list(adata.obs["flag"].astype(bool))
+
+
+def test_boolean_categorical_survives_append_onto_a_sharded_file(tmp_dir):
+    """The mixed dictionary/plain shape `append` creates.
+
+    `append` raw-copies the base `Dictionary(_, Boolean)` shards while the
+    appended obs shard lands as plain `Boolean`, so the assembler has to
+    reconcile the two — and arrow cannot pack a `Boolean` into a dictionary.
+    Fixing the key-widening and dedup paths alone left this third site
+    raising the same error on `read_obs()` after an ordinary append, which is
+    also what `to_anndata()` and a filtered collect go through.
+    """
+    import pandas as pd
+
+    adata = _adata_with_typed_categoricals()
+    base, addition = tmp_dir / "ap_base.scx", tmp_dir / "ap_add.scx"
+    pyscx.from_anndata(adata, str(base), shard_size=100)
+
+    second = _adata_with_typed_categoricals()
+    second.obs.index = [f"cell_{i + adata.n_obs}" for i in range(second.n_obs)]
+    pyscx.from_anndata(second, str(addition), shard_size=100)
+
+    assert len(pyscx.open(str(base)).read_obs()) == adata.n_obs
+    pyscx.append(str(base), str(addition))
+
+    obs = pyscx.open(str(base)).read_obs()
+    assert len(obs) == adata.n_obs + second.n_obs
+    # The column must still be a categorical, not silently degraded to plain
+    # bool by the append — a dtype that changes under append is its own bug.
+    assert isinstance(obs["flag"].dtype, pd.CategoricalDtype)
+    expected = list(adata.obs["flag"].astype(bool)) + list(second.obs["flag"].astype(bool))
+    assert list(obs["flag"].astype(bool)) == expected

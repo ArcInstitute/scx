@@ -83,6 +83,59 @@ pub fn downcast_large_types_schema(schema: &Schema) -> Schema {
     Schema::new(new_fields).with_metadata(schema.metadata().clone())
 }
 
+/// Encode `col` as `Dictionary(Int32, value_type)`.
+///
+/// `arrow::compute::cast` does this for most value types, but its dictionary
+/// *packing* has no `Boolean` support and fails with *"Unsupported output
+/// type for dictionary packing: Boolean"*. That is the same limitation
+/// [`widen_dictionary_keys`] sidesteps by casting keys, and it is reachable
+/// here by an ordinary `append`: the base shards keep their
+/// `Dictionary(_, Boolean)` while the appended obs shard lands as plain
+/// `Boolean`, so [`reconcile_dictionary_representations`] has to encode the
+/// plain side — and the whole assembled read (`read_obs`, `to_anndata`,
+/// filtered collect) died there.
+///
+/// A `Boolean` column has at most three states, so it is packed by hand:
+/// values `[false, true]`, keys `0`/`1`, nulls preserved as null keys. That
+/// keeps the column a categorical, so `read_obs()` returns the same pandas
+/// dtype before and after an `append` — degrading it to a plain `bool`
+/// column instead would make append silently change a column's dtype, which
+/// is its own bug class.
+fn encode_to_dictionary(col: &ArrayRef, value_type: &DataType) -> Result<ArrayRef> {
+    use std::sync::Arc;
+
+    if !matches!(value_type, DataType::Boolean) {
+        return Ok(arrow::compute::cast(
+            col,
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(value_type.clone())),
+        )?);
+    }
+
+    // Decode to plain Boolean first: `col` may itself be a dictionary with a
+    // key width other than Int32, which is the other half of the mixed case.
+    let plain = if matches!(col.data_type(), DataType::Dictionary(_, _)) {
+        arrow::compute::cast(col, &DataType::Boolean)?
+    } else {
+        col.clone()
+    };
+    let plain = plain
+        .as_any()
+        .downcast_ref::<arrow::array::BooleanArray>()
+        .ok_or_else(|| {
+            ScxError::InvalidCatalog(
+                "column declared Boolean but failed downcast while encoding a dictionary".into(),
+            )
+        })?;
+
+    let keys: arrow::array::Int32Array = (0..plain.len())
+        .map(|i| (!plain.is_null(i)).then(|| i32::from(plain.value(i))))
+        .collect();
+    let values: ArrayRef = Arc::new(arrow::array::BooleanArray::from(vec![false, true]));
+    Ok(Arc::new(arrow::array::DictionaryArray::<
+        arrow::datatypes::Int32Type,
+    >::try_new(keys, values)?))
+}
+
 /// Cast every `Dictionary(K, V)` column's key (index) type to `Int32` so that
 /// concatenating per-shard categoricals during sharded-metadata assembly cannot
 /// overflow a narrow per-shard key (`Int8`/`Int16`) once the combined vocabulary
@@ -258,7 +311,7 @@ pub fn reconcile_dictionary_representations(batches: Vec<RecordBatch>) -> Result
                     let cast_col = if col.data_type() == &target_dt {
                         col.clone()
                     } else {
-                        arrow::compute::cast(col, &target_dt)?
+                        encode_to_dictionary(col, value_type.as_ref())?
                     };
                     new_columns.push(cast_col);
                     // Inherit the captured dictionary field's metadata (categorical
@@ -571,6 +624,51 @@ mod tests {
             vec![Some(true), Some(false), None, Some(true)],
             "values and nulls must survive the key widening"
         );
+    }
+
+    /// Regression: the mixed dictionary/plain shape `append` creates.
+    ///
+    /// `append` raw-copies the base `Dictionary(_, Boolean)` shards while the
+    /// appended obs shard lands as plain `Boolean`, so reconcile has to encode
+    /// the plain side — and `arrow::compute::cast` cannot pack a `Boolean`
+    /// into a dictionary. Fixing only `widen_dictionary_keys` and the dedup
+    /// arm left this third site raising the same error on `read_obs()` after
+    /// an ordinary append.
+    #[test]
+    fn reconcile_handles_a_mixed_boolean_dictionary_and_plain_column() {
+        use arrow::array::{Array, BooleanArray};
+        use arrow::datatypes::Int32Type;
+
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Boolean));
+        let keys = arrow::array::Int32Array::from(vec![Some(0), Some(1), None]);
+        let values: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
+        let dict: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+        let plain: ArrayRef = Arc::new(BooleanArray::from(vec![Some(false), Some(true)]));
+
+        let out = reconcile_dictionary_representations(vec![
+            batch_from(vec![("flag", dict_dt.clone(), dict)]),
+            batch_from(vec![("flag", DataType::Boolean, plain)]),
+        ])
+        .expect("a mixed boolean column must reconcile");
+
+        // Both batches must end up on the same dtype, or `concat` rejects them.
+        assert_eq!(out[0].schema().field(0).data_type(), &dict_dt);
+        assert_eq!(out[1].schema().field(0).data_type(), &dict_dt);
+
+        // And the values must survive on the encoded side.
+        let decoded = arrow::compute::cast(out[1].column(0), &DataType::Boolean).unwrap();
+        let decoded = decoded.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(
+            (0..decoded.len())
+                .map(|i| (!decoded.is_null(i)).then(|| decoded.value(i)))
+                .collect::<Vec<_>>(),
+            vec![Some(false), Some(true)]
+        );
+
+        // The pair must actually concatenate — the failure this guards is a
+        // read that dies while assembling a sharded axis.
+        let schema = out[0].schema();
+        arrow::compute::concat_batches(&schema, &out).expect("reconciled batches must concat");
     }
 
     #[test]
