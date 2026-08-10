@@ -95,12 +95,20 @@ pub fn downcast_large_types_schema(schema: &Schema) -> Schema {
 /// plain side — and the whole assembled read (`read_obs`, `to_anndata`,
 /// filtered collect) died there.
 ///
-/// A `Boolean` column has at most three states, so it is packed by hand:
-/// values `[false, true]`, keys `0`/`1`, nulls preserved as null keys. That
-/// keeps the column a categorical, so `read_obs()` returns the same pandas
-/// dtype before and after an `append` — degrading it to a plain `bool`
-/// column instead would make append silently change a column's dtype, which
-/// is its own bug class.
+/// A `Boolean` column has at most three states, so it is packed by hand,
+/// nulls preserved as null keys. Packing by hand rather than degrading the
+/// column to a plain `bool` array keeps it a categorical, so an `append`
+/// does not silently change a column's pandas dtype.
+///
+/// Only the values **actually present** are installed, in first-occurrence
+/// order. Unconditionally emitting `[false, true]` is the obvious shortcut
+/// and is wrong: it *invents* a category. A column whose declared vocabulary
+/// is `[True]` came back as `CategoricalDtype(categories=[True, False])`
+/// after an append — visible in `.cat.categories`, in dtype equality, in
+/// `groupby(observed=False)`, and in any categorical encoder. The dictionary
+/// shards on the other side of the reconcile contribute their own declared
+/// categories, and the later concat + dedup unions the two, so nothing is
+/// lost by packing only what this shard holds.
 fn encode_to_dictionary(col: &ArrayRef, value_type: &DataType) -> Result<ArrayRef> {
     use std::sync::Arc;
 
@@ -127,10 +135,30 @@ fn encode_to_dictionary(col: &ArrayRef, value_type: &DataType) -> Result<ArrayRe
             )
         })?;
 
+    // First-occurrence order, matching the dedup helpers in `reader.rs`.
+    let mut present: Vec<bool> = Vec::with_capacity(2);
+    for i in 0..plain.len() {
+        if !plain.is_null(i) {
+            let v = plain.value(i);
+            if !present.contains(&v) {
+                present.push(v);
+                if present.len() == 2 {
+                    break;
+                }
+            }
+        }
+    }
     let keys: arrow::array::Int32Array = (0..plain.len())
-        .map(|i| (!plain.is_null(i)).then(|| i32::from(plain.value(i))))
+        .map(|i| {
+            (!plain.is_null(i)).then(|| {
+                present
+                    .iter()
+                    .position(|&p| p == plain.value(i))
+                    .expect("every non-null value was interned above") as i32
+            })
+        })
         .collect();
-    let values: ArrayRef = Arc::new(arrow::array::BooleanArray::from(vec![false, true]));
+    let values: ArrayRef = Arc::new(arrow::array::BooleanArray::from(present));
     Ok(Arc::new(arrow::array::DictionaryArray::<
         arrow::datatypes::Int32Type,
     >::try_new(keys, values)?))
@@ -666,9 +694,92 @@ mod tests {
         );
 
         // The pair must actually concatenate — the failure this guards is a
-        // read that dies while assembling a sharded axis.
+        // read that dies while assembling a sharded axis — and the merged
+        // column must decode to the right values. "concat succeeded" alone
+        // would let a key-remapping regression hide: the two sides intern
+        // their values in different orders (`[true, false]` vs `[false]`),
+        // so a naive concat that kept both key spaces would silently invert
+        // the appended rows.
         let schema = out[0].schema();
-        arrow::compute::concat_batches(&schema, &out).expect("reconciled batches must concat");
+        let merged =
+            arrow::compute::concat_batches(&schema, &out).expect("reconciled batches must concat");
+        let decoded = arrow::compute::cast(merged.column(0), &DataType::Boolean).unwrap();
+        let decoded = decoded.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(
+            (0..decoded.len())
+                .map(|i| (!decoded.is_null(i)).then(|| decoded.value(i)))
+                .collect::<Vec<_>>(),
+            vec![Some(true), Some(false), None, Some(false), Some(true)],
+            "merged column must preserve every row's value across both key spaces"
+        );
+    }
+
+    /// The hand-packed encoder must not **invent** a category. Emitting
+    /// `[false, true]` unconditionally is the obvious shortcut and turns a
+    /// column whose declared vocabulary is `[True]` into `[True, False]` —
+    /// visible in `.cat.categories`, dtype equality, and
+    /// `groupby(observed=False)`.
+    #[test]
+    fn boolean_encoding_installs_only_the_values_present() {
+        use arrow::array::BooleanArray;
+        use arrow::datatypes::Int32Type;
+
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Boolean));
+        let keys = arrow::array::Int32Array::from(vec![Some(0), Some(0)]);
+        let values: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+        let dict: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+        // The plain side holds only `true` — so must `false` stay out of the
+        // vocabulary.
+        let plain: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), Some(true)]));
+
+        let out = reconcile_dictionary_representations(vec![
+            batch_from(vec![("flag", dict_dt, dict)]),
+            batch_from(vec![("flag", DataType::Boolean, plain)]),
+        ])
+        .unwrap();
+
+        let encoded = out[1].column(0).as_any_dictionary_opt().unwrap();
+        let vocab = encoded
+            .values()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(
+            (0..vocab.len()).map(|i| vocab.value(i)).collect::<Vec<_>>(),
+            vec![true],
+            "only the values actually present may be installed"
+        );
+    }
+
+    /// An all-null Boolean column has no values to intern at all. The
+    /// encoder must still produce a well-formed dictionary rather than
+    /// panicking or inventing a vocabulary for rows that have none.
+    #[test]
+    fn boolean_encoding_handles_an_all_null_column() {
+        use arrow::array::BooleanArray;
+        use arrow::datatypes::Int32Type;
+
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Boolean));
+        let keys = arrow::array::Int32Array::from(vec![Some(0)]);
+        let values: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
+        let dict: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+        let plain: ArrayRef = Arc::new(BooleanArray::from(vec![None, None] as Vec<Option<bool>>));
+
+        let out = reconcile_dictionary_representations(vec![
+            batch_from(vec![("flag", dict_dt.clone(), dict)]),
+            batch_from(vec![("flag", DataType::Boolean, plain)]),
+        ])
+        .expect("an all-null boolean column must reconcile");
+        let schema = out[0].schema();
+        let merged = arrow::compute::concat_batches(&schema, &out).unwrap();
+        let decoded = arrow::compute::cast(merged.column(0), &DataType::Boolean).unwrap();
+        let decoded = decoded.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(
+            (0..decoded.len())
+                .map(|i| (!decoded.is_null(i)).then(|| decoded.value(i)))
+                .collect::<Vec<_>>(),
+            vec![Some(true), None, None]
+        );
     }
 
     #[test]

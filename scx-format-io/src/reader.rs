@@ -2616,8 +2616,9 @@ fn unify_dictionary_columns(batch: &RecordBatch) -> Result<RecordBatch> {
 /// (key narrowed via [`min_dictionary_key_type`]) for string value types, or
 /// `None` for any shape that should take the decode/re-encode fallback
 /// (non-Int32 keys — not produced by the assembler's `widen_dictionary_keys` —
-/// or non-string value types). Categoricals are strings, so the fast path
-/// covers all real cases.
+/// or a value type with neither a fast path nor a hand-packing arm).
+/// `Utf8` / `LargeUtf8` cover the common categorical, and `Boolean` has its
+/// own arm because arrow cannot pack it at all.
 fn dedup_dictionary_column(
     col: &arrow::array::ArrayRef,
     value_type: &arrow::datatypes::DataType,

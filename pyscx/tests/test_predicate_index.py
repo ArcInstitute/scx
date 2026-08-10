@@ -162,3 +162,48 @@ def test_boolean_categorical_survives_append_onto_a_sharded_file(tmp_dir):
     assert isinstance(obs["flag"].dtype, pd.CategoricalDtype)
     expected = list(adata.obs["flag"].astype(bool)) + list(second.obs["flag"].astype(bool))
     assert list(obs["flag"].astype(bool)) == expected
+
+
+@pytest.mark.parametrize(
+    "levels, ordered",
+    [([True], False), ([True], True), ([True, False], False)],
+)
+def test_append_does_not_invent_a_boolean_category(tmp_dir, levels, ordered):
+    """Append must not widen a boolean categorical's declared vocabulary.
+
+    Encoding the plain (appended) shard as a dictionary is what makes the
+    mixed representation readable at all, but installing ``[False, True]``
+    unconditionally *invents* a category: a column declaring only ``[True]``
+    came back as ``CategoricalDtype(categories=[True, False])``. That is
+    observable in ``.cat.categories``, in dtype equality, in
+    ``groupby(observed=False)``, and in any categorical encoder — while the
+    row values, which an earlier version of this test checked alone, are
+    untouched.
+    """
+    import anndata
+    import numpy as np
+    import pandas as pd
+    import scipy.sparse as sp
+
+    def make(n, offset):
+        flag = pd.Categorical([levels[0]] * n, categories=levels, ordered=ordered)
+        obs = pd.DataFrame({"flag": flag}, index=[f"c{offset + i}" for i in range(n)])
+        X = sp.random(n, 5, density=0.2, format="csr", dtype="float32", random_state=0)
+        return anndata.AnnData(X, obs=obs, var=pd.DataFrame(index=[f"g{i}" for i in range(5)]))
+
+    base, addition = tmp_dir / "inv_base.scx", tmp_dir / "inv_add.scx"
+    pyscx.from_anndata(make(200, 0), str(base), shard_size=50)
+    pyscx.from_anndata(make(100, 200), str(addition), shard_size=50)
+
+    before = pyscx.open(str(base)).read_obs()["flag"]
+    assert list(before.cat.categories) == levels
+    pyscx.append(str(base), str(addition))
+    after = pyscx.open(str(base)).read_obs()["flag"]
+
+    assert list(after.cat.categories) == levels, (
+        f"append widened the declared vocabulary {levels} -> "
+        f"{list(after.cat.categories)}"
+    )
+    assert after.cat.ordered == ordered
+    assert len(after) == 300
+    assert bool((after.astype(bool) == levels[0]).all())

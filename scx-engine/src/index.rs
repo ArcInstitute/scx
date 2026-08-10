@@ -1785,7 +1785,18 @@ impl ObsPredicateIndexBuilder {
                     // it — `values.len()` is the row count, not the
                     // distinct count (numeric accumulators don't
                     // dedupe), so a cardinality check here would be
-                    // misleading anyway. Matches batch-mode behaviour.
+                    // misleading anyway.
+                    //
+                    // NOTE: this does **not** match batch-mode behaviour.
+                    // `build_predicate_index_bytes_inner` applies
+                    // `high_cardinality_threshold` to every column before
+                    // the categorical/numeric split, so a high-cardinality
+                    // numeric column is skipped there and indexed here.
+                    // Pre-existing for plain numeric columns; integer-valued
+                    // categoricals now inherit it. Unifying the two changes
+                    // behaviour for existing numeric columns on the
+                    // streaming path, so it is left alone and documented
+                    // (docs/api.md) rather than changed here.
                     let _ = matches!(selection, ColumnSelection::Named)
                         && values.len() > self.options.high_cardinality_threshold;
                     indexed.push(IndexedColumn::Numeric(numeric_index_from_values(
@@ -2417,8 +2428,12 @@ fn estimate_unique_values(col: &ArrayRef) -> usize {
 }
 
 /// True when two Arrow dtypes are interchangeable for predicate-index
-/// purposes: both categorical (any of `Utf8` / `LargeUtf8` /
-/// `Dictionary(_, _)`) or both numeric. Used by
+/// purposes: both categorical (`Utf8` / `LargeUtf8`, or a dictionary over
+/// one of those) or both numeric (a numeric type, or a dictionary over
+/// one). Classification goes through [`logical_type`], so a
+/// `Dictionary(_, V)` shard and a plain `V` shard are interchangeable —
+/// which matters because `append` writes some columns plain where
+/// `from_anndata` writes them dictionary-encoded. Used by
 /// [`ObsPredicateIndexBuilder::push_shard`] to accept shards whose
 /// per-shard upcast widens columns to `LargeUtf8` while the builder
 /// was initialised with the input file's narrow `Utf8` schema.
@@ -2449,8 +2464,8 @@ fn logical_type(dt: &DataType) -> &DataType {
 /// `pd.Categorical([1, 2, 3])` becomes — is not categorical for index
 /// purposes, because `build_categorical_index` can only extract string
 /// values from a dictionary. Accepting it wrote an index with zero entries
-/// and no outcome, leaving the column unreachable from the query engine
-/// engine. Such a column routes to the numeric index instead;
+/// and no outcome, leaving the column unreachable from the query engine.
+/// Such a column routes to the numeric index instead;
 /// a non-string, non-numeric value type (e.g. `Boolean`) is reported as an
 /// unsupported dtype, exactly as the equivalent plain column already is.
 fn is_categorical_type(dt: &DataType) -> bool {
