@@ -694,12 +694,25 @@ conversions → `pyscx.merge(..., index_obs=[...])`).
 Behaviour:
 
 - Force-listed columns (`--index-obs`/`--index-var`) **hard-error** if
-  the column is missing or has an unsupported dtype.
+  the column is missing or has an unsupported dtype. Unsupported means
+  anything that is neither a string nor a number: `Boolean`, and
+  equally a boolean-valued pandas `Categorical`
+  (`Dictionary(_, Boolean)`), which is a dictionary-encoded `Boolean`
+  and no more indexable than the plain column.
 - Preset columns warn (`MissingPresetIndexColumn` /
   `UnsupportedIndexColumn`) and are skipped without aborting the
   conversion.
 - Auto-indexing picks up categorical-like columns with cardinality
   `≤ index_auto_threshold` (default `1000`).
+- **A column is classified by what it holds, not by how it is stored.**
+  pandas writes every `Categorical` as an Arrow dictionary, whatever the
+  categories are, so the dictionary's *value* type decides:
+  `pd.Categorical(["A", "B"])` → the categorical index (Level-1
+  `CategoryBitset` pruning + Level-2 row-set pushdown), while
+  `pd.Categorical([1, 2, 3])` → the **numeric** index, exactly as the
+  plain integer column it holds (Level-1 `MinMax` pruning; numeric
+  operators are residual at Level 2, so no row-set pushdown). Query
+  syntax follows the value type too: `batch == 3`, not `batch == '3'`.
 - Multimodal inputs emit `PredicateIndexSkippedMultimodal` and skip
   predicate-index emission entirely — the read path is unimodal-only
   today. The same skip-with-warning applies to multimodal

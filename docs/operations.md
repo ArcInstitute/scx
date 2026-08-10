@@ -232,6 +232,13 @@ pruning reads those directly**. For the numeric arm it never consults the index
 section at all (`scx-engine/src/pushdown.rs` gates only on
 `!stats.column_stats.is_empty()`). So the two must be maintained together:
 
+The `CategoryBitset` is positional over the column's sorted category list, so a
+predicate value has to be resolved to an ordinal before it can be checked — and
+the only value that can be is a **string**, looked up in the global category
+dictionary the index carries. A numeric literal is a *value*, never an ordinal:
+it is left unresolved and prunes nothing, which is why `batch == 3` on an
+integer-valued categorical is served by the numeric `MinMax` arm instead.
+
 - **Losing** the stats, as `build-csc` and `optimize` do, costs pruning. Rows are
   still correct.
 - **Keeping a stale one** returns the wrong rows. A shard whose recorded `max`
