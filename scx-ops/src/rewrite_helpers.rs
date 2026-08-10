@@ -201,6 +201,37 @@ pub fn copy_obs_var_preserving_layout(
     Ok(())
 }
 
+/// The value encoding to re-emit canonicalized values under, given the one the
+/// source shard used.
+///
+/// Canonicalization **sums duplicate coordinates**, so it can produce a value
+/// larger than any the source held — and the source's encoding was chosen to fit
+/// the source's values. Re-encoding through it has two failure modes, and the
+/// quiet one is the dangerous one: `Uint8` refuses `200 + 200 = 400` outright, so
+/// the upgrade fails on exactly the non-canonical input it exists to repair,
+/// while `Float16` is unchecked — `f16::from_f32` maps anything past 65504 to
+/// **infinity** and the op reports success.
+///
+/// So widen to the narrowest encoding that actually holds the result. Integers
+/// stay integers (canonicalizing sums counts; it never makes them fractional)
+/// and floats stay floats. Returns the source encoding unchanged whenever it
+/// still fits, which is the overwhelmingly common case — this only widens for a
+/// shard canonicalization actually rewrote.
+pub fn encoding_for_canonicalized(source: ValueEncoding, data: &[f32]) -> ValueEncoding {
+    let max = data.iter().copied().fold(0.0f32, f32::max);
+    match source {
+        // f16's finite ceiling. Past it `from_f32` yields inf, silently.
+        ValueEncoding::Float16 if max > 65504.0 => ValueEncoding::Float32,
+        ValueEncoding::Uint8 if max > 255.0 => {
+            encoding_for_canonicalized(ValueEncoding::Uint16, data)
+        }
+        ValueEncoding::Uint16 if max > 65535.0 => ValueEncoding::Uint32,
+        // Uint32 saturates the integer ladder; a sum past u32::MAX would need
+        // f32 and is not reachable from counts that fit u32 in a real matrix.
+        other => other,
+    }
+}
+
 /// Section families this file's copy helpers do **not** carry, checked against
 /// the input so the loss can be reported rather than discovered later.
 ///
@@ -286,21 +317,15 @@ pub(crate) fn dropped_section_labels(reader: &ScxReader) -> Vec<&'static str> {
 /// detection bitmaps, `varm`/`obsp`/`varp`, `adata.raw`, and the grouped-sort
 /// group index. The list is an allowlist, so a section type added to the format
 /// is dropped here silently until someone adds it — that is the shape of the
-/// bug this carry was written to fix. Since both callers rename a new file over
-/// the target with no prior catalog, a drop is unrecoverable, so
-/// [`warn_dropped_sections`] now reports it rather than leaving the user to
+/// bug this carry was written to fix. A drop is unrecoverable on the in-place
+/// form of either caller (a rename over the target, carrying no prior catalog),
+/// so [`warn_dropped_sections`] reports it rather than leaving the user to
 /// discover it: see [`DROPPED_SECTION_FAMILIES`], which must be kept in step
 /// with what is actually copied below.
 ///
-/// `canonicalize` re-sorts, dedup-sums and zero-drops every layer CSR shard
-/// before re-encoding. It exists because the two callers legitimately differ:
-/// `scx upgrade` stamps the output [`DEFAULT_WRITE_FORMAT_VERSION`], whose
-/// contract *is* canonical CSR, so it must canonicalize what it re-emits;
-/// `build_csc` deliberately clamps its output version to the source's
-/// (SCX-005) precisely so it does **not** have to, and passing `true` there
-/// would silently change the nnz of a file it promises to re-emit unchanged.
-///
-/// [`DEFAULT_WRITE_FORMAT_VERSION`]: scx_format_io::header::DEFAULT_WRITE_FORMAT_VERSION
+/// Layers are re-emitted as they are. For the canonicalizing variant — which
+/// `scx upgrade` needs and `build_csc` must not have — see
+/// [`copy_auxiliary_sections_canonicalizing`].
 pub fn copy_auxiliary_sections(
     reader: &ScxReader,
     writer: &mut ScxWriter,
@@ -311,6 +336,15 @@ pub fn copy_auxiliary_sections(
 }
 
 /// [`copy_auxiliary_sections`] with control over layer canonicalization.
+///
+/// `canonicalize` re-sorts, dedup-sums and zero-drops every layer CSR shard
+/// before re-encoding, widening the value encoding if the sums need it
+/// ([`encoding_for_canonicalized`]). The two callers legitimately differ:
+/// `scx upgrade` stamps the output `DEFAULT_WRITE_FORMAT_VERSION`, whose
+/// contract *is* canonical CSR, so it must canonicalize what it re-emits;
+/// `build_csc` deliberately clamps its output version to the source's
+/// (SCX-005) precisely so it does **not** have to, and passing `true` there
+/// would change the nnz of a file it promises to re-emit unchanged.
 ///
 /// Split out rather than added as a fifth parameter to the existing function:
 /// `canonicalize` is wanted by exactly one of the two callers, and widening a
@@ -388,9 +422,14 @@ fn copy_layers(
             let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
             let mut indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
             let mut indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
-            if canonicalize {
+            // Canonicalizing sums duplicates, which can exceed what the source
+            // encoding holds — see `encoding_for_canonicalized`.
+            let ve = if canonicalize {
                 scx_sparse::canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut data);
-            }
+                encoding_for_canonicalized(ve, &data)
+            } else {
+                ve
+            };
             let mut raw_values = Vec::new();
             for &v in &data {
                 ve.encode_f32(&mut raw_values, v)?;

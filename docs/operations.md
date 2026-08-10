@@ -144,8 +144,8 @@ modality table — and multimodal only requires v2, so it lands in this branch.
 It copies layers, `obsm`, `uns`, predicate indexes and deletion vectors. It does
 **not** carry detection bitmaps, `varm`, `obsp`, `varp`, `adata.raw`, layer CSC
 sidecars, or the grouped-sort group index — the same allowlist `build-csc` uses, and the same
-gap. Since both ops rename a new file over the target with no prior catalog,
-that loss is not rollback-able, so the op now warns before writing:
+gap. On the in-place form of either op — a rename over the target carrying no
+prior catalog — that loss cannot be rolled back, so the op warns before writing:
 
 ```
 scx upgrade: the output will not carry varm, obsp — this rewrite copies only

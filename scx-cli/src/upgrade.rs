@@ -27,27 +27,6 @@ pub fn run_upgrade(
     let reader = ScxReader::open(input)?;
     let old_version = reader.header().format_version;
 
-    // Multimodal is v2, so it sits squarely in the pre-v3 branch this command
-    // still rewrites — but nothing here is modality-aware. `csr_shards_sorted()`
-    // returns every modality's shards, the loop below writes them through the
-    // single-modality `write_csr_shard`, and the output header's
-    // `..Default::default()` zeroes `n_modalities` and the modality-table
-    // pointers. A valid CITE-seq or Multiome file would come out nominally
-    // single-modality with overlapping global row ranges and no per-modality
-    // var — and on `--in-place`, over the top of the original. `optimize` and
-    // `build_csc` both refuse; this is the third op of the three, and the only
-    // one that did not.
-    if reader.is_multimodal() {
-        return Err(format!(
-            "scx upgrade does not support multimodal files yet: {} carries a modality \
-             table, and this rewrite would flatten it into a single-modality file. \
-             Extract a modality with `scx subset --modality NAME`, or use \
-             `scx compact` / `scx optimize`, which handle multimodal inputs.",
-            input.display()
-        )
-        .into());
-    }
-
     // `scx upgrade` re-writes to the newest **unframed** version (v4 requires
     // row-group framing, which upgrade does not add).
     //
@@ -86,6 +65,32 @@ pub fn run_upgrade(
             DEFAULT_WRITE_FORMAT_VERSION
         );
         return Ok(());
+    }
+
+    // Only now: nothing here is modality-aware, so a multimodal file that would
+    // actually be rewritten must be refused. `csr_shards_sorted()` returns every
+    // modality's shards, the loop below writes them through the single-modality
+    // `write_csr_shard`, and the output header's `..Default::default()` zeroes
+    // `n_modalities` and the modality-table pointers — a CITE-seq file would come
+    // out nominally single-modality with overlapping global row ranges and no
+    // per-modality var, on `--in-place` over the top of the original. Multimodal
+    // only requires v2, so it reaches here.
+    //
+    // **After** the version gates, deliberately. Placing it first also turned a
+    // multimodal *v3 or v4* file — which is never rewritten and was a harmless
+    // exit-0 "nothing to do" — into a hard error, contradicting this module's
+    // own contract and `docs/api.md`. Refuse what would be damaged, not what
+    // would be left alone.
+    if reader.is_multimodal() {
+        return Err(format!(
+            "scx upgrade does not support multimodal files yet: {} carries a modality \
+             table, and this rewrite would flatten it into a single-modality file. \
+             Extract a modality with `scx subset {} out.scx --modality NAME`, or use \
+             `scx compact`, which handles multimodal inputs.",
+            input.display(),
+            input.display()
+        )
+        .into());
     }
 
     // 3. Determine output path
@@ -193,10 +198,18 @@ fn rewrite_with_current_version(
 
         let mut indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
         let mut indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
-        if !scx_sparse::is_canonical_csr(&indptr_u64, &indices_u32, &data) {
+        // Canonicalizing sums duplicate coordinates, so a value can outgrow the
+        // width the source chose for the values it held. Re-encoding through the
+        // old width either refuses outright (`Uint8` rejects 200 + 200 = 400,
+        // failing on exactly the input this op exists to repair) or, for
+        // `Float16`, silently yields infinity. Widen to what the result needs.
+        let ve = if !scx_sparse::is_canonical_csr(&indptr_u64, &indices_u32, &data) {
             scx_sparse::canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut data);
             csr_was_rewritten = true;
-        }
+            scx_ops::encoding_for_canonicalized(ve, &data)
+        } else {
+            ve
+        };
         let raw_values = ve.encode_f32_batch(&data)?;
 
         writer.write_csr_shard(
@@ -802,6 +815,81 @@ mod tests {
         );
     }
 
+    /// Canonicalizing **sums** duplicate coordinates, so a value can outgrow the
+    /// width the source picked for the values it actually held. Re-encoding
+    /// through the old width fails two ways, and the quiet one is worse:
+    /// `Uint8::encode_f32` refuses `200 + 200 = 400` outright — so the upgrade
+    /// errors on exactly the non-canonical input it exists to repair — while
+    /// `Float16` is unchecked and `f16::from_f32` maps anything past 65504 to
+    /// **infinity**, reporting success.
+    #[test]
+    fn upgrade_widens_the_value_encoding_when_canonicalizing_overflows_it() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("uint8_overflow.scx");
+        let (n_obs, n_vars) = (1usize, 3usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        // Column 1 duplicated: 200 + 200 = 400, past what Uint8 can hold.
+        w.write_csr_shard(
+            &[0u64, 2],
+            &[1u32, 1],
+            &[200u8, 200],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false)
+            .expect("a duplicate summing past the source width must not fail the upgrade");
+
+        let out = ScxReader::open(&output).unwrap();
+        let got = out.read_all_csr_shards().unwrap();
+        assert_eq!(
+            got.data,
+            vec![400.0],
+            "the summed value must survive intact, not saturate or error"
+        );
+    }
+
+    /// The unit-level statement of the same rule, including the `Float16` arm —
+    /// which cannot be exercised end-to-end here (no CLI path writes f16 counts)
+    /// but is the one that fails *silently*.
+    #[test]
+    fn canonicalized_encoding_widens_only_when_the_sums_need_it() {
+        use scx_codec::ValueEncoding::*;
+        // Fits: unchanged.
+        assert_eq!(scx_ops::encoding_for_canonicalized(Uint8, &[255.0]), Uint8);
+        assert_eq!(
+            scx_ops::encoding_for_canonicalized(Uint16, &[65535.0]),
+            Uint16
+        );
+        assert_eq!(
+            scx_ops::encoding_for_canonicalized(Float16, &[65504.0]),
+            Float16
+        );
+        // Overflows: widened, and only one step where one step suffices.
+        assert_eq!(scx_ops::encoding_for_canonicalized(Uint8, &[400.0]), Uint16);
+        assert_eq!(
+            scx_ops::encoding_for_canonicalized(Uint8, &[70000.0]),
+            Uint32,
+            "a Uint8 sum past u16 must go all the way to u32, not stop at u16"
+        );
+        assert_eq!(
+            scx_ops::encoding_for_canonicalized(Float16, &[70000.0]),
+            Float32,
+            "f16 saturates to infinity past 65504 without complaining"
+        );
+    }
+
     /// Switching obs/var to the streaming writers must not quietly trade away
     /// the shard-cover validation `read_obs()` / `read_var()` performed on the
     /// way to assembling the axis.
@@ -865,6 +953,82 @@ mod tests {
         assert!(
             msg.contains("row_start") && msg.contains("obs_metadata"),
             "the error should name the axis and what was wrong, got: {msg}"
+        );
+    }
+
+    /// A multimodal file at or past the target version is never rewritten, so
+    /// there is nothing to protect it from — it must stay the exit-0 "nothing to
+    /// do" it always was. Placing the refusal before the version gates turned
+    /// that into a hard error for the common modern case, contradicting the
+    /// module contract and `docs/api.md`.
+    #[test]
+    fn upgrade_leaves_an_at_target_multimodal_file_alone() {
+        use crate::test_utils::write_multimodal_test_file;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_multimodal_test_file(&dir, 6, 4, 3);
+        let src = ScxReader::open(&input).unwrap();
+        assert!(src.is_multimodal());
+        assert_eq!(
+            src.header().format_version,
+            DEFAULT_WRITE_FORMAT_VERSION,
+            "fixture must be at the target version for this to test the ordering"
+        );
+        drop(src);
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false)
+            .expect("an already-at-target multimodal file must be a no-op, not an error");
+        assert!(!output.exists(), "a no-op writes nothing");
+    }
+
+    /// A shard whose stamp disagrees with the payload it carries. Walking the
+    /// stamps alone proves they tile a range; it does not prove each shard holds
+    /// the rows it claims, and the streaming writer derives the output range from
+    /// the payload — so this turns a detectable input into a malformed output.
+    #[test]
+    fn upgrade_rejects_a_shard_whose_stamp_disagrees_with_its_payload() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("stamp_mismatch.scx");
+        let (n_obs, n_vars) = (6usize, 4usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        let obs = sample_obs(n_obs);
+        // Stamped 3 rows, carries 2. The stamps still tile [0, 6).
+        w.write_obs_shard(0, 0, 3, n_obs as u64, &obs.slice(0, 2))
+            .unwrap();
+        w.write_obs_shard(1, 3, 3, n_obs as u64, &obs.slice(3, 3))
+            .unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        let mut indptr = vec![0u64];
+        let (mut indices, mut values) = (Vec::new(), Vec::new());
+        for row in 0..n_obs {
+            indices.push(((row * 2) % n_vars) as u32);
+            values.push(((row + 1) % 256) as u8);
+            indptr.push(indptr.last().unwrap() + 1);
+        }
+        w.write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let output = dir.path().join("upgraded.scx");
+        let err = run_upgrade(&input, Some(output.as_path()), false)
+            .expect_err("a shard whose stamp overstates its payload must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("n_shard_rows") && msg.contains("carries"),
+            "the error should say the stamp and the payload disagree, got: {msg}"
         );
     }
 
