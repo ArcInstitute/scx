@@ -145,8 +145,19 @@ fn can_exclude_shard(
                         bitset,
                     } => {
                         // Resolve the predicate value to a bit index.
+                        //
+                        // Only a `Utf8` value can be resolved, and only
+                        // through the category dictionary. An integer
+                        // literal is a **value**, never a bit index: the
+                        // bitset is positional over the sorted category
+                        // list, so reading `batch == 2` as "bit 2" prunes on
+                        // a numeric coincidence. Worse, a column indexed
+                        // before review §5.6 carries an entry-less
+                        // `CategoricalIndex`, whose derived bitset is
+                        // zero-length — so every shard took the
+                        // out-of-range → "absent" branch below and the query
+                        // returned nothing at all.
                         let bit_index = match val {
-                            ScalarValue::Int64(idx) => Some(*idx as usize),
                             ScalarValue::Utf8(s) => {
                                 // Look up string value in category dictionary.
                                 match category_dicts.and_then(|dicts| dicts.get(cnh)) {
@@ -276,10 +287,13 @@ fn can_exclude_shard(
                         column_name_hash: cnh,
                         bitset,
                     } => {
-                        // For category In: exclude if none of the values have their bit set
+                        // For category In: exclude if none of the values have
+                        // their bit set. As in the `Eq` arm, only a `Utf8`
+                        // member resolves — an integer member is a value, not
+                        // an ordinal, and treating it as one lets an
+                        // entry-less legacy index exclude every shard.
                         let all_absent = values.iter().all(|v| {
                             let bit_index = match v {
-                                ScalarValue::Int64(idx) => Some(*idx as usize),
                                 ScalarValue::Utf8(s) => category_dicts
                                     .and_then(|dicts| dicts.get(cnh))
                                     .and_then(|vals| vals.binary_search(s).ok()),
@@ -553,11 +567,30 @@ mod tests {
         assert_eq!(candidates[0].shard_idx, 2);
     }
 
+    /// The global category dictionary a real query carries: sorted
+    /// values keyed by column-name hash, exactly the shape
+    /// `CategoricalIndex::entries` (BTreeMap-sorted) produces.
+    fn category_dicts(col: &str, values: &[&str]) -> CategoryDictionaries {
+        let mut m = CategoryDictionaries::new();
+        m.insert(
+            column_name_hash(col),
+            values.iter().map(|s| s.to_string()).collect(),
+        );
+        m
+    }
+
+    /// Bitset pruning as it is actually reached: a `Utf8` literal
+    /// resolved to its ordinal through the category dictionary.
+    ///
+    /// This is the only way `can_exclude_shard` ever sees a
+    /// `CategoryBitset` from `parse_predicate`, because a categorical
+    /// column is `Utf8` / `Dictionary(_, Utf8)` and rejects a bare
+    /// integer literal.
     #[test]
-    fn category_bitset_excludes_shard() {
-        // Category bitset: Shard 0 has categories {0, 2} (bits 0,2 set)
-        //                   Shard 1 has categories {1, 3} (bits 1,3 set)
-        // Predicate: category index == 2 → Shard 1 excluded
+    fn category_bitset_excludes_shard_via_the_dictionary() {
+        // Categories sorted: ["B cell", "NK cell", "T cell"] → bits 0,1,2.
+        // Shard 0 holds {B cell, T cell} = bits 0,2 → 0b101
+        // Shard 1 holds {NK cell}        = bit  1   → 0b010
         let catalog = catalog_with_shards(vec![
             (
                 0,
@@ -567,16 +600,86 @@ mod tests {
             (
                 100,
                 200,
-                vec![category_bitset_stat("cell_type", vec![0b0000_1010])],
+                vec![category_bitset_stat("cell_type", vec![0b0000_0010])],
             ),
         ]);
+        let dicts = category_dicts("cell_type", &["B cell", "NK cell", "T cell"]);
         let preds = vec![Predicate::Eq(
             "cell_type".to_string(),
-            ScalarValue::Int64(2),
+            ScalarValue::Utf8("T cell".to_string()),
         )];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
-        assert_eq!(candidates.len(), 1);
+        let candidates = prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&dicts), 0);
+        assert_eq!(candidates.len(), 1, "only shard 0 holds 'T cell'");
         assert_eq!(candidates[0].shard_idx, 0);
+
+        // A value absent from the (complete) dictionary excludes every shard.
+        let preds = vec![Predicate::Eq(
+            "cell_type".to_string(),
+            ScalarValue::Utf8("Nope".to_string()),
+        )];
+        assert!(
+            prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&dicts), 0).is_empty()
+        );
+    }
+
+    /// An integer literal is a **value**, never a bit index into the
+    /// category bitset. Reading it as an ordinal prunes on a numeric
+    /// coincidence: here `batch == 2` would resolve to bit 2, which
+    /// shard 1 does not have set, and drop the shard that holds it.
+    ///
+    /// Unreachable before integer literals validated against
+    /// integer-valued categoricals (review §5.6) — and the reason that
+    /// fix could not ship on its own.
+    #[test]
+    fn an_integer_literal_is_never_a_category_ordinal() {
+        let catalog = catalog_with_shards(vec![
+            (
+                0,
+                100,
+                vec![category_bitset_stat("batch", vec![0b0000_0101])],
+            ),
+            (
+                100,
+                200,
+                vec![category_bitset_stat("batch", vec![0b0000_0010])],
+            ),
+        ]);
+        let preds = vec![Predicate::Eq("batch".to_string(), ScalarValue::Int64(2))];
+        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        assert_eq!(
+            candidates.len(),
+            2,
+            "an unresolvable literal must not exclude any shard"
+        );
+    }
+
+    /// The legacy-file regression. Every SCX file written before the
+    /// §5.6 fix indexed an integer categorical as an entry-less
+    /// `CategoricalIndex`, which `derive_shard_column_stats` turns into
+    /// a **zero-length** `CategoryBitset` on every shard. Reading an
+    /// integer literal as an ordinal then took the
+    /// `byte_idx >= bitset.len()` → "absent" branch on every shard, so
+    /// `batch == 3` came back empty with no error and no warning.
+    #[test]
+    fn an_empty_category_bitset_never_prunes_a_shard() {
+        let catalog = catalog_with_shards(vec![
+            (0, 100, vec![category_bitset_stat("batch", vec![])]),
+            (100, 200, vec![category_bitset_stat("batch", vec![])]),
+        ]);
+        for pred in [
+            Predicate::Eq("batch".to_string(), ScalarValue::Int64(3)),
+            Predicate::In(
+                "batch".to_string(),
+                vec![ScalarValue::Int64(1), ScalarValue::Int64(2)],
+            ),
+        ] {
+            let candidates = prune_shards_by_catalog(&catalog, std::slice::from_ref(&pred), None);
+            assert_eq!(
+                candidates.len(),
+                2,
+                "{pred} must scan both shards, not silently return nothing"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::*;
-use arrow::array::{Int32Array, RecordBatch, StringArray};
+use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::io::Cursor;
 use std::sync::Arc;
@@ -878,6 +878,214 @@ fn build_obs_predicate_index_bytes_forced_high_cardinality_errors() {
             assert!(s.contains("10"), "expected '10' in {s}");
         }
         _ => panic!("expected ForcedColumnError"),
+    }
+}
+
+// -------------------------------------------------------------------
+// Dictionary value types (review §5.6)
+//
+// `pd.Categorical([1, 2, 3])` reaches Arrow as `Dictionary(_, Int64)`
+// and `pd.Categorical([True, False])` as `Dictionary(_, Boolean)`.
+// Both used to be classified as *categorical*, whose builder can only
+// read string values out of a dictionary — so the column was indexed
+// with zero entries, silently.
+// -------------------------------------------------------------------
+
+/// One obs batch with an integer-valued and a boolean-valued
+/// categorical alongside a string one, keyed `Int32` exactly as
+/// `widen_dictionary_keys` normalises them on disk.
+fn make_dictionary_obs_batch() -> RecordBatch {
+    use arrow::array::{BooleanArray, DictionaryArray, Int64Array};
+    use arrow::datatypes::Int32Type;
+
+    // 8 rows: batch ∈ {10, 20, 30}, flag ∈ {true, false}, cell_type ∈ {A, B}
+    let batch_keys = Int32Array::from(vec![0, 1, 2, 0, 1, 2, 0, 1]);
+    let batch_values: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, 30]));
+    let batch_col: ArrayRef =
+        Arc::new(DictionaryArray::<Int32Type>::try_new(batch_keys, batch_values).unwrap());
+
+    let flag_keys = Int32Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1]);
+    let flag_values: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
+    let flag_col: ArrayRef =
+        Arc::new(DictionaryArray::<Int32Type>::try_new(flag_keys, flag_values).unwrap());
+
+    let ct_keys = Int32Array::from(vec![0, 0, 1, 1, 0, 1, 0, 1]);
+    let ct_values: ArrayRef = Arc::new(StringArray::from(vec!["A", "B"]));
+    let ct_col: ArrayRef =
+        Arc::new(DictionaryArray::<Int32Type>::try_new(ct_keys, ct_values).unwrap());
+
+    let schema = Schema::new(vec![
+        Field::new("batch", batch_col.data_type().clone(), true),
+        Field::new("flag", flag_col.data_type().clone(), true),
+        Field::new("cell_type", ct_col.data_type().clone(), true),
+    ]);
+    RecordBatch::try_new(Arc::new(schema), vec![batch_col, flag_col, ct_col]).unwrap()
+}
+
+/// An integer-valued categorical must land on the **numeric** index
+/// with real leaf entries — not on the categorical index, which can
+/// only extract string values and therefore produced an entry-less
+/// `CategoricalIndex` that no query could ever hit.
+#[test]
+fn integer_categorical_is_indexed_numerically() {
+    let batch = make_dictionary_obs_batch();
+    let shard_ranges = vec![(0u64, 8u64)];
+    let opts = PredicateIndexBuildOptions {
+        forced_columns: vec!["batch".to_string()],
+        preset_columns: vec![],
+        auto_threshold: 1000,
+        high_cardinality_threshold: 100_000,
+    };
+    let mut outcomes = Vec::new();
+    let mut names = Vec::new();
+    let bytes =
+        build_obs_predicate_index_bytes(&batch, &shard_ranges, &opts, &mut outcomes, &mut names)
+            .unwrap()
+            .expect("forced integer categorical must produce an index");
+    assert!(
+        outcomes.is_empty(),
+        "an integer categorical is indexable; got {outcomes:?}"
+    );
+
+    let index = PredicateIndex::read_from(&mut Cursor::new(&bytes)).unwrap();
+    assert_eq!(index.columns.len(), 1);
+    match &index.columns[0] {
+        IndexedColumn::Numeric(num) => {
+            assert_eq!(num.column_name, "batch");
+            let n_entries: usize = num.leaf_pages.iter().map(|p| p.entries.len()).sum();
+            assert!(
+                n_entries > 0,
+                "numeric index for an integer categorical must carry leaf entries"
+            );
+        }
+        IndexedColumn::Categorical(cat) => panic!(
+            "integer categorical was indexed as categorical with {} entries \
+             (zero entries is the §5.6 bug)",
+            cat.entries.len()
+        ),
+    }
+    assert_eq!(index.indexed_kind("batch"), Some(IndexKind::Numeric));
+}
+
+/// A boolean-valued categorical is no more indexable than a plain
+/// `Boolean` column. It must say so as a typed outcome instead of
+/// writing an empty categorical index and reporting success.
+#[test]
+fn boolean_categorical_is_reported_unsupported() {
+    let batch = make_dictionary_obs_batch();
+    let shard_ranges = vec![(0u64, 8u64)];
+    let opts = PredicateIndexBuildOptions {
+        forced_columns: vec!["flag".to_string()],
+        preset_columns: vec![],
+        auto_threshold: 1000,
+        high_cardinality_threshold: 100_000,
+    };
+    let mut outcomes = Vec::new();
+    let mut names = Vec::new();
+    let bytes =
+        build_obs_predicate_index_bytes(&batch, &shard_ranges, &opts, &mut outcomes, &mut names)
+            .unwrap();
+    assert!(bytes.is_none(), "nothing indexable → no index section");
+    assert_eq!(outcomes.len(), 1, "expected one outcome, got {outcomes:?}");
+    match &outcomes[0] {
+        BuildOutcome::ForcedColumnError { column, reason } => {
+            assert_eq!(column, "flag");
+            assert!(
+                matches!(reason, SkipReason::UnsupportedDtype(_)),
+                "expected UnsupportedDtype, got {reason:?}"
+            );
+        }
+        other => panic!("expected ForcedColumnError, got {other:?}"),
+    }
+}
+
+/// Auto-detect must make the same three calls: numeric for the integer
+/// categorical, categorical for the string one, and skip the boolean.
+#[test]
+fn auto_detect_routes_each_dictionary_value_type() {
+    let batch = make_dictionary_obs_batch();
+    let shard_ranges = vec![(0u64, 8u64)];
+    let index = build_indexes(&batch, &shard_ranges, &[]).unwrap();
+    assert_eq!(index.indexed_kind("batch"), Some(IndexKind::Numeric));
+    assert_eq!(
+        index.indexed_kind("cell_type"),
+        Some(IndexKind::Categorical)
+    );
+    assert_eq!(index.indexed_kind("flag"), None);
+    // The string categorical must still carry its values.
+    assert_eq!(
+        index
+            .categorical_eq("cell_type", "A")
+            .map(|r| !r.is_empty()),
+        Some(true)
+    );
+}
+
+/// The streaming builder shares the extractors with the batch builder
+/// and must agree with it on all three value types — otherwise a
+/// row-sharded atlas silently indexes differently from a small file.
+#[test]
+fn streaming_builder_agrees_on_dictionary_value_types() {
+    let batch = make_dictionary_obs_batch();
+    let opts = PredicateIndexBuildOptions {
+        forced_columns: vec!["batch".to_string()],
+        preset_columns: vec![],
+        auto_threshold: 1000,
+        high_cardinality_threshold: 100_000,
+    };
+    let mut builder = ObsPredicateIndexBuilder::new(batch.schema(), &opts).unwrap();
+    builder.push_shard(&batch.slice(0, 4), 0).unwrap();
+    builder.push_shard(&batch.slice(4, 4), 4).unwrap();
+    let mut outcomes = Vec::new();
+    let mut names = Vec::new();
+    let bytes = builder
+        .finish(&[(0, 4), (4, 8)], &mut outcomes, &mut names)
+        .unwrap();
+    assert!(outcomes.is_empty(), "got {outcomes:?}");
+    let index = PredicateIndex::read_from(&mut Cursor::new(
+        &bytes.expect("streaming builder must emit an index"),
+    ))
+    .unwrap();
+    assert_eq!(index.indexed_kind("batch"), Some(IndexKind::Numeric));
+    let n_entries: usize = match &index.columns[0] {
+        IndexedColumn::Numeric(num) => num.leaf_pages.iter().map(|p| p.entries.len()).sum(),
+        _ => 0,
+    };
+    assert!(n_entries > 0, "streaming numeric index must not be empty");
+}
+
+/// `widen_dictionary_keys` normalises on-disk keys to `Int32`, but the
+/// builders also run on caller-supplied batches. Every Arrow key width
+/// must decode; the string extractor used to handle only
+/// `Int8`/`Int16`/`Int32` and returned `None` — an empty index — for
+/// the rest.
+#[test]
+fn dictionary_keys_of_every_width_decode() {
+    use arrow::array::{DictionaryArray, Int64Array, UInt8Array};
+    use arrow::datatypes::{Int64Type, UInt8Type};
+
+    let values: ArrayRef = Arc::new(StringArray::from(vec!["A", "B"]));
+
+    let i64_col: ArrayRef = Arc::new(
+        DictionaryArray::<Int64Type>::try_new(
+            Int64Array::from(vec![0i64, 1, 0, 1]),
+            values.clone(),
+        )
+        .unwrap(),
+    );
+    let u8_col: ArrayRef = Arc::new(
+        DictionaryArray::<UInt8Type>::try_new(UInt8Array::from(vec![1u8, 0, 1, 0]), values.clone())
+            .unwrap(),
+    );
+
+    for (label, col) in [("Int64 keys", i64_col), ("UInt8 keys", u8_col)] {
+        let cat = build_categorical_index(&col, "c", &[(0u64, 4u64)]);
+        assert_eq!(
+            cat.entries.len(),
+            2,
+            "{label}: expected both categories, got {:?}",
+            cat.entries.iter().map(|e| &e.value).collect::<Vec<_>>()
+        );
     }
 }
 

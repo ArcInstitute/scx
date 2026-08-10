@@ -2428,18 +2428,41 @@ fn column_class_compatible(a: &DataType, b: &DataType) -> bool {
         || a == b
 }
 
-/// Check if a data type is categorical (string or dictionary).
-fn is_categorical_type(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(_, _)
-    )
+/// The type a column *logically* holds: a dictionary's value type, or the
+/// type itself. Dictionary encoding is a storage detail — pandas writes
+/// every `Categorical` that way regardless of what the categories are — so
+/// classification must look through it. Both [`is_categorical_type`] and
+/// [`is_numeric_type`] go through this, which is what keeps
+/// `Dictionary(_, Int64)` and plain `Int64` from drifting into different
+/// classes (see [`column_class_compatible`]).
+fn logical_type(dt: &DataType) -> &DataType {
+    match dt {
+        DataType::Dictionary(_, value_type) => value_type.as_ref(),
+        other => other,
+    }
 }
 
-/// Check if a data type is numeric.
+/// Check if a data type is categorical: a string, or a dictionary **whose
+/// values are strings**.
+///
+/// The value type matters. A `Dictionary(_, Int64)` — what
+/// `pd.Categorical([1, 2, 3])` becomes — is not categorical for index
+/// purposes, because `build_categorical_index` can only extract string
+/// values from a dictionary. Accepting it wrote an index with zero entries
+/// and no outcome, leaving the column unreachable from the query engine
+/// (review §5.6). Such a column routes to the numeric index instead;
+/// a non-string, non-numeric value type (e.g. `Boolean`) is reported as an
+/// unsupported dtype, exactly as the equivalent plain column already is.
+fn is_categorical_type(dt: &DataType) -> bool {
+    matches!(logical_type(dt), DataType::Utf8 | DataType::LargeUtf8)
+}
+
+/// Check if a data type is numeric, looking through dictionary encoding
+/// so an integer- or float-valued pandas `Categorical` is indexed as the
+/// numbers it holds.
 fn is_numeric_type(dt: &DataType) -> bool {
     matches!(
-        dt,
+        logical_type(dt),
         DataType::Int8
             | DataType::Int16
             | DataType::Int32
@@ -2474,37 +2497,47 @@ fn extract_string_value(col: &ArrayRef, row: usize) -> Option<String> {
             }
         }
         DataType::Dictionary(_, _) => {
-            // Cast to StringArray view of dictionary values
-            if let Some(dict) = col.as_any_dictionary_opt() {
-                let keys = dict.keys();
-                let values = dict.values();
-                if keys.is_null(row) {
-                    return None;
-                }
-                let key = keys
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int32Array>()
-                    .map(|k| k.value(row) as usize)
-                    .or_else(|| {
-                        keys.as_any()
-                            .downcast_ref::<arrow::array::Int8Array>()
-                            .map(|k| k.value(row) as usize)
-                    })
-                    .or_else(|| {
-                        keys.as_any()
-                            .downcast_ref::<arrow::array::Int16Array>()
-                            .map(|k| k.value(row) as usize)
-                    })?;
-                values
+            let dict = col.as_any_dictionary_opt()?;
+            let key = dictionary_key_at(dict, row)?;
+            let values = dict.values();
+            match values.data_type() {
+                DataType::Utf8 => values
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
-                    .map(|str_arr| str_arr.value(key).to_string())
-            } else {
-                None
+                    .filter(|a| !a.is_null(key))
+                    .map(|a| a.value(key).to_string()),
+                DataType::LargeUtf8 => values
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                    .filter(|a| !a.is_null(key))
+                    .map(|a| a.value(key).to_string()),
+                _ => None,
             }
         }
         _ => None,
     }
+}
+
+/// Resolve the dictionary key at `row` to an index into `values()`, for any
+/// Arrow key width. `None` for a null key or an out-of-range one (a
+/// malformed file must not panic on the values index — see
+/// docs/conventions.md).
+///
+/// Shared by [`extract_string_value`] and [`extract_numeric_value`] so the
+/// two cannot disagree about which key widths decode. The string path used
+/// to hand-roll `Int32`/`Int8`/`Int16` only and silently returned `None` —
+/// an *empty index* — for the rest; `widen_dictionary_keys` normalises
+/// on-disk keys to `Int32`, but the builders also run on caller-supplied
+/// batches, where `Int64` and unsigned keys occur.
+fn dictionary_key_at(dict: &dyn arrow::array::AnyDictionaryArray, row: usize) -> Option<usize> {
+    let keys = dict.keys();
+    if keys.is_null(row) {
+        return None;
+    }
+    // `normalized_keys` is defined for every key width and already maps to
+    // `usize`, so this needs no per-type downcast chain at all.
+    let key = *dict.normalized_keys().get(row)?;
+    (key < dict.values().len()).then_some(key)
 }
 
 /// Extract a numeric value from an Arrow array as f64.
@@ -2553,6 +2586,14 @@ fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
             .as_any()
             .downcast_ref::<Float64Array>()
             .map(|a| a.value(row)),
+        // A numeric-valued pandas `Categorical` (`pd.Categorical([1, 2, 3])`
+        // → `Dictionary(_, Int64)`). Resolve the key and recurse into the
+        // values array, which is one of the arms above.
+        DataType::Dictionary(_, _) => {
+            let dict = col.as_any_dictionary_opt()?;
+            let key = dictionary_key_at(dict, row)?;
+            extract_numeric_value(dict.values(), key)
+        }
         _ => None,
     }
 }
