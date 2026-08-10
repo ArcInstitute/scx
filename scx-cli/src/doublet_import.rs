@@ -193,6 +193,19 @@ pub fn run_doublet_import(
     }
 
     println!("Wrote obs columns {:?}", s.obs_columns_added);
+    println!(
+        "Obs rewrite: {} (peak memory {})",
+        if s.obs_streamed {
+            "streamed shard-by-shard"
+        } else {
+            "whole table materialized"
+        },
+        if s.obs_streamed {
+            "one obs shard"
+        } else {
+            "the entire obs table \u{2014} run `scx optimize` to shard it"
+        },
+    );
     if s.obs_index_dropped {
         println!(
             "Note: the obs predicate index was dropped — this import overwrote a \

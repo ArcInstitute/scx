@@ -64,8 +64,9 @@
 //! * **The key diagnosis on a failed join** ([`KeyDiagnosis`]) reads every obs
 //!   column. Only reached when the import is already failing.
 //! * **`obsm` embeddings**, which `write_obsm` emits as one `n_obs`-row
-//!   section. Not reached unless the caller supplies them; no doublet caller
-//!   does.
+//!   section. Not reached unless the caller supplies them — no doublet caller
+//!   does, but `cellbender_import(latent_embedding=True)` builds one, so this
+//!   is reachable on the layer op.
 //!
 //! The **source** side is resident in full by construction —
 //! [`ExternalObsData`] holds every key and every annotation — which is the
@@ -995,6 +996,68 @@ fn build_new_obs(
 // The obs rewrite
 // ---------------------------------------------------------------------------
 
+/// Read the join key column(s) and validate the obs shard cover in one pass,
+/// before anything is written.
+///
+/// [`ScxReader::read_obs_keys`] on its own is not enough, and the gap is narrow
+/// enough to be worth spelling out. It walks the *stamps* — so a gap, a
+/// reordering, or a total that disagrees with `n_obs` is refused — but it never
+/// compares a shard's stamp with the number of rows that shard actually
+/// carries. Those two agree on every file a writer produces, and they can
+/// disagree in a way nothing downstream notices when the errors **cancel**: a
+/// shard stamped 6 rows carrying 4, beside one stamped 4 carrying 6, tiles
+/// `[0, 10)` by stamps and sums to 10 by payload. The caller's
+/// `n_obs`-vs-header check passes, and the only thing left that would catch it
+/// used to live inside the write loop — after the dry-run return, and after the
+/// first bytes had been appended.
+///
+/// That made `dry_run` a liar on exactly this input: it reported a clean join
+/// and the real import then failed. Doing the check here restores the contract
+/// three separate surfaces promise — "`--dry-run` runs every validation", "a
+/// rejected import leaves the file byte-identical" — at no extra I/O, because
+/// this pass is the projected read the join needed anyway.
+pub(crate) fn read_obs_keys_validated(
+    reader: &ScxReader,
+    obs_schema: &Schema,
+    key_columns: &[String],
+    n_obs: u64,
+) -> Result<RecordBatch> {
+    let n_shards = reader.obs_metadata_shard_count();
+    if n_shards == 0 {
+        // A legacy single section has no per-shard stamps to contradict, so
+        // there is nothing extra to check — and no per-shard reader either.
+        return Ok(reader.read_obs_keys(key_columns)?);
+    }
+
+    let projection: Vec<usize> = key_columns
+        .iter()
+        .map(|name| {
+            obs_schema.index_of(name).map_err(|_| {
+                OpsError::InvalidInput(format!("obs column '{name}' disappeared before the read"))
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    let mut cover = crate::compact::ShardCoverCheck::default();
+    let mut shards: Vec<(u32, RecordBatch)> = Vec::with_capacity(n_shards);
+    for idx in 0..n_shards as u32 {
+        let projected = reader.read_obs_shard_projected(idx, &projection)?;
+        cover.visit("obs_metadata", &projected)?;
+        // Arrow IPC column projection hands back a zero-copy slice into the
+        // shard's whole message body, so retaining it would keep every
+        // un-projected column resident and the projection would save nothing.
+        // `compact_key_shard` rebuilds into fresh buffers — the same move
+        // `read_obs_keys` makes, and the reason this loop is not a memory
+        // regression over it.
+        shards.push((idx, scx_format_io::compact_key_shard(&projected)?));
+    }
+    cover.finish("obs_metadata", n_obs)?;
+    Ok(scx_format_io::assemble_sharded_metadata(
+        "obs_metadata",
+        shards,
+    )?)
+}
+
 /// How the target's obs axis was rewritten. Reported on both attach summaries
 /// and recorded in provenance, so "did this import hold the whole obs table"
 /// is answerable after the fact rather than inferred from the file's layout.
@@ -1020,17 +1083,15 @@ pub enum ObsRewrite {
 /// rather than re-deriving them from `header.shard_target_rows`. That matches
 /// `compact` and `optimize`, and it is what makes the rewrite streamable at all.
 ///
-/// [`crate::compact::ShardCoverCheck`] earns its place here on exactly one
-/// property. `read_obs_keys` already walked the stamps, so a gapped or
-/// out-of-order axis is refused before this runs, and a payload total that
-/// disagrees with `n_obs` is caught by the caller's header shape check. What
-/// neither sees is a shard whose *payload* contradicts its own stamp while the
-/// totals still come out right — and dropping the check there does not merely
-/// lose a diagnostic, it launders the file: the driver derives each output
-/// shard's range from the rows it can see, so the result is well-formed with
-/// obs bound to different matrix rows than the input claimed. Pinned by
-/// `a_shard_stamped_longer_than_its_payload_is_rejected`, which passes without
-/// this call only because the import silently succeeds.
+/// [`crate::compact::ShardCoverCheck`] runs here as well as in
+/// [`read_obs_keys_validated`], which is what actually refuses a bad axis
+/// before any byte is written. Keeping it in the write loop is not redundancy
+/// for its own sake: this is the loop that derives each output shard's range
+/// from the rows it can *see*, so it is the one place where a stamp the payload
+/// does not honour turns into a well-formed file whose obs is bound to
+/// different matrix rows than the input claimed. The pre-write pass makes that
+/// unreachable; this makes it unreachable even if a future caller forgets the
+/// pre-write pass.
 pub(crate) fn write_obs_shards_appending<F>(
     reader: &ScxReader,
     writer: &mut ScxWriter,
@@ -1232,9 +1293,12 @@ fn check_collisions(
         }
     }
     if !data.row_embeddings.is_empty() {
-        let existing = reader.read_all_obsm().unwrap_or_default();
+        // Names only — `read_all_obsm` would decode every existing embedding
+        // just to look at its key, which on an atlas is the largest thing this
+        // op touches. `list_obsm` is a catalog scan. (Round-1 finding: codex.)
+        let existing = reader.list_obsm();
         for (name, _) in &data.row_embeddings {
-            if existing.iter().any(|(k, _)| k == name) {
+            if existing.iter().any(|k| k == name) {
                 return Err(OpsError::InvalidInput(format!(
                     "obsm key '{name}' already exists; pass overwrite=true to replace it"
                 )));
@@ -1317,9 +1381,15 @@ fn build_params_json(
 /// `obsm` / `uns`, joined to the target's own obs axis by key.
 ///
 /// Every validation runs before the first byte is written, so a rejected import
-/// leaves the file byte-identical. `X`, layers, the CSC sidecar, `.raw`,
-/// deletion vectors, detection bitmaps and `var` are never read or rewritten;
-/// the whole import is undoable with `scx rollback`.
+/// leaves the file byte-identical — including the obs shard cover, which
+/// [`read_obs_keys_validated`] checks during the join's projected key read.
+/// That placement is load-bearing rather than incidental: the same check inside
+/// the write loop would sit past the `dry_run` return, so a preview could
+/// report a clean join for a file the real import then refuses.
+///
+/// `X`, layers, the CSC sidecar, `.raw`, deletion vectors, detection bitmaps
+/// and `var` are never read or rewritten; the whole import is undoable with
+/// `scx rollback`.
 pub fn attach_external_obs(
     path: &Path,
     data: &ExternalObsData,
@@ -1409,7 +1479,7 @@ fn attach_external_obs_inner(
     // n_obs-vs-header shape check below.
     let obs_schema = reader.read_obs_schema_physical()?;
     let (key_spec, key_columns) = resolve_target_key_spec(&obs_schema, &opts.join_key)?;
-    let key_batch = reader.read_obs_keys(&key_columns)?;
+    let key_batch = read_obs_keys_validated(reader, &obs_schema, &key_columns, n_obs)?;
     if key_batch.num_rows() as u64 != n_obs {
         return Err(OpsError::ShapeMismatch {
             detail: format!(

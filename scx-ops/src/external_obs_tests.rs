@@ -1921,6 +1921,60 @@ fn a_gapped_obs_axis_is_rejected_not_normalized() {
     );
 }
 
+/// A dry run must reach the same verdict the real import will.
+///
+/// Round-1 finding (codex): every `--dry-run` surface promises it "runs every
+/// validation", and the payload-vs-stamp check used to live inside the write
+/// loop — past the dry-run return. On the cancelling fixture below the dry run
+/// reported a clean join of 10 rows and the real import then failed, which is
+/// the one way a preview can be worse than useless.
+#[test]
+fn a_dry_run_rejects_what_the_real_import_would_reject() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mis-stamped.scx");
+    let obs = obs_batch(10);
+
+    // Stamps tile [0, 10) and payloads sum to 10; only the per-shard pairing is
+    // wrong, so nothing but the payload-vs-stamp check can see it.
+    let header = FileHeader::new_single_modality(10, 3, 0, 5, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer
+        .write_obs_shard(0, 0, 6, 10, &obs.slice(0, 4))
+        .unwrap();
+    writer
+        .write_obs_shard(1, 6, 4, 10, &obs.slice(4, 6))
+        .unwrap();
+    writer.write_var(&var_batch(3)).unwrap();
+    writer
+        .write_csr_shard(
+            &[0u64; 11],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let before = std::fs::read(&path).unwrap();
+    let data = score_data(keys("cell_", 10), |i| i as f32);
+    let dry = AttachObsOptions {
+        dry_run: true,
+        ..opts()
+    };
+    let err = attach_external_obs(&path, &data, &dry).unwrap_err();
+    assert!(
+        err.to_string().contains("carries"),
+        "a dry run must refuse what the real import refuses, got: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a rejected dry run must leave the file byte-identical"
+    );
+}
+
 /// The two paths are one implementation seen from two angles. Same source, same
 /// obs content, one sharded target and one single-section twin: the resulting
 /// obs must agree on values, schema and the reported join counts.

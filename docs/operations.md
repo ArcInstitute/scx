@@ -522,23 +522,33 @@ whose obs is sharded — anything `from_anndata` wrote above `shard_target_rows`
 and anything `merge` or `append` produced — neither import holds the obs table:
 the schema comes from the Arrow IPC footer, the join reads only the key
 column(s), and the rewrite runs one obs shard at a time. Peak is one obs shard
-plus the join arrays (one row index and one key string per target cell). The
-input's shard boundaries are preserved rather than re-derived, as with `compact`
-and `optimize`.
+plus the join arrays (one row index and one key string per target cell).
 
-Four paths are still unbounded, and three of them are reachable:
+**The input's obs shard boundaries are preserved**, not re-derived from
+`header.shard_target_rows` — one output shard per input shard, as with `compact`
+and `optimize`. This is a change: an import used to normalise them. It shows up
+only on a target whose shards do *not* already match `shard_target_rows`, which
+in practice means one grown by `append`. Nothing downstream depends on the
+boundaries (the obs predicate index keys on CSR shards, not obs-metadata
+shards), so this is a layout note rather than a compatibility one.
+
+These paths are still unbounded:
 
 | Path | Cost | What to do |
 |---|---|---|
 | A legacy single-section `obs` target | the whole obs table | Run [`scx optimize`](#optimize) first to migrate obs to the sharded layout. The import warns and reports `obs_streamed = false`. |
 | A failed join's key diagnosis | the whole obs table, plus a pass per column | Only reached when the import is already failing. |
-| `obsm` embeddings supplied by the caller | one `n_obs`-row section | Not reached by any doublet caller or by CellBender. |
+| `obsm` embeddings supplied by the caller | one `n_obs`-row section | Reachable: `cellbender-import --latent-embedding` / `cellbender_import(latent_embedding=True)` builds one. Leave it off unless you want the latents. |
 | The source table | resident in full | Inherent: the join is by key, so the source's row order is its own business. The source is the small side — that is the premise the feature rests on. |
 
-The import summary reports `obs_streamed`, so which target-side path ran is
-answerable after the fact rather than inferred from the file's layout. The same
-applies to `cellbender-import`, whose `var` axis is additionally read whole —
-that is the gene axis, so it does not scale with the atlas.
+The import summary reports `obs_streamed`, and all three CLI subcommands print
+it, so which target-side path ran is answerable after the fact rather than
+inferred from the file's layout. `cellbender-import` additionally reads `var`
+whole — that is the gene axis, so it does not scale with the atlas.
+
+Validation, including the obs shard cover, runs entirely before the first byte
+is written, so `--dry-run` reaches the same verdict the real import would and a
+rejected import leaves the file byte-identical.
 
 ### The join is by key string, never by row position
 

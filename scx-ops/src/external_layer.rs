@@ -45,7 +45,10 @@
 //! # Memory
 //!
 //! Target-side obs is handled exactly as in the obs-only sibling — see
-//! [`crate::external_obs`] for the full account. On a sharded target the join
+//! [`crate::external_obs`] for the full account. One difference matters: the
+//! `obsm` path *is* reachable here. `--latent-embedding` /
+//! `latent_embedding=True` makes `read_cellbender_h5` populate
+//! `row_embeddings`, which this op scatters to a full `n_obs`-row section. On a sharded target the join
 //! reads only the obs key column and the rewrite runs one shard at a time; a
 //! legacy single-section `ObsMetadata` target is assembled whole, warns, and
 //! reports [`AttachLayerSummary::obs_streamed`] as `false`. `var` is read whole
@@ -395,7 +398,14 @@ pub struct AttachLayerSummary {
 /// Attach `data` to the SCX file at `path` as a new layer plus annotations.
 ///
 /// Every validation runs before the first byte is written, so a rejected import
-/// leaves the file byte-identical.
+/// leaves the file byte-identical — including the obs shard cover, which
+/// [`crate::external_obs::read_obs_keys_validated`] checks during the join's
+/// projected key read rather than during the write.
+///
+/// The one thing that can still fail mid-write is an encode error on a layer
+/// shard. That leaves trailing bytes at EOF, but the catalog is only swapped by
+/// `commit_in_place`, so the file still reads as it did and `scx compact`
+/// reclaims the orphans.
 pub fn attach_external_layer(
     path: &Path,
     data: &ExternalLayerData,
@@ -477,7 +487,12 @@ fn attach_external_layer_inner(
     // n_obs-vs-header check below is still a pre-write validation.
     let obs_schema = reader.read_obs_schema_physical()?;
     let obs_key_column = resolve_key_column("obs", &obs_schema, opts.obs_key_column.as_deref())?;
-    let key_batch = reader.read_obs_keys(std::slice::from_ref(&obs_key_column))?;
+    let key_batch = crate::external_obs::read_obs_keys_validated(
+        reader,
+        &obs_schema,
+        std::slice::from_ref(&obs_key_column),
+        n_obs,
+    )?;
     if key_batch.num_rows() as u64 != n_obs {
         return Err(OpsError::ShapeMismatch {
             detail: format!(
@@ -1724,9 +1739,12 @@ fn check_collisions(
         }
     }
     if !data.row_embeddings.is_empty() {
-        let existing = reader.read_all_obsm().unwrap_or_default();
+        // Names only — `read_all_obsm` would decode every existing embedding
+        // just to look at its key, which on an atlas is the largest thing this
+        // op touches. `list_obsm` is a catalog scan. (Round-1 finding: codex.)
+        let existing = reader.list_obsm();
         for (name, _) in &data.row_embeddings {
-            if existing.iter().any(|(k, _)| k == name) {
+            if existing.iter().any(|k| k == name) {
                 return Err(OpsError::InvalidInput(format!(
                     "obsm key '{name}' already exists; pass overwrite=true to replace it"
                 )));

@@ -685,9 +685,10 @@ The input's obs shard boundaries are preserved rather than re-derived.
 A target whose `obs` is a single legacy `ObsMetadata` section has no per-shard
 reader, so the whole table is assembled; the op warns and reports
 `obs_streamed = false` in its summary. Run `scx optimize` on such a file first
-to migrate obs to the sharded layout. The remaining unbounded paths — the
-key diagnosis printed on a *failed* join, caller-supplied `obsm` embeddings, and
-the source table itself — are enumerated in
+to migrate obs to the sharded layout. The remaining unbounded paths — the key
+diagnosis printed on a *failed* join, an `obsm` embedding when one is requested
+(`cellbender_import(latent_embedding=True)` is the reachable case), and the
+source table itself — are enumerated in
 [docs/operations.md § Memory: bounded on the target, resident on the source](operations.md#memory-bounded-on-the-target-resident-on-the-source).
 
 ## Conversion-time predicate indexes and detection bitmaps

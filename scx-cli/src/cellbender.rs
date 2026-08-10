@@ -103,6 +103,19 @@ pub fn run_cellbender_import(
         "Wrote layer '{layer}' ({} nnz, {:?}) + obs {:?} + var {:?}",
         s.layer_nnz, s.value_encoding, s.obs_columns_added, s.var_columns_added
     );
+    println!(
+        "Obs rewrite: {} (peak memory {})",
+        if s.obs_streamed {
+            "streamed shard-by-shard"
+        } else {
+            "whole table materialized"
+        },
+        if s.obs_streamed {
+            "one obs shard"
+        } else {
+            "the entire obs table \u{2014} run `scx optimize` to shard it"
+        },
+    );
     println!("Undo with: scx rollback {}", input.display());
     // Worth saying out loud: a later subset would silently discard the layer.
     println!("Note: `scx subset` currently drops layers.");
