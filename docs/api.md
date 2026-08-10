@@ -669,6 +669,27 @@ Decimal prefixes (`KB`, `MB`, `GB`, `TB`) are **rejected** to avoid
 shard's metadata plus one worker, conversion refuses to start with
 an actionable error rather than OOMing partway through.
 
+### Ops that bound themselves without a budget knob
+
+Some ops are bounded structurally rather than by a `memory_budget=`, because
+there is nothing to trade off — they stream, or they do not.
+
+`pyscx.obs_import` / `doublet_import` / `cellbender_import` (and their `scx`
+subcommands) rewrite the target's `obs` **one shard at a time** whenever the
+target's obs is sharded — anything `from_anndata` wrote above
+`shard_target_rows`, and anything `merge` or `append` produced. Peak is one obs
+shard plus one row index and one key string per target cell, so landing a
+100-cell annotation on a 10M-cell atlas does not cost the atlas's obs table.
+The input's obs shard boundaries are preserved rather than re-derived.
+
+A target whose `obs` is a single legacy `ObsMetadata` section has no per-shard
+reader, so the whole table is assembled; the op warns and reports
+`obs_streamed = false` in its summary. Run `scx optimize` on such a file first
+to migrate obs to the sharded layout. The remaining unbounded paths — the
+key diagnosis printed on a *failed* join, caller-supplied `obsm` embeddings, and
+the source table itself — are enumerated in
+[docs/operations.md § Memory: bounded on the target, resident on the source](operations.md#memory-bounded-on-the-target-resident-on-the-source).
+
 ## Conversion-time predicate indexes and detection bitmaps
 
 CLI flags `--index-obs`, `--index-var`, `--index-preset`,
@@ -1369,9 +1390,12 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   **`overwrite` replaces, it does not merge** — importing several
   per-batch tables in turn keeps only the last. Returns a summary dict
   (`n_obs`, `n_matched`, `n_target_rows_absent`, `n_source_rows_absent`,
-  `obs_key_column`, `obs_columns_added`, `obs_index_dropped`, and a
-  `key_diagnosis` on failure or `dry_run`); inspect `n_matched`, or run with
-  `dry_run=True`, before trusting the result. Undone by `pyscx.rollback`. See
+  `obs_key_column`, `obs_columns_added`, `obs_index_dropped`, `obs_streamed`,
+  and a `key_diagnosis` on failure or `dry_run`); inspect `n_matched`, or run
+  with `dry_run=True`, before trusting the result. `obs_streamed` is `False`
+  when the target's obs is a legacy single section and had to be assembled
+  whole — see [Ops that bound themselves without a budget knob](#ops-that-bound-themselves-without-a-budget-knob).
+  Undone by `pyscx.rollback`. See
   [docs/operations.md § External obs import](operations.md#external-obs-import).
 - `pyscx.diagnose_obs_key(path, key=None)` — Read-only. Report which obs columns
   could serve as a join key: `n_obs`, `resolved_key`, `resolved_cardinality`,

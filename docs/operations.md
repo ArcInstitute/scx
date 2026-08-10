@@ -477,6 +477,14 @@ appended with the source file's BLAKE3 in `input_checksums`.
 Known interaction: `scx subset` currently drops layers, so subset before
 importing rather than after.
 
+Memory behaves as it does for `obs-import` — see
+[§ Memory: bounded on the target, resident on the source](#memory-bounded-on-the-target-resident-on-the-source)
+below. The CellBender-specific addition is the source: `read_cellbender_h5` is
+not streaming and does not honour `--memory-budget`, because the barcode-keyed
+join reorders rows arbitrarily and the matrix has to be resident. Bounded in
+practice by `total_droplets_included` (default 25k, heuristic cap 70k), but a
+full all-droplet output on a very wide feature axis still costs several GB.
+
 ## External obs import
 
 `scx obs-import <target.scx> <table.csv>` / `pyscx.obs_import` land per-cell
@@ -506,6 +514,31 @@ section that must cover every cell. On an 864 MB / 500k-cell atlas that is
 payload of the columns being added. `scx info` reports the orphaned total; see
 [§ Compact](#compact) to reclaim it, and prefer one import of a concatenated
 table over a loop of per-batch imports.
+
+### Memory: bounded on the target, resident on the source
+
+Rewriting obs in full is a *bytes-on-disk* cost, not a memory one. On a file
+whose obs is sharded — anything `from_anndata` wrote above `shard_target_rows`,
+and anything `merge` or `append` produced — neither import holds the obs table:
+the schema comes from the Arrow IPC footer, the join reads only the key
+column(s), and the rewrite runs one obs shard at a time. Peak is one obs shard
+plus the join arrays (one row index and one key string per target cell). The
+input's shard boundaries are preserved rather than re-derived, as with `compact`
+and `optimize`.
+
+Four paths are still unbounded, and three of them are reachable:
+
+| Path | Cost | What to do |
+|---|---|---|
+| A legacy single-section `obs` target | the whole obs table | Run [`scx optimize`](#optimize) first to migrate obs to the sharded layout. The import warns and reports `obs_streamed = false`. |
+| A failed join's key diagnosis | the whole obs table, plus a pass per column | Only reached when the import is already failing. |
+| `obsm` embeddings supplied by the caller | one `n_obs`-row section | Not reached by any doublet caller or by CellBender. |
+| The source table | resident in full | Inherent: the join is by key, so the source's row order is its own business. The source is the small side — that is the premise the feature rests on. |
+
+The import summary reports `obs_streamed`, so which target-side path ran is
+answerable after the fact rather than inferred from the file's layout. The same
+applies to `cellbender-import`, whose `var` axis is additionally read whole —
+that is the gene axis, so it does not scale with the atlas.
 
 ### The join is by key string, never by row position
 
