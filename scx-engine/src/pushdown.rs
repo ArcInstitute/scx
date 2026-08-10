@@ -152,7 +152,7 @@ fn can_exclude_shard(
                         // bitset is positional over the sorted category
                         // list, so reading `batch == 2` as "bit 2" prunes on
                         // a numeric coincidence. Worse, a column indexed
-                        // before review §5.6 carries an entry-less
+                        // by an earlier version carries an entry-less
                         // `CategoricalIndex`, whose derived bitset is
                         // zero-length — so every shard took the
                         // out-of-range → "absent" branch below and the query
@@ -628,7 +628,7 @@ mod tests {
     /// shard 1 does not have set, and drop the shard that holds it.
     ///
     /// Unreachable before integer literals validated against
-    /// integer-valued categoricals (review §5.6) — and the reason that
+    /// integer-valued categoricals — and the reason that
     /// fix could not ship on its own.
     #[test]
     fn an_integer_literal_is_never_a_category_ordinal() {
@@ -654,7 +654,7 @@ mod tests {
     }
 
     /// The legacy-file regression. Every SCX file written before the
-    /// §5.6 fix indexed an integer categorical as an entry-less
+    /// classification fix indexed an integer categorical as an entry-less
     /// `CategoricalIndex`, which `derive_shard_column_stats` turns into
     /// a **zero-length** `CategoryBitset` on every shard. Reading an
     /// integer literal as an ordinal then took the

@@ -882,7 +882,7 @@ fn build_obs_predicate_index_bytes_forced_high_cardinality_errors() {
 }
 
 // -------------------------------------------------------------------
-// Dictionary value types (review §5.6)
+// Dictionary value types
 //
 // `pd.Categorical([1, 2, 3])` reaches Arrow as `Dictionary(_, Int64)`
 // and `pd.Categorical([True, False])` as `Dictionary(_, Boolean)`.
@@ -960,7 +960,7 @@ fn integer_categorical_is_indexed_numerically() {
         }
         IndexedColumn::Categorical(cat) => panic!(
             "integer categorical was indexed as categorical with {} entries \
-             (zero entries is the §5.6 bug)",
+             (zero entries is the bug)",
             cat.entries.len()
         ),
     }

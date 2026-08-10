@@ -2450,7 +2450,7 @@ fn logical_type(dt: &DataType) -> &DataType {
 /// purposes, because `build_categorical_index` can only extract string
 /// values from a dictionary. Accepting it wrote an index with zero entries
 /// and no outcome, leaving the column unreachable from the query engine
-/// (review §5.6). Such a column routes to the numeric index instead;
+/// engine. Such a column routes to the numeric index instead;
 /// a non-string, non-numeric value type (e.g. `Boolean`) is reported as an
 /// unsupported dtype, exactly as the equivalent plain column already is.
 fn is_categorical_type(dt: &DataType) -> bool {

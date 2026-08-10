@@ -161,7 +161,7 @@ pub fn eval_rowset(pred: &Predicate, ctx: &RowSetCtx) -> Option<RowSet> {
             // categorical index is *unknown*, not provably absent: skipping
             // it and returning the union of the members that did resolve
             // silently narrows the result. That is not hypothetical — a file
-            // written before review §5.6 indexed an integer-valued
+            // written by an earlier version indexed an integer-valued
             // categorical as an entry-less `CategoricalIndex`, so
             // `batch in [1, 2]` resolved to an exact **empty** row set.
             if vals.iter().any(|v| !matches!(v, ScalarValue::Utf8(_))) {
@@ -510,7 +510,7 @@ impl<'a> Parser<'a> {
     /// integers, floats and bools — so the *value* type is what a literal
     /// has to match. Hardcoding `Utf8` here made an integer-valued
     /// categorical reject both `batch == 1` and `batch == '1'`, leaving the
-    /// column unreachable from the query engine (review §5.6).
+    /// column unreachable from the query engine.
     fn validate_type(
         &self,
         col: &str,
@@ -901,7 +901,7 @@ fn eval_comparison_on_array(
             // Any other value type — an integer / float / bool pandas
             // `Categorical` — decodes to its value array and re-enters the
             // primitive arms above, so a dictionary-encoded column compares
-            // exactly like the plain column it holds (review §5.6). Decoding
+            // exactly like the plain column it holds. Decoding
             // costs one pass; `Predicate::In` is an OR of `Eq` and so decodes
             // once per member, which is fine at categorical cardinality.
             _ => {
@@ -1602,7 +1602,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Dictionary value types other than string (review §5.6)
+    // Dictionary value types other than string
     // -----------------------------------------------------------------------
 
     /// `pd.Categorical([...])` over integers / bools / floats, keyed
@@ -1637,7 +1637,7 @@ mod tests {
         (*dict_batch().schema()).clone()
     }
 
-    /// The core §5.6 case: `batch == 20` must parse **and** select the
+    /// The core case: `batch == 20` must parse **and** select the
     /// right rows. A test that only asserts `parse_predicate(...).is_ok()`
     /// would pass against a version that returns every row, or none.
     #[test]
@@ -1719,7 +1719,7 @@ mod tests {
     }
 
     /// And the same for an integer-valued categorical, which is the
-    /// column the §5.6 user actually has.
+    /// column an analyst actually has.
     #[test]
     fn string_literal_against_an_integer_categorical_is_rejected() {
         let schema = dict_schema();
@@ -1975,7 +1975,7 @@ mod tests {
         /// silently drops rows; the whole predicate must go residual.
         ///
         /// Reachable since integer literals started validating against
-        /// integer-valued categoricals (review §5.6): a file written
+        /// integer-valued categoricals: a file written
         /// before that fix carries an entry-less `CategoricalIndex` for
         /// such a column, so `batch in [1, 2]` would resolve to an
         /// exact **empty** row set.
@@ -1996,7 +1996,7 @@ mod tests {
         }
 
         /// The same hazard in its purest form: an index whose column
-        /// carries no entries at all (what §5.6 wrote for every
+        /// carries no entries at all (what earlier versions wrote for every
         /// integer categorical) must not answer "no rows anywhere".
         #[test]
         fn in_over_an_entry_less_categorical_is_residual() {

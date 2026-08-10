@@ -39,7 +39,7 @@ def test_from_anndata_unknown_preset_raises(synthetic_adata, tmp_dir):
 
 
 # ---------------------------------------------------------------------------
-# Non-string categorical value types (review §5.6)
+# Non-string categorical value types
 #
 # pandas writes every Categorical as an Arrow dictionary regardless of what
 # the categories are, so `pd.Categorical([1, 2, 3])` arrives as
