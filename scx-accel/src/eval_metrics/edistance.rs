@@ -227,45 +227,6 @@ pub fn compute_energy_distance<F: PairwiseFloat>(
     })
 }
 
-/// How much a full `n×n` pairwise-distance mean overstates the strict
-/// upper-triangle mean, because of the self diagonal.
-///
-/// `scx_gpu::gpu_mean_pairwise_distance(a, a, …)` reduces the whole square;
-/// [`super::distances::mean_pairwise_distance_self`] sums only `j > i`. Subtract
-/// this from the former to get the latter.
-///
-/// - **Euclidean → 0.** The diagonal is `(‖a‖² + ‖a‖² − 2·a·a).max(0).sqrt()`.
-/// - **Cosine → one unit per zero-norm row, over `n²`.** Row normalization
-///   leaves a zero-norm row as zeros, so its Gram diagonal is `0` and its
-///   distance `1 − 0 = 1`; every other row normalizes to unit length and gives
-///   `1 − 1 = 0`.
-///
-/// "Zero-norm" is tested in `f64`, matching `distances::normalize_rows`, which
-/// accumulates `‖·‖²` in `f64` — so a row of f32 denormals whose square
-/// underflows counts as *nonzero* on both sides of the comparison.
-///
-/// Returns 0.0 whenever `cosine` is false or no row is zero-norm, which is every
-/// input the existing GPU fixtures use.
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-fn self_diagonal_correction(a: &[f32], n: usize, n_dims: usize, cosine: bool) -> f64 {
-    if !cosine || n == 0 || n_dims == 0 {
-        return 0.0;
-    }
-    let zero_norm_rows = (0..n)
-        .filter(|&i| {
-            a[i * n_dims..(i + 1) * n_dims]
-                .iter()
-                .map(|&x| {
-                    let xf = x as f64;
-                    xf * xf
-                })
-                .sum::<f64>()
-                == 0.0
-        })
-        .count();
-    zero_norm_rows as f64 / (n as f64 * n as f64)
-}
-
 /// Build a group index: maps each group ID to the list of row indices
 /// belonging to that group. This is done once before the parallel loop
 /// to avoid repeated O(N) scans inside `par_iter`.
@@ -359,27 +320,19 @@ pub fn compute_energy_distance_gpu(
         scx_gpu::gpu_mean_pairwise_distance(dev, &handle, a, b, na, nb, n_dims, cosine)
             .map_err(|e| crate::AccelError::LinAlg(format!("GPU pairwise distance: {e}")))
     };
-    // Self-distance, matched to the CPU convention.
+    // `gpu_mean_pairwise_distance(a, a, n, n)` omits the self diagonal inside
+    // the kernel, so it already matches the CPU's strict-upper-triangle
+    // convention and needs no host-side correction.
     //
-    // `gpu_mean_pairwise_distance(a, a, ..)` reduces the **full n×n square**,
-    // diagonal included, while the CPU self path sums the strict upper triangle
-    // — i.e. it drops the diagonal, which is what
-    // `sklearn.metrics.pairwise.cosine_distances` does (it forces the self
-    // diagonal to 0 when `X is Y`).
-    //
-    // For euclidean that is the same answer: the diagonal is
-    // `(‖a‖² + ‖a‖² − 2·a·a).max(0).sqrt()` = 0. For **cosine** it is not, on
-    // exactly one kind of row. `normalize_rows` leaves a zero-norm row as zeros,
-    // so its Gram diagonal is `1 − 0 = 1`, and the square carries one such 1.0
-    // per zero-norm row. Two all-zero rows: triangle → `2·1/4 = 0.5`, square →
-    // `4·1/4 = 1.0`. Subtract them so both devices answer the same question.
-    //
-    // Non-cosine, or no zero-norm rows, makes this exactly zero — so every
-    // existing GPU fixture is bit-unchanged by it.
-    let self_mean = |a: &[f32], n: usize| -> crate::Result<f64> {
-        let full = mean_pair(a, a, n, n)?;
-        Ok(full - self_diagonal_correction(a, n, n_dims, cosine))
-    };
+    // An earlier round of this PR tried to repair it on the host by subtracting
+    // a count of zero-norm rows. That was wrong twice over: it only covered
+    // cosine, leaving euclidean's f32-gram residual in place (~6.5e-4 of mean
+    // error at n=20, d=2000, against a documented `atol=1e-3` per-perturbation
+    // bar), and it classified zero-norm rows in f64 while the device normalizer
+    // accumulates in f32 — so a row of denormals disagreed about which side had
+    // a diagonal at all. A host-side classifier cannot exactly repair a device
+    // full-square reduction; the kernel skips the pair instead.
+    let self_mean = |a: &[f32], n: usize| -> crate::Result<f64> { mean_pair(a, a, n, n) };
 
     let real_index = build_group_index(real_groups);
     let pred_index = build_group_index(pred_groups);
@@ -894,70 +847,6 @@ mod tests {
         let pert_indices: Vec<u32> = (1..=n_perts as u32).collect();
         let pred = cells.clone();
         (cells, pred, groups, pert_names, pert_indices)
-    }
-
-    #[test]
-    fn self_diagonal_correction_is_zero_unless_cosine_meets_a_zero_row() {
-        // The correction exists to reconcile the GPU's full-square self mean
-        // with the CPU's strict upper triangle. It must be exactly zero on
-        // everything the existing GPU fixtures feed it, or it would shift
-        // numbers that are already correct.
-        let nonzero = vec![1.0f32, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0];
-        assert_eq!(self_diagonal_correction(&nonzero, 3, 3, true), 0.0);
-        assert_eq!(self_diagonal_correction(&nonzero, 3, 3, false), 0.0);
-
-        // Euclidean never needs it, zero rows or not.
-        let two_zero = vec![0.0f32; 6];
-        assert_eq!(self_diagonal_correction(&two_zero, 2, 3, false), 0.0);
-
-        // Cosine + zero rows: one unit per zero row, over n^2. Two all-zero
-        // rows take the GPU's 4*1/4 = 1.0 down to the triangle's 2*1/4 = 0.5.
-        assert_eq!(self_diagonal_correction(&two_zero, 2, 3, true), 2.0 / 4.0);
-
-        // One zero row among two unit rows.
-        let mixed = vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
-        assert_eq!(self_diagonal_correction(&mixed, 3, 3, true), 1.0 / 9.0);
-
-        // Denormal rows are *not* zero-norm: `normalize_rows` accumulates in
-        // f64, where 1e-30^2 is representable, so it normalizes them and the
-        // diagonal is 1 - 1 = 0 on both devices.
-        let denormal = vec![1e-30f32; 6];
-        assert_eq!(self_diagonal_correction(&denormal, 2, 3, true), 0.0);
-
-        // Degenerate shapes must not divide by zero or index out of range.
-        assert_eq!(self_diagonal_correction(&[], 0, 3, true), 0.0);
-        assert_eq!(self_diagonal_correction(&two_zero, 2, 0, true), 0.0);
-    }
-
-    #[test]
-    fn the_gpu_correction_reproduces_the_cpu_self_distance() {
-        // Cross-checks the correction's *value* against the CPU kernels rather
-        // than against its own arithmetic: full-square mean minus the
-        // correction must equal what `mean_pairwise_distance_self` returns.
-        // This is the identity the GPU path relies on, and it needs no GPU.
-        for (a, n) in [
-            (vec![0.0f32; 6], 2usize),
-            (vec![0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0], 3),
-            (vec![1.0f32, 2.0, 3.0, -1.0, 0.5, 2.0, 0.0, 4.0, 1.0], 3),
-        ] {
-            for cosine in [true, false] {
-                let metric = if cosine {
-                    DistanceMetric::Cosine
-                } else {
-                    DistanceMetric::Euclidean
-                };
-                let square =
-                    mean_pairwise_distance(&a, &a, n, n, 3, metric, DistanceBackend::Gemm).unwrap();
-                let triangle =
-                    mean_pairwise_distance_self(&a, n, 3, metric, DistanceBackend::Gemm).unwrap();
-                let corrected = square - self_diagonal_correction(&a, n, 3, cosine);
-                assert!(
-                    (corrected - triangle).abs() < 1e-6,
-                    "cosine={cosine} n={n}: square {square} - correction = {corrected}, \
-                     but the CPU self path returns {triangle}"
-                );
-            }
-        }
     }
 
     #[test]

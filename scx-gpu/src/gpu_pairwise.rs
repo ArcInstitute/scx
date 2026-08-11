@@ -66,9 +66,19 @@ fn col_sqnorm(
 /// `a` `[na × d]` and `b` `[nb × d]` (f32 host slices). `cosine=false` →
 /// euclidean; `cosine=true` → cosine distance (`1 − cosine_sim`, clamped
 /// `[0,2]`, inputs L2-normalized first). Returns `0.0` when either set is empty
-/// (matching the CPU `mean_pairwise_distance`). For the self case pass the same
-/// slice as `a` and `b` — the diagonal contributes 0 (clamped) and the mean is
-/// over `na²`, matching `mean_pairwise_distance_self`.
+/// (matching the CPU `mean_pairwise_distance`).
+///
+/// For the self case pass the same slice as `a` and `b` with `na == nb`: the
+/// kernel then **omits the diagonal** and divides by `na²`, which is exactly
+/// what the CPU `mean_pairwise_distance_self` computes (`2·Σ_{i<j} d / n²`) and
+/// what `sklearn.metrics.pairwise.cosine_distances` does when X is Y.
+///
+/// The diagonal has to be skipped rather than assumed zero. The gram is f32
+/// while the norms are f64, so a euclidean self entry is the square root of a
+/// small nonzero residual — measured on the CPU at ~6.5e-4 of mean error for
+/// `n = 20`, `d = 2000`, against a documented CPU/GPU bar of `atol=1e-3` per
+/// perturbation. And a cosine zero-norm row normalizes to zeros, giving
+/// `1 − 0 = 1` on its own diagonal, not 0.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_mean_pairwise_distance(
     dev: &GpuDevice,
@@ -98,7 +108,18 @@ pub fn gpu_mean_pairwise_distance(
     let budget = pairwise_gram_budget(dev);
     let gram_bytes = (na as u64).saturating_mul(nb as u64).saturating_mul(4);
     if gram_bytes > budget {
-        return gpu_mean_pairwise_distance_chunked(dev, handle, a, b, na, nb, d, cosine, budget);
+        return gpu_mean_pairwise_distance_chunked(
+            dev,
+            handle,
+            a,
+            b,
+            na,
+            nb,
+            d,
+            cosine,
+            std::ptr::eq(a, b) && na == nb,
+            budget,
+        );
     }
 
     // Self-distance fast path: `compute_energy_distance_gpu` calls this with
@@ -167,7 +188,9 @@ pub fn gpu_mean_pairwise_distance(
     let func = module
         .load_function("pairwise_dist_sum_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("pairwise_dist_sum: {e}")))?;
-    launch_pairwise_sum(dev, &func, &gram, &a_sq, b_sq, na, nb, cosine, &mut out)?;
+    launch_pairwise_sum(
+        dev, &func, &gram, &a_sq, b_sq, na, nb, cosine, 0, is_self, &mut out,
+    )?;
     dev.synchronize()?;
 
     let sum = dev.dtoh_copy(&out)?[0];
@@ -208,6 +231,8 @@ fn launch_pairwise_sum(
     na: usize,
     nb: usize,
     cosine: bool,
+    a_row_offset: usize,
+    skip_diagonal: bool,
     out: &mut CudaSlice<f64>,
 ) -> Result<(), GpuError> {
     let threads: u32 = 256;
@@ -218,6 +243,8 @@ fn launch_pairwise_sum(
     let na_i64 = na as i64;
     let nb_i64 = nb as i64;
     let mode: i32 = if cosine { 1 } else { 0 };
+    let offset_i64 = a_row_offset as i64;
+    let skip_i32: i32 = i32::from(skip_diagonal);
     let smem: u32 = threads * 8; // one f64 per thread
     unsafe {
         dev.stream()
@@ -228,6 +255,8 @@ fn launch_pairwise_sum(
             .arg(&na_i64)
             .arg(&nb_i64)
             .arg(&mode)
+            .arg(&offset_i64)
+            .arg(&skip_i32)
             .arg(out)
             .launch(LaunchConfig {
                 grid_dim: (blocks.max(1), 1, 1),
@@ -244,7 +273,9 @@ fn launch_pairwise_sum(
 /// block's gram (`na_block × nb` f32) fits the budget; uploads `b` once and
 /// accumulates every block's pairwise-sum into a single `out` via the kernel's
 /// `atomicAdd`, then divides by `na·nb`. Numerically equivalent to the
-/// single-shot path within f64-atomic summation order.
+/// single-shot path within f64-atomic summation order. `is_self` is forwarded
+/// to the kernel along with each tile's global first row, so the diagonal is
+/// omitted from whichever tile happens to contain it.
 #[allow(clippy::too_many_arguments)]
 fn gpu_mean_pairwise_distance_chunked(
     dev: &GpuDevice,
@@ -255,6 +286,7 @@ fn gpu_mean_pairwise_distance_chunked(
     nb: usize,
     d: usize,
     cosine: bool,
+    is_self: bool,
     budget: u64,
 ) -> Result<f64, GpuError> {
     // `b` is the columns operand — upload + normalize + squared-norm once and
@@ -310,7 +342,11 @@ fn gpu_mean_pairwise_distance_chunked(
         } else {
             col_sqnorm(dev, &a_dev, d, na_b)?
         };
-        launch_pairwise_sum(dev, &func, &gram, &a_sq, &b_sq, na_b, nb, cosine, &mut out)?;
+        // `i0` is this tile's first global a-row, which is what lets the
+        // kernel find the diagonal inside a tile that does not start at 0.
+        launch_pairwise_sum(
+            dev, &func, &gram, &a_sq, &b_sq, na_b, nb, cosine, i0, is_self, &mut out,
+        )?;
         i0 = i1;
     }
     dev.synchronize()?;

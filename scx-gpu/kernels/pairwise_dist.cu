@@ -33,6 +33,16 @@ extern "C" __global__ void col_sqnorm_kernel(
 // mode 0 = euclidean (uses a_sq/b_sq), mode 1 = cosine (ignores a_sq/b_sq).
 // Grid-stride over the gram elements; block-reduce in double, then a single
 // atomicAdd(double) of the block partial into *out_sum (native on CC >= 6.0).
+//
+// skip_diagonal != 0 omits the self pair (global a-row == b-row), matching the
+// CPU `mean_pairwise_distance_self`, which sums the strict upper triangle and
+// so never evaluates d(a_i, a_i) — the convention
+// `sklearn.metrics.pairwise.cosine_distances` uses when X is Y. It must be
+// skipped rather than assumed zero: the gram is f32 while the norms are f64,
+// so a euclidean self entry is sqrt of a small nonzero residual (measured ~0.11
+// per diagonal at n_dims=2000), and a cosine zero-norm row normalizes to zeros
+// and yields 1 - 0 = 1. a_row_offset is the global index of this block's first
+// a-row, so the chunked launcher can identify the diagonal in its own tile.
 extern "C" __global__ void pairwise_dist_sum_kernel(
     const float* __restrict__ gram,   // [na x nb] col-major: (i,j) at i + j*na
     const double* __restrict__ a_sq,  // [na] (euclidean only)
@@ -40,6 +50,8 @@ extern "C" __global__ void pairwise_dist_sum_kernel(
     long long na,
     long long nb,
     int mode,
+    long long a_row_offset,           // global index of local a-row 0
+    int skip_diagonal,                // != 0 -> omit global a-row == b-row
     double* __restrict__ out_sum
 ) {
     extern __shared__ double sdata[];
@@ -54,6 +66,7 @@ extern "C" __global__ void pairwise_dist_sum_kernel(
         // large control groups, so a 32-bit cast would overflow.
         long long j = idx / na;
         long long i = idx - j * na;
+        if (skip_diagonal && (a_row_offset + i) == j) continue;
         double g = (double)gram[idx];
         double dist;
         if (mode == 0) {

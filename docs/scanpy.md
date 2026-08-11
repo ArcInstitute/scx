@@ -3028,9 +3028,9 @@ The self-distance term (`d(X, X)`, and the once-per-side control self-distance)
 additionally takes the **strict upper triangle** rather than the full square,
 which is what `backend="scalar"` has always done and what
 `sklearn.metrics.pairwise.cosine_distances` does (it forces the self diagonal to
-0 when `X is Y`). On ordinary input the discarded half is the symmetric mirror
-plus an exact-zero diagonal, so values move only in the last bits and land
-*closer* to `backend="scalar"` than before.
+0 when `X is Y` rather than evaluating it). On ordinary input the discarded half
+is the symmetric mirror plus a diagonal that evaluates to ~0, so values move only
+in the last bits and land *closer* to `backend="scalar"` than before.
 
 > [!IMPORTANT]
 > On a **zero-norm row under `metric="cosine"`** it is not a last-bit change.

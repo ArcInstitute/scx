@@ -63,15 +63,36 @@ pub fn pairwise_memory_budget() -> u64 {
     })
 }
 
+/// faer's leading dimension for a `Mat` of `n_rows` rows of `elem_bytes` each.
+///
+/// `faer::Mat` pads its column stride to a 64-byte boundary, so a `Mat` of
+/// `n_rows` rows actually reserves `pad(n_rows) × n_cols × elem_bytes`. Measured
+/// on faer 0.24: `Mat::<f32>::zeros(1, 1000)` asks the allocator for 64 000
+/// bytes, not 4 000 — a 16× overshoot — and `Mat::<f64>::zeros(1, 1000)` for
+/// 64 000 rather than 8 000. The rounding quantum is `64 / elem_bytes`
+/// (f32 → 16 rows, f64 → 8).
+///
+/// [`plan_gram_row_block`] budgets against this rather than the logical size,
+/// so a narrow `n_b` cannot blow past the byte ceiling the knob advertises.
+pub fn faer_padded_rows(n_rows: usize, elem_bytes: usize) -> usize {
+    let quantum = (64 / elem_bytes.max(1)).max(1);
+    n_rows.div_ceil(quantum).saturating_mul(quantum)
+}
+
 /// Pure planner (no allocation, unit-testable): how many rows of `a` one Gram
-/// block may cover so that `rows × n_b × elem_bytes` fits `budget`.
+/// block may cover so that faer's actual allocation for it fits `budget`.
+///
+/// Budgets [`faer_padded_rows`]`(n_b, elem_bytes) × rows × elem_bytes` — the
+/// bytes the allocator is really asked for — not the logical `n_b × rows`.
 ///
 /// Two clamps carry the contract:
 ///
 /// - **Never 0.** A single row whose Gram alone exceeds the budget still gets
 ///   its own block, so the caller always makes progress rather than looping
 ///   forever or erroring. Same rule as the GPU sibling
-///   (`scx-gpu/src/gpu_pairwise.rs::gpu_mean_pairwise_distance_chunked`).
+///   (`scx-gpu/src/gpu_pairwise.rs::gpu_mean_pairwise_distance_chunked`). This
+///   is the one case where the result can exceed `budget`, which is why the
+///   documented bound is `max(budget, one padded Gram row)`.
 /// - **Never more than `n_a`.** Anything that already fits stays one block, and
 ///   a one-block run issues exactly the gemm the unblocked kernel did, over
 ///   exactly the same operands — so *blocking* contributes no drift below the
@@ -79,7 +100,9 @@ pub fn pairwise_memory_budget() -> u64 {
 ///   the full square to the upper triangle. That is a separate change; this
 ///   clamp is what keeps the cross path bit-identical.)
 pub fn plan_gram_row_block(n_a: usize, n_b: usize, elem_bytes: usize, budget: u64) -> usize {
-    let per_row = (n_b as u64).saturating_mul(elem_bytes as u64).max(1);
+    let per_row = (faer_padded_rows(n_b, elem_bytes) as u64)
+        .saturating_mul(elem_bytes as u64)
+        .max(1);
     // Clamp in `u64` *before* narrowing: on a 32-bit target `budget / per_row`
     // can exceed `usize::MAX` and a direct cast would truncate — plausibly to a
     // tiny value or 0, silently shrinking the block instead of widening it.
@@ -212,6 +235,43 @@ mod tests {
             (rows as u64) * (n as u64) * 4 <= budget,
             "block of {rows} rows needs {} bytes, over the {budget}-byte budget",
             (rows as u64) * (n as u64) * 4
+        );
+    }
+
+    #[test]
+    fn faer_padding_is_measured_not_assumed() {
+        // Quantum is 64 bytes / elem. Values pinned against a live
+        // `Mat::zeros` allocation probe on faer 0.24.
+        assert_eq!(faer_padded_rows(1, 4), 16);
+        assert_eq!(faer_padded_rows(3, 4), 16);
+        assert_eq!(faer_padded_rows(16, 4), 16);
+        assert_eq!(faer_padded_rows(17, 4), 32);
+        assert_eq!(faer_padded_rows(1, 8), 8);
+        assert_eq!(faer_padded_rows(7, 8), 8);
+        assert_eq!(faer_padded_rows(17, 8), 24);
+        // A shape already on the boundary must not be inflated.
+        assert_eq!(faer_padded_rows(4096, 4), 4096);
+        assert_eq!(faer_padded_rows(0, 4), 0);
+    }
+
+    #[test]
+    fn a_narrow_gram_still_fits_the_budget_once_padded() {
+        // The case the logical-size planner got wrong: `n_b = 1` f32 pads to 16
+        // rows, so budgeting `n_b * elem` overshoots the real allocation 16×.
+        let budget = 1 << 20; // 1 MiB
+        let rows = plan_gram_row_block(10_000_000, 1, 4, budget);
+        let real_bytes = (faer_padded_rows(1, 4) as u64) * (rows as u64) * 4;
+        assert!(
+            real_bytes <= budget,
+            "block of {rows} rows really allocates {real_bytes} bytes, over the {budget} budget"
+        );
+        // And the logical calculation is what would have overshot, so this test
+        // is not vacuous.
+        let logical_rows = (budget / 4) as usize;
+        assert!(
+            logical_rows > rows * 8,
+            "expected the padded planner to be much tighter than the logical one \
+             ({logical_rows} vs {rows})"
         );
     }
 

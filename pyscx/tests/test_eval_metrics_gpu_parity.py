@@ -149,6 +149,70 @@ def test_energy_distance_gpu_matches_cpu_cosine():
     assert _close_or_nan(float(cpu), float(gpu), 1e-4), f"cpu={cpu} gpu={gpu}"
 
 
+def _make_zero_row_adata(n_obs=120, n_vars=40, n_perts=4, seed=11, n_zero=6):
+    """Paired adata whose first `n_zero` cells of every group are all-zero rows.
+
+    All-zero cells are the input on which the self-diagonal convention stops
+    being a rounding detail: row normalization leaves such a row as zeros, so its
+    cosine self-similarity is `1 - 0 = 1`, and a full-square reduction counts a
+    whole unit per zero row that the strict upper triangle does not.
+    """
+    import pandas as pd
+
+    rng = np.random.default_rng(seed)
+    pert_names = ["control"] + [f"drug_{i}" for i in range(n_perts - 1)]
+    labels = [pert_names[i % n_perts] for i in range(n_obs)]
+
+    def build(off):
+        X = np.abs(rng.normal(3.0, 1.0, size=(n_obs, n_vars))).astype(np.float32) + off
+        # Zero out the first `n_zero` cells of each group.
+        seen = {}
+        for i, lab in enumerate(labels):
+            k = seen.get(lab, 0)
+            if k < n_zero:
+                X[i, :] = 0.0
+                seen[lab] = k + 1
+        return ad.AnnData(sp.csr_matrix(X), obs=pd.DataFrame({"perturbation": labels}))
+
+    return build(0.0), build(0.3)
+
+
+@pytest.mark.parametrize("metric", ["euclidean", "cosine"])
+def test_energy_distance_gpu_matches_cpu_with_zero_rows(metric):
+    """The case the CPU/GPU self-diagonal divergence actually shows up on.
+
+    Before the kernel learned to skip the self diagonal, the GPU reduced the
+    full `n x n` square while the CPU summed the strict upper triangle. For
+    cosine that is a whole unit per all-zero row; for euclidean it is the f32
+    gram residual, which at small groups exceeds the `atol=1e-3` per-perturbation
+    bar this suite advertises. Ordinary fixtures cannot see either — every row in
+    `_make_paired_adata` has a nonzero norm and the groups are large.
+    """
+    real, pred = _make_zero_row_adata()
+    cpu = pyscx.accel.energy_distance(real, pred, metric=metric, device="cpu")
+    gpu = pyscx.accel.energy_distance(real, pred, metric=metric, device="gpu")
+    assert _edist_route(pred)["route"].startswith("gpu"), _edist_route(pred)
+    assert _close_or_nan(float(cpu), float(gpu), 1e-4), f"cpu={cpu} gpu={gpu}"
+
+
+@pytest.mark.parametrize("metric", ["euclidean", "cosine"])
+def test_energy_distance_gpu_matches_cpu_small_groups(metric):
+    """Small groups are where the f32 self-diagonal residual is largest.
+
+    The diagonal's contribution to a self-distance mean scales as ~1/n, so a
+    20-cell perturbation group is ~50x more exposed than a 1000-cell one. Pinned
+    per-perturbation, not just on the correlation, since the correlation can
+    absorb a uniform shift.
+    """
+    real, pred = _make_paired_adata(n_obs=80, n_vars=2000, n_perts=4, seed=21)
+    cpu = pyscx.accel.energy_distance_details(real, pred, metric=metric, device="cpu")
+    gpu = pyscx.accel.energy_distance_details(real, pred, metric=metric, device="gpu")
+    for name in cpu["d_real"]:
+        assert _close_or_nan(cpu["d_real"][name], gpu["d_real"][name], 1e-3), (
+            f"{metric} d_real[{name}]: cpu={cpu['d_real'][name]} gpu={gpu['d_real'][name]}"
+        )
+
+
 def test_energy_distance_gpu_matches_cpu_backed(tmp_path):
     real, pred = _make_paired_adata(seed=6)
     rp = str(tmp_path / "real.scx")

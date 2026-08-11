@@ -589,13 +589,14 @@ fn mean_pairwise_distance_with_budget<F: PairwiseFloat>(
 /// * `metric` — Distance metric to use.
 ///
 /// # Returns
-/// The mean distance over all `n*(n-1)/2` distinct unordered pairs,
-/// equivalent to `pairwise_distances(a, a).mean()` but including the
-/// zero diagonal (matching sklearn's convention for `pairwise_distances`).
+/// The mean distance over all `n*(n-1)/2` distinct unordered pairs, taken over
+/// the full `n × n` matrix's cell count: `sum(d(a_i, a_j) for i < j) * 2 / (n * n)`.
 ///
-/// Specifically: `sum(d(a_i, a_j) for i < j) * 2 / (n * n)`.
-/// This matches `sklearn.metrics.pairwise_distances(a, a).mean()` because
-/// the diagonal entries are 0 and the matrix is symmetric.
+/// This matches `sklearn.metrics.pairwise_distances(a, a).mean()`, which forces
+/// the self diagonal to 0 when `X is Y` rather than evaluating it. Note that
+/// *evaluating* it would not always give 0 — under cosine, a zero-norm row
+/// normalizes to zeros and its self-similarity is `1 - 0 = 1` — which is why
+/// both backends skip the pair instead of adding it and trusting it to vanish.
 ///
 /// Returns 0.0 if `n < 2`.
 pub fn mean_pairwise_distance_self<F: PairwiseFloat>(
@@ -633,15 +634,17 @@ fn mean_pairwise_distance_self_with_budget<F: PairwiseFloat>(
     let backend = resolve_backend(backend, metric)?;
 
     // Both backends sum the strict upper triangle. The full n×n matrix holds
-    // each of those pairs twice plus n zero-diagonal entries, so:
+    // each of those pairs twice, plus n diagonal cells that sklearn forces to 0
+    // (they are *not* evaluated — see the note above about zero-norm rows), so:
     //   full_sum = 2 * total
     //   mean     = full_sum / (n * n)
     // which is what `sklearn.metrics.pairwise_distances(a, a).mean()` returns.
     let row_sums: Vec<f64> = match backend {
         DistanceBackend::Gemm => {
             // This used to re-enter the (a, a) cross path, which computed the
-            // whole n×n Gram — the mirror half and an exact-zero diagonal for
-            // nothing. `UpperTriangle` narrows each block's columns operand to
+            // whole n×n Gram — the mirror half for nothing, plus a diagonal that
+            // is only zero on well-behaved input (a cosine zero-norm row's is
+            // 1.0). `UpperTriangle` narrows each block's columns operand to
             // `a[a0..]`. That always halves the expansion loop; it reduces the
             // *gemm* only once there is more than one block, since the first
             // block's operand is still all of `a` — total gemm work is
