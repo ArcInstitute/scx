@@ -1028,10 +1028,15 @@ QueryPipeline::open("file.scx")?
   ("this value is in *no* shard") drawn from a local artifact (the vocabulary
   this file's index happens to hold), so it is made only when the vocabulary
   is known to cover every shard being pruned — established by the catalog
-  itself, since the index build emits a `CategoryBitset` for *every* shard of
-  an indexed categorical column, including an all-zero one where the column
-  has no values there. A shard with no bitset for the column was never seen by
-  that build.
+  itself. Every shard must carry, for that column, a `CategoryBitset` (not just
+  any stat under the same hash — `MinMax` answers to it too) whose byte length
+  is the one the vocabulary implies, consistently across shards. The index
+  build emits exactly that for *every* shard of an indexed categorical column,
+  including an all-zero bitset where the column has no values there, and sizes
+  each from the same entry list the dictionary comes from. So a missing bitset
+  means that shard was never seen by the build, and a wrong-length one means
+  the stats and the index section came from different builds — where bit *i*
+  no longer means entry *i*.
   - In practice the vocabulary is complete on anything written by `convert`,
     `merge`, `compact`, `sort` or `subset` with `--index-*`. It is **not**
     complete after `append` without `--index-obs`, which adds shards the
