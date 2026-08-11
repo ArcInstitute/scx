@@ -151,31 +151,72 @@ jobs:
       # through a pool built in *this* process: the per-pipeline pool passed
       # into `decode_stage`, or `crate::pool::cpu_pool()`.
       #
-      # Deliberately NOT a file allowlist: the three files that hold a `par_*`
-      # today are exactly the files where the next one will be added, so
-      # allowlisting them would blind the gate where it matters most. Instead
-      # every dispatch line must have an `install(` within the preceding 12
-      # lines — true of all of them today by a margin of 1-8 lines. Comments are
-      # skipped, since the rule itself is discussed in prose in these files.
+      # Deliberately NOT a file allowlist: the files holding a `par_*` today are
+      # exactly where the next one will be added, so allowlisting them would
+      # blind the gate where it matters most. Instead every dispatch line needs
+      # an `install(` within the preceding 12 lines **and inside the same
+      # function** — an `fn` line resets the window. Without that reset a safe
+      # function ending in `pool.install(...)` silently covers a bare
+      # `par_iter` in the *next* function; that bypass was demonstrated against
+      # the first version of this gate, which is why the fixtures below exist.
       #
-      # This gate is textual and stops at the crate boundary: it cannot see the
-      # `par_iter` in `scx-format-io`'s `warm_shards` or `read_obs`, which are
-      # covered by `BackedCsrReader::set_cpu_pool` and by an `install` at the
-      # call site. `pyscx/tests/test_fork_safety.py` is what actually pins those.
+      # It is a text heuristic, so it is checked against known-good and
+      # known-bad fixtures before its silence on the real tree is trusted. It
+      # also stops at the crate boundary: it cannot see the `par_iter` in
+      # `scx-format-io`'s `warm_shards` or `read_obs`, which are covered by
+      # `BackedCsrReader::set_cpu_pool` and an `install` at the call site.
+      # `pyscx/tests/test_fork_safety.py` is what actually pins those.
       - name: scx-loader never dispatches to rayon's global pool
         run: |
-          bad=$(awk '
-            FNR == 1 { last_install = -100 }
-            { line = $0; sub(/^[[:space:]]+/, "", line) }
-            line ~ /^\/\// { next }
-            /\.install\(/ { last_install = FNR }
-            /par_iter|par_chunks|par_bridge|into_par_iter|par_sort|rayon::(join|scope|in_place_scope)/ {
-              if (FNR - last_install > 12) print FILENAME ":" FNR ": " line
-            }
-          ' $(find scx-loader/src -name '*.rs'))
+          mkdir -p /tmp/gatefix
+          printf '%s\n' \
+            'FNR == 1 { last_install = -100 }' \
+            '{ line = $0; sub(/^[[:space:]]+/, "", line) }' \
+            'line ~ /^\/\// { next }' \
+            'line ~ /^(pub[[:space:]]*(\([^)]*\))?[[:space:]]*)?(default[[:space:]]+)?(const[[:space:]]+)?(async[[:space:]]+)?(unsafe[[:space:]]+)?fn[[:space:]]/ { last_install = -100 }' \
+            '/\.install\(/ { last_install = FNR }' \
+            '/par_iter|par_chunks|par_bridge|into_par_iter|par_sort|par_extend|par_drain|rayon::(join|scope|in_place_scope|spawn|broadcast)/ {' \
+            '  if (FNR - last_install > 12) print FILENAME ":" FNR ": " line' \
+            '}' \
+            > /tmp/gatefix/gate.awk
+          printf '%s\n' \
+            'fn guarded(pool: &rayon::ThreadPool, v: &mut [f32]) {' \
+            '    pool.install(|| {' \
+            '        v.par_iter_mut().for_each(|x| *x *= 2.0);' \
+            '    });' \
+            '}' \
+            > /tmp/gatefix/good.rs
+          printf '%s\n' \
+            'fn guarded(pool: &rayon::ThreadPool, v: &mut [f32]) {' \
+            '    pool.install(|| {' \
+            '        v.par_iter_mut().for_each(|x| *x *= 2.0);' \
+            '    });' \
+            '}' \
+            '' \
+            'fn leaks_into_the_next_fn(v: &mut [f32]) {' \
+            '    v.par_iter_mut().for_each(|x| *x *= 3.0);' \
+            '}' \
+            '' \
+            'fn also_unguarded(f: impl Fn() + Send) {' \
+            '    rayon::spawn(f);' \
+            '}' \
+            > /tmp/gatefix/bad.rs
+
+          if [ -n "$(awk -f /tmp/gatefix/gate.awk /tmp/gatefix/good.rs)" ]; then
+            echo "::error::rayon gate self-test: flagged a correctly guarded dispatch."
+            exit 1
+          fi
+          n=$(awk -f /tmp/gatefix/gate.awk /tmp/gatefix/bad.rs | wc -l)
+          if [ "$n" -ne 2 ]; then
+            echo "::error::rayon gate self-test: expected 2 findings in the bad fixture, got $n:"
+            awk -f /tmp/gatefix/gate.awk /tmp/gatefix/bad.rs
+            exit 1
+          fi
+
+          bad=$(awk -f /tmp/gatefix/gate.awk $(find scx-loader/src -name '*.rs'))
           if [ -n "$bad" ]; then
             echo "$bad"
-            echo "::error::rayon dispatch in scx-loader with no nearby pool.install(...) — route it through crate::pool::cpu_pool() (see docs/multithreading.md § Fork safety)."
+            echo "::error::rayon dispatch in scx-loader with no pool.install(...) earlier in the same function — route it through crate::pool::cpu_pool() (see docs/multithreading.md § Fork safety)."
             exit 1
           fi
 

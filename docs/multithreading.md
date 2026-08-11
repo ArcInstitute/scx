@@ -240,9 +240,30 @@ global one's. `BackedCsrReader::set_cpu_pool` carries it into `scx-format-io`;
 unset (every other consumer) keeps the global registry, so `scx-accel`,
 `scx-ops`, `scx-engine` and `scx-cli` are unchanged.
 
+The slot is a lock-free `AtomicPtr` to a **never-freed** entry, and that is
+load-bearing rather than an optimisation. Dropping the inherited pool would call
+`ThreadPool::drop` → `Registry::terminate` → `Sleep::wake_specific_thread`,
+which locks each worker's `is_blocked` mutex — inheritable in the locked state
+from a parent worker that no longer exists. A `Mutex` guarding the slot has the
+same problem one level up. Both would hang the child before it ever used the
+fresh pool, so the child neither locks nor destroys inherited state; it leaks
+one small entry per fork generation instead.
+
 The kernels are bare `#[pyfunction]`s, so a forked worker calls them with no
 dataset in hand and no PID check in front of them — the pool is the only guard
 there.
+
+#### Per-worker thread footprint
+
+A `TrainingDataset` worker holds **two** rayon pools, not one: `cpu_pool()`,
+built when the constructor runs `read_obs` / the PFlog α estimate, and the
+per-`TrainingPipeline` decode pool built in `start_epoch`. They are separate on
+purpose — the decode pool is per-instance and released by `close()` / `Drop`,
+while `cpu_pool()` is process-wide — so budget `2 × threads` per worker, times
+`num_workers`. Both are sized by `resolve_pool_threads`, so
+`SCX_LOADER_CPU_THREADS` caps each of them; before that they could diverge,
+since the decode pool read `num_cpus::get_physical()` directly and ignored the
+knob. `IndexPlanDataset` and `SparseCellSetDataset` hold only `cpu_pool()`.
 
 `pyscx/tests/test_fork_safety.py` is the durable regression test;
 post-fix Lambda HPC measurements confirm the workers0 / workers2 paths

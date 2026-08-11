@@ -658,9 +658,14 @@ The same construct-in-the-worker rule applies to `IndexPlanDataset` and
 `SparseCellSetDataset`. Both spawn CPU work on a pool that
 `scx_loader::pool::cpu_pool()` rebuilds whenever the PID changes, so a forked
 worker never dispatches to rayon's inherited global registry (whose worker
-threads `fork()` does not duplicate — a dispatch to it never returns). Size it
-with `SCX_LOADER_CPU_THREADS`; the default is physical cores capped at 8, *per
-worker process*, so raising `num_workers` multiplies the thread count.
+threads `fork()` does not duplicate — a dispatch to it never returns).
+
+Size the pools with `SCX_LOADER_CPU_THREADS` (default: physical cores capped at
+8). It applies *per worker process*, so `num_workers` multiplies it — and a
+`TrainingDataset` worker holds **two** pools, the shared `cpu_pool()` plus its
+own decode pool, so budget `num_workers × 2 × threads` there. `IndexPlanDataset`
+and `SparseCellSetDataset` hold one. See
+[multithreading.md § Per-worker thread footprint](multithreading.md#per-worker-thread-footprint).
 
 > [!TIP]
 > Use `multiprocessing.set_start_method("spawn")` if your workload allows.

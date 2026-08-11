@@ -16,8 +16,6 @@ use crate::io_stage::io_stage;
 use crate::projection::HvgProjection;
 use crate::shuffle::ShardShuffler;
 
-use crate::pool::DEFAULT_DECODE_POOL_MAX_THREADS;
-
 /// Bounded join deadline for `Drop` and `join_epoch_handles` shutdown.
 /// If the I/O or decode thread does not finish within this window the join
 /// is abandoned and the thread handle is detached — preferable to wedging
@@ -799,9 +797,18 @@ impl TrainingPipeline {
     /// Lazily build the per-pipeline rayon `ThreadPool`. Called from
     /// `start_epoch` so the pool is constructed inside the worker
     /// process, after any fork. Reused across epochs.
+    ///
+    /// Sized through [`crate::pool::resolve_pool_threads`], the same function
+    /// that sizes `cpu_pool()`, so `SCX_LOADER_CPU_THREADS` governs **both**
+    /// pools a `TrainingPipeline` worker can hold. It previously read
+    /// `num_cpus::get_physical()` directly and ignored the knob, which made
+    /// per-worker thread count unpredictable once the constructor also began
+    /// building a pool — see the footprint note in `docs/multithreading.md`.
     fn ensure_decode_pool(&mut self) -> Result<&Arc<rayon::ThreadPool>> {
         if self.decode_pool.is_none() {
-            let n_threads = num_cpus::get_physical().clamp(1, DEFAULT_DECODE_POOL_MAX_THREADS);
+            let n_threads = crate::pool::resolve_pool_threads(
+                std::env::var(crate::pool::CPU_THREADS_ENV).ok().as_deref(),
+            );
             let t = Instant::now();
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(n_threads)

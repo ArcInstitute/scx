@@ -391,11 +391,9 @@ def test_spawn_num_workers_2(fixture_paths: list[str]) -> None:
 # vacuously. `test_fork_index_plan_sharded_obs` and
 # `test_fork_index_plan_multi_shard_gather` below are the non-vacuous versions;
 # both assert their own premise in the parent before forking.
-# So the rayon-after-fork hazard from Phase 1 does not apply; the only
-# remaining concern is the tokio runtime's fork-hostility (#2/#3/#5 in
-# "Why fork is hard"). Phase 1 evidence shows tokio's multi-thread runtime
-# constructs cleanly in a forked child, so this test is expected to pass
-# without any Phase-2-style fix.
+#
+# The tokio side is genuinely fine: its multi-thread runtime constructs cleanly
+# in a forked child, which is why this test passed at all.
 
 
 def _child_iterate_index_plan_dataset(scx_path: str, conn) -> None:
@@ -857,3 +855,41 @@ def test_fork_sparse_cellset_dataset(unframed_multi_shard_path: str) -> None:
         "SparseCellSetDataset gather",
     )
     assert n == 4
+
+
+def _child_construct_index_plan_pflog(scx_path: str, conn) -> None:
+    """`pflog=True` routes construction through `scx_accel::estimate_alpha`,
+    which walks shards on `scx_format_io::prefetch`'s `rayon::in_place_scope` —
+    a third rayon entry point, distinct from `read_obs` and `warm_shards`."""
+    try:
+        import warnings
+
+        import pyscx
+
+        warnings.simplefilter("ignore")
+        ds = pyscx.IndexPlanDataset(
+            scx_path, normalize=False, log1p=False, obs_columns=[], pflog=True
+        )
+        conn.send(("ok", int(ds.n_obs)))
+    except BaseException as exc:  # noqa: BLE001
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def test_fork_index_plan_pflog_alpha_estimate(unframed_multi_shard_path: str) -> None:
+    """The α-estimate path under fork.
+
+    `prefetch`'s guard — `current_num_threads() > 1 && current_thread_index()
+    .is_none()` — asks "am I already on a rayon worker?", and **cannot see a
+    fork**: after one, both halves still read as they did in the parent. So the
+    guard passes and `in_place_scope` spawns onto threads that no longer exist.
+    Uses the multi-shard fixture because a single-shard file would take the
+    sequential arm and prove nothing.
+    """
+    n = _run_forked_child(
+        _child_construct_index_plan_pflog,
+        (unframed_multi_shard_path,),
+        "IndexPlanDataset pflog alpha",
+    )
+    assert n == MULTI_N_OBS

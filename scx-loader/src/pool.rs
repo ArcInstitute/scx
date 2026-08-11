@@ -26,14 +26,30 @@
 //! drawing on a stale process-global pool. So the pool is stored with the PID
 //! that built it and rebuilt whenever `std::process::id()` disagrees.
 //!
-//! Dropping the stale inherited pool in the child is safe and does not need a
-//! `mem::forget`: `ThreadPool::drop` calls `Registry::terminate`, which sets
-//! per-worker latches and returns — it never joins (rayon-core 1.13.0,
-//! `registry.rs:594-600`). **Re-check that on a rayon major bump**; if
-//! `terminate` ever starts joining, this drop would block forever on threads
-//! that no longer exist.
+//! # Why the slot is lock-free and never freed
+//!
+//! Both of the obvious implementations deadlock in the child, for the same
+//! reason the bug exists at all: `fork()` copies mutexes in whatever state they
+//! were in, and the threads that would have unlocked them are gone.
+//!
+//! * **Never drop the inherited pool.** `ThreadPool::drop` → `Registry::terminate`
+//!   → `OnceLatch::set_and_tickle_one` → `Sleep::wake_specific_thread`, which does
+//!   `sleep_state.is_blocked.lock().unwrap()` (rayon-core 1.13.0,
+//!   `sleep/mod.rs:288-291`). A parent worker asleep at fork time leaves that
+//!   mutex locked in the child with nobody to release it. "It does not join" is
+//!   **not** sufficient grounds to drop it — an earlier version of this comment
+//!   said exactly that and was wrong. Entries are therefore leaked deliberately:
+//!   one small allocation plus one dead `Arc` per fork generation.
+//! * **Never take a lock to read the slot.** A `Mutex` around the slot can itself
+//!   be inherited locked, so the child would hang before it ever used the fresh
+//!   pool. An `AtomicPtr` to a never-freed entry needs no lock to read, so the
+//!   child's first access cannot block on parent state.
+//!
+//! The cost of the leak is bounded and tiny; the cost of getting it wrong is the
+//! exact silent hang this module exists to prevent.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
 
 /// Hard upper bound on loader rayon worker threads. On many-core hosts the
 /// decode work is embarrassingly parallel but memory-bound; more than ~8
@@ -66,41 +82,84 @@ pub fn resolve_pool_threads(raw: Option<&str>) -> usize {
     num_cpus::get_physical().clamp(1, DEFAULT_DECODE_POOL_MAX_THREADS)
 }
 
-/// The cached pool together with the PID that built it.
-type PidKeyedPool = Mutex<Option<(u32, Arc<rayon::ThreadPool>)>>;
-
-fn slot() -> &'static PidKeyedPool {
-    static SLOT: OnceLock<PidKeyedPool> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
+/// A pool together with the PID that built it. Allocated with [`Box::leak`] and
+/// **never freed** — see the module docs for why dropping one in a forked child
+/// can hang.
+struct Entry {
+    pid: u32,
+    pool: Arc<rayon::ThreadPool>,
 }
 
-/// The process-wide loader pool, rebuilt whenever `pid` differs from the one
-/// that built the cached instance. Split out of [`cpu_pool`] so the fork
-/// behaviour is testable without actually forking.
+/// A published [`Entry`] pointer, or null before the first pool is built.
 ///
-/// Panics only if the pool cannot be built at all, which means rayon could not
-/// spawn a thread — there is no useful fallback from that, and returning a
-/// `Result` here would push a `?` into every call site on the hot path for a
-/// condition equivalent to OOM.
-fn pool_for_pid(pid: u32) -> Arc<rayon::ThreadPool> {
-    let mut guard = slot().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((cached_pid, pool)) = guard.as_ref() {
-        if *cached_pid == pid {
-            return Arc::clone(pool);
+/// [`Slot`] rather than a bare static so the tests can drive the PID logic
+/// against their own instance. They used to share the production static with a
+/// module-local mutex, which does not work: `SparseCellSetLoader::new` and
+/// friends now call [`cpu_pool`] too, and those tests never took that mutex, so
+/// a real-PID rebuild could land between a test's two calls. Reproduced at 4
+/// failures in 40 runs of `RUST_TEST_THREADS=128 cargo test -p scx-loader --lib`
+/// before this was split out.
+pub(crate) struct Slot(AtomicPtr<Entry>);
+
+impl Slot {
+    pub(crate) const fn new() -> Self {
+        Slot(AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    /// The pool for `pid`, building and publishing one if the slot is empty or
+    /// holds another process's.
+    ///
+    /// Panics only if rayon cannot spawn a thread at all; there is no useful
+    /// fallback from that, and a `Result` would push a `?` into every call site
+    /// for a condition equivalent to OOM.
+    fn pool_for_pid(&self, pid: u32) -> Arc<rayon::ThreadPool> {
+        let current = self.0.load(Ordering::Acquire);
+        if !current.is_null() {
+            // SAFETY: every pointer ever stored comes from `Box::leak` below and
+            // is never freed, so a non-null load is always a live `Entry`.
+            let entry = unsafe { &*current };
+            if entry.pid == pid {
+                return Arc::clone(&entry.pool);
+            }
+        }
+
+        let n_threads = resolve_pool_threads(std::env::var(CPU_THREADS_ENV).ok().as_deref());
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n_threads)
+                .thread_name(|i| format!("scx-loader-cpu-{i}"))
+                .build()
+                .expect("failed to build the scx-loader CPU thread pool"),
+        );
+        tracing::trace!(pid, n_threads, "scx-loader CPU pool constructed");
+
+        let fresh: *mut Entry = Box::leak(Box::new(Entry {
+            pid,
+            pool: Arc::clone(&pool),
+        }));
+        match self
+            .0
+            .compare_exchange(current, fresh, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => pool,
+            Err(winner) => {
+                // Someone published first. Our `pool` is this process's own and
+                // its threads are alive, so dropping it here is safe — unlike
+                // the inherited one, which is why `fresh` is left leaked rather
+                // than reclaimed.
+                // SAFETY: as above — `winner` came from `Box::leak`.
+                let entry = unsafe { &*winner };
+                if entry.pid == pid {
+                    Arc::clone(&entry.pool)
+                } else {
+                    pool
+                }
+            }
         }
     }
-    let n_threads = resolve_pool_threads(std::env::var(CPU_THREADS_ENV).ok().as_deref());
-    let pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n_threads)
-            .thread_name(|i| format!("scx-loader-cpu-{i}"))
-            .build()
-            .expect("failed to build the scx-loader CPU thread pool"),
-    );
-    tracing::trace!(pid, n_threads, "scx-loader CPU pool constructed");
-    *guard = Some((pid, Arc::clone(&pool)));
-    pool
 }
+
+static SLOT: Slot = Slot::new();
 
 /// The loader's CPU pool for *this* process.
 ///
@@ -111,28 +170,29 @@ fn pool_for_pid(pid: u32) -> Arc<rayon::ThreadPool> {
 /// pool for the calling thread, so nested `par_*` inside a callee dispatches
 /// here too, without the callee needing to know about it.
 pub fn cpu_pool() -> Arc<rayon::ThreadPool> {
-    pool_for_pid(std::process::id())
+    SLOT.pool_for_pid(std::process::id())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every test below mutates the one process-global slot, and cargo runs
-    /// them concurrently in a single binary. Without this, a rebuild from one
-    /// test lands between another's two `pool_for_pid` calls and fails it for a
-    /// reason that has nothing to do with the code under test.
-    static SERIALISE: Mutex<()> = Mutex::new(());
-
-    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-        SERIALISE.lock().unwrap_or_else(|e| e.into_inner())
+    /// Each test drives its **own** slot. Sharing the production static — even
+    /// under a module-local mutex — is not viable: `SparseCellSetLoader::new`
+    /// and the other constructors now call `cpu_pool()` themselves, and those
+    /// tests hold no such mutex, so a real-PID rebuild lands between a test's
+    /// two calls and fails it for a reason unrelated to the code under test.
+    /// That was not hypothetical: 4 of 40 runs of
+    /// `RUST_TEST_THREADS=128 cargo test -p scx-loader --lib` failed this way.
+    fn fresh_slot() -> Slot {
+        Slot::new()
     }
 
     #[test]
     fn the_same_pid_reuses_one_pool() {
-        let _g = exclusive();
-        let a = pool_for_pid(4242);
-        let b = pool_for_pid(4242);
+        let slot = fresh_slot();
+        let a = slot.pool_for_pid(4242);
+        let b = slot.pool_for_pid(4242);
         assert!(
             Arc::ptr_eq(&a, &b),
             "a repeated pid must reuse the cached pool, not build a second one"
@@ -141,11 +201,11 @@ mod tests {
 
     #[test]
     fn a_changed_pid_rebuilds_the_pool() {
-        let _g = exclusive();
+        let slot = fresh_slot();
         // The fork case: the cached pool belongs to the parent and its worker
         // threads did not survive, so the child must not be handed it back.
-        let parent = pool_for_pid(4243);
-        let child = pool_for_pid(4244);
+        let parent = slot.pool_for_pid(4243);
+        let child = slot.pool_for_pid(4244);
         assert!(
             !Arc::ptr_eq(&parent, &child),
             "a changed pid must rebuild — reusing the parent's pool is the \
@@ -156,8 +216,25 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuild_never_drops_the_previous_pool() {
+        // The inherited pool must be leaked, not dropped: `ThreadPool::drop`
+        // locks each worker's `is_blocked` mutex, which a forked child can
+        // inherit locked with no owner to release it. Holding no `Arc` of our
+        // own, the parent pool must still be alive after the rebuild — if the
+        // slot had dropped it, `Arc::strong_count` on a resurrected handle
+        // could not still see the leaked entry's reference.
+        let slot = fresh_slot();
+        let parent_weak = Arc::downgrade(&slot.pool_for_pid(4245));
+        let _child = slot.pool_for_pid(4246);
+        assert!(
+            parent_weak.upgrade().is_some(),
+            "the superseded pool was dropped — in a forked child that drop can \
+             block forever on an inherited-locked worker mutex"
+        );
+    }
+
+    #[test]
     fn cpu_pool_is_stable_within_a_process() {
-        let _g = exclusive();
         assert!(Arc::ptr_eq(&cpu_pool(), &cpu_pool()));
     }
 
