@@ -8,23 +8,32 @@
 //! For Euclidean and cosine metrics a faer-backed gemm path is available, which
 //! is much faster than the row-by-row scalar path on dense, low-dimensional
 //! embeddings (e.g. PCA outputs). It does need a Gram, `a·bᵀ`, and that is the
-//! one buffer either path allocates.
+//! allocation this module's budget governs.
 //!
 //! # Working set
 //!
 //! The Gram is built **one row block of `a` at a time**, sized by
 //! [`crate::mem_budget::plan_gram_row_block`] against
 //! `SCX_ACCEL_PAIRWISE_MEMORY_BUDGET` (default 256 MiB), and reduced before the
-//! next block overwrites it. So the gemm path's working set is the budget, not
-//! `n_a · n_b · size_of::<F>()` — which at the 100 K control cells
-//! `energy_distance` is documented for, on its default `dtype="f32"`, would be
-//! 40 GB. An input whose whole Gram already fits the budget is a single block,
-//! i.e. exactly the unblocked computation.
+//! next block overwrites it — rather than as `n_a · n_b · size_of::<F>()`, which
+//! at the 100 K control cells `energy_distance` is documented for, on its
+//! default `dtype="f32"`, is 40 GB. An input whose whole Gram already fits the
+//! budget is a single block, i.e. exactly the unblocked computation.
 //!
-//! Note what this does *not* bound: `compute_energy_distance` evaluates
-//! perturbations on a rayon `par_iter`, so up to `rayon::current_num_threads()`
-//! blocks are live at once, and its `extract_group_rows_indexed` copies each
-//! group's rows per task independently of anything here.
+//! Stated exactly, because the knob is a tuning surface:
+//!
+//! - The Gram block is `max(budget, one Gram row)`. The planner never returns a
+//!   zero-row block, so a single row wider than the budget still gets one — the
+//!   floor that guarantees progress rather than an error.
+//! - **Cosine allocates outside the budget.** `normalize_rows` materialises a
+//!   full `n_a · n_dims` copy, plus `n_b · n_dims` when `a` and `b` differ — at
+//!   100 K × 2000 f32 that is ~800 MB for a self-distance and ~1.6 GB for a
+//!   cross. Lowering the budget does not touch it. Euclidean keeps only the
+//!   `O(n)` f64 row-norm buffers.
+//! - `compute_energy_distance` evaluates perturbations on a rayon `par_iter`, so
+//!   up to `rayon::current_num_threads()` of everything above is live at once,
+//!   and its `extract_group_rows_indexed` copies each group's rows per task
+//!   independently of anything here.
 //!
 //! Both kernels are generic over [`PairwiseFloat`] (`f32` or `f64`).
 //! Reductions always accumulate in `f64` regardless of the input precision,
@@ -256,12 +265,11 @@ enum GemmShape {
 /// per-task overhead — and 64 sits *below* the iterator length at any size worth
 /// parallelising, so it never forbids splitting outright.
 fn row_sq_norms<F: PairwiseFloat>(data: &[F], n: usize, n_dims: usize) -> Vec<f64> {
-    (0..n)
-        .into_par_iter()
+    data[..n * n_dims]
+        .par_chunks_exact(n_dims)
         .with_min_len(64)
-        .map(|i| {
-            data[i * n_dims..(i + 1) * n_dims]
-                .iter()
+        .map(|row| {
+            row.iter()
                 .map(|&x| {
                     let xf = x.as_f64();
                     xf * xf
@@ -1320,12 +1328,12 @@ mod tests {
         // three pairs of a 3-point fixture are 5, sqrt(2) and sqrt(13), so any
         // miscount moves the mean.
         //
-        // One boundary these tests deliberately cannot see: `j_start = t` vs
-        // `t + 1`. Including the diagonal adds `d(a_i, a_i)`, which is exactly
-        // 0 for both gemm metrics (`(a_sq + a_sq - 2·a_sq).max(0)` and
-        // `1 - â_i·â_i`), so the two spellings agree bit-for-bit and no fixture
-        // separates them. It is not a defect either way — noted so a future
-        // reader does not mistake the silence for coverage.
+        // The `j_start = t` vs `t + 1` boundary is *not* covered by this
+        // fixture — every row here has a nonzero norm, so the diagonal it would
+        // add is exactly 0 under both gemm metrics. It is covered by
+        // `gemm_self_skips_the_diagonal_of_a_zero_norm_row` below, where a
+        // zero-norm row makes the cosine diagonal 1.0 and the two spellings
+        // differ by a whole unit.
         let a = vec![0.0, 0.0, 3.0, 4.0, 1.0, 1.0];
         let expected = 2.0 * (5.0 + 2.0f64.sqrt() + 13.0f64.sqrt()) / 9.0;
         for rows in [1usize, 2, 3] {
@@ -1341,6 +1349,71 @@ mod tests {
             assert!(
                 (gemm - expected).abs() < 1e-12,
                 "{rows}-row blocks gave {gemm}, hand-computed value is {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemm_self_skips_the_diagonal_of_a_zero_norm_row() {
+        // A zero-norm row is where "the self diagonal is exactly 0" stops being
+        // true. `normalize_rows` leaves such a row as zeros, so its cosine Gram
+        // diagonal is `1 - 0 = 1`, not 1 - 1 = 0. Two all-zero rows:
+        //
+        //   strict upper triangle : 2 * 1 / 4     = 0.5   (scalar, and gemm now)
+        //   full n*n square       : 4 * 1 / 4     = 1.0   (gemm before this change)
+        //
+        // The triangle is the right answer: it is what the scalar backend has
+        // always returned, and what `sklearn.metrics.pairwise.cosine_distances`
+        // returns, since that forces the self diagonal to 0 when `X is Y`.
+        //
+        // This is also the fixture that makes `j_start = t` vs `t + 1`
+        // detectable — with nonzero rows the diagonal contributes 0 and the two
+        // spellings are indistinguishable.
+        for (label, a, n) in [
+            ("two zero rows", vec![0.0f64; 6], 2usize),
+            (
+                "one zero row among unit rows",
+                vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                3,
+            ),
+        ] {
+            let scalar = mean_pairwise_distance_self(
+                &a,
+                n,
+                3,
+                DistanceMetric::Cosine,
+                DistanceBackend::Scalar,
+            )
+            .unwrap();
+            let gemm = mean_pairwise_distance_self(
+                &a,
+                n,
+                3,
+                DistanceMetric::Cosine,
+                DistanceBackend::Gemm,
+            )
+            .unwrap();
+            assert!(
+                (scalar - gemm).abs() < 1e-12,
+                "{label}: gemm self {gemm} != scalar self {scalar}"
+            );
+
+            // Premise: the full-square convention really does differ here, so
+            // the equality above is not something every implementation passes.
+            let full_square = mean_pairwise_distance(
+                &a,
+                &a,
+                n,
+                n,
+                3,
+                DistanceMetric::Cosine,
+                DistanceBackend::Gemm,
+            )
+            .unwrap();
+            assert!(
+                (full_square - gemm).abs() > 1e-3,
+                "{label}: the full n*n square gave {full_square}, same as the triangle's \
+                 {gemm} — this fixture has no zero-norm row and proves nothing"
             );
         }
     }

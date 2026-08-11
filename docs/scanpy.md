@@ -2999,20 +2999,48 @@ cells × 2K genes × 50 perturbations the default `gemm + f32` path is **52×**
 faster than cell-eval's `sklearn.metrics.pairwise_distances`; above ~500K the
 reference becomes infeasible while SCX remains usable.
 
-The gemm backend does need a Gram (`a·bᵀ`), and that is the one buffer it
-allocates. It is built **one row block of `a` at a time**, bounded by
+The gemm backend does need a Gram (`a·bᵀ`), and that is the allocation the
+budget governs. It is built **one row block of `a` at a time**, bounded by
 `SCX_ACCEL_PAIRWISE_MEMORY_BUDGET` (default 256 MiB) and reduced before the next
-block overwrites it, so the working set is the budget rather than
-`n_a · n_b · itemsize` — which at 100K control cells on the default
-`dtype="f32"` would be 40 GB. Inputs whose whole Gram already fits the budget
-are a single block, i.e. the unblocked computation — so the knob changes the
-working set, never what is summed.
+block overwrites it, rather than as `n_a · n_b · itemsize` — which at 100K
+control cells on the default `dtype="f32"` is 40 GB. Inputs whose whole Gram
+already fits the budget are a single block, i.e. the unblocked computation.
+
+Two things the knob does **not** cover, since it is what operators will tune:
+
+- The block is `max(budget, one Gram row)`. A single row wider than the budget
+  still gets its own block — the floor that guarantees progress instead of an
+  error.
+- **`metric="cosine"` allocates outside it.** Row normalization materialises a
+  full `n_a · n_dims` copy, plus `n_b · n_dims` when the two sides differ; at
+  100K × 2000 f32 that is ~800 MB for a self-distance and ~1.6 GB for a cross,
+  untouched by lowering the budget. `metric="euclidean"` keeps only `O(n)`
+  row-norm buffers.
+
+The knob changes how the same pairs are batched, never *which* pairs are summed
+or the order the row sums reduce in. It is not bit-neutral above the budget,
+though: a different block width makes faer panel the gemm differently, so Gram
+ulps move — the same class of drift `Par::rayon(0)` already has across thread
+counts, and well inside the `atol=1e-4` parity bound. Below the budget there is
+one block and the result is bit-identical to pyscx ≤ 0.13.0's gemm.
 
 The self-distance term (`d(X, X)`, and the once-per-side control self-distance)
-additionally takes the **strict upper triangle** rather than the full square.
-Its numbers move in the last bits versus pyscx ≤ 0.13.0: the discarded half is
-the symmetric mirror plus an exact-zero diagonal, so this is a reassociation,
-and it lands *closer* to `backend="scalar"` than before, not further.
+additionally takes the **strict upper triangle** rather than the full square,
+which is what `backend="scalar"` has always done and what
+`sklearn.metrics.pairwise.cosine_distances` does (it forces the self diagonal to
+0 when `X is Y`). On ordinary input the discarded half is the symmetric mirror
+plus an exact-zero diagonal, so values move only in the last bits and land
+*closer* to `backend="scalar"` than before.
+
+> [!IMPORTANT]
+> On a **zero-norm row under `metric="cosine"`** it is not a last-bit change.
+> Row normalization leaves such a row as zeros, so its raw self-similarity is
+> `1 - 0 = 1`, not `1 - 1 = 0` — the full square counted a whole unit per
+> zero-norm row and the triangle does not. Two all-zero rows: `1.0` before,
+> `0.5` now. This **fixes** a divergence — `backend="gemm"` (the `auto` default)
+> and `backend="scalar"` used to disagree on such input, and gemm was the one
+> that was wrong. If you have compared the two backends on data containing
+> all-zero cells, the gemm numbers change.
 
 > [!NOTE]
 > The budget bounds **one block**, not the op. `energy_distance` evaluates

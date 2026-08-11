@@ -1516,6 +1516,17 @@ Captured 2026-08-10 on Chimera `cpu`-partition nodes via
 `cargo bench -p scx-accel --bench distances` (criterion median), plus one end-to-end
 `/usr/bin/time -v` run. `d2k` = 2000 dims. `before` is `db537021`.
 
+> [!NOTE]
+> These are **Criterion microbenchmark** medians and a single `/usr/bin/time -v`
+> run, not captured entries under `benchmarks/comprehensive/results/`.
+> `docs/benchmark_manifest.md` asks for a manifest behind every number here; the
+> manifest schema is a `benchmark`/`format`/`dataset` triple shaped for the SLURM
+> comprehensive suite and has no `cargo bench` distance-kernel triple, so the
+> commands and node descriptions above stand in for one — the same disclosure the
+> covariance-PCA microbenchmark section carries.
+> `benchmarks/scripts/check_readme_manifests.py` parses `README.md` only and does
+> not flag these claims.
+
 **Restoring parallelism** (16-CPU node). All four `with_min_len` calls in
 `eval_metrics/distances.rs` exceeded their iterator length, so rayon never split them —
 `(0..n).with_min_len(n * 16)` on the scalar self path is unsatisfiable for every `n`. Those

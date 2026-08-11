@@ -108,7 +108,11 @@ pub fn gpu_mean_pairwise_distance(
     // gemm operands — halving the host→device copy, the cosine normalize, and
     // the col_sqnorm launches on those calls. Numerically identical (same
     // buffers feed the gemm / reduce).
-    let is_self = std::ptr::eq(a, b);
+    // `na == nb` is part of the test, not redundant: a caller may legally pass
+    // the same buffer with different row counts (`(a, a, 3, 5)` = the first 3
+    // rows against the first 5), and aliasing there would upload and normalize
+    // the wrong extent. Mirrors the CPU `pairwise_gemm_row_sums` guard.
+    let is_self = std::ptr::eq(a, b) && na == nb;
 
     // Row-major [n × d] host slice == col-major [d × n] device buffer.
     let mut a_dev = dev.htod_copy(a)?;

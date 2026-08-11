@@ -80,7 +80,10 @@ pub fn pairwise_memory_budget() -> u64 {
 ///   clamp is what keeps the cross path bit-identical.)
 pub fn plan_gram_row_block(n_a: usize, n_b: usize, elem_bytes: usize, budget: u64) -> usize {
     let per_row = (n_b as u64).saturating_mul(elem_bytes as u64).max(1);
-    ((budget / per_row) as usize).clamp(1, n_a.max(1))
+    // Clamp in `u64` *before* narrowing: on a 32-bit target `budget / per_row`
+    // can exceed `usize::MAX` and a direct cast would truncate — plausibly to a
+    // tiny value or 0, silently shrinking the block instead of widening it.
+    ((budget / per_row).clamp(1, n_a.max(1) as u64)) as usize
 }
 
 /// Pure parse of the `SCX_ACCEL_NUM_THREADS` value: `Some(n)` for a positive
