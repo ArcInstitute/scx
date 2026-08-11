@@ -156,21 +156,23 @@ rec("lazy_row_sums", np.asarray(adl.X.sum(axis=1)).ravel())
 rec("lazy_col_var", np.asarray(adl.X.var(axis=0)).ravel())
 
 # --- streaming PCA: pca/cpu.rs's six shard loops ---
-# `method="randomized"` only, and deliberately. That route is *structurally*
-# deterministic — the forward SpMM writes each output row exactly once, the
-# transpose takes its sequential branch at this size, and the fused column-means
-# pass accumulates in shard order — so it belongs under this file's exact-bits
-# blanket. `method="covariance"` does not: it folds into `ThreadLocal`
-# accumulators whose merge order is scheduler-dependent, and five consecutive
-# runs on this very fixture produce five different results with no prefetch
-# involved at all. Putting it here would make the suite flaky and would tell you
-# nothing; `covariance_pca_agrees_across_depths_within_reassociation_noise` in
-# scx-accel covers it against the bar it can actually hold.
-adpca = pyscx.open(path).to_anndata(backed=True)
-pyscx.accel.pca(adpca, n_comps=3, device="cpu", method="randomized")
-rec("pca_embeddings", adpca.obsm["X_pca"])
-rec("pca_components", adpca.varm["PCs"])
-rec("pca_variance_ratio", adpca.uns["pca"]["variance_ratio"])
+# Both routes, and `covariance` is here on purpose. It used to be excluded:
+# it folded into `ThreadLocal` accumulators whose merge order was
+# scheduler-dependent, so five consecutive runs on this very fixture produced
+# five different results with no prefetch involved at all, and putting it under
+# this file's exact-bits blanket would only have made the suite flaky. Both
+# reductions now partition their output across workers and merge nothing, so
+# entry (i, j) sums rows in ascending order at any width — the exact-bits bar is
+# the one it can hold, and this is the coverage that exclusion was costing.
+for _pca_method in ("randomized", "covariance"):
+    adpca = pyscx.open(path).to_anndata(backed=True)
+    pyscx.accel.pca(adpca, n_comps=3, device="cpu", method=_pca_method)
+    rec(f"pca_{_pca_method}_embeddings", adpca.obsm["X_pca"])
+    rec(f"pca_{_pca_method}_components", adpca.varm["PCs"])
+    # Inside the loop: recording this once after it left `pca_variance_ratio`
+    # holding only the last method's value, silently dropping the randomized
+    # coverage that key used to carry.
+    rec(f"pca_{_pca_method}_variance_ratio", adpca.uns["pca"]["variance_ratio"])
 
 # Same, through a column projection — `ProjectedShardSource` wraps the shard
 # source, so this is the only arm that exercises the projected path's ordering.
@@ -225,15 +227,19 @@ def test_probe_covered_every_kernel(ab):
     """Guard against a silently-empty comparison."""
     off, on = ab
     assert off.keys() == on.keys()
-    # 23 arrays + the binary-identity marker.
-    assert len(off) >= 20, f"probe recorded only {len(off)} entries"
+    # 25 arrays + the binary-identity marker (covariance PCA added two).
+    assert len(off) >= 22, f"probe recorded only {len(off)} entries"
     for name, vals in off.items():
         assert vals, f"{name} came back empty — nothing is being compared"
     # PCA specifically: an all-zero or non-finite embedding would satisfy the
     # bit-identity assertion while comparing nothing. NaN in particular would
     # sail through, because `float('nan').hex()` is the string "nan" on both
     # arms.
-    for name in ("pca_embeddings", "pca_proj_embeddings"):
+    for name in (
+        "pca_randomized_embeddings",
+        "pca_covariance_embeddings",
+        "pca_proj_embeddings",
+    ):
         vals = np.array([float.fromhex(v) for v in off[name]])
         assert np.isfinite(vals).all(), f"{name} is not finite"
         assert vals.std() > 0.0, f"{name} is constant — the comparison is vacuous"

@@ -2023,8 +2023,9 @@ Two methods, auto-routed by the number of variables:
 - **Covariance PCA** (CPU: n_vars ≤ 5,000): Builds the covariance matrix
   `X^T @ X` directly from CSR nonzeros via sparse outer product accumulation
   (exploiting symmetry), then eigendecomposes. Exact results, faster than
-  randomized SVD for HVG-selected data. Parallel accumulation via rayon
-  thread-local matrices. CPU-only; the former native GPU covariance path
+  randomized SVD for HVG-selected data. Parallel accumulation into one shared
+  matrix whose columns are partitioned across rayon workers (see
+  [Reproducibility](#reproducibility)). CPU-only; the former native GPU covariance path
   (`cusolverDnSsyevd`) was removed in Phase 3.2.
 - **Randomized SVD** (CPU: n_vars > 5,000): Streaming shard-by-shard SpMM
   with zero-copy `MatRef::from_row_major_slice` views. Skips intermediate QR
@@ -2065,7 +2066,7 @@ pyscx.accel.pca(adata, n_comps=50)
 |-----------|---------|-------------|
 | `n_comps` | 50 | Number of principal components |
 | `zero_center` | True | Mean-center data (True = standard PCA, False = TruncatedSVD) |
-| `random_state` | 0 | Random seed (used by randomized SVD; covariance method is deterministic) |
+| `random_state` | 0 | Random seed. Seeds the randomized SVD's Ω only — the covariance method draws no randomness. Both are deterministic; see [Reproducibility](#reproducibility) |
 | `n_oversamples` | 10 | Extra dimensions for accuracy (randomized SVD only) |
 | `n_power_iterations` | 2 | Power iterations for spectral accuracy (randomized SVD only) |
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
@@ -2082,6 +2083,61 @@ internally. Peak memory on CPU is one shard plus working matrices (plus
 sparse `X` plus rapids' internal dense working buffers — use
 `pyscx.accel.estimate_gpu_memory(adata, operation="pca")` for pre-flight
 sizing (see [gpu-setup.md § GPU memory model](gpu-setup.md#gpu-memory-model)).
+
+#### Reproducibility
+
+**Running the same call twice on the same machine gives bit-identical results**, on both CPU
+methods and on in-memory, backed and lazy `X`. Peak memory is also lower than it looks: the
+reductions hold one accumulator, not one per thread.
+
+That is worth stating because it was not always true. Through v0.13.0 inclusive, the streaming covariance
+build and transpose SpMM accumulated into per-thread buffers whose merge order came from rayon
+work-stealing, so five consecutive `method="covariance"` runs produced five different results
+— and this table used to claim the covariance method was deterministic. Both reductions now
+partition their *output* across workers rather than their input rows, so nothing is merged and
+the thread schedule cannot reach the result.
+
+One boundary is worth knowing:
+
+| Change | Same bits? |
+|---|---|
+| Re-running the same call | ✅ |
+| `SCX_ACCEL_PREFETCH_DEPTH` or `SCX_ACCEL_NUM_THREADS` | ✅ |
+| A different `RAYON_NUM_THREADS`, or a machine with a different core count | ⚠️ see below |
+| A different CPU (different SIMD width) | ❌ |
+
+SCX's own reductions are identical at any thread count. The **dense** decomposition
+underneath them — faer's QR and self-adjoint eigendecomposition — blocks its work by the
+ambient rayon width, so its low bits move when that changes. This is the same contract
+numpy/scipy give, where LAPACK's bits likewise move with `OMP_NUM_THREADS`, and it is why
+pinning `RAYON_NUM_THREADS` is the usual advice for cross-machine comparison.
+
+Set `SCX_ACCEL_DETERMINISTIC_LINALG=1` to remove that last dependency: it pins faer to
+sequential execution, making PCA's results identical regardless of thread count. It is
+opt-in because it is not free — measured at ~2.3× slower on the covariance route's
+eigendecomposition, though ~1.65× *faster* on the randomized route's thin QR. Read once, at
+the **first CPU PCA / PFlog call**: set it before then.
+
+> [!IMPORTANT]
+> **The guarantee is scoped to CPU PCA and PFlog, but the side effect is process-wide.**
+> Those are different sets and it matters which you are relying on.
+>
+> - **Guaranteed reproducible:** CPU PCA and PFlog. Nothing is pinned until one of them
+>   runs, and only their determinism is tested.
+> - **Slowed but not made reproducible:** every *implicit* faer decomposition in the
+>   process, because the setting is one global. After the first pinned PCA call, Harmony's
+>   LU fallback, NB-GLM's LLT/LU/QR and the native-GPU PCA's host SVD run sequentially too.
+>   If you set this knob, expect those to get slower — a call-order-dependent effect, since
+>   before that first PCA call they are unaffected.
+> - **Untouched:** call sites that pass faer an explicit `Par` — the exact-kNN gemm and the
+>   eval-metrics distance gemm hand it `Par::rayon(0)` directly and ignore the global, so
+>   pinning makes them neither sequential nor reproducible.
+>
+> Do not read this knob as an accelerator-wide reproducibility switch.
+
+Version-to-version bits are not promised. The first release after v0.13.0 changes them once, by
+fixing the above — so a result computed with v0.13.0 or earlier will not reproduce exactly on a
+later build, and was not reproducible run to run in the first place.
 
 ### kNN graph (`pyscx.accel.neighbors`)
 
@@ -3181,7 +3237,7 @@ parallelism — see [docs/multithreading.md](multithreading.md).
 | `ScxBackedDataset` slicing / column projection | Rayon per access | Each `X[...]` call decodes touched shards in parallel |
 | `pyscx.query().where(...).collect()` | Rayon parallel shard decode | Only shards surviving catalog pushdown are decoded |
 | `pyscx.iter_chunks()`, `pyscx.preprocess()`, `pyscx.save_layer()` | Rayon parallel shard decode + encode | Parallel encode achieves up to 3.2× at 32 threads |
-| `pyscx.accel.pca` (CPU) | Rayon | Parallel covariance accumulation (thread-local matrices); streaming SpMM parallelizes inner products |
+| `pyscx.accel.pca` (CPU) | Rayon | Covariance and transpose SpMM partition their output columns across workers — one shared accumulator, no merge |
 | `pyscx.accel.neighbors` (CPU) | Rayon | Parallel kNN queries on HNSW index |
 | `pyscx.accel.umap` (CPU) | Single-threaded SGD | Edge updates are serial on CPU; GPU path uses CUDA kernel parallelism |
 | `pyscx.accel.leiden` | Opt-in rayon via `parallel=True` | Sequential by default (reproduces C++ leidenalg's move-node ordering); parallel uses conflict-free graph coloring |
@@ -3207,11 +3263,12 @@ import pyscx
 
 `RAYON_NUM_THREADS` sizes the process-wide rayon pool that most accelerators use.
 `SCX_ACCEL_NUM_THREADS` is a narrower ceiling for the accelerators' private rayon work —
-Harmony batch integration and both PCA covariance-accumulator paths (streaming and
-in-memory) — so you can cap those on a fat node without shrinking every op. It is read
+Harmony batch integration, and the number of column blocks the PCA reductions split their
+output into — so you can cap those on a fat node without shrinking every op. It is read
 once at first use (set it before the first accelerator call); unset (the default) leaves
-today's behaviour unchanged, and the PCA memory-derived worker cap still applies on top of
-it. Other `SCX_ACCEL_*` knobs (`SCX_ACCEL_PREFETCH_DEPTH`,
+today's behaviour unchanged. On PCA it bounds **speed and memory only**: the block count
+cannot change the numbers, because the blocks write to disjoint slices and are never merged
+(see [PCA § Reproducibility](#reproducibility)). Other `SCX_ACCEL_*` knobs (`SCX_ACCEL_PREFETCH_DEPTH`,
 `SCX_ACCEL_REDUCTION_MODE`, `SCX_ACCEL_DE_MEMORY_BUDGET`) are documented in
 [performance.md](performance.md). `SCX_ACCEL_PREFETCH_DEPTH` bounds the
 decode-prefetch pipeline, which since Phase 4.2 also covers the backed
@@ -3233,7 +3290,10 @@ Three consequences worth knowing before you tune it:
   the shared pipeline instead declines to engage on a single-thread pool (that
   guard is what prevents a nested-call deadlock). If you pin
   `RAYON_NUM_THREADS=1` for reproducibility, GPU HVG/DE will be **slower than
-  before 4.2**, not faster.
+  before 4.2**, not faster. For **CPU PCA** you no longer need to pin it at all —
+  repeated runs agree at any thread count, and `SCX_ACCEL_DETERMINISTIC_LINALG=1`
+  covers the cross-thread-count case more cheaply than serializing everything
+  (see [PCA § Reproducibility](#reproducibility)).
 - **`prefer_format="csc"` does not inherit the 4.2 speedups.** The CSC column
   kernels reach their source through `&dyn ColumnShardSource` and still decode
   serially; only the CSR paths are prefetched. They do benefit from the `col_*`

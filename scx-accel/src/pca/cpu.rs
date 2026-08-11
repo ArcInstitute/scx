@@ -17,21 +17,60 @@
 //!
 //! Peak memory: O(n_obs × k + n_vars × k) where k = n_components + n_oversamples.
 //! One decoded shard (~16K × n_vars × 4 bytes) is held at a time.
-
-use std::cell::RefCell;
+//!
+//! # Determinism
+//!
+//! **The same input gives the same bits on every run.** That was not true before
+//! this module's reductions were rewritten: the covariance build and the
+//! transpose SpMM accumulated into per-worker buffers whose row→worker assignment
+//! was decided by rayon work-stealing and whose merge order was
+//! `ThreadLocal::iter_mut()`, so five consecutive runs of the same call produced
+//! five different results.
+//!
+//! Both now **partition their output** instead of their input ([`colblocks`]):
+//! each worker owns a disjoint slice of the covariance triangle (or of `Z`),
+//! scans every row, and takes only the nonzeros landing in its slice. Nothing is
+//! merged, so the schedule cannot reach the result — entry `(i, j)` sums rows in
+//! ascending order at any block count, on any thread count, at any prefetch
+//! depth. Shards arrive in order from [`crate::prefetch::for_each_shard_ordered`],
+//! which is what extends that from one shard to the whole matrix. The forward
+//! SpMM was already row-disjoint and needed no change.
+//!
+//! Two consequences worth stating plainly:
+//!
+//! - Peak memory fell with it. There is one `n_vars × n_vars` covariance
+//!   accumulator and one `n_vars × k` transpose accumulator, not one of each per
+//!   worker — which is why `SCX_PCA_COV_MEMORY_BUDGET` no longer has anything to
+//!   cap (see [`warn_if_cov_memory_budget_set`]).
+//! - The reductions are only *half* the op. faer's dense QR and self-adjoint
+//!   eigendecomposition block their work by the ambient rayon width, so their low
+//!   bits move when it does. They are stable run to run at a fixed width, which
+//!   is all the defect above required — and it is the same contract numpy/scipy
+//!   give, where LAPACK's bits likewise move with `OMP_NUM_THREADS`. Callers who
+//!   need identity *across* thread counts set `SCX_ACCEL_DETERMINISTIC_LINALG=1`;
+//!   see [`pin_linalg_if_requested`] for what that costs and why it is opt-in.
+//!
+//! The partitioned kernels require **canonical** CSR rows (strictly increasing
+//! column indices). SCX writers guarantee it and `scx_engine::project_csr`
+//! already documents the same precondition; a non-canonical CSR falls back to a
+//! serial accumulation that is correct — including the coalesced value for
+//! duplicate coordinates — and deterministic, but single-threaded. It is *not*
+//! bit-identical to the partitioned kernel: that kernel cannot run on such input
+//! at all, and summing a row in stored rather than ascending order lands on
+//! different low bits.
 
 use faer::{Mat, MatRef};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
-use thread_local::ThreadLocal;
 
 use scx_format_io::ShardSource;
 use scx_sparse::total_variance_from_col_sq;
 
 use scx_sparse::ScxCsr;
 
+use super::colblocks;
 use crate::error::{AccelError, Result};
 
 // ---------------------------------------------------------------------------
@@ -91,128 +130,302 @@ fn mat_to_row_major_buf(mat: &Mat<f64>) -> Vec<f64> {
     data
 }
 
-/// Accumulate the sparse outer product X^T @ X directly from CSR nonzeros.
+/// Accumulate the sparse outer product `Xᵀ X` (lower triangle) and column sums
+/// from CSR nonzeros, **serially, in row order**.
 ///
-/// For each row, iterates pairs of nonzeros and accumulates `C[c1, c2] += v1 * v2`.
-/// Exploits symmetry: writes **only the lower triangle** (entries `(r, c)` with
-/// `r >= c`). The eigensolver reads the lower triangle via
-/// `self_adjoint_eigen(Side::Lower)`, so the upper triangle is never populated —
-/// this halves the inner-loop stores and avoids a cache-unfriendly second scatter.
-/// Also accumulates `col_sums` in the same pass (caller provides the slice).
+/// `cov` is `n_vars × n_vars` column-major: entry `(hi, lo)` lives at
+/// `lo * n_vars + hi`. Only the lower triangle (`hi >= lo`) is written — the
+/// eigensolver reads `Side::Lower`, so populating the upper triangle would
+/// double the inner-loop stores for nothing.
 ///
-/// Retained as the serial reference for `test_sparse_covariance_matches_dense`; the
-/// production paths (streaming + in-memory) use the parallel variant below.
-#[allow(dead_code)]
-fn sparse_outer_product_accumulate(csr: &ScxCsr, col_sums: &mut [f64], cov: &mut Mat<f64>) {
-    let n_rows = csr.n_rows();
-    for r in 0..n_rows {
+/// Makes no assumption about index order within a row, which is what lets it be
+/// both the bit-exact oracle for [`accumulate_covariance_into`] and its fallback
+/// on a non-canonical CSR.
+///
+/// # Duplicate coordinates
+///
+/// A row may legally list the same column twice (scipy's `has_canonical_format
+/// == False`), in which case the cell's value is the *sum* of the entries. The
+/// pair loop handles that without materialising the sum: for `c1 == c2` the
+/// coalesced diagonal is `(v1 + v2)² = v1² + v2² + 2·v1·v2`, so the cross term
+/// counts twice — once for each ordering — where a genuine off-diagonal pair
+/// counts once. Off-diagonal entries need no special case: every duplicate
+/// contributes its own product, and those already sum to the coalesced value.
+///
+/// Missing that doubling is a wrong *answer*, not a rounding difference: a row
+/// holding column 0 twice with values 1 and 2 must give `(XᵀX)[0,0] = 9`, and
+/// counting the cross term once gives 7.
+fn accumulate_covariance_serial(
+    csr: &ScxCsr,
+    cov: &mut [f64],
+    col_sums: &mut [f64],
+    n_vars: usize,
+) {
+    for r in 0..csr.n_rows() {
         let start = csr.indptr[r] as usize;
         let end = csr.indptr[r + 1] as usize;
-        // Accumulate col_sums
         for idx in start..end {
-            let c = csr.indices[idx] as usize;
-            let v = csr.data[idx] as f64;
-            col_sums[c] += v;
+            col_sums[csr.indices[idx] as usize] += csr.data[idx] as f64;
         }
-        // Sparse outer product — lower triangle only
         for i in start..end {
             let c1 = csr.indices[i] as usize;
             let v1 = csr.data[i] as f64;
-            cov[(c1, c1)] += v1 * v1; // diagonal
+            cov[c1 * n_vars + c1] += v1 * v1; // diagonal
             for j in (i + 1)..end {
                 let c2 = csr.indices[j] as usize;
                 let v2 = csr.data[j] as f64;
                 let prod = v1 * v2;
+                if c1 == c2 {
+                    // Duplicate coordinate: both orderings land on the diagonal.
+                    cov[c1 * n_vars + c1] += prod + prod;
+                    continue;
+                }
                 // Write the lower-triangle entry only (row >= col).
                 let (lo, hi) = if c1 < c2 { (c1, c2) } else { (c2, c1) };
-                cov[(hi, lo)] += prod;
+                cov[lo * n_vars + hi] += prod;
             }
         }
     }
 }
 
-/// Parallel sparse outer product accumulation using thread-local `Mat<f64>` accumulators.
+/// Accumulate the covariance columns `[a, b)` and their column sums from a
+/// **strictly increasing** CSR.
 ///
-/// Same algorithm as [`sparse_outer_product_accumulate`] (lower-triangle only) but
-/// distributes rows across rayon threads. Each thread gets its own n_vars × n_vars
-/// covariance matrix (~30 MB for n_vars=2000) and col_sums vector, then results are
-/// reduced by element-wise addition.
-fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>, Vec<f64>) {
-    let n_rows = csr.n_rows();
-    // Bound peak memory: each parallel fold segment allocates a full
-    // n_vars×n_vars f64 accumulator (n_vars²·8 bytes). rayon `fold` produces one
-    // accumulator per segment, and `with_min_len(L)` caps segments at n_rows/L,
-    // so sizing the segment length by the budget-derived worker count limits the
-    // number of concurrent accumulators — the same guarantee the streaming
-    // covariance path gets from `cov_accumulator_workers` (previously this
-    // in-memory path used the full thread count, so peak scaled with cores).
-    let max_threads = rayon::current_num_threads().max(1);
-    // `.max(1)` is defensive: cov_accumulator_workers already floors at 1, but
-    // guard the `n_rows / workers` divisor against any future 0-return.
-    // The shared `SCX_ACCEL_NUM_THREADS` ceiling lowers the segment count here
-    // too (when set), so the knob covers both the streaming and in-memory
-    // covariance accumulators; unset → the memory-derived cap is unchanged.
-    let workers = cov_accumulator_workers(n_vars, cov_memory_budget(), max_threads)
-        .min(crate::mem_budget::accel_num_threads().unwrap_or(usize::MAX))
-        .max(1);
-    let chunk_size = (n_rows / workers).max(256);
-
-    (0..n_rows)
-        .into_par_iter()
-        .with_min_len(chunk_size)
-        .fold(
-            || (Mat::<f64>::zeros(n_vars, n_vars), vec![0.0f64; n_vars]),
-            |(mut cov_local, mut sums_local), r| {
-                let start = csr.indptr[r] as usize;
-                let end = csr.indptr[r + 1] as usize;
-                for idx in start..end {
-                    let c = csr.indices[idx] as usize;
-                    let v = csr.data[idx] as f64;
-                    sums_local[c] += v;
-                }
-                for i in start..end {
-                    let c1 = csr.indices[i] as usize;
-                    let v1 = csr.data[i] as f64;
-                    cov_local[(c1, c1)] += v1 * v1;
-                    for j in (i + 1)..end {
-                        let c2 = csr.indices[j] as usize;
-                        let v2 = csr.data[j] as f64;
-                        let prod = v1 * v2;
-                        // Write the lower-triangle entry only (row >= col).
-                        let (lo, hi) = if c1 < c2 { (c1, c2) } else { (c2, c1) };
-                        cov_local[(hi, lo)] += prod;
-                    }
-                }
-                (cov_local, sums_local)
-            },
-        )
-        .reduce(
-            || (Mat::<f64>::zeros(n_vars, n_vars), vec![0.0f64; n_vars]),
-            |(mut ca, mut sa), (cb, sb)| {
-                ca += cb;
-                for i in 0..n_vars {
-                    sa[i] += sb[i];
-                }
-                (ca, sa)
-            },
-        )
+/// `cov_part` is the `(b − a)`-column, `n_vars`-row column-major slice the block
+/// owns; `sum_part` is `col_sums[a..b]`. Because the row's indices ascend, every
+/// pair `(c_i, c_j)` with `j >= i` already has `c_j >= c_i`, so the pair's
+/// lower-triangle home is `(hi, lo) = (c_j, c_i)` with no comparison, and a pair
+/// belongs to this block exactly when `c_i ∈ [a, b)` — a contiguous window found
+/// by two binary searches. `j` starts at `i`, so the diagonal falls out of the
+/// same loop.
+#[inline]
+fn accumulate_covariance_block(
+    csr: &ScxCsr,
+    cov_part: &mut [f64],
+    sum_part: &mut [f64],
+    n_vars: usize,
+    a: usize,
+    b: usize,
+) {
+    if a >= b {
+        return;
+    }
+    for r in 0..csr.n_rows() {
+        let start = csr.indptr[r] as usize;
+        let end = csr.indptr[r + 1] as usize;
+        let row_idx = &csr.indices[start..end];
+        let row_dat = &csr.data[start..end];
+        let (lo, hi) = colblocks::sorted_subrange(row_idx, a, b);
+        for i in lo..hi {
+            let c1 = row_idx[i] as usize;
+            let v1 = row_dat[i] as f64;
+            sum_part[c1 - a] += v1;
+            let cov_col = &mut cov_part[(c1 - a) * n_vars..(c1 - a + 1) * n_vars];
+            for (&c2, &v2) in row_idx[i..].iter().zip(&row_dat[i..]) {
+                cov_col[c2 as usize] += v1 * v2 as f64;
+            }
+        }
+    }
 }
 
-/// Default per-call memory budget (bytes) for the streaming covariance-PCA
-/// accumulators. Caps how many `n_vars × n_vars` f64 matrices the parallel build
-/// holds concurrently. Override with `SCX_PCA_COV_MEMORY_BUDGET` (bytes). At the
-/// n_vars ≤ [`COVARIANCE_PCA_THRESHOLD`] route ceiling a single accumulator is
-/// ~200 MB, so this admits ~10 workers there and the full core count for smaller
-/// n_vars.
-const DEFAULT_COV_MEMORY_BUDGET: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
-
-/// Read the covariance-accumulator memory budget (bytes) from the environment,
-/// falling back to [`DEFAULT_COV_MEMORY_BUDGET`] when unset or unparseable.
-fn cov_memory_budget() -> u64 {
-    match std::env::var("SCX_PCA_COV_MEMORY_BUDGET") {
-        Ok(s) => s.trim().parse::<u64>().unwrap_or(DEFAULT_COV_MEMORY_BUDGET),
-        Err(_) => DEFAULT_COV_MEMORY_BUDGET,
+/// Fold one shard's contribution into the shared covariance lower triangle and
+/// column sums, partitioning the **output** across rayon workers.
+///
+/// Each block owns a disjoint contiguous slice of `cov` (and of `col_sums`), so
+/// nothing is merged and the split cannot reach the result: entry `(hi, lo)`
+/// accumulates rows in ascending order for any block count on any thread count.
+/// Callers get bit-identical output from a 1-thread and a 64-thread run, and the
+/// accumulator is one `n_vars × n_vars` matrix rather than one per worker.
+///
+/// A non-canonical CSR (unsorted or duplicated column indices) breaks the
+/// `c_j >= c_i` step the partition rests on; that falls back to
+/// [`accumulate_covariance_serial`], which computes the correct value —
+/// duplicates coalesced — deterministically, but single-threaded. Not
+/// "bit-identical": there is nothing to be identical *to*, since the partitioned
+/// kernel cannot run on this input, and a row summed in stored rather than
+/// ascending order lands on different low bits.
+fn accumulate_covariance_into(csr: &ScxCsr, cov: &mut [f64], col_sums: &mut [f64], n_vars: usize) {
+    if csr.n_rows() == 0 || csr.indices.is_empty() {
+        return;
     }
+    if !colblocks::rows_strictly_increasing(csr) {
+        warn_non_canonical_csr_once();
+        accumulate_covariance_serial(csr, cov, col_sums, n_vars);
+        return;
+    }
+
+    let n_blocks = colblocks::block_count(n_vars);
+    if n_blocks == 1 {
+        accumulate_covariance_block(csr, cov, col_sums, n_vars, 0, n_vars);
+        return;
+    }
+
+    // Exact per-column op count: the nonzero at position `i` of a row drives
+    // `end − i` updates, all of them in column `c_i`'s block. `O(nnz)` against
+    // the `O(Σ mᵣ²)` main loop, and integer, so the plan is a pure function of
+    // the data — it is a load-balancing hint only, never part of the result.
+    let mut weights = vec![0u64; n_vars];
+    for r in 0..csr.n_rows() {
+        let start = csr.indptr[r] as usize;
+        let end = csr.indptr[r + 1] as usize;
+        for i in start..end {
+            weights[csr.indices[i] as usize] += (end - i) as u64;
+        }
+    }
+    let blocks = colblocks::plan_blocks(&weights, n_blocks);
+    let cov_parts = colblocks::split_by_blocks(cov, &blocks, n_vars);
+    let sum_parts = colblocks::split_by_blocks(col_sums, &blocks, 1);
+
+    blocks
+        .par_iter()
+        .zip(cov_parts)
+        .zip(sum_parts)
+        .for_each(|((block, cov_part), sum_part)| {
+            accumulate_covariance_block(csr, cov_part, sum_part, n_vars, block.start, block.end);
+        });
+}
+
+/// Turn the accumulated cross-product `Xᵀ X` into the sample covariance, in
+/// place: apply the rank-1 mean-centering correction (when centering) and divide
+/// by `n_obs − 1`.
+///
+/// Touches only the lower triangle (`hi >= lo`), which is all the accumulator
+/// populated and all `self_adjoint_eigen(Side::Lower)` reads. Iterating `hi`
+/// inside `lo` walks the column-major buffer contiguously; the arithmetic per
+/// entry — subtract, then divide — is unchanged.
+fn finalize_covariance(cov: &mut [f64], means: Option<&[f64]>, n_obs: usize, n_vars: usize) {
+    let n_obs_f = n_obs as f64;
+    let denom = (n_obs_f - 1.0).max(1.0);
+    for lo in 0..n_vars {
+        let col = &mut cov[lo * n_vars..(lo + 1) * n_vars];
+        match means {
+            Some(mu) => {
+                let m_lo = mu[lo];
+                for (hi, slot) in col.iter_mut().enumerate().skip(lo) {
+                    *slot = (*slot - n_obs_f * mu[hi] * m_lo) / denom;
+                }
+            }
+            None => {
+                for slot in col.iter_mut().skip(lo) {
+                    *slot /= denom;
+                }
+            }
+        }
+    }
+}
+
+/// One-shot notice that a CSR reached the covariance build without canonical
+/// rows. Not an error — the answer is identical — but the caller loses the
+/// parallel path and should know why.
+fn warn_non_canonical_csr_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        log::warn!(
+            "covariance PCA: a CSR row's column indices are not strictly increasing; \
+             falling back to a serial accumulation. The values are correct and still \
+             deterministic, but this path does not parallelize. To restore it, canonicalize \
+             the matrix: scipy `sort_indices()` for out-of-order columns and \
+             `sum_duplicates()` for repeated ones — sorting alone leaves a duplicate \
+             coordinate on this same serial path"
+        );
+    });
+}
+
+/// Pure parse of `SCX_ACCEL_DETERMINISTIC_LINALG`: `1` / `true` / `yes` / `on`
+/// (case-insensitive) opt in, everything else — including unset — does not.
+fn parse_deterministic_linalg(raw: Option<String>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Pin faer's dense decompositions to sequential execution, if asked.
+///
+/// # Why this is opt-in
+///
+/// SCX's own PCA reductions are bit-identical at any thread count — they
+/// partition their output, so the schedule cannot reach the result. faer's dense
+/// QR and self-adjoint eigendecomposition are different: they block their work by
+/// the **ambient rayon width**, so their low bits move when the pool width does.
+/// Measured on this tree: a thin QR's Q differs in 14 818 of 48 000 elements
+/// between a 1- and a 2-thread pool, and a 400-variable EVD in essentially every
+/// element; below roughly 64 variables the EVD does not parallelize and agrees.
+///
+/// Both are perfectly stable **run to run at a fixed width**, which is why the
+/// default leaves them alone — that is the same contract numpy/scipy give, where
+/// LAPACK's bits likewise move with `OMP_NUM_THREADS`. It is also enough to fix
+/// the defect this all started from: repeated runs of one script on one machine
+/// now agree exactly.
+///
+/// Callers who need identity *across* thread counts — comparing a laptop run
+/// against a cluster run, say — set `SCX_ACCEL_DETERMINISTIC_LINALG=1` and pay
+/// for it: the covariance route's `n_vars × n_vars` EVD is ~2.3× slower
+/// sequential (measured at n_vars = 2000), while the randomized route's thin QR
+/// is actually ~1.65× *faster*, sequential having less overhead at k ≈ 60.
+///
+/// # Why it is set once and never restored
+///
+/// faer's parallelism lives in a process-wide `AtomicUsize`, so setting it around
+/// each call and restoring it afterwards would race any other faer user in the
+/// process. Reading the knob once and applying it once is the only form of this
+/// that is not a data race.
+///
+/// # What it guarantees, and what it merely touches
+///
+/// These are different sets, and conflating them is how the first version of
+/// this comment got it wrong.
+///
+/// **Guaranteed:** CPU PCA and PFlog only. It is initialised from those five
+/// entry points, so nothing is pinned until one of them runs, and only their
+/// determinism is tested.
+///
+/// **Touched:** every *implicit* faer decomposition in the process, because the
+/// setting is one global. After the first pinned PCA call, Harmony's LU fallback
+/// (`harmony/cpu.rs`), NB-GLM's LLT/LU/QR (`nb_glm/{irls,dispersion,wald,validate}.rs`)
+/// and the native-GPU PCA's host SVD (`scx-gpu`) all run sequentially too —
+/// where before that call they did not. That is a real call-order-dependent
+/// performance side effect, and it does *not* buy those ops determinism.
+///
+/// **Not touched:** call sites passing an **explicit** `Par`. The exact-kNN gemm
+/// (`neighbors/cpu.rs`) and the eval-metrics distance gemm
+/// (`eval_metrics/distances.rs`) hand faer `Par::rayon(0)` directly and ignore
+/// the global entirely, so pinning cannot make them sequential or reproducible.
+fn pin_linalg_if_requested() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if parse_deterministic_linalg(std::env::var("SCX_ACCEL_DETERMINISTIC_LINALG").ok()) {
+            faer::set_global_parallelism(faer::Par::Seq);
+            log::info!(
+                "SCX_ACCEL_DETERMINISTIC_LINALG is set: pinning faer's dense decompositions \
+                 to sequential execution, so CPU PCA / PFlog results are bit-identical \
+                 across thread counts. The setting is a faer process-global, so every \
+                 implicit faer decomposition (Harmony, NB-GLM, native-GPU PCA's host SVD) \
+                 also runs sequentially from here on; call sites passing an explicit Par \
+                 are unaffected. Expect a slower eigendecomposition on the covariance route"
+            );
+        }
+    });
+}
+
+/// One-shot notice that `SCX_PCA_COV_MEMORY_BUDGET` no longer does anything.
+///
+/// It used to cap how many concurrent `n_vars × n_vars` f64 accumulators the
+/// covariance build held, back when there was one per worker. The build now
+/// partitions the output and holds exactly one regardless of thread count, so
+/// there is nothing left to cap — but a user who set the knob deserves to be
+/// told that rather than have it silently ignored.
+fn warn_if_cov_memory_budget_set() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("SCX_PCA_COV_MEMORY_BUDGET").is_some() {
+            log::warn!(
+                "SCX_PCA_COV_MEMORY_BUDGET is set but no longer has any effect: covariance \
+                 PCA accumulates into a single shared n_vars × n_vars matrix instead of one \
+                 per worker, so peak memory no longer scales with the thread count"
+            );
+        }
+    });
 }
 
 /// Decode-prefetch depth for the streaming PCA passes.
@@ -221,11 +434,9 @@ fn cov_memory_budget() -> u64 {
 /// `SCX_ACCEL_PREFETCH_DEPTH`, default 4, already capped by the rayon pool
 /// width — additionally lowered by `SCX_ACCEL_NUM_THREADS` when that is set.
 ///
-/// PCA is the only accelerator with two *private* rayon pools **and** a
-/// user-visible thread cap. Both pools already honour `SCX_ACCEL_NUM_THREADS`
-/// (see [`accumulate_covariance_streaming`] and
-/// [`sparse_outer_product_accumulate_par`]); leaving decode-prefetch outside it
-/// would quietly stop that knob from bounding PCA's concurrency at all.
+/// PCA's reductions honour `SCX_ACCEL_NUM_THREADS` through
+/// [`colblocks::block_count`]; leaving decode-prefetch outside it would quietly
+/// stop that knob from bounding PCA's concurrency at all.
 ///
 /// `pyscx` calls this too, to size the slice of `pca(memory_budget=…)` it must
 /// reserve for decoded-but-unconsumed shards — the two have to agree, so there
@@ -234,131 +445,6 @@ pub fn pca_prefetch_depth() -> usize {
     crate::prefetch::prefetch_depth()
         .min(crate::mem_budget::accel_num_threads().unwrap_or(usize::MAX))
         .max(1)
-}
-
-/// Number of concurrent covariance accumulators that fit in `budget` bytes,
-/// clamped to `[1, max_threads]`. Each accumulator is one `n_vars × n_vars` f64
-/// matrix (`n_vars² × 8` bytes). Mirrors the worker-deration arithmetic used by
-/// scx-convert's parallel-streaming coordinator: `(budget / per_worker).max(1)`
-/// then clamped to the requested thread count.
-fn cov_accumulator_workers(n_vars: usize, budget: u64, max_threads: usize) -> usize {
-    let mat_bytes = (n_vars as u64)
-        .saturating_mul(n_vars as u64)
-        .saturating_mul(8)
-        .max(1);
-    let by_budget = (budget / mat_bytes).max(1) as usize;
-    by_budget.min(max_threads.max(1))
-}
-
-/// Stream shards and accumulate the covariance **lower triangle** + column sums,
-/// reusing a bounded set of thread-local accumulators across **all** shards.
-///
-/// Peak memory is bounded to ≈ `(workers + 1) × n_vars² × 8` bytes regardless of
-/// shard count or host core count, where `workers` is derived from
-/// [`cov_memory_budget`]. This preserves the out-of-core property of the streaming
-/// path — peak RAM scales with `n_vars` (≤ [`COVARIANCE_PCA_THRESHOLD`]), not
-/// `n_obs` — while avoiding the per-shard accumulator reallocation of a naive
-/// `fold`-per-shard loop. Like the accumulators above, only the lower triangle is
-/// written (the eigensolver reads `Side::Lower`).
-///
-/// Shards arrive through the bounded ordered decode-prefetch pipeline at
-/// `depth`, so up to `depth` decode on the **global** rayon pool while the
-/// accumulation runs on this function's own memory-bounded private pool. The
-/// two pools are disjoint sets of OS threads, and the pipeline's live set is
-/// capped by its channel capacity, so a decode worker can never park while the
-/// calling thread is blocked inside `pool.install`.
-fn accumulate_covariance_streaming<S: ShardSource + Sync + ?Sized>(
-    source: &S,
-    n_vars: usize,
-    depth: usize,
-) -> Result<(Mat<f64>, Vec<f64>)> {
-    let max_threads = rayon::current_num_threads();
-    let budget = cov_memory_budget();
-    // Memory-derived worker cap, lowered further by the shared
-    // `SCX_ACCEL_NUM_THREADS` policy when set (unset → no change).
-    let workers = cov_accumulator_workers(n_vars, budget, max_threads)
-        .min(crate::mem_budget::accel_num_threads().unwrap_or(usize::MAX));
-    if workers < max_threads {
-        log::debug!(
-            "covariance_pca: capping accumulator workers to {workers} of {max_threads} \
-             (n_vars={n_vars}, budget={budget} B, ~{} MB/accumulator) to bound peak memory",
-            (n_vars as u64)
-                .saturating_mul(n_vars as u64)
-                .saturating_mul(8)
-                / (1024 * 1024)
-        );
-    }
-
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(workers)
-        .build()
-        .map_err(|e| AccelError::InvalidInput(format!("rayon thread pool: {e}")))?;
-
-    // Per-thread accumulators, reused across every shard (≤ `workers` of them).
-    // Only the per-row accumulation runs in the bounded private pool; decode
-    // happens on the global pool ahead of the consume closure.
-    let mut tls: ThreadLocal<RefCell<(Mat<f64>, Vec<f64>)>> = ThreadLocal::new();
-
-    crate::prefetch::for_each_shard_ordered(source, depth, |_shard_idx, csr| {
-        let n_rows = csr.n_rows();
-        if n_rows == 0 {
-            return Ok(());
-        }
-        // Bind the reduction guard only for shards that actually accumulate, so
-        // empty shards don't inflate the reduction call count.
-        let _r = scx_format_io::reduction_guard();
-        let chunk_size = (n_rows / workers.max(1)).max(256);
-        let csr_ref = &csr;
-        let tls_ref = &tls;
-        pool.install(move || {
-            (0..n_rows)
-                .into_par_iter()
-                .with_min_len(chunk_size)
-                .for_each(|r| {
-                    let cell = tls_ref.get_or(|| {
-                        RefCell::new((Mat::<f64>::zeros(n_vars, n_vars), vec![0.0f64; n_vars]))
-                    });
-                    let (cov_local, sums_local) = &mut *cell.borrow_mut();
-                    let start = csr_ref.indptr[r] as usize;
-                    let end = csr_ref.indptr[r + 1] as usize;
-                    for idx in start..end {
-                        let c = csr_ref.indices[idx] as usize;
-                        let v = csr_ref.data[idx] as f64;
-                        sums_local[c] += v;
-                    }
-                    for i in start..end {
-                        let c1 = csr_ref.indices[i] as usize;
-                        let v1 = csr_ref.data[i] as f64;
-                        cov_local[(c1, c1)] += v1 * v1;
-                        for j in (i + 1)..end {
-                            let c2 = csr_ref.indices[j] as usize;
-                            let v2 = csr_ref.data[j] as f64;
-                            let prod = v1 * v2;
-                            // Write the lower-triangle entry only (row >= col).
-                            let (lo, hi) = if c1 < c2 { (c1, c2) } else { (c2, c1) };
-                            cov_local[(hi, lo)] += prod;
-                        }
-                    }
-                });
-        });
-        Ok(())
-    })?;
-
-    // Reduce the thread-local lower triangles + column sums into the result.
-    let mut cov = Mat::<f64>::zeros(n_vars, n_vars);
-    let mut col_sums = vec![0.0f64; n_vars];
-    for cell in tls.iter_mut() {
-        let (cov_local, sums_local) = cell.get_mut();
-        for i in 0..n_vars {
-            for j in 0..=i {
-                cov[(i, j)] += cov_local[(i, j)];
-            }
-        }
-        for (acc, &s) in col_sums.iter_mut().zip(sums_local.iter()) {
-            *acc += s;
-        }
-    }
-    Ok((cov, col_sums))
 }
 
 /// Thin SVD: A = U Σ V^T. Returns (U, σ, V^T).
@@ -451,6 +537,7 @@ pub fn randomized_pca_with_depth<S: ShardSource + Sync + ?Sized>(
     let (n_obs, n_vars) = source.shape();
     validate_inputs(n_obs, n_vars, n_components)?;
     warn_if_cache_undersized(source, "randomized_pca");
+    pin_linalg_if_requested();
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
     // Fused pass: compute column means and sum-of-squares together (1 shard pass)
@@ -704,6 +791,7 @@ pub fn pflog_pca_with_depth<S: ShardSource + Sync + ?Sized>(
         )));
     }
     warn_if_cache_undersized(delta_source, "pflog_pca");
+    pin_linalg_if_requested();
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
 
@@ -766,6 +854,7 @@ pub fn randomized_pca_inmemory(
 ) -> Result<PcaResult> {
     let (n_obs, n_vars) = (csr.n_rows(), csr.n_cols());
     validate_inputs(n_obs, n_vars, n_components)?;
+    pin_linalg_if_requested();
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
 
@@ -982,10 +1071,171 @@ fn streaming_spmm_forward<S: ShardSource + Sync + ?Sized>(
     Ok(y)
 }
 
+/// Column sums of `Q`: `sum_q[j] = Σ_r Q[r, j]`.
+///
+/// The column-centering rank-1 term needs this, and it does not depend on `X` at
+/// all — so it is computed once per call rather than folded into the shard loop,
+/// where it used to ride the same work-stealing reduction the rest of the pass
+/// did. Parallel over `j`: each output element sums rows in ascending order on a
+/// single worker, and `Q` is column-major so each `j` walks contiguous memory.
+fn column_sums_of_q(q: &Mat<f64>) -> Vec<f64> {
+    let (n_obs, k) = (q.nrows(), q.ncols());
+    let mut sum_q = vec![0.0f64; k];
+    sum_q.par_iter_mut().enumerate().for_each(|(j, slot)| {
+        let mut acc = 0.0f64;
+        for r in 0..n_obs {
+            acc += q[(r, j)];
+        }
+        *slot = acc;
+    });
+    sum_q
+}
+
+/// `Z -= μ ⊗ (1ᵀ Q)` — the column-centering rank-1 term, applied once after all
+/// shards have been folded in.
+fn apply_transpose_mean_correction(z: &mut [f64], means: &[f64], sum_q: &[f64], k: usize) {
+    debug_assert_eq!(z.len(), means.len() * k);
+    // `chunks_mut(0)` panics, so record why it cannot happen rather than adding an
+    // early return: an early return would turn a genuinely broken caller into a
+    // silent no-op. Every PCA entry point calls `validate_inputs`, which rejects
+    // `n_components == 0` and empty axes, and `k` is at least `n_components`
+    // clamped to two non-zero axes — so `k >= 1` for every reachable call.
+    debug_assert!(k > 0, "k must be non-zero — validate_inputs guarantees it");
+    for (v, row) in z.chunks_mut(k).enumerate() {
+        let mu = means[v];
+        for (slot, &sq) in row.iter_mut().zip(sum_q) {
+            *slot -= mu * sq;
+        }
+    }
+}
+
+/// Accumulate the variable rows `[a, b)` of `Z = Xᵀ Q` from one CSR.
+///
+/// `z_part` is the `(b − a)`-row, `k`-column row-major slice this block owns, and
+/// `q_row` is caller-provided scratch of length `k` so the row gather allocates
+/// once per block rather than once per row.
+///
+/// Each nonzero contributes to exactly one variable row, so the blocks' index
+/// windows *tile* each CSR row: unlike the covariance kernel there is no read
+/// amplification, and total work is independent of the block count. Element
+/// `(v, j)` accumulates rows in ascending order at any width, which is what makes
+/// the split invisible in the result.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn spmm_transpose_block(
+    csr: &ScxCsr,
+    q: &Mat<f64>,
+    row_base: usize,
+    z_part: &mut [f64],
+    k: usize,
+    a: usize,
+    b: usize,
+    sorted: bool,
+    q_row: &mut [f64],
+) {
+    if a >= b {
+        return;
+    }
+    for r in 0..csr.n_rows() {
+        let start = csr.indptr[r] as usize;
+        let end = csr.indptr[r + 1] as usize;
+        let row_idx = &csr.indices[start..end];
+        let row_dat = &csr.data[start..end];
+        // A canonical row's columns in `[a, b)` form a contiguous window. A
+        // non-canonical one does not, so scan the whole row and test membership
+        // — slower, same bits, and still deterministic.
+        let (lo, hi) = if sorted {
+            colblocks::sorted_subrange(row_idx, a, b)
+        } else {
+            (0, row_idx.len())
+        };
+        if lo == hi {
+            continue;
+        }
+        let gr = row_base + r;
+        for (j, slot) in q_row.iter_mut().enumerate() {
+            *slot = q[(gr, j)];
+        }
+        for (&col, &val) in row_idx[lo..hi].iter().zip(&row_dat[lo..hi]) {
+            let col = col as usize;
+            if !sorted && !(a..b).contains(&col) {
+                continue;
+            }
+            let val = val as f64;
+            let z_off = (col - a) * k;
+            for (j, &qj) in q_row.iter().enumerate() {
+                z_part[z_off + j] += val * qj;
+            }
+        }
+    }
+}
+
+/// Fold one CSR's contribution into the shared `Z = Xᵀ Q` accumulator
+/// (`n_vars × k`, row-major), partitioning the **variable axis** across rayon
+/// workers.
+///
+/// `row_base` is the CSR's first global observation row, so the same kernel
+/// serves the streaming loop (one call per shard, `row_base` advancing) and the
+/// in-memory entry (one call at `row_base = 0`).
+///
+/// Blocks own disjoint slices of `z`, so nothing is merged and the accumulator is
+/// one `n_vars × k` buffer instead of one per worker.
+fn spmm_transpose_into(
+    csr: &ScxCsr,
+    q: &Mat<f64>,
+    row_base: usize,
+    z: &mut [f64],
+    k: usize,
+    n_vars: usize,
+) {
+    if csr.n_rows() == 0 || csr.indices.is_empty() {
+        return;
+    }
+    let sorted = colblocks::rows_strictly_increasing(csr);
+    // Below this the rayon overhead outweighs the work; one block is the same
+    // arithmetic in the same order, so the threshold is invisible in the result.
+    let n_blocks = if csr.n_rows() * k > 10_000 {
+        colblocks::block_count(n_vars)
+    } else {
+        1
+    };
+
+    if n_blocks == 1 {
+        let mut q_row = vec![0.0f64; k];
+        spmm_transpose_block(csr, q, row_base, z, k, 0, n_vars, sorted, &mut q_row);
+        return;
+    }
+
+    // Exact per-column op count: each nonzero in column `c` drives `k` updates,
+    // all in variable row `c`. Load balancing only — see `colblocks`.
+    let mut weights = vec![0u64; n_vars];
+    for &c in &csr.indices {
+        weights[c as usize] += 1;
+    }
+    let blocks = colblocks::plan_blocks(&weights, n_blocks);
+    let z_parts = colblocks::split_by_blocks(z, &blocks, k);
+
+    blocks.par_iter().zip(z_parts).for_each(|(block, z_part)| {
+        let mut q_row = vec![0.0f64; k];
+        spmm_transpose_block(
+            csr,
+            q,
+            row_base,
+            z_part,
+            k,
+            block.start,
+            block.end,
+            sorted,
+            &mut q_row,
+        );
+    });
+}
+
 /// Streaming transpose SpMM: Z = (X - μ)^T @ Q, shard-by-shard.
 ///
-/// Q is `Mat<f64>` (n_obs × k), column-major. Each shard is parallelized
-/// via rayon thread-local accumulators (same approach as `spmm_transpose_csr`).
+/// Q is `Mat<f64>` (n_obs × k), column-major. Shards arrive in order through the
+/// decode-prefetch pipeline and each folds into a single shared accumulator whose
+/// variable rows are partitioned across workers (see [`spmm_transpose_into`]).
 /// Returns row-major `Vec<f64>` of shape (n_vars × k).
 fn streaming_spmm_transpose<S: ShardSource + Sync + ?Sized>(
     source: &S,
@@ -998,122 +1248,18 @@ fn streaming_spmm_transpose<S: ShardSource + Sync + ?Sized>(
     debug_assert_eq!(q.nrows(), n_obs);
 
     let mut z = vec![0.0f64; n_vars * k];
-    let mut sum_q = if means.is_some() {
-        vec![0.0f64; k]
-    } else {
-        vec![]
-    };
-
     let mut global_row = 0usize;
-
-    // Per-thread scratch buffers hoisted across *all* shards: each thread's
-    // buffer accumulates its contributions across every parallel shard, and
-    // the final reduction into `z` / `sum_q` runs once after the shard loop.
-    // Eliminates `n_shards - 1` zero-and-reduce passes over the `n_vars·k`
-    // accumulator compared with per-shard reduction.
-    let mut tls_z: ThreadLocal<RefCell<Vec<f64>>> = ThreadLocal::new();
-    let mut tls_sq: ThreadLocal<RefCell<Vec<f64>>> = ThreadLocal::new();
-    let tls_q_row: ThreadLocal<RefCell<Vec<f64>>> = ThreadLocal::new();
-    let sq_len = if means.is_some() { k } else { 0 };
 
     crate::prefetch::for_each_shard_ordered(source, depth, |_shard_idx, csr| {
         let _r = scx_format_io::reduction_guard();
-        let shard_rows = csr.n_rows();
-        let use_parallel = shard_rows * k > 10_000;
-
-        if use_parallel {
-            let gr_base = global_row;
-            let chunk_size = (shard_rows / rayon::current_num_threads().max(1)).max(256);
-
-            (0..shard_rows)
-                .into_par_iter()
-                .with_min_len(chunk_size)
-                .for_each(|r| {
-                    let mut zl = tls_z
-                        .get_or(|| RefCell::new(vec![0.0f64; n_vars * k]))
-                        .borrow_mut();
-                    let mut sql = tls_sq
-                        .get_or(|| RefCell::new(vec![0.0f64; sq_len]))
-                        .borrow_mut();
-
-                    let mut q_row = tls_q_row
-                        .get_or(|| RefCell::new(vec![0.0f64; k]))
-                        .borrow_mut();
-
-                    let gr = gr_base + r;
-                    for j in 0..k {
-                        q_row[j] = q[(gr, j)];
-                    }
-                    if means.is_some() {
-                        for j in 0..k {
-                            sql[j] += q_row[j];
-                        }
-                    }
-                    let start = csr.indptr[r] as usize;
-                    let end = csr.indptr[r + 1] as usize;
-                    for idx in start..end {
-                        let col = csr.indices[idx] as usize;
-                        let val = csr.data[idx] as f64;
-                        let z_offset = col * k;
-                        for j in 0..k {
-                            zl[z_offset + j] += val * q_row[j];
-                        }
-                    }
-                });
-        } else {
-            // Sequential path for small shards
-            let mut q_row = vec![0.0f64; k];
-            for r in 0..shard_rows {
-                let gr = global_row + r;
-                for j in 0..k {
-                    q_row[j] = q[(gr, j)];
-                }
-                if means.is_some() {
-                    for j in 0..k {
-                        sum_q[j] += q_row[j];
-                    }
-                }
-                let start = csr.indptr[r] as usize;
-                let end = csr.indptr[r + 1] as usize;
-                for idx in start..end {
-                    let col = csr.indices[idx] as usize;
-                    let val = csr.data[idx] as f64;
-                    let z_offset = col * k;
-                    for j in 0..k {
-                        z[z_offset + j] += val * q_row[j];
-                    }
-                }
-            }
-        }
-
-        global_row += shard_rows;
+        spmm_transpose_into(&csr, q, global_row, &mut z, k, n_vars);
+        global_row += csr.n_rows();
         Ok(())
     })?;
 
-    // Reduce thread-local parallel-path accumulators into the globals.
-    // Sequential-path shards wrote directly to `z` / `sum_q`, so this step
-    // folds in the parallel contributions only.
-    for buf in tls_z.iter_mut() {
-        let zl = buf.get_mut();
-        for (zg, zv) in z.iter_mut().zip(zl.iter()) {
-            *zg += *zv;
-        }
-    }
-    for buf in tls_sq.iter_mut() {
-        let sql = buf.get_mut();
-        for (sg, sv) in sum_q.iter_mut().zip(sql.iter()) {
-            *sg += *sv;
-        }
-    }
-
     // Mean centering correction: Z -= μ @ (1^T @ Q)
     if let Some(mu) = means {
-        #[allow(clippy::needless_range_loop)]
-        for v in 0..n_vars {
-            for j in 0..k {
-                z[v * k + j] -= mu[v] * sum_q[j];
-            }
-        }
+        apply_transpose_mean_correction(&mut z, mu, &column_sums_of_q(q), k);
     }
 
     Ok(z)
@@ -1144,141 +1290,21 @@ fn spmm_forward_csr(csr: &ScxCsr, m_data: &[f64], k: usize, means: Option<&[f64]
 
 /// In-memory transpose SpMM: Z = (X - μ)^T @ Q using a single CSR.
 ///
-/// Parallelized via rayon: each thread accumulates into a thread-local
-/// `z_local` buffer (n_vars × k), then all buffers are reduced by summation.
+/// Single-shard special case of [`streaming_spmm_transpose`], sharing its kernel
+/// so the two routes cannot drift.
 /// Returns row-major `Vec<f64>` of shape (n_vars × k).
 fn spmm_transpose_csr(csr: &ScxCsr, q: &Mat<f64>, means: Option<&[f64]>) -> Vec<f64> {
-    let n_obs = csr.n_rows();
     let n_vars = csr.n_cols();
     let k = q.ncols();
 
-    // Parallel threshold: use rayon when work is substantial
-    let use_parallel = n_obs * k > 10_000;
+    let mut z = vec![0.0f64; n_vars * k];
+    spmm_transpose_into(csr, q, 0, &mut z, k, n_vars);
 
-    if use_parallel {
-        // Each chunk of rows produces a thread-local (z_local, sum_q_local).
-        // We partition rows into ~equal chunks for rayon.
-        let chunk_size = (n_obs / rayon::current_num_threads().max(1)).max(256);
-
-        // The fold accumulator carries a reusable `q_row` scratch buffer as its
-        // third element so it is allocated once per rayon task (per chunk)
-        // rather than once per row. Values are identical to the per-row alloc.
-        let (z, sum_q, _) = (0..n_obs)
-            .into_par_iter()
-            .with_min_len(chunk_size)
-            .fold(
-                || {
-                    (
-                        vec![0.0f64; n_vars * k],
-                        if means.is_some() {
-                            vec![0.0f64; k]
-                        } else {
-                            vec![]
-                        },
-                        vec![0.0f64; k],
-                    )
-                },
-                |(mut z_local, mut sq_local, mut q_row), r| {
-                    // Copy one row from column-major Q into the reused buffer
-                    for j in 0..k {
-                        q_row[j] = q[(r, j)];
-                    }
-                    if means.is_some() {
-                        for j in 0..k {
-                            sq_local[j] += q_row[j];
-                        }
-                    }
-                    let start = csr.indptr[r] as usize;
-                    let end = csr.indptr[r + 1] as usize;
-                    for idx in start..end {
-                        let col = csr.indices[idx] as usize;
-                        let val = csr.data[idx] as f64;
-                        let z_offset = col * k;
-                        for j in 0..k {
-                            z_local[z_offset + j] += val * q_row[j];
-                        }
-                    }
-                    (z_local, sq_local, q_row)
-                },
-            )
-            .reduce(
-                || {
-                    (
-                        vec![0.0f64; n_vars * k],
-                        if means.is_some() {
-                            vec![0.0f64; k]
-                        } else {
-                            vec![]
-                        },
-                        Vec::new(),
-                    )
-                },
-                |(mut za, mut sqa, qa), (zb, sqb, _qb)| {
-                    for i in 0..za.len() {
-                        za[i] += zb[i];
-                    }
-                    for i in 0..sqa.len() {
-                        sqa[i] += sqb[i];
-                    }
-                    (za, sqa, qa)
-                },
-            );
-
-        // Apply mean correction
-        if let Some(mu) = means {
-            let mut z = z;
-            #[allow(clippy::needless_range_loop)]
-            for v in 0..n_vars {
-                for j in 0..k {
-                    z[v * k + j] -= mu[v] * sum_q[j];
-                }
-            }
-            z
-        } else {
-            z
-        }
-    } else {
-        // Sequential path for small matrices
-        let mut z = vec![0.0f64; n_vars * k];
-        let mut sum_q = if means.is_some() {
-            vec![0.0f64; k]
-        } else {
-            vec![]
-        };
-        let mut q_row = vec![0.0f64; k];
-
-        for r in 0..n_obs {
-            for j in 0..k {
-                q_row[j] = q[(r, j)];
-            }
-            if means.is_some() {
-                for j in 0..k {
-                    sum_q[j] += q_row[j];
-                }
-            }
-            let start = csr.indptr[r] as usize;
-            let end = csr.indptr[r + 1] as usize;
-            for idx in start..end {
-                let col = csr.indices[idx] as usize;
-                let val = csr.data[idx] as f64;
-                let z_offset = col * k;
-                for j in 0..k {
-                    z[z_offset + j] += val * q_row[j];
-                }
-            }
-        }
-
-        if let Some(mu) = means {
-            #[allow(clippy::needless_range_loop)]
-            for v in 0..n_vars {
-                for j in 0..k {
-                    z[v * k + j] -= mu[v] * sum_q[j];
-                }
-            }
-        }
-
-        z
+    if let Some(mu) = means {
+        apply_transpose_mean_correction(&mut z, mu, &column_sums_of_q(q), k);
     }
+
+    z
 }
 
 /// Shared SpMM-forward kernel: accumulates X_shard @ M into y[global_row*k..].
@@ -1443,14 +1469,30 @@ pub fn covariance_pca_with_depth<S: ShardSource + Sync + ?Sized>(
     let (n_obs, n_vars) = source.shape();
     validate_inputs(n_obs, n_vars, n_components)?;
     warn_if_cache_undersized(source, "covariance_pca");
+    pin_linalg_if_requested();
+
+    warn_if_cov_memory_budget_set();
 
     // --- Pass 1: Accumulate covariance matrix and column sums ---
     // Sparse outer product: accumulate C[c1,c2] += v1*v2 directly from CSR nonzeros.
     // No densification — touches only nonzero entries (~2% for typical HVG-selected
-    // data). Streams shard-by-shard with a memory-bounded set of thread-local
-    // accumulators (see `accumulate_covariance_streaming`); only the lower triangle
-    // is populated. Shard reads go through the cached `read_shard_arc` (T4.4).
-    let (mut cov, col_sums) = accumulate_covariance_streaming(source, n_vars, depth)?;
+    // data). Shards arrive in order through the decode-prefetch pipeline and each
+    // one folds into a *single* shared accumulator whose columns are partitioned
+    // across workers, so peak RAM scales with `n_vars` (≤ COVARIANCE_PCA_THRESHOLD)
+    // and not with the thread count, and the result is bit-identical at any width.
+    // Only the lower triangle is populated. Shard reads go through the cached
+    // `read_shard_arc` (T4.4).
+    let mut cov = vec![0.0f64; n_vars * n_vars];
+    let mut col_sums = vec![0.0f64; n_vars];
+    crate::prefetch::for_each_shard_ordered(source, depth, |_shard_idx, csr| {
+        if csr.n_rows() > 0 {
+            // Bind the reduction guard only for shards that actually accumulate, so
+            // empty shards don't inflate the reduction call count.
+            let _r = scx_format_io::reduction_guard();
+            accumulate_covariance_into(&csr, &mut cov, &mut col_sums, n_vars);
+        }
+        Ok(())
+    })?;
 
     // --- Mean centering ---
     let means = if zero_center {
@@ -1464,28 +1506,11 @@ pub fn covariance_pca_with_depth<S: ShardSource + Sync + ?Sized>(
         None
     };
 
-    // Post-processing touches only the lower triangle (`j <= i`): the upper triangle
-    // is intentionally left unpopulated since the eigensolver reads `Side::Lower`.
-    if let Some(ref mu) = means {
-        // C -= n_obs * (mu^T @ mu)  (rank-1 correction for mean centering)
-        for i in 0..n_vars {
-            for j in 0..=i {
-                cov[(i, j)] -= n_obs as f64 * mu[i] * mu[j];
-            }
-        }
-    }
-
-    // Convert to sample covariance: C /= (n-1)
-    let denom = (n_obs as f64 - 1.0).max(1.0);
-    for i in 0..n_vars {
-        for j in 0..=i {
-            cov[(i, j)] /= denom;
-        }
-    }
+    finalize_covariance(&mut cov, means.as_deref(), n_obs, n_vars);
 
     // --- Eigendecomposition ---
     // Reads the lower triangle only; the upper triangle of `cov` is unpopulated.
-    let evd = cov
+    let evd = MatRef::from_column_major_slice(&cov, n_vars, n_vars)
         .self_adjoint_eigen(faer::Side::Lower)
         .map_err(|e| AccelError::LinAlg(format!("Eigendecomposition failed: {e:?}")))?;
 
@@ -1590,11 +1615,17 @@ pub fn covariance_pca_inmemory(
 ) -> Result<PcaResult> {
     let (n_obs, n_vars) = (csr.n_rows(), csr.n_cols());
     validate_inputs(n_obs, n_vars, n_components)?;
+    pin_linalg_if_requested();
+
+    warn_if_cov_memory_budget_set();
 
     // --- Build covariance matrix via sparse outer products ---
-    // Parallel accumulation: each rayon thread gets a thread-local n_vars × n_vars
-    // covariance matrix (~30 MB for n_vars=2000) and col_sums vector.
-    let (mut cov, col_sums) = sparse_outer_product_accumulate_par(csr, n_vars);
+    // One shared n_vars × n_vars accumulator with its columns partitioned across
+    // rayon workers — the same kernel the streaming entry point folds each shard
+    // through, so the two routes cannot drift.
+    let mut cov = vec![0.0f64; n_vars * n_vars];
+    let mut col_sums = vec![0.0f64; n_vars];
+    accumulate_covariance_into(csr, &mut cov, &mut col_sums, n_vars);
 
     // Mean centering
     let means = if zero_center {
@@ -1608,26 +1639,10 @@ pub fn covariance_pca_inmemory(
         None
     };
 
-    // Post-processing touches only the lower triangle (`j <= i`): the accumulator
-    // populates only that triangle and the eigensolver reads `Side::Lower`.
-    if let Some(ref mu) = means {
-        for i in 0..n_vars {
-            for j in 0..=i {
-                cov[(i, j)] -= n_obs as f64 * mu[i] * mu[j];
-            }
-        }
-    }
-
-    // Sample covariance
-    let denom = (n_obs as f64 - 1.0).max(1.0);
-    for i in 0..n_vars {
-        for j in 0..=i {
-            cov[(i, j)] /= denom;
-        }
-    }
+    finalize_covariance(&mut cov, means.as_deref(), n_obs, n_vars);
 
     // Eigendecomposition — reads the lower triangle only.
-    let evd = cov
+    let evd = MatRef::from_column_major_slice(&cov, n_vars, n_vars)
         .self_adjoint_eigen(faer::Side::Lower)
         .map_err(|e| AccelError::LinAlg(format!("Eigendecomposition failed: {e:?}")))?;
 
@@ -1675,24 +1690,20 @@ pub fn covariance_pca_inmemory(
         mc
     });
 
-    for r in 0..n_obs {
-        let start = csr.indptr[r] as usize;
-        let end = csr.indptr[r + 1] as usize;
-        let e_offset = r * n_components;
-        for idx in start..end {
-            let c = csr.indices[idx] as usize;
-            let val = csr.data[idx] as f64;
-            let v_offset = c * n_components;
-            for pc in 0..n_components {
-                embeddings[e_offset + pc] += val * v_rm[v_offset + pc];
-            }
-        }
-        if let Some(ref mc) = mean_correction {
-            for pc in 0..n_components {
-                embeddings[e_offset + pc] -= mc[pc];
-            }
-        }
-    }
+    // Same `Y = (X - μ) @ M` the streaming route runs, through the same kernel
+    // rather than a hand-inlined copy of it — output rows are disjoint and each
+    // row's nonzeros are still consumed in index order, so this is bit-identical
+    // to the loop it replaces (`covariance_embeddings_kernel_matches_the_inlined_scatter_bitwise`
+    // is that oracle). The difference is that `spmm_forward_into` parallelises
+    // across rows above its work threshold, where this pass was single-threaded.
+    spmm_forward_into(
+        csr,
+        &v_rm,
+        n_components,
+        &mut embeddings,
+        0,
+        mean_correction.as_deref(),
+    );
 
     Ok(PcaResult {
         embeddings,
@@ -1711,27 +1722,23 @@ pub fn covariance_pca_inmemory(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_cov_accumulator_workers_budget_cap() {
-        // One n_vars=5000 accumulator is 5000² × 8 = 200 MB.
-        let mat_bytes = 5000u64 * 5000 * 8;
-        // A budget that fits ~3 accumulators caps workers to 3 regardless of cores.
-        assert_eq!(cov_accumulator_workers(5000, 3 * mat_bytes, 32), 3);
-        // A tiny budget collapses to a single worker (serial-equivalent), never 0.
-        assert_eq!(cov_accumulator_workers(5000, 1, 32), 1);
-        assert_eq!(cov_accumulator_workers(5000, 0, 32), 1);
-        // A generous budget is clamped to the available thread count, not exceeded.
-        assert_eq!(cov_accumulator_workers(2000, u64::MAX, 8), 8);
-        // Small n_vars under the default budget uses all cores.
-        assert_eq!(
-            cov_accumulator_workers(2000, DEFAULT_COV_MEMORY_BUDGET, 16),
-            16
-        );
-        // max_threads is floored at 1 even if a caller passes 0.
-        assert_eq!(
-            cov_accumulator_workers(100, DEFAULT_COV_MEMORY_BUDGET, 0),
-            1
-        );
+    /// Accumulate `csr` into a fresh lower triangle using exactly `n_blocks`
+    /// column blocks — the seam that lets the tests below pin the block count
+    /// instead of hoping the ambient pool width varies.
+    fn covariance_with_blocks(
+        csr: &ScxCsr,
+        n_vars: usize,
+        n_blocks: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mut cov = vec![0.0f64; n_vars * n_vars];
+        let mut col_sums = vec![0.0f64; n_vars];
+        let blocks = colblocks::plan_blocks(&vec![1u64; n_vars], n_blocks);
+        let cov_parts = colblocks::split_by_blocks(&mut cov, &blocks, n_vars);
+        let sum_parts = colblocks::split_by_blocks(&mut col_sums, &blocks, 1);
+        for ((block, cov_part), sum_part) in blocks.iter().zip(cov_parts).zip(sum_parts) {
+            accumulate_covariance_block(csr, cov_part, sum_part, n_vars, block.start, block.end);
+        }
+        (cov, col_sums)
     }
 
     /// A simple in-memory multi-shard `ShardSource` for streaming-PCA tests.
@@ -2216,12 +2223,14 @@ mod tests {
         );
 
         // --- Sparse sequential ---
-        let mut cov_sparse = Mat::<f64>::zeros(n_vars, n_vars);
+        let mut cov_sparse = vec![0.0f64; n_vars * n_vars];
         let mut col_sums_sparse = vec![0.0f64; n_vars];
-        sparse_outer_product_accumulate(&csr, &mut col_sums_sparse, &mut cov_sparse);
+        accumulate_covariance_serial(&csr, &mut cov_sparse, &mut col_sums_sparse, n_vars);
 
-        // --- Sparse parallel ---
-        let (cov_par, col_sums_par) = sparse_outer_product_accumulate_par(&csr, n_vars);
+        // --- Sparse partitioned ---
+        let mut cov_par = vec![0.0f64; n_vars * n_vars];
+        let mut col_sums_par = vec![0.0f64; n_vars];
+        accumulate_covariance_into(&csr, &mut cov_par, &mut col_sums_par, n_vars);
 
         // Check col_sums match
         for c in 0..n_vars {
@@ -2246,16 +2255,16 @@ mod tests {
         for i in 0..n_vars {
             for j in 0..=i {
                 assert!(
-                    (cov_dense[(i, j)] - cov_sparse[(i, j)]).abs() < 1e-10,
+                    (cov_dense[(i, j)] - cov_sparse[j * n_vars + i]).abs() < 1e-10,
                     "cov mismatch at ({i},{j}): dense={}, sparse={}",
                     cov_dense[(i, j)],
-                    cov_sparse[(i, j)]
+                    cov_sparse[j * n_vars + i]
                 );
                 assert!(
-                    (cov_dense[(i, j)] - cov_par[(i, j)]).abs() < 1e-10,
+                    (cov_dense[(i, j)] - cov_par[j * n_vars + i]).abs() < 1e-10,
                     "cov mismatch at ({i},{j}): dense={}, par={}",
                     cov_dense[(i, j)],
-                    cov_par[(i, j)]
+                    cov_par[j * n_vars + i]
                 );
             }
         }
@@ -2486,9 +2495,9 @@ mod tests {
             return;
         }
         let src = gauged_fixture(8, 12, 6);
-        // The load-bearing case: the consume closure enters a *private* rayon
-        // pool via `pool.install` while decode runs on the global one.
-        accumulate_covariance_streaming(&src, 6, 4).unwrap();
+        // The load-bearing case: the consume closure runs its own `par_iter` over
+        // column blocks on the global pool while decode overlaps on the same one.
+        covariance_pca_with_depth(&src, 2, true, 4).unwrap();
         assert_prefetch_engaged(&src, "covariance build");
     }
 
@@ -2663,6 +2672,457 @@ mod tests {
                 "embedding[{i}] {a} vs {b} exceeds the f64-reassociation bar"
             );
         }
+    }
+
+    /// A fixture whose sums are **order-sensitive**: values span ~10 decades, so
+    /// the pairwise products the covariance accumulates span ~20, and a running
+    /// f64 sum loses different low bits depending on the order the rows arrive
+    /// in. Without that span a bit-identity assertion is vacuous — a well-
+    /// conditioned fixture is bit-identical under *every* order, including a
+    /// broken one. `the_reassociating_fixture_can_detect_a_reordering` is the
+    /// premise test that proves this one is not.
+    ///
+    /// Rows are dense so every column pair is exercised, and the LCG keeps the
+    /// mantissas non-trivial (a period-4 pattern of exact powers of ten sums
+    /// exactly and would defeat the point).
+    fn reassociating_shard(row_base: usize, n_rows: usize, n_vars: usize) -> ScxCsr {
+        let mut state = 0x2545_F491_4F6C_DD1Du64 ^ (row_base as u64).wrapping_mul(0x9E37_79B9);
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        for r in 0..n_rows {
+            for c in 0..n_vars {
+                let bits = next();
+                // Mantissa in [1, 2), exponent cycling over 10^{-5..5}, random sign.
+                let mant = 1.0 + (bits >> 40) as f32 / 16_777_216.0;
+                let exp = 10f32.powi((((row_base + r + c) % 11) as i32) - 5);
+                let sign = if bits & 1 == 0 { 1.0 } else { -1.0 };
+                indices.push(c as i32);
+                data.push(sign * mant * exp);
+            }
+            indptr.push(indices.len() as i64);
+        }
+        ScxCsr::new_unchecked((n_rows, n_vars), indptr, indices, data)
+    }
+
+    fn reassociating_fixture(
+        n_shards: usize,
+        rows_per_shard: usize,
+        n_vars: usize,
+    ) -> VecShardSource {
+        VecShardSource {
+            shards: (0..n_shards)
+                .map(|s| reassociating_shard(s * rows_per_shard, rows_per_shard, n_vars))
+                .collect(),
+            n_obs: n_shards * rows_per_shard,
+            n_vars,
+        }
+    }
+
+    /// The premise every bit-identity assertion below rests on: this fixture's
+    /// sums really do depend on accumulation order, so "the bits matched" is
+    /// evidence of a fixed order rather than of an order that never mattered.
+    #[test]
+    fn the_reassociating_fixture_can_detect_a_reordering() {
+        let csr = reassociating_shard(0, 64, 6);
+        let n_vars = 6;
+
+        let mut fwd_cov = vec![0.0f64; n_vars * n_vars];
+        let mut fwd_sums = vec![0.0f64; n_vars];
+        accumulate_covariance_serial(&csr, &mut fwd_cov, &mut fwd_sums, n_vars);
+
+        // Same rows, visited last-to-first. Any correct implementation returns
+        // the same *value*; only the low bits move.
+        let mut rev_indptr = vec![0i64];
+        let mut rev_indices = Vec::new();
+        let mut rev_data = Vec::new();
+        for r in (0..csr.n_rows()).rev() {
+            let (s, e) = (csr.indptr[r] as usize, csr.indptr[r + 1] as usize);
+            rev_indices.extend_from_slice(&csr.indices[s..e]);
+            rev_data.extend_from_slice(&csr.data[s..e]);
+            rev_indptr.push(rev_indices.len() as i64);
+        }
+        let rev = ScxCsr::new_unchecked((csr.n_rows(), n_vars), rev_indptr, rev_indices, rev_data);
+        let mut rev_cov = vec![0.0f64; n_vars * n_vars];
+        let mut rev_sums = vec![0.0f64; n_vars];
+        accumulate_covariance_serial(&rev, &mut rev_cov, &mut rev_sums, n_vars);
+
+        let moved = fwd_cov
+            .iter()
+            .zip(&rev_cov)
+            .any(|(a, b)| a.to_bits() != b.to_bits());
+        assert!(
+            moved,
+            "premise failed: reversing the row order left every covariance entry \
+             bit-identical, so this fixture cannot tell a fixed accumulation order \
+             from an arbitrary one and every bit-identity test using it is vacuous"
+        );
+    }
+
+    /// The core claim, at the kernel rather than through a whole PCA: splitting
+    /// the covariance output `n` ways must reproduce the serial accumulation
+    /// **exactly**, for every `n`. Because the blocks are disjoint and each one
+    /// walks rows in order, the split is invisible in the result — which is what
+    /// makes the thread count a speed knob rather than a numeric one.
+    ///
+    /// `the_reassociating_fixture_can_detect_a_reordering` is the premise: this
+    /// fixture's sums genuinely move under a different order, so matching bits
+    /// here is evidence and not an accident of a well-conditioned input.
+    ///
+    /// This test and `covariance_pca_is_bit_identical_across_thread_counts` are
+    /// not redundant, and neither subsumes the other. Making the block kernel
+    /// walk rows backwards reddens *this* one (it disagrees with the serial
+    /// oracle) and leaves the thread-count one green (backwards is still the
+    /// same order at every width). Correctness and determinism are separate
+    /// claims and need separate tests.
+    #[test]
+    fn covariance_accumulate_is_bit_identical_for_every_block_count() {
+        let n_vars = 17usize;
+        let csr = reassociating_shard(0, 200, n_vars);
+
+        let mut want_cov = vec![0.0f64; n_vars * n_vars];
+        let mut want_sums = vec![0.0f64; n_vars];
+        accumulate_covariance_serial(&csr, &mut want_cov, &mut want_sums, n_vars);
+
+        for n_blocks in [1usize, 2, 3, 5, 17, 32] {
+            let (cov, sums) = covariance_with_blocks(&csr, n_vars, n_blocks);
+            assert_bits_eq(&cov, &want_cov, &format!("covariance at {n_blocks} blocks"));
+            assert_bits_eq(&sums, &want_sums, &format!("col_sums at {n_blocks} blocks"));
+        }
+    }
+
+    /// A non-canonical CSR cannot take the partitioned path (the `c_j >= c_i`
+    /// step is what makes a pair's block a function of `c_i` alone), so it falls
+    /// back to the serial accumulation — which this pins against that same
+    /// reference. Note the bar is the serial oracle, not the partitioned kernel:
+    /// summing a row in stored rather than ascending order genuinely moves the
+    /// low bits, so there is no bit-identity to assert across the two.
+    #[test]
+    fn an_unsorted_csr_matches_the_serial_oracle() {
+        // Row 0's indices descend; row 1's are canonical.
+        let csr = ScxCsr::new_unchecked(
+            (2, 4),
+            vec![0, 3, 6],
+            vec![3, 1, 0, 0, 2, 3],
+            vec![2.5, -1.5, 4.0, 0.5, -3.0, 7.0],
+        );
+        assert!(
+            !colblocks::rows_strictly_increasing(&csr),
+            "premise: the fixture must actually be non-canonical"
+        );
+
+        let mut want_cov = vec![0.0f64; 16];
+        let mut want_sums = vec![0.0f64; 4];
+        accumulate_covariance_serial(&csr, &mut want_cov, &mut want_sums, 4);
+
+        let mut got_cov = vec![0.0f64; 16];
+        let mut got_sums = vec![0.0f64; 4];
+        accumulate_covariance_into(&csr, &mut got_cov, &mut got_sums, 4);
+
+        assert_bits_eq(&got_cov, &want_cov, "unsorted covariance");
+        assert_bits_eq(&got_sums, &want_sums, "unsorted col_sums");
+    }
+
+    /// A duplicate coordinate is a *value* question, not an ordering one, so it
+    /// needs a value oracle: densify the row with duplicates summed — scipy's
+    /// own semantics — and compare `XᵀX` against that.
+    ///
+    /// The predicate test elsewhere only asserts duplicates are *rejected* by
+    /// `rows_strictly_increasing`, which says nothing about what the fallback
+    /// they are routed to then computes. Before the `c1 == c2` doubling this
+    /// returned 7 where the answer is 9.
+    #[test]
+    fn duplicate_coordinates_accumulate_to_their_coalesced_value() {
+        let n_vars = 3usize;
+        // Row 0: column 0 twice (1 + 2 = 3) and column 2 once.
+        // Row 1: column 1 three times (0.5 + 0.25 + 1.25 = 2.0).
+        let csr = ScxCsr::new_unchecked(
+            (2, n_vars),
+            vec![0, 3, 6],
+            vec![0, 0, 2, 1, 1, 1],
+            vec![1.0, 2.0, 4.0, 0.5, 0.25, 1.25],
+        );
+        assert!(
+            !colblocks::rows_strictly_increasing(&csr),
+            "premise: the fixture must carry duplicate coordinates"
+        );
+
+        // Oracle: coalesce to dense, then a plain Xᵀ X.
+        let mut dense = vec![0.0f64; 2 * n_vars];
+        for r in 0..2 {
+            let (s, e) = (csr.indptr[r] as usize, csr.indptr[r + 1] as usize);
+            for idx in s..e {
+                dense[r * n_vars + csr.indices[idx] as usize] += csr.data[idx] as f64;
+            }
+        }
+        let mut want = vec![0.0f64; n_vars * n_vars];
+        let mut want_sums = vec![0.0f64; n_vars];
+        for r in 0..2 {
+            for c in 0..n_vars {
+                want_sums[c] += dense[r * n_vars + c];
+            }
+            for lo in 0..n_vars {
+                for hi in lo..n_vars {
+                    want[lo * n_vars + hi] += dense[r * n_vars + lo] * dense[r * n_vars + hi];
+                }
+            }
+        }
+
+        let mut got = vec![0.0f64; n_vars * n_vars];
+        let mut got_sums = vec![0.0f64; n_vars];
+        accumulate_covariance_into(&csr, &mut got, &mut got_sums, n_vars);
+
+        for lo in 0..n_vars {
+            for hi in lo..n_vars {
+                let (g, w) = (got[lo * n_vars + hi], want[lo * n_vars + hi]);
+                assert!(
+                    (g - w).abs() <= 1e-12 * w.abs().max(1.0),
+                    "cov[{hi},{lo}]: got {g}, coalesced oracle says {w}"
+                );
+            }
+        }
+        for c in 0..n_vars {
+            assert!((got_sums[c] - want_sums[c]).abs() <= 1e-12);
+        }
+    }
+
+    /// Run `f` inside a private rayon pool of exactly `threads` threads.
+    fn in_pool<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(f)
+    }
+
+    /// The covariance **reduction** is bit-identical at any thread count.
+    ///
+    /// The fixture has to be big enough that the build genuinely splits work.
+    /// 300 rows/shard does **not**: the pre-fix
+    /// `with_min_len((n_rows / workers).max(256))` cannot halve 300 into two
+    /// ≥256-row chunks, so it ran as a single task on a single thread-local
+    /// accumulator and passed this test for the wrong reason. 2048 rows split
+    /// four ways at any thread count, and `n_vars = 6` gives the *new* kernel 6
+    /// column blocks at width 12 against 1 at width 1.
+    ///
+    /// `n_vars` is deliberately small for a second reason: faer's self-adjoint
+    /// eigendecomposition blocks by the ambient rayon width and its bits move
+    /// with it above roughly 400 variables (measured). Keeping the fixture below
+    /// that isolates *our* reduction, which is what this test is about. The
+    /// whole-op claim across thread counts needs
+    /// `SCX_ACCEL_DETERMINISTIC_LINALG=1` and lives in
+    /// `tests/pca_linalg_parallelism.rs`; without it the guarantee is
+    /// per-thread-count,
+    /// which is `covariance_pca_is_bit_identical_run_to_run` below.
+    #[test]
+    fn covariance_reduction_is_bit_identical_across_thread_counts() {
+        let (rows_per_shard, n_vars) = (2048usize, 6usize);
+        assert!(
+            rows_per_shard >= 512 && n_vars >= 2,
+            "premise: the fixture must be splittable — rows for a row-partitioned \
+             build, columns for a column-partitioned one"
+        );
+        let src = reassociating_fixture(4, rows_per_shard, n_vars);
+        let one = in_pool(1, || covariance_pca_with_depth(&src, 3, true, 4).unwrap());
+        for threads in [2usize, 7, 12] {
+            let got = in_pool(threads, || {
+                covariance_pca_with_depth(&src, 3, true, 4).unwrap()
+            });
+            assert_bits_eq(
+                &got.embeddings,
+                &one.embeddings,
+                &format!("covariance embeddings at {threads} threads vs 1"),
+            );
+            assert_bits_eq(
+                &got.components,
+                &one.components,
+                &format!("covariance components at {threads} threads vs 1"),
+            );
+        }
+    }
+
+    /// The transpose SpMM is bit-identical at any thread count, on a fixture that
+    /// reaches its parallel branch. `Q` is fixed across the arms on purpose: the
+    /// whole randomized route cannot make this claim without pinned linalg,
+    /// because faer's QR reblocks with the pool width — so feeding a fixed `Q`
+    /// is what isolates the reduction this change actually fixed.
+    #[test]
+    fn transpose_spmm_is_bit_identical_across_thread_counts() {
+        let (rows_per_shard, n_vars, k) = (1200usize, 12usize, 10usize);
+        let src = reassociating_fixture(4, rows_per_shard, n_vars);
+        assert!(
+            rows_per_shard * k > 10_000,
+            "premise: this fixture must reach the parallel branch \
+             (rows_per_shard {rows_per_shard} x k {k})"
+        );
+        let q = Mat::<f64>::from_fn(src.n_obs(), k, |i, j| {
+            // Wide dynamic range, same reason as `reassociating_shard`.
+            let e = 10f64.powi(((i + j) % 9) as i32 - 4);
+            if (i + j) % 2 == 0 {
+                e
+            } else {
+                -e * 1.5
+            }
+        });
+        let means: Vec<f64> = (0..n_vars).map(|v| 0.25 * (v + 1) as f64).collect();
+
+        for mu in [None, Some(means.as_slice())] {
+            let one = in_pool(1, || streaming_spmm_transpose(&src, &q, mu, 4).unwrap());
+            for threads in [2usize, 7, 12] {
+                let got = in_pool(threads, || {
+                    streaming_spmm_transpose(&src, &q, mu, 4).unwrap()
+                });
+                assert_bits_eq(
+                    &got,
+                    &one,
+                    &format!(
+                        "transpose SpMM at {threads} threads vs 1 (centered: {})",
+                        mu.is_some()
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Splitting the transpose output `n` ways must reproduce the single-block
+    /// accumulation exactly, for every `n` — the transpose twin of
+    /// `covariance_accumulate_is_bit_identical_for_every_block_count`.
+    #[test]
+    fn spmm_transpose_is_bit_identical_for_every_block_count() {
+        let (n_vars, k) = (17usize, 6usize);
+        let csr = reassociating_shard(0, 400, n_vars);
+        let q = Mat::<f64>::from_fn(400, k, |i, j| {
+            let e = 10f64.powi(((i + j) % 9) as i32 - 4);
+            if (i + j) % 2 == 0 {
+                e
+            } else {
+                -e * 1.5
+            }
+        });
+
+        let mut want = vec![0.0f64; n_vars * k];
+        let mut q_row = vec![0.0f64; k];
+        spmm_transpose_block(&csr, &q, 0, &mut want, k, 0, n_vars, true, &mut q_row);
+
+        for n_blocks in [1usize, 2, 3, 5, 17, 32] {
+            let blocks = colblocks::plan_blocks(&vec![1u64; n_vars], n_blocks);
+            let mut got = vec![0.0f64; n_vars * k];
+            let parts = colblocks::split_by_blocks(&mut got, &blocks, k);
+            for (block, part) in blocks.iter().zip(parts) {
+                let mut scratch = vec![0.0f64; k];
+                spmm_transpose_block(
+                    &csr,
+                    &q,
+                    0,
+                    part,
+                    k,
+                    block.start,
+                    block.end,
+                    true,
+                    &mut scratch,
+                );
+            }
+            assert_bits_eq(&got, &want, &format!("transpose at {n_blocks} blocks"));
+        }
+    }
+
+    /// The premise for the transpose bit-identity tests: this fixture's sums are
+    /// order-sensitive, so matching bits is evidence rather than an artefact of
+    /// well-conditioned data.
+    #[test]
+    fn the_transpose_fixture_can_detect_a_reordering() {
+        let (n_vars, k) = (17usize, 6usize);
+        let csr = reassociating_shard(0, 400, n_vars);
+        let q = Mat::<f64>::from_fn(400, k, |i, j| {
+            let e = 10f64.powi(((i + j) % 9) as i32 - 4);
+            if (i + j) % 2 == 0 {
+                e
+            } else {
+                -e * 1.5
+            }
+        });
+
+        let mut fwd = vec![0.0f64; n_vars * k];
+        let mut scratch = vec![0.0f64; k];
+        spmm_transpose_block(&csr, &q, 0, &mut fwd, k, 0, n_vars, true, &mut scratch);
+
+        // The same products, gathered last row first.
+        let mut rev = vec![0.0f64; n_vars * k];
+        for r in (0..csr.n_rows()).rev() {
+            let (s, e) = (csr.indptr[r] as usize, csr.indptr[r + 1] as usize);
+            for idx in s..e {
+                let c = csr.indices[idx] as usize;
+                let v = csr.data[idx] as f64;
+                for j in 0..k {
+                    rev[c * k + j] += v * q[(r, j)];
+                }
+            }
+        }
+
+        assert!(
+            fwd.iter()
+                .zip(&rev)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "premise failed: reversing the row order left every Z entry bit-identical, \
+             so this fixture cannot tell a fixed accumulation order from an arbitrary \
+             one and the bit-identity tests using it are vacuous"
+        );
+    }
+
+    /// The defect this change exists for: repeated runs of the same call on the
+    /// same machine used to disagree, because row→worker assignment was decided
+    /// by work-stealing. This is the guarantee the default configuration makes —
+    /// faer's dense decompositions are stable at a fixed width, so nothing else
+    /// has to be pinned for it to hold.
+    #[test]
+    fn covariance_pca_is_bit_identical_run_to_run() {
+        let src = reassociating_fixture(4, 2048, 6);
+        let first = covariance_pca_with_depth(&src, 3, true, 4).unwrap();
+        for run in 1..5 {
+            let again = covariance_pca_with_depth(&src, 3, true, 4).unwrap();
+            assert_bits_eq(
+                &again.embeddings,
+                &first.embeddings,
+                &format!("covariance embeddings, run {run} vs run 0"),
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_pca_is_bit_identical_run_to_run() {
+        let src = reassociating_fixture(4, 1200, 12);
+        let first = randomized_pca_with_depth(&src, 2, 8, 2, true, 11, 4).unwrap();
+        for run in 1..5 {
+            let again = randomized_pca_with_depth(&src, 2, 8, 2, true, 11, 4).unwrap();
+            assert_bits_eq(
+                &again.embeddings,
+                &first.embeddings,
+                &format!("randomized embeddings, run {run} vs run 0"),
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_linalg_opts_in_only_on_an_affirmative_value() {
+        for on in ["1", "true", "TRUE", "yes", "On", " 1 "] {
+            assert!(
+                parse_deterministic_linalg(Some(on.into())),
+                "{on:?} should opt in"
+            );
+        }
+        for off in ["0", "false", "no", "", "2", "maybe"] {
+            assert!(
+                !parse_deterministic_linalg(Some(off.into())),
+                "{off:?} should not opt in"
+            );
+        }
+        assert!(!parse_deterministic_linalg(None));
     }
 
     #[test]
