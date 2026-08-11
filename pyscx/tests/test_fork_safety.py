@@ -823,3 +823,37 @@ def test_fork_training_dataset_sharded_obs(sharded_obs_path: str) -> None:
         _child_iterate_training_dataset, (sharded_obs_path,), "TrainingDataset sharded-obs"
     )
     assert n == MULTI_N_OBS
+
+
+def _child_iterate_sparse_cellset(scx_path: str, conn) -> None:
+    try:
+        import warnings
+
+        import pyscx
+
+        warnings.simplefilter("ignore")
+        ds = pyscx.SparseCellSetDataset([scx_path], cache_shards=8)
+        # (file_ids, rows, role_tags, set_offsets) — one set spanning four shards.
+        rows = [0, 70, 140, 200]
+        plan = ([0] * len(rows), rows, [0] * len(rows), [0, len(rows)])
+        n = 0
+        for batch in ds.iter_with_plans(iter([plan]), lookahead=0):
+            n += len(batch["cell_indices"])
+        conn.send(("ok", n))
+    except BaseException as exc:  # noqa: BLE001
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def test_fork_sparse_cellset_dataset(unframed_multi_shard_path: str) -> None:
+    """The other class §9.1 names. Its readers come from
+    `PrefetchEngine::from_scx_readers`, a construction path nothing else here
+    exercises under fork, and its gather reaches the same `warm_shards`.
+    """
+    n = _run_forked_child(
+        _child_iterate_sparse_cellset,
+        (unframed_multi_shard_path,),
+        "SparseCellSetDataset gather",
+    )
+    assert n == 4
