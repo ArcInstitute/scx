@@ -539,6 +539,19 @@ pub fn encode_shard_framed(
     target_nnz: Option<u64>,
 ) -> Result<(EncodedShard, BlockIndex), ScxError> {
     let n_rows = indptr.len().saturating_sub(1);
+    // The group loop below runs once per row group, so zero rows means zero
+    // entries — and `resolve_block_index` rejects an empty index on every read
+    // path. Such a shard writes and checksums cleanly and then fails every read,
+    // so refuse it here rather than emitting it. This is the single seam both
+    // write paths funnel through: `write_shard_inner` and `encode_one_shard*`
+    // (the subset path, which bypasses the writer) both arrive via
+    // `encode_shard_adaptive`.
+    //
+    // Only the *framed* encoding is affected. An unframed zero-row shard emits
+    // the legacy single-entry index, is never resolved, and stays legal.
+    if n_rows == 0 {
+        return Err(ScxError::ZeroRowFramedShard);
+    }
     let w_v = value_encoding.byte_width();
     let g = row_group_rows.clamp(1, MAX_BLOCK_ROWS) as usize;
     let nnz_cap = target_nnz.unwrap_or(u64::MAX);
@@ -617,6 +630,83 @@ mod adaptive_codec_tests {
     use super::*;
     use crate::modality::ModalityType;
     use scx_codec::CodecId;
+
+    /// Framing emits one `BlockIndexEntry` per row group, so a zero-row shard
+    /// makes the group loop never run and produces an **empty** block index —
+    /// which every read path rejects via `resolve_block_index`. The shard writes
+    /// and checksums cleanly, then fails every read.
+    ///
+    /// Refuse it at the encoder, which is the one function that would produce
+    /// the empty index and the seam both write paths funnel through
+    /// (`write_shard_inner` → `encode_shard_adaptive` → here, and
+    /// `encode_one_shard*` → the same, which is the subset path that bypasses
+    /// `write_shard_inner` entirely).
+    #[test]
+    fn zero_row_framed_shard_is_refused_at_write() {
+        let err = encode_shard_framed(
+            &[0u64],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+            4,
+            None,
+        )
+        .expect_err("framing a zero-row shard must be refused");
+        assert!(
+            matches!(err, ScxError::ZeroRowFramedShard),
+            "expected ZeroRowFramedShard, got {err:?}"
+        );
+
+        // Same refusal through the adaptive wrapper, which is what the writers
+        // actually call.
+        let err = encode_shard_adaptive(
+            &[0u64],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+            Some(FramingConfig {
+                row_group_rows: 4,
+                ..Default::default()
+            }),
+        )
+        .expect_err("framing a zero-row shard must be refused via the adaptive path");
+        assert!(matches!(err, ScxError::ZeroRowFramedShard));
+    }
+
+    /// The control the guard above needs: an **unframed** zero-row shard is
+    /// legal and stays legal. Its indptr stream is a valid `[0]` and no block
+    /// index is involved, so nothing about it is unreadable — rejecting it too
+    /// would break every writer that emits an empty matrix (e.g. a 0-row
+    /// `optimize` output). Without this arm the guard could over-reject and the
+    /// test above would not notice.
+    #[test]
+    fn zero_row_unframed_shard_is_still_accepted() {
+        let (_enc, bi, version, _codec) = encode_shard_adaptive(
+            &[0u64],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+            None,
+        )
+        .expect("an unframed zero-row shard is legal");
+        assert_eq!(
+            version,
+            crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+            "unframed shards stay v1"
+        );
+        // The legacy single-entry index, not the empty one framing would emit.
+        // `resolve_block_index` is never called on a v1 shard, so this entry's
+        // all-zero offsets are inert — which is precisely why the unframed
+        // zero-row shard was always readable and the framed one never was.
+        assert_eq!(bi.entries.len(), 1);
+        assert_eq!(bi.entries[0].n_rows, 0);
+    }
 
     /// Census-like integer shard: `n_rows` rows, `nnz` sorted unique column
     /// indices each. `max_count` sets the value range (≤8 median → Scx1 heuristic;

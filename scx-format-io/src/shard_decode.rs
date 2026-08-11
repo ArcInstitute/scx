@@ -477,6 +477,63 @@ mod tests {
         );
     }
 
+    /// A framed shard with zero rows — writable before the encoder learned to
+    /// refuse it, and unreadable on *every* path, because framing emits an empty
+    /// block index and `resolve_block_index` rejected it outright.
+    ///
+    /// The bytes are assembled by hand rather than by the writer, because the
+    /// writer now refuses to produce them: the point of the test is that a file
+    /// already on disk is not bricked by the new guard. Both value domains are
+    /// covered — a `native` read has its own framed reassembly path.
+    #[test]
+    fn a_zero_row_framed_shard_written_before_the_guard_still_reads() {
+        use crate::shard::BlockIndex;
+
+        let header = ShardHeader {
+            magic: SHARD_MAGIC,
+            shard_format_version: 2, // framed
+            shard_type: 0,
+            codec_id: 0, // None
+            value_encoding: 2,
+            index_dtype: 1,
+            reserved_flags: [0u8; 3],
+            n_major: 0,
+            n_minor: 16,
+            nnz: 0,
+            global_offset: 0,
+            indptr_rel_offset: SHARD_HEADER_SIZE as u32,
+            indptr_length: 0,
+            indices_rel_offset: SHARD_HEADER_SIZE as u32,
+            indices_length: 0,
+            values_rel_offset: SHARD_HEADER_SIZE as u32,
+            values_length: 0,
+            block_index_rel_offset: SHARD_HEADER_SIZE as u32,
+            block_index_length: 4, // just the u32 count == 0
+            checksum: [0u8; 8],
+        };
+        let mut block_index_bytes = Vec::new();
+        BlockIndex { entries: vec![] }
+            .write_to(&mut block_index_bytes)
+            .unwrap();
+
+        let (indptr, indices, data) =
+            decode_shard_regions_scipy(&header, &[], &[], &[], &block_index_bytes)
+                .expect("a zero-row framed shard must decode, not error");
+        assert_eq!(
+            indptr,
+            vec![0i64],
+            "an empty CSR still carries indptr = [0]"
+        );
+        assert!(indices.is_empty());
+        assert!(data.is_empty());
+
+        let (indptr, indices, _vals) =
+            decode_shard_regions_native(&header, &[], &[], &[], &block_index_bytes)
+                .expect("the native framed path must agree");
+        assert_eq!(indptr, vec![0i64]);
+        assert!(indices.is_empty());
+    }
+
     /// `decode_shard_regions_scipy` on a **framed (v2)** shard reassembles the
     /// same global CSR as decoding the identical matrix unframed (v1). Covers the
     /// helper shared with the scx-gpu host-bounce.
