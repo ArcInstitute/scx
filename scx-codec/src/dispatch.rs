@@ -698,8 +698,28 @@ fn u64_vec_to_i64(data: Vec<u64>) -> Result<Vec<i64>, CodecError> {
 /// with no bound to enforce (a decode that is not addressing a column axis)
 /// passes exactly that clamp value and gets the pre-existing behaviour.
 fn u32_vec_to_i32_bounded(data: Vec<u32>, bound: u32) -> Result<Vec<i32>, CodecError> {
+    // Clamp internally rather than trusting the caller. A `bound` above the sign
+    // limit would otherwise *widen* the check past what this function guaranteed
+    // before it took a bound at all, letting a caller disable the sign guard by
+    // accident. `clamp_index_bound` already does this for callers that use it;
+    // doing it here too means no caller can get it wrong.
+    let bound = bound.min(NO_INDEX_BOUND);
     if let Some((position, &bad)) = data.iter().enumerate().find(|&(_, &v)| v >= bound) {
-        return Err(if bad > i32::MAX as u32 {
+        // Classify by whether a real column bound was declared, NOT by whether
+        // the offending value also happens to exceed `i32::MAX`.
+        //
+        // Getting this backwards reintroduced the exact defect the typed
+        // `IndexOutOfRange` variant exists to remove: with a declared bound, a
+        // value ≥ 2^31 took the sign branch, so the scipy path reported
+        // `MalformedInput` → `ScxError::Codec` → `RuntimeError` while the native
+        // path reported `ShardIndexOutOfRange` → `CorruptFile` → `ValueError`
+        // for the same payload. The Python exception type depended on whether
+        // the caller asked for `f32` or a narrowed dtype.
+        //
+        // With a bound present, an out-of-range index is an out-of-range index
+        // at any magnitude. The legacy sign-only message survives for
+        // `NO_INDEX_BOUND`, where there is no column axis to be out of.
+        return Err(if bound == NO_INDEX_BOUND {
             CodecError::MalformedInput(format!(
                 "column index {bad} exceeds i32::MAX (corrupt or hostile input)"
             ))

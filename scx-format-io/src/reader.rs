@@ -3978,11 +3978,19 @@ impl ScxReader {
                 venc,
                 scx_codec::clamp_index_bound(header.n_minor),
             )
-            .map_err(|e| {
-                ScxError::InvalidCatalog(format!(
-                    "row-group convert of {} group {g}: {e}",
+            // An out-of-range index must keep its structured
+            // `ShardIndexOutOfRange` identity, so let the promoting
+            // `From<CodecError>` handle that variant and only wrap the rest with
+            // the shard name. Blanket-wrapping in `InvalidCatalog` kept the
+            // error class right but destroyed the variant, so a caller matching
+            // on `ShardIndexOutOfRange` saw this seam behave differently from
+            // every other one.
+            .map_err(|e| match e {
+                scx_codec::CodecError::IndexOutOfRange { .. } => ScxError::from(e),
+                other => ScxError::InvalidCatalog(format!(
+                    "row-group convert of {} group {g}: {other}",
                     entry.name
-                ))
+                )),
             })?;
             group_cache.insert(g, scipy);
         }

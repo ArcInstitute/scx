@@ -288,6 +288,35 @@ impl ScxCsr {
                 rows: n_rows,
                 cols: n_cols,
             })?;
+        // Invariant 5 (`indices[k] ∈ [0, n_cols)`) is a *caller* obligation on
+        // `new_unchecked`, and this is the one method where breaking it does not
+        // announce itself: `dense[row_base + col]` with an out-of-range column
+        // runs off the end of one row into the next and returns a plausible,
+        // wrong matrix — no panic, no error. (A negative index becomes ~2^64 and
+        // wraps the add in release.) Everywhere else an out-of-range index
+        // addresses a `Vec` sized by the same axis, so it panics.
+        //
+        // The readers bound decoded indices at the decode seam, but against the
+        // *shard header's* `n_minor`, while this scatters into a buffer sized by
+        // `shape.1`. Those agree on any file a writer produced — they are still
+        // two different numbers, and this is a public API reachable from callers
+        // that never went through a reader at all.
+        //
+        // One pass, against an allocation of `n_rows × n_cols` that this function
+        // is about to make anyway.
+        if let Some((position, &index)) = self
+            .indices
+            .iter()
+            .enumerate()
+            .find(|&(_, &c)| c < 0 || c as usize >= n_cols)
+        {
+            return Err(CsrError::IndexOutOfRange {
+                index,
+                n_cols,
+                position,
+            });
+        }
+
         let mut dense = vec![T::default(); total];
         for row in 0..n_rows {
             let start = self.indptr[row] as usize;
@@ -708,6 +737,55 @@ mod tests {
     }
 
     #[test]
+    /// `to_dense_dtype` is the one scatter where breaking invariant 5 is silent,
+    /// and `to_dense` delegates to it — so this guard covers every densify call
+    /// site, including `pyscx`'s query / `obs_filter` path
+    /// (`convert/interop.rs::csr_to_scipy_typed`), which the typed twin in
+    /// `scx-format-io` does not reach.
+    ///
+    /// Pins the corruption arithmetic, not just the error: with the guard
+    /// removed, `dense[row_base + col]` for row 1 / column 12 of a 3x10 matrix
+    /// writes flat index 22 — row 2, column 2 — and returns a well-formed wrong
+    /// matrix. An `is_err()` assertion would pass against a build that panicked
+    /// instead and would not characterise the defect.
+    #[test]
+    fn to_dense_dtype_rejects_an_out_of_range_column() {
+        let csr = ScxCsr::new_unchecked(
+            (3, 10),
+            vec![0, 1, 3, 4],
+            vec![0, 12, 3, 9],
+            vec![11.0, 22.0, 33.0, 44.0],
+        );
+        match csr.to_dense() {
+            Err(CsrError::IndexOutOfRange {
+                index,
+                n_cols,
+                position,
+            }) => assert_eq!((index, n_cols, position), (12, 10, 1)),
+            other => panic!("expected IndexOutOfRange, got {other:?}"),
+        }
+
+        // Where the unguarded write would have landed.
+        assert_eq!(1 * 10 + 12, 22);
+        assert_eq!(22 / 10, 2, "row 1's value lands in row 2");
+
+        // A negative column is the other half: `col as usize` makes it ~2^64 and
+        // the add wraps in release rather than panicking.
+        let neg = ScxCsr::new_unchecked((2, 4), vec![0, 1, 2], vec![0, -1], vec![1.0, 2.0]);
+        assert!(matches!(
+            neg.to_dense(),
+            Err(CsrError::IndexOutOfRange { index: -1, .. })
+        ));
+    }
+
+    /// Control: the guard must not reject a full-width matrix. Without this an
+    /// off-by-one (`>` for `>=`) would pass the test above.
+    #[test]
+    fn to_dense_dtype_accepts_the_largest_legal_column() {
+        let csr = ScxCsr::new_unchecked((1, 4), vec![0, 2], vec![0, 3], vec![7.0, 9.0]);
+        assert_eq!(csr.to_dense().unwrap(), vec![7.0, 0.0, 0.0, 9.0]);
+    }
+
     fn to_dense_dtype_matches_to_dense() {
         let csr = sample_csr();
         // Cast the f32 data to u16 (all values fit) and scatter.

@@ -181,6 +181,13 @@ jobs:
           # pyscx cloud — covered by the python job; also check standalone
           - flags: "-p pyscx --features cloud"
             name: "pyscx --features cloud"
+          # scx-gpu's benchmark binary is `required-features = ["bench"]`, so no
+          # default-feature lane ever compiles it — a `scx-codec` signature change
+          # broke it and every GPU lane here still passed. It is the binary
+          # `benchmarks/scripts/slurm_gpu_bench.sh` runs, so the break would have
+          # surfaced hours into a SLURM job instead of in CI.
+          - flags: "-p scx-gpu --features bench --bin gpu_bench"
+            name: "scx-gpu --features bench (gpu_bench bin)"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

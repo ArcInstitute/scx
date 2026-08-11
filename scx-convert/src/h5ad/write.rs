@@ -152,7 +152,7 @@ pub(crate) fn write_raw_to_h5ad(
     let raw = reader.read_all_raw_csr_shards()?;
     let raw_n_vars = raw.shape.1;
     let (indptr, indices, data, n_obs) = match keep_mask {
-        Some(mask) => filter_csr_rows(&raw.indptr, &raw.indices, &raw.data, mask),
+        Some(mask) => filter_csr_rows(&raw.indptr, &raw.indices, &raw.data, mask)?,
         None => (raw.indptr, raw.indices, raw.data, raw.shape.0),
     };
 
@@ -163,6 +163,9 @@ pub(crate) fn write_raw_to_h5ad(
     Ok(())
 }
 
+/// `(indptr, indices, data, n_kept_rows)` for a row-filtered CSR.
+type FilteredCsr = (Vec<i64>, Vec<i32>, Vec<f32>, usize);
+
 /// Subset CSR rows by a boolean obs keep-mask, returning new
 /// `(indptr, indices, data, n_kept_rows)`. Used to apply deletion
 /// vectors to the raw matrix on export (raw shares the obs axis).
@@ -171,8 +174,24 @@ fn filter_csr_rows(
     indices: &[i32],
     data: &[f32],
     mask: &[bool],
-) -> (Vec<i64>, Vec<i32>, Vec<f32>, usize) {
-    let n_rows = indptr.len().saturating_sub(1).min(mask.len());
+) -> Result<FilteredCsr, ConvertError> {
+    // `min(mask.len())` here silently dropped every row past the shorter of the
+    // two, exporting a raw matrix with fewer rows than obs — the same
+    // clamp-instead-of-check the reader-side deletion filters and the engine's
+    // row filter had. The mask is obs-indexed and raw shares the obs axis, so a
+    // mismatch means the file is inconsistent, not that the export should guess.
+    let declared = indptr.len().saturating_sub(1);
+    if mask.len() != declared {
+        return Err(ConvertError::Scx(scx_format_io::ScxError::InvalidCatalog(
+            format!(
+                "raw export keep mask covers {} rows but raw X has {} \
+                 (truncated or corrupt file)",
+                mask.len(),
+                declared,
+            ),
+        )));
+    }
+    let n_rows = declared;
     let mut out_indptr = vec![0i64];
     let mut out_indices = Vec::new();
     let mut out_data = Vec::new();
@@ -186,7 +205,7 @@ fn filter_csr_rows(
         }
     }
     let n = out_indptr.len() - 1;
-    (out_indptr, out_indices, out_data, n)
+    Ok((out_indptr, out_indices, out_data, n))
 }
 
 fn write_sparse_group(

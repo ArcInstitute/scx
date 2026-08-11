@@ -245,16 +245,29 @@ pub fn filter_csr_rows(
     indices: &[i32],
     data: &[f32],
     keep_mask: &[bool],
-) -> (Vec<i64>, Vec<i32>, Vec<f32>) {
+) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
     let n_rows = indptr.len().saturating_sub(1);
-    debug_assert_eq!(
-        keep_mask.len(),
-        n_rows,
-        "filter_csr_rows: keep_mask length ({}) != CSR row count ({})",
-        keep_mask.len(),
-        n_rows,
-    );
-    let mask_len = keep_mask.len().min(n_rows);
+    // A mismatch used to be a `debug_assert!` followed by
+    // `min(keep_mask.len(), n_rows)`, which means release builds — the ones
+    // users run — silently dropped every row past the shorter of the two and
+    // returned a truncated query result. The assertion documented the invariant
+    // and then the next line worked around it.
+    //
+    // Same failure the reader-side deletion filters had: the mask and the CSR
+    // come from independent places, and the direction that does *not* panic is
+    // the dangerous one, because a wrong answer looks like an answer. Reject
+    // both directions instead of clamping.
+    if keep_mask.len() != n_rows {
+        return Err(EngineError::FormatError(
+            scx_format_io::ScxError::InvalidCatalog(format!(
+                "filter_csr_rows: keep mask covers {} rows but the decoded CSR has {} \
+             (truncated or corrupt shard)",
+                keep_mask.len(),
+                n_rows,
+            )),
+        ));
+    }
+    let mask_len = n_rows;
 
     let mut new_indptr = Vec::with_capacity(mask_len + 1);
     new_indptr.push(0i64);
@@ -273,7 +286,7 @@ pub fn filter_csr_rows(
         new_indptr.push(prev + (end - start) as i64);
     }
 
-    (new_indptr, new_indices, new_data)
+    Ok((new_indptr, new_indices, new_data))
 }
 
 // ============================================================================
@@ -1329,7 +1342,7 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
 
             // Filter to matching rows within the shard
             let (filtered_indptr, filtered_indices, filtered_data) =
-                filter_csr_rows(&indptr, &indices, &data, &si.local_keep_mask);
+                filter_csr_rows(&indptr, &indices, &data, &si.local_keep_mask)?;
 
             Ok((filtered_indptr, filtered_indices, filtered_data))
         })?;
@@ -1595,7 +1608,7 @@ mod tests {
         let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
         let keep = vec![true, false, true, false];
 
-        let (new_ip, new_idx, new_data) = filter_csr_rows(&indptr, &indices, &data, &keep);
+        let (new_ip, new_idx, new_data) = filter_csr_rows(&indptr, &indices, &data, &keep).unwrap();
         assert_eq!(new_ip, vec![0, 2, 4]);
         assert_eq!(new_idx, vec![0, 1, 1, 3]);
         assert_eq!(new_data, vec![1.0, 2.0, 6.0, 7.0]);
@@ -1608,7 +1621,7 @@ mod tests {
         let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
         let keep = vec![true, true];
 
-        let (new_ip, new_idx, new_data) = filter_csr_rows(&indptr, &indices, &data, &keep);
+        let (new_ip, new_idx, new_data) = filter_csr_rows(&indptr, &indices, &data, &keep).unwrap();
         assert_eq!(new_ip, vec![0, 2, 5]);
         assert_eq!(new_idx, indices);
         assert_eq!(new_data, data);
@@ -1621,10 +1634,46 @@ mod tests {
         let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
         let keep = vec![false, false];
 
-        let (new_ip, new_idx, new_data) = filter_csr_rows(&indptr, &indices, &data, &keep);
+        let (new_ip, new_idx, new_data) = filter_csr_rows(&indptr, &indices, &data, &keep).unwrap();
         assert_eq!(new_ip, vec![0]);
         assert!(new_idx.is_empty());
         assert!(new_data.is_empty());
+    }
+
+    /// A keep mask that disagrees with the CSR row count is a corrupt or
+    /// truncated file, not a request to guess.
+    ///
+    /// This used to be a `debug_assert!` followed by `min(keep_mask.len(),
+    /// n_rows)`, so in release — the builds users run — the *shorter* case
+    /// silently dropped every row past the end of the mask and returned a
+    /// truncated query result. That direction never panicked, which is exactly
+    /// why it needed a test rather than an assertion: a wrong answer looks like
+    /// an answer.
+    #[test]
+    fn filter_rejects_a_mask_that_disagrees_with_the_csr() {
+        let indptr = vec![0i64, 2, 5, 7];
+        let indices = vec![0i32, 1, 0, 1, 2, 1, 3];
+        let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+
+        // Shorter than the CSR: the silent-truncation direction. Pre-fix this
+        // returned Ok with 1 row where 3 were present.
+        let short = vec![true];
+        let err = filter_csr_rows(&indptr, &indices, &data, &short)
+            .expect_err("a short mask must error, not truncate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains('1') && msg.contains('3'),
+            "must report both counts: {msg}"
+        );
+
+        // Longer than the CSR: would have indexed past the end of indptr.
+        let long = vec![true, true, true, true, true];
+        assert!(filter_csr_rows(&indptr, &indices, &data, &long).is_err());
+
+        // Control: an exactly-matching mask still filters.
+        let ok = vec![true, false, true];
+        let (ip, _, _) = filter_csr_rows(&indptr, &indices, &data, &ok).unwrap();
+        assert_eq!(ip.len(), 3, "two kept rows");
     }
 
     // -----------------------------------------------------------------------

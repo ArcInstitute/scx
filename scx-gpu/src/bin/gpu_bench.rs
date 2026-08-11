@@ -348,6 +348,10 @@ fn bench_shard_decode(dev: &GpuDevice) -> Vec<BenchResult> {
                 n_rows_actual,
                 nnz,
                 index_dtype_u16,
+                // A timing harness over a shard this binary just generated:
+                // bound the sign guard only, so the measurement is not skewed by
+                // a column check the CPU reference would not otherwise do.
+                scx_codec::NO_INDEX_BOUND,
             )
             .unwrap();
         });
@@ -555,6 +559,7 @@ fn bench_multi_shard(dev: &GpuDevice) -> Vec<BenchResult> {
             n_rows,
             nnz,
             index_dtype_u16,
+            scx_codec::NO_INDEX_BOUND,
         )
         .unwrap();
     });

@@ -751,30 +751,62 @@ mod tests {
         }
     }
 
-    /// The sign case — which turns out to have been guarded all along, in
-    /// `scx-codec` rather than here.
+    /// An index at or above 2^31 must be rejected identically on both value
+    /// domains, because the *file* is equally corrupt either way.
     ///
-    /// Indices are `u32` on disk and `i32` in scipy's CSR, so a value at or
-    /// above 2^31 would reinterpret to a *negative* `i32`, and in
-    /// `scatter_typed_csr_to_dense` (or `ScxCsr::to_dense`) `dense[base + col as
-    /// usize]` would make it ~2^64, wrap the add in release, and write to some
-    /// other cell — a plausible, wrong answer with no panic and no error.
+    /// Indices are `u32` on disk and `i32` in scipy's CSR, so such a value would
+    /// reinterpret to a *negative* `i32`, and in `scatter_typed_csr_to_dense` (or
+    /// `ScxCsr::to_dense`) `dense[base + col as usize]` would make it ~2^64,
+    /// wrap the add in release, and write to some other cell — a plausible,
+    /// wrong answer with no panic and no error.
     ///
-    /// It cannot happen: every scipy decode path converts through
-    /// `u32_vec_to_i32`, which rejects `> i32::MAX` outright. This test exists
-    /// to pin that guard, because the bound check added alongside it deliberately
-    /// reinterprets as `u32` on the assumption that nothing negative reaches it.
-    /// If someone removes the codec-side check, this fails here rather than
-    /// silently in a dense materialization.
+    /// The scipy path has always rejected it, in `scx-codec`'s
+    /// `u32_vec_to_i32`. What it did *not* do was classify it the same way: the
+    /// sign branch produced `MalformedInput` → `ScxError::Codec` → `Other`,
+    /// while the native seam produced `ShardIndexOutOfRange` → `CorruptFile`.
+    /// One corrupt file, two Python exception types, chosen by whether the
+    /// caller asked for `f32` or a narrowed dtype — the same defect the typed
+    /// `IndexOutOfRange` variant exists to remove. An earlier version of this
+    /// test asserted the *divergence*, which is how it survived.
     #[test]
-    fn an_index_above_i32_max_is_rejected_by_the_codec() {
+    fn an_index_above_i32_max_is_rejected_the_same_way_on_both_paths() {
         // index_dtype = 1 (u32) so the value survives the round-trip.
-        let (scipy, _native) = decode_with_claimed_n_minor(&[0, 0x8000_0000], 1, 100, 100, None);
-        let err = scipy.expect_err("2^31 must not reach an i32 CSR");
-        let msg = err.to_string();
+        let (scipy, native) = decode_with_claimed_n_minor(&[0, 0x8000_0000], 1, 100, 100, None);
+        for (what, r) in [("scipy", scipy.map(|_| ())), ("native", native)] {
+            let err = r.expect_err("2^31 must not reach a CSR");
+            assert!(
+                matches!(
+                    err,
+                    ScxError::ShardIndexOutOfRange {
+                        index: 0x8000_0000,
+                        ..
+                    }
+                ),
+                "{what}: expected ShardIndexOutOfRange, got {err:?}"
+            );
+        }
+    }
+
+    /// The sign guard itself still exists, and still has its own message, for
+    /// the case where there is no column axis to be out of.
+    ///
+    /// `NO_INDEX_BOUND` is what a caller passes when it is decoding something
+    /// that is not addressing a column axis. There the only hazard is the `i32`
+    /// reinterpretation, and the legacy diagnostic is the accurate one — calling
+    /// it "out of range for n_minor 2147483648" would invent a bound the caller
+    /// never declared.
+    #[test]
+    fn without_a_declared_bound_the_sign_guard_keeps_its_own_message() {
+        use scx_codec::{CodecError, NO_INDEX_BOUND};
+        let err = scx_codec::decoded_shard_to_scipy(
+            (vec![0, 2], vec![0, 0x8000_0000], vec![1, 2]),
+            ValueEncoding::Uint8,
+            NO_INDEX_BOUND,
+        )
+        .expect_err("2^31 must not reinterpret to a negative i32");
         assert!(
-            msg.contains("exceeds i32::MAX"),
-            "expected the codec's own sign guard, got: {msg}"
+            matches!(err, CodecError::MalformedInput(ref m) if m.contains("exceeds i32::MAX")),
+            "expected the sign-only diagnostic, got {err:?}"
         );
     }
 

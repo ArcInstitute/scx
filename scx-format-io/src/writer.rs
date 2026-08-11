@@ -2350,7 +2350,11 @@ impl ScxWriter {
             // costs nothing and catches an encode bug at the point it happens.
             scx_codec::clamp_index_bound(sh.n_minor),
         )
-        .map_err(ScxError::Codec)?;
+        // `ScxError::from`, not `ScxError::Codec`: the latter constructs the
+        // variant directly and bypasses the promoting `From`, so an
+        // `IndexOutOfRange` from the bound above would stay `Codec` here while
+        // every other seam reports `ShardIndexOutOfRange`.
+        .map_err(ScxError::from)?;
 
         // Restore the file cursor to EOF so subsequent
         // `write_csc_shard_for` calls append from the right position.
