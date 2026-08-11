@@ -179,20 +179,34 @@ def _make_zero_row_adata(n_obs=120, n_vars=40, n_perts=4, seed=11, n_zero=6):
 
 @pytest.mark.parametrize("metric", ["euclidean", "cosine"])
 def test_energy_distance_gpu_matches_cpu_with_zero_rows(metric):
-    """The case the CPU/GPU self-diagonal divergence actually shows up on.
+    """All-zero cells, where the cosine self diagonal is a whole unit.
 
     Before the kernel learned to skip the self diagonal, the GPU reduced the
-    full `n x n` square while the CPU summed the strict upper triangle. For
-    cosine that is a whole unit per all-zero row; for euclidean it is the f32
-    gram residual, which at small groups exceeds the `atol=1e-3` per-perturbation
-    bar this suite advertises. Ordinary fixtures cannot see either — every row in
-    `_make_paired_adata` has a nonzero norm and the groups are large.
+    full `n x n` square while the CPU summed the strict upper triangle. Row
+    normalization leaves an all-zero row as zeros, so its cosine self-similarity
+    is `1 - 0 = 1` and each such row added a whole unit the CPU never counted —
+    6 zero rows in a 30-cell group is 6/900 = 6.7e-3 of the self term.
+
+    **Asserted per perturbation, not on the correlation.** Both self terms shift
+    by the same amount for every group, and a Pearson correlation absorbs a
+    uniform shift almost completely: measured against a kernel with the skip
+    reverted, the correlation form of this test *passed* while the per-pert form
+    fails. Only `d_real` / `d_pred` see it.
+
+    Euclidean is included for symmetry and is expected to pass either way: an
+    all-zero row has `a_sq = b_sq = g = 0`, so its euclidean diagonal really is
+    exactly 0 and there is no divergence to catch. The euclidean exposure lives
+    in `test_energy_distance_gpu_matches_cpu_small_groups`.
     """
     real, pred = _make_zero_row_adata()
-    cpu = pyscx.accel.energy_distance(real, pred, metric=metric, device="cpu")
-    gpu = pyscx.accel.energy_distance(real, pred, metric=metric, device="gpu")
+    cpu = pyscx.accel.energy_distance_details(real, pred, metric=metric, device="cpu")
+    gpu = pyscx.accel.energy_distance_details(real, pred, metric=metric, device="gpu")
     assert _edist_route(pred)["route"].startswith("gpu"), _edist_route(pred)
-    assert _close_or_nan(float(cpu), float(gpu), 1e-4), f"cpu={cpu} gpu={gpu}"
+    for side in ("d_real", "d_pred"):
+        for name in cpu[side]:
+            assert _close_or_nan(cpu[side][name], gpu[side][name], 1e-3), (
+                f"{metric} {side}[{name}]: cpu={cpu[side][name]} gpu={gpu[side][name]}"
+            )
 
 
 @pytest.mark.parametrize("metric", ["euclidean", "cosine"])
@@ -203,6 +217,12 @@ def test_energy_distance_gpu_matches_cpu_small_groups(metric):
     20-cell perturbation group is ~50x more exposed than a 1000-cell one. Pinned
     per-perturbation, not just on the correlation, since the correlation can
     absorb a uniform shift.
+
+    The **euclidean** arm is the one with power here: verified to fail against a
+    kernel with the diagonal skip reverted. Cosine passes either way on nonzero
+    rows — a normalized row's self-similarity is 1 to within f32 epsilon, so its
+    diagonal is ~1e-7 and contributes ~5e-9 to the mean. It is kept as the
+    symmetric case, not as a guard.
     """
     real, pred = _make_paired_adata(n_obs=80, n_vars=2000, n_perts=4, seed=21)
     cpu = pyscx.accel.energy_distance_details(real, pred, metric=metric, device="cpu")
