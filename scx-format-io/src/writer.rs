@@ -2345,6 +2345,10 @@ impl ScxWriter {
             sh.n_major as usize,
             sh.nnz as usize,
             index_dtype_u16,
+            // This reads back a shard *this writer* just wrote, so the bound is
+            // a self-check rather than a defence against a hostile file — but it
+            // costs nothing and catches an encode bug at the point it happens.
+            scx_codec::clamp_index_bound(sh.n_minor),
         )
         .map_err(ScxError::Codec)?;
 

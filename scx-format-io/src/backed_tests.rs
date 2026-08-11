@@ -2433,3 +2433,54 @@ fn a_shard_whose_rows_match_the_catalog_still_reads() {
     assert_eq!(got.shape.0, 8);
     assert_eq!(full.shape.0, 8);
 }
+
+/// The block-index row-run path is the **third** decode seam: it calls
+/// `scx_codec::decode_row_group` directly and never passes through
+/// `decode_shard_regions_scipy`, so it needs the minor-axis bound check by hand.
+///
+/// Without it, a *partial* read of a framed shard would be the one remaining way
+/// to get an unvalidated column index out of the reader — the two whole-shard
+/// seams would look fully guarded while a scattered `read_rows_with` over the
+/// same file handed the bad index straight to the caller.
+///
+/// The shard is written legitimately and then its header's `n_minor` is narrowed
+/// in place, so the payload decodes cleanly and only a comparison against
+/// `n_minor` can catch it.
+#[test]
+fn the_block_index_row_run_path_rejects_an_out_of_range_index() {
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+
+    // Narrow every CSR shard header's n_minor from 100 to 8; `sample_shard_data`
+    // puts columns up to 99 in there, so most rows now carry out-of-range indices.
+    let offsets: Vec<usize> = {
+        let reader = ScxReader::open(&path).unwrap();
+        reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard)
+            .map(|e| e.offset as usize)
+            .collect()
+    };
+    assert_eq!(offsets.len(), 2, "fixture should have two shards");
+    let mut bytes = std::fs::read(&path).unwrap();
+    for off in offsets {
+        // n_minor is at byte 16 of the shard header (`ShardHeader::write_to`).
+        bytes[off + 16..off + 20].copy_from_slice(&8u32.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+
+    // A scattered read is what selects the block-index path (a dense request
+    // would fall back to a full-shard decode, which the other seam guards).
+    let err = backed
+        .read_rows_with(&[1, 9, 30], |_, _, _| Ok(()))
+        .expect_err("a scattered framed read must reject the out-of-range index");
+    assert!(
+        matches!(err, ScxError::ShardIndexOutOfRange { .. })
+            || matches!(err, ScxError::InvalidCatalog(_)),
+        "expected an index/catalog error, got {err:?}"
+    );
+}

@@ -3968,7 +3968,17 @@ impl ScxReader {
                     entry.name
                 ))
             })?;
-            let scipy = scx_codec::decoded_shard_to_scipy(decoded, venc).map_err(|e| {
+            // The third decode seam: this path calls `scx_codec::decode_row_group`
+            // directly and never passes through `decode_shard_regions_scipy`, so
+            // it has to supply the minor-axis bound itself. Without it a partial
+            // (block-index) read would be the one remaining way to get an
+            // unvalidated column index out of the reader.
+            let scipy = scx_codec::decoded_shard_to_scipy(
+                decoded,
+                venc,
+                scx_codec::clamp_index_bound(header.n_minor),
+            )
+            .map_err(|e| {
                 ScxError::InvalidCatalog(format!(
                     "row-group convert of {} group {g}: {e}",
                     entry.name

@@ -804,6 +804,10 @@ mod tests {
             n_rows,
             nnz,
             index_dtype_u16,
+            // A CPU reference decode for GPU parity: the fixture's columns are
+            // trusted, so take the sign-only bound rather than inventing an
+            // n_minor the caller did not pass.
+            scx_codec::NO_INDEX_BOUND,
         )
         .expect("CPU decode failed")
     }

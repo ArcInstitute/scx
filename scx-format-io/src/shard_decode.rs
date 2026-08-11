@@ -113,9 +113,11 @@ pub fn decode_shard_regions_scipy(
     let index_dtype_u16 = sh.index_dtype == 0;
 
     // Row-group-framed (v2) shards reassemble from the block index; legacy (v1)
-    // shards take the direct whole-shard path below.
-    if sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION {
-        return decode_framed_shard_scipy(
+    // shards take the direct whole-shard path. Both fall through to the same
+    // bound check below rather than returning early, so neither layout can be
+    // the one that skips it.
+    let (indptr, indices, data) = if sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+        decode_framed_shard_scipy(
             sh,
             indptr_bytes,
             indices_bytes,
@@ -124,25 +126,139 @@ pub fn decode_shard_regions_scipy(
             codec_id,
             value_encoding,
             index_dtype_u16,
-        );
-    }
-
-    let encoded = EncodedShardRef {
-        indptr_bytes,
-        indices_bytes,
-        values_bytes,
+        )?
+    } else {
+        let encoded = EncodedShardRef {
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+        };
+        scx_codec::decode_shard_scipy(
+            &encoded,
+            codec_id,
+            value_encoding,
+            sh.n_major as usize,
+            sh.nnz as usize,
+            index_dtype_u16,
+            scx_codec::clamp_index_bound(sh.n_minor),
+        )?
     };
 
-    let (indptr, indices, data) = scx_codec::decode_shard_scipy(
-        &encoded,
-        codec_id,
-        value_encoding,
-        sh.n_major as usize,
-        sh.nnz as usize,
-        index_dtype_u16,
-    )?;
-
+    // No standalone pass on this path: the bound rides on the scan `scx-codec`
+    // already performs to keep a `> i32::MAX` value from reinterpreting to a
+    // negative `i32`. Only the comparand changed, so the check is free here.
+    // The native twin below has no such existing scan and does pay for one.
     Ok((indptr, indices, data))
+}
+
+/// Reject any decoded minor-axis index outside `[0, n_minor)`, for the **native**
+/// (`u32`) decode path.
+///
+/// # Why the reader validates at all
+///
+/// `ScxCsr::new_unchecked` states as invariant 5 that every index lies in
+/// `[0, shape.1)`, and roughly twenty sites across this crate and `scx-sparse`
+/// rely on it — `dense[base + col]`, `result[c] += v`, `col_sums[col]`, and so
+/// on — indexing a buffer sized by `n_minor` without a check. Nothing enforced
+/// the invariant. The catalog's BLAKE3 covers catalog bytes, not shard payloads
+/// (see [`crate::reader::ScxReader::read_shard_from_entry`]), so a decoded index
+/// is unauthenticated in exactly the way `clamped_reserve` already documents for
+/// declared lengths.
+///
+/// Enforcing it at the decode, rather than at each consumer, is what lets those
+/// sites keep indexing unchecked — and keeps the two streaming statistics
+/// kernels (`backed.rs` and `prefetch.rs`), which are each other's oracle, from
+/// diverging on malformed input because only one of them grew a guard.
+///
+/// # Why only the native path calls this
+///
+/// The scipy path gets the same check for free: `scx-codec` already walks every
+/// index there, to keep a `> i32::MAX` value from reinterpreting to a negative
+/// `i32`, so passing `clamp_index_bound(n_minor)` into `decode_shard_scipy`
+/// changes only that scan's comparand. The native path has no such existing pass
+/// and pays for this one.
+///
+/// The difference is worth the asymmetry: measured as a standalone pass on the
+/// scipy path — which is what the ML loader, the GPU host-bounce and every
+/// mmap/cloud read use — it cost **+5.1–6.4%** of per-shard decode time
+/// (`tabula_sapiens_100k`, 194.9M nnz, three runs). The pass runs at 10.0 GB/s,
+/// i.e. memory-bandwidth-bound, so it could not be made cheaper in place; the
+/// only way to make it free was to stop making it a separate pass.
+///
+/// # Cost, on the path that still pays
+///
+/// One `max` reduction over data still hot from the decode, then a single
+/// comparison. `max` rather than a short-circuiting `find` because the good case
+/// is every case: `find` would run a scalar loop over the whole slice anyway,
+/// while `max` auto-vectorizes. Locating the offending position for the error
+/// message happens only on the cold path.
+///
+/// # `n_minor == 0` is "not declared", not "zero columns"
+///
+/// See [`scx_codec::clamp_index_bound`], which encodes the same rule for the
+/// scipy path. Older writers stamped the **file-level** `n_vars` into every
+/// shard header, and on a multimodal file that field is `0` — the real column
+/// count lives in the per-modality metadata. Both multimodal conformance
+/// fixtures (`v2_multimodal_citeseq.scx`, `v2_multimodal_partial_csc.scx`) carry
+/// `n_minor = 0` on shards with hundreds of nonzeros, and reading them is
+/// correct behaviour, not corruption.
+///
+/// Skipping is safe rather than merely convenient: a genuinely zero-column
+/// matrix has no nonzeros to check. Current writers resolve the per-modality
+/// `n_vars` (`ScxWriter::write_shard_inner`), so files written today do get the
+/// bound; only legacy multimodal shards fall through unvalidated, which is the
+/// right trade against bricking them.
+///
+/// # Not covered
+///
+/// `scx-gpu`'s in-VRAM decode paths never pass through this seam — their indices
+/// stay device-resident and remain unvalidated.
+#[inline]
+fn check_minor_indices<T: MinorIndexBits>(indices: &[T], n_minor: u32) -> Result<()> {
+    if n_minor == 0 {
+        return Ok(());
+    }
+    let Some(max) = indices.iter().map(|&c| c.bits()).max() else {
+        return Ok(());
+    };
+    if max < n_minor {
+        return Ok(());
+    }
+    // Cold: re-walk only to name the *first* offender. Reporting `max` with the
+    // first offender's position would pair a value and a position that need not
+    // belong together.
+    let (position, index) = indices
+        .iter()
+        .map(|&c| c.bits())
+        .enumerate()
+        .find(|&(_, bits)| bits >= n_minor)
+        .unwrap_or((0, max));
+    Err(ScxError::ShardIndexOutOfRange {
+        index,
+        position,
+        n_minor,
+    })
+}
+
+/// The `u32` bit pattern of a decoded minor-axis index, for the single unsigned
+/// compare in [`check_minor_indices`]. Implemented for both decode domains:
+/// `i32` (scipy) and `u32` (native).
+trait MinorIndexBits: Copy {
+    fn bits(self) -> u32;
+}
+
+impl MinorIndexBits for i32 {
+    #[inline]
+    fn bits(self) -> u32 {
+        self as u32
+    }
+}
+
+impl MinorIndexBits for u32 {
+    #[inline]
+    fn bits(self) -> u32 {
+        self
+    }
 }
 
 /// Reassemble a whole framed (v2) shard into a global scipy CSR by iterating its
@@ -188,8 +304,11 @@ fn decode_framed_shard_scipy(
             index_dtype_u16,
         )?;
         // Convert this group (local CSR) to scipy types, then rebase indptr.
-        let (g_indptr, g_indices, g_data) =
-            scx_codec::decoded_shard_to_scipy(decoded, value_encoding)?;
+        let (g_indptr, g_indices, g_data) = scx_codec::decoded_shard_to_scipy(
+            decoded,
+            value_encoding,
+            scx_codec::clamp_index_bound(sh.n_minor),
+        )?;
         for &local in &g_indptr[1..] {
             indptr.push(running + local);
         }
@@ -266,8 +385,10 @@ pub fn decode_shard_regions_native(
         .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
     let index_dtype_u16 = sh.index_dtype == 0;
 
-    if sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION {
-        return decode_framed_shard_native(
+    // Both layouts fall through to the same bound check — see the scipy twin.
+    let (indptr, indices, values) = if sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION
+    {
+        decode_framed_shard_native(
             sh,
             indptr_bytes,
             indices_bytes,
@@ -276,23 +397,25 @@ pub fn decode_shard_regions_native(
             codec_id,
             value_encoding,
             index_dtype_u16,
-        );
-    }
-
-    let encoded = EncodedShardRef {
-        indptr_bytes,
-        indices_bytes,
-        values_bytes,
+        )?
+    } else {
+        let encoded = EncodedShardRef {
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+        };
+        scx_codec::decode_shard_native(
+            &encoded,
+            codec_id,
+            value_encoding,
+            sh.n_major as usize,
+            sh.nnz as usize,
+            index_dtype_u16,
+        )?
     };
 
-    Ok(scx_codec::decode_shard_native(
-        &encoded,
-        codec_id,
-        value_encoding,
-        sh.n_major as usize,
-        sh.nnz as usize,
-        index_dtype_u16,
-    )?)
+    check_minor_indices(&indices, sh.n_minor)?;
+    Ok((indptr, indices, values))
 }
 
 /// Native-value twin of [`decode_framed_shard_scipy`]. Reassembles a framed (v2)
@@ -532,6 +655,177 @@ mod tests {
                 .expect("the native framed path must agree");
         assert_eq!(indptr, vec![0i64]);
         assert!(indices.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Minor-axis index bounds
+    // -----------------------------------------------------------------------
+
+    /// Encode a shard, then hand the decoder a header whose `n_minor` is
+    /// `claimed_n_minor` — i.e. a shard carrying indices past the end of its own
+    /// declared column axis.
+    ///
+    /// Patching the header rather than the payload is what makes this a *decode*
+    /// test: the indices themselves encode and decode perfectly, so no codec
+    /// length check fires. Only a comparison against `n_minor` can catch it, and
+    /// nothing performed one.
+    /// `(scipy decode, native decode reduced to its error)` — the native values
+    /// are irrelevant here, only whether the seam accepted the shard.
+    type SeamOutcome = (Result<(Vec<i64>, Vec<i32>, Vec<f32>)>, Result<()>);
+
+    fn decode_with_claimed_n_minor(
+        indices: &[u32],
+        index_dtype: u8,
+        encoded_n_cols: u32,
+        claimed_n_minor: u32,
+        framing: Option<crate::encoder::FramingConfig>,
+    ) -> SeamOutcome {
+        use crate::encoder::encode_one_shard;
+        use crate::modality::ModalityType;
+
+        let indptr: Vec<u64> = vec![0, indices.len() as u64];
+        let values: Vec<f32> = (0..indices.len()).map(|i| (i + 1) as f32).collect();
+        let s = encode_one_shard(
+            &indptr,
+            indices,
+            &values,
+            Some(CodecId::None),
+            index_dtype,
+            encoded_n_cols,
+            0,
+            SectionType::CsrShard,
+            ModalityType::Rna,
+            "X_shard_0".to_string(),
+            framing,
+        )
+        .expect("encode_one_shard");
+        let mut sh = ShardHeader::read_from(&mut Cursor::new(&s.header_buf[..])).unwrap();
+        sh.n_minor = claimed_n_minor;
+
+        let scipy = decode_shard_regions_scipy(
+            &sh,
+            &s.encoded.indptr_bytes,
+            &s.encoded.indices_bytes,
+            &s.encoded.values_bytes,
+            &s.block_index_bytes,
+        );
+        let native = decode_shard_regions_native(
+            &sh,
+            &s.encoded.indptr_bytes,
+            &s.encoded.indices_bytes,
+            &s.encoded.values_bytes,
+            &s.block_index_bytes,
+        )
+        .map(|_| ());
+        (scipy, native)
+    }
+
+    /// A decoded column index at or past `n_minor` must be rejected at the
+    /// decode seam.
+    ///
+    /// ~20 sites across this crate and `scx-sparse` index a buffer sized by
+    /// `n_minor` with a decoded column and none of them check it, because
+    /// `ScxCsr::new_unchecked`'s invariant 5 says every index is in range. That
+    /// invariant was never enforced anywhere: the catalog's BLAKE3 covers
+    /// catalog bytes, not shard payloads. Validating here is what makes it true.
+    ///
+    /// Both value domains and both layouts, because they are four separate
+    /// reassembly paths.
+    #[test]
+    fn out_of_range_column_index_is_rejected() {
+        for framing in [
+            None,
+            Some(crate::encoder::FramingConfig {
+                row_group_rows: 2,
+                ..Default::default()
+            }),
+        ] {
+            let (scipy, native) = decode_with_claimed_n_minor(&[0, 3, 9], 0, 16, 8, framing);
+            for (what, r) in [("scipy", scipy.map(|_| ())), ("native", native)] {
+                let err = r.expect_err("index 9 with n_minor 8 must be rejected ({what})");
+                assert!(
+                    matches!(err, ScxError::ShardIndexOutOfRange { index: 9, .. }),
+                    "{what}: expected ShardIndexOutOfRange{{index:9}}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    /// The sign case — which turns out to have been guarded all along, in
+    /// `scx-codec` rather than here.
+    ///
+    /// Indices are `u32` on disk and `i32` in scipy's CSR, so a value at or
+    /// above 2^31 would reinterpret to a *negative* `i32`, and in
+    /// `scatter_typed_csr_to_dense` (or `ScxCsr::to_dense`) `dense[base + col as
+    /// usize]` would make it ~2^64, wrap the add in release, and write to some
+    /// other cell — a plausible, wrong answer with no panic and no error.
+    ///
+    /// It cannot happen: every scipy decode path converts through
+    /// `u32_vec_to_i32`, which rejects `> i32::MAX` outright. This test exists
+    /// to pin that guard, because the bound check added alongside it deliberately
+    /// reinterprets as `u32` on the assumption that nothing negative reaches it.
+    /// If someone removes the codec-side check, this fails here rather than
+    /// silently in a dense materialization.
+    #[test]
+    fn an_index_above_i32_max_is_rejected_by_the_codec() {
+        // index_dtype = 1 (u32) so the value survives the round-trip.
+        let (scipy, _native) = decode_with_claimed_n_minor(&[0, 0x8000_0000], 1, 100, 100, None);
+        let err = scipy.expect_err("2^31 must not reach an i32 CSR");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds i32::MAX"),
+            "expected the codec's own sign guard, got: {msg}"
+        );
+    }
+
+    /// The native (`u32`) decode has no such conversion — it hands the value
+    /// back as-is — so for it, 2^31 is just another out-of-range index and the
+    /// seam check is what catches it.
+    #[test]
+    fn an_index_above_i32_max_is_rejected_on_the_native_path() {
+        let (_scipy, native) = decode_with_claimed_n_minor(&[0, 0x8000_0000], 1, 100, 100, None);
+        let err = native.expect_err("2^31 exceeds n_minor 100");
+        assert!(
+            matches!(
+                err,
+                ScxError::ShardIndexOutOfRange {
+                    index: 0x8000_0000,
+                    ..
+                }
+            ),
+            "expected ShardIndexOutOfRange, got {err:?}"
+        );
+    }
+
+    /// `n_minor == 0` means the shard header does not declare a column bound —
+    /// it is not a claim that the matrix has zero columns.
+    ///
+    /// Older writers stamped the file-level `n_vars` into every shard header,
+    /// and that field is `0` on a multimodal file (the real count is
+    /// per-modality). Both multimodal conformance fixtures carry `n_minor = 0`
+    /// on shards with hundreds of nonzeros; treating `0` as a bound rejected
+    /// them outright, which is how this was found.
+    ///
+    /// Pinned as a test because the natural "tightening" — dropping the
+    /// exemption so every shard is validated — silently breaks reading every
+    /// multimodal file written before the per-modality `n_minor` fix.
+    #[test]
+    fn n_minor_zero_means_undeclared_and_does_not_reject() {
+        let (scipy, native) = decode_with_claimed_n_minor(&[0, 3, 9], 0, 16, 0, None);
+        let (_, indices, _) = scipy.expect("a legacy multimodal shard must still decode");
+        assert_eq!(indices, vec![0i32, 3, 9]);
+        native.expect("native path agrees");
+    }
+
+    /// Control: the largest legal index (`n_minor - 1`) still decodes. Without
+    /// this an off-by-one that rejected every full-width matrix would pass the
+    /// two tests above.
+    #[test]
+    fn the_largest_legal_column_index_still_decodes() {
+        let (scipy, native) = decode_with_claimed_n_minor(&[0, 7], 0, 16, 8, None);
+        let (_, indices, _) = scipy.expect("index 7 is legal for n_minor 8");
+        assert_eq!(indices, vec![0i32, 7]);
+        native.expect("native path agrees");
     }
 
     /// `decode_shard_regions_scipy` on a **framed (v2)** shard reassembles the
