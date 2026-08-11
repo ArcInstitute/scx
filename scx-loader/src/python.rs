@@ -2528,25 +2528,33 @@ pub fn downsample_counts_csr<'py>(
     // Per-row work is independent and each row's key is derived from its own
     // identity, so this is safely parallel; `collect` restores row order before
     // flattening, so the output is byte-identical regardless of scheduling.
+    //
+    // On the loader's pool, never rayon's global registry: this is a bare
+    // `#[pyfunction]`, so a forked DataLoader worker reaches it without ever
+    // constructing a dataset and therefore without passing any PID check, and a
+    // global-pool dispatch from a forked child hangs forever. See `crate::pool`.
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let pool = crate::pool::cpu_pool();
     let out_rows: Vec<(Vec<i32>, Vec<f32>)> = py.detach(|| {
-        (0..n_rows)
-            .into_par_iter()
-            .map(|r| {
-                let lo = indptr[r] as usize;
-                let hi = indptr[r + 1] as usize;
-                let mut i = indices[lo..hi].to_vec();
-                let mut d = data[lo..hi].to_vec();
-                // No identities supplied ⇒ key on `(seed, method, row)` alone.
-                // Falling back to `r` (the row's position in this batch) would be
-                // worse than useless: the same cell would draw differently
-                // depending on where it landed in the batch, which is exactly the
-                // scheduling dependence the per-row key exists to avoid.
-                let ident = if idents.is_empty() { 0 } else { idents[r] };
-                crate::downsample::downsample_row(&mut i, &mut d, &cfg, ident, rows[r]);
-                (i, d)
-            })
-            .collect()
+        pool.install(|| {
+            (0..n_rows)
+                .into_par_iter()
+                .map(|r| {
+                    let lo = indptr[r] as usize;
+                    let hi = indptr[r + 1] as usize;
+                    let mut i = indices[lo..hi].to_vec();
+                    let mut d = data[lo..hi].to_vec();
+                    // No identities supplied ⇒ key on `(seed, method, row)` alone.
+                    // Falling back to `r` (the row's position in this batch) would be
+                    // worse than useless: the same cell would draw differently
+                    // depending on where it landed in the batch, which is exactly the
+                    // scheduling dependence the per-row key exists to avoid.
+                    let ident = if idents.is_empty() { 0 } else { idents[r] };
+                    crate::downsample::downsample_row(&mut i, &mut d, &cfg, ident, rows[r]);
+                    (i, d)
+                })
+                .collect()
+        })
     });
 
     let mut out_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
