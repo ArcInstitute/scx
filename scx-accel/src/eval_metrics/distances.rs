@@ -240,8 +240,9 @@ enum GemmShape {
     /// Every row of `a` against every row of `b`. `row_sums[i] = Σ_j d(a_i, b_j)`.
     Cross,
     /// `a` and `b` are the same buffer and only the strict upper triangle is
-    /// summed: `row_sums[i] = Σ_{j>i} d(a_i, a_j)`. Half the flops of `Cross`
-    /// on the same input, and the same convention the scalar self path uses.
+    /// summed: `row_sums[i] = Σ_{j>i} d(a_i, a_j)`, using the same convention
+    /// the scalar self path uses. Always half the expansion of `Cross`; half the
+    /// *gemm* only once blocked (see `mean_pairwise_distance_self`).
     UpperTriangle,
 }
 
@@ -366,7 +367,8 @@ fn pairwise_gemm_row_sums<F: PairwiseFloat>(
         let a1 = (a0 + block_rows).min(n_a);
         let rows = a1 - a0;
         // Which rows of `b` this block needs. `Cross` touches all of them;
-        // `UpperTriangle` needs only `j >= a0`, which is what halves its work.
+        // `UpperTriangle` needs only `j >= a0` — the narrowing that removes the
+        // symmetric half of the work as the blocks advance.
         let (b0, extent) = match shape {
             GemmShape::Cross => (0usize, n_b),
             GemmShape::UpperTriangle => (a0, n_b - a0),
@@ -632,7 +634,11 @@ fn mean_pairwise_distance_self_with_budget<F: PairwiseFloat>(
             // This used to re-enter the (a, a) cross path, which computed the
             // whole n×n Gram — the mirror half and an exact-zero diagonal for
             // nothing. `UpperTriangle` narrows each block's columns operand to
-            // `a[a0..]`, halving both the gemm flops and the expansion.
+            // `a[a0..]`. That always halves the expansion loop; it reduces the
+            // *gemm* only once there is more than one block, since the first
+            // block's operand is still all of `a` — total gemm work is
+            // `≈ (k+1)/2k` of the square at `k` blocks. Measured 1.03× at one
+            // block and 1.38× at eight (docs/performance.md).
             pairwise_gemm_row_sums(a, a, n, n, n_dims, metric, GemmShape::UpperTriangle, budget)
         }
         DistanceBackend::Scalar => {
