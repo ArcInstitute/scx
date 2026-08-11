@@ -2290,3 +2290,146 @@ fn catalog_int_value_max_reports_zero_for_an_empty_matrix() {
     assert_eq!(backed.total_nnz().unwrap(), 0);
     assert_eq!(backed.catalog_int_value_max(), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// A shard that decodes fewer rows than the catalog claims
+// ---------------------------------------------------------------------------
+
+/// Write a single-shard file, then rewrite the shard header in place so it
+/// declares fewer rows than the catalog entry does.
+///
+/// The two counts live in different places and neither authenticates the other:
+/// `BackedCsrIndex` reads `(row_start, row_end)` from the catalog stats, which
+/// the catalog's BLAKE3 covers; `decode_shard` derives the row count from the
+/// decoded indptr, whose length is governed by the shard header — inside the
+/// section payload, which the fast read path deliberately does not re-hash
+/// (`read_shard_from_entry` says so in its own doc). Truncation, a partial
+/// write, or a hostile file separates them.
+///
+/// `n_major` and `indptr_length` are patched together because the `None` codec
+/// requires `indptr_bytes.len() == (n_major + 1) * 8` — so the shard stays
+/// internally consistent and decodes cleanly to `new_rows`. That is the point:
+/// nothing about the shard is detectably wrong until it is compared to the
+/// catalog.
+fn write_shard_shrunk_in_header(
+    dir: &TempDir,
+    n_obs: usize,
+    n_vars: usize,
+    new_rows: u32,
+) -> std::path::PathBuf {
+    let path = dir.path().join("shrunk.scx");
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    let header = sample_header(n_obs as u64, n_vars as u64, *indptr.last().unwrap());
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    // Locate the shard section, then patch its header in place.
+    let offset = {
+        let reader = ScxReader::open(&path).unwrap();
+        let entry = reader
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::CsrShard)
+            .expect("one CSR shard");
+        entry.offset as usize
+    };
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    // ShardHeader field byte offsets, per `ShardHeader::write_to`:
+    //   n_major 12, nnz 20, indptr_length 40, indices_length 48,
+    //   values_length 56.
+    //
+    // Every one of these is patched so the shrunk shard stays *internally*
+    // coherent — `sample_shard_data` gives 2 nnz per row, indices are u16
+    // (n_vars ≤ 65535) and values u8. A shard that were internally inconsistent
+    // would be caught by the codec's own length checks and would test those
+    // instead of the catalog comparison this exists for.
+    let new_nnz = (new_rows as u64) * 2;
+    bytes[offset + 12..offset + 16].copy_from_slice(&new_rows.to_le_bytes());
+    bytes[offset + 20..offset + 28].copy_from_slice(&new_nnz.to_le_bytes());
+    bytes[offset + 40..offset + 44].copy_from_slice(&((new_rows + 1) * 8).to_le_bytes());
+    bytes[offset + 48..offset + 52].copy_from_slice(&((new_nnz as u32) * 2).to_le_bytes());
+    bytes[offset + 56..offset + 60].copy_from_slice(&(new_nnz as u32).to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    path
+}
+
+/// The catalog says this shard covers 8 rows; it decodes to 4.
+///
+/// `read_rows_with`'s full-shard fallback computes each row's position as
+/// `row - shard_row_start` from the **catalog** and then indexes the *decoded*
+/// indptr with it — an index-out-of-bounds panic inside the reader, where the
+/// convention requires an error.
+///
+/// The check goes in `decode_shard` rather than at that call site, because the
+/// same decoded `ScxCsr` is handed to `read_rows_with`, `read_shard_cached*`
+/// and the `ShardSource` impl; all three are asserted here so the guard is
+/// pinned to the decode, not to the one caller the panic surfaced through.
+#[test]
+fn shard_decoding_fewer_rows_than_the_catalog_claims_errors() {
+    let dir = TempDir::new().unwrap();
+    let path = write_shard_shrunk_in_header(&dir, 8, 10, 4);
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+
+    let err = backed
+        .read_rows_with(&[0, 7], |_, _, _| Ok(()))
+        .expect_err("the full-shard fallback must error, not panic");
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains('8') && msg.contains('4'),
+        "the error must report both counts so the file can be diagnosed: {msg}"
+    );
+
+    // Same guard, reached through the shard cache directly.
+    assert!(
+        backed.read_shard_cached_arc(0).is_err(),
+        "the cache must not hand out a short shard either"
+    );
+
+    // `read_shard_uncached` is a second, independent decode entry point — it
+    // builds its own `ScxCsr` and never touches `decode_shard`. It is public and
+    // streaming callers use it, so a guard placed only on the cached path would
+    // leave this one panicking.
+    assert!(
+        backed.read_shard_uncached(0).is_err(),
+        "the uncached decode path needs the same guard"
+    );
+
+    // `read_rows` was already guarded — by a *different* check, downstream,
+    // which rejects the row slice rather than the shard. Asserting only through
+    // it would have looked like proof while testing nothing: pin the error type
+    // so a future refactor cannot quietly route this path back to the panic.
+    let err = backed.read_rows(0, 8).unwrap_err();
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "read_rows should now fail at the decode, not at the row slice: {err:?}"
+    );
+}
+
+/// Control: an untouched file with the same shape still reads. Without this a
+/// guard that rejected every shard would pass the test above.
+#[test]
+fn a_shard_whose_rows_match_the_catalog_still_reads() {
+    let dir = TempDir::new().unwrap();
+    let (backed, full) = write_test_file_and_open(&dir, 8, 10, 1, 4);
+    let got = backed.read_rows(0, 8).unwrap();
+    assert_eq!(got.shape.0, 8);
+    assert_eq!(full.shape.0, 8);
+}
