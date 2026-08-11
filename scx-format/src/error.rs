@@ -114,6 +114,45 @@ pub enum ScxError {
     #[error("malformed block index: {0}")]
     InvalidBlockIndex(String),
 
+    /// A decoded minor-axis index (column for row-major shards, row for CSC)
+    /// falls outside `[0, n_minor)`.
+    ///
+    /// The catalog's BLAKE3 covers catalog bytes, not shard payloads, so a
+    /// decoded index is **unauthenticated** — see
+    /// [`ScxError::AllocationTooLarge`] and `clamped_reserve` for the same
+    /// reasoning applied to declared lengths. Every consumer of a decoded shard
+    /// uses the index to address a buffer sized by `n_minor`; the readers
+    /// validate it once at the decode seam so those consumers can index
+    /// unchecked.
+    ///
+    /// `index` is reported as the decoded `u32`: a negative `i32` from a
+    /// scipy-side decode reinterprets to a value `≥ 2³¹` here, which is how it
+    /// is detected in the first place.
+    #[error(
+        "shard '{shard}': minor-axis index {index} at position {position} is out of range \
+         for n_minor {n_minor} (a negative index reads as ≥ 2^31 here)"
+    )]
+    ShardIndexOutOfRange {
+        shard: String,
+        index: u32,
+        position: usize,
+        n_minor: u32,
+    },
+
+    /// A row-group-framed shard was asked for with zero rows.
+    ///
+    /// Framing emits one [`crate::BlockIndexEntry`] per row group, so a zero-row
+    /// shard produces an **empty** block index — which `resolve_block_index`
+    /// rejects on every read. Such a shard writes and checksums cleanly and then
+    /// fails every read, so the writer refuses it instead. (Readers still accept
+    /// an empty block index when the header agrees the shard is empty, so files
+    /// written before this guard remain readable.)
+    #[error(
+        "refusing to row-group-frame a zero-row shard: framing would emit an empty block \
+         index, which no reader accepts. Skip the shard instead of writing an empty one."
+    )]
+    ZeroRowFramedShard,
+
     #[error("n_vars {0} exceeds u32::MAX, cannot fit in shard header n_minor field")]
     NVarsOverflow(u64),
 
@@ -249,6 +288,9 @@ impl ScxError {
             | ScxError::ShardStreamTooLarge(_)
             | ScxError::StaleCscSidecar { .. }
             | ScxError::ColumnStatsOverflow(_)
+            // Write-path only: no file exists yet, so `CorruptFile`'s "re-run
+            // conversion" suffix would point the caller at nothing.
+            | ScxError::ZeroRowFramedShard
             | ScxError::UnsupportedColumnType { .. }
             | ScxError::DuplicateSection { .. }
             | ScxError::ObsLayoutConflict { .. }
@@ -283,6 +325,7 @@ impl ScxError {
             | ScxError::SectionOutOfBounds { .. }
             | ScxError::AllocationTooLarge { .. }
             | ScxError::InvalidBlockIndex(_)
+            | ScxError::ShardIndexOutOfRange { .. }
             | ScxError::ColumnStatsShardCountMismatch { .. } => ScxErrorClass::CorruptFile,
             ScxError::Io(io_err) => ScxErrorClass::Io(io_err.kind()),
             // Deliberately NOT `CorruptFile`: both files are intact. The
@@ -409,6 +452,12 @@ mod tests {
             .class(),
             ScxErrorClass::Validation
         );
+        // Write-path only — no file exists yet, so `CorruptFile`'s "re-run
+        // conversion" suffix would send the caller to fix nothing.
+        assert_eq!(
+            ScxError::ZeroRowFramedShard.class(),
+            ScxErrorClass::Validation
+        );
 
         // CorruptFile: malformed/unreadable on-disk data (previously Other,
         // now surfaced as ValueError rather than RuntimeError in pyscx).
@@ -418,6 +467,19 @@ mod tests {
         );
         assert_eq!(
             ScxError::UnknownValueEncoding(7).class(),
+            ScxErrorClass::CorruptFile
+        );
+        // A decoded index outside `[0, n_minor)` means the shard payload is
+        // malformed — the payload is not covered by the catalog checksum, so
+        // this is the read-path detection of genuine corruption.
+        assert_eq!(
+            ScxError::ShardIndexOutOfRange {
+                shard: "X_shard_0".to_string(),
+                index: u32::MAX,
+                position: 3,
+                n_minor: 100,
+            }
+            .class(),
             ScxErrorClass::CorruptFile
         );
         assert_eq!(
