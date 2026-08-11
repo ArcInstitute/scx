@@ -2118,12 +2118,22 @@ opt-in because it is not free — measured at ~2.3× slower on the covariance ro
 eigendecomposition, though ~1.65× *faster* on the randomized route's thin QR. Read once, at
 the **first CPU PCA / PFlog call**: set it before then.
 
-> [!NOTE]
-> **The guarantee is scoped to CPU PCA and PFlog**, even though the setting it writes is a
-> faer process-global. `scx-accel`'s other faer call sites — the exact-kNN gemm and the
-> eval-metrics distance gemm — pass an explicit `Par::rayon(0)` and so ignore the global;
-> Harmony does not use faer's global at all. Do not read this knob as an accelerator-wide
-> reproducibility switch.
+> [!IMPORTANT]
+> **The guarantee is scoped to CPU PCA and PFlog, but the side effect is process-wide.**
+> Those are different sets and it matters which you are relying on.
+>
+> - **Guaranteed reproducible:** CPU PCA and PFlog. Nothing is pinned until one of them
+>   runs, and only their determinism is tested.
+> - **Slowed but not made reproducible:** every *implicit* faer decomposition in the
+>   process, because the setting is one global. After the first pinned PCA call, Harmony's
+>   LU fallback, NB-GLM's LLT/LU/QR and the native-GPU PCA's host SVD run sequentially too.
+>   If you set this knob, expect those to get slower — a call-order-dependent effect, since
+>   before that first PCA call they are unaffected.
+> - **Untouched:** call sites that pass faer an explicit `Par` — the exact-kNN gemm and the
+>   eval-metrics distance gemm hand it `Par::rayon(0)` directly and ignore the global, so
+>   pinning makes them neither sequential nor reproducible.
+>
+> Do not read this knob as an accelerator-wide reproducibility switch.
 
 Version-to-version bits are not promised. The first release after v0.13.0 changes them once, by
 fixing the above — so a result computed with v0.13.0 or earlier will not reproduce exactly on a

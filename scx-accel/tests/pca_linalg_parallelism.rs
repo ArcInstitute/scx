@@ -16,6 +16,8 @@
 //! result, and `pca::cpu::tests` asserts that at the kernel level with faer out
 //! of the picture.
 
+use std::sync::Mutex;
+
 use faer::Par;
 use scx_accel::{covariance_pca_inmemory, randomized_pca_inmemory};
 use scx_sparse::ScxCsr;
@@ -56,18 +58,39 @@ fn differing(a: &[f64], b: &[f64]) -> usize {
         .count()
 }
 
-/// Run `f` under an explicit faer parallelism setting.
+/// Serialises every test in this binary that touches faer's global.
+///
+/// Its own integration binary isolates this file from *other* binaries, not its
+/// two tests from each other: the default harness runs them concurrently, so one
+/// could flip the global out from under the other between `set_global_parallelism`
+/// and the decomposition — silently turning a `Par::Seq` arm into a parallel one
+/// and masking the very premise these tests exist to establish.
+static FAER_GLOBAL: Mutex<()> = Mutex::new(());
+
+/// Run `f` under an explicit faer parallelism setting, holding [`FAER_GLOBAL`].
 ///
 /// Setting the global directly is the only way to vary this: faer's solver
 /// constructors take no `Par` argument, they all read `get_global_parallelism()`.
 /// Note that `install`ing a rayon pool of a given width is *not* equivalent — it
 /// changes `rayon::current_num_threads()`, but faer reaches its parallel path
 /// differently from inside a worker thread, and the divergence does not show.
+///
+/// The caller must already hold the lock (see [`with_faer_global`]); this takes
+/// no lock itself so that a whole premise/guarantee pair stays atomic.
 fn under<T>(par: Par, f: impl FnOnce() -> T) -> T {
     faer::set_global_parallelism(par);
     let out = f();
     faer::set_global_parallelism(Par::rayon(0));
     out
+}
+
+/// Hold the global-parallelism lock for the duration of one test body.
+///
+/// Poisoning is ignored: a panicking test has already failed, and refusing the
+/// lock afterwards would turn one failure into every-test-fails.
+fn with_faer_global<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = FAER_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    f()
 }
 
 /// The randomized route's thin QR reblocks with faer's parallelism.
@@ -77,49 +100,53 @@ fn under<T>(par: Par, f: impl FnOnce() -> T) -> T {
 /// Check before deleting it: the covariance twin below may still need the knob.
 #[test]
 fn faer_parallelism_changes_the_randomized_route() {
-    let csr = wide_range_csr(4_800, 12);
-    let run = || {
-        randomized_pca_inmemory(&csr, 2, 8, 2, true, 11)
-            .unwrap()
-            .embeddings
-    };
+    with_faer_global(|| {
+        let csr = wide_range_csr(4_800, 12);
+        let run = || {
+            randomized_pca_inmemory(&csr, 2, 8, 2, true, 11)
+                .unwrap()
+                .embeddings
+        };
 
-    let seq = under(Par::Seq, run);
-    let wide = under(Par::rayon(12), run);
-    assert!(
-        differing(&seq, &wide) > 0,
-        "premise: faer's parallelism no longer changes the randomized route's bits, \
+        let seq = under(Par::Seq, run);
+        let wide = under(Par::rayon(12), run);
+        assert!(
+            differing(&seq, &wide) > 0,
+            "premise: faer's parallelism no longer changes the randomized route's bits, \
          so SCX_ACCEL_DETERMINISTIC_LINALG buys nothing here"
-    );
+        );
 
-    // And the knob's setting is stable in itself: sequential twice is sequential.
-    assert_eq!(
-        differing(&seq, &under(Par::Seq, run)),
-        0,
-        "sequential faer must be reproducible — if this fails the knob cannot \
+        // And the knob's setting is stable in itself: sequential twice is sequential.
+        assert_eq!(
+            differing(&seq, &under(Par::Seq, run)),
+            0,
+            "sequential faer must be reproducible — if this fails the knob cannot \
          deliver what it promises"
-    );
+        );
+    });
 }
 
 /// Same question for the covariance route, whose dense step is the
 /// `n_vars × n_vars` self-adjoint eigendecomposition rather than a QR.
 #[test]
 fn faer_parallelism_changes_the_covariance_route() {
-    let csr = wide_range_csr(1_500, 500);
-    let run = || covariance_pca_inmemory(&csr, 5, true).unwrap().embeddings;
+    with_faer_global(|| {
+        let csr = wide_range_csr(1_500, 500);
+        let run = || covariance_pca_inmemory(&csr, 5, true).unwrap().embeddings;
 
-    let seq = under(Par::Seq, run);
-    let wide = under(Par::rayon(12), run);
-    assert!(
-        differing(&seq, &wide) > 0,
-        "premise: faer's parallelism no longer changes the covariance route's bits \
+        let seq = under(Par::Seq, run);
+        let wide = under(Par::rayon(12), run);
+        assert!(
+            differing(&seq, &wide) > 0,
+            "premise: faer's parallelism no longer changes the covariance route's bits \
          at n_vars=500. Either faer became parallelism-stable, or this fixture fell \
          below the size at which its eigendecomposition parallelizes at all"
-    );
+        );
 
-    assert_eq!(
-        differing(&seq, &under(Par::Seq, run)),
-        0,
-        "sequential faer must be reproducible"
-    );
+        assert_eq!(
+            differing(&seq, &under(Par::Seq, run)),
+            0,
+            "sequential faer must be reproducible"
+        );
+    });
 }

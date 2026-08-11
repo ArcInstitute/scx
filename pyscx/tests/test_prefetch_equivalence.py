@@ -169,7 +169,10 @@ for _pca_method in ("randomized", "covariance"):
     pyscx.accel.pca(adpca, n_comps=3, device="cpu", method=_pca_method)
     rec(f"pca_{_pca_method}_embeddings", adpca.obsm["X_pca"])
     rec(f"pca_{_pca_method}_components", adpca.varm["PCs"])
-rec("pca_variance_ratio", adpca.uns["pca"]["variance_ratio"])
+    # Inside the loop: recording this once after it left `pca_variance_ratio`
+    # holding only the last method's value, silently dropping the randomized
+    # coverage that key used to carry.
+    rec(f"pca_{_pca_method}_variance_ratio", adpca.uns["pca"]["variance_ratio"])
 
 # Same, through a column projection — `ProjectedShardSource` wraps the shard
 # source, so this is the only arm that exercises the projected path's ordering.

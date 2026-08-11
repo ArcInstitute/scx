@@ -315,9 +315,11 @@ fn warn_non_canonical_csr_once() {
     ONCE.call_once(|| {
         log::warn!(
             "covariance PCA: a CSR row's column indices are not strictly increasing; \
-             falling back to a serial accumulation. The result is unchanged and still \
-             deterministic, but this path does not parallelize — canonicalize the matrix \
-             (scipy `sort_indices()`) to restore it"
+             falling back to a serial accumulation. The values are correct and still \
+             deterministic, but this path does not parallelize. To restore it, canonicalize \
+             the matrix: scipy `sort_indices()` for out-of-order columns and \
+             `sum_duplicates()` for repeated ones — sorting alone leaves a duplicate \
+             coordinate on this same serial path"
         );
     });
 }
@@ -362,16 +364,26 @@ fn parse_deterministic_linalg(raw: Option<String>) -> bool {
 /// process. Reading the knob once and applying it once is the only form of this
 /// that is not a data race.
 ///
-/// # What it does and does not reach
+/// # What it guarantees, and what it merely touches
 ///
-/// It is initialised from the five CPU PCA / PFlog entry points, and the
-/// guarantee is scoped to those. Writing the global does not make every faer
-/// user sequential: `scx-accel`'s other faer call sites — the exact-kNN gemm
+/// These are different sets, and conflating them is how the first version of
+/// this comment got it wrong.
+///
+/// **Guaranteed:** CPU PCA and PFlog only. It is initialised from those five
+/// entry points, so nothing is pinned until one of them runs, and only their
+/// determinism is tested.
+///
+/// **Touched:** every *implicit* faer decomposition in the process, because the
+/// setting is one global. After the first pinned PCA call, Harmony's LU fallback
+/// (`harmony/cpu.rs`), NB-GLM's LLT/LU/QR (`nb_glm/{irls,dispersion,wald,validate}.rs`)
+/// and the native-GPU PCA's host SVD (`scx-gpu`) all run sequentially too —
+/// where before that call they did not. That is a real call-order-dependent
+/// performance side effect, and it does *not* buy those ops determinism.
+///
+/// **Not touched:** call sites passing an **explicit** `Par`. The exact-kNN gemm
 /// (`neighbors/cpu.rs`) and the eval-metrics distance gemm
-/// (`eval_metrics/distances.rs`) — pass an **explicit** `Par::rayon(0)` and
-/// therefore ignore the global entirely. Harmony does not go through faer's
-/// global either; it builds its own rayon pool. So this knob is a CPU PCA/PFlog
-/// contract, not an accelerator-wide one, and the docs say so.
+/// (`eval_metrics/distances.rs`) hand faer `Par::rayon(0)` directly and ignore
+/// the global entirely, so pinning cannot make them sequential or reproducible.
 fn pin_linalg_if_requested() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -379,8 +391,11 @@ fn pin_linalg_if_requested() {
             faer::set_global_parallelism(faer::Par::Seq);
             log::info!(
                 "SCX_ACCEL_DETERMINISTIC_LINALG is set: pinning faer's dense decompositions \
-                 to sequential execution process-wide, so results are bit-identical across \
-                 thread counts. Expect a slower eigendecomposition on the covariance route"
+                 to sequential execution, so CPU PCA / PFlog results are bit-identical \
+                 across thread counts. The setting is a faer process-global, so every \
+                 implicit faer decomposition (Harmony, NB-GLM, native-GPU PCA's host SVD) \
+                 also runs sequentially from here on; call sites passing an explicit Par \
+                 are unaffected. Expect a slower eigendecomposition on the covariance route"
             );
         }
     });
@@ -1073,6 +1088,12 @@ fn column_sums_of_q(q: &Mat<f64>) -> Vec<f64> {
 /// shards have been folded in.
 fn apply_transpose_mean_correction(z: &mut [f64], means: &[f64], sum_q: &[f64], k: usize) {
     debug_assert_eq!(z.len(), means.len() * k);
+    // `chunks_mut(0)` panics, so record why it cannot happen rather than adding an
+    // early return: an early return would turn a genuinely broken caller into a
+    // silent no-op. Every PCA entry point calls `validate_inputs`, which rejects
+    // `n_components == 0` and empty axes, and `k` is at least `n_components`
+    // clamped to two non-zero axes — so `k >= 1` for every reachable call.
+    debug_assert!(k > 0, "k must be non-zero — validate_inputs guarantees it");
     for (v, row) in z.chunks_mut(k).enumerate() {
         let mu = means[v];
         for (slot, &sq) in row.iter_mut().zip(sum_q) {
