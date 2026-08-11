@@ -2484,3 +2484,75 @@ fn the_block_index_row_run_path_rejects_an_out_of_range_index() {
         "expected an index/catalog error, got {err:?}"
     );
 }
+
+/// A shard header that *widens* its own `n_minor` past the catalog's width.
+///
+/// This is the move the seam's original bound could not stop. Indices were
+/// checked against the payload's own `n_minor`, so raising it smuggled an index
+/// through that is still out of range for the matrix the catalog describes —
+/// and the default (non-dense) read then handed `scipy.sparse.csr_matrix` a
+/// structurally invalid matrix, whose `.toarray()` misplaces the value into
+/// another row. Guarding only the densify sites left that open, because the
+/// corruption happened on scipy's side of the boundary.
+///
+/// The catalog is the authority: its BLAKE3 covers catalog bytes, while the
+/// shard payload is not covered at all. Requiring the two to agree removes the
+/// move entirely — the payload cannot widen itself.
+#[test]
+fn a_shard_header_that_widens_n_minor_past_the_catalog_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let n_vars = 10usize;
+    let path = dir.path().join("widened.scx");
+    let (indptr, indices, values) = sample_shard_data(6, n_vars);
+    let header = sample_header(6, n_vars as u64, *indptr.last().unwrap());
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(6)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    // Sanity: it reads before we touch it.
+    ScxReader::open(&path)
+        .unwrap()
+        .read_all_csr_shards()
+        .expect("fixture must be readable before the mutation");
+
+    // Widen n_minor (shard-header byte 16) from 10 to 13, leaving the catalog's
+    // authenticated col_end at 10.
+    let offset = {
+        let reader = ScxReader::open(&path).unwrap();
+        reader
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::CsrShard)
+            .expect("one CSR shard")
+            .offset as usize
+    };
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(bytes[offset + 16..offset + 20].try_into().unwrap()),
+        n_vars as u32,
+    );
+    bytes[offset + 16..offset + 20].copy_from_slice(&13u32.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let err = ScxReader::open(&path)
+        .unwrap()
+        .read_all_csr_shards()
+        .expect_err("a header/catalog width disagreement must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("13") && msg.contains("10"),
+        "must report both widths so the file can be diagnosed: {msg}"
+    );
+}

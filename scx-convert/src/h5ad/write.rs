@@ -2907,3 +2907,49 @@ mod uns_envelope_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod raw_export_filter_tests {
+    use super::*;
+
+    /// The raw-export keep mask and raw X share the obs axis, so a length
+    /// disagreement means the file is inconsistent — not that the export should
+    /// pick one and carry on.
+    ///
+    /// This helper used to open with `min(mask.len())`, which made the *shorter*
+    /// case silent: it exported a raw matrix with fewer rows than obs and
+    /// returned no error. That direction never panicked, which is why it needed
+    /// a test rather than an assertion — a wrong file looks like a file.
+    ///
+    /// (`scx-engine::collect::filter_csr_rows` is a separate copy of the same
+    /// helper with the same defect, tested separately; this one is private to
+    /// the h5ad writer and easy to regress unnoticed.)
+    #[test]
+    fn raw_export_rejects_a_mask_that_disagrees_with_raw_x() {
+        // 3-row raw X.
+        let indptr = vec![0i64, 2, 3, 5];
+        let indices = vec![0i32, 1, 2, 0, 3];
+        let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+
+        let short = vec![true];
+        let err = filter_csr_rows(&indptr, &indices, &data, &short)
+            .expect_err("a short mask must error rather than truncate the export");
+        let msg = err.to_string();
+        assert!(
+            msg.contains('1') && msg.contains('3'),
+            "must report both counts: {msg}"
+        );
+
+        let long = vec![true, true, true, true];
+        assert!(filter_csr_rows(&indptr, &indices, &data, &long).is_err());
+
+        // Control: an exactly-matching mask still filters, so the guard is not
+        // rejecting every export.
+        let (ip, ix, d, n) = filter_csr_rows(&indptr, &indices, &data, &[true, false, true])
+            .expect("a matching mask must still filter");
+        assert_eq!(n, 2);
+        assert_eq!(ip, vec![0, 2, 4]);
+        assert_eq!(ix, vec![0, 1, 0, 3]);
+        assert_eq!(d, vec![1.0, 2.0, 4.0, 5.0]);
+    }
+}

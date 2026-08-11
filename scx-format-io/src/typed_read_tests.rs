@@ -39,14 +39,13 @@ fn assert_native_matches_scipy(
     assert_eq!(&n_as_f32, s_data, "values differ");
 }
 
-fn decode_both(
-    codec: CodecId,
-    values: &[f32],
-    framing: Option<FramingConfig>,
-) -> (
+/// `(native decode, scipy decode)` of the same shard, for the parity assertions.
+type NativeAndScipy = (
     (Vec<i64>, Vec<u32>, ShardValuesNative),
     (Vec<i64>, Vec<i32>, Vec<f32>),
-) {
+);
+
+fn decode_both(codec: CodecId, values: &[f32], framing: Option<FramingConfig>) -> NativeAndScipy {
     let indptr = [0u64, 2, 2, 5, 7];
     let indices = [0u32, 3, 1, 4, 9, 2, 8];
     let n_cols: u32 = 16;
@@ -637,7 +636,7 @@ fn typed_read_applies_deletion_vectors() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("dv.scx");
-    let shards = vec![u8_shard(6, 10, 0, 0)];
+    let shards = [u8_shard(6, 10, 0, 0)];
     let total_nnz: u64 = *shards[0].0.last().unwrap();
     let hdr = header(6, 10, total_nnz);
     let mut writer = ScxWriter::new(&path, hdr).unwrap();

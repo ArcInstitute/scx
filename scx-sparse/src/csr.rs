@@ -168,8 +168,17 @@ impl ScxCsr {
     ///
     /// It is enforced now, once per shard, at the `scx-format-io` decode seam —
     /// on the scipy path by the bound handed to `scx_codec::decode_shard_scipy`,
-    /// on the native path by its own pass. So every CSR that comes out of a
-    /// reader satisfies invariant 5.
+    /// on the native path by its own pass — and the seam first requires the
+    /// shard header's declared width to match the catalog's authenticated one,
+    /// so a corrupt payload cannot widen its own bound to smuggle an index
+    /// through. A CSR that comes out of a reader satisfies invariant 5 against
+    /// the width the catalog records.
+    ///
+    /// One gap survives that: a **v1** catalog does not record a minor extent
+    /// (`col_start`/`col_end` are v2-only and read as `0`), so on those files
+    /// there is nothing to reconcile against and the header's `n_minor` stands
+    /// alone. Same for a legacy multimodal shard, whose `n_minor` is `0` —
+    /// "undeclared", not "zero columns" — where the bound is skipped entirely.
     ///
     /// Callers constructing a CSR from anywhere *other* than a reader still owe
     /// the invariant themselves, and one known caller does not yet discharge it:
@@ -736,8 +745,7 @@ mod tests {
         assert_eq!(csr.nnz(), 0);
     }
 
-    #[test]
-    /// `to_dense_dtype` is the one scatter where breaking invariant 5 is silent,
+    /// `to_dense_dtype` is the scatter where breaking invariant 5 is silent,
     /// and `to_dense` delegates to it — so this guard covers every densify call
     /// site, including `pyscx`'s query / `obs_filter` path
     /// (`convert/interop.rs::csr_to_scipy_typed`), which the typed twin in
@@ -765,9 +773,11 @@ mod tests {
             other => panic!("expected IndexOutOfRange, got {other:?}"),
         }
 
-        // Where the unguarded write would have landed.
-        assert_eq!(1 * 10 + 12, 22);
-        assert_eq!(22 / 10, 2, "row 1's value lands in row 2");
+        // Where the unguarded write would have landed: `row_base + col` for
+        // row 1 of a 10-column matrix is 10 + 12 = 22, i.e. row 2, column 2.
+        let (row, n_cols, col) = (1usize, 10usize, 12usize);
+        assert_eq!(row * n_cols + col, 22);
+        assert_eq!((row * n_cols + col) / n_cols, 2, "lands in row 2");
 
         // A negative column is the other half: `col as usize` makes it ~2^64 and
         // the add wraps in release rather than panicking.
@@ -786,6 +796,7 @@ mod tests {
         assert_eq!(csr.to_dense().unwrap(), vec![7.0, 0.0, 0.0, 9.0]);
     }
 
+    #[test]
     fn to_dense_dtype_matches_to_dense() {
         let csr = sample_csr();
         // Cast the f32 data to u16 (all values fit) and scatter.

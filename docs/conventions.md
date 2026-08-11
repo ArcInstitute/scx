@@ -54,11 +54,22 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
     while the seam validates against the shard header's `n_minor`. Those agree on
     any file a writer produced, but they are two numbers, so a corrupt shard can
     pass one and violate the other.
-  - **Check where a violation would be silent.** That same scatter writes
+  - **Check where a violation would be silent.** The dense scatters write
     `dense[base + col]`, so an out-of-range column runs off the end of one row
     into the next and returns a plausible, wrong matrix rather than panicking.
-    Everywhere else the index addresses a `Vec` sized by the axis it was
-    validated against, so a violation panics and announces itself.
+    There are two such sites and both are guarded:
+    `scx_format_io::typed_read::scatter_typed_csr_to_dense` and
+    `ScxCsr::to_dense_dtype` (which `to_dense` delegates to, and which pyscx's
+    query / `obs_filter` path reaches).
+
+    ⚠️ "Everywhere else it panics" is *almost* true and the exception matters:
+    a CSR handed to `scipy.sparse.csr_matrix` crosses out of Rust entirely, and
+    scipy constructs an out-of-range matrix without complaint — `.toarray()`
+    then misplaces the value exactly as the Rust scatter would. That is why the
+    decode seam reconciles the shard header's declared width against the
+    catalog's authenticated one *before* bounding indices by it: a payload that
+    can widen its own bound can put an invalid matrix into scipy's hands, where
+    no Rust-side guard runs at all.
 - **Prefer riding an existing pass to adding one.** The bound above is enforced
   by handing `scx_codec::decode_shard_scipy` an `index_bound`, so it rides the
   scan that already rejects `> i32::MAX`; only the comparand changes. The same

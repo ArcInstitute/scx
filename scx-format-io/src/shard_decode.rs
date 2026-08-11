@@ -74,15 +74,106 @@ pub fn decode_shard_bytes(
         }
     }
 
+    // Reconcile the shard's own header against the catalog before trusting
+    // either. This is the seam every full-entry read funnels through — the local
+    // mmap reader, the cloud range reader, the ML loader's `io_stage`, and
+    // `scx-engine`'s `read_row_range` — so a check here covers all of them,
+    // where the `BackedCsrReader`-only check covered just the backed cache.
+    check_header_against_catalog(&sh, entry)?;
+
     // Delegate the codec-resolve + framed/unframed decode to the shared region
     // decoder (also used by the scx-gpu host-bounce, so both honor framing).
-    decode_shard_regions_scipy(
+    let (indptr, indices, data) = decode_shard_regions_scipy(
         &sh,
         indptr_bytes,
         indices_bytes,
         values_bytes,
         block_index_bytes,
-    )
+    )?;
+
+    // The decoded major-axis extent, against the catalog's. `decode_shard_regions_*`
+    // cannot do this — it never sees the entry.
+    if let Some(expected) = catalog_major_extent(&sh, entry)? {
+        let got = indptr.len().saturating_sub(1) as u64;
+        if got != expected {
+            return Err(ScxError::InvalidCatalog(format!(
+                "shard '{}': catalog says {expected} rows, decoded {got} \
+                 (truncated or corrupt file)",
+                entry.name
+            )));
+        }
+    }
+
+    Ok((indptr, indices, data))
+}
+
+/// The major-axis extent the **catalog** assigns this shard, or `None` when the
+/// entry carries no stats.
+///
+/// `ShardEntryLite::into_transient_full_entry` deliberately sets `stats: None` —
+/// the backed reader keeps row ranges in `BackedCsrIndex` instead — so the
+/// backed path returns `None` here and is covered by
+/// `BackedCsrReader::check_decoded_shard_rows`.
+fn catalog_major_extent(sh: &ShardHeader, entry: &FullCatalogEntry) -> Result<Option<u64>> {
+    let Some(stats) = entry.stats.as_ref() else {
+        return Ok(None);
+    };
+    // CSR-class shards tile the row axis (`row_start..row_end`); a CSC sidecar
+    // tiles the column axis. `compute_shard_stats` writes the *other* pair as
+    // `0..n_minor`, so reading the wrong one would compare an extent against a
+    // width.
+    let (lo, hi) = if sh.is_csc(entry.section_type) {
+        (stats.col_start, stats.col_end)
+    } else {
+        (stats.row_start, stats.row_end)
+    };
+    hi.checked_sub(lo).map(Some).ok_or_else(|| {
+        ScxError::InvalidCatalog(format!(
+            "shard '{}': catalog major range {lo}..{hi} is inverted",
+            entry.name
+        ))
+    })
+}
+
+/// Reject a shard whose header disagrees with the catalog about the minor axis.
+///
+/// The two carry the same number by construction — `compute_shard_stats` derives
+/// `col_end` (CSR) / `row_end` (CSC) from the very `n_minor` stamped into the
+/// header — but they live in different places, and only one of them is
+/// authenticated: the catalog's BLAKE3 covers catalog bytes, the shard payload
+/// is not covered at all.
+///
+/// That asymmetry is the point. Bounding decoded indices by the payload's own
+/// `n_minor` lets a corrupt shard raise its declared width and smuggle an index
+/// past the bound — one that is still out of range for the matrix the catalog
+/// describes, and which then reaches `scipy.sparse.csr_matrix` as a structurally
+/// invalid matrix whose `.toarray()` misplaces the value. Requiring the two to
+/// agree removes that move: the payload cannot widen itself.
+///
+/// A v1 catalog writes `0` for the v2-only `col_start`/`col_end` pair, so there
+/// is nothing to reconcile against and the header stands alone — strictly the
+/// pre-existing position, not a regression.
+fn check_header_against_catalog(sh: &ShardHeader, entry: &FullCatalogEntry) -> Result<()> {
+    let Some(stats) = entry.stats.as_ref() else {
+        return Ok(());
+    };
+    let authenticated = if sh.is_csc(entry.section_type) {
+        stats.row_end
+    } else {
+        stats.col_end
+    };
+    if authenticated == 0 {
+        return Ok(()); // v1 catalog: no minor extent recorded.
+    }
+    if authenticated != sh.n_minor as u64 {
+        return Err(ScxError::InvalidCatalog(format!(
+            "shard '{}': header declares n_minor {} but the catalog says {authenticated} \
+             (corrupt file; the shard payload is not covered by the catalog checksum, \
+             so the catalog is the authority here)",
+            entry.name, sh.n_minor
+        )));
+    }
+    Ok(())
 }
 
 /// Decode a shard's already-extracted byte regions into scipy triples
@@ -361,13 +452,32 @@ pub fn decode_shard_bytes_native(
         }
     }
 
-    decode_shard_regions_native(
+    // Same reconciliation as the scipy twin — this is a full-entry seam too, and
+    // it is the one the typed / dense reads take. Guarding only the scipy entry
+    // point left `to_anndata(container="dense")` accepting a shard whose header
+    // had widened its own declared width past the catalog's.
+    check_header_against_catalog(&sh, entry)?;
+
+    let (indptr, indices, values) = decode_shard_regions_native(
         &sh,
         indptr_bytes,
         indices_bytes,
         values_bytes,
         block_index_bytes,
-    )
+    )?;
+
+    if let Some(expected) = catalog_major_extent(&sh, entry)? {
+        let got = indptr.len().saturating_sub(1) as u64;
+        if got != expected {
+            return Err(ScxError::InvalidCatalog(format!(
+                "shard '{}': catalog says {expected} rows, decoded {got} \
+                 (truncated or corrupt file)",
+                entry.name
+            )));
+        }
+    }
+
+    Ok((indptr, indices, values))
 }
 
 /// Native-value twin of [`decode_shard_regions_scipy`]. Same framed/legacy split,

@@ -719,6 +719,16 @@ fn u32_vec_to_i32_bounded(data: Vec<u32>, bound: u32) -> Result<Vec<i32>, CodecE
         // With a bound present, an out-of-range index is an out-of-range index
         // at any magnitude. The legacy sign-only message survives for
         // `NO_INDEX_BOUND`, where there is no column axis to be out of.
+        //
+        // A declared width at or above 2^31 clamps to the same sentinel, so it
+        // takes the sign branch too. That is accurate rather than a collision:
+        // an `i32` CSR cannot represent such a column at all, so "exceeds
+        // i32::MAX" is the actual reason for the rejection, and naming the
+        // declared width instead would describe a bound that is not what
+        // stopped it. The native (`u32`) path legitimately accepts the same
+        // index, because it has no sign hazard to begin with — the two domains
+        // differ there because the *representations* differ, not because the
+        // classification is inconsistent.
         return Err(if bound == NO_INDEX_BOUND {
             CodecError::MalformedInput(format!(
                 "column index {bad} exceeds i32::MAX (corrupt or hostile input)"
