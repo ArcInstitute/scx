@@ -16,11 +16,7 @@ use crate::io_stage::io_stage;
 use crate::projection::HvgProjection;
 use crate::shuffle::ShardShuffler;
 
-/// Hard upper bound on per-pipeline rayon worker threads. On many-core hosts
-/// the decode work is embarrassingly parallel but memory-bound; more than
-/// ~8 workers does not pay off and increases the fork-hostile thread count
-/// for downstream callers that use spawn-mode multiprocessing.
-const DEFAULT_DECODE_POOL_MAX_THREADS: usize = 8;
+use crate::pool::DEFAULT_DECODE_POOL_MAX_THREADS;
 
 /// Bounded join deadline for `Drop` and `join_epoch_handles` shutdown.
 /// If the I/O or decode thread does not finish within this window the join
