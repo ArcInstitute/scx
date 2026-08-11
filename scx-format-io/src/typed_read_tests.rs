@@ -738,3 +738,69 @@ fn typed_deletion_mask_must_match_the_csr_row_count() {
     let typed = reader.read_all_csr_shards_typed(&plan).unwrap();
     assert_eq!(typed.shape.0, 5, "one of six rows was deleted");
 }
+
+/// The dense scatter is bounded by the **assembled matrix's** `n_cols` (the
+/// file header's `n_vars`), while the decode seam validates against the
+/// **shard header's** `n_minor`. On any file a writer produced those are equal,
+/// so the seam covers the scatter — but they are two independent numbers, and a
+/// corrupt shard claiming `n_minor > n_vars` passes the seam while carrying an
+/// index the scatter cannot hold.
+///
+/// The gap matters at this one site because a violation here is **silent**.
+/// The assertions below pin the corruption, not merely the error: pre-fix,
+/// `dense[base + col]` with `col = 12` and `n_cols = 10` wrote two cells into
+/// the *next* row and returned a plausible, wrong 3x10 matrix — no panic, no
+/// error. Asserting only `is_err()` would pass against a build that panicked
+/// instead, and would not characterise the bug at all.
+#[test]
+fn dense_scatter_rejects_an_index_the_seam_bound_let_through() {
+    use scx_sparse::TypedCsr;
+
+    // 3x10, but row 1 carries column 12 — beyond `n_cols`, and beyond anything
+    // this matrix can hold.
+    let csr = TypedCsr {
+        shape: (3, 10),
+        indptr: vec![0, 1, 3, 4],
+        indices: IndexBuffer::I32(vec![0, 12, 3, 9]),
+        values: ValueBuffer::U16(vec![11, 22, 33, 44]),
+    };
+
+    let err = super::scatter_typed_csr_to_dense(&csr)
+        .expect_err("an index past n_cols must be rejected, not scattered");
+    match err {
+        crate::error::ScxError::ShardIndexOutOfRange {
+            index,
+            position,
+            n_minor,
+        } => assert_eq!((index, position, n_minor), (12, 1, 10)),
+        other => panic!("expected ShardIndexOutOfRange, got {other:?}"),
+    }
+
+    // Characterise what the unguarded write would have done, so the failure this
+    // guards is on the record rather than described: `base + col` for row 1 is
+    // `10 + 12 = 22`, which lands in row 2 (cells 20..30) — a value silently
+    // attributed to the wrong cell of the wrong row.
+    let (row, col, n_cols) = (1usize, 12usize, 10usize);
+    let flat = row * n_cols + col;
+    assert_eq!(flat, 22);
+    assert_eq!(flat / n_cols, 2, "row 1's value lands in row 2");
+
+    // Control: the same matrix with an in-range index scatters normally, so the
+    // guard is not rejecting every dense read.
+    let ok = TypedCsr {
+        shape: (3, 10),
+        indptr: vec![0, 1, 3, 4],
+        indices: IndexBuffer::I32(vec![0, 2, 3, 9]),
+        values: ValueBuffer::U16(vec![11, 22, 33, 44]),
+    };
+    let dense = super::scatter_typed_csr_to_dense(&ok).expect("in-range indices scatter");
+    match dense.values {
+        ValueBuffer::U16(v) => {
+            assert_eq!(v.len(), 30);
+            assert_eq!(v[0], 11);
+            assert_eq!(v[12], 22, "row 1, col 2");
+            assert_eq!(v[29], 44, "row 2, col 9");
+        }
+        other => panic!("wrong arm: {other:?}"),
+    }
+}

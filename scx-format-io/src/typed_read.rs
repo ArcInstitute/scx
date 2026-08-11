@@ -446,6 +446,32 @@ fn scatter_typed_csr_to_dense(csr: &TypedCsr) -> Result<TypedDense> {
     };
     let indptr = &csr.indptr;
 
+    // The decode seam already bounded every index against its **shard's**
+    // `n_minor`; this bounds against the **assembled matrix's** `n_cols`, which
+    // comes from the file header's `n_vars`. They agree on any file a writer
+    // produced, so this is normally a no-op — but they are two different numbers
+    // and a shard header claiming `n_minor > n_vars` would slip an index through
+    // the seam into the write below.
+    //
+    // Worth the one pass here specifically, and nowhere else: this is the site
+    // where a violation does *not* announce itself. `dense[base + col]` with an
+    // out-of-range `col` runs off the end of one row into the next and returns a
+    // plausible, wrong matrix — no panic, no error. Every other consumer indexes
+    // a `Vec` sized by the same axis it validates against, so it panics instead.
+    // Cost is negligible against the `n_rows × n_cols` allocation this function
+    // already makes.
+    if let Some((position, &bad)) = cols
+        .iter()
+        .enumerate()
+        .find(|&(_, &c)| c < 0 || c as usize >= n_cols)
+    {
+        return Err(ScxError::ShardIndexOutOfRange {
+            index: bad as u32,
+            position,
+            n_minor: n_cols as u32,
+        });
+    }
+
     macro_rules! scatter {
         ($arm:ident, $vals:expr, $ty:ty) => {{
             let mut dense = vec![<$ty>::default(); total];

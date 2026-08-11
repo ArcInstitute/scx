@@ -40,12 +40,25 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   (`scx_format_io::decode_shard_regions_scipy` / `_native`) enforce the
   minor-axis bound, which is what lets the ~20 sites downstream write
   `dense[base + col]` or `col_sums[col]` with no check of their own. **Do not
-  add a per-consumer bounds check**: it is redundant, it costs a branch in a hot
-  loop, and — worse — where two kernels are each other's oracle (the streaming
-  statistics pair in `backed.rs` and `prefetch.rs`) guarding only one makes them
-  disagree on precisely the malformed input where their agreement is the
-  evidence. If a new decode path is added that bypasses those seams, it owes the
-  same check; `reader.rs`'s block-index row-run path is the existing example.
+  add a per-consumer bounds check against the same axis**: it is redundant, it
+  costs a branch in a hot loop, and — worse — where two kernels are each other's
+  oracle (the streaming statistics pair in `backed.rs` and `prefetch.rs`)
+  guarding only one makes them disagree on precisely the malformed input where
+  their agreement is the evidence. If a new decode path is added that bypasses
+  those seams, it owes the same check; `reader.rs`'s block-index row-run path is
+  the existing example.
+
+  Two carve-outs, both narrow:
+  - **A consumer bounded by a *different* axis owes its own check.** The dense
+    scatter in `typed_read.rs` sizes its buffer from the file header's `n_vars`
+    while the seam validates against the shard header's `n_minor`. Those agree on
+    any file a writer produced, but they are two numbers, so a corrupt shard can
+    pass one and violate the other.
+  - **Check where a violation would be silent.** That same scatter writes
+    `dense[base + col]`, so an out-of-range column runs off the end of one row
+    into the next and returns a plausible, wrong matrix rather than panicking.
+    Everywhere else the index addresses a `Vec` sized by the axis it was
+    validated against, so a violation panics and announces itself.
 - **Prefer riding an existing pass to adding one.** The bound above is enforced
   by handing `scx_codec::decode_shard_scipy` an `index_bound`, so it rides the
   scan that already rejects `> i32::MAX`; only the comparand changes. The same
