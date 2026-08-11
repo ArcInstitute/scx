@@ -107,6 +107,7 @@ impl Predicate {
 // ---------------------------------------------------------------------------
 
 use crate::index::PredicateIndex;
+use crate::pushdown::CategoryDictionaries;
 use crate::rowset::{shard_range_to_global, RowSet};
 
 /// Context for [`eval_rowset`]: the obs predicate index plus the **shard
@@ -121,9 +122,27 @@ pub struct RowSetCtx<'a> {
     pub index: &'a PredicateIndex,
     pub shard_row_ranges: &'a [(u32, u64, u64)],
     pub n_obs: u64,
+    /// The same per-column vocabularies Level-1 prunes with, carried here for
+    /// their `complete` bit alone.
+    ///
+    /// Level-2 reads a categorical miss the same way Level-1 does, and more
+    /// sharply: [`PredicateIndex::categorical_eq`] returns `Some(&[])` for an
+    /// absent value, which `eval_rowset` treats as an *exact* empty row-set
+    /// rather than "not resolvable here". On a vocabulary that is not the
+    /// column's complete value set that is a wrong answer, not a slow one, so
+    /// an incomplete column is residual here — see [`RowSetCtx::resolvable`].
+    pub category_dicts: &'a CategoryDictionaries,
 }
 
 impl RowSetCtx<'_> {
+    /// Whether a categorical predicate on `column` may be resolved from the
+    /// index. `false` only when the column IS indexed as a categorical and its
+    /// vocabulary is not trustworthy as complete; an unindexed column is
+    /// declined by `categorical_eq` itself.
+    fn resolvable(&self, column: &str) -> bool {
+        self.category_dicts.vocabulary_is_usable(column)
+    }
+
     /// Map a slice of shard-local ranges to a global [`RowSet`]. Returns `None`
     /// if any range references a shard absent from the range table (stale
     /// index) — the caller then treats the predicate as residual.
@@ -144,7 +163,11 @@ pub fn eval_rowset(pred: &Predicate, ctx: &RowSetCtx) -> Option<RowSet> {
         Predicate::Eq(col, ScalarValue::Utf8(v)) => {
             // `categorical_eq` returns None iff the column is not an indexed
             // categorical (residual); Some(&[]) iff indexed but value absent
-            // (exact empty row-set).
+            // (exact empty row-set). That second reading is only a row-set at
+            // all when the vocabulary is the column's complete value set.
+            if !ctx.resolvable(col) {
+                return None;
+            }
             let ranges = ctx.index.categorical_eq(col, v)?;
             ctx.shard_ranges_to_rowset(ranges)
         }
@@ -152,8 +175,11 @@ pub fn eval_rowset(pred: &Predicate, ctx: &RowSetCtx) -> Option<RowSet> {
         // string category; only string equality is index-resolvable here.
         Predicate::Eq(_, _) => None,
         Predicate::In(col, vals) => {
-            // Only index-resolvable if the column is an indexed categorical.
-            if ctx.index.indexed_kind(col) != Some(crate::index::IndexKind::Categorical) {
+            // Only index-resolvable if the column is an indexed categorical
+            // whose vocabulary is complete (see the `Eq` arm).
+            if ctx.index.indexed_kind(col) != Some(crate::index::IndexKind::Categorical)
+                || !ctx.resolvable(col)
+            {
                 return None;
             }
             // Every member must be resolvable, or the whole predicate is
@@ -1911,6 +1937,7 @@ mod tests {
             CategoricalEntry, CategoricalIndex, IndexedColumn, PredicateIndex, ShardRange,
         };
         use crate::predicate::{eval_rowset, Predicate, RowSetCtx, ScalarValue};
+        use crate::pushdown::CategoryDictionaries;
         use crate::rowset::RowRange;
 
         fn sr(shard_id: u32, row_start: u32, row_end: u32) -> ShardRange {
@@ -1957,16 +1984,85 @@ mod tests {
             vec![(0, 0, 10), (1, 10, 20)]
         }
 
-        fn mk<'a>(index: &'a PredicateIndex, ranges: &'a [(u32, u64, u64)]) -> RowSetCtx<'a> {
+        /// Every categorical column in `index`, marked complete — what
+        /// `build_category_dicts` produces for a file whose every shard carries
+        /// the column's `CategoryBitset`. The default for these tests, which
+        /// are about the row-set algebra rather than about trusting the index.
+        fn complete_dicts(index: &PredicateIndex) -> CategoryDictionaries {
+            let mut dicts = CategoryDictionaries::new();
+            for col in &index.columns {
+                if let crate::index::IndexedColumn::Categorical(cat) = col {
+                    dicts.insert(
+                        scx_format_io::column_name_hash(&cat.column_name),
+                        cat.entries.iter().map(|e| e.value.clone()).collect(),
+                        true,
+                    );
+                }
+            }
+            dicts
+        }
+
+        fn mk<'a>(
+            index: &'a PredicateIndex,
+            ranges: &'a [(u32, u64, u64)],
+            dicts: &'a CategoryDictionaries,
+        ) -> RowSetCtx<'a> {
             RowSetCtx {
                 index,
                 shard_row_ranges: ranges,
                 n_obs: 20,
+                category_dicts: dicts,
             }
         }
 
         fn eq(col: &str, v: &str) -> Predicate {
             Predicate::Eq(col.into(), ScalarValue::Utf8(v.into()))
+        }
+
+        /// An incomplete vocabulary is unusable here, and for a sharper reason
+        /// than at Level-1.
+        ///
+        /// `categorical_eq` answers `Some(&[])` for an absent value, which this
+        /// evaluator reads as an *exact* empty row-set — a wrong answer, not a
+        /// slow one, when the vocabulary is only part of the column's values.
+        /// The **hit** is no safer: a partial vocabulary's shard ranges cover
+        /// only the rows that were recorded, so a present value resolves to a
+        /// row-set missing the rest. Both must go residual.
+        #[test]
+        fn categorical_predicates_are_residual_when_the_vocabulary_is_incomplete() {
+            let index = idx();
+            let ranges = ctx_ranges();
+            let mut dicts = complete_dicts(&index);
+            // Mark `cell_type` incomplete; leave `tissue` alone as a control.
+            dicts.insert(
+                scx_format_io::column_name_hash("cell_type"),
+                vec!["B cell".to_string(), "T cell".to_string()],
+                false,
+            );
+            let ctx = mk(&index, &ranges, &dicts);
+
+            assert!(
+                eval_rowset(&eq("cell_type", "B cell"), &ctx).is_none(),
+                "a value present in a partial vocabulary still resolves to only \
+                 the rows that were recorded"
+            );
+            assert!(
+                eval_rowset(&eq("cell_type", "Nope"), &ctx).is_none(),
+                "absent from a partial vocabulary is not an exact empty row-set"
+            );
+            assert!(
+                eval_rowset(
+                    &Predicate::In("cell_type".into(), vec![ScalarValue::Utf8("B cell".into())]),
+                    &ctx
+                )
+                .is_none(),
+                "the `In` arm resolves through the same lookup"
+            );
+            assert!(
+                eval_rowset(&eq("tissue", "blood"), &ctx).is_some(),
+                "a complete sibling column must keep resolving — the guard is \
+                 per column, not per file"
+            );
         }
 
         /// A non-string `In` member cannot be *resolved* against a
@@ -1983,7 +2079,8 @@ mod tests {
         fn in_with_a_non_string_member_is_residual() {
             let index = idx();
             let ranges = ctx_ranges();
-            let ctx = mk(&index, &ranges);
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
             let pred = Predicate::In(
                 "cell_type".into(),
                 vec![ScalarValue::Utf8("B cell".into()), ScalarValue::Int64(1)],
@@ -2008,12 +2105,31 @@ mod tests {
                 })],
             };
             let ranges = ctx_ranges();
-            let ctx = mk(&index, &ranges);
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
             let pred = Predicate::In("batch".into(), vec![ScalarValue::Int64(1)]);
             assert!(
                 eval_rowset(&pred, &ctx).is_none(),
                 "an entry-less legacy index must fall back to a scan, not \
                  return an exact empty row set"
+            );
+            // The `In` arm was guarded by rejecting the non-string member. A
+            // *string* literal walks straight past that guard and into
+            // `categorical_eq`, whose miss on an empty entry list is reported
+            // as an exact empty row-set — the same silent zero rows, one
+            // spelling over.
+            assert!(
+                eval_rowset(&eq("batch", "1"), &ctx).is_none(),
+                "a string literal reaches the same entry-less index through \
+                 `Eq`, and must be residual there too"
+            );
+            assert!(
+                eval_rowset(
+                    &Predicate::In("batch".into(), vec![ScalarValue::Utf8("1".into())]),
+                    &ctx
+                )
+                .is_none(),
+                "and through `In` with a string member"
             );
         }
 
@@ -2021,7 +2137,8 @@ mod tests {
         fn eq_categorical_resolves_to_global_rowset() {
             let index = idx();
             let ranges = ctx_ranges();
-            let ctx = mk(&index, &ranges);
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
             let rs = eval_rowset(&eq("cell_type", "B cell"), &ctx).unwrap();
             // shard0 [0,5) + shard1 global [10,13)
             assert_eq!(
@@ -2037,7 +2154,8 @@ mod tests {
         fn eq_absent_value_is_exact_empty() {
             let index = idx();
             let ranges = ctx_ranges();
-            let ctx = mk(&index, &ranges);
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
             let rs = eval_rowset(&eq("cell_type", "NK cell"), &ctx).unwrap();
             assert!(rs.is_empty());
         }
@@ -2046,7 +2164,8 @@ mod tests {
         fn non_indexed_column_is_residual() {
             let index = idx();
             let ranges = ctx_ranges();
-            let ctx = mk(&index, &ranges);
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
             assert!(eval_rowset(&eq("donor_id", "d1"), &ctx).is_none());
         }
 
@@ -2054,7 +2173,8 @@ mod tests {
         fn in_list_unions() {
             let index = idx();
             let ranges = ctx_ranges();
-            let ctx = mk(&index, &ranges);
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
             let p = Predicate::In(
                 "cell_type".into(),
                 vec![
@@ -2071,7 +2191,8 @@ mod tests {
         fn and_intersects_or_unions() {
             let index = idx();
             let ranges = ctx_ranges();
-            let ctx = mk(&index, &ranges);
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
             // cell_type==B cell AND tissue==blood -> [0,5) (shard1 not in blood)
             let and = Predicate::And(
                 Box::new(eq("cell_type", "B cell")),
@@ -2103,7 +2224,8 @@ mod tests {
             // `cell_type` with unannotated cells) gets pushdown.
             let index = idx();
             let ranges = ctx_ranges();
-            let ctx = mk(&index, &ranges);
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
             let or = Predicate::Or(
                 Box::new(eq("cell_type", "T cell")),
                 Box::new(eq("tissue", "blood")),
@@ -2119,7 +2241,8 @@ mod tests {
         fn and_with_residual_side_is_residual() {
             let index = idx();
             let ranges = ctx_ranges();
-            let ctx = mk(&index, &ranges);
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
             let and = Predicate::And(
                 Box::new(eq("cell_type", "B cell")),
                 Box::new(eq("donor_id", "d1")), // not indexed
@@ -2131,7 +2254,8 @@ mod tests {
         fn ne_not_numeric_are_residual() {
             let index = idx();
             let ranges = ctx_ranges();
-            let ctx = mk(&index, &ranges);
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
             assert!(eval_rowset(
                 &Predicate::Ne("cell_type".into(), ScalarValue::Utf8("B cell".into())),
                 &ctx

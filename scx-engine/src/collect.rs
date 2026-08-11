@@ -3,6 +3,7 @@
 // Ties together pushdown, decode, projection, filtering, and fused operations
 // to execute a QueryPipeline. Called by `QueryPipeline::collect()`.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use arrow::array::{Array, RecordBatch, UInt32Array};
@@ -147,6 +148,11 @@ struct ExecutionPlan {
     /// catalog-level shard pruning. `None` when the file has no obs predicate
     /// index. See [`try_rowset_mask`].
     obs_predicate_index: Option<PredicateIndex>,
+    /// Per-column category vocabularies and whether each may be trusted as
+    /// complete. Built once in [`build_plan`] and used by **both** pushdown
+    /// levels — Level-1 for catalog pruning, Level-2 for row-set resolution —
+    /// so the two cannot end up trusting the index to different degrees.
+    category_dicts: CategoryDictionaries,
 }
 
 /// Build an execution plan from a QueryPipeline.
@@ -166,7 +172,14 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
     // Build category dictionaries from predicate index for catalog-level pruning.
     // Maps column_name_hash → sorted list of category values, so Utf8 predicate
     // values can be resolved to CategoryBitset bit positions.
-    let category_dicts = build_category_dicts(&obs_predicate_index);
+    // Completeness is judged over exactly the shards the pruner will iterate —
+    // `prune_shards_by_catalog_with_dict` scans the same modality below — so
+    // the claim "every shard being pruned was covered by this vocabulary's
+    // build" is checked against those shards and no others. (The index's own
+    // `shard_id` space does not enter into it: the test is per-entry, "does
+    // this shard carry a `CategoryBitset` for this column hash".)
+    let pruned_shards = scan_shards(catalog, pipeline.modality_id());
+    let category_dicts = build_category_dicts(&obs_predicate_index, &pruned_shards);
     let dicts_ref = if category_dicts.is_empty() {
         None
     } else {
@@ -207,6 +220,7 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
         limit: pipeline.limit_value(),
         deletion_vectors: pipeline.deletion_vectors().clone(),
         obs_predicate_index,
+        category_dicts,
     })
 }
 
@@ -215,21 +229,166 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
 /// For each categorical column in the index, creates a mapping from
 /// `column_name_hash` to the sorted list of category values. The position
 /// in this list corresponds to the bit position in `CategoryBitset`.
-fn build_category_dicts(index: &Option<PredicateIndex>) -> CategoryDictionaries {
+///
+/// Each dictionary also carries whether its vocabulary may be trusted as the
+/// column's **complete** value set — see [`BitsetCoverage::covers`].
+/// Level-1 needs that bit before it may read a dictionary miss as proof the
+/// value exists in no shard.
+///
+/// `pruned_shards` must be the shard list the caller will hand to
+/// [`prune_shards_by_catalog_with_dict`] — the same modality. Completeness is a
+/// statement about *those* shards, so judging it over any other set would
+/// license pruning shards nothing was checked against. Note this is **not**
+/// the index's `shard_id` space: the evidence is per-catalog-entry (see
+/// [`collect_bitset_coverage`]) and never resolves a shard id.
+fn build_category_dicts(
+    index: &Option<PredicateIndex>,
+    pruned_shards: &[&FullCatalogEntry],
+) -> CategoryDictionaries {
     let mut dicts = CategoryDictionaries::new();
     let index = match index {
         Some(idx) => idx,
         None => return dicts,
     };
+    let coverage = collect_bitset_coverage(pruned_shards);
     for col in &index.columns {
         if let IndexedColumn::Categorical(cat) = col {
             let hash = scx_format_io::column_name_hash(&cat.column_name);
             let values: Vec<String> = cat.entries.iter().map(|e| e.value.clone()).collect();
+            let complete = coverage
+                .get(&hash)
+                .is_some_and(|cov| cov.covers(pruned_shards.len(), values.len()));
             // CategoricalIndex entries are already sorted by BTreeMap in build_indexes
-            dicts.insert(hash, values);
+            dicts.insert(hash, values, complete);
         }
     }
     dicts
+}
+
+/// What the catalog says about one column's per-shard `CategoryBitset`s,
+/// accumulated in a **single** pass over the shard entries.
+///
+/// One pass matters. The obvious shape — ask "is this column covered?" once per
+/// indexed column, each asking walking every shard's whole `column_stats`
+/// vector — is O(shards × columns²), and `build_plan` runs it on every query,
+/// including a `collect` or `count` with no obs predicate at all. A shard may
+/// carry up to `u8::MAX` stats, so at atlas shard counts that is tens of
+/// millions of hash comparisons to answer a question about a handful of
+/// columns. Gathering the evidence once and answering per column from the map
+/// is O(shards × stats) regardless of how many columns are indexed.
+#[derive(Debug, Default)]
+struct BitsetCoverage {
+    /// **Distinct shards** carrying a `CategoryBitset` for this column — not
+    /// the number of such stat records. The two differ exactly when one shard
+    /// carries the column twice, and counting records would then let that
+    /// shard's surplus pay for another shard's absence.
+    shards: usize,
+    /// Byte length of the first bitset seen.
+    len: usize,
+    /// Cleared once two shards disagree about that length.
+    consistent: bool,
+    /// Set when one shard carried this column more than once. A malformed
+    /// catalog, not extra evidence: nothing says which of the two bitsets the
+    /// dictionary's bit positions belong to.
+    duplicated: bool,
+}
+
+impl BitsetCoverage {
+    /// Record one shard's bitset for this column. Call **at most once per
+    /// shard** — [`collect_bitset_coverage`] routes a repeat to
+    /// [`Self::mark_duplicated`] instead, which is what keeps `shards` a shard
+    /// count rather than a record count.
+    fn observe(&mut self, len: usize) {
+        if self.shards == 0 {
+            self.len = len;
+            self.consistent = true;
+        } else if self.len != len {
+            self.consistent = false;
+        }
+        self.shards += 1;
+    }
+
+    fn mark_duplicated(&mut self) {
+        self.duplicated = true;
+    }
+
+    /// Whether this column's vocabulary of `n_values` may be trusted as the
+    /// complete value set over `n_shards` shards.
+    ///
+    /// Four conditions, and each rules out a way the catalog and the index
+    /// section can disagree:
+    ///
+    /// - **Every shard carries a bitset.** `derive_shard_column_stats` emits one
+    ///   for *every* shard of an indexed categorical — including an all-zero one
+    ///   where the column has no values there — so a missing bitset means the
+    ///   build that produced this vocabulary never saw that shard. This is what
+    ///   `append` without `--index-obs` leaves behind: the appended CSR shards
+    ///   carry no `column_stats` at all.
+    /// - **It is a `CategoryBitset`, not just *some* stat with this hash.**
+    ///   `ColumnStat::column_name_hash` answers for `MinMax` too, so testing the
+    ///   hash alone lets a numeric stat license a categorical vocabulary.
+    /// - **Its length is the one this vocabulary implies**, consistently across
+    ///   shards. `derive_shard_column_stats` sizes every bitset
+    ///   `entries.len().div_ceil(8)` from the same entry list the dictionary
+    ///   comes from, so a disagreement means the stats and the index section
+    ///   were produced by different builds — and then bit *i* does not mean
+    ///   entry *i*.
+    /// - **No shard carries it twice.** `shards` counts distinct shards, so the
+    ///   count alone cannot distinguish "both shards covered" from "one shard
+    ///   covered twice, the other not at all" — and it is the uncovered shard
+    ///   that the vocabulary would then be claiming to describe. A repeat is
+    ///   also unresolvable on its own terms: nothing says which of the two
+    ///   bitsets the dictionary's bit positions belong to.
+    ///
+    /// The last three matter at **Level-2** especially. Level-1 declines a
+    /// mismatched bitset per shard (`pushdown::bitset_matches_dictionary`) and
+    /// never prunes a shard that has no stats at all, but Level-2 does not look
+    /// at bitsets: it asks only whether the column is usable and then treats
+    /// `categorical_eq` as exact. Folding these conditions in here is what makes
+    /// a mismatched, wrong-variant or unevenly-covered column residual at
+    /// Level-2 rather than authoritative.
+    ///
+    /// An empty shard list is never complete: with nothing to check against, a
+    /// coverage claim would be vacuous.
+    fn covers(&self, n_shards: usize, n_values: usize) -> bool {
+        n_shards > 0
+            && self.consistent
+            && !self.duplicated
+            && self.shards == n_shards
+            && self.len == n_values.div_ceil(8)
+    }
+}
+
+/// One pass over `pruned_shards`, recording each column's `CategoryBitset`
+/// coverage. See [`BitsetCoverage`] for why this is a pass rather than a query.
+///
+/// `seen_here` is what keeps [`BitsetCoverage::shards`] a count of *shards*
+/// rather than of stat records: a column met twice within one shard is recorded
+/// as duplicated instead of counted twice.
+fn collect_bitset_coverage(pruned_shards: &[&FullCatalogEntry]) -> HashMap<u64, BitsetCoverage> {
+    let mut coverage: HashMap<u64, BitsetCoverage> = HashMap::new();
+    let mut seen_here: HashSet<u64> = HashSet::new();
+    for entry in pruned_shards {
+        let Some(stats) = entry.stats.as_ref() else {
+            continue;
+        };
+        seen_here.clear();
+        for cs in &stats.column_stats {
+            if let scx_format_io::catalog::ColumnStat::CategoryBitset {
+                column_name_hash,
+                bitset,
+            } = cs
+            {
+                let cov = coverage.entry(*column_name_hash).or_default();
+                if seen_here.insert(*column_name_hash) {
+                    cov.observe(bitset.len());
+                } else {
+                    cov.mark_duplicated();
+                }
+            }
+        }
+    }
+    coverage
 }
 
 // ============================================================================
@@ -729,6 +888,7 @@ fn try_rowset_mask(
         index,
         shard_row_ranges: &csr_shard_ranges,
         n_obs: n_obs as u64,
+        category_dicts: &plan.category_dicts,
     };
     let (indexed, residual) = partition_obs_predicates(&plan.obs_predicates, &ctx);
     // Nothing resolved from the index (including a no-filter query) → legacy
@@ -2193,6 +2353,234 @@ mod tests {
             x_decode_count(&pipeline),
             1,
             "limit(1) must decode only the first X shard, not all {MS_SHARDS}"
+        );
+    }
+
+    /// The over-fix guard, end to end: a file written by the normal conversion
+    /// path must still be recognised as carrying a complete vocabulary, and a
+    /// filter naming a value the file does not contain must still short-circuit
+    /// without reading a single obs shard.
+    ///
+    /// Gating the short-circuit on completeness is only worth doing if
+    /// completeness is the ordinary case. If this goes red, the guard has
+    /// turned every miss on every file into a full obs scan.
+    #[test]
+    fn a_converted_file_carries_a_complete_vocabulary_and_still_short_circuits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_indexed_multishard_file(&dir);
+
+        let pipeline = QueryPipeline::open(&path)
+            .unwrap()
+            .filter_obs("cell_type == 'Z'")
+            .unwrap();
+        let plan = build_plan(&pipeline).unwrap();
+        let dict = plan
+            .category_dicts
+            .get(&scx_format_io::column_name_hash("cell_type"))
+            .expect("cell_type is indexed");
+        assert!(
+            dict.complete,
+            "every CSR shard of a freshly converted file carries the column's \
+             CategoryBitset, so its vocabulary is the complete value set"
+        );
+
+        let pm = plan_and_mask(&pipeline).unwrap();
+        assert_eq!(
+            pm.skipped_shards, MS_SHARDS,
+            "'Z' is absent from a complete vocabulary → prune every shard"
+        );
+        assert_eq!(pm.matched_rows, 0);
+    }
+
+    /// The catalog-derived signal itself.
+    ///
+    /// `derive_shard_column_stats` emits a `CategoryBitset` for *every* shard of
+    /// an indexed categorical column — an all-zero one where the column has no
+    /// values in that shard — so a shard without one was never seen by the
+    /// build that produced the vocabulary. That is what `append` without
+    /// `--index-obs` leaves behind.
+    #[test]
+    fn a_shard_without_the_columns_bitset_makes_the_vocabulary_incomplete() {
+        use scx_format_io::catalog::{ColumnStat, FullCatalogEntry, ShardStats};
+        use scx_format_io::section::SectionType;
+
+        let hash = scx_format_io::column_name_hash("cell_type");
+        let shard = |column_stats: Vec<ColumnStat>| FullCatalogEntry {
+            name: "X_shard".to_string(),
+            offset: 4352,
+            length: 10,
+            section_type: SectionType::CsrShard,
+            checksum: [0; 32],
+            modality_id: 0,
+            stats: Some(ShardStats {
+                row_start: 0,
+                row_end: 10,
+                col_start: 0,
+                col_end: 0,
+                nnz: 1,
+                value_min: 1,
+                value_max: 1,
+                value_sum: 1,
+                n_indexed_columns: column_stats.len() as u8,
+                column_stats,
+            }),
+        };
+        let bitset = || ColumnStat::CategoryBitset {
+            column_name_hash: hash,
+            bitset: vec![0b0000_0001],
+        };
+
+        let indexed = shard(vec![bitset()]);
+        let appended = shard(Vec::new());
+        // A shard carrying stats for some *other* indexed column is just as
+        // uncovered for this one.
+        let other_column = shard(vec![ColumnStat::CategoryBitset {
+            column_name_hash: scx_format_io::column_name_hash("tissue"),
+            bitset: vec![0b0000_0001],
+        }]);
+        // `ColumnStat::column_name_hash` answers for `MinMax` too, so a numeric
+        // stat under this column's hash satisfies a hash-only test — and would
+        // let a numeric column license a categorical vocabulary.
+        let numeric_stat = shard(vec![ColumnStat::MinMax {
+            column_name_hash: hash,
+            min: 0.0,
+            max: 1.0,
+        }]);
+        // Sized for a nine-value vocabulary: a different index build.
+        let wrong_len = shard(vec![ColumnStat::CategoryBitset {
+            column_name_hash: hash,
+            bitset: vec![0b0000_0001, 0b0000_0000],
+        }]);
+
+        // One value → one byte, which is what `bitset()` carries.
+        let complete = |shards: &[&FullCatalogEntry], n_values: usize| {
+            collect_bitset_coverage(shards)
+                .get(&hash)
+                .is_some_and(|c| c.covers(shards.len(), n_values))
+        };
+
+        assert!(complete(&[&indexed, &indexed], 1));
+        assert!(
+            !complete(&[&indexed, &appended], 1),
+            "the appended shard was never seen by the index build"
+        );
+        assert!(!complete(&[&other_column], 1));
+        assert!(
+            !complete(&[&numeric_stat], 1),
+            "a MinMax stat is not evidence that a categorical vocabulary is complete"
+        );
+        assert!(
+            !complete(&[&wrong_len], 1),
+            "a bitset sized for another vocabulary means the stats and the index \
+             section came from different builds"
+        );
+        assert!(
+            !complete(&[&indexed, &wrong_len], 1),
+            "one disagreeing shard is enough — bit i no longer means entry i"
+        );
+        assert!(
+            !complete(&[&indexed], 9),
+            "nine values need two bytes; this shard carries one"
+        );
+        assert!(
+            !complete(&[], 1),
+            "with nothing to check against, a coverage claim is vacuous"
+        );
+
+        // Counting stat *records* rather than distinct shards lets one shard's
+        // surplus pay for another shard's absence. Two bitsets under the hash on
+        // shard A and none on shard B still totals two — and shard B, which
+        // nothing covers, is what the vocabulary would then be claiming to
+        // describe. `&[&indexed, &indexed]` above does not catch this: it
+        // repeats an entry *reference*, which is two shards each carrying one.
+        let doubled = shard(vec![bitset(), bitset()]);
+        assert!(
+            !complete(&[&doubled, &appended], 1),
+            "a duplicate bitset in one shard must not stand in for a shard that \
+             carries none"
+        );
+        assert!(
+            !complete(&[&doubled, &indexed], 1),
+            "two bitsets for one column in a single shard is a malformed \
+             catalog, not extra evidence"
+        );
+    }
+
+    /// Proof that *which* modality's shards you scan is load-bearing.
+    ///
+    /// `csr_shards_for_modality(0)` filters to modality 0 — it is **not** the
+    /// flattened all-modality list, though the test that appears to prove it
+    /// (`csr_shards_for_modality_0_matches_shards_sorted_single_modality`) is a
+    /// single-modality fixture. On a multimodal catalog the two lists give
+    /// opposite verdicts, which is what this pins.
+    ///
+    /// ⚠️ **It does not guard `build_plan`'s call site.** It scans the modality
+    /// itself rather than going through `build_plan`, so reverting that call to
+    /// a hardcoded `0` would leave this green. Closing that needs a multimodal
+    /// fixture file with a predicate index; what this test buys is that the
+    /// argument matters at all, so the revert would be a behaviour change
+    /// rather than a no-op.
+    #[test]
+    fn completeness_follows_the_queried_modality_not_modality_zero() {
+        use scx_format_io::catalog::{ColumnStat, FullCatalog, FullCatalogEntry, ShardStats};
+        use scx_format_io::section::SectionType;
+
+        let hash = scx_format_io::column_name_hash("cell_type");
+        let shard =
+            |modality_id: u8, row_start: u64, column_stats: Vec<ColumnStat>| FullCatalogEntry {
+                name: format!("X_shard_m{modality_id}_{row_start}"),
+                offset: 4352 + row_start,
+                length: 10,
+                section_type: SectionType::CsrShard,
+                checksum: [0; 32],
+                modality_id,
+                stats: Some(ShardStats {
+                    row_start,
+                    row_end: row_start + 10,
+                    col_start: 0,
+                    col_end: 0,
+                    nnz: 1,
+                    value_min: 1,
+                    value_max: 1,
+                    value_sum: 1,
+                    n_indexed_columns: column_stats.len() as u8,
+                    column_stats,
+                }),
+            };
+        let bitset = vec![ColumnStat::CategoryBitset {
+            column_name_hash: hash,
+            bitset: vec![0b0000_0001],
+        }];
+
+        // Modality 0 is fully indexed; modality 1's shards carry no stats.
+        let catalog = FullCatalog {
+            catalog_version: scx_format_io::CURRENT_CATALOG_VERSION,
+            manifest_sequence: 1,
+            prev_catalog_offset: 0,
+            n_obs: 20,
+            entries: vec![
+                shard(0, 0, bitset.clone()),
+                shard(0, 10, bitset.clone()),
+                shard(1, 0, Vec::new()),
+                shard(1, 10, Vec::new()),
+            ],
+            data_generation: 0,
+            csc_build_generation: 0,
+        };
+
+        let covers = |modality_id: u8| {
+            let shards = scan_shards(&catalog, modality_id);
+            collect_bitset_coverage(&shards)
+                .get(&hash)
+                .is_some_and(|c| c.covers(shards.len(), 1))
+        };
+
+        assert!(covers(0), "modality 0's shards are all indexed");
+        assert!(
+            !covers(1),
+            "a modality-1 query must judge completeness over modality 1's \
+             shards — reading modality 0's would license pruning shards nothing \
+             was checked against"
         );
     }
 
