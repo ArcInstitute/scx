@@ -3,7 +3,7 @@
 // Ties together pushdown, decode, projection, filtering, and fused operations
 // to execute a QueryPipeline. Called by `QueryPipeline::collect()`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use arrow::array::{Array, RecordBatch, UInt32Array};
@@ -231,7 +231,7 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
 /// in this list corresponds to the bit position in `CategoryBitset`.
 ///
 /// Each dictionary also carries whether its vocabulary may be trusted as the
-/// column's **complete** value set — see [`category_vocabulary_is_complete`].
+/// column's **complete** value set — see [`BitsetCoverage::covers`].
 /// Level-1 needs that bit before it may read a dictionary miss as proof the
 /// value exists in no shard.
 ///
@@ -239,9 +239,8 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
 /// [`prune_shards_by_catalog_with_dict`] — the same modality. Completeness is a
 /// statement about *those* shards, so judging it over any other set would
 /// license pruning shards nothing was checked against. Note this is **not**
-/// the index's `shard_id` space: the test is per-catalog-entry ("does this
-/// shard carry a `CategoryBitset` for this column hash"), and never resolves a
-/// shard id.
+/// the index's `shard_id` space: the evidence is per-catalog-entry (see
+/// [`collect_bitset_coverage`]) and never resolves a shard id.
 fn build_category_dicts(
     index: &Option<PredicateIndex>,
     pruned_shards: &[&FullCatalogEntry],
@@ -279,15 +278,26 @@ fn build_category_dicts(
 /// is O(shards × stats) regardless of how many columns are indexed.
 #[derive(Debug, Default)]
 struct BitsetCoverage {
-    /// Shards carrying a `CategoryBitset` for this column.
+    /// **Distinct shards** carrying a `CategoryBitset` for this column — not
+    /// the number of such stat records. The two differ exactly when one shard
+    /// carries the column twice, and counting records would then let that
+    /// shard's surplus pay for another shard's absence.
     shards: usize,
     /// Byte length of the first bitset seen.
     len: usize,
     /// Cleared once two shards disagree about that length.
     consistent: bool,
+    /// Set when one shard carried this column more than once. A malformed
+    /// catalog, not extra evidence: nothing says which of the two bitsets the
+    /// dictionary's bit positions belong to.
+    duplicated: bool,
 }
 
 impl BitsetCoverage {
+    /// Record one shard's bitset for this column. Call **at most once per
+    /// shard** — [`collect_bitset_coverage`] routes a repeat to
+    /// [`Self::mark_duplicated`] instead, which is what keeps `shards` a shard
+    /// count rather than a record count.
     fn observe(&mut self, len: usize) {
         if self.shards == 0 {
             self.len = len;
@@ -298,10 +308,14 @@ impl BitsetCoverage {
         self.shards += 1;
     }
 
+    fn mark_duplicated(&mut self) {
+        self.duplicated = true;
+    }
+
     /// Whether this column's vocabulary of `n_values` may be trusted as the
     /// complete value set over `n_shards` shards.
     ///
-    /// Three conditions, and each rules out a way the catalog and the index
+    /// Four conditions, and each rules out a way the catalog and the index
     /// section can disagree:
     ///
     /// - **Every shard carries a bitset.** `derive_shard_column_stats` emits one
@@ -319,19 +333,27 @@ impl BitsetCoverage {
     ///   comes from, so a disagreement means the stats and the index section
     ///   were produced by different builds — and then bit *i* does not mean
     ///   entry *i*.
+    /// - **No shard carries it twice.** `shards` counts distinct shards, so the
+    ///   count alone cannot distinguish "both shards covered" from "one shard
+    ///   covered twice, the other not at all" — and it is the uncovered shard
+    ///   that the vocabulary would then be claiming to describe. A repeat is
+    ///   also unresolvable on its own terms: nothing says which of the two
+    ///   bitsets the dictionary's bit positions belong to.
     ///
-    /// The last two matter at **Level-2** especially. Level-1 declines a
-    /// mismatched bitset per shard ([`bitset_matches_dictionary`]), but Level-2
-    /// never looks at bitsets: it asks only whether the column is usable and
-    /// then treats `categorical_eq` as exact. Folding both conditions in here is
-    /// what makes a mismatched or wrong-variant column residual at Level-2
-    /// rather than authoritative.
+    /// The last three matter at **Level-2** especially. Level-1 declines a
+    /// mismatched bitset per shard (`pushdown::bitset_matches_dictionary`) and
+    /// never prunes a shard that has no stats at all, but Level-2 does not look
+    /// at bitsets: it asks only whether the column is usable and then treats
+    /// `categorical_eq` as exact. Folding these conditions in here is what makes
+    /// a mismatched, wrong-variant or unevenly-covered column residual at
+    /// Level-2 rather than authoritative.
     ///
     /// An empty shard list is never complete: with nothing to check against, a
     /// coverage claim would be vacuous.
     fn covers(&self, n_shards: usize, n_values: usize) -> bool {
         n_shards > 0
             && self.consistent
+            && !self.duplicated
             && self.shards == n_shards
             && self.len == n_values.div_ceil(8)
     }
@@ -339,22 +361,30 @@ impl BitsetCoverage {
 
 /// One pass over `pruned_shards`, recording each column's `CategoryBitset`
 /// coverage. See [`BitsetCoverage`] for why this is a pass rather than a query.
+///
+/// `seen_here` is what keeps [`BitsetCoverage::shards`] a count of *shards*
+/// rather than of stat records: a column met twice within one shard is recorded
+/// as duplicated instead of counted twice.
 fn collect_bitset_coverage(pruned_shards: &[&FullCatalogEntry]) -> HashMap<u64, BitsetCoverage> {
     let mut coverage: HashMap<u64, BitsetCoverage> = HashMap::new();
+    let mut seen_here: HashSet<u64> = HashSet::new();
     for entry in pruned_shards {
         let Some(stats) = entry.stats.as_ref() else {
             continue;
         };
+        seen_here.clear();
         for cs in &stats.column_stats {
             if let scx_format_io::catalog::ColumnStat::CategoryBitset {
                 column_name_hash,
                 bitset,
             } = cs
             {
-                coverage
-                    .entry(*column_name_hash)
-                    .or_default()
-                    .observe(bitset.len());
+                let cov = coverage.entry(*column_name_hash).or_default();
+                if seen_here.insert(*column_name_hash) {
+                    cov.observe(bitset.len());
+                } else {
+                    cov.mark_duplicated();
+                }
             }
         }
     }
@@ -2455,6 +2485,24 @@ mod tests {
         assert!(
             !complete(&[], 1),
             "with nothing to check against, a coverage claim is vacuous"
+        );
+
+        // Counting stat *records* rather than distinct shards lets one shard's
+        // surplus pay for another shard's absence. Two bitsets under the hash on
+        // shard A and none on shard B still totals two — and shard B, which
+        // nothing covers, is what the vocabulary would then be claiming to
+        // describe. `&[&indexed, &indexed]` above does not catch this: it
+        // repeats an entry *reference*, which is two shards each carrying one.
+        let doubled = shard(vec![bitset(), bitset()]);
+        assert!(
+            !complete(&[&doubled, &appended], 1),
+            "a duplicate bitset in one shard must not stand in for a shard that \
+             carries none"
+        );
+        assert!(
+            !complete(&[&doubled, &indexed], 1),
+            "two bitsets for one column in a single shard is a malformed \
+             catalog, not extra evidence"
         );
     }
 
