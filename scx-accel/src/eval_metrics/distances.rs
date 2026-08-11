@@ -1,13 +1,39 @@
 //! Shared pairwise distance kernels for evaluation metrics.
 //!
-//! Provides point-to-point distance functions (Euclidean, L1, cosine) and
-//! streaming mean pairwise distance computation that avoids materializing
-//! the full `[N, N]` distance matrix — computing the running sum instead.
+//! Provides point-to-point distance functions (Euclidean, L1, cosine) and mean
+//! pairwise distance computation that never materialises the full `[N, N]`
+//! distance matrix — the reduction keeps one `f64` per row of `a` and nothing
+//! else.
 //!
-//! For Euclidean and cosine metrics, a faer-backed gemm path is available
-//! that materialises the `[N_A, N_B]` Gram matrix in one BLAS-level call
-//! and expands it to distances. This is much faster than the row-by-row
-//! scalar path on dense, low-dimensional embeddings (e.g. PCA outputs).
+//! For Euclidean and cosine metrics a faer-backed gemm path is available, which
+//! is much faster than the row-by-row scalar path on dense, low-dimensional
+//! embeddings (e.g. PCA outputs). It does need a Gram, `a·bᵀ`, and that is the
+//! allocation this module's budget governs.
+//!
+//! # Working set
+//!
+//! The Gram is built **one row block of `a` at a time**, sized by
+//! [`crate::mem_budget::plan_gram_row_block`] against
+//! `SCX_ACCEL_PAIRWISE_MEMORY_BUDGET` (default 256 MiB), and reduced before the
+//! next block overwrites it — rather than as `n_a · n_b · size_of::<F>()`, which
+//! at the 100 K control cells `energy_distance` is documented for, on its
+//! default `dtype="f32"`, is 40 GB. An input whose whole Gram already fits the
+//! budget is a single block, i.e. exactly the unblocked computation.
+//!
+//! Stated exactly, because the knob is a tuning surface:
+//!
+//! - The Gram block is `max(budget, one Gram row)`. The planner never returns a
+//!   zero-row block, so a single row wider than the budget still gets one — the
+//!   floor that guarantees progress rather than an error.
+//! - **Cosine allocates outside the budget.** `normalize_rows` materialises a
+//!   full `n_a · n_dims` copy, plus `n_b · n_dims` when `a` and `b` differ — at
+//!   100 K × 2000 f32 that is ~800 MB for a self-distance and ~1.6 GB for a
+//!   cross. Lowering the budget does not touch it. Euclidean keeps only the
+//!   `O(n)` f64 row-norm buffers.
+//! - `compute_energy_distance` evaluates perturbations on a rayon `par_iter`, so
+//!   up to `rayon::current_num_threads()` of everything above is live at once,
+//!   and its `extract_group_rows_indexed` copies each group's rows per task
+//!   independently of anything here.
 //!
 //! Both kernels are generic over [`PairwiseFloat`] (`f32` or `f64`).
 //! Reductions always accumulate in `f64` regardless of the input precision,
@@ -217,13 +243,59 @@ fn point_distance_generic<F: PairwiseFloat>(
     }
 }
 
-/// Compute per-row distance sums for `(a, b)` via faer's gemm.
+/// Which pairs the gemm driver reduces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GemmShape {
+    /// Every row of `a` against every row of `b`. `row_sums[i] = Σ_j d(a_i, b_j)`.
+    Cross,
+    /// `a` and `b` are the same buffer and only the strict upper triangle is
+    /// summed: `row_sums[i] = Σ_{j>i} d(a_i, a_j)`, using the same convention
+    /// the scalar self path uses. Always half the expansion of `Cross`; half the
+    /// *gemm* only once blocked (see `mean_pairwise_distance_self`).
+    UpperTriangle,
+}
+
+/// Squared row norms of a `[n × n_dims]` row-major matrix, in `f64`.
 ///
-/// Returns a `Vec<f64>` of length `n_a` where `row_sums[i] = sum_j d(a_i, b_j)`.
-/// The reduction is deterministic in row order (sequential per-row sum), but
-/// the matmul itself uses faer's parallel `Par::rayon(0)` and is not strictly
-/// bit-deterministic across thread counts (results agree within floating-point
-/// rounding, well below the `atol=1e-4` parity tolerance).
+/// Widened from `F` so an f32 input does not lose the norm to accumulation
+/// error on long rows.
+///
+/// This one keeps its `with_min_len`, unlike the four the distance loops used
+/// to carry: each item here is only `O(n_dims)` work, so a floor genuinely damps
+/// per-task overhead — and 64 sits *below* the iterator length at any size worth
+/// parallelising, so it never forbids splitting outright.
+fn row_sq_norms<F: PairwiseFloat>(data: &[F], n: usize, n_dims: usize) -> Vec<f64> {
+    // `par_chunks_exact` panics on a zero chunk size, and `n_dims == 0` reaches
+    // here from the public entry points (only `n_a == 0 || n_b == 0` short-
+    // circuits). A zero-width row has a zero norm — which is what the previous
+    // `(0..n).map(|i| data[i*0..(i+1)*0].sum())` produced — so answer that
+    // directly rather than letting the chunker reject it.
+    if n_dims == 0 {
+        return vec![0.0; n];
+    }
+    data[..n * n_dims]
+        .par_chunks_exact(n_dims)
+        .with_min_len(64)
+        .map(|row| {
+            row.iter()
+                .map(|&x| {
+                    let xf = x.as_f64();
+                    xf * xf
+                })
+                .sum::<f64>()
+        })
+        .collect()
+}
+
+/// Compute per-row distance sums for `(a, b)` via faer's gemm, **blocking the
+/// rows of `a`** so the Gram never exists in full.
+///
+/// Returns a `Vec<f64>` of length `n_a`. The Gram is only ever read by a
+/// per-row reduction and nothing downstream needs a second row, so it is
+/// materialised one row block at a time: `block_rows × n_b` elements sized to
+/// `budget` by [`crate::mem_budget::plan_gram_row_block`], reduced, then
+/// overwritten by the next block. An input whose whole Gram fits the budget is
+/// one block, i.e. exactly the unblocked computation.
 ///
 /// `metric` must be `Euclidean` or `Cosine`; `L1` has no gemm formulation.
 ///
@@ -231,6 +303,16 @@ fn point_distance_generic<F: PairwiseFloat>(
 /// gemm — the throughput win that motivates the f32 path) but the row-norm² and
 /// final distance expansion always run in `f64`, so the reduction stays tight
 /// against the `atol=1e-4` parity bound regardless of input precision.
+///
+/// The *reduction* order is unchanged by the blocking: each `row_sums[i]` is an
+/// independent serial sum over ascending `j`, and the caller reduces the vector
+/// in ascending `i`. What does move is the Gram's own last bits — the matmul
+/// still runs under `Par::rayon(0)`, which was never bit-stable across thread
+/// counts, and a block changes its `m` dimension, so faer blocks it differently.
+/// Both are the same class of drift and both stay well below the `atol=1e-4`
+/// parity tolerance; an input inside the budget is one block and so is
+/// bit-identical to the unblocked kernel.
+#[allow(clippy::too_many_arguments)]
 fn pairwise_gemm_row_sums<F: PairwiseFloat>(
     a: &[F],
     b: &[F],
@@ -238,113 +320,136 @@ fn pairwise_gemm_row_sums<F: PairwiseFloat>(
     n_b: usize,
     n_dims: usize,
     metric: DistanceMetric,
+    shape: GemmShape,
+    budget: u64,
 ) -> Vec<f64> {
     debug_assert!(matches!(
         metric,
         DistanceMetric::Euclidean | DistanceMetric::Cosine
     ));
+    debug_assert!(
+        shape == GemmShape::Cross || (std::ptr::eq(a, b) && n_a == n_b),
+        "UpperTriangle requires `a` and `b` to be the same buffer"
+    );
 
     // For cosine, work on row-normalized copies. Then cosine distance is
     // simply `1 - (Ã · B̃ᵀ)[i,j]`. Zero-norm rows are left as zeros; their
     // dot product with anything is 0, giving distance 1.0 (matches the
-    // scalar `cosine_distance` semantics).
-    let (a_buf, b_buf, a_ref, b_ref);
-    let (a_view, b_view) = match metric {
-        DistanceMetric::Cosine => {
-            a_buf = normalize_rows(a, n_a, n_dims);
-            b_buf = normalize_rows(b, n_b, n_dims);
-            a_ref = MatRef::<F>::from_row_major_slice(&a_buf, n_a, n_dims);
-            b_ref = MatRef::<F>::from_row_major_slice(&b_buf, n_b, n_dims);
-            (a_ref, b_ref)
-        }
-        DistanceMetric::Euclidean => {
-            let a_ref = MatRef::<F>::from_row_major_slice(a, n_a, n_dims);
-            let b_ref = MatRef::<F>::from_row_major_slice(b, n_b, n_dims);
-            (a_ref, b_ref)
-        }
-        DistanceMetric::L1 => unreachable!("L1 is not supported for gemm path"),
+    // scalar `cosine_distance` semantics). A self-distance passes the same
+    // slice twice, so normalize it once and alias — the same `ptr::eq` check
+    // `scx_gpu::gpu_mean_pairwise_distance` makes, and at 100 K × 2000 dims it
+    // is an 800 MB copy not made.
+    //
+    // `n_a == n_b` is part of the test, not redundant with `ptr::eq`: a caller
+    // may legally pass the same buffer with different row counts (`(a, a, 3,
+    // 5)` = the first 3 rows against the first 5), and aliasing there would
+    // index the shorter side's norms out of bounds.
+    let is_self = std::ptr::eq(a, b) && n_a == n_b;
+    let cosine = metric == DistanceMetric::Cosine;
+    let a_norm: Option<Vec<F>> = cosine.then(|| normalize_rows(a, n_a, n_dims));
+    let b_norm: Option<Vec<F>> = (cosine && !is_self).then(|| normalize_rows(b, n_b, n_dims));
+    let a_data: &[F] = a_norm.as_deref().unwrap_or(a);
+    let b_data: &[F] = b_norm.as_deref().or(a_norm.as_deref()).unwrap_or(b);
+
+    // Squared row norms (Euclidean only). O(n) next to the O(n_a·n_b·n_dims)
+    // main work, so they are computed once over the whole input rather than
+    // per block. Aliased for a self-distance.
+    let (a_sq, b_sq_owned) = match metric {
+        DistanceMetric::Euclidean => (
+            row_sq_norms(a_data, n_a, n_dims),
+            if is_self {
+                None
+            } else {
+                Some(row_sq_norms(b_data, n_b, n_dims))
+            },
+        ),
+        _ => (Vec::new(), None),
     };
+    let b_sq: &[f64] = b_sq_owned.as_deref().unwrap_or(&a_sq);
 
-    // Compute the Gram as `B · Aᵀ` of shape `(n_b, n_a)` rather than
-    // `A · Bᵀ` of shape `(n_a, n_b)`. faer's `Mat` is column-major, so the
-    // inner reduction loop (fixed `i`, varying `j`) walks down a single
-    // column — contiguous access. The transposed layout gives the same
-    // values: `(B·Aᵀ)[j, i] = b_j · a_i = (A·Bᵀ)[i, j]`.
-    let mut gram = Mat::<F>::zeros(n_b, n_a);
-    matmul(
-        gram.as_mut(),
-        faer::Accum::Replace,
-        b_view,
-        a_view.transpose(),
-        F::one(),
-        faer::Par::rayon(0),
-    );
+    let block_rows =
+        crate::mem_budget::plan_gram_row_block(n_a, n_b, std::mem::size_of::<F>(), budget);
 
-    match metric {
-        DistanceMetric::Euclidean => {
-            // Precompute squared row norms in f64 (widening from F as needed).
-            let a_sq: Vec<f64> = (0..n_a)
-                .into_par_iter()
-                .with_min_len(64)
-                .map(|i| {
-                    let row = &a[i * n_dims..(i + 1) * n_dims];
-                    row.iter()
-                        .map(|&x| {
-                            let xf = x.as_f64();
-                            xf * xf
-                        })
-                        .sum::<f64>()
-                })
-                .collect();
-            let b_sq: Vec<f64> = (0..n_b)
-                .into_par_iter()
-                .with_min_len(64)
-                .map(|j| {
-                    let row = &b[j * n_dims..(j + 1) * n_dims];
-                    row.iter()
-                        .map(|&x| {
-                            let xf = x.as_f64();
-                            xf * xf
-                        })
-                        .sum::<f64>()
-                })
-                .collect();
+    // One buffer for every block, reused. `Accum::Replace` overwrites it, so it
+    // never needs clearing — and allocating per block would memset the entire
+    // `n_a × n_b` product over the run, which is the cost the blocking exists to
+    // avoid. Sized for the widest block either shape asks for: `n_b` rows for
+    // `Cross`, and for `UpperTriangle` the first block's extent, also `n_b`.
+    let mut gram = Mat::<F>::zeros(n_b, block_rows);
+    let mut row_sums = vec![0.0f64; n_a];
 
-            (0..n_a)
-                .into_par_iter()
-                .with_min_len((n_b * 16).max(1))
-                .map(|i| {
-                    let ai_sq = a_sq[i];
-                    let mut row_sum = 0.0f64;
-                    for j in 0..n_b {
-                        // `gram[(j, i)]` walks down column `i` of the
-                        // column-major matrix — contiguous in memory.
-                        // max(0, ·) clamps tiny negatives from FP cancellation
-                        // for near-identical rows.
-                        let g = gram[(j, i)].as_f64();
-                        let d_sq = (ai_sq + b_sq[j] - 2.0 * g).max(0.0);
-                        row_sum += d_sq.sqrt();
-                    }
-                    row_sum
-                })
-                .collect()
-        }
-        DistanceMetric::Cosine => (0..n_a)
-            .into_par_iter()
-            .with_min_len((n_b * 16).max(1))
-            .map(|i| {
+    let mut a0 = 0usize;
+    while a0 < n_a {
+        let a1 = (a0 + block_rows).min(n_a);
+        let rows = a1 - a0;
+        // Which rows of `b` this block needs. `Cross` touches all of them;
+        // `UpperTriangle` needs only `j >= a0` — the narrowing that removes the
+        // symmetric half of the work as the blocks advance.
+        let (b0, extent) = match shape {
+            GemmShape::Cross => (0usize, n_b),
+            GemmShape::UpperTriangle => (a0, n_b - a0),
+        };
+
+        // Compute the Gram block as `B · A_blockᵀ` of shape `(extent, rows)`
+        // rather than `A_block · Bᵀ`. faer's `Mat` is column-major, so the
+        // inner reduction loop (fixed row, varying `j`) walks down a single
+        // column — contiguous access. The transposed layout gives the same
+        // values: `(B·Aᵀ)[j, i] = b_j · a_i = (A·Bᵀ)[i, j]`.
+        let a_block =
+            MatRef::<F>::from_row_major_slice(&a_data[a0 * n_dims..a1 * n_dims], rows, n_dims);
+        let b_block = MatRef::<F>::from_row_major_slice(
+            &b_data[b0 * n_dims..(b0 + extent) * n_dims],
+            extent,
+            n_dims,
+        );
+        matmul(
+            gram.as_mut().submatrix_mut(0, 0, extent, rows),
+            faer::Accum::Replace,
+            b_block,
+            a_block.transpose(),
+            F::one(),
+            faer::Par::rayon(0),
+        );
+
+        let g = gram.as_ref().submatrix(0, 0, extent, rows);
+        row_sums[a0..a1]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(t, slot)| {
+                // Local column `t` of the block is global row `a0 + t`; local
+                // Gram row `jl` is global `b` row `b0 + jl`. For the triangle,
+                // `b0 == a0`, so `j > i` is exactly `jl > t`.
+                let j_start = match shape {
+                    GemmShape::Cross => 0,
+                    GemmShape::UpperTriangle => t + 1,
+                };
                 let mut row_sum = 0.0f64;
-                for j in 0..n_b {
-                    // `gram[(j, i)]` is contiguous along `j` (column-major).
-                    // Clamp to [0, 2] to match scalar cosine_distance behavior.
-                    let d = (1.0 - gram[(j, i)].as_f64()).clamp(0.0, 2.0);
-                    row_sum += d;
+                match metric {
+                    DistanceMetric::Euclidean => {
+                        let ai_sq = a_sq[a0 + t];
+                        for jl in j_start..extent {
+                            // max(0, ·) clamps tiny negatives from FP
+                            // cancellation for near-identical rows.
+                            let gv = g[(jl, t)].as_f64();
+                            let d_sq = (ai_sq + b_sq[b0 + jl] - 2.0 * gv).max(0.0);
+                            row_sum += d_sq.sqrt();
+                        }
+                    }
+                    DistanceMetric::Cosine => {
+                        for jl in j_start..extent {
+                            // Clamp to [0, 2] to match scalar cosine_distance.
+                            row_sum += (1.0 - g[(jl, t)].as_f64()).clamp(0.0, 2.0);
+                        }
+                    }
+                    DistanceMetric::L1 => unreachable!(),
                 }
-                row_sum
-            })
-            .collect(),
-        DistanceMetric::L1 => unreachable!(),
+                *slot = row_sum;
+            });
+
+        a0 = a1;
     }
+
+    row_sums
 }
 
 /// Allocate a row-normalized copy of `[n_rows × n_dims]` row-major matrix.
@@ -355,6 +460,13 @@ fn pairwise_gemm_row_sums<F: PairwiseFloat>(
 /// many large entries; the inverse-norm scaling is then narrowed back to `F`
 /// before applying to each element.
 fn normalize_rows<F: PairwiseFloat>(data: &[F], n_rows: usize, n_dims: usize) -> Vec<F> {
+    // `par_chunks_mut` panics on a zero chunk size. Zero-width rows have nothing
+    // to normalize and the output is empty either way. (This one predates the
+    // blocking work — `row_sq_norms` grew the same edge in the round-1 cleanup,
+    // and the test that covers both found this on its way past.)
+    if n_dims == 0 {
+        return Vec::new();
+    }
     let mut out = vec![F::from_f64(0.0); n_rows * n_dims];
     out.par_chunks_mut(n_dims)
         .enumerate()
@@ -408,6 +520,36 @@ pub fn mean_pairwise_distance<F: PairwiseFloat>(
     metric: DistanceMetric,
     backend: DistanceBackend,
 ) -> crate::Result<f64> {
+    mean_pairwise_distance_with_budget(
+        a,
+        b,
+        n_a,
+        n_b,
+        n_dims,
+        metric,
+        backend,
+        crate::mem_budget::pairwise_memory_budget(),
+    )
+}
+
+/// [`mean_pairwise_distance`] with the Gram block budget injected rather than
+/// read from the env.
+///
+/// The public entry reads `SCX_ACCEL_PAIRWISE_MEMORY_BUDGET` through a
+/// `OnceLock`, which a test setting the env var would race into whichever test
+/// ran first. Taking the budget as an argument lets the tests below force a
+/// block count directly. Same shim shape as `mem_budget`'s own tests.
+#[allow(clippy::too_many_arguments)]
+fn mean_pairwise_distance_with_budget<F: PairwiseFloat>(
+    a: &[F],
+    b: &[F],
+    n_a: usize,
+    n_b: usize,
+    n_dims: usize,
+    metric: DistanceMetric,
+    backend: DistanceBackend,
+    budget: u64,
+) -> crate::Result<f64> {
     if n_a == 0 || n_b == 0 {
         return Ok(0.0);
     }
@@ -423,14 +565,19 @@ pub fn mean_pairwise_distance<F: PairwiseFloat>(
     // `Vec<f64>` row-sum buffer costs O(n_a) transient memory — trivial
     // vs. the O(n_a * n_b * n_dims) inner work.
     //
-    // `with_min_len(n_b * 16)` prevents oversubscription when this runs
-    // inside `fused_edistance`, where the caller already holds a rayon
-    // scope — tiny chunks would thrash.
+    // No `with_min_len` floor: every item here is Ω(n_b · n_dims) work, which
+    // dwarfs rayon's split overhead. The floor this used to carry —
+    // `(n_b * 16).max(1)`, justified as preventing oversubscription under
+    // `fused_edistance` — exceeded the iterator length whenever `n_a < 32·n_b`,
+    // which for a perturbation-vs-control call is always, so it did not damp
+    // splitting, it forbade it. Nesting inside another `par_iter` on the same
+    // global pool does not oversubscribe; it work-steals.
     let row_sums: Vec<f64> = match backend {
-        DistanceBackend::Gemm => pairwise_gemm_row_sums(a, b, n_a, n_b, n_dims, metric),
+        DistanceBackend::Gemm => {
+            pairwise_gemm_row_sums(a, b, n_a, n_b, n_dims, metric, GemmShape::Cross, budget)
+        }
         DistanceBackend::Scalar => (0..n_a)
             .into_par_iter()
-            .with_min_len((n_b * 16).max(1))
             .map(|i| {
                 let row_a = &a[i * n_dims..(i + 1) * n_dims];
                 let mut row_sum = 0.0f64;
@@ -457,13 +604,14 @@ pub fn mean_pairwise_distance<F: PairwiseFloat>(
 /// * `metric` — Distance metric to use.
 ///
 /// # Returns
-/// The mean distance over all `n*(n-1)/2` distinct unordered pairs,
-/// equivalent to `pairwise_distances(a, a).mean()` but including the
-/// zero diagonal (matching sklearn's convention for `pairwise_distances`).
+/// The mean distance over all `n*(n-1)/2` distinct unordered pairs, taken over
+/// the full `n × n` matrix's cell count: `sum(d(a_i, a_j) for i < j) * 2 / (n * n)`.
 ///
-/// Specifically: `sum(d(a_i, a_j) for i < j) * 2 / (n * n)`.
-/// This matches `sklearn.metrics.pairwise_distances(a, a).mean()` because
-/// the diagonal entries are 0 and the matrix is symmetric.
+/// This matches `sklearn.metrics.pairwise_distances(a, a).mean()`, which forces
+/// the self diagonal to 0 when `X is Y` rather than evaluating it. Note that
+/// *evaluating* it would not always give 0 — under cosine, a zero-norm row
+/// normalizes to zeros and its self-similarity is `1 - 0 = 1` — which is why
+/// both backends skip the pair instead of adding it and trusting it to vanish.
 ///
 /// Returns 0.0 if `n < 2`.
 pub fn mean_pairwise_distance_self<F: PairwiseFloat>(
@@ -473,6 +621,26 @@ pub fn mean_pairwise_distance_self<F: PairwiseFloat>(
     metric: DistanceMetric,
     backend: DistanceBackend,
 ) -> crate::Result<f64> {
+    mean_pairwise_distance_self_with_budget(
+        a,
+        n,
+        n_dims,
+        metric,
+        backend,
+        crate::mem_budget::pairwise_memory_budget(),
+    )
+}
+
+/// [`mean_pairwise_distance_self`] with the Gram block budget injected rather
+/// than read from the env. See [`mean_pairwise_distance_with_budget`].
+fn mean_pairwise_distance_self_with_budget<F: PairwiseFloat>(
+    a: &[F],
+    n: usize,
+    n_dims: usize,
+    metric: DistanceMetric,
+    backend: DistanceBackend,
+    budget: u64,
+) -> crate::Result<f64> {
     if n < 2 {
         return Ok(0.0);
     }
@@ -480,26 +648,35 @@ pub fn mean_pairwise_distance_self<F: PairwiseFloat>(
 
     let backend = resolve_backend(backend, metric)?;
 
-    match backend {
+    // Both backends sum the strict upper triangle. The full n×n matrix holds
+    // each of those pairs twice, plus n diagonal cells that sklearn forces to 0
+    // (they are *not* evaluated — see the note above about zero-norm rows), so:
+    //   full_sum = 2 * total
+    //   mean     = full_sum / (n * n)
+    // which is what `sklearn.metrics.pairwise_distances(a, a).mean()` returns.
+    let row_sums: Vec<f64> = match backend {
         DistanceBackend::Gemm => {
-            // Re-use the (a, a) cross path; diagonal is exactly zero for
-            // Euclidean / cosine on identical rows (clamping handles FP
-            // cancellation), so dividing the full-matrix sum by n*n matches
-            // the upper-triangle convention used by the scalar path.
-            mean_pairwise_distance(a, a, n, n, n_dims, metric, DistanceBackend::Gemm)
+            // This used to re-enter the (a, a) cross path, which computed the
+            // whole n×n Gram — the mirror half for nothing, plus a diagonal that
+            // is only zero on well-behaved input (a cosine zero-norm row's is
+            // 1.0). `UpperTriangle` narrows each block's columns operand to
+            // `a[a0..]`. That always halves the expansion loop; it reduces the
+            // *gemm* only once there is more than one block, since the first
+            // block's operand is still all of `a` — total gemm work is
+            // `≈ (k+1)/2k` of the square at `k` blocks. Measured 1.03× at one
+            // block and 1.38× at eight (docs/performance.md).
+            pairwise_gemm_row_sums(a, a, n, n, n_dims, metric, GemmShape::UpperTriangle, budget)
         }
         DistanceBackend::Scalar => {
-            // Parallelise the upper-triangle sum across rows. Each row `i`
-            // has `n - i - 1` pairs to compute, so the work is uneven; the
-            // `with_min_len((n * 16).max(1))` chunking matches the cross
-            // path's heuristic and prevents oversubscription when this runs
-            // inside `compute_energy_distance`'s pert-level par_iter.
-            //
-            // Reduction is sequential over the per-row sums for bit-stable
-            // output across thread counts.
-            let row_sums: Vec<f64> = (0..n)
+            // Row `i` has `n - i - 1` pairs, so the work is triangular and
+            // rayon's adaptive splitting is exactly what balances it. The
+            // floor this used to carry, `with_min_len((n * 16).max(1))`, was
+            // never satisfiable — `16n > n` for every `n` — so it did not damp
+            // splitting, it disabled it, and this ran single-threaded at every
+            // pool size. Reduction stays sequential over the per-row sums for
+            // bit-stable output across thread counts.
+            (0..n)
                 .into_par_iter()
-                .with_min_len((n * 16).max(1))
                 .map(|i| {
                     let row_i = &a[i * n_dims..(i + 1) * n_dims];
                     let mut row_sum = 0.0f64;
@@ -509,16 +686,12 @@ pub fn mean_pairwise_distance_self<F: PairwiseFloat>(
                     }
                     row_sum
                 })
-                .collect();
-            let total: f64 = row_sums.iter().sum();
-            // Upper triangle has n*(n-1)/2 pairs. The full n×n matrix has these
-            // pairs twice plus n zero-diagonal entries, so:
-            //   full_sum = 2 * total
-            //   mean = full_sum / (n * n)
-            Ok(2.0 * total / (n as f64 * n as f64))
+                .collect()
         }
         DistanceBackend::Auto => unreachable!("resolve_backend collapses Auto"),
-    }
+    };
+    let total: f64 = row_sums.iter().sum();
+    Ok(2.0 * total / (n as f64 * n as f64))
 }
 
 #[cfg(test)]
@@ -1006,6 +1179,343 @@ mod tests {
             (scalar - gemm).abs() < 1e-12,
             "scalar={scalar} vs gemm={gemm}"
         );
+    }
+
+    // ── Gram blocking ─────────────────────────────────────────────────
+
+    /// Deterministic points in `[-1, 1)`, no `rand` dependency.
+    fn pts<F: PairwiseFloat>(n: usize, d: usize, seed: u64) -> Vec<F> {
+        let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        (0..n * d)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                F::from_f64(((s >> 40) as f64 / (1u64 << 24) as f64) * 2.0 - 1.0)
+            })
+            .collect()
+    }
+
+    /// Budget that admits exactly `rows` rows of `a` per Gram block.
+    fn budget_for<F>(rows: usize, n_b: usize) -> u64 {
+        (rows as u64) * (n_b as u64) * (std::mem::size_of::<F>() as u64)
+    }
+
+    #[test]
+    fn blocking_does_not_change_the_cross_answer() {
+        // Shapes chosen so the last block is full, one row short, and one row
+        // over — the three ways a block loop gets its boundary wrong.
+        for (n_a, n_b, n_d) in [(64usize, 40usize, 9usize), (65, 40, 9), (63, 40, 9)] {
+            let a: Vec<f64> = pts(n_a, n_d, 3);
+            let b: Vec<f64> = pts(n_b, n_d, 11);
+            for metric in [DistanceMetric::Euclidean, DistanceMetric::Cosine] {
+                let whole = mean_pairwise_distance_with_budget(
+                    &a,
+                    &b,
+                    n_a,
+                    n_b,
+                    n_d,
+                    metric,
+                    DistanceBackend::Gemm,
+                    u64::MAX,
+                )
+                .unwrap();
+                for rows in [1usize, 2, 7, 16, n_a - 1, n_a] {
+                    let blocked = mean_pairwise_distance_with_budget(
+                        &a,
+                        &b,
+                        n_a,
+                        n_b,
+                        n_d,
+                        metric,
+                        DistanceBackend::Gemm,
+                        budget_for::<f64>(rows, n_b),
+                    )
+                    .unwrap();
+                    assert!(
+                        (whole - blocked).abs() < 1e-12,
+                        "{metric:?} {n_a}x{n_b}: {rows}-row blocks gave {blocked}, \
+                         one block gives {whole}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_cross_matches_the_scalar_backend() {
+        // The oracle is the row-by-row formulation, not another run of the same
+        // gemm — a blocking bug that also corrupted the unblocked path would
+        // survive `blocking_does_not_change_the_cross_answer`.
+        let (n_a, n_b, n_d) = (37usize, 23usize, 8usize);
+        let a: Vec<f64> = pts(n_a, n_d, 5);
+        let b: Vec<f64> = pts(n_b, n_d, 17);
+        for metric in [DistanceMetric::Euclidean, DistanceMetric::Cosine] {
+            let scalar =
+                mean_pairwise_distance(&a, &b, n_a, n_b, n_d, metric, DistanceBackend::Scalar)
+                    .unwrap();
+            for rows in [1usize, 5, 36] {
+                let blocked = mean_pairwise_distance_with_budget(
+                    &a,
+                    &b,
+                    n_a,
+                    n_b,
+                    n_d,
+                    metric,
+                    DistanceBackend::Gemm,
+                    budget_for::<f64>(rows, n_b),
+                )
+                .unwrap();
+                assert!(
+                    (scalar - blocked).abs() < 1e-10,
+                    "{metric:?}: {rows}-row blocks gave {blocked}, scalar gives {scalar}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_cross_matches_the_scalar_backend_f32() {
+        // f32 is the documented pyscx default, and it is the precision the
+        // blocking has to hold at — a wider block sums the same pairs, but the
+        // gemm runs at F.
+        let (n_a, n_b, n_d) = (48usize, 31usize, 12usize);
+        let a: Vec<f32> = pts(n_a, n_d, 21);
+        let b: Vec<f32> = pts(n_b, n_d, 29);
+        for metric in [DistanceMetric::Euclidean, DistanceMetric::Cosine] {
+            let scalar =
+                mean_pairwise_distance(&a, &b, n_a, n_b, n_d, metric, DistanceBackend::Scalar)
+                    .unwrap();
+            for rows in [1usize, 7, n_a] {
+                let blocked = mean_pairwise_distance_with_budget(
+                    &a,
+                    &b,
+                    n_a,
+                    n_b,
+                    n_d,
+                    metric,
+                    DistanceBackend::Gemm,
+                    budget_for::<f32>(rows, n_b),
+                )
+                .unwrap();
+                assert!(
+                    (scalar - blocked).abs() < 1e-6,
+                    "{metric:?} f32: {rows}-row blocks gave {blocked}, scalar gives {scalar}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gemm_self_triangle_matches_the_scalar_backend() {
+        // The self path narrows each block's columns operand to `a[a0..]` and
+        // sums only `j > i`. Its diagonal block is the part that gets written
+        // wrong: `n` is swept across block boundaries so that the diagonal
+        // lands at the start, middle and end of a block.
+        for n in [2usize, 3, 17, 64, 65] {
+            let n_d = 7;
+            let a: Vec<f64> = pts(n, n_d, 41);
+            for metric in [DistanceMetric::Euclidean, DistanceMetric::Cosine] {
+                let scalar =
+                    mean_pairwise_distance_self(&a, n, n_d, metric, DistanceBackend::Scalar)
+                        .unwrap();
+                for rows in [1usize, 2, 5, 16, n] {
+                    let gemm = mean_pairwise_distance_self_with_budget(
+                        &a,
+                        n,
+                        n_d,
+                        metric,
+                        DistanceBackend::Gemm,
+                        budget_for::<f64>(rows, n),
+                    )
+                    .unwrap();
+                    assert!(
+                        (scalar - gemm).abs() < 1e-10,
+                        "{metric:?} n={n}: {rows}-row blocks gave {gemm}, scalar gives {scalar}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemm_self_triangle_counts_every_pair_exactly_once() {
+        // Premise for the test above: if the triangle dropped or double-counted
+        // pairs, agreement with the scalar path would still be possible for a
+        // fixture whose pairwise distances are all equal. These are not — the
+        // three pairs of a 3-point fixture are 5, sqrt(2) and sqrt(13), so any
+        // miscount moves the mean.
+        //
+        // The `j_start = t` vs `t + 1` boundary is *not* covered by this
+        // fixture — every row here has a nonzero norm, so the diagonal it would
+        // add is exactly 0 under both gemm metrics. It is covered by
+        // `gemm_self_skips_the_diagonal_of_a_zero_norm_row` below, where a
+        // zero-norm row makes the cosine diagonal 1.0 and the two spellings
+        // differ by a whole unit.
+        let a = vec![0.0, 0.0, 3.0, 4.0, 1.0, 1.0];
+        let expected = 2.0 * (5.0 + 2.0f64.sqrt() + 13.0f64.sqrt()) / 9.0;
+        for rows in [1usize, 2, 3] {
+            let gemm = mean_pairwise_distance_self_with_budget(
+                &a,
+                3,
+                2,
+                DistanceMetric::Euclidean,
+                DistanceBackend::Gemm,
+                budget_for::<f64>(rows, 3),
+            )
+            .unwrap();
+            assert!(
+                (gemm - expected).abs() < 1e-12,
+                "{rows}-row blocks gave {gemm}, hand-computed value is {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_width_input_does_not_panic() {
+        // Regression: swapping `row_sq_norms` to `par_chunks_exact(n_dims)`
+        // turned `n_dims == 0` from "every row has norm 0" into a panic, on a
+        // shape the public entry points accept (only `n_a == 0 || n_b == 0`
+        // short-circuits). Zero-width points are all identical, so every
+        // distance is 0.
+        let a: Vec<f64> = vec![];
+        for metric in [
+            DistanceMetric::Euclidean,
+            DistanceMetric::Cosine,
+            DistanceMetric::L1,
+        ] {
+            for backend in [DistanceBackend::Gemm, DistanceBackend::Scalar] {
+                if metric == DistanceMetric::L1 && backend == DistanceBackend::Gemm {
+                    continue; // rejected by resolve_backend, tested elsewhere
+                }
+                let cross = mean_pairwise_distance(&a, &a, 2, 2, 0, metric, backend).unwrap();
+                let selfd = mean_pairwise_distance_self(&a, 2, 0, metric, backend).unwrap();
+                // Cosine's zero-norm rule gives 1.0 per pair; euclidean/L1 give 0.
+                let expect_cross = if metric == DistanceMetric::Cosine {
+                    1.0
+                } else {
+                    0.0
+                };
+                assert_eq!(cross, expect_cross, "{metric:?}/{backend:?} cross");
+                assert_eq!(
+                    selfd,
+                    expect_cross / 2.0,
+                    "{metric:?}/{backend:?} self (triangle over n^2)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gemm_self_skips_the_diagonal_of_a_zero_norm_row() {
+        // A zero-norm row is where "the self diagonal is exactly 0" stops being
+        // true. `normalize_rows` leaves such a row as zeros, so its cosine Gram
+        // diagonal is `1 - 0 = 1`, not 1 - 1 = 0. Two all-zero rows:
+        //
+        //   strict upper triangle : 2 * 1 / 4     = 0.5   (scalar, and gemm now)
+        //   full n*n square       : 4 * 1 / 4     = 1.0   (gemm before this change)
+        //
+        // The triangle is the right answer: it is what the scalar backend has
+        // always returned, and what `sklearn.metrics.pairwise.cosine_distances`
+        // returns, since that forces the self diagonal to 0 when `X is Y`.
+        //
+        // This is also the fixture that makes `j_start = t` vs `t + 1`
+        // detectable — with nonzero rows the diagonal contributes 0 and the two
+        // spellings are indistinguishable.
+        for (label, a, n) in [
+            ("two zero rows", vec![0.0f64; 6], 2usize),
+            (
+                "one zero row among unit rows",
+                vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                3,
+            ),
+        ] {
+            let scalar = mean_pairwise_distance_self(
+                &a,
+                n,
+                3,
+                DistanceMetric::Cosine,
+                DistanceBackend::Scalar,
+            )
+            .unwrap();
+            let gemm = mean_pairwise_distance_self(
+                &a,
+                n,
+                3,
+                DistanceMetric::Cosine,
+                DistanceBackend::Gemm,
+            )
+            .unwrap();
+            assert!(
+                (scalar - gemm).abs() < 1e-12,
+                "{label}: gemm self {gemm} != scalar self {scalar}"
+            );
+
+            // Premise: the full-square convention really does differ here, so
+            // the equality above is not something every implementation passes.
+            let full_square = mean_pairwise_distance(
+                &a,
+                &a,
+                n,
+                n,
+                3,
+                DistanceMetric::Cosine,
+                DistanceBackend::Gemm,
+            )
+            .unwrap();
+            assert!(
+                (full_square - gemm).abs() > 1e-3,
+                "{label}: the full n*n square gave {full_square}, same as the triangle's \
+                 {gemm} — this fixture has no zero-norm row and proves nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_buffer_with_different_row_counts_is_not_a_self_distance() {
+        // `(a, a, n_a, n_b)` with `n_a != n_b` means "the first n_a rows against
+        // the first n_b rows" — legal, and *not* a self-distance. Keying the
+        // norm/normalized-copy aliasing on `ptr::eq` alone would reuse the
+        // shorter side's buffers for the longer one and index out of bounds.
+        let (n_a, n_b, n_d) = (3usize, 7usize, 5usize);
+        let a: Vec<f64> = pts(n_b, n_d, 71);
+        for metric in [DistanceMetric::Euclidean, DistanceMetric::Cosine] {
+            let expect =
+                mean_pairwise_distance(&a, &a, n_a, n_b, n_d, metric, DistanceBackend::Scalar)
+                    .unwrap();
+            let got = mean_pairwise_distance(&a, &a, n_a, n_b, n_d, metric, DistanceBackend::Gemm)
+                .unwrap();
+            assert!(
+                (expect - got).abs() < 1e-12,
+                "{metric:?}: {got} vs {expect}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_one_row_block_is_the_floor_not_a_hang() {
+        // `plan_gram_row_block` never returns 0, so a budget smaller than one
+        // row's Gram still terminates — with one row per block.
+        let (n, n_d) = (9usize, 4usize);
+        let a: Vec<f64> = pts(n, n_d, 61);
+        let scalar = mean_pairwise_distance_self(
+            &a,
+            n,
+            n_d,
+            DistanceMetric::Euclidean,
+            DistanceBackend::Scalar,
+        )
+        .unwrap();
+        let gemm = mean_pairwise_distance_self_with_budget(
+            &a,
+            n,
+            n_d,
+            DistanceMetric::Euclidean,
+            DistanceBackend::Gemm,
+            1, // one byte
+        )
+        .unwrap();
+        assert!((scalar - gemm).abs() < 1e-12, "{gemm} vs {scalar}");
     }
 
     #[test]

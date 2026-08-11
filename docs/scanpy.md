@@ -2992,13 +2992,78 @@ Route `gpu_dense` / `cpu_csr`, recorded on
 `O(N²)` in cells per perturbation (auto-skipped ≥ 500K cells on the CPU
 reference), the GPU path is what makes it tractable at scale.
 
-SCX's implementation avoids materializing the `[N, N]` distance matrix per
-perturbation (streaming accumulation of per-row sums even on the gemm
-path), precomputes control self-distance once, and parallelizes across
-perturbations with rayon. At 20K cells × 2K genes × 50 perturbations the
-default `gemm + f32` path is **52×** faster than cell-eval's
-`sklearn.metrics.pairwise_distances`; above ~500K the reference becomes
-infeasible while SCX remains usable.
+SCX's implementation never materializes the `[N, N]` *distance* matrix per
+perturbation — the reduction keeps one `f64` per row — precomputes control
+self-distance once, and parallelizes across perturbations with rayon. At 20K
+cells × 2K genes × 50 perturbations the default `gemm + f32` path is **52×**
+faster than cell-eval's `sklearn.metrics.pairwise_distances`; above ~500K the
+reference becomes infeasible while SCX remains usable.
+
+The gemm backend does need a Gram (`a·bᵀ`), and that is the allocation the
+budget governs. It is built **one row block of `a` at a time**, bounded by
+`SCX_ACCEL_PAIRWISE_MEMORY_BUDGET` (default 256 MiB) and reduced before the next
+block overwrites it, rather than as `n_a · n_b · itemsize` — which at 100K
+control cells on the default `dtype="f32"` is 40 GB. Inputs whose whole Gram
+already fits the budget are a single block, i.e. the unblocked computation.
+
+Two things the knob does **not** cover, since it is what operators will tune:
+
+- The block is `max(budget, one Gram row)`. A single row wider than the budget
+  still gets its own block — the floor that guarantees progress instead of an
+  error.
+- **`metric="cosine"` allocates outside it.** Row normalization materialises a
+  full `n_a · n_dims` copy, plus `n_b · n_dims` when the two sides differ; at
+  100K × 2000 f32 that is ~800 MB for a self-distance and ~1.6 GB for a cross,
+  untouched by lowering the budget. `metric="euclidean"` keeps only `O(n)`
+  row-norm buffers.
+
+The knob changes how the same pairs are batched, never *which* pairs are summed
+or the order the row sums reduce in. It is not bit-neutral above the budget,
+though: a different block width makes faer panel the gemm differently, so Gram
+ulps move — the same class of drift `Par::rayon(0)` already has across thread
+counts, and well inside the `atol=1e-4` parity bound. Below the budget there is
+one block and the *blocking* contributes nothing — the **cross** distance is then
+bit-identical to pyscx ≤ 0.13.0's gemm. That is not a statement about
+`energy_distance` as a whole: its self terms changed convention regardless of
+blocking (see the upper-triangle note above), so the metric's output is not
+generally bit-identical to the previous release.
+
+The self-distance term (`d(X, X)`, and the once-per-side control self-distance)
+additionally takes the **strict upper triangle** rather than the full square,
+which is what `backend="scalar"` has always done and what
+`sklearn.metrics.pairwise.cosine_distances` does (it forces the self diagonal to
+0 when `X is Y` rather than evaluating it). On ordinary input the discarded half
+is the symmetric mirror plus a diagonal that evaluates to ~0, so values move only
+in the last bits and land *closer* to `backend="scalar"` than before.
+
+> [!IMPORTANT]
+> On a **zero-norm row under `metric="cosine"`** it is not a last-bit change.
+> Row normalization leaves such a row as zeros, so its raw self-similarity is
+> `1 - 0 = 1`, not `1 - 1 = 0` — the full square counted a whole unit per
+> zero-norm row and the triangle does not. Two all-zero rows: `1.0` before,
+> `0.5` now. This **fixes** a divergence — `backend="gemm"` (the `auto` default)
+> and `backend="scalar"` used to disagree on such input, and gemm was the one
+> that was wrong. If you have compared the two backends on data containing
+> all-zero cells, the gemm numbers change.
+
+> [!NOTE]
+> The budget bounds **one block**, not the op. `energy_distance` evaluates
+> perturbations on a rayon `par_iter`, so up to `RAYON_NUM_THREADS` blocks are
+> live at once, and each task additionally holds its own dense copy of that
+> perturbation's and the control's rows. Measured end to end at 30K control +
+> 10K perturbation cells × 50 dims with 16 threads, peak RSS is **1.76 GB** —
+> well above the 256 MiB budget, and dominated by those per-task buffers rather
+> than by any single Gram. (Unblocked, the same run peaks at 3.85 GB.)
+
+**Tuning.** Blocking is a memory/throughput trade and it only engages above the
+budget. Which way it goes depends on `n_dims`: on a 50-dim embedding the gemm is
+memory-bound and blocking is *faster* (the measurement above runs 3.9 s → 1.0 s),
+while on a 2000-dim raw-gene input it costs up to 2× once it engages. If you are
+running on raw genes with RAM to spare, raising
+`SCX_ACCEL_PAIRWISE_MEMORY_BUDGET` until the Gram fits in one block restores the
+unblocked throughput exactly; if the host is tight, lowering it — or
+`RAYON_NUM_THREADS` — shrinks the Gram term. See
+[performance.md § Pairwise-distance kernels](performance.md#pairwise-distance-kernels-gram-blocking-and-the-with_min_len-fix).
 
 #### Knockdown efficiency (`pyscx.accel.knockdown_efficiency`)
 
@@ -3270,7 +3335,9 @@ today's behaviour unchanged. On PCA it bounds **speed and memory only**: the blo
 cannot change the numbers, because the blocks write to disjoint slices and are never merged
 (see [PCA § Reproducibility](#reproducibility)). Other `SCX_ACCEL_*` knobs (`SCX_ACCEL_PREFETCH_DEPTH`,
 `SCX_ACCEL_REDUCTION_MODE`, `SCX_ACCEL_DE_MEMORY_BUDGET`) are documented in
-[performance.md](performance.md). `SCX_ACCEL_PREFETCH_DEPTH` bounds the
+[performance.md](performance.md); `SCX_ACCEL_PAIRWISE_MEMORY_BUDGET`, which bounds one
+`energy_distance` Gram block and so interacts with `RAYON_NUM_THREADS` multiplicatively, is
+in the [architecture.md environment table](architecture.md#environment-variables). `SCX_ACCEL_PREFETCH_DEPTH` bounds the
 decode-prefetch pipeline, which since Phase 4.2 also covers the backed
 aggregation kernels (QC, filtering, `col_*`, `normalize_total`'s row sums), their
 column-projected **CSR** and lazy/transformed twins, and GPU staging — so raising it

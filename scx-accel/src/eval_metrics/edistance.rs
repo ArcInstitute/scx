@@ -6,9 +6,22 @@
 //! of per-perturbation e-distances.
 //!
 //! The key optimization over cell-eval's sklearn-based approach:
-//! - No `[N, N]` pairwise distance matrix allocation.
+//! - No `[N, N]` pairwise *distance* matrix allocation — the reduction keeps
+//!   one `f64` per row. The gemm backend does build a Gram, one row block at a
+//!   time against `SCX_ACCEL_PAIRWISE_MEMORY_BUDGET`; see
+//!   [`super::distances`] § Working set.
 //! - Control self-distances precomputed once and reused.
 //! - Per-perturbation computation parallelized with rayon.
+//!
+//! # Peak memory is dominated by the group copies, not the Gram
+//!
+//! `extract_group_rows_indexed` materialises a fresh dense
+//! `n_group × n_dims` buffer for the perturbation *and* the control side of
+//! every task, inside the `par_iter` below — so the copies scale with the
+//! thread count, and at 50 K cells/group × 2000 dims × 32 threads they are tens
+//! of GB, well past the blocked Gram. Bounding that means gathering rows per
+//! Gram block rather than per task, which is a change to this file's parallel
+//! structure and has not been made.
 
 use std::collections::HashMap;
 
@@ -307,6 +320,19 @@ pub fn compute_energy_distance_gpu(
         scx_gpu::gpu_mean_pairwise_distance(dev, &handle, a, b, na, nb, n_dims, cosine)
             .map_err(|e| crate::AccelError::LinAlg(format!("GPU pairwise distance: {e}")))
     };
+    // `gpu_mean_pairwise_distance(a, a, n, n)` omits the self diagonal inside
+    // the kernel, so it already matches the CPU's strict-upper-triangle
+    // convention and needs no host-side correction.
+    //
+    // An earlier round of this PR tried to repair it on the host by subtracting
+    // a count of zero-norm rows. That was wrong twice over: it only covered
+    // cosine, leaving euclidean's f32-gram residual in place (~6.5e-4 of mean
+    // error at n=20, d=2000, against a documented `atol=1e-3` per-perturbation
+    // bar), and it classified zero-norm rows in f64 while the device normalizer
+    // accumulates in f32 — so a row of denormals disagreed about which side had
+    // a diagonal at all. A host-side classifier cannot exactly repair a device
+    // full-square reduction; the kernel skips the pair instead.
+    let self_mean = |a: &[f32], n: usize| -> crate::Result<f64> { mean_pair(a, a, n, n) };
 
     let real_index = build_group_index(real_groups);
     let pred_index = build_group_index(pred_groups);
@@ -322,8 +348,8 @@ pub fn compute_energy_distance_gpu(
     }
 
     // Control self-distance, once per side (self(a) = mean_pairwise(a, a)).
-    let sigma_ctrl_real = mean_pair(&ctrl_real, &ctrl_real, n_ctrl_real, n_ctrl_real)?;
-    let sigma_ctrl_pred = mean_pair(&ctrl_pred, &ctrl_pred, n_ctrl_pred, n_ctrl_pred)?;
+    let sigma_ctrl_real = self_mean(&ctrl_real, n_ctrl_real)?;
+    let sigma_ctrl_pred = self_mean(&ctrl_pred, n_ctrl_pred)?;
 
     // Per-perturbation, sequential: GpuDevice work serialises on the device.
     let mut d_real = Vec::with_capacity(pert_group_indices.len());
@@ -336,14 +362,14 @@ pub fn compute_energy_distance_gpu(
 
         let e_real = if n_pr > 0 {
             2.0 * mean_pair(&pert_real, &ctrl_real, n_pr, n_ctrl_real)?
-                - mean_pair(&pert_real, &pert_real, n_pr, n_pr)?
+                - self_mean(&pert_real, n_pr)?
                 - sigma_ctrl_real
         } else {
             f64::NAN
         };
         let e_pred = if n_pp > 0 {
             2.0 * mean_pair(&pert_pred, &ctrl_pred, n_pp, n_ctrl_pred)?
-                - mean_pair(&pert_pred, &pert_pred, n_pp, n_pp)?
+                - self_mean(&pert_pred, n_pp)?
                 - sigma_ctrl_pred
         } else {
             f64::NAN
