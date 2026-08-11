@@ -5,6 +5,36 @@ backed by a **benchmark manifest entry** — a JSON result file checked into
 `benchmarks/comprehensive/results/` (either under `raw/` or promoted into
 `baselines/LATEST/summary.json`).
 
+## Scope: which claims this covers
+
+The manifest schema is a `benchmark` × `format` × `dataset` triple produced by
+the SLURM comprehensive suite (`benchmarks/comprehensive/`). That is the right
+shape for a claim of the form "SCX reads `census_1m` N× faster than h5ad", and
+it is what the rule above governs. **Those claims must be manifested. No
+exceptions.**
+
+It is not a shape a `cargo bench` kernel microbenchmark can take — there is no
+format and no dataset, only a criterion id and a machine. `docs/performance.md`
+carries such numbers (covariance PCA, the pairwise distance kernels), and
+inventing a synthetic triple for them would put un-reproducible rows into the
+baseline that `gate_candidate.py` compares against. So they are **disclosed
+inline instead**, and a disclosure is only adequate if it carries all of:
+
+- the exact command, including the criterion filter;
+- the machine (partition, core count) and the date;
+- the commit or branch point each arm was measured at;
+- an explicit `[!NOTE]` saying it is a microbenchmark with no manifest entry, so
+  a reader never mistakes it for a captured result.
+
+If a number could be expressed as a triple, it must be — this tier is for
+kernel-level measurements that genuinely cannot, not a way around the capture
+harness.
+
+> [!IMPORTANT]
+> `benchmarks/scripts/check_readme_manifests.py` enforces only the first tier,
+> and only over `README.md` — it does not parse `docs/performance.md` at all.
+> The second tier is a review-time convention, not a checked one.
+
 ## Schema
 
 Each raw result JSON is written by `BenchmarkResult.to_dict()` (see

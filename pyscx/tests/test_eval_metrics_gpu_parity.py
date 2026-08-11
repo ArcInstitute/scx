@@ -238,10 +238,35 @@ def test_energy_distance_gpu_matches_cpu_small_groups(metric):
     gpu = pyscx.accel.energy_distance_details(real, pred, metric=metric, device="gpu")
     route = _edist_route(pred, "energy_distance_details")
     assert route["route"].startswith("gpu"), route
-    for name in cpu["d_real"]:
-        assert _close_or_nan(cpu["d_real"][name], gpu["d_real"][name], 1e-3), (
-            f"{metric} d_real[{name}]: cpu={cpu['d_real'][name]} gpu={gpu['d_real'][name]}"
-        )
+    for side in ("d_real", "d_pred"):
+        for name in cpu[side]:
+            assert _close_or_nan(cpu[side][name], gpu[side][name], 1e-3), (
+                f"{metric} {side}[{name}]: cpu={cpu[side][name]} gpu={gpu[side][name]}"
+            )
+
+
+def test_energy_distance_gpu_matches_cpu_chunked_self(monkeypatch):
+    """Force the GPU's chunked Gram path and check the diagonal skip survives it.
+
+    The chunked launcher passes each tile's global first a-row (`i0`) so the
+    kernel can find `global_a_row == b_row` inside a tile that does not start at
+    0. Get that offset wrong and the wrong pairs get skipped — which the
+    single-shot path cannot detect, because it always has `i0 == 0`.
+
+    `SCX_GPU_PAIRWISE_MAX_GRAM_BYTES` is read per call (not cached), so shrinking
+    it here forces blocking on an otherwise-small fixture.
+    """
+    monkeypatch.setenv("SCX_GPU_PAIRWISE_MAX_GRAM_BYTES", "4096")
+    real, pred = _make_zero_row_adata(n_obs=120, n_vars=40)
+    cpu = pyscx.accel.energy_distance_details(real, pred, metric="cosine", device="cpu")
+    gpu = pyscx.accel.energy_distance_details(real, pred, metric="cosine", device="gpu")
+    route = _edist_route(pred, "energy_distance_details")
+    assert route["route"].startswith("gpu"), route
+    for side in ("d_real", "d_pred"):
+        for name in cpu[side]:
+            assert _close_or_nan(cpu[side][name], gpu[side][name], 1e-3), (
+                f"chunked {side}[{name}]: cpu={cpu[side][name]} gpu={gpu[side][name]}"
+            )
 
 
 def test_energy_distance_gpu_matches_cpu_backed(tmp_path):

@@ -3022,7 +3022,11 @@ or the order the row sums reduce in. It is not bit-neutral above the budget,
 though: a different block width makes faer panel the gemm differently, so Gram
 ulps move — the same class of drift `Par::rayon(0)` already has across thread
 counts, and well inside the `atol=1e-4` parity bound. Below the budget there is
-one block and the result is bit-identical to pyscx ≤ 0.13.0's gemm.
+one block and the *blocking* contributes nothing — the **cross** distance is then
+bit-identical to pyscx ≤ 0.13.0's gemm. That is not a statement about
+`energy_distance` as a whole: its self terms changed convention regardless of
+blocking (see the upper-triangle note above), so the metric's output is not
+generally bit-identical to the previous release.
 
 The self-distance term (`d(X, X)`, and the once-per-side control self-distance)
 additionally takes the **strict upper triangle** rather than the full square,

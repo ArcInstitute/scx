@@ -265,6 +265,14 @@ enum GemmShape {
 /// per-task overhead — and 64 sits *below* the iterator length at any size worth
 /// parallelising, so it never forbids splitting outright.
 fn row_sq_norms<F: PairwiseFloat>(data: &[F], n: usize, n_dims: usize) -> Vec<f64> {
+    // `par_chunks_exact` panics on a zero chunk size, and `n_dims == 0` reaches
+    // here from the public entry points (only `n_a == 0 || n_b == 0` short-
+    // circuits). A zero-width row has a zero norm — which is what the previous
+    // `(0..n).map(|i| data[i*0..(i+1)*0].sum())` produced — so answer that
+    // directly rather than letting the chunker reject it.
+    if n_dims == 0 {
+        return vec![0.0; n];
+    }
     data[..n * n_dims]
         .par_chunks_exact(n_dims)
         .with_min_len(64)
@@ -452,6 +460,13 @@ fn pairwise_gemm_row_sums<F: PairwiseFloat>(
 /// many large entries; the inverse-norm scaling is then narrowed back to `F`
 /// before applying to each element.
 fn normalize_rows<F: PairwiseFloat>(data: &[F], n_rows: usize, n_dims: usize) -> Vec<F> {
+    // `par_chunks_mut` panics on a zero chunk size. Zero-width rows have nothing
+    // to normalize and the output is empty either way. (This one predates the
+    // blocking work — `row_sq_norms` grew the same edge in the round-1 cleanup,
+    // and the test that covers both found this on its way past.)
+    if n_dims == 0 {
+        return Vec::new();
+    }
     let mut out = vec![F::from_f64(0.0); n_rows * n_dims];
     out.par_chunks_mut(n_dims)
         .enumerate()
@@ -1353,6 +1368,41 @@ mod tests {
                 (gemm - expected).abs() < 1e-12,
                 "{rows}-row blocks gave {gemm}, hand-computed value is {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn a_zero_width_input_does_not_panic() {
+        // Regression: swapping `row_sq_norms` to `par_chunks_exact(n_dims)`
+        // turned `n_dims == 0` from "every row has norm 0" into a panic, on a
+        // shape the public entry points accept (only `n_a == 0 || n_b == 0`
+        // short-circuits). Zero-width points are all identical, so every
+        // distance is 0.
+        let a: Vec<f64> = vec![];
+        for metric in [
+            DistanceMetric::Euclidean,
+            DistanceMetric::Cosine,
+            DistanceMetric::L1,
+        ] {
+            for backend in [DistanceBackend::Gemm, DistanceBackend::Scalar] {
+                if metric == DistanceMetric::L1 && backend == DistanceBackend::Gemm {
+                    continue; // rejected by resolve_backend, tested elsewhere
+                }
+                let cross = mean_pairwise_distance(&a, &a, 2, 2, 0, metric, backend).unwrap();
+                let selfd = mean_pairwise_distance_self(&a, 2, 0, metric, backend).unwrap();
+                // Cosine's zero-norm rule gives 1.0 per pair; euclidean/L1 give 0.
+                let expect_cross = if metric == DistanceMetric::Cosine {
+                    1.0
+                } else {
+                    0.0
+                };
+                assert_eq!(cross, expect_cross, "{metric:?}/{backend:?} cross");
+                assert_eq!(
+                    selfd,
+                    expect_cross / 2.0,
+                    "{metric:?}/{backend:?} self (triangle over n^2)"
+                );
+            }
         }
     }
 
