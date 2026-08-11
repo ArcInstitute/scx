@@ -243,7 +243,9 @@ fn can_exclude_shard(
                         // to call an empty vocabulary complete, so the `Err`
                         // arm below declines.
                         let dict = category_dicts.and_then(|dicts| dicts.get(cnh));
-                        if !bitset_matches_dictionary(bitset, dict) {
+                        if !bitset_matches_dictionary(bitset, dict)
+                            || !single_bitset_for(column_stats, hash)
+                        {
                             continue;
                         }
                         let bit_index = match val {
@@ -388,7 +390,9 @@ fn can_exclude_shard(
                         // an ordinal, and treating it as one lets an
                         // entry-less legacy index exclude every shard.
                         let dict = category_dicts.and_then(|dicts| dicts.get(cnh));
-                        if !bitset_matches_dictionary(bitset, dict) {
+                        if !bitset_matches_dictionary(bitset, dict)
+                            || !single_bitset_for(column_stats, hash)
+                        {
                             continue;
                         }
                         let all_absent = values.iter().all(|v| {
@@ -476,6 +480,32 @@ fn bitset_matches_dictionary(bitset: &[u8], dict: Option<&CategoryDictionary>) -
         Some(d) => bitset.len() == d.values.len().div_ceil(8),
         None => true,
     }
+}
+
+/// Whether this shard carries exactly one `CategoryBitset` for `hash`.
+///
+/// Two records for one column in one shard cannot both be authoritative, and
+/// [`can_exclude_shard`] returns on the **first** stat that excludes — so of a
+/// pair disagreeing about a value, whichever is met first decides whether the
+/// shard survives. That is a silent wrong answer chosen by iteration order, and
+/// an unrecoverable one: the residual path only ever re-examines shards that
+/// were *kept*, so a shard Level-1 excluded is gone.
+///
+/// This cannot be folded into the plan-level `complete` bit, which is why the
+/// check lives here. `complete` gates the *miss* inference — "absent from the
+/// vocabulary, therefore in no shard" — while this is the *hit* path, which
+/// reads bits out of whichever shard it is looking at no matter what the
+/// vocabulary as a whole is worth. `collect_bitset_coverage` does record the
+/// duplicate, and that is what makes the column residual at Level-2; Level-1
+/// needs its own refusal.
+fn single_bitset_for(column_stats: &[ColumnStat], hash: u64) -> bool {
+    column_stats
+        .iter()
+        .filter(|cs| {
+            matches!(cs, ColumnStat::CategoryBitset { column_name_hash, .. } if *column_name_hash == hash)
+        })
+        .count()
+        == 1
 }
 
 /// Integers with magnitude below 2^53 are exactly representable in f64, so
@@ -938,6 +968,53 @@ mod tests {
             candidates.iter().any(|c| c.shard_idx == 1),
             "the appended shard must survive pruning or its rows are unreachable"
         );
+    }
+
+    /// A shard carrying the same column twice must not prune on either copy.
+    ///
+    /// `can_exclude_shard` returns on the **first** stat that excludes, so of
+    /// two `CategoryBitset` records under one hash — one saying the value is
+    /// absent, one saying it is present — whichever is met first decides. That
+    /// is a coin toss over a silent wrong answer, and it is unrecoverable:
+    /// nothing downstream re-examines a shard Level-1 has already excluded.
+    ///
+    /// The plan-level completeness bit does not cover this. It gates the *miss*
+    /// inference; this is the *hit* path, which reads bits from whichever shard
+    /// it is looking at regardless of what the vocabulary is worth.
+    #[test]
+    fn a_shard_carrying_a_column_twice_prunes_on_neither_copy() {
+        // Categories ["A", "B"]. One record says 'A' is absent (bit 0 clear),
+        // its twin says present — the shard genuinely holds an 'A'.
+        let catalog = catalog_with_shards(vec![(
+            0,
+            100,
+            vec![
+                category_bitset_stat("cell_type", vec![0b0000_0010]), // 'A' absent
+                category_bitset_stat("cell_type", vec![0b0000_0011]), // 'A' present
+            ],
+        )]);
+        let dicts = category_dicts("cell_type", &["A", "B"]);
+        for pred in [
+            Predicate::Eq("cell_type".to_string(), ScalarValue::Utf8("A".to_string())),
+            Predicate::In(
+                "cell_type".to_string(),
+                vec![ScalarValue::Utf8("A".to_string())],
+            ),
+        ] {
+            assert_eq!(
+                prune_shards_by_catalog_with_dict(
+                    &catalog,
+                    std::slice::from_ref(&pred),
+                    None,
+                    Some(&dicts),
+                    0
+                )
+                .len(),
+                1,
+                "{pred}: two records for one column disagree about 'A'; the \
+                 shard must survive, not be excluded by whichever was met first"
+            );
+        }
     }
 
     /// The legacy-file regression again, through the door the integer-literal
