@@ -234,6 +234,14 @@ fn can_exclude_shard(
                         // zero-length — so every shard took the
                         // out-of-range → "absent" branch below and the query
                         // returned nothing at all.
+                        //
+                        // Rejecting the integer literal only closed that for
+                        // `batch == 1`. The *string* spelling, `batch == '1'`,
+                        // resolves through the dictionary instead and misses
+                        // in an empty vocabulary — same silent zero rows. What
+                        // covers it is `CategoryDictionaries::insert` refusing
+                        // to call an empty vocabulary complete, so the `Err`
+                        // arm below declines.
                         let dict = category_dicts.and_then(|dicts| dicts.get(cnh));
                         if !bitset_matches_dictionary(bitset, dict) {
                             continue;
