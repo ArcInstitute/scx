@@ -152,7 +152,7 @@ pub(crate) fn write_raw_to_h5ad(
     let raw = reader.read_all_raw_csr_shards()?;
     let raw_n_vars = raw.shape.1;
     let (indptr, indices, data, n_obs) = match keep_mask {
-        Some(mask) => filter_csr_rows(&raw.indptr, &raw.indices, &raw.data, mask),
+        Some(mask) => filter_csr_rows(&raw.indptr, &raw.indices, &raw.data, mask)?,
         None => (raw.indptr, raw.indices, raw.data, raw.shape.0),
     };
 
@@ -163,6 +163,9 @@ pub(crate) fn write_raw_to_h5ad(
     Ok(())
 }
 
+/// `(indptr, indices, data, n_kept_rows)` for a row-filtered CSR.
+type FilteredCsr = (Vec<i64>, Vec<i32>, Vec<f32>, usize);
+
 /// Subset CSR rows by a boolean obs keep-mask, returning new
 /// `(indptr, indices, data, n_kept_rows)`. Used to apply deletion
 /// vectors to the raw matrix on export (raw shares the obs axis).
@@ -171,8 +174,24 @@ fn filter_csr_rows(
     indices: &[i32],
     data: &[f32],
     mask: &[bool],
-) -> (Vec<i64>, Vec<i32>, Vec<f32>, usize) {
-    let n_rows = indptr.len().saturating_sub(1).min(mask.len());
+) -> Result<FilteredCsr, ConvertError> {
+    // `min(mask.len())` here silently dropped every row past the shorter of the
+    // two, exporting a raw matrix with fewer rows than obs — the same
+    // clamp-instead-of-check the reader-side deletion filters and the engine's
+    // row filter had. The mask is obs-indexed and raw shares the obs axis, so a
+    // mismatch means the file is inconsistent, not that the export should guess.
+    let declared = indptr.len().saturating_sub(1);
+    if mask.len() != declared {
+        return Err(ConvertError::Scx(scx_format_io::ScxError::InvalidCatalog(
+            format!(
+                "raw export keep mask covers {} rows but raw X has {} \
+                 (truncated or corrupt file)",
+                mask.len(),
+                declared,
+            ),
+        )));
+    }
+    let n_rows = declared;
     let mut out_indptr = vec![0i64];
     let mut out_indices = Vec::new();
     let mut out_data = Vec::new();
@@ -186,7 +205,7 @@ fn filter_csr_rows(
         }
     }
     let n = out_indptr.len() - 1;
-    (out_indptr, out_indices, out_data, n)
+    Ok((out_indptr, out_indices, out_data, n))
 }
 
 fn write_sparse_group(
@@ -2886,5 +2905,51 @@ mod uns_envelope_tests {
             uns.group("good").is_err(),
             "valid envelope must not be a subgroup"
         );
+    }
+}
+
+#[cfg(test)]
+mod raw_export_filter_tests {
+    use super::*;
+
+    /// The raw-export keep mask and raw X share the obs axis, so a length
+    /// disagreement means the file is inconsistent — not that the export should
+    /// pick one and carry on.
+    ///
+    /// This helper used to open with `min(mask.len())`, which made the *shorter*
+    /// case silent: it exported a raw matrix with fewer rows than obs and
+    /// returned no error. That direction never panicked, which is why it needed
+    /// a test rather than an assertion — a wrong file looks like a file.
+    ///
+    /// (`scx-engine::collect::filter_csr_rows` is a separate copy of the same
+    /// helper with the same defect, tested separately; this one is private to
+    /// the h5ad writer and easy to regress unnoticed.)
+    #[test]
+    fn raw_export_rejects_a_mask_that_disagrees_with_raw_x() {
+        // 3-row raw X.
+        let indptr = vec![0i64, 2, 3, 5];
+        let indices = vec![0i32, 1, 2, 0, 3];
+        let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+
+        let short = vec![true];
+        let err = filter_csr_rows(&indptr, &indices, &data, &short)
+            .expect_err("a short mask must error rather than truncate the export");
+        let msg = err.to_string();
+        assert!(
+            msg.contains('1') && msg.contains('3'),
+            "must report both counts: {msg}"
+        );
+
+        let long = vec![true, true, true, true];
+        assert!(filter_csr_rows(&indptr, &indices, &data, &long).is_err());
+
+        // Control: an exactly-matching mask still filters, so the guard is not
+        // rejecting every export.
+        let (ip, ix, d, n) = filter_csr_rows(&indptr, &indices, &data, &[true, false, true])
+            .expect("a matching mask must still filter");
+        assert_eq!(n, 2);
+        assert_eq!(ip, vec![0, 2, 4]);
+        assert_eq!(ix, vec![0, 1, 0, 3]);
+        assert_eq!(d, vec![1.0, 2.0, 4.0, 5.0]);
     }
 }

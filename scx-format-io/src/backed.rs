@@ -1825,12 +1825,84 @@ impl BackedCsrReader {
         }
 
         let n_rows = indptr.len().saturating_sub(1);
+        self.check_decoded_shard_rows(shard_idx, n_rows)?;
+        self.check_decoded_shard_minor(shard_idx)?;
         Ok(ScxCsr::new_unchecked(
             (n_rows, self.n_vars),
             indptr,
             indices,
             data,
         ))
+    }
+
+    /// Reject a shard whose decoded row count disagrees with the row range the
+    /// catalog assigned it.
+    ///
+    /// The two numbers come from independent places and nothing used to compare
+    /// them. `n_rows` is derived from the decoded indptr, whose length the shard
+    /// header governs — and that header sits in the section payload, which the
+    /// fast read path deliberately does not re-hash (`read_shard_from_entry`
+    /// documents the omission). The row range comes from the catalog stats,
+    /// which the catalog's BLAKE3 *does* cover. Truncation, a partial write, or
+    /// a hostile file separates them.
+    ///
+    /// It matters because every caller addresses a row as
+    /// `row - shard_row_start`, taking the offset from the catalog and applying
+    /// it to the decoded indptr: `read_rows_with`'s full-shard fallback,
+    /// `read_rows`, `read_shard_cached*`, and the `ShardSource` impl. A shard
+    /// whose stats claim 8 rows but decodes to 4 panicked with an
+    /// index-out-of-bounds *inside the reader*.
+    ///
+    /// Both decode entry points call this — [`Self::decode_shard`] (the cached
+    /// path) and [`Self::read_shard_uncached`] (the streaming one). They build
+    /// their `ScxCsr` separately, so a check on one alone would leave the other
+    /// panicking.
+    ///
+    /// The range comes from `self.index`, **not** from the shard's catalog
+    /// entry: `ShardEntryLite::into_transient_full_entry` sets `stats: None`,
+    /// because the lite entry deliberately drops the row range and every row
+    /// lookup goes through [`BackedCsrIndex`].
+    /// Reconcile a shard header's declared minor extent against this reader's
+    /// authenticated column width, before the decoded CSR is handed out.
+    ///
+    /// The shared full-entry seam (`decode_shard_bytes`) does this against the
+    /// catalog's stats — but the backed reader passes a *transient* entry with
+    /// `stats: None` by design, so that check no-ops here and this path was the
+    /// one place a payload could still widen its own `n_minor`, smuggle an index
+    /// past the codec's bound, and produce an `ScxCsr` whose `shape.1` is
+    /// `self.n_vars`. Rust densify then rejects it, but the default read hands
+    /// those triples straight to `scipy.sparse.csr_matrix`, which accepts them —
+    /// and `.toarray()` misplaces the value into another row.
+    ///
+    /// O(1): the codec has already bounded every index against the header's
+    /// `n_minor`, so confirming that number equals the real width is enough to
+    /// know the bound it enforced was the right one.
+    fn check_decoded_shard_minor(&self, shard_idx: usize) -> Result<()> {
+        let Some(lite) = self.shard_entry(shard_idx) else {
+            return Ok(());
+        };
+        let sh = self
+            .reader
+            .read_shard_header(&lite.into_transient_full_entry())?;
+        crate::shard_decode::reconcile_declared_minor(
+            sh.n_minor,
+            self.n_vars as u64,
+            &format!("CSR shard {shard_idx}"),
+        )
+    }
+
+    fn check_decoded_shard_rows(&self, shard_idx: usize, n_rows: usize) -> Result<()> {
+        let Some((row_start, row_end)) = self.index.shard_range(shard_idx) else {
+            return Ok(());
+        };
+        let expected = row_end.saturating_sub(row_start) as usize;
+        if expected != n_rows {
+            return Err(ScxError::InvalidCatalog(format!(
+                "CSR shard {shard_idx} covers rows {row_start}..{row_end} ({expected} rows) \
+                 per the catalog, but decoded {n_rows} rows (truncated or corrupt file)"
+            )));
+        }
+        Ok(())
     }
 
     /// Read and optionally cache a single decoded shard (owned clone).
@@ -1886,6 +1958,10 @@ impl BackedCsrReader {
             .reader
             .read_shard_from_entry(&lite.into_transient_full_entry())?;
         let n_rows = indptr.len().saturating_sub(1);
+
+        self.check_decoded_shard_rows(shard_idx, n_rows)?;
+        self.check_decoded_shard_minor(shard_idx)?;
+
         let csr = Arc::new(ScxCsr::new_unchecked(
             (n_rows, self.n_vars),
             indptr,

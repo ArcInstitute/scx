@@ -3599,6 +3599,7 @@ impl ScxReader {
             Some(keep) => keep,
             None => return Ok(csr),
         };
+        crate::deletion_vectors::check_keep_mask_covers_csr(keep.len(), csr.shape.0)?;
 
         // Filter CSR rows
         let mut new_indptr = vec![0i64];
@@ -3933,6 +3934,26 @@ impl ScxReader {
             "block_index",
         )?;
 
+        // Third seam: this path bounds decoded indices by `header.n_minor` alone,
+        // so without this it stayed the one way a widened payload could still get
+        // an out-of-range index out of the reader — via a *scattered* framed read
+        // while the whole-shard paths rejected the same file.
+        // The minor axis is per shard *class*, not universal: a row-major shard's
+        // minor extent is the column count, a CSC sidecar's is `n_obs`. Using
+        // `n_vars` for both rejected every scattered CSC read — caught by
+        // `read_csc_columns_scattered_matches_full_decode`.
+        let authenticated_minor =
+            if crate::shard_decode::catalog_says_column_major(entry.section_type) {
+                self.header.n_obs
+            } else {
+                self.header.n_vars
+            };
+        crate::shard_decode::reconcile_declared_minor(
+            header.n_minor,
+            authenticated_minor,
+            &format!("shard '{}'", entry.name),
+        )?;
+
         let spans = crate::shard::resolve_block_index(&header, block_index_bytes)?;
         let find_group = |row: usize| -> usize {
             spans
@@ -3967,11 +3988,29 @@ impl ScxReader {
                     entry.name
                 ))
             })?;
-            let scipy = scx_codec::decoded_shard_to_scipy(decoded, venc).map_err(|e| {
-                ScxError::InvalidCatalog(format!(
-                    "row-group convert of {} group {g}: {e}",
+            // The third decode seam: this path calls `scx_codec::decode_row_group`
+            // directly and never passes through `decode_shard_regions_scipy`, so
+            // it has to supply the minor-axis bound itself. Without it a partial
+            // (block-index) read would be the one remaining way to get an
+            // unvalidated column index out of the reader.
+            let scipy = scx_codec::decoded_shard_to_scipy(
+                decoded,
+                venc,
+                scx_codec::clamp_index_bound(header.n_minor),
+            )
+            // An out-of-range index must keep its structured
+            // `ShardIndexOutOfRange` identity, so let the promoting
+            // `From<CodecError>` handle that variant and only wrap the rest with
+            // the shard name. Blanket-wrapping in `InvalidCatalog` kept the
+            // error class right but destroyed the variant, so a caller matching
+            // on `ShardIndexOutOfRange` saw this seam behave differently from
+            // every other one.
+            .map_err(|e| match e {
+                scx_codec::CodecError::IndexOutOfRange { .. } => ScxError::from(e),
+                other => ScxError::InvalidCatalog(format!(
+                    "row-group convert of {} group {g}: {other}",
                     entry.name
-                ))
+                )),
             })?;
             group_cache.insert(g, scipy);
         }

@@ -143,16 +143,54 @@ impl ScxCsr {
     ///
     /// Violating any invariant causes out-of-bounds reads in downstream
     /// operations (SpMM, column projection, iteration). These are logic bugs,
-    /// not memory-safety UB — they will trigger bounds-check panics rather
-    /// than silently return wrong answers. A future refactor could upgrade
-    /// this constructor to an `unsafe fn` if the accessors ever switch to
-    /// unchecked indexing.
+    /// not memory-safety UB. A future refactor could upgrade this constructor
+    /// to an `unsafe fn` if the accessors ever switch to unchecked indexing.
     ///
-    /// In debug builds, invariants 1–3 are checked via `debug_assert!`; if
+    /// ⚠️ **A violation does not always announce itself.** This comment used to
+    /// promise that breaking an invariant "will trigger bounds-check panics
+    /// rather than silently return wrong answers". That is false for invariant
+    /// 5 on the dense paths: [`Self::to_dense`] and its typed twin in
+    /// `scx-format-io` write `dense[row_base + col as usize]`, where an
+    /// out-of-range `col` runs off the end of one row into the next — a
+    /// plausible, wrong matrix and no panic — and a negative one becomes ~2^64
+    /// and wraps the add in release.
+    ///
+    /// In debug builds, invariants 1–4 are checked via `debug_assert!`; if
     /// that fires the caller has a bug.
     ///
-    /// Use when the data is known to be valid (e.g., decoded from
-    /// checksummed shards).
+    /// # Who upholds invariant 5
+    ///
+    /// Not this constructor, and for a long time nobody: the readers passed
+    /// decoded shard data straight in, and a shard payload is **not** covered by
+    /// the catalog checksum (`ScxReader::read_shard_from_entry` documents that
+    /// omission). "Decoded from checksummed shards" was never the guarantee it
+    /// sounds like.
+    ///
+    /// It is enforced now, once per shard, at the `scx-format-io` decode seam —
+    /// on the scipy path by the bound handed to `scx_codec::decode_shard_scipy`,
+    /// on the native path by its own pass — and the seam first requires the
+    /// shard header's declared width to match the catalog's authenticated one,
+    /// so a corrupt payload cannot widen its own bound to smuggle an index
+    /// through. A CSR that comes out of a reader satisfies invariant 5 against
+    /// the width the catalog records.
+    ///
+    /// One gap survives that: a **v1** catalog does not record a minor extent
+    /// (`col_start`/`col_end` are v2-only and read as `0`), so on those files
+    /// there is nothing to reconcile against and the header's `n_minor` stands
+    /// alone. Same for a legacy multimodal shard, whose `n_minor` is `0` —
+    /// "undeclared", not "zero columns" — where the bound is skipped entirely.
+    ///
+    /// Callers constructing a CSR from anywhere *other* than a reader still owe
+    /// the invariant themselves, and one known caller does not yet discharge it:
+    /// `rscx::interop::write_csc_shards_from_csr_r` builds a CSR from
+    /// R-supplied index vectors and does not bound them against `n_vars`
+    /// (`scx_sparse::validate_csr_arrays` is called only on rscx's *export*
+    /// side). The consequence is now a detectable one rather than a silent one —
+    /// such a file is rejected when read back instead of materialising a wrong
+    /// dense matrix — but the write side should validate. Tracked separately;
+    /// not part of the reader-side work that added this note.
+    ///
+    /// Use when the data is known to be valid.
     pub fn new_unchecked(
         shape: (usize, usize),
         indptr: Vec<i64>,
@@ -259,6 +297,35 @@ impl ScxCsr {
                 rows: n_rows,
                 cols: n_cols,
             })?;
+        // Invariant 5 (`indices[k] ∈ [0, n_cols)`) is a *caller* obligation on
+        // `new_unchecked`, and this is the one method where breaking it does not
+        // announce itself: `dense[row_base + col]` with an out-of-range column
+        // runs off the end of one row into the next and returns a plausible,
+        // wrong matrix — no panic, no error. (A negative index becomes ~2^64 and
+        // wraps the add in release.) Everywhere else an out-of-range index
+        // addresses a `Vec` sized by the same axis, so it panics.
+        //
+        // The readers bound decoded indices at the decode seam, but against the
+        // *shard header's* `n_minor`, while this scatters into a buffer sized by
+        // `shape.1`. Those agree on any file a writer produced — they are still
+        // two different numbers, and this is a public API reachable from callers
+        // that never went through a reader at all.
+        //
+        // One pass, against an allocation of `n_rows × n_cols` that this function
+        // is about to make anyway.
+        if let Some((position, &index)) = self
+            .indices
+            .iter()
+            .enumerate()
+            .find(|&(_, &c)| c < 0 || c as usize >= n_cols)
+        {
+            return Err(CsrError::IndexOutOfRange {
+                index,
+                n_cols,
+                position,
+            });
+        }
+
         let mut dense = vec![T::default(); total];
         for row in 0..n_rows {
             let start = self.indptr[row] as usize;
@@ -676,6 +743,57 @@ mod tests {
         assert_eq!(csr.n_rows(), 0);
         assert_eq!(csr.n_cols(), 0);
         assert_eq!(csr.nnz(), 0);
+    }
+
+    /// `to_dense_dtype` is the scatter where breaking invariant 5 is silent,
+    /// and `to_dense` delegates to it — so this guard covers every densify call
+    /// site, including `pyscx`'s query / `obs_filter` path
+    /// (`convert/interop.rs::csr_to_scipy_typed`), which the typed twin in
+    /// `scx-format-io` does not reach.
+    ///
+    /// Pins the corruption arithmetic, not just the error: with the guard
+    /// removed, `dense[row_base + col]` for row 1 / column 12 of a 3x10 matrix
+    /// writes flat index 22 — row 2, column 2 — and returns a well-formed wrong
+    /// matrix. An `is_err()` assertion would pass against a build that panicked
+    /// instead and would not characterise the defect.
+    #[test]
+    fn to_dense_dtype_rejects_an_out_of_range_column() {
+        let csr = ScxCsr::new_unchecked(
+            (3, 10),
+            vec![0, 1, 3, 4],
+            vec![0, 12, 3, 9],
+            vec![11.0, 22.0, 33.0, 44.0],
+        );
+        match csr.to_dense() {
+            Err(CsrError::IndexOutOfRange {
+                index,
+                n_cols,
+                position,
+            }) => assert_eq!((index, n_cols, position), (12, 10, 1)),
+            other => panic!("expected IndexOutOfRange, got {other:?}"),
+        }
+
+        // Where the unguarded write would have landed: `row_base + col` for
+        // row 1 of a 10-column matrix is 10 + 12 = 22, i.e. row 2, column 2.
+        let (row, n_cols, col) = (1usize, 10usize, 12usize);
+        assert_eq!(row * n_cols + col, 22);
+        assert_eq!((row * n_cols + col) / n_cols, 2, "lands in row 2");
+
+        // A negative column is the other half: `col as usize` makes it ~2^64 and
+        // the add wraps in release rather than panicking.
+        let neg = ScxCsr::new_unchecked((2, 4), vec![0, 1, 2], vec![0, -1], vec![1.0, 2.0]);
+        assert!(matches!(
+            neg.to_dense(),
+            Err(CsrError::IndexOutOfRange { index: -1, .. })
+        ));
+    }
+
+    /// Control: the guard must not reject a full-width matrix. Without this an
+    /// off-by-one (`>` for `>=`) would pass the test above.
+    #[test]
+    fn to_dense_dtype_accepts_the_largest_legal_column() {
+        let csr = ScxCsr::new_unchecked((1, 4), vec![0, 2], vec![0, 3], vec![7.0, 9.0]);
+        assert_eq!(csr.to_dense().unwrap(), vec![7.0, 0.0, 0.0, 9.0]);
     }
 
     #[test]

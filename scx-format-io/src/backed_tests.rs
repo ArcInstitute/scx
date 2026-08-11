@@ -2290,3 +2290,333 @@ fn catalog_int_value_max_reports_zero_for_an_empty_matrix() {
     assert_eq!(backed.total_nnz().unwrap(), 0);
     assert_eq!(backed.catalog_int_value_max(), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// A shard that decodes fewer rows than the catalog claims
+// ---------------------------------------------------------------------------
+
+/// Write a single-shard file, then rewrite the shard header in place so it
+/// declares fewer rows than the catalog entry does.
+///
+/// The two counts live in different places and neither authenticates the other:
+/// `BackedCsrIndex` reads `(row_start, row_end)` from the catalog stats, which
+/// the catalog's BLAKE3 covers; `decode_shard` derives the row count from the
+/// decoded indptr, whose length is governed by the shard header — inside the
+/// section payload, which the fast read path deliberately does not re-hash
+/// (`read_shard_from_entry` says so in its own doc). Truncation, a partial
+/// write, or a hostile file separates them.
+///
+/// `n_major` and `indptr_length` are patched together because the `None` codec
+/// requires `indptr_bytes.len() == (n_major + 1) * 8` — so the shard stays
+/// internally consistent and decodes cleanly to `new_rows`. That is the point:
+/// nothing about the shard is detectably wrong until it is compared to the
+/// catalog.
+fn write_shard_shrunk_in_header(
+    dir: &TempDir,
+    n_obs: usize,
+    n_vars: usize,
+    new_rows: u32,
+) -> std::path::PathBuf {
+    let path = dir.path().join("shrunk.scx");
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    let header = sample_header(n_obs as u64, n_vars as u64, *indptr.last().unwrap());
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    // Locate the shard section, then patch its header in place.
+    let offset = {
+        let reader = ScxReader::open(&path).unwrap();
+        let entry = reader
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::CsrShard)
+            .expect("one CSR shard");
+        entry.offset as usize
+    };
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    // ShardHeader field byte offsets, per `ShardHeader::write_to`:
+    //   n_major 12, nnz 20, indptr_length 40, indices_length 48,
+    //   values_length 56.
+    //
+    // Every one of these is patched so the shrunk shard stays *internally*
+    // coherent — `sample_shard_data` gives 2 nnz per row, indices are u16
+    // (n_vars ≤ 65535) and values u8. A shard that were internally inconsistent
+    // would be caught by the codec's own length checks and would test those
+    // instead of the catalog comparison this exists for.
+    let new_nnz = (new_rows as u64) * 2;
+    bytes[offset + 12..offset + 16].copy_from_slice(&new_rows.to_le_bytes());
+    bytes[offset + 20..offset + 28].copy_from_slice(&new_nnz.to_le_bytes());
+    bytes[offset + 40..offset + 44].copy_from_slice(&((new_rows + 1) * 8).to_le_bytes());
+    bytes[offset + 48..offset + 52].copy_from_slice(&((new_nnz as u32) * 2).to_le_bytes());
+    bytes[offset + 56..offset + 60].copy_from_slice(&(new_nnz as u32).to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    path
+}
+
+/// The catalog says this shard covers 8 rows; it decodes to 4.
+///
+/// `read_rows_with`'s full-shard fallback computes each row's position as
+/// `row - shard_row_start` from the **catalog** and then indexes the *decoded*
+/// indptr with it — an index-out-of-bounds panic inside the reader, where the
+/// convention requires an error.
+///
+/// The check goes in `decode_shard` rather than at that call site, because the
+/// same decoded `ScxCsr` is handed to `read_rows_with`, `read_shard_cached*`
+/// and the `ShardSource` impl; all three are asserted here so the guard is
+/// pinned to the decode, not to the one caller the panic surfaced through.
+#[test]
+fn shard_decoding_fewer_rows_than_the_catalog_claims_errors() {
+    let dir = TempDir::new().unwrap();
+    let path = write_shard_shrunk_in_header(&dir, 8, 10, 4);
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+
+    let err = backed
+        .read_rows_with(&[0, 7], |_, _, _| Ok(()))
+        .expect_err("the full-shard fallback must error, not panic");
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains('8') && msg.contains('4'),
+        "the error must report both counts so the file can be diagnosed: {msg}"
+    );
+
+    // Same guard, reached through the shard cache directly.
+    assert!(
+        backed.read_shard_cached_arc(0).is_err(),
+        "the cache must not hand out a short shard either"
+    );
+
+    // `read_shard_uncached` is a second, independent decode entry point — it
+    // builds its own `ScxCsr` and never touches `decode_shard`. It is public and
+    // streaming callers use it, so a guard placed only on the cached path would
+    // leave this one panicking.
+    assert!(
+        backed.read_shard_uncached(0).is_err(),
+        "the uncached decode path needs the same guard"
+    );
+
+    // `read_rows` was already guarded — by a *different* check, downstream,
+    // which rejects the row slice rather than the shard. Asserting only through
+    // it would have looked like proof while testing nothing: pin the error type
+    // so a future refactor cannot quietly route this path back to the panic.
+    let err = backed.read_rows(0, 8).unwrap_err();
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "read_rows should now fail at the decode, not at the row slice: {err:?}"
+    );
+}
+
+/// Control: an untouched file with the same shape still reads. Without this a
+/// guard that rejected every shard would pass the test above.
+#[test]
+fn a_shard_whose_rows_match_the_catalog_still_reads() {
+    let dir = TempDir::new().unwrap();
+    let (backed, full) = write_test_file_and_open(&dir, 8, 10, 1, 4);
+    let got = backed.read_rows(0, 8).unwrap();
+    assert_eq!(got.shape.0, 8);
+    assert_eq!(full.shape.0, 8);
+}
+
+/// The block-index row-run path is the **third** decode seam: it calls
+/// `scx_codec::decode_row_group` directly and never passes through
+/// `decode_shard_regions_scipy`, so it needs the minor-axis bound check by hand.
+///
+/// Without it, a *partial* read of a framed shard would be the one remaining way
+/// to get an unvalidated column index out of the reader — the two whole-shard
+/// seams would look fully guarded while a scattered `read_rows_with` over the
+/// same file handed the bad index straight to the caller.
+///
+/// The shard is written legitimately and then its header's `n_minor` is narrowed
+/// in place, so the payload decodes cleanly and only a comparison against
+/// `n_minor` can catch it.
+#[test]
+fn the_block_index_row_run_path_rejects_an_out_of_range_index() {
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+
+    // Narrow every CSR shard header's n_minor from 100 to 8; `sample_shard_data`
+    // puts columns up to 99 in there, so most rows now carry out-of-range indices.
+    let offsets: Vec<usize> = {
+        let reader = ScxReader::open(&path).unwrap();
+        reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard)
+            .map(|e| e.offset as usize)
+            .collect()
+    };
+    assert_eq!(offsets.len(), 2, "fixture should have two shards");
+    let mut bytes = std::fs::read(&path).unwrap();
+    for off in offsets {
+        // n_minor is at byte 16 of the shard header (`ShardHeader::write_to`).
+        bytes[off + 16..off + 20].copy_from_slice(&8u32.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+
+    // A scattered read is what selects the block-index path (a dense request
+    // would fall back to a full-shard decode, which the other seam guards).
+    let err = backed
+        .read_rows_with(&[1, 9, 30], |_, _, _| Ok(()))
+        .expect_err("a scattered framed read must reject the out-of-range index");
+    assert!(
+        matches!(err, ScxError::ShardIndexOutOfRange { .. })
+            || matches!(err, ScxError::InvalidCatalog(_)),
+        "expected an index/catalog error, got {err:?}"
+    );
+}
+
+/// A shard header that *widens* its own `n_minor` past the catalog's width.
+///
+/// This is the move the seam's original bound could not stop. Indices were
+/// checked against the payload's own `n_minor`, so raising it smuggled an index
+/// through that is still out of range for the matrix the catalog describes —
+/// and the default (non-dense) read then handed `scipy.sparse.csr_matrix` a
+/// structurally invalid matrix, whose `.toarray()` misplaces the value into
+/// another row. Guarding only the densify sites left that open, because the
+/// corruption happened on scipy's side of the boundary.
+///
+/// The catalog is the authority: its BLAKE3 covers catalog bytes, while the
+/// shard payload is not covered at all. Requiring the two to agree removes the
+/// move entirely — the payload cannot widen itself.
+#[test]
+fn a_shard_header_that_widens_n_minor_past_the_catalog_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let n_vars = 10usize;
+    let path = dir.path().join("widened.scx");
+    let (indptr, indices, values) = sample_shard_data(6, n_vars);
+    let header = sample_header(6, n_vars as u64, *indptr.last().unwrap());
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(6)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    // Sanity: it reads before we touch it.
+    ScxReader::open(&path)
+        .unwrap()
+        .read_all_csr_shards()
+        .expect("fixture must be readable before the mutation");
+
+    // Widen n_minor (shard-header byte 16) from 10 to 13, leaving the catalog's
+    // authenticated col_end at 10.
+    let offset = {
+        let reader = ScxReader::open(&path).unwrap();
+        reader
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::CsrShard)
+            .expect("one CSR shard")
+            .offset as usize
+    };
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(bytes[offset + 16..offset + 20].try_into().unwrap()),
+        n_vars as u32,
+    );
+    bytes[offset + 16..offset + 20].copy_from_slice(&13u32.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let err = ScxReader::open(&path)
+        .unwrap()
+        .read_all_csr_shards()
+        .expect_err("a header/catalog width disagreement must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("13") && msg.contains("10"),
+        "must report both widths so the file can be diagnosed: {msg}"
+    );
+
+    // The eager path alone is not proof. `BackedCsrReader` passes a *transient*
+    // entry with `stats: None`, so the catalog-stats reconcile no-ops there and
+    // this was the surface that stayed open after the first attempt: backed
+    // AnnData, lazy transforms and every `ShardSource` accelerator read through
+    // it. Measured before the fix: `read_shard_cached_arc` returned
+    // `Ok(shape=(6, 10))` carrying an index of 12.
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    for (what, r) in [
+        (
+            "read_shard_cached_arc",
+            backed.read_shard_cached_arc(0).map(|_| ()),
+        ),
+        (
+            "read_shard_uncached",
+            backed.read_shard_uncached(0).map(|_| ()),
+        ),
+        (
+            "read_rows_with",
+            backed.read_rows_with(&[0, 3], |_, _, _| Ok(())),
+        ),
+    ] {
+        assert!(
+            r.is_err(),
+            "{what}: the backed path must reject a widened header too"
+        );
+    }
+}
+
+/// The framed **block-index** path is a third seam: it decodes row-groups
+/// directly and bounds them by `header.n_minor` alone, so a widened payload
+/// could still get an out-of-range index out through a *scattered* read while
+/// the whole-shard paths rejected the same file.
+#[test]
+fn the_block_index_path_also_rejects_a_widened_header() {
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+
+    let offsets: Vec<usize> = {
+        let reader = ScxReader::open(&path).unwrap();
+        reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard)
+            .map(|e| e.offset as usize)
+            .collect()
+    };
+    let mut bytes = std::fs::read(&path).unwrap();
+    for off in &offsets {
+        // Widen n_minor (shard-header byte 16) from 100 to 128.
+        bytes[off + 16..off + 20].copy_from_slice(&128u32.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    // A scattered request is what selects the block-index path; a dense one
+    // falls back to a full-shard decode, which a different guard covers.
+    assert!(
+        backed
+            .read_rows_with(&[1, 9, 30], |_, _, _| Ok(()))
+            .is_err(),
+        "a scattered framed read must reject a widened header"
+    );
+}

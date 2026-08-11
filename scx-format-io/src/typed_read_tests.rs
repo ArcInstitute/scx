@@ -39,14 +39,13 @@ fn assert_native_matches_scipy(
     assert_eq!(&n_as_f32, s_data, "values differ");
 }
 
-fn decode_both(
-    codec: CodecId,
-    values: &[f32],
-    framing: Option<FramingConfig>,
-) -> (
+/// `(native decode, scipy decode)` of the same shard, for the parity assertions.
+type NativeAndScipy = (
     (Vec<i64>, Vec<u32>, ShardValuesNative),
     (Vec<i64>, Vec<i32>, Vec<f32>),
-) {
+);
+
+fn decode_both(codec: CodecId, values: &[f32], framing: Option<FramingConfig>) -> NativeAndScipy {
     let indptr = [0u64, 2, 2, 5, 7];
     let indices = [0u32, 3, 1, 4, 9, 2, 8];
     let n_cols: u32 = 16;
@@ -637,7 +636,7 @@ fn typed_read_applies_deletion_vectors() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("dv.scx");
-    let shards = vec![u8_shard(6, 10, 0, 0)];
+    let shards = [u8_shard(6, 10, 0, 0)];
     let total_nnz: u64 = *shards[0].0.last().unwrap();
     let hdr = header(6, 10, total_nnz);
     let mut writer = ScxWriter::new(&path, hdr).unwrap();
@@ -669,5 +668,138 @@ fn typed_read_applies_deletion_vectors() {
     match &typed.values {
         ValueBuffer::U16(v) => assert_eq!(v, &want_v),
         _ => panic!("wrong arm"),
+    }
+}
+
+/// The typed twin of `deletion_mask_longer_than_csr_errors` /
+/// `deletion_mask_shorter_than_csr_errors`.
+///
+/// These two paths are each other's oracle in
+/// `typed_read_applies_deletion_vectors`, which asserts the typed result equals
+/// the f32 result. That agreement is only evidence if both sides reject the
+/// same malformed input — a guard on one side alone would make them disagree
+/// on exactly the files where the comparison matters.
+#[cfg(feature = "deletion-vectors")]
+#[test]
+fn typed_deletion_mask_must_match_the_csr_row_count() {
+    use crate::deletion_vectors::DeletionVectors;
+
+    let dir = tempfile::tempdir().unwrap();
+    // n_obs declared vs CSR rows actually written.
+    let build = |name: &str, n_obs: usize, csr_rows: usize| -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let (ip, ix, v, enc, rs) = u8_shard(csr_rows, 10, 0, 0);
+        let hdr = header(n_obs as u64, 10, *ip.last().unwrap());
+        let mut writer = ScxWriter::new(&path, hdr).unwrap();
+        writer.write_obs(&obs_batch(n_obs)).unwrap();
+        writer.write_var(&var_batch(10)).unwrap();
+        writer
+            .write_csr_shard(&ip, &ix, &v, CodecId::None, enc, rs)
+            .unwrap();
+        let mut dv = DeletionVectors::new();
+        dv.insert_global([0u32]);
+        writer.write_deletion_vectors(&dv).unwrap();
+        writer.finish().unwrap();
+        path
+    };
+
+    let plan = MaterializePlan {
+        container: Container::Csr,
+        data_dtype: ValueDtype::U16,
+        index_dtype: IndexDtype::I32,
+        allow_lossy: false,
+    };
+
+    for (name, n_obs, csr_rows, what) in [
+        (
+            "typed_mask_long.scx",
+            10usize,
+            4usize,
+            "mask longer than CSR",
+        ),
+        ("typed_mask_short.scx", 4, 10, "mask shorter than CSR"),
+    ] {
+        let path = build(name, n_obs, csr_rows);
+        let reader = ScxReader::open(&path).unwrap();
+        let err = reader
+            .read_all_csr_shards_typed(&plan)
+            .expect_err(&format!("{what} must be rejected, not answered"));
+        assert!(
+            matches!(err, crate::error::ScxError::InvalidCatalog(_)),
+            "{what}: expected InvalidCatalog, got {err:?}"
+        );
+    }
+
+    // Control: agreeing counts still filter, so the guard is not rejecting
+    // every file.
+    let path = build("typed_mask_ok.scx", 6, 6);
+    let reader = ScxReader::open(&path).unwrap();
+    let typed = reader.read_all_csr_shards_typed(&plan).unwrap();
+    assert_eq!(typed.shape.0, 5, "one of six rows was deleted");
+}
+
+/// The dense scatter is bounded by the **assembled matrix's** `n_cols` (the
+/// file header's `n_vars`), while the decode seam validates against the
+/// **shard header's** `n_minor`. On any file a writer produced those are equal,
+/// so the seam covers the scatter — but they are two independent numbers, and a
+/// corrupt shard claiming `n_minor > n_vars` passes the seam while carrying an
+/// index the scatter cannot hold.
+///
+/// The gap matters at this one site because a violation here is **silent**.
+/// The assertions below pin the corruption, not merely the error: pre-fix,
+/// `dense[base + col]` with `col = 12` and `n_cols = 10` wrote two cells into
+/// the *next* row and returned a plausible, wrong 3x10 matrix — no panic, no
+/// error. Asserting only `is_err()` would pass against a build that panicked
+/// instead, and would not characterise the bug at all.
+#[test]
+fn dense_scatter_rejects_an_index_the_seam_bound_let_through() {
+    use scx_sparse::TypedCsr;
+
+    // 3x10, but row 1 carries column 12 — beyond `n_cols`, and beyond anything
+    // this matrix can hold.
+    let csr = TypedCsr {
+        shape: (3, 10),
+        indptr: vec![0, 1, 3, 4],
+        indices: IndexBuffer::I32(vec![0, 12, 3, 9]),
+        values: ValueBuffer::U16(vec![11, 22, 33, 44]),
+    };
+
+    let err = super::scatter_typed_csr_to_dense(&csr)
+        .expect_err("an index past n_cols must be rejected, not scattered");
+    match err {
+        crate::error::ScxError::ShardIndexOutOfRange {
+            index,
+            position,
+            n_minor,
+        } => assert_eq!((index, position, n_minor), (12, 1, 10)),
+        other => panic!("expected ShardIndexOutOfRange, got {other:?}"),
+    }
+
+    // Characterise what the unguarded write would have done, so the failure this
+    // guards is on the record rather than described: `base + col` for row 1 is
+    // `10 + 12 = 22`, which lands in row 2 (cells 20..30) — a value silently
+    // attributed to the wrong cell of the wrong row.
+    let (row, col, n_cols) = (1usize, 12usize, 10usize);
+    let flat = row * n_cols + col;
+    assert_eq!(flat, 22);
+    assert_eq!(flat / n_cols, 2, "row 1's value lands in row 2");
+
+    // Control: the same matrix with an in-range index scatters normally, so the
+    // guard is not rejecting every dense read.
+    let ok = TypedCsr {
+        shape: (3, 10),
+        indptr: vec![0, 1, 3, 4],
+        indices: IndexBuffer::I32(vec![0, 2, 3, 9]),
+        values: ValueBuffer::U16(vec![11, 22, 33, 44]),
+    };
+    let dense = super::scatter_typed_csr_to_dense(&ok).expect("in-range indices scatter");
+    match dense.values {
+        ValueBuffer::U16(v) => {
+            assert_eq!(v.len(), 30);
+            assert_eq!(v[0], 11);
+            assert_eq!(v[12], 22, "row 1, col 2");
+            assert_eq!(v[29], 44, "row 2, col 9");
+        }
+        other => panic!("wrong arm: {other:?}"),
     }
 }

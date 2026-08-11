@@ -344,6 +344,34 @@ impl Default for DeletionVectors {
     }
 }
 
+/// Assert that a keep mask and the CSR it is about to filter describe the same
+/// rows, before anything indexes one by the other.
+///
+/// The two counts come from independent places and nothing used to compare
+/// them: a mask is `header.n_obs` long ([`DeletionVectors::build_keep_mask`]),
+/// while the assembled CSR's row count is `Σ(row_end − row_start)` over the
+/// catalog's shard stats. On a truncated or hostile file they diverge, and the
+/// row filters walk the mask while indexing `csr.indptr[row + 1]`.
+///
+/// Both directions are rejected, and the *shorter* one is the reason this
+/// enforces equality rather than just the bound that panics. A longer mask runs
+/// off the end of `indptr` — an index-out-of-bounds panic inside the reader,
+/// which is loud but violates the convention that readers return errors. A
+/// shorter mask never panics at all: it simply stops early and returns a
+/// quietly truncated matrix. That is the same corruption delivered as an
+/// answer, which is worse.
+#[cfg(feature = "deletion-vectors")]
+pub(crate) fn check_keep_mask_covers_csr(mask_len: usize, csr_rows: usize) -> Result<()> {
+    if mask_len != csr_rows {
+        return Err(ScxError::InvalidCatalog(format!(
+            "deletion keep mask covers {mask_len} obs rows but the assembled CSR has \
+             {csr_rows} rows; the file's header n_obs and its CSR shard row ranges \
+             disagree (truncated or corrupt file)"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

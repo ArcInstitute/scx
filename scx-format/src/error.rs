@@ -114,6 +114,44 @@ pub enum ScxError {
     #[error("malformed block index: {0}")]
     InvalidBlockIndex(String),
 
+    /// A decoded minor-axis index (column for row-major shards, row for CSC)
+    /// falls outside `[0, n_minor)`.
+    ///
+    /// The catalog's BLAKE3 covers catalog bytes, not shard payloads, so a
+    /// decoded index is **unauthenticated** — see
+    /// [`ScxError::AllocationTooLarge`] and `clamped_reserve` for the same
+    /// reasoning applied to declared lengths. Every consumer of a decoded shard
+    /// uses the index to address a buffer sized by `n_minor`; the readers
+    /// validate it once at the decode seam so those consumers can index
+    /// unchecked.
+    ///
+    /// `index` is reported as the decoded `u32`: a negative `i32` from a
+    /// scipy-side decode reinterprets to a value `≥ 2³¹` here, which is how it
+    /// is detected in the first place.
+    #[error(
+        "minor-axis index {index} at position {position} is out of range for n_minor \
+         {n_minor} (corrupt or truncated shard payload; a negative index reads as ≥ 2^31 here)"
+    )]
+    ShardIndexOutOfRange {
+        index: u32,
+        position: usize,
+        n_minor: u32,
+    },
+
+    /// A row-group-framed shard was asked for with zero rows.
+    ///
+    /// Framing emits one [`crate::BlockIndexEntry`] per row group, so a zero-row
+    /// shard produces an **empty** block index — which `resolve_block_index`
+    /// rejects on every read. Such a shard writes and checksums cleanly and then
+    /// fails every read, so the writer refuses it instead. (Readers still accept
+    /// an empty block index when the header agrees the shard is empty, so files
+    /// written before this guard remain readable.)
+    #[error(
+        "refusing to row-group-frame a zero-row shard: framing would emit an empty block \
+         index, which no reader accepts. Skip the shard instead of writing an empty one."
+    )]
+    ZeroRowFramedShard,
+
     #[error("n_vars {0} exceeds u32::MAX, cannot fit in shard header n_minor field")]
     NVarsOverflow(u64),
 
@@ -149,7 +187,7 @@ pub enum ScxError {
     Csr(#[from] scx_sparse::CsrError),
 
     #[error("codec error: {0}")]
-    Codec(#[from] scx_codec::CodecError),
+    Codec(scx_codec::CodecError),
 
     #[error("CSC transpose failed: {0}")]
     CscTranspose(String),
@@ -249,6 +287,9 @@ impl ScxError {
             | ScxError::ShardStreamTooLarge(_)
             | ScxError::StaleCscSidecar { .. }
             | ScxError::ColumnStatsOverflow(_)
+            // Write-path only: no file exists yet, so `CorruptFile`'s "re-run
+            // conversion" suffix would point the caller at nothing.
+            | ScxError::ZeroRowFramedShard
             | ScxError::UnsupportedColumnType { .. }
             | ScxError::DuplicateSection { .. }
             | ScxError::ObsLayoutConflict { .. }
@@ -283,6 +324,7 @@ impl ScxError {
             | ScxError::SectionOutOfBounds { .. }
             | ScxError::AllocationTooLarge { .. }
             | ScxError::InvalidBlockIndex(_)
+            | ScxError::ShardIndexOutOfRange { .. }
             | ScxError::ColumnStatsShardCountMismatch { .. } => ScxErrorClass::CorruptFile,
             ScxError::Io(io_err) => ScxErrorClass::Io(io_err.kind()),
             // Deliberately NOT `CorruptFile`: both files are intact. The
@@ -409,6 +451,12 @@ mod tests {
             .class(),
             ScxErrorClass::Validation
         );
+        // Write-path only — no file exists yet, so `CorruptFile`'s "re-run
+        // conversion" suffix would send the caller to fix nothing.
+        assert_eq!(
+            ScxError::ZeroRowFramedShard.class(),
+            ScxErrorClass::Validation
+        );
 
         // CorruptFile: malformed/unreadable on-disk data (previously Other,
         // now surfaced as ValueError rather than RuntimeError in pyscx).
@@ -418,6 +466,18 @@ mod tests {
         );
         assert_eq!(
             ScxError::UnknownValueEncoding(7).class(),
+            ScxErrorClass::CorruptFile
+        );
+        // A decoded index outside `[0, n_minor)` means the shard payload is
+        // malformed — the payload is not covered by the catalog checksum, so
+        // this is the read-path detection of genuine corruption.
+        assert_eq!(
+            ScxError::ShardIndexOutOfRange {
+                index: u32::MAX,
+                position: 3,
+                n_minor: 100,
+            }
+            .class(),
             ScxErrorClass::CorruptFile
         );
         assert_eq!(
@@ -499,5 +559,38 @@ mod tests {
             ScxError::CscTranspose("boom".into()).class(),
             ScxErrorClass::Other
         );
+    }
+}
+
+impl From<scx_codec::CodecError> for ScxError {
+    /// Lift a codec error, promoting the one variant that is really a
+    /// *file-corruption* report rather than a codec failure.
+    ///
+    /// `CodecError::IndexOutOfRange` is raised when a decoded minor-axis index
+    /// falls outside the shard's declared column axis. On the scipy decode path
+    /// that check rides on the scan `scx-codec` already performs for the
+    /// `i32::MAX` sign guard, so it surfaces as a codec error; on the native
+    /// path the reader runs its own pass and raises
+    /// [`ScxError::ShardIndexOutOfRange`] directly.
+    ///
+    /// Mapping them together matters because they classify differently:
+    /// `Codec(_)` is [`ScxErrorClass::Other`] (a `RuntimeError` in pyscx) while
+    /// `ShardIndexOutOfRange` is [`ScxErrorClass::CorruptFile`] (a `ValueError`
+    /// naming the file as corrupt). Without this the same broken file would
+    /// raise two different Python exception types depending on whether the
+    /// caller asked for `f32` or a narrowed dtype.
+    fn from(e: scx_codec::CodecError) -> Self {
+        match e {
+            scx_codec::CodecError::IndexOutOfRange {
+                index,
+                position,
+                bound,
+            } => ScxError::ShardIndexOutOfRange {
+                index,
+                position,
+                n_minor: bound,
+            },
+            other => ScxError::Codec(other),
+        }
     }
 }

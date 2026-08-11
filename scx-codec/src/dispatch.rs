@@ -223,6 +223,25 @@ pub enum CodecError {
 
     #[error("malformed codec input: {0}")]
     MalformedInput(String),
+
+    /// A decoded minor-axis index is at or past the caller-supplied bound.
+    ///
+    /// Typed rather than folded into [`CodecError::MalformedInput`] so the
+    /// reader can map it onto `ScxError::ShardIndexOutOfRange` and have it
+    /// classify as `CorruptFile`. Without a distinct variant the scipy path
+    /// (where this bound rides on the existing `i32::MAX` scan) and the native
+    /// path (which runs its own pass) would report the same corruption as two
+    /// different error classes — `RuntimeError` on one and `ValueError` on the
+    /// other, from the same broken file.
+    #[error(
+        "column index {index} at position {position} is out of range for n_minor \
+         {bound} (corrupt or truncated shard payload)"
+    )]
+    IndexOutOfRange {
+        index: u32,
+        position: usize,
+        bound: u32,
+    },
 }
 
 /// Decoded shard: `(indptr, indices, values_raw_bytes)`.
@@ -347,6 +366,7 @@ pub fn decode_shard_scipy(
     n_rows: usize,
     nnz: usize,
     index_dtype_u16: bool,
+    index_bound: u32,
 ) -> Result<ScipyShard, CodecError> {
     // For Scx1, we can avoid the u32→raw_bytes→f32 chain for values
     if codec_id == CodecId::Scx1 {
@@ -373,7 +393,7 @@ pub fn decode_shard_scipy(
         // indices: forbp → Vec<u32> → Vec<i32>
         let (indices_u32, _) =
             forbp_decode_with_hint(encoded.indices_bytes, n_rows, nnz, index_dtype_u16)?;
-        let indices = u32_vec_to_i32(indices_u32)?;
+        let indices = u32_vec_to_i32_bounded(indices_u32, index_bound)?;
 
         // values: rice → Vec<u32> → Vec<f32> directly (skip raw bytes intermediate)
         let values_u32 = rice_decode(encoded.values_bytes, nnz, B_VAL)?;
@@ -392,7 +412,7 @@ pub fn decode_shard_scipy(
         index_dtype_u16,
     )?;
     let indptr = u64_vec_to_i64(indptr_u64)?;
-    let indices = u32_vec_to_i32(indices_u32)?;
+    let indices = u32_vec_to_i32_bounded(indices_u32, index_bound)?;
     let data = values_raw_to_f32(&values_raw, value_encoding);
     Ok((indptr, indices, data))
 }
@@ -405,10 +425,11 @@ pub fn decode_shard_scipy(
 pub fn decoded_shard_to_scipy(
     decoded: DecodedShard,
     value_encoding: ValueEncoding,
+    index_bound: u32,
 ) -> Result<ScipyShard, CodecError> {
     let (indptr_u64, indices_u32, values_raw) = decoded;
     let indptr = u64_vec_to_i64(indptr_u64)?;
-    let indices = u32_vec_to_i32(indices_u32)?;
+    let indices = u32_vec_to_i32_bounded(indices_u32, index_bound)?;
     let data = values_raw_to_f32(&values_raw, value_encoding);
     Ok((indptr, indices, data))
 }
@@ -659,16 +680,89 @@ fn u64_vec_to_i64(data: Vec<u64>) -> Result<Vec<i64>, CodecError> {
     Ok(bytemuck::cast_vec::<u64, i64>(data))
 }
 
-/// Convert Vec<u32> to Vec<i32> via zero-copy reinterpretation.
-/// Column indices are always non-negative and below n_vars (well within i32 range),
-/// so the bit patterns are identical. Uses bytemuck for safe transmute.
-fn u32_vec_to_i32(data: Vec<u32>) -> Result<Vec<i32>, CodecError> {
-    if let Some(&bad) = data.iter().find(|&&v| v > i32::MAX as u32) {
-        return Err(CodecError::MalformedInput(format!(
-            "column index {bad} exceeds i32::MAX (corrupt or hostile input)"
-        )));
+/// Convert Vec<u32> to Vec<i32> via zero-copy reinterpretation, rejecting any
+/// index at or above `bound`.
+///
+/// # Why the bound rides along here
+///
+/// This scan already existed, to keep a `> i32::MAX` value from reinterpreting
+/// to a *negative* `i32`. In the good case it walks every element and returns
+/// `None`, so the caller's minor-axis bound check costs nothing extra when it
+/// rides on the same pass — only the comparand changes. Measured as a standalone
+/// pass instead, the same check cost **+5.1–6.4%** of per-shard decode
+/// (194.9M nnz, memory-bandwidth-bound at 10.0 GB/s, so not optimisable in
+/// place). Folding it in is what makes it free on the hot path.
+///
+/// `bound` is the shard's `n_minor`, clamped by the caller to at most
+/// `i32::MAX as u32 + 1` so the original sign guarantee still holds. A caller
+/// with no bound to enforce (a decode that is not addressing a column axis)
+/// passes exactly that clamp value and gets the pre-existing behaviour.
+fn u32_vec_to_i32_bounded(data: Vec<u32>, bound: u32) -> Result<Vec<i32>, CodecError> {
+    // Clamp internally rather than trusting the caller. A `bound` above the sign
+    // limit would otherwise *widen* the check past what this function guaranteed
+    // before it took a bound at all, letting a caller disable the sign guard by
+    // accident. `clamp_index_bound` already does this for callers that use it;
+    // doing it here too means no caller can get it wrong.
+    let bound = bound.min(NO_INDEX_BOUND);
+    if let Some((position, &bad)) = data.iter().enumerate().find(|&(_, &v)| v >= bound) {
+        // Classify by whether a real column bound was declared, NOT by whether
+        // the offending value also happens to exceed `i32::MAX`.
+        //
+        // Getting this backwards reintroduced the exact defect the typed
+        // `IndexOutOfRange` variant exists to remove: with a declared bound, a
+        // value ≥ 2^31 took the sign branch, so the scipy path reported
+        // `MalformedInput` → `ScxError::Codec` → `RuntimeError` while the native
+        // path reported `ShardIndexOutOfRange` → `CorruptFile` → `ValueError`
+        // for the same payload. The Python exception type depended on whether
+        // the caller asked for `f32` or a narrowed dtype.
+        //
+        // With a bound present, an out-of-range index is an out-of-range index
+        // at any magnitude. The legacy sign-only message survives for
+        // `NO_INDEX_BOUND`, where there is no column axis to be out of.
+        //
+        // A declared width at or above 2^31 clamps to the same sentinel, so it
+        // takes the sign branch too. That is accurate rather than a collision:
+        // an `i32` CSR cannot represent such a column at all, so "exceeds
+        // i32::MAX" is the actual reason for the rejection, and naming the
+        // declared width instead would describe a bound that is not what
+        // stopped it. The native (`u32`) path legitimately accepts the same
+        // index, because it has no sign hazard to begin with — the two domains
+        // differ there because the *representations* differ, not because the
+        // classification is inconsistent.
+        return Err(if bound == NO_INDEX_BOUND {
+            CodecError::MalformedInput(format!(
+                "column index {bad} exceeds i32::MAX (corrupt or hostile input)"
+            ))
+        } else {
+            CodecError::IndexOutOfRange {
+                index: bad,
+                position,
+                bound,
+            }
+        });
     }
     Ok(bytemuck::cast_vec::<u32, i32>(data))
+}
+
+/// The bound that reproduces the pre-existing behaviour: reject only what would
+/// reinterpret to a negative `i32`. Callers that know the shard's `n_minor` pass
+/// [`clamp_index_bound`] instead.
+pub const NO_INDEX_BOUND: u32 = i32::MAX as u32 + 1;
+
+/// Clamp a shard's `n_minor` into a usable index bound.
+///
+/// `n_minor == 0` means the shard header does not *declare* a column axis — old
+/// writers stamped the file-level `n_vars`, which is `0` on a multimodal file
+/// because the real count is per-modality. Two multimodal conformance fixtures
+/// carry `n_minor = 0` on shards with hundreds of nonzeros, so treating it as a
+/// bound would reject valid files. Anything above `i32::MAX` is clamped down to
+/// preserve the sign guarantee.
+pub fn clamp_index_bound(n_minor: u32) -> u32 {
+    if n_minor == 0 {
+        NO_INDEX_BOUND
+    } else {
+        n_minor.min(NO_INDEX_BOUND)
+    }
 }
 
 /// Convert raw LE value bytes to f32 according to ValueEncoding.
@@ -2199,19 +2293,61 @@ mod tests {
     #[test]
     fn test_u32_to_i32_cast_valid() {
         let data = vec![0u32, 100, i32::MAX as u32];
-        let result = u32_vec_to_i32(data).unwrap();
+        let result = u32_vec_to_i32_bounded(data, NO_INDEX_BOUND).unwrap();
         assert_eq!(result, vec![0i32, 100, i32::MAX]);
     }
 
     #[test]
     fn test_u32_to_i32_rejects_overflow() {
         let data = vec![0u32, 100, u32::MAX];
-        match u32_vec_to_i32(data) {
+        match u32_vec_to_i32_bounded(data, NO_INDEX_BOUND) {
             Err(CodecError::MalformedInput(msg)) => {
                 assert!(msg.contains("exceeds i32::MAX"), "got: {msg}");
             }
             other => panic!("expected MalformedInput, got {other:?}"),
         }
+    }
+
+    /// The bound rides on the same scan as the sign guard, so it must produce a
+    /// *different* message: "exceeds i32::MAX" would be a lie about an index of
+    /// 9 in an 8-column shard, and would send whoever reads it looking for an
+    /// overflow that is not there.
+    #[test]
+    fn test_u32_to_i32_rejects_out_of_range_index_with_its_own_message() {
+        let data = vec![0u32, 3, 9];
+        match u32_vec_to_i32_bounded(data, 8) {
+            Err(e @ CodecError::IndexOutOfRange { .. }) => {
+                let CodecError::IndexOutOfRange {
+                    index,
+                    position,
+                    bound,
+                } = e
+                else {
+                    unreachable!()
+                };
+                assert_eq!((index, position, bound), (9, 2, 8));
+                assert!(
+                    !e.to_string().contains("i32::MAX"),
+                    "an in-i32-range index is not an overflow: {e}"
+                );
+            }
+            other => panic!("expected IndexOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// `clamp_index_bound` maps the "undeclared" sentinel to the sign-only
+    /// bound. Old writers stamped the file-level `n_vars` into every shard
+    /// header, which is 0 on a multimodal file, so treating 0 as a real bound
+    /// rejects valid files (two multimodal conformance fixtures, specifically).
+    #[test]
+    fn test_clamp_index_bound() {
+        assert_eq!(clamp_index_bound(0), NO_INDEX_BOUND, "0 means undeclared");
+        assert_eq!(clamp_index_bound(8), 8);
+        assert_eq!(
+            clamp_index_bound(u32::MAX),
+            NO_INDEX_BOUND,
+            "must not widen past the sign guarantee"
+        );
     }
 
     #[test]

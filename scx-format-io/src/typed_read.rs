@@ -242,6 +242,11 @@ impl ScxReader {
             Some(keep) => keep,
             None => return Ok(csr),
         };
+        // Same guard as the untyped twin, and it has to be the same guard: the
+        // two paths are each other's oracle in `typed_read_applies_deletion_vectors`,
+        // so a check on one side only would make them disagree on exactly the
+        // malformed files where agreement is the evidence.
+        crate::deletion_vectors::check_keep_mask_covers_csr(keep.len(), csr.shape.0)?;
         let mut new_indptr = vec![0i64];
         for (row, &is_kept) in keep.iter().enumerate() {
             if !is_kept {
@@ -338,8 +343,21 @@ fn fill_value_slice(
 /// Total nnz retained by the keep-mask — used to pre-size the compacted
 /// buffers so the copy doesn't repeatedly reallocate (the common case is few
 /// deletions on a large matrix, where the kept total is close to the original).
+///
+/// # Caller obligation
+///
+/// `keep.len() + 1 == indptr.len()`. Today's only caller has already been
+/// through [`check_keep_mask_covers_csr`](crate::deletion_vectors::check_keep_mask_covers_csr),
+/// which is where a malformed file is turned into an error; the assert exists
+/// so a future direct caller that skips it trips in tests rather than in
+/// somebody's file.
 #[cfg(feature = "deletion-vectors")]
 fn kept_nnz(indptr: &[i64], keep: &[bool]) -> usize {
+    debug_assert_eq!(
+        keep.len() + 1,
+        indptr.len(),
+        "keep mask and indptr disagree; call check_keep_mask_covers_csr first"
+    );
     let mut n = 0usize;
     for (row, &k) in keep.iter().enumerate() {
         if k {
@@ -350,6 +368,9 @@ fn kept_nnz(indptr: &[i64], keep: &[bool]) -> usize {
 }
 
 /// Compact an index buffer to the kept rows (deletion-vector filter).
+///
+/// Same caller obligation as [`kept_nnz`], which it calls: `keep` must cover
+/// exactly the rows `indptr` describes.
 #[cfg(feature = "deletion-vectors")]
 fn compact_index_buffer(src: &IndexBuffer, indptr: &[i64], keep: &[bool]) -> IndexBuffer {
     let cap = kept_nnz(indptr, keep);
@@ -375,6 +396,8 @@ fn compact_index_buffer(src: &IndexBuffer, indptr: &[i64], keep: &[bool]) -> Ind
 }
 
 /// Compact a value buffer to the kept rows (deletion-vector filter).
+///
+/// Same caller obligation as [`kept_nnz`], which it calls.
 #[cfg(feature = "deletion-vectors")]
 fn compact_value_buffer(src: &ValueBuffer, indptr: &[i64], keep: &[bool]) -> ValueBuffer {
     let cap = kept_nnz(indptr, keep);
@@ -422,6 +445,32 @@ fn scatter_typed_csr_to_dense(csr: &TypedCsr) -> Result<TypedDense> {
         }
     };
     let indptr = &csr.indptr;
+
+    // The decode seam already bounded every index against its **shard's**
+    // `n_minor`; this bounds against the **assembled matrix's** `n_cols`, which
+    // comes from the file header's `n_vars`. They agree on any file a writer
+    // produced, so this is normally a no-op — but they are two different numbers
+    // and a shard header claiming `n_minor > n_vars` would slip an index through
+    // the seam into the write below.
+    //
+    // Worth the one pass here specifically, and nowhere else: this is the site
+    // where a violation does *not* announce itself. `dense[base + col]` with an
+    // out-of-range `col` runs off the end of one row into the next and returns a
+    // plausible, wrong matrix — no panic, no error. Every other consumer indexes
+    // a `Vec` sized by the same axis it validates against, so it panics instead.
+    // Cost is negligible against the `n_rows × n_cols` allocation this function
+    // already makes.
+    if let Some((position, &bad)) = cols
+        .iter()
+        .enumerate()
+        .find(|&(_, &c)| c < 0 || c as usize >= n_cols)
+    {
+        return Err(ScxError::ShardIndexOutOfRange {
+            index: bad as u32,
+            position,
+            n_minor: n_cols as u32,
+        });
+    }
 
     macro_rules! scatter {
         ($arm:ident, $vals:expr, $ty:ty) => {{

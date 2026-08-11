@@ -2382,3 +2382,106 @@ fn test_obs_categorical_rejects_numeric_and_unknown_columns() {
     let err = reader.obs_categorical("nope").unwrap_err().to_string();
     assert!(err.contains("nope"), "must name the column: {err}");
 }
+
+// ---------------------------------------------------------------------------
+// Deletion-vector row filter: the keep mask must match the CSR it filters
+// ---------------------------------------------------------------------------
+
+/// Write a file whose header claims `n_obs` rows while the CSR shards cover
+/// only `csr_rows`, with one deleted row so the deletion filter engages.
+///
+/// This is what a truncated file looks like from the reader's side: the keep
+/// mask is built from `header.n_obs` (`build_keep_mask`), while the assembled
+/// CSR's row count comes from summing the catalog's per-shard row ranges.
+/// Nothing cross-checked them.
+#[cfg(feature = "deletion-vectors")]
+fn write_mask_csr_mismatch_file(
+    dir: &tempfile::TempDir,
+    filename: &str,
+    n_obs: usize,
+    csr_rows: usize,
+) -> std::path::PathBuf {
+    use crate::deletion_vectors::DeletionVectors;
+
+    let n_vars = 8usize;
+    let path = dir.path().join(filename);
+    let (indptr, indices, values) = sample_shard_data(csr_rows, n_vars);
+    let header = sample_header(n_obs as u64, n_vars as u64, *indptr.last().unwrap());
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let mut dv = DeletionVectors::new();
+    dv.insert_global([0u32]);
+    writer.write_deletion_vectors(&dv).unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// A keep mask longer than the CSR indexed straight off the end of `indptr`
+/// and panicked *inside the reader*. The convention is that a reader returns an
+/// error on malformed input, so this must be `InvalidCatalog`.
+#[cfg(feature = "deletion-vectors")]
+#[test]
+fn deletion_mask_longer_than_csr_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    // 10 obs declared, 4 rows of CSR actually present.
+    let path = write_mask_csr_mismatch_file(&dir, "mask_long.scx", 10, 4);
+    let reader = ScxReader::open(&path).unwrap();
+
+    let err = reader.read_all_csr_shards_filtered().unwrap_err();
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("10") && msg.contains('4'),
+        "the error must report both counts so the file can be diagnosed: {msg}"
+    );
+}
+
+/// The other direction, and the reason this enforces equality rather than only
+/// the panicking bound: a mask *shorter* than the CSR never panics. It silently
+/// drops every row past the end of the mask and returns a quietly truncated
+/// matrix — the same corruption, delivered as an answer instead of a crash.
+///
+/// The pre-fix failure mode is therefore `Ok` with a wrong row count, which is
+/// why this asserts the error rather than merely "does not panic".
+#[cfg(feature = "deletion-vectors")]
+#[test]
+fn deletion_mask_shorter_than_csr_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    // 4 obs declared, 10 rows of CSR actually present.
+    let path = write_mask_csr_mismatch_file(&dir, "mask_short.scx", 4, 10);
+    let reader = ScxReader::open(&path).unwrap();
+
+    let err = reader.read_all_csr_shards_filtered().unwrap_err();
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+}
+
+/// The control both tests above need: when the mask and the CSR agree, the
+/// filter still works and still deletes. Without this arm a fix that rejected
+/// *every* file would pass the two tests above.
+#[cfg(feature = "deletion-vectors")]
+#[test]
+fn deletion_mask_matching_the_csr_still_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_mask_csr_mismatch_file(&dir, "mask_ok.scx", 6, 6);
+    let reader = ScxReader::open(&path).unwrap();
+
+    let csr = reader.read_all_csr_shards_filtered().unwrap();
+    assert_eq!(csr.shape.0, 5, "one of six rows was deleted");
+}

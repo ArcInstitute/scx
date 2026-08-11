@@ -213,7 +213,6 @@ mod tests {
             values_bytes: &shard_bytes[header.values_rel_offset as usize..]
                 [..header.values_length as usize],
         };
-        let _ = n_cols;
         decode_shard_scipy(
             &enc,
             CodecId::Scx1,
@@ -221,6 +220,7 @@ mod tests {
             n_rows,
             nnz,
             header.index_dtype == 0,
+            scx_codec::clamp_index_bound(n_cols as u32),
         )
         .unwrap()
     }

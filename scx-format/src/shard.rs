@@ -464,7 +464,23 @@ pub fn resolve_block_index(
     let entries = &bi.entries;
     let inval = |m: String| ScxError::InvalidBlockIndex(m);
     if entries.is_empty() {
-        return Err(inval("empty block index".into()));
+        // A zero-row shard has no row groups, so an empty index is its *correct*
+        // encoding rather than a truncated one. `encode_shard_framed`'s group
+        // loop never runs for `n_major == 0`, and such shards were writable long
+        // before the writer learned to refuse them — reject them here and those
+        // files become permanently unreadable.
+        //
+        // The exemption is keyed to the header, not to the emptiness: an index
+        // that is empty while the header claims rows or nnz is a truncated index
+        // and stays rejected. Without that clause this would quietly turn every
+        // corrupt-index file into an empty matrix.
+        if header.n_major == 0 && header.nnz == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(inval(format!(
+            "empty block index, but the header declares n_major {} / nnz {}",
+            header.n_major, header.nnz
+        )));
     }
 
     let indptr_len = header.indptr_length as usize;
@@ -686,6 +702,64 @@ mod tests {
         assert_eq!(spans[1].indptr, 24..48);
         assert_eq!(spans[1].indices, 10..16);
         assert_eq!(spans[1].values, 20..32);
+    }
+
+    /// A framed shard with zero rows and zero nnz has an empty block index by
+    /// construction — `encode_shard_framed`'s group loop never runs. Such a
+    /// shard was writable and then failed *every* read, so the empty index has
+    /// to resolve to zero spans when (and only when) the header agrees the
+    /// shard is empty.
+    ///
+    /// The writer now refuses to produce one (`ZeroRowFramedShard`), so this is
+    /// purely the compatibility half: files written before that guard must stay
+    /// readable rather than being bricked by it.
+    #[test]
+    fn empty_block_index_resolves_for_a_zero_row_shard() {
+        let (mut h, _) = framed_fixture();
+        h.n_major = 0;
+        h.nnz = 0;
+        h.indptr_length = 0;
+        h.indices_length = 0;
+        h.values_length = 0;
+
+        let bi = BlockIndex { entries: vec![] };
+        let mut bytes = Vec::new();
+        bi.write_to(&mut bytes).unwrap();
+
+        let spans = resolve_block_index(&h, &bytes).expect("a zero-row shard must resolve");
+        assert!(
+            spans.is_empty(),
+            "zero rows means zero row-groups, got {} spans",
+            spans.len()
+        );
+    }
+
+    /// The other half of the pair: the exemption is keyed to the header, not to
+    /// the empty index. An index that is empty while the header claims rows or
+    /// nnz is a *truncated* index and must stay rejected — otherwise the
+    /// exemption above would silently turn every corrupt-index file into an
+    /// empty matrix.
+    #[test]
+    fn empty_block_index_is_still_rejected_when_the_header_claims_content() {
+        let (h0, _) = framed_fixture();
+
+        // Rows but no nnz (an all-empty-row shard is still framed).
+        let mut h = h0.clone();
+        h.n_major = 4;
+        h.nnz = 0;
+        assert!(
+            matches!(resolve_err(&h, vec![]), ScxError::InvalidBlockIndex(_)),
+            "n_major > 0 with an empty index is truncation, not an empty shard"
+        );
+
+        // nnz but no rows — incoherent, and equally not an empty shard.
+        let mut h = h0;
+        h.n_major = 0;
+        h.nnz = 8;
+        assert!(
+            matches!(resolve_err(&h, vec![]), ScxError::InvalidBlockIndex(_)),
+            "nnz > 0 with an empty index is truncation, not an empty shard"
+        );
     }
 
     fn resolve_err(h: &ShardHeader, entries: Vec<BlockIndexEntry>) -> ScxError {
