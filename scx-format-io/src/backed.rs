@@ -886,6 +886,16 @@ pub struct BackedCsrReader {
     /// on the training hot path; caching the 76-byte header parse avoids
     /// re-reading it every batch for shards whose framing never changes.
     framed_cache: OnceLock<Vec<AtomicU8>>,
+    /// Optional pool for this reader's own parallel decode
+    /// ([`Self::warm_shards`]). `None` — the default for every constructor —
+    /// keeps dispatch on rayon's global registry, so `scx-accel`, `scx-ops`,
+    /// `scx-engine` and `scx-cli` are unaffected. See [`Self::set_cpu_pool`].
+    ///
+    /// `cfg`-gated because `rayon` is an optional dependency: without the
+    /// `parallel` feature there is no `rayon::ThreadPool` to name, and
+    /// `warm_shards` is a sequential loop anyway.
+    #[cfg(feature = "parallel")]
+    cpu_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl BackedCsrReader {
@@ -949,6 +959,8 @@ impl BackedCsrReader {
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
             framed_cache: OnceLock::new(),
+            #[cfg(feature = "parallel")]
+            cpu_pool: None,
         }
     }
 
@@ -986,6 +998,8 @@ impl BackedCsrReader {
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
             framed_cache: OnceLock::new(),
+            #[cfg(feature = "parallel")]
+            cpu_pool: None,
         }
     }
 
@@ -1025,6 +1039,8 @@ impl BackedCsrReader {
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
             framed_cache: OnceLock::new(),
+            #[cfg(feature = "parallel")]
+            cpu_pool: None,
         }
     }
 
@@ -1080,6 +1096,8 @@ impl BackedCsrReader {
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
             framed_cache: OnceLock::new(),
+            #[cfg(feature = "parallel")]
+            cpu_pool: None,
         }
     }
 
@@ -1152,6 +1170,25 @@ impl BackedCsrReader {
     /// gather adoption too, not just the L2 prefetch skip.
     pub fn set_scatter_block_index(&mut self, enabled: bool) {
         self.scatter_block_index = enabled;
+    }
+
+    /// Run this reader's parallel shard warm ([`Self::warm_shards`]) on `pool`
+    /// instead of rayon's global registry.
+    ///
+    /// Exists for callers that may be running in a **forked** process. `fork()`
+    /// duplicates rayon's global registry as a data structure but not its
+    /// worker threads, so a `par_*` dispatched from the child parks forever in
+    /// `LockLatch::wait_and_reset`. A pool built *after* the fork has live
+    /// threads and does not. `scx-loader` passes `scx_loader::pool::cpu_pool()`
+    /// here; see its module docs for why that pool is keyed on the PID.
+    ///
+    /// Unset by default, which keeps every other consumer (`scx-accel`,
+    /// `scx-ops`, `scx-engine`, `scx-cli`) on the global pool exactly as before
+    /// — they do not fork, and they compose with their own global-pool parallel
+    /// regions.
+    #[cfg(feature = "parallel")]
+    pub fn set_cpu_pool(&mut self, pool: Arc<rayon::ThreadPool>) {
+        self.cpu_pool = Some(pool);
     }
 
     /// Whether a shard request-group should be served by the block-index
@@ -2060,11 +2097,33 @@ impl BackedCsrReader {
                 misses.truncate(self.cache_shards);
             }
 
-            misses
-                .par_iter()
-                .try_for_each(|&idx| self.read_shard_cached_arc(idx).map(|_| ()))?;
+            // `install` on the per-reader pool when one was set, else the
+            // global registry as before. This is the fork guard: a caller that
+            // may be running in a forked child (the ML loader) sets a pool
+            // built after the fork, whose worker threads actually exist. See
+            // `set_cpu_pool`.
+            let decode_all = || -> Result<()> {
+                misses
+                    .par_iter()
+                    .try_for_each(|&idx| self.warm_one_shard(idx))
+            };
+            match self.cpu_pool.as_ref() {
+                Some(pool) => pool.install(decode_all)?,
+                None => decode_all()?,
+            }
             Ok(())
         }
+    }
+
+    /// One shard of [`Self::warm_shards`]' parallel body.
+    ///
+    /// Split out only so the test below has a place to observe *which* pool the
+    /// decode ran on; inlining it back would make that unobservable.
+    #[cfg(feature = "parallel")]
+    fn warm_one_shard(&self, idx: usize) -> Result<()> {
+        #[cfg(test)]
+        tests::note_warm_thread();
+        self.read_shard_cached_arc(idx).map(|_| ())
     }
 
     // --- Native shard-by-shard aggregation ---

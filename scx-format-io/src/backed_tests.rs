@@ -2620,3 +2620,115 @@ fn the_block_index_path_also_rejects_a_widened_header() {
         "a scattered framed read must reject a widened header"
     );
 }
+
+// -----------------------------------------------------------------------
+// set_cpu_pool / warm_shards pool routing
+// -----------------------------------------------------------------------
+//
+// `warm_shards` used to dispatch unconditionally against rayon's *global*
+// registry. `fork()` duplicates that registry as a data structure but not its
+// worker threads, so a `par_*` from a forked child parks forever in
+// `LockLatch::wait_and_reset` — which is how the ML loader hung under
+// `DataLoader(num_workers>0, start_method="fork")`. `set_cpu_pool` lets a
+// caller that may be forked hand in a pool built *after* the fork.
+//
+// Observing *which* pool ran the decode needs a tag that unrelated,
+// concurrently-running tests in this binary cannot forge. Each test below
+// stamps its own nonce into a thread-local on its pool's workers via
+// `spawn_handler`; `warm_one_shard` records the nonce it sees. A decode on the
+// global pool (or on any other test's pool) carries nonce 0 and is ignored, so
+// there is nothing to serialise between tests.
+
+use std::cell::Cell;
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+
+thread_local! {
+    /// Nonce of the test pool owning this worker thread; 0 on any other thread.
+    static POOL_NONCE: Cell<u64> = const { Cell::new(0) };
+}
+
+static WARM_NONCES: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+
+/// Called from `BackedCsrReader::warm_one_shard` on whatever thread rayon chose.
+pub(super) fn note_warm_thread() {
+    let nonce = POOL_NONCE.with(|n| n.get());
+    if nonce != 0 {
+        WARM_NONCES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(nonce);
+    }
+}
+
+fn warmed_on(nonce: u64) -> bool {
+    WARM_NONCES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&nonce)
+}
+
+/// A pool whose workers stamp `nonce` into `POOL_NONCE`.
+fn tagged_pool(nonce: u64) -> Arc<rayon::ThreadPool> {
+    Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .spawn_handler(move |thread| {
+                std::thread::spawn(move || {
+                    POOL_NONCE.with(|n| n.set(nonce));
+                    thread.run();
+                });
+                Ok(())
+            })
+            .build()
+            .unwrap(),
+    )
+}
+
+/// Rows spread across all four shards of the fixture, so `warm_shards` gets
+/// more than one miss — below that it short-circuits to a sequential loop and
+/// never dispatches at all (which is exactly why the old fork test, a single
+/// 16-cell shard, passed vacuously).
+const ACROSS_SHARDS: [u64; 4] = [0, 4, 8, 11];
+
+#[test]
+fn warm_shards_runs_on_the_injected_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut backed, full) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+    let nonce = 0x5C0001_u64;
+    backed.set_cpu_pool(tagged_pool(nonce));
+
+    let out = gather_with(&backed, &ACROSS_SHARDS);
+
+    assert!(
+        warmed_on(nonce),
+        "warm_shards dispatched somewhere other than the injected pool — under \
+         fork that is the global registry, whose workers do not exist"
+    );
+    // The routing must not change the answer.
+    for (i, &row) in ACROSS_SHARDS.iter().enumerate() {
+        let expected = full.row_slice(row as usize, row as usize + 1).unwrap();
+        assert_eq!(out[i].0, expected.indices, "row {row} indices");
+        assert_eq!(out[i].1, expected.data, "row {row} data");
+    }
+}
+
+#[test]
+fn a_reader_without_a_pool_keeps_using_the_global_one() {
+    // Over-fix guard: `scx-accel`/`scx-ops`/`scx-engine`/`scx-cli` never set a
+    // pool and must keep composing with their own global-pool parallel regions.
+    // Build a tagged pool and deliberately do NOT inject it.
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, full) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+    let nonce = 0x5C0002_u64;
+    let _unused = tagged_pool(nonce);
+
+    let out = gather_with(&backed, &ACROSS_SHARDS);
+
+    assert!(!warmed_on(nonce), "an un-injected pool must never be used");
+    for (i, &row) in ACROSS_SHARDS.iter().enumerate() {
+        let expected = full.row_slice(row as usize, row as usize + 1).unwrap();
+        assert_eq!(out[i].0, expected.indices, "row {row} indices");
+        assert_eq!(out[i].1, expected.data, "row {row} data");
+    }
+}
