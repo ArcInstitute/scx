@@ -125,8 +125,16 @@ def test_pseudobulk_means_gpu_matches_cpu():
 # f32-gemm parity is at the 1e-4 bar. L1 has no gemm decomposition → CPU.
 
 
-def _edist_route(adata):
-    return adata.uns["scx_accel"]["energy_distance"]
+def _edist_route(adata, op="energy_distance"):
+    """`energy_distance` and `energy_distance_details` stamp *different* keys.
+
+    Passing the wrong one raises `KeyError` before any numeric comparison runs,
+    which makes the test fail for a reason that has nothing to do with parity —
+    and, worse, makes it fail identically whether or not the code under test is
+    correct. That happened here: the zero-row parity test looked like it had
+    caught a defect when it had only mistyped a dict key.
+    """
+    return adata.uns["scx_accel"][op]
 
 
 def _close_or_nan(a, b, atol):
@@ -201,7 +209,8 @@ def test_energy_distance_gpu_matches_cpu_with_zero_rows(metric):
     real, pred = _make_zero_row_adata()
     cpu = pyscx.accel.energy_distance_details(real, pred, metric=metric, device="cpu")
     gpu = pyscx.accel.energy_distance_details(real, pred, metric=metric, device="gpu")
-    assert _edist_route(pred)["route"].startswith("gpu"), _edist_route(pred)
+    route = _edist_route(pred, "energy_distance_details")
+    assert route["route"].startswith("gpu"), route
     for side in ("d_real", "d_pred"):
         for name in cpu[side]:
             assert _close_or_nan(cpu[side][name], gpu[side][name], 1e-3), (
@@ -227,6 +236,8 @@ def test_energy_distance_gpu_matches_cpu_small_groups(metric):
     real, pred = _make_paired_adata(n_obs=80, n_vars=2000, n_perts=4, seed=21)
     cpu = pyscx.accel.energy_distance_details(real, pred, metric=metric, device="cpu")
     gpu = pyscx.accel.energy_distance_details(real, pred, metric=metric, device="gpu")
+    route = _edist_route(pred, "energy_distance_details")
+    assert route["route"].startswith("gpu"), route
     for name in cpu["d_real"]:
         assert _close_or_nan(cpu["d_real"][name], gpu["d_real"][name], 1e-3), (
             f"{metric} d_real[{name}]: cpu={cpu['d_real'][name]} gpu={gpu['d_real'][name]}"
