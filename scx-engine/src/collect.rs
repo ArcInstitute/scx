@@ -171,8 +171,14 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
     // Build category dictionaries from predicate index for catalog-level pruning.
     // Maps column_name_hash → sorted list of category values, so Utf8 predicate
     // values can be resolved to CategoryBitset bit positions.
-    let index_shards = scan_shards(catalog, 0);
-    let category_dicts = build_category_dicts(&obs_predicate_index, &index_shards);
+    // Completeness is judged over exactly the shards the pruner will iterate —
+    // `prune_shards_by_catalog_with_dict` scans the same modality below — so
+    // the claim "every shard being pruned was covered by this vocabulary's
+    // build" is checked against those shards and no others. (The index's own
+    // `shard_id` space does not enter into it: the test is per-entry, "does
+    // this shard carry a `CategoryBitset` for this column hash".)
+    let pruned_shards = scan_shards(catalog, pipeline.modality_id());
+    let category_dicts = build_category_dicts(&obs_predicate_index, &pruned_shards);
     let dicts_ref = if category_dicts.is_empty() {
         None
     } else {
@@ -228,14 +234,16 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
 /// Level-1 needs that bit before it may read a dictionary miss as proof the
 /// value exists in no shard.
 ///
-/// `index_shards` is the flattened (`modality_id == 0`) CSR shard list, which
-/// is the shard space the index's `shard_id`s address — not the per-modality
-/// list a modality-scoped query prunes. Computing completeness over the
-/// flattened superset is the stricter of the two, so a modality-scoped query
-/// cannot inherit a claim that was only established for one modality.
+/// `pruned_shards` must be the shard list the caller will hand to
+/// [`prune_shards_by_catalog_with_dict`] — the same modality. Completeness is a
+/// statement about *those* shards, so judging it over any other set would
+/// license pruning shards nothing was checked against. Note this is **not**
+/// the index's `shard_id` space: the test is per-catalog-entry ("does this
+/// shard carry a `CategoryBitset` for this column hash"), and never resolves a
+/// shard id.
 fn build_category_dicts(
     index: &Option<PredicateIndex>,
-    index_shards: &[&FullCatalogEntry],
+    pruned_shards: &[&FullCatalogEntry],
 ) -> CategoryDictionaries {
     let mut dicts = CategoryDictionaries::new();
     let index = match index {
@@ -250,15 +258,16 @@ fn build_category_dicts(
             dicts.insert(
                 hash,
                 values,
-                category_vocabulary_is_complete(hash, index_shards),
+                category_vocabulary_is_complete(hash, pruned_shards),
             );
         }
     }
     dicts
 }
 
-/// Whether the index's vocabulary for `column_name_hash` covers every shard
-/// Level-1 might prune.
+/// Whether the index's vocabulary for `column_name_hash` covers every shard in
+/// `pruned_shards` — the exact set the caller will prune, so the claim is
+/// checked against the shards it licenses excluding.
 ///
 /// The signal is the catalog's own bookkeeping. `derive_shard_column_stats`
 /// emits a `CategoryBitset` for **every** shard of an indexed categorical
@@ -282,10 +291,10 @@ fn build_category_dicts(
 /// would be vacuously true and hand out a claim nothing established.
 fn category_vocabulary_is_complete(
     column_name_hash: u64,
-    index_shards: &[&FullCatalogEntry],
+    pruned_shards: &[&FullCatalogEntry],
 ) -> bool {
-    !index_shards.is_empty()
-        && index_shards.iter().all(|entry| {
+    !pruned_shards.is_empty()
+        && pruned_shards.iter().all(|entry| {
             entry.stats.as_ref().is_some_and(|s| {
                 s.column_stats
                     .iter()
