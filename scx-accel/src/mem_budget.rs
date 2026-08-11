@@ -73,8 +73,11 @@ pub fn pairwise_memory_budget() -> u64 {
 ///   forever or erroring. Same rule as the GPU sibling
 ///   (`scx-gpu/src/gpu_pairwise.rs::gpu_mean_pairwise_distance_chunked`).
 /// - **Never more than `n_a`.** Anything that already fits stays one block, and
-///   a one-block run is the untiled computation — so inputs below the budget
-///   keep today's bits exactly.
+///   a one-block run issues exactly the gemm the unblocked kernel did, over
+///   exactly the same operands — so *blocking* contributes no drift below the
+///   budget. (The self path's numbers still move once, because it switched from
+///   the full square to the upper triangle. That is a separate change; this
+///   clamp is what keeps the cross path bit-identical.)
 pub fn plan_gram_row_block(n_a: usize, n_b: usize, elem_bytes: usize, budget: u64) -> usize {
     let per_row = (n_b as u64).saturating_mul(elem_bytes as u64).max(1);
     ((budget / per_row) as usize).clamp(1, n_a.max(1))

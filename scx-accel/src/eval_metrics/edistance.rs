@@ -6,9 +6,22 @@
 //! of per-perturbation e-distances.
 //!
 //! The key optimization over cell-eval's sklearn-based approach:
-//! - No `[N, N]` pairwise distance matrix allocation.
+//! - No `[N, N]` pairwise *distance* matrix allocation — the reduction keeps
+//!   one `f64` per row. The gemm backend does build a Gram, one row block at a
+//!   time against `SCX_ACCEL_PAIRWISE_MEMORY_BUDGET`; see
+//!   [`super::distances`] § Working set.
 //! - Control self-distances precomputed once and reused.
 //! - Per-perturbation computation parallelized with rayon.
+//!
+//! # Peak memory is dominated by the group copies, not the Gram
+//!
+//! `extract_group_rows_indexed` materialises a fresh dense
+//! `n_group × n_dims` buffer for the perturbation *and* the control side of
+//! every task, inside the `par_iter` below — so the copies scale with the
+//! thread count, and at 50 K cells/group × 2000 dims × 32 threads they are tens
+//! of GB, well past the blocked Gram. Bounding that means gathering rows per
+//! Gram block rather than per task, which is a change to this file's parallel
+//! structure and has not been made.
 
 use std::collections::HashMap;
 
