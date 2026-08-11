@@ -475,11 +475,20 @@ impl IndexPlanLoader {
                                 .to_string(),
                         });
                     }
-                    let est =
-                        scx_accel::estimate_alpha(&backed, &scx_accel::AlphaOptions::default())
-                            .map_err(|e| LoaderError::ConfigError {
-                                reason: format!("pflog α estimation failed: {e}"),
-                            })?;
+                    // On the loader's pool for the same reason as `read_obs`
+                    // above: `estimate_alpha` walks shards through
+                    // `scx_format_io::prefetch`, whose `rayon::in_place_scope`
+                    // cannot tell an inherited-and-dead global registry from a
+                    // live one. Inside `install` the prefetch takes its
+                    // already-on-a-worker sequential path — the right trade for
+                    // a one-time construction-path estimate.
+                    let est = crate::pool::cpu_pool()
+                        .install(|| {
+                            scx_accel::estimate_alpha(&backed, &scx_accel::AlphaOptions::default())
+                        })
+                        .map_err(|e| LoaderError::ConfigError {
+                            reason: format!("pflog α estimation failed: {e}"),
+                        })?;
                     log::info!(
                         "pflog: estimated α={:.6} (pseudocount={:.6}, n_genes_used={}, fell_back={})",
                         est.alpha,

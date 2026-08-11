@@ -784,3 +784,42 @@ def test_fork_downsample_counts_csr(fixture_paths: list[str]) -> None:
     assert fixture_paths
     n = _run_forked_child(_child_downsample_counts, (), "downsample_counts_csr")
     assert n == 513  # n_rows + 1
+
+
+def _child_iterate_training_dataset(scx_path: str, conn) -> None:
+    try:
+        import pyscx
+
+        ds = pyscx.TrainingDataset(
+            scx_path,
+            batch_size=32,
+            normalize=False,
+            log1p=False,
+            obs_columns=["global_cell_id"],
+        )
+        try:
+            n = sum(len(b["cell_indices"]) for b in ds)
+        finally:
+            ds.close()
+        conn.send(("ok", n))
+    except BaseException as exc:  # noqa: BLE001
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def test_fork_training_dataset_sharded_obs(sharded_obs_path: str) -> None:
+    """`TrainingDataset` reaches the same `read_obs` par_iter as
+    `IndexPlanDataset` — `TrainingPipeline::new` calls it too.
+
+    The per-pipeline decode pool that Phase 2.0 added does not cover this: it is
+    built in `start_epoch`, long after the constructor has already dispatched.
+    The tests above this one only ever exercised 16-cell files whose obs is a
+    single section, so the class every fork-safety guarantee is written about
+    was hanging on any file large enough to shard its obs — which is every file
+    the loader exists for.
+    """
+    n = _run_forked_child(
+        _child_iterate_training_dataset, (sharded_obs_path,), "TrainingDataset sharded-obs"
+    )
+    assert n == MULTI_N_OBS
