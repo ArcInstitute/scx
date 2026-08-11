@@ -1036,7 +1036,10 @@ QueryPipeline::open("file.scx")?
   each from the same entry list the dictionary comes from. So a missing bitset
   means that shard was never seen by the build, and a wrong-length one means
   the stats and the index section came from different builds — where bit *i*
-  no longer means entry *i*.
+  no longer means entry *i*. A column appearing **twice within one shard**
+  disqualifies it too: nothing says which of the two bitsets the dictionary's
+  positions belong to, and counting stat records rather than shards would let
+  one shard's surplus stand in for a shard that carries none.
   - In practice the vocabulary is complete on anything written by `convert`,
     `merge`, `compact`, `sort` or `subset` with `--index-*`. It is **not**
     complete after `append` without `--index-obs`, which adds shards the
