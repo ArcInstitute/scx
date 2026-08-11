@@ -143,16 +143,35 @@ impl ScxCsr {
     ///
     /// Violating any invariant causes out-of-bounds reads in downstream
     /// operations (SpMM, column projection, iteration). These are logic bugs,
-    /// not memory-safety UB — they will trigger bounds-check panics rather
-    /// than silently return wrong answers. A future refactor could upgrade
-    /// this constructor to an `unsafe fn` if the accessors ever switch to
-    /// unchecked indexing.
+    /// not memory-safety UB. A future refactor could upgrade this constructor
+    /// to an `unsafe fn` if the accessors ever switch to unchecked indexing.
     ///
-    /// In debug builds, invariants 1–3 are checked via `debug_assert!`; if
+    /// ⚠️ **A violation does not always announce itself.** This comment used to
+    /// promise that breaking an invariant "will trigger bounds-check panics
+    /// rather than silently return wrong answers". That is false for invariant
+    /// 5 on the dense paths: [`Self::to_dense`] and its typed twin in
+    /// `scx-format-io` write `dense[row_base + col as usize]`, where an
+    /// out-of-range `col` runs off the end of one row into the next — a
+    /// plausible, wrong matrix and no panic — and a negative one becomes ~2^64
+    /// and wraps the add in release.
+    ///
+    /// In debug builds, invariants 1–4 are checked via `debug_assert!`; if
     /// that fires the caller has a bug.
     ///
-    /// Use when the data is known to be valid (e.g., decoded from
-    /// checksummed shards).
+    /// # Who upholds invariant 5
+    ///
+    /// Not this constructor, and for a long time nobody: the readers passed
+    /// decoded shard data straight in, and a shard payload is **not** covered by
+    /// the catalog checksum (`ScxReader::read_shard_from_entry` documents that
+    /// omission). "Decoded from checksummed shards" was never the guarantee it
+    /// sounds like.
+    ///
+    /// It is enforced now, once per shard, at the `scx-format-io` decode seam —
+    /// on the scipy path by the bound handed to `scx_codec::decode_shard_scipy`,
+    /// on the native path by its own pass. Callers constructing a CSR from
+    /// anywhere *other* than a reader still owe the invariant themselves.
+    ///
+    /// Use when the data is known to be valid.
     pub fn new_unchecked(
         shape: (usize, usize),
         indptr: Vec<i64>,

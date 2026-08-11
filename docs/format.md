@@ -364,6 +364,27 @@ This invariant is enforced by current writers at untrusted ingest boundaries
 canonicalize on ordinary reads; use `scx validate --deep` to decode shards
 and check the invariant.
 
+**Readers do, however, enforce the index bound on every read.** A shard payload
+is not covered by the catalog checksum, so `Every stored index is in [0,
+n_minor)` is a claim about the file, not a guarantee about the bytes. Readers
+check it once per decode — the whole workspace then indexes buffers sized by
+`n_minor` with decoded indices and no further checks. An index at or past
+`n_minor` is a hard error, not a best-effort warning.
+
+Two consequences worth knowing when writing a reader:
+
+- **`n_minor == 0` means "not declared", not "zero columns".** Writers before
+  the per-modality fix stamped the *file-level* `n_vars` into every shard
+  header, and that field is `0` on a multimodal file because the real column
+  count is per-modality. Shards with `n_minor == 0` and a nonzero `nnz` exist in
+  the wild and must still read; treat `0` as "no bound available" and skip the
+  check. (A genuinely zero-column matrix has no nonzeros to check anyway.)
+  Current writers resolve the per-modality `n_vars`, so new files carry a real
+  bound.
+- **The bound also caps the sign reinterpretation.** Indices are `u32` on disk
+  and `i32` in a scipy CSR, so a value at or above `2^31` would reinterpret to a
+  negative index. Readers must reject those regardless of `n_minor`.
+
 ### Block index
 
 Enables O(1) random access to any row range inside a shard:
@@ -406,6 +427,21 @@ statistics use `u64` because they address global rows (billions of cells).
   increasing within a row and every index lies in `[0, n_minor)`, so a group
   cannot store more entries than it has cells. Framing exists only in v4 files
   and v4 ⊇ v3, so it holds for every framed shard.
+
+**A framed shard MUST have `n_major >= 1`.** Framing emits one block-index
+entry per row group, so a zero-row shard produces an *empty* index — and an
+empty index is not resolvable: there is nothing to check coverage or offsets
+against. Writers refuse to frame a zero-row shard; emit no shard at all
+instead. (An **unframed** zero-row shard is legal and always was: it carries
+the legacy single entry, which is never resolved.)
+
+Readers must nonetheless accept an empty block index when the header agrees the
+shard is empty — `n_major == 0 && nnz == 0` resolves to zero spans, i.e. an
+empty CSR. Files predating the writer guard contain such shards, and rejecting
+them makes those files permanently unreadable. Key the exemption to the header,
+not to the emptiness: an index that is empty while the header claims rows or
+nnz is a *truncated* index and must stay rejected, or every corrupt-index file
+silently becomes an empty matrix.
 
 **Reader requirement — reassembly must not pre-allocate from the header.**
 `header.nnz`, `header.n_major` and every `nnz_in_block` are unauthenticated (the

@@ -32,6 +32,27 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   under Linux overcommit a multi-GB reservation succeeds and the decode returns
   the error the assertion wanted (see
   `scx-format-io/tests/framed_decode_allocation.rs`).
+- **Validate shard payload at the decode seam, not at the consumer.** A shard
+  payload is unauthenticated — the catalog's BLAKE3 covers catalog bytes only,
+  and `read_shard_from_entry` skips the per-shard checksum by design. So a
+  decoded value is untrusted input no matter how deep in the stack it surfaces.
+  Both places that turn shard bytes into a CSR
+  (`scx_format_io::decode_shard_regions_scipy` / `_native`) enforce the
+  minor-axis bound, which is what lets the ~20 sites downstream write
+  `dense[base + col]` or `col_sums[col]` with no check of their own. **Do not
+  add a per-consumer bounds check**: it is redundant, it costs a branch in a hot
+  loop, and — worse — where two kernels are each other's oracle (the streaming
+  statistics pair in `backed.rs` and `prefetch.rs`) guarding only one makes them
+  disagree on precisely the malformed input where their agreement is the
+  evidence. If a new decode path is added that bypasses those seams, it owes the
+  same check; `reader.rs`'s block-index row-run path is the existing example.
+- **Prefer riding an existing pass to adding one.** The bound above is enforced
+  by handing `scx_codec::decode_shard_scipy` an `index_bound`, so it rides the
+  scan that already rejects `> i32::MAX`; only the comparand changes. The same
+  check written as its own pass measured **+5.1–6.4%** of per-shard decode
+  (194.9M nnz) and could not be optimised away — at 10.0 GB/s it was already
+  memory-bandwidth-bound. Fused, it is inside noise. On a hot path, *where* a
+  validation happens can matter more than what it does.
 
 ## Checksums
 
