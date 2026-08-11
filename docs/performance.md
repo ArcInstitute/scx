@@ -1193,12 +1193,21 @@ one shared accumulator. Two things follow: the per-worker merge disappears, and 
 write set drops from the whole matrix (32 MB at 2K vars) to its own slice (~2 MB), which fits
 cache.
 
-`cargo bench -p scx-accel --bench covariance_pca`, 12 cores, 8 shards × 25 K rows:
+`cargo bench -p scx-accel --bench covariance_pca`, 12 cores, 8 shards × 25 K rows,
+before/after on the same host in one sitting (Criterion medians):
 
 | Fixture | Before | After | Speedup |
 |---|---|---|---|
 | 2 000 vars, 5 % dense | 2.589 s | **1.057 s** | **2.45×** |
 | 5 000 vars, 3 % dense | 14.769 s | **7.230 s** | **2.04×** |
+
+> [!NOTE]
+> These are **Criterion microbenchmark** medians from the in-repo bench, not a captured
+> entry under `benchmarks/comprehensive/results/`. `docs/benchmark_manifest.md` asks for a
+> manifest behind every number here; the manifest system is shaped for the SLURM
+> comprehensive suite and has no covariance-PCA microbenchmark triple, so the reproduction
+> recipe above stands in for one. `benchmarks/scripts/check_readme_manifests.py` does not
+> flag these claims.
 
 Peak memory falls with it: one accumulator rather than one per worker, which is why
 `SCX_PCA_COV_MEMORY_BUDGET` no longer has anything to cap. The transpose SpMM got the same

@@ -53,7 +53,11 @@
 //! The partitioned kernels require **canonical** CSR rows (strictly increasing
 //! column indices). SCX writers guarantee it and `scx_engine::project_csr`
 //! already documents the same precondition; a non-canonical CSR falls back to a
-//! serial accumulation that is identical bit for bit, just not parallel.
+//! serial accumulation that is correct — including the coalesced value for
+//! duplicate coordinates — and deterministic, but single-threaded. It is *not*
+//! bit-identical to the partitioned kernel: that kernel cannot run on such input
+//! at all, and summing a row in stored rather than ascending order lands on
+//! different low bits.
 
 use faer::{Mat, MatRef};
 use rand::SeedableRng;
@@ -235,8 +239,11 @@ fn accumulate_covariance_block(
 ///
 /// A non-canonical CSR (unsorted or duplicated column indices) breaks the
 /// `c_j >= c_i` step the partition rests on; that falls back to
-/// [`accumulate_covariance_serial`], which is bit-identical and still
-/// deterministic, just single-threaded.
+/// [`accumulate_covariance_serial`], which computes the correct value —
+/// duplicates coalesced — deterministically, but single-threaded. Not
+/// "bit-identical": there is nothing to be identical *to*, since the partitioned
+/// kernel cannot run on this input, and a row summed in stored rather than
+/// ascending order lands on different low bits.
 fn accumulate_covariance_into(csr: &ScxCsr, cov: &mut [f64], col_sums: &mut [f64], n_vars: usize) {
     if csr.n_rows() == 0 || csr.indices.is_empty() {
         return;
@@ -2792,7 +2799,10 @@ mod tests {
 
     /// A non-canonical CSR cannot take the partitioned path (the `c_j >= c_i`
     /// step is what makes a pair's block a function of `c_i` alone), so it falls
-    /// back to the serial accumulation. Same answer, still deterministic.
+    /// back to the serial accumulation — which this pins against that same
+    /// reference. Note the bar is the serial oracle, not the partitioned kernel:
+    /// summing a row in stored rather than ascending order genuinely moves the
+    /// low bits, so there is no bit-identity to assert across the two.
     #[test]
     fn an_unsorted_csr_matches_the_serial_oracle() {
         // Row 0's indices descend; row 1's are canonical.
