@@ -1021,6 +1021,42 @@ QueryPipeline::open("file.scx")?
   `modify_metadata(..., index_obs=[…])` or a copy-out `sort` / `compact` with
   `--index-obs` / `--index-preset`. Full per-op table in
   [docs/operations.md § Per-shard column stats and the in-place ops](operations.md#per-shard-column-stats-and-the-in-place-ops).
+- **A dictionary miss short-circuits only on a complete vocabulary.** A
+  `filter_obs("cell_type == 'Typo'")` whose value is absent from an indexed
+  column's category dictionary can be answered instantly by pruning every
+  shard, instead of scanning obs to find nothing. That inference is global
+  ("this value is in *no* shard") drawn from a local artifact (the vocabulary
+  this file's index happens to hold), so it is made only when the vocabulary
+  is known to cover every shard being pruned — established by the catalog
+  itself, since the index build emits a `CategoryBitset` for *every* shard of
+  an indexed categorical column, including an all-zero one where the column
+  has no values there. A shard with no bitset for the column was never seen by
+  that build.
+  - In practice the vocabulary is complete on anything written by `convert`,
+    `merge`, `compact`, `sort` or `subset` with `--index-*`. It is **not**
+    complete after `append` without `--index-obs`, which adds shards the
+    file-scope index has never seen. Such a file answers correctly either way
+    (an appended shard carries no column stats, so pruning never touches it),
+    but a miss on it costs a full obs scan; `--index-obs` on the append, or a
+    copy-out `compact --index-obs`, restores the short-circuit.
+  - The same bit gates Level-2. There a partial vocabulary is worse than slow:
+    `categorical_eq` reports an absent value as an *exact empty row-set*, and
+    reports a present one with only the rows that were recorded — so an
+    incomplete column is residual (decode + mask) rather than resolvable.
+  - An **empty** vocabulary is never complete, however well covered. It cannot
+    tell "this column has no values" apart from "this build recorded none of
+    them". That distinction is load-bearing on files written before
+    integer-valued categoricals were classified: such a file carries an
+    entry-less categorical index, every shard gets a zero-length
+    `CategoryBitset` for it, and `batch == '1'` would prune every shard and
+    return nothing — silently, because the type mismatch that rejects a string
+    literal against an integer column lives in the residual evaluator, which
+    never runs once Level-1 has short-circuited. Those columns now fall back to
+    a scan (and still raise the type error). Re-index with `--index-obs` to
+    make the column queryable.
+  - `in [...]` and `==` make the identical inference. They used to disagree —
+    `==` pruned on a miss unconditionally while `in` refused to — which meant
+    one predicate had two answers depending on how it was spelled.
 - Fused normalize+log1p in single CSR row scan
 - Parallel shard processing via rayon
 - **Bounded obs memory on row-sharded files.** `filter_obs` / `count`

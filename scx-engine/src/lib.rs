@@ -32,7 +32,7 @@ pub use predicate::{eval_rowset, evaluate, parse_predicate, Predicate, RowSetCtx
 pub use projection::{decode_shard_projected, project_csr, project_csr_row, project_var};
 pub use pushdown::{
     prune_shards_by_catalog, prune_shards_by_catalog_with_dict, CategoryDictionaries,
-    ShardCandidate,
+    CategoryDictionary, ShardCandidate,
 };
 pub use reader::{BoxedSectionReader, SectionReader};
 pub use rowset::{shard_range_to_global, RowRange, RowSet};

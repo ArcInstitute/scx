@@ -147,6 +147,11 @@ struct ExecutionPlan {
     /// catalog-level shard pruning. `None` when the file has no obs predicate
     /// index. See [`try_rowset_mask`].
     obs_predicate_index: Option<PredicateIndex>,
+    /// Per-column category vocabularies and whether each may be trusted as
+    /// complete. Built once in [`build_plan`] and used by **both** pushdown
+    /// levels — Level-1 for catalog pruning, Level-2 for row-set resolution —
+    /// so the two cannot end up trusting the index to different degrees.
+    category_dicts: CategoryDictionaries,
 }
 
 /// Build an execution plan from a QueryPipeline.
@@ -166,7 +171,8 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
     // Build category dictionaries from predicate index for catalog-level pruning.
     // Maps column_name_hash → sorted list of category values, so Utf8 predicate
     // values can be resolved to CategoryBitset bit positions.
-    let category_dicts = build_category_dicts(&obs_predicate_index);
+    let index_shards = scan_shards(catalog, 0);
+    let category_dicts = build_category_dicts(&obs_predicate_index, &index_shards);
     let dicts_ref = if category_dicts.is_empty() {
         None
     } else {
@@ -207,6 +213,7 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
         limit: pipeline.limit_value(),
         deletion_vectors: pipeline.deletion_vectors().clone(),
         obs_predicate_index,
+        category_dicts,
     })
 }
 
@@ -215,7 +222,21 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
 /// For each categorical column in the index, creates a mapping from
 /// `column_name_hash` to the sorted list of category values. The position
 /// in this list corresponds to the bit position in `CategoryBitset`.
-fn build_category_dicts(index: &Option<PredicateIndex>) -> CategoryDictionaries {
+///
+/// Each dictionary also carries whether its vocabulary may be trusted as the
+/// column's **complete** value set — see [`category_vocabulary_is_complete`].
+/// Level-1 needs that bit before it may read a dictionary miss as proof the
+/// value exists in no shard.
+///
+/// `index_shards` is the flattened (`modality_id == 0`) CSR shard list, which
+/// is the shard space the index's `shard_id`s address — not the per-modality
+/// list a modality-scoped query prunes. Computing completeness over the
+/// flattened superset is the stricter of the two, so a modality-scoped query
+/// cannot inherit a claim that was only established for one modality.
+fn build_category_dicts(
+    index: &Option<PredicateIndex>,
+    index_shards: &[&FullCatalogEntry],
+) -> CategoryDictionaries {
     let mut dicts = CategoryDictionaries::new();
     let index = match index {
         Some(idx) => idx,
@@ -226,10 +247,51 @@ fn build_category_dicts(index: &Option<PredicateIndex>) -> CategoryDictionaries 
             let hash = scx_format_io::column_name_hash(&cat.column_name);
             let values: Vec<String> = cat.entries.iter().map(|e| e.value.clone()).collect();
             // CategoricalIndex entries are already sorted by BTreeMap in build_indexes
-            dicts.insert(hash, values);
+            dicts.insert(
+                hash,
+                values,
+                category_vocabulary_is_complete(hash, index_shards),
+            );
         }
     }
     dicts
+}
+
+/// Whether the index's vocabulary for `column_name_hash` covers every shard
+/// Level-1 might prune.
+///
+/// The signal is the catalog's own bookkeeping. `derive_shard_column_stats`
+/// emits a `CategoryBitset` for **every** shard of an indexed categorical
+/// column — including an all-zero one for a shard where the column has no
+/// values — so "every shard carries a bitset for this column" is exactly "the
+/// index build that produced this vocabulary saw this shard".
+///
+/// The case it catches is `append` without `--index-obs`: the appended CSR
+/// shards carry no `column_stats` at all, so the file-scope index describes
+/// only the rows that predate the append. Today that is *survivable* for a
+/// different reason — `prune_shards_by_catalog_with_dict` skips a shard with no
+/// column stats, so the appended shard stays a candidate and is scanned — but
+/// nothing recorded that the vocabulary had stopped being global, and a
+/// dictionary miss was still read as proof of absence everywhere.
+///
+/// What it does **not** prove: that the bitsets and the index section came from
+/// the same build. [`bitset_matches_dictionary`] covers the part of that a
+/// cheap check can cover.
+///
+/// An empty shard list is not complete: with nothing to compare against, `all`
+/// would be vacuously true and hand out a claim nothing established.
+fn category_vocabulary_is_complete(
+    column_name_hash: u64,
+    index_shards: &[&FullCatalogEntry],
+) -> bool {
+    !index_shards.is_empty()
+        && index_shards.iter().all(|entry| {
+            entry.stats.as_ref().is_some_and(|s| {
+                s.column_stats
+                    .iter()
+                    .any(|cs| cs.column_name_hash() == column_name_hash)
+            })
+        })
 }
 
 // ============================================================================
@@ -729,6 +791,7 @@ fn try_rowset_mask(
         index,
         shard_row_ranges: &csr_shard_ranges,
         n_obs: n_obs as u64,
+        category_dicts: &plan.category_dicts,
     };
     let (indexed, residual) = partition_obs_predicates(&plan.obs_predicates, &ctx);
     // Nothing resolved from the index (including a no-filter query) → legacy
@@ -2193,6 +2256,102 @@ mod tests {
             x_decode_count(&pipeline),
             1,
             "limit(1) must decode only the first X shard, not all {MS_SHARDS}"
+        );
+    }
+
+    /// The over-fix guard, end to end: a file written by the normal conversion
+    /// path must still be recognised as carrying a complete vocabulary, and a
+    /// filter naming a value the file does not contain must still short-circuit
+    /// without reading a single obs shard.
+    ///
+    /// Gating the short-circuit on completeness is only worth doing if
+    /// completeness is the ordinary case. If this goes red, the guard has
+    /// turned every miss on every file into a full obs scan.
+    #[test]
+    fn a_converted_file_carries_a_complete_vocabulary_and_still_short_circuits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_indexed_multishard_file(&dir);
+
+        let pipeline = QueryPipeline::open(&path)
+            .unwrap()
+            .filter_obs("cell_type == 'Z'")
+            .unwrap();
+        let plan = build_plan(&pipeline).unwrap();
+        let dict = plan
+            .category_dicts
+            .get(&scx_format_io::column_name_hash("cell_type"))
+            .expect("cell_type is indexed");
+        assert!(
+            dict.complete,
+            "every CSR shard of a freshly converted file carries the column's \
+             CategoryBitset, so its vocabulary is the complete value set"
+        );
+
+        let pm = plan_and_mask(&pipeline).unwrap();
+        assert_eq!(
+            pm.skipped_shards, MS_SHARDS,
+            "'Z' is absent from a complete vocabulary → prune every shard"
+        );
+        assert_eq!(pm.matched_rows, 0);
+    }
+
+    /// The catalog-derived signal itself.
+    ///
+    /// `derive_shard_column_stats` emits a `CategoryBitset` for *every* shard of
+    /// an indexed categorical column — an all-zero one where the column has no
+    /// values in that shard — so a shard without one was never seen by the
+    /// build that produced the vocabulary. That is what `append` without
+    /// `--index-obs` leaves behind.
+    #[test]
+    fn a_shard_without_the_columns_bitset_makes_the_vocabulary_incomplete() {
+        use scx_format_io::catalog::{ColumnStat, FullCatalogEntry, ShardStats};
+        use scx_format_io::section::SectionType;
+
+        let hash = scx_format_io::column_name_hash("cell_type");
+        let shard = |column_stats: Vec<ColumnStat>| FullCatalogEntry {
+            name: "X_shard".to_string(),
+            offset: 4352,
+            length: 10,
+            section_type: SectionType::CsrShard,
+            checksum: [0; 32],
+            modality_id: 0,
+            stats: Some(ShardStats {
+                row_start: 0,
+                row_end: 10,
+                col_start: 0,
+                col_end: 0,
+                nnz: 1,
+                value_min: 1,
+                value_max: 1,
+                value_sum: 1,
+                n_indexed_columns: column_stats.len() as u8,
+                column_stats,
+            }),
+        };
+        let bitset = || ColumnStat::CategoryBitset {
+            column_name_hash: hash,
+            bitset: vec![0b0000_0001],
+        };
+
+        let indexed = shard(vec![bitset()]);
+        let appended = shard(Vec::new());
+        // A shard carrying stats for some *other* indexed column is just as
+        // uncovered for this one.
+        let other_column = shard(vec![ColumnStat::CategoryBitset {
+            column_name_hash: scx_format_io::column_name_hash("tissue"),
+            bitset: vec![0b0000_0001],
+        }]);
+
+        assert!(category_vocabulary_is_complete(hash, &[&indexed, &indexed]));
+        assert!(
+            !category_vocabulary_is_complete(hash, &[&indexed, &appended]),
+            "the appended shard was never seen by the index build"
+        );
+        assert!(!category_vocabulary_is_complete(hash, &[&other_column]));
+        assert!(
+            !category_vocabulary_is_complete(hash, &[]),
+            "with nothing to compare against, `all` is vacuously true — do not \
+             hand out a claim nothing established"
         );
     }
 
