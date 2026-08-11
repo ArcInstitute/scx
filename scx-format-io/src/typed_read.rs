@@ -242,6 +242,11 @@ impl ScxReader {
             Some(keep) => keep,
             None => return Ok(csr),
         };
+        // Same guard as the untyped twin, and it has to be the same guard: the
+        // two paths are each other's oracle in `typed_read_applies_deletion_vectors`,
+        // so a check on one side only would make them disagree on exactly the
+        // malformed files where agreement is the evidence.
+        crate::deletion_vectors::check_keep_mask_covers_csr(keep.len(), csr.shape.0)?;
         let mut new_indptr = vec![0i64];
         for (row, &is_kept) in keep.iter().enumerate() {
             if !is_kept {
@@ -338,8 +343,21 @@ fn fill_value_slice(
 /// Total nnz retained by the keep-mask — used to pre-size the compacted
 /// buffers so the copy doesn't repeatedly reallocate (the common case is few
 /// deletions on a large matrix, where the kept total is close to the original).
+///
+/// # Caller obligation
+///
+/// `keep.len() + 1 == indptr.len()`. Today's only caller has already been
+/// through [`check_keep_mask_covers_csr`](crate::deletion_vectors::check_keep_mask_covers_csr),
+/// which is where a malformed file is turned into an error; the assert exists
+/// so a future direct caller that skips it trips in tests rather than in
+/// somebody's file.
 #[cfg(feature = "deletion-vectors")]
 fn kept_nnz(indptr: &[i64], keep: &[bool]) -> usize {
+    debug_assert_eq!(
+        keep.len() + 1,
+        indptr.len(),
+        "keep mask and indptr disagree; call check_keep_mask_covers_csr first"
+    );
     let mut n = 0usize;
     for (row, &k) in keep.iter().enumerate() {
         if k {
@@ -350,6 +368,9 @@ fn kept_nnz(indptr: &[i64], keep: &[bool]) -> usize {
 }
 
 /// Compact an index buffer to the kept rows (deletion-vector filter).
+///
+/// Same caller obligation as [`kept_nnz`], which it calls: `keep` must cover
+/// exactly the rows `indptr` describes.
 #[cfg(feature = "deletion-vectors")]
 fn compact_index_buffer(src: &IndexBuffer, indptr: &[i64], keep: &[bool]) -> IndexBuffer {
     let cap = kept_nnz(indptr, keep);
@@ -375,6 +396,8 @@ fn compact_index_buffer(src: &IndexBuffer, indptr: &[i64], keep: &[bool]) -> Ind
 }
 
 /// Compact a value buffer to the kept rows (deletion-vector filter).
+///
+/// Same caller obligation as [`kept_nnz`], which it calls.
 #[cfg(feature = "deletion-vectors")]
 fn compact_value_buffer(src: &ValueBuffer, indptr: &[i64], keep: &[bool]) -> ValueBuffer {
     let cap = kept_nnz(indptr, keep);

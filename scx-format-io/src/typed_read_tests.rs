@@ -671,3 +671,70 @@ fn typed_read_applies_deletion_vectors() {
         _ => panic!("wrong arm"),
     }
 }
+
+/// The typed twin of `deletion_mask_longer_than_csr_errors` /
+/// `deletion_mask_shorter_than_csr_errors`.
+///
+/// These two paths are each other's oracle in
+/// `typed_read_applies_deletion_vectors`, which asserts the typed result equals
+/// the f32 result. That agreement is only evidence if both sides reject the
+/// same malformed input — a guard on one side alone would make them disagree
+/// on exactly the files where the comparison matters.
+#[cfg(feature = "deletion-vectors")]
+#[test]
+fn typed_deletion_mask_must_match_the_csr_row_count() {
+    use crate::deletion_vectors::DeletionVectors;
+
+    let dir = tempfile::tempdir().unwrap();
+    // n_obs declared vs CSR rows actually written.
+    let build = |name: &str, n_obs: usize, csr_rows: usize| -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let (ip, ix, v, enc, rs) = u8_shard(csr_rows, 10, 0, 0);
+        let hdr = header(n_obs as u64, 10, *ip.last().unwrap());
+        let mut writer = ScxWriter::new(&path, hdr).unwrap();
+        writer.write_obs(&obs_batch(n_obs)).unwrap();
+        writer.write_var(&var_batch(10)).unwrap();
+        writer
+            .write_csr_shard(&ip, &ix, &v, CodecId::None, enc, rs)
+            .unwrap();
+        let mut dv = DeletionVectors::new();
+        dv.insert_global([0u32]);
+        writer.write_deletion_vectors(&dv).unwrap();
+        writer.finish().unwrap();
+        path
+    };
+
+    let plan = MaterializePlan {
+        container: Container::Csr,
+        data_dtype: ValueDtype::U16,
+        index_dtype: IndexDtype::I32,
+        allow_lossy: false,
+    };
+
+    for (name, n_obs, csr_rows, what) in [
+        (
+            "typed_mask_long.scx",
+            10usize,
+            4usize,
+            "mask longer than CSR",
+        ),
+        ("typed_mask_short.scx", 4, 10, "mask shorter than CSR"),
+    ] {
+        let path = build(name, n_obs, csr_rows);
+        let reader = ScxReader::open(&path).unwrap();
+        let err = reader
+            .read_all_csr_shards_typed(&plan)
+            .expect_err(&format!("{what} must be rejected, not answered"));
+        assert!(
+            matches!(err, crate::error::ScxError::InvalidCatalog(_)),
+            "{what}: expected InvalidCatalog, got {err:?}"
+        );
+    }
+
+    // Control: agreeing counts still filter, so the guard is not rejecting
+    // every file.
+    let path = build("typed_mask_ok.scx", 6, 6);
+    let reader = ScxReader::open(&path).unwrap();
+    let typed = reader.read_all_csr_shards_typed(&plan).unwrap();
+    assert_eq!(typed.shape.0, 5, "one of six rows was deleted");
+}

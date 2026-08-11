@@ -3599,6 +3599,7 @@ impl ScxReader {
             Some(keep) => keep,
             None => return Ok(csr),
         };
+        crate::deletion_vectors::check_keep_mask_covers_csr(keep.len(), csr.shape.0)?;
 
         // Filter CSR rows
         let mut new_indptr = vec![0i64];
