@@ -3934,6 +3934,26 @@ impl ScxReader {
             "block_index",
         )?;
 
+        // Third seam: this path bounds decoded indices by `header.n_minor` alone,
+        // so without this it stayed the one way a widened payload could still get
+        // an out-of-range index out of the reader — via a *scattered* framed read
+        // while the whole-shard paths rejected the same file.
+        // The minor axis is per shard *class*, not universal: a row-major shard's
+        // minor extent is the column count, a CSC sidecar's is `n_obs`. Using
+        // `n_vars` for both rejected every scattered CSC read — caught by
+        // `read_csc_columns_scattered_matches_full_decode`.
+        let authenticated_minor =
+            if crate::shard_decode::catalog_says_column_major(entry.section_type) {
+                self.header.n_obs
+            } else {
+                self.header.n_vars
+            };
+        crate::shard_decode::reconcile_declared_minor(
+            header.n_minor,
+            authenticated_minor,
+            &format!("shard '{}'", entry.name),
+        )?;
+
         let spans = crate::shard::resolve_block_index(&header, block_index_bytes)?;
         let find_group = |row: usize| -> usize {
             spans

@@ -16,6 +16,7 @@ use scx_codec::{CodecId, EncodedShardRef, ShardValuesNative, ValueEncoding};
 
 use crate::catalog::FullCatalogEntry;
 use crate::error::{Result, ScxError};
+use crate::section::SectionType;
 use crate::shard::{
     clamped_reserve, resolve_block_index, ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION,
 };
@@ -107,6 +108,48 @@ pub fn decode_shard_bytes(
     Ok((indptr, indices, data))
 }
 
+/// Whether the **catalog** says this section is column-major.
+///
+/// Named explicitly rather than derived from the shard header, and it includes
+/// `LayerCscShard`: a layer's CSC sidecar tiles the same axis as X's, so omitting
+/// it would read the wrong stats pair for every layer sidecar.
+pub(crate) fn catalog_says_column_major(section_type: SectionType) -> bool {
+    matches!(
+        section_type,
+        SectionType::CscShard | SectionType::LayerCscShard
+    )
+}
+
+/// Reconcile a shard's declared minor extent against a width the caller knows
+/// from an authenticated source.
+///
+/// O(1) — two integers. The expensive part (bounding every decoded index)
+/// already happened inside the codec using the header's `n_minor`, so once that
+/// number is confirmed equal to the real width, the bound it enforced was the
+/// right one. That is what lets the backed reader, which deliberately carries no
+/// catalog stats on its transient entries, close the same hole for the price of
+/// a comparison.
+///
+/// `0` means "undeclared" — legacy multimodal shards stamp the file-level
+/// `n_vars`, which is `0` there — and is left alone, as everywhere else.
+pub(crate) fn reconcile_declared_minor(
+    declared: u32,
+    authenticated: u64,
+    what: &str,
+) -> Result<()> {
+    if declared == 0 || authenticated == 0 {
+        return Ok(());
+    }
+    if declared as u64 != authenticated {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{what}: header declares n_minor {declared} but the file says \
+             {authenticated} (corrupt file; the shard payload is not covered by \
+             the catalog checksum, so it is not the authority here)"
+        )));
+    }
+    Ok(())
+}
+
 /// The major-axis extent the **catalog** assigns this shard, or `None` when the
 /// entry carries no stats.
 ///
@@ -114,7 +157,7 @@ pub fn decode_shard_bytes(
 /// the backed reader keeps row ranges in `BackedCsrIndex` instead — so the
 /// backed path returns `None` here and is covered by
 /// `BackedCsrReader::check_decoded_shard_rows`.
-fn catalog_major_extent(sh: &ShardHeader, entry: &FullCatalogEntry) -> Result<Option<u64>> {
+fn catalog_major_extent(_sh: &ShardHeader, entry: &FullCatalogEntry) -> Result<Option<u64>> {
     let Some(stats) = entry.stats.as_ref() else {
         return Ok(None);
     };
@@ -122,7 +165,7 @@ fn catalog_major_extent(sh: &ShardHeader, entry: &FullCatalogEntry) -> Result<Op
     // tiles the column axis. `compute_shard_stats` writes the *other* pair as
     // `0..n_minor`, so reading the wrong one would compare an extent against a
     // width.
-    let (lo, hi) = if sh.is_csc(entry.section_type) {
+    let (lo, hi) = if catalog_says_column_major(entry.section_type) {
         (stats.col_start, stats.col_end)
     } else {
         (stats.row_start, stats.row_end)
@@ -157,11 +200,30 @@ fn check_header_against_catalog(sh: &ShardHeader, entry: &FullCatalogEntry) -> R
     let Some(stats) = entry.stats.as_ref() else {
         return Ok(());
     };
-    let authenticated = if sh.is_csc(entry.section_type) {
+    // Dispatch on the **catalog's** section type, never on `ShardHeader::is_csc`.
+    // `is_csc` is true when *either* the catalog says CSC or the payload's own
+    // `shard_type` byte does, and `validate_csc_strict` only rejects the one
+    // direction (`CscShard` + `shard_type != 1`). A `CsrShard` entry carrying a
+    // self-consistent transposed payload (`shard_type = 1`, major and minor
+    // swapped) would therefore choose which catalog axes validated it — and both
+    // comparisons would pass while the catalog says the section is row-major.
+    // Letting unauthenticated bytes pick their own referee defeats the point of
+    // reconciling against the catalog at all.
+    let authenticated = if catalog_says_column_major(entry.section_type) {
         stats.row_end
     } else {
         stats.col_end
     };
+    // Having fixed the axis from the catalog, require the payload to agree about
+    // the layout too, in *both* directions.
+    let payload_says_csc = sh.shard_type == 1;
+    if payload_says_csc != catalog_says_column_major(entry.section_type) {
+        return Err(ScxError::InvalidCatalog(format!(
+            "shard '{}': catalog section type {:?} disagrees with the payload's \
+             shard_type byte {} (corrupt file)",
+            entry.name, entry.section_type, sh.shard_type
+        )));
+    }
     if authenticated == 0 {
         return Ok(()); // v1 catalog: no minor extent recorded.
     }

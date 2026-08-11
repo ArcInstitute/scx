@@ -1826,6 +1826,7 @@ impl BackedCsrReader {
 
         let n_rows = indptr.len().saturating_sub(1);
         self.check_decoded_shard_rows(shard_idx, n_rows)?;
+        self.check_decoded_shard_minor(shard_idx)?;
         Ok(ScxCsr::new_unchecked(
             (n_rows, self.n_vars),
             indptr,
@@ -1861,6 +1862,35 @@ impl BackedCsrReader {
     /// entry: `ShardEntryLite::into_transient_full_entry` sets `stats: None`,
     /// because the lite entry deliberately drops the row range and every row
     /// lookup goes through [`BackedCsrIndex`].
+    /// Reconcile a shard header's declared minor extent against this reader's
+    /// authenticated column width, before the decoded CSR is handed out.
+    ///
+    /// The shared full-entry seam (`decode_shard_bytes`) does this against the
+    /// catalog's stats — but the backed reader passes a *transient* entry with
+    /// `stats: None` by design, so that check no-ops here and this path was the
+    /// one place a payload could still widen its own `n_minor`, smuggle an index
+    /// past the codec's bound, and produce an `ScxCsr` whose `shape.1` is
+    /// `self.n_vars`. Rust densify then rejects it, but the default read hands
+    /// those triples straight to `scipy.sparse.csr_matrix`, which accepts them —
+    /// and `.toarray()` misplaces the value into another row.
+    ///
+    /// O(1): the codec has already bounded every index against the header's
+    /// `n_minor`, so confirming that number equals the real width is enough to
+    /// know the bound it enforced was the right one.
+    fn check_decoded_shard_minor(&self, shard_idx: usize) -> Result<()> {
+        let Some(lite) = self.shard_entry(shard_idx) else {
+            return Ok(());
+        };
+        let sh = self
+            .reader
+            .read_shard_header(&lite.into_transient_full_entry())?;
+        crate::shard_decode::reconcile_declared_minor(
+            sh.n_minor,
+            self.n_vars as u64,
+            &format!("CSR shard {shard_idx}"),
+        )
+    }
+
     fn check_decoded_shard_rows(&self, shard_idx: usize, n_rows: usize) -> Result<()> {
         let Some((row_start, row_end)) = self.index.shard_range(shard_idx) else {
             return Ok(());
@@ -1930,6 +1960,7 @@ impl BackedCsrReader {
         let n_rows = indptr.len().saturating_sub(1);
 
         self.check_decoded_shard_rows(shard_idx, n_rows)?;
+        self.check_decoded_shard_minor(shard_idx)?;
 
         let csr = Arc::new(ScxCsr::new_unchecked(
             (n_rows, self.n_vars),

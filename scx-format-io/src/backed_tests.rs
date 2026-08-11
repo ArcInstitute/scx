@@ -2555,4 +2555,68 @@ fn a_shard_header_that_widens_n_minor_past_the_catalog_is_rejected() {
         msg.contains("13") && msg.contains("10"),
         "must report both widths so the file can be diagnosed: {msg}"
     );
+
+    // The eager path alone is not proof. `BackedCsrReader` passes a *transient*
+    // entry with `stats: None`, so the catalog-stats reconcile no-ops there and
+    // this was the surface that stayed open after the first attempt: backed
+    // AnnData, lazy transforms and every `ShardSource` accelerator read through
+    // it. Measured before the fix: `read_shard_cached_arc` returned
+    // `Ok(shape=(6, 10))` carrying an index of 12.
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    for (what, r) in [
+        (
+            "read_shard_cached_arc",
+            backed.read_shard_cached_arc(0).map(|_| ()),
+        ),
+        (
+            "read_shard_uncached",
+            backed.read_shard_uncached(0).map(|_| ()),
+        ),
+        (
+            "read_rows_with",
+            backed.read_rows_with(&[0, 3], |_, _, _| Ok(())),
+        ),
+    ] {
+        assert!(
+            r.is_err(),
+            "{what}: the backed path must reject a widened header too"
+        );
+    }
+}
+
+/// The framed **block-index** path is a third seam: it decodes row-groups
+/// directly and bounds them by `header.n_minor` alone, so a widened payload
+/// could still get an out-of-range index out through a *scattered* read while
+/// the whole-shard paths rejected the same file.
+#[test]
+fn the_block_index_path_also_rejects_a_widened_header() {
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+
+    let offsets: Vec<usize> = {
+        let reader = ScxReader::open(&path).unwrap();
+        reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard)
+            .map(|e| e.offset as usize)
+            .collect()
+    };
+    let mut bytes = std::fs::read(&path).unwrap();
+    for off in &offsets {
+        // Widen n_minor (shard-header byte 16) from 100 to 128.
+        bytes[off + 16..off + 20].copy_from_slice(&128u32.to_le_bytes());
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    // A scattered request is what selects the block-index path; a dense one
+    // falls back to a full-shard decode, which a different guard covers.
+    assert!(
+        backed
+            .read_rows_with(&[1, 9, 30], |_, _, _| Ok(()))
+            .is_err(),
+        "a scattered framed read must reject a widened header"
+    );
 }
