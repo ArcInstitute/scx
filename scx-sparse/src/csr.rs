@@ -168,8 +168,18 @@ impl ScxCsr {
     ///
     /// It is enforced now, once per shard, at the `scx-format-io` decode seam —
     /// on the scipy path by the bound handed to `scx_codec::decode_shard_scipy`,
-    /// on the native path by its own pass. Callers constructing a CSR from
-    /// anywhere *other* than a reader still owe the invariant themselves.
+    /// on the native path by its own pass. So every CSR that comes out of a
+    /// reader satisfies invariant 5.
+    ///
+    /// Callers constructing a CSR from anywhere *other* than a reader still owe
+    /// the invariant themselves, and one known caller does not yet discharge it:
+    /// `rscx::interop::write_csc_shards_from_csr_r` builds a CSR from
+    /// R-supplied index vectors and does not bound them against `n_vars`
+    /// (`scx_sparse::validate_csr_arrays` is called only on rscx's *export*
+    /// side). The consequence is now a detectable one rather than a silent one —
+    /// such a file is rejected when read back instead of materialising a wrong
+    /// dense matrix — but the write side should validate. Tracked separately;
+    /// not part of the reader-side work that added this note.
     ///
     /// Use when the data is known to be valid.
     pub fn new_unchecked(
