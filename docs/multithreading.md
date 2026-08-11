@@ -216,6 +216,34 @@ threads at construction time. A forked child therefore inherits no
 fork-hostile state from the parent. The eager-construct-then-fork case is
 caught by the PID check in `__next__` (`scx-loader/src/python.rs`).
 
+#### The other three surfaces: `scx_loader::pool::cpu_pool()`
+
+`TrainingPipeline`'s per-pipeline pool covers only `TrainingPipeline`.
+`IndexPlanDataset`, `SparseCellSetDataset` and the two standalone kernels
+(`pyscx.collate_cellset_gathered`, `pyscx.downsample_counts_csr`) reached the
+**global** registry and hung a forked worker the same way. Two of those paths
+run through `scx-format-io` rather than any `par_*` in this crate, which is why
+"the loader does not use rayon" was believed and was wrong:
+
+| Path | Reached via |
+|---|---|
+| `IndexPlanLoader::new` → `ScxReader::read_obs` | the sharded-obs-metadata `par_iter`; fires at **construction** on any file whose obs is sharded |
+| gather → `BackedCsrReader::warm_shards` | the parallel cold-shard decode |
+| `collate_gathered`, `downsample_counts_csr` | `par_chunks_mut` / `into_par_iter` directly |
+
+All four now go through **`scx_loader::pool::cpu_pool()`** — one pool per
+process, shared by every reader, sized `num_cpus::get_physical().clamp(1, 8)`
+and overridable with **`SCX_LOADER_CPU_THREADS`**. It is keyed on the PID and
+rebuilt when that changes, because a plain `OnceLock` filled by the parent
+would hand the child a private pool whose threads are just as absent as the
+global one's. `BackedCsrReader::set_cpu_pool` carries it into `scx-format-io`;
+unset (every other consumer) keeps the global registry, so `scx-accel`,
+`scx-ops`, `scx-engine` and `scx-cli` are unchanged.
+
+The kernels are bare `#[pyfunction]`s, so a forked worker calls them with no
+dataset in hand and no PID check in front of them — the pool is the only guard
+there.
+
 `pyscx/tests/test_fork_safety.py` is the durable regression test;
 post-fix Lambda HPC measurements confirm the workers0 / workers2 paths
 run cleanly end-to-end. 
@@ -229,7 +257,7 @@ floors to 0.5× the post-fix median per the gate's convention).
 | Runtime | Reason |
 |---------|--------|
 | tokio (current-thread, per I/O thread) | Async I/O with efficient epoll/io_uring integration; per-thread runtime keeps the fork-hostile thread count at zero |
-| rayon (per-pipeline pool) | Work-stealing for CPU-bound decode/normalize, isolated from the global registry |
+| rayon (per-pipeline pool for `TrainingPipeline`; the process-wide `pool::cpu_pool()` elsewhere) | Work-stealing for CPU-bound decode/normalize, isolated from the global registry — whose worker threads do not survive `fork()` |
 | std::thread | Bridges async and sync worlds without blocking the tokio reactor |
 
 > [!IMPORTANT]

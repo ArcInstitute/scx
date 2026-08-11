@@ -654,6 +654,14 @@ loader = torch.utils.data.DataLoader(
 **Don't** construct a `TrainingDataset` in the parent process and share it
 across forked workers — the PID check in `__next__` raises `RuntimeError`.
 
+The same construct-in-the-worker rule applies to `IndexPlanDataset` and
+`SparseCellSetDataset`. Both spawn CPU work on a pool that
+`scx_loader::pool::cpu_pool()` rebuilds whenever the PID changes, so a forked
+worker never dispatches to rayon's inherited global registry (whose worker
+threads `fork()` does not duplicate — a dispatch to it never returns). Size it
+with `SCX_LOADER_CPU_THREADS`; the default is physical cores capped at 8, *per
+worker process*, so raising `num_workers` multiplies the thread count.
+
 > [!TIP]
 > Use `multiprocessing.set_start_method("spawn")` if your workload allows.
 > Spawn re-execs Python in the child and eliminates fork hazards entirely.

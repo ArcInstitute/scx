@@ -984,22 +984,32 @@ fn build_multimodal_batch_dict<'py>(
 /// `IndexPlanDataset` is fork-safe under PyTorch
 /// `DataLoader(num_workers > 0, start_method="fork")` **when the dataset is
 /// constructed lazily inside the worker's `__iter__`** — same contract as
-/// `TrainingDataset`. Because `IndexPlanLoader` does *not* use rayon's
-/// global pool (its prefetch goes via `tokio::spawn_blocking` and
-/// `std::thread::spawn`), the rayon-after-fork hazard that motivated
-/// Phase 2.0 for `TrainingDataset` does **not** apply here. The multi-threaded
-/// tokio runtime is, moreover, **not** built eagerly in `IndexPlanLoader::new()`
-/// — it is constructed lazily on first use in `IndexPlanLoader::runtime()`
-/// (a `OnceLock<Runtime>` in `scx-loader/src/index_plan.rs`), whose first touch
-/// is always from an `IndexPlanIter`, post-fork in the `DataLoader` worker. So
-/// the loader never owns runtime threads at the moment a child is forked, and
-/// each worker builds its own runtime fresh; the parent's runtime threads are
-/// never inherited. The construct-then-fork case is additionally caught by the
-/// PID check in `iter_with_plans` / `next_batch_for_test`.
+/// `TrainingDataset`.
 ///
-/// **Acceptance test**: `pyscx/tests/test_fork_safety.py::test_fork_index_plan_dataset`
-/// pins this contract end-to-end (multiprocessing.fork + lazy worker
-/// construction + plan iteration to completion).
+/// The multi-threaded tokio runtime is **not** built eagerly in
+/// `IndexPlanLoader::new()` — it is constructed lazily on first use in
+/// `IndexPlanLoader::runtime()` (a `OnceLock<Runtime>` in
+/// `scx-loader/src/index_plan.rs`), whose first touch is always from an
+/// `IndexPlanIter`, post-fork in the `DataLoader` worker. So the loader never
+/// owns runtime threads at the moment a child is forked, and each worker builds
+/// its own runtime fresh; the parent's runtime threads are never inherited. The
+/// construct-then-fork case is additionally caught by the PID check in
+/// `iter_with_plans` / `next_batch_for_test`.
+///
+/// **Rayon.** This class *does* reach rayon, just not directly — through
+/// `scx-format-io`. `IndexPlanLoader::new` calls `ScxReader::read_obs`, which
+/// fans the shard decode out with `par_iter` on any file with sharded obs
+/// metadata; and the gather reaches `BackedCsrReader::warm_shards`. Both used to
+/// dispatch against rayon's *global* registry, which `fork()` copies as a data
+/// structure without its worker threads, so a forked worker parked forever with
+/// no error and no batch. (An earlier version of this comment asserted the
+/// opposite — that the rayon-after-fork hazard did not apply here.) Both now go
+/// through `crate::pool::cpu_pool()`, which is rebuilt whenever the PID changes.
+///
+/// **Acceptance tests**: in `pyscx/tests/test_fork_safety.py` —
+/// `test_fork_index_plan_dataset` (fork + lazy construction + plan iteration),
+/// `test_fork_index_plan_sharded_obs` (the `read_obs` path) and
+/// `test_fork_index_plan_multi_shard_gather` (the `warm_shards` path).
 ///
 /// Recommended: call `start_method="spawn"` for the same reason it is
 /// recommended on `TrainingDataset` — no fork hazards at all.
