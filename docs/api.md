@@ -2593,9 +2593,15 @@ schema matches `TrainingDataset`.
   generators, queues all work).
 - Plan iteration is lazy: the loader pulls the next plan only when it is
   ready to schedule a prefetch for it.
-- The loader keeps `lookahead` plans in flight at once: the head plan is
+- The loader keeps *up to* `lookahead` plans in flight at once: the head plan is
   decoding while shards for the next `lookahead - 1` are being warmed via
   `tokio::task::spawn_blocking` calls into `BackedCsrReader::read_shard_cached_arc`.
+- **`lookahead` is a budget, not an obligation on the generator.** The loader
+  waits for the first plan of a batch and fills the remaining slots only from
+  plans the generator has already produced. A generator that yields plan *i+1*
+  only after inspecting batch *i* — curriculum sampling, hard-negative mining —
+  runs correctly, merely un-prefetched. (Before v0.13.1 it deadlocked: the
+  generator waited for the batch, the loader waited for `lookahead` plans.)
 - `StopIteration` from `plans` ends the batch stream cleanly. Other Python
   exceptions from `plans` propagate as `RuntimeError("plan iterator raised: ...")`.
 - Empty plans inside a stream are silently skipped.
@@ -2658,6 +2664,35 @@ ds = pyscx.IndexPlanDataset("atlas.scx", cache_shards=128, lookahead=4,
                             max_plan_size=16384, max_memory_mb=256)
 print(ds.effective_cache_shards(), ds.effective_lookahead())
 # Detects when auto-tuning kicked in.
+```
+
+**Lifecycle — `close()` and `closed`**
+
+`IndexPlanDataset` and `SparseCellSetDataset` both expose `close()` and a
+`closed` property. `close()` releases the loader's tokio runtime with the GIL
+detached and a 5 s bound, so tearing the dataset down cannot stall other Python
+threads while an in-flight shard decode finishes. Dropping the object does the
+same, so `close()` buys determinism rather than correctness.
+
+Unlike `TrainingDataset.close()`, **it is terminal on these two classes**: their
+tokio runtime is built exactly once so that a forked child can never inherit
+live tokio threads, which also means it cannot be rebuilt. Every method raises
+`RuntimeError` afterwards; construct a new dataset. `closed` and `repr()` never
+raise.
+
+The 5 s bound applies when `close()` holds the last reference to the loader. A
+still-alive `IndexPlanBatchIter` / `SparseCellSetBatchIter` holds one too, in
+which case `close()` releases only its own and the teardown happens — also
+off-GIL — when that iterator drops.
+
+```python
+ds = pyscx.IndexPlanDataset("atlas.scx")
+try:
+    for batch in ds.iter_with_plans(plans):
+        ...
+finally:
+    ds.close()
+assert ds.closed
 ```
 
 ### Fork safety under PyTorch `DataLoader(num_workers > 0)`

@@ -379,6 +379,26 @@ for batch in ds.iter_with_plans(plan_generator(perturbed, controls, 1024)):
 access (20K vs 189 cells/s). See [api.md § IndexPlanDataset](api.md#indexplandataset)
 for the full constructor reference, batch schema, and iterator semantics.
 
+### Feedback and curriculum plan generators
+
+`lookahead` is a prefetch *budget*, not a contract the generator has to meet.
+The loader waits for the first plan of each batch and then tops its queue up
+with whatever the generator has already produced, so a generator that computes
+plan *i+1* from batch *i* — curriculum sampling, hard-negative mining, anything
+with a feedback signal — is supported directly:
+
+```python
+def curriculum(model):
+    plan = initial_plan()
+    while True:
+        batch = yield plan
+        plan = next_plan_from(model, batch)   # needs the previous batch
+```
+
+Such a generator simply runs un-prefetched (effectively `lookahead=0`) while it
+is the bottleneck, and regains depth whenever it runs ahead. It is never
+required to stay `lookahead` plans in front of the consumer.
+
 
 ## SparseCellSetDataset and the native collation kernel
 
@@ -666,6 +686,36 @@ Size the pools with `SCX_LOADER_CPU_THREADS` (default: physical cores capped at
 own decode pool, so budget `num_workers × 2 × threads` there. `IndexPlanDataset`
 and `SparseCellSetDataset` hold one. See
 [multithreading.md § Per-worker thread footprint](multithreading.md#per-worker-thread-footprint).
+
+### Closing a dataset
+
+All four dataset classes have `close()`, and all four release the GIL around
+teardown — a `#[pyclass]` is dropped with the GIL held, and tearing down a
+tokio runtime blocks until every already-started shard decode returns, which
+would otherwise stall every other Python thread (CUDA stream callbacks, the
+logging thread) for that window. Dropping the object does the same thing, so
+`close()` is for explicitness and determinism, not correctness:
+
+```python
+def __iter__(self):
+    ds = pyscx.IndexPlanDataset(self.path, **self.kwargs)
+    try:
+        yield from ds.iter_with_plans(self.plans())
+    finally:
+        ds.close()
+```
+
+Two differences worth knowing:
+
+| | `TrainingDataset`, `MultimodalTrainingDataset` | `IndexPlanDataset`, `SparseCellSetDataset` |
+|---|---|---|
+| after `close()` | re-usable — the next `__iter__` rebuilds the pool and runtime | **terminal** — every method raises `RuntimeError`; construct a new dataset |
+| why | its pool and runtime are rebuilt per epoch anyway | the runtime is built exactly once, so a forked child can never inherit live tokio threads; that also means it cannot be rebuilt |
+
+`closed` and `repr()` never raise on any of them. On the two terminal classes,
+`close()`'s 5 s bound applies only when it holds the last reference to the
+loader: a still-alive batch iterator holds one too, and the teardown then
+happens — also off-GIL — when that iterator drops.
 
 > [!TIP]
 > Use `multiprocessing.set_start_method("spawn")` if your workload allows.

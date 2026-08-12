@@ -271,6 +271,23 @@ while `cpu_pool()` is process-wide — so budget `2 × threads` per worker, time
 since the decode pool read `num_cpus::get_physical()` directly and ignored the
 knob. `IndexPlanDataset` and `SparseCellSetDataset` hold only `cpu_pool()`.
 
+#### Teardown never runs under the GIL
+
+pyo3 drops a `#[pyclass]` with the GIL held, and dropping a tokio runtime blocks
+until every already-started `spawn_blocking` returns — for these loaders, a
+`read_shard_cached_arc` decode that can be hundreds of megabytes of Pcodec. All
+four dataset classes therefore detach the GIL around teardown, in both `close()`
+and `Drop`, and bound the wait by `SHUTDOWN_DEADLINE` (5 s):
+`TrainingPipeline::shutdown` for the two training classes,
+`{IndexPlanLoader,PrefetchEngine,SparseCellSetLoader}::shutdown_owned` for the
+other two. `shutdown_owned` consumes the value so it can take the runtime out of
+its `OnceLock` and call `shutdown_timeout` rather than a plain unbounded drop.
+
+The batch-iterator pyclasses (`IndexPlanBatchIter`, `SparseCellSetBatchIter`)
+detach too, and must: each holds its own `Arc` to the loader, so in the ordinary
+`for b in ds.iter_with_plans(...)` shape the iterator outlives `ds.close()` in
+the caller's frame and is the object that actually releases the runtime.
+
 `pyscx/tests/test_fork_safety.py` is the durable regression test;
 post-fix Lambda HPC measurements confirm the workers0 / workers2 paths
 run cleanly end-to-end. 

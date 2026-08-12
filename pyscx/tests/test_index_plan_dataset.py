@@ -894,3 +894,163 @@ class TestBlockIndexAdoption:
         assert not [w for w in caught if "row-group framed" in str(w.message)], (
             "a framed file must not trigger the unframed preflight warning"
         )
+
+
+class TestFeedbackPlanGenerator:
+    """§9.4 — prefetch depth is opportunistic, not an obligation.
+
+    `refill` used to loop on a blocking `recv` until the in-flight queue held
+    `lookahead` plans. A generator that yields plan i+1 only after inspecting
+    batch i — curriculum / feedback sampling — wedged forever: the generator
+    waited for batch i, the consumer waited for plan i+4.
+    """
+
+    def test_curriculum_generator_yields_every_batch(self, scx_path):
+        """The generator *blocks* until it has seen the previous batch.
+
+        Note it blocks rather than merely asserting it was not called ahead:
+        the plan-pull thread eagerly buffers up to `lookahead` plans into its
+        bounded channel, so being asked early is by design. What a real
+        curriculum generator cannot do is *answer* early, and that is what
+        used to wedge the loader.
+
+        `Semaphore.acquire` releases the GIL while it waits, so the pull thread
+        parking here does not stall the interpreter. Its timeout also turns the
+        old deadlock into a failed assertion instead of a hung test run.
+        """
+        import threading
+
+        ds = pyscx.IndexPlanDataset(
+            scx_path, normalize=False, log1p=False, obs_columns=[]
+        )
+        seen = []
+        n_plans = 5
+        ack = threading.Semaphore(0)
+
+        def curriculum():
+            for i in range(n_plans):
+                if i > 0:
+                    assert ack.acquire(timeout=30), (
+                        f"generator waited 30s for batch {i - 1} and never got it — "
+                        "the loader is demanding plans ahead of the feedback signal"
+                    )
+                # Gated on the ack, so this is now a real invariant: plan i is
+                # computed from exactly the first i batches.
+                assert len(seen) == i
+                yield [(i * 2, i * 2 + 1)]
+
+        # lookahead=4 is the default and the value that used to deadlock.
+        for batch in ds.iter_with_plans(curriculum(), lookahead=4):
+            seen.append(batch["X"].shape[0])
+            ack.release()
+
+        assert len(seen) == n_plans
+        assert all(n == 1 for n in seen)
+
+    def test_a_generator_that_lags_does_not_truncate_the_epoch(self, scx_path):
+        """A merely slow generator must still produce every batch.
+
+        Guards the tempting wrong fix: swapping the blocking `recv` for a
+        `try_recv` whose empty arm ends the plan stream truncates the epoch
+        silently, with no error anywhere.
+        """
+        import time
+
+        ds = pyscx.IndexPlanDataset(
+            scx_path, normalize=False, log1p=False, obs_columns=[]
+        )
+        n_plans = 6
+
+        def slow():
+            for i in range(n_plans):
+                time.sleep(0.02)
+                yield [(i, i + 1)]
+
+        n = sum(1 for _ in ds.iter_with_plans(slow(), lookahead=4))
+        assert n == n_plans, "a slow generator must not truncate the epoch"
+
+
+class TestCloseAndTeardown:
+    """§9.3 — teardown is bounded and does not run under the GIL."""
+
+    def test_close_is_idempotent_and_terminal(self, scx_path):
+        ds = pyscx.IndexPlanDataset(
+            scx_path, normalize=False, log1p=False, obs_columns=[]
+        )
+        assert ds.closed is False
+        assert ds.n_obs > 0
+
+        ds.close()
+        assert ds.closed is True
+        ds.close()  # idempotent
+
+        # Terminal, unlike TrainingDataset.close(): the tokio runtime is built
+        # exactly once so a forked child can never inherit it, so it cannot be
+        # rebuilt on a later __iter__.
+        with pytest.raises(RuntimeError, match="closed"):
+            ds.iter_with_plans(iter([[(0, 1)]]))
+        with pytest.raises(RuntimeError, match="closed"):
+            _ = ds.n_obs
+        with pytest.raises(RuntimeError, match="closed"):
+            ds.memory_budget()
+
+    def test_repr_never_raises_when_closed(self, scx_path):
+        """`repr` is what a debugger and a traceback call; it must not fail
+        just because the object was closed."""
+        ds = pyscx.IndexPlanDataset(
+            scx_path, normalize=False, log1p=False, obs_columns=[]
+        )
+        assert "n_obs=" in repr(ds)
+        ds.close()
+        assert repr(ds) == "IndexPlanDataset(closed)"
+
+    def test_close_with_a_live_iterator_does_not_raise(self, scx_path):
+        """The iterator holds its own reference to the loader, so `close`
+        cannot take sole ownership. It must release its own reference and
+        leave the iterator's teardown to that object's own drop."""
+        ds = pyscx.IndexPlanDataset(
+            scx_path, normalize=False, log1p=False, obs_columns=[]
+        )
+        it = ds.iter_with_plans(iter([[(0, 1)], [(2, 3)]]), lookahead=2)
+        next(it)
+        ds.close()
+        # The iterator was built from a live loader and keeps working.
+        assert next(it)["X"].shape[0] == 1
+        del it
+
+    def test_teardown_mid_flight_is_bounded(self, scx_path):
+        """Abandoning an epoch with prefetches outstanding must tear down
+        cleanly and promptly.
+
+        This is the ordering guard, not a GIL measurement. The iterator holds
+        its own reference to the loader, so dropping the dataset first cannot
+        take sole ownership; the runtime is released when the *iterator* drops.
+        Getting that ordering wrong shows up here as a hang or a panic.
+
+        Note on what is deliberately **not** asserted: whether the teardown
+        released the GIL. That is the §9.3 defect, and it is not measurable at
+        unit-test scale — teardown of even a 60000x3000 file with prefetches in
+        flight was measured at ~9 ms with the GIL held, well inside scheduler
+        noise, so a threshold that could see it would be flaky and a threshold
+        that is not flaky passes on the broken code. The property is carried by
+        construction instead: `IndexPlanDataset::drop` and
+        `IndexPlanBatchIter::drop` mirror `TrainingDataset::drop`, which has
+        the same status.
+        """
+        import time
+
+        ds = pyscx.IndexPlanDataset(
+            scx_path, normalize=False, log1p=False, obs_columns=[]
+        )
+        plans = [[(i, i + 1)] for i in range(8)]
+        it = ds.iter_with_plans(iter(plans), lookahead=4)
+        next(it)  # prefetches for the following plans are now in flight
+
+        t0 = time.monotonic()
+        del ds  # not the last reference — `it` still holds one
+        del it  # this is what actually releases the runtime
+        elapsed = time.monotonic() - t0
+
+        # The bound is `SHUTDOWN_DEADLINE` (5 s) plus slack; a hang or a
+        # missing `shutdown_timeout` is what this catches, not latency.
+        assert elapsed < 10.0, f"mid-flight teardown took {elapsed:.2f}s"
