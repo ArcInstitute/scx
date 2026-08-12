@@ -50,6 +50,12 @@
 
 set -uo pipefail
 
+# GPU tests are `#[ignore]`d (see docs/testing.md § GPU Test Skip Behavior), so
+# `--include-ignored` is required or this script exits 0 having run nothing.
+# `--lib --tests` keeps the flag away from rustdoc, where ```ignore fences mean
+# the same thing. SCX_REQUIRE_GPU=1 makes a missing device a failure, not a skip.
+export SCX_REQUIRE_GPU=1
+
 SCX_DIR=/home/nickyoungblut/dev/rust/scx
 CONDA=/home/nickyoungblut/miniforge3
 ENV="${CONDA}/envs/scx-bench-gpu"
@@ -130,9 +136,9 @@ echo
 echo "############ 1. cargo GPU suites (branch) ############"
 cd "${SCX_DIR}" || exit 1
 CARGO_TARGET_DIR=/home/nickyoungblut/.cargo-target-45-branch \
-    cargo test -p scx-gpu --release -- --test-threads=1 2>&1 | tail -25
+    cargo test -p scx-gpu --release --lib --tests -- --include-ignored --test-threads=1 2>&1 | tail -25
 CARGO_TARGET_DIR=/home/nickyoungblut/.cargo-target-45-branch \
-    cargo test -p scx-accel --features gpu --release -- --test-threads=1 2>&1 | tail -25
+    cargo test -p scx-accel --features gpu --release --lib --tests -- --include-ignored --test-threads=1 2>&1 | tail -25
 
 echo
 echo "############ 2. pytest failure-set A/B ############"

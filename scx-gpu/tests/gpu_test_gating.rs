@@ -95,24 +95,89 @@ fn rust_sources(root: &Path) -> Vec<PathBuf> {
 
 /// The `{…}` block starting at the first `{` at or after `from`.
 ///
-/// Returns `None` when the braces never balance before EOF — treated as a hard
-/// error by the callers rather than as "no body", because an unbalanced brace
-/// (a `{` inside a string literal, say) makes every downstream answer wrong in
-/// the direction that *hides* a violation.
+/// Braces inside string literals, char literals and comments are skipped. A
+/// counter that does not do this is wrong in both directions, and only one of
+/// them announces itself: a stray `"{"` over-runs into the next function, which
+/// the `#[test]`-in-body assertion catches — but a stray `"}"` closes the body
+/// *early* and silently, hiding whatever follows it from every rule here.
+///
+/// Returns `None` when the braces never balance before EOF; callers treat that
+/// as a hard error rather than as "no body".
 fn brace_block(text: &str, from: usize) -> Option<(usize, usize)> {
-    let bytes = text.as_bytes();
+    let b = text.as_bytes();
     let start = text[from..].find('{')? + from;
     let mut depth = 0usize;
-    for (offset, &b) in bytes[start..].iter().enumerate() {
-        match b {
-            b'{' => depth += 1,
+    let mut i = start;
+
+    while i < b.len() {
+        match b[i] {
+            // Line comment.
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                i = text[i..].find('\n').map_or(b.len(), |p| i + p);
+            }
+            // Block comment. Rust nests these; so does this.
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut nest = 1usize;
+                i += 2;
+                while i < b.len() && nest > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        nest += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        nest -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            // Raw string: r"…", r#"…"#, r##"…"##.
+            b'r' if matches!(b.get(i + 1), Some(&b'"') | Some(&b'#')) => {
+                let mut hashes = 0usize;
+                let mut j = i + 1;
+                while b.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if b.get(j) != Some(&b'"') {
+                    i += 1; // an identifier starting with `r`, not a raw string
+                    continue;
+                }
+                let terminator = format!("\"{}", "#".repeat(hashes));
+                i = text[j + 1..]
+                    .find(&terminator)
+                    .map_or(b.len(), |p| j + 1 + p + terminator.len());
+            }
+            // Ordinary string, with backslash escapes.
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            // Char literal — only the two that can affect the count, plus the
+            // escaped forms. A bare `'` is far more often a lifetime (`&'a str`),
+            // and treating that as a literal would swallow the rest of the file.
+            b'\'' => {
+                let rest = &text[i..];
+                let lit = ["'{'", "'}'", "'\\''", "'\\\\'"]
+                    .iter()
+                    .find(|l| rest.starts_with(*l));
+                i += lit.map_or(1, |l| l.len());
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some((start, start + offset + 1));
+                    return Some((start, i + 1));
                 }
+                i += 1;
             }
-            _ => {}
+            _ => i += 1,
         }
     }
     None
@@ -190,6 +255,16 @@ fn test_fns(text: &str, path: &Path) -> Vec<TestFn> {
 fn extracted_test_files(sources: &[PathBuf]) -> HashSet<PathBuf> {
     let mut out = HashSet::new();
     for src in sources {
+        // Union, not replacement: the suffix convention still holds for the 15
+        // `*_tests.rs` files, and a future `#[cfg(test)] mod foo_tests;` with no
+        // `#[path]` would otherwise recreate exactly the hole this fixes.
+        if src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("_tests.rs"))
+        {
+            out.insert(src.clone());
+        }
         let Ok(text) = std::fs::read_to_string(src) else {
             continue;
         };

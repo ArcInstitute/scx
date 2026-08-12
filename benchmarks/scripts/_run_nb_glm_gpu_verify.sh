@@ -10,6 +10,12 @@
 
 set -uo pipefail
 
+# GPU tests are `#[ignore]`d (see docs/testing.md § GPU Test Skip Behavior), so
+# `--include-ignored` is required or this script exits 0 having run nothing.
+# `--lib --tests` keeps the flag away from rustdoc, where ```ignore fences mean
+# the same thing. SCX_REQUIRE_GPU=1 makes a missing device a failure, not a skip.
+export SCX_REQUIRE_GPU=1
+
 SCX_DIR="/home/nickyoungblut/dev/rust/scx"
 cd "${SCX_DIR}"
 export PATH=/usr/local/cuda/bin:${PATH}
@@ -23,11 +29,11 @@ echo
 rc=0
 
 echo "=== [1a] scx-gpu gpu_nb_glm smoke (release) ==="
-cargo test -p scx-gpu --release gpu_nb_glm -- --nocapture --test-threads=1 || rc=1
+cargo test -p scx-gpu --release --lib --tests gpu_nb_glm -- --include-ignored --nocapture --test-threads=1 || rc=1
 echo
 
 echo "=== [1b] scx-accel CPU<->GPU NB-GLM parity (release) ==="
-cargo test -p scx-accel --features gpu --release nb_glm::gpu -- --nocapture --test-threads=1 || rc=1
+cargo test -p scx-accel --features gpu --release --lib --tests nb_glm::gpu -- --include-ignored --nocapture --test-threads=1 || rc=1
 echo
 
 echo "=== [2a] build pyscx (release, hdf5,gpu) ==="

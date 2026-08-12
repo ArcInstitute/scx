@@ -485,7 +485,9 @@ fn test_multi_covariate_runs() {
 }
 
 // ── GPU tests ─────────────────────────────────────────────────────
-// Skip silently on machines without a CUDA driver; run otherwise.
+// `#[ignore]`d and gated, so a machine without a CUDA driver reports them as
+// ignored rather than as passes that did nothing. The GPU harness re-selects
+// them with `--include-ignored` under `SCX_REQUIRE_GPU=1`.
 
 #[cfg(feature = "gpu")]
 #[test]
