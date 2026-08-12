@@ -803,6 +803,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_pinned_slot_basic_stage_and_grow() {
         let dev = require_gpu!();
         let ctx = dev.context();
@@ -848,6 +849,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_csr_slot_upload_and_view_sizes() {
         let dev = require_gpu!();
         let ctx = dev.context();
@@ -886,6 +888,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_csr_slot_descr_cache_hit_same_shape() {
         let dev = require_gpu!();
         let ctx = dev.context();
@@ -915,6 +918,7 @@ mod tests {
     /// n_rows / n_cols). The existing `*_on_shape_change` test varies
     /// `n_rows`; this isolates the nnz path.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_csr_slot_descr_cache_invalidates_on_nnz_change() {
         let dev = require_gpu!();
         let ctx = dev.context();
@@ -950,6 +954,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_csr_slot_descr_cache_invalidates_on_shape_change() {
         let dev = require_gpu!();
         let ctx = dev.context();

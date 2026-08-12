@@ -181,6 +181,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn csr_only_reports_csr_and_rejects_csc() {
         let dev = require_gpu!();
         let csr = csr_fixture();
@@ -195,6 +196,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn with_csc_reports_both_layouts() {
         let dev = require_gpu!();
         let csr = csr_fixture();
@@ -205,6 +207,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn csr_iteration_yields_source_values() {
         let dev = require_gpu!();
         let csr = csr_fixture();
@@ -226,6 +229,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn csc_iteration_yields_source_values() {
         let dev = require_gpu!();
         let csr = csr_fixture();

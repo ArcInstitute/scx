@@ -9,6 +9,12 @@
 # too late — ld.so caches it at startup).
 set -uo pipefail
 
+# GPU tests are `#[ignore]`d (see docs/testing.md § GPU Test Skip Behavior), so
+# `--include-ignored` is required or this script exits 0 having run nothing.
+# `--lib --tests` keeps the flag away from rustdoc, where ```ignore fences mean
+# the same thing. SCX_REQUIRE_GPU=1 makes a missing device a failure, not a skip.
+export SCX_REQUIRE_GPU=1
+
 SCX_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "${SCX_DIR}"
 
@@ -26,8 +32,12 @@ ls -l "${CONDA_PREFIX}/lib/"libnvcomp.so* 2>/dev/null || echo "WARNING: libnvcom
 echo "CONDA_PREFIX=${CONDA_PREFIX}"
 echo
 
+# This job exists to measure nvcomp. Without this, a node missing
+# libnvcomp.so.5 makes every nvcomp test a listed skip and the spike
+# reports success having measured nothing.
+export SCX_REQUIRE_NVCOMP=1
 echo "=== cargo test -p scx-gpu --release nvcomp (spike) ==="
-cargo test -p scx-gpu --release nvcomp -- --nocapture --test-threads=1
+cargo test -p scx-gpu --release --lib --tests nvcomp -- --include-ignored --nocapture --test-threads=1
 rc=$?
 echo "=== spike exit: ${rc} ==="
 exit ${rc}

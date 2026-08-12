@@ -17,23 +17,62 @@
 
 // --- Test-only macro (must precede module declarations for textual scoping) ---
 
-/// Try to acquire a GPU device, skipping the test if CUDA is unavailable.
+/// Acquire a GPU device for a test, or return early if CUDA is unavailable.
 ///
 /// Usage in `#[cfg(test)]` modules:
 /// ```ignore
-/// let dev = require_gpu!();
+/// #[test]
+/// #[ignore = "requires a CUDA GPU"]
+/// fn my_gpu_test() {
+///     let dev = require_gpu!();
+/// }
 /// ```
 ///
-/// Defined once here; used across all test modules in the crate.
+/// **The `#[ignore]` is not optional.** Without it the test is *selected* on a
+/// CPU-only host, returns immediately, and is counted as passed — which is how
+/// 170 tests in this crate came to be guaranteed no-ops in CI. With it, a
+/// default run reports them as ignored, and the harness opts back in with
+/// `--include-ignored` plus `SCX_REQUIRE_GPU=1` so a skip there is a failure.
+/// `tests/gpu_test_gating.rs` enforces the pairing in both directions.
+///
+/// The decision itself lives in [`crate::test_gate`] so that `scx-accel`'s GPU
+/// tests share it; only the `return` has to be a macro.
 #[cfg(test)]
 macro_rules! require_gpu {
     () => {
-        match $crate::device::GpuDevice::new(0) {
-            Ok(dev) => dev,
-            Err(_) => {
-                eprintln!("CUDA not available — skipping GPU test");
-                return;
-            }
+        match $crate::test_gate::device_or_skip(module_path!()) {
+            Some(dev) => dev,
+            None => return,
+        }
+    };
+}
+
+/// Gate a test on an optional CUDA library rather than on the device itself.
+///
+/// A GPU node legitimately may not carry nvcomp or cuVS, so these skip by
+/// default and report via [`crate::test_gate::SKIP_MARKER`]; `SCX_REQUIRE_NVCOMP=1`
+/// / `SCX_REQUIRE_CUVS=1` make them hard requirements for a run that means to
+/// cover them. Use *below* `require_gpu!()`, never instead of it.
+#[cfg(test)]
+macro_rules! require_gpu_cap {
+    (nvcomp) => {
+        if !$crate::test_gate::capability_or_skip(
+            "nvcomp",
+            $crate::test_gate::REQUIRE_NVCOMP_ENV,
+            $crate::nvcomp::nvcomp_available(),
+            module_path!(),
+        ) {
+            return;
+        }
+    };
+    (cuvs) => {
+        if !$crate::test_gate::capability_or_skip(
+            "cuVS",
+            $crate::test_gate::REQUIRE_CUVS_ENV,
+            $crate::gpu_knn::cuvs_available(),
+            module_path!(),
+        ) {
+            return;
         }
     };
 }
@@ -79,6 +118,7 @@ pub mod shard_decode;
 pub mod shufdelta_gpu;
 pub mod sparse_dense;
 pub mod staging;
+pub mod test_gate;
 
 // Re-export primary types for convenience.
 pub use backed_gpu_matrix_source::BackedGpuMatrixSource;

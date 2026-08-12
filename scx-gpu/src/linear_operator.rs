@@ -475,6 +475,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_matmat_matches_cpu_centered() {
         let dev = require_gpu!();
         let cusparse = CusparseHandle::new().unwrap();
@@ -522,6 +523,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_matmat_matches_cpu_not_centered() {
         let dev = require_gpu!();
         let cusparse = CusparseHandle::new().unwrap();
@@ -564,6 +566,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_rmatmat_matches_cpu_centered() {
         let dev = require_gpu!();
         let cusparse = CusparseHandle::new().unwrap();
@@ -610,6 +613,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_accumulate_gram_matches_cpu_centered() {
         let dev = require_gpu!();
         let cusparse = CusparseHandle::new().unwrap();
@@ -651,6 +655,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_accumulate_gram_matches_cpu_not_centered() {
         let dev = require_gpu!();
         let cusparse = CusparseHandle::new().unwrap();
@@ -702,6 +707,7 @@ mod tests {
     /// identically, so `gram_a == gram_b` would still hold. The CPU
     /// reference is what actually catches the bug.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_accumulate_gram_scratch_reuse() {
         let dev = require_gpu!();
         let cusparse = CusparseHandle::new().unwrap();
@@ -775,6 +781,7 @@ mod tests {
     /// rows `[378, 503)` only and the mean-correct touches a shorter
     /// `(shard_rows × k)` region than the others.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_matmat_uneven_shards_centered() {
         let dev = require_gpu!();
         let cusparse = CusparseHandle::new().unwrap();
@@ -830,6 +837,7 @@ mod tests {
     /// with `ld = n_obs`; an off-by-one in the view's offset/ld would either
     /// read past the end of `d_y` (silently zero or garbage) or skip rows.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_rmatmat_uneven_shards_centered() {
         let dev = require_gpu!();
         let cusparse = CusparseHandle::new().unwrap();
@@ -885,6 +893,7 @@ mod tests {
     /// `test_randomized_pca_pool_no_realloc_across_power_iters` — it
     /// exercises the same SpMM pattern without dragging in cuSOLVER QR.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_matmat_rmatmat_pool_no_realloc_across_power_iters() {
         let dev = require_gpu!();
         let cusparse = CusparseHandle::new().unwrap();
@@ -951,6 +960,7 @@ mod tests {
     /// pool's `alloc_count` is at most 1 after both calls (single grow
     /// event for cuSPARSE's largest workspace shape).
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_matmat_pooled_reuses_workspace_across_calls() {
         let dev = require_gpu!();
         let cusparse = CusparseHandle::new().unwrap();

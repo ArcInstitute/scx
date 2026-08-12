@@ -8,6 +8,12 @@
 
 set -uo pipefail
 
+# GPU tests are `#[ignore]`d (see docs/testing.md § GPU Test Skip Behavior), so
+# `--include-ignored` is required or this script exits 0 having run nothing.
+# `--lib --tests` keeps the flag away from rustdoc, where ```ignore fences mean
+# the same thing. SCX_REQUIRE_GPU=1 makes a missing device a failure, not a skip.
+export SCX_REQUIRE_GPU=1
+
 # Resolve the repo root from this script's location (benchmarks/scripts/<this>)
 # so the driver is portable rather than tied to one checkout path. Override with
 # SCX_DIR / SCX_GPU_CONDA_ENV in the environment.
@@ -45,7 +51,7 @@ for f in tests/test_pdex_ref_gpu_parity.py tests/test_pdex_ref_gpu_csc_parity.py
 done
 
 echo "=== cargo test -p scx-accel --features gpu --release (pdex + csc) ==="
-cargo test -p scx-accel --features gpu --release pdex -- --nocapture --test-threads=1 || rc=1
+cargo test -p scx-accel --features gpu --release --lib --tests pdex -- --include-ignored --nocapture --test-threads=1 || rc=1
 
 echo "=== done (rc=${rc}) ==="
 exit ${rc}

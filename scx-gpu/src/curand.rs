@@ -123,6 +123,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_random_gaussian_gpu_basic() {
         let dev = require_gpu!();
 
@@ -149,6 +150,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_random_gaussian_gpu_odd_count() {
         let dev = require_gpu!();
 
@@ -161,6 +163,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_random_gaussian_gpu_reproducible() {
         let dev = require_gpu!();
 
@@ -184,6 +187,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_random_gaussian_gpu_empty() {
         let dev = require_gpu!();
 

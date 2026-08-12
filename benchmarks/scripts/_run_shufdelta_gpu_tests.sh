@@ -11,6 +11,12 @@
 # pipeline-vs-sequential equality test forces the Phase-1 sequential path.
 set -uo pipefail
 
+# GPU tests are `#[ignore]`d (see docs/testing.md § GPU Test Skip Behavior), so
+# `--include-ignored` is required or this script exits 0 having run nothing.
+# `--lib --tests` keeps the flag away from rustdoc, where ```ignore fences mean
+# the same thing. SCX_REQUIRE_GPU=1 makes a missing device a failure, not a skip.
+export SCX_REQUIRE_GPU=1
+
 SCX_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "${SCX_DIR}"
 
@@ -31,7 +37,7 @@ echo
 overall=0
 run_filter() {
     echo "=== cargo test -p scx-gpu --release '$1' ==="
-    cargo test -p scx-gpu --release "$1" -- --nocapture --test-threads=1
+    cargo test -p scx-gpu --release --lib --tests "$1" -- --include-ignored --nocapture --test-threads=1
     local rc=$?
     echo "=== '$1' exit: ${rc} ==="
     [ "${rc}" -ne 0 ] && overall=1

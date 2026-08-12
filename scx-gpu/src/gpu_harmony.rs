@@ -1153,6 +1153,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_distances_kernel_matches_cpu() {
         let dev = require_gpu!();
         let d = 5usize;
@@ -1187,6 +1188,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_distances_gemm_matches_kernel() {
         // GEMM-backed variant must produce numerically equivalent
         // output to the hand-written kernel within f32 GEMM rounding.
@@ -1218,6 +1220,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_distances_multi_tile_matches_single_tile() {
         // Verify the host-tile loop produces the same output as a
         // single launch on a smaller N. We exercise tiling by calling
@@ -1260,6 +1263,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_l2_normalize_cols_kernel() {
         let dev = require_gpu!();
         let d = 4usize;
@@ -1277,6 +1281,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_correction_kernel() {
         let dev = require_gpu!();
         let d = 3usize;
@@ -1316,6 +1321,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_z_sum_kernel_matches_cpu() {
         // Per-cluster z-sum: z_sum[j, t] = sum_{i in batch j} R[k,i] * Z[t,i].
         let dev = require_gpu!();
@@ -1392,6 +1398,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_correction_grouped_matches_per_pair() {
         // Per-pair launches and one grouped launch must produce
         // bit-equivalent output (no atomics involved — disjoint cell
@@ -1464,6 +1471,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_softmax_penalty_kernel_uniform() {
         let dev = require_gpu!();
         // With O == E and all theta = 0, the diversity penalty is 1 and
@@ -1511,6 +1519,7 @@ mod tests {
     /// `cross_kgb` (K·B) into two f64 scalars matching a host f64 sum.
     /// Exercises a non-trivial length (> one block) and an empty-array edge.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_reduce_objective_matches_host() {
         let dev = require_gpu!();
         let n = 5000usize; // > block size, forces the grid-stride + atomicAdd

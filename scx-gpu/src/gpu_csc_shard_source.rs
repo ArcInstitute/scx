@@ -573,6 +573,7 @@ mod tests {
     /// Pipelined source yields the staged shards verbatim — dtoh of
     /// the view's `data` returns each shard's tagged values.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_raw_csc_source_round_trip() {
         let dev = require_gpu!();
         let shards = vec![make_csc(8, 3, 1.0), make_csc(8, 4, 100.0)];
@@ -623,6 +624,7 @@ mod tests {
     ///     per-callback host-blocking dtoh that would mask the race.
     ///   - Repeating across a small outer loop to amplify the window.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_multi_shard_csc_pinned_no_corruption() {
         use cudarc::driver::safe::CudaSlice;
 

@@ -836,26 +836,19 @@ mod tests {
     fn test_cuvs_available_check() {
         // This just checks that the availability check doesn't panic.
         // On machines without cuVS, it returns false.
+        // gpu-gate-exempt: the probe is the subject under test, not a gate on it.
         let available = cuvs_available();
         println!("cuVS available: {available}");
     }
 
-    /// This test requires both a GPU and cuVS installation.
-    /// It will be skipped gracefully on CI machines without these.
+    /// Requires both a GPU and a cuVS installation. `#[ignore]`d for the
+    /// former; the cuVS half reports a skip marker on a GPU node without it.
     #[test]
+    #[ignore = "requires a CUDA GPU + cuVS"]
     fn test_gpu_knn_cagra_basic() {
-        let dev = match GpuDevice::new(0) {
-            Ok(dev) => dev,
-            Err(_) => {
-                eprintln!("CUDA not available — skipping GPU kNN test");
-                return;
-            }
-        };
+        let dev = require_gpu!();
 
-        if !cuvs_available() {
-            eprintln!("cuVS not available — skipping GPU kNN test");
-            return;
-        }
+        require_gpu_cap!(cuvs);
 
         // Two clusters in 3D: cluster A at origin, cluster B at (10,10,10)
         let n_per_cluster = 25;
@@ -909,18 +902,10 @@ mod tests {
     /// above the cuVS default of 64 (`itopk_size >= search_k`). Before that fix
     /// this hard-errored in `cuvsCagraSearch`.
     #[test]
+    #[ignore = "requires a CUDA GPU + cuVS"]
     fn test_gpu_knn_cagra_large_k() {
-        let dev = match GpuDevice::new(0) {
-            Ok(dev) => dev,
-            Err(_) => {
-                eprintln!("CUDA not available — skipping GPU kNN large-k test");
-                return;
-            }
-        };
-        if !cuvs_available() {
-            eprintln!("cuVS not available — skipping GPU kNN large-k test");
-            return;
-        }
+        let dev = require_gpu!();
+        require_gpu_cap!(cuvs);
 
         // n_neighbors (80) well above the default itopk_size (64).
         let n_obs = 400usize;

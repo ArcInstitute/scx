@@ -9,6 +9,48 @@
 //! When built with the `gpu` feature, GPU-accelerated variants are available:
 //! - [`randomized_pca_gpu`] — GPU PCA via cuSPARSE SpMM + cuSOLVER QR
 
+// --- Test-only macro (must precede module declarations for textual scoping) ---
+
+/// Acquire a GPU device for a test, or return early if CUDA is unavailable.
+///
+/// The twin of `scx-gpu`'s `require_gpu!()`, sharing its decision function so
+/// the two crates cannot drift; only the `return` has to be a macro.
+///
+/// **Pair it with `#[ignore = "requires a CUDA GPU"]`.** Without the attribute
+/// the test is selected on a CPU-only host, returns immediately and counts as
+/// passed. `scx-gpu/tests/gpu_test_gating.rs` enforces the pairing across both
+/// crates, and also rejects a bare `GpuDevice::new(0)` in test code — 11 of the
+/// GPU tests here used to gate inside a helper function, where nothing that
+/// inspects test bodies could see them.
+#[cfg(all(test, feature = "gpu"))]
+macro_rules! require_gpu_or_skip {
+    () => {
+        match scx_gpu::test_gate::device_or_skip(module_path!()) {
+            Some(_) => {}
+            None => return,
+        }
+    };
+}
+
+/// Gate a test on an optional CUDA library rather than on the device itself.
+///
+/// The twin of `scx-gpu`'s `require_gpu_cap!`. Use *below* `require_gpu_or_skip!()`,
+/// never instead of it: a missing device on a GPU node is a broken job, a missing
+/// optional library is a deployment state worth reporting.
+#[cfg(all(test, feature = "gpu"))]
+macro_rules! require_gpu_cap {
+    (cuvs) => {
+        if !scx_gpu::test_gate::capability_or_skip(
+            "cuVS",
+            scx_gpu::test_gate::REQUIRE_CUVS_ENV,
+            $crate::neighbors::gpu::cuvs_available(),
+            module_path!(),
+        ) {
+            return;
+        }
+    };
+}
+
 pub mod csc;
 pub mod diffexp;
 pub mod error;

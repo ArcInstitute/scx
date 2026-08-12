@@ -467,6 +467,7 @@ mod tests {
     /// empty ones. Confirms the capture/end_capture pair runs without
     /// driver error.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_empty_capture_yields_graph() {
         let dev = require_gpu!();
         let stream = capturable_stream(&dev);
@@ -487,6 +488,7 @@ mod tests {
     /// wait-on-event that invalidates the capture (cudarc 0.19's
     /// `device_ptr_mut` checks `is_managing_stream_synchronization`).
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_capture_replay_memset_parity() {
         let dev = require_gpu!();
         let stream = capturable_stream(&dev);
@@ -543,6 +545,7 @@ mod tests {
     /// returns the cached entry (replay counter increments, captures
     /// stays at 1).
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_cache_replays_on_repeat_key() {
         let dev = require_gpu!();
         let stream = capturable_stream(&dev);

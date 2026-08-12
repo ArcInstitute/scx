@@ -227,6 +227,7 @@ mod tests {
 
     /// Concatenate three uneven row-shards on device == host decode-and-concat.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_decode_csr_shards_to_device_matches_host_concat() {
         let dev = require_gpu!();
         let n_cols: u32 = 500;
@@ -297,6 +298,7 @@ mod tests {
 
     /// A single shard round-trips identically to a direct `decode_shard_gpu`.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_decode_csr_shards_to_device_single_shard() {
         let dev = require_gpu!();
         let n_cols: u32 = 300;
@@ -323,12 +325,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_decode_csr_shards_to_device_empty_errs() {
-        // No GPU needed: the empty check fires before any device work.
-        let dev = match crate::device::GpuDevice::new(0) {
-            Ok(d) => d,
-            Err(_) => return, // no GPU — skip
-        };
+        // The empty check fires before any device work, but constructing the
+        // device is still what makes this a GPU test.
+        let dev = require_gpu!();
         assert!(decode_csr_shards_to_device(&dev, &[]).is_err());
     }
 }

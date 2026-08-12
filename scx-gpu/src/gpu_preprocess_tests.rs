@@ -46,6 +46,7 @@ fn cpu_log1p(indptr: &[i64], data: &mut [f32]) {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_normalize_log1p_matches_cpu() {
     let dev = require_gpu!();
 
@@ -86,6 +87,7 @@ fn test_gpu_normalize_log1p_matches_cpu() {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_normalize_only() {
     let dev = require_gpu!();
 
@@ -123,6 +125,7 @@ fn test_gpu_normalize_only() {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_log1p_only() {
     let dev = require_gpu!();
 
@@ -153,6 +156,7 @@ fn test_gpu_log1p_only() {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_normalize_log1p_empty_row() {
     let dev = require_gpu!();
 
@@ -185,6 +189,7 @@ fn test_gpu_normalize_log1p_empty_row() {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_normalize_log1p_zero_rows() {
     let dev = require_gpu!();
 
@@ -199,6 +204,7 @@ fn test_gpu_normalize_log1p_zero_rows() {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_apply_fused_ops_dispatch() {
     let dev = require_gpu!();
 
@@ -257,6 +263,7 @@ fn test_gpu_apply_fused_ops_dispatch() {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_normalize_log1p_large() {
     let dev = require_gpu!();
 
@@ -383,6 +390,7 @@ fn split_into_shards(csr: &ScxCsr, n_shards: usize) -> Vec<ScxCsr> {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_preprocess_to_csr_normalize_matches_cpu() {
     let dev = require_gpu!();
     let n_rows = 500;
@@ -431,6 +439,7 @@ fn test_gpu_preprocess_to_csr_normalize_matches_cpu() {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_preprocess_to_csr_log1p_matches_cpu() {
     let dev = require_gpu!();
     let n_rows = 500;
@@ -457,6 +466,7 @@ fn test_gpu_preprocess_to_csr_log1p_matches_cpu() {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_preprocess_to_csr_fused_matches_cpu() {
     let dev = require_gpu!();
     let n_rows = 500;
@@ -492,6 +502,7 @@ fn test_gpu_preprocess_to_csr_fused_matches_cpu() {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_preprocess_to_csr_single_shard() {
     // Exercises the single-shard fast path of `RawGpuShardSource`.
     let dev = require_gpu!();
@@ -542,6 +553,7 @@ fn cpu_row_scale(indptr: &[i64], data: &mut [f32], factors: &[f32]) {
 /// multiply. row_scale uses plain f32 multiply on both paths, so this is a
 /// tight bound.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_row_scale_matches_cpu() {
     let dev = require_gpu!();
     let indptr: Vec<i64> = vec![0, 2, 5, 6];
@@ -573,6 +585,7 @@ fn test_gpu_row_scale_matches_cpu() {
 /// concatenated result must equal the source scaled per global row,
 /// validating the per-shard `global_row_offset` accumulation.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_preprocess_to_csr_row_scale_only_multishard() {
     let dev = require_gpu!();
     let n_rows = 400;
@@ -603,6 +616,7 @@ fn test_gpu_preprocess_to_csr_row_scale_only_multishard() {
 /// Full chain normalize → log1p → row_scale on a multi-shard source vs a
 /// CPU reference applying the transforms in the same canonical order.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_preprocess_to_csr_normalize_log1p_row_scale_multishard() {
     let dev = require_gpu!();
     let n_rows = 500;
@@ -727,6 +741,7 @@ fn run_normalize_tier(
 /// same input, including empty and single-nonzero rows. Forced tiers let us
 /// exercise the warp/block kernels on a small deterministic matrix.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_normalize_tiers_match_cpu() {
     let dev = require_gpu!();
     // Mix of empty, tiny, medium, and dense rows.
@@ -760,6 +775,7 @@ fn test_gpu_normalize_tiers_match_cpu() {
 
 /// Same, for the fused normalize+log1p kernels (f32 vs f64 → 1e-4).
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_normalize_log1p_tiers_match_cpu() {
     let dev = require_gpu!();
     let row_nnz = [0usize, 1, 7, 50, 64, 300, 2, 0, 257];
@@ -789,6 +805,7 @@ fn test_gpu_normalize_log1p_tiers_match_cpu() {
 /// stresses the cooperative reductions' empty/zero-sum guards and the
 /// strided write loops. Both nonzero-parallel tiers must still match CPU.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_normalize_skewed_rows() {
     let dev = require_gpu!();
     let mut row_nnz = vec![0usize; 200];
@@ -820,6 +837,7 @@ fn test_gpu_normalize_skewed_rows() {
 /// Auto-dispatch (`gpu_normalize` → `choose_row_tier`) must land in the
 /// expected tier for the warp- and block-density regimes and match CPU.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_normalize_auto_dispatch_warp_and_block() {
     let dev = require_gpu!();
     let target_sum = 1e4f32;
@@ -863,6 +881,7 @@ fn test_gpu_normalize_auto_dispatch_warp_and_block() {
 /// Exercise it on a larger matrix (the small `test_gpu_log1p_only` above
 /// already covers it through the unchanged public API).
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_log1p_nnz_large() {
     let dev = require_gpu!();
     let row_nnz = vec![37usize; 1000];

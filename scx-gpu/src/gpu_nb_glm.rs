@@ -303,16 +303,11 @@ mod tests {
     use super::*;
 
     /// Smoke test: a tiny 2-group design fits to finite, sensible values on a
-    /// GPU host; skipped gracefully when no CUDA device is present.
+    /// GPU host; `#[ignore]`d + gated, so a CPU host reports it as ignored.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_nb_glm_smoke() {
-        let dev = match GpuDevice::new(0) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("no CUDA device — skipping GPU NB-GLM smoke test");
-                return;
-            }
-        };
+        let dev = require_gpu!();
         // 4 samples, 2 groups (control/treat), p=2 design [1, is_treat].
         let n_sub = 4;
         let p = 2;

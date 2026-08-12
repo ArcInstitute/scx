@@ -4,8 +4,10 @@ members = ["scx-format", "scx-format-io", "scx-codec", "scx-sparse", "scx-cli", 
 # available (CI, Rust-only dev). Build explicitly with: cargo build -p rscx
 #
 # scx-gpu is deliberately included: cudarc compiles without CUDA installed
-# (it only fails at runtime when no GPU is present). GPU tests gracefully
-# skip via require_gpu!(). The CI `build-cpu-only` job pins this contract.
+# (it only fails at runtime when no GPU is present). Its GPU tests are
+# `#[ignore]`d and gated by require_gpu!(), so a CPU-only run reports them as
+# ignored instead of as passes; `scx-gpu/tests/gpu_test_gating.rs` enforces the
+# pairing. The CI `build-cpu-only` job pins the compile half of this contract.
 default-members = ["scx-format", "scx-format-io", "scx-codec", "scx-sparse", "scx-cli", "scx-convert", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "scx-mtx", "scx-accel", "pyscx", "tests/scx-integration-tests"]
 resolver = "2"
 

@@ -485,16 +485,15 @@ fn test_multi_covariate_runs() {
 }
 
 // ── GPU tests ─────────────────────────────────────────────────────
-// Skip silently on machines without a CUDA driver; run otherwise.
+// `#[ignore]`d and gated, so a machine without a CUDA driver reports them as
+// ignored rather than as passes that did nothing. The GPU harness re-selects
+// them with `--include-ignored` under `SCX_REQUIRE_GPU=1`.
 
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_harmony_shape_matches_cpu() {
-    // Skip if no GPU available.
-    if scx_gpu::GpuDevice::new(0).is_err() {
-        eprintln!("CUDA not available — skipping GPU harmony test");
-        return;
-    }
+    require_gpu_or_skip!();
     let n = 200;
     let d = 6;
     let emb = random_embeddings(n, d, 100);
@@ -519,12 +518,9 @@ fn test_gpu_harmony_shape_matches_cpu() {
 
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_vs_cpu_per_pc_correlation() {
-    // Skip on machines without CUDA.
-    if scx_gpu::GpuDevice::new(0).is_err() {
-        eprintln!("CUDA not available — skipping GPU harmony correlation test");
-        return;
-    }
+    require_gpu_or_skip!();
     let n_per = 80;
     let d = 5;
     let (emb, labels) = batched_gaussian(n_per, d, 123);
@@ -590,11 +586,9 @@ fn test_gpu_vs_cpu_per_pc_correlation() {
 /// same test process.
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_harmony_graph_vs_direct_parity() {
-    if scx_gpu::GpuDevice::new(0).is_err() {
-        eprintln!("CUDA not available — skipping GPU harmony graph parity test");
-        return;
-    }
+    require_gpu_or_skip!();
     let n_per = 80;
     let d = 5;
     let (emb, labels) = batched_gaussian(n_per, d, 123);
@@ -665,11 +659,9 @@ fn test_gpu_harmony_graph_vs_direct_parity() {
 /// replays).
 #[cfg(feature = "gpu")]
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_harmony_captures_once_across_outer_iters() {
-    if scx_gpu::GpuDevice::new(0).is_err() {
-        eprintln!("CUDA not available — skipping Harmony capture-count test");
-        return;
-    }
+    require_gpu_or_skip!();
     let n_per = 80;
     let d = 5;
     let (emb, labels) = batched_gaussian(n_per, d, 123);

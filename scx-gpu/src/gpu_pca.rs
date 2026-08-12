@@ -953,6 +953,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_mean_correct() {
         let dev = require_gpu!();
 
@@ -994,6 +995,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_mean_correct_empty() {
         let dev = require_gpu!();
 
@@ -1004,6 +1006,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_scale_columns() {
         // Phase 3.3 — broadcast-scale columns of a col-major matrix.
         let dev = require_gpu!();
@@ -1039,6 +1042,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_randomized_pca_phase3_parity() {
         // After the GPU-resident-embedding refactor, verify that
         // variance_ratio is non-negative, monotone-descending by PC index, and
@@ -1177,6 +1181,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_randomized_pca_cholesky_vs_householder() {
         // Phase 4.5 — opt-in CholeskyQR2 must produce the same PCA as the
         // default Householder path on well-conditioned inputs. Both paths
@@ -1326,6 +1331,7 @@ mod tests {
     /// transpose). The downloaded device embedding must therefore match the
     /// host embedding element-for-element, and the loadings/variance are shared.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_randomized_pca_device_matches_host() {
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
