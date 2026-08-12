@@ -758,7 +758,9 @@ methods (covariance and randomized SVD) explicitly reject
 The `csc` knob on the conversion entry points (`pyscx.from_anndata` /
 `from_h5ad` / `from_10x`, `scx convert --csc`) is a three-state policy:
 
-- **`off`** (default) — never emit a CSC sidecar; CSR-only output.
+- **`off`** — never emit a CSC sidecar; CSR-only output. This is what an
+  unset `csc` resolves to *unless* an accel-ready `index_preset` upgrades
+  it (see below) — the default is deferred, not a pinned `"off"`.
 - **`always`** — always emit a CSC sidecar regardless of dataset size.
 - **`auto`** — emit a sidecar only when the dataset is large enough that the
   column-axis acceleration pays for the extra write-time transpose and
@@ -769,6 +771,14 @@ The `csc` knob on the conversion entry points (`pyscx.from_anndata` /
 
 `auto` is resolved against the matrix shape at write time, so a (unimodal)
 streaming conversion picks it up from the X reader's reported dimensions.
+
+On the pyscx entry points and `scx convert`, the default is a *deferred*
+`off`: leaving `csc` unset lets an accel-ready `--index-preset` /
+`index_preset=` (`training` or `perturbseq`, whose substrate is the
+column-major sidecar) upgrade it to `auto`. `cellxgene` is query-oriented
+and does not. Passing any explicit value — including `off` — always wins.
+The rule lives in `scx_engine::index::resolve_csc_policy` so the CLI and
+pyscx cannot drift apart.
 
 Multimodal (h5mu / MuData) inputs cannot build per-modality CSC while
 streaming, and `scx build-csc` is unimodal-only (it would collapse all
