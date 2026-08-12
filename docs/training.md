@@ -712,10 +712,17 @@ Two differences worth knowing:
 | after `close()` | re-usable — the next `__iter__` rebuilds the pool and runtime | **terminal** — every method raises `RuntimeError`; construct a new dataset |
 | why | its pool and runtime are rebuilt per epoch anyway | the runtime is built exactly once, so a forked child can never inherit live tokio threads; that also means it cannot be rebuilt |
 
-`closed` and `repr()` never raise on any of them. On the two terminal classes,
-`close()`'s 5 s bound applies only when it holds the last reference to the
-loader: a still-alive batch iterator holds one too, and the teardown then
-happens — also off-GIL — when that iterator drops.
+`repr()` never raises on any of them. The `closed` property exists on the two
+terminal classes only — `TrainingDataset` and `MultimodalTrainingDataset` have
+`close()` but no `closed`, because for them close is not a state change worth
+querying.
+
+Whichever object ends up holding the last reference does the teardown, and every
+one of them bounds it at 5 s and detaches the GIL first — the dataset's
+`close()`/`Drop`, and the batch iterator's `Drop` *and* its end-of-stream branch
+in `__next__`. So `ds.close()` followed by draining an outstanding iterator is
+safe: `close()` releases only the dataset's reference, and the iterator's own
+teardown finishes the job under the same guarantees.
 
 > [!TIP]
 > Use `multiprocessing.set_start_method("spawn")` if your workload allows.

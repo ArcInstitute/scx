@@ -1560,7 +1560,14 @@ impl IndexPlanBatchIter {
                 // Drop the inner iterator to release the plan-pull thread
                 // and tokio runtime references; subsequent next calls return
                 // None without re-entering Rust.
-                self.inner = None;
+                //
+                // Off the GIL, and not merely for symmetry with `Drop`: after
+                // `ds.close()` the dataset has already released its `Arc`, so
+                // exhausting the iterator here can be what releases the *last*
+                // one and tears the runtime down. `Drop` cannot cover it —
+                // once `inner` is `None` it early-returns.
+                let inner = self.inner.take();
+                py.detach(move || drop(inner));
                 Ok(None)
             }
         }
@@ -2420,7 +2427,11 @@ impl SparseCellSetBatchIter {
             }
             Some(Err(e)) => Err(loader_err_to_py(e)),
             None => {
-                self.inner = None;
+                // Off the GIL — see `IndexPlanBatchIter::__next__`. After
+                // `ds.close()` this can be what releases the last engine
+                // reference, and `Drop` cannot cover it once `inner` is taken.
+                let inner = self.inner.take();
+                py.detach(move || drop(inner));
                 Ok(None)
             }
         }

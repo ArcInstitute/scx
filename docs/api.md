@@ -2680,10 +2680,17 @@ live tokio threads, which also means it cannot be rebuilt. Every method raises
 `RuntimeError` afterwards; construct a new dataset. `closed` and `repr()` never
 raise.
 
-The 5 s bound applies when `close()` holds the last reference to the loader. A
-still-alive `IndexPlanBatchIter` / `SparseCellSetBatchIter` holds one too, in
-which case `close()` releases only its own and the teardown happens — also
-off-GIL — when that iterator drops.
+A still-alive `IndexPlanBatchIter` / `SparseCellSetBatchIter` holds its own
+reference, so `close()` releases only the dataset's. The iterator then does the
+teardown itself — under the same 5 s bound and with the GIL detached — on
+whichever comes first, its `Drop` or the end-of-stream branch of `__next__`. So
+this ordering, which the API supports, is safe:
+
+```python
+it = ds.iter_with_plans(plans)
+ds.close()      # releases the dataset's reference only
+list(it)        # the iterator's own teardown, bounded and off-GIL
+```
 
 ```python
 ds = pyscx.IndexPlanDataset("atlas.scx")

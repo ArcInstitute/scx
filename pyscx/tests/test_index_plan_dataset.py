@@ -1018,6 +1018,34 @@ class TestCloseAndTeardown:
         assert next(it)["X"].shape[0] == 1
         del it
 
+    def test_close_then_drain_the_iterator(self, scx_path):
+        """`ds.close()` first, *then* exhaust the iterator.
+
+        The ordering the API supports and the one that used to be worst:
+        `close()` cannot unwrap the loader while the iterator holds a
+        reference, so exhaustion is what releases the runtime — and it happens
+        inside `__next__`'s end-of-stream branch, which the iterator's `Drop`
+        can never cover (it early-returns once `inner` is taken). The bound now
+        lives in the Rust iterator's own `Drop`, so both paths get it.
+        """
+        import time
+
+        ds = pyscx.IndexPlanDataset(
+            scx_path, normalize=False, log1p=False, obs_columns=[]
+        )
+        it = ds.iter_with_plans(iter([[(0, 1)], [(2, 3)], [(4, 5)]]), lookahead=4)
+        next(it)
+        ds.close()
+
+        t0 = time.monotonic()
+        rest = list(it)  # EOS branch releases the last reference
+        elapsed = time.monotonic() - t0
+
+        assert len(rest) == 2, "closing the dataset must not truncate a live iterator"
+        assert elapsed < 10.0, f"drain-after-close took {elapsed:.2f}s"
+        # Iterating again is a clean StopIteration, not a crash.
+        assert list(it) == []
+
     def test_teardown_mid_flight_is_bounded(self, scx_path):
         """Abandoning an epoch with prefetches outstanding must tear down
         cleanly and promptly.
@@ -1027,15 +1055,18 @@ class TestCloseAndTeardown:
         take sole ownership; the runtime is released when the *iterator* drops.
         Getting that ordering wrong shows up here as a hang or a panic.
 
-        Note on what is deliberately **not** asserted: whether the teardown
-        released the GIL. That is the §9.3 defect, and it is not measurable at
-        unit-test scale — teardown of even a 60000x3000 file with prefetches in
-        flight was measured at ~9 ms with the GIL held, well inside scheduler
-        noise, so a threshold that could see it would be flaky and a threshold
-        that is not flaky passes on the broken code. The property is carried by
-        construction instead: `IndexPlanDataset::drop` and
-        `IndexPlanBatchIter::drop` mirror `TrainingDataset::drop`, which has
-        the same status.
+        Note on what is deliberately **not** asserted here: whether the teardown
+        released the GIL, and whether it honoured the 5 s deadline. Neither is
+        measurable at unit-test scale — teardown of even a 60000x3000 file with
+        prefetches in flight was measured at ~9 ms, so a threshold that could
+        see either property would be flaky and a stable one passes on broken
+        code. Both are pinned in Rust instead, where the mechanism can be
+        exercised directly: `an_iter_that_is_the_last_owner_takes_the_bounded_shutdown`
+        proves this path reaches `shutdown_owned`, and
+        `shutdown_owned_returns_at_the_deadline_rather_than_joining_a_slow_task`
+        proves `shutdown_owned` abandons an overrunning task (60 s task, 200 ms
+        deadline). GIL release remains carried by construction, mirroring
+        `TrainingDataset::drop`.
         """
         import time
 

@@ -160,6 +160,13 @@ pub struct IndexPlanLoader {
     scatter_block_index: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Times `shutdown_owned` ran on *this* thread. See its body.
+    pub(crate) static SHUTDOWN_OWNED_CALLS: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
+
 impl IndexPlanLoader {
     /// Open an SCX file for plan-driven reads.
     ///
@@ -985,6 +992,15 @@ impl IndexPlanLoader {
     /// A plain drop would block *unbounded*; `shutdown_timeout` detaches the
     /// blocking pool once the deadline passes.
     pub fn shutdown_owned(self, deadline: std::time::Duration) {
+        // Test-only observation of *which path* tore the runtime down. A plain
+        // `Runtime::drop` and a `shutdown_timeout` are indistinguishable at
+        // fixture scale (both return in microseconds), so without this a test
+        // cannot tell the bounded path from the unbounded one. Thread-local,
+        // not a global counter: `cargo test` runs tests in parallel and the
+        // drops under test happen on the test's own thread.
+        #[cfg(test)]
+        SHUTDOWN_OWNED_CALLS.with(|c| c.set(c.get() + 1));
+
         // `IndexPlanLoader` has no `Drop` impl, so moving the runtime out of
         // the struct is legal; the remaining fields drop cheaply after.
         if let Some(rt) = self.runtime.into_inner() {
@@ -1034,7 +1050,9 @@ pub struct IterMetrics {
 /// per-batch decode. `next` blocks on the head plan's prefetch handles,
 /// then delegates to [`IndexPlanLoader::process_plan`].
 pub struct IndexPlanIter {
-    loader: Arc<IndexPlanLoader>,
+    /// Always `Some` until `Drop` takes it to run the bounded shutdown. Read
+    /// through [`Self::loader`] rather than directly.
+    loader: Option<Arc<IndexPlanLoader>>,
     plan_rx: Receiver<std::result::Result<Vec<(u64, u64)>, LoaderError>>,
     /// Pull worker that owns the user-supplied `plans` iterator. Detached on
     /// drop — the worker exits naturally when `plan_rx` is dropped (next
@@ -1077,7 +1095,7 @@ impl IndexPlanIter {
             .ok();
 
         Self {
-            loader,
+            loader: Some(loader),
             plan_rx,
             plan_thread,
             in_flight: VecDeque::with_capacity(cap),
@@ -1092,6 +1110,14 @@ impl IndexPlanIter {
     /// time — atomics are `Relaxed`, no locks involved.
     pub fn iter_metrics(&self) -> Arc<IterMetrics> {
         Arc::clone(&self.iter_metrics)
+    }
+
+    /// The loader. `None` only inside `Drop`, after the Arc has been handed to
+    /// the bounded shutdown, and nothing reads it after that point.
+    fn loader(&self) -> &Arc<IndexPlanLoader> {
+        self.loader
+            .as_ref()
+            .expect("IndexPlanIter::loader is taken only by Drop")
     }
 
     /// Refill the in-flight queue up to `lookahead.max(1)` plans, spawning a
@@ -1178,7 +1204,7 @@ impl IndexPlanIter {
         // `read_rows_with`, so this per-shard `group_len` matches what the
         // gather's sidecar decision sees — the prefetch skip and the gather
         // choice must agree (else the adoption the metric proves diverges).
-        let index = self.loader.backed.index();
+        let index = self.loader().backed.index();
         let mut seen: HashSet<u64> = HashSet::with_capacity(plan.len() * 2);
         let mut per_shard: HashMap<usize, usize> = HashMap::new();
         for &(p, c) in plan {
@@ -1200,17 +1226,17 @@ impl IndexPlanIter {
         //    `use_block_index`.
         // Dense/large groups (and unframed shards) still prefetch and warm the
         // cache as before.
-        let handle = self.loader.runtime()?.handle().clone();
+        let handle = self.loader().runtime()?.handle().clone();
         Ok(per_shard
             .into_iter()
             .filter(|&(sidx, group_len)| {
-                if self.loader.backed.cache_contains(sidx) {
+                if self.loader().backed.cache_contains(sidx) {
                     self.iter_metrics
                         .prefetch_skipped_cache_hit
                         .fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
-                if self.loader.backed.in_flight_contains(sidx) {
+                if self.loader().backed.in_flight_contains(sidx) {
                     self.iter_metrics
                         .prefetch_skipped_in_flight
                         .fetch_add(1, Ordering::Relaxed);
@@ -1219,8 +1245,8 @@ impl IndexPlanIter {
                 // Block-index-eligible framed shards: leave them undecoded so
                 // `read_rows_with` takes the group-level block-index path. Gated
                 // by the loader's `scatter_block_index` flag.
-                if self.loader.scatter_block_index()
-                    && self.loader.backed.block_index_eligible(sidx, group_len)
+                if self.loader().scatter_block_index()
+                    && self.loader().backed.block_index_eligible(sidx, group_len)
                 {
                     self.iter_metrics
                         .prefetch_skipped_block_index
@@ -1233,7 +1259,7 @@ impl IndexPlanIter {
                 self.iter_metrics
                     .prefetch_tasks_spawned
                     .fetch_add(1, Ordering::Relaxed);
-                let loader = Arc::clone(&self.loader);
+                let loader = Arc::clone(self.loader());
                 handle.spawn_blocking(move || loader.backed.read_shard_cached_arc(sidx))
             })
             .collect())
@@ -1242,7 +1268,7 @@ impl IndexPlanIter {
     /// Block on every prefetch handle for the head plan. Surfaces the first
     /// shard read error or join panic.
     fn await_head(&self, prefetches: Vec<ShardJoin>) -> std::result::Result<(), LoaderError> {
-        let runtime = self.loader.runtime()?;
+        let runtime = self.loader().runtime()?;
         for h in prefetches {
             match runtime.block_on(h) {
                 Ok(Ok(_arc_shard)) => {
@@ -1287,7 +1313,7 @@ impl Iterator for IndexPlanIter {
                 if let Err(e) = self.await_head(head.prefetches) {
                     return Some(Err(e));
                 }
-                return Some(self.loader.process_plan(head.plan));
+                return Some(self.loader().process_plan(head.plan));
             }
 
             // Queue empty — surface a deferred plan-stream error one-shot,
@@ -1303,10 +1329,23 @@ impl Iterator for IndexPlanIter {
 }
 
 impl Drop for IndexPlanIter {
-    /// Best-effort shutdown. The loader's tokio runtime is owned by the
-    /// `Arc<IndexPlanLoader>` (which the dataset, not this iter, holds), so
-    /// dropping the iter does not tear down the runtime — we only need to
-    /// release the prefetch tasks and the plan-pull thread.
+    /// Release the prefetch tasks and the plan-pull thread, then — **if this
+    /// iter turns out to hold the last `Arc<IndexPlanLoader>`** — tear the
+    /// tokio runtime down with the bounded `shutdown_owned`.
+    ///
+    /// The iter really can be the last owner, and the ordering that gets there
+    /// is one the API explicitly supports:
+    ///
+    /// ```python
+    /// it = ds.iter_with_plans(...)
+    /// ds.close()     # releases the dataset's Arc; the iter still holds one
+    /// list(it)       # this drop is what releases the runtime
+    /// ```
+    ///
+    /// Doing the bounded teardown here rather than in the `#[pyclass]` wrapper
+    /// is what makes it unconditional: `IndexPlanBatchIter::__next__` also
+    /// drops the inner iter on end-of-stream, and that path would otherwise
+    /// take a plain unbounded `Runtime::drop`.
     fn drop(&mut self) {
         // Abort any outstanding prefetch handles so the runtime threads
         // stop blocking on shards we no longer need.
@@ -1327,7 +1366,7 @@ impl Drop for IndexPlanIter {
         // Optional one-shot profile dump. Enabled by `SCX_LOADER_PROFILE=1`
         // — see `crate::budget::profiling_enabled`.
         if profiling_enabled() {
-            let cm = &self.loader.cache_metrics;
+            let cm = &self.loader().cache_metrics;
             let im = &self.iter_metrics;
             let hits = cm.hits.load(Ordering::Relaxed);
             let misses = cm.misses.load(Ordering::Relaxed);
@@ -1347,6 +1386,13 @@ impl Drop for IndexPlanIter {
                  prefetch_skipped_in_flight={skip_inflight} \
                  prefetch_skipped_block_index={skip_block_index}"
             );
+        }
+
+        // Last, because the profile dump above still reads the loader.
+        if let Some(loader) = self.loader.take() {
+            if let Some(loader) = Arc::into_inner(loader) {
+                loader.shutdown_owned(crate::pipeline::SHUTDOWN_DEADLINE);
+            }
         }
     }
 }

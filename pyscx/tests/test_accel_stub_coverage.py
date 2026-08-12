@@ -18,6 +18,8 @@ from __future__ import annotations
 import pathlib
 import re
 
+import pytest
+
 import pyscx
 import pyscx.accel as accel
 
@@ -74,3 +76,51 @@ def test_user_facing_accelerators_have_stubs():
     runtime = _runtime_functions()
     absent = sorted(required - runtime)
     assert not absent, f"declared accelerators absent from pyscx.accel at runtime: {absent}"
+
+
+# ---------------------------------------------------------------------------
+# Drift guard for the plan-driven dataset classes in `__init__.pyi`.
+#
+# `pyscx` ships `py.typed`, so a public method missing from the stub is a
+# mypy/Pyright error for anyone following the docs — while the runtime works
+# fine, which is what makes the drift invisible. `close()` / `closed` reached
+# `__init__.pyi` only because a reviewer noticed; this makes the next one fail
+# a test instead.
+# ---------------------------------------------------------------------------
+
+_LIFECYCLE_CLASSES = ["IndexPlanDataset", "SparseCellSetDataset"]
+
+
+def _class_stub_body(text: str, cls: str) -> str:
+    """The stub text between `class <cls>:` and the next top-level statement."""
+    start = re.search(rf"^class {cls}\b.*?:$", text, re.MULTILINE)
+    assert start, f"{cls} has no stub in __init__.pyi at all"
+    rest = text[start.end() :]
+    end = re.search(r"^\S", rest, re.MULTILINE)
+    return rest[: end.start()] if end else rest
+
+
+@pytest.mark.parametrize("cls", _LIFECYCLE_CLASSES)
+def test_public_methods_are_all_in_the_init_stub(cls):
+    """Every public runtime attribute of the class appears in its stub block."""
+    pyi = (pathlib.Path(pyscx.__file__).parent / "__init__.pyi").read_text()
+    body = _class_stub_body(pyi, cls)
+
+    runtime = {
+        n
+        for n in dir(getattr(pyscx, cls))
+        if not n.startswith("_") and n not in {"mro"}
+    }
+    missing = sorted(n for n in runtime if not re.search(rf"\bdef {n}\b|\b{n}\s*:", body))
+    assert not missing, (
+        f"{cls} exposes {missing} at runtime but they are absent from "
+        f"__init__.pyi — py.typed users get missing-attribute errors"
+    )
+
+
+@pytest.mark.parametrize("cls", _LIFECYCLE_CLASSES)
+def test_lifecycle_members_exist_at_runtime(cls):
+    """The other direction: no dead stubs for a lifecycle API that got removed."""
+    obj = getattr(pyscx, cls)
+    for member in ("close", "closed"):
+        assert hasattr(obj, member), f"{cls}.{member} is stubbed but missing at runtime"

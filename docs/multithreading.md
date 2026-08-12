@@ -283,10 +283,20 @@ and `Drop`, and bound the wait by `SHUTDOWN_DEADLINE` (5 s):
 other two. `shutdown_owned` consumes the value so it can take the runtime out of
 its `OnceLock` and call `shutdown_timeout` rather than a plain unbounded drop.
 
-The batch-iterator pyclasses (`IndexPlanBatchIter`, `SparseCellSetBatchIter`)
-detach too, and must: each holds its own `Arc` to the loader, so in the ordinary
-`for b in ds.iter_with_plans(...)` shape the iterator outlives `ds.close()` in
-the caller's frame and is the object that actually releases the runtime.
+The batch iterators must do the same, and for a reason easy to miss: each holds
+its own `Arc` to the loader (and, on the sparse path, to the `PrefetchEngine`
+underneath it — a *separate* ownership edge, so a `close()` can successfully
+unwrap the loader and still leave the engine owned by the iterator). In the
+ordinary `for b in ds.iter_with_plans(...)` shape the iterator outlives
+`ds.close()` in the caller's frame, so it is the object that actually releases
+the runtime.
+
+The bound therefore lives in `IndexPlanIter::drop` / `PlanPrefetchIter::drop` —
+the Rust iterators that own the `Arc` — rather than in the `#[pyclass]`
+wrappers. That is what makes it unconditional: `__next__` also drops the inner
+iterator on end-of-stream, and a bound implemented only in the wrapper's `Drop`
+would miss that path entirely (`Drop` early-returns once `inner` is `None`). The
+wrappers' job is just to make sure both drops happen with the GIL detached.
 
 `pyscx/tests/test_fork_safety.py` is the durable regression test;
 post-fix Lambda HPC measurements confirm the workers0 / workers2 paths

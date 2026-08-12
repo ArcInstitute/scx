@@ -438,3 +438,52 @@ fn engine_shutdown_owned_returns_promptly_after_the_runtime_is_built() {
         "an idle runtime must shut down well inside the deadline, took {elapsed:?}"
     );
 }
+
+/// The sparse-path twin: the iterator holds an `Arc<PrefetchEngine>` that is a
+/// *separate* ownership edge from `SparseCellSetLoader`'s, so a dataset `close()`
+/// can unwrap the loader and still leave the engine owned by the iterator. That
+/// path must take the bounded shutdown.
+#[test]
+fn engine_iter_that_is_the_last_owner_takes_the_bounded_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = SHUTDOWN_OWNED_CALLS.with(|c| c.get());
+
+    let engine = two_file_engine(dir.path(), 8);
+    let plans: Vec<Plan> = vec![vec![(0u32, 5u64)], vec![(1u32, 30u64)]];
+    let mut it = Arc::clone(&engine).iter_with_plans(into_iter(plans), 4, rows_of, gather);
+
+    drop(engine); // the `ds.close()` half
+
+    while let Some(b) = it.next() {
+        b.expect("batch must gather");
+    }
+    drop(it);
+
+    assert_eq!(
+        SHUTDOWN_OWNED_CALLS.with(|c| c.get()),
+        before + 1,
+        "the iterator was the last owner of the engine, so its drop must go \
+         through shutdown_owned"
+    );
+}
+
+#[test]
+fn engine_shutdown_owned_returns_at_the_deadline_rather_than_joining_a_slow_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = two_file_engine(dir.path(), 8);
+
+    let handle = engine.runtime().expect("runtime").handle().clone();
+    handle.spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(60)));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let engine = Arc::into_inner(engine).expect("sole owner");
+    let t0 = std::time::Instant::now();
+    engine.shutdown_owned(std::time::Duration::from_millis(200));
+    let elapsed = t0.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "shutdown_owned waited {elapsed:?} — it joined the 60s task instead of \
+         abandoning it at the deadline"
+    );
+}
