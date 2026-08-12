@@ -20,7 +20,11 @@ use crate::shuffle::ShardShuffler;
 /// If the I/O or decode thread does not finish within this window the join
 /// is abandoned and the thread handle is detached — preferable to wedging
 /// the worker process exit forever.
-const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+///
+/// Also the deadline `crate::runtime::BoundedRuntime` is built with, so the
+/// plan-driven loaders bound their teardown by the same window as the training
+/// pipeline; two constants here would drift silently.
+pub(crate) const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Polling interval for `JoinHandle::is_finished()` waits during bounded
 /// shutdown.

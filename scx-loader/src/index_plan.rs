@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use arrow::record_batch::RecordBatch;
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, Receiver, TryRecvError};
 use scx_format_io::{BackedCsrReader, ScxReader};
 use scx_sparse::ScxCsr;
 use tokio::runtime::Runtime;
@@ -97,7 +97,9 @@ struct PairedDenseGather {
 /// fork worker processes: the runtime threads never exist in the parent
 /// at fork time, so the child does not inherit a wedged thread pool.
 pub struct IndexPlanLoader {
-    backed: BackedCsrReader,
+    /// `Arc` so prefetch tasks can capture the reader alone — see
+    /// [`crate::runtime`] for why a task must never hold the loader.
+    backed: Arc<BackedCsrReader>,
     obs_metadata: RecordBatch,
     /// Stable global category dictionaries (one per categorical obs column),
     /// computed once at construction. Built from the same full obs table as
@@ -119,7 +121,7 @@ pub struct IndexPlanLoader {
     ///
     /// Lazily built by [`Self::runtime`] on first use so the parent process
     /// never holds tokio I/O threads that would be inherited across `fork(2)`.
-    runtime: OnceLock<Runtime>,
+    runtime: OnceLock<crate::runtime::BoundedRuntime>,
     /// Effective LRU shard cache size after auto-tuning to fit
     /// `max_memory_mb`. May be less than the user-requested `cache_shards`.
     effective_cache_shards: usize,
@@ -158,6 +160,14 @@ pub struct IndexPlanLoader {
     /// full-shard-decodes. The process-wide reader default still comes from
     /// `SCX_SCATTER_BLOCK_INDEX`.
     scatter_block_index: bool,
+    /// Test-only: when set, every prefetch task announces itself and then parks
+    /// until released. Holding a task *in flight* is the only way to observe
+    /// whether its closure captured the loader; without it the task finishes
+    /// before the assertion runs and the test passes on the broken code.
+    /// Per-loader rather than a global so parallel tests do not stall each
+    /// other's prefetches.
+    #[cfg(test)]
+    prefetch_gate: Option<Arc<PrefetchGate>>,
 }
 
 impl IndexPlanLoader {
@@ -506,7 +516,7 @@ impl IndexPlanLoader {
         // `IndexPlanLoader` and then have a `DataLoader` fork worker
         // processes without inheriting a wedged thread pool.
         Ok(Self {
-            backed,
+            backed: Arc::new(backed),
             obs_metadata,
             cat_dicts,
             config,
@@ -525,6 +535,8 @@ impl IndexPlanLoader {
             // Default on; the Python layer overrides via
             // `set_scatter_block_index` when the caller passes the kwarg.
             scatter_block_index: true,
+            #[cfg(test)]
+            prefetch_gate: None,
         })
     }
 
@@ -535,9 +547,19 @@ impl IndexPlanLoader {
     /// disables **both** the L1 gather adoption and the L2 prefetch skip — a
     /// `scatter_block_index=False` file full-shard-decodes, no leak via L1. See
     /// [`Self::scatter_block_index`].
+    /// Test-only: park every prefetch task on `gate` until it is released.
+    #[cfg(test)]
+    pub(crate) fn set_prefetch_gate(&mut self, gate: Arc<PrefetchGate>) {
+        self.prefetch_gate = Some(gate);
+    }
+
     pub fn set_scatter_block_index(&mut self, enabled: bool) {
         self.scatter_block_index = enabled;
-        self.backed.set_scatter_block_index(enabled);
+        // Called only during construction, before any clone escapes, so the
+        // `Arc` is still uniquely owned.
+        Arc::get_mut(&mut self.backed)
+            .expect("set_scatter_block_index runs before the reader Arc is shared")
+            .set_scatter_block_index(enabled);
     }
 
     /// Return the tokio runtime, building it on first call.
@@ -557,7 +579,7 @@ impl IndexPlanLoader {
     /// runtime construction in the rare concurrent first-touch case.
     fn runtime(&self) -> Result<&Runtime> {
         if let Some(rt) = self.runtime.get() {
-            return Ok(rt);
+            return Ok(rt.get());
         }
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -569,7 +591,12 @@ impl IndexPlanLoader {
                     "failed to create tokio runtime for IndexPlanLoader: {e}"
                 ))
             })?;
-        Ok(self.runtime.get_or_init(|| rt))
+        Ok(self
+            .runtime
+            .get_or_init(|| {
+                crate::runtime::BoundedRuntime::new(rt, crate::pipeline::SHUTDOWN_DEADLINE)
+            })
+            .get())
     }
 
     pub fn n_obs(&self) -> u64 {
@@ -974,6 +1001,54 @@ impl IndexPlanLoader {
     }
 }
 
+/// Test-only rendezvous for holding prefetch tasks in flight.
+///
+/// `started` must be signalled *before* parking: a test that infers "a task is
+/// running" from a sleep passes on a loaded machine even when the closure has
+/// regressed to capturing the loader, which is precisely the blindness this
+/// gate exists to remove.
+#[cfg(test)]
+pub(crate) struct PrefetchGate {
+    started: AtomicU64,
+    hold: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl PrefetchGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: AtomicU64::new(0),
+            hold: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Called from inside a prefetch task: announce, then park.
+    fn enter(&self) {
+        self.started.fetch_add(1, Ordering::AcqRel);
+        while self.hold.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Block until at least one task has entered, or fail after `timeout`.
+    /// Returning `false` means the test could not establish its premise and
+    /// must fail rather than assert against an empty runtime.
+    pub(crate) fn wait_for_entry(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self.started.load(Ordering::Acquire) > 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    }
+
+    pub(crate) fn release(&self) {
+        self.hold.store(false, Ordering::Release);
+    }
+}
+
 /// Per-plan in-flight state: the plan itself plus one `spawn_blocking` join
 /// handle per shard scheduled for prefetch (cached / in-flight shards are
 /// filtered out by the iter pre-check before this Vec is built).
@@ -1079,18 +1154,56 @@ impl IndexPlanIter {
     /// shard prefetch per shard referenced by each plan that is not already
     /// resident in the LRU.
     ///
+    /// **Prefetch depth is opportunistic, never an obligation on the plan
+    /// generator.** Only the first plan is waited for, and only when
+    /// `may_block` and the queue is empty — at that point there is nothing to
+    /// yield, so blocking is progress. Every later slot is filled with
+    /// `try_recv`, so a generator that produces plan *i+1* only after seeing
+    /// batch *i* (curriculum / feedback sampling) runs un-prefetched instead of
+    /// deadlocking against a queue that will never reach `lookahead`.
+    ///
+    /// `may_block` is the caller's, not ours: `next` calls this a second time
+    /// after popping the head purely to keep the queue warm, and at that point
+    /// `in_flight` is empty in exactly the feedback case — so deciding here on
+    /// `in_flight.is_empty()` alone would reinstate the deadlock one call
+    /// later.
+    ///
     /// On a plan-stream error, latches the error in `plan_stream_error` and
     /// stops; the iterator drains `in_flight` first and surfaces the error
     /// one-shot after the queue empties. Plain end-of-stream sets
     /// `plan_stream_done` instead.
-    fn refill(&mut self) {
+    fn refill(&mut self, may_block: bool) {
         let target = self.lookahead.max(1);
         while self.in_flight.len() < target
             && !self.plan_stream_done
             && self.plan_stream_error.is_none()
         {
-            match self.plan_rx.recv() {
-                Ok(Ok(plan)) => match self.spawn_prefetches(&plan) {
+            let item = if may_block && self.in_flight.is_empty() {
+                match self.plan_rx.recv() {
+                    Ok(item) => item,
+                    Err(_) => {
+                        // plan_tx dropped → end of stream.
+                        self.plan_stream_done = true;
+                        break;
+                    }
+                }
+            } else {
+                match self.plan_rx.try_recv() {
+                    Ok(item) => item,
+                    // Not ready is not finished. Latching `plan_stream_done`
+                    // here would end the epoch the first time a generator is
+                    // momentarily slow, silently truncating the data with no
+                    // error anywhere.
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.plan_stream_done = true;
+                        break;
+                    }
+                }
+            };
+
+            match item {
+                Ok(plan) => match self.spawn_prefetches(&plan) {
                     Ok(prefetches) => {
                         self.in_flight.push_back(InFlight { plan, prefetches });
                     }
@@ -1103,13 +1216,8 @@ impl IndexPlanIter {
                         break;
                     }
                 },
-                Ok(Err(e)) => {
+                Err(e) => {
                     self.plan_stream_error = Some(e);
-                    break;
-                }
-                Err(_) => {
-                    // plan_tx dropped → end of stream.
-                    self.plan_stream_done = true;
                     break;
                 }
             }
@@ -1181,8 +1289,21 @@ impl IndexPlanIter {
                 self.iter_metrics
                     .prefetch_tasks_spawned
                     .fetch_add(1, Ordering::Relaxed);
-                let loader = Arc::clone(&self.loader);
-                handle.spawn_blocking(move || loader.backed.read_shard_cached_arc(sidx))
+                // Capture the *reader*, never the loader: an already-started
+                // `spawn_blocking` cannot be aborted, so a task holding the
+                // loader could outlive this iter and release the final
+                // reference — dropping the runtime from one of its own
+                // threads. See `crate::runtime`.
+                let backed = Arc::clone(&self.loader.backed);
+                #[cfg(test)]
+                let gate = self.loader.prefetch_gate.clone();
+                handle.spawn_blocking(move || {
+                    #[cfg(test)]
+                    if let Some(gate) = gate {
+                        gate.enter();
+                    }
+                    backed.read_shard_cached_arc(sidx)
+                })
             })
             .collect())
     }
@@ -1216,12 +1337,16 @@ impl Iterator for IndexPlanIter {
         // Loop so empty plans are silently skipped (spec: "Plan list is empty
         // → yield no batch for that plan; continue to the next").
         loop {
-            self.refill();
+            // Nothing has been yielded yet on this call, so waiting for the
+            // first plan is the only way to make progress.
+            self.refill(true);
 
             if let Some(head) = self.in_flight.pop_front() {
                 // Refill again so the queue stays warm during the upcoming
-                // process_plan call. Errors latched here drain through later.
-                self.refill();
+                // process_plan call. Strictly non-blocking: we already hold a
+                // plan to process, and the generator may be waiting on the
+                // batch it produces. Errors latched here drain through later.
+                self.refill(false);
 
                 if head.plan.is_empty() {
                     // Skip empty plan; loop to pull the next.
@@ -1247,10 +1372,22 @@ impl Iterator for IndexPlanIter {
 }
 
 impl Drop for IndexPlanIter {
-    /// Best-effort shutdown. The loader's tokio runtime is owned by the
-    /// `Arc<IndexPlanLoader>` (which the dataset, not this iter, holds), so
-    /// dropping the iter does not tear down the runtime — we only need to
-    /// release the prefetch tasks and the plan-pull thread.
+    /// Release the prefetch tasks and the plan-pull thread.
+    ///
+    /// The runtime teardown is deliberately **not** here. This iter really can
+    /// hold the last `Arc<IndexPlanLoader>` — the API supports
+    ///
+    /// ```python
+    /// it = ds.iter_with_plans(...)
+    /// ds.close()     # releases the dataset's Arc; the iter still holds one
+    /// list(it)       # this is what releases the runtime
+    /// ```
+    ///
+    /// — but it cannot reliably *know* that it does, so it does not try. The
+    /// deadline lives in `BoundedRuntime::drop`, which the loader's `OnceLock`
+    /// holds; it fires when the loader field of this struct drops, just after
+    /// this body returns. See [`crate::runtime`] for the two ownership cases
+    /// that made the "last owner calls shutdown" shape unworkable.
     fn drop(&mut self) {
         // Abort any outstanding prefetch handles so the runtime threads
         // stop blocking on shards we no longer need.

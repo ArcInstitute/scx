@@ -189,3 +189,157 @@ def test_fork_pre_fork_dataset_raises_in_child(two_scx):
     status, payload = parent_conn.recv()
     proc.join(timeout=30)
     assert status == "err" and "num_workers=0" in payload
+
+
+# ---------------------------------------------------------------------------
+# §9.3 / §9.4 — lifecycle: bounded teardown, and an opportunistic plan pull.
+# ---------------------------------------------------------------------------
+
+
+def test_feedback_plan_generator_yields_every_batch(two_scx):
+    """§9.4 on the sparse path.
+
+    `PlanPrefetchIter::refill` had the same blocking-`recv` loop as the paired
+    loader's, so a generator that answers only after seeing the previous batch
+    wedged it the same way. The generator blocks here rather than merely
+    asserting it was not called ahead — the plan-pull thread buffers up to
+    `lookahead` plans by design, so being *asked* early is fine; answering
+    early is what a curriculum sampler cannot do.
+    """
+    import threading
+
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    seen = []
+    n_plans = 5
+    ack = threading.Semaphore(0)
+
+    def curriculum():
+        for i in range(n_plans):
+            if i > 0:
+                assert ack.acquire(timeout=30), (
+                    f"generator waited 30s for batch {i - 1} and never got it — "
+                    "the loader is demanding plans ahead of the feedback signal"
+                )
+            assert len(seen) == i
+            yield ([0, 1], [i, i + 1], [0, 1], [0, 1, 2])
+
+    for b in ds.iter_with_plans(curriculum(), lookahead=4):
+        seen.append(b["shape"][0])
+        ack.release()
+
+    assert len(seen) == n_plans
+    assert all(n == 2 for n in seen)
+
+
+def test_close_is_idempotent_and_terminal(two_scx):
+    """§9.3 — `close()` releases the prefetch engine's tokio runtime off the
+    GIL, and is terminal because that runtime is built exactly once so a
+    forked child can never inherit it."""
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    assert ds.closed is False
+    assert ds.n_files == 2
+
+    ds.close()
+    assert ds.closed is True
+    ds.close()  # idempotent
+
+    with pytest.raises(RuntimeError, match="closed"):
+        ds.iter_with_plans(iter([_PLAN]))
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = ds.n_files
+    with pytest.raises(RuntimeError, match="closed"):
+        ds.memory_budget()
+
+
+def test_repr_never_raises_when_closed(two_scx):
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    assert "n_files=" in repr(ds)
+    ds.close()
+    assert repr(ds) == "SparseCellSetDataset(closed)"
+
+
+def test_teardown_mid_flight_is_bounded(two_scx):
+    """Abandoning an epoch with prefetches outstanding tears down cleanly.
+
+    The ordering guard: the iterator holds its own reference to the loader, so
+    dropping the dataset first cannot take sole ownership and the runtime is
+    released when the iterator drops. See the paired loader's namesake test for
+    why the GIL-release half of §9.3 is carried by construction rather than by
+    an assertion here.
+    """
+    import time
+
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    plans = [([0, 1], [i, i + 1], [0, 1], [0, 1, 2]) for i in range(8)]
+    it = ds.iter_with_plans(iter(plans), lookahead=4)
+    next(it)
+
+    t0 = time.monotonic()
+    del ds
+    del it
+    elapsed = time.monotonic() - t0
+    assert elapsed < 10.0, f"mid-flight teardown took {elapsed:.2f}s"
+
+
+def test_close_then_drain_the_iterator(two_scx):
+    """The twin of `IndexPlanDataset`'s namesake, on the path where the
+    ownership graph is worse.
+
+    Here the iterator's stored `process` closure owns an
+    `Arc<SparseCellSetLoader>` which owns a second `Arc<PrefetchEngine>`, so
+    `close()` cannot reach the engine and neither can the iterator's own `Drop`
+    body (a `Drop` body runs before its struct's fields). The teardown deadline
+    therefore lives in the runtime newtype itself, and this exercises the
+    ordering end to end.
+    """
+    import time
+
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    plans = [([0, 1], [i, i + 1], [0, 1], [0, 1, 2]) for i in range(4)]
+    it = ds.iter_with_plans(iter(plans), lookahead=4)
+    next(it)
+    ds.close()
+
+    t0 = time.monotonic()
+    rest = list(it)
+    elapsed = time.monotonic() - t0
+
+    assert len(rest) == 3, "closing the dataset must not truncate a live iterator"
+    assert elapsed < 10.0, f"drain-after-close took {elapsed:.2f}s"
+    assert list(it) == []
+
+
+def test_closed_dataset_raises_before_running_user_code(two_scx):
+    """A closed dataset must report *that*, not run the caller's `__iter__`
+    first and surface whatever it raises."""
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    ds.close()
+
+    class Exploding:
+        def __iter__(self):
+            raise AssertionError("user __iter__ ran on a closed dataset")
+
+    with pytest.raises(RuntimeError, match="closed"):
+        ds.iter_with_plans(Exploding())
+
+    # Same for the argument-validation path: closed beats ValueError.
+    with pytest.raises(RuntimeError, match="closed"):
+        ds.suggested_cache_shards([0, 0], [1])

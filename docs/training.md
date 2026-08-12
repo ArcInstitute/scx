@@ -379,6 +379,55 @@ for batch in ds.iter_with_plans(plan_generator(perturbed, controls, 1024)):
 access (20K vs 189 cells/s). See [api.md § IndexPlanDataset](api.md#indexplandataset)
 for the full constructor reference, batch schema, and iterator semantics.
 
+### Feedback and curriculum plan generators
+
+`lookahead` is a prefetch *budget*, not a contract the generator has to meet.
+The loader waits for the first plan of each batch and then tops its queue up
+with whatever the generator has already produced, so a generator that computes
+plan *i+1* from batch *i* — curriculum sampling, hard-negative mining, anything
+with a feedback signal — is supported directly:
+
+Two properties of the loader shape the code you have to write:
+
+1. It advances the generator with `next()`, never `.send()` — so
+   `batch = yield plan` binds `None`, not the batch.
+2. The plan-pull thread does **not** wait for the consumer. After `yield`, it
+   sends the plan and immediately asks for the next one, up to the channel's
+   capacity — so reading a shared variable straight after `yield` reads the
+   *previous* iteration's value, or `None` on the first.
+
+So the feedback has to be an explicit rendezvous: publish the batch, then
+signal, and have the generator block on that signal before answering.
+
+```python
+import threading
+
+published = threading.Semaphore(0)
+state = {"batch": None}
+
+def curriculum(model):
+    plan = initial_plan()
+    while True:
+        yield plan
+        # Block until the consumer has published the batch for the plan just
+        # yielded. Without this the loader asks for the next plan immediately
+        # and `state["batch"]` is still the previous one.
+        published.acquire()
+        plan = next_plan_from(model, state["batch"])
+
+for batch in ds.iter_with_plans(curriculum(model)):
+    state["batch"] = batch     # publish first…
+    published.release()        # …then signal
+    ...
+```
+
+`pyscx/tests/test_index_plan_dataset.py::TestFeedbackPlanGenerator` is the
+executable version of this.
+
+Such a generator simply runs un-prefetched (effectively `lookahead=0`) while it
+is the bottleneck, and regains depth whenever it runs ahead. It is never
+required to stay `lookahead` plans in front of the consumer.
+
 
 ## SparseCellSetDataset and the native collation kernel
 
@@ -666,6 +715,43 @@ Size the pools with `SCX_LOADER_CPU_THREADS` (default: physical cores capped at
 own decode pool, so budget `num_workers × 2 × threads` there. `IndexPlanDataset`
 and `SparseCellSetDataset` hold one. See
 [multithreading.md § Per-worker thread footprint](multithreading.md#per-worker-thread-footprint).
+
+### Closing a dataset
+
+All four dataset classes have `close()`, and all four release the GIL around
+teardown — a `#[pyclass]` is dropped with the GIL held, and tearing down a
+tokio runtime blocks until every already-started shard decode returns, which
+would otherwise stall every other Python thread (CUDA stream callbacks, the
+logging thread) for that window. Dropping the object does the same thing, so
+`close()` is for explicitness and determinism, not correctness:
+
+```python
+def __iter__(self):
+    ds = pyscx.IndexPlanDataset(self.path, **self.kwargs)
+    try:
+        yield from ds.iter_with_plans(self.plans())
+    finally:
+        ds.close()
+```
+
+Two differences worth knowing:
+
+| | `TrainingDataset`, `MultimodalTrainingDataset` | `IndexPlanDataset`, `SparseCellSetDataset` |
+|---|---|---|
+| after `close()` | re-usable — the next `__iter__` rebuilds the pool and runtime | **terminal** — every method raises `RuntimeError`; construct a new dataset |
+| why | its pool and runtime are rebuilt per epoch anyway | the runtime is built exactly once, so a forked child can never inherit live tokio threads; that also means it cannot be rebuilt |
+
+`repr()` never raises on any of them. The `closed` property exists on the two
+terminal classes only — `TrainingDataset` and `MultimodalTrainingDataset` have
+`close()` but no `closed`, because for them close is not a state change worth
+querying.
+
+Whichever object ends up holding the last reference does the teardown, and every
+one of them bounds it at 5 s and detaches the GIL first — the dataset's
+`close()`/`Drop`, and the batch iterator's `Drop` *and* its end-of-stream branch
+in `__next__`. So `ds.close()` followed by draining an outstanding iterator is
+safe: `close()` releases only the dataset's reference, and the iterator's own
+teardown finishes the job under the same guarantees.
 
 > [!TIP]
 > Use `multiprocessing.set_start_method("spawn")` if your workload allows.

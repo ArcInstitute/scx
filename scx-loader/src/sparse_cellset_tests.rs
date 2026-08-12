@@ -1212,3 +1212,75 @@ fn collate_gathered_errors_rather_than_panicking_on_a_bad_indptr() {
     .to_string();
     assert!(err.contains("non-decreasing"), "unhelpful: {err}");
 }
+
+// ---------------------------------------------------------------------
+// §9.3 — teardown through the *production* ownership graph.
+//
+// The engine `Arc` has more owners than are visible from any one of them:
+// `SparseCellSetLoader` holds one, `PlanPrefetchIter` holds one, and the
+// `process` closure the iter stores holds an `Arc<SparseCellSetLoader>` that
+// holds a third. A round-1 attempt put the deadline behind `Arc::into_inner`
+// in `PlanPrefetchIter::drop`, which — because a `Drop` body runs before its
+// struct's own fields — could never succeed here. The test that shipped with it
+// used a capture-free `gather` and so passed against the broken path.
+//
+// These go through `SparseCellSetLoader::iter_with_plans`, which is what builds
+// the loader-capturing closure.
+// ---------------------------------------------------------------------
+
+#[test]
+fn teardown_through_the_real_iter_ownership_graph_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("f0.scx");
+    write_fixture(&p0, 32, 8, 4);
+
+    let before = crate::runtime::BOUNDED_SHUTDOWNS.with(|c| c.get());
+
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        /*cache_shards*/ 4,
+        /*bytes_budget*/ None,
+        /*lookahead*/ 4,
+        /*remap*/ None,
+        /*n_global_genes*/ None,
+        /*normalize*/ false,
+        /*log1p*/ false,
+        /*target_sum*/ 1e4,
+        /*downsample*/ None,
+    )
+    .unwrap();
+
+    let plans = vec![
+        SparseCellSetPlan {
+            file_ids: vec![0, 0],
+            rows: vec![0, 9],
+            role_tags: vec![0, 0],
+            set_offsets: vec![0, 2],
+        },
+        SparseCellSetPlan {
+            file_ids: vec![0, 0],
+            rows: vec![17, 26],
+            role_tags: vec![0, 0],
+            set_offsets: vec![0, 2],
+        },
+    ];
+    // The production constructor: `process` closes over an
+    // `Arc<SparseCellSetLoader>`, which owns another engine Arc.
+    let mut it = Arc::clone(&loader).iter_with_plans(plans.into_iter().map(Ok), 4);
+    it.next().expect("first batch").expect("must gather"); // forces the runtime
+
+    // The `ds.close()` half: the dataset's loader reference goes away while the
+    // iterator (and the closure inside it) are still alive.
+    drop(loader);
+    while let Some(b) = it.next() {
+        b.expect("must gather");
+    }
+    drop(it);
+
+    assert_eq!(
+        crate::runtime::BOUNDED_SHUTDOWNS.with(|c| c.get()),
+        before + 1,
+        "the engine outlived every explicit owner, so its runtime must still \
+         have gone down through BoundedRuntime::drop"
+    );
+}

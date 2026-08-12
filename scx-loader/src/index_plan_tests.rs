@@ -996,3 +996,289 @@ fn lazy_runtime_idempotent_under_concurrent_init() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// §9.4 — prefetch depth is opportunistic, never an obligation on the plan
+// generator.
+//
+// `refill` used to loop on a *blocking* `recv` until `in_flight` reached
+// `lookahead.max(1)` (default 4). A generator that produces plan i+1 only
+// after seeing batch i — curriculum / feedback sampling, a normal shape for
+// perturbation training — deadlocked permanently: the generator waited for
+// batch i, the consumer waited for plan i+4, and nothing timed either out.
+// ---------------------------------------------------------------------
+
+/// Run `f` on a worker thread; panic rather than hang the suite if it has not
+/// finished within `secs`. Without this, the red for a `refill` deadlock is a
+/// `cargo test` run that never returns and has to be killed by hand — which
+/// reads as infrastructure trouble rather than as a failing test.
+fn with_deadline<T: Send + 'static>(
+    secs: u64,
+    label: &'static str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(v) => v,
+        Err(_) => panic!("{label}: no result within {secs}s — the iterator deadlocked"),
+    }
+}
+
+/// A plan generator that will not produce plan `i + 1` until the consumer has
+/// acknowledged batch `i`.
+struct FeedbackPlans {
+    plans: std::vec::IntoIter<Vec<(u64, u64)>>,
+    ack: Receiver<()>,
+    first: bool,
+}
+
+impl Iterator for FeedbackPlans {
+    type Item = std::result::Result<Vec<(u64, u64)>, LoaderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.first {
+            // Park until the consumer has seen the previous batch. A sender
+            // that has gone away means the consumer stopped early.
+            self.ack.recv().ok()?;
+        }
+        self.first = false;
+        self.plans.next().map(Ok)
+    }
+}
+
+/// The §9.4 red: a feedback generator must still see every batch.
+#[test]
+fn feedback_generator_yields_every_batch() {
+    let plans = vec![
+        vec![(0u64, 1u64)],
+        vec![(2u64, 3u64)],
+        vec![(4u64, 5u64)],
+        vec![(6u64, 7u64)],
+    ];
+    let want = plans.len();
+
+    let got = with_deadline(30, "feedback plan generator", move || {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let loader = open_loader_arc(&path);
+
+        // Rendezvous: the ack is delivered only once the generator asks for it,
+        // so the two sides really are lock-stepped.
+        let (ack_tx, ack_rx) = bounded(0);
+        let it = loader.iter_with_plans(
+            FeedbackPlans {
+                plans: plans.into_iter(),
+                ack: ack_rx,
+                first: true,
+            },
+            /*lookahead*/ 4,
+        );
+
+        let mut count = 0usize;
+        for batch in it {
+            batch.expect("batch must decode");
+            count += 1;
+            // What a feedback sampler does after scoring the batch.
+            let _ = ack_tx.send(());
+        }
+        count
+    });
+
+    assert_eq!(
+        got, want,
+        "every plan must produce a batch when the generator waits on the previous one"
+    );
+}
+
+/// A generator that is merely slow must not end the epoch.
+///
+/// This is the red for the *wrong* fix rather than for the old code: swapping
+/// the blocking `recv` for a `try_recv` whose `Empty` arm sets
+/// `plan_stream_done` truncates the epoch to a single batch, silently and with
+/// no error anywhere.
+#[test]
+fn a_slow_generator_does_not_end_the_epoch() {
+    let plans: Vec<Vec<(u64, u64)>> = (0..5).map(|i| vec![(i * 2, i * 2 + 1)]).collect();
+    let want = plans.len();
+
+    let got = with_deadline(30, "slow plan generator", move || {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let loader = open_loader_arc(&path);
+
+        let slow = plans.into_iter().map(|p| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Ok(p)
+        });
+        let mut count = 0usize;
+        for batch in loader.iter_with_plans(slow, /*lookahead*/ 4) {
+            batch.expect("batch must decode");
+            count += 1;
+        }
+        count
+    });
+
+    assert_eq!(got, want, "a slow generator must not truncate the epoch");
+}
+
+/// Over-fix guard: when the generator keeps up, the queue still fills to
+/// `lookahead`. A "fix" that pulled one plan at a time would pass every test
+/// above and quietly delete the prefetch.
+#[test]
+fn prefetch_depth_survives_when_the_generator_keeps_up() {
+    const LOOKAHEAD: usize = 4;
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+    let loader = open_loader_arc(&path);
+
+    let plans: Vec<Vec<(u64, u64)>> = (0..LOOKAHEAD as u64)
+        .map(|i| vec![(i * 2, i * 2 + 1)])
+        .collect();
+
+    // Exactly `LOOKAHEAD` plans, and the plan channel is `bounded(LOOKAHEAD)`,
+    // so the pull thread buffers all of them and then runs to exhaustion
+    // without needing the consumer. Waiting on `drained` before the first
+    // `next()` is what makes the `try_recv` arms below race-free.
+    let (drained_tx, drained_rx) = bounded(1);
+    let gen = into_plan_iter(plans).chain(std::iter::from_fn(
+        move || -> Option<std::result::Result<Vec<(u64, u64)>, LoaderError>> {
+            let _ = drained_tx.send(());
+            None
+        },
+    ));
+
+    let mut it = loader.iter_with_plans(gen, LOOKAHEAD);
+    drained_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("plan generator must drain into the bounded channel");
+
+    it.next()
+        .expect("first batch")
+        .expect("first batch must decode");
+
+    assert_eq!(
+        it.in_flight.len(),
+        LOOKAHEAD - 1,
+        "the queue must still be prefetched to depth when the generator is ahead"
+    );
+}
+
+// ---------------------------------------------------------------------
+// §9.3 — bounded, GIL-free teardown.
+// ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// §9.3 — the teardown deadline holds regardless of who releases the last
+// reference.
+// ---------------------------------------------------------------------
+
+/// A prefetch task must not capture the loader.
+///
+/// It used to: `spawn_blocking(move || loader.backed.read_shard_cached_arc(..))`.
+/// An already-started blocking task cannot be aborted, so such a task could
+/// outlive the iterator and release the *final* loader reference — dropping the
+/// tokio runtime from one of that runtime's own threads. Capturing only the
+/// `Arc<BackedCsrReader>` means no task can ever be the last owner.
+///
+/// The gate is load-bearing, and so is its *start signal*. A first version
+/// counted references after `next()` returned and **passed with the loader
+/// captured again** — the tasks had already finished. A second version parked
+/// them but inferred "a task is running" from a 300 ms sleep, which fails the
+/// same way on a loaded machine: no task started, nothing held, count clean.
+/// The gate now announces entry before parking, and the test fails outright if
+/// no task announces.
+#[test]
+fn a_prefetch_task_does_not_capture_the_loader() {
+    let dir = tempfile::tempdir().unwrap();
+    // Unframed: a framed file routes the scattered gather through the block
+    // index, and `spawn_prefetches` then skips warming — no task, nothing to
+    // observe.
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
+
+    let mut config = LoaderConfig::default();
+    config.normalize = false;
+    config.log1p = false;
+    config.obs_columns = vec!["cell_id".to_string()];
+    let mut raw = IndexPlanLoader::new(&path, config, 4, true, 4, 16384).unwrap();
+    raw.set_scatter_block_index(false);
+    let gate = Arc::new(PrefetchGate::new());
+    raw.set_prefetch_gate(Arc::clone(&gate));
+    let loader = Arc::new(raw);
+
+    let mut it = Arc::clone(&loader).iter_with_plans(
+        into_plan_iter(vec![
+            vec![(0u64, 1u64)],
+            vec![(8, 12)],
+            vec![(16, 20)],
+            vec![(24, 28)],
+        ]),
+        4,
+    );
+    assert_eq!(
+        Arc::strong_count(&loader),
+        2,
+        "unexpected extra owner at start"
+    );
+
+    // Spawn the queue's prefetches on a background thread: the head plan's are
+    // awaited, and the gate is holding them, so `next()` would block here.
+    let handle = std::thread::spawn(move || {
+        let b = it.next();
+        (it, b)
+    });
+
+    // Wait for a task to actually announce itself. A sleep here would let the
+    // test pass on a loaded machine with the bug present: no task started, so
+    // no task is holding anything, so the count looks clean.
+    let entered = gate.wait_for_entry(std::time::Duration::from_secs(30));
+    let held = Arc::strong_count(&loader);
+    gate.release();
+
+    let (it, batch) = handle.join().expect("worker must not panic");
+    batch.expect("a batch").expect("must decode");
+    drop(it);
+
+    assert!(
+        entered,
+        "no prefetch task started within 30s — the premise never held, so the \
+         ownership assertion below would have been vacuous"
+    );
+    assert_eq!(
+        held, 2,
+        "a prefetch task in flight is holding an Arc<IndexPlanLoader> \
+         (strong_count={held}); such a task can outlive the iterator and drop \
+         the runtime from a runtime thread"
+    );
+}
+
+/// Whoever releases the last reference gets the bounded teardown — including
+/// the iterator, which is the last owner after the advertised
+/// `ds.close(); list(it)` ordering.
+#[test]
+fn the_iterator_as_last_owner_still_gets_a_bounded_teardown() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+
+    let before = crate::runtime::BOUNDED_SHUTDOWNS.with(|c| c.get());
+
+    let loader = open_loader_arc(&path);
+    let mut it = Arc::clone(&loader)
+        .iter_with_plans(into_plan_iter(vec![vec![(0u64, 1u64)], vec![(4, 9)]]), 4);
+    it.next().expect("first batch").expect("must decode"); // forces the runtime
+
+    drop(loader); // the `ds.close()` half — the iter is now the only owner
+    while let Some(b) = it.next() {
+        b.expect("must decode");
+    }
+    drop(it);
+
+    assert_eq!(
+        crate::runtime::BOUNDED_SHUTDOWNS.with(|c| c.get()),
+        before + 1,
+        "the iterator released the last reference, so the runtime must have \
+         gone down through BoundedRuntime::drop"
+    );
+}

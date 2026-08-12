@@ -14,6 +14,7 @@ pub mod pool;
 pub mod projection;
 #[cfg(feature = "python")]
 pub mod python;
+pub(crate) mod runtime;
 pub mod shuffle;
 pub mod sparse_cellset;
 pub mod sparse_cellset_collate;

@@ -271,6 +271,45 @@ while `cpu_pool()` is process-wide — so budget `2 × threads` per worker, time
 since the decode pool read `num_cpus::get_physical()` directly and ignored the
 knob. `IndexPlanDataset` and `SparseCellSetDataset` hold only `cpu_pool()`.
 
+#### Teardown never runs under the GIL
+
+pyo3 drops a `#[pyclass]` with the GIL held, and dropping a tokio runtime blocks
+until every already-started `spawn_blocking` returns — for these loaders, a
+`read_shard_cached_arc` decode that can be hundreds of megabytes of Pcodec. All
+four dataset classes therefore detach the GIL around teardown, in both `close()`
+and `Drop`, and bound the wait by `SHUTDOWN_DEADLINE` (5 s) —
+`TrainingPipeline::shutdown` for the two training classes, and for the other two
+the mechanism below.
+
+The batch iterators must do the same, and for a reason easy to miss: each holds
+its own `Arc` to the loader, so in the ordinary
+`for b in ds.iter_with_plans(...)` shape the iterator outlives `ds.close()` in
+the caller's frame and is the object that actually releases the runtime. That
+covers the GIL half.
+
+**The deadline is not enforced by any of those owners.** It lives in
+`BoundedRuntime` (`scx-loader/src/runtime.rs`), the newtype the runtime is
+stored in, whose `Drop` calls `shutdown_timeout`. The reason is worth recording,
+because the obvious alternative was tried and is wrong: "whoever holds the last
+`Arc` calls shutdown" needs each owner to know it is last, which means
+`Arc::into_inner`, which is only sound if you can enumerate every holder. Twice
+here you could not —
+
+* `PlanPrefetchIter` stores the caller's `process` closure, and
+  `SparseCellSetLoader::iter_with_plans` builds that closure around an
+  `Arc<SparseCellSetLoader>` holding another engine `Arc`. A `Drop` body runs
+  *before* its struct's fields, so the closure was still alive and
+  `Arc::into_inner` failed **deterministically** on the production path.
+* `IndexPlanIter`'s prefetch tasks captured the whole loader. An already-started
+  `spawn_blocking` cannot be aborted, so the task outlived the drop and released
+  the final reference itself — from a runtime thread.
+
+With the deadline in the runtime's own `Drop`, every release path bounds itself,
+including ones nobody enumerated. The remaining obligation is narrow and local:
+a runtime must not be dropped from one of its own threads, which is why
+prefetch tasks now capture `Arc<BackedCsrReader>` and never the loader
+(`a_prefetch_task_does_not_capture_the_loader` pins it).
+
 `pyscx/tests/test_fork_safety.py` is the durable regression test;
 post-fix Lambda HPC measurements confirm the workers0 / workers2 paths
 run cleanly end-to-end. 

@@ -96,6 +96,21 @@ class IndexPlanDataset:
     def n_vars(self) -> int: ...
     @property
     def n_output_genes(self) -> int: ...
+    @property
+    def closed(self) -> bool:
+        """True once `close()` has run. Never raises."""
+        ...
+
+    def close(self) -> None:
+        """Release the tokio runtime, GIL detached and bounded by 5 s.
+
+        Idempotent, and **terminal** — unlike `TrainingDataset.close()`, which
+        rebuilds on the next `__iter__`. This class's runtime is built exactly
+        once so a forked child can never inherit it, so it cannot be rebuilt;
+        every other method raises `RuntimeError` afterwards. `closed` and
+        `__repr__` keep working.
+        """
+        ...
 
     def effective_cache_shards(self) -> int:
         """Resolved `cache_shards` after memory-budget auto-tuning. May be
@@ -241,6 +256,16 @@ class SparseCellSetDataset:
     def n_files(self) -> int: ...
     @property
     def n_cols(self) -> int: ...
+    @property
+    def closed(self) -> bool:
+        """True once `close()` has run. Never raises."""
+        ...
+
+    def close(self) -> None:
+        """Release the prefetch engine's tokio runtime, GIL detached and
+        bounded by 5 s. Idempotent and **terminal** — see
+        `IndexPlanDataset.close`."""
+        ...
 
     def iter_with_plans(
         self,

@@ -1020,11 +1020,44 @@ fn build_multimodal_batch_dict<'py>(
 /// recommended on `TrainingDataset` — no fork hazards at all.
 #[pyclass]
 pub struct IndexPlanDataset {
-    loader: Arc<IndexPlanLoader>,
+    /// `None` once [`IndexPlanDataset::close`] has run. Every accessor goes
+    /// through [`IndexPlanDataset::loader`], which raises on a closed dataset;
+    /// `close` needs the `Option` because bounding the runtime teardown
+    /// requires *owning* the loader, not merely borrowing it.
+    loader: Option<Arc<IndexPlanLoader>>,
     /// PID at construction time — used to detect forking. The shard cache and
     /// mmap state are not fork-safe; consumers must lazily construct the
     /// dataset post-fork in each DataLoader worker.
     creation_pid: u32,
+}
+
+impl IndexPlanDataset {
+    /// The live loader, or a `RuntimeError` naming the cause when the dataset
+    /// has been closed. Deliberately **not** in the `#[pymethods]` block — a
+    /// method there would be exported to Python as `ds.loader`.
+    fn loader(&self) -> PyResult<&Arc<IndexPlanLoader>> {
+        self.loader.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "IndexPlanDataset is closed. close() is terminal on this class: the \
+                 tokio runtime is built exactly once so it can never be inherited \
+                 across a fork, and so cannot be rebuilt. Construct a new dataset.",
+            )
+        })
+    }
+
+    /// Shared teardown for `close` and `Drop`. **Must be called without the
+    /// GIL**: releasing the last reference tears the tokio runtime down, which
+    /// blocks on in-flight shard decodes.
+    ///
+    /// Just a drop — deliberately. An earlier version tried `Arc::into_inner`
+    /// here so it could call a bounded shutdown when it was the last owner, and
+    /// that is not decidable from this side: the batch iterators, the caller's
+    /// `process` closure and (previously) the prefetch tasks all hold
+    /// references. The deadline now lives in `BoundedRuntime::drop`, so the
+    /// last release bounds itself wherever it happens. See [`crate::runtime`].
+    fn shutdown_detached(loader: Option<Arc<IndexPlanLoader>>) {
+        drop(loader);
+    }
 }
 
 #[pymethods]
@@ -1187,27 +1220,59 @@ impl IndexPlanDataset {
         }
 
         Ok(Self {
-            loader: Arc::new(loader),
+            loader: Some(Arc::new(loader)),
             creation_pid: std::process::id(),
         })
     }
 
     /// Total number of observations (cells) in the dataset.
     #[getter]
-    fn n_obs(&self) -> u64 {
-        self.loader.n_obs()
+    fn n_obs(&self) -> PyResult<u64> {
+        Ok(self.loader()?.n_obs())
     }
 
     /// Total number of variables (genes) in the dataset.
     #[getter]
-    fn n_vars(&self) -> u64 {
-        self.loader.n_vars()
+    fn n_vars(&self) -> PyResult<u64> {
+        Ok(self.loader()?.n_vars())
     }
 
     /// Number of output genes per batch (HVG count if projection active).
     #[getter]
-    fn n_output_genes(&self) -> usize {
-        self.loader.n_output_cols()
+    fn n_output_genes(&self) -> PyResult<usize> {
+        Ok(self.loader()?.n_output_cols())
+    }
+
+    /// True once [`Self::close`] has run. Never raises.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.loader.is_none()
+    }
+
+    /// Release the loader's tokio runtime, bounded by a 5 s deadline, with the
+    /// GIL detached.
+    ///
+    /// A `#[pyclass]` is dropped with the GIL held, and dropping the runtime
+    /// blocks until every already-started `spawn_blocking` returns — those are
+    /// `read_shard_cached_arc` decodes that can be hundreds of megabytes of
+    /// Pcodec. Without this, `del ds` freezes every other Python thread
+    /// (PyTorch CUDA stream callbacks, the logging thread) for that whole
+    /// window. `Drop` does the same thing, so `close()` is an explicitness
+    /// convenience, not a correctness requirement.
+    ///
+    /// Idempotent. **Terminal**, unlike `TrainingDataset.close()`: that class
+    /// rebuilds its pool and runtime on the next `__iter__`, whereas this one
+    /// cannot, because the runtime is built exactly once so that a forked
+    /// child can never inherit live tokio threads. Any later call raises
+    /// `RuntimeError`; construct a new dataset instead.
+    ///
+    /// The 5 s bound applies only when this call holds the last reference to
+    /// the loader. A still-alive `IndexPlanBatchIter` holds one too; in that
+    /// case this releases ours off-GIL and the iterator's own drop — also
+    /// off-GIL — finishes the teardown.
+    fn close(&mut self, py: Python<'_>) {
+        let loader = self.loader.take();
+        py.detach(|| Self::shutdown_detached(loader));
     }
 
     /// Drive the loader from a Python iterable of `(pert_idx, ctrl_idx)`
@@ -1225,7 +1290,13 @@ impl IndexPlanDataset {
     /// Returns: an `IndexPlanBatchIter` (Python iterator) whose `__next__`
     /// yields `{"X", "X_paired", "pairs", "obs", "obs_paired"}` dicts.
     /// Plan iteration is lazy: the loader pulls the next plan only when it
-    /// is ready to schedule a prefetch for it.
+    /// is ready to schedule a prefetch for it, and **prefetch depth is
+    /// opportunistic** — the loader waits only for the first plan of each
+    /// batch, then tops the queue up with whatever the generator has already
+    /// produced. A generator that yields plan *i+1* only after inspecting
+    /// batch *i* (curriculum / feedback sampling) therefore runs correctly,
+    /// merely un-prefetched; it is never required to run `lookahead` plans
+    /// ahead of the consumer.
     #[pyo3(signature = (plans, lookahead=None))]
     fn iter_with_plans(
         &self,
@@ -1238,7 +1309,8 @@ impl IndexPlanDataset {
                  construction). The Rust shard cache and mmap state are not fork-safe.",
             ));
         }
-        let lookahead = lookahead.unwrap_or_else(|| self.loader.effective_lookahead());
+        let loader = self.loader()?;
+        let lookahead = lookahead.unwrap_or_else(|| loader.effective_lookahead());
 
         // Bind plans → its iter, hold an owned Py<PyAny> Send-safe handle.
         let py_iter: Py<PyAny> = Python::attach(|py| -> PyResult<Py<PyAny>> {
@@ -1246,17 +1318,17 @@ impl IndexPlanDataset {
         })?;
 
         let plan_stream = PyPlanIterator { py_iter };
-        let inner = Arc::clone(&self.loader).iter_with_plans(plan_stream, lookahead);
+        let inner = Arc::clone(loader).iter_with_plans(plan_stream, lookahead);
         let iter_metrics = inner.iter_metrics();
-        let cache_metrics = self.loader.cache_metrics();
+        let cache_metrics = loader.cache_metrics();
         let thrash = ThrashSampler::new(
             "IndexPlanDataset",
-            self.loader.effective_cache_shards(),
-            self.loader.n_shards(),
+            loader.effective_cache_shards(),
+            loader.n_shards(),
             // The paired path's auto-tune reduces the count to fit the budget, so
             // a reduction there IS byte-driven.
-            self.loader.effective_cache_shards() < self.loader.requested_cache_shards(),
-            self.loader.shard_decoded_bytes(),
+            loader.effective_cache_shards() < loader.requested_cache_shards(),
+            loader.shard_decoded_bytes(),
         );
         Ok(IndexPlanBatchIter {
             inner: Some(inner),
@@ -1269,8 +1341,8 @@ impl IndexPlanDataset {
 
     /// Effective LRU shard cache size after auto-tuning to fit
     /// `max_memory_mb`. May be less than the user-requested `cache_shards`.
-    fn effective_cache_shards(&self) -> usize {
-        self.loader.effective_cache_shards()
+    fn effective_cache_shards(&self) -> PyResult<usize> {
+        Ok(self.loader()?.effective_cache_shards())
     }
 
     /// Number of distinct CSR shards `plan` touches — the `cache_shards` that
@@ -1285,15 +1357,16 @@ impl IndexPlanDataset {
     /// need = max(probe.suggested_cache_shards(p) for p in plans[:64])
     /// ds = pyscx.IndexPlanDataset(path, cache_shards=need)
     /// ```
-    fn suggested_cache_shards(&self, py: Python<'_>, plan: Vec<(u64, u64)>) -> usize {
-        py.detach(|| self.loader.plan_shard_touch_count(&plan))
+    fn suggested_cache_shards(&self, py: Python<'_>, plan: Vec<(u64, u64)>) -> PyResult<usize> {
+        let loader = self.loader()?;
+        Ok(py.detach(|| loader.plan_shard_touch_count(&plan)))
     }
 
     /// Effective default lookahead after auto-tuning to fit `max_memory_mb`.
     /// May be less than the user-requested `lookahead`. Used by
     /// `iter_with_plans` when the caller does not pass an explicit override.
-    fn effective_lookahead(&self) -> usize {
-        self.loader.effective_lookahead()
+    fn effective_lookahead(&self) -> PyResult<usize> {
+        Ok(self.loader()?.effective_lookahead())
     }
 
     /// Snapshot of the underlying `BackedCsrReader`'s shard-cache counters,
@@ -1313,7 +1386,7 @@ impl IndexPlanDataset {
     /// All values are `int`. Counters are atomic and read with `Relaxed`
     /// ordering. Sample as often as you want — there are no locks involved.
     fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        cache_metrics_to_pydict(py, &self.loader.cache_metrics())
+        cache_metrics_to_pydict(py, &self.loader()?.cache_metrics())
     }
 
     /// Per-component memory breakdown estimated at construction. Returns a
@@ -1335,13 +1408,11 @@ impl IndexPlanDataset {
     /// `breakdown` sub-dict shape, plus the index-plan-specific
     /// `effective_*` fields.
     fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = self.loader.budget_breakdown().to_pydict(py)?;
-        dict.set_item("max_memory_mb", self.loader.max_memory_mb())?;
-        dict.set_item(
-            "effective_cache_shards",
-            self.loader.effective_cache_shards(),
-        )?;
-        dict.set_item("effective_lookahead", self.loader.effective_lookahead())?;
+        let loader = self.loader()?;
+        let dict = loader.budget_breakdown().to_pydict(py)?;
+        dict.set_item("max_memory_mb", loader.max_memory_mb())?;
+        dict.set_item("effective_cache_shards", loader.effective_cache_shards())?;
+        dict.set_item("effective_lookahead", loader.effective_lookahead())?;
         Ok(dict)
     }
 
@@ -1364,7 +1435,7 @@ impl IndexPlanDataset {
             ));
         }
 
-        let loader = Arc::clone(&self.loader);
+        let loader = Arc::clone(self.loader()?);
         let batch = py
             .detach(move || loader.process_plan(plan))
             .map_err(loader_err_to_py)?;
@@ -1372,13 +1443,37 @@ impl IndexPlanDataset {
         index_plan_batch_to_dict(py, batch)
     }
 
+    /// Never raises, closed or not — `repr` is what a debugger and a traceback
+    /// call, and neither should fail because the object was closed.
     fn __repr__(&self) -> String {
-        format!(
-            "IndexPlanDataset(n_obs={}, n_vars={}, n_output_genes={})",
-            self.loader.n_obs(),
-            self.loader.n_vars(),
-            self.loader.n_output_cols(),
-        )
+        match self.loader.as_ref() {
+            Some(l) => format!(
+                "IndexPlanDataset(n_obs={}, n_vars={}, n_output_genes={})",
+                l.n_obs(),
+                l.n_vars(),
+                l.n_output_cols(),
+            ),
+            None => "IndexPlanDataset(closed)".to_string(),
+        }
+    }
+}
+
+impl Drop for IndexPlanDataset {
+    /// Release the GIL around the runtime teardown on drop.
+    ///
+    /// Mirrors `TrainingDataset::drop`, including the `Py_IsInitialized` probe
+    /// for the case where we are dropped *after* the interpreter has finalized
+    /// and there is no GIL to detach from. `py.detach` only wraps pure-Rust
+    /// work here — it never calls into Python — so it is safe even
+    /// mid-finalization, where the finalizing thread holds the GIL while
+    /// destructors run.
+    fn drop(&mut self) {
+        let loader = self.loader.take();
+        if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
+            Python::attach(|py| py.detach(|| Self::shutdown_detached(loader)));
+        } else {
+            Self::shutdown_detached(loader);
+        }
     }
 }
 
@@ -1464,7 +1559,14 @@ impl IndexPlanBatchIter {
                 // Drop the inner iterator to release the plan-pull thread
                 // and tokio runtime references; subsequent next calls return
                 // None without re-entering Rust.
-                self.inner = None;
+                //
+                // Off the GIL, and not merely for symmetry with `Drop`: after
+                // `ds.close()` the dataset has already released its `Arc`, so
+                // exhausting the iterator here can be what releases the *last*
+                // one and tears the runtime down. `Drop` cannot cover it —
+                // once `inner` is `None` it early-returns.
+                let inner = self.inner.take();
+                py.detach(move || drop(inner));
                 Ok(None)
             }
         }
@@ -1498,6 +1600,25 @@ impl IndexPlanBatchIter {
         dict.set_item("cache", cache_metrics_to_pydict(py, &self.cache_metrics)?)?;
         dict.set_item("prefetch", iter_metrics_to_pydict(py, &self.iter_metrics)?)?;
         Ok(dict)
+    }
+}
+
+impl Drop for IndexPlanBatchIter {
+    /// Release the GIL around dropping the inner iterator.
+    ///
+    /// This iterator holds its own `Arc<IndexPlanLoader>`, so in the ordinary
+    /// `for b in ds.iter_with_plans(...)` shape it outlives `ds.close()` in the
+    /// caller's frame and becomes the *last* reference — which would put the
+    /// whole runtime teardown back under the GIL that `close` just took care to
+    /// detach. `IndexPlanIter::drop` also aborts in-flight prefetches, but an
+    /// abort cannot stop a `spawn_blocking` task that has already started.
+    fn drop(&mut self) {
+        let inner = self.inner.take();
+        if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
+            Python::attach(|py| py.detach(move || drop(inner)));
+        } else {
+            drop(inner);
+        }
     }
 }
 
@@ -1987,11 +2108,42 @@ impl Iterator for PySparseCellSetPlanIterator {
 /// emits sparse CSR (not dense pairs) and is multi-file.
 #[pyclass]
 pub struct SparseCellSetDataset {
-    loader: Arc<SparseCellSetLoader>,
+    /// `None` once [`SparseCellSetDataset::close`] has run — see
+    /// [`IndexPlanDataset::loader`] for why this is an `Option`.
+    loader: Option<Arc<SparseCellSetLoader>>,
     default_lookahead: usize,
     /// PID at construction — the shard cache / mmap state is not fork-safe, so
     /// the dataset must be built post-fork in each worker (or `num_workers=0`).
     creation_pid: u32,
+}
+
+impl SparseCellSetDataset {
+    /// The live loader, or a `RuntimeError` when the dataset has been closed.
+    /// Deliberately **not** in the `#[pymethods]` block — a method there would
+    /// be exported to Python as `ds.loader`.
+    fn loader(&self) -> PyResult<&Arc<SparseCellSetLoader>> {
+        self.loader.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "SparseCellSetDataset is closed. close() is terminal on this class: \
+                 the tokio runtime is built exactly once so it can never be inherited \
+                 across a fork, and so cannot be rebuilt. Construct a new dataset.",
+            )
+        })
+    }
+
+    /// Shared teardown for `close` and `Drop`. **Must be called without the
+    /// GIL**: releasing the last reference tears the tokio runtime down, which
+    /// blocks on in-flight shard decodes.
+    ///
+    /// Just a drop — deliberately. An earlier version tried `Arc::into_inner`
+    /// here so it could call a bounded shutdown when it was the last owner, and
+    /// that is not decidable from this side: the batch iterators, the caller's
+    /// `process` closure and (previously) the prefetch tasks all hold
+    /// references. The deadline now lives in `BoundedRuntime::drop`, so the
+    /// last release bounds itself wherever it happens. See [`crate::runtime`].
+    fn shutdown_detached(loader: Option<Arc<SparseCellSetLoader>>) {
+        drop(loader);
+    }
 }
 
 #[pymethods]
@@ -2073,7 +2225,7 @@ impl SparseCellSetDataset {
         }
 
         Ok(Self {
-            loader,
+            loader: Some(loader),
             default_lookahead: lookahead,
             creation_pid: std::process::id(),
         })
@@ -2081,15 +2233,30 @@ impl SparseCellSetDataset {
 
     /// Number of `.scx` files (the `file_id` range).
     #[getter]
-    fn n_files(&self) -> usize {
-        self.loader.n_files()
+    fn n_files(&self) -> PyResult<usize> {
+        Ok(self.loader()?.n_files())
     }
 
     /// CSR column count of emitted batches (max per-file `n_vars`, or the
     /// global vocab size when remap tables were supplied).
     #[getter]
-    fn n_cols(&self) -> usize {
-        self.loader.n_cols()
+    fn n_cols(&self) -> PyResult<usize> {
+        Ok(self.loader()?.n_cols())
+    }
+
+    /// True once [`Self::close`] has run. Never raises.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.loader.is_none()
+    }
+
+    /// Release the prefetch engine's tokio runtime, bounded by a 5 s deadline,
+    /// with the GIL detached. See [`IndexPlanDataset::close`] — same hazard,
+    /// same terminal semantics, same best-effort bound when a live
+    /// `SparseCellSetBatchIter` still holds a reference.
+    fn close(&mut self, py: Python<'_>) {
+        let loader = self.loader.take();
+        py.detach(|| Self::shutdown_detached(loader));
     }
 
     /// Drive the loader from a Python iterable of batch plans, each a tuple
@@ -2107,6 +2274,9 @@ impl SparseCellSetDataset {
                  construction). The Rust shard cache and mmap state are not fork-safe.",
             ));
         }
+        // Before touching the caller's object: a closed dataset must raise the
+        // terminal-state error, not run arbitrary user `__iter__` code first.
+        let loader = self.loader()?;
         let lookahead = lookahead.unwrap_or(self.default_lookahead);
 
         let py_iter: Py<PyAny> = Python::attach(|py| -> PyResult<Py<PyAny>> {
@@ -2114,20 +2284,20 @@ impl SparseCellSetDataset {
         })?;
 
         let plan_stream = PySparseCellSetPlanIterator { py_iter };
-        let inner = Arc::clone(&self.loader).iter_with_plans(plan_stream, lookahead);
+        let inner = Arc::clone(loader).iter_with_plans(plan_stream, lookahead);
         Ok(SparseCellSetBatchIter {
             inner: Some(inner),
-            cache_metrics: self.loader.cache_metrics(),
+            cache_metrics: loader.cache_metrics(),
             thrash: ThrashSampler::new(
                 "SparseCellSetDataset",
                 // The *affordable* count, not the requested one: on a large-shard
                 // file the byte budget binds first, and a warning that says
                 // "exceeds cache_shards=128" while the budget only holds 8 sends
                 // the caller to raise a knob that cannot help.
-                self.loader.effective_cache_shards(),
-                self.loader.total_shards(),
-                self.loader.effective_cache_shards() < self.loader.cache_shards(),
-                self.loader.shard_decoded_bytes(),
+                loader.effective_cache_shards(),
+                loader.total_shards(),
+                loader.effective_cache_shards() < loader.cache_shards(),
+                loader.shard_decoded_bytes(),
             ),
         })
     }
@@ -2155,6 +2325,9 @@ impl SparseCellSetDataset {
         file_ids: Vec<u32>,
         rows: Vec<u64>,
     ) -> PyResult<usize> {
+        // Closed-state check first, so a closed dataset reports that rather
+        // than a ValueError about its arguments.
+        let loader = self.loader()?;
         if file_ids.len() != rows.len() {
             return Err(PyValueError::new_err(format!(
                 "file_ids and rows must be the same length, got {} and {}",
@@ -2162,7 +2335,7 @@ impl SparseCellSetDataset {
                 rows.len()
             )));
         }
-        Ok(py.detach(|| self.loader.plan_shard_touch_count(&file_ids, &rows)))
+        Ok(py.detach(|| loader.plan_shard_touch_count(&file_ids, &rows)))
     }
 
     /// Resolved shard-cache budget:
@@ -2178,14 +2351,12 @@ impl SparseCellSetDataset {
     /// plan-tuple term: on the sparse path the shard cache *is* the budget.
     fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
-        let budget = self.loader.cache_bytes_budget();
-        let per_shard = self.loader.shard_decoded_bytes();
+        let loader = self.loader()?;
+        let budget = loader.cache_bytes_budget();
+        let per_shard = loader.shard_decoded_bytes();
         dict.set_item("max_memory_mb", budget / (1024 * 1024))?;
-        dict.set_item("cache_shards", self.loader.cache_shards())?;
-        dict.set_item(
-            "affordable_cache_shards",
-            self.loader.effective_cache_shards(),
-        )?;
+        dict.set_item("cache_shards", loader.cache_shards())?;
+        dict.set_item("affordable_cache_shards", loader.effective_cache_shards())?;
         dict.set_item("shard_decoded_bytes", per_shard)?;
         Ok(dict)
     }
@@ -2196,15 +2367,32 @@ impl SparseCellSetDataset {
     /// `bytes_inserted`, `duplicate_waiters`, `peak_bytes_in_cache`. All `int`;
     /// atomic, lock-free — sample as often as you like.
     fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        cache_metrics_to_pydict(py, &self.loader.cache_metrics())
+        cache_metrics_to_pydict(py, &self.loader()?.cache_metrics())
     }
 
+    /// Never raises, closed or not.
     fn __repr__(&self) -> String {
-        format!(
-            "SparseCellSetDataset(n_files={}, n_cols={})",
-            self.loader.n_files(),
-            self.loader.n_cols()
-        )
+        match self.loader.as_ref() {
+            Some(l) => format!(
+                "SparseCellSetDataset(n_files={}, n_cols={})",
+                l.n_files(),
+                l.n_cols()
+            ),
+            None => "SparseCellSetDataset(closed)".to_string(),
+        }
+    }
+}
+
+impl Drop for SparseCellSetDataset {
+    /// Release the GIL around the runtime teardown on drop — see
+    /// [`IndexPlanDataset::drop`].
+    fn drop(&mut self) {
+        let loader = self.loader.take();
+        if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
+            Python::attach(|py| py.detach(|| Self::shutdown_detached(loader)));
+        } else {
+            Self::shutdown_detached(loader);
+        }
     }
 }
 
@@ -2241,7 +2429,11 @@ impl SparseCellSetBatchIter {
             }
             Some(Err(e)) => Err(loader_err_to_py(e)),
             None => {
-                self.inner = None;
+                // Off the GIL — see `IndexPlanBatchIter::__next__`. After
+                // `ds.close()` this can be what releases the last engine
+                // reference, and `Drop` cannot cover it once `inner` is taken.
+                let inner = self.inner.take();
+                py.detach(move || drop(inner));
                 Ok(None)
             }
         }
@@ -2256,6 +2448,20 @@ impl SparseCellSetBatchIter {
 
     fn __repr__(&self) -> String {
         format!("SparseCellSetBatchIter(exhausted={})", self.inner.is_none())
+    }
+}
+
+impl Drop for SparseCellSetBatchIter {
+    /// Release the GIL around dropping the inner iterator — see
+    /// [`IndexPlanBatchIter::drop`] for why this iterator, not just the
+    /// dataset, has to do it.
+    fn drop(&mut self) {
+        let inner = self.inner.take();
+        if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
+            Python::attach(|py| py.detach(move || drop(inner)));
+        } else {
+            drop(inner);
+        }
     }
 }
 
