@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use arrow::record_batch::RecordBatch;
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, Receiver, TryRecvError};
 use scx_format_io::{BackedCsrReader, ScxReader};
 use scx_sparse::ScxCsr;
 use tokio::runtime::Runtime;
@@ -1079,18 +1079,56 @@ impl IndexPlanIter {
     /// shard prefetch per shard referenced by each plan that is not already
     /// resident in the LRU.
     ///
+    /// **Prefetch depth is opportunistic, never an obligation on the plan
+    /// generator.** Only the first plan is waited for, and only when
+    /// `may_block` and the queue is empty — at that point there is nothing to
+    /// yield, so blocking is progress. Every later slot is filled with
+    /// `try_recv`, so a generator that produces plan *i+1* only after seeing
+    /// batch *i* (curriculum / feedback sampling) runs un-prefetched instead of
+    /// deadlocking against a queue that will never reach `lookahead`.
+    ///
+    /// `may_block` is the caller's, not ours: `next` calls this a second time
+    /// after popping the head purely to keep the queue warm, and at that point
+    /// `in_flight` is empty in exactly the feedback case — so deciding here on
+    /// `in_flight.is_empty()` alone would reinstate the deadlock one call
+    /// later.
+    ///
     /// On a plan-stream error, latches the error in `plan_stream_error` and
     /// stops; the iterator drains `in_flight` first and surfaces the error
     /// one-shot after the queue empties. Plain end-of-stream sets
     /// `plan_stream_done` instead.
-    fn refill(&mut self) {
+    fn refill(&mut self, may_block: bool) {
         let target = self.lookahead.max(1);
         while self.in_flight.len() < target
             && !self.plan_stream_done
             && self.plan_stream_error.is_none()
         {
-            match self.plan_rx.recv() {
-                Ok(Ok(plan)) => match self.spawn_prefetches(&plan) {
+            let item = if may_block && self.in_flight.is_empty() {
+                match self.plan_rx.recv() {
+                    Ok(item) => item,
+                    Err(_) => {
+                        // plan_tx dropped → end of stream.
+                        self.plan_stream_done = true;
+                        break;
+                    }
+                }
+            } else {
+                match self.plan_rx.try_recv() {
+                    Ok(item) => item,
+                    // Not ready is not finished. Latching `plan_stream_done`
+                    // here would end the epoch the first time a generator is
+                    // momentarily slow, silently truncating the data with no
+                    // error anywhere.
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.plan_stream_done = true;
+                        break;
+                    }
+                }
+            };
+
+            match item {
+                Ok(plan) => match self.spawn_prefetches(&plan) {
                     Ok(prefetches) => {
                         self.in_flight.push_back(InFlight { plan, prefetches });
                     }
@@ -1103,13 +1141,8 @@ impl IndexPlanIter {
                         break;
                     }
                 },
-                Ok(Err(e)) => {
+                Err(e) => {
                     self.plan_stream_error = Some(e);
-                    break;
-                }
-                Err(_) => {
-                    // plan_tx dropped → end of stream.
-                    self.plan_stream_done = true;
                     break;
                 }
             }
@@ -1216,12 +1249,16 @@ impl Iterator for IndexPlanIter {
         // Loop so empty plans are silently skipped (spec: "Plan list is empty
         // → yield no batch for that plan; continue to the next").
         loop {
-            self.refill();
+            // Nothing has been yielded yet on this call, so waiting for the
+            // first plan is the only way to make progress.
+            self.refill(true);
 
             if let Some(head) = self.in_flight.pop_front() {
                 // Refill again so the queue stays warm during the upcoming
-                // process_plan call. Errors latched here drain through later.
-                self.refill();
+                // process_plan call. Strictly non-blocking: we already hold a
+                // plan to process, and the generator may be waiting on the
+                // batch it produces. Errors latched here drain through later.
+                self.refill(false);
 
                 if head.plan.is_empty() {
                     // Skip empty plan; loop to pull the next.

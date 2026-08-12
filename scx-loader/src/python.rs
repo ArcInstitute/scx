@@ -1225,7 +1225,13 @@ impl IndexPlanDataset {
     /// Returns: an `IndexPlanBatchIter` (Python iterator) whose `__next__`
     /// yields `{"X", "X_paired", "pairs", "obs", "obs_paired"}` dicts.
     /// Plan iteration is lazy: the loader pulls the next plan only when it
-    /// is ready to schedule a prefetch for it.
+    /// is ready to schedule a prefetch for it, and **prefetch depth is
+    /// opportunistic** — the loader waits only for the first plan of each
+    /// batch, then tops the queue up with whatever the generator has already
+    /// produced. A generator that yields plan *i+1* only after inspecting
+    /// batch *i* (curriculum / feedback sampling) therefore runs correctly,
+    /// merely un-prefetched; it is never required to run `lookahead` plans
+    /// ahead of the consumer.
     #[pyo3(signature = (plans, lookahead=None))]
     fn iter_with_plans(
         &self,

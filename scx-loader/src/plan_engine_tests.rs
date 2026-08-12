@@ -251,3 +251,146 @@ fn engine_runtime_idempotent_under_concurrent_init() {
         "all threads must observe the same lazily-built runtime"
     );
 }
+
+// ---------------------------------------------------------------------
+// §9.4 — prefetch depth is opportunistic, never an obligation on the plan
+// generator. `PlanPrefetchIter::refill` had the same blocking-`recv` loop as
+// `IndexPlanIter::refill`, and deadlocked the same way against a generator
+// that produces plan i+1 only after seeing batch i.
+// ---------------------------------------------------------------------
+
+/// Run `f` on a worker thread; panic rather than hang the suite if it has not
+/// finished within `secs`.
+fn with_deadline<T: Send + 'static>(
+    secs: u64,
+    label: &'static str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(v) => v,
+        Err(_) => panic!("{label}: no result within {secs}s — the iterator deadlocked"),
+    }
+}
+
+/// A plan generator that will not produce plan `i + 1` until the consumer has
+/// acknowledged batch `i`.
+struct FeedbackPlans {
+    plans: std::vec::IntoIter<Plan>,
+    ack: Receiver<()>,
+    first: bool,
+}
+
+impl Iterator for FeedbackPlans {
+    type Item = Result<Plan>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.first {
+            self.ack.recv().ok()?;
+        }
+        self.first = false;
+        self.plans.next().map(Ok)
+    }
+}
+
+#[test]
+fn engine_feedback_generator_yields_every_batch() {
+    let plans: Vec<Plan> = vec![
+        vec![(0u32, 5u64)],
+        vec![(1u32, 30u64)],
+        vec![(0u32, 12u64)],
+        vec![(1u32, 7u64)],
+    ];
+    let want = plans.len();
+
+    let got = with_deadline(30, "engine feedback plan generator", move || {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = two_file_engine(dir.path(), 8);
+        let (ack_tx, ack_rx) = bounded(0);
+        let it = engine.iter_with_plans(
+            FeedbackPlans {
+                plans: plans.into_iter(),
+                ack: ack_rx,
+                first: true,
+            },
+            /*lookahead*/ 4,
+            rows_of,
+            gather,
+        );
+
+        let mut count = 0usize;
+        for batch in it {
+            batch.expect("batch must gather");
+            count += 1;
+            let _ = ack_tx.send(());
+        }
+        count
+    });
+
+    assert_eq!(
+        got, want,
+        "every plan must produce a batch when the generator waits on the previous one"
+    );
+}
+
+/// Red for the *wrong* fix: mapping `TryRecvError::Empty` onto
+/// `plan_stream_done` truncates the epoch to one batch, silently.
+#[test]
+fn engine_slow_generator_does_not_end_the_epoch() {
+    let plans: Vec<Plan> = (0..5u64).map(|i| vec![(0u32, i * 3)]).collect();
+    let want = plans.len();
+
+    let got = with_deadline(30, "engine slow plan generator", move || {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = two_file_engine(dir.path(), 8);
+        let slow = plans.into_iter().map(|p| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Ok(p)
+        });
+        let mut count = 0usize;
+        for batch in engine.iter_with_plans(slow, /*lookahead*/ 4, rows_of, gather) {
+            batch.expect("batch must gather");
+            count += 1;
+        }
+        count
+    });
+
+    assert_eq!(got, want, "a slow generator must not truncate the epoch");
+}
+
+/// Over-fix guard: with the generator ahead, the queue still fills to depth.
+#[test]
+fn engine_prefetch_depth_survives_when_the_generator_keeps_up() {
+    const LOOKAHEAD: usize = 4;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = two_file_engine(dir.path(), 8);
+
+    let plans: Vec<Plan> = (0..LOOKAHEAD as u64).map(|i| vec![(0u32, i * 3)]).collect();
+
+    // Exactly `LOOKAHEAD` plans into a `bounded(LOOKAHEAD)` channel, so the
+    // pull thread buffers all of them and runs to exhaustion without the
+    // consumer — which is what makes the `try_recv` arms race-free here.
+    let (drained_tx, drained_rx) = bounded(1);
+    let gen = into_iter(plans).chain(std::iter::from_fn(move || -> Option<Result<Plan>> {
+        let _ = drained_tx.send(());
+        None
+    }));
+
+    let mut it = engine.iter_with_plans(gen, LOOKAHEAD, rows_of, gather);
+    drained_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("plan generator must drain into the bounded channel");
+
+    it.next()
+        .expect("first batch")
+        .expect("first batch must gather");
+
+    assert_eq!(
+        it.in_flight.len(),
+        LOOKAHEAD - 1,
+        "the queue must still be prefetched to depth when the generator is ahead"
+    );
+}
