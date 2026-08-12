@@ -32,6 +32,10 @@ ls -l "${CONDA_PREFIX}/lib/"libnvcomp.so* 2>/dev/null || echo "WARNING: libnvcom
 echo "CONDA_PREFIX=${CONDA_PREFIX}"
 echo
 
+# This job exists to measure nvcomp. Without this, a node missing
+# libnvcomp.so.5 makes every nvcomp test a listed skip and the spike
+# reports success having measured nothing.
+export SCX_REQUIRE_NVCOMP=1
 echo "=== cargo test -p scx-gpu --release nvcomp (spike) ==="
 cargo test -p scx-gpu --release --lib --tests nvcomp -- --include-ignored --nocapture --test-threads=1
 rc=$?

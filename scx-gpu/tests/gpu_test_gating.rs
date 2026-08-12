@@ -474,6 +474,62 @@ fn scan(tree: &Path) -> Scan {
     s
 }
 
+/// `brace_block` is the primitive every rule here stands on, and it had no
+/// direct test — the integration scan only exercises it on real files, which
+/// happen to contain no brace inside a string. Each case is a shape that
+/// silently mis-scanned before the lexer landed; the lifetime case is the one
+/// that would break a naive char-literal handler.
+#[test]
+fn brace_block_skips_strings_comments_and_char_literals() {
+    for (src, label) in [
+        (
+            r#"fn t() { let s = "}"; let x = 1; }"#,
+            "close brace in a string",
+        ),
+        (r#"fn t() { let s = "{"; }"#, "open brace in a string"),
+        ("fn t() { // }\n let x = 1; }", "line comment"),
+        ("fn t() { /* } */ let x = 1; }", "block comment"),
+        (
+            "fn t() { /* /* } */ */ let x = 1; }",
+            "nested block comment",
+        ),
+        ("fn t() { let c = '}'; }", "char literal"),
+        (r##"fn t() { let r = r"}"; }"##, "raw string"),
+        (
+            r###"fn t() { let r = r#"a"}"#; }"###,
+            "raw string with hash",
+        ),
+        (
+            r#"fn t() { let s = "\""; let u = "}"; }"#,
+            "escaped quote then brace",
+        ),
+        (
+            "fn t<'a>(x: &'a str) { let _ = x; }",
+            "lifetime is not a char literal",
+        ),
+    ] {
+        let open = src.find('{').expect("fixture has a brace");
+        assert_eq!(
+            brace_block(src, 0),
+            Some((open, src.len())),
+            "{label}: body should span the whole fn"
+        );
+    }
+}
+
+/// An unbalanced block never returns a span; callers turn that into a panic
+/// rather than silently treating it as "no body".
+#[test]
+fn brace_block_reports_unbalanced_input() {
+    // Unbalanced: no closing brace before EOF.
+    assert_eq!(brace_block("fn t() { let x = 1;", 0), None);
+    // A `{` hidden in a string is not an opener, so there is none to find.
+    assert_eq!(brace_block(r#"let s = "{";"#, 0), None);
+    // Searching past the last brace finds nothing rather than panicking.
+    let src = "fn t() -> u8 { 0 }";
+    assert_eq!(brace_block(src, src.len()), None);
+}
+
 #[test]
 fn gpu_tests_are_gated_and_ignored() {
     let gpu_src = crate_root().join("src");

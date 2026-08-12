@@ -62,6 +62,7 @@ set -uo pipefail
 # `--lib --tests` keeps the flag away from rustdoc, where ```ignore fences mean
 # the same thing. SCX_REQUIRE_GPU=1 makes a missing device a failure, not a skip.
 export SCX_REQUIRE_GPU=1
+VERIFY_STATUS=0
 
 SCX_DIR=/home/nickyoungblut/dev/rust/scx
 CONDA=/home/nickyoungblut/miniforge3
@@ -124,10 +125,20 @@ run_arm() {
 echo
 echo "############ 1. cargo GPU suites (branch) ############"
 cd "${SCX_DIR}"
+# The pipe to `tail` discards cargo's status and there is no `set -e`, so
+# capture PIPESTATUS: after the #[ignore] sweep these two invocations select
+# and run all 204 GPU tests, and a silently-discarded verdict here is the same
+# bug this PR removes, at the job level.
 CARGO_TARGET_DIR=/home/nickyoungblut/.cargo-target-42-branch \
     cargo test -p scx-gpu --release --lib --tests -- --include-ignored --test-threads=1 2>&1 | tail -20
+CARGO_GPU_RC=${PIPESTATUS[0]}
 CARGO_TARGET_DIR=/home/nickyoungblut/.cargo-target-42-branch \
     cargo test -p scx-accel --features gpu --release --lib --tests -- --include-ignored --test-threads=1 2>&1 | tail -20
+CARGO_ACCEL_RC=${PIPESTATUS[0]}
+if [[ ${CARGO_GPU_RC} -ne 0 || ${CARGO_ACCEL_RC} -ne 0 ]]; then
+    echo "!! cargo GPU suites FAILED (scx-gpu=${CARGO_GPU_RC} scx-accel=${CARGO_ACCEL_RC})"
+    VERIFY_STATUS=1
+fi
 
 echo
 echo "############ 2. pytest failure-set A/B ############"
@@ -167,4 +178,5 @@ for depth in 1 4; do
 done
 
 echo
-echo "=== done; artifacts under ${OUT} ==="
+echo "=== done (status ${VERIFY_STATUS}); artifacts under ${OUT} ==="
+exit ${VERIFY_STATUS}
