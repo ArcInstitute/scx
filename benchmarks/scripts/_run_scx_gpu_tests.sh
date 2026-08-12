@@ -54,11 +54,26 @@ STATUS=0
 run_suite() {
     local name="$1"; shift
     local log="${LOG_DIR}/${name}.log"
-    echo "=== ${name} ==="
-    "$@" -- --include-ignored --nocapture --test-threads=1 2>&1 | tee "${log}"
+
+    # `--lib --tests`, NOT the default target set: `--include-ignored` is passed
+    # through to *every* harness cargo starts, including the doctest one, where
+    # a ```ignore fence means exactly the same flag. Three module-doc examples
+    # here are illustrative pseudo-code fenced that way (cusolver, cusparse,
+    # gpu_preprocess); selecting them makes rustdoc try to compile prose.
+    echo "=== ${name} (lib + integration tests) ==="
+    "$@" --lib --tests -- --include-ignored --nocapture --test-threads=1 2>&1 | tee "${log}"
     local rc=${PIPESTATUS[0]}
     if [[ ${rc} -ne 0 ]]; then
         echo "!! ${name}: cargo test exited ${rc}"
+        STATUS=1
+    fi
+
+    # Doctests, with the default selection: no GPU doctest exists to opt into.
+    echo "=== ${name} (doctests) ==="
+    "$@" --doc 2>&1 | tail -5
+    rc=${PIPESTATUS[0]}
+    if [[ ${rc} -ne 0 ]]; then
+        echo "!! ${name}: doctests exited ${rc}"
         STATUS=1
     fi
     # `--include-ignored` selects everything, so a non-zero ignored count means
