@@ -1046,15 +1046,17 @@ impl IndexPlanDataset {
     }
 
     /// Shared teardown for `close` and `Drop`. **Must be called without the
-    /// GIL**: it blocks on the tokio runtime's in-flight shard decodes.
+    /// GIL**: releasing the last reference tears the tokio runtime down, which
+    /// blocks on in-flight shard decodes.
+    ///
+    /// Just a drop — deliberately. An earlier version tried `Arc::into_inner`
+    /// here so it could call a bounded shutdown when it was the last owner, and
+    /// that is not decidable from this side: the batch iterators, the caller's
+    /// `process` closure and (previously) the prefetch tasks all hold
+    /// references. The deadline now lives in `BoundedRuntime::drop`, so the
+    /// last release bounds itself wherever it happens. See [`crate::runtime`].
     fn shutdown_detached(loader: Option<Arc<IndexPlanLoader>>) {
-        let Some(loader) = loader else { return };
-        // Sole ownership lets us bound the wait. A live `IndexPlanBatchIter`
-        // holds a reference too, in which case dropping ours here is still off
-        // the GIL, and that iterator's own `Drop` finishes the job.
-        if let Some(loader) = Arc::into_inner(loader) {
-            loader.shutdown_owned(crate::pipeline::SHUTDOWN_DEADLINE);
-        }
+        drop(loader);
     }
 }
 
@@ -1467,9 +1469,6 @@ impl Drop for IndexPlanDataset {
     /// destructors run.
     fn drop(&mut self) {
         let loader = self.loader.take();
-        if loader.is_none() {
-            return;
-        }
         if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
             Python::attach(|py| py.detach(|| Self::shutdown_detached(loader)));
         } else {
@@ -1615,9 +1614,6 @@ impl Drop for IndexPlanBatchIter {
     /// abort cannot stop a `spawn_blocking` task that has already started.
     fn drop(&mut self) {
         let inner = self.inner.take();
-        if inner.is_none() {
-            return;
-        }
         if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
             Python::attach(|py| py.detach(move || drop(inner)));
         } else {
@@ -2136,12 +2132,17 @@ impl SparseCellSetDataset {
     }
 
     /// Shared teardown for `close` and `Drop`. **Must be called without the
-    /// GIL**: it blocks on the prefetch engine's in-flight shard decodes.
+    /// GIL**: releasing the last reference tears the tokio runtime down, which
+    /// blocks on in-flight shard decodes.
+    ///
+    /// Just a drop — deliberately. An earlier version tried `Arc::into_inner`
+    /// here so it could call a bounded shutdown when it was the last owner, and
+    /// that is not decidable from this side: the batch iterators, the caller's
+    /// `process` closure and (previously) the prefetch tasks all hold
+    /// references. The deadline now lives in `BoundedRuntime::drop`, so the
+    /// last release bounds itself wherever it happens. See [`crate::runtime`].
     fn shutdown_detached(loader: Option<Arc<SparseCellSetLoader>>) {
-        let Some(loader) = loader else { return };
-        if let Some(loader) = Arc::into_inner(loader) {
-            loader.shutdown_owned(crate::pipeline::SHUTDOWN_DEADLINE);
-        }
+        drop(loader);
     }
 }
 
@@ -2273,6 +2274,9 @@ impl SparseCellSetDataset {
                  construction). The Rust shard cache and mmap state are not fork-safe.",
             ));
         }
+        // Before touching the caller's object: a closed dataset must raise the
+        // terminal-state error, not run arbitrary user `__iter__` code first.
+        let loader = self.loader()?;
         let lookahead = lookahead.unwrap_or(self.default_lookahead);
 
         let py_iter: Py<PyAny> = Python::attach(|py| -> PyResult<Py<PyAny>> {
@@ -2280,7 +2284,6 @@ impl SparseCellSetDataset {
         })?;
 
         let plan_stream = PySparseCellSetPlanIterator { py_iter };
-        let loader = self.loader()?;
         let inner = Arc::clone(loader).iter_with_plans(plan_stream, lookahead);
         Ok(SparseCellSetBatchIter {
             inner: Some(inner),
@@ -2322,6 +2325,9 @@ impl SparseCellSetDataset {
         file_ids: Vec<u32>,
         rows: Vec<u64>,
     ) -> PyResult<usize> {
+        // Closed-state check first, so a closed dataset reports that rather
+        // than a ValueError about its arguments.
+        let loader = self.loader()?;
         if file_ids.len() != rows.len() {
             return Err(PyValueError::new_err(format!(
                 "file_ids and rows must be the same length, got {} and {}",
@@ -2329,7 +2335,6 @@ impl SparseCellSetDataset {
                 rows.len()
             )));
         }
-        let loader = self.loader()?;
         Ok(py.detach(|| loader.plan_shard_touch_count(&file_ids, &rows)))
     }
 
@@ -2383,9 +2388,6 @@ impl Drop for SparseCellSetDataset {
     /// [`IndexPlanDataset::drop`].
     fn drop(&mut self) {
         let loader = self.loader.take();
-        if loader.is_none() {
-            return;
-        }
         if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
             Python::attach(|py| py.detach(|| Self::shutdown_detached(loader)));
         } else {
@@ -2455,9 +2457,6 @@ impl Drop for SparseCellSetBatchIter {
     /// dataset, has to do it.
     fn drop(&mut self) {
         let inner = self.inner.take();
-        if inner.is_none() {
-            return;
-        }
         if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
             Python::attach(|py| py.detach(move || drop(inner)));
         } else {

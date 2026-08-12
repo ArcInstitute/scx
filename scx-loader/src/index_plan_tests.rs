@@ -1170,112 +1170,107 @@ fn prefetch_depth_survives_when_the_generator_keeps_up() {
 // §9.3 — bounded, GIL-free teardown.
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// §9.3 — the teardown deadline holds regardless of who releases the last
+// reference.
+// ---------------------------------------------------------------------
+
+/// A prefetch task must not capture the loader.
+///
+/// It used to: `spawn_blocking(move || loader.backed.read_shard_cached_arc(..))`.
+/// An already-started blocking task cannot be aborted, so such a task could
+/// outlive the iterator and release the *final* loader reference — dropping the
+/// tokio runtime from one of that runtime's own threads. Capturing only the
+/// `Arc<BackedCsrReader>` means no task can ever be the last owner.
+///
+/// The gate is load-bearing. A first version of this test just counted
+/// references after `next()` returned, and **passed with the loader captured
+/// again** — the tasks had already finished and dropped their clones. Holding
+/// one in flight is what makes the count mean anything.
 #[test]
-fn shutdown_owned_without_a_built_runtime_is_a_noop() {
+fn a_prefetch_task_does_not_capture_the_loader() {
+    use std::sync::atomic::AtomicBool;
+
     let dir = tempfile::tempdir().unwrap();
-    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
-    let loader = open_loader_arc(&path);
-    assert!(
-        loader.runtime.get().is_none(),
-        "the runtime must still be lazy — otherwise this test proves nothing"
+    // Unframed: a framed file routes the scattered gather through the block
+    // index, and `spawn_prefetches` then skips warming — no task, nothing to
+    // observe.
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
+
+    let mut config = LoaderConfig::default();
+    config.normalize = false;
+    config.log1p = false;
+    config.obs_columns = vec!["cell_id".to_string()];
+    let mut raw = IndexPlanLoader::new(&path, config, 4, true, 4, 16384).unwrap();
+    raw.set_scatter_block_index(false);
+    let gate = Arc::new(AtomicBool::new(true));
+    raw.set_prefetch_gate(Arc::clone(&gate));
+    let loader = Arc::new(raw);
+
+    let mut it = Arc::clone(&loader).iter_with_plans(
+        into_plan_iter(vec![
+            vec![(0u64, 1u64)],
+            vec![(8, 12)],
+            vec![(16, 20)],
+            vec![(24, 28)],
+        ]),
+        4,
     );
-    let loader = Arc::into_inner(loader).expect("sole owner");
-    loader.shutdown_owned(std::time::Duration::from_secs(5));
-}
+    assert_eq!(
+        Arc::strong_count(&loader),
+        2,
+        "unexpected extra owner at start"
+    );
 
-#[test]
-fn shutdown_owned_returns_promptly_after_the_runtime_is_built() {
-    let elapsed = with_deadline(30, "index-plan shutdown_owned", || {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
-        let loader = open_loader_arc(&path);
-
-        // Consume an iterator so the lazy runtime is actually built and has
-        // run `spawn_blocking` prefetches.
-        let plans = vec![vec![(0u64, 1u64)], vec![(4u64, 9u64)]];
-        let mut it = loader.clone().iter_with_plans(into_plan_iter(plans), 4);
-        while let Some(b) = it.next() {
-            b.expect("batch must decode");
-        }
-        drop(it);
-        assert!(
-            loader.runtime.get().is_some(),
-            "the runtime must have been built by iteration"
-        );
-
-        let loader = Arc::into_inner(loader).expect("iter dropped, so sole owner");
-        let t0 = std::time::Instant::now();
-        loader.shutdown_owned(crate::pipeline::SHUTDOWN_DEADLINE);
-        t0.elapsed()
+    // Spawn the queue's prefetches on a background thread: the head plan's are
+    // awaited, and the gate is holding them, so `next()` would block here.
+    let handle = std::thread::spawn(move || {
+        let b = it.next();
+        (it, b)
     });
 
-    assert!(
-        elapsed < crate::pipeline::SHUTDOWN_DEADLINE,
-        "an idle runtime must shut down well inside the deadline, took {elapsed:?}"
-    );
-}
+    // Give the tasks time to be spawned and park on the gate.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let held = Arc::strong_count(&loader);
+    gate.store(false, std::sync::atomic::Ordering::Release);
 
-/// The iterator can be the **last** owner of the loader, and that path must take
-/// the bounded shutdown rather than a plain `Runtime::drop`.
-///
-/// Ordering is the one the Python API explicitly supports — `ds.close()` while a
-/// batch iterator is still alive, then drain it. Before this, the dataset's
-/// `close` failed to unwrap the `Arc`, the iterator's drop just released its
-/// reference, and the runtime went down through an unbounded plain drop.
-#[test]
-fn an_iter_that_is_the_last_owner_takes_the_bounded_shutdown() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
-
-    let before = SHUTDOWN_OWNED_CALLS.with(|c| c.get());
-
-    let loader = open_loader_arc(&path);
-    let plans = vec![vec![(0u64, 1u64)], vec![(4u64, 9u64)]];
-    let mut it = Arc::clone(&loader).iter_with_plans(into_plan_iter(plans), 4);
-
-    // The `ds.close()` half: the dataset's reference goes away while the
-    // iterator is still live and mid-stream.
-    drop(loader);
-
-    while let Some(b) = it.next() {
-        b.expect("batch must decode");
-    }
-    // …and the drain finishes on the iterator, which is now the sole owner.
+    let (it, batch) = handle.join().expect("worker must not panic");
+    batch.expect("a batch").expect("must decode");
     drop(it);
 
     assert_eq!(
-        SHUTDOWN_OWNED_CALLS.with(|c| c.get()),
-        before + 1,
-        "the iterator was the last owner, so its drop must go through \
-         shutdown_owned — a plain Runtime::drop is unbounded"
+        held, 2,
+        "a prefetch task in flight is holding an Arc<IndexPlanLoader> \
+         (strong_count={held}); such a task can outlive the iterator and drop \
+         the runtime from a runtime thread"
     );
 }
 
-/// `shutdown_owned` must return at its deadline instead of waiting for a
-/// blocking task that overruns it. This is the property the whole consuming
-/// signature exists for, and the only test here that can distinguish
-/// `shutdown_timeout` from a plain drop by behaviour rather than instrumentation.
+/// Whoever releases the last reference gets the bounded teardown — including
+/// the iterator, which is the last owner after the advertised
+/// `ds.close(); list(it)` ordering.
 #[test]
-fn shutdown_owned_returns_at_the_deadline_rather_than_joining_a_slow_task() {
+fn the_iterator_as_last_owner_still_gets_a_bounded_teardown() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+
+    let before = crate::runtime::BOUNDED_SHUTDOWNS.with(|c| c.get());
+
     let loader = open_loader_arc(&path);
+    let mut it = Arc::clone(&loader)
+        .iter_with_plans(into_plan_iter(vec![vec![(0u64, 1u64)], vec![(4, 9)]]), 4);
+    it.next().expect("first batch").expect("must decode"); // forces the runtime
 
-    // Force the lazy runtime, then park one blocking task well past any
-    // deadline we would use.
-    let handle = loader.runtime().expect("runtime").handle().clone();
-    handle.spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(60)));
-    // Let it actually start; `shutdown_timeout` only waits on *started* tasks.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    drop(loader); // the `ds.close()` half — the iter is now the only owner
+    while let Some(b) = it.next() {
+        b.expect("must decode");
+    }
+    drop(it);
 
-    let loader = Arc::into_inner(loader).expect("sole owner");
-    let t0 = std::time::Instant::now();
-    loader.shutdown_owned(std::time::Duration::from_millis(200));
-    let elapsed = t0.elapsed();
-
-    assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "shutdown_owned waited {elapsed:?} — it joined the 60s task instead of \
-         abandoning it at the deadline"
+    assert_eq!(
+        crate::runtime::BOUNDED_SHUTDOWNS.with(|c| c.get()),
+        before + 1,
+        "the iterator released the last reference, so the runtime must have \
+         gone down through BoundedRuntime::drop"
     );
 }

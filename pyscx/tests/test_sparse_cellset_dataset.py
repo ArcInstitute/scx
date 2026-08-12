@@ -291,3 +291,55 @@ def test_teardown_mid_flight_is_bounded(two_scx):
     del it
     elapsed = time.monotonic() - t0
     assert elapsed < 10.0, f"mid-flight teardown took {elapsed:.2f}s"
+
+
+def test_close_then_drain_the_iterator(two_scx):
+    """The twin of `IndexPlanDataset`'s namesake, on the path where the
+    ownership graph is worse.
+
+    Here the iterator's stored `process` closure owns an
+    `Arc<SparseCellSetLoader>` which owns a second `Arc<PrefetchEngine>`, so
+    `close()` cannot reach the engine and neither can the iterator's own `Drop`
+    body (a `Drop` body runs before its struct's fields). The teardown deadline
+    therefore lives in the runtime newtype itself, and this exercises the
+    ordering end to end.
+    """
+    import time
+
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    plans = [([0, 1], [i, i + 1], [0, 1], [0, 1, 2]) for i in range(4)]
+    it = ds.iter_with_plans(iter(plans), lookahead=4)
+    next(it)
+    ds.close()
+
+    t0 = time.monotonic()
+    rest = list(it)
+    elapsed = time.monotonic() - t0
+
+    assert len(rest) == 3, "closing the dataset must not truncate a live iterator"
+    assert elapsed < 10.0, f"drain-after-close took {elapsed:.2f}s"
+    assert list(it) == []
+
+
+def test_closed_dataset_raises_before_running_user_code(two_scx):
+    """A closed dataset must report *that*, not run the caller's `__iter__`
+    first and surface whatever it raises."""
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    ds.close()
+
+    class Exploding:
+        def __iter__(self):
+            raise AssertionError("user __iter__ ran on a closed dataset")
+
+    with pytest.raises(RuntimeError, match="closed"):
+        ds.iter_with_plans(Exploding())
+
+    # Same for the argument-validation path: closed beats ValueError.
+    with pytest.raises(RuntimeError, match="closed"):
+        ds.suggested_cache_shards([0, 0], [1])

@@ -360,23 +360,6 @@ impl SparseCellSetLoader {
         self.engine.cache_metrics()
     }
 
-    /// Consume the loader and shut the underlying engine's tokio runtime down
-    /// with a bounded wait.
-    ///
-    /// **The caller must not hold the GIL** — see
-    /// [`crate::index_plan::IndexPlanLoader::shutdown_owned`].
-    ///
-    /// Best-effort by construction: the timed shutdown only happens when this
-    /// loader holds the last reference to the engine. A live
-    /// `SparseCellSetBatchIter` holds one too, in which case this just releases
-    /// ours and the engine is torn down when that iterator drops (which is
-    /// itself off-GIL — see `SparseCellSetBatchIter::drop`).
-    pub fn shutdown_owned(self, deadline: std::time::Duration) {
-        if let Some(engine) = Arc::into_inner(self.engine) {
-            engine.shutdown_owned(deadline);
-        }
-    }
-
     /// CSR column count of emitted batches.
     pub fn n_cols(&self) -> usize {
         self.n_cols

@@ -388,11 +388,19 @@ plan *i+1* from batch *i* — curriculum sampling, hard-negative mining, anythin
 with a feedback signal — is supported directly:
 
 ```python
+# The loader advances the generator with `next()`, never `.send()`, so feed the
+# batch back through shared state — `batch = yield plan` would always bind None.
+state = {"batch": None}
+
 def curriculum(model):
     plan = initial_plan()
     while True:
-        batch = yield plan
-        plan = next_plan_from(model, batch)   # needs the previous batch
+        yield plan
+        plan = next_plan_from(model, state["batch"])   # needs the previous batch
+
+for batch in ds.iter_with_plans(curriculum(model)):
+    state["batch"] = batch
+    ...
 ```
 
 Such a generator simply runs un-prefetched (effectively `lookahead=0`) while it

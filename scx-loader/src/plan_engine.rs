@@ -44,20 +44,13 @@ pub struct PrefetchEngine {
     readers: Vec<Arc<BackedCsrReader>>,
     /// Lazily built so it is never inherited across a fork — mirrors
     /// `IndexPlanLoader`. Built on the first `iter_with_plans` consumption.
-    runtime: OnceLock<Runtime>,
+    runtime: OnceLock<crate::runtime::BoundedRuntime>,
     /// Default lookahead depth (overridable per `iter_with_plans` call).
     default_lookahead: usize,
     /// Shared handle to the readers' one `SharedShardCache` counters
     /// (hits / misses / evictions / …). Mirrors `IndexPlanLoader::cache_metrics`;
     /// always populated (a zeroed default when no reader enabled metrics).
     cache_metrics: Arc<CacheMetrics>,
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Times `shutdown_owned` ran on *this* thread. See its body.
-    pub(crate) static SHUTDOWN_OWNED_CALLS: std::cell::Cell<u32> =
-        const { std::cell::Cell::new(0) };
 }
 
 impl PrefetchEngine {
@@ -134,7 +127,7 @@ impl PrefetchEngine {
     /// forked child starts with an empty `OnceLock`.
     fn runtime(&self) -> Result<&Runtime> {
         if let Some(rt) = self.runtime.get() {
-            return Ok(rt);
+            return Ok(rt.get());
         }
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -146,29 +139,12 @@ impl PrefetchEngine {
                     "failed to create tokio runtime for PrefetchEngine: {e}"
                 ))
             })?;
-        Ok(self.runtime.get_or_init(|| rt))
-    }
-
-    /// Consume the engine and shut its tokio runtime down with a bounded wait.
-    ///
-    /// **The caller must not hold the GIL** — see
-    /// [`crate::index_plan::IndexPlanLoader::shutdown_owned`] for why a plain
-    /// GIL-held drop freezes every other Python thread for the length of an
-    /// in-flight shard decode.
-    pub fn shutdown_owned(self, deadline: std::time::Duration) {
-        // Test-only observation of *which path* tore the runtime down. A plain
-        // `Runtime::drop` and a `shutdown_timeout` are indistinguishable at
-        // fixture scale (both return in microseconds), so without this a test
-        // cannot tell the bounded path from the unbounded one. Thread-local,
-        // not a global counter: `cargo test` runs tests in parallel and the
-        // drops under test happen on the test's own thread.
-        #[cfg(test)]
-        SHUTDOWN_OWNED_CALLS.with(|c| c.set(c.get() + 1));
-
-        // No `Drop` impl on `PrefetchEngine`, so the partial move is legal.
-        if let Some(rt) = self.runtime.into_inner() {
-            rt.shutdown_timeout(deadline);
-        }
+        Ok(self
+            .runtime
+            .get_or_init(|| {
+                crate::runtime::BoundedRuntime::new(rt, crate::pipeline::SHUTDOWN_DEADLINE)
+            })
+            .get())
     }
 
     /// Stream `plans` through the engine, pipelining shard prefetch ahead of
@@ -206,7 +182,7 @@ impl PrefetchEngine {
             .ok();
 
         PlanPrefetchIter {
-            engine: Some(self),
+            engine: self,
             plan_rx,
             plan_thread,
             in_flight: VecDeque::with_capacity(cap),
@@ -229,9 +205,7 @@ struct InFlight<P> {
 
 /// Iterator returned by [`PrefetchEngine::iter_with_plans`].
 pub struct PlanPrefetchIter<P, T, RowsFn, ProcFn> {
-    /// Always `Some` until `Drop` takes it to run the bounded shutdown. Read
-    /// through [`Self::engine`] rather than directly.
-    engine: Option<Arc<PrefetchEngine>>,
+    engine: Arc<PrefetchEngine>,
     plan_rx: Receiver<Result<P>>,
     /// Detached on drop — the pull worker exits when `plan_rx` drops or the
     /// user iterator ends.
@@ -334,13 +308,13 @@ where
             by_file.entry(fid).or_default().push(row);
         }
 
-        let handle = self.engine().runtime()?.handle().clone();
+        let handle = self.engine.runtime()?.handle().clone();
         let mut joins = Vec::new();
         for (fid, rs) in by_file {
             // Prefetch is best-effort: an out-of-range `file_id` from an
             // untrusted plan is skipped here (no panic) and surfaces as a
             // clean error from `SparseCellSetLoader::gather`'s validation.
-            let Some(reader) = self.engine().readers.get(fid as usize) else {
+            let Some(reader) = self.engine.readers.get(fid as usize) else {
                 continue;
             };
             // Dedup rows + count unique rows per shard (matches the gather's
@@ -377,7 +351,7 @@ where
     /// Block on every prefetch handle for the head plan, surfacing the first
     /// shard read error or join panic.
     fn await_head(&self, prefetches: Vec<ShardJoin>) -> Result<()> {
-        let runtime = self.engine().runtime()?;
+        let runtime = self.engine.runtime()?;
         for h in prefetches {
             match runtime.block_on(h) {
                 Ok(Ok(_arc_shard)) => {
@@ -416,7 +390,7 @@ where
             if let Err(e) = self.await_head(head.prefetches) {
                 return Some(Err(e));
             }
-            return Some((self.process)(self.engine(), &head.plan));
+            return Some((self.process)(&self.engine, &head.plan));
         }
 
         // Queue empty — surface a deferred plan-stream error one-shot.
@@ -430,16 +404,13 @@ where
 }
 
 impl<P, T, RowsFn, ProcFn> Drop for PlanPrefetchIter<P, T, RowsFn, ProcFn> {
-    /// Releases the prefetches and the pull worker, then — **if this iter holds
-    /// the last `Arc<PrefetchEngine>`** — tears the runtime down with the
-    /// bounded `shutdown_owned`. See [`crate::index_plan::IndexPlanIter`]'s
-    /// `Drop` for the ordering that makes the iter the last owner.
-    ///
-    /// Note the engine Arc is a *separate* edge from the loader Arc:
-    /// `SparseCellSetLoader` and this iter each hold one, so a
-    /// `SparseCellSetDataset::close()` can successfully unwrap the loader and
-    /// still fail to unwrap the engine underneath it. That is exactly the case
-    /// this bound covers.
+    /// Releases the prefetches and the pull worker. The runtime teardown is
+    /// *not* done here: this iter is not reliably the last owner — the caller's
+    /// `process` closure is a field of this very struct and, on the sparse
+    /// path, owns an `Arc<SparseCellSetLoader>` that owns another engine `Arc`.
+    /// A `Drop` body runs before its struct's fields, so any `Arc::into_inner`
+    /// attempted here fails deterministically. The deadline lives in
+    /// `BoundedRuntime::drop` instead — see [`crate::runtime`].
     fn drop(&mut self) {
         // Abort every in-flight shard prefetch, mirroring `IndexPlanLoader::drop`.
         // Without this, up to `lookahead` `spawn_blocking` decodes keep running on
@@ -457,22 +428,6 @@ impl<P, T, RowsFn, ProcFn> Drop for PlanPrefetchIter<P, T, RowsFn, ProcFn> {
         // worker parked in `send` would block us. Taking the handle here also
         // marks the field as read.
         let _ = self.plan_thread.take();
-
-        if let Some(engine) = self.engine.take() {
-            if let Some(engine) = Arc::into_inner(engine) {
-                engine.shutdown_owned(crate::pipeline::SHUTDOWN_DEADLINE);
-            }
-        }
-    }
-}
-
-impl<P, T, RowsFn, ProcFn> PlanPrefetchIter<P, T, RowsFn, ProcFn> {
-    /// The engine. `None` only inside `Drop`, after the Arc has been handed to
-    /// the bounded shutdown, and nothing reads it after that point.
-    fn engine(&self) -> &Arc<PrefetchEngine> {
-        self.engine
-            .as_ref()
-            .expect("PlanPrefetchIter::engine is taken only by Drop")
     }
 }
 
