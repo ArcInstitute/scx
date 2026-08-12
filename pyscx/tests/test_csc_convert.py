@@ -226,6 +226,67 @@ def test_every_preset_aware_entry_point_defaults_csc_to_none():
     )
 
 
+def _pyfunction_blocks():
+    """(name, signature_attr, body) for every `#[pyfunction]` in lib.rs.
+
+    Each block runs from one `#[pyfunction]` to the next, so `body` is the
+    whole function including its attributes.
+    """
+    import pathlib
+    import re
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "lib.rs"
+    if not src.is_file():
+        pytest.skip(f"pyscx Rust source not available at {src}")
+
+    blocks = []
+    for chunk in src.read_text().split("#[pyfunction]")[1:]:
+        sig = re.search(r"#\[pyo3\(signature = \((.*?)\)\)\]", chunk, re.DOTALL)
+        name = re.search(r"\bfn\s+(\w+)\s*\(", chunk)
+        if sig and name:
+            blocks.append((name.group(1), sig.group(1), chunk))
+    return blocks
+
+
+def test_every_preset_aware_entry_point_calls_resolve_csc_policy():
+    """`csc=None` is necessary but not sufficient — resolution must run.
+
+    Declaring `csc=None` only makes the upgrade *possible*. An entry point
+    that then did `csc.unwrap_or("off")`, or passed the `Option` on to a
+    default of its own, would satisfy the signature guard above and
+    silently reintroduce exactly the opt-out this PR fixes.
+
+    So assert the other half at the source: every `#[pyfunction]` whose
+    pyo3 signature carries both `csc` and `index_preset` must call
+    `resolve_csc_policy` in its body.
+
+    Scope, stated so it is not over-trusted: this reads `src/lib.rs` only,
+    where all four conversion entry points live today. A preset-aware
+    entry point added in another module would escape *this* test — the
+    runtime signature guard above is the one that covers any module,
+    because it introspects the built extension rather than a file.
+    """
+    blocks = _pyfunction_blocks()
+    assert blocks, "parsed no #[pyfunction] blocks out of lib.rs — the scan is broken"
+
+    preset_aware = [
+        (name, body)
+        for name, sig, body in blocks
+        if "csc=" in sig and "index_preset=" in sig
+    ]
+    assert preset_aware, (
+        "found no #[pyfunction] taking both `csc` and `index_preset` — "
+        "discovery is broken, not the surface"
+    )
+
+    missing = [n for n, body in preset_aware if "resolve_csc_policy" not in body]
+    assert not missing, (
+        f"these entry points accept both `csc` and `index_preset` but never "
+        f"call `resolve_csc_policy`, so an accel-ready preset cannot upgrade "
+        f"an unset `csc`: {missing}."
+    )
+
+
 # ---------------------------------------------------------------------------
 # The same preset trio, run through `from_10x` — the entry point the signature
 # guard above catches statically. These assert the resolution actually reaches

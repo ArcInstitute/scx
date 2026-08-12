@@ -758,7 +758,9 @@ methods (covariance and randomized SVD) explicitly reject
 The `csc` knob on the conversion entry points (`pyscx.from_anndata` /
 `from_h5ad` / `from_10x`, `scx convert --csc`) is a three-state policy:
 
-- **`off`** (default) — never emit a CSC sidecar; CSR-only output.
+- **`off`** — never emit a CSC sidecar; CSR-only output. This is what an
+  unset `csc` resolves to *unless* an accel-ready `index_preset` upgrades
+  it (see below) — the default is deferred, not a pinned `"off"`.
 - **`always`** — always emit a CSC sidecar regardless of dataset size.
 - **`auto`** — emit a sidecar only when the dataset is large enough that the
   column-axis acceleration pays for the extra write-time transpose and
