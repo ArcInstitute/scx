@@ -2600,8 +2600,14 @@ schema matches `TrainingDataset`.
   waits for the first plan of a batch and fills the remaining slots only from
   plans the generator has already produced. A generator that yields plan *i+1*
   only after inspecting batch *i* — curriculum sampling, hard-negative mining —
-  runs correctly, merely un-prefetched. (Before v0.13.1 it deadlocked: the
-  generator waited for the batch, the loader waited for `lookahead` plans.)
+  therefore makes progress rather than deadlocking; it simply runs
+  un-prefetched. (Before v0.13.1 it hung: the generator waited for the batch,
+  the loader waited for `lookahead` plans.)
+- The plan-pull thread is eager and never waits for the consumer, so such a
+  generator must **block on an explicit feedback signal** after `yield` — the
+  loader will otherwise ask for the next plan before the current batch exists.
+  See [training.md § Feedback and curriculum plan generators](training.md#feedback-and-curriculum-plan-generators)
+  for the rendezvous.
 - `StopIteration` from `plans` ends the batch stream cleanly. Other Python
   exceptions from `plans` propagate as `RuntimeError("plan iterator raised: ...")`.
 - Empty plans inside a stream are silently skipped.

@@ -160,13 +160,14 @@ pub struct IndexPlanLoader {
     /// full-shard-decodes. The process-wide reader default still comes from
     /// `SCX_SCATTER_BLOCK_INDEX`.
     scatter_block_index: bool,
-    /// Test-only: when set, every prefetch task parks until it is cleared.
-    /// Holding a task *in flight* is the only way to observe whether its
-    /// closure captured the loader; without it the task finishes before the
-    /// assertion runs and the test passes on the broken code. Per-loader rather
-    /// than a global so parallel tests do not stall each other's prefetches.
+    /// Test-only: when set, every prefetch task announces itself and then parks
+    /// until released. Holding a task *in flight* is the only way to observe
+    /// whether its closure captured the loader; without it the task finishes
+    /// before the assertion runs and the test passes on the broken code.
+    /// Per-loader rather than a global so parallel tests do not stall each
+    /// other's prefetches.
     #[cfg(test)]
-    prefetch_gate: Option<Arc<std::sync::atomic::AtomicBool>>,
+    prefetch_gate: Option<Arc<PrefetchGate>>,
 }
 
 impl IndexPlanLoader {
@@ -546,9 +547,9 @@ impl IndexPlanLoader {
     /// disables **both** the L1 gather adoption and the L2 prefetch skip — a
     /// `scatter_block_index=False` file full-shard-decodes, no leak via L1. See
     /// [`Self::scatter_block_index`].
-    /// Test-only: park every prefetch task on `gate` until it is set false.
+    /// Test-only: park every prefetch task on `gate` until it is released.
     #[cfg(test)]
-    pub(crate) fn set_prefetch_gate(&mut self, gate: Arc<std::sync::atomic::AtomicBool>) {
+    pub(crate) fn set_prefetch_gate(&mut self, gate: Arc<PrefetchGate>) {
         self.prefetch_gate = Some(gate);
     }
 
@@ -1000,6 +1001,54 @@ impl IndexPlanLoader {
     }
 }
 
+/// Test-only rendezvous for holding prefetch tasks in flight.
+///
+/// `started` must be signalled *before* parking: a test that infers "a task is
+/// running" from a sleep passes on a loaded machine even when the closure has
+/// regressed to capturing the loader, which is precisely the blindness this
+/// gate exists to remove.
+#[cfg(test)]
+pub(crate) struct PrefetchGate {
+    started: AtomicU64,
+    hold: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl PrefetchGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: AtomicU64::new(0),
+            hold: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Called from inside a prefetch task: announce, then park.
+    fn enter(&self) {
+        self.started.fetch_add(1, Ordering::AcqRel);
+        while self.hold.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Block until at least one task has entered, or fail after `timeout`.
+    /// Returning `false` means the test could not establish its premise and
+    /// must fail rather than assert against an empty runtime.
+    pub(crate) fn wait_for_entry(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self.started.load(Ordering::Acquire) > 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    }
+
+    pub(crate) fn release(&self) {
+        self.hold.store(false, Ordering::Release);
+    }
+}
+
 /// Per-plan in-flight state: the plan itself plus one `spawn_blocking` join
 /// handle per shard scheduled for prefetch (cached / in-flight shards are
 /// filtered out by the iter pre-check before this Vec is built).
@@ -1251,9 +1300,7 @@ impl IndexPlanIter {
                 handle.spawn_blocking(move || {
                     #[cfg(test)]
                     if let Some(gate) = gate {
-                        while gate.load(Ordering::Acquire) {
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                        }
+                        gate.enter();
                     }
                     backed.read_shard_cached_arc(sidx)
                 })
@@ -1325,23 +1372,22 @@ impl Iterator for IndexPlanIter {
 }
 
 impl Drop for IndexPlanIter {
-    /// Release the prefetch tasks and the plan-pull thread, then — **if this
-    /// iter turns out to hold the last `Arc<IndexPlanLoader>`** — tear the
-    /// tokio runtime down with the bounded `shutdown_owned`.
+    /// Release the prefetch tasks and the plan-pull thread.
     ///
-    /// The iter really can be the last owner, and the ordering that gets there
-    /// is one the API explicitly supports:
+    /// The runtime teardown is deliberately **not** here. This iter really can
+    /// hold the last `Arc<IndexPlanLoader>` — the API supports
     ///
     /// ```python
     /// it = ds.iter_with_plans(...)
     /// ds.close()     # releases the dataset's Arc; the iter still holds one
-    /// list(it)       # this drop is what releases the runtime
+    /// list(it)       # this is what releases the runtime
     /// ```
     ///
-    /// Doing the bounded teardown here rather than in the `#[pyclass]` wrapper
-    /// is what makes it unconditional: `IndexPlanBatchIter::__next__` also
-    /// drops the inner iter on end-of-stream, and that path would otherwise
-    /// take a plain unbounded `Runtime::drop`.
+    /// — but it cannot reliably *know* that it does, so it does not try. The
+    /// deadline lives in `BoundedRuntime::drop`, which the loader's `OnceLock`
+    /// holds; it fires when the loader field of this struct drops, just after
+    /// this body returns. See [`crate::runtime`] for the two ownership cases
+    /// that made the "last owner calls shutdown" shape unworkable.
     fn drop(&mut self) {
         // Abort any outstanding prefetch handles so the runtime threads
         // stop blocking on shards we no longer need.

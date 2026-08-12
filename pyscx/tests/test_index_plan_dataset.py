@@ -1061,12 +1061,12 @@ class TestCloseAndTeardown:
         prefetches in flight was measured at ~9 ms, so a threshold that could
         see either property would be flaky and a stable one passes on broken
         code. Both are pinned in Rust instead, where the mechanism can be
-        exercised directly: `an_iter_that_is_the_last_owner_takes_the_bounded_shutdown`
-        proves this path reaches `shutdown_owned`, and
-        `shutdown_owned_returns_at_the_deadline_rather_than_joining_a_slow_task`
-        proves `shutdown_owned` abandons an overrunning task (60 s task, 200 ms
-        deadline). GIL release remains carried by construction, mirroring
-        `TrainingDataset::drop`.
+        exercised directly: `runtime::tests::drop_abandons_a_task_that_overruns_the_deadline`
+        proves the bound (60 s task, 200 ms deadline), and
+        `the_iterator_as_last_owner_still_gets_a_bounded_teardown` plus the
+        sparse `teardown_through_the_real_iter_ownership_graph_is_bounded`
+        prove it fires on the ownership paths this test walks. GIL release
+        remains carried by construction, mirroring `TrainingDataset::drop`.
         """
         import time
 

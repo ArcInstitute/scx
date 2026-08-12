@@ -277,11 +277,9 @@ pyo3 drops a `#[pyclass]` with the GIL held, and dropping a tokio runtime blocks
 until every already-started `spawn_blocking` returns — for these loaders, a
 `read_shard_cached_arc` decode that can be hundreds of megabytes of Pcodec. All
 four dataset classes therefore detach the GIL around teardown, in both `close()`
-and `Drop`, and bound the wait by `SHUTDOWN_DEADLINE` (5 s):
-`TrainingPipeline::shutdown` for the two training classes,
-`{IndexPlanLoader,PrefetchEngine,SparseCellSetLoader}::shutdown_owned` for the
-other two. `shutdown_owned` consumes the value so it can take the runtime out of
-its `OnceLock` and call `shutdown_timeout` rather than a plain unbounded drop.
+and `Drop`, and bound the wait by `SHUTDOWN_DEADLINE` (5 s) —
+`TrainingPipeline::shutdown` for the two training classes, and for the other two
+the mechanism below.
 
 The batch iterators must do the same, and for a reason easy to miss: each holds
 its own `Arc` to the loader, so in the ordinary

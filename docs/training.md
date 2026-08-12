@@ -387,21 +387,42 @@ with whatever the generator has already produced, so a generator that computes
 plan *i+1* from batch *i* — curriculum sampling, hard-negative mining, anything
 with a feedback signal — is supported directly:
 
+Two properties of the loader shape the code you have to write:
+
+1. It advances the generator with `next()`, never `.send()` — so
+   `batch = yield plan` binds `None`, not the batch.
+2. The plan-pull thread does **not** wait for the consumer. After `yield`, it
+   sends the plan and immediately asks for the next one, up to the channel's
+   capacity — so reading a shared variable straight after `yield` reads the
+   *previous* iteration's value, or `None` on the first.
+
+So the feedback has to be an explicit rendezvous: publish the batch, then
+signal, and have the generator block on that signal before answering.
+
 ```python
-# The loader advances the generator with `next()`, never `.send()`, so feed the
-# batch back through shared state — `batch = yield plan` would always bind None.
+import threading
+
+published = threading.Semaphore(0)
 state = {"batch": None}
 
 def curriculum(model):
     plan = initial_plan()
     while True:
         yield plan
-        plan = next_plan_from(model, state["batch"])   # needs the previous batch
+        # Block until the consumer has published the batch for the plan just
+        # yielded. Without this the loader asks for the next plan immediately
+        # and `state["batch"]` is still the previous one.
+        published.acquire()
+        plan = next_plan_from(model, state["batch"])
 
 for batch in ds.iter_with_plans(curriculum(model)):
-    state["batch"] = batch
+    state["batch"] = batch     # publish first…
+    published.release()        # …then signal
     ...
 ```
+
+`pyscx/tests/test_index_plan_dataset.py::TestFeedbackPlanGenerator` is the
+executable version of this.
 
 Such a generator simply runs un-prefetched (effectively `lookahead=0`) while it
 is the bottleneck, and regains depth whenever it runs ahead. It is never

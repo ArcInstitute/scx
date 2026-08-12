@@ -1183,14 +1183,15 @@ fn prefetch_depth_survives_when_the_generator_keeps_up() {
 /// tokio runtime from one of that runtime's own threads. Capturing only the
 /// `Arc<BackedCsrReader>` means no task can ever be the last owner.
 ///
-/// The gate is load-bearing. A first version of this test just counted
-/// references after `next()` returned, and **passed with the loader captured
-/// again** — the tasks had already finished and dropped their clones. Holding
-/// one in flight is what makes the count mean anything.
+/// The gate is load-bearing, and so is its *start signal*. A first version
+/// counted references after `next()` returned and **passed with the loader
+/// captured again** — the tasks had already finished. A second version parked
+/// them but inferred "a task is running" from a 300 ms sleep, which fails the
+/// same way on a loaded machine: no task started, nothing held, count clean.
+/// The gate now announces entry before parking, and the test fails outright if
+/// no task announces.
 #[test]
 fn a_prefetch_task_does_not_capture_the_loader() {
-    use std::sync::atomic::AtomicBool;
-
     let dir = tempfile::tempdir().unwrap();
     // Unframed: a framed file routes the scattered gather through the block
     // index, and `spawn_prefetches` then skips warming — no task, nothing to
@@ -1203,7 +1204,7 @@ fn a_prefetch_task_does_not_capture_the_loader() {
     config.obs_columns = vec!["cell_id".to_string()];
     let mut raw = IndexPlanLoader::new(&path, config, 4, true, 4, 16384).unwrap();
     raw.set_scatter_block_index(false);
-    let gate = Arc::new(AtomicBool::new(true));
+    let gate = Arc::new(PrefetchGate::new());
     raw.set_prefetch_gate(Arc::clone(&gate));
     let loader = Arc::new(raw);
 
@@ -1229,15 +1230,22 @@ fn a_prefetch_task_does_not_capture_the_loader() {
         (it, b)
     });
 
-    // Give the tasks time to be spawned and park on the gate.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Wait for a task to actually announce itself. A sleep here would let the
+    // test pass on a loaded machine with the bug present: no task started, so
+    // no task is holding anything, so the count looks clean.
+    let entered = gate.wait_for_entry(std::time::Duration::from_secs(30));
     let held = Arc::strong_count(&loader);
-    gate.store(false, std::sync::atomic::Ordering::Release);
+    gate.release();
 
     let (it, batch) = handle.join().expect("worker must not panic");
     batch.expect("a batch").expect("must decode");
     drop(it);
 
+    assert!(
+        entered,
+        "no prefetch task started within 30s — the premise never held, so the \
+         ownership assertion below would have been vacuous"
+    );
     assert_eq!(
         held, 2,
         "a prefetch task in flight is holding an Arc<IndexPlanLoader> \
