@@ -7,7 +7,15 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-scx-format-io = { path = "../scx-format-io", features = ["deletion-vectors"] }
+# `parallel` is a default feature, but it is named explicitly because the loader
+# depends on it structurally: `BackedCsrReader::set_cpu_pool` — the fork guard
+# that keeps a forked DataLoader worker off rayon's dead global registry — only
+# exists under it. Without it here, a future `default-features = false` would
+# surface as "no method named set_cpu_pool" rather than as a feature problem.
+scx-format-io = { path = "../scx-format-io", features = [
+    "deletion-vectors",
+    "parallel",
+] }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 # v4 PFlog α estimator (estimate_alpha) — used at loader construction when

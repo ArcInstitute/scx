@@ -674,47 +674,54 @@ pub fn collate_gathered(
     let mut target = vec![0f32; n_rows * k_dec];
     let mut library = vec![0f32; n_rows];
 
-    enc_ids
-        .par_chunks_mut(k_enc)
-        .zip(enc_counts.par_chunks_mut(k_enc))
-        .zip(enc_mask.par_chunks_mut(k_enc))
-        .zip(enc_pad.par_chunks_mut(k_enc))
-        .zip(target.par_chunks_mut(k_dec))
-        .zip(library.par_iter_mut())
-        .enumerate()
-        .for_each(|(r, (((((eid, ecnt), emask), epad), tgt), libslot))| {
-            let s = row_set[r];
-            let lo = indptr[r] as usize;
-            let hi = indptr[r + 1] as usize;
-            let cin = CellIn {
-                gene_ids: &indices[lo..hi],
-                raw: &data[lo..hi],
-                query: &query_gene_ids[s * k_dec..(s + 1) * k_dec],
-                enc_mask_positions: if has_mask {
-                    Some(&enc_mask_positions[r * k_dec..(r + 1) * k_dec])
-                } else {
-                    None
-                },
-                hide_readout: hide_readout[r] != 0,
-            };
-            let cfg = CollateConfig {
-                k_enc,
-                mode: scalars.mode,
-                target_sum: scalars.target_sum,
-                n_measured: n_measured[s] as usize,
-                pflog_alpha: scalars.pflog_alpha,
-                n_genes_total: scalars.n_genes_total,
-                lib_size_redef: scalars.lib_size_redef,
-            };
-            let mut out = CellOut {
-                enc_ids: eid,
-                enc_counts: ecnt,
-                enc_mask: emask,
-                enc_pad: epad,
-                target: tgt,
-            };
-            *libslot = collate_cell(&cin, &cfg, &mut out);
-        });
+    // On the loader's pool, never rayon's global registry. This kernel is
+    // exposed as `pyscx.collate_cellset_gathered`, so a forked DataLoader
+    // worker can call it with no dataset in hand and therefore no PID check in
+    // front of it — and a global-pool dispatch from a forked child hangs
+    // forever. See `crate::pool`.
+    crate::pool::cpu_pool().install(|| {
+        enc_ids
+            .par_chunks_mut(k_enc)
+            .zip(enc_counts.par_chunks_mut(k_enc))
+            .zip(enc_mask.par_chunks_mut(k_enc))
+            .zip(enc_pad.par_chunks_mut(k_enc))
+            .zip(target.par_chunks_mut(k_dec))
+            .zip(library.par_iter_mut())
+            .enumerate()
+            .for_each(|(r, (((((eid, ecnt), emask), epad), tgt), libslot))| {
+                let s = row_set[r];
+                let lo = indptr[r] as usize;
+                let hi = indptr[r + 1] as usize;
+                let cin = CellIn {
+                    gene_ids: &indices[lo..hi],
+                    raw: &data[lo..hi],
+                    query: &query_gene_ids[s * k_dec..(s + 1) * k_dec],
+                    enc_mask_positions: if has_mask {
+                        Some(&enc_mask_positions[r * k_dec..(r + 1) * k_dec])
+                    } else {
+                        None
+                    },
+                    hide_readout: hide_readout[r] != 0,
+                };
+                let cfg = CollateConfig {
+                    k_enc,
+                    mode: scalars.mode,
+                    target_sum: scalars.target_sum,
+                    n_measured: n_measured[s] as usize,
+                    pflog_alpha: scalars.pflog_alpha,
+                    n_genes_total: scalars.n_genes_total,
+                    lib_size_redef: scalars.lib_size_redef,
+                };
+                let mut out = CellOut {
+                    enc_ids: eid,
+                    enc_counts: ecnt,
+                    enc_mask: emask,
+                    enc_pad: epad,
+                    target: tgt,
+                };
+                *libslot = collate_cell(&cin, &cfg, &mut out);
+            });
+    });
 
     Ok(CollatedCellSetBatch {
         encoder_gene_ids: enc_ids,

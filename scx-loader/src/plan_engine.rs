@@ -87,6 +87,10 @@ impl PrefetchEngine {
             .map(|(fid, r)| {
                 let mut backed =
                     BackedCsrReader::with_shared_cache(r, fid as u32, Arc::clone(&shared));
+                // One pool for every reader, not one each: `cpu_pool()` is
+                // process-wide, so an N-file engine does not spawn N pools.
+                // Same fork rationale as `IndexPlanLoader` — see `crate::pool`.
+                backed.set_cpu_pool(crate::pool::cpu_pool());
                 // Always-on metrics, mirroring `IndexPlanLoader`. `enable_metrics`
                 // is idempotent on the shared cache, so doing it per reader installs
                 // one aggregate handle that `new` reads back via `metrics()`.

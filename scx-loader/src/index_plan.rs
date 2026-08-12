@@ -215,7 +215,17 @@ impl IndexPlanLoader {
         let n_modalities = reader.n_modalities();
 
         // Borrow obs / sizes off ScxReader before BackedCsrReader::new takes ownership.
-        let obs_metadata = reader.read_obs()?;
+        //
+        // Wrapped in `install` because `read_obs` is not the plain section read
+        // it looks like: on a file with sharded obs metadata it fans the shard
+        // decode out with `par_iter` (`ScxReader::read_sharded_layout_by_prefix`),
+        // and this constructor runs inside the forked `DataLoader` worker, where
+        // rayon's inherited global pool has no live threads. Every atlas-scale
+        // file has sharded obs, so this — not the gather — is the first thing a
+        // forked worker hangs on. `install` makes the loader's pool *current*
+        // for this thread, so the nested `par_iter` lands there without
+        // `ScxReader` needing to know anything about pools.
+        let obs_metadata = crate::pool::cpu_pool().install(|| reader.read_obs())?;
 
         // Stable global category dictionaries, built once over the full obs
         // table so codes are identical across pulls and match TrainingPipeline.
@@ -434,6 +444,11 @@ impl IndexPlanLoader {
             effective_cache_shards,
             cache_bytes_budget,
         );
+        // Keep `warm_shards` off rayon's global registry: this loader is
+        // routinely constructed inside a forked `DataLoader` worker, where the
+        // inherited global pool has no live worker threads and any dispatch to
+        // it hangs forever. See `crate::pool`.
+        backed.set_cpu_pool(crate::pool::cpu_pool());
         // Always-on metrics on this surface — the iter's profile log and
         // the per-iter snapshot accessor read from this handle.
         let cache_metrics = backed.enable_metrics();
@@ -460,11 +475,20 @@ impl IndexPlanLoader {
                                 .to_string(),
                         });
                     }
-                    let est =
-                        scx_accel::estimate_alpha(&backed, &scx_accel::AlphaOptions::default())
-                            .map_err(|e| LoaderError::ConfigError {
-                                reason: format!("pflog α estimation failed: {e}"),
-                            })?;
+                    // On the loader's pool for the same reason as `read_obs`
+                    // above: `estimate_alpha` walks shards through
+                    // `scx_format_io::prefetch`, whose `rayon::in_place_scope`
+                    // cannot tell an inherited-and-dead global registry from a
+                    // live one. Inside `install` the prefetch takes its
+                    // already-on-a-worker sequential path — the right trade for
+                    // a one-time construction-path estimate.
+                    let est = crate::pool::cpu_pool()
+                        .install(|| {
+                            scx_accel::estimate_alpha(&backed, &scx_accel::AlphaOptions::default())
+                        })
+                        .map_err(|e| LoaderError::ConfigError {
+                            reason: format!("pflog α estimation failed: {e}"),
+                        })?;
                     log::info!(
                         "pflog: estimated α={:.6} (pseudocount={:.6}, n_genes_used={}, fell_back={})",
                         est.alpha,

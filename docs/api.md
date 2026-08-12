@@ -2662,14 +2662,21 @@ print(ds.effective_cache_shards(), ds.effective_lookahead())
 
 ### Fork safety under PyTorch `DataLoader(num_workers > 0)`
 
-`pyscx.TrainingDataset` and `pyscx.IndexPlanDataset` are fork-safe under
+`pyscx.TrainingDataset`, `pyscx.IndexPlanDataset` and
+`pyscx.SparseCellSetDataset` are fork-safe under
 `torch.utils.data.DataLoader(num_workers > 0, start_method="fork")` —
 the Linux PyTorch default — when the dataset is **constructed lazily
 inside the worker's `__iter__`** (the pattern `cell-load-scx` and
-`state-scx` already use). Both the per-pipeline tokio runtime (current-
-thread, per-epoch) and per-pipeline `rayon::ThreadPool` (lazily built on
-first iteration) are constructed inside the worker process, so a forked
-child inherits no fork-hostile state from the parent.
+`state-scx` already use). The per-pipeline tokio runtime (current-thread,
+per-epoch), the per-pipeline `rayon::ThreadPool` (lazily built on first
+iteration) and the process-wide `scx_loader::pool::cpu_pool()` used during
+construction are all created inside the worker process, so a forked child
+inherits no fork-hostile state from the parent. `cpu_pool()` is keyed on the
+PID and rebuilt when it changes, which is what makes "created in the worker"
+true even if the parent touched a loader path first. Construction therefore
+does own worker threads — they are simply the child's own. See
+[multithreading.md § Per-worker thread footprint](multithreading.md#per-worker-thread-footprint)
+for how many.
 
 ```python
 # Recommended IterableDataset wrapper for DataLoader(num_workers=2)

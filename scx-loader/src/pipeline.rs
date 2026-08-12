@@ -16,12 +16,6 @@ use crate::io_stage::io_stage;
 use crate::projection::HvgProjection;
 use crate::shuffle::ShardShuffler;
 
-/// Hard upper bound on per-pipeline rayon worker threads. On many-core hosts
-/// the decode work is embarrassingly parallel but memory-bound; more than
-/// ~8 workers does not pay off and increases the fork-hostile thread count
-/// for downstream callers that use spawn-mode multiprocessing.
-const DEFAULT_DECODE_POOL_MAX_THREADS: usize = 8;
-
 /// Bounded join deadline for `Drop` and `join_epoch_handles` shutdown.
 /// If the I/O or decode thread does not finish within this window the join
 /// is abandoned and the thread handle is detached — preferable to wedging
@@ -499,15 +493,20 @@ fn adaptive_budget_mb(
 ///    shuffles, projects, densifies, normalizes
 /// 3. **GPU stage** (caller): consumes pre-built `Batch`es via `next_batch()`
 ///
-/// **Fork-safety contract**. Both the tokio current-thread runtime and
-/// the rayon `ThreadPool` are constructed *lazily inside `start_epoch`*,
-/// i.e. after any fork has happened. The `TrainingPipeline` value itself
-/// contains no live runtime,
-/// rayon registry, or worker threads at construction time, so a forked child
-/// that constructs its own pipeline does not inherit fork-hostile state from
-/// the parent. `pyscx.from_anndata` in the parent — which lazily initialises
-/// rayon's *global* pool as a side-effect — is the historical wedge case;
-/// this design eliminates dependence on that pool entirely.
+/// **Fork-safety contract**. Both the tokio current-thread runtime and the
+/// per-pipeline rayon `ThreadPool` are constructed *lazily inside
+/// `start_epoch`*, i.e. after any fork has happened, so a forked child that
+/// constructs its own pipeline does not inherit fork-hostile state from the
+/// parent. `pyscx.from_anndata` in the parent — which lazily initialises
+/// rayon's *global* pool as a side-effect — is the historical wedge case; this
+/// design eliminates dependence on that pool entirely.
+///
+/// The constructor does own threads, however: [`Self::new`] runs `read_obs`
+/// and the PFlog α estimate inside [`crate::pool::cpu_pool`], which builds that
+/// pool. They are this process's threads, created after the fork — which is the
+/// property fork-safety actually needs — but the earlier claim that the value
+/// holds no worker threads at construction is no longer true. See
+/// `docs/multithreading.md` § Per-worker thread footprint.
 ///
 /// See [docs/multithreading.md §Training data loader](../../docs/multithreading.md#training-data-loader-triple-buffered-pipeline).
 pub struct TrainingPipeline {
@@ -616,10 +615,21 @@ impl TrainingPipeline {
                 });
             }
             let est_reader = BackedCsrReader::new(ScxReader::open(path.as_ref())?, 0);
-            let est = scx_accel::estimate_alpha(&est_reader, &scx_accel::AlphaOptions::default())
+            // `estimate_alpha` walks shards through `scx_format_io::prefetch`,
+            // which uses `rayon::in_place_scope`. Its "am I already on a worker?"
+            // guard cannot see a fork — after one, `current_num_threads()` still
+            // reports the parent's count and `current_thread_index()` is still
+            // `None` — so on the global registry it spawns onto threads that do
+            // not exist and the drain blocks forever. Inside `install` that same
+            // guard sees a worker thread and takes the sequential path, which is
+            // the right trade for a one-time construction-path estimate.
+            let est = crate::pool::cpu_pool()
+                .install(|| {
+                    scx_accel::estimate_alpha(&est_reader, &scx_accel::AlphaOptions::default())
+                })
                 .map_err(|e| LoaderError::ConfigError {
-                reason: format!("pflog α estimation failed: {e}"),
-            })?;
+                    reason: format!("pflog α estimation failed: {e}"),
+                })?;
             log::info!(
                 "pflog: estimated α={:.6} (pseudocount={:.6}, n_genes_used={}, fell_back={})",
                 est.alpha,
@@ -630,9 +640,17 @@ impl TrainingPipeline {
             config.pflog_alpha = Some(est.alpha);
         }
 
-        // Read obs metadata (full RecordBatch for column extraction)
+        // Read obs metadata (full RecordBatch for column extraction).
+        //
+        // On a file with sharded obs metadata this is not a plain section read:
+        // `read_sharded_layout_by_prefix` fans the shard decode out with
+        // `par_iter`. This constructor is the lazily-constructed-in-`__iter__`
+        // call a forked `DataLoader` worker makes, where rayon's inherited
+        // global registry has no live threads — so without `install` a forked
+        // worker hangs here on every atlas-scale file, which is every file with
+        // `n_obs > shard_target_rows`. Same reason as `IndexPlanLoader::new`.
         let t0 = Instant::now();
-        let obs_metadata = reader.read_obs()?;
+        let obs_metadata = crate::pool::cpu_pool().install(|| reader.read_obs())?;
         if profile {
             eprintln!(
                 "[scx-loader profile] read_obs: {:?} ({} rows)",
@@ -784,9 +802,18 @@ impl TrainingPipeline {
     /// Lazily build the per-pipeline rayon `ThreadPool`. Called from
     /// `start_epoch` so the pool is constructed inside the worker
     /// process, after any fork. Reused across epochs.
+    ///
+    /// Sized through [`crate::pool::resolve_pool_threads`], the same function
+    /// that sizes `cpu_pool()`, so `SCX_LOADER_CPU_THREADS` governs **both**
+    /// pools a `TrainingPipeline` worker can hold. It previously read
+    /// `num_cpus::get_physical()` directly and ignored the knob, which made
+    /// per-worker thread count unpredictable once the constructor also began
+    /// building a pool — see the footprint note in `docs/multithreading.md`.
     fn ensure_decode_pool(&mut self) -> Result<&Arc<rayon::ThreadPool>> {
         if self.decode_pool.is_none() {
-            let n_threads = num_cpus::get_physical().clamp(1, DEFAULT_DECODE_POOL_MAX_THREADS);
+            let n_threads = crate::pool::resolve_pool_threads(
+                std::env::var(crate::pool::CPU_THREADS_ENV).ok().as_deref(),
+            );
             let t = Instant::now();
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(n_threads)

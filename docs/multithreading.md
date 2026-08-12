@@ -169,10 +169,10 @@ field-on-pipeline runtime with a model that is fork-safe by construction.
 A dedicated OS thread (`scx-decode`) receives shard groups and dispatches
 the per-row sparse-to-dense scatter + HVG projection + fused normalize+log1p
 to a **per-`TrainingPipeline` `rayon::ThreadPool`** via `pool.install(...)`.
-The pool is built lazily inside `start_epoch` via
-`rayon::ThreadPoolBuilder::new().num_threads(num_cpus::get_physical().min(8))`,
-persisted across epochs for the same `TrainingPipeline`, and dropped in
-`shutdown()` / `Drop`. Completed batches are sent through a bounded
+The pool is built lazily inside `start_epoch`, sized by
+`pool::resolve_pool_threads` — the same function that sizes `cpu_pool()`, so
+`SCX_LOADER_CPU_THREADS` governs both — persisted across epochs for the same
+`TrainingPipeline`, and dropped in `shutdown()` / `Drop`. Completed batches are sent through a bounded
 `crossbeam` channel (capacity = `prefetch_batches`, minimum 2).
 
 > [!IMPORTANT]
@@ -207,14 +207,69 @@ reaches callers.
 
 The pipeline is fork-safe under
 `torch.utils.data.DataLoader(num_workers > 0, start_method="fork")` **when
-the dataset is constructed lazily inside the worker's `__iter__`**. Both
-the tokio current-thread runtime (per-epoch, lives on the I/O thread) and
-the rayon `ThreadPool` (per-instance, lazily built on first
-`start_epoch`) are constructed inside the worker process, so the
-`TrainingPipeline` value contains no live runtime, registry, or worker
-threads at construction time. A forked child therefore inherits no
+the dataset is constructed lazily inside the worker's `__iter__`**. The tokio
+current-thread runtime (per-epoch, lives on the I/O thread) and the
+per-pipeline rayon `ThreadPool` (lazily built on first `start_epoch`) are both
+constructed inside the worker process, so a forked child inherits no
 fork-hostile state from the parent. The eager-construct-then-fork case is
 caught by the PID check in `__next__` (`scx-loader/src/python.rs`).
+
+`TrainingPipeline::new` is **not** thread-free, though: it runs `read_obs` (and
+the PFlog α estimate) through `cpu_pool()`, which builds that pool. So a
+constructed-but-not-yet-iterated pipeline already owns worker threads — they are
+just this process's own, built after the fork, which is the property that
+matters. Earlier text here claimed the value held no worker threads at
+construction; that stopped being true when the constructor started using a
+pool.
+
+#### The other three surfaces: `scx_loader::pool::cpu_pool()`
+
+`TrainingPipeline`'s per-pipeline pool covers only `TrainingPipeline`.
+`IndexPlanDataset`, `SparseCellSetDataset` and the two standalone kernels
+(`pyscx.collate_cellset_gathered`, `pyscx.downsample_counts_csr`) reached the
+**global** registry and hung a forked worker the same way. Two of those paths
+run through `scx-format-io` rather than any `par_*` in this crate, which is why
+"the loader does not use rayon" was believed and was wrong:
+
+| Path | Reached via |
+|---|---|
+| `IndexPlanLoader::new` → `ScxReader::read_obs` | the sharded-obs-metadata `par_iter`; fires at **construction** on any file whose obs is sharded |
+| gather → `BackedCsrReader::warm_shards` | the parallel cold-shard decode |
+| `collate_gathered`, `downsample_counts_csr` | `par_chunks_mut` / `into_par_iter` directly |
+
+All four now go through **`scx_loader::pool::cpu_pool()`** — one pool per
+process, shared by every reader, sized `num_cpus::get_physical().clamp(1, 8)`
+and overridable with **`SCX_LOADER_CPU_THREADS`**. It is keyed on the PID and
+rebuilt when that changes, because a plain `OnceLock` filled by the parent
+would hand the child a private pool whose threads are just as absent as the
+global one's. `BackedCsrReader::set_cpu_pool` carries it into `scx-format-io`;
+unset (every other consumer) keeps the global registry, so `scx-accel`,
+`scx-ops`, `scx-engine` and `scx-cli` are unchanged.
+
+The slot is a lock-free `AtomicPtr` to a **never-freed** entry, and that is
+load-bearing rather than an optimisation. Dropping the inherited pool would call
+`ThreadPool::drop` → `Registry::terminate` → `Sleep::wake_specific_thread`,
+which locks each worker's `is_blocked` mutex — inheritable in the locked state
+from a parent worker that no longer exists. A `Mutex` guarding the slot has the
+same problem one level up. Both would hang the child before it ever used the
+fresh pool, so the child neither locks nor destroys inherited state; it leaks
+one small entry per fork generation instead.
+
+The kernels are bare `#[pyfunction]`s, so a forked worker calls them with no
+dataset in hand and no PID check in front of them — the pool is the only guard
+there.
+
+#### Per-worker thread footprint
+
+A `TrainingDataset` worker holds **two** rayon pools, not one: `cpu_pool()`,
+built when the constructor runs `read_obs` / the PFlog α estimate, and the
+per-`TrainingPipeline` decode pool built in `start_epoch`. They are separate on
+purpose — the decode pool is per-instance and released by `close()` / `Drop`,
+while `cpu_pool()` is process-wide — so budget `2 × threads` per worker, times
+`num_workers`. Both are sized by `resolve_pool_threads`, so
+`SCX_LOADER_CPU_THREADS` caps each of them; before that they could diverge,
+since the decode pool read `num_cpus::get_physical()` directly and ignored the
+knob. `IndexPlanDataset` and `SparseCellSetDataset` hold only `cpu_pool()`.
 
 `pyscx/tests/test_fork_safety.py` is the durable regression test;
 post-fix Lambda HPC measurements confirm the workers0 / workers2 paths
@@ -229,7 +284,7 @@ floors to 0.5× the post-fix median per the gate's convention).
 | Runtime | Reason |
 |---------|--------|
 | tokio (current-thread, per I/O thread) | Async I/O with efficient epoll/io_uring integration; per-thread runtime keeps the fork-hostile thread count at zero |
-| rayon (per-pipeline pool) | Work-stealing for CPU-bound decode/normalize, isolated from the global registry |
+| rayon (per-pipeline pool for `TrainingPipeline`; the process-wide `pool::cpu_pool()` elsewhere) | Work-stealing for CPU-bound decode/normalize, isolated from the global registry — whose worker threads do not survive `fork()` |
 | std::thread | Bridges async and sync worlds without blocking the tokio reactor |
 
 > [!IMPORTANT]

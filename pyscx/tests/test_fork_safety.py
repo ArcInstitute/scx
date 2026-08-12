@@ -377,13 +377,23 @@ def test_spawn_num_workers_2(fixture_paths: list[str]) -> None:
 #
 # IndexPlanDataset shares the tokio multi-thread runtime + std::thread +
 # crossbeam primitives with TrainingDataset (it owns its own runtime built
-# eagerly in `IndexPlanLoader::new`), but does *not* use rayon directly —
-# its prefetch goes via `tokio::spawn_blocking` and `std::thread::spawn`.
-# So the rayon-after-fork hazard from Phase 1 does not apply; the only
-# remaining concern is the tokio runtime's fork-hostility (#2/#3/#5 in
-# "Why fork is hard"). Phase 1 evidence shows tokio's multi-thread runtime
-# constructs cleanly in a forked child, so this test is expected to pass
-# without any Phase-2-style fix.
+# lazily in `IndexPlanLoader::runtime()`); its prefetch goes via
+# `tokio::spawn_blocking` and `std::thread::spawn`.
+#
+# It *does* reach rayon, though — through `scx-format-io`, not directly — which
+# is why this test alone was not enough. `IndexPlanLoader::new` calls
+# `ScxReader::read_obs`, which fans the shard decode out with `par_iter` on any
+# file with sharded obs metadata; and the gather reaches `warm_shards`. Both
+# used to hit rayon's *global* registry, whose worker threads do not survive
+# `fork()`. The fixture below is 16 cells in a single shard with unsharded obs,
+# so it reached neither: `misses.len() == 1` short-circuits `warm_shards` to a
+# sequential loop, and unsharded obs is a plain section read. It passed
+# vacuously. `test_fork_index_plan_sharded_obs` and
+# `test_fork_index_plan_multi_shard_gather` below are the non-vacuous versions;
+# both assert their own premise in the parent before forking.
+#
+# The tokio side is genuinely fine: its multi-thread runtime constructs cleanly
+# in a forked child, which is why this test passed at all.
 
 
 def _child_iterate_index_plan_dataset(scx_path: str, conn) -> None:
@@ -473,3 +483,413 @@ def test_fork_index_plan_dataset(fixture_paths: list[str]) -> None:
     assert set(seen) == expected, (
         f"missing={expected - set(seen)} extra={set(seen) - expected}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The rayon-after-fork hazard, reached through scx-format-io
+# ---------------------------------------------------------------------------
+#
+# `fork()` copies rayon's global registry as a data structure but not its worker
+# threads, so a `par_*` dispatched from the child parks forever in
+# `LockLatch::wait_and_reset` — no error, no batch. The parent gets that
+# registry initialised by almost anything; `pyscx.from_anndata` is itself
+# `par_iter`, so the fixtures below arm it as a side effect of existing.
+#
+# Each test asserts, in the parent, that its fixture actually reaches the code
+# path in question. Without that a fixture drifts back to the vacuous case and
+# nothing says so.
+
+# Small enough to stay fast, large enough to shard four ways at SHARD_SIZE.
+MULTI_N_OBS = 256
+MULTI_N_VARS = 32
+MULTI_SHARD_SIZE = 64
+
+
+def _make_multi_shard_fixture(path: str, *, unframed: bool, sharded_obs: bool) -> None:
+    """A 4-shard file. `unframed` writes legacy (v1) shards so the gather takes
+    the full-shard path; `sharded_obs` leaves obs as `ObsMetadataShard`s."""
+    import anndata as ad
+    import numpy as np
+    import pandas as pd
+    import scipy.sparse as sp
+
+    import pyscx
+
+    rng = np.random.default_rng(7)
+    dense = rng.integers(0, 10, size=(MULTI_N_OBS, MULTI_N_VARS), dtype=np.int32).astype(
+        np.float32
+    )
+    dense[rng.random((MULTI_N_OBS, MULTI_N_VARS)) < 0.6] = 0
+    obs = pd.DataFrame(
+        {"global_cell_id": np.arange(MULTI_N_OBS, dtype=np.int64)},
+        index=[f"cell_{i}" for i in range(MULTI_N_OBS)],
+    )
+    var = pd.DataFrame(index=[f"gene_{i}" for i in range(MULTI_N_VARS)])
+    adata = ad.AnnData(X=sp.csr_matrix(dense), obs=obs, var=var)
+
+    kwargs: dict[str, Any] = {"shard_size": MULTI_SHARD_SIZE}
+    if unframed:
+        kwargs["row_group_rows"] = 0
+    if not sharded_obs:
+        kwargs["force_legacy_metadata"] = True
+    pyscx.from_anndata(adata, path, **kwargs)
+
+
+@pytest.fixture(scope="module")
+def sharded_obs_path(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Framed X, **sharded obs** — the `read_obs` trigger in isolation."""
+    import pyscx
+
+    p = str(tmp_path_factory.mktemp("fork_sharded_obs") / "f.scx")
+    _make_multi_shard_fixture(p, unframed=False, sharded_obs=True)
+    # Premise: without sharded obs metadata `read_obs` is a plain section read
+    # and never touches rayon, so the test below would prove nothing.
+    assert pyscx.open(p).obs_metadata_shard_count > 0, (
+        "fixture has unsharded obs — read_obs would not reach par_iter"
+    )
+    return p
+
+
+@pytest.fixture(scope="module")
+def unframed_multi_shard_path(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Unframed X, **unsharded** obs — the `warm_shards` trigger in isolation
+    (unsharded obs so the read_obs trigger cannot mask it)."""
+    import pyscx
+
+    p = str(tmp_path_factory.mktemp("fork_unframed") / "f.scx")
+    _make_multi_shard_fixture(p, unframed=True, sharded_obs=False)
+    exp = pyscx.open(p)
+    assert exp.shard_count >= 3, f"want >= 3 CSR shards, got {exp.shard_count}"
+    assert exp.obs_metadata_shard_count == 0, (
+        "obs must be unsharded here so this test isolates the gather"
+    )
+    return p
+
+
+# Rows in four different shards (0-63, 64-127, 128-191, 192-255), as pairs.
+_SPANNING_PLAN = [(0, 70), (10, 140), (20, 200), (30, 80)]
+
+
+def test_gather_premise_holds_in_parent(unframed_multi_shard_path: str) -> None:
+    """Guard for the two tests below: prove the plan really does drive
+    `warm_shards` down its **parallel** arm, in-process where we can read the
+    counters. If this goes quiet the fork tests become vacuous and nothing else
+    would say so — which is exactly how the 16-cell fixture above went blind.
+
+    Three conditions, all necessary:
+      * `lookahead=0`, or `IndexPlanIter` prefetches every touched shard via
+        `spawn_blocking` first and `warm_shards` sees no misses at all;
+      * `cache_shards >= 2`, or `warm_shards` short-circuits to a sequential
+        loop;
+      * shards that skip the block-index path, or they never enter
+        `full_shards`. Hence the unframed fixture plus `scatter_block_index`.
+    """
+    import pyscx
+
+    ds = pyscx.IndexPlanDataset(
+        unframed_multi_shard_path,
+        normalize=False,
+        log1p=False,
+        obs_columns=[],
+        cache_shards=8,
+        scatter_block_index=False,
+    )
+    assert ds.effective_cache_shards() >= 2, (
+        "cache_shards collapsed to 1 — warm_shards would run sequentially"
+    )
+    for _ in ds.iter_with_plans(iter([_SPANNING_PLAN]), lookahead=0):
+        pass
+    m = ds.cache_metrics()
+    assert m["full_shard_groups"] >= 2, (
+        f"plan produced {m['full_shard_groups']} full-shard groups, need >= 2 for "
+        f"warm_shards to dispatch in parallel (block_index_groups="
+        f"{m['block_index_groups']})"
+    )
+
+
+def _child_construct_index_plan(scx_path: str, conn) -> None:
+    """Construct only — that is the whole trigger for the read_obs path."""
+    try:
+        import pyscx
+
+        ds = pyscx.IndexPlanDataset(
+            scx_path, normalize=False, log1p=False, obs_columns=["global_cell_id"]
+        )
+        conn.send(("ok", int(ds.n_obs)))
+    except BaseException as exc:  # noqa: BLE001
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def _child_gather_across_shards(scx_path: str, conn) -> None:
+    try:
+        import warnings
+
+        import pyscx
+
+        # The unframed fixture warns that the block-index path cannot fire.
+        # That is the point of the fixture, not a problem.
+        warnings.simplefilter("ignore")
+        ds = pyscx.IndexPlanDataset(
+            scx_path,
+            normalize=False,
+            log1p=False,
+            obs_columns=[],
+            cache_shards=8,
+            scatter_block_index=False,
+        )
+        seen: list[tuple[int, int]] = []
+        for batch in ds.iter_with_plans(iter([_SPANNING_PLAN]), lookahead=0):
+            seen.extend((int(p), int(c)) for p, c in batch["pairs"])
+        conn.send(("ok", seen))
+    except BaseException as exc:  # noqa: BLE001
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def _child_collate_cellset(conn) -> None:
+    """No dataset, no file — a bare pyfunction, so no PID check guards it."""
+    try:
+        import numpy as np
+
+        import pyscx
+
+        n_rows, k_enc, n_genes = 512, 16, 64
+        indptr = np.arange(0, n_rows * k_enc + 1, k_enc, dtype=np.int64)
+        indices = np.tile(np.arange(k_enc, dtype=np.int32), n_rows)
+        data = np.full(n_rows * k_enc, 3.0, dtype=np.float32)
+        out = pyscx.collate_cellset_gathered(
+            indptr,
+            indices,
+            data,
+            np.array([0, n_rows], dtype=np.int64),
+            np.arange(n_rows, dtype=np.uint64),
+            np.zeros(n_rows, dtype=np.uint32),
+            np.zeros(n_rows, dtype=np.int32),
+            n_genes,
+            np.arange(n_genes, dtype=np.int32),
+            np.array([], dtype=np.uint8),
+            np.zeros(n_rows, dtype=np.uint8),
+            np.array([n_genes], dtype=np.uint32),
+            k_enc,
+            "pass_through",
+            n_genes,
+        )
+        conn.send(("ok", int(out["n_rows"])))
+    except BaseException as exc:  # noqa: BLE001
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def _child_downsample_counts(conn) -> None:
+    try:
+        import numpy as np
+
+        import pyscx
+
+        n_rows, k = 512, 16
+        indptr = np.arange(0, n_rows * k + 1, k, dtype=np.int64)
+        indices = np.tile(np.arange(k, dtype=np.int32), n_rows)
+        data = np.full(n_rows * k, 20.0, dtype=np.float32)
+        out = pyscx.downsample_counts_csr(
+            indptr,
+            indices,
+            data,
+            np.arange(n_rows, dtype=np.uint64),
+            np.array([], dtype=np.uint64),
+            target_library_size=10,
+            seed=0,
+        )
+        conn.send(("ok", int(len(out["indptr"]))))
+    except BaseException as exc:  # noqa: BLE001
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def _run_forked_child(target, args: tuple, label: str):
+    """Fork `target`, enforce the deadline, and return its payload.
+
+    The parent has already run `pyscx.from_anndata` (or another rayon user) by
+    the time this is called, so the global registry the child inherits is armed
+    and dead — which is the condition under test.
+    """
+    ctx = mp.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=target, args=(*args, child_conn), daemon=False)
+    proc.start()
+    child_conn.close()
+    proc.join(timeout=TEST_DEADLINE_SEC)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=2.0)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=2.0)
+        pytest.fail(
+            f"{label}: child did not finish within {TEST_DEADLINE_SEC}s — this is "
+            "the rayon-after-fork hang, not a slow test"
+        )
+    if not parent_conn.poll(0.0):
+        pytest.fail(f"{label}: child exited (rc={proc.exitcode}) without sending status")
+    status, payload = parent_conn.recv()
+    parent_conn.close()
+    if status == "err":
+        pytest.fail(f"{label}: child raised: {payload}")
+    return payload
+
+
+def test_fork_index_plan_sharded_obs(sharded_obs_path: str) -> None:
+    """`IndexPlanLoader::new` -> `ScxReader::read_obs` -> the sharded-metadata
+    `par_iter`. Construction alone is the trigger, so this needs no plan and no
+    gather — and it fires on every atlas-scale file, since obs shards whenever
+    `n_obs > shard_target_rows`.
+    """
+    n_obs = _run_forked_child(
+        _child_construct_index_plan, (sharded_obs_path,), "sharded-obs construct"
+    )
+    assert n_obs == MULTI_N_OBS
+
+
+def test_fork_index_plan_multi_shard_gather(unframed_multi_shard_path: str) -> None:
+    """`read_rows_with` -> `warm_shards` -> `par_iter`, under the conditions
+    `test_gather_premise_holds_in_parent` pins."""
+    seen = _run_forked_child(
+        _child_gather_across_shards, (unframed_multi_shard_path,), "multi-shard gather"
+    )
+    assert set(map(tuple, seen)) == set(_SPANNING_PLAN)
+
+
+def test_fork_collate_cellset_gathered(fixture_paths: list[str]) -> None:
+    """`pyscx.collate_cellset_gathered` — reachable from a forked worker with no
+    dataset in hand, so none of the PID checks in `python.rs` apply.
+
+    Depends on `fixture_paths` only to guarantee the parent has run
+    `from_anndata` and armed the global registry first; without that the child
+    would initialise a fresh registry of its own and pass regardless.
+    """
+    assert fixture_paths
+    n_rows = _run_forked_child(_child_collate_cellset, (), "collate_cellset_gathered")
+    assert n_rows == 512
+
+
+def test_fork_downsample_counts_csr(fixture_paths: list[str]) -> None:
+    """`pyscx.downsample_counts_csr` — same shape as the collate kernel above."""
+    assert fixture_paths
+    n = _run_forked_child(_child_downsample_counts, (), "downsample_counts_csr")
+    assert n == 513  # n_rows + 1
+
+
+def _child_iterate_training_dataset(scx_path: str, conn) -> None:
+    try:
+        import pyscx
+
+        ds = pyscx.TrainingDataset(
+            scx_path,
+            batch_size=32,
+            normalize=False,
+            log1p=False,
+            obs_columns=["global_cell_id"],
+        )
+        try:
+            n = sum(len(b["cell_indices"]) for b in ds)
+        finally:
+            ds.close()
+        conn.send(("ok", n))
+    except BaseException as exc:  # noqa: BLE001
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def test_fork_training_dataset_sharded_obs(sharded_obs_path: str) -> None:
+    """`TrainingDataset` reaches the same `read_obs` par_iter as
+    `IndexPlanDataset` — `TrainingPipeline::new` calls it too.
+
+    The per-pipeline decode pool that Phase 2.0 added does not cover this: it is
+    built in `start_epoch`, long after the constructor has already dispatched.
+    The tests above this one only ever exercised 16-cell files whose obs is a
+    single section, so the class every fork-safety guarantee is written about
+    was hanging on any file large enough to shard its obs — which is every file
+    the loader exists for.
+    """
+    n = _run_forked_child(
+        _child_iterate_training_dataset, (sharded_obs_path,), "TrainingDataset sharded-obs"
+    )
+    assert n == MULTI_N_OBS
+
+
+def _child_iterate_sparse_cellset(scx_path: str, conn) -> None:
+    try:
+        import warnings
+
+        import pyscx
+
+        warnings.simplefilter("ignore")
+        ds = pyscx.SparseCellSetDataset([scx_path], cache_shards=8)
+        # (file_ids, rows, role_tags, set_offsets) — one set spanning four shards.
+        rows = [0, 70, 140, 200]
+        plan = ([0] * len(rows), rows, [0] * len(rows), [0, len(rows)])
+        n = 0
+        for batch in ds.iter_with_plans(iter([plan]), lookahead=0):
+            n += len(batch["cell_indices"])
+        conn.send(("ok", n))
+    except BaseException as exc:  # noqa: BLE001
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def test_fork_sparse_cellset_dataset(unframed_multi_shard_path: str) -> None:
+    """The other class §9.1 names. Its readers come from
+    `PrefetchEngine::from_scx_readers`, a construction path nothing else here
+    exercises under fork, and its gather reaches the same `warm_shards`.
+    """
+    n = _run_forked_child(
+        _child_iterate_sparse_cellset,
+        (unframed_multi_shard_path,),
+        "SparseCellSetDataset gather",
+    )
+    assert n == 4
+
+
+def _child_construct_index_plan_pflog(scx_path: str, conn) -> None:
+    """`pflog=True` routes construction through `scx_accel::estimate_alpha`,
+    which walks shards on `scx_format_io::prefetch`'s `rayon::in_place_scope` —
+    a third rayon entry point, distinct from `read_obs` and `warm_shards`."""
+    try:
+        import warnings
+
+        import pyscx
+
+        warnings.simplefilter("ignore")
+        ds = pyscx.IndexPlanDataset(
+            scx_path, normalize=False, log1p=False, obs_columns=[], pflog=True
+        )
+        conn.send(("ok", int(ds.n_obs)))
+    except BaseException as exc:  # noqa: BLE001
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def test_fork_index_plan_pflog_alpha_estimate(unframed_multi_shard_path: str) -> None:
+    """The α-estimate path under fork.
+
+    `prefetch`'s guard — `current_num_threads() > 1 && current_thread_index()
+    .is_none()` — asks "am I already on a rayon worker?", and **cannot see a
+    fork**: after one, both halves still read as they did in the parent. So the
+    guard passes and `in_place_scope` spawns onto threads that no longer exist.
+    Uses the multi-shard fixture because a single-shard file would take the
+    sequential arm and prove nothing.
+    """
+    n = _run_forked_child(
+        _child_construct_index_plan_pflog,
+        (unframed_multi_shard_path,),
+        "IndexPlanDataset pflog alpha",
+    )
+    assert n == MULTI_N_OBS

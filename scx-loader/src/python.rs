@@ -77,7 +77,12 @@ use scx_format_io::ScxReader;
 /// (per-epoch, owned by a dedicated I/O `std::thread`) and per-pipeline
 /// `rayon::ThreadPool` (per-instance, lazily built on first `start_epoch()`)
 /// are constructed *inside the worker process* and therefore never inherit
-/// fork-hostile thread state from the parent.
+/// fork-hostile thread state from the parent. The same holds for the
+/// process-wide [`crate::pool::cpu_pool`] the constructor uses for `read_obs`
+/// and the PFlog α estimate: it is keyed on the PID, so a child never draws on
+/// a pool the parent built. Note that this means construction *does* create
+/// worker threads — the guarantee is that they are the child's own, not that
+/// there are none.
 ///
 /// **Constraints that still apply:**
 /// - Eager-construct in parent + fork = unsupported. The PID check in
@@ -984,22 +989,32 @@ fn build_multimodal_batch_dict<'py>(
 /// `IndexPlanDataset` is fork-safe under PyTorch
 /// `DataLoader(num_workers > 0, start_method="fork")` **when the dataset is
 /// constructed lazily inside the worker's `__iter__`** — same contract as
-/// `TrainingDataset`. Because `IndexPlanLoader` does *not* use rayon's
-/// global pool (its prefetch goes via `tokio::spawn_blocking` and
-/// `std::thread::spawn`), the rayon-after-fork hazard that motivated
-/// Phase 2.0 for `TrainingDataset` does **not** apply here. The multi-threaded
-/// tokio runtime is, moreover, **not** built eagerly in `IndexPlanLoader::new()`
-/// — it is constructed lazily on first use in `IndexPlanLoader::runtime()`
-/// (a `OnceLock<Runtime>` in `scx-loader/src/index_plan.rs`), whose first touch
-/// is always from an `IndexPlanIter`, post-fork in the `DataLoader` worker. So
-/// the loader never owns runtime threads at the moment a child is forked, and
-/// each worker builds its own runtime fresh; the parent's runtime threads are
-/// never inherited. The construct-then-fork case is additionally caught by the
-/// PID check in `iter_with_plans` / `next_batch_for_test`.
+/// `TrainingDataset`.
 ///
-/// **Acceptance test**: `pyscx/tests/test_fork_safety.py::test_fork_index_plan_dataset`
-/// pins this contract end-to-end (multiprocessing.fork + lazy worker
-/// construction + plan iteration to completion).
+/// The multi-threaded tokio runtime is **not** built eagerly in
+/// `IndexPlanLoader::new()` — it is constructed lazily on first use in
+/// `IndexPlanLoader::runtime()` (a `OnceLock<Runtime>` in
+/// `scx-loader/src/index_plan.rs`), whose first touch is always from an
+/// `IndexPlanIter`, post-fork in the `DataLoader` worker. So the loader never
+/// owns runtime threads at the moment a child is forked, and each worker builds
+/// its own runtime fresh; the parent's runtime threads are never inherited. The
+/// construct-then-fork case is additionally caught by the PID check in
+/// `iter_with_plans` / `next_batch_for_test`.
+///
+/// **Rayon.** This class *does* reach rayon, just not directly — through
+/// `scx-format-io`. `IndexPlanLoader::new` calls `ScxReader::read_obs`, which
+/// fans the shard decode out with `par_iter` on any file with sharded obs
+/// metadata; and the gather reaches `BackedCsrReader::warm_shards`. Both used to
+/// dispatch against rayon's *global* registry, which `fork()` copies as a data
+/// structure without its worker threads, so a forked worker parked forever with
+/// no error and no batch. (An earlier version of this comment asserted the
+/// opposite — that the rayon-after-fork hazard did not apply here.) Both now go
+/// through `crate::pool::cpu_pool()`, which is rebuilt whenever the PID changes.
+///
+/// **Acceptance tests**: in `pyscx/tests/test_fork_safety.py` —
+/// `test_fork_index_plan_dataset` (fork + lazy construction + plan iteration),
+/// `test_fork_index_plan_sharded_obs` (the `read_obs` path) and
+/// `test_fork_index_plan_multi_shard_gather` (the `warm_shards` path).
 ///
 /// Recommended: call `start_method="spawn"` for the same reason it is
 /// recommended on `TrainingDataset` — no fork hazards at all.
@@ -2528,25 +2543,33 @@ pub fn downsample_counts_csr<'py>(
     // Per-row work is independent and each row's key is derived from its own
     // identity, so this is safely parallel; `collect` restores row order before
     // flattening, so the output is byte-identical regardless of scheduling.
+    //
+    // On the loader's pool, never rayon's global registry: this is a bare
+    // `#[pyfunction]`, so a forked DataLoader worker reaches it without ever
+    // constructing a dataset and therefore without passing any PID check, and a
+    // global-pool dispatch from a forked child hangs forever. See `crate::pool`.
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let pool = crate::pool::cpu_pool();
     let out_rows: Vec<(Vec<i32>, Vec<f32>)> = py.detach(|| {
-        (0..n_rows)
-            .into_par_iter()
-            .map(|r| {
-                let lo = indptr[r] as usize;
-                let hi = indptr[r + 1] as usize;
-                let mut i = indices[lo..hi].to_vec();
-                let mut d = data[lo..hi].to_vec();
-                // No identities supplied ⇒ key on `(seed, method, row)` alone.
-                // Falling back to `r` (the row's position in this batch) would be
-                // worse than useless: the same cell would draw differently
-                // depending on where it landed in the batch, which is exactly the
-                // scheduling dependence the per-row key exists to avoid.
-                let ident = if idents.is_empty() { 0 } else { idents[r] };
-                crate::downsample::downsample_row(&mut i, &mut d, &cfg, ident, rows[r]);
-                (i, d)
-            })
-            .collect()
+        pool.install(|| {
+            (0..n_rows)
+                .into_par_iter()
+                .map(|r| {
+                    let lo = indptr[r] as usize;
+                    let hi = indptr[r + 1] as usize;
+                    let mut i = indices[lo..hi].to_vec();
+                    let mut d = data[lo..hi].to_vec();
+                    // No identities supplied ⇒ key on `(seed, method, row)` alone.
+                    // Falling back to `r` (the row's position in this batch) would be
+                    // worse than useless: the same cell would draw differently
+                    // depending on where it landed in the batch, which is exactly the
+                    // scheduling dependence the per-row key exists to avoid.
+                    let ident = if idents.is_empty() { 0 } else { idents[r] };
+                    crate::downsample::downsample_row(&mut i, &mut d, &cfg, ident, rows[r]);
+                    (i, d)
+                })
+                .collect()
+        })
     });
 
     let mut out_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);

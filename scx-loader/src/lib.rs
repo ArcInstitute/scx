@@ -10,6 +10,7 @@ pub mod io_stage;
 pub mod normalize;
 pub mod pipeline;
 pub mod plan_engine;
+pub mod pool;
 pub mod projection;
 #[cfg(feature = "python")]
 pub mod python;
@@ -32,6 +33,7 @@ pub use normalize::{
 };
 pub use pipeline::{compute_memory_budget, LoaderConfig, MemoryBudget, TrainingPipeline};
 pub use plan_engine::{PlanPrefetchIter, PrefetchEngine};
+pub use pool::{cpu_pool, resolve_pool_threads, DEFAULT_DECODE_POOL_MAX_THREADS};
 pub use projection::{scatter_row_full, HvgProjection};
 pub use shuffle::{RowShuffler, ShardShuffler};
 pub use sparse_cellset::{
