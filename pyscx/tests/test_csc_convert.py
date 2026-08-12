@@ -226,11 +226,34 @@ def test_every_preset_aware_entry_point_defaults_csc_to_none():
     )
 
 
+def _rust_body_after(text, start):
+    """The `{...}` body of the fn whose `fn name(` match ended at `start`.
+
+    Brace-matched, so it stops at the function's own closing brace. Naive
+    "everything until the next item" slicing would swallow the following
+    function's rustdoc, and a `resolve_csc_policy` mention left in *that*
+    would mask a deleted call. Line comments are stripped for the same
+    reason: a mention is not a call.
+    """
+    i = text.index("{", start)
+    depth, j = 0, i
+    while j < len(text):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    body = text[i : j + 1]
+    return "\n".join(line.split("//")[0] for line in body.splitlines())
+
+
 def _pyfunction_blocks():
     """(name, signature_attr, body) for every `#[pyfunction]` in lib.rs.
 
-    Each block runs from one `#[pyfunction]` to the next, so `body` is the
-    whole function including its attributes.
+    `body` is the function's brace-matched body with comments stripped —
+    not the raw span between attributes.
     """
     import pathlib
     import re
@@ -239,12 +262,16 @@ def _pyfunction_blocks():
     if not src.is_file():
         pytest.skip(f"pyscx Rust source not available at {src}")
 
+    text = src.read_text()
     blocks = []
-    for chunk in src.read_text().split("#[pyfunction]")[1:]:
-        sig = re.search(r"#\[pyo3\(signature = \((.*?)\)\)\]", chunk, re.DOTALL)
-        name = re.search(r"\bfn\s+(\w+)\s*\(", chunk)
+    for m in re.finditer(r"#\[pyfunction\]", text):
+        nxt = text.find("#[pyfunction]", m.end())
+        head = text[m.end() : nxt if nxt != -1 else len(text)]
+        sig = re.search(r"#\[pyo3\(signature = \((.*?)\)\)\]", head, re.DOTALL)
+        name = re.search(r"\bfn\s+(\w+)\s*\(", head)
         if sig and name:
-            blocks.append((name.group(1), sig.group(1), chunk))
+            body = _rust_body_after(text, m.end() + name.end())
+            blocks.append((name.group(1), sig.group(1), body))
     return blocks
 
 
@@ -259,6 +286,10 @@ def test_every_preset_aware_entry_point_calls_resolve_csc_policy():
     So assert the other half at the source: every `#[pyfunction]` whose
     pyo3 signature carries both `csc` and `index_preset` must call
     `resolve_csc_policy` in its body.
+
+    The body is brace-matched and comment-stripped, so a `resolve_csc_policy`
+    mention in a neighbouring function's rustdoc or in a comment cannot
+    stand in for a real call.
 
     Scope, stated so it is not over-trusted: this reads `src/lib.rs` only,
     where all four conversion entry points live today. A preset-aware
@@ -322,7 +353,7 @@ def tenx_h5(tmp_path):
     path = tmp_path / "filtered_feature_bc_matrix.h5"
     with h5py.File(path, "w") as f:
         g = f.create_group("matrix")
-        g.create_dataset("data", data=counts.data.astype(np.int32))
+        g.create_dataset("data", data=counts.data)  # already int32
         g.create_dataset("indices", data=counts.indices.astype(np.int64))
         g.create_dataset("indptr", data=counts.indptr.astype(np.int64))
         # Transposed, per the 10x spec: [n_vars, n_obs].
