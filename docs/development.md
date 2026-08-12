@@ -114,7 +114,9 @@ cargo build -p scx-accel --features gpu
 
 # Run GPU tests. #[ignore]d by default, so opt in explicitly; SCX_REQUIRE_GPU=1
 # turns "no CUDA device" into a failure instead of a silent early return.
-SCX_REQUIRE_GPU=1 cargo test -p scx-gpu -- --include-ignored
+# --lib --tests keeps --include-ignored away from rustdoc, where ```ignore
+# fences mean the same flag (see testing.md § GPU Test Skip Behavior).
+SCX_REQUIRE_GPU=1 cargo test -p scx-gpu --lib --tests -- --include-ignored
 ```
 
 ### Python editable install (pyscx)
@@ -229,7 +231,7 @@ failure, which is what the sbatch harness sets.
 
 ```bash
 cargo test -p scx-gpu                                          # 42 passed; 170 ignored
-SCX_REQUIRE_GPU=1 cargo test -p scx-gpu -- --include-ignored   # the real run
+SCX_REQUIRE_GPU=1 cargo test -p scx-gpu --lib --tests -- --include-ignored   # the real run
 ```
 
 `scx-gpu/tests/gpu_test_gating.rs` fails the build if a GPU test carries one

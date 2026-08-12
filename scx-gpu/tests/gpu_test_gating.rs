@@ -27,17 +27,23 @@
 //! 1. A test invokes a device gate **iff** it carries the `#[ignore]` reason.
 //! 2. In test-only code, a failure to open a device is never a quiet `return`:
 //!    `GpuDevice::new(0)` must be `.unwrap()`/`.expect()`-terminated, and the
-//!    capability probes may not be called at all. This is the rule that catches
-//!    a gate hidden in a helper function — 11 of `scx-accel`'s 34 GPU tests
-//!    gated through `no_gpu()` / `run_parity()`, invisible to any check that
-//!    only reads test bodies.
-//! 3. Both discovered sets are non-empty, so a rename cannot make this pass
+//!    capability probes may not be called at all. This catches a gate hidden in
+//!    a helper function — 11 of `scx-accel`'s 34 GPU tests gated through
+//!    `no_gpu()` / `run_parity()`, invisible to any check that only reads test
+//!    bodies. Which files count as test-only is resolved by following
+//!    `#[cfg(test)] #[path = "…"] mod …;`, **not** by a filename suffix: the
+//!    suffix version of this rule missed `scx-accel/src/harmony/tests.rs`
+//!    entirely, and a `no_gpu()` planted there passed.
+//! 3. A gate macro may not appear outside a `#[test]` body — wrapped in a
+//!    helper, its `return` leaves the helper and the test runs on regardless.
+//! 4. Both discovered sets are non-empty, so a rename cannot make this pass
 //!    vacuously, and no extracted body over-ran its function.
 //!
 //! An intentional exception carries `// gpu-gate-exempt: <reason>` on the same
 //! or preceding line. Every one is printed on a passing run, so exemptions are
 //! visible in CI output rather than accumulating quietly.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Prefix of the reason string that marks a test as GPU-requiring.
@@ -174,17 +180,44 @@ fn test_fns(text: &str, path: &Path) -> Vec<TestFn> {
     out
 }
 
+/// Files pulled in whole by a `#[cfg(…test…)] #[path = "…"] mod …;`.
+///
+/// Resolved by following the declaration rather than by matching a filename
+/// suffix. The suffix heuristic (`*_tests.rs`) was wrong by exactly one file:
+/// `scx-accel/src/harmony/tests.rs` is included this way, holds four GPU tests,
+/// and has no inline `#[cfg(test)] mod` of its own — so the probe rule below
+/// never scanned it, and a `no_gpu()` helper reintroduced there passed CI.
+fn extracted_test_files(sources: &[PathBuf]) -> HashSet<PathBuf> {
+    let mut out = HashSet::new();
+    for src in sources {
+        let Ok(text) = std::fs::read_to_string(src) else {
+            continue;
+        };
+        for m in text.match_indices("#[path = \"") {
+            let start = m.0 + "#[path = \"".len();
+            let Some(end) = text[start..].find('"') else {
+                continue;
+            };
+            let name = &text[start..start + end];
+            // The `#[cfg(…test…)]` sits within a couple of lines above.
+            let ctx_start = text[..m.0].rfind("#[cfg(").unwrap_or(0);
+            if !text[ctx_start..m.0].contains("test") {
+                continue;
+            }
+            if let Some(dir) = src.parent() {
+                out.insert(dir.join(name));
+            }
+        }
+    }
+    out
+}
+
 /// Regions of `text` that are compiled only under `cfg(test)`.
 ///
-/// A `*_tests.rs` file is test-only in its entirety (the repo's convention for
-/// extracted test modules, per `docs/conventions.md`); elsewhere it is the body
-/// of each `#[cfg(…test…)] mod … { … }`.
-fn test_regions(text: &str, path: &Path) -> Vec<String> {
-    let is_extracted = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with("_tests.rs"));
-    if is_extracted {
+/// A file listed in `extracted` is test-only in its entirety; elsewhere it is
+/// the body of each `#[cfg(…test…)] mod … { … }`.
+fn test_regions(text: &str, path: &Path, extracted: &HashSet<PathBuf>) -> Vec<String> {
+    if extracted.contains(path) {
         return vec![text.to_string()];
     }
 
@@ -251,6 +284,7 @@ fn is_exempt_near(region: &str, occurrence: usize) -> bool {
 }
 
 struct Scan {
+    gate_outside_a_test: Vec<String>,
     gated_without_ignore: Vec<String>,
     ignored_without_gate: Vec<String>,
     quiet_probes: Vec<String>,
@@ -262,6 +296,7 @@ struct Scan {
 
 fn scan(tree: &Path) -> Scan {
     let mut s = Scan {
+        gate_outside_a_test: Vec::new(),
         gated_without_ignore: Vec::new(),
         ignored_without_gate: Vec::new(),
         quiet_probes: Vec::new(),
@@ -271,13 +306,17 @@ fn scan(tree: &Path) -> Scan {
         exempt: Vec::new(),
     };
 
-    for path in rust_sources(tree) {
-        let text = std::fs::read_to_string(&path).expect("read source");
+    let sources = rust_sources(tree);
+    let extracted = extracted_test_files(&sources);
+
+    for path in &sources {
+        let path = path.as_path();
+        let text = std::fs::read_to_string(path).expect("read source");
         if !text.contains("#[test]") && !text.contains("#[cfg(test") {
             continue;
         }
 
-        for t in test_fns(&text, &path) {
+        for t in test_fns(&text, path) {
             s.tests += 1;
             assert!(
                 !t.body.contains("#[test]"),
@@ -298,13 +337,40 @@ fn scan(tree: &Path) -> Scan {
             }
         }
 
-        for region in test_regions(&text, &path) {
+        for region in test_regions(&text, path, &extracted) {
             s.regions += 1;
             let base_line = text
                 .find(&region)
                 .map_or(1, |off| line_of(&text, off))
                 .saturating_sub(1);
             s.exempt.extend(exemptions(&region, &path, base_line));
+
+            // A gate macro outside a `#[test]` body is the last way to hide
+            // one: its `return` leaves the *helper*, so the test carries on
+            // regardless — and neither rule above sees a gate or a raw probe.
+            // Whole-line comments are stripped so a rustdoc that merely names
+            // the macro is not counted as an invocation.
+            let code: String = region
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let in_bodies: String = test_fns(&region, &path)
+                .iter()
+                .map(|t| t.body.as_str())
+                .collect();
+            for gate in DEVICE_GATES {
+                let outside = code
+                    .matches(gate)
+                    .count()
+                    .saturating_sub(in_bodies.matches(gate).count());
+                if outside > 0 {
+                    s.gate_outside_a_test.push(format!(
+                        "{}: {outside} × `{gate}` outside any #[test] fn",
+                        path.display()
+                    ));
+                }
+            }
 
             for (i, _) in region.match_indices("GpuDevice::new(0)") {
                 let tail = &region[i..(i + 120).min(region.len())];
@@ -374,6 +440,11 @@ fn gpu_tests_are_gated_and_ignored() {
         for f in &s.ignored_without_gate {
             failures.push(format!(
                 "ignored as GPU-requiring but never gates (so it runs nowhere): {f}"
+            ));
+        }
+        for f in &s.gate_outside_a_test {
+            failures.push(format!(
+                "gate macro in a helper — its `return` leaves the helper, not the test: {f}"
             ));
         }
         for f in &s.quiet_probes {

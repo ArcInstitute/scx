@@ -24,8 +24,9 @@ jobs:
           # only the save failed). main keeps the cache fresh.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Validates that the entire workspace — including scx-gpu (cudarc) —
-      # compiles on machines without CUDA installed. GPU tests gracefully
-      # skip at runtime via require_gpu!().
+      # compiles on machines without CUDA installed. GPU tests are `#[ignore]`d
+      # and gated, so the Test job reports them as ignored rather than as passes
+      # that did nothing; scx-gpu/tests/gpu_test_gating.rs enforces the pairing.
       - name: Verify CPU-only workspace build
         run: cargo build --workspace --exclude rscx
 

@@ -265,8 +265,8 @@ for the full gate table and workflow.
 ```bash
 # Rust-level GPU tests. They are #[ignore]d, so --include-ignored is required
 # and SCX_REQUIRE_GPU=1 makes a missing device a failure rather than a skip.
-SCX_REQUIRE_GPU=1 cargo test -p scx-gpu -- --include-ignored
-SCX_REQUIRE_GPU=1 cargo test -p scx-accel --features gpu -- --include-ignored
+SCX_REQUIRE_GPU=1 cargo test -p scx-gpu --lib --tests -- --include-ignored
+SCX_REQUIRE_GPU=1 cargo test -p scx-accel --features gpu --lib --tests -- --include-ignored
 
 # On a Chimera GPU node, both suites with the preflight and skip summary:
 bash benchmarks/scripts/slurm_scx_gpu_tests.sh
@@ -293,9 +293,16 @@ library *below* the device gate.
 
 ```bash
 cargo test -p scx-gpu                    # 42 passed; 170 ignored   ← honest on a CPU host
-cargo test -p scx-gpu -- --include-ignored   # selects them; they skip, printing SCX_GPU_TEST_SKIPPED
-SCX_REQUIRE_GPU=1 cargo test -p scx-gpu -- --include-ignored   # 170 FAILED — no device, and one was required
+cargo test -p scx-gpu --lib --tests -- --include-ignored   # selects them; they skip, printing SCX_GPU_TEST_SKIPPED
+SCX_REQUIRE_GPU=1 cargo test -p scx-gpu --lib --tests -- --include-ignored   # 170 FAILED — no device, and one was required
 ```
+
+⚠️ **`--lib --tests` is load-bearing, not decoration.** Cargo forwards
+`--include-ignored` to *every* harness it starts, including rustdoc's — where an
+` ```ignore ` fence means the same flag. Three scx-gpu module-doc examples
+(`cusolver`, `cusparse`, `gpu_preprocess`) are illustrative pseudo-code fenced
+that way, so the unscoped form additionally fails on them. Run doctests
+separately with `cargo test -p scx-gpu --doc`.
 
 `SCX_REQUIRE_GPU=1` turns "no device" from a skip into a hard failure;
 `SCX_REQUIRE_NVCOMP=1` / `SCX_REQUIRE_CUVS=1` do the same per optional library.
