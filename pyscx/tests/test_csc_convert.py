@@ -232,8 +232,17 @@ def _rust_body_after(text, start):
     Brace-matched, so it stops at the function's own closing brace. Naive
     "everything until the next item" slicing would swallow the following
     function's rustdoc, and a `resolve_csc_policy` mention left in *that*
-    would mask a deleted call. Line comments are stripped for the same
-    reason: a mention is not a call.
+    would mask a deleted call.
+
+    Only whole-line comments are dropped. Splitting every line at its
+    first `//` would truncate `"https://…"` mid-string, which can only
+    lose a real call (a loud failure), but there is no reason to accept
+    even that when the rustdoc case this exists for is always whole-line.
+
+    The brace counter does not know about `{` inside string literals or
+    `/* */`, so an unbalanced one could run the body past the function's
+    end — the one direction that could *hide* a missing call. The caller
+    checks for that rather than this trying to lex Rust.
     """
     i = text.index("{", start)
     depth, j = 0, i
@@ -246,7 +255,9 @@ def _rust_body_after(text, start):
                 break
         j += 1
     body = text[i : j + 1]
-    return "\n".join(line.split("//")[0] for line in body.splitlines())
+    return "\n".join(
+        line for line in body.splitlines() if not line.lstrip().startswith("//")
+    )
 
 
 def _pyfunction_blocks():
@@ -300,6 +311,13 @@ def test_every_preset_aware_entry_point_calls_resolve_csc_policy():
     blocks = _pyfunction_blocks()
     assert blocks, "parsed no #[pyfunction] blocks out of lib.rs — the scan is broken"
 
+    # A body that ran past its own closing brace would swallow the next
+    # function and could borrow *its* call — the only failure direction
+    # that hides a missing one. An over-run always captures the following
+    # `#[pyfunction]`, so its absence is the integrity check.
+    overrun = [n for n, _, body in blocks if "#[pyfunction]" in body]
+    assert not overrun, f"brace matching ran past the end of: {overrun}"
+
     preset_aware = [
         (name, body)
         for name, sig, body in blocks
@@ -310,7 +328,8 @@ def test_every_preset_aware_entry_point_calls_resolve_csc_policy():
         "discovery is broken, not the surface"
     )
 
-    missing = [n for n, body in preset_aware if "resolve_csc_policy" not in body]
+    # `resolve_csc_policy(` — a call, not a bare mention.
+    missing = [n for n, body in preset_aware if "resolve_csc_policy(" not in body]
     assert not missing, (
         f"these entry points accept both `csc` and `index_preset` but never "
         f"call `resolve_csc_policy`, so an accel-ready preset cannot upgrade "
