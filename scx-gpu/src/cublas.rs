@@ -374,6 +374,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_cublas_handle() {
         let _dev = require_gpu!();
         let handle = CublasHandle::new().unwrap();
@@ -412,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_sgemm_matches_cpu() {
         let dev = require_gpu!();
         let handle = CublasHandle::new().unwrap();
@@ -462,6 +464,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_sgemm_transpose_a() {
         let dev = require_gpu!();
         let handle = CublasHandle::new().unwrap();
@@ -510,6 +513,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_sgemv_matches_cpu() {
         let dev = require_gpu!();
         let handle = CublasHandle::new().unwrap();
@@ -562,6 +566,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_sgemv_transpose() {
         let dev = require_gpu!();
         let handle = CublasHandle::new().unwrap();
@@ -614,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_sger_matches_cpu() {
         let dev = require_gpu!();
         let handle = CublasHandle::new().unwrap();

@@ -697,6 +697,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_streaming_mean_var_matches_cpu() {
         let dev = require_gpu!();
         let n_rows = 500;
@@ -736,6 +737,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_streaming_clip_square_sum_matches_cpu() {
         let dev = require_gpu!();
         let n_rows = 500;
@@ -775,6 +777,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_streaming_mean_var_empty() {
         let dev = require_gpu!();
         let source = InMemorySource {
@@ -861,6 +864,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_streaming_mean_var_batched_matches_cpu() {
         let dev = require_gpu!();
         let n_rows = 500;
@@ -906,6 +910,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_streaming_clip_square_sum_batched_matches_cpu() {
         let dev = require_gpu!();
         let n_rows = 500;
@@ -1082,6 +1087,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_streaming_mean_var_csc_matches_cpu() {
         let dev = require_gpu!();
         let (n_rows, n_cols) = (400usize, 90usize);
@@ -1098,6 +1104,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_streaming_clip_square_sum_csc_matches_cpu() {
         let dev = require_gpu!();
         let (n_rows, n_cols) = (400usize, 90usize);
@@ -1123,6 +1130,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_streaming_mean_var_csc_empty() {
         let dev = require_gpu!();
         let src = InMemCscSource {
@@ -1137,6 +1145,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_streaming_csc_hot_gene_and_all_zero() {
         // A hot gene (col 0 nonzero in every row) and an all-zero gene (col 1
         // empty) in a single shard. Proves the one-block-per-column reduce

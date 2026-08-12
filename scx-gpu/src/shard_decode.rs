@@ -813,6 +813,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_scx1() {
         let dev = require_gpu!();
 
@@ -979,6 +980,7 @@ mod tests {
     /// exercises this path; real data (e.g. pbmc3k cells expressing >=128 genes)
     /// does.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_scx1_dense_rows_u16() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
@@ -991,6 +993,7 @@ mod tests {
     /// Same SIMD-layout parity for u32 column indices (n_cols > 65535), which
     /// exercises the wider `frame_min` / `frame_bits` path of the BitPacker4x kernel.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_scx1_dense_rows_u32() {
         let dev = require_gpu!();
         let n_cols: u32 = 70_000;
@@ -1142,6 +1145,7 @@ mod tests {
     /// multi-group fixture (14 rows, `row_group_rows = 4` → 4 groups) exercises
     /// the per-group concat path.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_framed() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
@@ -1223,6 +1227,7 @@ mod tests {
     /// multi-group fixture (14 rows, `row_group_rows = 4`) has groups with
     /// g_nnz up to ~647, exercising the multi-tile undelta prefix-scan carry.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_framed_shufdelta_u16() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
@@ -1234,6 +1239,7 @@ mod tests {
     /// Framed ShufDeltaZstd GPU decode, u32 indices (n_cols > 65535) — 4-plane
     /// undelta + 4-wide unshuffle.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_framed_shufdelta_u32() {
         let dev = require_gpu!();
         let n_cols: u32 = 70_000;
@@ -1246,6 +1252,7 @@ mod tests {
     /// `row_group_rows`) so a plane's `g_nnz` spans many 256-element tiles,
     /// exercising multi-hop carry propagation in the single-block undelta kernel.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_framed_shufdelta_large_group() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
@@ -1258,6 +1265,7 @@ mod tests {
 
     /// Unframed (v1) ShufDeltaZstd GPU decode vs the CPU reference decode.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_unframed_shufdelta() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
@@ -1312,6 +1320,7 @@ mod tests {
     /// Float-valued ShufDeltaZstd (zstd-only, no plane transforms) has no GPU
     /// path and must fall back to the host-bounce, still decoding correctly.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_framed_shufdelta_float_fallback() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
@@ -1374,6 +1383,7 @@ mod tests {
     /// the sequential (Phase-1) path forced by `SCX_SHUFDELTA_GPU_SEQUENTIAL=1`,
     /// and both match the source CSR. Both take the shufdelta GPU path.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_shufdelta_pipeline_matches_sequential() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
@@ -1429,6 +1439,7 @@ mod tests {
     /// producer/consumer channel + backpressure + empty-group skipping in the
     /// pipelined path. Output must stay byte-exact vs source.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_shufdelta_many_small_groups() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
@@ -1443,12 +1454,10 @@ mod tests {
     /// compressed bytes cross PCIe) — and is byte-identical to the source CSR.
     /// Skipped when nvcomp is not loadable.
     #[test]
+    #[ignore = "requires a CUDA GPU + nvcomp"]
     fn test_shard_decode_gpu_shufdelta_nvcomp() {
         let dev = require_gpu!();
-        if !crate::nvcomp::nvcomp_available() {
-            eprintln!("nvcomp not available — skipping Phase 2 nvcomp path test");
-            return;
-        }
+        require_gpu_cap!(nvcomp);
         let n_cols: u32 = 4000;
         let row_nnzs = [0usize, 1, 5, 130, 256, 7, 0, 384, 200, 3, 128, 129, 512, 50];
         let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
@@ -1492,12 +1501,10 @@ mod tests {
     /// nvcomp path (`SCX_NVCOMP_NO_BATCH=1`), and reports `fully_device_decoded`
     /// with `n_shards_shufdelta_gpu == n_shards`. Skipped when nvcomp is absent.
     #[test]
+    #[ignore = "requires a CUDA GPU + nvcomp"]
     fn test_shufdelta_shards_nvcomp_batched_matches_host() {
         let dev = require_gpu!();
-        if !crate::nvcomp::nvcomp_available() {
-            eprintln!("nvcomp not available — skipping Phase 2.x batched test");
-            return;
-        }
+        require_gpu_cap!(nvcomp);
         let n_cols: u32 = 4000;
         // Three uneven shards, each multi-group (row_group_rows = 4) with empty,
         // sparse, exactly-threshold and dense (>=128 nnz) rows.
@@ -1600,6 +1607,7 @@ mod tests {
     /// batched tests above early-return there, leaving that path uncovered.
     /// Runs whenever a GPU is present.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shufdelta_shards_no_nvcomp_matches_host() {
         let dev = require_gpu!();
         // Force the non-nvcomp per-shard path regardless of nvcomp availability,
@@ -1669,12 +1677,10 @@ mod tests {
     /// path). Guards the shard-chunking that bounds the transient host/device
     /// footprint. Skipped when nvcomp is absent.
     #[test]
+    #[ignore = "requires a CUDA GPU + nvcomp"]
     fn test_shufdelta_shards_nvcomp_batched_chunked_matches_host() {
         let dev = require_gpu!();
-        if !crate::nvcomp::nvcomp_available() {
-            eprintln!("nvcomp not available — skipping M3 chunked batched test");
-            return;
-        }
+        require_gpu_cap!(nvcomp);
         let n_cols: u32 = 4000;
         let shard_row_nnzs: [&[usize]; 3] = [
             &[0usize, 1, 5, 130, 256, 7, 0, 384],
@@ -1752,12 +1758,10 @@ mod tests {
     /// (the spec's Open Question #1), and a warm-up call to exclude one-time
     /// nvcomp init from the timing. Skipped when nvcomp is not loadable.
     #[test]
+    #[ignore = "requires a CUDA GPU + nvcomp"]
     fn test_nvcomp_zstd_batch_matches_cpu() {
         let dev = require_gpu!();
-        if !crate::nvcomp::nvcomp_available() {
-            eprintln!("nvcomp not available — skipping Phase 2 spike");
-            return;
-        }
+        require_gpu_cap!(nvcomp);
         // 16384 rows × 1000 nnz, row_group_rows=64 → 256 groups → 256 frames per
         // sub-stream: enough independent frames to fill an H100's SMs.
         let n_cols: u32 = 30000;
@@ -1867,6 +1871,7 @@ mod tests {
     /// to the same matrix decoded unframed (v1) on the device — proving the
     /// per-group concat + host-assembled indptr equals the whole-shard path.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_framed_scx1_matches_unframed() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
@@ -1921,6 +1926,7 @@ mod tests {
     /// within one group) exercises the `g_nnz == 0` branch: the group's indptr is
     /// extended but no device decode / dtod copy runs. Output stays byte-identical.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_framed_scx1_empty_group() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
@@ -1953,6 +1959,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_none() {
         let dev = require_gpu!();
 
@@ -2015,6 +2022,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_shard_decode_gpu_zstd() {
         let dev = require_gpu!();
 

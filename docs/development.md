@@ -27,8 +27,10 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 
 The default workspace build compiles all crates — including `scx-gpu` — on
 CPU-only machines. `cudarc` (the CUDA binding crate) compiles without a CUDA
-toolkit installed; GPU functionality is only exercised at runtime. GPU tests
-gracefully skip via the `require_gpu!()` macro when no CUDA device is present.
+toolkit installed; GPU functionality is only exercised at runtime. GPU tests are
+`#[ignore]`d, so a CPU-only run reports them as ignored — `cargo test -p scx-gpu`
+prints `42 passed; 170 ignored` rather than claiming to have run them. See
+[testing.md § GPU Test Skip Behavior](testing.md#gpu-test-skip-behavior).
 
 ```bash
 # Build all crates except rscx (which requires the R toolchain).
@@ -110,8 +112,9 @@ cargo check -p scx-gpu
 # Build scx-accel with GPU support (requires CUDA toolkit for full functionality)
 cargo build -p scx-accel --features gpu
 
-# Run GPU tests (skips gracefully if no CUDA device is present)
-cargo test -p scx-gpu --features bench
+# Run GPU tests. #[ignore]d by default, so opt in explicitly; SCX_REQUIRE_GPU=1
+# turns "no CUDA device" into a failure instead of a silent early return.
+SCX_REQUIRE_GPU=1 cargo test -p scx-gpu -- --include-ignored
 ```
 
 ### Python editable install (pyscx)
@@ -218,11 +221,21 @@ cd rscx && Rscript -e 'testthat::test_dir("tests/testthat")' && cd ..
 
 ### GPU test skip behavior
 
-All GPU tests use a `require_gpu!()` macro that:
-1. Attempts to create a `GpuDevice` (CUDA context + stream)
-2. If initialization fails (no GPU, no driver, wrong CUDA version), returns
-   `Ok(())` silently
-3. Tests run normally on GPU nodes; safely skipped on CPU-only machines
+A GPU test that cannot run is **ignored**, never passed. Each one carries
+`#[ignore = "requires a CUDA GPU"]` (so a default run counts and names it) plus
+`require_gpu!()` / `require_gpu_or_skip!()` (so it returns early if selected on
+a host with no device). `SCX_REQUIRE_GPU=1` turns that early return into a hard
+failure, which is what the sbatch harness sets.
+
+```bash
+cargo test -p scx-gpu                                          # 42 passed; 170 ignored
+SCX_REQUIRE_GPU=1 cargo test -p scx-gpu -- --include-ignored   # the real run
+```
+
+`scx-gpu/tests/gpu_test_gating.rs` fails the build if a GPU test carries one
+half of that pairing without the other. Full detail, including the optional
+nvcomp/cuVS gates: [testing.md § GPU Test Skip
+Behavior](testing.md#gpu-test-skip-behavior).
 
 ### Python test suite
 
@@ -262,7 +275,9 @@ combinations that are not covered by the default workspace build:
 compiles without CUDA installed. This ensures that:
 - `cargo build --workspace --exclude rscx` works on any machine with a Rust toolchain
 - `cargo test --workspace --exclude rscx` runs all non-GPU tests everywhere
-- GPU tests gracefully skip via `require_gpu!()`
+- GPU tests are `#[ignore]`d, so they are counted and named as ignored rather
+  than reported as passes that did nothing; `scx-gpu/tests/gpu_test_gating.rs`
+  fails the build if a GPU test drops either half of that contract
 - CI validates the CPU-only build contract on every PR
 
 ### Feature flags

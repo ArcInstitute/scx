@@ -548,17 +548,6 @@ mod tests {
         }
     }
 
-    /// Skip helper: returns true (and prints) when no CUDA device is present.
-    #[cfg(feature = "gpu")]
-    fn no_gpu() -> bool {
-        if scx_gpu::device::GpuDevice::new(0).is_err() {
-            eprintln!("CUDA not available — skipping GPU Wilcoxon v3 parity test");
-            true
-        } else {
-            false
-        }
-    }
-
     /// Run the CPU CSR streaming baseline for the given fixture/params.
     #[cfg(feature = "gpu")]
     #[allow(clippy::too_many_arguments)]
@@ -642,10 +631,9 @@ mod tests {
     /// (1) CSC-direct vs CPU streaming — 1-vs-rest.
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn wilcoxon_gpu_v3_csc_one_vs_rest() {
-        if no_gpu() {
-            return;
-        }
+        require_gpu_or_skip!();
         let dir = tempdir().unwrap();
         let (path, gn, gr, names) = three_group_fixture(dir.path(), "wil_csc_ovr", 7);
         let cpu = cpu_baseline(&path, &gn, &gr, &names, None, 7);
@@ -657,10 +645,9 @@ mod tests {
     /// (2) CSC-direct vs CPU streaming — ref-mode.
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn wilcoxon_gpu_v3_csc_ref_mode() {
-        if no_gpu() {
-            return;
-        }
+        require_gpu_or_skip!();
         let dir = tempdir().unwrap();
         let (path, gn, gr, names) = three_group_fixture(dir.path(), "wil_csc_ref", 7);
         let cpu = cpu_baseline(&path, &gn, &gr, &names, Some(0), 7);
@@ -672,10 +659,9 @@ mod tests {
     /// (3) CSR-direct fallback (no CSC sidecar) vs CPU streaming — 1-vs-rest.
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn wilcoxon_gpu_v3_csr_fallback() {
-        if no_gpu() {
-            return;
-        }
+        require_gpu_or_skip!();
         let dir = tempdir().unwrap();
         let (path, gn, gr, names) = three_group_fixture(dir.path(), "wil_csr_fb", 7);
         let cpu = cpu_baseline(&path, &gn, &gr, &names, None, 7);
@@ -687,10 +673,9 @@ mod tests {
     /// (4) Route metadata: CSC sidecar → GpuCscV3; none → GpuCsrV3 (v3 on).
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn wilcoxon_gpu_v3_route_metadata() {
-        if no_gpu() {
-            return;
-        }
+        require_gpu_or_skip!();
         let dir = tempdir().unwrap();
         let (path, gn, gr, names) = three_group_fixture(dir.path(), "wil_route", 7);
         let csc = gpu_v3(&path, &gn, &gr, &names, Some(0), 7, true);
@@ -710,10 +695,9 @@ mod tests {
     /// (5) Empty test group — must produce NaN score / p=1 matching CPU.
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn wilcoxon_gpu_v3_csc_empty_group() {
-        if no_gpu() {
-            return;
-        }
+        require_gpu_or_skip!();
         let dir = tempdir().unwrap();
         let (path, gn, gr, _names) = three_group_fixture(dir.path(), "wil_empty", 7);
         // 4th group label with zero members.
@@ -731,10 +715,9 @@ mod tests {
     /// (6) All-zero gene column — defined U / p=1 for the constant column.
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn wilcoxon_gpu_v3_csc_all_zero_gene() {
-        if no_gpu() {
-            return;
-        }
+        require_gpu_or_skip!();
         let n_obs = 48usize;
         let n_vars = 12usize;
         let mut dense = deterministic_dense(n_obs, n_vars);
@@ -755,10 +738,9 @@ mod tests {
     /// (7) Tie-spanning gene — constant value across all cells (max ties).
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn wilcoxon_gpu_v3_csc_tie_spanning_gene() {
-        if no_gpu() {
-            return;
-        }
+        require_gpu_or_skip!();
         let n_obs = 48usize;
         let n_vars = 12usize;
         let mut dense = deterministic_dense(n_obs, n_vars);
@@ -780,10 +762,9 @@ mod tests {
     /// `gene_chunk_size=7` spans shard boundaries (exercises range prefilter).
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn wilcoxon_gpu_v3_csc_multi_shard() {
-        if no_gpu() {
-            return;
-        }
+        require_gpu_or_skip!();
         let dir = tempdir().unwrap();
         let (path, gn, gr, names) = three_group_fixture(dir.path(), "wil_multishard", 4);
         let cpu = cpu_baseline(&path, &gn, &gr, &names, None, 7);

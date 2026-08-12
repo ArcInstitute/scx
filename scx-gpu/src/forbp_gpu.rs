@@ -294,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_forbp_gpu_vs_cpu_basic() {
         let dev = require_gpu!();
         let rows = vec![vec![0u32, 5, 10, 20], vec![1, 3, 7], vec![100, 200]];
@@ -314,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_forbp_gpu_vs_cpu_variable_nnz() {
         let dev = require_gpu!();
         // 140 rows spanning 2 FOR-BP blocks (128 + 12), mix of empty and non-empty
@@ -358,6 +360,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_forbp_gpu_vs_cpu_u16_indices() {
         let dev = require_gpu!();
         // Rows with u16 indices including values near the u16 max (65535)
@@ -433,6 +436,7 @@ mod tests {
     /// Dense rows (>= 128 nnz → BitPacker4x) at every chunk boundary + remainder,
     /// interleaved with empty and sparse (scalar-kernel) rows; u16 indices.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_forbp_gpu_bp4x_dense_u16() {
         let dev = require_gpu!();
         let rows = vec![
@@ -451,6 +455,7 @@ mod tests {
     /// One dense (nnz = 256) row per target `frame_bits` (1, 7, 16, 31, 32),
     /// u32 indices — covers the no-span (fb = 32) and two-word-span paths.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_forbp_gpu_bp4x_frame_bits_sweep_u32() {
         let dev = require_gpu!();
         let rows = vec![
@@ -467,6 +472,7 @@ mod tests {
     /// indices equal) — routed to the scalar kernel (index_packing == 1), which
     /// previously host-fell-back at >= 128 nnz. Plus a dense fb > 0 neighbour.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_forbp_gpu_bp4x_frame_bits_zero_dense() {
         let dev = require_gpu!();
         let rows = vec![

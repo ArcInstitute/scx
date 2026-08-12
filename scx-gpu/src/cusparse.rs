@@ -1078,6 +1078,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_cusparse_descriptor() {
         let dev = require_gpu!();
         let shard_bytes = build_small_shard();
@@ -1104,6 +1105,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_device_pointers() {
         let dev = require_gpu!();
         let shard_bytes = build_small_shard();
@@ -1214,6 +1216,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_spmm_csr() {
         let dev = require_gpu!();
 
@@ -1272,6 +1275,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_spmm_csr_transpose() {
         let dev = require_gpu!();
 
@@ -1330,6 +1334,7 @@ mod tests {
     /// match the contiguous-buffer result bit-for-bit and that the
     /// untouched rows remain zero.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_spmm_csr_view_matches_contiguous() {
         let dev = require_gpu!();
         let m = 4;
@@ -1423,6 +1428,7 @@ mod tests {
     /// Same as the forward parity test but for the transpose path. Reads a
     /// strided `(m × n)` view from a `(ld × n)` source buffer.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_spmm_csr_transpose_view_matches_contiguous() {
         let dev = require_gpu!();
         let m = 4;
@@ -1504,6 +1510,7 @@ mod tests {
     /// The pool must reuse its single grow-only slot across SpMM calls of the
     /// same shape.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_workspace_pool_reuses_across_calls() {
         let dev = require_gpu!();
         let m = 4;
@@ -1558,6 +1565,7 @@ mod tests {
 
     /// The pool must grow exactly once when a larger shape arrives.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_workspace_pool_grows_on_bigger_shape() {
         let dev = require_gpu!();
         // Small CSR: 4×3.
@@ -1660,6 +1668,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_spmm_alpha_beta() {
         let dev = require_gpu!();
 

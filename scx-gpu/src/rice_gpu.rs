@@ -160,6 +160,7 @@ mod tests {
     use scx_codec::rice::{rice_decode, rice_encode, B_VAL};
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_rice_gpu_vs_cpu_all_ones() {
         let dev = require_gpu!();
         let values = vec![1u32; 256];
@@ -176,6 +177,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_rice_gpu_vs_cpu_typical_umi() {
         let dev = require_gpu!();
         // Typical UMI distribution: ~55% ones, geometric tail
@@ -210,6 +212,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_rice_gpu_vs_cpu_multi_block() {
         let dev = require_gpu!();
         // 600 values = 3 blocks: 256 + 256 + 88
@@ -232,6 +235,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_rice_gpu_vs_cpu_outlier() {
         let dev = require_gpu!();
         // Most values are 1, with large outliers that produce long unary codes

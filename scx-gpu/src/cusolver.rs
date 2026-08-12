@@ -512,6 +512,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_cusolver_handle() {
         let _dev = require_gpu!();
         let handle = CusolverHandle::new().unwrap();
@@ -520,6 +521,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_qr_orthonormal() {
         let dev = require_gpu!();
         let handle = CusolverHandle::new().unwrap();
@@ -562,6 +564,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_qr_tall_skinny() {
         let dev = require_gpu!();
         let handle = CusolverHandle::new().unwrap();
@@ -619,6 +622,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_cholesky_qr2_orthonormal() {
         // Phase 4.3 — CQR2 on a well-conditioned 10_000 × 60 Gaussian matrix.
         // Expect ||Q^T Q − I||_F < 1e-4. Random Gaussian matrices have
@@ -646,6 +650,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_gpu_cholesky_qr2_ill_conditioned() {
         // Phase 4.4 — deliberately non-SPD input: stack near-duplicate columns
         // (col 0 and col 1 differ by 1e-8-scale noise). A^T A is effectively

@@ -338,6 +338,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_sparse_to_dense_gpu_matches_cpu() {
         let dev = require_gpu!();
 
@@ -385,6 +386,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_sparse_to_dense_with_hvg() {
         let dev = require_gpu!();
 

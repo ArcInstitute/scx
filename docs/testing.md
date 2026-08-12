@@ -263,8 +263,13 @@ for the full gate table and workflow.
 ### Running GPU Tests
 
 ```bash
-# Rust-level GPU tests (require CUDA device)
-cargo test -p scx-gpu --features bench
+# Rust-level GPU tests. They are #[ignore]d, so --include-ignored is required
+# and SCX_REQUIRE_GPU=1 makes a missing device a failure rather than a skip.
+SCX_REQUIRE_GPU=1 cargo test -p scx-gpu -- --include-ignored
+SCX_REQUIRE_GPU=1 cargo test -p scx-accel --features gpu -- --include-ignored
+
+# On a Chimera GPU node, both suites with the preflight and skip summary:
+bash benchmarks/scripts/slurm_scx_gpu_tests.sh
 
 # Python-level GPU accelerator tests
 cd pyscx && ../.venv/bin/maturin develop --features hdf5,gpu && \
@@ -273,15 +278,41 @@ cd pyscx && ../.venv/bin/maturin develop --features hdf5,gpu && \
 
 ### GPU Test Skip Behavior
 
-All GPU tests use a `require_gpu!()` macro that gracefully skips when no CUDA
-device is available. This macro:
+A GPU test that cannot run is reported as **ignored**, never as passed. Every
+one carries two things, and needs both:
 
-1. Attempts to create a `GpuDevice` (CUDA context + stream)
-2. If CUDA initialization fails (no GPU, no driver, wrong CUDA version), the test returns `Ok(())` silently
-3. Tests run normally in CI environments with GPUs, and are safely skipped in CPU-only CI
+| | what it does |
+|---|---|
+| `#[ignore = "requires a CUDA GPU"]` | libtest does not select it by default, so a plain run counts and names it as ignored |
+| `require_gpu!()` (scx-gpu) / `require_gpu_or_skip!()` (scx-accel) | acquires device 0 once the test *is* selected, and returns early if there is none |
 
-The macro is defined per-module (e.g., `cusparse.rs`, `cusolver.rs`, `gpu_pca.rs`,
-`gpu_umap.rs`, `gpu_preprocess.rs`) to avoid cross-module test coupling.
+Both macros delegate to `scx_gpu::test_gate`, which is a normal `pub` module
+rather than `#[cfg(test)]` so that `scx-accel` shares the identical decision.
+`require_gpu_cap!(nvcomp)` / `require_gpu_cap!(cuvs)` gate on an optional CUDA
+library *below* the device gate.
+
+```bash
+cargo test -p scx-gpu                    # 42 passed; 170 ignored   ← honest on a CPU host
+cargo test -p scx-gpu -- --include-ignored   # selects them; they skip, printing SCX_GPU_TEST_SKIPPED
+SCX_REQUIRE_GPU=1 cargo test -p scx-gpu -- --include-ignored   # 170 FAILED — no device, and one was required
+```
+
+`SCX_REQUIRE_GPU=1` turns "no device" from a skip into a hard failure;
+`SCX_REQUIRE_NVCOMP=1` / `SCX_REQUIRE_CUVS=1` do the same per optional library.
+`benchmarks/scripts/_run_scx_gpu_tests.sh` sets `SCX_REQUIRE_GPU=1`, passes
+`--include-ignored`, asserts the result line reports `0 ignored`, and prints
+every `SCX_GPU_TEST_SKIPPED` line as a closing summary — so a node missing
+nvcomp shows up as listed coverage it did not provide, not as tests that
+silently stopped existing.
+
+**Why the pairing is enforced.** Before this, `require_gpu!()` expanded to
+`eprintln! + return` with no `#[ignore]`, so 170 tests here and 34 in
+`scx-accel` were guaranteed no-ops on every CPU host — counted as passed, with
+the message swallowed by libtest's output capture. `scx-gpu/tests/gpu_test_gating.rs`
+scans both crates' sources and fails if a test has one half without the other,
+or decides for itself whether to run (a bare `GpuDevice::new(0)` probe, the
+shape 11 of `scx-accel`'s GPU tests used via helper functions). It needs no GPU,
+so it runs in CI — where the drift happens.
 
 ### GPU Correctness Thresholds
 

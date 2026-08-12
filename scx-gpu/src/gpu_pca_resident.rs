@@ -575,6 +575,7 @@ mod tests {
     /// (fits-VRAM) input routes through the resident path on both. Compared by
     /// |cosine| (sign-free), not bitwise.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_resident_capture_vs_direct_subspace() {
         let dev = require_gpu!();
         let (n_rows, n_cols, k) = (400usize, 60usize, 8usize);
@@ -711,6 +712,7 @@ mod tests {
     /// low-rank data. Pre-fix the top subspace is rotated and this fails;
     /// post-fix it passes.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_resident_pca_matches_cpu_reference() {
         let dev = require_gpu!();
         // A small matrix suffices: G1 was cross-*iteration* accumulation into a
@@ -810,6 +812,7 @@ mod tests {
     /// runs are bit-identical, and (3) writing into a reused buffer fully
     /// overwrites it (also guards the G1 concern).
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_column_sum_kernel_f64_deterministic() {
         let dev = require_gpu!();
         let (m, k) = (262_144usize, 3usize);

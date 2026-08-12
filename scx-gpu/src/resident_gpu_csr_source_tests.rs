@@ -126,6 +126,7 @@ fn drain(dev: &GpuDevice, source: &mut dyn GpuMatrixSource) -> Vec<Observed> {
 /// The whole contract: a resident drain is indistinguishable from a streaming
 /// one at the callback boundary.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn resident_drain_matches_streaming_drain_exactly() {
     let dev = require_gpu!();
     let src = fixture();
@@ -157,6 +158,7 @@ fn resident_drain_matches_streaming_drain_exactly() {
 /// Replay is repeatable — the point of residency is that the *second* pass is
 /// free, so the second pass had better be identical to the first.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn resident_source_replays_identically_across_passes() {
     let dev = require_gpu!();
     let src = fixture();
@@ -176,6 +178,7 @@ fn resident_source_replays_identically_across_passes() {
 /// source is still usable afterwards — the caller's fallback is a plain
 /// streaming pass, so an aborted drain must not have poisoned the staging ring.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn tiny_budget_declines_and_leaves_the_source_usable() {
     let dev = require_gpu!();
     let src = fixture();
@@ -211,6 +214,7 @@ fn tiny_budget_declines_and_leaves_the_source_usable() {
 /// still succeeds and yields every shard after a declined one" is the property
 /// that actually has to hold.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn a_declined_build_leaves_the_device_reusable() {
     let dev = require_gpu!();
     let src = fixture();
@@ -236,6 +240,7 @@ fn a_declined_build_leaves_the_device_reusable() {
 /// An empty source is declined rather than producing a zero-shard resident
 /// source that would silently skip the caller's work.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn empty_source_declines() {
     let dev = require_gpu!();
     let src = MultiShardCsr {
@@ -255,6 +260,7 @@ fn empty_source_declines() {
 /// absent from the retained set too — otherwise `global_row` accounting in the
 /// consumer would see a different subsequence.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn empty_shards_are_skipped_in_both_drains() {
     let dev = require_gpu!();
     let n_vars = 32;
@@ -294,6 +300,7 @@ fn empty_shards_are_skipped_in_both_drains() {
 /// The resident source retains CSR only; a CSC request must fail loudly rather
 /// than silently returning nothing.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn csc_request_is_unsupported() {
     let dev = require_gpu!();
     let src = fixture();
@@ -309,6 +316,7 @@ fn csc_request_is_unsupported() {
 /// power-of-two capacity — the property that keeps resident VRAM equal to the
 /// matrix rather than up to 2× it.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn clone_exact_is_exactly_sized() {
     let dev = require_gpu!();
     // 9 rows / a nnz that is not a power of two, so the staging slot's

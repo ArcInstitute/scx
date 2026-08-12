@@ -1,19 +1,6 @@
 use super::*;
 use crate::diffexp::{pdex_ref, wilcoxon_rank_sum};
 
-/// Skip the test cleanly when no CUDA GPU is available.
-macro_rules! require_gpu_or_skip {
-    () => {
-        match scx_gpu::GpuDevice::new(0) {
-            Ok(_) => 0usize,
-            Err(_) => {
-                eprintln!("CUDA not available — skipping GPU DE test");
-                return;
-            }
-        }
-    };
-}
-
 // ---- Synthetic dimension-bound guards (pure, no GPU required) ----
 
 #[test]
@@ -133,8 +120,9 @@ fn make_fixture() -> (
 /// match within `< 1e-9 abs / 1e-6 rel`, target/ref/log2fc within
 /// `< 1e-4 rel` (mirrors `test_pdex_ref_parity.py` tolerance).
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_pdex_ref_gpu_dense_matches_cpu() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
 
     let (data, n_obs, n_vars, gene_names, groups, group_names, reference) = make_fixture();
     let mode = crate::pseudobulk::GeomMeanMode::ArithRaw;
@@ -235,8 +223,9 @@ fn test_pdex_ref_gpu_dense_matches_cpu() {
 /// (the `SCX_DISABLE_CUDA_GRAPHS=1` env var is `OnceLock`-cached
 /// at process start and can't be re-read).
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_pdex_ref_gpu_graph_vs_direct_parity() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
 
     let (data, n_obs, n_vars, gene_names, groups, group_names, reference) = make_fixture();
     let mode = crate::pseudobulk::GeomMeanMode::ArithRaw;
@@ -323,8 +312,9 @@ fn test_pdex_ref_gpu_graph_vs_direct_parity() {
 /// tolerance. Test compares raw p (not BH) since the per-group sort
 /// ordering can differ on ties.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_wilcoxon_gpu_dense_matches_cpu_one_vs_rest() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
 
     let (data, n_obs, n_vars, gene_names, groups, group_names, _reference) = make_fixture();
 
@@ -407,8 +397,9 @@ fn test_wilcoxon_gpu_dense_matches_cpu_one_vs_rest() {
 /// p / score, same shape as
 /// `test_pdex_ref_gpu_graph_vs_direct_parity`.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_wilcoxon_gpu_one_vs_rest_graph_vs_direct_parity() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
 
     let (data, n_obs, n_vars, gene_names, groups, group_names, _reference) = make_fixture();
 
@@ -495,8 +486,9 @@ fn test_wilcoxon_gpu_one_vs_rest_graph_vs_direct_parity() {
 /// last return value; passing it as `reference: Some(...)` routes
 /// the GPU driver into the ref-mode capture path.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_wilcoxon_gpu_ref_mode_graph_vs_direct_parity() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
 
     let (data, n_obs, n_vars, gene_names, groups, group_names, reference) = make_fixture();
     // `reference` is a `usize` (group index) — make_fixture always
@@ -583,8 +575,9 @@ fn test_wilcoxon_gpu_ref_mode_graph_vs_direct_parity() {
 /// without a per-chunk `buf.fill(0.0)`, non-zero entries from chunk
 /// N-1 leak into the zero positions of chunk N and corrupt every U.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_pdex_ref_gpu_sparse_multi_chunk_matches_dense() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
 
     // 80 cells × 200 genes — chunk_size = 64 forces 4 chunks. Keep
     // the matrix sparse-on-purpose (mostly zeros) so the leak would
@@ -692,8 +685,9 @@ fn test_pdex_ref_gpu_sparse_multi_chunk_matches_dense() {
 /// the reference group itself is above 8192 cells (12K total, with
 /// 9000 reference cells and 3000 test cells).
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_pdex_ref_gpu_multi_tile_matches_cpu() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
 
     let n_obs = 12_000usize;
     let n_vars = 6usize;
@@ -920,8 +914,9 @@ fn run_pdex_pair(
 /// Hand-crafted counts: gene 0 puts the singleton above the entire ref
 /// distribution; gene 1 puts it below; gene 2 puts it inside.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_pdex_ref_gpu_group_of_one_cell() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
     let n_obs = 11usize;
     let n_vars = 3usize;
     let mut data = vec![0.0f32; n_obs * n_vars];
@@ -960,8 +955,9 @@ fn test_pdex_ref_gpu_group_of_one_cell() {
 /// Edge case 2 — gene with zero counts in every cell.
 /// 20 cells × 4 genes, gene 2 is all-zero. ref={0..9}, test_A={10..19}.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_pdex_ref_gpu_all_zero_gene() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
     let n_obs = 20usize;
     let n_vars = 4usize;
     let mut data = vec![0.0f32; n_obs * n_vars];
@@ -991,8 +987,9 @@ fn test_pdex_ref_gpu_all_zero_gene() {
 /// Edge case 3 — reference smaller than test group (n_ref=3, n_test=30).
 /// Exercises the asymmetric `n1 / n2` path in the variance formula.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_pdex_ref_gpu_ref_smaller_than_test_group() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
     let n_obs = 33usize;
     let n_vars = 4usize;
     let mut data = vec![0.0f32; n_obs * n_vars];
@@ -1021,8 +1018,9 @@ fn test_pdex_ref_gpu_ref_smaller_than_test_group() {
 /// (zero-variance group). Exercises the combined-tie-term path on a
 /// pathologically tie-heavy input.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_pdex_ref_gpu_all_equal_values_in_group() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
     let n_obs = 20usize;
     let n_vars = 3usize;
     let mut data = vec![0.0f32; n_obs * n_vars];
@@ -1059,8 +1057,9 @@ fn test_pdex_ref_gpu_all_equal_values_in_group() {
 /// (integer-valued) and within the documented p-value / FDR
 /// tolerance.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_lazy_entry_points_match_dense_reference() {
-    let _ = require_gpu_or_skip!();
+    require_gpu_or_skip!();
 
     let n_obs = 60usize;
     let n_vars = 150usize;
@@ -1223,29 +1222,6 @@ fn test_gpu_lazy_entry_points_match_dense_reference() {
 // Unlabelled cells on the GPU 1-vs-rest path
 // ---------------------------------------------------------------------------
 
-/// Same gate as `require_gpu_or_skip!`, but `SCX_REQUIRE_GPU=1` turns the skip
-/// into a hard failure and a run prints a marker.
-///
-/// Most of this suite passes green while doing nothing on a CPU host, so a new
-/// GPU regression is worth exactly as much as the proof that it executed. The
-/// marker line is what the sbatch log is grepped for.
-macro_rules! require_gpu_or_skip_loud {
-    ($name:expr) => {
-        match scx_gpu::GpuDevice::new(0) {
-            Ok(_) => {
-                eprintln!("SCX_GPU_TEST_RAN: {}", $name);
-            }
-            Err(e) => {
-                if std::env::var("SCX_REQUIRE_GPU").as_deref() == Ok("1") {
-                    panic!("SCX_REQUIRE_GPU=1 but no CUDA device for {}: {e}", $name);
-                }
-                eprintln!("CUDA not available — skipping {}", $name);
-                return;
-            }
-        }
-    };
-}
-
 /// **The oracle for unlabelled-cell semantics on the GPU**, mirroring
 /// `diffexp::cpu_tests::test_one_vs_rest_unlabelled_cells_equal_physical_subset`.
 ///
@@ -1256,8 +1232,9 @@ macro_rules! require_gpu_or_skip_loud {
 /// subtracted covered labelled groups only — the same numerator/denominator
 /// mismatch the CPU kernels had, replicated deliberately for parity.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset() {
-    require_gpu_or_skip_loud!("wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset");
+    require_gpu_or_skip!();
 
     let n_groups = 3usize;
     let n_vars = 6usize;
@@ -1363,8 +1340,9 @@ fn test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset() {
 /// The GPU 1-vs-rest arm must also agree with the *CPU* kernel when unlabelled
 /// cells are present — the cross-device parity the CPU-only fix would break.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_wilcoxon_gpu_unlabelled_matches_cpu() {
-    require_gpu_or_skip_loud!("wilcoxon_gpu_unlabelled_matches_cpu");
+    require_gpu_or_skip!();
 
     let n_groups = 3usize;
     let n_vars = 5usize;

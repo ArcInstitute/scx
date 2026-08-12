@@ -98,6 +98,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn reports_csr_layout_and_applied_transforms() {
         let dev = require_gpu!();
         let src = InMemCsr {

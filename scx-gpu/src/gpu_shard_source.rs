@@ -842,6 +842,7 @@ mod tests {
     /// this, on the path with the largest shards in the system — had no
     /// production caller and every source started at capacity 1.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn hinted_source_presizes_the_staging_slot() {
         let dev = require_gpu!();
         let shards = vec![make_csr(3, 5, 1.0), make_csr(7, 5, 100.0)];
@@ -1045,6 +1046,7 @@ mod tests {
     /// Raw source yields the staged shard verbatim (slot.view returns
     /// the uploaded data).
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_raw_source_round_trip() {
         let dev = require_gpu!();
         let shards = vec![make_csr(3, 5, 1.0), make_csr(4, 5, 100.0)];
@@ -1075,6 +1077,7 @@ mod tests {
     /// `GpuPreprocessedShardSource` applies normalize+log1p in place;
     /// reading the view's `data` back yields the transformed values.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_preprocessed_source_normalize_log1p() {
         let dev = require_gpu!();
         // Tiny 2-row CSR: row 0 = [5, 5] (sum 10), row 1 = [1, 4] (sum 5).
@@ -1125,6 +1128,7 @@ mod tests {
     /// descriptor build; subsequent in-loop accesses to
     /// `slot.cached_sp_descr` reuse it.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_cached_descr_reused_per_shard() {
         let dev = require_gpu!();
         let shards = vec![make_csr(4, 6, 1.0), make_csr(4, 6, 1.0)];
@@ -1163,6 +1167,7 @@ mod tests {
     /// [`test_cached_descr_reused_per_shard`] which only checks within-
     /// shard reuse.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_cross_shard_descr_reuse_same_shape() {
         let dev = require_gpu!();
         // Two identically-shaped shards (same n_rows, same nnz). The
@@ -1215,6 +1220,7 @@ mod tests {
     ///     per-callback host-blocking dtoh that would mask the race.
     ///   - Repeating across a small outer loop to amplify the race window.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_multi_shard_pinned_no_corruption() {
         use cudarc::driver::safe::CudaSlice;
 

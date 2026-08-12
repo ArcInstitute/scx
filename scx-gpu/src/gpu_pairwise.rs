@@ -381,6 +381,7 @@ mod tests {
     /// atomic-summation order, for euclidean and cosine, on cross (`a != b`)
     /// inputs — including the degenerate `na_block == 1` (row-by-row) budget.
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn chunked_matches_single_shot_cross() {
         let dev = require_gpu!();
         let handle = CublasHandle::new().unwrap();
@@ -418,6 +419,7 @@ mod tests {
     /// Chunking must also match the single-shot `is_self` fast path when
     /// `a == b` (the control self-distance term that OOMs at scale).
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn chunked_matches_single_shot_self() {
         let dev = require_gpu!();
         let handle = CublasHandle::new().unwrap();

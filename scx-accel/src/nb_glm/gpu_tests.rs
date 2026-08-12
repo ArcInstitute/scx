@@ -4,9 +4,12 @@
 //! bench), so the CPU `f64` fitter is the reference. These assert
 //! per-quantity *relative* tolerances (not bit-equality): a ported special-
 //! function set + a safeguarded Illinois root-find diverge in convergence path
-//! from the CPU implementation. They skip gracefully when no CUDA device is
-//! present (worker/login nodes); the GPU CI harness (`slurm_scx_gpu_tests.sh`)
-//! exercises them on an H100.
+//! from the CPU implementation.
+//!
+//! They are `#[ignore]`d and gated, so on a host with no CUDA device (worker
+//! and login nodes) they are reported as ignored rather than as passes that did
+//! nothing. The GPU harness (`slurm_scx_gpu_tests.sh`) re-selects them with
+//! `--include-ignored` under `SCX_REQUIRE_GPU=1` and runs them on an H100.
 
 use super::gpu_pseudobulk_nb_glm;
 use crate::nb_glm::{pseudobulk_nb_glm, DispersionMethod, NbGlmContrast, NbGlmOptions};
@@ -86,13 +89,9 @@ fn spearman(a: &[f64], b: &[f64]) -> f64 {
 }
 
 fn run_parity(method: DispersionMethod, n_sub: usize) {
-    let dev = match GpuDevice::new(0) {
-        Ok(d) => d,
-        Err(_) => {
-            eprintln!("no CUDA device — skipping GPU NB-GLM parity test");
-            return;
-        }
-    };
+    // The gate lives in each `#[test]` caller, so by here a device is
+    // guaranteed and a failure to open one is a real failure, not a skip.
+    let dev = GpuDevice::new(0).expect("device gate passed but opening device 0 failed");
     let n_genes = 400;
     let (counts, design) = synth(n_genes, n_sub, 42);
     let options = NbGlmOptions {
@@ -161,16 +160,22 @@ fn run_parity(method: DispersionMethod, n_sub: usize) {
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn gpu_cpu_parity_cox_reid_shrunk_small_nsub() {
+    require_gpu_or_skip!();
     run_parity(DispersionMethod::CoxReidShrunk, 6);
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn gpu_cpu_parity_cox_reid_mle() {
+    require_gpu_or_skip!();
     run_parity(DispersionMethod::CoxReidMle, 8);
 }
 
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn gpu_cpu_parity_moments() {
+    require_gpu_or_skip!();
     run_parity(DispersionMethod::Moments, 8);
 }

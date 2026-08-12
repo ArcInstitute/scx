@@ -191,11 +191,10 @@ mod tests {
     /// its embedding — the fused path only removes the host round-trip of the
     /// embedding between the two stages.
     #[test]
+    #[ignore = "requires a CUDA GPU + cuVS"]
     fn test_pca_then_knn_gpu_matches_sequential() {
-        if !crate::gpu_available() || !crate::cuvs_available() {
-            eprintln!("GPU + cuVS not available — skipping fused PCA→kNN parity test");
-            return;
-        }
+        require_gpu_or_skip!();
+        require_gpu_cap!(cuvs);
 
         let n_rows = 400;
         let n_cols = 60;

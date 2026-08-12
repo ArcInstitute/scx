@@ -1,0 +1,391 @@
+//! A GPU test must declare itself as one — enforced by scanning the source.
+//!
+//! # Why this exists
+//!
+//! `require_gpu!()` used to expand to `eprintln! + return`. On a host with no
+//! CUDA device — every CI runner and most dev machines — that made 170 tests in
+//! this crate and 34 in `scx-accel` guaranteed no-ops that libtest counted as
+//! **passed**, with the message swallowed by output capture. Inverting a plane
+//! index in a decode kernel would have moved no counter anywhere it was run.
+//!
+//! The repair is a pairing: the gate macro decides at runtime, and
+//! `#[ignore = "requires a CUDA GPU"]` tells libtest not to select the test by
+//! default so a plain run reports it as ignored rather than passed. Either half
+//! alone is worthless — an un-`#[ignore]`d gated test is the original bug, and
+//! an `#[ignore]`d test with no gate never runs anywhere at all.
+//!
+//! # Why it lives in `tests/` and runs without a GPU
+//!
+//! **The drift happens on CPU hosts, so the guard has to run there.** A check
+//! that only fires on the GPU node would not have caught a single one of the
+//! ten hand-rolled gates that existed before this file: they were written, and
+//! reviewed, and merged, on machines that never executed them. This is a
+//! source scan, needs no device, and rides along with `cargo test --workspace`.
+//!
+//! # What it checks
+//!
+//! 1. A test invokes a device gate **iff** it carries the `#[ignore]` reason.
+//! 2. In test-only code, a failure to open a device is never a quiet `return`:
+//!    `GpuDevice::new(0)` must be `.unwrap()`/`.expect()`-terminated, and the
+//!    capability probes may not be called at all. This is the rule that catches
+//!    a gate hidden in a helper function — 11 of `scx-accel`'s 34 GPU tests
+//!    gated through `no_gpu()` / `run_parity()`, invisible to any check that
+//!    only reads test bodies.
+//! 3. Both discovered sets are non-empty, so a rename cannot make this pass
+//!    vacuously, and no extracted body over-ran its function.
+//!
+//! An intentional exception carries `// gpu-gate-exempt: <reason>` on the same
+//! or preceding line. Every one is printed on a passing run, so exemptions are
+//! visible in CI output rather than accumulating quietly.
+
+use std::path::{Path, PathBuf};
+
+/// Prefix of the reason string that marks a test as GPU-requiring.
+const IGNORE_PREFIX: &str = "#[ignore = \"requires a CUDA GPU";
+
+/// Macros that acquire a device and return early when there is none.
+const DEVICE_GATES: [&str; 2] = ["require_gpu!()", "require_gpu_or_skip!()"];
+
+/// Opt-out marker; must be followed by a reason.
+const EXEMPT_MARKER: &str = "gpu-gate-exempt:";
+
+/// Probes that must not be used to decide whether a test runs.
+const CAPABILITY_PROBES: [&str; 3] = ["gpu_available()", "cuvs_available()", "nvcomp_available()"];
+
+/// Sanctioned endings for a `GpuDevice::new(0)` in test code: both are hard
+/// errors, so neither can turn into a silent pass.
+const HARD_FAIL_ENDINGS: [&str; 2] = [".unwrap()", ".expect("];
+
+struct TestFn {
+    name: String,
+    line: usize,
+    attrs: String,
+    body: String,
+}
+
+fn crate_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn rust_sources(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The `{…}` block starting at the first `{` at or after `from`.
+///
+/// Returns `None` when the braces never balance before EOF — treated as a hard
+/// error by the callers rather than as "no body", because an unbalanced brace
+/// (a `{` inside a string literal, say) makes every downstream answer wrong in
+/// the direction that *hides* a violation.
+fn brace_block(text: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let start = text[from..].find('{')? + from;
+    let mut depth = 0usize;
+    for (offset, &b) in bytes[start..].iter().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((start, start + offset + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn line_of(text: &str, offset: usize) -> usize {
+    text[..offset].bytes().filter(|&b| b == b'\n').count() + 1
+}
+
+/// Every `#[test]` function in `text`, with the attribute block that precedes
+/// its `fn` line and its brace-matched body.
+fn test_fns(text: &str, path: &Path) -> Vec<TestFn> {
+    let mut out = Vec::new();
+    let mut search = 0usize;
+    while let Some(rel) = text[search..].find("#[test]") {
+        let at = search + rel;
+        search = at + "#[test]".len();
+
+        // Only a real attribute, not the token inside a string or doc comment.
+        let line_start = text[..at].rfind('\n').map_or(0, |p| p + 1);
+        let prefix = &text[line_start..at];
+        if !prefix.trim().is_empty() {
+            continue;
+        }
+
+        let Some(fn_rel) = text[at..].find("fn ") else {
+            continue;
+        };
+        let fn_at = at + fn_rel;
+        let name_start = fn_at + "fn ".len();
+        let name: String = text[name_start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+
+        // Attribute block: the run of `#[…]` / comment lines ending at `fn`.
+        let fn_line_start = text[..fn_at].rfind('\n').map_or(0, |p| p + 1);
+        let mut attr_start = fn_line_start;
+        while attr_start > 0 {
+            let prev_end = attr_start - 1;
+            let prev_start = text[..prev_end].rfind('\n').map_or(0, |p| p + 1);
+            let line = text[prev_start..prev_end].trim();
+            if line.starts_with("#[") || line.starts_with("//") {
+                attr_start = prev_start;
+            } else {
+                break;
+            }
+        }
+
+        let (body_start, body_end) = brace_block(text, fn_at).unwrap_or_else(|| {
+            panic!(
+                "{}: braces never balance for `{name}` — the scan cannot be trusted",
+                path.display()
+            )
+        });
+
+        out.push(TestFn {
+            name,
+            line: line_of(text, fn_at),
+            attrs: text[attr_start..fn_line_start].to_string(),
+            body: text[body_start..body_end].to_string(),
+        });
+        search = body_end;
+    }
+    out
+}
+
+/// Regions of `text` that are compiled only under `cfg(test)`.
+///
+/// A `*_tests.rs` file is test-only in its entirety (the repo's convention for
+/// extracted test modules, per `docs/conventions.md`); elsewhere it is the body
+/// of each `#[cfg(…test…)] mod … { … }`.
+fn test_regions(text: &str, path: &Path) -> Vec<String> {
+    let is_extracted = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with("_tests.rs"));
+    if is_extracted {
+        return vec![text.to_string()];
+    }
+
+    let mut out = Vec::new();
+    let mut search = 0usize;
+    while let Some(rel) = text[search..].find("#[cfg(") {
+        let at = search + rel;
+        search = at + "#[cfg(".len();
+        let Some(close) = text[at..].find(")]") else {
+            break;
+        };
+        let cfg = &text[at..at + close];
+        if !cfg.contains("test") {
+            continue;
+        }
+        let after = at + close + ")]".len();
+        // The attribute must apply to an inline `mod … {`, not a `mod …;`.
+        let rest = text[after..].trim_start();
+        if !rest.starts_with("mod ") {
+            continue;
+        }
+        let Some(semi_or_brace) = rest.find(['{', ';']) else {
+            continue;
+        };
+        if rest.as_bytes()[semi_or_brace] == b';' {
+            continue;
+        }
+        if let Some((s, e)) = brace_block(text, after) {
+            out.push(text[s..e].to_string());
+            search = e;
+        }
+    }
+    out
+}
+
+/// Lines carrying an exemption marker, as `path:line — reason`.
+fn exemptions(region: &str, path: &Path, base_line: usize) -> Vec<String> {
+    region
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let reason = line.split_once(EXEMPT_MARKER)?.1.trim();
+            assert!(
+                !reason.is_empty(),
+                "{}: `{EXEMPT_MARKER}` with no reason on line {}",
+                path.display(),
+                base_line + i
+            );
+            Some(format!("{}:{} — {reason}", path.display(), base_line + i))
+        })
+        .collect()
+}
+
+fn is_exempt_near(region: &str, occurrence: usize) -> bool {
+    // The marker may sit on the occurrence's own line or the one above it.
+    let line_start = region[..occurrence].rfind('\n').map_or(0, |p| p + 1);
+    let prev_start = region[..line_start.saturating_sub(1)]
+        .rfind('\n')
+        .map_or(0, |p| p + 1);
+    let line_end = region[occurrence..]
+        .find('\n')
+        .map_or(region.len(), |p| occurrence + p);
+    region[prev_start..line_end].contains(EXEMPT_MARKER)
+}
+
+struct Scan {
+    gated_without_ignore: Vec<String>,
+    ignored_without_gate: Vec<String>,
+    quiet_probes: Vec<String>,
+    gated: usize,
+    tests: usize,
+    regions: usize,
+    exempt: Vec<String>,
+}
+
+fn scan(tree: &Path) -> Scan {
+    let mut s = Scan {
+        gated_without_ignore: Vec::new(),
+        ignored_without_gate: Vec::new(),
+        quiet_probes: Vec::new(),
+        gated: 0,
+        tests: 0,
+        regions: 0,
+        exempt: Vec::new(),
+    };
+
+    for path in rust_sources(tree) {
+        let text = std::fs::read_to_string(&path).expect("read source");
+        if !text.contains("#[test]") && !text.contains("#[cfg(test") {
+            continue;
+        }
+
+        for t in test_fns(&text, &path) {
+            s.tests += 1;
+            assert!(
+                !t.body.contains("#[test]"),
+                "{}: the body extracted for `{}` ran past the end of the function — \
+                 brace matching cannot be trusted, so every other verdict here is suspect",
+                path.display(),
+                t.name
+            );
+
+            let gated = DEVICE_GATES.iter().any(|g| t.body.contains(g));
+            let ignored = t.attrs.contains(IGNORE_PREFIX);
+            let where_ = format!("{}:{} {}", path.display(), t.line, t.name);
+            match (gated, ignored) {
+                (true, false) => s.gated_without_ignore.push(where_),
+                (false, true) => s.ignored_without_gate.push(where_),
+                (true, true) => s.gated += 1,
+                (false, false) => {}
+            }
+        }
+
+        for region in test_regions(&text, &path) {
+            s.regions += 1;
+            let base_line = text
+                .find(&region)
+                .map_or(1, |off| line_of(&text, off))
+                .saturating_sub(1);
+            s.exempt.extend(exemptions(&region, &path, base_line));
+
+            for (i, _) in region.match_indices("GpuDevice::new(0)") {
+                let tail = &region[i..(i + 120).min(region.len())];
+                let hard = HARD_FAIL_ENDINGS.iter().any(|e| tail.contains(e));
+                if !hard && !is_exempt_near(&region, i) {
+                    s.quiet_probes.push(format!(
+                        "{}:{} GpuDevice::new(0) that neither unwraps nor goes through a gate",
+                        path.display(),
+                        base_line + line_of(&region, i)
+                    ));
+                }
+            }
+            for probe in CAPABILITY_PROBES {
+                for (i, _) in region.match_indices(probe) {
+                    if !is_exempt_near(&region, i) {
+                        s.quiet_probes.push(format!(
+                            "{}:{} `{probe}` called from test code — use require_gpu_cap!()",
+                            path.display(),
+                            base_line + line_of(&region, i)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    s
+}
+
+#[test]
+fn gpu_tests_are_gated_and_ignored() {
+    let gpu_src = crate_root().join("src");
+    let accel_src = crate_root().join("../scx-accel/src");
+
+    let mut trees = vec![("scx-gpu", scan(&gpu_src))];
+    // Absent when this crate is consumed outside the workspace; the scx-gpu
+    // half is never optional.
+    if accel_src.is_dir() {
+        trees.push(("scx-accel", scan(&accel_src)));
+    } else {
+        eprintln!("scx-accel sources not present — scanning scx-gpu only");
+    }
+
+    let mut failures = Vec::new();
+    for (name, s) in &trees {
+        assert!(
+            s.tests > 0 && s.regions > 0,
+            "{name}: discovered {} tests in {} test regions — the scan found nothing, \
+             which means it is measuring nothing",
+            s.tests,
+            s.regions
+        );
+        assert!(
+            s.gated > 0,
+            "{name}: no gated GPU tests discovered; if the gate macros were renamed, \
+             this guard is now vacuous"
+        );
+        eprintln!("{name}: {} GPU-gated of {} tests", s.gated, s.tests);
+        for e in &s.exempt {
+            eprintln!("  gpu-gate-exempt {e}");
+        }
+
+        for f in &s.gated_without_ignore {
+            failures.push(format!(
+                "gated but not ignored (counts as PASSED on a CPU host): {f}"
+            ));
+        }
+        for f in &s.ignored_without_gate {
+            failures.push(format!(
+                "ignored as GPU-requiring but never gates (so it runs nowhere): {f}"
+            ));
+        }
+        for f in &s.quiet_probes {
+            failures.push(format!("test decides for itself whether to run: {f}"));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "GPU test gating violations:\n  {}\n\nEvery GPU test needs both \
+         `require_gpu!()` (or `require_gpu_or_skip!()`) and \
+         `#[ignore = \"requires a CUDA GPU\"]`. See scx-gpu/src/test_gate.rs.",
+        failures.join("\n  ")
+    );
+}

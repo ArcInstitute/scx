@@ -323,16 +323,13 @@ mod tests {
     // kernels use f64 atomicAdd (CSR fallback) or f64 shared-mem tree-reduce
     // (CSC) for the pseudobulk fold — same precision as `gpu_de_pseudobulk_all_groups`.
     //
-    // Skips via `require_gpu_or_skip!()` if no CUDA device is available
-    // (the test binary still links; the test just returns).
+    // Gated by `require_gpu_or_skip!()` + `#[ignore]`: a default run reports it
+    // as ignored rather than as a pass that did nothing.
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_pdex_ref_gpu_v3_csc_matches_cpu_streaming() {
-        use scx_gpu::device::GpuDevice;
-        if GpuDevice::new(0).is_err() {
-            eprintln!("CUDA not available — skipping GPU CSC parity test");
-            return;
-        }
+        require_gpu_or_skip!();
         let n_obs = 64usize;
         let n_vars = 20usize;
         let cols_per_csc_shard = 7usize;
@@ -454,12 +451,9 @@ mod tests {
 
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_pdex_ref_gpu_v3_csr_fallback_matches_cpu_streaming() {
-        use scx_gpu::device::GpuDevice;
-        if GpuDevice::new(0).is_err() {
-            eprintln!("CUDA not available — skipping GPU CSR fallback parity test");
-            return;
-        }
+        require_gpu_or_skip!();
         let n_obs = 64usize;
         let n_vars = 20usize;
         let cols_per_csc_shard = 7usize;
@@ -561,12 +555,9 @@ mod tests {
     /// the backed streaming path.)
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_pdex_ref_gpu_v3_csr_backed_multichunk_graph_capture() {
-        use scx_gpu::device::GpuDevice;
-        if GpuDevice::new(0).is_err() {
-            eprintln!("CUDA not available — skipping GPU graph-capture regression test");
-            return;
-        }
+        require_gpu_or_skip!();
         let n_obs = 64usize;
         let n_vars = 20usize;
         let cols_per_csc_shard = 7usize;
@@ -663,13 +654,10 @@ mod tests {
     /// never trigger capture.)
     #[cfg(feature = "gpu")]
     #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn test_wilcoxon_gpu_v3_csr_backed_multichunk_graph_capture() {
         use crate::diffexp::wilcoxon_rank_sum_streaming;
-        use scx_gpu::device::GpuDevice;
-        if GpuDevice::new(0).is_err() {
-            eprintln!("CUDA not available — skipping GPU graph-capture regression test");
-            return;
-        }
+        require_gpu_or_skip!();
         let n_obs = 64usize;
         let n_vars = 20usize;
         let cols_per_csc_shard = 7usize;

@@ -18,28 +18,43 @@ fn test_block_sort_capacity_constant_matches_kernel() {
     assert_eq!(GPU_DE_BLOCK_SORT_CAPACITY, 1024 * 8);
 }
 
+/// Restore `SCX_GPU_DE_GENE_CHUNK_SIZE` on drop, so a panicking assertion
+/// cannot leak the override into whatever test runs next.
+struct ChunkSizeEnvGuard(Option<String>);
+
+impl ChunkSizeEnvGuard {
+    fn set(value: &str) -> Self {
+        let prev = std::env::var("SCX_GPU_DE_GENE_CHUNK_SIZE").ok();
+        std::env::set_var("SCX_GPU_DE_GENE_CHUNK_SIZE", value);
+        Self(prev)
+    }
+}
+
+impl Drop for ChunkSizeEnvGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(v) => std::env::set_var("SCX_GPU_DE_GENE_CHUNK_SIZE", v),
+            None => std::env::remove_var("SCX_GPU_DE_GENE_CHUNK_SIZE"),
+        }
+    }
+}
+
+/// The override snaps down to the nearest multiple of 64 — asserted against
+/// `default_gpu_de_gene_chunk_size` itself, which needs a device.
+///
+/// This used to fall back to an `else` branch when no device was present, which
+/// asserted `((129 / 64).max(1)) * 64 == 128` — a statement about two literals,
+/// not about `default_gpu_de_gene_chunk_size` — and so passed on a CPU host
+/// while touching none of the code it names. That branch is deleted rather than
+/// kept: it was coverage of nothing, and leaving it would have made this the one
+/// GPU test that still reports a pass it did not earn.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_default_chunk_size_respects_env() {
-    // Set an explicit override and confirm it round-trips (snapped to 64).
-    let prev = std::env::var("SCX_GPU_DE_GENE_CHUNK_SIZE").ok();
-    std::env::set_var("SCX_GPU_DE_GENE_CHUNK_SIZE", "129");
-    // The function only touches GPU mem if no env override is set; this
-    // test exercises the env-override branch without needing a device.
-    // We fake a GpuDevice by creating one only if available; otherwise
-    // skip with a noop assertion of the env path's value semantics.
-    if let Ok(dev) = GpuDevice::new(0) {
-        let v = default_gpu_de_gene_chunk_size(&dev, 1, 1);
-        assert_eq!(v, 128, "129 should snap down to 128 (multiple of 64)");
-    } else {
-        // No GPU on this host; just confirm the snapping logic by hand.
-        let raw: usize = 129;
-        assert_eq!(((raw / 64).max(1)) * 64, 128);
-    }
-    if let Some(v) = prev {
-        std::env::set_var("SCX_GPU_DE_GENE_CHUNK_SIZE", v);
-    } else {
-        std::env::remove_var("SCX_GPU_DE_GENE_CHUNK_SIZE");
-    }
+    let _guard = ChunkSizeEnvGuard::set("129");
+    let dev = require_gpu!();
+    let v = default_gpu_de_gene_chunk_size(&dev, 1, 1);
+    assert_eq!(v, 128, "129 should snap down to 128 (multiple of 64)");
 }
 
 #[test]
@@ -366,6 +381,7 @@ fn test_cpu_emulator_combined_tie_sweeps() {
 /// combined tie against CPU references on a small heavily-tied integer
 /// fixture. Skips cleanly when no CUDA device is available.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_de_primitives_match_cpu_reference() {
     let dev = require_gpu!();
 
@@ -511,6 +527,7 @@ fn test_gpu_de_primitives_match_cpu_reference() {
 /// Block radix sort over a randomized [16 × 1000] slab; row-wise parity
 /// with `Vec::sort_by` reference.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_de_block_sort_random_parity() {
     let dev = require_gpu!();
 
@@ -562,6 +579,7 @@ fn test_gpu_de_block_sort_random_parity() {
 /// Output must match `Vec::sort_by` per row exactly. Includes deliberate
 /// ties (modulo) to stress the merge-path co-rank.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_de_block_sort_above_capacity() {
     let dev = require_gpu!();
 
@@ -618,6 +636,7 @@ fn test_gpu_de_block_sort_above_capacity() {
 /// the partial-tile and odd-pair-count edge cases (the final tile is only
 /// 1000 keys; the final merge pair pairs a full run with a partial one).
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_de_block_sort_above_capacity_uneven() {
     let dev = require_gpu!();
 
@@ -669,6 +688,7 @@ fn test_gpu_de_block_sort_above_capacity_uneven() {
 /// sums must match a host f64 reference for all 4 `mode_id` transforms.
 /// Synthetic 50 cells × 5 genes × 3 groups fixture (ref + 2 test groups).
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_de_pseudobulk_all_modes() {
     let dev = require_gpu!();
 
@@ -757,6 +777,7 @@ fn test_gpu_de_pseudobulk_all_modes() {
 /// (`n_groups` past the SMEM ceiling, ~900 on H100 — naturally selected, no env
 /// override). Both must match a host f64 reference for all 4 mode transforms.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_gpu_de_csc_pseudobulk_smem_and_atomic_parity() {
     let dev = require_gpu!();
 
@@ -886,6 +907,7 @@ fn csc_view_fixture<'a>(
 /// this so they can pre-grow once before the loop and never re-allocate
 /// per chunk.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_scratch_ensure_capacity_no_realloc_on_same_or_smaller() {
     let dev = require_gpu!();
     let n_obs = 100;
@@ -960,6 +982,7 @@ fn test_scratch_ensure_capacity_no_realloc_on_same_or_smaller() {
 /// fixtures cover: (a) full column range, (b) middle column subrange,
 /// (c) an empty shard interleaved with non-empty shards.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_csr_shard_to_dense_chunk_parity() {
     use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
     use scx_format_io::ShardSource;
@@ -1140,6 +1163,7 @@ fn run_combined_tie(dev: &GpuDevice, ref_rows: &[Vec<f32>], group_rows: &[Vec<f3
 
 /// Strictly increasing row → no ties → tie term must be exactly 0.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_tie_term_sorted_no_ties() {
     let dev = require_gpu!();
     let n = 5000usize;
@@ -1152,6 +1176,7 @@ fn test_tie_term_sorted_no_ties() {
 /// All-tied row of constant value → exactly one run of size `n`,
 /// tie term = n³ − n.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_tie_term_sorted_all_tied() {
     let dev = require_gpu!();
     let n = 4096usize;
@@ -1167,6 +1192,7 @@ fn test_tie_term_sorted_all_tied() {
 /// walk was the bottleneck. 4 genes × 50_000 cells covers the multi-block
 /// dispatch as well.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_tie_term_sorted_large_with_ties() {
     let dev = require_gpu!();
     let chunk_size = 4usize;
@@ -1203,6 +1229,7 @@ fn test_tie_term_sorted_large_with_ties() {
 /// `n_per_gene = 600`, `per_thread = 3`, so a run from position 100 to
 /// 400 spans ~100 per-thread slices. Stitching must merge them.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_tie_term_sorted_run_spans_tiles() {
     let dev = require_gpu!();
     let n = 600usize;
@@ -1229,6 +1256,7 @@ fn test_tie_term_sorted_run_spans_tiles() {
 /// deterministic ties, exercises merge-path partitioning across the
 /// full block.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_combined_tie_term_large_with_ties() {
     let dev = require_gpu!();
     let chunk_size = 4usize;
@@ -1278,6 +1306,7 @@ fn test_combined_tie_term_large_with_ties() {
 /// adjacent thread slices each see a single-run of the same key.
 /// Boundary stitching must merge all of them into one long run.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_combined_tie_term_run_spans_threads() {
     let dev = require_gpu!();
     // n_ref + n_g = 600 → per_thread = 3 → many adjacent slices that
@@ -1308,6 +1337,7 @@ fn test_combined_tie_term_run_spans_threads() {
 /// Empty group: combined tie must equal `tie_term_sorted_kernel` on
 /// the ref alone (single-stream fallthrough via merge_path_co_rank).
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_combined_tie_term_empty_group() {
     let dev = require_gpu!();
     let mut state: u64 = 0xBEEF;
@@ -1339,6 +1369,7 @@ fn test_combined_tie_term_empty_group() {
 /// A regression on either side would not surface against the existing
 /// well-above (50k) and well-below (≤4k) tests.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_tie_term_sorted_threshold_boundary() {
     let dev = require_gpu!();
     for &n in &[
@@ -1364,6 +1395,7 @@ fn test_tie_term_sorted_threshold_boundary() {
 /// tie kernel. Dispatch is by `n_ref + n_g`. Pairs are chosen so the
 /// sum spans the threshold.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_combined_tie_term_threshold_boundary() {
     let dev = require_gpu!();
     for &(n_ref, n_g) in &[(4096usize, 4095usize), (4096, 4096), (4097, 4096)] {
@@ -1394,6 +1426,7 @@ fn test_combined_tie_term_threshold_boundary() {
 /// the cast and this test catches it. Expected value is computed in
 /// f64 (exact integer for `n ≤ 2^53`).
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_tie_term_sorted_overflow_regression() {
     let dev = require_gpu!();
     let n = 2_100_000usize;
@@ -1408,6 +1441,7 @@ fn test_tie_term_sorted_overflow_regression() {
 /// two all-`1.0` streams is one run of length `n_ref + n_g = 2_200_000`,
 /// which cubes to ~1.06 × 10¹⁹ — well past i64::MAX.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_combined_tie_term_overflow_regression() {
     let dev = require_gpu!();
     let n_ref = 1_100_000usize;
@@ -1440,6 +1474,7 @@ fn test_combined_tie_term_overflow_regression() {
 /// regardless of accumulation order and an equality assertion is safe here even
 /// though the kernel is order-nondeterministic in general.
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_csr_gene_major_and_pseudobulk_window_parity() {
     use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
     use scx_format_io::ShardSource;
