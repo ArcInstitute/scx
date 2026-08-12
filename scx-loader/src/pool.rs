@@ -122,7 +122,12 @@ impl Slot {
                 return Arc::clone(&entry.pool);
             }
         }
+        self.build_and_publish(current, pid)
+    }
 
+    /// Build a pool for `pid` and hand it to [`Self::publish`], having already
+    /// observed `expected` in the slot.
+    fn build_and_publish(&self, expected: *mut Entry, pid: u32) -> Arc<rayon::ThreadPool> {
         let n_threads = resolve_pool_threads(std::env::var(CPU_THREADS_ENV).ok().as_deref());
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
@@ -132,21 +137,50 @@ impl Slot {
                 .expect("failed to build the scx-loader CPU thread pool"),
         );
         tracing::trace!(pid, n_threads, "scx-loader CPU pool constructed");
+        self.publish(expected, pid, pool)
+    }
 
+    /// Publish `pool` for `pid`, or hand back the winner if another thread got
+    /// there first.
+    ///
+    /// Split from the build, and taking `expected` rather than re-loading it,
+    /// so a test can force the lost-race branch deterministically with a pool
+    /// it owns a `Weak` to. Racing real threads does not reproduce it: the
+    /// load-to-publish window is tiny, and a test written that way passes just
+    /// as happily with the leak reinstated (verified). Counting live
+    /// `scx-loader-cpu-*` threads instead is worse still — other tests build
+    /// pools concurrently, which made that version fail 45 runs in 60.
+    fn publish(
+        &self,
+        expected: *mut Entry,
+        pid: u32,
+        pool: Arc<rayon::ThreadPool>,
+    ) -> Arc<rayon::ThreadPool> {
         let fresh: *mut Entry = Box::leak(Box::new(Entry {
             pid,
             pool: Arc::clone(&pool),
         }));
         match self
             .0
-            .compare_exchange(current, fresh, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(expected, fresh, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => pool,
             Err(winner) => {
-                // Someone published first. Our `pool` is this process's own and
-                // its threads are alive, so dropping it here is safe — unlike
-                // the inherited one, which is why `fresh` is left leaked rather
-                // than reclaimed.
+                // Someone published first. Reclaim `fresh`: the CAS failed, so
+                // the pointer was never stored and no other thread can ever
+                // have observed it. Leaving it leaked would keep an `Arc` on a
+                // whole live pool — N worker threads and their stacks — for the
+                // rest of the process, which is a very different thing from the
+                // deliberate one-entry-per-fork-generation leak above.
+                //
+                // Dropping *this* pool is safe for the same reason the
+                // inherited one is not: its workers are threads of this
+                // process and are alive to be woken. Only the inherited entry
+                // must never be touched.
+                //
+                // SAFETY: `fresh` came from `Box::leak` in this call and was
+                // never published, so this is the unique owner.
+                drop(unsafe { Box::from_raw(fresh) });
                 // SAFETY: as above — `winner` came from `Box::leak`.
                 let entry = unsafe { &*winner };
                 if entry.pid == pid {
@@ -230,6 +264,49 @@ mod tests {
             parent_weak.upgrade().is_some(),
             "the superseded pool was dropped — in a forked child that drop can \
              block forever on an inherited-locked worker mutex"
+        );
+    }
+
+    #[test]
+    fn losing_the_publication_race_reclaims_the_unpublished_pool() {
+        // A racer that loses the CAS built a pool of its own. That entry was
+        // never published, so it must be reclaimed — leaking it keeps a whole
+        // live pool (N worker threads and their stacks) alive for the rest of
+        // the process, which is a very different thing from the deliberate
+        // one-small-entry-per-fork-generation leak.
+        //
+        // Reachable from Python: `collate_cellset_gathered` enters `py.detach`
+        // before calling `cpu_pool()`, so several threads genuinely can be in
+        // here at once.
+        //
+        // The loser's pool is built *here* so the test can hold a `Weak` to it
+        // and watch it die. Two earlier shapes did not work: racing 16 threads
+        // never hit the branch, and counting live `scx-loader-cpu-*` threads
+        // picked up pools other tests were building concurrently.
+        let slot = fresh_slot();
+        let winner = slot.pool_for_pid(9101);
+
+        let loser = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        );
+        let loser_weak = Arc::downgrade(&loser);
+
+        // `expected = null` is stale — the winner is already published — so the
+        // compare_exchange must fail and take the reclaim path.
+        let handed_back = slot.publish(std::ptr::null_mut(), 9101, loser);
+
+        assert!(
+            Arc::ptr_eq(&handed_back, &winner),
+            "a lost race must hand back the published pool"
+        );
+        assert!(
+            loser_weak.upgrade().is_none(),
+            "the unpublished pool is still alive — its entry was leaked instead \
+             of reclaimed, so a full pool's worth of worker threads survives for \
+             the rest of the process"
         );
     }
 

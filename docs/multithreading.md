@@ -169,10 +169,10 @@ field-on-pipeline runtime with a model that is fork-safe by construction.
 A dedicated OS thread (`scx-decode`) receives shard groups and dispatches
 the per-row sparse-to-dense scatter + HVG projection + fused normalize+log1p
 to a **per-`TrainingPipeline` `rayon::ThreadPool`** via `pool.install(...)`.
-The pool is built lazily inside `start_epoch` via
-`rayon::ThreadPoolBuilder::new().num_threads(num_cpus::get_physical().min(8))`,
-persisted across epochs for the same `TrainingPipeline`, and dropped in
-`shutdown()` / `Drop`. Completed batches are sent through a bounded
+The pool is built lazily inside `start_epoch`, sized by
+`pool::resolve_pool_threads` — the same function that sizes `cpu_pool()`, so
+`SCX_LOADER_CPU_THREADS` governs both — persisted across epochs for the same
+`TrainingPipeline`, and dropped in `shutdown()` / `Drop`. Completed batches are sent through a bounded
 `crossbeam` channel (capacity = `prefetch_batches`, minimum 2).
 
 > [!IMPORTANT]
@@ -207,14 +207,20 @@ reaches callers.
 
 The pipeline is fork-safe under
 `torch.utils.data.DataLoader(num_workers > 0, start_method="fork")` **when
-the dataset is constructed lazily inside the worker's `__iter__`**. Both
-the tokio current-thread runtime (per-epoch, lives on the I/O thread) and
-the rayon `ThreadPool` (per-instance, lazily built on first
-`start_epoch`) are constructed inside the worker process, so the
-`TrainingPipeline` value contains no live runtime, registry, or worker
-threads at construction time. A forked child therefore inherits no
+the dataset is constructed lazily inside the worker's `__iter__`**. The tokio
+current-thread runtime (per-epoch, lives on the I/O thread) and the
+per-pipeline rayon `ThreadPool` (lazily built on first `start_epoch`) are both
+constructed inside the worker process, so a forked child inherits no
 fork-hostile state from the parent. The eager-construct-then-fork case is
 caught by the PID check in `__next__` (`scx-loader/src/python.rs`).
+
+`TrainingPipeline::new` is **not** thread-free, though: it runs `read_obs` (and
+the PFlog α estimate) through `cpu_pool()`, which builds that pool. So a
+constructed-but-not-yet-iterated pipeline already owns worker threads — they are
+just this process's own, built after the fork, which is the property that
+matters. Earlier text here claimed the value held no worker threads at
+construction; that stopped being true when the constructor started using a
+pool.
 
 #### The other three surfaces: `scx_loader::pool::cpu_pool()`
 

@@ -493,15 +493,20 @@ fn adaptive_budget_mb(
 ///    shuffles, projects, densifies, normalizes
 /// 3. **GPU stage** (caller): consumes pre-built `Batch`es via `next_batch()`
 ///
-/// **Fork-safety contract**. Both the tokio current-thread runtime and
-/// the rayon `ThreadPool` are constructed *lazily inside `start_epoch`*,
-/// i.e. after any fork has happened. The `TrainingPipeline` value itself
-/// contains no live runtime,
-/// rayon registry, or worker threads at construction time, so a forked child
-/// that constructs its own pipeline does not inherit fork-hostile state from
-/// the parent. `pyscx.from_anndata` in the parent — which lazily initialises
-/// rayon's *global* pool as a side-effect — is the historical wedge case;
-/// this design eliminates dependence on that pool entirely.
+/// **Fork-safety contract**. Both the tokio current-thread runtime and the
+/// per-pipeline rayon `ThreadPool` are constructed *lazily inside
+/// `start_epoch`*, i.e. after any fork has happened, so a forked child that
+/// constructs its own pipeline does not inherit fork-hostile state from the
+/// parent. `pyscx.from_anndata` in the parent — which lazily initialises
+/// rayon's *global* pool as a side-effect — is the historical wedge case; this
+/// design eliminates dependence on that pool entirely.
+///
+/// The constructor does own threads, however: [`Self::new`] runs `read_obs`
+/// and the PFlog α estimate inside [`crate::pool::cpu_pool`], which builds that
+/// pool. They are this process's threads, created after the fork — which is the
+/// property fork-safety actually needs — but the earlier claim that the value
+/// holds no worker threads at construction is no longer true. See
+/// `docs/multithreading.md` § Per-worker thread footprint.
 ///
 /// See [docs/multithreading.md §Training data loader](../../docs/multithreading.md#training-data-loader-triple-buffered-pipeline).
 pub struct TrainingPipeline {

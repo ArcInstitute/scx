@@ -154,11 +154,14 @@ jobs:
       # Deliberately NOT a file allowlist: the files holding a `par_*` today are
       # exactly where the next one will be added, so allowlisting them would
       # blind the gate where it matters most. Instead every dispatch line needs
-      # an `install(` within the preceding 12 lines **and inside the same
-      # function** — an `fn` line resets the window. Without that reset a safe
-      # function ending in `pool.install(...)` silently covers a bare
-      # `par_iter` in the *next* function; that bypass was demonstrated against
-      # the first version of this gate, which is why the fixtures below exist.
+      # an `install(` within the preceding 12 lines, **inside the same
+      # function**, and **lexically inside the install's block** — brace depth
+      # must be strictly greater than at the `install(` line. Each clause is
+      # there because a demonstrated bypass got through without it: an `fn`
+      # reset (a bare `par_iter` in the *next* function was covered by the
+      # previous function's install) and the depth check (a `par_iter` on the
+      # line *after* a single-line `pool.install(...)` in the same function).
+      # Both are in the bad fixture below.
       #
       # It is a text heuristic, so it is checked against known-good and
       # known-bad fixtures before its silence on the real tree is trusted. It
@@ -170,13 +173,14 @@ jobs:
         run: |
           mkdir -p /tmp/gatefix
           printf '%s\n' \
-            'FNR == 1 { last_install = -100 }' \
+            'FNR == 1 { last_install = -100; depth = 0; install_depth = -1 }' \
             '{ line = $0; sub(/^[[:space:]]+/, "", line) }' \
             'line ~ /^\/\// { next }' \
-            'line ~ /^(pub[[:space:]]*(\([^)]*\))?[[:space:]]*)?(default[[:space:]]+)?(const[[:space:]]+)?(async[[:space:]]+)?(unsafe[[:space:]]+)?fn[[:space:]]/ { last_install = -100 }' \
-            '/\.install\(/ { last_install = FNR }' \
+            '{ start_depth = depth; t = $0; depth += gsub(/{/, "", t); t = $0; depth -= gsub(/}/, "", t) }' \
+            'line ~ /^(pub[[:space:]]*(\([^)]*\))?[[:space:]]*)?(default[[:space:]]+)?(const[[:space:]]+)?(async[[:space:]]+)?(unsafe[[:space:]]+)?fn[[:space:]]/ { last_install = -100; install_depth = -1 }' \
+            '/\.install\(/ { last_install = FNR; install_depth = start_depth }' \
             '/par_iter|par_chunks|par_bridge|into_par_iter|par_sort|par_extend|par_drain|rayon::(join|scope|in_place_scope|spawn|broadcast)/ {' \
-            '  if (FNR - last_install > 12) print FILENAME ":" FNR ": " line' \
+            '  if (FNR - last_install > 12 || start_depth <= install_depth) print FILENAME ":" FNR ": " line' \
             '}' \
             > /tmp/gatefix/gate.awk
           printf '%s\n' \
@@ -200,6 +204,11 @@ jobs:
             'fn also_unguarded(f: impl Fn() + Send) {' \
             '    rayon::spawn(f);' \
             '}' \
+            '' \
+            'fn same_fn_after_install(pool: &rayon::ThreadPool, v: &mut [f32]) {' \
+            '    pool.install(|| do_one_safe_thing());' \
+            '    v.par_iter_mut().for_each(|x| *x *= 4.0);' \
+            '}' \
             > /tmp/gatefix/bad.rs
 
           if [ -n "$(awk -f /tmp/gatefix/gate.awk /tmp/gatefix/good.rs)" ]; then
@@ -207,8 +216,8 @@ jobs:
             exit 1
           fi
           n=$(awk -f /tmp/gatefix/gate.awk /tmp/gatefix/bad.rs | wc -l)
-          if [ "$n" -ne 2 ]; then
-            echo "::error::rayon gate self-test: expected 2 findings in the bad fixture, got $n:"
+          if [ "$n" -ne 3 ]; then
+            echo "::error::rayon gate self-test: expected 3 findings in the bad fixture, got $n:"
             awk -f /tmp/gatefix/gate.awk /tmp/gatefix/bad.rs
             exit 1
           fi
