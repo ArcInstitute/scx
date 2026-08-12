@@ -686,10 +686,12 @@ fn from_h5ad(
 /// Reads the 10x file with scanpy.read_10x_h5(), then writes via from_anndata.
 ///
 /// `csc`, `csc_cols_per_shard`, and `uns_format` mirror `from_anndata`
-/// — see those docs.
+/// — see those docs. In particular `csc=None` (the default) resolves to
+/// `"off"` unless an accel-ready `index_preset` (`training` /
+/// `perturbseq`) upgrades it to `"auto"`; an explicit value always wins.
 #[pyfunction]
 #[pyo3(signature = (
-    h5_path, scx_path, codec=None, shard_size=None, csc="off",
+    h5_path, scx_path, codec=None, shard_size=None, csc=None,
     csc_cols_per_shard=5000, uns_format="tagged",
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", memory_budget=None, force_legacy_metadata=false,
@@ -702,7 +704,7 @@ fn from_10x(
     scx_path: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
-    csc: &str,
+    csc: Option<&str>,
     csc_cols_per_shard: usize,
     uns_format: &str,
     index_obs: Option<Vec<String>>,
@@ -726,6 +728,11 @@ fn from_10x(
     )?;
     let adata = scanpy.call_method1("read_10x_h5", (h5_path,))?;
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
+    // An explicit `csc` always wins; an unset one is upgraded to `auto` by an
+    // accel-ready `index_preset`. Shared with `from_anndata` / `from_h5ad` /
+    // `from_h5mu` and the `scx convert` CLI so the front-ends cannot drift —
+    // this entry point previously pinned `"off"` and silently opted out.
+    let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     convert::from_anndata_impl(
         py,
         &adata,
@@ -736,7 +743,7 @@ fn from_10x(
         // returns a fresh AnnData with no other reference. The kwarg was
         // removed from the public signature (T3.7); pass false.
         false,
-        csc,
+        &csc,
         csc_cols_per_shard,
         uns_format,
         index_obs.unwrap_or_default(),

@@ -770,6 +770,14 @@ The `csc` knob on the conversion entry points (`pyscx.from_anndata` /
 `auto` is resolved against the matrix shape at write time, so a (unimodal)
 streaming conversion picks it up from the X reader's reported dimensions.
 
+On the pyscx entry points and `scx convert`, the default is a *deferred*
+`off`: leaving `csc` unset lets an accel-ready `--index-preset` /
+`index_preset=` (`training` or `perturbseq`, whose substrate is the
+column-major sidecar) upgrade it to `auto`. `cellxgene` is query-oriented
+and does not. Passing any explicit value — including `off` — always wins.
+The rule lives in `scx_engine::index::resolve_csc_policy` so the CLI and
+pyscx cannot drift apart.
+
 Multimodal (h5mu / MuData) inputs cannot build per-modality CSC while
 streaming, and `scx build-csc` is unimodal-only (it would collapse all
 modalities into one CSC transpose). So per-modality CSC is built only by

@@ -1403,7 +1403,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   - `modality_types`: optional dict `{name: "rna" | "protein" | "atac"
     | "spatial" | "methylation" | "custom"}`. Modalities not listed
     fall back to name inference and emit `ModalityTypeInferred`.
-- `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", memory_budget=None, force_legacy_metadata=False, row_group_rows=256, row_group_target_nnz=None)` — 10x HDF5 to SCX.
+- `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, csc=None, csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", memory_budget=None, force_legacy_metadata=False, row_group_rows=256, row_group_target_nnz=None)` — 10x HDF5 to SCX. `csc=None` resolves to `"off"` unless `index_preset` implies `"auto"`.
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
 - `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
 - `pyscx.cellbender_import(path, cellbender_h5, *, layer="cellbender", obs_key=None, var_key=None, prefix="cellbender_", uns_key="cellbender", overwrite=False, on_missing_rows="zero", on_extra_rows="warn", gene_axis="identical", latent_embedding=False, dry_run=False)` —
