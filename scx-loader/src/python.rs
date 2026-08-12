@@ -77,7 +77,12 @@ use scx_format_io::ScxReader;
 /// (per-epoch, owned by a dedicated I/O `std::thread`) and per-pipeline
 /// `rayon::ThreadPool` (per-instance, lazily built on first `start_epoch()`)
 /// are constructed *inside the worker process* and therefore never inherit
-/// fork-hostile thread state from the parent.
+/// fork-hostile thread state from the parent. The same holds for the
+/// process-wide [`crate::pool::cpu_pool`] the constructor uses for `read_obs`
+/// and the PFlog α estimate: it is keyed on the PID, so a child never draws on
+/// a pool the parent built. Note that this means construction *does* create
+/// worker threads — the guarantee is that they are the child's own, not that
+/// there are none.
 ///
 /// **Constraints that still apply:**
 /// - Eager-construct in parent + fork = unsupported. The PID check in
