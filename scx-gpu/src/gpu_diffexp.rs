@@ -215,9 +215,17 @@ impl GpuDeChunkScratch {
 
     /// Grow the ping-pong aux buffer to hold at least `n_elements` f32 keys.
     ///
-    /// Called by [`gpu_de_block_sort`] before the multi-tile path. No-op when
-    /// the aux is already large enough. Bumps to `next_power_of_two` to amortise
-    /// repeated growths across a streaming chunk loop.
+    /// **The caller must size this before a multi-tile sort** — despite the
+    /// name, [`gpu_de_block_sort`] does NOT call it. It cannot: it takes `slab`
+    /// and `aux` as two separate `&mut CudaSlice<f32>` (so a caller can thread
+    /// two disjoint `GpuDeChunkScratch` fields at once) and so holds no handle
+    /// to the scratch. An undersized aux is rejected there with
+    /// `ShapeMismatch`, not grown. Use [`gpu_de_aux_elems`] to compute
+    /// `n_elements`, and read its doc for which sort's `n_per_gene` governs.
+    ///
+    /// No-op when the aux is already large enough. Bumps to
+    /// `next_power_of_two` to amortise repeated growths across a streaming
+    /// chunk loop.
     pub fn ensure_aux_capacity(
         &mut self,
         dev: &GpuDevice,
@@ -1828,6 +1836,24 @@ pub fn gpu_de_per_gene_scratch_bytes(
     f32_elems
         .saturating_mul(4)
         .saturating_add(f64_elems.saturating_mul(8))
+}
+
+/// Element count [`GpuDeChunkScratch::slab_aux`] must hold for a DE chunk loop.
+///
+/// `n_per_gene_max` is the **largest** `n_per_gene` that any
+/// [`gpu_de_block_sort`] call in the loop will pass — not merely the first one.
+/// Both v3 chunk sequences sort twice: the pool/reference slab, and then (in
+/// ref-mode) each test group's own slab. So it is `max(pool_len, n_g_max)`, and
+/// sizing it against the pool alone breaks on any reference smaller than the
+/// largest test group — the group sort then hits the multi-tile path with an
+/// aux built for the pool and fails with `ShapeMismatch`.
+///
+/// Kept next to [`gpu_de_per_gene_scratch_bytes`] because the two must agree:
+/// that function charges `n_pool_max` elements per gene for this buffer, so a
+/// caller passing a larger `n_per_gene_max` here than it passed as
+/// `n_pool_max` there has a VRAM budget that under-counts what it allocates.
+pub fn gpu_de_aux_elems(chunk_size: usize, n_per_gene_max: usize) -> Result<usize, GpuError> {
+    de_alloc_elems(chunk_size, n_per_gene_max.max(1))
 }
 
 /// Pure budget clamp (no device access — unit-testable).

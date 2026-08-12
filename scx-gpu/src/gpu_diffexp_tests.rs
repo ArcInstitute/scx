@@ -10,6 +10,61 @@ fn test_de_alloc_elems_rejects_overflow() {
     assert!(matches!(err, GpuError::ShapeMismatch { .. }), "got {err:?}");
 }
 
+/// The aux buffer is governed by the **largest** per-gene sort in a chunk
+/// loop, not by the first one. A ref-mode DE call with a small reference and a
+/// large test group is the shape that separates the two, and sizing from the
+/// pool alone is what §8.2 was.
+///
+/// Arithmetic only — it cannot see a driver that computes the wrong
+/// `n_per_gene_max` at the call site. That is what the GPU-node test
+/// `test_wilcoxon_gpu_ref_mode_small_ref_large_group_matches_cpu` is for.
+#[test]
+fn test_gpu_de_aux_elems_covers_the_largest_sort_not_the_pool() {
+    let chunk = 4usize;
+    let pool_len = 512usize; // reference group in ref-mode
+    let n_g_max = 9_000usize; // largest test group
+
+    // Only the group sort takes the multi-tile path, so only it reads aux at
+    // all — which is exactly why sizing for the pool looks fine until it isn't.
+    assert!(n_g_max > GPU_DE_BLOCK_SORT_CAPACITY);
+    assert!(pool_len <= GPU_DE_BLOCK_SORT_CAPACITY);
+
+    // What `gpu_de_block_sort` demands of `aux` for the group sort. Compare
+    // against post-`next_power_of_two` capacities: that rounding is what
+    // `ensure_aux_capacity` applies, and it is generous enough to mask a
+    // too-small request on a less lopsided fixture.
+    let needed = chunk * n_g_max;
+    let from_pool = gpu_de_aux_elems(chunk, pool_len)
+        .unwrap()
+        .next_power_of_two();
+    assert!(
+        from_pool < needed,
+        "fixture no longer separates the two sizings: a pool-derived aux of \
+         {from_pool} already covers the group sort's {needed}"
+    );
+
+    let from_max = gpu_de_aux_elems(chunk, pool_len.max(n_g_max))
+        .unwrap()
+        .next_power_of_two();
+    assert!(from_max >= needed, "aux {from_max} < required {needed}");
+
+    // 1-vs-rest: the pool is every labelled cell, so it already dominates every
+    // group and the same expression must not inflate the allocation.
+    let labelled = 20_000usize;
+    assert_eq!(
+        gpu_de_aux_elems(chunk, labelled.max(n_g_max)).unwrap(),
+        chunk * labelled
+    );
+
+    // An empty pool still yields a usable request, not a zero-length buffer.
+    assert_eq!(gpu_de_aux_elems(chunk, 0).unwrap(), chunk);
+
+    // Overflow is rejected here rather than wrapping into a small allocation
+    // that resurfaces as an unexplained ShapeMismatch at sort time.
+    let err = gpu_de_aux_elems(usize::MAX, 2).unwrap_err();
+    assert!(matches!(err, GpuError::ShapeMismatch { .. }), "got {err:?}");
+}
+
 #[test]
 fn test_block_sort_capacity_constant_matches_kernel() {
     // BLOCK_THREADS * ITEMS_PER_THREAD in kernels/diffexp.cu must match

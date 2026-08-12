@@ -137,7 +137,7 @@ pub use gpu_csc_shard_source::{GpuCscShardSource, GpuCscShardView, RawGpuCscShar
 pub use gpu_csr_assemble::{decode_csr_shards_to_device, decode_csr_shards_to_device_with_stats};
 pub use gpu_diffexp::{
     build_cell_to_group_dev, build_cell_to_pool_dev, build_cell_to_pos_dev,
-    default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_budget_gene_chunk,
+    default_gpu_de_gene_chunk_size, gpu_de_aux_elems, gpu_de_block_sort, gpu_de_budget_gene_chunk,
     gpu_de_combined_tie_term, gpu_de_per_gene_scratch_bytes, gpu_de_pseudobulk_all_groups,
     gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct, gpu_de_pvalues,
     gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_csr_to_gene_major_filtered,
