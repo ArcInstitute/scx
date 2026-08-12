@@ -20,7 +20,11 @@ use crate::shuffle::ShardShuffler;
 /// If the I/O or decode thread does not finish within this window the join
 /// is abandoned and the thread handle is detached — preferable to wedging
 /// the worker process exit forever.
-const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+///
+/// Shared with `IndexPlanLoader` / `PrefetchEngine` / `SparseCellSetLoader`'s
+/// `shutdown_owned` so all four dataset classes bound their teardown by the
+/// same window; two constants here would drift silently.
+pub(crate) const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Polling interval for `JoinHandle::is_finished()` waits during bounded
 /// shutdown.

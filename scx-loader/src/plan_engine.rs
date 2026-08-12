@@ -142,6 +142,19 @@ impl PrefetchEngine {
         Ok(self.runtime.get_or_init(|| rt))
     }
 
+    /// Consume the engine and shut its tokio runtime down with a bounded wait.
+    ///
+    /// **The caller must not hold the GIL** — see
+    /// [`crate::index_plan::IndexPlanLoader::shutdown_owned`] for why a plain
+    /// GIL-held drop freezes every other Python thread for the length of an
+    /// in-flight shard decode.
+    pub fn shutdown_owned(self, deadline: std::time::Duration) {
+        // No `Drop` impl on `PrefetchEngine`, so the partial move is legal.
+        if let Some(rt) = self.runtime.into_inner() {
+            rt.shutdown_timeout(deadline);
+        }
+    }
+
     /// Stream `plans` through the engine, pipelining shard prefetch ahead of
     /// `process`. `rows_of` reports the `(file_id, row)`s a plan touches;
     /// `process` performs the gather once those shards are warm. Returns an

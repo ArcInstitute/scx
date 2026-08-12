@@ -394,3 +394,47 @@ fn engine_prefetch_depth_survives_when_the_generator_keeps_up() {
         "the queue must still be prefetched to depth when the generator is ahead"
     );
 }
+
+// ---------------------------------------------------------------------
+// §9.3 — bounded, GIL-free teardown.
+// ---------------------------------------------------------------------
+
+#[test]
+fn engine_shutdown_owned_without_a_built_runtime_is_a_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = two_file_engine(dir.path(), 8);
+    assert!(
+        engine.runtime.get().is_none(),
+        "the runtime must still be lazy — otherwise this test proves nothing"
+    );
+    let engine = Arc::into_inner(engine).expect("sole owner");
+    engine.shutdown_owned(std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn engine_shutdown_owned_returns_promptly_after_the_runtime_is_built() {
+    let elapsed = with_deadline(30, "plan-engine shutdown_owned", || {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = two_file_engine(dir.path(), 8);
+        let plans: Vec<Plan> = vec![vec![(0u32, 5u64)], vec![(1u32, 30u64)]];
+        let mut it = Arc::clone(&engine).iter_with_plans(into_iter(plans), 4, rows_of, gather);
+        while let Some(b) = it.next() {
+            b.expect("batch must gather");
+        }
+        drop(it);
+        assert!(
+            engine.runtime.get().is_some(),
+            "the runtime must have been built by iteration"
+        );
+
+        let engine = Arc::into_inner(engine).expect("iter dropped, so sole owner");
+        let t0 = std::time::Instant::now();
+        engine.shutdown_owned(crate::pipeline::SHUTDOWN_DEADLINE);
+        t0.elapsed()
+    });
+
+    assert!(
+        elapsed < crate::pipeline::SHUTDOWN_DEADLINE,
+        "an idle runtime must shut down well inside the deadline, took {elapsed:?}"
+    );
+}

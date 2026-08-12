@@ -1165,3 +1165,52 @@ fn prefetch_depth_survives_when_the_generator_keeps_up() {
         "the queue must still be prefetched to depth when the generator is ahead"
     );
 }
+
+// ---------------------------------------------------------------------
+// §9.3 — bounded, GIL-free teardown.
+// ---------------------------------------------------------------------
+
+#[test]
+fn shutdown_owned_without_a_built_runtime_is_a_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+    let loader = open_loader_arc(&path);
+    assert!(
+        loader.runtime.get().is_none(),
+        "the runtime must still be lazy — otherwise this test proves nothing"
+    );
+    let loader = Arc::into_inner(loader).expect("sole owner");
+    loader.shutdown_owned(std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn shutdown_owned_returns_promptly_after_the_runtime_is_built() {
+    let elapsed = with_deadline(30, "index-plan shutdown_owned", || {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+        let loader = open_loader_arc(&path);
+
+        // Consume an iterator so the lazy runtime is actually built and has
+        // run `spawn_blocking` prefetches.
+        let plans = vec![vec![(0u64, 1u64)], vec![(4u64, 9u64)]];
+        let mut it = loader.clone().iter_with_plans(into_plan_iter(plans), 4);
+        while let Some(b) = it.next() {
+            b.expect("batch must decode");
+        }
+        drop(it);
+        assert!(
+            loader.runtime.get().is_some(),
+            "the runtime must have been built by iteration"
+        );
+
+        let loader = Arc::into_inner(loader).expect("iter dropped, so sole owner");
+        let t0 = std::time::Instant::now();
+        loader.shutdown_owned(crate::pipeline::SHUTDOWN_DEADLINE);
+        t0.elapsed()
+    });
+
+    assert!(
+        elapsed < crate::pipeline::SHUTDOWN_DEADLINE,
+        "an idle runtime must shut down well inside the deadline, took {elapsed:?}"
+    );
+}

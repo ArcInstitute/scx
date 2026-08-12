@@ -972,6 +972,25 @@ impl IndexPlanLoader {
     {
         IndexPlanIter::new(self, plans, lookahead)
     }
+
+    /// Consume the loader and shut its tokio runtime down with a bounded wait.
+    ///
+    /// **The caller must not hold the GIL.** This blocks until every
+    /// already-started `spawn_blocking` returns or `deadline` elapses, and
+    /// those tasks are `read_shard_cached_arc` decodes that can be hundreds of
+    /// megabytes of Pcodec. Dropping the runtime under the GIL — which is what
+    /// pyo3 does for a `#[pyclass]` with no `Drop` of its own — freezes every
+    /// other Python thread for that whole window.
+    ///
+    /// A plain drop would block *unbounded*; `shutdown_timeout` detaches the
+    /// blocking pool once the deadline passes.
+    pub fn shutdown_owned(self, deadline: std::time::Duration) {
+        // `IndexPlanLoader` has no `Drop` impl, so moving the runtime out of
+        // the struct is legal; the remaining fields drop cheaply after.
+        if let Some(rt) = self.runtime.into_inner() {
+            rt.shutdown_timeout(deadline);
+        }
+    }
 }
 
 /// Per-plan in-flight state: the plan itself plus one `spawn_blocking` join
