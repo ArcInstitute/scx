@@ -525,10 +525,17 @@ into the batch for any stored value `<= -1`; under `pflog` a single such value
 made the whole cell's baseline `NaN`, and with it every gene in that row. As on
 the sparse path, `NaN` clips to `0` too.
 
+The clip reaches the **normalization denominator** too, not just the values.
+Under `normalize=True, log1p=True` the per-cell depth is the sum of the clipped
+values, so a negative that is about to be discarded cannot inflate the genes
+that survive it (`[-1, 3]` normalizes by 3, not 2), and a stored `NaN` cannot
+make the depth `NaN` and skip normalization for the whole cell.
+
 With `normalize=False, log1p=False` — or `normalize=True` alone, which scales
-rather than logs — negative values still reach the batch unchanged. That is
-deliberate: nothing is undefined there, and a pre-centered or scaled matrix
-stored in `X` is a legitimate thing to stream.
+rather than logs — negative values still reach the batch unchanged, and the
+denominator stays the signed sum. That is deliberate: nothing is undefined
+there, and a pre-centered or scaled matrix stored in `X` is a legitimate thing
+to stream.
 
 Reproducibility caveat: this is a Rust-native ChaCha8 sampler, so runs
 downsampled by a numpy-based implementation are **not** bit-reproducible under it.

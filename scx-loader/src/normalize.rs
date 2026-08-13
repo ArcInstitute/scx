@@ -181,9 +181,16 @@ pub fn transform_depth(csr_data: &[f32], log1p: bool) -> f64 {
 /// - `depth`: The normalization denominator — the cell's total count over the
 ///   **full transcriptome**. Callers whose `row` is HVG-projected MUST pass the
 ///   full pre-projection row sum here, not the panel-local sum, so normalization
-///   matches scanpy's normalize-then-subset and the pflog path. For a
-///   full-transcriptome `row` this equals `row.iter().sum()`. Ignored when
+///   matches scanpy's normalize-then-subset and the pflog path. Ignored when
 ///   `normalize == false`.
+///
+///   **Derive it with [`transform_depth`], not `row.iter().sum()`.** When
+///   `log1p` is set the values are clipped before the log, so a raw sum
+///   describes a row that will not exist by the time it is divided: a discarded
+///   negative inflates every surviving gene, and a single `NaN` makes the whole
+///   sum `NaN` and skips normalization for the entire cell. `transform_depth`
+///   clips exactly when a log follows and returns the signed sum otherwise, so
+///   the normalize-only path is unaffected.
 #[inline]
 pub fn apply_dense_transforms(
     row: &mut [f32],

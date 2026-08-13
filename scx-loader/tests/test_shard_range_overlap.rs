@@ -163,6 +163,64 @@ fn the_plan_driven_loaders_refuse_a_multimodal_file() {
     );
 }
 
+/// `SparseCellSetLoader` gets the same guard, and it needs its own assertion:
+/// the test above constructs only `IndexPlanLoader`, so disabling this guard
+/// would have left an "all three loaders" claim green. Found by
+/// codex - gpt-5.6-sol.
+#[test]
+fn the_cell_set_loader_refuses_a_multimodal_file() {
+    use scx_format_io::ScxReader;
+    use scx_loader::SparseCellSetLoader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::write_multimodal_fixture(&dir.path().join("mm.scx"), 8, 6, 6);
+
+    let readers = vec![ScxReader::open(&path).unwrap()];
+    let err = SparseCellSetLoader::new(
+        readers, 4, None, 4, None, None, /*normalize=*/ false, /*log1p=*/ false, 1e4,
+        None,
+    )
+    .err()
+    .expect("SparseCellSetLoader must refuse a multimodal file");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("SparseCellSetLoader (file 0)") && msg.contains("overlap"),
+        "message should name the loader, the file index, and the cause: {msg}"
+    );
+}
+
+/// The control: a single-modality file still opens through the cell-set loader.
+#[test]
+fn the_cell_set_loader_still_opens_a_single_modality_file() {
+    use scx_format_io::ScxReader;
+    use scx_loader::SparseCellSetLoader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::write_multi_shard_fixture(&dir.path().join("ok.scx"), 16, 16, 4);
+    let readers = vec![ScxReader::open(&path).unwrap()];
+    SparseCellSetLoader::new(readers, 4, None, 4, None, None, false, false, 1e4, None)
+        .expect("a clean file must still open");
+}
+
+/// Overlap is only half of "exactly once". A cover with a **gap** passes
+/// `has_overlapping_csr_ranges` and then loses the uncovered cells — a short
+/// epoch on `TrainingPipeline`, and an in-bounds row reported as "out of range"
+/// mid-iteration on the plan-driven loaders. Found by codex - gpt-5.6-sol.
+#[test]
+fn rejects_a_file_whose_shards_leave_a_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::write_gapped_shards_fixture(&dir.path().join("gap.scx"), 16, 8, 6, 3);
+
+    let err = TrainingPipeline::new(&path, config())
+        .err()
+        .expect("expected construction to fail on a gapped cover");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exactly once") && msg.contains("gap"),
+        "message should name the invariant and the cause: {msg}"
+    );
+}
+
 /// The control for the test above: a single-modality file still opens.
 #[test]
 fn the_plan_driven_loader_still_opens_a_single_modality_file() {

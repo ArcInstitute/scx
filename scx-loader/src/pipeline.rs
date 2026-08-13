@@ -354,6 +354,33 @@ pub(crate) fn ensure_csr_ranges_are_readable(
                     ),
                 });
             }
+            // Overlap is only half of "exactly once". A cover with a *gap*, one
+            // that stops short of `n_obs`, or one whose shards carry no
+            // row-range stats passes `has_overlapping_csr_ranges` — it skips
+            // stat-less entries outright — and then loses the uncovered rows:
+            // `TrainingPipeline` emits a short epoch, and the plan-driven
+            // loaders report an in-bounds row as "out of range" mid-iteration,
+            // blaming the caller's plan for the file's defect.
+            //
+            // A single-modality file's shards are stamped `modality_id = 0`, so
+            // the same catalog predicate the scoped arm uses answers this
+            // exactly. On a multimodal file modality 0 owns no shards, so it
+            // would report `false` — which is why the overlap check above runs
+            // first and returns the message that actually helps.
+            if !reader
+                .catalog()
+                .modality_csr_ranges_tile_obs(0, reader.n_obs())
+            {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "{who}: this file's CSR shards do not cover the obs axis \
+                         [0, {}) exactly once — they leave a gap, stop short, or are \
+                         missing row-range stats, so some cells belong to no shard. \
+                         `scx info` lists the shard row ranges.",
+                        reader.n_obs()
+                    ),
+                });
+            }
         }
     }
     Ok(())
