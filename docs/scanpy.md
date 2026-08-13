@@ -1934,6 +1934,27 @@ conclusions — a silent CSR fallback measured as "GPU DE" is exactly the
 benchmarking trap the [route metadata](api.md#accelerator-route-metadata) exists
 to catch.
 
+**Malformed input is rejected, not ranked.** Every GPU route validates each
+shard on the host before it is staged, and raises rather than producing
+numbers. Two invariants the kernels cannot enforce themselves:
+
+- **Finite values.** The per-gene sort pads with `+INF` and sorts on the raw
+  IEEE-754 bit pattern, so a NaN would land above `+INF` and corrupt the U
+  statistic, the tie counts and every p-value in the gene — silently. Filter or
+  QC NaN / Inf before DE; the CPU paths reject the same input.
+- **One value per `(cell, gene)`.** The scatter runs one thread per nonzero, so
+  a duplicated entry would put two threads on one output cell with a
+  nondeterministic winner. On the CSC side this is checked as *strictly
+  increasing* row indices per column, which is what `scx build-csc` and every
+  other sidecar writer emits; a hand-built sidecar with distinct-but-unordered
+  rows is refused conservatively rather than raced.
+
+Both surface as a `RuntimeError` naming the offending gene column or nonzero
+index. The CSC-direct route previously ran neither check, so a NaN in a file
+with a CSC sidecar returned a complete `rank_genes_groups` / `pdex_ref` result
+on `device="gpu"` — finite, plausible scores and p-values, no error — while the
+same file on CPU, or on GPU without a sidecar, was rejected.
+
 **Benchmark route gates.** The benchmark suite enforces correct GPU dispatch
 via absolute-floor gates in `thresholds.yaml`. Every `accel_*.py` GPU variant
 emits an `<op>_route_gpu_correct` signal (1.0 when a GPU route ran, 0.0 on a
