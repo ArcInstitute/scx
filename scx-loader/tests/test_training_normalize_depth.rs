@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::write_known_multinnz_fixture;
+use common::{write_known_multinnz_fixture, KNOWN_MULTINNZ_N_VARS};
 use scx_format_io::{BackedCsrReader, ScxReader};
 use scx_loader::{
     fused_normalize_log1p_dense_with_depth, HvgProjection, LoaderConfig, TrainingPipeline,
@@ -71,7 +71,7 @@ fn training_pipeline_hvg_normalize_uses_full_depth() {
     // Panel captures genes 2 and 7 (present in every row) but not 33 or 58, so
     // panel-local depth is strictly below full depth for every cell.
     let hvg_indices = vec![2u32, 7, 40];
-    let hvg = HvgProjection::new(hvg_indices.clone());
+    let hvg = HvgProjection::new(hvg_indices.clone(), KNOWN_MULTINNZ_N_VARS).unwrap();
     let n_hvg = hvg.n_output_cols();
     let target_sum = 1.0e4_f64;
 

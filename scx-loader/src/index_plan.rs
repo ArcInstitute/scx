@@ -249,22 +249,11 @@ impl IndexPlanLoader {
             extract_obs_columns(&obs_metadata, &[0u64], &config.obs_columns, &cat_dicts)?;
         }
 
-        // HvgProjection::new does not validate against n_vars — do it here so
-        // out-of-range indices fail at construction rather than panicking later
-        // in scatter_row.
+        // `HvgProjection::new` range-checks against n_vars, so an out-of-range
+        // index fails at construction rather than becoming a silently all-zero
+        // output column downstream.
         let hvg_projection = match &config.hvg_indices {
-            Some(idxs) => {
-                let n_vars_u32: u32 =
-                    u32::try_from(n_vars).map_err(|_| LoaderError::ConfigError {
-                        reason: format!("n_vars={n_vars} exceeds u32::MAX; HVG indices use u32"),
-                    })?;
-                if let Some(&bad) = idxs.iter().find(|&&i| i >= n_vars_u32) {
-                    return Err(LoaderError::ConfigError {
-                        reason: format!("HVG index {bad} is out of range (n_vars={n_vars})"),
-                    });
-                }
-                Some(HvgProjection::new(idxs.clone()))
-            }
+            Some(idxs) => Some(HvgProjection::new(idxs.clone(), n_vars)?),
             None => None,
         };
 

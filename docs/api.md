@@ -2481,7 +2481,7 @@ loop is one epoch; shards are reshuffled between epochs for training randomizati
 |---|---|---|
 | `path` | — | Path to `.scx` file. |
 | `batch_size` | `1024` | Mini-batch size. Auto-tuned downward if `max_memory_mb` is exceeded. |
-| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. |
+| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. Every index must be `< n_vars` — an out-of-range index is rejected at construction, because it matches no column and would otherwise yield an output feature that is silently always zero. |
 | `obs_columns` | `[]` | Obs metadata column names included in each batch. |
 | `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). **On by default** — set `normalize=False` (with `log1p=False`) for raw-count output. |
 | `log1p` | `True` | Apply `log1p` after normalize. **On by default** — set `log1p=False` for raw-count output. |
@@ -2560,7 +2560,7 @@ per-cell pairing flexibility.
 | Argument | Default | Notes |
 |---|---|---|
 | `path` | — | Path to `.scx` file. |
-| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. |
+| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. Every index must be `< n_vars` — an out-of-range index is rejected at construction, because it matches no column and would otherwise yield an output feature that is silently always zero. |
 | `obs_columns` | `[]` | Obs metadata column names included in each batch. |
 | `normalize` | `True` | Total-count normalize (fused with `log1p`). |
 | `log1p` | `True` | Apply `log1p` after normalize. |

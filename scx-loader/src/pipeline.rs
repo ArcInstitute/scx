@@ -603,6 +603,28 @@ impl TrainingPipeline {
             )
         };
 
+        // HVG projection, built here rather than just before it is stored: the
+        // memory budget below derives `n_output_genes` from `hvg_indices.len()`
+        // (`adaptive_budget_mb`, then `compute_memory_budget`), so validating
+        // later would let an out-of-range panel size the budget first.
+        let projection = match &config.hvg_indices {
+            // Single-modality: range-checked. An index >= n_vars matches no CSR
+            // column on either scatter path, so it becomes an output column that
+            // is always exactly zero — a dead input feature that trains to a zero
+            // weight and is never diagnosed.
+            Some(idxs) if config.modality_id.is_none() => {
+                Some(HvgProjection::new(idxs.clone(), n_vars)?)
+            }
+            // Multimodal: deliberately NOT range-checked. `MultimodalTrainingDataset`
+            // fans a single panel across every modality (`python.rs`, one
+            // `TrainingPipeline` per modality) and each resolves its own `n_vars`,
+            // so a 33k-gene RNA panel would be rejected by a ~137-feature ADT
+            // modality. Accepted trade-off: the all-zero-column behaviour above
+            // survives on this path only, and `docs/training.md` says so.
+            Some(idxs) => Some(HvgProjection::new_unchecked(idxs.clone())),
+            None => None,
+        };
+
         // v4 PFlog: resolve α once. `None` ⇒ estimate over the raw CSR shards
         // (single-modality only — modality-scoped estimation isn't wired, and a
         // whole-file `BackedCsrReader` on a multimodal file would pool every
@@ -758,12 +780,6 @@ impl TrainingPipeline {
                 n_vars,
             );
         }
-
-        // Create HVG projection if configured
-        let projection = config
-            .hvg_indices
-            .as_ref()
-            .map(|indices| HvgProjection::new(indices.clone()));
 
         // Create shard shuffler
         let shuffler =

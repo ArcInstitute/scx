@@ -254,7 +254,7 @@ loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=0)
 |---|---|---|
 | `path` | — | Path to `.scx` file. |
 | `batch_size` | `1024` | Mini-batch size. Auto-tuned downward if `max_memory_mb` is exceeded; check via `effective_batch_size`. |
-| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. |
+| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. Every index must be `< n_vars` — an out-of-range index is rejected at construction, because it matches no column and would otherwise yield an output feature that is silently always zero. |
 | `obs_columns` | `None` | Obs metadata column names included in each batch dict. `None` = no obs columns. |
 | `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). The per-cell depth is the **full transcriptome** total count even under `hvg_indices` projection (matching scanpy's normalize-then-subset), not the panel-local sum. **scVI and other count-likelihood models need `normalize=False, log1p=False`.** |
 | `log1p` | `True` | Apply `log1p` after normalize. |
@@ -536,6 +536,17 @@ for batch in ds:
 > by `TrainingDataset`. `n_vars` returns a `dict[str, int]` mapping modality
 > names to per-modality variable counts. With `return_dict=False`, batches
 > are tuples of X arrays only (no obs or cell_indices).
+
+> [!WARNING]
+> **`hvg_indices` is not range-checked here.** A single panel is applied to
+> *every* modality, and each modality has its own feature count, so the check
+> that `TrainingDataset` and `IndexPlanDataset` apply — reject any index
+> `>= n_vars` — would reject an RNA-sized panel outright on a CITE-seq file
+> whose ADT modality has ~100 features. The panel is therefore passed through
+> unvalidated, and an index beyond a given modality's width yields a column
+> that is **silently always zero** for that modality. Pass per-modality panels
+> that are in range for the modality they apply to, or check them yourself
+> against `ds.n_vars[modality]`.
 
 See [multimodal.md](multimodal.md) for the full API.
 
