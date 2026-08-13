@@ -577,9 +577,11 @@ fn wilcoxon_rank_sum_gpu_dispatch(
 /// test group, `scratch.per_tg_pool_slabs[tg_idx][..sz * n_g]` are populated;
 /// `scratch.u_or_rank` / `scratch.tie_term` / per-group slabs pre-grown by the
 /// caller. `scratch.slab_aux` must hold `chunk_max × max(pool_len, n_g_max)`
-/// f32 keys — **both** sorts below feed it, the pool's and (ref-mode) each test
-/// group's, so a reference smaller than the largest test group is governed by
-/// the group. See `scx_gpu::gpu_de_aux_elems`. Empty test groups (`n_g == 0`)
+/// f32 keys whenever that exceeds `GPU_DE_BLOCK_SORT_CAPACITY` (below it no
+/// sort here touches aux at all) — **both** sorts below feed it, the pool's and
+/// (ref-mode) each test group's, so a reference smaller than the largest test
+/// group is governed by the group. See `scx_gpu::gpu_de_aux_elems` for the one
+/// expression that decides this. Empty test groups (`n_g == 0`)
 /// are skipped (the host post-pass synthesises NaN scores / p = 1 for them).
 #[allow(clippy::too_many_arguments)]
 fn wilcoxon_chunk_gpu_sequence_v3(
@@ -1923,12 +1925,16 @@ where
 
     // Clamp the gene chunk so the per-target-group pool slabs (the dominant
     // `n_test × chunk × n_g_max` allocation) fit a budget fraction of free VRAM
-    // (B8). `n_sorted_max` is what the aux buffer costs (the model's first
-    // argument); `pool_len` is the ref/pool slab; `n_slots` sizes the f64 sums.
+    // (B8). The model's first argument charges for the `slab` (sized `pool_len`
+    // below) *and* the aux buffer, so it takes whichever is larger — and aux is
+    // 0 unless some sort actually reaches the multi-tile path, since budgeting
+    // for a buffer that is never allocated only shrinks the chunk. `n_slots`
+    // sizes the f64 sums.
+    let budget_pool = pool_len.max(scx_gpu::gpu_de_aux_span(n_sorted_max)).max(1);
     let chunk_size = clamp_chunk_to_de_budget(
         dev,
         chunk_size,
-        n_sorted_max,
+        budget_pool,
         pool_len.max(1),
         n_g_max,
         n_test,
@@ -2301,13 +2307,14 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
         .map(|&g| group_indices[g].len())
         .max()
         .unwrap_or(0);
-    // Must match the core's `n_sorted_max`, or residency is decided against a
-    // smaller working set than the core then allocates.
+    // Must match the core's `budget_pool`, or residency is decided against a
+    // different working set than the core then allocates.
     let n_sorted_max = pool_len.max(n_g_max).max(1);
+    let budget_pool = pool_len.max(scx_gpu::gpu_de_aux_span(n_sorted_max)).max(1);
     let probe_chunk = probe_de_gene_chunk(
         dev,
         chunk_size,
-        n_sorted_max,
+        budget_pool,
         pool_len.max(1),
         n_g_max,
         n_test,
@@ -2327,7 +2334,7 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
         clamp_chunk_to_de_budget(
             dev,
             chunk_size,
-            n_sorted_max,
+            budget_pool,
             pool_len.max(1),
             n_g_max,
             n_test,

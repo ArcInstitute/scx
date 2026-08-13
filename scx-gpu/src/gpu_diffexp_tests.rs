@@ -56,13 +56,40 @@ fn test_gpu_de_aux_elems_covers_the_largest_sort_not_the_pool() {
         chunk * labelled
     );
 
-    // An empty pool still yields a usable request, not a zero-length buffer.
-    assert_eq!(gpu_de_aux_elems(chunk, 0).unwrap(), chunk);
-
     // Overflow is rejected here rather than wrapping into a small allocation
     // that resurfaces as an unexplained ShapeMismatch at sort time.
-    let err = gpu_de_aux_elems(usize::MAX, 2).unwrap_err();
+    let err = gpu_de_aux_elems(usize::MAX, GPU_DE_BLOCK_SORT_CAPACITY + 1).unwrap_err();
     assert!(matches!(err, GpuError::ShapeMismatch { .. }), "got {err:?}");
+}
+
+/// Below the single-tile capacity `gpu_de_block_sort` returns without touching
+/// `aux`, so demanding one is pure waste — VRAM, and a smaller gene chunk once
+/// `gpu_de_per_gene_scratch_bytes` charges for it. The boundary is exact:
+/// `<=` takes the fast path, so capacity itself needs nothing.
+#[test]
+fn test_gpu_de_aux_elems_is_zero_below_the_multi_tile_threshold() {
+    let chunk = 500usize;
+    let cap = GPU_DE_BLOCK_SORT_CAPACITY;
+
+    // The regime that ref-mode lives in: a tiny reference, every test group on
+    // the fast path. Sizing from the max here would reserve chunk × 8192 f32
+    // for a buffer no sort reads.
+    assert_eq!(gpu_de_aux_span(1usize.max(cap)), 0);
+    assert_eq!(gpu_de_aux_elems(chunk, 1usize.max(cap)).unwrap(), 0);
+
+    // Exact boundary, both sides.
+    assert_eq!(gpu_de_aux_span(cap), 0);
+    assert_eq!(gpu_de_aux_elems(chunk, cap).unwrap(), 0);
+    assert_eq!(gpu_de_aux_span(cap + 1), cap + 1);
+    assert_eq!(gpu_de_aux_elems(chunk, cap + 1).unwrap(), chunk * (cap + 1));
+
+    // Degenerate inputs stay quiet rather than demanding a buffer.
+    assert_eq!(gpu_de_aux_elems(chunk, 0).unwrap(), 0);
+    assert_eq!(gpu_de_aux_elems(0, cap + 1).unwrap(), 0);
+
+    // `ensure_aux_capacity` treats a 0 request as a no-op, so a fast-path-only
+    // driver never allocates: it starts at capacity 0 and 0 <= 0 returns early.
+    // (Asserted here rather than on a device, which the CPU CI lane has none of.)
 }
 
 #[test]

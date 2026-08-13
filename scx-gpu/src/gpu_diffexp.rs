@@ -1842,7 +1842,24 @@ pub fn gpu_de_per_gene_scratch_bytes(
         .saturating_add(f64_elems.saturating_mul(8))
 }
 
+/// Per-gene span of [`GpuDeChunkScratch::slab_aux`]: `n_per_gene_max` when the
+/// multi-tile sort path can be reached, and **0** when it cannot.
+///
+/// [`gpu_de_block_sort`] returns from the single-tile fast path without ever
+/// touching `aux`, so at or below [`GPU_DE_BLOCK_SORT_CAPACITY`] the buffer is
+/// dead weight — both in VRAM and in the [`gpu_de_per_gene_scratch_bytes`]
+/// budget, where charging for it needlessly shrinks the gene chunk.
+pub fn gpu_de_aux_span(n_per_gene_max: usize) -> usize {
+    if n_per_gene_max > GPU_DE_BLOCK_SORT_CAPACITY {
+        n_per_gene_max
+    } else {
+        0
+    }
+}
+
 /// Element count [`GpuDeChunkScratch::slab_aux`] must hold for a DE chunk loop.
+/// Zero when no sort in the loop can reach the multi-tile path — see
+/// [`gpu_de_aux_span`].
 ///
 /// `n_per_gene_max` is the **largest** `n_per_gene` that any
 /// [`gpu_de_block_sort`] call in the loop will pass — not merely the first one.
@@ -1857,7 +1874,10 @@ pub fn gpu_de_per_gene_scratch_bytes(
 /// caller passing a larger `n_per_gene_max` here than it passed as
 /// `n_pool_max` there has a VRAM budget that under-counts what it allocates.
 pub fn gpu_de_aux_elems(chunk_size: usize, n_per_gene_max: usize) -> Result<usize, GpuError> {
-    de_alloc_elems(chunk_size, n_per_gene_max.max(1))
+    match gpu_de_aux_span(n_per_gene_max) {
+        0 => Ok(0),
+        span => de_alloc_elems(chunk_size, span),
+    }
 }
 
 /// Pure budget clamp (no device access — unit-testable).
