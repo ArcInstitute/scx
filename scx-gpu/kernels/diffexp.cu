@@ -343,6 +343,13 @@ extern "C" __global__ void pseudobulk_all_groups_kernel(
 // 48 KB default shared-mem allocation.
 //
 // `sums` MUST be pre-zeroed before the FIRST shard's invocation.
+//
+// `n_obs` bounds `cell_to_group`. Two host-side layers already reject a row
+// index outside it — the shard decoder's `check_minor_indices` on any backed
+// file, then `validate_csc_shard_for_gpu` before staging — so this guard is
+// unreachable in practice and deliberately kept anyway: an out-of-bounds device
+// read poisons the whole CUDA context, and review §8.3 was precisely a
+// host-side check that existed but had never been wired to this route.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void csc_shard_pseudobulk_kernel(
     const long long* __restrict__ col_indptr,     // [n_cols_in_shard + 1]
@@ -355,7 +362,8 @@ extern "C" __global__ void csc_shard_pseudobulk_kernel(
     int c0,
     int chunk_size,
     int n_groups,
-    int mode_id
+    int mode_id,
+    int n_obs
 ) {
     int gene_local = blockIdx.x;
     if (gene_local >= chunk_size) return;
@@ -376,6 +384,7 @@ extern "C" __global__ void csc_shard_pseudobulk_kernel(
     long long end   = col_indptr[col_in_shard + 1];
     for (long long e = start + tid; e < end; e += nthr) {
         int cell = row_indices[e];
+        if (cell < 0 || cell >= n_obs) continue;
         int g = cell_to_group[cell];
         if (g >= 0 && g < n_groups) {
             sdata[(long long)g * nthr + tid] += apply_pre_transform(data[e], mode_id);
@@ -432,7 +441,8 @@ extern "C" __global__ void csc_shard_pseudobulk_global_kernel(
     int c0,
     int chunk_size,
     int n_groups,
-    int mode_id
+    int mode_id,
+    int n_obs                                     // bounds cell_to_group; see above
 ) {
     int gene_local = blockIdx.x;
     if (gene_local >= chunk_size) return;
@@ -444,6 +454,7 @@ extern "C" __global__ void csc_shard_pseudobulk_global_kernel(
     long long end   = col_indptr[col_in_shard + 1];
     for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
         int cell = row_indices[e];
+        if (cell < 0 || cell >= n_obs) continue;
         int g = cell_to_group[cell];
         if (g >= 0 && g < n_groups) {
             atomicAdd(&sums[(long long)g * (long long)chunk_size + (long long)gene_local],
@@ -469,6 +480,9 @@ extern "C" __global__ void csc_shard_pseudobulk_global_kernel(
 // count as the pre-#6 kernel.
 //
 // `slab` MUST be pre-zeroed by the caller before the FIRST shard's scatter.
+//
+// `n_obs` bounds both cell tables; see `csc_shard_pseudobulk_kernel` above for
+// why the guard is here as well as on the host.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void csc_shard_to_gene_major_kernel(
     const long long* __restrict__ col_indptr,     // [n_cols_in_shard + 1]
@@ -482,7 +496,8 @@ extern "C" __global__ void csc_shard_to_gene_major_kernel(
     int shard_col_start,
     int c0,
     int chunk_size,
-    int n_perm
+    int n_perm,
+    int n_obs                                     // bounds cell_to_group / cell_to_pos
 ) {
     int gene_local = blockIdx.x;
     if (gene_local >= chunk_size) return;
@@ -494,6 +509,7 @@ extern "C" __global__ void csc_shard_to_gene_major_kernel(
     long long end   = col_indptr[col_in_shard + 1];
     for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
         int cell = row_indices[e];
+        if (cell < 0 || cell >= n_obs) continue;
         if (cell_to_group[cell] == this_group_id) {
             int pos = cell_to_pos[cell];
             slab[(long long)gene_local * (long long)n_perm + (long long)pos] = data[e];

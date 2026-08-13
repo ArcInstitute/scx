@@ -29,6 +29,7 @@ use scx_format_io::shard_source::ColumnShardSource;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
+use crate::shard_validate::validate_csc_shard_for_gpu;
 use crate::staging::PinnedCscSlot;
 
 /// Borrowed CSC view backed by a device-resident CSC shard slot.
@@ -152,9 +153,22 @@ pub trait GpuCscShardSource {
 /// CSC kernels in this pipeline (`csc_shard_pseudobulk_kernel`,
 /// `csc_shard_to_gene_major_kernel`) are custom — no cuSPARSE descriptor
 /// cache is needed.
+///
+/// Every shard is run through [`validate_csc_shard_for_gpu`] before it is
+/// staged, the column-major counterpart of what the CSR pipeline has always
+/// done. Until review §8.3 this path validated nothing at all, so the
+/// CSC-direct DE route — the default whenever a sidecar exists — fed NaN,
+/// duplicate `(cell, gene)` pairs and out-of-range cell ids straight to the
+/// kernels.
 pub struct RawGpuCscShardSource<'a> {
     dev: &'a GpuDevice,
     source: &'a (dyn ColumnShardSource + Sync),
+    /// Shard indices already validated by this adapter, so a source iterated
+    /// once per gene chunk pays the O(nnz) scans once per shard rather than
+    /// once per chunk. Sound because `source` is a shared borrow held for the
+    /// adapter's whole lifetime: the bytes behind a given shard index cannot
+    /// change underneath it.
+    validated: Vec<bool>,
     pinned: [PinnedCscSlot; 2],
     /// Per-pinned-slot copy-stream events captured immediately after the
     /// slot's most recent `upload_to`. Host-waited on before the slot is
@@ -202,6 +216,7 @@ impl<'a> RawGpuCscShardSource<'a> {
         Ok(Self {
             dev,
             source,
+            validated: vec![false; source.n_csc_shards()],
             pinned,
             pinned_events: [None, None],
             col_indptr,
@@ -213,6 +228,14 @@ impl<'a> RawGpuCscShardSource<'a> {
             n_obs,
             n_vars,
         })
+    }
+
+    /// Number of shards this adapter has validated so far. Test-only: lets the
+    /// caching test assert that a second pass over the same source re-scans
+    /// nothing, and that a pass did not skip a shard it staged.
+    #[cfg(test)]
+    pub(crate) fn validated_count(&self) -> usize {
+        self.validated.iter().filter(|v| **v).count()
     }
 
     /// Grow device buffers to fit a shard's `col_indptr_len` / `nnz`.
@@ -275,6 +298,13 @@ impl<'a> RawGpuCscShardSource<'a> {
             let col_start = col_start as usize;
             let col_end = col_end as usize;
 
+            if !self.validated.get(i).copied().unwrap_or(false) {
+                validate_csc_shard_for_gpu(&shard, self.n_obs, col_start)?;
+                if let Some(v) = self.validated.get_mut(i) {
+                    *v = true;
+                }
+            }
+
             self.ensure_device_capacity(col_indptr_len, nnz)?;
             self.pinned[0].stage(&shard)?;
             self.pinned[0].upload_to(
@@ -312,6 +342,7 @@ impl<'a> RawGpuCscShardSource<'a> {
         let col_indptr_cap = &mut self.col_indptr_cap;
         let nnz_cap = &mut self.nnz_cap;
         let n_obs = self.n_obs;
+        let validated = &mut self.validated;
 
         // Local grow helper — same logic as `ensure_device_capacity`
         // but operates on the hoisted field references.
@@ -385,6 +416,13 @@ impl<'a> RawGpuCscShardSource<'a> {
                 }
                 let col_start = col_start_u32 as usize;
                 let col_end = col_end_u32 as usize;
+
+                if !validated.get(i).copied().unwrap_or(false) {
+                    validate_csc_shard_for_gpu(&csc, n_obs, col_start)?;
+                    if let Some(v) = validated.get_mut(i) {
+                        *v = true;
+                    }
+                }
 
                 // Host-side gate: if this pinned slot still has an
                 // outstanding copy-stream event from a previous shard,
@@ -568,6 +606,146 @@ mod tests {
             indptr.push(indices.len() as i64);
         }
         ScxCsc::new_unchecked((n_obs, n_cols), indptr, indices, data)
+    }
+
+    /// `n_cols` columns holding rows `0..per_col` in strictly increasing
+    /// order — enough nonzeros per column that a duplicate can be planted.
+    fn make_dense_csc(n_obs: usize, n_cols: usize, per_col: usize) -> ScxCsc {
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for c in 0..n_cols {
+            for r in 0..per_col {
+                indices.push(r as i32);
+                data.push((c * per_col + r) as f32 + 1.0);
+            }
+            indptr.push(indices.len() as i64);
+        }
+        ScxCsc::new_unchecked((n_obs, n_cols), indptr, indices, data)
+    }
+
+    /// §8.3: the CSC staging path validated nothing, so a malformed sidecar
+    /// reached the kernels — a NaN corrupting the radix sort, a duplicate
+    /// racing one `slab` cell, an out-of-range row as an OOB device read.
+    ///
+    /// Each fixture must be rejected **before** anything is staged: the
+    /// callback never fires, and the shard is not recorded as validated.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn test_csc_source_rejects_malformed_shards_before_staging() {
+        let dev = require_gpu!();
+
+        let nan = {
+            let mut s = make_dense_csc(8, 3, 4);
+            s.data[5] = f32::NAN;
+            s
+        };
+        let duplicate = {
+            let mut s = make_dense_csc(8, 3, 4);
+            s.indices[5] = s.indices[4];
+            s
+        };
+        let out_of_range = {
+            let mut s = make_dense_csc(8, 3, 4);
+            s.indices[5] = 8; // == n_obs
+            s
+        };
+
+        for (label, shard) in [
+            ("non-finite", nan),
+            ("duplicate row", duplicate),
+            ("out-of-range row", out_of_range),
+        ] {
+            let src = InMemoryCscSource {
+                shards: vec![shard],
+                ranges: vec![(0, 3)],
+                n_obs: 8,
+                n_vars: 3,
+            };
+            let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
+            let mut calls = 0usize;
+            let err = gpu
+                .for_each_gpu_csc_shard(|_, _| {
+                    calls += 1;
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(
+                matches!(err, GpuError::InvalidShard(_)),
+                "{label}: expected InvalidShard, got {err:?}"
+            );
+            assert_eq!(calls, 0, "{label}: must be rejected before staging");
+            assert_eq!(
+                gpu.validated_count(),
+                0,
+                "{label}: a rejected shard must not be recorded as validated"
+            );
+        }
+    }
+
+    /// Every shard the source stages is validated — including on the
+    /// multi-shard pipelined path, which is a separate call site from the
+    /// single-shard fast path and was the one §8.3's absent check hid in.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn test_csc_source_validates_every_staged_shard() {
+        let dev = require_gpu!();
+        let src = InMemoryCscSource {
+            shards: vec![
+                make_dense_csc(8, 3, 4),
+                make_dense_csc(8, 4, 4),
+                make_dense_csc(8, 3, 4),
+            ],
+            ranges: vec![(0, 3), (3, 7), (7, 10)],
+            n_obs: 8,
+            n_vars: 10,
+        };
+        let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
+        gpu.for_each_gpu_csc_shard(|_, _| Ok(())).unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(
+            gpu.validated_count(),
+            3,
+            "every staged shard must be scanned"
+        );
+
+        // A second pass re-yields all three; the per-shard record is what keeps
+        // the O(nnz) scans from repeating once per gene chunk.
+        gpu.for_each_gpu_csc_shard(|_, _| Ok(())).unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(gpu.validated_count(), 3);
+    }
+
+    /// A malformed shard in the middle of a multi-shard source aborts the
+    /// iteration rather than being staged.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn test_csc_source_rejects_malformed_shard_on_the_pipelined_path() {
+        let dev = require_gpu!();
+        let bad = {
+            let mut s = make_dense_csc(8, 4, 4);
+            s.data[2] = f32::NAN;
+            s
+        };
+        let src = InMemoryCscSource {
+            shards: vec![make_dense_csc(8, 3, 4), bad, make_dense_csc(8, 3, 4)],
+            ranges: vec![(0, 3), (3, 7), (7, 10)],
+            n_obs: 8,
+            n_vars: 10,
+        };
+        let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
+        let mut seen: Vec<usize> = Vec::new();
+        let err = gpu
+            .for_each_gpu_csc_shard(|idx, _| {
+                seen.push(idx);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, GpuError::InvalidShard(_)),
+            "expected InvalidShard, got {err:?}"
+        );
+        assert_eq!(seen, vec![0], "iteration must stop at the malformed shard");
     }
 
     /// Pipelined source yields the staged shards verbatim — dtoh of

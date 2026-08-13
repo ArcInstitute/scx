@@ -115,6 +115,7 @@ pub mod profile;
 pub mod resident_gpu_csr_source;
 pub mod rice_gpu;
 pub mod shard_decode;
+pub(crate) mod shard_validate;
 pub mod shufdelta_gpu;
 pub mod sparse_dense;
 pub mod staging;

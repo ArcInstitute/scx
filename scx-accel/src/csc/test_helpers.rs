@@ -134,6 +134,63 @@ pub(crate) fn write_csr_csc_test_file(
     path
 }
 
+/// Write an SCX file whose CSR shard is clean but whose single-shard CSC
+/// sidecar has been mutated by `corrupt` after encoding.
+///
+/// Exists so the GPU CSC-direct route can be driven through its real public
+/// entry point against a sidecar no writer would ever emit — a NaN, a duplicate
+/// row within a column, an out-of-range row. The sidecar is written as
+/// `Float32` (rather than the `Uint8` of [`write_csr_csc_test_file`]) precisely
+/// so a NaN is representable on disk.
+///
+/// `corrupt` receives the CSC `(row_indices, values)` for the whole matrix and
+/// mutates them in place; it must not change their length, since `indptr` is
+/// already fixed.
+pub(crate) fn write_file_with_corrupt_csc(
+    dir: &std::path::Path,
+    name: &str,
+    n_obs: usize,
+    n_vars: usize,
+    dense: &[u8],
+    corrupt: impl FnOnce(&mut [u32], &mut [f32]),
+) -> PathBuf {
+    let path = dir.join(format!("{name}.scx"));
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    let (csr_indptr, csr_indices, csr_values) = dense_to_csr(dense, n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &csr_indptr,
+            &csr_indices,
+            &csr_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    let (csc_indptr, mut csc_indices, csc_u8) = dense_to_csc_range(dense, n_obs, n_vars, 0, n_vars);
+    let mut csc_values: Vec<f32> = csc_u8.iter().map(|&v| v as f32).collect();
+    corrupt(&mut csc_indices, &mut csc_values);
+    let value_bytes: Vec<u8> = csc_values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    writer
+        .write_csc_shard(
+            &csc_indptr,
+            &csc_indices,
+            &value_bytes,
+            CodecId::None,
+            ValueEncoding::Float32,
+            0,
+        )
+        .unwrap();
+
+    writer.finish().unwrap();
+    path
+}
+
 /// Build a deterministic dense reference matrix. Pattern: `((r*7 +
 /// c*11) % 200 + 1)` for cells where `(r + c) % 3 == 0`, zero
 /// elsewhere.

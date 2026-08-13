@@ -38,13 +38,13 @@
 use std::sync::Arc;
 
 use cudarc::driver::safe::{CudaEvent, CudaSlice, CudaStream};
-use rayon::prelude::*;
 use scx_format_io::{prefetch, ShardSource};
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::gpu_preprocess::apply_fused_ops_inner;
 use crate::profile::{self, CodecClass};
+use crate::shard_validate::{first_non_finite, first_unsorted_major};
 use crate::staging::{GpuCsrSlot, PinnedCsrSlot};
 
 /// Approximate the host→device bytes a staged CSR shard moves (data f32 +
@@ -78,7 +78,7 @@ fn csr_htod_bytes(csr: &scx_sparse::ScxCsr) -> usize {
 /// was a rounding error beside the 123 re-decodes. Now that
 /// [`ResidentGpuCsrSource`](crate::ResidentGpuCsrSource) makes each shard's
 /// decode happen exactly once, this scan is one of the few things left on the
-/// critical path, hence the parallel form below (§9.13).
+/// critical path, hence the parallel form (§9.13).
 ///
 /// Both scans keep the serial version's *exact* answer, not just the same
 /// accept/reject decision: the sortedness check reduces by **minimum row
@@ -87,32 +87,13 @@ fn csr_htod_bytes(csr: &scx_sparse::ScxCsr) -> usize {
 /// the same offending position it always did — a first-hit early exit would
 /// have made the message nondeterministic under load.
 ///
-/// Small shards run serially: below [`VALIDATE_PAR_MIN_NNZ`] the rayon
+/// Small shards run serially: below `VALIDATE_PAR_MIN_NNZ` the rayon
 /// split/join costs more than the scan.
+///
+/// The scans themselves live in [`crate::shard_validate`], shared with the CSC
+/// sidecar's validator so the two layouts cannot drift in what they accept.
 pub(crate) fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), GpuError> {
-    /// First `(row, a, b)` whose row has `a >= b` at adjacent positions,
-    /// minimised over rows.
-    fn first_unsorted_row(csr: &scx_sparse::ScxCsr, r: usize) -> Option<(usize, i32, i32)> {
-        let s = csr.indptr[r] as usize;
-        let e = csr.indptr[r + 1] as usize;
-        csr.indices[s..e]
-            .windows(2)
-            .find(|w| w[0] >= w[1])
-            .map(|w| (r, w[0], w[1]))
-    }
-
-    let n_rows = csr.n_rows();
-    let parallel = csr.data.len() >= validate_par_min_nnz();
-
-    let unsorted = if parallel {
-        (0..n_rows)
-            .into_par_iter()
-            .filter_map(|r| first_unsorted_row(csr, r))
-            .min_by_key(|(r, _, _)| *r)
-    } else {
-        (0..n_rows).find_map(|r| first_unsorted_row(csr, r))
-    };
-    if let Some((r, a, b)) = unsorted {
+    if let Some((r, a, b)) = first_unsorted_major(&csr.indptr, &csr.indices, csr.n_rows()) {
         return Err(GpuError::InvalidShard(format!(
             "ScxCsr row {r} has unsorted or duplicate column indices ({a} >= {b}): \
              GPU shard scatter requires strictly-increasing per-row indices for \
@@ -120,12 +101,7 @@ pub(crate) fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), 
         )));
     }
 
-    let non_finite = if parallel {
-        csr.data.par_iter().position_first(|v| !v.is_finite())
-    } else {
-        csr.data.iter().position(|v| !v.is_finite())
-    };
-    if let Some(pos) = non_finite {
+    if let Some(pos) = first_non_finite(&csr.data) {
         return Err(GpuError::InvalidShard(format!(
             "ScxCsr contains a non-finite value ({}) at nonzero index {pos}: GPU DE ranking \
              requires finite input (NaN corrupts the radix sort; sanitise/QC before DE)",
@@ -133,33 +109,6 @@ pub(crate) fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), 
         )));
     }
     Ok(())
-}
-
-/// Default nnz below which [`validate_shard_for_gpu_de`] scans serially. Real
-/// shards are orders of magnitude above this (a census_500k shard carries
-/// ~24 M nnz); the threshold exists so unit fixtures and degenerate single-row
-/// shards don't pay a pool round-trip. Deliberately low enough that a test can
-/// exceed it with a ~256 KB fixture and still exercise the parallel path.
-pub(crate) const VALIDATE_PAR_MIN_NNZ: usize = 65_536;
-
-/// Effective threshold, overridable by `SCX_GPU_VALIDATE_PAR_MIN_NNZ`.
-///
-/// Exists because the parallel scan is not free for every consumer. It runs on
-/// the **consuming** thread, so on a decode-bound op it competes with the very
-/// decode-prefetch workers that are feeding it — GPU DE wins (validation is on
-/// its critical path now that each shard is decoded once) while GPU HVG, which
-/// validates but gains nothing from residency, can only lose. Setting the knob
-/// above any real shard's nnz restores the pre-4.5 serial scan **exactly**: the
-/// `else` arm below is the original code, unchanged, so this is a genuine
-/// baseline rather than an "off" arm that means something new.
-pub(crate) fn validate_par_min_nnz() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("SCX_GPU_VALIDATE_PAR_MIN_NNZ")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(VALIDATE_PAR_MIN_NNZ)
-    })
 }
 
 /// Host-RAM budget, in bytes, for the shards the GPU staging path holds
@@ -705,6 +654,7 @@ impl<'a> GpuShardSource for GpuPreprocessedShardSource<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shard_validate::validate_par_min_nnz;
     use scx_sparse::ScxCsr;
 
     struct InMemorySource {
