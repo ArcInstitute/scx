@@ -88,3 +88,94 @@ fn accepts_a_clean_single_modality_file() {
     let path = common::write_multi_shard_fixture(&dir.path().join("ok.scx"), 16, 16, 4);
     TrainingPipeline::new(&path, config()).expect("a clean tiling must still open");
 }
+
+/// Selecting a modality is not a free pass: that modality's **own** shards
+/// still have to tile the obs axis exactly once.
+///
+/// `ShardGroupIndex::build` cannot stand in for this. It only sees one shard
+/// group, so two overlapping shards have to be drawn into the same group before
+/// it notices — which the shuffle re-decides every epoch, and never at
+/// `shard_group_size == 1`. Found by codex - gpt-5.6-sol.
+#[test]
+fn rejects_a_scoped_modality_whose_own_shards_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::write_multimodal_overlapping_fixture(&dir.path().join("mm_bad.scx"), 8, 6);
+
+    // Modality 1 ("adt") is written as one clean shard; modality 2 ("rna") as
+    // two that overlap. Scoping to the clean one still works, so this is not
+    // "reject anything multimodal".
+    TrainingPipeline::new(
+        &path,
+        LoaderConfig {
+            modality_id: Some(1),
+            shard_group_size: 1,
+            ..config()
+        },
+    )
+    .expect("the well-formed modality must still open");
+
+    let err = TrainingPipeline::new(
+        &path,
+        LoaderConfig {
+            modality_id: Some(2),
+            // The group size at which the mid-epoch check provably cannot fire.
+            shard_group_size: 1,
+            ..config()
+        },
+    )
+    .err()
+    .expect("expected the malformed modality to be rejected at construction");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("modality 2") && msg.contains("tile the obs axis"),
+        "message should name the modality and the invariant: {msg}"
+    );
+}
+
+/// `IndexPlanLoader` and `SparseCellSetLoader` have no modality surface, so on
+/// a multimodal file they read the flattened shard list and `BackedCsrReader`'s
+/// row index keeps an arbitrary modality's shard per row — answering from a
+/// modality the caller never chose, silently. Verified before the fix: an
+/// equal-width two-modality file constructed fine and `process_plan` returned
+/// rows. Found by codex - gpt-5.6-sol.
+#[test]
+fn the_plan_driven_loaders_refuse_a_multimodal_file() {
+    use scx_loader::IndexPlanLoader;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Equal widths, so nothing would trip on a shape mismatch either.
+    let path = common::write_multimodal_fixture(&dir.path().join("mm.scx"), 8, 6, 6);
+
+    let mut cfg = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        max_memory_mb: 512,
+        ..Default::default()
+    };
+    cfg.obs_columns.clear();
+    let err = IndexPlanLoader::new(&path, cfg, 4, true, 4, 16)
+        .err()
+        .expect("IndexPlanLoader must refuse a multimodal file");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("IndexPlanLoader") && msg.contains("overlap"),
+        "message should name the loader and the cause: {msg}"
+    );
+}
+
+/// The control for the test above: a single-modality file still opens.
+#[test]
+fn the_plan_driven_loader_still_opens_a_single_modality_file() {
+    use scx_loader::IndexPlanLoader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = common::write_multi_shard_fixture(&dir.path().join("ok.scx"), 16, 16, 4);
+    let mut cfg = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        max_memory_mb: 512,
+        ..Default::default()
+    };
+    cfg.obs_columns.clear();
+    IndexPlanLoader::new(&path, cfg, 4, true, 4, 16).expect("a clean file must still open");
+}

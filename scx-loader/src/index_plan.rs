@@ -224,6 +224,11 @@ impl IndexPlanLoader {
         }
 
         let reader = ScxReader::open(path.as_ref())?;
+        // This loader has no modality surface, so it reads the flattened shard
+        // list. On a multimodal file that list claims every obs row once per
+        // modality and `BackedCsrReader`'s row index keeps an arbitrary one —
+        // answering from a modality the caller never chose. Refuse instead.
+        crate::pipeline::ensure_csr_ranges_are_readable(&reader, None, "IndexPlanLoader")?;
         let n_obs = reader.n_obs();
         let n_vars = reader.n_vars();
         // Captured before `reader` is consumed by `BackedCsrReader::new` below;
@@ -978,7 +983,8 @@ impl IndexPlanLoader {
             // normalize-then-subset semantics. Only needed when normalizing —
             // the depth vectors stay 0.0 (and are ignored) otherwise.
             if self.config.normalize {
-                let depth: f64 = data.iter().map(|&v| v as f64).sum();
+                // Clipped when a log follows — see `normalize::transform_depth`.
+                let depth: f64 = crate::normalize::transform_depth(data, self.config.log1p);
                 match request.side {
                     PairSide::Perturbed => depth_x[request.pair_idx] = depth,
                     PairSide::Control => depth_x_paired[request.pair_idx] = depth,

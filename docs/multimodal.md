@@ -216,11 +216,31 @@ The panel is sorted and deduplicated on every path including that one, so batch
 columns are in ascending gene-index order whatever order it was passed in, and a
 panel that is not already ascending-unique emits a `UserWarning`.
 
-A multimodal file opened with **no** modality at all — `TrainingPipeline::new`
-from Rust with `modality_id: None`, which the Python bindings never do — is
-rejected at construction. With no filter the loader would pool every modality's
-CSR shards, and since each modality independently tiles `[0, n_obs)`, two shards
-would claim the same cell at different widths.
+### Loaders refuse a multimodal file they cannot scope
+
+Every loader resolves a cell by its **global obs row**, so the shard list it
+reads has to claim each row exactly once. A multimodal file read without a
+modality breaks that: each modality independently tiles `[0, n_obs)`, so the
+flattened list claims every row once per modality.
+
+- `TrainingPipeline` / `TrainingDataset` with no modality is rejected at
+  construction. (Python never reaches this — `TrainingDataset` resolves a
+  modality itself, falling back to the alphabetically-first with a warning.)
+- **`IndexPlanDataset` and `SparseCellSetDataset` are rejected too.** Neither has
+  a modality surface, and before this they read the flattened list through
+  `BackedCsrReader`, whose row index keeps one arbitrary modality's shard per
+  row — so a plan asking for cell 3 got *some* modality's cell 3, with no
+  warning and no way to tell which. Extract a modality first:
+
+  ```bash
+  scx subset --modality rna atlas.scx atlas.rna.scx
+  ```
+
+- Scoping to a modality is checked too, not just accepted: that modality's own
+  shards must tile `[0, n_obs)` exactly once. A malformed tiling (overlapping or
+  gapped shard ranges, from a merge/append/compact defect) is rejected at
+  construction rather than silently dropping or duplicating cells part-way
+  through an epoch.
 
 ### 3.4 Modality-scoped queries — `query(modality=…)`
 

@@ -534,3 +534,65 @@ class TestNegativeValuesOnTheLogPaths:
         x = self._epoch(signed_scx, normalize=False, log1p=False)
         for (row, col), value in NEGATIVE_CELLS.items():
             assert x[row, col] == value
+
+
+class TestNormalizationDenominatorOnTheLogPaths:
+    """The clip has to reach the normalization *denominator*, not only the
+    values.
+
+    A cell `[-1, 3]` has raw depth 2 but clipped depth 3, so normalizing by the
+    raw sum scaled the surviving positive gene 1.5x on the strength of a value
+    that was then discarded. A stored NaN was worse: it made the sum NaN, so
+    `depth > 0` was false and normalization was skipped for every valid gene in
+    that cell. Found by codex - gpt-5.6-sol during review of this change.
+    """
+
+    @pytest.fixture
+    def two_gene_scx(self, tmp_path):
+        """Cell 0 = [-1, 3], cell 1 = [NaN, 4], cell 2 = [1, 3] (control)."""
+        import anndata
+        import scipy.sparse as sp
+
+        dense = np.array(
+            [[-1.0, 3.0], [np.nan, 4.0], [1.0, 3.0]], dtype=np.float32
+        )
+        path = str(tmp_path / "two_gene.scx")
+        pyscx.from_anndata(anndata.AnnData(sp.csr_matrix(dense)), path)
+
+        stored = pyscx.open(path).to_anndata().X.toarray()
+        assert stored[0, 0] == -1.0 and np.isnan(stored[1, 0]), (
+            "fixture lost its signed/NaN values"
+        )
+        return path
+
+    def _rows(self, path, **kwargs):
+        ds = pyscx.TrainingDataset(path, batch_size=8, **kwargs)
+        x, idx = [], []
+        for batch in ds:
+            x.append(batch["X"])
+            idx.append(batch["cell_indices"])
+        ds.close()
+        return np.concatenate(x, axis=0)[np.argsort(np.concatenate(idx))]
+
+    def test_negative_does_not_inflate_the_normalized_positive(self, two_gene_scx):
+        x = self._rows(two_gene_scx, normalize=True, log1p=True, target_sum=1e4)
+        # Clipped depth 3 -> the positive gene carries the whole target sum.
+        assert x[0, 0] == 0.0
+        assert abs(x[0, 1] - np.log1p(1e4)) < 1e-2, (
+            f"expected log1p(10000)={np.log1p(1e4)}, got {x[0, 1]} "
+            "(log1p(15000) means the raw depth was used)"
+        )
+
+    def test_nan_does_not_disable_normalization_for_the_cell(self, two_gene_scx):
+        x = self._rows(two_gene_scx, normalize=True, log1p=True, target_sum=1e4)
+        assert np.isfinite(x[1]).all()
+        assert x[1, 0] == 0.0
+        assert abs(x[1, 1] - np.log1p(1e4)) < 1e-2, (
+            f"the valid gene must still normalize, got {x[1, 1]}"
+        )
+
+    def test_a_clean_row_is_unaffected(self, two_gene_scx):
+        """Nothing about a non-negative cell changes."""
+        x = self._rows(two_gene_scx, normalize=True, log1p=True, target_sum=1e4)
+        assert abs(x[2, 0] - np.log1p(2.5e3)) < 1e-2
+        assert abs(x[2, 1] - np.log1p(7.5e3)) < 1e-2

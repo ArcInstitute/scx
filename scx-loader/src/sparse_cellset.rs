@@ -180,6 +180,16 @@ impl SparseCellSetLoader {
         target_sum: f64,
         downsample: Option<crate::downsample::DownsampleConfig>,
     ) -> Result<Arc<Self>> {
+        // Same reason as `IndexPlanLoader`: this loader resolves cells by global
+        // obs row through `BackedCsrReader`, so a multimodal file's flattened
+        // shard list would answer from an arbitrary modality.
+        for (file_id, reader) in scx_readers.iter().enumerate() {
+            crate::pipeline::ensure_csr_ranges_are_readable(
+                reader,
+                None,
+                &format!("SparseCellSetLoader (file {file_id})"),
+            )?;
+        }
         if let Some(cfg) = &downsample {
             cfg.validate()?;
             // An empty table means "no stable per-file identity", which keys on

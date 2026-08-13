@@ -121,8 +121,45 @@ pub fn fused_normalize_log1p_dense_with_depth(row: &mut [f32], target_sum: f64, 
 /// - `row`: Dense row of f32 values to transform in-place.
 /// - `target_sum`: Target sum for normalization (e.g., 1e4).
 pub fn fused_normalize_log1p_dense(row: &mut [f32], target_sum: f64) {
-    let row_sum: f64 = row.iter().map(|&v| v as f64).sum();
-    fused_normalize_log1p_dense_with_depth(row, target_sum, row_sum);
+    let depth = transform_depth(row, /*log1p=*/ true);
+    fused_normalize_log1p_dense_with_depth(row, target_sum, depth);
+}
+
+/// The normalization denominator for a row, over the values the transform will
+/// actually see.
+///
+/// `csr_data` is the cell's **full pre-projection** stored nonzeros — see
+/// [`normalize_dense_row_with_depth`] for why the panel-local sum is the wrong
+/// statistic under an HVG projection.
+///
+/// # Why `log1p` changes the answer
+///
+/// On the log paths the values are clipped to zero before the log
+/// ([`log1p_dense_row`]), so a denominator that still counts the pre-clip
+/// negatives does not describe the row being normalized. Concretely, a row
+/// `[-1, 3]` at `target_sum = 1e4` has raw depth `2`, giving a factor of `5000`
+/// and `log1p(15000)` for the surviving gene — a **positive** gene silently
+/// scaled by 1.5× because of a value that was then discarded. Clipping the
+/// denominator too gives depth `3` and `log1p(10000)`, which is what
+/// clip-then-normalize means and what the sparse gather already does (it clips
+/// in `transform_row` before deriving its depth).
+///
+/// A stored `NaN` is the sharper case: it makes the raw sum `NaN`, `depth > 0.0`
+/// is then false, and normalization is skipped for **every** otherwise-valid
+/// value in that cell. Clipping maps it to `0` and the rest of the row
+/// normalizes as it should.
+///
+/// When `log1p` is false the raw, signed sum is returned unchanged. That path
+/// scales without taking a log, nothing is undefined, and a caller streaming a
+/// pre-centered matrix through `normalize=True, log1p=False` still gets the
+/// denominator its data implies.
+#[inline]
+pub fn transform_depth(csr_data: &[f32], log1p: bool) -> f64 {
+    if log1p {
+        csr_data.iter().map(|&v| v.max(0.0) as f64).sum()
+    } else {
+        csr_data.iter().map(|&v| v as f64).sum()
+    }
 }
 
 /// Apply the configured dense-row transforms in-place.
@@ -378,6 +415,70 @@ mod tests {
         let mut scaled = vec![-2.0f32, 4.0];
         apply_dense_transforms(&mut scaled, true, false, 2.0, 2.0);
         assert_eq!(scaled, vec![-2.0, 4.0]);
+    }
+
+    /// The clip has to reach the **denominator**, not only the values.
+    ///
+    /// A row `[-1, 3]` has raw depth 2 but clipped depth 3. Normalizing by 2
+    /// scales the surviving positive gene to 15000 instead of 10000 — a valid
+    /// gene mis-scaled 1.5x by a value that is then discarded. Found by
+    /// codex - gpt-5.6-sol.
+    #[test]
+    fn the_log_paths_normalize_by_the_clipped_depth() {
+        let row = [-1.0f32, 3.0];
+        assert_eq!(transform_depth(&row, /*log1p=*/ true), 3.0);
+        assert_eq!(transform_depth(&row, /*log1p=*/ false), 2.0);
+
+        let mut got = row;
+        apply_dense_transforms(
+            &mut got,
+            /*normalize=*/ true,
+            /*log1p=*/ true,
+            10_000.0,
+            transform_depth(&row, true),
+        );
+        assert_eq!(got[0], 0.0);
+        assert!(
+            (got[1] - 10_000.0f32.ln_1p()).abs() < 1e-3,
+            "expected log1p(10000)={}, got {}",
+            10_000.0f32.ln_1p(),
+            got[1]
+        );
+    }
+
+    /// A single stored `NaN` made the raw sum `NaN`, so `depth > 0.0` was false
+    /// and normalization was skipped for **every** valid value in that cell.
+    /// Found by codex - gpt-5.6-sol.
+    #[test]
+    fn a_nan_does_not_disable_normalization_for_the_whole_cell() {
+        let row = [f32::NAN, 4.0];
+        let depth = transform_depth(&row, /*log1p=*/ true);
+        assert_eq!(depth, 4.0, "NaN must contribute 0, not poison the sum");
+
+        let mut got = row;
+        apply_dense_transforms(&mut got, true, true, 10_000.0, depth);
+        assert_eq!(got[0], 0.0);
+        assert!(
+            (got[1] - 10_000.0f32.ln_1p()).abs() < 1e-3,
+            "the valid gene must still be normalized: {got:?}"
+        );
+    }
+
+    /// Normalize-only keeps the signed denominator — the deliberately
+    /// unchanged path. Without this the fix above could quietly become
+    /// "the loader always clips".
+    #[test]
+    fn normalize_only_keeps_the_signed_depth() {
+        let row = [-1.0f32, 3.0];
+        let mut got = row;
+        apply_dense_transforms(
+            &mut got,
+            /*normalize=*/ true,
+            /*log1p=*/ false,
+            10_000.0,
+            transform_depth(&row, false),
+        );
+        assert_eq!(got, [-5000.0, 15000.0]);
     }
 
     #[test]

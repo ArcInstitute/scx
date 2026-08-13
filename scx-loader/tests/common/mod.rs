@@ -400,6 +400,106 @@ pub fn write_multimodal_fixture(
     path.to_path_buf()
 }
 
+/// A 2-modality fixture where modality `adt` (id 1) tiles `[0, n_obs)` with one
+/// clean shard and modality `rna` (id 2) is **malformed**: two shards whose row
+/// ranges overlap, so that modality alone violates the exactly-once invariant.
+///
+/// Lets a test scope to a modality and still be wrong — the case
+/// `ShardGroupIndex::build` cannot catch at `shard_group_size == 1`, because the
+/// two overlapping shards never share a group.
+pub fn write_multimodal_overlapping_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    n_vars: usize,
+) -> std::path::PathBuf {
+    use scx_format_io::modality::ModalityType;
+    assert!(n_obs >= 4 && n_obs % 2 == 0);
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        (2 * n_obs) as u64,
+        n_obs as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+    writer.write_obs(&string_column("cell_id", n_obs)).unwrap();
+
+    let one_row_shard = |row_start: usize, rows: usize| {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows {
+            indices.push(((row_start + local) % n_vars) as u32);
+            values.push(1u8);
+            indptr.push(*indptr.last().unwrap() + 1);
+        }
+        (indptr, indices, values)
+    };
+
+    // id 1 — clean: one shard covering [0, n_obs).
+    let adt = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(adt, &string_column("gene_id", n_vars))
+        .unwrap();
+    writer.set_modality_n_vars(adt, n_vars as u64).unwrap();
+    let (indptr, indices, values) = one_row_shard(0, n_obs);
+    writer
+        .write_csr_shard_for(
+            adt,
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // id 2 — malformed: [0, n_obs/2 + 1) and [n_obs/2 - 1, n_obs), overlapping
+    // on two rows.
+    let rna = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna, &string_column("gene_id", n_vars))
+        .unwrap();
+    writer.set_modality_n_vars(rna, n_vars as u64).unwrap();
+    let half = n_obs / 2;
+    for (row_start, rows) in [(0usize, half + 1), (half - 1, n_obs - half + 1)] {
+        let (indptr, indices, values) = one_row_shard(row_start, rows);
+        writer
+            .write_csr_shard_for(
+                rna,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
 /// Single-column `RecordBatch` of `{prefix}_{i}` strings — the obs/var shape
 /// every fixture here writes.
 fn string_column(name: &str, n: usize) -> RecordBatch {

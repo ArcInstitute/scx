@@ -207,8 +207,12 @@ fn fill_batch_parallel(
                 // the no-projection case this equals `output_row.iter().sum()`.
                 // Only needed when normalizing — skip the sum on raw-count /
                 // log1p-only configs (e.g. scVI) where `depth` is ignored.
+                // `transform_depth` clips when a log follows, so the
+                // denominator describes the values that will actually be
+                // logged — see its docs for the 1.5x mis-scale and the
+                // NaN-disables-the-whole-cell case that a raw sum causes.
                 let depth: f64 = if normalize {
-                    csr_data.iter().map(|&v| v as f64).sum()
+                    crate::normalize::transform_depth(csr_data, log1p)
                 } else {
                     0.0
                 };

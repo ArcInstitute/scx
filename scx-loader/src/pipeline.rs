@@ -110,7 +110,9 @@ pub struct LoaderConfig {
     /// `None` on a **multimodal** file is rejected at construction: with no
     /// filter the I/O stage pools every modality's shards, and since each
     /// modality independently tiles `[0, n_obs)` two of them would claim the
-    /// same global row.
+    /// same global row. `Some(mid)` is checked too — that modality's own shards
+    /// must tile the obs axis exactly once. See
+    /// [`ensure_csr_ranges_are_readable`].
     pub modality_id: Option<u8>,
     /// Opt out of the `hvg_indices` range check against `n_vars`.
     ///
@@ -278,6 +280,83 @@ fn shuffle_quality_degraded(requested: usize, effective: usize) -> bool {
         );
     }
     degraded
+}
+
+/// Refuse a file whose CSR shards do not tile the obs axis exactly once for the
+/// reader that is about to consume them.
+///
+/// Every loader in this crate resolves a cell by its **global obs row**, so the
+/// shard list it reads must claim each row exactly once. Two ways that fails:
+///
+/// * **A multimodal file read unscoped.** Each modality independently tiles
+///   `[0, n_obs)`, so the flattened list claims every row once per modality.
+///   `TrainingPipeline` would pool them into shard groups and drop or duplicate
+///   cells depending on the epoch's shuffle; `IndexPlanLoader` and
+///   `SparseCellSetLoader` go through `BackedCsrReader`, whose row index is
+///   built from the same flattened ranges, so they silently answer from
+///   whichever modality the index happened to keep — verified: a two-modality
+///   file with equal widths returns one modality's rows with no warning, and
+///   with differing widths it fails mid-iteration with a message blaming the
+///   file. Neither of those is a modality *choice* the caller made.
+/// * **A malformed single-modality tiling** — the merge / append / compact
+///   defect. `ShardGroupIndex::build` catches the duplicate only when both
+///   shards land in the same shard group, which the shuffle re-draws each epoch
+///   (and never, at `shard_group_size == 1`).
+///
+/// `scoped_modality` is `Some(mid)` when the caller selected one, in which case
+/// that modality's own tiling is what must hold; `None` means the whole
+/// flattened list is being read.
+pub(crate) fn ensure_csr_ranges_are_readable(
+    reader: &ScxReader,
+    scoped_modality: Option<u8>,
+    who: &str,
+) -> Result<()> {
+    match scoped_modality {
+        Some(mid) => {
+            if !reader
+                .catalog()
+                .modality_csr_ranges_tile_obs(mid, reader.n_obs())
+            {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "{who}: modality {mid}'s CSR shards do not tile the obs axis \
+                         [0, {}) exactly once — they overlap, leave a gap, or are \
+                         missing row-range stats, so a cell cannot be resolved to a \
+                         single shard. `scx info` lists the shard row ranges.",
+                        reader.n_obs()
+                    ),
+                });
+            }
+        }
+        None => {
+            if reader.catalog().has_overlapping_csr_ranges() {
+                let n_modalities = reader.n_modalities();
+                let remedy = if n_modalities > 1 {
+                    format!(
+                        "This file has {n_modalities} modalities, each covering the whole \
+                         obs axis, so the overlap is expected — but reading them pooled is \
+                         not a modality choice, it is an arbitrary one. Select one \
+                         (`modality_id` / `modality=` on TrainingDataset), use \
+                         `MultimodalTrainingDataset` to read several at once, or extract a \
+                         modality first with `scx subset --modality NAME` for the loaders \
+                         that have no modality surface."
+                    )
+                } else {
+                    "This file has a single modality, so its shards should tile the obs \
+                     axis exactly; the overlap means the file is malformed. `scx info` \
+                     lists the shard row ranges."
+                        .to_string()
+                };
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "{who}: this file's CSR shard row ranges overlap, so a cell \
+                         cannot be attributed to a single shard. {remedy}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compute the memory budget for the training pipeline.
@@ -622,41 +701,14 @@ impl TrainingPipeline {
                         reader.n_modalities()
                     ),
                 })?;
+            ensure_csr_ranges_are_readable(&reader, Some(mid), "TrainingPipeline")?;
             let n_shards = reader.catalog().csr_shards_for_modality(mid).len();
             (info.n_vars, n_shards, info.nnz)
         } else {
             // No modality selected, so the I/O stage pools `shards_sorted()`
-            // (`io_stage.rs`) — every modality's shards at once. Each modality
-            // independently tiles `[0, n_obs)`, so two of them landing in one
-            // shard group means two shards claim the same global obs row at
-            // different widths; `ShardGroupIndex::build` would reject that
-            // mid-epoch, and before it checked, the loser's rows silently
-            // vanished. Fail at construction, where the fix can be named.
-            // `has_overlapping_csr_ranges` is `true` for any multimodal file by
-            // construction and `false` for a single clean tiling, so this also
-            // catches a genuinely corrupt single-modality file.
-            if reader.catalog().has_overlapping_csr_ranges() {
-                let n_modalities = reader.n_modalities();
-                let remedy = if n_modalities > 1 {
-                    format!(
-                        "This file has {n_modalities} modalities, each covering the whole \
-                         obs axis, so the overlap is expected: select one with \
-                         `modality_id`, or use `MultimodalTrainingDataset` to read several \
-                         at once."
-                    )
-                } else {
-                    "This file has a single modality, so its shards should tile the obs \
-                     axis exactly; the overlap means the file is malformed. `scx info` \
-                     lists the shard row ranges."
-                        .to_string()
-                };
-                return Err(LoaderError::ConfigError {
-                    reason: format!(
-                        "this file's CSR shard row ranges overlap, so a cell cannot be \
-                         attributed to a single shard. {remedy}"
-                    ),
-                });
-            }
+            // (`io_stage.rs`) — every modality's shards at once. See
+            // `ensure_csr_ranges_are_readable` for what that does to a cell.
+            ensure_csr_ranges_are_readable(&reader, None, "TrainingPipeline")?;
             (
                 header.n_vars,
                 reader.catalog().shards_sorted().len(),
@@ -664,10 +716,12 @@ impl TrainingPipeline {
             )
         };
 
-        // HVG projection, built here rather than just before it is stored: the
-        // memory budget below derives `n_output_genes` from `hvg_indices.len()`
-        // (`adaptive_budget_mb`, then `compute_memory_budget`), so validating
-        // later would let an out-of-range panel size the budget first.
+        // HVG projection, built here rather than just before it is stored,
+        // because the memory budget below needs it: `adaptive_budget_mb` reads
+        // `n_output_cols()` straight off it, and `compute_memory_budget` — which
+        // only gets a `LoaderConfig` — recomputes the same width through
+        // `HvgProjection::output_cols_for`. Building it first also means an
+        // out-of-range panel is rejected before it can size anything.
         let projection = match &config.hvg_indices {
             // Range-checked — the default, including every modality-*scoped*
             // loader. An index >= n_vars matches no CSR column on either scatter
