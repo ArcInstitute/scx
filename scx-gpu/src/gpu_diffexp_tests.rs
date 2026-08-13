@@ -10,6 +10,98 @@ fn test_de_alloc_elems_rejects_overflow() {
     assert!(matches!(err, GpuError::ShapeMismatch { .. }), "got {err:?}");
 }
 
+/// The aux buffer is governed by the **largest** per-gene sort in a chunk
+/// loop, not by the first one. A ref-mode DE call with a small reference and a
+/// large test group is the shape that separates the two, and sizing from the
+/// pool alone is what §8.2 was.
+///
+/// Arithmetic only — it cannot see a driver that computes the wrong
+/// `n_per_gene_max` at the call site. That is what the GPU-node test
+/// `test_wilcoxon_gpu_ref_mode_small_ref_large_group_matches_cpu` is for.
+#[test]
+fn test_gpu_de_aux_elems_covers_the_largest_sort_not_the_pool() {
+    let chunk = 4usize;
+    let pool_len = 512usize; // reference group in ref-mode
+    let n_g_max = 9_000usize; // largest test group
+
+    // Only the group sort takes the multi-tile path, so only it reads aux at
+    // all — which is exactly why sizing for the pool looks fine until it isn't.
+    assert!(n_g_max > GPU_DE_BLOCK_SORT_CAPACITY);
+    assert!(pool_len <= GPU_DE_BLOCK_SORT_CAPACITY);
+
+    // Sizing from the pool yields a buffer the group sort cannot use — under
+    // the span rule the pool is on the fast path, so it asks for nothing at
+    // all. Asserted as an equality, not as `< needed`: `0.next_power_of_two()`
+    // is 1, so a `<` comparison here would hold no matter how the span rule
+    // were broken and the fixture would look like it still separated the two.
+    assert_eq!(gpu_de_aux_elems(chunk, pool_len).unwrap(), 0);
+
+    // What `gpu_de_block_sort` demands of `aux` for the group sort. Compared
+    // post-`next_power_of_two`, since that rounding is what
+    // `ensure_aux_capacity` applies and it is generous enough to mask a
+    // too-small request on a less lopsided fixture.
+    let needed = chunk * n_g_max;
+    let from_max = gpu_de_aux_elems(chunk, pool_len.max(n_g_max))
+        .unwrap()
+        .next_power_of_two();
+    assert!(from_max >= needed, "aux {from_max} < required {needed}");
+
+    // 1-vs-rest: the pool is every labelled cell, so it already dominates every
+    // group and the same expression must not inflate the allocation.
+    let labelled = 20_000usize;
+    assert_eq!(
+        gpu_de_aux_elems(chunk, labelled.max(n_g_max)).unwrap(),
+        chunk * labelled
+    );
+
+    // Overflow is rejected here rather than wrapping into a small allocation
+    // that resurfaces as an unexplained ShapeMismatch at sort time.
+    let err = gpu_de_aux_elems(usize::MAX, GPU_DE_BLOCK_SORT_CAPACITY + 1).unwrap_err();
+    assert!(matches!(err, GpuError::ShapeMismatch { .. }), "got {err:?}");
+}
+
+/// Below the single-tile capacity `gpu_de_block_sort` returns without touching
+/// `aux`, so demanding one is pure waste — VRAM, and a smaller gene chunk once
+/// `gpu_de_per_gene_scratch_bytes` charges for it. The boundary is exact:
+/// `<=` takes the fast path, so capacity itself needs nothing.
+#[test]
+fn test_gpu_de_aux_elems_is_zero_below_the_multi_tile_threshold() {
+    let chunk = 500usize;
+    let cap = GPU_DE_BLOCK_SORT_CAPACITY;
+
+    // The regime that ref-mode lives in: a tiny reference, every test group on
+    // the fast path. Sizing from the max here would reserve chunk × 8192 f32
+    // for a buffer no sort reads.
+    assert_eq!(gpu_de_aux_span(1usize.max(cap)), 0);
+    assert_eq!(gpu_de_aux_elems(chunk, 1usize.max(cap)).unwrap(), 0);
+
+    // Exact boundary, both sides.
+    assert_eq!(gpu_de_aux_span(cap), 0);
+    assert_eq!(gpu_de_aux_elems(chunk, cap).unwrap(), 0);
+    assert_eq!(gpu_de_aux_span(cap + 1), cap + 1);
+    assert_eq!(gpu_de_aux_elems(chunk, cap + 1).unwrap(), chunk * (cap + 1));
+
+    // Degenerate inputs stay quiet rather than demanding a buffer.
+    assert_eq!(gpu_de_aux_elems(chunk, 0).unwrap(), 0);
+    assert_eq!(gpu_de_aux_elems(0, cap + 1).unwrap(), 0);
+
+    // `ensure_aux_capacity` treats a 0 request as a no-op, so a fast-path-only
+    // driver never allocates: it starts at capacity 0 and 0 <= 0 returns early.
+    // (Asserted here rather than on a device, which the CPU CI lane has none of.)
+
+    // The budget must follow the allocation. `n_slab` and `n_aux` were one
+    // argument charged twice, so a fast-path driver kept paying for the aux
+    // buffer it had just stopped allocating — the chunk shrank to reserve
+    // nothing. Passing the span (0 here) is what keeps the two in step.
+    let with_aux = gpu_de_per_gene_scratch_bytes(cap, cap, cap, cap, 1, 2);
+    let without = gpu_de_per_gene_scratch_bytes(cap, gpu_de_aux_span(cap), cap, cap, 1, 2);
+    assert_eq!(
+        with_aux - without,
+        cap * 4,
+        "dropping the aux charge should save exactly one span of f32"
+    );
+}
+
 #[test]
 fn test_block_sort_capacity_constant_matches_kernel() {
     // BLOCK_THREADS * ITEMS_PER_THREAD in kernels/diffexp.cu must match
@@ -64,7 +156,8 @@ fn test_per_gene_scratch_bytes_dominated_by_per_tg_pool() {
     let n_test = 40;
     let n_g_max = 10_000;
     let bytes = gpu_de_per_gene_scratch_bytes(
-        /* n_pool_max */ 16_000,
+        /* n_slab */ 16_000,
+        /* n_aux */ 16_000,
         /* n_ref */ 16_000,
         n_g_max,
         n_test,
@@ -89,7 +182,7 @@ fn test_clamp_chunk_for_budget() {
     // and a partially-occupied GPU whose free VRAM the full chunk would blow
     // past (the report OOM'd because the backed reader / shard decode / index
     // tables already held VRAM, so free ≪ 80 GB).
-    let per_gene = gpu_de_per_gene_scratch_bytes(16_000, 16_000, 10_000, 40, 41);
+    let per_gene = gpu_de_per_gene_scratch_bytes(16_000, 16_000, 16_000, 10_000, 40, 41);
     let free = 8 * 1024 * 1024 * 1024usize; // 8 GB free at DE time
 
     // 4000 × per_gene at frac=0.6 of 8 GB does not fit → clamps below 4000,
@@ -115,7 +208,7 @@ fn test_clamp_chunk_for_budget() {
 
     // Pathological: per-tg pool so large even the floor chunk can't fit on a
     // tiny device → fits=false (caller surfaces a clear error).
-    let huge_per_gene = gpu_de_per_gene_scratch_bytes(0, 0, 4_000_000, 200, 201);
+    let huge_per_gene = gpu_de_per_gene_scratch_bytes(0, 0, 0, 4_000_000, 200, 201);
     let small_free = 4 * 1024 * 1024 * 1024usize; // 4 GB
     let (chunk3, fits3) = clamp_chunk_for_budget(4000, huge_per_gene, small_free, 0.6);
     assert!(

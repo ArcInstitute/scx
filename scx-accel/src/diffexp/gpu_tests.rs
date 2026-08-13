@@ -797,6 +797,140 @@ fn test_pdex_ref_gpu_multi_tile_matches_cpu() {
     }
 }
 
+/// §8.2 regression: ref-mode Wilcoxon with a reference **smaller** than the
+/// largest test group.
+///
+/// `wilcoxon_chunk_gpu_sequence_v3` sorts twice per chunk — the pool, then (in
+/// ref-mode only) each test group's slab. The driver used to size `slab_aux`
+/// from `pool_len` alone, so a small reference paired with a test group over
+/// `GPU_DE_BLOCK_SORT_CAPACITY` sent the group sort down the multi-tile path
+/// with a buffer built for the pool, and `gpu_de_block_sort` rejected it. The
+/// realistic trigger is ordinary: `reference="B cell"` against a much larger
+/// T-cell group.
+///
+/// The fixture is deliberately lopsided rather than merely large. `n_vars = 4`
+/// pins `chunk_size` to 4 (`resolve_chunk_size` mins against `n_vars`), so the
+/// old sizing yields `next_pow2(4 × 512) = 2_048` against the group sort's
+/// `4 × 9_000 = 36_000` — a clean `ShapeMismatch`, not a near miss that the
+/// power-of-two rounding could absorb. 9_000 also clears the 8_192 single-tile
+/// capacity, so the multi-tile path genuinely runs.
+///
+/// 1-vs-rest cannot reach this: its pool is every labelled cell, which is
+/// `≥ n_g_max` by construction. Hence ref-mode here, and the sibling
+/// `test_wilcoxon_gpu_dense_matches_cpu_one_vs_rest` for the other mode.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn test_wilcoxon_gpu_ref_mode_small_ref_large_group_matches_cpu() {
+    require_gpu_or_skip!();
+
+    let n_ref = 512usize;
+    let n_test_cells = 9_000usize;
+    let n_obs = n_ref + n_test_cells;
+    let n_vars = 4usize;
+
+    let groups: Vec<usize> = (0..n_obs).map(|i| usize::from(i >= n_ref)).collect();
+    let group_names = vec!["B_cell".to_string(), "T_cell".to_string()];
+    let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+
+    // Deterministic counts (same LCG idiom as the pdex multi-tile fixture);
+    // gene 1 is up in the test group, gene 3 down, the rest flat.
+    let mut data = vec![0.0f32; n_obs * n_vars];
+    let mut state: u64 = 0x2468_ACE0_1357_9BDF;
+    let mut next_uniform = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+    for cell in 0..n_obs {
+        let is_test = groups[cell] == 1;
+        for gene in 0..n_vars {
+            let lambda: f64 = match (is_test, gene) {
+                (true, 1) => 7.0,
+                (true, 3) => 1.5,
+                _ => 3.5,
+            };
+            let p = (lambda / 10.0).clamp(0.0, 1.0);
+            let mut k = 0u32;
+            for _ in 0..10 {
+                if next_uniform() < p {
+                    k += 1;
+                }
+            }
+            data[cell * n_vars + gene] = k as f32;
+        }
+    }
+
+    let cpu = wilcoxon_rank_sum(
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        Some(0), // reference = the SMALL group
+        false,   // not log-transformed
+        false,   // rankby_abs
+        true,    // tie_correct
+        0,       // gene_index_base
+    )
+    .expect("CPU wilcoxon (ref-mode) failed");
+
+    let gpu = wilcoxon_rank_sum_gpu_dense(
+        0,
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        Some(0),
+        false,
+        false,
+        true,
+    )
+    .expect(
+        "GPU wilcoxon ref-mode failed with n_ref=512 < n_g=9000 — \
+         slab_aux sized from the pool instead of the largest sort (§8.2)",
+    );
+
+    assert_eq!(cpu.group_names, gpu.group_names);
+    // Map by gene name: the per-group output is score-sorted, and ties can
+    // order differently between host and device.
+    use std::collections::HashMap;
+    let group_to_map = |res: &DiffExpResult, g: usize| -> HashMap<String, (f64, f64)> {
+        res.names[g]
+            .iter()
+            .zip(res.scores[g].iter().zip(res.pvals[g].iter()))
+            .map(|(n, (&s, &p))| (n.clone(), (s, p)))
+            .collect()
+    };
+    for g in 0..cpu.group_names.len() {
+        let cpu_map = group_to_map(&cpu, g);
+        let gpu_map = group_to_map(&gpu, g);
+        for gene in &gene_names {
+            let (s_cpu, p_cpu) = cpu_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
+            let (s_gpu, p_gpu) = gpu_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
+            assert!(
+                s_cpu.is_finite() && s_gpu.is_finite(),
+                "non-finite score group={} gene={gene}: cpu={s_cpu}, gpu={s_gpu}",
+                cpu.group_names[g],
+            );
+            assert!(
+                (s_cpu - s_gpu).abs() < 1e-6,
+                "score mismatch group={} gene={gene}: cpu={s_cpu}, gpu={s_gpu}",
+                cpu.group_names[g],
+            );
+            assert!(
+                (p_cpu - p_gpu).abs() < 1e-9
+                    || (p_cpu - p_gpu).abs() / p_cpu.abs().max(1e-12) < 1e-6,
+                "pval mismatch group={} gene={gene}: cpu={p_cpu}, gpu={p_gpu}",
+                cpu.group_names[g],
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // G1.7 — dedicated edge-case probes.
 //
