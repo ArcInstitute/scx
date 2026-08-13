@@ -1243,7 +1243,11 @@ pub fn gpu_de_block_sort(
         })?;
     if aux.len() < n_elements {
         return Err(GpuError::ShapeMismatch {
-            expected: format!("aux buffer ≥ chunk_size * n_per_gene = {n_elements} f32 keys",),
+            expected: format!(
+                "aux buffer ≥ chunk_size * n_per_gene = {chunk_size} * {n_per_gene} = \
+                 {n_elements} f32 keys — size it with gpu_de_aux_elems() against the \
+                 LARGEST n_per_gene in the chunk loop, not the first sort's"
+            ),
             got: format!("aux.len() = {}", aux.len()),
         });
     }
