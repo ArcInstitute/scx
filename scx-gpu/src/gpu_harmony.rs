@@ -1107,10 +1107,32 @@ pub fn gpu_harmony_correction_grouped(
 
 /// Rough device-memory footprint for a Harmony GPU run, in bytes.
 ///
-/// Counts the buffers that live on the device for the full duration of
-/// the iteration loop: Z_orig, Z_corr, Z_cos, R, dist, Y plus per-cell
-/// batch labels and small O/E/theta/sigma arrays. Transient scratch is
-/// not included.
+/// A deliberate **lower bound**, not an estimate of peak usage. Callers rely on
+/// that direction: [`gpu_harmony_fits`] refuses a run only when this exceeds
+/// free VRAM, which is sound precisely because the real footprint is never
+/// smaller.
+///
+/// Counts every persistent buffer whose size is derivable from
+/// `(n, d, k, b, c)`: Z_orig, Z_corr, Z_cos, R, dist, Y, the per-cell batch
+/// labels and small O/E/theta/sigma arrays, the always-live per-cell scratch
+/// (`R-row`, `order`, `obj_cell`), the K·B objective partial, the
+/// `all_cells` / `cells_concat` pair, and the correction scratch
+/// (`z_sum`, `W`, `pr_b`, `batch_offsets`).
+///
+/// `all_cells` is exactly `c · n`, not an approximation: `HarmonyState::new`
+/// requires every covariate to carry `n_obs` labels and pushes each cell into
+/// exactly one level per covariate, and the GPU setup concatenates every
+/// `(covariate, level)` pair once. The per-cluster `batch_prop_cutoff` pruning
+/// happens later, inside the correction loop, and never shrinks `batch_index`.
+///
+/// **Still excluded, so still an undercount**: `d_block_cells`, sized from
+/// `config.block_size` rather than from these five parameters, and genuinely
+/// transient scratch.
+///
+/// Both extensions came out of PR #422 review. **codex** found the first batch
+/// of missing always-live buffers; **codex** and **Cursor Agent (Grok)** then
+/// independently disproved this doc's own claim that the `all_cells` pair could
+/// not be derived — it can, and now is.
 pub fn gpu_harmony_memory_bytes(n: usize, d: usize, k: usize, b: usize, c: usize) -> u64 {
     let f32b = std::mem::size_of::<f32>() as u64;
     let i32b = std::mem::size_of::<i32>() as u64;
@@ -1132,7 +1154,40 @@ pub fn gpu_harmony_memory_bytes(n: usize, d: usize, k: usize, b: usize, c: usize
     let ts = (b + k) * f32b;
     // batch labels: C*N * i32, cov_offset: C * i32
     let lab = c * n * i32b + c * i32b;
-    z + r + y + oe + ts + lab
+    // Always-live per-cell scratch, held across the whole iteration loop:
+    // R-row (N f32), order (N i32), obj_cell (N f32).
+    let per_cell = 2 * n * f32b + n * i32b;
+    // Objective cross partial: K*B f32.
+    let cross = k * b * f32b;
+    // Global cell membership + its concat scratch: each exactly C*N i32 (see
+    // the doc above for why this is exact rather than a guess).
+    let membership = 2 * c * n * i32b;
+    // Correction scratch, hoisted out of the K-loop and live for the run:
+    // z_sum + W (B*d f32 each), pr_b (B f32), batch_offsets (B+1 i32).
+    let correction = 2 * b * d * f32b + b * f32b + (b + 1) * i32b;
+    z + r + y + oe + ts + lab + per_cell + cross + membership + correction
+}
+
+/// Whether a Harmony GPU run can be **ruled out** against `free_bytes` of
+/// device memory before any of it is allocated.
+///
+/// `false` means the run certainly cannot fit; `true` means only that it is not
+/// certainly impossible, since [`gpu_harmony_memory_bytes`] is a lower bound —
+/// it omits transient scratch and the batch-structure-dependent buffers it
+/// cannot derive. A `true` here is therefore not a promise that the run fits,
+/// and the caller still has to survive its own allocations.
+///
+/// That asymmetry is why there is **no headroom multiplier here**. The estimate
+/// is a strict undercount, so `estimate > free` is a fact, not a heuristic, and
+/// refusing on it cannot turn a run that would have succeeded into an error.
+/// Padding it would buy a slightly earlier failure in the grey zone at the cost
+/// of refusing runs that fit — the worse trade, because the grey zone still
+/// fails safely (and legibly) at the allocation itself.
+///
+/// Equality fits: `estimate == free` is the exactly-fits case, and refusing it
+/// would be refusing a run the estimate says is possible.
+pub fn gpu_harmony_fits(free_bytes: u64, n: usize, d: usize, k: usize, b: usize, c: usize) -> bool {
+    gpu_harmony_memory_bytes(n, d, k, b, c) <= free_bytes
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
@@ -1150,6 +1205,29 @@ mod tests {
         // The full estimate must be within a sensible order of magnitude.
         assert!(large > 300_000_000);
         assert!(large < 5_000_000_000);
+    }
+
+    #[test]
+    fn fits_refuses_only_when_the_estimate_exceeds_free_memory() {
+        let (n, d, k, b, c) = (1_000_000usize, 30usize, 100usize, 3usize, 1usize);
+        let need = gpu_harmony_memory_bytes(n, d, k, b, c);
+
+        // Exactly enough fits — refusing here would refuse a run the estimate
+        // itself says is possible.
+        assert!(gpu_harmony_fits(need, n, d, k, b, c));
+        assert!(gpu_harmony_fits(need + 1, n, d, k, b, c));
+        // One byte short is a certain refusal.
+        assert!(!gpu_harmony_fits(need - 1, n, d, k, b, c));
+        assert!(!gpu_harmony_fits(0, n, d, k, b, c));
+    }
+
+    /// The estimate must stay an *undercount* of what the run allocates, since
+    /// that is what makes a refusal a fact rather than a guess. A small run on
+    /// a realistically-sized card must never be refused.
+    #[test]
+    fn a_small_run_is_never_refused_on_a_real_card() {
+        const H100_80GB: u64 = 80 * 1024 * 1024 * 1024;
+        assert!(gpu_harmony_fits(H100_80GB, 100_000, 50, 100, 4, 2));
     }
 
     #[test]

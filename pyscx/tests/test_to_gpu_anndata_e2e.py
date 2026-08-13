@@ -35,9 +35,19 @@ pytestmark = pytest.mark.skipif(
 def scx1_scx(tmp_path):
     """A small framed Scx1 SCX file that decodes fully in VRAM.
 
-    Small integer UMI-like counts (``poisson(2.0)``, median ~2) auto-route to the
-    Scx1 codec, the only codec with GPU decode kernels. The default framed (v4)
-    layout decodes group-by-group in VRAM (``decode_framed_scx1_gpu``).
+    Small integer UMI-like counts (``poisson(2.0)``, median ~2). The framed (v4)
+    layout decodes group-by-group in VRAM (``decode_framed_scx1_gpu``); Scx1 is
+    the only codec with GPU decode kernels.
+
+    ``codec="scx1"`` is **explicit, and must stay explicit.** This fixture used
+    to rely on ``codec="auto"`` picking Scx1 from the median-≤-8 heuristic, but
+    ``auto`` is cost-aware now and adopts ``ShufDeltaZstd`` whenever it comes out
+    ≥5% smaller — which it does here (``scx info`` reports ``Codec: shufdelta``).
+    A ShufDeltaZstd shard host-bounces, so every assertion below about in-VRAM
+    decode silently became untestable. The `accel_to_gpu_anndata` benchmark
+    already forces ``--codec scx1`` for exactly this reason; this fixture had not
+    caught up. A test whose premise is "these shards are Scx1" must not leave the
+    codec to a heuristic that is free to change.
 
     NB: do *not* reuse ``conftest.py::synthetic_adata`` here — its
     ``randint(0, 200)`` values (median ~100) route to Zstd, which host-bounces.
@@ -51,7 +61,7 @@ def scx1_scx(tmp_path):
     adata = anndata.AnnData(X=sp.csr_matrix(dense))
 
     path = str(tmp_path / "scx1.scx")
-    pyscx.from_anndata(adata, path)  # codec="auto" → framed Scx1
+    pyscx.from_anndata(adata, path, codec="scx1")
     return path
 
 
@@ -77,6 +87,63 @@ def test_to_gpu_anndata_decode_gpu_transfer_mode(scx1_scx):
         f"bytes_uploaded={bytes_uploaded} should be ~indptr-only, well under "
         f"nnz*8={nnz * 8}"
     )
+
+
+def test_device_decode_failure_falls_back_to_host_assemble(scx1_scx, monkeypatch):
+    """A failed in-VRAM decode still produces X, via host-assemble (§8.10).
+
+    ``SCX_FORCE_DEVICE_DECODE_FAILURE=1`` makes the device decode report a
+    module-load failure — the realistic trigger, since a build whose PTX did not
+    compile bakes empty stubs that fail exactly there. Before the fallback this
+    raised ``RuntimeError: GPU shard assembly failed``, even though the
+    host-assemble path beside it reaches the same cupy ``X``.
+
+    The fallback must be *visible*: a silently-degraded handoff is a broken
+    build nobody notices. Both the warning and the recorded reason are asserted,
+    since ``transfer_mode`` alone cannot distinguish this from host-assemble
+    chosen up front for a filtered request.
+    """
+    monkeypatch.setenv("SCX_FORCE_DEVICE_DECODE_FAILURE", "1")
+
+    with pytest.warns(UserWarning, match="in-VRAM shard decode failed"):
+        gpu_adata = pyscx.open(scx1_scx).to_gpu_anndata()
+
+    meta = gpu_adata.uns["scx_accel"]["to_gpu_anndata"]
+    assert meta["transfer_mode"] == "scx_device_handoff"
+    assert meta["fallback_reason"] == "gpu_runtime_error"
+    # Still a GPU route: the result is on the device either way, just uploaded
+    # from the host rather than decoded in VRAM.
+    assert meta["route"] == "gpu_csr"
+
+    # And the answer is right, not merely present.
+    cpu_x = pyscx.open(scx1_scx).to_anndata().X
+    cpu_x = cpu_x.tocsr() if not sp.isspmatrix_csr(cpu_x) else cpu_x
+    cpu_x.sort_indices()
+    fallback_x = gpu_adata.X.get()
+    fallback_x.sort_indices()
+    np.testing.assert_array_equal(fallback_x.indptr, cpu_x.indptr)
+    np.testing.assert_array_equal(fallback_x.indices, cpu_x.indices)
+    np.testing.assert_allclose(fallback_x.data, cpu_x.data, rtol=1e-5, atol=1e-5)
+
+
+def test_device_decode_fallback_is_off_by_default(scx1_scx):
+    """The knob is opt-in: an unset env leaves the fast path alone.
+
+    Guards the fault-injection hook itself — a hook that fired unconditionally
+    would make the test above pass while silently disabling the in-VRAM decode
+    for every user.
+    """
+    import os
+
+    assert "SCX_FORCE_DEVICE_DECODE_FAILURE" not in os.environ
+    meta = pyscx.open(scx1_scx).to_gpu_anndata().uns["scx_accel"]["to_gpu_anndata"]
+    # The fast path ran. Asserted as "not host-assemble" rather than as a
+    # specific device-decode mode: which of the two fast-path modes you get
+    # depends on the shard codec, and this test is about the knob, not the
+    # codec. `test_to_gpu_anndata_decode_gpu_transfer_mode` is what pins the
+    # fully-in-VRAM mode.
+    assert meta["transfer_mode"] != "scx_device_handoff"
+    assert meta["fallback_reason"] == "none"
 
 
 def test_to_gpu_anndata_values_match_cpu(scx1_scx):

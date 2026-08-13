@@ -138,6 +138,22 @@ pub enum FallbackReason {
     /// importable, so the op fell back to CPU. See `plan_rapids_route` and
     /// `docs/gpu-setup.md` (rapids analysis backend).
     NoRapids,
+    /// The op reached a *slower* path because the faster one failed on the
+    /// device at run time — not because the request or the input ruled it out.
+    ///
+    /// Every other variant here is a pre-flight condition, decided before any
+    /// device work. This one is decided by a failure that already happened, so
+    /// it is only ever recorded on an op that **succeeded** by another route.
+    /// A GPU op that fails outright raises instead, and its route stamp is
+    /// rolled back (`pyscx`'s `RouteStamp`) rather than rewritten to claim a
+    /// CPU run that never happened — `device="auto"` resolves the device up
+    /// front and does not re-run on CPU after a runtime GPU failure.
+    ///
+    /// Currently produced by `Experiment.to_gpu_anndata`, which falls through
+    /// to host-assemble when the in-VRAM shard decode fails. Without this the
+    /// slow path is indistinguishable from the one chosen up front because the
+    /// request needed filtering.
+    GpuRuntimeError,
 }
 
 impl FallbackReason {
@@ -152,6 +168,7 @@ impl FallbackReason {
             FallbackReason::UserForcedCpu => "user_forced_cpu",
             FallbackReason::PerfPolicy => "perf_policy",
             FallbackReason::NoRapids => "no_rapids",
+            FallbackReason::GpuRuntimeError => "gpu_runtime_error",
         }
     }
 }
@@ -241,7 +258,17 @@ pub enum DeviceRequest {
     Cpu,
     /// Force GPU (error elsewhere if unavailable).
     Gpu,
-    /// Prefer GPU when available, else CPU.
+    /// Prefer GPU when it is **available at dispatch**, else CPU.
+    ///
+    /// Availability is resolved once, before the op starts, from the
+    /// pre-flight conditions [`FallbackReason`] enumerates. It is **not**
+    /// re-evaluated afterwards: a GPU that is present but then fails at run
+    /// time — out of memory, a driver fault — raises, rather than silently
+    /// re-running the op on CPU. That is deliberate. A CPU re-run of an
+    /// atlas-scale op is not a graceful degradation the caller can ignore; it
+    /// is hours of work they did not ask for, discoverable only after the
+    /// fact. The error names the shortfall and the remedy instead
+    /// (`device="cpu"`).
     Auto,
 }
 
@@ -719,6 +746,71 @@ mod tests {
         );
         assert!(AccelRoute::RapidsSinglecell.is_gpu());
         assert_eq!(FallbackReason::NoRapids.as_str(), "no_rapids");
+        // Read back out of `uns["scx_accel"]["to_gpu_anndata"]` by
+        // `pyscx/tests/test_gpu_device_handoff.py`.
+        assert_eq!(
+            FallbackReason::GpuRuntimeError.as_str(),
+            "gpu_runtime_error"
+        );
+    }
+
+    /// No two reasons may serialise to the same string: the value is what a
+    /// gate and a user branch on, so a collision would make two different
+    /// diagnoses indistinguishable on the wire.
+    #[test]
+    fn fallback_reason_strings_are_distinct() {
+        let all = [
+            FallbackReason::None,
+            FallbackReason::NoCuda,
+            FallbackReason::NoCscSidecar,
+            FallbackReason::UnsupportedDimensions,
+            FallbackReason::UnsupportedInputLayout,
+            FallbackReason::UserForcedCpu,
+            FallbackReason::PerfPolicy,
+            FallbackReason::NoRapids,
+            FallbackReason::GpuRuntimeError,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for r in all {
+            assert!(seen.insert(r.as_str()), "duplicate string for {r:?}");
+        }
+    }
+
+    /// A runtime fallback is never a *planned* route: every planner decides
+    /// from pre-flight facts only, and this reason is recorded after the fact
+    /// by the op that survived. If a planner ever starts returning it, the
+    /// contract in its doc comment (and this test) needs revisiting.
+    #[test]
+    fn no_planner_returns_the_runtime_reason() {
+        for device in [DeviceRequest::Cpu, DeviceRequest::Gpu, DeviceRequest::Auto] {
+            for gpu_available in [false, true] {
+                for gpu_eligible in [false, true] {
+                    for csc_available in [false, true] {
+                        for layout in [
+                            InputLayout::DenseHost,
+                            InputLayout::CsrHost,
+                            InputLayout::BackedCsr,
+                            InputLayout::BackedCsc,
+                            InputLayout::LazyCsr,
+                        ] {
+                            let info = plan_de_route(
+                                device,
+                                layout,
+                                gpu_available,
+                                gpu_eligible,
+                                csc_available,
+                            );
+                            assert_ne!(info.fallback_reason, FallbackReason::GpuRuntimeError);
+                        }
+                        let info =
+                            plan_hvg_route(device, gpu_available, gpu_eligible, csc_available);
+                        assert_ne!(info.fallback_reason, FallbackReason::GpuRuntimeError);
+                    }
+                    let info = plan_nb_glm_route(device, gpu_available, gpu_eligible);
+                    assert_ne!(info.fallback_reason, FallbackReason::GpuRuntimeError);
+                }
+            }
+        }
     }
 
     // --- rapids router (plan_rapids_route) ---

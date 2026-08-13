@@ -1668,6 +1668,13 @@ All accelerators that support GPU expose a `device` parameter:
 - `device="gpu"` — force GPU (raises error if unavailable)
 - `device="gpu:1"` — select a specific GPU on multi-GPU systems
 
+`auto` resolves availability **once, before the op starts**. A GPU that is
+present but then fails while running — out of memory, a driver fault — raises;
+`auto` does not silently re-run the op on CPU, because a CPU re-run at atlas
+scale is hours of work you did not ask for. The error names the shortfall and
+the remedy. See [docs/gpu-setup.md § What `device="auto"` does and does not
+do](gpu-setup.md#what-deviceauto-does-and-does-not-do).
+
 > **Seeing the route at op start / diagnosing a slow GPU op.** Each accelerator
 > logs its resolved route the moment it starts, at INFO — enable it with
 > `import logging; logging.basicConfig(level=logging.INFO)` (or

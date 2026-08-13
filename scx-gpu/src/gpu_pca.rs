@@ -292,11 +292,32 @@ fn randomized_pca_core(
     // streaming path (below) when it won't fit VRAM. `try_build_resident_csr`
     // drains `source` once; the streaming `op` is only used on the fallback.
     //
+    // A device failure while *building* the resident CSR also falls back rather
+    // than failing the PCA. The builder's own pre-flight declines cleanly on a
+    // matrix it can see is too big, but its three closing `htod_copy` calls can
+    // still fail if free VRAM moved underneath it — and the streaming power
+    // loop in the `else` arm computes the same answer without them. Residency
+    // is an optimisation; it must not be the reason the call errors. A
+    // malformed shard still propagates (`is_runtime_failure` = false): the
+    // streaming operator reads the same shards and would only re-derive it.
+    // Re-driving `source` is safe — the builder only calls `read_shard(s)` by
+    // index and keeps no state in it.
+    //
+    // No pool trim on the decline, unlike the DE residency path: that one trims
+    // because the caller's very next act is to size its gene chunk against free
+    // VRAM, and untrimmed pool memory would shrink it to pay for buffers
+    // nothing holds. Here the free-VRAM pre-flight is already behind us and the
+    // streaming operator allocates out of the same pool, so trimming would
+    // hand the driver back memory we are about to ask for again.
+    //
     // Ensure the means upload + Ω generation (issued on the default stream
     // above) are complete before the resident loop, which may run on the
     // per-thread capture stream (no auto cross-stream sync there).
     dev.synchronize()?;
-    let resident = crate::gpu_pca_resident::try_build_resident_csr(dev, source, k)?;
+    let resident = crate::error::decline_on_runtime_failure(
+        crate::gpu_pca_resident::try_build_resident_csr(dev, source, k),
+        "GPU PCA resident CSR",
+    )?;
     let graph_replayed = if let Some(gpu_csr) = resident {
         crate::gpu_pca_resident::run_resident_power_loop(
             dev,

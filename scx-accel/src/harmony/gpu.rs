@@ -34,6 +34,42 @@ fn f64_to_f32(v: &[f64]) -> Vec<f32> {
     v.iter().map(|&x| x as f32).collect()
 }
 
+/// The one sentence a user gets when Harmony will not fit the card.
+///
+/// It has to carry the whole remedy on its own: `device="auto"` picks the
+/// device before the op starts and does not silently re-run on CPU, so there
+/// is no second chance in which to explain. Names what the run needs, what was
+/// free, the shape terms the user actually controls (`n_clusters` is the one
+/// knob here that moves `K·N`), and the two ways out.
+///
+/// `≥` rather than `=`: [`scx_gpu::gpu_harmony_memory_bytes`] is a lower bound —
+/// it still omits transient scratch and the batch-structure-dependent buffers.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn harmony_vram_message(
+    device_id: usize,
+    n: usize,
+    d: usize,
+    k: usize,
+    b: usize,
+    c: usize,
+    free: usize,
+    total: usize,
+) -> String {
+    let need = scx_gpu::gpu_harmony_memory_bytes(n, d, k, b, c);
+    // "Harmony", not "harmony_integrate": pyscx already prefixes the op name
+    // (`harmony_integrate_gpu: …`), and the note form appends this to an
+    // allocation error that names its own buffer.
+    format!(
+        "Harmony needs ≥{:.1} GB of device memory for {n} cells × {d} PCs × \
+         {k} clusters, but only {:.1} GB of {:.1} GB is free on GPU {device_id}. Re-run with \
+         device=\"cpu\", lower n_clusters, or free VRAM — device=\"auto\" resolves the device \
+         before the op starts and does not fall back to CPU on a runtime GPU failure.",
+        need as f64 / 1e9,
+        free as f64 / 1e9,
+        total as f64 / 1e9,
+    )
+}
+
 /// Auto-route distance computation: GEMM for large N (cuBLAS
 /// dispatches optimised tiles), hand-written kernel for small N
 /// (avoids GEMM launch overhead) or whenever either of N / K
@@ -241,13 +277,61 @@ pub fn harmony_integrate_gpu(
 
     let dev = GpuDevice::new(device_id)
         .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
+
+    // §8.10: probe free VRAM before allocating any of it.
+    //
+    // `gpu_harmony_memory_bytes` has existed since this path landed and was
+    // called by nothing but its own test, so a run that could not possibly fit
+    // died at whichever `htod_copy` happened to be first, with a raw cudarc
+    // message that named neither the shortfall nor the remedy.
+    //
+    // The probe is placed here rather than at the top of the function because
+    // `k`, `b` and `c` come out of `HarmonyState::new`; hoisting it would mean
+    // duplicating that derivation. Everything it guards — every device
+    // allocation — is still below it.
+    //
+    // A probe that itself fails must not block the run: on `Err` we fall
+    // through and let the allocations decide, exactly as before this existed.
+    let free_vram = dev.free_memory().ok();
+    if let Some((free, total)) = free_vram {
+        if !scx_gpu::gpu_harmony_fits(free as u64, n, d, k, b, c_count) {
+            return Err(AccelError::GpuOutOfMemory(harmony_vram_message(
+                device_id, n, d, k, b, c_count, free, total,
+            )));
+        }
+    }
+    // Appended to every persistent-buffer allocation below — established by
+    // grepping the whole setup block, not by trusting this sentence. An earlier
+    // round of this PR made exactly that claim while four allocations still
+    // raised a bare message, so the claim is only worth as much as the sweep
+    // behind it.
+    //
+    // A shortfall the estimate could not see (transient scratch, and the
+    // batch-structure-dependent buffers it cannot derive) then still reports the
+    // sizing rather than a bare `alloc_zeros(N) failed`.
+    //
+    // Appended rather than used to reclassify — but note the reason is no longer
+    // that the error kind is unknowable. `htod_copy` and `alloc_zeros` both type
+    // a driver OOM as `GpuError::OutOfMemory` now. It is that Harmony flattens
+    // every device error in this function to `AccelError::LinAlg`, and re-typing
+    // only the allocation arm would make the error kind depend on which buffer
+    // happened to fail first.
+    let vram_note = free_vram
+        .map(|(free, total)| {
+            format!(
+                " — {}",
+                harmony_vram_message(device_id, n, d, k, b, c_count, free, total)
+            )
+        })
+        .unwrap_or_default();
+
     let cublas = CublasHandle::new()
         .map_err(|e| AccelError::LinAlg(format!("cuBLAS handle init failed: {e}")))?;
 
     // Upload Z_orig once — it never changes.
     let d_z_orig = dev
         .htod_copy(&f64_to_f32(&state.z_orig))
-        .map_err(|e| AccelError::LinAlg(format!("upload Z_orig: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload Z_orig: {e}{vram_note}")))?;
 
     // Persistent device buffers (reused across iterations). All
     // are kept resident across the iter loop and across the inner
@@ -255,29 +339,29 @@ pub fn harmony_integrate_gpu(
     // loop) round-trips to host.
     let mut d_z_corr = dev
         .htod_copy(&f64_to_f32(&state.z_orig))
-        .map_err(|e| AccelError::LinAlg(format!("alloc Z_corr: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc Z_corr: {e}{vram_note}")))?;
     let mut d_z_cos = dev
         .alloc_zeros::<f32>(d * n)
-        .map_err(|e| AccelError::LinAlg(format!("alloc Z_cos: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc Z_cos: {e}{vram_note}")))?;
     let mut d_dist = dev
         .alloc_zeros::<f32>(k * n)
-        .map_err(|e| AccelError::LinAlg(format!("alloc dist: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc dist: {e}{vram_note}")))?;
     let mut d_y = dev
         .alloc_zeros::<f32>(d * k)
-        .map_err(|e| AccelError::LinAlg(format!("alloc Y: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc Y: {e}{vram_note}")))?;
 
     // R / O / E persist on GPU across the entire run; CPU mirror
     // is kept only for the small (B+1)×(B+1) regression solve in
     // the correction step (O/E downloaded once per outer iter).
     let mut d_r = dev
         .htod_copy(&state.r)
-        .map_err(|e| AccelError::LinAlg(format!("upload R: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload R: {e}{vram_note}")))?;
     let mut d_o = dev
         .htod_copy(&f64_to_f32(&state.o))
-        .map_err(|e| AccelError::LinAlg(format!("upload O: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload O: {e}{vram_note}")))?;
     let mut d_e = dev
         .htod_copy(&f64_to_f32(&state.e))
-        .map_err(|e| AccelError::LinAlg(format!("upload E: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload E: {e}{vram_note}")))?;
     // Upload the cold-start dist matrix from CPU `HarmonyState::new`
     // so iter 0's GPU update_r has the same dist values that CPU
     // `update_r` would read from `state.dist_mat`. After iter 0,
@@ -290,17 +374,17 @@ pub fn harmony_integrate_gpu(
     // Read-only constants — uploaded once.
     let d_sigma = dev
         .htod_copy(&f64_to_f32(&state.sigma))
-        .map_err(|e| AccelError::LinAlg(format!("upload sigma: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload sigma: {e}{vram_note}")))?;
     let d_theta = dev
         .htod_copy(&f64_to_f32(&state.theta))
-        .map_err(|e| AccelError::LinAlg(format!("upload theta: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload theta: {e}{vram_note}")))?;
     let d_pr_b = dev
         .htod_copy(&f64_to_f32(&state.pr_b))
-        .map_err(|e| AccelError::LinAlg(format!("upload pr_b: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload pr_b: {e}{vram_note}")))?;
     let cov_offset_i32: Vec<i32> = state.layout.cov_offset.iter().map(|&v| v as i32).collect();
     let d_cov_offset = dev
         .htod_copy(&cov_offset_i32)
-        .map_err(|e| AccelError::LinAlg(format!("upload cov_offset: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload cov_offset: {e}{vram_note}")))?;
 
     // Flatten per-covariate labels to (C x N) row-major i32. Batch
     // count per covariate is bounded by `max_batches` (default
@@ -314,14 +398,14 @@ pub fn harmony_integrate_gpu(
     }
     let d_labels = dev
         .htod_copy(&labels_flat)
-        .map_err(|e| AccelError::LinAlg(format!("upload batch labels: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload batch labels: {e}{vram_note}")))?;
 
     // Per-cluster R-row scratch (size N) — used by z-sum and
     // grouped correction kernels. Filled per cluster via
     // memcpy_dtod from `d_r[ku*n..(ku+1)*n]`.
     let mut d_r_row = dev
         .alloc_zeros::<f32>(n)
-        .map_err(|e| AccelError::LinAlg(format!("alloc R-row scratch: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc R-row scratch: {e}{vram_note}")))?;
 
     // Task 2.6: pre-upload the global per-batch cell membership ONCE — it
     // is fixed for the whole run. `all_cells` concatenates each global
@@ -341,9 +425,9 @@ pub fn harmony_integrate_gpu(
         batch_start.push(all_cells.len() as i32);
     }
     let all_cells_total = all_cells.len();
-    let d_all_cells = dev
-        .htod_copy(&all_cells)
-        .map_err(|e| AccelError::LinAlg(format!("upload global cell membership: {e}")))?;
+    let d_all_cells = dev.htod_copy(&all_cells).map_err(|e| {
+        AccelError::LinAlg(format!("upload global cell membership: {e}{vram_note}"))
+    })?;
 
     // Task 2.6: persistent correction scratch hoisted out of the
     // per-cluster K-loop. `b` (total batch levels) upper-bounds any
@@ -351,22 +435,22 @@ pub fn harmony_integrate_gpu(
     // the z-sum / correction kernels only touch the valid `b_prime`-prefix.
     let mut d_z_sum_scratch = dev
         .alloc_zeros::<f32>((b * d).max(1))
-        .map_err(|e| AccelError::LinAlg(format!("alloc z_sum scratch: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc z_sum scratch: {e}{vram_note}")))?;
     let mut d_w_scratch = dev
         .alloc_zeros::<f32>((b * d).max(1))
-        .map_err(|e| AccelError::LinAlg(format!("alloc W scratch: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc W scratch: {e}{vram_note}")))?;
     let mut d_cells_concat_scratch = dev
         .alloc_zeros::<i32>(all_cells_total.max(1))
-        .map_err(|e| AccelError::LinAlg(format!("alloc cells_concat scratch: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc cells_concat scratch: {e}{vram_note}")))?;
     let mut d_offsets_scratch = dev
         .alloc_zeros::<i32>(b + 1)
-        .map_err(|e| AccelError::LinAlg(format!("alloc batch_offsets scratch: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc batch_offsets scratch: {e}{vram_note}")))?;
 
     // Per-sub-iter shuffled cell order (CPU shuffle, GPU consumes
     // contiguous block ranges). Allocated once at full size N.
     let mut d_order = dev
         .alloc_zeros::<i32>(n)
-        .map_err(|e| AccelError::LinAlg(format!("alloc d_order: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc d_order: {e}{vram_note}")))?;
 
     // Block-cells scratch (size = max possible block_len). Filled
     // per block via memcpy_dtod from a slice of d_order.
@@ -375,15 +459,15 @@ pub fn harmony_integrate_gpu(
     let block_len = n.div_ceil(n_blocks.max(1));
     let mut d_block_cells = dev
         .alloc_zeros::<i32>(block_len)
-        .map_err(|e| AccelError::LinAlg(format!("alloc d_block_cells: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc d_block_cells: {e}{vram_note}")))?;
 
     // Objective scratch.
     let mut d_obj_cell = dev
         .alloc_zeros::<f32>(n)
-        .map_err(|e| AccelError::LinAlg(format!("alloc d_obj_cell: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc d_obj_cell: {e}{vram_note}")))?;
     let mut d_cross_kgb = dev
         .alloc_zeros::<f32>(k * b)
-        .map_err(|e| AccelError::LinAlg(format!("alloc d_cross_kgb: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc d_cross_kgb: {e}{vram_note}")))?;
 
     let mut converged = false;
     let mut iters_used = 0usize;

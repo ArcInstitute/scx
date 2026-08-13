@@ -33,6 +33,16 @@ pub enum AccelError {
     #[error("GPU device initialization failed: {0}")]
     GpuInitFailed(String),
 
+    /// The GPU does not have enough free memory for the op, and no non-GPU
+    /// path was substituted (`device="auto"` resolves the device up front and
+    /// does not re-run on CPU after a runtime failure — see
+    /// [`crate::route::DeviceRequest::Auto`]). The inner string must name the
+    /// shortfall in the terms the user controls — how much the op needs, how
+    /// much was free, and what to change — because that message is the whole
+    /// remedy the caller gets. Surfaced as `RuntimeError` on the Python side.
+    #[error("GPU out of memory: {0}")]
+    GpuOutOfMemory(String),
+
     /// `prefer_format="csc"` was requested but the dataset cannot
     /// service CSC reads. The inner string names the missing
     /// capability — for example: no CSC sidecar on disk, a

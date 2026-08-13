@@ -16,6 +16,63 @@ use cudarc::nvrtc::Ptx;
 use crate::error::GpuError;
 use crate::gpu_graph::GpuGraphCache;
 
+/// Map a cudarc driver error onto the right [`GpuError`] variant, keeping an
+/// out-of-memory *typed* as one.
+///
+/// Every allocating call that is not `alloc_zeros` reaches the driver through a
+/// path whose failures all look alike at the Rust level — `clone_htod` returns
+/// the same `DriverError` for a bad context and for a card with no memory left.
+/// Flattening those to [`GpuError::CudaError`] made `GpuError::OutOfMemory`
+/// mean "the allocation went through `alloc_zeros`" rather than "the device is
+/// out of memory", which is not a distinction any caller wants to reason about.
+///
+/// It is load-bearing for [`GpuError::alternate_route_may_succeed`]: that
+/// predicate exists to say *an OOM is not worth retrying by another route to
+/// the same device*, and it cannot say so about an OOM disguised as a generic
+/// CUDA fault. Found by **codex** on PR #422, which traced the disguise from
+/// `htod_copy` through to `to_gpu_anndata`'s fallback.
+///
+/// `CUDA_ERROR_OUT_OF_MEMORY` is the only code special-cased; every other driver
+/// failure stays a `CudaError`.
+fn classify_driver_error(context: &str, e: cudarc::driver::DriverError) -> GpuError {
+    // `e.to_string()` is what forces the driver library to load: `DriverError`'s
+    // Display calls `cuGetErrorString`. Rendering here, and passing the finished
+    // string down, is what lets the decision be tested on a host with no CUDA
+    // driver at all — see `classify_driver_status`.
+    classify_driver_status(context, e.0 as u32, &e.to_string())
+}
+
+/// The driver status code for an out-of-memory failure.
+///
+/// Spelled as a literal rather than read from `cudarc::driver::sys` at run time,
+/// because *touching* that enum's `Display` path dlopens `libcuda`. The
+/// `const _` below pins the literal to cudarc's own value at **compile** time,
+/// so a renumbering upstream is a build error on every host — including the
+/// driverless CI runners, which is exactly where a runtime lookup could not go.
+const CUDA_ERROR_OUT_OF_MEMORY_CODE: u32 = 2;
+
+const _: () = assert!(
+    cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY as u32 == CUDA_ERROR_OUT_OF_MEMORY_CODE,
+    "cudarc renumbered CUDA_ERROR_OUT_OF_MEMORY; update CUDA_ERROR_OUT_OF_MEMORY_CODE"
+);
+
+/// The classification decision, over a plain status code and an already-rendered
+/// message.
+///
+/// Split out from [`classify_driver_error`] so it can be tested without a CUDA
+/// driver present. The first version of this test constructed a synthetic
+/// `DriverError` and passed locally — on a host that happens to have `libcuda`
+/// — while panicking on CI, because formatting the error is what loads the
+/// library. A test for a pure decision should not need a driver, and now does
+/// not.
+fn classify_driver_status(context: &str, code: u32, rendered: &str) -> GpuError {
+    if code == CUDA_ERROR_OUT_OF_MEMORY_CODE {
+        GpuError::OutOfMemory(format!("{context}: {rendered}"))
+    } else {
+        GpuError::CudaError(format!("{context}: {rendered}"))
+    }
+}
+
 /// A GPU device handle wrapping a CUDA context and its default stream.
 ///
 /// In cudarc 0.19, `CudaDevice` was removed. The primary abstractions are now
@@ -156,7 +213,7 @@ impl GpuDevice {
     pub fn htod_copy<T: DeviceRepr>(&self, data: &[T]) -> Result<CudaSlice<T>, GpuError> {
         self.stream
             .clone_htod(data)
-            .map_err(|e| GpuError::CudaError(format!("host-to-device copy failed: {e}")))
+            .map_err(|e| classify_driver_error("host-to-device copy failed", e))
     }
 
     /// Copy device data to host (synchronous).
@@ -310,6 +367,42 @@ impl Drop for GpuDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An out-of-memory driver failure must stay typed as one no matter which
+    /// cudarc call produced it.
+    ///
+    /// Drives `classify_driver_status` with the raw code rather than building a
+    /// `DriverError`: formatting one calls `cuGetErrorString`, which dlopens
+    /// `libcuda`. The first version of this test did build one, passed here,
+    /// and panicked on CI's driverless runner. The code being a real
+    /// `CUDA_ERROR_OUT_OF_MEMORY` is pinned by the `const _` assertion beside
+    /// the constant — by the compiler, on every host, rather than by this test.
+    #[test]
+    fn a_driver_oom_is_classified_as_out_of_memory() {
+        let e = classify_driver_status(
+            "host-to-device copy failed",
+            CUDA_ERROR_OUT_OF_MEMORY_CODE,
+            "out of memory",
+        );
+        assert!(
+            matches!(e, GpuError::OutOfMemory(_)),
+            "expected OutOfMemory, got {e}"
+        );
+        // And therefore no alternate route to the same device is worth trying.
+        assert!(!e.alternate_route_may_succeed());
+        assert!(e.is_runtime_failure());
+    }
+
+    #[test]
+    fn a_non_oom_driver_error_stays_a_cuda_error() {
+        // 1 == CUDA_ERROR_INVALID_VALUE. Any non-OOM code will do; the point is
+        // that the carve-out is narrow rather than swallowing everything.
+        let e = classify_driver_status("host-to-device copy failed", 1, "invalid argument");
+        assert!(matches!(e, GpuError::CudaError(_)), "got {e}");
+        // A generic driver fault is still worth another route (that is what
+        // makes the OOM carve-out meaningful rather than vacuous).
+        assert!(e.alternate_route_may_succeed());
+    }
 
     /// B4: Test CUDA device enumeration.
     ///

@@ -705,3 +705,82 @@ fn test_gpu_memory_estimate_reasonable() {
     assert!(bytes > 1_000_000);
     assert!(bytes < 1_000_000_000);
 }
+
+/// The refusal message is the entire remedy the caller gets — `device="auto"`
+/// does not re-run on CPU — so pin that it actually names the shortfall and the
+/// way out, not just that it is non-empty. Runs on a CPU host under
+/// `--features gpu`: the message builder is pure arithmetic and formatting.
+#[cfg(feature = "gpu")]
+#[test]
+fn test_gpu_vram_message_names_the_shortfall_and_the_remedy() {
+    // 8M cells × 50 PCs × 100 clusters against 6.1 GB free of 79.1 GB.
+    let msg = super::gpu::harmony_vram_message(
+        0,
+        8_000_000,
+        50,
+        100,
+        4,
+        1,
+        6_100_000_000,
+        79_100_000_000,
+    );
+    // The three numbers a user needs to act on.
+    assert!(
+        msg.contains("8000000 cells × 50 PCs × 100 clusters"),
+        "{msg}"
+    );
+    // Pins the figure `docs/gpu-setup.md` quotes for these exact inputs. Not
+    // redundant with the shape assertion: the doc example already drifted once
+    // (14.2 GB, a number I estimated rather than rendered) and moved again when
+    // the bound was tightened (11.2 → 11.3 → 11.4). Tightening it further *should*
+    // fail here, so the doc is updated alongside instead of going stale.
+    assert!(
+        msg.contains("≥11.4 GB"),
+        "docs/gpu-setup.md quotes ≥11.4 GB for these inputs — update both together. Got: {msg}"
+    );
+    assert!(msg.contains("6.1 GB of 79.1 GB"), "{msg}");
+    assert!(msg.contains("GPU 0"), "{msg}");
+    // `≥`, not `=`: the estimate excludes transient scratch.
+    assert!(msg.contains("≥"), "{msg}");
+    // And what to do about it. Without this the message is a diagnosis with no
+    // prescription, which is what the raw cudarc error already was.
+    assert!(msg.contains(r#"device="cpu""#), "{msg}");
+    assert!(msg.contains("n_clusters"), "{msg}");
+    // Does not restate the op name — pyscx prefixes it, and the note form
+    // appends this to an allocation error that already names its buffer.
+    assert!(!msg.contains("harmony_integrate"), "{msg}");
+}
+
+/// The VRAM pre-flight (§8.10) must not refuse a run that fits.
+///
+/// It is the one way this change could regress a working setup: a refusal is a
+/// hard error with no CPU fallback behind it, so an estimate that over-counted
+/// would turn ordinary Harmony calls into failures. A run this small on any
+/// real card must sail through — and it exercises the *live* probe against
+/// actual `cuMemGetInfo`, not the arithmetic, which `gpu_harmony_fits`'
+/// own unit tests already cover on a CPU host.
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn test_gpu_preflight_admits_a_run_that_fits() {
+    require_gpu_or_skip!();
+    let n = 500;
+    let d = 8;
+    let emb = random_embeddings(n, d, 11);
+    let labels: Vec<u32> = (0..n as u32).map(|i| i % 4).collect();
+    let cov = BatchCovariate {
+        labels,
+        n_levels: 4,
+        name: None,
+    };
+    let config = HarmonyConfig {
+        n_clusters: Some(6),
+        max_iter: 2,
+        random_state: 3,
+        ..Default::default()
+    };
+    let result = harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config)
+        .expect("the VRAM pre-flight must not refuse a run this size on a real GPU");
+    assert_eq!(result.z_corrected.len(), n * d);
+    assert!(result.z_corrected.iter().all(|v| v.is_finite()));
+}
