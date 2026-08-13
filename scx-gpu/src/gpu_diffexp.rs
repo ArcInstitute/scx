@@ -852,6 +852,30 @@ pub fn gpu_de_pseudobulk_csr_direct(
     Ok(())
 }
 
+/// Reject a per-cell device table that does not cover every row the shard can
+/// name, before any CSC kernel indexes it.
+///
+/// The CSC kernels dereference `cell_to_group[row_indices[e]]` /
+/// `cell_to_pos[...]` with no device-side bound on the table, so this closes
+/// the second half of the out-of-range hazard: `RawGpuCscShardSource` validates
+/// row indices against the *source's* `n_obs`, and nothing else compares that
+/// against the `n_obs` the caller sized these tables from — the DE drivers take
+/// it from their `groups` argument while the source takes it from the file. An
+/// O(1) check per launch, so it costs nothing next to the kernel it guards.
+fn ensure_cell_table_covers(
+    table: &CudaSlice<i32>,
+    n_obs: usize,
+    name: &str,
+) -> Result<(), GpuError> {
+    if table.len() < n_obs {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!("{name} covering the shard's n_obs = {n_obs}"),
+            got: format!("{name}.len() = {}", table.len()),
+        });
+    }
+    Ok(())
+}
+
 /// G4 v3 (CSC-direct): all-groups pseudobulk fold over one CSC shard.
 ///
 /// One block per chunk gene; threads tree-reduce per-group accumulators in
@@ -908,6 +932,7 @@ pub fn gpu_de_pseudobulk_csc_direct(
         "n_cols_in_shard {} exceeds i32::MAX",
         n_cols_in_shard
     );
+    ensure_cell_table_covers(cell_to_group_dev, csc_view.n_obs, "cell_to_group")?;
 
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
 
@@ -985,6 +1010,10 @@ pub fn gpu_de_pseudobulk_csc_direct(
     let c0_i32 = c0 as i32;
     let chunk_size_i32 = chunk_size as i32;
     let n_groups_i32 = n_groups as i32;
+    let n_obs_i32 = i32::try_from(csc_view.n_obs).map_err(|_| GpuError::ShapeMismatch {
+        expected: "n_obs <= i32::MAX".to_string(),
+        got: format!("n_obs = {}", csc_view.n_obs),
+    })?;
 
     // Both kernels share the same parameter list.
     unsafe {
@@ -1001,6 +1030,7 @@ pub fn gpu_de_pseudobulk_csc_direct(
             .arg(&chunk_size_i32)
             .arg(&n_groups_i32)
             .arg(&mode_id)
+            .arg(&n_obs_i32)
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk launch: {e}")))?;
@@ -1058,6 +1088,8 @@ pub fn gpu_de_scatter_csc_to_gene_major(
         "n_perm {} exceeds i32::MAX",
         n_perm
     );
+    ensure_cell_table_covers(cell_to_group_dev, csc_view.n_obs, "cell_to_group")?;
+    ensure_cell_table_covers(cell_to_pos_dev, csc_view.n_obs, "cell_to_pos")?;
 
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
     let func = module
@@ -1078,6 +1110,10 @@ pub fn gpu_de_scatter_csc_to_gene_major(
     let c0_i32 = c0 as i32;
     let chunk_size_i32 = chunk_size as i32;
     let n_perm_i32 = n_perm as i32;
+    let n_obs_i32 = i32::try_from(csc_view.n_obs).map_err(|_| GpuError::ShapeMismatch {
+        expected: "n_obs <= i32::MAX".to_string(),
+        got: format!("n_obs = {}", csc_view.n_obs),
+    })?;
 
     unsafe {
         dev.stream()
@@ -1094,6 +1130,7 @@ pub fn gpu_de_scatter_csc_to_gene_major(
             .arg(&c0_i32)
             .arg(&chunk_size_i32)
             .arg(&n_perm_i32)
+            .arg(&n_obs_i32)
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_to_gene_major_kernel: {e}")))?;

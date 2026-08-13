@@ -476,6 +476,99 @@ mod tests {
         }
     }
 
+    /// Premise check for the GPU §8.3 test, runnable without a device: the
+    /// corrupt-sidecar fixture must actually reach a reader **carrying its
+    /// corruption**. A writer or codec that sanitised NaN, or rejected the f32
+    /// encoding, would leave that test asserting nothing while still passing
+    /// its clean arm.
+    ///
+    /// It also pins the CPU/GPU symmetry the finding is about: the CPU CSC path
+    /// already refuses this file.
+    #[test]
+    fn corrupt_csc_fixture_round_trips_its_corruption() {
+        use crate::csc::test_helpers::write_file_with_corrupt_csc;
+
+        let dir = tempdir().unwrap();
+        let (n_obs, n_vars) = (16usize, 8usize);
+        let dense = deterministic_dense(n_obs, n_vars);
+
+        let clean =
+            write_file_with_corrupt_csc(dir.path(), "rt_clean", n_obs, n_vars, &dense, |_, _| {});
+        let reader = BackedCscReader::new(ScxReader::open(&clean).unwrap(), 0).unwrap();
+        let csc = ColumnShardSource::read_csc_shard(&reader, 0).unwrap();
+        assert!(
+            csc.data.iter().all(|v| v.is_finite()) && !csc.data.is_empty(),
+            "clean fixture must decode to finite values"
+        );
+        assert!(
+            csc.indices.iter().all(|&i| (i as usize) < n_obs),
+            "clean fixture rows must be in range"
+        );
+
+        let nan =
+            write_file_with_corrupt_csc(dir.path(), "rt_nan", n_obs, n_vars, &dense, |_, v| {
+                v[3] = f32::NAN;
+            });
+        let reader = BackedCscReader::new(ScxReader::open(&nan).unwrap(), 0).unwrap();
+        let csc = ColumnShardSource::read_csc_shard(&reader, 0).unwrap();
+        assert!(csc.data[3].is_nan(), "the NaN must survive the round trip");
+
+        let dup =
+            write_file_with_corrupt_csc(dir.path(), "rt_dup", n_obs, n_vars, &dense, |ix, _| {
+                ix[3] = ix[2];
+            });
+        let reader = BackedCscReader::new(ScxReader::open(&dup).unwrap(), 0).unwrap();
+        let csc = ColumnShardSource::read_csc_shard(&reader, 0).unwrap();
+        assert_eq!(
+            csc.indices[3], csc.indices[2],
+            "the duplicate row must survive the round trip"
+        );
+
+        // An out-of-range row does NOT survive: `check_minor_indices` in the
+        // shard decoder bounds CSC row indices against the shard header's
+        // `n_minor` (= n_obs). So on any backed file that hazard is already
+        // closed one layer below the GPU — the validator's range check and the
+        // kernels' `cell` guard are defence in depth for `ColumnShardSource`
+        // impls that do not decode through that seam. Pinned here so the layer
+        // that actually closes it is named, and a future change that relaxes it
+        // shows up as a failure rather than as silence.
+        let oob =
+            write_file_with_corrupt_csc(dir.path(), "rt_oob", n_obs, n_vars, &dense, |ix, _| {
+                ix[3] = n_obs as u32;
+            });
+        let reader = BackedCscReader::new(ScxReader::open(&oob).unwrap(), 0).unwrap();
+        let err = ColumnShardSource::read_csc_shard(&reader, 0)
+            .expect_err("the decoder must reject an out-of-range CSC row index");
+        assert!(
+            matches!(
+                err,
+                scx_format_io::ScxError::ShardIndexOutOfRange { index, .. }
+                    if index == n_obs as u32
+            ),
+            "expected ShardIndexOutOfRange, got {err:?}"
+        );
+
+        // The CPU CSC route rejects the NaN file; §8.3 is that the GPU CSC
+        // route did not.
+        let reader = BackedCscReader::new(ScxReader::open(&nan).unwrap(), 0).unwrap();
+        let gene_names: Vec<String> = (0..n_vars).map(|j| format!("g{j}")).collect();
+        let groups: Vec<usize> = (0..n_obs).map(|i| i % 2).collect();
+        let group_names = vec!["a".to_string(), "b".to_string()];
+        let err = wilcoxon_rank_sum_streaming_csc(
+            &reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            4,
+            false,
+            false,
+            true,
+        )
+        .expect_err("CPU CSC path must reject a non-finite value");
+        assert!(err.to_string().contains("non-finite"), "{err}");
+    }
+
     // -----------------------------------------------------------------------
     // GPU CSC-direct / CSR-direct v3 Wilcoxon parity (§C.9). All gated on a
     // CUDA device; the binary still links without one. Compared by gene name
@@ -785,6 +878,81 @@ mod tests {
             "expected prefiltered shard count in (0, {}), got {decoded}",
             n_csc_shards * n_chunks
         );
+    }
+
+    /// (10) §8.3 — the CSC-direct route staged shards with **no** validation,
+    /// so a malformed sidecar reached the kernels: a NaN sorted above `+INF` in
+    /// `block_radix_sort_per_gene_kernel` and silently corrupted U / tie counts
+    /// / p-values, and a duplicate `(cell, gene)` raced one `slab` cell with a
+    /// nondeterministic winner. The CPU CSC path and `gpu_csr_v3` reject both;
+    /// this route was the outlier. Each must now surface as an error, not a
+    /// number — driven through the real public entry point over a real file, so
+    /// the test covers the route and not just the validator.
+    ///
+    /// The finding's third defect (an out-of-range row as an unguarded
+    /// `cell_to_group[cell]` device read) has no arm here because it cannot be
+    /// staged from a backed file at all: the shard decoder rejects it first.
+    /// See `corrupt_csc_fixture_round_trips_its_corruption`, which pins that.
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn wilcoxon_gpu_v3_csc_rejects_a_malformed_sidecar() {
+        require_gpu_or_skip!();
+        use crate::csc::test_helpers::write_file_with_corrupt_csc;
+
+        let dir = tempdir().unwrap();
+        let n_obs = 64usize;
+        let n_vars = 20usize;
+        let dense = deterministic_dense(n_obs, n_vars);
+        let gn: Vec<String> = (0..n_vars).map(|j| format!("g{j}")).collect();
+        let gr: Vec<usize> = (0..n_obs).map(|i| (i * 3) / n_obs).collect();
+        let names = vec!["ref".to_string(), "ko_a".to_string(), "ko_b".to_string()];
+
+        let run = |path: &std::path::Path| {
+            let csr_reader = BackedCsrReader::new(ScxReader::open(path).unwrap(), 0);
+            let csc_reader = BackedCscReader::new(ScxReader::open(path).unwrap(), 0).unwrap();
+            wilcoxon_rank_sum_gpu(
+                0,
+                GpuDeShardInput::Backed {
+                    csr: &csr_reader,
+                    csc: Some(&csc_reader),
+                },
+                &gn,
+                &gr,
+                &names,
+                None,
+                Some(7),
+                false,
+                false,
+                true,
+            )
+        };
+
+        // Premise: the same fixture written *without* corruption runs the
+        // CSC-direct route to completion, so every rejection below is
+        // attributable to the corruption and not to the f32 sidecar encoding.
+        let clean =
+            write_file_with_corrupt_csc(dir.path(), "csc_clean", n_obs, n_vars, &dense, |_, _| {});
+        let ok = run(&clean).expect("clean f32 sidecar must succeed");
+        assert_eq!(ok.exec_info.route, AccelRoute::GpuCscV3);
+
+        let nan =
+            write_file_with_corrupt_csc(dir.path(), "csc_nan", n_obs, n_vars, &dense, |_, v| {
+                v[7] = f32::NAN;
+            });
+        let dup =
+            write_file_with_corrupt_csc(dir.path(), "csc_dup", n_obs, n_vars, &dense, |ix, _| {
+                ix[7] = ix[6]; // duplicate row inside the first column
+            });
+
+        for (label, needle, path) in [
+            ("non-finite", "non-finite", nan),
+            ("duplicate row", "unsorted or duplicate", dup),
+        ] {
+            let err = run(&path).expect_err(&format!("{label} must be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains(needle), "{label}: unexpected message: {msg}");
+        }
     }
 
     // (Former test (9) "v3 CSC-direct vs v1 dense-chunk" was removed with the
