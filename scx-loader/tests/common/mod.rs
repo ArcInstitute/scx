@@ -282,6 +282,138 @@ pub fn write_known_multinnz_fixture(
     path.to_path_buf()
 }
 
+/// Build a **deliberately malformed** single-modality fixture whose two CSR
+/// shards claim overlapping global row ranges: shard 0 covers `[0, rows)` and
+/// shard 1 covers `[rows - overlap, 2*rows - overlap)`.
+///
+/// This is the shape a merge / append / compact defect would leave behind. The
+/// writer takes `row_start` from the caller and does not cross-check it against
+/// previously written shards, which is what makes the fixture constructible —
+/// and is also why the loader has to check for itself.
+pub fn write_overlapping_shards_fixture(
+    path: &std::path::Path,
+    rows_per_shard: usize,
+    n_vars: usize,
+    overlap: usize,
+) -> std::path::PathBuf {
+    assert!(overlap > 0 && overlap <= rows_per_shard);
+    let n_obs = 2 * rows_per_shard - overlap;
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        (2 * rows_per_shard) as u64,
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+    writer.write_obs(&string_column("cell_id", n_obs)).unwrap();
+    writer.write_var(&string_column("gene_id", n_vars)).unwrap();
+
+    for row_start in [0usize, rows_per_shard - overlap] {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows_per_shard {
+            indices.push(((row_start + local) % n_vars) as u32);
+            values.push(1u8);
+            indptr.push(*indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
+/// Build a well-formed 2-modality fixture (`rna` / `adt`) over a shared obs
+/// axis, each modality holding one CSR shard covering `[0, n_obs)`.
+///
+/// Legitimate on its own terms — but the two modalities' shard row ranges
+/// necessarily overlap in the *flattened* catalog view, which is what a loader
+/// opened without a `modality_id` would consume.
+pub fn write_multimodal_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    rna_vars: usize,
+    adt_vars: usize,
+) -> std::path::PathBuf {
+    use scx_format_io::modality::ModalityType;
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        rna_vars.max(adt_vars) as u64,
+        (2 * n_obs) as u64,
+        n_obs as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+    writer.write_obs(&string_column("cell_id", n_obs)).unwrap();
+
+    let mut ids = Vec::new();
+    for (name, kind, m_vars) in [
+        ("adt", ModalityType::Protein, adt_vars),
+        ("rna", ModalityType::Rna, rna_vars),
+    ] {
+        let id = writer
+            .add_modality(name, kind, CodecId::None, ValueEncoding::Uint8, false)
+            .unwrap();
+        writer
+            .write_var_for(id, &string_column("gene_id", m_vars))
+            .unwrap();
+        writer.set_modality_n_vars(id, m_vars as u64).unwrap();
+        ids.push((id, m_vars));
+    }
+
+    for (id, m_vars) in ids {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for r in 0..n_obs {
+            indices.push((r % m_vars) as u32);
+            values.push(1u8);
+            indptr.push(*indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard_for(
+                id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
+/// Single-column `RecordBatch` of `{prefix}_{i}` strings — the obs/var shape
+/// every fixture here writes.
+fn string_column(name: &str, n: usize) -> RecordBatch {
+    let prefix = name.trim_end_matches("_id");
+    let ids: Vec<String> = (0..n).map(|i| format!("{prefix}_{i}")).collect();
+    RecordBatch::try_new(
+        StdArc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)])),
+        vec![StdArc::new(StringArray::from(
+            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap()
+}
+
 /// Build an `IndexPlanLoader` against a fixture with default settings —
 /// no normalization, no log1p, single obs column `"cell_id"`, 4 cache shards,
 /// shard sort enabled, lookahead 4, plan-size cap 16384, and a generous

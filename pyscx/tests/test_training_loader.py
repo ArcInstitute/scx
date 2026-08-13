@@ -60,6 +60,35 @@ class TestTrainingDatasetConstruction:
         )
         assert ds.n_output_genes == 2
 
+    def test_hvg_panel_in_rank_order_warns_about_column_order(self, scx_path):
+        """`np.argsort(-variances)[:k]` is a natural way to build a panel, and
+        it is in rank order — but the projection sorts, so the columns come
+        back in gene-index order and the caller's own column->gene mapping is
+        silently wrong. Nothing said so before."""
+        with pytest.warns(UserWarning, match="ascending gene-index order"):
+            ds = pyscx.TrainingDataset(
+                scx_path, hvg_indices=np.array([40, 5, 20], dtype=np.uint32)
+            )
+        # Reordering alone drops nothing.
+        assert ds.n_output_genes == 3
+
+    def test_hvg_panel_with_duplicates_warns_about_the_width(self, scx_path):
+        with pytest.warns(UserWarning, match="deduplicated from 5 to 3"):
+            ds = pyscx.TrainingDataset(
+                scx_path, hvg_indices=np.array([3, 3, 5, 5, 9], dtype=np.uint32)
+            )
+        assert ds.n_output_genes == 3
+
+    def test_a_canonical_hvg_panel_warns_about_nothing(self, scx_path, recwarn):
+        """The half that keeps the warning from becoming noise: the recipe
+        every doc uses -- `np.where(...)[0]` -- is already ascending and
+        unique, so it must stay silent."""
+        ds = pyscx.TrainingDataset(
+            scx_path, hvg_indices=np.array([0, 5, 10, 49], dtype=np.uint32)
+        )
+        assert ds.n_output_genes == 4
+        assert [w for w in recwarn if "hvg_indices" in str(w.message)] == []
+
     def test_repr(self, scx_path):
         ds = pyscx.TrainingDataset(scx_path)
         r = repr(ds)
@@ -423,3 +452,85 @@ class TestDropShutdown:
         )
         assert b"ok" in r.stdout
 
+
+
+NEGATIVE_CELLS = {
+    (0, 0): -5.5,  # well below the singularity
+    (1, 7): -1.0,  # exactly ln(x + 1)'s singularity -> -inf, not NaN
+    (2, 3): -0.25,  # above it: log1p is defined, but the value is negative
+}
+
+
+class TestNegativeValuesOnTheLogPaths:
+    """A stored value <= -1 made `log1p` produce NaN (or -inf) in the batch,
+    silently and only on the dense loaders — the sparse gather has clipped for
+    a while.
+
+    The clip is scoped to the paths that take a log, so a pre-centered matrix
+    streamed with no transforms still comes back signed.
+
+    Uses a genuinely float matrix: the shared integer-count fixture is stored
+    with an unsigned value encoding, so negatives never survive the write and
+    the whole premise would be vacuous.
+    """
+
+    @pytest.fixture
+    def signed_scx(self, tmp_path):
+        import anndata
+        import scipy.sparse as sp
+
+        rng = np.random.default_rng(0)
+        dense = (rng.random((40, 12)) * 10).astype(np.float32)
+        dense[dense < 6.0] = 0.0
+        for (row, col), value in NEGATIVE_CELLS.items():
+            dense[row, col] = value
+        path = str(tmp_path / "signed.scx")
+        pyscx.from_anndata(anndata.AnnData(sp.csr_matrix(dense)), path)
+
+        # The premise: the negatives really are on disk. Without this the
+        # assertions below would pass against a file that never had them.
+        stored = pyscx.open(path).to_anndata().X.toarray()
+        for (row, col), value in NEGATIVE_CELLS.items():
+            assert stored[row, col] == value, "fixture lost its negatives"
+        return path
+
+    def _epoch(self, path, **kwargs):
+        """One epoch, re-indexed back to file row order.
+
+        Batches arrive shuffled, so `cell_indices` — not row position — is what
+        identifies a cell.
+        """
+        ds = pyscx.TrainingDataset(path, batch_size=16, **kwargs)
+        rows, idx = [], []
+        for batch in ds:
+            rows.append(batch["X"])
+            idx.append(batch["cell_indices"])
+        ds.close()
+        x = np.concatenate(rows, axis=0)
+        order = np.argsort(np.concatenate(idx))
+        return x[order]
+
+    def test_log1p_emits_no_nan(self, signed_scx):
+        x = self._epoch(signed_scx, normalize=False, log1p=True)
+        assert np.isfinite(x).all(), "log1p must not put NaN/inf in the batch"
+        for row, col in NEGATIVE_CELLS:
+            assert x[row, col] == 0.0, f"({row}, {col}) should clip to log1p(0)"
+
+    def test_normalize_log1p_emits_no_nan(self, signed_scx):
+        x = self._epoch(signed_scx, normalize=True, log1p=True)
+        assert np.isfinite(x).all()
+        for row, col in NEGATIVE_CELLS:
+            assert x[row, col] == 0.0
+
+    def test_pflog_emits_no_nan(self, signed_scx):
+        """pflog sums the per-gene deltas into a per-cell baseline, so one bad
+        value NaN'd every gene in that row, not just its own."""
+        x = self._epoch(signed_scx, pflog=True, pflog_alpha=0.05)
+        assert np.isfinite(x).all(), "one negative must not NaN a whole row"
+
+    def test_no_transform_still_returns_signed_values(self, signed_scx):
+        """The deliberate scope of the clip. Someone streaming a centered
+        matrix with transforms off keeps their negatives."""
+        x = self._epoch(signed_scx, normalize=False, log1p=False)
+        for (row, col), value in NEGATIVE_CELLS.items():
+            assert x[row, col] == value

@@ -37,7 +37,7 @@ ds.close()
 |---|---|---|
 | `path` | — | Path to `.scx`. |
 | `batch_size` | `1024` | Auto-tuned downward only if an **explicit** `max_memory_mb` is exceeded; the adaptive default budget preserves it. |
-| `hvg_indices` | `None` | `np.ndarray[uint32]` of gene indices; `None` = all genes. |
+| `hvg_indices` | `None` | `np.ndarray[uint32]` of gene indices; `None` = all genes. Every index must be `< n_vars`. Sorted and deduplicated, so batch columns come back in ascending gene-index order whatever order you pass — `np.unique(hvg_indices)` is the column order. |
 | `obs_columns` | `[]` | Obs column names included in each batch. |
 | `normalize` | `True` | Total-count normalize (fused with `log1p` in one CSR row scan). |
 | `log1p` | `True` | Apply `log1p` after normalize. |

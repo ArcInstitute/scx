@@ -283,11 +283,10 @@ impl BudgetBreakdown {
 
 /// Returns `true` if `SCX_LOADER_PROFILE` is set to `"1"` or `"true"`.
 ///
-/// Shared helper for the env-var check used across `pipeline.rs`,
-/// `decode_stage.rs`, `io_stage.rs`, and `index_plan.rs`. Note this is not
-/// the sole reader of the variable: some call sites (e.g. the inner
-/// `spawn_blocking` path in `io_stage.rs`) re-read `SCX_LOADER_PROFILE`
-/// inline rather than calling this function.
+/// The sole reader of the variable. Every profiling call site — `pipeline.rs`,
+/// `decode_stage.rs`, `io_stage.rs`, `index_plan.rs` — reads it once at stage
+/// scope through this function and passes the resulting `bool` down, including
+/// into `io_stage`'s `spawn_blocking` closures.
 pub(crate) fn profiling_enabled() -> bool {
     std::env::var("SCX_LOADER_PROFILE")
         .map(|v| v == "1" || v == "true")

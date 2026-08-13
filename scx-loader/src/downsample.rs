@@ -59,6 +59,7 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::Binomial;
 
 use crate::error::{LoaderError, Result};
+use crate::seed::splitmix64;
 
 /// Which sampler redistributes the row's counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,26 +163,16 @@ pub fn file_identity(path: &str) -> u64 {
     )
 }
 
-/// SplitMix64 finalizer. Used to *chain* key components rather than add them.
-///
-/// The rest of `scx-loader` derives seeds additively — `seed + epoch * PHI`
-/// (`shuffle.rs`, `decode_stage.rs`) — which collides across components:
-/// `(seed + 1, row)` and `(seed, row + 1)` land on the same stream. With three
-/// components plus a method tag that is not acceptable, so this is deliberately a
-/// new convention in the crate.
-///
-/// **This is a mixer, not a KDF.** The goal is that distinct key tuples land on
-/// independent-looking streams; there is no secrecy or preimage-resistance claim,
-/// and nothing here should be reused where one is needed.
-#[inline]
-fn splitmix64(x: u64) -> u64 {
-    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
 /// Derive this row's RNG seed from `(seed, method, file_identity, row)`.
+///
+/// Chained rather than additive — see [`crate::seed`] for why. This four-component
+/// key is where the convention started; `shuffle.rs` and `decode_stage.rs` were
+/// converted to it later.
+///
+/// **Do not change this derivation.** Its output is pinned by a blake3 golden
+/// (`downsample_tests.rs`) that `state3` also consumes, so a change here is a
+/// cross-repo break — see the failure message on that test for the full
+/// regeneration procedure.
 #[inline]
 fn row_seed(seed: u64, method: DownsampleMethod, file_identity: u64, row: u64) -> u64 {
     let mut h = splitmix64(seed);

@@ -37,6 +37,23 @@ pub enum LoaderError {
         name: String,
         available: Vec<String>,
     },
+
+    /// Two CSR shards claim the same global obs row.
+    ///
+    /// The loader's row index is keyed on the global row, so a collision does
+    /// not fail — it silently drops whichever shard's row loses. This is that
+    /// drop, made loud. Either the file's shard row ranges overlap (a merge /
+    /// append / compact defect), or shards of two different modalities were
+    /// pooled into one group because no `modality_id` was selected.
+    #[error(
+        "global obs row {global_row} is claimed by two shards in one shard group \
+         (group positions {shard_a} and {shard_b}); CSR shard row ranges must be disjoint"
+    )]
+    ShardRowOverlap {
+        global_row: u64,
+        shard_a: usize,
+        shard_b: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, LoaderError>;

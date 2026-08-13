@@ -117,7 +117,14 @@ pub struct IndexPlanLoader {
     /// Tokio runtime used by [`IndexPlanIter`] to spawn shard prefetches via
     /// `spawn_blocking`. `read_shard_cached_arc` is synchronous and CPU/IO
     /// bound, so it must run on the blocking pool — bare `tokio::spawn` does
-    /// not accept it. 2 worker threads matches `TrainingPipeline`.
+    /// not accept it.
+    ///
+    /// Multi-threaded with 2 workers, which is **not** what `TrainingPipeline`
+    /// does: since the fork-safety restructure that pipeline drives a
+    /// `new_current_thread` runtime on its own I/O thread (`pipeline.rs`), so
+    /// its blocking work is already off the reactor. Here the iterator awaits
+    /// several prefetches concurrently from the caller's thread, so the
+    /// reactor needs workers of its own.
     ///
     /// Lazily built by [`Self::runtime`] on first use so the parent process
     /// never holds tokio I/O threads that would be inherited across `fork(2)`.
@@ -665,6 +672,17 @@ impl IndexPlanLoader {
     /// warn; `None` is the common case.
     pub fn cache_sizing(&self) -> Option<crate::budget::CacheSizingVerdict> {
         self.cache_sizing
+    }
+
+    /// Verdict on whether building the HVG projection changed the panel the
+    /// caller passed — `None` when it was already ascending and unique.
+    /// Mirrors `TrainingPipeline::hvg_panel`; see
+    /// [`crate::projection::assess_hvg_panel`].
+    pub fn hvg_panel(&self) -> Option<crate::projection::HvgPanelVerdict> {
+        self.config
+            .hvg_indices
+            .as_deref()
+            .and_then(crate::projection::assess_hvg_panel)
     }
 
     /// The `cache_shards` the caller requested, before the budget auto-tune.

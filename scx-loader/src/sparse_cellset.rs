@@ -815,7 +815,11 @@ fn remap_row(indices: &[i32], data: &[f32], local_to_global: &[i32]) -> (Vec<i32
 /// its scale from the row sum — which, over a sparse row's nonzeros, equals the
 /// full row sum since the absent zeros contribute nothing. `normalize` rounds
 /// `(v as f64 * factor) as f32` per element (not an f32 scale multiply), exactly
-/// as [`normalize_dense_row`]; `log1p` is `ln_1p`, exactly as [`log1p_dense_row`].
+/// as [`crate::normalize::normalize_dense_row`]; `log1p` **is**
+/// [`crate::normalize::log1p_dense_row`], which computes `(v.max(0.0) + 1.0).ln()`
+/// — not `f32::ln_1p`, as an earlier version of this comment claimed. Its clip
+/// is a no-op here: `transform_row` has already run
+/// [`crate::downsample::clip_negatives`] over the same buffer.
 fn apply_sparse_transforms(data: &mut [f32], normalize: bool, log1p: bool, target_sum: f64) {
     if normalize {
         crate::normalize::normalize_dense_row(data, target_sum);

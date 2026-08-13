@@ -254,7 +254,7 @@ loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=0)
 |---|---|---|
 | `path` | — | Path to `.scx` file. |
 | `batch_size` | `1024` | Mini-batch size. Auto-tuned downward if `max_memory_mb` is exceeded; check via `effective_batch_size`. |
-| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. Every index must be `< n_vars` — an out-of-range index is rejected at construction, because it matches no column and would otherwise yield an output feature that is silently always zero. |
+| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. Every index must be `< n_vars` — an out-of-range index is rejected at construction, because it matches no column and would otherwise yield an output feature that is silently always zero. **The panel is sorted and deduplicated**, so batch columns are in ascending gene-index order regardless of the order you pass, and duplicates shrink the batch width (check `n_output_genes`). Passing a panel that is not already ascending-unique emits a `UserWarning`; `np.unique(hvg_indices)` reproduces the column order the batches use. |
 | `obs_columns` | `None` | Obs metadata column names included in each batch dict. `None` = no obs columns. |
 | `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). The per-cell depth is the **full transcriptome** total count even under `hvg_indices` projection (matching scanpy's normalize-then-subset), not the panel-local sum. **scVI and other count-likelihood models need `normalize=False, log1p=False`.** |
 | `log1p` | `True` | Apply `log1p` after normalize. |
@@ -293,6 +293,21 @@ Each `for batch in dataset:` loop is one epoch. On each epoch:
 
 This two-level shuffle provides training randomization without random I/O.
 The same `seed` always produces the identical ordering for reproducibility.
+
+> [!NOTE]
+> **The `seed` → ordering mapping changed in v0.13.1.** The two levels used to
+> compose `seed` and `epoch` by addition, which collides: `(seed, epoch)` and
+> `(seed + φ, epoch − 1)` drove the *same* stream, so a seed sweep over
+> `s, s + φ, s + 2φ` silently replayed orderings from neighbouring epochs, and
+> the row shuffle at seed `s` was identical to the shard shuffle at
+> `s + 0xDEADBEEF`. Both levels now chain their components through SplitMix64
+> with distinct domain tags, matching what `downsample` and `scx sort --shuffle`
+> already did.
+>
+> Determinism is unchanged — the same seed still gives the same ordering within
+> a version — but a given seed produces a *different* ordering than it did
+> before. Files written by `scx sort --shuffle` are unaffected; that permutation
+> is on disk and its derivation did not change.
 
 #### When two levels aren't enough: pre-shuffle the file
 
@@ -503,6 +518,18 @@ manifest position.
 > the values are. Code relying on negatives reaching the consumer needs to read
 > them before the gather.
 
+The dense loaders (`TrainingDataset`, `MultimodalTrainingDataset`,
+`IndexPlanDataset`) clip **only where a log is applied** — `log1p=True` and
+`pflog=True`. `ln` is undefined below `-1`, so an unclipped `log1p` put `NaN`
+into the batch for any stored value `<= -1`; under `pflog` a single such value
+made the whole cell's baseline `NaN`, and with it every gene in that row. As on
+the sparse path, `NaN` clips to `0` too.
+
+With `normalize=False, log1p=False` — or `normalize=True` alone, which scales
+rather than logs — negative values still reach the batch unchanged. That is
+deliberate: nothing is undefined there, and a pre-centered or scaled matrix
+stored in `X` is a legitimate thing to stream.
+
 Reproducibility caveat: this is a Rust-native ChaCha8 sampler, so runs
 downsampled by a numpy-based implementation are **not** bit-reproducible under it.
 What is contractual is the semantics above plus the golden fixture at
@@ -552,6 +579,11 @@ for batch in ds:
 > or the implicit alphabetically-first fallback on a multimodal file — has one
 > panel and one unambiguous `n_vars`, so it **is** range-checked like any
 > single-modality loader.
+>
+> The *other* panel semantics are unchanged here: the panel is still sorted and
+> deduplicated, so every modality's columns come back in ascending gene-index
+> order, and a non-canonical panel still emits the `UserWarning` (once — one
+> panel, one warning).
 
 See [multimodal.md](multimodal.md) for the full API.
 
@@ -848,7 +880,7 @@ dataset.close()
 | `.toarray()` / `.todense()` | Automatic | SCX does sparse→dense in Rust |
 | `sc.pp.normalize_total()` | `normalize=True` | Fused in Rust, one CSR scan |
 | `sc.pp.log1p()` | `log1p=True` | Fused with normalize |
-| `adata[:, hvg_mask].copy()` | `hvg_indices=` | Column projection in Rust |
+| `adata[:, hvg_mask].copy()` | `hvg_indices=` | Column projection in Rust. Unlike `adata[:, idx]`, the panel is sorted and deduplicated — see `hvg_indices` above |
 | `torch.utils.data.Dataset` | Not needed | SCX is already iterable |
 | `DataLoader(num_workers=4)` | `num_workers=0` | Rust manages I/O threads |
 | `shuffle=True` | Automatic | Two-level shuffle per epoch |

@@ -212,6 +212,16 @@ zero. `MultimodalTrainingDataset` is the sole exception: it shares one panel
 across modalities of differing widths, so it cannot range-check and does not
 (see [training.md § MultimodalTrainingDataset](training.md#multimodaltrainingdataset)).
 
+The panel is sorted and deduplicated on every path including that one, so batch
+columns are in ascending gene-index order whatever order it was passed in, and a
+panel that is not already ascending-unique emits a `UserWarning`.
+
+A multimodal file opened with **no** modality at all — `TrainingPipeline::new`
+from Rust with `modality_id: None`, which the Python bindings never do — is
+rejected at construction. With no filter the loader would pool every modality's
+CSR shards, and since each modality independently tiles `[0, n_obs)`, two shards
+would claim the same cell at different widths.
+
 ### 3.4 Modality-scoped queries — `query(modality=…)`
 
 Selective, out-of-core reads of **one** modality run through the query

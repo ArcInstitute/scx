@@ -119,7 +119,11 @@ class ScxDataModule:
     batch_size : int
         Mini-batch size.
     hvg_indices : array-like or None
-        Gene indices for HVG projection. None = all genes.
+        Gene indices for HVG projection. None = all genes. Passed through to
+        the loader, which sorts and deduplicates the panel — so batch columns
+        are in ascending gene-index order regardless of the order given, and
+        ``n_output_genes`` can be smaller than ``len(hvg_indices)``. Use
+        ``np.unique(hvg_indices)`` to recover the column order.
     normalize : bool
         Apply total-count normalization (default True). Set ``False`` for
         raw-count output (required by scVI — see the warning above).

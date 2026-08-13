@@ -49,16 +49,34 @@ pub fn normalize_dense_row(row: &mut [f32], target_sum: f64) {
     normalize_dense_row_with_depth(row, target_sum, row_sum);
 }
 
-/// Apply `ln(x + 1)` to each element of a dense row (in-place).
+/// Apply `ln(x + 1)` to each element of a dense row (in-place), clipping
+/// negatives to zero first.
 ///
-/// Equivalent to `numpy.log1p`. Zeros map to `ln(1.0) = 0.0`, preserving
-/// sparsity in the dense representation.
+/// Equivalent to `numpy.log1p` on non-negative input. Zeros map to
+/// `ln(1.0) = 0.0`, preserving sparsity in the dense representation.
+///
+/// # Why the clip
+///
+/// `ln` is undefined below `-1` and singular at it, so an unguarded
+/// `(v + 1.0).ln()` puts `NaN` (or `-inf`) into the batch for any stored value
+/// `<= -1` and nothing downstream can attribute it. The sparse loader has
+/// clipped unconditionally since it and the collate kernel were found to
+/// disagree about what a row contained (see
+/// [`crate::downsample::clip_negatives`]); this is the same clip, applied where
+/// the dense loaders would otherwise produce `NaN`.
+///
+/// Scoped deliberately to the paths that take a log. `apply_dense_transforms`'
+/// no-log arms are untouched, so a caller feeding a centered or scaled matrix
+/// through with no transforms still gets its signed values back.
+///
+/// `f32::max` returns the non-`NaN` operand, so a stored `NaN` maps to `0` —
+/// matching the collate kernel's `raw.max(0.0)` reads exactly.
 ///
 /// # Arguments
 /// - `row`: Dense row of f32 values to transform in-place.
 pub fn log1p_dense_row(row: &mut [f32]) {
     for v in row.iter_mut() {
-        *v = (*v + 1.0).ln();
+        *v = (v.max(0.0) + 1.0).ln();
     }
 }
 
@@ -70,15 +88,19 @@ pub fn log1p_dense_row(row: &mut [f32]) {
 /// depth rather than `row.iter().sum()` on the HVG-projected path.
 ///
 /// Zeros produce `ln(0.0 * factor + 1.0) = ln(1.0) = 0.0`, staying zero.
-/// `depth <= 0.0` leaves the row unchanged (all-zero → still zero).
+/// Negatives (and `NaN`) are clipped to zero before the log, for the reason
+/// [`log1p_dense_row`] documents.
+///
+/// `depth <= 0.0` skips the **scale** — there is nothing to divide by — but the
+/// log still runs. Previously the whole body was skipped, so a row whose values
+/// sum to zero or below came back untransformed even though the caller asked
+/// for log1p; an all-zero row is unaffected either way, since `log1p(0) == 0`.
 pub fn fused_normalize_log1p_dense_with_depth(row: &mut [f32], target_sum: f64, depth: f64) {
-    if depth > 0.0 {
-        let factor = target_sum / depth;
-        for v in row.iter_mut() {
-            // Scale in f64 for precision, cast to f32, then f32 ln for speed.
-            // Numerically matches sequential normalize→log1p path.
-            *v = ((*v as f64 * factor) as f32 + 1.0).ln();
-        }
+    let factor = if depth > 0.0 { target_sum / depth } else { 1.0 };
+    for v in row.iter_mut() {
+        // Scale in f64 for precision, cast to f32, then f32 ln for speed.
+        // Numerically matches sequential normalize→log1p path.
+        *v = (((*v as f64 * factor) as f32).max(0.0) + 1.0).ln();
     }
 }
 
@@ -157,6 +179,11 @@ pub fn apply_dense_transforms(
 ///
 /// Returns `None` only for `n_vars == 0` (degenerate). An empty cell yields
 /// `Some(0.0)` (v4 is representable at zero depth). Accumulates in `f64`.
+///
+/// Values are clipped to zero before the `ln_1p`, as on every other log path
+/// (see [`log1p_dense_row`]). It matters more here than anywhere else: this is
+/// a **sum**, so one stored value below `-1/(4α)` would make the baseline `NaN`
+/// and every gene in that cell `NaN` with it.
 #[inline]
 pub fn pflog_baseline_row(csr_data: &[f32], four_alpha: f64, n_vars: usize) -> Option<f64> {
     if n_vars == 0 {
@@ -164,7 +191,7 @@ pub fn pflog_baseline_row(csr_data: &[f32], four_alpha: f64, n_vars: usize) -> O
     }
     let sum_delta: f64 = csr_data
         .iter()
-        .map(|&v| (four_alpha * v as f64).ln_1p())
+        .map(|&v| (four_alpha * v.max(0.0) as f64).ln_1p())
         .sum();
     Some(-sum_delta / n_vars as f64)
 }
@@ -270,6 +297,99 @@ mod tests {
             row2.iter().all(|&v| v == 0.0),
             "fused should leave zeros unchanged"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Negatives and NaN on the log paths
+    //
+    // `ln` is undefined below -1, so an unguarded `(v + 1.0).ln()` put NaN in
+    // the batch for any stored value <= -1 — silently, and only on the dense
+    // loaders, since the sparse gather has clipped unconditionally for a while.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn log1p_clips_negatives_instead_of_emitting_nan() {
+        let mut row = vec![-5.0f32, -1.0, -0.5, 0.0, 3.0];
+        log1p_dense_row(&mut row);
+
+        assert!(
+            row.iter().all(|v| v.is_finite()),
+            "no NaN or inf may reach the batch: {row:?}"
+        );
+        assert_eq!(
+            &row[..4],
+            &[0.0, 0.0, 0.0, 0.0],
+            "negatives clip to log1p(0)"
+        );
+        assert!(
+            (row[4] - 4.0f32.ln()).abs() < 1e-6,
+            "positives are untouched"
+        );
+    }
+
+    /// `f32::max` returns the non-NaN operand, so NaN maps to 0 — the same
+    /// semantics `downsample::clip_negatives` documents and the collate
+    /// kernel's `raw.max(0.0)` reads use.
+    #[test]
+    fn log1p_maps_nan_to_zero_like_the_sparse_clip() {
+        let mut row = vec![f32::NAN, f32::NEG_INFINITY];
+        log1p_dense_row(&mut row);
+        assert_eq!(row, vec![0.0, 0.0]);
+
+        let mut fused = vec![f32::NAN, f32::NEG_INFINITY, 4.0];
+        fused_normalize_log1p_dense_with_depth(&mut fused, 10.0, 4.0);
+        assert!(fused.iter().all(|v| v.is_finite()), "{fused:?}");
+        assert_eq!(&fused[..2], &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn fused_clips_negatives_instead_of_emitting_nan() {
+        let mut row = vec![-8.0f32, 0.0, 2.0];
+        fused_normalize_log1p_dense_with_depth(&mut row, 10.0, 2.0);
+        assert!(row.iter().all(|v| v.is_finite()), "{row:?}");
+        assert_eq!(&row[..2], &[0.0, 0.0]);
+    }
+
+    /// A row whose values sum to zero or below used to skip the transform
+    /// entirely — `depth <= 0.0` returned before the loop — so a caller who
+    /// asked for log1p got raw values back. Now only the *scale* is skipped.
+    #[test]
+    fn fused_still_logs_when_the_depth_is_non_positive() {
+        let mut row = vec![-9.0f32, 3.0];
+        fused_normalize_log1p_dense_with_depth(&mut row, 10.0, -6.0);
+        assert_eq!(row[0], 0.0, "the negative clips");
+        assert!(
+            (row[1] - 4.0f32.ln()).abs() < 1e-6,
+            "the positive is logged unscaled, not passed through raw: {row:?}"
+        );
+    }
+
+    /// The clip is scoped to the log paths on purpose. Someone feeding a
+    /// centered or scaled matrix through with no transforms still gets their
+    /// signed values back — pinning that this fix did not quietly become
+    /// "the loader zeroes negatives".
+    #[test]
+    fn no_transform_still_passes_negatives_through() {
+        let mut row = vec![-2.5f32, 0.0, 1.5];
+        apply_dense_transforms(&mut row, false, false, 0.0, 0.0);
+        assert_eq!(row, vec![-2.5, 0.0, 1.5]);
+
+        // normalize-only likewise: it scales, it does not log.
+        let mut scaled = vec![-2.0f32, 4.0];
+        apply_dense_transforms(&mut scaled, true, false, 2.0, 2.0);
+        assert_eq!(scaled, vec![-2.0, 4.0]);
+    }
+
+    #[test]
+    fn pflog_baseline_is_finite_on_a_row_containing_a_negative() {
+        let baseline = pflog_baseline_row(&[-3.0, 1.0, 2.0], 0.4, 8).unwrap();
+        assert!(
+            baseline.is_finite(),
+            "one bad value must not NaN the whole cell's baseline"
+        );
+        // The negative contributes ln1p(0) == 0, i.e. exactly as if absent.
+        let without = pflog_baseline_row(&[1.0, 2.0], 0.4, 8).unwrap();
+        assert!((baseline - without).abs() < 1e-12);
     }
 
     #[test]

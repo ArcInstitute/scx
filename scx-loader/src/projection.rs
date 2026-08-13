@@ -30,6 +30,46 @@ pub struct HvgProjection {
     n_output_cols: usize,
 }
 
+/// Construction-time verdict: building the projection changed the panel the
+/// caller passed.
+///
+/// The panel is canonicalised to ascending-unique (see
+/// [`HvgProjection::normalize_panel`]), so a caller who passed rank order —
+/// `np.argsort(-variances)[:2000]`, a natural thing to write — gets output
+/// columns in *gene-index* order instead, and duplicates shrink the batch
+/// width. Neither is wrong, but both silently break the caller's own mapping
+/// from column position back to gene, which is the only place that mapping
+/// exists. `None` means the panel was already canonical and nothing needs
+/// saying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvgPanelVerdict {
+    /// Length of the panel as passed.
+    pub requested_len: usize,
+    /// Output columns after deduplication — the actual batch width.
+    pub unique_len: usize,
+    /// The panel was not in ascending order, so output columns are not in the
+    /// order it was written in.
+    pub was_reordered: bool,
+}
+
+/// Returns a verdict iff building the projection would change the panel.
+///
+/// Pure, so it stays unit-testable without a file, and so the two loader
+/// constructors can share one definition of "worth warning about".
+pub fn assess_hvg_panel(gene_indices: &[u32]) -> Option<HvgPanelVerdict> {
+    let requested_len = gene_indices.len();
+    let unique_len = HvgProjection::output_cols_for(gene_indices);
+    let was_reordered = gene_indices.windows(2).any(|w| w[0] > w[1]);
+    if unique_len == requested_len && !was_reordered {
+        return None;
+    }
+    Some(HvgPanelVerdict {
+        requested_len,
+        unique_len,
+        was_reordered,
+    })
+}
+
 impl HvgProjection {
     /// Create a new HVG projection, validating every index against the file's
     /// gene count.
@@ -84,12 +124,42 @@ impl HvgProjection {
         Self::new_with_dense_remap_limit(gene_indices, DENSE_REMAP_MAX_BYTES)
     }
 
+    /// Canonicalise a panel to ascending order with no duplicates.
+    ///
+    /// Not a convenience: the merge-scan scatter uses its cursor into
+    /// `gene_indices` **as** the output column index, so ascending order is
+    /// what makes that path agree with the dense-remap path, and a duplicate
+    /// would leave one of the two columns permanently unwritten. Output columns
+    /// therefore come back in gene-index order whatever order the caller passed.
+    ///
+    /// The single definition of a panel's width and column order — see
+    /// [`Self::output_cols_for`] for the reason it is factored out.
+    fn normalize_panel(gene_indices: &mut Vec<u32>) {
+        gene_indices.sort_unstable();
+        gene_indices.dedup();
+    }
+
+    /// Number of output columns a panel would produce, without building the
+    /// projection.
+    ///
+    /// The memory model has to size the batch buffer before there is a
+    /// projection to ask (`pipeline::compute_memory_budget` takes only a
+    /// `LoaderConfig`), and answering with `hvg_indices.len()` was wrong for any
+    /// panel containing duplicates: the budget costed the raw length while the
+    /// batch was allocated at the deduplicated one, so a 2000-entry panel with
+    /// 200 duplicates reserved 10 % more than it could ever use — and could
+    /// auto-tune `batch_size` down to afford memory that was never needed.
+    pub fn output_cols_for(gene_indices: &[u32]) -> usize {
+        let mut panel = gene_indices.to_vec();
+        Self::normalize_panel(&mut panel);
+        panel.len()
+    }
+
     fn new_with_dense_remap_limit(
         mut gene_indices: Vec<u32>,
         max_dense_remap_bytes: usize,
     ) -> Self {
-        gene_indices.sort_unstable();
-        gene_indices.dedup();
+        Self::normalize_panel(&mut gene_indices);
 
         let n_output_cols = gene_indices.len();
         let dense_remap = Self::build_dense_remap(&gene_indices, max_dense_remap_bytes);
@@ -227,7 +297,7 @@ impl HvgProjection {
                 };
                 if out_idx >= 0 {
                     output_row[out_idx as usize] =
-                        ((four_alpha * value as f64).ln_1p() + baseline) as f32;
+                        ((four_alpha * value.max(0.0) as f64).ln_1p() + baseline) as f32;
                 }
             }
             return;
@@ -244,7 +314,7 @@ impl HvgProjection {
                 gi += 1;
             }
             if gi < self.gene_indices.len() && self.gene_indices[gi] == col {
-                output_row[gi] = ((four_alpha * value as f64).ln_1p() + baseline) as f32;
+                output_row[gi] = ((four_alpha * value.max(0.0) as f64).ln_1p() + baseline) as f32;
             }
         }
     }
@@ -331,7 +401,7 @@ pub fn pflog_row_full(
                 ),
             });
         }
-        output_row[idx] = ((four_alpha * value as f64).ln_1p() + baseline) as f32;
+        output_row[idx] = ((four_alpha * value.max(0.0) as f64).ln_1p() + baseline) as f32;
     }
     Ok(())
 }
@@ -515,6 +585,66 @@ mod tests {
         proj.scatter_row(&csr_indices, &csr_data, &mut output);
 
         assert_eq!(output, vec![1.0, 2.0, 3.0]);
+    }
+
+    // -----------------------------------------------------------------
+    // Panel width and the canonicalisation verdict
+    // -----------------------------------------------------------------
+
+    /// `output_cols_for` must agree with the built projection on every shape,
+    /// because the memory model uses the former to size what the latter
+    /// allocates. Disagreement is the bug: the budget used to cost
+    /// `hvg_indices.len()`.
+    #[test]
+    fn output_cols_for_agrees_with_the_built_projection() {
+        for panel in [
+            vec![],
+            vec![7],
+            vec![0, 1, 2, 3],
+            vec![5, 5, 10, 10, 10, 20],
+            vec![20, 5, 100, 50],
+            vec![9, 9, 9, 9],
+        ] {
+            let expected = HvgProjection::new_unchecked(panel.clone()).n_output_cols();
+            assert_eq!(
+                HvgProjection::output_cols_for(&panel),
+                expected,
+                "width disagreement on panel {panel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assess_hvg_panel_is_silent_on_an_already_canonical_panel() {
+        assert_eq!(assess_hvg_panel(&[]), None);
+        assert_eq!(assess_hvg_panel(&[42]), None);
+        // `np.where(...)[0]` — the recipe every doc uses — is exactly this.
+        assert_eq!(assess_hvg_panel(&[0, 3, 7, 900]), None);
+    }
+
+    #[test]
+    fn assess_hvg_panel_reports_a_reordered_panel() {
+        // `np.argsort(-variances)[:4]` shape: rank order, all unique.
+        let v = assess_hvg_panel(&[900, 3, 7, 0]).expect("reordering must be reported");
+        assert!(v.was_reordered);
+        assert_eq!(v.requested_len, 4);
+        assert_eq!(v.unique_len, 4, "nothing was dropped, only reordered");
+    }
+
+    #[test]
+    fn assess_hvg_panel_reports_a_deduplicated_panel() {
+        // Ascending, so the only change is the dedup.
+        let v = assess_hvg_panel(&[5, 5, 10, 10, 10, 20]).expect("dedup must be reported");
+        assert!(!v.was_reordered);
+        assert_eq!(v.requested_len, 6);
+        assert_eq!(v.unique_len, 3);
+    }
+
+    #[test]
+    fn assess_hvg_panel_reports_both_at_once() {
+        let v = assess_hvg_panel(&[20, 5, 5, 10]).expect("both changes must be reported");
+        assert!(v.was_reordered);
+        assert_eq!((v.requested_len, v.unique_len), (4, 3));
     }
 
     #[test]

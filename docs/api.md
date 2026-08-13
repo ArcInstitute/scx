@@ -2481,7 +2481,7 @@ loop is one epoch; shards are reshuffled between epochs for training randomizati
 |---|---|---|
 | `path` | — | Path to `.scx` file. |
 | `batch_size` | `1024` | Mini-batch size. Auto-tuned downward if `max_memory_mb` is exceeded. |
-| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. Every index must be `< n_vars` — an out-of-range index is rejected at construction, because it matches no column and would otherwise yield an output feature that is silently always zero. |
+| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. Every index must be `< n_vars` — an out-of-range index is rejected at construction, because it matches no column and would otherwise yield an output feature that is silently always zero. **The panel is sorted and deduplicated**, so batch columns are in ascending gene-index order regardless of the order you pass, and duplicates shrink the batch width (check `n_output_genes`). Passing a panel that is not already ascending-unique emits a `UserWarning`; `np.unique(hvg_indices)` reproduces the column order the batches use. |
 | `obs_columns` | `[]` | Obs metadata column names included in each batch. |
 | `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). **On by default** — set `normalize=False` (with `log1p=False`) for raw-count output. |
 | `log1p` | `True` | Apply `log1p` after normalize. **On by default** — set `log1p=False` for raw-count output. |
@@ -2531,6 +2531,13 @@ Each `for batch in dataset:` loop is one epoch. On each epoch:
 This two-level shuffle provides training randomization without random I/O. The same `seed`
 and epoch always produce the identical ordering.
 
+> [!NOTE]
+> The `seed` → ordering mapping changed in v0.13.1: both levels now chain
+> `(seed, domain tag, epoch)` through SplitMix64 instead of adding them, which
+> removes a collision where `(seed, epoch)` aliased `(seed + φ, epoch − 1)`.
+> Determinism within a version is unchanged; a given seed produces a different
+> ordering than it did before. See [docs/training.md](training.md#epoch-and-shuffling).
+
 ```python
 dataset = pyscx.TrainingDataset("file.scx", batch_size=1024,
     hvg_indices=hvg_array, normalize=True, log1p=True,
@@ -2560,7 +2567,7 @@ per-cell pairing flexibility.
 | Argument | Default | Notes |
 |---|---|---|
 | `path` | — | Path to `.scx` file. |
-| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. Every index must be `< n_vars` — an out-of-range index is rejected at construction, because it matches no column and would otherwise yield an output feature that is silently always zero. |
+| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. Every index must be `< n_vars` — an out-of-range index is rejected at construction, because it matches no column and would otherwise yield an output feature that is silently always zero. **The panel is sorted and deduplicated**, so batch columns are in ascending gene-index order regardless of the order you pass, and duplicates shrink the batch width (check `n_output_genes`). Passing a panel that is not already ascending-unique emits a `UserWarning`; `np.unique(hvg_indices)` reproduces the column order the batches use. |
 | `obs_columns` | `[]` | Obs metadata column names included in each batch. |
 | `normalize` | `True` | Total-count normalize (fused with `log1p`). |
 | `log1p` | `True` | Apply `log1p` after normalize. |
