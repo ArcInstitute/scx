@@ -732,11 +732,11 @@ fn test_gpu_vram_message_names_the_shortfall_and_the_remedy() {
     // Pins the figure `docs/gpu-setup.md` quotes for these exact inputs. Not
     // redundant with the shape assertion: the doc example already drifted once
     // (14.2 GB, a number I estimated rather than rendered) and moved again when
-    // the bound was tightened (11.2 → 11.3). Tightening it further *should*
+    // the bound was tightened (11.2 → 11.3 → 11.4). Tightening it further *should*
     // fail here, so the doc is updated alongside instead of going stale.
     assert!(
-        msg.contains("≥11.3 GB"),
-        "docs/gpu-setup.md quotes ≥11.3 GB for these inputs — update both together. Got: {msg}"
+        msg.contains("≥11.4 GB"),
+        "docs/gpu-setup.md quotes ≥11.4 GB for these inputs — update both together. Got: {msg}"
     );
     assert!(msg.contains("6.1 GB of 79.1 GB"), "{msg}");
     assert!(msg.contains("GPU 0"), "{msg}");

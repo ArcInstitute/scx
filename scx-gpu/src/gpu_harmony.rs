@@ -1112,19 +1112,27 @@ pub fn gpu_harmony_correction_grouped(
 /// free VRAM, which is sound precisely because the real footprint is never
 /// smaller.
 ///
-/// Counts the buffers that live on the device for the full duration of the
-/// iteration loop: Z_orig, Z_corr, Z_cos, R, dist, Y, the per-cell batch labels
-/// and small O/E/theta/sigma arrays, plus the always-live per-cell scratch
-/// (`R-row`, `order`, `obj_cell`) and the K·B objective partial.
+/// Counts every persistent buffer whose size is derivable from
+/// `(n, d, k, b, c)`: Z_orig, Z_corr, Z_cos, R, dist, Y, the per-cell batch
+/// labels and small O/E/theta/sigma arrays, the always-live per-cell scratch
+/// (`R-row`, `order`, `obj_cell`), the K·B objective partial, the
+/// `all_cells` / `cells_concat` pair, and the correction scratch
+/// (`z_sum`, `W`, `pr_b`, `batch_offsets`).
 ///
-/// **Still excluded, so still an undercount**: the `all_cells` / `cells_concat`
-/// pair, whose length depends on the batch structure rather than on
-/// `(n, d, k, b, c)` and so cannot be derived here without guessing upward; the
-/// per-block buffers; and genuinely transient scratch.
+/// `all_cells` is exactly `c · n`, not an approximation: `HarmonyState::new`
+/// requires every covariate to carry `n_obs` labels and pushes each cell into
+/// exactly one level per covariate, and the GPU setup concatenates every
+/// `(covariate, level)` pair once. The per-cluster `batch_prop_cutoff` pruning
+/// happens later, inside the correction loop, and never shrinks `batch_index`.
 ///
-/// The per-cell scratch terms were added on PR #422 after **codex** pointed out
-/// that several always-live buffers were missing — the bound stayed sound, but
-/// it was looser than its own doc claimed.
+/// **Still excluded, so still an undercount**: `d_block_cells`, sized from
+/// `config.block_size` rather than from these five parameters, and genuinely
+/// transient scratch.
+///
+/// Both extensions came out of PR #422 review. **codex** found the first batch
+/// of missing always-live buffers; **codex** and **Cursor Agent (Grok)** then
+/// independently disproved this doc's own claim that the `all_cells` pair could
+/// not be derived — it can, and now is.
 pub fn gpu_harmony_memory_bytes(n: usize, d: usize, k: usize, b: usize, c: usize) -> u64 {
     let f32b = std::mem::size_of::<f32>() as u64;
     let i32b = std::mem::size_of::<i32>() as u64;
@@ -1151,7 +1159,13 @@ pub fn gpu_harmony_memory_bytes(n: usize, d: usize, k: usize, b: usize, c: usize
     let per_cell = 2 * n * f32b + n * i32b;
     // Objective cross partial: K*B f32.
     let cross = k * b * f32b;
-    z + r + y + oe + ts + lab + per_cell + cross
+    // Global cell membership + its concat scratch: each exactly C*N i32 (see
+    // the doc above for why this is exact rather than a guess).
+    let membership = 2 * c * n * i32b;
+    // Correction scratch, hoisted out of the K-loop and live for the run:
+    // z_sum + W (B*d f32 each), pr_b (B f32), batch_offsets (B+1 i32).
+    let correction = 2 * b * d * f32b + b * f32b + (b + 1) * i32b;
+    z + r + y + oe + ts + lab + per_cell + cross + membership + correction
 }
 
 /// Whether a Harmony GPU run can be **ruled out** against `free_bytes` of

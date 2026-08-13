@@ -575,7 +575,7 @@ try:
     pyscx.accel.harmony_integrate(adata, key="batch")          # device="auto"
 except RuntimeError as e:
     print(e)
-    # harmony_integrate_gpu: GPU out of memory: Harmony needs ≥11.3 GB of device
+    # harmony_integrate_gpu: GPU out of memory: Harmony needs ≥11.4 GB of device
     # memory for 8000000 cells × 50 PCs × 100 clusters, but only 6.1 GB of
     # 79.1 GB is free on GPU 0. Re-run with device="cpu", lower n_clusters, or
     # free VRAM — device="auto" resolves the device before the op starts and

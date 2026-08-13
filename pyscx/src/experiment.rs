@@ -1600,10 +1600,24 @@ impl PyExperiment {
                         // host-assemble cannot conjure the VRAM — it would pay a
                         // full host materialization to fail again, and with a worse
                         // message than this one.
+                        //
+                        // "With a worse message" is only true if this one carries
+                        // the remedy, so an OOM here gets the same `>VRAM`
+                        // guidance the up-front gate gives. It is appended only
+                        // for an OOM: the same arm also catches malformed shards
+                        // and unsupported layouts, where "use a backed workflow"
+                        // would be advice for a problem the caller does not have.
                         Err(e) => {
+                            let remedy = if matches!(e, scx_accel::GpuError::OutOfMemory(_)) {
+                                " — this is the >VRAM regime: use a backed/streaming \
+                                 workflow (open(...).to_anndata(backed=True) + \
+                                 pyscx.accel.*), not to_gpu_anndata"
+                            } else {
+                                ""
+                            };
                             return Err(PyRuntimeError::new_err(format!(
-                                "GPU shard assembly failed: {e}"
-                            )))
+                                "GPU shard assembly failed: {e}{remedy}"
+                            )));
                         }
                     };
                     Some((adata, n_cols, gpu_csr, decode_stats))
