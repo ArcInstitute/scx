@@ -1107,10 +1107,24 @@ pub fn gpu_harmony_correction_grouped(
 
 /// Rough device-memory footprint for a Harmony GPU run, in bytes.
 ///
-/// Counts the buffers that live on the device for the full duration of
-/// the iteration loop: Z_orig, Z_corr, Z_cos, R, dist, Y plus per-cell
-/// batch labels and small O/E/theta/sigma arrays. Transient scratch is
-/// not included.
+/// A deliberate **lower bound**, not an estimate of peak usage. Callers rely on
+/// that direction: [`gpu_harmony_fits`] refuses a run only when this exceeds
+/// free VRAM, which is sound precisely because the real footprint is never
+/// smaller.
+///
+/// Counts the buffers that live on the device for the full duration of the
+/// iteration loop: Z_orig, Z_corr, Z_cos, R, dist, Y, the per-cell batch labels
+/// and small O/E/theta/sigma arrays, plus the always-live per-cell scratch
+/// (`R-row`, `order`, `obj_cell`) and the K·B objective partial.
+///
+/// **Still excluded, so still an undercount**: the `all_cells` / `cells_concat`
+/// pair, whose length depends on the batch structure rather than on
+/// `(n, d, k, b, c)` and so cannot be derived here without guessing upward; the
+/// per-block buffers; and genuinely transient scratch.
+///
+/// The per-cell scratch terms were added on PR #422 after **codex** pointed out
+/// that several always-live buffers were missing — the bound stayed sound, but
+/// it was looser than its own doc claimed.
 pub fn gpu_harmony_memory_bytes(n: usize, d: usize, k: usize, b: usize, c: usize) -> u64 {
     let f32b = std::mem::size_of::<f32>() as u64;
     let i32b = std::mem::size_of::<i32>() as u64;
@@ -1132,15 +1146,22 @@ pub fn gpu_harmony_memory_bytes(n: usize, d: usize, k: usize, b: usize, c: usize
     let ts = (b + k) * f32b;
     // batch labels: C*N * i32, cov_offset: C * i32
     let lab = c * n * i32b + c * i32b;
-    z + r + y + oe + ts + lab
+    // Always-live per-cell scratch, held across the whole iteration loop:
+    // R-row (N f32), order (N i32), obj_cell (N f32).
+    let per_cell = 2 * n * f32b + n * i32b;
+    // Objective cross partial: K*B f32.
+    let cross = k * b * f32b;
+    z + r + y + oe + ts + lab + per_cell + cross
 }
 
 /// Whether a Harmony GPU run can be **ruled out** against `free_bytes` of
 /// device memory before any of it is allocated.
 ///
 /// `false` means the run certainly cannot fit; `true` means only that it is not
-/// certainly impossible, since [`gpu_harmony_memory_bytes`] counts the
-/// persistent buffers and excludes transient scratch.
+/// certainly impossible, since [`gpu_harmony_memory_bytes`] is a lower bound —
+/// it omits transient scratch and the batch-structure-dependent buffers it
+/// cannot derive. A `true` here is therefore not a promise that the run fits,
+/// and the caller still has to survive its own allocations.
 ///
 /// That asymmetry is why there is **no headroom multiplier here**. The estimate
 /// is a strict undercount, so `estimate > free` is a fact, not a heuristic, and

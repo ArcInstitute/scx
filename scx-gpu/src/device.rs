@@ -16,6 +16,32 @@ use cudarc::nvrtc::Ptx;
 use crate::error::GpuError;
 use crate::gpu_graph::GpuGraphCache;
 
+/// Map a cudarc driver error onto the right [`GpuError`] variant, keeping an
+/// out-of-memory *typed* as one.
+///
+/// Every allocating call that is not `alloc_zeros` reaches the driver through a
+/// path whose failures all look alike at the Rust level — `clone_htod` returns
+/// the same `DriverError` for a bad context and for a card with no memory left.
+/// Flattening those to [`GpuError::CudaError`] made `GpuError::OutOfMemory`
+/// mean "the allocation went through `alloc_zeros`" rather than "the device is
+/// out of memory", which is not a distinction any caller wants to reason about.
+///
+/// It is load-bearing for [`GpuError::alternate_route_may_succeed`]: that
+/// predicate exists to say *an OOM is not worth retrying by another route to
+/// the same device*, and it cannot say so about an OOM disguised as a generic
+/// CUDA fault. Found by **codex** on PR #422, which traced the disguise from
+/// `htod_copy` through to `to_gpu_anndata`'s fallback.
+///
+/// `CUDA_ERROR_OUT_OF_MEMORY` (code 2) is the only code special-cased; every
+/// other driver failure stays a `CudaError`.
+fn classify_driver_error(context: &str, e: cudarc::driver::DriverError) -> GpuError {
+    if e.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {
+        GpuError::OutOfMemory(format!("{context}: {e}"))
+    } else {
+        GpuError::CudaError(format!("{context}: {e}"))
+    }
+}
+
 /// A GPU device handle wrapping a CUDA context and its default stream.
 ///
 /// In cudarc 0.19, `CudaDevice` was removed. The primary abstractions are now
@@ -156,7 +182,7 @@ impl GpuDevice {
     pub fn htod_copy<T: DeviceRepr>(&self, data: &[T]) -> Result<CudaSlice<T>, GpuError> {
         self.stream
             .clone_htod(data)
-            .map_err(|e| GpuError::CudaError(format!("host-to-device copy failed: {e}")))
+            .map_err(|e| classify_driver_error("host-to-device copy failed", e))
     }
 
     /// Copy device data to host (synchronous).
@@ -310,6 +336,40 @@ impl Drop for GpuDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An out-of-memory driver error must stay typed as one no matter which
+    /// cudarc call produced it.
+    ///
+    /// `DriverError` is a public tuple over `CUresult`, so this exercises the
+    /// real mapping on a CPU host — no device needed, and no reliance on
+    /// `GpuError::OutOfMemory` being constructed by hand, which is exactly the
+    /// gap that let `htod_copy` report an OOM as a generic `CudaError`.
+    #[test]
+    fn a_driver_oom_is_classified_as_out_of_memory() {
+        let e = classify_driver_error(
+            "host-to-device copy failed",
+            cudarc::driver::DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY),
+        );
+        assert!(
+            matches!(e, GpuError::OutOfMemory(_)),
+            "expected OutOfMemory, got {e}"
+        );
+        // And therefore no alternate route to the same device is worth trying.
+        assert!(!e.alternate_route_may_succeed());
+        assert!(e.is_runtime_failure());
+    }
+
+    #[test]
+    fn a_non_oom_driver_error_stays_a_cuda_error() {
+        let e = classify_driver_error(
+            "host-to-device copy failed",
+            cudarc::driver::DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE),
+        );
+        assert!(matches!(e, GpuError::CudaError(_)), "got {e}");
+        // A generic driver fault is still worth another route (that is what
+        // makes the OOM carve-out meaningful rather than vacuous).
+        assert!(e.alternate_route_may_succeed());
+    }
 
     /// B4: Test CUDA device enumeration.
     ///

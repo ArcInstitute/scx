@@ -42,8 +42,8 @@ fn f64_to_f32(v: &[f64]) -> Vec<f32> {
 /// free, the shape terms the user actually controls (`n_clusters` is the one
 /// knob here that moves `K·N`), and the two ways out.
 ///
-/// `≥` rather than `=`: [`scx_gpu::gpu_harmony_memory_bytes`] counts the
-/// persistent buffers only and excludes transient scratch.
+/// `≥` rather than `=`: [`scx_gpu::gpu_harmony_memory_bytes`] is a lower bound —
+/// it still omits transient scratch and the batch-structure-dependent buffers.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn harmony_vram_message(
     device_id: usize,
@@ -300,8 +300,7 @@ pub fn harmony_integrate_gpu(
             )));
         }
     }
-    // Appended to the persistent-buffer allocations below — the ones the
-    // estimate actually models. A shortfall it could not see (transient scratch
+    // Appended to every persistent-buffer allocation below. A shortfall it could not see (transient scratch
     // is excluded from it by design) then still reports the sizing instead of a
     // bare `host-to-device copy failed`. Deliberately *appended* rather than
     // used to reclassify: `htod_copy` reports every failure as `CudaError`, so
@@ -364,17 +363,17 @@ pub fn harmony_integrate_gpu(
     // Read-only constants — uploaded once.
     let d_sigma = dev
         .htod_copy(&f64_to_f32(&state.sigma))
-        .map_err(|e| AccelError::LinAlg(format!("upload sigma: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload sigma: {e}{vram_note}")))?;
     let d_theta = dev
         .htod_copy(&f64_to_f32(&state.theta))
-        .map_err(|e| AccelError::LinAlg(format!("upload theta: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload theta: {e}{vram_note}")))?;
     let d_pr_b = dev
         .htod_copy(&f64_to_f32(&state.pr_b))
-        .map_err(|e| AccelError::LinAlg(format!("upload pr_b: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload pr_b: {e}{vram_note}")))?;
     let cov_offset_i32: Vec<i32> = state.layout.cov_offset.iter().map(|&v| v as i32).collect();
     let d_cov_offset = dev
         .htod_copy(&cov_offset_i32)
-        .map_err(|e| AccelError::LinAlg(format!("upload cov_offset: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload cov_offset: {e}{vram_note}")))?;
 
     // Flatten per-covariate labels to (C x N) row-major i32. Batch
     // count per covariate is bounded by `max_batches` (default
@@ -388,14 +387,14 @@ pub fn harmony_integrate_gpu(
     }
     let d_labels = dev
         .htod_copy(&labels_flat)
-        .map_err(|e| AccelError::LinAlg(format!("upload batch labels: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload batch labels: {e}{vram_note}")))?;
 
     // Per-cluster R-row scratch (size N) — used by z-sum and
     // grouped correction kernels. Filled per cluster via
     // memcpy_dtod from `d_r[ku*n..(ku+1)*n]`.
     let mut d_r_row = dev
         .alloc_zeros::<f32>(n)
-        .map_err(|e| AccelError::LinAlg(format!("alloc R-row scratch: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc R-row scratch: {e}{vram_note}")))?;
 
     // Task 2.6: pre-upload the global per-batch cell membership ONCE — it
     // is fixed for the whole run. `all_cells` concatenates each global
@@ -425,22 +424,22 @@ pub fn harmony_integrate_gpu(
     // the z-sum / correction kernels only touch the valid `b_prime`-prefix.
     let mut d_z_sum_scratch = dev
         .alloc_zeros::<f32>((b * d).max(1))
-        .map_err(|e| AccelError::LinAlg(format!("alloc z_sum scratch: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc z_sum scratch: {e}{vram_note}")))?;
     let mut d_w_scratch = dev
         .alloc_zeros::<f32>((b * d).max(1))
-        .map_err(|e| AccelError::LinAlg(format!("alloc W scratch: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc W scratch: {e}{vram_note}")))?;
     let mut d_cells_concat_scratch = dev
         .alloc_zeros::<i32>(all_cells_total.max(1))
-        .map_err(|e| AccelError::LinAlg(format!("alloc cells_concat scratch: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc cells_concat scratch: {e}{vram_note}")))?;
     let mut d_offsets_scratch = dev
         .alloc_zeros::<i32>(b + 1)
-        .map_err(|e| AccelError::LinAlg(format!("alloc batch_offsets scratch: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc batch_offsets scratch: {e}{vram_note}")))?;
 
     // Per-sub-iter shuffled cell order (CPU shuffle, GPU consumes
     // contiguous block ranges). Allocated once at full size N.
     let mut d_order = dev
         .alloc_zeros::<i32>(n)
-        .map_err(|e| AccelError::LinAlg(format!("alloc d_order: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc d_order: {e}{vram_note}")))?;
 
     // Block-cells scratch (size = max possible block_len). Filled
     // per block via memcpy_dtod from a slice of d_order.

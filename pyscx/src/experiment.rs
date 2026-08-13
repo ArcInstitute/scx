@@ -225,8 +225,14 @@ fn force_device_decode_failure(
 /// other trace of it is a `fallback_reason` nobody thinks to read when the call
 /// appeared to succeed. Once per call is the right frequency for an op a user
 /// invokes deliberately, not in a loop.
+///
+/// **Called only after the host route has actually produced the result.** The
+/// message is in the past tense and asserts the result is correct; emitting it
+/// at the point of failure would hand that reassurance to a caller who is about
+/// to receive an exception instead. Takes the error's text rather than the error
+/// itself, since by then the `GpuError` is long out of scope.
 #[cfg(feature = "gpu")]
-fn warn_device_decode_fallback(py: Python<'_>, e: &scx_accel::GpuError) {
+fn warn_device_decode_fallback(py: Python<'_>, e: &str) {
     let msg = format!(
         "to_gpu_anndata: the in-VRAM shard decode failed ({e}); assembled X on the host and \
          uploaded it instead. The result is correct but the fast path did not run — \
@@ -1419,10 +1425,13 @@ impl PyExperiment {
                 && n_csr_shards > 0;
 
             // Set when the in-VRAM decode failed on the device and the
-            // host-assemble path below produced the result instead — recorded
-            // as `fallback_reason` so a degraded handoff is distinguishable
-            // from host-assemble chosen up front for a filtered request.
-            let mut device_decode_failed = false;
+            // host-assemble path below is being asked to produce the result
+            // instead — recorded as `fallback_reason` so a degraded handoff is
+            // distinguishable from host-assemble chosen up front for a filtered
+            // request. Holds the device error's text so the warning, which
+            // fires only once the fallback has actually worked, can still name
+            // what failed.
+            let mut device_decode_error: Option<String> = None;
 
             // Yields the decoded CSR rather than a finished handoff: adopting
             // it consumes `dev`, and `dev` must survive for the host-assemble
@@ -1569,7 +1578,13 @@ impl PyExperiment {
                         // CSR in the same VRAM) and an input defect (the host
                         // decode rejects the same shard). See its doc.
                         Err(e) if e.alternate_route_may_succeed() => {
-                            warn_device_decode_fallback(py, &e);
+                            // Deliberately does NOT warn here. The warning says
+                            // the result was assembled on the host and is
+                            // correct; the host route has not run yet, and if it
+                            // fails the caller would get that reassurance
+                            // followed by an exception. Recorded now, announced
+                            // after it is true.
+                            device_decode_error = Some(e.to_string());
                             // The partial device buffers are dropped by now, but
                             // cudarc frees into a memory pool that keeps them
                             // charged to the process until trimmed — and the
@@ -1578,7 +1593,6 @@ impl PyExperiment {
                             // nothing holds. Best-effort: a failing trim must not
                             // replace the fallback with an error.
                             let _ = dev.reclaim_memory_pool();
-                            device_decode_failed = true;
                             break 'fast None;
                         }
                         // An out-of-memory failure is *not* worth retrying: both
@@ -1744,7 +1758,7 @@ impl PyExperiment {
             // string — so the reason carries that distinction.
             let mut info = scx_accel::route::AccelExecutionInfo::new(
                 scx_accel::route::AccelRoute::GpuCsr,
-                if device_decode_failed {
+                if device_decode_error.is_some() {
                     scx_accel::route::FallbackReason::GpuRuntimeError
                 } else {
                     scx_accel::route::FallbackReason::None
@@ -1756,6 +1770,14 @@ impl PyExperiment {
             info.cupy_version = Some(cupy_version);
             info.n_shards_shufdelta_gpu = n_shufdelta_gpu;
             crate::accel::route::write_accel_route(py, &adata, "to_gpu_anndata", &info)?;
+
+            // Announce the degraded path only now — every step it claims
+            // succeeded (host assembly, its own VRAM gate, the upload, the cuPy
+            // adoption, the stamp) is behind us, so the past tense is true and
+            // the route it points the reader at exists to be read.
+            if let Some(err) = device_decode_error {
+                warn_device_decode_fallback(py, &err);
+            }
 
             Ok(adata)
         }
