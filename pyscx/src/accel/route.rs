@@ -468,6 +468,10 @@ pub(crate) fn announce_route(
             "the input dimensions exceed the GPU path's supported limit"
         }
         FallbackReason::PerfPolicy => "a performance policy selected CPU",
+        FallbackReason::GpuRuntimeError => {
+            "the GPU path failed at run time and a slower path produced the result — the \
+             original device error was reported at the point of failure"
+        }
         _ => "see adata.uns[\"scx_accel\"] for details",
     };
     let msg = format!(
@@ -617,6 +621,30 @@ mod tests {
         assert!(!should_warn_gpu_fallback(
             "gpu",
             &info(AccelRoute::GpuCsrV3, FallbackReason::NoCscSidecar)
+        ));
+    }
+
+    /// The negative match in `should_warn_gpu_fallback` is what makes a new
+    /// `FallbackReason` warn by default rather than pass silently. Pin it on
+    /// the variant that exercised the property, so a future edit that turns
+    /// the guard into a positive allow-list fails here.
+    #[test]
+    fn a_runtime_failure_landing_on_cpu_warns() {
+        assert!(should_warn_gpu_fallback(
+            "gpu",
+            &info(AccelRoute::CpuCsr, FallbackReason::GpuRuntimeError)
+        ));
+        assert!(should_warn_gpu_fallback(
+            "gpu:1",
+            &info(AccelRoute::CpuDense, FallbackReason::GpuRuntimeError)
+        ));
+        // Still on a GPU route (to_gpu_anndata's host-assemble fallback ends up
+        // on the device either way), so this warning — which is specifically
+        // "you asked for GPU and got CPU" — must stay silent. That path emits
+        // its own warning naming the device failure.
+        assert!(!should_warn_gpu_fallback(
+            "gpu",
+            &info(AccelRoute::GpuCsr, FallbackReason::GpuRuntimeError)
         ));
     }
 }

@@ -2543,10 +2543,33 @@ fn resident_max_frac() -> f64 {
 /// - there is only **one** gene chunk, where residency is pure cost: the
 ///   streaming pass would have run exactly once anyway;
 /// - the matrix does not fit the VRAM budget (decided inside
-///   [`scx_gpu::try_build_resident`]).
+///   [`scx_gpu::try_build_resident`]);
+/// - the device *fails* while building it — see below.
 ///
 /// `effective_chunk` must be the **post-clamp** chunk size, since clamping can
 /// only shrink the chunk and therefore only increase the chunk count.
+///
+/// # A device failure here is a decline, not an error
+///
+/// The budget check predicts what `clone_exact` will allocate, so it declines
+/// cleanly on a matrix it can see is too big. What it cannot predict is another
+/// process taking the VRAM between the check and the allocation, or any other
+/// mid-drain CUDA fault — and that used to propagate, failing the whole DE call
+/// over an optimisation. That contradicted
+/// [`clamp_chunk_with_residency_backoff`]'s stated contract 60 lines below
+/// (*"Residency is an optimisation; it must never be the reason a call
+/// errors"*), which goes to the trouble of releasing residency and retrying
+/// when the *clamp* fails.
+///
+/// [`scx_gpu::decline_on_runtime_failure`] closes that: a device-side failure
+/// streams instead, exactly as an over-budget matrix already did. An
+/// input-defect error (a malformed shard) still propagates — the streaming
+/// pass would only re-derive it a decode later.
+///
+/// Streaming after a partial drain is safe: `RawGpuShardSource::run` drains its
+/// pinned events on every exit path, and `try_build_resident` drops the shards
+/// it had retained and trims the memory pool before propagating, so the
+/// caller's next free-VRAM probe is not charged for them.
 fn try_resident_csr(
     dev: &GpuDevice,
     source: &mut dyn GpuMatrixSource,
@@ -2556,8 +2579,11 @@ fn try_resident_csr(
     if !resident_enabled() || effective_chunk == 0 || n_vars.div_ceil(effective_chunk) <= 1 {
         return Ok(None);
     }
-    let resident = scx_gpu::try_build_resident(dev, source, resident_max_frac())
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE resident CSR build: {e}")))?;
+    let resident = scx_gpu::decline_on_runtime_failure(
+        scx_gpu::try_build_resident(dev, source, resident_max_frac()),
+        "GPU DE resident CSR",
+    )
+    .map_err(|e| AccelError::LinAlg(format!("GPU DE resident CSR build: {e}")))?;
     if let Some(r) = resident.as_ref() {
         log::debug!(
             "GPU DE: {} CSR shards held device-resident ({:.2} GiB) across {} gene chunks",

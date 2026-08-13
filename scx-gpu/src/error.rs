@@ -41,6 +41,82 @@ pub enum GpuError {
 
 pub type Result<T> = std::result::Result<T, GpuError>;
 
+impl GpuError {
+    /// Whether the *device* failed, as opposed to the input being defective.
+    ///
+    /// True means: this same input, handed to a non-GPU path, would have
+    /// produced an answer — the GPU ran out of memory, a driver/library call
+    /// failed, a module would not load. Those are the failures a caller may
+    /// legitimately answer by taking another path.
+    ///
+    /// False means the input itself is the problem, so no other path helps:
+    ///
+    /// * [`GpuError::InvalidShard`] — the shard is malformed, and the CPU
+    ///   kernels reject exactly the same shards (`validate_shard_for_gpu_de` /
+    ///   `validate_csc_shard_for_gpu` exist precisely because a NaN or a
+    ///   duplicate `(row, col)` is not computable anywhere). It also carries
+    ///   the *host-side* read/decode failures via
+    ///   [`scx_format_io::PrefetchError`] below, which no device would fix
+    ///   either. Retrying these elsewhere converts a fast, precise rejection
+    ///   into a slow one.
+    /// * [`GpuError::ShapeMismatch`] / [`GpuError::CodecError`] — a caller bug
+    ///   or an unreadable stream; deterministic in both cases.
+    /// * [`GpuError::UnsupportedLayout`] — a routing decision, already
+    ///   expressible as `FallbackReason::UnsupportedInputLayout`; it is not a
+    ///   failure that happened, it is a path that was never viable.
+    ///
+    /// The `match` is deliberately exhaustive with no `_` arm: a new
+    /// `GpuError` variant must be classified by whoever adds it, and the
+    /// compiler — not a test — is what enforces that.
+    pub fn is_runtime_failure(&self) -> bool {
+        match self {
+            GpuError::CudaError(_)
+            | GpuError::KernelLaunchFailed(_)
+            | GpuError::GdsUnavailable(_)
+            | GpuError::DeviceNotFound(_)
+            | GpuError::CuBlasError(_)
+            | GpuError::CuSparseError(_)
+            | GpuError::CuSolverError(_)
+            | GpuError::CuRandError(_)
+            | GpuError::StreamError(_)
+            | GpuError::OutOfMemory(_)
+            | GpuError::ModuleLoadError(_)
+            | GpuError::CuVsError(_)
+            | GpuError::LibraryNotFound(_) => true,
+
+            GpuError::InvalidShard(_)
+            | GpuError::ShapeMismatch { .. }
+            | GpuError::CodecError(_)
+            | GpuError::UnsupportedLayout(_) => false,
+        }
+    }
+}
+
+/// Turn a device-side failure while building an *optional* accelerator into a
+/// decline, leaving the caller's slower-but-equivalent path to run.
+///
+/// For builders that already return `Ok(None)` to mean "declined, stream
+/// instead" — [`crate::try_build_resident`] and the PCA resident-CSR builder.
+/// Both are optimisations layered over a streaming path that produces the same
+/// answer, so a device failure while *constructing* one must not be the reason
+/// the whole op errors. An input-defect error ([`GpuError::is_runtime_failure`]
+/// = false) still propagates: the streaming path would only re-derive it.
+///
+/// Callers are responsible for leaving the source re-drivable after a partial
+/// drain; both current callers do (`RawGpuShardSource::run` drains its pinned
+/// events on every exit path, and `try_build_resident` returns its retained
+/// device buffers to the pool before propagating).
+pub fn decline_on_runtime_failure<T>(built: Result<Option<T>>, what: &str) -> Result<Option<T>> {
+    match built {
+        Ok(v) => Ok(v),
+        Err(e) if e.is_runtime_failure() => {
+            log::warn!("{what} declined ({e}); falling back to the streaming path");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 impl scx_format_io::PrefetchError for GpuError {
     /// Keeps the pre-4.2 wording of the staging loop's read-error arm, so the
     /// message a user sees when a shard fails to decode mid-stream is unchanged
@@ -56,5 +132,100 @@ impl scx_format_io::PrefetchError for GpuError {
     /// uses for "the host side could not produce a usable shard".
     fn prefetch_internal(msg: String) -> Self {
         GpuError::InvalidShard(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s() -> String {
+        "boom".to_string()
+    }
+
+    /// Every variant, both classes. Listing them one by one (rather than
+    /// looping) is the point: adding a variant breaks the exhaustive `match`
+    /// in `is_runtime_failure` at compile time, and this test is where the
+    /// intended answer for each existing variant is written down.
+    #[test]
+    fn device_failures_are_runtime_failures() {
+        for e in [
+            GpuError::CudaError(s()),
+            GpuError::KernelLaunchFailed(s()),
+            GpuError::GdsUnavailable(s()),
+            GpuError::DeviceNotFound(3),
+            GpuError::CuBlasError(s()),
+            GpuError::CuSparseError(s()),
+            GpuError::CuSolverError(s()),
+            GpuError::CuRandError(s()),
+            GpuError::StreamError(s()),
+            GpuError::OutOfMemory(s()),
+            GpuError::ModuleLoadError(s()),
+            GpuError::CuVsError(s()),
+            GpuError::LibraryNotFound(s()),
+        ] {
+            assert!(e.is_runtime_failure(), "{e} should be a runtime failure");
+        }
+    }
+
+    #[test]
+    fn input_defects_are_not_runtime_failures() {
+        for e in [
+            GpuError::InvalidShard(s()),
+            GpuError::ShapeMismatch {
+                expected: s(),
+                got: s(),
+            },
+            GpuError::CodecError(scx_codec::CodecError::MalformedInput(s())),
+            GpuError::UnsupportedLayout(s()),
+        ] {
+            assert!(
+                !e.is_runtime_failure(),
+                "{e} is an input defect, not a device failure"
+            );
+        }
+    }
+
+    /// A host-side shard read failure arrives as `InvalidShard` through the
+    /// `PrefetchError` impl above. It must stay on the non-runtime side: no
+    /// device can fix an unreadable file, so declining to the streaming path
+    /// would only re-derive the same error one pass later.
+    #[test]
+    fn a_host_side_read_failure_is_not_a_runtime_failure() {
+        use scx_format_io::PrefetchError;
+        let e = GpuError::prefetch_internal("decode worker panicked".to_string());
+        assert!(!e.is_runtime_failure());
+    }
+
+    #[test]
+    fn decline_passes_success_through_unchanged() {
+        let built: Result<Option<u8>> = Ok(Some(7));
+        assert_eq!(
+            decline_on_runtime_failure(built, "widget").unwrap(),
+            Some(7)
+        );
+
+        let declined: Result<Option<u8>> = Ok(None);
+        assert_eq!(
+            decline_on_runtime_failure(declined, "widget").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn decline_converts_a_device_failure_into_a_decline() {
+        let built: Result<Option<()>> = Err(GpuError::OutOfMemory("clone_exact".to_string()));
+        assert_eq!(
+            decline_on_runtime_failure(built, "resident CSR").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn decline_still_propagates_an_input_defect() {
+        let built: Result<Option<()>> = Err(GpuError::InvalidShard("NaN at 3".to_string()));
+        let err = decline_on_runtime_failure(built, "resident CSR")
+            .expect_err("a malformed shard must not be swallowed as a decline");
+        assert!(matches!(err, GpuError::InvalidShard(_)));
     }
 }

@@ -1135,6 +1135,26 @@ pub fn gpu_harmony_memory_bytes(n: usize, d: usize, k: usize, b: usize, c: usize
     z + r + y + oe + ts + lab
 }
 
+/// Whether a Harmony GPU run can be **ruled out** against `free_bytes` of
+/// device memory before any of it is allocated.
+///
+/// `false` means the run certainly cannot fit; `true` means only that it is not
+/// certainly impossible, since [`gpu_harmony_memory_bytes`] counts the
+/// persistent buffers and excludes transient scratch.
+///
+/// That asymmetry is why there is **no headroom multiplier here**. The estimate
+/// is a strict undercount, so `estimate > free` is a fact, not a heuristic, and
+/// refusing on it cannot turn a run that would have succeeded into an error.
+/// Padding it would buy a slightly earlier failure in the grey zone at the cost
+/// of refusing runs that fit — the worse trade, because the grey zone still
+/// fails safely (and legibly) at the allocation itself.
+///
+/// Equality fits: `estimate == free` is the exactly-fits case, and refusing it
+/// would be refusing a run the estimate says is possible.
+pub fn gpu_harmony_fits(free_bytes: u64, n: usize, d: usize, k: usize, b: usize, c: usize) -> bool {
+    gpu_harmony_memory_bytes(n, d, k, b, c) <= free_bytes
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1150,6 +1170,29 @@ mod tests {
         // The full estimate must be within a sensible order of magnitude.
         assert!(large > 300_000_000);
         assert!(large < 5_000_000_000);
+    }
+
+    #[test]
+    fn fits_refuses_only_when_the_estimate_exceeds_free_memory() {
+        let (n, d, k, b, c) = (1_000_000usize, 30usize, 100usize, 3usize, 1usize);
+        let need = gpu_harmony_memory_bytes(n, d, k, b, c);
+
+        // Exactly enough fits — refusing here would refuse a run the estimate
+        // itself says is possible.
+        assert!(gpu_harmony_fits(need, n, d, k, b, c));
+        assert!(gpu_harmony_fits(need + 1, n, d, k, b, c));
+        // One byte short is a certain refusal.
+        assert!(!gpu_harmony_fits(need - 1, n, d, k, b, c));
+        assert!(!gpu_harmony_fits(0, n, d, k, b, c));
+    }
+
+    /// The estimate must stay an *undercount* of what the run allocates, since
+    /// that is what makes a refusal a fact rather than a guess. A small run on
+    /// a realistically-sized card must never be refused.
+    #[test]
+    fn a_small_run_is_never_refused_on_a_real_card() {
+        const H100_80GB: u64 = 80 * 1024 * 1024 * 1024;
+        assert!(gpu_harmony_fits(H100_80GB, 100_000, 50, 100, 4, 2));
     }
 
     #[test]

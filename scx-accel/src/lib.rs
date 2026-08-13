@@ -172,8 +172,8 @@ pub use scx_gpu::nvcomp::nvcomp_enabled;
 pub use scx_gpu::profile;
 #[cfg(feature = "gpu")]
 pub use scx_gpu::{
-    cusparse_modern_abi_available, gpu_log1p, gpu_preprocess_to_csr, GpuDevice, GpuMathMode,
-    GpuPcaTuning, ProfileSnapshot, QrMethod, SpmmAlgPolicy, StageStat,
+    cusparse_modern_abi_available, gpu_log1p, gpu_preprocess_to_csr, GpuDevice, GpuError,
+    GpuMathMode, GpuPcaTuning, ProfileSnapshot, QrMethod, SpmmAlgPolicy, StageStat,
 };
 #[cfg(feature = "gpu")]
 pub use scx_gpu::{

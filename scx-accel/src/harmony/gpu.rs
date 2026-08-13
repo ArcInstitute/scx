@@ -34,6 +34,39 @@ fn f64_to_f32(v: &[f64]) -> Vec<f32> {
     v.iter().map(|&x| x as f32).collect()
 }
 
+/// The one sentence a user gets when Harmony will not fit the card.
+///
+/// It has to carry the whole remedy on its own: `device="auto"` picks the
+/// device before the op starts and does not silently re-run on CPU, so there
+/// is no second chance in which to explain. Names what the run needs, what was
+/// free, the shape terms the user actually controls (`n_clusters` is the one
+/// knob here that moves `K·N`), and the two ways out.
+///
+/// `≥` rather than `=`: [`scx_gpu::gpu_harmony_memory_bytes`] counts the
+/// persistent buffers only and excludes transient scratch.
+#[allow(clippy::too_many_arguments)]
+fn harmony_vram_message(
+    device_id: usize,
+    n: usize,
+    d: usize,
+    k: usize,
+    b: usize,
+    c: usize,
+    free: usize,
+    total: usize,
+) -> String {
+    let need = scx_gpu::gpu_harmony_memory_bytes(n, d, k, b, c);
+    format!(
+        "harmony_integrate needs ≥{:.1} GB of device memory for {n} cells × {d} PCs × \
+         {k} clusters, but only {:.1} GB of {:.1} GB is free on GPU {device_id}. Re-run with \
+         device=\"cpu\", lower n_clusters, or free VRAM — device=\"auto\" resolves the device \
+         before the op starts and does not fall back to CPU on a runtime GPU failure.",
+        need as f64 / 1e9,
+        free as f64 / 1e9,
+        total as f64 / 1e9,
+    )
+}
+
 /// Auto-route distance computation: GEMM for large N (cuBLAS
 /// dispatches optimised tiles), hand-written kernel for small N
 /// (avoids GEMM launch overhead) or whenever either of N / K
@@ -241,13 +274,51 @@ pub fn harmony_integrate_gpu(
 
     let dev = GpuDevice::new(device_id)
         .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
+
+    // §8.10: probe free VRAM before allocating any of it.
+    //
+    // `gpu_harmony_memory_bytes` has existed since this path landed and was
+    // called by nothing but its own test, so a run that could not possibly fit
+    // died at whichever `htod_copy` happened to be first, with a raw cudarc
+    // message that named neither the shortfall nor the remedy.
+    //
+    // The probe is placed here rather than at the top of the function because
+    // `k`, `b` and `c` come out of `HarmonyState::new`; hoisting it would mean
+    // duplicating that derivation. Everything it guards — every device
+    // allocation — is still below it.
+    //
+    // A probe that itself fails must not block the run: on `Err` we fall
+    // through and let the allocations decide, exactly as before this existed.
+    let free_vram = dev.free_memory().ok();
+    if let Some((free, total)) = free_vram {
+        if !scx_gpu::gpu_harmony_fits(free as u64, n, d, k, b, c_count) {
+            return Err(AccelError::GpuOutOfMemory(harmony_vram_message(
+                device_id, n, d, k, b, c_count, free, total,
+            )));
+        }
+    }
+    // Appended to the persistent-buffer allocations below — the ones the
+    // estimate actually models. A shortfall it could not see (transient scratch
+    // is excluded from it by design) then still reports the sizing instead of a
+    // bare `host-to-device copy failed`. Deliberately *appended* rather than
+    // used to reclassify: `htod_copy` reports every failure as `CudaError`, so
+    // there is no honest way to call one of these an out-of-memory error.
+    let vram_note = free_vram
+        .map(|(free, total)| {
+            format!(
+                " — {}",
+                harmony_vram_message(device_id, n, d, k, b, c_count, free, total)
+            )
+        })
+        .unwrap_or_default();
+
     let cublas = CublasHandle::new()
         .map_err(|e| AccelError::LinAlg(format!("cuBLAS handle init failed: {e}")))?;
 
     // Upload Z_orig once — it never changes.
     let d_z_orig = dev
         .htod_copy(&f64_to_f32(&state.z_orig))
-        .map_err(|e| AccelError::LinAlg(format!("upload Z_orig: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload Z_orig: {e}{vram_note}")))?;
 
     // Persistent device buffers (reused across iterations). All
     // are kept resident across the iter loop and across the inner
@@ -255,29 +326,29 @@ pub fn harmony_integrate_gpu(
     // loop) round-trips to host.
     let mut d_z_corr = dev
         .htod_copy(&f64_to_f32(&state.z_orig))
-        .map_err(|e| AccelError::LinAlg(format!("alloc Z_corr: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc Z_corr: {e}{vram_note}")))?;
     let mut d_z_cos = dev
         .alloc_zeros::<f32>(d * n)
-        .map_err(|e| AccelError::LinAlg(format!("alloc Z_cos: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc Z_cos: {e}{vram_note}")))?;
     let mut d_dist = dev
         .alloc_zeros::<f32>(k * n)
-        .map_err(|e| AccelError::LinAlg(format!("alloc dist: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc dist: {e}{vram_note}")))?;
     let mut d_y = dev
         .alloc_zeros::<f32>(d * k)
-        .map_err(|e| AccelError::LinAlg(format!("alloc Y: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc Y: {e}{vram_note}")))?;
 
     // R / O / E persist on GPU across the entire run; CPU mirror
     // is kept only for the small (B+1)×(B+1) regression solve in
     // the correction step (O/E downloaded once per outer iter).
     let mut d_r = dev
         .htod_copy(&state.r)
-        .map_err(|e| AccelError::LinAlg(format!("upload R: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload R: {e}{vram_note}")))?;
     let mut d_o = dev
         .htod_copy(&f64_to_f32(&state.o))
-        .map_err(|e| AccelError::LinAlg(format!("upload O: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload O: {e}{vram_note}")))?;
     let mut d_e = dev
         .htod_copy(&f64_to_f32(&state.e))
-        .map_err(|e| AccelError::LinAlg(format!("upload E: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("upload E: {e}{vram_note}")))?;
     // Upload the cold-start dist matrix from CPU `HarmonyState::new`
     // so iter 0's GPU update_r has the same dist values that CPU
     // `update_r` would read from `state.dist_mat`. After iter 0,

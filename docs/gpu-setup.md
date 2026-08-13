@@ -555,6 +555,44 @@ a `UserWarning` naming the `fallback_reason` rather than failing silently. (A
 `device="gpu"` request on a host with no CUDA GPU still errors up front; `"auto"`
 falls back to CPU quietly by design.)
 
+### What `device="auto"` does and does not do
+
+`device="auto"` resolves to GPU or CPU **once, before the op starts**, from the
+pre-flight conditions `fallback_reason` enumerates: is CUDA present, does this
+op have a kernel for this input layout, are the dimensions in range, is rapids
+importable. That decision is then final.
+
+It is **not** a safety net for a GPU that is present but fails while running.
+An out-of-memory error, a driver fault, or a kernel launch failure **raises**;
+`auto` does not quietly re-run the op on CPU. That is deliberate: a CPU re-run
+of an atlas-scale DE or PCA is not a degradation you can ignore, it is hours of
+work you did not ask for, discoverable only after the fact — and the run that
+already failed has consumed its time either way. The error names the shortfall
+and the remedy instead. When you want the CPU kernel, ask for it:
+
+```python
+try:
+    pyscx.accel.harmony_integrate(adata, key="batch")          # device="auto"
+except RuntimeError as e:
+    print(e)
+    # GPU out of memory: harmony_integrate needs ≥14.2 GB of device memory for
+    # 8000000 cells × 50 PCs × 100 clusters, but only 6.1 GB of 79.1 GB is free
+    # on GPU 0. Re-run with device="cpu", lower n_clusters, or free VRAM — …
+    pyscx.accel.harmony_integrate(adata, key="batch", device="cpu")
+```
+
+Because a failed op raises, it also leaves **no** `uns["scx_accel"]` entry — the
+stamp is rolled back rather than rewritten to claim a CPU run that never
+happened. See [api.md § Accelerator route metadata](api.md#accelerator-route-metadata).
+
+The one place a runtime failure is *survived* rather than raised is
+`Experiment.to_gpu_anndata`, and it is not a GPU→CPU fallback: when the in-VRAM
+shard decode fails, the host-assemble path uploads the same matrix to the same
+device, so the result is unchanged. It warns and records
+`fallback_reason="gpu_runtime_error"`, because a device decode that stopped
+working — a build whose PTX did not compile, a driver mismatch — is worth
+knowing about even though the call succeeded.
+
 ### `pyscx.accel.gpu_available()` returns `False`
 
 Possible causes:

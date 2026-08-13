@@ -705,3 +705,37 @@ fn test_gpu_memory_estimate_reasonable() {
     assert!(bytes > 1_000_000);
     assert!(bytes < 1_000_000_000);
 }
+
+/// The VRAM pre-flight (§8.10) must not refuse a run that fits.
+///
+/// It is the one way this change could regress a working setup: a refusal is a
+/// hard error with no CPU fallback behind it, so an estimate that over-counted
+/// would turn ordinary Harmony calls into failures. A run this small on any
+/// real card must sail through — and it exercises the *live* probe against
+/// actual `cuMemGetInfo`, not the arithmetic, which `gpu_harmony_fits`'
+/// own unit tests already cover on a CPU host.
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn test_gpu_preflight_admits_a_run_that_fits() {
+    require_gpu_or_skip!();
+    let n = 500;
+    let d = 8;
+    let emb = random_embeddings(n, d, 11);
+    let labels: Vec<u32> = (0..n as u32).map(|i| i % 4).collect();
+    let cov = BatchCovariate {
+        labels,
+        n_levels: 4,
+        name: None,
+    };
+    let config = HarmonyConfig {
+        n_clusters: Some(6),
+        max_iter: 2,
+        random_state: 3,
+        ..Default::default()
+    };
+    let result = harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config)
+        .expect("the VRAM pre-flight must not refuse a run this size on a real GPU");
+    assert_eq!(result.z_corrected.len(), n * d);
+    assert!(result.z_corrected.iter().all(|v| v.is_finite()));
+}

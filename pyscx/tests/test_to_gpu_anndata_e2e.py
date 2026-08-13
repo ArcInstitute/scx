@@ -79,6 +79,58 @@ def test_to_gpu_anndata_decode_gpu_transfer_mode(scx1_scx):
     )
 
 
+def test_device_decode_failure_falls_back_to_host_assemble(scx1_scx, monkeypatch):
+    """A failed in-VRAM decode still produces X, via host-assemble (§8.10).
+
+    ``SCX_FORCE_DEVICE_DECODE_FAILURE=1`` makes the device decode report a
+    module-load failure — the realistic trigger, since a build whose PTX did not
+    compile bakes empty stubs that fail exactly there. Before the fallback this
+    raised ``RuntimeError: GPU shard assembly failed``, even though the
+    host-assemble path beside it reaches the same cupy ``X``.
+
+    The fallback must be *visible*: a silently-degraded handoff is a broken
+    build nobody notices. Both the warning and the recorded reason are asserted,
+    since ``transfer_mode`` alone cannot distinguish this from host-assemble
+    chosen up front for a filtered request.
+    """
+    monkeypatch.setenv("SCX_FORCE_DEVICE_DECODE_FAILURE", "1")
+
+    with pytest.warns(UserWarning, match="in-VRAM shard decode failed"):
+        gpu_adata = pyscx.open(scx1_scx).to_gpu_anndata()
+
+    meta = gpu_adata.uns["scx_accel"]["to_gpu_anndata"]
+    assert meta["transfer_mode"] == "scx_device_handoff"
+    assert meta["fallback_reason"] == "gpu_runtime_error"
+    # Still a GPU route: the result is on the device either way, just uploaded
+    # from the host rather than decoded in VRAM.
+    assert meta["route"] == "gpu_csr"
+
+    # And the answer is right, not merely present.
+    cpu_x = pyscx.open(scx1_scx).to_anndata().X
+    cpu_x = cpu_x.tocsr() if not sp.isspmatrix_csr(cpu_x) else cpu_x
+    cpu_x.sort_indices()
+    fallback_x = gpu_adata.X.get()
+    fallback_x.sort_indices()
+    np.testing.assert_array_equal(fallback_x.indptr, cpu_x.indptr)
+    np.testing.assert_array_equal(fallback_x.indices, cpu_x.indices)
+    np.testing.assert_allclose(fallback_x.data, cpu_x.data, rtol=1e-5, atol=1e-5)
+
+
+def test_device_decode_fallback_is_off_by_default(scx1_scx):
+    """The knob is opt-in: an unset env leaves the fast path alone.
+
+    Guards the fault-injection hook itself — a hook that fired unconditionally
+    would make the test above pass while silently disabling the in-VRAM decode
+    for every user.
+    """
+    import os
+
+    assert "SCX_FORCE_DEVICE_DECODE_FAILURE" not in os.environ
+    meta = pyscx.open(scx1_scx).to_gpu_anndata().uns["scx_accel"]["to_gpu_anndata"]
+    assert meta["transfer_mode"] == "scx_device_decode_gpu"
+    assert meta["fallback_reason"] == "none"
+
+
 def test_to_gpu_anndata_values_match_cpu(scx1_scx):
     """GPU-decoded ``X`` is identical to the CPU decode path."""
     cpu_x = pyscx.open(scx1_scx).to_anndata().X
