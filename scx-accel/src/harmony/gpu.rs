@@ -300,11 +300,22 @@ pub fn harmony_integrate_gpu(
             )));
         }
     }
-    // Appended to every persistent-buffer allocation below. A shortfall it could not see (transient scratch
-    // is excluded from it by design) then still reports the sizing instead of a
-    // bare `host-to-device copy failed`. Deliberately *appended* rather than
-    // used to reclassify: `htod_copy` reports every failure as `CudaError`, so
-    // there is no honest way to call one of these an out-of-memory error.
+    // Appended to every persistent-buffer allocation below — established by
+    // grepping the whole setup block, not by trusting this sentence. An earlier
+    // round of this PR made exactly that claim while four allocations still
+    // raised a bare message, so the claim is only worth as much as the sweep
+    // behind it.
+    //
+    // A shortfall the estimate could not see (transient scratch, and the
+    // batch-structure-dependent buffers it cannot derive) then still reports the
+    // sizing rather than a bare `alloc_zeros(N) failed`.
+    //
+    // Appended rather than used to reclassify — but note the reason is no longer
+    // that the error kind is unknowable. `htod_copy` and `alloc_zeros` both type
+    // a driver OOM as `GpuError::OutOfMemory` now. It is that Harmony flattens
+    // every device error in this function to `AccelError::LinAlg`, and re-typing
+    // only the allocation arm would make the error kind depend on which buffer
+    // happened to fail first.
     let vram_note = free_vram
         .map(|(free, total)| {
             format!(
@@ -414,9 +425,9 @@ pub fn harmony_integrate_gpu(
         batch_start.push(all_cells.len() as i32);
     }
     let all_cells_total = all_cells.len();
-    let d_all_cells = dev
-        .htod_copy(&all_cells)
-        .map_err(|e| AccelError::LinAlg(format!("upload global cell membership: {e}")))?;
+    let d_all_cells = dev.htod_copy(&all_cells).map_err(|e| {
+        AccelError::LinAlg(format!("upload global cell membership: {e}{vram_note}"))
+    })?;
 
     // Task 2.6: persistent correction scratch hoisted out of the
     // per-cluster K-loop. `b` (total batch levels) upper-bounds any
@@ -448,15 +459,15 @@ pub fn harmony_integrate_gpu(
     let block_len = n.div_ceil(n_blocks.max(1));
     let mut d_block_cells = dev
         .alloc_zeros::<i32>(block_len)
-        .map_err(|e| AccelError::LinAlg(format!("alloc d_block_cells: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc d_block_cells: {e}{vram_note}")))?;
 
     // Objective scratch.
     let mut d_obj_cell = dev
         .alloc_zeros::<f32>(n)
-        .map_err(|e| AccelError::LinAlg(format!("alloc d_obj_cell: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc d_obj_cell: {e}{vram_note}")))?;
     let mut d_cross_kgb = dev
         .alloc_zeros::<f32>(k * b)
-        .map_err(|e| AccelError::LinAlg(format!("alloc d_cross_kgb: {e}")))?;
+        .map_err(|e| AccelError::LinAlg(format!("alloc d_cross_kgb: {e}{vram_note}")))?;
 
     let mut converged = false;
     let mut iters_used = 0usize;

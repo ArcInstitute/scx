@@ -595,6 +595,11 @@ device, so the result is unchanged. It warns and records
 working — a build whose PTX did not compile, a driver mismatch — is worth
 knowing about even though the call succeeded.
 
+**Out of memory is excluded from even that one exception.** Both routes end with
+the same CSR resident in the same VRAM, so host-assemble cannot fix a shortfall;
+it would only pay a full host materialization before raising anyway. An OOM
+during the device decode raises directly, with the `>VRAM` guidance.
+
 ### `pyscx.accel.gpu_available()` returns `False`
 
 Possible causes:
