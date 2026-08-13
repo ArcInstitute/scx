@@ -582,9 +582,13 @@ extern "C" __global__ void csr_shard_pseudobulk_kernel(
 // the raw IEEE-754 bit pattern (cub::BlockRadixSort), so a NaN — whose bit
 // pattern lies above +INF / outside the normal ordering — would land at the
 // wrong position and corrupt the downstream U statistic and tie counts.
-// Callers must guarantee finite input: `validate_shard_for_gpu_de` enforces it
-// release-active at the host-side staging boundary (`GpuError::InvalidShard`),
-// and the CPU DE entry point rejects non-finite input symmetrically.
+// Callers must guarantee finite input. This kernel sorts slabs filled from
+// EITHER layout, so both host-side staging validators enforce it release-active
+// (`GpuError::InvalidShard`): `validate_shard_for_gpu_de` for CSR and
+// `validate_csc_shard_for_gpu` for the CSC sidecar. Naming only the first is
+// what review §8.3 was — the CSC-direct route reached this kernel without ever
+// passing the validator its comment cited. The CPU DE entry point rejects
+// non-finite input symmetrically.
 // ---------------------------------------------------------------------------
 // `__launch_bounds__(BLOCK_THREADS)` is REQUIRED, not an optimization hint.
 // This kernel is always launched with exactly BLOCK_THREADS (1024) threads/block

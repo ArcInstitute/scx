@@ -90,8 +90,13 @@ fn csr_htod_bytes(csr: &scx_sparse::ScxCsr) -> usize {
 /// Small shards run serially: below `VALIDATE_PAR_MIN_NNZ` the rayon
 /// split/join costs more than the scan.
 ///
-/// The scans themselves live in [`crate::shard_validate`], shared with the CSC
-/// sidecar's validator so the two layouts cannot drift in what they accept.
+/// The scans themselves live in [`crate::shard_validate`]. The CSC sidecar's
+/// validator calls the same implementations, so the ordering, the parallel
+/// threshold and the choice of which offender gets named cannot drift between
+/// the layouts — but the two do **not** run the same set, and are not meant to:
+/// CSC additionally range-checks its minor-axis (row) indices, because its
+/// kernels index the per-cell tables with them directly. CSR never has, and
+/// this does not add one.
 pub(crate) fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), GpuError> {
     if let Some((r, a, b)) = first_unsorted_major(&csr.indptr, &csr.indices, csr.n_rows()) {
         return Err(GpuError::InvalidShard(format!(
