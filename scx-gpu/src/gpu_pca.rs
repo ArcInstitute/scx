@@ -303,6 +303,13 @@ fn randomized_pca_core(
     // Re-driving `source` is safe — the builder only calls `read_shard(s)` by
     // index and keeps no state in it.
     //
+    // No pool trim on the decline, unlike the DE residency path: that one trims
+    // because the caller's very next act is to size its gene chunk against free
+    // VRAM, and untrimmed pool memory would shrink it to pay for buffers
+    // nothing holds. Here the free-VRAM pre-flight is already behind us and the
+    // streaming operator allocates out of the same pool, so trimming would
+    // hand the driver back memory we are about to ask for again.
+    //
     // Ensure the means upload + Ω generation (issued on the default stream
     // above) are complete before the resident loop, which may run on the
     // per-thread capture stream (no auto cross-stream sync there).
