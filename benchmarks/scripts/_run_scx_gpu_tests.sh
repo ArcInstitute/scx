@@ -42,9 +42,11 @@ echo
 
 export SCX_REQUIRE_GPU=1
 echo "SCX_REQUIRE_GPU=1 — a GPU test that cannot open a device is a FAILURE here,"
-echo "not a skip. Optional-library skips (nvcomp, cuVS) are still allowed and are"
-echo "listed in the summary below; set SCX_REQUIRE_NVCOMP=1 / SCX_REQUIRE_CUVS=1"
-echo "to make those hard requirements too."
+echo "not a skip. Optional-library skips (nvcomp, cuVS) and free-VRAM skips are"
+echo "still allowed and are listed in the summary below; set SCX_REQUIRE_NVCOMP=1"
+echo "/ SCX_REQUIRE_CUVS=1 / SCX_REQUIRE_LARGE_VRAM=1 to make those hard"
+echo "requirements too. Those three pass through from the submitting environment."
+echo "  SCX_REQUIRE_LARGE_VRAM=${SCX_REQUIRE_LARGE_VRAM:-<unset>}"
 echo
 
 LOG_DIR=$(mktemp -d)
@@ -115,8 +117,9 @@ if [[ -n "${SKIPPED}" ]]; then
     echo "${SKIPPED}"
     echo
     echo "  $(printf '%s\n' "${SKIPPED}" | wc -l) test(s) skipped. Under SCX_REQUIRE_GPU=1 a device"
-    echo "  gate cannot skip, so these are optional-library gates (nvcomp, cuVS)"
-    echo "  — coverage this node did not provide, not tests that stopped existing."
+    echo "  gate cannot skip, so these are optional-library gates (nvcomp, cuVS) or"
+    echo "  free-VRAM gates — coverage this node did not provide, not tests that"
+    echo "  stopped existing."
 else
     echo "(none — every GPU test executed)"
 fi

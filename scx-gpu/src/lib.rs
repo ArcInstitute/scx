@@ -75,6 +75,14 @@ macro_rules! require_gpu_cap {
             return;
         }
     };
+    // Free-VRAM floor, for tests whose subject is a buffer past a 32-bit index
+    // boundary and so cannot be made smaller. `SCX_REQUIRE_LARGE_VRAM=1` turns
+    // the skip into a failure.
+    (vram: $bytes:expr, $dev:expr) => {
+        if !$crate::test_gate::vram_or_skip($dev, $bytes, module_path!()) {
+            return;
+        }
+    };
 }
 
 // --- Module declarations ---
@@ -130,7 +138,7 @@ pub use cusparse::{
     cusparse_modern_abi_available, spmm_csr, spmm_csr_transpose, CusparseHandle,
     CusparseSpMatDescr, DnMatDescr, GpuCsrPointers,
 };
-pub use device::GpuDevice;
+pub use device::{flat_launch_1d, GpuDevice};
 pub use device_resident::{DeviceEmbedding, DeviceKnnGraph};
 pub use error::{decline_on_runtime_failure, GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;

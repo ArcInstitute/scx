@@ -106,7 +106,12 @@ extern "C" __global__ void row_scale_kernel(
     long long start = indptr[row];
     long long end = indptr[row + 1];
 
-    float factor = factors[row_offset + row];
+    // 64-bit global row id (review §8.4): `factors` is indexed in the *global*
+    // obs row space, so `row_offset + row` is an n_obs-scale quantity even
+    // though each shard's `n_rows` is small. The host already refuses a
+    // row_offset past i32::MAX (`gpu_preprocess.rs`); this makes the kernel
+    // correct on its own terms rather than by the caller's grace.
+    float factor = factors[(long long)row_offset + row];
     for (long long i = start; i < end; i++) {
         data[i] *= factor;
     }
@@ -189,8 +194,13 @@ __device__ __forceinline__ void normalize_warp_row(
     bool do_log1p
 ) {
     int lane = threadIdx.x % warpSize;
-    int warp_global = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
-    if (warp_global >= n_rows) return;
+    // 64-bit warp id (review §8.4): one warp per row means the flat thread index
+    // is 32 × n_rows, which wraps `unsigned` past 134.2M rows; the negative id
+    // then passes the `>= n_rows` guard and `indptr[warp_global]` reads out of
+    // bounds. Per-shard row counts are far below that, so this is
+    // defence-in-depth — the nonzero addressing below is already 64-bit.
+    long long warp_global = ((long long)blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    if (warp_global >= (long long)n_rows) return;
 
     long long start = indptr[warp_global];
     long long end = indptr[warp_global + 1];

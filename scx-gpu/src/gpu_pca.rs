@@ -30,7 +30,7 @@ use crate::cublas::{gpu_sgemm, gpu_transpose_f32, CublasHandle};
 use crate::curand::random_gaussian_gpu;
 use crate::cusolver::{gpu_cholesky_qr2, gpu_qr_q, CusolverHandle, QrMethod};
 use crate::cusparse::{CuSparseWorkspacePool, CusparseHandle};
-use crate::device::GpuDevice;
+use crate::device::{flat_launch_1d, GpuDevice};
 use crate::device_resident::DeviceEmbedding;
 use crate::error::GpuError;
 use crate::linear_operator::CenteredSparseOperator;
@@ -676,7 +676,7 @@ pub(crate) fn gpu_mean_correct_colmajor_strided(
     global_row: usize,
     ld: usize,
 ) -> Result<(), GpuError> {
-    let total = shard_rows * k;
+    let total = (shard_rows as u64) * (k as u64);
     if total == 0 {
         return Ok(());
     }
@@ -692,28 +692,22 @@ pub(crate) fn gpu_mean_correct_colmajor_strided(
         .load_function("mean_correct_colmajor_strided_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_strided: {e}")))?;
 
-    let shard_rows_i32 = shard_rows as i32;
-    let k_i32 = k as i32;
-    let global_row_i32 = global_row as i32;
-    let ld_i32 = ld as i32;
+    let shard_rows_i64 = shard_rows as i64;
+    let k_i64 = k as i64;
+    let global_row_i64 = global_row as i64;
+    let ld_i64 = ld as i64;
 
-    let threads: u32 = 256;
-    let blocks = (total as u32).div_ceil(threads);
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let cfg = flat_launch_1d(total, 256)?;
 
     unsafe {
         dev.stream()
             .launch_builder(&func)
             .arg(y)
             .arg(mc)
-            .arg(&shard_rows_i32)
-            .arg(&k_i32)
-            .arg(&global_row_i32)
-            .arg(&ld_i32)
+            .arg(&shard_rows_i64)
+            .arg(&k_i64)
+            .arg(&global_row_i64)
+            .arg(&ld_i64)
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_strided: {e}")))?;
@@ -817,7 +811,7 @@ pub(crate) fn gpu_outer_sub(
     n_vars: usize,
     k: usize,
 ) -> Result<(), GpuError> {
-    let total = n_vars * k;
+    let total = (n_vars as u64) * (k as u64);
     if total == 0 {
         return Ok(());
     }
@@ -826,16 +820,10 @@ pub(crate) fn gpu_outer_sub(
         .load_function("outer_sub_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("outer_sub: {e}")))?;
 
-    let n_vars_i32 = n_vars as i32;
-    let k_i32 = k as i32;
+    let n_vars_i64 = n_vars as i64;
+    let k_i64 = k as i64;
 
-    let threads: u32 = 256;
-    let blocks = (total as u32).div_ceil(threads);
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let cfg = flat_launch_1d(total, 256)?;
 
     unsafe {
         dev.stream()
@@ -843,8 +831,8 @@ pub(crate) fn gpu_outer_sub(
             .arg(z)
             .arg(mu)
             .arg(sum_q)
-            .arg(&n_vars_i32)
-            .arg(&k_i32)
+            .arg(&n_vars_i64)
+            .arg(&k_i64)
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("outer_sub: {e}")))?;
@@ -865,7 +853,7 @@ pub(crate) fn gpu_scale_columns(
     m: usize,
     k: usize,
 ) -> Result<(), GpuError> {
-    let total = m * k;
+    let total = (m as u64) * (k as u64);
     if total == 0 {
         return Ok(());
     }
@@ -874,24 +862,18 @@ pub(crate) fn gpu_scale_columns(
         .load_function("scale_columns_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("scale_columns: {e}")))?;
 
-    let m_i32 = m as i32;
-    let k_i32 = k as i32;
+    let m_i64 = m as i64;
+    let k_i64 = k as i64;
 
-    let threads: u32 = 256;
-    let blocks = (total as u32).div_ceil(threads);
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let cfg = flat_launch_1d(total, 256)?;
 
     unsafe {
         dev.stream()
             .launch_builder(&func)
             .arg(u)
             .arg(sigma)
-            .arg(&m_i32)
-            .arg(&k_i32)
+            .arg(&m_i64)
+            .arg(&k_i64)
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("scale_columns: {e}")))?;
@@ -941,19 +923,7 @@ pub fn mean_correct_gpu(
     let n_obs_i64 = n_obs as i64;
     let k_i64 = k as i64;
 
-    let threads: u32 = 256;
-    let blocks_u64 = total.div_ceil(threads as u64);
-    if blocks_u64 > i32::MAX as u64 {
-        return Err(GpuError::ShapeMismatch {
-            expected: "n_obs*k / 256 < 2^31 (CUDA grid_dim.x cap)".into(),
-            got: format!("blocks = {blocks_u64}"),
-        });
-    }
-    let cfg = LaunchConfig {
-        grid_dim: (blocks_u64 as u32, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let cfg = flat_launch_1d(total, 256)?;
 
     unsafe {
         dev.stream()
@@ -1058,6 +1028,76 @@ mod tests {
                 "scale_columns mismatch at {i}: got {}, expected {}",
                 out[i],
                 expected[i]
+            );
+        }
+    }
+
+    /// The col-major kernels must still do their work when the matrix has more
+    /// than 2³¹ elements (review §8.4).
+    ///
+    /// With a 32-bit `total = m * k` the product overflows a signed `int`,
+    /// which is UB, so what the kernel then does is nvcc's choice: measured
+    /// against the pre-fix kernels at this exact shape (nvcc 12.6, `-O3`,
+    /// `compute_70`, H100) it is `CUDA_ERROR_ILLEGAL_ADDRESS` — threads whose
+    /// `idx` wrapped negative survive the bounds check and write below the
+    /// buffer. Past 2³² elements the host's `(total as u32)` block count is
+    /// the silent variant: a grid too small to reach the tail, no error at all.
+    ///
+    /// Either way the work does not happen, on the two paths that matter at
+    /// census scale (36M cells × k=60 = 2.16e9, which the PCA VRAM pre-flight
+    /// admits on an 80 GB H100): `zero_center=True` yielding an uncentered PCA,
+    /// and the final embedding leaving unscaled by its singular values. The
+    /// assertions below cover the silent shape; the `synchronize` covers the
+    /// illegal-address shape.
+    ///
+    /// Sized at the smallest matrix that reaches the boundary — 2³¹ + 256
+    /// elements, 8 GiB of f32 — because below it the bug does not exist. The
+    /// buffer is `alloc_zeros`, so nothing 8 GiB wide is ever allocated on the
+    /// host, and only five single elements are read back (a `dtoh_copy` would
+    /// pull the whole 8 GiB). Both kernels run on the one allocation: two 8 GiB
+    /// tests under libtest's default thread pool would double the VRAM demand.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn colmajor_kernels_do_their_work_past_2_31_elements() {
+        let dev = require_gpu!();
+
+        const K: usize = 4;
+        // 2^31 + 256 elements: the first size at which a 32-bit element count
+        // wraps. m is the row count of the (m × K) col-major matrix.
+        let m: usize = (1usize << 31) / K + 64;
+        let total = m * K;
+        assert!(total > (1usize << 31), "test must cross the 2^31 boundary");
+
+        // 8 GiB for the matrix, plus headroom for the driver's own allocations.
+        require_gpu_cap!(vram: total * 4 + (2 << 30), &dev);
+
+        let mut d_y = dev.alloc_zeros::<f32>(total).unwrap();
+        // mc[c] = c + 1 against an all-zero Y, so a corrected element reads
+        // -(col + 1) and an untouched one reads exactly 0.0.
+        let d_mc = dev.htod_copy(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let d_sigma = dev.htod_copy(&[2.0f32; K]).unwrap();
+
+        gpu_mean_correct_colmajor_strided(&dev, &mut d_y, &d_mc, m, K, 0, m).unwrap();
+        gpu_scale_columns(&dev, &mut d_y, &d_sigma, m, K).unwrap();
+        // Launches are async, so a wrapped index surfaces here rather than
+        // above — this `unwrap` is load-bearing, not ceremony. Against the
+        // pre-fix kernels it is what fires (CUDA_ERROR_ILLEGAL_ADDRESS).
+        dev.synchronize().unwrap();
+
+        // Sentinels spanning all four columns and straddling the 2^31 index:
+        // flat 1<<31 and the final element are the two a 32-bit `idx` could not
+        // address even if the count were right.
+        for flat in [0usize, m + 7, 2 * m, 1usize << 31, total - 1] {
+            let col = flat / m;
+            let expected = -2.0 * (col + 1) as f32;
+            let got = dev
+                .stream()
+                .memcpy_dtov(&d_y.slice(flat..flat + 1))
+                .unwrap()[0];
+            assert_eq!(
+                got, expected,
+                "element {flat} (col {col}) reads {got}, expected {expected} — \
+                 0.0 means the kernel returned without touching the matrix",
             );
         }
     }

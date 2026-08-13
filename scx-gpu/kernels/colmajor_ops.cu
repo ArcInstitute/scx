@@ -20,21 +20,31 @@
 // through a contiguous shard temporary.
 //
 // total threads = shard_rows × k
+//
+// 64-BIT INDEXING (review §8.4): shard_rows × k exceeds 2^31 at census scale
+// (36M cells × k=60 = 2.16e9), and the resident PCA path passes shard_rows =
+// n_obs. With `int total` that product is a signed overflow — UB, so the
+// manifestation is nvcc's choice, and measured at 2^31+256 elements it is an
+// illegal memory access from threads whose `idx` wrapped negative. Past 2^32
+// the host's u32 block count silently under-launches instead. Either way the
+// PCA runs uncentered despite zero_center=True. `global_row` and `ld` are
+// 64-bit for the same reason: they address the global (n_obs × k) buffer.
+// Matches `spmm_mean_correct.cu`, the row-major sibling.
 extern "C" __global__ void mean_correct_colmajor_strided_kernel(
     float* __restrict__ Y,           // [ld × k], col-major; full matrix
     const float* __restrict__ mc,    // [k]
-    int shard_rows,
-    int k,
-    int global_row,
-    int ld
+    long long shard_rows,
+    long long k,
+    long long global_row,
+    long long ld
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = shard_rows * k;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = shard_rows * k;
     if (idx >= total) return;
 
-    int col = idx / shard_rows;
-    int row = idx % shard_rows;
-    long long flat = (long long)col * (long long)ld + (long long)global_row + (long long)row;
+    long long col = idx / shard_rows;
+    long long row = idx % shard_rows;
+    long long flat = col * ld + global_row + row;
     Y[flat] -= mc[col];
 }
 
@@ -115,46 +125,11 @@ extern "C" __global__ void column_sum_kernel(
     }
 }
 
-// Select the top-k eigenvectors (in descending eigenvalue order) from an
-// ascending-ordered (n × n) column-major eigenvector matrix, writing them
-// into an (n × k) column-major output.
-//
-// src: (n × n) col-major eigvecs, eigenvalues ascending by column index.
-// dst: (n × k) col-major, column j of dst ← column (n-1-j) of src.
-//
-// Element (row, col=j) in dst corresponds to (row, src_col = n-1-j) in src.
-// total threads = n × k
-extern "C" __global__ void select_top_eigvecs_desc_kernel(
-    const float* __restrict__ src,   // [n × n], col-major
-    float* __restrict__ dst,         // [n × k], col-major
-    int n,
-    int k
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = n * k;
-    if (idx >= total) return;
-
-    int col = idx / n;           // output column 0..k
-    int row = idx % n;
-    int src_col = n - 1 - col;   // descending: largest first
-
-    dst[col * n + row] = src[src_col * n + row];
-}
-
-// Copy the last `k` entries of a length-`n` vector into a length-`k` output
-// in reversed order — i.e. out[j] = in[n - 1 - j] for j in [0, k).
-//
-// total threads = k
-extern "C" __global__ void reverse_tail_vec_kernel(
-    const float* __restrict__ src,   // [n]
-    float* __restrict__ dst,         // [k]
-    int n,
-    int k
-) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= k) return;
-    dst[j] = src[n - 1 - j];
-}
+// `select_top_eigvecs_desc_kernel` and `reverse_tail_vec_kernel` lived here.
+// Both were the tail of the GPU covariance-PCA path and had no host caller left
+// after it was removed; the first carried the same 32-bit `total = n * k` /
+// `dst[col * n + row]` overflow as its neighbours (review §8.4). Deleted rather
+// than widened — a dead broken kernel is worth less than the diff to fix it.
 
 // Broadcast-scale each column of a col-major matrix by a scalar.
 //
@@ -164,17 +139,24 @@ extern "C" __global__ void reverse_tail_vec_kernel(
 // s: [k] per-column scale factors
 //
 // total threads = m × k
+//
+// 64-BIT INDEXING (review §8.4): `m` is n_obs here — this kernel writes the
+// final PCA embedding U·Σ — so m × k passes 2^31 around 43M cells at 50
+// components, leaving the embedding columns unscaled by their singular values.
+// A 32-bit `total` overflows a signed int (UB; measured as an illegal memory
+// access, see the test), and a 32-bit `idx` could not address the buffer past
+// 2^31 even if the count were right.
 extern "C" __global__ void scale_columns_kernel(
     float* __restrict__ U,           // [m × k], col-major, in-place
     const float* __restrict__ s,     // [k]
-    int m,
-    int k
+    long long m,
+    long long k
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = m * k;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = m * k;
     if (idx >= total) return;
 
-    int col = idx / m;
+    long long col = idx / m;
     U[idx] *= s[col];
 }
 
@@ -247,19 +229,24 @@ extern "C" __global__ void col_clip_sq_nonzeros_kernel(
 // sum_q: [k]
 //
 // total threads = n_vars × k
+//
+// 64-bit for the same reason as its neighbours (review §8.4). n_vars × k is
+// ~3e6 on today's inputs, so this one is defence-in-depth rather than a live
+// failure — but it is the identical defect, and a gene axis is not bounded by
+// anything in the format.
 extern "C" __global__ void outer_sub_kernel(
     float* __restrict__ Z,           // [n_vars × k], col-major
     const float* __restrict__ mu,    // [n_vars]
     const float* __restrict__ sum_q, // [k]
-    int n_vars,
-    int k
+    long long n_vars,
+    long long k
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = n_vars * k;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = n_vars * k;
     if (idx >= total) return;
 
-    int col = idx / n_vars;
-    int row = idx % n_vars;
+    long long col = idx / n_vars;
+    long long row = idx % n_vars;
 
     Z[idx] -= mu[row] * sum_q[col];
 }

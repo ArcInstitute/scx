@@ -43,6 +43,9 @@ pub const REQUIRE_NVCOMP_ENV: &str = "SCX_REQUIRE_NVCOMP";
 /// Set to `1` to turn "cuVS not loadable" from a skip into a panic.
 pub const REQUIRE_CUVS_ENV: &str = "SCX_REQUIRE_CUVS";
 
+/// Set to `1` to turn "not enough free VRAM" from a skip into a panic.
+pub const REQUIRE_LARGE_VRAM_ENV: &str = "SCX_REQUIRE_LARGE_VRAM";
+
 /// Prefix of the line printed when a gate declines to run a test.
 ///
 /// The harness greps for it to report what a GPU-node run did *not* cover, so a
@@ -97,6 +100,48 @@ pub fn capability_or_skip(cap: &str, env_var: &str, available: bool, what: &str)
         "{env_var}=1 but {cap} is not available for {what}"
     );
     eprintln!("{SKIP_MARKER}: {what} — {cap} not available");
+    false
+}
+
+/// Gate on **free VRAM**, for the handful of tests whose whole point is a
+/// buffer past a 32-bit index boundary. `false` means the caller should `return`.
+///
+/// These cannot be shrunk: an 8 GiB allocation is the smallest launch that
+/// reaches 2³¹ f32 elements, which is the only size at which the overflow being
+/// tested exists at all. A small card is a real deployment state, so it skips
+/// and *reports* — but a run that means to cover the case says so with
+/// [`REQUIRE_LARGE_VRAM_ENV`] and gets a hard failure instead.
+///
+/// # Panics
+///
+/// When `SCX_REQUIRE_LARGE_VRAM=1` and the device has less free VRAM than
+/// `need_bytes`, or when free VRAM cannot be queried at all.
+pub fn vram_or_skip(dev: &GpuDevice, need_bytes: usize, what: &str) -> bool {
+    let free = match dev.free_memory() {
+        Ok((free, _total)) => free,
+        Err(e) => {
+            assert!(
+                !strict(REQUIRE_LARGE_VRAM_ENV),
+                "{REQUIRE_LARGE_VRAM_ENV}=1 but free VRAM could not be queried for {what}: {e}"
+            );
+            eprintln!("{SKIP_MARKER}: {what} — free VRAM unknown ({e})");
+            return false;
+        }
+    };
+    if free >= need_bytes {
+        return true;
+    }
+    assert!(
+        !strict(REQUIRE_LARGE_VRAM_ENV),
+        "{REQUIRE_LARGE_VRAM_ENV}=1 but {what} needs {} MiB free VRAM and only {} MiB is free",
+        need_bytes / (1 << 20),
+        free / (1 << 20)
+    );
+    eprintln!(
+        "{SKIP_MARKER}: {what} — needs {} MiB free VRAM, {} MiB available",
+        need_bytes / (1 << 20),
+        free / (1 << 20)
+    );
     false
 }
 

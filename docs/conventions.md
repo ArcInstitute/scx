@@ -186,6 +186,17 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
 - CUDA kernels compiled via `cc` build script (`build.rs`).
 - GPU decoders must produce bit-identical output to the scalar CPU
   reference.
+- **64-bit flat indexing.** A kernel that indexes a flat matrix computes its
+  element total *and* its flat index in 64-bit (`long long` parameters, with the
+  `(long long)` cast applied to `blockIdx.x` before the multiply);
+  `kernels/spmm_mean_correct.cu` is the reference shape. Host wrappers size 1-D
+  grids through `scx_gpu::flat_launch_1d`, never `(total as u32).div_ceil(...)`.
+  Both halves are required: a 32-bit `int total = m * k` overflows past 2³¹
+  elements — signed overflow, so UB, and what nvcc emits at `-O3` is threads
+  whose index wrapped negative writing below the buffer — while a `u32` block
+  count truncates the grid past 2³² elements and silently skips the tail with no
+  error at all. `n_obs × n_comps` crosses 2³¹ around 36M cells, which the GPU
+  PCA VRAM pre-flight admits on an 80 GB H100.
 - GDS requires local NVMe + nvidia-fs drivers + ext4/XFS filesystem;
   always falls back to the CPU path.
 - In-VRAM GPU analysis (PCA, kNN, UMAP, preprocessing) routes through

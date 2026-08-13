@@ -11,6 +11,7 @@ use std::sync::Arc;
 use cudarc::driver::safe::{
     CudaContext, CudaModule, CudaSlice, CudaStream, DeviceRepr, ValidAsZeroBits,
 };
+use cudarc::driver::LaunchConfig;
 use cudarc::nvrtc::Ptx;
 
 use crate::error::GpuError;
@@ -364,9 +365,98 @@ impl Drop for GpuDevice {
     }
 }
 
+/// 1-D launch geometry for a flat, one-thread-per-element kernel.
+///
+/// `total` is counted in `u64` — never `usize as u32` — and the block count is
+/// checked against the CUDA `grid_dim.x` cap **before** the cast, so a matrix
+/// past 2³¹ elements errors instead of silently launching a truncated grid.
+///
+/// This exists because the truncating form is invisible: `(total as u32)` on a
+/// matrix of 2³² + 1000 elements yields a grid four blocks wide, the kernel
+/// returns having touched the first thousand elements, and the caller gets a
+/// partly-transformed matrix with no error to attribute it to (review §8.4).
+///
+/// This is only the host half. The kernel's own element count and flat index
+/// must be 64-bit too — a 32-bit `int total = m * k` overflows a step earlier,
+/// at 2³¹, and being signed overflow it is UB rather than a defined wrap — so
+/// widening the grid alone buys nothing. See `spmm_mean_correct.cu` for the
+/// reference shape.
+///
+/// `total == 0` resolves to an empty grid rather than an error; callers still
+/// short-circuit earlier to skip the module load.
+///
+/// # Errors
+///
+/// [`GpuError::ShapeMismatch`] when `total / threads` exceeds `i32::MAX`, the
+/// driver's maximum `grid_dim.x`.
+pub fn flat_launch_1d(total: u64, threads: u32) -> Result<LaunchConfig, GpuError> {
+    debug_assert!(threads > 0, "flat_launch_1d: block size must be non-zero");
+    let blocks = total.div_ceil(threads as u64);
+    if blocks > i32::MAX as u64 {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!("total / {threads} <= 2^31 - 1 (CUDA grid_dim.x cap)"),
+            got: format!("total = {total} needs {blocks} blocks"),
+        });
+    }
+    Ok(LaunchConfig {
+        grid_dim: (blocks as u32, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grid a flat kernel is launched with must cover **every** element.
+    ///
+    /// The failure this pins is not a crash: `(total as u32).div_ceil(threads)`
+    /// truncates the element count, the kernel is handed far too few threads,
+    /// and the tail of the matrix is simply never visited — no error anywhere.
+    /// It bites past 2³², so the first two cases below pass either way and are
+    /// here to bound the regression from the other side; the last two are what
+    /// goes red against the truncating form. `36M × 60` is a real census-scale
+    /// PCA shape (`n_obs × k`), just under the u32 boundary.
+    #[test]
+    fn a_flat_grid_covers_every_element_past_2_31() {
+        for total in [
+            (1u64 << 31) + 1,              // past the signed-int wrap
+            36_000_000u64 * 60,            // 36 M cells × k=60 = 2.16e9
+            (1u64 << 32) + 1000,           // past the u32 wrap
+            (u32::MAX as u64 + 1) * 3 / 2, // 1.5 × u32::MAX
+        ] {
+            let threads = 256u32;
+            let cfg = flat_launch_1d(total, threads).expect("geometry must resolve");
+            let covered = cfg.grid_dim.0 as u64 * cfg.block_dim.0 as u64;
+            assert!(
+                covered >= total,
+                "grid covers {covered} threads but {total} elements need visiting",
+            );
+        }
+    }
+
+    /// Past the CUDA `grid_dim.x` cap the answer is an error, never a grid that
+    /// silently wrapped into range.
+    #[test]
+    fn a_flat_grid_past_the_grid_dim_cap_is_rejected() {
+        let threads = 256u32;
+        let total = (i32::MAX as u64 + 1) * threads as u64;
+        let err = flat_launch_1d(total, threads).expect_err("must not launch past the cap");
+        assert!(
+            matches!(err, GpuError::ShapeMismatch { .. }),
+            "expected ShapeMismatch, got {err}"
+        );
+    }
+
+    /// Zero elements resolve to an empty grid rather than an error — the
+    /// wrappers all short-circuit before calling, and this keeps the helper
+    /// honest for any that forget to.
+    #[test]
+    fn a_flat_grid_of_zero_elements_is_empty() {
+        let cfg = flat_launch_1d(0, 256).expect("zero is not an error");
+        assert_eq!(cfg.grid_dim.0, 0);
+    }
 
     /// An out-of-memory driver failure must stay typed as one no matter which
     /// cudarc call produced it.
