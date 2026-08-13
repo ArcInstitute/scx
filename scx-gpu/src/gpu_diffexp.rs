@@ -1819,7 +1819,8 @@ fn gpu_de_force_atomic_pseudobulk() -> bool {
 /// `[chunk_max]` `tie_term`/`u_or_rank`/`p_values` scalars). None is a per-op constant,
 /// so multiplying this whole value by the chunk size is correct, not an over-count.
 pub fn gpu_de_per_gene_scratch_bytes(
-    n_pool_max: usize,
+    n_slab: usize,
+    n_aux: usize,
     n_ref: usize,
     n_g_max: usize,
     n_test: usize,
@@ -1827,8 +1828,14 @@ pub fn gpu_de_per_gene_scratch_bytes(
 ) -> usize {
     let p2 = |x: usize| x.max(1).next_power_of_two();
     // f32 (4 bytes): slab + aux + ref_slab + group_slab + per_tg_pool (×n_test).
-    let f32_elems = n_pool_max
-        .saturating_add(n_pool_max)
+    //
+    // `n_slab` and `n_aux` are separate because they diverge: the slab is
+    // whatever `GpuDeChunkScratch::new` was given, while aux is 0 unless some
+    // sort reaches the multi-tile path ([`gpu_de_aux_span`]). They were one
+    // argument charged twice, which billed every fast-path caller for an aux
+    // buffer `gpu_de_aux_elems` no longer allocates.
+    let f32_elems = n_slab
+        .saturating_add(n_aux)
         .saturating_add(p2(n_ref))
         .saturating_add(p2(n_g_max))
         .saturating_add(n_test.saturating_mul(p2(n_g_max)));

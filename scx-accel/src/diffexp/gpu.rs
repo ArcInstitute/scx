@@ -576,9 +576,10 @@ fn wilcoxon_rank_sum_gpu_dispatch(
 /// Pre-condition: `scratch.ref_slab[..sz * pool_len]` and, for each non-empty
 /// test group, `scratch.per_tg_pool_slabs[tg_idx][..sz * n_g]` are populated;
 /// `scratch.u_or_rank` / `scratch.tie_term` / per-group slabs pre-grown by the
-/// caller. `scratch.slab_aux` must hold `chunk_max × max(pool_len, n_g_max)`
-/// f32 keys whenever that exceeds `GPU_DE_BLOCK_SORT_CAPACITY` (below it no
-/// sort here touches aux at all) — **both** sorts below feed it, the pool's and
+/// caller. `scratch.slab_aux` must hold
+/// `chunk_max × gpu_de_aux_span(max(pool_len, n_g_max))` f32 keys — the span is
+/// per-gene, and is 0 at or below `GPU_DE_BLOCK_SORT_CAPACITY`, where no sort
+/// here touches aux at all. **Both** sorts below feed it, the pool's and
 /// (ref-mode) each test group's, so a reference smaller than the largest test
 /// group is governed by the group. See `scx_gpu::gpu_de_aux_elems` for the one
 /// expression that decides this. Empty test groups (`n_g == 0`)
@@ -967,6 +968,7 @@ fn pdex_ref_gpu_chunked_v3_csr(
         dev,
         chunk_size,
         n_pool_max,
+        n_pool_max,
         n_ref,
         n_g_max,
         n_test,
@@ -983,6 +985,7 @@ fn pdex_ref_gpu_chunked_v3_csr(
         clamp_chunk_to_de_budget(
             dev,
             chunk_size,
+            n_pool_max,
             n_pool_max,
             n_ref,
             n_g_max,
@@ -1403,6 +1406,7 @@ fn pdex_ref_gpu_chunked_v3_csc(
     let chunk_size = clamp_chunk_to_de_budget(
         dev,
         chunk_size,
+        n_pool_max,
         n_pool_max,
         n_ref,
         n_g_max,
@@ -1930,11 +1934,11 @@ where
     // 0 unless some sort actually reaches the multi-tile path, since budgeting
     // for a buffer that is never allocated only shrinks the chunk. `n_slots`
     // sizes the f64 sums.
-    let budget_pool = pool_len.max(scx_gpu::gpu_de_aux_span(n_sorted_max)).max(1);
     let chunk_size = clamp_chunk_to_de_budget(
         dev,
         chunk_size,
-        budget_pool,
+        pool_len.max(1),
+        n_sorted_max,
         pool_len.max(1),
         n_g_max,
         n_test,
@@ -2307,14 +2311,14 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
         .map(|&g| group_indices[g].len())
         .max()
         .unwrap_or(0);
-    // Must match the core's `budget_pool`, or residency is decided against a
+    // Must match the core's arguments, or residency is decided against a
     // different working set than the core then allocates.
     let n_sorted_max = pool_len.max(n_g_max).max(1);
-    let budget_pool = pool_len.max(scx_gpu::gpu_de_aux_span(n_sorted_max)).max(1);
     let probe_chunk = probe_de_gene_chunk(
         dev,
         chunk_size,
-        budget_pool,
+        pool_len.max(1),
+        n_sorted_max,
         pool_len.max(1),
         n_g_max,
         n_test,
@@ -2334,7 +2338,8 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
         clamp_chunk_to_de_budget(
             dev,
             chunk_size,
-            budget_pool,
+            pool_len.max(1),
+            n_sorted_max,
             pool_len.max(1),
             n_g_max,
             n_test,
@@ -2450,17 +2455,28 @@ fn open_device(device_id: usize) -> Result<GpuDevice> {
 /// budget fraction of free VRAM. Logs when it clamps; errors with an
 /// actionable, dimension-naming message when even the minimum chunk can't fit,
 /// rather than letting `per_tg_pool_slabs` OOM with a raw CUDA error (B8).
+#[allow(clippy::too_many_arguments)]
 fn clamp_chunk_to_de_budget(
     dev: &GpuDevice,
     requested_chunk: usize,
-    n_pool_max: usize,
+    n_slab: usize,
+    n_sorted_max: usize,
     n_ref: usize,
     n_g_max: usize,
     n_test: usize,
     n_slots: usize,
 ) -> Result<usize> {
-    let per_gene =
-        scx_gpu::gpu_de_per_gene_scratch_bytes(n_pool_max, n_ref, n_g_max, n_test, n_slots);
+    // Aux is charged only when a sort can actually reach the multi-tile path;
+    // `gpu_de_aux_elems` allocates nothing below it, so billing for it here
+    // would shrink the gene chunk to reserve a buffer that never exists.
+    let per_gene = scx_gpu::gpu_de_per_gene_scratch_bytes(
+        n_slab,
+        scx_gpu::gpu_de_aux_span(n_sorted_max),
+        n_ref,
+        n_g_max,
+        n_test,
+        n_slots,
+    );
     let (chunk, fits) = scx_gpu::gpu_de_budget_gene_chunk(dev, requested_chunk, per_gene);
     if !fits {
         return Err(AccelError::LinAlg(format!(
@@ -2560,17 +2576,28 @@ fn try_resident_csr(
 /// twice per call, which reads as a bug. When even the minimum chunk will not
 /// fit, this returns the requested size and lets the real clamp raise the
 /// actionable error a few lines later.
+#[allow(clippy::too_many_arguments)]
 fn probe_de_gene_chunk(
     dev: &GpuDevice,
     requested_chunk: usize,
-    n_pool_max: usize,
+    n_slab: usize,
+    n_sorted_max: usize,
     n_ref: usize,
     n_g_max: usize,
     n_test: usize,
     n_slots: usize,
 ) -> usize {
-    let per_gene =
-        scx_gpu::gpu_de_per_gene_scratch_bytes(n_pool_max, n_ref, n_g_max, n_test, n_slots);
+    // Aux is charged only when a sort can actually reach the multi-tile path;
+    // `gpu_de_aux_elems` allocates nothing below it, so billing for it here
+    // would shrink the gene chunk to reserve a buffer that never exists.
+    let per_gene = scx_gpu::gpu_de_per_gene_scratch_bytes(
+        n_slab,
+        scx_gpu::gpu_de_aux_span(n_sorted_max),
+        n_ref,
+        n_g_max,
+        n_test,
+        n_slots,
+    );
     let (chunk, fits) = scx_gpu::gpu_de_budget_gene_chunk(dev, requested_chunk, per_gene);
     if fits {
         chunk
