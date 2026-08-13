@@ -1801,10 +1801,15 @@ fn gpu_de_force_atomic_pseudobulk() -> bool {
 
 /// Device-scratch bytes consumed *per gene column* of a DE chunk, matching the
 /// chunk-linear allocations of the v3 drivers (`GpuDeChunkScratch::new` + the
-/// `ensure_*_capacity` grow calls). `next_power_of_two` mirrors the slab grow
-/// rounding so this is an upper bound, not an under-count.
+/// `ensure_*_capacity` grow calls). `next_power_of_two` mirrors the *span*
+/// rounding those grow calls apply.
 ///
-/// - `n_pool_max` — base `slab` + ping-pong `aux` capacity (f32, ×2 terms)
+/// - `n_slab`     — base `slab`, as handed to [`GpuDeChunkScratch::new`] (f32)
+/// - `n_aux`      — ping-pong `aux` (f32). **Separate from `n_slab`**, and
+///   usually [`gpu_de_aux_span`] of the loop's largest sort, which is 0 on the
+///   single-tile fast path. These were one argument charged twice until the two
+///   diverged: `gpu_de_aux_elems` stopped allocating aux below
+///   [`GPU_DE_BLOCK_SORT_CAPACITY`] while the budget kept billing for it.
 /// - `n_ref`      — `ref_slab` (f32)
 /// - `n_g_max`    — `group_slab` (f32) **and** the dominant `per_tg_pool_slabs`
 ///   (f32, ×`n_test`)
@@ -1818,6 +1823,13 @@ fn gpu_de_force_atomic_pseudobulk() -> bool {
 /// `sums` is `[n_slots × chunk_max]` via `ensure_sums_capacity`; the `+3` covers the
 /// `[chunk_max]` `tie_term`/`u_or_rank`/`p_values` scalars). None is a per-op constant,
 /// so multiplying this whole value by the chunk size is correct, not an over-count.
+///
+/// **Known under-count, pre-existing (review §8.13):** `n_aux` is the only term
+/// whose allocation rounds the *product* rather than the span —
+/// `ensure_aux_capacity` takes an already-multiplied `chunk × span` and applies
+/// `next_power_of_two` to that, so the real buffer can be up to 2× what this
+/// charges. A per-gene model cannot express it; fixing it means rounding the
+/// span instead, or making the clamp iterate against the candidate chunk.
 pub fn gpu_de_per_gene_scratch_bytes(
     n_slab: usize,
     n_aux: usize,
@@ -1877,9 +1889,11 @@ pub fn gpu_de_aux_span(n_per_gene_max: usize) -> usize {
 /// aux built for the pool and fails with `ShapeMismatch`.
 ///
 /// Kept next to [`gpu_de_per_gene_scratch_bytes`] because the two must agree:
-/// that function charges `n_pool_max` elements per gene for this buffer, so a
-/// caller passing a larger `n_per_gene_max` here than it passed as
-/// `n_pool_max` there has a VRAM budget that under-counts what it allocates.
+/// that function's `n_aux` is the per-gene charge for this same buffer, so pass
+/// it [`gpu_de_aux_span`] of the *same* `n_per_gene_max` used here. A caller
+/// that widens one and not the other gets a VRAM budget that disagrees with
+/// what it allocates — in one direction an under-count, in the other a chunk
+/// shrunk to reserve a buffer that is never created.
 pub fn gpu_de_aux_elems(chunk_size: usize, n_per_gene_max: usize) -> Result<usize, GpuError> {
     match gpu_de_aux_span(n_per_gene_max) {
         0 => Ok(0),

@@ -1929,11 +1929,12 @@ where
 
     // Clamp the gene chunk so the per-target-group pool slabs (the dominant
     // `n_test × chunk × n_g_max` allocation) fit a budget fraction of free VRAM
-    // (B8). The model's first argument charges for the `slab` (sized `pool_len`
-    // below) *and* the aux buffer, so it takes whichever is larger — and aux is
-    // 0 unless some sort actually reaches the multi-tile path, since budgeting
-    // for a buffer that is never allocated only shrinks the chunk. `n_slots`
-    // sizes the f64 sums.
+    // (B8). `pool_len` is the `slab` (sized the same below) and `n_sorted_max`
+    // is the largest sort, from which the wrapper derives the aux charge via
+    // `gpu_de_aux_span` — 0 unless some sort actually reaches the multi-tile
+    // path, since budgeting for a buffer that is never allocated only shrinks
+    // the chunk. They are separate arguments precisely so neither has to stand
+    // in for the other. `n_slots` sizes the f64 sums.
     let chunk_size = clamp_chunk_to_de_budget(
         dev,
         chunk_size,
