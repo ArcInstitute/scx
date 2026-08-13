@@ -73,8 +73,9 @@ impl HvgProjection {
     ///
     /// 1. the geometry unit tests below, which have no file behind them and so
     ///    no meaningful `n_vars`;
-    /// 2. the multimodal branch of `TrainingPipeline::new`, which fans one panel
-    ///    across modalities of differing widths — see the comment there.
+    /// 2. the `LoaderConfig::shared_hvg_panel` branch of `TrainingPipeline::new`,
+    ///    for the one caller that fans a single panel across modalities of
+    ///    differing widths — see that field's docs for why.
     ///
     /// Everything else must go through [`HvgProjection::new`]. Keeping the
     /// bypass a *named* function rather than an `if` around the check is the

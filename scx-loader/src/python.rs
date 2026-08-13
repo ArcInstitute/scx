@@ -1088,10 +1088,10 @@ impl IndexPlanDataset {
     /// Args:
     ///     path: Path to the .scx file.
     ///     hvg_indices: Gene indices for HVG projection. None = all genes.
-    ///         Every index must be < n_vars (the selected modality's
-    ///         n_vars when `modality=` or the multimodal fallback is in
-    ///         play); an out-of-range index is rejected at construction
-    ///         rather than becoming an always-zero output column.
+    ///         Every index must be < n_vars; an out-of-range index is
+    ///         rejected at construction rather than becoming an
+    ///         always-zero output column. This class has no modality
+    ///         surface — the bound is always the file-wide n_vars.
     ///     obs_columns: Obs metadata column names to include in each batch.
     ///     normalize: Apply total-count normalization (default: True).
     ///     log1p: Apply ln(x+1) to each row (default: True). Independent of
