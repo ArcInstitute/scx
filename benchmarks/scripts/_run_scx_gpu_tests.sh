@@ -41,12 +41,21 @@ echo "=== preflight: $(nvidia-smi -L | wc -l) device(s) visible ==="
 echo
 
 export SCX_REQUIRE_GPU=1
+# Default the free-VRAM gate ON, for the same reason SCX_REQUIRE_GPU is on: this
+# job holds a whole H100 via --gres=gpu:1, so the ~10 GiB of headroom the >2^31
+# indexing test needs is a property of the allocation, not a gamble. Left opt-in,
+# the ONE test that can observe the 2^31 kernel overflow could quietly skip on a
+# fragmented card and the suite would still go green — which is exactly the
+# silence this harness exists to remove. Override with SCX_REQUIRE_LARGE_VRAM=0
+# when running on a smaller or shared GPU.
+export SCX_REQUIRE_LARGE_VRAM=${SCX_REQUIRE_LARGE_VRAM:-1}
 echo "SCX_REQUIRE_GPU=1 — a GPU test that cannot open a device is a FAILURE here,"
-echo "not a skip. Optional-library skips (nvcomp, cuVS) and free-VRAM skips are"
-echo "still allowed and are listed in the summary below; set SCX_REQUIRE_NVCOMP=1"
-echo "/ SCX_REQUIRE_CUVS=1 / SCX_REQUIRE_LARGE_VRAM=1 to make those hard"
-echo "requirements too. Those three pass through from the submitting environment."
-echo "  SCX_REQUIRE_LARGE_VRAM=${SCX_REQUIRE_LARGE_VRAM:-<unset>}"
+echo "not a skip. SCX_REQUIRE_LARGE_VRAM=${SCX_REQUIRE_LARGE_VRAM} — likewise for the"
+echo "tests that need a multi-GiB allocation to reach a 32-bit index boundary."
+echo "Optional-library skips (nvcomp, cuVS) are still allowed and are listed in the"
+echo "summary below; set SCX_REQUIRE_NVCOMP=1 / SCX_REQUIRE_CUVS=1 to make those"
+echo "hard requirements too. All of these pass through from the submitting"
+echo "environment."
 echo
 
 LOG_DIR=$(mktemp -d)
@@ -117,9 +126,9 @@ if [[ -n "${SKIPPED}" ]]; then
     echo "${SKIPPED}"
     echo
     echo "  $(printf '%s\n' "${SKIPPED}" | wc -l) test(s) skipped. Under SCX_REQUIRE_GPU=1 a device"
-    echo "  gate cannot skip, so these are optional-library gates (nvcomp, cuVS) or"
-    echo "  free-VRAM gates — coverage this node did not provide, not tests that"
-    echo "  stopped existing."
+    echo "  gate cannot skip, and under SCX_REQUIRE_LARGE_VRAM=1 neither can a"
+    echo "  free-VRAM gate, so these are optional-library gates (nvcomp, cuVS) —"
+    echo "  coverage this node did not provide, not tests that stopped existing."
 else
     echo "(none — every GPU test executed)"
 fi

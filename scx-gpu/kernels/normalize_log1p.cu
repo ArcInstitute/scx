@@ -93,11 +93,17 @@ extern "C" __global__ void log1p_kernel(
 // factor is supplied. `factors` is a global per-row vector indexed in the
 // source's iteration row order; `row_offset` is this shard's first global
 // row, so one device factor vector serves every shard in a streamed source.
+// `row_offset` is `long long` (review §8.4): `factors` is indexed in the
+// *global* obs row space, so `row_offset + row` is an n_obs-scale quantity even
+// though each shard's `n_rows` is small. Promoting only the addition would have
+// left the value truncating at the parameter boundary instead — the host would
+// still have had to cap `row_offset` at i32::MAX for the kernel to be safe,
+// which is a cap on the obs axis with no reason to exist.
 extern "C" __global__ void row_scale_kernel(
     const long long* __restrict__ indptr,
     float* __restrict__ data,
     int n_rows,
-    int row_offset,
+    long long row_offset,
     const float* __restrict__ factors
 ) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -106,12 +112,7 @@ extern "C" __global__ void row_scale_kernel(
     long long start = indptr[row];
     long long end = indptr[row + 1];
 
-    // 64-bit global row id (review §8.4): `factors` is indexed in the *global*
-    // obs row space, so `row_offset + row` is an n_obs-scale quantity even
-    // though each shard's `n_rows` is small. The host already refuses a
-    // row_offset past i32::MAX (`gpu_preprocess.rs`); this makes the kernel
-    // correct on its own terms rather than by the caller's grace.
-    float factor = factors[(long long)row_offset + row];
+    float factor = factors[row_offset + row];
     for (long long i = start; i < end; i++) {
         data[i] *= factor;
     }

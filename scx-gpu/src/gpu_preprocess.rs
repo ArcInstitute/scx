@@ -227,11 +227,9 @@ pub(crate) fn apply_fused_ops_with_tier(
                 factors.len()
             )));
         }
-        let row_offset_i32: i32 = row_offset.try_into().map_err(|_| {
-            GpuError::InvalidShard(format!(
-                "row_scale row_offset {row_offset} exceeds i32::MAX"
-            ))
-        })?;
+        // `row_scale_kernel` takes `row_offset` as `long long`, so there is no
+        // i32 cap to enforce here — the length guard above is the real bound.
+        let row_offset_i64 = row_offset as i64;
         let func = module
             .load_function("row_scale_kernel")
             .map_err(|e| GpuError::KernelLaunchFailed(format!("row_scale_kernel: {e}")))?;
@@ -241,7 +239,7 @@ pub(crate) fn apply_fused_ops_with_tier(
                 .arg(indptr)
                 .arg(&mut *data)
                 .arg(&n_rows_i32)
-                .arg(&row_offset_i32)
+                .arg(&row_offset_i64)
                 .arg(factors)
                 .launch(cfg)
         }

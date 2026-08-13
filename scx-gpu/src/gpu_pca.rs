@@ -1090,10 +1090,7 @@ mod tests {
         for flat in [0usize, m + 7, 2 * m, 1usize << 31, total - 1] {
             let col = flat / m;
             let expected = -2.0 * (col + 1) as f32;
-            let got = dev
-                .stream()
-                .memcpy_dtov(&d_y.slice(flat..flat + 1))
-                .unwrap()[0];
+            let got = dev.stream().clone_dtoh(&d_y.slice(flat..flat + 1)).unwrap()[0];
             assert_eq!(
                 got, expected,
                 "element {flat} (col {col}) reads {got}, expected {expected} — \

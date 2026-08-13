@@ -388,9 +388,17 @@ impl Drop for GpuDevice {
 /// # Errors
 ///
 /// [`GpuError::ShapeMismatch`] when `total / threads` exceeds `i32::MAX`, the
-/// driver's maximum `grid_dim.x`.
+/// driver's maximum `grid_dim.x`, or when `threads` is zero. The zero check is
+/// a real check rather than a `debug_assert!`: this returns a `Result` and is
+/// re-exported from the crate root, and in a release build the assert would
+/// vanish and leave `div_ceil` to panic with a bare divide-by-zero instead.
 pub fn flat_launch_1d(total: u64, threads: u32) -> Result<LaunchConfig, GpuError> {
-    debug_assert!(threads > 0, "flat_launch_1d: block size must be non-zero");
+    if threads == 0 {
+        return Err(GpuError::ShapeMismatch {
+            expected: "threads > 0 (CUDA block_dim.x)".into(),
+            got: "threads = 0".into(),
+        });
+    }
     let blocks = total.div_ceil(threads as u64);
     if blocks > i32::MAX as u64 {
         return Err(GpuError::ShapeMismatch {
@@ -456,6 +464,18 @@ mod tests {
     fn a_flat_grid_of_zero_elements_is_empty() {
         let cfg = flat_launch_1d(0, 256).expect("zero is not an error");
         assert_eq!(cfg.grid_dim.0, 0);
+    }
+
+    /// A zero *block size* is an `Err`, not a panic — the check has to survive
+    /// a release build, where a `debug_assert!` would be compiled out and
+    /// `div_ceil` would divide by zero instead. Found by **gemini-code-assist**.
+    #[test]
+    fn a_zero_block_size_is_rejected_not_panicked_on() {
+        let err = flat_launch_1d(1024, 0).expect_err("zero threads must not launch");
+        assert!(
+            matches!(err, GpuError::ShapeMismatch { .. }),
+            "expected ShapeMismatch, got {err}"
+        );
     }
 
     /// An out-of-memory driver failure must stay typed as one no matter which
