@@ -7,13 +7,21 @@
 //! reported as [`GpuError::InvalidShard`] rather than a `debug_assert!` that
 //! vanishes in release builds.
 //!
-//! Both layouts go through the same three scanners so the two cannot drift:
-//! `gpu_shard_source::validate_shard_for_gpu_de` for row-major CSR and
-//! [`validate_csc_shard_for_gpu`] for the column-major
-//! sidecar. Before this module existed only the CSR path validated, so the
+//! Two validators sit on top of the scanners:
+//! `gpu_shard_source::validate_shard_for_gpu_de` for row-major CSR, and
+//! [`validate_csc_shard_for_gpu`] for the column-major sidecar. They share the
+//! scan **implementations** — so the ordering, the parallel threshold and the
+//! choice of which offender gets named cannot drift between layouts — but they
+//! do **not** run the same set: CSR runs [`first_unsorted_major`] and
+//! [`first_non_finite`]; CSC runs those plus [`first_out_of_range`]. CSR has
+//! never range-checked its minor-axis (column) indices and this module does not
+//! add one — its kernels bound the column window themselves, and the shard
+//! decoder already rejects an out-of-range minor index on either layout.
+//!
+//! Before this module existed only the CSR path validated at all, so the
 //! CSC-direct DE route — the *default* whenever a CSC sidecar is present —
-//! staged NaN, duplicate `(cell, gene)` pairs and out-of-range cell ids
-//! straight into the kernels (review §8.3).
+//! staged NaN and duplicate `(cell, gene)` pairs straight into the kernels
+//! (review §8.3).
 //!
 //! ## Determinism
 //!

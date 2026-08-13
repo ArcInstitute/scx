@@ -975,6 +975,86 @@ fn test_gpu_de_csc_pseudobulk_smem_and_atomic_parity() {
     }
 }
 
+/// §8.3: the CSC kernels dereference `cell_to_group[row_indices[e]]` /
+/// `cell_to_pos[...]` with no device-side bound on the table itself, and
+/// nothing compared the two `n_obs` values involved — the DE drivers size those
+/// tables from their `groups` argument while the shard source takes `n_obs`
+/// from the file. Both launch wrappers now refuse a table that does not cover
+/// the shard's `n_obs`, before any kernel is dispatched.
+///
+/// **Its red cannot be watched.** Removing the guard does not make this test
+/// fail cleanly — the launch proceeds with a short table and reads out of
+/// bounds on the device, which poisons the CUDA context for every test after
+/// it in the process. The success arm at the end is what rules out the fixture
+/// being rejected for some unrelated reason.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn test_csc_launch_wrappers_reject_an_undersized_cell_table() {
+    let dev = require_gpu!();
+    let n_obs = 8usize;
+    let n_cols = 2usize;
+
+    let d_col_indptr = dev.htod_copy(&[0i64, 1, 2]).unwrap();
+    let d_row_indices = dev.htod_copy(&[0i32, 1]).unwrap();
+    let d_data = dev.htod_copy(&[1.0f32, 2.0]).unwrap();
+    let view = csc_view_fixture(&d_col_indptr, &d_row_indices, &d_data, n_obs, n_cols);
+
+    // Half the rows the shard is entitled to name.
+    let short = dev.alloc_zeros::<i32>(n_obs / 2).unwrap();
+    let full = dev.alloc_zeros::<i32>(n_obs).unwrap();
+    let mut d_sums = dev.alloc_zeros::<f64>(n_cols).unwrap();
+    let mut d_slab = dev.alloc_zeros::<f32>(n_cols * n_obs).unwrap();
+
+    let err =
+        gpu_de_pseudobulk_csc_direct(&dev, &view, &short, &mut d_sums, 0, n_cols, n_cols, 1, 0)
+            .unwrap_err();
+    assert!(
+        matches!(err, GpuError::ShapeMismatch { .. }),
+        "pseudobulk with a short cell_to_group: got {err:?}"
+    );
+
+    let err = gpu_de_scatter_csc_to_gene_major(
+        &dev,
+        &view,
+        &short,
+        &full,
+        0,
+        &mut d_slab,
+        0,
+        n_cols,
+        n_cols,
+        n_obs,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, GpuError::ShapeMismatch { .. }),
+        "scatter with a short cell_to_group: got {err:?}"
+    );
+
+    // cell_to_pos is checked too, not only cell_to_group.
+    let err = gpu_de_scatter_csc_to_gene_major(
+        &dev,
+        &view,
+        &full,
+        &short,
+        0,
+        &mut d_slab,
+        0,
+        n_cols,
+        n_cols,
+        n_obs,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, GpuError::ShapeMismatch { .. }),
+        "scatter with a short cell_to_pos: got {err:?}"
+    );
+
+    // Premise: tables that do cover `n_obs` are accepted and the kernel runs.
+    gpu_de_pseudobulk_csc_direct(&dev, &view, &full, &mut d_sums, 0, n_cols, n_cols, 1, 0).unwrap();
+    dev.synchronize().unwrap();
+}
+
 /// Build a `GpuCscShardView` spanning columns `[0, n_cols)` from device buffers
 /// for a single-shard test fixture.
 fn csc_view_fixture<'a>(
