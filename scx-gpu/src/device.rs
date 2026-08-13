@@ -32,13 +32,44 @@ use crate::gpu_graph::GpuGraphCache;
 /// CUDA fault. Found by **codex** on PR #422, which traced the disguise from
 /// `htod_copy` through to `to_gpu_anndata`'s fallback.
 ///
-/// `CUDA_ERROR_OUT_OF_MEMORY` (code 2) is the only code special-cased; every
-/// other driver failure stays a `CudaError`.
+/// `CUDA_ERROR_OUT_OF_MEMORY` is the only code special-cased; every other driver
+/// failure stays a `CudaError`.
 fn classify_driver_error(context: &str, e: cudarc::driver::DriverError) -> GpuError {
-    if e.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {
-        GpuError::OutOfMemory(format!("{context}: {e}"))
+    // `e.to_string()` is what forces the driver library to load: `DriverError`'s
+    // Display calls `cuGetErrorString`. Rendering here, and passing the finished
+    // string down, is what lets the decision be tested on a host with no CUDA
+    // driver at all — see `classify_driver_status`.
+    classify_driver_status(context, e.0 as u32, &e.to_string())
+}
+
+/// The driver status code for an out-of-memory failure.
+///
+/// Spelled as a literal rather than read from `cudarc::driver::sys` at run time,
+/// because *touching* that enum's `Display` path dlopens `libcuda`. The
+/// `const _` below pins the literal to cudarc's own value at **compile** time,
+/// so a renumbering upstream is a build error on every host — including the
+/// driverless CI runners, which is exactly where a runtime lookup could not go.
+const CUDA_ERROR_OUT_OF_MEMORY_CODE: u32 = 2;
+
+const _: () = assert!(
+    cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY as u32 == CUDA_ERROR_OUT_OF_MEMORY_CODE,
+    "cudarc renumbered CUDA_ERROR_OUT_OF_MEMORY; update CUDA_ERROR_OUT_OF_MEMORY_CODE"
+);
+
+/// The classification decision, over a plain status code and an already-rendered
+/// message.
+///
+/// Split out from [`classify_driver_error`] so it can be tested without a CUDA
+/// driver present. The first version of this test constructed a synthetic
+/// `DriverError` and passed locally — on a host that happens to have `libcuda`
+/// — while panicking on CI, because formatting the error is what loads the
+/// library. A test for a pure decision should not need a driver, and now does
+/// not.
+fn classify_driver_status(context: &str, code: u32, rendered: &str) -> GpuError {
+    if code == CUDA_ERROR_OUT_OF_MEMORY_CODE {
+        GpuError::OutOfMemory(format!("{context}: {rendered}"))
     } else {
-        GpuError::CudaError(format!("{context}: {e}"))
+        GpuError::CudaError(format!("{context}: {rendered}"))
     }
 }
 
@@ -337,18 +368,21 @@ impl Drop for GpuDevice {
 mod tests {
     use super::*;
 
-    /// An out-of-memory driver error must stay typed as one no matter which
+    /// An out-of-memory driver failure must stay typed as one no matter which
     /// cudarc call produced it.
     ///
-    /// `DriverError` is a public tuple over `CUresult`, so this exercises the
-    /// real mapping on a CPU host — no device needed, and no reliance on
-    /// `GpuError::OutOfMemory` being constructed by hand, which is exactly the
-    /// gap that let `htod_copy` report an OOM as a generic `CudaError`.
+    /// Drives `classify_driver_status` with the raw code rather than building a
+    /// `DriverError`: formatting one calls `cuGetErrorString`, which dlopens
+    /// `libcuda`. The first version of this test did build one, passed here,
+    /// and panicked on CI's driverless runner. The code being a real
+    /// `CUDA_ERROR_OUT_OF_MEMORY` is pinned by the `const _` assertion beside
+    /// the constant — by the compiler, on every host, rather than by this test.
     #[test]
     fn a_driver_oom_is_classified_as_out_of_memory() {
-        let e = classify_driver_error(
+        let e = classify_driver_status(
             "host-to-device copy failed",
-            cudarc::driver::DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY),
+            CUDA_ERROR_OUT_OF_MEMORY_CODE,
+            "out of memory",
         );
         assert!(
             matches!(e, GpuError::OutOfMemory(_)),
@@ -361,10 +395,9 @@ mod tests {
 
     #[test]
     fn a_non_oom_driver_error_stays_a_cuda_error() {
-        let e = classify_driver_error(
-            "host-to-device copy failed",
-            cudarc::driver::DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE),
-        );
+        // 1 == CUDA_ERROR_INVALID_VALUE. Any non-OOM code will do; the point is
+        // that the carve-out is narrow rather than swallowing everything.
+        let e = classify_driver_status("host-to-device copy failed", 1, "invalid argument");
         assert!(matches!(e, GpuError::CudaError(_)), "got {e}");
         // A generic driver fault is still worth another route (that is what
         // makes the OOM carve-out meaningful rather than vacuous).
