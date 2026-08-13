@@ -189,29 +189,7 @@ pub(crate) fn project_batch_columns(
     })
 }
 
-/// Whether a failed in-VRAM CSR assembly should fall through to
-/// `to_gpu_anndata`'s host-assemble path instead of failing the call (§8.10).
-///
-/// Two conditions, and the second is the interesting one:
-///
-/// * The device must have failed, not the input
-///   ([`scx_accel::GpuError::is_runtime_failure`]). A malformed shard is
-///   rejected identically by the host decode, so falling through would only
-///   re-derive the same error one full materialization later.
-/// * **Not** an out-of-memory failure. Both arms end with the same CSR
-///   resident on the device, so host-assemble cannot conjure the VRAM — it
-///   would pay a full host materialization to arrive at its own `>VRAM`
-///   pre-flight and raise anyway. Excluding it keeps the fast, accurate error.
-///
-/// What is left is the class host-assemble genuinely survives: a module that
-/// will not load (a PTX-stub build), a decode kernel launch failure, an
-/// nvcomp/library problem. None of those touch the host decode path.
-#[cfg(feature = "gpu")]
-fn device_decode_falls_back(e: &scx_accel::GpuError) -> bool {
-    e.is_runtime_failure() && !matches!(e, scx_accel::GpuError::OutOfMemory(_))
-}
-
-/// Fault-injection hook for the host-assemble fallback above.
+/// Fault-injection hook for the host-assemble fallback below.
 ///
 /// `SCX_FORCE_DEVICE_DECODE_FAILURE=1` makes the in-VRAM decode report a
 /// module-load failure — the realistic trigger, since a build whose PTX did not
@@ -1585,7 +1563,12 @@ impl PyExperiment {
                         // different road. Take it rather than failing the call —
                         // the realistic trigger is a module that will not load
                         // (a stub-PTX build), which host-assemble does not touch.
-                        Err(e) if device_decode_falls_back(&e) => {
+                        //
+                        // `alternate_route_may_succeed` is what excludes an
+                        // out-of-memory failure (both roads end with the same
+                        // CSR in the same VRAM) and an input defect (the host
+                        // decode rejects the same shard). See its doc.
+                        Err(e) if e.alternate_route_may_succeed() => {
                             warn_device_decode_fallback(py, &e);
                             // The partial device buffers are dropped by now, but
                             // cudarc frees into a memory pool that keeps them

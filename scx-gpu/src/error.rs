@@ -90,6 +90,26 @@ impl GpuError {
             | GpuError::UnsupportedLayout(_) => false,
         }
     }
+
+    /// Whether producing the same result by a **different route to the same
+    /// device** could succeed.
+    ///
+    /// [`Self::is_runtime_failure`] minus out-of-memory. A module that will not
+    /// load, a kernel launch failure, a library problem — another route (decode
+    /// on the host, then upload) does not go near any of those. A memory
+    /// shortfall is different in kind: every route still has to land the same
+    /// bytes in the same VRAM, so an alternative can only buy a slower trip to
+    /// the same error, and with a worse message than the one already in hand.
+    ///
+    /// Used by `Experiment.to_gpu_anndata` to decide whether a failed in-VRAM
+    /// shard decode falls through to host-assemble. Note this is *not* the
+    /// question a GPU→CPU fallback would ask — a CPU kernel needs no VRAM at
+    /// all, so out-of-memory would belong on its "yes" side. There is no such
+    /// fallback: `device="auto"` resolves the device before the op starts and
+    /// raises on a runtime failure rather than re-running on CPU.
+    pub fn alternate_route_may_succeed(&self) -> bool {
+        self.is_runtime_failure() && !matches!(self, GpuError::OutOfMemory(_))
+    }
 }
 
 /// Turn a device-side failure while building an *optional* accelerator into a
@@ -195,6 +215,37 @@ mod tests {
         use scx_format_io::PrefetchError;
         let e = GpuError::prefetch_internal("decode worker panicked".to_string());
         assert!(!e.is_runtime_failure());
+    }
+
+    /// The out-of-memory carve-out is a design decision, not an oversight, and
+    /// nothing else records it: both routes to the device end with the same CSR
+    /// resident in the same VRAM, so an alternative route cannot fix a
+    /// shortfall — it can only pay a full host materialization to fail again.
+    #[test]
+    fn out_of_memory_is_the_one_device_failure_no_alternate_route_survives() {
+        let oom = GpuError::OutOfMemory(s());
+        assert!(oom.is_runtime_failure());
+        assert!(!oom.alternate_route_may_succeed());
+    }
+
+    #[test]
+    fn other_device_failures_admit_an_alternate_route() {
+        for e in [
+            // The realistic trigger: a build whose PTX did not compile bakes
+            // empty stubs that fail here, and the host decode is untouched.
+            GpuError::ModuleLoadError(s()),
+            GpuError::KernelLaunchFailed(s()),
+            GpuError::CudaError(s()),
+            GpuError::LibraryNotFound(s()),
+        ] {
+            assert!(e.alternate_route_may_succeed(), "{e}");
+        }
+    }
+
+    #[test]
+    fn an_input_defect_admits_no_alternate_route() {
+        assert!(!GpuError::InvalidShard(s()).alternate_route_may_succeed());
+        assert!(!GpuError::UnsupportedLayout(s()).alternate_route_may_succeed());
     }
 
     #[test]
