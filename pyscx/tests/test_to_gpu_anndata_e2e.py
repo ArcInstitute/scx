@@ -35,9 +35,19 @@ pytestmark = pytest.mark.skipif(
 def scx1_scx(tmp_path):
     """A small framed Scx1 SCX file that decodes fully in VRAM.
 
-    Small integer UMI-like counts (``poisson(2.0)``, median ~2) auto-route to the
-    Scx1 codec, the only codec with GPU decode kernels. The default framed (v4)
-    layout decodes group-by-group in VRAM (``decode_framed_scx1_gpu``).
+    Small integer UMI-like counts (``poisson(2.0)``, median ~2). The framed (v4)
+    layout decodes group-by-group in VRAM (``decode_framed_scx1_gpu``); Scx1 is
+    the only codec with GPU decode kernels.
+
+    ``codec="scx1"`` is **explicit, and must stay explicit.** This fixture used
+    to rely on ``codec="auto"`` picking Scx1 from the median-≤-8 heuristic, but
+    ``auto`` is cost-aware now and adopts ``ShufDeltaZstd`` whenever it comes out
+    ≥5% smaller — which it does here (``scx info`` reports ``Codec: shufdelta``).
+    A ShufDeltaZstd shard host-bounces, so every assertion below about in-VRAM
+    decode silently became untestable. The `accel_to_gpu_anndata` benchmark
+    already forces ``--codec scx1`` for exactly this reason; this fixture had not
+    caught up. A test whose premise is "these shards are Scx1" must not leave the
+    codec to a heuristic that is free to change.
 
     NB: do *not* reuse ``conftest.py::synthetic_adata`` here — its
     ``randint(0, 200)`` values (median ~100) route to Zstd, which host-bounces.
@@ -51,7 +61,7 @@ def scx1_scx(tmp_path):
     adata = anndata.AnnData(X=sp.csr_matrix(dense))
 
     path = str(tmp_path / "scx1.scx")
-    pyscx.from_anndata(adata, path)  # codec="auto" → framed Scx1
+    pyscx.from_anndata(adata, path, codec="scx1")
     return path
 
 
@@ -127,7 +137,12 @@ def test_device_decode_fallback_is_off_by_default(scx1_scx):
 
     assert "SCX_FORCE_DEVICE_DECODE_FAILURE" not in os.environ
     meta = pyscx.open(scx1_scx).to_gpu_anndata().uns["scx_accel"]["to_gpu_anndata"]
-    assert meta["transfer_mode"] == "scx_device_decode_gpu"
+    # The fast path ran. Asserted as "not host-assemble" rather than as a
+    # specific device-decode mode: which of the two fast-path modes you get
+    # depends on the shard codec, and this test is about the knob, not the
+    # codec. `test_to_gpu_anndata_decode_gpu_transfer_mode` is what pins the
+    # fully-in-VRAM mode.
+    assert meta["transfer_mode"] != "scx_device_handoff"
     assert meta["fallback_reason"] == "none"
 
 
