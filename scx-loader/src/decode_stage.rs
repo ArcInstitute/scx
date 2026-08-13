@@ -964,7 +964,7 @@ mod tests {
         let cell_indices: Vec<u64> = vec![0, 1, 2, 3];
 
         // Project to genes [0, 1, 4, 5]
-        let proj = HvgProjection::new(vec![0, 1, 4, 5]);
+        let proj = HvgProjection::new_unchecked(vec![0, 1, 4, 5]);
         let n_output = proj.n_output_cols();
 
         let x = fill_batch_parallel(
@@ -1520,7 +1520,7 @@ mod tests {
             shards: vec![shard],
         };
 
-        let proj = HvgProjection::new(vec![0, 1, 4]);
+        let proj = HvgProjection::new_unchecked(vec![0, 1, 4]);
         let n_output = proj.n_output_cols();
 
         let config = LoaderConfig {
@@ -1726,7 +1726,7 @@ mod tests {
         };
         let four_alpha = 4.0; // α = 1 (pinned)
         let panel: Vec<u32> = vec![0, 1, 2, 3]; // strict subset of 10 genes
-        let proj = HvgProjection::new(panel.clone());
+        let proj = HvgProjection::new_unchecked(panel.clone());
         let n_output = proj.n_output_cols();
 
         let config = LoaderConfig {

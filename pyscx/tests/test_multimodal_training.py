@@ -243,3 +243,108 @@ def test_training_dataset_explicit_modality_kwarg(cite_seq_path):
     assert ds.n_vars == rna_n_vars
     assert ds.n_obs == n_obs
     ds.close()
+
+
+def test_hvg_indices_are_not_range_checked_on_a_shared_multimodal_panel(
+    cite_seq_path,
+):
+    """`MultimodalTrainingDataset` alone skips the HVG range check.
+
+    Everything else — `TrainingDataset` and `IndexPlanDataset` — rejects an
+    `hvg_indices` entry `>= n_vars`, because it matches no column and yields
+    an output feature that is silently always zero. `MultimodalTrainingDataset`
+    cannot: it fans one panel across every selected modality and they have
+    different widths, so an RNA-sized panel would be rejected outright by this
+    fixture's 8-feature ADT modality.
+
+    This test pins that decision. Without it the opt-out in
+    `TrainingPipeline::new` reads as dead code and a later cleanup would
+    silently re-enable the check, turning working multimodal calls into
+    errors. `docs/training.md` documents the trade-off for users.
+
+    The companion test below pins the *other* half: the opt-out is keyed to
+    this one caller, not to "a modality is selected".
+    """
+    import pyscx
+
+    path, n_obs, rna_n_vars, adt_n_vars = cite_seq_path
+    assert adt_n_vars < rna_n_vars  # the panel below is OOR for adt only
+
+    panel = np.array([0, 5, rna_n_vars - 1], dtype=np.uint32)
+
+    ds = pyscx.MultimodalTrainingDataset(
+        path,
+        modalities=["rna", "adt"],
+        batch_size=16,
+        hvg_indices=panel,
+        normalize=False,
+        log1p=False,
+        seed=42,
+    )
+    batch = next(iter(ds))
+    # Both modalities report the panel width.
+    assert batch["X"]["rna"].shape[1] == len(panel)
+    assert batch["X"]["adt"].shape[1] == len(panel)
+    # Panel entries 0 and 5 are real adt features; entry 49 is past its 8, so
+    # that column is the silently-always-zero one this bypass permits. Assert
+    # both halves — an all-zero adt block would pass the dead-column check
+    # while proving nothing about the projection.
+    adt = batch["X"]["adt"]
+    assert np.any(adt[:, :2]), "in-range adt columns should carry data"
+    assert not np.any(adt[:, 2]), "the out-of-range column is always zero"
+    ds.close()
+
+
+def test_modality_scoped_training_dataset_still_range_checks_hvg(cite_seq_path):
+    """A *scoped* `TrainingDataset` is checked — the opt-out is not `modality_id`.
+
+    Keying the opt-out on "a modality is selected" would have been the obvious
+    implementation and is wrong: `TrainingDataset(path, modality="adt")` and the
+    implicit alphabetically-first fallback both set `modality_id`, yet each has
+    exactly one panel and one unambiguous `n_vars`. Under that keying every
+    multimodal `TrainingDataset` silently kept the dead-zero-column behaviour
+    while the docs promised it was rejected.
+
+    Both entry points are asserted because they reach `modality_id` by different
+    routes (explicit kwarg vs. fallback), and only one of them warns.
+    """
+    import pyscx
+
+    path, _n_obs, rna_n_vars, adt_n_vars = cite_seq_path
+    panel = np.array([0, 5, rna_n_vars - 1], dtype=np.uint32)  # OOR for adt
+
+    # Explicit modality=.
+    with pytest.raises(RuntimeError, match="out of range"):
+        pyscx.TrainingDataset(
+            path,
+            modality="adt",
+            batch_size=16,
+            hvg_indices=panel,
+            normalize=False,
+            log1p=False,
+        )
+
+    # Implicit fallback: no modality= on a multimodal file resolves the
+    # alphabetically-first modality, which here is "adt".
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(RuntimeError, match="out of range"):
+            pyscx.TrainingDataset(
+                path,
+                batch_size=16,
+                hvg_indices=panel,
+                normalize=False,
+                log1p=False,
+            )
+
+    # And a panel that IS in range for the scoped modality still builds.
+    ds = pyscx.TrainingDataset(
+        path,
+        modality="adt",
+        batch_size=16,
+        hvg_indices=np.array([0, adt_n_vars - 1], dtype=np.uint32),
+        normalize=False,
+        log1p=False,
+    )
+    assert ds.n_output_genes == 2
+    ds.close()

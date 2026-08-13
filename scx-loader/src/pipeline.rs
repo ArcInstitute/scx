@@ -106,6 +106,25 @@ pub struct LoaderConfig {
     /// with this filter (the per-shard bitmap keys reference the global
     /// shard index, not the per-modality index).
     pub modality_id: Option<u8>,
+    /// Opt out of the `hvg_indices` range check against `n_vars`.
+    ///
+    /// Set **only** by `MultimodalTrainingDataset`, which fans one panel across
+    /// every selected modality (one `TrainingPipeline` each). Those modalities
+    /// have different widths — RNA ~33k, ADT ~100 — so a single shared panel
+    /// cannot be in range for all of them, and range-checking it would reject
+    /// an ordinary CITE-seq call outright. The cost of the opt-out is the
+    /// behaviour [`crate::projection::HvgProjection::new`] exists to prevent:
+    /// an index past a given modality's width yields an output column that is
+    /// silently always zero for that modality.
+    ///
+    /// This is deliberately **not** keyed on `modality_id`. A modality id means
+    /// "this pipeline reads one modality's shards", which is also true of
+    /// `TrainingDataset(path, modality="adt")` and of the implicit
+    /// alphabetically-first fallback `TrainingDataset` takes on a multimodal
+    /// file. Those have exactly one panel and one unambiguous `n_vars`, so the
+    /// shared-panel argument does not apply to them and they are checked like
+    /// any single-modality loader. Default `false`.
+    pub shared_hvg_panel: bool,
 }
 
 impl Default for LoaderConfig {
@@ -125,6 +144,7 @@ impl Default for LoaderConfig {
             max_memory_mb: 512,
             auto_memory_budget: false,
             modality_id: None,
+            shared_hvg_panel: false,
         }
     }
 }
@@ -603,6 +623,28 @@ impl TrainingPipeline {
             )
         };
 
+        // HVG projection, built here rather than just before it is stored: the
+        // memory budget below derives `n_output_genes` from `hvg_indices.len()`
+        // (`adaptive_budget_mb`, then `compute_memory_budget`), so validating
+        // later would let an out-of-range panel size the budget first.
+        let projection = match &config.hvg_indices {
+            // Range-checked — the default, including every modality-*scoped*
+            // loader. An index >= n_vars matches no CSR column on either scatter
+            // path, so it becomes an output column that is always exactly zero:
+            // a dead input feature that trains to a zero weight and is never
+            // diagnosed. `n_vars` here is already the per-modality width when a
+            // modality is selected, so the bound is the right one to check.
+            Some(idxs) if !config.shared_hvg_panel => {
+                Some(HvgProjection::new(idxs.clone(), n_vars)?)
+            }
+            // Deliberately NOT range-checked, for the one caller that shares a
+            // single panel across modalities of differing widths — see
+            // `LoaderConfig::shared_hvg_panel` for why, and `docs/training.md`
+            // for the user-facing statement of the trade-off.
+            Some(idxs) => Some(HvgProjection::new_unchecked(idxs.clone())),
+            None => None,
+        };
+
         // v4 PFlog: resolve α once. `None` ⇒ estimate over the raw CSR shards
         // (single-modality only — modality-scoped estimation isn't wired, and a
         // whole-file `BackedCsrReader` on a multimodal file would pool every
@@ -758,12 +800,6 @@ impl TrainingPipeline {
                 n_vars,
             );
         }
-
-        // Create HVG projection if configured
-        let projection = config
-            .hvg_indices
-            .as_ref()
-            .map(|indices| HvgProjection::new(indices.clone()));
 
         // Create shard shuffler
         let shuffler =

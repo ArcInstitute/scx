@@ -186,13 +186,18 @@ pub fn write_dense_scx1_fixture(
     path.to_path_buf()
 }
 
+/// Gene count of [`write_known_multinnz_fixture`]'s output. Exported so a test
+/// can range-check its HVG panel against the same number the fixture wrote,
+/// rather than repeating the literal.
+pub const KNOWN_MULTINNZ_N_VARS: u64 = 64;
+
 /// Build a fixture where every row has nonzeros at the **same known** genes
 /// (`2, 7, 33, 58`) with strictly-positive values. Because the columns are
 /// fixed, a test can choose an HVG panel that captures some-but-not-all of a
 /// row's mass and know exactly that the panel-local depth is strictly below the
 /// full-transcriptome depth — the condition under which the L2 panel-local
 /// normalize bug would diverge from the correct (full-depth) result. `n_vars`
-/// is 64 (> the max gene id, 58).
+/// is [`KNOWN_MULTINNZ_N_VARS`] (> the max gene id, 58).
 pub fn write_known_multinnz_fixture(
     path: &std::path::Path,
     n_obs: usize,
@@ -200,7 +205,7 @@ pub fn write_known_multinnz_fixture(
 ) -> std::path::PathBuf {
     assert!(n_obs % n_shards == 0, "n_obs must divide n_shards");
     const GENES: [u32; 4] = [2, 7, 33, 58];
-    let n_vars: usize = 64;
+    let n_vars: usize = KNOWN_MULTINNZ_N_VARS as usize;
     let rows_per_shard = n_obs / n_shards;
     let nnz_per_row = GENES.len();
 

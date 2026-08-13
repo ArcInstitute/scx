@@ -9,6 +9,8 @@
 //! scattered into the dense output tensor, only HVG columns get a write.
 //! This avoids materializing intermediate projected CSR data.
 
+use crate::error::LoaderError;
+
 const DENSE_REMAP_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// HVG gene projection for the training data loader.
@@ -29,11 +31,56 @@ pub struct HvgProjection {
 }
 
 impl HvgProjection {
-    /// Create a new HVG projection from a list of gene indices.
+    /// Create a new HVG projection, validating every index against the file's
+    /// gene count.
     ///
     /// The input `gene_indices` are sorted and deduplicated. Each unique gene
     /// index is mapped to a contiguous output position `[0..n_hvg)`.
-    pub fn new(gene_indices: Vec<u32>) -> Self {
+    ///
+    /// # Why this is the only checked constructor
+    ///
+    /// An index `>= n_vars` matches no CSR column on either scatter path — the
+    /// dense remap takes `dense_remap.get(idx) -> None -> continue`, the
+    /// merge-scan simply never finds it — so the projected batch carries a
+    /// column that is **always exactly zero**. Nothing downstream can tell that
+    /// apart from a gene that happens to be silent, so it becomes a dead input
+    /// feature that trains to a zero weight and is never diagnosed. That is why
+    /// the check lives here and not in the callers: `IndexPlanLoader` had it and
+    /// `TrainingPipeline` did not, and the divergence was invisible from either
+    /// side.
+    ///
+    /// An empty panel is valid and yields `n_output_cols() == 0`.
+    ///
+    /// # Errors
+    ///
+    /// [`LoaderError::ConfigError`] when any index is `>= n_vars`, or when
+    /// `n_vars` itself exceeds `u32::MAX` (HVG indices are `u32`).
+    pub fn new(gene_indices: Vec<u32>, n_vars: u64) -> Result<Self, LoaderError> {
+        let n_vars_u32: u32 = u32::try_from(n_vars).map_err(|_| LoaderError::ConfigError {
+            reason: format!("n_vars={n_vars} exceeds u32::MAX; HVG indices use u32"),
+        })?;
+        if let Some(&bad) = gene_indices.iter().find(|&&i| i >= n_vars_u32) {
+            return Err(LoaderError::ConfigError {
+                reason: format!("HVG index {bad} is out of range (n_vars={n_vars})"),
+            });
+        }
+        Ok(Self::new_unchecked(gene_indices))
+    }
+
+    /// Build a projection **without** the `n_vars` range check.
+    ///
+    /// Two callers, both deliberate:
+    ///
+    /// 1. the geometry unit tests below, which have no file behind them and so
+    ///    no meaningful `n_vars`;
+    /// 2. the `LoaderConfig::shared_hvg_panel` branch of `TrainingPipeline::new`,
+    ///    for the one caller that fans a single panel across modalities of
+    ///    differing widths — see that field's docs for why.
+    ///
+    /// Everything else must go through [`HvgProjection::new`]. Keeping the
+    /// bypass a *named* function rather than an `if` around the check is the
+    /// point: every site that skips validation is one grep away.
+    pub(crate) fn new_unchecked(gene_indices: Vec<u32>) -> Self {
         Self::new_with_dense_remap_limit(gene_indices, DENSE_REMAP_MAX_BYTES)
     }
 
@@ -293,10 +340,91 @@ pub fn pflog_row_full(
 mod tests {
     use super::*;
 
+    // ----- Range validation (`new` vs `new_unchecked`) --------------------
+    //
+    // An out-of-range index is invisible downstream — `scatter_row` skips it on
+    // both paths and the batch simply carries an always-zero column — so these
+    // assert on the constructor, which is the only place the difference exists.
+
+    /// The boundary is `>= n_vars`, not `> n_vars`: on a 50-gene file, index 50
+    /// is already out of range. This is the exact off-by-one that reached the
+    /// `TrainingPipeline` path as a silent dead feature column.
+    #[test]
+    fn new_rejects_an_index_equal_to_n_vars() {
+        // `let Err(..) else` rather than `unwrap_err()`: the Ok type holds a
+        // dense remap that can reach 8 MiB, and unwrap_err would need Debug on
+        // it and dump the whole thing on failure.
+        let Err(err) = HvgProjection::new(vec![0, 1, 50], 50) else {
+            panic!("index 50 must be rejected on a 50-gene file");
+        };
+        let msg = err.to_string();
+        // The wording is load-bearing: `IndexPlanLoader`'s pre-existing Rust and
+        // Python tests assert against this exact string, and they were left
+        // unmodified so that they witness the hoist preserving behaviour.
+        assert!(
+            msg.contains("HVG index 50")
+                && msg.contains("out of range")
+                && msg.contains("n_vars=50"),
+            "unexpected message: {msg}"
+        );
+        assert!(matches!(err, LoaderError::ConfigError { .. }));
+    }
+
+    #[test]
+    fn new_rejects_an_index_far_past_n_vars() {
+        let Err(err) = HvgProjection::new(vec![0, 1, 99_999], 50) else {
+            panic!("index 99999 must be rejected on a 50-gene file");
+        };
+        assert!(err.to_string().contains("HVG index 99999"));
+    }
+
+    /// The last valid index must still be accepted — a check written as `>`
+    /// instead of `>=` passes the rejection tests above while silently costing
+    /// the file its final gene, so both halves of the boundary are pinned.
+    #[test]
+    fn new_accepts_the_last_valid_index() {
+        let proj = HvgProjection::new(vec![0, 49], 50).unwrap();
+        assert_eq!(proj.n_output_cols(), 2);
+    }
+
+    /// An empty panel is valid on both loader paths today (`n_output_genes` is
+    /// 0 on each), so hoisting the check must not start rejecting it.
+    #[test]
+    fn new_accepts_an_empty_panel_even_on_an_empty_file() {
+        assert_eq!(HvgProjection::new(vec![], 0).unwrap().n_output_cols(), 0);
+        assert_eq!(HvgProjection::new(vec![], 50).unwrap().n_output_cols(), 0);
+    }
+
+    /// `n_vars` beyond `u32::MAX` cannot be compared against `u32` indices, so
+    /// it is refused rather than silently truncated into a wrong bound.
+    #[test]
+    fn new_rejects_an_n_vars_past_u32_max() {
+        let Err(err) = HvgProjection::new(vec![0], u32::MAX as u64 + 1) else {
+            panic!("an n_vars past u32::MAX must be rejected");
+        };
+        assert!(
+            err.to_string().contains("exceeds u32::MAX"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// Validation is the *only* thing `new` adds: sort, dedup and the resulting
+    /// output width must be identical to the unchecked path, since both loaders
+    /// already agreed on that behaviour before the hoist.
+    #[test]
+    fn new_matches_new_unchecked_apart_from_the_range_check() {
+        let panel = vec![20u32, 5, 100, 5, 50];
+        let checked = HvgProjection::new(panel.clone(), 101).unwrap();
+        let unchecked = HvgProjection::new_unchecked(panel);
+        assert_eq!(checked.n_output_cols(), unchecked.n_output_cols());
+        assert_eq!(checked.gene_indices, unchecked.gene_indices);
+        assert_eq!(checked.dense_remap, unchecked.dense_remap);
+    }
+
     #[test]
     fn test_projection_3_of_30k() {
         // Project 3 genes out of a 30K gene space
-        let proj = HvgProjection::new(vec![100, 500, 29999]);
+        let proj = HvgProjection::new_unchecked(vec![100, 500, 29999]);
         assert_eq!(proj.n_output_cols(), 3);
 
         // CSR row with values at various columns, including the 3 HVG genes
@@ -314,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_non_hvg_values_not_written() {
-        let proj = HvgProjection::new(vec![5, 10]);
+        let proj = HvgProjection::new_unchecked(vec![5, 10]);
         let csr_indices: Vec<i32> = vec![0, 3, 5, 7, 10, 15];
         let csr_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut output = vec![0.0f32; 2];
@@ -327,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_output_column_indices_correctly_remapped() {
-        let proj = HvgProjection::new(vec![20, 5, 100, 50]);
+        let proj = HvgProjection::new_unchecked(vec![20, 5, 100, 50]);
         // After sort+dedup: [5, 20, 50, 100]
         assert_eq!(proj.n_output_cols(), 4);
         assert!(proj.uses_dense_remap());
@@ -364,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_empty_hvg_set_all_zeros() {
-        let proj = HvgProjection::new(vec![]);
+        let proj = HvgProjection::new_unchecked(vec![]);
         assert_eq!(proj.n_output_cols(), 0);
 
         let csr_indices: Vec<i32> = vec![0, 1, 2];
@@ -377,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_gene_indices_deduplicated() {
-        let proj = HvgProjection::new(vec![5, 5, 10, 10, 10, 20]);
+        let proj = HvgProjection::new_unchecked(vec![5, 5, 10, 10, 10, 20]);
         assert_eq!(proj.n_output_cols(), 3); // only 3 unique: [5, 10, 20]
 
         let csr_indices: Vec<i32> = vec![5, 10, 20];
@@ -391,7 +519,7 @@ mod tests {
 
     #[test]
     fn test_no_matching_genes_in_csr_row() {
-        let proj = HvgProjection::new(vec![100, 200, 300]);
+        let proj = HvgProjection::new_unchecked(vec![100, 200, 300]);
         // CSR row has no genes matching the HVG set
         let csr_indices: Vec<i32> = vec![0, 1, 50, 99];
         let csr_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
@@ -404,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_all_csr_genes_are_hvg() {
-        let proj = HvgProjection::new(vec![0, 1, 2, 3, 4]);
+        let proj = HvgProjection::new_unchecked(vec![0, 1, 2, 3, 4]);
         let csr_indices: Vec<i32> = vec![0, 1, 2, 3, 4];
         let csr_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let mut output = vec![0.0f32; 5];
@@ -418,7 +546,7 @@ mod tests {
     fn test_dense_remap_handles_sparse_row_and_out_of_range_non_hvg() {
         let mut genes: Vec<u32> = (0..2000).collect();
         genes.push(29_999);
-        let proj = HvgProjection::new(genes);
+        let proj = HvgProjection::new_unchecked(genes);
         assert_eq!(proj.n_output_cols(), 2001);
         assert!(proj.uses_dense_remap());
 
@@ -577,7 +705,7 @@ mod tests {
         let (idx, data) = sparsify(&full);
         let four_alpha = 4.0;
         let panel = vec![1u32, 2, 5, 7]; // strict subset
-        let proj = HvgProjection::new(panel.clone());
+        let proj = HvgProjection::new_unchecked(panel.clone());
         assert!(proj.uses_dense_remap());
 
         let mut out = vec![0.0f32; proj.n_output_cols()];
@@ -630,7 +758,7 @@ mod tests {
         let (idx, data) = sparsify(&full);
         let four_alpha = 4.0;
         let panel = vec![1u32, 2, 5, 7];
-        let proj = HvgProjection::new(panel.clone());
+        let proj = HvgProjection::new_unchecked(panel.clone());
 
         let mut out = vec![0.0f32; proj.n_output_cols()];
         proj.scatter_pflog_row(&idx, &data, four_alpha, full.len(), &mut out);

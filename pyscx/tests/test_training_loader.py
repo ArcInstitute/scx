@@ -28,6 +28,38 @@ class TestTrainingDatasetConstruction:
         ds = pyscx.TrainingDataset(scx_path, hvg_indices=hvg)
         assert ds.n_output_genes == 5
 
+    def test_hvg_out_of_range_rejected_at_construction(self, scx_path):
+        """Mirror of the IndexPlanDataset test of the same name.
+
+        An index >= n_vars matches no column, so before this was checked the
+        batch simply carried an output feature that was always exactly zero —
+        a dead input that trains to a zero weight and is never diagnosed.
+        """
+        with pytest.raises(RuntimeError, match="out of range"):
+            pyscx.TrainingDataset(
+                scx_path,
+                hvg_indices=np.array([0, 1, 99999], dtype=np.uint32),
+            )
+
+    def test_hvg_index_equal_to_n_vars_rejected(self, scx_path):
+        """The boundary: on a 50-gene file, index 50 is already out of range.
+
+        This is the realistic way to trip it — a panel built against a file
+        with one more gene, not a wild 99999.
+        """
+        with pytest.raises(RuntimeError, match="out of range"):
+            pyscx.TrainingDataset(
+                scx_path, hvg_indices=np.array([50], dtype=np.uint32)
+            )
+
+    def test_hvg_last_valid_index_accepted(self, scx_path):
+        """The other half of the boundary — rejecting gene 49 would be a
+        different bug that neither test above would catch."""
+        ds = pyscx.TrainingDataset(
+            scx_path, hvg_indices=np.array([0, 49], dtype=np.uint32)
+        )
+        assert ds.n_output_genes == 2
+
     def test_repr(self, scx_path):
         ds = pyscx.TrainingDataset(scx_path)
         r = repr(ds)

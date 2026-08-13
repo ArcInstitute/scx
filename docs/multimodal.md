@@ -205,6 +205,13 @@ alphabetically-first modality and emits a `UserWarning` directing the
 user to `MultimodalTrainingDataset`. Pass `modality="rna"` explicitly
 to suppress the warning.
 
+`hvg_indices` is range-checked against the **selected** modality's feature
+count on both of those scoped paths — an index `>= n_vars` is rejected at
+construction rather than becoming an output column that is silently always
+zero. `MultimodalTrainingDataset` is the sole exception: it shares one panel
+across modalities of differing widths, so it cannot range-check and does not
+(see [training.md § MultimodalTrainingDataset](training.md#multimodaltrainingdataset)).
+
 ### 3.4 Modality-scoped queries — `query(modality=…)`
 
 Selective, out-of-core reads of **one** modality run through the query
