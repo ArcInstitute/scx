@@ -24,12 +24,19 @@
 // 64-BIT INDEXING (review §8.4): shard_rows × k exceeds 2^31 at census scale
 // (36M cells × k=60 = 2.16e9), and the resident PCA path passes shard_rows =
 // n_obs. With `int total` that product is a signed overflow — UB, so the
-// manifestation is nvcc's choice, and measured at 2^31+256 elements it is an
-// illegal memory access from threads whose `idx` wrapped negative. Past 2^32
-// the host's u32 block count silently under-launches instead. Either way the
-// PCA runs uncentered despite zero_center=True. `global_row` and `ld` are
-// 64-bit for the same reason: they address the global (n_obs × k) buffer.
-// Matches `spmm_mean_correct.cu`, the row-major sibling.
+// manifestation is nvcc's choice, and the two regimes fail differently:
+//
+//   * 2^31 <= total < 2^32 — measured at 2^31+256 elements, an illegal memory
+//     access from threads whose `idx` wrapped negative. The call FAILS at the
+//     next synchronize and the CUDA context is poisoned; there is no PCA result
+//     at all, uncentered or otherwise. Being UB, another toolchain could land
+//     elsewhere in this range, including on the silent behaviour below.
+//   * total >= 2^32 — the host's u32 block count under-launches instead, so the
+//     tail of the matrix is simply never visited and a *completed* PCA comes
+//     back uncentered despite zero_center=True, with nothing reporting it.
+//
+// `global_row` and `ld` are 64-bit for the same reason: they address the global
+// (n_obs × k) buffer. Matches `spmm_mean_correct.cu`, the row-major sibling.
 extern "C" __global__ void mean_correct_colmajor_strided_kernel(
     float* __restrict__ Y,           // [ld × k], col-major; full matrix
     const float* __restrict__ mc,    // [k]
@@ -142,10 +149,13 @@ extern "C" __global__ void column_sum_kernel(
 //
 // 64-BIT INDEXING (review §8.4): `m` is n_obs here — this kernel writes the
 // final PCA embedding U·Σ — so m × k passes 2^31 around 43M cells at 50
-// components, leaving the embedding columns unscaled by their singular values.
-// A 32-bit `total` overflows a signed int (UB; measured as an illegal memory
-// access, see the test), and a 32-bit `idx` could not address the buffer past
-// 2^31 even if the count were right.
+// components. A 32-bit `total` overflows a signed int (UB; measured as an
+// illegal memory access, which fails the call outright), and past 2^32 the
+// host's truncated grid instead returns an embedding whose tail columns were
+// never scaled by their singular values, silently. See
+// `mean_correct_colmajor_strided_kernel` above for the two regimes in full. A
+// 32-bit `idx` could not address the buffer past 2^31 even if the count were
+// right.
 extern "C" __global__ void scale_columns_kernel(
     float* __restrict__ U,           // [m × k], col-major, in-place
     const float* __restrict__ s,     // [k]

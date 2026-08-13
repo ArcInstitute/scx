@@ -18,9 +18,10 @@
 //!    turns "cannot" into a hard failure instead of a silent early return.
 //!
 //! The sbatch harness (`benchmarks/scripts/_run_scx_gpu_tests.sh`) sets
-//! `SCX_REQUIRE_GPU=1` and passes `--include-ignored`, so on a GPU node a test
-//! that quietly declines to run is a red build. `scx-gpu/tests/gpu_test_gating.rs`
-//! keeps the two halves in sync.
+//! `SCX_REQUIRE_GPU=1` — and defaults `SCX_REQUIRE_LARGE_VRAM=1`, the same
+//! escalation for [`vram_or_skip`] — and passes `--include-ignored`, so on a GPU
+//! node a test that quietly declines to run is a red build.
+//! `scx-gpu/tests/gpu_test_gating.rs` keeps the two halves in sync.
 //!
 //! ## Why it is public, and not `#[cfg(test)]`
 //!

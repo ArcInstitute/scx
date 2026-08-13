@@ -126,9 +126,19 @@ if [[ -n "${SKIPPED}" ]]; then
     echo "${SKIPPED}"
     echo
     echo "  $(printf '%s\n' "${SKIPPED}" | wc -l) test(s) skipped. Under SCX_REQUIRE_GPU=1 a device"
-    echo "  gate cannot skip, and under SCX_REQUIRE_LARGE_VRAM=1 neither can a"
-    echo "  free-VRAM gate, so these are optional-library gates (nvcomp, cuVS) —"
-    echo "  coverage this node did not provide, not tests that stopped existing."
+    echo "  gate cannot skip, so these are coverage this node did not provide, not"
+    echo "  tests that stopped existing."
+    # The footer must read the ACTUAL value, not the default: under
+    # SCX_REQUIRE_LARGE_VRAM=0 a vram_or_skip miss still prints the marker and
+    # lands in this list, and asserting "these are optional-library gates" would
+    # mislabel it as nvcomp/cuVS on the very override path this script documents.
+    if [[ "${SCX_REQUIRE_LARGE_VRAM}" == "1" ]]; then
+        echo "  SCX_REQUIRE_LARGE_VRAM=1, so a free-VRAM gate cannot skip either —"
+        echo "  every entry above is an optional-library gate (nvcomp, cuVS)."
+    else
+        echo "  SCX_REQUIRE_LARGE_VRAM=${SCX_REQUIRE_LARGE_VRAM}, so an entry above may be a"
+        echo "  free-VRAM skip as well as an optional-library one (nvcomp, cuVS)."
+    fi
 else
     echo "(none — every GPU test executed)"
 fi

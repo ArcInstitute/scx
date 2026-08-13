@@ -195,8 +195,11 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   elements — signed overflow, so UB, and what nvcc emits at `-O3` is threads
   whose index wrapped negative writing below the buffer — while a `u32` block
   count truncates the grid past 2³² elements and silently skips the tail with no
-  error at all. `n_obs × n_comps` crosses 2³¹ around 36M cells, which the GPU
-  PCA VRAM pre-flight admits on an 80 GB H100.
+  error at all. The two crossings are at different shapes and both are reachable:
+  `n_obs × k` (mean correction, `k = n_components + n_oversamples`) crosses 2³¹ at
+  36M cells × k=60 = 2.16e9, which the GPU PCA VRAM pre-flight admits on an 80 GB
+  H100; `n_obs × n_components` (embedding scale) crosses later, around 43M cells
+  at 50 PCs.
 - GDS requires local NVMe + nvidia-fs drivers + ext4/XFS filesystem;
   always falls back to the CPU path.
 - In-VRAM GPU analysis (PCA, kNN, UMAP, preprocessing) routes through

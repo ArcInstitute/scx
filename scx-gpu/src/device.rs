@@ -367,9 +367,16 @@ impl Drop for GpuDevice {
 
 /// 1-D launch geometry for a flat, one-thread-per-element kernel.
 ///
-/// `total` is counted in `u64` — never `usize as u32` — and the block count is
-/// checked against the CUDA `grid_dim.x` cap **before** the cast, so a matrix
-/// past 2³¹ elements errors instead of silently launching a truncated grid.
+/// `total` is counted in `u64` — never `usize as u32` — so the grid covers every
+/// element however large the matrix, and the block count is checked against the
+/// CUDA `grid_dim.x` cap **before** the cast, so an unlaunchable grid errors
+/// instead of wrapping into a plausible-looking small one.
+///
+/// Note the two thresholds are far apart, and neither is 2³¹ *elements*: the
+/// `u64` count is what fixes the >2³² truncation, while the cap rejection needs
+/// `blocks > i32::MAX`, i.e. `total > 256 × (2³¹ − 1) ≈ 5.5e11` elements at the
+/// usual 256-thread block. A 2³¹-element matrix launches normally, as
+/// `a_flat_grid_covers_every_element_past_2_31` asserts.
 ///
 /// This exists because the truncating form is invisible: `(total as u32)` on a
 /// matrix of 2³² + 1000 elements yields a grid four blocks wide, the kernel

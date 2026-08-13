@@ -305,12 +305,19 @@ that way, so the unscoped form additionally fails on them. Run doctests
 separately with `cargo test -p scx-gpu --doc`.
 
 `SCX_REQUIRE_GPU=1` turns "no device" from a skip into a hard failure;
-`SCX_REQUIRE_NVCOMP=1` / `SCX_REQUIRE_CUVS=1` do the same per optional library.
-`benchmarks/scripts/_run_scx_gpu_tests.sh` sets `SCX_REQUIRE_GPU=1`, passes
-`--include-ignored`, asserts the result line reports `0 ignored`, and prints
-every `SCX_GPU_TEST_SKIPPED` line as a closing summary — so a node missing
-nvcomp shows up as listed coverage it did not provide, not as tests that
-silently stopped existing.
+`SCX_REQUIRE_NVCOMP=1` / `SCX_REQUIRE_CUVS=1` do the same per optional library,
+and `SCX_REQUIRE_LARGE_VRAM=1` does it for the free-VRAM floor that gates the
+tests needing a multi-GiB allocation to reach a 32-bit index boundary (today:
+`colmajor_kernels_do_their_work_past_2_31_elements`, which needs ~10 GiB).
+`benchmarks/scripts/_run_scx_gpu_tests.sh` sets `SCX_REQUIRE_GPU=1`, **defaults
+`SCX_REQUIRE_LARGE_VRAM=1`** (override with `=0` on a smaller or shared GPU),
+passes `--include-ignored`, asserts the result line reports `0 ignored`, and
+prints every `SCX_GPU_TEST_SKIPPED` line as a closing summary — so a node
+missing nvcomp shows up as listed coverage it did not provide, not as tests that
+silently stopped existing. The VRAM default is on for the same reason the device
+one is: the job holds a whole GPU via `--gres=gpu:1`, and left opt-in the only
+test that can observe a 2³¹ kernel-index overflow could quietly skip while the
+suite reported green.
 
 **Why the pairing is enforced.** Before this, `require_gpu!()` expanded to
 `eprintln! + return` with no `#[ignore]`, so 170 tests here and 34 in
