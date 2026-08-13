@@ -538,15 +538,20 @@ for batch in ds:
 > are tuples of X arrays only (no obs or cell_indices).
 
 > [!WARNING]
-> **`hvg_indices` is not range-checked here.** A single panel is applied to
-> *every* modality, and each modality has its own feature count, so the check
-> that `TrainingDataset` and `IndexPlanDataset` apply — reject any index
-> `>= n_vars` — would reject an RNA-sized panel outright on a CITE-seq file
-> whose ADT modality has ~100 features. The panel is therefore passed through
-> unvalidated, and an index beyond a given modality's width yields a column
-> that is **silently always zero** for that modality. Pass per-modality panels
-> that are in range for the modality they apply to, or check them yourself
-> against `ds.n_vars[modality]`.
+> **`hvg_indices` is not range-checked here — this class only.** A single panel
+> is applied to *every* selected modality, and modalities have different feature
+> counts, so the check the other loaders apply — reject any index `>= n_vars` —
+> would reject an RNA-sized panel outright on a CITE-seq file whose ADT modality
+> has ~100 features. The panel is therefore passed through unvalidated, and an
+> index beyond a given modality's width yields a column that is **silently
+> always zero** for that modality. Check panels yourself against
+> `ds.n_vars[modality]`.
+>
+> This applies to `MultimodalTrainingDataset` and nothing else. A
+> *modality-scoped* `TrainingDataset` — `TrainingDataset(path, modality="rna")`,
+> or the implicit alphabetically-first fallback on a multimodal file — has one
+> panel and one unambiguous `n_vars`, so it **is** range-checked like any
+> single-modality loader.
 
 See [multimodal.md](multimodal.md) for the full API.
 

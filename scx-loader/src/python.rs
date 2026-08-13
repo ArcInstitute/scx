@@ -121,6 +121,10 @@ impl TrainingDataset {
     ///     path: Path to the .scx file.
     ///     batch_size: Mini-batch size (default: 1024).
     ///     hvg_indices: Gene indices for HVG projection. None = all genes.
+    ///         Every index must be < n_vars (the selected modality's
+    ///         n_vars when `modality=` or the multimodal fallback is in
+    ///         play); an out-of-range index is rejected at construction
+    ///         rather than becoming an always-zero output column.
     ///     obs_columns: Obs metadata column names to include in each batch.
     ///     normalize: Apply total-count normalization (default: True).
     ///         NOTE: this is **on by default** — batches are normalized even
@@ -217,6 +221,11 @@ impl TrainingDataset {
             max_memory_mb.unwrap_or_else(|| LoaderConfig::default().max_memory_mb),
             max_memory_mb.is_none(),
             modality_id,
+            // One panel, one modality, one unambiguous `n_vars` — even when
+            // `modality_id` is set by `modality=` or the implicit
+            // alphabetically-first fallback. Range-check it.
+            /*shared_hvg_panel=*/
+            false,
         );
 
         let pipeline = TrainingPipeline::new(path, config)
@@ -407,6 +416,9 @@ fn resolve_loader_config(
     max_memory_mb: usize,
     auto_memory_budget: bool,
     modality_id: Option<u8>,
+    // `true` only from `MultimodalTrainingDataset`, which shares one panel
+    // across modalities of differing widths — see `LoaderConfig::shared_hvg_panel`.
+    shared_hvg_panel: bool,
 ) -> LoaderConfig {
     let defaults = LoaderConfig::default();
     LoaderConfig {
@@ -424,6 +436,7 @@ fn resolve_loader_config(
         max_memory_mb,
         auto_memory_budget,
         modality_id,
+        shared_hvg_panel,
     }
 }
 
@@ -526,7 +539,11 @@ impl MultimodalTrainingDataset {
     ///         to every modality identically; for per-modality
     ///         projections, instantiate separate
     ///         `TrainingDataset(modality=…, hvg_indices=…)` instances
-    ///         and zip in Python.
+    ///         and zip in Python. Because one panel spans modalities of
+    ///         differing widths, this is the ONE loader that does not
+    ///         range-check the panel: an index past a given modality's
+    ///         n_vars yields a silently always-zero column there. The
+    ///         per-modality `TrainingDataset` route above is checked.
     ///     obs_columns: Obs columns to include in each batch (read
     ///         once from the global obs table).
     ///     return_dict: If True (default), yield
@@ -677,6 +694,10 @@ impl MultimodalTrainingDataset {
                     modality_mb,
                     max_memory_mb.is_none(),
                     Some(*mid),
+                    // The one caller that shares a single panel across
+                    // modalities of differing widths.
+                    /*shared_hvg_panel=*/
+                    true,
                 )
             })
             .collect();
@@ -1067,6 +1088,10 @@ impl IndexPlanDataset {
     /// Args:
     ///     path: Path to the .scx file.
     ///     hvg_indices: Gene indices for HVG projection. None = all genes.
+    ///         Every index must be < n_vars (the selected modality's
+    ///         n_vars when `modality=` or the multimodal fallback is in
+    ///         play); an out-of-range index is rejected at construction
+    ///         rather than becoming an always-zero output column.
     ///     obs_columns: Obs metadata column names to include in each batch.
     ///     normalize: Apply total-count normalization (default: True).
     ///     log1p: Apply ln(x+1) to each row (default: True). Independent of
