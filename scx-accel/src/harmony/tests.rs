@@ -706,6 +706,42 @@ fn test_gpu_memory_estimate_reasonable() {
     assert!(bytes < 1_000_000_000);
 }
 
+/// The refusal message is the entire remedy the caller gets — `device="auto"`
+/// does not re-run on CPU — so pin that it actually names the shortfall and the
+/// way out, not just that it is non-empty. Runs on a CPU host under
+/// `--features gpu`: the message builder is pure arithmetic and formatting.
+#[cfg(feature = "gpu")]
+#[test]
+fn test_gpu_vram_message_names_the_shortfall_and_the_remedy() {
+    // 8M cells × 50 PCs × 100 clusters against 6.1 GB free of 79.1 GB.
+    let msg = super::gpu::harmony_vram_message(
+        0,
+        8_000_000,
+        50,
+        100,
+        4,
+        1,
+        6_100_000_000,
+        79_100_000_000,
+    );
+    // The three numbers a user needs to act on.
+    assert!(
+        msg.contains("8000000 cells × 50 PCs × 100 clusters"),
+        "{msg}"
+    );
+    assert!(msg.contains("6.1 GB of 79.1 GB"), "{msg}");
+    assert!(msg.contains("GPU 0"), "{msg}");
+    // `≥`, not `=`: the estimate excludes transient scratch.
+    assert!(msg.contains("≥"), "{msg}");
+    // And what to do about it. Without this the message is a diagnosis with no
+    // prescription, which is what the raw cudarc error already was.
+    assert!(msg.contains(r#"device="cpu""#), "{msg}");
+    assert!(msg.contains("n_clusters"), "{msg}");
+    // Does not restate the op name — pyscx prefixes it, and the note form
+    // appends this to an allocation error that already names its buffer.
+    assert!(!msg.contains("harmony_integrate"), "{msg}");
+}
+
 /// The VRAM pre-flight (§8.10) must not refuse a run that fits.
 ///
 /// It is the one way this change could regress a working setup: a refusal is a

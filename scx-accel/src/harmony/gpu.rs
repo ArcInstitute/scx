@@ -45,7 +45,7 @@ fn f64_to_f32(v: &[f64]) -> Vec<f32> {
 /// `≥` rather than `=`: [`scx_gpu::gpu_harmony_memory_bytes`] counts the
 /// persistent buffers only and excludes transient scratch.
 #[allow(clippy::too_many_arguments)]
-fn harmony_vram_message(
+pub(super) fn harmony_vram_message(
     device_id: usize,
     n: usize,
     d: usize,
@@ -56,8 +56,11 @@ fn harmony_vram_message(
     total: usize,
 ) -> String {
     let need = scx_gpu::gpu_harmony_memory_bytes(n, d, k, b, c);
+    // "Harmony", not "harmony_integrate": pyscx already prefixes the op name
+    // (`harmony_integrate_gpu: …`), and the note form appends this to an
+    // allocation error that names its own buffer.
     format!(
-        "harmony_integrate needs ≥{:.1} GB of device memory for {n} cells × {d} PCs × \
+        "Harmony needs ≥{:.1} GB of device memory for {n} cells × {d} PCs × \
          {k} clusters, but only {:.1} GB of {:.1} GB is free on GPU {device_id}. Re-run with \
          device=\"cpu\", lower n_clusters, or free VRAM — device=\"auto\" resolves the device \
          before the op starts and does not fall back to CPU on a runtime GPU failure.",
