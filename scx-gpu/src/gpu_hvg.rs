@@ -21,13 +21,13 @@
 //! the two implementations agree to ~1e-5 relative error on typical scRNA-seq
 //! densities.
 
-use cudarc::driver::safe::{CudaSlice, LaunchConfig};
+use cudarc::driver::safe::CudaSlice;
 use cudarc::driver::PushKernelArg;
 
 use scx_format_io::{ColumnShardSource, ShardSource};
 
 use crate::backed_gpu_matrix_source::BackedGpuMatrixSource;
-use crate::device::GpuDevice;
+use crate::device::{flat_launch_1d, GpuDevice};
 use crate::error::GpuError;
 use crate::gpu_csc_shard_source::{GpuCscShardSource, RawGpuCscShardSource};
 use crate::gpu_matrix_source::GpuMatrixSource;
@@ -91,12 +91,7 @@ pub fn gpu_streaming_mean_var(
             return Ok(());
         }
         let threads: u32 = 256;
-        let blocks = ((nnz as u64).div_ceil(threads as u64)) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let cfg = flat_launch_1d(nnz as u64, threads)?;
         unsafe {
             dev.stream()
                 .launch_builder(&func)
@@ -166,12 +161,7 @@ pub fn gpu_streaming_clip_square_sum(
             return Ok(());
         }
         let threads: u32 = 256;
-        let blocks = ((nnz as u64).div_ceil(threads as u64)) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let cfg = flat_launch_1d(nnz as u64, threads)?;
         unsafe {
             dev.stream()
                 .launch_builder(&func)
@@ -232,11 +222,9 @@ pub fn gpu_streaming_mean_var_csc(
         }
         let n_cols_i32 = n_cols as i32;
         let col_start_i32 = view.col_start as i32;
-        let cfg = LaunchConfig {
-            grid_dim: (n_cols as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        // One block per column: a flat `n_cols × 256` launch is exactly
+        // `n_cols` blocks, with the grid-cap check for free.
+        let cfg = flat_launch_1d(n_cols as u64 * 256, 256)?;
         unsafe {
             dev.stream()
                 .launch_builder(&func)
@@ -314,11 +302,9 @@ pub fn gpu_streaming_clip_square_sum_csc(
         }
         let n_cols_i32 = n_cols as i32;
         let col_start_i32 = view.col_start as i32;
-        let cfg = LaunchConfig {
-            grid_dim: (n_cols as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        // One block per column: a flat `n_cols × 256` launch is exactly
+        // `n_cols` blocks, with the grid-cap check for free.
+        let cfg = flat_launch_1d(n_cols as u64 * 256, 256)?;
         unsafe {
             dev.stream()
                 .launch_builder(&func)
@@ -425,12 +411,7 @@ pub fn gpu_streaming_mean_var_batched(
         }
 
         let threads: u32 = 256;
-        let blocks = ((shard_n_rows as u64).div_ceil(threads as u64)) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let cfg = flat_launch_1d(shard_n_rows as u64, threads)?;
         unsafe {
             dev.stream()
                 .launch_builder(&func)
@@ -548,12 +529,7 @@ pub fn gpu_streaming_clip_square_sum_batched(
         }
 
         let threads: u32 = 256;
-        let blocks = ((shard_n_rows as u64).div_ceil(threads as u64)) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let cfg = flat_launch_1d(shard_n_rows as u64, threads)?;
         unsafe {
             dev.stream()
                 .launch_builder(&func)

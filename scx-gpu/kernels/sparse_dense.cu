@@ -30,10 +30,17 @@ extern "C" __global__ void sparse_to_dense_kernel(
     int n_output_cols
 ) {
     // Each warp handles one row. Warp lane = threadIdx.x % 32.
-    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    //
+    // 64-bit warp id (review §8.4): the launch is 32 threads per row, so the
+    // flat thread index is 32 × n_rows and wraps `unsigned` past 134.2M rows —
+    // whereupon `warp_id` goes negative, sails through the `>= n_rows` guard,
+    // and `indptr[warp_id]` reads out of bounds (which poisons the CUDA context
+    // for the whole process). Shards are far smaller than that today, so this
+    // is defence-in-depth; everything downstream of the row id is already 64-bit.
+    long long warp_id = ((long long)blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane_id = threadIdx.x % 32;
 
-    if (warp_id >= n_rows) return;
+    if (warp_id >= (long long)n_rows) return;
 
     // Row boundaries from indptr (i64 → unsigned range)
     long long row_start = indptr[warp_id];
@@ -44,7 +51,7 @@ extern "C" __global__ void sparse_to_dense_kernel(
     if (row_nnz <= 0) return;
 
     // Base pointer into the output dense row
-    float* out_row = output + (long long)warp_id * n_output_cols;
+    float* out_row = output + warp_id * n_output_cols;
 
     // Warp-cooperative scatter: each lane handles elements at
     // lane_id, lane_id+32, lane_id+64, ...

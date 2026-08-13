@@ -4,10 +4,10 @@
 //! cooperative row scatter: each warp (32 threads) handles one row's
 //! non-zeros in parallel, with optional column remapping for HVG projection.
 
-use cudarc::driver::safe::{CudaSlice, CudaView, LaunchConfig};
+use cudarc::driver::safe::{CudaSlice, CudaView};
 use cudarc::driver::PushKernelArg;
 
-use crate::device::GpuDevice;
+use crate::device::{flat_launch_1d, GpuDevice};
 use crate::error::GpuError;
 use crate::shard_decode::GpuCsr;
 
@@ -233,14 +233,12 @@ pub fn sparse_to_dense_gpu_into_view(
 
     // Launch config: one warp (32 threads) per row.
     // CUDA block size = 256 threads = 8 warps per block.
+    //
+    // Sized as a flat 32-threads-per-row launch, which yields the identical
+    // block count as `n_rows / warps_per_block` while counting in u64 and
+    // rejecting a grid past the `grid_dim.x` cap instead of truncating it.
     let threads_per_block: u32 = 256;
-    let warps_per_block = threads_per_block / 32;
-    let grid_dim = (n_rows as u32).div_ceil(warps_per_block);
-    let cfg = LaunchConfig {
-        grid_dim: (grid_dim, 1, 1),
-        block_dim: (threads_per_block, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let cfg = flat_launch_1d(n_rows as u64 * 32, threads_per_block)?;
 
     // Build kernel argument for hvg_map (null pointer if None).
     // cudarc expects all arguments to be pushed in order; for a nullable pointer

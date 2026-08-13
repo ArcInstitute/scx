@@ -33,13 +33,13 @@
 //! produces small rounding differences (~1e-6 relative error). For single-cell
 //! RNA-seq data these differences are negligible.
 
-use cudarc::driver::safe::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
+use cudarc::driver::safe::{CudaSlice, CudaView, CudaViewMut};
 use cudarc::driver::PushKernelArg;
 
 use scx_format_io::ShardSource;
 use scx_sparse::{concatenate_csr, ScxCsr};
 
-use crate::device::GpuDevice;
+use crate::device::{flat_launch_1d, GpuDevice};
 use crate::error::GpuError;
 use crate::gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource};
 
@@ -133,13 +133,8 @@ pub(crate) fn apply_fused_ops_with_tier(
     let n_rows_i32 = n_rows as i32;
     let nnz = data.len();
     let threads: u32 = 256;
-    let blocks = (n_rows as u32).div_ceil(threads);
     // Thread-per-row config — also used by the row_scale tail below.
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let cfg = flat_launch_1d(n_rows as u64, threads)?;
 
     match (normalize, log1p) {
         (Some(target_sum), do_log1p) => {
@@ -155,20 +150,16 @@ pub(crate) fn apply_fused_ops_with_tier(
                     cfg,
                 ),
                 RowTier::Warp => {
-                    // One warp per row: 256 threads = 8 warps per block.
-                    let warps_per_block = threads / 32;
-                    let warp_blocks = (n_rows as u32).div_ceil(warps_per_block);
+                    // One warp per row: 256 threads = 8 warps per block. Sized
+                    // as a flat 32-threads-per-row launch — same block count,
+                    // but counted in u64 and checked against the grid_dim.x cap.
                     (
                         if do_log1p {
                             "normalize_log1p_warp_kernel"
                         } else {
                             "normalize_warp_kernel"
                         },
-                        LaunchConfig {
-                            grid_dim: (warp_blocks, 1, 1),
-                            block_dim: (threads, 1, 1),
-                            shared_mem_bytes: 0,
-                        },
+                        flat_launch_1d(n_rows as u64 * 32, threads)?,
                     )
                 }
                 RowTier::Block => (
@@ -177,12 +168,9 @@ pub(crate) fn apply_fused_ops_with_tier(
                     } else {
                         "normalize_block_kernel"
                     },
-                    // One block per row.
-                    LaunchConfig {
-                        grid_dim: (n_rows as u32, 1, 1),
-                        block_dim: (threads, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
+                    // One block per row: a flat `n_rows × threads` launch is
+                    // exactly `n_rows` blocks, with the cap check for free.
+                    flat_launch_1d(n_rows as u64 * threads as u64, threads)?,
                 ),
             };
             let func = module
@@ -203,12 +191,12 @@ pub(crate) fn apply_fused_ops_with_tier(
             // log1p is elementwise and row-independent: one thread per nonzero,
             // grid-strided. No reduction, so the row tier doesn't apply.
             let nnz_i64 = nnz as i64;
-            let log1p_blocks = (nnz as u32).div_ceil(threads).max(1);
-            let log1p_cfg = LaunchConfig {
-                grid_dim: (log1p_blocks, 1, 1),
-                block_dim: (threads, 1, 1),
-                shared_mem_bytes: 0,
-            };
+            // `log1p_nnz_kernel` is 64-bit and grid-strided; only its launcher
+            // ever truncated the nnz count. The `.max(1)` preserves the previous
+            // behaviour for `nnz == 0` — one block that the grid-stride loop
+            // exits immediately, rather than an empty (illegal) grid.
+            let mut log1p_cfg = flat_launch_1d(nnz as u64, threads)?;
+            log1p_cfg.grid_dim.0 = log1p_cfg.grid_dim.0.max(1);
             let func = module
                 .load_function("log1p_nnz_kernel")
                 .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p_nnz_kernel: {e}")))?;
@@ -239,11 +227,9 @@ pub(crate) fn apply_fused_ops_with_tier(
                 factors.len()
             )));
         }
-        let row_offset_i32: i32 = row_offset.try_into().map_err(|_| {
-            GpuError::InvalidShard(format!(
-                "row_scale row_offset {row_offset} exceeds i32::MAX"
-            ))
-        })?;
+        // `row_scale_kernel` takes `row_offset` as `long long`, so there is no
+        // i32 cap to enforce here — the length guard above is the real bound.
+        let row_offset_i64 = row_offset as i64;
         let func = module
             .load_function("row_scale_kernel")
             .map_err(|e| GpuError::KernelLaunchFailed(format!("row_scale_kernel: {e}")))?;
@@ -253,7 +239,7 @@ pub(crate) fn apply_fused_ops_with_tier(
                 .arg(indptr)
                 .arg(&mut *data)
                 .arg(&n_rows_i32)
-                .arg(&row_offset_i32)
+                .arg(&row_offset_i64)
                 .arg(factors)
                 .launch(cfg)
         }
