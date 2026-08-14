@@ -288,10 +288,14 @@ fn widest_of_two(a: ValueEncoding, b: ValueEncoding) -> ValueEncoding {
 /// landing exactly on 2³² is written one low; that is the residue of the f32
 /// round-trip these paths already have, not something this rung can fix.
 ///
-/// **Only the rewrite paths are ambiguous.** A caller holding values that never
-/// went through a `u32` decode — `attach_external_layer`, whose source is an
-/// external file — knows 2³² is a real sum, and must use
-/// `scx_codec::detect_value_encoding` instead of this function.
+/// **Only the rewrite paths are ambiguous**, and not because their values came
+/// off disk — an external file can hand over a `u32`-derived 2³² just as easily.
+/// What separates them is evidence: `attach_external_layer` runs
+/// `scx_codec::detect_value_encoding` over its pre-canonical values, and that
+/// detector sends 2³² to `Float32`, so a `Uint32` layer encoding *proves* no
+/// input held the alias and any later 2³² is a sum. A rewrite has no such step —
+/// its encoding comes from the shard header it is copying — so it cannot tell
+/// the two apart and must not use the fresh-data rule.
 const U32_DECODE_CEILING: f64 = (1u64 << 32) as f64;
 
 /// The codec to pair with a value encoding [`encoding_for_canonicalized`] may

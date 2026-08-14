@@ -421,13 +421,24 @@ pub struct AttachLayerSummary {
 /// ⚠️ This deliberately does **not** use
 /// [`crate::rewrite_helpers::encoding_for_canonicalized`], despite asking a
 /// nearly identical question. That helper is written for the rewrite ops, where
-/// a value of 2³² is equally a decoded on-disk `u32::MAX`, so it keeps `Uint32`
-/// and lets `as u32` saturate — preserving a format-valid archive at the cost of
-/// writing a genuine sum one low. Here there is no such ambiguity:
-/// `ExternalLayerData` carries values from an external file that never passed
-/// through a `u32` decode, so a sum of 2³² is a sum of 2³² and encoding it as
-/// `Uint32` is silent corruption with the evidence in hand to avoid it. The
-/// fresh-data rule is [`detect_value_encoding`]'s, and that is what is used.
+/// a value of 2³² is equally the f32 image of a decoded on-disk `u32::MAX`, so
+/// it keeps `Uint32` and lets `as u32` saturate — preserving a format-valid
+/// archive at the cost of writing a genuine sum one low.
+///
+/// Here that ambiguity is resolved, and by the detection this op already did
+/// rather than by where the values came from. (They are *not* guaranteed
+/// decode-free: a CellBender `data` dataset stored as `u32` is read through
+/// `v as f32`, so a stored `u32::MAX` arrives here as 2³² just as it would off
+/// an SCX shard.) The argument is narrower and holds: `layer_wide` was chosen by
+/// [`detect_value_encoding`] over the **pre-canonical** values, and that
+/// detector sends anything above `u32::MAX` — 2³² included — to `Float32`. So if
+/// `layer_wide` is `Uint32`, no source value was the 2³² alias, and a 2³²
+/// appearing after canonicalization was necessarily produced by summing. Writing
+/// it `Uint32` would be silent corruption with the evidence in hand to avoid it.
+///
+/// A *pinned* `Uint32` gets no such guarantee — detection never ran — so a
+/// source value of 2³² is reported rather than saturated. That is a deliberate
+/// fail-loud on a path with no production caller.
 fn shard_value_encoding(
     layer_wide: ValueEncoding,
     pinned: bool,

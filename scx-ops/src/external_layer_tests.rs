@@ -1533,6 +1533,55 @@ fn attach_layer_uses_the_fresh_data_rule_at_the_u32_ceiling() {
         ValueEncoding::Float32,
         "a fresh sum above u32::MAX must not be written as Uint32 and saturated"
     );
+
+    // The written header, not just the summary: keeping the two in sync while
+    // passing the layer-wide encoding to the encoder would re-saturate the shard
+    // and still satisfy the assertion above.
+    let reader = ScxReader::open(&path).unwrap();
+    let entry = reader
+        .catalog()
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::LayerCsrShard)
+        .expect("the layer shard must exist");
+    let sh = reader.read_shard_header(entry).unwrap();
+    assert_eq!(
+        ValueEncoding::from_u8(sh.value_encoding),
+        Some(ValueEncoding::Float32),
+        "the shard on disk must carry the widened encoding, not just the summary"
+    );
+}
+
+/// The preview has to predict the boundary case too — this is the third of the
+/// trio (detected / pinned / dry-run), and the one whose absence would let a
+/// future split between the two loops go unnoticed.
+#[test]
+fn dry_run_predicts_the_encoding_at_the_u32_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let two_pow_31 = 2_147_483_648.0f32;
+    let data = duplicate_coordinate_data(two_pow_31, two_pow_31);
+    let preview = AttachLayerOptions {
+        dry_run: true,
+        ..opts("cb")
+    };
+    let summary = attach_external_layer(&path, &data, &preview).unwrap();
+    assert_eq!(
+        summary.value_encoding,
+        ValueEncoding::Float32,
+        "the preview must report the encoding the write will actually use"
+    );
+
+    let pinned_preview = AttachLayerOptions {
+        dry_run: true,
+        value_encoding: Some(ValueEncoding::Uint32),
+        ..opts("cb")
+    };
+    assert!(
+        attach_external_layer(&path, &data, &pinned_preview).is_err(),
+        "a preview must surface the pinned failure at the ceiling, not defer it"
+    );
 }
 
 /// The pinned branch has to answer the same question the same way: at 2³² the
