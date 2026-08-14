@@ -117,7 +117,14 @@ pub struct IndexPlanLoader {
     /// Tokio runtime used by [`IndexPlanIter`] to spawn shard prefetches via
     /// `spawn_blocking`. `read_shard_cached_arc` is synchronous and CPU/IO
     /// bound, so it must run on the blocking pool — bare `tokio::spawn` does
-    /// not accept it. 2 worker threads matches `TrainingPipeline`.
+    /// not accept it.
+    ///
+    /// Multi-threaded with 2 workers, which is **not** what `TrainingPipeline`
+    /// does: since the fork-safety restructure that pipeline drives a
+    /// `new_current_thread` runtime on its own I/O thread (`pipeline.rs`), so
+    /// its blocking work is already off the reactor. Here the iterator awaits
+    /// several prefetches concurrently from the caller's thread, so the
+    /// reactor needs workers of its own.
     ///
     /// Lazily built by [`Self::runtime`] on first use so the parent process
     /// never holds tokio I/O threads that would be inherited across `fork(2)`.
@@ -217,6 +224,11 @@ impl IndexPlanLoader {
         }
 
         let reader = ScxReader::open(path.as_ref())?;
+        // This loader has no modality surface, so it reads the flattened shard
+        // list. On a multimodal file that list claims every obs row once per
+        // modality and `BackedCsrReader`'s row index keeps an arbitrary one —
+        // answering from a modality the caller never chose. Refuse instead.
+        crate::pipeline::ensure_csr_ranges_are_readable(&reader, None, "IndexPlanLoader")?;
         let n_obs = reader.n_obs();
         let n_vars = reader.n_vars();
         // Captured before `reader` is consumed by `BackedCsrReader::new` below;
@@ -667,6 +679,17 @@ impl IndexPlanLoader {
         self.cache_sizing
     }
 
+    /// Verdict on whether building the HVG projection changed the panel the
+    /// caller passed — `None` when it was already ascending and unique.
+    /// Mirrors `TrainingPipeline::hvg_panel`; see
+    /// [`crate::projection::assess_hvg_panel`].
+    pub fn hvg_panel(&self) -> Option<crate::projection::HvgPanelVerdict> {
+        self.config
+            .hvg_indices
+            .as_deref()
+            .and_then(crate::projection::assess_hvg_panel)
+    }
+
     /// The `cache_shards` the caller requested, before the budget auto-tune.
     pub fn requested_cache_shards(&self) -> usize {
         self.requested_cache_shards
@@ -960,7 +983,8 @@ impl IndexPlanLoader {
             // normalize-then-subset semantics. Only needed when normalizing —
             // the depth vectors stay 0.0 (and are ignored) otherwise.
             if self.config.normalize {
-                let depth: f64 = data.iter().map(|&v| v as f64).sum();
+                // Clipped when a log follows — see `normalize::transform_depth`.
+                let depth: f64 = crate::normalize::transform_depth(data, self.config.log1p);
                 match request.side {
                     PairSide::Perturbed => depth_x[request.pair_idx] = depth,
                     PairSide::Control => depth_x_paired[request.pair_idx] = depth,

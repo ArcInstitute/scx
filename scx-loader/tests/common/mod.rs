@@ -282,6 +282,362 @@ pub fn write_known_multinnz_fixture(
     path.to_path_buf()
 }
 
+/// Build a **deliberately malformed** single-modality fixture whose two CSR
+/// shards claim overlapping global row ranges: shard 0 covers `[0, rows)` and
+/// shard 1 covers `[rows - overlap, 2*rows - overlap)`.
+///
+/// This is the shape a merge / append / compact defect would leave behind. The
+/// writer takes `row_start` from the caller and does not cross-check it against
+/// previously written shards, which is what makes the fixture constructible —
+/// and is also why the loader has to check for itself.
+pub fn write_overlapping_shards_fixture(
+    path: &std::path::Path,
+    rows_per_shard: usize,
+    n_vars: usize,
+    overlap: usize,
+) -> std::path::PathBuf {
+    assert!(overlap > 0 && overlap <= rows_per_shard);
+    let n_obs = 2 * rows_per_shard - overlap;
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        (2 * rows_per_shard) as u64,
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+    writer.write_obs(&string_column("cell_id", n_obs)).unwrap();
+    writer.write_var(&string_column("gene_id", n_vars)).unwrap();
+
+    for row_start in [0usize, rows_per_shard - overlap] {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows_per_shard {
+            indices.push(((row_start + local) % n_vars) as u32);
+            values.push(1u8);
+            indptr.push(*indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
+/// Build a **deliberately malformed** single-modality fixture whose CSR shards
+/// leave a *gap*: `[0, gap_start)` and `[gap_start + gap_rows, n_obs)`, so the
+/// rows in between belong to no shard at all.
+///
+/// The complement of [`write_overlapping_shards_fixture`]. An overlap-only
+/// check passes this file and then silently loses those cells.
+pub fn write_gapped_shards_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    n_vars: usize,
+    gap_start: usize,
+    gap_rows: usize,
+) -> std::path::PathBuf {
+    assert!(gap_rows > 0 && gap_start + gap_rows < n_obs);
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        (n_obs - gap_rows) as u64,
+        gap_start.max(1) as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+    writer.write_obs(&string_column("cell_id", n_obs)).unwrap();
+    writer.write_var(&string_column("gene_id", n_vars)).unwrap();
+
+    for (row_start, rows) in [
+        (0usize, gap_start),
+        (gap_start + gap_rows, n_obs - gap_start - gap_rows),
+    ] {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows {
+            indices.push(((row_start + local) % n_vars) as u32);
+            values.push(1u8);
+            indptr.push(*indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
+/// Build a well-formed 2-modality fixture (`rna` / `adt`) over a shared obs
+/// axis, each modality holding one CSR shard covering `[0, n_obs)`.
+///
+/// Legitimate on its own terms — but the two modalities' shard row ranges
+/// necessarily overlap in the *flattened* catalog view, which is what a loader
+/// opened without a `modality_id` would consume.
+pub fn write_multimodal_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    rna_vars: usize,
+    adt_vars: usize,
+) -> std::path::PathBuf {
+    use scx_format_io::modality::ModalityType;
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        rna_vars.max(adt_vars) as u64,
+        (2 * n_obs) as u64,
+        n_obs as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+    writer.write_obs(&string_column("cell_id", n_obs)).unwrap();
+
+    let mut ids = Vec::new();
+    for (name, kind, m_vars) in [
+        ("adt", ModalityType::Protein, adt_vars),
+        ("rna", ModalityType::Rna, rna_vars),
+    ] {
+        let id = writer
+            .add_modality(name, kind, CodecId::None, ValueEncoding::Uint8, false)
+            .unwrap();
+        writer
+            .write_var_for(id, &string_column("gene_id", m_vars))
+            .unwrap();
+        writer.set_modality_n_vars(id, m_vars as u64).unwrap();
+        ids.push((id, m_vars));
+    }
+
+    for (id, m_vars) in ids {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for r in 0..n_obs {
+            indices.push((r % m_vars) as u32);
+            values.push(1u8);
+            indptr.push(*indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard_for(
+                id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
+/// Build a **valid** file whose single modality is registered in the modality
+/// table, so its only X is stamped `modality_id = 1` and modality 0 owns no
+/// shards at all.
+///
+/// This is the shape `pyscx.from_mudata(MuData({"rna": adata}))` and a
+/// single-modality h5mu ingest emit — as unambiguous as a legacy id-0 file, and
+/// the case an "is modality 0 covered?" preflight silently rejects. Every other
+/// "single modality" fixture here writes id-0 shards, which is exactly why that
+/// regression got through.
+pub fn write_single_registered_modality_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    n_vars: usize,
+    n_shards: usize,
+) -> std::path::PathBuf {
+    use scx_format_io::modality::ModalityType;
+    assert!(n_obs % n_shards == 0);
+    let rows_per_shard = n_obs / n_shards;
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        n_obs as u64,
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+    writer.write_obs(&string_column("cell_id", n_obs)).unwrap();
+
+    let rna = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna, &string_column("gene_id", n_vars))
+        .unwrap();
+    writer.set_modality_n_vars(rna, n_vars as u64).unwrap();
+
+    for s in 0..n_shards {
+        let row_start = s * rows_per_shard;
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows_per_shard {
+            indices.push(((row_start + local) % n_vars) as u32);
+            values.push(1u8);
+            indptr.push(*indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard_for(
+                rna,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
+/// A 2-modality fixture where modality `adt` (id 1) tiles `[0, n_obs)` with one
+/// clean shard and modality `rna` (id 2) is **malformed**: two shards whose row
+/// ranges overlap, so that modality alone violates the exactly-once invariant.
+///
+/// Lets a test scope to a modality and still be wrong — the case
+/// `ShardGroupIndex::build` cannot catch at `shard_group_size == 1`, because the
+/// two overlapping shards never share a group.
+pub fn write_multimodal_overlapping_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    n_vars: usize,
+) -> std::path::PathBuf {
+    use scx_format_io::modality::ModalityType;
+    assert!(n_obs >= 4 && n_obs % 2 == 0);
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        (2 * n_obs) as u64,
+        n_obs as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+    writer.write_obs(&string_column("cell_id", n_obs)).unwrap();
+
+    let one_row_shard = |row_start: usize, rows: usize| {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows {
+            indices.push(((row_start + local) % n_vars) as u32);
+            values.push(1u8);
+            indptr.push(*indptr.last().unwrap() + 1);
+        }
+        (indptr, indices, values)
+    };
+
+    // id 1 — clean: one shard covering [0, n_obs).
+    let adt = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(adt, &string_column("gene_id", n_vars))
+        .unwrap();
+    writer.set_modality_n_vars(adt, n_vars as u64).unwrap();
+    let (indptr, indices, values) = one_row_shard(0, n_obs);
+    writer
+        .write_csr_shard_for(
+            adt,
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // id 2 — malformed: [0, n_obs/2 + 1) and [n_obs/2 - 1, n_obs), overlapping
+    // on two rows.
+    let rna = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna, &string_column("gene_id", n_vars))
+        .unwrap();
+    writer.set_modality_n_vars(rna, n_vars as u64).unwrap();
+    let half = n_obs / 2;
+    for (row_start, rows) in [(0usize, half + 1), (half - 1, n_obs - half + 1)] {
+        let (indptr, indices, values) = one_row_shard(row_start, rows);
+        writer
+            .write_csr_shard_for(
+                rna,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
+/// Single-column `RecordBatch` of `{prefix}_{i}` strings — the obs/var shape
+/// every fixture here writes.
+fn string_column(name: &str, n: usize) -> RecordBatch {
+    let prefix = name.trim_end_matches("_id");
+    let ids: Vec<String> = (0..n).map(|i| format!("{prefix}_{i}")).collect();
+    RecordBatch::try_new(
+        StdArc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)])),
+        vec![StdArc::new(StringArray::from(
+            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap()
+}
+
 /// Build an `IndexPlanLoader` against a fixture with default settings —
 /// no normalization, no log1p, single obs column `"cell_id"`, 4 cache shards,
 /// shard sort enabled, lookahead 4, plan-size cap 16384, and a generous

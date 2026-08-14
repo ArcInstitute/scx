@@ -82,10 +82,13 @@ fn fixed_seed_yields_the_pinned_permutation() {
 
 #[test]
 fn domain_tag_separates_from_a_bare_seed() {
-    // The tag exists so `shuffle(seed=42)` is uncorrelated with the training
-    // loader's `(seed=42, epoch=0)` shard permutation — and 42 is the default
-    // on *both* surfaces, so that pairing is the likely one. Reproduce the
-    // loader's un-domain-separated derivation and assert the two disagree.
+    // The tag exists so `shuffle(seed=42)` is uncorrelated with a bare
+    // `ChaCha8Rng::seed_from_u64(42)` permutation — and 42 is the default on
+    // both this surface and the training loader's, so that pairing is the
+    // likely one. The bare derivation below *was* the loader's at epoch 0; the
+    // loader has since moved to a tagged, chained seed of its own
+    // (`scx-loader/src/seed.rs`), so this now pins the weaker, and sufficient,
+    // property: this module's output is not a plain seed-42 shuffle.
     use rand::seq::SliceRandom;
     use rand::SeedableRng;
     let mut bare = rand_chacha::ChaCha8Rng::seed_from_u64(42);

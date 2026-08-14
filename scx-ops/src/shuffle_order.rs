@@ -22,17 +22,20 @@
 //!
 //! Two deliberate choices:
 //!
-//! - **Mix, don't add.** Every pre-existing `scx-loader` seed site combines
-//!   components *additively* (`shuffle.rs`, `decode_stage.rs`), which collides:
-//!   `(seed + 1, epoch)` aliases `(seed, epoch + 1)`. `scx-loader`'s
-//!   `downsample.rs` established the chained-SplitMix64 convention for anything
-//!   with more than one component; this mirrors it. (It cannot *import* it —
-//!   that lives in `scx-loader`, which `scx-ops` does not depend on.)
+//! - **Mix, don't add.** Additive composition collides: `(seed + 1, epoch)`
+//!   aliases `(seed, epoch + 1)`. `scx-loader`'s `downsample.rs` established the
+//!   chained-SplitMix64 convention for anything with more than one component and
+//!   `scx-loader`'s `seed.rs` now applies it crate-wide (its `shuffle.rs` and
+//!   `decode_stage.rs` were additive when this module was written, and are not
+//!   any more); this mirrors it. (It cannot *import* it — that lives in
+//!   `scx-loader`, which `scx-ops` does not depend on.)
 //! - **Domain-separate.** Without the tag, `shuffle(seed=42)` and the training
 //!   loader's `(seed=42, epoch=0)` shard permutation would be driven by the
 //!   same ChaCha8 stream. `42` is the default on both surfaces, so that pairing
 //!   is the *likely* one, not a corner case. The correlation would be a
 //!   statistical wart rather than a bug, but the tag costs one xor.
+//!   (`scx-loader` now tags its own two levels as well, so the three streams are
+//!   mutually separated rather than only this one being separated from them.)
 //!
 //! SplitMix64 is a **mixer, not a KDF** — it is here to decorrelate nearby
 //! seeds, not to resist an adversary. Nothing about this permutation is secret.

@@ -46,7 +46,15 @@ struct ShardGroupIndex {
 
 impl ShardGroupIndex {
     /// Build the index from all non-deleted cells in the shard group.
-    fn build(group: &ShardGroup) -> Self {
+    ///
+    /// Every global row in the group must be claimed by exactly one shard. That
+    /// is checked here rather than assumed: the map is keyed on the global row,
+    /// so a second claim would overwrite the first and the losing row would
+    /// vanish from `cell_indices()` — an epoch short by a number of cells that
+    /// varies per epoch, because which shards share a group depends on the
+    /// shard shuffle. `HashMap::insert` hands back the displaced value, so the
+    /// check costs nothing.
+    fn build(group: &ShardGroup) -> Result<Self> {
         let mut cell_to_shard = HashMap::new();
         for (shard_idx, shard) in group.shards.iter().enumerate() {
             for local_row in 0..shard.n_rows as usize {
@@ -57,10 +65,18 @@ impl ShardGroupIndex {
                     }
                 }
                 let global_idx = shard.global_row_offset + local_row as u64;
-                cell_to_shard.insert(global_idx, (shard_idx, local_row));
+                if let Some((prev_shard, _)) =
+                    cell_to_shard.insert(global_idx, (shard_idx, local_row))
+                {
+                    return Err(LoaderError::ShardRowOverlap {
+                        global_row: global_idx,
+                        shard_a: prev_shard,
+                        shard_b: shard_idx,
+                    });
+                }
             }
         }
-        ShardGroupIndex { cell_to_shard }
+        Ok(ShardGroupIndex { cell_to_shard })
     }
 
     /// Look up a cell's CSR row data from the shard group.
@@ -187,12 +203,20 @@ fn fill_batch_parallel(
                 // row) before any HVG projection. With a projection, the dense
                 // `output_row` holds only the panel genes, so its own sum would
                 // be a panel-local depth that silently diverges from scanpy's
-                // normalize-then-subset and from the pflog path above. For
-                // the no-projection case this equals `output_row.iter().sum()`.
+                // normalize-then-subset and from the pflog path above.
                 // Only needed when normalizing — skip the sum on raw-count /
                 // log1p-only configs (e.g. scVI) where `depth` is ignored.
+                //
+                // Not `output_row.iter().sum()` even without a projection: on
+                // the log path the values are clipped before the log, so the
+                // denominator has to be clipped too — that is what
+                // `transform_depth` decides.
+                // `transform_depth` clips when a log follows, so the
+                // denominator describes the values that will actually be
+                // logged — see its docs for the 1.5x mis-scale and the
+                // NaN-disables-the-whole-cell case that a raw sum causes.
                 let depth: f64 = if normalize {
-                    csr_data.iter().map(|&v| v as f64).sum()
+                    crate::normalize::transform_depth(csr_data, log1p)
                 } else {
                     0.0
                 };
@@ -665,13 +689,15 @@ pub fn decode_stage(
 
     // Create a seeded RNG for row-level shuffle (Level 2).
     // The shard-level shuffle (Level 1) already happened in shuffle_epoch().
-    // Incorporate the epoch number so different epochs produce different row orderings.
-    let mut rng = ChaCha8Rng::seed_from_u64(
-        config
-            .seed
-            .wrapping_add(0xDEADBEEF)
-            .wrapping_add(epoch.wrapping_mul(0x9E3779B97F4A7C15)),
-    );
+    // The epoch is chained in so different epochs produce different row
+    // orderings, and the domain tag keeps this stream independent of Level 1's
+    // at the same `(seed, epoch)` — see `crate::seed` for why neither is done
+    // by addition.
+    let mut rng = ChaCha8Rng::seed_from_u64(crate::seed::epoch_stream_seed(
+        config.seed,
+        crate::seed::ROW_SHUFFLE_TAG,
+        epoch,
+    ));
 
     let profile = profiling_enabled();
     let decode_start = Instant::now();
@@ -686,7 +712,7 @@ pub fn decode_stage(
 
         // Step 1: Build index for efficient row lookup
         let t0 = Instant::now();
-        let group_index = ShardGroupIndex::build(&group);
+        let group_index = ShardGroupIndex::build(&group)?;
         let index_time = t0.elapsed();
 
         // Step 2: Pool all non-deleted cell indices
@@ -852,7 +878,7 @@ mod tests {
             shards: vec![shard0, shard1],
         };
 
-        let index = ShardGroupIndex::build(&group);
+        let index = ShardGroupIndex::build(&group).unwrap();
 
         // All 8 cells should be present
         assert_eq!(index.cell_to_shard.len(), 8);
@@ -862,6 +888,75 @@ mod tests {
                 "cell {i} missing from index"
             );
         }
+    }
+
+    /// Two shards whose row ranges overlap must be rejected, not silently
+    /// deduplicated. Before this was checked, the second shard's rows
+    /// overwrote the first's in the map and the epoch was short by the
+    /// overlap — non-deterministically, since which shards share a group
+    /// depends on the per-epoch shard shuffle.
+    #[test]
+    fn build_rejects_two_shards_claiming_the_same_global_row() {
+        // shard0 covers [0, 5); shard1 claims [3, 6) — rows 3 and 4 collide.
+        let group = ShardGroup {
+            shards: vec![
+                make_shard_data(5, 10, 0, None),
+                make_shard_data(3, 10, 3, None),
+            ],
+        };
+
+        let Err(err) = ShardGroupIndex::build(&group) else {
+            panic!("expected an overlap error, got Ok");
+        };
+        assert!(
+            matches!(err, LoaderError::ShardRowOverlap { global_row: 3, .. }),
+            "expected ShardRowOverlap on row 3, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("global obs row 3") && msg.contains("disjoint"),
+            "message should name the row and the invariant: {msg}"
+        );
+    }
+
+    /// A deleted row does not launder an overlap: it is skipped before the
+    /// insert, so a collision on any *live* row still fails.
+    #[test]
+    fn build_rejects_an_overlap_even_when_some_rows_are_deleted() {
+        let mut deleted = roaring::RoaringBitmap::new();
+        deleted.insert(4); // local row 4 of shard0 == global row 4
+
+        let group = ShardGroup {
+            shards: vec![
+                make_shard_data(5, 10, 0, Some(deleted)),
+                make_shard_data(3, 10, 3, None),
+            ],
+        };
+
+        // Global row 4 is deleted from shard0, but global row 3 is not.
+        let Err(err) = ShardGroupIndex::build(&group) else {
+            panic!("expected an overlap error, got Ok");
+        };
+        assert!(
+            matches!(err, LoaderError::ShardRowOverlap { global_row: 3, .. }),
+            "expected ShardRowOverlap on row 3, got: {err}"
+        );
+    }
+
+    /// Adjacent, non-overlapping ranges — the normal case — still build.
+    /// Without this the check could be satisfied by rejecting everything.
+    #[test]
+    fn build_accepts_adjacent_disjoint_shards() {
+        let group = ShardGroup {
+            shards: vec![
+                make_shard_data(5, 10, 0, None),
+                make_shard_data(3, 10, 5, None),
+            ],
+        };
+        assert_eq!(
+            ShardGroupIndex::build(&group).unwrap().cell_to_shard.len(),
+            8
+        );
     }
 
     #[test]
@@ -876,7 +971,7 @@ mod tests {
             shards: vec![shard0, shard1],
         };
 
-        let index = ShardGroupIndex::build(&group);
+        let index = ShardGroupIndex::build(&group).unwrap();
 
         // 5 - 2 + 3 = 6 cells should be present
         assert_eq!(index.cell_to_shard.len(), 6);
@@ -894,7 +989,7 @@ mod tests {
             shards: vec![shard],
         };
 
-        let index = ShardGroupIndex::build(&group);
+        let index = ShardGroupIndex::build(&group).unwrap();
 
         // Row 0 (global=100): indices=[0, 1], data=[1.0, 2.0]
         let (idx, data) = index.get_row(100, &group).unwrap();
@@ -922,7 +1017,7 @@ mod tests {
         let group = ShardGroup {
             shards: vec![shard],
         };
-        let index = ShardGroupIndex::build(&group);
+        let index = ShardGroupIndex::build(&group).unwrap();
         let cell_indices: Vec<u64> = vec![0, 1, 2, 3];
         let n_genes = 10;
 
@@ -960,7 +1055,7 @@ mod tests {
         let group = ShardGroup {
             shards: vec![shard],
         };
-        let index = ShardGroupIndex::build(&group);
+        let index = ShardGroupIndex::build(&group).unwrap();
         let cell_indices: Vec<u64> = vec![0, 1, 2, 3];
 
         // Project to genes [0, 1, 4, 5]
@@ -1006,7 +1101,7 @@ mod tests {
         let group = ShardGroup {
             shards: vec![shard],
         };
-        let index = ShardGroupIndex::build(&group);
+        let index = ShardGroupIndex::build(&group).unwrap();
         let cell_indices: Vec<u64> = vec![0, 1, 2];
         let n_genes = 10;
 
@@ -1044,7 +1139,7 @@ mod tests {
         let group = ShardGroup {
             shards: vec![shard],
         };
-        let index = ShardGroupIndex::build(&group);
+        let index = ShardGroupIndex::build(&group).unwrap();
         let cell_indices: Vec<u64> = vec![0, 1];
         let n_genes = 10;
         let target_sum = 1e4;

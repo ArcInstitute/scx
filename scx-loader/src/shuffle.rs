@@ -13,8 +13,16 @@ use rand_chacha::ChaCha8Rng;
 
 /// Shuffles shard indices into randomized shard groups each epoch.
 ///
-/// Uses a deterministic RNG seeded from `(seed, epoch)` so that the same
-/// seed and epoch always produce the identical shard ordering.
+/// Uses a deterministic RNG seeded from `(seed, epoch)` — chained through
+/// [`crate::seed::epoch_stream_seed`] with the shard-shuffle domain tag, not
+/// added — so that the same seed and epoch always produce the identical shard
+/// ordering.
+///
+/// The chaining removes the *systematic* aliasing the old additive scheme had
+/// (`(s, e)` drove the same stream as `(s + φ, e − 1)`) and leaves distinct
+/// pairs on independent-looking streams. It is not injective and does not claim
+/// to be: `(u64, u64)` does not fit in the `u64` a stream is seeded from, so
+/// collisions exist by counting. What is gone is being able to *predict* one.
 #[derive(Debug)]
 pub struct ShardShuffler {
     n_shards: usize,
@@ -100,9 +108,11 @@ impl ShardShuffler {
 
     /// Core shuffle logic shared by `shuffle_epoch` and `shuffle_epoch_sorted`.
     fn shuffle_epoch_inner(&mut self) -> Vec<Vec<usize>> {
-        let combined_seed = self
-            .rng_seed
-            .wrapping_add(self.epoch.wrapping_mul(0x9E3779B97F4A7C15));
+        let combined_seed = crate::seed::epoch_stream_seed(
+            self.rng_seed,
+            crate::seed::SHARD_SHUFFLE_TAG,
+            self.epoch,
+        );
         let mut rng = ChaCha8Rng::seed_from_u64(combined_seed);
 
         let mut indices: Vec<usize> = (0..self.n_shards).collect();

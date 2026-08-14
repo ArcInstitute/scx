@@ -102,9 +102,17 @@ pub struct LoaderConfig {
     /// `Some(id)` (1-based) = restrict the I/O stage to shards stamped
     /// with the given `modality_id`. Cells (obs) are global across
     /// modalities, so `n_obs` is unchanged; only the X matrix is
-    /// per-modality. Deletion vectors are not supported in conjunction
-    /// with this filter (the per-shard bitmap keys reference the global
-    /// shard index, not the per-modality index).
+    /// per-modality. Deletion vectors compose with this filter: v2 stores
+    /// deletions as global obs rows, and `io_stage::reconstruct_deletion_map`
+    /// re-buckets them into whichever modality's shard ranges are being read
+    /// (`reconstruct_deletion_map_cross_modality` pins that).
+    ///
+    /// `None` on a **multimodal** file is rejected at construction: with no
+    /// filter the I/O stage pools every modality's shards, and since each
+    /// modality independently tiles `[0, n_obs)` two of them would claim the
+    /// same global row. `Some(mid)` is checked too — that modality's own shards
+    /// must tile the obs axis exactly once. See
+    /// [`ensure_csr_ranges_are_readable`].
     pub modality_id: Option<u8>,
     /// Opt out of the `hvg_indices` range check against `n_vars`.
     ///
@@ -274,11 +282,147 @@ fn shuffle_quality_degraded(requested: usize, effective: usize) -> bool {
     degraded
 }
 
+/// Refuse a file whose CSR shards do not tile the obs axis exactly once for the
+/// reader that is about to consume them.
+///
+/// Every loader in this crate resolves a cell by its **global obs row**, so the
+/// shard list it reads must claim each row exactly once. Two ways that fails:
+///
+/// * **A multimodal file read unscoped.** Each modality independently tiles
+///   `[0, n_obs)`, so the flattened list claims every row once per modality.
+///   `TrainingPipeline` would pool them into shard groups and drop or duplicate
+///   cells depending on the epoch's shuffle; `IndexPlanLoader` and
+///   `SparseCellSetLoader` go through `BackedCsrReader`, whose row index is
+///   built from the same flattened ranges, so they silently answer from
+///   whichever modality the index happened to keep — verified: a two-modality
+///   file with equal widths returns one modality's rows with no warning, and
+///   with differing widths it fails mid-iteration with a message blaming the
+///   file. Neither of those is a modality *choice* the caller made.
+/// * **A malformed single-modality tiling** — the merge / append / compact
+///   defect. `ShardGroupIndex::build` catches the duplicate only when both
+///   shards land in the same shard group, which the shuffle re-draws each epoch
+///   (and never, at `shard_group_size == 1`).
+///
+/// `scoped_modality` is `Some(mid)` when the caller selected one, in which case
+/// that modality's own tiling is what must hold; `None` means the whole
+/// flattened list is being read.
+pub(crate) fn ensure_csr_ranges_are_readable(
+    reader: &ScxReader,
+    scoped_modality: Option<u8>,
+    who: &str,
+) -> Result<()> {
+    match scoped_modality {
+        Some(mid) => {
+            if !reader
+                .catalog()
+                .modality_csr_ranges_tile_obs(mid, reader.n_obs())
+            {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "{who}: modality {mid}'s CSR shards do not tile the obs axis \
+                         [0, {}) exactly once — they overlap, leave a gap, or are \
+                         missing row-range stats, so a cell cannot be resolved to a \
+                         single shard. `scx info` lists the shard row ranges.",
+                        reader.n_obs()
+                    ),
+                });
+            }
+        }
+        None => {
+            if reader.catalog().has_overlapping_csr_ranges() {
+                let n_modalities = reader.n_modalities();
+                let remedy = if n_modalities > 1 {
+                    format!(
+                        "This file has {n_modalities} modalities, each covering the whole \
+                         obs axis, so the overlap is expected — but reading them pooled is \
+                         not a modality choice, it is an arbitrary one. Select one \
+                         (`modality_id` / `modality=` on TrainingDataset), use \
+                         `MultimodalTrainingDataset` to read several at once, or extract a \
+                         modality first with `scx subset --modality NAME` for the loaders \
+                         that have no modality surface."
+                    )
+                } else {
+                    "This file has a single modality, so its shards should tile the obs \
+                     axis exactly; the overlap means the file is malformed. `scx info` \
+                     lists the shard row ranges."
+                        .to_string()
+                };
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "{who}: this file's CSR shard row ranges overlap, so a cell \
+                         cannot be attributed to a single shard. {remedy}"
+                    ),
+                });
+            }
+            // Overlap is only half of "exactly once". A cover with a *gap*, one
+            // that stops short of `n_obs`, or one whose shards carry no
+            // row-range stats passes `has_overlapping_csr_ranges` — it skips
+            // stat-less entries outright — and then loses the uncovered rows:
+            // `TrainingPipeline` emits a short epoch, and the plan-driven
+            // loaders report an in-bounds row as "out of range" mid-iteration,
+            // blaming the caller's plan for the file's defect.
+            //
+            // This walks the **flattened** list, which is what the unscoped path
+            // actually reads — deliberately not
+            // `modality_csr_ranges_tile_obs(0, n_obs)`. That looked equivalent
+            // ("a single-modality file's shards are stamped `modality_id = 0`")
+            // and is not: a file with a *one-entry modality table* — what
+            // `from_mudata(MuData({"rna": adata}))` and a single-modality h5mu
+            // ingest emit — stamps its only X with `modality_id = 1`, leaving
+            // modality 0 owning no shards. Its flattened cover is perfectly
+            // unambiguous, and keying on modality 0 rejected every such file
+            // with a false "leave a gap".
+            //
+            // The overlap check above has already established the ranges are
+            // disjoint and sorted, so contiguity from 0 to `n_obs` is all that
+            // is left to prove.
+            let n_obs = reader.n_obs();
+            let mut expected: u64 = 0;
+            for entry in reader.catalog().csr_shards_sorted() {
+                let Some(stats) = entry.stats.as_ref() else {
+                    return Err(LoaderError::ConfigError {
+                        reason: format!(
+                            "{who}: CSR shard '{}' carries no row-range stats, so the \
+                             rows it holds cannot be located. `scx info` lists the \
+                             shard row ranges.",
+                            entry.name
+                        ),
+                    });
+                };
+                if stats.row_start != expected {
+                    return Err(LoaderError::ConfigError {
+                        reason: format!(
+                            "{who}: this file's CSR shards do not cover the obs axis \
+                             [0, {n_obs}) exactly once — shard '{}' starts at row {} \
+                             where row {expected} was expected, so rows \
+                             [{expected}, {}) belong to no shard. `scx info` lists the \
+                             shard row ranges.",
+                            entry.name, stats.row_start, stats.row_start
+                        ),
+                    });
+                }
+                expected = stats.row_end;
+            }
+            if expected != n_obs {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "{who}: this file's CSR shards cover the obs axis only up to \
+                         row {expected}, but n_obs is {n_obs} — rows \
+                         [{expected}, {n_obs}) belong to no shard. `scx info` lists \
+                         the shard row ranges."
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compute the memory budget for the training pipeline.
 ///
 /// Memory model:
 /// ```text
-/// n_output_genes     = hvg_indices.len() if present, else n_vars
+/// n_output_genes     = unique genes in hvg_indices if present, else n_vars
 /// shard_buffer       = (shard_group_size + 1) × decoded_shard_bytes
 /// batch_buffer       = (max(prefetch_batches, 2) + 1) × batch_size × n_output_genes × 4
 /// mmap_resident      = file_size_bytes (entire file faulted into RSS during epoch)
@@ -296,8 +440,12 @@ pub fn compute_memory_budget(
     avg_nnz_per_cell: f64,
     file_size_bytes: usize,
 ) -> MemoryBudget {
+    // The deduplicated width, not `hvg.len()` — the batch is allocated at
+    // `HvgProjection::n_output_cols()`, so costing the raw length over-reserves
+    // for any panel with duplicates and can auto-tune `batch_size` down to
+    // afford memory that is never used.
     let n_output_genes = match &config.hvg_indices {
-        Some(hvg) => hvg.len(),
+        Some(hvg) => HvgProjection::output_cols_for(hvg),
         None => n_vars as usize,
     };
 
@@ -561,7 +709,6 @@ pub struct TrainingPipeline {
     /// `Drop`. Workers are *not* shared with rayon's global registry.
     decode_pool: Option<Arc<rayon::ThreadPool>>,
     shuffler: ShardShuffler,
-    epoch_active: bool,
 }
 
 impl TrainingPipeline {
@@ -613,9 +760,14 @@ impl TrainingPipeline {
                         reader.n_modalities()
                     ),
                 })?;
+            ensure_csr_ranges_are_readable(&reader, Some(mid), "TrainingPipeline")?;
             let n_shards = reader.catalog().csr_shards_for_modality(mid).len();
             (info.n_vars, n_shards, info.nnz)
         } else {
+            // No modality selected, so the I/O stage pools `shards_sorted()`
+            // (`io_stage.rs`) — every modality's shards at once. See
+            // `ensure_csr_ranges_are_readable` for what that does to a cell.
+            ensure_csr_ranges_are_readable(&reader, None, "TrainingPipeline")?;
             (
                 header.n_vars,
                 reader.catalog().shards_sorted().len(),
@@ -623,10 +775,12 @@ impl TrainingPipeline {
             )
         };
 
-        // HVG projection, built here rather than just before it is stored: the
-        // memory budget below derives `n_output_genes` from `hvg_indices.len()`
-        // (`adaptive_budget_mb`, then `compute_memory_budget`), so validating
-        // later would let an out-of-range panel size the budget first.
+        // HVG projection, built here rather than just before it is stored,
+        // because the memory budget below needs it: `adaptive_budget_mb` reads
+        // `n_output_cols()` straight off it, and `compute_memory_budget` — which
+        // only gets a `LoaderConfig` — recomputes the same width through
+        // `HvgProjection::output_cols_for`. Building it first also means an
+        // out-of-range panel is rejected before it can size anything.
         let projection = match &config.hvg_indices {
             // Range-checked — the default, including every modality-*scoped*
             // loader. An index >= n_vars matches no CSR column on either scatter
@@ -748,8 +902,11 @@ impl TrainingPipeline {
         // the hard-ceiling auto-tune + warnings rather than reserving unbounded
         // RAM). Only ever raises, never lowers.
         if config.auto_memory_budget {
-            let n_output_genes = match &config.hvg_indices {
-                Some(hvg) => hvg.len(),
+            // Read the width off the projection built above rather than the raw
+            // panel: they differ whenever the panel had duplicates, and the
+            // projection's answer is the one the batch is allocated at.
+            let n_output_genes = match &projection {
+                Some(proj) => proj.n_output_cols(),
                 None => n_vars as usize,
             };
             let adaptive_mb = adaptive_budget_mb(
@@ -835,7 +992,6 @@ impl TrainingPipeline {
             decode_handle: None,
             decode_pool: None,
             shuffler,
-            epoch_active: false,
         })
     }
 
@@ -1099,7 +1255,6 @@ impl TrainingPipeline {
         self.batch_rx = Some(batch_rx);
         self.io_handle = Some(io_handle);
         self.decode_handle = Some(decode_handle);
-        self.epoch_active = true;
 
         Ok(())
     }
@@ -1142,12 +1297,11 @@ impl TrainingPipeline {
                     "next_batch: channel closed (epoch end or fault)"
                 );
                 // The epoch is over either way; tear it down before deciding
-                // clean-vs-fault (`join_epoch_handles` only clears
-                // `epoch_active` on its clean tail, not its early error
-                // returns, so set it here unconditionally).
-                let join = self.join_epoch_handles();
-                self.epoch_active = false;
-                join.map(|()| None)
+                // clean-vs-fault. `join_epoch_handles` clears `batch_rx` as its
+                // first statement, on every exit path including its early error
+                // returns, so the teardown holds even when the join reports a
+                // fault.
+                self.join_epoch_handles().map(|()| None)
             }
         }
     }
@@ -1169,6 +1323,18 @@ impl TrainingPipeline {
             Some(proj) => proj.n_output_cols(),
             None => self.n_vars as usize,
         }
+    }
+
+    /// Verdict on whether building the HVG projection changed the panel the
+    /// caller passed — `None` when it was already ascending and unique.
+    ///
+    /// The pyo3 layer turns this into a `UserWarning`; pure-Rust callers can
+    /// read the struct. See [`crate::projection::assess_hvg_panel`].
+    pub fn hvg_panel(&self) -> Option<crate::projection::HvgPanelVerdict> {
+        self.config
+            .hvg_indices
+            .as_deref()
+            .and_then(crate::projection::assess_hvg_panel)
     }
 
     /// Effective batch_size after memory budget auto-tuning.
@@ -1250,7 +1416,6 @@ impl TrainingPipeline {
             }
         }
 
-        self.epoch_active = false;
         Ok(())
     }
 
@@ -1551,6 +1716,83 @@ mod tests {
         assert_eq!(budget.prefetch_batches, 4);
         assert_eq!(budget.batch_size, 1024);
         assert!(!budget.budget_exceeded);
+    }
+
+    /// The budget must cost the panel's *deduplicated* width, because that is
+    /// what the batch is allocated at (`HvgProjection::n_output_cols`). Costing
+    /// the raw length over-reserves and can auto-tune `batch_size` down to
+    /// afford memory the loader can never use.
+    #[test]
+    fn budget_costs_the_deduplicated_hvg_width() {
+        let unique: Vec<u32> = (0..2000).collect();
+        // Same 2000 genes, each written twice: identical batch, twice the len().
+        let mut duplicated: Vec<u32> = unique.iter().chain(unique.iter()).copied().collect();
+        duplicated.sort_unstable();
+
+        let budget_of = |panel: Vec<u32>| {
+            compute_memory_budget(
+                &LoaderConfig {
+                    hvg_indices: Some(panel),
+                    ..LoaderConfig::default()
+                },
+                30_000,
+                16_384,
+                10.0,
+                0,
+            )
+        };
+        let plain = budget_of(unique);
+        let dup = budget_of(duplicated);
+
+        assert_eq!(
+            dup.estimated_bytes, plain.estimated_bytes,
+            "a duplicated panel projects to the same width, so it must cost the same"
+        );
+        assert_eq!(dup.batch_size, plain.batch_size);
+        assert_eq!(dup.prefetch_batches, plain.prefetch_batches);
+        assert_eq!(dup.shard_group_size, plain.shard_group_size);
+    }
+
+    /// The same claim where it bites: under a budget tight enough to force the
+    /// auto-tune to act, an inflated width made it act *harder* than the real
+    /// width needed.
+    #[test]
+    fn a_duplicated_panel_does_not_tighten_the_auto_tune() {
+        let unique: Vec<u32> = (0..8000).collect();
+        let mut duplicated: Vec<u32> = unique.iter().chain(unique.iter()).copied().collect();
+        duplicated.sort_unstable();
+
+        let budget_of = |panel: Vec<u32>| {
+            compute_memory_budget(
+                &LoaderConfig {
+                    hvg_indices: Some(panel),
+                    max_memory_mb: 128,
+                    auto_memory_budget: false,
+                    ..LoaderConfig::default()
+                },
+                30_000,
+                16_384,
+                10.0,
+                0,
+            )
+        };
+        let dup = budget_of(duplicated);
+        let plain = budget_of(unique);
+        // A budget this tight does reduce something — assert that first, or the
+        // comparison below could pass by both arms being untouched.
+        assert!(
+            plain.prefetch_batches < 4 || plain.shard_group_size < 8 || plain.batch_size < 1024,
+            "fixture must actually engage the auto-tune"
+        );
+        assert_eq!(
+            (dup.shard_group_size, dup.prefetch_batches, dup.batch_size),
+            (
+                plain.shard_group_size,
+                plain.prefetch_batches,
+                plain.batch_size
+            ),
+            "the duplicated panel tuned to a different config than the identical batch needs"
+        );
     }
 
     #[test]
@@ -1947,7 +2189,6 @@ mod tests {
         pipeline.batch_rx = Some(batch_rx);
         pipeline.decode_handle = Some(decode_handle);
         pipeline.io_handle = None;
-        pipeline.epoch_active = true;
 
         let result = pipeline.next_batch();
         assert!(
@@ -1961,8 +2202,8 @@ mod tests {
             "unexpected error message: {msg}"
         );
         assert!(
-            !pipeline.epoch_active,
-            "epoch must be inactive after a fault"
+            pipeline.batch_rx.is_none(),
+            "the epoch must be torn down after a fault"
         );
     }
 

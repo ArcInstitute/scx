@@ -15,6 +15,7 @@ pub mod projection;
 #[cfg(feature = "python")]
 pub mod python;
 pub(crate) mod runtime;
+pub(crate) mod seed;
 pub mod shuffle;
 pub mod sparse_cellset;
 pub mod sparse_cellset_collate;
@@ -35,7 +36,7 @@ pub use normalize::{
 pub use pipeline::{compute_memory_budget, LoaderConfig, MemoryBudget, TrainingPipeline};
 pub use plan_engine::{PlanPrefetchIter, PrefetchEngine};
 pub use pool::{cpu_pool, resolve_pool_threads, DEFAULT_DECODE_POOL_MAX_THREADS};
-pub use projection::{scatter_row_full, HvgProjection};
+pub use projection::{assess_hvg_panel, scatter_row_full, HvgPanelVerdict, HvgProjection};
 pub use shuffle::{RowShuffler, ShardShuffler};
 pub use sparse_cellset::{
     collate_gathered, CollateScalars, CollatedCellSetBatch, SparseCellSetBatch,

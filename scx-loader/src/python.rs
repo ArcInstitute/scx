@@ -125,6 +125,10 @@ impl TrainingDataset {
     ///         n_vars when `modality=` or the multimodal fallback is in
     ///         play); an out-of-range index is rejected at construction
     ///         rather than becoming an always-zero output column.
+    ///         Sorted and deduplicated, so batch columns are in ascending
+    ///         gene-index order regardless of the order passed and duplicates
+    ///         shrink the batch (see `n_output_genes`); a panel that is not
+    ///         already ascending-unique gets a UserWarning.
     ///     obs_columns: Obs metadata column names to include in each batch.
     ///     normalize: Apply total-count normalization (default: True).
     ///         NOTE: this is **on by default** — batches are normalized even
@@ -230,6 +234,10 @@ impl TrainingDataset {
 
         let pipeline = TrainingPipeline::new(path, config)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        if let Some(v) = pipeline.hvg_panel() {
+            warn_hvg_panel(py, "TrainingDataset", &v)?;
+        }
 
         Ok(TrainingDataset {
             pipeline,
@@ -544,6 +552,10 @@ impl MultimodalTrainingDataset {
     ///         range-check the panel: an index past a given modality's
     ///         n_vars yields a silently always-zero column there. The
     ///         per-modality `TrainingDataset` route above is checked.
+    ///         Sorted and deduplicated as everywhere else, so batch columns
+    ///         are in ascending gene-index order regardless of the order
+    ///         passed; a panel that is not already ascending-unique gets a
+    ///         UserWarning (once, since the panel is shared).
     ///     obs_columns: Obs columns to include in each batch (read
     ///         once from the global obs table).
     ///     return_dict: If True (default), yield
@@ -580,6 +592,7 @@ impl MultimodalTrainingDataset {
         max_memory_mb=None,
     ))]
     fn new(
+        py: Python<'_>,
         path: &str,
         modalities: Vec<String>,
         batch_size: Option<usize>,
@@ -707,6 +720,12 @@ impl MultimodalTrainingDataset {
             let pipeline = TrainingPipeline::new(path, config.clone())
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             pipelines.push(pipeline);
+        }
+
+        // One shared panel, so one warning — emit it off the first pipeline
+        // rather than once per modality.
+        if let Some(v) = pipelines.first().and_then(|p| p.hvg_panel()) {
+            warn_hvg_panel(py, "MultimodalTrainingDataset", &v)?;
         }
 
         // Pin uniform effective batch_size + shard_group_size (min across
@@ -1092,6 +1111,10 @@ impl IndexPlanDataset {
     ///         rejected at construction rather than becoming an
     ///         always-zero output column. This class has no modality
     ///         surface — the bound is always the file-wide n_vars.
+    ///         Sorted and deduplicated, so batch columns are in ascending
+    ///         gene-index order regardless of the order passed and duplicates
+    ///         shrink the batch (see `n_output_genes`); a panel that is not
+    ///         already ascending-unique gets a UserWarning.
     ///     obs_columns: Obs metadata column names to include in each batch.
     ///     normalize: Apply total-count normalization (default: True).
     ///     log1p: Apply ln(x+1) to each row (default: True). Independent of
@@ -1217,6 +1240,9 @@ impl IndexPlanDataset {
 
         if let Some(v) = loader.cache_sizing() {
             warn_cache_sizing(py, "IndexPlanDataset", &v)?;
+        }
+        if let Some(v) = loader.hvg_panel() {
+            warn_hvg_panel(py, "IndexPlanDataset", &v)?;
         }
 
         // Preflight: the scattered block-index fast path can only fire on
@@ -1735,6 +1761,45 @@ fn warn_cache_sizing(
         v.shard_decoded_bytes / 1024,
         v.budget_mb_for_requested,
         v.effective_cache_shards,
+    );
+    warnings.call_method1("warn", (msg, user_warning))?;
+    Ok(())
+}
+
+/// Emit the construction-time `UserWarning` for an `hvg_indices` panel that the
+/// projection had to canonicalise.
+///
+/// Same house style as [`warn_cache_sizing`]: warn and continue, name the
+/// observed numbers, say what the caller actually gets. Silent for a panel that
+/// is already ascending and unique — which the documented recipe,
+/// `np.where(adata.var["highly_variable"])[0]`, always is — so this fires only
+/// when the caller's own column→gene mapping has genuinely diverged from the
+/// batch's.
+fn warn_hvg_panel(
+    py: Python<'_>,
+    dataset: &str,
+    v: &crate::projection::HvgPanelVerdict,
+) -> PyResult<()> {
+    let warnings = py.import("warnings")?;
+    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    let mut parts: Vec<String> = Vec::new();
+    if v.was_reordered {
+        parts.push(
+            "sorted into ascending gene-index order, so batch columns are NOT in the \
+             order you passed"
+                .to_string(),
+        );
+    }
+    if v.unique_len != v.requested_len {
+        parts.push(format!(
+            "deduplicated from {} to {} entries, so the batch is {} columns wide",
+            v.requested_len, v.unique_len, v.unique_len
+        ));
+    }
+    let msg = format!(
+        "{dataset}: hvg_indices was {}. Index your gene names with \
+         `np.unique(hvg_indices)` to recover the column order the batches actually use.",
+        parts.join(" and "),
     );
     warnings.call_method1("warn", (msg, user_warning))?;
     Ok(())
