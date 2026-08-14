@@ -169,13 +169,21 @@ impl ValueEncoding {
                 // On the *detect* path, fresh out-of-range data is caught
                 // upstream by `detect_value_encoding`, which sends anything
                 // above `u32::MAX` to `Float32` so this arm is never selected
-                // for it. The two in-tree writers that reach an encoding
-                // *after* detection — `encoding_for_canonicalized` (whose
-                // ladder now runs to `Float32`) and `attach_external_layer`
-                // (which re-derives each shard's encoding from its
-                // canonicalized values) — divert or refuse before getting
-                // here. What remains: a caller passing an explicit encoding
-                // bypasses the detector entirely and still saturates.
+                // for it. `attach_external_layer`, which re-derives each
+                // shard's encoding after canonicalizing, applies that same
+                // fresh-data rule and so never selects this arm either.
+                //
+                // `scx_ops::encoding_for_canonicalized` is the deliberate
+                // exception and arrives here **on purpose**: its values may
+                // have come off disk, where an f32 of exactly 2³² is the image
+                // of a stored `u32::MAX`, so it keeps `Uint32` precisely to get
+                // the saturation above — which restores the original value.
+                // Do not "fix" it to divert at 2³²; this arm is what makes a
+                // rewrite of such an archive lossless. Strictly above 2³² it
+                // does divert, since no `u32` decodes there.
+                //
+                // What remains: a caller passing an explicit encoding bypasses
+                // every detector and still saturates.
                 //
                 // Separately, this arm cannot see the loss that happens
                 // *before* it. The rewrite paths decode integer shards to

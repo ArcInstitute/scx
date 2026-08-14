@@ -218,53 +218,80 @@ pub fn copy_obs_var_preserving_layout(
 /// still fits, which is the overwhelmingly common case — this only widens for a
 /// shard canonicalization actually rewrote.
 pub fn encoding_for_canonicalized(source: ValueEncoding, data: &[f32]) -> ValueEncoding {
-    // `Float16`'s limit is a magnitude, the integer limits are signed ceilings,
-    // so the two need different folds. Using the signed max for f16 is how the
-    // negative half went unguarded: it starts at 0.0, so an all-negative shard
-    // reports `max == 0.0` and never widens. Folded in f64 to match
-    // `detect_value_encoding`; every threshold here is exact in f32 too, so the
-    // width is convention rather than correctness — the *constant* on the
-    // `Uint32` arm is what has to be right.
-    let max = data.iter().map(|&v| v as f64).fold(0.0f64, f64::max);
-    let max_abs = data.iter().map(|&v| v.abs() as f64).fold(0.0f64, f64::max);
+    // One pass, folding both limits together. `Float16`'s ceiling is a
+    // magnitude while the integer ceilings are signed, so both are needed —
+    // using the signed max for f16 is how the negative half went unguarded: it
+    // starts at 0.0, so an all-negative shard reports `max == 0.0` and never
+    // widens. The rungs below are a flat ladder rather than a recursive one
+    // because recursing re-folded the whole slice per rung, and `copy_layers`
+    // calls this on every layer shard of an upgrade.
+    //
+    // Folded in f64 to match `detect_value_encoding`; every threshold here is
+    // exact in f32 too, so the width is convention rather than correctness —
+    // the *constant* on the `Uint32` rung is what has to be right.
+    let (max, max_abs) = data.iter().fold((0.0f64, 0.0f64), |(m, ma), &v| {
+        let v = v as f64;
+        (m.max(v), ma.max(v.abs()))
+    });
     match source {
         // f16's finite ceiling. Past it `from_f32` yields ±inf, silently.
         ValueEncoding::Float16 if max_abs > 65504.0 => ValueEncoding::Float32,
-        // Each integer rung hands off to the next rather than terminating, so a
-        // narrow source whose sums outgrow the whole ladder reaches Float32.
-        ValueEncoding::Uint8 if max > u8::MAX as f64 => {
-            encoding_for_canonicalized(ValueEncoding::Uint16, data)
+        ValueEncoding::Uint8 | ValueEncoding::Uint16 | ValueEncoding::Uint32 => {
+            if max > U32_DECODE_CEILING {
+                ValueEncoding::Float32
+            } else if max > u16::MAX as f64 {
+                ValueEncoding::Uint32
+            } else if max > u8::MAX as f64 {
+                // Never narrower than the source: a shard whose values happen to
+                // fit a smaller width keeps the encoding the file already chose.
+                widest_of_two(source, ValueEncoding::Uint16)
+            } else {
+                source
+            }
         }
-        ValueEncoding::Uint16 if max > u16::MAX as f64 => {
-            encoding_for_canonicalized(ValueEncoding::Uint32, data)
-        }
-        // 2³², **exclusive** — not `u32::MAX`. The two differ here and the gap
-        // is the whole point: `u32::MAX as f32` rounds *up* to 2³², so no `u32`
-        // on disk decodes above 2³², and a value strictly greater can only have
-        // been produced by summing. That makes this arm provenance-proof, which
-        // matters because at 2³² itself the provenances are indistinguishable —
-        // it is equally the f32 image of a decoded `u32::MAX` and a sum that
-        // reached it. Keeping `Uint32` there is the better half of an
-        // irreducible choice: `as u32` saturates the decoded value back to
-        // `u32::MAX` exactly, so the rewrite stays lossless on a format-valid
-        // archive, whereas widening would write 2³² — one larger, and no longer
-        // a value `u32` can hold at all, so the file stops reading as uint32. A
-        // sum that lands exactly on 2³² is written one low; that is the residue
-        // of the f32 round-trip these paths already have, not something this
-        // arm can fix (see the `>2²⁴` note on `ValueEncoding::encode_f32`).
-        //
-        // Above the ceiling the source encoding does *not* fail quietly —
-        // `encode_f32` refuses outright — so widening here is what keeps the
-        // rewrite from aborting. Pair it with `codec_for_canonicalized`: Float32
-        // is not Scx1-encodable.
-        ValueEncoding::Uint32 if max > U32_DECODE_CEILING => ValueEncoding::Float32,
         other => other,
     }
 }
 
+/// The wider of two **integer** encodings.
+///
+/// Only ever called with the source rung and the rung its values need, so the
+/// ordering question is `Uint8 < Uint16 < Uint32` and nothing else; floats never
+/// reach it.
+fn widest_of_two(a: ValueEncoding, b: ValueEncoding) -> ValueEncoding {
+    let rank = |e: ValueEncoding| match e {
+        ValueEncoding::Uint8 => 0,
+        ValueEncoding::Uint16 => 1,
+        _ => 2,
+    };
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
 /// The largest `f32` any on-disk `u32` decodes to: 2³², because `u32::MAX as
-/// f32` rounds up. Values at or below it may be decoded originals; values above
-/// it cannot be.
+/// f32` rounds *up*. Values at or below it may be decoded originals; values
+/// above it cannot be.
+///
+/// This is why [`encoding_for_canonicalized`]'s top rung is bounded here rather
+/// than at `u32::MAX`, and the gap between the two is the whole point. Strictly
+/// above 2³² a value is provably a sum, so widening is unambiguous — and
+/// necessary, because `encode_f32` refuses such a value outright and would abort
+/// the rewrite. **At** 2³² the provenances are indistinguishable: it is equally
+/// the f32 image of a decoded `u32::MAX` and a sum that reached it. Keeping
+/// `Uint32` is the better half of that irreducible choice — `as u32` saturates
+/// the decoded value back to `u32::MAX` exactly, so the rewrite stays lossless
+/// on a format-valid archive, whereas widening writes 2³², one larger and not a
+/// value `u32` can hold at all, so the file stops reading as `uint32`. A sum
+/// landing exactly on 2³² is written one low; that is the residue of the f32
+/// round-trip these paths already have, not something this rung can fix.
+///
+/// **Only the rewrite paths are ambiguous.** A caller holding values that never
+/// went through a `u32` decode — `attach_external_layer`, whose source is an
+/// external file — knows 2³² is a real sum, and must use
+/// `scx_codec::detect_value_encoding` instead of this function.
 const U32_DECODE_CEILING: f64 = (1u64 << 32) as f64;
 
 /// The codec to pair with a value encoding [`encoding_for_canonicalized`] may

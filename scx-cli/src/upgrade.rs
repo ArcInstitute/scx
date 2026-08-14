@@ -968,6 +968,20 @@ mod tests {
             .expect("a layer shard widened to Float32 must drop Scx1, not fail FloatWithScx1");
 
         let out = ScxReader::open(&output).unwrap();
+        // The header, not just the decoded value: a decode-only assertion still
+        // passes if the shard were written Float32 under some other wrong codec.
+        let entry = out
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == scx_format_io::section::SectionType::LayerCsrShard)
+            .expect("the upgraded file must carry the layer shard");
+        let sh = out.read_shard_header(entry).unwrap();
+        assert_eq!(
+            ValueEncoding::from_u8(sh.value_encoding),
+            Some(ValueEncoding::Float32)
+        );
+        assert_ne!(CodecId::from_u8(sh.codec_id), Some(CodecId::Scx1));
         assert_eq!(out.read_layer("counts").unwrap().data, vec![5e9]);
     }
 

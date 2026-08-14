@@ -1509,6 +1509,75 @@ fn attach_layer_rejects_a_pinned_encoding_the_sums_outgrow() {
     );
 }
 
+/// The 2³² ambiguity is irreducible for the *rewrite* paths — there an f32 of
+/// 2³² is equally a decoded on-disk `u32::MAX`, so `encoding_for_canonicalized`
+/// deliberately keeps `Uint32` and lets `as u32` saturate it back. It is **not**
+/// ambiguous here: `ExternalLayerData` carries fresh values that never passed
+/// through a `u32` decode, so a sum of `2³¹ + 2³¹` is exactly 2³² and nothing
+/// else. Encoding it as `Uint32` writes `u32::MAX`, one less than the sum, with
+/// no error — the same silent corruption this PR exists to remove, on the one
+/// path that has the evidence to avoid it.
+///
+/// Read back through `f32` the two are indistinguishable (`u32::MAX as f32` is
+/// 2³²), so the encoding is what has to be asserted.
+#[test]
+fn attach_layer_uses_the_fresh_data_rule_at_the_u32_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let two_pow_31 = 2_147_483_648.0f32;
+    let data = duplicate_coordinate_data(two_pow_31, two_pow_31);
+    let summary = attach_external_layer(&path, &data, &opts("cb")).unwrap();
+    assert_eq!(
+        summary.value_encoding,
+        ValueEncoding::Float32,
+        "a fresh sum above u32::MAX must not be written as Uint32 and saturated"
+    );
+}
+
+/// The pinned branch has to answer the same question the same way: at 2³² the
+/// values genuinely do not fit `Uint32`, so a caller who pinned it must be told,
+/// not handed a silently saturated shard.
+#[test]
+fn attach_layer_rejects_a_pinned_uint32_at_the_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let two_pow_31 = 2_147_483_648.0f32;
+    let data = duplicate_coordinate_data(two_pow_31, two_pow_31);
+    let pinned = AttachLayerOptions {
+        value_encoding: Some(ValueEncoding::Uint32),
+        ..opts("cb")
+    };
+    assert!(
+        attach_external_layer(&path, &data, &pinned).is_err(),
+        "a pinned Uint32 that the canonicalized sum outgrows must be reported"
+    );
+}
+
+/// The overflow diagnostic is the only thing that makes a pinned `Float16`
+/// overflow audible at all, so it has to name the value that caused it. Folding
+/// the reported maximum from `0.0` with a *signed* max reports `0` for an
+/// all-negative shard — the one case the magnitude guard was just added for.
+#[test]
+fn attach_layer_pinned_overflow_names_the_offending_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let data = duplicate_coordinate_data(-40_000.0, -40_000.0);
+    let pinned = AttachLayerOptions {
+        value_encoding: Some(ValueEncoding::Float16),
+        ..opts("cb")
+    };
+    let err = attach_external_layer(&path, &data, &pinned)
+        .expect_err("a pinned Float16 the sums outgrow must be reported");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("-80000"),
+        "the diagnostic must name the value that overflowed, got: {msg}"
+    );
+}
+
 /// `--dry-run` predicts the import; it has to predict this too. The write loop
 /// would refuse a pinned encoding the sums outgrow, so a preview that returns
 /// `Ok` sends the user into a failure it was asked to find.
