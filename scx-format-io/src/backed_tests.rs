@@ -1955,9 +1955,9 @@ fn prefetched_aggregations_are_bit_identical_to_a_sequential_loop() {
         ref_row_sums.extend(csr.row_sums());
         ref_row_nnz.extend(csr.row_nnz());
         ref_row_sq.extend(csr.row_sum_of_squares());
-        ref_row_var.extend(csr.row_var());
-        ref_row_max.extend(csr.row_max());
-        ref_row_min.extend(csr.row_min());
+        ref_row_var.extend(csr.row_var().unwrap());
+        ref_row_max.extend(csr.row_max().unwrap());
+        ref_row_min.extend(csr.row_min().unwrap());
         for (s, p) in ref_col_sums.iter_mut().zip(csr.col_sums().iter()) {
             *s += p;
         }

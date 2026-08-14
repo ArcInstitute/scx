@@ -131,7 +131,7 @@ pub fn col_max_projected(
 
     // Implicit zeros: if column has fewer stored entries than n_obs
     for c in 0..n_proj {
-        if col_nnz[c] < n_obs {
+        if scx_sparse::implicit_zero_count(n_obs, col_nnz[c])? > 0 {
             if maxes[c] == f64::NEG_INFINITY {
                 maxes[c] = 0.0;
             } else {
@@ -174,7 +174,7 @@ pub fn col_min_projected(
     )?;
 
     for c in 0..n_proj {
-        if col_nnz[c] < n_obs {
+        if scx_sparse::implicit_zero_count(n_obs, col_nnz[c])? > 0 {
             if mins[c] == f64::INFINITY {
                 mins[c] = 0.0;
             } else {
@@ -229,20 +229,9 @@ pub fn col_var_projected(
     )?;
 
     // Add contribution from implicit zeros
-    let mut variances = vec![0.0f64; n_proj];
-    for c in 0..n_proj {
-        debug_assert!(
-            col_nnz[c] <= n_obs,
-            "col_nnz[{}] = {} exceeds n_obs = {}",
-            c,
-            col_nnz[c],
-            n_obs
-        );
-        let n_zeros = n_obs - col_nnz[c];
-        let total_sq_dev = sq_devs[c] + n_zeros as f64 * col_means[c] * col_means[c];
-        variances[c] = total_sq_dev / n_obs as f64;
-    }
-    Ok(variances)
+    Ok(scx_sparse::finalize_implicit_zero_variance(
+        &sq_devs, &col_nnz, &col_means, n_obs,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +339,7 @@ pub fn row_stats_projected(
     col_indices: &[u32],
 ) -> Result<ProjectedRowStats> {
     let n_obs = reader.shape().0;
+    let n_proj = col_indices.len();
     let mut sums = vec![0.0f64; n_obs];
     let mut sumsq = vec![0.0f64; n_obs];
     let mut global_row = 0usize;
@@ -362,6 +352,17 @@ pub fn row_stats_projected(
             for row in 0..projected.n_rows() {
                 let s = projected.indptr[row] as usize;
                 let e = projected.indptr[row + 1] as usize;
+                // Same overfull-axis guard the unprojected `ScxCsr::row_var`
+                // applies, against the projected width. Without it, an active
+                // column projection turned an error back into a clamped `0.0`:
+                // `X.var(axis=1)` rejected an overfull row while
+                // `X[:, cols].var(axis=1)` answered, so view selection decided
+                // whether a corrupt file was caught. `project_csr` does not
+                // drop duplicates, and a canonical source row can hold at most
+                // one entry per projected column, so `e - s > n_proj` carries
+                // the same proof as elsewhere. The count is already in hand —
+                // this adds no pass.
+                scx_sparse::implicit_zero_count(n_proj, e - s)?;
                 let g = global_row + row;
                 let mut sm = 0.0f64;
                 let mut sq = 0.0f64;
@@ -755,7 +756,7 @@ pub fn col_max_masked_projected(
     )?;
 
     for c in 0..n_proj {
-        if col_nnz[c] < n_kept {
+        if scx_sparse::implicit_zero_count(n_kept, col_nnz[c])? > 0 {
             if maxes[c] == f64::NEG_INFINITY {
                 maxes[c] = 0.0;
             } else {
@@ -806,7 +807,7 @@ pub fn col_min_masked_projected(
     )?;
 
     for c in 0..n_proj {
-        if col_nnz[c] < n_kept {
+        if scx_sparse::implicit_zero_count(n_kept, col_nnz[c])? > 0 {
             if mins[c] == f64::INFINITY {
                 mins[c] = 0.0;
             } else {
@@ -866,20 +867,9 @@ pub fn col_var_masked_projected(
     )?;
 
     // Add zero-entry contributions
-    let mut variances = vec![0.0f64; n_proj];
-    for c in 0..n_proj {
-        debug_assert!(
-            col_nnz[c] <= n_kept,
-            "col_nnz[{}] = {} exceeds n_kept = {}",
-            c,
-            col_nnz[c],
-            n_kept
-        );
-        let n_zeros = n_kept - col_nnz[c];
-        let total = sq_devs[c] + n_zeros as f64 * col_means[c] * col_means[c];
-        variances[c] = total / n_kept as f64;
-    }
-    Ok(variances)
+    Ok(scx_sparse::finalize_implicit_zero_variance(
+        &sq_devs, &col_nnz, &col_means, n_kept,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,7 +1002,7 @@ pub fn col_max_projected_csc(
         col_nnz[output_col] += e - s;
     })?;
     for c in 0..n_proj {
-        if col_nnz[c] < n_obs {
+        if scx_sparse::implicit_zero_count(n_obs, col_nnz[c])? > 0 {
             if maxes[c] == f64::NEG_INFINITY {
                 maxes[c] = 0.0;
             } else {
@@ -1046,7 +1036,7 @@ pub fn col_min_projected_csc(
         col_nnz[output_col] += e - s;
     })?;
     for c in 0..n_proj {
-        if col_nnz[c] < n_obs {
+        if scx_sparse::implicit_zero_count(n_obs, col_nnz[c])? > 0 {
             if mins[c] == f64::INFINITY {
                 mins[c] = 0.0;
             } else {
@@ -1068,9 +1058,6 @@ pub fn col_var_projected_csc(
     n_obs: usize,
 ) -> Result<Vec<f64>> {
     let n_proj = col_indices.len();
-    if n_obs == 0 {
-        return Ok(vec![0.0f64; n_proj]);
-    }
     let mut sum_x = vec![0.0f64; n_proj];
     let mut sum_x2 = vec![0.0f64; n_proj];
     let mut col_nnz = vec![0usize; n_proj];
@@ -1091,6 +1078,26 @@ pub fn col_var_projected_csc(
     // var = E[X²] - (E[X])²; the implicit-zero entries contribute 0 to
     // both sum_x and sum_x², so the formula is just a population mean
     // and second moment over n_obs.
+    //
+    // This form never subtracts a count, so it never wrapped — but it also
+    // never *noticed*: an overfull column drives `var` negative and the clamp
+    // below turns that into a plausible `0.0`. The CSR twin
+    // (`col_var_projected`) rejects the same column, so leaving this unwired
+    // would make `prefer_format` decide whether a corrupt file errors or
+    // answers. `col_nnz` was already tallied above; this is the check it was
+    // missing.
+    //
+    // The counts are validated *before* the zero-extent short-circuit, matching
+    // `finalize_implicit_zero_variance`. An `if n_obs == 0 { return Ok(zeros) }`
+    // guard used to sit at the top of this function, which meant a 0-row matrix
+    // holding stored entries — non-canonical by definition — returned zeros
+    // without ever reaching the check.
+    for &nnz in &col_nnz {
+        scx_sparse::implicit_zero_count(n_obs, nnz)?;
+    }
+    if n_obs == 0 {
+        return Ok(vec![0.0f64; n_proj]);
+    }
     let n = n_obs as f64;
     let mut variances = vec![0.0f64; n_proj];
     for c in 0..n_proj {
@@ -1183,7 +1190,7 @@ pub fn col_max_masked_projected_csc(
         }
     })?;
     for c in 0..n_proj {
-        if col_nnz[c] < n_kept {
+        if scx_sparse::implicit_zero_count(n_kept, col_nnz[c])? > 0 {
             if maxes[c] == f64::NEG_INFINITY {
                 maxes[c] = 0.0;
             } else {
@@ -1221,7 +1228,7 @@ pub fn col_min_masked_projected_csc(
         }
     })?;
     for c in 0..n_proj {
-        if col_nnz[c] < n_kept {
+        if scx_sparse::implicit_zero_count(n_kept, col_nnz[c])? > 0 {
             if mins[c] == f64::INFINITY {
                 mins[c] = 0.0;
             } else {
@@ -1248,11 +1255,11 @@ pub fn col_var_masked_projected_csc(
 ) -> Result<Vec<f64>> {
     let n_proj = col_indices.len();
     let n_kept = kept_rows.len();
-    if n_kept == 0 {
-        return Ok(vec![0.0f64; n_proj]);
-    }
     let mut sum_x = vec![0.0f64; n_proj];
     let mut sum_x2 = vec![0.0f64; n_proj];
+    // Tallied for the overfull-axis check below, exactly as the unmasked twin
+    // does. Only kept rows are counted, so it is compared against `n_kept`.
+    let mut col_nnz = vec![0usize; n_proj];
     walk_csc_runs(source, col_indices, |local_col, output_col, csc| {
         let s = csc.indptr[local_col] as usize;
         let e = csc.indptr[local_col + 1] as usize;
@@ -1262,9 +1269,18 @@ pub fn col_var_masked_projected_csc(
                 let v = csc.data[k] as f64;
                 sum_x[output_col] += v;
                 sum_x2[output_col] += v * v;
+                col_nnz[output_col] += 1;
             }
         }
     })?;
+    // Counts validated before the zero-extent short-circuit; see the unmasked
+    // twin for why the ordering matters.
+    for &nnz in &col_nnz {
+        scx_sparse::implicit_zero_count(n_kept, nnz)?;
+    }
+    if n_kept == 0 {
+        return Ok(vec![0.0f64; n_proj]);
+    }
     let n = n_kept as f64;
     let mut variances = vec![0.0f64; n_proj];
     for c in 0..n_proj {

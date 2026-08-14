@@ -29,6 +29,41 @@ overflow-checks = true
 [profile.bench.package.scx-codec]
 overflow-checks = true
 
+# scx-sparse gets the same treatment, and for the same reason: it is the other
+# crate that turns decoded — therefore unauthenticated — shard bytes into
+# structures whose arithmetic assumes an invariant the read path does not check.
+# Concretely, a statistic that infers an implicit-zero count as `extent - nnz`
+# inverts those operands on a duplicated coordinate: in release that wrapped to
+# ~1.8e19 and was returned as a variance of 8.3e19. Those sites now go through
+# `scx_sparse::implicit_zero_count`, so this override is a backstop for the
+# *next* one, not the fix. (Note it covers this crate only — the same class of
+# subtraction lives in `scx-accel`'s CSC Wilcoxon kernel and had to be guarded
+# explicitly there.)
+#
+# It also covers a second family that is still unguarded: the `end - start` row
+# spans derived from `indptr`, whose monotonicity `ScxCsr::new_unchecked` only
+# `debug_assert!`s. A non-monotonic indptr from a corrupt file now panics here
+# instead of wrapping into a giant slice range.
+#
+# ⚠️ Unlike the codec's, this override is NOT free, and the number is measured
+# rather than assumed. `cargo bench -p scx-sparse --bench transpose_bench`
+# (50k x 5k, the crate's hottest loop and what `scx build-csc` runs), before vs
+# after, confirmed stable over a repeat run:
+#
+#   new_scatter   815.09 µs -> 838.69 µs   (+2.9%)
+#   old_sort      5.2290 ms -> 5.3329 ms   (+2.0%)
+#
+# That is the price of the backstop, on this path only. It is accepted here
+# deliberately: `scx build-csc` is a one-off per file, whereas a wrapped count
+# read back as a variance is silent and permanent. If that trade ever stops
+# being worth it, deleting these four lines is the whole reversal — the six
+# sites the wrap actually reached are explicitly checked and stay checked.
+[profile.release.package.scx-sparse]
+overflow-checks = true
+
+[profile.bench.package.scx-sparse]
+overflow-checks = true
+
 [workspace.package]
 license = "MIT"
 authors = ["Nick Youngblut <nick.youngblut@arcinstitute.org>"]

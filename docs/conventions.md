@@ -48,7 +48,55 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   those seams, it owes the same check; `reader.rs`'s block-index row-run path is
   the existing example.
 
-  Two carve-outs, both narrow:
+  Three carve-outs, all narrow:
+  - **A consumer relying on a *different invariant* owes its own check.** The
+    rule above is about re-validating the *same* thing the seam validated. The
+    seam bounds each index's **value** against `n_minor`; it says nothing about
+    the indices' **ordering or uniqueness**, which `docs/format.md` § "v3
+    canonical CSR invariant" also requires and which only `scx validate --deep`
+    checks on the read path. Anything inferring a *cardinality* from a dimension
+    — "this axis has `extent` cells and `nnz` of them are stored, so
+    `extent - nnz` are implicit zeros" — depends on uniqueness, not on the
+    bound, and the seam's guarantee does not imply it. That inference is
+    centralised in `scx_sparse::implicit_zero_count` (and
+    `finalize_implicit_zero_variance` for the per-column variance shape); every
+    statistic that infers an implicit-zero count that way goes through it.
+    Written inline as a `usize` subtraction it wrapped in release and returned
+    `8.3e19` as a variance. **Do not delete those checks as redundant with the
+    seam** — they guard a different invariant, and they are O(1) per row /
+    O(n_vars) per finalize, never per-nnz.
+
+    ⚠️ **Be precise about what that helper is.** It rejects `nnz > extent` —
+    an axis holding more stored entries than it has cells. That *implies* a
+    duplicate coordinate, but not the reverse: a sparse row with a couple of
+    repeats stays under its extent and passes. It is an overfull-axis guard,
+    not a uniqueness check, and describing it as the latter overstates what
+    the read path verifies. Real uniqueness enforcement means an ordering pass
+    at the decode seam, which is deliberately not on the read path (see the
+    measured cost below) and lives in `scx validate --deep` instead.
+
+    Aggregations that use the second-moment identity `E[X²] − E[X]²` instead of
+    a count subtraction (the CSC column-variance kernels, the projected row
+    stats, the scalar `var(axis=None)`) never wrapped. Where a per-column or
+    per-row count is available they run the same check, so neither
+    `prefer_format` nor an active column projection changes whether a corrupt
+    file is rejected. Only the scalar `var(axis=None)` has no count to carry;
+    there the result is clamped at `0.0`, because a negative variance is not a
+    defensible answer either.
+
+    ⚠️ **Clamp with `if v < 0.0 { 0.0 } else { v }`, never `v.max(0.0)`.**
+    Rust's `f64::max` ignores NaN and returns the other operand, so `.max(0.0)`
+    silently converts a NaN variance into a real-looking `0.0`. NaN in `X` is
+    supported input — the dense h5ad streamer preserves it deliberately — so
+    that is data loss, not tidying. The conditional passes NaN through, since
+    `NaN < 0.0` is false.
+
+    The same `extent - count` subtraction appears outside `scx-sparse`: the CSC
+    Wilcoxon kernel in `scx-accel` derives both a pooled and a per-group
+    implicit-zero count. The per-package `overflow-checks` override does not
+    cross crate boundaries, so guards there have to be explicit — and the
+    per-group subtraction needs its own check, because it can invert while the
+    pooled one still fits.
   - **A consumer bounded by a *different* axis owes its own check.** The dense
     scatter in `typed_read.rs` sizes its buffer from the file header's `n_vars`
     while the seam validates against the shard header's `n_minor`. Those agree on

@@ -207,7 +207,7 @@ fn gene_stats_nnz(
     n_groups: usize,
     tie_correct: bool,
     log_transformed: bool,
-) -> Vec<(f64, f64, f64)> {
+) -> Result<Vec<(f64, f64, f64)>> {
     let mut group_sum = vec![0.0f64; n_groups];
     let mut nonzero_in_g = vec![0usize; n_groups];
     let mut neg: Vec<(f64, usize)> = Vec::new();
@@ -243,13 +243,23 @@ fn gene_stats_nnz(
     // Each stored entry is one distinct cell (one entry per (cell,gene) in CSC),
     // and out-of-range rows plus unlabelled cells are dropped above, so the
     // pooled nonzeros never exceed n_labelled. A corrupt sidecar with duplicate
-    // rows in a column would break this.
-    debug_assert!(
-        n_neg + n_pos <= n_labelled,
-        "pooled nnz ({}) exceeds n_labelled ({n_labelled}) — duplicate rows in a CSC column?",
-        n_neg + n_pos
-    );
-    let n_zero_total = n_labelled - n_neg - n_pos;
+    // rows in a column breaks that, and this used to be a `debug_assert!` —
+    // compiled out in exactly the release builds where the subtraction below
+    // then wrapped to ~1.8e19 and became a rank-block width. `ScxCsc::new`
+    // rejects duplicate row indices, but the decode path builds sidecar shards
+    // with `ScxCsc::new_unchecked`, so that check never runs here.
+    //
+    // `scx-sparse`'s release `overflow-checks` override does not reach this
+    // crate, so the guard has to be explicit.
+    let n_zero_total =
+        scx_sparse::implicit_zero_count(n_labelled, n_neg + n_pos).map_err(|_| {
+            AccelError::InvalidInput(format!(
+                "non-canonical CSC sidecar: a gene column holds {} labelled nonzero cells \
+             against {n_labelled} labelled cells, so at least one cell is stored twice; \
+             run `scx validate --deep`",
+                n_neg + n_pos
+            ))
+        })?;
     // Mid-rank of the zero tie-block spanning 1-based ranks [n_neg+1 .. n_neg+n_zero].
     let zero_mid = n_neg as f64 + (n_zero_total as f64 + 1.0) / 2.0;
 
@@ -273,8 +283,20 @@ fn gene_stats_nnz(
     );
 
     // Zero cells (implicit + explicit) per group all carry the zero mid-rank.
+    //
+    // Checked per group, not just pooled: the two subtractions have different
+    // operands, so a duplicate concentrated in one small group can invert this
+    // one while the pooled count above still fits under `n_labelled`.
     for g in 0..n_groups {
-        let n_zero_cells_g = group_cell_counts[g] - nonzero_in_g[g];
+        let n_zero_cells_g = scx_sparse::implicit_zero_count(group_cell_counts[g], nonzero_in_g[g])
+            .map_err(|_| {
+                AccelError::InvalidInput(format!(
+                    "non-canonical CSC sidecar: group {g} holds {} nonzero cells against \
+                     {} cells in the group, so at least one cell is stored twice; \
+                     run `scx validate --deep`",
+                    nonzero_in_g[g], group_cell_counts[g]
+                ))
+            })?;
         rank_sum[g] += n_zero_cells_g as f64 * zero_mid;
     }
 
@@ -292,7 +314,7 @@ fn gene_stats_nnz(
         let logfc = compute_logfc(mean_group, mean_ref, log_transformed);
         out.push((score, pval, logfc));
     }
-    out
+    Ok(out)
 }
 
 /// Exact sparse-nnz 1-vs-rest Wilcoxon over a CSC source (§5.3).
@@ -358,7 +380,7 @@ fn wilcoxon_rank_sum_nnz_csc<S: ColumnShardSource + ?Sized>(
                     log_transformed,
                 )
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         for (local_col, res) in chunk_results.into_iter().enumerate() {
             per_gene[chunk_start + local_col] = res;
         }
@@ -413,6 +435,89 @@ mod tests {
     use crate::diffexp::wilcoxon_rank_sum_streaming;
     use scx_format_io::{BackedCscReader, BackedCsrReader, ScxReader};
     use tempfile::tempdir;
+
+    /// A gene column holding the same cell twice is non-canonical, and both
+    /// implicit-zero counts here used to be raw `usize` subtractions guarded
+    /// only by a `debug_assert!` — compiled out in exactly the release builds
+    /// where they then wrapped to ~1.8e19 and became a rank-block width.
+    ///
+    /// Two arms, because the two subtractions have different operands and the
+    /// second can invert while the first still fits:
+    ///   * pooled  — `n_labelled - (n_neg + n_pos)`
+    ///   * per-group — `group_cell_counts[g] - nonzero_in_g[g]`
+    ///
+    /// `gene_stats_nnz` is called directly: the corruption cannot be written to
+    /// a file (writers canonicalize, and the encoder `debug_assert`s it), so a
+    /// unit call on the kernel is the only way to exercise it at all.
+    #[test]
+    fn gene_stats_nnz_rejects_a_cell_stored_twice() {
+        // 2 labelled cells in one group. The column stores cell 0 twice, so
+        // both the pooled count (2 > ... ) and the group count invert.
+        let groups = vec![0usize, 0usize];
+        let group_cell_counts = vec![2usize];
+        let err = gene_stats_nnz(
+            &[0, 0, 1],
+            &[1.0, 2.0, 3.0],
+            &groups,
+            &group_cell_counts,
+            2,
+            2,
+            1,
+            true,
+            false,
+        )
+        .expect_err("a cell stored twice must be rejected, not ranked");
+        // Assert the *pooled* message specifically. Both guards produce a
+        // "non-canonical CSC sidecar" error, so matching only that prefix let
+        // this arm pass with the pooled guard sabotaged — the per-group guard
+        // was catching it downstream. Whenever the pooled count inverts some
+        // group's must too (the group counts sum to n_labelled), so only the
+        // message distinguishes which guard fired, and the pooled one still has
+        // to exist: its subtraction runs first and would wrap before the
+        // per-group loop is ever reached.
+        assert!(
+            matches!(err, AccelError::InvalidInput(ref m) if m.contains("a gene column holds")),
+            "expected the pooled guard to fire first, got: {err:?}"
+        );
+
+        // Per-group arm: pooled count fits (2 <= 3 labelled) but group 0 holds
+        // 2 stored entries against its 1 cell. This is the case the pooled
+        // check alone would wave through.
+        let groups = vec![0usize, 1usize, 1usize];
+        let group_cell_counts = vec![1usize, 2usize];
+        let err = gene_stats_nnz(
+            &[0, 0],
+            &[1.0, 2.0],
+            &groups,
+            &group_cell_counts,
+            3,
+            3,
+            2,
+            true,
+            false,
+        )
+        .expect_err("a per-group overfull count must be rejected too");
+        assert!(
+            matches!(err, AccelError::InvalidInput(ref m) if m.contains("group 0")),
+            "unexpected error: {err:?}"
+        );
+
+        // Canonical input on the same shape still works.
+        let groups = vec![0usize, 0usize];
+        let group_cell_counts = vec![2usize];
+        assert!(gene_stats_nnz(
+            &[0, 1],
+            &[1.0, 2.0],
+            &groups,
+            &group_cell_counts,
+            2,
+            2,
+            1,
+            true,
+            false,
+        )
+        .is_ok());
+    }
 
     #[test]
     fn wilcoxon_csc_matches_csr() {

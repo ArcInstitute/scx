@@ -2366,7 +2366,7 @@ impl BackedCsrReader {
             self,
             prefetch::prefetch_depth(),
             |_shard_idx, csr| -> Result<()> {
-                all_var.extend(csr.row_var());
+                all_var.extend(csr.row_var()?);
                 Ok(())
             },
         )?;
@@ -2410,14 +2410,9 @@ impl BackedCsrReader {
         )?;
 
         // Add contribution from implicit zeros: (n_obs - col_nnz[c]) * mean[c]²
-        let mut variances = vec![0.0f64; self.n_vars];
-        for c in 0..self.n_vars {
-            let n_zeros = n_obs - col_nnz[c];
-            let total_sq_dev = sq_devs[c] + n_zeros as f64 * col_means[c] * col_means[c];
-            variances[c] = total_sq_dev / n_obs as f64;
-        }
-
-        Ok(variances)
+        Ok(scx_sparse::finalize_implicit_zero_variance(
+            &sq_devs, &col_nnz, &col_means, n_obs,
+        )?)
     }
 
     // --- Max / Min ---
@@ -2429,7 +2424,7 @@ impl BackedCsrReader {
             self,
             prefetch::prefetch_depth(),
             |_shard_idx, csr| -> Result<()> {
-                all_max.extend(csr.row_max());
+                all_max.extend(csr.row_max()?);
                 Ok(())
             },
         )?;
@@ -2465,7 +2460,7 @@ impl BackedCsrReader {
 
         // Apply implicit-zero correction at the global level
         for c in 0..self.n_vars {
-            if col_nnz[c] < self.n_obs {
+            if scx_sparse::implicit_zero_count(self.n_obs, col_nnz[c])? > 0 {
                 if maxes[c] == f64::NEG_INFINITY {
                     maxes[c] = 0.0;
                 } else {
@@ -2483,7 +2478,7 @@ impl BackedCsrReader {
             self,
             prefetch::prefetch_depth(),
             |_shard_idx, csr| -> Result<()> {
-                all_min.extend(csr.row_min());
+                all_min.extend(csr.row_min()?);
                 Ok(())
             },
         )?;
@@ -2510,7 +2505,7 @@ impl BackedCsrReader {
         )?;
 
         for c in 0..self.n_vars {
-            if col_nnz[c] < self.n_obs {
+            if scx_sparse::implicit_zero_count(self.n_obs, col_nnz[c])? > 0 {
                 if mins[c] == f64::INFINITY {
                     mins[c] = 0.0;
                 } else {
@@ -2629,13 +2624,9 @@ impl BackedCsrReader {
         )?;
 
         // Add zero-entry contributions
-        let mut variances = vec![0.0f64; self.n_vars];
-        for c in 0..self.n_vars {
-            let n_zeros = n_kept - col_nnz[c];
-            let total = sq_devs[c] + n_zeros as f64 * col_means[c] * col_means[c];
-            variances[c] = total / n_kept as f64;
-        }
-        Ok(variances)
+        Ok(scx_sparse::finalize_implicit_zero_variance(
+            &sq_devs, &col_nnz, &col_means, n_kept,
+        )?)
     }
 
     /// Internal: masked column aggregation over kept rows.
@@ -2685,7 +2676,7 @@ impl BackedCsrReader {
         match op {
             AggOp::Max => {
                 for c in 0..self.n_vars {
-                    if col_nnz[c] < n_kept {
+                    if scx_sparse::implicit_zero_count(n_kept, col_nnz[c])? > 0 {
                         if result[c] == f64::NEG_INFINITY {
                             result[c] = 0.0;
                         } else {
@@ -2696,7 +2687,7 @@ impl BackedCsrReader {
             }
             AggOp::Min => {
                 for c in 0..self.n_vars {
-                    if col_nnz[c] < n_kept {
+                    if scx_sparse::implicit_zero_count(n_kept, col_nnz[c])? > 0 {
                         if result[c] == f64::INFINITY {
                             result[c] = 0.0;
                         } else {

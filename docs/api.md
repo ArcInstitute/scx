@@ -848,9 +848,47 @@ which the writer uses to build the `lazy_transforms` payload.
 - `row_nnz()` / `col_nnz()` — Streaming per-row/column NNZ
 - `row_var()` / `col_var()` — Streaming per-row/column variance
 - `row_max()` / `col_max()` / `row_min()` / `col_min()` — Streaming extrema
+
 - `total_nnz()` — Total NNZ across all shards
 - `col_means_and_sum_sq(zero_center)` — Single-pass column statistics for PCA
 - Masked variants (deletion-vector aware): `col_sums_masked(kept_rows)`, `col_nnz_masked(kept_rows)`, `col_max_masked(kept_rows)`, `col_min_masked(kept_rows)`, `col_var_masked(kept_rows)`
+
+### Overfull-axis rejection in the aggregations
+
+`row_var` / `col_var` and the four extrema fold implicit zeros into their result,
+and so have to know how many there are: `extent − nnz`, where `extent` is
+`n_cols` on the row axis and `n_obs` (or the kept-row count) on the column axis.
+That is only valid on a **canonical** CSR — `docs/format.md` § "v3 canonical CSR
+invariant" requires per-row column indices to be strictly increasing, so an axis
+of `extent` cells holds at most `extent` entries. Ordinary reads do not verify
+that: the decode seam bounds index *values*, and only `scx validate --deep`
+checks ordering. They therefore return
+`ScxError::Csr(CsrError::NonCanonicalAxis { extent, nnz })` when **an axis holds
+more stored entries than it has cells**, rather than reporting a number derived
+from a wrapped count. Surfaced through pyscx as a `RuntimeError` from
+`X.var(axis=0)` / `X.var(axis=1)` / `X.max(axis=…)` / `X.min(axis=…)` on a backed
+matrix, with or without a column projection.
+
+⚠️ **That predicate is narrower than "the shard is canonical", and the
+difference matters.** `nnz > extent` proves a repeated coordinate, but the
+converse does not hold: a sparse row with a couple of repeats stays under its
+extent and is *not* detected — a 1×3 row storing indices `[0, 0]` yields a
+variance computed from both entries plus one implicit zero, with no error. So
+these are overfull-axis guards, not uniqueness guards.
+
+Which routes reject, and which answer:
+
+| Route | On an overfull axis |
+|---|---|
+| `X.var(axis=0)` / `X.var(axis=1)`, projected or not, CSR or CSC | `RuntimeError` |
+| `X.max(axis=…)` / `X.min(axis=…)`, projected or not | `RuntimeError` |
+| CSC Wilcoxon DE (`scx-accel`, nnz fast path) | `AccelError::InvalidInput` |
+| **`X.var(axis=None)` scalar, unprojected** | **clamped to `0.0`** — no per-column count exists on that path |
+| `scx-accel` PCA total variance | `saturating_sub`, absorbed |
+| Any duplicate leaving the axis under its extent | not detected anywhere |
+
+Use `scx validate --deep` when you need an actual canonicality verdict on a file.
+None of the read-path aggregations is a substitute for it.
 
 ## ShardSource Trait (`scx-format-io/src/shard_source.rs`)
 
