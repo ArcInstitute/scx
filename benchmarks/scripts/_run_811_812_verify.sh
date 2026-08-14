@@ -59,7 +59,21 @@ case "$(python -c 'import sys; print(sys.prefix)')" in
     *) echo "PREFLIGHT FAILED: python is not from ${CONDA_ENV}" >&2; exit 1 ;;
 esac
 
-echo "=== maturin develop --release --features hdf5,gpu ==="
+# Isolated target dir, wiped WHOLESALE. Sharing the workspace `target/` across
+# runs of this driver produces:
+#
+#   maturin failed: Failed to parse ELF file at 'target/maturin/libpyscx.so':
+#   Malformed entity: Object is too small
+#
+# — because cargo finds everything fresh, relinks nothing ("Finished in 1.08s"),
+# and maturin then reads whatever truncated artifact a previous run left behind.
+# Clearing only `$TARGET/maturin` does not help: cargo re-links a 0-byte
+# artifact from `release/` and maturin dies the same way. Wipe the whole tree.
+# Costs a full rebuild per run, which is the price of a build you can trust.
+export CARGO_TARGET_DIR="${SCX_DIR}/target-gpu-verify"
+rm -rf "${CARGO_TARGET_DIR}"
+
+echo "=== maturin develop --release --features hdf5,gpu (target: ${CARGO_TARGET_DIR}) ==="
 ( cd pyscx && maturin develop --release --features hdf5,gpu ) || { echo "BUILD FAILED"; exit 1; }
 
 # Preflight the feature being measured: if the native GPU PCA route cannot run
