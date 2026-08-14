@@ -26,7 +26,7 @@ use scx_format_io::shard::{clamped_reserve, resolve_block_index, ShardHeader};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::profile::{self, CodecClass};
-use crate::shard_decode::{DeviceDecodeStats, GpuCsr};
+use crate::shard_decode::{check_device_len, DeviceDecodeStats, GpuCsr};
 
 /// Compiled PTX for the shufdelta kernels (produced by build.rs via nvcc --ptx).
 const SHUFDELTA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/shufdelta.ptx"));
@@ -364,8 +364,12 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
         &mut combined_indptr,
     )?;
     profile::record_host_decode_since(CodecClass::Generic, t_indptr);
-    debug_assert_eq!(nnz_final, nnz);
-    debug_assert_eq!(combined_indptr.len(), n_rows + 1);
+    check_device_len(nnz_final, nnz, "framed ShufDeltaZstd block-index nnz")?;
+    check_device_len(
+        combined_indptr.len(),
+        n_rows + 1,
+        "framed ShufDeltaZstd indptr",
+    )?;
 
     let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
     let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
@@ -785,7 +789,7 @@ pub fn decode_framed_shufdelta_gpu_nvcomp(
         &mut combined_indptr,
     )?;
     profile::record_host_decode_since(CodecClass::Generic, t_indptr);
-    debug_assert_eq!(nnz_final, nnz);
+    check_device_len(nnz_final, nnz, "nvcomp ShufDeltaZstd block-index nnz")?;
 
     let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
     let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
@@ -1016,7 +1020,11 @@ fn prescan_shufdelta_shards<'a>(shards: &[&'a [u8]]) -> Result<ShufdeltaBatchPla
         }
         total_nnz = new_total_nnz;
     }
-    debug_assert_eq!(combined_indptr.len(), total_rows + 1);
+    check_device_len(
+        combined_indptr.len(),
+        total_rows + 1,
+        "nvcomp batch plan indptr",
+    )?;
 
     Ok(ShufdeltaBatchPlan {
         groups,
