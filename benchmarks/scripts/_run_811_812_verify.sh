@@ -33,23 +33,32 @@ if [ -n "${CONDA_BASE}" ] && [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
     source "${CONDA_BASE}/etc/profile.d/conda.sh"
 fi
 conda activate "${CONDA_ENV}"
-echo "python: $(which python)"
+echo "python: $(command -v python)"
 
 echo "=== maturin develop --release --features hdf5,gpu ==="
 ( cd pyscx && maturin develop --release --features hdf5,gpu ) || { echo "BUILD FAILED"; exit 1; }
 
-# Preflight the feature being measured: if the GPU PCA route cannot run at all,
-# fail here rather than after an hour of confusing test output.
-echo "=== preflight: one real GPU PCA ==="
-python - <<'PY' || { echo "PREFLIGHT FAILED: GPU PCA did not run"; exit 1; }
+# Preflight the feature being measured: if the native GPU PCA route cannot run
+# at all, fail here rather than after an hour of confusing test output.
+#
+# SCX_FORCE_NATIVE_GPU=1 is load-bearing, not decoration, and the first version
+# of this script got it wrong: with an in-memory `X` and rapids-singlecell
+# installed, PCA routes to `rapids_singlecell_gpu`, so a `route.startswith("gpu")`
+# check fails on a perfectly healthy GPU. The subject here is the native
+# resident/streaming pair, which is what the tests below pin too — so pin it,
+# and accept any route naming a GPU rather than one spelling of it.
+echo "=== preflight: one real native GPU PCA ==="
+SCX_FORCE_NATIVE_GPU=1 python - <<'PY' || { echo "PREFLIGHT FAILED: native GPU PCA did not run"; exit 1; }
 import numpy as np, scipy.sparse as sp, anndata, pyscx, sys
 rng = np.random.default_rng(0)
 x = rng.poisson(2.0, size=(300, 60)).astype(np.float32)
 a = anndata.AnnData(X=sp.csr_matrix(x))
 pyscx.accel.pca(a, n_comps=4, device="gpu", method="randomized")
 info = a.uns["scx_accel"]["pca"]
-print("preflight route:", info["route"], "resident_csr:", info.get("resident_csr"))
-sys.exit(0 if info["route"].startswith("gpu") else 1)
+print("preflight route:", info["route"],
+      "resident_csr:", info.get("resident_csr"),
+      "spmm_policy:", info.get("spmm_policy"))
+sys.exit(0 if "gpu" in info["route"] else 1)
 PY
 
 rc=0
