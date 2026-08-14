@@ -453,9 +453,14 @@ pub fn forbp_decode(
     forbp_decode_inner(data, n_rows, 0, index_dtype_u16)
 }
 
-/// Decode FOR-BP encoded indices with an optional nnz hint for pre-allocation.
+/// Decode FOR-BP encoded indices against a **declared** nnz.
 ///
-/// When `nnz_hint > 0`, pre-allocates the output vectors for better performance.
+/// When `nnz_hint > 0` it is both a pre-allocation size and a contract: the
+/// stream's per-row nnz varints must sum to exactly `nnz_hint`, or decode
+/// fails. That check is what keeps a corrupt shard from producing an `indices`
+/// array shorter than its own `indptr.last()` — see `check_decoded_shape` in
+/// `dispatch.rs`. Pass `0` (or use [`forbp_decode`]) when there is no external
+/// count to check against; the length is then whatever the stream says.
 pub fn forbp_decode_with_hint(
     data: &[u8],
     n_rows: usize,
@@ -665,6 +670,15 @@ fn forbp_decode_inner(
             return Err(BitStreamError);
         }
         rows_remaining -= n_rows_in_block;
+    }
+
+    // The output length is driven entirely by the stream's own per-row nnz
+    // varints, so a corrupt stream decodes a different count than the caller
+    // declared and the shard's three arrays silently disagree (the sibling
+    // `delta_golomb_decode` / `rice_decode` both return exactly the requested
+    // count). When the caller stated an nnz, it is a contract, not a hint.
+    if nnz_hint > 0 && all_indices.len() != nnz_hint {
+        return Err(BitStreamError);
     }
 
     Ok((all_indices, all_row_lengths))

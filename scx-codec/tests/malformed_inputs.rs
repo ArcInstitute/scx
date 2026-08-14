@@ -8,11 +8,16 @@
 
 use scx_codec::bitstream::{BitReader, BitWriter};
 use scx_codec::delta_golomb::{delta_golomb_decode, delta_golomb_encode};
-use scx_codec::dispatch::{decode_shard_ref, CodecError, CodecId, EncodedShardRef};
+use scx_codec::dispatch::{
+    decode_indptr_only, decode_row_group, decode_row_group_indptr_only, decode_shard_native,
+    decode_shard_ref, decode_shard_scipy, CodecError, CodecId, EncodedShardRef, RowGroupSpan,
+};
 use scx_codec::forbp::{
     forbp_decode_with_hint, forbp_decode_with_metadata, forbp_encode, ForBpRowMetadata,
 };
-use scx_codec::rice::{rice_decode, rice_decode_with_metadata, RiceBlockMetadata, B_VAL};
+use scx_codec::rice::{
+    rice_decode, rice_decode_with_metadata, rice_encode, RiceBlockMetadata, B_VAL,
+};
 use scx_codec::shuffle::{byte_shuffle, byte_unshuffle};
 use scx_codec::value_encoding::values_to_raw_bytes;
 use scx_codec::ValueEncoding;
@@ -243,4 +248,319 @@ fn test_decode_capacity_boundary_passes() {
         }
         Err(_) => {} // any other downstream failure is fine
     }
+}
+
+// ---------------------------------------------------------------------------
+// The CSR shape invariant at the decode boundary
+//
+// A decoded shard is three arrays that must agree, and they are produced by
+// three independent sub-stream decoders: `delta_golomb_decode` and
+// `rice_decode` return exactly the count the *caller* asks for, while FOR-BP
+// returns whatever its own per-row nnz varints say. Nothing used to compare
+// them, so a corrupt Scx1 shard decoded to a structurally invalid CSR whose
+// `indices` were shorter than `indptr.last()` — and `ScxCsr::new_unchecked`
+// only `debug_asserts` the difference, so in release the consumers index past
+// the end of `indices` instead of erroring.
+// ---------------------------------------------------------------------------
+
+/// Build an Scx1 shard whose header declares `nnz = 6` for one row while the
+/// FOR-BP index stream encodes only 3 indices. Every sub-stream is produced by
+/// the real encoder — the shard is malformed only in that the three disagree.
+fn scx1_shard_with_short_index_stream() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let indptr_bytes = delta_golomb_encode(&[0, 6]).unwrap();
+    let indices_bytes = forbp_encode(&[1, 2, 3], &[3], false).unwrap();
+    let values_bytes = rice_encode(&[1, 1, 1, 1, 1, 1], B_VAL).unwrap();
+    (indptr_bytes, indices_bytes, values_bytes)
+}
+
+#[test]
+fn forbp_hint_shorter_than_declared_nnz_is_rejected() {
+    // The primitive where the divergence originates. `nnz_hint` used to be
+    // advisory ("for pre-allocation"), so a stream declaring 3 indices decoded
+    // happily against a caller that asked for 6. Every production caller passes
+    // the exact nnz, so the hint is a contract.
+    let encoded = forbp_encode(&[1, 2, 3], &[3], false).unwrap();
+    assert!(forbp_decode_with_hint(&encoded, 1, 3, false).is_ok());
+    assert!(
+        forbp_decode_with_hint(&encoded, 1, 6, false).is_err(),
+        "3-index stream accepted against a declared nnz of 6"
+    );
+}
+
+/// Build an Scx1 shard that is self-consistent everywhere the *primitives* can
+/// see — the FOR-BP stream really does hold 3 indices and Rice really does hold
+/// 3 values, both matching the declared `nnz = 3` — but whose indptr claims the
+/// single row ends at 2. Only a check that compares the arrays *to each other*
+/// catches it, so this fixture pins `check_decoded_shape` specifically, where
+/// [`scx1_shard_with_short_index_stream`] is caught one layer down by FOR-BP's
+/// own contract.
+fn scx1_shard_with_disagreeing_indptr() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let indptr_bytes = delta_golomb_encode(&[0, 2]).unwrap();
+    let indices_bytes = forbp_encode(&[1, 2, 3], &[3], false).unwrap();
+    let values_bytes = rice_encode(&[1, 1, 1], B_VAL).unwrap();
+    (indptr_bytes, indices_bytes, values_bytes)
+}
+
+#[test]
+fn scx1_shard_shorter_than_declared_nnz_is_rejected() {
+    // The review's reproducer verbatim: pre-fix, `decode_shard_scipy` returned
+    // `Ok(([0, 6], [1, 2, 3], [1.0; 6]))` — an indptr claiming six non-zeros
+    // over an `indices` of three. Caught now by FOR-BP's declared-nnz contract,
+    // so the error kind is `BitStream`, not `MalformedInput`; the shard-level
+    // `check_decoded_shape` is the second line of defence behind it (pinned by
+    // `scx1_shard_indptr_disagreeing_with_nnz_is_rejected`).
+    let (indptr_bytes, indices_bytes, values_bytes) = scx1_shard_with_short_index_stream();
+    let encoded = EncodedShardRef {
+        indptr_bytes: &indptr_bytes,
+        indices_bytes: &indices_bytes,
+        values_bytes: &values_bytes,
+    };
+
+    assert!(
+        decode_shard_scipy(
+            &encoded,
+            CodecId::Scx1,
+            ValueEncoding::Uint32,
+            1,
+            6,
+            false,
+            100
+        )
+        .is_err(),
+        "decode_shard_scipy accepted a 3-index stream against a declared nnz of 6"
+    );
+    assert!(
+        decode_shard_native(&encoded, CodecId::Scx1, ValueEncoding::Uint32, 1, 6, false).is_err(),
+        "decode_shard_native accepted a 3-index stream against a declared nnz of 6"
+    );
+    assert!(
+        decode_shard_ref(&encoded, CodecId::Scx1, ValueEncoding::Uint32, 1, 6, false).is_err(),
+        "decode_shard_ref accepted a 3-index stream against a declared nnz of 6"
+    );
+}
+
+#[test]
+fn scx1_shard_indptr_disagreeing_with_nnz_is_rejected() {
+    // Pins the shard-level shape gate on all three entry points.
+    // `decode_shard_scipy` / `_native` short-circuit Scx1 and never reach
+    // `decode_shard_ref`, so each carries its own call and each needs its own
+    // assertion — the review's reproducer was on the scipy path.
+    let (indptr_bytes, indices_bytes, values_bytes) = scx1_shard_with_disagreeing_indptr();
+    let encoded = EncodedShardRef {
+        indptr_bytes: &indptr_bytes,
+        indices_bytes: &indices_bytes,
+        values_bytes: &values_bytes,
+    };
+
+    let err = decode_shard_scipy(
+        &encoded,
+        CodecId::Scx1,
+        ValueEncoding::Uint32,
+        1,
+        3,
+        false,
+        100,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, CodecError::MalformedInput(msg) if msg.contains("indptr ends at")),
+        "expected an indptr/nnz MalformedInput, got {err:?}"
+    );
+
+    // `ShardValuesNative` is not `Debug`, so match rather than `unwrap_err`.
+    match decode_shard_native(&encoded, CodecId::Scx1, ValueEncoding::Uint32, 1, 3, false) {
+        Err(CodecError::MalformedInput(msg)) => assert!(msg.contains("indptr ends at"), "{msg}"),
+        Err(other) => panic!("expected MalformedInput, got {other:?}"),
+        Ok((indptr, indices, _)) => panic!(
+            "accepted a malformed shard: indptr={indptr:?}, indices.len()={}",
+            indices.len()
+        ),
+    }
+
+    let err =
+        decode_shard_ref(&encoded, CodecId::Scx1, ValueEncoding::Uint32, 1, 3, false).unwrap_err();
+    assert!(
+        matches!(&err, CodecError::MalformedInput(msg) if msg.contains("indptr ends at")),
+        "expected an indptr/nnz MalformedInput, got {err:?}"
+    );
+}
+
+#[test]
+fn row_group_shape_mismatch_is_rejected() {
+    // The framed (v2 shard) path. `decode_row_group` used to hand-roll exactly
+    // this check (`indptr[0] == 0`, `indptr.last() == nnz`) and nothing else;
+    // it now inherits the full gate from `decode_shard_ref`, and must still
+    // name the group in the message.
+    let (indptr_bytes, indices_bytes, values_bytes) = scx1_shard_with_disagreeing_indptr();
+    let span = RowGroupSpan {
+        row_start: 7,
+        n_rows: 1,
+        nnz: 3,
+        indptr: 0..indptr_bytes.len(),
+        indices: 0..indices_bytes.len(),
+        values: 0..values_bytes.len(),
+    };
+    let err = decode_row_group(
+        CodecId::Scx1,
+        &span,
+        &indptr_bytes,
+        &indices_bytes,
+        &values_bytes,
+        ValueEncoding::Uint32,
+        false,
+    )
+    .unwrap_err();
+    match &err {
+        CodecError::MalformedInput(msg) => {
+            assert!(msg.contains("row-group at row 7"), "{msg}");
+            assert!(msg.contains("indptr ends at"), "{msg}");
+        }
+        other => panic!("expected MalformedInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn none_shard_indptr_last_not_nnz_is_rejected() {
+    // The indptr half of the same invariant. Under `CodecId::None` the indptr
+    // is raw LE bytes, so it can say anything: here it claims the single row
+    // ends at 5 while the header declares nnz = 2. `csr_to_csc` walks
+    // `indptr[row]..indptr[row + 1]` and would index past `indices`.
+    let indptr: Vec<u8> = [0u64, 5].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indices: Vec<u8> = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let values: Vec<u8> = [7u32, 9].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let encoded = EncodedShardRef {
+        indptr_bytes: &indptr,
+        indices_bytes: &indices,
+        values_bytes: &values,
+    };
+    let err =
+        decode_shard_ref(&encoded, CodecId::None, ValueEncoding::Uint32, 1, 2, false).unwrap_err();
+    assert!(
+        matches!(err, CodecError::MalformedInput(_)),
+        "expected MalformedInput, got {err:?}"
+    );
+}
+
+#[test]
+fn none_shard_non_monotone_indptr_is_rejected() {
+    // `indptr.last() == nnz` alone is not enough: an interior entry can still
+    // exceed `indices.len()` while the last one is honest, which is the same
+    // out-of-bounds walk one row earlier.
+    let indptr: Vec<u8> = [0u64, 5, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indices: Vec<u8> = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let values: Vec<u8> = [7u32, 9].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let encoded = EncodedShardRef {
+        indptr_bytes: &indptr,
+        indices_bytes: &indices,
+        values_bytes: &values,
+    };
+    let err =
+        decode_shard_ref(&encoded, CodecId::None, ValueEncoding::Uint32, 2, 2, false).unwrap_err();
+    assert!(
+        matches!(err, CodecError::MalformedInput(_)),
+        "expected MalformedInput, got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The indptr-only decode seam
+//
+// `decode_indptr_only` / `decode_row_group_indptr_only` are what every
+// direct-to-device GPU decoder builds its `GpuCsr` indptr from — they never
+// reach `decode_shard_ref`, so they never saw `check_decoded_shape`. Both
+// checked at most `first == 0` and `last == nnz`, which is not enough: an
+// interior entry can exceed nnz while the last one is honest, and a consumer
+// walking `indptr[row]..indptr[row + 1]` then reads past the end of `indices`
+// one row early. That is the same defect `none_shard_non_monotone_indptr_is_rejected`
+// pins on the whole-shard path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn indptr_only_rejects_non_monotone() {
+    // `[0, 5, 2]` over 2 rows: ends at 2, starts at 0, right length — every
+    // endpoint check passes and row 0 still addresses [0, 5) of a 2-element
+    // index buffer.
+    let raw: Vec<u8> = [0u64, 5, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let err = decode_indptr_only(&raw, CodecId::None, 2).unwrap_err();
+    assert!(
+        matches!(&err, CodecError::MalformedInput(msg) if msg.contains("not monotone")),
+        "expected a monotonicity MalformedInput, got {err:?}"
+    );
+}
+
+#[test]
+fn indptr_only_rejects_non_zero_start() {
+    // Scx1's Delta-Golomb encodes non-negative deltas, so its output is always
+    // monotone — but it reads the *first* value as a raw LE u64, so the start is
+    // unconstrained by the codec and has to be checked.
+    let raw: Vec<u8> = [3u64, 5].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let err = decode_indptr_only(&raw, CodecId::None, 1).unwrap_err();
+    assert!(
+        matches!(&err, CodecError::MalformedInput(msg) if msg.contains("must start at 0")),
+        "expected a zero-start MalformedInput, got {err:?}"
+    );
+}
+
+#[test]
+fn indptr_only_accepts_a_well_formed_indptr() {
+    // Over-rejection guard: the shape gate must not reject valid data.
+    let raw: Vec<u8> = [0u64, 2, 2, 7]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    assert_eq!(
+        decode_indptr_only(&raw, CodecId::None, 3).unwrap(),
+        vec![0i64, 2, 2, 7]
+    );
+}
+
+#[test]
+fn row_group_indptr_only_rejects_non_monotone() {
+    // The seam every framed GPU assembler goes through: `prescan_framed_group_indptr`
+    // calls this once per group and concatenates the results into the combined
+    // indptr it uploads.
+    let raw: Vec<u8> = [0u64, 5, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let span = RowGroupSpan {
+        row_start: 4,
+        n_rows: 2,
+        nnz: 2,
+        indptr: 0..raw.len(),
+        indices: 0..0,
+        values: 0..0,
+    };
+    let err = decode_row_group_indptr_only(CodecId::None, &span, &raw).unwrap_err();
+    match &err {
+        CodecError::MalformedInput(msg) => assert!(msg.contains("not monotone"), "{msg}"),
+        other => panic!("expected MalformedInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn row_group_names_the_group_for_a_short_forbp_stream() {
+    // The corruption this PR targets fails inside `forbp_decode_with_hint`,
+    // whose error carries no message and arrives as `CodecError::BitStream`.
+    // Relabelling only `MalformedInput` left the primary case anonymous.
+    let (indptr_bytes, indices_bytes, values_bytes) = scx1_shard_with_short_index_stream();
+    let span = RowGroupSpan {
+        row_start: 9,
+        n_rows: 1,
+        nnz: 6,
+        indptr: 0..indptr_bytes.len(),
+        indices: 0..indices_bytes.len(),
+        values: 0..values_bytes.len(),
+    };
+    let err = decode_row_group(
+        CodecId::Scx1,
+        &span,
+        &indptr_bytes,
+        &indices_bytes,
+        &values_bytes,
+        ValueEncoding::Uint32,
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("row-group at row 9"),
+        "error does not name the failing group: {err}"
+    );
 }

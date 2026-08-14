@@ -18,9 +18,9 @@ pub use cast::{
     CastFromF32, CastFromI32, CastFromU32, F32_MAX_EXACT_INT,
 };
 pub use dispatch::{
-    clamp_index_bound, decode_indptr_only, decode_row_group, decode_row_group_indptr_only,
-    decode_shard, decode_shard_native, decode_shard_ref, decode_shard_scipy,
-    decoded_shard_to_native, decoded_shard_to_scipy, encode_shard,
+    check_indptr_shape, clamp_index_bound, decode_indptr_only, decode_row_group,
+    decode_row_group_indptr_only, decode_shard, decode_shard_native, decode_shard_ref,
+    decode_shard_scipy, decoded_shard_to_native, decoded_shard_to_scipy, encode_shard,
     zstd_decode_bounded as zstd_decompress_bounded, CodecError, CodecId, CodecSelection,
     DecodedShard, EncodedShard, EncodedShardRef, NativeShard, RowGroupSpan, ScipyShard,
     ShardValuesNative, ValueEncoding, NO_INDEX_BOUND,

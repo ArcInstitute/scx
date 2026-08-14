@@ -24,6 +24,25 @@ use crate::profile::{self, CodecClass};
 use crate::rice_gpu::rice_decode_gpu;
 use crate::shufdelta_gpu::{decode_indices_frame_to_device, decode_values_frame_to_device};
 
+/// Reject a device-decoded array whose length disagrees with the count the
+/// shard header or block index declared.
+///
+/// The GPU decoders derive their output length from the bitstream itself —
+/// `forbp_decode_gpu` sums the stream's per-row nnz varints — while the
+/// destination is a `slice_mut` sized from the declared nnz. These checks used
+/// to be `debug_assert_eq!`, so on a release build a corrupt frame reached
+/// `memcpy_dtod` with mismatched extents instead of erroring. The CPU twin
+/// enforces the same invariant inside `scx_codec`'s shard decoders; this is the
+/// device-side half, which never passes through them.
+pub(crate) fn check_device_len(got: usize, declared: usize, what: &str) -> Result<(), GpuError> {
+    if got != declared {
+        return Err(GpuError::InvalidShard(format!(
+            "{what}: device decode produced {got} elements but {declared} were declared"
+        )));
+    }
+    Ok(())
+}
+
 /// GPU-resident CSR matrix.
 ///
 /// Type layout matches scipy CSR conventions: i64 indptr, i32 indices, f32 data.
@@ -287,6 +306,13 @@ fn decode_scx1_gpu(
     let t_host = profile::start();
     let indptr_u64 =
         delta_golomb_decode(indptr_bytes, n_rows + 1).map_err(scx_codec::CodecError::from)?;
+    // This path calls `delta_golomb_decode` directly rather than going through
+    // `decode_indptr_only`, so it is the one place that does not inherit the
+    // shared gate — apply it by hand. Not just `last == nnz`: Delta-Golomb's
+    // deltas are non-negative, but it reads its *first* value as a raw LE `u64`
+    // (`delta_golomb.rs`), so a corrupt stream can begin anywhere.
+    scx_codec::check_indptr_shape(&indptr_u64, n_rows, Some(nnz))
+        .map_err(|e| GpuError::InvalidShard(format!("unframed Scx1 indptr: {e}")))?;
     let indptr_i64: Vec<i64> = indptr_u64.into_iter().map(|v| v as i64).collect();
     profile::record_host_decode_since(CodecClass::Scx1, t_host);
 
@@ -305,6 +331,11 @@ fn decode_scx1_gpu(
     let t_gpu = profile::start();
     let (d_indices_u32, _row_lengths) =
         forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?;
+    // FOR-BP sizes its output from the stream's own per-row nnz varints, so this
+    // is where it can disagree with the header (`rice_decode_gpu` below is given
+    // `nnz` and returns exactly that). Unchecked, the two device buffers of a
+    // `GpuCsr` would have different lengths.
+    check_device_len(d_indices_u32.len(), nnz, "unframed Scx1 indices")?;
     // FOR-BP indices (scalar + BitPacker4x rows, Task 4.4b) and Rice values both
     // decode on the device — the gpu_decode bucket covers the bitstream upload +
     // kernels; only the indptr round-trips through the host.
@@ -470,8 +501,8 @@ fn decode_framed_scx1_gpu(
             // The block index already guarantees Σ nnz == header.nnz; these
             // localize a corrupt frame that decoded a different length before it
             // becomes a mismatched-length dtod copy (mirrors gpu_csr_assemble).
-            debug_assert_eq!(d_indices.len(), g_nnz);
-            debug_assert_eq!(d_data.len(), g_nnz);
+            check_device_len(d_indices.len(), g_nnz, "framed Scx1 group indices")?;
+            check_device_len(d_data.len(), g_nnz, "framed Scx1 group values")?;
 
             let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
             dev.stream()
@@ -483,8 +514,8 @@ fn decode_framed_scx1_gpu(
                 .map_err(|e| GpuError::CudaError(format!("dtod data (framed group): {e}")))?;
         }
     }
-    debug_assert_eq!(nnz_final, nnz);
-    debug_assert_eq!(combined_indptr.len(), n_rows + 1);
+    check_device_len(nnz_final, nnz, "framed shard block-index nnz")?;
+    check_device_len(combined_indptr.len(), n_rows + 1, "framed shard indptr")?;
 
     let indptr_bytes_uploaded = (combined_indptr.len() * 8) as u64;
     let d_indptr = dev.htod_copy(&combined_indptr)?;
@@ -662,8 +693,8 @@ fn decode_framed_shufdelta_gpu(
             let (d_data, up_v) =
                 decode_values_frame_to_device(dev, vv_frame, g_nnz, value_encoding)?;
             host_uploaded_bytes += up_i + up_v;
-            debug_assert_eq!(d_indices.len(), g_nnz);
-            debug_assert_eq!(d_data.len(), g_nnz);
+            check_device_len(d_indices.len(), g_nnz, "framed ShufDeltaZstd group indices")?;
+            check_device_len(d_data.len(), g_nnz, "framed ShufDeltaZstd group values")?;
 
             let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
             dev.stream()
@@ -675,8 +706,8 @@ fn decode_framed_shufdelta_gpu(
                 .map_err(|e| GpuError::CudaError(format!("dtod data (shufdelta group): {e}")))?;
         }
     }
-    debug_assert_eq!(nnz_final, nnz);
-    debug_assert_eq!(combined_indptr.len(), n_rows + 1);
+    check_device_len(nnz_final, nnz, "framed shard block-index nnz")?;
+    check_device_len(combined_indptr.len(), n_rows + 1, "framed shard indptr")?;
 
     host_uploaded_bytes += (combined_indptr.len() * 8) as u64;
     let d_indptr = dev.htod_copy(&combined_indptr)?;
@@ -739,7 +770,14 @@ fn decode_shufdelta_gpu(
     let combined_indptr =
         scx_codec::decode_indptr_only(indptr_bytes, CodecId::ShufDeltaZstd, n_rows)
             .map_err(|e| GpuError::InvalidShard(format!("unframed ShufDeltaZstd indptr: {e}")))?;
-    debug_assert_eq!(combined_indptr.len(), n_rows + 1);
+    // `decode_indptr_only` has already applied length / zero-start /
+    // monotonicity; this adds the header's `nnz`, which it does not receive.
+    // ShufDeltaZstd's indptr is raw `u64`s behind an unshuffle+undelta, so
+    // nothing about the codec constrains the values — every part of the gate is
+    // load-bearing here, and the indices/values buffers below are sized from
+    // `nnz`, so a disagreeing indptr yields a `GpuCsr` that contradicts itself.
+    scx_codec::check_indptr_shape(&combined_indptr, n_rows, Some(nnz))
+        .map_err(|e| GpuError::InvalidShard(format!("unframed ShufDeltaZstd indptr: {e}")))?;
     let mut host_uploaded_bytes = (combined_indptr.len() * 8) as u64;
 
     let (combined_indices, combined_data) = if nnz > 0 {
