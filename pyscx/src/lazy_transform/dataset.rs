@@ -592,20 +592,8 @@ impl ScxLazyTransformedDataset {
         .map_err(|e| e.to_string())?;
 
         // Add contribution from implicit zeros
-        let mut variances = vec![0.0f64; n_vars];
-        for c in 0..n_vars {
-            debug_assert!(
-                col_nnz[c] <= n_obs,
-                "col_nnz[{}] = {} exceeds n_obs = {}",
-                c,
-                col_nnz[c],
-                n_obs
-            );
-            let n_zeros = n_obs - col_nnz[c];
-            let total = sq_devs[c] + n_zeros as f64 * col_means[c] * col_means[c];
-            variances[c] = total / n_obs as f64;
-        }
-        Ok(variances)
+        scx_sparse::finalize_implicit_zero_variance(&sq_devs, &col_nnz, &col_means, n_obs)
+            .map_err(|e| e.to_string())
     }
 
     /// Stream all shards, apply transforms, compute masked column sums (deletion-aware).

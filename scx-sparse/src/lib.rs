@@ -8,7 +8,10 @@ pub mod validate;
 
 pub use convert::{csr_to_dense, dense_to_csr};
 pub use csc::{CscError, ScxCsc};
-pub use csr::{concatenate_csr, total_variance_from_col_sq, CsrError, ScxCsr};
+pub use csr::{
+    concatenate_csr, finalize_implicit_zero_variance, implicit_zero_count,
+    total_variance_from_col_sq, CsrError, ScxCsr,
+};
 pub use materialize::{
     Container, IndexBuffer, IndexDtype, MaterializePlan, TypedCsr, TypedDense, ValueBuffer,
     ValueDtype,

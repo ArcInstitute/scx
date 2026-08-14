@@ -46,6 +46,88 @@ pub enum CsrError {
         end: usize,
         n_rows: usize,
     },
+
+    #[error(
+        "non-canonical CSR: an axis of {extent} cells holds {nnz} stored entries, \
+         so at least one coordinate is stored more than once (docs/format.md \
+         § v3 canonical CSR invariant requires strictly increasing per-row \
+         column indices); run `scx validate --deep` to locate it"
+    )]
+    NonCanonicalAxis { extent: usize, nnz: usize },
+}
+
+/// Number of implicit zeros on an axis of `extent` cells holding `nnz` stored
+/// entries, or [`CsrError::NonCanonicalAxis`] if `nnz` exceeds `extent`.
+///
+/// # Why this can fail, and why here
+///
+/// In a canonical CSR it cannot: `docs/format.md` § "v3 canonical CSR
+/// invariant" requires per-row column indices to be strictly increasing and to
+/// lie in `[0, n_minor)`, so an axis of `extent` cells stores at most `extent`
+/// entries. `nnz > extent` therefore *proves* the same coordinate is stored
+/// twice.
+///
+/// Ordinary reads do not detect that. The decode seam bounds index **values**
+/// against the shard's minor extent — see the "Who upholds invariant 5" note on
+/// [`ScxCsr::new_unchecked`] — but nothing on the read path checks their
+/// **ordering or uniqueness**; only `scx validate --deep` does
+/// (`scx-format-io`'s `validate_canonical_csr_entry`). Neither does
+/// [`ScxCsr::new`]. So a duplicate survives all the way to whichever statistic
+/// first infers a cardinality from a dimension — which is this function, and
+/// which is why the check belongs here rather than at the consumers.
+///
+/// This is **not** the redundant per-consumer bounds check that
+/// `docs/conventions.md` warns against: that rule is about re-validating the
+/// *same* axis the seam already validated. This is a different invariant
+/// (cardinality, not index range), and the seam's guarantee does not imply it.
+///
+/// Getting it wrong is not a near-miss. Before this function existed,
+/// `extent - nnz` was written inline as a `usize` subtraction: in release it
+/// wrapped to ~1.8e19 and was multiplied by `mean²`, so a 1×2 row storing three
+/// entries reported a variance of `8.301034833169298e19`.
+pub fn implicit_zero_count(extent: usize, nnz: usize) -> Result<usize, CsrError> {
+    extent
+        .checked_sub(nnz)
+        .ok_or(CsrError::NonCanonicalAxis { extent, nnz })
+}
+
+/// Finalize a per-column population variance from partial centered sums.
+///
+/// `sq_devs[c]` is `Σ (x − μ_c)²` over the **stored** entries of column `c`
+/// (as produced by [`ScxCsr::col_var_partial`]); this folds in the implicit
+/// zeros, each of which contributes `μ_c²`, and divides by `extent`.
+///
+/// `extent` is the number of rows the columns span — the full `n_obs`, or the
+/// kept-row count when a deletion vector or row mask is applied. All three
+/// slices must be the same length: the number of columns being aggregated over,
+/// which is `n_vars` for a whole-matrix reduction and the projection width for
+/// a column-projected one.
+///
+/// Errors with [`CsrError::NonCanonicalAxis`] when any `col_nnz[c] > extent`;
+/// see [`implicit_zero_count`] for why that is corruption rather than an
+/// unusual-but-valid shape.
+///
+/// Kept deliberately in the two-pass centered form rather than the algebraically
+/// equivalent `Σx²/n − μ²`: the latter is cancellation-prone, which
+/// `scx-accel`'s `accumulate_centered_ss` documents as the reason it forms
+/// `(x − μ)` directly.
+pub fn finalize_implicit_zero_variance(
+    sq_devs: &[f64],
+    col_nnz: &[usize],
+    col_means: &[f64],
+    extent: usize,
+) -> Result<Vec<f64>, CsrError> {
+    debug_assert_eq!(sq_devs.len(), col_nnz.len());
+    debug_assert_eq!(sq_devs.len(), col_means.len());
+    if extent == 0 {
+        return Ok(vec![0.0; sq_devs.len()]);
+    }
+    let mut variances = Vec::with_capacity(sq_devs.len());
+    for ((&sq_dev, &nnz), &mean) in sq_devs.iter().zip(col_nnz).zip(col_means) {
+        let n_zeros = implicit_zero_count(extent, nnz)?;
+        variances.push((sq_dev + n_zeros as f64 * mean * mean) / extent as f64);
+    }
+    Ok(variances)
 }
 
 /// A CSR sparse matrix with scipy-compatible dtypes.
@@ -179,6 +261,23 @@ impl ScxCsr {
     /// there is nothing to reconcile against and the header's `n_minor` stands
     /// alone. Same for a legacy multimodal shard, whose `n_minor` is `0` —
     /// "undeclared", not "zero columns" — where the bound is skipped entirely.
+    ///
+    /// # What is deliberately *not* on the list: uniqueness
+    ///
+    /// Nothing here — nor in [`Self::new`], the fully-validating constructor —
+    /// requires a row's column indices to be *distinct*. Invariant 5 bounds each
+    /// index's **value**; it says nothing about how many times a value may
+    /// appear. `docs/format.md` § "v3 canonical CSR invariant" does require
+    /// strictly increasing per-row indices, but on the read path only
+    /// `scx validate --deep` checks it, so a duplicate reaches this constructor
+    /// intact.
+    ///
+    /// That gap used to be load-bearing in the wrong direction: five statistics
+    /// in this file inferred an implicit-zero count as `extent - nnz`, which a
+    /// duplicate makes negative. They now go through [`implicit_zero_count`] and
+    /// report [`CsrError::NonCanonicalAxis`] instead of assuming. A CSR with
+    /// duplicates is still *constructible* — the constructors are unchanged —
+    /// but it no longer yields a plausible-looking number.
     ///
     /// Callers constructing a CSR from anywhere *other* than a reader still owe
     /// the invariant themselves, and one known caller does not yet discharge it:
@@ -449,7 +548,10 @@ impl ScxCsr {
     /// For each row, computes `mean = sum(data) / n_cols`, then accumulates
     /// `(val - mean)²` for stored entries and `n_zeros * mean²` for implicit zeros.
     /// Returns `f64` for precision.
-    pub fn row_var(&self) -> Vec<f64> {
+    ///
+    /// Errors with [`CsrError::NonCanonicalAxis`] if any row stores more entries
+    /// than the matrix has columns — see [`implicit_zero_count`].
+    pub fn row_var(&self) -> Result<Vec<f64>, CsrError> {
         let n_cols = self.shape.1;
         let mut variances = Vec::with_capacity(self.shape.0);
         for r in 0..self.shape.0 {
@@ -476,12 +578,12 @@ impl ScxCsr {
                 .sum();
 
             // Add contribution from implicit zeros: n_zeros * mean²
-            let n_zeros = n_cols - nnz;
+            let n_zeros = implicit_zero_count(n_cols, nnz)?;
             var_sum += n_zeros as f64 * mean * mean;
 
             variances.push(var_sum / n_cols as f64);
         }
-        variances
+        Ok(variances)
     }
 
     /// Compute per-column sum-of-squared-deviations from given means.
@@ -509,7 +611,14 @@ impl ScxCsr {
     /// When a row has fewer stored entries than `n_cols`, the max is
     /// `max(stored_max, 0.0)`. For rows with no stored entries and `n_cols > 0`,
     /// returns `0.0` (all entries are implicit zeros).
-    pub fn row_max(&self) -> Vec<f64> {
+    ///
+    /// Errors with [`CsrError::NonCanonicalAxis`] if any row stores more entries
+    /// than the matrix has columns. Note that this one never *wrapped* — the
+    /// `nnz < n_cols` gate below simply read false and skipped the implicit-zero
+    /// correction, so a row storing `-5.0` three times in two columns reported a
+    /// max of `-5.0` when one of its two cells is an implicit `0.0`. Silently
+    /// wrong in debug and release alike; see [`implicit_zero_count`].
+    pub fn row_max(&self) -> Result<Vec<f64>, CsrError> {
         let n_cols = self.shape.1;
         let mut maxes = Vec::with_capacity(self.shape.0);
         for r in 0..self.shape.0 {
@@ -522,6 +631,8 @@ impl ScxCsr {
                 continue;
             }
 
+            let n_zeros = implicit_zero_count(n_cols, nnz)?;
+
             if nnz == 0 {
                 // All entries are implicit zeros
                 maxes.push(0.0);
@@ -533,14 +644,14 @@ impl ScxCsr {
                 .map(|&v| v as f64)
                 .fold(f64::NEG_INFINITY, f64::max);
 
-            if nnz < n_cols {
+            if n_zeros > 0 {
                 // Has implicit zeros
                 maxes.push(stored_max.max(0.0));
             } else {
                 maxes.push(stored_max);
             }
         }
-        maxes
+        Ok(maxes)
     }
 
     /// Compute per-column max, accounting for implicit zeros.
@@ -552,7 +663,9 @@ impl ScxCsr {
     /// correction compares stored-nnz against the right denominator.
     /// When the column has fewer stored entries than `total_n_obs`, returns
     /// `max(stored_max, 0.0)`.
-    pub fn col_max(&self, total_n_obs: usize) -> Vec<f64> {
+    ///
+    /// Errors with [`CsrError::NonCanonicalAxis`]; see [`Self::row_max`].
+    pub fn col_max(&self, total_n_obs: usize) -> Result<Vec<f64>, CsrError> {
         let mut maxes = vec![f64::NEG_INFINITY; self.shape.1];
         let mut col_counts = vec![0usize; self.shape.1];
 
@@ -564,7 +677,7 @@ impl ScxCsr {
         }
 
         for c in 0..self.shape.1 {
-            if col_counts[c] < total_n_obs {
+            if implicit_zero_count(total_n_obs, col_counts[c])? > 0 {
                 // Has implicit zeros — max is at least 0.0
                 if maxes[c] == f64::NEG_INFINITY {
                     maxes[c] = 0.0; // all entries in this shard contribute nothing
@@ -575,14 +688,16 @@ impl ScxCsr {
             // If col_counts[c] == total_n_obs, all entries are stored; keep stored_max
             // If col_counts[c] == 0 and total_n_obs == 0, keep NEG_INFINITY (degenerate)
         }
-        maxes
+        Ok(maxes)
     }
 
     /// Compute per-row min, accounting for implicit zeros.
     ///
     /// When a row has fewer stored entries than `n_cols`, the min is
     /// `min(stored_min, 0.0)`.
-    pub fn row_min(&self) -> Vec<f64> {
+    ///
+    /// Errors with [`CsrError::NonCanonicalAxis`]; see [`Self::row_max`].
+    pub fn row_min(&self) -> Result<Vec<f64>, CsrError> {
         let n_cols = self.shape.1;
         let mut mins = Vec::with_capacity(self.shape.0);
         for r in 0..self.shape.0 {
@@ -595,6 +710,8 @@ impl ScxCsr {
                 continue;
             }
 
+            let n_zeros = implicit_zero_count(n_cols, nnz)?;
+
             if nnz == 0 {
                 // All entries are implicit zeros
                 mins.push(0.0);
@@ -606,14 +723,14 @@ impl ScxCsr {
                 .map(|&v| v as f64)
                 .fold(f64::INFINITY, f64::min);
 
-            if nnz < n_cols {
+            if n_zeros > 0 {
                 // Has implicit zeros
                 mins.push(stored_min.min(0.0));
             } else {
                 mins.push(stored_min);
             }
         }
-        mins
+        Ok(mins)
     }
 
     /// Compute per-column min, accounting for implicit zeros.
@@ -622,7 +739,9 @@ impl ScxCsr {
     /// (not just this shard); see [`Self::col_max`] for the rationale on
     /// the renaming. When the column has fewer stored entries than
     /// `total_n_obs`, returns `min(stored_min, 0.0)`.
-    pub fn col_min(&self, total_n_obs: usize) -> Vec<f64> {
+    ///
+    /// Errors with [`CsrError::NonCanonicalAxis`]; see [`Self::row_max`].
+    pub fn col_min(&self, total_n_obs: usize) -> Result<Vec<f64>, CsrError> {
         let mut mins = vec![f64::INFINITY; self.shape.1];
         let mut col_counts = vec![0usize; self.shape.1];
 
@@ -634,7 +753,7 @@ impl ScxCsr {
         }
 
         for c in 0..self.shape.1 {
-            if col_counts[c] < total_n_obs {
+            if implicit_zero_count(total_n_obs, col_counts[c])? > 0 {
                 if mins[c] == f64::INFINITY {
                     mins[c] = 0.0;
                 } else {
@@ -642,7 +761,7 @@ impl ScxCsr {
                 }
             }
         }
-        mins
+        Ok(mins)
     }
 }
 
@@ -1096,7 +1215,7 @@ mod tests {
         // row 0: [0, 5, 0, 10, 0] → mean=3.0, var = (9+4+9+49+9)/5 = 16.0
         // row 1: [1, 0, 3, 0, 7]  → mean=2.2, var = (1.44+4.84+0.64+4.84+23.04)/5 = 6.96
         // row 2: [0, 0, 2, 0, 0]  → mean=0.4, var = (0.16+0.16+2.56+0.16+0.16)/5 = 0.64
-        let var = csr.row_var();
+        let var = csr.row_var().unwrap();
         assert!((var[0] - 16.0).abs() < 1e-10);
         assert!((var[1] - 6.96).abs() < 1e-10);
         assert!((var[2] - 0.64).abs() < 1e-10);
@@ -1122,7 +1241,7 @@ mod tests {
     #[test]
     fn test_row_max() {
         let csr = sample_csr();
-        let maxes = csr.row_max();
+        let maxes = csr.row_max().unwrap();
         // row 0: [0, 5, 0, 10, 0] → max = 10 (has zeros, max(10, 0) = 10)
         // row 1: [1, 0, 3, 0, 7]  → max = 7  (has zeros, max(7, 0) = 7)
         // row 2: [0, 0, 2, 0, 0]  → max = 2  (has zeros, max(2, 0) = 2)
@@ -1132,14 +1251,14 @@ mod tests {
     #[test]
     fn test_row_max_all_zeros() {
         let csr = ScxCsr::new((1, 3), vec![0, 0], vec![], vec![]).unwrap();
-        let maxes = csr.row_max();
+        let maxes = csr.row_max().unwrap();
         assert_eq!(maxes, vec![0.0]);
     }
 
     #[test]
     fn test_col_max() {
         let csr = sample_csr();
-        let maxes = csr.col_max(3);
+        let maxes = csr.col_max(3).unwrap();
         // col 0: [0,1,0] → stored: [1], has zeros → max(1,0)=1
         // col 1: [5,0,0] → stored: [5], has zeros → max(5,0)=5
         // col 2: [0,3,2] → stored: [3,2], has zeros → max(3,0)=3
@@ -1153,7 +1272,7 @@ mod tests {
     #[test]
     fn test_row_min() {
         let csr = sample_csr();
-        let mins = csr.row_min();
+        let mins = csr.row_min().unwrap();
         // All rows have implicit zeros, so min = min(stored_min, 0.0) = 0.0
         assert_eq!(mins, vec![0.0, 0.0, 0.0]);
     }
@@ -1161,14 +1280,14 @@ mod tests {
     #[test]
     fn test_row_min_all_zeros() {
         let csr = ScxCsr::new((1, 3), vec![0, 0], vec![], vec![]).unwrap();
-        let mins = csr.row_min();
+        let mins = csr.row_min().unwrap();
         assert_eq!(mins, vec![0.0]);
     }
 
     #[test]
     fn test_col_min() {
         let csr = sample_csr();
-        let mins = csr.col_min(3);
+        let mins = csr.col_min(3).unwrap();
         // All columns have at least one implicit zero, so min = min(stored_min, 0.0) = 0.0
         assert_eq!(mins, vec![0.0, 0.0, 0.0, 0.0, 0.0]);
     }
@@ -1177,7 +1296,7 @@ mod tests {
     fn test_col_min_negative_values() {
         // 2x3 matrix: row0=[−5, 0, 3], row1=[0, −2, 0]
         let csr = ScxCsr::new((2, 3), vec![0, 2, 3], vec![0, 2, 1], vec![-5.0, 3.0, -2.0]).unwrap();
-        let mins = csr.col_min(2);
+        let mins = csr.col_min(2).unwrap();
         // col 0: [-5, 0] → min(-5, 0) = -5 (has implicit zero)
         // col 1: [0, -2] → min(-2, 0) = -2 (has implicit zero)
         // col 2: [3, 0]  → min(3, 0) = 0   (has implicit zero)
@@ -1194,9 +1313,109 @@ mod tests {
             vec![-1.0, -3.0, -2.0, -4.0],
         )
         .unwrap();
-        let maxes = csr.col_max(2);
+        let maxes = csr.col_max(2).unwrap();
         // col 0: [-1, -2] → no implicit zeros → max = -1
         // col 1: [-3, -4] → no implicit zeros → max = -3
         assert_eq!(maxes, vec![-1.0, -3.0]);
+    }
+
+    // --- Non-canonical input: nnz > extent ---
+    //
+    // Every statistic in this file that folds in implicit zeros has to know how
+    // many there are, and derives it from `extent - nnz`. A duplicate coordinate
+    // inverts those operands. `ScxCsr::new` accepts such a matrix — it validates
+    // index *range*, not uniqueness — so these fixtures are constructible
+    // through the fully-validating constructor, which is the point.
+
+    /// 1x2 holding three entries summing to 6.0, so `mean == 3.0`.
+    /// Column 1 is stored twice: `nnz == 3` against `n_cols == 2`.
+    fn non_canonical_row() -> ScxCsr {
+        ScxCsr::new((1, 2), vec![0, 3], vec![0, 1, 1], vec![1.0, 2.0, 3.0])
+            .expect("new() validates index range, not uniqueness")
+    }
+
+    #[test]
+    fn implicit_zero_count_rejects_more_entries_than_cells() {
+        assert_eq!(implicit_zero_count(5, 2).unwrap(), 3);
+        assert_eq!(implicit_zero_count(4, 4).unwrap(), 0);
+        assert_eq!(implicit_zero_count(0, 0).unwrap(), 0);
+        assert!(matches!(
+            implicit_zero_count(2, 3),
+            Err(CsrError::NonCanonicalAxis { extent: 2, nnz: 3 })
+        ));
+    }
+
+    #[test]
+    fn row_var_reports_non_canonical_instead_of_a_wrapped_count() {
+        // Before the fix this did not fail — it *answered*. `n_cols - nnz` is a
+        // usize subtraction, so 2 - 3 wrapped to 18446744073709551615, which
+        // times mean² (9.0) over n_cols (2) gave 8.301034833169298e19 in
+        // release. Debug builds panicked with "attempt to subtract with
+        // overflow" instead, so the same defect had two different symptoms and
+        // neither was an error.
+        assert!(matches!(
+            non_canonical_row().row_var(),
+            Err(CsrError::NonCanonicalAxis { extent: 2, nnz: 3 })
+        ));
+    }
+
+    #[test]
+    fn extrema_report_non_canonical_instead_of_skipping_the_zero_correction() {
+        // The extrema never wrapped: they gate on `nnz < n_cols`, which simply
+        // reads false when nnz is larger, silently skipping the implicit-zero
+        // correction. This fixture stores -5.0 three times in column 0 of a
+        // 1x2 matrix, so column 1 is an implicit zero and the true row max is
+        // 0.0 — but row_max() returned -5.0, in *both* profiles. That makes
+        // this the case that proves the extrema fix independently of
+        // overflow-checks.
+        let csr = ScxCsr::new((1, 2), vec![0, 3], vec![0, 0, 0], vec![-5.0, -5.0, -5.0]).unwrap();
+        assert!(matches!(
+            csr.row_max(),
+            Err(CsrError::NonCanonicalAxis { extent: 2, nnz: 3 })
+        ));
+        assert!(matches!(
+            csr.row_min(),
+            Err(CsrError::NonCanonicalAxis { extent: 2, nnz: 3 })
+        ));
+        // Column axis: column 0 holds 3 entries against total_n_obs == 1.
+        assert!(matches!(
+            csr.col_max(1),
+            Err(CsrError::NonCanonicalAxis { extent: 1, nnz: 3 })
+        ));
+        assert!(matches!(
+            csr.col_min(1),
+            Err(CsrError::NonCanonicalAxis { extent: 1, nnz: 3 })
+        ));
+    }
+
+    #[test]
+    fn finalize_implicit_zero_variance_matches_the_inline_form_it_replaced() {
+        // The shape the five call sites in scx-format-io and pyscx used to
+        // spell out. Two columns over 4 rows: col 0 stores 3 entries, col 1
+        // stores 1.
+        let sq_devs = [2.5f64, 0.75];
+        let col_nnz = [3usize, 1];
+        let col_means = [1.25f64, 0.5];
+        let got = finalize_implicit_zero_variance(&sq_devs, &col_nnz, &col_means, 4).unwrap();
+        let want: Vec<f64> = (0..2)
+            .map(|c| {
+                let n_zeros = (4 - col_nnz[c]) as f64;
+                (sq_devs[c] + n_zeros * col_means[c] * col_means[c]) / 4.0
+            })
+            .collect();
+        assert_eq!(got, want, "must stay bit-identical on canonical input");
+
+        // extent == 0 short-circuits rather than dividing by zero.
+        assert_eq!(
+            finalize_implicit_zero_variance(&[0.0, 0.0], &[0, 0], &[0.0, 0.0], 0).unwrap(),
+            vec![0.0, 0.0]
+        );
+
+        // And a column claiming more stored entries than there are rows is
+        // reported, not folded in as ~1.8e19 zeros.
+        assert!(matches!(
+            finalize_implicit_zero_variance(&[1.0], &[5], &[1.0], 4),
+            Err(CsrError::NonCanonicalAxis { extent: 4, nnz: 5 })
+        ));
     }
 }

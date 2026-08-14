@@ -131,7 +131,7 @@ pub fn col_max_projected(
 
     // Implicit zeros: if column has fewer stored entries than n_obs
     for c in 0..n_proj {
-        if col_nnz[c] < n_obs {
+        if scx_sparse::implicit_zero_count(n_obs, col_nnz[c])? > 0 {
             if maxes[c] == f64::NEG_INFINITY {
                 maxes[c] = 0.0;
             } else {
@@ -174,7 +174,7 @@ pub fn col_min_projected(
     )?;
 
     for c in 0..n_proj {
-        if col_nnz[c] < n_obs {
+        if scx_sparse::implicit_zero_count(n_obs, col_nnz[c])? > 0 {
             if mins[c] == f64::INFINITY {
                 mins[c] = 0.0;
             } else {
@@ -229,20 +229,9 @@ pub fn col_var_projected(
     )?;
 
     // Add contribution from implicit zeros
-    let mut variances = vec![0.0f64; n_proj];
-    for c in 0..n_proj {
-        debug_assert!(
-            col_nnz[c] <= n_obs,
-            "col_nnz[{}] = {} exceeds n_obs = {}",
-            c,
-            col_nnz[c],
-            n_obs
-        );
-        let n_zeros = n_obs - col_nnz[c];
-        let total_sq_dev = sq_devs[c] + n_zeros as f64 * col_means[c] * col_means[c];
-        variances[c] = total_sq_dev / n_obs as f64;
-    }
-    Ok(variances)
+    Ok(scx_sparse::finalize_implicit_zero_variance(
+        &sq_devs, &col_nnz, &col_means, n_obs,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -755,7 +744,7 @@ pub fn col_max_masked_projected(
     )?;
 
     for c in 0..n_proj {
-        if col_nnz[c] < n_kept {
+        if scx_sparse::implicit_zero_count(n_kept, col_nnz[c])? > 0 {
             if maxes[c] == f64::NEG_INFINITY {
                 maxes[c] = 0.0;
             } else {
@@ -806,7 +795,7 @@ pub fn col_min_masked_projected(
     )?;
 
     for c in 0..n_proj {
-        if col_nnz[c] < n_kept {
+        if scx_sparse::implicit_zero_count(n_kept, col_nnz[c])? > 0 {
             if mins[c] == f64::INFINITY {
                 mins[c] = 0.0;
             } else {
@@ -866,20 +855,9 @@ pub fn col_var_masked_projected(
     )?;
 
     // Add zero-entry contributions
-    let mut variances = vec![0.0f64; n_proj];
-    for c in 0..n_proj {
-        debug_assert!(
-            col_nnz[c] <= n_kept,
-            "col_nnz[{}] = {} exceeds n_kept = {}",
-            c,
-            col_nnz[c],
-            n_kept
-        );
-        let n_zeros = n_kept - col_nnz[c];
-        let total = sq_devs[c] + n_zeros as f64 * col_means[c] * col_means[c];
-        variances[c] = total / n_kept as f64;
-    }
-    Ok(variances)
+    Ok(scx_sparse::finalize_implicit_zero_variance(
+        &sq_devs, &col_nnz, &col_means, n_kept,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,7 +990,7 @@ pub fn col_max_projected_csc(
         col_nnz[output_col] += e - s;
     })?;
     for c in 0..n_proj {
-        if col_nnz[c] < n_obs {
+        if scx_sparse::implicit_zero_count(n_obs, col_nnz[c])? > 0 {
             if maxes[c] == f64::NEG_INFINITY {
                 maxes[c] = 0.0;
             } else {
@@ -1046,7 +1024,7 @@ pub fn col_min_projected_csc(
         col_nnz[output_col] += e - s;
     })?;
     for c in 0..n_proj {
-        if col_nnz[c] < n_obs {
+        if scx_sparse::implicit_zero_count(n_obs, col_nnz[c])? > 0 {
             if mins[c] == f64::INFINITY {
                 mins[c] = 0.0;
             } else {
@@ -1183,7 +1161,7 @@ pub fn col_max_masked_projected_csc(
         }
     })?;
     for c in 0..n_proj {
-        if col_nnz[c] < n_kept {
+        if scx_sparse::implicit_zero_count(n_kept, col_nnz[c])? > 0 {
             if maxes[c] == f64::NEG_INFINITY {
                 maxes[c] = 0.0;
             } else {
@@ -1221,7 +1199,7 @@ pub fn col_min_masked_projected_csc(
         }
     })?;
     for c in 0..n_proj {
-        if col_nnz[c] < n_kept {
+        if scx_sparse::implicit_zero_count(n_kept, col_nnz[c])? > 0 {
             if mins[c] == f64::INFINITY {
                 mins[c] = 0.0;
             } else {

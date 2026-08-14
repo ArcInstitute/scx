@@ -1006,6 +1006,22 @@ fn accumulate_centered_ss(csr: &ScxCsr, means: &[f64], total: &mut f64, col_nnz:
 
 /// Finalize the stable centered total variance: fold the implicit-zero
 /// contribution `(n_obs − nnz_c)·μ_c²` per column and divide by `n_obs − 1`.
+///
+/// ⚠️ This is the one implicit-zero count in the tree that still **absorbs** a
+/// non-canonical shard instead of reporting it. Everywhere else — the six
+/// `BackedCsrReader` statistics, their projected and masked twins in pyscx, and
+/// the five `ScxCsr` methods — routes through
+/// `scx_sparse::implicit_zero_count`, which returns
+/// `CsrError::NonCanonicalAxis` when a column claims more stored entries than
+/// there are rows. Here `saturating_sub` clamps it to zero and the PCA
+/// continues.
+///
+/// That is deliberate, not an oversight: this function returns a bare `f64`,
+/// and so does `stable_centered_total_variance_inmemory` below it, so giving it
+/// an error channel means threading `Result` through the PCA result path. The
+/// clamp is at least bounded — it never produced the ~1.8e19 wrap that the
+/// unguarded subtractions did. Worth revisiting whenever that path grows a
+/// `Result` for another reason.
 fn finalize_centered_variance(mut total: f64, col_nnz: &[u64], means: &[f64], n_obs: usize) -> f64 {
     for (c, &nnz) in col_nnz.iter().enumerate() {
         let n_zeros = (n_obs as u64).saturating_sub(nnz) as f64;

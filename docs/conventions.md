@@ -48,7 +48,23 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   those seams, it owes the same check; `reader.rs`'s block-index row-run path is
   the existing example.
 
-  Two carve-outs, both narrow:
+  Three carve-outs, all narrow:
+  - **A consumer relying on a *different invariant* owes its own check.** The
+    rule above is about re-validating the *same* thing the seam validated. The
+    seam bounds each index's **value** against `n_minor`; it says nothing about
+    the indices' **ordering or uniqueness**, which `docs/format.md` § "v3
+    canonical CSR invariant" also requires and which only `scx validate --deep`
+    checks on the read path. Anything inferring a *cardinality* from a dimension
+    — "this axis has `extent` cells and `nnz` of them are stored, so
+    `extent - nnz` are implicit zeros" — depends on uniqueness, not on the
+    bound, and the seam's guarantee does not imply it. That inference is
+    centralised in `scx_sparse::implicit_zero_count` (and
+    `finalize_implicit_zero_variance` for the per-column variance shape); every
+    statistic that folds in implicit zeros goes through it. Written inline as a
+    `usize` subtraction it wrapped in release and returned `8.3e19` as a
+    variance. **Do not delete those checks as redundant with the seam** — they
+    guard a different invariant, and they are O(1) per row / O(n_vars) per
+    finalize, never per-nnz.
   - **A consumer bounded by a *different* axis owes its own check.** The dense
     scatter in `typed_read.rs` sizes its buffer from the file header's `n_vars`
     while the seam validates against the shard header's `n_minor`. Those agree on

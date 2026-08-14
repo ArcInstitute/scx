@@ -848,6 +848,18 @@ which the writer uses to build the `lazy_transforms` payload.
 - `row_nnz()` / `col_nnz()` — Streaming per-row/column NNZ
 - `row_var()` / `col_var()` — Streaming per-row/column variance
 - `row_max()` / `col_max()` / `row_min()` / `col_min()` — Streaming extrema
+
+Every one of the six above folds implicit zeros into its result, and so has to
+know how many there are: `extent − nnz`, where `extent` is `n_cols` on the row
+axis and `n_obs` (or the kept-row count) on the column axis. That is only valid
+on a **canonical** CSR — `docs/format.md` § "v3 canonical CSR invariant" requires
+per-row column indices to be strictly increasing, so an axis of `extent` cells
+holds at most `extent` entries. Ordinary reads do not verify that: the decode
+seam bounds index *values*, and only `scx validate --deep` checks ordering. These
+six therefore return `ScxError::Csr(CsrError::NonCanonicalAxis { extent, nnz })`
+when a shard stores a coordinate twice, rather than reporting a number derived
+from a wrapped count. Surfaced through pyscx as a `RuntimeError` from
+`X.var(axis=…)` / `X.max(axis=…)` / `X.min(axis=…)` on a backed matrix.
 - `total_nnz()` — Total NNZ across all shards
 - `col_means_and_sum_sq(zero_center)` — Single-pass column statistics for PCA
 - Masked variants (deletion-vector aware): `col_sums_masked(kept_rows)`, `col_nnz_masked(kept_rows)`, `col_max_masked(kept_rows)`, `col_min_masked(kept_rows)`, `col_var_masked(kept_rows)`
