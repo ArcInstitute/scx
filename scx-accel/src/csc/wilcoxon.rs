@@ -251,6 +251,11 @@ fn gene_stats_nnz(
     //
     // `scx-sparse`'s release `overflow-checks` override does not reach this
     // crate, so the guard has to be explicit.
+    //
+    // Note precisely what it proves: `n_neg + n_pos` counts labelled **nonzero**
+    // cells, since explicit stored zeros join the implicit-zero block above. So
+    // a column overfull purely with duplicated explicit zeros passes this — the
+    // arithmetic is safe either way, but this is not a canonicality verdict.
     let n_zero_total =
         scx_sparse::implicit_zero_count(n_labelled, n_neg + n_pos).map_err(|_| {
             AccelError::InvalidInput(format!(

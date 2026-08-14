@@ -357,11 +357,21 @@ pub fn row_stats_projected(
                 // column projection turned an error back into a clamped `0.0`:
                 // `X.var(axis=1)` rejected an overfull row while
                 // `X[:, cols].var(axis=1)` answered, so view selection decided
-                // whether a corrupt file was caught. `project_csr` does not
-                // drop duplicates, and a canonical source row can hold at most
-                // one entry per projected column, so `e - s > n_proj` carries
-                // the same proof as elsewhere. The count is already in hand —
-                // this adds no pass.
+                // whether a corrupt file was caught. A canonical source row
+                // holds at most one entry per projected column, so
+                // `e - s > n_proj` carries the same proof as elsewhere, and the
+                // count is already in hand — this adds no pass.
+                //
+                // ⚠️ It is weaker than the unprojected check, because it runs
+                // *after* a lossy transform. `project_csr_row` advances its
+                // `gene_set` pointer monotonically, so on an **unsorted** row
+                // it silently skips every index smaller than one already seen.
+                // A row storing `[1, 0, 0]` projects to `[1]`: the raw row is
+                // overfull and rejected upstream, the projected one is not.
+                // Sorted duplicates (`[0, 0]`) do survive projection and are
+                // caught here. Closing the unsorted case means validating
+                // before the projection, or making `project_csr` fallible —
+                // both larger than this change.
                 scx_sparse::implicit_zero_count(n_proj, e - s)?;
                 let g = global_row + row;
                 let mut sm = 0.0f64;

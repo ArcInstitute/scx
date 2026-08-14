@@ -911,7 +911,16 @@ impl ScxBackedSparseDataset {
                                 0.0
                             } else {
                                 let mean = s / n_proj;
-                                (sq / n_proj - mean * mean).max(0.0)
+                                // Conditional, not `.max(0.0)`: see the note on
+                                // the unprojected scalar arm below. `f64::max`
+                                // ignores NaN, which would turn a NaN variance
+                                // into a real-looking 0.0.
+                                let c = sq / n_proj - mean * mean;
+                                if c < 0.0 {
+                                    0.0
+                                } else {
+                                    c
+                                }
                             }
                         })
                         .collect();
@@ -940,7 +949,9 @@ impl ScxBackedSparseDataset {
                         return Ok(0.0f64.into_pyobject(py)?.into_any());
                     }
                     let mean = sums.iter().sum::<f64>() / n_total;
-                    let variance = (sumsq.iter().sum::<f64>() / n_total - mean * mean).max(0.0);
+                    // Conditional, not `.max(0.0)` — NaN must survive; see below.
+                    let centered = sumsq.iter().sum::<f64>() / n_total - mean * mean;
+                    let variance = if centered < 0.0 { 0.0 } else { centered };
                     return Ok(variance.into_pyobject(py)?.into_any());
                 }
                 // Total scalar variance via Var(X) = E[X²] - (E[X])².
