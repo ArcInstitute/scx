@@ -962,7 +962,17 @@ impl ScxBackedSparseDataset {
                 .map_err(PyRuntimeError::new_err)?;
                 let mean = self.filter_row_results(&all_sums).iter().sum::<f64>() / n_total;
                 let mean_sq = self.filter_row_results(&all_sq).iter().sum::<f64>() / n_total;
-                let variance = mean_sq - mean * mean;
+                // `.max(0.0)` matches the projected branch above. E[X²] − E[X]²
+                // is exact only for canonical data: a duplicated coordinate
+                // inflates both moments unevenly and can drive this negative
+                // (measured: shape (1,2) storing [1,2,3] gives 7 − 9 = −2.0).
+                // This form never subtracted a count so it never wrapped, but
+                // returning a negative variance is not a defensible answer
+                // either. It is a clamp, not a detector — see
+                // `scx_sparse::implicit_zero_count` § "What this does NOT
+                // detect" for what the count-carrying routes catch that this
+                // one cannot.
+                let variance = (mean_sq - mean * mean).max(0.0);
                 Ok(variance.into_pyobject(py)?.into_any())
             }
             Some(_) => Err(PyValueError::new_err("axis must be 0, 1, or None")),

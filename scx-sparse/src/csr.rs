@@ -54,6 +54,16 @@ pub enum CsrError {
          column indices); run `scx validate --deep` to locate it"
     )]
     NonCanonicalAxis { extent: usize, nnz: usize },
+
+    #[error(
+        "column statistic slices disagree: sq_devs={sq_devs}, col_nnz={col_nnz}, \
+         col_means={col_means} (all three must be one entry per aggregated column)"
+    )]
+    StatsLengthMismatch {
+        sq_devs: usize,
+        col_nnz: usize,
+        col_means: usize,
+    },
 }
 
 /// Number of implicit zeros on an axis of `extent` cells holding `nnz` stored
@@ -75,6 +85,24 @@ pub enum CsrError {
 /// [`ScxCsr::new`]. So a duplicate survives all the way to whichever statistic
 /// first infers a cardinality from a dimension — which is this function, and
 /// which is why the check belongs here rather than at the consumers.
+///
+/// # What this does NOT detect
+///
+/// **The pigeonhole argument runs one way only.** `nnz > extent` implies a
+/// duplicate; a duplicate does *not* imply `nnz > extent`. A sparse row with a
+/// few repeats stays well under its extent and passes here unchallenged — a
+/// 1×3 row storing indices `[0, 0]` with values `[1, 2]` has `nnz = 2 ≤ 3`, so
+/// `row_var` returns `2/3`, where canonicalizing the duplicate (summing to
+/// `[3, 0, 0]`) gives `2.0`. That is the common shape of a duplicate in real
+/// data, and it is silently wrong here. Pinned by
+/// `duplicates_under_the_extent_are_not_detected`.
+///
+/// So this is **not** a uniqueness check and must not be described as one. It
+/// catches exactly the overfull-axis case — which is the case that used to
+/// wrap a `usize` subtraction and return `8.3e19`. Real uniqueness enforcement
+/// needs an ordering pass at the decode seam, which `scx validate --deep`
+/// does and ordinary reads deliberately do not (measured cost, see
+/// `docs/conventions.md`).
 ///
 /// This is **not** the redundant per-consumer bounds check that
 /// `docs/conventions.md` warns against: that rule is about re-validating the
@@ -105,7 +133,13 @@ pub fn implicit_zero_count(extent: usize, nnz: usize) -> Result<usize, CsrError>
 ///
 /// Errors with [`CsrError::NonCanonicalAxis`] when any `col_nnz[c] > extent`;
 /// see [`implicit_zero_count`] for why that is corruption rather than an
-/// unusual-but-valid shape.
+/// unusual-but-valid shape, **and for the duplicates it cannot see**.
+///
+/// Errors with [`CsrError::StatsLengthMismatch`] if the three slices disagree.
+/// That check runs on every profile, not just under `debug_assertions`: this
+/// function is public, and a `zip` over mismatched slices would otherwise
+/// silently truncate to the shortest — returning a short `Vec` that a caller
+/// indexing by column would then read as a different column's variance.
 ///
 /// Kept deliberately in the two-pass centered form rather than the algebraically
 /// equivalent `Σx²/n − μ²`: the latter is cancellation-prone, which
@@ -117,8 +151,19 @@ pub fn finalize_implicit_zero_variance(
     col_means: &[f64],
     extent: usize,
 ) -> Result<Vec<f64>, CsrError> {
-    debug_assert_eq!(sq_devs.len(), col_nnz.len());
-    debug_assert_eq!(sq_devs.len(), col_means.len());
+    if sq_devs.len() != col_nnz.len() || sq_devs.len() != col_means.len() {
+        return Err(CsrError::StatsLengthMismatch {
+            sq_devs: sq_devs.len(),
+            col_nnz: col_nnz.len(),
+            col_means: col_means.len(),
+        });
+    }
+    // Validate the counts *before* the zero-extent short-circuit. An axis of
+    // zero cells holding stored entries is still non-canonical, and returning
+    // `Ok(zeros)` for it would contradict this function's own contract.
+    for &nnz in col_nnz {
+        implicit_zero_count(extent, nnz)?;
+    }
     if extent == 0 {
         return Ok(vec![0.0; sq_devs.len()]);
     }
@@ -275,9 +320,15 @@ impl ScxCsr {
     /// That gap used to be load-bearing in the wrong direction: five statistics
     /// in this file inferred an implicit-zero count as `extent - nnz`, which a
     /// duplicate makes negative. They now go through [`implicit_zero_count`] and
-    /// report [`CsrError::NonCanonicalAxis`] instead of assuming. A CSR with
-    /// duplicates is still *constructible* — the constructors are unchanged —
-    /// but it no longer yields a plausible-looking number.
+    /// report [`CsrError::NonCanonicalAxis`] instead of wrapping.
+    ///
+    /// ⚠️ That is **narrower than a uniqueness check**, and this note used to
+    /// overstate it. What those statistics reject is an axis holding *more
+    /// stored entries than it has cells* — the pigeonhole case, which is
+    /// exactly the one that used to wrap. A duplicate that leaves the row under
+    /// its extent (the common shape: a sparse row with a couple of repeats)
+    /// passes, and the statistic returns a number computed from the duplicated
+    /// entries. See [`implicit_zero_count`] § "What this does NOT detect".
     ///
     /// Callers constructing a CSR from anywhere *other* than a reader still owe
     /// the invariant themselves, and one known caller does not yet discharge it:
@@ -1417,5 +1468,59 @@ mod tests {
             finalize_implicit_zero_variance(&[1.0], &[5], &[1.0], 4),
             Err(CsrError::NonCanonicalAxis { extent: 4, nnz: 5 })
         ));
+    }
+
+    #[test]
+    fn finalize_implicit_zero_variance_validates_on_every_profile() {
+        // `pub` fn: mismatched slices must be an error, not a `debug_assert!`
+        // that compiles out and lets `zip` truncate to the shortest input. A
+        // short return would be read by a caller as a *different* column's
+        // variance, which is worse than the panic it replaced.
+        assert!(matches!(
+            finalize_implicit_zero_variance(&[1.0, 2.0], &[1], &[1.0, 2.0], 4),
+            Err(CsrError::StatsLengthMismatch {
+                sq_devs: 2,
+                col_nnz: 1,
+                col_means: 2
+            })
+        ));
+
+        // The zero-extent short-circuit must not smuggle a bad count past the
+        // contract: an axis of 0 cells holding 3 entries is non-canonical, and
+        // used to return `Ok([0.0])` because the early return came first.
+        assert!(matches!(
+            finalize_implicit_zero_variance(&[0.0], &[3], &[0.0], 0),
+            Err(CsrError::NonCanonicalAxis { extent: 0, nnz: 3 })
+        ));
+        // ...while a genuinely empty axis still short-circuits.
+        assert_eq!(
+            finalize_implicit_zero_variance(&[0.0], &[0], &[0.0], 0).unwrap(),
+            vec![0.0]
+        );
+    }
+
+    #[test]
+    fn duplicates_under_the_extent_are_not_detected() {
+        // Pins the LIMIT of `implicit_zero_count`, so nobody reads the guard as
+        // a uniqueness check. Pigeonhole runs one way: `nnz > extent` proves a
+        // duplicate, but a duplicate that leaves the row under its extent is
+        // invisible — and that is the common shape in real data.
+        //
+        // 1x3 storing column 0 twice: nnz = 2 <= n_cols = 3, so no error.
+        let dup = ScxCsr::new((1, 3), vec![0, 2], vec![0, 0], vec![1.0, 2.0]).unwrap();
+        let var = dup
+            .row_var()
+            .expect("under-extent duplicate is NOT rejected");
+
+        // What it returns is computed from both stored entries plus one
+        // implicit zero: mean = 3/3 = 1, so (0 + 1 + 1)/3.
+        assert!((var[0] - 2.0 / 3.0).abs() < 1e-12, "got {}", var[0]);
+
+        // Canonicalizing the duplicate (summing to dense [3, 0, 0]) gives 2.0.
+        // The gap between 0.667 and 2.0 is the silent-corruption window this
+        // guard does not close; closing it needs an ordering pass at the decode
+        // seam (`scx validate --deep`), deliberately not on the read path.
+        let canonical = ScxCsr::new((1, 3), vec![0, 1], vec![0], vec![3.0]).unwrap();
+        assert!((canonical.row_var().unwrap()[0] - 2.0).abs() < 1e-12);
     }
 }

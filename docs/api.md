@@ -857,9 +857,26 @@ per-row column indices to be strictly increasing, so an axis of `extent` cells
 holds at most `extent` entries. Ordinary reads do not verify that: the decode
 seam bounds index *values*, and only `scx validate --deep` checks ordering. These
 six therefore return `ScxError::Csr(CsrError::NonCanonicalAxis { extent, nnz })`
-when a shard stores a coordinate twice, rather than reporting a number derived
-from a wrapped count. Surfaced through pyscx as a `RuntimeError` from
-`X.var(axis=…)` / `X.max(axis=…)` / `X.min(axis=…)` on a backed matrix.
+when **an axis holds more stored entries than it has cells**, rather than
+reporting a number derived from a wrapped count. Surfaced through pyscx as a
+`RuntimeError` from `X.var(axis=…)` / `X.max(axis=…)` / `X.min(axis=…)` on a
+backed matrix.
+
+⚠️ **That predicate is narrower than "the shard is canonical", and the
+difference matters.** `nnz > extent` proves a repeated coordinate, but the
+converse does not hold: a sparse row with a couple of repeats stays under its
+extent and is *not* detected — a 1×3 row storing indices `[0, 0]` yields a
+variance computed from both entries plus one implicit zero, with no error. So
+these are overfull-axis guards, not uniqueness guards. Two further consequences
+worth knowing:
+
+- Aggregations built on the second-moment identity `E[X²] − E[X]²` rather than a
+  count subtraction — the CSC column-variance kernels and the scalar
+  `X.var(axis=None)` — never wrapped, and detect only what their `col_nnz`
+  tally can see. Where no count is carried (the scalar path) the result is
+  **clamped** to `0.0` rather than rejected.
+- Use `scx validate --deep` when you need an actual canonicality verdict on a
+  file. None of the read-path aggregations is a substitute for it.
 - `total_nnz()` — Total NNZ across all shards
 - `col_means_and_sum_sq(zero_center)` — Single-pass column statistics for PCA
 - Masked variants (deletion-vector aware): `col_sums_masked(kept_rows)`, `col_nnz_masked(kept_rows)`, `col_max_masked(kept_rows)`, `col_min_masked(kept_rows)`, `col_var_masked(kept_rows)`

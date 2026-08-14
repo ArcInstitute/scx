@@ -1069,9 +1069,18 @@ pub fn col_var_projected_csc(
     // var = E[X²] - (E[X])²; the implicit-zero entries contribute 0 to
     // both sum_x and sum_x², so the formula is just a population mean
     // and second moment over n_obs.
+    //
+    // This form never subtracts a count, so it never wrapped — but it also
+    // never *noticed*: an overfull column drives `var` negative and the clamp
+    // below turns that into a plausible `0.0`. The CSR twin
+    // (`col_var_projected`) rejects the same column, so leaving this unwired
+    // would make `prefer_format` decide whether a corrupt file errors or
+    // answers. `col_nnz` was already tallied above; this is the check it was
+    // missing.
     let n = n_obs as f64;
     let mut variances = vec![0.0f64; n_proj];
     for c in 0..n_proj {
+        scx_sparse::implicit_zero_count(n_obs, col_nnz[c])?;
         let mean = sum_x[c] / n;
         let var = sum_x2[c] / n - mean * mean;
         variances[c] = if var < 0.0 { 0.0 } else { var };
@@ -1231,6 +1240,9 @@ pub fn col_var_masked_projected_csc(
     }
     let mut sum_x = vec![0.0f64; n_proj];
     let mut sum_x2 = vec![0.0f64; n_proj];
+    // Tallied for the canonicality check below, exactly as the unmasked twin
+    // does. Only kept rows are counted, so it is compared against `n_kept`.
+    let mut col_nnz = vec![0usize; n_proj];
     walk_csc_runs(source, col_indices, |local_col, output_col, csc| {
         let s = csc.indptr[local_col] as usize;
         let e = csc.indptr[local_col + 1] as usize;
@@ -1240,12 +1252,14 @@ pub fn col_var_masked_projected_csc(
                 let v = csc.data[k] as f64;
                 sum_x[output_col] += v;
                 sum_x2[output_col] += v * v;
+                col_nnz[output_col] += 1;
             }
         }
     })?;
     let n = n_kept as f64;
     let mut variances = vec![0.0f64; n_proj];
     for c in 0..n_proj {
+        scx_sparse::implicit_zero_count(n_kept, col_nnz[c])?;
         let mean = sum_x[c] / n;
         let var = sum_x2[c] / n - mean * mean;
         variances[c] = if var < 0.0 { 0.0 } else { var };

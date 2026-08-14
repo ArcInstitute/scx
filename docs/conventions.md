@@ -60,11 +60,28 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
     bound, and the seam's guarantee does not imply it. That inference is
     centralised in `scx_sparse::implicit_zero_count` (and
     `finalize_implicit_zero_variance` for the per-column variance shape); every
-    statistic that folds in implicit zeros goes through it. Written inline as a
-    `usize` subtraction it wrapped in release and returned `8.3e19` as a
-    variance. **Do not delete those checks as redundant with the seam** — they
-    guard a different invariant, and they are O(1) per row / O(n_vars) per
-    finalize, never per-nnz.
+    statistic that infers an implicit-zero count that way goes through it.
+    Written inline as a `usize` subtraction it wrapped in release and returned
+    `8.3e19` as a variance. **Do not delete those checks as redundant with the
+    seam** — they guard a different invariant, and they are O(1) per row /
+    O(n_vars) per finalize, never per-nnz.
+
+    ⚠️ **Be precise about what that helper is.** It rejects `nnz > extent` —
+    an axis holding more stored entries than it has cells. That *implies* a
+    duplicate coordinate, but not the reverse: a sparse row with a couple of
+    repeats stays under its extent and passes. It is an overfull-axis guard,
+    not a uniqueness check, and describing it as the latter overstates what
+    the read path verifies. Real uniqueness enforcement means an ordering pass
+    at the decode seam, which is deliberately not on the read path (see the
+    measured cost below) and lives in `scx validate --deep` instead.
+
+    Aggregations that use the second-moment identity `E[X²] − E[X]²` instead of
+    a count subtraction (the CSC column-variance kernels, the scalar
+    `var(axis=None)`) never wrapped. Where they already tally a per-column
+    count they run the same check, so `prefer_format` cannot change whether a
+    corrupt file is rejected; where no count exists the result is clamped at
+    `0.0` rather than rejected, because a negative variance is not a
+    defensible answer either.
   - **A consumer bounded by a *different* axis owes its own check.** The dense
     scatter in `typed_read.rs` sizes its buffer from the file header's `n_vars`
     while the seam validates against the shard header's `n_minor`. Those agree on
