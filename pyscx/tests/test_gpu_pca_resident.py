@@ -199,6 +199,7 @@ def test_streaming_arm_honours_and_reports_deterministic_spmm(scx_path):
         u, v = a[:, pc], b[:, pc]
         cos = abs(float(np.dot(u, v)) / (np.linalg.norm(u) * np.linalg.norm(v)))
         assert cos > 0.99, (
-            f"component {pc} diverged between the deterministic and heuristic "
-            f"SpMM algorithms: |cos| = {cos:.6f}"
+            f"component {pc} diverged between the pinned CSR_ALG2 "
+            f"(policy='deterministic') and heuristic ALG_DEFAULT SpMM "
+            f"algorithms: |cos| = {cos:.6f}"
         )

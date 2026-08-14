@@ -109,10 +109,17 @@ pub struct HarmonyResult {
     ///
     /// `None` on the CPU path, which has no capture decision to make.
     /// `Some(true)` when capture succeeded and every later sub-iter replayed
-    /// the graph; `Some(false)` when capture failed, produced no graph, or
-    /// `SCX_DISABLE_CUDA_GRAPHS=1` turned it off — in which case the kernels
-    /// ran directly. The numbers are the same either way; the throughput is
-    /// not, which is why a failure is recorded rather than swallowed.
+    /// the graph. `Some(false)` means simply "no graph was replayed", which has
+    /// **four** causes, not three: capture failed, capture produced no graph,
+    /// `SCX_DISABLE_CUDA_GRAPHS=1` turned it off, or the run never reached a
+    /// capture attempt at all — the first k-means sub-iteration is always a
+    /// direct warm-up, so a configuration with only one sub-iteration in total
+    /// (e.g. `max_iter = 1, max_iter_kmeans = 1`, or `max_iter = 0`) has no
+    /// second sub-iter on which to capture. Read `Some(false)` as "the kernels
+    /// ran directly", not as "capture was tried and failed"; the WARN log
+    /// distinguishes the failure cases. The numbers are the same either way;
+    /// the throughput is not, which is why a failure is recorded rather than
+    /// swallowed.
     pub graph_replay: Option<bool>,
 }
 
