@@ -41,9 +41,12 @@ pub fn encode_value(
             // an on-disk `u32::MAX` decodes to; compact/merge/sort re-encode
             // decoded f32 under the input's own encoding, and rejecting it
             // would abort them on format-valid archives. `as u32` saturates
-            // back to `u32::MAX`, restoring the original value. Fresh
-            // out-of-range data is diverted to `Float32` by
-            // `detect_value_encoding` and never reaches this arm.
+            // back to `u32::MAX`, restoring the original value.
+            //
+            // Fresh out-of-range data is diverted to `Float32` by
+            // `detect_value_encoding` — but only on the detect path; see
+            // `ValueEncoding::encode_f32` for the callers that bypass it and
+            // still saturate silently.
             const UINT32_BOUND: f32 = (1u128 << 32) as f32;
             if !(0.0..=UINT32_BOUND).contains(&value) {
                 return Err(OpsError::ValueOutOfRange {

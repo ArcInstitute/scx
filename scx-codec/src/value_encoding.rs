@@ -185,8 +185,8 @@ mod tests {
     fn detect_f64_falls_back_to_float_above_u32_max() {
         // 5e9 > u32::MAX (≈4.29e9) is an exact f64 integer; encoding it as Uint32
         // would saturate the `as u32` cast and corrupt the value, so it must fall
-        // back to Float32. (f32 can't reach this case — it loses integer
-        // exactness well below u32::MAX.)
+        // back to Float32. The f32 detector has the same bucket for the same
+        // reason — see `detect_f32_falls_back_to_float_above_u32_max`.
         assert_eq!(
             detect_value_encoding_f64(&[5_000_000_000.0]),
             ValueEncoding::Float32

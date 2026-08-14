@@ -954,6 +954,19 @@ fn test_compact_preserves_u32_max_value() {
         .expect("compact must not reject a format-valid Uint32 shard holding u32::MAX");
 
     let reader = ScxReader::open(&out).unwrap();
+
+    // Assert the on-disk encoding first. Reading back f32 alone cannot settle
+    // this: `u32::MAX as f32` is 2³² either way, so a widen to `Float32` would
+    // satisfy the value check below while quietly changing the format.
+    let entries = reader.catalog().csr_shards_sorted();
+    assert_eq!(entries.len(), 1);
+    let hdr = reader.read_shard_header(entries[0]).unwrap();
+    assert_eq!(
+        ValueEncoding::from_u8(hdr.value_encoding),
+        Some(ValueEncoding::Uint32),
+        "compact must keep the Uint32 encoding, not widen around the bound"
+    );
+
     let csr = reader.read_all_csr_shards().unwrap();
     assert_eq!(csr.data[0], u32::MAX as f32);
     assert_eq!(csr.data[1], 7.0);

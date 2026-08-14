@@ -166,9 +166,22 @@ impl ValueEncoding {
                 // let `as u32` saturate — which is the *correct* answer for
                 // the decode-seam provenance.
                 //
-                // Fresh out-of-range data is caught upstream instead, by
-                // `detect_value_encoding`, which sends anything above
-                // `u32::MAX` to `Float32` and never selects this arm for it.
+                // On the *detect* path, fresh out-of-range data is caught
+                // upstream by `detect_value_encoding`, which sends anything
+                // above `u32::MAX` to `Float32` so this arm is never selected
+                // for it. That is not every caller: anything passing an
+                // explicit encoding bypasses the detector, and two in-tree
+                // writers can hand a fresh 2³² here after detection —
+                // `scx_ops::rewrite_helpers::encoding_for_canonicalized`
+                // (whose ladder stops at `Uint32`, so a canonicalized sum of
+                // duplicate coordinates past `u32::MAX` keeps it), and
+                // `attach_external_layer` (detects once, then canonicalizes
+                // per shard and re-encodes under the detected encoding). Those
+                // still saturate silently, exactly as they did before this
+                // module gained the comment. Closing that needs the rewrite
+                // paths to carry native `u32` instead of round-tripping
+                // through `f32`, which is a separate change.
+                //
                 // `contains` (not `<=`) so NaN is rejected rather than written
                 // as 0.
                 const UINT32_BOUND: f32 = (1u128 << 32) as f32;
