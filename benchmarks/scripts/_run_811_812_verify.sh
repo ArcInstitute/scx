@@ -14,9 +14,16 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCX_DIR="${SCX_DIR:-/home/nickyoungblut/dev/rust/scx}"
+# Derive the repo root from this script's own location (benchmarks/scripts/<this>),
+# as `_run_pdex_gpu_parity.sh` does. An earlier version computed SCRIPT_DIR and then
+# ignored it in favour of a hardcoded home path, so the committed harness pointed at
+# one developer's checkout from any other clone. That matters more than it looks:
+# with `set -uo pipefail` and no `-e`, a failed `cd` does not stop the script — it
+# carries on in whatever cwd sbatch started in, which is exactly how this driver
+# once reported "feature broken" for an environment that had never activated.
+SCX_DIR="${SCX_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 CONDA_ENV="${SCX_GPU_CONDA_ENV:-scx-bench-gpu}"
-cd "${SCX_DIR}"
+cd "${SCX_DIR}" || { echo "PREFLIGHT FAILED: cannot cd to SCX_DIR=${SCX_DIR}" >&2; exit 1; }
 
 echo "=== node: $(hostname) ==="
 nvidia-smi --query-gpu=index,name,driver_version --format=csv

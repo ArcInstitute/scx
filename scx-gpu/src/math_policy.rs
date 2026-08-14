@@ -1,17 +1,28 @@
 //! GPU math-mode and SpMM-algorithm policies for the PCA power loop (Task 2.5).
 //!
-//! These two knobs let the PCA path trade reproducibility for speed and record
-//! the choice as an explicit artifact (surfaced through
+//! These two knobs let the PCA path trade numerical strictness and algorithm
+//! pinning for speed, and record the choice as an explicit artifact (surfaced
+//! through
 //! `scx_accel::route::AccelExecutionInfo` → `adata.uns["scx_accel"]["pca"]`).
 //! Numerics under [`GpuMathMode::AllowTf32`] are validated by subspace/variance
 //! agreement, **not** bitwise (TF32 truncates the SpMM/GEMM mantissa).
 //!
-//! ## Why a deterministic SpMM algorithm is on offer
+//! ## What the SpMM algorithm policy is, and what it is NOT
 //!
-//! `CUSPARSE_SPMM_ALG_DEFAULT` heuristically picks an algorithm that may use
-//! atomics, so the same input can produce different last-place bits run to run.
-//! [`SpmmAlgPolicy::Deterministic`] (`CUSPARSE_SPMM_CSR_ALG2`, the no-atomics
-//! CSR algorithm) trades some throughput for a bit-reproducible power loop.
+//! `CUSPARSE_SPMM_ALG_DEFAULT` lets cuSPARSE pick heuristically, which may
+//! select an atomics-based kernel. [`SpmmAlgPolicy::Deterministic`] instead
+//! pins `CUSPARSE_SPMM_CSR_ALG2` explicitly.
+//!
+//! **It is not a bit-reproducibility guarantee for PCA, and must not be
+//! documented as one.** cuSPARSE states plainly that "operations using
+//! transpose or conjugate-transpose have no reproducibility guarantees"
+//! (CUDA 12.6 cuSPARSE § Result Reproducibility). The randomized PCA power
+//! loop necessarily issues `Aᵀ · Y` through
+//! `CUSPARSE_OPERATION_TRANSPOSE`, so **no** choice of algorithm makes the
+//! loop as a whole run-to-run bitwise identical. What the policy buys is a
+//! pinned, non-heuristic algorithm selection — reproducible *dispatch*, and
+//! the removal of the heuristic's freedom to switch kernels between runs or
+//! across shapes — not reproducible bits.
 //!
 //! The policy reaches **both** PCA power loops — the device-resident one and
 //! the streaming operator used when the matrix exceeds VRAM. That symmetry is
@@ -20,10 +31,11 @@
 //! against free VRAM, so a policy honoured on only one path would make the
 //! recorded provenance false on runs the caller cannot predict.
 //!
-//! (An earlier version of this note said captured PCA SpMM segments force
-//! `Deterministic` regardless of the requested policy. SpMM-segment CUDA-graph
-//! capture has since been removed — `cusparseSpMM` is not capture-safe on
-//! current cuSPARSE — so nothing overrides the request today.)
+//! (Two earlier versions of this note were wrong. The first said captured PCA
+//! SpMM segments force `Deterministic` regardless of the requested policy —
+//! SpMM-segment CUDA-graph capture has since been removed, so nothing
+//! overrides the request today. The second called the result
+//! "bit-reproducible", which the transpose multiply rules out.)
 
 use cudarc::cublas::sys as cbs;
 use cudarc::cusparse::sys as csp;
@@ -78,10 +90,14 @@ pub enum SpmmAlgPolicy {
     /// run-to-run nondeterministic). Fastest general default.
     #[default]
     Default,
-    /// `CUSPARSE_SPMM_CSR_ALG2` — the no-atomics, deterministic CSR algorithm.
-    /// Pick this for bit-reproducible runs. Applied to both the forward
-    /// (`NON_TRANSPOSE`) and transpose multiplies of the power loop, on the
-    /// resident and streaming paths alike.
+    /// Pin `CUSPARSE_SPMM_CSR_ALG2` explicitly instead of letting cuSPARSE
+    /// choose. Applied to both the forward (`NON_TRANSPOSE`) and transpose
+    /// multiplies of the power loop, on the resident and streaming paths alike.
+    ///
+    /// **The name overpromises: this does not make GPU PCA bit-reproducible.**
+    /// cuSPARSE gives no reproducibility guarantee for transpose operations,
+    /// and the power loop issues one every iteration. It pins the algorithm
+    /// choice; it does not pin the bits. See the module docs.
     Deterministic,
     /// Reserved: intended to time the candidate algorithms once per shape and
     /// cache the winner. **Not yet implemented** — currently resolves to the
@@ -120,11 +136,12 @@ impl SpmmAlgPolicy {
 /// Bundle of PCA GPU tuning knobs, threaded through the PCA entry points.
 ///
 /// [`Default`] is strict-fp32 + the cuSPARSE heuristic SpMM — the
-/// behaviour-preserving configuration that matches pre-2.5 results. Note that
-/// it is **not** the reproducible one: the heuristic algorithm may use atomics
-/// (see [`SpmmAlgPolicy::Default`]). Reproducibility is
-/// `SpmmAlgPolicy::Deterministic`, which is opt-in precisely because it costs
-/// throughput.
+/// behaviour-preserving configuration that matches pre-2.5 results.
+///
+/// Neither policy makes GPU PCA bit-reproducible; the transpose multiply in
+/// the power loop has no cuSPARSE reproducibility guarantee under any
+/// algorithm. [`SpmmAlgPolicy::Deterministic`] pins the algorithm rather than
+/// the bits — see [`SpmmAlgPolicy`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct GpuPcaTuning {
     /// cuBLAS / cuSPARSE math mode.

@@ -250,8 +250,8 @@ impl Drop for DnMatDescr {
 /// Describes a sub-region of `buf` interpreted as a `(rows × cols)` column-major
 /// matrix with leading dimension `ld`, starting at `buf[offset_elems]`.
 ///
-/// Used by the strided cuSPARSE SpMM wrappers ([`spmm_csr_view`] /
-/// [`spmm_csr_transpose_view`]) to let SpMM write/read a sub-region of a
+/// Used by the strided cuSPARSE SpMM wrappers ([`spmm_csr_view_with_alg`] /
+/// [`spmm_csr_transpose_view_with_alg`]) to let SpMM write/read a sub-region of a
 /// larger global buffer without per-shard scatter/gather kernels. `ld` must
 /// be >= `rows` for the contiguous case; for sub-regions, `ld` is the leading
 /// dimension of the full enclosing matrix (e.g. `n_obs` when writing a
@@ -496,8 +496,8 @@ pub fn spmm_csr_transpose(
 /// into possibly-larger column-major buffers.
 ///
 /// This is the unified entry point that the contiguous helpers ([`spmm_csr`],
-/// [`spmm_csr_transpose`]) and the strided helpers ([`spmm_csr_view`],
-/// [`spmm_csr_transpose_view`]) all delegate to. `pool` is `Some` when the
+/// [`spmm_csr_transpose`]) and the strided helpers ([`spmm_csr_view_with_alg`],
+/// [`spmm_csr_transpose_view_with_alg`]) all delegate to. `pool` is `Some` when the
 /// caller wants the workspace reused across calls (PCA power iteration);
 /// `None` falls back to per-call `dev.alloc_zeros`.
 #[allow(clippy::too_many_arguments)]
