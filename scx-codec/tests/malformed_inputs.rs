@@ -9,8 +9,8 @@
 use scx_codec::bitstream::{BitReader, BitWriter};
 use scx_codec::delta_golomb::{delta_golomb_decode, delta_golomb_encode};
 use scx_codec::dispatch::{
-    decode_row_group, decode_shard_native, decode_shard_ref, decode_shard_scipy, CodecError,
-    CodecId, EncodedShardRef, RowGroupSpan,
+    decode_indptr_only, decode_row_group, decode_row_group_indptr_only, decode_shard_native,
+    decode_shard_ref, decode_shard_scipy, CodecError, CodecId, EncodedShardRef, RowGroupSpan,
 };
 use scx_codec::forbp::{
     forbp_decode_with_hint, forbp_decode_with_metadata, forbp_encode, ForBpRowMetadata,
@@ -459,5 +459,108 @@ fn none_shard_non_monotone_indptr_is_rejected() {
     assert!(
         matches!(err, CodecError::MalformedInput(_)),
         "expected MalformedInput, got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The indptr-only decode seam
+//
+// `decode_indptr_only` / `decode_row_group_indptr_only` are what every
+// direct-to-device GPU decoder builds its `GpuCsr` indptr from — they never
+// reach `decode_shard_ref`, so they never saw `check_decoded_shape`. Both
+// checked at most `first == 0` and `last == nnz`, which is not enough: an
+// interior entry can exceed nnz while the last one is honest, and a consumer
+// walking `indptr[row]..indptr[row + 1]` then reads past the end of `indices`
+// one row early. That is the same defect `none_shard_non_monotone_indptr_is_rejected`
+// pins on the whole-shard path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn indptr_only_rejects_non_monotone() {
+    // `[0, 5, 2]` over 2 rows: ends at 2, starts at 0, right length — every
+    // endpoint check passes and row 0 still addresses [0, 5) of a 2-element
+    // index buffer.
+    let raw: Vec<u8> = [0u64, 5, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let err = decode_indptr_only(&raw, CodecId::None, 2).unwrap_err();
+    assert!(
+        matches!(&err, CodecError::MalformedInput(msg) if msg.contains("not monotone")),
+        "expected a monotonicity MalformedInput, got {err:?}"
+    );
+}
+
+#[test]
+fn indptr_only_rejects_non_zero_start() {
+    // Scx1's Delta-Golomb encodes non-negative deltas, so its output is always
+    // monotone — but it reads the *first* value as a raw LE u64, so the start is
+    // unconstrained by the codec and has to be checked.
+    let raw: Vec<u8> = [3u64, 5].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let err = decode_indptr_only(&raw, CodecId::None, 1).unwrap_err();
+    assert!(
+        matches!(&err, CodecError::MalformedInput(msg) if msg.contains("must start at 0")),
+        "expected a zero-start MalformedInput, got {err:?}"
+    );
+}
+
+#[test]
+fn indptr_only_accepts_a_well_formed_indptr() {
+    // Over-rejection guard: the shape gate must not reject valid data.
+    let raw: Vec<u8> = [0u64, 2, 2, 7]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    assert_eq!(
+        decode_indptr_only(&raw, CodecId::None, 3).unwrap(),
+        vec![0i64, 2, 2, 7]
+    );
+}
+
+#[test]
+fn row_group_indptr_only_rejects_non_monotone() {
+    // The seam every framed GPU assembler goes through: `prescan_framed_group_indptr`
+    // calls this once per group and concatenates the results into the combined
+    // indptr it uploads.
+    let raw: Vec<u8> = [0u64, 5, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let span = RowGroupSpan {
+        row_start: 4,
+        n_rows: 2,
+        nnz: 2,
+        indptr: 0..raw.len(),
+        indices: 0..0,
+        values: 0..0,
+    };
+    let err = decode_row_group_indptr_only(CodecId::None, &span, &raw).unwrap_err();
+    match &err {
+        CodecError::MalformedInput(msg) => assert!(msg.contains("not monotone"), "{msg}"),
+        other => panic!("expected MalformedInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn row_group_names_the_group_for_a_short_forbp_stream() {
+    // The corruption this PR targets fails inside `forbp_decode_with_hint`,
+    // whose error carries no message and arrives as `CodecError::BitStream`.
+    // Relabelling only `MalformedInput` left the primary case anonymous.
+    let (indptr_bytes, indices_bytes, values_bytes) = scx1_shard_with_short_index_stream();
+    let span = RowGroupSpan {
+        row_start: 9,
+        n_rows: 1,
+        nnz: 6,
+        indptr: 0..indptr_bytes.len(),
+        indices: 0..indices_bytes.len(),
+        values: 0..values_bytes.len(),
+    };
+    let err = decode_row_group(
+        CodecId::Scx1,
+        &span,
+        &indptr_bytes,
+        &indices_bytes,
+        &values_bytes,
+        ValueEncoding::Uint32,
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("row-group at row 9"),
+        "error does not name the failing group: {err}"
     );
 }

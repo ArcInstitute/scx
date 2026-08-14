@@ -306,16 +306,13 @@ fn decode_scx1_gpu(
     let t_host = profile::start();
     let indptr_u64 =
         delta_golomb_decode(indptr_bytes, n_rows + 1).map_err(scx_codec::CodecError::from)?;
-    // `delta_golomb_decode` returns exactly `n_rows + 1` entries but their
-    // *values* come from the stream, so a corrupt indptr can end anywhere. The
-    // CPU decoders check this inside `scx_codec`; this path bypasses them
-    // entirely, decoding indices and values straight to the device.
-    if indptr_u64.last() != Some(&(nnz as u64)) {
-        return Err(GpuError::InvalidShard(format!(
-            "unframed Scx1 indptr ends at {:?} but the header declares nnz {nnz}",
-            indptr_u64.last()
-        )));
-    }
+    // This path calls `delta_golomb_decode` directly rather than going through
+    // `decode_indptr_only`, so it is the one place that does not inherit the
+    // shared gate — apply it by hand. Not just `last == nnz`: Delta-Golomb's
+    // deltas are non-negative, but it reads its *first* value as a raw LE `u64`
+    // (`delta_golomb.rs`), so a corrupt stream can begin anywhere.
+    scx_codec::check_indptr_shape(&indptr_u64, n_rows, Some(nnz))
+        .map_err(|e| GpuError::InvalidShard(format!("unframed Scx1 indptr: {e}")))?;
     let indptr_i64: Vec<i64> = indptr_u64.into_iter().map(|v| v as i64).collect();
     profile::record_host_decode_since(CodecClass::Scx1, t_host);
 
@@ -773,22 +770,14 @@ fn decode_shufdelta_gpu(
     let combined_indptr =
         scx_codec::decode_indptr_only(indptr_bytes, CodecId::ShufDeltaZstd, n_rows)
             .map_err(|e| GpuError::InvalidShard(format!("unframed ShufDeltaZstd indptr: {e}")))?;
-    check_device_len(
-        combined_indptr.len(),
-        n_rows + 1,
-        "unframed ShufDeltaZstd indptr",
-    )?;
-    // The length is fixed by `n_rows`, but the *values* come from the stream —
-    // same split as the unframed Scx1 twin above, and the same reason to check:
-    // the indices/values buffers below are sized from the header's `nnz`, so an
-    // indptr ending elsewhere yields a `GpuCsr` whose indptr contradicts its own
-    // arrays.
-    if combined_indptr.last() != Some(&(nnz as i64)) {
-        return Err(GpuError::InvalidShard(format!(
-            "unframed ShufDeltaZstd indptr ends at {:?} but the header declares nnz {nnz}",
-            combined_indptr.last()
-        )));
-    }
+    // `decode_indptr_only` has already applied length / zero-start /
+    // monotonicity; this adds the header's `nnz`, which it does not receive.
+    // ShufDeltaZstd's indptr is raw `u64`s behind an unshuffle+undelta, so
+    // nothing about the codec constrains the values — every part of the gate is
+    // load-bearing here, and the indices/values buffers below are sized from
+    // `nnz`, so a disagreeing indptr yields a `GpuCsr` that contradicts itself.
+    scx_codec::check_indptr_shape(&combined_indptr, n_rows, Some(nnz))
+        .map_err(|e| GpuError::InvalidShard(format!("unframed ShufDeltaZstd indptr: {e}")))?;
     let mut host_uploaded_bytes = (combined_indptr.len() * 8) as u64;
 
     let (combined_indices, combined_data) = if nnz > 0 {

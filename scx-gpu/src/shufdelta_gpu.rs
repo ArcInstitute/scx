@@ -790,6 +790,13 @@ pub fn decode_framed_shufdelta_gpu_nvcomp(
     )?;
     profile::record_host_decode_since(CodecClass::Generic, t_indptr);
     check_device_len(nnz_final, nnz, "nvcomp ShufDeltaZstd block-index nnz")?;
+    // Paired with the nnz check, matching the pipelined twin — this arm had only
+    // the nnz half.
+    check_device_len(
+        combined_indptr.len(),
+        n_rows + 1,
+        "nvcomp ShufDeltaZstd indptr",
+    )?;
 
     let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
     let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;

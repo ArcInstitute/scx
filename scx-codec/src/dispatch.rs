@@ -639,7 +639,16 @@ pub fn decode_indptr_only(
             le_bytes_to_u64(&raw, n_rows_p1)?
         }
     };
-    u64_vec_to_i64(indptr_u64)
+    let indptr = u64_vec_to_i64(indptr_u64)?;
+    // Every caller decodes a shard-local or group-local indptr, so a zero start
+    // and monotonicity both hold for any honest stream. Checked here rather than
+    // per caller because this is the only seam the direct-to-device GPU decoders
+    // pass through — they never reach `check_decoded_shape`, and a `GpuCsr` whose
+    // indptr addresses past its own `indices` is handed straight to cuSPARSE /
+    // `cupyx.sparse.csr_matrix`, which walk it exactly as `csr_to_csc` does.
+    // `nnz` is not known here; the whole-shard callers check it themselves.
+    check_indptr_shape(&indptr, n_rows, None)?;
+    Ok(indptr)
 }
 
 /// Decode a single row-group of a framed (v4/shard-v2) shard to a **local** CSR.
@@ -682,10 +691,19 @@ pub fn decode_row_group(
     // a local CSR": `indptr[0] == 0`, `indptr.last() == nnz`) and adds the
     // index/value lengths it did not check. Re-label the message so a framed
     // shard still says which group failed.
+    //
+    // `BitStream` is relabelled too, not just `MalformedInput`. The corruption
+    // this gate exists for — a FOR-BP stream shorter than the declared nnz —
+    // fails inside `forbp_decode_with_hint`, whose error carries no message and
+    // so arrives as `BitStream`. Prefixing only `MalformedInput` left exactly
+    // the primary case anonymous. `IndexOutOfRange` is deliberately *not*
+    // folded in: it is a typed variant that `ScxError` maps to
+    // `ShardIndexOutOfRange` / `CorruptFile`, and flattening it here would
+    // downgrade a corrupt-file report to a generic codec error.
     decode_shard_ref(&enc, codec_id, value_encoding, n_rows, nnz, index_dtype_u16).map_err(|e| {
         match e {
-            CodecError::MalformedInput(msg) => {
-                CodecError::MalformedInput(format!("row-group at row {}: {msg}", span.row_start))
+            CodecError::MalformedInput(_) | CodecError::BitStream(_) => {
+                CodecError::MalformedInput(format!("row-group at row {}: {e}", span.row_start))
             }
             other => other,
         }
@@ -704,15 +722,14 @@ pub fn decode_row_group_indptr_only(
 ) -> Result<Vec<i64>, CodecError> {
     let ip = slice_span(indptr_bytes, &span.indptr, "indptr")?;
     let indptr = decode_indptr_only(ip, codec_id, span.n_rows as usize)?;
-    let nnz = span.nnz as i64;
-    if indptr.first() != Some(&0) || indptr.last() != Some(&nnz) {
-        return Err(CodecError::MalformedInput(format!(
-            "row-group indptr not local-rebased (first={:?}, last={:?}, nnz={})",
-            indptr.first(),
-            indptr.last(),
-            span.nnz
-        )));
-    }
+    // `decode_indptr_only` has already checked length, zero start and
+    // monotonicity; this adds the group's declared nnz, which only the span
+    // knows. Was a hand-rolled `first`/`last` pair that omitted monotonicity —
+    // and since every framed GPU assembler builds its combined indptr out of
+    // this function, that omission was the whole hole.
+    check_indptr_shape(&indptr, span.n_rows as usize, Some(span.nnz as usize)).map_err(|e| {
+        CodecError::MalformedInput(format!("row-group at row {}: {e}", span.row_start))
+    })?;
     Ok(indptr)
 }
 
@@ -1398,34 +1415,7 @@ fn check_decoded_shape(
     n_rows: usize,
     nnz: usize,
 ) -> Result<(), CodecError> {
-    let expected_indptr_len = n_rows
-        .checked_add(1)
-        .ok_or_else(|| CodecError::MalformedInput(format!("CSR n_rows+1 overflow: {n_rows}")))?;
-    if indptr.len() != expected_indptr_len {
-        return Err(CodecError::MalformedInput(format!(
-            "decoded CSR indptr length {} != n_rows + 1 ({expected_indptr_len})",
-            indptr.len()
-        )));
-    }
-    if indptr.first() != Some(&0) {
-        return Err(CodecError::MalformedInput(format!(
-            "decoded CSR indptr must start at 0, got {:?}",
-            indptr.first()
-        )));
-    }
-    if let Some(row) = indptr.windows(2).position(|w| w[0] > w[1]) {
-        return Err(CodecError::MalformedInput(format!(
-            "decoded CSR indptr not monotone at row {row}: {} > {}",
-            indptr[row],
-            indptr[row + 1]
-        )));
-    }
-    if indptr.last() != Some(&(nnz as u64)) {
-        return Err(CodecError::MalformedInput(format!(
-            "decoded CSR indptr ends at {:?} != declared nnz {nnz}",
-            indptr.last()
-        )));
-    }
+    check_indptr_shape(indptr, n_rows, Some(nnz))?;
     if indices_len != nnz {
         return Err(CodecError::MalformedInput(format!(
             "decoded CSR has {indices_len} indices != declared nnz {nnz}"
@@ -1435,6 +1425,75 @@ fn check_decoded_shape(
         return Err(CodecError::MalformedInput(format!(
             "decoded CSR has {values_len} values != declared nnz {nnz}"
         )));
+    }
+    Ok(())
+}
+
+/// Validate the indptr half of the CSR shape invariant: `len == n_rows + 1`,
+/// starts at 0, monotone non-decreasing, and (when the caller knows it) ends at
+/// the declared `nnz`.
+///
+/// Generic over the integer width because the decode families hand it different
+/// types — the whole-shard decoders carry `u64` straight off the sub-stream,
+/// while the indptr-only paths have already widened to the `i64` scipy layout.
+/// One implementation rather than two on purpose: the hand-rolled first/last
+/// check that used to live in [`decode_row_group_indptr_only`] is exactly how
+/// the *monotonicity* half went missing on every GPU path that builds its
+/// `GpuCsr` indptr from it.
+///
+/// Monotonicity is not redundant with the endpoint checks. An interior entry can
+/// exceed `nnz` while the last one is honest — `[0, 5, 2]` for `nnz = 2` — and a
+/// consumer walking `indptr[row]..indptr[row + 1]` then reads past the end of
+/// `indices` one row early. Nor is a zero start implied by the codec:
+/// `delta_golomb_decode` reads its first value as a raw LE `u64`, so an Scx1
+/// indptr may begin anywhere even though its deltas are non-negative.
+///
+/// `nnz` is `None` for callers that decode the indptr alone and have no declared
+/// non-zero count to compare against.
+pub fn check_indptr_shape<T: Copy + Into<i128>>(
+    indptr: &[T],
+    n_rows: usize,
+    nnz: Option<usize>,
+) -> Result<(), CodecError> {
+    let expected_indptr_len = n_rows
+        .checked_add(1)
+        .ok_or_else(|| CodecError::MalformedInput(format!("CSR n_rows+1 overflow: {n_rows}")))?;
+    if indptr.len() != expected_indptr_len {
+        return Err(CodecError::MalformedInput(format!(
+            "decoded CSR indptr length {} != n_rows + 1 ({expected_indptr_len})",
+            indptr.len()
+        )));
+    }
+    let first: i128 = match indptr.first() {
+        Some(&v) => v.into(),
+        None => {
+            return Err(CodecError::MalformedInput(
+                "decoded CSR indptr is empty".into(),
+            ))
+        }
+    };
+    if first != 0 {
+        return Err(CodecError::MalformedInput(format!(
+            "decoded CSR indptr must start at 0, got {first}"
+        )));
+    }
+    let mut prev = first;
+    for (row, &raw) in indptr.iter().enumerate().skip(1) {
+        let cur: i128 = raw.into();
+        if cur < prev {
+            return Err(CodecError::MalformedInput(format!(
+                "decoded CSR indptr not monotone at row {}: {prev} > {cur}",
+                row - 1
+            )));
+        }
+        prev = cur;
+    }
+    if let Some(nnz) = nnz {
+        if prev != nnz as i128 {
+            return Err(CodecError::MalformedInput(format!(
+                "decoded CSR indptr ends at {prev} != declared nnz {nnz}"
+            )));
+        }
     }
     Ok(())
 }
