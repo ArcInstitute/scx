@@ -96,8 +96,14 @@ class TestHarmonyBasic:
         import pyscx
 
         adata = harmony_adata
+        # `device="cpu"`, not the default `"auto"`: the backend assertion below
+        # names the CPU integrator, and `"auto"` resolves to GPU on a GPU host,
+        # so this test could only pass off-GPU — a test that cannot pass on the
+        # hardware it is meant to cover. Observed failing on an H100
+        # (`'scx-gpu' == 'scx-accel-cpu'`). The GPU backend string is covered by
+        # the GPU-gated tests in the scx-accel suite.
         pyscx.accel.harmony_integrate(
-            adata, "batch", max_iter=2, random_state=0
+            adata, "batch", device="cpu", max_iter=2, random_state=0
         )
         assert "harmony" in adata.uns
         info = adata.uns["harmony"]
