@@ -88,6 +88,7 @@ use crate::external_obs::{
 use crate::in_place::{
     commit_in_place, entry_matches_key, layer_entry_matches, prepare_in_place, read_provenance_ops,
 };
+use crate::rewrite_helpers::encoding_for_canonicalized;
 
 /// Obs/var column names that resolve a join key when the caller does not name
 /// one, in **preference order** — the first present column wins.
@@ -327,8 +328,11 @@ pub struct AttachLayerOptions {
     /// When false (default), any pre-existing layer / obs column / var column /
     /// obsm key / uns key this op would replace is an error.
     pub overwrite: bool,
-    /// `None` detects the narrowest encoding that fits **all** values, once, so
-    /// every shard of the layer shares one encoding.
+    /// `None` detects the narrowest encoding that fits **all** values, once,
+    /// over the source values as handed in. A shard whose canonicalized sums
+    /// outgrow that encoding is widened on its own (see
+    /// [`shard_value_encoding`]), so shards may differ; `Some` pins the
+    /// encoding and makes an outgrowing shard an error instead.
     pub value_encoding: Option<ValueEncoding>,
     /// `None` lets the encoder pick per shard.
     pub codec: Option<CodecId>,
@@ -379,6 +383,8 @@ pub struct AttachLayerSummary {
     pub var_key_column: String,
     pub column_axis_match: ColumnAxisMatch,
     pub layer_nnz: u64,
+    /// The widest encoding any shard was written under — which is the detected
+    /// one unless canonicalization outgrew it. See [`shard_value_encoding`].
     pub value_encoding: ValueEncoding,
     pub shard_ranges_from: ShardRangeSource,
     pub obs_columns_added: Vec<String>,
@@ -389,6 +395,49 @@ pub struct AttachLayerSummary {
     /// single-section `ObsMetadata` forces. See
     /// [`crate::external_obs::ObsRewrite`].
     pub obs_streamed: bool,
+}
+
+/// The value encoding one canonicalized shard is written under.
+///
+/// The layer-wide encoding is detected once, over the source values as handed
+/// in and before the per-shard gather. Canonicalization then **sums duplicate
+/// coordinates**, so a shard's values can outgrow it — and re-encoding under
+/// the stale encoding fails three different ways, only the first of them
+/// audibly:
+///
+/// - `Uint8` refuses `200 + 200 = 400` outright, aborting the import on exactly
+///   the input canonicalization exists to repair;
+/// - `Float16` maps anything past 65504 to infinity and reports success;
+/// - `Uint32` accepts exactly 2³² and saturates it to `u32::MAX`, because
+///   `u32::MAX as f32` *is* 2³² and that bound has to stay inclusive for the
+///   rewrite ops — see [`ValueEncoding::encode_f32`].
+///
+/// Who resolves it depends on where the encoding came from. A **detected**
+/// encoding is this op's own guess, so widen the shard, exactly as the rewrite
+/// ops do via [`encoding_for_canonicalized`]; per-shard encodings are ordinary,
+/// since each shard header carries its own and `scx info` reports the
+/// breakdown. A **pinned** encoding is the caller's decision, so report that it
+/// no longer holds rather than overriding it silently — which is also the only
+/// thing that makes the `Float16` and `Uint32` cases audible at all.
+fn shard_value_encoding(
+    layer_wide: ValueEncoding,
+    pinned: bool,
+    values: &[f32],
+    layer_name: &str,
+    shard_idx: usize,
+) -> Result<ValueEncoding> {
+    let needed = encoding_for_canonicalized(layer_wide, values);
+    if needed == layer_wide || !pinned {
+        return Ok(needed);
+    }
+    let max = values.iter().copied().fold(0.0f32, f32::max);
+    Err(OpsError::InvalidInput(format!(
+        "layer '{layer_name}' shard {shard_idx}: value_encoding is pinned to \
+         {layer_wide:?}, but canonicalization sums duplicate coordinates and this \
+         shard reaches {max}, which needs {needed:?}. Drop the pin to let each \
+         shard widen to what it holds, or pre-sum the duplicate coordinates in \
+         the source."
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -622,12 +671,25 @@ fn attach_external_layer_inner(
         // would overstate nnz exactly when the source has explicit zeros or
         // duplicate coordinates, and the preview would disagree with the
         // import it is meant to predict.
+        //
+        // The encoding goes through the same decision for the same reason: the
+        // write loop refuses a pinned encoding the canonicalized sums outgrow,
+        // so a preview that returned `Ok` would send the caller into the one
+        // failure it was asked to find.
         summary.obsm_keys_added = obsm_batches.iter().map(|(k, _)| k.clone()).collect();
-        for (row_start, row_end) in &shard_ranges {
+        for (shard_idx, (row_start, row_end)) in shard_ranges.iter().enumerate() {
             let (mut i, mut j, mut v) =
                 gather_shard(data, &row_join, &col_map, *row_start, *row_end);
             scx_sparse::canonicalize_csr(&mut i, &mut j, &mut v);
             summary.layer_nnz += *i.last().unwrap_or(&0);
+            shard_value_encoding(
+                value_encoding,
+                opts.value_encoding.is_some(),
+                &v,
+                &opts.layer_name,
+                shard_idx,
+            )?;
+            summary.value_encoding = encoding_for_canonicalized(summary.value_encoding, &v);
         }
         return Ok(summary);
     }
@@ -690,6 +752,21 @@ fn attach_external_layer_inner(
         // actually written rather than the pre-dedup input.
         summary.layer_nnz += *s_indptr.last().unwrap_or(&0);
 
+        // Likewise decided after canonicalization: the sums are what has to fit,
+        // not the values the layer-wide encoding was detected from.
+        let shard_ve = shard_value_encoding(
+            value_encoding,
+            opts.value_encoding.is_some(),
+            &s_values,
+            &opts.layer_name,
+            shard_idx,
+        )?;
+        // Running widest, so the summary's single field reports an encoding the
+        // file actually uses. Folding through the same function keeps the two in
+        // step: it only ever moves up one ladder, so re-applying it to the
+        // running value is a max.
+        summary.value_encoding = encoding_for_canonicalized(summary.value_encoding, &s_values);
+
         let section = encode_one_shard_with_value_encoding(
             &s_indptr,
             &s_indices,
@@ -702,7 +779,7 @@ fn attach_external_layer_inner(
             modality_type,
             format!("{}_shard_{}", opts.layer_name, shard_idx),
             framing,
-            Some(value_encoding),
+            Some(shard_ve),
         )?;
         writer.write_preencoded_shard(section)?;
     }

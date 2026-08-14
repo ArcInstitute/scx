@@ -1436,3 +1436,106 @@ fn sharded_and_single_section_layer_imports_agree() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Value encoding vs. canonicalization
+// ---------------------------------------------------------------------------
+
+/// One cell, one gene, the same coordinate twice — canonicalization sums them.
+fn duplicate_coordinate_data(a: f32, b: f32) -> ExternalLayerData {
+    ExternalLayerData {
+        row_keys: vec!["cell_0".to_string()],
+        col_keys: vec!["g0".to_string()],
+        indptr: vec![0, 2],
+        indices: vec![0, 0],
+        values: vec![a, b],
+        row_annotations: None,
+        row_embeddings: Vec::new(),
+        col_annotations: None,
+        uns: None,
+        source_checksum: None,
+        source_name: None,
+    }
+}
+
+/// The encoding is detected **once** over the whole layer, before the per-shard
+/// gather; canonicalization then sums duplicate coordinates, so a shard's values
+/// can outgrow it. Re-encoding under the stale encoding fails three different
+/// ways and only this one is loud — `Uint8` refuses `200 + 200 = 400` outright,
+/// aborting the import on exactly the input canonicalization exists to repair.
+/// (`Float16` yields infinity and `Uint32` saturates at 2³², both silently.)
+#[test]
+fn attach_layer_widens_a_detected_encoding_the_sums_outgrow() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let data = duplicate_coordinate_data(200.0, 200.0);
+    let summary = attach_external_layer(&path, &data, &opts("cb"))
+        .expect("a duplicate-coordinate sum past the detected encoding must widen, not abort");
+
+    assert_eq!(
+        summary.value_encoding,
+        ValueEncoding::Uint16,
+        "the summary must report the encoding actually written"
+    );
+    let layer = ScxReader::open(&path).unwrap().read_layer("cb").unwrap();
+    assert_eq!(
+        layer.data,
+        vec![400.0],
+        "the summed value must survive intact, not saturate or error"
+    );
+}
+
+/// A caller-pinned encoding is authoritative: widening it silently would
+/// override a deliberate choice. Report that it no longer holds instead — which
+/// is also the only way the `Uint32` and `Float16` arms stop being silent, since
+/// neither errors on its own.
+#[test]
+fn attach_layer_rejects_a_pinned_encoding_the_sums_outgrow() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let data = duplicate_coordinate_data(200.0, 200.0);
+    let pinned = AttachLayerOptions {
+        value_encoding: Some(ValueEncoding::Uint8),
+        ..opts("cb")
+    };
+    let err = attach_external_layer(&path, &data, &pinned)
+        .expect_err("a pinned encoding the canonicalized values outgrow must be reported");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cb") && msg.contains("Uint8") && msg.contains("400"),
+        "the error must name the layer, the pinned encoding and the offending value, got: {msg}"
+    );
+}
+
+/// `--dry-run` predicts the import; it has to predict this too. The write loop
+/// would refuse a pinned encoding the sums outgrow, so a preview that returns
+/// `Ok` sends the user into a failure it was asked to find.
+#[test]
+fn dry_run_reports_the_encoding_the_write_would_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+    let data = duplicate_coordinate_data(200.0, 200.0);
+
+    let preview = AttachLayerOptions {
+        dry_run: true,
+        ..opts("cb")
+    };
+    let summary = attach_external_layer(&path, &data, &preview).unwrap();
+    assert_eq!(
+        summary.value_encoding,
+        ValueEncoding::Uint16,
+        "the preview must report the widened encoding the write will use"
+    );
+
+    let pinned_preview = AttachLayerOptions {
+        dry_run: true,
+        value_encoding: Some(ValueEncoding::Uint8),
+        ..opts("cb")
+    };
+    assert!(
+        attach_external_layer(&path, &data, &pinned_preview).is_err(),
+        "a preview must surface the pinned-encoding failure, not defer it to the write"
+    );
+}
