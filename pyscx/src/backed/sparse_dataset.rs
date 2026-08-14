@@ -962,17 +962,24 @@ impl ScxBackedSparseDataset {
                 .map_err(PyRuntimeError::new_err)?;
                 let mean = self.filter_row_results(&all_sums).iter().sum::<f64>() / n_total;
                 let mean_sq = self.filter_row_results(&all_sq).iter().sum::<f64>() / n_total;
-                // `.max(0.0)` matches the projected branch above. E[X²] − E[X]²
-                // is exact only for canonical data: a duplicated coordinate
-                // inflates both moments unevenly and can drive this negative
-                // (measured: shape (1,2) storing [1,2,3] gives 7 − 9 = −2.0).
-                // This form never subtracted a count so it never wrapped, but
-                // returning a negative variance is not a defensible answer
+                // E[X²] − E[X]² is exact only for canonical data: a duplicated
+                // coordinate inflates both moments unevenly and can drive this
+                // negative (measured: shape (1,2) storing [1,2,3] gives
+                // 7 − 9 = −2.0). This form never subtracted a count so it never
+                // wrapped, but a negative variance is not a defensible answer
                 // either. It is a clamp, not a detector — see
                 // `scx_sparse::implicit_zero_count` § "What this does NOT
-                // detect" for what the count-carrying routes catch that this
-                // one cannot.
-                let variance = (mean_sq - mean * mean).max(0.0);
+                // detect".
+                //
+                // ⚠️ Use the conditional, NOT `.max(0.0)`. Rust's `f64::max`
+                // *ignores* NaN and returns the other operand, so `.max(0.0)`
+                // silently converts a NaN variance to `0.0`. NaN in `X` is
+                // supported input (the dense h5ad streamer deliberately
+                // preserves it), and a NaN there must stay NaN rather than be
+                // reported as a real zero variance. `NaN < 0.0` is false, so
+                // this form passes it through. Same shape as the CSC kernels.
+                let centered = mean_sq - mean * mean;
+                let variance = if centered < 0.0 { 0.0 } else { centered };
                 Ok(variance.into_pyobject(py)?.into_any())
             }
             Some(_) => Err(PyValueError::new_err("axis must be 0, 1, or None")),

@@ -32,11 +32,13 @@ overflow-checks = true
 # scx-sparse gets the same treatment, and for the same reason: it is the other
 # crate that turns decoded — therefore unauthenticated — shard bytes into
 # structures whose arithmetic assumes an invariant the read path does not check.
-# Concretely, every statistic that folds in implicit zeros derives their count as
-# `extent - nnz`, and a duplicate coordinate inverts those operands: in release
-# that wrapped to ~1.8e19 and was returned as a variance of 8.3e19. Those sites
-# now go through `scx_sparse::implicit_zero_count`, so this override is a
-# backstop for the *next* one, not the fix.
+# Concretely, a statistic that infers an implicit-zero count as `extent - nnz`
+# inverts those operands on a duplicated coordinate: in release that wrapped to
+# ~1.8e19 and was returned as a variance of 8.3e19. Those sites now go through
+# `scx_sparse::implicit_zero_count`, so this override is a backstop for the
+# *next* one, not the fix. (Note it covers this crate only — the same class of
+# subtraction lives in `scx-accel`'s CSC Wilcoxon kernel and had to be guarded
+# explicitly there.)
 #
 # It also covers a second family that is still unguarded: the `end - start` row
 # spans derived from `indptr`, whose monotonicity `ScxCsr::new_unchecked` only

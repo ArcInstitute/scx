@@ -610,6 +610,11 @@ impl ScxCsr {
             let end = self.indptr[r + 1] as usize;
             let nnz = end - start;
 
+            // Validate before the zero-extent short-circuit, matching
+            // `finalize_implicit_zero_variance`: a (1, 0) shape holding a
+            // stored entry is non-canonical, and returning 0.0 for it would
+            // contradict the contract this method advertises.
+            let n_zeros = implicit_zero_count(n_cols, nnz)?;
             if n_cols == 0 {
                 variances.push(0.0);
                 continue;
@@ -629,7 +634,6 @@ impl ScxCsr {
                 .sum();
 
             // Add contribution from implicit zeros: n_zeros * mean²
-            let n_zeros = implicit_zero_count(n_cols, nnz)?;
             var_sum += n_zeros as f64 * mean * mean;
 
             variances.push(var_sum / n_cols as f64);
@@ -677,12 +681,11 @@ impl ScxCsr {
             let end = self.indptr[r + 1] as usize;
             let nnz = end - start;
 
+            let n_zeros = implicit_zero_count(n_cols, nnz)?;
             if n_cols == 0 {
                 maxes.push(f64::NEG_INFINITY);
                 continue;
             }
-
-            let n_zeros = implicit_zero_count(n_cols, nnz)?;
 
             if nnz == 0 {
                 // All entries are implicit zeros
@@ -756,12 +759,11 @@ impl ScxCsr {
             let end = self.indptr[r + 1] as usize;
             let nnz = end - start;
 
+            let n_zeros = implicit_zero_count(n_cols, nnz)?;
             if n_cols == 0 {
                 mins.push(f64::INFINITY);
                 continue;
             }
-
-            let n_zeros = implicit_zero_count(n_cols, nnz)?;
 
             if nnz == 0 {
                 // All entries are implicit zeros
@@ -1497,6 +1499,39 @@ mod tests {
             finalize_implicit_zero_variance(&[0.0], &[0], &[0.0], 0).unwrap(),
             vec![0.0]
         );
+    }
+
+    #[test]
+    fn zero_extent_does_not_bypass_the_row_statistics_contract() {
+        // A (1, 0) shape holding a stored entry is non-canonical: zero cells
+        // cannot hold one entry. The `n_cols == 0` early return used to come
+        // first, so these answered 0.0 / ±inf instead — the same ordering bug
+        // that was fixed in `finalize_implicit_zero_variance` and initially
+        // missed here.
+        let bad = ScxCsr {
+            shape: (1, 0),
+            indptr: vec![0, 1],
+            indices: vec![0],
+            data: vec![1.0],
+        };
+        assert!(matches!(
+            bad.row_var(),
+            Err(CsrError::NonCanonicalAxis { extent: 0, nnz: 1 })
+        ));
+        assert!(matches!(
+            bad.row_max(),
+            Err(CsrError::NonCanonicalAxis { extent: 0, nnz: 1 })
+        ));
+        assert!(matches!(
+            bad.row_min(),
+            Err(CsrError::NonCanonicalAxis { extent: 0, nnz: 1 })
+        ));
+
+        // A genuinely empty (0-column, 0-entry) row still short-circuits.
+        let empty = ScxCsr::new((1, 0), vec![0, 0], vec![], vec![]).unwrap();
+        assert_eq!(empty.row_var().unwrap(), vec![0.0]);
+        assert_eq!(empty.row_max().unwrap(), vec![f64::NEG_INFINITY]);
+        assert_eq!(empty.row_min().unwrap(), vec![f64::INFINITY]);
     }
 
     #[test]

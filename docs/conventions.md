@@ -76,12 +76,27 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
     measured cost below) and lives in `scx validate --deep` instead.
 
     Aggregations that use the second-moment identity `E[X²] − E[X]²` instead of
-    a count subtraction (the CSC column-variance kernels, the scalar
-    `var(axis=None)`) never wrapped. Where they already tally a per-column
-    count they run the same check, so `prefer_format` cannot change whether a
-    corrupt file is rejected; where no count exists the result is clamped at
-    `0.0` rather than rejected, because a negative variance is not a
+    a count subtraction (the CSC column-variance kernels, the projected row
+    stats, the scalar `var(axis=None)`) never wrapped. Where a per-column or
+    per-row count is available they run the same check, so neither
+    `prefer_format` nor an active column projection changes whether a corrupt
+    file is rejected. Only the scalar `var(axis=None)` has no count to carry;
+    there the result is clamped at `0.0`, because a negative variance is not a
     defensible answer either.
+
+    ⚠️ **Clamp with `if v < 0.0 { 0.0 } else { v }`, never `v.max(0.0)`.**
+    Rust's `f64::max` ignores NaN and returns the other operand, so `.max(0.0)`
+    silently converts a NaN variance into a real-looking `0.0`. NaN in `X` is
+    supported input — the dense h5ad streamer preserves it deliberately — so
+    that is data loss, not tidying. The conditional passes NaN through, since
+    `NaN < 0.0` is false.
+
+    The same `extent - count` subtraction appears outside `scx-sparse`: the CSC
+    Wilcoxon kernel in `scx-accel` derives both a pooled and a per-group
+    implicit-zero count. The per-package `overflow-checks` override does not
+    cross crate boundaries, so guards there have to be explicit — and the
+    per-group subtraction needs its own check, because it can invert while the
+    pooled one still fits.
   - **A consumer bounded by a *different* axis owes its own check.** The dense
     scatter in `typed_read.rs` sizes its buffer from the file header's `n_vars`
     while the seam validates against the shard header's `n_minor`. Those agree on
