@@ -454,6 +454,76 @@ pub fn write_multimodal_fixture(
     path.to_path_buf()
 }
 
+/// Build a **valid** file whose single modality is registered in the modality
+/// table, so its only X is stamped `modality_id = 1` and modality 0 owns no
+/// shards at all.
+///
+/// This is the shape `pyscx.from_mudata(MuData({"rna": adata}))` and a
+/// single-modality h5mu ingest emit — as unambiguous as a legacy id-0 file, and
+/// the case an "is modality 0 covered?" preflight silently rejects. Every other
+/// "single modality" fixture here writes id-0 shards, which is exactly why that
+/// regression got through.
+pub fn write_single_registered_modality_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    n_vars: usize,
+    n_shards: usize,
+) -> std::path::PathBuf {
+    use scx_format_io::modality::ModalityType;
+    assert!(n_obs % n_shards == 0);
+    let rows_per_shard = n_obs / n_shards;
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        n_obs as u64,
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+    writer.write_obs(&string_column("cell_id", n_obs)).unwrap();
+
+    let rna = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna, &string_column("gene_id", n_vars))
+        .unwrap();
+    writer.set_modality_n_vars(rna, n_vars as u64).unwrap();
+
+    for s in 0..n_shards {
+        let row_start = s * rows_per_shard;
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows_per_shard {
+            indices.push(((row_start + local) % n_vars) as u32);
+            values.push(1u8);
+            indptr.push(*indptr.last().unwrap() + 1);
+        }
+        writer
+            .write_csr_shard_for(
+                rna,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
 /// A 2-modality fixture where modality `adt` (id 1) tiles `[0, n_obs)` with one
 /// clean shard and modality `rna` (id 2) is **malformed**: two shards whose row
 /// ranges overlap, so that modality alone violates the exactly-once invariant.

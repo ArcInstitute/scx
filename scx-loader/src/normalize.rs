@@ -105,10 +105,14 @@ pub fn fused_normalize_log1p_dense_with_depth(row: &mut [f32], target_sum: f64, 
 }
 
 /// Fused normalize + log1p for a dense row (single pass, in-place), deriving
-/// the depth from the row's own sum.
+/// the depth from the row itself.
 ///
-/// Computes `row[i] = ln(row[i] * target_sum / row_sum + 1.0)` in a single
-/// pass, avoiding two separate traversals of the dense row.
+/// Computes `row[i] = ln(max(row[i], 0) * target_sum / depth + 1.0)` in a
+/// single pass, avoiding two separate traversals of the dense row. `depth` is
+/// [`transform_depth`] over this row with `log1p = true`, i.e. the sum of the
+/// **clipped** values — not `row.iter().sum()`, which would let a negative
+/// that is about to be discarded inflate every gene that survives it, and would
+/// let one `NaN` skip normalization for the whole row.
 ///
 /// Convenience wrapper over [`fused_normalize_log1p_dense_with_depth`] for
 /// callers whose `row` **is** the full transcriptome (no HVG projection).

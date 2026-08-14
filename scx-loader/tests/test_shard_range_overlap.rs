@@ -216,9 +216,51 @@ fn rejects_a_file_whose_shards_leave_a_gap() {
         .expect("expected construction to fail on a gapped cover");
     let msg = err.to_string();
     assert!(
-        msg.contains("exactly once") && msg.contains("gap"),
-        "message should name the invariant and the cause: {msg}"
+        msg.contains("exactly once") && msg.contains("belong to no shard"),
+        "message should name the invariant and the consequence: {msg}"
     );
+    // The rows that actually went missing, not just "something is wrong".
+    assert!(
+        msg.contains("rows [6, 9)"),
+        "message should name the uncovered rows: {msg}"
+    );
+}
+
+/// A file whose **only** modality is registered in the modality table — so its
+/// X is stamped `modality_id = 1` and modality 0 owns nothing — is valid and
+/// unambiguous, and must open on every unscoped entry point.
+///
+/// This is what `from_mudata(MuData({"rna": adata}))` and a single-modality
+/// h5mu ingest write. An earlier version of the cover check asked "does
+/// modality 0 tile the obs axis?" and rejected all of them with a false "leave
+/// a gap" error — valid input broken by a guard meant to catch corruption.
+/// Every other single-modality fixture here writes id-0 shards, which is why
+/// nothing caught it. Found by codex - gpt-5.6-sol.
+#[test]
+fn accepts_a_file_whose_only_modality_is_registered_as_id_1() {
+    use scx_format_io::ScxReader;
+    use scx_loader::{IndexPlanLoader, SparseCellSetLoader};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path =
+        common::write_single_registered_modality_fixture(&dir.path().join("mono.scx"), 16, 8, 4);
+
+    TrainingPipeline::new(&path, config())
+        .expect("unscoped TrainingPipeline must accept a sole registered modality");
+
+    let mut cfg = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        max_memory_mb: 512,
+        ..Default::default()
+    };
+    cfg.obs_columns.clear();
+    IndexPlanLoader::new(&path, cfg, 4, true, 4, 16)
+        .expect("IndexPlanLoader must accept a sole registered modality");
+
+    let readers = vec![ScxReader::open(&path).unwrap()];
+    SparseCellSetLoader::new(readers, 4, None, 4, None, None, false, false, 1e4, None)
+        .expect("SparseCellSetLoader must accept a sole registered modality");
 }
 
 /// The control for the test above: a single-modality file still opens.

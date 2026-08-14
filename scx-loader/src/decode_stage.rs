@@ -203,10 +203,14 @@ fn fill_batch_parallel(
                 // row) before any HVG projection. With a projection, the dense
                 // `output_row` holds only the panel genes, so its own sum would
                 // be a panel-local depth that silently diverges from scanpy's
-                // normalize-then-subset and from the pflog path above. For
-                // the no-projection case this equals `output_row.iter().sum()`.
+                // normalize-then-subset and from the pflog path above.
                 // Only needed when normalizing — skip the sum on raw-count /
                 // log1p-only configs (e.g. scVI) where `depth` is ignored.
+                //
+                // Not `output_row.iter().sum()` even without a projection: on
+                // the log path the values are clipped before the log, so the
+                // denominator has to be clipped too — that is what
+                // `transform_depth` decides.
                 // `transform_depth` clips when a log follows, so the
                 // denominator describes the values that will actually be
                 // logged — see its docs for the 1.5x mis-scale and the

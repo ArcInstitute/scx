@@ -16,7 +16,13 @@ use rand_chacha::ChaCha8Rng;
 /// Uses a deterministic RNG seeded from `(seed, epoch)` — chained through
 /// [`crate::seed::epoch_stream_seed`] with the shard-shuffle domain tag, not
 /// added — so that the same seed and epoch always produce the identical shard
-/// ordering, and no `(seed, epoch)` pair aliases another.
+/// ordering.
+///
+/// The chaining removes the *systematic* aliasing the old additive scheme had
+/// (`(s, e)` drove the same stream as `(s + φ, e − 1)`) and leaves distinct
+/// pairs on independent-looking streams. It is not injective and does not claim
+/// to be: `(u64, u64)` does not fit in the `u64` a stream is seeded from, so
+/// collisions exist by counting. What is gone is being able to *predict* one.
 #[derive(Debug)]
 pub struct ShardShuffler {
     n_shards: usize,

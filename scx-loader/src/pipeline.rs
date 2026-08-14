@@ -362,22 +362,54 @@ pub(crate) fn ensure_csr_ranges_are_readable(
             // loaders report an in-bounds row as "out of range" mid-iteration,
             // blaming the caller's plan for the file's defect.
             //
-            // A single-modality file's shards are stamped `modality_id = 0`, so
-            // the same catalog predicate the scoped arm uses answers this
-            // exactly. On a multimodal file modality 0 owns no shards, so it
-            // would report `false` — which is why the overlap check above runs
-            // first and returns the message that actually helps.
-            if !reader
-                .catalog()
-                .modality_csr_ranges_tile_obs(0, reader.n_obs())
-            {
+            // This walks the **flattened** list, which is what the unscoped path
+            // actually reads — deliberately not
+            // `modality_csr_ranges_tile_obs(0, n_obs)`. That looked equivalent
+            // ("a single-modality file's shards are stamped `modality_id = 0`")
+            // and is not: a file with a *one-entry modality table* — what
+            // `from_mudata(MuData({"rna": adata}))` and a single-modality h5mu
+            // ingest emit — stamps its only X with `modality_id = 1`, leaving
+            // modality 0 owning no shards. Its flattened cover is perfectly
+            // unambiguous, and keying on modality 0 rejected every such file
+            // with a false "leave a gap".
+            //
+            // The overlap check above has already established the ranges are
+            // disjoint and sorted, so contiguity from 0 to `n_obs` is all that
+            // is left to prove.
+            let n_obs = reader.n_obs();
+            let mut expected: u64 = 0;
+            for entry in reader.catalog().csr_shards_sorted() {
+                let Some(stats) = entry.stats.as_ref() else {
+                    return Err(LoaderError::ConfigError {
+                        reason: format!(
+                            "{who}: CSR shard '{}' carries no row-range stats, so the \
+                             rows it holds cannot be located. `scx info` lists the \
+                             shard row ranges.",
+                            entry.name
+                        ),
+                    });
+                };
+                if stats.row_start != expected {
+                    return Err(LoaderError::ConfigError {
+                        reason: format!(
+                            "{who}: this file's CSR shards do not cover the obs axis \
+                             [0, {n_obs}) exactly once — shard '{}' starts at row {} \
+                             where row {expected} was expected, so rows \
+                             [{expected}, {}) belong to no shard. `scx info` lists the \
+                             shard row ranges.",
+                            entry.name, stats.row_start, stats.row_start
+                        ),
+                    });
+                }
+                expected = stats.row_end;
+            }
+            if expected != n_obs {
                 return Err(LoaderError::ConfigError {
                     reason: format!(
-                        "{who}: this file's CSR shards do not cover the obs axis \
-                         [0, {}) exactly once — they leave a gap, stop short, or are \
-                         missing row-range stats, so some cells belong to no shard. \
-                         `scx info` lists the shard row ranges.",
-                        reader.n_obs()
+                        "{who}: this file's CSR shards cover the obs axis only up to \
+                         row {expected}, but n_obs is {n_obs} — rows \
+                         [{expected}, {n_obs}) belong to no shard. `scx info` lists \
+                         the shard row ranges."
                     ),
                 });
             }
