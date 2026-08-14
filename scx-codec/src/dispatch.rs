@@ -156,12 +156,23 @@ impl ValueEncoding {
                 buf.extend_from_slice(&(value as u16).to_le_bytes());
             }
             Self::Uint32 => {
-                // Exclusive at 2³², which f32 represents exactly. `u32::MAX as
-                // f32` must NOT be used as an inclusive bound: it rounds *up*
-                // to 2³², so it admits the very value `as u32` saturates from
-                // and writes 4294967295 to disk in its place.
+                // Inclusive at 2³², and deliberately so. `u32::MAX as f32` IS
+                // 2³² — the conversion rounds up — so this one f32 value has
+                // two provenances the encoder cannot tell apart: a genuine
+                // out-of-range 2³², or the f32 image of an on-disk `u32::MAX`
+                // that a rewrite path (compact / merge / sort / build_csc)
+                // just decoded and is handing straight back. Rejecting it
+                // would fail those ops on format-valid archives, so accept and
+                // let `as u32` saturate — which is the *correct* answer for
+                // the decode-seam provenance.
+                //
+                // Fresh out-of-range data is caught upstream instead, by
+                // `detect_value_encoding`, which sends anything above
+                // `u32::MAX` to `Float32` and never selects this arm for it.
+                // `contains` (not `<=`) so NaN is rejected rather than written
+                // as 0.
                 const UINT32_BOUND: f32 = (1u128 << 32) as f32;
-                if !(0.0..UINT32_BOUND).contains(&value) {
+                if !(0.0..=UINT32_BOUND).contains(&value) {
                     return Err(CodecError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("value {value} out of range for uint32"),
@@ -1621,27 +1632,39 @@ mod tests {
         );
     }
 
-    /// The `Uint32` range guard must be exclusive at 2³². `u32::MAX as f32`
-    /// rounds *up* to 2³², so an inclusive bound written that way admits
-    /// exactly the value `as u32` saturates from — silent on-disk corruption
-    /// (2³² would land as 4294967295).
+    /// An on-disk `u32::MAX` decodes to f32 as exactly 2³² (the conversion
+    /// rounds up), and the rewrite paths re-encode that decoded f32 under the
+    /// input's own `Uint32` encoding. So this arm must accept 2³² and saturate
+    /// it back to `u32::MAX` — a bound that rejects it aborts compact / merge /
+    /// sort / build_csc on format-valid archives. Fresh out-of-range values are
+    /// kept away from this arm by `detect_value_encoding`, not by this check.
     #[test]
-    fn encode_f32_uint32_rejects_saturating_value() {
-        let two_pow_32 = (1u128 << 32) as f32;
+    fn encode_f32_uint32_preserves_decoded_u32_max() {
+        let decoded_max = u32::MAX as f32;
+        assert_eq!(decoded_max, (1u128 << 32) as f32, "u32::MAX as f32 IS 2^32");
+
         let mut buf = Vec::new();
-        assert!(ValueEncoding::Uint32
-            .encode_f32(&mut buf, two_pow_32)
-            .is_err());
-        assert!(buf.is_empty());
-        // The largest f32 below the bound (2³² - 2⁸) still encodes, exactly.
+        ValueEncoding::Uint32
+            .encode_f32(&mut buf, decoded_max)
+            .unwrap();
+        assert_eq!(
+            buf,
+            u32::MAX.to_le_bytes(),
+            "u32::MAX must survive re-encode"
+        );
+
+        // The largest f32 strictly below 2³² (2³² - 2⁸) is exact either way.
+        buf.clear();
         ValueEncoding::Uint32
             .encode_f32(&mut buf, 4_294_967_040.0f32)
             .unwrap();
         assert_eq!(buf, 4_294_967_040u32.to_le_bytes());
-        // Batch encoding shares the same guard.
+
+        // Genuinely out of range, and NaN, are still refused.
         assert!(ValueEncoding::Uint32
-            .encode_f32_batch(&[two_pow_32])
+            .encode_f32(&mut Vec::new(), 8_589_934_592.0f32)
             .is_err());
+        assert!(ValueEncoding::Uint32.encode_f32_batch(&[f32::NAN]).is_err());
     }
 
     /// Build a small CSR matrix for testing.

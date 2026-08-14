@@ -36,13 +36,16 @@ pub fn encode_value(
             buf.extend_from_slice(&(value as u16).to_le_bytes());
         }
         ValueEncoding::Uint32 => {
-            // Exclusive at 2³², which f32 represents exactly. `u32::MAX as f32`
-            // rounds *up* to 2³², so using it as an inclusive bound admits the
-            // very value `as u32` saturates from and writes 4294967295 in its
-            // place — silent corruption on the compact/merge re-encode path.
-            // (255 and 65535 above are exact in f32, so those bounds are fine.)
+            // Inclusive at 2³² — see `ValueEncoding::encode_f32`, which this
+            // mirrors. `u32::MAX as f32` IS 2³², so this value is exactly what
+            // an on-disk `u32::MAX` decodes to; compact/merge/sort re-encode
+            // decoded f32 under the input's own encoding, and rejecting it
+            // would abort them on format-valid archives. `as u32` saturates
+            // back to `u32::MAX`, restoring the original value. Fresh
+            // out-of-range data is diverted to `Float32` by
+            // `detect_value_encoding` and never reaches this arm.
             const UINT32_BOUND: f32 = (1u128 << 32) as f32;
-            if !(0.0..UINT32_BOUND).contains(&value) {
+            if !(0.0..=UINT32_BOUND).contains(&value) {
                 return Err(OpsError::ValueOutOfRange {
                     value,
                     encoding: "Uint32",
@@ -116,21 +119,29 @@ mod tests {
         }
     }
 
-    /// The re-encode path used by compact/merge shares the codec's saturation
-    /// hazard: `u32::MAX as f32` rounds up to 2³², so an inclusive bound
-    /// written that way lets 2³² through and `as u32` saturates it to
-    /// 4294967295 on the way to disk.
+    /// compact / merge / sort decode a shard to f32 and re-encode it under the
+    /// input's own encoding. An on-disk `u32::MAX` decodes to exactly 2³²
+    /// (`u32::MAX as f32` rounds up), so this arm must accept that value and
+    /// saturate it back — rejecting it aborts those ops on a format-valid
+    /// archive. `detect_value_encoding` is what keeps fresh out-of-range data
+    /// away from `Uint32` in the first place.
     #[test]
-    fn encode_value_uint32_rejects_saturating_value() {
-        let two_pow_32 = (1u128 << 32) as f32;
+    fn encode_value_uint32_preserves_decoded_u32_max() {
+        let decoded_max = u32::MAX as f32;
+        assert_eq!(decoded_max, (1u128 << 32) as f32);
+
         let mut buf = Vec::new();
-        assert!(matches!(
-            encode_value(&mut buf, two_pow_32, ValueEncoding::Uint32),
-            Err(OpsError::ValueOutOfRange { .. })
-        ));
-        assert!(buf.is_empty());
-        // The largest f32 below the bound (2³² - 2⁸) still encodes, exactly.
+        encode_value(&mut buf, decoded_max, ValueEncoding::Uint32).unwrap();
+        assert_eq!(buf, u32::MAX.to_le_bytes());
+
+        buf.clear();
         encode_value(&mut buf, 4_294_967_040.0, ValueEncoding::Uint32).unwrap();
         assert_eq!(buf, 4_294_967_040u32.to_le_bytes());
+
+        // Genuinely out of range is still refused.
+        assert!(matches!(
+            encode_value(&mut Vec::new(), 8_589_934_592.0, ValueEncoding::Uint32),
+            Err(OpsError::ValueOutOfRange { .. })
+        ));
     }
 }
