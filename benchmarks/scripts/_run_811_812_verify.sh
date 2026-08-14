@@ -28,12 +28,36 @@ if ! nvidia-smi -L 2>/dev/null | grep -q '^GPU '; then
     exit 1
 fi
 
-CONDA_BASE="$(conda info --base 2>/dev/null || dirname "$(dirname "${CONDA_EXE:-}")")"
-if [ -n "${CONDA_BASE}" ] && [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
-    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+# Bootstrap conda BEFORE trying to run it. Under `sbatch --wrap` the shell is
+# non-interactive and does not read the profile, so `conda` is not on PATH and
+# `conda info --base` — the usual discovery step — is itself a
+# `command not found`. Source the hook from a known prefix first, and only fall
+# back to querying an already-present conda.
+#
+# This is not hypothetical: the first run of this script did exactly that, and
+# the failure surfaced two steps later as `python: command not found` reported
+# by the preflight, which reads as "the feature is broken" rather than "the env
+# never activated". Worse, `maturin` (resolved from ~/.local/bin) had already
+# built against the uv `.venv` instead — whose nvrtc is 13.0 and fails on H100.
+for prefix in "${CONDA_PREFIX_ROOT:-}" "$HOME/miniforge3" "$HOME/miniconda3" "$HOME/anaconda3"; do
+    if [ -n "${prefix}" ] && [ -f "${prefix}/etc/profile.d/conda.sh" ]; then
+        source "${prefix}/etc/profile.d/conda.sh"
+        break
+    fi
+done
+if ! command -v conda >/dev/null 2>&1; then
+    echo "PREFLIGHT FAILED: conda not found; cannot activate ${CONDA_ENV}." >&2
+    exit 1
 fi
-conda activate "${CONDA_ENV}"
+conda activate "${CONDA_ENV}" || { echo "PREFLIGHT FAILED: conda activate ${CONDA_ENV}" >&2; exit 1; }
 echo "python: $(command -v python)"
+# Fail loudly if we are about to build against the uv venv rather than the
+# conda env — the whole reason this driver exists (nvrtc 12.6 vs 13.0).
+python -c "import sys; print('py', sys.version.split()[0], sys.prefix)"
+case "$(python -c 'import sys; print(sys.prefix)')" in
+    *"${CONDA_ENV}"*) ;;
+    *) echo "PREFLIGHT FAILED: python is not from ${CONDA_ENV}" >&2; exit 1 ;;
+esac
 
 echo "=== maturin develop --release --features hdf5,gpu ==="
 ( cd pyscx && maturin develop --release --features hdf5,gpu ) || { echo "BUILD FAILED"; exit 1; }
