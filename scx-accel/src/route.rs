@@ -200,6 +200,12 @@ pub struct AccelExecutionInfo {
     pub math_mode: Option<&'static str>,
     /// cuSPARSE SpMM algorithm policy for the op, if applicable (Task 2.5):
     /// `"default"` / `"deterministic"` / `"benchmark_once"`. `None` otherwise.
+    ///
+    /// `"deterministic"` names an algorithm (`CUSPARSE_SPMM_CSR_ALG2`), **not**
+    /// a bit-reproducibility guarantee — cuSPARSE gives none for transpose
+    /// operations, which the PCA power loop issues every iteration. See
+    /// `scx_gpu::SpmmAlgPolicy`. `"benchmark_once"` is reserved and currently
+    /// resolves to the same algorithm as `"default"`.
     pub spmm_policy: Option<&'static str>,
     // --- rapids-route / device-handoff metadata ---
     /// rapids-singlecell version, when a rapids route ran (`None` otherwise).
@@ -223,14 +229,25 @@ pub struct AccelExecutionInfo {
     /// aggregate `transfer_mode` cannot (it stays `scx_device_handoff_streamed`
     /// while any shard uploads decompressed bytes). `None` outside that path.
     pub n_shards_shufdelta_gpu: Option<u32>,
-    /// Whether a GPU CSR route held the whole matrix device-resident across
-    /// gene chunks instead of re-decoding every shard per chunk (§9.11).
+    /// Whether the route held the whole matrix device-resident instead of
+    /// re-decoding it, on the two ops that make that choice.
     ///
-    /// `Some(true)` = resident, `Some(false)` = the streaming path ran (matrix
-    /// over the VRAM budget, only one gene chunk, or the kill switch set),
+    /// `Some(true)` = resident, `Some(false)` = the streaming path ran,
     /// `None` = the route has no residency decision to make (CPU, dense, or a
-    /// CSC-direct route, which prefilters by column range and never re-decodes
-    /// in the first place).
+    /// CSC-direct DE route, which prefilters by column range and never
+    /// re-decodes in the first place).
+    ///
+    /// - **GPU CSR DE routes** (§9.11): residency is across *gene chunks*.
+    ///   Streaming means the matrix was over the VRAM budget, there was only
+    ///   one gene chunk, or `SCX_GPU_DE_RESIDENT=0`.
+    /// - **Native GPU PCA** (§8.11): residency is across the randomized *power
+    ///   loop*. Streaming means over the VRAM budget or
+    ///   `SCX_GPU_PCA_RESIDENT=0`, in which case the operator re-decodes and
+    ///   re-uploads the whole matrix on every `matmat`/`rmatmat`.
+    ///
+    /// Both decisions are made dynamically against *free* VRAM at call time, so
+    /// the same input can go either way run to run — which is why this is
+    /// recorded rather than inferred from shape.
     ///
     /// A gate reads this to catch a *silent* fall back to streaming, the same
     /// way `de_route_csc_direct` catches a silent CSR fallback. Note the

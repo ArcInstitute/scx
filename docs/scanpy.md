@@ -3424,6 +3424,15 @@ Two knobs:
 - **`SCX_GPU_DE_RESIDENT=0`** — kill switch. Restores the pre-4.5 streaming
   behaviour exactly.
 
+Native GPU **PCA** has the same two-path structure and its own kill switch,
+**`SCX_GPU_PCA_RESIDENT=0`**, which forces the streaming power loop (the whole
+matrix re-decoded and re-uploaded on every multiply). Both ops record which path
+ran on `resident_csr` — see
+[api.md § Accelerator route metadata](api.md#accelerator-route-metadata). The
+PCA knob is also what makes the streaming loop reachable from a test: residency
+is decided against *free* VRAM at call time, so on a large card no fixture can
+force the streaming branch by shape alone.
+
 A third knob, `SCX_GPU_VALIDATE_PAR_MIN_NNZ`, sets the shard size above which
 the per-shard GPU-DE validation scan (strictly-increasing columns + finiteness)
 runs in parallel; default 65 536 nnz, and pinning it above any real shard's nnz

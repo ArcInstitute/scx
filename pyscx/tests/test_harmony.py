@@ -96,8 +96,14 @@ class TestHarmonyBasic:
         import pyscx
 
         adata = harmony_adata
+        # `device="cpu"`, not the default `"auto"`: the backend assertion below
+        # names the CPU integrator, and `"auto"` resolves to GPU on a GPU host,
+        # so this test could only pass off-GPU — a test that cannot pass on the
+        # hardware it is meant to cover. Observed failing on an H100
+        # (`'scx-gpu' == 'scx-accel-cpu'`). The GPU backend string is covered by
+        # the GPU-gated tests in the scx-accel suite.
         pyscx.accel.harmony_integrate(
-            adata, "batch", max_iter=2, random_state=0
+            adata, "batch", device="cpu", max_iter=2, random_state=0
         )
         assert "harmony" in adata.uns
         info = adata.uns["harmony"]
@@ -161,6 +167,33 @@ class TestHarmonyDevice:
         # device="cpu" → CpuDense path, recorded as a user-forced CPU fallback.
         assert route["route"] == "cpu_dense"
         assert route["fallback_reason"] == "user_forced_cpu"
+
+    def test_graph_replay_is_none_on_cpu(self, harmony_adata):
+        """§8.12: the CPU route must report no CUDA-graph decision.
+
+        Scope warning, because it is easy to over-read: this assertion
+        **passes without the §8.12 fix** — the pre-fix stamp left every
+        optional field None, so `graph_replay` was already None here. It is
+        checked and stated rather than implied. What it guards is the Python
+        surface: that the key still reaches `uns`, and that CPU never reports
+        a `False` (which would claim a capture was attempted and did not
+        replay — a different and untrue statement).
+
+        The assertions that actually distinguish fixed from unfixed are in
+        Rust: `test_cpu_harmony_reports_no_graph_decision` (the field exists at
+        all) and `test_gpu_harmony_reports_graph_replay` (`Some(True)` under
+        capture, `Some(False)` under the kill switch), the latter running only
+        on the Chimera GPU suite.
+        """
+        import pyscx
+
+        adata = harmony_adata
+        pyscx.accel.harmony_integrate(
+            adata, "batch", device="cpu", max_iter=2, random_state=0
+        )
+        route = adata.uns["scx_accel"]["harmony_integrate"]
+        assert "graph_replay" in route
+        assert route["graph_replay"] is None
 
 
 class TestHarmonyErrors:

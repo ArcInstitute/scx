@@ -72,6 +72,7 @@ pub fn randomized_pca_gpu<S: ShardSource + Sync>(
         n_obs: gpu_result.n_obs,
         n_vars: gpu_result.n_vars,
         graph_replayed: Some(gpu_result.graph_replayed),
+        resident_csr: Some(gpu_result.resident_csr),
     })
 }
 

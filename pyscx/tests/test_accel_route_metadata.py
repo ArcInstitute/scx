@@ -121,11 +121,20 @@ def test_pca_rejects_invalid_spmm_policy():
 
 
 @gpu_only
-def test_pca_gpu_randomized_populates_tuning_metadata():
+def test_pca_gpu_randomized_populates_tuning_metadata(monkeypatch):
     """Task 2.5: the randomized GPU PCA route records the math-mode /
     SpMM-policy / graph-replay fields the CPU route leaves None. Defaults are
     strict_fp32 + heuristic SpMM; capture is opt-in/off so graph_replay is
-    False (not None). De-risks the deferred 2.7 gate wiring."""
+    False (not None). De-risks the deferred 2.7 gate wiring.
+
+    `SCX_FORCE_NATIVE_GPU=1` is required, not cosmetic: `math_mode` /
+    `spmm_policy` / `graph_replay` are stamped only by the **native** randomized
+    route, and an in-memory `X` with rapids-singlecell installed routes to
+    `rapids_singlecell_gpu` instead. Without the pin this asserted a route that
+    cannot occur on a rapids host — observed failing on an H100 with
+    `'rapids_singlecell_gpu' == 'gpu_csr'`. Same pin as `test_accel_pca_gpu.py`.
+    """
+    monkeypatch.setenv("SCX_FORCE_NATIVE_GPU", "1")
     adata = _random_count_adata(n_obs=400, n_vars=120, density=0.1, seed=3)
     pyscx.accel.pca(adata, n_comps=5, device="gpu", method="randomized")
     info = _route(adata, "pca")
@@ -136,9 +145,19 @@ def test_pca_gpu_randomized_populates_tuning_metadata():
 
 
 @gpu_only
-def test_pca_gpu_randomized_records_tuned_knobs():
+def test_pca_gpu_randomized_records_tuned_knobs(monkeypatch):
     """Task 2.5: explicit `allow_tf32` / `spmm_policy` kwargs are reflected in
-    the recorded metadata on the randomized GPU route."""
+    the recorded metadata on the randomized GPU route.
+
+    Pinned to the native route for the same reason as the test above.
+
+    Scope note: this asserts the metadata *echo* only. That the streaming arm
+    of that route actually applies the requested SpMM algorithm — the §8.11
+    defect — is covered by `test_gpu_pca_resident.py`, because this fixture is
+    ~38 KB and always takes the device-resident loop, which honoured the policy
+    all along.
+    """
+    monkeypatch.setenv("SCX_FORCE_NATIVE_GPU", "1")
     adata = _random_count_adata(n_obs=400, n_vars=120, density=0.1, seed=4)
     pyscx.accel.pca(
         adata,

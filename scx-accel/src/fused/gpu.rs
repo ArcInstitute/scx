@@ -115,6 +115,7 @@ pub fn pca_then_knn_gpu<S: ShardSource + Sync>(
         n_obs: pca_dev.n_obs,
         n_vars: pca_dev.n_vars,
         graph_replayed: Some(pca_dev.graph_replayed),
+        resident_csr: Some(pca_dev.resident_csr),
     };
 
     Ok((pca, knn))

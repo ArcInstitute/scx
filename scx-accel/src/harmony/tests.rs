@@ -657,6 +657,82 @@ fn test_gpu_harmony_graph_vs_direct_parity() {
 /// exactly 1 (warm-up runs first, capture fires on the second
 /// sub-iter, every other sub-iter across all later outer iters
 /// replays).
+/// The CPU path makes no CUDA-graph decision, so it must report `None` rather
+/// than a `Some(false)` that would read as "capture was tried and failed".
+#[test]
+fn test_cpu_harmony_reports_no_graph_decision() {
+    let n = 120;
+    let d = 4;
+    let emb = random_embeddings(n, d, 5);
+    let labels: Vec<u32> = (0..n as u32).map(|i| i % 2).collect();
+    let cov = BatchCovariate {
+        labels,
+        n_levels: 2,
+        name: None,
+    };
+    let config = HarmonyConfig {
+        n_clusters: Some(3),
+        max_iter: 2,
+        random_state: 7,
+        ..Default::default()
+    };
+    let result = harmony_integrate(&emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
+    assert_eq!(
+        result.graph_replay, None,
+        "CPU Harmony has no capture decision to report; Some(_) would claim one was made"
+    );
+}
+
+/// The GPU path must report whether it actually replayed a captured graph.
+///
+/// Note what the neighbouring capture-count test does *not* cover: it asserts
+/// capture is **attempted** once, which stays green even if every attempt
+/// fails. This is the assertion that notices.
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn test_gpu_harmony_reports_graph_replay() {
+    require_gpu_or_skip!();
+    let n_per = 80;
+    let d = 5;
+    let (emb, labels) = batched_gaussian(n_per, d, 77);
+    let n = emb.len() / d;
+    let cov = BatchCovariate {
+        labels,
+        n_levels: 2,
+        name: None,
+    };
+    let config = HarmonyConfig {
+        n_clusters: Some(4),
+        max_iter: 3,
+        random_state: 5,
+        ..Default::default()
+    };
+
+    let prev = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
+    let on = harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config);
+    scx_gpu::set_cuda_graphs_enabled_override(prev);
+    let on = on.unwrap();
+    assert_eq!(
+        on.graph_replay,
+        Some(true),
+        "graphs enabled but no captured graph was replayed — capture failed silently, \
+         which is exactly the condition this field exists to surface. Re-run with \
+         RUST_LOG=warn to see the reason the capture arm logged."
+    );
+
+    // Kill switch: no capture is attempted at all, so the honest answer is
+    // Some(false) — a decision was available and the graph was not used.
+    let prev = scx_gpu::set_cuda_graphs_enabled_override(Some(false));
+    let off = harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config);
+    scx_gpu::set_cuda_graphs_enabled_override(prev);
+    assert_eq!(
+        off.unwrap().graph_replay,
+        Some(false),
+        "kill switch set but the result claims a graph was replayed"
+    );
+}
+
 #[cfg(feature = "gpu")]
 #[test]
 #[ignore = "requires a CUDA GPU"]

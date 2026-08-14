@@ -327,17 +327,24 @@ pub fn harmony_integrate(
     // planner resolves the actual route from the device intent + GPU availability,
     // matching the dispatch branch above (GPU branch runs iff resolve_device
     // returned a CUDA id, i.e. device="gpu"/"gpu:N" or "auto" with a GPU present).
-    super::route::write_accel_route(
-        py,
-        adata,
-        "harmony_integrate",
-        &super::route::simple_exec_info(
-            device,
-            true,
-            scx_accel::AccelRoute::GpuDense,
-            scx_accel::AccelRoute::CpuDense,
-        ),
-    )?;
+    //
+    // `graph_replay` is re-stamped from the result rather than left `None`:
+    // Harmony is the only production CUDA-graph capture site in the tree, and
+    // a capture that fails silently re-runs every k-means sub-iter directly
+    // for the rest of the call. Without this field that slowdown had no
+    // observable signal at all. `fallback_reason` deliberately stays `none` —
+    // the GPU route did run, and the numbers are identical either way.
+    let mut info = super::route::simple_exec_info(
+        device,
+        true,
+        scx_accel::AccelRoute::GpuDense,
+        scx_accel::AccelRoute::CpuDense,
+    );
+    if info.route.is_gpu() {
+        info.graph_replay = result.graph_replay;
+    }
+    super::route::announce_route(py, "harmony_integrate", device, &info);
+    super::route::write_accel_route(py, adata, "harmony_integrate", &info)?;
 
     Ok(())
 }

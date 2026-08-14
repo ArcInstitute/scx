@@ -63,6 +63,9 @@ benchmarks/comprehensive/results/reports/dashboard_history.json
 
 # Rust
 /target/
+# Isolated cargo target for benchmarks/scripts/_run_811_812_verify.sh — that
+# driver wipes it wholesale each run to avoid maturin's stale-artifact failure.
+/target-gpu-verify/
 **/fuzz/target/
 **/fuzz/corpus/
 **/fuzz/artifacts/
