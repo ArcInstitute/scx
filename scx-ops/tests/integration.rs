@@ -912,6 +912,66 @@ fn test_compact_widens_value_encoding_across_shards() {
     );
 }
 
+/// A format-valid `Uint32` shard holding `u32::MAX` must survive compact.
+///
+/// `read_shard_from_entry` decodes the raw `u32` stream to f32, and
+/// `u32::MAX as f32` rounds *up* to exactly 2³². The re-encode side therefore
+/// sees a value that is indistinguishable from a genuine out-of-range 2³²; if
+/// it rejects that, compact aborts with `ValueOutOfRange` on an archive the
+/// writer was entitled to produce (`detect_value_encoding_f64` picks `Uint32`
+/// for exactly `u32::MAX`, which is the rscx ingest path).
+#[test]
+fn test_compact_preserves_u32_max_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("u32max.scx");
+    let n_vars = 4usize;
+    let header = sample_header(2, n_vars as u64);
+    let mut w = ScxWriter::new(&path, header).unwrap();
+    w.write_obs(&sample_obs(2)).unwrap();
+    w.write_var(&sample_var(n_vars)).unwrap();
+
+    // Raw LE u32 bytes, written directly so the fixture does not depend on the
+    // encode path under test.
+    let ip = vec![0u64, 1, 2];
+    let ix = vec![0u32, 1];
+    let mut vals = Vec::new();
+    vals.extend_from_slice(&u32::MAX.to_le_bytes());
+    vals.extend_from_slice(&7u32.to_le_bytes());
+    w.write_csr_shard(&ip, &ix, &vals, CodecId::None, ValueEncoding::Uint32, 0)
+        .unwrap();
+    w.write_provenance(vec![ProvenanceEntry {
+        timestamp: 1710000000,
+        action: "convert".to_string(),
+        tool: "test".to_string(),
+        params_json: "{}".to_string(),
+        input_checksums: vec![],
+    }])
+    .unwrap();
+    w.finish().unwrap();
+
+    let out = dir.path().join("u32max_compact.scx");
+    scx_ops::compact(&path, &out)
+        .expect("compact must not reject a format-valid Uint32 shard holding u32::MAX");
+
+    let reader = ScxReader::open(&out).unwrap();
+
+    // Assert the on-disk encoding first. Reading back f32 alone cannot settle
+    // this: `u32::MAX as f32` is 2³² either way, so a widen to `Float32` would
+    // satisfy the value check below while quietly changing the format.
+    let entries = reader.catalog().csr_shards_sorted();
+    assert_eq!(entries.len(), 1);
+    let hdr = reader.read_shard_header(entries[0]).unwrap();
+    assert_eq!(
+        ValueEncoding::from_u8(hdr.value_encoding),
+        Some(ValueEncoding::Uint32),
+        "compact must keep the Uint32 encoding, not widen around the bound"
+    );
+
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.data[0], u32::MAX as f32);
+    assert_eq!(csr.data[1], 7.0);
+}
+
 /// Merge preserves obs metadata in correct order
 #[test]
 fn test_merge_preserves_obs_metadata() {

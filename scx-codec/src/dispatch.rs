@@ -156,7 +156,36 @@ impl ValueEncoding {
                 buf.extend_from_slice(&(value as u16).to_le_bytes());
             }
             Self::Uint32 => {
-                if !(0.0..=u32::MAX as f32).contains(&value) {
+                // Inclusive at 2³², and deliberately so. `u32::MAX as f32` IS
+                // 2³² — the conversion rounds up — so this one f32 value has
+                // two provenances the encoder cannot tell apart: a genuine
+                // out-of-range 2³², or the f32 image of an on-disk `u32::MAX`
+                // that a rewrite path (compact / merge / sort / build_csc)
+                // just decoded and is handing straight back. Rejecting it
+                // would fail those ops on format-valid archives, so accept and
+                // let `as u32` saturate — which is the *correct* answer for
+                // the decode-seam provenance.
+                //
+                // On the *detect* path, fresh out-of-range data is caught
+                // upstream by `detect_value_encoding`, which sends anything
+                // above `u32::MAX` to `Float32` so this arm is never selected
+                // for it. That is not every caller: anything passing an
+                // explicit encoding bypasses the detector, and two in-tree
+                // writers can hand a fresh 2³² here after detection —
+                // `scx_ops::rewrite_helpers::encoding_for_canonicalized`
+                // (whose ladder stops at `Uint32`, so a canonicalized sum of
+                // duplicate coordinates past `u32::MAX` keeps it), and
+                // `attach_external_layer` (detects once, then canonicalizes
+                // per shard and re-encodes under the detected encoding). Those
+                // still saturate silently, exactly as they did before this
+                // module gained the comment. Closing that needs the rewrite
+                // paths to carry native `u32` instead of round-tripping
+                // through `f32`, which is a separate change.
+                //
+                // `contains` (not `<=`) so NaN is rejected rather than written
+                // as 0.
+                const UINT32_BOUND: f32 = (1u128 << 32) as f32;
+                if !(0.0..=UINT32_BOUND).contains(&value) {
                     return Err(CodecError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("value {value} out of range for uint32"),
@@ -1614,6 +1643,44 @@ mod tests {
             raw_bytes_to_u32(&[5, 0, 0, 0], ValueEncoding::Uint32).unwrap(),
             vec![5]
         );
+    }
+
+    /// An on-disk `u32::MAX` decodes to f32 as exactly 2³² (the conversion
+    /// rounds up), and the rewrite paths re-encode that decoded f32 under the
+    /// input's own `Uint32` encoding. So this arm must accept 2³² and saturate
+    /// it back to `u32::MAX` — a bound that rejects it aborts compact / merge /
+    /// sort / build_csc on format-valid archives. On the detect path, fresh
+    /// out-of-range values are kept away from this arm by
+    /// `detect_value_encoding` rather than by this check — but callers that
+    /// pass an explicit encoding bypass that, and still saturate; see the
+    /// comment on the arm itself.
+    #[test]
+    fn encode_f32_uint32_preserves_decoded_u32_max() {
+        let decoded_max = u32::MAX as f32;
+        assert_eq!(decoded_max, (1u128 << 32) as f32, "u32::MAX as f32 IS 2^32");
+
+        let mut buf = Vec::new();
+        ValueEncoding::Uint32
+            .encode_f32(&mut buf, decoded_max)
+            .unwrap();
+        assert_eq!(
+            buf,
+            u32::MAX.to_le_bytes(),
+            "u32::MAX must survive re-encode"
+        );
+
+        // The largest f32 strictly below 2³² (2³² - 2⁸) is exact either way.
+        buf.clear();
+        ValueEncoding::Uint32
+            .encode_f32(&mut buf, 4_294_967_040.0f32)
+            .unwrap();
+        assert_eq!(buf, 4_294_967_040u32.to_le_bytes());
+
+        // Genuinely out of range, and NaN, are still refused.
+        assert!(ValueEncoding::Uint32
+            .encode_f32(&mut Vec::new(), 8_589_934_592.0f32)
+            .is_err());
+        assert!(ValueEncoding::Uint32.encode_f32_batch(&[f32::NAN]).is_err());
     }
 
     /// Build a small CSR matrix for testing.
