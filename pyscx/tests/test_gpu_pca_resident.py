@@ -8,10 +8,15 @@ call time, so the same script on the same data can go either way depending on
 what else is on the card.
 
 That mattered because only the resident loop honoured `spmm_policy`. The
-streaming operator hardcoded `CUSPARSE_SPMM_ALG_DEFAULT` — an algorithm that
-may use atomics — while `uns["scx_accel"]["pca"]["spmm_policy"]` reported
-whatever the caller asked for. A user who requested `"deterministic"` on a
-matrix too big for VRAM got nondeterminism and was told otherwise.
+streaming operator hardcoded `CUSPARSE_SPMM_ALG_DEFAULT` — cuSPARSE's heuristic
+pick — while `uns["scx_accel"]["pca"]["spmm_policy"]` reported whatever the
+caller asked for. A user who asked to pin `CUSPARSE_SPMM_CSR_ALG2` on a matrix
+too big for VRAM got the heuristic and was told otherwise.
+
+Note what `spmm_policy="deterministic"` is: an algorithm selection, **not** a
+bit-reproducibility guarantee. cuSPARSE gives no reproducibility guarantee for
+transpose operations and the power loop issues one every iteration, so these
+tests compare subspaces, not bits.
 
 What these tests pin:
 
@@ -26,9 +31,11 @@ What these tests pin:
    and as an accurate stamp.
 
 Note what is *not* claimed: nothing here observes which cuSPARSE algorithm
-actually executed — the host cannot. That the streaming operator passes the
-policy through is guaranteed structurally, by there being no algorithm-less
-strided-SpMM entry point left to call.
+actually executed — the host cannot. The structural guard is that no
+algorithm-less strided-SpMM entry point remains, so a call site can no longer
+*omit* the algorithm and inherit a hidden default. It does not stop a future
+call site passing the heuristic deliberately — that is a review question, not a
+compile error.
 
 The env knob is read once per process (`OnceLock`), so each arm runs in a
 subprocess — the same reason `test_gpu_de_resident.py` does.
@@ -169,8 +176,9 @@ def test_streaming_arm_honours_and_reports_deterministic_spmm(scx_path):
     """The streaming path must both *run* and *report* the requested policy.
 
     Before the fix this arm ran `CUSPARSE_SPMM_ALG_DEFAULT` and still stamped
-    `"deterministic"`. The stamp assertion alone cannot catch that — it was
-    already passing — so the load-bearing half is that the run completes at all:
+    `"deterministic"` (which names ALG2, not a reproducibility guarantee). The
+    stamp assertion alone cannot catch that — it was already passing — so the
+    load-bearing half is that the run completes at all:
     it is the first exercise of `CUSPARSE_SPMM_CSR_ALG2` on this operator, and
     in particular under `CUSPARSE_OPERATION_TRANSPOSE`.
     """

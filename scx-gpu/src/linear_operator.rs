@@ -46,7 +46,8 @@ use crate::sparse_dense::sparse_to_dense_gpu_into_view;
 /// [`Self::rmatmat`]; [`Self::accumulate_gram`] issues no SpMM and is
 /// unaffected. Before this field existed the streaming PCA path hardcoded
 /// `CUSPARSE_SPMM_ALG_DEFAULT` while the resident path honoured the policy, so
-/// a `>VRAM` run reported `spmm_policy="deterministic"` having used atomics.
+/// a `>VRAM` run reported the caller's requested policy having actually used
+/// cuSPARSE's heuristic pick.
 pub struct CenteredSparseOperator<'a> {
     dev: &'a GpuDevice,
     cusparse: &'a CusparseHandle,
@@ -1106,8 +1107,10 @@ mod tests {
     /// This is the path a `>VRAM` PCA takes. Before the policy was threaded in
     /// it hardcoded `CUSPARSE_SPMM_ALG_DEFAULT` while
     /// `uns["scx_accel"]["pca"]["spmm_policy"]` reported whatever the caller
-    /// asked for, so a caller who requested determinism got atomics and was
-    /// told otherwise.
+    /// asked for, so a caller who asked to pin `CUSPARSE_SPMM_CSR_ALG2` got the
+    /// heuristic and was told otherwise. (Note the policy pins an *algorithm*,
+    /// not the bits — cuSPARSE guarantees no reproducibility for the transpose
+    /// multiply this loop issues. See `SpmmAlgPolicy::Deterministic`.)
     ///
     /// Two things are checked, and it is worth being precise about which is
     /// which. The `spmm_alg()` assertion is a real regression guard: it fails
@@ -1117,9 +1120,14 @@ mod tests {
     /// resident loop already relies on but this operator never exercised) and
     /// confirm the two algorithms agree. They would pass even if the operator
     /// ignored the policy entirely; nothing observable from the host reports
-    /// which algorithm cuSPARSE actually ran. What makes the wiring
-    /// unbypassable is structural, not this test: there is no algorithm-less
-    /// strided-SpMM entry point left to call.
+    /// which algorithm cuSPARSE actually ran.
+    ///
+    /// The structural guard is what carries the wiring, and it is narrower than
+    /// "unbypassable": with no algorithm-less strided-SpMM entry point left, a
+    /// call site can no longer *omit* the algorithm and inherit a hidden
+    /// default. It can still pass `CUSPARSE_SPMM_ALG_DEFAULT` deliberately —
+    /// the `cusparse.rs` tests do. The guard is against an invisible default,
+    /// not against a wrong choice.
     #[test]
     #[ignore = "requires a CUDA GPU"]
     fn streaming_operator_honours_the_spmm_policy() {

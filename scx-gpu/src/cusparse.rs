@@ -688,9 +688,15 @@ fn spmm_impl(
 ///
 /// There is deliberately **no** algorithm-less convenience wrapper. One existed
 /// and hardcoded `CUSPARSE_SPMM_ALG_DEFAULT`, which is how the streaming PCA
-/// operator came to ignore a caller's `spmm_policy="deterministic"` while the
-/// route metadata still reported it. Naming the algorithm is now the only way
-/// to issue a strided SpMM, so that divergence cannot reappear silently.
+/// operator came to ignore the caller's requested `spmm_policy` while the route
+/// metadata still reported it.
+///
+/// Precisely what removing it buys, and what it does not: a call site can no
+/// longer *omit* the algorithm and silently inherit a hidden default — the
+/// choice is now a required argument, so it is explicit and greppable. It does
+/// not prevent a future call site from *deliberately* passing
+/// `CUSPARSE_SPMM_ALG_DEFAULT`, which the tests in this file legitimately do.
+/// The guard is against an invisible default, not against a wrong choice.
 #[allow(clippy::too_many_arguments)]
 pub fn spmm_csr_view_with_alg(
     handle: &CusparseHandle,

@@ -200,6 +200,12 @@ pub struct AccelExecutionInfo {
     pub math_mode: Option<&'static str>,
     /// cuSPARSE SpMM algorithm policy for the op, if applicable (Task 2.5):
     /// `"default"` / `"deterministic"` / `"benchmark_once"`. `None` otherwise.
+    ///
+    /// `"deterministic"` names an algorithm (`CUSPARSE_SPMM_CSR_ALG2`), **not**
+    /// a bit-reproducibility guarantee — cuSPARSE gives none for transpose
+    /// operations, which the PCA power loop issues every iteration. See
+    /// `scx_gpu::SpmmAlgPolicy`. `"benchmark_once"` is reserved and currently
+    /// resolves to the same algorithm as `"default"`.
     pub spmm_policy: Option<&'static str>,
     // --- rapids-route / device-handoff metadata ---
     /// rapids-singlecell version, when a rapids route ran (`None` otherwise).

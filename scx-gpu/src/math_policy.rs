@@ -122,7 +122,9 @@ impl SpmmAlgPolicy {
     /// [`SpmmAlgPolicy::BenchmarkOnce`] is not yet implemented and resolves to
     /// the same heuristic algorithm as [`SpmmAlgPolicy::Default`]
     /// (`CUSPARSE_SPMM_ALG_DEFAULT`); when per-shape timing lands it will pick
-    /// between the heuristic and deterministic algorithms here.
+    /// between `CUSPARSE_SPMM_ALG_DEFAULT` and `CUSPARSE_SPMM_CSR_ALG2` here.
+    /// (Naming ALG2 "the deterministic algorithm" would repeat the overclaim
+    /// documented on [`SpmmAlgPolicy::Deterministic`].)
     pub fn to_alg(self) -> csp::cusparseSpMMAlg_t {
         match self {
             SpmmAlgPolicy::Default | SpmmAlgPolicy::BenchmarkOnce => {

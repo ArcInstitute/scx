@@ -2,9 +2,10 @@
 # §8.11 + §8.12 GPU verification driver (sbatch --wrap payload).
 #
 # Chained AFTER the scx-gpu/scx-accel cargo suite job, never concurrent with it:
-# this one runs `maturin develop`, which rewrites the in-tree .so that every
-# venv and conda env resolves to, and would invalidate any concurrent job that
-# imports pyscx (CLAUDE.local.md).
+# this one runs `maturin develop`, which rewrites the in-tree
+# `pyscx/python/pyscx/*.so` that every venv and conda env resolves to through
+# its editable install — so it would invalidate any concurrent job that merely
+# *imports* pyscx, whether or not that job builds anything.
 #
 # Covers the two pytest surfaces the cargo suite cannot reach:
 #   - test_gpu_pca_resident.py         §8.11 resident vs streaming + spmm_policy
@@ -78,7 +79,15 @@ esac
 # artifact from `release/` and maturin dies the same way. Wipe the whole tree.
 # Costs a full rebuild per run, which is the price of a build you can trust.
 export CARGO_TARGET_DIR="${SCX_DIR}/target-gpu-verify"
-rm -rf "${CARGO_TARGET_DIR}"
+# Guarded, for the same reason the `cd` above is: `set -uo pipefail` has no
+# `-e`, so a failed wipe (permissions, a busy NFS artifact) would otherwise fall
+# straight through into `maturin develop` against the stale tree this line
+# exists to remove — reintroducing the failure silently.
+rm -rf "${CARGO_TARGET_DIR}" || {
+    echo "PREFLIGHT FAILED: could not wipe ${CARGO_TARGET_DIR}" >&2; exit 1; }
+if [ -e "${CARGO_TARGET_DIR}" ]; then
+    echo "PREFLIGHT FAILED: ${CARGO_TARGET_DIR} still exists after rm -rf" >&2; exit 1
+fi
 
 echo "=== maturin develop --release --features hdf5,gpu (target: ${CARGO_TARGET_DIR}) ==="
 ( cd pyscx && maturin develop --release --features hdf5,gpu ) || { echo "BUILD FAILED"; exit 1; }
