@@ -86,7 +86,11 @@ pub fn detect_value_encoding_f64(data: &[f64]) -> ValueEncoding {
 /// canonical entry point cited by historical call sites (`pyscx/anndata`,
 /// `scx-cli/convert/dtype`, `scx-mtx/convert`). Returns
 /// `Err(CodecError::Io(InvalidData))` if any value falls outside the
-/// range representable by the requested integer encoding.
+/// range representable by the requested integer encoding — with one
+/// documented exception: under `Uint32`, exactly 2³² is accepted and
+/// saturates to `u32::MAX`, because `u32::MAX as f32` *is* 2³² and the
+/// encoder cannot tell a fresh out-of-range value from the f32 image of a
+/// decoded `u32::MAX`. See [`ValueEncoding::encode_f32`].
 pub fn values_to_raw_bytes(data: &[f32], encoding: ValueEncoding) -> Result<Vec<u8>, CodecError> {
     encoding.encode_f32_batch(data)
 }

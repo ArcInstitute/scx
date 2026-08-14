@@ -1649,8 +1649,11 @@ mod tests {
     /// rounds up), and the rewrite paths re-encode that decoded f32 under the
     /// input's own `Uint32` encoding. So this arm must accept 2³² and saturate
     /// it back to `u32::MAX` — a bound that rejects it aborts compact / merge /
-    /// sort / build_csc on format-valid archives. Fresh out-of-range values are
-    /// kept away from this arm by `detect_value_encoding`, not by this check.
+    /// sort / build_csc on format-valid archives. On the detect path, fresh
+    /// out-of-range values are kept away from this arm by
+    /// `detect_value_encoding` rather than by this check — but callers that
+    /// pass an explicit encoding bypass that, and still saturate; see the
+    /// comment on the arm itself.
     #[test]
     fn encode_f32_uint32_preserves_decoded_u32_max() {
         let decoded_max = u32::MAX as f32;

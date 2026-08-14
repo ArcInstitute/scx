@@ -126,8 +126,10 @@ mod tests {
     /// input's own encoding. An on-disk `u32::MAX` decodes to exactly 2³²
     /// (`u32::MAX as f32` rounds up), so this arm must accept that value and
     /// saturate it back — rejecting it aborts those ops on a format-valid
-    /// archive. `detect_value_encoding` is what keeps fresh out-of-range data
-    /// away from `Uint32` in the first place.
+    /// archive. On the detect path, `detect_value_encoding` is what keeps fresh
+    /// out-of-range data away from `Uint32` in the first place; callers passing
+    /// an explicit encoding bypass it and still saturate (documented on
+    /// `ValueEncoding::encode_f32`).
     #[test]
     fn encode_value_uint32_preserves_decoded_u32_max() {
         let decoded_max = u32::MAX as f32;
