@@ -16,31 +16,37 @@ pub fn encode_value(
 ) -> crate::error::Result<()> {
     match encoding {
         ValueEncoding::Uint8 => {
-            if value < 0.0 || value > u8::MAX as f32 {
+            if !(0.0..=u8::MAX as f32).contains(&value) {
                 return Err(OpsError::ValueOutOfRange {
                     value,
                     encoding: "Uint8",
-                    max: u8::MAX as f32,
+                    max: u8::MAX as f64,
                 });
             }
             buf.push(value as u8);
         }
         ValueEncoding::Uint16 => {
-            if value < 0.0 || value > u16::MAX as f32 {
+            if !(0.0..=u16::MAX as f32).contains(&value) {
                 return Err(OpsError::ValueOutOfRange {
                     value,
                     encoding: "Uint16",
-                    max: u16::MAX as f32,
+                    max: u16::MAX as f64,
                 });
             }
             buf.extend_from_slice(&(value as u16).to_le_bytes());
         }
         ValueEncoding::Uint32 => {
-            if value < 0.0 || value > u32::MAX as f32 {
+            // Exclusive at 2³², which f32 represents exactly. `u32::MAX as f32`
+            // rounds *up* to 2³², so using it as an inclusive bound admits the
+            // very value `as u32` saturates from and writes 4294967295 in its
+            // place — silent corruption on the compact/merge re-encode path.
+            // (255 and 65535 above are exact in f32, so those bounds are fine.)
+            const UINT32_BOUND: f32 = (1u128 << 32) as f32;
+            if !(0.0..UINT32_BOUND).contains(&value) {
                 return Err(OpsError::ValueOutOfRange {
                     value,
                     encoding: "Uint32",
-                    max: u32::MAX as f32,
+                    max: u32::MAX as f64,
                 });
             }
             buf.extend_from_slice(&(value as u32).to_le_bytes());
@@ -80,5 +86,51 @@ pub(crate) fn widest_value_encoding(encs: &[ValueEncoding]) -> ValueEncoding {
         ValueEncoding::Float32
     } else {
         max_int
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NaN is not a value any integer encoding can hold. The range checks are
+    /// written as `!range.contains(&v)` rather than a pair of comparisons
+    /// precisely because `contains` is false for NaN, so all three arms reject
+    /// it instead of writing `value as uN` (which is 0).
+    #[test]
+    fn encode_value_integer_encodings_reject_nan() {
+        for enc in [
+            ValueEncoding::Uint8,
+            ValueEncoding::Uint16,
+            ValueEncoding::Uint32,
+        ] {
+            let mut buf = Vec::new();
+            assert!(
+                matches!(
+                    encode_value(&mut buf, f32::NAN, enc),
+                    Err(OpsError::ValueOutOfRange { .. })
+                ),
+                "NaN accepted by {enc:?}"
+            );
+            assert!(buf.is_empty());
+        }
+    }
+
+    /// The re-encode path used by compact/merge shares the codec's saturation
+    /// hazard: `u32::MAX as f32` rounds up to 2³², so an inclusive bound
+    /// written that way lets 2³² through and `as u32` saturates it to
+    /// 4294967295 on the way to disk.
+    #[test]
+    fn encode_value_uint32_rejects_saturating_value() {
+        let two_pow_32 = (1u128 << 32) as f32;
+        let mut buf = Vec::new();
+        assert!(matches!(
+            encode_value(&mut buf, two_pow_32, ValueEncoding::Uint32),
+            Err(OpsError::ValueOutOfRange { .. })
+        ));
+        assert!(buf.is_empty());
+        // The largest f32 below the bound (2³² - 2⁸) still encodes, exactly.
+        encode_value(&mut buf, 4_294_967_040.0, ValueEncoding::Uint32).unwrap();
+        assert_eq!(buf, 4_294_967_040u32.to_le_bytes());
     }
 }

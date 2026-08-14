@@ -63,11 +63,13 @@ pub enum OpsError {
     #[error("CSR shape mismatch on append: {detail}")]
     ShapeMismatch { detail: String },
 
+    /// `max` is `f64`, not `f32`: `u32::MAX as f32` rounds up to 2³², so an
+    /// `f32` limit field would report a bound one larger than the one enforced.
     #[error("f32 value {value} out of range for {encoding} encoding (max {max})")]
     ValueOutOfRange {
         value: f32,
         encoding: &'static str,
-        max: f32,
+        max: f64,
     },
 
     #[error(transparent)]

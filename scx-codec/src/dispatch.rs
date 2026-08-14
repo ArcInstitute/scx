@@ -156,7 +156,12 @@ impl ValueEncoding {
                 buf.extend_from_slice(&(value as u16).to_le_bytes());
             }
             Self::Uint32 => {
-                if !(0.0..=u32::MAX as f32).contains(&value) {
+                // Exclusive at 2³², which f32 represents exactly. `u32::MAX as
+                // f32` must NOT be used as an inclusive bound: it rounds *up*
+                // to 2³², so it admits the very value `as u32` saturates from
+                // and writes 4294967295 to disk in its place.
+                const UINT32_BOUND: f32 = (1u128 << 32) as f32;
+                if !(0.0..UINT32_BOUND).contains(&value) {
                     return Err(CodecError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("value {value} out of range for uint32"),
@@ -1614,6 +1619,29 @@ mod tests {
             raw_bytes_to_u32(&[5, 0, 0, 0], ValueEncoding::Uint32).unwrap(),
             vec![5]
         );
+    }
+
+    /// The `Uint32` range guard must be exclusive at 2³². `u32::MAX as f32`
+    /// rounds *up* to 2³², so an inclusive bound written that way admits
+    /// exactly the value `as u32` saturates from — silent on-disk corruption
+    /// (2³² would land as 4294967295).
+    #[test]
+    fn encode_f32_uint32_rejects_saturating_value() {
+        let two_pow_32 = (1u128 << 32) as f32;
+        let mut buf = Vec::new();
+        assert!(ValueEncoding::Uint32
+            .encode_f32(&mut buf, two_pow_32)
+            .is_err());
+        assert!(buf.is_empty());
+        // The largest f32 below the bound (2³² - 2⁸) still encodes, exactly.
+        ValueEncoding::Uint32
+            .encode_f32(&mut buf, 4_294_967_040.0f32)
+            .unwrap();
+        assert_eq!(buf, 4_294_967_040u32.to_le_bytes());
+        // Batch encoding shares the same guard.
+        assert!(ValueEncoding::Uint32
+            .encode_f32_batch(&[two_pow_32])
+            .is_err());
     }
 
     /// Build a small CSR matrix for testing.

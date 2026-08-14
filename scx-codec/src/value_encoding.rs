@@ -39,8 +39,14 @@ pub fn detect_value_encoding(data: &[f32]) -> ValueEncoding {
         ValueEncoding::Uint8
     } else if max_val <= u16::MAX as f64 {
         ValueEncoding::Uint16
-    } else {
+    } else if max_val <= u32::MAX as f64 {
         ValueEncoding::Uint32
+    } else {
+        // f32 loses integer *contiguity* above 2²⁴ but still represents values
+        // beyond u32::MAX exactly (2³², 1e10, …), so this bucket is reachable.
+        // Encoding one as Uint32 would either saturate the `as u32` cast and
+        // silently corrupt the value, or hard-fail `encode_f32`'s range check.
+        ValueEncoding::Float32
     }
 }
 
@@ -67,8 +73,9 @@ pub fn detect_value_encoding_f64(data: &[f64]) -> ValueEncoding {
         // f64 can exactly represent integers past u32::MAX (up to 2^53), so an
         // integer-valued f64 > u32::MAX must fall back to float — encoding it as
         // Uint32 would saturate the `f64 as u32` cast and silently corrupt the
-        // value. (The f32 detector can't hit this: f32 loses integer exactness
-        // above 2^24, well below u32::MAX.)
+        // value. The f32 detector has the identical bucket for the identical
+        // reason: losing integer *contiguity* above 2^24 does not stop an f32
+        // from representing 2^32 exactly.
         ValueEncoding::Float32
     }
 }
@@ -155,6 +162,22 @@ mod tests {
         assert_eq!(
             detect_value_encoding_f64(&[1.0, -1.0]),
             ValueEncoding::Float32
+        );
+    }
+
+    #[test]
+    fn detect_f32_falls_back_to_float_above_u32_max() {
+        // f32 loses integer *contiguity* above 2²⁴ but still represents 2³² and
+        // 1e10 exactly, so the f32 detector reaches the same case as its f64
+        // twin. `Uint32` would either saturate the `as u32` cast (2³² → u32::MAX,
+        // silent corruption) or hard-fail the encoder's range check (1e10).
+        let two_pow_32 = (1u128 << 32) as f32;
+        assert_eq!(detect_value_encoding(&[two_pow_32]), ValueEncoding::Float32);
+        assert_eq!(detect_value_encoding(&[1e10f32]), ValueEncoding::Float32);
+        // The largest f32 at or below u32::MAX still picks Uint32.
+        assert_eq!(
+            detect_value_encoding(&[4_294_967_040.0f32]),
+            ValueEncoding::Uint32
         );
     }
 

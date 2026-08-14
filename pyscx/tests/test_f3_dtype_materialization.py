@@ -174,6 +174,58 @@ def test_fractional_into_int_fails_loud(tmp_dir):
         pyscx.open(path).to_anndata(data_dtype="int32")
 
 
+def test_saturating_value_into_int32_fails_loud(tmp_dir):
+    # Rust's `f32 as i32` saturates and `i32::MAX as f32` rounds *up* to 2**31,
+    # so a round-trip check done in f32 could not tell the two apart: the gate
+    # used to return 2147483647 for an input of 2147483648.0.
+    #
+    # Only reachable on a *float-encoded* shard — an all-integer shard decodes
+    # through the u32-source gate, which was always exact — so the -1.0 is
+    # load-bearing: a negative value forces Float32 encoding. It must not be
+    # fractional, or *it* would trip the gate and the test would pass for the
+    # wrong reason; -1.0 narrows to int32 losslessly, so 2**31 is the only
+    # value under test.
+    dense = np.zeros((3, 3), dtype=np.float32)
+    dense[0, 0] = 2147483648.0  # 2**31
+    dense[1, 1] = -1.0
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(3)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(3)]),
+    )
+    path = _write(tmp_dir, adata, "sat.scx")
+
+    with pytest.raises(ValueError, match="lossy"):
+        pyscx.open(path).to_anndata(data_dtype="int32")
+    # allow_lossy still saturates, as documented.
+    rt = pyscx.open(path).to_anndata(data_dtype="int32", allow_lossy=True)
+    assert rt.X.data.dtype == np.int32
+    assert rt.X.toarray()[0, 0] == np.iinfo(np.int32).max
+
+
+def test_integer_value_above_u32_max_survives_round_trip(tmp_dir):
+    # An integer-valued f32 beyond u32::MAX must be stored as Float32. It used
+    # to pick the Uint32 encoding, where 2**32 passed an inclusive
+    # `u32::MAX as f32` range check (that limit rounds up to 2**32) and the
+    # `as u32` cast then saturated it to 4294967295 on disk, while 1e10 hard
+    # failed the same check with "out of range for uint32".
+    dense = np.zeros((3, 3), dtype=np.float32)
+    dense[0, 0] = 4294967296.0  # 2**32
+    dense[1, 1] = 1e10
+    dense[2, 2] = 3.0
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(3)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(3)]),
+    )
+    path = _write(tmp_dir, adata, "above_u32.scx")
+
+    back = pyscx.open(path).to_anndata().X.toarray()
+    assert back[0, 0] == 4294967296.0
+    assert back[1, 1] == 1e10
+    assert back[2, 2] == 3.0
+
+
 def test_bad_container_and_dtype_names(tmp_dir):
     adata = _counts_adata()
     path = _write(tmp_dir, adata)

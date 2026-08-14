@@ -171,9 +171,16 @@ impl CastFromF32 for half::f16 {
     }
 }
 
-/// Signed-integer value target: round-trip through `f32` catches range and
-/// fractional loss (Rust's `f32 as int` saturates, so out-of-range fails the
-/// equality check).
+/// Signed-integer value target: an explicit range guard, then a round-trip
+/// equality check for fractional loss.
+///
+/// The range guard cannot be written as `<$t>::MAX as f32`. Rust's `f32 as int`
+/// *saturates*, and for a target with ≥24 significant bits `<$t>::MAX as f32`
+/// rounds **up** to `2^(B-1)` — precisely the value the cast saturates from —
+/// so the two alias and a round-trip check performed in `f32` cannot tell a
+/// saturated result from an exact one (`i32`, `i64`). Bound against the true
+/// exclusive limit instead: `[-2^(B-1), 2^(B-1))`, both powers of two and
+/// therefore exact in `f32` at every width.
 macro_rules! impl_cast_from_f32_signed_int {
     ($t:ty, $name:literal) => {
         impl CastFromF32 for $t {
@@ -183,9 +190,15 @@ macro_rules! impl_cast_from_f32_signed_int {
                 v as $t
             }
             fn cast_lossless(v: f32) -> Option<Self> {
-                if !v.is_finite() {
+                // `const`, not `let`: a `u128 as f32` conversion is a
+                // compiler-rt call that an unoptimized build would otherwise
+                // emit per element in this hot loop.
+                const BOUND: f32 = (1u128 << (<$t>::BITS - 1)) as f32;
+                if !v.is_finite() || !(-BOUND..BOUND).contains(&v) {
                     return None;
                 }
+                // In range, so the cast below cannot saturate: the round-trip
+                // is purely a fractional-loss check.
                 let t = v as $t;
                 if t as f32 == v {
                     Some(t)
@@ -197,8 +210,9 @@ macro_rules! impl_cast_from_f32_signed_int {
     };
 }
 
-/// Unsigned-integer value target: explicit sign-loss guard (negative → unsigned)
-/// plus the round-trip equality check.
+/// Unsigned-integer value target: a sign-loss guard (negative → unsigned) and
+/// the same exact-in-`f32` exclusive upper bound as the signed macro (`2^B`
+/// here), then the round-trip fractional check.
 macro_rules! impl_cast_from_f32_unsigned_int {
     ($t:ty, $name:literal) => {
         impl CastFromF32 for $t {
@@ -208,7 +222,8 @@ macro_rules! impl_cast_from_f32_unsigned_int {
                 v as $t
             }
             fn cast_lossless(v: f32) -> Option<Self> {
-                if !v.is_finite() || v < 0.0 {
+                const BOUND: f32 = (1u128 << <$t>::BITS) as f32;
+                if !v.is_finite() || !(0.0..BOUND).contains(&v) {
                     return None;
                 }
                 let t = v as $t;
@@ -559,6 +574,86 @@ mod tests {
     fn fractional_into_int_fails_loud() {
         let v = vec![1.5f32];
         assert!(checked_cast_values::<i32>(&v, false).is_err());
+    }
+
+    #[test]
+    fn f32_saturation_alias_rejected() {
+        // Rust's `f32 as int` saturates, and for a target with >= 24
+        // significant bits `T::MAX as f32` rounds *up* to `T::MAX + 1` — so a
+        // round-trip check performed in f32 cannot tell a saturated result from
+        // an exact one. Each of these must fail loud, not return `T::MAX`.
+        let two_pow_31 = (1u128 << 31) as f32;
+        let two_pow_32 = (1u128 << 32) as f32;
+        let two_pow_63 = (1u128 << 63) as f32;
+        assert!(checked_cast_values::<i32>(&[two_pow_31], false).is_err());
+        assert!(checked_cast_values::<u32>(&[two_pow_32], false).is_err());
+        assert!(checked_cast_values::<i64>(&[two_pow_63], false).is_err());
+        // Narrow targets were never affected; keep them covered so a future
+        // rewrite cannot regress them.
+        assert!(checked_cast_values::<i8>(&[128.0f32], false).is_err());
+        assert!(checked_cast_values::<i16>(&[32768.0f32], false).is_err());
+        assert!(checked_cast_values::<u8>(&[256.0f32], false).is_err());
+        assert!(checked_cast_values::<u16>(&[65536.0f32], false).is_err());
+        // Past the negative bound (-2^31 - 2^8, the f32 below i32::MIN).
+        assert!(checked_cast_values::<i32>(&[-2147483904.0f32], false).is_err());
+        // `allow_lossy` still saturates without error (documented escape hatch).
+        let out: Vec<i32> = checked_cast_values(&[two_pow_31], true).unwrap();
+        assert_eq!(out, vec![i32::MAX]);
+    }
+
+    #[test]
+    fn f32_largest_representable_still_accepted() {
+        // The saturation guard must not over-reject: the largest f32 strictly
+        // below each target's exclusive bound is exact and in range, and each
+        // MIN is a power of two so the lower bound is inclusive.
+        assert_eq!(
+            checked_cast_values::<i8>(&[127.0, -128.0], false).unwrap(),
+            vec![127i8, -128]
+        );
+        assert_eq!(
+            checked_cast_values::<i16>(&[32767.0, -32768.0], false).unwrap(),
+            vec![32767i16, -32768]
+        );
+        assert_eq!(
+            checked_cast_values::<u8>(&[255.0], false).unwrap(),
+            vec![255u8]
+        );
+        assert_eq!(
+            checked_cast_values::<u16>(&[65535.0], false).unwrap(),
+            vec![65535u16]
+        );
+        // 2^31 - 2^7 and 2^32 - 2^8: the f32s immediately below the bounds.
+        assert_eq!(
+            checked_cast_values::<i32>(&[2147483520.0f32], false).unwrap(),
+            vec![2147483520i32]
+        );
+        assert_eq!(
+            checked_cast_values::<u32>(&[4294967040.0f32], false).unwrap(),
+            vec![4294967040u32]
+        );
+        // 2^63 - 2^39 (f32 spacing at that magnitude is 2^39).
+        let i64_top = ((1u128 << 63) - (1u128 << 39)) as f32;
+        assert_eq!(
+            checked_cast_values::<i64>(&[i64_top], false).unwrap(),
+            vec![9223371487098961920i64]
+        );
+        // i64::MIN is exactly -2^63 and the lower bound is inclusive.
+        let i64_min = -((1u128 << 63) as f32);
+        assert_eq!(
+            checked_cast_values::<i64>(&[i64_min], false).unwrap(),
+            vec![i64::MIN]
+        );
+    }
+
+    #[test]
+    fn f32_into_rejects_saturation_alias() {
+        // The in-assembly narrow reader reaches these impls through
+        // `checked_cast_f32_into`, not `checked_cast_values`.
+        let mut dst = [0i32; 1];
+        assert!(checked_cast_f32_into(&[(1u128 << 31) as f32], &mut dst, false).is_err());
+        let mut ok = [0i32; 1];
+        checked_cast_f32_into(&[2147483520.0f32], &mut ok, false).unwrap();
+        assert_eq!(ok, [2147483520i32]);
     }
 
     #[test]
