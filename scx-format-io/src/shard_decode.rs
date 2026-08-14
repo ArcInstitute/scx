@@ -772,6 +772,83 @@ mod tests {
         );
     }
 
+    /// The shared codec seam must reject a shard whose decoded arrays do not
+    /// agree with each other.
+    ///
+    /// `decode_shard_regions_scipy` is the seam every non-mmap consumer uses —
+    /// including the scx-gpu host bounce — and it validated only the *minor
+    /// axis bound* on the decoded indices, never a length. The whole-file read
+    /// (`ScxReader::assemble_shards`) does check lengths, which is why this
+    /// went unnoticed: the defect was only reachable through the callers that
+    /// skip it.
+    ///
+    /// The shard here is self-consistent everywhere a single sub-stream
+    /// decoder can see — FOR-BP holds 3 indices, Rice holds 3 values, the
+    /// header declares `nnz = 3` — but its indptr says the one row ends at 2.
+    /// A structurally invalid CSR: `ScxCsr::new_unchecked` only `debug_assert`s
+    /// the difference, so in release `csr_to_csc` would walk off the end of
+    /// `indices`.
+    #[test]
+    fn decode_shard_regions_rejects_indptr_disagreeing_with_nnz() {
+        use scx_codec::delta_golomb::delta_golomb_encode;
+        use scx_codec::forbp::forbp_encode;
+        use scx_codec::rice::{rice_encode, B_VAL};
+
+        let indptr_bytes = delta_golomb_encode(&[0, 2]).unwrap();
+        let indices_bytes = forbp_encode(&[1, 2, 3], &[3], false).unwrap();
+        let values_bytes = rice_encode(&[1, 1, 1], B_VAL).unwrap();
+
+        let header = ShardHeader {
+            magic: SHARD_MAGIC,
+            shard_format_version: 1, // legacy whole-shard, not framed
+            shard_type: 0,
+            codec_id: 1,       // Scx1
+            value_encoding: 2, // Uint32
+            index_dtype: 1,    // u32
+            reserved_flags: [0u8; 3],
+            n_major: 1,
+            n_minor: 100,
+            nnz: 3,
+            global_offset: 0,
+            indptr_rel_offset: SHARD_HEADER_SIZE as u32,
+            indptr_length: indptr_bytes.len() as u32,
+            indices_rel_offset: SHARD_HEADER_SIZE as u32,
+            indices_length: indices_bytes.len() as u32,
+            values_rel_offset: SHARD_HEADER_SIZE as u32,
+            values_length: values_bytes.len() as u32,
+            block_index_rel_offset: SHARD_HEADER_SIZE as u32,
+            block_index_length: 0,
+            checksum: [0u8; 8],
+        };
+
+        let err =
+            decode_shard_regions_scipy(&header, &indptr_bytes, &indices_bytes, &values_bytes, &[])
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("indptr ends at"),
+            "expected a shape MalformedInput, got {err:?}"
+        );
+
+        // The native twin decodes through its own Scx1 short-circuit, so it
+        // needs its own assertion rather than riding on the scipy one.
+        match decode_shard_regions_native(
+            &header,
+            &indptr_bytes,
+            &indices_bytes,
+            &values_bytes,
+            &[],
+        ) {
+            Err(other) => assert!(
+                other.to_string().contains("indptr ends at"),
+                "expected a shape MalformedInput, got {other:?}"
+            ),
+            Ok((indptr, indices, _)) => panic!(
+                "accepted a malformed shard: indptr={indptr:?}, indices.len()={}",
+                indices.len()
+            ),
+        }
+    }
+
     /// A framed shard with zero rows — writable before the encoder learned to
     /// refuse it, and unreadable on *every* path, because framing emits an empty
     /// block index and `resolve_block_index` rejected it outright.

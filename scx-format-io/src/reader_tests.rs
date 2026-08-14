@@ -1004,31 +1004,42 @@ fn test_validate_detects_corruption() {
     ));
 }
 
-/// Regression guard for Phase 2A: verified path catches corruption,
-/// unchecked path (default) does not error on corrupted shard payload.
+/// Regression guard for Phase 2A: the verified path checks the shard checksum,
+/// the unchecked path (default) does not.
+///
+/// The tamper here is the **stored checksum itself**, not the payload. That is
+/// deliberate, and it is what isolates the property under test: with the payload
+/// untouched, the shard still decodes to a structurally valid CSR, so the only
+/// thing that can distinguish the two paths is whether they compare the
+/// checksum. This test used to flip a payload byte and assert the unchecked read
+/// returned `Ok` — which stopped being true once the codec gained a post-decode
+/// CSR shape gate, because the flipped byte was in the *indptr* sub-stream and
+/// the decoded indptr no longer ended at the declared `nnz`. That was the shape
+/// gate working, but it left this test asserting the wrong thing: it would have
+/// passed just as well if the unchecked path had started verifying checksums.
+/// The payload-corruption case is covered below by its own test.
 #[test]
 fn test_verified_vs_unchecked_shard_read() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_test_file(&dir, "verify_guard.scx", 6, 10, 2, false);
 
-    // Read the file, corrupt a byte in a shard payload, write back
     let mut data = std::fs::read(&path).unwrap();
     let reader = ScxReader::open(&path).unwrap();
     let shards = reader.catalog().shards_sorted();
     assert!(!shards.is_empty());
     let shard_entry = shards[0].clone();
     let shard_offset = shard_entry.offset as usize;
-    let corrupt_pos = shard_offset + SHARD_HEADER_SIZE + 1;
     drop(reader);
 
-    data[corrupt_pos] ^= 0xFF;
+    // The checksum is the last field of the shard header, and it covers only
+    // the payload that follows — so corrupting it leaves every decode input
+    // byte-identical.
+    let checksum_pos = shard_offset + SHARD_HEADER_SIZE - 8;
+    data[checksum_pos] ^= 0xFF;
     std::fs::write(&path, &data).unwrap();
 
-    // Re-open (catalog checksum is still intact since we only corrupted
-    // shard payload bytes, not the catalog region)
     let reader = ScxReader::open(&path).unwrap();
 
-    // Verified path should detect the corruption
     let verified_result = reader.read_shard_from_entry_verified(&shard_entry);
     assert!(verified_result.is_err());
     assert!(matches!(
@@ -1036,9 +1047,46 @@ fn test_verified_vs_unchecked_shard_read() {
         ScxError::ChecksumMismatch { .. }
     ));
 
-    // Unchecked path (default) should not error — it skips the checksum
+    // Unchecked path skips the comparison, so identical bytes read fine.
     let unchecked_result = reader.read_shard_from_entry(&shard_entry);
-    assert!(unchecked_result.is_ok());
+    assert!(
+        unchecked_result.is_ok(),
+        "unchecked read failed on an intact payload: {:?}",
+        unchecked_result.err()
+    );
+}
+
+/// Corruption inside the indptr sub-stream is caught even with checksums off.
+///
+/// The unchecked read path is the default one, and it is what the ML loader,
+/// the query engine and the GPU host bounce all use. Before the codec enforced
+/// the CSR shape after decode, a flipped indptr byte produced a structurally
+/// invalid CSR that was returned as `Ok` — `indptr.last()` no longer equalled
+/// the declared `nnz`, and `ScxCsr::new_unchecked` only `debug_assert`s that,
+/// so a release build would index past the end of `indices` downstream.
+#[test]
+fn test_unchecked_read_still_rejects_a_structurally_broken_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "shape_guard.scx", 6, 10, 2, false);
+
+    let mut data = std::fs::read(&path).unwrap();
+    let reader = ScxReader::open(&path).unwrap();
+    let shard_entry = reader.catalog().shards_sorted()[0].clone();
+    let shard_offset = shard_entry.offset as usize;
+    drop(reader);
+
+    // Second byte of the indptr sub-stream, which starts right after the header.
+    data[shard_offset + SHARD_HEADER_SIZE + 1] ^= 0xFF;
+    std::fs::write(&path, &data).unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    let err = reader
+        .read_shard_from_entry(&shard_entry)
+        .expect_err("a corrupt indptr must not decode to an Ok CSR");
+    assert!(
+        !matches!(err, ScxError::ChecksumMismatch { .. }),
+        "the unchecked path must not be verifying checksums; got {err:?}"
+    );
 }
 
 // -----------------------------------------------------------------------

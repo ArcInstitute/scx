@@ -23,7 +23,9 @@ use scx_format_io::shard::{ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION};
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
-use crate::shard_decode::{decode_shard_gpu_with_stats, DeviceDecodeStats, GpuCsr};
+use crate::shard_decode::{
+    check_device_len, decode_shard_gpu_with_stats, DeviceDecodeStats, GpuCsr,
+};
 
 /// Decode all CSR shards of a modality straight onto the device and concatenate
 /// them (in the order given, row-stacked) into a single [`GpuCsr`].
@@ -124,8 +126,12 @@ pub fn decode_csr_shards_to_device_with_stats(
         let (rows, nnz) = per_shard[i];
         let (shard, shard_stats) = decode_shard_gpu_with_stats(dev, bytes)?;
         stats.merge(&shard_stats);
-        debug_assert_eq!(shard.shape.0, rows);
-        debug_assert_eq!(shard.indices.len(), nnz);
+        // Catalog stats vs. what the shard actually decoded to. Returned
+        // errors, not `debug_assert`s: these bound the `slice_mut` extents used
+        // by the `memcpy_dtod` calls below, so a stat-drifted or corrupt shard
+        // would otherwise reach a mismatched-extent copy in release.
+        check_device_len(shard.shape.0, rows, &format!("shard {i} rows"))?;
+        check_device_len(shard.indices.len(), nnz, &format!("shard {i} indices"))?;
 
         if nnz > 0 {
             // memcpy_dtod into the [nnz_base, nnz_base + nnz) sub-range — the
@@ -144,7 +150,7 @@ pub fn decode_csr_shards_to_device_with_stats(
         // array, offset by the running nnz base. The small indptr is the only
         // array that round-trips to the host.
         let shard_indptr = dev.dtoh_copy(&shard.indptr)?;
-        debug_assert_eq!(shard_indptr.len(), rows + 1);
+        check_device_len(shard_indptr.len(), rows + 1, &format!("shard {i} indptr"))?;
         for &v in &shard_indptr[1..=rows] {
             combined_indptr.push(nnz_base as i64 + v);
         }
@@ -152,8 +158,12 @@ pub fn decode_csr_shards_to_device_with_stats(
         nnz_base += nnz;
         // `shard` (its device buffers) is dropped here, before the next shard.
     }
-    debug_assert_eq!(nnz_base, total_nnz);
-    debug_assert_eq!(combined_indptr.len(), total_rows + 1);
+    check_device_len(nnz_base, total_nnz, "assembled CSR nnz")?;
+    check_device_len(
+        combined_indptr.len(),
+        total_rows + 1,
+        "assembled CSR indptr",
+    )?;
 
     let combined_indptr = dev.htod_copy(&combined_indptr)?;
 

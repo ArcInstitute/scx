@@ -363,7 +363,7 @@ pub fn decode_shard_ref(
     nnz: usize,
     index_dtype_u16: bool,
 ) -> Result<DecodedShard, CodecError> {
-    match codec_id {
+    let decoded = match codec_id {
         CodecId::None => decode_none_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
         CodecId::Scx1 => decode_scx1_ref(encoded, value_encoding, n_rows, nnz, index_dtype_u16),
         CodecId::Zstd => decode_zstd_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
@@ -374,7 +374,23 @@ pub fn decode_shard_ref(
         CodecId::ShufDeltaZstd => {
             decode_shufdelta_zstd_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16)
         }
+    }?;
+    // Single structural gate for every codec, and for every row group, since
+    // `decode_row_group` funnels through here. Values are still raw bytes at
+    // this point, so they get their own byte-exact check — dividing by the
+    // element width would round a ragged length down to a passing element
+    // count. Several arms already check this; those become belt-and-braces.
+    let (indptr, indices, values) = &decoded;
+    let expected_value_bytes = checked_len(nnz, value_encoding.byte_width(), "values")?;
+    if values.len() != expected_value_bytes {
+        return Err(CodecError::MalformedInput(format!(
+            "shard decoded {} value bytes != declared nnz {nnz} * {} bytes/element",
+            values.len(),
+            value_encoding.byte_width()
+        )));
     }
+    check_decoded_shape(indptr, indices.len(), nnz, n_rows, nnz)?;
+    Ok(decoded)
 }
 
 /// Scipy-compatible decoded shard: `(indptr_i64, indices_i32, data_f32)`.
@@ -417,15 +433,27 @@ pub fn decode_shard_scipy(
 
         // indptr: delta_golomb → Vec<u64> → Vec<i64>
         let indptr_u64 = delta_golomb_decode(encoded.indptr_bytes, n_rows_p1)?;
-        let indptr = u64_vec_to_i64(indptr_u64)?;
 
         // indices: forbp → Vec<u32> → Vec<i32>
         let (indices_u32, _) =
             forbp_decode_with_hint(encoded.indices_bytes, n_rows, nnz, index_dtype_u16)?;
-        let indices = u32_vec_to_i32_bounded(indices_u32, index_bound)?;
 
         // values: rice → Vec<u32> → Vec<f32> directly (skip raw bytes intermediate)
         let values_u32 = rice_decode(encoded.values_bytes, nnz, B_VAL)?;
+
+        // This path short-circuits Scx1 and never reaches `decode_shard_ref`,
+        // so it needs its own structural gate. Check before the conversions —
+        // `u64_vec_to_i64` consumes the indptr.
+        check_decoded_shape(
+            &indptr_u64,
+            indices_u32.len(),
+            values_u32.len(),
+            n_rows,
+            nnz,
+        )?;
+
+        let indptr = u64_vec_to_i64(indptr_u64)?;
+        let indices = u32_vec_to_i32_bounded(indices_u32, index_bound)?;
         let data: Vec<f32> = values_u32.into_iter().map(|v| v as f32).collect();
 
         return Ok((indptr, indices, data));
@@ -514,10 +542,15 @@ pub fn decode_shard_native(
         bound_capacity(nnz, encoded.values_bytes.len(), "scx1 values")?;
 
         let indptr_u64 = delta_golomb_decode(encoded.indptr_bytes, n_rows_p1)?;
-        let indptr = u64_vec_to_i64(indptr_u64)?;
         let (indices, _) =
             forbp_decode_with_hint(encoded.indices_bytes, n_rows, nnz, index_dtype_u16)?;
         let values_u32 = rice_decode(encoded.values_bytes, nnz, B_VAL)?;
+
+        // Own structural gate: like the scipy twin, this arm short-circuits
+        // Scx1 and never reaches `decode_shard_ref`.
+        check_decoded_shape(&indptr_u64, indices.len(), values_u32.len(), n_rows, nnz)?;
+
+        let indptr = u64_vec_to_i64(indptr_u64)?;
         return Ok((indptr, indices, ShardValuesNative::U32(values_u32)));
     }
 
@@ -644,17 +677,19 @@ pub fn decode_row_group(
         indices_bytes: ix,
         values_bytes: vv,
     };
-    let decoded = decode_shard_ref(&enc, codec_id, value_encoding, n_rows, nnz, index_dtype_u16)?;
-    // The framed wire invariant: each group decodes to a local CSR.
-    if decoded.0.first() != Some(&0) || decoded.0.last() != Some(&(nnz as u64)) {
-        return Err(CodecError::MalformedInput(format!(
-            "row-group indptr not local-rebased (first={:?}, last={:?}, nnz={})",
-            decoded.0.first(),
-            decoded.0.last(),
-            nnz
-        )));
-    }
-    Ok(decoded)
+    // `decode_shard_ref` applies the full shape gate, which subsumes the
+    // framed wire invariant this used to check by hand ("each group decodes to
+    // a local CSR": `indptr[0] == 0`, `indptr.last() == nnz`) and adds the
+    // index/value lengths it did not check. Re-label the message so a framed
+    // shard still says which group failed.
+    decode_shard_ref(&enc, codec_id, value_encoding, n_rows, nnz, index_dtype_u16).map_err(|e| {
+        match e {
+            CodecError::MalformedInput(msg) => {
+                CodecError::MalformedInput(format!("row-group at row {}: {msg}", span.row_start))
+            }
+            other => other,
+        }
+    })
 }
 
 /// Decode **only** a row-group's local indptr (F-b). Mirrors [`decode_row_group`]
@@ -1331,6 +1366,77 @@ pub(crate) fn bound_capacity(
         }
     }
     Ok(declared)
+}
+
+/// Post-decode structural check: assert the three decoded arrays actually are
+/// the CSR the shard header declared.
+///
+/// Every other guard in this module is a *pre*-decode plausibility bound on
+/// byte lengths. This one runs after, and it is needed because a shard's three
+/// sub-streams are decoded independently: `delta_golomb_decode` and
+/// `rice_decode` return exactly the count the caller asked for, while
+/// `forbp_decode_with_hint` used to return whatever its own per-row nnz varints
+/// said. So a corrupt Scx1 shard could decode to `indptr = [0, 6]` with three
+/// indices and six values — a structurally invalid CSR, returned as `Ok`.
+///
+/// Downstream that is not benign. `ScxCsr::new_unchecked` restates these
+/// invariants as a caller obligation and only `debug_assert`s them, so in a
+/// release build `scx_sparse::transpose::csr_to_csc` walks
+/// `indptr[row]..indptr[row + 1]` and indexes past the end of `indices` —
+/// a panic on malformed input, which the reader convention forbids.
+///
+/// Mirrors invariants 1–4 and 6 of `ScxCsr::new_unchecked`. Invariant 5 (every
+/// index below the minor-axis extent) is enforced separately, by
+/// `u32_vec_to_i32_bounded` here and `check_minor_indices` in `scx-format-io`,
+/// because it needs `n_minor`, which the codec layer is not given.
+///
+/// `values_len` is an element count, not a byte count.
+fn check_decoded_shape(
+    indptr: &[u64],
+    indices_len: usize,
+    values_len: usize,
+    n_rows: usize,
+    nnz: usize,
+) -> Result<(), CodecError> {
+    let expected_indptr_len = n_rows
+        .checked_add(1)
+        .ok_or_else(|| CodecError::MalformedInput(format!("CSR n_rows+1 overflow: {n_rows}")))?;
+    if indptr.len() != expected_indptr_len {
+        return Err(CodecError::MalformedInput(format!(
+            "decoded CSR indptr length {} != n_rows + 1 ({expected_indptr_len})",
+            indptr.len()
+        )));
+    }
+    if indptr.first() != Some(&0) {
+        return Err(CodecError::MalformedInput(format!(
+            "decoded CSR indptr must start at 0, got {:?}",
+            indptr.first()
+        )));
+    }
+    if let Some(row) = indptr.windows(2).position(|w| w[0] > w[1]) {
+        return Err(CodecError::MalformedInput(format!(
+            "decoded CSR indptr not monotone at row {row}: {} > {}",
+            indptr[row],
+            indptr[row + 1]
+        )));
+    }
+    if indptr.last() != Some(&(nnz as u64)) {
+        return Err(CodecError::MalformedInput(format!(
+            "decoded CSR indptr ends at {:?} != declared nnz {nnz}",
+            indptr.last()
+        )));
+    }
+    if indices_len != nnz {
+        return Err(CodecError::MalformedInput(format!(
+            "decoded CSR has {indices_len} indices != declared nnz {nnz}"
+        )));
+    }
+    if values_len != nnz {
+        return Err(CodecError::MalformedInput(format!(
+            "decoded CSR has {values_len} values != declared nnz {nnz}"
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
