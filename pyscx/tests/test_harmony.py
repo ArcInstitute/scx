@@ -162,6 +162,33 @@ class TestHarmonyDevice:
         assert route["route"] == "cpu_dense"
         assert route["fallback_reason"] == "user_forced_cpu"
 
+    def test_graph_replay_is_none_on_cpu(self, harmony_adata):
+        """§8.12: the CPU route must report no CUDA-graph decision.
+
+        Scope warning, because it is easy to over-read: this assertion
+        **passes without the §8.12 fix** — the pre-fix stamp left every
+        optional field None, so `graph_replay` was already None here. It is
+        checked and stated rather than implied. What it guards is the Python
+        surface: that the key still reaches `uns`, and that CPU never reports
+        a `False` (which would claim a capture was attempted and did not
+        replay — a different and untrue statement).
+
+        The assertions that actually distinguish fixed from unfixed are in
+        Rust: `test_cpu_harmony_reports_no_graph_decision` (the field exists at
+        all) and `test_gpu_harmony_reports_graph_replay` (`Some(True)` under
+        capture, `Some(False)` under the kill switch), the latter running only
+        on the Chimera GPU suite.
+        """
+        import pyscx
+
+        adata = harmony_adata
+        pyscx.accel.harmony_integrate(
+            adata, "batch", device="cpu", max_iter=2, random_state=0
+        )
+        route = adata.uns["scx_accel"]["harmony_integrate"]
+        assert "graph_replay" in route
+        assert route["graph_replay"] is None
+
 
 class TestHarmonyErrors:
     """Informative error surface for common misuse."""

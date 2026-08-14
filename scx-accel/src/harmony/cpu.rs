@@ -105,6 +105,15 @@ pub struct HarmonyResult {
     pub n_iterations: usize,
     /// Whether the algorithm converged.
     pub converged: bool,
+    /// Whether the GPU k-means sub-iter loop replayed a captured CUDA graph.
+    ///
+    /// `None` on the CPU path, which has no capture decision to make.
+    /// `Some(true)` when capture succeeded and every later sub-iter replayed
+    /// the graph; `Some(false)` when capture failed, produced no graph, or
+    /// `SCX_DISABLE_CUDA_GRAPHS=1` turned it off — in which case the kernels
+    /// ran directly. The numbers are the same either way; the throughput is
+    /// not, which is why a failure is recorded rather than swallowed.
+    pub graph_replay: Option<bool>,
 }
 
 /// Batch covariate specification.
@@ -1531,6 +1540,7 @@ impl HarmonyState {
             objective_harmony: std::mem::take(&mut self.objective_harmony),
             n_iterations: iters_used,
             converged,
+            graph_replay: None,
         })
     }
 }

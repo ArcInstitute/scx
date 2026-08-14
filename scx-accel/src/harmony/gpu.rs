@@ -486,6 +486,14 @@ pub fn harmony_integrate_gpu(
     // allocated/computed above and remain stable for the rest of
     // the function — the only inter-sub-iter change is d_order's
     // contents, which the captured graph reads by pointer.
+    // NOTE: `SCX_DISABLE_CUDA_GRAPHS=1` (via `cuda_graphs_enabled`) selects
+    // **two** things here, not one: no capture, *and* the device's own stream
+    // instead of the per-thread stream — see the `graphs_enabled` forks at the
+    // order upload, the direct-dispatch `active_dev`, and the per-sub-iter
+    // sync below. A run with the switch set is therefore not an isolated
+    // "graph vs no graph" A/B; it is "graph on PTS vs no graph on the default
+    // stream". The same shape exists in `diffexp/gpu.rs`, where there is no
+    // capture at all and the variable is purely a stream selector.
     let graphs_enabled = cuda_graphs_enabled();
     let pts: Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
     let dev_pts = dev.with_stream(pts.clone());
@@ -503,6 +511,10 @@ pub fn harmony_integrate_gpu(
     // again for this call" contract that the hoisted layout would
     // otherwise quietly violate.
     let mut capture_failed = false;
+    // Whether a captured graph was ever replayed on this call. Stays false
+    // under the kill switch and on any capture failure, and is what
+    // `HarmonyResult::graph_replay` reports.
+    let mut graph_replayed = false;
 
     for iter in 0..state.config.max_iter {
         iters_used = iter + 1;
@@ -676,47 +688,73 @@ pub fn harmony_integrate_gpu(
                     )
                     .map_err(|e| scx_gpu::GpuError::CudaError(format!("{e}")))
                 });
-                match capture_result {
-                    Ok(Some(g)) => {
-                        // Capture succeeded — actually run the
-                        // work via the captured graph and stash
-                        // for subsequent replays.
-                        g.launch().map_err(|e| {
-                            AccelError::LinAlg(format!("harmony sub-iter first graph.launch: {e}"))
-                        })?;
-                        sub_graph = Some(g);
+                // Both failure shapes used to share one `_ =>` arm that
+                // bound nothing, so the `GpuError` was discarded and a
+                // run which captured nothing — and therefore re-ran
+                // every remaining sub-iter directly, a multi-×
+                // slowdown — looked exactly like one that replayed a
+                // graph. Name the cause in the log, and let
+                // `graph_replayed` carry the outcome out to
+                // `uns["scx_accel"]["harmony_integrate"]["graph_replay"]`.
+                let captured = match capture_result {
+                    Ok(Some(g)) => Some(g),
+                    // `end_capture` returned no graph: nothing was
+                    // recorded in the capture region.
+                    Ok(None) => {
+                        log::warn!(
+                            "harmony: k-means sub-iter CUDA-graph capture produced no graph; \
+                             running the kernels directly for the rest of this call (results \
+                             are unaffected, throughput is not)"
+                        );
+                        None
                     }
-                    _ => {
-                        // Capture failed or returned no graph —
-                        // fall back to direct run for THIS
-                        // sub-iter and don't try capture again
-                        // for this call. The `capture_failed`
-                        // flag pushes every later sub-iter through
-                        // the direct path above.
-                        capture_failed = true;
-                        run_kmeans_subiter_kernels(
-                            &dev_pts,
-                            &d_order,
-                            &mut d_block_cells,
-                            &mut d_r,
-                            &mut d_o,
-                            &mut d_e,
-                            &d_dist,
-                            &d_sigma,
-                            &d_theta,
-                            &d_labels,
-                            &d_cov_offset,
-                            &d_pr_b,
-                            &mut d_obj_cell,
-                            &mut d_cross_kgb,
-                            n,
-                            k,
-                            b,
-                            c_count,
-                            n_blocks,
-                            block_len,
-                        )?;
+                    Err(e) => {
+                        log::warn!(
+                            "harmony: k-means sub-iter CUDA-graph capture failed ({e}); \
+                             running the kernels directly for the rest of this call (results \
+                             are unaffected, throughput is not)"
+                        );
+                        None
                     }
+                };
+
+                if let Some(g) = captured {
+                    // Capture succeeded — actually run the work via
+                    // the captured graph and stash it for subsequent
+                    // replays.
+                    g.launch().map_err(|e| {
+                        AccelError::LinAlg(format!("harmony sub-iter first graph.launch: {e}"))
+                    })?;
+                    sub_graph = Some(g);
+                    graph_replayed = true;
+                } else {
+                    // Fall back to a direct run for THIS sub-iter and
+                    // don't try capture again for this call. The
+                    // `capture_failed` flag pushes every later sub-iter
+                    // through the direct path above.
+                    capture_failed = true;
+                    run_kmeans_subiter_kernels(
+                        &dev_pts,
+                        &d_order,
+                        &mut d_block_cells,
+                        &mut d_r,
+                        &mut d_o,
+                        &mut d_e,
+                        &d_dist,
+                        &d_sigma,
+                        &d_theta,
+                        &d_labels,
+                        &d_cov_offset,
+                        &d_pr_b,
+                        &mut d_obj_cell,
+                        &mut d_cross_kgb,
+                        n,
+                        k,
+                        b,
+                        c_count,
+                        n_blocks,
+                        block_len,
+                    )?;
                 }
             }
 
@@ -1026,5 +1064,6 @@ pub fn harmony_integrate_gpu(
         objective_harmony: std::mem::take(&mut state.objective_harmony),
         n_iterations: iters_used,
         converged,
+        graph_replay: Some(graph_replayed),
     })
 }

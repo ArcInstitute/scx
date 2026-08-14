@@ -6,14 +6,24 @@
 //! Numerics under [`GpuMathMode::AllowTf32`] are validated by subspace/variance
 //! agreement, **not** bitwise (TF32 truncates the SpMM/GEMM mantissa).
 //!
-//! ## Why a deterministic SpMM algorithm matters for graph capture
+//! ## Why a deterministic SpMM algorithm is on offer
 //!
 //! `CUSPARSE_SPMM_ALG_DEFAULT` heuristically picks an algorithm that may use
-//! atomics (run-to-run nondeterministic) and may size its workspace
-//! differently across shapes. CUDA-graph capture bakes in buffer pointers and
-//! forbids allocations inside the captured region, so the captured PCA SpMM
-//! segments force [`SpmmAlgPolicy::Deterministic`] (`CUSPARSE_SPMM_CSR_ALG2`,
-//! the no-atomics CSR algorithm) regardless of the requested policy.
+//! atomics, so the same input can produce different last-place bits run to run.
+//! [`SpmmAlgPolicy::Deterministic`] (`CUSPARSE_SPMM_CSR_ALG2`, the no-atomics
+//! CSR algorithm) trades some throughput for a bit-reproducible power loop.
+//!
+//! The policy reaches **both** PCA power loops — the device-resident one and
+//! the streaming operator used when the matrix exceeds VRAM. That symmetry is
+//! load-bearing rather than incidental: `uns["scx_accel"]["pca"]["spmm_policy"]`
+//! is stamped from the caller's request, and residency is decided dynamically
+//! against free VRAM, so a policy honoured on only one path would make the
+//! recorded provenance false on runs the caller cannot predict.
+//!
+//! (An earlier version of this note said captured PCA SpMM segments force
+//! `Deterministic` regardless of the requested policy. SpMM-segment CUDA-graph
+//! capture has since been removed — `cusparseSpMM` is not capture-safe on
+//! current cuSPARSE — so nothing overrides the request today.)
 
 use cudarc::cublas::sys as cbs;
 use cudarc::cusparse::sys as csp;
@@ -69,7 +79,9 @@ pub enum SpmmAlgPolicy {
     #[default]
     Default,
     /// `CUSPARSE_SPMM_CSR_ALG2` — the no-atomics, deterministic CSR algorithm.
-    /// Required inside CUDA-graph capture and for bit-reproducible runs.
+    /// Pick this for bit-reproducible runs. Applied to both the forward
+    /// (`NON_TRANSPOSE`) and transpose multiplies of the power loop, on the
+    /// resident and streaming paths alike.
     Deterministic,
     /// Reserved: intended to time the candidate algorithms once per shape and
     /// cache the winner. **Not yet implemented** — currently resolves to the
@@ -106,6 +118,13 @@ impl SpmmAlgPolicy {
 }
 
 /// Bundle of PCA GPU tuning knobs, threaded through the PCA entry points.
+///
+/// [`Default`] is strict-fp32 + the cuSPARSE heuristic SpMM — the
+/// behaviour-preserving configuration that matches pre-2.5 results. Note that
+/// it is **not** the reproducible one: the heuristic algorithm may use atomics
+/// (see [`SpmmAlgPolicy::Default`]). Reproducibility is
+/// `SpmmAlgPolicy::Deterministic`, which is opt-in precisely because it costs
+/// throughput.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct GpuPcaTuning {
     /// cuBLAS / cuSPARSE math mode.
@@ -115,8 +134,9 @@ pub struct GpuPcaTuning {
 }
 
 impl GpuPcaTuning {
-    /// Strict-fp32 + heuristic-default — the reproducible, behaviour-preserving
-    /// default that matches pre-2.5 results.
+    /// Bundle an explicit math mode and SpMM policy. For the
+    /// behaviour-preserving configuration use [`GpuPcaTuning::default`], whose
+    /// reproducibility caveat is documented on the struct.
     pub fn new(math_mode: GpuMathMode, spmm_policy: SpmmAlgPolicy) -> Self {
         Self {
             math_mode,

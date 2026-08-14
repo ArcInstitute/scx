@@ -100,6 +100,15 @@ pub struct PcaResult {
     /// (Task 2.5). `None` on CPU paths; `Some(true)` only when the device-
     /// resident capture path ran and replayed a graph.
     pub graph_replayed: Option<bool>,
+    /// Whether the GPU power loop held the whole matrix **device-resident**
+    /// (`Some(true)`) or fell back to the streaming operator (`Some(false)`).
+    /// `None` on CPU paths, which have no residency decision to make.
+    ///
+    /// Recorded because the decision is dynamic — taken against *free* VRAM at
+    /// call time, so the same script on the same data can take either path
+    /// depending on what else is on the card. `SCX_GPU_PCA_RESIDENT=0` pins the
+    /// streaming arm.
+    pub resident_csr: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,6 +1433,7 @@ fn build_pca_result(
         n_obs,
         n_vars,
         graph_replayed: None,
+        resident_csr: None,
     })
 }
 
@@ -1602,6 +1612,7 @@ pub fn covariance_pca_with_depth<S: ShardSource + Sync + ?Sized>(
         n_obs,
         n_vars,
         graph_replayed: None,
+        resident_csr: None,
     })
 }
 
@@ -1715,6 +1726,7 @@ pub fn covariance_pca_inmemory(
         n_obs,
         n_vars,
         graph_replayed: None,
+        resident_csr: None,
     })
 }
 

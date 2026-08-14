@@ -595,6 +595,7 @@ fn run_fused_gpu<S: ShardSource + Sync>(
         device,
         &["pca", "neighbors", "pca_neighbors"],
         pca_res.graph_replayed,
+        pca_res.resident_csr,
     )
 }
 
@@ -609,6 +610,7 @@ fn stamp_fused_route(
     device: &str,
     ops: &[&str],
     graph_replayed: Option<bool>,
+    resident_csr: Option<bool>,
 ) -> PyResult<()> {
     let mut info = super::route::simple_exec_info(
         device,
@@ -618,6 +620,7 @@ fn stamp_fused_route(
     );
     if info.route.is_gpu() {
         info.graph_replay = graph_replayed;
+        info.resident_csr = resident_csr;
         info.math_mode = Some(scx_accel::GpuMathMode::default().as_str());
         info.spmm_policy = Some(scx_accel::SpmmAlgPolicy::default().as_str());
     }

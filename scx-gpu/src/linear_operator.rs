@@ -19,30 +19,41 @@
 //! `gpu_pca.rs:326-327` in the current randomized-PCA implementation.
 
 use cudarc::cublas::sys as cbs;
+use cudarc::cusparse::sys as csp;
 use cudarc::driver::safe::CudaSlice;
 use scx_format_io::ShardSource;
 
 use crate::cublas::{gpu_sgemm, gpu_sgemv, gpu_sger, CublasHandle};
 use crate::cusparse::{
-    spmm_csr_transpose_view, spmm_csr_view, CuSparseWorkspacePool, CusparseHandle, DnMatView,
-    DnMatViewMut,
+    spmm_csr_transpose_view_with_alg, spmm_csr_view_with_alg, CuSparseWorkspacePool,
+    CusparseHandle, DnMatView, DnMatViewMut,
 };
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::gpu_pca::{gpu_column_sums, gpu_mean_correct_colmajor_strided, gpu_outer_sub};
 use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
+use crate::math_policy::SpmmAlgPolicy;
 use crate::sparse_dense::sparse_to_dense_gpu_into_view;
 
 /// Implicit-centering sparse operator over a `&dyn ShardSource`.
 ///
 /// `d_means` is `None` when `zero_center == false`; all three ops then
 /// reduce to their non-centered equivalents (`X · V`, `Xᵀ · Y`, `Xᵀ X`).
+///
+/// `spmm_policy` is the caller's [`SpmmAlgPolicy`] — held as the *policy*, not
+/// the resolved cuSPARSE enum, so the operator carries the caller's intent and
+/// resolves it at each launch. It applies to both [`Self::matmat`] and
+/// [`Self::rmatmat`]; [`Self::accumulate_gram`] issues no SpMM and is
+/// unaffected. Before this field existed the streaming PCA path hardcoded
+/// `CUSPARSE_SPMM_ALG_DEFAULT` while the resident path honoured the policy, so
+/// a `>VRAM` run reported `spmm_policy="deterministic"` having used atomics.
 pub struct CenteredSparseOperator<'a> {
     dev: &'a GpuDevice,
     cusparse: &'a CusparseHandle,
     cublas: &'a CublasHandle,
     source: &'a (dyn ShardSource + Sync),
     d_means: Option<&'a CudaSlice<f32>>,
+    spmm_policy: SpmmAlgPolicy,
 }
 
 impl<'a> CenteredSparseOperator<'a> {
@@ -54,6 +65,7 @@ impl<'a> CenteredSparseOperator<'a> {
         cublas: &'a CublasHandle,
         source: &'a (dyn ShardSource + Sync),
         d_means: Option<&'a CudaSlice<f32>>,
+        spmm_policy: SpmmAlgPolicy,
     ) -> Self {
         Self {
             dev,
@@ -61,7 +73,14 @@ impl<'a> CenteredSparseOperator<'a> {
             cublas,
             source,
             d_means,
+            spmm_policy,
         }
+    }
+
+    /// The cuSPARSE SpMM algorithm this operator launches with — the resolution
+    /// of the [`SpmmAlgPolicy`] it was constructed with.
+    pub fn spmm_alg(&self) -> csp::cusparseSpMMAlg_t {
+        self.spmm_policy.to_alg()
     }
 
     /// `out (n_obs × k, col-major) = (X − μ) · V`.
@@ -153,7 +172,7 @@ impl<'a> CenteredSparseOperator<'a> {
                 ld: n_obs as i64,
             };
             // Y_shard = A · V   (β = 0 → overwrite the strided sub-region)
-            spmm_csr_view(
+            spmm_csr_view_with_alg(
                 self.cusparse,
                 self.dev.stream(),
                 self.dev,
@@ -163,6 +182,7 @@ impl<'a> CenteredSparseOperator<'a> {
                 c_view,
                 1.0,
                 0.0,
+                self.spmm_policy.to_alg(),
             )?;
 
             if let Some(ref mc) = d_mc {
@@ -236,7 +256,7 @@ impl<'a> CenteredSparseOperator<'a> {
             };
             // out += Aᵀ · Y_shard   (β = 1 → accumulate into contiguous out)
             let c_view = DnMatViewMut::contiguous(d_out, n_vars as i64, k as i64);
-            spmm_csr_transpose_view(
+            spmm_csr_transpose_view_with_alg(
                 self.cusparse,
                 self.dev.stream(),
                 self.dev,
@@ -246,6 +266,7 @@ impl<'a> CenteredSparseOperator<'a> {
                 c_view,
                 1.0,
                 1.0,
+                self.spmm_policy.to_alg(),
             )?;
             global_row += shard_rows;
             Ok(())
@@ -500,7 +521,14 @@ mod tests {
         let d_v = dev.htod_copy(&v_host).unwrap();
         let d_mu = dev.htod_copy(&means).unwrap();
 
-        let op = CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, Some(&d_mu));
+        let op = CenteredSparseOperator::new(
+            &dev,
+            &cusparse,
+            &cublas,
+            &source,
+            Some(&d_mu),
+            SpmmAlgPolicy::Default,
+        );
         let mut d_out = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
         op.matmat(&d_v, &mut d_out, k).unwrap();
         dev.synchronize().unwrap();
@@ -545,7 +573,14 @@ mod tests {
         let v_host: Vec<f32> = (0..n_cols * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
         let d_v = dev.htod_copy(&v_host).unwrap();
 
-        let op = CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, None);
+        let op = CenteredSparseOperator::new(
+            &dev,
+            &cusparse,
+            &cublas,
+            &source,
+            None,
+            SpmmAlgPolicy::Default,
+        );
         let mut d_out = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
         op.matmat(&d_v, &mut d_out, k).unwrap();
         dev.synchronize().unwrap();
@@ -590,7 +625,14 @@ mod tests {
         let d_y = dev.htod_copy(&y_host).unwrap();
         let d_mu = dev.htod_copy(&means).unwrap();
 
-        let op = CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, Some(&d_mu));
+        let op = CenteredSparseOperator::new(
+            &dev,
+            &cusparse,
+            &cublas,
+            &source,
+            Some(&d_mu),
+            SpmmAlgPolicy::Default,
+        );
         let mut d_out = dev.alloc_zeros::<f32>(n_cols * k).unwrap();
         op.rmatmat(&d_y, &mut d_out, k).unwrap();
         dev.synchronize().unwrap();
@@ -632,7 +674,14 @@ mod tests {
         };
 
         let d_mu = dev.htod_copy(&means).unwrap();
-        let op = CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, Some(&d_mu));
+        let op = CenteredSparseOperator::new(
+            &dev,
+            &cusparse,
+            &cublas,
+            &source,
+            Some(&d_mu),
+            SpmmAlgPolicy::Default,
+        );
         let mut d_gram = dev.alloc_zeros::<f32>(n_cols * n_cols).unwrap();
         op.accumulate_gram(&mut d_gram).unwrap();
         dev.synchronize().unwrap();
@@ -672,7 +721,14 @@ mod tests {
             n_vars: n_cols,
         };
 
-        let op = CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, None);
+        let op = CenteredSparseOperator::new(
+            &dev,
+            &cusparse,
+            &cublas,
+            &source,
+            None,
+            SpmmAlgPolicy::Default,
+        );
         let mut d_gram = dev.alloc_zeros::<f32>(n_cols * n_cols).unwrap();
         op.accumulate_gram(&mut d_gram).unwrap();
         dev.synchronize().unwrap();
@@ -735,7 +791,14 @@ mod tests {
         };
 
         let d_mu = dev.htod_copy(&means).unwrap();
-        let op = CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, Some(&d_mu));
+        let op = CenteredSparseOperator::new(
+            &dev,
+            &cusparse,
+            &cublas,
+            &source,
+            Some(&d_mu),
+            SpmmAlgPolicy::Default,
+        );
 
         let mut d_gram_a = dev.alloc_zeros::<f32>(n_cols * n_cols).unwrap();
         op.accumulate_gram(&mut d_gram_a).unwrap();
@@ -812,7 +875,14 @@ mod tests {
         let d_v = dev.htod_copy(&v_host).unwrap();
         let d_mu = dev.htod_copy(&means).unwrap();
 
-        let op = CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, Some(&d_mu));
+        let op = CenteredSparseOperator::new(
+            &dev,
+            &cusparse,
+            &cublas,
+            &source,
+            Some(&d_mu),
+            SpmmAlgPolicy::Default,
+        );
         let mut d_out = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
         op.matmat(&d_v, &mut d_out, k).unwrap();
         dev.synchronize().unwrap();
@@ -861,7 +931,14 @@ mod tests {
         let d_y = dev.htod_copy(&y_host).unwrap();
         let d_mu = dev.htod_copy(&means).unwrap();
 
-        let op = CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, Some(&d_mu));
+        let op = CenteredSparseOperator::new(
+            &dev,
+            &cusparse,
+            &cublas,
+            &source,
+            Some(&d_mu),
+            SpmmAlgPolicy::Default,
+        );
         let mut d_out = dev.alloc_zeros::<f32>(n_cols * k).unwrap();
         op.rmatmat(&d_y, &mut d_out, k).unwrap();
         dev.synchronize().unwrap();
@@ -917,7 +994,14 @@ mod tests {
         let d_v = dev.htod_copy(&v_host).unwrap();
         let d_mu = dev.htod_copy(&means).unwrap();
 
-        let op = CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, Some(&d_mu));
+        let op = CenteredSparseOperator::new(
+            &dev,
+            &cusparse,
+            &cublas,
+            &source,
+            Some(&d_mu),
+            SpmmAlgPolicy::Default,
+        );
         let mut pool = CuSparseWorkspacePool::new();
         let mut d_y = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
         let mut d_z = dev.alloc_zeros::<f32>(n_cols * k).unwrap();
@@ -981,7 +1065,14 @@ mod tests {
         let v_host: Vec<f32> = (0..n_cols * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
         let d_v = dev.htod_copy(&v_host).unwrap();
 
-        let op = CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, None);
+        let op = CenteredSparseOperator::new(
+            &dev,
+            &cusparse,
+            &cublas,
+            &source,
+            None,
+            SpmmAlgPolicy::Default,
+        );
         let mut pool = CuSparseWorkspacePool::new();
         let mut d_out = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
 
@@ -1006,6 +1097,91 @@ mod tests {
             "expected 8 with_workspace calls (2 matmat × 4 shards); got alloc={} reuse={}",
             metrics.alloc_count,
             metrics.reuse_count
+        );
+    }
+
+    /// The streaming operator must launch the algorithm its `SpmmAlgPolicy`
+    /// resolves to, on **both** multiplies.
+    ///
+    /// This is the path a `>VRAM` PCA takes. Before the policy was threaded in
+    /// it hardcoded `CUSPARSE_SPMM_ALG_DEFAULT` while
+    /// `uns["scx_accel"]["pca"]["spmm_policy"]` reported whatever the caller
+    /// asked for, so a caller who requested determinism got atomics and was
+    /// told otherwise.
+    ///
+    /// Two things are checked, and it is worth being precise about which is
+    /// which. The `spmm_alg()` assertion is a real regression guard: it fails
+    /// if the field stops being wired to the policy. The numeric halves are
+    /// **acceptance** checks — they catch `CUSPARSE_STATUS_NOT_SUPPORTED` for
+    /// `CSR_ALG2` (notably under `CUSPARSE_OPERATION_TRANSPOSE`, which the
+    /// resident loop already relies on but this operator never exercised) and
+    /// confirm the two algorithms agree. They would pass even if the operator
+    /// ignored the policy entirely; nothing observable from the host reports
+    /// which algorithm cuSPARSE actually ran. What makes the wiring
+    /// unbypassable is structural, not this test: there is no algorithm-less
+    /// strided-SpMM entry point left to call.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn streaming_operator_honours_the_spmm_policy() {
+        let dev = require_gpu!();
+        let cusparse = CusparseHandle::new().unwrap();
+        let cublas = CublasHandle::new().unwrap();
+
+        let n_rows = 400;
+        let n_cols = 70;
+        let k = 6;
+        let csr = random_csr(n_rows, n_cols, 0.12, 91);
+        let x_dense = densify(&csr);
+        let means = col_means(&x_dense, n_rows, n_cols);
+        let shards = split_into_shards(&csr, 4);
+        let source = InMemorySource {
+            shards,
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let mut rng = StdRng::seed_from_u64(19);
+        let v_host: Vec<f32> = (0..n_cols * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let y_host: Vec<f32> = (0..n_rows * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let d_v = dev.htod_copy(&v_host).unwrap();
+        let d_y = dev.htod_copy(&y_host).unwrap();
+        let d_mu = dev.htod_copy(&means).unwrap();
+
+        let mut forward = Vec::new();
+        let mut transpose = Vec::new();
+        for policy in [SpmmAlgPolicy::Default, SpmmAlgPolicy::Deterministic] {
+            let op =
+                CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, Some(&d_mu), policy);
+            assert_eq!(
+                op.spmm_alg(),
+                policy.to_alg(),
+                "operator launches {:?} but was constructed with {policy:?}",
+                op.spmm_alg()
+            );
+
+            // Forward: (X − μ) · V, n_rows × k col-major.
+            let mut d_fwd = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
+            op.matmat(&d_v, &mut d_fwd, k).unwrap();
+            // Transpose: (X − μ)ᵀ · Y, n_cols × k col-major. `CSR_ALG2` under
+            // CUSPARSE_OPERATION_TRANSPOSE is the combination this operator
+            // had never issued.
+            let mut d_rev = dev.alloc_zeros::<f32>(n_cols * k).unwrap();
+            op.rmatmat(&d_y, &mut d_rev, k).unwrap();
+            dev.synchronize().unwrap();
+
+            forward.push(dev.dtoh_copy(&d_fwd).unwrap());
+            transpose.push(dev.dtoh_copy(&d_rev).unwrap());
+        }
+
+        let fwd_err = rel_error(&forward[0], &forward[1]);
+        assert!(
+            fwd_err < 1e-4,
+            "matmat under Deterministic diverged from Default: rel_error = {fwd_err}"
+        );
+        let rev_err = rel_error(&transpose[0], &transpose[1]);
+        assert!(
+            rev_err < 1e-4,
+            "rmatmat under Deterministic diverged from Default: rel_error = {rev_err}"
         );
     }
 }

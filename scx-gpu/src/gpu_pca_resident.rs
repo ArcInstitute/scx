@@ -48,9 +48,30 @@ use crate::shard_decode::GpuCsr;
 /// comparing against free device memory.
 const RESIDENT_VRAM_HEADROOM: f64 = 1.2;
 
+/// Kill switch for GPU PCA CSR residency. `SCX_GPU_PCA_RESIDENT=0` forces the
+/// streaming power loop (the whole matrix re-decoded and re-uploaded on every
+/// `matmat`/`rmatmat`) — an escape hatch for a host where the extra VRAM is not
+/// available, and the "off" arm for an A/B.
+///
+/// The mirror of `SCX_GPU_DE_RESIDENT` on the GPU-DE side, down to being read
+/// **once per process**: `pyscx/tests/test_gpu_pca_resident.py` runs its two
+/// arms as subprocesses precisely because the setting is supposed to be
+/// process-stable, and a per-call `env::var` would quietly make that isolation
+/// unnecessary — and the promise untrue for anyone relying on it.
+///
+/// This is also what makes the streaming path *reachable* from a test at all.
+/// Residency is otherwise decided dynamically against free VRAM, so no fixture
+/// can force the streaming branch on an 80 GB card, and the branch that ignored
+/// `spmm_policy` was therefore never exercised.
+fn pca_resident_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("SCX_GPU_PCA_RESIDENT").as_deref(), Ok("0")))
+}
+
 /// Drain `source` into a single device-resident CSR, or return `None` when the
-/// resident matrix plus PCA dense scratch would not fit device memory (the
-/// caller then falls back to the streaming power loop).
+/// resident matrix plus PCA dense scratch would not fit device memory, or when
+/// [`pca_resident_enabled`] is off (the caller then falls back to the streaming
+/// power loop).
 ///
 /// `k` is the oversampled rank used to size the dense scratch in the VRAM
 /// pre-flight (`2·n_obs·k + n_vars·k` f32 for `d_y` / `d_z` + small vectors).
@@ -63,6 +84,9 @@ pub(crate) fn try_build_resident_csr(
     source: &(dyn ShardSource + Sync),
     k: usize,
 ) -> Result<Option<GpuCsr>, GpuError> {
+    if !pca_resident_enabled() {
+        return Ok(None);
+    }
     let (n_obs, n_vars) = source.shape();
     let n_shards = source.n_shards();
     if n_obs == 0 || n_vars == 0 || n_shards == 0 {

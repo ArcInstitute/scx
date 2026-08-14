@@ -19,20 +19,35 @@
 //!   capture mode rejects these APIs. G2's `GpuPcaScratch` /
 //!   `GpuDeChunkScratch` provide stable pre-grown scratch addresses; the
 //!   stable-buffer prerequisite is already in place.
-//! - Capture MUST run on a non-NULL stream. cudarc's
+//! - Capture MUST run on a non-NULL stream, and specifically on
+//!   `CudaContext::per_thread_stream()`. cudarc's
 //!   `CudaContext::default_stream()` returns the NULL stream (`cu_stream
 //!   = std::ptr::null_mut()`) which CUDA rejects for capture
-//!   (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`). Production call sites
-//!   must capture on a stream obtained via
-//!   `CudaContext::new_stream()` (an explicit non-blocking stream) or
-//!   `CudaContext::per_thread_stream()` (the per-thread default, also
-//!   capturable). Each call site is responsible for any cross-stream
-//!   synchronization needed before/after replay.
+//!   (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`).
+//!
+//!   **Do not capture on `CudaContext::new_stream()`.** It is capturable in
+//!   isolation, but creating one flips the cudarc context into multi-stream
+//!   mode, which turns on cudarc's automatic cross-stream synchronization
+//!   (`is_managing_stream_synchronization()`); the `cuStreamWaitEvent` calls
+//!   that inserts invalidate any capture they touch. `per_thread_stream()` is
+//!   capturable and does *not* flip that switch. Note this is a property of
+//!   the whole context, not of one call site: while any `new_stream()` stream
+//!   is alive anywhere in the process — the GPU shard sources and the
+//!   ShufDelta decoder each create one — capture can fail. Each call site is
+//!   still responsible for any cross-stream synchronization it needs
+//!   before/after replay.
 //!
 //! ## Kill switch
 //!
 //! Set `SCX_DISABLE_CUDA_GRAPHS=1` to bypass capture at every call site;
-//! callers fall back to direct kernel dispatch with no behavioural change.
+//! callers fall back to direct kernel dispatch with no change to results.
+//!
+//! It is **not** an isolated "graph vs no graph" A/B, because call sites also
+//! use it to choose the stream: `harmony/gpu.rs` runs its k-means sub-iter
+//! kernels, order upload and sync on the per-thread stream when graphs are
+//! enabled and on the device's own stream when they are not, and three sites
+//! in `diffexp/gpu.rs` read it purely as a stream selector with no capture
+//! involved at all. Read a measurement taken with the switch set accordingly.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

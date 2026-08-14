@@ -121,6 +121,11 @@ pub struct GpuPcaResult {
     /// Whether a captured CUDA graph was replayed in the power loop (Task 2.5):
     /// `true` only on the device-resident capture path.
     pub graph_replayed: bool,
+    /// Whether the whole matrix was held **device-resident** across the power
+    /// loop (`true`) or the streaming operator re-decoded and re-uploaded it on
+    /// every multiply (`false`). Decided dynamically against free VRAM, so the
+    /// same input can go either way run to run — which is why it is recorded.
+    pub resident_csr: bool,
 }
 
 /// Result of GPU randomized PCA with the embedding kept **device-resident**
@@ -150,6 +155,9 @@ pub struct GpuPcaDeviceResult {
     pub n_vars: usize,
     /// Whether a captured CUDA graph was replayed in the power loop (Task 2.5).
     pub graph_replayed: bool,
+    /// Whether the whole matrix was held device-resident across the power loop.
+    /// See [`GpuPcaResult::resident_csr`].
+    pub resident_csr: bool,
 }
 
 /// Internal output of the shared randomized-PCA core: the scaled embedding kept
@@ -172,6 +180,9 @@ struct RandomizedPcaCore {
     /// `true` only on the device-resident capture path; `false` for the
     /// streaming or direct-resident paths.
     graph_replayed: bool,
+    /// Whether the whole matrix was held device-resident across the power loop.
+    /// See [`GpuPcaResult::resident_csr`].
+    resident_csr: bool,
 }
 
 /// Shared randomized-PCA core: runs the full streaming SpMM / QR / SVD pipeline
@@ -277,12 +288,17 @@ fn randomized_pca_core(
     // with cuSPARSE workspace served by `pool`.
     let mut scratch = GpuPcaScratch::new(dev, n_obs, n_vars, k)?;
     let mut pool = CuSparseWorkspacePool::new();
+    // `tuning.spmm_policy` reaches the streaming operator here, not just the
+    // resident loop below: both power-loop paths must run the algorithm the
+    // caller asked for, because `uns["scx_accel"]["pca"]["spmm_policy"]` is
+    // stamped from that request either way.
     let op = CenteredSparseOperator::new(
         dev,
         &cusparse_handle,
         &cublas_handle,
         source,
         d_means.as_ref(),
+        tuning.spmm_policy,
     );
 
     // Task 2.5: when the full matrix fits device memory, run the power loop on
@@ -318,6 +334,7 @@ fn randomized_pca_core(
         crate::gpu_pca_resident::try_build_resident_csr(dev, source, k),
         "GPU PCA resident CSR",
     )?;
+    let resident_csr = resident.is_some();
     let graph_replayed = if let Some(gpu_csr) = resident {
         crate::gpu_pca_resident::run_resident_power_loop(
             dev,
@@ -511,6 +528,7 @@ fn randomized_pca_core(
         n_obs,
         n_vars,
         graph_replayed,
+        resident_csr,
     })
 }
 
@@ -553,6 +571,7 @@ pub fn gpu_randomized_pca(
         n_obs,
         n_vars,
         graph_replayed,
+        resident_csr,
     } = core;
 
     // Single D→H copy of the final embedding, col-major (n_obs × n_components).
@@ -577,6 +596,7 @@ pub fn gpu_randomized_pca(
         n_obs,
         n_vars,
         graph_replayed,
+        resident_csr,
     })
 }
 
@@ -622,6 +642,7 @@ pub fn gpu_randomized_pca_device(
         n_obs,
         n_vars,
         graph_replayed,
+        resident_csr,
     } = core;
 
     // Transpose col-major (n_obs × n_components) → row-major on the device.
@@ -652,6 +673,7 @@ pub fn gpu_randomized_pca_device(
         n_obs,
         n_vars,
         graph_replayed,
+        resident_csr,
     })
 }
 

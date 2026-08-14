@@ -674,44 +674,23 @@ fn spmm_impl(
 }
 
 /// Strided SpMM: `C = α·A·B + β·C` where `B` / `C` are views into larger
-/// column-major buffers.
+/// column-major buffers, with an explicit cuSPARSE algorithm.
 ///
-/// Same algorithm and tuning as [`spmm_csr`]. Used by the GPU PCA loop to
-/// write a `(shard_rows × k)` SpMM result directly into a `(n_obs × k)`
-/// global buffer at row offset `global_row`, avoiding a per-shard scatter.
+/// Used by the GPU PCA loop to write a `(shard_rows × k)` SpMM result directly
+/// into a `(n_obs × k)` global buffer at row offset `global_row`, avoiding a
+/// per-shard scatter. Both PCA power loops — resident and streaming — pass the
+/// algorithm resolved from their
+/// [`SpmmAlgPolicy`](crate::math_policy::SpmmAlgPolicy).
 ///
 /// `b.ld` and `c.ld` must each be `>= rows`. `pool` is `Some` to reuse
 /// workspace across calls (recommended in iterative loops); `None` allocates
 /// per call.
-#[allow(clippy::too_many_arguments)]
-pub fn spmm_csr_view(
-    handle: &CusparseHandle,
-    stream: &Arc<CudaStream>,
-    dev: &GpuDevice,
-    pool: Option<&mut CuSparseWorkspacePool>,
-    a: &CusparseSpMatDescr,
-    b: DnMatView<'_>,
-    c: DnMatViewMut<'_>,
-    alpha: f32,
-    beta: f32,
-) -> Result<(), GpuError> {
-    spmm_csr_view_with_alg(
-        handle,
-        stream,
-        dev,
-        pool,
-        a,
-        b,
-        c,
-        alpha,
-        beta,
-        csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
-    )
-}
-
-/// [`spmm_csr_view`] with an explicit cuSPARSE algorithm (Task 2.5). The PCA
-/// power loop passes the algorithm resolved from its [`SpmmAlgPolicy`](crate::math_policy::SpmmAlgPolicy);
-/// `CUSPARSE_SPMM_CSR_ALG2` is required inside CUDA-graph capture.
+///
+/// There is deliberately **no** algorithm-less convenience wrapper. One existed
+/// and hardcoded `CUSPARSE_SPMM_ALG_DEFAULT`, which is how the streaming PCA
+/// operator came to ignore a caller's `spmm_policy="deterministic"` while the
+/// route metadata still reported it. Naming the algorithm is now the only way
+/// to issue a strided SpMM, so that divergence cannot reappear silently.
 #[allow(clippy::too_many_arguments)]
 pub fn spmm_csr_view_with_alg(
     handle: &CusparseHandle,
@@ -741,38 +720,12 @@ pub fn spmm_csr_view_with_alg(
 }
 
 /// Strided transposed SpMM: `C = α·Aᵀ·B + β·C` where `B` / `C` are views
-/// into larger column-major buffers.
+/// into larger column-major buffers, with an explicit cuSPARSE algorithm.
 ///
-/// Same algorithm and tuning as [`spmm_csr_transpose`]. Used by the GPU PCA
-/// loop to read a `(shard_rows × k)` view from a `(n_obs × k)` buffer at
-/// row offset `global_row`, avoiding a per-shard gather.
-#[allow(clippy::too_many_arguments)]
-pub fn spmm_csr_transpose_view(
-    handle: &CusparseHandle,
-    stream: &Arc<CudaStream>,
-    dev: &GpuDevice,
-    pool: Option<&mut CuSparseWorkspacePool>,
-    a: &CusparseSpMatDescr,
-    b: DnMatView<'_>,
-    c: DnMatViewMut<'_>,
-    alpha: f32,
-    beta: f32,
-) -> Result<(), GpuError> {
-    spmm_csr_transpose_view_with_alg(
-        handle,
-        stream,
-        dev,
-        pool,
-        a,
-        b,
-        c,
-        alpha,
-        beta,
-        csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
-    )
-}
-
-/// [`spmm_csr_transpose_view`] with an explicit cuSPARSE algorithm (Task 2.5).
+/// Used by the GPU PCA loop to read a `(shard_rows × k)` view from a
+/// `(n_obs × k)` buffer at row offset `global_row`, avoiding a per-shard
+/// gather. As with [`spmm_csr_view_with_alg`] there is deliberately no
+/// algorithm-less wrapper — see that function's note.
 #[allow(clippy::too_many_arguments)]
 pub fn spmm_csr_transpose_view_with_alg(
     handle: &CusparseHandle,
@@ -1381,7 +1334,7 @@ mod tests {
             cols: n as i64,
             ld: ld as i64,
         };
-        spmm_csr_view(
+        spmm_csr_view_with_alg(
             &handle,
             dev.stream(),
             &dev,
@@ -1391,6 +1344,7 @@ mod tests {
             c_view,
             1.0,
             0.0,
+            csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
         )
         .unwrap();
         let c_strided = dev.dtoh_copy(&d_c_strided).unwrap();
@@ -1482,7 +1436,7 @@ mod tests {
             ld: ld as i64,
         };
         let c_view = DnMatViewMut::contiguous(&mut d_c_view, k as i64, n as i64);
-        spmm_csr_transpose_view(
+        spmm_csr_transpose_view_with_alg(
             &handle,
             dev.stream(),
             &dev,
@@ -1492,6 +1446,7 @@ mod tests {
             c_view,
             1.0,
             0.0,
+            csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
         )
         .unwrap();
         let c_view_host = dev.dtoh_copy(&d_c_view).unwrap();
@@ -1531,7 +1486,7 @@ mod tests {
         for _ in 0..10 {
             let b_view = DnMatView::contiguous(&d_b, k as i64, n as i64);
             let c_view = DnMatViewMut::contiguous(&mut d_c, m as i64, n as i64);
-            spmm_csr_view(
+            spmm_csr_view_with_alg(
                 &handle,
                 dev.stream(),
                 &dev,
@@ -1541,6 +1496,7 @@ mod tests {
                 c_view,
                 1.0,
                 0.0,
+                csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
             )
             .unwrap();
         }
@@ -1605,7 +1561,7 @@ mod tests {
             let mut d_c = dev.alloc_zeros::<f32>(m_small * n_small).unwrap();
             let b_view = DnMatView::contiguous(&d_b, k_small as i64, n_small as i64);
             let c_view = DnMatViewMut::contiguous(&mut d_c, m_small as i64, n_small as i64);
-            spmm_csr_view(
+            spmm_csr_view_with_alg(
                 &handle,
                 dev.stream(),
                 &dev,
@@ -1615,6 +1571,7 @@ mod tests {
                 c_view,
                 1.0,
                 0.0,
+                csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
             )
             .unwrap();
         }
@@ -1628,7 +1585,7 @@ mod tests {
             let mut d_c = dev.alloc_zeros::<f32>(m_big * n_big).unwrap();
             let b_view = DnMatView::contiguous(&d_b, k_big as i64, n_big as i64);
             let c_view = DnMatViewMut::contiguous(&mut d_c, m_big as i64, n_big as i64);
-            spmm_csr_view(
+            spmm_csr_view_with_alg(
                 &handle,
                 dev.stream(),
                 &dev,
@@ -1638,6 +1595,7 @@ mod tests {
                 c_view,
                 1.0,
                 0.0,
+                csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
             )
             .unwrap();
         }

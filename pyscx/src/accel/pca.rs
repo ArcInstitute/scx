@@ -472,6 +472,7 @@ fn stamp_pca_route(
     math_mode: Option<&'static str>,
     spmm_policy: Option<&'static str>,
     graph_replay: Option<bool>,
+    resident_csr: Option<bool>,
 ) -> PyResult<()> {
     let mut info = super::route::simple_exec_info(
         device,
@@ -483,6 +484,7 @@ fn stamp_pca_route(
         info.math_mode = math_mode;
         info.spmm_policy = spmm_policy;
         info.graph_replay = graph_replay;
+        info.resident_csr = resident_csr;
     }
     super::route::announce_route(py, "pca", device, &info);
     super::route::write_accel_route(py, adata, "pca", &info)
@@ -813,7 +815,7 @@ pub fn pca(
     // branches re-stamp after dispatch, and a failure after that must still
     // restore whatever a previous successful pca recorded.
     let route = super::route::RouteStamp::begin(adata, "pca")?;
-    stamp_pca_route(py, adata, device, pca_gpu_eligible, None, None, None)?;
+    stamp_pca_route(py, adata, device, pca_gpu_eligible, None, None, None, None)?;
 
     // ------- GPU path -------
     // Probe libcusparse for the cuSPARSE 12.5+ ABI before dispatching, so an
@@ -845,18 +847,20 @@ pub fn pca(
         // recorded only for the randomized route that actually consumes them
         // (covariance passes `None`); `stamp_pca_route` itself drops every knob
         // on a non-GPU route.
-        let stamp = |graph_replayed: Option<bool>, m: &str| -> PyResult<()> {
-            let is_rand = m == "randomized";
-            stamp_pca_route(
-                py,
-                adata,
-                device,
-                pca_gpu_eligible,
-                is_rand.then_some(math_mode_label),
-                is_rand.then_some(spmm_policy_lbl),
-                graph_replayed,
-            )
-        };
+        let stamp =
+            |graph_replayed: Option<bool>, resident_csr: Option<bool>, m: &str| -> PyResult<()> {
+                let is_rand = m == "randomized";
+                stamp_pca_route(
+                    py,
+                    adata,
+                    device,
+                    pca_gpu_eligible,
+                    is_rand.then_some(math_mode_label),
+                    is_rand.then_some(spmm_policy_lbl),
+                    graph_replayed,
+                    resident_csr,
+                )
+            };
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
             // The handle's *view*, not the raw reader: `kept_to_global` and
@@ -902,7 +906,7 @@ pub fn pca(
                 ),
             }
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            stamp(result.graph_replayed, m)?;
+            stamp(result.graph_replayed, result.resident_csr, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
             route.commit();
             return Ok(());
@@ -942,7 +946,7 @@ pub fn pca(
                 ),
             }
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            stamp(result.graph_replayed, m)?;
+            stamp(result.graph_replayed, result.resident_csr, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
             route.commit();
             return Ok(());
@@ -1001,7 +1005,7 @@ pub fn pca(
                 ),
             }
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            stamp(result.graph_replayed, m)?;
+            stamp(result.graph_replayed, result.resident_csr, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
             route.commit();
             return Ok(());
@@ -1042,7 +1046,7 @@ pub fn pca(
             ),
         }
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-        stamp(result.graph_replayed, m)?;
+        stamp(result.graph_replayed, result.resident_csr, m)?;
         write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
         route.commit();
         return Ok(());

@@ -1080,7 +1080,8 @@ re-describe them. All are optional — defaults apply when unset.
 | `SCX_CSC_AUTO_VARS_THRESHOLD` | `scx-format` | `5000` | `CscPolicy::Auto` builds a CSC sidecar only when `n_vars ≥` this. |
 | `SCX_GPU_DE_GENE_CHUNK_SIZE` | `scx-gpu` | VRAM heuristic | Overrides the streaming GPU-DE gene-chunk size (rounded to a multiple of 64, min 64). |
 | `SCX_CUVS_TRUST_LAYOUT` | `scx-gpu` | unset | `=1` downgrades a cuVS version/layout-compatibility mismatch from a hard error to a warning (kNN results may be wrong). |
-| `SCX_DISABLE_CUDA_GRAPHS` | `scx-gpu` | unset | `=1`/`true` bypasses CUDA-graph capture at every call site. |
+| `SCX_DISABLE_CUDA_GRAPHS` | `scx-gpu` | unset | `=1`/`true` bypasses CUDA-graph capture at every call site. **Not an isolated capture A/B**: call sites also read it to pick a stream. Harmony (the only capture site) runs its k-means sub-iter kernels, order upload and sync on the per-thread stream when graphs are enabled and on the device's own stream when they are not; three sites in `scx-accel/src/diffexp/gpu.rs` read it purely as a stream selector with no capture involved. |
+| `SCX_GPU_PCA_RESIDENT` | `scx-gpu` | unset | `=0` forces the streaming GPU PCA power loop instead of the device-resident one (the whole matrix re-decoded and re-uploaded per multiply). Mirrors `SCX_GPU_DE_RESIDENT`; the path taken is recorded on `uns["scx_accel"]["pca"]["resident_csr"]`. Read once per process. |
 | `SCX_GPU_PROFILE` | `scx-gpu` | unset | Any non-empty, non-`0` value emits GPU profiling output. |
 | `SCX_LOADER_PROFILE` | `scx-loader` | unset | `=1`/`true` emits ML-loader profiling: per-stage timing (I/O-stage decode + `tx.send` back-pressure wait, decode-stage scatter) and the memory-budget breakdown on drop. |
 
