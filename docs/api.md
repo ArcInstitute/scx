@@ -880,12 +880,19 @@ Which routes reject, and which answer:
 
 | Route | On an overfull axis |
 |---|---|
-| `X.var(axis=0)` / `X.var(axis=1)`, projected or not, CSR or CSC | `RuntimeError` |
-| `X.max(axis=…)` / `X.min(axis=…)`, projected or not | `RuntimeError` |
-| CSC Wilcoxon DE (`scx-accel`, nnz fast path) | `AccelError::InvalidInput` |
-| **`X.var(axis=None)` scalar, unprojected** | **clamped to `0.0`** — no per-column count exists on that path |
+| `X.var(axis=0)` / `X.var(axis=1)`, CSR or CSC, projected or not | `RuntimeError` |
+| `X.max(axis=0)` / `X.min(axis=0)`, projected or not | `RuntimeError` |
+| `X.max(axis=1)` / `X.min(axis=1)`, **unprojected** | `RuntimeError` |
+| `X.max(axis=1)` / `X.min(axis=1)`, **with a column projection** | **answers** — that branch materializes via `to_memory()` and defers to scipy, so no guard runs |
+| CSC Wilcoxon DE (`scx-accel`, nnz fast path) | `AccelError::InvalidInput` when the **labelled-nonzero** count overruns; explicit stored zeros are excluded from that count, so a column overfull purely with duplicate zeros is not caught |
+| `X.var(axis=None)` scalar, unprojected | clamped to `0.0` — no per-column count exists on that path |
 | `scx-accel` PCA total variance | `saturating_sub`, absorbed |
-| Any duplicate leaving the axis under its extent | not detected anywhere |
+| A duplicate leaving the axis under its extent | not detected anywhere |
+| An **unsorted** overfull row seen through a column projection | not detected — `project_csr` drops indices smaller than one already seen, so the projected row is no longer overfull |
+
+Variance results preserve `NaN`: the clamps use `if v < 0.0 { 0.0 } else { v }`
+rather than `v.max(0.0)`, which would return `0.0` for a NaN input because
+Rust's `f64::max` ignores NaN.
 
 Use `scx validate --deep` when you need an actual canonicality verdict on a file.
 None of the read-path aggregations is a substitute for it.

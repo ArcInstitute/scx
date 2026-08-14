@@ -256,3 +256,49 @@ def test_mean_with_deletions(tmp_dir):
     full_mean = np.asarray(adata_full.X.mean(axis=0)).flatten()
 
     np.testing.assert_allclose(backed_mean, full_mean, rtol=1e-6)
+
+
+def test_variance_preserves_nan_on_every_view(tmp_dir):
+    """A NaN in X must stay NaN through `var()`, projected or not.
+
+    Rust's `f64::max` *ignores* NaN and returns the other operand, so a
+    `.max(0.0)` clamp silently reports a NaN variance as a real `0.0`. NaN in
+    `X` is supported input — the dense h5ad streamer preserves it deliberately —
+    so that is data loss, not tidying.
+
+    This is a regression lock with a history: the clamp was introduced to stop
+    an unrelated negative variance, using `.max(0.0)`. One review round fixed
+    the unprojected scalar arm and left the two projected arms in the *same
+    function* still eating NaN, which the next round caught. There was no test
+    either time, which is why it shipped twice. Hence: every view, one test.
+    """
+    import anndata
+    import pandas as pd
+    import pyscx
+
+    dense = np.array([[np.nan, 1.0], [2.0, 3.0]], dtype=np.float32)
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1"]),
+    )
+    path = str(tmp_dir / "nan_var.scx")
+    pyscx.from_anndata(adata, path)
+    backed = pyscx.open(path).to_anndata(backed=True)
+
+    # Unprojected: scalar, per-row and per-column.
+    assert np.isnan(float(np.asarray(backed.X.var()))), "scalar var() ate the NaN"
+    assert np.isnan(np.asarray(backed.X.var(axis=1)).ravel()[0]), "var(axis=1) ate the NaN"
+    assert np.isnan(np.asarray(backed.X.var(axis=0)).ravel()[0]), "var(axis=0) ate the NaN"
+
+    # Through a column projection — the arms that were missed the first time.
+    view = backed[:, ["g0", "g1"]]
+    assert np.isnan(float(np.asarray(view.X.var()))), "projected scalar var() ate the NaN"
+    assert np.isnan(
+        np.asarray(view.X.var(axis=1)).ravel()[0]
+    ), "projected var(axis=1) ate the NaN"
+
+    # The NaN-free row/column must still produce a real number on every view,
+    # so the assertions above cannot pass by making everything NaN.
+    assert np.isfinite(np.asarray(backed.X.var(axis=1)).ravel()[1])
+    assert np.isfinite(np.asarray(view.X.var(axis=1)).ravel()[1])

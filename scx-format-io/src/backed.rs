@@ -2382,6 +2382,12 @@ impl BackedCsrReader {
     pub fn col_var(&self) -> Result<Vec<f64>> {
         let n_obs = self.n_obs;
         if n_obs == 0 {
+            // Paired with the CSC kernels, which validate their tallies before
+            // this short-circuit. A 0-row file holding stored entries is
+            // non-canonical, but reaching that verdict here costs a full walk
+            // the CSR path would otherwise skip; `finalize_implicit_zero_variance`
+            // is where the count is checked, and it is never reached. Documented
+            // rather than silently divergent — see docs/api.md.
             return Ok(vec![0.0f64; self.n_vars]);
         }
 

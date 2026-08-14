@@ -96,7 +96,22 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
     implicit-zero count. The per-package `overflow-checks` override does not
     cross crate boundaries, so guards there have to be explicit — and the
     per-group subtraction needs its own check, because it can invert while the
-    pooled one still fits.
+    pooled one still fits. Note what those two operands actually prove: they
+    count **labelled nonzero** cells, not stored entries, so a column overfull
+    purely with duplicated *explicit zeros* passes them.
+
+    Two limits worth stating rather than implying, because both make a guard
+    weaker than its name suggests:
+    - **A check that runs after a lossy transform inherits the transform's
+      blind spots.** `row_stats_projected` validates the *projected* row, and
+      `project_csr_row` advances its `gene_set` pointer monotonically — so on an
+      unsorted row it drops every index smaller than one already seen. An
+      unsorted overfull row can project to a well-formed one.
+    - **A route that materializes and defers to another library runs no guard
+      at all.** Projected `max(axis=1)` / `min(axis=1)` go through
+      `to_memory()` into scipy, so they answer where their unprojected twins
+      reject. Written down in `docs/api.md`'s route table rather than left for
+      the next reader to discover.
   - **A consumer bounded by a *different* axis owes its own check.** The dense
     scatter in `typed_read.rs` sizes its buffer from the file header's `n_vars`
     while the seam validates against the shard header's `n_minor`. Those agree on
