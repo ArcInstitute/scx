@@ -36,23 +36,6 @@ pub struct Batch {
 }
 
 impl Batch {
-    /// Allocate a zero-filled batch (used for pre-allocation in the ring buffer).
-    pub fn zeros(n_rows: usize, n_genes: usize) -> Self {
-        Batch {
-            x: vec![0.0f32; n_rows * n_genes],
-            x_shape: (n_rows, n_genes),
-            obs: HashMap::new(),
-            cell_indices: Vec::new(),
-        }
-    }
-
-    /// Zero-fill `x` without reallocating. Used for ring buffer reuse.
-    pub fn reset(&mut self) {
-        self.x.fill(0.0);
-        self.obs.clear();
-        self.cell_indices.clear();
-    }
-
     /// Number of rows in this batch.
     pub fn n_rows(&self) -> usize {
         self.x_shape.0
@@ -67,48 +50,6 @@ impl Batch {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_batch_zeros_correct_shape() {
-        let batch = Batch::zeros(128, 2000);
-        assert_eq!(batch.n_rows(), 128);
-        assert_eq!(batch.n_genes(), 2000);
-        assert_eq!(batch.x.len(), 128 * 2000);
-        assert!(batch.x.iter().all(|&v| v == 0.0));
-    }
-
-    #[test]
-    fn test_batch_zeros_empty() {
-        let batch = Batch::zeros(0, 0);
-        assert_eq!(batch.n_rows(), 0);
-        assert_eq!(batch.n_genes(), 0);
-        assert!(batch.x.is_empty());
-    }
-
-    #[test]
-    fn test_batch_reset_zeros_data() {
-        let mut batch = Batch::zeros(4, 3);
-        // Set some non-zero values
-        batch.x[0] = 1.0;
-        batch.x[5] = 2.5;
-        batch.x[11] = 3.0;
-        batch.cell_indices = vec![10, 20, 30, 40];
-        batch
-            .obs
-            .insert("test".to_string(), ObsColumn::Int64(vec![1, 2, 3, 4]));
-
-        batch.reset();
-
-        // x should be zeroed
-        assert!(batch.x.iter().all(|&v| v == 0.0));
-        // Shape should be unchanged
-        assert_eq!(batch.n_rows(), 4);
-        assert_eq!(batch.n_genes(), 3);
-        assert_eq!(batch.x.len(), 12);
-        // obs and cell_indices should be cleared
-        assert!(batch.obs.is_empty());
-        assert!(batch.cell_indices.is_empty());
-    }
 
     #[test]
     fn test_obs_column_int64() {
