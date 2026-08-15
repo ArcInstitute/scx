@@ -214,6 +214,198 @@ fn test_decode_capacity_boundary_passes() {
 }
 
 // ---------------------------------------------------------------------------
+// Bounded decompression: Lz4Shuffle and Pcodec
+//
+// Every other codec caps how many bytes a sub-stream may decompress to before
+// it decompresses (`zstd_decode_bounded`, keyed on `indptr_byte_cap` /
+// `checked_len`). `Lz4Shuffle` did not: `lz4_frame_decompress` was a plain
+// `read_to_end` into an unbounded `Vec`, so a small shard could force an
+// arbitrarily large allocation, and the declared-length check only ran
+// afterwards — on a buffer that had already been materialised.
+//
+// This is production-reachable: `select_codec_for_modality` picks
+// `Lz4Shuffle` for non-binary integer ATAC counts, so every Multiome /
+// TEA-seq ATAC modality writes shards that decode through this path.
+//
+// The assertions key on the error *message*, not `is_err()`: an unbounded
+// decode also errors, just one full allocation too late, so `is_err()` passes
+// against the broken code.
+// ---------------------------------------------------------------------------
+
+/// Stream-compress `n_bytes` of zeros into an LZ4 frame without ever holding
+/// `n_bytes` in memory. Returns a small frame that decompresses to `n_bytes`.
+fn lz4_bomb(n_bytes: usize) -> Vec<u8> {
+    use std::io::Write;
+    const CHUNK: usize = 64 * 1024;
+    let zeros = [0u8; CHUNK];
+    let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+    let mut written = 0;
+    while written < n_bytes {
+        let n = CHUNK.min(n_bytes - written);
+        enc.write_all(&zeros[..n]).unwrap();
+        written += n;
+    }
+    enc.finish().unwrap()
+}
+
+/// 64 MiB of zeros, which LZ4 stores in a few hundred KiB at most. Large
+/// enough that decoding it unbounded is unmistakable, small enough that the
+/// test stays fast if the guard regresses.
+const BOMB_BYTES: usize = 64 * 1024 * 1024;
+
+#[test]
+fn test_lz4_indptr_bomb_is_capped_before_decompression() {
+    let bomb = lz4_bomb(BOMB_BYTES);
+    assert!(
+        bomb.len() < 1 << 20,
+        "bomb should be small on the wire, got {} bytes",
+        bomb.len()
+    );
+
+    // `indptr` is the first sub-stream decompressed. A 2-row shard bounds it
+    // to 24 bytes, so 64 MiB must be refused, not decompressed and measured.
+    // The other two streams are valid frames so that this test can only fail
+    // on the indptr cap — a garbage sibling stream would mask it.
+    let indices_raw: Vec<u8> = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indices = lz4_roundtrip_compress(&byte_shuffle(&indices_raw, 4).unwrap());
+    let values = lz4_roundtrip_compress(&byte_shuffle(&[0u8; 8], 4).unwrap());
+    let encoded = EncodedShardRef {
+        indptr_bytes: &bomb,
+        indices_bytes: &indices,
+        values_bytes: &values,
+    };
+    let err = decode_shard_ref(
+        &encoded,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Uint32,
+        2, // n_rows
+        2, // nnz
+        false,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds limit"),
+        "expected the decompression cap to fire before allocating, got: {msg}"
+    );
+}
+
+#[test]
+fn test_lz4_values_bomb_is_capped_before_decompression() {
+    let bomb = lz4_bomb(BOMB_BYTES);
+    // A valid 2-row/2-nnz indptr and indices, so the bomb in `values` is what
+    // the decoder trips on rather than an earlier sub-stream.
+    let indptr_raw: Vec<u8> = [0u64, 1, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indices_raw: Vec<u8> = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indptr = lz4_roundtrip_compress(&byte_shuffle(&indptr_raw, 8).unwrap());
+    let indices = lz4_roundtrip_compress(&byte_shuffle(&indices_raw, 4).unwrap());
+
+    let encoded = EncodedShardRef {
+        indptr_bytes: &indptr,
+        indices_bytes: &indices,
+        values_bytes: &bomb,
+    };
+    let err = decode_shard_ref(
+        &encoded,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Uint32,
+        2, // n_rows
+        2, // nnz → values bounded to 8 bytes
+        false,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds limit"),
+        "expected the decompression cap to fire before allocating, got: {msg}"
+    );
+}
+
+/// Compress with the same LZ4 frame settings the encoder uses.
+fn lz4_roundtrip_compress(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+#[test]
+fn test_lz4_hostile_shape_errors_instead_of_panicking() {
+    // `n_rows` chosen so `(n_rows + 1) * 8` overflows `usize`. The five sibling
+    // codecs reach `indptr_byte_cap`, whose checked arithmetic returns an
+    // error; Lz4Shuffle skipped it and hit the unchecked `count * 8` inside
+    // `le_bytes_to_u64`. `scx-codec` sets `overflow-checks = true` in release,
+    // so that was a panic on malformed input in every profile — which the
+    // reader convention forbids.
+    let encoded = EncodedShardRef {
+        indptr_bytes: &lz4_roundtrip_compress(&[0u8; 32]),
+        indices_bytes: &lz4_roundtrip_compress(&[0u8; 8]),
+        values_bytes: &lz4_roundtrip_compress(&[0u8; 8]),
+    };
+    let err = decode_shard_ref(
+        &encoded,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Uint32,
+        usize::MAX / 4, // n_rows
+        2,
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CodecError::MalformedInput(_)),
+        "expected MalformedInput, got {err:?}"
+    );
+}
+
+#[test]
+fn test_lz4_indptr_only_bomb_is_capped() {
+    // `decode_indptr_only`'s Lz4Shuffle arm carried the same hole as the full
+    // decoder and is reached independently (indptr-only reads).
+    let bomb = lz4_bomb(BOMB_BYTES);
+    let err = decode_indptr_only(&bomb, CodecId::Lz4Shuffle, 2).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds limit"),
+        "expected the decompression cap to fire before allocating, got: {msg}"
+    );
+}
+
+#[test]
+fn test_pcodec_float_values_are_bounded_before_decompression() {
+    // Pcodec's float arms called `pco::standalone::simple_decompress` with no
+    // bound and checked the length only afterwards. Build a genuine pcodec
+    // stream of many floats, then declare a tiny `nnz`.
+    const N: usize = 1 << 20; // 1Mi floats → 4 MiB decoded
+    let floats = vec![0.0f32; N];
+    let values = pco::standalone::simple_compress(&floats, &pco::ChunkConfig::default()).unwrap();
+
+    let indptr_raw: Vec<u8> = [0u64, 1, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indices_raw: Vec<u8> = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indptr = zstd::encode_all(indptr_raw.as_slice(), 3).unwrap();
+    let indices = zstd::encode_all(indices_raw.as_slice(), 3).unwrap();
+
+    let encoded = EncodedShardRef {
+        indptr_bytes: &indptr,
+        indices_bytes: &indices,
+        values_bytes: &values,
+    };
+    let err = decode_shard_ref(
+        &encoded,
+        CodecId::Pcodec,
+        ValueEncoding::Float32,
+        2, // n_rows
+        2, // nnz → 2 floats declared, 1Mi present
+        false,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds limit"),
+        "expected the element cap to fire before decompressing, got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The CSR shape invariant at the decode boundary
 //
 // A decoded shard is three arrays that must agree, and they are produced by

@@ -20,6 +20,13 @@ zstd = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
+# Already regular dependencies; also needed by `tests/malformed_inputs.rs`, which
+# hand-builds oversized compressed sub-streams (an LZ4 frame stream-compressed
+# without materialising it, and a pcodec stream of 1Mi floats) to prove the
+# decode paths cap their output before allocating it.
+lz4_flex = { workspace = true }
+pco = { workspace = true }
+zstd = { workspace = true }
 
 [[bench]]
 name = "codec_bench"

@@ -66,6 +66,12 @@ jobs:
           - { crate: scx-codec,  target: fuzz_delta_golomb }
           - { crate: scx-codec,  target: fuzz_forbp }
           - { crate: scx-codec,  target: fuzz_rice }
+          # Composite-level targets: these drive `decode_shard_ref`, where a
+          # codec's guards are actually applied. `fuzz_shufdelta` existed but
+          # was never listed here, so it was build-checked and never run.
+          - { crate: scx-codec,  target: fuzz_shufdelta }
+          - { crate: scx-codec,  target: fuzz_lz4_shuffle }
+          - { crate: scx-codec,  target: fuzz_pcodec }
           - { crate: scx-format, target: fuzz_header }
           - { crate: scx-format, target: fuzz_shard }
           - { crate: scx-format, target: fuzz_catalog }
