@@ -123,9 +123,6 @@ impl ScxLazyTransformedDataset {
     /// `ColumnShardSource` trait impl on `LazyShardSource`. Crate-private
     /// because `LazyShardSource` itself is `pub(crate)`.
     ///
-    /// `#[allow(dead_code)]` until consumers in `pyscx::accel` reach
-    /// for it.
-    #[allow(dead_code)]
     pub(crate) fn as_column_source(&self) -> Option<LazyShardSource> {
         let source = self.as_shard_source();
         if source.supports_csc() {

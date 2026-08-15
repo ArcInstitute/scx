@@ -118,9 +118,7 @@ impl LazyShardSource {
     ///
     /// Predicate used by `ScxLazyTransformedDataset::as_column_source()`
     /// (the analog to `ScxBackedSparseDataset::as_column_source` for
-    /// the lazy-transformed wrapper). `#[allow(dead_code)]` until the
-    /// CSC consumers in `pyscx::accel` reach for it.
-    #[allow(dead_code)]
+    /// the lazy-transformed wrapper).
     pub(crate) fn supports_csc(&self) -> bool {
         self.backed_csc.is_some()
             && self.transforms.iter().all(Transform::is_column_local)

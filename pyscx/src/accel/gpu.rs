@@ -282,6 +282,7 @@ pub(crate) struct RapidsInfo {
     pub cupy_version: Option<String>,
 }
 
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 fn module_version(py: Python<'_>, module: &str) -> Option<String> {
     py.import(module)
         .ok()
@@ -296,7 +297,7 @@ fn module_version(py: Python<'_>, module: &str) -> Option<String> {
 ///
 /// Used by the Phase 1.3/1.4 op routers via
 /// [`crate::accel::route::rapids_exec_info`].
-#[allow(dead_code)] // first consumers land in Phase 1.3/1.4
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 pub(crate) fn rapids_singlecell_info(py: Python<'_>) -> RapidsInfo {
     static INFO: std::sync::OnceLock<RapidsInfo> = std::sync::OnceLock::new();
     INFO.get_or_init(|| {
@@ -316,7 +317,7 @@ pub(crate) fn rapids_singlecell_info(py: Python<'_>) -> RapidsInfo {
 /// Whether cuPy is importable. cuPy (not rapids) is the hard requirement for the
 /// `to_gpu_anndata` device handoff — the returned `X` is a
 /// `cupyx.scipy.sparse.csr_matrix`. Returns the version string when present.
-#[allow(dead_code)] // consumed by the gpu-gated to_gpu_anndata (1.2)
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 pub(crate) fn cupy_info(py: Python<'_>) -> Option<String> {
     module_version(py, "cupy")
 }
