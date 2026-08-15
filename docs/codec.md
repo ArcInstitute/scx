@@ -214,8 +214,9 @@ a small shard force an arbitrarily large allocation from untrusted input.
 - ~3.1× compression on float data (vs ~2.9× for Zstd on Smart-seq2)
 - ~1.5× faster decompression than Zstd on typical data
 - Available via `codec="lz4"` in `from_anndata()` and `scx convert`, and
-  **auto-selected for integer ATAC counts** by the per-modality heuristic
-  (§13) — the modality-blind heuristic in §8 never picks it.
+  **auto-selected for non-binary integer ATAC counts** by the per-modality
+  heuristic (§13) — binary `Uint8` ATAC goes to Zstd, and the modality-blind
+  heuristic in §8 never picks it.
 
 Implementation: `scx-codec/src/shuffle.rs`, `scx-codec/src/dispatch.rs`.
 

@@ -24,6 +24,7 @@ fuzz_target!(|data: &[u8]| {
         ValueEncoding::Uint16,
         ValueEncoding::Uint32,
         ValueEncoding::Float32,
+        ValueEncoding::Float16,
     ] {
         for idx16 in [true, false] {
             for &(n_rows, nnz) in &[(0usize, 0usize), (1, 4), (10, 100)] {

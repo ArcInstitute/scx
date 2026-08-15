@@ -719,3 +719,103 @@ fn row_group_names_the_group_for_a_short_forbp_stream() {
         "error does not name the failing group: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression: the Pcodec float arms must decode what this crate encodes.
+//
+// The bounded-decode work above briefly guarded `pcodec_decompress_bounded`
+// with `bound_capacity`, whose "at least 1 bit per output value" floor is a
+// property of the Scx1 Golomb/Rice codes and **not** of pcodec, which is an
+// entropy coder. Low-entropy float payloads — a constant layer, or raw counts
+// stored as `f32`, which is the standard AnnData layout — compress below that
+// floor, so the guard rejected shards `encode_shard` had just produced.
+//
+// These are round trips through the public API, at nnz large enough to leave
+// the region where pcodec's per-chunk overhead keeps the ratio above 1
+// bit/value. The pre-existing dispatch proptests cannot see this: `arb_csr`
+// caps nnz near 1000, which stays above the floor.
+// ---------------------------------------------------------------------------
+
+/// Build a CSR shard: `n_rows` rows of `per_row` entries, values from `f`.
+fn pcodec_shard(
+    n_rows: usize,
+    per_row: usize,
+    encoding: ValueEncoding,
+    f: impl Fn(usize) -> f32,
+) -> (Vec<u64>, Vec<u32>, Vec<u8>, usize) {
+    let nnz = n_rows * per_row;
+    let indptr: Vec<u64> = (0..=n_rows).map(|r| (r * per_row) as u64).collect();
+    let indices: Vec<u32> = (0..nnz).map(|i| (i % per_row) as u32).collect();
+    let floats: Vec<f32> = (0..nnz).map(&f).collect();
+    let values = values_to_raw_bytes(&floats, encoding).unwrap();
+    (indptr, indices, values, nnz)
+}
+
+fn assert_pcodec_roundtrips(label: &str, encoding: ValueEncoding, f: impl Fn(usize) -> f32) {
+    // 500 rows × 200 = 100_000 nnz — a realistic shard size, and far enough
+    // past pcodec's chunk overhead that low-entropy data lands under 1 bit/value.
+    let (indptr, indices, values, nnz) = pcodec_shard(500, 200, encoding, f);
+    let encoded = scx_codec::dispatch::encode_shard(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::Pcodec,
+        encoding,
+        false,
+    )
+    .unwrap();
+
+    // Premise: this payload really is compressed below the 1-bit-per-value
+    // floor. If it were not, the test would pass for the wrong reason.
+    let bits_per_value = (encoded.values_bytes.len() as f64 * 8.0) / nnz as f64;
+    assert!(
+        bits_per_value < 1.0,
+        "{label}: premise failed — {bits_per_value:.3} bits/value is above the \
+         1-bit floor, so this case would not exercise the regression"
+    );
+
+    let decoded = scx_codec::dispatch::decode_shard(
+        &encoded,
+        CodecId::Pcodec,
+        encoding,
+        500,
+        nnz,
+        false,
+    )
+    .unwrap_or_else(|e| {
+        panic!("{label}: encode→decode round trip failed at {bits_per_value:.3} bits/value: {e}")
+    });
+    assert_eq!(decoded.0.len(), 501, "{label}: indptr length");
+    assert_eq!(decoded.1.len(), nnz, "{label}: indices length");
+    assert_eq!(
+        decoded.2.len(),
+        nnz * encoding.byte_width(),
+        "{label}: values byte length"
+    );
+    assert_eq!(decoded.2, values, "{label}: values must round-trip exactly");
+}
+
+#[test]
+fn test_pcodec_low_entropy_float_roundtrip() {
+    // A constant layer: pcodec reaches ~0 bits/value.
+    assert_pcodec_roundtrips("constant f32", ValueEncoding::Float32, |_| 1.0);
+
+    // Raw counts stored as f32 — mostly 1.0, some 2.0, few 3/4. This is what
+    // an AnnData `X` of raw scRNA-seq counts looks like, and it measures
+    // ~0.96 bits/value: under the floor, and not a degenerate input.
+    assert_pcodec_roundtrips("raw counts as f32", ValueEncoding::Float32, |i| {
+        match (i * 2_654_435_761) % 100 {
+            0..=79 => 1.0,
+            80..=93 => 2.0,
+            94..=97 => 3.0,
+            _ => 4.0,
+        }
+    });
+}
+
+#[test]
+fn test_pcodec_low_entropy_float16_roundtrip() {
+    // The Float16 arm decodes through the same pcodec helper (as f32, then
+    // narrowed), so it carried the same false rejection.
+    assert_pcodec_roundtrips("constant f16", ValueEncoding::Float16, |_| 1.0);
+}

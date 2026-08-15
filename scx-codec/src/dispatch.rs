@@ -1095,7 +1095,10 @@ pub fn zstd_decode_bounded(data: &[u8], max_bytes: usize) -> Result<Vec<u8>, Cod
     let decoder = zstd::Decoder::new(data)?;
     // Cap initial allocation to avoid huge alloc from untrusted max_bytes
     let mut output = Vec::with_capacity(max_bytes.min(1 << 20));
-    let mut limited = decoder.take(max_bytes as u64 + 1);
+    // `saturating_add` for the same reason as `lz4_frame_decompress`: unreachable
+    // today, but a `+ 1` here would be a panic rather than an error under this
+    // crate's release `overflow-checks`.
+    let mut limited = decoder.take((max_bytes as u64).saturating_add(1));
     limited.read_to_end(&mut output)?;
     if output.len() > max_bytes {
         return Err(CodecError::Io(std::io::Error::new(
@@ -1170,7 +1173,12 @@ fn lz4_frame_decompress(data: &[u8], max_bytes: usize) -> Result<Vec<u8>, CodecE
     use std::io::Read;
     let decoder = lz4_flex::frame::FrameDecoder::new(data);
     let mut out = Vec::with_capacity(max_bytes.min(1 << 20));
-    let mut limited = decoder.take(max_bytes as u64 + 1);
+    // `saturating_add`: no current caller can reach `max_bytes == usize::MAX`
+    // (the indices arm's `checked_len(nnz, >= 2)` errors first), but this crate
+    // sets `overflow-checks = true` in release, so a plain `+ 1` would make a
+    // reader panic rather than error if a future caller ever did. Keep the
+    // property local to the guard instead of resting it on call order.
+    let mut limited = decoder.take((max_bytes as u64).saturating_add(1));
     limited.read_to_end(&mut out)?;
     if out.len() > max_bytes {
         return Err(CodecError::Io(std::io::Error::new(
@@ -1598,13 +1606,30 @@ fn encode_pcodec(
 /// a shard declaring two values could decompress a million — the length check
 /// downstream then fires one full allocation too late. `simple_decompress_into`
 /// writes at most `dst.len()` numbers, so the declared shape caps the
-/// allocation the way `zstd_decode_bounded` does for the integer arms.
+/// allocation the way `zstd_decode_bounded` does for the integer arms. That cap
+/// — plus the `finished` / `n_processed` checks below — *is* the bomb defence
+/// here; nothing else is needed and nothing else is correct.
 ///
-/// `n_values` is itself bounded against the input first: pcodec cannot emit
-/// more numbers than the compressed stream has bits, the same loose-but-real
-/// bound [`bound_capacity`] applies to the Scx1 primitives.
+/// **Do not add a compression-ratio plausibility bound to this function.**
+/// [`bound_capacity`] is sound only for the Scx1 primitives, whose Golomb/Rice
+/// codes spend at least one input bit per output value. pcodec is an entropy
+/// coder with no such floor: a constant run costs ~0 bits/value, and ordinary
+/// single-cell payloads sit under it too — raw counts stored as `f32` (the
+/// standard AnnData layout, ~80% ones) measure ≈0.96 bits/value. Applying the
+/// 1-bit floor here rejected shards this crate's *own encoder* had just
+/// produced, at every realistic shard size. See
+/// `test_pcodec_low_entropy_float_roundtrip`.
+///
+/// `n_values` needs no plausibility bound of its own, because it has already
+/// been corroborated by real bytes before this is reached: `decode_pcodec_ref`
+/// decodes the indices sub-stream first, and `le_bytes_to_indices` demands an
+/// *exact* `n_values * index_width` bytes. A hostile `nnz` therefore dies
+/// there, one allocation of the same magnitude earlier — exactly as it does on
+/// the `decode_zstd_ref` path. The `checked_len` below is only an overflow
+/// guard, so a `n_values` near `usize::MAX` returns an error instead of
+/// panicking in `vec![0f32; _]` with `capacity overflow`.
 fn pcodec_decompress_bounded(data: &[u8], n_values: usize) -> Result<Vec<f32>, CodecError> {
-    bound_capacity(n_values, data.len(), "pcodec values")?;
+    checked_len(n_values, std::mem::size_of::<f32>(), "pcodec values")?;
     let mut out = vec![0f32; n_values];
     let progress = pco::standalone::simple_decompress_into(data, &mut out)
         .map_err(|e| CodecError::Io(std::io::Error::other(e.to_string())))?;
