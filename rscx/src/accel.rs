@@ -1043,7 +1043,9 @@ fn nbglm_options(
 /// @param test_col Which groupby column holds the condition being tested.
 /// @param reference Reference level in `test_col` (the DE baseline).
 /// @param gene_names Gene names, length n_genes.
-/// @param aggr_method `"sum"` or `"mean"` pseudobulk aggregation.
+/// @param aggr_method Must be `"sum"`; the NB count model is defined on summed
+///   replicate counts, so `"mean"` is refused here (pyscx's pydeseq2 backend is
+///   the way to get mean aggregation).
 /// @param min_cells_per_group Drop pseudobulk groups with fewer cells.
 /// @param dispersion `"cox_reid_shrunk"` / `"cox_reid_mle"` / `"moments"`.
 /// @param cooks_filtering,independent_filtering DESeq2 results-stage filters.
@@ -1131,9 +1133,27 @@ fn scx_pseudobulk_dex_matrix_impl(
             n_vars
         )));
     }
+    // The NB count likelihood is defined on replicate-level *summed* counts, so
+    // a fractional aggregate is not a valid input to the model. rscx exposes
+    // only the NB-GLM backend, so `mean` has no engine to fall back to here and
+    // is refused up front. Without this the call reached the NB-GLM input
+    // validator, which reported a fractional cell
+    // ("counts[gene=0, sample=0] = 4.35 must be an integer count") — true, but
+    // it names an interior coordinate rather than the argument at fault.
+    // pyscx draws the same line, and its `backend="pydeseq2"` is the way to get
+    // mean aggregation.
     let agg = match aggr_method {
         "sum" => AggregationMethod::Sum,
-        "mean" => AggregationMethod::Mean,
+        "mean" => {
+            return Err(Error::Other(
+                "scx_pseudobulk_dex requires aggr_method='sum' (got 'mean'): the \
+                 negative-binomial count model is defined on summed replicate counts, \
+                 not fractional mean aggregates. Use aggr_method='sum', or for mean \
+                 aggregation use pyscx pseudobulk_dex(backend='pydeseq2', \
+                 aggr_method='mean'), which rscx does not expose."
+                    .to_string(),
+            ))
+        }
         other => {
             return Err(Error::Other(format!(
                 "unknown aggr_method '{other}' (expected 'sum' or 'mean')"

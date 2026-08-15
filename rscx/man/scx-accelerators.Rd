@@ -266,7 +266,9 @@ groupby.}
 
 \item{test_col}{The \code{group_by} column holding the condition being tested.}
 
-\item{aggr_method}{Pseudobulk aggregation, \code{"sum"} (default) or \code{"mean"}.}
+\item{aggr_method}{Pseudobulk aggregation, \code{"sum"} (default) or \code{"mean"}.
+\code{scx_pseudobulk_dex()} accepts only \code{"sum"}: its negative-binomial count
+model is defined on summed replicate counts, not fractional aggregates.}
 
 \item{dispersion}{Dispersion estimator: \code{"cox_reid_shrunk"} (default),
 \code{"cox_reid_mle"}, or \code{"moments"}.}

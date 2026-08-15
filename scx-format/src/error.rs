@@ -364,6 +364,39 @@ pub fn validate_allocation(requested: usize, section_remaining: usize) -> Result
     Ok(())
 }
 
+impl From<scx_codec::CodecError> for ScxError {
+    /// Lift a codec error, promoting the one variant that is really a
+    /// *file-corruption* report rather than a codec failure.
+    ///
+    /// `CodecError::IndexOutOfRange` is raised when a decoded minor-axis index
+    /// falls outside the shard's declared column axis. On the scipy decode path
+    /// that check rides on the scan `scx-codec` already performs for the
+    /// `i32::MAX` sign guard, so it surfaces as a codec error; on the native
+    /// path the reader runs its own pass and raises
+    /// [`ScxError::ShardIndexOutOfRange`] directly.
+    ///
+    /// Mapping them together matters because they classify differently:
+    /// `Codec(_)` is [`ScxErrorClass::Other`] (a `RuntimeError` in pyscx) while
+    /// `ShardIndexOutOfRange` is [`ScxErrorClass::CorruptFile`] (a `ValueError`
+    /// naming the file as corrupt). Without this the same broken file would
+    /// raise two different Python exception types depending on whether the
+    /// caller asked for `f32` or a narrowed dtype.
+    fn from(e: scx_codec::CodecError) -> Self {
+        match e {
+            scx_codec::CodecError::IndexOutOfRange {
+                index,
+                position,
+                bound,
+            } => ScxError::ShardIndexOutOfRange {
+                index,
+                position,
+                n_minor: bound,
+            },
+            other => ScxError::Codec(other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,38 +592,5 @@ mod tests {
             ScxError::CscTranspose("boom".into()).class(),
             ScxErrorClass::Other
         );
-    }
-}
-
-impl From<scx_codec::CodecError> for ScxError {
-    /// Lift a codec error, promoting the one variant that is really a
-    /// *file-corruption* report rather than a codec failure.
-    ///
-    /// `CodecError::IndexOutOfRange` is raised when a decoded minor-axis index
-    /// falls outside the shard's declared column axis. On the scipy decode path
-    /// that check rides on the scan `scx-codec` already performs for the
-    /// `i32::MAX` sign guard, so it surfaces as a codec error; on the native
-    /// path the reader runs its own pass and raises
-    /// [`ScxError::ShardIndexOutOfRange`] directly.
-    ///
-    /// Mapping them together matters because they classify differently:
-    /// `Codec(_)` is [`ScxErrorClass::Other`] (a `RuntimeError` in pyscx) while
-    /// `ShardIndexOutOfRange` is [`ScxErrorClass::CorruptFile`] (a `ValueError`
-    /// naming the file as corrupt). Without this the same broken file would
-    /// raise two different Python exception types depending on whether the
-    /// caller asked for `f32` or a narrowed dtype.
-    fn from(e: scx_codec::CodecError) -> Self {
-        match e {
-            scx_codec::CodecError::IndexOutOfRange {
-                index,
-                position,
-                bound,
-            } => ScxError::ShardIndexOutOfRange {
-                index,
-                position,
-                n_minor: bound,
-            },
-            other => ScxError::Codec(other),
-        }
     }
 }
