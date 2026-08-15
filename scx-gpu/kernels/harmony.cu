@@ -556,42 +556,6 @@ extern "C" __global__ void harmony_z_sum_kernel(
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Kernel 4 — Batched correction scatter-subtract.
-//
-// For a single cluster k and a single qualifying batch b (a list of
-// cell indices `cells` of length `n_cells`, along with per-PC weight
-// vector `w_row` of length d), apply:
-//     Z_corr[:, cells[j]] -= w_row * R_row_k[cells[j]]   for j in 0..n_cells
-//
-// R_row_k is R[k, :] (length N, from the K×N row-major R matrix).
-//
-// Grid: 2D launch with (n_cells, d) threads mapped via 1D global index.
-// Each thread updates one (cell-in-batch, t) slot in Z_corr.
-// ──────────────────────────────────────────────────────────────────────
-extern "C" __global__ void harmony_correction_kernel(
-    float* __restrict__ Z_corr,          // [d x N], col-major
-    int d,
-    int N,
-    const int* __restrict__ cells,       // [n_cells]
-    int n_cells,
-    const float* __restrict__ R_row_k,   // [N]
-    const float* __restrict__ w_row      // [d]
-) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = (long long)n_cells * (long long)d;
-    if (idx >= total) return;
-
-    int j = (int)(idx / d);
-    int t = (int)(idx - (long long)j * d);
-
-    int cell = cells[j];
-    float r = R_row_k[cell];
-    if (r == 0.0f) return;  // nothing to subtract
-
-    Z_corr[(long long)cell * d + t] -= w_row[t] * r;
-}
-
-// ──────────────────────────────────────────────────────────────────────
 // Kernel 4b — Grouped correction scatter-subtract for one cluster.
 //
 // Replaces the K * B' per-(cluster, batch) launches with one launch

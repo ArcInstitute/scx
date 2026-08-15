@@ -135,8 +135,7 @@ pub use cublas::{gpu_sgemm, gpu_sgemv, gpu_sger, gpu_strsm, gpu_transpose_f32, C
 pub use curand::random_gaussian_gpu;
 pub use cusolver::{gpu_cholesky_qr2, gpu_qr_q, CusolverHandle, QrMethod};
 pub use cusparse::{
-    cusparse_modern_abi_available, spmm_csr, spmm_csr_transpose, CusparseHandle,
-    CusparseSpMatDescr, DnMatDescr, GpuCsrPointers,
+    cusparse_modern_abi_available, CusparseHandle, CusparseSpMatDescr, DnMatDescr, GpuCsrPointers,
 };
 pub use device::{flat_launch_1d, GpuDevice};
 pub use device_resident::{DeviceEmbedding, DeviceKnnGraph};
@@ -156,10 +155,10 @@ pub use gpu_diffexp::{
 pub use gpu_graph::{capture_graph, cuda_graphs_enabled, set_cuda_graphs_enabled_override};
 pub use gpu_harmony::{
     gpu_harmony_block_oe_update, gpu_harmony_block_softmax_penalty, gpu_harmony_compute_o_e_full,
-    gpu_harmony_correction, gpu_harmony_correction_grouped, gpu_harmony_distances,
-    gpu_harmony_distances_gemm, gpu_harmony_fits, gpu_harmony_l2_normalize_cols,
-    gpu_harmony_memory_bytes, gpu_harmony_obj_cross, gpu_harmony_obj_kmeans_entropy,
-    gpu_harmony_reduce_objective, gpu_harmony_softmax, gpu_harmony_z_sum,
+    gpu_harmony_correction_grouped, gpu_harmony_distances, gpu_harmony_distances_gemm,
+    gpu_harmony_fits, gpu_harmony_l2_normalize_cols, gpu_harmony_memory_bytes,
+    gpu_harmony_obj_cross, gpu_harmony_obj_kmeans_entropy, gpu_harmony_reduce_objective,
+    gpu_harmony_softmax, gpu_harmony_z_sum,
 };
 pub use gpu_hvg::{
     gpu_streaming_clip_square_sum, gpu_streaming_clip_square_sum_batched,

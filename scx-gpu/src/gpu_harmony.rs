@@ -834,77 +834,6 @@ pub fn gpu_harmony_z_sum(
     Ok(())
 }
 
-/// Apply a single per-(cluster, batch) correction to `Z_corr`.
-///
-/// For each cell index `c_j` in `cells`, subtracts `w_row * R_row_k[c_j]`
-/// from column `c_j` of `Z_corr`. Intended to be called in a loop over
-/// all (cluster, kept-batch) pairs on the CPU side.
-pub fn gpu_harmony_correction(
-    dev: &GpuDevice,
-    z_corr: &mut CudaSlice<f32>,
-    d: usize,
-    n: usize,
-    cells: &CudaSlice<i32>,
-    r_row_k: &CudaSlice<f32>,
-    w_row: &CudaSlice<f32>,
-) -> Result<(), GpuError> {
-    let n_cells = cells.len();
-    if n_cells == 0 || d == 0 {
-        return Ok(());
-    }
-    if z_corr.len() < d * n {
-        return Err(GpuError::ShapeMismatch {
-            expected: format!("Z_corr length >= d*N = {}", d * n),
-            got: format!("{}", z_corr.len()),
-        });
-    }
-    if r_row_k.len() < n {
-        return Err(GpuError::ShapeMismatch {
-            expected: format!("R_row_k length >= N = {n}"),
-            got: format!("{}", r_row_k.len()),
-        });
-    }
-    if w_row.len() < d {
-        return Err(GpuError::ShapeMismatch {
-            expected: format!("w_row length >= d = {d}"),
-            got: format!("{}", w_row.len()),
-        });
-    }
-
-    let module = dev.load_module_cached(HARMONY_PTX)?;
-    let func = module
-        .load_function("harmony_correction_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_correction: {e}")))?;
-
-    let total: u64 = (n_cells as u64) * (d as u64);
-    let threads: u32 = 256;
-    let blocks = (total as u32).div_ceil(threads).max(1);
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    let d_i32 = d as i32;
-    let n_i32 = n as i32;
-    let n_cells_i32 = n_cells as i32;
-
-    unsafe {
-        dev.stream()
-            .launch_builder(&func)
-            .arg(z_corr)
-            .arg(&d_i32)
-            .arg(&n_i32)
-            .arg(cells)
-            .arg(&n_cells_i32)
-            .arg(r_row_k)
-            .arg(w_row)
-            .launch(cfg)
-    }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_correction: {e}")))?;
-    Ok(())
-}
-
 /// Apply correction for one cluster across all kept batches in a single launch.
 ///
 /// Replaces the K * B' per-(cluster, batch) launches with one launch
@@ -1280,46 +1209,6 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA GPU"]
-    fn test_correction_kernel() {
-        let dev = require_gpu!();
-        let d = 3usize;
-        let n = 5usize;
-        // Z_corr columns = [1,1,1] replicated.
-        let z_host = vec![1.0f32; d * n];
-        let r_row: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
-        let w_row: Vec<f32> = vec![0.5, 0.25, 0.125];
-        let cells: Vec<i32> = vec![1, 3]; // subtract at cells 1 and 3
-
-        let mut z = dev.htod_copy(&z_host).unwrap();
-        let r = dev.htod_copy(&r_row).unwrap();
-        let w = dev.htod_copy(&w_row).unwrap();
-        let c = dev.htod_copy(&cells).unwrap();
-        gpu_harmony_correction(&dev, &mut z, d, n, &c, &r, &w).unwrap();
-        dev.synchronize().unwrap();
-        let got = dev.dtoh_copy(&z).unwrap();
-
-        for i in 0..n as i32 {
-            let col = &got[(i as usize) * d..(i as usize + 1) * d];
-            if cells.contains(&i) {
-                let r_ki = r_row[i as usize];
-                for t in 0..d {
-                    let expected = 1.0 - w_row[t] * r_ki;
-                    assert!(
-                        (col[t] - expected).abs() < 1e-5,
-                        "cell {i}, t={t}: {} vs {expected}",
-                        col[t]
-                    );
-                }
-            } else {
-                for &v in col {
-                    assert!((v - 1.0).abs() < 1e-6);
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
     fn test_z_sum_kernel_matches_cpu() {
         // Per-cluster z-sum: z_sum[j, t] = sum_{i in batch j} R[k,i] * Z[t,i].
         let dev = require_gpu!();
@@ -1398,9 +1287,17 @@ mod tests {
     #[test]
     #[ignore = "requires a CUDA GPU"]
     fn test_correction_grouped_matches_per_pair() {
-        // Per-pair launches and one grouped launch must produce
-        // bit-equivalent output (no atomics involved — disjoint cell
-        // writes per (j, t)).
+        // The grouped launch must reproduce a host reference. This used to
+        // compare against per-(cluster, batch) `gpu_harmony_correction`
+        // launches — one GPU kernel as the oracle for another, which proves
+        // agreement rather than correctness. That kernel is deleted (it also
+        // carried the §8.18 `u64 → u32` grid-count truncation); the reference
+        // below is the arithmetic the kernel is supposed to implement:
+        //
+        //     Z[t, c] -= w[j][t] * R[c]   for every cell c in kept batch j
+        //
+        // No atomics are involved — the (j, t) writes are disjoint per cell —
+        // so the comparison is exact.
         let dev = require_gpu!();
         let d = 4usize;
         let n = 12usize;
@@ -1417,17 +1314,16 @@ mod tests {
         // R[ku, :] for the cluster being tested.
         let r_row: Vec<f32> = (0..n).map(|i| 0.05 * (i as f32 + 1.0)).collect();
 
-        // --- Baseline: per-pair launches ---
-        let mut z_baseline = dev.htod_copy(&z_initial).unwrap();
+        // --- Baseline: host reference ---
         let r = dev.htod_copy(&r_row).unwrap();
-        let d_cells_b0 = dev.htod_copy(&cells_b0).unwrap();
-        let d_cells_b1 = dev.htod_copy(&cells_b1).unwrap();
-        let d_w_b0 = dev.htod_copy(&w_b0).unwrap();
-        let d_w_b1 = dev.htod_copy(&w_b1).unwrap();
-        gpu_harmony_correction(&dev, &mut z_baseline, d, n, &d_cells_b0, &r, &d_w_b0).unwrap();
-        gpu_harmony_correction(&dev, &mut z_baseline, d, n, &d_cells_b1, &r, &d_w_b1).unwrap();
-        dev.synchronize().unwrap();
-        let got_baseline = dev.dtoh_copy(&z_baseline).unwrap();
+        let mut got_baseline = z_initial.clone();
+        for (cells, w) in [(&cells_b0, &w_b0), (&cells_b1, &w_b1)] {
+            for &c in cells.iter() {
+                for t in 0..d {
+                    got_baseline[(c as usize) * d + t] -= w[t] * r_row[c as usize];
+                }
+            }
+        }
 
         // --- Grouped: one launch ---
         let mut z_grouped = dev.htod_copy(&z_initial).unwrap();

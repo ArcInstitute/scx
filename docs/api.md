@@ -1244,11 +1244,17 @@ GPU-accelerated analysis APIs. Requires CUDA Toolkit ≥ 12.0 at build time.
 
 ### cuSPARSE SpMM
 
-#### `spmm_csr(handle, stream, a, b, c, m, k, n, alpha, beta) → Result<(), GpuError>`
-Sparse × dense matrix multiply: C = α·A·B + β·C. A is GPU-resident CSR, B/C are dense column-major f32.
+#### `spmm_csr_view_with_alg(handle, stream, dev, pool, a, b_view, c_view, alpha, beta, alg) → Result<(), GpuError>`
+Sparse × dense matrix multiply: C = α·A·B + β·C. A is GPU-resident CSR; B/C are
+`DnMatView` / `DnMatViewMut` over dense column-major f32, so a sub-block of a
+larger buffer can be read or written without a copy. `pool` reuses the cuSPARSE
+workspace across calls (the PCA power loop passes `Some`).
 
-#### `spmm_csr_transpose(handle, stream, a, b, c, m, k, n, alpha, beta) → Result<(), GpuError>`
-Transposed SpMM: C = α·A^T·B + β·C.
+#### `spmm_csr_transpose_view_with_alg(...) → Result<(), GpuError>`
+Transposed SpMM: C = α·A^T·B + β·C, same view-based signature.
+
+> The contiguous-buffer `spmm_csr` / `spmm_csr_transpose` wrappers were removed —
+> every production caller uses the strided-view entry points above.
 
 ### cuSOLVER Dense Operations
 
