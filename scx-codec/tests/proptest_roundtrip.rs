@@ -19,30 +19,64 @@ fn nonzero_val(max: u32) -> impl Strategy<Value = u32> {
     1..=max
 }
 
+/// Column counts spanning the u16/u32 index-dtype boundary.
+///
+/// The writer picks `index_dtype_u16` per shard from `index_max_value <=
+/// u16::MAX`, so a strategy that only ever produces `n_vars <= 65535` exercises
+/// exactly one of the two index encodings. This one straddles 65536
+/// deliberately, including both sides of the boundary exactly.
+fn arb_n_vars() -> impl Strategy<Value = u32> {
+    prop_oneof![
+        Just(1000u32),    // the historical value
+        Just(65_535),     // largest u16 index
+        Just(65_536),     // smallest u32 index
+        Just(200_000),    // comfortably u32
+        1000u32..150_000, // and a spread across the boundary
+    ]
+}
+
 /// Generate a random CSR matrix as (indptr, indices, values_u8).
 /// Returns (indptr, indices, values_raw, n_rows, nnz, index_dtype_u16).
+///
+/// `n_vars` is sampled from [`arb_n_vars`] rather than fixed, so every property
+/// built on this strategy sees both index dtypes. Per-row nnz is clamped to
+/// `n_vars` because the index generator draws *distinct* columns.
 fn arb_csr(
     max_rows: usize,
     max_nnz_per_row: usize,
     encoding: ValueEncoding,
 ) -> impl Strategy<Value = (Vec<u64>, Vec<u32>, Vec<u8>, usize, usize, bool)> {
-    (1..=max_rows).prop_flat_map(move |n_rows| {
-        prop::collection::vec(0..=max_nnz_per_row, n_rows).prop_flat_map(move |row_nnzs| {
+    (1..=max_rows, arb_n_vars()).prop_flat_map(move |(n_rows, n_vars)| {
+        let row_cap = max_nnz_per_row.min(n_vars as usize);
+        prop::collection::vec(0..=row_cap, n_rows).prop_flat_map(move |row_nnzs| {
             let total_nnz: usize = row_nnzs.iter().sum();
-            let n_vars = 1000u32; // use u16 indices
             let index_u16 = n_vars <= 65535;
 
-            // Generate sorted indices per row
+            // Sorted distinct indices *by construction*, via strictly positive
+            // gaps — never by rejection.
+            //
+            // The obvious `hash_set(0..n_vars, nnz)` draws `nnz` columns and
+            // rejects the whole row if any two collide, so its cost is the
+            // birthday problem: P(no collision) ≈ exp(-nnz² / 2·n_vars). That
+            // is ~0.82 at the old nnz ≤ 20 / n_vars = 1000, and ~2e-9 once nnz
+            // reaches 200 — every draw rejected, the property never runs. Gaps
+            // of `1..=n_vars/nnz` keep the last index below `n_vars` while
+            // costing one draw per element.
             let idx_strats: Vec<_> = row_nnzs
                 .iter()
                 .map(|&nnz| {
                     if nnz == 0 {
                         Just(vec![]).boxed()
                     } else {
-                        prop::collection::hash_set(0..n_vars, nnz)
-                            .prop_map(|set| {
-                                let mut v: Vec<u32> = set.into_iter().collect();
-                                v.sort_unstable();
+                        let max_gap = ((n_vars as usize / nnz).max(1)) as u32;
+                        prop::collection::vec(1..=max_gap, nnz)
+                            .prop_map(|gaps| {
+                                let mut v = Vec::with_capacity(gaps.len());
+                                let mut cur = 0u32;
+                                for g in gaps {
+                                    cur += g;
+                                    v.push(cur - 1);
+                                }
                                 v
                             })
                             .boxed()
@@ -214,12 +248,80 @@ proptest! {
 // Full dispatch round-trip property tests
 // =========================================================================
 
+// =========================================================================
+// Strategy coverage guard
+//
+// `arb_csr` used to hardcode `n_vars = 1000` and every caller passed
+// `max_nnz_per_row = 20`, so across all 18 dispatch properties the u32-index
+// branch and FOR-BP's BitPacker4x path (`nnz >= SIMD_THRESHOLD`) were reached
+// exactly zero times. Widening the ranges is only half the fix — a range that
+// never samples the far side is the same vacuum in a new costume. This asserts
+// the generator actually reaches both sides of both boundaries.
+// =========================================================================
+
+#[test]
+fn arb_csr_reaches_both_index_dtypes_and_both_sides_of_simd_threshold() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
+
+    // 12 rows keeps each draw cheap — every draw still yields 12 per-row nnz
+    // samples, so a few dozen draws give hundreds of SIMD-threshold
+    // observations. Building the full 50-row strategy 256 times costs minutes
+    // in a debug build, and this guard runs on every `cargo test`.
+    let strat = arb_csr(12, 200, ValueEncoding::Uint32);
+    // Each draw rejection-samples one index set per row, so the default
+    // per-runner local-reject budget (1000) is spent long before the loop ends.
+    // Deterministic RNG so the coverage assertion cannot flake.
+    let cfg = ProptestConfig {
+        max_local_rejects: 1 << 22,
+        ..ProptestConfig::default()
+    };
+    let mut runner =
+        TestRunner::new_with_rng(cfg, TestRng::deterministic_rng(RngAlgorithm::ChaCha));
+
+    let (mut u16_idx_seen, mut u32_idx_seen) = (0usize, 0usize);
+    let (mut below_simd, mut at_or_above_simd) = (0usize, 0usize);
+
+    for _ in 0..64 {
+        let (indptr, _, _, _, _, u16_idx) = strat.new_tree(&mut runner).unwrap().current();
+        if u16_idx {
+            u16_idx_seen += 1;
+        } else {
+            u32_idx_seen += 1;
+        }
+        for w in indptr.windows(2) {
+            let row_nnz = (w[1] - w[0]) as usize;
+            if row_nnz >= scx_codec::forbp::SIMD_THRESHOLD {
+                at_or_above_simd += 1;
+            } else {
+                below_simd += 1;
+            }
+        }
+    }
+
+    // A tenth, not "at least one": each dispatch property runs only 30 cases,
+    // so a branch reached once in 64 draws would still be absent from most
+    // properties most runs. Both shares sit near a half by construction, so
+    // this has wide margin while still failing if either branch becomes rare.
+    let draws = u16_idx_seen + u32_idx_seen;
+    assert!(
+        u16_idx_seen * 10 >= draws && u32_idx_seen * 10 >= draws,
+        "each index dtype must be a real share of draws, got u16={u16_idx_seen} u32={u32_idx_seen} of {draws}"
+    );
+    let rows = below_simd + at_or_above_simd;
+    assert!(
+        below_simd * 10 >= rows && at_or_above_simd * 10 >= rows,
+        "per-row nnz must straddle SIMD_THRESHOLD={} in both directions, got below={below_simd} at_or_above={at_or_above_simd} of {rows}",
+        scx_codec::forbp::SIMD_THRESHOLD
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(30))]
 
     #[test]
     fn dispatch_none_u8_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint8)
+        data in arb_csr(50, 200, ValueEncoding::Uint8)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Uint8, u16_idx).unwrap();
@@ -231,7 +333,7 @@ proptest! {
 
     #[test]
     fn dispatch_scx1_u8_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint8)
+        data in arb_csr(50, 200, ValueEncoding::Uint8)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Scx1, ValueEncoding::Uint8, u16_idx).unwrap();
@@ -243,7 +345,7 @@ proptest! {
 
     #[test]
     fn dispatch_scx1_u16_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint16)
+        data in arb_csr(50, 200, ValueEncoding::Uint16)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Scx1, ValueEncoding::Uint16, u16_idx).unwrap();
@@ -255,7 +357,7 @@ proptest! {
 
     #[test]
     fn dispatch_zstd_u32_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint32)
+        data in arb_csr(50, 200, ValueEncoding::Uint32)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Zstd, ValueEncoding::Uint32, u16_idx).unwrap();
@@ -267,7 +369,7 @@ proptest! {
 
     #[test]
     fn dispatch_lz4shuffle_u8_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint8)
+        data in arb_csr(50, 200, ValueEncoding::Uint8)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Uint8, u16_idx).unwrap();
@@ -279,7 +381,7 @@ proptest! {
 
     #[test]
     fn dispatch_lz4shuffle_u16_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint16)
+        data in arb_csr(50, 200, ValueEncoding::Uint16)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Uint16, u16_idx).unwrap();
@@ -291,7 +393,7 @@ proptest! {
 
     #[test]
     fn dispatch_lz4shuffle_u32_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint32)
+        data in arb_csr(50, 200, ValueEncoding::Uint32)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Uint32, u16_idx).unwrap();
@@ -305,7 +407,7 @@ proptest! {
     /// the codec × encoding matrix for the canonical-matrix property.
     #[test]
     fn dispatch_lz4shuffle_f32_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Float32)
+        data in arb_csr(50, 200, ValueEncoding::Float32)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Float32, u16_idx).unwrap();
@@ -317,7 +419,7 @@ proptest! {
 
     #[test]
     fn dispatch_zstd_f32_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Float32)
+        data in arb_csr(50, 200, ValueEncoding::Float32)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Zstd, ValueEncoding::Float32, u16_idx).unwrap();
@@ -329,7 +431,7 @@ proptest! {
 
     #[test]
     fn dispatch_none_f32_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Float32)
+        data in arb_csr(50, 200, ValueEncoding::Float32)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Float32, u16_idx).unwrap();
@@ -341,7 +443,7 @@ proptest! {
 
     #[test]
     fn dispatch_pcodec_u8_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint8)
+        data in arb_csr(50, 200, ValueEncoding::Uint8)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Pcodec, ValueEncoding::Uint8, u16_idx).unwrap();
@@ -353,7 +455,7 @@ proptest! {
 
     #[test]
     fn dispatch_pcodec_u16_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint16)
+        data in arb_csr(50, 200, ValueEncoding::Uint16)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Pcodec, ValueEncoding::Uint16, u16_idx).unwrap();
@@ -365,7 +467,7 @@ proptest! {
 
     #[test]
     fn dispatch_pcodec_u32_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint32)
+        data in arb_csr(50, 200, ValueEncoding::Uint32)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Pcodec, ValueEncoding::Uint32, u16_idx).unwrap();
@@ -377,7 +479,7 @@ proptest! {
 
     #[test]
     fn dispatch_pcodec_f32_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Float32)
+        data in arb_csr(50, 200, ValueEncoding::Float32)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Pcodec, ValueEncoding::Float32, u16_idx).unwrap();
@@ -392,7 +494,7 @@ proptest! {
     /// value path).
     #[test]
     fn dispatch_shufdelta_u8_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint8)
+        data in arb_csr(50, 200, ValueEncoding::Uint8)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::ShufDeltaZstd, ValueEncoding::Uint8, u16_idx).unwrap();
@@ -404,7 +506,7 @@ proptest! {
 
     #[test]
     fn dispatch_shufdelta_u16_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint16)
+        data in arb_csr(50, 200, ValueEncoding::Uint16)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::ShufDeltaZstd, ValueEncoding::Uint16, u16_idx).unwrap();
@@ -416,7 +518,7 @@ proptest! {
 
     #[test]
     fn dispatch_shufdelta_u32_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Uint32)
+        data in arb_csr(50, 200, ValueEncoding::Uint32)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::ShufDeltaZstd, ValueEncoding::Uint32, u16_idx).unwrap();
@@ -428,7 +530,7 @@ proptest! {
 
     #[test]
     fn dispatch_shufdelta_f32_roundtrip(
-        data in arb_csr(50, 20, ValueEncoding::Float32)
+        data in arb_csr(50, 200, ValueEncoding::Float32)
     ) {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::ShufDeltaZstd, ValueEncoding::Float32, u16_idx).unwrap();
@@ -443,8 +545,8 @@ proptest! {
     /// uint16 — both with Scx1 codec.
     #[test]
     fn dispatch_scx1_mixed_u8_u16_roundtrip(
-        data_u8 in arb_csr(25, 20, ValueEncoding::Uint8),
-        data_u16 in arb_csr(25, 20, ValueEncoding::Uint16),
+        data_u8 in arb_csr(25, 200, ValueEncoding::Uint8),
+        data_u16 in arb_csr(25, 200, ValueEncoding::Uint16),
     ) {
         // Shard 1: uint8 encoding
         let (ip1, ix1, v1, nr1, nnz1, u16_1) = data_u8;
@@ -466,8 +568,8 @@ proptest! {
     /// Mixed encoding with Zstd codec (uint8 + uint32).
     #[test]
     fn dispatch_zstd_mixed_u8_u32_roundtrip(
-        data_u8 in arb_csr(25, 20, ValueEncoding::Uint8),
-        data_u32 in arb_csr(25, 20, ValueEncoding::Uint32),
+        data_u8 in arb_csr(25, 200, ValueEncoding::Uint8),
+        data_u32 in arb_csr(25, 200, ValueEncoding::Uint32),
     ) {
         let (ip1, ix1, v1, nr1, nnz1, u16_1) = data_u8;
         let enc1 = encode_shard(&ip1, &ix1, &v1, CodecId::Zstd, ValueEncoding::Uint8, u16_1).unwrap();
@@ -482,5 +584,116 @@ proptest! {
         prop_assert_eq!(&d_ip2, &ip2);
         prop_assert_eq!(&d_ix2, &ix2);
         prop_assert_eq!(&d_v2, &v2);
+    }
+}
+
+// =========================================================================
+// Codec × value-encoding cells the matrix above never covered.
+//
+// `dispatch_scx1_u32` is the one the review names; the rest close cells that
+// were simply absent (`None` at u16/u32, `Zstd` at u8/u16). `Float16` was
+// passed by no property at all, which made `arb_csr`'s Float16 packer dead
+// code and left the codecs' 2-byte-stride paths unexercised here.
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(30))]
+
+    #[test]
+    fn dispatch_scx1_u32_roundtrip(
+        data in arb_csr(50, 200, ValueEncoding::Uint32)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Scx1, ValueEncoding::Uint32, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Scx1, ValueEncoding::Uint32, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_none_u16_roundtrip(
+        data in arb_csr(50, 200, ValueEncoding::Uint16)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Uint16, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::None, ValueEncoding::Uint16, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_none_u32_roundtrip(
+        data in arb_csr(50, 200, ValueEncoding::Uint32)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Uint32, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::None, ValueEncoding::Uint32, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_zstd_u8_roundtrip(
+        data in arb_csr(50, 200, ValueEncoding::Uint8)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Zstd, ValueEncoding::Uint8, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Zstd, ValueEncoding::Uint8, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_zstd_u16_roundtrip(
+        data in arb_csr(50, 200, ValueEncoding::Uint16)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Zstd, ValueEncoding::Uint16, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Zstd, ValueEncoding::Uint16, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    /// Float16 is lossy on encode (f32 → f16), so `arb_csr` already emits the
+    /// narrowed 2-byte payload and the round-trip is byte-exact on that.
+    #[test]
+    fn dispatch_none_f16_roundtrip(
+        data in arb_csr(50, 200, ValueEncoding::Float16)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::None, ValueEncoding::Float16, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::None, ValueEncoding::Float16, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_pcodec_f16_roundtrip(
+        data in arb_csr(50, 200, ValueEncoding::Float16)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Pcodec, ValueEncoding::Float16, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Pcodec, ValueEncoding::Float16, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_shufdelta_f16_roundtrip(
+        data in arb_csr(50, 200, ValueEncoding::Float16)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::ShufDeltaZstd, ValueEncoding::Float16, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::ShufDeltaZstd, ValueEncoding::Float16, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
     }
 }
