@@ -1,6 +1,6 @@
 # SCX Implementation Roadmap
 
-**Last updated**: 2026-08-09
+**Last updated**: 2026-08-14
 
 ## Strategy: AnnData-First, Not Scanpy-Replacement
 
