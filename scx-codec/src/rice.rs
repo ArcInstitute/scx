@@ -87,7 +87,7 @@ pub fn rice_decode(
 ) -> Result<Vec<u32>, CodecError> {
     // F-f: bound the allocation to what `data` could physically encode so a
     // hostile `n_values` can't drive an eager multi-GiB `with_capacity`.
-    crate::dispatch::bound_capacity(n_values, data.len(), "rice values")?;
+    crate::guards::bound_capacity(n_values, data.len(), "rice values")?;
     let mut output = Vec::with_capacity(n_values);
     let mut reader = BitReader::new(data);
     let mut remaining = n_values;

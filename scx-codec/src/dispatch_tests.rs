@@ -4,8 +4,17 @@
 //! `docs/conventions.md` § Test Organization. Kept as a `#[path]` sibling
 //! rather than moved to `tests/` so it retains white-box access to the
 //! crate-private codec bodies and guard helpers via `use super::*`.
+//!
+//! The imports below `use super::*` are the only lines not carried over
+//! verbatim: `dispatch.rs` used to import them for its own body, so the inline
+//! module inherited them, and the ORG-3.7-2 split moved both owners elsewhere.
+
+use std::io::Cursor;
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use super::*;
+use crate::codecs::shufdelta::SHUFDELTA_ZSTD_LEVEL;
 
 /// F8: a value buffer whose length is not a multiple of the element width
 /// is rejected, not silently truncated to drop the partial element.
