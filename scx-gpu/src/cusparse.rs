@@ -11,8 +11,10 @@
 //! let handle = CusparseHandle::new()?;
 //! let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream())?;
 //! // B is column-major dense (k × n), C is column-major dense (m × n)
-//! spmm_csr(&handle, dev.stream(), &a_desc, &b_device, &mut c_device,
-//!          m, k, n, 1.0, 0.0)?;
+//! spmm_csr_view_with_alg(&handle, dev.stream(), &dev, None, &a_desc,
+//!     DnMatView::contiguous(&b_device, k as i64, n as i64),
+//!     DnMatViewMut::contiguous(&mut c_device, m as i64, n as i64),
+//!     1.0, 0.0, csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT)?;
 //! ```
 
 use std::mem::MaybeUninit;
@@ -112,7 +114,8 @@ impl CusparseHandle {
     /// Bind this handle to the given CUDA stream.
     ///
     /// All subsequent cuSPARSE operations using this handle will execute on
-    /// `stream`. Must be called before `spmm_csr` / `spmm_csr_transpose`.
+    /// `stream`. Must be called before [`spmm_csr_view_with_alg`] /
+    /// [`spmm_csr_transpose_view_with_alg`].
     fn set_stream(&self, stream: &CudaStream) -> Result<(), GpuError> {
         unsafe {
             csp::cusparseSetStream(self.raw, stream.cu_stream() as _)
@@ -303,7 +306,7 @@ impl<'a> DnMatViewMut<'a> {
 
 /// Pool of reusable cuSPARSE SpMM workspace buffers.
 ///
-/// `spmm_csr` allocates a fresh `CudaSlice<u8>` workspace inside every call.
+/// Each SpMM call otherwise allocates a fresh `CudaSlice<u8>` workspace.
 /// In iterative GPU PCA (randomized power iteration) that means ~30 × N_shards
 /// × 2 allocations per run. The pool replaces that with one grow-only
 /// `CudaSlice<u8>` slot:
@@ -413,9 +416,8 @@ impl CuSparseWorkspacePool {
 /// Strided SpMM: `C = α·op(A)·B + β·C` where `B` and `C` are strided views
 /// into possibly-larger column-major buffers.
 ///
-/// This is the unified entry point that the contiguous helpers ([`spmm_csr`],
-/// [`spmm_csr_transpose`]) and the strided helpers ([`spmm_csr_view_with_alg`],
-/// [`spmm_csr_transpose_view_with_alg`]) all delegate to. `pool` is `Some` when the
+/// This is the unified entry point that [`spmm_csr_view_with_alg`] and
+/// [`spmm_csr_transpose_view_with_alg`] delegate to. `pool` is `Some` when the
 /// caller wants the workspace reused across calls (PCA power iteration);
 /// `None` falls back to per-call `dev.alloc_zeros`.
 #[allow(clippy::too_many_arguments)]
@@ -1023,7 +1025,7 @@ mod tests {
         }
     }
 
-    /// Strided SpMM view parity vs the contiguous `spmm_csr`.
+    /// Strided SpMM view parity vs a host CSR×dense reference.
     ///
     /// Writes a `(m × n)` result into an oversized `(m + 5) × n` buffer at
     /// row offset 3 with `ld = m + 5`, then verifies the populated rows

@@ -96,8 +96,6 @@ pub struct PcaResult {
     pub n_obs: usize,
     /// Number of variables.
     pub n_vars: usize,
-    /// Whether a captured CUDA graph was replayed in the GPU power loop
-    /// (Task 2.5). `None` on CPU paths; `Some(true)` only when the device-
     /// Whether the GPU power loop held the whole matrix **device-resident**
     /// (`Some(true)`) or fell back to the streaming operator (`Some(false)`).
     /// `None` on CPU paths, which have no residency decision to make.

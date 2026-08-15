@@ -33,8 +33,13 @@ pub enum Strictness {
 pub struct SectionDigest {
     /// Section name, e.g. `X_shard_0`.
     pub name: String,
-    /// Raw section-type id, so an unknown future type still digests rather
-    /// than being silently dropped from the comparison.
+    /// Raw section-type id.
+    ///
+    /// Stored raw rather than as a `SectionType` so the digest does not depend
+    /// on this crate's view of the type table. Note it does **not** buy
+    /// forward-compatibility: `FullCatalog::read_from` skips section types it
+    /// does not recognise (`catalog.rs`, "skipping unknown section type"), so an
+    /// unknown type never reaches this function at all.
     pub section_type: u16,
     /// `0` for the global / primary modality.
     pub modality_id: u8,
@@ -45,6 +50,39 @@ pub struct SectionDigest {
     pub offset: Option<u64>,
     /// BLAKE3 of the section bytes, hex-encoded.
     pub blake3: String,
+    /// The entry's `ShardStats`, when it has them.
+    ///
+    /// **Load-bearing, not decoration.** These live in the catalog, not in the
+    /// section payload, so a file whose shard bytes are byte-identical can still
+    /// carry different `row_start` / `nnz` / per-column stats — and readers act
+    /// on them: shards are ordered by `row_start`, export budgets from `nnz`,
+    /// and predicate pushdown prunes on `column_stats`. §6.1 of the review is
+    /// precisely that shape (stale `column_stats` survive an obs replacement, so
+    /// a query silently returns nothing), and a digest blind to them could not
+    /// have caught it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stats: Option<StatsDigest>,
+}
+
+/// A catalog entry's `ShardStats`, flattened for comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatsDigest {
+    pub row_start: u64,
+    pub row_end: u64,
+    pub col_start: u64,
+    pub col_end: u64,
+    pub nnz: u64,
+    pub value_min: u32,
+    pub value_max: u32,
+    pub value_sum: u64,
+    /// Kept alongside `column_stats` deliberately: the two drifting apart is a
+    /// decode bug (`ShardStats::read_from` reads exactly this many), so the
+    /// digest should catch a file where they disagree.
+    pub n_indexed_columns: u8,
+    /// One entry per column stat, `(column_name_hash, discriminant, payload)`.
+    /// `MinMax` payloads are compared by bit pattern so a `-0.0`/`0.0` or NaN
+    /// change is not silently equal.
+    pub column_stats: Vec<String>,
 }
 
 /// The header fields a refactor must not change.
@@ -75,10 +113,37 @@ pub struct FileDigest {
     /// Section types excluded from `sections`, by raw id.
     pub excluded_section_types: Vec<u16>,
     pub header: HeaderDigest,
+    /// Catalog-level fields that live outside every section payload.
+    pub catalog: CatalogDigest,
     /// Sorted by `(name, modality_id)`, so shard *write order* does not affect
     /// the digest — only shard *content and boundaries* do. Reordering which
     /// rows land in which shard changes `X_shard_0`'s bytes and is caught.
     pub sections: Vec<SectionDigest>,
+}
+
+/// Catalog-level scalars, none of which appear in any section's bytes.
+///
+/// `prev_catalog_offset` is deliberately absent: it points at the *previous*
+/// catalog, so it differs between a fresh write and a rewrite of the same
+/// logical content, which is exactly the pair an A/B wants to call equal.
+/// `Strictness::Layout` pins the catalog pointers instead — see
+/// [`CatalogDigest::catalog_offset`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogDigest {
+    pub catalog_version: u16,
+    pub manifest_sequence: u64,
+    pub n_obs: u64,
+    /// Bumped by every in-place CSR-mutating writer; a rewrite that forgets to
+    /// bump it is a real defect a payload hash cannot see.
+    pub data_generation: u64,
+    /// The `data_generation` a CSC sidecar was built against. A mismatch makes
+    /// readers reject the sidecar, so it is behaviour, not bookkeeping.
+    pub csc_build_generation: u64,
+    /// Header catalog pointers — `Some` only under [`Strictness::Layout`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub catalog_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub front_catalog_offset: Option<u64>,
 }
 
 /// Section types excluded from a digest by default.
@@ -133,14 +198,31 @@ pub fn digest_file_excluding(
                 Strictness::Layout => Some(entry.offset),
             },
             blake3: hex(&computed),
+            stats: entry.stats.as_ref().map(stats_digest),
         });
     }
     sections.sort_by(|a, b| (&a.name, a.modality_id).cmp(&(&b.name, b.modality_id)));
 
     let h = reader.header();
+    let c = reader.catalog();
     Ok(FileDigest {
         strictness,
         excluded_section_types: skip.into_iter().collect(),
+        catalog: CatalogDigest {
+            catalog_version: c.catalog_version,
+            manifest_sequence: c.manifest_sequence,
+            n_obs: c.n_obs,
+            data_generation: c.data_generation,
+            csc_build_generation: c.csc_build_generation,
+            catalog_offset: match strictness {
+                Strictness::Content => None,
+                Strictness::Layout => Some(h.full_catalog_offset),
+            },
+            front_catalog_offset: match strictness {
+                Strictness::Content => None,
+                Strictness::Layout => Some(h.front_catalog_offset),
+            },
+        },
         header: HeaderDigest {
             format_version: h.format_version,
             flags: h.flags,
@@ -190,6 +272,12 @@ pub fn assert_digests_eq(actual: &FileDigest, expected: &FileDigest) {
             actual.header, expected.header
         ));
     }
+    if actual.catalog != expected.catalog {
+        report.push(format!(
+            "catalog: {:?}\n     expected: {:?}",
+            actual.catalog, expected.catalog
+        ));
+    }
 
     let key = |s: &SectionDigest| (s.name.clone(), s.modality_id);
     let a: BTreeSet<_> = actual.sections.iter().map(key).collect();
@@ -230,6 +318,12 @@ pub fn assert_digests_eq(actual: &FileDigest, expected: &FileDigest) {
                 "section type {} vs {}",
                 sa.section_type, se.section_type
             ));
+        }
+        if sa.stats != se.stats {
+            // Named separately from `content`: identical shard bytes with
+            // different catalog stats is the §6.1 shape, and reporting it as a
+            // generic mismatch would send the reader looking in the payload.
+            what.push(format!("catalog stats {:?} vs {:?}", sa.stats, se.stats));
         }
         report.push(format!("{}: {}", sa.name, what.join(", ")));
     }
@@ -275,6 +369,48 @@ pub fn assert_matches_golden(path: &Path, golden: &Path, strictness: Strictness)
     });
     assert_digests_eq(&actual, &expected);
     Ok(())
+}
+
+/// Flatten a `ShardStats` for comparison.
+///
+/// `column_stats` becomes one string per stat rather than a structured value:
+/// `ColumnStat` is not `Eq` (it carries `f64`), and comparing the bit pattern is
+/// what makes a `0.0` → `-0.0` or a NaN change visible instead of silently equal.
+fn stats_digest(s: &scx_format_io::catalog::ShardStats) -> StatsDigest {
+    use scx_format_io::catalog::ColumnStat;
+    StatsDigest {
+        row_start: s.row_start,
+        row_end: s.row_end,
+        col_start: s.col_start,
+        col_end: s.col_end,
+        nnz: s.nnz,
+        value_min: s.value_min,
+        value_max: s.value_max,
+        value_sum: s.value_sum,
+        n_indexed_columns: s.n_indexed_columns,
+        column_stats: s
+            .column_stats
+            .iter()
+            .map(|cs| match cs {
+                ColumnStat::MinMax {
+                    column_name_hash,
+                    min,
+                    max,
+                } => format!(
+                    "minmax:{column_name_hash:016x}:{:016x}:{:016x}",
+                    min.to_bits(),
+                    max.to_bits()
+                ),
+                ColumnStat::CategoryBitset {
+                    column_name_hash,
+                    bitset,
+                } => format!(
+                    "bitset:{column_name_hash:016x}:{}",
+                    hex(&blake3_hash(bitset))
+                ),
+            })
+            .collect(),
+    }
 }
 
 fn hex(bytes: &[u8; 32]) -> String {

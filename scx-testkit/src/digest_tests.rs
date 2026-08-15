@@ -5,7 +5,10 @@
 //! the thing this crate exists to stop other people shipping.
 
 use super::*;
-use crate::fixtures::{mixed_codec_file, mixed_codec_file_with, FixtureOpts};
+use crate::fixtures::{
+    mixed_codec_file, mixed_codec_file_with, perturb_catalog_data_generation, perturb_catalog_nnz,
+    FixtureOpts,
+};
 use scx_format_io::ScxReader;
 
 fn write(dir: &tempfile::TempDir, name: &str, opts: &FixtureOpts) -> std::path::PathBuf {
@@ -228,40 +231,151 @@ fn digest_ignores_a_provenance_timestamp_and_nothing_more() {
     );
 }
 
-/// `Strictness::Content` survives a section moving; `Strictness::Layout` does
-/// not. Two knobs that would be indistinguishable if either were wired wrong.
+/// `Strictness::Layout` catches a section that only *moved*; `Content` does not.
+///
+/// Demonstrated on the CSR shards, whose bytes are identical in both files —
+/// only their offsets differ, because one file carries a larger `uns` blob
+/// ahead of them. An earlier version of this test varied the provenance
+/// timestamp and asserted nothing about offsets at all: provenance is written
+/// last (so it shifts nothing) and a unix second is 10 digits either way (so it
+/// does not even change that section's length). It demonstrated nothing.
 #[test]
-fn layout_strictness_pins_offsets_and_content_does_not() {
+fn layout_catches_a_moved_section_and_content_does_not() {
     let dir = tempfile::tempdir().unwrap();
-    // A longer provenance string shifts every later section's offset without
-    // changing any of their bytes.
-    let a = write(&dir, "a.scx", &FixtureOpts::default());
+    let a = write(
+        &dir,
+        "a.scx",
+        &FixtureOpts {
+            uns_pad: 16,
+            ..Default::default()
+        },
+    );
     let b = write(
         &dir,
         "b.scx",
         &FixtureOpts {
-            provenance_timestamp: 1_900_000_000,
+            uns_pad: 512,
             ..Default::default()
         },
     );
-    assert_digests_eq(&dig(&a), &dig(&b));
 
-    let la = digest_file(&a, Strictness::Layout).unwrap();
-    assert!(
-        la.sections.iter().all(|s| s.offset.is_some()),
-        "Layout must record offsets"
+    let shards = |d: &FileDigest| -> Vec<SectionDigest> {
+        d.sections
+            .iter()
+            .filter(|s| s.name.starts_with("X_shard_"))
+            .cloned()
+            .collect()
+    };
+    let (ca, cb) = (shards(&dig(&a)), shards(&dig(&b)));
+    let (la, lb) = (
+        shards(&digest_file(&a, Strictness::Layout).unwrap()),
+        shards(&digest_file(&b, Strictness::Layout).unwrap()),
     );
+
+    // Premise: the shards really are byte-identical and really did move.
+    assert_eq!(ca.len(), 3, "premise: three shards");
+    for (x, y) in la.iter().zip(&lb) {
+        assert_eq!(x.blake3, y.blake3, "{} bytes must be identical", x.name);
+        assert_eq!(x.length, y.length, "{} length must be identical", x.name);
+    }
     assert!(
-        dig(&a).sections.iter().all(|s| s.offset.is_none()),
-        "Content must not record offsets"
+        la.iter().zip(&lb).any(|(x, y)| x.offset != y.offset),
+        "premise: a larger uns blob must shift the shards"
     );
+
+    assert_eq!(ca, cb, "Content must ignore a pure move");
+    assert_ne!(la, lb, "Layout must catch a pure move");
+    assert!(
+        la.iter().all(|s| s.offset.is_some()),
+        "Layout records offsets"
+    );
+    assert!(ca.iter().all(|s| s.offset.is_none()), "Content does not");
 
     // Digests taken at different strictness are refused rather than silently
     // compared on their common fields.
-    let err = std::panic::catch_unwind(|| assert_digests_eq(&la, &dig(&b)))
+    let full_a = digest_file(&a, Strictness::Layout).unwrap();
+    let err = std::panic::catch_unwind(|| assert_digests_eq(&full_a, &dig(&a)))
         .expect_err("mixed strictness must panic");
     let msg = err.downcast_ref::<String>().unwrap();
     assert!(msg.contains("strictness"), "got:\n{msg}");
+}
+
+/// Catalog stats are part of the digest — a file whose shard *bytes* are
+/// byte-identical but whose catalog stats differ must not compare equal.
+///
+/// This is the §6.1 shape: `modify_metadata` left stale `column_stats` on
+/// untouched CSR shards and a later `filter_obs` pruned every shard, returning
+/// zero rows. The shard payloads never moved, so a payload-only digest is blind
+/// to it — which is exactly the class this harness exists to gate before the
+/// `scx-ops` index-rebuild work.
+#[test]
+fn digest_detects_catalog_stats_drift_with_identical_section_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = mixed_codec_file(&dir.path().join("f.scx")).unwrap();
+    let before = dig(&path);
+
+    // Rewrite one CSR shard's catalog `nnz` in place, leaving every section
+    // payload untouched.
+    let target = "X_shard_1";
+    {
+        let r = ScxReader::open(&path).unwrap();
+        let e = r
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.name == target)
+            .expect("fixture must have the shard");
+        assert!(e.stats.is_some(), "premise: the entry carries stats");
+    }
+    perturb_catalog_nnz(&path, target);
+
+    let after = dig(&path);
+    // Premise: not one section byte moved.
+    for (x, y) in before.sections.iter().zip(&after.sections) {
+        assert_eq!(
+            x.blake3, y.blake3,
+            "section {} payload must be untouched",
+            x.name
+        );
+    }
+    assert_ne!(
+        before.sections, after.sections,
+        "a catalog stats change must change the digest"
+    );
+
+    let msg = std::panic::catch_unwind(|| assert_digests_eq(&after, &before))
+        .expect_err("differing catalog stats must panic");
+    let msg = msg.downcast_ref::<String>().unwrap();
+    assert!(
+        msg.contains(target) && msg.contains("catalog stats"),
+        "the failure must name the shard and say it is the catalog, got:\n{msg}"
+    );
+}
+
+/// The catalog generation counters are covered too. A rewrite that forgets to
+/// bump `data_generation` leaves every reader believing a stale CSC sidecar is
+/// fresh, and no section payload records it.
+#[test]
+fn digest_covers_the_catalog_generation_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = mixed_codec_file(&dir.path().join("f.scx")).unwrap();
+    let before = dig(&path);
+
+    perturb_catalog_data_generation(&path);
+    let after = dig(&path);
+    assert_eq!(
+        before.sections, after.sections,
+        "premise: only the catalog scalar changed"
+    );
+    assert_eq!(
+        after.catalog.data_generation,
+        before.catalog.data_generation + 1,
+        "premise: the perturbation landed"
+    );
+    assert_ne!(
+        before.catalog, after.catalog,
+        "data_generation must be part of the digest"
+    );
 }
 
 /// A corrupt section is an error, not a digest.

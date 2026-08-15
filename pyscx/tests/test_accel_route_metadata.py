@@ -114,6 +114,9 @@ def test_pca_cpu_route_omits_tuning_metadata():
     # is the op that captures. The key is still emitted (route.rs stamps it for
     # every op), so assert the value rather than the key's absence.
     assert info["graph_replay"] is None
+
+
+def test_pca_rejects_invalid_spmm_policy():
     """Task 2.5: spmm_policy is validated on every device path."""
     adata = _make_adata()
     with pytest.raises(ValueError, match="spmm_policy"):
@@ -126,8 +129,10 @@ def test_pca_gpu_randomized_populates_tuning_metadata(monkeypatch):
     SpMM-policy fields the CPU route leaves None. Defaults are strict_fp32 +
     heuristic SpMM. De-risks the deferred 2.7 gate wiring.
 
-    PCA stamps no `graph_replay`: SpMM-segment capture was removed, so there is
-    no capture decision to report. `harmony_integrate` is the op that does.
+    PCA reports `graph_replay` as `None`: SpMM-segment capture was removed, so
+    it has no capture decision to make. The key is still stamped for every op,
+    so the contract is "present and None". `harmony_integrate` is the op whose
+    value is dynamic.
 
     `SCX_FORCE_NATIVE_GPU=1` is required, not cosmetic: `math_mode` /
     `spmm_policy` are stamped only by the **native** randomized
@@ -143,7 +148,11 @@ def test_pca_gpu_randomized_populates_tuning_metadata(monkeypatch):
     assert info["route"] == "gpu_csr"
     assert info["math_mode"] == "strict_fp32"
     assert info["spmm_policy"] == "default"
-    assert info.get("graph_replay") is None
+    # Key presence *and* value: `route.rs` stamps `graph_replay` for every op,
+    # so the contract is "present and None", and `.get(...) is None` would pass
+    # for a key that had silently stopped being emitted.
+    assert "graph_replay" in info
+    assert info["graph_replay"] is None
 
 
 @gpu_only

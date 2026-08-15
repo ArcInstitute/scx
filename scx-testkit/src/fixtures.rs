@@ -9,12 +9,14 @@
 //! encoder path — unframed integer, row-group-framed integer, and float
 //! (`Pcodec`) — so a single digest covers all three.
 
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
+use scx_format_io::catalog::FullCatalog;
 use scx_format_io::encoder::FramingConfig;
 use scx_format_io::header::FileHeader;
 use scx_format_io::provenance::ProvenanceEntry;
@@ -55,6 +57,13 @@ pub struct FixtureOpts {
     /// change a float shard can carry, and invisible to any comparison that
     /// only checks lengths.
     pub perturb_float_bit: bool,
+    /// Size of a filler `uns` blob written **before** the shards, so a larger
+    /// value shifts every shard's byte offset while leaving their bytes
+    /// identical. This is the knob a `Strictness::Layout` test needs: padding
+    /// provenance would shift nothing, because provenance is written last, and
+    /// varying `provenance_timestamp` shifts nothing either — a unix second is
+    /// 10 digits either way.
+    pub uns_pad: usize,
 }
 
 impl Default for FixtureOpts {
@@ -68,6 +77,7 @@ impl Default for FixtureOpts {
             shard_order: [0, 1, 2],
             framed_codec: CodecId::Scx1,
             perturb_float_bit: false,
+            uns_pad: 0,
         }
     }
 }
@@ -119,6 +129,9 @@ pub fn mixed_codec_file_with(path: &Path, opts: &FixtureOpts) -> Result<PathBuf>
     let mut writer = ScxWriter::new(path, header)?;
     writer.write_obs(&obs(n_obs))?;
     writer.write_var(&var(n_vars))?;
+    if opts.uns_pad > 0 {
+        writer.write_uns(&serde_json::json!({ "pad": "x".repeat(opts.uns_pad) }))?;
+    }
 
     let mut order = opts.shard_order;
     order.sort_unstable();
@@ -238,4 +251,59 @@ fn var(n: usize) -> RecordBatch {
         ))],
     )
     .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Catalog perturbation — for tests that must change a *catalog* field while
+// leaving every section payload byte-identical.
+// ---------------------------------------------------------------------------
+
+/// Rewrite the full catalog in place after applying `mutate`.
+///
+/// The catalog is re-serialised through `FullCatalog::write_to`, so its
+/// trailing BLAKE3 is recomputed and the file still opens. Only mutations that
+/// preserve the serialised length are supported — every scalar in `ShardStats`
+/// is fixed-width, so changing one is fine; adding an entry is not.
+fn rewrite_catalog(path: &Path, mutate: impl FnOnce(&mut FullCatalog)) -> Result<()> {
+    let (mut catalog, offset, length) = {
+        let r = scx_format_io::ScxReader::open(path)?;
+        (
+            r.catalog().clone(),
+            r.header().full_catalog_offset,
+            r.header().full_catalog_length,
+        )
+    };
+    mutate(&mut catalog);
+    let mut buf = Vec::new();
+    catalog.write_to(&mut buf)?;
+    assert_eq!(
+        buf.len() as u64,
+        length,
+        "catalog perturbation changed the serialised length; only fixed-width \
+         scalar edits are supported"
+    );
+    let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Bump the catalog `nnz` of one named CSR shard, touching no section bytes.
+pub fn perturb_catalog_nnz(path: &Path, section_name: &str) {
+    rewrite_catalog(path, |c| {
+        let e = c
+            .entries
+            .iter_mut()
+            .find(|e| e.name == section_name)
+            .unwrap_or_else(|| panic!("no section named {section_name}"));
+        let s = e.stats.as_mut().expect("entry carries stats");
+        s.nnz += 1;
+    })
+    .unwrap();
+}
+
+/// Bump the catalog's `data_generation`, touching no section bytes.
+pub fn perturb_catalog_data_generation(path: &Path) {
+    rewrite_catalog(path, |c| c.data_generation += 1).unwrap();
 }

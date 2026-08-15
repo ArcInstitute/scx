@@ -85,7 +85,6 @@ pub struct GpuPcaResult {
     pub n_obs: usize,
     /// Number of variables.
     pub n_vars: usize,
-    /// Whether a captured CUDA graph was replayed in the power loop (Task 2.5):
     /// Whether the whole matrix was held **device-resident** across the power
     /// loop (`true`) or the streaming operator re-decoded and re-uploaded it on
     /// every multiply (`false`). Decided dynamically against free VRAM, so the
@@ -139,9 +138,6 @@ struct RandomizedPcaCore {
     n_components: usize,
     n_obs: usize,
     n_vars: usize,
-    /// Whether a captured CUDA graph was replayed in the power loop (Task 2.5).
-    /// `true` only on the device-resident capture path; `false` for the
-    /// streaming or direct-resident paths.
     /// Whether the whole matrix was held device-resident across the power loop.
     /// See [`GpuPcaResult::resident_csr`].
     resident_csr: bool,
