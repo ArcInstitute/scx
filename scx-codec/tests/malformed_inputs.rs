@@ -19,6 +19,64 @@ use scx_codec::value_encoding::values_to_raw_bytes;
 use scx_codec::ValueEncoding;
 
 // ---------------------------------------------------------------------------
+// Peak-allocation tracking, for the two tests that assert a decode does not
+// size a buffer from an untrusted header field.
+//
+// Those decodes fail either way and with the same message, so an `is_err()` or
+// message assertion cannot tell a bounded implementation from an unbounded one
+// — the only observable difference is how much memory it claims on the way to
+// the error. Counters are thread-local and libtest gives each test its own
+// thread, so a concurrent test cannot pollute the measurement.
+// ---------------------------------------------------------------------------
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+thread_local! {
+    static LIVE: Cell<usize> = const { Cell::new(0) };
+    static PEAK: Cell<usize> = const { Cell::new(0) };
+}
+
+struct PeakTracking;
+
+unsafe impl GlobalAlloc for PeakTracking {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            // `try_with`: TLS may be torn down late in the thread's life, and an
+            // allocator must not panic there.
+            let _ = LIVE.try_with(|live| {
+                let now = live.get() + layout.size();
+                live.set(now);
+                let _ = PEAK.try_with(|peak| {
+                    if now > peak.get() {
+                        peak.set(now);
+                    }
+                });
+            });
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(layout.size())));
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: PeakTracking = PeakTracking;
+
+/// Run `f`, returning its value and the peak bytes live on this thread during it.
+fn peak_alloc_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let base = LIVE.with(|l| l.get());
+    PEAK.with(|p| p.set(base));
+    let out = f();
+    let peak = PEAK.with(|p| p.get());
+    (out, peak.saturating_sub(base))
+}
+
+// ---------------------------------------------------------------------------
 // P0 #3: Float16 stride conformance
 // ---------------------------------------------------------------------------
 
@@ -818,4 +876,95 @@ fn test_pcodec_low_entropy_float16_roundtrip() {
     // The Float16 arm decodes through the same pcodec helper (as f32, then
     // narrowed), so it carried the same false rejection.
     assert_pcodec_roundtrips("constant f16", ValueEncoding::Float16, |_| 1.0);
+}
+
+/// The inverse of `test_pcodec_float_values_are_bounded_before_decompression`:
+/// a *large declared* `nnz` against a *tiny* pcodec stream.
+///
+/// Sizing the float destination from the header made this a second allocation
+/// as large as the indices bomb that let it through. `le_bytes_to_indices`
+/// wants an exact `nnz * width` bytes, and Zstd expands a few KiB of zero
+/// indices into exactly that — so "the indices stream corroborates `nnz`" is
+/// not a bound, it is the same untrusted number arriving by a longer route.
+///
+/// The decode fails either way, with the same message, so the assertion is on
+/// **allocation**: the values arm must not claim another `nnz * 4`. The indices
+/// buffer itself is pre-existing and shared with every other codec, so it is
+/// measured as the baseline rather than treated as a defect here.
+#[test]
+fn test_pcodec_large_declared_nnz_does_not_preallocate_from_the_header() {
+    const NNZ: usize = 16 * 1024 * 1024;
+    const FLOAT_DST_BYTES: usize = NNZ * 4;
+
+    let indptr_raw: Vec<u8> = [0u64, NNZ as u64]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let indptr = zstd::encode_all(indptr_raw.as_slice(), 3).unwrap();
+    let indices = zstd::encode_all(vec![0u8; NNZ * 4].as_slice(), 3).unwrap();
+    assert!(
+        indices.len() < 64 * 1024,
+        "premise: the indices bomb must be tiny, got {} B",
+        indices.len()
+    );
+
+    // A genuine, tiny pcodec stream carrying two values.
+    let values =
+        pco::standalone::simple_compress(&[1.0f32, 2.0], &pco::ChunkConfig::default()).unwrap();
+
+    // Baseline: the same shard decoded as an *integer* Pcodec shard. Integer
+    // values take the Zstd arm, so this measures everything except the float
+    // destination — indices bomb, growth transients and all.
+    let (_, baseline) = peak_alloc_bytes(|| {
+        let encoded = EncodedShardRef {
+            indptr_bytes: &indptr,
+            indices_bytes: &indices,
+            values_bytes: &values,
+        };
+        decode_shard_ref(
+            &encoded,
+            CodecId::Pcodec,
+            ValueEncoding::Uint32,
+            1,
+            NNZ,
+            false,
+        )
+    });
+
+    let (res, peak) = peak_alloc_bytes(|| {
+        let encoded = EncodedShardRef {
+            indptr_bytes: &indptr,
+            indices_bytes: &indices,
+            values_bytes: &values,
+        };
+        decode_shard_ref(
+            &encoded,
+            CodecId::Pcodec,
+            ValueEncoding::Float32,
+            1,
+            NNZ,
+            false,
+        )
+    });
+
+    let err = res.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("pcodec value count 2") && msg.contains(&NNZ.to_string()),
+        "expected the count mismatch after a stream-sized decode, got: {msg}"
+    );
+
+    // Half the float destination is a wide margin: a header-sized `vec![0f32;
+    // nnz]` adds a full FLOAT_DST_BYTES over the baseline, while growing from
+    // the stream adds the fixed slab (256 KiB) plus two decoded values.
+    let budget = baseline + FLOAT_DST_BYTES / 2;
+    assert!(
+        peak <= budget,
+        "the float arm allocated from the untrusted header: peak {peak} B vs \
+         baseline {baseline} B (+{} B). A stream-sized decode should add well \
+         under {} B, not approach the {FLOAT_DST_BYTES} B destination the \
+         header declared.",
+        peak.saturating_sub(baseline),
+        FLOAT_DST_BYTES / 2
+    );
 }

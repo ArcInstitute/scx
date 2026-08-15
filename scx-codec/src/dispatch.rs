@@ -1602,13 +1602,16 @@ fn encode_pcodec(
 
 /// Decompress exactly `n_values` f32s from a pcodec stream.
 ///
-/// `pco::standalone::simple_decompress` sizes its output from the *stream*, so
-/// a shard declaring two values could decompress a million — the length check
-/// downstream then fires one full allocation too late. `simple_decompress_into`
-/// writes at most `dst.len()` numbers, so the declared shape caps the
-/// allocation the way `zstd_decode_bounded` does for the integer arms. That cap
-/// — plus the `finished` / `n_processed` checks below — *is* the bomb defence
-/// here; nothing else is needed and nothing else is correct.
+/// Two opposite hostile shapes meet here, and a guard for one is not a guard
+/// for the other:
+///
+/// - **Stream larger than declared.** `pco::standalone::simple_decompress`
+///   sizes its output from the *stream*, so a shard declaring two values could
+///   decompress a million and the length check downstream would fire one full
+///   allocation too late. Bounded below by refusing to append past `n_values`.
+/// - **Declared larger than stream.** Sizing the destination from `n_values`
+///   instead inverts the problem — see the `n_values` note below. Bounded by
+///   growing `out` only as pco actually produces numbers.
 ///
 /// **Do not add a compression-ratio plausibility bound to this function.**
 /// [`bound_capacity`] is sound only for the Scx1 primitives, whose Golomb/Rice
@@ -1620,31 +1623,85 @@ fn encode_pcodec(
 /// produced, at every realistic shard size. See
 /// `test_pcodec_low_entropy_float_roundtrip`.
 ///
-/// `n_values` needs no plausibility bound of its own, because it has already
-/// been corroborated by real bytes before this is reached: `decode_pcodec_ref`
-/// decodes the indices sub-stream first, and `le_bytes_to_indices` demands an
-/// *exact* `n_values * index_width` bytes. A hostile `nnz` therefore dies
-/// there, one allocation of the same magnitude earlier — exactly as it does on
-/// the `decode_zstd_ref` path. The `checked_len` below is only an overflow
-/// guard, so a `n_values` near `usize::MAX` returns an error instead of
-/// panicking in `vec![0f32; _]` with `capacity overflow`.
+/// **`n_values` is not trustworthy, and must not size the destination.** It is
+/// a shard-header field. It is tempting to argue it has already been
+/// corroborated, because `decode_pcodec_ref` decodes the indices sub-stream
+/// first and `le_bytes_to_indices` demands an *exact* `n_values * index_width`
+/// bytes — but those are *decompressed* bytes, and Zstd will expand a ~2 KiB
+/// run of zero indices into exactly the `n_values * width` the check wants. A
+/// `vec![0f32; n_values]` sized from the header therefore hands a few kilobytes
+/// of input a second allocation of the same magnitude as the indices bomb that
+/// let it through: measured at 165 MB of peak RSS from a 2.5 KiB shard before
+/// this loop replaced it.
+///
+/// So the destination grows with numbers pco has *actually produced*, capped at
+/// `n_values`, which is the same shape `zstd_decode_bounded` uses — eager
+/// capacity clamped, `read_to_end` growing against a `take` limiter. `read`
+/// wants a `dst` whose length is a multiple of 256 (or ≥ the chunk remainder),
+/// hence the fixed slab.
 fn pcodec_decompress_bounded(data: &[u8], n_values: usize) -> Result<Vec<f32>, CodecError> {
-    checked_len(n_values, std::mem::size_of::<f32>(), "pcodec values")?;
-    let mut out = vec![0f32; n_values];
-    let progress = pco::standalone::simple_decompress_into(data, &mut out)
-        .map_err(|e| CodecError::Io(std::io::Error::other(e.to_string())))?;
-    if !progress.finished {
-        return Err(CodecError::Io(std::io::Error::new(
+    use pco::standalone::{DecompressorItem, FileDecompressor};
+
+    // 65536 = 256 × 256, satisfying `ChunkDecompressor::read`'s stride rule.
+    const SLAB: usize = 1 << 16;
+
+    let pco_err = |e: pco::errors::PcoError| CodecError::Io(std::io::Error::other(e.to_string()));
+    let too_many = || {
+        CodecError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("decompressed pcodec values exceeds limit {n_values}"),
-        )));
+        ))
+    };
+
+    // Overflow guard only — `n_values` still bounds the *total*, it just never
+    // gets to be an up-front allocation.
+    checked_len(n_values, std::mem::size_of::<f32>(), "pcodec values")?;
+
+    let mut out: Vec<f32> = Vec::with_capacity(n_values.min(SLAB));
+    // Round up to `read`'s 256 stride, but never overshoot a small shard: a
+    // fixed 256 KiB slab made a 5k-value shard decode ~1.5× slower than the
+    // eager path it replaces. `checked_len` above keeps `next_multiple_of`
+    // clear of overflow. Both branches of `read`'s contract stay satisfied —
+    // this is a multiple of 256, and for an honest stream it is also ≥ the
+    // chunk remainder.
+    let slab_len = SLAB.min(n_values.next_multiple_of(256).max(256));
+    let mut slab = vec![0f32; slab_len];
+    let (fd, mut src) = FileDecompressor::new(data).map_err(pco_err)?;
+
+    loop {
+        match fd.chunk_decompressor::<f32, _>(src).map_err(pco_err)? {
+            DecompressorItem::EndOfData(_) => break,
+            DecompressorItem::Chunk(mut cd) => {
+                loop {
+                    let progress = cd.read(&mut slab).map_err(pco_err)?;
+                    // Refuse *before* appending, so an over-long stream can
+                    // never grow `out` past the declared shape.
+                    if out.len() + progress.n_processed > n_values {
+                        return Err(too_many());
+                    }
+                    out.extend_from_slice(&slab[..progress.n_processed]);
+                    if progress.finished {
+                        break;
+                    }
+                    if progress.n_processed == 0 {
+                        // Defensive: a chunk that reports neither progress nor
+                        // completion would otherwise spin forever.
+                        return Err(CodecError::MalformedInput(
+                            "pcodec chunk made no progress".to_string(),
+                        ));
+                    }
+                }
+                src = cd.into_src();
+            }
+        }
     }
-    if progress.n_processed != n_values {
+
+    if out.len() != n_values {
         return Err(CodecError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "decompressed pcodec value count {} != expected {n_values}",
-                progress.n_processed
+                out.len()
             ),
         )));
     }
