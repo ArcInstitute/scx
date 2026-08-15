@@ -204,12 +204,19 @@ for users migrating from Zarr.
 
 LZ4 frame decompress → byte-unshuffle (reverse of encoding).
 
+Each sub-stream is capped at the byte length the shard's declared shape implies
+(`indptr_byte_cap` / `checked_len`) *before* decompression, as for `zstd`. LZ4
+compresses runs at ratios well past 100:1, so an uncapped frame decode would let
+a small shard force an arbitrarily large allocation from untrusted input.
+
 ### Characteristics
 
 - ~3.1× compression on float data (vs ~2.9× for Zstd on Smart-seq2)
 - ~1.5× faster decompression than Zstd on typical data
-- Available via `codec="lz4"` in `from_anndata()` and `scx convert`; not
-  auto-selected by the heuristic.
+- Available via `codec="lz4"` in `from_anndata()` and `scx convert`, and
+  **auto-selected for non-binary integer ATAC counts** by the per-modality
+  heuristic (§13) — binary `Uint8` ATAC goes to Zstd, and the modality-blind
+  heuristic in §8 never picks it.
 
 Implementation: `scx-codec/src/shuffle.rs`, `scx-codec/src/dispatch.rs`.
 

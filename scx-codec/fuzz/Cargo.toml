@@ -42,3 +42,15 @@ name = "fuzz_shufdelta"
 path = "fuzz_targets/fuzz_shufdelta.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_lz4_shuffle"
+path = "fuzz_targets/fuzz_lz4_shuffle.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_pcodec"
+path = "fuzz_targets/fuzz_pcodec.rs"
+test = false
+doc = false

@@ -19,6 +19,64 @@ use scx_codec::value_encoding::values_to_raw_bytes;
 use scx_codec::ValueEncoding;
 
 // ---------------------------------------------------------------------------
+// Peak-allocation tracking, for the two tests that assert a decode does not
+// size a buffer from an untrusted header field.
+//
+// Those decodes fail either way and with the same message, so an `is_err()` or
+// message assertion cannot tell a bounded implementation from an unbounded one
+// — the only observable difference is how much memory it claims on the way to
+// the error. Counters are thread-local and libtest gives each test its own
+// thread, so a concurrent test cannot pollute the measurement.
+// ---------------------------------------------------------------------------
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+thread_local! {
+    static LIVE: Cell<usize> = const { Cell::new(0) };
+    static PEAK: Cell<usize> = const { Cell::new(0) };
+}
+
+struct PeakTracking;
+
+unsafe impl GlobalAlloc for PeakTracking {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            // `try_with`: TLS may be torn down late in the thread's life, and an
+            // allocator must not panic there.
+            let _ = LIVE.try_with(|live| {
+                let now = live.get() + layout.size();
+                live.set(now);
+                let _ = PEAK.try_with(|peak| {
+                    if now > peak.get() {
+                        peak.set(now);
+                    }
+                });
+            });
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(layout.size())));
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: PeakTracking = PeakTracking;
+
+/// Run `f`, returning its value and the peak bytes live on this thread during it.
+fn peak_alloc_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let base = LIVE.with(|l| l.get());
+    PEAK.with(|p| p.set(base));
+    let out = f();
+    let peak = PEAK.with(|p| p.get());
+    (out, peak.saturating_sub(base))
+}
+
+// ---------------------------------------------------------------------------
 // P0 #3: Float16 stride conformance
 // ---------------------------------------------------------------------------
 
@@ -211,6 +269,198 @@ fn test_decode_capacity_boundary_passes() {
         }
         Err(_) => {} // any other downstream failure is fine
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded decompression: Lz4Shuffle and Pcodec
+//
+// Every other codec caps how many bytes a sub-stream may decompress to before
+// it decompresses (`zstd_decode_bounded`, keyed on `indptr_byte_cap` /
+// `checked_len`). `Lz4Shuffle` did not: `lz4_frame_decompress` was a plain
+// `read_to_end` into an unbounded `Vec`, so a small shard could force an
+// arbitrarily large allocation, and the declared-length check only ran
+// afterwards — on a buffer that had already been materialised.
+//
+// This is production-reachable: `select_codec_for_modality` picks
+// `Lz4Shuffle` for non-binary integer ATAC counts, so every Multiome /
+// TEA-seq ATAC modality writes shards that decode through this path.
+//
+// The assertions key on the error *message*, not `is_err()`: an unbounded
+// decode also errors, just one full allocation too late, so `is_err()` passes
+// against the broken code.
+// ---------------------------------------------------------------------------
+
+/// Stream-compress `n_bytes` of zeros into an LZ4 frame without ever holding
+/// `n_bytes` in memory. Returns a small frame that decompresses to `n_bytes`.
+fn lz4_bomb(n_bytes: usize) -> Vec<u8> {
+    use std::io::Write;
+    const CHUNK: usize = 64 * 1024;
+    let zeros = [0u8; CHUNK];
+    let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+    let mut written = 0;
+    while written < n_bytes {
+        let n = CHUNK.min(n_bytes - written);
+        enc.write_all(&zeros[..n]).unwrap();
+        written += n;
+    }
+    enc.finish().unwrap()
+}
+
+/// 64 MiB of zeros, which LZ4 stores in a few hundred KiB at most. Large
+/// enough that decoding it unbounded is unmistakable, small enough that the
+/// test stays fast if the guard regresses.
+const BOMB_BYTES: usize = 64 * 1024 * 1024;
+
+#[test]
+fn test_lz4_indptr_bomb_is_capped_before_decompression() {
+    let bomb = lz4_bomb(BOMB_BYTES);
+    assert!(
+        bomb.len() < 1 << 20,
+        "bomb should be small on the wire, got {} bytes",
+        bomb.len()
+    );
+
+    // `indptr` is the first sub-stream decompressed. A 2-row shard bounds it
+    // to 24 bytes, so 64 MiB must be refused, not decompressed and measured.
+    // The other two streams are valid frames so that this test can only fail
+    // on the indptr cap — a garbage sibling stream would mask it.
+    let indices_raw: Vec<u8> = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indices = lz4_roundtrip_compress(&byte_shuffle(&indices_raw, 4).unwrap());
+    let values = lz4_roundtrip_compress(&byte_shuffle(&[0u8; 8], 4).unwrap());
+    let encoded = EncodedShardRef {
+        indptr_bytes: &bomb,
+        indices_bytes: &indices,
+        values_bytes: &values,
+    };
+    let err = decode_shard_ref(
+        &encoded,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Uint32,
+        2, // n_rows
+        2, // nnz
+        false,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds limit"),
+        "expected the decompression cap to fire before allocating, got: {msg}"
+    );
+}
+
+#[test]
+fn test_lz4_values_bomb_is_capped_before_decompression() {
+    let bomb = lz4_bomb(BOMB_BYTES);
+    // A valid 2-row/2-nnz indptr and indices, so the bomb in `values` is what
+    // the decoder trips on rather than an earlier sub-stream.
+    let indptr_raw: Vec<u8> = [0u64, 1, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indices_raw: Vec<u8> = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indptr = lz4_roundtrip_compress(&byte_shuffle(&indptr_raw, 8).unwrap());
+    let indices = lz4_roundtrip_compress(&byte_shuffle(&indices_raw, 4).unwrap());
+
+    let encoded = EncodedShardRef {
+        indptr_bytes: &indptr,
+        indices_bytes: &indices,
+        values_bytes: &bomb,
+    };
+    let err = decode_shard_ref(
+        &encoded,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Uint32,
+        2, // n_rows
+        2, // nnz → values bounded to 8 bytes
+        false,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds limit"),
+        "expected the decompression cap to fire before allocating, got: {msg}"
+    );
+}
+
+/// Compress with the same LZ4 frame settings the encoder uses.
+fn lz4_roundtrip_compress(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+#[test]
+fn test_lz4_hostile_shape_errors_instead_of_panicking() {
+    // `n_rows` chosen so `(n_rows + 1) * 8` overflows `usize`. The five sibling
+    // codecs reach `indptr_byte_cap`, whose checked arithmetic returns an
+    // error; Lz4Shuffle skipped it and hit the unchecked `count * 8` inside
+    // `le_bytes_to_u64`. `scx-codec` sets `overflow-checks = true` in release,
+    // so that was a panic on malformed input in every profile — which the
+    // reader convention forbids.
+    let encoded = EncodedShardRef {
+        indptr_bytes: &lz4_roundtrip_compress(&[0u8; 32]),
+        indices_bytes: &lz4_roundtrip_compress(&[0u8; 8]),
+        values_bytes: &lz4_roundtrip_compress(&[0u8; 8]),
+    };
+    let err = decode_shard_ref(
+        &encoded,
+        CodecId::Lz4Shuffle,
+        ValueEncoding::Uint32,
+        usize::MAX / 4, // n_rows
+        2,
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CodecError::MalformedInput(_)),
+        "expected MalformedInput, got {err:?}"
+    );
+}
+
+#[test]
+fn test_lz4_indptr_only_bomb_is_capped() {
+    // `decode_indptr_only`'s Lz4Shuffle arm carried the same hole as the full
+    // decoder and is reached independently (indptr-only reads).
+    let bomb = lz4_bomb(BOMB_BYTES);
+    let err = decode_indptr_only(&bomb, CodecId::Lz4Shuffle, 2).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds limit"),
+        "expected the decompression cap to fire before allocating, got: {msg}"
+    );
+}
+
+#[test]
+fn test_pcodec_float_values_are_bounded_before_decompression() {
+    // Pcodec's float arms called `pco::standalone::simple_decompress` with no
+    // bound and checked the length only afterwards. Build a genuine pcodec
+    // stream of many floats, then declare a tiny `nnz`.
+    const N: usize = 1 << 20; // 1Mi floats → 4 MiB decoded
+    let floats = vec![0.0f32; N];
+    let values = pco::standalone::simple_compress(&floats, &pco::ChunkConfig::default()).unwrap();
+
+    let indptr_raw: Vec<u8> = [0u64, 1, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indices_raw: Vec<u8> = [0u32, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let indptr = zstd::encode_all(indptr_raw.as_slice(), 3).unwrap();
+    let indices = zstd::encode_all(indices_raw.as_slice(), 3).unwrap();
+
+    let encoded = EncodedShardRef {
+        indptr_bytes: &indptr,
+        indices_bytes: &indices,
+        values_bytes: &values,
+    };
+    let err = decode_shard_ref(
+        &encoded,
+        CodecId::Pcodec,
+        ValueEncoding::Float32,
+        2, // n_rows
+        2, // nnz → 2 floats declared, 1Mi present
+        false,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds limit"),
+        "expected the element cap to fire before decompressing, got: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -525,5 +775,282 @@ fn row_group_names_the_group_for_a_short_forbp_stream() {
     assert!(
         format!("{err}").contains("row-group at row 9"),
         "error does not name the failing group: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: the Pcodec float arms must decode what this crate encodes.
+//
+// The bounded-decode work above briefly guarded `pcodec_decompress_bounded`
+// with `bound_capacity`, whose "at least 1 bit per output value" floor is a
+// property of the Scx1 Golomb/Rice codes and **not** of pcodec, which is an
+// entropy coder. Low-entropy float payloads — a constant layer, or raw counts
+// stored as `f32`, which is the standard AnnData layout — compress below that
+// floor, so the guard rejected shards `encode_shard` had just produced.
+//
+// These are round trips through the public API, at nnz large enough to leave
+// the region where pcodec's per-chunk overhead keeps the ratio above 1
+// bit/value. The pre-existing dispatch proptests cannot see this: `arb_csr`
+// caps nnz near 1000, which stays above the floor.
+// ---------------------------------------------------------------------------
+
+/// Build a CSR shard: `n_rows` rows of `per_row` entries, values from `f`.
+fn pcodec_shard(
+    n_rows: usize,
+    per_row: usize,
+    encoding: ValueEncoding,
+    f: impl Fn(usize) -> f32,
+) -> (Vec<u64>, Vec<u32>, Vec<u8>, usize) {
+    let nnz = n_rows * per_row;
+    let indptr: Vec<u64> = (0..=n_rows).map(|r| (r * per_row) as u64).collect();
+    let indices: Vec<u32> = (0..nnz).map(|i| (i % per_row) as u32).collect();
+    let floats: Vec<f32> = (0..nnz).map(&f).collect();
+    let values = values_to_raw_bytes(&floats, encoding).unwrap();
+    (indptr, indices, values, nnz)
+}
+
+fn assert_pcodec_roundtrips(label: &str, encoding: ValueEncoding, f: impl Fn(usize) -> f32) {
+    // 500 rows × 200 = 100_000 nnz — a realistic shard size, and far enough
+    // past pcodec's chunk overhead that low-entropy data lands under 1 bit/value.
+    let (indptr, indices, values, nnz) = pcodec_shard(500, 200, encoding, f);
+    let encoded = scx_codec::dispatch::encode_shard(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::Pcodec,
+        encoding,
+        false,
+    )
+    .unwrap();
+
+    // Premise: this payload really is compressed below the 1-bit-per-value
+    // floor. If it were not, the test would pass for the wrong reason.
+    let bits_per_value = (encoded.values_bytes.len() as f64 * 8.0) / nnz as f64;
+    assert!(
+        bits_per_value < 1.0,
+        "{label}: premise failed — {bits_per_value:.3} bits/value is above the \
+         1-bit floor, so this case would not exercise the regression"
+    );
+
+    let decoded = scx_codec::dispatch::decode_shard(
+        &encoded,
+        CodecId::Pcodec,
+        encoding,
+        500,
+        nnz,
+        false,
+    )
+    .unwrap_or_else(|e| {
+        panic!("{label}: encode→decode round trip failed at {bits_per_value:.3} bits/value: {e}")
+    });
+    assert_eq!(decoded.0.len(), 501, "{label}: indptr length");
+    assert_eq!(decoded.1.len(), nnz, "{label}: indices length");
+    assert_eq!(
+        decoded.2.len(),
+        nnz * encoding.byte_width(),
+        "{label}: values byte length"
+    );
+    assert_eq!(decoded.2, values, "{label}: values must round-trip exactly");
+}
+
+#[test]
+fn test_pcodec_low_entropy_float_roundtrip() {
+    // A constant layer: pcodec reaches ~0 bits/value.
+    assert_pcodec_roundtrips("constant f32", ValueEncoding::Float32, |_| 1.0);
+
+    // Raw counts stored as f32 — mostly 1.0, some 2.0, few 3/4. This is what
+    // an AnnData `X` of raw scRNA-seq counts looks like, and it measures
+    // ~0.96 bits/value: under the floor, and not a degenerate input.
+    assert_pcodec_roundtrips("raw counts as f32", ValueEncoding::Float32, |i| {
+        match (i * 2_654_435_761) % 100 {
+            0..=79 => 1.0,
+            80..=93 => 2.0,
+            94..=97 => 3.0,
+            _ => 4.0,
+        }
+    });
+}
+
+#[test]
+fn test_pcodec_low_entropy_float16_roundtrip() {
+    // The Float16 arm decodes through the same pcodec helper (as f32, then
+    // narrowed), so it carried the same false rejection.
+    assert_pcodec_roundtrips("constant f16", ValueEncoding::Float16, |_| 1.0);
+}
+
+/// The inverse of `test_pcodec_float_values_are_bounded_before_decompression`:
+/// a *large declared* `nnz` against a *tiny* pcodec stream.
+///
+/// Sizing the float destination from the header made this a second allocation
+/// as large as the indices bomb that let it through. `le_bytes_to_indices`
+/// wants an exact `nnz * width` bytes, and Zstd expands a few KiB of zero
+/// indices into exactly that — so "the indices stream corroborates `nnz`" is
+/// not a bound, it is the same untrusted number arriving by a longer route.
+///
+/// The decode fails either way, with the same message, so the assertion is on
+/// **allocation**: the values arm must not claim another `nnz * 4`. The indices
+/// buffer itself is pre-existing and shared with every other codec, so it is
+/// measured as the baseline rather than treated as a defect here.
+#[test]
+fn test_pcodec_large_declared_nnz_does_not_preallocate_from_the_header() {
+    const NNZ: usize = 16 * 1024 * 1024;
+    const FLOAT_DST_BYTES: usize = NNZ * 4;
+
+    let indptr_raw: Vec<u8> = [0u64, NNZ as u64]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let indptr = zstd::encode_all(indptr_raw.as_slice(), 3).unwrap();
+    let indices = zstd::encode_all(vec![0u8; NNZ * 4].as_slice(), 3).unwrap();
+    assert!(
+        indices.len() < 64 * 1024,
+        "premise: the indices bomb must be tiny, got {} B",
+        indices.len()
+    );
+
+    // A genuine, tiny pcodec stream carrying two values.
+    let values =
+        pco::standalone::simple_compress(&[1.0f32, 2.0], &pco::ChunkConfig::default()).unwrap();
+
+    // Baseline: the same shard decoded as an *integer* Pcodec shard. Integer
+    // values take the Zstd arm, so this measures everything except the float
+    // destination — indices bomb, growth transients and all.
+    let (_, baseline) = peak_alloc_bytes(|| {
+        let encoded = EncodedShardRef {
+            indptr_bytes: &indptr,
+            indices_bytes: &indices,
+            values_bytes: &values,
+        };
+        decode_shard_ref(
+            &encoded,
+            CodecId::Pcodec,
+            ValueEncoding::Uint32,
+            1,
+            NNZ,
+            false,
+        )
+    });
+
+    let (res, peak) = peak_alloc_bytes(|| {
+        let encoded = EncodedShardRef {
+            indptr_bytes: &indptr,
+            indices_bytes: &indices,
+            values_bytes: &values,
+        };
+        decode_shard_ref(
+            &encoded,
+            CodecId::Pcodec,
+            ValueEncoding::Float32,
+            1,
+            NNZ,
+            false,
+        )
+    });
+
+    let err = res.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("pcodec value count 2") && msg.contains(&NNZ.to_string()),
+        "expected the count mismatch after a stream-sized decode, got: {msg}"
+    );
+
+    // Half the float destination is a wide margin: a header-sized `vec![0f32;
+    // nnz]` adds a full FLOAT_DST_BYTES over the baseline, while growing from
+    // the stream adds the fixed slab (256 KiB) plus two decoded values.
+    let budget = baseline + FLOAT_DST_BYTES / 2;
+    assert!(
+        peak <= budget,
+        "the float arm allocated from the untrusted header: peak {peak} B vs \
+         baseline {baseline} B (+{} B). A stream-sized decode should add well \
+         under {} B, not approach the {FLOAT_DST_BYTES} B destination the \
+         header declared.",
+        peak.saturating_sub(baseline),
+        FLOAT_DST_BYTES / 2
+    );
+}
+
+/// An honest round trip that spans **more than one pco chunk**.
+///
+/// The incremental decode loop is a two-level state machine, and its outer
+/// level — finish a chunk, hand the source to the next via `into_src` — is
+/// reached only above pco's default page size (`1 << 18` values). Every other
+/// pcodec test here sits below that or fails on the first `read`, so chunk-to-
+/// chunk advancement, concatenation order and the aggregate count had no
+/// regression net: the loop could break after chunk one and they would all
+/// still pass.
+///
+/// The multi-chunk premise is *proved* by walking the stream, not assumed from
+/// pco's default paging, so this cannot quietly become a single-chunk test if
+/// that default changes.
+#[test]
+fn test_pcodec_multi_chunk_roundtrip_is_byte_exact() {
+    use pco::standalone::{DecompressorItem, FileDecompressor};
+
+    // ~3 default pco pages of diverse (not low-entropy) floats.
+    const NNZ: usize = 800_000;
+    let mut state: u64 = 0xdead_beef_cafe_babe;
+    let floats: Vec<f32> = (0..NNZ)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32) / 1024.0
+        })
+        .collect();
+
+    let n_rows = 800usize;
+    let per_row = NNZ / n_rows;
+    let indptr: Vec<u64> = (0..=n_rows).map(|r| (r * per_row) as u64).collect();
+    let indices: Vec<u32> = (0..NNZ).map(|i| (i % per_row) as u32).collect();
+    let values = values_to_raw_bytes(&floats, ValueEncoding::Float32).unwrap();
+
+    let encoded = scx_codec::dispatch::encode_shard(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::Pcodec,
+        ValueEncoding::Float32,
+        false,
+    )
+    .unwrap();
+
+    // Premise: the value stream really does carry more than one chunk.
+    let mut chunks = 0usize;
+    let mut scratch = vec![0f32; 1 << 16];
+    let (fd, mut src) = FileDecompressor::new(encoded.values_bytes.as_slice()).unwrap();
+    loop {
+        match fd.chunk_decompressor::<f32, _>(src).unwrap() {
+            DecompressorItem::EndOfData(_) => break,
+            DecompressorItem::Chunk(mut cd) => {
+                chunks += 1;
+                loop {
+                    if cd.read(&mut scratch).unwrap().finished {
+                        break;
+                    }
+                }
+                src = cd.into_src();
+            }
+        }
+    }
+    assert!(
+        chunks > 1,
+        "premise failed: {NNZ} values encoded to {chunks} pco chunk(s), so this \
+         test would not reach the chunk-to-chunk transition"
+    );
+
+    let decoded = scx_codec::dispatch::decode_shard(
+        &encoded,
+        CodecId::Pcodec,
+        ValueEncoding::Float32,
+        n_rows,
+        NNZ,
+        false,
+    )
+    .unwrap();
+    assert_eq!(decoded.0.len(), n_rows + 1, "indptr length");
+    assert_eq!(decoded.1.len(), NNZ, "indices length");
+    assert_eq!(
+        decoded.2, values,
+        "values must round-trip byte-exactly across {chunks} pco chunks"
     );
 }

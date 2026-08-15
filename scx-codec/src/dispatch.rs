@@ -637,7 +637,7 @@ pub fn decode_indptr_only(
             le_bytes_to_u64(&raw, n_rows_p1)?
         }
         CodecId::Lz4Shuffle => {
-            let shuffled = lz4_frame_decompress(indptr_bytes)?;
+            let shuffled = lz4_frame_decompress(indptr_bytes, indptr_byte_cap(n_rows)?)?;
             let raw = byte_unshuffle(&shuffled, 8)?;
             le_bytes_to_u64(&raw, n_rows_p1)?
         }
@@ -1095,7 +1095,10 @@ pub fn zstd_decode_bounded(data: &[u8], max_bytes: usize) -> Result<Vec<u8>, Cod
     let decoder = zstd::Decoder::new(data)?;
     // Cap initial allocation to avoid huge alloc from untrusted max_bytes
     let mut output = Vec::with_capacity(max_bytes.min(1 << 20));
-    let mut limited = decoder.take(max_bytes as u64 + 1);
+    // `saturating_add` for the same reason as `lz4_frame_decompress`: unreachable
+    // today, but a `+ 1` here would be a panic rather than an error under this
+    // crate's release `overflow-checks`.
+    let mut limited = decoder.take((max_bytes as u64).saturating_add(1));
     limited.read_to_end(&mut output)?;
     if output.len() > max_bytes {
         return Err(CodecError::Io(std::io::Error::new(
@@ -1157,11 +1160,36 @@ fn lz4_frame_compress(data: &[u8]) -> Result<Vec<u8>, CodecError> {
     Ok(buf)
 }
 
-fn lz4_frame_decompress(data: &[u8]) -> Result<Vec<u8>, CodecError> {
+/// Decompress an LZ4 frame, refusing to produce more than `max_bytes`.
+///
+/// `max_bytes` is the exact expected decompressed length, derived from the
+/// shard's declared shape (`indptr_byte_cap` / `checked_len`) exactly as the
+/// Zstd paths derive theirs. The cap is applied *during* decompression via
+/// `Read::take`, not checked afterwards: an LZ4 frame compresses runs at a
+/// ratio well past 100:1, so a small shard could otherwise force an
+/// arbitrarily large allocation before anything noticed the length was wrong.
+/// Mirrors [`zstd_decode_bounded`].
+fn lz4_frame_decompress(data: &[u8], max_bytes: usize) -> Result<Vec<u8>, CodecError> {
     use std::io::Read;
-    let mut decoder = lz4_flex::frame::FrameDecoder::new(data);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out)?;
+    let decoder = lz4_flex::frame::FrameDecoder::new(data);
+    let mut out = Vec::with_capacity(max_bytes.min(1 << 20));
+    // `saturating_add`: no current caller can reach `max_bytes == usize::MAX`
+    // (the indices arm's `checked_len(nnz, >= 2)` errors first), but this crate
+    // sets `overflow-checks = true` in release, so a plain `+ 1` would make a
+    // reader panic rather than error if a future caller ever did. Keep the
+    // property local to the guard instead of resting it on call order.
+    let mut limited = decoder.take((max_bytes as u64).saturating_add(1));
+    limited.read_to_end(&mut out)?;
+    if out.len() > max_bytes {
+        return Err(CodecError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "decompressed size {} exceeds limit {}",
+                out.len(),
+                max_bytes
+            ),
+        )));
+    }
     Ok(out)
 }
 
@@ -1199,27 +1227,40 @@ fn decode_lz4_shuffle_ref(
     value_encoding: ValueEncoding,
     index_dtype_u16: bool,
 ) -> Result<DecodedShard, CodecError> {
+    // Bound every sub-stream from the declared shape before decompressing, in
+    // the same order and by the same helpers as `decode_zstd_ref`. Deriving the
+    // caps up front is also what keeps the unchecked `count * width`
+    // multiplications inside `le_bytes_to_u64` / `le_bytes_to_indices` out of
+    // reach of a hostile `n_rows` / `nnz`: `indptr_byte_cap` and `checked_len`
+    // do those multiplications in checked arithmetic and return an error, where
+    // this codec previously reached them directly and panicked under the
+    // crate's `overflow-checks = true`.
+    let index_width = if index_dtype_u16 { 2 } else { 4 };
+    let indptr_max = indptr_byte_cap(n_rows)?;
+    let indices_max = checked_len(nnz, index_width, "indices")?;
+    let values_max = checked_len(nnz, value_encoding.byte_width(), "values")?;
+
     // LZ4 frame decompress then byte-unshuffle each array
-    let indptr_shuffled = lz4_frame_decompress(encoded.indptr_bytes)?;
-    let indices_shuffled = lz4_frame_decompress(encoded.indices_bytes)?;
-    let values_shuffled = lz4_frame_decompress(encoded.values_bytes)?;
+    let indptr_shuffled = lz4_frame_decompress(encoded.indptr_bytes, indptr_max)?;
+    let indices_shuffled = lz4_frame_decompress(encoded.indices_bytes, indices_max)?;
+    let values_shuffled = lz4_frame_decompress(encoded.values_bytes, values_max)?;
 
     let indptr_raw = byte_unshuffle(&indptr_shuffled, 8)?;
-    let index_width = if index_dtype_u16 { 2 } else { 4 };
     let indices_raw = byte_unshuffle(&indices_shuffled, index_width)?;
     let values_raw = byte_unshuffle(&values_shuffled, value_encoding.byte_width())?;
 
     let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
     let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
 
-    let expected_len = checked_len(nnz, value_encoding.byte_width(), "values")?;
-    if values_raw.len() != expected_len {
+    // `values_max` is the exact expected length, so a *short* stream is what
+    // remains to catch here — the cap above already refused a long one.
+    if values_raw.len() != values_max {
         return Err(CodecError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "decompressed values byte length {} != expected {}",
                 values_raw.len(),
-                expected_len
+                values_max
             ),
         )));
     }
@@ -1559,6 +1600,119 @@ fn encode_pcodec(
     })
 }
 
+/// Decompress exactly `n_values` f32s from a pcodec stream.
+///
+/// Two opposite hostile shapes meet here, and a guard for one is not a guard
+/// for the other:
+///
+/// - **Stream larger than declared.** `pco::standalone::simple_decompress`
+///   sizes its output from the *stream*, so a shard declaring two values could
+///   decompress a million and the length check downstream would fire one full
+///   allocation too late. Bounded below by refusing to append past `n_values`.
+/// - **Declared larger than stream.** Sizing the destination from `n_values`
+///   instead inverts the problem — see the `n_values` note below. Bounded by
+///   growing `out` only as pco actually produces numbers.
+///
+/// **Do not add a compression-ratio plausibility bound to this function.**
+/// [`bound_capacity`] is sound only for the Scx1 primitives, whose Golomb/Rice
+/// codes spend at least one input bit per output value. pcodec is an entropy
+/// coder with no such floor: a constant run costs ~0 bits/value, and ordinary
+/// single-cell payloads sit under it too — raw counts stored as `f32` (the
+/// standard AnnData layout, ~80% ones) measure ≈0.96 bits/value. Applying the
+/// 1-bit floor here rejected shards this crate's *own encoder* had just
+/// produced, at every realistic shard size. See
+/// `test_pcodec_low_entropy_float_roundtrip`.
+///
+/// **`n_values` is not trustworthy, and must not size the destination.** It is
+/// a shard-header field. It is tempting to argue it has already been
+/// corroborated, because `decode_pcodec_ref` decodes the indices sub-stream
+/// first and `le_bytes_to_indices` demands an *exact* `n_values * index_width`
+/// bytes — but those are *decompressed* bytes, and Zstd will expand a ~2 KiB
+/// run of zero indices into exactly the `n_values * width` the check wants. A
+/// `vec![0f32; n_values]` sized from the header therefore hands a few kilobytes
+/// of input a second allocation of the same magnitude as the indices bomb that
+/// let it through: measured at 165 MB of peak RSS from a 2.5 KiB shard before
+/// this loop replaced it.
+///
+/// So the destination grows with numbers pco has *actually produced*, capped at
+/// `n_values`, which is the same shape `zstd_decode_bounded` uses — eager
+/// capacity clamped, `read_to_end` growing against a `take` limiter. `read`
+/// wants a `dst` whose length is a multiple of 256 (or ≥ the chunk remainder),
+/// hence the fixed slab.
+fn pcodec_decompress_bounded(data: &[u8], n_values: usize) -> Result<Vec<f32>, CodecError> {
+    use pco::standalone::{DecompressorItem, FileDecompressor};
+
+    // 65536 = 256 × 256, satisfying `ChunkDecompressor::read`'s stride rule.
+    const SLAB: usize = 1 << 16;
+
+    let pco_err = |e: pco::errors::PcoError| CodecError::Io(std::io::Error::other(e.to_string()));
+    let too_many = || {
+        CodecError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("decompressed pcodec values exceeds limit {n_values}"),
+        ))
+    };
+
+    // Overflow guard only — `n_values` still bounds the *total*, it just never
+    // gets to be an up-front allocation.
+    checked_len(n_values, std::mem::size_of::<f32>(), "pcodec values")?;
+
+    let mut out: Vec<f32> = Vec::with_capacity(n_values.min(SLAB));
+    // Round up to `read`'s 256 stride, but never overshoot a small shard: a
+    // fixed 256 KiB slab made a 5k-value shard decode ~1.5× slower than the
+    // eager path it replaces. `checked_len` above keeps `next_multiple_of`
+    // clear of overflow.
+    //
+    // `read` accepts a `dst` that is a multiple of 256 *or* at least the
+    // chunk's remaining count. Only the **first** clause is what makes this
+    // sound, and it always holds: `.max(256)` keeps the slab non-zero and both
+    // `next_multiple_of(256)` and `SLAB` are multiples of 256. The second
+    // clause is *not* generally true here — a default pco page is 1<<18
+    // values, which exceeds the 1<<16 slab — so do not lean on it.
+    let slab_len = SLAB.min(n_values.next_multiple_of(256).max(256));
+    let mut slab = vec![0f32; slab_len];
+    let (fd, mut src) = FileDecompressor::new(data).map_err(pco_err)?;
+
+    loop {
+        match fd.chunk_decompressor::<f32, _>(src).map_err(pco_err)? {
+            DecompressorItem::EndOfData(_) => break,
+            DecompressorItem::Chunk(mut cd) => {
+                loop {
+                    let progress = cd.read(&mut slab).map_err(pco_err)?;
+                    // Refuse *before* appending, so an over-long stream can
+                    // never grow `out` past the declared shape.
+                    if out.len() + progress.n_processed > n_values {
+                        return Err(too_many());
+                    }
+                    out.extend_from_slice(&slab[..progress.n_processed]);
+                    if progress.finished {
+                        break;
+                    }
+                    if progress.n_processed == 0 {
+                        // Defensive: a chunk that reports neither progress nor
+                        // completion would otherwise spin forever.
+                        return Err(CodecError::MalformedInput(
+                            "pcodec chunk made no progress".to_string(),
+                        ));
+                    }
+                }
+                src = cd.into_src();
+            }
+        }
+    }
+
+    if out.len() != n_values {
+        return Err(CodecError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "decompressed pcodec value count {} != expected {n_values}",
+                out.len()
+            ),
+        )));
+    }
+    Ok(out)
+}
+
 fn decode_pcodec_ref(
     encoded: &EncodedShardRef,
     n_rows: usize,
@@ -1579,8 +1733,7 @@ fn decode_pcodec_ref(
     // values: Pcodec for float encodings, Zstd for integer encodings
     let values_raw = match value_encoding {
         ValueEncoding::Float32 => {
-            let floats: Vec<f32> = pco::standalone::simple_decompress(encoded.values_bytes)
-                .map_err(|e| CodecError::Io(std::io::Error::other(e.to_string())))?;
+            let floats = pcodec_decompress_bounded(encoded.values_bytes, nnz)?;
             let mut buf = Vec::with_capacity(floats.len() * 4);
             for &f in &floats {
                 buf.extend_from_slice(&f.to_le_bytes());
@@ -1589,8 +1742,7 @@ fn decode_pcodec_ref(
         }
         ValueEncoding::Float16 => {
             // Decompress as f32, narrow back to f16
-            let floats: Vec<f32> = pco::standalone::simple_decompress(encoded.values_bytes)
-                .map_err(|e| CodecError::Io(std::io::Error::other(e.to_string())))?;
+            let floats = pcodec_decompress_bounded(encoded.values_bytes, nnz)?;
             let mut buf = Vec::with_capacity(floats.len() * 2);
             for &f in &floats {
                 buf.extend_from_slice(&half::f16::from_f32(f).to_le_bytes());

@@ -198,7 +198,10 @@ The file header stores a default `codec_id`, but each shard header may **overrid
 
 Auto-codec selection (`scx-format/src/codec_select.rs`) samples up to 10K non-zero
 values per shard: integer data uses the median heuristic to choose Scx1 vs Zstd,
-float data routes to Pcodec. LZ4+shuffle is available via `codec="lz4"` but not auto-selected.
+float data routes to Pcodec. LZ4+shuffle is available via `codec="lz4"`, and is
+also auto-selected by the *per-modality* heuristic
+(`select_codec_for_modality`) for non-binary integer ATAC counts; the
+modality-blind heuristic above never picks it.
 
 ---
 
