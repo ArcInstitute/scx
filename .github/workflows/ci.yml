@@ -85,7 +85,10 @@ jobs:
           # runner out of disk on PRs ("No space left on device" — tests passed,
           # only the save failed). main keeps the cache fresh.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --exclude rscx -- -D warnings
+      # `--all-targets` lints tests, benches and examples too. Without it a
+      # whole class of test-code defect is invisible to CI, and test code is
+      # where the correctness reasoning lives.
+      - run: cargo clippy --workspace --exclude rscx --all-targets -- -D warnings
 
   fmt:
     name: Format
@@ -275,14 +278,20 @@ jobs:
       matrix:
         include:
           # scx-cli cloud feature only
-          - flags: "-p scx-cli --features cloud"
+          - flags: "-p scx-cli --features cloud --all-targets"
             name: "scx-cli --features cloud"
           # scx-cli cloud + hdf5 — pulls in the hdf5-rust bindings
-          - flags: "-p scx-cli --features hdf5,cloud"
+          - flags: "-p scx-cli --features hdf5,cloud --all-targets"
             name: "scx-cli --features hdf5,cloud"
           # scx-accel gpu feature — requires cudarc stubs only, no CUDA toolkit
-          - flags: "-p scx-accel --features gpu"
+          - flags: "-p scx-accel --features gpu --all-targets"
             name: "scx-accel --features gpu"
+          # scx-convert hdf5 — the ingest/export path. The `test` job runs
+          # default features only, so before this lane existed the hdf5-gated
+          # half of scx-convert (including its test modules) was compiled by no
+          # CI job at all.
+          - flags: "-p scx-convert --features hdf5 --all-targets"
+            name: "scx-convert --features hdf5"
           # pyscx gpu feature — the rapids-absent lane (ACC-RUST-OPT-V4 §4.3).
           # Compiles + clippy-checks the gpu-gated rapids routing on a CPU runner
           # with neither CUDA nor rapids-singlecell present (cudarc stubs compile);
@@ -291,17 +300,17 @@ jobs:
           # no_rapids branch is unit-tested in `cargo test` (scx-accel route).
           # The runtime no_rapids→CPU assertion on a GPU host without rapids is a
           # Phase 2.2 GPU gate (needs hardware CI does not have).
-          - flags: "-p pyscx --features gpu"
+          - flags: "-p pyscx --features gpu --all-targets"
             name: "pyscx --features gpu"
           # pyscx hdf5 + gpu — the documented GPU build combo (report F2).
           # maturin's `--features` REPLACES the pyproject default set (which
           # includes hdf5), so the docs/skills build with `--features hdf5,gpu`;
           # this guards that the combo compiles + clippy-checks so the h5ad I/O
           # path can't silently regress under a GPU build.
-          - flags: "-p pyscx --features hdf5,gpu"
+          - flags: "-p pyscx --features hdf5,gpu --all-targets"
             name: "pyscx --features hdf5,gpu"
           # pyscx cloud — covered by the python job; also check standalone
-          - flags: "-p pyscx --features cloud"
+          - flags: "-p pyscx --features cloud --all-targets"
             name: "pyscx --features cloud"
           # scx-gpu's benchmark binary is `required-features = ["bench"]`, so no
           # default-feature lane ever compiles it — a `scx-codec` signature change

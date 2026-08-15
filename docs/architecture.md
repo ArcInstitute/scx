@@ -12,7 +12,11 @@ For the API reference, see [api.md](api.md).
 
 ## Crate Dependency Graph
 
-The workspace contains 15 crates plus an integration-test crate (`scx-integration-tests`), 16 members in total. Dependencies flow bottom-up:
+The workspace contains 15 code crates plus two test-only members — `scx-testkit`
+(the output-identity harness) and `scx-integration-tests` — 17 in total. Neither
+test-only crate appears in the graph below: both are `publish = false` and are
+reached only through `[dev-dependencies]`, so nothing shipped depends on them.
+Dependencies flow bottom-up:
 
 ```
                         ┌──────────┐
@@ -76,6 +80,7 @@ rscx (R bindings via extendr, depends on scx-format-io, scx-codec, scx-sparse, s
 | **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `optimize`, `merge`, `rollback`, `cellbender-import`, `obs-import`, `doublet-import`, `benchmark`, cloud ops |
 | **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud`, `backed`, `accel`, `preprocess`, `lazy_transform`, `projected_agg` |
 | **rscx** | R bindings via extendr | Seurat v5 + SingleCellExperiment interop, pipe-friendly query API |
+| **scx-testkit** | Test-only (`publish = false`, dev-dependency): asserts a refactor did not change what SCX writes. Hashes **per catalog section** rather than the whole file, because every mutating write path stamps `SystemTime::now()` into `Provenance` (and `file_checksum` covers it), so a whole-file BLAKE3 differs between two runs of the same op. Covers each section's payload **plus** its `ShardStats` (`row_start`, `nnz`, `column_stats`) and the catalog's `data_generation` / `csc_build_generation` — those live in the catalog, not in any section's bytes, and readers act on them, so a payload-only hash would call two behaviourally different files equal. `Strictness::Layout` additionally pins section offsets and the header's catalog pointers. The 4096-byte root catalog is deliberately excluded: it has no production readers and every writer rebuilds it. | `digest` (`FileDigest` / `Strictness::{Content,Layout}` / `assert_matches_golden`), `fixtures` (`mixed_codec_file` — one unframed, one row-group-framed integer and one `Pcodec` float shard, so the digest covers every encoder path) |
 
 > [!NOTE]
 > `scx-loader` has its own streaming-optimized gene projection and fused

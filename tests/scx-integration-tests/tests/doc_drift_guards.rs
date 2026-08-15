@@ -100,8 +100,8 @@ fn deletion_vector_version_pinned() {
 }
 
 /// The workspace member set must match the documented crate graph (15 code
-/// crates + the integration-test crate). A crate added or renamed without
-/// updating AGENTS.md / docs/architecture.md trips this (D3).
+/// crates + `scx-testkit` + the integration-test crate). A crate added or
+/// renamed without updating AGENTS.md / docs/architecture.md trips this (D3).
 #[test]
 fn workspace_members_match_documented_crates() {
     let cargo = std::fs::read_to_string(workspace_root().join("Cargo.toml")).unwrap();
@@ -120,6 +120,9 @@ fn workspace_members_match_documented_crates() {
         "scx-gpu",
         "scx-mtx",
         "scx-accel",
+        // Test-only (`publish = false`): the output-identity harness the
+        // refactor series gates on. Not part of the dependency core.
+        "scx-testkit",
         "pyscx",
         "rscx",
         "tests/scx-integration-tests",

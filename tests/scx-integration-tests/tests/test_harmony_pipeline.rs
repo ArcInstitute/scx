@@ -115,7 +115,7 @@ fn test_harmony_pipeline_end_to_end() {
         .z_corrected
         .iter()
         .zip(pca.embeddings.iter())
-        .filter(|(a, b)| (**a as f64 - *b).abs() < 1e-9)
+        .filter(|(a, b)| (**a - *b).abs() < 1e-9)
         .count();
     assert!(
         unchanged < harmony.z_corrected.len(),

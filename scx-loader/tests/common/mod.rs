@@ -27,7 +27,7 @@ pub fn write_multi_shard_fixture(
     n_vars: usize,
     n_shards: usize,
 ) -> std::path::PathBuf {
-    assert!(n_obs % n_shards == 0, "n_obs must divide n_shards");
+    assert!(n_obs.is_multiple_of(n_shards), "n_obs must divide n_shards");
     let rows_per_shard = n_obs / n_shards;
 
     let header = FileHeader::new_single_modality(
@@ -110,7 +110,7 @@ pub fn write_dense_scx1_fixture(
     nnz_per_row: usize,
     codec: CodecId,
 ) -> std::path::PathBuf {
-    assert!(n_obs % n_shards == 0);
+    assert!(n_obs.is_multiple_of(n_shards));
     let rows_per_shard = n_obs / n_shards;
     let n_vars = nnz_per_row * 251 + 16;
     let header = FileHeader::new_single_modality(
@@ -203,7 +203,7 @@ pub fn write_known_multinnz_fixture(
     n_obs: usize,
     n_shards: usize,
 ) -> std::path::PathBuf {
-    assert!(n_obs % n_shards == 0, "n_obs must divide n_shards");
+    assert!(n_obs.is_multiple_of(n_shards), "n_obs must divide n_shards");
     const GENES: [u32; 4] = [2, 7, 33, 58];
     let n_vars: usize = KNOWN_MULTINNZ_N_VARS as usize;
     let rows_per_shard = n_obs / n_shards;
@@ -470,7 +470,7 @@ pub fn write_single_registered_modality_fixture(
     n_shards: usize,
 ) -> std::path::PathBuf {
     use scx_format_io::modality::ModalityType;
-    assert!(n_obs % n_shards == 0);
+    assert!(n_obs.is_multiple_of(n_shards));
     let rows_per_shard = n_obs / n_shards;
 
     let header = FileHeader::new_single_modality(
@@ -537,7 +537,7 @@ pub fn write_multimodal_overlapping_fixture(
     n_vars: usize,
 ) -> std::path::PathBuf {
     use scx_format_io::modality::ModalityType;
-    assert!(n_obs >= 4 && n_obs % 2 == 0);
+    assert!(n_obs >= 4 && n_obs.is_multiple_of(2));
 
     let header = FileHeader::new_single_modality(
         n_obs as u64,
@@ -643,11 +643,13 @@ fn string_column(name: &str, n: usize) -> RecordBatch {
 /// shard sort enabled, lookahead 4, plan-size cap 16384, and a generous
 /// memory budget so auto-tuning does not interfere with correctness assertions.
 pub fn open_loader(path: &std::path::Path, sort_by_shard: bool) -> IndexPlanLoader {
-    let mut config = LoaderConfig::default();
-    config.normalize = false;
-    config.log1p = false;
-    config.obs_columns = vec!["cell_id".to_string()];
-    config.max_memory_mb = 1024;
+    let config = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        obs_columns: vec!["cell_id".to_string()],
+        max_memory_mb: 1024,
+        ..Default::default()
+    };
     IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
 }
 
@@ -670,12 +672,14 @@ pub fn open_loader_with_flags(
     target_sum: f64,
     sort_by_shard: bool,
 ) -> IndexPlanLoader {
-    let mut config = LoaderConfig::default();
-    config.normalize = normalize;
-    config.log1p = log1p;
-    config.target_sum = target_sum;
-    config.obs_columns = vec!["cell_id".to_string()];
-    config.max_memory_mb = 1024;
+    let config = LoaderConfig {
+        normalize,
+        log1p,
+        target_sum,
+        obs_columns: vec!["cell_id".to_string()],
+        max_memory_mb: 1024,
+        ..Default::default()
+    };
     IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
 }
 
@@ -686,11 +690,13 @@ pub fn open_loader_hvg(
     hvg: Vec<u32>,
     sort_by_shard: bool,
 ) -> IndexPlanLoader {
-    let mut config = LoaderConfig::default();
-    config.normalize = false;
-    config.log1p = false;
-    config.hvg_indices = Some(hvg);
-    config.obs_columns = vec!["cell_id".to_string()];
-    config.max_memory_mb = 1024;
+    let config = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        hvg_indices: Some(hvg),
+        obs_columns: vec!["cell_id".to_string()],
+        max_memory_mb: 1024,
+        ..Default::default()
+    };
     IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
 }

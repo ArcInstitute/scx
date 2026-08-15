@@ -1454,29 +1454,6 @@ fn read_categorical_column(
     Ok((field, Arc::new(dict)))
 }
 
-/// Read obsm embeddings from h5ad file (root `/obsm`).
-///
-/// Kept for callers that need the non-streaming, fully-materialised
-/// view (the streaming pipeline now goes through
-/// [`list_dense_mapping_shapes`] + [`read_dense_mapping_shard`]). The
-/// `_at` form is also exposed for h5mu per-modality paths.
-#[allow(dead_code)]
-pub fn read_obsm(
-    file: &hdf5::File,
-    sink: &mut WarningSink,
-) -> Result<HashMap<String, RecordBatch>, ConvertError> {
-    read_obsm_at(file, "obsm", sink)
-}
-
-/// Read varm embeddings from h5ad file (root `/varm`). See [`read_obsm`].
-#[allow(dead_code)]
-pub fn read_varm(
-    file: &hdf5::File,
-    sink: &mut WarningSink,
-) -> Result<HashMap<String, RecordBatch>, ConvertError> {
-    read_obsm_at(file, "varm", sink)
-}
-
 /// Read an obsm group at an arbitrary path (e.g. `mod/rna/obsm` for an
 /// h5mu file's per-modality embeddings). Returns the same
 /// `name -> RecordBatch` map as `read_obsm`. Missing groups return an

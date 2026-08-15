@@ -35,12 +35,14 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 ## Build and Test
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
+# `--exclude rscx` matches CI: rscx pulls in extendr-api, whose build.rs panics
+# without an R toolchain (it is a workspace member but not a default-member).
+cargo test --workspace --exclude rscx
+cargo clippy --workspace --exclude rscx --all-targets -- -D warnings
 cargo fmt --check
 
 # With cloud features:
-cargo test --workspace --features cloud
+cargo test --workspace --exclude rscx --features cloud
 
 # Python bindings (always use uv venv at .venv/):
 cd pyscx && ../.venv/bin/maturin develop && ../.venv/bin/pytest tests/ -v
@@ -56,7 +58,7 @@ cd rscx && R CMD INSTALL .
 
 ## Architecture (summary)
 
-15 workspace crates plus an integration-test crate; the dependency core is `{scx-codec, scx-sparse} → scx-format (pure on-disk layout/spec) → scx-format-io (runtime reader/writer/backed I/O) → {scx-mtx, scx-ops, scx-engine, scx-loader, scx-cloud, scx-gpu, scx-accel, scx-convert} → {scx-cli, pyscx, rscx}`. Full graph and isolation rules in [docs/architecture.md § Crate Dependency Graph](docs/architecture.md#crate-dependency-graph). Feature flags: `scx-cli{hdf5,hdf5-static,cloud,default-bin}`, `scx-convert{hdf5,hdf5-static}`, `pyscx{hdf5,hdf5-static,cloud,gpu}`, `scx-gpu{gds}`, `scx-accel{gpu}` — all opt-in.
+15 workspace crates plus two test-only ones (`scx-testkit`, the output-identity harness, and the `scx-integration-tests` crate); the dependency core is `{scx-codec, scx-sparse} → scx-format (pure on-disk layout/spec) → scx-format-io (runtime reader/writer/backed I/O) → {scx-mtx, scx-ops, scx-engine, scx-loader, scx-cloud, scx-gpu, scx-accel, scx-convert} → {scx-cli, pyscx, rscx}`. Full graph and isolation rules in [docs/architecture.md § Crate Dependency Graph](docs/architecture.md#crate-dependency-graph). Feature flags: `scx-cli{hdf5,hdf5-static,cloud,default-bin}`, `scx-convert{hdf5,hdf5-static}`, `pyscx{hdf5,hdf5-static,cloud,gpu}`, `scx-gpu{gds}`, `scx-accel{gpu}` — all opt-in.
 
 File format ([docs/format.md](docs/format.md)): 256-byte LE header (magic `b"SCX\x01"`), 4096-byte root catalog at offset 256, 8-byte-aligned sections (29 types, IDs 0–29 with id 26 reserved), full catalog at EOF with per-entry checksums + shard statistics. v3 writers emit canonical row-major CSR. 76-byte CSR shard headers (magic `b"SCXS"`). Codecs: `None`, `Scx1` (integer only), `Pcodec` (float), `Zstd`, `Lz4Shuffle`, `ShufDeltaZstd`. The user-facing codec **intent axis** is `codec="auto"|"fast"|"compact"` (resolved by `scx_format::resolve_codec`): `auto` (default) is cost-aware adaptive — per framed integer shard it adopts `ShufDeltaZstd` when smaller by ≥ `ADOPT_MARGIN` (5%), else the heuristic (`Scx1` median ≤ 8, `Zstd` > 8); `fast` is the decode-max heuristic single-encode (the pre-flip default); `compact` adopts `ShufDeltaZstd` on ties. Float always → `Pcodec`. `auto` files are typically mixed-codec (`scx info` shows the per-shard breakdown). The prior `auto_v2` profile + `decode_target` knob were removed (pre-1.0 clean break). On-disk `u64`/`u16-u32`/`u8-u32`, in-memory `i64`/`i32`/`f32` to match scipy CSR zero-copy.
 

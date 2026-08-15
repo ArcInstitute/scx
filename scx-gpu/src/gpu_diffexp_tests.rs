@@ -279,7 +279,7 @@ fn cpu_emulator_combined_tie(
     let per_thread = total.div_ceil(block_threads);
 
     let co_rank = |diag: usize| -> usize {
-        let mut i_lo = if diag > n_g { diag - n_g } else { 0 };
+        let mut i_lo = diag.saturating_sub(n_g);
         let mut i_hi = diag.min(n_ref);
         while i_lo < i_hi {
             let i = (i_lo + i_hi) / 2;
@@ -499,19 +499,24 @@ fn test_gpu_de_primitives_match_cpu_reference() {
     let n_g = group_cells.len();
 
     let mut scratch = GpuDeChunkScratch::new(&dev, n_obs, chunk_size, n_ref.max(n_g)).unwrap();
-    gpu_de_upload_chunk(&dev, &mut scratch, &dense, n_obs, chunk_size).unwrap();
 
-    // Scatter + sort ref.
-    let mut d_ref_slab = dev.alloc_zeros::<f32>(chunk_size * n_ref).unwrap();
-    gpu_de_scatter_gene_major(
-        &dev,
-        &scratch.dense,
-        &ref_cells,
-        &mut d_ref_slab,
-        n_obs,
-        chunk_size,
-    )
-    .unwrap();
+    // Gene-major slab, staged on the host: `slab[gene * n_sel + j]` is the
+    // value for the j-th selected cell. This used to go through the v1 dense
+    // upload + scatter kernels; those are deleted, and a host reference is the
+    // better input anyway — the primitives below are the subject of the test,
+    // so their input should not itself be a GPU kernel under test.
+    let host_gene_major = |cells: &[i32]| -> Vec<f32> {
+        let mut out = vec![0.0f32; chunk_size * cells.len()];
+        for (j, &c) in cells.iter().enumerate() {
+            for g in 0..chunk_size {
+                out[g * cells.len() + j] = dense[c as usize * chunk_size + g];
+            }
+        }
+        out
+    };
+
+    // Sort ref.
+    let mut d_ref_slab = dev.htod_copy(&host_gene_major(&ref_cells)).unwrap();
     scratch
         .ensure_aux_capacity(&dev, chunk_size * n_ref)
         .unwrap();
@@ -539,17 +544,8 @@ fn test_gpu_de_primitives_match_cpu_reference() {
     assert!((tie_ref[0] - cpu_tie_term(&expected_ref_g0)).abs() < 1e-9);
     assert!((tie_ref[1] - cpu_tie_term(&expected_ref_g1)).abs() < 1e-9);
 
-    // Scatter + sort group + searchsorted U1.
-    let mut d_group_slab = dev.alloc_zeros::<f32>(chunk_size * n_g).unwrap();
-    gpu_de_scatter_gene_major(
-        &dev,
-        &scratch.dense,
-        &group_cells,
-        &mut d_group_slab,
-        n_obs,
-        chunk_size,
-    )
-    .unwrap();
+    // Sort group + searchsorted U1.
+    let mut d_group_slab = dev.htod_copy(&host_gene_major(&group_cells)).unwrap();
     gpu_de_searchsorted_u_stat(
         &dev,
         &d_ref_slab,
@@ -847,8 +843,8 @@ fn test_gpu_de_pseudobulk_all_modes() {
             let end = group_offsets[g + 1] as usize;
             for gene in 0..chunk_size {
                 let mut host_sum = 0.0f64;
-                for i in start..end {
-                    let cell = all_group_cells[i] as usize;
+                for &c in &all_group_cells[start..end] {
+                    let cell = c as usize;
                     let x = dense_host[cell * chunk_size + gene];
                     host_sum += host_pre(x, mode_id);
                 }
@@ -1147,141 +1143,6 @@ fn test_scratch_ensure_capacity_no_realloc_on_same_or_smaller() {
         frozen,
         "16 iterations of same/smaller ensure_* must not grow",
     );
-}
-
-/// `gpu_de_scatter_shard_to_dense` reproduces, on device, the dense
-/// `[n_obs × sz]` row-major chunk for a given column range directly from
-/// a CSR shard source. Three
-/// fixtures cover: (a) full column range, (b) middle column subrange,
-/// (c) an empty shard interleaved with non-empty shards.
-#[test]
-#[ignore = "requires a CUDA GPU"]
-fn test_csr_shard_to_dense_chunk_parity() {
-    use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
-    use scx_format_io::ShardSource;
-    use scx_sparse::ScxCsr;
-
-    let dev = require_gpu!();
-
-    // Tiny in-memory shard source for the test. Shard 0 has 3 rows
-    // with ties + missing columns; shard 1 has 0 rows (empty);
-    // shard 2 has 4 rows with one row entirely outside the chunk.
-    struct InMemorySource {
-        shards: Vec<ScxCsr>,
-        n_obs: usize,
-        n_vars: usize,
-    }
-    impl ShardSource for InMemorySource {
-        fn n_shards(&self) -> usize {
-            self.shards.len()
-        }
-        fn n_obs(&self) -> usize {
-            self.n_obs
-        }
-        fn n_vars(&self) -> usize {
-            self.n_vars
-        }
-        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
-            Ok(self.shards[shard_idx].clone())
-        }
-    }
-
-    // 8 columns; each row written explicitly so the parity comparison
-    // also catches col→(col-c0) miscalculation.
-    let n_vars = 8usize;
-    let shard0 = ScxCsr::new_unchecked(
-        (3, n_vars),
-        vec![0i64, 3, 5, 7],
-        vec![0i32, 3, 6, 1, 5, 2, 7],
-        vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-    );
-    // Empty shard: indptr length n_rows+1 = 1, no nonzeros. Note the
-    // RawGpuShardSource driver itself skips a `csr.n_rows() == 0`
-    // shard before invoking the callback, so this shard advances
-    // `global_row` by 0 — the next shard's global_row stays correct.
-    let shard1 = ScxCsr::new_unchecked((0, n_vars), vec![0i64], vec![], vec![]);
-    let shard2 = ScxCsr::new_unchecked(
-        (4, n_vars),
-        vec![0i64, 2, 2, 4, 6],
-        vec![0i32, 4, 2, 7, 1, 3],
-        vec![10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0],
-    );
-    let shards = vec![shard0.clone(), shard1.clone(), shard2.clone()];
-    // total rows in the dense matrix: 3 + 0 + 4 = 7
-    let n_obs = 7usize;
-    let src = InMemorySource {
-        shards: shards.clone(),
-        n_obs,
-        n_vars,
-    };
-
-    // Reference dense `[n_obs × sz]` built on host for a given column
-    // range. Matches what `gpu_de_scatter_shard_to_dense` writes on
-    // device.
-    let host_reference = |c0: usize, c1: usize| -> Vec<f32> {
-        let sz = c1 - c0;
-        let mut buf = vec![0.0f32; n_obs * sz];
-        let mut global_row = 0usize;
-        for shard in &shards {
-            let n_rows = shard.n_rows();
-            for r in 0..n_rows {
-                let s = shard.indptr[r] as usize;
-                let e = shard.indptr[r + 1] as usize;
-                for k in s..e {
-                    let col = shard.indices[k] as usize;
-                    if col >= c0 && col < c1 {
-                        buf[(global_row + r) * sz + (col - c0)] = shard.data[k];
-                    }
-                }
-            }
-            global_row += n_rows;
-        }
-        buf
-    };
-
-    // Run the GPU scatter for a (c0, c1) range against the host
-    // reference. The dense buffer is allocated freshly each
-    // sub-test to verify the zeroed-prefix contract.
-    let run_case = |c0: usize, c1: usize| {
-        let sz = c1 - c0;
-        let mut gpu_src = RawGpuShardSource::new(&dev, &src).unwrap();
-        let mut dense = dev.alloc_zeros::<f32>(n_obs * sz).unwrap();
-        // Zero is already the alloc_zeros postcondition; a real
-        // chunked driver re-zeros each iteration via memset_zeros.
-
-        let mut global_row = 0usize;
-        gpu_src
-            .for_each_gpu_shard(|_idx, slot| {
-                let view = slot.view();
-                let n_rows = view.shape.0;
-                crate::gpu_diffexp::gpu_de_scatter_shard_to_dense(
-                    &dev, &view, &mut dense, global_row, sz, c0, c1,
-                )?;
-                global_row += n_rows;
-                Ok(())
-            })
-            .unwrap();
-        dev.synchronize().unwrap();
-
-        let mut host_actual = vec![0.0f32; n_obs * sz];
-        dev.stream().memcpy_dtoh(&dense, &mut host_actual).unwrap();
-        dev.synchronize().unwrap();
-
-        let host_expected = host_reference(c0, c1);
-        assert_eq!(
-            host_actual, host_expected,
-            "shard-to-dense scatter mismatch for c0={c0}, c1={c1}"
-        );
-    };
-
-    // (a) full column range
-    run_case(0, n_vars);
-    // (b) middle subrange — excludes col 0 and col 7, includes ties at col 1..6
-    run_case(1, 6);
-    // (c) narrow subrange — only one shard contributes to col 4
-    run_case(4, 5);
-    // (d) empty intersection — should leave dense fully zero
-    run_case(0, 0); // c0 == c1 short-circuits in the wrapper
 }
 
 // ----- G1.9: warp-parallel tie-term kernel parity -----
@@ -1710,15 +1571,6 @@ fn test_csr_gene_major_and_pseudobulk_window_parity() {
     let cell_to_pos_dev = dev.htod_copy(&cell_to_pos).unwrap();
     let n_groups = 2usize;
 
-    // The v2 gene-major scatter takes a single `cell_to_pool` map (-1 = not in
-    // the pool) rather than the group+pos pair. It has no production caller
-    // today but is still exported from scx-gpu and received the identical
-    // windowing rewrite, so it is covered here rather than left as an untested
-    // change waiting for a future wire-up to inherit.
-    let cell_to_pool: Vec<i32> = vec![0, 1, -1, -1, -1];
-    let cell_to_pool_dev = dev.htod_copy(&cell_to_pool).unwrap();
-    let n_pool = 2usize;
-
     // Host references, written the pre-windowing way (linear scan + predicate)
     // so the assertion compares the new kernel against the old formulation.
     let host_slab = |c0: usize, c1: usize, group: i32| -> Vec<f32> {
@@ -1766,34 +1618,9 @@ fn test_csr_gene_major_and_pseudobulk_window_parity() {
         sums
     };
 
-    // Host reference for the v2 pool scatter, again written the pre-windowing
-    // way (linear scan + predicate).
-    let host_pool_slab = |c0: usize, c1: usize| -> Vec<f32> {
-        let sz = c1 - c0;
-        let mut slab = vec![0.0f32; sz * n_pool];
-        let mut global_row = 0usize;
-        for shard in &shards {
-            for r in 0..shard.n_rows() {
-                let pos = cell_to_pool[global_row + r];
-                if pos < 0 {
-                    continue;
-                }
-                for k in shard.indptr[r] as usize..shard.indptr[r + 1] as usize {
-                    let col = shard.indices[k] as usize;
-                    if col >= c0 && col < c1 {
-                        slab[(col - c0) * n_pool + pos as usize] = shard.data[k];
-                    }
-                }
-            }
-            global_row += shard.n_rows();
-        }
-        slab
-    };
-
     let run_case = |c0: usize, c1: usize| {
         let sz = c1 - c0;
         let mut gpu_src = RawGpuShardSource::new(&dev, &src).unwrap();
-        let mut pool_slab = dev.alloc_zeros::<f32>(sz * n_pool).unwrap();
         let mut slab0 = dev.alloc_zeros::<f32>(sz * n_perm).unwrap();
         let mut slab1 = dev.alloc_zeros::<f32>(sz * n_perm).unwrap();
         let mut sums = dev.alloc_zeros::<f64>(n_groups * sz).unwrap();
@@ -1840,17 +1667,6 @@ fn test_csr_gene_major_and_pseudobulk_window_parity() {
                     c1,
                     0, // ArithRaw: f(x) = x
                 )?;
-                crate::gpu_diffexp::gpu_de_scatter_shard_to_gene_major(
-                    &dev,
-                    &view,
-                    &cell_to_pool_dev,
-                    &mut pool_slab,
-                    global_row,
-                    n_pool,
-                    sz,
-                    c0,
-                    c1,
-                )?;
                 global_row += n_rows;
                 Ok(())
             })
@@ -1871,11 +1687,6 @@ fn test_csr_gene_major_and_pseudobulk_window_parity() {
             dev.dtoh_copy(&sums).unwrap(),
             host_sums(c0, c1),
             "pseudobulk sums mismatch for [{c0}, {c1})"
-        );
-        assert_eq!(
-            dev.dtoh_copy(&pool_slab).unwrap(),
-            host_pool_slab(c0, c1),
-            "v2 pool gene-major slab mismatch for [{c0}, {c1})"
         );
     };
 

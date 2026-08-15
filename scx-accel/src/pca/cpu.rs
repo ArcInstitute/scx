@@ -96,10 +96,6 @@ pub struct PcaResult {
     pub n_obs: usize,
     /// Number of variables.
     pub n_vars: usize,
-    /// Whether a captured CUDA graph was replayed in the GPU power loop
-    /// (Task 2.5). `None` on CPU paths; `Some(true)` only when the device-
-    /// resident capture path ran and replayed a graph.
-    pub graph_replayed: Option<bool>,
     /// Whether the GPU power loop held the whole matrix **device-resident**
     /// (`Some(true)`) or fell back to the streaming operator (`Some(false)`).
     /// `None` on CPU paths, which have no residency decision to make.
@@ -1448,7 +1444,6 @@ fn build_pca_result(
         n_components,
         n_obs,
         n_vars,
-        graph_replayed: None,
         resident_csr: None,
     })
 }
@@ -1627,7 +1622,6 @@ pub fn covariance_pca_with_depth<S: ShardSource + Sync + ?Sized>(
         n_components,
         n_obs,
         n_vars,
-        graph_replayed: None,
         resident_csr: None,
     })
 }
@@ -1741,7 +1735,6 @@ pub fn covariance_pca_inmemory(
         n_components,
         n_obs,
         n_vars,
-        graph_replayed: None,
         resident_csr: None,
     })
 }
@@ -1802,7 +1795,7 @@ mod tests {
     /// - col 1: values `r % 5` (mean 2, per-5-cycle Σdev² = 10) → `2·n_rows`.
     /// - total numerator `= 3·n_rows`, so variance `= 3·n_rows / (n_rows − 1)`.
     fn cancellation_csr(n_rows: usize) -> ScxCsr {
-        assert!(n_rows % 10 == 0, "n_rows must be a multiple of 10");
+        assert!(n_rows.is_multiple_of(10), "n_rows must be a multiple of 10");
         let mut indptr = vec![0i64];
         let mut indices = Vec::new();
         let mut data: Vec<f32> = Vec::new();
@@ -2147,7 +2140,7 @@ mod tests {
 
         // Compare top-3 PC embeddings via cosine similarity per component
         for pc in 0..3 {
-            let mut cov_col = vec![0.0f64; 10];
+            let mut cov_col = [0.0f64; 10];
             let mut rand_col = vec![0.0f64; 10];
             for i in 0..10 {
                 cov_col[i] = cov_result.embeddings[i * 3 + pc];

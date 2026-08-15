@@ -778,8 +778,7 @@ mod tests {
         let mut sum = vec![vec![0.0f64; n_cols]; n_batches];
         let mut sum_sq = vec![vec![0.0f64; n_cols]; n_batches];
         let mut counts = vec![0usize; n_batches];
-        for row in 0..n_rows {
-            let b = cell_batch[row];
+        for (row, &b) in cell_batch.iter().enumerate().take(n_rows) {
             if b < 0 || (b as usize) >= n_batches {
                 continue;
             }
@@ -807,8 +806,7 @@ mod tests {
         let mut out: Vec<(Vec<f64>, Vec<f64>)> = (0..n_batches)
             .map(|_| (vec![0.0f64; n_cols], vec![0.0f64; n_cols]))
             .collect();
-        for row in 0..n_rows {
-            let b = cell_batch[row];
+        for (row, &b) in cell_batch.iter().enumerate().take(n_rows) {
             if b < 0 || (b as usize) >= n_batches {
                 continue;
             }

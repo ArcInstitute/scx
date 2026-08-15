@@ -1,5 +1,5 @@
 [workspace]
-members = ["scx-format", "scx-format-io", "scx-codec", "scx-sparse", "scx-cli", "scx-convert", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "scx-mtx", "scx-accel", "pyscx", "rscx", "tests/scx-integration-tests"]
+members = ["scx-format", "scx-format-io", "scx-codec", "scx-sparse", "scx-cli", "scx-convert", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "scx-mtx", "scx-accel", "scx-testkit", "pyscx", "rscx", "tests/scx-integration-tests"]
 # rscx excluded from default-members: requires R toolchain + extendr, not always
 # available (CI, Rust-only dev). Build explicitly with: cargo build -p rscx
 #
@@ -8,7 +8,7 @@ members = ["scx-format", "scx-format-io", "scx-codec", "scx-sparse", "scx-cli", 
 # `#[ignore]`d and gated by require_gpu!(), so a CPU-only run reports them as
 # ignored instead of as passes; `scx-gpu/tests/gpu_test_gating.rs` enforces the
 # pairing. The CI `build-cpu-only` job pins the compile half of this contract.
-default-members = ["scx-format", "scx-format-io", "scx-codec", "scx-sparse", "scx-cli", "scx-convert", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "scx-mtx", "scx-accel", "pyscx", "tests/scx-integration-tests"]
+default-members = ["scx-format", "scx-format-io", "scx-codec", "scx-sparse", "scx-cli", "scx-convert", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "scx-mtx", "scx-accel", "scx-testkit", "pyscx", "tests/scx-integration-tests"]
 resolver = "2"
 
 # Keep overflow checks on for the codec crate even in release/bench. Decode is

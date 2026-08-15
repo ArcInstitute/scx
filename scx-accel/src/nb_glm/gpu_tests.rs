@@ -18,7 +18,7 @@ use scx_gpu::GpuDevice;
 /// Deterministic synthetic Perturb-seq-shaped pseudobulk: `n_genes` genes,
 /// `n_sub` samples split into reference/target halves, design `[1, is_target]`.
 fn synth(n_genes: usize, n_sub: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
-    assert!(n_sub % 2 == 0);
+    assert!(n_sub.is_multiple_of(2));
     let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
     let mut next = || {
         // xorshift64*

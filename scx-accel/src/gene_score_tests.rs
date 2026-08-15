@@ -115,7 +115,7 @@ fn zscore_matches_reference() {
             let gi = g as usize;
             let m = mean(&cols[gi]);
             let s = std1(&cols[gi], m);
-            z += (row[gi as usize] as f64 - m) / s;
+            z += (row[gi] as f64 - m) / s;
         }
         let expected = z / k.sqrt();
         assert!(

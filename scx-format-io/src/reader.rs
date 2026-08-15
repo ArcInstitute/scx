@@ -3653,20 +3653,6 @@ impl ScxReader {
         let _ = self.mmap.advise_range(Advice::WillNeed, offset, len);
     }
 
-    /// Hint that a byte range is no longer needed (`MADV_DONTNEED`).
-    ///
-    /// # Safety
-    /// `UncheckedAdvice::DontNeed` may discard dirty pages on some platforms,
-    /// but our mmap is read-only so this is safe.
-    #[cfg(unix)]
-    #[allow(dead_code)]
-    unsafe fn advise_dontneed(&self, offset: usize, len: usize) {
-        use memmap2::UncheckedAdvice;
-        let _ = self
-            .mmap
-            .unchecked_advise_range(UncheckedAdvice::DontNeed, offset, len);
-    }
-
     // -----------------------------------------------------------------------
     // Validate (11.12)
     // -----------------------------------------------------------------------

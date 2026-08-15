@@ -7,9 +7,6 @@
 //!   `n_vars × k` right-hand side (the "forward" power-iteration step).
 //! * [`rmatmat`](CenteredSparseOperator::rmatmat) — `out = (X − μ)ᵀ · Y` for
 //!   an `n_obs × k` right-hand side (the "transpose" power-iteration step).
-//! * [`accumulate_gram`](CenteredSparseOperator::accumulate_gram) — dense
-//!   `n_vars × n_vars` Gram matrix `(X − μ)ᵀ (X − μ)` (the covariance-PCA
-//!   accumulator).
 //!
 //! All routines stream shards via [`RawGpuShardSource`] (the G3 staging path,
 //! with a cached cuSPARSE descriptor per reusable slot), reuse the
@@ -23,7 +20,7 @@ use cudarc::cusparse::sys as csp;
 use cudarc::driver::safe::CudaSlice;
 use scx_format_io::ShardSource;
 
-use crate::cublas::{gpu_sgemm, gpu_sgemv, gpu_sger, CublasHandle};
+use crate::cublas::{gpu_sgemv, CublasHandle};
 use crate::cusparse::{
     spmm_csr_transpose_view_with_alg, spmm_csr_view_with_alg, CuSparseWorkspacePool,
     CusparseHandle, DnMatView, DnMatViewMut,
@@ -33,7 +30,6 @@ use crate::error::GpuError;
 use crate::gpu_pca::{gpu_column_sums, gpu_mean_correct_colmajor_strided, gpu_outer_sub};
 use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
 use crate::math_policy::SpmmAlgPolicy;
-use crate::sparse_dense::sparse_to_dense_gpu_into_view;
 
 /// Implicit-centering sparse operator over a `&dyn ShardSource`.
 ///
@@ -43,8 +39,7 @@ use crate::sparse_dense::sparse_to_dense_gpu_into_view;
 /// `spmm_policy` is the caller's [`SpmmAlgPolicy`] — held as the *policy*, not
 /// the resolved cuSPARSE enum, so the operator carries the caller's intent and
 /// resolves it at each launch. It applies to both [`Self::matmat`] and
-/// [`Self::rmatmat`]; [`Self::accumulate_gram`] issues no SpMM and is
-/// unaffected. Before this field existed the streaming PCA path hardcoded
+/// [`Self::rmatmat`]. Before this field existed the streaming PCA path hardcoded
 /// `CUSPARSE_SPMM_ALG_DEFAULT` while the resident path honoured the policy, so
 /// a `>VRAM` run reported the caller's requested policy having actually used
 /// cuSPARSE's heuristic pick.
@@ -277,103 +272,6 @@ impl<'a> CenteredSparseOperator<'a> {
         if let Some(d_mu) = self.d_means {
             let d_sum_q = gpu_column_sums(self.dev, d_y, n_obs, k)?;
             gpu_outer_sub(self.dev, d_out, d_mu, &d_sum_q, n_vars, k)?;
-        }
-
-        Ok(())
-    }
-
-    /// `out (n_vars × n_vars, col-major) = (X − μ)ᵀ (X − μ)`.
-    ///
-    /// Per shard: densify `X_shard` (row-major `shard_rows × n_vars`) and
-    /// accumulate `out += X_shardᵀ · X_shard` via cuBLAS `sgemm`. After the
-    /// loop, if centered, apply the rank-1 correction `out −= n_obs · μ · μᵀ`
-    /// via `sger`.
-    ///
-    /// A single `max_shard_rows × n_vars × 4 B` densification scratch is
-    /// allocated once above the loop and reused across shards (Phase 10):
-    /// the leading `shard_rows × n_vars` slice is zeroed before each
-    /// `sparse_to_dense_gpu_into` call (the kernel only writes positions
-    /// for nonzeros, so reuse without zeroing would carry over stale rows
-    /// from the previous, possibly larger shard). `gpu_sgemm` receives
-    /// `&d_dense` whose leading-dimension is `n_vars`; passing `k = shard_rows`
-    /// makes cuBLAS ignore the rows past `shard_rows × n_vars`.
-    pub fn accumulate_gram(&self, d_out: &mut CudaSlice<f32>) -> Result<(), GpuError> {
-        let (n_obs, n_vars) = self.source.shape();
-
-        // Row-major dense X_shard of shape (shard_rows × n_vars) has the same
-        // byte layout as column-major (n_vars × shard_rows). We use it as A
-        // with `trans_a = N` and as B with `trans_b = T`, so cuBLAS computes
-        // A · Bᵀ = X_cm · X_cmᵀ = (X_rm)ᵀ · X_rm = Gram contribution.
-        self.dev
-            .stream()
-            .memset_zeros(d_out)
-            .map_err(|e| GpuError::KernelLaunchFailed(format!("gram: zero out: {e}")))?;
-
-        // Hoist the dense scratch to a single allocation sized for the
-        // largest shard. `alloc_zeros` zero-initialises it; per-shard zeroing
-        // happens inside the closure below.
-        let max_shard_rows = self
-            .source
-            .max_shard_rows()
-            .map_err(|e| GpuError::InvalidShard(format!("max_shard_rows: {e}")))?;
-        let scratch_len = max_shard_rows.saturating_mul(n_vars);
-        let mut d_dense = self.dev.alloc_zeros::<f32>(scratch_len)?;
-
-        let mut src = RawGpuShardSource::new(self.dev, self.source)?;
-        src.for_each_gpu_shard(|_idx, slot| {
-            let view = slot.view();
-            let shard_rows = view.shape.0;
-            if shard_rows == 0 {
-                return Ok(());
-            }
-            // Zero only the leading region we're about to write — the kernel
-            // does not touch positions outside `[0, shard_rows * n_vars)`, but
-            // it also does not write empty rows or absent (row, col) entries,
-            // so any leftover values from the previous shard would corrupt the
-            // Gram contribution.
-            let used = shard_rows * n_vars;
-            self.dev
-                .stream()
-                .memset_zeros(&mut d_dense.slice_mut(0..used))
-                .map_err(|e| GpuError::KernelLaunchFailed(format!("gram: zero scratch: {e}")))?;
-            sparse_to_dense_gpu_into_view(
-                self.dev,
-                &view.indptr,
-                &view.indices,
-                &view.data,
-                shard_rows,
-                None,
-                n_vars,
-                &mut d_dense,
-            )?;
-            gpu_sgemm(
-                self.cublas,
-                self.dev.stream(),
-                &d_dense,
-                &d_dense,
-                d_out,
-                n_vars,
-                n_vars,
-                shard_rows,
-                1.0,
-                1.0,
-                cbs::cublasOperation_t::CUBLAS_OP_N,
-                cbs::cublasOperation_t::CUBLAS_OP_T,
-            )?;
-            Ok(())
-        })?;
-
-        if let Some(d_mu) = self.d_means {
-            gpu_sger(
-                self.cublas,
-                self.dev.stream(),
-                d_mu,
-                d_mu,
-                d_out,
-                n_vars,
-                n_vars,
-                -(n_obs as f32),
-            )?;
         }
 
         Ok(())
@@ -653,185 +551,6 @@ mod tests {
         }
         let err = rel_error(&out_gpu, &out_cpu);
         assert!(err < 1e-4, "rmatmat centered rel_error = {err}");
-    }
-
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn test_accumulate_gram_matches_cpu_centered() {
-        let dev = require_gpu!();
-        let cusparse = CusparseHandle::new().unwrap();
-        let cublas = CublasHandle::new().unwrap();
-
-        let n_rows = 250;
-        let n_cols = 40;
-        let csr = random_csr(n_rows, n_cols, 0.12, 5);
-        let x_dense = densify(&csr);
-        let means = col_means(&x_dense, n_rows, n_cols);
-        let shards = split_into_shards(&csr, 3);
-        let source = InMemorySource {
-            shards,
-            n_obs: n_rows,
-            n_vars: n_cols,
-        };
-
-        let d_mu = dev.htod_copy(&means).unwrap();
-        let op = CenteredSparseOperator::new(
-            &dev,
-            &cusparse,
-            &cublas,
-            &source,
-            Some(&d_mu),
-            SpmmAlgPolicy::Default,
-        );
-        let mut d_gram = dev.alloc_zeros::<f32>(n_cols * n_cols).unwrap();
-        op.accumulate_gram(&mut d_gram).unwrap();
-        dev.synchronize().unwrap();
-        let gram_gpu = dev.dtoh_copy(&d_gram).unwrap();
-
-        // CPU ref: Gram[a, b] = Σ_r (x[r, a] − μ[a]) (x[r, b] − μ[b]), col-major.
-        let mut gram_cpu = vec![0.0f32; n_cols * n_cols];
-        for b in 0..n_cols {
-            for a in 0..n_cols {
-                let mut acc = 0.0f32;
-                for r in 0..n_rows {
-                    acc +=
-                        (x_dense[r * n_cols + a] - means[a]) * (x_dense[r * n_cols + b] - means[b]);
-                }
-                gram_cpu[b * n_cols + a] = acc;
-            }
-        }
-        let err = rel_error(&gram_gpu, &gram_cpu);
-        assert!(err < 1e-3, "accumulate_gram centered rel_error = {err}");
-    }
-
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn test_accumulate_gram_matches_cpu_not_centered() {
-        let dev = require_gpu!();
-        let cusparse = CusparseHandle::new().unwrap();
-        let cublas = CublasHandle::new().unwrap();
-
-        let n_rows = 250;
-        let n_cols = 40;
-        let csr = random_csr(n_rows, n_cols, 0.12, 17);
-        let x_dense = densify(&csr);
-        let shards = split_into_shards(&csr, 3);
-        let source = InMemorySource {
-            shards,
-            n_obs: n_rows,
-            n_vars: n_cols,
-        };
-
-        let op = CenteredSparseOperator::new(
-            &dev,
-            &cusparse,
-            &cublas,
-            &source,
-            None,
-            SpmmAlgPolicy::Default,
-        );
-        let mut d_gram = dev.alloc_zeros::<f32>(n_cols * n_cols).unwrap();
-        op.accumulate_gram(&mut d_gram).unwrap();
-        dev.synchronize().unwrap();
-        let gram_gpu = dev.dtoh_copy(&d_gram).unwrap();
-
-        let mut gram_cpu = vec![0.0f32; n_cols * n_cols];
-        for b in 0..n_cols {
-            for a in 0..n_cols {
-                let mut acc = 0.0f32;
-                for r in 0..n_rows {
-                    acc += x_dense[r * n_cols + a] * x_dense[r * n_cols + b];
-                }
-                gram_cpu[b * n_cols + a] = acc;
-            }
-        }
-        let err = rel_error(&gram_gpu, &gram_cpu);
-        assert!(err < 1e-3, "accumulate_gram uncentered rel_error = {err}");
-    }
-
-    /// Phase 10 regression: hoisting the densification scratch out of the
-    /// shard loop means the same `d_dense` buffer is reused across shards.
-    /// If the per-shard zero pass were ever dropped, nonzero positions
-    /// written by shard *i* would survive into shard *(i+1)*'s leading
-    /// region at coordinates the new shard happens to leave empty (no
-    /// nonzero), and `gpu_sgemm` would fold that stale data into the Gram.
-    ///
-    /// Uses heterogeneous shard sizes (`221 / 4` → 56, 56, 56, 53 via
-    /// ceil-div) and verifies *both* bit-identical determinism across
-    /// runs *and* approximate equality against a CPU reference. The
-    /// determinism check alone is insufficient — under a dropped
-    /// zero-pass, both runs allocate fresh `d_dense` and corrupt
-    /// identically, so `gram_a == gram_b` would still hold. The CPU
-    /// reference is what actually catches the bug.
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn test_accumulate_gram_scratch_reuse() {
-        let dev = require_gpu!();
-        let cusparse = CusparseHandle::new().unwrap();
-        let cublas = CublasHandle::new().unwrap();
-
-        let n_rows = 221;
-        let n_cols = 35;
-        let csr = random_csr(n_rows, n_cols, 0.12, 99);
-        let x_dense = densify(&csr);
-        let means = col_means(&x_dense, n_rows, n_cols);
-
-        let shards = split_into_shards(&csr, 4);
-        // Sanity: the test premise depends on at least one shard boundary
-        // being heterogeneous. If split_into_shards' rounding ever changes
-        // and produces uniform shards on these dimensions, surface it here
-        // rather than silently weakening the test.
-        assert!(
-            shards.windows(2).any(|w| w[0].n_rows() != w[1].n_rows()),
-            "test precondition: shards must have at least one heterogeneous boundary"
-        );
-        let source = InMemorySource {
-            shards,
-            n_obs: n_rows,
-            n_vars: n_cols,
-        };
-
-        let d_mu = dev.htod_copy(&means).unwrap();
-        let op = CenteredSparseOperator::new(
-            &dev,
-            &cusparse,
-            &cublas,
-            &source,
-            Some(&d_mu),
-            SpmmAlgPolicy::Default,
-        );
-
-        let mut d_gram_a = dev.alloc_zeros::<f32>(n_cols * n_cols).unwrap();
-        op.accumulate_gram(&mut d_gram_a).unwrap();
-        dev.synchronize().unwrap();
-        let gram_a = dev.dtoh_copy(&d_gram_a).unwrap();
-
-        let mut d_gram_b = dev.alloc_zeros::<f32>(n_cols * n_cols).unwrap();
-        op.accumulate_gram(&mut d_gram_b).unwrap();
-        dev.synchronize().unwrap();
-        let gram_b = dev.dtoh_copy(&d_gram_b).unwrap();
-
-        assert_eq!(
-            gram_a, gram_b,
-            "accumulate_gram must be bit-identical across runs"
-        );
-
-        // CPU reference: Gram[a, b] = Σ_r (x[r, a] − μ[a]) (x[r, b] − μ[b]),
-        // col-major. This is the check that actually catches a dropped
-        // per-shard zero pass — determinism alone holds under that bug.
-        let mut gram_cpu = vec![0.0f32; n_cols * n_cols];
-        for b in 0..n_cols {
-            for a in 0..n_cols {
-                let mut acc = 0.0f32;
-                for r in 0..n_rows {
-                    acc +=
-                        (x_dense[r * n_cols + a] - means[a]) * (x_dense[r * n_cols + b] - means[b]);
-                }
-                gram_cpu[b * n_cols + a] = acc;
-            }
-        }
-        let err = rel_error(&gram_a, &gram_cpu);
-        assert!(err < 1e-3, "scratch reuse rel_error vs CPU = {err}");
     }
 
     /// G2 regression: the strided SpMM path writes shard SpMM results

@@ -416,11 +416,13 @@ fn test_gpu_preprocess_to_csr_normalize_matches_cpu() {
     let mut cpu_data = csr.data.clone();
     cpu_normalize(&csr.indptr, &mut cpu_data, target_sum as f64);
 
-    // Elementwise rel-err < 1e-5.
+    // Elementwise rel-err < 1e-5. Lengths first: `zip` stops at the shorter
+    // side, so a short GPU result would otherwise pass vacuously.
+    assert_eq!(result.data.len(), cpu_data.len());
     let mut max_rel_err = 0.0f64;
-    for i in 0..cpu_data.len() {
-        let diff = (result.data[i] as f64 - cpu_data[i] as f64).abs();
-        let denom = (cpu_data[i] as f64).abs().max(1e-10);
+    for (&got, &want) in result.data.iter().zip(&cpu_data) {
+        let diff = (got as f64 - want as f64).abs();
+        let denom = (want as f64).abs().max(1e-10);
         max_rel_err = max_rel_err.max(diff / denom);
     }
     assert!(max_rel_err < 1e-5, "normalize max rel err = {max_rel_err}");
@@ -459,8 +461,9 @@ fn test_gpu_preprocess_to_csr_log1p_matches_cpu() {
     let mut cpu_data = csr.data.clone();
     cpu_log1p(&csr.indptr, &mut cpu_data);
 
-    for i in 0..cpu_data.len() {
-        let diff = (result.data[i] - cpu_data[i]).abs();
+    assert_eq!(result.data.len(), cpu_data.len());
+    for (i, (&got, &want)) in result.data.iter().zip(&cpu_data).enumerate() {
+        let diff = (got - want).abs();
         assert!(diff < 1e-6, "log1p mismatch at [{i}]: {diff}");
     }
 }
@@ -488,10 +491,11 @@ fn test_gpu_preprocess_to_csr_fused_matches_cpu() {
     let mut cpu_data = csr.data.clone();
     cpu_fused_normalize_log1p(&csr.indptr, &mut cpu_data, target_sum as f64);
 
+    assert_eq!(result.data.len(), cpu_data.len());
     let mut max_rel_err = 0.0f64;
-    for i in 0..cpu_data.len() {
-        let diff = (result.data[i] as f64 - cpu_data[i] as f64).abs();
-        let denom = (cpu_data[i] as f64).abs().max(1e-10);
+    for (&got, &want) in result.data.iter().zip(&cpu_data) {
+        let diff = (got as f64 - want as f64).abs();
+        let denom = (want as f64).abs().max(1e-10);
         max_rel_err = max_rel_err.max(diff / denom);
     }
     // GPU f32 vs CPU f64 intermediates — same tolerance as the fused kernel test above.
@@ -606,9 +610,9 @@ fn test_gpu_preprocess_to_csr_row_scale_only_multishard() {
     cpu_row_scale(&csr.indptr, &mut cpu_data, &factors);
 
     assert_eq!(result.data.len(), cpu_data.len());
-    for i in 0..cpu_data.len() {
-        let diff = (result.data[i] as f64 - cpu_data[i] as f64).abs();
-        let denom = (cpu_data[i] as f64).abs().max(1e-10);
+    for (i, (&got, &want)) in result.data.iter().zip(&cpu_data).enumerate() {
+        let diff = (got as f64 - want as f64).abs();
+        let denom = (want as f64).abs().max(1e-10);
         assert!(diff / denom < 1e-5, "row_scale mismatch at nnz {i}");
     }
 }
@@ -641,9 +645,9 @@ fn test_gpu_preprocess_to_csr_normalize_log1p_row_scale_multishard() {
 
     assert_eq!(result.data.len(), cpu_data.len());
     let mut max_rel = 0.0f64;
-    for i in 0..cpu_data.len() {
-        let diff = (result.data[i] as f64 - cpu_data[i] as f64).abs();
-        let denom = (cpu_data[i] as f64).abs().max(1e-10);
+    for (&got, &want) in result.data.iter().zip(&cpu_data) {
+        let diff = (got as f64 - want as f64).abs();
+        let denom = (want as f64).abs().max(1e-10);
         max_rel = max_rel.max(diff / denom);
     }
     assert!(

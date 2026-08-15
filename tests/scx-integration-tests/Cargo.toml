@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dev-dependencies]
+scx-testkit = { path = "../../scx-testkit" }
 scx-format-io = { path = "../../scx-format-io", features = ["deletion-vectors"] }
 scx-codec = { path = "../../scx-codec" }
 scx-ops = { path = "../../scx-ops" }

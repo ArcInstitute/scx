@@ -298,8 +298,10 @@ class TestPcaNeighborsDeviceResident:
         the stamped route, exactly as standalone `pca()` does.
 
         For the randomized core, `stamp_fused_route` records the math-mode and
-        SpMM-policy defaults and the graph-replay flag (capture was removed in
-        3.4 → `graph_replay` is always False, never the missing key).
+        SpMM-policy defaults. PCA reports `graph_replay` as `None`: SpMM-segment
+        capture was removed in 3.4, so it has no capture decision to make. The
+        key is still stamped — `route.rs` emits it for every op — so the contract
+        is "present and None", not "absent".
         """
         import pyscx
 
@@ -313,9 +315,13 @@ class TestPcaNeighborsDeviceResident:
         assert pca["route"] == "gpu_device_resident"
         assert pca["math_mode"] == "strict_fp32"
         assert pca["spmm_policy"] == "default"
-        # graph_replay is a present key (bool), not absent.
+        # PCA makes no CUDA-graph capture decision, but the key is still
+        # stamped, so assert presence *and* value — `.get(...) is None` would
+        # also pass if the key silently stopped being emitted. `resident_csr` is
+        # the residency decision PCA does make.
         assert "graph_replay" in pca
-        assert pca["graph_replay"] in (True, False)
+        assert pca["graph_replay"] is None
+        assert pca["resident_csr"] in (True, False)
 
     def test_non_default_use_rep_falls_back_to_sequential(self, synthetic_adata, monkeypatch):
         """A non-default `use_rep` must NOT take the fused device-resident path.

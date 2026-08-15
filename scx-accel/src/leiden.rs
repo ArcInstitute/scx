@@ -452,12 +452,6 @@ impl Grouping {
     }
 
     #[inline]
-    #[allow(dead_code)]
-    fn node_count(&self) -> usize {
-        self.assignments.len()
-    }
-
-    #[inline]
     fn group_size(&self, group: usize) -> usize {
         if group < self.group_sizes.len() {
             self.group_sizes[group]

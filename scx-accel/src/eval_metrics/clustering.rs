@@ -550,8 +550,8 @@ mod tests {
 
         // Just check they produce reasonable values
         assert!(ami > -0.5 && ami < 1.0, "AMI out of range: {ami}");
-        assert!(nmi >= 0.0 && nmi <= 1.0, "NMI out of range: {nmi}");
-        assert!(ari >= -1.0 && ari <= 1.0, "ARI out of range: {ari}");
+        assert!((0.0..=1.0).contains(&nmi), "NMI out of range: {nmi}");
+        assert!((-1.0..=1.0).contains(&ari), "ARI out of range: {ari}");
     }
 
     #[test]

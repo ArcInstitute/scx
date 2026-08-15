@@ -100,16 +100,6 @@ pub struct NumericLeafEntry {
     pub row_end: u32,
 }
 
-/// Hash index for high-cardinality columns (>10K unique values).
-/// Stretch goal — not implemented in initial Phase 2.
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct HashIndex {
-    pub column_name: String,
-    pub mph_data: Vec<u8>,
-    pub entries: Vec<CategoricalEntry>,
-}
-
 // ============================================================================
 // C2. Serialization — docs/format.md (Predicate Indexes) binary layout
 // ============================================================================

@@ -1,0 +1,20 @@
+[package]
+name = "scx-testkit"
+version = "0.14.0"
+edition = "2021"
+description = "Test-only harness for asserting SCX output identity across refactors"
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+scx-format = { path = "../scx-format" }
+scx-format-io = { path = "../scx-format-io" }
+scx-codec = { path = "../scx-codec" }
+arrow = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

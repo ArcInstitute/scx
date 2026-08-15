@@ -62,44 +62,6 @@ pub fn sample_var(n: usize) -> arrow::array::RecordBatch {
     .unwrap()
 }
 
-/// Write a test SCX file with CSR shards and obs metadata for filtering.
-#[allow(dead_code)]
-pub fn write_test_file(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> std::path::PathBuf {
-    let path = dir.path().join("test.scx");
-    let header = sample_header(n_obs as u64, n_vars as u64);
-    let mut writer = ScxWriter::new(&path, header).unwrap();
-    writer.write_obs(&sample_obs(n_obs)).unwrap();
-    writer.write_var(&sample_var(n_vars)).unwrap();
-
-    // Build CSR data: each row has 2 nnz
-    let mut indptr = vec![0u64];
-    let mut indices = Vec::new();
-    let mut values = Vec::new();
-    for row in 0..n_obs {
-        let col0 = (row * 2) % n_vars;
-        let col1 = (row * 2 + 1) % n_vars;
-        indices.push(col0 as u32);
-        indices.push(col1 as u32);
-        values.push(((row + 1) % 256) as u8);
-        values.push(((row + 2) % 256) as u8);
-        indptr.push(indptr.last().unwrap() + 2);
-    }
-
-    writer
-        .write_csr_shard(
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
-
-    writer.finish().unwrap();
-    path
-}
-
 // ---------------------------------------------------------------------------
 // Sort test fixtures
 //
@@ -110,7 +72,6 @@ pub fn write_test_file(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> 
 // ---------------------------------------------------------------------------
 
 /// Write `n_obs` rows of deterministic 2-nnz-per-row CSR as a single shard.
-#[allow(dead_code)]
 fn write_csr_single_shard(writer: &mut ScxWriter, n_obs: usize, n_vars: usize) {
     let mut indptr = vec![0u64];
     let mut indices = Vec::new();
@@ -138,7 +99,6 @@ fn write_csr_single_shard(writer: &mut ScxWriter, n_obs: usize, n_vars: usize) {
 
 /// Build an obs `RecordBatch` from a `cell_id` column plus a set of named
 /// `Utf8` (categorical-by-string) columns of length `n_obs`.
-#[allow(dead_code)]
 fn obs_with_string_cols(n_obs: usize, cols: &[(&str, Vec<String>)]) -> RecordBatch {
     let mut fields = vec![Field::new("cell_id", DataType::Utf8, false)];
     let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();

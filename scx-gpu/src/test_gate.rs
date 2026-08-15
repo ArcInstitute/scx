@@ -54,8 +54,61 @@ pub const REQUIRE_LARGE_VRAM_ENV: &str = "SCX_REQUIRE_LARGE_VRAM";
 /// rather than as a test that merely stopped existing.
 pub const SKIP_MARKER: &str = "SCX_GPU_TEST_SKIPPED";
 
-fn strict(var: &str) -> bool {
-    std::env::var(var).as_deref() == Ok("1")
+pub use decision::{decline, strict};
+
+/// The strict-escalation decision, in a submodule so [`Strict`] is opaque to
+/// the gates.
+///
+/// The gates below need to know whether a strict variable is set, but a gate
+/// that could *inspect* that answer could also act on it — and the whole value
+/// of this module is that "no device, and the environment said that is a
+/// failure" resolves the same way everywhere. `Strict` is therefore
+/// constructed only by [`strict`] and consumed only by [`decline`]; outside
+/// this submodule there is no way to get the `bool` back out. A gate that
+/// hand-rolls `if env::var(...) == "1"` is a visible edit rather than a
+/// one-character drift.
+///
+/// It also makes the escalation **testable without a GPU and without touching
+/// the environment**: [`decision::strict_for_test`] builds the `true` case
+/// directly. Before this split the `SCX_REQUIRE_GPU=1` branch was reachable
+/// only by running the suite on a CPU host with the variable set — i.e. by
+/// hand, in a harness, never in CI — so the one assertion the whole GPU-test
+/// contract rests on was itself covered by nothing.
+mod decision {
+    /// Opaque answer to "is this strict variable set to `1`?".
+    #[must_use]
+    pub struct Strict(bool);
+
+    /// Read a strict variable. Exactly `"1"` opts in; anything else, including
+    /// `"true"` and `"0"`, does not.
+    pub fn strict(var: &str) -> Strict {
+        Strict(std::env::var(var).as_deref() == Ok("1"))
+    }
+
+    /// A gate's precondition is not met: panic under strict, else print the
+    /// skip marker for the harness to collect.
+    ///
+    /// Both messages are closures so the strict-mode text is not built on the
+    /// (overwhelmingly common) skip path, and — more usefully — so a test can
+    /// prove the non-strict path never builds it at all.
+    ///
+    /// # Panics
+    ///
+    /// When `s` was read from a variable set to `1`.
+    pub fn decline(s: Strict, reason: impl FnOnce() -> String, skip: impl FnOnce() -> String) {
+        if s.0 {
+            panic!("{}", reason());
+        }
+        eprintln!("{}: {}", super::SKIP_MARKER, skip());
+    }
+
+    /// Build a `Strict` directly, so the strict branch is reachable from a
+    /// CPU-only unit test. Mutating the real variable would not do: it is
+    /// process-global, and every other test in the binary shares it.
+    #[cfg(test)]
+    pub fn strict_for_test(v: bool) -> Strict {
+        Strict(v)
+    }
 }
 
 /// Acquire device 0 for a test, or decide the test must skip.
@@ -71,11 +124,11 @@ pub fn device_or_skip(what: &str) -> Option<GpuDevice> {
     match GpuDevice::new(0) {
         Ok(dev) => Some(dev),
         Err(e) => {
-            assert!(
-                !strict(REQUIRE_GPU_ENV),
-                "{REQUIRE_GPU_ENV}=1 but no CUDA device is available for {what}: {e}"
+            decline(
+                strict(REQUIRE_GPU_ENV),
+                || format!("{REQUIRE_GPU_ENV}=1 but no CUDA device is available for {what}: {e}"),
+                || format!("{what} — no CUDA device ({e})"),
             );
-            eprintln!("{SKIP_MARKER}: {what} — no CUDA device ({e})");
             None
         }
     }
@@ -96,11 +149,11 @@ pub fn capability_or_skip(cap: &str, env_var: &str, available: bool, what: &str)
     if available {
         return true;
     }
-    assert!(
-        !strict(env_var),
-        "{env_var}=1 but {cap} is not available for {what}"
+    decline(
+        strict(env_var),
+        || format!("{env_var}=1 but {cap} is not available for {what}"),
+        || format!("{what} — {cap} not available"),
     );
-    eprintln!("{SKIP_MARKER}: {what} — {cap} not available");
     false
 }
 
@@ -121,41 +174,84 @@ pub fn vram_or_skip(dev: &GpuDevice, need_bytes: usize, what: &str) -> bool {
     let free = match dev.free_memory() {
         Ok((free, _total)) => free,
         Err(e) => {
-            assert!(
-                !strict(REQUIRE_LARGE_VRAM_ENV),
-                "{REQUIRE_LARGE_VRAM_ENV}=1 but free VRAM could not be queried for {what}: {e}"
+            decline(
+                strict(REQUIRE_LARGE_VRAM_ENV),
+                || {
+                    format!(
+                        "{REQUIRE_LARGE_VRAM_ENV}=1 but free VRAM could not be queried \
+                         for {what}: {e}"
+                    )
+                },
+                || format!("{what} — free VRAM unknown ({e})"),
             );
-            eprintln!("{SKIP_MARKER}: {what} — free VRAM unknown ({e})");
             return false;
         }
     };
     if free >= need_bytes {
         return true;
     }
-    assert!(
-        !strict(REQUIRE_LARGE_VRAM_ENV),
-        "{REQUIRE_LARGE_VRAM_ENV}=1 but {what} needs {} MiB free VRAM and only {} MiB is free",
-        need_bytes / (1 << 20),
-        free / (1 << 20)
-    );
-    eprintln!(
-        "{SKIP_MARKER}: {what} — needs {} MiB free VRAM, {} MiB available",
-        need_bytes / (1 << 20),
-        free / (1 << 20)
+    let (need_mib, free_mib) = (need_bytes / (1 << 20), free / (1 << 20));
+    decline(
+        strict(REQUIRE_LARGE_VRAM_ENV),
+        || {
+            format!(
+                "{REQUIRE_LARGE_VRAM_ENV}=1 but {what} needs {need_mib} MiB free VRAM \
+                 and only {free_mib} MiB is free"
+            )
+        },
+        || format!("{what} — needs {need_mib} MiB free VRAM, {free_mib} MiB available"),
     );
     false
 }
 
 #[cfg(test)]
 mod tests {
+    use super::decision::strict_for_test;
     use super::*;
 
     /// The strict variables are opt-in: unset means skip, not panic. Asserted
     /// against the real reader rather than a copy of the comparison.
+    ///
+    /// A name no environment sets, so this is the "unset" case. `decline` must
+    /// therefore not panic — and, since the reason closure is `unreachable!`,
+    /// it must not even build the strict message.
     #[test]
     fn strict_is_opt_in() {
-        // A name no environment sets, so this is the "unset" case.
-        assert!(!strict("SCX_REQUIRE_GPU_DEFINITELY_UNSET_2ADB1F"));
+        decline(
+            strict("SCX_REQUIRE_GPU_DEFINITELY_UNSET_2ADB1F"),
+            || unreachable!("an unset strict variable must not build a panic message"),
+            || "test_gate::strict_is_opt_in".to_string(),
+        );
+    }
+
+    /// The escalation the entire GPU-test contract rests on: with the variable
+    /// set, "cannot run" is a failure, not a skip.
+    ///
+    /// This is the assertion that had no test. It could previously be reached
+    /// only by running the suite on a CPU host with `SCX_REQUIRE_GPU=1` — by
+    /// hand or from the sbatch harness, never in CI — so nothing would have
+    /// noticed it being weakened, and every GPU test would have gone back to
+    /// silently passing while doing nothing.
+    #[test]
+    #[should_panic(expected = "SCX_REQUIRE_GPU=1 but no CUDA device is available")]
+    fn strict_turns_a_skip_into_a_failure() {
+        decline(
+            strict_for_test(true),
+            || format!("{REQUIRE_GPU_ENV}=1 but no CUDA device is available for x"),
+            || unreachable!("a strict decline must panic rather than print a skip"),
+        );
+    }
+
+    /// The same escalation for the optional-library and VRAM gates, which
+    /// share `decline` precisely so there is one branch to get right.
+    #[test]
+    #[should_panic(expected = "SCX_REQUIRE_NVCOMP=1 but nvcomp is not available")]
+    fn strict_capability_gate_also_fails() {
+        decline(
+            strict_for_test(true),
+            || format!("{REQUIRE_NVCOMP_ENV}=1 but nvcomp is not available for x"),
+            || unreachable!(),
+        );
     }
 
     /// An available capability never consults the environment, so it cannot
@@ -168,5 +264,49 @@ mod tests {
             true,
             "test_gate::available_capability_never_panics"
         ));
+    }
+
+    /// An *unavailable* capability under an unset variable skips and returns
+    /// `false` — the real gate, not a stand-in for it.
+    #[test]
+    fn unavailable_capability_skips_when_not_strict() {
+        assert!(!capability_or_skip(
+            "nvcomp",
+            "SCX_REQUIRE_NVCOMP_DEFINITELY_UNSET_2ADB1F",
+            false,
+            "test_gate::unavailable_capability_skips_when_not_strict"
+        ));
+    }
+
+    /// `Strict` is opaque outside `decision`, so a gate that reads a strict
+    /// variable has nothing it *can* do with the answer except hand it to
+    /// `decline`. That closes one shape of drift; this closes the other — a
+    /// gate that stops consulting the environment at all and just returns.
+    ///
+    /// Without it the `decline` tests above would keep passing while the gates
+    /// no longer called it, which is exactly the class of green-but-vacuous
+    /// test this module exists to eliminate.
+    #[test]
+    fn every_gate_routes_its_decline_through_decline() {
+        let src = include_str!("test_gate.rs");
+        for name in ["device_or_skip", "capability_or_skip", "vram_or_skip"] {
+            let start = src
+                .find(&format!("pub fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found — was it renamed?"));
+            // Top-level fns, so the next `\npub fn ` / `\nmod ` / `\n#[cfg(test)]`
+            // ends the body without needing to brace-match.
+            let rest = &src[start..];
+            let end = ["\npub fn ", "\nmod ", "\n#[cfg(test)]"]
+                .iter()
+                .filter_map(|m| rest[1..].find(m).map(|i| i + 1))
+                .min()
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("decline("),
+                "{name} no longer routes through decline() — the \
+                 {REQUIRE_GPU_ENV}-style escalation is only tested there"
+            );
+        }
     }
 }

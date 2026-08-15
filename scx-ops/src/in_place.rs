@@ -39,9 +39,7 @@ pub(crate) struct InPlacePrep {
     pub(crate) old_catalog: FullCatalog,
     pub(crate) old_n_obs: u64,
     pub(crate) old_catalog_offset: u64,
-    pub(crate) modality_table: Option<ModalityTable>,
     pub(crate) modality_id: u8,
-    pub(crate) modality_name: Option<String>,
     pub(crate) modality_type: ModalityType,
     pub(crate) target_n_vars: u64,
     pub(crate) old_per_modality_csr: u32,
@@ -72,7 +70,7 @@ pub(crate) fn prepare_in_place(
         FullCatalog::read_from(&mut Cursor::new(&buf), fc_length as usize, true)?
     };
 
-    let mut modality_table = if header.n_modalities > 0
+    let modality_table = if header.n_modalities > 0
         && header.modality_table_offset != 0
         && header.modality_table_length != 0
     {
@@ -104,7 +102,6 @@ pub(crate) fn prepare_in_place(
     }
 
     let modality_info = modality_table.as_ref().and_then(|t| t.info_of(modality_id));
-    let modality_name: Option<String> = modality_info.map(|info| info.name.clone());
     let modality_type: ModalityType = modality_info
         .map(|info| info.modality_type)
         .unwrap_or(ModalityType::Rna);
@@ -132,9 +129,6 @@ pub(crate) fn prepare_in_place(
     let old_catalog_offset = header.full_catalog_offset;
     let header_index_dtype = header.index_dtype;
 
-    // suppress unused mut warning when modality_table happens to be None
-    let _ = &mut modality_table;
-
     Ok((
         lock,
         InPlacePrep {
@@ -143,9 +137,7 @@ pub(crate) fn prepare_in_place(
             old_catalog,
             old_n_obs,
             old_catalog_offset,
-            modality_table,
             modality_id,
-            modality_name,
             modality_type,
             target_n_vars,
             old_per_modality_csr,

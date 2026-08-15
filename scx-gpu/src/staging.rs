@@ -693,8 +693,8 @@ impl GpuCsrSlot {
 /// the refactored chunked driver,
 /// which consumes any `&dyn ShardSource + Sync` through
 /// [`crate::gpu_shard_source::RawGpuShardSource`]. The driver's per-shard
-/// device-resident scatter (`gpu_de_scatter_shard_to_dense`) then
-/// replaces the per-chunk host materialise + `gpu_de_upload_chunk` path.
+/// device-resident gene-major scatter replaced the per-chunk host
+/// materialise + dense-upload path, which has since been deleted.
 ///
 /// `read_shard(0)` returns `csr.clone()` — `ScxCsr` owns its buffers, so
 /// cloning is an `Arc`-free vector copy. The cost is paid once at the

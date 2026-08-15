@@ -1244,11 +1244,17 @@ GPU-accelerated analysis APIs. Requires CUDA Toolkit ≥ 12.0 at build time.
 
 ### cuSPARSE SpMM
 
-#### `spmm_csr(handle, stream, a, b, c, m, k, n, alpha, beta) → Result<(), GpuError>`
-Sparse × dense matrix multiply: C = α·A·B + β·C. A is GPU-resident CSR, B/C are dense column-major f32.
+#### `spmm_csr_view_with_alg(handle, stream, dev, pool, a, b_view, c_view, alpha, beta, alg) → Result<(), GpuError>`
+Sparse × dense matrix multiply: C = α·A·B + β·C. A is GPU-resident CSR; B/C are
+`DnMatView` / `DnMatViewMut` over dense column-major f32, so a sub-block of a
+larger buffer can be read or written without a copy. `pool` reuses the cuSPARSE
+workspace across calls (the PCA power loop passes `Some`).
 
-#### `spmm_csr_transpose(handle, stream, a, b, c, m, k, n, alpha, beta) → Result<(), GpuError>`
-Transposed SpMM: C = α·A^T·B + β·C.
+#### `spmm_csr_transpose_view_with_alg(...) → Result<(), GpuError>`
+Transposed SpMM: C = α·A^T·B + β·C, same view-based signature.
+
+> The contiguous-buffer `spmm_csr` / `spmm_csr_transpose` wrappers were removed —
+> every production caller uses the strided-view entry points above.
 
 ### cuSOLVER Dense Operations
 
@@ -1265,8 +1271,9 @@ Generate a random Gaussian matrix directly on GPU via cuRAND XORWOW generator.
 #### `gpu_randomized_pca(dev, reader, n_components, n_oversamples, n_power_iterations, zero_center, seed) → Result<GpuPcaResult, GpuError>`
 Complete GPU-accelerated randomized PCA. Streams SpMM shard-by-shard via cuSPARSE, QR via cuSOLVER, SVD via CPU faer, final projection via GPU GEMM. Returns `GpuPcaResult { embeddings, components, variance_explained, variance_ratio, mean }`.
 
-#### `mean_correct_gpu(dev, y, mc, n_obs, k) → Result<(), GpuError>`
-Mean-centering correction kernel: Y[i,j] -= mc[j] for all rows.
+> **Row-major `mean_correct_gpu`** — removed. It had no caller after the GPU PCA
+> path moved to the col-major operator; centering now happens inside
+> `CenteredSparseOperator` via `mean_correct_colmajor_strided_kernel`.
 
 ### GPU kNN
 
@@ -2312,7 +2319,7 @@ The dict carries:
 - `resident_csr` — GPU CSR DE routes **and native GPU PCA**. `True` when the whole matrix was held **device-resident**, `False` when the route streamed, `None` where there is no residency decision to make — CPU, dense, or a CSC-direct route, which prefilters by column range and never re-decodes. On DE this is across gene chunks (streamed = over the VRAM budget, only one gene chunk, or `SCX_GPU_DE_RESIDENT=0`); on PCA it is across the randomized power loop (streamed = over the VRAM budget or `SCX_GPU_PCA_RESIDENT=0`, in which case the operator re-decodes and re-uploads the whole matrix on every multiply). The decision is dynamic on both — taken against *free* VRAM at call time — so the same input can go either way run to run, which is why it is recorded rather than inferred from shape. See [scanpy.md § GPU DE device residency](scanpy.md#gpu-de-device-residency).
 - `transfer_mode`, `bytes_uploaded`, `device_id`, `rapids_version`, `cuml_version`, `cupy_version` — GPU device-handoff / rapids detail. `transfer_mode` is how the GPU-resident matrix was produced, one of: `scx_device_decode_gpu` (framed Scx1 shards decoded fully in VRAM group-by-group — only the indptr is uploaded; covers dense ≥128-nnz rows via the BitPacker4x kernel; from `to_gpu_anndata`), `scx_device_handoff_streamed` (on-device but a shard host-bounced because it is not an Scx1 shard — a non-Scx1 codec; from `to_gpu_anndata`), `scx_device_handoff` (host-assembled CSR or an already-device-resident input; from `to_gpu_anndata` or a rapids op consuming a device-resident `X`), or `anndata_to_gpu` (rapids uploaded a host `X` via `rsc.get.anndata_to_GPU`). `bytes_uploaded` is the real host→device byte count for that mode (`None` when not tracked). `scx_device_handoff` has two causes that the mode string alone cannot separate — the request needed filtering, or the in-VRAM decode *failed* and the host path took over — so read `fallback_reason` alongside it: `gpu_runtime_error` means the fast path broke (a `UserWarning` names the device error) and is worth investigating; `none` means host-assemble was chosen up front.
 - `math_mode`, `spmm_policy` — GPU PCA only (Task 2.5): the cuBLAS/cuSPARSE float math mode (`strict_fp32` / `allow_tf32`) and the cuSPARSE SpMM algorithm policy (`default` / `deterministic` / `benchmark_once`) the run used. `benchmark_once` is **reserved and not yet implemented** — it resolves to the same heuristic algorithm as `default`, and is echoed back so the wire API is stable for when per-shape timing lands; treat it as `default` when reading provenance. `None` on CPU / ops without these knobs. Both describe **whichever power loop ran** — the device-resident one and the streaming one apply the same requested policy, so a `>VRAM` run is not silently downgraded. Read `resident_csr` alongside them to tell the two apart. (Before v0.13.1 the streaming loop hardcoded the heuristic `CUSPARSE_SPMM_ALG_DEFAULT`, so `spmm_policy="deterministic"` was reported but not applied whenever the matrix exceeded VRAM.) **`"deterministic"` names an algorithm, not a guarantee:** it pins `CUSPARSE_SPMM_CSR_ALG2` instead of letting cuSPARSE choose heuristically, but it does **not** make GPU PCA bit-reproducible. cuSPARSE gives no reproducibility guarantee for transpose operations, and the randomized power loop issues `Aᵀ · Y` every iteration — so no algorithm choice makes the loop run-to-run bitwise identical. For guaranteed-reproducible PCA use `device="cpu"` (see [scanpy.md § Reproducibility](scanpy.md#reproducibility)).
-- `graph_replay` — whether a captured CUDA graph was replayed. Meaningful for `harmony_integrate`, the only op that captures: `True` when the k-means sub-iter graph was captured and replayed. `False` means "no graph was replayed" and has four causes, not three: capture failed, capture produced no graph, `SCX_DISABLE_CUDA_GRAPHS=1` turned it off, or the run never reached a capture attempt — the first k-means sub-iteration is always a direct warm-up, so a call configured with only one sub-iteration in total (e.g. `max_iter=1, max_iter_kmeans=1`) has no second sub-iter on which to capture. In every case the kernels ran directly; read it as that, not as "capture was tried and failed" (the WARN log distinguishes the failure cases). Results are identical either way; throughput is not, which is why a failure is recorded (and logged at WARN naming the device error) rather than swallowed. It is always `False` for GPU PCA: SpMM-segment CUDA-graph capture was removed (`cusparseSpMM` is not capture-safe on current cuSPARSE); the device-resident PCA power loop still avoids re-decoding/re-uploading the matrix each power iteration, and the field is retained there for metadata continuity. `None` on CPU routes, which make no capture decision.
+- `graph_replay` — whether a captured CUDA graph was replayed. Meaningful for `harmony_integrate`, the only op that captures: `True` when the k-means sub-iter graph was captured and replayed. `False` means "no graph was replayed" and has four causes, not three: capture failed, capture produced no graph, `SCX_DISABLE_CUDA_GRAPHS=1` turned it off, or the run never reached a capture attempt — the first k-means sub-iteration is always a direct warm-up, so a call configured with only one sub-iteration in total (e.g. `max_iter=1, max_iter_kmeans=1`) has no second sub-iter on which to capture. In every case the kernels ran directly; read it as that, not as "capture was tried and failed" (the WARN log distinguishes the failure cases). Results are identical either way; throughput is not, which is why a failure is recorded (and logged at WARN naming the device error) rather than swallowed. `None` on CPU routes, which make no capture decision, **and on GPU PCA**, which no longer makes a capture decision: SpMM-segment capture was removed (`cusparseSpMM` is not capture-safe on current cuSPARSE), so the field could only ever read `False` there. The device-resident PCA power loop still avoids re-decoding/re-uploading the matrix each power iteration — read `resident_csr` for that, which is the decision PCA actually makes.
 
 **Op keys:**
 

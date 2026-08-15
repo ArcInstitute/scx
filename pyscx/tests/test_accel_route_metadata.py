@@ -110,6 +110,9 @@ def test_pca_cpu_route_omits_tuning_metadata():
     assert info["route"] == "cpu_csr"
     assert info["math_mode"] is None
     assert info["spmm_policy"] is None
+    # PCA never records a capture decision on any route — `harmony_integrate`
+    # is the op that captures. The key is still emitted (route.rs stamps it for
+    # every op), so assert the value rather than the key's absence.
     assert info["graph_replay"] is None
 
 
@@ -123,12 +126,16 @@ def test_pca_rejects_invalid_spmm_policy():
 @gpu_only
 def test_pca_gpu_randomized_populates_tuning_metadata(monkeypatch):
     """Task 2.5: the randomized GPU PCA route records the math-mode /
-    SpMM-policy / graph-replay fields the CPU route leaves None. Defaults are
-    strict_fp32 + heuristic SpMM; capture is opt-in/off so graph_replay is
-    False (not None). De-risks the deferred 2.7 gate wiring.
+    SpMM-policy fields the CPU route leaves None. Defaults are strict_fp32 +
+    heuristic SpMM. De-risks the deferred 2.7 gate wiring.
+
+    PCA reports `graph_replay` as `None`: SpMM-segment capture was removed, so
+    it has no capture decision to make. The key is still stamped for every op,
+    so the contract is "present and None". `harmony_integrate` is the op whose
+    value is dynamic.
 
     `SCX_FORCE_NATIVE_GPU=1` is required, not cosmetic: `math_mode` /
-    `spmm_policy` / `graph_replay` are stamped only by the **native** randomized
+    `spmm_policy` are stamped only by the **native** randomized
     route, and an in-memory `X` with rapids-singlecell installed routes to
     `rapids_singlecell_gpu` instead. Without the pin this asserted a route that
     cannot occur on a rapids host — observed failing on an H100 with
@@ -141,7 +148,11 @@ def test_pca_gpu_randomized_populates_tuning_metadata(monkeypatch):
     assert info["route"] == "gpu_csr"
     assert info["math_mode"] == "strict_fp32"
     assert info["spmm_policy"] == "default"
-    assert info["graph_replay"] is False
+    # Key presence *and* value: `route.rs` stamps `graph_replay` for every op,
+    # so the contract is "present and None", and `.get(...) is None` would pass
+    # for a key that had silently stopped being emitted.
+    assert "graph_replay" in info
+    assert info["graph_replay"] is None
 
 
 @gpu_only

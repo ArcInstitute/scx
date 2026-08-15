@@ -748,8 +748,8 @@ mod tests {
         // Control cells (group 0)
         for _ in 0..cells_per_group {
             cells.extend_from_slice(&[0.0, 0.0, 0.0]);
-            groups.push(0u32);
         }
+        groups.resize(cells_per_group, 0u32);
         // Perturbation cells
         for p in 1..=n_perts {
             for _ in 0..cells_per_group {
@@ -813,9 +813,12 @@ mod tests {
 
     // ── f32 vs f64 parity (Phase 2) ───────────────────────────────────
 
+    /// `(real, pred, groups, pert_names, pert_indices)`.
+    type ParityDataset = (Vec<f64>, Vec<f64>, Vec<u32>, Vec<String>, Vec<u32>);
+
     /// Build a synthetic 1000 × 100 dataset with 5 perts (200 cells each)
     /// in f64, plus an exact f32 cast.
-    fn make_parity_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<String>, Vec<u32>) {
+    fn make_parity_dataset() -> ParityDataset {
         let n_perts: usize = 5; // groups 1..=5; 0 is control
         let cells_per_group = 200;
         let n_total = (n_perts + 1) * cells_per_group;

@@ -71,12 +71,14 @@ fn init_tracing_once() {
 /// Drive one full epoch through a freshly constructed `TrainingPipeline`.
 /// Returns the number of batches produced. Used inside the forked child.
 fn run_one_epoch(path: &std::path::Path) -> usize {
-    let mut config = LoaderConfig::default();
-    config.batch_size = 32;
-    config.normalize = false;
-    config.log1p = false;
-    config.obs_columns = vec!["cell_id".to_string()];
-    config.max_memory_mb = 128;
+    let config = LoaderConfig {
+        batch_size: 32,
+        normalize: false,
+        log1p: false,
+        obs_columns: vec!["cell_id".to_string()],
+        max_memory_mb: 128,
+        ..Default::default()
+    };
 
     let mut pipeline = TrainingPipeline::new(path, config).expect("TrainingPipeline::new");
     pipeline.start_epoch().expect("start_epoch");

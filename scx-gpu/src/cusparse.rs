@@ -11,8 +11,10 @@
 //! let handle = CusparseHandle::new()?;
 //! let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream())?;
 //! // B is column-major dense (k × n), C is column-major dense (m × n)
-//! spmm_csr(&handle, dev.stream(), &a_desc, &b_device, &mut c_device,
-//!          m, k, n, 1.0, 0.0)?;
+//! spmm_csr_view_with_alg(&handle, dev.stream(), &dev, None, &a_desc,
+//!     DnMatView::contiguous(&b_device, k as i64, n as i64),
+//!     DnMatViewMut::contiguous(&mut c_device, m as i64, n as i64),
+//!     1.0, 0.0, csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT)?;
 //! ```
 
 use std::mem::MaybeUninit;
@@ -112,7 +114,8 @@ impl CusparseHandle {
     /// Bind this handle to the given CUDA stream.
     ///
     /// All subsequent cuSPARSE operations using this handle will execute on
-    /// `stream`. Must be called before `spmm_csr` / `spmm_csr_transpose`.
+    /// `stream`. Must be called before [`spmm_csr_view_with_alg`] /
+    /// [`spmm_csr_transpose_view_with_alg`].
     fn set_stream(&self, stream: &CudaStream) -> Result<(), GpuError> {
         unsafe {
             csp::cusparseSetStream(self.raw, stream.cu_stream() as _)
@@ -303,7 +306,7 @@ impl<'a> DnMatViewMut<'a> {
 
 /// Pool of reusable cuSPARSE SpMM workspace buffers.
 ///
-/// `spmm_csr` allocates a fresh `CudaSlice<u8>` workspace inside every call.
+/// Each SpMM call otherwise allocates a fresh `CudaSlice<u8>` workspace.
 /// In iterative GPU PCA (randomized power iteration) that means ~30 × N_shards
 /// × 2 allocations per run. The pool replaces that with one grow-only
 /// `CudaSlice<u8>` slot:
@@ -410,94 +413,11 @@ impl CuSparseWorkspacePool {
     }
 }
 
-/// Compute sparse × dense matrix multiply: `C = α·A·B + β·C`.
-///
-/// - `A` is a GPU-resident CSR matrix (m × k) via `CusparseSpMatDescr`
-/// - `B` is a dense **column-major** matrix (k × n) on GPU
-/// - `C` is a dense **column-major** matrix (m × n) on GPU, overwritten
-///
-/// Uses cuSPARSE generic SpMM API with:
-/// - `CUSPARSE_OPERATION_NON_TRANSPOSE` for both A and B
-/// - `CUSPARSE_ORDER_COL` (cuSPARSE preference for performance)
-/// - `CUDA_R_32F` compute type
-/// - `CUSPARSE_SPMM_ALG_DEFAULT` (cuSPARSE auto-tunes)
-///
-/// The workspace buffer is allocated per-call. For repeated SpMM calls with
-/// the same sparsity pattern (e.g., power iteration in PCA), consider
-/// caching the workspace externally.
-#[allow(clippy::too_many_arguments)]
-pub fn spmm_csr(
-    handle: &CusparseHandle,
-    stream: &Arc<CudaStream>,
-    dev: &GpuDevice,
-    a: &CusparseSpMatDescr,
-    b: &CudaSlice<f32>,
-    c: &mut CudaSlice<f32>,
-    m: usize,
-    k: usize,
-    n: usize,
-    alpha: f32,
-    beta: f32,
-) -> Result<(), GpuError> {
-    spmm_impl(
-        handle,
-        stream,
-        dev,
-        csp::cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE,
-        a,
-        b,
-        c,
-        m,
-        k,
-        n,
-        alpha,
-        beta,
-    )
-}
-
-/// SpMM with transpose: `C = α·A^T·B + β·C`.
-///
-/// - `A` is a GPU-resident CSR matrix (m × k), transposed to (k × m)
-/// - `B` is a dense **column-major** matrix (m × n) on GPU
-/// - `C` is a dense **column-major** matrix (k × n) on GPU, overwritten
-///
-/// Same algorithm selection as [`spmm_csr`].
-#[allow(clippy::too_many_arguments)]
-pub fn spmm_csr_transpose(
-    handle: &CusparseHandle,
-    stream: &Arc<CudaStream>,
-    dev: &GpuDevice,
-    a: &CusparseSpMatDescr,
-    b: &CudaSlice<f32>,
-    c: &mut CudaSlice<f32>,
-    m: usize,
-    k: usize,
-    n: usize,
-    alpha: f32,
-    beta: f32,
-) -> Result<(), GpuError> {
-    spmm_impl(
-        handle,
-        stream,
-        dev,
-        csp::cusparseOperation_t::CUSPARSE_OPERATION_TRANSPOSE,
-        a,
-        b,
-        c,
-        m,
-        k,
-        n,
-        alpha,
-        beta,
-    )
-}
-
 /// Strided SpMM: `C = α·op(A)·B + β·C` where `B` and `C` are strided views
 /// into possibly-larger column-major buffers.
 ///
-/// This is the unified entry point that the contiguous helpers ([`spmm_csr`],
-/// [`spmm_csr_transpose`]) and the strided helpers ([`spmm_csr_view_with_alg`],
-/// [`spmm_csr_transpose_view_with_alg`]) all delegate to. `pool` is `Some` when the
+/// This is the unified entry point that [`spmm_csr_view_with_alg`] and
+/// [`spmm_csr_transpose_view_with_alg`] delegate to. `pool` is `Some` when the
 /// caller wants the workspace reused across calls (PCA power iteration);
 /// `None` falls back to per-call `dev.alloc_zeros`.
 #[allow(clippy::too_many_arguments)]
@@ -606,71 +526,6 @@ fn spmm_impl_view(
     crate::profile::record_compute_since(t_compute);
 
     Ok(())
-}
-
-/// Convert `(m, k, n, op_a)` plus contiguous buffers into the equivalent
-/// strided-view dimensions for the legacy `spmm_csr` / `spmm_csr_transpose`
-/// entry points. Centralises the dimension table shared by both wrappers.
-fn contiguous_view_dims(
-    op_a: csp::cusparseOperation_t,
-    m: usize,
-    k: usize,
-    n: usize,
-) -> (i64, i64, i64, i64) {
-    match op_a {
-        csp::cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE => {
-            (k as i64, n as i64, m as i64, n as i64)
-        }
-        // TRANSPOSE or CONJUGATE_TRANSPOSE
-        _ => (m as i64, n as i64, k as i64, n as i64),
-    }
-}
-
-/// Legacy contiguous-buffer SpMM, retained for callers that don't yet thread
-/// a `CuSparseWorkspacePool` through. Delegates to [`spmm_impl_view`].
-#[allow(clippy::too_many_arguments)]
-fn spmm_impl(
-    handle: &CusparseHandle,
-    stream: &Arc<CudaStream>,
-    dev: &GpuDevice,
-    op_a: csp::cusparseOperation_t,
-    a: &CusparseSpMatDescr,
-    b: &CudaSlice<f32>,
-    c: &mut CudaSlice<f32>,
-    m: usize,
-    k: usize,
-    n: usize,
-    alpha: f32,
-    beta: f32,
-) -> Result<(), GpuError> {
-    let (b_rows, b_cols, c_rows, c_cols) = contiguous_view_dims(op_a, m, k, n);
-    let b_view = DnMatView {
-        buf: b,
-        offset_elems: 0,
-        rows: b_rows,
-        cols: b_cols,
-        ld: b_rows,
-    };
-    let c_view = DnMatViewMut {
-        buf: c,
-        offset_elems: 0,
-        rows: c_rows,
-        cols: c_cols,
-        ld: c_rows,
-    };
-    spmm_impl_view(
-        handle,
-        stream,
-        dev,
-        None,
-        op_a,
-        a,
-        b_view,
-        c_view,
-        alpha,
-        beta,
-        csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
-    )
 }
 
 /// Strided SpMM: `C = α·A·B + β·C` where `B` / `C` are views into larger
@@ -996,10 +851,6 @@ mod tests {
     use crate::test_utils::build_test_shard;
     use scx_codec::{CodecId, ValueEncoding};
 
-    /// The cuSPARSE ABI probe must return a bool without panicking, even when
-    /// no libcusparse is installed (the "no GPU runtime" case on CPU-only CI
-    /// runners). Regardless of GPU availability, calling the probe twice
-    /// returns the same cached value — `OnceLock` semantics.
     #[test]
     fn test_cusparse_modern_abi_probe_does_not_panic() {
         let first = cusparse_modern_abi_available();
@@ -1174,119 +1025,7 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn test_spmm_csr() {
-        let dev = require_gpu!();
-
-        // A: 4×3 sparse CSR
-        //   row 0: [(0, 1.0), (2, 3.0)]
-        //   row 1: [(1, 2.0)]
-        //   row 2: []
-        //   row 3: [(0, 4.0), (1, 5.0), (2, 6.0)]
-        let m = 4;
-        let k = 3;
-        let n = 2;
-        let indptr: Vec<i64> = vec![0, 2, 3, 3, 6];
-        let indices: Vec<i32> = vec![0, 2, 1, 0, 1, 2];
-        let data: Vec<f32> = vec![1.0, 3.0, 2.0, 4.0, 5.0, 6.0];
-
-        // B: 3×2 col-major:  [[1, 4],
-        //                      [2, 5],
-        //                      [3, 6]]
-        // col-major: [1,2,3, 4,5,6]
-        let b_host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-
-        let gpu_csr = build_simple_gpu_csr(&dev, &indptr, &indices, &data, m, k);
-        let handle = CusparseHandle::new().unwrap();
-        let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
-
-        let d_b = dev.htod_copy(&b_host).unwrap();
-        let mut d_c = dev.alloc_zeros::<f32>(m * n).unwrap();
-
-        spmm_csr(
-            &handle,
-            dev.stream(),
-            &dev,
-            &a_desc,
-            &d_b,
-            &mut d_c,
-            m,
-            k,
-            n,
-            1.0,
-            0.0,
-        )
-        .unwrap();
-
-        let c_gpu = dev.dtoh_copy(&d_c).unwrap();
-        let c_cpu = cpu_spmm(&indptr, &indices, &data, &b_host, m, k, n);
-
-        assert_eq!(c_gpu.len(), c_cpu.len());
-        for i in 0..c_gpu.len() {
-            assert!(
-                (c_gpu[i] - c_cpu[i]).abs() < 1e-5,
-                "SpMM mismatch at index {i}: GPU={}, CPU={}",
-                c_gpu[i],
-                c_cpu[i]
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn test_spmm_csr_transpose() {
-        let dev = require_gpu!();
-
-        // A: 4×3 sparse CSR (same as above)
-        // A^T: 3×4, B: 4×2 col-major, C: 3×2 col-major
-        let m = 4;
-        let k = 3;
-        let n = 2;
-        let indptr: Vec<i64> = vec![0, 2, 3, 3, 6];
-        let indices: Vec<i32> = vec![0, 2, 1, 0, 1, 2];
-        let data: Vec<f32> = vec![1.0, 3.0, 2.0, 4.0, 5.0, 6.0];
-
-        // B: 4×2 col-major
-        let b_host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-
-        let gpu_csr = build_simple_gpu_csr(&dev, &indptr, &indices, &data, m, k);
-        let handle = CusparseHandle::new().unwrap();
-        let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
-
-        let d_b = dev.htod_copy(&b_host).unwrap();
-        let mut d_c = dev.alloc_zeros::<f32>(k * n).unwrap();
-
-        super::spmm_csr_transpose(
-            &handle,
-            dev.stream(),
-            &dev,
-            &a_desc,
-            &d_b,
-            &mut d_c,
-            m,
-            k,
-            n,
-            1.0,
-            0.0,
-        )
-        .unwrap();
-
-        let c_gpu = dev.dtoh_copy(&d_c).unwrap();
-        let c_cpu = cpu_spmm_transpose(&indptr, &indices, &data, &b_host, m, k, n);
-
-        assert_eq!(c_gpu.len(), c_cpu.len());
-        for i in 0..c_gpu.len() {
-            assert!(
-                (c_gpu[i] - c_cpu[i]).abs() < 1e-5,
-                "SpMM transpose mismatch at index {i}: GPU={}, CPU={}",
-                c_gpu[i],
-                c_cpu[i]
-            );
-        }
-    }
-
-    /// Strided SpMM view parity vs the contiguous `spmm_csr`.
+    /// Strided SpMM view parity vs a host CSR×dense reference.
     ///
     /// Writes a `(m × n)` result into an oversized `(m + 5) × n` buffer at
     /// row offset 3 with `ld = m + 5`, then verifies the populated rows
@@ -1308,24 +1047,9 @@ mod tests {
         let handle = CusparseHandle::new().unwrap();
         let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
 
-        // Reference: contiguous SpMM.
+        // Reference: computed on the host, not by a second GPU entry point.
         let d_b = dev.htod_copy(&b_host).unwrap();
-        let mut d_c_contig = dev.alloc_zeros::<f32>(m * n).unwrap();
-        spmm_csr(
-            &handle,
-            dev.stream(),
-            &dev,
-            &a_desc,
-            &d_b,
-            &mut d_c_contig,
-            m,
-            k,
-            n,
-            1.0,
-            0.0,
-        )
-        .unwrap();
-        let c_ref = dev.dtoh_copy(&d_c_contig).unwrap();
+        let c_ref = cpu_spmm(&indptr, &indices, &data, &b_host, m, k, n);
 
         // Strided: write into a `(ld × n)` buffer at row offset 3 with ld = m + 5.
         let ld = m + 5;
@@ -1403,24 +1127,8 @@ mod tests {
         let handle = CusparseHandle::new().unwrap();
         let a_desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
 
-        // Reference: contiguous transposed SpMM.
-        let d_b_contig = dev.htod_copy(&b_host).unwrap();
-        let mut d_c_contig = dev.alloc_zeros::<f32>(k * n).unwrap();
-        super::spmm_csr_transpose(
-            &handle,
-            dev.stream(),
-            &dev,
-            &a_desc,
-            &d_b_contig,
-            &mut d_c_contig,
-            m,
-            k,
-            n,
-            1.0,
-            0.0,
-        )
-        .unwrap();
-        let c_ref = dev.dtoh_copy(&d_c_contig).unwrap();
+        // Reference: computed on the host, not by a second GPU entry point.
+        let c_ref = cpu_spmm_transpose(&indptr, &indices, &data, &b_host, m, k, n);
 
         // Strided: read B from a (ld × n) buffer at row offset 3 with ld = m + 5.
         let ld = m + 5;
@@ -1656,18 +1364,17 @@ mod tests {
         let d_b = dev.htod_copy(&b_host).unwrap();
         let mut d_c = dev.htod_copy(&c_init).unwrap();
 
-        spmm_csr(
+        spmm_csr_view_with_alg(
             &handle,
             dev.stream(),
             &dev,
+            None,
             &a_desc,
-            &d_b,
-            &mut d_c,
-            m,
-            k,
-            n,
+            DnMatView::contiguous(&d_b, k as i64, n as i64),
+            DnMatViewMut::contiguous(&mut d_c, m as i64, n as i64),
             2.0,
             0.5,
+            csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
         )
         .unwrap();
 
@@ -1676,5 +1383,12 @@ mod tests {
         // C = 2.0*[3, 8] + 0.5*[10, 20] = [6, 16] + [5, 10] = [11, 26]
         assert!((c_gpu[0] - 11.0).abs() < 1e-5);
         assert!((c_gpu[1] - 26.0).abs() < 1e-5);
+        // And against the host reference, so the literals above are checked by
+        // something other than the comment that derives them.
+        let ab = cpu_spmm(&indptr, &indices, &data, &b_host, m, k, n);
+        for i in 0..m * n {
+            let want = 2.0 * ab[i] + 0.5 * c_init[i];
+            assert!((c_gpu[i] - want).abs() < 1e-5, "alpha/beta mismatch at {i}");
+        }
     }
 }

@@ -3336,6 +3336,89 @@ fn test_streaming_append_drops_csc_from_input() {
 /// rejected for the same reason as the bulk path (review finding #3): it would
 /// leave sibling modalities under-covering the global obs axis.
 #[test]
+fn test_streaming_append_from_a_multimodal_source_is_supported() {
+    // The inverse of `test_streaming_append_multimodal_rejected`, and the
+    // reason append's `source_modality_id` handling is NOT dead code.
+    //
+    // `prepare_append`'s `MultimodalUnsupported` guard tests the *target*
+    // header. A multimodal **source** appended into a single-modality target
+    // passes it cleanly, and `rscx::scx_append_from` reaches exactly this
+    // combination — `scx-cli` and `pyscx` refuse it in their own front-ends,
+    // but the Rust API does not. Nothing covered it before.
+    use scx_format_io::modality::ModalityType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let n_vars: u64 = 10;
+
+    // Target: plain single-modality, 4 rows.
+    let target = write_test_file(&dir, "mm_source_target.scx", 4, n_vars as usize, 1);
+
+    // Source: multimodal, whose `adt` modality has the same n_vars as the
+    // target. Both modalities independently tile the shared 2-row obs axis.
+    let source = dir.path().join("mm_source.scx");
+    {
+        let mut writer = ScxWriter::new(&source, sample_header(2, 30)).unwrap();
+        writer.write_obs(&sample_obs(2)).unwrap();
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &sample_var(2)).unwrap();
+        writer.write_var_for(adt_id, &sample_var(2)).unwrap();
+        writer.set_modality_n_vars(rna_id, 30).unwrap();
+        writer.set_modality_n_vars(adt_id, n_vars).unwrap();
+        for (mid, nv) in [(rna_id, 30usize), (adt_id, n_vars as usize)] {
+            let (indptr, indices, values) = sample_shard_data(2, nv);
+            writer
+                .write_csr_shard_for(
+                    mid,
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    0,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    let src_reader = ScxReader::open(&source).unwrap();
+    let adt_modality_id = src_reader.modality_id("adt").expect("adt modality");
+    scx_ops::append_from_reader(
+        &target,
+        &src_reader,
+        &AppendOptions::default(), // target modality 0 — single-modality
+        adt_modality_id,
+    )
+    .expect("a multimodal source into a single-modality target must be supported");
+    drop(src_reader);
+
+    // The target grew by the source's obs count, and only the selected
+    // modality's rows came across.
+    let reader = ScxReader::open(&target).unwrap();
+    assert_eq!(reader.n_obs(), 6, "4 target rows + 2 source rows");
+    assert!(!reader.is_multimodal(), "the target stays single-modality");
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape, (6, n_vars as usize));
+}
+
+#[test]
 fn test_streaming_append_multimodal_rejected() {
     use scx_format_io::modality::ModalityType;
     use scx_format_io::section::SectionType;

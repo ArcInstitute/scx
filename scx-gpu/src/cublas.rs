@@ -5,7 +5,6 @@
 //! All dense matrices are column-major (cuBLAS native layout).
 //!
 //! Consumed by:
-//! - `linear_operator::CenteredSparseOperator::accumulate_gram` (via `gpu_sgemm` + `gpu_sger`).
 //! - Phase 2 GPU covariance PCA's `d_out += −n · μ μᵀ` correction (`gpu_sger`).
 //! - Phase 3's GPU-resident final embedding multiply (`gpu_sgemm`).
 //! - Phase 3's `mc = Vᵀ · μ` precomputation (`gpu_sgemv`).

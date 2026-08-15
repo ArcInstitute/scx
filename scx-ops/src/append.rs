@@ -24,7 +24,7 @@ use crate::error::{OpsError, Result};
 use crate::flock::FileLock;
 use crate::in_place::{commit_in_place, prepare_in_place, InPlacePrep};
 use crate::predicate_index::{
-    requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
+    user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
 };
 use crate::rewrite_helpers::{build_raw_copied_csr_section, raw_copy_csr_eligible};
 
@@ -301,7 +301,8 @@ pub fn append_from_reader_with_index_options(
     // re-canonicalization, so a pre-v3 source could inject non-canonical shards
     // into the (possibly v3) base. Gate the file's format_version on the lower
     // of base and source — never claim v3 unless both already guarantee it.
-    let feature_floor = if prep.header.n_modalities > 0 { 2 } else { 1 };
+    // A multimodal target is rejected by `prepare_append`, so the floor is v1.
+    let feature_floor = 1;
     let base_version = prep.header.format_version;
     let source_version = source.header().format_version;
     // SCX-005: a v3+ base declares the canonical-CSR invariant, but append does
@@ -814,10 +815,9 @@ fn write_csr_chunk(
         CodecSelection::Explicit(c) => c,
     };
 
-    let shard_name = match prep.modality_name.as_deref() {
-        Some(mname) => format!("X/{mname}/shard_{shard_idx}"),
-        None => format!("X_shard_{shard_idx}"),
-    };
+    // `prep.modality_name` is always `None` here — a multimodal target is
+    // rejected by `prepare_append`.
+    let shard_name = format!("X_shard_{shard_idx}");
 
     // Pad to 8-byte alignment
     let pad = write_alignment_padding(&mut *lock, *write_offset)?;
@@ -985,10 +985,9 @@ fn raw_copy_csr_shard(
     lock.write_all(&section_data)?;
     *write_offset += section_length;
 
-    let shard_name = match prep.modality_name.as_deref() {
-        Some(mname) => format!("X/{mname}/shard_{shard_idx}"),
-        None => format!("X_shard_{shard_idx}"),
-    };
+    // `prep.modality_name` is always `None` here — a multimodal target is
+    // rejected by `prepare_append`.
+    let shard_name = format!("X_shard_{shard_idx}");
 
     Ok(FullCatalogEntry {
         name: shard_name,
@@ -1042,18 +1041,16 @@ fn finalize_append(
     // older shards retain their original smaller stamps).
     let new_unified = unify_dict_columns(new_obs)?;
 
-    // Multimodal-skip vs single-modality rebuild decision.
     // `user_wants_index` treats a non-zero `index_auto_threshold` as an
     // explicit request — fixes the pre-fix bug where
     // `--index-auto-threshold N` alone was a no-op.
-    let target_is_multimodal = prep.modality_table.is_some();
-    let want_index = user_wants_index(index_options);
-    let multimodal_skip = if target_is_multimodal && want_index {
-        Some(requested_columns(index_options))
-    } else {
-        None
-    };
-    let rebuild_index = want_index && !target_is_multimodal;
+    //
+    // `multimodal_skip` is always `None` for append: a multimodal target is
+    // rejected by `prepare_append`. The field stays in the shared
+    // `PredicateIndexBuildSummary` because `merge` and `compact` do populate it
+    // (`scx-cli/src/index_warnings.rs` renders it).
+    let multimodal_skip = None;
+    let rebuild_index = user_wants_index(index_options);
 
     let new_n_obs = prep.old_n_obs + n_new_rows;
     let shard_target_rows = prep.header.shard_target_rows.max(1) as usize;
@@ -1409,7 +1406,6 @@ fn finalize_append(
     lock.write_all(&prov_bytes)?;
     let prov_length = prov_bytes.len() as u64;
     let prov_checksum = blake3_hash(&prov_bytes);
-    write_offset += prov_length;
 
     // Build new catalog. Append always drops every CSC sidecar
     // (single- and multi-modality alike): CSC shard headers stamp
@@ -1441,13 +1437,6 @@ fn finalize_append(
              are stale after append; re-run `scx sort --group-by` to regroup"
         );
     }
-    let n_new_csr_shards =
-        u32::try_from(new_shard_entries.len()).map_err(|_| OpsError::ShapeMismatch {
-            detail: format!(
-                "appended CSR shard count {} exceeds u32::MAX",
-                new_shard_entries.len(),
-            ),
-        })?;
     let mut new_entries: Vec<FullCatalogEntry> = prep
         .old_catalog
         .entries
@@ -1528,51 +1517,34 @@ fn finalize_append(
         csc_build_generation: 0,
     };
 
-    let (modality_table_offset, modality_table_length) =
-        if let Some(mut table) = prep.modality_table.take() {
-            if prep.modality_id != 0 {
-                if let Some(info) = table.entries.get_mut((prep.modality_id - 1) as usize) {
-                    info.n_csr_shards += n_new_csr_shards;
-                    info.nnz += total_new_nnz;
-                }
-            }
-            // Clear HAS_CSC and n_csc_shards on every modality —
-            // append always drops the file-wide sidecar (see catalog
-            // comment above).
-            for info in table.entries.iter_mut() {
-                info.n_csc_shards = 0;
-                info.flags = scx_format_io::ModalityFlags::from_bits_truncate(
-                    info.flags.bits() & !scx_format_io::ModalityFlags::HAS_CSC,
-                );
-            }
-
-            let pad = write_alignment_padding(&mut *lock, write_offset)?;
-            write_offset += pad as u64;
-            let mt_offset = write_offset;
-            let mut mt_buf = Vec::new();
-            table.write_to(&mut mt_buf)?;
-            lock.write_all(&mt_buf)?;
-            let mt_len = mt_buf.len() as u64;
-            // `write_offset` is not threaded past this point: the shared
-            // `commit_in_place` seeks to EOF to place the catalog.
-            (mt_offset, mt_len)
-        } else {
-            (
-                prep.header.modality_table_offset,
-                prep.header.modality_table_length,
-            )
-        };
+    // `prepare_append` rejects a multimodal *target* (`n_modalities > 0`), and
+    // `prepare_in_place` only populates `modality_table` in that case — so a
+    // successful append always has `modality_table == None` and carries the
+    // existing pointers through unchanged. (The `source_modality_id` parameter
+    // is a different axis and is very much live: a multimodal *source* into a
+    // single-modality target is supported.)
+    let (modality_table_offset, modality_table_length) = (
+        prep.header.modality_table_offset,
+        prep.header.modality_table_length,
+    );
 
     // Append-specific header fields. These read `new_catalog` / `total_new_nnz`
     // and do not depend on the on-disk catalog offset, so they're stamped
     // before the shared commit (which sets only the catalog-pointer fields).
     prep.header.n_obs = new_n_obs;
     prep.header.nnz += total_new_nnz;
-    prep.header.n_csr_shards = new_catalog
+    // Checked, not `as u32`: the overflow guard used to sit on the appended
+    // shard count alone, which only the (now-deleted) multimodal branch read.
+    // The header field is the thing that actually truncates.
+    let total_csr_shards = new_catalog
         .entries
         .iter()
         .filter(|e| e.section_type == SectionType::CsrShard)
-        .count() as u32;
+        .count();
+    prep.header.n_csr_shards =
+        u32::try_from(total_csr_shards).map_err(|_| OpsError::ShapeMismatch {
+            detail: format!("CSR shard count {total_csr_shards} exceeds u32::MAX"),
+        })?;
     // Append drops every CSC sidecar, so n_csc_shards collapses to 0
     // and HAS_CSC clears. Kept as a count to defend against any future
     // partial-preservation logic re-introduction.

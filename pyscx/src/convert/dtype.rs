@@ -12,44 +12,6 @@ use std::sync::Arc;
 
 use scx_codec::{CodecId, ValueEncoding};
 
-/// Convert i64 slice to Vec<u64> with overflow check.
-///
-/// Returns PyValueError if any element is negative.
-#[allow(dead_code)]
-pub(crate) fn i64_to_u64(v: &[i64]) -> PyResult<Vec<u64>> {
-    v.iter()
-        .map(|&val| {
-            if val < 0 {
-                Err(PyRuntimeError::new_err(format!(
-                    "negative value {} cannot be converted to u64",
-                    val
-                )))
-            } else {
-                Ok(val as u64)
-            }
-        })
-        .collect()
-}
-
-/// Convert i32 slice to Vec<u32> with overflow check.
-///
-/// Returns PyValueError if any element is negative.
-#[allow(dead_code)]
-pub(crate) fn i32_to_u32(v: &[i32]) -> PyResult<Vec<u32>> {
-    v.iter()
-        .map(|&val| {
-            if val < 0 {
-                Err(PyRuntimeError::new_err(format!(
-                    "negative value {} cannot be converted to u32",
-                    val
-                )))
-            } else {
-                Ok(val as u32)
-            }
-        })
-        .collect()
-}
-
 /// Encode f32 values to raw LE bytes according to a value encoding.
 ///
 /// Delegates to the canonical [`scx_codec::value_encoding::values_to_raw_bytes`]

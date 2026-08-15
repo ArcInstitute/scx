@@ -19,27 +19,6 @@ pub const B_IDX: usize = 128;
 /// from the scalar LSB-first remainder packing — and route those correctly.
 pub const SIMD_THRESHOLD: usize = BitPacker4x::BLOCK_LEN;
 
-/// Per-row decode metadata produced by the actual FOR-BP encoder.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForBpRowMetadata {
-    pub nnz: u32,
-    pub value_start: u64,
-    pub frame_min: u32,
-    pub frame_bits: u8,
-    /// `0` empty, `1` scalar/no-payload layout, `2` BitPacker4x layout.
-    pub index_packing: u8,
-    /// Bit offset from the start of the encoded index stream to this row's
-    /// packed delta payload.
-    pub indices_bit_offset: u64,
-}
-
-/// Encoded FOR-BP bytes plus per-row metadata from the same encode pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForBpEncodeResult {
-    pub bytes: Vec<u8>,
-    pub rows: Vec<ForBpRowMetadata>,
-}
-
 // ---------------------------------------------------------------------------
 // LEB128 varint helpers (task 5.2)
 // ---------------------------------------------------------------------------
@@ -113,18 +92,7 @@ pub fn forbp_encode(
     row_lengths: &[usize],
     index_dtype_u16: bool,
 ) -> Result<Vec<u8>, CodecError> {
-    Ok(forbp_encode_with_metadata(indices, row_lengths, index_dtype_u16)?.bytes)
-}
-
-/// Encode CSR column indices and return the exact per-row decode metadata
-/// observed during encoding.
-pub fn forbp_encode_with_metadata(
-    indices: &[u32],
-    row_lengths: &[usize],
-    index_dtype_u16: bool,
-) -> Result<ForBpEncodeResult, CodecError> {
     let mut output = Vec::new();
-    let mut rows = Vec::with_capacity(row_lengths.len());
     let mut idx_offset: usize = 0;
 
     for block_rows in row_lengths.chunks(B_IDX) {
@@ -152,16 +120,7 @@ pub fn forbp_encode_with_metadata(
             if nnz > u32::MAX as usize {
                 return Err(BitStreamError.into());
             }
-            let value_start = idx_offset as u64;
             if nnz == 0 {
-                rows.push(ForBpRowMetadata {
-                    nnz: 0,
-                    value_start,
-                    frame_min: 0,
-                    frame_bits: 0,
-                    index_packing: 0,
-                    indices_bit_offset: 0,
-                });
                 continue;
             }
 
@@ -201,12 +160,6 @@ pub fn forbp_encode_with_metadata(
 
             // Write frame_bits
             output.push(frame_bits);
-            let indices_bit_offset = (output.len() as u64) * 8;
-            let index_packing = if frame_bits > 0 && nnz >= SIMD_THRESHOLD {
-                2
-            } else {
-                1
-            };
 
             // Bit-pack deltas if frame_bits > 0
             if frame_bits > 0 {
@@ -244,14 +197,6 @@ pub fn forbp_encode_with_metadata(
                 }
             }
 
-            rows.push(ForBpRowMetadata {
-                nnz: nnz as u32,
-                value_start,
-                frame_min,
-                frame_bits,
-                index_packing,
-                indices_bit_offset,
-            });
             idx_offset += nnz;
         }
     }
@@ -263,115 +208,7 @@ pub fn forbp_encode_with_metadata(
         )));
     }
 
-    Ok(ForBpEncodeResult {
-        bytes: output,
-        rows,
-    })
-}
-
-/// Decode FOR-BP indices using encoder-produced per-row metadata instead of
-/// walking the block stream. This is used to verify decode sidecar offsets.
-pub fn forbp_decode_with_metadata(
-    data: &[u8],
-    rows: &[ForBpRowMetadata],
-) -> Result<Vec<u32>, BitStreamError> {
-    let nnz_total: usize = rows
-        .iter()
-        .map(|row| row.nnz as usize)
-        .try_fold(0usize, |acc, nnz| {
-            acc.checked_add(nnz).ok_or(BitStreamError)
-        })?;
-    // F-f: bound the eager allocation to what `data` could physically encode
-    // (≥1 bit per index) before allocating — the metadata `nnz` fields are
-    // caller-supplied. Twin of the guard in `rice_decode_with_metadata`; the
-    // per-row payload guard below only fires *after* this `with_capacity`.
-    if data.len().checked_mul(8).is_some_and(|cap| nnz_total > cap) {
-        return Err(BitStreamError);
-    }
-    let mut all_indices = Vec::with_capacity(nnz_total);
-
-    for row in rows {
-        let nnz = row.nnz as usize;
-        if nnz == 0 {
-            continue;
-        }
-        if row.frame_bits > 32 {
-            return Err(BitStreamError);
-        }
-
-        let start = all_indices.len();
-        all_indices.resize(start + nnz, 0);
-
-        if row.frame_bits > 0 {
-            let bit_offset = usize::try_from(row.indices_bit_offset).map_err(|_| BitStreamError)?;
-            let total_bits = nnz
-                .checked_mul(row.frame_bits as usize)
-                .ok_or(BitStreamError)?;
-            if bit_offset.checked_add(total_bits).ok_or(BitStreamError)? > data.len() * 8 {
-                return Err(BitStreamError);
-            }
-
-            if row.index_packing == 2 {
-                if !bit_offset.is_multiple_of(8) {
-                    return Err(BitStreamError);
-                }
-                let packer = BitPacker4x::new();
-                let full_chunks = nnz / SIMD_THRESHOLD;
-                let remainder = nnz % SIMD_THRESHOLD;
-                let chunk_bytes = row.frame_bits as usize * SIMD_THRESHOLD / 8;
-                let mut data_offset = bit_offset / 8;
-
-                for c in 0..full_chunks {
-                    let dst_start = start + c * SIMD_THRESHOLD;
-                    if data_offset + chunk_bytes > data.len() {
-                        return Err(BitStreamError);
-                    }
-                    packer.decompress(
-                        &data[data_offset..],
-                        &mut all_indices[dst_start..dst_start + SIMD_THRESHOLD],
-                        row.frame_bits,
-                    );
-                    data_offset += chunk_bytes;
-                }
-
-                if remainder > 0 {
-                    let rem_start = start + full_chunks * SIMD_THRESHOLD;
-                    let rem_bits = remainder * row.frame_bits as usize;
-                    let rem_bytes = rem_bits.div_ceil(8);
-                    if data_offset + rem_bytes > data.len() {
-                        return Err(BitStreamError);
-                    }
-                    unpack_fixed_width(
-                        &data[data_offset..data_offset + rem_bytes],
-                        0,
-                        remainder,
-                        row.frame_bits,
-                        &mut all_indices[rem_start..],
-                    );
-                }
-            } else if row.index_packing == 1 {
-                unpack_fixed_width(
-                    data,
-                    bit_offset,
-                    nnz,
-                    row.frame_bits,
-                    &mut all_indices[start..],
-                );
-            } else {
-                return Err(BitStreamError);
-            }
-        } else if row.index_packing > 1 {
-            return Err(BitStreamError);
-        }
-
-        let mut prev = row.frame_min;
-        for delta in &mut all_indices[start..start + nnz] {
-            prev = prev.checked_add(*delta).ok_or(BitStreamError)?;
-            *delta = prev;
-        }
-    }
-
-    Ok(all_indices)
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------

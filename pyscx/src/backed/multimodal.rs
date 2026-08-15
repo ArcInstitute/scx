@@ -2,7 +2,6 @@
 //
 // Extracted from the former pyscx/src/backed.rs (T5.7).
 
-use std::path::Path;
 use std::sync::Arc;
 
 use pyo3::exceptions::PyRuntimeError;
@@ -276,11 +275,6 @@ impl ScxBackedMuModality {
         format!("ScxBackedMuModality(modalities={:?})", self.modality_names)
     }
 }
-
-// Suppress unused-import warning on `Path` when no other code in this
-// file references it (we only need it transitively for path conversion).
-#[allow(dead_code)]
-fn _path_marker(_p: &Path) {}
 
 // ---------------------------------------------------------------------------
 // ScxBackedObsmDataset — backed dense row-gather for an obsm embedding
