@@ -1436,3 +1436,224 @@ fn sharded_and_single_section_layer_imports_agree() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Value encoding vs. canonicalization
+// ---------------------------------------------------------------------------
+
+/// One cell, one gene, the same coordinate twice — canonicalization sums them.
+fn duplicate_coordinate_data(a: f32, b: f32) -> ExternalLayerData {
+    ExternalLayerData {
+        row_keys: vec!["cell_0".to_string()],
+        col_keys: vec!["g0".to_string()],
+        indptr: vec![0, 2],
+        indices: vec![0, 0],
+        values: vec![a, b],
+        row_annotations: None,
+        row_embeddings: Vec::new(),
+        col_annotations: None,
+        uns: None,
+        source_checksum: None,
+        source_name: None,
+    }
+}
+
+/// The encoding is detected **once** over the whole layer, before the per-shard
+/// gather; canonicalization then sums duplicate coordinates, so a shard's values
+/// can outgrow it. Re-encoding under the stale encoding fails three different
+/// ways and only this one is loud — `Uint8` refuses `200 + 200 = 400` outright,
+/// aborting the import on exactly the input canonicalization exists to repair.
+/// (`Float16` yields infinity and `Uint32` saturates at 2³², both silently.)
+#[test]
+fn attach_layer_widens_a_detected_encoding_the_sums_outgrow() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let data = duplicate_coordinate_data(200.0, 200.0);
+    let summary = attach_external_layer(&path, &data, &opts("cb"))
+        .expect("a duplicate-coordinate sum past the detected encoding must widen, not abort");
+
+    assert_eq!(
+        summary.value_encoding,
+        ValueEncoding::Uint16,
+        "the summary must report the encoding actually written"
+    );
+    let layer = ScxReader::open(&path).unwrap().read_layer("cb").unwrap();
+    assert_eq!(
+        layer.data,
+        vec![400.0],
+        "the summed value must survive intact, not saturate or error"
+    );
+}
+
+/// A caller-pinned encoding is authoritative: widening it silently would
+/// override a deliberate choice. Report that it no longer holds instead — which
+/// is also the only way the `Uint32` and `Float16` arms stop being silent, since
+/// neither errors on its own.
+#[test]
+fn attach_layer_rejects_a_pinned_encoding_the_sums_outgrow() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let data = duplicate_coordinate_data(200.0, 200.0);
+    let pinned = AttachLayerOptions {
+        value_encoding: Some(ValueEncoding::Uint8),
+        ..opts("cb")
+    };
+    let err = attach_external_layer(&path, &data, &pinned)
+        .expect_err("a pinned encoding the canonicalized values outgrow must be reported");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cb") && msg.contains("Uint8") && msg.contains("400"),
+        "the error must name the layer, the pinned encoding and the offending value, got: {msg}"
+    );
+}
+
+/// The 2³² ambiguity is irreducible for the *rewrite* paths — there an f32 of
+/// 2³² is equally a decoded on-disk `u32::MAX`, so `encoding_for_canonicalized`
+/// deliberately keeps `Uint32` and lets `as u32` saturate it back. It is **not**
+/// ambiguous here: `ExternalLayerData` carries fresh values that never passed
+/// through a `u32` decode, so a sum of `2³¹ + 2³¹` is exactly 2³² and nothing
+/// else. Encoding it as `Uint32` writes `u32::MAX`, one less than the sum, with
+/// no error — the same silent corruption this PR exists to remove, on the one
+/// path that has the evidence to avoid it.
+///
+/// Read back through `f32` the two are indistinguishable (`u32::MAX as f32` is
+/// 2³²), so the encoding is what has to be asserted.
+#[test]
+fn attach_layer_uses_the_fresh_data_rule_at_the_u32_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let two_pow_31 = 2_147_483_648.0f32;
+    let data = duplicate_coordinate_data(two_pow_31, two_pow_31);
+    let summary = attach_external_layer(&path, &data, &opts("cb")).unwrap();
+    assert_eq!(
+        summary.value_encoding,
+        ValueEncoding::Float32,
+        "a fresh sum above u32::MAX must not be written as Uint32 and saturated"
+    );
+
+    // The written header, not just the summary: keeping the two in sync while
+    // passing the layer-wide encoding to the encoder would re-saturate the shard
+    // and still satisfy the assertion above.
+    let reader = ScxReader::open(&path).unwrap();
+    let entry = reader
+        .catalog()
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::LayerCsrShard)
+        .expect("the layer shard must exist");
+    let sh = reader.read_shard_header(entry).unwrap();
+    assert_eq!(
+        ValueEncoding::from_u8(sh.value_encoding),
+        Some(ValueEncoding::Float32),
+        "the shard on disk must carry the widened encoding, not just the summary"
+    );
+}
+
+/// The preview has to predict the boundary case too — this is the third of the
+/// trio (detected / pinned / dry-run), and the one whose absence would let a
+/// future split between the two loops go unnoticed.
+#[test]
+fn dry_run_predicts_the_encoding_at_the_u32_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let two_pow_31 = 2_147_483_648.0f32;
+    let data = duplicate_coordinate_data(two_pow_31, two_pow_31);
+    let preview = AttachLayerOptions {
+        dry_run: true,
+        ..opts("cb")
+    };
+    let summary = attach_external_layer(&path, &data, &preview).unwrap();
+    assert_eq!(
+        summary.value_encoding,
+        ValueEncoding::Float32,
+        "the preview must report the encoding the write will actually use"
+    );
+
+    let pinned_preview = AttachLayerOptions {
+        dry_run: true,
+        value_encoding: Some(ValueEncoding::Uint32),
+        ..opts("cb")
+    };
+    assert!(
+        attach_external_layer(&path, &data, &pinned_preview).is_err(),
+        "a preview must surface the pinned failure at the ceiling, not defer it"
+    );
+}
+
+/// The pinned branch has to answer the same question the same way: at 2³² the
+/// values genuinely do not fit `Uint32`, so a caller who pinned it must be told,
+/// not handed a silently saturated shard.
+#[test]
+fn attach_layer_rejects_a_pinned_uint32_at_the_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let two_pow_31 = 2_147_483_648.0f32;
+    let data = duplicate_coordinate_data(two_pow_31, two_pow_31);
+    let pinned = AttachLayerOptions {
+        value_encoding: Some(ValueEncoding::Uint32),
+        ..opts("cb")
+    };
+    assert!(
+        attach_external_layer(&path, &data, &pinned).is_err(),
+        "a pinned Uint32 that the canonicalized sum outgrows must be reported"
+    );
+}
+
+/// The overflow diagnostic is the only thing that makes a pinned `Float16`
+/// overflow audible at all, so it has to name the value that caused it. Folding
+/// the reported maximum from `0.0` with a *signed* max reports `0` for an
+/// all-negative shard — the one case the magnitude guard was just added for.
+#[test]
+fn attach_layer_pinned_overflow_names_the_offending_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+
+    let data = duplicate_coordinate_data(-40_000.0, -40_000.0);
+    let pinned = AttachLayerOptions {
+        value_encoding: Some(ValueEncoding::Float16),
+        ..opts("cb")
+    };
+    let err = attach_external_layer(&path, &data, &pinned)
+        .expect_err("a pinned Float16 the sums outgrow must be reported");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("-80000"),
+        "the diagnostic must name the value that overflowed, got: {msg}"
+    );
+}
+
+/// `--dry-run` predicts the import; it has to predict this too. The write loop
+/// would refuse a pinned encoding the sums outgrow, so a preview that returns
+/// `Ok` sends the user into a failure it was asked to find.
+#[test]
+fn dry_run_reports_the_encoding_the_write_would_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 1, 1, 1);
+    let data = duplicate_coordinate_data(200.0, 200.0);
+
+    let preview = AttachLayerOptions {
+        dry_run: true,
+        ..opts("cb")
+    };
+    let summary = attach_external_layer(&path, &data, &preview).unwrap();
+    assert_eq!(
+        summary.value_encoding,
+        ValueEncoding::Uint16,
+        "the preview must report the widened encoding the write will use"
+    );
+
+    let pinned_preview = AttachLayerOptions {
+        dry_run: true,
+        value_encoding: Some(ValueEncoding::Uint8),
+        ..opts("cb")
+    };
+    assert!(
+        attach_external_layer(&path, &data, &pinned_preview).is_err(),
+        "a preview must surface the pinned-encoding failure, not defer it to the write"
+    );
+}

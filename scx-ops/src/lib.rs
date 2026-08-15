@@ -54,7 +54,7 @@ pub use optimize::{optimize, optimize_with_framing, OptimizeStats};
 pub use predicate_index::PredicateIndexBuildSummary;
 pub use rebuild_csc::{framing_for_csc_rebuild, rebuild_csc_inplace};
 pub use rewrite_helpers::{
-    copy_auxiliary_sections, copy_auxiliary_sections_canonicalizing,
+    codec_for_canonicalized, copy_auxiliary_sections, copy_auxiliary_sections_canonicalizing,
     copy_obs_var_preserving_layout, encoding_for_canonicalized,
 };
 pub use rollback::{rollback, rollback_to};

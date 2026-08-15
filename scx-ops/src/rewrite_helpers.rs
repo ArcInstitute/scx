@@ -218,17 +218,103 @@ pub fn copy_obs_var_preserving_layout(
 /// still fits, which is the overwhelmingly common case — this only widens for a
 /// shard canonicalization actually rewrote.
 pub fn encoding_for_canonicalized(source: ValueEncoding, data: &[f32]) -> ValueEncoding {
-    let max = data.iter().copied().fold(0.0f32, f32::max);
+    // One pass, folding both limits together. `Float16`'s ceiling is a
+    // magnitude while the integer ceilings are signed, so both are needed —
+    // using the signed max for f16 is how the negative half went unguarded: it
+    // starts at 0.0, so an all-negative shard reports `max == 0.0` and never
+    // widens. The rungs below are a flat ladder rather than a recursive one
+    // because recursing re-folded the whole slice per rung, and `copy_layers`
+    // calls this on every layer shard of an upgrade.
+    //
+    // Folded in f64 to match `detect_value_encoding`; every threshold here is
+    // exact in f32 too, so the width is convention rather than correctness —
+    // the *constant* on the `Uint32` rung is what has to be right.
+    let (max, max_abs) = data.iter().fold((0.0f64, 0.0f64), |(m, ma), &v| {
+        let v = v as f64;
+        (m.max(v), ma.max(v.abs()))
+    });
     match source {
-        // f16's finite ceiling. Past it `from_f32` yields inf, silently.
-        ValueEncoding::Float16 if max > 65504.0 => ValueEncoding::Float32,
-        ValueEncoding::Uint8 if max > 255.0 => {
-            encoding_for_canonicalized(ValueEncoding::Uint16, data)
+        // f16's finite ceiling. Past it `from_f32` yields ±inf, silently.
+        ValueEncoding::Float16 if max_abs > 65504.0 => ValueEncoding::Float32,
+        ValueEncoding::Uint8 | ValueEncoding::Uint16 | ValueEncoding::Uint32 => {
+            if max > U32_DECODE_CEILING {
+                ValueEncoding::Float32
+            } else if max > u16::MAX as f64 {
+                ValueEncoding::Uint32
+            } else if max > u8::MAX as f64 {
+                // Never narrower than the source: a shard whose values happen to
+                // fit a smaller width keeps the encoding the file already chose.
+                widest_of_two(source, ValueEncoding::Uint16)
+            } else {
+                source
+            }
         }
-        ValueEncoding::Uint16 if max > 65535.0 => ValueEncoding::Uint32,
-        // Uint32 saturates the integer ladder; a sum past u32::MAX would need
-        // f32 and is not reachable from counts that fit u32 in a real matrix.
         other => other,
+    }
+}
+
+/// The wider of two **integer** encodings.
+///
+/// Only ever called with the source rung and the rung its values need, so the
+/// ordering question is `Uint8 < Uint16 < Uint32` and nothing else; floats never
+/// reach it.
+fn widest_of_two(a: ValueEncoding, b: ValueEncoding) -> ValueEncoding {
+    let rank = |e: ValueEncoding| match e {
+        ValueEncoding::Uint8 => 0,
+        ValueEncoding::Uint16 => 1,
+        _ => 2,
+    };
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// The largest `f32` any on-disk `u32` decodes to: 2³², because `u32::MAX as
+/// f32` rounds *up*. Values at or below it may be decoded originals; values
+/// above it cannot be.
+///
+/// This is why [`encoding_for_canonicalized`]'s top rung is bounded here rather
+/// than at `u32::MAX`, and the gap between the two is the whole point. Strictly
+/// above 2³² a value is provably a sum, so widening is unambiguous — and
+/// necessary, because `encode_f32` refuses such a value outright and would abort
+/// the rewrite. **At** 2³² the provenances are indistinguishable: it is equally
+/// the f32 image of a decoded `u32::MAX` and a sum that reached it. Keeping
+/// `Uint32` is the better half of that irreducible choice — `as u32` saturates
+/// the decoded value back to `u32::MAX` exactly, so the rewrite stays lossless
+/// on a format-valid archive, whereas widening writes 2³², one larger and not a
+/// value `u32` can hold at all, so the file stops reading as `uint32`. A sum
+/// landing exactly on 2³² is written one low; that is the residue of the f32
+/// round-trip these paths already have, not something this rung can fix.
+///
+/// **Only the rewrite paths are ambiguous**, and not because their values came
+/// off disk — an external file can hand over a `u32`-derived 2³² just as easily.
+/// What separates them is evidence: `attach_external_layer` runs
+/// `scx_codec::detect_value_encoding` over its pre-canonical values, and that
+/// detector sends 2³² to `Float32`, so a `Uint32` layer encoding *proves* no
+/// input held the alias and any later 2³² is a sum. A rewrite has no such step —
+/// its encoding comes from the shard header it is copying — so it cannot tell
+/// the two apart and must not use the fresh-data rule.
+const U32_DECODE_CEILING: f64 = (1u64 << 32) as f64;
+
+/// The codec to pair with a value encoding [`encoding_for_canonicalized`] may
+/// have widened.
+///
+/// `Scx1` encodes integers only, so `Scx1` + `Float32` is
+/// [`scx_codec::CodecError::FloatWithScx1`] — the rewrite aborts on exactly the
+/// input the widening exists to let through. `encode_one_shard_from_bytes`
+/// already performs this downgrade for callers that pick a codec through it;
+/// the rewrite writers (`write_csr_shard` / `write_layer_csr_shard`) pass their
+/// codec straight to `encode_shard_adaptive`, which does not, so they have to
+/// ask for it. Kept next to the ladder because the two decisions are one
+/// decision: whenever the encoding can stop being integral, the codec can stop
+/// being valid.
+pub fn codec_for_canonicalized(source: CodecId, encoding: ValueEncoding) -> CodecId {
+    if source == CodecId::Scx1 && !encoding.is_integer() {
+        CodecId::Zstd
+    } else {
+        source
     }
 }
 
@@ -424,11 +510,15 @@ fn copy_layers(
             let mut indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
             // Canonicalizing sums duplicates, which can exceed what the source
             // encoding holds — see `encoding_for_canonicalized`.
-            let ve = if canonicalize {
+            let (ve, ci) = if canonicalize {
                 scx_sparse::canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut data);
-                encoding_for_canonicalized(ve, &data)
+                let widened = encoding_for_canonicalized(ve, &data);
+                // The codec has to follow the encoding: this writer hands `ci`
+                // straight to `encode_shard_adaptive`, which will not downgrade
+                // Scx1 for a float encoding on its own.
+                (widened, codec_for_canonicalized(ci, widened))
             } else {
-                ve
+                (ve, ci)
             };
             let mut raw_values = Vec::new();
             for &v in &data {
@@ -635,5 +725,98 @@ mod tests {
         .unwrap();
         w.finish().unwrap();
         assert!(dropped_section_labels(&ScxReader::open(&plain).unwrap()).is_empty());
+    }
+
+    /// The integer ladder must not stop at `Uint32`. A sum past the decode
+    /// ceiling re-encoded under `Uint32` hard-fails `ValueEncoding::encode_f32`
+    /// — aborting the rewrite on exactly the non-canonical input this function
+    /// exists to repair.
+    #[test]
+    fn canonicalized_uint32_sum_past_the_decode_ceiling_widens_to_float32() {
+        let past = (1u128 << 33) as f32;
+        assert_eq!(
+            encoding_for_canonicalized(ValueEncoding::Uint32, &[1.0, past]),
+            ValueEncoding::Float32
+        );
+    }
+
+    /// Each rung must hand off to the next, not terminate. A `Uint8` source
+    /// whose sums outgrow the whole ladder has to climb all the way to
+    /// `Float32`; stopping at `Uint32` lands it on the arm above.
+    #[test]
+    fn canonicalized_uint8_cascades_all_the_way_to_float32() {
+        let past = (1u128 << 33) as f32;
+        assert_eq!(
+            encoding_for_canonicalized(ValueEncoding::Uint8, &[past]),
+            ValueEncoding::Float32
+        );
+    }
+
+    /// The boundary is 2³² **exclusive**, and that is load-bearing in both
+    /// directions.
+    ///
+    /// No `u32` decodes above 2³² — `u32::MAX as f32` rounds *up* to exactly
+    /// 2³² — so a value strictly greater can only have come from summing, which
+    /// makes the arm provenance-proof. At 2³² itself the two provenances are
+    /// indistinguishable, and keeping `Uint32` is the better half: `as u32`
+    /// saturates a decoded `u32::MAX` back to itself exactly, whereas widening
+    /// writes 2³², which no longer fits `u32` at all.
+    #[test]
+    fn canonicalized_uint32_widens_only_strictly_above_the_decode_ceiling() {
+        let two_pow_32 = (1u128 << 32) as f32;
+        assert_eq!(u32::MAX as f32, two_pow_32, "the alias this arm turns on");
+
+        assert_eq!(
+            encoding_for_canonicalized(ValueEncoding::Uint32, &[4_294_967_040.0]),
+            ValueEncoding::Uint32
+        );
+        assert_eq!(
+            encoding_for_canonicalized(ValueEncoding::Uint32, &[two_pow_32]),
+            ValueEncoding::Uint32,
+            "a decoded u32::MAX must survive the rewrite as u32::MAX"
+        );
+        assert_eq!(
+            encoding_for_canonicalized(ValueEncoding::Uint32, &[two_pow_32 * 2.0]),
+            ValueEncoding::Float32,
+            "a sum no u32 can decode to must widen rather than abort the encoder"
+        );
+    }
+
+    /// `Float16`'s ceiling is a *magnitude*, but the fold only ever looked at
+    /// the signed maximum — which starts at `0.0`, so an all-negative shard
+    /// reports `max == 0.0` and never widens. Two duplicate `-40000`s sum to
+    /// `-80000`, `f16::from_f32` maps that to `-inf`, and the rewrite reports
+    /// success. Layers hold arbitrary floats, so this is reachable data.
+    #[test]
+    fn canonicalized_float16_widens_on_negative_overflow_too() {
+        assert_eq!(
+            encoding_for_canonicalized(ValueEncoding::Float16, &[-80_000.0]),
+            ValueEncoding::Float32
+        );
+        assert_eq!(
+            encoding_for_canonicalized(ValueEncoding::Float16, &[-65_504.0, 1.0]),
+            ValueEncoding::Float16,
+            "the negative end of the representable range must not widen"
+        );
+    }
+
+    /// A widened encoding has to drag the codec with it: `Scx1` encodes
+    /// integers only, so pairing it with `Float32` is `FloatWithScx1` — the
+    /// widening arm would abort the very rewrite it exists to let through.
+    #[test]
+    fn canonicalized_codec_drops_scx1_when_the_encoding_goes_float() {
+        assert_eq!(
+            codec_for_canonicalized(CodecId::Scx1, ValueEncoding::Float32),
+            CodecId::Zstd
+        );
+        assert_eq!(
+            codec_for_canonicalized(CodecId::Scx1, ValueEncoding::Uint32),
+            CodecId::Scx1,
+            "an encoding Scx1 can hold must keep it"
+        );
+        assert_eq!(
+            codec_for_canonicalized(CodecId::Zstd, ValueEncoding::Float32),
+            CodecId::Zstd
+        );
     }
 }

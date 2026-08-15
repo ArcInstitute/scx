@@ -44,9 +44,14 @@ pub fn encode_value(
             // back to `u32::MAX`, restoring the original value.
             //
             // Fresh out-of-range data is diverted to `Float32` by
-            // `detect_value_encoding` — but only on the detect path; see
-            // `ValueEncoding::encode_f32` for the callers that bypass it and
-            // still saturate silently.
+            // `detect_value_encoding`, on the detect path and on
+            // `attach_external_layer`'s post-canonicalization one.
+            // `encoding_for_canonicalized` deliberately does *not* divert at
+            // exactly 2³² — its values may be decoded originals, and saturating
+            // is what restores them — so the rewrite ops reach this arm by
+            // design. A caller passing an explicit encoding bypasses every
+            // detector; so does any `u32` above 2²⁴, which the f32 decode
+            // rounded long before reaching here. See `ValueEncoding::encode_f32`.
             const UINT32_BOUND: f32 = (1u128 << 32) as f32;
             if !(0.0..=UINT32_BOUND).contains(&value) {
                 return Err(OpsError::ValueOutOfRange {

@@ -327,8 +327,11 @@ pub struct AttachLayerOptions {
     /// When false (default), any pre-existing layer / obs column / var column /
     /// obsm key / uns key this op would replace is an error.
     pub overwrite: bool,
-    /// `None` detects the narrowest encoding that fits **all** values, once, so
-    /// every shard of the layer shares one encoding.
+    /// `None` detects the narrowest encoding that fits **all** values, once,
+    /// over the source values as handed in. A shard whose canonicalized sums
+    /// outgrow that encoding is widened on its own (see
+    /// [`shard_value_encoding`]), so shards may differ; `Some` pins the
+    /// encoding and makes an outgrowing shard an error instead.
     pub value_encoding: Option<ValueEncoding>,
     /// `None` lets the encoder pick per shard.
     pub codec: Option<CodecId>,
@@ -379,6 +382,8 @@ pub struct AttachLayerSummary {
     pub var_key_column: String,
     pub column_axis_match: ColumnAxisMatch,
     pub layer_nnz: u64,
+    /// The widest encoding any shard was written under — which is the detected
+    /// one unless canonicalization outgrew it. See [`shard_value_encoding`].
     pub value_encoding: ValueEncoding,
     pub shard_ranges_from: ShardRangeSource,
     pub obs_columns_added: Vec<String>,
@@ -389,6 +394,122 @@ pub struct AttachLayerSummary {
     /// single-section `ObsMetadata` forces. See
     /// [`crate::external_obs::ObsRewrite`].
     pub obs_streamed: bool,
+}
+
+/// The value encoding one canonicalized shard is written under.
+///
+/// The layer-wide encoding is detected once, over the source values as handed
+/// in and before the per-shard gather. Canonicalization then **sums duplicate
+/// coordinates**, so a shard's values can outgrow it — and re-encoding under
+/// the stale encoding fails three different ways, only the first of them
+/// audibly:
+///
+/// - `Uint8` refuses `200 + 200 = 400` outright, aborting the import on exactly
+///   the input canonicalization exists to repair;
+/// - `Float16` maps anything past 65504 to infinity and reports success;
+/// - `Uint32` accepts exactly 2³² and saturates it to `u32::MAX`, because
+///   `u32::MAX as f32` *is* 2³² and that bound has to stay inclusive for the
+///   rewrite ops — see [`ValueEncoding::encode_f32`].
+///
+/// Who resolves it depends on where the encoding came from. A **detected**
+/// encoding is this op's own guess, so widen the shard; per-shard encodings are
+/// ordinary, since each shard header carries its own and `scx info` reports the
+/// breakdown. A **pinned** encoding is the caller's decision, so report that it
+/// no longer holds rather than overriding it silently — which is also the only
+/// thing that makes the `Float16` case audible at all.
+///
+/// ⚠️ This deliberately does **not** use
+/// [`crate::rewrite_helpers::encoding_for_canonicalized`], despite asking a
+/// nearly identical question. That helper is written for the rewrite ops, where
+/// a value of 2³² is equally the f32 image of a decoded on-disk `u32::MAX`, so
+/// it keeps `Uint32` and lets `as u32` saturate — preserving a format-valid
+/// archive at the cost of writing a genuine sum one low.
+///
+/// Here that ambiguity is resolved, and by the detection this op already did
+/// rather than by where the values came from. (They are *not* guaranteed
+/// decode-free: a CellBender `data` dataset stored as `u32` is read through
+/// `v as f32`, so a stored `u32::MAX` arrives here as 2³² just as it would off
+/// an SCX shard.) The argument is narrower and holds: `layer_wide` was chosen by
+/// [`detect_value_encoding`] over the **pre-canonical** values, and that
+/// detector sends anything above `u32::MAX` — 2³² included — to `Float32`. So if
+/// `layer_wide` is `Uint32`, no source value was the 2³² alias, and a 2³²
+/// appearing after canonicalization was necessarily produced by summing. Writing
+/// it `Uint32` would be silent corruption with the evidence in hand to avoid it.
+///
+/// A *pinned* `Uint32` gets no such guarantee — detection never ran — so a
+/// source value of 2³² is reported rather than saturated. That is a deliberate
+/// fail-loud on a path with no production caller.
+fn shard_value_encoding(
+    layer_wide: ValueEncoding,
+    pinned: bool,
+    values: &[f32],
+    layer_name: &str,
+    shard_idx: usize,
+) -> Result<ValueEncoding> {
+    if encoding_holds(layer_wide, values) {
+        return Ok(layer_wide);
+    }
+    // Reported by magnitude: a `Float16` shard overflows at its *negative* end
+    // too, and a signed max folded from `0.0` names `0` for exactly that case.
+    let worst = values
+        .iter()
+        .copied()
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+        .unwrap_or(0.0);
+    let needed = detect_value_encoding(values);
+    if pinned {
+        return Err(OpsError::InvalidInput(format!(
+            "layer '{layer_name}' shard {shard_idx}: value_encoding is pinned to \
+             {layer_wide:?}, but canonicalization sums duplicate coordinates and this \
+             shard reaches {worst}, which needs {needed:?}. Drop the pin to let each \
+             shard widen to what it holds, or pre-sum the duplicate coordinates in \
+             the source."
+        )));
+    }
+    Ok(needed)
+}
+
+/// The wider of two encodings this op actually wrote, for the summary's single
+/// `value_encoding` field.
+///
+/// Every shard is either `layer_wide` or [`detect_value_encoding`]'s answer, so
+/// the only pairs reaching here are drawn from `Uint8 < Uint16 < Uint32 <
+/// Float32` plus a pinned `Float16` — and a pinned encoding errors rather than
+/// varying, so `Float16` never appears alongside a different value.
+fn widest_written(a: ValueEncoding, b: ValueEncoding) -> ValueEncoding {
+    let rank = |e: ValueEncoding| match e {
+        ValueEncoding::Uint8 => 0,
+        ValueEncoding::Uint16 => 1,
+        ValueEncoding::Uint32 => 2,
+        ValueEncoding::Float16 => 3,
+        ValueEncoding::Float32 => 4,
+    };
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// Does `encoding` hold every one of `values` exactly, without saturating?
+///
+/// The integer bounds are compared in `f64` and are **exclusive of 2³²** for
+/// `Uint32`, unlike [`ValueEncoding::encode_f32`], which accepts 2³² and
+/// saturates it. That leniency exists for the rewrite seam, where 2³² may be a
+/// decoded `u32::MAX`; on fresh values it would write `u32::MAX` for a sum of
+/// 2³² and report success.
+fn encoding_holds(encoding: ValueEncoding, values: &[f32]) -> bool {
+    values.iter().all(|&v| {
+        let v = v as f64;
+        match encoding {
+            ValueEncoding::Uint8 => (0.0..=u8::MAX as f64).contains(&v) && v.fract() == 0.0,
+            ValueEncoding::Uint16 => (0.0..=u16::MAX as f64).contains(&v) && v.fract() == 0.0,
+            ValueEncoding::Uint32 => (0.0..=u32::MAX as f64).contains(&v) && v.fract() == 0.0,
+            // f16's finite range, as a magnitude.
+            ValueEncoding::Float16 => v.abs() <= 65504.0,
+            ValueEncoding::Float32 => true,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -622,12 +743,25 @@ fn attach_external_layer_inner(
         // would overstate nnz exactly when the source has explicit zeros or
         // duplicate coordinates, and the preview would disagree with the
         // import it is meant to predict.
+        //
+        // The encoding goes through the same decision for the same reason: the
+        // write loop refuses a pinned encoding the canonicalized sums outgrow,
+        // so a preview that returned `Ok` would send the caller into the one
+        // failure it was asked to find.
         summary.obsm_keys_added = obsm_batches.iter().map(|(k, _)| k.clone()).collect();
-        for (row_start, row_end) in &shard_ranges {
+        for (shard_idx, (row_start, row_end)) in shard_ranges.iter().enumerate() {
             let (mut i, mut j, mut v) =
                 gather_shard(data, &row_join, &col_map, *row_start, *row_end);
             scx_sparse::canonicalize_csr(&mut i, &mut j, &mut v);
             summary.layer_nnz += *i.last().unwrap_or(&0);
+            let shard_ve = shard_value_encoding(
+                value_encoding,
+                opts.value_encoding.is_some(),
+                &v,
+                &opts.layer_name,
+                shard_idx,
+            )?;
+            summary.value_encoding = widest_written(summary.value_encoding, shard_ve);
         }
         return Ok(summary);
     }
@@ -690,6 +824,20 @@ fn attach_external_layer_inner(
         // actually written rather than the pre-dedup input.
         summary.layer_nnz += *s_indptr.last().unwrap_or(&0);
 
+        // Likewise decided after canonicalization: the sums are what has to fit,
+        // not the values the layer-wide encoding was detected from.
+        let shard_ve = shard_value_encoding(
+            value_encoding,
+            opts.value_encoding.is_some(),
+            &s_values,
+            &opts.layer_name,
+            shard_idx,
+        )?;
+        // Running widest, so the summary's single field reports an encoding the
+        // file actually uses — folded from the encoding just chosen rather than
+        // re-derived from the values, which would scan every shard twice.
+        summary.value_encoding = widest_written(summary.value_encoding, shard_ve);
+
         let section = encode_one_shard_with_value_encoding(
             &s_indptr,
             &s_indices,
@@ -702,7 +850,7 @@ fn attach_external_layer_inner(
             modality_type,
             format!("{}_shard_{}", opts.layer_name, shard_idx),
             framing,
-            Some(value_encoding),
+            Some(shard_ve),
         )?;
         writer.write_preencoded_shard(section)?;
     }

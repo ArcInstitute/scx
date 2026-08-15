@@ -203,12 +203,16 @@ fn rewrite_with_current_version(
         // old width either refuses outright (`Uint8` rejects 200 + 200 = 400,
         // failing on exactly the input this op exists to repair) or, for
         // `Float16`, silently yields infinity. Widen to what the result needs.
-        let ve = if !scx_sparse::is_canonical_csr(&indptr_u64, &indices_u32, &data) {
+        let (ve, ci) = if !scx_sparse::is_canonical_csr(&indptr_u64, &indices_u32, &data) {
             scx_sparse::canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut data);
             csr_was_rewritten = true;
-            scx_ops::encoding_for_canonicalized(ve, &data)
+            let widened = scx_ops::encoding_for_canonicalized(ve, &data);
+            // Widening can land on `Float32`, which `Scx1` cannot encode;
+            // `write_csr_shard` passes the codec through unchanged, so the
+            // downgrade has to happen here or the upgrade dies FloatWithScx1.
+            (widened, scx_ops::codec_for_canonicalized(ci, widened))
         } else {
-            ve
+            (ve, ci)
         };
         let raw_values = ve.encode_f32_batch(&data)?;
 
@@ -858,6 +862,195 @@ mod tests {
             vec![400.0],
             "the summed value must survive intact, not saturate or error"
         );
+    }
+
+    /// Widening past `Uint32` lands on `Float32`, and `Scx1` encodes integers
+    /// only — so the widened encoding has to drag the codec with it. The
+    /// `encode_one_shard*` path does that downgrade itself
+    /// (`scx-format-io/src/encoder.rs`), but `write_csr_shard` /
+    /// `write_layer_csr_shard` take the codec they are given and hand it
+    /// straight to `encode_shard_adaptive`, which returns `FloatWithScx1`.
+    /// So the arm that exists to *avoid* aborting the upgrade would abort it.
+    ///
+    /// `2_500_000_000 + 2_500_000_000` is exact in f32 both before and after
+    /// summing (each is a multiple of its binade's ULP), so the fixture tests
+    /// the codec transition and nothing else.
+    #[test]
+    fn upgrade_pairs_a_widened_float_encoding_with_a_codec_that_can_hold_it() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("scx1_u32_overflow.scx");
+        let (n_obs, n_vars) = (1usize, 3usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        let half = 2_500_000_000u32;
+        let raw: Vec<u8> = [half, half].iter().flat_map(|v| v.to_le_bytes()).collect();
+        w.write_csr_shard(
+            &[0u64, 2],
+            &[1u32, 1],
+            &raw,
+            CodecId::Scx1,
+            ValueEncoding::Uint32,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false).expect(
+            "a Uint32 sum past 2³² must widen to Float32 AND drop Scx1, not fail FloatWithScx1",
+        );
+
+        let out = ScxReader::open(&output).unwrap();
+        let entry = out.catalog().shards_sorted()[0];
+        let sh = out.read_shard_header(entry).unwrap();
+        assert_eq!(
+            ValueEncoding::from_u8(sh.value_encoding),
+            Some(ValueEncoding::Float32)
+        );
+        assert_ne!(
+            CodecId::from_u8(sh.codec_id),
+            Some(CodecId::Scx1),
+            "Scx1 cannot encode a float value encoding"
+        );
+        assert_eq!(out.read_all_csr_shards().unwrap().data, vec![5e9]);
+    }
+
+    /// The layer twin of the above, and the more exposed of the two: the X loop
+    /// only runs the ladder when `is_canonical_csr` says the shard needs
+    /// rewriting, but `copy_layers` runs it on **every** layer shard whenever
+    /// `canonicalize` is set — so a layer reaches the widening arm on inputs the
+    /// X path never would.
+    #[test]
+    fn upgrade_pairs_a_widened_layer_encoding_with_a_codec_that_can_hold_it() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("scx1_layer_overflow.scx");
+        let (n_obs, n_vars) = (1usize, 3usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        w.write_csr_shard(
+            &[0u64, 1],
+            &[0u32],
+            &[1u8],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        let half = 2_500_000_000u32;
+        let raw: Vec<u8> = [half, half].iter().flat_map(|v| v.to_le_bytes()).collect();
+        w.write_layer_csr_shard(
+            &[0u64, 2],
+            &[1u32, 1],
+            &raw,
+            CodecId::Scx1,
+            ValueEncoding::Uint32,
+            0,
+            "counts",
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false)
+            .expect("a layer shard widened to Float32 must drop Scx1, not fail FloatWithScx1");
+
+        let out = ScxReader::open(&output).unwrap();
+        // The header, not just the decoded value: a decode-only assertion still
+        // passes if the shard were written Float32 under some other wrong codec.
+        let entry = out
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == scx_format_io::section::SectionType::LayerCsrShard)
+            .expect("the upgraded file must carry the layer shard");
+        let sh = out.read_shard_header(entry).unwrap();
+        assert_eq!(
+            ValueEncoding::from_u8(sh.value_encoding),
+            Some(ValueEncoding::Float32)
+        );
+        assert_ne!(CodecId::from_u8(sh.codec_id), Some(CodecId::Scx1));
+        assert_eq!(out.read_layer("counts").unwrap().data, vec![5e9]);
+    }
+
+    /// `u32::MAX as f32` **is** 2³², so a decoded on-disk `u32::MAX` is
+    /// indistinguishable from a canonicalized sum that reached 2³². Re-encoding
+    /// it as `Uint32` saturates it back to exactly `u32::MAX`, which makes the
+    /// rewrite lossless for that value; widening to `Float32` instead writes
+    /// 2³², which is one larger and no longer fits `u32` at all — so a file that
+    /// read fine as `uint32` stops doing so after an upgrade that was supposed
+    /// to preserve it. The widening arm must therefore trigger strictly *above*
+    /// 2³², not at it.
+    ///
+    /// The shard is non-canonical (unsorted indices) so the ladder actually
+    /// runs; a canonical shard never reaches it on the X path.
+    #[test]
+    fn upgrade_does_not_widen_a_decoded_u32_max_into_a_value_u32_cannot_hold() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use scx_sparse::materialize::{MaterializePlan, ValueBuffer, ValueDtype};
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("u32_max.scx");
+        let (n_obs, n_vars) = (1usize, 3usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        let raw: Vec<u8> = [u32::MAX, 5u32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        w.write_csr_shard(
+            &[0u64, 2],
+            &[2u32, 1], // descending: forces canonicalization
+            &raw,
+            CodecId::None,
+            ValueEncoding::Uint32,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        let entry = out.catalog().shards_sorted()[0];
+        let sh = out.read_shard_header(entry).unwrap();
+        assert_eq!(
+            ValueEncoding::from_u8(sh.value_encoding),
+            Some(ValueEncoding::Uint32),
+            "a format-valid Uint32 archive must not be rewritten as float"
+        );
+
+        let plan = MaterializePlan {
+            data_dtype: ValueDtype::U32,
+            ..MaterializePlan::default_csr_f32()
+        };
+        let typed = out
+            .read_all_csr_shards_typed(&plan)
+            .expect("the upgraded file must still read as uint32");
+        match typed.values {
+            ValueBuffer::U32(v) => assert!(
+                v.contains(&u32::MAX),
+                "u32::MAX did not survive the upgrade: {v:?}"
+            ),
+            other => panic!("expected a u32 buffer, got {other:?}"),
+        }
     }
 
     /// The unit-level statement of the same rule, including the `Float16` arm —

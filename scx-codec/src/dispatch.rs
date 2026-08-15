@@ -169,18 +169,29 @@ impl ValueEncoding {
                 // On the *detect* path, fresh out-of-range data is caught
                 // upstream by `detect_value_encoding`, which sends anything
                 // above `u32::MAX` to `Float32` so this arm is never selected
-                // for it. That is not every caller: anything passing an
-                // explicit encoding bypasses the detector, and two in-tree
-                // writers can hand a fresh 2³² here after detection —
-                // `scx_ops::rewrite_helpers::encoding_for_canonicalized`
-                // (whose ladder stops at `Uint32`, so a canonicalized sum of
-                // duplicate coordinates past `u32::MAX` keeps it), and
-                // `attach_external_layer` (detects once, then canonicalizes
-                // per shard and re-encodes under the detected encoding). Those
-                // still saturate silently, exactly as they did before this
-                // module gained the comment. Closing that needs the rewrite
-                // paths to carry native `u32` instead of round-tripping
-                // through `f32`, which is a separate change.
+                // for it. `attach_external_layer`, which re-derives each
+                // shard's encoding after canonicalizing, applies that same
+                // fresh-data rule and so never selects this arm either.
+                //
+                // `scx_ops::encoding_for_canonicalized` is the deliberate
+                // exception and arrives here **on purpose**: its values may
+                // have come off disk, where an f32 of exactly 2³² is the image
+                // of a stored `u32::MAX`, so it keeps `Uint32` precisely to get
+                // the saturation above — which restores the original value.
+                // Do not "fix" it to divert at 2³²; this arm is what makes a
+                // rewrite of such an archive lossless. Strictly above 2³² it
+                // does divert, since no `u32` decodes there.
+                //
+                // What remains: a caller passing an explicit encoding bypasses
+                // every detector and still saturates.
+                //
+                // Separately, this arm cannot see the loss that happens
+                // *before* it. The rewrite paths decode integer shards to
+                // `f32`, so any on-disk `u32` above 2²⁴ is already rounded by
+                // the time it arrives; 2³² saturation is the tail of that, not
+                // its own bug. Closing it needs the rewrite paths to carry
+                // native `u32` instead of round-tripping through `f32`, which
+                // is a separate change.
                 //
                 // `contains` (not `<=`) so NaN is rejected rather than written
                 // as 0.
