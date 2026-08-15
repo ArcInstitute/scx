@@ -1526,3 +1526,364 @@ mod query_lookup_tests {
         assert!(!index_covers_all_obs(&idx, &[(0, 0, 10)], 10));
     }
 }
+
+// ===========================================================================
+// Numeric index size — one leaf entry per shard, not one per row
+// ===========================================================================
+//
+// The numeric B+ tree's leaf entries are read by exactly two consumers, and
+// both fold them to shard granularity on the spot: `derive_shard_column_stats`
+// (per-shard `ColumnStat::MinMax`, which is what Level-1 pruning reads) and
+// `max_covered_global_row` (per-shard max `row_end`, which is what
+// `index_covers_all_obs` reads). `eval_rowset` returns `None` for every
+// numeric operator and there is no range-lookup method, so nothing else ever
+// sees a leaf. Emitting one leaf per *row* therefore buys nothing and costs
+// 28 B/row on disk plus a whole-axis accumulator in memory.
+
+/// The value at obs row `row` of the fixture column, for `n` rows.
+///
+/// `STRIDE` is coprime with every `n` used below, so this is a permutation of
+/// `0..n` — all-distinct values in an order unrelated to row order. That
+/// ordering is the whole point of the fixture. The old builder sorted by
+/// value and merged two leaf entries only when rows adjacent in *value* order
+/// were also adjacent in *row* order, so a monotonically increasing column
+/// collapses to one entry per shard all by itself and hides the defect
+/// completely. A real `total_counts` / `pct_counts_mt` column looks like this
+/// one, not like a sorted range.
+const STRIDE: usize = 7919;
+
+fn fixture_value(row: usize, n: usize) -> f64 {
+    ((row * STRIDE) % n) as f64 * 0.5
+}
+
+fn distinct_numeric_obs_batch(n: usize) -> RecordBatch {
+    let col: ArrayRef = Arc::new(Float64Array::from_iter_values(
+        (0..n).map(|i| fixture_value(i, n)),
+    ));
+    let schema = Schema::new(vec![Field::new("n_counts", DataType::Float64, true)]);
+    RecordBatch::try_new(Arc::new(schema), vec![col]).unwrap()
+}
+
+/// The exact `(min, max)` of the fixture's values over a global row range.
+fn fixture_min_max(rows: std::ops::Range<usize>, n: usize) -> (f64, f64) {
+    rows.map(|r| fixture_value(r, n))
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        })
+}
+
+fn n_counts_opts() -> PredicateIndexBuildOptions {
+    PredicateIndexBuildOptions {
+        forced_columns: vec!["n_counts".to_string()],
+        preset_columns: vec![],
+        auto_threshold: 1000,
+        high_cardinality_threshold: 100_000,
+    }
+}
+
+/// Push `batch` through the streaming builder in fixed-size chunks, then
+/// finish against `shard_row_ranges`. `push_rows` is deliberately decoupled
+/// from the shard ranges: the two partitions agree on the convert path but
+/// not on the merge one, and the difference is load-bearing.
+fn streaming_numeric_index(
+    batch: &RecordBatch,
+    push_rows: usize,
+    shard_row_ranges: &[(u64, u64)],
+) -> PredicateIndex {
+    let mut builder = ObsPredicateIndexBuilder::new(batch.schema(), &n_counts_opts()).unwrap();
+    let mut offset = 0usize;
+    while offset < batch.num_rows() {
+        let take = push_rows.min(batch.num_rows() - offset);
+        builder
+            .push_shard(&batch.slice(offset, take), offset as u64)
+            .unwrap();
+        offset += take;
+    }
+    let mut outcomes = Vec::new();
+    let mut names = Vec::new();
+    let bytes = builder
+        .finish(shard_row_ranges, &mut outcomes, &mut names)
+        .unwrap()
+        .expect("a forced numeric column must produce an index");
+    assert!(
+        outcomes.is_empty(),
+        "unexpected build outcomes: {outcomes:?}"
+    );
+    PredicateIndex::read_from(&mut Cursor::new(&bytes)).unwrap()
+}
+
+fn batch_numeric_index(batch: &RecordBatch, shard_row_ranges: &[(u64, u64)]) -> PredicateIndex {
+    let mut outcomes = Vec::new();
+    let mut names = Vec::new();
+    let bytes = build_obs_predicate_index_bytes(
+        batch,
+        shard_row_ranges,
+        &n_counts_opts(),
+        &mut outcomes,
+        &mut names,
+    )
+    .unwrap()
+    .expect("a forced numeric column must produce an index");
+    assert!(
+        outcomes.is_empty(),
+        "unexpected build outcomes: {outcomes:?}"
+    );
+    PredicateIndex::read_from(&mut Cursor::new(&bytes)).unwrap()
+}
+
+fn numeric_leaf_count(index: &PredicateIndex) -> usize {
+    index
+        .columns
+        .iter()
+        .map(|c| match c {
+            IndexedColumn::Numeric(num) => num
+                .leaf_pages
+                .iter()
+                .map(|p| p.entries.len())
+                .sum::<usize>(),
+            IndexedColumn::Categorical(_) => panic!("expected a numeric column"),
+        })
+        .sum()
+}
+
+/// Per-shard `(min, max)` as Level-1 pruning will actually see it.
+fn min_max_per_shard(index: &PredicateIndex, n_shards: usize) -> Vec<Option<(f64, f64)>> {
+    use scx_format_io::catalog::ColumnStat;
+    derive_shard_column_stats(index, n_shards)
+        .into_iter()
+        .map(|stats| {
+            stats.into_iter().find_map(|s| match s {
+                ColumnStat::MinMax { min, max, .. } => Some((min, max)),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+const N_ROWS: usize = 200_000;
+const N_SHARDS: usize = 4;
+const SHARD_ROWS: usize = N_ROWS / N_SHARDS;
+
+fn aligned_shard_ranges() -> Vec<(u64, u64)> {
+    (0..N_SHARDS)
+        .map(|s| ((s * SHARD_ROWS) as u64, ((s + 1) * SHARD_ROWS) as u64))
+        .collect()
+}
+
+/// The finding. A 200k-row distinct numeric column across 4 shards must
+/// produce **4** leaf entries — one per shard, which is all either consumer
+/// can use. Before the fix it produced one per row.
+#[test]
+fn numeric_index_emits_one_leaf_entry_per_shard() {
+    let batch = distinct_numeric_obs_batch(N_ROWS);
+    let ranges = aligned_shard_ranges();
+
+    let streaming = numeric_leaf_count(&streaming_numeric_index(&batch, SHARD_ROWS, &ranges));
+    assert_eq!(
+        streaming, N_SHARDS,
+        "streaming builder emitted {streaming} leaf entries for {N_ROWS} rows across \
+         {N_SHARDS} shards — the leaves are per-row, and every consumer folds them \
+         to per-shard anyway"
+    );
+
+    let batched = numeric_leaf_count(&batch_numeric_index(&batch, &ranges));
+    assert_eq!(
+        batched, N_SHARDS,
+        "batch builder emitted {batched} leaf entries for {N_ROWS} rows across \
+         {N_SHARDS} shards"
+    );
+}
+
+/// The disk half of the same finding, pinned independently of the entry
+/// count: a `NumericLeafEntry` is 28 B on the wire, so a per-row index over
+/// 200k rows is ~5.6 MB. Per-shard it is a few hundred bytes. Scaled to a
+/// 50M-cell atlas the difference is ~1.4 GB per indexed numeric column.
+#[test]
+fn numeric_index_section_does_not_scale_with_rows() {
+    let batch = distinct_numeric_obs_batch(N_ROWS);
+    let ranges = aligned_shard_ranges();
+    let mut builder = ObsPredicateIndexBuilder::new(batch.schema(), &n_counts_opts()).unwrap();
+    let mut offset = 0usize;
+    while offset < N_ROWS {
+        builder
+            .push_shard(&batch.slice(offset, SHARD_ROWS), offset as u64)
+            .unwrap();
+        offset += SHARD_ROWS;
+    }
+    let bytes = builder
+        .finish(&ranges, &mut Vec::new(), &mut Vec::new())
+        .unwrap()
+        .expect("a forced numeric column must produce an index");
+    assert!(
+        bytes.len() < 4096,
+        "numeric index section is {} B for {N_ROWS} rows across {N_SHARDS} shards; \
+         it must be bounded by the shard count, not the row count",
+        bytes.len()
+    );
+}
+
+/// The two builders must fold to the same per-shard stats. The batch builder
+/// has the whole column and the shard ranges in hand and stays exact; the
+/// streaming one summarises. With the push partition aligned to the shard
+/// partition — the convert / append / modify_metadata shape — they must agree
+/// exactly, or a row-sharded atlas prunes differently from a small file.
+#[test]
+fn streaming_and_batch_numeric_indexes_agree_on_shard_stats() {
+    let batch = distinct_numeric_obs_batch(N_ROWS);
+    let ranges = aligned_shard_ranges();
+    let streaming = min_max_per_shard(
+        &streaming_numeric_index(&batch, SHARD_ROWS, &ranges),
+        N_SHARDS,
+    );
+    let batched = min_max_per_shard(&batch_numeric_index(&batch, &ranges), N_SHARDS);
+    assert_eq!(
+        streaming, batched,
+        "streaming and batch per-shard MinMax diverge"
+    );
+}
+
+/// …and that shared answer must be the *exact* per-shard range, not merely a
+/// sound superset. A fix that widened everywhere would still satisfy the
+/// no-false-prune property while quietly destroying pruning power.
+#[test]
+fn numeric_index_min_max_is_exact_when_pushes_align() {
+    let batch = distinct_numeric_obs_batch(N_ROWS);
+    let ranges = aligned_shard_ranges();
+    let got = min_max_per_shard(
+        &streaming_numeric_index(&batch, SHARD_ROWS, &ranges),
+        N_SHARDS,
+    );
+    let want: Vec<Option<(f64, f64)>> = (0..N_SHARDS)
+        .map(|s| {
+            Some(fixture_min_max(
+                s * SHARD_ROWS..(s + 1) * SHARD_ROWS,
+                N_ROWS,
+            ))
+        })
+        .collect();
+    assert_eq!(got, want);
+}
+
+/// The merge shape: the shard partition is only known at `finish`
+/// (`merge.rs` builds `output_shard_row_ranges` while the builder is already
+/// accumulating), so pushes need not align with it. A summary block that
+/// straddles a shard boundary contributes its bounds to both shards.
+///
+/// That widening is only allowed in the safe direction. Level-1 pruning skips
+/// a shard when the probe value falls outside `[min, max]`, so a **wider**
+/// bound can only fail to prune — never prune a shard that holds a match.
+/// This asserts both halves: containment (no false prune) and a bound on how
+/// far the widening can reach (no collapse into a useless global range).
+#[test]
+fn straddling_pushes_widen_min_max_but_never_prune_a_matching_shard() {
+    // Boundaries deliberately co-prime with the summary block size, so every
+    // one of them falls strictly inside a block.
+    const N: usize = 20_004;
+    const BLOCK: usize = NUMERIC_BLOCK_ROWS as usize;
+    let bounds = [0usize, 5001, 10002, 15003, N];
+    let ranges: Vec<(u64, u64)> = bounds
+        .windows(2)
+        .map(|w| (w[0] as u64, w[1] as u64))
+        .collect();
+    let batch = distinct_numeric_obs_batch(N);
+    // One push covering everything — the merge-one-input-file shape.
+    let index = streaming_numeric_index(&batch, N, &ranges);
+    let got = min_max_per_shard(&index, ranges.len());
+
+    for (s, &(start, end)) in ranges.iter().enumerate() {
+        let (start, end) = (start as usize, end as usize);
+        let (min, max) = got[s].unwrap_or_else(|| panic!("shard {s} lost its MinMax entirely"));
+        // No false prune: every value physically in this shard is inside the
+        // recorded bounds, so `Eq` on any of them cannot skip the shard.
+        let (true_min, true_max) = fixture_min_max(start..end, N);
+        assert!(
+            min <= true_min && max >= true_max,
+            "shard {s} bounds [{min}, {max}] exclude its own values \
+             [{true_min}, {true_max}] — Level-1 pruning would skip a shard \
+             that holds a match"
+        );
+        // Bounded widening: at most one summary block's worth of neighbouring
+        // rows can leak in from either side.
+        let (reach_min, reach_max) =
+            fixture_min_max(start.saturating_sub(BLOCK - 1)..(end + BLOCK - 1).min(N), N);
+        assert!(
+            min >= reach_min && max <= reach_max,
+            "shard {s} bounds [{min}, {max}] reach past one summary block \
+             beyond [{reach_min}, {reach_max}]"
+        );
+    }
+}
+
+/// Coverage must stay exactly as sound as it was. `index_covers_all_obs` is
+/// what decides whether a post-`append` index may be trusted for row-set
+/// pushdown, so a summary that claimed rows it has no value for would let a
+/// stale index answer a query. Under-claiming is safe (full-scan fallback);
+/// over-claiming is not.
+///
+/// Here the last three rows are null, so the index reaches global row 9 of 12
+/// — one past the last valued row — and no further.
+#[test]
+fn numeric_index_coverage_stops_at_the_last_valued_row() {
+    let col: ArrayRef = Arc::new(Float64Array::from(
+        (0..12)
+            .map(|i| if i < 9 { Some(i as f64) } else { None })
+            .collect::<Vec<_>>(),
+    ));
+    let schema = Schema::new(vec![Field::new("n_counts", DataType::Float64, true)]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![col]).unwrap();
+    let ranges = vec![(0u64, 6u64), (6, 12)];
+    let index = streaming_numeric_index(&batch, 6, &ranges);
+
+    let obs_ranges = [(0u32, 0u64, 6u64), (1u32, 6u64, 12u64)];
+    assert!(
+        index_covers_all_obs(&index, &obs_ranges, 9),
+        "the index must cover every row that carries a value"
+    );
+    assert!(
+        !index_covers_all_obs(&index, &obs_ranges, 10),
+        "the index must not claim coverage of a trailing null tail"
+    );
+}
+
+/// The conversion entry points restore `push_shard`'s contract on their
+/// callers' behalf.
+///
+/// The numeric accumulator summarises *within* a push, so a caller that hands
+/// the whole obs axis to one `push_shard` call while telling `finish` there
+/// are several shards would give every shard the same widened `[min, max]` —
+/// sound, but it erases exactly the Level-1 pruning the index exists for.
+/// Both conversion entry points did that: the batch one wraps obs in
+/// `iter::once`, and `compact` / `sort` push *input* shards against *output*
+/// shard ranges that a reshape has moved. `streaming_impl` re-splits instead.
+///
+/// `n_counts` is 10..13 in shard 0 and 1000..1003 in shard 1, so an unsplit
+/// push shows up immediately as shard 0 claiming a max of 1003. That both
+/// conversion entry points route through the splitter is covered end-to-end
+/// by `tests/pushdown_skip.rs::numeric_filter_skips_shard_out_of_range`.
+#[test]
+fn a_multi_shard_push_is_split_before_it_reaches_the_accumulator() {
+    use arrow::array::Int64Array;
+
+    let n_counts: ArrayRef = Arc::new(Int64Array::from(vec![
+        10i64, 11, 12, 13, 1000, 1001, 1002, 1003,
+    ]));
+    let schema = Schema::new(vec![Field::new("n_counts", DataType::Int64, false)]);
+    let obs = RecordBatch::try_new(Arc::new(schema), vec![n_counts]).unwrap();
+    let ranges = [(0u64, 4u64), (4u64, 8u64)];
+
+    let mut builder = ObsPredicateIndexBuilder::new(obs.schema(), &n_counts_opts()).unwrap();
+    // The whole axis in a single push, against a two-shard range table.
+    push_split_on_shard_boundaries(&mut builder, &obs, 0, &ranges).unwrap();
+    let bytes = builder
+        .finish(&ranges, &mut Vec::new(), &mut Vec::new())
+        .unwrap()
+        .expect("a forced numeric column must produce an index");
+    let index = PredicateIndex::read_from(&mut Cursor::new(&bytes)).unwrap();
+
+    assert_eq!(
+        min_max_per_shard(&index, 2),
+        vec![Some((10.0, 13.0)), Some((1000.0, 1003.0))],
+        "a push spanning both shards was summarised as one block, so both \
+         shards recorded the whole column's range and neither can be pruned"
+    );
+}

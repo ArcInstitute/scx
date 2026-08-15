@@ -736,10 +736,13 @@ Behaviour:
   and `append` running equivalent incremental builders — applies the cap to
   categorical columns only and always materialises a numeric index, whatever
   its cardinality. This is long-standing behaviour for plain numeric
-  columns; integer-valued categoricals now inherit it. It matters because a
-  numeric index is per-row, not per-category (see the size note below), so
-  force-listing a high-cardinality integer column on an atlas-scale streaming
-  build produces a large index where the in-memory path would have refused.
+  columns; integer-valued categoricals inherit it. What differs is only
+  *which outcomes get reported* — not the size of the result. A numeric index
+  is **one entry per shard** (that column's `[min, max]` over the shard's
+  rows), so its size is set by the shard count and a million distinct values
+  cost the same as ten. Force-listing a high-cardinality numeric column on a
+  streaming build therefore produces the same small index it would anywhere;
+  the in-memory path simply declines to build it and says so.
 - **A column is classified by what it holds, not by how it is stored.**
   pandas writes every `Categorical` as an Arrow dictionary, whatever the
   categories are, so the dictionary's *value* type decides:

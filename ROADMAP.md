@@ -184,7 +184,7 @@ and parallel shard decode (highest-impact fixes from earlier benchmarks).
 
 ### 2.3 scx-engine (predicate indexes)
 - [x] Categorical predicate index: sorted value → shard ranges
-- [x] Numeric predicate index: B+ tree for range queries
+- [x] Numeric predicate index: per-shard `[min, max]` bounds driving Level-1 shard pruning (numeric operators stay residual at Level 2 — see docs/format.md §Predicate Indexes)
 - [x] High-cardinality hash index (>10K unique values)
 - [x] Auto-indexing for low-cardinality columns (<1K unique values)
 - [x] `scx-cli` flag to specify indexed columns during conversion — `scx convert --index-obs` / `--index-var` / `--index-preset` (also on `append`/`compact`)

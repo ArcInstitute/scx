@@ -57,7 +57,14 @@ pub struct ShardRange {
     pub row_end: u32,   // exclusive
 }
 
-/// Numeric index using a B+ tree for range queries.
+/// Numeric index: a B+ tree over per-shard value bounds.
+///
+/// Writers emit one leaf entry per shard (see [`numeric_leaves_from_spans`]).
+/// Nothing navigates the tree to answer a range query — `eval_rowset` is
+/// residual for every numeric operator — so in practice this is the carrier
+/// for the per-shard `[min, max]` that Level-1 pruning reads, and the shape is
+/// a B+ tree because the wire format is. Readers accept the finer leaves
+/// older files carry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NumericIndex {
     pub column_name: String,
@@ -80,7 +87,9 @@ pub struct LeafPage {
     pub entries: Vec<NumericLeafEntry>,
 }
 
-/// A leaf entry mapping a numeric value range to a shard row range.
+/// A conservative bound on a shard row range: every value in
+/// `[row_start, row_end)` of `shard_id` lies within `[min_value, max_value]`.
+/// It does not record which row holds which value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NumericLeafEntry {
     pub min_value: f64,
@@ -1408,11 +1417,22 @@ pub fn build_obs_predicate_index_bytes(
 /// The builder accepts shards one at a time via [`Self::push_shard`]
 /// and finalises into the same serialised bytes blob at [`Self::finish`].
 ///
-/// Memory profile per indexed column matches the batch-mode path
-/// (categorical: `BTreeMap<String, Vec<u64>>` indexed by value;
-/// numeric: `Vec<(f64, u64)>` of all values). The win is that we never
-/// have to materialise the obs `RecordBatch` itself — Arrow column
-/// buffers stay shard-local and are released after each `push_shard`.
+/// Memory per indexed column: categorical accumulates
+/// `BTreeMap<String, Vec<u64>>` indexed by value, as the batch-mode path
+/// does; numeric accumulates one [`NumericSpan`] per
+/// [`NUMERIC_BLOCK_ROWS`]-row block rather than a `(value, row)` pair per row,
+/// which is what keeps an atlas-scale numeric column in the low megabytes
+/// instead of 16 B per row per column. On top of that we never have to
+/// materialise the obs `RecordBatch` itself — Arrow column buffers stay
+/// shard-local and are released after each `push_shard`.
+///
+/// **Push one shard per call.** The numeric accumulator summarises within a
+/// push, so pushing a batch that spans several of the shard ranges later
+/// handed to [`Self::finish`] gives each of them the same widened bounds —
+/// sound, but it costs the Level-1 pruning the index is for. Callers that
+/// hold the shard partition should split on it first; the streaming
+/// conversion entry point does that for its callers
+/// (`push_split_on_shard_boundaries`).
 ///
 /// Column selection works identically to the batch-mode path:
 /// - forced + preset columns are tracked from the start (even if they
@@ -1460,10 +1480,48 @@ enum ColumnSelection {
     Named,
 }
 
+/// Rows per streaming numeric summary block, counted from the start of each
+/// push.
+///
+/// The shard partition is not known until `finish` — it is *not* inherently
+/// the `push_shard` partition, and cannot be moved earlier: `scx-ops`' merge
+/// builds its output shard ranges while this builder is already accumulating.
+/// So the accumulator cannot summarise per shard directly; it summarises per
+/// fixed-size block of rows *within each push* and folds those onto shards at
+/// `finish`.
+///
+/// Blocks never span two pushes, which is what makes the block size
+/// irrelevant to precision for a caller that pushes one shard at a time: all
+/// of a push's blocks then lie inside one shard, and the fold takes min/max
+/// across them, so the result is exact at any shard size. Every caller that
+/// goes through [`build_and_write_conversion_predicate_indexes_streaming`] is
+/// in that class by construction — it re-splits each batch on the shard
+/// boundaries before pushing (see `push_split_on_shard_boundaries`) — as are
+/// append and `modify_metadata`, which chunk to the shard layout. Merge is
+/// the exception: it pushes one whole input file, so its blocks can straddle.
+///
+/// For that case the block size sets both the memory bound (one
+/// [`NumericSpan`], 32 B, per block per column — ~1.5 MB for a 50M-row axis,
+/// against 800 MB for the whole-axis `(value, row)` list this replaced) and
+/// the bound on how far a straddling block can widen a shard's recorded
+/// `[min, max]` (at most the values of the ≤ `NUMERIC_BLOCK_ROWS - 1` rows on
+/// the far side of the boundary). Widening only ever costs pruning power,
+/// never correctness — see [`numeric_leaves_from_spans`].
+const NUMERIC_BLOCK_ROWS: u64 = 1024;
+
 enum ColumnState {
-    Categorical { values: BTreeMap<String, Vec<u64>> },
-    Numeric { values: Vec<(f64, u64)> },
-    Unsupported { dtype: String },
+    Categorical {
+        values: BTreeMap<String, Vec<u64>>,
+    },
+    /// One [`NumericSpan`] per `NUMERIC_BLOCK_ROWS`-row block that carried at
+    /// least one value, in ascending row order (`push_shard` enforces that
+    /// rows arrive contiguously and in order).
+    Numeric {
+        blocks: Vec<NumericSpan>,
+    },
+    Unsupported {
+        dtype: String,
+    },
     MissingColumn,
 }
 
@@ -1492,7 +1550,7 @@ impl ObsPredicateIndexBuilder {
                         values: BTreeMap::new(),
                     }
                 } else {
-                    ColumnState::Numeric { values: Vec::new() }
+                    ColumnState::Numeric { blocks: Vec::new() }
                 };
                 columns.push(ColumnAccumulator {
                     name: field.name().clone(),
@@ -1532,7 +1590,7 @@ impl ObsPredicateIndexBuilder {
                                 true,
                             )
                         } else if is_numeric_type(dt) {
-                            (ColumnState::Numeric { values: Vec::new() }, true)
+                            (ColumnState::Numeric { blocks: Vec::new() }, true)
                         } else {
                             (
                                 ColumnState::Unsupported {
@@ -1574,6 +1632,12 @@ impl ObsPredicateIndexBuilder {
     /// cover (no gap, no overlap) of the obs axis. The builder
     /// verifies the order against [`Self::rows_pushed`] but trusts
     /// the caller's `shard_row_offset` for correctness.
+    ///
+    /// A `batch` should not span more than one of the shard ranges passed to
+    /// [`Self::finish`] — nothing enforces it, and the categorical side is
+    /// insensitive to it, but the numeric side summarises per push and will
+    /// hand every spanned shard the same widened bounds. See the type-level
+    /// docs.
     pub fn push_shard(
         &mut self,
         batch: &arrow::array::RecordBatch,
@@ -1641,13 +1705,41 @@ impl ObsPredicateIndexBuilder {
                         }
                     }
                 }
-                ColumnState::Numeric { values } => {
+                ColumnState::Numeric { blocks } => {
+                    // Fold into the open block, opening a new one whenever the
+                    // row crosses a block boundary. Blocks are counted from
+                    // the start of *this push*, never across pushes: where the
+                    // caller's push partition is the shard partition — convert,
+                    // append's raw-copy path, modify_metadata — that makes
+                    // every block shard-local and the resulting bounds exact,
+                    // however small the shards are. Only a caller that pushes
+                    // across shard boundaries (merge, one input file per push)
+                    // can produce a straddling block.
+                    let mut open_block: Option<u64> = None;
                     for i in 0..n_rows {
                         if array.is_null(i) {
                             continue;
                         }
-                        if let Some(v) = extract_numeric_value(array, i) {
-                            values.push((v, shard_row_offset + i as u64));
+                        let Some(v) = extract_numeric_value(array, i) else {
+                            continue;
+                        };
+                        let row = shard_row_offset + i as u64;
+                        let block = i as u64 / NUMERIC_BLOCK_ROWS;
+                        match blocks.last_mut() {
+                            Some(open) if open_block == Some(block) => {
+                                open.min = open.min.min(v);
+                                open.max = open.max.max(v);
+                                open.last_row = row;
+                            }
+                            _ => {
+                                blocks.push(NumericSpan {
+                                    min: v,
+                                    max: v,
+                                    first_row: row,
+                                    last_row: row,
+                                });
+                                open_block = Some(block);
+                            }
                         }
                     }
                 }
@@ -1775,33 +1867,36 @@ impl ObsPredicateIndexBuilder {
                         auto_mode_index_count += 1;
                     }
                 }
-                ColumnState::Numeric { values } => {
+                ColumnState::Numeric { blocks } => {
                     // Intentional no-op: numeric columns always build a
                     // B+ tree regardless of cardinality, so unlike the
                     // categorical path there's no "skip on high
                     // cardinality" branch. The condition is kept (as
                     // a `let _` below) only so future readers see that
-                    // we considered cardinality and chose to ignore
-                    // it — `values.len()` is the row count, not the
-                    // distinct count (numeric accumulators don't
-                    // dedupe), so a cardinality check here would be
-                    // misleading anyway.
+                    // we considered cardinality and chose to ignore it.
                     //
-                    // NOTE: this does **not** match batch-mode behaviour.
-                    // `build_predicate_index_bytes_inner` applies
+                    // There is nothing left for a cap to bound: the index is
+                    // one leaf entry per shard whatever the column holds, so
+                    // a million distinct values and ten cost the same bytes.
+                    // (`blocks.len()` isn't a cardinality either — it is the
+                    // number of `NUMERIC_BLOCK_ROWS`-row blocks that carried
+                    // a value — so a check here would be doubly misleading.)
+                    //
+                    // NOTE: this still does **not** match batch-mode
+                    // behaviour. `build_predicate_index_bytes_inner` applies
                     // `high_cardinality_threshold` to every column before
                     // the categorical/numeric split, so a high-cardinality
-                    // numeric column is skipped there and indexed here.
-                    // Pre-existing for plain numeric columns; integer-valued
-                    // categoricals now inherit it. Unifying the two changes
-                    // behaviour for existing numeric columns on the
-                    // streaming path, so it is left alone and documented
-                    // (docs/api.md) rather than changed here.
+                    // numeric column is skipped there and indexed here. What
+                    // survives of that divergence is only which *outcomes*
+                    // get reported, not an index-size difference; unifying it
+                    // would change what the batch path reports, so it is left
+                    // alone and documented (docs/api.md) rather than changed
+                    // here.
                     let _ = matches!(selection, ColumnSelection::Named)
-                        && values.len() > self.options.high_cardinality_threshold;
-                    indexed.push(IndexedColumn::Numeric(numeric_index_from_values(
+                        && blocks.len() > self.options.high_cardinality_threshold;
+                    indexed.push(IndexedColumn::Numeric(numeric_index_from_spans(
                         &name,
-                        values,
+                        blocks.into_iter(),
                         shard_row_ranges,
                         64,
                     )));
@@ -1835,54 +1930,111 @@ impl ObsPredicateIndexBuilder {
     }
 }
 
-/// Pre-collected variant of [`build_numeric_index`] used by the
-/// streaming builder. Identical algorithm — only the source of the
-/// `(value, global_row)` pairs differs.
-fn numeric_index_from_values(
+/// One conservative summary of a contiguous run of obs rows: `[min, max]`
+/// bounds every valued row in `[first_row, last_row]`, in **global** row
+/// space. Rows in between that carry no value simply do not narrow it.
+///
+/// This is the single input shape both numeric builders reduce to. The batch
+/// builder emits one span per valued row (so it stays exact); the streaming
+/// builder emits one per fixed-size block of rows (so its memory is bounded).
+#[derive(Debug, Clone, Copy)]
+struct NumericSpan {
+    min: f64,
+    max: f64,
+    first_row: u64,
+    last_row: u64,
+}
+
+/// Fold row-ordered spans into **one [`NumericLeafEntry`] per shard**.
+///
+/// Per-shard is the granularity the leaves are actually consumed at:
+/// [`derive_shard_column_stats`] folds them to a per-shard
+/// `ColumnStat::MinMax` (what Level-1 pruning reads) and
+/// [`PredicateIndex::max_covered_global_row`] takes the per-shard maximum
+/// `row_end` (what [`index_covers_all_obs`] reads). No query path ever looks
+/// at an individual leaf — `eval_rowset` is residual for every numeric
+/// operator and there is no range-lookup method — so emitting finer leaves
+/// only costs bytes. Before this was per-shard, a continuous obs column
+/// produced ~1 leaf per row (28 B each on the wire): ~1.4 GB for a single
+/// indexed numeric column on a 50M-cell atlas.
+///
+/// A span that straddles a shard boundary contributes its bounds to **both**
+/// shards. That widening is sound in the only direction that matters:
+/// Level-1 pruning excludes a shard when the probe falls outside
+/// `[min, max]`, so a wider bound can only fail to prune, never prune a
+/// shard that holds a match.
+///
+/// The row range is clamped to `[first_row, last_row + 1]` rather than to the
+/// span's full extent, which is what keeps **coverage** exact. A span whose
+/// valued rows all sit on one side of a boundary yields `lo >= hi` on the
+/// other side and contributes nothing there, so `max_covered_global_row` can
+/// never claim a row that carried no value. Under-claiming coverage is safe
+/// (the query falls back to a full obs scan); over-claiming would let a
+/// stale post-`append` index be trusted.
+fn numeric_leaves_from_spans(
+    spans: impl Iterator<Item = NumericSpan>,
+    shard_row_ranges: &[(u64, u64)],
+) -> Vec<NumericLeafEntry> {
+    let mut acc: Vec<Option<NumericLeafEntry>> = vec![None; shard_row_ranges.len()];
+
+    for span in spans {
+        // Linear scan, matching `global_row_to_shard`'s posture: the ranges
+        // are ascending and disjoint at every call site, but nothing in the
+        // signature promises it, so don't binary-search on the assumption.
+        for (i, &(s_start, s_end)) in shard_row_ranges.iter().enumerate() {
+            let lo = span.first_row.max(s_start);
+            let hi = (span.last_row + 1).min(s_end);
+            if lo >= hi {
+                continue;
+            }
+            let row_start = (lo - s_start) as u32;
+            let row_end = (hi - s_start) as u32;
+            match &mut acc[i] {
+                Some(entry) => {
+                    entry.min_value = entry.min_value.min(span.min);
+                    entry.max_value = entry.max_value.max(span.max);
+                    entry.row_start = entry.row_start.min(row_start);
+                    entry.row_end = entry.row_end.max(row_end);
+                }
+                slot @ None => {
+                    *slot = Some(NumericLeafEntry {
+                        min_value: span.min,
+                        max_value: span.max,
+                        shard_id: i as u32,
+                        row_start,
+                        row_end,
+                    })
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<NumericLeafEntry> = acc.into_iter().flatten().collect();
+    // Value order, so `build_internal_pages`' split keys (each page's first
+    // `min_value`) partition the tree the way a B+ tree's do.
+    entries.sort_by(|a, b| {
+        a.min_value
+            .partial_cmp(&b.min_value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    entries
+}
+
+/// Assemble a [`NumericIndex`] from row-ordered spans — the shared tail of
+/// both builders.
+fn numeric_index_from_spans(
     column_name: &str,
-    mut value_rows: Vec<(f64, u64)>,
+    spans: impl Iterator<Item = NumericSpan>,
     shard_row_ranges: &[(u64, u64)],
     fanout: u16,
 ) -> NumericIndex {
-    value_rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    if value_rows.is_empty() {
-        return NumericIndex {
-            column_name: column_name.to_string(),
-            fanout,
-            internal_pages: vec![],
-            leaf_pages: vec![],
-        };
-    }
-
-    let mut leaf_entries: Vec<NumericLeafEntry> = Vec::new();
-    for &(val, global_row) in &value_rows {
-        let Some((shard_id, local_row)) = global_row_to_shard(global_row, shard_row_ranges) else {
-            continue;
-        };
-        if let Some(last) = leaf_entries.last_mut() {
-            if last.shard_id == shard_id && local_row == last.row_end {
-                last.max_value = val;
-                last.row_end = local_row + 1;
-                continue;
-            }
-        }
-        leaf_entries.push(NumericLeafEntry {
-            min_value: val,
-            max_value: val,
-            shard_id,
-            row_start: local_row,
-            row_end: local_row + 1,
-        });
-    }
-
+    let leaf_entries = numeric_leaves_from_spans(spans, shard_row_ranges);
     let leaf_pages: Vec<LeafPage> = leaf_entries
         .chunks(fanout as usize)
         .map(|chunk| LeafPage {
             entries: chunk.to_vec(),
         })
         .collect();
-
     let internal_pages = build_internal_pages(&leaf_pages, fanout);
 
     NumericIndex {
@@ -2013,6 +2165,52 @@ pub fn build_and_write_conversion_predicate_indexes_streaming(
     )
 }
 
+/// Feed `batch` to the builder as one `push_shard` call **per shard it
+/// covers**, splitting it wherever a `shard_row_ranges` boundary falls inside
+/// it.
+///
+/// `push_shard` means what it says, and callers of the streaming entry points
+/// do not all honour it: the batch delegate pushes the whole obs axis in one
+/// call, and `compact` / `sort` push *input* shards while `finish` is handed
+/// the *output* shard ranges, which a reshape moves. The builder's numeric
+/// accumulator summarises within a push, so a push spanning several shards
+/// hands every one of them the same widened `[min, max]` — sound, but it
+/// erases the Level-1 pruning the index exists to provide. Since this
+/// function holds the shard partition, it can restore the contract for every
+/// caller at once, which is cheaper and less error-prone than fixing each.
+///
+/// `RecordBatch::slice` shares Arrow buffers, so the split is O(1) per piece.
+fn push_split_on_shard_boundaries(
+    builder: &mut ObsPredicateIndexBuilder,
+    batch: &arrow::array::RecordBatch,
+    row_offset: u64,
+    shard_row_ranges: &[(u64, u64)],
+) -> Result<()> {
+    let n_rows = batch.num_rows() as u64;
+    if n_rows == 0 {
+        return builder.push_shard(batch, row_offset);
+    }
+    let end = row_offset + n_rows;
+
+    let mut cuts: Vec<u64> = shard_row_ranges
+        .iter()
+        .flat_map(|&(start, stop)| [start, stop])
+        .filter(|&b| b > row_offset && b < end)
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut cursor = row_offset;
+    for cut in cuts.into_iter().chain(std::iter::once(end)) {
+        builder.push_shard(
+            &batch.slice((cursor - row_offset) as usize, (cut - cursor) as usize),
+            cursor,
+        )?;
+        cursor = cut;
+    }
+    Ok(())
+}
+
 fn streaming_impl(
     writer: &mut scx_format_io::ScxWriter,
     obs_schema: arrow::datatypes::SchemaRef,
@@ -2058,7 +2256,7 @@ fn streaming_impl(
     let mut builder = ObsPredicateIndexBuilder::new(obs_schema, &obs_build_opts)?;
     for shard in obs_shards {
         let (batch, row_offset) = shard?;
-        builder.push_shard(&batch, row_offset)?;
+        push_split_on_shard_boundaries(&mut builder, &batch, row_offset, obs_row_ranges)?;
     }
     let obs_bytes = builder.finish(
         obs_row_ranges,
@@ -2235,78 +2433,34 @@ pub fn build_categorical_index(
     }
 }
 
-/// Build a numeric B+ tree index for a column.
+/// Build a numeric B+ tree index for an in-memory column.
+///
+/// Emits one leaf entry per shard, with that shard's exact `[min, max]` —
+/// see [`numeric_leaves_from_spans`] for why per-shard is the right
+/// granularity and why this path stays exact where the streaming one
+/// summarises.
 pub fn build_numeric_index(
     column: &ArrayRef,
     column_name: &str,
     shard_row_ranges: &[(u64, u64)],
     fanout: u16,
 ) -> NumericIndex {
-    // Collect (value, global_row_idx) pairs
-    let mut value_rows: Vec<(f64, u64)> = Vec::new();
-    let n_rows = column.len();
-    for row in 0..n_rows {
+    // One span per valued row. A one-row span can never straddle a shard
+    // boundary, so this path stays exactly as precise as a per-row index
+    // while emitting one leaf entry per shard — no accumulator, no sort.
+    let spans = (0..column.len()).filter_map(|row| {
         if column.is_null(row) {
-            continue;
+            return None;
         }
-        if let Some(v) = extract_numeric_value(column, row) {
-            value_rows.push((v, row as u64));
-        }
-    }
-
-    // Sort by value
-    value_rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    if value_rows.is_empty() {
-        return NumericIndex {
-            column_name: column_name.to_string(),
-            fanout,
-            internal_pages: vec![],
-            leaf_pages: vec![],
-        };
-    }
-
-    // Group consecutive values into leaf entries, one per shard range
-    // Each leaf entry covers a contiguous value range within one shard.
-    let mut leaf_entries: Vec<NumericLeafEntry> = Vec::new();
-    for &(val, global_row) in &value_rows {
-        let Some((shard_id, local_row)) = global_row_to_shard(global_row, shard_row_ranges) else {
-            continue; // row doesn't belong to any shard — skip
-        };
-        // Try to extend the last entry if same shard and adjacent row
-        if let Some(last) = leaf_entries.last_mut() {
-            if last.shard_id == shard_id && local_row == last.row_end {
-                last.max_value = val;
-                last.row_end = local_row + 1;
-                continue;
-            }
-        }
-        leaf_entries.push(NumericLeafEntry {
-            min_value: val,
-            max_value: val,
-            shard_id,
-            row_start: local_row,
-            row_end: local_row + 1,
-        });
-    }
-
-    // Partition leaf entries into leaf pages (up to `fanout` entries per page)
-    let leaf_pages: Vec<LeafPage> = leaf_entries
-        .chunks(fanout as usize)
-        .map(|chunk| LeafPage {
-            entries: chunk.to_vec(),
+        extract_numeric_value(column, row).map(|v| NumericSpan {
+            min: v,
+            max: v,
+            first_row: row as u64,
+            last_row: row as u64,
         })
-        .collect();
+    });
 
-    // Build internal pages bottom-up
-    let internal_pages = build_internal_pages(&leaf_pages, fanout);
-
-    NumericIndex {
-        column_name: column_name.to_string(),
-        fanout,
-        internal_pages,
-        leaf_pages,
-    }
+    numeric_index_from_spans(column_name, spans, shard_row_ranges, fanout)
 }
 
 /// Build B+ tree internal pages from leaf pages, bottom-up.
