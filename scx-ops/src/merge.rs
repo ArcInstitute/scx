@@ -471,6 +471,32 @@ pub fn merge_with_options(
         });
     }
 
+    // The output CSR shard ranges the index will be finished over, predicted
+    // from the inputs' own CSR shards re-based onto the merged obs axis — the
+    // write loop below concatenates them in exactly this order. obs, by
+    // contrast, is chunked by `shard_target_rows`, so the two partitions
+    // diverge whenever an input was written with a different shard size, and a
+    // push spanning a CSR boundary would hand both shards the same widened
+    // numeric `[min, max]`. This is a precision hint only: `finish` still uses
+    // the ranges the write loop actually produced, so a mispredicted entry
+    // costs a little pruning and nothing else.
+    let predicted_csr_ranges: Vec<(u64, u64)> = if obs_index_builder.is_some() {
+        let mut ranges = Vec::new();
+        let mut offset = 0u64;
+        for reader in &readers {
+            for entry in reader.catalog().shards_sorted() {
+                if let Some(stats) = entry.stats.as_ref() {
+                    let n = stats.row_end.saturating_sub(stats.row_start);
+                    ranges.push((offset, offset + n));
+                    offset += n;
+                }
+            }
+        }
+        ranges
+    } else {
+        Vec::new()
+    };
+
     let mut out_shard_idx: u32 = 0;
     let mut cumulative_obs_rows: u64 = 0;
     for reader in &readers {
@@ -478,7 +504,7 @@ pub fn merge_with_options(
             let chunk = chunk?;
             let unified = unify_dict_columns(&chunk)?;
             if let Some(builder) = obs_index_builder.as_mut() {
-                builder.push_shard(&unified, cumulative_obs_rows)?;
+                builder.push_shard_split(&unified, cumulative_obs_rows, &predicted_csr_ranges)?;
             }
             let n_shard_rows = unified.num_rows() as u64;
             writer.write_obs_shard(

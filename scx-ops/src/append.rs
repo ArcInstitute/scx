@@ -1147,6 +1147,35 @@ fn finalize_append(
         None
     };
 
+    // Per-output-shard `(row_start, row_end)` for the full obs: existing CSR
+    // shards (modality_id == 0) sorted by row_start, plus the freshly-appended
+    // shards in append order. This is what the index is finished over below —
+    // computed up front because the obs pushes have to be split on it. None of
+    // append's three obs push shapes matches this partition: the raw-copy path
+    // pushes existing obs metadata shards, the convert-on-append path pushes
+    // the entire pre-append axis in one call, and new rows are chunked by
+    // `shard_target_rows`. Pushing across a boundary hands every spanned shard
+    // the same widened numeric `[min, max]`, which cannot give a wrong answer
+    // but does switch off Level-1 pruning for those shards.
+    let index_shard_row_ranges: Vec<(u64, u64)> = if rebuild_index {
+        let mut ranges: Vec<(u64, u64)> = prep
+            .old_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
+            .filter_map(|e| e.stats.as_ref().map(|s| (s.row_start, s.row_end)))
+            .collect();
+        ranges.sort_by_key(|(s, _)| *s);
+        ranges.extend(
+            new_shard_entries
+                .iter()
+                .filter_map(|e| e.stats.as_ref().map(|s| (s.row_start, s.row_end))),
+        );
+        ranges
+    } else {
+        Vec::new()
+    };
+
     let mut out_shard_idx: u32;
     let mut cumulative_obs_rows: u64;
 
@@ -1175,7 +1204,8 @@ fn finalize_append(
                 let batch =
                     scx_format_io::downcast_large_types(&batch).map_err(OpsError::Format)?;
                 let n = batch.num_rows() as u64;
-                b.push_shard(&batch, row_offset).map_err(OpsError::Engine)?;
+                b.push_shard_split(&batch, row_offset, &index_shard_row_ranges)
+                    .map_err(OpsError::Engine)?;
                 row_offset += n;
             }
         }
@@ -1189,7 +1219,7 @@ fn finalize_append(
         out_shard_idx = 0;
         cumulative_obs_rows = 0;
         if let Some(b) = obs_index_builder.as_mut() {
-            b.push_shard(old_unified, cumulative_obs_rows)
+            b.push_shard_split(old_unified, cumulative_obs_rows, &index_shard_row_ranges)
                 .map_err(OpsError::Engine)?;
         }
         writer.write_obs_shard(
@@ -1212,7 +1242,7 @@ fn finalize_append(
         let take = std::cmp::min(shard_target_rows, new_n - cursor);
         let chunk = new_unified.slice(cursor, take);
         if let Some(b) = obs_index_builder.as_mut() {
-            b.push_shard(&chunk, cumulative_obs_rows)
+            b.push_shard_split(&chunk, cumulative_obs_rows, &index_shard_row_ranges)
                 .map_err(OpsError::Engine)?;
         }
         writer.write_obs_shard(
@@ -1234,28 +1264,16 @@ fn finalize_append(
     // bulk setter can't reach them.
     let mut per_shard_obs_stats: Option<Vec<Vec<scx_format_io::catalog::ColumnStat>>> = None;
     let index_result = if let Some(builder) = obs_index_builder {
-        // Per-output-shard `(row_start, row_end)` for the full obs:
-        // existing CSR shards (modality_id == 0) sorted by row_start,
-        // plus the freshly-appended shards in append order.
-        let mut shard_row_ranges: Vec<(u64, u64)> = prep
-            .old_catalog
-            .entries
-            .iter()
-            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
-            .filter_map(|e| e.stats.as_ref().map(|s| (s.row_start, s.row_end)))
-            .collect();
-        shard_row_ranges.sort_by_key(|(s, _)| *s);
-        shard_row_ranges.extend(
-            new_shard_entries
-                .iter()
-                .filter_map(|e| e.stats.as_ref().map(|s| (s.row_start, s.row_end))),
-        );
+        // Computed before the obs pushes (see `index_shard_row_ranges`), which
+        // were split on it. The two must be the same list, not two derivations
+        // of it — a split against ranges `finish` does not use buys nothing.
+        let shard_row_ranges = &index_shard_row_ranges;
 
         let var = var_for_index.expect("var_for_index populated when rebuild_index is true");
         let mut result = scx_engine::ConversionPredicateIndexResult::default();
         let obs_bytes = builder
             .finish(
-                &shard_row_ranges,
+                shard_row_ranges,
                 &mut result.obs_outcomes,
                 &mut result.obs_indexed_columns,
             )

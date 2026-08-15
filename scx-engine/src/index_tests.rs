@@ -1854,7 +1854,8 @@ fn numeric_index_coverage_stops_at_the_last_valued_row() {
 /// sound, but it erases exactly the Level-1 pruning the index exists for.
 /// Both conversion entry points did that: the batch one wraps obs in
 /// `iter::once`, and `compact` / `sort` push *input* shards against *output*
-/// shard ranges that a reshape has moved. `streaming_impl` re-splits instead.
+/// shard ranges that a reshape has moved. Every writer now uses
+/// `push_shard_split` instead.
 ///
 /// `n_counts` is 10..13 in shard 0 and 1000..1003 in shard 1, so an unsplit
 /// push shows up immediately as shard 0 claiming a max of 1003. That both
@@ -1873,7 +1874,7 @@ fn a_multi_shard_push_is_split_before_it_reaches_the_accumulator() {
 
     let mut builder = ObsPredicateIndexBuilder::new(obs.schema(), &n_counts_opts()).unwrap();
     // The whole axis in a single push, against a two-shard range table.
-    push_split_on_shard_boundaries(&mut builder, &obs, 0, &ranges).unwrap();
+    builder.push_shard_split(&obs, 0, &ranges).unwrap();
     let bytes = builder
         .finish(&ranges, &mut Vec::new(), &mut Vec::new())
         .unwrap()

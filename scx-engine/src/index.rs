@@ -1429,10 +1429,14 @@ pub fn build_obs_predicate_index_bytes(
 /// **Push one shard per call.** The numeric accumulator summarises within a
 /// push, so pushing a batch that spans several of the shard ranges later
 /// handed to [`Self::finish`] gives each of them the same widened bounds —
-/// sound, but it costs the Level-1 pruning the index is for. Callers that
-/// hold the shard partition should split on it first; the streaming
-/// conversion entry point does that for its callers
-/// (`push_split_on_shard_boundaries`).
+/// sound, but it costs the Level-1 pruning the index is for. Very few callers
+/// naturally push at that granularity: they chunk obs by `shard_target_rows`
+/// (`modify_metadata`, merge's concatenating path, append's new rows) or push
+/// a whole axis at once (the batch conversion entry point, append's
+/// convert-on-append path), while `finish` is given the **CSR** shard ranges,
+/// which need not match either. Use [`Self::push_shard_split`] with the ranges
+/// you will pass to `finish`; it is a precision hint, so an approximation is
+/// still worth passing.
 ///
 /// Column selection works identically to the batch-mode path:
 /// - forced + preset columns are tracked from the start (even if they
@@ -1493,14 +1497,14 @@ enum ColumnSelection {
 /// Blocks never span two pushes, which is what makes the block size
 /// irrelevant to precision for a caller that pushes one shard at a time: all
 /// of a push's blocks then lie inside one shard, and the fold takes min/max
-/// across them, so the result is exact at any shard size. Every caller that
-/// goes through [`build_and_write_conversion_predicate_indexes_streaming`] is
-/// in that class by construction — it re-splits each batch on the shard
-/// boundaries before pushing (see `push_split_on_shard_boundaries`) — as are
-/// append and `modify_metadata`, which chunk to the shard layout. Merge is
-/// the exception: it pushes one whole input file, so its blocks can straddle.
+/// across them, so the result is exact at any shard size. Callers reach that
+/// state via [`ObsPredicateIndexBuilder::push_shard_split`], which every
+/// in-tree writer now uses; merge's sorted path is aligned by construction
+/// (obs and X are both chunked by `shard_target_rows`).
 ///
-/// For that case the block size sets both the memory bound (one
+/// A block can still straddle where a caller's range hint does not match what
+/// `finish` receives. For that case the block size sets both the memory bound
+/// (one
 /// [`NumericSpan`], 32 B, per block per column — ~1.5 MB for a 50M-row axis,
 /// against 800 MB for the whole-axis `(value, row)` list this replaced) and
 /// the bound on how far a straddling block can widen a shard's recorded
@@ -1636,8 +1640,9 @@ impl ObsPredicateIndexBuilder {
     /// A `batch` should not span more than one of the shard ranges passed to
     /// [`Self::finish`] — nothing enforces it, and the categorical side is
     /// insensitive to it, but the numeric side summarises per push and will
-    /// hand every spanned shard the same widened bounds. See the type-level
-    /// docs.
+    /// hand every spanned shard the same widened bounds. Prefer
+    /// [`Self::push_shard_split`] wherever the shard ranges are known. See the
+    /// type-level docs.
     pub fn push_shard(
         &mut self,
         batch: &arrow::array::RecordBatch,
@@ -1759,6 +1764,58 @@ impl ObsPredicateIndexBuilder {
                      pushing shard at offset {shard_row_offset} with {n_rows} rows",
             ))
         })?;
+        Ok(())
+    }
+
+    /// [`Self::push_shard`], but split wherever a `shard_row_ranges` boundary
+    /// falls inside `batch` — one push per shard the batch covers.
+    ///
+    /// Use this instead of `push_shard` whenever the caller knows the ranges
+    /// it will hand [`Self::finish`], which is most of them. `push_shard`
+    /// means what it says, and callers do not all honour it: the batch
+    /// conversion entry point pushes the whole obs axis in one call,
+    /// `compact` / `sort` push *input* shards against *output* ranges a
+    /// reshape has moved, append's convert-on-append path pushes the entire
+    /// pre-append axis, and `modify_metadata` / merge chunk obs by
+    /// `shard_target_rows` while finishing over CSR shards that need not
+    /// match. Each of those hands every spanned shard the same widened
+    /// `[min, max]`, which cannot produce a wrong answer but does erase the
+    /// Level-1 pruning the index exists to provide.
+    ///
+    /// `shard_row_ranges` is a **precision hint, not a correctness input**:
+    /// it only decides where pushes are cut. Ranges that turn out not to
+    /// match what `finish` receives cost some pruning power and nothing else,
+    /// so a caller that can only approximate them should still pass them.
+    ///
+    /// `RecordBatch::slice` shares Arrow buffers, so each piece is O(1).
+    pub fn push_shard_split(
+        &mut self,
+        batch: &arrow::array::RecordBatch,
+        row_offset: u64,
+        shard_row_ranges: &[(u64, u64)],
+    ) -> Result<()> {
+        let n_rows = batch.num_rows() as u64;
+        if n_rows == 0 {
+            return self.push_shard(batch, row_offset);
+        }
+        let end = row_offset + n_rows;
+
+        let mut cuts: Vec<u64> = shard_row_ranges
+            .iter()
+            .flat_map(|&(start, stop)| [start, stop])
+            .filter(|&b| b > row_offset && b < end)
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+
+        let mut cursor = row_offset;
+        for cut in cuts.into_iter().chain(std::iter::once(end)) {
+            self.push_shard(
+                &batch.slice((cursor - row_offset) as usize, (cut - cursor) as usize),
+                cursor,
+            )?;
+            cursor = cut;
+        }
         Ok(())
     }
 
@@ -1892,6 +1949,13 @@ impl ObsPredicateIndexBuilder {
                     // would change what the batch path reports, so it is left
                     // alone and documented (docs/api.md) rather than changed
                     // here.
+                    //
+                    // It is also not a divergence any conversion front end can
+                    // reach on obs: `scx convert` and `pyscx.from_anndata` go
+                    // through `build_and_write_conversion_predicate_indexes`,
+                    // which hands obs to *this* builder via a one-item
+                    // iterator. The batch path owns `var`, and obs only for
+                    // direct callers of `build_obs_predicate_index_bytes`.
                     let _ = matches!(selection, ColumnSelection::Named)
                         && blocks.len() > self.options.high_cardinality_threshold;
                     indexed.push(IndexedColumn::Numeric(numeric_index_from_spans(
@@ -2165,52 +2229,6 @@ pub fn build_and_write_conversion_predicate_indexes_streaming(
     )
 }
 
-/// Feed `batch` to the builder as one `push_shard` call **per shard it
-/// covers**, splitting it wherever a `shard_row_ranges` boundary falls inside
-/// it.
-///
-/// `push_shard` means what it says, and callers of the streaming entry points
-/// do not all honour it: the batch delegate pushes the whole obs axis in one
-/// call, and `compact` / `sort` push *input* shards while `finish` is handed
-/// the *output* shard ranges, which a reshape moves. The builder's numeric
-/// accumulator summarises within a push, so a push spanning several shards
-/// hands every one of them the same widened `[min, max]` — sound, but it
-/// erases the Level-1 pruning the index exists to provide. Since this
-/// function holds the shard partition, it can restore the contract for every
-/// caller at once, which is cheaper and less error-prone than fixing each.
-///
-/// `RecordBatch::slice` shares Arrow buffers, so the split is O(1) per piece.
-fn push_split_on_shard_boundaries(
-    builder: &mut ObsPredicateIndexBuilder,
-    batch: &arrow::array::RecordBatch,
-    row_offset: u64,
-    shard_row_ranges: &[(u64, u64)],
-) -> Result<()> {
-    let n_rows = batch.num_rows() as u64;
-    if n_rows == 0 {
-        return builder.push_shard(batch, row_offset);
-    }
-    let end = row_offset + n_rows;
-
-    let mut cuts: Vec<u64> = shard_row_ranges
-        .iter()
-        .flat_map(|&(start, stop)| [start, stop])
-        .filter(|&b| b > row_offset && b < end)
-        .collect();
-    cuts.sort_unstable();
-    cuts.dedup();
-
-    let mut cursor = row_offset;
-    for cut in cuts.into_iter().chain(std::iter::once(end)) {
-        builder.push_shard(
-            &batch.slice((cursor - row_offset) as usize, (cut - cursor) as usize),
-            cursor,
-        )?;
-        cursor = cut;
-    }
-    Ok(())
-}
-
 fn streaming_impl(
     writer: &mut scx_format_io::ScxWriter,
     obs_schema: arrow::datatypes::SchemaRef,
@@ -2256,7 +2274,7 @@ fn streaming_impl(
     let mut builder = ObsPredicateIndexBuilder::new(obs_schema, &obs_build_opts)?;
     for shard in obs_shards {
         let (batch, row_offset) = shard?;
-        push_split_on_shard_boundaries(&mut builder, &batch, row_offset, obs_row_ranges)?;
+        builder.push_shard_split(&batch, row_offset, obs_row_ranges)?;
     }
     let obs_bytes = builder.finish(
         obs_row_ranges,
