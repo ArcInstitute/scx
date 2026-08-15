@@ -551,6 +551,8 @@ scx_pseudobulk <- function(object, group_by, method = "sum",
 #'   test against (`NULL` tests each group vs the rest); for `scx_pseudobulk_dex` /
 #'   `scx_nb_glm`, the reference level of `test_col`.
 #' @param aggr_method Pseudobulk aggregation, `"sum"` (default) or `"mean"`.
+#'   `scx_pseudobulk_dex()` accepts only `"sum"`: its negative-binomial count
+#'   model is defined on summed replicate counts, not fractional aggregates.
 #' @param dispersion Dispersion estimator: `"cox_reid_shrunk"` (default),
 #'   `"cox_reid_mle"`, or `"moments"`.
 #' @param cooks_filtering,independent_filtering DESeq2 results-stage filters
@@ -604,10 +606,18 @@ scx_pseudobulk_dex <- function(object, group_by, test_col, reference,
     stop(sprintf("test_col '%s' is not among group_by columns (%s)",
                  test_col, paste(cols, collapse = ", ")), call. = FALSE)
   }
+  # Refuse rather than warn: the NB-GLM is the only DE engine rscx exposes and
+  # it is defined on summed counts, so there is no degraded-but-working path to
+  # warn about. Warning and continuing sent the fractional values into the
+  # model's input validator, which failed naming an interior cell instead of
+  # the argument at fault. Matches the pyscx guard.
   if (identical(aggr_method, "mean")) {
-    warning(paste0("scx_pseudobulk_dex: aggr_method='mean' feeds fractional ",
-                   "values into the NB-GLM count model; 'sum' (the default) ",
-                   "is recommended for DE."), call. = FALSE)
+    stop(paste0("scx_pseudobulk_dex requires aggr_method='sum' (got 'mean'): ",
+                "the negative-binomial count model is defined on summed ",
+                "replicate counts, not fractional mean aggregates. Use ",
+                "aggr_method='sum', or for mean aggregation use pyscx ",
+                "pseudobulk_dex(backend='pydeseq2', aggr_method='mean'), ",
+                "which rscx does not expose."), call. = FALSE)
   }
 
   gene_names <- rownames(mat)

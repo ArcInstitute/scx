@@ -466,12 +466,50 @@ test_that("scx_nb_glm fits a planted effect on pre-aggregated counts", {
   expect_error(scx_nb_glm(base, design, contrast = 99L), "contrast index")
 })
 
-test_that("scx_pseudobulk_dex warns when aggr_method='mean'", {
+test_that("scx_pseudobulk_dex rejects aggr_method='mean'", {
   d <- .make_replicated()
-  expect_warning(
+  # NB-GLM is the only DE engine rscx exposes and it is defined on summed
+  # counts, so 'mean' is refused at the argument rather than surfacing from the
+  # model's input validator as a complaint about an interior cell.
+  expect_error(
     scx_pseudobulk_dex(d$counts, group_by = d$meta, test_col = "condition",
                        reference = "ctrl", min_cells_per_group = 5L,
                        aggr_method = "mean"),
-    "mean"
+    "requires aggr_method='sum'",
+    fixed = TRUE
+  )
+  # The refusal names the way to get mean aggregation, not just the refusal.
+  expect_error(
+    scx_pseudobulk_dex(d$counts, group_by = d$meta, test_col = "condition",
+                       reference = "ctrl", min_cells_per_group = 5L,
+                       aggr_method = "mean"),
+    "pydeseq2",
+    fixed = TRUE
+  )
+  # aggr_method='sum' is unaffected by the guard.
+  expect_s3_class(
+    scx_pseudobulk_dex(d$counts, group_by = d$meta, test_col = "condition",
+                       reference = "ctrl", min_cells_per_group = 5L,
+                       aggr_method = "sum"),
+    "data.frame"
+  )
+})
+
+test_that("scx_pseudobulk_dex_matrix refuses 'mean' at the extendr entry too", {
+  # The R wrapper is not the only caller: the extendr export is reachable
+  # directly, so the guard has to hold there as well or a direct caller still
+  # reaches the NB-GLM validator.
+  d <- .make_replicated()
+  mat <- methods::as(d$counts, "CsparseMatrix")
+  groupby <- lapply(d$meta, as.character)
+  cols <- names(groupby)
+  genes <- rownames(mat)
+  if (is.null(genes)) genes <- as.character(seq_len(nrow(mat)))
+  expect_error(
+    rscx:::scx_pseudobulk_dex_matrix(mat, groupby, cols, "condition", "ctrl",
+                                     genes, "mean", 5L, "cox_reid_shrunk",
+                                     TRUE, TRUE),
+    "requires aggr_method='sum'",
+    fixed = TRUE
   )
 })
