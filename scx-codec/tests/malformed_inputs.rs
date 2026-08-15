@@ -12,12 +12,8 @@ use scx_codec::dispatch::{
     decode_indptr_only, decode_row_group, decode_row_group_indptr_only, decode_shard_native,
     decode_shard_ref, decode_shard_scipy, CodecError, CodecId, EncodedShardRef, RowGroupSpan,
 };
-use scx_codec::forbp::{
-    forbp_decode_with_hint, forbp_decode_with_metadata, forbp_encode, ForBpRowMetadata,
-};
-use scx_codec::rice::{
-    rice_decode, rice_decode_with_metadata, rice_encode, RiceBlockMetadata, B_VAL,
-};
+use scx_codec::forbp::{forbp_decode_with_hint, forbp_encode};
+use scx_codec::rice::{rice_decode, rice_encode, B_VAL};
 use scx_codec::shuffle::{byte_shuffle, byte_unshuffle};
 use scx_codec::value_encoding::values_to_raw_bytes;
 use scx_codec::ValueEncoding;
@@ -172,39 +168,6 @@ fn test_decode_hostile_capacity_forbp() {
     // n_rows = 1M against a 10-byte input → rejected by the tighter
     // `n_rows > data.len()` bound (each row writes ≥1 varint byte).
     assert!(forbp_decode_with_hint(&[0u8; 10], 1_000_000, 0, false).is_err());
-}
-
-#[test]
-fn test_decode_hostile_capacity_forbp_metadata() {
-    // Caller-supplied metadata with nnz ≈ u32::MAX must be rejected before the
-    // eager `Vec::with_capacity(nnz_total)` (F-1 review finding).
-    let rows = vec![ForBpRowMetadata {
-        nnz: u32::MAX,
-        value_start: 0,
-        frame_min: 0,
-        frame_bits: 0,
-        index_packing: 0,
-        indices_bit_offset: 0,
-    }];
-    assert!(forbp_decode_with_metadata(&[0u8; 4], &rows).is_err());
-}
-
-#[test]
-fn test_decode_hostile_capacity_rice_metadata() {
-    // Summed block counts (1000) exceed input_len * 8 (8) → MalformedInput
-    // before allocation.
-    let blocks = vec![RiceBlockMetadata {
-        value_start: 0,
-        n_values: 1000,
-        bit_offset: 0,
-        k: 0,
-    }];
-    match rice_decode_with_metadata(&[0u8; 1], &blocks) {
-        Err(CodecError::MalformedInput(msg)) => {
-            assert!(msg.contains("rice metadata decode"), "got: {msg}");
-        }
-        other => panic!("expected MalformedInput, got {other:?}"),
-    }
 }
 
 #[test]

@@ -318,20 +318,6 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Create a `BitReader` positioned at an absolute bit offset.
-    pub fn new_at(data: &'a [u8], bit_offset: usize) -> Result<Self, BitStreamError> {
-        let byte_offset = bit_offset / 8;
-        if byte_offset > data.len() {
-            return Err(BitStreamError);
-        }
-        let mut reader = Self::new(&data[byte_offset..]);
-        let intra_byte = (bit_offset % 8) as u8;
-        if intra_byte > 0 {
-            reader.read_bits(intra_byte)?;
-        }
-        Ok(reader)
-    }
-
     /// Return the current position in bits from the start of the data.
     pub fn position(&self) -> usize {
         self.byte_pos * 8 - self.bits_left as usize
