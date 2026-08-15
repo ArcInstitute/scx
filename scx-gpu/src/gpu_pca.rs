@@ -86,8 +86,6 @@ pub struct GpuPcaResult {
     /// Number of variables.
     pub n_vars: usize,
     /// Whether a captured CUDA graph was replayed in the power loop (Task 2.5):
-    /// `true` only on the device-resident capture path.
-    pub graph_replayed: bool,
     /// Whether the whole matrix was held **device-resident** across the power
     /// loop (`true`) or the streaming operator re-decoded and re-uploaded it on
     /// every multiply (`false`). Decided dynamically against free VRAM, so the
@@ -120,8 +118,6 @@ pub struct GpuPcaDeviceResult {
     pub n_obs: usize,
     /// Number of variables.
     pub n_vars: usize,
-    /// Whether a captured CUDA graph was replayed in the power loop (Task 2.5).
-    pub graph_replayed: bool,
     /// Whether the whole matrix was held device-resident across the power loop.
     /// See [`GpuPcaResult::resident_csr`].
     pub resident_csr: bool,
@@ -146,7 +142,6 @@ struct RandomizedPcaCore {
     /// Whether a captured CUDA graph was replayed in the power loop (Task 2.5).
     /// `true` only on the device-resident capture path; `false` for the
     /// streaming or direct-resident paths.
-    graph_replayed: bool,
     /// Whether the whole matrix was held device-resident across the power loop.
     /// See [`GpuPcaResult::resident_csr`].
     resident_csr: bool,
@@ -302,7 +297,7 @@ fn randomized_pca_core(
         "GPU PCA resident CSR",
     )?;
     let resident_csr = resident.is_some();
-    let graph_replayed = if let Some(gpu_csr) = resident {
+    if let Some(gpu_csr) = resident {
         crate::gpu_pca_resident::run_resident_power_loop(
             dev,
             &gpu_csr,
@@ -387,8 +382,7 @@ fn randomized_pca_core(
 
         // Step 6: B = (X − μ)ᵀ · Q  (final, n_vars × k) — written into scratch.d_z
         op.rmatmat_pooled(&scratch.d_y, &mut scratch.d_z, k, &mut pool)?;
-        false
-    };
+    }
     let d_b_final = &scratch.d_z;
 
     // Step 7: Download B to host, SVD via faer (f64 for accuracy)
@@ -494,7 +488,6 @@ fn randomized_pca_core(
         n_components,
         n_obs,
         n_vars,
-        graph_replayed,
         resident_csr,
     })
 }
@@ -537,7 +530,6 @@ pub fn gpu_randomized_pca(
         n_components,
         n_obs,
         n_vars,
-        graph_replayed,
         resident_csr,
     } = core;
 
@@ -562,7 +554,6 @@ pub fn gpu_randomized_pca(
         n_components,
         n_obs,
         n_vars,
-        graph_replayed,
         resident_csr,
     })
 }
@@ -608,7 +599,6 @@ pub fn gpu_randomized_pca_device(
         n_components,
         n_obs,
         n_vars,
-        graph_replayed,
         resident_csr,
     } = core;
 
@@ -639,7 +629,6 @@ pub fn gpu_randomized_pca_device(
         n_components,
         n_obs,
         n_vars,
-        graph_replayed,
         resident_csr,
     })
 }

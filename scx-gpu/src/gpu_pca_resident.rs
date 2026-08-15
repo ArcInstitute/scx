@@ -378,9 +378,8 @@ fn power_iter_direct(
 /// with the final `B = (X − μ)ᵀ·Q` (`n_vars × k`, col-major) — exactly the two
 /// buffers the streaming core leaves for the downstream SVD.
 ///
-/// Always returns `false` (no CUDA-graph replay): SpMM-segment capture was
-/// removed. The `Result<bool, _>` shape is kept so callers can keep recording
-/// `graph_replayed` without churn.
+/// SpMM-segment CUDA-graph capture was removed; this loop dispatches kernels
+/// directly.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_resident_power_loop(
     dev: &GpuDevice,
@@ -397,7 +396,7 @@ pub(crate) fn run_resident_power_loop(
     k: usize,
     n_power_iterations: usize,
     tuning: GpuPcaTuning,
-) -> Result<bool, GpuError> {
+) -> Result<(), GpuError> {
     // SpMM-segment CUDA-graph capture was removed: capturing `cusparseSpMM`
     // poisons the CUDA context on the cuSPARSE versions tested (CUDA 12.x on
     // H100) and was never a measured win. The residency benefit (single upload +
@@ -433,7 +432,7 @@ pub(crate) fn run_resident_power_loop(
         n_power_iterations,
         tuning.spmm_policy.to_alg(),
     )?;
-    Ok(false)
+    Ok(())
 }
 
 /// Direct (non-captured) resident power loop on `active`, filling `scratch.d_y`
@@ -635,7 +634,6 @@ mod tests {
             tuning,
         )
         .unwrap();
-        assert!(!direct.graph_replayed, "graphs disabled → no replay");
 
         // Restore env-controlled behaviour for sibling tests.
         set_cuda_graphs_enabled_override(None);

@@ -586,15 +586,14 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     write_pca_to_adata(py, adata, &pca_res, "scx-gpu-cusparse", None)?;
     super::neighbors::write_neighbors_to_adata(py, adata, knn_res, n_neighbors, use_rep, "cagra")?;
     // Stamp the device-resident route on pca / neighbors / pca_neighbors,
-    // carrying the Task 2.5 metadata (finding 5): `graph_replay` from the PCA
-    // result and the math-mode / SpMM-policy knobs (the randomized path consumes
-    // both — covariance, which recorded neither, was removed in Phase 3.2).
+    // carrying the Task 2.5 metadata (finding 5): the math-mode / SpMM-policy
+    // knobs (the randomized path consumes both — covariance, which recorded
+    // neither, was removed in Phase 3.2).
     stamp_fused_route(
         py,
         adata,
         device,
         &["pca", "neighbors", "pca_neighbors"],
-        pca_res.graph_replayed,
         pca_res.resident_csr,
     )
 }
@@ -609,7 +608,6 @@ fn stamp_fused_route(
     adata: &Bound<'_, PyAny>,
     device: &str,
     ops: &[&str],
-    graph_replayed: Option<bool>,
     resident_csr: Option<bool>,
 ) -> PyResult<()> {
     let mut info = super::route::simple_exec_info(
@@ -619,7 +617,6 @@ fn stamp_fused_route(
         scx_accel::AccelRoute::CpuCsr,
     );
     if info.route.is_gpu() {
-        info.graph_replay = graph_replayed;
         info.resident_csr = resident_csr;
         info.math_mode = Some(scx_accel::GpuMathMode::default().as_str());
         info.spmm_policy = Some(scx_accel::SpmmAlgPolicy::default().as_str());

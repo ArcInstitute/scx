@@ -98,8 +98,6 @@ pub struct PcaResult {
     pub n_vars: usize,
     /// Whether a captured CUDA graph was replayed in the GPU power loop
     /// (Task 2.5). `None` on CPU paths; `Some(true)` only when the device-
-    /// resident capture path ran and replayed a graph.
-    pub graph_replayed: Option<bool>,
     /// Whether the GPU power loop held the whole matrix **device-resident**
     /// (`Some(true)`) or fell back to the streaming operator (`Some(false)`).
     /// `None` on CPU paths, which have no residency decision to make.
@@ -1448,7 +1446,6 @@ fn build_pca_result(
         n_components,
         n_obs,
         n_vars,
-        graph_replayed: None,
         resident_csr: None,
     })
 }
@@ -1627,7 +1624,6 @@ pub fn covariance_pca_with_depth<S: ShardSource + Sync + ?Sized>(
         n_components,
         n_obs,
         n_vars,
-        graph_replayed: None,
         resident_csr: None,
     })
 }
@@ -1741,7 +1737,6 @@ pub fn covariance_pca_inmemory(
         n_components,
         n_obs,
         n_vars,
-        graph_replayed: None,
         resident_csr: None,
     })
 }
