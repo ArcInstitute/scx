@@ -22,14 +22,15 @@ fn nonzero_val(max: u32) -> impl Strategy<Value = u32> {
 /// Column counts spanning the u16/u32 index-dtype boundary.
 ///
 /// The writer picks `index_dtype_u16` per shard from `index_max_value <=
-/// u16::MAX`, so a strategy that only ever produces `n_vars <= 65535` exercises
-/// exactly one of the two index encodings. This one straddles 65536
-/// deliberately, including both sides of the boundary exactly.
+/// u16::MAX` where `index_max_value = n_vars - 1`
+/// (`scx-format-io/src/writer.rs`), so the boundary sits at **65_537 columns**,
+/// not 65_536: a 65_536-column matrix's largest index is 65_535, which still
+/// fits u16. Both exact sides are sampled.
 fn arb_n_vars() -> impl Strategy<Value = u32> {
     prop_oneof![
         Just(1000u32),    // the historical value
-        Just(65_535),     // largest u16 index
-        Just(65_536),     // smallest u32 index
+        Just(65_536),     // largest n_vars still using u16 indices
+        Just(65_537),     // smallest n_vars needing u32 indices
         Just(200_000),    // comfortably u32
         1000u32..150_000, // and a spread across the boundary
     ]
@@ -50,7 +51,8 @@ fn arb_csr(
         let row_cap = max_nnz_per_row.min(n_vars as usize);
         prop::collection::vec(0..=row_cap, n_rows).prop_flat_map(move |row_nnzs| {
             let total_nnz: usize = row_nnzs.iter().sum();
-            let index_u16 = n_vars <= 65535;
+            // Mirrors the writer: the *maximum index*, not the column count.
+            let index_u16 = (n_vars as usize).saturating_sub(1) <= u16::MAX as usize;
 
             // Sorted distinct indices *by construction*, via strictly positive
             // gaps — never by rejection.
@@ -65,21 +67,25 @@ fn arb_csr(
             let idx_strats: Vec<_> = row_nnzs
                 .iter()
                 .map(|&nnz| {
-                    if nnz == 0 {
-                        Just(vec![]).boxed()
-                    } else {
-                        let max_gap = ((n_vars as usize / nnz).max(1)) as u32;
-                        prop::collection::vec(1..=max_gap, nnz)
-                            .prop_map(|gaps| {
-                                let mut v = Vec::with_capacity(gaps.len());
-                                let mut cur = 0u32;
-                                for g in gaps {
-                                    cur += g;
-                                    v.push(cur - 1);
-                                }
-                                v
-                            })
-                            .boxed()
+                    // `checked_div` rather than an `if nnz == 0` guard around
+                    // `n_vars / nnz`: clippy 1.97's `manual_checked_ops` rejects
+                    // the latter, and CI's toolchain is newer than the dev box's.
+                    match (n_vars as usize).checked_div(nnz) {
+                        None => Just(vec![]).boxed(),
+                        Some(gap) => {
+                            let max_gap = gap.max(1) as u32;
+                            prop::collection::vec(1..=max_gap, nnz)
+                                .prop_map(|gaps| {
+                                    let mut v = Vec::with_capacity(gaps.len());
+                                    let mut cur = 0u32;
+                                    for g in gaps {
+                                        cur += g;
+                                        v.push(cur - 1);
+                                    }
+                                    v
+                                })
+                                .boxed()
+                        }
                     }
                 })
                 .collect();
@@ -680,6 +686,30 @@ proptest! {
         let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
         let encoded = encode_shard(&indptr, &indices, &values, CodecId::Pcodec, ValueEncoding::Float16, u16_idx).unwrap();
         let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Pcodec, ValueEncoding::Float16, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_zstd_f16_roundtrip(
+        data in arb_csr(50, 200, ValueEncoding::Float16)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Zstd, ValueEncoding::Float16, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Zstd, ValueEncoding::Float16, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_lz4shuffle_f16_roundtrip(
+        data in arb_csr(50, 200, ValueEncoding::Float16)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Lz4Shuffle, ValueEncoding::Float16, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::Lz4Shuffle, ValueEncoding::Float16, n_rows, nnz, u16_idx).unwrap();
         prop_assert_eq!(&d_ip, &indptr);
         prop_assert_eq!(&d_ix, &indices);
         prop_assert_eq!(&d_v, &values);

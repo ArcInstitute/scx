@@ -1,4 +1,14 @@
-//! Split out of `dispatch.rs` (ORG-3.7-2). Pure move.
+//! `CodecId::ShufDeltaZstd` — byte-filter codec. Per sub-stream:
+//!
+//!   indices / indptr : byte-shuffle -> byte-delta -> zstd
+//!   integer values   : byte-shuffle -> zstd          (no delta)
+//!   float values     : zstd only    (no shuffle, no delta)
+//!
+//! Monolithic per shard. Random-row / grouped reads decode the whole shard; the
+//! row-group-framed form (F5-b) rides the BlockIndex substrate and is out of
+//! scope here.
+//!
+//! Split out of `dispatch.rs` (ORG-3.7-2).
 
 use crate::byte_delta::{byte_delta_planes, byte_undelta_planes};
 use crate::codec_id::{CodecError, DecodedShard, EncodedShard, EncodedShardRef, ValueEncoding};

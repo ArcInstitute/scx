@@ -1,8 +1,9 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use scx_codec::{
-    decode_indptr_only, decode_shard_native, decode_shard_ref, decode_shard_scipy, CodecId,
-    EncodedShardRef, ValueEncoding, NO_INDEX_BOUND,
+    decode_indptr_only, decode_row_group, decode_row_group_indptr_only, decode_shard_native,
+    decode_shard_ref, decode_shard_scipy, CodecId, EncodedShardRef, RowGroupSpan, ValueEncoding,
+    NO_INDEX_BOUND,
 };
 
 // Composite-level fuzzing of the shard decode dispatch.
@@ -72,4 +73,22 @@ fuzz_target!(|data: &[u8]| {
     for &n_rows in &[0usize, 1, 10, 1_000_000] {
         let _ = decode_indptr_only(body, codec, n_rows);
     }
+
+    // The row-group seam slices three frames out of the sub-streams and funnels
+    // them back through `decode_shard_ref`, relabelling errors with the group.
+    // Spans are derived from the input so libFuzzer can drive them out of range.
+    let span = RowGroupSpan {
+        row_start: 0,
+        n_rows: (body.first().copied().unwrap_or(1) as u16) % 8,
+        nnz: (body.last().copied().unwrap_or(1) as u32) % 64,
+        indptr: 0..a,
+        indices: a..b,
+        values: b..body.len(),
+    };
+    for venc in [ValueEncoding::Uint8, ValueEncoding::Uint32, ValueEncoding::Float32] {
+        for idx16 in [true, false] {
+            let _ = decode_row_group(codec, &span, body, body, body, venc, idx16);
+        }
+    }
+    let _ = decode_row_group_indptr_only(codec, &span, body);
 });

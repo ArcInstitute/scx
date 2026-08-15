@@ -218,7 +218,7 @@ a small shard force an arbitrarily large allocation from untrusted input.
   heuristic (§13) — binary `Uint8` ATAC goes to Zstd, and the modality-blind
   heuristic in §8 never picks it.
 
-Implementation: `scx-codec/src/shuffle.rs`, `scx-codec/src/dispatch.rs`.
+Implementation: `scx-codec/src/shuffle.rs`, `scx-codec/src/codecs/lz4_shuffle.rs`.
 
 ## 7b. ShufDeltaZstd (codec_id = 5)
 
@@ -273,7 +273,7 @@ reads touch only the covering groups. **Measured:** framing at `G ∈ {256,512,
 1024}` retains essentially the full monolithic win (size flat within ~0.2 % across
 `G`; 1.75×/1.46× vs Scx1 on census_1m/rgfp), so no per-shard dictionary is needed.
 
-Implementation: `scx-codec/src/{byte_delta.rs,dispatch.rs}` (codec +
+Implementation: `scx-codec/src/{byte_delta.rs,codecs/shufdelta.rs}` (codec +
 `decode_row_group`), `scx-format-io/src/encoder.rs` (`encode_shard_framed`),
 `scx-format/src/shard.rs` (`resolve_block_index`).
 
@@ -573,6 +573,6 @@ values. Future codec versions should prioritize index improvements.
 | FOR-BP + BitPacker4x | `scx-codec/src/forbp.rs` |
 | Delta-Golomb-Rice indptr | `scx-codec/src/delta_golomb.rs` |
 | LZ4+Shuffle byte permutation | `scx-codec/src/shuffle.rs` |
-| Codec dispatch (`codec_id`) | `scx-codec/src/dispatch.rs` |
+| Codec dispatch (`codec_id`) | `scx-codec/src/dispatch.rs` (driver); `codecs/` (per-codec bodies), `codec_id.rs` (wire types), `guards.rs` (shared bounds), `raw.rs` (LE helpers) |
 | Auto codec selection | `scx-format/src/codec_select.rs` |
 | CUDA kernel decoders | `scx-gpu/src/kernels/` |

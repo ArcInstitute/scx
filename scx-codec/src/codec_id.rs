@@ -303,10 +303,6 @@ pub struct RowGroupSpan {
     pub values: Range<usize>,
 }
 
-// ---------------------------------------------------------------------------
-// Encode
-// ---------------------------------------------------------------------------
-
 /// Scipy-compatible decoded shard: `(indptr_i64, indices_i32, data_f32)`.
 ///
 /// Eliminates intermediate type conversions by producing the final scipy

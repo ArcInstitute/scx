@@ -9,7 +9,7 @@ use crate::codecs::none::{decode_none_ref, encode_none};
 use crate::codecs::pcodec::{decode_pcodec_ref, encode_pcodec};
 use crate::codecs::scx1::{decode_scx1_ref, encode_scx1};
 use crate::codecs::shufdelta::{decode_shufdelta_zstd_ref, encode_shufdelta_zstd};
-use crate::codecs::zstd_codec::{decode_zstd_ref, encode_zstd, zstd_decode_bounded};
+use crate::codecs::zstd_codec::{decode_zstd_ref, encode_zstd};
 use crate::delta_golomb::delta_golomb_decode;
 use crate::forbp::forbp_decode_with_hint;
 use crate::guards::*;
@@ -22,6 +22,12 @@ use crate::shuffle::byte_unshuffle;
 // integration tests import through that path, and `dispatch_tests.rs` reaches
 // all of it through `use super::*`.
 pub use crate::codec_id::*;
+// These four were `pub` items of the public `dispatch` module before the split,
+// so `scx_codec::dispatch::{..}` was a supported path for each. The glob `use`
+// above restores the types; these restore the functions and the constant, which
+// an out-of-tree caller would otherwise hit E0603 on.
+pub use crate::codecs::zstd_codec::zstd_decode_bounded;
+pub use crate::guards::{check_indptr_shape, clamp_index_bound, NO_INDEX_BOUND};
 
 /// Encode a CSR shard's three arrays using the specified codec.
 ///

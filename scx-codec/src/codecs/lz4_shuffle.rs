@@ -124,15 +124,3 @@ pub(crate) fn decode_lz4_shuffle_ref(
 
     Ok((indptr, indices, values_raw))
 }
-
-// ---------------------------------------------------------------------------
-// CodecId::ShufDeltaZstd
-//
-// byte-filter codec: per sub-stream,
-//   indices / indptr : byte-shuffle -> byte-delta -> zstd
-//   integer values   : byte-shuffle -> zstd          (no delta)
-//   float values     : zstd only    (no shuffle, no delta)
-// Monolithic per shard. Random-row / grouped
-// reads decode the whole shard; the row-group-framed form (F5-b) rides the
-// BlockIndex substrate and is out of scope here.
-// ---------------------------------------------------------------------------
