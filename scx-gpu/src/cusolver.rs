@@ -665,8 +665,8 @@ mod tests {
         let mut a_host = vec![0.0f32; m * n];
 
         // Column 0: deterministic gradient.
-        for r in 0..m {
-            a_host[r] = (r as f32) * 0.001 + 1.0;
+        for (r, v) in a_host.iter_mut().enumerate().take(m) {
+            *v = (r as f32) * 0.001 + 1.0;
         }
         // Column 1: col 0 + tiny noise (far below f32 precision for col 0's norm).
         for r in 0..m {

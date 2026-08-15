@@ -418,7 +418,7 @@ fn scan(tree: &Path) -> Scan {
                 .find(&region)
                 .map_or(1, |off| line_of(&text, off))
                 .saturating_sub(1);
-            s.exempt.extend(exemptions(&region, &path, base_line));
+            s.exempt.extend(exemptions(&region, path, base_line));
 
             // A gate macro outside a `#[test]` body is the last way to hide
             // one: its `return` leaves the *helper*, so the test carries on
@@ -430,7 +430,7 @@ fn scan(tree: &Path) -> Scan {
                 .filter(|l| !l.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let in_bodies: String = test_fns(&region, &path)
+            let in_bodies: String = test_fns(&region, path)
                 .iter()
                 .map(|t| t.body.as_str())
                 .collect();

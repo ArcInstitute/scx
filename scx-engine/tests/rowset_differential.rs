@@ -63,7 +63,7 @@ fn is_deleted(i: usize) -> bool {
 
 fn cell_type_at(i: usize) -> Option<&'static str> {
     // Spread across shards; every 7th row is NULL (exercises null handling).
-    if i % 7 == 0 {
+    if i.is_multiple_of(7) {
         return None;
     }
     match i % 3 {
@@ -84,7 +84,7 @@ fn tissue_at(i: usize) -> &'static str {
 
 /// Non-indexed categorical → forces the residual decode path.
 fn quality_at(i: usize) -> &'static str {
-    if i % 2 == 0 {
+    if i.is_multiple_of(2) {
         "hi"
     } else {
         "lo"

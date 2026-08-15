@@ -230,7 +230,7 @@ mod tests {
             n_rows,
             nnz,
             header.index_dtype == 0,
-            scx_codec::clamp_index_bound(n_cols as u32),
+            scx_codec::clamp_index_bound(n_cols),
         )
         .unwrap()
     }

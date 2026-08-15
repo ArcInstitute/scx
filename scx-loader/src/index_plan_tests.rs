@@ -22,7 +22,7 @@ fn write_multi_shard_fixture(
     n_shards: usize,
 ) -> std::path::PathBuf {
     assert!(
-        n_obs % n_shards == 0,
+        n_obs.is_multiple_of(n_shards),
         "n_obs must divide n_shards in this fixture"
     );
     let rows_per_shard = n_obs / n_shards;
@@ -89,10 +89,12 @@ fn write_multi_shard_fixture(
 }
 
 fn open_loader(path: &std::path::Path, sort_by_shard: bool) -> IndexPlanLoader {
-    let mut config = LoaderConfig::default();
-    config.normalize = false;
-    config.log1p = false;
-    config.obs_columns = vec!["cell_id".to_string()];
+    let config = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        obs_columns: vec!["cell_id".to_string()],
+        ..Default::default()
+    };
     IndexPlanLoader::new(
         path,
         config,
@@ -109,11 +111,13 @@ fn open_loader_hvg(
     sort_by_shard: bool,
     hvg_indices: Vec<u32>,
 ) -> IndexPlanLoader {
-    let mut config = LoaderConfig::default();
-    config.normalize = false;
-    config.log1p = false;
-    config.obs_columns = vec!["cell_id".to_string()];
-    config.hvg_indices = Some(hvg_indices);
+    let config = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        obs_columns: vec!["cell_id".to_string()],
+        hvg_indices: Some(hvg_indices),
+        ..Default::default()
+    };
     IndexPlanLoader::new(
         path,
         config,
@@ -304,7 +308,9 @@ fn sort_by_shard_is_a_pure_permutation_of_unsorted_output() {
 
     // Build (pair, row, paired_row) tuples and compare as multisets.
     let n_cols = unsorted.x.len() / unsorted.pairs.len();
-    let triples = |b: &IndexPlanBatch| -> Vec<((u64, u64), Vec<u32>, Vec<u32>)> {
+    /// `(pair, row bits, paired-row bits)` — compared as a multiset.
+    type Triples = Vec<((u64, u64), Vec<u32>, Vec<u32>)>;
+    let triples = |b: &IndexPlanBatch| -> Triples {
         (0..b.pairs.len())
             .map(|i| {
                 let r: Vec<u32> = b.x[i * n_cols..][..n_cols]
@@ -351,10 +357,12 @@ fn into_plan_iter(
 }
 
 fn open_loader_arc(path: &std::path::Path) -> Arc<IndexPlanLoader> {
-    let mut config = LoaderConfig::default();
-    config.normalize = false;
-    config.log1p = false;
-    config.obs_columns = vec!["cell_id".to_string()];
+    let config = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        obs_columns: vec!["cell_id".to_string()],
+        ..Default::default()
+    };
     Arc::new(
         IndexPlanLoader::new(
             path, config, /*cache_shards*/ 4, /*sort_by_shard*/ true,
@@ -500,7 +508,7 @@ fn write_dense_fixture(
     n_shards: usize,
     nnz_per_row: usize,
 ) -> std::path::PathBuf {
-    assert!(n_obs % n_shards == 0);
+    assert!(n_obs.is_multiple_of(n_shards));
     assert!(nnz_per_row <= n_vars);
     let rows_per_shard = n_obs / n_shards;
     let total_nnz = (n_obs * nnz_per_row) as u64;
@@ -588,8 +596,11 @@ fn write_dense_fixture(
 fn budget_generous_no_autotune() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
-    let mut config = LoaderConfig::default();
-    config.max_memory_mb = 4096; // way over budget needed for this tiny file
+    // Way over the budget needed for this tiny file.
+    let config = LoaderConfig {
+        max_memory_mb: 4096,
+        ..Default::default()
+    };
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 8, /*sort_by_shard*/ true, /*lookahead*/ 4,
         /*max_plan_size*/ 1024,
@@ -607,7 +618,6 @@ fn budget_tight_reduces_lookahead_first() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 256, 8, 4);
 
-    let mut config = LoaderConfig::default();
     // Budget components at requested settings (post-L1-dedup-gather model):
     //   python       = 50 MB
     //   batch buffer = 2 × 65536 × 8 × 4         ≈ 4 MB
@@ -617,7 +627,10 @@ fn budget_tight_reduces_lookahead_first() {
     //   shard cache  = ~negligible (sparse fixture)
     // Total ≈ 70 MB. Floor at lookahead=1: 50+4+1+8 ≈ 63 MB.
     // A 66 MB budget forces lookahead reduction without floor-failure.
-    config.max_memory_mb = 66;
+    let config = LoaderConfig {
+        max_memory_mb: 66,
+        ..Default::default()
+    };
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 8, /*sort_by_shard*/ true, /*lookahead*/ 8,
         /*max_plan_size*/ 65536,
@@ -660,8 +673,10 @@ fn budget_very_tight_reduces_cache_shards() {
     //   shard cache  = 16 × 2.1 MB         ≈ 33 MB
     // Total ≈ 115 MB. Budget 96 forces lookahead → 1, then cache_shards.
 
-    let mut config = LoaderConfig::default();
-    config.max_memory_mb = 96;
+    let config = LoaderConfig {
+        max_memory_mb: 96,
+        ..Default::default()
+    };
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 16, /*sort_by_shard*/ true, /*lookahead*/ 4,
         /*max_plan_size*/ 1024,
@@ -691,8 +706,11 @@ fn budget_below_floor_refuses_construction() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 4096, 4096, 4);
 
-    let mut config = LoaderConfig::default();
-    config.max_memory_mb = 40; // below the 50 MB python overhead alone
+    // Below the 50 MB python overhead alone.
+    let config = LoaderConfig {
+        max_memory_mb: 40,
+        ..Default::default()
+    };
     let result = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 4, /*sort_by_shard*/ true, /*lookahead*/ 2,
         /*max_plan_size*/ 4096,
@@ -722,8 +740,10 @@ fn budget_below_floor_refuses_construction() {
 fn budget_shrink_records_a_cache_sizing_verdict() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_dense_fixture(&dir.path().join("f.scx"), 1024, 4096, 8, 2048);
-    let mut config = LoaderConfig::default();
-    config.max_memory_mb = 96;
+    let config = LoaderConfig {
+        max_memory_mb: 96,
+        ..Default::default()
+    };
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 16, /*sort_by_shard*/ true, /*lookahead*/ 4,
         /*max_plan_size*/ 1024,
@@ -752,8 +772,10 @@ fn budget_shrink_records_a_cache_sizing_verdict() {
 fn budget_generous_records_no_cache_sizing_verdict() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
-    let mut config = LoaderConfig::default();
-    config.max_memory_mb = 4096;
+    let config = LoaderConfig {
+        max_memory_mb: 4096,
+        ..Default::default()
+    };
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 8, /*sort_by_shard*/ true, /*lookahead*/ 4,
         /*max_plan_size*/ 1024,
@@ -781,14 +803,18 @@ fn auto_memory_budget_preserves_the_requested_cache() {
     const MAX_PLAN: usize = 1024;
 
     // Arm A: the historical hard default.
-    let mut fixed = LoaderConfig::default();
-    fixed.max_memory_mb = 512;
+    let fixed = LoaderConfig {
+        max_memory_mb: 512,
+        ..Default::default()
+    };
     let fixed_loader = IndexPlanLoader::new(&path, fixed, CACHE_SHARDS, true, 4, MAX_PLAN).unwrap();
 
     // Arm B: same file, same request, adaptive budget.
-    let mut auto = LoaderConfig::default();
-    auto.max_memory_mb = 512; // now the *floor*, not the ceiling
-    auto.auto_memory_budget = true;
+    let auto = LoaderConfig {
+        max_memory_mb: 512, // now the *floor*, not the ceiling
+        auto_memory_budget: true,
+        ..Default::default()
+    };
     let auto_loader = IndexPlanLoader::new(&path, auto, CACHE_SHARDS, true, 4, MAX_PLAN).unwrap();
 
     assert!(
@@ -816,8 +842,10 @@ fn auto_memory_budget_preserves_the_requested_cache() {
 fn auto_memory_budget_is_capped_not_unbounded() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_dense_fixture(&dir.path().join("f.scx"), 256, 512, 4, 512);
-    let mut config = LoaderConfig::default();
-    config.auto_memory_budget = true;
+    let config = LoaderConfig {
+        auto_memory_budget: true,
+        ..Default::default()
+    };
     // 65536 × ~257 KB ≈ 17 GB, far past ADAPTIVE_BUDGET_CAP_MB.
     let loader = IndexPlanLoader::new(&path, config, 65536, true, 4, 1024).unwrap();
     assert_eq!(
@@ -883,8 +911,10 @@ fn plan_shard_touch_count_counts_distinct_shards() {
 fn budget_lookahead_zero_honored_when_fits() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
-    let mut config = LoaderConfig::default();
-    config.max_memory_mb = 256;
+    let config = LoaderConfig {
+        max_memory_mb: 256,
+        ..Default::default()
+    };
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 4, /*sort_by_shard*/ true, /*lookahead*/ 0,
         /*max_plan_size*/ 1024,
@@ -900,10 +930,12 @@ fn budget_lookahead_zero_honored_when_fits() {
 fn process_plan_rejects_oversize_plan() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
-    let mut config = LoaderConfig::default();
-    config.normalize = false;
-    config.log1p = false;
-    config.obs_columns = vec!["cell_id".to_string()];
+    let config = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        obs_columns: vec!["cell_id".to_string()],
+        ..Default::default()
+    };
 
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 4, /*sort_by_shard*/ false, /*lookahead*/ 1,
@@ -1198,10 +1230,12 @@ fn a_prefetch_task_does_not_capture_the_loader() {
     // observe.
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
 
-    let mut config = LoaderConfig::default();
-    config.normalize = false;
-    config.log1p = false;
-    config.obs_columns = vec!["cell_id".to_string()];
+    let config = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        obs_columns: vec!["cell_id".to_string()],
+        ..Default::default()
+    };
     let mut raw = IndexPlanLoader::new(&path, config, 4, true, 4, 16384).unwrap();
     raw.set_scatter_block_index(false);
     let gate = Arc::new(PrefetchGate::new());
@@ -1270,7 +1304,7 @@ fn the_iterator_as_last_owner_still_gets_a_bounded_teardown() {
     it.next().expect("first batch").expect("must decode"); // forces the runtime
 
     drop(loader); // the `ds.close()` half — the iter is now the only owner
-    while let Some(b) = it.next() {
+    for b in it.by_ref() {
         b.expect("must decode");
     }
     drop(it);

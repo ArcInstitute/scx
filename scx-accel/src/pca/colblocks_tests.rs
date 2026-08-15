@@ -57,7 +57,7 @@ fn blocks_balance_by_weight_not_column_count() {
 /// every column onto the last block.
 #[test]
 fn a_zero_weight_axis_splits_evenly() {
-    let blocks = plan_blocks(&vec![0u64; 12], 4);
+    let blocks = plan_blocks(&[0u64; 12], 4);
     assert_eq!(blocks, vec![0..3, 3..6, 6..9, 9..12]);
 }
 
@@ -78,7 +78,7 @@ fn sorted_subrange_finds_the_half_open_window() {
 fn contiguous_windows_partition_a_row() {
     let row = [0i32, 1, 5, 6, 9, 11];
     for n_blocks in 1..=6usize {
-        let blocks = plan_blocks(&vec![1u64; 12], n_blocks);
+        let blocks = plan_blocks(&[1u64; 12], n_blocks);
         let mut seen = Vec::new();
         for b in &blocks {
             let (lo, hi) = sorted_subrange(&row, b.start, b.end);
@@ -106,7 +106,7 @@ fn strictly_increasing_rejects_unsorted_and_duplicate_columns() {
 
 #[test]
 fn split_by_blocks_yields_disjoint_slices_covering_the_buffer() {
-    let blocks = plan_blocks(&vec![1u64; 7], 3);
+    let blocks = plan_blocks(&[1u64; 7], 3);
     let mut buf = vec![0u32; 7 * 4];
     {
         let parts = split_by_blocks(&mut buf, &blocks, 4);

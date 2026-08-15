@@ -210,7 +210,7 @@ fn write_bench_file(dir: &TempDir) -> PathBuf {
         }
 
         // Build the CategoryBitset: bit i set if sorted_types[i] is present
-        let n_bytes = (sorted_types.len() + 7) / 8;
+        let n_bytes = sorted_types.len().div_ceil(8);
         let mut bitset = vec![0u8; n_bytes];
         for (i, &ct) in sorted_types.iter().enumerate() {
             if present.contains(ct) {

@@ -472,10 +472,10 @@ mod tests {
 
         // Both should produce valid scores
         for &s in &without.scores {
-            assert!(s >= 0.0 && s <= 1.0, "score out of range: {s}");
+            assert!((0.0..=1.0).contains(&s), "score out of range: {s}");
         }
         for &s in &with_excl.scores {
-            assert!(s >= 0.0 && s <= 1.0, "score out of range: {s}");
+            assert!((0.0..=1.0).contains(&s), "score out of range: {s}");
         }
     }
 
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn test_validation_errors() {
         let perts = vec!["a".to_string(), "b".to_string()];
-        let genes = vec!["g0".to_string(), "g1".to_string()];
+        let genes = ["g0".to_string(), "g1".to_string()];
 
         // Wrong real_effects length
         assert!(compute_discrimination_score(

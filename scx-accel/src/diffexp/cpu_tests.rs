@@ -110,12 +110,12 @@ fn test_wilcoxon_rank_sum_basic() {
     let groups: Vec<usize> = (0..n_obs).map(|i| if i < 10 { 0 } else { 1 }).collect();
 
     for i in 0..10 {
-        data[i * n_vars + 0] = 10.0 + i as f32; // group 0, gene 0: high
+        data[i * n_vars] = 10.0 + i as f32; // group 0, gene 0: high
         data[i * n_vars + 1] = 5.0; // group 0, gene 1: medium
         data[i * n_vars + 2] = 1.0; // group 0, gene 2: low
     }
     for i in 10..20 {
-        data[i * n_vars + 0] = 1.0; // group 1, gene 0: low
+        data[i * n_vars] = 1.0; // group 1, gene 0: low
         data[i * n_vars + 1] = 5.0; // group 1, gene 1: medium
         data[i * n_vars + 2] = 10.0 + (i - 10) as f32; // group 1, gene 2: high
     }
@@ -235,11 +235,11 @@ fn test_logfc_log_transformed() {
     let groups: Vec<usize> = (0..n_obs).map(|i| if i < 10 { 0 } else { 1 }).collect();
 
     for i in 0..10 {
-        data[i * n_vars + 0] = (10.0f32 + 1.0).ln(); // ln(11) ≈ 2.397
+        data[i * n_vars] = (10.0f32 + 1.0).ln(); // ln(11) ≈ 2.397
         data[i * n_vars + 1] = (1.0f32 + 1.0).ln(); // ln(2) ≈ 0.693
     }
     for i in 10..20 {
-        data[i * n_vars + 0] = (1.0f32 + 1.0).ln(); // ln(2) ≈ 0.693
+        data[i * n_vars] = (1.0f32 + 1.0).ln(); // ln(2) ≈ 0.693
         data[i * n_vars + 1] = (10.0f32 + 1.0).ln(); // ln(11) ≈ 2.397
     }
 
@@ -616,12 +616,12 @@ fn test_wilcoxon_sparse_matches_dense() {
     let groups: Vec<usize> = (0..n_obs).map(|i| if i < 10 { 0 } else { 1 }).collect();
 
     for i in 0..10 {
-        dense_data[i * n_vars + 0] = 10.0 + i as f32;
+        dense_data[i * n_vars] = 10.0 + i as f32;
         dense_data[i * n_vars + 1] = 5.0;
         dense_data[i * n_vars + 2] = 1.0;
     }
     for i in 10..20 {
-        dense_data[i * n_vars + 0] = 1.0;
+        dense_data[i * n_vars] = 1.0;
         dense_data[i * n_vars + 1] = 5.0;
         dense_data[i * n_vars + 2] = 10.0 + (i - 10) as f32;
     }
@@ -1537,12 +1537,8 @@ fn test_pdex_ref_epsilon_stabilises_zero_ref() {
     let mut data = vec![0.0f32; n_obs * n_vars];
     let groups = vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
     // Group 0 (ref) is all zeros. Group 1 has positive values.
-    for cell in 4..8 {
-        data[cell] = 3.0;
-    }
-    for cell in 8..12 {
-        data[cell] = 5.0;
-    }
+    data[4..8].fill(3.0);
+    data[8..12].fill(5.0);
     let group_names = vec!["ref".to_string(), "ta".to_string(), "tb".to_string()];
     let gene_names = vec!["g0".to_string()];
 

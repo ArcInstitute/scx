@@ -76,13 +76,15 @@ fn build_loader(
     target_sum: f64,
     sort_by_shard: bool,
 ) -> IndexPlanLoader {
-    let mut config = LoaderConfig::default();
-    config.normalize = normalize;
-    config.log1p = normalize;
-    config.target_sum = target_sum;
-    config.hvg_indices = hvg;
-    config.obs_columns = vec!["cell_id".to_string()];
-    config.max_memory_mb = 1024;
+    let config = LoaderConfig {
+        normalize,
+        log1p: normalize,
+        target_sum,
+        hvg_indices: hvg,
+        obs_columns: vec!["cell_id".to_string()],
+        max_memory_mb: 1024,
+        ..Default::default()
+    };
     IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
 }
 

@@ -680,7 +680,7 @@ fn correctness_select_genes() {
     // Verify: all column indices in the projected CSR should be in 0..3
     for &idx in &result.x.indices {
         assert!(
-            idx >= 0 && idx < 3,
+            (0..3).contains(&idx),
             "projected index {idx} out of range [0, 3)"
         );
     }
@@ -779,7 +779,7 @@ fn correctness_combined_pipeline() {
 
     // 3. All indices should be in [0, 3)
     for &idx in &result.x.indices {
-        assert!(idx >= 0 && idx < 3);
+        assert!((0..3).contains(&idx));
     }
 
     // 4. Values should be positive (after log1p)

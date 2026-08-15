@@ -645,8 +645,7 @@ fn cloud_modality_accessors_and_unknown_modality() {
         let reader2 = rt.block_on(scx_cloud::open_cloud(&url)).unwrap();
         let adapter2 = CloudSectionReader::new(Arc::new(reader2), Arc::clone(&rt));
         let err = QueryPipeline::from_reader_for_modality(Box::new(adapter2), 99)
-            .err()
-            .expect("unknown modality should error");
+            .expect_err("unknown modality should error");
         assert!(
             matches!(err, scx_engine::EngineError::UnknownModality { .. }),
             "expected UnknownModality, got {err:?} ({url})"

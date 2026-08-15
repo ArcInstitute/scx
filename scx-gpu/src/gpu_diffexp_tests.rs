@@ -279,7 +279,7 @@ fn cpu_emulator_combined_tie(
     let per_thread = total.div_ceil(block_threads);
 
     let co_rank = |diag: usize| -> usize {
-        let mut i_lo = if diag > n_g { diag - n_g } else { 0 };
+        let mut i_lo = diag.saturating_sub(n_g);
         let mut i_hi = diag.min(n_ref);
         while i_lo < i_hi {
             let i = (i_lo + i_hi) / 2;
@@ -847,8 +847,8 @@ fn test_gpu_de_pseudobulk_all_modes() {
             let end = group_offsets[g + 1] as usize;
             for gene in 0..chunk_size {
                 let mut host_sum = 0.0f64;
-                for i in start..end {
-                    let cell = all_group_cells[i] as usize;
+                for &c in &all_group_cells[start..end] {
+                    let cell = c as usize;
                     let x = dense_host[cell * chunk_size + gene];
                     host_sum += host_pre(x, mode_id);
                 }

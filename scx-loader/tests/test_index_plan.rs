@@ -287,7 +287,9 @@ fn sort_by_shard_is_pure_permutation() {
     let b_so = loader_sorted.process_plan(plan.clone()).unwrap();
 
     let n_cols = loader_unsorted.n_output_cols();
-    let triples = |b: &scx_loader::IndexPlanBatch| -> Vec<((u64, u64), Vec<u32>, Vec<u32>)> {
+    /// `(pair, row bits, paired-row bits)` — compared as a multiset.
+    type Triples = Vec<((u64, u64), Vec<u32>, Vec<u32>)>;
+    let triples = |b: &scx_loader::IndexPlanBatch| -> Triples {
         (0..b.pairs.len())
             .map(|i| {
                 let r: Vec<u32> = b.x[i * n_cols..(i + 1) * n_cols]
@@ -325,8 +327,7 @@ fn hvg_paired_scatter_via_process_plan() {
 
     // For row 7 → col 7, value 8 → HVG position 0.
     let n_cols = 3;
-    for i in 0..plan.len() {
-        let (p, c) = plan[i];
+    for (i, &(p, c)) in plan.iter().enumerate() {
         let p_row = &batch.x[i * n_cols..(i + 1) * n_cols];
         let c_row = &batch.x_paired[i * n_cols..(i + 1) * n_cols];
 
@@ -360,8 +361,10 @@ fn ctor_rejects_zero_cache_shards() {
     let dir = tempfile::tempdir().unwrap();
     let path = fixture(&dir);
 
-    let mut config = scx_loader::LoaderConfig::default();
-    config.max_memory_mb = 1024;
+    let config = scx_loader::LoaderConfig {
+        max_memory_mb: 1024,
+        ..Default::default()
+    };
     let r = scx_loader::IndexPlanLoader::new(&path, config, 0, true, 4, 1024);
     assert!(matches!(r, Err(LoaderError::ConfigError { .. })));
 }
@@ -375,9 +378,11 @@ fn ctor_rejects_missing_obs_column() {
     let dir = tempfile::tempdir().unwrap();
     let path = fixture(&dir);
 
-    let mut config = scx_loader::LoaderConfig::default();
-    config.obs_columns = vec!["nonexistent_column".to_string()];
-    config.max_memory_mb = 1024;
+    let config = scx_loader::LoaderConfig {
+        obs_columns: vec!["nonexistent_column".to_string()],
+        max_memory_mb: 1024,
+        ..Default::default()
+    };
     let r = scx_loader::IndexPlanLoader::new(&path, config, 4, true, 4, 1024);
     match r {
         Err(LoaderError::ObsColumnNotFound { name, available }) => {
@@ -398,9 +403,11 @@ fn ctor_rejects_hvg_out_of_range() {
     let dir = tempfile::tempdir().unwrap();
     let path = fixture(&dir);
 
-    let mut config = scx_loader::LoaderConfig::default();
-    config.hvg_indices = Some(vec![0, 5, N_VARS as u32]); // last one is OOR
-    config.max_memory_mb = 1024;
+    let config = scx_loader::LoaderConfig {
+        hvg_indices: Some(vec![0, 5, N_VARS as u32]), // last one is OOR
+        max_memory_mb: 1024,
+        ..Default::default()
+    };
     let r = scx_loader::IndexPlanLoader::new(&path, config, 4, true, 4, 1024);
     match r {
         Err(LoaderError::ConfigError { reason }) => {
@@ -634,11 +641,13 @@ fn budget_breakdown_includes_transient_terms() {
     // Also verify the no-obs case has request scratch only (smaller bound).
     let n_obs_cols: usize = 1;
     let max_plan_size = 8192usize;
-    let mut config = LoaderConfig::default();
-    config.normalize = false;
-    config.log1p = false;
-    config.obs_columns = vec!["cell_id".to_string()];
-    config.max_memory_mb = 1024;
+    let config = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        obs_columns: vec!["cell_id".to_string()],
+        max_memory_mb: 1024,
+        ..Default::default()
+    };
     let loader = IndexPlanLoader::new(
         &path,
         config,
@@ -657,11 +666,13 @@ fn budget_breakdown_includes_transient_terms() {
 
     // No-obs case: should still account for the PairRequest scratch but
     // not for any obs Vecs. Budget should drop by exactly the obs term.
-    let mut cfg2 = LoaderConfig::default();
-    cfg2.normalize = false;
-    cfg2.log1p = false;
-    cfg2.obs_columns = vec![];
-    cfg2.max_memory_mb = 1024;
+    let cfg2 = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        obs_columns: vec![],
+        max_memory_mb: 1024,
+        ..Default::default()
+    };
     let loader2 = IndexPlanLoader::new(
         &path,
         cfg2,

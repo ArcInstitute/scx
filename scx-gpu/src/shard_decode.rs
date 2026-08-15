@@ -820,21 +820,19 @@ mod tests {
     use scx_format_io::shard::ShardHeader;
 
     /// CPU reference decode for comparison.
+    ///
+    /// Takes the three byte streams as the `EncodedShardRef` they already form
+    /// rather than as three loose slices — the arity is otherwise 8, and a
+    /// positional-argument mix-up between two `&[u8]` parameters is exactly the
+    /// class of error a GPU parity test cannot detect.
     fn cpu_decode(
-        indptr_bytes: &[u8],
-        indices_bytes: &[u8],
-        values_bytes: &[u8],
+        encoded: EncodedShardRef<'_>,
         codec_id: CodecId,
         value_encoding: ValueEncoding,
         n_rows: usize,
         nnz: usize,
         index_dtype_u16: bool,
     ) -> (Vec<i64>, Vec<i32>, Vec<f32>) {
-        let encoded = EncodedShardRef {
-            indptr_bytes,
-            indices_bytes,
-            values_bytes,
-        };
         decode_shard_scipy(
             &encoded,
             codec_id,
@@ -916,9 +914,11 @@ mod tests {
         let values_enc =
             &shard_bytes[header.values_rel_offset as usize..][..header.values_length as usize];
         let (cpu_indptr, cpu_indices, cpu_data) = cpu_decode(
-            indptr_enc,
-            indices_enc,
-            values_enc,
+            EncodedShardRef {
+                indptr_bytes: indptr_enc,
+                indices_bytes: indices_enc,
+                values_bytes: values_enc,
+            },
             CodecId::Scx1,
             ValueEncoding::Uint16,
             n_rows,
@@ -993,9 +993,11 @@ mod tests {
         let values_enc =
             &shard_bytes[header.values_rel_offset as usize..][..header.values_length as usize];
         let (cpu_indptr, cpu_indices, cpu_data) = cpu_decode(
-            indptr_enc,
-            indices_enc,
-            values_enc,
+            EncodedShardRef {
+                indptr_bytes: indptr_enc,
+                indices_bytes: indices_enc,
+                values_bytes: values_enc,
+            },
             CodecId::Scx1,
             ValueEncoding::Uint16,
             n_rows,
@@ -1334,9 +1336,11 @@ mod tests {
         let values_enc =
             &shard_bytes[header.values_rel_offset as usize..][..header.values_length as usize];
         let (cpu_indptr, cpu_indices, cpu_data) = cpu_decode(
-            indptr_enc,
-            indices_enc,
-            values_enc,
+            EncodedShardRef {
+                indptr_bytes: indptr_enc,
+                indices_bytes: indices_enc,
+                values_bytes: values_enc,
+            },
             CodecId::ShufDeltaZstd,
             ValueEncoding::Uint16,
             n_rows,
@@ -2043,9 +2047,11 @@ mod tests {
         let values_enc =
             &shard_bytes[header.values_rel_offset as usize..][..header.values_length as usize];
         let (cpu_indptr, cpu_indices, cpu_data) = cpu_decode(
-            indptr_enc,
-            indices_enc,
-            values_enc,
+            EncodedShardRef {
+                indptr_bytes: indptr_enc,
+                indices_bytes: indices_enc,
+                values_bytes: values_enc,
+            },
             CodecId::None,
             ValueEncoding::Uint8,
             10,
@@ -2122,9 +2128,11 @@ mod tests {
         let values_enc =
             &shard_bytes[header.values_rel_offset as usize..][..header.values_length as usize];
         let (cpu_indptr, cpu_indices, cpu_data) = cpu_decode(
-            indptr_enc,
-            indices_enc,
-            values_enc,
+            EncodedShardRef {
+                indptr_bytes: indptr_enc,
+                indices_bytes: indices_enc,
+                values_bytes: values_enc,
+            },
             CodecId::Zstd,
             ValueEncoding::Float32,
             n_rows,

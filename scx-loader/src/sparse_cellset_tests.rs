@@ -12,7 +12,7 @@ use scx_format_io::{BackedCsrReader, ScxReader};
 /// Minimal multi-shard `.scx`: row `r` has one non-zero at column `r % n_vars`
 /// with value `((r + 1) & 0xFF)`. Mirrors the plan_engine / index_plan fixture.
 fn write_fixture(path: &std::path::Path, n_obs: usize, n_vars: usize, n_shards: usize) {
-    assert!(n_obs % n_shards == 0);
+    assert!(n_obs.is_multiple_of(n_shards));
     let rows_per_shard = n_obs / n_shards;
     let header = FileHeader::new_single_modality(
         n_obs as u64,
@@ -1207,8 +1207,7 @@ fn collate_gathered_errors_rather_than_panicking_on_a_bad_indptr() {
         &[2],
         &scalars,
     )
-    .err()
-    .expect("a non-monotonic indptr must be an error, not a panic")
+    .expect_err("a non-monotonic indptr must be an error, not a panic")
     .to_string();
     assert!(err.contains("non-decreasing"), "unhelpful: {err}");
 }
@@ -1272,7 +1271,7 @@ fn teardown_through_the_real_iter_ownership_graph_is_bounded() {
     // The `ds.close()` half: the dataset's loader reference goes away while the
     // iterator (and the closure inside it) are still alive.
     drop(loader);
-    while let Some(b) = it.next() {
+    for b in it.by_ref() {
         b.expect("must gather");
     }
     drop(it);

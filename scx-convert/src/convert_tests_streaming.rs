@@ -1165,7 +1165,7 @@ fn scx_uns_between_the_write_cap_and_the_read_ceiling_still_exports_to_h5ad() {
     // what keeps the exporter's 127 a safe ceiling rather than a hopeful one.
     let too_deep = nest(SERDE_JSON_MAX_NESTING + 50);
     let mut w2 = ScxWriter::new(
-        &dir.path().join("over.scx"),
+        dir.path().join("over.scx"),
         FileHeader::new_single_modality(4, 2, 0, 4, 0, 0),
     )
     .unwrap();

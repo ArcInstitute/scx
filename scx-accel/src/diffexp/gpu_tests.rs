@@ -55,10 +55,8 @@ fn test_validate_wilcoxon_inputs_enforces_dim_guard_without_buffer() {
     validate_wilcoxon_inputs(Some(100), 10, 10, 10, 10).unwrap();
 }
 
-/// Deterministic small fixture: 60 cells × 8 genes, 3 groups (ref +
-/// 2 KOs) with engineered fold changes. Mirrors the shape of
-/// `pyscx/tests/test_pdex_ref_parity.py::_make_adata`.
-fn make_fixture() -> (
+/// `(data, n_obs, n_vars, gene_names, groups, group_names, reference)`.
+type Fixture = (
     Vec<f32>,
     usize,
     usize,
@@ -66,7 +64,12 @@ fn make_fixture() -> (
     Vec<usize>,
     Vec<String>,
     usize,
-) {
+);
+
+/// Deterministic small fixture: 60 cells × 8 genes, 3 groups (ref +
+/// 2 KOs) with engineered fold changes. Mirrors the shape of
+/// `pyscx/tests/test_pdex_ref_parity.py::_make_adata`.
+fn make_fixture() -> Fixture {
     let n_obs = 60usize;
     let n_vars = 8usize;
     // group 0: ref (20 cells), group 1: KO_A (20 cells), group 2: KO_B (20 cells).
@@ -1097,7 +1100,7 @@ fn test_pdex_ref_gpu_all_zero_gene() {
     let mut data = vec![0.0f32; n_obs * n_vars];
     // Non-zero genes: deterministic spread.
     for cell in 0..n_obs {
-        data[cell * n_vars + 0] = (cell as f32) % 5.0;
+        data[cell * n_vars] = (cell as f32) % 5.0;
         data[cell * n_vars + 1] = (cell as f32) * 0.5;
         // gene 2 left as 0.0
         data[cell * n_vars + 3] = if cell < 10 { 1.0 } else { 3.0 };
@@ -1162,7 +1165,7 @@ fn test_pdex_ref_gpu_all_equal_values_in_group() {
     // Gene 1: ref has spread; test group A is constant 5.0 (zero-variance).
     // Gene 2: both groups have spread but several values tie with each other.
     for cell in 0..n_obs {
-        data[cell * n_vars + 0] = ((cell as f32) % 7.0) + 0.5;
+        data[cell * n_vars] = ((cell as f32) % 7.0) + 0.5;
         data[cell * n_vars + 1] = if cell < 10 {
             (cell as f32) % 11.0 // ref: spread including 5.0 a few times
         } else {
@@ -1203,7 +1206,7 @@ fn test_gpu_lazy_entry_points_match_dense_reference() {
 
     // Reproducible sparse fixture (~12% density, integer counts ≤ 5).
     let mut data = vec![0.0f32; n_obs * n_vars];
-    let mut state: u64 = 0xDEADBEEFCAFE_F00D;
+    let mut state: u64 = 0xDEAD_BEEF_CAFE_F00D;
     let mut next = || {
         state = state
             .wrapping_mul(6364136223846793005)
@@ -1446,7 +1449,7 @@ fn test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset() {
             .collect()
     };
 
-    for g in 0..group_names.len() {
+    for (g, group_name) in group_names.iter().enumerate() {
         let a = to_map(&with_sentinel, g);
         let b = to_map(&physically_subset, g);
         for gene in &gene_names {
@@ -1455,17 +1458,17 @@ fn test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset() {
             assert!(
                 (sa - sb).abs() < 1e-6,
                 "score mismatch group={} gene={gene}: sentinel={sa}, subset={sb}",
-                group_names[g]
+                group_name
             );
             assert!(
                 (pa - pb).abs() < 1e-9 || (pa - pb).abs() / pa.abs().max(1e-12) < 1e-6,
                 "pval mismatch group={} gene={gene}: sentinel={pa}, subset={pb}",
-                group_names[g]
+                group_name
             );
             assert!(
                 (la - lb).abs() < 1e-6,
                 "logFC mismatch group={} gene={gene}: sentinel={la}, subset={lb}",
-                group_names[g]
+                group_name
             );
         }
     }
@@ -1534,7 +1537,7 @@ fn test_wilcoxon_gpu_unlabelled_matches_cpu() {
             .map(|(i, n)| (n.clone(), (res.scores[g][i], res.logfoldchanges[g][i])))
             .collect()
     };
-    for g in 0..group_names.len() {
+    for (g, group_name) in group_names.iter().enumerate() {
         let c = to_map(&cpu, g);
         let d = to_map(&gpu, g);
         for gene in &gene_names {
@@ -1543,12 +1546,12 @@ fn test_wilcoxon_gpu_unlabelled_matches_cpu() {
             assert!(
                 (sc - sg).abs() < 1e-6,
                 "score mismatch group={} gene={gene}: cpu={sc}, gpu={sg}",
-                group_names[g]
+                group_name
             );
             assert!(
                 (lc - lg).abs() < 1e-6,
                 "logFC mismatch group={} gene={gene}: cpu={lc}, gpu={lg}",
-                group_names[g]
+                group_name
             );
         }
     }

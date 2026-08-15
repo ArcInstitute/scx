@@ -860,7 +860,7 @@ mod tests {
         // no-self) neighbor structure at k=5.
         let (data, n_obs, n_vars) = two_cluster_data();
         let result = build_knn_graph(&data, n_obs, n_vars, 5, 100, 50, 42).unwrap();
-        let knn_idx: Vec<usize> = result.indices.iter().map(|&i| i as usize).collect();
+        let knn_idx: Vec<usize> = result.indices.to_vec();
         let (indptr, indices, cdata) =
             compute_connectivities(&knn_idx, &result.distances, n_obs, 5);
         let (r_indptr, r_indices, r_data) =
@@ -1000,13 +1000,15 @@ mod tests {
         );
 
         // Distances themselves should match brute force within FP tolerance.
-        for i in 0..n_obs * k {
-            let diff = (result.distances[i] - ref_dist[i]).abs();
+        // Assert the lengths first: `zip` stops at the shorter side, so a shape
+        // change would otherwise silently shrink what the loop below compares.
+        assert_eq!(result.distances.len(), n_obs * k);
+        assert_eq!(ref_dist.len(), n_obs * k);
+        for (i, (&got, &want)) in result.distances.iter().zip(&ref_dist).enumerate() {
+            let diff = (got - want).abs();
             assert!(
                 diff < 1e-4,
-                "distance mismatch at flat-idx {i}: exact={} ref={}",
-                result.distances[i],
-                ref_dist[i],
+                "distance mismatch at flat-idx {i}: exact={got} ref={want}",
             );
         }
     }

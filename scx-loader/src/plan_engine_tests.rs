@@ -15,7 +15,7 @@ use crate::error::LoaderError;
 /// with value `((r + 1) & 0xFF)`, so `(col, value)` is recoverable from the
 /// row index. Mirrors `index_plan_tests::write_multi_shard_fixture`.
 fn write_multi_shard_fixture(path: &std::path::Path, n_obs: usize, n_vars: usize, n_shards: usize) {
-    assert!(n_obs % n_shards == 0, "n_obs must divide n_shards");
+    assert!(n_obs.is_multiple_of(n_shards), "n_obs must divide n_shards");
     let rows_per_shard = n_obs / n_shards;
     let header = FileHeader::new_single_modality(
         n_obs as u64,
