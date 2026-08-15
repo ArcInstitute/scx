@@ -968,3 +968,89 @@ fn test_pcodec_large_declared_nnz_does_not_preallocate_from_the_header() {
         FLOAT_DST_BYTES / 2
     );
 }
+
+/// An honest round trip that spans **more than one pco chunk**.
+///
+/// The incremental decode loop is a two-level state machine, and its outer
+/// level — finish a chunk, hand the source to the next via `into_src` — is
+/// reached only above pco's default page size (`1 << 18` values). Every other
+/// pcodec test here sits below that or fails on the first `read`, so chunk-to-
+/// chunk advancement, concatenation order and the aggregate count had no
+/// regression net: the loop could break after chunk one and they would all
+/// still pass.
+///
+/// The multi-chunk premise is *proved* by walking the stream, not assumed from
+/// pco's default paging, so this cannot quietly become a single-chunk test if
+/// that default changes.
+#[test]
+fn test_pcodec_multi_chunk_roundtrip_is_byte_exact() {
+    use pco::standalone::{DecompressorItem, FileDecompressor};
+
+    // ~3 default pco pages of diverse (not low-entropy) floats.
+    const NNZ: usize = 800_000;
+    let mut state: u64 = 0xdead_beef_cafe_babe;
+    let floats: Vec<f32> = (0..NNZ)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32) / 1024.0
+        })
+        .collect();
+
+    let n_rows = 800usize;
+    let per_row = NNZ / n_rows;
+    let indptr: Vec<u64> = (0..=n_rows).map(|r| (r * per_row) as u64).collect();
+    let indices: Vec<u32> = (0..NNZ).map(|i| (i % per_row) as u32).collect();
+    let values = values_to_raw_bytes(&floats, ValueEncoding::Float32).unwrap();
+
+    let encoded = scx_codec::dispatch::encode_shard(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::Pcodec,
+        ValueEncoding::Float32,
+        false,
+    )
+    .unwrap();
+
+    // Premise: the value stream really does carry more than one chunk.
+    let mut chunks = 0usize;
+    let mut scratch = vec![0f32; 1 << 16];
+    let (fd, mut src) = FileDecompressor::new(encoded.values_bytes.as_slice()).unwrap();
+    loop {
+        match fd.chunk_decompressor::<f32, _>(src).unwrap() {
+            DecompressorItem::EndOfData(_) => break,
+            DecompressorItem::Chunk(mut cd) => {
+                chunks += 1;
+                loop {
+                    if cd.read(&mut scratch).unwrap().finished {
+                        break;
+                    }
+                }
+                src = cd.into_src();
+            }
+        }
+    }
+    assert!(
+        chunks > 1,
+        "premise failed: {NNZ} values encoded to {chunks} pco chunk(s), so this \
+         test would not reach the chunk-to-chunk transition"
+    );
+
+    let decoded = scx_codec::dispatch::decode_shard(
+        &encoded,
+        CodecId::Pcodec,
+        ValueEncoding::Float32,
+        n_rows,
+        NNZ,
+        false,
+    )
+    .unwrap();
+    assert_eq!(decoded.0.len(), n_rows + 1, "indptr length");
+    assert_eq!(decoded.1.len(), NNZ, "indices length");
+    assert_eq!(
+        decoded.2, values,
+        "values must round-trip byte-exactly across {chunks} pco chunks"
+    );
+}

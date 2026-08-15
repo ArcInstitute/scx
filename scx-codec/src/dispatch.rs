@@ -1661,9 +1661,14 @@ fn pcodec_decompress_bounded(data: &[u8], n_values: usize) -> Result<Vec<f32>, C
     // Round up to `read`'s 256 stride, but never overshoot a small shard: a
     // fixed 256 KiB slab made a 5k-value shard decode ~1.5× slower than the
     // eager path it replaces. `checked_len` above keeps `next_multiple_of`
-    // clear of overflow. Both branches of `read`'s contract stay satisfied —
-    // this is a multiple of 256, and for an honest stream it is also ≥ the
-    // chunk remainder.
+    // clear of overflow.
+    //
+    // `read` accepts a `dst` that is a multiple of 256 *or* at least the
+    // chunk's remaining count. Only the **first** clause is what makes this
+    // sound, and it always holds: `.max(256)` keeps the slab non-zero and both
+    // `next_multiple_of(256)` and `SLAB` are multiples of 256. The second
+    // clause is *not* generally true here — a default pco page is 1<<18
+    // values, which exceeds the 1<<16 slab — so do not lean on it.
     let slab_len = SLAB.min(n_values.next_multiple_of(256).max(256));
     let mut slab = vec![0f32; slab_len];
     let (fd, mut src) = FileDecompressor::new(data).map_err(pco_err)?;
