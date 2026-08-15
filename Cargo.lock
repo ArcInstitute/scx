@@ -3668,6 +3668,7 @@ dependencies = [
  "scx-format-io",
  "scx-ops",
  "scx-sparse",
+ "scx-testkit",
  "serde",
  "serde_json",
  "tempfile",
@@ -3756,6 +3757,20 @@ dependencies = [
  "rand_chacha 0.3.1",
  "rand_distr 0.4.3",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "scx-testkit"
+version = "0.14.0"
+dependencies = [
+ "arrow",
+ "blake3",
+ "scx-codec",
+ "scx-format",
+ "scx-format-io",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

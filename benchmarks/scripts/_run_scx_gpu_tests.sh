@@ -116,7 +116,15 @@ run_suite scx-accel  cargo test -p scx-accel --features gpu --release
 # why this must not be anchored with `^`, which would silently match nothing
 # and report full coverage on a node that skipped half the suite.
 echo "=== skipped on this node ==="
+# `test_gate::tests::*` are the gate's OWN unit tests. They call `decline`
+# directly to prove the skip path still prints and the strict path still
+# panics, so they emit the marker while running perfectly happily on any host.
+# Listing them as "coverage this node did not provide" would be false, and
+# would put a line reading `[nvcomp not available]` in front of a reader for a
+# test that has nothing to do with nvcomp. That module is CPU-only by
+# construction — it tests the decision, never a device.
 SKIPPED=$(grep -h 'SCX_GPU_TEST_SKIPPED' "${LOG_DIR}"/*.log 2>/dev/null \
+    | grep -v 'test_gate::tests::' \
     | awk -F' \\.\\.\\. SCX_GPU_TEST_SKIPPED: ' '{
           name = $1; sub(/^test /, "", name);
           reason = $2; sub(/ \(.*/, "", reason); sub(/^[^ ]+ . /, "", reason);
