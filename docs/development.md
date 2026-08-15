@@ -41,8 +41,9 @@ cargo build --workspace --exclude rscx
 # Run all tests
 cargo test --workspace --exclude rscx
 
-# Lint
-cargo clippy --workspace --exclude rscx -- -D warnings
+# Lint. `--all-targets` also lints tests, benches and examples — CI holds them
+# to the same bar, so a lib-only run can be clean while CI is red.
+cargo clippy --workspace --exclude rscx --all-targets -- -D warnings
 
 # Format check
 cargo fmt --check
@@ -395,9 +396,9 @@ to `main`:
 |-----|-------------|
 | `build-cpu-only` | `cargo build --workspace --exclude rscx` — pins the CPU-only build contract |
 | `test` | `cargo test --workspace --exclude rscx` |
-| `clippy` | `cargo clippy --workspace --exclude rscx -- -D warnings` |
+| `clippy` | `cargo clippy --workspace --exclude rscx --all-targets -- -D warnings` — `--all-targets` lints test and bench code too |
 | `fmt` | `cargo fmt --check` |
-| `feature-check` | Matrix of `cargo check`/`clippy` for feature combos (cloud, hdf5, gpu) |
+| `feature-check` | Matrix of `cargo check`/`clippy --all-targets` for feature combos (cloud, hdf5, gpu) |
 | `python` | maturin develop + pytest (with cloud features, fork-safety tests) |
 
 The `build-cpu-only` job explicitly validates that the entire workspace

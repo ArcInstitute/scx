@@ -43,12 +43,12 @@ Run on the edited working tree, *before* committing (Phase 2 of the pipeline bel
 
 **Format and codec:**
 
-- [ ] `cargo test --workspace` passes (CPU-only). **Two known non-blocking environmental failures:**
+- [ ] `cargo test --workspace --exclude rscx` passes (CPU-only). **Two known non-blocking environmental failures:**
   - `scx-cloud::backend::tests::create_gcs_backend` (and potentially `create_s3_backend`) **fail in a sandbox with no network** — the `object_store` GCS builder probes the GCE metadata server at `build()` time. They pass in CI, which has network. To confirm a failure is this and not a real regression, re-run the single test on plain `main` (`git stash` or a clean checkout): an *identical* failure on `main` means environmental, not introduced by your change.
   - See also the extendr note below.
-- [ ] `cargo clippy --workspace -- -D warnings` clean
+- [ ] `cargo clippy --workspace --exclude rscx --all-targets -- -D warnings` clean. `--exclude rscx` matches CI (see the extendr note below); `--all-targets` lints test and bench code, which CI also does.
 - [ ] `cargo fmt --check` clean
-- [ ] `cargo test --workspace --features cloud` passes if cloud changes
+- [ ] `cargo test --workspace --exclude rscx --features cloud` passes if cloud changes
 - [ ] `cargo check` on default-members compiles. **`cargo check --workspace` may fail in `extendr-api`** (the R-bindings dep needs an R toolchain); rscx is intentionally excluded from default-members for this reason — that failure is *not* a release blocker.
 
 **Fuzzing** (run before any release that touches `scx-codec`, `scx-format`, or `scx-engine` parsers; recommended on every synchronized minor regardless):
@@ -95,7 +95,7 @@ The repo's remote is named `github`, NOT `origin`. Never commit the version bump
 **Phase 2 — Run pre-release checks (mandatory, not optional)**
 
 4. **Sanity build:** `cargo check` (default-members only). Expect the rscx/extendr failure on `cargo check --workspace`; that's pre-existing.
-5. **Run the full [Pre-release verification](#pre-release-verification) checklist** appropriate to what changed — this is part of the bump, not a separate later step. For a version-only bump the format/codec/Python checks should be unaffected, but at minimum **all three of** `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace` MUST be clean before you commit and open the PR. Run them locally first; let CI be the second signal, not the first. Do not proceed to Phase 3 with a failing check.
+5. **Run the full [Pre-release verification](#pre-release-verification) checklist** appropriate to what changed — this is part of the bump, not a separate later step. For a version-only bump the format/codec/Python checks should be unaffected, but at minimum **all three of** `cargo fmt --check`, `cargo clippy --workspace --exclude rscx --all-targets -- -D warnings`, and `cargo test --workspace --exclude rscx` MUST be clean before you commit and open the PR. Run them locally first; let CI be the second signal, not the first. Do not proceed to Phase 3 with a failing check.
 
 **Phase 3 — Commit on a branch**
 

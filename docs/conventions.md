@@ -184,6 +184,35 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   sharing a `*_common` fixtures module (see `scx-convert`'s `convert_tests_*`),
   kept as crate submodules to preserve `super::` access to crate internals.
 
+## Refactor PRs
+
+Rules for any PR whose stated purpose is to move, split, or unify code rather
+than to change what it does. They exist because a behaviour-preserving refactor
+validated by a suite that cannot fail is indistinguishable from a regression.
+
+- **A split-only commit must be a pure move.** `git diff --stat` should show
+  matched insertions and deletions with no net line delta beyond `use` / `mod`
+  lines. Never mix a module split with a semantic change in one commit — a
+  reviewer cannot tell them apart in a 3000-line diff, and a bisect cannot
+  either.
+- **The test that would catch the refactor going wrong lands first, and is
+  watched failing.** Break the pre-refactor code deliberately, confirm the new
+  test goes red, then restore and refactor. A test written afterwards against
+  code you just wrote tests the code, not the contract.
+- **Identity and determinism claims cite the harness.** A path documented as
+  byte-identical or deterministic (the `scx-ops` rewrite paths, the
+  `scx-convert` sequential-vs-parallel coordinators, the `scx-gpu` decoders)
+  must, when refactored, cite an `scx-testkit` digest test in the PR body. A
+  round-trip test is not evidence for a byte-identity contract — it proves the
+  data survived, not that the bytes did. See
+  [Test Organization](#test-organization) and `scx-testkit/src/digest.rs`.
+- **Never `git add -A`.** The repo root carries untracked scratch markdown, and
+  the local pre-commit hook already runs `git add -u`.
+- **Perf-touching refactors gate before merge** against
+  `results/baselines/LATEST` via `benchmarks/scripts/gate_candidate.py`,
+  submitted as SLURM jobs one at a time. Added abstraction on a decode or
+  rewrite hot path is a measurable cost until measured otherwise.
+
 ## Python Bindings (pyscx)
 
 - PyO3 with `Bound<'py, T>` API (not deprecated `&PyAny`).

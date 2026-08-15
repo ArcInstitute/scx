@@ -35,12 +35,14 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 ## Build and Test
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
+# `--exclude rscx` matches CI: rscx pulls in extendr-api, whose build.rs panics
+# without an R toolchain (it is a workspace member but not a default-member).
+cargo test --workspace --exclude rscx
+cargo clippy --workspace --exclude rscx --all-targets -- -D warnings
 cargo fmt --check
 
 # With cloud features:
-cargo test --workspace --features cloud
+cargo test --workspace --exclude rscx --features cloud
 
 # Python bindings (always use uv venv at .venv/):
 cd pyscx && ../.venv/bin/maturin develop && ../.venv/bin/pytest tests/ -v
