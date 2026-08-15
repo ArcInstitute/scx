@@ -123,8 +123,8 @@ pub fn upload_hvg_map(
 /// for absent entries.
 ///
 /// Thin wrapper around [`sparse_to_dense_gpu_into`] for one-shot callers that
-/// don't reuse a scratch buffer. Loop callers (e.g. `accumulate_gram`) should
-/// hoist the buffer and call [`sparse_to_dense_gpu_into`] directly.
+/// don't reuse a scratch buffer. Loop callers should hoist the buffer and call
+/// [`sparse_to_dense_gpu_into`] directly.
 pub fn sparse_to_dense_gpu(
     device: &GpuDevice,
     gpu_csr: &GpuCsr,

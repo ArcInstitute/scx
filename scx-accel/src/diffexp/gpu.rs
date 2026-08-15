@@ -698,12 +698,12 @@ fn wilcoxon_chunk_gpu_sequence_v3(
 /// G4 v2: pdex_ref per-chunk GPU kernel sequence WITHOUT per-chunk scatter
 /// kernel calls. The v2 chunk loop pre-populates `scratch.ref_slab` and
 /// `scratch.per_tg_pool_slabs[..]` directly from the CSR shard source via
-/// [`gpu_de_scatter_shard_to_gene_major`] before invoking this sequence,
-/// so this function starts with sort + tie on already-filled slabs.
+/// the CSR gene-major scatter before invoking this sequence, so this
+/// function starts with sort + tie on already-filled slabs.
 ///
 /// Versus a scatter-from-dense sequence:
-/// - Skips `gpu_de_scatter_gene_major` for ref (slab is pre-populated).
-/// - Skips `gpu_de_scatter_gene_major` for each test group; reads from
+/// - Skips the ref scatter (slab is pre-populated).
+/// - Skips the per-test-group scatter; reads from
 ///   `scratch.per_tg_pool_slabs[tg_idx]` instead of `scratch.group_slab`.
 ///
 /// Same numerical contract as v1 — produces identical U / p / tie values
@@ -859,8 +859,8 @@ fn compute_pdex_means_from_sums(
 /// G4 v3 CSR-fallback driver for `pdex_ref`. Same shape as v2 but drops
 /// the `[n_obs × chunk_size]` dense materialization step: per chunk, zeros
 /// ref + per-tg pool slabs + sums, walks the CSR shard source ONCE per
-/// chunk, populating the per-tg pool slabs (via G4.1's
-/// `gpu_de_scatter_shard_to_gene_major`) and pseudobulk sums (via the new
+/// chunk, populating the per-tg pool slabs (via the CSR gene-major
+/// scatter) and pseudobulk sums (via the new
 /// `gpu_de_pseudobulk_csr_direct`) in a single pass per shard. No dense
 /// scatter, no `gpu_de_pseudobulk_all_groups` call.
 ///

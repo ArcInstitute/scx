@@ -36,9 +36,6 @@ use crate::error::GpuError;
 use crate::linear_operator::CenteredSparseOperator;
 use crate::math_policy::GpuPcaTuning;
 
-/// PTX source for the row-major mean-correction kernel, compiled at build time.
-const MEAN_CORRECT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/spmm_mean_correct.ptx"));
-
 /// PTX source for col-major scatter/gather/mean-correct/column-sum kernels.
 const COLMAJOR_OPS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/colmajor_ops.ptx"));
 
@@ -51,19 +48,13 @@ const COLMAJOR_OPS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/colmajor_
 /// iter × ~30 iters); this scratch lets `gpu_randomized_pca` allocate once
 /// and reuse across the whole run.
 ///
-/// Sized for a known `k` at construction time; [`Self::ensure_k_capacity`]
-/// grows the buffers in `next_power_of_two` steps when a larger `k` arrives.
-/// Mirrors the grow-only pattern in
-/// [`crate::gpu_diffexp::GpuDeChunkScratch`].
+/// Sized for a known `k` at construction time.
 pub struct GpuPcaScratch {
-    /// `(n_obs × k_capacity)` col-major — receives forward SpMM output and
+    /// `(n_obs × k)` col-major — receives forward SpMM output and
     /// is then consumed in-place by `gpu_qr_q` / `gpu_cholesky_qr2`.
     pub d_y: CudaSlice<f32>,
-    /// `(n_vars × k_capacity)` col-major — receives transpose SpMM output.
+    /// `(n_vars × k)` col-major — receives transpose SpMM output.
     pub d_z: CudaSlice<f32>,
-    n_obs: usize,
-    n_vars: usize,
-    k_capacity: usize,
 }
 
 impl GpuPcaScratch {
@@ -72,31 +63,7 @@ impl GpuPcaScratch {
     pub fn new(dev: &GpuDevice, n_obs: usize, n_vars: usize, k: usize) -> Result<Self, GpuError> {
         let d_y = dev.alloc_zeros::<f32>(n_obs * k)?;
         let d_z = dev.alloc_zeros::<f32>(n_vars * k)?;
-        Ok(Self {
-            d_y,
-            d_z,
-            n_obs,
-            n_vars,
-            k_capacity: k,
-        })
-    }
-
-    /// Grow `d_y` / `d_z` to at least `k` columns, bumping to
-    /// `next_power_of_two` to amortise repeated growths.
-    pub fn ensure_k_capacity(&mut self, dev: &GpuDevice, k: usize) -> Result<(), GpuError> {
-        if k <= self.k_capacity {
-            return Ok(());
-        }
-        let new_cap = k.next_power_of_two().max(self.k_capacity * 2);
-        self.d_y = dev.alloc_zeros::<f32>(self.n_obs * new_cap)?;
-        self.d_z = dev.alloc_zeros::<f32>(self.n_vars * new_cap)?;
-        self.k_capacity = new_cap;
-        Ok(())
-    }
-
-    /// Maximum `k` this scratch is sized for.
-    pub fn k_capacity(&self) -> usize {
-        self.k_capacity
+        Ok(Self { d_y, d_z })
     }
 }
 
@@ -913,110 +880,9 @@ fn format_scx_error(e: scx_format_io::ScxError) -> GpuError {
     GpuError::InvalidShard(format!("SCX read error: {e}"))
 }
 
-/// Subtract a per-column correction vector from each row of a matrix.
-///
-/// Computes `Y[row, col] -= mc[col]` for all `(row, col)`.
-/// The matrix Y is in **row-major** layout.
-///
-/// - `y`: row-major `[n_obs × k]` on GPU, modified in-place
-/// - `mc`: correction vector `[k]` on GPU
-/// - `n_obs`: number of rows
-/// - `k`: number of columns
-///
-/// The kernel uses 256 threads per block with one thread per element.
-/// Total threads = `n_obs × k`.
-pub fn mean_correct_gpu(
-    dev: &GpuDevice,
-    y: &mut CudaSlice<f32>,
-    mc: &CudaSlice<f32>,
-    n_obs: usize,
-    k: usize,
-) -> Result<(), GpuError> {
-    let total: u64 = (n_obs as u64) * (k as u64);
-    if total == 0 {
-        return Ok(());
-    }
-
-    let module = dev.load_module_cached(MEAN_CORRECT_PTX)?;
-    let func = module
-        .load_function("mean_correct_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_kernel: {e}")))?;
-
-    let n_obs_i64 = n_obs as i64;
-    let k_i64 = k as i64;
-
-    let cfg = flat_launch_1d(total, 256)?;
-
-    unsafe {
-        dev.stream()
-            .launch_builder(&func)
-            .arg(y)
-            .arg(mc)
-            .arg(&n_obs_i64)
-            .arg(&k_i64)
-            .launch(cfg)
-    }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_kernel: {e}")))?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn test_mean_correct() {
-        let dev = require_gpu!();
-
-        let n_obs = 4;
-        let k = 3;
-
-        // Y (row-major 4×3): each row = [10, 20, 30]
-        let y_host: Vec<f32> = vec![
-            10.0, 20.0, 30.0, // row 0
-            10.0, 20.0, 30.0, // row 1
-            10.0, 20.0, 30.0, // row 2
-            10.0, 20.0, 30.0, // row 3
-        ];
-        // mc = [1, 2, 3]
-        let mc_host: Vec<f32> = vec![1.0, 2.0, 3.0];
-
-        let mut d_y = dev.htod_copy(&y_host).unwrap();
-        let d_mc = dev.htod_copy(&mc_host).unwrap();
-
-        mean_correct_gpu(&dev, &mut d_y, &d_mc, n_obs, k).unwrap();
-        dev.synchronize().unwrap();
-
-        let result = dev.dtoh_copy(&d_y).unwrap();
-
-        // Expected: each row = [10-1, 20-2, 30-3] = [9, 18, 27]
-        let expected: Vec<f32> = vec![
-            9.0, 18.0, 27.0, 9.0, 18.0, 27.0, 9.0, 18.0, 27.0, 9.0, 18.0, 27.0,
-        ];
-
-        assert_eq!(result.len(), expected.len());
-        for i in 0..result.len() {
-            assert!(
-                (result[i] - expected[i]).abs() < 1e-5,
-                "mean_correct mismatch at {i}: got {}, expected {}",
-                result[i],
-                expected[i]
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn test_mean_correct_empty() {
-        let dev = require_gpu!();
-
-        // Zero-size should not panic
-        let mut d_y = dev.alloc_zeros::<f32>(0).unwrap();
-        let d_mc = dev.alloc_zeros::<f32>(0).unwrap();
-        mean_correct_gpu(&dev, &mut d_y, &d_mc, 0, 0).unwrap();
-    }
 
     #[test]
     #[ignore = "requires a CUDA GPU"]

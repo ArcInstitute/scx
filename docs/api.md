@@ -1265,8 +1265,9 @@ Generate a random Gaussian matrix directly on GPU via cuRAND XORWOW generator.
 #### `gpu_randomized_pca(dev, reader, n_components, n_oversamples, n_power_iterations, zero_center, seed) → Result<GpuPcaResult, GpuError>`
 Complete GPU-accelerated randomized PCA. Streams SpMM shard-by-shard via cuSPARSE, QR via cuSOLVER, SVD via CPU faer, final projection via GPU GEMM. Returns `GpuPcaResult { embeddings, components, variance_explained, variance_ratio, mean }`.
 
-#### `mean_correct_gpu(dev, y, mc, n_obs, k) → Result<(), GpuError>`
-Mean-centering correction kernel: Y[i,j] -= mc[j] for all rows.
+> **Row-major `mean_correct_gpu`** — removed. It had no caller after the GPU PCA
+> path moved to the col-major operator; centering now happens inside
+> `CenteredSparseOperator` via `mean_correct_colmajor_strided_kernel`.
 
 ### GPU kNN
 

@@ -36,7 +36,8 @@
 //     back uncentered despite zero_center=True, with nothing reporting it.
 //
 // `global_row` and `ld` are 64-bit for the same reason: they address the global
-// (n_obs × k) buffer. Matches `spmm_mean_correct.cu`, the row-major sibling.
+// (n_obs × k) buffer. This kernel is the reference shape for the 64-bit flat
+// indexing rule in docs/conventions.md § GPU.
 extern "C" __global__ void mean_correct_colmajor_strided_kernel(
     float* __restrict__ Y,           // [ld × k], col-major; full matrix
     const float* __restrict__ mc,    // [k]

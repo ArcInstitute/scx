@@ -281,7 +281,8 @@ validated by a suite that cannot fail is indistinguishable from a regression.
 - **64-bit flat indexing.** A kernel that indexes a flat matrix computes its
   element total *and* its flat index in 64-bit (`long long` parameters, with the
   `(long long)` cast applied to `blockIdx.x` before the multiply);
-  `kernels/spmm_mean_correct.cu` is the reference shape. Host wrappers size 1-D
+  `kernels/colmajor_ops.cu`'s `mean_correct_colmajor_strided_kernel` is the
+  reference shape. Host wrappers size 1-D
   grids through `scx_gpu::flat_launch_1d`, never `(total as u32).div_ceil(...)`.
   Both halves are required: a 32-bit `int total = m * k` overflows past 2³¹
   elements — signed overflow, so UB, and what nvcc emits at `-O3` is threads

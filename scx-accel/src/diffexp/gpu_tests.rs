@@ -481,9 +481,8 @@ fn test_wilcoxon_gpu_one_vs_rest_graph_vs_direct_parity() {
 
 /// G10.5 parity (ref-mode): graph-captured wilcoxon path matches
 /// direct in ref-mode. Same kernel determinism contract as the
-/// 1-vs-rest test above, but exercises the second `GraphKey`
-/// variant (`mode=1`) and the per-tg combined-tie + tie_per_group
-/// staging path.
+/// 1-vs-rest test above, but exercises ref-mode (`mode=1`) and the
+/// per-tg combined-tie + tie_per_group staging path.
 ///
 /// The shared `make_fixture` provides a reference group via its
 /// last return value; passing it as `reference: Some(...)` routes
@@ -1185,9 +1184,10 @@ fn test_pdex_ref_gpu_all_equal_values_in_group() {
 }
 
 /// The lazy arm of `pdex_ref_gpu` / `wilcoxon_rank_sum_gpu`
-/// matches the dense (`gpu_de_upload_chunk`) reference on the same fixture.
-/// We feed the same `ScxCsr` through both paths: dense via
-/// `pdex_ref_gpu_dense` (legacy host upload), and lazy via
+/// matches the dense reference on the same fixture. We feed the same `ScxCsr`
+/// through both paths: dense via `pdex_ref_gpu_dense` (which densifies to CSR
+/// and routes through v3 — it has not gone through the old host-upload
+/// primitive since that path was retired), and lazy via
 /// `pdex_ref_gpu(GpuDeShardInput::Lazy(&InMemoryCsrShardSource(&csr)))`
 /// (new device-resident
 /// scatter). The two paths must agree bit-for-bit on the U statistic

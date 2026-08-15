@@ -133,7 +133,7 @@ pub mod test_gate;
 pub use backed_gpu_matrix_source::BackedGpuMatrixSource;
 pub use cublas::{gpu_sgemm, gpu_sgemv, gpu_sger, gpu_strsm, gpu_transpose_f32, CublasHandle};
 pub use curand::random_gaussian_gpu;
-pub use cusolver::{gpu_cholesky_qr2, gpu_eigh_sym, gpu_qr_q, CusolverHandle, QrMethod};
+pub use cusolver::{gpu_cholesky_qr2, gpu_qr_q, CusolverHandle, QrMethod};
 pub use cusparse::{
     cusparse_modern_abi_available, spmm_csr, spmm_csr_transpose, CusparseHandle,
     CusparseSpMatDescr, DnMatDescr, GpuCsrPointers,
@@ -145,28 +145,21 @@ pub use forbp_gpu::forbp_decode_gpu;
 pub use gpu_csc_shard_source::{GpuCscShardSource, GpuCscShardView, RawGpuCscShardSource};
 pub use gpu_csr_assemble::{decode_csr_shards_to_device, decode_csr_shards_to_device_with_stats};
 pub use gpu_diffexp::{
-    build_cell_to_group_dev, build_cell_to_pool_dev, build_cell_to_pos_dev,
-    default_gpu_de_gene_chunk_size, gpu_de_aux_elems, gpu_de_aux_span, gpu_de_block_sort,
-    gpu_de_budget_gene_chunk, gpu_de_combined_tie_term, gpu_de_per_gene_scratch_bytes,
-    gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct,
-    gpu_de_pvalues, gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_csr_to_gene_major_filtered,
-    gpu_de_scatter_gene_major, gpu_de_scatter_gene_major_dev, gpu_de_scatter_shard_to_dense,
-    gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
-    gpu_de_tie_term, gpu_de_upload_chunk, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
-    GPU_DE_MIN_GENE_CHUNK,
+    build_cell_to_group_dev, build_cell_to_pos_dev, default_gpu_de_gene_chunk_size,
+    gpu_de_aux_elems, gpu_de_aux_span, gpu_de_block_sort, gpu_de_budget_gene_chunk,
+    gpu_de_combined_tie_term, gpu_de_per_gene_scratch_bytes, gpu_de_pseudobulk_all_groups,
+    gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct, gpu_de_pvalues,
+    gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_csr_to_gene_major_filtered,
+    gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term, GpuDeChunkScratch,
+    GPU_DE_BLOCK_SORT_CAPACITY, GPU_DE_MIN_GENE_CHUNK,
 };
-pub use gpu_graph::{
-    capture_graph, cuda_graphs_enabled, exec_kernel_node_set_params, graph_kernel_nodes,
-    read_kernel_node_params, set_cuda_graphs_enabled_override, GpuGraphCache, GpuGraphMetrics,
-    GraphKey,
-};
+pub use gpu_graph::{capture_graph, cuda_graphs_enabled, set_cuda_graphs_enabled_override};
 pub use gpu_harmony::{
     gpu_harmony_block_oe_update, gpu_harmony_block_softmax_penalty, gpu_harmony_compute_o_e_full,
     gpu_harmony_correction, gpu_harmony_correction_grouped, gpu_harmony_distances,
     gpu_harmony_distances_gemm, gpu_harmony_fits, gpu_harmony_l2_normalize_cols,
     gpu_harmony_memory_bytes, gpu_harmony_obj_cross, gpu_harmony_obj_kmeans_entropy,
-    gpu_harmony_reduce_objective, gpu_harmony_softmax, gpu_harmony_softmax_penalty,
-    gpu_harmony_z_sum,
+    gpu_harmony_reduce_objective, gpu_harmony_softmax, gpu_harmony_z_sum,
 };
 pub use gpu_hvg::{
     gpu_streaming_clip_square_sum, gpu_streaming_clip_square_sum_batched,
@@ -181,8 +174,7 @@ pub use gpu_nb_glm::{
 };
 pub use gpu_pairwise::gpu_mean_pairwise_distance;
 pub use gpu_pca::{
-    gpu_randomized_pca, gpu_randomized_pca_device, mean_correct_gpu, GpuPcaDeviceResult,
-    GpuPcaResult,
+    gpu_randomized_pca, gpu_randomized_pca_device, GpuPcaDeviceResult, GpuPcaResult,
 };
 pub use gpu_preprocess::{
     gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,

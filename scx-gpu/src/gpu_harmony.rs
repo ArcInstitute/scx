@@ -219,86 +219,6 @@ pub fn gpu_harmony_distances_gemm(
     Ok(())
 }
 
-/// Fused softmax + diversity-penalty kernel.
-///
-/// For each cell, computes `R[:, i] = softmax(-dist[:, i]/sigma + sum_c theta_c * log_ratio_c)`
-/// where `log_ratio_c = log((2 E[k, b_c(i)]+1) / (O[k, b_c(i)] + E[k, b_c(i)] + 1))`.
-///
-/// `batch_labels_flat` must be the per-covariate labels laid out as a
-/// `(C x N)` row-major i32 matrix (so covariate c's label for cell i is
-/// at `c*N + i`). `cov_offset` has length C.
-#[allow(clippy::too_many_arguments)]
-pub fn gpu_harmony_softmax_penalty(
-    dev: &GpuDevice,
-    dist: &CudaSlice<f32>,
-    sigma: &CudaSlice<f32>,
-    o: &CudaSlice<f32>,
-    e: &CudaSlice<f32>,
-    theta: &CudaSlice<f32>,
-    batch_labels_flat: &CudaSlice<i32>,
-    cov_offset: &CudaSlice<i32>,
-    r_out: &mut CudaSlice<f32>,
-    c: usize,
-    k: usize,
-    n: usize,
-    b: usize,
-) -> Result<(), GpuError> {
-    if k == 0 || n == 0 || c == 0 {
-        return Ok(());
-    }
-    if (n as u64) > i32::MAX as u64 {
-        return Err(GpuError::ShapeMismatch {
-            expected: "n < 2^31 (CUDA grid_dim.x cap)".into(),
-            got: format!("n = {n}"),
-        });
-    }
-
-    let module = dev.load_module_cached(HARMONY_PTX)?;
-    let func = module
-        .load_function("harmony_softmax_penalty_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_softmax_penalty: {e}")))?;
-
-    // One block per cell, min(256, next_pow2(K)) threads. Power-of-two
-    // block size simplifies the reduction logic in the kernel.
-    let threads: u32 = {
-        let mut t = 32u32;
-        while (t as usize) < k && t < 1024 {
-            t <<= 1;
-        }
-        t.min(1024)
-    };
-    let cfg = LaunchConfig {
-        grid_dim: (n as u32, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: (threads as usize * std::mem::size_of::<f32>()) as u32,
-    };
-
-    let c_i32 = c as i32;
-    let k_i32 = k as i32;
-    let n_i32 = n as i32;
-    let b_i32 = b as i32;
-
-    unsafe {
-        dev.stream()
-            .launch_builder(&func)
-            .arg(dist)
-            .arg(sigma)
-            .arg(o)
-            .arg(e)
-            .arg(theta)
-            .arg(batch_labels_flat)
-            .arg(cov_offset)
-            .arg(&c_i32)
-            .arg(&k_i32)
-            .arg(&n_i32)
-            .arg(&b_i32)
-            .arg(r_out)
-            .launch(cfg)
-    }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_softmax_penalty: {e}")))?;
-    Ok(())
-}
-
 /// Plain softmax `R[:, i] = softmax(-dist[:, i] / sigma)` for every cell.
 ///
 /// No diversity penalty applied — used at iter > 0 cold-start, where the
@@ -1545,51 +1465,6 @@ mod tests {
 
         for (i, (a, b)) in got_baseline.iter().zip(got_grouped.iter()).enumerate() {
             assert!((a - b).abs() < 1e-6, "idx {i}: baseline {a} vs grouped {b}");
-        }
-    }
-
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn test_softmax_penalty_kernel_uniform() {
-        let dev = require_gpu!();
-        // With O == E and all theta = 0, the diversity penalty is 1 and
-        // the kernel should reduce to plain softmax(-dist/sigma).
-        let k = 4usize;
-        let n = 3usize;
-        let b = 2usize;
-        let c = 1usize;
-
-        let dist: Vec<f32> = (0..k * n).map(|i| (i % 3) as f32 * 0.1).collect();
-        let sigma = vec![0.1f32; k];
-        let o = vec![1.0f32; k * b];
-        let e = vec![1.0f32; k * b];
-        let theta = vec![0.0f32; b];
-        let labels: Vec<i32> = (0..n as i32).map(|i| i % (b as i32)).collect();
-        let cov_offset: Vec<i32> = vec![0];
-
-        let d_dist = dev.htod_copy(&dist).unwrap();
-        let d_sigma = dev.htod_copy(&sigma).unwrap();
-        let d_o = dev.htod_copy(&o).unwrap();
-        let d_e = dev.htod_copy(&e).unwrap();
-        let d_theta = dev.htod_copy(&theta).unwrap();
-        let d_labels = dev.htod_copy(&labels).unwrap();
-        let d_cov = dev.htod_copy(&cov_offset).unwrap();
-        let mut d_r = dev.alloc_zeros::<f32>(k * n).unwrap();
-
-        gpu_harmony_softmax_penalty(
-            &dev, &d_dist, &d_sigma, &d_o, &d_e, &d_theta, &d_labels, &d_cov, &mut d_r, c, k, n, b,
-        )
-        .unwrap();
-        dev.synchronize().unwrap();
-        let got = dev.dtoh_copy(&d_r).unwrap();
-
-        // Columns should sum to 1.
-        for i in 0..n {
-            let mut s = 0f32;
-            for ku in 0..k {
-                s += got[ku * n + i];
-            }
-            assert!((s - 1.0).abs() < 1e-4, "col {i} sum = {s}");
         }
     }
 
