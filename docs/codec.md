@@ -273,8 +273,9 @@ reads touch only the covering groups. **Measured:** framing at `G ∈ {256,512,
 1024}` retains essentially the full monolithic win (size flat within ~0.2 % across
 `G`; 1.75×/1.46× vs Scx1 on census_1m/rgfp), so no per-shard dictionary is needed.
 
-Implementation: `scx-codec/src/{byte_delta.rs,codecs/shufdelta.rs}` (codec +
-`decode_row_group`), `scx-format-io/src/encoder.rs` (`encode_shard_framed`),
+Implementation: `scx-codec/src/{byte_delta.rs,codecs/shufdelta.rs}` (codec),
+`scx-codec/src/dispatch.rs` (`decode_row_group`),
+`scx-format-io/src/encoder.rs` (`encode_shard_framed`),
 `scx-format/src/shard.rs` (`resolve_block_index`).
 
 **Loader adoption (training / scattered reads).** The backed reader's scattered

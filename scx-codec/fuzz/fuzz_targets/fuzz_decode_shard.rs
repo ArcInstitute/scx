@@ -76,14 +76,20 @@ fuzz_target!(|data: &[u8]| {
 
     // The row-group seam slices three frames out of the sub-streams and funnels
     // them back through `decode_shard_ref`, relabelling errors with the group.
-    // Spans are derived from the input so libFuzzer can drive them out of range.
+    //
+    // The span endpoints are taken from the input *unclamped*, so libFuzzer can
+    // drive them past the stream length or invert them and exercise
+    // `slice_span`'s rejection. An earlier version derived them from `len/3`
+    // and `2*len/3`, which is always ordered and always in bounds — it reached
+    // the entry point but could never fuzz the parser boundary it claimed to.
+    let g = |i: usize| body.get(i).copied().unwrap_or(0) as usize;
     let span = RowGroupSpan {
         row_start: 0,
-        n_rows: (body.first().copied().unwrap_or(1) as u16) % 8,
-        nnz: (body.last().copied().unwrap_or(1) as u32) % 64,
-        indptr: 0..a,
-        indices: a..b,
-        values: b..body.len(),
+        n_rows: (g(0) as u16) % 8,
+        nnz: (g(1) as u32) % 64,
+        indptr: g(2)..g(3),
+        indices: g(4)..g(5),
+        values: g(6)..g(7),
     };
     for venc in [ValueEncoding::Uint8, ValueEncoding::Uint32, ValueEncoding::Float32] {
         for idx16 in [true, false] {

@@ -242,8 +242,8 @@ pub(crate) fn check_decoded_shape(
 /// types — the whole-shard decoders carry `u64` straight off the sub-stream,
 /// while the indptr-only paths have already widened to the `i64` scipy layout.
 /// One implementation rather than two on purpose: the hand-rolled first/last
-/// check that used to live in [`decode_row_group_indptr_only`] is exactly how
-/// the *monotonicity* half went missing on every GPU path that builds its
+/// check that used to live in [`crate::decode_row_group_indptr_only`] is exactly
+/// how the *monotonicity* half went missing on every GPU path that builds its
 /// `GpuCsr` indptr from it.
 ///
 /// Monotonicity is not redundant with the endpoint checks. An interior entry can

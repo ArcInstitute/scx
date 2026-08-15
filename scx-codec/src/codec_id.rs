@@ -282,7 +282,7 @@ pub type DecodedShard = (Vec<u64>, Vec<u32>, Vec<u8>);
 /// A resolved, validated row-group within a framed (v4/shard-v2) shard.
 ///
 /// Produced by `scx_format::resolve_block_index` from the on-disk `BlockIndex`;
-/// consumed by [`decode_row_group`]. The three `Range<usize>` are byte ranges
+/// consumed by [`crate::decode_row_group`]. The three `Range<usize>` are byte ranges
 /// **into each sub-stream** (indptr / indices / values), inferred from the
 /// per-entry offsets (`[offset[g], offset[g+1])`, last = stream length). This is
 /// the codec-agnostic random-access unit underneath F5-b: a group decodes

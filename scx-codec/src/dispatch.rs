@@ -34,7 +34,8 @@ pub use crate::guards::{check_indptr_shape, clamp_index_bound, NO_INDEX_BOUND};
 /// - `indptr`: the indptr array (length = n_rows + 1).
 /// - `indices`: the column indices (length = nnz), stored as u32.
 /// - `values`: raw little-endian bytes of the value array (length = nnz × value_encoding.byte_width()).
-/// - `index_dtype_u16`: if true, indices fit in u16 (n_vars <= 65535).
+/// - `index_dtype_u16`: if true, every index fits in u16 — i.e. the largest
+///   index `n_vars - 1` is `<= u16::MAX`, so up to 65_536 columns.
 pub fn encode_shard(
     indptr: &[u64],
     indices: &[u32],
@@ -195,9 +196,9 @@ pub fn decode_shard_scipy(
 
 /// Convert a raw [`DecodedShard`] (`u64` indptr / `u32` indices / raw value
 /// bytes) into the scipy-compatible `(i64, i32, f32)` triple, matching
-/// [`decode_shard_scipy`]'s conversions. Lets callers that decode via the
-/// metadata offsets ([`decode_scx1_row_range`] / parallel decode) produce the
-/// same scipy types the sequential reader path returns.
+/// [`decode_shard_scipy`]'s conversions. Lets callers that decode a shard
+/// themselves (e.g. the parallel decode path) produce the same scipy types the
+/// sequential reader path returns.
 pub fn decoded_shard_to_scipy(
     decoded: DecodedShard,
     value_encoding: ValueEncoding,

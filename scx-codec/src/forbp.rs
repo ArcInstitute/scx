@@ -86,7 +86,8 @@ fn bits_needed(max_val: u32) -> u8 {
 ///
 /// `indices` is the flat array of column indices (sorted within each row).
 /// `row_lengths` gives the number of non-zero entries per row.
-/// `index_dtype_u16` is true when n_vars <= 65535 (frame_min written as u16).
+/// `index_dtype_u16` is true when the largest index `n_vars - 1` fits u16 —
+/// i.e. up to 65_536 columns (frame_min written as u16).
 pub fn forbp_encode(
     indices: &[u32],
     row_lengths: &[usize],
