@@ -1497,10 +1497,12 @@ enum ColumnSelection {
 /// Blocks never span two pushes, which is what makes the block size
 /// irrelevant to precision for a caller that pushes one shard at a time: all
 /// of a push's blocks then lie inside one shard, and the fold takes min/max
-/// across them, so the result is exact at any shard size. Callers reach that
-/// state via [`ObsPredicateIndexBuilder::push_shard_split`], which every
-/// in-tree writer now uses; merge's sorted path is aligned by construction
-/// (obs and X are both chunked by `shard_target_rows`).
+/// across them, so the result is exact at any shard size. Every writer whose
+/// pushes can straddle reaches that state via
+/// [`ObsPredicateIndexBuilder::push_shard_split`]. Merge's sorted path is the
+/// one that still calls `push_shard` directly, and correctly: it flushes obs
+/// and X at the same `shard_target_rows`, so its pushes already are the shard
+/// partition.
 ///
 /// A block can still straddle where a caller's range hint does not match what
 /// `finish` receives. For that case the block size sets both the memory bound
@@ -1713,13 +1715,12 @@ impl ObsPredicateIndexBuilder {
                 ColumnState::Numeric { blocks } => {
                     // Fold into the open block, opening a new one whenever the
                     // row crosses a block boundary. Blocks are counted from
-                    // the start of *this push*, never across pushes: where the
-                    // caller's push partition is the shard partition — convert,
-                    // append's raw-copy path, modify_metadata — that makes
-                    // every block shard-local and the resulting bounds exact,
-                    // however small the shards are. Only a caller that pushes
-                    // across shard boundaries (merge, one input file per push)
-                    // can produce a straddling block.
+                    // the start of *this push*, never across pushes, so a
+                    // push confined to one shard yields shard-local blocks and
+                    // exact bounds however small the shards are. Callers get
+                    // there by calling `push_shard_split` rather than by
+                    // pushing at CSR granularity naturally — almost none of
+                    // them does; see its rustdoc for which and why.
                     let mut open_block: Option<u64> = None;
                     for i in 0..n_rows {
                         if array.is_null(i) {
@@ -1944,11 +1945,14 @@ impl ObsPredicateIndexBuilder {
                     // `high_cardinality_threshold` to every column before
                     // the categorical/numeric split, so a high-cardinality
                     // numeric column is skipped there and indexed here. What
-                    // survives of that divergence is only which *outcomes*
-                    // get reported, not an index-size difference; unifying it
-                    // would change what the batch path reports, so it is left
-                    // alone and documented (docs/api.md) rather than changed
-                    // here.
+                    // survives of that divergence is not an index-size
+                    // argument any more — it is that the batch path drops the
+                    // column outright, which changes index presence,
+                    // `indexed_column_names`, the serialised bytes and the
+                    // Level-1 pruning available on it, while this path keeps
+                    // it for a handful of bytes. Unifying them would change
+                    // batch-path behaviour, so it is left alone and documented
+                    // (docs/api.md) rather than changed here.
                     //
                     // It is also not a divergence any conversion front end can
                     // reach on obs: `scx convert` and `pyscx.from_anndata` go
@@ -2035,17 +2039,46 @@ struct NumericSpan {
 /// never claim a row that carried no value. Under-claiming coverage is safe
 /// (the query falls back to a full obs scan); over-claiming would let a
 /// stale post-`append` index be trusted.
+///
+/// `spans` must arrive in ascending row order — both builders produce them
+/// that way. Out-of-order spans still fold correctly (the cursor rewinds),
+/// just more slowly.
 fn numeric_leaves_from_spans(
     spans: impl Iterator<Item = NumericSpan>,
     shard_row_ranges: &[(u64, u64)],
 ) -> Vec<NumericLeafEntry> {
     let mut acc: Vec<Option<NumericLeafEntry>> = vec![None; shard_row_ranges.len()];
 
+    // Every in-tree range table is ascending and disjoint, but nothing in the
+    // signature promises it — `global_row_to_shard` scans exhaustively for
+    // exactly that reason. Check once instead of assuming: when it holds, the
+    // window of shards a span can overlap only moves forward (spans arrive in
+    // row order), so a cursor makes the fold O(spans + shards) rather than
+    // O(spans × shards). The batch builder emits one span per row, so that
+    // product is the whole column times the shard count.
+    let ascending_disjoint = shard_row_ranges.windows(2).all(|w| w[0].1 <= w[1].0);
+    let mut cursor = 0usize;
+
     for span in spans {
-        // Linear scan, matching `global_row_to_shard`'s posture: the ranges
-        // are ascending and disjoint at every call site, but nothing in the
-        // signature promises it, so don't binary-search on the assumption.
-        for (i, &(s_start, s_end)) in shard_row_ranges.iter().enumerate() {
+        let first = if ascending_disjoint {
+            // Row order is a documented precondition, not an enforced one. A
+            // span that goes backwards rewinds the cursor, costing a rescan
+            // rather than a wrong answer.
+            if cursor > 0 && shard_row_ranges[cursor - 1].1 > span.first_row {
+                cursor = 0;
+            }
+            while cursor < shard_row_ranges.len() && shard_row_ranges[cursor].1 <= span.first_row {
+                cursor += 1;
+            }
+            cursor
+        } else {
+            0
+        };
+
+        for (i, &(s_start, s_end)) in shard_row_ranges.iter().enumerate().skip(first) {
+            if ascending_disjoint && s_start > span.last_row {
+                break;
+            }
             let lo = span.first_row.max(s_start);
             let hi = (span.last_row + 1).min(s_end);
             if lo >= hi {

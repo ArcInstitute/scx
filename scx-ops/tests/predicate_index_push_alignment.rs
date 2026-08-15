@@ -220,3 +220,84 @@ fn a_shard_that_cannot_match_is_still_pruned_after_an_index_rebuild() {
         got.skipped_shards
     );
 }
+
+/// The convert-on-append shape: a legacy file whose obs is a single section
+/// gets its whole pre-append obs axis fed to the builder in **one** push,
+/// against a range table of the old CSR shards plus the newly appended ones.
+///
+/// That is the structurally misaligned case — no chunk size can make a single
+/// whole-axis push match a multi-shard range table — and it is the one the
+/// `modify_metadata` fixture above cannot reach, because that path chunks.
+#[test]
+fn convert_on_append_gives_each_old_csr_shard_its_own_numeric_bounds() {
+    use scx_ops::{append_with_index_options, AppendOptions};
+    use std::num::NonZeroU32;
+
+    let dir = TempDir::new().unwrap();
+    let path = write_fixture(&dir);
+
+    // 40 new rows, values far above every existing one, so a shard that
+    // absorbed them would be obvious.
+    const N_NEW: usize = 40;
+    let new_obs = {
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("n_counts", DataType::Int64, false),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(
+                    (0..N_NEW).map(|i| format!("new_{i}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    (0..N_NEW).map(|i| 9000 + i as i64).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+    let indptr: Vec<u64> = (0..=N_NEW as u64).collect();
+    let indices: Vec<u32> = (0..N_NEW).map(|r| (r % N_VARS) as u32).collect();
+    let values: Vec<u8> = (0..N_NEW).map(|r| ((r % 255) + 1) as u8).collect();
+
+    append_with_index_options(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        &AppendOptions {
+            shard_target_rows: NonZeroU32::new(100).unwrap(),
+            ..Default::default()
+        },
+        &scx_engine::ConversionPredicateIndexOptions {
+            index_obs: vec!["n_counts".to_string()],
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 1000,
+        },
+    )
+    .unwrap();
+
+    // The three pre-existing CSR shards keep their own bounds; the appended
+    // shard carries only the new values.
+    let mut want: Vec<Option<(f64, f64)>> = Vec::new();
+    let mut start = 0usize;
+    for &n in &CSR_SHARDS {
+        want.push(Some((
+            n_counts(start) as f64,
+            n_counts(start + n - 1) as f64,
+        )));
+        start += n;
+    }
+    want.push(Some((9000.0, (9000 + N_NEW - 1) as f64)));
+
+    assert_eq!(
+        min_max_per_shard(&path),
+        want,
+        "the single whole-axis push was summarised as one block, so every old \
+         CSR shard recorded the whole pre-append column's range"
+    );
+}

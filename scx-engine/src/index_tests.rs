@@ -1854,8 +1854,9 @@ fn numeric_index_coverage_stops_at_the_last_valued_row() {
 /// sound, but it erases exactly the Level-1 pruning the index exists for.
 /// Both conversion entry points did that: the batch one wraps obs in
 /// `iter::once`, and `compact` / `sort` push *input* shards against *output*
-/// shard ranges that a reshape has moved. Every writer now uses
-/// `push_shard_split` instead.
+/// shard ranges that a reshape has moved. Every writer whose pushes can
+/// straddle uses `push_shard_split` instead; merge's sorted path still calls
+/// `push_shard`, correctly, because it flushes obs and X at the same size.
 ///
 /// `n_counts` is 10..13 in shard 0 and 1000..1003 in shard 1, so an unsplit
 /// push shows up immediately as shard 0 claiming a max of 1003. That both
@@ -1886,5 +1887,47 @@ fn a_multi_shard_push_is_split_before_it_reaches_the_accumulator() {
         vec![Some((10.0, 13.0)), Some((1000.0, 1003.0))],
         "a push spanning both shards was summarised as one block, so both \
          shards recorded the whole column's range and neither can be pruned"
+    );
+}
+
+/// The fold must be linear in spans, not spans × shards.
+///
+/// `numeric_leaves_from_spans` maps each span onto the shards it overlaps, and
+/// the batch builder emits **one span per valued row** — so an exhaustive
+/// per-span scan of the range table is the whole column times the shard count.
+/// The ranges are ascending and disjoint at every call site (checked once, not
+/// assumed), and spans arrive in row order, so a cursor collapses that to
+/// O(spans + shards).
+///
+/// A wall-clock ratio would be flaky, so this asserts an absolute bound at a
+/// size where the two curves are orders of magnitude apart: with the cursor
+/// this is milliseconds, while the exhaustive scan is 4e9 iterations and was
+/// measured at over a minute on this machine.
+#[test]
+fn numeric_leaf_fold_is_not_quadratic_in_rows_times_shards() {
+    const N: usize = 200_000;
+    const SHARDS: usize = 20_000;
+    const ROWS_PER_SHARD: usize = N / SHARDS;
+
+    let batch = distinct_numeric_obs_batch(N);
+    let ranges: Vec<(u64, u64)> = (0..SHARDS)
+        .map(|s| {
+            (
+                (s * ROWS_PER_SHARD) as u64,
+                ((s + 1) * ROWS_PER_SHARD) as u64,
+            )
+        })
+        .collect();
+
+    let start = std::time::Instant::now();
+    let index = build_numeric_index(batch.column(0), "n_counts", &ranges, 64);
+    let elapsed = start.elapsed();
+
+    let entries: usize = index.leaf_pages.iter().map(|p| p.entries.len()).sum();
+    assert_eq!(entries, SHARDS, "one leaf entry per shard, still");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "folding {N} spans over {SHARDS} shards took {elapsed:?}; the per-span \
+         scan of the range table is quadratic"
     );
 }

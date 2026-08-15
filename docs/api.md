@@ -736,13 +736,14 @@ Behaviour:
 
   The cap does still apply, unchanged, to **`var`** (`--index-var`), which is
   built by the batch builder. It also applies to obs on the batch builder
-  itself (`build_obs_predicate_index_bytes`), but no conversion front end
-  reaches that path: `scx convert` and `pyscx.from_anndata` both go through
+  itself (`build_obs_predicate_index_bytes`), where a capped column is
+  **dropped from the index entirely** — not merely reported: it is absent from
+  `indexed_columns`, absent from the serialised bytes, and gets no Level-1
+  pruning. No conversion front end reaches that path, though: `scx convert`
+  and `pyscx.from_anndata` both go through
   `build_and_write_conversion_predicate_indexes`, which hands obs to the
-  streaming builder with a one-item iterator. So the batch-vs-streaming
-  distinction is not one users of the conversion APIs can observe on obs, and
-  the only difference it makes anywhere is *which outcomes get reported*, not
-  the size of the result.
+  streaming builder with a one-item iterator. So the distinction is real where
+  it applies, and not one users of the conversion APIs can observe on obs.
 - **A column is classified by what it holds, not by how it is stored.**
   pandas writes every `Categorical` as an Arrow dictionary, whatever the
   categories are, so the dictionary's *value* type decides:
