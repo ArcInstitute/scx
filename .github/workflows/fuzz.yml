@@ -72,6 +72,10 @@ jobs:
           - { crate: scx-codec,  target: fuzz_shufdelta }
           - { crate: scx-codec,  target: fuzz_lz4_shuffle }
           - { crate: scx-codec,  target: fuzz_pcodec }
+          # Sweeps all six codecs from one corpus, and is the only target that
+          # reaches `decode_shard_scipy` / `decode_shard_native`, which bypass
+          # `decode_shard_ref` for Scx1.
+          - { crate: scx-codec,  target: fuzz_decode_shard }
           - { crate: scx-format, target: fuzz_header }
           - { crate: scx-format, target: fuzz_shard }
           - { crate: scx-format, target: fuzz_catalog }
