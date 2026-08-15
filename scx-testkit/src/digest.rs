@@ -1,6 +1,7 @@
 //! Per-section content digest of an SCX file.
 
 use std::collections::BTreeSet;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use scx_format_io::checksum::blake3_hash;
@@ -123,11 +124,10 @@ pub struct FileDigest {
 
 /// Catalog-level scalars, none of which appear in any section's bytes.
 ///
-/// `prev_catalog_offset` is deliberately absent: it points at the *previous*
-/// catalog, so it differs between a fresh write and a rewrite of the same
-/// logical content, which is exactly the pair an A/B wants to call equal.
-/// `Strictness::Layout` pins the catalog pointers instead — see
-/// [`CatalogDigest::catalog_offset`].
+/// **Not** covered: the 4096-byte root catalog at offset 256. Verified: it has
+/// **zero** production readers workspace-wide — every writer rebuilds it from
+/// the full catalog — so two files differing only there behave identically, and
+/// digesting it would make an A/B fail on a difference nothing can observe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogDigest {
     pub catalog_version: u16,
@@ -139,11 +139,32 @@ pub struct CatalogDigest {
     /// The `data_generation` a CSC sidecar was built against. A mismatch makes
     /// readers reject the sidecar, so it is behaviour, not bookkeeping.
     pub csc_build_generation: u64,
+    /// BLAKE3 of the front catalog's bytes, when the file carries one.
+    ///
+    /// The front catalog is a **second parsed copy** of the catalog, not
+    /// decoration: `scx-cloud`'s `CloudReader` reads it in preference to the
+    /// EOF one when `has_front_catalog()` is set. A cloud-ready file can
+    /// therefore have an intact EOF catalog, intact section payloads, and a
+    /// stale front catalog — and `open_cloud` would see different bytes from
+    /// every local reader. Hashed rather than parsed so a difference is caught
+    /// whatever its shape.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub front_catalog_blake3: Option<String>,
     /// Header catalog pointers — `Some` only under [`Strictness::Layout`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub catalog_offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub front_catalog_offset: Option<u64>,
+    /// The rollback chain's back-pointer — `Some` only under
+    /// [`Strictness::Layout`].
+    ///
+    /// Excluded from `Content` on purpose: a fresh write and a rewrite of the
+    /// same logical content legitimately point at different previous catalogs,
+    /// and that pair must compare equal. But `scx_ops::rollback` walks this
+    /// chain, so under `Layout` — whose job is physical identity — a file
+    /// pointing rollback somewhere else is a real difference.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prev_catalog_offset: Option<u64>,
 }
 
 /// Section types excluded from a digest by default.
@@ -214,6 +235,11 @@ pub fn digest_file_excluding(
             n_obs: c.n_obs,
             data_generation: c.data_generation,
             csc_build_generation: c.csc_build_generation,
+            front_catalog_blake3: front_catalog_hash(path, h)?,
+            prev_catalog_offset: match strictness {
+                Strictness::Content => None,
+                Strictness::Layout => Some(c.prev_catalog_offset),
+            },
             catalog_offset: match strictness {
                 Strictness::Content => None,
                 Strictness::Layout => Some(h.full_catalog_offset),
@@ -369,6 +395,21 @@ pub fn assert_matches_golden(path: &Path, golden: &Path, strictness: Strictness)
     });
     assert_digests_eq(&actual, &expected);
     Ok(())
+}
+
+/// Hash the front catalog's bytes, or `None` when the file has none.
+fn front_catalog_hash(
+    path: &Path,
+    h: &scx_format_io::header::FileHeader,
+) -> Result<Option<String>> {
+    if !h.has_front_catalog() || h.front_catalog_offset == 0 || h.front_catalog_length == 0 {
+        return Ok(None);
+    }
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(h.front_catalog_offset))?;
+    let mut buf = vec![0u8; h.front_catalog_length as usize];
+    f.read_exact(&mut buf)?;
+    Ok(Some(hex(&blake3_hash(&buf))))
 }
 
 /// Flatten a `ShardStats` for comparison.

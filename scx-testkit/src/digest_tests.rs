@@ -6,8 +6,8 @@
 
 use super::*;
 use crate::fixtures::{
-    mixed_codec_file, mixed_codec_file_with, perturb_catalog_data_generation, perturb_catalog_nnz,
-    FixtureOpts,
+    mixed_codec_file, mixed_codec_file_with, perturb_catalog_csc_generation,
+    perturb_catalog_data_generation, perturb_catalog_nnz, FixtureOpts,
 };
 use scx_format_io::ScxReader;
 
@@ -376,6 +376,74 @@ fn digest_covers_the_catalog_generation_counters() {
         before.catalog, after.catalog,
         "data_generation must be part of the digest"
     );
+
+    // The sidecar-freshness counter too: a `build-csc` that forgot to stamp it
+    // leaves readers accepting a stale sidecar, and no payload records it.
+    let path2 = mixed_codec_file(&dir.path().join("g.scx")).unwrap();
+    let b2 = dig(&path2);
+    perturb_catalog_csc_generation(&path2);
+    let a2 = dig(&path2);
+    assert_eq!(
+        b2.sections, a2.sections,
+        "premise: only the catalog scalar changed"
+    );
+    assert_ne!(
+        b2.catalog, a2.catalog,
+        "csc_build_generation must be part of the digest"
+    );
+}
+
+/// `Strictness::Layout` pins the header's catalog pointers, not just section
+/// offsets.
+///
+/// Without this the two `catalog_offset` / `front_catalog_offset` assignments in
+/// `digest_file_excluding` could be deleted and every other test would still
+/// pass — the layout test compares only shard sections. Found in review of the
+/// commit that added them.
+#[test]
+fn layout_pins_the_catalog_pointers() {
+    let dir = tempfile::tempdir().unwrap();
+    // A larger `uns` blob ahead of the shards moves the EOF catalog too.
+    let a = write(
+        &dir,
+        "a.scx",
+        &FixtureOpts {
+            uns_pad: 16,
+            ..Default::default()
+        },
+    );
+    let b = write(
+        &dir,
+        "b.scx",
+        &FixtureOpts {
+            uns_pad: 512,
+            ..Default::default()
+        },
+    );
+
+    let (la, lb) = (
+        digest_file(&a, Strictness::Layout).unwrap(),
+        digest_file(&b, Strictness::Layout).unwrap(),
+    );
+    assert!(
+        la.catalog.catalog_offset.is_some(),
+        "Layout records the catalog offset"
+    );
+    assert_ne!(
+        la.catalog.catalog_offset, lb.catalog.catalog_offset,
+        "the catalog moved, so Layout must see it"
+    );
+    assert!(
+        la.catalog.prev_catalog_offset.is_some(),
+        "Layout records the rollback back-pointer"
+    );
+
+    // Content records none of them — a rewrite of the same logical content
+    // legitimately lands its catalog elsewhere.
+    let ca = dig(&a);
+    assert_eq!(ca.catalog.catalog_offset, None);
+    assert_eq!(ca.catalog.front_catalog_offset, None);
+    assert_eq!(ca.catalog.prev_catalog_offset, None);
 }
 
 /// A corrupt section is an error, not a digest.

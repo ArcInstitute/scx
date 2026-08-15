@@ -307,3 +307,8 @@ pub fn perturb_catalog_nnz(path: &Path, section_name: &str) {
 pub fn perturb_catalog_data_generation(path: &Path) {
     rewrite_catalog(path, |c| c.data_generation += 1).unwrap();
 }
+
+/// Bump the catalog's `csc_build_generation`, touching no section bytes.
+pub fn perturb_catalog_csc_generation(path: &Path) {
+    rewrite_catalog(path, |c| c.csc_build_generation += 1).unwrap();
+}
