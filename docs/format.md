@@ -751,6 +751,18 @@ PREDICATE INDEX SECTION (v2 — wide counters):
         For each entry: min_value / max_value (f64), shard_id / row_start / row_end (u32 each, unchanged)
 ```
 
+**Numeric leaf entries are conservative bounds, not a per-row map.** An entry
+asserts only that every value in `[row_start, row_end)` of `shard_id` lies
+within `[min_value, max_value]` — it does not say which row holds which value.
+Writers emit **one entry per shard per column**, because that is the
+granularity both consumers read at: the per-shard `MinMax` column stat that
+drives Level-1 shard pruning, and the coverage check that decides whether a
+file-scope index still describes every obs row. Readers accept any number of
+entries per shard, so files written before this (one entry per contiguous
+value run, in practice ~one per row on a continuous column) keep working
+unchanged. Numeric comparisons are residual at Level 2 in every version — no
+reader navigates the internal pages to answer a range query.
+
 **High-cardinality columns** (> 10,000 unique values, e.g. `donor_id`): the
 categorical index becomes a minimal perfect hash function pointing to offset
 arrays, capping size at ~100 KB regardless of cardinality.

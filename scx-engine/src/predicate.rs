@@ -218,6 +218,18 @@ pub fn eval_rowset(pred: &Predicate, ctx: &RowSetCtx) -> Option<RowSet> {
         }
         // Residual in v1 (see module docs): Ne/Not (null-complement hazard),
         // numeric comparisons (conservative B+ tree leaves).
+        //
+        // A numeric leaf bounds a row range by `[min_value, max_value]`; it
+        // does not say which row holds which value. So a range lookup yields
+        // the rows that *may* match, and `eval_rowset` must return the rows
+        // that *do* — `Some` here means exactly resolvable, and the caller
+        // stops evaluating the predicate. Making these resolvable is not a
+        // matter of indexing more finely: it needs the (definitely, maybe)
+        // lattice that would let a residual-but-narrowed answer be expressed
+        // at all. Until then, numeric predicates are narrowed at Level 1 by
+        // the per-shard `MinMax` column stats and then evaluated on the mask
+        // path, and the leaves are kept at shard granularity because that is
+        // the only granularity anything reads them at.
         Predicate::Ne(_, _)
         | Predicate::Not(_)
         | Predicate::Lt(_, _)

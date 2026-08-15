@@ -726,20 +726,24 @@ Behaviour:
   conversion.
 - Auto-indexing picks up categorical-like columns with cardinality
   `≤ index_auto_threshold` (default `1000`).
-- **The cardinality caps apply to the batch builder only.** The in-memory
-  path (`pyscx.from_anndata` on a small file) runs every column through
-  `index_auto_threshold` / the high-cardinality threshold before choosing a
-  categorical or numeric index, so a high-cardinality **numeric** column is
-  skipped with a reported outcome. Conversion (`scx convert`,
-  `pyscx.from_anndata`) uses that batch builder, so it is capped. The
-  **streaming** builder — used by `sort` and streaming `compact`, with `merge`
-  and `append` running equivalent incremental builders — applies the cap to
-  categorical columns only and always materialises a numeric index, whatever
-  its cardinality. This is long-standing behaviour for plain numeric
-  columns; integer-valued categoricals now inherit it. It matters because a
-  numeric index is per-row, not per-category (see the size note below), so
-  force-listing a high-cardinality integer column on an atlas-scale streaming
-  build produces a large index where the in-memory path would have refused.
+- **A high-cardinality numeric obs column is indexed, not skipped.** The
+  high-cardinality cap applies to categorical columns; the numeric branch
+  ignores it deliberately, because a numeric index is **one entry per shard**
+  (that column's `[min, max]` over the shard's rows) and so costs the same
+  bytes for a million distinct values as for ten. Force-listing
+  `--index-obs total_counts` on an atlas is cheap and gives Level-1 shard
+  pruning on that column.
+
+  The cap does still apply, unchanged, to **`var`** (`--index-var`), which is
+  built by the batch builder. It also applies to obs on the batch builder
+  itself (`build_obs_predicate_index_bytes`), where a capped column is
+  **dropped from the index entirely** — not merely reported: it is absent from
+  `indexed_columns`, absent from the serialised bytes, and gets no Level-1
+  pruning. No conversion front end reaches that path, though: `scx convert`
+  and `pyscx.from_anndata` both go through
+  `build_and_write_conversion_predicate_indexes`, which hands obs to the
+  streaming builder with a one-item iterator. So the distinction is real where
+  it applies, and not one users of the conversion APIs can observe on obs.
 - **A column is classified by what it holds, not by how it is stored.**
   pandas writes every `Categorical` as an Arrow dictionary, whatever the
   categories are, so the dictionary's *value* type decides:

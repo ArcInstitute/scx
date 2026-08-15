@@ -445,12 +445,26 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
         let mut obs_shard_ranges: Vec<(u64, u64)> = Vec::new();
         let mut cursor = 0usize;
         let mut idx = 0u32;
+        // The obs chunking below is by `shard_target_rows`; the index is
+        // finished over the CSR shard ranges (see the `use_csr` choice after
+        // the loop), and after a `compact` those two partitions diverge. Split
+        // each chunk on the ranges the index will actually be keyed to, or the
+        // numeric accumulator hands every CSR shard a chunk-wide `[min, max]`
+        // and Level-1 pruning stops excluding shards that cannot match.
+        let index_ranges: Vec<(u64, u64)> = if !csr_ranges.is_empty()
+            && csr_ranges.iter().map(|(s, e)| e - s).sum::<u64>() == prep.old_n_obs
+        {
+            csr_ranges.clone()
+        } else {
+            Vec::new()
+        };
         while cursor < n {
             let take = std::cmp::min(shard_target_rows, n - cursor);
             let chunk = unified.slice(cursor, take);
             let row_start = cursor as u64;
             if let Some(b) = builder.as_mut() {
-                b.push_shard(&chunk, row_start).map_err(OpsError::Engine)?;
+                b.push_shard_split(&chunk, row_start, &index_ranges)
+                    .map_err(OpsError::Engine)?;
             }
             writer.write_obs_shard(idx, row_start, take as u64, prep.old_n_obs, &chunk)?;
             obs_shard_ranges.push((row_start, row_start + take as u64));
@@ -464,13 +478,14 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
             // CSR ranges fully cover [0, n_obs): a partial range list (some
             // shards missing stats on older files) would misalign the index's
             // shard space with the matrix.
-            let csr_covers_all = !csr_ranges.is_empty()
-                && csr_ranges.iter().map(|(s, e)| e - s).sum::<u64>() == prep.old_n_obs;
-            let use_csr = csr_covers_all;
-            let ranges: &[(u64, u64)] = if use_csr {
-                &csr_ranges
-            } else {
+            //
+            // `index_ranges` above encodes exactly that choice — empty means
+            // "fall back" — and the pushes were split on it, so the two must
+            // stay derived from the one predicate rather than recomputed.
+            let ranges: &[(u64, u64)] = if index_ranges.is_empty() {
                 &obs_shard_ranges
+            } else {
+                &index_ranges
             };
             let obs_bytes = builder
                 .finish(
@@ -482,7 +497,7 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
             match obs_bytes {
                 Some(bytes) => {
                     writer.write_obs_predicate_index(&bytes)?;
-                    if use_csr {
+                    if !index_ranges.is_empty() {
                         let index = scx_engine::PredicateIndex::read_from(&mut Cursor::new(&bytes))
                             .map_err(OpsError::Engine)?;
                         per_shard_obs_stats = Some(scx_engine::derive_shard_column_stats(
