@@ -99,6 +99,20 @@ fn preparse_forbp(
                 .read_u8()
                 .map_err(|e| GpuError::InvalidShard(format!("FOR-BP prescan: frame_bits: {e}")))?;
 
+            // `frame_bits` is a u8 straight off an untrusted stream, and it
+            // reaches the CUDA kernel as a shift width. A delta is a `u32`, so
+            // anything above 32 is unrepresentable and the stream is corrupt.
+            // Both CPU decoders reject it (`forbp.rs`'s streaming decode, added
+            // by the fuzz regression in #333); this prescan is the third copy of
+            // the same per-row parse and was the one without the guard. Per-shard
+            // checksum verification is opt-in on the read path, so "the catalog
+            // would have caught it" does not hold here either.
+            if frame_bits > 32 {
+                return Err(GpuError::InvalidShard(format!(
+                    "FOR-BP prescan: frame_bits={frame_bits} exceeds 32"
+                )));
+            }
+
             // Record the bit offset where packed deltas start
             let bit_offset = (cursor.position() as u32) * 8;
 
@@ -291,6 +305,62 @@ mod tests {
         let indices: Vec<u32> = rows.iter().flatten().copied().collect();
         let row_lengths: Vec<usize> = rows.iter().map(|r| r.len()).collect();
         (indices, row_lengths)
+    }
+
+    /// A `frame_bits` above 32 is unrepresentable for `u32` deltas and must be
+    /// rejected here, not forwarded to the kernel as a shift width.
+    ///
+    /// Needs no GPU: the prescan is host-side. That is the point — the two CPU
+    /// decoders in `scx-codec` have carried this guard since the #333 fuzz
+    /// regression, and this third copy of the same per-row parse did not.
+    #[test]
+    fn preparse_rejects_frame_bits_above_32() {
+        let rows = vec![vec![0u32, 5, 10, 20]];
+        let (indices, row_lengths) = flatten(&rows);
+        let mut encoded = forbp_encode(&indices, &row_lengths, true).unwrap();
+
+        // Single-row u16-index block: u32 block_nnz, u16 n_rows_in_block, a
+        // 1-byte nnz varint (nnz = 4), u16 frame_min, then frame_bits.
+        const FRAME_BITS_OFF: usize = 4 + 2 + 1 + 2;
+
+        // Premises, so a layout change fails here rather than making the
+        // corruption below land on some unrelated byte and pass vacuously.
+        assert!(
+            (1..=32).contains(&encoded[FRAME_BITS_OFF]),
+            "fixture drifted: byte {FRAME_BITS_OFF} is {}, not a plausible frame_bits",
+            encoded[FRAME_BITS_OFF]
+        );
+        assert!(
+            preparse_forbp(&encoded, 1, true).is_ok(),
+            "premise: the fixture parses before corruption"
+        );
+
+        encoded[FRAME_BITS_OFF] = 47;
+        let Err(err) = preparse_forbp(&encoded, 1, true) else {
+            panic!("frame_bits=47 must be rejected, not handed to the kernel");
+        };
+        // Match the guard's own message, not merely `is_err()`. Without the
+        // guard this input still errors — as "truncated packed deltas", because
+        // 47 × 4 bits overruns the buffer — so an `is_err()` assertion would
+        // pass against the unguarded code and prove nothing.
+        assert!(
+            matches!(&err, GpuError::InvalidShard(m) if m.contains("frame_bits=47")),
+            "expected the frame_bits guard, got {err:?}"
+        );
+
+        // And the case that actually reaches the kernel: pad the stream so the
+        // corrupted delta-skip stays in bounds and the truncation check cannot
+        // fire at all. Unguarded, this parses "successfully" and forwards
+        // frame_bits=47 to the GPU as a shift width.
+        let mut padded = encoded.clone();
+        padded.extend(std::iter::repeat_n(0u8, 64));
+        let Err(err) = preparse_forbp(&padded, 1, true) else {
+            panic!("frame_bits=47 within a padded buffer must still be rejected");
+        };
+        assert!(
+            matches!(&err, GpuError::InvalidShard(m) if m.contains("frame_bits=47")),
+            "expected the frame_bits guard, got {err:?}"
+        );
     }
 
     #[test]
