@@ -59,7 +59,8 @@ pub struct ShardRange {
 
 /// Numeric index: a B+ tree over per-shard value bounds.
 ///
-/// Writers emit one leaf entry per shard (see [`numeric_leaves_from_spans`]).
+/// Writers emit at most one leaf entry per shard — none for a shard holding
+/// no value (see [`numeric_leaves_from_spans`]).
 /// Nothing navigates the tree to answer a range query — `eval_rowset` is
 /// residual for every numeric operator — so in practice this is the carrier
 /// for the per-shard `[min, max]` that Level-1 pruning reads, and the shape is
@@ -1801,12 +1802,29 @@ impl ObsPredicateIndexBuilder {
         }
         let end = row_offset + n_rows;
 
-        let mut cuts: Vec<u64> = shard_row_ranges
-            .iter()
-            .flat_map(|&(start, stop)| [start, stop])
-            .filter(|&b| b > row_offset && b < end)
-            .collect();
-        cuts.sort_unstable();
+        // Only the ranges overlapping this batch can contribute a cut. When the
+        // table is well-formed and ascending they are a contiguous window, so
+        // find its start and stop at its end instead of visiting every range
+        // on every push: callers push roughly one batch per shard, which made
+        // the full scan quadratic in shard count before the leaf fold even ran.
+        let mut cuts: Vec<u64> = if ranges_ascending_disjoint(shard_row_ranges) {
+            let first = shard_row_ranges.partition_point(|&(_, stop)| stop <= row_offset);
+            // Ascending and disjoint ⇒ the emitted boundaries come out sorted.
+            shard_row_ranges[first..]
+                .iter()
+                .take_while(|&&(start, _)| start < end)
+                .flat_map(|&(start, stop)| [start, stop])
+                .filter(|&b| b > row_offset && b < end)
+                .collect()
+        } else {
+            let mut all: Vec<u64> = shard_row_ranges
+                .iter()
+                .flat_map(|&(start, stop)| [start, stop])
+                .filter(|&b| b > row_offset && b < end)
+                .collect();
+            all.sort_unstable();
+            all
+        };
         cuts.dedup();
 
         let mut cursor = row_offset;
@@ -1998,6 +2016,19 @@ impl ObsPredicateIndexBuilder {
     }
 }
 
+/// Are the shard ranges each well-formed *and* ascending and disjoint?
+///
+/// Both halves matter. Checking only `end <= next.start` accepts an inverted
+/// range like `[(100, 50), (60, 70)]`, and the scans below would then stop at
+/// the inverted entry's `start` and miss the valid overlap behind it — the
+/// exhaustive fallback exists precisely so a malformed table cannot lose an
+/// overlap, so the predicate that selects it has to be the stronger one.
+/// Every in-tree table is catalog-derived and valid; this is about the public
+/// helper's stated contract, not about a reachable in-tree bug.
+fn ranges_ascending_disjoint(ranges: &[(u64, u64)]) -> bool {
+    ranges.iter().all(|&(start, stop)| start <= stop) && ranges.windows(2).all(|w| w[0].1 <= w[1].0)
+}
+
 /// One conservative summary of a contiguous run of obs rows: `[min, max]`
 /// bounds every valued row in `[first_row, last_row]`, in **global** row
 /// space. Rows in between that carry no value simply do not narrow it.
@@ -2013,7 +2044,9 @@ struct NumericSpan {
     last_row: u64,
 }
 
-/// Fold row-ordered spans into **one [`NumericLeafEntry`] per shard**.
+/// Fold row-ordered spans into **at most one [`NumericLeafEntry`] per shard** —
+/// a shard no valued span reaches emits none, which is what keeps a null tail
+/// out of the coverage calculation.
 ///
 /// Per-shard is the granularity the leaves are actually consumed at:
 /// [`derive_shard_column_stats`] folds them to a per-shard
@@ -2056,7 +2089,7 @@ fn numeric_leaves_from_spans(
     // row order), so a cursor makes the fold O(spans + shards) rather than
     // O(spans × shards). The batch builder emits one span per row, so that
     // product is the whole column times the shard count.
-    let ascending_disjoint = shard_row_ranges.windows(2).all(|w| w[0].1 <= w[1].0);
+    let ascending_disjoint = ranges_ascending_disjoint(shard_row_ranges);
     let mut cursor = 0usize;
 
     for span in spans {

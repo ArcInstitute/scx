@@ -1786,7 +1786,8 @@ fn straddling_pushes_widen_min_max_but_never_prune_a_matching_shard() {
         .map(|w| (w[0] as u64, w[1] as u64))
         .collect();
     let batch = distinct_numeric_obs_batch(N);
-    // One push covering everything — the merge-one-input-file shape.
+    // One push covering every shard — what a caller that does not split looks
+    // like. (No in-tree writer pushes this way any more; see `push_shard_split`.)
     let index = streaming_numeric_index(&batch, N, &ranges);
     let got = min_max_per_shard(&index, ranges.len());
 
@@ -1929,5 +1930,89 @@ fn numeric_leaf_fold_is_not_quadratic_in_rows_times_shards() {
         elapsed < std::time::Duration::from_secs(10),
         "folding {N} spans over {SHARDS} shards took {elapsed:?}; the per-span \
          scan of the range table is quadratic"
+    );
+}
+
+/// …and so must the splitter, which the fold's own perf test does not reach.
+///
+/// `push_shard_split` computes its cut points from the range table on every
+/// call, and callers push roughly one batch per shard — so scanning the whole
+/// table per push is quadratic in shard count before the leaf fold even runs.
+/// The overlapping ranges are a contiguous window when the table is
+/// well-formed and ascending, which is the case this bounds.
+#[test]
+fn push_shard_split_is_not_quadratic_in_shard_count() {
+    const N: usize = 200_000;
+    const SHARDS: usize = 20_000;
+    const ROWS: usize = N / SHARDS;
+
+    let batch = distinct_numeric_obs_batch(N);
+    let ranges: Vec<(u64, u64)> = (0..SHARDS)
+        .map(|s| ((s * ROWS) as u64, ((s + 1) * ROWS) as u64))
+        .collect();
+
+    let start = std::time::Instant::now();
+    let mut builder = ObsPredicateIndexBuilder::new(batch.schema(), &n_counts_opts()).unwrap();
+    // One push per shard — the shape every in-tree streaming writer has.
+    for (s, &(lo, hi)) in ranges.iter().enumerate() {
+        builder
+            .push_shard_split(&batch.slice(s * ROWS, (hi - lo) as usize), lo, &ranges)
+            .unwrap();
+    }
+    let bytes = builder
+        .finish(&ranges, &mut Vec::new(), &mut Vec::new())
+        .unwrap()
+        .expect("a forced numeric column must produce an index");
+    let elapsed = start.elapsed();
+
+    let index = PredicateIndex::read_from(&mut Cursor::new(&bytes)).unwrap();
+    assert_eq!(numeric_leaf_count(&index), SHARDS);
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "{SHARDS} pushes against a {SHARDS}-range table took {elapsed:?}; the \
+         splitter is scanning the whole table per push"
+    );
+}
+
+/// A malformed range table must fall back to the exhaustive scan, not be
+/// silently classified as fast-path-safe.
+///
+/// The fast path stops walking once a range starts past the span, which is
+/// only sound if the ranges really are ascending *and* each is well-formed.
+/// An inverted range like `(100, 50)` satisfies "my end precedes the next
+/// range's start" while sitting in the wrong place entirely, so a predicate
+/// that checks only adjacent pairs would break out of the walk and lose the
+/// valid overlap behind it. No in-tree table is malformed — this pins the
+/// stated fallback contract of the public helper.
+#[test]
+fn a_malformed_range_table_still_finds_every_overlap() {
+    let col: ArrayRef = Arc::new(Float64Array::from(
+        (0..80).map(|i| i as f64).collect::<Vec<_>>(),
+    ));
+    let schema = Schema::new(vec![Field::new("n_counts", DataType::Float64, true)]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![col]).unwrap();
+
+    // Inverted first range, valid second. `end <= next.start` holds (50 <= 60).
+    //
+    // The span has to be multi-row to reach the break: a one-row span (what the
+    // batch builder emits) makes the cursor skip *past* the inverted range and
+    // find the valid one anyway. So this goes through the streaming builder,
+    // whose single 80-row push is one summary block spanning both ranges.
+    let malformed = [(100u64, 50u64), (60, 70)];
+    let index = streaming_numeric_index(&batch, 80, &malformed);
+
+    // The fallback cannot make a malformed table meaningful — the surviving
+    // block still summarises all 80 rows, so the bound is conservative. What
+    // it must not do is *lose* the overlap: without the validity check the
+    // walk breaks at the inverted range and shard 1 gets no entry at all, so
+    // no `MinMax` stat and no coverage.
+    let per_shard = min_max_per_shard(&index, malformed.len());
+    let (min, max) = per_shard[1].expect(
+        "the valid range behind the inverted one was skipped entirely — the \
+         fast path accepted a table it cannot walk",
+    );
+    assert!(
+        min <= 60.0 && max >= 69.0,
+        "shard 1 covers rows 60..70 (values 60..69) but recorded [{min}, {max}]"
     );
 }
