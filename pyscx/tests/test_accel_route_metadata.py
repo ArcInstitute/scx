@@ -110,9 +110,10 @@ def test_pca_cpu_route_omits_tuning_metadata():
     assert info["route"] == "cpu_csr"
     assert info["math_mode"] is None
     assert info["spmm_policy"] is None
-
-
-def test_pca_rejects_invalid_spmm_policy():
+    # PCA never records a capture decision on any route — `harmony_integrate`
+    # is the op that captures. The key is still emitted (route.rs stamps it for
+    # every op), so assert the value rather than the key's absence.
+    assert info["graph_replay"] is None
     """Task 2.5: spmm_policy is validated on every device path."""
     adata = _make_adata()
     with pytest.raises(ValueError, match="spmm_policy"):
