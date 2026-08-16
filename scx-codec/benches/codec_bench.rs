@@ -406,6 +406,39 @@ fn bench_decode_shard(c: &mut Criterion) {
                 })
             },
         );
+
+        // ORG-3.7-3: the trait seam sits on `decode_shard_ref` for *every*
+        // codec, so measuring only Scx1 and ShufDeltaZstd leaves four of six
+        // arms unmeasured. These cover the rest of the dispatch surface.
+        for (codec, name) in [
+            (CodecId::None, "none"),
+            (CodecId::Zstd, "zstd"),
+            (CodecId::Lz4Shuffle, "lz4shuffle"),
+            (CodecId::Pcodec, "pcodec"),
+        ] {
+            let enc_other = encode_shard(
+                &indptr,
+                &indices,
+                &values,
+                codec,
+                ValueEncoding::Uint8,
+                index_dtype_u16,
+            )
+            .unwrap();
+            group.bench_with_input(BenchmarkId::new(name, label), &enc_other, |b, e| {
+                b.iter(|| {
+                    decode_shard(
+                        black_box(e),
+                        black_box(codec),
+                        black_box(ValueEncoding::Uint8),
+                        black_box(n_rows_actual),
+                        black_box(nnz),
+                        black_box(index_dtype_u16),
+                    )
+                    .unwrap()
+                })
+            });
+        }
     }
 
     group.finish();

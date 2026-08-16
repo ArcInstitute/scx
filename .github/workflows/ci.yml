@@ -119,6 +119,30 @@ jobs:
             echo "::error::Hand-spelled FileHeader literal found — use FileHeader::new_single_modality(...) or FileHeader { .., ..Default::default() }."
             exit 1
           fi
+      # ORG-3.7-3: the three shape-derived decode caps are derived in exactly
+      # one place, `DecodeBounds::derive`. Every whole-shard decode entry point
+      # (including the Scx1 short-circuits in `decode_shard_scipy` /
+      # `decode_shard_native`, which `scx-format-io` materialization reaches)
+      # must go through it rather than re-deriving the products by hand.
+      #
+      # This is a static guard because it is not falsifiable at runtime: Scx1's
+      # independent `bound_capacity` rejects a hostile shape before the byte
+      # caps decide, so a hostile-input test stays green whether or not the
+      # derivation is there. Grepping for the primitives is what actually pins
+      # it. `guards.rs` defines them; `shard_codec.rs` is the one derivation
+      # site; `raw.rs`/codec bodies use `checked_len` for other products. A
+      # legitimate standalone use marks itself `ORG-3.7-3-ALLOW` with a reason
+      # (today: `decode_indptr_only`, which has no nnz or encoding to derive
+      # from).
+      - name: Decode caps are derived only in DecodeBounds::derive
+        run: |
+          if grep -rEn --include='*.rs' 'indptr_byte_cap[[:space:]]*\(' scx-codec/src \
+               | grep -vE 'scx-codec/src/(guards\.rs|shard_codec\.rs)' \
+               | grep -v 'ORG-3.7-3-ALLOW'; then
+            echo "::error::indptr_byte_cap called outside DecodeBounds::derive — decode caps must come from the driver's derivation."
+            exit 1
+          fi
+
       # §10.1: a numpy borrow is not GIL-bound and does not clear numpy's
       # WRITEABLE flag, so a `&[T]` taken from one must never be read after the
       # GIL is released. `GilHeldCsrSlices` is the single borrowed-buffer

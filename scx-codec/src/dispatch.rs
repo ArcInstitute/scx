@@ -94,10 +94,25 @@ fn decode_via<C: ShardCodec>(
     index_dtype_u16: bool,
     bounds: &DecodeBounds,
 ) -> Result<DecodedShard, CodecError> {
-    if !C::supports(value_encoding) {
-        return Err(CodecError::FloatWithScx1);
-    }
     C::decode(encoded, shape, value_encoding, index_dtype_u16, bounds)
+}
+
+/// Whether `codec_id` can represent `value_encoding`, via each codec's
+/// `ShardCodec::supports`.
+///
+/// The one support check for every whole-shard decode entry point. It runs
+/// **before** any shape arithmetic, because the encoding rejection is the
+/// older, public answer: Scx1 + float returns `FloatWithScx1` even when the
+/// shape is also invalid.
+pub(crate) fn codec_supports(codec_id: CodecId, value_encoding: ValueEncoding) -> bool {
+    match codec_id {
+        CodecId::None => NoneCodec::supports(value_encoding),
+        CodecId::Scx1 => Scx1Codec::supports(value_encoding),
+        CodecId::Zstd => ZstdCodec::supports(value_encoding),
+        CodecId::Lz4Shuffle => Lz4ShuffleCodec::supports(value_encoding),
+        CodecId::Pcodec => PcodecCodec::supports(value_encoding),
+        CodecId::ShufDeltaZstd => ShufDeltaZstdCodec::supports(value_encoding),
+    }
 }
 
 /// Decode an `EncodedShardRef` (borrowed) back to `(indptr, indices, values_bytes)`.
@@ -115,11 +130,10 @@ pub fn decode_shard_ref(
     // `bounds`; it has no way to derive its own, which is what made "this
     // decoder forgot a guard" representable before (§3.5, and #436's LZ4 hole).
     let shape = ShardShape { n_rows, nnz };
-    // `supports` is checked inside `decode_via`, but the *encoding* rejection
-    // must precede the *shape* arithmetic or a doubly-invalid call (Scx1 +
-    // float + an overflowing nnz) changes its error from `FloatWithScx1` to
-    // `MalformedInput`. That precedence is pre-existing public behaviour.
-    if codec_id == CodecId::Scx1 && !Scx1Codec::supports(value_encoding) {
+    // The encoding rejection precedes the shape arithmetic: a doubly-invalid
+    // call (Scx1 + float + an overflowing nnz) must still answer
+    // `FloatWithScx1`, which is pre-existing public behaviour.
+    if !codec_supports(codec_id, value_encoding) {
         return Err(CodecError::FloatWithScx1);
     }
     let bounds = DecodeBounds::derive(shape, value_encoding, index_dtype_u16)?;
@@ -181,7 +195,7 @@ pub fn decode_shard_scipy(
 ) -> Result<ScipyShard, CodecError> {
     // For Scx1, we can avoid the u32→raw_bytes→f32 chain for values
     if codec_id == CodecId::Scx1 {
-        if !value_encoding.is_integer() {
+        if !codec_supports(codec_id, value_encoding) {
             return Err(CodecError::FloatWithScx1);
         }
 
@@ -276,7 +290,7 @@ pub fn decode_shard_native(
 ) -> Result<NativeShard, CodecError> {
     // Scx1: keep the Rice-decoded u32 values and forbp u32 indices as-is.
     if codec_id == CodecId::Scx1 {
-        if !value_encoding.is_integer() {
+        if !codec_supports(codec_id, value_encoding) {
             return Err(CodecError::FloatWithScx1);
         }
 
@@ -364,7 +378,10 @@ pub fn decode_indptr_only(
     // `indptr_byte_cap` performs the `(n_rows + 1) * 8` in checked arithmetic,
     // so computing it first is also what stops a `usize::MAX` `n_rows` from
     // wrapping inside a codec's own `n_rows + 1` (F-f).
-    let indptr_max = indptr_byte_cap(n_rows)?;
+    // Indptr-only decode has no `nnz` and no value encoding, so
+    // `DecodeBounds::derive` does not apply: this is the indptr product on its
+    // own, and it is still the checked one.
+    let indptr_max = indptr_byte_cap(n_rows)?; // ORG-3.7-3-ALLOW
     let indptr_u64: Vec<u64> = match codec_id {
         CodecId::None => NoneCodec::decode_indptr_only(indptr_bytes, n_rows, indptr_max)?,
         CodecId::Scx1 => Scx1Codec::decode_indptr_only(indptr_bytes, n_rows, indptr_max)?,
