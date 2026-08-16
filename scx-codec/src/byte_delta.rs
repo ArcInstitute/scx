@@ -36,8 +36,8 @@ pub fn byte_delta_planes(buf: &mut [u8], n_planes: usize, n_elems: usize) {
 /// Inverse of [`byte_delta_planes`]: in-place per-plane wrapping-`u8` cumulative
 /// sum along the element axis. `buf.len()` must equal `n_planes * n_elems`.
 ///
-/// On x86_64 this dispatches to the SSE2 kernel ([`crate::simd::undelta_planes`],
-/// baseline-guaranteed, bit-identical); every other target uses the scalar
+/// On x86_64 this dispatches to the SSE2 kernel `simd::undelta_planes`
+/// (crate-private, baseline-guaranteed, bit-identical); every other target uses the scalar
 /// reference below.
 pub fn byte_undelta_planes(buf: &mut [u8], n_planes: usize, n_elems: usize) {
     if n_elems <= 1 {
