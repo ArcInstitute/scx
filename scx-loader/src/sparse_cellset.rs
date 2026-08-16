@@ -124,8 +124,8 @@ pub struct SparseCellSetLoader {
 
 /// Average decoded bytes per CSR shard across `readers`, from catalog stats
 /// only (no decode). Same per-shard model as `IndexPlanLoader`'s auto-tune and
-/// as `WeightedLruCache::estimate_bytes`: `nnz × 8` (i32 indices + f32 data) +
-/// `rows × 8` (i64 indptr).
+/// as `scx_format_io`'s `SizeHint for ScxCsr`: `nnz × 8` (i32 indices + f32
+/// data) + `rows × 8` (i64 indptr).
 fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> usize {
     let mut total_nnz = 0u64;
     let mut total_rows = 0u64;

@@ -455,29 +455,66 @@ impl<K: Eq + Hash> Drop for LeaderGuard<'_, K> {
     }
 }
 
-/// LRU cache with both a count cap and a byte cap. Evicts oldest entries
-/// until both caps are satisfied for a new insertion.
+/// Decoded-payload size in bytes, as the cache's byte budget accounts for it.
 ///
-/// Bytes are estimated from the decoded `ScxCsr` (`indptr.len()*8 +
-/// indices.len()*4 + data.len()*4`) — matches the per-component model used
-/// by `IndexPlanLoader`'s memory-budget auto-tune.
-struct CacheEntry {
-    csr: Arc<ScxCsr>,
+/// The three caches measured their payloads three different ways in three
+/// different places. This is that measure, once, next to the type it describes:
+/// a CSR/CSC shard by the per-component model `IndexPlanLoader`'s memory-budget
+/// auto-tune also uses, a dense shard by Arrow's own accounting.
+pub(crate) trait SizeHint {
+    fn size_bytes(&self) -> usize;
+}
+
+/// `indptr.len()*8 + indices.len()*4 + data.len()*4`.
+fn csr_component_bytes(indptr: usize, indices: usize, data: usize) -> usize {
+    indptr
+        .saturating_mul(8)
+        .saturating_add(indices.saturating_mul(4))
+        .saturating_add(data.saturating_mul(4))
+}
+
+impl SizeHint for ScxCsr {
+    fn size_bytes(&self) -> usize {
+        csr_component_bytes(self.indptr.len(), self.indices.len(), self.data.len())
+    }
+}
+
+impl SizeHint for ScxCsc {
+    fn size_bytes(&self) -> usize {
+        // Same three `Vec<i64>` / `Vec<i32>` / `Vec<f32>` components as
+        // `ScxCsr`, just column-major, so the same model applies.
+        csr_component_bytes(self.indptr.len(), self.indices.len(), self.data.len())
+    }
+}
+
+struct CacheEntry<V> {
+    value: Arc<V>,
     bytes: usize,
 }
 
-struct WeightedLruCache {
-    inner: LruCache<(u32, usize), CacheEntry>,
+/// LRU cache with both a count cap and a byte cap. Evicts oldest entries
+/// until both caps are satisfied for a new insertion.
+///
+/// Generic over the decoded payload: `ScxCsr` for X/layer shards, `ScxCsc` for
+/// the gene-major sidecar, `DenseShard` for an `obsm` embedding. Bytes come
+/// from [`SizeHint`], which is the only thing that differed between the three
+/// hand-rolled caches this replaced.
+///
+/// `K: Copy` is load-bearing, not incidental: `put_with_budget` compares the
+/// key `LruCache::push` hands back against the key it inserted, which is how a
+/// genuine eviction is told apart from a same-key replacement.
+struct WeightedLruCache<K: Eq + Hash + Copy, V: SizeHint> {
+    inner: LruCache<K, CacheEntry<V>>,
     /// Hard byte cap. `usize::MAX` means count-only behavior (compatible
     /// with `BackedCsrReader::new`).
     bytes_budget: usize,
     /// Cumulative bytes currently in `inner`.
     bytes_used: usize,
-    /// Optional metrics handle (cloned from BackedCsrReader on construction).
+    /// Optional metrics handle (cloned from the owning reader on construction).
     metrics: Option<Arc<CacheMetrics>>,
 }
 
-impl WeightedLruCache {
+impl<K: Eq + Hash + Copy, V: SizeHint> WeightedLruCache<K, V> {
     fn new(cache_shards: usize, bytes_budget: usize) -> Self {
         // Clamp to ≥1: `cache_shards` flows from user-facing Python constructors,
         // and `NonZeroUsize::new(0)` would panic. A 1-shard cache is the minimum
@@ -491,30 +528,22 @@ impl WeightedLruCache {
         }
     }
 
-    fn estimate_bytes(csr: &ScxCsr) -> usize {
-        csr.indptr
-            .len()
-            .saturating_mul(8)
-            .saturating_add(csr.indices.len().saturating_mul(4))
-            .saturating_add(csr.data.len().saturating_mul(4))
+    fn get(&mut self, key: &K) -> Option<Arc<V>> {
+        self.inner.get(key).map(|e| Arc::clone(&e.value))
     }
 
-    fn get(&mut self, key: &(u32, usize)) -> Option<Arc<ScxCsr>> {
-        self.inner.get(key).map(|e| Arc::clone(&e.csr))
-    }
-
-    fn contains(&self, key: &(u32, usize)) -> bool {
+    fn contains(&self, key: &K) -> bool {
         self.inner.contains(key)
     }
 
-    /// Insert `csr` under `key`, evicting oldest entries until both the
+    /// Insert `value` under `key`, evicting oldest entries until both the
     /// count cap (enforced by the inner `LruCache`) and the byte cap are
     /// satisfied. If a new entry on its own exceeds `bytes_budget`, all
     /// other entries are evicted and the new one is still inserted (the
     /// alternative — refusing to cache — would defeat the cache for any
     /// outsized shard).
-    fn put_with_budget(&mut self, key: (u32, usize), csr: Arc<ScxCsr>) {
-        let bytes = Self::estimate_bytes(&csr);
+    fn put_with_budget(&mut self, key: K, value: Arc<V>) {
+        let bytes = value.size_bytes();
 
         // Evict by byte budget first. The LruCache's count cap is handled
         // by `LruCache::put` returning the displaced entry, which we
@@ -537,7 +566,7 @@ impl WeightedLruCache {
         // (inflating `bytes_used` / `peak_bytes_in_cache`). `push` returns the
         // displaced `(key, entry)` in BOTH cases; a returned key != the inserted
         // key is a genuine eviction.
-        let entry = CacheEntry { csr, bytes };
+        let entry = CacheEntry { value, bytes };
         if let Some((evicted_key, displaced)) = self.inner.push(key, entry) {
             self.bytes_used = self.bytes_used.saturating_sub(displaced.bytes);
             if evicted_key != key {
@@ -614,7 +643,7 @@ type InFlightTable = Mutex<HashMap<(u32, usize), Arc<InFlightSlot>>>;
 /// (`pyscx/tests/test_fork_safety.py`) catches any regression.
 pub struct SharedShardCache {
     /// `None` when `cache_shards == 0` (no caching; every read decodes).
-    cache: Option<Mutex<WeightedLruCache>>,
+    cache: Option<Mutex<WeightedLruCache<(u32, usize), ScxCsr>>>,
     /// Singleflight table for in-flight decodes, same fork-safety contract as
     /// `cache`. Present iff `cache` is.
     in_flight: Option<InFlightTable>,
@@ -3041,48 +3070,15 @@ pub struct BackedCscReader {
     /// index). Pre-cached at construction so we don't re-scan the
     /// catalog on every read.
     sorted_entries: Vec<FullCatalogEntry>,
-    /// Optional count-only LRU cache (`None` ⇒ no caching).
-    cache: Option<Mutex<CscCache>>,
+    /// Optional LRU cache of decoded CSC shards (`None` ⇒ no caching).
+    ///
+    /// `BackedCscReader::new` / `for_modality` / `for_layer` open it with a
+    /// `usize::MAX` byte budget, i.e. count-only — the behaviour the
+    /// hand-rolled `CscCache` this replaced had no way to do otherwise.
+    /// [`Self::with_byte_budget`] is the way to bound it in bytes.
+    cache: Option<Mutex<WeightedLruCache<usize, ScxCsc>>>,
     /// Optional metrics handle.
     metrics: Option<Arc<CacheMetrics>>,
-}
-
-/// Minimal count-only LRU cache for decoded CSC shards. Counterpart to
-/// `WeightedLruCache` for CSR; we don't yet need a byte budget here.
-struct CscCache {
-    inner: LruCache<usize, Arc<ScxCsc>>,
-    metrics: Option<Arc<CacheMetrics>>,
-}
-
-impl CscCache {
-    fn new(cap: usize) -> Self {
-        let cap = NonZeroUsize::new(cap).unwrap();
-        CscCache {
-            inner: LruCache::new(cap),
-            metrics: None,
-        }
-    }
-
-    fn get(&mut self, key: &usize) -> Option<Arc<ScxCsc>> {
-        self.inner.get(key).cloned()
-    }
-
-    fn put(&mut self, key: usize, value: Arc<ScxCsc>) {
-        // `push` (not `put`) so a count-cap eviction is counted: `put` returns
-        // `None` when a new key evicts the LRU, so the eviction would be missed.
-        // A returned key != the inserted key is a genuine eviction.
-        if let Some((evicted_key, _displaced)) = self.inner.push(key, value) {
-            if evicted_key != key {
-                if let Some(m) = &self.metrics {
-                    m.evictions.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        // CSC cache is count-only (no byte budget); `bytes_inserted` /
-        // `peak_bytes_in_cache` on the shared `CacheMetrics` are
-        // intentionally left at zero here. Mirror their CSR-side
-        // semantics if a byte budget is added later.
-    }
 }
 
 impl BackedCscReader {
@@ -3117,6 +3113,31 @@ impl BackedCscReader {
     /// avoids cache thrashing under interleaved access patterns
     /// (e.g. totalVI training touching RNA + ADT in the same step).
     pub fn for_modality(reader: ScxReader, modality_id: u8, cache_shards: usize) -> Result<Self> {
+        Self::for_modality_with_byte_budget(reader, modality_id, cache_shards, usize::MAX)
+    }
+
+    /// Global-modality CSC reader with both a count cap and a byte cap on the
+    /// decoded-shard LRU. The CSR and dense readers have had a byte budget
+    /// since their caches did; CSC could not express one until all three
+    /// shared an implementation.
+    ///
+    /// `bytes_budget` counts a decoded `ScxCsc` by its components
+    /// (`indptr.len()*8 + indices.len()*4 + data.len()*4`), the same model the
+    /// loader's memory-budget auto-tune uses.
+    pub fn with_byte_budget(
+        reader: ScxReader,
+        cache_shards: usize,
+        bytes_budget: usize,
+    ) -> Result<Self> {
+        Self::for_modality_with_byte_budget(reader, 0, cache_shards, bytes_budget)
+    }
+
+    fn for_modality_with_byte_budget(
+        reader: ScxReader,
+        modality_id: u8,
+        cache_shards: usize,
+        bytes_budget: usize,
+    ) -> Result<Self> {
         let index = BackedCscIndex::from_catalog_for_modality(reader.catalog(), modality_id);
         let n_obs = reader.n_obs() as usize;
         // For multimodal files the per-modality `n_vars` lives on
@@ -3135,7 +3156,10 @@ impl BackedCscReader {
             .collect();
         check_csc_sidecar_fresh(reader.catalog(), &sorted_entries)?;
         let cache = if cache_shards > 0 {
-            Some(Mutex::new(CscCache::new(cache_shards)))
+            Some(Mutex::new(WeightedLruCache::new(
+                cache_shards,
+                bytes_budget,
+            )))
         } else {
             None
         };
@@ -3174,7 +3198,7 @@ impl BackedCscReader {
             .collect();
         check_csc_sidecar_fresh(reader.catalog(), &sorted_entries)?;
         let cache = if cache_shards > 0 {
-            Some(Mutex::new(CscCache::new(cache_shards)))
+            Some(Mutex::new(WeightedLruCache::new(cache_shards, usize::MAX)))
         } else {
             None
         };
@@ -3273,7 +3297,7 @@ impl BackedCscReader {
         let csc = Arc::new(self.read_shard_uncached(shard_idx)?);
         if let Some(ref cache_mutex) = self.cache {
             let mut cache = cache_mutex.lock().unwrap();
-            cache.put(shard_idx, Arc::clone(&csc));
+            cache.put_with_budget(shard_idx, Arc::clone(&csc));
         }
         Ok(csc)
     }
@@ -3489,77 +3513,12 @@ impl DenseShardEntryLite {
     }
 }
 
-/// LRU cache of decoded dense shards with both a count cap and a byte
-/// cap. Dense analog of [`WeightedLruCache`]; bytes are measured exactly
-/// via `RecordBatch::get_array_memory_size()` rather than the CSR
-/// component formula.
-struct DenseLruCache {
-    inner: LruCache<usize, DenseCacheEntry>,
-    bytes_budget: usize,
-    bytes_used: usize,
-    metrics: Option<Arc<CacheMetrics>>,
-}
-
-struct DenseCacheEntry {
-    shard: Arc<DenseShard>,
-    bytes: usize,
-}
-
-impl DenseLruCache {
-    fn new(cache_shards: usize, bytes_budget: usize) -> Self {
-        // Clamp to ≥1 — see `WeightedLruCache::new`; `NonZeroUsize::new(0)` panics.
-        let cap = NonZeroUsize::new(cache_shards.max(1)).unwrap();
-        DenseLruCache {
-            inner: LruCache::new(cap),
-            bytes_budget,
-            bytes_used: 0,
-            metrics: None,
-        }
-    }
-
-    fn estimate_bytes(shard: &DenseShard) -> usize {
-        shard.batch.get_array_memory_size()
-    }
-
-    fn get(&mut self, key: &usize) -> Option<Arc<DenseShard>> {
-        self.inner.get(key).map(|e| Arc::clone(&e.shard))
-    }
-
-    fn contains(&self, key: &usize) -> bool {
-        self.inner.contains(key)
-    }
-
-    fn put_with_budget(&mut self, key: usize, shard: Arc<DenseShard>) {
-        let bytes = Self::estimate_bytes(&shard);
-        while self.bytes_used.saturating_add(bytes) > self.bytes_budget && !self.inner.is_empty() {
-            if let Some((_, evicted)) = self.inner.pop_lru() {
-                self.bytes_used = self.bytes_used.saturating_sub(evicted.bytes);
-                if let Some(m) = &self.metrics {
-                    m.evictions.fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
-                break;
-            }
-        }
-        // `push` (not `put`): see `WeightedLruCache::put_with_budget` — `put`
-        // returns `None` on a count-cap eviction, so the eviction would go
-        // uncounted and its bytes never subtracted. `push` returns the displaced
-        // entry; a returned key != the inserted key is a genuine eviction.
-        let entry = DenseCacheEntry { shard, bytes };
-        if let Some((evicted_key, displaced)) = self.inner.push(key, entry) {
-            self.bytes_used = self.bytes_used.saturating_sub(displaced.bytes);
-            if evicted_key != key {
-                if let Some(m) = &self.metrics {
-                    m.evictions.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        self.bytes_used = self.bytes_used.saturating_add(bytes);
-        if let Some(m) = &self.metrics {
-            m.bytes_inserted.fetch_add(bytes as u64, Ordering::Relaxed);
-            m.peak_bytes_in_cache
-                .fetch_max(self.bytes_used as u64, Ordering::Relaxed);
-        }
+impl SizeHint for DenseShard {
+    /// Arrow's own accounting rather than the CSR component formula — a
+    /// `RecordBatch` of `n_cols` primitive arrays has buffer padding and
+    /// validity bitmaps the component model does not see.
+    fn size_bytes(&self) -> usize {
+        self.batch.get_array_memory_size()
     }
 }
 
@@ -3587,7 +3546,7 @@ pub struct BackedDenseReader {
     schema: Arc<arrow::datatypes::Schema>,
     /// Per-shard catalog rows, ordered by `row_start`.
     sorted_entries: Vec<DenseShardEntryLite>,
-    cache: Option<Mutex<DenseLruCache>>,
+    cache: Option<Mutex<WeightedLruCache<usize, DenseShard>>>,
     in_flight: Option<Mutex<HashMap<usize, Arc<InFlightSlot>>>>,
     metrics: Option<Arc<CacheMetrics>>,
     prefetch_count: usize,
@@ -3659,7 +3618,10 @@ impl BackedDenseReader {
             .collect();
         let schema = Arc::new(arrow::datatypes::Schema::new(layout.fields));
         let cache = if cache_shards > 0 {
-            Some(Mutex::new(DenseLruCache::new(cache_shards, bytes_budget)))
+            Some(Mutex::new(WeightedLruCache::new(
+                cache_shards,
+                bytes_budget,
+            )))
         } else {
             None
         };

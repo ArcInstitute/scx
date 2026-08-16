@@ -631,7 +631,7 @@ fn test_backed_dense_legacy_single_section() {
 }
 
 // -----------------------------------------------------------------------
-// DenseLruCache
+// The dense shard cache
 // -----------------------------------------------------------------------
 //
 // The dense LRU had no test of any kind — not eviction, not the byte budget,
@@ -1681,7 +1681,7 @@ fn backed_csc_read_csc_columns_skip_count_metric() {
 }
 
 // -----------------------------------------------------------------------
-// CscCache
+// The CSC shard cache
 // -----------------------------------------------------------------------
 //
 // The CSC cache had no eviction, capacity or put/get test. It is also the one
@@ -1734,12 +1734,15 @@ fn csc_cache_evicts_at_the_count_cap() {
 
 #[test]
 fn csc_cache_counts_an_eviction_but_not_a_replacement() {
-    // `CscCache::put` uses `LruCache::push`, not `put`, precisely because `put`
-    // returns `None` when a new key evicts the LRU — so a count-cap eviction
-    // would go uncounted. Nothing checked that, and the distinction is
+    // `put_with_budget` uses `LruCache::push`, not `put`, precisely because
+    // `put` returns `None` when a new key evicts the LRU — so a count-cap
+    // eviction would go uncounted. Nothing checked that, and the distinction is
     // invisible until someone reads the eviction counter and believes it.
+    //
+    // Driven at the CSC instantiation of the shared cache: `usize::MAX` bytes
+    // so only the count cap can evict, which is what this is about.
     let metrics = Arc::new(CacheMetrics::default());
-    let mut cache = CscCache::new(2);
+    let mut cache: WeightedLruCache<usize, ScxCsc> = WeightedLruCache::new(2, usize::MAX);
     cache.metrics = Some(Arc::clone(&metrics));
     let empty = || {
         Arc::new(ScxCsc::new_unchecked(
@@ -1750,16 +1753,16 @@ fn csc_cache_counts_an_eviction_but_not_a_replacement() {
         ))
     };
 
-    cache.put(0, empty());
-    cache.put(0, empty());
+    cache.put_with_budget(0, empty());
+    cache.put_with_budget(0, empty());
     assert_eq!(
         metrics.evictions.load(Ordering::Relaxed),
         0,
         "re-inserting the same key is a replacement, not an eviction"
     );
 
-    cache.put(1, empty());
-    cache.put(2, empty());
+    cache.put_with_budget(1, empty());
+    cache.put_with_budget(2, empty());
     assert_eq!(
         metrics.evictions.load(Ordering::Relaxed),
         1,
@@ -1770,11 +1773,14 @@ fn csc_cache_counts_an_eviction_but_not_a_replacement() {
 }
 
 #[test]
-fn csc_metrics_leave_the_byte_counters_at_zero() {
-    // Pins today's accounting so the change is visible as an edited assertion:
-    // the CSC cache is count-only, and `CscCache::put`'s comment says
-    // `bytes_inserted` / `peak_bytes_in_cache` are "intentionally left at
-    // zero". The CSR and dense caches both populate them.
+fn csc_metrics_now_report_bytes_like_the_other_two_caches() {
+    // **Changed behaviour.** This test previously asserted these were zero, and
+    // the hand-rolled CSC cache said they were "intentionally left at zero".
+    // Sharing the
+    // cache means CSC accounts for bytes the way CSR and dense always have, so
+    // anything sampling `CacheMetrics` off a `BackedCscReader` sees real
+    // numbers where it saw zeros. `CacheMetrics`'s fields are unchanged — it is
+    // pyscx's FFI shape — only which caches populate them.
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = write_csc_test_file(&dir, 12, 12, 3);
     let reader = ScxReader::open(&path).unwrap();
@@ -1786,20 +1792,53 @@ fn csc_metrics_leave_the_byte_counters_at_zero() {
     }
 
     assert!(metrics.misses.load(Ordering::Relaxed) > 0, "shards decoded");
-    assert_eq!(
-        metrics.bytes_inserted.load(Ordering::Relaxed),
-        0,
-        "CSC is count-only today"
+    assert!(
+        metrics.bytes_inserted.load(Ordering::Relaxed) > 0,
+        "CSC now measures what it caches"
     );
-    assert_eq!(
-        metrics.peak_bytes_in_cache.load(Ordering::Relaxed),
-        0,
-        "CSC is count-only today"
+    assert!(
+        metrics.peak_bytes_in_cache.load(Ordering::Relaxed) > 0,
+        "and reports the high-water mark"
     );
     assert_eq!(
         metrics.duplicate_waiters.load(Ordering::Relaxed),
         0,
-        "CSC has no singleflight today — nothing can wait"
+        "CSC has no singleflight yet — nothing can wait"
+    );
+}
+
+#[test]
+fn a_csc_reader_can_now_be_opened_under_a_byte_budget() {
+    // The capability CSC could not express before: `BackedCscReader::new` is
+    // count-only (`usize::MAX`), and `with_byte_budget` bounds it in bytes.
+    // Both are the same cache now, so this is a constructor, not a new path.
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = write_csc_test_file(&dir, 12, 12, 3);
+
+    let probe = ScxReader::open(&path).unwrap();
+    let mut probe_reader = BackedCscReader::new(probe, 4).unwrap();
+    let probe_metrics = probe_reader.enable_metrics();
+    probe_reader.read_shard_cached(0).unwrap();
+    let one_shard = probe_metrics.bytes_inserted.load(Ordering::Relaxed) as usize;
+    assert!(one_shard > 0);
+
+    // Count cap of 4 (all four fit) but room for two, so any eviction is the
+    // byte cap's doing.
+    let reader = ScxReader::open(&path).unwrap();
+    let mut backed = BackedCscReader::with_byte_budget(reader, 4, one_shard * 2).unwrap();
+    let metrics = backed.enable_metrics();
+    for s in 0..backed.n_shards() {
+        backed.read_shard_cached(s).unwrap();
+    }
+
+    assert!(
+        metrics.evictions.load(Ordering::Relaxed) >= 2,
+        "four shards into a two-shard byte budget must evict, got {}",
+        metrics.evictions.load(Ordering::Relaxed)
+    );
+    assert!(
+        metrics.peak_bytes_in_cache.load(Ordering::Relaxed) as usize <= one_shard * 2,
+        "peak exceeded the byte budget"
     );
 }
 
