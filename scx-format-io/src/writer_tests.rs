@@ -3123,7 +3123,8 @@ fn layer_csc_shards_are_column_major_end_to_end() {
     assert_eq!(index.shard_for_col(21), Some(1));
 }
 
-/// A multimodal file gets no per-shard column stats — and the refusal is loud.
+/// The **bulk, index-derived** column-stat path refuses a multimodal file, and
+/// the refusal is loud.
 ///
 /// `assign_csr_shard_column_stats` maps `per_shard[i]` onto the i-th CSR shard
 /// **by position**, which is only meaningful while "the i-th CSR shard" and
@@ -3133,10 +3134,20 @@ fn layer_csc_shards_are_column_major_end_to_end() {
 /// shards and Level-1 pruning would then skip shards that do match.
 ///
 /// The entry filter (`modality_id == 0`) is what prevents that, and this test
-/// is what keeps it. Predicate indexes are unimodal-only today — `scx convert`
-/// emits `PredicateIndexSkippedMultimodal` and `merge` records
-/// `multimodal_skip` — so this is the backstop for the day that changes: it
-/// must fail closed, not mis-assign.
+/// is what keeps it.
+///
+/// ⚠️ Scope, precisely — this test pins one path, not a file-wide property:
+///
+/// - It says nothing about [`ScxWriter::set_shard_column_stats`], which writes
+///   to the last-written entry whatever its modality. That setter is not fed by
+///   a predicate index, so it carries no positional assumption to violate.
+/// - It does **not** establish that a multimodal file cannot carry an
+///   `obs_predicate_index`. `write_obs_predicate_index` is public and accepts a
+///   writer with registered modalities; the high-level builders skip emission by
+///   convention (`scx convert` emits `PredicateIndexSkippedMultimodal`, `merge`
+///   records `multimodal_skip`). The read side does not rely on that convention
+///   — see `scx_engine::index::derive_shard_column_stats` for the three
+///   independent guards.
 #[test]
 fn bulk_csr_shard_column_stats_refuses_a_multimodal_file() {
     let dir = tempfile::tempdir().unwrap();
