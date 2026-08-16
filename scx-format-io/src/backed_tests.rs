@@ -1686,9 +1686,9 @@ fn backed_csc_read_csc_columns_skip_count_metric() {
 // The CSC shard cache
 // -----------------------------------------------------------------------
 //
-// The CSC cache had no eviction, capacity or put/get test. It is also the one
-// of the three that is count-only and has no singleflight, so these pin both
-// what it does and what it deliberately does not do.
+// The CSC cache had no eviction, capacity or put/get test of any kind. These
+// pin the count-cap behaviour that survived the unification (`new` still opens
+// count-only) and the byte accounting and singleflight that are new to it.
 
 #[test]
 fn csc_cache_evicts_at_the_count_cap() {
@@ -1807,6 +1807,127 @@ fn csc_metrics_now_report_bytes_like_the_other_two_caches() {
         0,
         "nothing raced in this test, so nobody waited"
     );
+}
+
+#[test]
+fn shard_cache_decodes_one_contended_key_exactly_once() {
+    // The deterministic counterpart to the two reader-level dedup tests below.
+    // Those spawn threads and bound `misses` by the number of distinct shards,
+    // which is the same guarantee the CSR test has always asserted — but it is
+    // only *evidence* of singleflight when the threads actually contend. A
+    // scheduler that runs one thread to completion first would populate the
+    // cache, turn every peer into an ordinary LRU hit, and satisfy the bound
+    // with the singleflight removed. That was measured not to happen here (8
+    // threads over 2 shards gave 11–15 misses with `in_flight` disabled), but
+    // "did not happen on this machine" is not determinism.
+    //
+    // So drive `ShardCache` directly and make the contention a property of the
+    // test rather than of the scheduler: whoever wins leadership holds its
+    // decode open until every follower has registered as a waiter, so no peer
+    // can race past on a cache hit. The deadline is what keeps a *broken*
+    // singleflight a bounded failure rather than a hang — with every thread a
+    // leader, `duplicate_waiters` never rises and each spins to the deadline,
+    // then `decodes` is 8 and the assert fires.
+    use std::sync::atomic::AtomicUsize;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const FOLLOWERS: u64 = 7;
+    let cache: Arc<ShardCache<usize, ScxCsc>> = ShardCache::new(4, usize::MAX);
+    let metrics = cache.enable_metrics();
+    let decodes = Arc::new(AtomicUsize::new(0));
+
+    let handles: Vec<_> = (0..=FOLLOWERS)
+        .map(|_| {
+            let c = Arc::clone(&cache);
+            let d = Arc::clone(&decodes);
+            let m = Arc::clone(&metrics);
+            thread::spawn(move || {
+                c.get_or_decode(0usize, || {
+                    d.fetch_add(1, Ordering::Relaxed);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while m.duplicate_waiters.load(Ordering::Relaxed) < FOLLOWERS
+                        && Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                    Ok(Arc::new(ScxCsc::new_unchecked(
+                        (4, 1),
+                        vec![0, 0],
+                        Vec::new(),
+                        Vec::new(),
+                    )))
+                })
+                .unwrap();
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert_eq!(
+        decodes.load(Ordering::Relaxed),
+        1,
+        "{} threads contending on one key must produce exactly one decode",
+        FOLLOWERS + 1
+    );
+    assert_eq!(
+        metrics.duplicate_waiters.load(Ordering::Relaxed),
+        FOLLOWERS,
+        "every non-leader must have waited on the leader's Condvar"
+    );
+    assert_eq!(metrics.misses.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        metrics.hits.load(Ordering::Relaxed),
+        FOLLOWERS,
+        "each waiter is served from the cache the leader filled"
+    );
+}
+
+#[test]
+fn dense_reader_enable_metrics_is_idempotent() {
+    // **Changed behaviour**, and the one the PR description originally denied:
+    // this used to install a fresh `CacheMetrics` per call, so a second call
+    // reset the counters and orphaned the first caller's handle. It now returns
+    // the same accumulating handle, matching `BackedCsrReader`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_obsm_file(&dir, 100, 4, 6);
+    let reader = ScxReader::open(&path).unwrap();
+    let mut backed = BackedDenseReader::new_obsm(reader, "X_emb", 4).unwrap();
+
+    let first = backed.enable_metrics();
+    backed.read_row_indices(&[0]).unwrap();
+    let after_one = first.misses.load(Ordering::Relaxed);
+    assert!(after_one > 0, "a cold read must miss");
+
+    let second = backed.enable_metrics();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "re-enabling must hand back the same counters, not a fresh set"
+    );
+    assert_eq!(
+        second.misses.load(Ordering::Relaxed),
+        after_one,
+        "counters accumulate for the life of the reader; they are not reset"
+    );
+}
+
+#[test]
+fn csc_reader_enable_metrics_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = write_csc_test_file(&dir, 12, 12, 3);
+    let reader = ScxReader::open(&path).unwrap();
+    let mut backed = BackedCscReader::new(reader, 4).unwrap();
+
+    let first = backed.enable_metrics();
+    backed.read_shard_cached(0).unwrap();
+    let after_one = first.misses.load(Ordering::Relaxed);
+    assert!(after_one > 0);
+
+    let second = backed.enable_metrics();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(second.misses.load(Ordering::Relaxed), after_one);
 }
 
 #[test]

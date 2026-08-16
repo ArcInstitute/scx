@@ -184,16 +184,19 @@ pub(super) fn check_csc_sidecar_fresh(
 /// On-demand CSC reader with optional decoded-shard caching.
 ///
 /// Wraps an [`ScxReader`] with a [`BackedCscIndex`] for O(log n)
-/// column-range lookups and an optional count-only LRU cache for
-/// decoded `ScxCsc` shards. Implements [`crate::ColumnShardSource`].
+/// column-range lookups and a [`ShardCache`] of decoded `ScxCsc` shards.
+/// Implements [`crate::ColumnShardSource`].
 ///
-/// The cache is intentionally simpler than `BackedCsrReader`'s:
-/// count-only LRU, no byte budget, no singleflight. CSC analytical
-/// kernels (Phase F: DE on gene chunks, projected `col_*`) tend to
-/// access shards in column-range order with limited reuse, so the CSR
-/// reader's heavier machinery isn't a fit yet. If benchmarks later show
-/// contention on the same shard from multiple threads, the singleflight
-/// pattern can be ported over.
+/// The cache is the same byte-budgeted, singleflighted one the CSR and dense
+/// readers use. It was a separate count-only implementation with neither, on
+/// the reasoning that CSC analytical kernels (DE on gene chunks, projected
+/// `col_*`) access shards in column-range order with limited reuse. The reuse
+/// argument holds and is why [`Self::new`] still opens **count-only** — a
+/// `usize::MAX` byte budget, so only the shard count bounds it, exactly as
+/// before. What it did not justify was a third copy of the eviction loop, or
+/// concurrent readers of one cold shard each decoding their own copy.
+///
+/// [`Self::with_byte_budget`] bounds the cache in bytes instead.
 pub struct BackedCscReader {
     reader: ScxReader,
     index: BackedCscIndex,
@@ -340,9 +343,16 @@ impl BackedCscReader {
     /// `misses` / `evictions` reflect CSC-side activity; CSR metrics
     /// live on `BackedCsrReader::enable_metrics()` separately.
     ///
-    /// Idempotent since the cache became shared: repeat calls return the same
-    /// handle rather than installing a fresh set of counters and orphaning
-    /// whatever the previous caller was sampling.
+    /// **Idempotent, and that is a change.** This used to install a fresh
+    /// `CacheMetrics` on every call, so a second call reset the counters to
+    /// zero and orphaned the handle the first caller was holding. It now
+    /// returns the same handle every time, with counters that accumulate for
+    /// the life of the reader — matching `BackedCsrReader`, which has always
+    /// behaved this way via the shared cache's `OnceLock`.
+    ///
+    /// A caller that wants a fresh measurement window must therefore snapshot
+    /// the counters and subtract, rather than re-enabling. Nothing in-tree did
+    /// the latter, but this is public API and the old behaviour was reachable.
     pub fn enable_metrics(&mut self) -> Arc<CacheMetrics> {
         self.cache.enable_metrics()
     }

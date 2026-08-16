@@ -931,16 +931,19 @@ pub trait ShardSource {
 ## BackedCscReader (`scx-format-io/src/backed/csc.rs`)
 
 Column-major counterpart to `BackedCsrReader`. Streams CSC sidecar
-shards from disk with an LRU shard cache, parallel to the CSR side.
+shards from disk through the same `ShardCache` the CSR and dense readers use —
+a byte-budgeted LRU plus a singleflight table, so concurrent readers of one cold
+shard decode it once.
 
-- `new(reader, cache_shards)` — Create from `ScxReader`. `cache_shards = 0` disables caching (one decode per call)
+- `new(reader, cache_shards)` — Create from `ScxReader`. `cache_shards = 0` disables caching (one decode per call). Count-only: the byte budget is `usize::MAX`, so only the shard count bounds the cache
+- `with_byte_budget(reader, cache_shards, bytes)` — As `new`, but also caps the cache in bytes. A decoded `ScxCsc` is measured by its components (`indptr.len()*8 + indices.len()*4 + data.len()*4`), the same model `IndexPlanLoader`'s memory-budget auto-tune uses
 - `index()` — Per-shard column-range index, sorted by `col_start`
 - `n_shards()` / `n_obs()` / `n_vars()` — Dimensions
 - `read_shard_uncached(idx)` → `ScxCsc` — Single CSC shard, bypass cache
-- `read_shard_cached(idx)` → `Arc<ScxCsc>` — Single CSC shard, through cache
+- `read_shard_cached(idx)` → `Arc<ScxCsc>` — Single CSC shard, through cache and singleflight
 - `read_csc_columns(col_range)` → `ScxCsc` — Decode only shards overlapping the half-open range; partial-overlap shards are sliced post-decode
 - `read_csc_columns_subset(cols)` → `ScxCsc` — Gather columns from a sorted unique `&[u32]`; contiguous runs share a single decode
-- `enable_metrics()` / `metrics()` — Per-call hits / misses / decoded-bytes counters
+- `enable_metrics()` / `metrics()` — Hits / misses / evictions / decoded-bytes counters. **Idempotent**: repeat calls return the same accumulating handle rather than resetting. To measure an interval, snapshot and subtract — the same contract `BackedCsrReader` and `BackedDenseReader` have
 
 ## ColumnShardSource Trait (`scx-format-io/src/shard_source.rs`)
 

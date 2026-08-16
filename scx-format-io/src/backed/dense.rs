@@ -189,6 +189,17 @@ impl BackedDenseReader {
     }
 
     /// Enable cache-behaviour counters (test/diagnostic use).
+    ///
+    /// **Idempotent, and that is a change.** This used to install a fresh
+    /// `CacheMetrics` on every call, so a second call reset the counters to
+    /// zero and orphaned the handle the first caller was holding. It now
+    /// returns the same handle every time, with counters that accumulate for
+    /// the life of the reader — matching `BackedCsrReader`, which has always
+    /// behaved this way via the shared cache's `OnceLock`.
+    ///
+    /// A caller that wants a fresh measurement window must therefore snapshot
+    /// the counters and subtract, rather than re-enabling. Nothing in-tree did
+    /// the latter, but this is public API and the old behaviour was reachable.
     pub fn enable_metrics(&mut self) -> Arc<CacheMetrics> {
         self.cache.enable_metrics()
     }
