@@ -37,7 +37,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{
@@ -99,19 +99,57 @@ fn n_genes_at(i: usize) -> i64 {
     100 + ((i * 137) % 900) as i64 // [100, 999]
 }
 
-fn full_obs() -> RecordBatch {
+/// How the fixture's three categorical obs columns are encoded on disk.
+///
+/// `Utf8` is what this oracle has always written. `Dictionary` is the shape a
+/// pandas categorical actually reaches Arrow — and therefore SCX — as: every
+/// `.h5ad` obs column of dtype `category` lands as `Dictionary(Int32, Utf8)`
+/// (`scx-convert/src/h5ad_obs.rs`). Both arms must give identical answers, on
+/// both evaluation paths, against the same ground truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObsEncoding {
+    Utf8,
+    Dictionary,
+}
+
+impl ObsEncoding {
+    fn data_type(self) -> DataType {
+        match self {
+            Self::Utf8 => DataType::Utf8,
+            Self::Dictionary => {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }
+        }
+    }
+
+    /// Build a categorical column in this encoding. The `Dictionary` arm goes
+    /// through arrow's cast so the vocabulary is derived from the values,
+    /// exactly as the h5ad reader derives it from pandas' categories.
+    fn categorical(self, values: Vec<Option<&str>>) -> ArrayRef {
+        let utf8: ArrayRef = Arc::new(StringArray::from(values));
+        match self {
+            Self::Utf8 => utf8,
+            Self::Dictionary => arrow::compute::cast(&utf8, &self.data_type()).unwrap(),
+        }
+    }
+}
+
+fn full_obs(enc: ObsEncoding) -> RecordBatch {
     let n = N_OBS as usize;
     let cell_id: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
     let cell_type: Vec<Option<&str>> = (0..n).map(cell_type_at).collect();
-    let tissue: Vec<&str> = (0..n).map(tissue_at).collect();
-    let quality: Vec<&str> = (0..n).map(quality_at).collect();
+    let tissue: Vec<Option<&str>> = (0..n).map(|i| Some(tissue_at(i))).collect();
+    let quality: Vec<Option<&str>> = (0..n).map(|i| Some(quality_at(i))).collect();
     let n_genes: Vec<i64> = (0..n).map(n_genes_at).collect();
 
+    // `cell_id` stays Utf8 in both arms: the obs index is a plain string column
+    // in real files, and keeping it fixed means a difference between the arms is
+    // attributable to the categorical encoding and nothing else.
     let schema = Schema::new(vec![
         Field::new("cell_id", DataType::Utf8, false),
-        Field::new("cell_type", DataType::Utf8, true), // nullable
-        Field::new("tissue", DataType::Utf8, false),
-        Field::new("quality", DataType::Utf8, false),
+        Field::new("cell_type", enc.data_type(), true), // nullable
+        Field::new("tissue", enc.data_type(), false),
+        Field::new("quality", enc.data_type(), false),
         Field::new("n_genes", DataType::Int64, false),
     ]);
     RecordBatch::try_new(
@@ -120,9 +158,9 @@ fn full_obs() -> RecordBatch {
             Arc::new(StringArray::from(
                 cell_id.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(cell_type)),
-            Arc::new(StringArray::from(tissue)),
-            Arc::new(StringArray::from(quality)),
+            enc.categorical(cell_type),
+            enc.categorical(tissue),
+            enc.categorical(quality),
             Arc::new(Int64Array::from(n_genes)),
         ],
     )
@@ -160,9 +198,9 @@ fn write_csr_shard(writer: &mut ScxWriter, n_rows: usize, row_start: u64) {
         .unwrap();
 }
 
-fn build_fixture(dir: &TempDir) -> PathBuf {
+fn build_fixture(dir: &TempDir, enc: ObsEncoding) -> PathBuf {
     let path = dir.path().join("rowset_diff.scx");
-    let obs = full_obs();
+    let obs = full_obs(enc);
     let var = sample_var();
     let mut writer = ScxWriter::new(
         &path,
@@ -205,7 +243,7 @@ fn build_fixture(dir: &TempDir) -> PathBuf {
         index_preset: None,
         index_auto_threshold: 1000,
     };
-    build_and_write_conversion_predicate_indexes(
+    let index_result = build_and_write_conversion_predicate_indexes(
         &mut writer,
         &obs,
         &var,
@@ -214,6 +252,30 @@ fn build_fixture(dir: &TempDir) -> PathBuf {
         &opts,
     )
     .unwrap();
+
+    // Canary: the two categoricals the generator queries must actually END UP
+    // INDEXED, in both encodings. Without this the `Dictionary` arm passes
+    // vacuously — an unindexed column is not a wrong answer, it is a residual
+    // one, so if `is_categorical_type` stopped seeing through dictionary
+    // encoding both arms would quietly fall through to the legacy full-decode
+    // path and every assertion below would still hold. Measured: with that
+    // exact break injected, the whole file stayed green until this check
+    // existed.
+    let mut indexed = index_result.obs_indexed_columns.clone();
+    indexed.sort();
+    assert_eq!(
+        indexed,
+        vec![
+            "cell_type".to_string(),
+            "n_genes".to_string(),
+            "tissue".to_string()
+        ],
+        "{enc:?}: obs predicate index does not cover the queried columns, so the \
+         row-set path would never resolve anything and this oracle would be \
+         comparing the legacy path against itself; outcomes: {:?}",
+        index_result.obs_outcomes
+    );
+
     writer.finish().unwrap();
     path
 }
@@ -439,10 +501,28 @@ fn count_exists(path: &PathBuf, expr: &str, pushdown: bool) -> (usize, bool) {
     (p.count().unwrap().matched_rows, p.exists().unwrap())
 }
 
+/// The obs columns are `Utf8` — what this oracle has always exercised.
 #[test]
-fn rowset_path_matches_legacy_path() {
+fn rowset_path_matches_legacy_path_utf8() {
+    rowset_path_matches_legacy_path(ObsEncoding::Utf8);
+}
+
+/// The obs categoricals are `Dictionary(Int32, Utf8)` — the shape every pandas
+/// categorical reaches SCX as, and one no end-to-end engine test had ever
+/// written. The whole chain differs from the `Utf8` arm: the builder's
+/// `extract_string_value` / `estimate_unique_values` take their dictionary
+/// branches, `is_categorical_type` must see through the key type, and the
+/// residual evaluator lands in `eval_dictionary_utf8` / `eval_dict_typed`
+/// rather than `eval_utf8`. Ground truth and the expected rows are identical to
+/// the `Utf8` arm — the encoding is not supposed to be observable.
+#[test]
+fn rowset_path_matches_legacy_path_dictionary() {
+    rowset_path_matches_legacy_path(ObsEncoding::Dictionary);
+}
+
+fn rowset_path_matches_legacy_path(enc: ObsEncoding) {
     let dir = TempDir::new().unwrap();
-    let path = build_fixture(&dir);
+    let path = build_fixture(&dir, enc);
 
     // Sanity: with the row-set path ON, a couple of hand-computed expectations
     // cross-check BOTH paths against ground truth.
@@ -570,7 +650,7 @@ fn rowset_path_matches_legacy_path() {
 
     assert!(
         checked > 3000,
-        "expected a substantial number of comparisons"
+        "expected a substantial number of comparisons ({enc:?})"
     );
     assert!(
         null_sensitive > 50,
