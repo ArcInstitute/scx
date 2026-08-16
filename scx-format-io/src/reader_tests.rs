@@ -2163,6 +2163,136 @@ fn test_open_with_shared_catalog_matches_open() {
     }
 }
 
+/// The modality table is parsed by *both* constructors, and until it was
+/// extracted into one helper each carried its own byte-identical copy. Only
+/// `open_inner`'s copy was ever exercised: every shared-catalog test uses a
+/// single-modality file, where the branch is skipped entirely.
+///
+/// So: open a two-modality file through the shared path and check the table
+/// actually came through, not just that the call returned `Ok`.
+#[test]
+fn open_with_shared_catalog_parses_the_modality_table() {
+    use crate::modality::ModalityType;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared_multimodal.scx");
+
+    let header = sample_header(2, 4, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(2)).unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var(4)).unwrap();
+    writer.write_var_for(adt_id, &sample_var(2)).unwrap();
+    writer.set_modality_n_vars(rna_id, 4).unwrap();
+    writer.set_modality_n_vars(adt_id, 2).unwrap();
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &[0u64, 1, 2],
+            &[0u32, 1],
+            &[1u8, 2],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let primary = ScxReader::open(&path).unwrap();
+    assert!(primary.is_multimodal(), "fixture premise");
+    let shared = ScxReader::open_with_shared_catalog(&path, primary.catalog_arc()).unwrap();
+
+    assert!(shared.is_multimodal());
+    assert_eq!(shared.n_modalities(), primary.n_modalities());
+    assert_eq!(shared.modality_names(), primary.modality_names());
+    assert_eq!(shared.modality_id("adt"), primary.modality_id("adt"));
+    assert_eq!(
+        shared.modality_info(rna_id).map(|i| i.n_vars),
+        Some(4),
+        "per-modality n_vars must survive the shared-catalog open"
+    );
+}
+
+/// `open_with_shared_catalog` must echo the offending path when the file is
+/// missing, exactly as `open` / `open_unchecked` do
+/// (`open_missing_file_error_includes_path`). It used bare `?` on `File::open`
+/// and `Mmap::map`, so its error was a context-free "No such file or
+/// directory (os error 2)" -- on the one path a DataLoader worker opens
+/// thousands of times, where knowing *which* file is the whole diagnosis.
+#[test]
+fn open_with_shared_catalog_echoes_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = write_test_file(&dir, "donor.scx", 4, 4, 1, false);
+    let catalog = ScxReader::open(&real).unwrap().catalog_arc();
+
+    let missing = dir.path().join("no_such_file_xyz.scx");
+    let msg = match ScxReader::open_with_shared_catalog(&missing, catalog) {
+        Ok(_) => panic!("expected open of a nonexistent path to fail"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains(&missing.display().to_string()),
+        "shared-catalog open error should echo the offending path, got: {msg}"
+    );
+}
+
+/// A v1 catalog must not reach `open_with_shared_catalog`.
+///
+/// `open_inner` calls `reconcile_v1_csr_col_range(header.n_vars)` to backfill
+/// `col_start` / `col_end` on v1 row-major entries. The shared path cannot: it
+/// holds an `Arc<FullCatalog>` and the method takes `&mut self`. It is safe
+/// today only because every donor happens to come from an `open_inner` reader
+/// -- an invariant nothing enforces, and one this very test file can violate
+/// by hand (see `test_open_with_shared_catalog_rejects_manifest_mismatch`,
+/// which constructs a catalog directly).
+///
+/// Rather than leave that as a convention, refuse the only version where the
+/// reconciliation is not a no-op. Every v2+ catalog is unaffected, and the
+/// shared-catalog path exists for atlas-scale modern files, none of which are
+/// v1.
+#[test]
+fn open_with_shared_catalog_rejects_an_unreconciled_v1_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "v1_donor.scx", 4, 4, 1, false);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let mut catalog = (*reader.catalog_arc()).clone();
+    // Simulate a catalog that never went through the reconciliation: v1, with
+    // the col range that a v1 file's entries would carry on disk.
+    catalog.catalog_version = 1;
+    for e in &mut catalog.entries {
+        if let Some(s) = e.stats.as_mut() {
+            s.col_start = 0;
+            s.col_end = 0;
+        }
+    }
+
+    let msg = match ScxReader::open_with_shared_catalog(&path, Arc::new(catalog)) {
+        Ok(_) => panic!("a v1 catalog must be refused by the shared-catalog path"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("catalog_version") && msg.contains("open()"),
+        "the error must say which version was refused and what to call instead, got: {msg}"
+    );
+}
+
 /// Smoke test: many readers can share a single `Arc<FullCatalog>`
 /// without contention. Mirrors the `to_anndata_backed` shape (one
 /// primary reader + several secondary readers sharing its catalog).

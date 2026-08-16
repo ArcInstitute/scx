@@ -127,10 +127,15 @@ impl ScxReader {
         Self::open_inner(path, false)
     }
 
-    fn open_inner(path: impl AsRef<Path>, verify_catalog: bool) -> Result<Self> {
-        let path = path.as_ref();
-        // Echo the offending path in the error — a bare "No such file or
-        // directory (os error 2)" forces the caller to guess which file failed.
+    /// `mmap` the file, echoing the offending path in any error — a bare
+    /// "No such file or directory (os error 2)" forces the caller to guess
+    /// which file failed, and the readers that hit this hardest open thousands
+    /// of files per run.
+    ///
+    /// Shared by both constructors so neither can quietly lose the context;
+    /// `open_with_shared_catalog` did, for exactly as long as it had its own
+    /// copy of these four lines.
+    fn map_with_path_context(path: &Path) -> Result<Mmap> {
         let file = File::open(path).map_err(|e| {
             ScxError::Io(std::io::Error::new(
                 e.kind(),
@@ -166,15 +171,71 @@ impl ScxReader {
                 ),
             )));
         }
+        Ok(mmap)
+    }
+
+    /// Read the root catalog at offset 256.
+    ///
+    /// The cursor is bounded to the root-catalog region so a corrupt entry
+    /// count cannot read past it into section-body bytes (SCX-007).
+    /// `RootCatalog::read_from` also rejects an over-large count on its own,
+    /// so this is defence in depth rather than the only line — but it is the
+    /// line that survives a change to that parser, and having it in one place
+    /// is why both constructors now get it.
+    fn read_root_catalog(mmap: &Mmap) -> Result<RootCatalog> {
+        let root_end = (HEADER_SIZE + crate::ROOT_CATALOG_MAX_SIZE).min(mmap.len());
+        RootCatalog::read_from(&mut Cursor::new(&mmap[HEADER_SIZE..root_end]))
+    }
+
+    /// Parse the `ModalityTable` section if the header points at one. The
+    /// pointer is `0/0` for single-modality files (legacy shape and v1 files
+    /// alike), which yields `None`.
+    ///
+    /// Extracted because both constructors carried a byte-identical copy.
+    fn parse_modality_table(mmap: &Mmap, header: &FileHeader) -> Result<Option<ModalityTable>> {
+        if header.n_modalities == 0
+            || header.modality_table_offset == 0
+            || header.modality_table_length == 0
+        {
+            return Ok(None);
+        }
+        let mt_off = header.modality_table_offset as usize;
+        let mt_len = header.modality_table_length as usize;
+        let mt_end = mt_off
+            .checked_add(mt_len)
+            .ok_or(ScxError::SectionOutOfBounds {
+                offset: header.modality_table_offset,
+                length: header.modality_table_length,
+                file_size: mmap.len(),
+            })?;
+        if mt_end > mmap.len() {
+            return Err(ScxError::SectionOutOfBounds {
+                offset: header.modality_table_offset,
+                length: header.modality_table_length,
+                file_size: mmap.len(),
+            });
+        }
+        let table = ModalityTable::read_from(&mut Cursor::new(&mmap[mt_off..mt_end]), mt_len)?;
+        // Cross-check header.n_modalities against the table's embedded count.
+        // Disagreement is corruption, not a v1/v2 mismatch.
+        if table.len() as u32 != header.n_modalities {
+            return Err(ScxError::InvalidCatalog(format!(
+                "header.n_modalities ({}) != ModalityTable.len() ({})",
+                header.n_modalities,
+                table.len()
+            )));
+        }
+        Ok(Some(table))
+    }
+
+    fn open_inner(path: impl AsRef<Path>, verify_catalog: bool) -> Result<Self> {
+        let path = path.as_ref();
+        let mmap = Self::map_with_path_context(path)?;
 
         // Read and validate file header
         let header = FileHeader::read_from(&mut Cursor::new(&mmap[..HEADER_SIZE]))?;
 
-        // Read root catalog at offset 256. Bound the cursor to the root-catalog
-        // region so a corrupt entry count cannot read past it into section-body
-        // bytes (SCX-007).
-        let root_end = (HEADER_SIZE + crate::ROOT_CATALOG_MAX_SIZE).min(mmap.len());
-        let root_catalog = RootCatalog::read_from(&mut Cursor::new(&mmap[HEADER_SIZE..root_end]))?;
+        let root_catalog = Self::read_root_catalog(&mmap)?;
 
         // Read full catalog using header's offset and length
         let fc_offset = header.full_catalog_offset as usize;
@@ -203,45 +264,7 @@ impl ScxReader {
         // v2 catalogs.
         full_catalog.reconcile_v1_csr_col_range(header.n_vars);
 
-        // Phase B: parse the ModalityTable section if the header
-        // points at one. The pointer is `0/0` for single-modality
-        // files (legacy shape and v1 files alike).
-        let modality_table = if header.n_modalities > 0
-            && header.modality_table_offset != 0
-            && header.modality_table_length != 0
-        {
-            let mt_off = header.modality_table_offset as usize;
-            let mt_len = header.modality_table_length as usize;
-            let mt_end = mt_off
-                .checked_add(mt_len)
-                .ok_or(ScxError::SectionOutOfBounds {
-                    offset: header.modality_table_offset,
-                    length: header.modality_table_length,
-                    file_size: mmap.len(),
-                })?;
-            if mt_end > mmap.len() {
-                return Err(ScxError::SectionOutOfBounds {
-                    offset: header.modality_table_offset,
-                    length: header.modality_table_length,
-                    file_size: mmap.len(),
-                });
-            }
-            let mt_slice = &mmap[mt_off..mt_end];
-            let table = ModalityTable::read_from(&mut Cursor::new(mt_slice), mt_len)?;
-            // Cross-check header.n_modalities against the table's
-            // embedded count. Disagreement is corruption, not a v1/v2
-            // mismatch.
-            if table.len() as u32 != header.n_modalities {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "header.n_modalities ({}) != ModalityTable.len() ({})",
-                    header.n_modalities,
-                    table.len()
-                )));
-            }
-            Some(table)
-        } else {
-            None
-        };
+        let modality_table = Self::parse_modality_table(&mmap, &header)?;
 
         Ok(ScxReader {
             mmap,
@@ -279,6 +302,18 @@ impl ScxReader {
     /// open, and the sequence check covers the mutation case the
     /// checksum would otherwise have to catch.
     ///
+    /// # v1 catalogs are refused
+    ///
+    /// [`Self::open_inner`] finishes by calling
+    /// `FullCatalog::reconcile_v1_csr_col_range`, which backfills
+    /// `col_start` / `col_end` on v1 row-major entries. This path cannot: it
+    /// receives an `Arc<FullCatalog>`, and the reconciliation takes
+    /// `&mut self`. Rather than rely on the convention that every donor
+    /// happens to have come from a full `open()`, a `catalog_version < 2`
+    /// catalog is rejected outright — that is the only version where the
+    /// reconciliation is not a no-op, and no v1 file needs a fast path built
+    /// for atlas-scale modern ones.
+    ///
     /// # Fork safety
     ///
     /// `Arc<FullCatalog>` is `Send + Sync` and has no interior
@@ -291,25 +326,18 @@ impl ScxReader {
         catalog: Arc<FullCatalog>,
     ) -> Result<Self> {
         let path = path.as_ref();
-        let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
 
-        #[cfg(unix)]
-        {
-            use memmap2::Advice;
-            let _ = mmap.advise(Advice::Normal);
-        }
-
-        if mmap.len() < HEADER_SIZE {
-            return Err(ScxError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "file too small: {} bytes (minimum {})",
-                    mmap.len(),
-                    HEADER_SIZE
-                ),
+        // See "# v1 catalogs are refused" above. Checked before the mmap so
+        // the caller learns the real reason rather than an I/O error.
+        if catalog.catalog_version < 2 {
+            return Err(ScxError::InvalidCatalog(format!(
+                "shared catalog has catalog_version {} (< 2), whose col_start/col_end \
+                 reconciliation this path cannot perform — use ScxReader::open()",
+                catalog.catalog_version,
             )));
         }
+
+        let mmap = Self::map_with_path_context(path)?;
 
         let header = FileHeader::read_from(&mut Cursor::new(&mmap[..HEADER_SIZE]))?;
         if header.manifest_sequence != catalog.manifest_sequence {
@@ -319,44 +347,12 @@ impl ScxReader {
                 catalog.manifest_sequence, header.manifest_sequence,
             )));
         }
-        let root_catalog = RootCatalog::read_from(&mut Cursor::new(&mmap[HEADER_SIZE..]))?;
+        let root_catalog = Self::read_root_catalog(&mmap)?;
 
         // Re-parse the (small) modality table from this instance's mmap.
         // It's only present on multimodal v2 files and is small; the
         // parse cost is negligible vs the full catalog.
-        let modality_table = if header.n_modalities > 0
-            && header.modality_table_offset != 0
-            && header.modality_table_length != 0
-        {
-            let mt_off = header.modality_table_offset as usize;
-            let mt_len = header.modality_table_length as usize;
-            let mt_end = mt_off
-                .checked_add(mt_len)
-                .ok_or(ScxError::SectionOutOfBounds {
-                    offset: header.modality_table_offset,
-                    length: header.modality_table_length,
-                    file_size: mmap.len(),
-                })?;
-            if mt_end > mmap.len() {
-                return Err(ScxError::SectionOutOfBounds {
-                    offset: header.modality_table_offset,
-                    length: header.modality_table_length,
-                    file_size: mmap.len(),
-                });
-            }
-            let mt_slice = &mmap[mt_off..mt_end];
-            let table = ModalityTable::read_from(&mut Cursor::new(mt_slice), mt_len)?;
-            if table.len() as u32 != header.n_modalities {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "header.n_modalities ({}) != ModalityTable.len() ({})",
-                    header.n_modalities,
-                    table.len()
-                )));
-            }
-            Some(table)
-        } else {
-            None
-        };
+        let modality_table = Self::parse_modality_table(&mmap, &header)?;
 
         Ok(ScxReader {
             mmap,
