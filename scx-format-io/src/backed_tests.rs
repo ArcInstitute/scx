@@ -2001,6 +2001,12 @@ fn write_float_file_and_open(
 /// multi-thread rayon pool, `depth > 1` and more than one shard. If any of
 /// those is false every kernel silently takes the same sequential path as the
 /// reference and these tests prove nothing.
+///
+/// This is also why the two tests that call it are `parallel`-gated rather than
+/// left to run: without the feature `prefetch::pool_threads()` is 1, so
+/// `prefetch_depth()` is 1, and the guard fires — correctly. Both sides of the
+/// comparison would be the sequential loop.
+#[cfg(feature = "parallel")]
 fn assert_prefetch_engages(backed: &BackedCsrReader) {
     assert!(
         crate::prefetch::prefetch_depth() > 1,
@@ -2019,6 +2025,7 @@ fn assert_prefetch_engages(backed: &BackedCsrReader) {
     );
 }
 
+#[cfg(feature = "parallel")]
 fn assert_bits_eq(label: &str, got: &[f64], want: &[f64]) {
     assert_eq!(got.len(), want.len(), "{label}: length differs");
     for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
@@ -2062,6 +2069,7 @@ fn fixture_is_sensitive_to_shard_order() {
     );
 }
 
+#[cfg(feature = "parallel")]
 #[test]
 fn prefetched_aggregations_are_bit_identical_to_a_sequential_loop() {
     let dir = tempfile::tempdir().unwrap();
@@ -2164,6 +2172,7 @@ fn prefetched_aggregations_are_bit_identical_to_a_sequential_loop() {
     assert_bits_eq("col_var", &backed.col_var().unwrap(), &ref_col_var);
 }
 
+#[cfg(feature = "parallel")]
 #[test]
 fn prefetched_masked_aggregations_are_bit_identical_to_a_sequential_loop() {
     let dir = tempfile::tempdir().unwrap();
@@ -2768,19 +2777,30 @@ fn the_block_index_path_also_rejects_a_widened_header() {
 // `spawn_handler`; `warm_one_shard` records the nonce it sees. A decode on the
 // global pool (or on any other test's pool) carries nonce 0 and is ignored, so
 // there is nothing to serialise between tests.
+//
+// Every item below is `parallel`-only: `set_cpu_pool` and `warm_one_shard` are
+// both `#[cfg(feature = "parallel")]`, and `rayon::ThreadPool` does not exist
+// without it. Un-gated, this block is why `cargo test -p scx-format-io
+// --no-default-features` had never compiled.
 
+#[cfg(feature = "parallel")]
 use std::cell::Cell;
+#[cfg(feature = "parallel")]
 use std::collections::BTreeSet;
+#[cfg(feature = "parallel")]
 use std::sync::Mutex;
 
+#[cfg(feature = "parallel")]
 thread_local! {
     /// Nonce of the test pool owning this worker thread; 0 on any other thread.
     static POOL_NONCE: Cell<u64> = const { Cell::new(0) };
 }
 
+#[cfg(feature = "parallel")]
 static WARM_NONCES: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
 
 /// Called from `BackedCsrReader::warm_one_shard` on whatever thread rayon chose.
+#[cfg(feature = "parallel")]
 pub(super) fn note_warm_thread() {
     let nonce = POOL_NONCE.with(|n| n.get());
     if nonce != 0 {
@@ -2791,6 +2811,7 @@ pub(super) fn note_warm_thread() {
     }
 }
 
+#[cfg(feature = "parallel")]
 fn warmed_on(nonce: u64) -> bool {
     WARM_NONCES
         .lock()
@@ -2799,6 +2820,7 @@ fn warmed_on(nonce: u64) -> bool {
 }
 
 /// A pool whose workers stamp `nonce` into `POOL_NONCE`.
+#[cfg(feature = "parallel")]
 fn tagged_pool(nonce: u64) -> Arc<rayon::ThreadPool> {
     Arc::new(
         rayon::ThreadPoolBuilder::new()
@@ -2819,8 +2841,10 @@ fn tagged_pool(nonce: u64) -> Arc<rayon::ThreadPool> {
 /// more than one miss — below that it short-circuits to a sequential loop and
 /// never dispatches at all (which is exactly why the old fork test, a single
 /// 16-cell shard, passed vacuously).
+#[cfg(feature = "parallel")]
 const ACROSS_SHARDS: [u64; 4] = [0, 4, 8, 11];
 
+#[cfg(feature = "parallel")]
 #[test]
 fn warm_shards_runs_on_the_injected_pool() {
     let dir = tempfile::tempdir().unwrap();
@@ -2843,6 +2867,7 @@ fn warm_shards_runs_on_the_injected_pool() {
     }
 }
 
+#[cfg(feature = "parallel")]
 #[test]
 fn a_reader_without_a_pool_keeps_using_the_global_one() {
     // Over-fix guard: `scx-accel`/`scx-ops`/`scx-engine`/`scx-cli` never set a

@@ -2024,6 +2024,9 @@ fn a_hostile_catalog_offset_does_not_panic_the_madvise_hint() {
     doctored.offset = u64::MAX - 10;
     doctored.length = 100; // offset + length overflows u64
 
+    // Degenerates to one element with `parallel` off — which is the point: the
+    // list is the set of strategies this build actually has.
+    #[cfg_attr(not(feature = "parallel"), allow(clippy::single_element_loop))]
     for strategy in [
         RowMajorStrategy::Sequential,
         #[cfg(feature = "parallel")]

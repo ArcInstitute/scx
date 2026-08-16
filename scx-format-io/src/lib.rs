@@ -51,6 +51,7 @@ pub use bitmap::{
 };
 #[cfg(feature = "deletion-vectors")]
 pub use categorical::GlobalCategoryAccum;
+#[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::DeletionVectors;
 pub use distinct::DistinctAccumulator;
 pub use encoder::{

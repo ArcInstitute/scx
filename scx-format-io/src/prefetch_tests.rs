@@ -123,6 +123,7 @@ fn empty_source_is_noop() {
 /// Source whose shard `0` stalls (spins) until `stall_head_until` *other*
 /// shards have decoded — forces the head-of-line-stall case that the
 /// spawn-on-consume fix must keep bounded.
+#[cfg(feature = "parallel")]
 struct StallHeadSource {
     n: usize,
     n_vars: usize,
@@ -130,6 +131,7 @@ struct StallHeadSource {
     stall_head_until: usize,
 }
 
+#[cfg(feature = "parallel")]
 impl ShardSource for StallHeadSource {
     fn n_shards(&self) -> usize {
         self.n
