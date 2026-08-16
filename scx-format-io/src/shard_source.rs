@@ -356,7 +356,7 @@ mod tests {
             // shard-skipping and post-decode `col_slice`.
             assert_eq!(col_range, 0..self.n_vars as u32);
             // Concatenate all shards along the column axis using the
-            // ScxCsc concatenation logic mirrored from reader.rs.
+            // ScxCsc concatenation logic mirrored from reader/matrix.rs.
             let mut indptr = vec![0i64];
             let mut indices = Vec::new();
             let mut data = Vec::new();

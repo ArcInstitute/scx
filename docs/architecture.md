@@ -431,22 +431,49 @@ Uses an **atomic rename** strategy for crash safety:
 7. rename() temp → final path  (atomic commit point)
 ```
 
-### Reader (`scx-format-io/src/reader.rs`)
+### Reader (`scx-format-io/src/reader/`)
+
+| Module | Holds |
+|---|---|
+| `mod.rs` | the `ScxReader` struct, accessors, `section_bytes` (the single mmap-slicing chokepoint), madvise helpers, freshness, modality lookups |
+| `open.rs` | the two constructors |
+| `metadata.rs` | Arrow IPC, sharded-metadata assembly, dictionary unification — reaches the mapping only through `section_bytes` |
+| `matrix.rs` | CSR/CSC shard decode, whole-matrix assembly, layers, `adata.raw` |
+| `integrity.rs` | checksum and canonical-CSR validation |
+| `filtered.rs` | deletion-vector and detection-bitmap reads (`deletion-vectors` feature) |
 
 Opens a file via `mmap` and validates magic/version/checksums:
 
 ```
-1. mmap the file (MADV_NORMAL default)
+1. mmap the file (MADV_NORMAL default), with the path echoed in any I/O error
 2. Parse 256-byte header
-3. Parse root catalog (offset 256)
+3. Parse root catalog (offset 256, cursor bounded to ROOT_CATALOG_MAX_SIZE)
 4. Parse full catalog (from header's full_catalog_offset)
-5. Individual sections accessed via catalog offsets
+5. Parse the ModalityTable if the header points at one
+6. Individual sections accessed via catalog offsets
 ```
+
+`open_with_shared_catalog` reuses a sibling reader's `Arc<FullCatalog>` and runs
+the same steps except 4, cross-checking `manifest_sequence` instead. `open()`
+finishes by backfilling v1 `col_start`/`col_end`, which the shared path cannot
+do — it holds an `Arc` it cannot mutate — so it *verifies* that backfill has
+happened rather than assuming it: a v1 catalog whose row-major entries still
+report `col_end == 0` is refused. Note `reconcile_v1_csr_col_range` does not bump
+`catalog_version`, so a reconciled catalog still reports 1; refusing on the
+version instead of the invariant would reject every v1 file `open()` accepts.
 
 All section access is via offset+length from the catalog — no sequential scanning.
 
+**Whole-matrix assembly.** One `assemble_row_major` serves `X`, a modality's
+`X`, layers, and `adata.raw`; the raw matrix passes its own `n_cols` and its own
+empty-result shape. `plan_row_major_layout` and `check_decoded_lengths` hold the
+per-shard stats arithmetic and the decoded-vs-catalog checks, and
+`typed_read.rs`'s narrowing assembler calls both. Output buffers are carved into
+per-shard exclusive slices with `split_at_mut` before decode, so the parallel
+path needs no `unsafe`.
+
 **madvise hints** (Unix only, `#[cfg(unix)]`):
-- `MADV_SEQUENTIAL` on the shard byte range during `assemble_shards_parallel()` — tells kernel to readahead aggressively for full reads
+- `MADV_SEQUENTIAL` on the shard byte range during `assemble_row_major()` — tells kernel to readahead aggressively for full reads
 - `MADV_WILLNEED` on next N shards in `BackedCsrReader::read_shard_cached()` — prefetches upcoming shards after a cache miss
 - `MADV_DONTNEED` after `read_shard_uncached()` — releases page cache for decoded shards during streaming aggregation (67% RSS reduction on 1M cells)
 

@@ -13,8 +13,9 @@
 //!   so counts above `2²⁴` materialize losslessly (where the f32 path rounds).
 //!
 //! The default (`csr`/`f32`/`i32`) plan is served by the untouched zero-copy
-//! path in `reader.rs`; callers gate on [`MaterializePlan::is_default_csr_f32`]
-//! and only route non-default plans here.
+//! path in `reader/matrix.rs`; callers gate on
+//! [`MaterializePlan::is_default_csr_f32`] and only route non-default plans
+//! here.
 
 use std::ops::Range;
 
@@ -27,7 +28,7 @@ use scx_sparse::{
 
 use crate::catalog::FullCatalogEntry;
 use crate::error::{Result, ScxError};
-use crate::reader::ScxReader;
+use crate::reader::{check_decoded_lengths, plan_row_major_layout, ScxReader, X_LABELS};
 
 impl ScxReader {
     /// Read the whole `X` matrix as a [`TypedCsr`] materialized directly at
@@ -140,26 +141,17 @@ impl ScxReader {
             });
         }
 
-        // Pre-compute per-shard (n_rows, nnz) from catalog stats and the max
-        // integer value across in-scope shards — all without decoding.
-        let mut shard_sizes: Vec<(usize, usize)> = Vec::with_capacity(shards.len());
-        let mut max_value: u32 = 0;
-        for e in shards {
-            let stats = e.stats.as_ref().ok_or_else(|| {
-                ScxError::InvalidCatalog(format!(
-                    "shard entry '{}' at offset {} has no stats block",
-                    e.name, e.offset
-                ))
-            })?;
-            let n_rows = stats.row_end.checked_sub(stats.row_start).ok_or_else(|| {
-                ScxError::InvalidCatalog(format!(
-                    "shard '{}' has row_end {} < row_start {}",
-                    e.name, stats.row_end, stats.row_start
-                ))
-            })? as usize;
-            shard_sizes.push((n_rows, stats.nnz as usize));
-            max_value = max_value.max(stats.value_max);
-        }
+        // Per-shard (n_rows, nnz) from catalog stats, and the max integer value
+        // across in-scope shards — all without decoding. The layout half is
+        // shared with the f32 assembler (`plan_row_major_layout`): this used to
+        // be a fourth hand-rolled copy of the same `checked_sub`.
+        let shard_sizes = plan_row_major_layout(shards, X_LABELS)?;
+        let max_value: u32 = shards
+            .iter()
+            .filter_map(|e| e.stats.as_ref())
+            .map(|s| s.value_max)
+            .max()
+            .unwrap_or(0);
         let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
         let total_nnz: usize = shard_sizes.iter().map(|(_, n)| *n).sum();
 
@@ -182,25 +174,16 @@ impl ScxReader {
 
             // Decoded-vs-catalog length checks (returned errors, not asserts —
             // a stat-drifted catalog must not panic the slice writes below).
-            if shard_ip.len() != n_rows + 1 {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "CSR shard {i} indptr length mismatch: catalog stats say {}, decoded {}",
-                    n_rows + 1,
-                    shard_ip.len()
-                )));
-            }
-            if shard_ix.len() != nnz {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "CSR shard {i} indices length mismatch: catalog stats say {nnz}, decoded {}",
-                    shard_ix.len()
-                )));
-            }
-            if native_values_len(&shard_vals) != nnz {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "CSR shard {i} data length mismatch: catalog stats say {nnz}, decoded {}",
-                    native_values_len(&shard_vals)
-                )));
-            }
+            // Shared with the f32 assembler so a fix lands once.
+            check_decoded_lengths(
+                X_LABELS,
+                i,
+                n_rows,
+                nnz,
+                shard_ip.len(),
+                shard_ix.len(),
+                native_values_len(&shard_vals),
+            )?;
 
             let range = cum_nnz..cum_nnz + nnz;
             fill_index_slice(&mut indices, range.clone(), &shard_ix, plan.allow_lossy)?;

@@ -65,7 +65,7 @@ GroupIndex (29)        — Condition/label-grouped sharding sidecar (one per
                          API. See docs/format.md § section ids.
 ```
 
-## ScxReader (`scx-format-io/src/reader.rs`)
+## ScxReader (`scx-format-io/src/reader/`)
 
 - `open(path)` — Open and validate file (mmap-based, validates magic/version/minimum size)
 - `header()`, `root_catalog()`, `catalog()` — Access file metadata

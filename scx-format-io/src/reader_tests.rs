@@ -1780,13 +1780,261 @@ fn test_parallel_matches_sequential() {
     let reader = ScxReader::open(&path).unwrap();
     let shards = reader.catalog().shards_sorted();
 
-    let sequential = reader.assemble_shards(&shards).unwrap();
-    let parallel = reader.assemble_shards_parallel(&shards).unwrap();
+    let sequential = assemble_x(&reader, &shards, RowMajorStrategy::Sequential).unwrap();
+    let parallel = assemble_x(&reader, &shards, RowMajorStrategy::Parallel).unwrap();
 
     assert_eq!(sequential.shape, parallel.shape);
     assert_eq!(sequential.indptr, parallel.indptr);
     assert_eq!(sequential.indices, parallel.indices);
     assert_eq!(sequential.data, parallel.data);
+}
+
+// -----------------------------------------------------------------------
+// Multi-shard concatenation (the assemblers' running row/nnz offsets)
+// -----------------------------------------------------------------------
+
+/// Test shim: assemble `X`-family shards with an explicit strategy.
+fn assemble_x(
+    reader: &ScxReader,
+    shards: &[&FullCatalogEntry],
+    strategy: RowMajorStrategy,
+) -> Result<ScxCsr> {
+    let n_vars = reader.header().n_vars as usize;
+    reader.assemble_row_major(shards, n_vars, (0, n_vars), X_LABELS, strategy)
+}
+
+/// One row's nonzeros. `(global_row % 4) + 1` entries at columns walking by 3
+/// from `global_row % n_vars`, values derived from the global row index.
+///
+/// Two properties are load-bearing: the per-row nnz **varies**, so a shard's
+/// nnz cannot be recovered from its row count; and every value is distinct
+/// enough that a nonzero landing in the wrong row shows up as a value
+/// mismatch rather than cancelling out. Values are never 0 — a 0 would be
+/// indistinguishable from an untouched slot in a freshly zeroed buffer, which
+/// is exactly the failure a mis-computed offset produces.
+fn irregular_row(global_row: usize, n_vars: usize) -> (Vec<u32>, Vec<u8>) {
+    let nnz = (global_row % 4) + 1;
+    // n_vars must exceed 3 * 3 for these to stay distinct without a dedup.
+    assert!(
+        n_vars > 9,
+        "irregular_row needs n_vars > 9 to avoid collisions"
+    );
+    let cols: Vec<u32> = (0..nnz)
+        .map(|k| ((global_row + k * 3) % n_vars) as u32)
+        .collect();
+    let mut sorted = cols.clone();
+    sorted.sort_unstable();
+    let values: Vec<u8> = sorted
+        .iter()
+        .enumerate()
+        .map(|(k, _)| ((global_row * 7 + k * 3) % 200 + 1) as u8)
+        .collect();
+    (sorted, values)
+}
+
+/// Write `shard_rows.len()` CSR shards with the given per-shard row counts,
+/// and return the assembled `(indptr, indices, data)` the reader must produce
+/// — computed here by walking the rows linearly, independently of any
+/// assembler.
+fn write_irregular_shards(
+    writer: &mut ScxWriter,
+    shard_rows: &[usize],
+    n_vars: usize,
+    raw: bool,
+) -> (Vec<i64>, Vec<i32>, Vec<f32>) {
+    let mut exp_indptr = vec![0i64];
+    let mut exp_indices: Vec<i32> = Vec::new();
+    let mut exp_data: Vec<f32> = Vec::new();
+
+    let mut row_start = 0usize;
+    for &rows in shard_rows {
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<u8> = Vec::new();
+        for local in 0..rows {
+            let (cols, vals) = irregular_row(row_start + local, n_vars);
+            indptr.push(indptr.last().unwrap() + cols.len() as u64);
+            exp_indptr.push(exp_indptr.last().unwrap() + cols.len() as i64);
+            for (c, v) in cols.iter().zip(vals.iter()) {
+                indices.push(*c);
+                values.push(*v);
+                exp_indices.push(*c as i32);
+                exp_data.push(*v as f32);
+            }
+        }
+        if raw {
+            writer
+                .write_raw_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_start as u64,
+                )
+                .unwrap();
+        } else {
+            writer
+                .write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_start as u64,
+                )
+                .unwrap();
+        }
+        row_start += rows;
+    }
+    (exp_indptr, exp_indices, exp_data)
+}
+
+/// Multi-shard concatenation is pinned by nothing else in the tree. Every one
+/// of the golden files under `tests/reference_files/` is written with a
+/// *single* `write_csr_shard` call (`golden_files.rs`), so the goldens
+/// exercise decode and never exercise the running row / nnz offsets that
+/// stitch shards together — and the backed reader reads shards one at a time,
+/// so it does not cover them either.
+///
+/// That is the arithmetic a unification of the assemblers most easily breaks,
+/// and it breaks into *shifted output*, not into an error: a wrong offset
+/// writes a valid-looking CSR whose rows are off by one. Hence exact
+/// `(indptr, indices, data)` assertions against a linearly computed
+/// expectation, on every assembler that concatenates.
+///
+/// The geometry is deliberately irregular — shard row counts `[3, 7, 1, 5]`,
+/// per-row nnz cycling `1..=4`, and a one-row shard in the middle — because
+/// uniform shards make an off-by-one in a prefix sum invisible.
+#[test]
+fn multi_shard_assembly_is_pinned() {
+    const SHARD_ROWS: &[usize] = &[3, 7, 1, 5];
+    const N_VARS: usize = 11;
+    const RAW_N_VARS: usize = 13;
+    let n_obs: usize = SHARD_ROWS.iter().sum();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("irregular_multi_shard.scx");
+
+    // `has_raw` is re-derived from the catalog at finalize, so it needs no
+    // explicit set here.
+    let header = sample_header(n_obs as u64, N_VARS as u64, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(N_VARS)).unwrap();
+    let (exp_indptr, exp_indices, exp_data) =
+        write_irregular_shards(&mut writer, SHARD_ROWS, N_VARS, false);
+
+    // The raw matrix has its OWN, different column count. Assembling it
+    // against `header.n_vars` instead of `raw_n_vars` is a distinct way to
+    // get this wrong, so pin it in the same fixture.
+    writer.set_raw_n_vars(RAW_N_VARS as u64);
+    writer.write_raw_var(&sample_var(RAW_N_VARS)).unwrap();
+    let (raw_indptr, raw_indices, raw_data) =
+        write_irregular_shards(&mut writer, SHARD_ROWS, RAW_N_VARS, true);
+    writer.finish().unwrap();
+
+    // Premise: the fixture really is multi-shard with irregular geometry, and
+    // the per-shard nnz really do differ. Without this the assertions below
+    // could pass against a single-shard file and prove nothing.
+    let reader = ScxReader::open(&path).unwrap();
+    let shards = reader.catalog().shards_sorted();
+    assert_eq!(
+        shards.len(),
+        SHARD_ROWS.len(),
+        "fixture must be multi-shard"
+    );
+    let per_shard_nnz: Vec<u64> = shards
+        .iter()
+        .map(|e| e.stats.as_ref().unwrap().nnz)
+        .collect();
+    assert!(
+        per_shard_nnz
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1,
+        "shards must differ in nnz or a wrong offset stays invisible: {per_shard_nnz:?}"
+    );
+    assert!(exp_indptr.windows(2).any(|w| w[1] - w[0] != 1));
+
+    let expect = |label: &str, csr: &ScxCsr, n_cols: usize, ip: &[i64], ix: &[i32], d: &[f32]| {
+        assert_eq!(csr.shape, (n_obs, n_cols), "{label}: shape");
+        assert_eq!(csr.indptr, ip, "{label}: indptr");
+        assert_eq!(csr.indices, ix, "{label}: indices");
+        assert_eq!(csr.data, d, "{label}: data");
+    };
+
+    expect(
+        "read_all_csr_shards",
+        &reader.read_all_csr_shards().unwrap(),
+        N_VARS,
+        &exp_indptr,
+        &exp_indices,
+        &exp_data,
+    );
+    expect(
+        "assemble_row_major/Sequential",
+        &assemble_x(&reader, &shards, RowMajorStrategy::Sequential).unwrap(),
+        N_VARS,
+        &exp_indptr,
+        &exp_indices,
+        &exp_data,
+    );
+    #[cfg(feature = "parallel")]
+    expect(
+        "assemble_row_major/Parallel",
+        &assemble_x(&reader, &shards, RowMajorStrategy::Parallel).unwrap(),
+        N_VARS,
+        &exp_indptr,
+        &exp_indices,
+        &exp_data,
+    );
+    expect(
+        "read_all_raw_csr_shards",
+        &reader.read_all_raw_csr_shards().unwrap(),
+        RAW_N_VARS,
+        &raw_indptr,
+        &raw_indices,
+        &raw_data,
+    );
+}
+
+/// The assembler's `madvise` hint is computed from raw catalog offsets, before
+/// `section_bytes` gets a chance to reject the entry. `e.offset + e.length` was
+/// a bare `u64` add and `max_end - min_offset` a bare `usize` subtract, so a
+/// catalog with an absurd offset panicked the reader in debug (overflow) or
+/// wrapped in release and then underflowed the subtraction.
+///
+/// A readahead hint is advisory, so the right answer is to skip it rather than
+/// to fail: the entry is still rejected a moment later by `section_bytes`,
+/// which is where a bad offset should surface. What must not happen is a panic
+/// — `docs/conventions.md`: readers return errors on malformed input.
+///
+/// `read_all_raw_csr_shards` newly reaches this block: before the assemblers
+/// were unified its hand-rolled body issued no hint at all.
+#[test]
+fn a_hostile_catalog_offset_does_not_panic_the_madvise_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "hostile_offset.scx", 6, 4, 2, false);
+    let reader = ScxReader::open(&path).unwrap();
+    let shards = reader.catalog().shards_sorted();
+
+    let mut doctored = shards[0].clone();
+    doctored.offset = u64::MAX - 10;
+    doctored.length = 100; // offset + length overflows u64
+
+    for strategy in [
+        RowMajorStrategy::Sequential,
+        #[cfg(feature = "parallel")]
+        RowMajorStrategy::Parallel,
+    ] {
+        let r = assemble_x(&reader, &[&doctored, shards[1]], strategy);
+        assert!(
+            r.is_err(),
+            "{strategy:?}: an out-of-bounds shard offset must be an error"
+        );
+    }
 }
 
 /// A catalog whose `stats.nnz` disagrees with the decoded shard length must
@@ -1807,13 +2055,13 @@ fn test_assemble_shards_rejects_stat_drift() {
     doctored.stats.as_mut().unwrap().nnz += 1;
 
     assert!(
-        reader.assemble_shards(&[&doctored]).is_err(),
+        assemble_x(&reader, &[&doctored], RowMajorStrategy::Sequential).is_err(),
         "sequential assemble must reject decoded-vs-catalog nnz drift"
     );
 
     #[cfg(feature = "parallel")]
     assert!(
-        reader.assemble_shards_parallel(&[&doctored]).is_err(),
+        assemble_x(&reader, &[&doctored], RowMajorStrategy::Parallel).is_err(),
         "parallel assemble must reject decoded-vs-catalog nnz drift"
     );
 }
@@ -1837,13 +2085,13 @@ fn test_assemble_shards_rejects_inverted_row_range() {
     }
 
     assert!(
-        reader.assemble_shards(&[&doctored]).is_err(),
+        assemble_x(&reader, &[&doctored], RowMajorStrategy::Sequential).is_err(),
         "sequential assemble must reject inverted row range"
     );
 
     #[cfg(feature = "parallel")]
     assert!(
-        reader.assemble_shards_parallel(&[&doctored]).is_err(),
+        assemble_x(&reader, &[&doctored], RowMajorStrategy::Parallel).is_err(),
         "parallel assemble must reject inverted row range"
     );
 }
@@ -1960,6 +2208,196 @@ fn test_open_with_shared_catalog_matches_open() {
         assert_eq!(ix_a, ix_b);
         assert_eq!(dv_a, dv_b);
     }
+}
+
+/// The modality table is parsed by *both* constructors, and until it was
+/// extracted into one helper each carried its own byte-identical copy. Only
+/// `open_inner`'s copy was ever exercised: every shared-catalog test uses a
+/// single-modality file, where the branch is skipped entirely.
+///
+/// So: open a two-modality file through the shared path and check the table
+/// actually came through, not just that the call returned `Ok`.
+#[test]
+fn open_with_shared_catalog_parses_the_modality_table() {
+    use crate::modality::ModalityType;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared_multimodal.scx");
+
+    let header = sample_header(2, 4, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(2)).unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var(4)).unwrap();
+    writer.write_var_for(adt_id, &sample_var(2)).unwrap();
+    writer.set_modality_n_vars(rna_id, 4).unwrap();
+    writer.set_modality_n_vars(adt_id, 2).unwrap();
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &[0u64, 1, 2],
+            &[0u32, 1],
+            &[1u8, 2],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let primary = ScxReader::open(&path).unwrap();
+    assert!(primary.is_multimodal(), "fixture premise");
+    let shared = ScxReader::open_with_shared_catalog(&path, primary.catalog_arc()).unwrap();
+
+    assert!(shared.is_multimodal());
+    assert_eq!(shared.n_modalities(), primary.n_modalities());
+    assert_eq!(shared.modality_names(), primary.modality_names());
+    assert_eq!(shared.modality_id("adt"), primary.modality_id("adt"));
+    assert_eq!(
+        shared.modality_info(rna_id).map(|i| i.n_vars),
+        Some(4),
+        "per-modality n_vars must survive the shared-catalog open"
+    );
+}
+
+/// `open_with_shared_catalog` must echo the offending path when the file is
+/// missing, exactly as `open` / `open_unchecked` do
+/// (`open_missing_file_error_includes_path`). It used bare `?` on `File::open`
+/// and `Mmap::map`, so its error was a context-free "No such file or
+/// directory (os error 2)" -- on the one path a DataLoader worker opens
+/// thousands of times, where knowing *which* file is the whole diagnosis.
+#[test]
+fn open_with_shared_catalog_echoes_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = write_test_file(&dir, "donor.scx", 4, 4, 1, false);
+    let catalog = ScxReader::open(&real).unwrap().catalog_arc();
+
+    let missing = dir.path().join("no_such_file_xyz.scx");
+    let msg = match ScxReader::open_with_shared_catalog(&missing, catalog) {
+        Ok(_) => panic!("expected open of a nonexistent path to fail"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains(&missing.display().to_string()),
+        "shared-catalog open error should echo the offending path, got: {msg}"
+    );
+}
+
+/// A v1 catalog that has NOT been reconciled must not reach
+/// `open_with_shared_catalog` — and one that HAS been must still be accepted.
+///
+/// `open_inner` calls `reconcile_v1_csr_col_range(header.n_vars)` to backfill
+/// `col_start` / `col_end` on v1 row-major entries. The shared path cannot: it
+/// holds an `Arc<FullCatalog>` and the method takes `&mut self`.
+///
+/// The first version of this refused every `catalog_version < 2` catalog, which
+/// was wrong in the direction that matters. `reconcile_v1_csr_col_range` does
+/// not bump `catalog_version` — a reconciled v1 catalog still reports 1 — so
+/// blanket rejection also refused the donors that come straight from
+/// `ScxReader::open()`, and `pyscx.to_anndata(backed=True)` opens X through
+/// this constructor unconditionally. A genuine v1 file that `open()` still
+/// accepts would have failed on that Python surface.
+///
+/// So: verify the invariant instead of rejecting the version. An unreconciled
+/// v1 entry carries `col_end == 0` (v1 stats have no column pair on disk and
+/// `read_from` leaves it zeroed); a reconciled one carries
+/// `col_end == header.n_vars`.
+#[test]
+fn open_with_shared_catalog_checks_v1_reconciliation_not_the_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "v1_donor.scx", 4, 4, 1, false);
+    let reader = ScxReader::open(&path).unwrap();
+    let n_vars = reader.header().n_vars;
+
+    // (a) A reconciled v1 catalog — what `open()` actually hands out for a v1
+    //     file — must be accepted.
+    let mut reconciled = (*reader.catalog_arc()).clone();
+    reconciled.catalog_version = 1;
+    for e in &mut reconciled.entries {
+        if let Some(st) = e.stats.as_mut() {
+            if matches!(
+                e.section_type,
+                SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+            ) {
+                st.col_start = 0;
+                st.col_end = n_vars;
+            }
+        }
+    }
+    let shared = ScxReader::open_with_shared_catalog(&path, Arc::new(reconciled))
+        .expect("a reconciled v1 catalog is what open() hands out; it must be accepted");
+    assert_eq!(shared.catalog().catalog_version, 1);
+    assert_eq!(shared.read_all_csr_shards().unwrap().shape, (4, 4));
+
+    // (b) An UNRECONCILED v1 catalog — the state the shared path genuinely
+    //     cannot fix up — must still be refused, with a message that says what
+    //     to call instead.
+    let mut unreconciled = (*reader.catalog_arc()).clone();
+    unreconciled.catalog_version = 1;
+    for e in &mut unreconciled.entries {
+        if let Some(st) = e.stats.as_mut() {
+            if matches!(
+                e.section_type,
+                SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+            ) {
+                st.col_start = 0;
+                st.col_end = 0;
+            }
+        }
+    }
+    let msg = match ScxReader::open_with_shared_catalog(&path, Arc::new(unreconciled)) {
+        Ok(_) => panic!("an unreconciled v1 catalog must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("reconcile") && msg.contains("open()"),
+        "the error must name the missing reconciliation and what to call instead, got: {msg}"
+    );
+
+    // (b2) A v1 catalog carrying a column range that is NOT the one the
+    //      reconciliation produces. The first version of this check only asked
+    //      `col_end != 0`, so it admitted this — a weaker guarantee than the
+    //      one the function documents.
+    let mut wrong_range = (*reader.catalog_arc()).clone();
+    wrong_range.catalog_version = 1;
+    for e in &mut wrong_range.entries {
+        if let Some(st) = e.stats.as_mut() {
+            if matches!(
+                e.section_type,
+                SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+            ) {
+                st.col_start = 1;
+                st.col_end = n_vars + 7;
+            }
+        }
+    }
+    assert!(
+        ScxReader::open_with_shared_catalog(&path, Arc::new(wrong_range)).is_err(),
+        "a v1 catalog whose column range is not 0..n_vars did not come from \
+         reconcile_v1_csr_col_range and must be refused"
+    );
+
+    // (c) A v2+ catalog is untouched by any of this.
+    assert!(
+        ScxReader::open_with_shared_catalog(&path, reader.catalog_arc()).is_ok(),
+        "the ordinary v2+ donor path must be unaffected"
+    );
 }
 
 /// Smoke test: many readers can share a single `Arc<FullCatalog>`
@@ -2532,4 +2970,383 @@ fn deletion_mask_matching_the_csr_still_filters() {
 
     let csr = reader.read_all_csr_shards_filtered().unwrap();
     assert_eq!(csr.shape.0, 5, "one of six rows was deleted");
+}
+
+// -----------------------------------------------------------------------
+// Zero-row shards, at file level
+// -----------------------------------------------------------------------
+
+/// The review asked for a zero-row *framed* shard round trip. Since §4.6 that
+/// is impossible by construction — `encode_shard_framed` returns
+/// `ZeroRowFramedShard` at write (`encoder.rs`), which is the fix. What §4.6
+/// left uncovered is the arm it deliberately kept legal: an **unframed**
+/// zero-row shard. `encoder.rs::zero_row_unframed_shard_is_still_accepted`
+/// proves the encoder accepts one; nothing writes it to a real file and reads
+/// it back.
+///
+/// Both shapes matter to the assemblers. A lone zero-row shard is the
+/// empty-matrix case an `optimize` / `subset` output can produce; a zero-row
+/// shard *between* two populated ones is what a delete-everything-in-a-shard
+/// rewrite produces, and it is the one that walks an assembler's running row
+/// and nnz offsets past a contributor of size 0.
+#[test]
+fn zero_row_unframed_shards_round_trip_through_a_file() {
+    // (a) a file whose only shard is zero-row.
+    let dir = tempfile::tempdir().unwrap();
+    let only = dir.path().join("only_zero_row.scx");
+    let mut header =
+        FileHeader::new_single_modality(0, 2, 0, crate::DEFAULT_SHARD_TARGET_ROWS, 0, 0);
+    header.format_version = 3;
+    let mut writer = ScxWriter::new(&only, header).unwrap();
+    writer.write_var(&sample_var(2)).unwrap();
+    writer
+        .write_csr_shard(&[0u64], &[], &[], CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = ScxReader::open(&only).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape, (0, 2));
+    assert_eq!(csr.indptr, vec![0]);
+    assert!(csr.indices.is_empty());
+    assert!(csr.data.is_empty());
+
+    // (b) a zero-row shard sandwiched between two populated ones. Rows
+    //     0..2 from shard 0, nothing from shard 1, rows 2..5 from shard 2.
+    let sandwich = dir.path().join("zero_row_sandwich.scx");
+    let mut header =
+        FileHeader::new_single_modality(5, 2, 5, crate::DEFAULT_SHARD_TARGET_ROWS, 0, 0);
+    header.format_version = 3;
+    let mut writer = ScxWriter::new(&sandwich, header).unwrap();
+    writer.write_var(&sample_var(2)).unwrap();
+    writer
+        .write_csr_shard(
+            &[0u64, 1, 2],
+            &[0u32, 1],
+            &[7u8, 8],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer
+        .write_csr_shard(&[0u64], &[], &[], CodecId::None, ValueEncoding::Uint8, 2)
+        .unwrap();
+    writer
+        .write_csr_shard(
+            &[0u64, 1, 2, 3],
+            &[1u32, 0, 1],
+            &[9u8, 10, 11],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            2,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = ScxReader::open(&sandwich).unwrap();
+    // Premise: the middle shard really is zero-row on disk. Without this the
+    // assertions below would also pass on a two-shard file.
+    let shards = reader.catalog().shards_sorted();
+    assert_eq!(shards.len(), 3, "fixture must keep the empty shard");
+    assert!(
+        shards.iter().any(|e| {
+            let s = e.stats.as_ref().unwrap();
+            s.row_end == s.row_start && s.nnz == 0
+        }),
+        "one shard must be genuinely zero-row"
+    );
+
+    let check = |label: &str, csr: &ScxCsr| {
+        assert_eq!(csr.shape, (5, 2), "{label}: shape");
+        assert_eq!(csr.indptr, vec![0, 1, 2, 3, 4, 5], "{label}: indptr");
+        assert_eq!(csr.indices, vec![0, 1, 1, 0, 1], "{label}: indices");
+        assert_eq!(csr.data, vec![7.0, 8.0, 9.0, 10.0, 11.0], "{label}: data");
+    };
+    check(
+        "read_all_csr_shards",
+        &reader.read_all_csr_shards().unwrap(),
+    );
+    check(
+        "assemble_row_major/Sequential",
+        &assemble_x(&reader, &shards, RowMajorStrategy::Sequential).unwrap(),
+    );
+    #[cfg(feature = "parallel")]
+    check(
+        "assemble_row_major/Parallel",
+        &assemble_x(&reader, &shards, RowMajorStrategy::Parallel).unwrap(),
+    );
+}
+
+// -----------------------------------------------------------------------
+// CSC sidecar freshness on the ScxReader paths (review 4.7)
+// -----------------------------------------------------------------------
+
+/// Write a small file carrying both a CSR shard and a CSC sidecar.
+///
+/// `framed` selects the CSC encoding, and it decides which arm of
+/// `read_csc_columns` the file exercises: a row-group-framed (v2) CSC shard
+/// takes the `decode_block_index_row_runs` scatter path, an unframed one takes
+/// the full-decode + `col_slice` path. The freshness fixtures below run both,
+/// because the first version of them ran only the unframed arm and so passed
+/// while the framed arm served a stale sidecar.
+fn write_reader_csc_fixture(
+    dir: &tempfile::TempDir,
+    name: &str,
+    framed: bool,
+) -> std::path::PathBuf {
+    let n_obs = 6usize;
+    let n_vars = 4usize;
+    let path = dir.path().join(name);
+    let mut header = sample_header(n_obs as u64, n_vars as u64, 0);
+    if framed {
+        header.format_version = crate::header::CURRENT_FORMAT_VERSION;
+    }
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    if framed {
+        writer.set_framing(Some(crate::encoder::FramingConfig {
+            row_group_rows: 1,
+            target_nnz: None,
+            trial: false,
+            decode_target: None,
+        }));
+    }
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    // Dense reference, then the same values as CSR and as CSC.
+    let mut dense = vec![0u8; n_obs * n_vars];
+    for (r, row) in dense.chunks_mut(n_vars).enumerate() {
+        for (c, cell) in row.iter_mut().enumerate() {
+            if (r + c) % 2 == 0 {
+                *cell = ((r * 5 + c * 3) % 200 + 1) as u8;
+            }
+        }
+    }
+
+    let mut ip = vec![0u64];
+    let mut ix: Vec<u32> = Vec::new();
+    let mut vals: Vec<u8> = Vec::new();
+    for r in 0..n_obs {
+        for c in 0..n_vars {
+            let v = dense[r * n_vars + c];
+            if v != 0 {
+                ix.push(c as u32);
+                vals.push(v);
+            }
+        }
+        ip.push(ix.len() as u64);
+    }
+    writer
+        .write_csr_shard(&ip, &ix, &vals, CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+
+    // Two CSC shards, two columns each.
+    let mut col_start = 0usize;
+    while col_start < n_vars {
+        let col_end = (col_start + 2).min(n_vars);
+        let mut cip = vec![0u64];
+        let mut cix: Vec<u32> = Vec::new();
+        let mut cvals: Vec<u8> = Vec::new();
+        for c in col_start..col_end {
+            for r in 0..n_obs {
+                let v = dense[r * n_vars + c];
+                if v != 0 {
+                    cix.push(r as u32);
+                    cvals.push(v);
+                }
+            }
+            cip.push(cix.len() as u64);
+        }
+        writer
+            .write_csc_shard(
+                &cip,
+                &cix,
+                &cvals,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                col_start as u64,
+            )
+            .unwrap();
+        col_start = col_end;
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// Rewrite the file's catalog with `data_generation` bumped, leaving the CSC
+/// sidecar's `csc_build_generation` behind — exactly the state a mutating op
+/// leaves when it rewrites X and carries an old sidecar across.
+///
+/// Only a `u64` in the v4 trailer changes, so the re-serialized catalog is the
+/// same length and can be spliced back in place; the assertion below makes
+/// that a checked assumption rather than a hope. `FullCatalog::write_to`
+/// recomputes the catalog's own BLAKE3, so the file still opens.
+fn bump_data_generation_on_disk(path: &std::path::Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let hdr = FileHeader::read_from(&mut std::io::Cursor::new(&bytes)).unwrap();
+    let fc_start = hdr.full_catalog_offset as usize;
+    let fc_len = hdr.full_catalog_length as usize;
+
+    let mut catalog = FullCatalog::read_from(
+        &mut std::io::Cursor::new(&bytes[fc_start..fc_start + fc_len]),
+        fc_len,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        catalog.csc_build_generation, catalog.data_generation,
+        "fixture premise: the written file starts fresh"
+    );
+    catalog.data_generation += 1;
+
+    let mut buf = Vec::new();
+    catalog.write_to(&mut buf).unwrap();
+    assert_eq!(
+        buf.len(),
+        fc_len,
+        "bumping a u64 must not change the catalog's serialized length"
+    );
+    bytes[fc_start..fc_start + fc_len].copy_from_slice(&buf);
+    std::fs::write(path, &bytes).unwrap();
+}
+
+/// Review §4.7: `check_csc_sidecar_fresh` was called from `BackedCscReader`'s
+/// constructors and nowhere else, so every `ScxReader` CSC read served a stale
+/// sidecar without complaint — the silent wrong answer the v4 generation
+/// counters exist to prevent.
+///
+/// The check does **not** live on `read_csc_from_entry`, which is where this
+/// test first put it on the reasoning that every CSC read funnels through it.
+/// Two funnel around it: the framed arm of `read_csc_columns` decodes via
+/// `decode_block_index_row_runs` and `continue`s, and `scx upgrade` copies a
+/// sidecar with `read_shard_from_entry`, then re-stamps it at the output's
+/// generation — turning a detectable stale sidecar into an undetectable one.
+/// So the guard sits at the four decode entry points instead, and this test
+/// runs both arms and the raw decoders. See
+/// `ScxReader::guard_csc_sidecar_fresh`.
+#[test]
+fn stale_csc_sidecar_is_refused_on_every_reader_csc_path() {
+    for framed in [false, true] {
+        stale_csc_sidecar_is_refused_impl(framed);
+    }
+}
+
+/// `framed` picks which arm of `read_csc_columns` runs: the framed (v2) shard
+/// takes the `decode_block_index_row_runs` scatter path, the unframed one the
+/// full-decode + `col_slice` path. The first version of this fixture ran only
+/// the unframed arm, so it passed while the scatter arm served a stale sidecar.
+fn stale_csc_sidecar_is_refused_impl(framed: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_reader_csc_fixture(&dir, "stale_csc.scx", framed);
+    bump_data_generation_on_disk(&path);
+
+    let reader = ScxReader::open(&path).unwrap();
+    // Premise: the file really is stale now, and really does have a sidecar.
+    assert_ne!(
+        reader.catalog().csc_build_generation,
+        reader.catalog().data_generation
+    );
+    assert_eq!(reader.csc_shard_count(), 2);
+
+    let expect_stale = |label: &str, r: Result<ScxCsc>| match r {
+        Ok(_) => panic!("{label}: a stale CSC sidecar must not be served"),
+        Err(e) => assert!(
+            matches!(e, ScxError::StaleCscSidecar { .. }),
+            "{label}: expected StaleCscSidecar, got {e}"
+        ),
+    };
+
+    expect_stale("read_csc_shard", reader.read_csc_shard(0));
+    expect_stale("read_csc_columns", reader.read_csc_columns(0..2));
+    expect_stale(
+        "read_csc_columns_subset",
+        reader.read_csc_columns_subset(&[0, 3]),
+    );
+    expect_stale("read_all_csc_shards", reader.read_all_csc_shards());
+    expect_stale("read_csc_shard_for", reader.read_csc_shard_for(0, 0));
+    expect_stale("read_csc_columns_for", reader.read_csc_columns_for(0, 0..2));
+    expect_stale(
+        "read_csc_columns_subset_for",
+        reader.read_csc_columns_subset_for(0, &[0, 3]),
+    );
+
+    // The raw decode entry points, not just the CSC-shaped wrappers. `scx
+    // upgrade` copies a sidecar forward with `read_shard_from_entry` and then
+    // re-stamps it at the output's generation, which turns a *detectable*
+    // stale sidecar into an undetectable one — strictly worse than not
+    // checking. Guarding only the wrappers leaves that path open.
+    let csc_entry = reader.catalog().csc_shards_sorted()[0].clone();
+    let raw = |label: &str, r: Result<(Vec<i64>, Vec<i32>, Vec<f32>)>| match r {
+        Ok(_) => panic!("{label}: a stale CSC sidecar must not decode"),
+        Err(e) => assert!(
+            matches!(e, ScxError::StaleCscSidecar { .. }),
+            "{label}: expected StaleCscSidecar, got {e}"
+        ),
+    };
+    raw(
+        "read_shard_from_entry",
+        reader.read_shard_from_entry(&csc_entry),
+    );
+    raw(
+        "read_shard_from_entry_verified",
+        reader.read_shard_from_entry_verified(&csc_entry),
+    );
+    match reader.read_shard_indptr_from_entry(&csc_entry) {
+        Ok(_) => panic!("read_shard_indptr_from_entry: stale sidecar must not decode"),
+        Err(e) => assert!(matches!(e, ScxError::StaleCscSidecar { .. }), "got {e}"),
+    }
+
+    // A CSR entry in the same file must be unaffected — the guard keys on the
+    // entry's section type, not on the file merely having a stale sidecar.
+    let csr_entry = reader.catalog().shards_sorted()[0].clone();
+    assert!(
+        reader.read_shard_from_entry(&csr_entry).is_ok(),
+        "the CSR side of a file with a stale CSC sidecar must still read"
+    );
+    assert!(reader.read_all_csr_shards().is_ok());
+}
+
+/// The accept side. A guard watched only in the red direction is proven to
+/// fire, not proven to be aimed correctly — #436 shipped one that also broke
+/// reading real f32 counts. So: a freshly written sidecar must still be served
+/// by every path above, and a file with no sidecar at all must be unaffected.
+#[test]
+fn a_fresh_csc_sidecar_is_still_served_on_every_reader_csc_path() {
+    for framed in [false, true] {
+        a_fresh_csc_sidecar_is_still_served_impl(framed);
+    }
+}
+
+fn a_fresh_csc_sidecar_is_still_served_impl(framed: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_reader_csc_fixture(&dir, "fresh_csc.scx", framed);
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(
+        reader.catalog().csc_build_generation,
+        reader.catalog().data_generation
+    );
+
+    assert_eq!(reader.read_csc_shard(0).unwrap().shape.1, 2);
+    assert_eq!(reader.read_csc_columns(0..2).unwrap().shape.1, 2);
+    assert_eq!(reader.read_csc_columns_subset(&[0, 3]).unwrap().shape.1, 2);
+    assert_eq!(reader.read_all_csc_shards().unwrap().shape.1, 4);
+    assert_eq!(reader.read_csc_shard_for(0, 0).unwrap().shape.1, 2);
+    assert_eq!(reader.read_csc_columns_for(0, 0..2).unwrap().shape.1, 2);
+    assert_eq!(
+        reader
+            .read_csc_columns_subset_for(0, &[0, 3])
+            .unwrap()
+            .shape
+            .1,
+        2
+    );
+
+    // A file with no CSC sidecar must not be dragged into the new guard: its
+    // counters are whatever the writer left, and there is nothing to validate.
+    let plain = write_test_file(&dir, "no_csc.scx", 6, 4, 2, false);
+    let plain_reader = ScxReader::open(&plain).unwrap();
+    assert_eq!(plain_reader.csc_shard_count(), 0);
+    assert_eq!(plain_reader.read_all_csr_shards().unwrap().shape, (6, 4));
 }

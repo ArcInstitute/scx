@@ -28,8 +28,12 @@ and checksum.
 
 ### scx-format-io (`parallel` feature — enabled by default)
 
-`ScxReader::read_all_csr_shards()` and `ScxReader::read_layer()` use rayon's
-`par_iter()` to decode shards concurrently via `assemble_shards_parallel()`.
+`ScxReader::read_all_csr_shards()`, `ScxReader::read_layer()` and
+`ScxReader::read_all_raw_csr_shards()` use rayon's `par_iter()` to decode shards
+concurrently via `assemble_row_major(.., RowMajorStrategy::Parallel)`. Each
+shard's slices of the merged output buffers are carved with `split_at_mut`
+before the loop starts, so the fan-out needs no `unsafe` and no bounds
+`assert!`: the borrow checker has already proved the regions disjoint.
 Each shard is independently decompressible — the reader issues `MADV_SEQUENTIAL`
 on the shard byte range before the parallel decode loop. Within each shard,
 FOR-BP index decode uses SIMD BitPacker4x (4 × 32-element blocks) for rows

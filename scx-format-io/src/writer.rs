@@ -2192,7 +2192,7 @@ impl ScxWriter {
         for (modality_id, csr_entries, n_vars) in work {
             // Decode each CSR shard back to ScxCsr by reading from the
             // open temp file. Mirrors the `read_shard_from_entry` flow
-            // in `scx-format/src/reader.rs::read_shard_from_entry_inner`,
+            // in `scx-format-io/src/reader/matrix.rs::read_shard_from_entry_inner`,
             // adapted to a `File` (no mmap).
             let mut csr_shards: Vec<scx_sparse::ScxCsr> = Vec::with_capacity(csr_entries.len());
             // The CSC sidecar encoding must cover EVERY shard, not just the

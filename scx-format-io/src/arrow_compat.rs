@@ -57,7 +57,7 @@ pub fn downcast_large_types(batch: &RecordBatch) -> Result<RecordBatch> {
 /// that need a schema for predicate parsing without paying to decode
 /// the full IPC batch. The local `ScxReader::read_obs_schema` already
 /// achieves the same effect by routing through its fast/slow path
-/// (see `scx-format/src/reader.rs`).
+/// (see `scx-format-io/src/reader/metadata.rs`).
 pub fn downcast_large_types_schema(schema: &Schema) -> Schema {
     let new_fields: Vec<Field> = schema
         .fields()
@@ -135,7 +135,7 @@ fn encode_to_dictionary(col: &ArrayRef, value_type: &DataType) -> Result<ArrayRe
             )
         })?;
 
-    // First-occurrence order, matching the dedup helpers in `reader.rs`.
+    // First-occurrence order, matching the dedup helpers in `reader/metadata.rs`.
     let mut present: Vec<bool> = Vec::with_capacity(2);
     for i in 0..plain.len() {
         if !plain.is_null(i) {

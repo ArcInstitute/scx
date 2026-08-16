@@ -1120,7 +1120,7 @@ reduction 29.7 s + ~24 s of QR/SVD = 153.5 s measured. `pca_hvg` does not: 28.7 
 25.6 s unexplained in the off arm but only ~10 s in the on arm. The missing term is
 `ProjectedShardSource::read_shard_arc`, which calls `project_csr` **after**
 `inner.read_shard_arc()` returns — outside `record_decode_since`, which wraps only the codec
-in `reader.rs`. Projecting 61,497 → 2,000 columns over every shard's nonzeros is real
+in `reader/matrix.rs`. Projecting 61,497 → 2,000 columns over every shard's nonzeros is real
 row-scale work, it is untimed, and because it sits inside the pipeline's read closure it is
 **also** overlapped. So the `decode` bucket *understates* what prefetch moves off the
 critical path for any projected or transformed source, and `pca_hvg` beats `pca` at 500k

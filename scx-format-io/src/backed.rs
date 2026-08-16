@@ -915,6 +915,17 @@ impl BackedCsrReader {
     /// `cache_shards`: number of decoded shards to cache (0 = no cache).
     /// Equivalent to [`Self::new_with_byte_budget`] with `bytes_budget =
     /// usize::MAX` — no byte cap.
+    ///
+    /// # Not modality-scoped
+    ///
+    /// This indexes **every** `CsrShard` in the catalog regardless of
+    /// `modality_id`, and takes `n_vars` from the file header (the max across
+    /// modalities). On a multimodal file that means one index over overlapping
+    /// row ranges — each modality independently tiles `[0, n_obs)` — so
+    /// `read_all` returns `Σ modalities` rows for an `n_obs`-cell file. Use
+    /// [`Self::for_modality`] for per-modality access; every production caller
+    /// does. Pinned by
+    /// `backed_csr_reader_new_on_a_multimodal_file_folds_every_modality`.
     pub fn new(reader: ScxReader, cache_shards: usize) -> Self {
         Self::new_with_byte_budget(reader, cache_shards, usize::MAX)
     }
@@ -2073,7 +2084,11 @@ impl BackedCsrReader {
             for &idx in &misses {
                 self.read_shard_cached_arc(idx)?;
             }
-            return Ok(());
+            // Tail expression, not `return`: with `parallel` off the block
+            // below is cfg'd away and this one is the function body's tail, so
+            // `return` is what clippy calls needless — a lint only the new
+            // parallel-off CI lane can see.
+            Ok(())
         }
 
         #[cfg(feature = "parallel")]
@@ -2982,6 +2997,28 @@ impl BackedCscIndex {
 // BackedCscReader — column-major counterpart to BackedCsrReader
 // ---------------------------------------------------------------------------
 
+/// Reject a CSC sidecar that was built against an earlier generation of
+/// the CSR data (the freshness guard introduced with `catalog_version`
+/// v4). The rule itself lives on [`FullCatalog::csc_sidecar_is_fresh`];
+/// this adds the "is there even a sidecar" half, which the constructors
+/// need because they are handed a possibly-empty entry list.
+///
+/// The check is skipped when `csc_entries` is empty (no sidecar to
+/// validate) and is a no-op for v1–v3 files (both counters default to
+/// `0`, so `0 == 0`), so existing valid sidecars are never rejected.
+fn check_csc_sidecar_fresh(catalog: &FullCatalog, csc_entries: &[FullCatalogEntry]) -> Result<()> {
+    if csc_entries.is_empty() {
+        return Ok(());
+    }
+    if !catalog.csc_sidecar_is_fresh() {
+        return Err(ScxError::StaleCscSidecar {
+            built_generation: catalog.csc_build_generation,
+            data_generation: catalog.data_generation,
+        });
+    }
+    Ok(())
+}
+
 /// On-demand CSC reader with optional decoded-shard caching.
 ///
 /// Wraps an [`ScxReader`] with a [`BackedCscIndex`] for O(log n)
@@ -2995,28 +3032,6 @@ impl BackedCscIndex {
 /// reader's heavier machinery isn't a fit yet. If benchmarks later show
 /// contention on the same shard from multiple threads, the singleflight
 /// pattern can be ported over.
-/// Reject a CSC sidecar that was built against an earlier generation of
-/// the CSR data (the freshness guard introduced with `catalog_version`
-/// v4). A sidecar is fresh iff `csc_build_generation == data_generation`;
-/// CSR-mutating writers bump `data_generation`, and only a CSC (re)build
-/// advances `csc_build_generation` to match.
-///
-/// The check is skipped when `csc_entries` is empty (no sidecar to
-/// validate) and is a no-op for v1–v3 files (both counters default to
-/// `0`, so `0 == 0`), so existing valid sidecars are never rejected.
-fn check_csc_sidecar_fresh(catalog: &FullCatalog, csc_entries: &[FullCatalogEntry]) -> Result<()> {
-    if csc_entries.is_empty() {
-        return Ok(());
-    }
-    if catalog.csc_build_generation != catalog.data_generation {
-        return Err(ScxError::StaleCscSidecar {
-            built_generation: catalog.csc_build_generation,
-            data_generation: catalog.data_generation,
-        });
-    }
-    Ok(())
-}
-
 pub struct BackedCscReader {
     reader: ScxReader,
     index: BackedCscIndex,
@@ -3370,7 +3385,7 @@ impl BackedCscReader {
 }
 
 /// Concatenate a list of CSC parts along the column axis.
-/// Internal helper — the same logic also lives in `reader.rs` as a
+/// Internal helper — the same logic also lives in `reader/matrix.rs` as a
 /// private free function. Local copy avoids cross-module visibility
 /// changes.
 fn concatenate_csc_along_cols(parts: Vec<ScxCsc>, n_rows: usize) -> Result<ScxCsc> {
