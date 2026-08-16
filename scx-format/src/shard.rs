@@ -196,9 +196,16 @@ pub fn derive_shard_type(section_type: SectionType) -> u8 {
 /// single write→read round trip*, because each site matched `CscShard` alone
 /// and no producer existed to make them disagree out loud.
 ///
-/// Adding a column-major section type is therefore a one-line change here.
 /// `scx-format-io`'s `column_major_dispatch_is_exhaustive` walks every
-/// discriminant and fails if any site drifts from this answer.
+/// discriminant and fails if the `shard_type` byte, either `ShardHeader` gate,
+/// or the decoder's catalog dispatch drifts from this answer;
+/// `every_section_type_picks_the_same_axis_in_both_view_paths` does the same
+/// for both `CatalogView` construction paths. The writer's own dispatches sit
+/// inside `write_shard_inner` and are reachable only by writing a shard, so
+/// they are covered behaviourally per section type rather than by a sweep.
+///
+/// Adding a column-major section type is therefore a **two**-line change: this
+/// match, and the non-vacuity count in `column_major_dispatch_is_exhaustive`.
 pub fn is_column_major(section_type: SectionType) -> bool {
     matches!(
         section_type,

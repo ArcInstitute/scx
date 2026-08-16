@@ -1247,7 +1247,7 @@ mod tests {
         );
     }
 
-    /// Every site that dispatches on storage order must agree with
+    /// Every dispatch site this test can *reach* must agree with
     /// `shard::is_column_major`, for **every** section type — not just the two
     /// that are column-major today.
     ///
@@ -1255,9 +1255,16 @@ mod tests {
     /// stops a future edit from re-spelling `matches!(st, CscShard | ...)` at
     /// one of these sites, which is exactly the state this series found the
     /// tree in (`LayerCscShard` was column-major to three callers and row-major
-    /// to five, with no producer to make them disagree out loud). Walking the
-    /// discriminants is what turns "adding a column-major section type is a
-    /// one-line change" into something a test can fail on.
+    /// to five, with no producer to make them disagree out loud).
+    ///
+    /// **What this does not cover**, so the claim is not read wider than it is:
+    /// the writer's index-width / `n_minor` / stats-axis dispatch and its
+    /// `csc_build_generation` stamp all live inside `write_shard_inner` and are
+    /// reachable only by writing a shard — which needs a per-section-type
+    /// writer method, and a hypothetical future column-major type would not
+    /// have one. Those five are covered behaviourally for the types that do
+    /// exist, by `layer_csc_shards_are_column_major_end_to_end` and the CSC
+    /// writer tests.
     #[test]
     fn column_major_dispatch_is_exhaustive() {
         use crate::shard::{derive_shard_type, is_column_major};
@@ -1282,14 +1289,89 @@ mod tests {
                 "{st:?} (id {raw}): the decoder's catalog dispatch disagrees with \
                  is_column_major — it would reconcile against the wrong stats pair"
             );
+
+            // `is_csc` answers "either the byte or the catalog says CSC", so
+            // testing it with the byte the writer stamps is vacuous for
+            // column-major types — the first clause already answers true.
+            // Pin it with `shard_type = 0`, where only the catalog clause can
+            // decide. (The `shard_type = 1` direction is true for every
+            // section type by construction and says nothing.)
+            let byte_says_row_major = ShardHeader {
+                shard_type: 0,
+                ..sample_header_for_dispatch_test()
+            };
+            assert_eq!(
+                byte_says_row_major.is_csc(st),
+                expected,
+                "{st:?} (id {raw}): ShardHeader::is_csc's catalog clause disagrees \
+                 with is_column_major"
+            );
+
+            // The strict gate, against the byte `derive_shard_type` stamps.
+            let sh = ShardHeader {
+                shard_type: derive_shard_type(st),
+                ..sample_header_for_dispatch_test()
+            };
+            sh.validate_csc_strict(st).unwrap_or_else(|e| {
+                panic!(
+                    "{st:?} (id {raw}): validate_csc_strict rejects the byte the \
+                     writer stamps for it: {e}"
+                )
+            });
+
+            // …and the mirror: the *other* byte must be refused for a
+            // column-major type and accepted for a row-major one, so the gate
+            // is not vacuously permissive.
+            let flipped = ShardHeader {
+                shard_type: 1 - derive_shard_type(st),
+                ..sample_header_for_dispatch_test()
+            };
+            assert_eq!(
+                flipped.validate_csc_strict(st).is_err(),
+                expected,
+                "{st:?} (id {raw}): validate_csc_strict must reject shard_type \
+                 {} exactly when the section is column-major",
+                flipped.shard_type
+            );
         }
 
         // Guards the guard: if `from_u8` or the predicate regressed to answering
         // `false` everywhere, every assertion above would hold vacuously.
+        //
+        // The cost of pinning it is that adding a column-major section type is
+        // a two-line change — `is_column_major` and this count — which is the
+        // intended trade: the count is what makes the loop mean something.
         assert_eq!(
             seen_column_major, 2,
             "expected exactly CscShard and LayerCscShard to be column-major; \
              update this count deliberately when adding one"
         );
+    }
+
+    /// A minimal, otherwise-valid shard header for the dispatch sweep. Only
+    /// `shard_type` matters to the gates under test.
+    fn sample_header_for_dispatch_test() -> ShardHeader {
+        ShardHeader {
+            magic: crate::shard::SHARD_MAGIC,
+            shard_format_version: 1,
+            shard_type: 0,
+            codec_id: 0,
+            value_encoding: 0,
+            index_dtype: 0,
+            reserved_flags: [0; 3],
+            n_major: 4,
+            n_minor: 8,
+            nnz: 4,
+            global_offset: 0,
+            indptr_rel_offset: 76,
+            indptr_length: 40,
+            indices_rel_offset: 116,
+            indices_length: 16,
+            values_rel_offset: 132,
+            values_length: 16,
+            block_index_rel_offset: 148,
+            block_index_length: 0,
+            checksum: [0; 8],
+        }
     }
 }

@@ -515,26 +515,31 @@ field interpretation:
 
 | Field | CSR semantics | CSC semantics |
 |-------|---------------|---------------|
-| `shard_type` | `0` (legacy: also produced for CSC) | `1` (authoritative) — readers also accept `0` when the catalog `section_type` is `CscShard` (legacy compatibility) |
+| `shard_type` | `0` | `1`. A **v1 catalog** may carry `0` (the writer hardcoded it before `derive_shard_type` existed) and readers tolerate that; on `catalog_version >= 2` the byte is **strictly required** to be `1`, for `csc_shard` and `layer_csc_shard` alike |
 | `n_major` | rows in this shard | **columns** in this shard |
 | `n_minor` | columns in full matrix | **rows** in full matrix (`n_obs`) |
 | `global_offset` | first row index | first **column** index covered by this shard |
 | `indptr` (length `n_major + 1`) | row-pointer | **column-pointer** |
 | `indices` (length `nnz`) | column indices in full matrix | **global row** indices in full matrix (CSC indices are NOT shard-local — they reference rows across all shards) |
 
-Catalog `section_type = CscShard (5)` is the authoritative
-discriminator; the in-shard `shard_type` byte exists for self-contained
-shard validation (e.g. exploded `.scxd` files where the catalog and
-shard live in separate files). Going forward writers emit `shard_type
-= 1`; readers also accept `shard_type = 0` for files written before
-the `derive_shard_type()` fix landed.
+The catalog's `section_type` — `csc_shard (5)` or `layer_csc_shard (16)` — is
+the authoritative discriminator; the in-shard `shard_type` byte exists for
+self-contained shard validation (e.g. exploded `.scxd` files where the catalog
+and the shard live in separate files). The two must agree: a v2+ reader rejects
+a shard whose byte disagrees with the section type, in **both** directions, and
+does so before any extent check. Unauthenticated payload bytes do not get to
+pick which axis validates them.
 
-### `ShardStats.row_start` / `row_end` axis overload
+### `ShardStats.row_start` / `row_end` axis overload (v1 only)
 
-CSC shards reuse the catalog `ShardStats.row_start` / `row_end` fields
-to record the **major-axis** range, which for CSC means
-`col_start..col_end`. The on-disk schema is unchanged from the CSR-only
-era; only the field interpretation differs.
+**This is a v1 compatibility note, not the current layout.** v1 catalogs had no
+column pair, so a column-major shard recorded its `col_start..col_end` in the
+`row_start` / `row_end` slots. v2 added an explicit `col_start` / `col_end`
+(see [Per-shard statistics](#per-shard-statistics)) and a column-major shard now
+records its range there, with `[0, n_obs)` in the row pair. `FullCatalog::read_from`
+reconciles a v1 entry by copying the row pair into the column pair at parse
+time, so `col_range()` is correct on both versions and no consumer needs to know
+which it is reading.
 
 Code accessing these fields should pick by section type:
 
@@ -545,10 +550,9 @@ Code accessing these fields should pick by section type:
 | `ShardStats::col_range()` | When the entry is known to be column-major (`CscShard`, `LayerCscShard`). |
 | Direct `ShardStats.row_start` field access | Allowed in legacy code paths but discouraged — prefer the accessors above. |
 
-A future format-version bump may rename the underlying fields (e.g. to
-`major_start` / `major_end`) without breaking on-disk compatibility,
-since the byte layout is unchanged. Until then the overload is
-documented but the schema stays put.
+The v1 overload is why `major_start()` / `major_end()` exist at all: they let a
+caller ask for the major axis without knowing the catalog version, and are the
+only accessors that stay correct across both.
 
 ### Multi-shard CSC layout
 

@@ -538,6 +538,15 @@ mod tests {
         assert_eq!(from_bytes.n_obs, from_full.n_obs);
         assert_eq!(from_bytes.entries.len(), from_full.entries.len());
 
+        // Before zipping: `zip` stops at the shorter side, so a *trailing*
+        // entry dropped by one path would slip through silently.
+        assert_eq!(
+            from_bytes.entries.len(),
+            from_full.entries.len(),
+            "the two view paths kept a different number of entries"
+        );
+        assert_eq!(from_bytes.entries.len(), full.entries.len());
+
         for (a, b) in from_bytes.entries.iter().zip(from_full.entries.iter()) {
             assert_eq!(a.name, b.name, "name mismatch");
             assert_eq!(a.offset, b.offset);
@@ -868,6 +877,15 @@ mod tests {
         full.write_to(&mut buf).unwrap();
         let from_bytes = CatalogView::read_from_bytes(&buf, true).unwrap();
         let from_full = CatalogView::from_full(&full);
+
+        // Before zipping: `zip` stops at the shorter side, so a *trailing*
+        // entry dropped by one path would slip through silently.
+        assert_eq!(
+            from_bytes.entries.len(),
+            from_full.entries.len(),
+            "the two view paths kept a different number of entries"
+        );
+        assert_eq!(from_bytes.entries.len(), full.entries.len());
 
         for (a, b) in from_bytes.entries.iter().zip(from_full.entries.iter()) {
             assert_eq!(a.section_type, b.section_type);

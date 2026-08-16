@@ -452,7 +452,9 @@ All section access is via offset+length from the catalog — no sequential scann
 
 ### Catalog representations (`FullCatalog`, `CatalogView`)
 
-Both are built by one parser. `scx-format/src/catalog_cursor.rs` holds the single walk over the catalog's entry list; it yields `RawEntry`, whose `section_type_raw` is an unresolved `u8` and whose `name_bytes` / `stats_bytes` are borrowed and undecoded. The two representations below differ only in what they materialise from it, and each validates exactly what it materialises. That shape is load-bearing rather than tidy: when two hand-written parsers existed they drifted on the order of two steps, and `FullCatalog` decoded an entry's stats before resolving its section type — so a file carrying a future section type with a short stats blob failed to open at all.
+Both **byte parsers** are one parser. `scx-format/src/catalog_cursor.rs` holds the single walk over the catalog's entry list; it yields `RawEntry`, whose `section_type_raw` is an unresolved `u8` and whose `name_bytes` / `stats_bytes` are borrowed and undecoded. The two representations below differ only in what they materialise from it, and each validates exactly what it materialises. That shape is load-bearing rather than tidy: when two hand-written parsers existed they drifted on the order of two steps, and `FullCatalog` decoded an entry's stats before resolving its section type — so a file carrying a future section type with a short stats blob failed to open at all.
+
+Note the scope: this is about parsing *bytes*. In production today only `FullCatalog` is built from bytes — every `CatalogView` comes from `CatalogView::from_full` in the backed-reader constructors, and `read_from_bytes` has no production caller (see the bullets below).
 
 `ScxReader` exposes two catalog representations that trade completeness against per-entry cost:
 
