@@ -125,7 +125,7 @@ enum ColumnSelection {
 /// the bound on how far a straddling block can widen a shard's recorded
 /// `[min, max]` (at most the values of the ≤ `NUMERIC_BLOCK_ROWS - 1` rows on
 /// the far side of the boundary). Widening only ever costs pruning power,
-/// never correctness — see [`numeric_leaves_from_spans`].
+/// never correctness — see `build::numeric_leaves_from_spans`.
 pub(crate) const NUMERIC_BLOCK_ROWS: u64 = 1024;
 
 enum ColumnState {

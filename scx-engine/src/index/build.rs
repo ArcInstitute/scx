@@ -377,10 +377,10 @@ pub(crate) struct NumericSpan {
 /// out of the coverage calculation.
 ///
 /// Per-shard is the granularity the leaves are actually consumed at:
-/// [`derive_shard_column_stats`] folds them to a per-shard
+/// [`super::derive::derive_shard_column_stats`] folds them to a per-shard
 /// `ColumnStat::MinMax` (what Level-1 pruning reads) and
 /// [`PredicateIndex::max_covered_global_row`] takes the per-shard maximum
-/// `row_end` (what [`index_covers_all_obs`] reads). No query path ever looks
+/// `row_end` (what [`super::lookup::index_covers_all_obs`] reads). No query path ever looks
 /// at an individual leaf — `eval_rowset` is residual for every numeric
 /// operator and there is no range-lookup method — so emitting finer leaves
 /// only costs bytes. Before this was per-shard, a continuous obs column

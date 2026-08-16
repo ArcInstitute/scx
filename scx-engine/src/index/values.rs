@@ -77,7 +77,7 @@ pub(crate) fn estimate_unique_values(col: &ArrayRef) -> usize {
 /// `Dictionary(_, V)` shard and a plain `V` shard are interchangeable —
 /// which matters because `append` writes some columns plain where
 /// `from_anndata` writes them dictionary-encoded. Used by
-/// [`ObsPredicateIndexBuilder::push_shard`] to accept shards whose
+/// [`super::stream::ObsPredicateIndexBuilder::push_shard`] to accept shards whose
 /// per-shard upcast widens columns to `LargeUtf8` while the builder
 /// was initialised with the input file's narrow `Utf8` schema.
 pub(crate) fn column_class_compatible(a: &DataType, b: &DataType) -> bool {
