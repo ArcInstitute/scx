@@ -190,14 +190,17 @@ fn roundtrip_numeric_index_v2() {
 /// are exercised below (cheap to materialise); the other five gate on
 /// `Vec::len() > u32::MAX`, which would require allocating > 4B
 /// elements and is infeasible to construct in a unit test. The
-/// inspected-only triggers, with the line in `requires_v2_encoding`
-/// that handles each:
+/// inspected-only triggers, each named by the guard in
+/// `index::wire::requires_v2_encoding` that handles it — by expression
+/// rather than by line number, because the line numbers this list
+/// originally carried were `index.rs` offsets and silently came to
+/// point at unrelated code when the file was split:
 ///
-/// - `cat.entries.len() > u32::MAX` (inspected at `requires_v2_encoding`, line 180)
-/// - `leaf_pages.len() > u32::MAX` (line 196)
-/// - `internal_pages.len() > u32::MAX` (line 199)
-/// - per-leaf-page `entries.len() > u32::MAX` (line 204)
-/// - summed numeric `total_entries > u32::MAX` (line 209)
+/// - `u32::try_from(cat.entries.len())`
+/// - `u32::try_from(num.leaf_pages.len())`
+/// - `u32::try_from(num.internal_pages.len())`
+/// - per-leaf-page `u32::try_from(lp.entries.len())`
+/// - summed numeric `u32::try_from(total)`
 ///
 /// If `requires_v2_encoding` is refactored, audit those five paths
 /// manually and treat them as code-review coverage, not test coverage.
