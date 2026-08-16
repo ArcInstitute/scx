@@ -142,6 +142,18 @@ jobs:
             echo "::error::indptr_byte_cap called outside DecodeBounds::derive — decode caps must come from the driver's derivation."
             exit 1
           fi
+      # The negative grep above only rejects a *forbidden* helper call, so
+      # deleting a `DecodeBounds::derive(...)` outright leaves nothing for it
+      # to find. This is the positive half: all three whole-shard decode entry
+      # points — `decode_shard_ref`, `decode_shard_scipy`, `decode_shard_native`
+      # — must each derive. Removing any one fails here.
+      - name: All three whole-shard decode entry points derive their bounds
+        run: |
+          n=$(grep -cE 'DecodeBounds::derive[[:space:]]*\(' scx-codec/src/dispatch.rs || true)
+          if [ "$n" -ne 3 ]; then
+            echo "::error::expected 3 DecodeBounds::derive call sites in dispatch.rs (decode_shard_ref, decode_shard_scipy, decode_shard_native), found $n."
+            exit 1
+          fi
 
       # §10.1: a numpy borrow is not GIL-bound and does not clear numpy's
       # WRITEABLE flag, so a `&[T]` taken from one must never be read after the

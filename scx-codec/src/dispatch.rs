@@ -83,10 +83,13 @@ pub fn decode_shard(
     decode_shard_ref(&r, codec_id, value_encoding, n_rows, nnz, index_dtype_u16)
 }
 
-/// Dispatch one codec, rejecting an encoding it cannot represent first.
+/// Dispatch one codec. A plain monomorphised hop — it performs no checks.
 ///
-/// Centralising `supports` is why `CodecError::FloatWithScx1` is now raised in
-/// one place rather than being each decoder's first statement.
+/// **Do not add the `supports` check here.** It has to run *before*
+/// `DecodeBounds::derive`, and this function is called after it: putting it
+/// back would restore the precedence bug where Scx1 + float + an overflowing
+/// `nnz` answered `MalformedInput` instead of `FloatWithScx1`. Use
+/// [`ensure_supported`], which every whole-shard entry point calls up front.
 fn decode_via<C: ShardCodec>(
     encoded: &EncodedShardRef,
     shape: ShardShape,
@@ -104,6 +107,19 @@ fn decode_via<C: ShardCodec>(
 /// **before** any shape arithmetic, because the encoding rejection is the
 /// older, public answer: Scx1 + float returns `FloatWithScx1` even when the
 /// shape is also invalid.
+/// Reject an encoding the codec cannot represent — the single construction
+/// site for [`CodecError::FloatWithScx1`].
+pub(crate) fn ensure_supported(
+    codec_id: CodecId,
+    value_encoding: ValueEncoding,
+) -> Result<(), CodecError> {
+    if codec_supports(codec_id, value_encoding) {
+        Ok(())
+    } else {
+        Err(CodecError::FloatWithScx1)
+    }
+}
+
 pub(crate) fn codec_supports(codec_id: CodecId, value_encoding: ValueEncoding) -> bool {
     match codec_id {
         CodecId::None => NoneCodec::supports(value_encoding),
@@ -133,9 +149,7 @@ pub fn decode_shard_ref(
     // The encoding rejection precedes the shape arithmetic: a doubly-invalid
     // call (Scx1 + float + an overflowing nnz) must still answer
     // `FloatWithScx1`, which is pre-existing public behaviour.
-    if !codec_supports(codec_id, value_encoding) {
-        return Err(CodecError::FloatWithScx1);
-    }
+    ensure_supported(codec_id, value_encoding)?;
     let bounds = DecodeBounds::derive(shape, value_encoding, index_dtype_u16)?;
     let decoded = match codec_id {
         CodecId::None => {
@@ -195,9 +209,7 @@ pub fn decode_shard_scipy(
 ) -> Result<ScipyShard, CodecError> {
     // For Scx1, we can avoid the u32→raw_bytes→f32 chain for values
     if codec_id == CodecId::Scx1 {
-        if !codec_supports(codec_id, value_encoding) {
-            return Err(CodecError::FloatWithScx1);
-        }
+        ensure_supported(codec_id, value_encoding)?;
 
         // L1 comes from the same derivation the driver uses, so this fast path
         // cannot drift from `decode_shard_ref`'s. It is a *decode* entry point
@@ -290,9 +302,7 @@ pub fn decode_shard_native(
 ) -> Result<NativeShard, CodecError> {
     // Scx1: keep the Rice-decoded u32 values and forbp u32 indices as-is.
     if codec_id == CodecId::Scx1 {
-        if !codec_supports(codec_id, value_encoding) {
-            return Err(CodecError::FloatWithScx1);
-        }
+        ensure_supported(codec_id, value_encoding)?;
 
         // Same single derivation as `decode_shard_scipy` above.
         DecodeBounds::derive(ShardShape { n_rows, nnz }, value_encoding, index_dtype_u16)?;
