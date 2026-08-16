@@ -1,8 +1,10 @@
 use super::*;
-use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use arrow::array::{ArrayRef, Float64Array, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::io::Cursor;
 use std::sync::Arc;
+
+use crate::error::EngineError;
 
 // -------------------------------------------------------------------
 // C2 Tests: Serialization round-trips
