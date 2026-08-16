@@ -2980,3 +2980,194 @@ fn zero_row_unframed_shards_round_trip_through_a_file() {
         &assemble_x(&reader, &shards, RowMajorStrategy::Parallel).unwrap(),
     );
 }
+
+// -----------------------------------------------------------------------
+// CSC sidecar freshness on the ScxReader paths (review 4.7)
+// -----------------------------------------------------------------------
+
+/// Write a small file carrying both a CSR shard and a CSC sidecar.
+fn write_reader_csc_fixture(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    let n_obs = 6usize;
+    let n_vars = 4usize;
+    let path = dir.path().join(name);
+    let header = sample_header(n_obs as u64, n_vars as u64, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    // Dense reference, then the same values as CSR and as CSC.
+    let mut dense = vec![0u8; n_obs * n_vars];
+    for (r, row) in dense.chunks_mut(n_vars).enumerate() {
+        for (c, cell) in row.iter_mut().enumerate() {
+            if (r + c) % 2 == 0 {
+                *cell = ((r * 5 + c * 3) % 200 + 1) as u8;
+            }
+        }
+    }
+
+    let mut ip = vec![0u64];
+    let mut ix: Vec<u32> = Vec::new();
+    let mut vals: Vec<u8> = Vec::new();
+    for r in 0..n_obs {
+        for c in 0..n_vars {
+            let v = dense[r * n_vars + c];
+            if v != 0 {
+                ix.push(c as u32);
+                vals.push(v);
+            }
+        }
+        ip.push(ix.len() as u64);
+    }
+    writer
+        .write_csr_shard(&ip, &ix, &vals, CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+
+    // Two CSC shards, two columns each.
+    let mut col_start = 0usize;
+    while col_start < n_vars {
+        let col_end = (col_start + 2).min(n_vars);
+        let mut cip = vec![0u64];
+        let mut cix: Vec<u32> = Vec::new();
+        let mut cvals: Vec<u8> = Vec::new();
+        for c in col_start..col_end {
+            for r in 0..n_obs {
+                let v = dense[r * n_vars + c];
+                if v != 0 {
+                    cix.push(r as u32);
+                    cvals.push(v);
+                }
+            }
+            cip.push(cix.len() as u64);
+        }
+        writer
+            .write_csc_shard(
+                &cip,
+                &cix,
+                &cvals,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                col_start as u64,
+            )
+            .unwrap();
+        col_start = col_end;
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// Rewrite the file's catalog with `data_generation` bumped, leaving the CSC
+/// sidecar's `csc_build_generation` behind — exactly the state a mutating op
+/// leaves when it rewrites X and carries an old sidecar across.
+///
+/// Only a `u64` in the v4 trailer changes, so the re-serialized catalog is the
+/// same length and can be spliced back in place; the assertion below makes
+/// that a checked assumption rather than a hope. `FullCatalog::write_to`
+/// recomputes the catalog's own BLAKE3, so the file still opens.
+fn bump_data_generation_on_disk(path: &std::path::Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let hdr = FileHeader::read_from(&mut std::io::Cursor::new(&bytes)).unwrap();
+    let fc_start = hdr.full_catalog_offset as usize;
+    let fc_len = hdr.full_catalog_length as usize;
+
+    let mut catalog = FullCatalog::read_from(
+        &mut std::io::Cursor::new(&bytes[fc_start..fc_start + fc_len]),
+        fc_len,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        catalog.csc_build_generation, catalog.data_generation,
+        "fixture premise: the written file starts fresh"
+    );
+    catalog.data_generation += 1;
+
+    let mut buf = Vec::new();
+    catalog.write_to(&mut buf).unwrap();
+    assert_eq!(
+        buf.len(),
+        fc_len,
+        "bumping a u64 must not change the catalog's serialized length"
+    );
+    bytes[fc_start..fc_start + fc_len].copy_from_slice(&buf);
+    std::fs::write(path, &bytes).unwrap();
+}
+
+/// Review §4.7: `check_csc_sidecar_fresh` was called from `BackedCscReader`'s
+/// constructors and nowhere else, so every `ScxReader` CSC read served a stale
+/// sidecar without complaint — the silent wrong answer the v4 generation
+/// counters exist to prevent. All five of those paths funnel through
+/// `read_csc_from_entry`, which is where the check belongs.
+#[test]
+fn stale_csc_sidecar_is_refused_on_every_reader_csc_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_reader_csc_fixture(&dir, "stale_csc.scx");
+    bump_data_generation_on_disk(&path);
+
+    let reader = ScxReader::open(&path).unwrap();
+    // Premise: the file really is stale now, and really does have a sidecar.
+    assert_ne!(
+        reader.catalog().csc_build_generation,
+        reader.catalog().data_generation
+    );
+    assert_eq!(reader.csc_shard_count(), 2);
+
+    let expect_stale = |label: &str, r: Result<ScxCsc>| match r {
+        Ok(_) => panic!("{label}: a stale CSC sidecar must not be served"),
+        Err(e) => assert!(
+            matches!(e, ScxError::StaleCscSidecar { .. }),
+            "{label}: expected StaleCscSidecar, got {e}"
+        ),
+    };
+
+    expect_stale("read_csc_shard", reader.read_csc_shard(0));
+    expect_stale("read_csc_columns", reader.read_csc_columns(0..2));
+    expect_stale(
+        "read_csc_columns_subset",
+        reader.read_csc_columns_subset(&[0, 3]),
+    );
+    expect_stale("read_all_csc_shards", reader.read_all_csc_shards());
+    expect_stale("read_csc_shard_for", reader.read_csc_shard_for(0, 0));
+    expect_stale("read_csc_columns_for", reader.read_csc_columns_for(0, 0..2));
+    expect_stale(
+        "read_csc_columns_subset_for",
+        reader.read_csc_columns_subset_for(0, &[0, 3]),
+    );
+}
+
+/// The accept side. A guard watched only in the red direction is proven to
+/// fire, not proven to be aimed correctly — #436 shipped one that also broke
+/// reading real f32 counts. So: a freshly written sidecar must still be served
+/// by every path above, and a file with no sidecar at all must be unaffected.
+#[test]
+fn a_fresh_csc_sidecar_is_still_served_on_every_reader_csc_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_reader_csc_fixture(&dir, "fresh_csc.scx");
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(
+        reader.catalog().csc_build_generation,
+        reader.catalog().data_generation
+    );
+
+    assert_eq!(reader.read_csc_shard(0).unwrap().shape.1, 2);
+    assert_eq!(reader.read_csc_columns(0..2).unwrap().shape.1, 2);
+    assert_eq!(reader.read_csc_columns_subset(&[0, 3]).unwrap().shape.1, 2);
+    assert_eq!(reader.read_all_csc_shards().unwrap().shape.1, 4);
+    assert_eq!(reader.read_csc_shard_for(0, 0).unwrap().shape.1, 2);
+    assert_eq!(reader.read_csc_columns_for(0, 0..2).unwrap().shape.1, 2);
+    assert_eq!(
+        reader
+            .read_csc_columns_subset_for(0, &[0, 3])
+            .unwrap()
+            .shape
+            .1,
+        2
+    );
+
+    // A file with no CSC sidecar must not be dragged into the new guard: its
+    // counters are whatever the writer left, and there is nothing to validate.
+    let plain = write_test_file(&dir, "no_csc.scx", 6, 4, 2, false);
+    let plain_reader = ScxReader::open(&plain).unwrap();
+    assert_eq!(plain_reader.csc_shard_count(), 0);
+    assert_eq!(plain_reader.read_all_csr_shards().unwrap().shape, (6, 4));
+}

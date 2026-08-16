@@ -717,6 +717,26 @@ impl FullCatalog {
         })
     }
 
+    /// Whether a CSC sidecar in this file was built against the current CSR
+    /// data.
+    ///
+    /// The `catalog_version` v4 freshness rule: CSR-mutating writers bump
+    /// `data_generation`, and only a CSC (re)build advances
+    /// `csc_build_generation` to match, so a sidecar is fresh iff the two are
+    /// equal. A v1–v3 file leaves both at `0`, which reads as fresh — that is
+    /// deliberate, since such a file predates the counters and its sidecar
+    /// cannot be shown to be stale.
+    ///
+    /// Callers are responsible for only asking when a sidecar exists; on a
+    /// file with none there is nothing to validate.
+    ///
+    /// The single predicate behind every freshness check. It had one call site
+    /// for a while — `BackedCscReader`'s constructors — while all five
+    /// `ScxReader` CSC read paths served a stale sidecar in silence.
+    pub fn csc_sidecar_is_fresh(&self) -> bool {
+        self.csc_build_generation == self.data_generation
+    }
+
     /// Populate `col_start`/`col_end` for v1 CSR/Layer/Obsp entries
     /// using `n_vars` from the file header. Called by production
     /// readers after `read_from` to fill in the v2-shape stats. CSC

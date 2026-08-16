@@ -2438,6 +2438,18 @@ impl ScxReader {
     /// shard payload was BLAKE3-checksummed when the catalog was
     /// verified at `open()`).
     fn read_csc_from_entry(&self, entry: &FullCatalogEntry) -> Result<ScxCsc> {
+        // Review §4.7. Reaching here means a CSC entry exists, so there is a
+        // sidecar to validate. Every `ScxReader` CSC read funnels through this
+        // function, which is why the check lives here rather than at each of
+        // the seven public entry points — the previous arrangement had it on
+        // `BackedCscReader`'s constructors only, and the reader paths served a
+        // sidecar built against superseded data without complaint.
+        if !self.full_catalog.csc_sidecar_is_fresh() {
+            return Err(ScxError::StaleCscSidecar {
+                built_generation: self.full_catalog.csc_build_generation,
+                data_generation: self.full_catalog.data_generation,
+            });
+        }
         let (indptr, indices, data) = self.read_shard_from_entry(entry)?;
         // For CSC: n_major == n_cols_in_shard, indices are global row
         // indices in [0, n_obs). The shard header's n_minor field

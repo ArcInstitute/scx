@@ -2993,6 +2993,28 @@ impl BackedCscIndex {
 // BackedCscReader — column-major counterpart to BackedCsrReader
 // ---------------------------------------------------------------------------
 
+/// Reject a CSC sidecar that was built against an earlier generation of
+/// the CSR data (the freshness guard introduced with `catalog_version`
+/// v4). The rule itself lives on [`FullCatalog::csc_sidecar_is_fresh`];
+/// this adds the "is there even a sidecar" half, which the constructors
+/// need because they are handed a possibly-empty entry list.
+///
+/// The check is skipped when `csc_entries` is empty (no sidecar to
+/// validate) and is a no-op for v1–v3 files (both counters default to
+/// `0`, so `0 == 0`), so existing valid sidecars are never rejected.
+fn check_csc_sidecar_fresh(catalog: &FullCatalog, csc_entries: &[FullCatalogEntry]) -> Result<()> {
+    if csc_entries.is_empty() {
+        return Ok(());
+    }
+    if !catalog.csc_sidecar_is_fresh() {
+        return Err(ScxError::StaleCscSidecar {
+            built_generation: catalog.csc_build_generation,
+            data_generation: catalog.data_generation,
+        });
+    }
+    Ok(())
+}
+
 /// On-demand CSC reader with optional decoded-shard caching.
 ///
 /// Wraps an [`ScxReader`] with a [`BackedCscIndex`] for O(log n)
@@ -3006,28 +3028,6 @@ impl BackedCscIndex {
 /// reader's heavier machinery isn't a fit yet. If benchmarks later show
 /// contention on the same shard from multiple threads, the singleflight
 /// pattern can be ported over.
-/// Reject a CSC sidecar that was built against an earlier generation of
-/// the CSR data (the freshness guard introduced with `catalog_version`
-/// v4). A sidecar is fresh iff `csc_build_generation == data_generation`;
-/// CSR-mutating writers bump `data_generation`, and only a CSC (re)build
-/// advances `csc_build_generation` to match.
-///
-/// The check is skipped when `csc_entries` is empty (no sidecar to
-/// validate) and is a no-op for v1–v3 files (both counters default to
-/// `0`, so `0 == 0`), so existing valid sidecars are never rejected.
-fn check_csc_sidecar_fresh(catalog: &FullCatalog, csc_entries: &[FullCatalogEntry]) -> Result<()> {
-    if csc_entries.is_empty() {
-        return Ok(());
-    }
-    if catalog.csc_build_generation != catalog.data_generation {
-        return Err(ScxError::StaleCscSidecar {
-            built_generation: catalog.csc_build_generation,
-            data_generation: catalog.data_generation,
-        });
-    }
-    Ok(())
-}
-
 pub struct BackedCscReader {
     reader: ScxReader,
     index: BackedCscIndex,
