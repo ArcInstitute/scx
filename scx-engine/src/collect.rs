@@ -649,6 +649,15 @@ pub(crate) fn scan_shards(
 /// `shards_sorted()` (== its index in `output_shard_row_ranges` at build time).
 /// Returns `None` if any shard lacks row-range stats — the index then can't be
 /// mapped to global rows safely, so the caller falls back to the legacy path.
+///
+/// ⚠️ **The position `i` here equals the index's `shard_id` only at
+/// `modality_id == 0`.** `sorted_shards` comes from
+/// [`scan_shards`], which is modality-scoped; on a multimodal file each
+/// modality's shards independently tile `[0, n_obs)`, so modality 2's third
+/// shard is also position 2 and would silently adopt modality 1's row-set. That
+/// is safe today only because multimodal files carry no predicate index at all
+/// — see [`crate::index::derive_shard_column_stats`] for who guarantees that and
+/// what fails closed if it stops being true.
 fn csr_shard_ranges_table(sorted_shards: &[&FullCatalogEntry]) -> Option<Vec<(u32, u64, u64)>> {
     let mut table = Vec::with_capacity(sorted_shards.len());
     for (i, entry) in sorted_shards.iter().enumerate() {

@@ -2386,6 +2386,26 @@ fn streaming_impl(
 /// out-of-range id signals an index/catalog shard-space misalignment, which
 /// would silently mis-place "value present" bits and risk incorrect shard
 /// skipping; it trips a `debug_assert` and is otherwise dropped defensively.
+///
+/// **This positional `shard_id` → CSR-shard mapping is only sound because
+/// multimodal files carry no predicate index.** It is correct-by-omission, and
+/// undocumented until now, so write it down where the assumption is made:
+///
+/// - Each modality's CSR shards independently tile `[0, n_obs)`. A flattened
+///   walk over "the i-th CSR shard" therefore stops meaning "shard_id i" the
+///   moment a second modality exists, and every sibling's stats would land on
+///   the first modality's shards.
+/// - Nothing builds one today: `scx convert` on an h5mu emits
+///   `ConvertWarning::PredicateIndexSkippedMultimodal`, `scx-ops::merge`
+///   records `multimodal_skip`, and `merge_multimodal` never calls this.
+/// - The backstop, if that changes, is
+///   [`scx_format_io::writer::assign_csr_shard_column_stats`], which counts only
+///   `modality_id == 0` entries and fails with `ColumnStatsShardCountMismatch`
+///   rather than mis-assigning
+///   (`writer_tests::bulk_csr_shard_column_stats_refuses_a_multimodal_file`).
+///
+/// Shipping multimodal indexing means giving `ShardRange` a modality scope, not
+/// relaxing this.
 pub fn derive_shard_column_stats(
     index: &PredicateIndex,
     n_shards: usize,
