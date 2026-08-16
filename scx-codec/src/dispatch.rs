@@ -1,21 +1,18 @@
 // Codec ID dispatch: selects a codec implementation and applies the guards
 // that every decode path shares (docs/codec.md (Codec IDs)).
 
-use crate::byte_delta::byte_undelta_planes;
-use crate::codecs::lz4_shuffle::{
-    decode_lz4_shuffle_ref, encode_lz4_shuffle, lz4_frame_decompress,
-};
-use crate::codecs::none::{decode_none_ref, encode_none};
-use crate::codecs::pcodec::{decode_pcodec_ref, encode_pcodec};
-use crate::codecs::scx1::{decode_scx1_ref, encode_scx1};
-use crate::codecs::shufdelta::{decode_shufdelta_zstd_ref, encode_shufdelta_zstd};
-use crate::codecs::zstd_codec::{decode_zstd_ref, encode_zstd};
+use crate::codecs::lz4_shuffle::Lz4ShuffleCodec;
+use crate::codecs::none::NoneCodec;
+use crate::codecs::pcodec::PcodecCodec;
+use crate::codecs::scx1::Scx1Codec;
+use crate::codecs::shufdelta::ShufDeltaZstdCodec;
+use crate::codecs::zstd_codec::ZstdCodec;
 use crate::delta_golomb::delta_golomb_decode;
 use crate::forbp::forbp_decode_with_hint;
 use crate::guards::*;
 use crate::raw::*;
 use crate::rice::{rice_decode, B_VAL};
-use crate::shuffle::byte_unshuffle;
+use crate::shard_codec::{DecodeBounds, ShardCodec, ShardShape};
 
 // Re-exported so `scx_codec::dispatch::{CodecId, ValueEncoding, ...}` keeps
 // resolving after the split: several in-crate modules and three `scx-format-io`
@@ -45,15 +42,23 @@ pub fn encode_shard(
     index_dtype_u16: bool,
 ) -> Result<EncodedShard, CodecError> {
     match codec_id {
-        CodecId::None => encode_none(indptr, indices, values, index_dtype_u16),
-        CodecId::Scx1 => encode_scx1(indptr, indices, values, value_encoding, index_dtype_u16),
-        CodecId::Zstd => encode_zstd(indptr, indices, values, index_dtype_u16),
-        CodecId::Lz4Shuffle => {
-            encode_lz4_shuffle(indptr, indices, values, value_encoding, index_dtype_u16)
+        CodecId::None => {
+            NoneCodec::encode(indptr, indices, values, value_encoding, index_dtype_u16)
         }
-        CodecId::Pcodec => encode_pcodec(indptr, indices, values, value_encoding, index_dtype_u16),
+        CodecId::Scx1 => {
+            Scx1Codec::encode(indptr, indices, values, value_encoding, index_dtype_u16)
+        }
+        CodecId::Zstd => {
+            ZstdCodec::encode(indptr, indices, values, value_encoding, index_dtype_u16)
+        }
+        CodecId::Lz4Shuffle => {
+            Lz4ShuffleCodec::encode(indptr, indices, values, value_encoding, index_dtype_u16)
+        }
+        CodecId::Pcodec => {
+            PcodecCodec::encode(indptr, indices, values, value_encoding, index_dtype_u16)
+        }
         CodecId::ShufDeltaZstd => {
-            encode_shufdelta_zstd(indptr, indices, values, value_encoding, index_dtype_u16)
+            ShufDeltaZstdCodec::encode(indptr, indices, values, value_encoding, index_dtype_u16)
         }
     }
 }
@@ -78,6 +83,23 @@ pub fn decode_shard(
     decode_shard_ref(&r, codec_id, value_encoding, n_rows, nnz, index_dtype_u16)
 }
 
+/// Dispatch one codec, rejecting an encoding it cannot represent first.
+///
+/// Centralising `supports` is why `CodecError::FloatWithScx1` is now raised in
+/// one place rather than being each decoder's first statement.
+fn decode_via<C: ShardCodec>(
+    encoded: &EncodedShardRef,
+    shape: ShardShape,
+    value_encoding: ValueEncoding,
+    index_dtype_u16: bool,
+    bounds: &DecodeBounds,
+) -> Result<DecodedShard, CodecError> {
+    if !C::supports(value_encoding) {
+        return Err(CodecError::FloatWithScx1);
+    }
+    C::decode(encoded, shape, value_encoding, index_dtype_u16, bounds)
+}
+
 /// Decode an `EncodedShardRef` (borrowed) back to `(indptr, indices, values_bytes)`.
 ///
 /// Zero-copy variant that avoids cloning mmap slices into owned Vecs.
@@ -89,17 +111,34 @@ pub fn decode_shard_ref(
     nnz: usize,
     index_dtype_u16: bool,
 ) -> Result<DecodedShard, CodecError> {
+    // One shape, one derivation of the caps, then dispatch. A codec receives
+    // `bounds`; it has no way to derive its own, which is what made "this
+    // decoder forgot a guard" representable before (§3.5, and #436's LZ4 hole).
+    let shape = ShardShape { n_rows, nnz };
+    let bounds = DecodeBounds::derive(shape, value_encoding, index_dtype_u16)?;
     let decoded = match codec_id {
-        CodecId::None => decode_none_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
-        CodecId::Scx1 => decode_scx1_ref(encoded, value_encoding, n_rows, nnz, index_dtype_u16),
-        CodecId::Zstd => decode_zstd_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
+        CodecId::None => {
+            decode_via::<NoneCodec>(encoded, shape, value_encoding, index_dtype_u16, &bounds)
+        }
+        CodecId::Scx1 => {
+            decode_via::<Scx1Codec>(encoded, shape, value_encoding, index_dtype_u16, &bounds)
+        }
+        CodecId::Zstd => {
+            decode_via::<ZstdCodec>(encoded, shape, value_encoding, index_dtype_u16, &bounds)
+        }
         CodecId::Lz4Shuffle => {
-            decode_lz4_shuffle_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16)
+            decode_via::<Lz4ShuffleCodec>(encoded, shape, value_encoding, index_dtype_u16, &bounds)
         }
-        CodecId::Pcodec => decode_pcodec_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
-        CodecId::ShufDeltaZstd => {
-            decode_shufdelta_zstd_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16)
+        CodecId::Pcodec => {
+            decode_via::<PcodecCodec>(encoded, shape, value_encoding, index_dtype_u16, &bounds)
         }
+        CodecId::ShufDeltaZstd => decode_via::<ShufDeltaZstdCodec>(
+            encoded,
+            shape,
+            value_encoding,
+            index_dtype_u16,
+            &bounds,
+        ),
     }?;
     // Single structural gate for every codec, and for every row group, since
     // `decode_row_group` funnels through here. Values are still raw bytes at
@@ -316,30 +355,20 @@ pub fn decode_indptr_only(
     codec_id: CodecId,
     n_rows: usize,
 ) -> Result<Vec<i64>, CodecError> {
-    // Guard the `+ 1` so a `usize::MAX` `n_rows` can't wrap before it reaches
-    // the sub-stream decoders (parity with the other Scx1 entry points — F-f).
-    let n_rows_p1 = n_rows
-        .checked_add(1)
-        .ok_or_else(|| CodecError::MalformedInput(format!("n_rows+1 overflow: {n_rows}")))?;
+    // `indptr_byte_cap` performs the `(n_rows + 1) * 8` in checked arithmetic,
+    // so computing it first is also what stops a `usize::MAX` `n_rows` from
+    // wrapping inside a codec's own `n_rows + 1` (F-f).
+    let indptr_max = indptr_byte_cap(n_rows)?;
     let indptr_u64: Vec<u64> = match codec_id {
-        CodecId::None => le_bytes_to_u64(indptr_bytes, n_rows_p1)?,
-        CodecId::Scx1 => delta_golomb_decode(indptr_bytes, n_rows_p1)?,
-        CodecId::Zstd | CodecId::Pcodec => {
-            let raw = zstd_decode_bounded(indptr_bytes, indptr_byte_cap(n_rows)?)?;
-            le_bytes_to_u64(&raw, n_rows_p1)?
-        }
+        CodecId::None => NoneCodec::decode_indptr_only(indptr_bytes, n_rows, indptr_max)?,
+        CodecId::Scx1 => Scx1Codec::decode_indptr_only(indptr_bytes, n_rows, indptr_max)?,
+        CodecId::Zstd => ZstdCodec::decode_indptr_only(indptr_bytes, n_rows, indptr_max)?,
+        CodecId::Pcodec => PcodecCodec::decode_indptr_only(indptr_bytes, n_rows, indptr_max)?,
         CodecId::Lz4Shuffle => {
-            let shuffled = lz4_frame_decompress(indptr_bytes, indptr_byte_cap(n_rows)?)?;
-            let raw = byte_unshuffle(&shuffled, 8)?;
-            le_bytes_to_u64(&raw, n_rows_p1)?
+            Lz4ShuffleCodec::decode_indptr_only(indptr_bytes, n_rows, indptr_max)?
         }
         CodecId::ShufDeltaZstd => {
-            let indptr_max = indptr_byte_cap(n_rows)?;
-            let mut planes = zstd_decode_bounded(indptr_bytes, indptr_max)?;
-            expect_exact_len(planes.len(), indptr_max, "indptr")?;
-            byte_undelta_planes(&mut planes, 8, n_rows_p1);
-            let raw = byte_unshuffle(&planes, 8)?;
-            le_bytes_to_u64(&raw, n_rows_p1)?
+            ShufDeltaZstdCodec::decode_indptr_only(indptr_bytes, n_rows, indptr_max)?
         }
     };
     let indptr = u64_vec_to_i64(indptr_u64)?;

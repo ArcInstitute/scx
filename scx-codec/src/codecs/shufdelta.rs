@@ -13,7 +13,46 @@
 use crate::byte_delta::{byte_delta_planes, byte_undelta_planes};
 use crate::codec_id::{CodecError, DecodedShard, EncodedShard, EncodedShardRef, ValueEncoding};
 use crate::codecs::zstd_codec::zstd_decode_bounded;
-use crate::guards::{checked_len, expect_exact_len, indptr_byte_cap};
+use crate::guards::expect_exact_len;
+use crate::shard_codec::{DecodeBounds, ShardCodec, ShardShape};
+
+/// `CodecId::ShufDeltaZstd` — byte-shuffle + byte-delta pre-filter, then zstd.
+pub struct ShufDeltaZstdCodec;
+
+impl ShardCodec for ShufDeltaZstdCodec {
+    fn encode(
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        value_encoding: ValueEncoding,
+        index_dtype_u16: bool,
+    ) -> Result<EncodedShard, CodecError> {
+        encode_shufdelta_zstd(indptr, indices, values, value_encoding, index_dtype_u16)
+    }
+
+    fn decode(
+        encoded: &EncodedShardRef,
+        shape: ShardShape,
+        value_encoding: ValueEncoding,
+        index_dtype_u16: bool,
+        bounds: &DecodeBounds,
+    ) -> Result<DecodedShard, CodecError> {
+        decode_shufdelta_zstd_ref(encoded, shape, value_encoding, index_dtype_u16, bounds)
+    }
+
+    fn decode_indptr_only(
+        indptr_bytes: &[u8],
+        n_rows: usize,
+        indptr_max: usize,
+    ) -> Result<Vec<u64>, CodecError> {
+        let mut planes = zstd_decode_bounded(indptr_bytes, indptr_max)?;
+        expect_exact_len(planes.len(), indptr_max, "indptr")?;
+        byte_undelta_planes(&mut planes, 8, n_rows + 1);
+        let raw = byte_unshuffle(&planes, 8)?;
+        le_bytes_to_u64(&raw, n_rows + 1)
+    }
+}
+
 use crate::raw::{
     indices_to_le_bytes, le_bytes_to_indices, le_bytes_to_u64, u64_slice_to_le_bytes,
 };
@@ -24,7 +63,7 @@ use crate::shuffle::{byte_shuffle, byte_unshuffle};
 /// pre-filter rather than the compression level.
 pub(crate) const SHUFDELTA_ZSTD_LEVEL: i32 = 3;
 
-pub(crate) fn encode_shufdelta_zstd(
+fn encode_shufdelta_zstd(
     indptr: &[u64],
     indices: &[u32],
     values: &[u8],
@@ -60,17 +99,20 @@ pub(crate) fn encode_shufdelta_zstd(
     })
 }
 
-pub(crate) fn decode_shufdelta_zstd_ref(
+fn decode_shufdelta_zstd_ref(
     encoded: &EncodedShardRef,
-    n_rows: usize,
-    nnz: usize,
+    shape: ShardShape,
     value_encoding: ValueEncoding,
     index_dtype_u16: bool,
+    bounds: &DecodeBounds,
 ) -> Result<DecodedShard, CodecError> {
+    let (n_rows, nnz) = (shape.n_rows, shape.nnz);
     let index_width = if index_dtype_u16 { 2 } else { 4 };
-    let indptr_max = indptr_byte_cap(n_rows)?;
-    let indices_max = checked_len(nnz, index_width, "indices")?;
-    let values_max = checked_len(nnz, value_encoding.byte_width(), "values")?;
+    let DecodeBounds {
+        indptr_max,
+        indices_max,
+        values_max,
+    } = *bounds;
 
     // indptr: zstd -> byte-undelta -> byte-unshuffle
     let mut indptr_planes = zstd_decode_bounded(encoded.indptr_bytes, indptr_max)?;
@@ -96,7 +138,7 @@ pub(crate) fn decode_shufdelta_zstd_ref(
     let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
     let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
 
-    let expected_len = checked_len(nnz, value_encoding.byte_width(), "values")?;
+    let expected_len = values_max;
     if values_raw.len() != expected_len {
         return Err(CodecError::MalformedInput(format!(
             "shufdelta values byte length {} != expected {}",
