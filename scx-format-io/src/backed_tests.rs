@@ -1803,8 +1803,49 @@ fn csc_metrics_now_report_bytes_like_the_other_two_caches() {
     assert_eq!(
         metrics.duplicate_waiters.load(Ordering::Relaxed),
         0,
-        "CSC has no singleflight yet — nothing can wait"
+        "nothing raced in this test, so nobody waited"
     );
+}
+
+#[test]
+fn csc_reader_dedups_concurrent_decodes_of_one_shard() {
+    // **New behaviour.** The hand-rolled CSC cache had no singleflight at all:
+    // N threads that all missed on the same cold shard each decoded their own
+    // copy. Sharing the cache means one decodes and the rest wait, so total
+    // misses are bounded by the number of distinct shards — the same guarantee
+    // the CSR and dense readers have had.
+    use std::thread;
+
+    let dir = tempfile::tempdir().unwrap();
+    // 24 vars / 6 per shard = 4 CSC shards; touch two of them.
+    let (path, _) = write_csc_test_file(&dir, 64, 24, 6);
+    let reader = ScxReader::open(&path).unwrap();
+    let mut backed = BackedCscReader::new(reader, 4).unwrap();
+    let metrics = backed.enable_metrics();
+    assert_eq!(backed.n_shards(), 4);
+    let backed = Arc::new(backed);
+
+    let n_threads = 8;
+    let handles: Vec<_> = (0..n_threads)
+        .map(|_| {
+            let b = Arc::clone(&backed);
+            thread::spawn(move || {
+                b.read_shard_cached(0).unwrap();
+                b.read_shard_cached(2).unwrap();
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let misses = metrics.misses.load(Ordering::Relaxed);
+    assert!(
+        misses <= 2,
+        "expected ≤ 2 misses across {n_threads} concurrent readers of 2 shards, got {misses} \
+         — the CSC singleflight is not deduplicating"
+    );
+    assert!(misses >= 1, "every shard had to be decoded once");
 }
 
 #[test]

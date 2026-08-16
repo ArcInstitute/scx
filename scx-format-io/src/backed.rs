@@ -461,7 +461,7 @@ impl<K: Eq + Hash> Drop for LeaderGuard<'_, K> {
 /// different places. This is that measure, once, next to the type it describes:
 /// a CSR/CSC shard by the per-component model `IndexPlanLoader`'s memory-budget
 /// auto-tune also uses, a dense shard by Arrow's own accounting.
-pub(crate) trait SizeHint {
+pub trait SizeHint {
     fn size_bytes(&self) -> usize;
 }
 
@@ -619,44 +619,61 @@ impl<K: Eq + Hash + Copy, V: SizeHint> WeightedLruCache<K, V> {
 }
 
 // ---------------------------------------------------------------------------
-// SharedShardCache
+// ShardCache
 // ---------------------------------------------------------------------------
 
-/// Singleflight table: `(file_id, shard_id) → in-flight decode slot`.
-type InFlightTable = Mutex<HashMap<(u32, usize), Arc<InFlightSlot>>>;
+/// Singleflight table: `key → in-flight decode slot`.
+type InFlightTable<K> = Mutex<HashMap<K, Arc<InFlightSlot>>>;
 
-/// Decoded-shard cache + singleflight table, keyed by `(file_id, shard_id)` so
-/// it can be **shared across several `BackedCsrReader`s** that together back one
+/// Decoded-shard cache + singleflight table.
+///
+/// The CSR instantiation is keyed by `(file_id, shard_id)` so it can be
+/// **shared across several `BackedCsrReader`s** that together back one
 /// multi-file run (the Phase 1 multi-reader prefetch engine). A standalone
-/// reader gets its own `SharedShardCache` with `file_id = 0`, so keying
-/// `(0, shard)` is isomorphic to the old per-reader `shard` key — single-reader
-/// behavior is unchanged.
+/// reader gets its own cache with `file_id = 0`, so keying `(0, shard)` is
+/// isomorphic to a per-reader `shard` key — single-reader behavior is
+/// unchanged. The CSC and dense readers key by plain `shard_idx`; they are
+/// per-reader and have no second file to disambiguate.
 ///
 /// # Fork safety
 ///
-/// **Invariant**: a `SharedShardCache` is owned (via `Arc`) by the reader(s) of
-/// one run *instance*, never a process-global `OnceCell` / `static` /
-/// `lazy_static`. A forked child constructs its own cache post-fork (e.g. a
-/// `DataLoader` worker building readers inside `__iter__`), so it never inherits
-/// a poisoned-locked `Mutex`. Sharing across readers within one instance keeps
-/// that contract — the fork-mode regression test
-/// (`pyscx/tests/test_fork_safety.py`) catches any regression.
-pub struct SharedShardCache {
+/// **Invariant**: a `ShardCache` is owned (via `Arc` for CSR, inline for CSC
+/// and dense) by the reader(s) of one run *instance*, never a process-global
+/// `OnceCell` / `static` / `lazy_static`. A forked child constructs its own
+/// cache post-fork (e.g. a `DataLoader` worker building readers inside
+/// `__iter__`), so it never inherits a poisoned-locked `Mutex`. Sharing across
+/// readers within one instance keeps that contract — the fork-mode regression
+/// test (`pyscx/tests/test_fork_safety.py`) catches any regression.
+pub struct ShardCache<K: Eq + Hash + Copy, V: SizeHint> {
     /// `None` when `cache_shards == 0` (no caching; every read decodes).
-    cache: Option<Mutex<WeightedLruCache<(u32, usize), ScxCsr>>>,
+    cache: Option<Mutex<WeightedLruCache<K, V>>>,
     /// Singleflight table for in-flight decodes, same fork-safety contract as
     /// `cache`. Present iff `cache` is.
-    in_flight: Option<InFlightTable>,
+    in_flight: Option<InFlightTable<K>>,
     /// Opt-in counters, shared by every reader on this cache.
     metrics: OnceLock<Arc<CacheMetrics>>,
     /// Open-time count cap, mirrored for `warm_shards` chunking without locking.
     cache_shards: usize,
 }
 
-impl SharedShardCache {
+/// The CSR instantiation, and the name every caller outside this crate uses.
+///
+/// Kept as an alias rather than renaming the type: `SharedShardCache::new` is
+/// called by `scx-loader`'s plan engine and the name is re-exported at the
+/// crate root, so generalising the struct must not become a cross-crate API
+/// change.
+pub type SharedShardCache = ShardCache<(u32, usize), ScxCsr>;
+
+impl<K: Eq + Hash + Copy, V: SizeHint> ShardCache<K, V> {
     /// Build a shared cache with a count cap (`cache_shards`, 0 = no cache) and
     /// byte budget. The budget governs *all* readers sharing this cache.
     pub fn new(cache_shards: usize, bytes_budget: usize) -> Arc<Self> {
+        Arc::new(Self::inline(cache_shards, bytes_budget))
+    }
+
+    /// Same cache, un-`Arc`ed, for the readers that own theirs outright rather
+    /// than sharing it across a multi-file run.
+    fn inline(cache_shards: usize, bytes_budget: usize) -> Self {
         let (cache, in_flight) = if cache_shards > 0 {
             (
                 Some(Mutex::new(WeightedLruCache::new(
@@ -668,28 +685,28 @@ impl SharedShardCache {
         } else {
             (None, None)
         };
-        Arc::new(SharedShardCache {
+        ShardCache {
             cache,
             in_flight,
             metrics: OnceLock::new(),
             cache_shards,
-        })
+        }
     }
 
     fn has_cache(&self) -> bool {
         self.cache.is_some()
     }
 
-    fn contains(&self, fid: u32, shard: usize) -> bool {
+    fn contains_key(&self, key: K) -> bool {
         match &self.cache {
-            Some(m) => m.lock().unwrap().contains(&(fid, shard)),
+            Some(m) => m.lock().unwrap().contains(&key),
             None => false,
         }
     }
 
-    fn in_flight_contains(&self, fid: u32, shard: usize) -> bool {
+    fn in_flight_contains_key(&self, key: K) -> bool {
         match &self.in_flight {
-            Some(m) => m.lock().unwrap().contains_key(&(fid, shard)),
+            Some(m) => m.lock().unwrap().contains_key(&key),
             None => false,
         }
     }
@@ -733,41 +750,15 @@ impl SharedShardCache {
         m
     }
 
-    /// Dedup `shard_indices` (local ids) to those neither cached nor in flight
-    /// for `fid`. Lock order `in_flight` → `cache` matches [`Self::get_or_decode`]
-    /// so concurrent callers can't deadlock.
-    fn filter_misses(&self, fid: u32, shard_indices: &[usize]) -> Vec<usize> {
-        let (Some(cache_mutex), Some(in_flight_mutex)) = (&self.cache, &self.in_flight) else {
-            return Vec::new();
-        };
-        let mut seen: HashSet<usize> = HashSet::with_capacity(shard_indices.len());
-        let mut misses: Vec<usize> = Vec::with_capacity(shard_indices.len());
-        let in_flight = in_flight_mutex.lock().unwrap();
-        let cache = cache_mutex.lock().unwrap();
-        for &idx in shard_indices {
-            if !seen.insert(idx) {
-                continue;
-            }
-            if cache.contains(&(fid, idx)) || in_flight.contains_key(&(fid, idx)) {
-                continue;
-            }
-            misses.push(idx);
-        }
-        misses
-    }
-
-    /// Return the cached `(fid, shard)` CSR, or run `decode` exactly once across
+    /// Return the cached value for `key`, or run `decode` exactly once across
     /// concurrent callers (singleflight) and cache the result under the budget.
     /// `decode` produces the decoded shard; the caller (the reader) owns the
-    /// decode because it is reader/mmap-specific. Mirrors the former
-    /// `BackedCsrReader::read_shard_cached_arc` loop, keyed by `(fid, shard)`.
-    fn get_or_decode(
-        &self,
-        fid: u32,
-        shard: usize,
-        decode: impl FnOnce() -> Result<Arc<ScxCsr>>,
-    ) -> Result<Arc<ScxCsr>> {
-        let key = (fid, shard);
+    /// decode because it is reader/mmap-specific.
+    ///
+    /// This is the *only* place that takes both locks, and it takes them
+    /// `in_flight` → `cache`. That used to be a contract three transcriptions
+    /// had to honour independently.
+    fn get_or_decode(&self, key: K, decode: impl FnOnce() -> Result<Arc<V>>) -> Result<Arc<V>> {
         loop {
             // Cache hit fast path.
             if let Some(ref cache_mutex) = self.cache {
@@ -783,7 +774,7 @@ impl SharedShardCache {
             // Singleflight: claim leadership or wait on a peer leader. `_guard`
             // (when present) signals waiters + removes the slot on drop, so a
             // panic in `decode` still wakes peers.
-            let _guard: Option<LeaderGuard<(u32, usize)>> = match &self.in_flight {
+            let _guard: Option<LeaderGuard<K>> = match &self.in_flight {
                 Some(in_flight_mutex) => {
                     let mut in_flight = in_flight_mutex.lock().unwrap();
                     if let Some(existing) = in_flight.get(&key) {
@@ -831,13 +822,49 @@ impl SharedShardCache {
             // Leader path. Decode (reader-owned), then insert under the budget
             // before `_guard` drops — a post-removal observer sees the entry
             // once it re-acquires `in_flight`.
-            let csr = decode()?;
+            let value = decode()?;
             if let Some(ref cache_mutex) = self.cache {
                 let mut cache = cache_mutex.lock().unwrap();
-                cache.put_with_budget(key, Arc::clone(&csr));
+                cache.put_with_budget(key, Arc::clone(&value));
             }
-            return Ok(csr);
+            return Ok(value);
         }
+    }
+}
+
+/// The `(file_id, shard_id)`-keyed helpers, which only the CSR reader has a use
+/// for: it is the one instantiation whose key has two components, because it is
+/// the one that can be shared across the readers of a multi-file run.
+impl SharedShardCache {
+    fn contains(&self, fid: u32, shard: usize) -> bool {
+        self.contains_key((fid, shard))
+    }
+
+    fn in_flight_contains(&self, fid: u32, shard: usize) -> bool {
+        self.in_flight_contains_key((fid, shard))
+    }
+
+    /// Dedup `shard_indices` (local ids) to those neither cached nor in flight
+    /// for `fid`. Lock order `in_flight` → `cache` matches
+    /// [`ShardCache::get_or_decode`] so concurrent callers can't deadlock.
+    fn filter_misses(&self, fid: u32, shard_indices: &[usize]) -> Vec<usize> {
+        let (Some(cache_mutex), Some(in_flight_mutex)) = (&self.cache, &self.in_flight) else {
+            return Vec::new();
+        };
+        let mut seen: HashSet<usize> = HashSet::with_capacity(shard_indices.len());
+        let mut misses: Vec<usize> = Vec::with_capacity(shard_indices.len());
+        let in_flight = in_flight_mutex.lock().unwrap();
+        let cache = cache_mutex.lock().unwrap();
+        for &idx in shard_indices {
+            if !seen.insert(idx) {
+                continue;
+            }
+            if cache.contains(&(fid, idx)) || in_flight.contains_key(&(fid, idx)) {
+                continue;
+            }
+            misses.push(idx);
+        }
+        misses
     }
 }
 
@@ -2014,7 +2041,7 @@ impl BackedCsrReader {
         // keyed by `(file_id, shard_idx)`; this reader owns the decode (it is
         // mmap/catalog-specific).
         let shard_cache = Arc::clone(&self.shard_cache);
-        shard_cache.get_or_decode(self.file_id, shard_idx, || self.decode_shard(shard_idx))
+        shard_cache.get_or_decode((self.file_id, shard_idx), || self.decode_shard(shard_idx))
     }
 
     /// Decode shard `shard_idx` from the underlying reader and trigger
@@ -3070,15 +3097,13 @@ pub struct BackedCscReader {
     /// index). Pre-cached at construction so we don't re-scan the
     /// catalog on every read.
     sorted_entries: Vec<FullCatalogEntry>,
-    /// Optional LRU cache of decoded CSC shards (`None` ⇒ no caching).
+    /// Decoded-shard cache + singleflight, keyed by shard index.
     ///
     /// `BackedCscReader::new` / `for_modality` / `for_layer` open it with a
     /// `usize::MAX` byte budget, i.e. count-only — the behaviour the
-    /// hand-rolled `CscCache` this replaced had no way to do otherwise.
+    /// hand-rolled cache this replaced had no way to do otherwise.
     /// [`Self::with_byte_budget`] is the way to bound it in bytes.
-    cache: Option<Mutex<WeightedLruCache<usize, ScxCsc>>>,
-    /// Optional metrics handle.
-    metrics: Option<Arc<CacheMetrics>>,
+    cache: ShardCache<usize, ScxCsc>,
 }
 
 impl BackedCscReader {
@@ -3155,22 +3180,13 @@ impl BackedCscReader {
             .cloned()
             .collect();
         check_csc_sidecar_fresh(reader.catalog(), &sorted_entries)?;
-        let cache = if cache_shards > 0 {
-            Some(Mutex::new(WeightedLruCache::new(
-                cache_shards,
-                bytes_budget,
-            )))
-        } else {
-            None
-        };
         Ok(BackedCscReader {
             reader,
             index,
             n_obs,
             n_vars,
             sorted_entries,
-            cache,
-            metrics: None,
+            cache: ShardCache::inline(cache_shards, bytes_budget),
         })
     }
 
@@ -3197,19 +3213,13 @@ impl BackedCscReader {
             .cloned()
             .collect();
         check_csc_sidecar_fresh(reader.catalog(), &sorted_entries)?;
-        let cache = if cache_shards > 0 {
-            Some(Mutex::new(WeightedLruCache::new(cache_shards, usize::MAX)))
-        } else {
-            None
-        };
         Ok(BackedCscReader {
             reader,
             index,
             n_obs,
             n_vars,
             sorted_entries,
-            cache,
-            metrics: None,
+            cache: ShardCache::inline(cache_shards, usize::MAX),
         })
     }
 
@@ -3223,19 +3233,17 @@ impl BackedCscReader {
     /// through the cache lock. The returned handle's `hits` /
     /// `misses` / `evictions` reflect CSC-side activity; CSR metrics
     /// live on `BackedCsrReader::enable_metrics()` separately.
+    ///
+    /// Idempotent since the cache became shared: repeat calls return the same
+    /// handle rather than installing a fresh set of counters and orphaning
+    /// whatever the previous caller was sampling.
     pub fn enable_metrics(&mut self) -> Arc<CacheMetrics> {
-        let m = Arc::new(CacheMetrics::default());
-        self.metrics = Some(Arc::clone(&m));
-        if let Some(ref cache_mutex) = self.cache {
-            let mut c = cache_mutex.lock().unwrap();
-            c.metrics = Some(Arc::clone(&m));
-        }
-        m
+        self.cache.enable_metrics()
     }
 
     /// Borrow the metrics handle, if enabled.
     pub fn metrics(&self) -> Option<&Arc<CacheMetrics>> {
-        self.metrics.as_ref()
+        self.cache.metrics()
     }
 
     /// Number of CSC shards.
@@ -3278,28 +3286,18 @@ impl BackedCscReader {
     /// Read and optionally cache a CSC shard, returning a shared
     /// `Arc<ScxCsc>`. On cache hit increments `metrics.hits`; on miss
     /// (or no cache) increments `metrics.misses` and decodes.
+    ///
+    /// Singleflighted as of the shared cache: concurrent readers of the same
+    /// cold shard decode it once and the rest wait, where before each decoded
+    /// its own copy. On a gene-major DE sweep that is the difference between
+    /// N decodes of a 5000-column shard and one.
     pub fn read_shard_cached(&self, shard_idx: usize) -> Result<Arc<ScxCsc>> {
         // See `BackedCsrReader::read_shard_cached_arc`: a cache hit bypasses
         // `section_bytes` entirely.
         self.check_fresh()?;
-        if let Some(ref cache_mutex) = self.cache {
-            let mut cache = cache_mutex.lock().unwrap();
-            if let Some(cached) = cache.get(&shard_idx) {
-                if let Some(m) = &self.metrics {
-                    m.hits.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(cached);
-            }
-        }
-        if let Some(m) = &self.metrics {
-            m.misses.fetch_add(1, Ordering::Relaxed);
-        }
-        let csc = Arc::new(self.read_shard_uncached(shard_idx)?);
-        if let Some(ref cache_mutex) = self.cache {
-            let mut cache = cache_mutex.lock().unwrap();
-            cache.put_with_budget(shard_idx, Arc::clone(&csc));
-        }
-        Ok(csc)
+        self.cache.get_or_decode(shard_idx, || {
+            Ok(Arc::new(self.read_shard_uncached(shard_idx)?))
+        })
     }
 
     /// Read a contiguous column slice across CSC shards.
@@ -3546,9 +3544,10 @@ pub struct BackedDenseReader {
     schema: Arc<arrow::datatypes::Schema>,
     /// Per-shard catalog rows, ordered by `row_start`.
     sorted_entries: Vec<DenseShardEntryLite>,
-    cache: Option<Mutex<WeightedLruCache<usize, DenseShard>>>,
-    in_flight: Option<Mutex<HashMap<usize, Arc<InFlightSlot>>>>,
-    metrics: Option<Arc<CacheMetrics>>,
+    /// Decoded-shard cache + singleflight, keyed by shard index. Before this
+    /// was shared, the reader carried `cache` / `in_flight` / `metrics` as
+    /// three separate fields and its own copy of the rendezvous loop.
+    cache: ShardCache<usize, DenseShard>,
     prefetch_count: usize,
 }
 
@@ -3617,19 +3616,6 @@ impl BackedDenseReader {
             })
             .collect();
         let schema = Arc::new(arrow::datatypes::Schema::new(layout.fields));
-        let cache = if cache_shards > 0 {
-            Some(Mutex::new(WeightedLruCache::new(
-                cache_shards,
-                bytes_budget,
-            )))
-        } else {
-            None
-        };
-        let in_flight = if cache.is_some() {
-            Some(Mutex::new(HashMap::new()))
-        } else {
-            None
-        };
         let prefetch_count = cache_shards.max(2);
         BackedDenseReader {
             reader,
@@ -3640,9 +3626,7 @@ impl BackedDenseReader {
             dtype: layout.dtype,
             schema,
             sorted_entries,
-            cache,
-            in_flight,
-            metrics: None,
+            cache: ShardCache::inline(cache_shards, bytes_budget),
             prefetch_count,
         }
     }
@@ -3679,88 +3663,31 @@ impl BackedDenseReader {
 
     /// Enable cache-behaviour counters (test/diagnostic use).
     pub fn enable_metrics(&mut self) -> Arc<CacheMetrics> {
-        let m = Arc::new(CacheMetrics::default());
-        if let Some(ref cache_mutex) = self.cache {
-            cache_mutex.lock().unwrap().metrics = Some(Arc::clone(&m));
-        }
-        self.metrics = Some(Arc::clone(&m));
-        m
+        self.cache.enable_metrics()
     }
 
     /// True if `shard_idx` is currently cached.
     pub fn cache_contains(&self, shard_idx: usize) -> bool {
-        match &self.cache {
-            Some(m) => m.lock().unwrap().contains(&shard_idx),
-            None => false,
-        }
+        self.cache.contains_key(shard_idx)
     }
 
     fn shard_count(&self) -> usize {
         self.sorted_entries.len()
     }
 
-    /// Decode + cache one dense shard, returning a shared `Arc`. Same
-    /// singleflight contract as [`BackedCsrReader::read_shard_cached_arc`].
+    /// Decode + cache one dense shard, returning a shared `Arc`. The
+    /// singleflight, the cache-hit fast path and the metrics accounting all
+    /// live in [`ShardCache::get_or_decode`]; what is left here is the part
+    /// that is actually dense-specific.
     fn read_shard_cached_arc(&self, shard_idx: usize) -> Result<Arc<DenseShard>> {
         // See `BackedCsrReader::read_shard_cached_arc`: a cache hit bypasses
         // `section_bytes` entirely.
         self.check_fresh()?;
-        loop {
-            if let Some(ref cache_mutex) = self.cache {
-                let mut cache = cache_mutex.lock().unwrap();
-                if let Some(cached) = cache.get(&shard_idx) {
-                    if let Some(m) = &self.metrics {
-                        m.hits.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return Ok(cached);
-                }
-            }
-
-            let _guard: Option<LeaderGuard<usize>> = match &self.in_flight {
-                Some(in_flight_mutex) => {
-                    let mut in_flight = in_flight_mutex.lock().unwrap();
-                    if let Some(existing) = in_flight.get(&shard_idx) {
-                        let slot = Arc::clone(existing);
-                        drop(in_flight);
-                        if let Some(m) = &self.metrics {
-                            m.duplicate_waiters.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let mut state = slot.state.lock().unwrap();
-                        while !*state {
-                            state = slot.cv.wait(state).unwrap();
-                        }
-                        drop(state);
-                        continue;
-                    }
-                    if let Some(ref cache_mutex) = self.cache {
-                        let mut cache = cache_mutex.lock().unwrap();
-                        if let Some(cached) = cache.get(&shard_idx) {
-                            if let Some(m) = &self.metrics {
-                                m.hits.fetch_add(1, Ordering::Relaxed);
-                            }
-                            return Ok(cached);
-                        }
-                    }
-                    let slot = Arc::new(InFlightSlot::new());
-                    in_flight.insert(shard_idx, Arc::clone(&slot));
-                    Some(LeaderGuard {
-                        in_flight: in_flight_mutex,
-                        slot,
-                        key: shard_idx,
-                    })
-                }
-                None => None,
-            };
-
-            if let Some(m) = &self.metrics {
-                m.misses.fetch_add(1, Ordering::Relaxed);
-            }
-
-            return self.decode_and_cache(shard_idx);
-        }
+        self.cache
+            .get_or_decode(shard_idx, || self.decode_shard(shard_idx))
     }
 
-    fn decode_and_cache(&self, shard_idx: usize) -> Result<Arc<DenseShard>> {
+    fn decode_shard(&self, shard_idx: usize) -> Result<Arc<DenseShard>> {
         let lite = *self
             .sorted_entries
             .get(shard_idx)
@@ -3772,11 +3699,6 @@ impl BackedDenseReader {
             .reader
             .read_dense_mapping_entry(&lite.into_transient_full_entry())?;
         let shard = Arc::new(DenseShard { batch });
-
-        if let Some(ref cache_mutex) = self.cache {
-            let mut cache = cache_mutex.lock().unwrap();
-            cache.put_with_budget(shard_idx, Arc::clone(&shard));
-        }
 
         #[cfg(unix)]
         {
@@ -3801,7 +3723,7 @@ impl BackedDenseReader {
     /// dense gather is bounded by the row batch, not zstd decode, so the
     /// CSR parallel-warm machinery isn't replicated here).
     fn warm_shards(&self, shard_indices: &[usize]) -> Result<()> {
-        if self.cache.is_none() {
+        if !self.cache.has_cache() {
             return Ok(());
         }
         let mut seen: HashSet<usize> = HashSet::with_capacity(shard_indices.len());
