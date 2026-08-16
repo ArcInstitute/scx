@@ -288,7 +288,7 @@ Pass `--csc-cols-per-shard 0` for no cap (single CSC shard).
                    CREATION                                    CONSUMPTION
  ─────────────────────────────────────────   ──────────────────────────────────────
 
- scx-sparse/src/transpose.rs                scx-format-io/src/backed.rs
+ scx-sparse/src/transpose.rs                scx-format-io/src/backed/csc.rs
  ┌──────────────────────────────────┐        ┌─────────────────────────────────┐
  │ streaming_csr_to_csc_iter_with   │        │ BackedCscIndex                  │
  │ _cap()                           │        │   shard_ranges: Vec<(col_start, │
@@ -323,17 +323,21 @@ Pass `--csc-cols-per-shard 0` for no cap (single CSC shard).
                                             └─────────────────────────────────┘
 ```
 
-**`BackedCscIndex`** (`scx-format-io/src/backed.rs`): A sorted vector of
+**`BackedCscIndex`** (`scx-format-io/src/backed/csc.rs`): A sorted vector of
 `(col_start, col_end, sorted_shard_idx)` ranges built from the catalog at
 construction time. Provides O(log n) column lookups via `partition_point`:
 `shard_for_col(col)` for single-column lookups and
 `shards_for_col_range(c_lo, c_hi)` for range queries.
 
-**`BackedCscReader`** (`scx-format-io/src/backed.rs`): The primary CSC consumer.
-Wraps an `ScxReader` + `BackedCscIndex` + a count-only LRU cache for decoded
-`ScxCsc` shards (simpler than the CSR reader's byte-budgeted / singleflight
-cache — CSC analytical workloads access shards in column-range order with
-limited reuse). Key method: `read_csc_columns(col_range)` skips non-overlapping
+**`BackedCscReader`** (`scx-format-io/src/backed/csc.rs`): The primary CSC
+consumer. Wraps an `ScxReader` + `BackedCscIndex` + a `ShardCache` of decoded
+`ScxCsc` shards — the same byte-budgeted, singleflighted cache the CSR and dense
+readers use. It was a separate count-only implementation with neither, on the
+reasoning that CSC workloads access shards in column-range order with limited
+reuse; the reuse argument holds, but it did not justify a third copy of the
+eviction loop, and concurrent readers of one cold shard each decoded their own.
+`BackedCscReader::new` still opens count-only (`usize::MAX` bytes);
+`with_byte_budget` bounds it. Key method: `read_csc_columns(col_range)` skips non-overlapping
 shards, `col_slice`s partial-overlap shards post-decode, and concatenates
 results. Implements `ColumnShardSource`.
 
@@ -476,6 +480,31 @@ path needs no `unsafe`.
 - `MADV_SEQUENTIAL` on the shard byte range during `assemble_row_major()` — tells kernel to readahead aggressively for full reads
 - `MADV_WILLNEED` on next N shards in `BackedCsrReader::read_shard_cached()` — prefetches upcoming shards after a cache miss
 - `MADV_DONTNEED` after `read_shard_uncached()` — releases page cache for decoded shards during streaming aggregation (67% RSS reduction on 1M cells)
+
+### Backed readers (`scx-format-io/src/backed/`)
+
+| Module | Holds |
+|---|---|
+| `mod.rs` | the re-exports every `backed::<name>` import path resolves through, `scatter_block_index_enabled`, `ROW_RANGE_WINDOW_DIVISOR` |
+| `index.rs` | `BackedCsrIndex` + `ShardEntryLite` — the row-range → shard binary search, shared by the CSR and dense readers |
+| `cache.rs` | `CacheMetrics`, `SizeHint`, `WeightedLruCache`, `ShardCache` |
+| `csr.rs` | `BackedCsrReader` and its `ShardSource` impl |
+| `aggregate.rs` | the native shard-by-shard statistics kernels, a second `impl BackedCsrReader` |
+| `csc.rs` | `BackedCscIndex`, `BackedCscReader`, the CSC sidecar freshness guard |
+| `dense.rs` | `BackedDenseReader` — row gather over an `obsm` mapping |
+
+**One cache for all three readers.** `ShardCache<K, V>` is a byte-budgeted LRU
+(`WeightedLruCache`) plus a singleflight table, generic over the decoded payload
+via `SizeHint` — `ScxCsr` and `ScxCsc` by their component sizes (`indptr×8 +
+indices×4 + data×4`, the model `IndexPlanLoader`'s memory-budget auto-tune also
+uses), `DenseShard` by `RecordBatch::get_array_memory_size()`. `SharedShardCache`
+is the CSR instantiation, keyed `(file_id, shard_id)` so several readers of one
+multi-file run share a budget; CSC and dense key by shard index alone.
+
+`ShardCache::get_or_decode` is the only place that takes both the `in_flight` and
+`cache` locks, and it takes them in that order — which is what makes the lock
+ordering a property of the code rather than a contract three separate
+transcriptions each had to honour.
 
 ### Catalog representations (`FullCatalog`, `CatalogView`)
 

@@ -510,7 +510,7 @@ are already defined) and wired up the loops that could not previously see it:
 
 | Consumer | What now prefetches |
 |---|---|
-| `scx-format-io/src/backed.rs` | the 15 aggregation kernels behind QC, filtering, `col_*` and `normalize_total`'s row sums |
+| `scx-format-io/src/backed/aggregate.rs` | the 15 aggregation kernels behind QC, filtering, `col_*` and `normalize_total`'s row sums |
 | `pyscx/src/projected_agg.rs` | the 17 column-projected CSR twins |
 | `pyscx/src/lazy_transform/dataset.rs` | the 8 `streaming_*` lazy/transformed kernels |
 | `scx-gpu/src/gpu_shard_source.rs` | GPU staging — replaces a single scoped decode thread + `sync_channel(1)` |

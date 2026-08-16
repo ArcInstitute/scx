@@ -549,7 +549,7 @@ and launch geometry it saw while streaming. See
 |------|-------------|-------|
 | `ScxReader` | `Send + Sync` | Backed by `mmap` (immutable `&[u8]`). Internal `Arc<FullCatalog>` is also `Send + Sync`. Safe to share via `Arc<ScxReader>` across threads or to reopen sibling readers with `ScxReader::open_with_shared_catalog`. |
 | `FullCatalog` / `CatalogView` | `Send + Sync` | Frozen after parse. `FullCatalog::reconcile_v1_csr_col_range` runs once before the `Arc` wrap; afterward both types are immutable. Only `FullCatalog` is shared through an `Arc` today — reader paths build `CatalogView`s as stack temporaries. See [Fork safety](#fork-safety) for the constraints any future memoisation must respect. |
-| `BackedCsrReader` | `Send + Sync` | `mmap`-backed catalog data + per-instance `WeightedLruCache` and singleflight `Mutex`. **Must remain per-process** — see [Why mutable reader state stays per-instance](#why-mutable-reader-state-stays-per-instance). |
+| `BackedCsrReader` | `Send + Sync` | `mmap`-backed catalog data + a per-instance `ShardCache` (byte-budgeted `WeightedLruCache` + singleflight `Mutex`). **Must remain per-process** — see [Why mutable reader state stays per-instance](#why-mutable-reader-state-stays-per-instance). |
 | `ScxWriter` | `Send` only | Single-owner, sequential writes. Not shared across threads. |
 | `QueryPipeline` | `Send` | Built on one thread, executed on another. Not shared. |
 | `TrainingPipeline` | `Send` | Owns its tokio runtime and thread handles. Called from one thread at a time. |
@@ -569,6 +569,13 @@ shared across forked workers:
 - The singleflight table that deduplicates concurrent decode requests. Its
   `Mutex<HashMap<ShardKey, ...>>` is held during decode dispatch. Same
   inherit-held-lock failure mode as the LRU cache.
+
+Both live in one `ShardCache`, and **`BackedCscReader` and `BackedDenseReader`
+hold one too** — so the constraint is not the CSR reader's alone. The CSC reader
+in particular gained a singleflight table when the three caches were unified; it
+previously had only a count-capped LRU. Every one of them is per-instance, never
+a process-global `OnceCell` / `static`, which is what keeps a forked
+`DataLoader` worker constructing its own readers safe.
 
 `mmap`-backed memory and the `Arc<FullCatalog>` payload that reader-open
 paths reuse are immutable, so they survive `fork()` cleanly

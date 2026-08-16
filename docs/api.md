@@ -841,7 +841,7 @@ The full transform list is also surfaced on the wrapper itself via
 `ScxLazyTransformedDataset.transforms_repr() → list[{"name","params"}]`,
 which the writer uses to build the `lazy_transforms` payload.
 
-## BackedCsrReader (`scx-format-io/src/backed.rs`)
+## BackedCsrReader (`scx-format-io/src/backed/csr.rs`)
 
 - `new(reader, cache_shards)` — Create backed reader from `ScxReader` with LRU shard cache
 - `read_rows(start, end)` → `ScxCsr` — Decode and concatenate rows from relevant shards
@@ -928,7 +928,7 @@ pub trait ShardSource {
 
 **Design note:** The trait is defined in `scx-format` (not `scx-accel`) so that `pyscx`'s `LazyShardSource` can implement it without creating a dependency on `scx-accel`. PCA functions in `scx-accel` are generic (`<S: ShardSource>`) rather than using `&dyn ShardSource` to allow monomorphization.
 
-## BackedCscReader (`scx-format-io/src/backed.rs`)
+## BackedCscReader (`scx-format-io/src/backed/csc.rs`)
 
 Column-major counterpart to `BackedCsrReader`. Streams CSC sidecar
 shards from disk with an LRU shard cache, parallel to the CSR side.
