@@ -1129,7 +1129,7 @@ pub(crate) fn build_var_batch_with_pandas_metadata(
 // -----------------------------------------------------------------------
 
 // E2-2026-05-20 `forced_column_missing_message` rendering tests live
-// alongside the helper in `scx-engine/src/index.rs`. The helper moved
+// alongside the helper in `scx-engine/src/index/diagnostics.rs`. The helper moved
 // out of `scx-convert` so `pyscx` (which only depends on `scx-engine`
 // unconditionally; `scx-convert` is `hdf5`-gated) can call it from
 // CPU-only builds. The previous duplicate tests here were removed in

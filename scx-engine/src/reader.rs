@@ -53,7 +53,7 @@ pub trait SectionReader: Send + Sync {
     /// and concatenates every obs metadata shard. Prefer the streaming
     /// [`Self::obs_metadata_shard_count`] + [`Self::read_obs_shard`] pair
     /// when you can process obs per-shard (the query engine does — see
-    /// `scx-engine/src/collect.rs`).
+    /// `scx-engine/src/collect/`).
     fn read_obs(&self) -> Result<RecordBatch>;
 
     /// Number of `ObsMetadataShard` sections (pure catalog scan, no I/O).

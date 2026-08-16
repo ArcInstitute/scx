@@ -90,7 +90,7 @@ impl Predicate {
 //
 // v1 exactness scope: categorical `Eq` / `In` and `And` / `Or` of those. `Ne`,
 // `Not`, and all numeric comparisons return `None` (residual) — see the module
-// docs in `collect.rs`: the categorical index omits null rows, so complementing
+// docs in `collect::mask`: the categorical index omits null rows, so complementing
 // it (for `Ne`/`Not`) would wrongly re-include them, and numeric B+ tree leaves
 // are conservative.
 //
