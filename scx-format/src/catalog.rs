@@ -284,18 +284,20 @@ impl ShardStats {
     /// CSC entries reconciled at catalog-read time the two pairs are
     /// equal, so this accessor returns the same value either way.
     pub fn major_start(&self, section_type: SectionType) -> u64 {
-        match section_type {
-            SectionType::CscShard => self.col_start,
-            _ => self.row_start,
+        if crate::shard::is_column_major(section_type) {
+            self.col_start
+        } else {
+            self.row_start
         }
     }
 
     /// Generic major-axis end: `row_end` for CSR/Layer/Obsp,
     /// `col_end` for CSC. See [`Self::major_start`] for the rationale.
     pub fn major_end(&self, section_type: SectionType) -> u64 {
-        match section_type {
-            SectionType::CscShard => self.col_end,
-            _ => self.row_end,
+        if crate::shard::is_column_major(section_type) {
+            self.col_end
+        } else {
+            self.row_end
         }
     }
 
@@ -893,7 +895,7 @@ impl FullCatalog {
             };
             if catalog_version < 2 {
                 if let Some(ref mut s) = entry.stats {
-                    if matches!(section_type, SectionType::CscShard) {
+                    if crate::shard::is_column_major(section_type) {
                         s.col_start = s.row_start;
                         s.col_end = s.row_end;
                     }

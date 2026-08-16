@@ -2980,3 +2980,119 @@ fn duplicate_section_name_is_rejected() {
         "expected DuplicateSection, got {err:?}"
     );
 }
+
+/// `LayerCscShard` (section id 16) must be column-major on every surface that
+/// touches it — the catalog stats, the 76-byte shard header, and the reader
+/// index that maps a column to a shard.
+///
+/// It was half-implemented in both directions at once. `catalog_view` and
+/// `shard_decode` treated it as column-major; `ShardStats::major_start`,
+/// `derive_shard_type` and the writer's own stats/index-width dispatch matched
+/// only `CscShard` and so treated it as row-major. `BackedCscIndex` papered
+/// over the split by passing `SectionType::CscShard` for a `LayerCscShard`
+/// entry. Nothing produced the section, so nothing forced the two halves to
+/// meet.
+///
+/// The load-bearing assertion is the last one: with the stats written on the
+/// row axis, every layer CSC shard reported `col_start == 0`, so `shard_for_col`
+/// could not tell two shards apart.
+#[test]
+fn layer_csc_shards_are_column_major_end_to_end() {
+    use crate::backed::BackedCscIndex;
+    use crate::modality::ModalityType;
+    use crate::reader::ScxReader;
+    use crate::shard::ShardHeader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("layer_csc.scx");
+
+    let mut writer = ScxWriter::new(&path, sample_header()).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var()).unwrap();
+    writer.set_modality_n_vars(rna_id, 50).unwrap();
+
+    let (indptr, indices, values) = sample_shard_data();
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    // Two layer CSC shards covering disjoint column ranges. Distinct starts
+    // are the point: a row-axis stat collapses both to 0.
+    for col_start in [0u64, 20] {
+        writer
+            .write_layer_csc_shard_for(
+                rna_id,
+                "counts",
+                (col_start / 20) as u32,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                col_start,
+            )
+            .unwrap();
+    }
+
+    let final_path = writer.finish().unwrap();
+    let reader = ScxReader::open(&final_path).unwrap();
+
+    // 1. Catalog stats carry the column range on the column axis.
+    let entries = reader
+        .catalog()
+        .layer_csc_shards_for_modality(rna_id, "counts");
+    assert_eq!(entries.len(), 2);
+    let starts: Vec<u64> = entries
+        .iter()
+        .map(|e| {
+            e.stats
+                .as_ref()
+                .unwrap()
+                .major_start(SectionType::LayerCscShard)
+        })
+        .collect();
+    assert_eq!(starts, vec![0, 20], "major axis must be the column axis");
+    for e in &entries {
+        let s = e.stats.as_ref().unwrap();
+        assert_eq!(
+            s.row_range(),
+            0..reader.n_obs(),
+            "the row pair carries the full row range, as for a CSC shard"
+        );
+    }
+
+    // 2. The 76-byte shard header agrees with the catalog. `shard_decode`
+    //    already treats this section as column-major, so a row-major
+    //    `shard_type` would have the header and the decoder disagree.
+    let bytes = reader.section_bytes(entries[0]).unwrap();
+    let sh = ShardHeader::read_from(&mut std::io::Cursor::new(bytes)).unwrap();
+    assert!(sh.is_csc(SectionType::LayerCscShard));
+    sh.validate_csc_strict(SectionType::LayerCscShard).unwrap();
+    assert_eq!(
+        sh.n_minor as u64,
+        reader.n_obs(),
+        "a column-major shard's minor axis is rows"
+    );
+
+    // 3. The reader index can tell the two shards apart.
+    let index = BackedCscIndex::from_catalog_for_layer(reader.catalog(), rna_id, "counts");
+    assert_eq!(index.n_shards(), 2);
+    assert_eq!(index.shard_for_col(0), Some(0));
+    assert_eq!(index.shard_for_col(21), Some(1));
+}

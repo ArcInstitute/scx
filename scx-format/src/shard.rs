@@ -177,14 +177,28 @@ impl ShardHeader {
 
 /// Derive the on-disk `shard_type` byte from a `SectionType`.
 ///
-/// Returns `1` for `CscShard` (column-major) and `0` for everything else
-/// (CSR, layer CSR, obsp CSR). Used by writer call sites to label shards
-/// correctly in their 76-byte headers.
+/// Returns `1` for the column-major section types (`CscShard` and its layer
+/// sibling `LayerCscShard`) and `0` for everything else (CSR, layer CSR,
+/// obsp CSR). Used by writer call sites to label shards correctly in their
+/// 76-byte headers.
 pub fn derive_shard_type(section_type: SectionType) -> u8 {
     match section_type {
-        SectionType::CscShard => 1,
+        SectionType::CscShard | SectionType::LayerCscShard => 1,
         _ => 0,
     }
+}
+
+/// Whether a section type stores its data column-major.
+///
+/// The one place that question is answered. `LayerCscShard` (id 16) used to
+/// be column-major to some callers and row-major to others — including within
+/// a single write→read round trip — because each site matched `CscShard`
+/// alone and there was no producer to force them to agree.
+pub fn is_column_major(section_type: SectionType) -> bool {
+    matches!(
+        section_type,
+        SectionType::CscShard | SectionType::LayerCscShard
+    )
 }
 
 impl ShardHeader {
@@ -196,7 +210,7 @@ impl ShardHeader {
     /// shards (the catalog `section_type == CscShard` is what made them
     /// CSC). The catalog wins when the byte disagrees.
     pub fn is_csc(&self, catalog_section_type: SectionType) -> bool {
-        self.shard_type == 1 || catalog_section_type == SectionType::CscShard
+        self.shard_type == 1 || is_column_major(catalog_section_type)
     }
 
     /// Strict v2 validation: when the catalog tags a shard as CSC,
@@ -211,7 +225,7 @@ impl ShardHeader {
     /// disagreement is corruption: surface a clear error rather than
     /// quietly accept it.
     pub fn validate_csc_strict(&self, catalog_section_type: SectionType) -> Result<()> {
-        if catalog_section_type == SectionType::CscShard && self.shard_type != 1 {
+        if is_column_major(catalog_section_type) && self.shard_type != 1 {
             return Err(ScxError::InvalidShardType {
                 expected: 1,
                 got: self.shard_type,

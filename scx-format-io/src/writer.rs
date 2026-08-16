@@ -1100,10 +1100,10 @@ impl ScxWriter {
         // u32 here on a CSC shard is read-correct even when the file
         // header says u16.
         let index_max_value: u64 = match section_type {
-            SectionType::CscShard => self.header.n_obs.saturating_sub(1),
             // Raw is row-major but has its OWN column axis (`raw_n_vars`),
             // independent of `header.n_vars`.
             SectionType::RawCsrShard => self.raw_n_vars.saturating_sub(1),
+            st if crate::shard::is_column_major(st) => self.header.n_obs.saturating_sub(1),
             _ => row_major_n_minor.saturating_sub(1),
         };
         let index_dtype_u16 = index_max_value <= u16::MAX as u64;
@@ -1183,8 +1183,8 @@ impl ScxWriter {
                 // shards use the per-modality column count resolved
                 // above so multimodal files stamp the correct extent.
                 let header_n_minor = match section_type {
-                    SectionType::CscShard => self.header.n_obs,
                     SectionType::RawCsrShard => self.raw_n_vars,
+                    st if crate::shard::is_column_major(st) => self.header.n_obs,
                     _ => row_major_n_minor,
                 };
                 if header_n_minor > u32::MAX as u64 {
@@ -1236,16 +1236,22 @@ impl ScxWriter {
         self.current_offset += section_length;
 
         // Compute shard stats from raw values. Dispatch on section
-        // type: CSC shards use the column-major axis (the file-wide
-        // `n_obs` is the unbound row range, shared across modalities),
-        // all others use the row-major axis with the per-modality
-        // column extent resolved at the top of this function.
-        // `row_start` here is interpreted on the major axis — for CSC
-        // paths it carries `col_start` (see `write_csc_shard`, which
-        // passes its `col_start` argument as the inner `row_start`).
+        // type: column-major shards use the column-major axis (the
+        // file-wide `n_obs` is the unbound row range, shared across
+        // modalities), all others use the row-major axis with the
+        // per-modality column extent resolved at the top of this
+        // function. `row_start` here is interpreted on the major axis —
+        // for column-major paths it carries `col_start` (see
+        // `write_csc_shard`, which passes its `col_start` argument as
+        // the inner `row_start`).
+        //
+        // `is_column_major` rather than a bare `CscShard` arm, here and in
+        // the two dispatches above: `LayerCscShard` is a CSC sidecar too,
+        // and matching only `CscShard` wrote its stats on the row axis
+        // while the readers looked for them on the column axis.
         let (major_kind, n_minor) = match section_type {
-            SectionType::CscShard => (MajorAxis::Col, self.header.n_obs),
             SectionType::RawCsrShard => (MajorAxis::Row, self.raw_n_vars),
+            st if crate::shard::is_column_major(st) => (MajorAxis::Col, self.header.n_obs),
             _ => (MajorAxis::Row, row_major_n_minor),
         };
         let stats = compute_shard_stats(

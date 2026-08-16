@@ -2881,8 +2881,8 @@ impl BackedCscIndex {
             .filter(|e| e.section_type == SectionType::CscShard && e.modality_id == modality_id)
             .filter_map(|e| {
                 e.stats.as_ref().map(|s| CscShardRange {
-                    col_start: s.major_start(SectionType::CscShard),
-                    col_end: s.major_end(SectionType::CscShard),
+                    col_start: s.major_start(e.section_type),
+                    col_end: s.major_end(e.section_type),
                     sorted_shard_idx: 0,
                 })
             })
@@ -2918,8 +2918,8 @@ impl BackedCscIndex {
             })
             .filter_map(|e| {
                 e.stats.as_ref().map(|s| CscShardRange {
-                    col_start: s.major_start(SectionType::CscShard),
-                    col_end: s.major_end(SectionType::CscShard),
+                    col_start: s.major_start(e.section_type),
+                    col_end: s.major_end(e.section_type),
                     sorted_shard_idx: 0,
                 })
             })
