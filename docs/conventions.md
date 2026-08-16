@@ -42,7 +42,7 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   `dense[base + col]` or `col_sums[col]` with no check of their own. **Do not
   add a per-consumer bounds check against the same axis**: it is redundant, it
   costs a branch in a hot loop, and — worse — where two kernels are each other's
-  oracle (the streaming statistics pair in `backed.rs` and `prefetch.rs`)
+  oracle (the streaming statistics pair in `backed/aggregate.rs` and `prefetch.rs`)
   guarding only one makes them disagree on precisely the malformed input where
   their agreement is the evidence. If a new decode path is added that bypasses
   those seams, it owes the same check; `reader/matrix.rs`'s block-index row-run path is

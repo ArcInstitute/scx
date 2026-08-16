@@ -1,7 +1,9 @@
 //! Deletion vectors and detection bitmaps: the reads that honour a
 //! logically-deleted row.
 //!
-//! Feature-gated on `deletion-vectors` in its entirety.
+//! Feature-gated on `deletion-vectors` in its entirety — at the `mod filtered;`
+//! declaration in `reader/mod.rs`, so no item in here carries its own `#[cfg]`
+//! and none can be added without one by accident.
 
 use super::*;
 
@@ -9,7 +11,6 @@ impl ScxReader {
     /// Phase 5b: read a single detection-bitmap shard by index, scoped
     /// to a modality (`modality_id == 0` for unimodal files). Shards
     /// are ordered by `row_start`, matching the CSR shard order.
-    #[cfg(feature = "deletion-vectors")]
     pub fn read_bitmap_shard_for(
         &self,
         modality_id: u8,
@@ -27,13 +28,11 @@ impl ScxReader {
 
     /// Phase 5b: unimodal helper — equivalent to
     /// `read_bitmap_shard_for(0, shard_idx)`.
-    #[cfg(feature = "deletion-vectors")]
     pub fn read_bitmap_shard(&self, shard_idx: usize) -> Result<crate::bitmap::BitmapShard> {
         self.read_bitmap_shard_for(0, shard_idx)
     }
 
     /// Number of bitmap shards available for a modality (0 if none).
-    #[cfg(feature = "deletion-vectors")]
     pub fn bitmap_shard_count(&self, modality_id: u8) -> usize {
         self.full_catalog
             .bitmap_shards_for_modality(modality_id)
@@ -117,7 +116,6 @@ impl ScxReader {
     /// being wrong alone — so the two must always move together. When the file
     /// has no deletion vectors (or nothing is deleted) this returns exactly what
     /// `read_obs()` returns, with no copy.
-    #[cfg(feature = "deletion-vectors")]
     pub fn read_obs_filtered(&self) -> Result<RecordBatch> {
         let obs = self.read_obs()?;
         match self.deletion_keep_mask()? {
@@ -129,7 +127,6 @@ impl ScxReader {
     /// Read all CSR shards with deletion vectors applied.
     /// Deleted rows are excluded from the returned ScxCsr.
     /// If no deletion vectors are present, returns the same result as `read_all_csr_shards()`.
-    #[cfg(feature = "deletion-vectors")]
     pub fn read_all_csr_shards_filtered(&self) -> Result<ScxCsr> {
         let csr = self.read_all_csr_shards()?;
         self.filter_csr_rows_by_deletion_vectors(csr, crate::deletion_vectors::DV_GLOBAL)
@@ -143,7 +140,6 @@ impl ScxReader {
     /// so each modality's filtered CSR has `n_obs - n_deleted` rows; a scoped
     /// (`modality_id >= 1`) bitmap, when present, additionally drops that
     /// modality's rows.
-    #[cfg(feature = "deletion-vectors")]
     pub fn read_all_csr_shards_for_filtered(&self, modality_id: u8) -> Result<ScxCsr> {
         let csr = self.read_all_csr_shards_for(modality_id)?;
         self.filter_csr_rows_by_deletion_vectors(csr, modality_id)
@@ -155,7 +151,6 @@ impl ScxReader {
     ///
     /// Layers must share X's row count (an AnnData invariant); the whole-cell
     /// row-keep mask is applied to the layer CSR.
-    #[cfg(feature = "deletion-vectors")]
     pub fn read_layer_filtered(&self, name: &str) -> Result<ScxCsr> {
         let csr = self.read_layer(name)?;
         self.filter_csr_rows_by_deletion_vectors(csr, crate::deletion_vectors::DV_GLOBAL)
@@ -164,7 +159,6 @@ impl ScxReader {
     /// Apply deletion vectors to an already-assembled CSR (X or layer), using
     /// the keep mask for `modality_id` (global-only for `DV_GLOBAL`). The mask
     /// is obs-indexed, so the input CSR must share X's row count.
-    #[cfg(feature = "deletion-vectors")]
     fn filter_csr_rows_by_deletion_vectors(&self, csr: ScxCsr, modality_id: u8) -> Result<ScxCsr> {
         // The keep mask is obs-indexed; the input CSR (X or a layer) shares
         // X's row count, so the mask aligns with its rows.

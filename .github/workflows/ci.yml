@@ -431,6 +431,43 @@ jobs:
             exit 1
           fi
 
+      # ORG-4.9-7: one LRU eviction loop and one singleflight, both in
+      # `scx-format-io/src/backed/cache.rs`. There were three of the first and
+      # two of the second: `CscCache` (count-only, no singleflight at all) and
+      # `DenseLruCache` (a ~55-line transcription of `get_or_decode`, down to
+      # the re-check under `in_flight`). They differed only in how a payload is
+      # measured in bytes, which is now `SizeHint`.
+      #
+      # `pop_lru()` is the fingerprint of a fourth eviction loop and
+      # `LeaderGuard {` of a third singleflight — constructing the guard is the
+      # step that makes a thread a leader.
+      - name: One shard-cache eviction loop and one singleflight
+        run: |
+          if grep -rEn --include='*.rs' '\.pop_lru\(\)|LeaderGuard[[:space:]]*\{' . \
+               | grep -vE 'scx-format-io/src/backed/cache\.rs' \
+               | grep -vE '(_tests\.rs|/tests/)' \
+               | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::LRU eviction or singleflight leadership outside backed/cache.rs — drive ShardCache::get_or_decode instead of restating it."
+            exit 1
+          fi
+      # The negative grep cannot see a reader that grows its own cache without
+      # naming either token. This is the positive half: each of the three
+      # readers must reach its cache through the shared type.
+      #
+      # Scanned only up to the first `#[cfg(test)]`, so a test that drives
+      # ShardCache cannot satisfy a guard about the production path — the
+      # mistake round 2 of #439 caught in the catalog guard above.
+      - name: All three backed readers share one ShardCache
+        run: |
+          set -e
+          for f in csr csc dense; do
+            if ! sed '/#\[cfg(test)\]/,$d' "scx-format-io/src/backed/$f.rs" \
+                 | grep -qE 'get_or_decode[[:space:]]*\('; then
+              echo "::error::backed/$f.rs no longer decodes through ShardCache::get_or_decode — that is how a second singleflight gets written."
+              exit 1
+            fi
+          done
+
   feature-check:
     name: Feature matrix (cargo check)
     runs-on: ubuntu-latest
@@ -480,18 +517,24 @@ jobs:
           # surfaced hours into a SLURM job instead of in CI.
           - flags: "-p scx-gpu --features bench --bin gpu_bench"
             name: "scx-gpu --features bench (gpu_bench bin)"
-          # scx-format-io with `parallel` off. The `test` job runs default
-          # features, so until this lane existed no CI job compiled the
-          # sequential side of the reader at all -- and Phase 3a moved every
-          # `#[cfg(feature = "parallel")]` in reader.rs across a module
-          # boundary. `--lib` deliberately, not `--all-targets`: the test
-          # target does not build with `parallel` off and did not before this
-          # lane either (backed_tests.rs names rayon and set_cpu_pool
-          # unconditionally). Fixing that is worth doing and is not this lane's
-          # job; a lane that covers the library is strictly better than the
-          # nothing that came before.
-          - flags: "-p scx-format-io --no-default-features --features deletion-vectors --lib"
+          # scx-format-io's three non-default feature configurations. The `test`
+          # job runs default features (`parallel` + `deletion-vectors`), so
+          # without these no CI job compiles the sequential reader or the
+          # deletion-vector-free build at all.
+          #
+          # `--all-targets`, not the `--lib` the first of these used to carry:
+          # this job runs check + clippy, and without `--all-targets` neither
+          # reaches the test target. `--lib` was there because the test target
+          # did not compile with `parallel` off; it does now, and compiling it
+          # is the point -- that is what surfaced three dead-code warnings and
+          # two tests that *fail* without `parallel` (the prefetch bit-identity
+          # pair, on their own vacuity guard, now gated with it).
+          - flags: "-p scx-format-io --no-default-features --features deletion-vectors --all-targets"
             name: "scx-format-io (parallel off)"
+          - flags: "-p scx-format-io --no-default-features --features parallel --all-targets"
+            name: "scx-format-io (deletion-vectors off)"
+          - flags: "-p scx-format-io --no-default-features --all-targets"
+            name: "scx-format-io (neither feature)"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

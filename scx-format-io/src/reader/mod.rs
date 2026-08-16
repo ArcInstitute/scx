@@ -110,6 +110,11 @@ pub struct ScxReader {
 
 // `metadata`, not `arrow`: a module named `arrow` inside this crate shadows
 // the `arrow` crate for every path in the subtree.
+// Gated as a whole rather than item-by-item: every item in it is a deletion-
+// vector or detection-bitmap read. Eight of the eleven carried their own
+// `#[cfg]` and three did not, so the module's own "feature-gated in its
+// entirety" header was false and `--no-default-features` did not build.
+#[cfg(feature = "deletion-vectors")]
 mod filtered;
 mod integrity;
 mod matrix;
