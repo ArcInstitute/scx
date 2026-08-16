@@ -45,7 +45,7 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   oracle (the streaming statistics pair in `backed.rs` and `prefetch.rs`)
   guarding only one makes them disagree on precisely the malformed input where
   their agreement is the evidence. If a new decode path is added that bypasses
-  those seams, it owes the same check; `reader.rs`'s block-index row-run path is
+  those seams, it owes the same check; `reader/matrix.rs`'s block-index row-run path is
   the existing example.
 
   Three carve-outs, all narrow:

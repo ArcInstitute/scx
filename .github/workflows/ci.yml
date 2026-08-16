@@ -195,6 +195,78 @@ jobs:
             fi
           done
 
+      # ORG-4.9-5: row-major CSR shards are stitched together in exactly one
+      # place, `scx-format-io/src/reader/matrix.rs::assemble_row_major`, and the
+      # two checks every such body needs live in `plan_row_major_layout` and
+      # `check_decoded_lengths` beside it. The cost of the alternative is on
+      # record: there were four hand-rolled copies (three in reader.rs, one in
+      # typed_read.rs that the review did not even count), carrying four copies
+      # of the same `checked_sub` and twelve of the same three length checks --
+      # so a bounds fix could land in three of four places.
+      #
+      # `row_end.checked_sub(` is the fingerprint of a fifth copy: deriving a
+      # shard's row count from catalog stats is exactly what the shared layout
+      # planner is for. Test files may name it in a comment about the guard.
+      - name: Row-major shard layout is derived only in reader/matrix.rs
+        run: |
+          if grep -rEn --include='*.rs' 'row_end\.checked_sub\(|length mismatch: catalog stats' . \
+               | grep -vE 'scx-format-io/src/reader/matrix\.rs' \
+               | grep -vE '(_tests\.rs|/tests/)' \
+               | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::row-major shard layout arithmetic outside reader/matrix.rs — call plan_row_major_layout / check_decoded_lengths instead of restating them."
+            exit 1
+          fi
+      # The negative grep above cannot see a body that re-derives the layout
+      # without naming checked_sub. This is the positive half: every consumer
+      # must be reached from the shared helpers.
+      #
+      # Scanned only up to the first `#[cfg(test)]` in each file. reader_tests.rs
+      # constructs assemblers directly, so a whole-file grep would stay green on
+      # a production path that had stopped using them as long as a test still
+      # did — the guard would be satisfied by the thing it is supposed to check.
+      # (This is the mistake round 2 of #439 caught in the catalog guard above.)
+      - name: Every row-major assembler is built from the shared helpers
+        run: |
+          set -e
+          # reader/matrix.rs owns the one assembler and must call both helpers.
+          for h in plan_row_major_layout check_decoded_lengths; do
+            if ! sed '/#\[cfg(test)\]/,$d' scx-format-io/src/reader/matrix.rs \
+                 | grep -qE "$h[[:space:]]*\("; then
+              echo "::error::reader/matrix.rs no longer calls $h — the row-major layout checks must stay in one place."
+              exit 1
+            fi
+          done
+          # typed_read.rs assembles at a narrowed dtype and is the copy the
+          # review missed; it must keep calling the same two helpers rather than
+          # growing its own again.
+          for h in plan_row_major_layout check_decoded_lengths; do
+            if ! sed '/#\[cfg(test)\]/,$d' scx-format-io/src/typed_read.rs \
+                 | grep -qE "$h[[:space:]]*\("; then
+              echo "::error::typed_read.rs no longer calls $h — it was a fourth copy of the row-major checks once already."
+              exit 1
+            fi
+          done
+      # §4.7: every ScxReader CSC read funnels through `read_csc_from_entry`,
+      # which is where the sidecar-freshness check lives. Before that it sat on
+      # BackedCscReader's constructors only, and the seven ScxReader CSC paths
+      # served a sidecar built against superseded CSR data in silence.
+      #
+      # Known limit, stated so nobody reads more into a green run than is
+      # there: this catches the call being *deleted* or moved below
+      # `#[cfg(test)]` (both watched failing), not the call being *neutered* --
+      # `if false && ...csc_sidecar_is_fresh()` still satisfies the grep. What
+      # catches neutering is the behavioural test,
+      # `stale_csc_sidecar_is_refused_on_every_reader_csc_path`. The grep is a
+      # structural tripwire layered over that test, not a replacement for it.
+      - name: The CSC read funnel checks sidecar freshness
+        run: |
+          if ! sed '/#\[cfg(test)\]/,$d' scx-format-io/src/reader/matrix.rs \
+               | grep -A 20 'fn read_csc_from_entry' \
+               | grep -qE 'csc_sidecar_is_fresh[[:space:]]*\('; then
+            echo "::error::read_csc_from_entry no longer checks csc_sidecar_is_fresh — every ScxReader CSC path funnels through it (§4.7)."
+            exit 1
+          fi
+
       # §10.1: a numpy borrow is not GIL-bound and does not clear numpy's
       # WRITEABLE flag, so a `&[T]` taken from one must never be read after the
       # GIL is released. `GilHeldCsrSlices` is the single borrowed-buffer
@@ -395,6 +467,18 @@ jobs:
           # surfaced hours into a SLURM job instead of in CI.
           - flags: "-p scx-gpu --features bench --bin gpu_bench"
             name: "scx-gpu --features bench (gpu_bench bin)"
+          # scx-format-io with `parallel` off. The `test` job runs default
+          # features, so until this lane existed no CI job compiled the
+          # sequential side of the reader at all -- and Phase 3a moved every
+          # `#[cfg(feature = "parallel")]` in reader.rs across a module
+          # boundary. `--lib` deliberately, not `--all-targets`: the test
+          # target does not build with `parallel` off and did not before this
+          # lane either (backed_tests.rs names rayon and set_cpu_pool
+          # unconditionally). Fixing that is worth doing and is not this lane's
+          # job; a lane that covers the library is strictly better than the
+          # nothing that came before.
+          - flags: "-p scx-format-io --no-default-features --features deletion-vectors --lib"
+            name: "scx-format-io (parallel off)"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

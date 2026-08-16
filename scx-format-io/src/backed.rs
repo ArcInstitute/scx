@@ -2084,7 +2084,11 @@ impl BackedCsrReader {
             for &idx in &misses {
                 self.read_shard_cached_arc(idx)?;
             }
-            return Ok(());
+            // Tail expression, not `return`: with `parallel` off the block
+            // below is cfg'd away and this one is the function body's tail, so
+            // `return` is what clippy calls needless — a lint only the new
+            // parallel-off CI lane can see.
+            Ok(())
         }
 
         #[cfg(feature = "parallel")]
