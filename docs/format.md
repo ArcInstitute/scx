@@ -229,6 +229,18 @@ sidecar whose counters disagree (v1–v3 files default both to `0`, so
 Unknown types are skipped by readers with a warning, which allows the
 format to evolve without breaking old readers.
 
+A reader MUST resolve the `section_type` byte **before** it decodes the
+entry's `stats` payload, and skip the entry without decoding them. The
+ordering is the whole of the guarantee: a future section type is free to
+carry a stats blob in whatever layout suits it, including one shorter than
+today's, and decoding first turns that into a parse failure for the entire
+catalog — and so for every section in the file, since the catalog is the only
+index to them. Skipping is per-entry; it never costs the file.
+
+Skipping is not preservation. An entry with an unknown `section_type` is
+dropped from the in-memory catalog, so any operation that rewrites the file
+(`compact`, `optimize`, `merge`) drops the section with it.
+
 #### `adata.raw` (raw section family)
 
 `adata.raw` holds pre-normalization counts on its **own var axis** (usually more
@@ -268,19 +280,30 @@ it is what lets a reader assume any `uns_blob` it encounters is parseable.
 
 ### Per-shard statistics
 
-Present when `section_type ∈ {csr_shard, csc_shard, layer_csr_shard, obsp_csr_shard}`:
+Present on the sharded matrix section types — `csr_shard`, `csc_shard`,
+`layer_csr_shard`, `layer_csc_shard`, `obsp_csr_shard`, `raw_csr_shard` — and,
+with only the row range populated, on the row-sharded metadata types
+`obs_metadata_shard` / `var_metadata_shard`.
+
+`catalog_version` selects the layout. v1 wrote 41 bytes before the per-column
+tail and carried no explicit column range; v2 inserted `col_start` / `col_end`
+after `row_end`, for 57. Writers emit v2 unconditionally (`FullCatalog::write_to`
+raises the declared version to at least 2 on serialise), so v1 stats appear
+only in files written before that:
 
 ```
-row_start: u64                   (first row, global)
-row_end:   u64                   (exclusive end, global)
+row_start: u64                   (major-axis start; see below)
+row_end:   u64                   (exclusive end)
+col_start: u64                   (v2 only)
+col_end:   u64                   (v2 only)
 nnz:       u64
 value_min: u32                   (integer encodings only)
 value_max: u32
 value_sum: u64
 n_indexed_columns: u8
 For each indexed column:
-  column_name_hash: u64          (BLAKE3 truncated)
   stat_type: u8                  (0 = numeric min/max, 1 = category bitset)
+  column_name_hash: u64          (BLAKE3 truncated)
   If numeric:
     col_min: f64
     col_max: f64
@@ -288,6 +311,21 @@ For each indexed column:
     bitset_length: u16
     category_bitset: [u8]        (bit i set if dictionary index i present)
 ```
+
+`stat_type` precedes `column_name_hash`, not the other way round — this
+document had the two transposed against every file ever written.
+
+**Which pair carries the meaningful range** depends on whether the section is
+column-major (`csc_shard`, `layer_csc_shard`) or row-major (everything else).
+A v2 row-major shard puts its row range in the row pair and `[0, n_vars)` in
+the column pair; a v2 column-major shard puts its column range in the column
+pair and `[0, n_obs)` in the row pair. v1 column-major shards axis-overloaded
+the row pair — the column range was written there — and readers reconcile that
+at catalog-parse time, so `col_start` / `col_end` are populated either way.
+
+The entry's `stats_length: u16` prefix is authoritative: a reader must not
+consume past it, and bytes it does not consume are forward-compat padding
+rather than the start of the next entry.
 
 `value_min` / `value_max` / `value_sum` are meaningful **only** for integer
 value encodings (uint8/16/32). For float encodings (f32, f16) they are zero
@@ -502,9 +540,9 @@ Code accessing these fields should pick by section type:
 
 | Method | When to use |
 |--------|-------------|
-| `ShardStats::major_start()` / `major_end()` | Generic — works for any shard type, returns the row range for CSR/Layer/Obsp and the col range for CSC. Use when the section type is unknown or when writing axis-agnostic helpers. |
+| `ShardStats::major_start()` / `major_end()` | Generic — works for any shard type, returning the row range for row-major sections and the column range for the column-major ones (`CscShard`, `LayerCscShard`; see `shard::is_column_major`). Use when the section type is unknown or when writing axis-agnostic helpers. |
 | `ShardStats::row_range()` | When the entry is known to be a row-major shard (`CsrShard`, `LayerCsrShard`, `ObspCsrShard`). |
-| `ShardStats::col_range()` | When the entry is known to be `CscShard`. |
+| `ShardStats::col_range()` | When the entry is known to be column-major (`CscShard`, `LayerCscShard`). |
 | Direct `ShardStats.row_start` field access | Allowed in legacy code paths but discouraged — prefer the accessors above. |
 
 A future format-version bump may rename the underlying fields (e.g. to
