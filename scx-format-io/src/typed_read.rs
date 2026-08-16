@@ -13,8 +13,9 @@
 //!   so counts above `2²⁴` materialize losslessly (where the f32 path rounds).
 //!
 //! The default (`csr`/`f32`/`i32`) plan is served by the untouched zero-copy
-//! path in `reader.rs`; callers gate on [`MaterializePlan::is_default_csr_f32`]
-//! and only route non-default plans here.
+//! path in `reader/matrix.rs`; callers gate on
+//! [`MaterializePlan::is_default_csr_f32`] and only route non-default plans
+//! here.
 
 use std::ops::Range;
 

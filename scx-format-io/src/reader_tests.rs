@@ -2000,6 +2000,43 @@ fn multi_shard_assembly_is_pinned() {
     );
 }
 
+/// The assembler's `madvise` hint is computed from raw catalog offsets, before
+/// `section_bytes` gets a chance to reject the entry. `e.offset + e.length` was
+/// a bare `u64` add and `max_end - min_offset` a bare `usize` subtract, so a
+/// catalog with an absurd offset panicked the reader in debug (overflow) or
+/// wrapped in release and then underflowed the subtraction.
+///
+/// A readahead hint is advisory, so the right answer is to skip it rather than
+/// to fail: the entry is still rejected a moment later by `section_bytes`,
+/// which is where a bad offset should surface. What must not happen is a panic
+/// — `docs/conventions.md`: readers return errors on malformed input.
+///
+/// `read_all_raw_csr_shards` newly reaches this block: before the assemblers
+/// were unified its hand-rolled body issued no hint at all.
+#[test]
+fn a_hostile_catalog_offset_does_not_panic_the_madvise_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "hostile_offset.scx", 6, 4, 2, false);
+    let reader = ScxReader::open(&path).unwrap();
+    let shards = reader.catalog().shards_sorted();
+
+    let mut doctored = shards[0].clone();
+    doctored.offset = u64::MAX - 10;
+    doctored.length = 100; // offset + length overflows u64
+
+    for strategy in [
+        RowMajorStrategy::Sequential,
+        #[cfg(feature = "parallel")]
+        RowMajorStrategy::Parallel,
+    ] {
+        let r = assemble_x(&reader, &[&doctored, shards[1]], strategy);
+        assert!(
+            r.is_err(),
+            "{strategy:?}: an out-of-bounds shard offset must be an error"
+        );
+    }
+}
+
 /// A catalog whose `stats.nnz` disagrees with the decoded shard length must
 /// return `Err` from both assemble paths, not panic. Before the fix the
 /// decoded-vs-catalog length checks were `debug_assert_eq!` (compiled out in
@@ -3154,8 +3191,17 @@ fn bump_data_generation_on_disk(path: &std::path::Path) {
 /// Review §4.7: `check_csc_sidecar_fresh` was called from `BackedCscReader`'s
 /// constructors and nowhere else, so every `ScxReader` CSC read served a stale
 /// sidecar without complaint — the silent wrong answer the v4 generation
-/// counters exist to prevent. All five of those paths funnel through
-/// `read_csc_from_entry`, which is where the check belongs.
+/// counters exist to prevent.
+///
+/// The check does **not** live on `read_csc_from_entry`, which is where this
+/// test first put it on the reasoning that every CSC read funnels through it.
+/// Two funnel around it: the framed arm of `read_csc_columns` decodes via
+/// `decode_block_index_row_runs` and `continue`s, and `scx upgrade` copies a
+/// sidecar with `read_shard_from_entry`, then re-stamps it at the output's
+/// generation — turning a detectable stale sidecar into an undetectable one.
+/// So the guard sits at the four decode entry points instead, and this test
+/// runs both arms and the raw decoders. See
+/// `ScxReader::guard_csc_sidecar_fresh`.
 #[test]
 fn stale_csc_sidecar_is_refused_on_every_reader_csc_path() {
     for framed in [false, true] {

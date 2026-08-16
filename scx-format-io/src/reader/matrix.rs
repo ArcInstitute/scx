@@ -1280,15 +1280,31 @@ impl ScxReader {
         // Hint aggressive readahead across the shard region.
         // Use min/max of file offsets since shards are sorted by row_start,
         // not file offset — they may not be contiguous after append/compact.
+        //
+        // Entirely checked, and silent on failure. This runs on raw catalog
+        // values *before* `section_bytes` has had a chance to reject them, so
+        // `offset + length` on a hostile catalog overflowed `u64` (panic in
+        // debug, wrap in release, then an underflowing `max_end - min_offset`)
+        // — a panic on malformed input, in a reader. A readahead hint is
+        // advisory, so skipping it is the correct degradation: the bad entry is
+        // still rejected a moment later by `section_bytes`, which is where an
+        // out-of-range offset should surface.
         #[cfg(unix)]
         {
-            let min_offset = shards.iter().map(|e| e.offset as usize).min().unwrap();
+            let min_offset = shards.iter().map(|e| e.offset).min().unwrap_or(0);
             let max_end = shards
                 .iter()
-                .map(|e| (e.offset + e.length) as usize)
+                .filter_map(|e| e.offset.checked_add(e.length))
                 .max()
-                .unwrap();
-            self.advise_sequential(min_offset, max_end - min_offset);
+                .unwrap_or(0);
+            if let (Ok(start), Some(len)) = (
+                usize::try_from(min_offset),
+                max_end
+                    .checked_sub(min_offset)
+                    .and_then(|n| usize::try_from(n).ok()),
+            ) {
+                self.advise_sequential(start, len);
+            }
         }
 
         let shard_sizes = plan_row_major_layout(shards, labels)?;

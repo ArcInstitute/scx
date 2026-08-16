@@ -57,7 +57,7 @@ pub fn downcast_large_types(batch: &RecordBatch) -> Result<RecordBatch> {
 /// that need a schema for predicate parsing without paying to decode
 /// the full IPC batch. The local `ScxReader::read_obs_schema` already
 /// achieves the same effect by routing through its fast/slow path
-/// (see `scx-format/src/reader.rs`).
+/// (see `scx-format-io/src/reader/metadata.rs`).
 pub fn downcast_large_types_schema(schema: &Schema) -> Schema {
     let new_fields: Vec<Field> = schema
         .fields()

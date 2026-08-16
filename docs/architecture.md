@@ -454,9 +454,13 @@ Opens a file via `mmap` and validates magic/version/checksums:
 ```
 
 `open_with_shared_catalog` reuses a sibling reader's `Arc<FullCatalog>` and runs
-the same steps except 4, cross-checking `manifest_sequence` instead. It refuses
-a `catalog_version < 2` catalog: `open()` finishes by backfilling v1
-`col_start`/`col_end`, and the shared path holds an `Arc` it cannot mutate.
+the same steps except 4, cross-checking `manifest_sequence` instead. `open()`
+finishes by backfilling v1 `col_start`/`col_end`, which the shared path cannot
+do — it holds an `Arc` it cannot mutate — so it *verifies* that backfill has
+happened rather than assuming it: a v1 catalog whose row-major entries still
+report `col_end == 0` is refused. Note `reconcile_v1_csr_col_range` does not bump
+`catalog_version`, so a reconciled catalog still reports 1; refusing on the
+version instead of the invariant would reject every v1 file `open()` accepts.
 
 All section access is via offset+length from the catalog — no sequential scanning.
 
