@@ -2965,8 +2965,9 @@ pub fn clear_csr_shard_column_stats_for(
 /// `None` clears every column; `Some(hashes)` clears only those.
 ///
 /// `n_indexed_columns` is rewritten from `column_stats.len()` rather than
-/// decremented: `LazyShardStats` uses the count to decide whether to retain the
-/// variable-length tail at all, so the two drifting apart is a decode bug.
+/// decremented: [`ShardStats::read_from`] loops exactly `n_indexed_columns`
+/// times over the stats payload, so a count that disagrees with the vector
+/// desynchronises the decode — it stops early or runs into the next field.
 ///
 /// The `as u8` cannot truncate, and deliberately does not become a `try_from`
 /// that panics — this crate returns errors rather than panicking, and there is

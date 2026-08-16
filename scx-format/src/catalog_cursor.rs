@@ -2,7 +2,7 @@
 //!
 //! ORG-4.9-1. Review §4.9's finding is that the same wire format was decoded
 //! by more than one hand-written walk, and §4.2 is what that cost: they had
-//! drifted on the order of two steps. [`FullCatalog::read_from`] decoded an
+//! drifted on the order of two steps. [`FullCatalog::read_from`](crate::catalog::FullCatalog::read_from) decoded an
 //! entry's `ShardStats` *before* resolving its `SectionType`, so a file
 //! carrying a section type this reader does not know — with a stats blob
 //! shorter than the current layout — failed to parse **at all**. Not the

@@ -38,8 +38,10 @@ use crate::section::SectionType;
 /// hot path. The diagnostic / pushdown-only fields the full struct
 /// carries (`value_min` / `value_max` / `value_sum`,
 /// `n_indexed_columns`, `column_stats`) are dropped here; callers that
-/// need them go through [`crate::catalog::LazyShardStats`] (lazy
-/// `column_stats` decode) or [`crate::catalog::ShardStats`] (eager).
+/// need them go through [`crate::catalog::ShardStats`], or hold the
+/// undecoded payload from
+/// [`RawEntry::stats_bytes`](crate::catalog_cursor::RawEntry) and decode
+/// on demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardStatsLite {
     /// Major-axis start. For row-major shards: `row_start`. For v2

@@ -161,7 +161,8 @@ fn stats_len(entries: &[crate::catalog::FullCatalogEntry], name: &str) -> usize 
 }
 
 /// `n_indexed_columns` and `column_stats.len()` must agree after any clear:
-/// `LazyShardStats` trusts the count to decide whether to decode the tail.
+/// `ShardStats::read_from` loops exactly `n_indexed_columns` times, so a
+/// drifted pair desynchronises the stats decode on read-back.
 fn assert_counts_agree(entries: &[crate::catalog::FullCatalogEntry]) {
     for e in entries {
         if let Some(s) = e.stats.as_ref() {
