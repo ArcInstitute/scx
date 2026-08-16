@@ -1706,6 +1706,136 @@ fn multimodal_fallback_does_not_mix_modalities() {
     );
 }
 
+/// Characterization: what `BackedCsrReader::new` — the *unscoped* constructor —
+/// does on a multimodal file. Nothing pinned this before, and the answer is
+/// surprising enough to be worth a test rather than a reading of the source.
+///
+/// `::new` builds its index from `CatalogView::csr_shards_sorted()`, which
+/// filters on `section_type == CsrShard` with **no `modality_id` predicate**.
+/// On a two-modality file that means one index over *both* modalities' shards,
+/// whose row ranges overlap (each modality independently tiles `[0, n_obs)`),
+/// while `n_vars` comes from the file header — the max across modalities, not
+/// any one modality's. `for_modality` is the scoped constructor and is what
+/// every production caller uses (`pyscx/src/experiment.rs`,
+/// `pyscx/src/backed/multimodal.rs`, `pyscx/src/convert/multimodal.rs`,
+/// `scx-convert/src/export_filter.rs`).
+///
+/// This test asserts today's behaviour, deliberately. It is not an endorsement
+/// — it is the tripwire that makes a change to it visible, and the safety net
+/// for the `backed.rs` split in Phase 3b.
+#[test]
+fn backed_csr_reader_new_on_a_multimodal_file_folds_every_modality() {
+    use crate::modality::ModalityType;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multimodal_unscoped.scx");
+
+    // The two modalities have DIFFERENT column counts, so "which n_vars did
+    // the reader take?" has an observable answer.
+    let n_obs: u64 = 4;
+    const RNA_VARS: u64 = 3;
+    const ATAC_VARS: u64 = 5;
+    let header = sample_header(n_obs, ATAC_VARS, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs as usize)).unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let atac_id = writer
+        .add_modality(
+            "atac",
+            ModalityType::Atac,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna_id, &sample_var(RNA_VARS as usize))
+        .unwrap();
+    writer
+        .write_var_for(atac_id, &sample_var(ATAC_VARS as usize))
+        .unwrap();
+    writer.set_modality_n_vars(rna_id, RNA_VARS).unwrap();
+    writer.set_modality_n_vars(atac_id, ATAC_VARS).unwrap();
+
+    // RNA values 11..=14 at column 0; ATAC values 21..=24 at column 4. The
+    // disjoint value ranges make "whose rows came back?" answerable.
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &[0, 1, 2, 3, 4],
+            &[0, 0, 0, 0],
+            &[11, 12, 13, 14],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer
+        .write_csr_shard_for(
+            atac_id,
+            &[0, 1, 2, 3, 4],
+            &[4, 4, 4, 4],
+            &[21, 22, 23, 24],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let unscoped = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
+
+    // 1. The index spans BOTH modalities: two shards, and their row ranges
+    //    overlap because each modality tiles [0, n_obs) independently.
+    assert_eq!(
+        unscoped.index().n_shards(),
+        2,
+        "::new indexes every CsrShard regardless of modality"
+    );
+    assert_eq!(unscoped.index().shard_range(0), Some((0, 4)));
+    assert_eq!(
+        unscoped.index().shard_range(1),
+        Some((0, 4)),
+        "the two modalities' row ranges overlap — this is the shape of the trap"
+    );
+
+    // 2. `shape` is header-derived, so it reports 4 rows while the index
+    //    covers 8 shard-rows. The pair disagreeing is the finding.
+    assert_eq!(
+        unscoped.shape(),
+        (4, ATAC_VARS as usize),
+        "n_obs from the header; n_vars is the file-wide max, not RNA's 3"
+    );
+
+    // 3. `read_all` concatenates every shard, so it returns 8 rows for a
+    //    4-cell file, with both modalities' values folded together.
+    let all = unscoped.read_all().unwrap();
+    assert_eq!(
+        all.shape,
+        (8, ATAC_VARS as usize),
+        "read_all folds both modalities: 4 RNA rows + 4 ATAC rows"
+    );
+    assert_eq!(
+        all.data,
+        vec![11.0, 12.0, 13.0, 14.0, 21.0, 22.0, 23.0, 24.0]
+    );
+    assert_eq!(all.indices, vec![0, 0, 0, 0, 4, 4, 4, 4]);
+
+    // 4. The scoped constructor is the one that answers per modality.
+    let rna = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), rna_id, 0);
+    assert_eq!(rna.shape(), (4, RNA_VARS as usize));
+    let rna_rows = rna.read_rows(0, 4).unwrap();
+    assert_eq!(rna_rows.data, vec![11.0, 12.0, 13.0, 14.0]);
+    assert_eq!(rna_rows.shape, (4, RNA_VARS as usize));
+}
+
 /// Write a fixture `.scx` at an explicit path (peer of `write_test_file_and_open`
 /// that returns nothing — the caller opens its own reader(s)).
 fn write_fixture_at(path: &std::path::Path, n_obs: usize, n_vars: usize, n_shards: usize) {

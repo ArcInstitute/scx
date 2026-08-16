@@ -1789,6 +1789,207 @@ fn test_parallel_matches_sequential() {
     assert_eq!(sequential.data, parallel.data);
 }
 
+// -----------------------------------------------------------------------
+// Multi-shard concatenation (the assemblers' running row/nnz offsets)
+// -----------------------------------------------------------------------
+
+/// One row's nonzeros. `(global_row % 4) + 1` entries at columns walking by 3
+/// from `global_row % n_vars`, values derived from the global row index.
+///
+/// Two properties are load-bearing: the per-row nnz **varies**, so a shard's
+/// nnz cannot be recovered from its row count; and every value is distinct
+/// enough that a nonzero landing in the wrong row shows up as a value
+/// mismatch rather than cancelling out. Values are never 0 — a 0 would be
+/// indistinguishable from an untouched slot in a freshly zeroed buffer, which
+/// is exactly the failure a mis-computed offset produces.
+fn irregular_row(global_row: usize, n_vars: usize) -> (Vec<u32>, Vec<u8>) {
+    let nnz = (global_row % 4) + 1;
+    // n_vars must exceed 3 * 3 for these to stay distinct without a dedup.
+    assert!(
+        n_vars > 9,
+        "irregular_row needs n_vars > 9 to avoid collisions"
+    );
+    let cols: Vec<u32> = (0..nnz)
+        .map(|k| ((global_row + k * 3) % n_vars) as u32)
+        .collect();
+    let mut sorted = cols.clone();
+    sorted.sort_unstable();
+    let values: Vec<u8> = sorted
+        .iter()
+        .enumerate()
+        .map(|(k, _)| ((global_row * 7 + k * 3) % 200 + 1) as u8)
+        .collect();
+    (sorted, values)
+}
+
+/// Write `shard_rows.len()` CSR shards with the given per-shard row counts,
+/// and return the assembled `(indptr, indices, data)` the reader must produce
+/// — computed here by walking the rows linearly, independently of any
+/// assembler.
+fn write_irregular_shards(
+    writer: &mut ScxWriter,
+    shard_rows: &[usize],
+    n_vars: usize,
+    raw: bool,
+) -> (Vec<i64>, Vec<i32>, Vec<f32>) {
+    let mut exp_indptr = vec![0i64];
+    let mut exp_indices: Vec<i32> = Vec::new();
+    let mut exp_data: Vec<f32> = Vec::new();
+
+    let mut row_start = 0usize;
+    for &rows in shard_rows {
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<u8> = Vec::new();
+        for local in 0..rows {
+            let (cols, vals) = irregular_row(row_start + local, n_vars);
+            indptr.push(indptr.last().unwrap() + cols.len() as u64);
+            exp_indptr.push(exp_indptr.last().unwrap() + cols.len() as i64);
+            for (c, v) in cols.iter().zip(vals.iter()) {
+                indices.push(*c);
+                values.push(*v);
+                exp_indices.push(*c as i32);
+                exp_data.push(*v as f32);
+            }
+        }
+        if raw {
+            writer
+                .write_raw_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_start as u64,
+                )
+                .unwrap();
+        } else {
+            writer
+                .write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_start as u64,
+                )
+                .unwrap();
+        }
+        row_start += rows;
+    }
+    (exp_indptr, exp_indices, exp_data)
+}
+
+/// Multi-shard concatenation is pinned by nothing else in the tree. Every one
+/// of the golden files under `tests/reference_files/` is written with a
+/// *single* `write_csr_shard` call (`golden_files.rs`), so the goldens
+/// exercise decode and never exercise the running row / nnz offsets that
+/// stitch shards together — and the backed reader reads shards one at a time,
+/// so it does not cover them either.
+///
+/// That is the arithmetic a unification of the assemblers most easily breaks,
+/// and it breaks into *shifted output*, not into an error: a wrong offset
+/// writes a valid-looking CSR whose rows are off by one. Hence exact
+/// `(indptr, indices, data)` assertions against a linearly computed
+/// expectation, on every assembler that concatenates.
+///
+/// The geometry is deliberately irregular — shard row counts `[3, 7, 1, 5]`,
+/// per-row nnz cycling `1..=4`, and a one-row shard in the middle — because
+/// uniform shards make an off-by-one in a prefix sum invisible.
+#[test]
+fn multi_shard_assembly_is_pinned() {
+    const SHARD_ROWS: &[usize] = &[3, 7, 1, 5];
+    const N_VARS: usize = 11;
+    const RAW_N_VARS: usize = 13;
+    let n_obs: usize = SHARD_ROWS.iter().sum();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("irregular_multi_shard.scx");
+
+    // `has_raw` is re-derived from the catalog at finalize, so it needs no
+    // explicit set here.
+    let header = sample_header(n_obs as u64, N_VARS as u64, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(N_VARS)).unwrap();
+    let (exp_indptr, exp_indices, exp_data) =
+        write_irregular_shards(&mut writer, SHARD_ROWS, N_VARS, false);
+
+    // The raw matrix has its OWN, different column count. Assembling it
+    // against `header.n_vars` instead of `raw_n_vars` is a distinct way to
+    // get this wrong, so pin it in the same fixture.
+    writer.set_raw_n_vars(RAW_N_VARS as u64);
+    writer.write_raw_var(&sample_var(RAW_N_VARS)).unwrap();
+    let (raw_indptr, raw_indices, raw_data) =
+        write_irregular_shards(&mut writer, SHARD_ROWS, RAW_N_VARS, true);
+    writer.finish().unwrap();
+
+    // Premise: the fixture really is multi-shard with irregular geometry, and
+    // the per-shard nnz really do differ. Without this the assertions below
+    // could pass against a single-shard file and prove nothing.
+    let reader = ScxReader::open(&path).unwrap();
+    let shards = reader.catalog().shards_sorted();
+    assert_eq!(
+        shards.len(),
+        SHARD_ROWS.len(),
+        "fixture must be multi-shard"
+    );
+    let per_shard_nnz: Vec<u64> = shards
+        .iter()
+        .map(|e| e.stats.as_ref().unwrap().nnz)
+        .collect();
+    assert!(
+        per_shard_nnz
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1,
+        "shards must differ in nnz or a wrong offset stays invisible: {per_shard_nnz:?}"
+    );
+    assert!(exp_indptr.windows(2).any(|w| w[1] - w[0] != 1));
+
+    let expect = |label: &str, csr: &ScxCsr, n_cols: usize, ip: &[i64], ix: &[i32], d: &[f32]| {
+        assert_eq!(csr.shape, (n_obs, n_cols), "{label}: shape");
+        assert_eq!(csr.indptr, ip, "{label}: indptr");
+        assert_eq!(csr.indices, ix, "{label}: indices");
+        assert_eq!(csr.data, d, "{label}: data");
+    };
+
+    expect(
+        "read_all_csr_shards",
+        &reader.read_all_csr_shards().unwrap(),
+        N_VARS,
+        &exp_indptr,
+        &exp_indices,
+        &exp_data,
+    );
+    expect(
+        "assemble_shards",
+        &reader.assemble_shards(&shards).unwrap(),
+        N_VARS,
+        &exp_indptr,
+        &exp_indices,
+        &exp_data,
+    );
+    #[cfg(feature = "parallel")]
+    expect(
+        "assemble_shards_parallel",
+        &reader.assemble_shards_parallel(&shards).unwrap(),
+        N_VARS,
+        &exp_indptr,
+        &exp_indices,
+        &exp_data,
+    );
+    expect(
+        "read_all_raw_csr_shards",
+        &reader.read_all_raw_csr_shards().unwrap(),
+        RAW_N_VARS,
+        &raw_indptr,
+        &raw_indices,
+        &raw_data,
+    );
+}
+
 /// A catalog whose `stats.nnz` disagrees with the decoded shard length must
 /// return `Err` from both assemble paths, not panic. Before the fix the
 /// decoded-vs-catalog length checks were `debug_assert_eq!` (compiled out in
@@ -2532,4 +2733,107 @@ fn deletion_mask_matching_the_csr_still_filters() {
 
     let csr = reader.read_all_csr_shards_filtered().unwrap();
     assert_eq!(csr.shape.0, 5, "one of six rows was deleted");
+}
+
+// -----------------------------------------------------------------------
+// Zero-row shards, at file level
+// -----------------------------------------------------------------------
+
+/// The review asked for a zero-row *framed* shard round trip. Since §4.6 that
+/// is impossible by construction — `encode_shard_framed` returns
+/// `ZeroRowFramedShard` at write (`encoder.rs`), which is the fix. What §4.6
+/// left uncovered is the arm it deliberately kept legal: an **unframed**
+/// zero-row shard. `encoder.rs::zero_row_unframed_shard_is_still_accepted`
+/// proves the encoder accepts one; nothing writes it to a real file and reads
+/// it back.
+///
+/// Both shapes matter to the assemblers. A lone zero-row shard is the
+/// empty-matrix case an `optimize` / `subset` output can produce; a zero-row
+/// shard *between* two populated ones is what a delete-everything-in-a-shard
+/// rewrite produces, and it is the one that walks an assembler's running row
+/// and nnz offsets past a contributor of size 0.
+#[test]
+fn zero_row_unframed_shards_round_trip_through_a_file() {
+    // (a) a file whose only shard is zero-row.
+    let dir = tempfile::tempdir().unwrap();
+    let only = dir.path().join("only_zero_row.scx");
+    let mut header =
+        FileHeader::new_single_modality(0, 2, 0, crate::DEFAULT_SHARD_TARGET_ROWS, 0, 0);
+    header.format_version = 3;
+    let mut writer = ScxWriter::new(&only, header).unwrap();
+    writer.write_var(&sample_var(2)).unwrap();
+    writer
+        .write_csr_shard(&[0u64], &[], &[], CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = ScxReader::open(&only).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape, (0, 2));
+    assert_eq!(csr.indptr, vec![0]);
+    assert!(csr.indices.is_empty());
+    assert!(csr.data.is_empty());
+
+    // (b) a zero-row shard sandwiched between two populated ones. Rows
+    //     0..2 from shard 0, nothing from shard 1, rows 2..5 from shard 2.
+    let sandwich = dir.path().join("zero_row_sandwich.scx");
+    let mut header =
+        FileHeader::new_single_modality(5, 2, 5, crate::DEFAULT_SHARD_TARGET_ROWS, 0, 0);
+    header.format_version = 3;
+    let mut writer = ScxWriter::new(&sandwich, header).unwrap();
+    writer.write_var(&sample_var(2)).unwrap();
+    writer
+        .write_csr_shard(
+            &[0u64, 1, 2],
+            &[0u32, 1],
+            &[7u8, 8],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer
+        .write_csr_shard(&[0u64], &[], &[], CodecId::None, ValueEncoding::Uint8, 2)
+        .unwrap();
+    writer
+        .write_csr_shard(
+            &[0u64, 1, 2, 3],
+            &[1u32, 0, 1],
+            &[9u8, 10, 11],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            2,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = ScxReader::open(&sandwich).unwrap();
+    // Premise: the middle shard really is zero-row on disk. Without this the
+    // assertions below would also pass on a two-shard file.
+    let shards = reader.catalog().shards_sorted();
+    assert_eq!(shards.len(), 3, "fixture must keep the empty shard");
+    assert!(
+        shards.iter().any(|e| {
+            let s = e.stats.as_ref().unwrap();
+            s.row_end == s.row_start && s.nnz == 0
+        }),
+        "one shard must be genuinely zero-row"
+    );
+
+    let check = |label: &str, csr: &ScxCsr| {
+        assert_eq!(csr.shape, (5, 2), "{label}: shape");
+        assert_eq!(csr.indptr, vec![0, 1, 2, 3, 4, 5], "{label}: indptr");
+        assert_eq!(csr.indices, vec![0, 1, 1, 0, 1], "{label}: indices");
+        assert_eq!(csr.data, vec![7.0, 8.0, 9.0, 10.0, 11.0], "{label}: data");
+    };
+    check(
+        "read_all_csr_shards",
+        &reader.read_all_csr_shards().unwrap(),
+    );
+    check("assemble_shards", &reader.assemble_shards(&shards).unwrap());
+    #[cfg(feature = "parallel")]
+    check(
+        "assemble_shards_parallel",
+        &reader.assemble_shards_parallel(&shards).unwrap(),
+    );
 }

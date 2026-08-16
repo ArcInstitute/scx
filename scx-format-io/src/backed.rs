@@ -915,6 +915,17 @@ impl BackedCsrReader {
     /// `cache_shards`: number of decoded shards to cache (0 = no cache).
     /// Equivalent to [`Self::new_with_byte_budget`] with `bytes_budget =
     /// usize::MAX` — no byte cap.
+    ///
+    /// # Not modality-scoped
+    ///
+    /// This indexes **every** `CsrShard` in the catalog regardless of
+    /// `modality_id`, and takes `n_vars` from the file header (the max across
+    /// modalities). On a multimodal file that means one index over overlapping
+    /// row ranges — each modality independently tiles `[0, n_obs)` — so
+    /// `read_all` returns `Σ modalities` rows for an `n_obs`-cell file. Use
+    /// [`Self::for_modality`] for per-modality access; every production caller
+    /// does. Pinned by
+    /// `backed_csr_reader_new_on_a_multimodal_file_folds_every_modality`.
     pub fn new(reader: ScxReader, cache_shards: usize) -> Self {
         Self::new_with_byte_budget(reader, cache_shards, usize::MAX)
     }
