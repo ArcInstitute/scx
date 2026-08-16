@@ -1,3 +1,5 @@
+use super::cache::WeightedLruCache;
+use super::csc::check_csc_sidecar_fresh;
 use super::*;
 use crate::encoder::encode_one_shard;
 use crate::header::FileHeader;
