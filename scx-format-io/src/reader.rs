@@ -149,6 +149,11 @@ type ShardOutputSlices<'a> = (&'a mut [i64], &'a mut [i32], &'a mut [f32]);
 /// exactly the property the `split_at_mut` carve-up is responsible for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RowMajorStrategy {
+    /// Constructed by [`Self::for_build`] when the `parallel` feature is off,
+    /// and by `parallel_matches_sequential`, which runs both arms against one
+    /// file. With `parallel` on, production never picks it — hence the
+    /// feature-conditional allow rather than a blanket one.
+    #[cfg_attr(feature = "parallel", allow(dead_code))]
     Sequential,
     #[cfg(feature = "parallel")]
     Parallel,
@@ -2268,16 +2273,16 @@ impl ScxReader {
                 ))
             })?;
 
-        // Serial, deliberately: this is what the hand-rolled body did, and
-        // keeping it here makes the switch to the build's default strategy a
-        // one-line, separately attributable change rather than something
-        // smuggled into a de-duplication.
+        // Same strategy as every other whole-matrix read. Until this was
+        // unified, raw was the one path that stayed serial even in a parallel
+        // build — not by decision, but because it was a third inlined copy
+        // that nobody updated when the other two gained the rayon fan-out.
         self.assemble_row_major(
             &shards,
             raw_n_vars,
             (self.header.n_obs as usize, 0),
             RAW_LABELS,
-            RowMajorStrategy::Sequential,
+            RowMajorStrategy::for_build(),
         )
     }
 
