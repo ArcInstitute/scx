@@ -155,88 +155,229 @@ impl RowSetCtx<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The shared tree walk
+//
+// Both evaluators recurse over the same `Predicate` tree and differ only in
+// what a node evaluates *to*: a Kleene `BooleanArray` over a decoded batch
+// (`MaskAlgebra`) or an exactly-resolved `Option<RowSet>` read out of the index
+// (`RowSetAlgebra`). Only the recursion is shared — each instance keeps its own
+// leaves AND its own combinator kernels, because that is where they genuinely
+// differ.
+//
+// ⚠️ **What this does and does not buy.** Be precise here, because two
+// plausible-sounding claims are both false.
+//
+// It does NOT make the two evaluators agree, and it would NOT have prevented
+// §5.1 (the row-set path deliberately restricted to reproduce the mask path's
+// non-Kleene `or`). That was a *combinator kernel choice* inside one instance,
+// and each instance still picks its own — as it must, since `or_kleene` and
+// `RowSet::union` are not interchangeable. The thing that catches a divergence
+// is the independent oracle in `tests/rowset_differential.rs`.
+//
+// It also does NOT add the "a new `Predicate` variant cannot be silently
+// mishandled" property. That was already true: `eval_inner` and `eval_rowset`
+// were each exhaustive with no `_` arm. Measured by adding a variant — five
+// compile errors before this refactor, six after, the sixth being `walk`
+// itself.
+//
+// What it buys is narrower: the descent is written once instead of twice, and
+// the two evaluators' actual difference is now legible as what it is — seven
+// leaves and three combinator kernels — rather than something you infer by
+// diffing two fifty-line matches.
+//
+// The unification is deliberately not the `(definitely, maybe)` lattice that
+// would make numeric leaves narrowable. That is a redesign, not a refactor: it
+// needs B+ tree range narrowing the index does not have.
+// ---------------------------------------------------------------------------
+
+/// One interpretation of a [`Predicate`] tree. See the section header above.
+trait PredicateAlgebra {
+    type Value;
+
+    /// Evaluate a non-combinator node. [`walk`] never passes `And` / `Or` /
+    /// `Not` here.
+    fn leaf(&self, pred: &Predicate) -> Result<Self::Value>;
+
+    fn and(&self, a: Self::Value, b: Self::Value) -> Result<Self::Value>;
+    fn or(&self, a: Self::Value, b: Self::Value) -> Result<Self::Value>;
+    fn not(&self, a: Self::Value) -> Result<Self::Value>;
+
+    /// Whether `v` already determines the enclosing `And` / `Or`, so the other
+    /// operand need not be evaluated.
+    ///
+    /// This exists to preserve `eval_rowset`'s original `?` short-circuit
+    /// exactly: a residual operand makes the whole node residual, and walking
+    /// the sibling would be pure but pointless index work. `MaskAlgebra` takes
+    /// the default — the mask evaluator never short-circuited, because both
+    /// Kleene kernels need both operands.
+    fn absorbing(&self, _v: &Self::Value) -> bool {
+        false
+    }
+}
+
+/// Recurse over `pred` under `alg`.
+///
+/// The match is exhaustive over `Predicate` with no `_` arm, so a new variant
+/// is a compile error here rather than being silently routed to `leaf` — where
+/// a combinator would hit `unreachable!` at runtime.
+fn walk<A: PredicateAlgebra>(pred: &Predicate, alg: &A) -> Result<A::Value> {
+    match pred {
+        Predicate::And(a, b) => {
+            let left = walk(a, alg)?;
+            if alg.absorbing(&left) {
+                return Ok(left);
+            }
+            let right = walk(b, alg)?;
+            alg.and(left, right)
+        }
+        Predicate::Or(a, b) => {
+            let left = walk(a, alg)?;
+            if alg.absorbing(&left) {
+                return Ok(left);
+            }
+            let right = walk(b, alg)?;
+            alg.or(left, right)
+        }
+        Predicate::Not(inner) => {
+            let v = walk(inner, alg)?;
+            alg.not(v)
+        }
+        Predicate::Eq(_, _)
+        | Predicate::Ne(_, _)
+        | Predicate::Lt(_, _)
+        | Predicate::Gt(_, _)
+        | Predicate::Le(_, _)
+        | Predicate::Ge(_, _)
+        | Predicate::In(_, _) => alg.leaf(pred),
+    }
+}
+
+/// Resolve leaves straight from the obs predicate index. `None` is *residual* —
+/// "this node is not exactly resolvable here" — not "no rows".
+struct RowSetAlgebra<'a, 'b> {
+    ctx: &'a RowSetCtx<'b>,
+}
+
+impl PredicateAlgebra for RowSetAlgebra<'_, '_> {
+    type Value = Option<RowSet>;
+
+    fn leaf(&self, pred: &Predicate) -> Result<Self::Value> {
+        let ctx = self.ctx;
+        Ok(match pred {
+            Predicate::Eq(col, ScalarValue::Utf8(v)) => {
+                // `categorical_eq` returns None iff the column is not an indexed
+                // categorical (residual); Some(&[]) iff indexed but value absent
+                // (exact empty row-set). That second reading is only a row-set at
+                // all when the vocabulary is the column's complete value set.
+                if !ctx.resolvable(col) {
+                    return Ok(None);
+                }
+                let Some(ranges) = ctx.index.categorical_eq(col, v) else {
+                    return Ok(None);
+                };
+                ctx.shard_ranges_to_rowset(ranges)
+            }
+            // Eq on a categorical column with a non-string literal cannot match
+            // a string category; only string equality is index-resolvable here.
+            Predicate::Eq(_, _) => None,
+            Predicate::In(col, vals) => {
+                // Only index-resolvable if the column is an indexed categorical
+                // whose vocabulary is complete (see the `Eq` arm).
+                if ctx.index.indexed_kind(col) != Some(crate::index::IndexKind::Categorical)
+                    || !ctx.resolvable(col)
+                {
+                    return Ok(None);
+                }
+                // Every member must be resolvable, or the whole predicate is
+                // residual. A non-string member against a string-valued
+                // categorical index is *unknown*, not provably absent: skipping
+                // it and returning the union of the members that did resolve
+                // silently narrows the result. That is not hypothetical — a file
+                // written by an earlier version indexed an integer-valued
+                // categorical as an entry-less `CategoricalIndex`, so
+                // `batch in [1, 2]` resolved to an exact **empty** row set.
+                if vals.iter().any(|v| !matches!(v, ScalarValue::Utf8(_))) {
+                    return Ok(None);
+                }
+                let mut acc = RowSet::empty();
+                for v in vals {
+                    if let ScalarValue::Utf8(s) = v {
+                        let Some(ranges) = ctx.index.categorical_eq(col, s) else {
+                            return Ok(None);
+                        };
+                        let Some(rs) = ctx.shard_ranges_to_rowset(ranges) else {
+                            return Ok(None);
+                        };
+                        acc = acc.union(&rs);
+                    }
+                }
+                Some(acc)
+            }
+            // Residual in v1 (see module docs): Ne (null-complement hazard),
+            // numeric comparisons (conservative B+ tree leaves).
+            //
+            // A numeric leaf bounds a row range by `[min_value, max_value]`; it
+            // does not say which row holds which value. So a range lookup yields
+            // the rows that *may* match, and `eval_rowset` must return the rows
+            // that *do* — `Some` here means exactly resolvable, and the caller
+            // stops evaluating the predicate. Making these resolvable is not a
+            // matter of indexing more finely: it needs the (definitely, maybe)
+            // lattice that would let a residual-but-narrowed answer be expressed
+            // at all. Until then, numeric predicates are narrowed at Level 1 by
+            // the per-shard `MinMax` column stats and then evaluated on the mask
+            // path, and the leaves are kept at shard granularity because that is
+            // the only granularity anything reads them at.
+            Predicate::Ne(_, _)
+            | Predicate::Lt(_, _)
+            | Predicate::Gt(_, _)
+            | Predicate::Le(_, _)
+            | Predicate::Ge(_, _) => None,
+            // `walk` handles these and never routes them here.
+            Predicate::And(_, _) | Predicate::Or(_, _) | Predicate::Not(_) => {
+                unreachable!("walk dispatches combinators")
+            }
+        })
+    }
+
+    fn and(&self, a: Self::Value, b: Self::Value) -> Result<Self::Value> {
+        Ok(match (a, b) {
+            (Some(ra), Some(rb)) => Some(ra.intersect(&rb)),
+            _ => None,
+        })
+    }
+
+    fn or(&self, a: Self::Value, b: Self::Value) -> Result<Self::Value> {
+        // An Or with a residual side can match rows in ANY shard, so it is not
+        // narrowable: both sides must resolve exactly. That is the only
+        // restriction — nullable operand columns are fine, because the union is
+        // exactly the Kleene TRUE-set (see the module header).
+        Ok(match (a, b) {
+            (Some(ra), Some(rb)) => Some(ra.union(&rb)),
+            _ => None,
+        })
+    }
+
+    /// `Not` is residual in v1: the categorical index omits null rows, so
+    /// complementing its TRUE-set would wrongly re-include them.
+    fn not(&self, _a: Self::Value) -> Result<Self::Value> {
+        Ok(None)
+    }
+
+    fn absorbing(&self, v: &Self::Value) -> bool {
+        v.is_none()
+    }
+}
+
 /// Resolve `pred` to an exact global [`RowSet`] using only the index, or `None`
 /// if any node touches a non-indexed column or an op outside the v1 exact
 /// scope (then the whole subtree is residual).
 pub fn eval_rowset(pred: &Predicate, ctx: &RowSetCtx) -> Option<RowSet> {
-    match pred {
-        Predicate::Eq(col, ScalarValue::Utf8(v)) => {
-            // `categorical_eq` returns None iff the column is not an indexed
-            // categorical (residual); Some(&[]) iff indexed but value absent
-            // (exact empty row-set). That second reading is only a row-set at
-            // all when the vocabulary is the column's complete value set.
-            if !ctx.resolvable(col) {
-                return None;
-            }
-            let ranges = ctx.index.categorical_eq(col, v)?;
-            ctx.shard_ranges_to_rowset(ranges)
-        }
-        // Eq on a categorical column with a non-string literal cannot match a
-        // string category; only string equality is index-resolvable here.
-        Predicate::Eq(_, _) => None,
-        Predicate::In(col, vals) => {
-            // Only index-resolvable if the column is an indexed categorical
-            // whose vocabulary is complete (see the `Eq` arm).
-            if ctx.index.indexed_kind(col) != Some(crate::index::IndexKind::Categorical)
-                || !ctx.resolvable(col)
-            {
-                return None;
-            }
-            // Every member must be resolvable, or the whole predicate is
-            // residual. A non-string member against a string-valued
-            // categorical index is *unknown*, not provably absent: skipping
-            // it and returning the union of the members that did resolve
-            // silently narrows the result. That is not hypothetical — a file
-            // written by an earlier version indexed an integer-valued
-            // categorical as an entry-less `CategoricalIndex`, so
-            // `batch in [1, 2]` resolved to an exact **empty** row set.
-            if vals.iter().any(|v| !matches!(v, ScalarValue::Utf8(_))) {
-                return None;
-            }
-            let mut acc = RowSet::empty();
-            for v in vals {
-                if let ScalarValue::Utf8(s) = v {
-                    let ranges = ctx.index.categorical_eq(col, s)?;
-                    acc = acc.union(&ctx.shard_ranges_to_rowset(ranges)?);
-                }
-            }
-            Some(acc)
-        }
-        Predicate::And(a, b) => {
-            let ra = eval_rowset(a, ctx)?;
-            let rb = eval_rowset(b, ctx)?;
-            Some(ra.intersect(&rb))
-        }
-        Predicate::Or(a, b) => {
-            // An Or with a residual side can match rows in ANY shard, so it is
-            // not narrowable: both sides must resolve exactly. That is the only
-            // restriction — nullable operand columns are fine, because the
-            // union is exactly the Kleene TRUE-set (see the module header).
-            let ra = eval_rowset(a, ctx)?;
-            let rb = eval_rowset(b, ctx)?;
-            Some(ra.union(&rb))
-        }
-        // Residual in v1 (see module docs): Ne/Not (null-complement hazard),
-        // numeric comparisons (conservative B+ tree leaves).
-        //
-        // A numeric leaf bounds a row range by `[min_value, max_value]`; it
-        // does not say which row holds which value. So a range lookup yields
-        // the rows that *may* match, and `eval_rowset` must return the rows
-        // that *do* — `Some` here means exactly resolvable, and the caller
-        // stops evaluating the predicate. Making these resolvable is not a
-        // matter of indexing more finely: it needs the (definitely, maybe)
-        // lattice that would let a residual-but-narrowed answer be expressed
-        // at all. Until then, numeric predicates are narrowed at Level 1 by
-        // the per-shard `MinMax` column stats and then evaluated on the mask
-        // path, and the leaves are kept at shard granularity because that is
-        // the only granularity anything reads them at.
-        Predicate::Ne(_, _)
-        | Predicate::Not(_)
-        | Predicate::Lt(_, _)
-        | Predicate::Gt(_, _)
-        | Predicate::Le(_, _)
-        | Predicate::Ge(_, _) => None,
-    }
+    // `RowSetAlgebra` never returns `Err` — every leaf resolves to `Some`/`None`
+    // from in-memory index lookups. If that ever changes, `None` is the safe
+    // reading: it routes the predicate to the residual decode-and-mask path,
+    // which is slower and always correct.
+    walk(pred, &RowSetAlgebra { ctx }).unwrap_or(None)
 }
 
 impl fmt::Display for Predicate {
@@ -809,58 +950,76 @@ pub fn evaluate(predicate: &Predicate, batch: &RecordBatch) -> Result<BooleanArr
     }
 }
 
-/// Internal evaluator that preserves null identity through the expression tree.
-fn eval_inner(predicate: &Predicate, batch: &RecordBatch) -> Result<BooleanArray> {
-    match predicate {
-        Predicate::Eq(col, val) => eval_comparison(batch, col, val, CmpOp::Eq),
-        Predicate::Ne(col, val) => eval_comparison(batch, col, val, CmpOp::Ne),
-        Predicate::Lt(col, val) => eval_comparison(batch, col, val, CmpOp::Lt),
-        Predicate::Gt(col, val) => eval_comparison(batch, col, val, CmpOp::Gt),
-        Predicate::Le(col, val) => eval_comparison(batch, col, val, CmpOp::Le),
-        Predicate::Ge(col, val) => eval_comparison(batch, col, val, CmpOp::Ge),
-        Predicate::In(col, vals) => {
-            // OR of individual Eq comparisons. Every operand compares the SAME
-            // column, and the comparison helpers propagate null purely from the
-            // input cell (independent of the scalar), so all operands share one
-            // null pattern and the Kleene and non-Kleene kernels agree here.
-            // `or_kleene` is used anyway so the whole evaluator has one rule.
-            let mut result: Option<BooleanArray> = None;
-            for val in vals {
-                let mask = eval_comparison(batch, col, val, CmpOp::Eq)?;
-                result = Some(match result {
-                    None => mask,
-                    Some(prev) => compute::kernels::boolean::or_kleene(&prev, &mask)?,
-                });
+/// Evaluate leaves as Arrow comparison kernels over a decoded batch, keeping
+/// null identity (UNKNOWN) intact through the tree.
+struct MaskAlgebra<'a> {
+    batch: &'a RecordBatch,
+}
+
+impl PredicateAlgebra for MaskAlgebra<'_> {
+    type Value = BooleanArray;
+
+    fn leaf(&self, pred: &Predicate) -> Result<Self::Value> {
+        let batch = self.batch;
+        match pred {
+            Predicate::Eq(col, val) => eval_comparison(batch, col, val, CmpOp::Eq),
+            Predicate::Ne(col, val) => eval_comparison(batch, col, val, CmpOp::Ne),
+            Predicate::Lt(col, val) => eval_comparison(batch, col, val, CmpOp::Lt),
+            Predicate::Gt(col, val) => eval_comparison(batch, col, val, CmpOp::Gt),
+            Predicate::Le(col, val) => eval_comparison(batch, col, val, CmpOp::Le),
+            Predicate::Ge(col, val) => eval_comparison(batch, col, val, CmpOp::Ge),
+            Predicate::In(col, vals) => {
+                // OR of individual Eq comparisons. Every operand compares the
+                // SAME column, and the comparison helpers propagate null purely
+                // from the input cell (independent of the scalar), so all
+                // operands share one null pattern and the Kleene and non-Kleene
+                // kernels agree here. `or_kleene` is used anyway so the whole
+                // evaluator has one rule.
+                let mut result: Option<BooleanArray> = None;
+                for val in vals {
+                    let mask = eval_comparison(batch, col, val, CmpOp::Eq)?;
+                    result = Some(match result {
+                        None => mask,
+                        Some(prev) => compute::kernels::boolean::or_kleene(&prev, &mask)?,
+                    });
+                }
+                // If vals is empty, return all-false
+                Ok(result.unwrap_or_else(|| BooleanArray::from(vec![false; batch.num_rows()])))
             }
-            // If vals is empty, return all-false
-            Ok(result.unwrap_or_else(|| BooleanArray::from(vec![false; batch.num_rows()])))
-        }
-        Predicate::And(a, b) => {
-            let left = eval_inner(a, batch)?;
-            let right = eval_inner(b, batch)?;
-            // `and_kleene`, not `and`: `null AND false` is FALSE (no value of
-            // the unknown operand makes the conjunction true). At the top level
-            // that is indistinguishable from arrow's non-Kleene `and` — both
-            // land on "not matched" — but under a `Not` it is the difference
-            // between `not (null AND false)` being true (correct) and false.
-            Ok(compute::kernels::boolean::and_kleene(&left, &right)?)
-        }
-        Predicate::Or(a, b) => {
-            let left = eval_inner(a, batch)?;
-            let right = eval_inner(b, batch)?;
-            // `or_kleene`, not `or`: `null OR true` is TRUE. Arrow's non-Kleene
-            // `or` returns null whenever either side is null, which the
-            // top-level coalesce turns into `false` — silently dropping a row
-            // whose other operand matched.
-            Ok(compute::kernels::boolean::or_kleene(&left, &right)?)
-        }
-        Predicate::Not(inner) => {
-            let mask = eval_inner(inner, batch)?;
-            // Arrow's `not` is already Kleene-correct: null stays null (NOT
-            // UNKNOWN is UNKNOWN), true→false, false→true.
-            Ok(compute::kernels::boolean::not(&mask)?)
+            // `walk` handles these and never routes them here.
+            Predicate::And(_, _) | Predicate::Or(_, _) | Predicate::Not(_) => {
+                unreachable!("walk dispatches combinators")
+            }
         }
     }
+
+    fn and(&self, a: Self::Value, b: Self::Value) -> Result<Self::Value> {
+        // `and_kleene`, not `and`: `null AND false` is FALSE (no value of the
+        // unknown operand makes the conjunction true). At the top level that is
+        // indistinguishable from arrow's non-Kleene `and` — both land on "not
+        // matched" — but under a `Not` it is the difference between
+        // `not (null AND false)` being true (correct) and false.
+        Ok(compute::kernels::boolean::and_kleene(&a, &b)?)
+    }
+
+    fn or(&self, a: Self::Value, b: Self::Value) -> Result<Self::Value> {
+        // `or_kleene`, not `or`: `null OR true` is TRUE. Arrow's non-Kleene
+        // `or` returns null whenever either side is null, which the top-level
+        // coalesce turns into `false` — silently dropping a row whose other
+        // operand matched.
+        Ok(compute::kernels::boolean::or_kleene(&a, &b)?)
+    }
+
+    fn not(&self, a: Self::Value) -> Result<Self::Value> {
+        // Arrow's `not` is already Kleene-correct: null stays null (NOT UNKNOWN
+        // is UNKNOWN), true→false, false→true.
+        Ok(compute::kernels::boolean::not(&a)?)
+    }
+}
+
+/// Internal evaluator that preserves null identity through the expression tree.
+fn eval_inner(predicate: &Predicate, batch: &RecordBatch) -> Result<BooleanArray> {
+    walk(predicate, &MaskAlgebra { batch })
 }
 
 #[derive(Debug, Clone, Copy)]
