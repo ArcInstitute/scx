@@ -2262,44 +2262,81 @@ fn open_with_shared_catalog_echoes_the_path() {
     );
 }
 
-/// A v1 catalog must not reach `open_with_shared_catalog`.
+/// A v1 catalog that has NOT been reconciled must not reach
+/// `open_with_shared_catalog` — and one that HAS been must still be accepted.
 ///
 /// `open_inner` calls `reconcile_v1_csr_col_range(header.n_vars)` to backfill
 /// `col_start` / `col_end` on v1 row-major entries. The shared path cannot: it
-/// holds an `Arc<FullCatalog>` and the method takes `&mut self`. It is safe
-/// today only because every donor happens to come from an `open_inner` reader
-/// -- an invariant nothing enforces, and one this very test file can violate
-/// by hand (see `test_open_with_shared_catalog_rejects_manifest_mismatch`,
-/// which constructs a catalog directly).
+/// holds an `Arc<FullCatalog>` and the method takes `&mut self`.
 ///
-/// Rather than leave that as a convention, refuse the only version where the
-/// reconciliation is not a no-op. Every v2+ catalog is unaffected, and the
-/// shared-catalog path exists for atlas-scale modern files, none of which are
-/// v1.
+/// The first version of this refused every `catalog_version < 2` catalog, which
+/// was wrong in the direction that matters. `reconcile_v1_csr_col_range` does
+/// not bump `catalog_version` — a reconciled v1 catalog still reports 1 — so
+/// blanket rejection also refused the donors that come straight from
+/// `ScxReader::open()`, and `pyscx.to_anndata(backed=True)` opens X through
+/// this constructor unconditionally. A genuine v1 file that `open()` still
+/// accepts would have failed on that Python surface.
+///
+/// So: verify the invariant instead of rejecting the version. An unreconciled
+/// v1 entry carries `col_end == 0` (v1 stats have no column pair on disk and
+/// `read_from` leaves it zeroed); a reconciled one carries
+/// `col_end == header.n_vars`.
 #[test]
-fn open_with_shared_catalog_rejects_an_unreconciled_v1_catalog() {
+fn open_with_shared_catalog_checks_v1_reconciliation_not_the_version() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_test_file(&dir, "v1_donor.scx", 4, 4, 1, false);
-
     let reader = ScxReader::open(&path).unwrap();
-    let mut catalog = (*reader.catalog_arc()).clone();
-    // Simulate a catalog that never went through the reconciliation: v1, with
-    // the col range that a v1 file's entries would carry on disk.
-    catalog.catalog_version = 1;
-    for e in &mut catalog.entries {
-        if let Some(s) = e.stats.as_mut() {
-            s.col_start = 0;
-            s.col_end = 0;
+    let n_vars = reader.header().n_vars;
+
+    // (a) A reconciled v1 catalog — what `open()` actually hands out for a v1
+    //     file — must be accepted.
+    let mut reconciled = (*reader.catalog_arc()).clone();
+    reconciled.catalog_version = 1;
+    for e in &mut reconciled.entries {
+        if let Some(st) = e.stats.as_mut() {
+            if matches!(
+                e.section_type,
+                SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+            ) {
+                st.col_start = 0;
+                st.col_end = n_vars;
+            }
         }
     }
+    let shared = ScxReader::open_with_shared_catalog(&path, Arc::new(reconciled))
+        .expect("a reconciled v1 catalog is what open() hands out; it must be accepted");
+    assert_eq!(shared.catalog().catalog_version, 1);
+    assert_eq!(shared.read_all_csr_shards().unwrap().shape, (4, 4));
 
-    let msg = match ScxReader::open_with_shared_catalog(&path, Arc::new(catalog)) {
-        Ok(_) => panic!("a v1 catalog must be refused by the shared-catalog path"),
+    // (b) An UNRECONCILED v1 catalog — the state the shared path genuinely
+    //     cannot fix up — must still be refused, with a message that says what
+    //     to call instead.
+    let mut unreconciled = (*reader.catalog_arc()).clone();
+    unreconciled.catalog_version = 1;
+    for e in &mut unreconciled.entries {
+        if let Some(st) = e.stats.as_mut() {
+            if matches!(
+                e.section_type,
+                SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+            ) {
+                st.col_start = 0;
+                st.col_end = 0;
+            }
+        }
+    }
+    let msg = match ScxReader::open_with_shared_catalog(&path, Arc::new(unreconciled)) {
+        Ok(_) => panic!("an unreconciled v1 catalog must be refused"),
         Err(e) => e.to_string(),
     };
     assert!(
-        msg.contains("catalog_version") && msg.contains("open()"),
-        "the error must say which version was refused and what to call instead, got: {msg}"
+        msg.contains("reconcile") && msg.contains("open()"),
+        "the error must name the missing reconciliation and what to call instead, got: {msg}"
+    );
+
+    // (c) A v2+ catalog is untouched by any of this.
+    assert!(
+        ScxReader::open_with_shared_catalog(&path, reader.catalog_arc()).is_ok(),
+        "the ordinary v2+ donor path must be unaffected"
     );
 }
 
@@ -2986,12 +3023,34 @@ fn zero_row_unframed_shards_round_trip_through_a_file() {
 // -----------------------------------------------------------------------
 
 /// Write a small file carrying both a CSR shard and a CSC sidecar.
-fn write_reader_csc_fixture(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+///
+/// `framed` selects the CSC encoding, and it decides which arm of
+/// `read_csc_columns` the file exercises: a row-group-framed (v2) CSC shard
+/// takes the `decode_block_index_row_runs` scatter path, an unframed one takes
+/// the full-decode + `col_slice` path. The freshness fixtures below run both,
+/// because the first version of them ran only the unframed arm and so passed
+/// while the framed arm served a stale sidecar.
+fn write_reader_csc_fixture(
+    dir: &tempfile::TempDir,
+    name: &str,
+    framed: bool,
+) -> std::path::PathBuf {
     let n_obs = 6usize;
     let n_vars = 4usize;
     let path = dir.path().join(name);
-    let header = sample_header(n_obs as u64, n_vars as u64, 0);
+    let mut header = sample_header(n_obs as u64, n_vars as u64, 0);
+    if framed {
+        header.format_version = crate::header::CURRENT_FORMAT_VERSION;
+    }
     let mut writer = ScxWriter::new(&path, header).unwrap();
+    if framed {
+        writer.set_framing(Some(crate::encoder::FramingConfig {
+            row_group_rows: 1,
+            target_nnz: None,
+            trial: false,
+            decode_target: None,
+        }));
+    }
     writer.write_obs(&sample_obs(n_obs)).unwrap();
     writer.write_var(&sample_var(n_vars)).unwrap();
 
@@ -3099,8 +3158,18 @@ fn bump_data_generation_on_disk(path: &std::path::Path) {
 /// `read_csc_from_entry`, which is where the check belongs.
 #[test]
 fn stale_csc_sidecar_is_refused_on_every_reader_csc_path() {
+    for framed in [false, true] {
+        stale_csc_sidecar_is_refused_impl(framed);
+    }
+}
+
+/// `framed` picks which arm of `read_csc_columns` runs: the framed (v2) shard
+/// takes the `decode_block_index_row_runs` scatter path, the unframed one the
+/// full-decode + `col_slice` path. The first version of this fixture ran only
+/// the unframed arm, so it passed while the scatter arm served a stale sidecar.
+fn stale_csc_sidecar_is_refused_impl(framed: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_reader_csc_fixture(&dir, "stale_csc.scx");
+    let path = write_reader_csc_fixture(&dir, "stale_csc.scx", framed);
     bump_data_generation_on_disk(&path);
 
     let reader = ScxReader::open(&path).unwrap();
@@ -3132,6 +3201,41 @@ fn stale_csc_sidecar_is_refused_on_every_reader_csc_path() {
         "read_csc_columns_subset_for",
         reader.read_csc_columns_subset_for(0, &[0, 3]),
     );
+
+    // The raw decode entry points, not just the CSC-shaped wrappers. `scx
+    // upgrade` copies a sidecar forward with `read_shard_from_entry` and then
+    // re-stamps it at the output's generation, which turns a *detectable*
+    // stale sidecar into an undetectable one — strictly worse than not
+    // checking. Guarding only the wrappers leaves that path open.
+    let csc_entry = reader.catalog().csc_shards_sorted()[0].clone();
+    let raw = |label: &str, r: Result<(Vec<i64>, Vec<i32>, Vec<f32>)>| match r {
+        Ok(_) => panic!("{label}: a stale CSC sidecar must not decode"),
+        Err(e) => assert!(
+            matches!(e, ScxError::StaleCscSidecar { .. }),
+            "{label}: expected StaleCscSidecar, got {e}"
+        ),
+    };
+    raw(
+        "read_shard_from_entry",
+        reader.read_shard_from_entry(&csc_entry),
+    );
+    raw(
+        "read_shard_from_entry_verified",
+        reader.read_shard_from_entry_verified(&csc_entry),
+    );
+    match reader.read_shard_indptr_from_entry(&csc_entry) {
+        Ok(_) => panic!("read_shard_indptr_from_entry: stale sidecar must not decode"),
+        Err(e) => assert!(matches!(e, ScxError::StaleCscSidecar { .. }), "got {e}"),
+    }
+
+    // A CSR entry in the same file must be unaffected — the guard keys on the
+    // entry's section type, not on the file merely having a stale sidecar.
+    let csr_entry = reader.catalog().shards_sorted()[0].clone();
+    assert!(
+        reader.read_shard_from_entry(&csr_entry).is_ok(),
+        "the CSR side of a file with a stale CSC sidecar must still read"
+    );
+    assert!(reader.read_all_csr_shards().is_ok());
 }
 
 /// The accept side. A guard watched only in the red direction is proven to
@@ -3140,8 +3244,14 @@ fn stale_csc_sidecar_is_refused_on_every_reader_csc_path() {
 /// by every path above, and a file with no sidecar at all must be unaffected.
 #[test]
 fn a_fresh_csc_sidecar_is_still_served_on_every_reader_csc_path() {
+    for framed in [false, true] {
+        a_fresh_csc_sidecar_is_still_served_impl(framed);
+    }
+}
+
+fn a_fresh_csc_sidecar_is_still_served_impl(framed: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_reader_csc_fixture(&dir, "fresh_csc.scx");
+    let path = write_reader_csc_fixture(&dir, "fresh_csc.scx", framed);
 
     let reader = ScxReader::open(&path).unwrap();
     assert_eq!(

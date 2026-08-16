@@ -126,6 +126,42 @@ impl ScxReader {
         Ok(Some(table))
     }
 
+    /// Verify that a v1 catalog handed to [`Self::open_with_shared_catalog`]
+    /// has already been through `reconcile_v1_csr_col_range`.
+    ///
+    /// The discriminator: v1 stats carry no column pair on disk, so
+    /// `FullCatalog::read_from` leaves `col_end` at `0`, and the reconciliation
+    /// sets it to the header's `n_vars`. A row-major entry still reporting
+    /// `col_end == 0` on a file with `n_vars > 0` therefore never went through
+    /// it, and its shard ranges would be wrong for any column-projected read.
+    ///
+    /// No-op for v2+, where the column pair is on disk and the reconciliation
+    /// is itself a no-op.
+    fn check_v1_catalog_reconciled(catalog: &FullCatalog, header: &FileHeader) -> Result<()> {
+        if catalog.catalog_version >= 2 || header.n_vars == 0 {
+            return Ok(());
+        }
+        for e in &catalog.entries {
+            if !matches!(
+                e.section_type,
+                SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+            ) {
+                continue;
+            }
+            if let Some(stats) = e.stats.as_ref() {
+                if stats.col_end == 0 {
+                    return Err(ScxError::InvalidCatalog(format!(
+                        "shared catalog is v1 and entry '{}' has not been reconciled \
+                         (col_end 0, expected {}); this path cannot reconcile a shared \
+                         Arc<FullCatalog> — pass a catalog from ScxReader::open()",
+                        e.name, header.n_vars,
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn open_inner(path: impl AsRef<Path>, verify_catalog: bool) -> Result<Self> {
         let path = path.as_ref();
         let mmap = Self::map_with_path_context(path)?;
@@ -200,17 +236,23 @@ impl ScxReader {
     /// open, and the sequence check covers the mutation case the
     /// checksum would otherwise have to catch.
     ///
-    /// # v1 catalogs are refused
+    /// # v1 catalogs must arrive reconciled
     ///
     /// [`Self::open_inner`] finishes by calling
     /// `FullCatalog::reconcile_v1_csr_col_range`, which backfills
     /// `col_start` / `col_end` on v1 row-major entries. This path cannot: it
     /// receives an `Arc<FullCatalog>`, and the reconciliation takes
-    /// `&mut self`. Rather than rely on the convention that every donor
-    /// happens to have come from a full `open()`, a `catalog_version < 2`
-    /// catalog is rejected outright — that is the only version where the
-    /// reconciliation is not a no-op, and no v1 file needs a fast path built
-    /// for atlas-scale modern ones.
+    /// `&mut self`.
+    ///
+    /// So it checks that the reconciliation has already happened, rather than
+    /// assuming it or refusing v1 outright. Refusing outright is what this did
+    /// first, and it was wrong in the direction that matters:
+    /// `reconcile_v1_csr_col_range` does not bump `catalog_version`, so a
+    /// *reconciled* v1 catalog still reports `1` — and every donor that comes
+    /// straight from `ScxReader::open()` is exactly that. `pyscx`'s backed
+    /// conversion opens `X` through this constructor unconditionally, so a
+    /// blanket refusal turned an internal invariant into a user-visible v1
+    /// read-compatibility break.
     ///
     /// # Fork safety
     ///
@@ -225,19 +267,12 @@ impl ScxReader {
     ) -> Result<Self> {
         let path = path.as_ref();
 
-        // See "# v1 catalogs are refused" above. Checked before the mmap so
-        // the caller learns the real reason rather than an I/O error.
-        if catalog.catalog_version < 2 {
-            return Err(ScxError::InvalidCatalog(format!(
-                "shared catalog has catalog_version {} (< 2), whose col_start/col_end \
-                 reconciliation this path cannot perform — use ScxReader::open()",
-                catalog.catalog_version,
-            )));
-        }
-
         let mmap = Self::map_with_path_context(path)?;
 
         let header = FileHeader::read_from(&mut Cursor::new(&mmap[..HEADER_SIZE]))?;
+
+        // See "# v1 catalogs must arrive reconciled" above.
+        Self::check_v1_catalog_reconciled(&catalog, &header)?;
         if header.manifest_sequence != catalog.manifest_sequence {
             return Err(ScxError::InvalidCatalog(format!(
                 "shared catalog manifest_sequence ({}) does not match file header ({}) — \

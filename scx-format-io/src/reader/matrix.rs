@@ -697,18 +697,9 @@ impl ScxReader {
     /// shard payload was BLAKE3-checksummed when the catalog was
     /// verified at `open()`).
     fn read_csc_from_entry(&self, entry: &FullCatalogEntry) -> Result<ScxCsc> {
-        // Review §4.7. Reaching here means a CSC entry exists, so there is a
-        // sidecar to validate. Every `ScxReader` CSC read funnels through this
-        // function, which is why the check lives here rather than at each of
-        // the seven public entry points — the previous arrangement had it on
-        // `BackedCscReader`'s constructors only, and the reader paths served a
-        // sidecar built against superseded data without complaint.
-        if !self.full_catalog.csc_sidecar_is_fresh() {
-            return Err(ScxError::StaleCscSidecar {
-                built_generation: self.full_catalog.csc_build_generation,
-                data_generation: self.full_catalog.data_generation,
-            });
-        }
+        // Freshness is enforced by `guard_csc_sidecar_fresh` inside the decode
+        // entry point below, not here — see that function for why the CSC
+        // wrapper is the wrong place for it.
         let (indptr, indices, data) = self.read_shard_from_entry(entry)?;
         // For CSC: n_major == n_cols_in_shard, indices are global row
         // indices in [0, n_obs). The shard header's n_minor field
@@ -978,6 +969,7 @@ impl ScxReader {
         entry: &FullCatalogEntry,
         runs: &[(usize, usize)],
     ) -> Result<Option<Vec<scx_codec::ScipyShard>>> {
+        self.guard_csc_sidecar_fresh(entry)?;
         let header = self.read_shard_header(entry)?;
         // Only framed shards carry a resolvable multi-entry block index.
         if header.shard_format_version <= crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
@@ -1134,11 +1126,49 @@ impl ScxReader {
         Ok(Some(out))
     }
 
+    /// Reject a decode of a column-major shard whose sidecar was built against
+    /// an earlier generation of the CSR data (review §4.7).
+    ///
+    /// Keyed on the **entry's section type**, so the CSR side of a file with a
+    /// stale sidecar still reads: staleness is a statement about the sidecar,
+    /// not about the file.
+    ///
+    /// # Why here and not on the CSC read wrappers
+    ///
+    /// It was on `read_csc_from_entry` first, on the reasoning that every
+    /// `ScxReader` CSC read funnels through it. Two things funnel around it:
+    ///
+    /// - the framed (v2) arm of [`Self::read_csc_columns`] decodes through
+    ///   [`Self::decode_block_index_row_runs`] and `continue`s, so the whole
+    ///   gene-subset scatter path — the hottest CSC read there is — skipped it;
+    /// - `scx upgrade` copies a sidecar forward with
+    ///   [`Self::read_shard_from_entry`] and then re-stamps it at the output's
+    ///   generation, which converts a *detectable* stale sidecar into an
+    ///   undetectable one. That is strictly worse than not checking.
+    ///
+    /// So the guard belongs at the point where shard payload becomes values,
+    /// which is the four functions below. `section_bytes` would be the broader
+    /// chokepoint but is deliberately not used: `scx info` / `scx validate`
+    /// must still be able to inspect and checksum a file whose sidecar is
+    /// stale, and a byte fetch is not a decode.
+    fn guard_csc_sidecar_fresh(&self, entry: &FullCatalogEntry) -> Result<()> {
+        if crate::shard::is_column_major(entry.section_type)
+            && !self.full_catalog.csc_sidecar_is_fresh()
+        {
+            return Err(ScxError::StaleCscSidecar {
+                built_generation: self.full_catalog.csc_build_generation,
+                data_generation: self.full_catalog.data_generation,
+            });
+        }
+        Ok(())
+    }
+
     fn read_shard_from_entry_inner(
         &self,
         entry: &FullCatalogEntry,
         verify_checksum: bool,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+        self.guard_csc_sidecar_fresh(entry)?;
         #[cfg(debug_assertions)]
         self.debug_counts
             .read_shard_from_entry
@@ -1185,6 +1215,7 @@ impl ScxReader {
         &self,
         entry: &FullCatalogEntry,
     ) -> Result<(Vec<i64>, Vec<u32>, scx_codec::ShardValuesNative)> {
+        self.guard_csc_sidecar_fresh(entry)?;
         let section = self.section_bytes(entry)?;
         crate::shard_decode::decode_shard_bytes_native(
             section,
@@ -1199,6 +1230,7 @@ impl ScxReader {
     /// per-row nnz counts (e.g. the streaming SCX → h5ad export's
     /// `precompute_total_nnz` when a deletion vector is active).
     pub fn read_shard_indptr_from_entry(&self, entry: &FullCatalogEntry) -> Result<Vec<i64>> {
+        self.guard_csc_sidecar_fresh(entry)?;
         let section = self.section_bytes(entry)?;
         crate::shard_decode::decode_shard_indptr_bytes(
             section,
