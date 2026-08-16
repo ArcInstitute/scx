@@ -670,7 +670,7 @@ impl QueryPipeline {
         }
     }
 
-    // -- Accessors for testing and collect.rs --
+    // -- Accessors for testing and the `collect` modules --
 
     /// Access the cached obs schema.
     pub fn obs_schema(&self) -> &Schema {

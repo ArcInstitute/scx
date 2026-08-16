@@ -1,5 +1,5 @@
 //! Regression tests for the engine-side per-shard retry isolation in
-//! `collect.rs::par_map_with_shard_retry`.
+//! `collect::retry::par_map_with_shard_retry`.
 //!
 //! At atlas scale a query fans thousands of shard reads out over rayon. The
 //! pre-fix `collect::<Result<_>>()?` made a *single* shard read that exhausted
@@ -365,7 +365,7 @@ fn deterministic_decode_error_is_not_retried() {
 
 #[test]
 fn query_survives_transient_csr_shard_failure() {
-    // The CSR X-shard decode fan-out (`read_shard_from_entry`, collect.rs Site
+    // The CSR X-shard decode fan-out (`read_shard_from_entry`, collect::execute Site
     // 3) is wrapped by the same per-shard retry as the obs path. A transient
     // decode failure must be recovered, not abort the materialize.
     let dir = TempDir::new().unwrap();

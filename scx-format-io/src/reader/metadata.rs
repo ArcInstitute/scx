@@ -630,7 +630,7 @@ pub fn assemble_sharded_metadata(
 ///
 /// Used by the query engine to rebuild the filtered obs metadata for a
 /// `filter_obs(...).collect()` result while only ever holding the matching
-/// rows in memory — see `scx-engine/src/collect.rs`.
+/// rows in memory — see `scx-engine/src/collect/execute.rs`.
 pub fn assemble_filtered_metadata(
     template_schema: &Arc<arrow::datatypes::Schema>,
     batches: Vec<RecordBatch>,
