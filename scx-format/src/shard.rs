@@ -202,7 +202,9 @@ pub fn derive_shard_type(section_type: SectionType) -> u8 {
 /// `every_section_type_picks_the_same_axis_in_both_view_paths` does the same
 /// for both `CatalogView` construction paths. The writer's own dispatches sit
 /// inside `write_shard_inner` and are reachable only by writing a shard, so
-/// they are covered behaviourally per section type rather than by a sweep.
+/// they are covered behaviourally per section type rather than by a sweep —
+/// which means a future column-major type needs its own writer test, not just
+/// the two lines below.
 ///
 /// Adding a column-major section type is therefore a **two**-line change: this
 /// match, and the non-vacuity count in `column_major_dispatch_is_exhaustive`.

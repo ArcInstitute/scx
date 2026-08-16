@@ -316,10 +316,16 @@ For each indexed column:
 document had the two transposed against every file ever written.
 
 **Which pair carries the meaningful range** depends on whether the section is
-column-major (`csc_shard`, `layer_csc_shard`) or row-major (everything else).
-A v2 row-major shard puts its row range in the row pair and `[0, n_vars)` in
-the column pair; a v2 column-major shard puts its column range in the column
-pair and `[0, n_obs)` in the row pair. v1 column-major shards axis-overloaded
+column-major (`csc_shard`, `layer_csc_shard`) or row-major (the other matrix
+shard types). A v2 row-major matrix shard puts its row range in the row pair
+and `[0, n_vars)` in the column pair; a v2 column-major shard puts its column
+range in the column pair and `[0, n_obs)` in the row pair.
+
+The metadata shard types are the exception, and a reader must not infer a
+column range for them: `obs_metadata_shard` / `var_metadata_shard` carry their
+row range in the row pair and leave the column pair at `0..0`, along with
+`nnz` and the value summaries. They have no CSR value semantics — the row range
+exists only so the query engine can map a metadata shard to its global rows. v1 column-major shards axis-overloaded
 the row pair — the column range was written there — and readers reconcile that
 at catalog-parse time, so `col_start` / `col_end` are populated either way.
 

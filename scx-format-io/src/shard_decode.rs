@@ -1262,9 +1262,12 @@ mod tests {
     /// `csc_build_generation` stamp all live inside `write_shard_inner` and are
     /// reachable only by writing a shard — which needs a per-section-type
     /// writer method, and a hypothetical future column-major type would not
-    /// have one. Those five are covered behaviourally for the types that do
-    /// exist, by `layer_csc_shards_are_column_major_end_to_end` and the CSC
-    /// writer tests.
+    /// have one. For the two types that do exist they are covered
+    /// behaviourally, by `layer_csc_shards_are_column_major_end_to_end` (which
+    /// writes with `n_obs > u16::MAX >= n_vars` so the index-width branch is
+    /// observable, and asserts the `csc_build_generation` stamp) and the CSC
+    /// writer tests. A *future* column-major type would need its own such
+    /// test; this sweep cannot supply one.
     #[test]
     fn column_major_dispatch_is_exhaustive() {
         use crate::shard::{derive_shard_type, is_column_major};

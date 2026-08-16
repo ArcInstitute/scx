@@ -3007,7 +3007,15 @@ fn layer_csc_shards_are_column_major_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("layer_csc.scx");
 
-    let mut writer = ScxWriter::new(&path, sample_header()).unwrap();
+    // `n_obs > u16::MAX >= n_vars` on purpose. A column-major shard's minor
+    // axis is rows, so the index width is decided by `n_obs` and must come out
+    // u32; a regression to the row-major branch would derive it from `n_vars`
+    // and pick u16. With the usual 100 × 50 fixture both branches choose u16
+    // and the dispatch is unobservable — which is exactly the hole a round-3
+    // reviewer found in the first version of this test.
+    let header =
+        FileHeader::new_single_modality(70_000, 50, 500, crate::DEFAULT_SHARD_TARGET_ROWS, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
     writer.write_obs(&sample_obs()).unwrap();
     let rna_id = writer
         .add_modality(
@@ -3090,8 +3098,25 @@ fn layer_csc_shards_are_column_major_end_to_end() {
         reader.n_obs(),
         "a column-major shard's minor axis is rows"
     );
+    assert_eq!(
+        sh.index_dtype,
+        1,
+        "index width must be derived from n_obs ({}) — the minor axis of a \
+         column-major shard — not from n_vars",
+        reader.n_obs()
+    );
 
-    // 3. The reader index can tell the two shards apart.
+    // 3. The CSC-sidecar freshness stamp fires for a layer sidecar too. If this
+    //    dispatch regressed to matching `CscShard` alone, nothing would ever set
+    //    it and the counter would stay 0 — which reads as "no sidecar".
+    let catalog = reader.catalog();
+    assert_ne!(catalog.data_generation, 0);
+    assert_eq!(
+        catalog.csc_build_generation, catalog.data_generation,
+        "writing a layer CSC sidecar must stamp csc_build_generation"
+    );
+
+    // 4. The reader index can tell the two shards apart.
     let index = BackedCscIndex::from_catalog_for_layer(reader.catalog(), rna_id, "counts");
     assert_eq!(index.n_shards(), 2);
     assert_eq!(index.shard_for_col(0), Some(0));
