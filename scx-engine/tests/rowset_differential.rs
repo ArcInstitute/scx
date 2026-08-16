@@ -8,7 +8,7 @@
 //! 2. on the row-set fast path (resolve indexed obs predicates straight from
 //!    the predicate index, no obs-shard decode); and
 //! 3. on the legacy full-decode-and-mask path, forced with
-//!    `SCX_DISABLE_ROWSET_PUSHDOWN`.
+//!    `QueryPipeline::rowset_pushdown(false)`.
 //!
 //! Layers 2 and 3 must agree with each other (X, obs, var, count, exists,
 //! across a range of `limit` values) *and* with layer 1. The differential half
@@ -26,9 +26,13 @@
 //! forcing the residual path), and obs/CSR shard boundaries that COINCIDE (the
 //! atlas case).
 //!
-//! NOTE: this file intentionally contains a single `#[test]` so the
-//! process-global `SCX_DISABLE_ROWSET_PUSHDOWN` env var is toggled without
-//! racing other tests (separate `tests/*.rs` files are separate binaries).
+//! The path selection is **per pipeline** (`QueryPipeline::rowset_pushdown`),
+//! not process-global. It used to be the `SCX_DISABLE_ROWSET_PUSHDOWN` env var,
+//! which forced this file to hold exactly one `#[test]` — cargo runs a test
+//! binary's tests on several threads, so a second test here would have raced
+//! this one's `set_var` and silently compared the wrong two paths. The env var
+//! still seeds the field's default at `QueryPipeline` construction; nothing
+//! reads it per query.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -402,8 +406,16 @@ fn cell_ids_of(batch: &RecordBatch) -> Vec<Option<String>> {
         .collect()
 }
 
-fn run(path: &PathBuf, expr: &str, limit: Option<usize>) -> Captured {
-    let mut p = QueryPipeline::open(path).unwrap().filter_obs(expr).unwrap();
+/// Run one query on the requested path. `pushdown = true` is the row-set fast
+/// path; `false` forces the legacy full-decode path. This is a per-pipeline
+/// setting, so the two arms below cannot interfere with each other — or with
+/// anything else in this binary.
+fn run(path: &PathBuf, expr: &str, limit: Option<usize>, pushdown: bool) -> Captured {
+    let mut p = QueryPipeline::open(path)
+        .unwrap()
+        .rowset_pushdown(pushdown)
+        .filter_obs(expr)
+        .unwrap();
     if let Some(n) = limit {
         p = p.limit(n);
     }
@@ -418,8 +430,12 @@ fn run(path: &PathBuf, expr: &str, limit: Option<usize>) -> Captured {
     }
 }
 
-fn count_exists(path: &PathBuf, expr: &str) -> (usize, bool) {
-    let p = QueryPipeline::open(path).unwrap().filter_obs(expr).unwrap();
+fn count_exists(path: &PathBuf, expr: &str, pushdown: bool) -> (usize, bool) {
+    let p = QueryPipeline::open(path)
+        .unwrap()
+        .rowset_pushdown(pushdown)
+        .filter_obs(expr)
+        .unwrap();
     (p.count().unwrap().matched_rows, p.exists().unwrap())
 }
 
@@ -430,7 +446,6 @@ fn rowset_path_matches_legacy_path() {
 
     // Sanity: with the row-set path ON, a couple of hand-computed expectations
     // cross-check BOTH paths against ground truth.
-    std::env::remove_var("SCX_DISABLE_ROWSET_PUSHDOWN");
     {
         // cell_type == 'T cell': rows where i%7!=0 and i%3==0, MINUS deleted rows
         // (cell_3, cell_18 are deleted T cells) — proves deletion_rowset applies.
@@ -438,7 +453,7 @@ fn rowset_path_matches_legacy_path() {
             .filter(|&i| cell_type_at(i) == Some("T cell") && !is_deleted(i))
             .map(|i| format!("cell_{i}"))
             .collect();
-        let got = run(&path, "cell_type == 'T cell'", None);
+        let got = run(&path, "cell_type == 'T cell'", None, true);
         let got_ids: Vec<String> = got.cell_ids.into_iter().flatten().collect();
         assert_eq!(
             got_ids, expected,
@@ -450,7 +465,7 @@ fn rowset_path_matches_legacy_path() {
         );
 
         // A deleted B cell (cell_1) must be absent too.
-        let b = run(&path, "cell_type == 'B cell'", None);
+        let b = run(&path, "cell_type == 'B cell'", None, true);
         let b_ids: Vec<String> = b.cell_ids.into_iter().flatten().collect();
         assert!(
             !b_ids.contains(&"cell_1".to_string()) && !b_ids.contains(&"cell_16".to_string()),
@@ -458,7 +473,7 @@ fn rowset_path_matches_legacy_path() {
         );
 
         // Absent value -> empty.
-        assert_eq!(run(&path, "cell_type == 'Ghost'", None).n_rows, 0);
+        assert_eq!(run(&path, "cell_type == 'Ghost'", None, true).n_rows, 0);
     }
 
     let limits = [None, Some(1usize), Some(5), Some(13), Some(1000)];
@@ -483,13 +498,10 @@ fn rowset_path_matches_legacy_path() {
 
         for &limit in &limits {
             // Row-set path (default).
-            std::env::remove_var("SCX_DISABLE_ROWSET_PUSHDOWN");
-            let fast = run(&path, &expr, limit);
+            let fast = run(&path, &expr, limit, true);
 
             // Legacy full-decode path.
-            std::env::set_var("SCX_DISABLE_ROWSET_PUSHDOWN", "1");
-            let slow = run(&path, &expr, limit);
-            std::env::remove_var("SCX_DISABLE_ROWSET_PUSHDOWN");
+            let slow = run(&path, &expr, limit, false);
 
             assert_eq!(
                 fast, slow,
@@ -537,11 +549,8 @@ fn rowset_path_matches_legacy_path() {
         }
 
         // count() / exists() parity across paths (limit-independent).
-        std::env::remove_var("SCX_DISABLE_ROWSET_PUSHDOWN");
-        let (fc, fe) = count_exists(&path, &expr);
-        std::env::set_var("SCX_DISABLE_ROWSET_PUSHDOWN", "1");
-        let (sc, se) = count_exists(&path, &expr);
-        std::env::remove_var("SCX_DISABLE_ROWSET_PUSHDOWN");
+        let (fc, fe) = count_exists(&path, &expr, true);
+        let (sc, se) = count_exists(&path, &expr, false);
         assert_eq!((fc, fe), (sc, se), "count/exists mismatch for `{expr}`");
         // exists() must agree with count() > 0 on the fast path.
         assert_eq!(

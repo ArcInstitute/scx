@@ -108,6 +108,11 @@ pub struct QueryPipeline {
     log1p: bool,
     limit: Option<usize>,
     deletion_vectors: Option<DeletionVectors>,
+    /// Whether row-set predicate pushdown may run for this pipeline. `false`
+    /// forces the legacy full-decode obs path. Defaults from the
+    /// `SCX_DISABLE_ROWSET_PUSHDOWN` environment variable, read **once here**
+    /// rather than per query — see [`rowset_pushdown`](Self::rowset_pushdown).
+    rowset_pushdown: bool,
     /// Lazily-parsed `group_index` sidecar (F2 grouped reads). Parsed at most
     /// once per pipeline by [`require_grouped`](Self::require_grouped); shared
     /// by all grouped-read calls on this pipeline.
@@ -217,6 +222,7 @@ impl QueryPipeline {
             log1p: false,
             limit: None,
             deletion_vectors,
+            rowset_pushdown: !crate::collect::rowset_pushdown_disabled_by_env(),
             group_index: std::sync::OnceLock::new(),
         })
     }
@@ -323,6 +329,37 @@ impl QueryPipeline {
     pub fn limit(mut self, n: usize) -> Self {
         self.limit_mut(n);
         self
+    }
+
+    /// Enable or disable row-set predicate pushdown for this pipeline, in
+    /// place.
+    ///
+    /// The `&mut` form of [`rowset_pushdown`](Self::rowset_pushdown).
+    pub fn rowset_pushdown_mut(&mut self, enabled: bool) {
+        self.rowset_pushdown = enabled;
+    }
+
+    /// Enable or disable row-set predicate pushdown for this pipeline.
+    ///
+    /// **Diagnostic knob, not a semantic one.** Both paths must return the same
+    /// rows for every predicate — that equivalence is what
+    /// `tests/rowset_differential.rs` asserts, and it is the reason this exists:
+    /// the oracle runs each generated query on both paths and compares. Turning
+    /// pushdown off makes queries slower, never more correct.
+    ///
+    /// Defaults to enabled unless `SCX_DISABLE_ROWSET_PUSHDOWN` is set in the
+    /// environment, which remains the field's only other source. Prefer this
+    /// setter in tests: the environment is process-global, so a test that
+    /// toggles it races every other test in the same binary, and cargo runs a
+    /// test binary's tests on multiple threads by default.
+    pub fn rowset_pushdown(mut self, enabled: bool) -> Self {
+        self.rowset_pushdown_mut(enabled);
+        self
+    }
+
+    /// Whether row-set predicate pushdown may run for this pipeline.
+    pub(crate) fn rowset_pushdown_enabled(&self) -> bool {
+        self.rowset_pushdown
     }
 
     /// Execute the pipeline and return the query result **without consuming

@@ -24,10 +24,15 @@ use crate::rowset::{RowRange, RowSet};
 use scx_format_io::catalog::FullCatalogEntry;
 use scx_format_io::{assemble_filtered_metadata, DeletionVectors, SectionType};
 
-/// Env var (test/diagnostic only) that forces the legacy full-decode obs path,
-/// disabling row-set predicate pushdown. The differential correctness oracle
-/// runs each query with and without it set and asserts byte-identical results.
-fn rowset_pushdown_disabled() -> bool {
+/// Env var (diagnostic only) that forces the legacy full-decode obs path,
+/// disabling row-set predicate pushdown.
+///
+/// Read **once per pipeline**, at construction, into
+/// [`QueryPipeline::rowset_pushdown`](crate::QueryPipeline::rowset_pushdown)'s
+/// backing field — not once per query. That field is the only thing
+/// [`compute_mask`] consults, so nothing has to mutate the process environment
+/// to exercise the legacy path; `tests/rowset_differential.rs` sets the field.
+pub(crate) fn rowset_pushdown_disabled_by_env() -> bool {
     std::env::var_os("SCX_DISABLE_ROWSET_PUSHDOWN").is_some()
 }
 
@@ -857,7 +862,7 @@ fn try_rowset_mask(
     sorted_shards: &[&FullCatalogEntry],
     n_obs: usize,
 ) -> Result<Option<MaskResult>> {
-    if rowset_pushdown_disabled() {
+    if !pipeline.rowset_pushdown_enabled() {
         return Ok(None);
     }
     let reader = pipeline.reader();
