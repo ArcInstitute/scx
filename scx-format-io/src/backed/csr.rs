@@ -308,9 +308,20 @@ impl BackedCsrReader {
 
     /// Enable cache-behavior metrics on this reader. Returns a cloneable
     /// `Arc<CacheMetrics>` so callers (e.g. `IndexPlanIter`) can sample
-    /// counters without going through the cache lock. Subsequent calls
-    /// rebind to a fresh metrics handle (intended for opt-in setup, not
-    /// runtime toggling).
+    /// counters without going through the cache lock.
+    ///
+    /// **Idempotent.** Repeat calls return the same accumulating handle, not a
+    /// fresh one — `ShardCache::enable_metrics` installs the counters through a
+    /// `OnceLock`. A caller that wants a fresh measurement window must snapshot
+    /// the counters and subtract; re-enabling does not reset them. Same
+    /// contract as [`BackedCscReader::enable_metrics`] and
+    /// [`BackedDenseReader::enable_metrics`].
+    ///
+    /// This doc comment previously said the opposite — that later calls "rebind
+    /// to a fresh metrics handle". That was never true of this wrapper: it has
+    /// delegated to the shared cache's `OnceLock` since the shared cache
+    /// existed. It went unnoticed until the CSC and dense readers were given
+    /// the same contract explicitly and the two descriptions collided.
     pub fn enable_metrics(&mut self) -> Arc<CacheMetrics> {
         self.shard_cache.enable_metrics()
     }

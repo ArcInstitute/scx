@@ -1914,6 +1914,33 @@ fn dense_reader_enable_metrics_is_idempotent() {
 }
 
 #[test]
+fn csr_reader_enable_metrics_is_idempotent() {
+    // The CSR reader has behaved this way since the shared cache existed — its
+    // rustdoc just said the opposite ("subsequent calls rebind to a fresh
+    // metrics handle") until round 2 caught the contradiction with the CSC and
+    // dense docs. Pinned here so the corrected sentence is enforced rather than
+    // asserted; this is the method `IndexPlanLoader` and `plan_engine` call.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+
+    let first = backed.enable_metrics();
+    backed.read_rows(0, 3).unwrap();
+    let after_one = first.misses.load(Ordering::Relaxed);
+    assert!(after_one > 0, "a cold read must miss");
+
+    let second = backed.enable_metrics();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "re-enabling must hand back the same counters, not a fresh set"
+    );
+    assert_eq!(
+        second.misses.load(Ordering::Relaxed),
+        after_one,
+        "counters accumulate for the life of the reader; they are not reset"
+    );
+}
+
+#[test]
 fn csc_reader_enable_metrics_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let (path, _) = write_csc_test_file(&dir, 12, 12, 3);
