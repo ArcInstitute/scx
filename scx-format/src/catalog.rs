@@ -3,6 +3,7 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
+use crate::catalog_cursor::{CatalogEntryCursor, CatalogPreamble};
 use crate::checksum::blake3_hash;
 use crate::error::{Result, ScxError};
 use crate::section::SectionType;
@@ -806,110 +807,68 @@ impl FullCatalog {
             });
         }
 
+        // Read the whole catalog up front, then parse the borrowed bytes.
+        // Callers pass `Cursor`s over larger buffers and rely on exactly
+        // `total_len` bytes being consumed from `r`.
         let mut all_bytes = vec![0u8; total_len];
         r.read_exact(&mut all_bytes)?;
 
-        let payload_len = total_len - 32;
-        let (payload, expected_checksum) = all_bytes.split_at(payload_len);
-
-        if verify_checksum {
-            let computed = blake3_hash(payload);
-            if computed[..] != *expected_checksum {
-                return Err(ScxError::ChecksumMismatch {
-                    section: "full_catalog".to_string(),
-                });
-            }
-        }
-
-        // Parse the payload through a `&mut &[u8]` reader so we can
-        // peel off name and stats payloads as borrowed sub-slices of
-        // `payload` without copying into per-entry `Vec<u8>` buffers
-        // or wrapping them in nested `Cursor`s.
-        let mut cur: &[u8] = payload;
-        let catalog_version = cur.read_u16::<LittleEndian>()?;
-        let manifest_sequence = cur.read_u64::<LittleEndian>()?;
-        let prev_catalog_offset = cur.read_u64::<LittleEndian>()?;
-        let n_obs = cur.read_u64::<LittleEndian>()?;
-        let n_entries = cur.read_u32::<LittleEndian>()? as usize;
-
-        // Minimum serialized size of a single v2 catalog entry:
-        // 2 (name_len) + 0 (empty name) + 8 (offset) + 8 (length) +
-        // 1 (section_type) + 32 (checksum) + 1 (modality_id) +
-        // 2 (stats_len) = 54 bytes.
-        // v1 entries lack modality_id: 53 bytes. Use the smaller bound.
-        const MIN_ENTRY_BYTES: usize = 53;
-        crate::error::validate_allocation(n_entries.saturating_mul(MIN_ENTRY_BYTES), payload_len)?;
+        // One walk over the entry list, shared with `CatalogView` — see
+        // `catalog_cursor`. Names and stats arrive borrowed and undecoded,
+        // so this loop decides what to materialise, not how to parse.
+        let mut cursor = CatalogEntryCursor::new(&all_bytes, verify_checksum)?;
+        let &CatalogPreamble {
+            catalog_version,
+            manifest_sequence,
+            prev_catalog_offset,
+            n_obs,
+            n_entries,
+        } = cursor.preamble();
 
         let mut entries = Vec::with_capacity(n_entries);
-        for _ in 0..n_entries {
-            let name_len = cur.read_u16::<LittleEndian>()? as usize;
-            // Borrow the name bytes directly out of the outer payload
-            // slice — no per-entry `vec![0u8; name_len]` copy. UTF-8
-            // is validated in place against the borrowed slice; the
-            // single `String` allocation below replaces the previous
-            // (zero-init Vec + into-String) pair.
-            let (name_bytes, rest) = cur.split_at_checked(name_len).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "catalog entry name truncated",
-                )
-            })?;
-            cur = rest;
-            let name = std::str::from_utf8(name_bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-                .to_string();
+        while let Some(raw) = cursor.next_entry() {
+            let raw = raw?;
 
-            let offset = cur.read_u64::<LittleEndian>()?;
-            let length = cur.read_u64::<LittleEndian>()?;
-            let section_type_raw = cur.read_u8()?;
-
-            let mut checksum = [0u8; 32];
-            cur.read_exact(&mut checksum)?;
-
-            // v2 catalogs carry a `modality_id: u8` after the
-            // per-entry checksum. v1 catalogs don't — leave at 0.
-            let modality_id = if catalog_version >= 2 {
-                cur.read_u8()?
-            } else {
-                0u8
-            };
-
-            let stats_len = cur.read_u16::<LittleEndian>()? as usize;
-            let stats = if stats_len > 0 {
-                // Parse `ShardStats` directly out of a borrowed
-                // sub-slice — no `vec![0u8; stats_len]` copy, no
-                // nested `Cursor`. The outer reader advances by
-                // exactly `stats_len` bytes regardless of how many
-                // `ShardStats::read_from` consumes, preserving the
-                // forward-compat property of the length prefix.
-                let (stats_bytes, rest) = cur.split_at_checked(stats_len).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "catalog entry stats payload truncated",
-                    )
-                })?;
-                cur = rest;
-                let mut stats_reader: &[u8] = stats_bytes;
-                Some(ShardStats::read_from(&mut stats_reader, catalog_version)?)
-            } else {
-                None
-            };
-
-            // Skip unknown section types (forward-compatibility) with a
-            // warning, matching the spec requirement that readers skip
-            // unrecognised types rather than failing.
-            let section_type = match SectionType::from_u8(section_type_raw) {
+            // Resolve the section type FIRST. Skipping unknown types is the
+            // spec's forward-compat requirement, and doing it before the
+            // stats decode is what makes it real: a future section whose
+            // stats blob is shorter than the current layout used to abort
+            // this parse, and with it the whole file (§4.2).
+            let section_type = match SectionType::from_u8(raw.section_type_raw) {
                 Some(st) => st,
                 None => {
                     log::warn!(
-                        "skipping unknown section type {} (name: '{}') at offset {}",
-                        section_type_raw,
-                        name,
-                        offset,
+                        "skipping unknown section type {} ({} name bytes) at offset {}",
+                        raw.section_type_raw,
+                        raw.name_bytes.len(),
+                        raw.offset,
                     );
                     continue;
                 }
             };
+
+            // Validate what we materialise, and only that. An entry dropped
+            // above never reaches this line, so its name encoding cannot
+            // fail the catalog.
+            let name = std::str::from_utf8(raw.name_bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                .to_string();
+
+            let mut checksum = [0u8; 32];
+            checksum.copy_from_slice(raw.checksum_bytes);
+
+            let stats = if raw.stats_bytes.is_empty() {
+                None
+            } else {
+                // `stats_bytes` is exactly `stats_len` long, so a decoder
+                // that reads fewer bytes than it holds leaves the remainder
+                // as forward-compat padding rather than desynchronising the
+                // entry list.
+                let mut stats_reader: &[u8] = raw.stats_bytes;
+                Some(ShardStats::read_from(&mut stats_reader, catalog_version)?)
+            };
+
+            let (offset, length, modality_id) = (raw.offset, raw.length, raw.modality_id);
 
             // v1 → v2 axis-overload reconciliation for CSC entries:
             // legacy v1 catalogs encoded `col_start`/`col_end` in the
@@ -946,13 +905,7 @@ impl FullCatalog {
         // v4 trailing generation counters. Present only when the catalog
         // declares v4; v1–v3 catalogs default both to 0 (a `0 == 0`
         // freshness match, so legacy CSC sidecars are never rejected).
-        let (data_generation, csc_build_generation) = if catalog_version >= 4 {
-            let data_generation = cur.read_u64::<LittleEndian>()?;
-            let csc_build_generation = cur.read_u64::<LittleEndian>()?;
-            (data_generation, csc_build_generation)
-        } else {
-            (0, 0)
-        };
+        let (data_generation, csc_build_generation) = cursor.finish()?;
 
         Ok(Self {
             catalog_version,

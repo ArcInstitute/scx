@@ -1343,3 +1343,225 @@ fn modality_csr_ranges_tile_obs_positive_and_negative() {
     assert!(good.modality_csr_ranges_tile_obs(7, 0));
     assert!(!good.modality_csr_ranges_tile_obs(7, 300));
 }
+
+// -----------------------------------------------------------------------
+// Forward compatibility: unknown section types (§4.2)
+// -----------------------------------------------------------------------
+
+/// A section type no reader knows. Asserted unassigned by every test that
+/// uses it, so this fixture fails loudly the day id 30 is allocated rather
+/// than quietly becoming a known-type test.
+const UNKNOWN_SECTION_TYPE: u8 = 30;
+
+/// Hand-build a catalog payload plus its trailing BLAKE3 checksum,
+/// bypassing [`FullCatalog::write_to`].
+///
+/// The writer cannot express what these fixtures need: an entry carrying a
+/// section type it has no variant for, or a stats blob that is not the
+/// current layout. Entries are `(name_bytes, section_type_raw, stats_bytes)`;
+/// the two generation counters are emitted only when `catalog_version >= 4`,
+/// matching `write_to`.
+fn build_raw_catalog(
+    catalog_version: u16,
+    n_obs: u64,
+    entries: &[(&[u8], u8, &[u8])],
+    generations: (u64, u64),
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.write_u16::<LittleEndian>(catalog_version).unwrap();
+    payload.write_u64::<LittleEndian>(1).unwrap(); // manifest_sequence
+    payload.write_u64::<LittleEndian>(0).unwrap(); // prev_catalog_offset
+    payload.write_u64::<LittleEndian>(n_obs).unwrap();
+    payload
+        .write_u32::<LittleEndian>(entries.len() as u32)
+        .unwrap();
+
+    for (i, (name, section_type_raw, stats)) in entries.iter().enumerate() {
+        payload
+            .write_u16::<LittleEndian>(name.len() as u16)
+            .unwrap();
+        payload.extend_from_slice(name);
+        payload
+            .write_u64::<LittleEndian>(4352 + i as u64 * 1000)
+            .unwrap(); // offset
+        payload.write_u64::<LittleEndian>(1000).unwrap(); // length
+        payload.push(*section_type_raw);
+        payload.extend_from_slice(&[0u8; 32]); // per-entry checksum
+        if catalog_version >= 2 {
+            payload.push(0); // modality_id
+        }
+        payload
+            .write_u16::<LittleEndian>(stats.len() as u16)
+            .unwrap();
+        payload.extend_from_slice(stats);
+    }
+
+    if catalog_version >= 4 {
+        payload.write_u64::<LittleEndian>(generations.0).unwrap();
+        payload.write_u64::<LittleEndian>(generations.1).unwrap();
+    }
+
+    let checksum = blake3_hash(&payload);
+    let mut out = payload;
+    out.extend_from_slice(&checksum);
+    out
+}
+
+/// A stats blob too short for the current layout: 8 bytes of `row_start`,
+/// 8 of `row_end`, and then it stops 4 bytes into `col_start`.
+///
+/// The length is the whole point of the fixture. The outer entry walk
+/// advances by `stats_len` whatever it holds, so a well-formed 57-byte blob
+/// — or an over-long one — parses cleanly on a *future* section type and
+/// demonstrates nothing. Only a blob shorter than the fixed-width prefix
+/// makes the stats decoder run off the end.
+fn short_stats_blob() -> Vec<u8> {
+    vec![0u8; SHORT_STATS_LEN]
+}
+
+const SHORT_STATS_LEN: usize = 20;
+
+/// The fixture is only a §4.2 repro while it is shorter than the layout a
+/// stats decoder expects. Checked at compile time so a future layout change
+/// cannot quietly turn these tests into ones that pass either way.
+const _: () = assert!(SHORT_STATS_LEN < SHARD_STATS_BASE_SIZE_V2);
+
+/// §4.2: a section type this reader does not know, carrying a stats blob
+/// shorter than today's layout, must cost that one entry — not the file.
+///
+/// `FullCatalog::read_from` decodes the stats before it resolves the
+/// section type, so the short blob aborts the entire catalog parse and the
+/// file will not open at all. The catalog is the index to everything, so a
+/// single future section makes every section unreachable.
+#[test]
+fn unknown_section_type_with_short_stats_blob_still_opens() {
+    assert!(
+        SectionType::from_u8(UNKNOWN_SECTION_TYPE).is_none(),
+        "fixture needs an unassigned section type; id {UNKNOWN_SECTION_TYPE} is now known"
+    );
+
+    let stats = short_stats_blob();
+    let bytes = build_raw_catalog(
+        4,
+        100,
+        &[
+            (b"obs", SectionType::ObsMetadata as u8, &[][..]),
+            (b"future_section", UNKNOWN_SECTION_TYPE, &stats[..]),
+            (b"var", SectionType::VarMetadata as u8, &[][..]),
+        ],
+        (0, 0),
+    );
+
+    let full = FullCatalog::read_from(&mut Cursor::new(&bytes), bytes.len(), true)
+        .expect("an unknown section type must cost its own entry, not the whole catalog");
+    let names: Vec<&str> = full.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["obs", "var"], "unknown entry must be dropped");
+
+    // The lightweight parser already resolves the type before touching the
+    // stats. Pin it so unifying the two cannot regress it in that direction.
+    let view = crate::catalog_view::CatalogView::read_from_bytes(&bytes, true)
+        .expect("CatalogView already skips before decoding stats");
+    let view_names: Vec<Option<&str>> = view.entries.iter().map(|e| e.name()).collect();
+    assert_eq!(view_names, vec![Some("obs"), Some("var")]);
+}
+
+/// The mirror of the fixture above, and the reason it is not enough on its
+/// own: skipping *before* decoding must not turn into skipping *instead of*
+/// decoding. A truncated stats blob on a section type the reader does know
+/// is corruption, and both parsers must still refuse it.
+#[test]
+fn truncated_stats_on_a_known_type_is_still_an_error() {
+    let stats = short_stats_blob();
+    let bytes = build_raw_catalog(
+        4,
+        100,
+        &[
+            (b"obs", SectionType::ObsMetadata as u8, &[][..]),
+            (b"X_shard_0", SectionType::CsrShard as u8, &stats[..]),
+        ],
+        (0, 0),
+    );
+
+    let err = FullCatalog::read_from(&mut Cursor::new(&bytes), bytes.len(), true)
+        .expect_err("a truncated stats blob on a known type is corruption");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("failed to fill whole buffer") || msg.contains("UnexpectedEof"),
+        "expected a truncated-read error, got: {msg}"
+    );
+
+    let view_err = crate::catalog_view::CatalogView::read_from_bytes(&bytes, true)
+        .expect_err("the lightweight parser must refuse it too");
+    let view_msg = format!("{view_err}");
+    assert!(
+        view_msg.contains("stats payload too short"),
+        "expected a short-stats error, got: {view_msg}"
+    );
+}
+
+/// Unknown entries are dropped, and dropping them must not disturb the
+/// order of the survivors. Nothing pins this today in either direction, so
+/// a parser unification could silently reverse or reorder the list — which
+/// would be invisible to every other test, since the read paths address
+/// shards by `(section_type, major_start)` and would still find them.
+#[test]
+fn unknown_section_ordering_matches_across_parsers() {
+    assert!(SectionType::from_u8(UNKNOWN_SECTION_TYPE).is_none());
+    let stats = short_stats_blob();
+
+    let bytes = build_raw_catalog(
+        4,
+        100,
+        &[
+            (b"obs", SectionType::ObsMetadata as u8, &[][..]),
+            (b"future_a", UNKNOWN_SECTION_TYPE, &stats[..]),
+            (b"var", SectionType::VarMetadata as u8, &[][..]),
+            (b"future_b", 200, &[][..]),
+            (b"uns", SectionType::UnsBlob as u8, &[][..]),
+        ],
+        (0, 0),
+    );
+
+    let full = FullCatalog::read_from(&mut Cursor::new(&bytes), bytes.len(), true).unwrap();
+    let full_names: Vec<&str> = full.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(full_names, vec!["obs", "var", "uns"]);
+
+    let view = crate::catalog_view::CatalogView::read_from_bytes(&bytes, true).unwrap();
+    let view_names: Vec<Option<&str>> = view.entries.iter().map(|e| e.name()).collect();
+    assert_eq!(
+        view_names,
+        full_names.iter().map(|n| Some(*n)).collect::<Vec<_>>(),
+        "both parsers must drop the same entries and keep the same order"
+    );
+}
+
+/// A name is only worth validating if it is going to be kept. An entry the
+/// reader is about to drop for having an unknown section type should not be
+/// able to fail the whole catalog on its name encoding.
+///
+/// The complementary case — invalid UTF-8 on an entry the reader *keeps* —
+/// is `catalog_rejects_invalid_utf8_name` above, and must stay an error.
+#[test]
+fn non_utf8_name_on_a_dropped_entry_is_tolerated() {
+    assert!(SectionType::from_u8(UNKNOWN_SECTION_TYPE).is_none());
+
+    // Lone continuation bytes — not a valid UTF-8 sequence.
+    let bad_name: &[u8] = &[0x80, 0x80, 0x80];
+    let bytes = build_raw_catalog(
+        4,
+        100,
+        &[
+            (b"obs", SectionType::ObsMetadata as u8, &[][..]),
+            (bad_name, UNKNOWN_SECTION_TYPE, &[][..]),
+        ],
+        (0, 0),
+    );
+
+    let full = FullCatalog::read_from(&mut Cursor::new(&bytes), bytes.len(), true)
+        .expect("a dropped entry's name encoding must not fail the catalog");
+    let names: Vec<&str> = full.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["obs"]);
+
+    crate::catalog_view::CatalogView::read_from_bytes(&bytes, true)
+        .expect("the lightweight parser already tolerates it");
+}

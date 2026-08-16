@@ -6,6 +6,9 @@ use crate::format::human_size;
 use scx_codec::{CodecId, ValueEncoding};
 
 use scx_format_io::catalog::FullCatalog;
+use scx_format_io::catalog_cursor::{
+    catalog_payload_len, CATALOG_CHECKSUM_LEN, CATALOG_PREAMBLE_LEN,
+};
 use scx_format_io::deletion_vectors::DeletionVectors;
 use scx_format_io::header::FileHeader;
 use scx_format_io::modality::{ModalityTable, ModalityType};
@@ -717,74 +720,25 @@ fn try_read_catalog_at(
     mmap: &[u8],
     offset: usize,
 ) -> Result<FullCatalog, Box<dyn std::error::Error>> {
-    // Catalog payload header: u16 version + u64 manifest_seq + u64 prev_offset
-    // + u64 n_obs + u32 n_entries = 30 bytes. Trailing 32-byte BLAKE3 checksum.
-    const HEADER_LEN: usize = 2 + 8 + 8 + 8 + 4;
-    const CHECKSUM_LEN: usize = 32;
-    // Smallest serialized entry (v1, empty name, no stats): 2 + 0 + 8 + 8 + 1
-    // + 32 + 2 = 53 bytes. Matches `FullCatalog::read_from`'s alloc guard.
-    const MIN_ENTRY_BYTES: usize = 53;
-
     // (a) A corrupt `prev_catalog_offset` can point past EOF — `checked_sub`
     // avoids the underflow/panic.
     let remaining = mmap
         .len()
         .checked_sub(offset)
         .ok_or("catalog offset points beyond end of file")?;
-    if remaining < HEADER_LEN + CHECKSUM_LEN {
+    if remaining < CATALOG_PREAMBLE_LEN + CATALOG_CHECKSUM_LEN {
         return Err("catalog truncated: fewer bytes remain than a minimal catalog".into());
     }
-    let slice = &mmap[offset..]; // safe: offset <= mmap.len()
 
-    let read_u16 = |p: usize| -> Option<usize> {
-        slice
-            .get(p..p + 2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
-    };
-    let catalog_version = read_u16(0).ok_or("catalog header truncated")?;
-    // n_entries is the u32 at byte offset 2+8+8+8 = 26.
-    let n_entries = slice
-        .get(26..30)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-        .ok_or("catalog header truncated")?;
-
-    // (b) Guard against a garbage `n_entries` driving a long walk — the
-    // entries can't fit if even their minimum size exceeds the remaining bytes.
-    if n_entries.saturating_mul(MIN_ENTRY_BYTES) > remaining {
-        return Err("catalog entry count exceeds remaining bytes (corrupt offset)".into());
-    }
-
-    // Bytes between an entry's name and its stats-length prefix: offset(8) +
-    // length(8) + section_type(1) + checksum(32) + modality_id(1, v2+ only).
-    let entry_mid = 8 + 8 + 1 + 32 + if catalog_version >= 2 { 1 } else { 0 };
-
-    // Walk the length prefixes to find the exact end of the entry block,
-    // bounds-checking every step against `remaining`.
-    let mut pos = HEADER_LEN;
-    for _ in 0..n_entries {
-        let name_len = read_u16(pos).ok_or("catalog entry name length truncated")?;
-        // Advance past name_len(2) + name + entry_mid to the stats-length prefix.
-        let stats_len_pos = pos
-            .checked_add(2 + name_len + entry_mid)
-            .filter(|&p| p + 2 <= remaining)
-            .ok_or("catalog entry truncated")?;
-        let stats_len = read_u16(stats_len_pos).ok_or("catalog entry stats length truncated")?;
-        pos = stats_len_pos
-            .checked_add(2 + stats_len)
-            .filter(|&p| p <= remaining)
-            .ok_or("catalog entry stats truncated")?;
-    }
-
-    // v4 trailing generation counters (two u64), present only when declared v4.
-    if catalog_version >= 4 {
-        pos = pos
-            .checked_add(16)
-            .filter(|&p| p <= remaining)
-            .ok_or("catalog v4 trailer truncated")?;
-    }
-
-    let total_len = pos
-        .checked_add(CHECKSUM_LEN)
+    // Walk the length prefixes with the same cursor `FullCatalog::read_from`
+    // parses through, rather than a second copy of the per-entry arithmetic
+    // (which is what this used to be: its own `MIN_ENTRY_BYTES`, its own v2
+    // `modality_id` gate, its own v4 trailer gate — three things to keep in
+    // step with the wire format by hand). The slice runs to EOF; the walk
+    // stops at the declared entry count.
+    let payload_len = catalog_payload_len(&mmap[offset..])?;
+    let total_len = payload_len
+        .checked_add(CATALOG_CHECKSUM_LEN)
         .filter(|&p| p <= remaining)
         .ok_or("catalog checksum truncated")?;
 
