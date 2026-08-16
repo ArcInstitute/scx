@@ -155,6 +155,39 @@ jobs:
             exit 1
           fi
 
+      # ORG-4.9-1: the catalog entry list is walked in exactly one place,
+      # `scx-format/src/catalog_cursor.rs`. The cost of the alternative is on
+      # record: when `FullCatalog::read_from` and `CatalogView::read_from_bytes`
+      # each had their own walk they drifted on the order of two steps, and the
+      # one that decoded stats before resolving the section type made any file
+      # containing a future section type unopenable (§4.2).
+      #
+      # `MIN_ENTRY_BYTES` is the fingerprint of a hand-rolled walk: nothing
+      # needs the value except code sizing entries itself. A caller that must
+      # find where a catalog ends without parsing it calls
+      # `catalog_payload_len`; one that walks a `File` it cannot slice
+      # (scx-ops' rollback reader) imports the constants rather than restating
+      # them. Test files may name it in a comment about the guard it exercises.
+      - name: Catalog entry layout is spelled out only in catalog_cursor.rs
+        run: |
+          if grep -rEn --include='*.rs' 'MIN_ENTRY_BYTES' . \
+               | grep -vE '(scx-format/src/(catalog_cursor\.rs|catalog_cursor_tests\.rs|lib\.rs)|_tests\.rs|/tests/)' \
+               | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::catalog entry-size arithmetic outside catalog_cursor.rs — walk the catalog with CatalogEntryCursor, or import the layout constants."
+            exit 1
+          fi
+      # The negative grep above cannot see a walk that re-derives 53 without
+      # naming it. This is the positive half: both representations are built by
+      # the cursor, so each must construct one.
+      - name: Both catalog representations are built by the cursor
+        run: |
+          for f in scx-format/src/catalog.rs scx-format/src/catalog_view.rs; do
+            if ! grep -qE 'CatalogEntryCursor::(new|over_payload)[[:space:]]*\(' "$f"; then
+              echo "::error::$f no longer builds a CatalogEntryCursor — the two catalog parsers must share one entry walk."
+              exit 1
+            fi
+          done
+
       # §10.1: a numpy borrow is not GIL-bound and does not clear numpy's
       # WRITEABLE flag, so a `&[T]` taken from one must never be read after the
       # GIL is released. `GilHeldCsrSlices` is the single borrowed-buffer
