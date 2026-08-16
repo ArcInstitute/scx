@@ -1780,8 +1780,8 @@ fn test_parallel_matches_sequential() {
     let reader = ScxReader::open(&path).unwrap();
     let shards = reader.catalog().shards_sorted();
 
-    let sequential = reader.assemble_shards(&shards).unwrap();
-    let parallel = reader.assemble_shards_parallel(&shards).unwrap();
+    let sequential = assemble_x(&reader, &shards, RowMajorStrategy::Sequential).unwrap();
+    let parallel = assemble_x(&reader, &shards, RowMajorStrategy::Parallel).unwrap();
 
     assert_eq!(sequential.shape, parallel.shape);
     assert_eq!(sequential.indptr, parallel.indptr);
@@ -1792,6 +1792,16 @@ fn test_parallel_matches_sequential() {
 // -----------------------------------------------------------------------
 // Multi-shard concatenation (the assemblers' running row/nnz offsets)
 // -----------------------------------------------------------------------
+
+/// Test shim: assemble `X`-family shards with an explicit strategy.
+fn assemble_x(
+    reader: &ScxReader,
+    shards: &[&FullCatalogEntry],
+    strategy: RowMajorStrategy,
+) -> Result<ScxCsr> {
+    let n_vars = reader.header().n_vars as usize;
+    reader.assemble_row_major(shards, n_vars, (0, n_vars), X_LABELS, strategy)
+}
 
 /// One row's nonzeros. `(global_row % 4) + 1` entries at columns walking by 3
 /// from `global_row % n_vars`, values derived from the global row index.
@@ -1964,8 +1974,8 @@ fn multi_shard_assembly_is_pinned() {
         &exp_data,
     );
     expect(
-        "assemble_shards",
-        &reader.assemble_shards(&shards).unwrap(),
+        "assemble_row_major/Sequential",
+        &assemble_x(&reader, &shards, RowMajorStrategy::Sequential).unwrap(),
         N_VARS,
         &exp_indptr,
         &exp_indices,
@@ -1973,8 +1983,8 @@ fn multi_shard_assembly_is_pinned() {
     );
     #[cfg(feature = "parallel")]
     expect(
-        "assemble_shards_parallel",
-        &reader.assemble_shards_parallel(&shards).unwrap(),
+        "assemble_row_major/Parallel",
+        &assemble_x(&reader, &shards, RowMajorStrategy::Parallel).unwrap(),
         N_VARS,
         &exp_indptr,
         &exp_indices,
@@ -2008,13 +2018,13 @@ fn test_assemble_shards_rejects_stat_drift() {
     doctored.stats.as_mut().unwrap().nnz += 1;
 
     assert!(
-        reader.assemble_shards(&[&doctored]).is_err(),
+        assemble_x(&reader, &[&doctored], RowMajorStrategy::Sequential).is_err(),
         "sequential assemble must reject decoded-vs-catalog nnz drift"
     );
 
     #[cfg(feature = "parallel")]
     assert!(
-        reader.assemble_shards_parallel(&[&doctored]).is_err(),
+        assemble_x(&reader, &[&doctored], RowMajorStrategy::Parallel).is_err(),
         "parallel assemble must reject decoded-vs-catalog nnz drift"
     );
 }
@@ -2038,13 +2048,13 @@ fn test_assemble_shards_rejects_inverted_row_range() {
     }
 
     assert!(
-        reader.assemble_shards(&[&doctored]).is_err(),
+        assemble_x(&reader, &[&doctored], RowMajorStrategy::Sequential).is_err(),
         "sequential assemble must reject inverted row range"
     );
 
     #[cfg(feature = "parallel")]
     assert!(
-        reader.assemble_shards_parallel(&[&doctored]).is_err(),
+        assemble_x(&reader, &[&doctored], RowMajorStrategy::Parallel).is_err(),
         "parallel assemble must reject inverted row range"
     );
 }
@@ -2960,10 +2970,13 @@ fn zero_row_unframed_shards_round_trip_through_a_file() {
         "read_all_csr_shards",
         &reader.read_all_csr_shards().unwrap(),
     );
-    check("assemble_shards", &reader.assemble_shards(&shards).unwrap());
+    check(
+        "assemble_row_major/Sequential",
+        &assemble_x(&reader, &shards, RowMajorStrategy::Sequential).unwrap(),
+    );
     #[cfg(feature = "parallel")]
     check(
-        "assemble_shards_parallel",
-        &reader.assemble_shards_parallel(&shards).unwrap(),
+        "assemble_row_major/Parallel",
+        &assemble_x(&reader, &shards, RowMajorStrategy::Parallel).unwrap(),
     );
 }

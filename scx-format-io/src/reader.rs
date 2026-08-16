@@ -108,6 +108,136 @@ pub struct ScxReader {
     debug_counts: ReaderDebugCounts,
 }
 
+/// Which nouns the row-major assembler uses in its diagnostics. The `X` and
+/// `adata.raw` families produce textually different errors, and the difference
+/// is worth keeping: it tells a reader which matrix failed on a file that has
+/// both.
+#[derive(Clone, Copy)]
+pub(crate) struct RowMajorLabels {
+    /// Names an offending *catalog entry* ("... has no stats block").
+    entry: &'static str,
+    /// Names an offending *shard* ("... length mismatch").
+    shard: &'static str,
+}
+
+/// Labels for `X`, a modality's `X`, and named layers.
+pub(crate) const X_LABELS: RowMajorLabels = RowMajorLabels {
+    entry: "shard entry",
+    shard: "CSR shard",
+};
+
+/// Labels for the `adata.raw` matrix.
+pub(crate) const RAW_LABELS: RowMajorLabels = RowMajorLabels {
+    entry: "raw CSR shard",
+    shard: "raw CSR shard",
+};
+
+/// One shard's exclusive slices of the merged output buffers: `(indptr,
+/// indices, data)`. Carved by `split_at_mut` before any decode starts, which
+/// is what lets the parallel path drop its raw-pointer scatter.
+type ShardOutputSlices<'a> = (&'a mut [i64], &'a mut [i32], &'a mut [f32]);
+
+/// Whether the row-major assembler fans its per-shard decode out across the
+/// rayon pool.
+///
+/// A parameter rather than a `#[cfg]` inside the assembler so
+/// `parallel_matches_sequential` can still run both against one file. After
+/// the unification the two share everything but the iterator, so be precise
+/// about what that differential now proves: not that two independent
+/// implementations agree — they are one implementation — but that fanning the
+/// writes out across threads does not reorder or overlap them, which is
+/// exactly the property the `split_at_mut` carve-up is responsible for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowMajorStrategy {
+    Sequential,
+    #[cfg(feature = "parallel")]
+    Parallel,
+}
+
+impl RowMajorStrategy {
+    /// What production reads use: parallel when the feature is on.
+    pub(crate) fn for_build() -> Self {
+        #[cfg(feature = "parallel")]
+        {
+            RowMajorStrategy::Parallel
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            RowMajorStrategy::Sequential
+        }
+    }
+}
+
+/// Per-shard `(n_rows, nnz)` from catalog stats, without decoding anything.
+///
+/// One of the two halves the review's "three near-identical assemblers" finding
+/// is really about: this `checked_sub` existed in four places (three assemblers
+/// plus the typed reader's own), so a fix to it could land in three of four.
+///
+/// `checked_sub` and not a bare `-`: a corrupt catalog with
+/// `row_end < row_start` would otherwise underflow-panic in debug or wrap to a
+/// huge `usize` in release, driving a giant allocation.
+pub(crate) fn plan_row_major_layout(
+    shards: &[&FullCatalogEntry],
+    labels: RowMajorLabels,
+) -> Result<Vec<(usize, usize)>> {
+    shards
+        .iter()
+        .map(|e| {
+            let stats = e.stats.as_ref().ok_or_else(|| {
+                ScxError::InvalidCatalog(format!(
+                    "{} '{}' at offset {} has no stats block",
+                    labels.entry, e.name, e.offset
+                ))
+            })?;
+            let n_rows = stats.row_end.checked_sub(stats.row_start).ok_or_else(|| {
+                ScxError::InvalidCatalog(format!(
+                    "shard '{}' has row_end {} < row_start {}",
+                    e.name, stats.row_end, stats.row_start
+                ))
+            })? as usize;
+            Ok::<_, ScxError>((n_rows, stats.nnz as usize))
+        })
+        .collect()
+}
+
+/// The three decoded-vs-catalog length checks, in one place.
+///
+/// The other half of the duplication: twelve copies of these three messages
+/// existed across four assembly bodies. Returned errors and not
+/// `debug_assert!`, because they are reachable on a corrupt or stat-drifted
+/// catalog and a mismatch would otherwise panic in the `copy_from_slice` /
+/// `shard_ip[j + 1]` indexing that follows every caller — in release, where
+/// `debug_assert!` is gone.
+pub(crate) fn check_decoded_lengths(
+    labels: RowMajorLabels,
+    i: usize,
+    n_rows: usize,
+    nnz: usize,
+    indptr_len: usize,
+    indices_len: usize,
+    values_len: usize,
+) -> Result<()> {
+    let kind = labels.shard;
+    if indptr_len != n_rows + 1 {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{kind} {i} indptr length mismatch: catalog stats say {}, decoded {indptr_len}",
+            n_rows + 1,
+        )));
+    }
+    if indices_len != nnz {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{kind} {i} indices length mismatch: catalog stats say {nnz}, decoded {indices_len}"
+        )));
+    }
+    if values_len != nnz {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{kind} {i} data length mismatch: catalog stats say {nnz}, decoded {values_len}"
+        )));
+    }
+    Ok(())
+}
+
 impl ScxReader {
     /// Open an SCX file for reading.
     ///
@@ -1773,10 +1903,7 @@ impl ScxReader {
     /// for the returned `n_cols`.
     pub fn read_all_csr_shards_for(&self, modality_id: u8) -> Result<ScxCsr> {
         let shards = self.full_catalog.csr_shards_for_modality(modality_id);
-        #[cfg(feature = "parallel")]
-        let assembled = self.assemble_shards_parallel(&shards)?;
-        #[cfg(not(feature = "parallel"))]
-        let assembled = self.assemble_shards(&shards)?;
+        let assembled = self.assemble_x_shards(&shards)?;
 
         // Writers now stamp `ShardHeader.n_minor` with the per-modality
         // `n_vars` (see `ScxWriter::write_shard_inner`), so the
@@ -1931,16 +2058,7 @@ impl ScxReader {
                 "layer '{layer_name}' for modality_id {modality_id}"
             )));
         }
-        let mut assembled = {
-            #[cfg(feature = "parallel")]
-            {
-                self.assemble_shards_parallel(&shards)?
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                self.assemble_shards(&shards)?
-            }
-        };
+        let mut assembled = self.assemble_x_shards(&shards)?;
         // Patch n_cols from the modality's per-modality n_vars (the
         // assembler used header.n_vars which is the file-wide max).
         if let Some(info) = self.modality_info(modality_id) {
@@ -2081,14 +2199,7 @@ impl ScxReader {
     /// Read all CSR shards and assemble into a single ScxCsr.
     pub fn read_all_csr_shards(&self) -> Result<ScxCsr> {
         let shards = self.full_catalog.shards_sorted();
-        #[cfg(feature = "parallel")]
-        {
-            self.assemble_shards_parallel(&shards)
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            self.assemble_shards(&shards)
-        }
+        self.assemble_x_shards(&shards)
     }
 
     // -----------------------------------------------------------------------
@@ -2157,84 +2268,17 @@ impl ScxReader {
                 ))
             })?;
 
-        let shard_sizes: Vec<(usize, usize)> = shards
-            .iter()
-            .map(|e| {
-                let stats = e.stats.as_ref().ok_or_else(|| {
-                    ScxError::InvalidCatalog(format!(
-                        "raw CSR shard '{}' at offset {} has no stats block",
-                        e.name, e.offset
-                    ))
-                })?;
-                // checked_sub (not bare `-`): a corrupt catalog with
-                // row_end < row_start would otherwise underflow-panic in debug
-                // or wrap to a huge usize in release (driving a giant alloc).
-                let n_rows = stats.row_end.checked_sub(stats.row_start).ok_or_else(|| {
-                    ScxError::InvalidCatalog(format!(
-                        "shard '{}' has row_end {} < row_start {}",
-                        e.name, stats.row_end, stats.row_start
-                    ))
-                })? as usize;
-                Ok::<_, ScxError>((n_rows, stats.nnz as usize))
-            })
-            .collect::<Result<_>>()?;
-        let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
-        let total_nnz: usize = shard_sizes.iter().map(|(_, n)| *n).sum();
-
-        let mut indptr = vec![0i64; total_rows + 1];
-        let mut indices = vec![0i32; total_nnz];
-        let mut data = vec![0f32; total_nnz];
-
-        let mut cum_rows = 0usize;
-        let mut cum_nnz = 0usize;
-        for (i, entry) in shards.iter().enumerate() {
-            let (n_rows, nnz) = shard_sizes[i];
-            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
-            // Decoded-vs-catalog length checks. Returned errors (not
-            // `debug_assert!`) because a mismatch on a corrupt / stat-drifted
-            // catalog would otherwise panic in the `copy_from_slice` /
-            // `shard_ip[j + 1]` indexing below in release — mirroring the guards
-            // in `assemble_shards`/`assemble_shards_parallel`.
-            if shard_ip.len() != n_rows + 1 {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "raw CSR shard {i} indptr length mismatch: catalog stats say {}, decoded {}",
-                    n_rows + 1,
-                    shard_ip.len()
-                )));
-            }
-            if shard_ix.len() != nnz {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "raw CSR shard {i} indices length mismatch: catalog stats say {nnz}, decoded {}",
-                    shard_ix.len()
-                )));
-            }
-            if shard_data.len() != nnz {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "raw CSR shard {i} data length mismatch: catalog stats say {nnz}, decoded {}",
-                    shard_data.len()
-                )));
-            }
-            indices[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_ix);
-            data[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_data);
-            if i == 0 {
-                indptr[0..n_rows + 1].copy_from_slice(&shard_ip);
-            } else {
-                let nnz_off_i64 = cum_nnz as i64;
-                for j in 0..n_rows {
-                    indptr[cum_rows + 1 + j] = shard_ip[j + 1] + nnz_off_i64;
-                }
-            }
-            cum_rows += n_rows;
-            cum_nnz += nnz;
-        }
-
-        let n_rows = indptr.len().saturating_sub(1);
-        Ok(ScxCsr::new_unchecked(
-            (n_rows, raw_n_vars),
-            indptr,
-            indices,
-            data,
-        ))
+        // Serial, deliberately: this is what the hand-rolled body did, and
+        // keeping it here makes the switch to the build's default strategy a
+        // one-line, separately attributable change rather than something
+        // smuggled into a de-duplication.
+        self.assemble_row_major(
+            &shards,
+            raw_n_vars,
+            (self.header.n_obs as usize, 0),
+            RAW_LABELS,
+            RowMajorStrategy::Sequential,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -3193,14 +3237,7 @@ impl ScxReader {
 
         // Sort by row_start
         shards.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
-        #[cfg(feature = "parallel")]
-        {
-            self.assemble_shards_parallel(&shards)
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            self.assemble_shards(&shards)
-        }
+        self.assemble_x_shards(&shards)
     }
 
     pub(crate) fn legacy_layer_shards(&self, name: &str) -> Vec<&FullCatalogEntry> {
@@ -4202,19 +4239,42 @@ impl ScxReader {
         Ok(())
     }
 
-    /// Assemble multiple shard entries into a single ScxCsr using parallel decode.
+    /// Assemble a set of row-major CSR shard entries into one [`ScxCsr`].
     ///
-    /// Pre-allocates the final merged arrays to exact sizes using catalog stats,
-    /// then decodes each shard in parallel directly into its non-overlapping region.
-    #[cfg(feature = "parallel")]
-    fn assemble_shards_parallel(&self, shards: &[&FullCatalogEntry]) -> Result<ScxCsr> {
+    /// The single implementation behind every whole-matrix read: `X`, a
+    /// per-modality `X`, a named layer, and (since the raw migration) the
+    /// `adata.raw` matrix. It replaced three hand-rolled copies that each
+    /// carried their own `checked_sub` and their own three decoded-vs-catalog
+    /// length checks — the shape where a bounds fix lands in two of three
+    /// places.
+    ///
+    /// `n_cols` is passed rather than read off the header because the raw
+    /// matrix has its own, independent column count. `empty_shape` is passed
+    /// for the same reason and is not derivable from `n_cols`: an empty `X`
+    /// read answers `(0, n_vars)` while an empty raw read answers
+    /// `(n_obs, 0)`, and collapsing the two is a silent change to what a
+    /// caller gets back for a file with no shards.
+    ///
+    /// # Why there is no `unsafe` here
+    ///
+    /// The parallel path used to launder three base pointers through `usize`
+    /// and rebuild `&mut` slices inside each rayon task, guarded by two
+    /// release-mode `assert!`s whose own comment called them "the ONLY thing
+    /// keeping the unsafe block below from writing past the allocated region".
+    /// Pre-splitting the output buffers with [`slice::split_at_mut`] hands
+    /// each task an exclusive slice the borrow checker has already proved
+    /// disjoint, at no cost — same slices, same writes — and takes both the
+    /// `unsafe` and the two panics-on-malformed-input with it.
+    fn assemble_row_major(
+        &self,
+        shards: &[&FullCatalogEntry],
+        n_cols: usize,
+        empty_shape: (usize, usize),
+        labels: RowMajorLabels,
+        strategy: RowMajorStrategy,
+    ) -> Result<ScxCsr> {
         if shards.is_empty() {
-            return Ok(ScxCsr::new_unchecked(
-                (0, self.header.n_vars as usize),
-                vec![0],
-                vec![],
-                vec![],
-            ));
+            return Ok(ScxCsr::new_unchecked(empty_shape, vec![0], vec![], vec![]));
         }
 
         // Hint aggressive readahead across the shard region.
@@ -4231,266 +4291,124 @@ impl ScxReader {
             self.advise_sequential(min_offset, max_end - min_offset);
         }
 
-        // Pre-compute per-shard (n_rows, nnz) from catalog stats
-        let shard_sizes: Vec<(usize, usize)> = shards
-            .iter()
-            .map(|e| {
-                let stats = e.stats.as_ref().ok_or_else(|| {
-                    ScxError::InvalidCatalog(format!(
-                        "shard entry '{}' at offset {} has no stats block",
-                        e.name, e.offset
-                    ))
-                })?;
-                // checked_sub (not bare `-`): a corrupt catalog with
-                // row_end < row_start would otherwise underflow-panic in debug
-                // or wrap to a huge usize in release (driving a giant alloc).
-                let n_rows = stats.row_end.checked_sub(stats.row_start).ok_or_else(|| {
-                    ScxError::InvalidCatalog(format!(
-                        "shard '{}' has row_end {} < row_start {}",
-                        e.name, stats.row_end, stats.row_start
-                    ))
-                })? as usize;
-                Ok::<_, ScxError>((n_rows, stats.nnz as usize))
-            })
-            .collect::<Result<_>>()?;
+        let shard_sizes = plan_row_major_layout(shards, labels)?;
         let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
         let total_nnz: usize = shard_sizes.iter().map(|(_, n)| *n).sum();
 
-        // Compute per-shard cumulative offsets
-        let mut row_offsets = Vec::with_capacity(shards.len());
-        let mut nnz_offsets = Vec::with_capacity(shards.len());
-        let (mut cum_rows, mut cum_nnz) = (0usize, 0usize);
-        for &(n_rows, nnz) in &shard_sizes {
-            row_offsets.push(cum_rows);
+        // Per-shard cumulative nnz, needed to rebase each shard's indptr.
+        let mut nnz_offsets = Vec::with_capacity(shard_sizes.len());
+        let mut cum_nnz = 0usize;
+        for &(_, nnz) in &shard_sizes {
             nnz_offsets.push(cum_nnz);
-            cum_rows += n_rows;
             cum_nnz += nnz;
         }
 
-        // Single allocation for final merged arrays
+        // Single allocation for the final merged arrays.
         let mut indptr = vec![0i64; total_rows + 1];
         let mut indices = vec![0i32; total_nnz];
         let mut data = vec![0f32; total_nnz];
 
-        // Parallel decode + copy into non-overlapping regions.
-        // Store base addresses as usize so they can cross thread boundaries
-        // (usize is Send+Sync; raw pointers are not).
-        // SAFETY: each rayon task writes to a disjoint region determined by
-        // pre-computed offsets, so there are no data races.
-        let indptr_base = indptr.as_mut_ptr() as usize;
-        let indices_base = indices.as_mut_ptr() as usize;
-        let data_base = data.as_mut_ptr() as usize;
-
-        shards.par_iter().enumerate().try_for_each(|(i, entry)| {
-            let (n_rows, nnz) = shard_sizes[i];
-            let row_off = row_offsets[i];
-            let nnz_off = nnz_offsets[i];
-
-            // Release-mode bounds guards — catch catalog corruption / stat
-            // drift before dereferencing raw pointers below.  `assert!` (not
-            // `debug_assert!`) because these invariants are the ONLY thing
-            // keeping the unsafe block below from writing past the allocated
-            // region; stripping them in release would silently corrupt the
-            // heap on malformed inputs.
-            assert!(
-                nnz_off + nnz <= total_nnz,
-                "shard {i}: nnz range {nnz_off}..{} exceeds total_nnz {total_nnz}",
-                nnz_off + nnz
-            );
-            assert!(
-                row_off + n_rows <= total_rows,
-                "shard {i}: row range {row_off}..{} exceeds total_rows {total_rows}",
-                row_off + n_rows
-            );
-
-            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
-            // Decoded-vs-catalog length checks. Returned errors (not
-            // `debug_assert!`) because these are reachable on a corrupt /
-            // stat-drifted catalog: a mismatch would otherwise panic in the
-            // `copy_from_slice` / `shard_ip[j + 1]` indexing below in release,
-            // violating the "readers return errors, not panic" convention.
-            if shard_ip.len() != n_rows + 1 {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "CSR shard {i} indptr length mismatch: catalog stats say {}, decoded {}",
-                    n_rows + 1,
-                    shard_ip.len()
-                )));
+        // Carve the outputs into per-shard exclusive slices up front. Shard 0
+        // takes `n_rows + 1` indptr slots (it owns the leading 0); every later
+        // shard takes `n_rows`, landing it at `row_offset + 1` — the same
+        // regions the pointer arithmetic used to compute. The sizes sum to the
+        // buffer lengths exactly, by construction of `total_rows` / `total_nnz`
+        // above, so the splits below cannot fail; `expect` rather than a
+        // silent `split_at_mut` panic in case that ever stops being true.
+        let mut chunks: Vec<ShardOutputSlices<'_>> = Vec::with_capacity(shard_sizes.len());
+        {
+            let mut ip_rest: &mut [i64] = &mut indptr;
+            let mut ix_rest: &mut [i32] = &mut indices;
+            let mut d_rest: &mut [f32] = &mut data;
+            for (i, &(n_rows, nnz)) in shard_sizes.iter().enumerate() {
+                let ip_take = if i == 0 { n_rows + 1 } else { n_rows };
+                let (ip_head, ip_tail) = ip_rest
+                    .split_at_mut_checked(ip_take)
+                    .ok_or_else(|| Self::split_overflow(labels, i, "indptr"))?;
+                let (ix_head, ix_tail) = ix_rest
+                    .split_at_mut_checked(nnz)
+                    .ok_or_else(|| Self::split_overflow(labels, i, "indices"))?;
+                let (d_head, d_tail) = d_rest
+                    .split_at_mut_checked(nnz)
+                    .ok_or_else(|| Self::split_overflow(labels, i, "data"))?;
+                chunks.push((ip_head, ix_head, d_head));
+                ip_rest = ip_tail;
+                ix_rest = ix_tail;
+                d_rest = d_tail;
             }
-            if shard_ix.len() != nnz {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "CSR shard {i} indices length mismatch: catalog stats say {nnz}, decoded {}",
-                    shard_ix.len()
-                )));
-            }
-            if shard_data.len() != nnz {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "CSR shard {i} data length mismatch: catalog stats say {nnz}, decoded {}",
-                    shard_data.len()
-                )));
-            }
+        }
 
-            // SAFETY: each shard writes to [nnz_off..nnz_off+nnz], non-overlapping.
-            // The non-overlap invariant is enforced by the monotonic `nnz_offsets`
-            // prefix scan at L725–733 combined with the `nnz_off + nnz <= total_nnz`
-            // guard above.
-            let ix_out = unsafe {
-                std::slice::from_raw_parts_mut((indices_base as *mut i32).add(nnz_off), nnz)
-            };
-            let d_out = unsafe {
-                std::slice::from_raw_parts_mut((data_base as *mut f32).add(nnz_off), nnz)
-            };
-            ix_out.copy_from_slice(&shard_ix);
-            d_out.copy_from_slice(&shard_data);
+        let decode_into =
+            |(i, (ip_out, ix_out, d_out)): (usize, ShardOutputSlices<'_>)| -> Result<()> {
+                let (n_rows, nnz) = shard_sizes[i];
+                let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(shards[i])?;
+                check_decoded_lengths(
+                    labels,
+                    i,
+                    n_rows,
+                    nnz,
+                    shard_ip.len(),
+                    shard_ix.len(),
+                    shard_data.len(),
+                )?;
 
-            // Indptr: shard 0 copies all n_rows+1 values as-is;
-            // shard i>0 copies [1..] with cumulative nnz offset.
-            if i == 0 {
-                // SAFETY: shard 0 writes to [0..n_rows+1], non-overlapping with i>0.
-                // Bounded by `row_off + n_rows <= total_rows` guard above.
-                let ip_out =
-                    unsafe { std::slice::from_raw_parts_mut(indptr_base as *mut i64, n_rows + 1) };
-                ip_out.copy_from_slice(&shard_ip);
-            } else {
-                // SAFETY: shard i writes to [row_off+1..row_off+1+n_rows], non-overlapping.
-                // Bounded by `row_off + n_rows <= total_rows` guard above.
-                let ip_out = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        (indptr_base as *mut i64).add(row_off + 1),
-                        n_rows,
-                    )
-                };
-                let nnz_off_i64 = nnz_off as i64;
-                for j in 0..n_rows {
-                    ip_out[j] = shard_ip[j + 1] + nnz_off_i64;
+                ix_out.copy_from_slice(&shard_ix);
+                d_out.copy_from_slice(&shard_data);
+
+                // Shard 0 owns indptr[0] and copies its decoded indptr verbatim
+                // (its nnz offset is 0); every later shard copies `[1..]` rebased
+                // by the running nnz.
+                if i == 0 {
+                    ip_out.copy_from_slice(&shard_ip);
+                } else {
+                    let nnz_off_i64 = nnz_offsets[i] as i64;
+                    for (j, slot) in ip_out.iter_mut().enumerate() {
+                        *slot = shard_ip[j + 1] + nnz_off_i64;
+                    }
                 }
-            }
+                Ok(())
+            };
 
-            Ok::<_, ScxError>(())
-        })?;
+        match strategy {
+            #[cfg(feature = "parallel")]
+            RowMajorStrategy::Parallel => chunks
+                .into_par_iter()
+                .enumerate()
+                .try_for_each(decode_into)?,
+            RowMajorStrategy::Sequential => {
+                chunks.into_iter().enumerate().try_for_each(decode_into)?
+            }
+        }
 
         let n_rows = indptr.len().saturating_sub(1);
         Ok(ScxCsr::new_unchecked(
-            (n_rows, self.header.n_vars as usize),
+            (n_rows, n_cols),
             indptr,
             indices,
             data,
         ))
     }
 
-    /// Assemble multiple shard entries into a single ScxCsr (sequential).
-    ///
-    /// Pre-allocates the final merged arrays to exact sizes using catalog stats,
-    /// then decodes each shard sequentially into its target region.
-    #[cfg(any(not(feature = "parallel"), test))]
-    fn assemble_shards(&self, shards: &[&FullCatalogEntry]) -> Result<ScxCsr> {
-        if shards.is_empty() {
-            return Ok(ScxCsr::new_unchecked(
-                (0, self.header.n_vars as usize),
-                vec![0],
-                vec![],
-                vec![],
-            ));
-        }
-
-        // Hint aggressive readahead across the shard region.
-        // Use min/max of file offsets since shards are sorted by row_start,
-        // not file offset — they may not be contiguous after append/compact.
-        #[cfg(unix)]
-        {
-            let min_offset = shards.iter().map(|e| e.offset as usize).min().unwrap();
-            let max_end = shards
-                .iter()
-                .map(|e| (e.offset + e.length) as usize)
-                .max()
-                .unwrap();
-            self.advise_sequential(min_offset, max_end - min_offset);
-        }
-
-        // Pre-compute per-shard (n_rows, nnz) from catalog stats
-        let shard_sizes: Vec<(usize, usize)> = shards
-            .iter()
-            .map(|e| {
-                let stats = e.stats.as_ref().ok_or_else(|| {
-                    ScxError::InvalidCatalog(format!(
-                        "shard entry '{}' at offset {} has no stats block",
-                        e.name, e.offset
-                    ))
-                })?;
-                // checked_sub (not bare `-`): a corrupt catalog with
-                // row_end < row_start would otherwise underflow-panic in debug
-                // or wrap to a huge usize in release (driving a giant alloc).
-                let n_rows = stats.row_end.checked_sub(stats.row_start).ok_or_else(|| {
-                    ScxError::InvalidCatalog(format!(
-                        "shard '{}' has row_end {} < row_start {}",
-                        e.name, stats.row_end, stats.row_start
-                    ))
-                })? as usize;
-                Ok::<_, ScxError>((n_rows, stats.nnz as usize))
-            })
-            .collect::<Result<_>>()?;
-        let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
-        let total_nnz: usize = shard_sizes.iter().map(|(_, n)| *n).sum();
-
-        // Single allocation for final merged arrays
-        let mut indptr = vec![0i64; total_rows + 1];
-        let mut indices = vec![0i32; total_nnz];
-        let mut data = vec![0f32; total_nnz];
-
-        let mut cum_rows = 0usize;
-        let mut cum_nnz = 0usize;
-
-        for (i, entry) in shards.iter().enumerate() {
-            let (n_rows, nnz) = shard_sizes[i];
-            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
-            // Decoded-vs-catalog length checks. Returned errors (not
-            // `debug_assert!`) because a mismatch on a corrupt / stat-drifted
-            // catalog would otherwise panic in the `copy_from_slice` /
-            // `shard_ip[j + 1]` indexing below in release.
-            if shard_ip.len() != n_rows + 1 {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "CSR shard {i} indptr length mismatch: catalog stats say {}, decoded {}",
-                    n_rows + 1,
-                    shard_ip.len()
-                )));
-            }
-            if shard_ix.len() != nnz {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "CSR shard {i} indices length mismatch: catalog stats say {nnz}, decoded {}",
-                    shard_ix.len()
-                )));
-            }
-            if shard_data.len() != nnz {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "CSR shard {i} data length mismatch: catalog stats say {nnz}, decoded {}",
-                    shard_data.len()
-                )));
-            }
-
-            // Copy indices and data into their target region
-            indices[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_ix);
-            data[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_data);
-
-            // Copy indptr with cumulative nnz offset
-            if i == 0 {
-                indptr[0..n_rows + 1].copy_from_slice(&shard_ip);
-            } else {
-                let nnz_off_i64 = cum_nnz as i64;
-                for j in 0..n_rows {
-                    indptr[cum_rows + 1 + j] = shard_ip[j + 1] + nnz_off_i64;
-                }
-            }
-
-            cum_rows += n_rows;
-            cum_nnz += nnz;
-        }
-
-        let n_rows = indptr.len().saturating_sub(1);
-        Ok(ScxCsr::new_unchecked(
-            (n_rows, self.header.n_vars as usize),
-            indptr,
-            indices,
-            data,
+    /// Unreachable given the prefix sums above, but a returned error rather
+    /// than a `split_at_mut` panic: readers return errors on malformed input.
+    fn split_overflow(labels: RowMajorLabels, i: usize, buffer: &str) -> ScxError {
+        ScxError::InvalidCatalog(format!(
+            "{} {i}: {buffer} output region exceeds the allocation implied by catalog stats",
+            labels.shard
         ))
+    }
+
+    /// Assemble row-major `X`-family shards (X, a modality's X, or a layer)
+    /// with this build's default strategy.
+    fn assemble_x_shards(&self, shards: &[&FullCatalogEntry]) -> Result<ScxCsr> {
+        let n_vars = self.header.n_vars as usize;
+        self.assemble_row_major(
+            shards,
+            n_vars,
+            (0, n_vars),
+            X_LABELS,
+            RowMajorStrategy::for_build(),
+        )
     }
 }
 
