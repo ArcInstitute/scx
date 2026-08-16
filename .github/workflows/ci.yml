@@ -468,6 +468,27 @@ jobs:
             fi
           done
 
+      # Phase 4a: the two *evaluators* share one descent.
+      #
+      # Deliberately only the positive half. A "nobody else destructures
+      # Predicate::And/Or/Not" guard would be false: `pushdown::can_exclude_shard`
+      # (Level-1 catalog pruning, different semantics — it answers "can this
+      # shard be excluded", not "which rows match"), `collect::flatten_and`
+      # (conjunct flattening, not evaluation) and
+      # `category_diagnosis::string_equality_terms` all walk the tree for their
+      # own reasons and legitimately do not go through `walk`. Guarding what is
+      # actually true beats a guard that has to be exempted into meaninglessness.
+      - name: Both predicate evaluators go through walk()
+        run: |
+          set -e
+          for f in eval_inner eval_rowset; do
+            if ! sed '/#\[cfg(test)\]/,$d' scx-engine/src/predicate.rs \
+                 | grep -A8 "fn $f" | grep -qE '\bwalk\(' ; then
+              echo "::error::$f no longer evaluates through walk() — that is how the two evaluators drift apart again (review 5.1)."
+              exit 1
+            fi
+          done
+
   feature-check:
     name: Feature matrix (cargo check)
     runs-on: ubuntu-latest

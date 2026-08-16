@@ -616,7 +616,21 @@ normalize(target_sum=1e4)          ← fused with log1p when possible
 - **Predicate pushdown (Level 1):** Per-shard statistics in the catalog (min/max for numerics,
   `CategoryBitset` for categoricals) enable skipping entire shards without reading any data.
 - **Predicate pushdown (Level 2):** Predicate indexes (§3.5) provide row-level mappings
-  within qualifying shards.
+  within qualifying shards. Disable per pipeline with
+  `QueryPipeline::rowset_pushdown(false)` (or the `SCX_DISABLE_ROWSET_PUSHDOWN`
+  environment variable, which seeds the default at construction) to force the
+  legacy full-decode path. This is a **diagnostic** knob: both paths must return
+  the same rows for every predicate, and `scx-engine/tests/rowset_differential.rs`
+  asserts exactly that.
+- **One tree walk, two interpretations:** both evaluators recurse through a
+  single `walk` over the `PredicateAlgebra` trait
+  (`scx-engine/src/predicate.rs`). `MaskAlgebra` evaluates leaves as Arrow
+  comparison kernels into a Kleene `BooleanArray`; `RowSetAlgebra` resolves them
+  straight from the predicate index into an `Option<RowSet>`, where `None` means
+  *residual*, not *no rows*. They share the descent only — each keeps its own
+  leaves and its own combinator kernels, since `or_kleene` and `RowSet::union`
+  are not interchangeable. Agreement between the two is enforced by the
+  differential oracle, not by the type system.
 - **Operation fusion:** `normalize(1e4) + log1p()` → single fused CSR row scan
   (`scx-engine/src/fused_ops.rs`).
 - **Parallel collection:** Qualifying shards are decoded and filtered in parallel
