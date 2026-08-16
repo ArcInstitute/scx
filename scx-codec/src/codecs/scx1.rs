@@ -3,8 +3,50 @@
 use crate::codec_id::{CodecError, DecodedShard, EncodedShard, EncodedShardRef, ValueEncoding};
 use crate::delta_golomb::{delta_golomb_decode, delta_golomb_encode};
 use crate::forbp::{forbp_decode_with_hint, forbp_encode};
-use crate::guards::{bound_capacity, checked_len, indptr_byte_cap};
+use crate::guards::bound_capacity;
 use crate::raw::{raw_bytes_to_u32, u32_to_raw_bytes};
+use crate::shard_codec::{DecodeBounds, ShardCodec, ShardShape};
+
+/// `CodecId::Scx1` — Delta-Golomb indptr, FOR-BP indices, Rice values.
+pub struct Scx1Codec;
+
+impl ShardCodec for Scx1Codec {
+    /// Rice coding is defined over integers; a float stream has no valid
+    /// encoding here. The driver turns this into `CodecError::FloatWithScx1`.
+    fn supports(value_encoding: ValueEncoding) -> bool {
+        value_encoding.is_integer()
+    }
+
+    fn encode(
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        value_encoding: ValueEncoding,
+        index_dtype_u16: bool,
+    ) -> Result<EncodedShard, CodecError> {
+        encode_scx1(indptr, indices, values, value_encoding, index_dtype_u16)
+    }
+
+    fn decode(
+        encoded: &EncodedShardRef,
+        shape: ShardShape,
+        value_encoding: ValueEncoding,
+        index_dtype_u16: bool,
+        bounds: &DecodeBounds,
+    ) -> Result<DecodedShard, CodecError> {
+        decode_scx1_ref(encoded, shape, value_encoding, index_dtype_u16, bounds)
+    }
+
+    fn decode_indptr_only(
+        indptr_bytes: &[u8],
+        n_rows: usize,
+        _indptr_max: usize,
+    ) -> Result<Vec<u64>, CodecError> {
+        // Delta-Golomb takes the element count, not a byte cap, and applies
+        // its own `bound_capacity` internally.
+        delta_golomb_decode(indptr_bytes, n_rows + 1).map_err(Into::into)
+    }
+}
 use crate::rice::{rice_decode, rice_encode, B_VAL};
 
 pub(crate) fn encode_scx1(
@@ -36,26 +78,26 @@ pub(crate) fn encode_scx1(
     })
 }
 
-pub(crate) fn decode_scx1_ref(
+fn decode_scx1_ref(
     encoded: &EncodedShardRef,
+    shape: ShardShape,
     value_encoding: ValueEncoding,
-    n_rows: usize,
-    nnz: usize,
     index_dtype_u16: bool,
+    _bounds: &DecodeBounds,
 ) -> Result<DecodedShard, CodecError> {
-    if !value_encoding.is_integer() {
-        return Err(CodecError::FloatWithScx1);
-    }
-
-    // L1: reject headers whose byte-length computations overflow `usize`
-    // (parity with every other codec path — F-e).
-    indptr_byte_cap(n_rows)?;
-    let idx_width = if index_dtype_u16 { 2 } else { 4 };
-    checked_len(nnz, idx_width, "scx1 indices")?;
-    checked_len(nnz, value_encoding.byte_width(), "scx1 values")?;
+    let (n_rows, nnz) = (shape.n_rows, shape.nnz);
+    // L1 (the shape-derived byte caps) is the driver's `DecodeBounds::derive`.
+    // Scx1 does not consume the byte maxima — its sub-streams are bit-packed,
+    // so the element counts below are what bound them — but deriving them is
+    // still what rejects an overflowing header before this point.
 
     // L2: reject headers declaring more elements than the compressed
     // sub-streams could physically produce (F-f), before any allocation.
+    //
+    // This one stays here rather than in `DecodeBounds`, deliberately:
+    // `bound_capacity` asserts >= 1 input bit per output element, which is a
+    // property of Golomb/Rice and false of every entropy coder. Hoisting it
+    // would break float decode on Pcodec exactly as #436 did.
     let n_rows_p1 = n_rows
         .checked_add(1)
         .ok_or_else(|| CodecError::MalformedInput(format!("scx1 n_rows+1 overflow: {n_rows}")))?;

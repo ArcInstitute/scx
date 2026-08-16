@@ -272,6 +272,142 @@ fn test_decode_capacity_boundary_passes() {
 }
 
 // ---------------------------------------------------------------------------
+// The `ShardCodec` seam: caps are derived once, for every codec
+//
+// ORG-3.7-3 moved the three shape-derived byte caps into
+// `DecodeBounds::derive`, called by the driver before it dispatches. The
+// property that buys is *uniformity*: no codec can reach its own decode body
+// with a shape whose byte lengths overflow, because none of them derive the
+// caps any more. Before this, each decoder re-derived them and `Lz4Shuffle`
+// derived nothing at all (#436).
+// ---------------------------------------------------------------------------
+
+const ALL_CODECS: [CodecId; 6] = [
+    CodecId::None,
+    CodecId::Scx1,
+    CodecId::Zstd,
+    CodecId::Lz4Shuffle,
+    CodecId::Pcodec,
+    CodecId::ShufDeltaZstd,
+];
+
+#[test]
+fn every_codec_rejects_a_hostile_shape_before_decoding() {
+    // `n_rows` chosen so `(n_rows + 1) * 8` overflows and `nnz` so
+    // `nnz * width` does. Every codec must return an error; none may panic,
+    // and none may get far enough to allocate.
+    let encoded = EncodedShardRef {
+        indptr_bytes: &[0u8; 16],
+        indices_bytes: &[0u8; 16],
+        values_bytes: &[0u8; 16],
+    };
+    for codec in ALL_CODECS {
+        for &(n_rows, nnz) in &[
+            (usize::MAX / 4, 8usize),
+            (4usize, usize::MAX / 2),
+            (usize::MAX, usize::MAX),
+        ] {
+            let err = decode_shard_ref(&encoded, codec, ValueEncoding::Uint32, n_rows, nnz, false)
+                .unwrap_err();
+            assert!(
+                matches!(err, CodecError::MalformedInput(_)),
+                "{codec:?} with n_rows={n_rows} nnz={nnz}: expected MalformedInput \
+                 from the shared cap derivation, got {err:?}"
+            );
+
+            // The scipy and native entry points are not wrappers around
+            // `decode_shard_ref`: both short-circuit Scx1 into the sub-stream
+            // primitives, so they are decode entry points in their own right,
+            // and `scx-format-io` reaches Scx1 through them.
+            //
+            // What this pins is that they *reject* a hostile shape, not which
+            // guard does it. For Scx1 the L2 `bound_capacity` check dominates:
+            // a huge declared count against a 16-byte sub-stream fails there
+            // regardless of L1, so replacing their hand-rolled L1 with the
+            // shared `DecodeBounds::derive` is de-duplication, not a bug fix,
+            // and is not falsifiable by any input. Verified by reverting that
+            // change and watching this test stay green.
+            let e = decode_shard_scipy(
+                &encoded,
+                codec,
+                ValueEncoding::Uint32,
+                n_rows,
+                nnz,
+                false,
+                u32::MAX,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(e, CodecError::MalformedInput(_)),
+                "{codec:?} scipy path with n_rows={n_rows} nnz={nnz}: got {e:?}"
+            );
+
+            // `NativeShard` carries `ShardValuesNative`, which is not `Debug`,
+            // so match on the Err arm rather than `unwrap_err()`.
+            match decode_shard_native(&encoded, codec, ValueEncoding::Uint32, n_rows, nnz, false) {
+                Err(CodecError::MalformedInput(_)) => {}
+                Err(other) => {
+                    panic!("{codec:?} native path with n_rows={n_rows} nnz={nnz}: got {other:?}")
+                }
+                Ok(_) => panic!("{codec:?} native path accepted n_rows={n_rows} nnz={nnz}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn scx1_float_precedence_survives_an_invalid_shape() {
+    // Scx1 + float + an overflowing shape is doubly invalid. `FloatWithScx1`
+    // is the pre-existing answer and must not become `MalformedInput` just
+    // because the shape arithmetic now runs in the driver.
+    let encoded = EncodedShardRef {
+        indptr_bytes: &[0u8; 16],
+        indices_bytes: &[0u8; 8],
+        values_bytes: &[0u8; 8],
+    };
+    for &(n_rows, nnz) in &[(1usize, 2usize), (usize::MAX / 4, usize::MAX / 2)] {
+        let err = decode_shard_ref(
+            &encoded,
+            CodecId::Scx1,
+            ValueEncoding::Float32,
+            n_rows,
+            nnz,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CodecError::FloatWithScx1),
+            "n_rows={n_rows} nnz={nnz}: expected FloatWithScx1, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn scx1_float_rejection_is_uniform_through_the_driver() {
+    // `supports()` is checked by the driver, so the rejection no longer
+    // depends on Scx1's decode body being reached at all.
+    let encoded = EncodedShardRef {
+        indptr_bytes: &[0u8; 16],
+        indices_bytes: &[0u8; 8],
+        values_bytes: &[0u8; 8],
+    };
+    let err =
+        decode_shard_ref(&encoded, CodecId::Scx1, ValueEncoding::Float32, 1, 2, false).unwrap_err();
+    assert!(
+        matches!(err, CodecError::FloatWithScx1),
+        "expected FloatWithScx1, got {err:?}"
+    );
+    // The other five must not borrow that rejection: they fail on the
+    // payload, not on the encoding being float.
+    for codec in ALL_CODECS.iter().filter(|c| **c != CodecId::Scx1) {
+        let e = decode_shard_ref(&encoded, *codec, ValueEncoding::Float32, 1, 2, false);
+        if let Err(CodecError::FloatWithScx1) = e {
+            panic!("{codec:?} must not report FloatWithScx1");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bounded decompression: Lz4Shuffle and Pcodec
 //
 // Every other codec caps how many bytes a sub-stream may decompress to before

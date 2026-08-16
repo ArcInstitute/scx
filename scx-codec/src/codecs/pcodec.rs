@@ -2,12 +2,48 @@
 
 use crate::codec_id::{CodecError, DecodedShard, EncodedShard, EncodedShardRef, ValueEncoding};
 use crate::codecs::zstd_codec::zstd_decode_bounded;
-use crate::guards::{checked_len, indptr_byte_cap};
+use crate::guards::checked_len;
+use crate::shard_codec::{DecodeBounds, ShardCodec, ShardShape};
+
+/// `CodecId::Pcodec` — pcodec for float values, zstd for indptr/indices.
+pub struct PcodecCodec;
+
+impl ShardCodec for PcodecCodec {
+    fn encode(
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        value_encoding: ValueEncoding,
+        index_dtype_u16: bool,
+    ) -> Result<EncodedShard, CodecError> {
+        encode_pcodec(indptr, indices, values, value_encoding, index_dtype_u16)
+    }
+
+    fn decode(
+        encoded: &EncodedShardRef,
+        shape: ShardShape,
+        value_encoding: ValueEncoding,
+        index_dtype_u16: bool,
+        bounds: &DecodeBounds,
+    ) -> Result<DecodedShard, CodecError> {
+        decode_pcodec_ref(encoded, shape, value_encoding, index_dtype_u16, bounds)
+    }
+
+    fn decode_indptr_only(
+        indptr_bytes: &[u8],
+        n_rows: usize,
+        indptr_max: usize,
+    ) -> Result<Vec<u64>, CodecError> {
+        let raw = zstd_decode_bounded(indptr_bytes, indptr_max)?;
+        le_bytes_to_u64(&raw, n_rows + 1)
+    }
+}
+
 use crate::raw::{
     indices_to_le_bytes, le_bytes_to_indices, le_bytes_to_u64, u64_slice_to_le_bytes,
 };
 
-pub(crate) fn encode_pcodec(
+fn encode_pcodec(
     indptr: &[u64],
     indices: &[u32],
     values: &[u8],
@@ -169,16 +205,20 @@ pub(crate) fn pcodec_decompress_bounded(
     Ok(out)
 }
 
-pub(crate) fn decode_pcodec_ref(
+fn decode_pcodec_ref(
     encoded: &EncodedShardRef,
-    n_rows: usize,
-    nnz: usize,
+    shape: ShardShape,
     value_encoding: ValueEncoding,
     index_dtype_u16: bool,
+    bounds: &DecodeBounds,
 ) -> Result<DecodedShard, CodecError> {
-    // indptr and indices: Zstd decompress
-    let indptr_max = indptr_byte_cap(n_rows)?;
-    let indices_max = checked_len(nnz, if index_dtype_u16 { 2 } else { 4 }, "indices")?;
+    let (n_rows, nnz) = (shape.n_rows, shape.nnz);
+    // indptr and indices: Zstd decompress, capped by the driver's bounds.
+    let DecodeBounds {
+        indptr_max,
+        indices_max,
+        values_max,
+    } = *bounds;
 
     let indptr_raw = zstd_decode_bounded(encoded.indptr_bytes, indptr_max)?;
     let indices_raw = zstd_decode_bounded(encoded.indices_bytes, indices_max)?;
@@ -205,14 +245,16 @@ pub(crate) fn decode_pcodec_ref(
             }
             buf
         }
-        _ => {
-            // Integer encodings: Zstd decompress
-            let values_max = checked_len(nnz, value_encoding.byte_width(), "values")?;
-            zstd_decode_bounded(encoded.values_bytes, values_max)?
-        }
+        // Integer encodings: Zstd decompress, capped by the driver's byte bound.
+        //
+        // NB `values_max` is a *byte* cap and is only usable here and in the
+        // length check below. `pcodec_decompress_bounded` takes an element
+        // *count*: the Float16 arm decompresses as f32 and narrows, so its
+        // count is `nnz` while `values_max` is `nnz * 2`.
+        _ => zstd_decode_bounded(encoded.values_bytes, values_max)?,
     };
 
-    let expected_len = checked_len(nnz, value_encoding.byte_width(), "values")?;
+    let expected_len = values_max;
     if values_raw.len() != expected_len {
         return Err(CodecError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

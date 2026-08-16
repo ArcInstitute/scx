@@ -1,7 +1,44 @@
 //! Split out of `dispatch.rs` (ORG-3.7-2). Pure move.
 
 use crate::codec_id::{CodecError, DecodedShard, EncodedShard, EncodedShardRef, ValueEncoding};
-use crate::guards::{checked_len, indptr_byte_cap};
+
+use crate::shard_codec::{DecodeBounds, ShardCodec, ShardShape};
+
+/// `CodecId::Lz4Shuffle` — byte-shuffle pre-filter, then LZ4 frame.
+pub struct Lz4ShuffleCodec;
+
+impl ShardCodec for Lz4ShuffleCodec {
+    fn encode(
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        value_encoding: ValueEncoding,
+        index_dtype_u16: bool,
+    ) -> Result<EncodedShard, CodecError> {
+        encode_lz4_shuffle(indptr, indices, values, value_encoding, index_dtype_u16)
+    }
+
+    fn decode(
+        encoded: &EncodedShardRef,
+        shape: ShardShape,
+        value_encoding: ValueEncoding,
+        index_dtype_u16: bool,
+        bounds: &DecodeBounds,
+    ) -> Result<DecodedShard, CodecError> {
+        decode_lz4_shuffle_ref(encoded, shape, value_encoding, index_dtype_u16, bounds)
+    }
+
+    fn decode_indptr_only(
+        indptr_bytes: &[u8],
+        n_rows: usize,
+        indptr_max: usize,
+    ) -> Result<Vec<u64>, CodecError> {
+        let shuffled = lz4_frame_decompress(indptr_bytes, indptr_max)?;
+        let raw = byte_unshuffle(&shuffled, 8)?;
+        le_bytes_to_u64(&raw, n_rows + 1)
+    }
+}
+
 use crate::raw::{
     indices_to_le_bytes, le_bytes_to_indices, le_bytes_to_u64, u64_slice_to_le_bytes,
 };
@@ -50,7 +87,7 @@ pub(crate) fn lz4_frame_decompress(data: &[u8], max_bytes: usize) -> Result<Vec<
     Ok(out)
 }
 
-pub(crate) fn encode_lz4_shuffle(
+fn encode_lz4_shuffle(
     indptr: &[u64],
     indices: &[u32],
     values: &[u8],
@@ -77,25 +114,23 @@ pub(crate) fn encode_lz4_shuffle(
     })
 }
 
-pub(crate) fn decode_lz4_shuffle_ref(
+fn decode_lz4_shuffle_ref(
     encoded: &EncodedShardRef,
-    n_rows: usize,
-    nnz: usize,
+    shape: ShardShape,
     value_encoding: ValueEncoding,
     index_dtype_u16: bool,
+    bounds: &DecodeBounds,
 ) -> Result<DecodedShard, CodecError> {
-    // Bound every sub-stream from the declared shape before decompressing, in
-    // the same order and by the same helpers as `decode_zstd_ref`. Deriving the
-    // caps up front is also what keeps the unchecked `count * width`
-    // multiplications inside `le_bytes_to_u64` / `le_bytes_to_indices` out of
-    // reach of a hostile `n_rows` / `nnz`: `indptr_byte_cap` and `checked_len`
-    // do those multiplications in checked arithmetic and return an error, where
-    // this codec previously reached them directly and panicked under the
-    // crate's `overflow-checks = true`.
+    let (n_rows, nnz) = (shape.n_rows, shape.nnz);
+    // Caps come from the driver's `DecodeBounds::derive` — this codec used to
+    // derive nothing at all, which is how it reached `le_bytes_to_u64`'s
+    // unchecked `count * 8` and panicked in release (#436).
     let index_width = if index_dtype_u16 { 2 } else { 4 };
-    let indptr_max = indptr_byte_cap(n_rows)?;
-    let indices_max = checked_len(nnz, index_width, "indices")?;
-    let values_max = checked_len(nnz, value_encoding.byte_width(), "values")?;
+    let DecodeBounds {
+        indptr_max,
+        indices_max,
+        values_max,
+    } = *bounds;
 
     // LZ4 frame decompress then byte-unshuffle each array
     let indptr_shuffled = lz4_frame_decompress(encoded.indptr_bytes, indptr_max)?;

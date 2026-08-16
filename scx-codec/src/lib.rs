@@ -10,6 +10,7 @@ pub mod guards;
 pub mod median;
 pub mod raw;
 pub mod rice;
+pub(crate) mod shard_codec;
 pub mod shuffle;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod simd;

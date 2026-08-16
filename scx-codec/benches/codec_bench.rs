@@ -406,6 +406,71 @@ fn bench_decode_shard(c: &mut Criterion) {
                 })
             },
         );
+
+        // ORG-3.7-3: the trait seam sits on `decode_shard_ref` for *every*
+        // codec, so measuring only Scx1 and ShufDeltaZstd leaves four of six
+        // arms unmeasured. These cover the rest of the dispatch surface.
+        for (codec, name) in [
+            (CodecId::None, "none"),
+            (CodecId::Zstd, "zstd"),
+            (CodecId::Lz4Shuffle, "lz4shuffle"),
+            (CodecId::Pcodec, "pcodec"),
+        ] {
+            let enc_other = encode_shard(
+                &indptr,
+                &indices,
+                &values,
+                codec,
+                ValueEncoding::Uint8,
+                index_dtype_u16,
+            )
+            .unwrap();
+            group.bench_with_input(BenchmarkId::new(name, label), &enc_other, |b, e| {
+                b.iter(|| {
+                    decode_shard(
+                        black_box(e),
+                        black_box(codec),
+                        black_box(ValueEncoding::Uint8),
+                        black_box(n_rows_actual),
+                        black_box(nnz),
+                        black_box(index_dtype_u16),
+                    )
+                    .unwrap()
+                })
+            });
+        }
+
+        // Pcodec at Uint8 routes its values through zstd, not pco — the arm
+        // above therefore never measures the float path the codec exists for.
+        let values_f32: Vec<u8> = (0..nnz)
+            .flat_map(|i| ((i % 97) as f32).to_le_bytes())
+            .collect();
+        let enc_pco_f32 = encode_shard(
+            &indptr,
+            &indices,
+            &values_f32,
+            CodecId::Pcodec,
+            ValueEncoding::Float32,
+            index_dtype_u16,
+        )
+        .unwrap();
+        group.bench_with_input(
+            BenchmarkId::new("pcodec_f32", label),
+            &enc_pco_f32,
+            |b, e| {
+                b.iter(|| {
+                    decode_shard(
+                        black_box(e),
+                        black_box(CodecId::Pcodec),
+                        black_box(ValueEncoding::Float32),
+                        black_box(n_rows_actual),
+                        black_box(nnz),
+                        black_box(index_dtype_u16),
+                    )
+                    .unwrap()
+                })
+            },
+        );
     }
 
     group.finish();
