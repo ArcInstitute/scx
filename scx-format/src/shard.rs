@@ -182,18 +182,23 @@ impl ShardHeader {
 /// obsp CSR). Used by writer call sites to label shards correctly in their
 /// 76-byte headers.
 pub fn derive_shard_type(section_type: SectionType) -> u8 {
-    match section_type {
-        SectionType::CscShard | SectionType::LayerCscShard => 1,
-        _ => 0,
-    }
+    u8::from(is_column_major(section_type))
 }
 
 /// Whether a section type stores its data column-major.
 ///
-/// The one place that question is answered. `LayerCscShard` (id 16) used to
-/// be column-major to some callers and row-major to others — including within
-/// a single write→read round trip — because each site matched `CscShard`
-/// alone and there was no producer to force them to agree.
+/// **The one place that question is answered.** Every site that dispatches on
+/// storage order — the on-disk `shard_type` byte, both catalog representations'
+/// stats-axis pick, the writer's stats/index-width/`n_minor` choice, the shard
+/// decoder's header/catalog reconciliation — calls this rather than restating
+/// the list. `LayerCscShard` (id 16) is what forced the rule: it used to be
+/// column-major to some callers and row-major to others, *including within a
+/// single write→read round trip*, because each site matched `CscShard` alone
+/// and no producer existed to make them disagree out loud.
+///
+/// Adding a column-major section type is therefore a one-line change here.
+/// `scx-format-io`'s `column_major_dispatch_is_exhaustive` walks every
+/// discriminant and fails if any site drifts from this answer.
 pub fn is_column_major(section_type: SectionType) -> bool {
     matches!(
         section_type,

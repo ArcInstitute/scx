@@ -1054,10 +1054,7 @@ impl ScxWriter {
         // the reader rejects a sidecar whose recorded generation does not
         // match `data_generation` (staleness guard). Mutating ops that
         // drop CSC never reach this branch, so the field stays `0`.
-        if matches!(
-            section_type,
-            SectionType::CscShard | SectionType::LayerCscShard
-        ) {
+        if crate::shard::is_column_major(section_type) {
             self.csc_build_generation = Some(self.data_generation);
         }
 

@@ -110,14 +110,13 @@ pub fn decode_shard_bytes(
 
 /// Whether the **catalog** says this section is column-major.
 ///
-/// Named explicitly rather than derived from the shard header, and it includes
-/// `LayerCscShard`: a layer's CSC sidecar tiles the same axis as X's, so omitting
-/// it would read the wrong stats pair for every layer sidecar.
+/// Named explicitly rather than derived from the shard header — the distinction
+/// from `ShardHeader::is_csc` is the whole point at the call sites, since the
+/// header is unauthenticated bytes. The answer itself comes from
+/// [`crate::shard::is_column_major`], so this cannot drift from what the writer
+/// stamped or from what either catalog representation reads.
 pub(crate) fn catalog_says_column_major(section_type: SectionType) -> bool {
-    matches!(
-        section_type,
-        SectionType::CscShard | SectionType::LayerCscShard
-    )
+    crate::shard::is_column_major(section_type)
 }
 
 /// Reconcile a shard's declared minor extent against a width the caller knows
@@ -1245,6 +1244,52 @@ mod tests {
         assert!(
             matches!(err, ScxError::SectionOutOfBounds { .. }),
             "expected SectionOutOfBounds, got {err:?}"
+        );
+    }
+
+    /// Every site that dispatches on storage order must agree with
+    /// `shard::is_column_major`, for **every** section type — not just the two
+    /// that are column-major today.
+    ///
+    /// The predicate being centralised is not itself the guarantee: nothing
+    /// stops a future edit from re-spelling `matches!(st, CscShard | ...)` at
+    /// one of these sites, which is exactly the state this series found the
+    /// tree in (`LayerCscShard` was column-major to three callers and row-major
+    /// to five, with no producer to make them disagree out loud). Walking the
+    /// discriminants is what turns "adding a column-major section type is a
+    /// one-line change" into something a test can fail on.
+    #[test]
+    fn column_major_dispatch_is_exhaustive() {
+        use crate::shard::{derive_shard_type, is_column_major};
+
+        let mut seen_column_major = 0usize;
+        for raw in 0u8..=255 {
+            let Some(st) = SectionType::from_u8(raw) else {
+                continue;
+            };
+            let expected = is_column_major(st);
+            seen_column_major += usize::from(expected);
+
+            assert_eq!(
+                derive_shard_type(st) == 1,
+                expected,
+                "{st:?} (id {raw}): the on-disk shard_type byte disagrees with \
+                 is_column_major — a reader would reject what the writer emits"
+            );
+            assert_eq!(
+                catalog_says_column_major(st),
+                expected,
+                "{st:?} (id {raw}): the decoder's catalog dispatch disagrees with \
+                 is_column_major — it would reconcile against the wrong stats pair"
+            );
+        }
+
+        // Guards the guard: if `from_u8` or the predicate regressed to answering
+        // `false` everywhere, every assertion above would hold vacuously.
+        assert_eq!(
+            seen_column_major, 2,
+            "expected exactly CscShard and LayerCscShard to be column-major; \
+             update this count deliberately when adding one"
         );
     }
 }

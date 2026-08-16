@@ -141,10 +141,7 @@ fn name_required_for(section_type: SectionType) -> bool {
 /// row-major shards (the v1 reconciliation that `FullCatalog::read_from`
 /// performs is implicit here).
 fn stats_axis_offsets(catalog_version: u16, section_type: SectionType) -> (usize, usize, usize) {
-    let is_column_major = matches!(
-        section_type,
-        SectionType::CscShard | SectionType::LayerCscShard
-    );
+    let is_column_major = crate::shard::is_column_major(section_type);
     if catalog_version >= 2 && is_column_major {
         // v2 CSC layout: row_start(8) row_end(8) col_start(8) col_end(8) nnz(8) ...
         (16, 24, 32)
@@ -299,15 +296,15 @@ impl CatalogView {
             .iter()
             .map(|e| {
                 let stats = e.stats.as_ref().map(|s| {
-                    let (major_start, major_end) = match e.section_type {
-                        // v2 CSC: explicit col pair. v1 CSC: row pair
-                        // already reconciled into col pair by
-                        // `FullCatalog::read_from`, so reading col_*
-                        // here is correct for both versions.
-                        SectionType::CscShard | SectionType::LayerCscShard => {
-                            (s.col_start, s.col_end)
-                        }
-                        _ => (s.row_start, s.row_end),
+                    // v2 column-major: explicit col pair. v1: the row pair was
+                    // already reconciled into the col pair by
+                    // `FullCatalog::read_from`, so reading col_* here is
+                    // correct for both versions.
+                    let (major_start, major_end) = if crate::shard::is_column_major(e.section_type)
+                    {
+                        (s.col_start, s.col_end)
+                    } else {
+                        (s.row_start, s.row_end)
                     };
                     ShardStatsLite {
                         major_start,
@@ -818,6 +815,77 @@ mod tests {
         assert_eq!(s.major_start, 0);
         assert_eq!(s.major_end, 256);
         assert_eq!(s.nnz, 50_000);
+    }
+
+    /// Both view construction paths must pick the same stats axis as
+    /// `shard::is_column_major` says, for **every** section type.
+    ///
+    /// `read_from_bytes_matches_from_full` compares the two paths against each
+    /// other, which is agreement rather than correctness — and its fixture
+    /// carries no `LayerCscShard` at all, so the axis they most recently
+    /// disagreed about is the one it could not see. This walks the
+    /// discriminants and checks both paths against the predicate, so neither a
+    /// re-spelled `matches!` in `stats_axis_offsets` nor one in `from_full` can
+    /// drift silently, and a newly column-major section type is covered the day
+    /// it is added.
+    #[test]
+    fn every_section_type_picks_the_same_axis_in_both_view_paths() {
+        // Four distinct values, so reading the wrong pair cannot coincide with
+        // reading the right one.
+        const ROW: (u64, u64) = (100, 200);
+        const COL: (u64, u64) = (300, 400);
+
+        let mut entries = Vec::new();
+        for raw in 0u8..=255 {
+            let Some(section_type) = SectionType::from_u8(raw) else {
+                continue;
+            };
+            entries.push(FullCatalogEntry {
+                name: format!("section_{raw}"),
+                offset: 4352 + u64::from(raw) * 1000,
+                length: 1000,
+                section_type,
+                checksum: [raw; 32],
+                modality_id: 0,
+                stats: Some(ShardStats {
+                    row_start: ROW.0,
+                    row_end: ROW.1,
+                    col_start: COL.0,
+                    col_end: COL.1,
+                    nnz: 7,
+                    value_min: 0,
+                    value_max: 0,
+                    value_sum: 0,
+                    n_indexed_columns: 0,
+                    column_stats: vec![],
+                }),
+            });
+        }
+        assert!(entries.len() > 20, "expected the full section-type enum");
+
+        let full = build_full(entries, 1000);
+        let mut buf = Vec::new();
+        full.write_to(&mut buf).unwrap();
+        let from_bytes = CatalogView::read_from_bytes(&buf, true).unwrap();
+        let from_full = CatalogView::from_full(&full);
+
+        for (a, b) in from_bytes.entries.iter().zip(from_full.entries.iter()) {
+            assert_eq!(a.section_type, b.section_type);
+            let expected = if crate::shard::is_column_major(a.section_type) {
+                COL
+            } else {
+                ROW
+            };
+            for (label, e) in [("read_from_bytes", a), ("from_full", b)] {
+                let s = e.stats.as_ref().unwrap();
+                assert_eq!(
+                    (s.major_start, s.major_end),
+                    expected,
+                    "{label} read the wrong stats axis for {:?}",
+                    e.section_type
+                );
+            }
+        }
     }
 
     /// §4.7: the v4 generation counters must survive into the view, by both

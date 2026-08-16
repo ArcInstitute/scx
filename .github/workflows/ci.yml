@@ -179,11 +179,18 @@ jobs:
       # The negative grep above cannot see a walk that re-derives 53 without
       # naming it. This is the positive half: both representations are built by
       # the cursor, so each must construct one.
+      #
+      # Scanned only up to the first `#[cfg(test)]`. `catalog_view.rs` embeds its
+      # test module in the same file, so a whole-file grep would stay green on a
+      # `read_from_bytes` that had stopped using the cursor as long as some test
+      # below still constructed one — the guard would be satisfied by the thing
+      # it is supposed to be checking.
       - name: Both catalog representations are built by the cursor
         run: |
           for f in scx-format/src/catalog.rs scx-format/src/catalog_view.rs; do
-            if ! grep -qE 'CatalogEntryCursor::(new|over_payload)[[:space:]]*\(' "$f"; then
-              echo "::error::$f no longer builds a CatalogEntryCursor — the two catalog parsers must share one entry walk."
+            if ! sed '/#\[cfg(test)\]/,$d' "$f" \
+                 | grep -qE 'CatalogEntryCursor::(new|over_payload)[[:space:]]*\('; then
+              echo "::error::$f no longer builds a CatalogEntryCursor in production code — the two catalog parsers must share one entry walk."
               exit 1
             fi
           done
