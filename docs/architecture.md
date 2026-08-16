@@ -634,7 +634,42 @@ normalize(target_sum=1e4)          ← fused with log1p when possible
 - **Operation fusion:** `normalize(1e4) + log1p()` → single fused CSR row scan
   (`scx-engine/src/fused_ops.rs`).
 - **Parallel collection:** Qualifying shards are decoded and filtered in parallel
-  via rayon (`scx-engine/src/collect.rs`).
+  via rayon (`scx-engine/src/collect/`).
+
+### Query execution (`scx-engine/src/collect/`)
+
+Three layers, bottom up. The split exists so that `mask` is the **only** module
+that decides row-set-pushdown vs legacy-full-decode; `execute` consumes a
+`MaskResult` without knowing which arm produced it, which makes that fork an
+interface rather than a branch buried mid-file.
+
+| Module | Holds |
+|---|---|
+| `mod.rs` | the re-exports every `collect::<name>` import path resolves through, and `rowset_pushdown_disabled_by_env` |
+| `retry.rs` | `par_map_with_shard_retry` — generic resilient parallel map, nothing query-specific |
+| `rows.rs` | `filter_csr_rows` — row selection inside one decoded shard |
+| `plan.rs` | `ExecutionPlan`: Level-1 catalog shard pruning and the category dictionaries both levels share |
+| `mask.rs` | the row-set fast path, the legacy full-decode fallback, and `compute_mask`, the fork between them |
+| `execute.rs` | `execute` / `count` / `exists`, `plan_and_mask` and `materialize` |
+
+### Predicate indexes (`scx-engine/src/index/`)
+
+| Module | Holds |
+|---|---|
+| `mod.rs` | the nine on-disk structs, `IndexKind`, and the re-exports every `index::<name>` path resolves through |
+| `wire.rs` | the [format.md](format.md) binary layout — `write_to` / `read_from`, v1 and v2 |
+| `lookup.rs` | query-time lookups: what the row-set fast path asks an index |
+| `build.rs` | eager construction, plus the categorical / numeric primitives `stream` shares |
+| `stream.rs` | `ObsPredicateIndexBuilder`, for callers that never hold the whole obs `RecordBatch` |
+| `derive.rs` | per-shard catalog `column_stats` (Level 1) derived from a finished index |
+| `diagnostics.rs` | CLI message rendering, index presets, and `resolve_csc_policy` |
+| `values.rs` | Arrow value extraction and type classification, the leaf layer |
+
+`diagnostics.rs` holds code that reads no index at all. It lives in `scx-engine`
+because `pyscx` depends on `scx-engine` unconditionally but on `scx-convert`
+only under the `hdf5` feature, so a helper shared by the `scx convert` CLI and
+the Python conversion entry points cannot live in `scx-convert`. Moving it
+within the crate is fine; moving it out is not.
 
 ### `SectionReader` — local + cloud unification
 
