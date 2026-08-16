@@ -2408,6 +2408,54 @@ mod tests {
             );
         }
 
+        /// The `Or` union stops exactly at the Kleene TRUE-set, including at a
+        /// null row — the property the whole row-set path rests on.
+        ///
+        /// `or_resolves_from_index_regardless_of_column_nullability` above only
+        /// asserts that a nullable operand does not *forfeit* pushdown. It does
+        /// not pin the boundary, and the boundary is where a wrong answer would
+        /// live: the categorical index omits NULL rows, so a row that is
+        /// UNKNOWN on one side and FALSE on the other must fall out of the
+        /// union, not into it.
+        ///
+        /// Global rows 13..20 are exactly that row: no `cell_type` entry covers
+        /// them (`B cell` ends at 13, `T cell` at 10) and `tissue == 'blood'` is
+        /// shard 0 only. Rows 10..13 are the mirror case and must be kept —
+        /// `B cell` is TRUE there even though `blood` is not.
+        ///
+        /// Today this is exercised only by the randomized generator in
+        /// `tests/rowset_differential.rs`, where a seed or grammar change could
+        /// lose it silently.
+        #[test]
+        fn or_stops_at_the_kleene_true_set_across_a_null_row() {
+            let index = idx();
+            let ranges = ctx_ranges();
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
+            let or = Predicate::Or(
+                Box::new(eq("cell_type", "B cell")),
+                Box::new(eq("tissue", "blood")),
+            );
+            let rs = eval_rowset(&or, &ctx).expect("both sides resolve exactly");
+            assert_eq!(
+                rs.ranges(),
+                &[RowRange { start: 0, end: 13 }],
+                "union must be `B cell` [0,5)+[10,13) ∪ `blood` [0,10)"
+            );
+            assert!(
+                rs.iter_rows().all(|r| r < 13),
+                "a row that is UNKNOWN on one operand and FALSE on the other is \
+                 not a match; rows 13..20 have no cell_type entry and no blood \
+                 entry, so they must not be in the union"
+            );
+            assert!(
+                (10..13).all(|r| rs.iter_rows().any(|x| x == r)),
+                "rows 10..13 are TRUE on `cell_type == 'B cell'` even though \
+                 `tissue == 'blood'` does not reach shard 1 — Kleene OR keeps \
+                 them"
+            );
+        }
+
         #[test]
         fn and_with_residual_side_is_residual() {
             let index = idx();

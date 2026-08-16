@@ -402,3 +402,61 @@ fn query_survives_transient_csr_shard_failure() {
         "all matched rows materialized"
     );
 }
+
+/// Every shard pruned at Level-1 means **no shard is read at all** — asserted
+/// by making every read fail.
+///
+/// `pushdown_skip.rs` covers "one of two shards is skipped". Nothing covered
+/// the all-pruned case, where the query must return an empty result without
+/// touching X: the candidate list is empty, so the decode loop never runs and
+/// the retry machinery above never gets a chance to mask a read that should
+/// not have happened.
+///
+/// The fault injector is used here as a *detector* rather than as a fault: with
+/// `usize::MAX` X-shard failures armed, any decode at all surfaces as an error,
+/// so `collect()` succeeding is direct evidence that none occurred. A counter
+/// would prove the same thing and would also have to be believed; an injected
+/// failure cannot be silently zero.
+///
+/// `cell_type == 'Ghost'` is absent from the file's complete `cell_type`
+/// vocabulary, so both shards' `CategoryBitset` prune.
+#[test]
+fn a_predicate_matching_no_shard_reads_no_shard() {
+    let dir = TempDir::new().unwrap();
+    let path = build_sharded_indexed_file(&dir);
+
+    let armed = |expr: &str| {
+        let inner = ScxReader::open(&path).unwrap();
+        let reader =
+            FaultInjectingReader::new(inner, 0, 0, Fault::NonRetryable).with_x_fails(usize::MAX);
+        QueryPipeline::from_reader(Box::new(reader))
+            .unwrap()
+            .filter_obs(expr)
+            .unwrap()
+    };
+
+    let r = armed("cell_type == 'Ghost'")
+        .collect()
+        .expect("every shard is pruned, so no X shard may be decoded");
+    assert_eq!(r.total_shards, 2);
+    assert_eq!(r.skipped_shards, 2, "both shards must be pruned");
+    assert_eq!(r.matched_rows, 0);
+    assert_eq!(r.x.n_rows(), 0);
+    assert_eq!(r.obs.num_rows(), 0, "obs must be filtered to nothing too");
+
+    // count() / exists() take their own paths to the same conclusion.
+    assert_eq!(
+        armed("cell_type == 'Ghost'").count().unwrap().matched_rows,
+        0
+    );
+    assert!(!armed("cell_type == 'Ghost'").exists().unwrap());
+
+    // Control, in the same armed configuration: a predicate that DOES match
+    // must hit the injector. Without this the assertions above pass just as
+    // well against an engine that reads nothing ever.
+    assert!(
+        armed("cell_type == 'A'").collect().is_err(),
+        "a matching predicate must decode a shard and so must trip the injector \
+         — otherwise the no-read assertions above are vacuous"
+    );
+}
