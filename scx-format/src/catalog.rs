@@ -3,6 +3,7 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
+use crate::catalog_cursor::{CatalogEntryCursor, CatalogPreamble};
 use crate::checksum::blake3_hash;
 use crate::error::{Result, ScxError};
 use crate::section::SectionType;
@@ -283,18 +284,20 @@ impl ShardStats {
     /// CSC entries reconciled at catalog-read time the two pairs are
     /// equal, so this accessor returns the same value either way.
     pub fn major_start(&self, section_type: SectionType) -> u64 {
-        match section_type {
-            SectionType::CscShard => self.col_start,
-            _ => self.row_start,
+        if crate::shard::is_column_major(section_type) {
+            self.col_start
+        } else {
+            self.row_start
         }
     }
 
     /// Generic major-axis end: `row_end` for CSR/Layer/Obsp,
     /// `col_end` for CSC. See [`Self::major_start`] for the rationale.
     pub fn major_end(&self, section_type: SectionType) -> u64 {
-        match section_type {
-            SectionType::CscShard => self.col_end,
-            _ => self.row_end,
+        if crate::shard::is_column_major(section_type) {
+            self.col_end
+        } else {
+            self.row_end
         }
     }
 
@@ -395,209 +398,6 @@ impl ShardStats {
             value_sum,
             n_indexed_columns,
             column_stats,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// LazyShardStats — eager scalars, lazy column_stats decode
-// ---------------------------------------------------------------------------
-
-/// `ShardStats` whose per-column statistics payload is retained as
-/// opaque bytes and parsed on demand. All fixed-width scalar fields
-/// (`row_*`, `col_*`, `nnz`, `value_*`, `n_indexed_columns`) are
-/// decoded eagerly at parse time — they are cheap and most read-path
-/// consumers need them. The variable-length `column_stats` tail is
-/// consumed only by `scx-engine::pushdown` during predicate
-/// evaluation; callers without a predicate (the dominant case) never
-/// allocate the `Vec<ColumnStat>` or the per-`CategoryBitset`
-/// `Vec<u8>` payloads.
-///
-/// Compared to `ShardStats`:
-///
-/// - Files with `n_indexed_columns == 0` retain an empty
-///   `column_stats_bytes`; `decode_column_stats()` returns `Vec::new`
-///   without I/O. The byte-level cost matches the existing
-///   `ShardStats::read_from` for these files.
-/// - Files with column stats pay the column-stats payload **copy**
-///   (into `Box<[u8]>`) eagerly but defer the per-stat
-///   `Vec<ColumnStat>` decoding — the larger of the two costs — until
-///   `decode_column_stats()` or `to_full()` is called.
-///
-/// The type does NOT replace `ShardStats` in public APIs; it is a
-/// sibling. Callers that need the full eagerly-parsed struct (writer
-/// round-trips, validation, metadata inspection) keep using
-/// `ShardStats::read_from`. Callers that read the column stats only
-/// sometimes (the predicate-pushdown path, future reader integrations)
-/// can adopt `LazyShardStats` to skip the per-entry column-stats
-/// allocation on the cold case.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LazyShardStats {
-    pub row_start: u64,
-    pub row_end: u64,
-    pub col_start: u64,
-    pub col_end: u64,
-    pub nnz: u64,
-    pub value_min: u32,
-    pub value_max: u32,
-    pub value_sum: u64,
-    pub n_indexed_columns: u8,
-    /// Raw bytes of the `column_stats` payload. Empty when
-    /// `n_indexed_columns == 0`. Decoded on demand via
-    /// `decode_column_stats()`. Owned (`Box<[u8]>`) so the type can be
-    /// freely cloned and shared without lifetime constraints; the
-    /// per-stats copy is bounded by the actual `column_stats` size,
-    /// not the full stats payload.
-    column_stats_bytes: Box<[u8]>,
-    /// Catalog version snapshot. Needed at decode time because v1
-    /// `ColumnStat` layout is identical to v2 (Phase 1 column stats
-    /// did not exist on v1 in practice, but the field-level decoder
-    /// branches on it for forward-compat).
-    catalog_version: u16,
-}
-
-impl LazyShardStats {
-    /// Parse from a stats payload reader. `stats_payload_len` is the
-    /// `stats_len: u16` value the outer catalog parser already
-    /// extracted — it bounds the column-stats tail without requiring
-    /// another walk through `ColumnStat::read_from`.
-    ///
-    /// Returns an error if `stats_payload_len` is smaller than the
-    /// fixed-width prefix for the given catalog version.
-    pub fn read_from<R: Read>(
-        r: &mut R,
-        catalog_version: u16,
-        stats_payload_len: usize,
-    ) -> Result<Self> {
-        let prefix_len = if catalog_version >= 2 {
-            SHARD_STATS_BASE_SIZE_V2
-        } else {
-            SHARD_STATS_BASE_SIZE_V1
-        };
-        if stats_payload_len < prefix_len {
-            return Err(ScxError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "stats payload too short for v{}: have {}, need >= {}",
-                    catalog_version, stats_payload_len, prefix_len
-                ),
-            )));
-        }
-
-        let row_start = r.read_u64::<LittleEndian>()?;
-        let row_end = r.read_u64::<LittleEndian>()?;
-        let (col_start, col_end) = if catalog_version >= 2 {
-            let cs = r.read_u64::<LittleEndian>()?;
-            let ce = r.read_u64::<LittleEndian>()?;
-            (cs, ce)
-        } else {
-            (0u64, 0u64)
-        };
-        let nnz = r.read_u64::<LittleEndian>()?;
-        let value_min = r.read_u32::<LittleEndian>()?;
-        let value_max = r.read_u32::<LittleEndian>()?;
-        let value_sum = r.read_u64::<LittleEndian>()?;
-        let n_indexed_columns = r.read_u8()?;
-
-        let tail_len = stats_payload_len - prefix_len;
-        let column_stats_bytes = if tail_len == 0 {
-            // Common case: `n_indexed_columns == 0`. No heap
-            // allocation for the column-stats tail.
-            Vec::new().into_boxed_slice()
-        } else {
-            let mut buf = vec![0u8; tail_len];
-            r.read_exact(&mut buf)?;
-            buf.into_boxed_slice()
-        };
-
-        Ok(Self {
-            row_start,
-            row_end,
-            col_start,
-            col_end,
-            nnz,
-            value_min,
-            value_max,
-            value_sum,
-            n_indexed_columns,
-            column_stats_bytes,
-            catalog_version,
-        })
-    }
-
-    /// Return the retained column-stats byte payload (empty when
-    /// `n_indexed_columns == 0`). Exposed primarily for diagnostics
-    /// and tests; production callers should use `decode_column_stats`.
-    pub fn column_stats_bytes(&self) -> &[u8] {
-        &self.column_stats_bytes
-    }
-
-    /// Snapshot of the catalog version that produced this stats
-    /// payload. Required for forward-compat decoding of column stats
-    /// when v2-only `ColumnStat` variants are added in future
-    /// catalog versions.
-    pub fn catalog_version(&self) -> u16 {
-        self.catalog_version
-    }
-
-    /// Decode the retained `column_stats` bytes into a fresh
-    /// `Vec<ColumnStat>`. Returns `Vec::new` for files with
-    /// `n_indexed_columns == 0` (without touching the byte buffer).
-    /// Allocates `n_indexed_columns` × `ColumnStat` + the per-
-    /// `CategoryBitset` `Vec<u8>` payloads — i.e., exactly what the
-    /// eager `ShardStats::read_from` would have allocated.
-    pub fn decode_column_stats(&self) -> Result<Vec<ColumnStat>> {
-        if self.n_indexed_columns == 0 {
-            return Ok(Vec::new());
-        }
-        let mut cur: &[u8] = &self.column_stats_bytes;
-        let mut out = Vec::with_capacity(self.n_indexed_columns as usize);
-        for _ in 0..self.n_indexed_columns {
-            out.push(ColumnStat::read_from(&mut cur)?);
-        }
-        Ok(out)
-    }
-
-    /// Force full `ShardStats` decoding for metadata inspection,
-    /// validation, or writer round-trips. Allocates the
-    /// `column_stats` `Vec`.
-    pub fn to_full(&self) -> Result<ShardStats> {
-        Ok(ShardStats {
-            row_start: self.row_start,
-            row_end: self.row_end,
-            col_start: self.col_start,
-            col_end: self.col_end,
-            nnz: self.nnz,
-            value_min: self.value_min,
-            value_max: self.value_max,
-            value_sum: self.value_sum,
-            n_indexed_columns: self.n_indexed_columns,
-            column_stats: self.decode_column_stats()?,
-        })
-    }
-
-    /// Build a `LazyShardStats` from an already-decoded `ShardStats`.
-    /// Re-serialises the `column_stats` payload into the retained
-    /// byte buffer so `to_full()` round-trips byte-identically.
-    /// Useful for callers that hold a fully-decoded `ShardStats` and
-    /// want to construct a lazy version for downstream APIs.
-    pub fn from_full(full: &ShardStats, catalog_version: u16) -> Result<Self> {
-        let mut buf = Vec::new();
-        for cs in &full.column_stats {
-            cs.write_to(&mut buf)?;
-        }
-        Ok(Self {
-            row_start: full.row_start,
-            row_end: full.row_end,
-            col_start: full.col_start,
-            col_end: full.col_end,
-            nnz: full.nnz,
-            value_min: full.value_min,
-            value_max: full.value_max,
-            value_sum: full.value_sum,
-            n_indexed_columns: full.n_indexed_columns,
-            column_stats_bytes: buf.into_boxed_slice(),
-            catalog_version,
         })
     }
 }
@@ -806,110 +606,68 @@ impl FullCatalog {
             });
         }
 
+        // Read the whole catalog up front, then parse the borrowed bytes.
+        // Callers pass `Cursor`s over larger buffers and rely on exactly
+        // `total_len` bytes being consumed from `r`.
         let mut all_bytes = vec![0u8; total_len];
         r.read_exact(&mut all_bytes)?;
 
-        let payload_len = total_len - 32;
-        let (payload, expected_checksum) = all_bytes.split_at(payload_len);
-
-        if verify_checksum {
-            let computed = blake3_hash(payload);
-            if computed[..] != *expected_checksum {
-                return Err(ScxError::ChecksumMismatch {
-                    section: "full_catalog".to_string(),
-                });
-            }
-        }
-
-        // Parse the payload through a `&mut &[u8]` reader so we can
-        // peel off name and stats payloads as borrowed sub-slices of
-        // `payload` without copying into per-entry `Vec<u8>` buffers
-        // or wrapping them in nested `Cursor`s.
-        let mut cur: &[u8] = payload;
-        let catalog_version = cur.read_u16::<LittleEndian>()?;
-        let manifest_sequence = cur.read_u64::<LittleEndian>()?;
-        let prev_catalog_offset = cur.read_u64::<LittleEndian>()?;
-        let n_obs = cur.read_u64::<LittleEndian>()?;
-        let n_entries = cur.read_u32::<LittleEndian>()? as usize;
-
-        // Minimum serialized size of a single v2 catalog entry:
-        // 2 (name_len) + 0 (empty name) + 8 (offset) + 8 (length) +
-        // 1 (section_type) + 32 (checksum) + 1 (modality_id) +
-        // 2 (stats_len) = 54 bytes.
-        // v1 entries lack modality_id: 53 bytes. Use the smaller bound.
-        const MIN_ENTRY_BYTES: usize = 53;
-        crate::error::validate_allocation(n_entries.saturating_mul(MIN_ENTRY_BYTES), payload_len)?;
+        // One walk over the entry list, shared with `CatalogView` — see
+        // `catalog_cursor`. Names and stats arrive borrowed and undecoded,
+        // so this loop decides what to materialise, not how to parse.
+        let mut cursor = CatalogEntryCursor::new(&all_bytes, verify_checksum)?;
+        let &CatalogPreamble {
+            catalog_version,
+            manifest_sequence,
+            prev_catalog_offset,
+            n_obs,
+            n_entries,
+        } = cursor.preamble();
 
         let mut entries = Vec::with_capacity(n_entries);
-        for _ in 0..n_entries {
-            let name_len = cur.read_u16::<LittleEndian>()? as usize;
-            // Borrow the name bytes directly out of the outer payload
-            // slice — no per-entry `vec![0u8; name_len]` copy. UTF-8
-            // is validated in place against the borrowed slice; the
-            // single `String` allocation below replaces the previous
-            // (zero-init Vec + into-String) pair.
-            let (name_bytes, rest) = cur.split_at_checked(name_len).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "catalog entry name truncated",
-                )
-            })?;
-            cur = rest;
-            let name = std::str::from_utf8(name_bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-                .to_string();
+        while let Some(raw) = cursor.next_entry() {
+            let raw = raw?;
 
-            let offset = cur.read_u64::<LittleEndian>()?;
-            let length = cur.read_u64::<LittleEndian>()?;
-            let section_type_raw = cur.read_u8()?;
-
-            let mut checksum = [0u8; 32];
-            cur.read_exact(&mut checksum)?;
-
-            // v2 catalogs carry a `modality_id: u8` after the
-            // per-entry checksum. v1 catalogs don't — leave at 0.
-            let modality_id = if catalog_version >= 2 {
-                cur.read_u8()?
-            } else {
-                0u8
-            };
-
-            let stats_len = cur.read_u16::<LittleEndian>()? as usize;
-            let stats = if stats_len > 0 {
-                // Parse `ShardStats` directly out of a borrowed
-                // sub-slice — no `vec![0u8; stats_len]` copy, no
-                // nested `Cursor`. The outer reader advances by
-                // exactly `stats_len` bytes regardless of how many
-                // `ShardStats::read_from` consumes, preserving the
-                // forward-compat property of the length prefix.
-                let (stats_bytes, rest) = cur.split_at_checked(stats_len).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "catalog entry stats payload truncated",
-                    )
-                })?;
-                cur = rest;
-                let mut stats_reader: &[u8] = stats_bytes;
-                Some(ShardStats::read_from(&mut stats_reader, catalog_version)?)
-            } else {
-                None
-            };
-
-            // Skip unknown section types (forward-compatibility) with a
-            // warning, matching the spec requirement that readers skip
-            // unrecognised types rather than failing.
-            let section_type = match SectionType::from_u8(section_type_raw) {
+            // Resolve the section type FIRST. Skipping unknown types is the
+            // spec's forward-compat requirement, and doing it before the
+            // stats decode is what makes it real: a future section whose
+            // stats blob is shorter than the current layout used to abort
+            // this parse, and with it the whole file (§4.2).
+            let section_type = match SectionType::from_u8(raw.section_type_raw) {
                 Some(st) => st,
                 None => {
                     log::warn!(
-                        "skipping unknown section type {} (name: '{}') at offset {}",
-                        section_type_raw,
-                        name,
-                        offset,
+                        "skipping unknown section type {} ({} name bytes) at offset {}",
+                        raw.section_type_raw,
+                        raw.name_bytes.len(),
+                        raw.offset,
                     );
                     continue;
                 }
             };
+
+            // Validate what we materialise, and only that. An entry dropped
+            // above never reaches this line, so its name encoding cannot
+            // fail the catalog.
+            let name = std::str::from_utf8(raw.name_bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+                .to_string();
+
+            let mut checksum = [0u8; 32];
+            checksum.copy_from_slice(raw.checksum_bytes);
+
+            let stats = if raw.stats_bytes.is_empty() {
+                None
+            } else {
+                // `stats_bytes` is exactly `stats_len` long, so a decoder
+                // that reads fewer bytes than it holds leaves the remainder
+                // as forward-compat padding rather than desynchronising the
+                // entry list.
+                let mut stats_reader: &[u8] = raw.stats_bytes;
+                Some(ShardStats::read_from(&mut stats_reader, catalog_version)?)
+            };
+
+            let (offset, length, modality_id) = (raw.offset, raw.length, raw.modality_id);
 
             // v1 → v2 axis-overload reconciliation for CSC entries:
             // legacy v1 catalogs encoded `col_start`/`col_end` in the
@@ -934,7 +692,7 @@ impl FullCatalog {
             };
             if catalog_version < 2 {
                 if let Some(ref mut s) = entry.stats {
-                    if matches!(section_type, SectionType::CscShard) {
+                    if crate::shard::is_column_major(section_type) {
                         s.col_start = s.row_start;
                         s.col_end = s.row_end;
                     }
@@ -946,13 +704,7 @@ impl FullCatalog {
         // v4 trailing generation counters. Present only when the catalog
         // declares v4; v1–v3 catalogs default both to 0 (a `0 == 0`
         // freshness match, so legacy CSC sidecars are never rejected).
-        let (data_generation, csc_build_generation) = if catalog_version >= 4 {
-            let data_generation = cur.read_u64::<LittleEndian>()?;
-            let csc_build_generation = cur.read_u64::<LittleEndian>()?;
-            (data_generation, csc_build_generation)
-        } else {
-            (0, 0)
-        };
+        let (data_generation, csc_build_generation) = cursor.finish()?;
 
         Ok(Self {
             catalog_version,

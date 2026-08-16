@@ -6,6 +6,9 @@ use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use scx_format_io::catalog::{FullCatalog, RootCatalog, RootCatalogEntry};
+use scx_format_io::catalog_cursor::{
+    entry_fixed_bytes_after_name, v4_trailer_len, CATALOG_CHECKSUM_LEN, CATALOG_PREAMBLE_LEN,
+};
 use scx_format_io::header::{FileHeader, HEADER_SIZE};
 
 use crate::checksum::finalize_header_with_checksum;
@@ -77,11 +80,14 @@ fn read_catalog_at(file: &mut (impl Read + Seek), offset: u64) -> Result<(FullCa
     let file_len = file.seek(SeekFrom::End(0))?;
     let max_available = file_len.saturating_sub(offset);
 
-    // Catalog header: version(2) + manifest_sequence(8) + prev_catalog_offset(8)
-    //                 + n_obs(8) + n_entries(4) = 30 bytes
-    // Minimum catalog = 30 + 32 (trailing checksum) = 62 bytes
-    const CATALOG_HEADER_SIZE: usize = 2 + 8 + 8 + 8 + 4;
-    const TRAILING_CHECKSUM: usize = 32;
+    // Layout constants come from `scx_format::catalog_cursor`, the one place
+    // the catalog's per-entry byte arithmetic is written down. This walk keeps
+    // its own loop — it reads a `File` with `seek`, which no slice cursor can
+    // do, and it exists precisely to avoid reading offset-to-EOF on a file
+    // with many appends. What it must not keep is its own copy of the numbers.
+    const CATALOG_HEADER_SIZE: usize = CATALOG_PREAMBLE_LEN;
+    const TRAILING_CHECKSUM: usize = CATALOG_CHECKSUM_LEN;
+    // Minimum catalog: preamble + trailing checksum, with no entries.
     let min_size = CATALOG_HEADER_SIZE + TRAILING_CHECKSUM;
 
     if (max_available as usize) < min_size {
@@ -109,7 +115,6 @@ fn read_catalog_at(file: &mut (impl Read + Seek), offset: u64) -> Result<(FullCa
     // v2 entry: same as v1 plus a modality_id(1) byte between
     //           checksum and stats_len.
     // We read entries incrementally, one at a time, to avoid loading to EOF.
-    let modality_id_bytes: usize = if catalog_version >= 2 { 1 } else { 0 };
     let mut entries_size: usize = 0;
     for i in 0..n_entries {
         let entry_start = offset + CATALOG_HEADER_SIZE as u64 + entries_size as u64;
@@ -126,10 +131,7 @@ fn read_catalog_at(file: &mut (impl Read + Seek), offset: u64) -> Result<(FullCa
         file.read_exact(&mut name_len_buf)?;
         let name_len = u16::from_le_bytes(name_len_buf) as usize;
 
-        // Fixed fields after name:
-        //   v1: offset(8) + length(8) + type(1) + checksum(32) = 49
-        //   v2: same + modality_id(1)               = 50
-        let fixed_after_name = 8 + 8 + 1 + 32 + modality_id_bytes;
+        let fixed_after_name = entry_fixed_bytes_after_name(catalog_version);
         let stats_len_pos = entry_start + 2 + name_len as u64 + fixed_after_name as u64;
 
         if stats_len_pos + 2 > file_len {
@@ -151,7 +153,7 @@ fn read_catalog_at(file: &mut (impl Read + Seek), offset: u64) -> Result<(FullCa
     // u64 generation counters (`data_generation`, `csc_build_generation`)
     // between the entry list and the trailing checksum — 16 bytes that the
     // entry scan above does not cover.
-    let trailing_generation_bytes: usize = if catalog_version >= 4 { 16 } else { 0 };
+    let trailing_generation_bytes: usize = v4_trailer_len(catalog_version);
     let total_catalog_len =
         CATALOG_HEADER_SIZE + entries_size + trailing_generation_bytes + TRAILING_CHECKSUM;
     if offset + total_catalog_len as u64 > file_len {

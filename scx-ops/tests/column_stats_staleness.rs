@@ -170,8 +170,8 @@ fn csr_column_stats(path: &Path) -> Vec<ColumnStat> {
 }
 
 /// `n_indexed_columns` must equal `column_stats.len()` on every entry —
-/// `LazyShardStats` trusts the count to decide whether to decode the tail at
-/// all, so a drifted pair is a decode bug, not a cosmetic one.
+/// `ShardStats::read_from` loops exactly `n_indexed_columns` times over the
+/// stats payload, so a drifted pair is a decode bug, not a cosmetic one.
 fn assert_stats_counts_agree(path: &Path) {
     let reader = ScxReader::open(path).unwrap();
     for e in reader.catalog().entries.iter() {

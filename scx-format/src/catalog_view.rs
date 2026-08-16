@@ -24,10 +24,8 @@
 
 use std::sync::Arc;
 
-use byteorder::{LittleEndian, ReadBytesExt};
-
 use crate::catalog::FullCatalog;
-use crate::checksum::blake3_hash;
+use crate::catalog_cursor::{CatalogEntryCursor, CatalogPreamble};
 use crate::error::{Result, ScxError};
 use crate::section::SectionType;
 
@@ -40,8 +38,10 @@ use crate::section::SectionType;
 /// hot path. The diagnostic / pushdown-only fields the full struct
 /// carries (`value_min` / `value_max` / `value_sum`,
 /// `n_indexed_columns`, `column_stats`) are dropped here; callers that
-/// need them go through [`crate::catalog::LazyShardStats`] (lazy
-/// `column_stats` decode) or [`crate::catalog::ShardStats`] (eager).
+/// need them go through [`crate::catalog::ShardStats`], or hold the
+/// undecoded payload from
+/// [`RawEntry::stats_bytes`](crate::catalog_cursor::RawEntry) and decode
+/// on demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardStatsLite {
     /// Major-axis start. For row-major shards: `row_start`. For v2
@@ -105,6 +105,19 @@ pub struct CatalogView {
     pub prev_catalog_offset: u64,
     pub n_obs: u64,
     pub entries: Vec<CatalogViewEntry>,
+    /// Monotonic identity of the CSR X data (v4+); `0` on v1–v3, where the
+    /// field did not exist. Mirrors [`FullCatalog::data_generation`].
+    ///
+    /// The view carries the two counters because it must be able to *say* it
+    /// has them. Dropping them silently would make a CSC sidecar look fresh
+    /// (`0 == 0`) to anything that checked freshness through the view — a
+    /// staleness bypass that no test could see, since the counters were
+    /// unrepresentable rather than merely unset.
+    pub data_generation: u64,
+    /// The `data_generation` the current CSC sidecar was built against (v4+),
+    /// or `0` when there is no sidecar. Mirrors
+    /// [`FullCatalog::csc_build_generation`].
+    pub csc_build_generation: u64,
 }
 
 /// Whether the lightweight view should retain a string copy of the
@@ -128,10 +141,7 @@ fn name_required_for(section_type: SectionType) -> bool {
 /// row-major shards (the v1 reconciliation that `FullCatalog::read_from`
 /// performs is implicit here).
 fn stats_axis_offsets(catalog_version: u16, section_type: SectionType) -> (usize, usize, usize) {
-    let is_column_major = matches!(
-        section_type,
-        SectionType::CscShard | SectionType::LayerCscShard
-    );
+    let is_column_major = crate::shard::is_column_major(section_type);
     if catalog_version >= 2 && is_column_major {
         // v2 CSC layout: row_start(8) row_end(8) col_start(8) col_end(8) nnz(8) ...
         (16, 24, 32)
@@ -192,102 +202,44 @@ impl CatalogView {
     /// be substituted in `ScxReader::open` without changing reader
     /// trust assumptions.
     pub fn read_from_bytes(payload_with_checksum: &[u8], verify_checksum: bool) -> Result<Self> {
-        let total_len = payload_with_checksum.len();
-        if total_len < 32 {
-            return Err(ScxError::ChecksumMismatch {
-                section: "full_catalog (too short)".to_string(),
-            });
-        }
-        let payload_len = total_len - 32;
-        let (payload, expected_checksum) = payload_with_checksum.split_at(payload_len);
-
-        if verify_checksum {
-            let computed = blake3_hash(payload);
-            if computed[..] != *expected_checksum {
-                return Err(ScxError::ChecksumMismatch {
-                    section: "full_catalog".to_string(),
-                });
-            }
-        }
-
-        let mut cur: &[u8] = payload;
-        let catalog_version = cur.read_u16::<LittleEndian>()?;
-        let manifest_sequence = cur.read_u64::<LittleEndian>()?;
-        let prev_catalog_offset = cur.read_u64::<LittleEndian>()?;
-        let n_obs = cur.read_u64::<LittleEndian>()?;
-        let n_entries = cur.read_u32::<LittleEndian>()? as usize;
-
-        // Same defensive cap as `FullCatalog::read_from`. The minimum
-        // serialised entry size is 53 bytes (v1 lacks modality_id);
-        // reject any `n_entries` that couldn't possibly fit.
-        const MIN_ENTRY_BYTES: usize = 53;
-        crate::error::validate_allocation(n_entries.saturating_mul(MIN_ENTRY_BYTES), payload_len)?;
+        // The same single walk `FullCatalog::read_from` uses — see
+        // `catalog_cursor`. What differs below is only what gets kept.
+        let mut cursor = CatalogEntryCursor::new(payload_with_checksum, verify_checksum)?;
+        let &CatalogPreamble {
+            catalog_version,
+            manifest_sequence,
+            prev_catalog_offset,
+            n_obs,
+            n_entries,
+        } = cursor.preamble();
 
         let mut entries = Vec::with_capacity(n_entries);
-        for _ in 0..n_entries {
-            let name_len = cur.read_u16::<LittleEndian>()? as usize;
-            let (name_bytes, rest) = cur.split_at_checked(name_len).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "catalog entry name truncated",
-                )
-            })?;
-            cur = rest;
+        while let Some(raw) = cursor.next_entry() {
+            let raw = raw?;
 
-            let offset = cur.read_u64::<LittleEndian>()?;
-            let length = cur.read_u64::<LittleEndian>()?;
-            let section_type_raw = cur.read_u8()?;
-
-            // Skip the 32-byte BLAKE3 entry checksum without copying.
-            // The lightweight view doesn't retain it — it's the largest
-            // per-entry field that the read path never looks at
-            // (32 bytes saved per entry).
-            let (_skip, rest) = cur.split_at_checked(32).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "catalog entry checksum truncated",
-                )
-            })?;
-            cur = rest;
-
-            let modality_id = if catalog_version >= 2 {
-                cur.read_u8()?
-            } else {
-                0u8
-            };
-
-            let stats_len = cur.read_u16::<LittleEndian>()? as usize;
-            let (stats_bytes, rest) = cur.split_at_checked(stats_len).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "catalog entry stats payload truncated",
-                )
-            })?;
-            cur = rest;
-
-            // Forward-compat: unknown section types are dropped from
-            // the view (matches the warn-and-skip behaviour of
-            // `FullCatalog::read_from`).
-            let section_type = match SectionType::from_u8(section_type_raw) {
+            // Forward-compat: unknown section types are dropped from the
+            // view, before their stats are decoded (see §4.2 in the cursor's
+            // module docs).
+            let section_type = match SectionType::from_u8(raw.section_type_raw) {
                 Some(st) => st,
                 None => {
                     log::warn!(
                         "skipping unknown section type {} at offset {}",
-                        section_type_raw,
-                        offset,
+                        raw.section_type_raw,
+                        raw.offset,
                     );
                     continue;
                 }
             };
 
-            let stats = if stats_len > 0 {
+            let stats = if raw.stats_bytes.is_empty() {
+                None
+            } else {
                 Some(parse_stats_lite(
-                    stats_bytes,
+                    raw.stats_bytes,
                     catalog_version,
                     section_type,
                 )?)
-            } else {
-                None
             };
 
             // Allocate a name only when the read path could plausibly
@@ -295,10 +247,11 @@ impl CatalogView {
             // (section_type, major_start) — see `BackedCsrIndex` and
             // `BackedCscReader` — so dropping the name on those entries
             // is free for the dominant case (X-shards, the source of
-            // the 16K-entry catalog amplification).
+            // the 16K-entry catalog amplification). UTF-8 is validated
+            // exactly where the name is kept, and nowhere else.
             let name = if name_required_for(section_type) {
                 Some(
-                    std::str::from_utf8(name_bytes)
+                    std::str::from_utf8(raw.name_bytes)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
                         .into(),
                 )
@@ -308,13 +261,15 @@ impl CatalogView {
 
             entries.push(CatalogViewEntry {
                 name,
-                offset,
-                length,
+                offset: raw.offset,
+                length: raw.length,
                 section_type,
-                modality_id,
+                modality_id: raw.modality_id,
                 stats,
             });
         }
+
+        let (data_generation, csc_build_generation) = cursor.finish()?;
 
         Ok(Self {
             catalog_version,
@@ -322,6 +277,8 @@ impl CatalogView {
             prev_catalog_offset,
             n_obs,
             entries,
+            data_generation,
+            csc_build_generation,
         })
     }
 
@@ -339,15 +296,15 @@ impl CatalogView {
             .iter()
             .map(|e| {
                 let stats = e.stats.as_ref().map(|s| {
-                    let (major_start, major_end) = match e.section_type {
-                        // v2 CSC: explicit col pair. v1 CSC: row pair
-                        // already reconciled into col pair by
-                        // `FullCatalog::read_from`, so reading col_*
-                        // here is correct for both versions.
-                        SectionType::CscShard | SectionType::LayerCscShard => {
-                            (s.col_start, s.col_end)
-                        }
-                        _ => (s.row_start, s.row_end),
+                    // v2 column-major: explicit col pair. v1: the row pair was
+                    // already reconciled into the col pair by
+                    // `FullCatalog::read_from`, so reading col_* here is
+                    // correct for both versions.
+                    let (major_start, major_end) = if crate::shard::is_column_major(e.section_type)
+                    {
+                        (s.col_start, s.col_end)
+                    } else {
+                        (s.row_start, s.row_end)
                     };
                     ShardStatsLite {
                         major_start,
@@ -375,6 +332,8 @@ impl CatalogView {
             prev_catalog_offset: full.prev_catalog_offset,
             n_obs: full.n_obs,
             entries,
+            data_generation: full.data_generation,
+            csc_build_generation: full.csc_build_generation,
         }
     }
 
@@ -448,7 +407,7 @@ const _: fn() = || {
 mod tests {
     use super::*;
 
-    use byteorder::WriteBytesExt;
+    use byteorder::{LittleEndian, WriteBytesExt};
 
     use crate::catalog::{
         column_name_hash, ColumnStat, FullCatalogEntry, ShardStats, CURRENT_CATALOG_VERSION,
@@ -578,6 +537,15 @@ mod tests {
         );
         assert_eq!(from_bytes.n_obs, from_full.n_obs);
         assert_eq!(from_bytes.entries.len(), from_full.entries.len());
+
+        // Before zipping: `zip` stops at the shorter side, so a *trailing*
+        // entry dropped by one path would slip through silently.
+        assert_eq!(
+            from_bytes.entries.len(),
+            from_full.entries.len(),
+            "the two view paths kept a different number of entries"
+        );
+        assert_eq!(from_bytes.entries.len(), full.entries.len());
 
         for (a, b) in from_bytes.entries.iter().zip(from_full.entries.iter()) {
             assert_eq!(a.name, b.name, "name mismatch");
@@ -856,6 +824,124 @@ mod tests {
         assert_eq!(s.major_start, 0);
         assert_eq!(s.major_end, 256);
         assert_eq!(s.nnz, 50_000);
+    }
+
+    /// Both view construction paths must pick the same stats axis as
+    /// `shard::is_column_major` says, for **every** section type.
+    ///
+    /// `read_from_bytes_matches_from_full` compares the two paths against each
+    /// other, which is agreement rather than correctness — and its fixture
+    /// carries no `LayerCscShard` at all, so the axis they most recently
+    /// disagreed about is the one it could not see. This walks the
+    /// discriminants and checks both paths against the predicate, so neither a
+    /// re-spelled `matches!` in `stats_axis_offsets` nor one in `from_full` can
+    /// drift silently, and a newly column-major section type is covered the day
+    /// it is added.
+    #[test]
+    fn every_section_type_picks_the_same_axis_in_both_view_paths() {
+        // Four distinct values, so reading the wrong pair cannot coincide with
+        // reading the right one.
+        const ROW: (u64, u64) = (100, 200);
+        const COL: (u64, u64) = (300, 400);
+
+        let mut entries = Vec::new();
+        for raw in 0u8..=255 {
+            let Some(section_type) = SectionType::from_u8(raw) else {
+                continue;
+            };
+            entries.push(FullCatalogEntry {
+                name: format!("section_{raw}"),
+                offset: 4352 + u64::from(raw) * 1000,
+                length: 1000,
+                section_type,
+                checksum: [raw; 32],
+                modality_id: 0,
+                stats: Some(ShardStats {
+                    row_start: ROW.0,
+                    row_end: ROW.1,
+                    col_start: COL.0,
+                    col_end: COL.1,
+                    nnz: 7,
+                    value_min: 0,
+                    value_max: 0,
+                    value_sum: 0,
+                    n_indexed_columns: 0,
+                    column_stats: vec![],
+                }),
+            });
+        }
+        assert!(entries.len() > 20, "expected the full section-type enum");
+
+        let full = build_full(entries, 1000);
+        let mut buf = Vec::new();
+        full.write_to(&mut buf).unwrap();
+        let from_bytes = CatalogView::read_from_bytes(&buf, true).unwrap();
+        let from_full = CatalogView::from_full(&full);
+
+        // Before zipping: `zip` stops at the shorter side, so a *trailing*
+        // entry dropped by one path would slip through silently.
+        assert_eq!(
+            from_bytes.entries.len(),
+            from_full.entries.len(),
+            "the two view paths kept a different number of entries"
+        );
+        assert_eq!(from_bytes.entries.len(), full.entries.len());
+
+        for (a, b) in from_bytes.entries.iter().zip(from_full.entries.iter()) {
+            assert_eq!(a.section_type, b.section_type);
+            let expected = if crate::shard::is_column_major(a.section_type) {
+                COL
+            } else {
+                ROW
+            };
+            for (label, e) in [("read_from_bytes", a), ("from_full", b)] {
+                let s = e.stats.as_ref().unwrap();
+                assert_eq!(
+                    (s.major_start, s.major_end),
+                    expected,
+                    "{label} read the wrong stats axis for {:?}",
+                    e.section_type
+                );
+            }
+        }
+    }
+
+    /// §4.7: the v4 generation counters must survive into the view, by both
+    /// construction paths.
+    ///
+    /// They are the CSC-sidecar freshness guard, and a sidecar is fresh iff
+    /// `csc_build_generation == data_generation`. A view that could not carry
+    /// them reported `0 == 0` — "fresh" — for every file, which is exactly
+    /// the answer a stale sidecar wants. `build_full` sets both to `0`, so
+    /// the pre-existing round-trip test could not have noticed.
+    #[test]
+    fn v4_generation_counters_survive_both_construction_paths() {
+        let entries = vec![FullCatalogEntry {
+            name: "X_csc_0".into(),
+            offset: 4352,
+            length: 1000,
+            section_type: SectionType::CscShard,
+            checksum: [0u8; 32],
+            modality_id: 0,
+            stats: Some(sample_csc_stats_v2(0, 100, 1000)),
+        }];
+        let full = FullCatalog {
+            data_generation: 9,
+            // Deliberately unequal: a stale sidecar is the case that must not
+            // be laundered into a fresh-looking one.
+            csc_build_generation: 7,
+            ..build_full(entries, 100)
+        };
+        let mut buf = Vec::new();
+        full.write_to(&mut buf).unwrap();
+
+        let from_bytes = CatalogView::read_from_bytes(&buf, true).unwrap();
+        assert_eq!(from_bytes.data_generation, 9);
+        assert_eq!(from_bytes.csc_build_generation, 7);
+
+        let from_full = CatalogView::from_full(&full);
+        assert_eq!(from_full.data_generation, 9);
+        assert_eq!(from_full.csc_build_generation, 7);
     }
 
     /// Checksum semantics must match `FullCatalog::read_from`:

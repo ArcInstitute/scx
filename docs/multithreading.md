@@ -544,7 +544,7 @@ and launch geometry it saw while streaming. See
 | Type | Thread-safe? | Notes |
 |------|-------------|-------|
 | `ScxReader` | `Send + Sync` | Backed by `mmap` (immutable `&[u8]`). Internal `Arc<FullCatalog>` is also `Send + Sync`. Safe to share via `Arc<ScxReader>` across threads or to reopen sibling readers with `ScxReader::open_with_shared_catalog`. |
-| `FullCatalog` / `CatalogView` | `Send + Sync` | Frozen after parse. `FullCatalog::reconcile_v1_csr_col_range` runs once before the `Arc` wrap; afterward both types are immutable. See [Fork safety](#fork-safety) for the constraints any future memoisation must respect. |
+| `FullCatalog` / `CatalogView` | `Send + Sync` | Frozen after parse. `FullCatalog::reconcile_v1_csr_col_range` runs once before the `Arc` wrap; afterward both types are immutable. Only `FullCatalog` is shared through an `Arc` today — reader paths build `CatalogView`s as stack temporaries. See [Fork safety](#fork-safety) for the constraints any future memoisation must respect. |
 | `BackedCsrReader` | `Send + Sync` | `mmap`-backed catalog data + per-instance `WeightedLruCache` and singleflight `Mutex`. **Must remain per-process** — see [Why mutable reader state stays per-instance](#why-mutable-reader-state-stays-per-instance). |
 | `ScxWriter` | `Send` only | Single-owner, sequential writes. Not shared across threads. |
 | `QueryPipeline` | `Send` | Built on one thread, executed on another. Not shared. |
@@ -566,8 +566,8 @@ shared across forked workers:
   `Mutex<HashMap<ShardKey, ...>>` is held during decode dispatch. Same
   inherit-held-lock failure mode as the LRU cache.
 
-`mmap`-backed memory and the `Arc<FullCatalog>` / `Arc<CatalogView>` payloads
-that reader-open paths reuse are immutable, so they survive `fork()` cleanly
+`mmap`-backed memory and the `Arc<FullCatalog>` payload that reader-open
+paths reuse are immutable, so they survive `fork()` cleanly
 and are the **only** state that may be shared across worker boundaries.
 Anything that allocates or takes a lock during reads — caches, decompression
 buffers, singleflight maps, open file descriptors that hold OS-level locks —
@@ -612,8 +612,9 @@ It MUST:
   identity-triple that mutation invalidates. `manifest_sequence` increments
   on every append / delete / rollback, so it is sufficient as the
   invalidation signal.
-- Store only immutable parsed catalog data — `Arc<FullCatalog>` and/or
-  `Arc<CatalogView>`. Both are `Send + Sync` and frozen after parse.
+- Store only immutable parsed catalog data — `Arc<FullCatalog>`, or an
+  `Arc<CatalogView>` if a future caller wants one. Both types are `Send + Sync`
+  and frozen after parse; only the `FullCatalog` form is shared today.
 - Use weak references or bounded capacity. A long-running worker that opens
   thousands of files must not retain every catalog indefinitely.
 - Provide an opt-out (env var or builder switch) for debugging and for

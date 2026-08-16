@@ -229,6 +229,18 @@ sidecar whose counters disagree (v1–v3 files default both to `0`, so
 Unknown types are skipped by readers with a warning, which allows the
 format to evolve without breaking old readers.
 
+A reader MUST resolve the `section_type` byte **before** it decodes the
+entry's `stats` payload, and skip the entry without decoding them. The
+ordering is the whole of the guarantee: a future section type is free to
+carry a stats blob in whatever layout suits it, including one shorter than
+today's, and decoding first turns that into a parse failure for the entire
+catalog — and so for every section in the file, since the catalog is the only
+index to them. Skipping is per-entry; it never costs the file.
+
+Skipping is not preservation. An entry with an unknown `section_type` is
+dropped from the in-memory catalog, so any operation that rewrites the file
+(`compact`, `optimize`, `merge`) drops the section with it.
+
 #### `adata.raw` (raw section family)
 
 `adata.raw` holds pre-normalization counts on its **own var axis** (usually more
@@ -268,19 +280,30 @@ it is what lets a reader assume any `uns_blob` it encounters is parseable.
 
 ### Per-shard statistics
 
-Present when `section_type ∈ {csr_shard, csc_shard, layer_csr_shard, obsp_csr_shard}`:
+Present on the sharded matrix section types — `csr_shard`, `csc_shard`,
+`layer_csr_shard`, `layer_csc_shard`, `obsp_csr_shard`, `raw_csr_shard` — and,
+with only the row range populated, on the row-sharded metadata types
+`obs_metadata_shard` / `var_metadata_shard`.
+
+`catalog_version` selects the layout. v1 wrote 41 bytes before the per-column
+tail and carried no explicit column range; v2 inserted `col_start` / `col_end`
+after `row_end`, for 57. Writers emit v2 unconditionally (`FullCatalog::write_to`
+raises the declared version to at least 2 on serialise), so v1 stats appear
+only in files written before that:
 
 ```
-row_start: u64                   (first row, global)
-row_end:   u64                   (exclusive end, global)
+row_start: u64                   (major-axis start; see below)
+row_end:   u64                   (exclusive end)
+col_start: u64                   (v2 only)
+col_end:   u64                   (v2 only)
 nnz:       u64
 value_min: u32                   (integer encodings only)
 value_max: u32
 value_sum: u64
 n_indexed_columns: u8
 For each indexed column:
-  column_name_hash: u64          (BLAKE3 truncated)
   stat_type: u8                  (0 = numeric min/max, 1 = category bitset)
+  column_name_hash: u64          (BLAKE3 truncated)
   If numeric:
     col_min: f64
     col_max: f64
@@ -288,6 +311,27 @@ For each indexed column:
     bitset_length: u16
     category_bitset: [u8]        (bit i set if dictionary index i present)
 ```
+
+`stat_type` precedes `column_name_hash`, not the other way round — this
+document had the two transposed against every file ever written.
+
+**Which pair carries the meaningful range** depends on whether the section is
+column-major (`csc_shard`, `layer_csc_shard`) or row-major (the other matrix
+shard types). A v2 row-major matrix shard puts its row range in the row pair
+and `[0, n_vars)` in the column pair; a v2 column-major shard puts its column
+range in the column pair and `[0, n_obs)` in the row pair.
+
+The metadata shard types are the exception, and a reader must not infer a
+column range for them: `obs_metadata_shard` / `var_metadata_shard` carry their
+row range in the row pair and leave the column pair at `0..0`, along with
+`nnz` and the value summaries. They have no CSR value semantics — the row range
+exists only so the query engine can map a metadata shard to its global rows. v1 column-major shards axis-overloaded
+the row pair — the column range was written there — and readers reconcile that
+at catalog-parse time, so `col_start` / `col_end` are populated either way.
+
+The entry's `stats_length: u16` prefix is authoritative: a reader must not
+consume past it, and bytes it does not consume are forward-compat padding
+rather than the start of the next entry.
 
 `value_min` / `value_max` / `value_sum` are meaningful **only** for integer
 value encodings (uint8/16/32). For float encodings (f32, f16) they are zero
@@ -477,40 +521,44 @@ field interpretation:
 
 | Field | CSR semantics | CSC semantics |
 |-------|---------------|---------------|
-| `shard_type` | `0` (legacy: also produced for CSC) | `1` (authoritative) — readers also accept `0` when the catalog `section_type` is `CscShard` (legacy compatibility) |
+| `shard_type` | `0` | `1`. A **v1 catalog** may carry `0` (the writer hardcoded it before `derive_shard_type` existed) and readers tolerate that; on `catalog_version >= 2` the byte is **strictly required** to be `1`, for `csc_shard` and `layer_csc_shard` alike |
 | `n_major` | rows in this shard | **columns** in this shard |
 | `n_minor` | columns in full matrix | **rows** in full matrix (`n_obs`) |
 | `global_offset` | first row index | first **column** index covered by this shard |
 | `indptr` (length `n_major + 1`) | row-pointer | **column-pointer** |
 | `indices` (length `nnz`) | column indices in full matrix | **global row** indices in full matrix (CSC indices are NOT shard-local — they reference rows across all shards) |
 
-Catalog `section_type = CscShard (5)` is the authoritative
-discriminator; the in-shard `shard_type` byte exists for self-contained
-shard validation (e.g. exploded `.scxd` files where the catalog and
-shard live in separate files). Going forward writers emit `shard_type
-= 1`; readers also accept `shard_type = 0` for files written before
-the `derive_shard_type()` fix landed.
+The catalog's `section_type` — `csc_shard (5)` or `layer_csc_shard (16)` — is
+the authoritative discriminator; the in-shard `shard_type` byte exists for
+self-contained shard validation (e.g. exploded `.scxd` files where the catalog
+and the shard live in separate files). The two must agree: a v2+ reader rejects
+a shard whose byte disagrees with the section type, in **both** directions, and
+does so before any extent check. Unauthenticated payload bytes do not get to
+pick which axis validates them.
 
-### `ShardStats.row_start` / `row_end` axis overload
+### `ShardStats.row_start` / `row_end` axis overload (v1 only)
 
-CSC shards reuse the catalog `ShardStats.row_start` / `row_end` fields
-to record the **major-axis** range, which for CSC means
-`col_start..col_end`. The on-disk schema is unchanged from the CSR-only
-era; only the field interpretation differs.
+**This is a v1 compatibility note, not the current layout.** v1 catalogs had no
+column pair, so a column-major shard recorded its `col_start..col_end` in the
+`row_start` / `row_end` slots. v2 added an explicit `col_start` / `col_end`
+(see [Per-shard statistics](#per-shard-statistics)) and a column-major shard now
+records its range there, with `[0, n_obs)` in the row pair. `FullCatalog::read_from`
+reconciles a v1 entry by copying the row pair into the column pair at parse
+time, so `col_range()` is correct on both versions and no consumer needs to know
+which it is reading.
 
 Code accessing these fields should pick by section type:
 
 | Method | When to use |
 |--------|-------------|
-| `ShardStats::major_start()` / `major_end()` | Generic — works for any shard type, returns the row range for CSR/Layer/Obsp and the col range for CSC. Use when the section type is unknown or when writing axis-agnostic helpers. |
+| `ShardStats::major_start()` / `major_end()` | Generic — works for any shard type, returning the row range for row-major sections and the column range for the column-major ones (`CscShard`, `LayerCscShard`; see `shard::is_column_major`). Use when the section type is unknown or when writing axis-agnostic helpers. |
 | `ShardStats::row_range()` | When the entry is known to be a row-major shard (`CsrShard`, `LayerCsrShard`, `ObspCsrShard`). |
-| `ShardStats::col_range()` | When the entry is known to be `CscShard`. |
+| `ShardStats::col_range()` | When the entry is known to be column-major (`CscShard`, `LayerCscShard`). |
 | Direct `ShardStats.row_start` field access | Allowed in legacy code paths but discouraged — prefer the accessors above. |
 
-A future format-version bump may rename the underlying fields (e.g. to
-`major_start` / `major_end`) without breaking on-disk compatibility,
-since the byte layout is unchanged. Until then the overload is
-documented but the schema stays put.
+The v1 overload is why `major_start()` / `major_end()` exist at all: they let a
+caller ask for the major axis without knowing the catalog version, and are the
+only accessors that stay correct across both.
 
 ### Multi-shard CSC layout
 

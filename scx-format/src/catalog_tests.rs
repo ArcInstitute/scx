@@ -324,260 +324,6 @@ fn v1_catalog_csr_reconcile_col_range() {
 }
 
 // -----------------------------------------------------------------------
-// LazyShardStats tests
-// -----------------------------------------------------------------------
-
-fn stats_with_column_stats() -> ShardStats {
-    ShardStats {
-        row_start: 0,
-        row_end: 256,
-        col_start: 0,
-        col_end: 5_000,
-        nnz: 50_000,
-        value_min: 1,
-        value_max: 255,
-        value_sum: 1_000_000,
-        n_indexed_columns: 2,
-        column_stats: vec![
-            ColumnStat::MinMax {
-                column_name_hash: column_name_hash("n_genes"),
-                min: 100.0,
-                max: 5000.0,
-            },
-            ColumnStat::CategoryBitset {
-                column_name_hash: column_name_hash("cell_type"),
-                bitset: vec![0xFF, 0x0F, 0xA5],
-            },
-        ],
-    }
-}
-
-/// `n_indexed_columns == 0`: the retained `column_stats_bytes`
-/// must be empty (no heap allocation) and `decode_column_stats`
-/// must return `Vec::new` without parsing.
-#[test]
-fn lazy_shard_stats_zero_indexed_columns_empty_tail() {
-    let full = sample_stats(); // n_indexed_columns == 0
-    let mut buf = Vec::new();
-    full.write_to(&mut buf).unwrap();
-    assert_eq!(buf.len(), SHARD_STATS_BASE_SIZE_V2);
-
-    let lazy =
-        LazyShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION, buf.len())
-            .unwrap();
-
-    assert_eq!(lazy.n_indexed_columns, 0);
-    assert!(
-        lazy.column_stats_bytes().is_empty(),
-        "n_indexed_columns=0 must retain zero bytes, got {} bytes",
-        lazy.column_stats_bytes().len(),
-    );
-
-    let decoded = lazy.decode_column_stats().unwrap();
-    assert!(decoded.is_empty());
-
-    // to_full() must round-trip cleanly back to the original.
-    assert_eq!(lazy.to_full().unwrap(), full);
-}
-
-/// `n_indexed_columns > 0`: the retained byte payload is the
-/// suffix beyond the fixed-width prefix, and `decode_column_stats`
-/// yields exactly the `Vec<ColumnStat>` an eager
-/// `ShardStats::read_from` would have produced.
-#[test]
-fn lazy_shard_stats_with_column_stats_decode_matches_eager() {
-    let full = stats_with_column_stats();
-    let mut buf = Vec::new();
-    full.write_to(&mut buf).unwrap();
-    assert!(buf.len() > SHARD_STATS_BASE_SIZE_V2);
-
-    let lazy =
-        LazyShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION, buf.len())
-            .unwrap();
-
-    assert_eq!(lazy.row_start, full.row_start);
-    assert_eq!(lazy.row_end, full.row_end);
-    assert_eq!(lazy.col_start, full.col_start);
-    assert_eq!(lazy.col_end, full.col_end);
-    assert_eq!(lazy.nnz, full.nnz);
-    assert_eq!(lazy.value_min, full.value_min);
-    assert_eq!(lazy.value_max, full.value_max);
-    assert_eq!(lazy.value_sum, full.value_sum);
-    assert_eq!(lazy.n_indexed_columns, full.n_indexed_columns);
-    assert_eq!(
-        lazy.column_stats_bytes().len(),
-        buf.len() - SHARD_STATS_BASE_SIZE_V2,
-    );
-
-    let decoded = lazy.decode_column_stats().unwrap();
-    assert_eq!(decoded, full.column_stats);
-
-    // Re-decoding is idempotent (no internal mutation).
-    assert_eq!(lazy.decode_column_stats().unwrap(), full.column_stats);
-}
-
-/// `to_full()` produces a struct byte-identical to the eager
-/// `ShardStats::read_from` of the same payload.
-#[test]
-fn lazy_shard_stats_to_full_round_trip() {
-    let full = stats_with_column_stats();
-    let mut buf = Vec::new();
-    full.write_to(&mut buf).unwrap();
-
-    let eager = ShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION).unwrap();
-    let lazy =
-        LazyShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION, buf.len())
-            .unwrap();
-    assert_eq!(lazy.to_full().unwrap(), eager);
-}
-
-/// `from_full().to_full()` round-trips an in-memory `ShardStats`
-/// without touching disk.
-#[test]
-fn lazy_shard_stats_from_full_round_trip() {
-    let full = stats_with_column_stats();
-    let lazy = LazyShardStats::from_full(&full, CURRENT_CATALOG_VERSION).unwrap();
-    assert_eq!(lazy.to_full().unwrap(), full);
-
-    let empty = sample_stats();
-    let lazy_empty = LazyShardStats::from_full(&empty, CURRENT_CATALOG_VERSION).unwrap();
-    assert!(lazy_empty.column_stats_bytes().is_empty());
-    assert_eq!(lazy_empty.to_full().unwrap(), empty);
-}
-
-/// v1 stats: 41-byte prefix, no `col_start`/`col_end`. Lazy parser
-/// must accept the legacy layout and leave `col_*` zero. v1 files
-/// did not ship `column_stats` in practice (`n_indexed_columns`
-/// was always 0 in Phase 1), but the decode pipeline still has to
-/// support a future v1 catalog with a non-empty tail — confirm
-/// the byte buffer is sized correctly off the `stats_payload_len`
-/// argument rather than a hard-coded prefix.
-#[test]
-fn lazy_shard_stats_v1_layout() {
-    // Hand-build a 41-byte v1 stats payload.
-    let mut v1 = Vec::new();
-    v1.write_u64::<LittleEndian>(0).unwrap();
-    v1.write_u64::<LittleEndian>(256).unwrap();
-    v1.write_u64::<LittleEndian>(50_000).unwrap(); // nnz
-    v1.write_u32::<LittleEndian>(1).unwrap();
-    v1.write_u32::<LittleEndian>(255).unwrap();
-    v1.write_u64::<LittleEndian>(1_000_000).unwrap();
-    v1.push(0); // n_indexed_columns = 0
-    assert_eq!(v1.len(), SHARD_STATS_BASE_SIZE_V1);
-
-    let lazy = LazyShardStats::read_from(&mut Cursor::new(&v1), 1, v1.len()).unwrap();
-    assert_eq!(lazy.row_start, 0);
-    assert_eq!(lazy.row_end, 256);
-    assert_eq!(lazy.col_start, 0, "v1 must leave col_start zero");
-    assert_eq!(lazy.col_end, 0, "v1 must leave col_end zero");
-    assert_eq!(lazy.nnz, 50_000);
-    assert_eq!(lazy.value_min, 1);
-    assert_eq!(lazy.value_max, 255);
-    assert_eq!(lazy.value_sum, 1_000_000);
-    assert_eq!(lazy.n_indexed_columns, 0);
-    assert!(lazy.column_stats_bytes().is_empty());
-    assert_eq!(lazy.catalog_version(), 1);
-}
-
-/// A `stats_payload_len` smaller than the fixed-width prefix
-/// must produce a clean error rather than reading past the
-/// buffer or returning garbage scalars.
-#[test]
-fn lazy_shard_stats_rejects_undersize_payload() {
-    let mut buf = vec![0u8; 8];
-    let err = LazyShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION, buf.len())
-        .unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("too short") || msg.contains("UnexpectedEof"),
-        "expected size-rejection error, got: {msg}"
-    );
-
-    // v1 prefix is 41 bytes; passing 40 must also reject.
-    buf.resize(40, 0);
-    let err = LazyShardStats::read_from(&mut Cursor::new(&buf), 1, buf.len()).unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("too short") || msg.contains("UnexpectedEof"));
-}
-
-/// Predicate-pushdown analogue: when a query requires column
-/// statistics, `decode_column_stats()` produces the same
-/// `Vec<ColumnStat>` that `scx-engine::pushdown` would receive
-/// from an eagerly-parsed `ShardStats`. This is the test the
-/// Phase 4 spec calls out as "predicate pushdown paths that
-/// force lazy stats decoding".
-#[test]
-fn lazy_shard_stats_pushdown_force_decode() {
-    // Build a stats payload whose column_stats describe a
-    // realistic obs-predicate filter (numeric range + categorical
-    // bitset). Then confirm the lazy path returns exactly the
-    // structures the eager `ShardStats::column_stats` would expose.
-    let full = ShardStats {
-        row_start: 16_384,
-        row_end: 32_768,
-        col_start: 0,
-        col_end: 60_000,
-        nnz: 5_000_000,
-        value_min: 0,
-        value_max: 65_535,
-        value_sum: 100_000_000,
-        n_indexed_columns: 2,
-        column_stats: vec![
-            ColumnStat::MinMax {
-                column_name_hash: column_name_hash("total_counts"),
-                min: 500.0,
-                max: 50_000.0,
-            },
-            ColumnStat::CategoryBitset {
-                column_name_hash: column_name_hash("cell_type"),
-                bitset: vec![0b0000_1011, 0b1100_0000, 0b0000_0001],
-            },
-        ],
-    };
-    let mut buf = Vec::new();
-    full.write_to(&mut buf).unwrap();
-
-    let lazy =
-        LazyShardStats::read_from(&mut Cursor::new(&buf), CURRENT_CATALOG_VERSION, buf.len())
-            .unwrap();
-
-    // Cold scalar access: no column-stats decoding has happened.
-    assert_eq!(lazy.nnz, 5_000_000);
-    assert_eq!(lazy.n_indexed_columns, 2);
-    assert!(!lazy.column_stats_bytes().is_empty());
-
-    // Force decode (the predicate-pushdown analogue).
-    let forced = lazy.decode_column_stats().unwrap();
-    assert_eq!(forced.len(), 2);
-    match &forced[0] {
-        ColumnStat::MinMax {
-            column_name_hash,
-            min,
-            max,
-        } => {
-            assert_eq!(*column_name_hash, column_name_hash_of("total_counts"));
-            assert_eq!(*min, 500.0);
-            assert_eq!(*max, 50_000.0);
-        }
-        _ => panic!("expected MinMax for total_counts"),
-    }
-    match &forced[1] {
-        ColumnStat::CategoryBitset {
-            column_name_hash,
-            bitset,
-        } => {
-            assert_eq!(*column_name_hash, column_name_hash_of("cell_type"));
-            assert_eq!(bitset, &vec![0b0000_1011, 0b1100_0000, 0b0000_0001]);
-        }
-        _ => panic!("expected CategoryBitset for cell_type"),
-    }
-}
-
-fn column_name_hash_of(name: &str) -> u64 {
-    column_name_hash(name)
-}
-
-// -----------------------------------------------------------------------
 // FullCatalog tests (9.13–9.16)
 // -----------------------------------------------------------------------
 
@@ -1342,4 +1088,226 @@ fn modality_csr_ranges_tile_obs_positive_and_negative() {
     // Empty shard list covers only n_obs == 0.
     assert!(good.modality_csr_ranges_tile_obs(7, 0));
     assert!(!good.modality_csr_ranges_tile_obs(7, 300));
+}
+
+// -----------------------------------------------------------------------
+// Forward compatibility: unknown section types (§4.2)
+// -----------------------------------------------------------------------
+
+/// A section type no reader knows. Asserted unassigned by every test that
+/// uses it, so this fixture fails loudly the day id 30 is allocated rather
+/// than quietly becoming a known-type test.
+const UNKNOWN_SECTION_TYPE: u8 = 30;
+
+/// Hand-build a catalog payload plus its trailing BLAKE3 checksum,
+/// bypassing [`FullCatalog::write_to`].
+///
+/// The writer cannot express what these fixtures need: an entry carrying a
+/// section type it has no variant for, or a stats blob that is not the
+/// current layout. Entries are `(name_bytes, section_type_raw, stats_bytes)`;
+/// the two generation counters are emitted only when `catalog_version >= 4`,
+/// matching `write_to`.
+fn build_raw_catalog(
+    catalog_version: u16,
+    n_obs: u64,
+    entries: &[(&[u8], u8, &[u8])],
+    generations: (u64, u64),
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.write_u16::<LittleEndian>(catalog_version).unwrap();
+    payload.write_u64::<LittleEndian>(1).unwrap(); // manifest_sequence
+    payload.write_u64::<LittleEndian>(0).unwrap(); // prev_catalog_offset
+    payload.write_u64::<LittleEndian>(n_obs).unwrap();
+    payload
+        .write_u32::<LittleEndian>(entries.len() as u32)
+        .unwrap();
+
+    for (i, (name, section_type_raw, stats)) in entries.iter().enumerate() {
+        payload
+            .write_u16::<LittleEndian>(name.len() as u16)
+            .unwrap();
+        payload.extend_from_slice(name);
+        payload
+            .write_u64::<LittleEndian>(4352 + i as u64 * 1000)
+            .unwrap(); // offset
+        payload.write_u64::<LittleEndian>(1000).unwrap(); // length
+        payload.push(*section_type_raw);
+        payload.extend_from_slice(&[0u8; 32]); // per-entry checksum
+        if catalog_version >= 2 {
+            payload.push(0); // modality_id
+        }
+        payload
+            .write_u16::<LittleEndian>(stats.len() as u16)
+            .unwrap();
+        payload.extend_from_slice(stats);
+    }
+
+    if catalog_version >= 4 {
+        payload.write_u64::<LittleEndian>(generations.0).unwrap();
+        payload.write_u64::<LittleEndian>(generations.1).unwrap();
+    }
+
+    let checksum = blake3_hash(&payload);
+    let mut out = payload;
+    out.extend_from_slice(&checksum);
+    out
+}
+
+/// A stats blob too short for the current layout: 8 bytes of `row_start`,
+/// 8 of `row_end`, and then it stops 4 bytes into `col_start`.
+///
+/// The length is the whole point of the fixture. The outer entry walk
+/// advances by `stats_len` whatever it holds, so a well-formed 57-byte blob
+/// — or an over-long one — parses cleanly on a *future* section type and
+/// demonstrates nothing. Only a blob shorter than the fixed-width prefix
+/// makes the stats decoder run off the end.
+fn short_stats_blob() -> Vec<u8> {
+    vec![0u8; SHORT_STATS_LEN]
+}
+
+const SHORT_STATS_LEN: usize = 20;
+
+/// The fixture is only a §4.2 repro while it is shorter than the layout a
+/// stats decoder expects. Checked at compile time so a future layout change
+/// cannot quietly turn these tests into ones that pass either way.
+const _: () = assert!(SHORT_STATS_LEN < SHARD_STATS_BASE_SIZE_V2);
+
+/// §4.2: a section type this reader does not know, carrying a stats blob
+/// shorter than today's layout, must cost that one entry — not the file.
+///
+/// `FullCatalog::read_from` decodes the stats before it resolves the
+/// section type, so the short blob aborts the entire catalog parse and the
+/// file will not open at all. The catalog is the index to everything, so a
+/// single future section makes every section unreachable.
+#[test]
+fn unknown_section_type_with_short_stats_blob_still_opens() {
+    assert!(
+        SectionType::from_u8(UNKNOWN_SECTION_TYPE).is_none(),
+        "fixture needs an unassigned section type; id {UNKNOWN_SECTION_TYPE} is now known"
+    );
+
+    let stats = short_stats_blob();
+    let bytes = build_raw_catalog(
+        4,
+        100,
+        &[
+            (b"obs", SectionType::ObsMetadata as u8, &[][..]),
+            (b"future_section", UNKNOWN_SECTION_TYPE, &stats[..]),
+            (b"var", SectionType::VarMetadata as u8, &[][..]),
+        ],
+        (0, 0),
+    );
+
+    let full = FullCatalog::read_from(&mut Cursor::new(&bytes), bytes.len(), true)
+        .expect("an unknown section type must cost its own entry, not the whole catalog");
+    let names: Vec<&str> = full.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["obs", "var"], "unknown entry must be dropped");
+
+    // The lightweight parser already resolves the type before touching the
+    // stats. Pin it so unifying the two cannot regress it in that direction.
+    let view = crate::catalog_view::CatalogView::read_from_bytes(&bytes, true)
+        .expect("CatalogView already skips before decoding stats");
+    let view_names: Vec<Option<&str>> = view.entries.iter().map(|e| e.name()).collect();
+    assert_eq!(view_names, vec![Some("obs"), Some("var")]);
+}
+
+/// The mirror of the fixture above, and the reason it is not enough on its
+/// own: skipping *before* decoding must not turn into skipping *instead of*
+/// decoding. A truncated stats blob on a section type the reader does know
+/// is corruption, and both parsers must still refuse it.
+#[test]
+fn truncated_stats_on_a_known_type_is_still_an_error() {
+    let stats = short_stats_blob();
+    let bytes = build_raw_catalog(
+        4,
+        100,
+        &[
+            (b"obs", SectionType::ObsMetadata as u8, &[][..]),
+            (b"X_shard_0", SectionType::CsrShard as u8, &stats[..]),
+        ],
+        (0, 0),
+    );
+
+    let err = FullCatalog::read_from(&mut Cursor::new(&bytes), bytes.len(), true)
+        .expect_err("a truncated stats blob on a known type is corruption");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("failed to fill whole buffer") || msg.contains("UnexpectedEof"),
+        "expected a truncated-read error, got: {msg}"
+    );
+
+    let view_err = crate::catalog_view::CatalogView::read_from_bytes(&bytes, true)
+        .expect_err("the lightweight parser must refuse it too");
+    let view_msg = format!("{view_err}");
+    assert!(
+        view_msg.contains("stats payload too short"),
+        "expected a short-stats error, got: {view_msg}"
+    );
+}
+
+/// Unknown entries are dropped, and dropping them must not disturb the
+/// order of the survivors. Nothing pins this today in either direction, so
+/// a parser unification could silently reverse or reorder the list — which
+/// would be invisible to every other test, since the read paths address
+/// shards by `(section_type, major_start)` and would still find them.
+#[test]
+fn unknown_section_ordering_matches_across_parsers() {
+    assert!(SectionType::from_u8(UNKNOWN_SECTION_TYPE).is_none());
+    let stats = short_stats_blob();
+
+    let bytes = build_raw_catalog(
+        4,
+        100,
+        &[
+            (b"obs", SectionType::ObsMetadata as u8, &[][..]),
+            (b"future_a", UNKNOWN_SECTION_TYPE, &stats[..]),
+            (b"var", SectionType::VarMetadata as u8, &[][..]),
+            (b"future_b", 200, &[][..]),
+            (b"uns", SectionType::UnsBlob as u8, &[][..]),
+        ],
+        (0, 0),
+    );
+
+    let full = FullCatalog::read_from(&mut Cursor::new(&bytes), bytes.len(), true).unwrap();
+    let full_names: Vec<&str> = full.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(full_names, vec!["obs", "var", "uns"]);
+
+    let view = crate::catalog_view::CatalogView::read_from_bytes(&bytes, true).unwrap();
+    let view_names: Vec<Option<&str>> = view.entries.iter().map(|e| e.name()).collect();
+    assert_eq!(
+        view_names,
+        full_names.iter().map(|n| Some(*n)).collect::<Vec<_>>(),
+        "both parsers must drop the same entries and keep the same order"
+    );
+}
+
+/// A name is only worth validating if it is going to be kept. An entry the
+/// reader is about to drop for having an unknown section type should not be
+/// able to fail the whole catalog on its name encoding.
+///
+/// The complementary case — invalid UTF-8 on an entry the reader *keeps* —
+/// is `catalog_rejects_invalid_utf8_name` above, and must stay an error.
+#[test]
+fn non_utf8_name_on_a_dropped_entry_is_tolerated() {
+    assert!(SectionType::from_u8(UNKNOWN_SECTION_TYPE).is_none());
+
+    // Lone continuation bytes — not a valid UTF-8 sequence.
+    let bad_name: &[u8] = &[0x80, 0x80, 0x80];
+    let bytes = build_raw_catalog(
+        4,
+        100,
+        &[
+            (b"obs", SectionType::ObsMetadata as u8, &[][..]),
+            (bad_name, UNKNOWN_SECTION_TYPE, &[][..]),
+        ],
+        (0, 0),
+    );
+
+    let full = FullCatalog::read_from(&mut Cursor::new(&bytes), bytes.len(), true)
+        .expect("a dropped entry's name encoding must not fail the catalog");
+    let names: Vec<&str> = full.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["obs"]);
+
+    crate::catalog_view::CatalogView::read_from_bytes(&bytes, true)
+        .expect("the lightweight parser already tolerates it");
 }

@@ -161,7 +161,8 @@ fn stats_len(entries: &[crate::catalog::FullCatalogEntry], name: &str) -> usize 
 }
 
 /// `n_indexed_columns` and `column_stats.len()` must agree after any clear:
-/// `LazyShardStats` trusts the count to decide whether to decode the tail.
+/// `ShardStats::read_from` loops exactly `n_indexed_columns` times, so a
+/// drifted pair desynchronises the stats decode on read-back.
 fn assert_counts_agree(entries: &[crate::catalog::FullCatalogEntry]) {
     for e in entries {
         if let Some(s) = e.stats.as_ref() {
@@ -2979,4 +2980,145 @@ fn duplicate_section_name_is_rejected() {
         matches!(err, ScxError::DuplicateSection { .. }),
         "expected DuplicateSection, got {err:?}"
     );
+}
+
+/// `LayerCscShard` (section id 16) must be column-major on every surface that
+/// touches it — the catalog stats, the 76-byte shard header, and the reader
+/// index that maps a column to a shard.
+///
+/// It was half-implemented in both directions at once. `catalog_view` and
+/// `shard_decode` treated it as column-major; `ShardStats::major_start`,
+/// `derive_shard_type` and the writer's own stats/index-width dispatch matched
+/// only `CscShard` and so treated it as row-major. `BackedCscIndex` papered
+/// over the split by passing `SectionType::CscShard` for a `LayerCscShard`
+/// entry. Nothing produced the section, so nothing forced the two halves to
+/// meet.
+///
+/// The load-bearing assertion is the last one: with the stats written on the
+/// row axis, every layer CSC shard reported `col_start == 0`, so `shard_for_col`
+/// could not tell two shards apart.
+#[test]
+fn layer_csc_shards_are_column_major_end_to_end() {
+    use crate::backed::BackedCscIndex;
+    use crate::modality::ModalityType;
+    use crate::reader::ScxReader;
+    use crate::shard::ShardHeader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("layer_csc.scx");
+
+    // `n_obs > u16::MAX >= n_vars` on purpose. A column-major shard's minor
+    // axis is rows, so the index width is decided by `n_obs` and must come out
+    // u32; a regression to the row-major branch would derive it from `n_vars`
+    // and pick u16. With the usual 100 × 50 fixture both branches choose u16
+    // and the dispatch is unobservable — which is exactly the hole a round-3
+    // reviewer found in the first version of this test.
+    let header =
+        FileHeader::new_single_modality(70_000, 50, 500, crate::DEFAULT_SHARD_TARGET_ROWS, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var()).unwrap();
+    writer.set_modality_n_vars(rna_id, 50).unwrap();
+
+    let (indptr, indices, values) = sample_shard_data();
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    // Two layer CSC shards covering disjoint column ranges. Distinct starts
+    // are the point: a row-axis stat collapses both to 0.
+    for col_start in [0u64, 20] {
+        writer
+            .write_layer_csc_shard_for(
+                rna_id,
+                "counts",
+                (col_start / 20) as u32,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                col_start,
+            )
+            .unwrap();
+    }
+
+    let final_path = writer.finish().unwrap();
+    let reader = ScxReader::open(&final_path).unwrap();
+
+    // 1. Catalog stats carry the column range on the column axis.
+    let entries = reader
+        .catalog()
+        .layer_csc_shards_for_modality(rna_id, "counts");
+    assert_eq!(entries.len(), 2);
+    let starts: Vec<u64> = entries
+        .iter()
+        .map(|e| {
+            e.stats
+                .as_ref()
+                .unwrap()
+                .major_start(SectionType::LayerCscShard)
+        })
+        .collect();
+    assert_eq!(starts, vec![0, 20], "major axis must be the column axis");
+    for e in &entries {
+        let s = e.stats.as_ref().unwrap();
+        assert_eq!(
+            s.row_range(),
+            0..reader.n_obs(),
+            "the row pair carries the full row range, as for a CSC shard"
+        );
+    }
+
+    // 2. The 76-byte shard header agrees with the catalog. `shard_decode`
+    //    already treats this section as column-major, so a row-major
+    //    `shard_type` would have the header and the decoder disagree.
+    let bytes = reader.section_bytes(entries[0]).unwrap();
+    let sh = ShardHeader::read_from(&mut std::io::Cursor::new(bytes)).unwrap();
+    assert!(sh.is_csc(SectionType::LayerCscShard));
+    sh.validate_csc_strict(SectionType::LayerCscShard).unwrap();
+    assert_eq!(
+        sh.n_minor as u64,
+        reader.n_obs(),
+        "a column-major shard's minor axis is rows"
+    );
+    assert_eq!(
+        sh.index_dtype,
+        1,
+        "index width must be derived from n_obs ({}) — the minor axis of a \
+         column-major shard — not from n_vars",
+        reader.n_obs()
+    );
+
+    // 3. The CSC-sidecar freshness stamp fires for a layer sidecar too. If this
+    //    dispatch regressed to matching `CscShard` alone, nothing would ever set
+    //    it and the counter would stay 0 — which reads as "no sidecar".
+    let catalog = reader.catalog();
+    assert_ne!(catalog.data_generation, 0);
+    assert_eq!(
+        catalog.csc_build_generation, catalog.data_generation,
+        "writing a layer CSC sidecar must stamp csc_build_generation"
+    );
+
+    // 4. The reader index can tell the two shards apart.
+    let index = BackedCscIndex::from_catalog_for_layer(reader.catalog(), rna_id, "counts");
+    assert_eq!(index.n_shards(), 2);
+    assert_eq!(index.shard_for_col(0), Some(0));
+    assert_eq!(index.shard_for_col(21), Some(1));
 }
