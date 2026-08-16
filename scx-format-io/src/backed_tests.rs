@@ -631,6 +631,133 @@ fn test_backed_dense_legacy_single_section() {
 }
 
 // -----------------------------------------------------------------------
+// DenseLruCache
+// -----------------------------------------------------------------------
+//
+// The dense LRU had no test of any kind — not eviction, not the byte budget,
+// not the singleflight around it — despite carrying its own transcription of
+// all three. These pin the behaviour that has to survive being folded into the
+// shared cache.
+
+/// Bytes one decoded 25-row × 6-col f32 shard occupies by the cache's own
+/// measure. Taken from the reader rather than recomputed, so the fixture cannot
+/// drift from `RecordBatch::get_array_memory_size()`.
+fn dense_shard_bytes(dir: &TempDir) -> usize {
+    let path = write_obsm_file(dir, 100, 4, 6);
+    let reader = ScxReader::open(&path).unwrap();
+    let mut backed = BackedDenseReader::new_obsm(reader, "X_emb", 4).unwrap();
+    let metrics = backed.enable_metrics();
+    backed.read_row_indices(&[0]).unwrap();
+    metrics.bytes_inserted.load(Ordering::Relaxed) as usize
+}
+
+#[test]
+fn dense_cache_evicts_to_fit_the_byte_budget() {
+    let probe_dir = tempfile::tempdir().unwrap();
+    let one_shard = dense_shard_bytes(&probe_dir);
+    assert!(one_shard > 0, "probe measured a zero-byte shard");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_obsm_file(&dir, 100, 4, 6);
+    let reader = ScxReader::open(&path).unwrap();
+    // Count cap of 4 (every shard fits) but a byte budget that holds two, so
+    // any eviction here is the byte cap's doing and not the count cap's.
+    let mut backed =
+        BackedDenseReader::new_obsm_with_byte_budget(reader, "X_emb", 4, one_shard * 2).unwrap();
+    let metrics = backed.enable_metrics();
+
+    // One row from each of the four shards, in order.
+    backed.read_row_indices(&[0, 25, 50, 75]).unwrap();
+
+    assert!(
+        metrics.evictions.load(Ordering::Relaxed) >= 2,
+        "four shards into a two-shard byte budget must evict at least twice, got {}",
+        metrics.evictions.load(Ordering::Relaxed)
+    );
+    assert!(
+        metrics.peak_bytes_in_cache.load(Ordering::Relaxed) as usize <= one_shard * 2,
+        "peak {} exceeded the {} byte budget",
+        metrics.peak_bytes_in_cache.load(Ordering::Relaxed),
+        one_shard * 2
+    );
+    // The first shard must be gone; the last must be resident.
+    assert!(
+        !backed.cache_contains(0),
+        "shard 0 should have been evicted"
+    );
+    assert!(backed.cache_contains(3), "shard 3 was just inserted");
+}
+
+#[test]
+fn dense_cache_admits_a_shard_larger_than_the_whole_budget() {
+    // Documented behaviour: an entry that cannot fit on its own is still
+    // inserted after everything else is evicted. Refusing to cache it would
+    // defeat the cache for any outsized shard — and, worse, silently, since
+    // every read would then look like a miss with no eviction to explain it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_obsm_file(&dir, 100, 4, 6);
+    let reader = ScxReader::open(&path).unwrap();
+    let mut backed = BackedDenseReader::new_obsm_with_byte_budget(reader, "X_emb", 4, 1).unwrap();
+    let metrics = backed.enable_metrics();
+
+    backed.read_row_indices(&[0]).unwrap();
+
+    assert!(
+        backed.cache_contains(0),
+        "an oversized shard must still be cached, not silently dropped"
+    );
+    // And it is served from the cache on the next read, not re-decoded.
+    // Asserted on `misses`, not `hits`: one `read_row_indices` warms and then
+    // gathers, so it takes more than one hit off the cache per call and the
+    // hit count is an artefact of the gather, not of the caching.
+    backed.read_row_indices(&[1]).unwrap();
+    assert_eq!(
+        metrics.misses.load(Ordering::Relaxed),
+        1,
+        "the shard must be decoded exactly once across both reads"
+    );
+    assert!(metrics.hits.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn dense_reader_dedups_concurrent_decodes_of_one_shard() {
+    // The dense singleflight, asserted the same way the CSR one is: with
+    // singleflight, total misses can never exceed the number of distinct
+    // shards touched, however many threads race. Without it, each thread
+    // decodes its own copy.
+    use std::thread;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_obsm_file(&dir, 100, 4, 6);
+    let reader = ScxReader::open(&path).unwrap();
+    let mut backed = BackedDenseReader::new_obsm(reader, "X_emb", 4).unwrap();
+    let metrics = backed.enable_metrics();
+    let backed = Arc::new(backed);
+
+    // Rows 0 and 50 live in shards 0 and 2 — two distinct shards.
+    let n_threads = 8;
+    let handles: Vec<_> = (0..n_threads)
+        .map(|_| {
+            let b = Arc::clone(&backed);
+            thread::spawn(move || {
+                b.read_row_indices(&[0, 50]).unwrap();
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let misses = metrics.misses.load(Ordering::Relaxed);
+    assert!(
+        misses <= 2,
+        "expected ≤ 2 misses across {n_threads} concurrent readers of 2 shards, got {misses} \
+         — the dense singleflight is not deduplicating"
+    );
+    assert!(misses >= 1, "every shard had to be decoded once");
+}
+
+// -----------------------------------------------------------------------
 // BackedCsrIndex tests
 // -----------------------------------------------------------------------
 
@@ -1551,6 +1678,129 @@ fn backed_csc_read_csc_columns_skip_count_metric() {
         "no new decodes; both shards served from cache"
     );
     assert_eq!(metrics.hits.load(Ordering::Relaxed), 2);
+}
+
+// -----------------------------------------------------------------------
+// CscCache
+// -----------------------------------------------------------------------
+//
+// The CSC cache had no eviction, capacity or put/get test. It is also the one
+// of the three that is count-only and has no singleflight, so these pin both
+// what it does and what it deliberately does not do.
+
+#[test]
+fn csc_cache_evicts_at_the_count_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    // 12 vars / 3 per shard = 4 CSC shards, cache capped at 2.
+    let (path, _) = write_csc_test_file(&dir, 12, 12, 3);
+    let reader = ScxReader::open(&path).unwrap();
+    let mut backed = BackedCscReader::new(reader, 2).unwrap();
+    let metrics = backed.enable_metrics();
+    assert_eq!(backed.n_shards(), 4);
+
+    for s in [0usize, 1, 2] {
+        backed.read_shard_cached(s).unwrap();
+    }
+    assert_eq!(
+        metrics.misses.load(Ordering::Relaxed),
+        3,
+        "three cold shards, three misses"
+    );
+    assert_eq!(
+        metrics.evictions.load(Ordering::Relaxed),
+        1,
+        "the third insert into a 2-entry cache evicts shard 0"
+    );
+
+    // Shards 1 and 2 are the residents.
+    backed.read_shard_cached(2).unwrap();
+    backed.read_shard_cached(1).unwrap();
+    assert_eq!(metrics.hits.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        metrics.misses.load(Ordering::Relaxed),
+        3,
+        "resident shards must not re-decode"
+    );
+
+    // Shard 0 was evicted, so it decodes again — and displaces another.
+    backed.read_shard_cached(0).unwrap();
+    assert_eq!(
+        metrics.misses.load(Ordering::Relaxed),
+        4,
+        "shard 0 was evicted and must miss"
+    );
+    assert_eq!(metrics.evictions.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn csc_cache_counts_an_eviction_but_not_a_replacement() {
+    // `CscCache::put` uses `LruCache::push`, not `put`, precisely because `put`
+    // returns `None` when a new key evicts the LRU — so a count-cap eviction
+    // would go uncounted. Nothing checked that, and the distinction is
+    // invisible until someone reads the eviction counter and believes it.
+    let metrics = Arc::new(CacheMetrics::default());
+    let mut cache = CscCache::new(2);
+    cache.metrics = Some(Arc::clone(&metrics));
+    let empty = || {
+        Arc::new(ScxCsc::new_unchecked(
+            (4, 1),
+            vec![0, 0],
+            Vec::new(),
+            Vec::new(),
+        ))
+    };
+
+    cache.put(0, empty());
+    cache.put(0, empty());
+    assert_eq!(
+        metrics.evictions.load(Ordering::Relaxed),
+        0,
+        "re-inserting the same key is a replacement, not an eviction"
+    );
+
+    cache.put(1, empty());
+    cache.put(2, empty());
+    assert_eq!(
+        metrics.evictions.load(Ordering::Relaxed),
+        1,
+        "the third distinct key must evict one and be counted"
+    );
+    assert!(cache.get(&0).is_none(), "key 0 is the LRU and must be gone");
+    assert!(cache.get(&2).is_some());
+}
+
+#[test]
+fn csc_metrics_leave_the_byte_counters_at_zero() {
+    // Pins today's accounting so the change is visible as an edited assertion:
+    // the CSC cache is count-only, and `CscCache::put`'s comment says
+    // `bytes_inserted` / `peak_bytes_in_cache` are "intentionally left at
+    // zero". The CSR and dense caches both populate them.
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = write_csc_test_file(&dir, 12, 12, 3);
+    let reader = ScxReader::open(&path).unwrap();
+    let mut backed = BackedCscReader::new(reader, 4).unwrap();
+    let metrics = backed.enable_metrics();
+
+    for s in 0..backed.n_shards() {
+        backed.read_shard_cached(s).unwrap();
+    }
+
+    assert!(metrics.misses.load(Ordering::Relaxed) > 0, "shards decoded");
+    assert_eq!(
+        metrics.bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "CSC is count-only today"
+    );
+    assert_eq!(
+        metrics.peak_bytes_in_cache.load(Ordering::Relaxed),
+        0,
+        "CSC is count-only today"
+    );
+    assert_eq!(
+        metrics.duplicate_waiters.load(Ordering::Relaxed),
+        0,
+        "CSC has no singleflight today — nothing can wait"
+    );
 }
 
 #[test]
