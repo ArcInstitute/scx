@@ -11,7 +11,7 @@ use scx_sparse::concatenate_csr;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-// --- Test helpers (same as reader.rs test helpers) ---
+// --- Test helpers (same as reader_tests.rs helpers) ---
 
 fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
     FileHeader::new_single_modality(n_obs, n_vars, nnz, 16384, 0, 0)

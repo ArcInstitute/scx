@@ -3385,7 +3385,7 @@ impl BackedCscReader {
 }
 
 /// Concatenate a list of CSC parts along the column axis.
-/// Internal helper — the same logic also lives in `reader.rs` as a
+/// Internal helper — the same logic also lives in `reader/matrix.rs` as a
 /// private free function. Local copy avoids cross-module visibility
 /// changes.
 fn concatenate_csc_along_cols(parts: Vec<ScxCsc>, n_rows: usize) -> Result<ScxCsc> {

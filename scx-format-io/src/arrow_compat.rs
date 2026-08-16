@@ -135,7 +135,7 @@ fn encode_to_dictionary(col: &ArrayRef, value_type: &DataType) -> Result<ArrayRe
             )
         })?;
 
-    // First-occurrence order, matching the dedup helpers in `reader.rs`.
+    // First-occurrence order, matching the dedup helpers in `reader/metadata.rs`.
     let mut present: Vec<bool> = Vec::with_capacity(2);
     for i in 0..plain.len() {
         if !plain.is_null(i) {

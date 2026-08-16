@@ -2370,6 +2370,29 @@ fn open_with_shared_catalog_checks_v1_reconciliation_not_the_version() {
         "the error must name the missing reconciliation and what to call instead, got: {msg}"
     );
 
+    // (b2) A v1 catalog carrying a column range that is NOT the one the
+    //      reconciliation produces. The first version of this check only asked
+    //      `col_end != 0`, so it admitted this — a weaker guarantee than the
+    //      one the function documents.
+    let mut wrong_range = (*reader.catalog_arc()).clone();
+    wrong_range.catalog_version = 1;
+    for e in &mut wrong_range.entries {
+        if let Some(st) = e.stats.as_mut() {
+            if matches!(
+                e.section_type,
+                SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+            ) {
+                st.col_start = 1;
+                st.col_end = n_vars + 7;
+            }
+        }
+    }
+    assert!(
+        ScxReader::open_with_shared_catalog(&path, Arc::new(wrong_range)).is_err(),
+        "a v1 catalog whose column range is not 0..n_vars did not come from \
+         reconcile_v1_csr_col_range and must be refused"
+    );
+
     // (c) A v2+ catalog is untouched by any of this.
     assert!(
         ScxReader::open_with_shared_catalog(&path, reader.catalog_arc()).is_ok(),

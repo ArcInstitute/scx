@@ -129,11 +129,18 @@ impl ScxReader {
     /// Verify that a v1 catalog handed to [`Self::open_with_shared_catalog`]
     /// has already been through `reconcile_v1_csr_col_range`.
     ///
-    /// The discriminator: v1 stats carry no column pair on disk, so
-    /// `FullCatalog::read_from` leaves `col_end` at `0`, and the reconciliation
-    /// sets it to the header's `n_vars`. A row-major entry still reporting
-    /// `col_end == 0` on a file with `n_vars > 0` therefore never went through
-    /// it, and its shard ranges would be wrong for any column-projected read.
+    /// The discriminator is the exact pair the reconciliation writes:
+    /// `col_start = 0`, `col_end = n_vars`. v1 stats carry no column pair on
+    /// disk, so `FullCatalog::read_from` leaves both at `0`; a row-major entry
+    /// not carrying that pair on a file with `n_vars > 0` never went through
+    /// the reconciliation, and its shard ranges would be wrong for any
+    /// column-projected read.
+    ///
+    /// Checking the whole pair rather than `col_end != 0` matters: the looser
+    /// form accepted any nonzero `col_end` and never looked at `col_start`, so
+    /// it admitted catalogs carrying a column range that is not the one
+    /// reconciliation produces — a weaker guarantee than the one this function
+    /// documents.
     ///
     /// No-op for v2+, where the column pair is on disk and the reconciliation
     /// is itself a no-op.
@@ -149,12 +156,13 @@ impl ScxReader {
                 continue;
             }
             if let Some(stats) = e.stats.as_ref() {
-                if stats.col_end == 0 {
+                if stats.col_start != 0 || stats.col_end != header.n_vars {
                     return Err(ScxError::InvalidCatalog(format!(
                         "shared catalog is v1 and entry '{}' has not been reconciled \
-                         (col_end 0, expected {}); this path cannot reconcile a shared \
-                         Arc<FullCatalog> — pass a catalog from ScxReader::open()",
-                        e.name, header.n_vars,
+                         (col_start/col_end {}..{}, expected 0..{}); this path cannot \
+                         reconcile a shared Arc<FullCatalog> — pass a catalog from \
+                         ScxReader::open()",
+                        e.name, stats.col_start, stats.col_end, header.n_vars,
                     )));
                 }
             }
