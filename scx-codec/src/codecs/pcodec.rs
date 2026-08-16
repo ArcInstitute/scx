@@ -217,7 +217,7 @@ fn decode_pcodec_ref(
     let DecodeBounds {
         indptr_max,
         indices_max,
-        ..
+        values_max,
     } = *bounds;
 
     let indptr_raw = zstd_decode_bounded(encoded.indptr_bytes, indptr_max)?;
@@ -245,14 +245,16 @@ fn decode_pcodec_ref(
             }
             buf
         }
-        _ => {
-            // Integer encodings: Zstd decompress
-            let values_max = checked_len(nnz, value_encoding.byte_width(), "values")?;
-            zstd_decode_bounded(encoded.values_bytes, values_max)?
-        }
+        // Integer encodings: Zstd decompress, capped by the driver's byte bound.
+        //
+        // NB `values_max` is a *byte* cap and is only usable here and in the
+        // length check below. `pcodec_decompress_bounded` takes an element
+        // *count*: the Float16 arm decompresses as f32 and narrows, so its
+        // count is `nnz` while `values_max` is `nnz * 2`.
+        _ => zstd_decode_bounded(encoded.values_bytes, values_max)?,
     };
 
-    let expected_len = checked_len(nnz, value_encoding.byte_width(), "values")?;
+    let expected_len = values_max;
     if values_raw.len() != expected_len {
         return Err(CodecError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

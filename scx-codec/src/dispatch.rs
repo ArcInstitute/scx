@@ -115,6 +115,13 @@ pub fn decode_shard_ref(
     // `bounds`; it has no way to derive its own, which is what made "this
     // decoder forgot a guard" representable before (§3.5, and #436's LZ4 hole).
     let shape = ShardShape { n_rows, nnz };
+    // `supports` is checked inside `decode_via`, but the *encoding* rejection
+    // must precede the *shape* arithmetic or a doubly-invalid call (Scx1 +
+    // float + an overflowing nnz) changes its error from `FloatWithScx1` to
+    // `MalformedInput`. That precedence is pre-existing public behaviour.
+    if codec_id == CodecId::Scx1 && !Scx1Codec::supports(value_encoding) {
+        return Err(CodecError::FloatWithScx1);
+    }
     let bounds = DecodeBounds::derive(shape, value_encoding, index_dtype_u16)?;
     let decoded = match codec_id {
         CodecId::None => {
@@ -146,7 +153,7 @@ pub fn decode_shard_ref(
     // element width would round a ragged length down to a passing element
     // count. Several arms already check this; those become belt-and-braces.
     let (indptr, indices, values) = &decoded;
-    let expected_value_bytes = checked_len(nnz, value_encoding.byte_width(), "values")?;
+    let expected_value_bytes = bounds.values_max;
     if values.len() != expected_value_bytes {
         return Err(CodecError::MalformedInput(format!(
             "shard decoded {} value bytes != declared nnz {nnz} * {} bytes/element",
@@ -178,11 +185,12 @@ pub fn decode_shard_scipy(
             return Err(CodecError::FloatWithScx1);
         }
 
-        // Same L1 overflow + L2 plausibility guards as `decode_scx1_ref`, so
-        // every Scx1 decode entry point rejects hostile headers up front (F-f).
-        indptr_byte_cap(n_rows)?;
-        checked_len(nnz, if index_dtype_u16 { 2 } else { 4 }, "scx1 indices")?;
-        checked_len(nnz, value_encoding.byte_width(), "scx1 values")?;
+        // L1 comes from the same derivation the driver uses, so this fast path
+        // cannot drift from `decode_shard_ref`'s. It is a *decode* entry point
+        // in its own right — `scx-format-io` materialization reaches Scx1
+        // through here, not through `decode_shard_ref` — so deriving it by
+        // hand was a second copy of exactly what this seam removes.
+        DecodeBounds::derive(ShardShape { n_rows, nnz }, value_encoding, index_dtype_u16)?;
         let n_rows_p1 = n_rows.checked_add(1).ok_or_else(|| {
             CodecError::MalformedInput(format!("scx1 n_rows+1 overflow: {n_rows}"))
         })?;
@@ -272,10 +280,8 @@ pub fn decode_shard_native(
             return Err(CodecError::FloatWithScx1);
         }
 
-        // Same L1 overflow + L2 plausibility guards as `decode_shard_scipy`.
-        indptr_byte_cap(n_rows)?;
-        checked_len(nnz, if index_dtype_u16 { 2 } else { 4 }, "scx1 indices")?;
-        checked_len(nnz, value_encoding.byte_width(), "scx1 values")?;
+        // Same single derivation as `decode_shard_scipy` above.
+        DecodeBounds::derive(ShardShape { n_rows, nnz }, value_encoding, index_dtype_u16)?;
         let n_rows_p1 = n_rows.checked_add(1).ok_or_else(|| {
             CodecError::MalformedInput(format!("scx1 n_rows+1 overflow: {n_rows}"))
         })?;

@@ -10,7 +10,7 @@ pub mod guards;
 pub mod median;
 pub mod raw;
 pub mod rice;
-pub mod shard_codec;
+pub(crate) mod shard_codec;
 pub mod shuffle;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod simd;
@@ -36,7 +36,6 @@ pub use guards::{check_indptr_shape, clamp_index_bound, NO_INDEX_BOUND};
 pub use median::{
     floor_median_u32, floor_median_u32_inplace, floor_median_u64, floor_median_u64_inplace,
 };
-pub use shard_codec::{DecodeBounds, ShardCodec, ShardShape};
 pub use value_encoding::{
     detect_value_encoding, detect_value_encoding_f64, is_integer_data, values_to_raw_bytes,
 };
