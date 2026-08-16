@@ -3122,3 +3122,91 @@ fn layer_csc_shards_are_column_major_end_to_end() {
     assert_eq!(index.shard_for_col(0), Some(0));
     assert_eq!(index.shard_for_col(21), Some(1));
 }
+
+/// The **bulk, index-derived** column-stat path refuses a multimodal file, and
+/// the refusal is loud.
+///
+/// `assign_csr_shard_column_stats` maps `per_shard[i]` onto the i-th CSR shard
+/// **by position**, which is only meaningful while "the i-th CSR shard" and
+/// "shard_id i in the predicate index" are the same thing. On a multimodal file
+/// they are not: every modality's shards independently tile `[0, n_obs)`, so a
+/// flattened positional walk would attribute one modality's stats to another's
+/// shards and Level-1 pruning would then skip shards that do match.
+///
+/// The entry filter (`modality_id == 0`) is what prevents that, and this test
+/// is what keeps it.
+///
+/// ⚠️ Scope, precisely — this test pins one path, not a file-wide property:
+///
+/// - It says nothing about [`ScxWriter::set_shard_column_stats`], which writes
+///   to the last-written entry whatever its modality. That setter is not fed by
+///   a predicate index, so it carries no positional assumption to violate.
+/// - It does **not** establish that a multimodal file cannot carry an
+///   `obs_predicate_index`. `write_obs_predicate_index` is public and accepts a
+///   writer with registered modalities; the high-level builders skip emission by
+///   convention (`scx convert` emits `PredicateIndexSkippedMultimodal`, `merge`
+///   records `multimodal_skip`). The read side does not rely on that convention
+///   — see `scx_engine::index::derive_shard_column_stats` for the three
+///   independent guards.
+#[test]
+fn bulk_csr_shard_column_stats_refuses_a_multimodal_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multimodal_stats.scx");
+    let mut writer = ScxWriter::new(&path, sample_header()).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var()).unwrap();
+    writer.write_var_for(adt_id, &sample_var()).unwrap();
+
+    // One CSR shard per modality, both covering the same obs rows — the
+    // multimodal layout. Neither is a modality-0 entry.
+    let (indptr, indices, values) = sample_shard_data();
+    for m in [rna_id, adt_id] {
+        writer
+            .write_csr_shard_for(
+                m,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+    }
+
+    // An index built over the single global obs axis produces one stat vec per
+    // *obs* shard range. There are two CSR shards on disk, so a positional walk
+    // that ignored `modality_id` would find two entries and happily assign.
+    let err = writer
+        .set_csr_shard_column_stats_bulk(vec![vec![]])
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ScxError::ColumnStatsShardCountMismatch {
+                got: 1,
+                expected: 0
+            }
+        ),
+        "expected a loud refusal naming zero modality-0 shards, got {err:?}"
+    );
+}

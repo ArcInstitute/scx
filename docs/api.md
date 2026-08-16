@@ -756,7 +756,20 @@ Behaviour:
 - Multimodal inputs emit `PredicateIndexSkippedMultimodal` and skip
   predicate-index emission entirely — the read path is unimodal-only
   today. The same skip-with-warning applies to multimodal
-  `merge` / `append` / `compact`.
+  `merge` / `append` / `compact`. The reason is that a `shard_id` is resolved to
+  "the i-th CSR shard" **by position**, and on a multimodal file each modality's
+  shards independently tile `[0, n_obs)`, so the i-th shard is ambiguous.
+  Adding multimodal indexing means giving `ShardRange` a modality scope.
+
+  Correctness does **not** rest on the file lacking an index —
+  `ScxWriter::write_obs_predicate_index` is public and accepts a multimodal
+  writer, so skipping emission is a convention of the high-level writers. Three
+  independent guards do the work: the write side
+  (`assign_csr_shard_column_stats` counts only `modality_id == 0` entries and
+  returns `ColumnStatsShardCountMismatch` rather than mis-assigning), Level-2
+  read (`build_plan` forces `obs_predicate_index` to `None` for any
+  `modality_id != 0` pipeline), and Level-1 read, which reads per-entry
+  `column_stats` and never consults an index `shard_id` at all.
 - The flags only build indexes on the SCX-writing ingest directions
   (`h5ad → scx`, `10x → scx`; `h5mu → scx` accepts them and skips with
   the warning above). On any other `scx convert` direction —

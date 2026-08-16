@@ -1647,7 +1647,13 @@ impl ScxWriter {
     /// last-written entry) this addresses shards by position, in a single sort
     /// pass — O(n log n) rather than O(n²) on atlas-scale shard counts.
     ///
-    /// `per_shard.len()` must equal the number of CSR shards written so far.
+    /// `per_shard.len()` must equal the number of **`modality_id == 0`** CSR
+    /// shards written so far — not the total. On a multimodal file every CSR
+    /// shard carries a nonzero modality id, so that count is zero and any
+    /// non-empty `per_shard` is rejected with
+    /// `ColumnStatsShardCountMismatch`; see
+    /// [`assign_csr_shard_column_stats`] for why failing closed is the right
+    /// answer there.
     pub fn set_csr_shard_column_stats_bulk(
         &mut self,
         per_shard: Vec<Vec<crate::catalog::ColumnStat>>,

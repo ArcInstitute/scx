@@ -24,10 +24,15 @@ use crate::rowset::{RowRange, RowSet};
 use scx_format_io::catalog::FullCatalogEntry;
 use scx_format_io::{assemble_filtered_metadata, DeletionVectors, SectionType};
 
-/// Env var (test/diagnostic only) that forces the legacy full-decode obs path,
-/// disabling row-set predicate pushdown. The differential correctness oracle
-/// runs each query with and without it set and asserts byte-identical results.
-fn rowset_pushdown_disabled() -> bool {
+/// Env var (diagnostic only) that forces the legacy full-decode obs path,
+/// disabling row-set predicate pushdown.
+///
+/// Read **once per pipeline**, at construction, into
+/// [`QueryPipeline::rowset_pushdown`](crate::QueryPipeline::rowset_pushdown)'s
+/// backing field — not once per query. That field is the only thing
+/// [`compute_mask`] consults, so nothing has to mutate the process environment
+/// to exercise the legacy path; `tests/rowset_differential.rs` sets the field.
+pub(crate) fn rowset_pushdown_disabled_by_env() -> bool {
     std::env::var_os("SCX_DISABLE_ROWSET_PUSHDOWN").is_some()
 }
 
@@ -644,6 +649,20 @@ pub(crate) fn scan_shards(
 /// `shards_sorted()` (== its index in `output_shard_row_ranges` at build time).
 /// Returns `None` if any shard lacks row-range stats — the index then can't be
 /// mapped to global rows safely, so the caller falls back to the legacy path.
+///
+/// ⚠️ **The position `i` here equals the index's `shard_id` only at
+/// `modality_id == 0`.** `sorted_shards` comes from [`scan_shards`], which is
+/// modality-scoped; on a multimodal file each modality's shards independently
+/// tile `[0, n_obs)`, so modality 2's third shard is also position 2 and would
+/// silently adopt modality 1's row-set.
+///
+/// What prevents that is [`build_plan`], which forces `obs_predicate_index` to
+/// `None` for every `modality_id != 0` pipeline — so this function is not
+/// reachable on a modality-scoped query, whatever the file contains. That guard
+/// is the load-bearing one; index absence is **not**. See
+/// [`crate::index::derive_shard_column_stats`] for the write-side half and for
+/// why "multimodal files carry no index" is a convention of the high-level
+/// writers rather than an enforced invariant.
 fn csr_shard_ranges_table(sorted_shards: &[&FullCatalogEntry]) -> Option<Vec<(u32, u64, u64)>> {
     let mut table = Vec::with_capacity(sorted_shards.len());
     for (i, entry) in sorted_shards.iter().enumerate() {
@@ -857,7 +876,7 @@ fn try_rowset_mask(
     sorted_shards: &[&FullCatalogEntry],
     n_obs: usize,
 ) -> Result<Option<MaskResult>> {
-    if rowset_pushdown_disabled() {
+    if !pipeline.rowset_pushdown_enabled() {
         return Ok(None);
     }
     let reader = pipeline.reader();

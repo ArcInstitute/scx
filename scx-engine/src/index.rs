@@ -2386,6 +2386,37 @@ fn streaming_impl(
 /// out-of-range id signals an index/catalog shard-space misalignment, which
 /// would silently mis-place "value present" bits and risk incorrect shard
 /// skipping; it trips a `debug_assert` and is otherwise dropped defensively.
+///
+/// **This positional `shard_id` → CSR-shard mapping is a write-time concern,
+/// and multimodal safety does not rest on it alone.** Each modality's CSR shards
+/// independently tile `[0, n_obs)`, so a flattened walk over "the i-th CSR
+/// shard" stops meaning "shard_id i" the moment a second modality exists. Three
+/// *independent* protections exist; none of them is "the file cannot contain an
+/// index":
+///
+/// - **Write side (here).**
+///   [`scx_format_io::writer::assign_csr_shard_column_stats`] counts only
+///   `modality_id == 0` CSR entries and returns `ColumnStatsShardCountMismatch`
+///   rather than mis-assigning, so these derived stats cannot land on a
+///   multimodal file's shards
+///   (`writer_tests::bulk_csr_shard_column_stats_refuses_a_multimodal_file`).
+/// - **Level-2 read.** `collect::build_plan` forces `obs_predicate_index` to
+///   `None` for every `modality_id != 0` pipeline, so `csr_shard_ranges_table`
+///   never runs on a modality-scoped query even if an index section is present.
+/// - **Level-1 read.** `pushdown::prune_shards_by_catalog_with_dict` reads the
+///   `column_stats` already attached to each catalog entry and never consults an
+///   index `shard_id`, so it is unaffected by this mapping either way.
+///
+/// **Index omission is a convention, not an invariant.** `scx convert` on an
+/// h5mu emits `ConvertWarning::PredicateIndexSkippedMultimodal`,
+/// `scx-ops::merge` records `multimodal_skip`, and `merge_multimodal` never
+/// calls this — but `ScxWriter::write_obs_predicate_index` is public and accepts
+/// a writer with registered modalities, so a file *can* carry one. That is why
+/// the two read-side guards above matter and must not be removed on the grounds
+/// that such a file "cannot exist".
+///
+/// Shipping multimodal indexing means giving `ShardRange` a modality scope, not
+/// relaxing any of this.
 pub fn derive_shard_column_stats(
     index: &PredicateIndex,
     n_shards: usize,

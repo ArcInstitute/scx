@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, RecordBatch, StringArray};
+use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{
@@ -21,6 +21,44 @@ use tempfile::TempDir;
 
 const N_VARS: usize = 4;
 
+/// How the fixture's categorical obs columns are encoded on disk.
+///
+/// Every test below runs both. `Dictionary(Int32, Utf8)` is the shape a pandas
+/// categorical reaches SCX as (`scx-convert/src/h5ad_obs.rs`), and until this
+/// parameterisation no end-to-end engine test wrote one — so the Level-1
+/// `CategoryBitset` pruning asserted here had only ever been exercised against
+/// `Utf8`. The `skipped_shards` assertions double as the canary: an encoding
+/// the builder declines to classify as categorical produces no bitset, no
+/// pruning, and `skipped_shards == 0`.
+///
+/// (`tests/rowset_differential.rs` carries the same enum. Integration test
+/// binaries do not share code, and a `tests/common/` module for twenty lines
+/// would be a heavier pattern than the duplication.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObsEncoding {
+    Utf8,
+    Dictionary,
+}
+
+impl ObsEncoding {
+    fn data_type(self) -> DataType {
+        match self {
+            Self::Utf8 => DataType::Utf8,
+            Self::Dictionary => {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }
+        }
+    }
+
+    fn categorical(self, values: Vec<&str>) -> ArrayRef {
+        let utf8: ArrayRef = Arc::new(StringArray::from(values));
+        match self {
+            Self::Utf8 => utf8,
+            Self::Dictionary => arrow::compute::cast(&utf8, &self.data_type()).unwrap(),
+        }
+    }
+}
+
 fn header(n_obs: u64) -> FileHeader {
     FileHeader::new_single_modality(n_obs, N_VARS as u64, 0, 16384, 0, 0)
 }
@@ -29,15 +67,15 @@ fn header(n_obs: u64) -> FileHeader {
 /// shard 1 (so each value is absent from exactly one shard). `n_counts` is
 /// small (10..13) in shard 0 and large (1000..1003) in shard 1. `donor` spans
 /// both shards ("d1"/"d2" appear in each) to exercise the no-skip direction.
-fn two_shard_obs() -> RecordBatch {
+fn two_shard_obs(enc: ObsEncoding) -> RecordBatch {
     let cell_id: Vec<String> = (0..8).map(|i| format!("cell_{i}")).collect();
     let cell_type: Vec<&str> = vec!["A", "A", "A", "A", "B", "B", "B", "B"];
     let donor: Vec<&str> = vec!["d1", "d1", "d2", "d2", "d1", "d1", "d2", "d2"];
     let n_counts: Vec<i64> = vec![10, 11, 12, 13, 1000, 1001, 1002, 1003];
     let schema = Schema::new(vec![
         Field::new("cell_id", DataType::Utf8, false),
-        Field::new("cell_type", DataType::Utf8, false),
-        Field::new("donor", DataType::Utf8, false),
+        Field::new("cell_type", enc.data_type(), false),
+        Field::new("donor", enc.data_type(), false),
         Field::new("n_counts", DataType::Int64, false),
     ]);
     RecordBatch::try_new(
@@ -46,8 +84,8 @@ fn two_shard_obs() -> RecordBatch {
             Arc::new(StringArray::from(
                 cell_id.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(cell_type)),
-            Arc::new(StringArray::from(donor)),
+            enc.categorical(cell_type),
+            enc.categorical(donor),
             Arc::new(Int64Array::from(n_counts)),
         ],
     )
@@ -85,9 +123,9 @@ fn write_shard(writer: &mut ScxWriter, n_rows: usize, row_start: u64) {
 
 /// Build a two-shard SCX file with an obs predicate index over `cell_type` +
 /// `donor` (categorical) and `n_counts` (numeric), through the production path.
-fn build_indexed_file(dir: &TempDir) -> std::path::PathBuf {
+fn build_indexed_file(dir: &TempDir, enc: ObsEncoding) -> std::path::PathBuf {
     let path = dir.path().join("indexed.scx");
-    let obs = two_shard_obs();
+    let obs = two_shard_obs(enc);
     let var = sample_var();
     let mut writer = ScxWriter::new(&path, header(8)).unwrap();
     writer.write_obs(&obs).unwrap();
@@ -106,7 +144,7 @@ fn build_indexed_file(dir: &TempDir) -> std::path::PathBuf {
         index_auto_threshold: 1000,
     };
     let obs_row_ranges = [(0u64, 4u64), (4u64, 8u64)];
-    build_and_write_conversion_predicate_indexes(
+    let result = build_and_write_conversion_predicate_indexes(
         &mut writer,
         &obs,
         &var,
@@ -115,14 +153,31 @@ fn build_indexed_file(dir: &TempDir) -> std::path::PathBuf {
         &opts,
     )
     .unwrap();
+
+    // Canary: an encoding whose categoricals the builder declines to index
+    // would leave every `skipped_shards` assertion below reading 0 for a reason
+    // that is not a bug — a residual query is slow, not wrong. Fail here, where
+    // the diagnosis is legible, rather than three asserts later.
+    let mut indexed = result.obs_indexed_columns.clone();
+    indexed.sort();
+    assert_eq!(
+        indexed,
+        vec![
+            "cell_type".to_string(),
+            "donor".to_string(),
+            "n_counts".to_string()
+        ],
+        "{enc:?}: obs index does not cover the queried columns; outcomes: {:?}",
+        result.obs_outcomes
+    );
+
     writer.finish().unwrap();
     path
 }
 
-#[test]
-fn categorical_filter_skips_shard_without_value() {
+fn categorical_filter_skips_shard_without_value(enc: ObsEncoding) {
     let dir = TempDir::new().unwrap();
-    let path = build_indexed_file(&dir);
+    let path = build_indexed_file(&dir, enc);
 
     // "A" lives only in shard 0 → shard 1 must be skipped.
     let r = QueryPipeline::open(&path)
@@ -146,10 +201,9 @@ fn categorical_filter_skips_shard_without_value() {
     assert_eq!(r.matched_rows, 4);
 }
 
-#[test]
-fn numeric_filter_skips_shard_out_of_range() {
+fn numeric_filter_skips_shard_out_of_range(enc: ObsEncoding) {
     let dir = TempDir::new().unwrap();
-    let path = build_indexed_file(&dir);
+    let path = build_indexed_file(&dir, enc);
 
     // n_counts > 500 → shard 0 (max 13) can't match and must be skipped.
     let r = QueryPipeline::open(&path)
@@ -169,10 +223,9 @@ fn numeric_filter_skips_shard_out_of_range() {
 /// Negative direction: a categorical value present in *every* shard must NOT be
 /// skipped anywhere. Guards against a shard-space misalignment that unsets a
 /// "present" bit and silently drops matching rows (incorrect over-skip).
-#[test]
-fn categorical_filter_present_everywhere_skips_nothing() {
+fn categorical_filter_present_everywhere_skips_nothing(enc: ObsEncoding) {
     let dir = TempDir::new().unwrap();
-    let path = build_indexed_file(&dir);
+    let path = build_indexed_file(&dir, enc);
 
     // "d1" lives in both shards → neither shard may be skipped.
     let r = QueryPipeline::open(&path)
@@ -191,10 +244,9 @@ fn categorical_filter_present_everywhere_skips_nothing() {
 
 /// Negative direction (numeric): a range that overlaps every shard's [min,max]
 /// must NOT be skipped anywhere.
-#[test]
-fn numeric_filter_overlapping_all_shards_skips_nothing() {
+fn numeric_filter_overlapping_all_shards_skips_nothing(enc: ObsEncoding) {
     let dir = TempDir::new().unwrap();
-    let path = build_indexed_file(&dir);
+    let path = build_indexed_file(&dir, enc);
 
     // n_counts > 5 → shard 0 (max 13) and shard 1 (max 1003) both qualify.
     let r = QueryPipeline::open(&path)
@@ -209,4 +261,47 @@ fn numeric_filter_overlapping_all_shards_skips_nothing() {
         "both shards have values > 5 — nothing may be skipped"
     );
     assert_eq!(r.matched_rows, 8, "all 8 rows match");
+}
+
+// Each fixture above runs in both obs encodings, as separate `#[test]`s so a
+// failure names the encoding rather than making the reader infer it.
+
+#[test]
+fn categorical_filter_skips_shard_without_value_utf8() {
+    categorical_filter_skips_shard_without_value(ObsEncoding::Utf8);
+}
+
+#[test]
+fn categorical_filter_skips_shard_without_value_dictionary() {
+    categorical_filter_skips_shard_without_value(ObsEncoding::Dictionary);
+}
+
+#[test]
+fn numeric_filter_skips_shard_out_of_range_utf8() {
+    numeric_filter_skips_shard_out_of_range(ObsEncoding::Utf8);
+}
+
+#[test]
+fn numeric_filter_skips_shard_out_of_range_dictionary() {
+    numeric_filter_skips_shard_out_of_range(ObsEncoding::Dictionary);
+}
+
+#[test]
+fn categorical_filter_present_everywhere_skips_nothing_utf8() {
+    categorical_filter_present_everywhere_skips_nothing(ObsEncoding::Utf8);
+}
+
+#[test]
+fn categorical_filter_present_everywhere_skips_nothing_dictionary() {
+    categorical_filter_present_everywhere_skips_nothing(ObsEncoding::Dictionary);
+}
+
+#[test]
+fn numeric_filter_overlapping_all_shards_skips_nothing_utf8() {
+    numeric_filter_overlapping_all_shards_skips_nothing(ObsEncoding::Utf8);
+}
+
+#[test]
+fn numeric_filter_overlapping_all_shards_skips_nothing_dictionary() {
+    numeric_filter_overlapping_all_shards_skips_nothing(ObsEncoding::Dictionary);
 }

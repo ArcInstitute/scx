@@ -8,7 +8,7 @@
 //! 2. on the row-set fast path (resolve indexed obs predicates straight from
 //!    the predicate index, no obs-shard decode); and
 //! 3. on the legacy full-decode-and-mask path, forced with
-//!    `SCX_DISABLE_ROWSET_PUSHDOWN`.
+//!    `QueryPipeline::rowset_pushdown(false)`.
 //!
 //! Layers 2 and 3 must agree with each other (X, obs, var, count, exists,
 //! across a range of `limit` values) *and* with layer 1. The differential half
@@ -26,14 +26,18 @@
 //! forcing the residual path), and obs/CSR shard boundaries that COINCIDE (the
 //! atlas case).
 //!
-//! NOTE: this file intentionally contains a single `#[test]` so the
-//! process-global `SCX_DISABLE_ROWSET_PUSHDOWN` env var is toggled without
-//! racing other tests (separate `tests/*.rs` files are separate binaries).
+//! The path selection is **per pipeline** (`QueryPipeline::rowset_pushdown`),
+//! not process-global. It used to be the `SCX_DISABLE_ROWSET_PUSHDOWN` env var,
+//! which forced this file to hold exactly one `#[test]` — cargo runs a test
+//! binary's tests on several threads, so a second test here would have raced
+//! this one's `set_var` and silently compared the wrong two paths. The env var
+//! still seeds the field's default at `QueryPipeline` construction; nothing
+//! reads it per query.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{
@@ -95,19 +99,57 @@ fn n_genes_at(i: usize) -> i64 {
     100 + ((i * 137) % 900) as i64 // [100, 999]
 }
 
-fn full_obs() -> RecordBatch {
+/// How the fixture's three categorical obs columns are encoded on disk.
+///
+/// `Utf8` is what this oracle has always written. `Dictionary` is the shape a
+/// pandas categorical actually reaches Arrow — and therefore SCX — as: every
+/// `.h5ad` obs column of dtype `category` lands as `Dictionary(Int32, Utf8)`
+/// (`scx-convert/src/h5ad_obs.rs`). Both arms must give identical answers, on
+/// both evaluation paths, against the same ground truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObsEncoding {
+    Utf8,
+    Dictionary,
+}
+
+impl ObsEncoding {
+    fn data_type(self) -> DataType {
+        match self {
+            Self::Utf8 => DataType::Utf8,
+            Self::Dictionary => {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }
+        }
+    }
+
+    /// Build a categorical column in this encoding. The `Dictionary` arm goes
+    /// through arrow's cast so the vocabulary is derived from the values,
+    /// exactly as the h5ad reader derives it from pandas' categories.
+    fn categorical(self, values: Vec<Option<&str>>) -> ArrayRef {
+        let utf8: ArrayRef = Arc::new(StringArray::from(values));
+        match self {
+            Self::Utf8 => utf8,
+            Self::Dictionary => arrow::compute::cast(&utf8, &self.data_type()).unwrap(),
+        }
+    }
+}
+
+fn full_obs(enc: ObsEncoding) -> RecordBatch {
     let n = N_OBS as usize;
     let cell_id: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
     let cell_type: Vec<Option<&str>> = (0..n).map(cell_type_at).collect();
-    let tissue: Vec<&str> = (0..n).map(tissue_at).collect();
-    let quality: Vec<&str> = (0..n).map(quality_at).collect();
+    let tissue: Vec<Option<&str>> = (0..n).map(|i| Some(tissue_at(i))).collect();
+    let quality: Vec<Option<&str>> = (0..n).map(|i| Some(quality_at(i))).collect();
     let n_genes: Vec<i64> = (0..n).map(n_genes_at).collect();
 
+    // `cell_id` stays Utf8 in both arms: the obs index is a plain string column
+    // in real files, and keeping it fixed means a difference between the arms is
+    // attributable to the categorical encoding and nothing else.
     let schema = Schema::new(vec![
         Field::new("cell_id", DataType::Utf8, false),
-        Field::new("cell_type", DataType::Utf8, true), // nullable
-        Field::new("tissue", DataType::Utf8, false),
-        Field::new("quality", DataType::Utf8, false),
+        Field::new("cell_type", enc.data_type(), true), // nullable
+        Field::new("tissue", enc.data_type(), false),
+        Field::new("quality", enc.data_type(), false),
         Field::new("n_genes", DataType::Int64, false),
     ]);
     RecordBatch::try_new(
@@ -116,9 +158,9 @@ fn full_obs() -> RecordBatch {
             Arc::new(StringArray::from(
                 cell_id.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(cell_type)),
-            Arc::new(StringArray::from(tissue)),
-            Arc::new(StringArray::from(quality)),
+            enc.categorical(cell_type),
+            enc.categorical(tissue),
+            enc.categorical(quality),
             Arc::new(Int64Array::from(n_genes)),
         ],
     )
@@ -156,9 +198,9 @@ fn write_csr_shard(writer: &mut ScxWriter, n_rows: usize, row_start: u64) {
         .unwrap();
 }
 
-fn build_fixture(dir: &TempDir) -> PathBuf {
+fn build_fixture(dir: &TempDir, enc: ObsEncoding) -> PathBuf {
     let path = dir.path().join("rowset_diff.scx");
-    let obs = full_obs();
+    let obs = full_obs(enc);
     let var = sample_var();
     let mut writer = ScxWriter::new(
         &path,
@@ -201,7 +243,7 @@ fn build_fixture(dir: &TempDir) -> PathBuf {
         index_preset: None,
         index_auto_threshold: 1000,
     };
-    build_and_write_conversion_predicate_indexes(
+    let index_result = build_and_write_conversion_predicate_indexes(
         &mut writer,
         &obs,
         &var,
@@ -210,6 +252,30 @@ fn build_fixture(dir: &TempDir) -> PathBuf {
         &opts,
     )
     .unwrap();
+
+    // Canary: the two categoricals the generator queries must actually END UP
+    // INDEXED, in both encodings. Without this the `Dictionary` arm passes
+    // vacuously — an unindexed column is not a wrong answer, it is a residual
+    // one, so if `is_categorical_type` stopped seeing through dictionary
+    // encoding both arms would quietly fall through to the legacy full-decode
+    // path and every assertion below would still hold. Measured: with that
+    // exact break injected, the whole file stayed green until this check
+    // existed.
+    let mut indexed = index_result.obs_indexed_columns.clone();
+    indexed.sort();
+    assert_eq!(
+        indexed,
+        vec![
+            "cell_type".to_string(),
+            "n_genes".to_string(),
+            "tissue".to_string()
+        ],
+        "{enc:?}: obs predicate index does not cover the queried columns, so the \
+         row-set path would never resolve anything and this oracle would be \
+         comparing the legacy path against itself; outcomes: {:?}",
+        index_result.obs_outcomes
+    );
+
     writer.finish().unwrap();
     path
 }
@@ -402,8 +468,16 @@ fn cell_ids_of(batch: &RecordBatch) -> Vec<Option<String>> {
         .collect()
 }
 
-fn run(path: &PathBuf, expr: &str, limit: Option<usize>) -> Captured {
-    let mut p = QueryPipeline::open(path).unwrap().filter_obs(expr).unwrap();
+/// Run one query on the requested path. `pushdown = true` is the row-set fast
+/// path; `false` forces the legacy full-decode path. This is a per-pipeline
+/// setting, so the two arms below cannot interfere with each other — or with
+/// anything else in this binary.
+fn run(path: &PathBuf, expr: &str, limit: Option<usize>, pushdown: bool) -> Captured {
+    let mut p = QueryPipeline::open(path)
+        .unwrap()
+        .rowset_pushdown(pushdown)
+        .filter_obs(expr)
+        .unwrap();
     if let Some(n) = limit {
         p = p.limit(n);
     }
@@ -418,19 +492,40 @@ fn run(path: &PathBuf, expr: &str, limit: Option<usize>) -> Captured {
     }
 }
 
-fn count_exists(path: &PathBuf, expr: &str) -> (usize, bool) {
-    let p = QueryPipeline::open(path).unwrap().filter_obs(expr).unwrap();
+fn count_exists(path: &PathBuf, expr: &str, pushdown: bool) -> (usize, bool) {
+    let p = QueryPipeline::open(path)
+        .unwrap()
+        .rowset_pushdown(pushdown)
+        .filter_obs(expr)
+        .unwrap();
     (p.count().unwrap().matched_rows, p.exists().unwrap())
 }
 
+/// The obs columns are `Utf8` — what this oracle has always exercised.
 #[test]
-fn rowset_path_matches_legacy_path() {
+fn rowset_path_matches_legacy_path_utf8() {
+    rowset_path_matches_legacy_path(ObsEncoding::Utf8);
+}
+
+/// The obs categoricals are `Dictionary(Int32, Utf8)` — the shape every pandas
+/// categorical reaches SCX as, and one no end-to-end engine test had ever
+/// written. The whole chain differs from the `Utf8` arm: the builder's
+/// `extract_string_value` / `estimate_unique_values` take their dictionary
+/// branches, `is_categorical_type` must see through the key type, and the
+/// residual evaluator lands in `eval_dictionary_utf8` / `eval_dict_typed`
+/// rather than `eval_utf8`. Ground truth and the expected rows are identical to
+/// the `Utf8` arm — the encoding is not supposed to be observable.
+#[test]
+fn rowset_path_matches_legacy_path_dictionary() {
+    rowset_path_matches_legacy_path(ObsEncoding::Dictionary);
+}
+
+fn rowset_path_matches_legacy_path(enc: ObsEncoding) {
     let dir = TempDir::new().unwrap();
-    let path = build_fixture(&dir);
+    let path = build_fixture(&dir, enc);
 
     // Sanity: with the row-set path ON, a couple of hand-computed expectations
     // cross-check BOTH paths against ground truth.
-    std::env::remove_var("SCX_DISABLE_ROWSET_PUSHDOWN");
     {
         // cell_type == 'T cell': rows where i%7!=0 and i%3==0, MINUS deleted rows
         // (cell_3, cell_18 are deleted T cells) — proves deletion_rowset applies.
@@ -438,7 +533,7 @@ fn rowset_path_matches_legacy_path() {
             .filter(|&i| cell_type_at(i) == Some("T cell") && !is_deleted(i))
             .map(|i| format!("cell_{i}"))
             .collect();
-        let got = run(&path, "cell_type == 'T cell'", None);
+        let got = run(&path, "cell_type == 'T cell'", None, true);
         let got_ids: Vec<String> = got.cell_ids.into_iter().flatten().collect();
         assert_eq!(
             got_ids, expected,
@@ -450,7 +545,7 @@ fn rowset_path_matches_legacy_path() {
         );
 
         // A deleted B cell (cell_1) must be absent too.
-        let b = run(&path, "cell_type == 'B cell'", None);
+        let b = run(&path, "cell_type == 'B cell'", None, true);
         let b_ids: Vec<String> = b.cell_ids.into_iter().flatten().collect();
         assert!(
             !b_ids.contains(&"cell_1".to_string()) && !b_ids.contains(&"cell_16".to_string()),
@@ -458,7 +553,7 @@ fn rowset_path_matches_legacy_path() {
         );
 
         // Absent value -> empty.
-        assert_eq!(run(&path, "cell_type == 'Ghost'", None).n_rows, 0);
+        assert_eq!(run(&path, "cell_type == 'Ghost'", None, true).n_rows, 0);
     }
 
     let limits = [None, Some(1usize), Some(5), Some(13), Some(1000)];
@@ -483,13 +578,10 @@ fn rowset_path_matches_legacy_path() {
 
         for &limit in &limits {
             // Row-set path (default).
-            std::env::remove_var("SCX_DISABLE_ROWSET_PUSHDOWN");
-            let fast = run(&path, &expr, limit);
+            let fast = run(&path, &expr, limit, true);
 
             // Legacy full-decode path.
-            std::env::set_var("SCX_DISABLE_ROWSET_PUSHDOWN", "1");
-            let slow = run(&path, &expr, limit);
-            std::env::remove_var("SCX_DISABLE_ROWSET_PUSHDOWN");
+            let slow = run(&path, &expr, limit, false);
 
             assert_eq!(
                 fast, slow,
@@ -537,11 +629,8 @@ fn rowset_path_matches_legacy_path() {
         }
 
         // count() / exists() parity across paths (limit-independent).
-        std::env::remove_var("SCX_DISABLE_ROWSET_PUSHDOWN");
-        let (fc, fe) = count_exists(&path, &expr);
-        std::env::set_var("SCX_DISABLE_ROWSET_PUSHDOWN", "1");
-        let (sc, se) = count_exists(&path, &expr);
-        std::env::remove_var("SCX_DISABLE_ROWSET_PUSHDOWN");
+        let (fc, fe) = count_exists(&path, &expr, true);
+        let (sc, se) = count_exists(&path, &expr, false);
         assert_eq!((fc, fe), (sc, se), "count/exists mismatch for `{expr}`");
         // exists() must agree with count() > 0 on the fast path.
         assert_eq!(
@@ -561,7 +650,7 @@ fn rowset_path_matches_legacy_path() {
 
     assert!(
         checked > 3000,
-        "expected a substantial number of comparisons"
+        "expected a substantial number of comparisons ({enc:?})"
     );
     assert!(
         null_sensitive > 50,
