@@ -482,8 +482,12 @@ jobs:
         run: |
           set -e
           for f in eval_inner eval_rowset; do
+            # Extract the function BODY (signature line to the first
+            # column-0 `}`) rather than a fixed -A window: a doc comment or
+            # attribute added inside the signature would otherwise push `walk(`
+            # out of range and fail the guard on correct code.
             if ! sed '/#\[cfg(test)\]/,$d' scx-engine/src/predicate.rs \
-                 | grep -A8 "fn $f" | grep -qE '\bwalk\(' ; then
+                 | sed -n "/^\(pub \)\?fn $f/,/^}/p" | grep -qE '\bwalk\(' ; then
               echo "::error::$f no longer evaluates through walk() — that is how the two evaluators drift apart again (review 5.1)."
               exit 1
             fi

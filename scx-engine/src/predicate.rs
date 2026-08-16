@@ -214,6 +214,28 @@ trait PredicateAlgebra {
     fn absorbing(&self, _v: &Self::Value) -> bool {
         false
     }
+
+    /// A value for `pred` that needs no descent into it at all. `Some(v)` makes
+    /// [`walk`] return `v` **without visiting `pred`'s operands**.
+    ///
+    /// `absorbing` cannot express this: it is consulted on a value that has
+    /// already been computed, so it can skip a *sibling* but never the subtree
+    /// under a unary node. `RowSetAlgebra` needs exactly that for `Not`, which
+    /// is unconditionally residual — the categorical index omits NULL rows, so
+    /// complementing its TRUE-set would wrongly re-include them, and no operand
+    /// value can change that answer.
+    ///
+    /// Without this hook `not (cell_type == 'T cell')` resolves the inner leaf,
+    /// turns every matching `ShardRange` into a `RowSet` (allocating, sorting
+    /// and coalescing the ranges), throws it away, and *then* takes the residual
+    /// decode path it was always going to take — O(matching shard ranges) of CPU
+    /// and peak memory bought for nothing, on an atlas-scale indexed
+    /// categorical. `partition_obs_predicates` flattens only `And`, so a
+    /// negated conjunct reaches `eval_rowset` whole and this is reachable from a
+    /// plain `filter_obs("not (cell_type == 'T cell')")`.
+    fn short_circuit(&self, _pred: &Predicate) -> Option<Self::Value> {
+        None
+    }
 }
 
 /// Recurse over `pred` under `alg`.
@@ -222,6 +244,11 @@ trait PredicateAlgebra {
 /// is a compile error here rather than being silently routed to `leaf` — where
 /// a combinator would hit `unreachable!` at runtime.
 fn walk<A: PredicateAlgebra>(pred: &Predicate, alg: &A) -> Result<A::Value> {
+    if let Some(v) = alg.short_circuit(pred) {
+        return Ok(v);
+    }
+    // Asked BEFORE any descent: an algebra that already knows this node's answer
+    // must not pay for its operands. See `PredicateAlgebra::short_circuit`.
     match pred {
         Predicate::And(a, b) => {
             let left = walk(a, alg)?;
@@ -360,12 +387,27 @@ impl PredicateAlgebra for RowSetAlgebra<'_, '_> {
 
     /// `Not` is residual in v1: the categorical index omits null rows, so
     /// complementing its TRUE-set would wrongly re-include them.
+    ///
+    /// Unreachable in practice — [`Self::short_circuit`] answers `Not` before
+    /// `walk` descends, so this is never called. Kept correct rather than
+    /// `unreachable!` so the algebra stays well-defined on its own terms.
     fn not(&self, _a: Self::Value) -> Result<Self::Value> {
         Ok(None)
     }
 
     fn absorbing(&self, v: &Self::Value) -> bool {
         v.is_none()
+    }
+
+    /// `Not` is residual whatever its operand resolves to, so the operand is
+    /// never worth resolving. This restores the pre-refactor behaviour: the
+    /// original `eval_rowset` matched `Predicate::Not(_)` in its residual arm
+    /// and returned `None` without recursing.
+    fn short_circuit(&self, pred: &Predicate) -> Option<Self::Value> {
+        match pred {
+            Predicate::Not(_) => Some(None),
+            _ => None,
+        }
     }
 }
 
@@ -2467,6 +2509,129 @@ mod tests {
                 Box::new(eq("donor_id", "d1")), // not indexed
             );
             assert!(eval_rowset(&and, &ctx).is_none());
+        }
+
+        /// `Not` must be answered without visiting its operand.
+        ///
+        /// The effect being guarded is **work not done**, which has no
+        /// functional observable — `eval_rowset` returns `None` for a negated
+        /// conjunct either way. So this counts `leaf` calls directly, through a
+        /// stand-in algebra that mirrors `RowSetAlgebra`'s `short_circuit`.
+        /// `not_short_circuits_before_visiting_its_operand` below then pins that
+        /// the real algebra declares it; together they cover what an end-to-end
+        /// assertion cannot see.
+        ///
+        /// Found by codex and Cursor Agent on PR #442: the first version of
+        /// `walk` descended into `Not`, resolved the inner leaf, allocated and
+        /// sorted a `RowSet` from every matching `ShardRange`, discarded it, and
+        /// then took the residual decode path anyway.
+        #[test]
+        fn walk_does_not_visit_operands_of_a_short_circuited_node() {
+            use crate::rowset::RowSet;
+            use std::cell::Cell;
+
+            struct Counting {
+                leaf_calls: Cell<usize>,
+            }
+            impl crate::predicate::PredicateAlgebra for Counting {
+                type Value = Option<RowSet>;
+                fn leaf(&self, _pred: &Predicate) -> crate::error::Result<Self::Value> {
+                    self.leaf_calls.set(self.leaf_calls.get() + 1);
+                    Ok(Some(RowSet::empty()))
+                }
+                fn and(
+                    &self,
+                    _a: Self::Value,
+                    _b: Self::Value,
+                ) -> crate::error::Result<Self::Value> {
+                    Ok(Some(RowSet::empty()))
+                }
+                fn or(
+                    &self,
+                    _a: Self::Value,
+                    _b: Self::Value,
+                ) -> crate::error::Result<Self::Value> {
+                    Ok(Some(RowSet::empty()))
+                }
+                fn not(&self, _a: Self::Value) -> crate::error::Result<Self::Value> {
+                    Ok(None)
+                }
+                fn short_circuit(&self, pred: &Predicate) -> Option<Self::Value> {
+                    match pred {
+                        Predicate::Not(_) => Some(None),
+                        _ => None,
+                    }
+                }
+            }
+
+            let inner = Predicate::And(
+                Box::new(eq("cell_type", "B cell")),
+                Box::new(eq("tissue", "blood")),
+            );
+
+            // Control: the same subtree, un-negated, visits both leaves. Without
+            // this the assertion below passes against a `walk` that visits
+            // nothing at all.
+            let alg = Counting {
+                leaf_calls: Cell::new(0),
+            };
+            crate::predicate::walk(&inner, &alg).unwrap();
+            assert_eq!(
+                alg.leaf_calls.get(),
+                2,
+                "the un-negated subtree must visit both leaves"
+            );
+
+            let alg = Counting {
+                leaf_calls: Cell::new(0),
+            };
+            let out = crate::predicate::walk(&Predicate::Not(Box::new(inner)), &alg).unwrap();
+            assert_eq!(
+                alg.leaf_calls.get(),
+                0,
+                "`Not` is residual whatever its operand resolves to, so `walk` \
+                 must not descend into it — resolving the operand allocates and \
+                 sorts a RowSet that is then discarded"
+            );
+            assert!(out.is_none(), "`Not` still resolves to residual");
+        }
+
+        /// The real `RowSetAlgebra` declares `Not` short-circuiting, and only
+        /// `Not`. Pairs with the counting test above: that one proves `walk`
+        /// honours the hook, this one proves the row-set algebra sets it.
+        #[test]
+        fn not_short_circuits_before_visiting_its_operand() {
+            use crate::predicate::PredicateAlgebra;
+            let index = idx();
+            let ranges = ctx_ranges();
+            let dicts = complete_dicts(&index);
+            let ctx = mk(&index, &ranges, &dicts);
+            let alg = crate::predicate::RowSetAlgebra { ctx: &ctx };
+
+            assert!(
+                matches!(
+                    alg.short_circuit(&Predicate::Not(Box::new(eq("cell_type", "B cell")))),
+                    Some(None)
+                ),
+                "Not must be answered without descending"
+            );
+            for p in [
+                eq("cell_type", "B cell"),
+                Predicate::Ne("cell_type".into(), ScalarValue::Utf8("B cell".into())),
+                Predicate::And(
+                    Box::new(eq("cell_type", "B cell")),
+                    Box::new(eq("tissue", "blood")),
+                ),
+                Predicate::Or(
+                    Box::new(eq("cell_type", "B cell")),
+                    Box::new(eq("tissue", "blood")),
+                ),
+            ] {
+                assert!(
+                    alg.short_circuit(&p).is_none(),
+                    "only Not short-circuits; {p} must still be walked"
+                );
+            }
         }
 
         #[test]

@@ -651,13 +651,18 @@ pub(crate) fn scan_shards(
 /// mapped to global rows safely, so the caller falls back to the legacy path.
 ///
 /// ⚠️ **The position `i` here equals the index's `shard_id` only at
-/// `modality_id == 0`.** `sorted_shards` comes from
-/// [`scan_shards`], which is modality-scoped; on a multimodal file each
-/// modality's shards independently tile `[0, n_obs)`, so modality 2's third
-/// shard is also position 2 and would silently adopt modality 1's row-set. That
-/// is safe today only because multimodal files carry no predicate index at all
-/// — see [`crate::index::derive_shard_column_stats`] for who guarantees that and
-/// what fails closed if it stops being true.
+/// `modality_id == 0`.** `sorted_shards` comes from [`scan_shards`], which is
+/// modality-scoped; on a multimodal file each modality's shards independently
+/// tile `[0, n_obs)`, so modality 2's third shard is also position 2 and would
+/// silently adopt modality 1's row-set.
+///
+/// What prevents that is [`build_plan`], which forces `obs_predicate_index` to
+/// `None` for every `modality_id != 0` pipeline — so this function is not
+/// reachable on a modality-scoped query, whatever the file contains. That guard
+/// is the load-bearing one; index absence is **not**. See
+/// [`crate::index::derive_shard_column_stats`] for the write-side half and for
+/// why "multimodal files carry no index" is a convention of the high-level
+/// writers rather than an enforced invariant.
 fn csr_shard_ranges_table(sorted_shards: &[&FullCatalogEntry]) -> Option<Vec<(u32, u64, u64)>> {
     let mut table = Vec::with_capacity(sorted_shards.len());
     for (i, entry) in sorted_shards.iter().enumerate() {
