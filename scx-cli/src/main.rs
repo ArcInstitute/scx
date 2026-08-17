@@ -2236,6 +2236,7 @@ fn dispatch_convert(
         index_preset,
         index_auto_threshold,
         bitmap: bitmap_policy,
+        obs_shard_policy: Default::default(),
         reader_threads,
         writer_queue_depth,
         sort_by,

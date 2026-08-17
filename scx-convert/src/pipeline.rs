@@ -9,7 +9,7 @@ use scx_format_io::modality::ModalityType;
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::{PreEncodedSection, ScxWriter};
-use scx_format_io::{encode_one_shard, FramingConfig};
+use scx_format_io::{encode_one_shard, FramingConfig, ObsShardPolicy};
 use scx_sparse::canonicalize_csr;
 
 use super::detect::{detect_input_format, detect_matrix_format, InputFormat, MatrixFormat};
@@ -207,6 +207,17 @@ pub struct ConvertOptions {
     /// Phase 5b: detection-bitmap shard generation policy. Default
     /// `Off` (explicit opt-in, matches `--csc` ergonomics).
     pub bitmap: BitmapPolicy,
+    /// Whether ingest emits the obs table as row-sharded
+    /// [`scx_format_io::section::SectionType::ObsMetadataShard`] sections
+    /// rather than one legacy `ObsMetadata` section.
+    ///
+    /// The same tri-state `scx optimize --shard-obs` and
+    /// `pyscx.optimize(shard_obs=)` take, on the same threshold
+    /// `pyscx.from_anndata` uses: `Auto` (default) shards when
+    /// `n_obs > shard_target_rows`, `Always` shards unconditionally, `Off`
+    /// keeps the single section. Applies to the **obs** axis only — var stays
+    /// a single section on every ingest path.
+    pub obs_shard_policy: ObsShardPolicy,
     /// Streaming reader worker thread count.
     /// `None` (default) = auto: use `RAYON_NUM_THREADS` if set, else
     /// [`std::thread::available_parallelism`]. `Some(1)` forces the
@@ -551,6 +562,7 @@ impl Default for ConvertOptions {
             index_preset: None,
             index_auto_threshold: 1000,
             bitmap: BitmapPolicy::Off,
+            obs_shard_policy: ObsShardPolicy::default(),
             reader_threads: None,
             writer_queue_depth: 4,
             sort_by: Vec::new(),
