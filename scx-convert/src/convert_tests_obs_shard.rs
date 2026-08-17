@@ -125,44 +125,55 @@ fn exported_categories(h5ad: &Path, col: &str) -> (Vec<String>, bool) {
     (cats.iter().map(|s| s.to_string()).collect(), ordered)
 }
 
-/// Render one obs column of a `read_obs()` batch as comparable strings, so two
-/// storage layouts can be compared without caring which Arrow encoding each
-/// arrived in.
+/// Render one obs column as comparable strings, whatever Arrow encoding it
+/// arrived in. `cast` decodes a dictionary of any key width, so this compares
+/// logical values rather than physical layout.
 fn column_as_strings(batch: &arrow::record_batch::RecordBatch, idx: usize) -> Vec<Option<String>> {
-    let arr = batch.column(idx);
-    if let Some(d) = arr.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
-        let values = d.values();
-        let values = values.as_any().downcast_ref::<StringArray>().unwrap();
-        return (0..d.len())
-            .map(|i| {
-                if d.is_null(i) {
-                    None
-                } else {
-                    Some(values.value(d.keys().value(i) as usize).to_string())
-                }
-            })
-            .collect();
-    }
-    let fmt = arrow::util::display::ArrayFormatter::try_new(
-        arr.as_ref(),
-        &arrow::util::display::FormatOptions::default(),
-    )
-    .unwrap();
-    (0..arr.len())
+    let arr = arrow::compute::cast(batch.column(idx), &DataType::Utf8).unwrap();
+    let s = arr.as_any().downcast_ref::<StringArray>().unwrap();
+    (0..s.len())
         .map(|i| {
-            if arr.is_null(i) {
+            if s.is_null(i) {
                 None
             } else {
-                Some(fmt.value(i).to_string())
+                Some(s.value(i).to_string())
             }
         })
         .collect()
 }
 
+/// The full **declared** category list of a dictionary column, in declared
+/// order, normalised to an `Int32` key so key width does not enter the
+/// comparison (see `sharded_and_single_section_obs_read_back_identically` for
+/// why the two layouts legitimately differ there). `None` for a plain column.
+fn declared_categories(
+    batch: &arrow::record_batch::RecordBatch,
+    idx: usize,
+) -> Option<Vec<String>> {
+    let col = batch.column(idx);
+    if !matches!(col.data_type(), DataType::Dictionary(_, _)) {
+        return None;
+    }
+    let canonical = arrow::compute::cast(
+        col,
+        &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+    )
+    .unwrap();
+    let d = canonical
+        .as_any()
+        .downcast_ref::<DictionaryArray<Int32Type>>()
+        .unwrap();
+    let v = d.values();
+    let v = v.as_any().downcast_ref::<StringArray>().unwrap();
+    Some((0..v.len()).map(|k| v.value(k).to_string()).collect())
+}
+
 /// Compare two `read_obs()` results field by field: schema names in order,
-/// every value, and — for categoricals — the full declared dictionary and the
-/// `ordered` bit. A dictionary-unification bug in `assemble_sharded_metadata`
-/// surfaces here and nowhere else.
+/// every value, the field metadata (which carries the categorical `ordered`
+/// bit), and — for categoricals — the full declared dictionary. A
+/// dictionary-unification bug in `assemble_sharded_metadata` surfaces here and
+/// nowhere else: slicing hands every shard the *same* dictionary, so the concat
+/// path has to dedup N identical copies back down to one.
 fn assert_obs_equivalent(
     a: &arrow::record_batch::RecordBatch,
     b: &arrow::record_batch::RecordBatch,
@@ -180,24 +191,13 @@ fn assert_obs_equivalent(
             "values differ in column '{name}'"
         );
         assert_eq!(
-            a.schema().field(i).metadata(),
-            b.schema().field(i).metadata(),
+            sa.field(i).metadata(),
+            sb.field(i).metadata(),
             "field metadata (e.g. the categorical `ordered` bit) differs in column '{name}'"
         );
-        // The declared dictionary, not just the values it happens to reference.
-        let dict_of = |batch: &arrow::record_batch::RecordBatch| -> Option<Vec<String>> {
-            let col = batch.column(i);
-            col.as_any()
-                .downcast_ref::<DictionaryArray<Int32Type>>()
-                .map(|d| {
-                    let v = d.values();
-                    let v = v.as_any().downcast_ref::<StringArray>().unwrap();
-                    (0..v.len()).map(|k| v.value(k).to_string()).collect()
-                })
-        };
         assert_eq!(
-            dict_of(a),
-            dict_of(b),
+            declared_categories(a, i),
+            declared_categories(b, i),
             "declared category list differs in column '{name}'"
         );
     }
@@ -454,6 +454,36 @@ fn sharded_and_single_section_obs_read_back_identically() {
          compare two frames that agree by both missing it"
     );
     assert_obs_equivalent(&oa, &ob);
+
+    // ⚠️ One thing the two layouts do *not* agree on, pinned here rather than
+    // quietly tolerated by the comparison above: the dictionary **key width**.
+    // `assemble_sharded_metadata` widens every shard's key to Int32 for the
+    // concat, then `unify_dictionary_columns` narrows it back to the minimal
+    // fit — Int8 for four categories. The single-section read has nothing to
+    // unify and keeps the Int32 key `read_categorical_group` built.
+    //
+    // Logical content is identical (values, declared list and `ordered` bit are
+    // all compared above), and pandas does not observe key width — but a Rust
+    // consumer that downcasts to `DictionaryArray<Int32Type>` does. This is not
+    // introduced here: `from_anndata` has emitted sharded obs since phase 4c, so
+    // its output already read back this way. 6c makes it apply to `scx convert`
+    // output too, which is worth stating in a test rather than leaving to be
+    // discovered downstream.
+    let phase_type = |b: &arrow::record_batch::RecordBatch| {
+        let i = b.schema().index_of("phase").unwrap();
+        b.column(i).data_type().clone()
+    };
+    assert_eq!(
+        phase_type(&oa),
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        "sharded obs should read back with the unified, minimally-keyed dictionary"
+    );
+    assert_eq!(
+        phase_type(&ob),
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        "single-section obs should keep the Int32 key the h5ad reader built"
+    );
+
     // var is deliberately untouched by this phase.
     assert_eq!(ra.var_metadata_shard_count(), 0);
     assert_eq!(rb.var_metadata_shard_count(), 0);
