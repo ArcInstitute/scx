@@ -608,35 +608,54 @@ fn copy_csr_class_aux(
             // and `upgrade`'s X loop both perform.
             let widened = encoding_for_canonicalized(ve, &data);
             let codec = codec_for_canonicalized(ci, widened);
-            let mut raw_values = Vec::new();
-            for &v in &data {
-                widened.encode_f32(&mut raw_values, v)?;
-            }
-            match entry.section_type {
-                SectionType::ObspCsrShard => {
-                    let (name, shard_idx) = obsp_csr_name_and_index(&entry.name)?;
-                    writer.write_obsp_shard(
-                        &indptr_u64,
-                        &indices_u32,
-                        &raw_values,
-                        codec,
-                        widened,
-                        row_start,
-                        &name,
-                        shard_idx,
-                    )?;
-                }
-                _ => {
-                    writer.write_raw_csr_shard(
-                        &indptr_u64,
-                        &indices_u32,
-                        &raw_values,
-                        codec,
-                        widened,
-                        row_start,
-                    )?;
-                }
-            }
+            // `encode_one_shard` + `write_preencoded_shard`, which is what
+            // `optimize` uses for exactly these section types. Going through the
+            // typed writers (`write_obsp_shard` / `write_raw_csr_shard`) instead
+            // was wrong twice over, and both were regressions:
+            //
+            // 1. **The minor extent.** Those writers derive `n_minor` from the
+            //    file header — `n_vars` for a row-major shard. An `ObspCsrShard`
+            //    is obs×obs, so on any file where `n_obs != n_vars` the re-emit
+            //    either declared a graph too narrow to hold its own endpoints or
+            //    silently changed its shape. `optimize` reads `n_minor` off the
+            //    source shard for this reason and says so; this now does the
+            //    same, which is also robust to a per-shard width difference.
+            // 2. **The section name.** `write_raw_csr_shard` names from
+            //    `raw_csr_shard_count`, which `copy_section_verbatim`
+            //    deliberately does not advance — the writer even predicts this
+            //    ("a future raw-aware verbatim copy must advance …"). A
+            //    multi-shard `.raw` with one canonical and one non-canonical
+            //    shard therefore emitted `raw/X_shard_0` twice, violating
+            //    SCX-015 uniqueness; name-based lookup returns the first and the
+            //    re-encoded shard becomes an unreachable duplicate.
+            //
+            // Passing the source's own `n_minor` and `entry.name` removes both
+            // failure modes by construction: nothing is derived, so a mixed
+            // canonical/non-canonical run is order-independent.
+            //
+            // Framing is `None`: `upgrade` emits unframed v3 (`scx optimize
+            // --row-group-rows` is the framed path), matching the X loop.
+            //
+            // The `_with_value_encoding` form rather than plain
+            // `encode_one_shard`, so the widening above is not silently
+            // replaced by the encoder's own per-shard auto-detect — and so the
+            // source's per-shard codec is preserved, which is what the X and
+            // layer loops do.
+            let pre = scx_format_io::encoder::encode_one_shard_with_value_encoding(
+                &indptr_u64,
+                &indices_u32,
+                &data,
+                Some(codec),
+                sh.index_dtype,
+                sh.n_minor,
+                row_start,
+                entry.section_type,
+                scx_format_io::modality::ModalityType::Rna,
+                entry.name.clone(),
+                None,
+                Some(widened),
+            )?;
+            writer.write_preencoded_shard(pre)?;
             return Ok(());
         }
     }
@@ -644,26 +663,6 @@ fn copy_csr_class_aux(
     let bytes = reader.section_bytes(entry)?;
     writer.copy_section_verbatim(entry, bytes)?;
     Ok(())
-}
-
-/// Split `obsp/<key>_shard_<idx>` back into its parts.
-///
-/// `rfind` rather than `find`: a key may itself contain `_shard_`, and the
-/// index is always the final segment — the same rule
-/// `read_sharded_layout_by_prefix` applies when it parses the suffix as `u32`.
-fn obsp_csr_name_and_index(
-    section_name: &str,
-) -> Result<(String, u32), Box<dyn std::error::Error>> {
-    let stem = section_name
-        .strip_prefix("obsp/")
-        .ok_or_else(|| format!("obsp CSR shard '{section_name}' is not under obsp/"))?;
-    let pos = stem
-        .rfind("_shard_")
-        .ok_or_else(|| format!("obsp CSR shard '{section_name}' has no _shard_ suffix"))?;
-    let idx: u32 = stem[pos + "_shard_".len()..]
-        .parse()
-        .map_err(|_| format!("obsp CSR shard '{section_name}' has a non-numeric shard index"))?;
-    Ok((stem[..pos].to_string(), idx))
 }
 
 /// Copy `adata.raw` — its CSR shards and its own var axis.

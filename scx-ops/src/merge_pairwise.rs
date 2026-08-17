@@ -91,6 +91,18 @@ pub(crate) fn has_global_obsp(readers: &[ScxReader]) -> bool {
 /// `docs/operations.md` both said obsp was refused. Saying "obsp" without
 /// qualifying the encoding is what made that read as a promise.
 ///
+/// ⚠️ **This reaches the Rust and Python surfaces, not the R one.** `rscx`
+/// installs no `log` sink, so `log::warn!` is discarded in a normal R session
+/// and `rscx::scx_merge` still drops the graph silently. Saying "the drop is no
+/// longer silent on any path" was therefore wrong, and it is not fixed by
+/// wording — it needs a sink in `rscx`, which is out of this PR's scope and is
+/// recorded in `docs/operations.md` instead.
+///
+/// The remedy it suggests also has to be one that works. An earlier version
+/// said "run `scx optimize` on the inputs", which cannot help: `optimize`
+/// re-encodes the graph *as* an `ObspCsrShard`, which is the encoding merge
+/// drops, so the second merge loses it exactly as the first did.
+///
 /// Found by codex - gpt-5.6-sol.
 pub(crate) fn warn_dropped_csr_backed_obsp(readers: &[ScxReader]) {
     let any = readers.iter().any(|r| {
@@ -103,8 +115,9 @@ pub(crate) fn warn_dropped_csr_backed_obsp(readers: &[ScxReader]) {
         log::warn!(
             "scx merge: dropping the CSR-backed obsp graph — merge carries the COO \
              encodings only, and nothing outside `scx optimize` reads a CSR-backed \
-             pairwise graph. Run `scx optimize` on the inputs if you need it preserved, \
-             or recompute neighbours after the merge."
+             pairwise graph, so there is nothing to rebase onto the merged obs axis. \
+             Recompute neighbours on the merged file; note that `scx optimize` will \
+             NOT help, because it re-emits the graph in this same encoding."
         );
     }
 }

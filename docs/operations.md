@@ -82,8 +82,11 @@ already follow. Three things this means in practice:
 - The **CSR-backed** `obsp` encoding (`ObspCsrShard`) is **not** carried, by any
   merge path, and does not trigger the sorted-merge refusal. Nothing outside
   `scx optimize` reads one, so there is nothing to rebase — `compact` and `sort`
-  drop it too. It is dropped with a warning. Run `scx optimize` on the inputs if
-  you need it preserved, or recompute neighbours after the merge.
+  drop it too. It is dropped with a warning; recompute neighbours on the merged
+  file. `scx optimize` does **not** help, because it re-emits the graph in this
+  same encoding. **The warning does not reach R**: `rscx` installs no Rust `log`
+  sink, so `rscx::scx_merge` still drops it silently. That is a gap in the R
+  binding, not in the op.
 
 Modality-scoped `obsp` / `varp` are also dropped, with a warning: the format
 has no per-modality pairwise reader to round-trip them through.

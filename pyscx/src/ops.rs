@@ -1238,7 +1238,10 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
 /// missing *layer* has always had. Merging per-sample files where one
 /// lacks `X_umap` used to succeed and silently produce an atlas without
 /// it. Drop the key from the others, or add it to the one, before
-/// merging.
+/// merging. An `obsp` key whose `data` column disagrees in dtype or
+/// nullability across inputs is refused for the same reason: the merged
+/// shards are read back under one schema, so writing them would produce
+/// a graph that cannot be loaded.
 ///
 /// File-scope `obsp` (COO) is carried, rebased into the merged obs
 /// space, and `varp` comes from input 0. The **CSR-backed** `obsp`

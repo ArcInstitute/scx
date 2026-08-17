@@ -360,8 +360,10 @@ pub fn merge_with_options(
         // whole-graph materialisation the sharded path exists to avoid.
         if merge_pairwise::has_global_obsp(&readers) {
             return Err(OpsError::InvalidInput(
-                "merge --sort-by does not yet support obsp; merge without --sort-by then \
-                 `scx sort`, or drop obsp before a sorted merge"
+                "merge --sort-by does not yet support COO obsp; merge without --sort-by \
+                 then `scx sort`, or drop obsp before a sorted merge. (A CSR-backed \
+                 obsp graph is dropped with a warning on every merge path, sorted or \
+                 not, so it does not reach this guard.)"
                     .into(),
             ));
         }
@@ -1891,8 +1893,11 @@ impl DenseMappingAxis {
 /// Row semantics differ by axis:
 /// - **obsm**: rows align with `obs`, which is concatenated across
 ///   inputs, so this helper walks every input's shards in order and
-///   re-stamps each as the next output shard. Keys missing from any
-///   input are dropped (existing semantic).
+///   re-stamps each as the next output shard. Keys are the **union**
+///   across source inputs, and a key any input lacks is a hard
+///   `DenseMappingMissing` (§6.4) — this rustdoc said "dropped (existing
+///   semantic)" until Phase 5b, which is the semantic that lost a
+///   100-file atlas its `X_umap` without a word.
 /// - **varm**: rows align with `var`, which is **shared** across
 ///   inputs (validated by var-identity check at merge entry).
 ///   Concatenating varm would duplicate rows, so this helper takes
