@@ -483,14 +483,22 @@ fn sort(family: SectionFamily) -> Carry {
     match family {
         F::ObsMetadata | F::X | F::Layer | F::Obsm | F::Obsp => Carry::Remapped,
         F::VarMetadata | F::Varm | F::Varp | F::Uns => Carry::Verbatim,
-        // Re-emitted against the permuted rows.
-        F::Bitmap => Carry::Remapped,
+        // Rebuilt against the permuted rows when `--bitmap auto/always` asks
+        // for it, and dropped otherwise — which is the default. Shard-local
+        // row keys cannot survive a permutation, so there is no third option:
+        // sort either regenerates the sidecar or loses it.
+        F::Bitmap => Carry::Conditional {
+            on: "rebuilt under --bitmap auto/always; dropped otherwise (the default)",
+        },
         F::Provenance => Carry::Rebuilt,
         F::ObsPredicateIndex | F::VarPredicateIndex => Carry::Rebuilt,
         F::ModalityTable => Carry::Rebuilt,
         // Written afresh by `--group-by`; a pre-existing one describes the
-        // input's row ranges and cannot survive a permutation.
-        F::GroupIndex => Carry::Rebuilt,
+        // input's row ranges and cannot survive a permutation, so a sort
+        // without `--group-by` drops it.
+        F::GroupIndex => Carry::Conditional {
+            on: "written by --group-by; dropped otherwise",
+        },
         F::DeletionVectors => Carry::Dropped {
             why: "applied — the output contains only the surviving rows",
             warns: false,

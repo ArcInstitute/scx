@@ -153,12 +153,12 @@ sort
   uns                          verbatim
   provenance                   rebuilt
   deletion vectors             dropped(SILENT)
-  detection bitmaps            remapped
+  detection bitmaps            conditional
   obs predicate index          rebuilt
   var predicate index          rebuilt
   modality table               rebuilt
   adata.raw                    dropped(warns)
-  grouped-sort group index     rebuilt
+  grouped-sort group index     conditional
   unwritten legacy index section dropped(SILENT)
 build-csc
   obs                          verbatim
