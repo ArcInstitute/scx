@@ -17,6 +17,7 @@ use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
 use crate::helpers::{encode_value, widest_value_encoding};
 use crate::merge_options::MergeOptions;
+use crate::merge_pairwise;
 use crate::merge_sorted;
 use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
@@ -348,6 +349,19 @@ pub fn merge_with_options(
                     .into(),
             ));
         }
+        // Same rejection, same reason. `write_obsp_shard_coo` stamps the output
+        // row range a shard covers and the reader verifies a contiguous cover,
+        // and a sorted merge interleaves every input's rows — so there is no
+        // per-input range to stamp. Refusing is the honest answer; carrying the
+        // graph as one un-sharded section would work but would reintroduce the
+        // whole-graph materialisation the sharded path exists to avoid.
+        if merge_pairwise::has_global_obsp(&readers) {
+            return Err(OpsError::InvalidInput(
+                "merge --sort-by does not yet support obsp; merge without --sort-by then \
+                 `scx sort`, or drop obsp before a sorted merge"
+                    .into(),
+            ));
+        }
         let order = merge_sorted::compute_merge_order(
             &readers,
             &unified_obs_schema,
@@ -365,8 +379,10 @@ pub fn merge_with_options(
             &mut obs_index_builder,
         )?;
         writer.write_var(&var)?;
-        // varm is var-axis (shared, unchanged); obsm errored above.
+        // varm and varp are var-axis (shared, unchanged, taken from input 0);
+        // obsm and obsp both errored above.
         merge_global_dense_mapping_sharded(&readers, &mut writer, DenseMappingAxis::Varm, n_vars)?;
+        merge_pairwise::carry_varp_only(&readers, &mut writer)?;
         let mut uns_conflicts_warned: usize = 0;
         if let Some(combined_uns) =
             combine_uns_for_merge(&readers, options.uns_policy, &mut uns_conflicts_warned)?
@@ -624,6 +640,16 @@ pub fn merge_with_options(
     // missing from any input are dropped (existing semantic).
     merge_global_dense_mapping_sharded(&readers, &mut writer, DenseMappingAxis::Obsm, total_n_obs)?;
     merge_global_dense_mapping_sharded(&readers, &mut writer, DenseMappingAxis::Varm, n_vars)?;
+
+    // §6.4: the pairwise graphs. obsp is obs×obs, so every endpoint is rebased
+    // by its input's offset in the concatenated row space; varp is var×var on a
+    // shared axis, so input 0's is the canonical one.
+    merge_pairwise::merge_pairwise_sections(
+        &readers,
+        &mut writer,
+        &input_row_offsets(&readers),
+        total_n_obs,
+    )?;
 
     // Merge uns according to the policy. Default `UnsPolicy::First`
     // matches today's pre-refactor behaviour (read first input's
@@ -887,6 +913,23 @@ pub fn merge_with_options(
     })
 }
 
+/// Each input's first row in the concatenated obs space.
+///
+/// A concatenating merge drops no rows, so this is just a running sum of
+/// `n_obs`. Shared by the deletion-vector remap and the obsp remap because they
+/// are the same rebase of the same axis, and having them derive it separately is
+/// how the two would drift.
+fn input_row_offsets(readers: &[ScxReader]) -> Vec<u64> {
+    readers
+        .iter()
+        .scan(0u64, |acc, r| {
+            let start = *acc;
+            *acc += r.n_obs();
+            Some(start)
+        })
+        .collect()
+}
+
 /// Union the inputs' deletion vectors into the merged output's row space, or
 /// `Ok(None)` when no input has any.
 ///
@@ -923,14 +966,7 @@ fn remap_deletion_vectors(
     // out_rows[input][input_row] — built once, then reused for every bitmap of
     // that input. For the concatenation case this is just an offset, so only the
     // sorted case materializes a map.
-    let offsets: Vec<u64> = readers
-        .iter()
-        .scan(0u64, |acc, r| {
-            let start = *acc;
-            *acc += r.n_obs();
-            Some(start)
-        })
-        .collect();
+    let offsets = input_row_offsets(readers);
     let sorted_map: Option<Vec<Vec<u64>>> = match order {
         None => None,
         Some(order) => {
@@ -1146,6 +1182,18 @@ fn merge_multimodal(
     // per modality, so there is no canonical `n_rows_total` for a
     // global varm shard. Per-modality varm is handled below in Step 5.
     merge_global_dense_mapping_sharded(readers, &mut writer, DenseMappingAxis::Obsm, total_n_obs)?;
+
+    // §6.4, multimodal: a file-scope obs×obs graph is carried on the same
+    // offsets as everything else on the shared obs axis. A file-scope `varp` is
+    // omitted for the same reason global `varm` is, just above.
+    // Modality-scoped pairwise graphs are dropped with a warning — there is no
+    // per-modality pairwise reader to round-trip them through.
+    merge_pairwise::merge_obsp_only(
+        readers,
+        &mut writer,
+        &input_row_offsets(readers),
+        total_n_obs,
+    )?;
 
     // Register modalities in input order.
     for info in &table.entries {
@@ -1863,10 +1911,15 @@ fn merge_global_dense_mapping_sharded(
         DenseMappingAxis::Varm => &readers[..1],
     };
 
-    let keys: BTreeSet<String> = readers[0]
-        .catalog()
-        .entries
+    // The **union** across every source input, not input 0's set. Taking it
+    // from `readers[0]` alone (§6.4) meant a key only a later input carried was
+    // never considered — so merging files where the first happened to lack
+    // `X_umap` produced an atlas with no UMAP and nothing to notice it by. For
+    // `varm`, `source_readers` is `&readers[..1]`, so the union *is* input 0's
+    // set and this changes nothing on that axis.
+    let keys: BTreeSet<String> = source_readers
         .iter()
+        .flat_map(|reader| reader.catalog().entries.iter())
         .filter(|e| e.modality_id == 0)
         .filter_map(|e| {
             if e.section_type == shard_type {
@@ -1892,7 +1945,7 @@ fn merge_global_dense_mapping_sharded(
         })
         .collect();
 
-    'next_key: for key in &keys {
+    for key in &keys {
         // Validate presence in every *source* input before writing
         // anything. For obsm, source_readers == readers (concatenate).
         // For varm, source_readers == &readers[..1] (input 0 only).
@@ -1917,7 +1970,17 @@ fn merge_global_dense_mapping_sharded(
                 None
             };
             if shards.is_empty() && legacy.is_none() {
-                continue 'next_key;
+                // §6.4: this was a bare `continue 'next_key` — the key was
+                // dropped from the output with no diagnostic, while a *layer*
+                // in this exact position was already a hard `LayerMissing`
+                // naming the file index. Same loss, same unrecoverability, so
+                // now the same answer.
+                return Err(OpsError::DenseMappingMissing {
+                    axis: prefix,
+                    key: key.clone(),
+                    file_index: idx,
+                    total: source_readers.len(),
+                });
             }
             per_input.push((idx, shards, legacy));
         }
@@ -2023,10 +2086,13 @@ fn merge_per_modality_dense_mapping_sharded(
         DenseMappingAxis::Varm => &readers[..1],
     };
 
-    let keys: BTreeSet<String> = readers[0]
-        .catalog()
-        .entries
+    // The union across source inputs, for the same reason as the global helper:
+    // input 0's set alone made a key only a later input carried invisible. What
+    // happens to a key some input lacks differs, though — see the `continue`
+    // below.
+    let keys: BTreeSet<String> = source_readers
         .iter()
+        .flat_map(|reader| reader.catalog().entries.iter())
         .filter(|e| e.modality_id == modality_id && e.name.starts_with(&key_prefix))
         .filter_map(|e| {
             let stem = e.name.strip_prefix(&key_prefix)?;
@@ -2070,6 +2136,21 @@ fn merge_per_modality_dense_mapping_sharded(
                 None
             };
             if shards.is_empty() && legacy.is_none() {
+                // **Not** the global helper's hard error, deliberately. That
+                // helper's tolerance was an accident of a bare `continue`; this
+                // one is documented above as intentional, because an input may
+                // legitimately carry nothing at all for a given modality+axis
+                // and refusing the whole merge over that would be refusing the
+                // ordinary multimodal case. What was wrong here was only the
+                // silence — a dropped key is now named. Review §6.4 measured
+                // the global path; narrowing the hard error to it is a
+                // deliberate scope choice, not an oversight.
+                log::warn!(
+                    "scx merge: dropping {prefix}['{modality_name}/{key}'] — input file \
+                     {idx} of {} does not carry it. Every input must have a key for it \
+                     to survive the merge.",
+                    source_readers.len()
+                );
                 continue 'next_key;
             }
             per_input.push((idx, shards, legacy));

@@ -42,6 +42,28 @@ pub enum OpsError {
     #[error("layer '{name}' missing in input file {file_index}")]
     LayerMissing { name: String, file_index: usize },
 
+    /// A merge input does not carry a dense mapping or pairwise graph that
+    /// another input does.
+    ///
+    /// The parity with [`Self::LayerMissing`] is the point. Before this existed,
+    /// `merge` took its `obsm` key set from input 0 alone — so a key only a
+    /// later input had was never even considered — and dropped any key an input
+    /// lacked with a bare `continue`. Merging 100 per-sample files where one
+    /// lacked `X_umap` therefore produced an atlas with no UMAP and said
+    /// nothing, while a *layer* in exactly that position had always been a hard
+    /// error naming the file. Review §6.4.
+    #[error(
+        "{axis} key '{key}' is missing in input file {file_index} of {total}; \
+         every input must carry it, or drop it from the others before merging \
+         (a layer in this position has always been a hard error)"
+    )]
+    DenseMappingMissing {
+        axis: &'static str,
+        key: String,
+        file_index: usize,
+        total: usize,
+    },
+
     #[error("could not resolve the {axis} join key column: {detail}")]
     KeyColumnUnresolved { axis: &'static str, detail: String },
 

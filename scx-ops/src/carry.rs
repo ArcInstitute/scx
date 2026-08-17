@@ -430,6 +430,18 @@ fn per_modality_override(op: RewriteOp, family: SectionFamily) -> Option<Carry> 
             why: "no per-modality pairwise reader exists, so it cannot be round-tripped",
             warns: false,
         }),
+        // The same split, and the reason this override list is the first thing
+        // to touch when an op gains a pairwise carry. Giving `merge` a global
+        // `Obsp => Remapped` without this row makes the per-modality case
+        // inherit it, and `merge_multimodal` has no per-modality pairwise reader
+        // either — so a multimodal merge of a file whose only graph is
+        // modality-scoped would write its whole output and then hard-fail the
+        // audit, on a merge that had always worked. That is the failure shape
+        // review round 1 of Phase 5a found three times.
+        (RewriteOp::Merge, F::Obsp | F::ObspCsr | F::Varp) => Some(Carry::Dropped {
+            why: "no per-modality pairwise reader exists, so it cannot be round-tripped",
+            warns: true,
+        }),
         _ => None,
     }
 }
@@ -528,21 +540,25 @@ fn merge(family: SectionFamily) -> Carry {
         F::Provenance => Carry::Rebuilt,
         F::ObsPredicateIndex | F::VarPredicateIndex => Carry::Rebuilt,
         F::ModalityTable => Carry::Rebuilt,
-        // §6.4 — OPEN MAJOR. `compact` remaps obsp through its keep-mask and
-        // `sort` through its permutation, so a merged kNN graph vanishes where
-        // a compacted or sorted one survives, with no warning. Phase 5b.
-        F::Obsp => Carry::Dropped {
-            why: "§6.4 (open): merge has no obsp writer; a merged graph is lost silently",
-            warns: false,
-        },
+        // Every input's COO graph is rebased by that input's offset in the
+        // concatenated obs space and re-emitted as the next output shard
+        // (`merge_pairwise`). Was §6.4: merge had no obsp writer at all, so a
+        // merged kNN graph vanished where a compacted or sorted one survived.
+        F::Obsp => Carry::Remapped,
+        // Still dropped, and for the reason `compact` and `sort` drop it rather
+        // than §6.4's: nothing in the crate reads a CSR-backed pairwise graph
+        // outside `optimize`'s shard loop, so there is nothing to rebase.
         F::ObspCsr => Carry::Dropped {
-            why: "§6.4 (open): merge has no obsp writer, in either encoding",
+            why: "no CSR-graph reader outside optimize's shard loop; nothing to rebase",
             warns: false,
         },
-        // §6.4 — OPEN MAJOR, same shape on the var axis.
-        F::Varp => Carry::Dropped {
-            why: "§6.4 (open): merge has no varp writer; lost silently",
-            warns: false,
+        // Var-axis on both dimensions, and merge validates one shared var axis,
+        // so input 0's graph is the canonical one — exactly as for `varm`, and
+        // `Conditional` for exactly the same reason: a key only a later input
+        // carries is not carried, and multimodal omits the global section by
+        // design because `n_vars` is per-modality.
+        F::Varp => Carry::Conditional {
+            on: "taken from input 0 only; multimodal global varp omitted by design",
         },
         F::XCsc => Carry::Dropped {
             why: "output row space differs from every input's (rebuild: scx build-csc)",

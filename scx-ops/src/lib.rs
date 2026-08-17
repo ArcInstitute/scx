@@ -14,6 +14,7 @@ pub mod helpers;
 mod in_place;
 pub mod merge;
 pub mod merge_options;
+mod merge_pairwise;
 mod merge_sorted;
 pub mod modify_metadata;
 pub mod optimize;

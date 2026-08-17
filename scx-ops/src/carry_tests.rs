@@ -110,9 +110,12 @@ merge
   layer CSC sidecars           dropped(SILENT)
   obsm                         rebuilt
   varm                         conditional
-  obsp                         dropped(SILENT)
+  obsp                         remapped
+    (per-modality)             dropped(warns)
   obsp (CSR-backed)            dropped(SILENT)
-  varp                         dropped(SILENT)
+    (per-modality)             dropped(warns)
+  varp                         conditional
+    (per-modality)             dropped(warns)
   uns                          rebuilt
   provenance                   rebuilt
   deletion vectors             remapped
@@ -256,9 +259,11 @@ fn upgrade_matches_build_csc_except_the_csc_sidecar() {
 #[test]
 fn open_bugs_are_labelled_in_the_table() {
     let open: Vec<(RewriteOp, SectionFamily)> = vec![
-        (RewriteOp::Merge, SectionFamily::Obsp),
-        (RewriteOp::Merge, SectionFamily::ObspCsr),
-        (RewriteOp::Merge, SectionFamily::Varp),
+        // §6.4's three cells were here until Phase 5b closed them: merge now
+        // remaps obsp by each input's row offset and takes varp from input 0.
+        // `ObspCsr` is still a drop but no longer an *open* one — nothing in
+        // the crate reads a CSR-backed graph outside `optimize`'s shard loop,
+        // which is the same reason `compact` and `sort` drop it.
         (RewriteOp::BuildCsc, SectionFamily::Varm),
         (RewriteOp::BuildCsc, SectionFamily::Obsp),
         (RewriteOp::BuildCsc, SectionFamily::ObspCsr),
