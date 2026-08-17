@@ -1442,4 +1442,210 @@ mod tests {
         assert_eq!(out.read_var().unwrap().num_rows(), n_vars);
         assert_eq!(out.read_all_csr_shards().unwrap().shape, (n_obs, n_vars));
     }
+
+    /// `upgrade` shares `build_csc`'s carry, and Phase 5b widened that carry by
+    /// seven families — but no `upgrade` fixture in this file carried any of
+    /// them, so nothing here would have noticed if the delegation broke.
+    ///
+    /// Phase 5a deferred this on the grounds that `scx-cli` has no lib target
+    /// and so needs a CLI subprocess test. That was wrong: this module is an
+    /// inline `#[cfg(test)]` mod and calls `run_upgrade` directly, like every
+    /// test around it.
+    ///
+    /// The `carry::audit_staged` call inside `run_upgrade` already asserts
+    /// presence for each of these, so this is really a test that the *input*
+    /// reaches the audit carrying them — which is the half a fail-closed audit
+    /// cannot supply for itself.
+    #[test]
+    fn upgrade_carries_the_families_build_csc_carries() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use arrow::array::{Float32Array, Int32Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use scx_format_io::section::SectionType;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("rich_v1.scx");
+        let (n_obs, n_vars) = (2usize, 4usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        // Canonical, so canonicalization changes nothing and the bitmap below
+        // is carried rather than gated — the other arm is the next test.
+        let (indptr, indices, values) = ([0u64, 2, 3], [1u32, 3, 0], [2u8, 7, 4]);
+        w.write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.write_bitmap_shard(&scx_format_io::bitmap::BitmapShard::build_from_csr(
+            0,
+            n_obs as u32,
+            n_vars as u32,
+            &indptr,
+            &indices,
+        ))
+        .unwrap();
+
+        let embed = |n: usize| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("0", DataType::Float32, false)])),
+                vec![Arc::new(Float32Array::from(
+                    (0..n).map(|i| i as f32).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap()
+        };
+        let coo = |n: usize| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new_with_metadata(
+                    vec![
+                        Field::new("row", DataType::Int32, false),
+                        Field::new("col", DataType::Int32, false),
+                        Field::new("data", DataType::Float32, false),
+                    ],
+                    HashMap::from([
+                        ("n_rows".to_string(), n.to_string()),
+                        ("n_cols".to_string(), n.to_string()),
+                    ]),
+                )),
+                vec![
+                    Arc::new(Int32Array::from(vec![0i32])),
+                    Arc::new(Int32Array::from(vec![(n - 1) as i32])),
+                    Arc::new(Float32Array::from(vec![1.0f32])),
+                ],
+            )
+            .unwrap()
+        };
+        w.write_obsm("X_pca", &embed(n_obs)).unwrap();
+        w.write_varm("PCs", &embed(n_vars)).unwrap();
+        w.write_obsp("connectivities", &coo(n_obs)).unwrap();
+        w.write_varp("gene_corr", &coo(n_vars)).unwrap();
+        w.set_raw_n_vars(n_vars as u64);
+        w.write_raw_csr_shard(
+            &[0u64, 1, 2],
+            &[0u32, 2],
+            &[9u8, 5],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.write_raw_var(&sample_var(n_vars)).unwrap();
+        w.write_group_index(
+            br#"{"group_by":"g","reference_shard":0,"reference_labels":[],"records":[]}"#,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+
+        let src = ScxReader::open(&input).unwrap();
+        let out = ScxReader::open(&output).unwrap();
+        // `SectionType` is not `Ord`, so this scans rather than building a set.
+        let has = |r: &ScxReader, ty: SectionType| {
+            r.catalog().entries.iter().any(|e| e.section_type == ty)
+        };
+        for ty in [
+            SectionType::VarmEmbedding,
+            SectionType::ObspEmbedding,
+            SectionType::VarpEmbedding,
+            SectionType::RawCsrShard,
+            SectionType::RawVarMetadata,
+            SectionType::BitmapShard,
+            SectionType::GroupIndex,
+        ] {
+            assert!(has(&src, ty), "premise: the fixture must carry {ty:?}");
+            assert!(has(&out, ty), "upgrade must carry {ty:?} (§6.3)");
+        }
+
+        // Readable, not merely present — `.raw` is the case where that was a
+        // live question, since nothing stamps a raw column count on the output.
+        assert_eq!(out.raw_n_vars(), src.raw_n_vars());
+        assert_eq!(
+            out.read_all_varm().unwrap().keys().collect::<Vec<_>>(),
+            src.read_all_varm().unwrap().keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            out.read_all_obsp().unwrap().keys().collect::<Vec<_>>(),
+            src.read_all_obsp().unwrap().keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            out.read_all_varp().unwrap().keys().collect::<Vec<_>>(),
+            src.read_all_varp().unwrap().keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The other arm of `upgrade`'s bitmap cell.
+    ///
+    /// A detection bitmap records which genes a row **stores**, and
+    /// `canonicalize_csr` drops explicit zeros — so a sidecar carried across a
+    /// canonicalizing rewrite of a non-canonical input names a gene the output
+    /// no longer has, and `detection_counts` answers from it. Same condition as
+    /// the CSC sidecar's, and gated on the same flag.
+    #[test]
+    fn upgrade_drops_bitmaps_when_canonicalizing_rewrites_the_matrix() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use scx_format_io::section::SectionType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("noncanonical_with_bitmap.scx");
+        let (n_obs, n_vars) = (2usize, 4usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        // Row 0 stores an explicit zero at column 1, so canonicalizing removes
+        // it — and the bitmap built alongside claims gene 1 for row 0.
+        let (indptr, indices, values) = ([0u64, 2, 3], [1u32, 3, 0], [0u8, 7, 4]);
+        w.write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        let bm = scx_format_io::bitmap::BitmapShard::build_from_csr(
+            0,
+            n_obs as u32,
+            n_vars as u32,
+            &indptr,
+            &indices,
+        );
+        assert!(
+            bm.cells_expressing(1).is_some_and(|rows| rows.contains(0)),
+            "premise: the bitmap must claim the gene canonicalization removes"
+        );
+        w.write_bitmap_shard(&bm).unwrap();
+        w.finish().unwrap();
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        assert!(
+            !out.catalog()
+                .entries
+                .iter()
+                .any(|e| e.section_type == SectionType::BitmapShard),
+            "a bitmap describing the pre-canonicalization matrix must be dropped, \
+             not carried forward to over-report detection"
+        );
+        assert!(!out.header().has_bitmap());
+        // The matrix really was rewritten, or the drop above is vacuous.
+        assert_eq!(out.read_all_csr_shards().unwrap().data, vec![7.0, 4.0]);
+    }
 }
