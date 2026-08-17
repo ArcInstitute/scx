@@ -92,7 +92,7 @@ pub(crate) fn write_obs_streaming_or_eager(
     // detect columns that are a `Dictionary` in any shard. Both signals are
     // needed before any HDF5 dataset is allocated. The unified schema then
     // declares a dict-anywhere column categorical even when shard 0 was plain.
-    let layout = scan_column_export_layout(reader.obs_shards(), &schema)?;
+    let layout = scan_column_export_layout(|| reader.obs_shards(), &schema, keep_mask_opt)?;
     let unified_schema = build_unified_export_schema(&schema, &layout);
     write_dataframe_group_streaming(
         parent,
@@ -101,7 +101,7 @@ pub(crate) fn write_obs_streaming_or_eager(
         reader.obs_shards(),
         n_rows_kept,
         keep_mask_opt,
-        &layout.needs_nullable,
+        layout,
         sink,
     )
 }
@@ -134,7 +134,7 @@ pub(crate) fn write_var_streaming_or_eager(
 
     let schema = reader.read_var_schema_logical_lossy()?;
     let n_rows_total = reader.n_vars() as usize;
-    let layout = scan_column_export_layout(reader.var_shards(), &schema)?;
+    let layout = scan_column_export_layout(|| reader.var_shards(), &schema, None)?;
     let unified_schema = build_unified_export_schema(&schema, &layout);
     write_dataframe_group_streaming(
         parent,
@@ -143,7 +143,7 @@ pub(crate) fn write_var_streaming_or_eager(
         reader.var_shards(),
         n_rows_total,
         None,
-        &layout.needs_nullable,
+        layout,
         sink,
     )
 }

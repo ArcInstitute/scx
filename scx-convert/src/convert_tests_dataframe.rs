@@ -1964,7 +1964,6 @@ mod streaming_obs_hdf5 {
         )
         .unwrap();
 
-        let needs_nullable = vec![false; schema.fields().len()];
         let shards: Vec<Result<RecordBatch, scx_format_io::error::ScxError>> =
             vec![Ok(good), Ok(bad)];
         let res = write_dataframe_group_streaming(
@@ -1974,7 +1973,7 @@ mod streaming_obs_hdf5 {
             shards,
             4,
             None,
-            &needs_nullable,
+            crate::h5ad::write::ColumnExportLayout::all_plain(schema.fields().len()),
             &mut WarningSink::log(),
         );
         let err = res.expect_err("reordered shard must be rejected");
@@ -2309,12 +2308,16 @@ mod streaming_obs_hdf5 {
         let s1 = str_cat_obs_shard(4, &["C", "C"], false); // rows 4..6, 'C' only here
         let shard0_schema = s0.schema();
         let shards = vec![s0, s1];
-        let layout =
-            scan_column_export_layout(shards.iter().cloned().map(Ok), &shard0_schema).unwrap();
-        let unified = build_unified_export_schema(&shard0_schema, &layout);
-
         // Keep all of shard 0, drop all of shard 1.
         let keep_mask = [true, true, true, true, false, false];
+        let layout = scan_column_export_layout(
+            || shards.iter().cloned().map(Ok),
+            &shard0_schema,
+            Some(&keep_mask),
+        )
+        .unwrap();
+        let unified = build_unified_export_schema(&shard0_schema, &layout);
+
         let file = hdf5::File::create(dir.path().join("dv.h5ad")).unwrap();
         let root = file.as_group().unwrap();
         write_dataframe_group_streaming(
@@ -2324,7 +2327,7 @@ mod streaming_obs_hdf5 {
             shards.into_iter().map(Ok),
             4,
             Some(&keep_mask),
-            &layout.needs_nullable,
+            layout,
             &mut WarningSink::log(),
         )
         .unwrap();
@@ -2529,6 +2532,132 @@ mod streaming_obs_hdf5 {
         assert_eq!(cats, vec!["I", "II", "III", "IV"]);
     }
 
+    /// §11.1 — pruning under a row filter is decided **per category**, not per
+    /// shard. `"C"` is declared by the one and only shard and referenced by a
+    /// single row, which the mask drops; the surviving rows keep the shard
+    /// alive, so nothing short of looking at the rows can tell that `"C"` is
+    /// now unused.
+    ///
+    /// This is the arm [`test_p3_5_deletion_vector_prunes_singleton_category`]
+    /// does not reach: there the whole shard carrying `"C"` is dropped, so the
+    /// writer skips the shard outright and the category never enters the
+    /// vocabulary whether or not the pre-scan ran. Measured: disabling
+    /// `scan_used_categories` leaves that test green and this one red with
+    /// `["A","B","C"]`.
+    #[test]
+    fn streaming_export_prunes_a_category_used_only_by_filtered_rows_of_a_kept_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = ["A", "B", "C"];
+        let s0 = declared_cat_obs_shard(0, &declared, &["A", "B", "C", "A"]);
+        let shard0_schema = s0.schema();
+        let shards = vec![s0];
+        // Drop only row 2 — the single "C".
+        let keep_mask = [true, true, false, true];
+        let layout = scan_column_export_layout(
+            || shards.iter().cloned().map(Ok),
+            &shard0_schema,
+            Some(&keep_mask),
+        )
+        .unwrap();
+        let unified = build_unified_export_schema(&shard0_schema, &layout);
+        let file = hdf5::File::create(dir.path().join("dv_partial.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+        write_dataframe_group_streaming(
+            &root,
+            "obs",
+            &unified,
+            shards.into_iter().map(Ok),
+            3,
+            Some(&keep_mask),
+            layout,
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+        drop(file);
+
+        let file = hdf5::File::open(dir.path().join("dv_partial.h5ad")).unwrap();
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(
+            cats,
+            vec!["A", "B"],
+            "'C' is referenced by no kept row and must be pruned, in declared order"
+        );
+        let want: Vec<Option<String>> = ["A", "B", "A"]
+            .iter()
+            .map(|s| Some(s.to_string()))
+            .collect();
+        assert_eq!(cat_rows(&cats, &codes), want);
+    }
+
+    /// §11.1 — a shard whose rows are *all* filtered out still contributes its
+    /// declared vocabulary, filtered by the same per-category rule. The
+    /// exporter skips such a shard's writes (an empty hyperslab selection is
+    /// not a write HDF5 accepts), and skipping the interning with it would make
+    /// the surviving vocabulary depend on how the rows happen to be sharded.
+    #[test]
+    fn streaming_export_vocabulary_does_not_depend_on_shard_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = ["A", "B", "C", "D"];
+        // "D" is declared everywhere and used nowhere; "C" lives only in the
+        // shard that is entirely dropped.
+        let s0 = declared_cat_obs_shard(0, &declared, &["A", "B"]);
+        let s1 = declared_cat_obs_shard(2, &declared, &["C", "C"]);
+        let shard0_schema = s0.schema();
+        let shards = vec![s0, s1];
+
+        // Unfiltered: every declared level survives, shard boundaries and all.
+        let layout =
+            scan_column_export_layout(|| shards.iter().cloned().map(Ok), &shard0_schema, None)
+                .unwrap();
+        let unified = build_unified_export_schema(&shard0_schema, &layout);
+        let file = hdf5::File::create(dir.path().join("unfiltered.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+        write_dataframe_group_streaming(
+            &root,
+            "obs",
+            &unified,
+            shards.iter().cloned().map(Ok),
+            4,
+            None,
+            layout,
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+        drop(file);
+        let file = hdf5::File::open(dir.path().join("unfiltered.h5ad")).unwrap();
+        let (cats, _) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(cats, vec!["A", "B", "C", "D"]);
+        drop(file);
+
+        // Filtered so shard 1 vanishes entirely: "C" and "D" both go, and the
+        // survivors keep declared order.
+        let keep_mask = [true, true, false, false];
+        let layout = scan_column_export_layout(
+            || shards.iter().cloned().map(Ok),
+            &shard0_schema,
+            Some(&keep_mask),
+        )
+        .unwrap();
+        let unified = build_unified_export_schema(&shard0_schema, &layout);
+        let file = hdf5::File::create(dir.path().join("filtered.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+        write_dataframe_group_streaming(
+            &root,
+            "obs",
+            &unified,
+            shards.into_iter().map(Ok),
+            2,
+            Some(&keep_mask),
+            layout,
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+        drop(file);
+        let file = hdf5::File::open(dir.path().join("filtered.h5ad")).unwrap();
+        let (cats, _) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(cats, vec!["A", "B"]);
+    }
+
     /// §11.1 — shards that declare **different** vocabularies union in
     /// declared order, first shard first. This is the layout `append` produces
     /// (each appended shard carries its own dictionary).
@@ -2616,7 +2745,8 @@ mod streaming_obs_hdf5 {
         n_rows: usize,
     ) -> Result<(), crate::pipeline::ConvertError> {
         let shard0_schema = shards[0].schema();
-        let layout = scan_column_export_layout(shards.iter().cloned().map(Ok), &shard0_schema)?;
+        let layout =
+            scan_column_export_layout(|| shards.iter().cloned().map(Ok), &shard0_schema, None)?;
         let unified = build_unified_export_schema(&shard0_schema, &layout);
         let file = hdf5::File::create(dir.join("err.h5ad")).unwrap();
         let root = file.as_group().unwrap();
@@ -2627,7 +2757,7 @@ mod streaming_obs_hdf5 {
             shards.into_iter().map(Ok),
             n_rows,
             None,
-            &layout.needs_nullable,
+            layout,
             &mut WarningSink::log(),
         )
     }
