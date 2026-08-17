@@ -222,6 +222,29 @@ cd rscx && Rscript -e 'testthat::test_dir("tests/testthat")' && cd ..
 | `scx-gpu` | Unit tests | CUDA decode, SpMM, GPU PCA/UMAP/preprocess |
 | `scx-integration-tests` | `tests/golden_files.rs` | Golden file regression (15 fixtures) |
 
+### The hdf5-gated suites are not in that run
+
+`cargo test --workspace` builds every member at its **default** features, and no
+workspace member enables `scx-convert/hdf5` by default (`scx-cli` and `pyscx`
+both declare `default = []`). The h5ad / h5mu ingest, export, dataframe and
+parallel-coordinator tests are all `#[cfg(all(test, feature = "hdf5"))]`, so the
+line above runs none of them. They have their own CI job, `Test (hdf5 features)`:
+
+```bash
+cargo test -p scx-convert --features hdf5      # convert_tests_* — ingest, export, dataframe
+cargo test -p scx-cli --features hdf5          # convert_stream, convert_subset, cellbender_cli, …
+```
+
+On a network filesystem (Weka / NFS / Lustre) prefix both with
+`HDF5_USE_FILE_LOCKING=FALSE`. Without it libhdf5's SWMR locking fails on
+`H5Fopen(): unable to lock file, errno = 11` under cargo's parallel test threads;
+every failure is an open error, never an assertion, and it is not a code defect.
+
+`SCX_REQUIRE_HDF5_THREADSAFE=1` (set by that CI job) turns a libhdf5 built
+without `--enable-threadsafe` into a hard failure instead of letting the parallel
+coordinator's tests skip themselves — the same discipline as `SCX_REQUIRE_GPU`
+below.
+
 ### GPU test skip behavior
 
 A GPU test that cannot run is **ignored**, never passed. Each one carries
@@ -277,7 +300,10 @@ combinations that are not covered by the default workspace build:
 `scx-gpu` is deliberately included in `default-members` because `cudarc`
 compiles without CUDA installed. This ensures that:
 - `cargo build --workspace --exclude rscx` works on any machine with a Rust toolchain
-- `cargo test --workspace --exclude rscx` runs all non-GPU tests everywhere
+- `cargo test --workspace --exclude rscx` runs every non-GPU test that is
+  reachable at **default** features — which excludes the hdf5-gated
+  `scx-convert` / `scx-cli` suites; see [The hdf5-gated suites are not in that
+  run](#the-hdf5-gated-suites-are-not-in-that-run)
 - GPU tests are `#[ignore]`d, so they are counted and named as ignored rather
   than reported as passes that did nothing; `scx-gpu/tests/gpu_test_gating.rs`
   fails the build if a GPU test drops either half of that contract
@@ -395,7 +421,8 @@ to `main`:
 | Job | What it does |
 |-----|-------------|
 | `build-cpu-only` | `cargo build --workspace --exclude rscx` — pins the CPU-only build contract |
-| `test` | `cargo test --workspace --exclude rscx` |
+| `test` | `cargo test --workspace --exclude rscx` — default features only |
+| `test-hdf5` | `cargo test -p scx-convert --features hdf5` + `-p scx-cli --features hdf5` — the h5ad/h5mu suites the `test` job cannot reach |
 | `clippy` | `cargo clippy --workspace --exclude rscx --all-targets -- -D warnings` — `--all-targets` lints test and bench code too |
 | `fmt` | `cargo fmt --check` |
 | `feature-check` | Matrix of `cargo check`/`clippy --all-targets` for feature combos (cloud, hdf5, gpu) |

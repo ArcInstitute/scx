@@ -132,8 +132,9 @@ fn parallel_memory_budget_refuses_oversized_shard() {
     // Parallel path only fires when libhdf5 is built thread-safe;
     // otherwise the dispatcher falls back to sequential which has no
     // per-worker budget check.
-    if !super::hdf5_threadsafe::hdf5_is_threadsafe() {
-        eprintln!("skipping: libhdf5 not built thread-safe");
+    if super::hdf5_threadsafe::skip_if_not_threadsafe(
+        "parallel_memory_budget_refuses_oversized_shard",
+    ) {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -163,8 +164,7 @@ fn parallel_memory_budget_refuses_oversized_shard() {
 
 #[test]
 fn parallel_memory_budget_derates_workers() {
-    if !super::hdf5_threadsafe::hdf5_is_threadsafe() {
-        eprintln!("skipping: libhdf5 not built thread-safe");
+    if super::hdf5_threadsafe::skip_if_not_threadsafe("parallel_memory_budget_derates_workers") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -283,8 +283,9 @@ fn compute_shard_row_ranges_partition_invariants() {
 /// the sequential path.
 #[test]
 fn dense_parallel_with_memory_budget_byte_identical() {
-    if !super::hdf5_threadsafe::hdf5_is_threadsafe() {
-        eprintln!("skipping: libhdf5 not built thread-safe");
+    if super::hdf5_threadsafe::skip_if_not_threadsafe(
+        "dense_parallel_with_memory_budget_byte_identical",
+    ) {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -342,8 +343,7 @@ fn dense_parallel_with_memory_budget_byte_identical() {
 /// the coordinator stays within that bound.
 #[test]
 fn parallel_in_flight_bounded_by_window() {
-    if !super::hdf5_threadsafe::hdf5_is_threadsafe() {
-        eprintln!("skipping: libhdf5 not built thread-safe");
+    if super::hdf5_threadsafe::skip_if_not_threadsafe("parallel_in_flight_bounded_by_window") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -950,6 +950,17 @@ fn parallel_ingest_worker_error_does_not_deadlock() {
     use super::pipeline::{h5ad_to_scx_streaming, test_hooks, StreamingOverrides};
     use std::time::{Duration, Instant};
 
+    // Without this the test does not skip on a non-thread-safe libhdf5 — it
+    // *fails*: the dispatcher routes to the sequential coordinator, whose
+    // workers never run, so the injected fault never fires and the convert
+    // returns `Ok`. Four of the six parallel-coordinator tests carried the
+    // guard and these two did not.
+    if super::hdf5_threadsafe::skip_if_not_threadsafe(
+        "parallel_ingest_worker_error_does_not_deadlock",
+    ) {
+        return;
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("src.h5ad");
     let scx_out = dir.path().join("out.scx");
@@ -1011,6 +1022,14 @@ fn parallel_ingest_worker_error_does_not_deadlock() {
 fn parallel_ingest_worker_panic_does_not_deadlock() {
     use super::pipeline::{h5ad_to_scx_streaming, test_hooks, StreamingOverrides};
     use std::time::{Duration, Instant};
+
+    // See the sibling above: sequential fallback makes this a failure rather
+    // than a skip on a non-thread-safe libhdf5.
+    if super::hdf5_threadsafe::skip_if_not_threadsafe(
+        "parallel_ingest_worker_panic_does_not_deadlock",
+    ) {
+        return;
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("src.h5ad");

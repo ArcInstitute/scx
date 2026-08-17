@@ -70,6 +70,50 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --exclude rscx
 
+  # `cargo test --workspace` above runs at DEFAULT features, and nothing in the
+  # workspace enables `scx-convert/hdf5` by default — `scx-cli` and `pyscx` both
+  # declare `default = []` and only opt in through their own `hdf5` feature. The
+  # `feature-check` lane compiles and clippy-checks the gated half but never runs
+  # it. So before this job existed, ~210 `#[test]`s in
+  # `scx-convert/src/convert_tests_*.rs` plus every hdf5-gated `scx-cli`
+  # integration test were built by CI and executed by nothing — which is how two
+  # Criticals (review §11.1 categorical vocabulary, §11.2 unbounded reorder
+  # buffer) shipped with regression tests that could not fail.
+  test-hdf5:
+    name: Test (hdf5 features)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # Assert rather than skip: the parallel streaming coordinator's tests
+      # `return` early when libhdf5 lacks `--enable-threadsafe`, and libtest
+      # captures that message, so a non-threadsafe runner would report this
+      # whole lane green with the coordinator untested. `scx-convert`'s
+      # `hdf5_threadsafe::tests::ci_requires_a_threadsafe_libhdf5` fails when
+      # this is set and the probe is false. Same shape as `SCX_REQUIRE_GPU`.
+      SCX_REQUIRE_HDF5_THREADSAFE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install hdf5 dev headers
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
+      - run: cargo test -p scx-convert --features hdf5
+      - run: cargo test -p scx-cli --features hdf5
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

@@ -41,6 +41,15 @@ cargo test --workspace --exclude rscx
 cargo clippy --workspace --exclude rscx --all-targets -- -D warnings
 cargo fmt --check
 
+# The line above runs at DEFAULT features, and nothing in the workspace enables
+# `scx-convert/hdf5` by default — so it runs NONE of the h5ad/h5mu tests. Those
+# need their own invocation (CI job `Test (hdf5 features)`):
+cargo test -p scx-convert --features hdf5
+cargo test -p scx-cli --features hdf5
+# On a network filesystem (Weka/NFS/Lustre) prefix both with
+# `HDF5_USE_FILE_LOCKING=FALSE` — libhdf5's SWMR lock fails there with
+# `H5Fopen(): unable to lock file, errno = 11` and it is not a code failure.
+
 # With cloud features:
 cargo test --workspace --exclude rscx --features cloud
 
