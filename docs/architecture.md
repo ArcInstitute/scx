@@ -531,7 +531,7 @@ Note the scope: this is about parsing *bytes*. In production today only `FullCat
 
 ### Sharded obs/var metadata reader APIs
 
-Files produced by streaming `scx merge`, `scx append`, and `pyscx.from_anndata` (when `n_obs > shard_target_rows`) store obs/var metadata as row-sharded Arrow IPC sections (types 24/25) instead of a single monolithic section. `ScxReader` exposes a parallel set of shard-aware accessors alongside the legacy single-section API:
+Files produced by streaming `scx merge`, `scx append`, `pyscx.from_anndata`, `scx optimize --shard-obs` and every `scx convert` / `pyscx.from_h5ad` / `pyscx.from_h5mu` ingest (all on the same `n_obs > shard_target_rows` boundary; the convert paths take `--shard-obs off|auto|always`) store obs metadata as row-sharded Arrow IPC sections (types 24/25) instead of a single monolithic section. Var is sharded only by merge / append / `from_anndata` — convert ingest always writes one `var_metadata` section. `ScxReader` exposes a parallel set of shard-aware accessors alongside the legacy single-section API:
 
 | Method | Returns | Notes |
 |--------|---------|-------|

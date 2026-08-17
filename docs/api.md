@@ -47,10 +47,15 @@ VarmEmbeddingShard (21)— Row-sharded varm (mirror of 20).
 ObspEmbeddingShard (22)— Row-sharded obsp (section per shard × key).
 VarpEmbeddingShard (23)— Row-sharded varp (mirror of 22).
 ObsMetadataShard (24)  — Row-sharded obs Arrow IPC. Produced by merge,
-                         append, and from_anndata when n_obs exceeds
-                         shard_size. Mutually exclusive with
+                         append, from_anndata, optimize --shard-obs and
+                         every scx convert / from_h5ad / from_h5mu ingest,
+                         all on the same n_obs > shard_size boundary;
+                         --shard-obs off|always overrides it on the
+                         convert paths. Mutually exclusive with
                          ObsMetadata (0) in the same file.
-VarMetadataShard (25)  — Row-sharded var Arrow IPC (mirror of 24).
+VarMetadataShard (25)  — Row-sharded var Arrow IPC (mirror of 24). NOT
+                         emitted by convert ingest at any n_vars — only by
+                         merge, append and from_anndata.
 (26)                   — RESERVED (formerly DecodeMetadataShard, removed;
                          random access now via the codec-agnostic row-group
                          BlockIndex, framing). Legacy files carrying id 26 are
