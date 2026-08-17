@@ -14,19 +14,24 @@
 //! ops over a fixture carrying **every** family and assert the surviving set
 //! against the declaration, independently.
 //!
-//! ## Several assertions here pin known bugs
+//! ## What used to be pinned here as a known bug
 //!
-//! `merge` drops obsp/varp, and `build-csc` drops varm/obsp/varp/`.raw`/
-//! bitmaps/the group index. Those are §6.3 and §6.4 of the 2026-08-05 review,
-//! both open Majors. They are asserted **as drops** because that is what the
-//! code does today, and the next PR in this series flips them — at which point
-//! these assertions move to the other list and the diff says exactly what
-//! changed for whom.
+//! Until Phase 5b this file asserted, in `known_open_drops_are_still_dropping`,
+//! that `merge` loses obsp/varp and `build-csc` loses varm/obsp/varp/`.raw`/
+//! bitmaps/the group index — §6.4 and §6.3 of the 2026-08-05 review, both open
+//! Majors, both asserted **as drops** because that is what the code did.
 //!
-//! A test that encodes a known bug has to say so in the test. `append`'s
-//! categorical tests are the cautionary case: they assert `Utf8` because that is
-//! what `append` produces, and nothing in them records that `Dictionary` is what
-//! it *should* produce, so they read as a specification for the bug.
+//! Those assertions are now inverted, and the test that inverts them
+//! (`merge_carries_the_graph_it_used_to_drop`,
+//! `build_csc_carries_what_optimize_carries`) is deliberately spelled out from
+//! the user's side rather than folded into the table walk, so a reader can see
+//! what changed without reconstructing it from `scx_ops::carry`.
+//!
+//! A test that encodes a known bug has to say so in the test — that is why the
+//! inversion was mechanical. `append`'s categorical tests are the cautionary
+//! case: they assert `Utf8` because that is what `append` produces, and nothing
+//! in them records that `Dictionary` is what it *should* produce, so they read
+//! as a specification for the bug rather than a note against it.
 
 mod common;
 
@@ -38,9 +43,72 @@ use scx_format_io::ObsShardPolicy;
 use scx_ops::carry::{family, policy, Carry, RewriteOp, SectionFamily};
 
 use common::{
-    fixture_all_families, fixture_all_families_without_varm, fixture_multimodal_per_modality_obsp,
-    fixture_with_csr_obsp,
+    fixture_all_families, fixture_all_families_with_extra_obsm, fixture_all_families_without_varm,
+    fixture_multimodal_per_modality_obsp, fixture_with_csr_obsp, fixture_with_explicit_zero_in_x,
 };
+
+/// The `(row, col)` endpoints of a COO pairwise batch, widened to `i64`.
+///
+/// The coordinate width is `Int32` or `Int64` depending on how the section was
+/// written and how wide the axis is, and a remap picks the output width from the
+/// *new* dimension — so a test that assumed one width would pass or fail for
+/// reasons unrelated to what it is checking.
+fn coo_endpoints(batch: &arrow::array::RecordBatch) -> (Vec<i64>, Vec<i64>) {
+    use arrow::array::{Array, Int32Array, Int64Array};
+    let col = |name: &str| -> Vec<i64> {
+        let a = batch.column_by_name(name).unwrap();
+        match a.data_type() {
+            arrow::datatypes::DataType::Int32 => a
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap() as i64)
+                .collect(),
+            arrow::datatypes::DataType::Int64 => a
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap())
+                .collect(),
+            other => panic!("unexpected COO coordinate type {other:?}"),
+        }
+    };
+    (col("row"), col("col"))
+}
+
+/// Every `(gene, global row)` pair the file's detection bitmaps claim.
+fn bitmap_detections(path: &Path) -> BTreeSet<(u32, u64)> {
+    let reader = ScxReader::open(path).unwrap();
+    let mut out = BTreeSet::new();
+    let n = reader.catalog().bitmap_shards_for_modality(0).len();
+    for idx in 0..n {
+        let shard = reader.read_bitmap_shard(idx).unwrap();
+        for (&gene, rows) in &shard.genes {
+            for local in rows.iter() {
+                out.insert((gene, shard.row_start + local as u64));
+            }
+        }
+    }
+    out
+}
+
+/// Every `(gene, global row)` pair the file's X shards actually store.
+fn x_detections(path: &Path) -> BTreeSet<(u32, u64)> {
+    let reader = ScxReader::open(path).unwrap();
+    let mut out = BTreeSet::new();
+    for entry in reader.catalog().csr_shards_sorted() {
+        let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
+        let (indptr, indices, _) = reader.read_shard_from_entry(entry).unwrap();
+        for row in 0..indptr.len() - 1 {
+            for &gene in &indices[indptr[row] as usize..indptr[row + 1] as usize] {
+                out.insert((gene as u32, row_start + row as u64));
+            }
+        }
+    }
+    out
+}
 
 /// The families a file actually carries, read off its catalog.
 fn families_of(path: &Path) -> BTreeSet<SectionFamily> {
@@ -215,34 +283,87 @@ fn build_csc_matches_the_table() {
     assert!(families_of(&output).contains(&SectionFamily::XCsc));
 }
 
-/// The four cells of the table that are open Majors, asserted as the losses
-/// they are — from the user's side, not the catalog's.
+/// §6.4, from the user's side: a merged file keeps its cell–cell graph.
 ///
-/// Deliberately spelled out rather than folded into `assert_matches_table`:
-/// when Phase 5b fixes them, this test is what has to be inverted, and a
-/// reviewer of that PR should be able to read what changes without
-/// reconstructing it from a table walk.
+/// This is the inversion of `known_open_drops_are_still_dropping`. Before
+/// Phase 5b `merge` had no obsp or varp writer at all — only a comment reading
+/// "obsp dropped (as plain merge does)" — so merging per-sample files after
+/// computing kNN silently produced an atlas with no graph, while `compact`
+/// remapped one through its keep-mask and `sort` through its permutation.
+///
+/// The `data` values are checked, not just the family: obsp is remapped by each
+/// input's global row offset, and an off-by-one offset produces a graph that is
+/// present, well-formed, and wrong.
 #[test]
-fn known_open_drops_are_still_dropping() {
+fn merge_carries_the_graph_it_used_to_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = fixture_all_families(dir.path(), "a.scx");
+    let b = fixture_all_families(dir.path(), "b.scx");
+    let merged = dir.path().join("merged.scx");
+    scx_ops::merge::merge(&[&a, &b], &merged).unwrap();
+
+    let after = families_of(&merged);
+    assert!(
+        after.contains(&SectionFamily::Obsp),
+        "merge must carry obsp (§6.4)"
+    );
+    assert!(
+        after.contains(&SectionFamily::Varp),
+        "merge must carry varp (§6.4)"
+    );
+
+    // Each input contributes its own edges, rebased into the concatenated row
+    // space. Both inputs are the same fixture, so the merged graph is the input
+    // graph twice over — once at offset 0, once at the offset of input 1.
+    let reader = ScxReader::open(&merged).unwrap();
+    let obsp = reader.read_all_obsp().unwrap();
+    let graph = obsp
+        .get("connectivities")
+        .expect("the merged file must still name the graph 'connectivities'");
+    let (rows, cols) = coo_endpoints(graph);
+    assert_eq!(
+        rows.len(),
+        2 * common::N_OBS,
+        "both inputs' edges must survive, not just input 0's"
+    );
+
+    // The deleted rows are gone from the obs axis, so the offset for input 1 is
+    // the merged file's own row count for input 0's block, not `N_OBS`.
+    let offset = *rows.iter().max().unwrap() as usize;
+    assert!(
+        offset > 0,
+        "input 1's edges must be rebased off zero, or the two blocks alias"
+    );
+    for (&r, &c) in rows.iter().zip(cols.iter()) {
+        assert!(
+            (r as u64) < reader.header().n_obs && (c as u64) < reader.header().n_obs,
+            "every remapped endpoint must land inside the merged obs axis \
+             (got row={r}, col={c}, n_obs={})",
+            reader.header().n_obs
+        );
+    }
+}
+
+/// §6.3, from the user's side: `build-csc` no longer loses what `optimize`
+/// keeps.
+///
+/// The other half of the inversion. `build-csc --in-place` renames a wholly new
+/// file over the target carrying no prior catalog, so `scx rollback` could not
+/// recover any of this — which is what made the narrowest carry allowlist in the
+/// crate the most dangerous one.
+#[test]
+fn build_csc_carries_what_optimize_carries() {
     let dir = tempfile::tempdir().unwrap();
     let input = fixture_all_families(dir.path(), "in.scx");
 
-    // §6.4 — merge loses obsp and varp, silently. `compact` remaps obsp through
-    // its keep-mask and `sort` through its permutation, so a merged kNN graph
-    // vanishes where a compacted or sorted one survives.
-    let merged = dir.path().join("merged.scx");
-    let b = fixture_all_families(dir.path(), "b.scx");
-    scx_ops::merge::merge(&[&input, &b], &merged).unwrap();
-    let after_merge = families_of(&merged);
-    assert!(!after_merge.contains(&SectionFamily::Obsp), "§6.4 fixed?");
-    assert!(!after_merge.contains(&SectionFamily::Varp), "§6.4 fixed?");
-
-    // §6.3 — build-csc's carry allowlist is the narrowest of any op here, and
-    // its output renames over the input with no prior catalog, so `scx
-    // rollback` cannot recover any of this.
     let with_csc = dir.path().join("with_csc.scx");
     scx_ops::run_build_csc(&input, &with_csc, "1G", false, 1024, None).unwrap();
     let after_csc = families_of(&with_csc);
+
+    let optimized = dir.path().join("optimized.scx");
+    scx_ops::optimize::optimize(&input, &optimized, None, ObsShardPolicy::Off).unwrap();
+    let after_opt = families_of(&optimized);
+
     for f in [
         SectionFamily::Varm,
         SectionFamily::Obsp,
@@ -252,30 +373,99 @@ fn known_open_drops_are_still_dropping() {
         SectionFamily::GroupIndex,
     ] {
         assert!(
-            !after_csc.contains(&f),
-            "§6.3 is fixed for {} — invert this test and the carry table entry",
+            after_csc.contains(&f),
+            "build-csc must carry {} (§6.3)",
             f.label()
         );
     }
 
-    // And the ops that get it right, so the contrast is pinned too: losing
-    // these would be a regression that "build-csc drops things" would hide.
-    let optimized = dir.path().join("optimized.scx");
-    scx_ops::optimize::optimize(&input, &optimized, None, ObsShardPolicy::Off).unwrap();
-    let after_opt = families_of(&optimized);
-    for f in [
+    // `.raw` is the one family in that list `optimize` still does not carry, so
+    // the two sets are compared with it excluded rather than asserted equal —
+    // saying so here keeps the next reader from "fixing" the difference.
+    let opt_should_carry = [
         SectionFamily::Varm,
         SectionFamily::Obsp,
         SectionFamily::Varp,
         SectionFamily::Bitmap,
         SectionFamily::GroupIndex,
-    ] {
+    ];
+    for f in opt_should_carry {
         assert!(
             after_opt.contains(&f),
             "optimize carries {} and must keep doing so",
             f.label()
         );
     }
+}
+
+/// Merge takes its obsm key set from **input 0 only**, so a key that only a
+/// later input has is never considered at all.
+///
+/// Before Phase 5b this merge succeeded and produced a file with no `X_umap`,
+/// with nothing said. A *layer* in the same position has always been a hard
+/// `OpsError::LayerMissing` naming the file index; this is that parity.
+#[test]
+fn merge_rejects_a_key_only_a_later_input_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = fixture_all_families(dir.path(), "plain.scx");
+    let extra = fixture_all_families_with_extra_obsm(dir.path(), "extra.scx", "X_umap");
+
+    let out = dir.path().join("merged.scx");
+    let err = scx_ops::merge::merge(&[&plain, &extra], &out)
+        .expect_err("a key only input 1 carries must not be silently invisible");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("X_umap") && msg.contains("obsm"),
+        "the error must name the axis and the key, got: {msg}"
+    );
+    assert!(
+        msg.contains('0'),
+        "and the input that lacks it, as LayerMissing does, got: {msg}"
+    );
+}
+
+/// The mirror case: input 0 has the key and a later input does not.
+///
+/// This is the one the review describes — "merging 100 per-sample files where
+/// one lacks `X_umap` silently yields an atlas with no UMAP". It was a
+/// `continue 'next_key` with no diagnostic.
+#[test]
+fn merge_rejects_a_key_a_later_input_lacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let extra = fixture_all_families_with_extra_obsm(dir.path(), "extra.scx", "X_umap");
+    let plain = fixture_all_families(dir.path(), "plain.scx");
+
+    let out = dir.path().join("merged.scx");
+    let err = scx_ops::merge::merge(&[&extra, &plain], &out)
+        .expect_err("a key input 1 lacks must not be dropped without a word");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("X_umap") && msg.contains("obsm"),
+        "the error must name the axis and the key, got: {msg}"
+    );
+    assert!(msg.contains('1'), "and the input that lacks it, got: {msg}");
+}
+
+/// Merging files that agree on their obsm keys stays a merge.
+///
+/// The accept side of the two guards above. Without it, "reject a mismatched
+/// key set" is indistinguishable from "reject every obsm", and the tests above
+/// would still pass if merge simply stopped carrying obsm at all.
+#[test]
+fn merge_accepts_a_key_every_input_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = fixture_all_families_with_extra_obsm(dir.path(), "a.scx", "X_umap");
+    let b = fixture_all_families_with_extra_obsm(dir.path(), "b.scx", "X_umap");
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge::merge(&[&a, &b], &out).expect("identical key sets must merge");
+
+    let reader = ScxReader::open(&out).unwrap();
+    let keys: BTreeSet<String> = reader.read_all_obsm().unwrap().into_keys().collect();
+    assert!(
+        keys.contains("X_umap") && keys.contains("X_pca"),
+        "both keys must survive, got: {keys:?}"
+    );
 }
 
 /// A **CSR-backed** obsp graph is a different family from a COO one, and the ops
@@ -370,4 +560,117 @@ fn per_modality_pairwise_is_a_different_decision_from_global() {
         "and it really is dropped — which is why the per-modality cell is a \
          declared drop rather than the global cell's Remapped"
     );
+}
+
+/// The same scope split, for `merge` — the trap Phase 5b walks into.
+///
+/// Giving `merge` a **global** obsp carry makes the per-modality case inherit
+/// it, and `merge_multimodal` has no per-modality pairwise reader either. So a
+/// multimodal merge of a file whose only graph is modality-scoped would write
+/// its whole output and then hard-fail the audit, on a merge that had always
+/// worked. That is the exact failure the scope split was added for in 5a, and
+/// the exact one a new carry re-opens if it forgets the override.
+#[test]
+fn merge_drops_per_modality_pairwise() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = fixture_multimodal_per_modality_obsp(dir.path(), "a.scx");
+    let b = fixture_multimodal_per_modality_obsp(dir.path(), "b.scx");
+    assert!(
+        families_of(&a).contains(&SectionFamily::Obsp),
+        "premise: the fixture must carry a modality-scoped obsp"
+    );
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge::merge(&[&a, &b], &out).expect("merge must not fail on per-modality-only obsp");
+
+    assert!(
+        !families_of(&out).contains(&SectionFamily::Obsp),
+        "and it really is dropped — merge has no per-modality pairwise reader, \
+         so the per-modality cell is a declared drop, not the global Remapped"
+    );
+}
+
+/// A detection bitmap must describe the matrix it ships with.
+///
+/// `optimize` copied bitmaps verbatim on the strength of a comment claiming
+/// `canonicalize_csr` leaves the per-row expressed-gene set unchanged. It does
+/// not: `canonicalize_csr` calls `drop_explicit_zeros_inplace`, and
+/// `BitmapShard::build_from_csr` keys off the stored index regardless of its
+/// value. So an input holding an explicit zero came out of `scx optimize` with a
+/// bitmap claiming a gene that the output's own X no longer stores, and
+/// `Experiment.detection_counts` over-reported it with nothing to notice by.
+///
+/// Asserted as agreement with the output's X rather than as a family drop,
+/// because agreement is the property; whether the fix drops the sidecar or
+/// rebuilds it is the table's business, not this test's.
+#[test]
+fn optimize_bitmaps_describe_the_matrix_they_ship_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = fixture_with_explicit_zero_in_x(dir.path(), "zeroed.scx");
+
+    // Premise: the input is the interesting shape — a bitmap that over-reports
+    // relative to a canonical reading of its own X. Without this the test would
+    // pass on a fixture that never had an explicit zero.
+    assert!(
+        bitmap_detections(&input).len() > x_canonical_detections(&input).len(),
+        "premise: the fixture's bitmap must claim a gene canonicalisation removes"
+    );
+
+    let out = dir.path().join("optimized.scx");
+    scx_ops::optimize::optimize(&input, &out, None, ObsShardPolicy::Off).unwrap();
+
+    if families_of(&out).contains(&SectionFamily::Bitmap) {
+        assert_eq!(
+            bitmap_detections(&out),
+            x_detections(&out),
+            "a carried bitmap must agree with the X it was carried alongside"
+        );
+    }
+}
+
+/// The accept side: a file canonicalisation does not touch keeps its bitmaps.
+///
+/// Without this, "drop the bitmap when canonicalisation rewrote a shard" is
+/// indistinguishable from "drop the bitmap", and the guard above would still
+/// pass if `optimize` simply stopped carrying detection sidecars at all — which
+/// would be a silent regression against §6.13 and against `optimize`'s whole
+/// reason for carrying more than any other op.
+#[test]
+fn optimize_keeps_bitmaps_when_canonicalisation_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = fixture_all_families(dir.path(), "clean.scx");
+    assert_eq!(
+        bitmap_detections(&input),
+        x_detections(&input),
+        "premise: this fixture's X is already canonical, so nothing is dropped"
+    );
+
+    let out = dir.path().join("optimized.scx");
+    scx_ops::optimize::optimize(&input, &out, None, ObsShardPolicy::Off).unwrap();
+
+    assert!(
+        families_of(&out).contains(&SectionFamily::Bitmap),
+        "optimize must still carry bitmaps through a rewrite that changes nothing"
+    );
+    assert_eq!(bitmap_detections(&out), x_detections(&out));
+}
+
+/// What the file's X would detect **after** canonicalisation — i.e. ignoring
+/// stored zeros. Only used for the premise assertion above, where the point is
+/// that the on-disk bitmap and this disagree.
+fn x_canonical_detections(path: &Path) -> BTreeSet<(u32, u64)> {
+    let reader = ScxReader::open(path).unwrap();
+    let mut out = BTreeSet::new();
+    for entry in reader.catalog().csr_shards_sorted() {
+        let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
+        let (indptr, indices, values) = reader.read_shard_from_entry(entry).unwrap();
+        for row in 0..indptr.len() - 1 {
+            for i in indptr[row] as usize..indptr[row + 1] as usize {
+                if values[i] != 0.0 {
+                    out.insert((indices[i] as u32, row_start + row as u64));
+                }
+            }
+        }
+    }
+    out
 }

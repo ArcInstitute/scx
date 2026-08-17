@@ -30,12 +30,36 @@ pub const N_VARS: usize = 6;
 pub const SHARD_ROWS: usize = 4;
 pub const RAW_N_VARS: usize = 9;
 
+/// What to vary in the all-families fixture.
+///
+/// A struct rather than a run of positional `bool`s. Every knob here exists to
+/// isolate exactly one carry decision, and `build_all_families(dir, name, true,
+/// false, true)` at a call site does not say which — which matters, because
+/// merge validates var identity and requires identical layers across inputs, so
+/// two fixtures compared by a merge test **have to** differ in one thing only.
+#[derive(Clone, Copy, Default)]
+pub struct FixtureShape {
+    /// Omit `varm`. For `merge_succeeds_when_only_a_later_input_has_varm`.
+    pub without_varm: bool,
+    /// Write a second `obsm` key under this name. For merge's key-symmetry
+    /// tests, which need two inputs whose obsm key sets differ by one.
+    pub extra_obsm_key: Option<&'static str>,
+    /// Store an **explicit zero** as X row 0's first value.
+    ///
+    /// `is_canonical_csr` treats a stored `0.0` as non-canonical, so this is
+    /// what makes `canonicalize_csr` actually rewrite the shard instead of
+    /// short-circuiting — and `BitmapShard::build_from_csr` keys off the stored
+    /// index regardless of its value, so the bitmap written below records a
+    /// gene that canonicalisation is about to remove.
+    pub explicit_zero_in_x: bool,
+}
+
 /// Every family the format can carry, in one file.
 ///
 /// Built by hand rather than by running an op, so it does not inherit any op's
 /// idea of what a file contains — which is the thing under test.
 pub fn fixture_all_families(dir: &Path, name: &str) -> PathBuf {
-    build_all_families(dir, name, true)
+    build_all_families(dir, name, FixtureShape::default())
 }
 
 /// The same file with **no `varm`**, and otherwise byte-for-byte the same shape.
@@ -44,10 +68,47 @@ pub fn fixture_all_families(dir: &Path, name: &str) -> PathBuf {
 /// identity and requires every input to carry the same layers, so the no-varm
 /// side cannot be some other fixture — it has to differ in exactly one family.
 pub fn fixture_all_families_without_varm(dir: &Path, name: &str) -> PathBuf {
-    build_all_families(dir, name, false)
+    build_all_families(
+        dir,
+        name,
+        FixtureShape {
+            without_varm: true,
+            ..FixtureShape::default()
+        },
+    )
 }
 
-fn build_all_families(dir: &Path, name: &str, with_varm: bool) -> PathBuf {
+/// The same file plus one more `obsm` key.
+///
+/// Merge takes its obsm key set from input 0 only and drops any key an input
+/// lacks, both silently; this is the fixture that makes either asymmetry
+/// visible, depending on which side of the merge it is placed.
+pub fn fixture_all_families_with_extra_obsm(dir: &Path, name: &str, key: &'static str) -> PathBuf {
+    build_all_families(
+        dir,
+        name,
+        FixtureShape {
+            extra_obsm_key: Some(key),
+            ..FixtureShape::default()
+        },
+    )
+}
+
+/// The same file with an explicit zero stored in X, so that canonicalisation
+/// has something to do and the detection bitmap written alongside is left
+/// describing a matrix that no longer exists.
+pub fn fixture_with_explicit_zero_in_x(dir: &Path, name: &str) -> PathBuf {
+    build_all_families(
+        dir,
+        name,
+        FixtureShape {
+            explicit_zero_in_x: true,
+            ..FixtureShape::default()
+        },
+    )
+}
+
+fn build_all_families(dir: &Path, name: &str, shape: FixtureShape) -> PathBuf {
     let path = dir.join(name);
     let mut writer = ScxWriter::new(
         &path,
@@ -64,7 +125,14 @@ fn build_all_families(dir: &Path, name: &str, with_varm: bool) -> PathBuf {
     // --- X, in two shards ------------------------------------------------
     let mut shard_ranges: Vec<(u64, u64)> = Vec::new();
     for (shard_idx, row_start) in (0..N_OBS).step_by(SHARD_ROWS).enumerate() {
-        let (indptr, indices, values) = csr_rows(row_start, SHARD_ROWS, N_VARS, 1);
+        let (indptr, indices, mut values) = csr_rows(row_start, SHARD_ROWS, N_VARS, 1);
+        // Row 0's first stored value only. One is enough — `is_canonical_csr`
+        // rejects the whole matrix on the first zero it finds — and keeping it
+        // to one shard means the *other* shard's bitmap stays correct, so a
+        // test can tell "the carry was gated" from "the carry was removed".
+        if shape.explicit_zero_in_x && row_start == 0 {
+            values[0] = 0;
+        }
         writer
             .write_csr_shard(
                 &indptr,
@@ -106,7 +174,10 @@ fn build_all_families(dir: &Path, name: &str, with_varm: bool) -> PathBuf {
 
     // --- obsm / varm -----------------------------------------------------
     writer.write_obsm("X_pca", &dense_embedding(N_OBS)).unwrap();
-    if with_varm {
+    if let Some(key) = shape.extra_obsm_key {
+        writer.write_obsm(key, &dense_embedding(N_OBS)).unwrap();
+    }
+    if !shape.without_varm {
         writer.write_varm("PCs", &dense_embedding(N_VARS)).unwrap();
     }
 
