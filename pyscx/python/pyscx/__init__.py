@@ -376,6 +376,12 @@ def from_h5ad(path, out, **kwargs):
             (integer-only), "zstd", "pcodec" (best for float layers),
             "lz4", "none".
         shard_size: Rows per CSR X shard. None uses the default.
+        shard_obs: "off", "auto" (default), or "always" — write obs as
+            row-sharded ObsMetadataShard sections. "auto" shards when
+            n_obs > shard_size, the same threshold pyscx.from_anndata and
+            pyscx.optimize(shard_obs=) use. Obs axis only; var is always a
+            single section on import. This is a storage-layout choice, not
+            a memory one: conversion peak RSS is unchanged.
         csc: "off", "auto", or "always". "always" adds a column-major
             sidecar via a two-pass CSR-then-rebuild write (transient disk
             ~2x the output); required for prefer_format="csc" accel paths.
@@ -1582,6 +1588,9 @@ def from_h5mu(path, out, **kwargs):
         out: Destination SCX file (str or os.PathLike).
         codec: Per-shard codec (see pyscx.from_h5ad). None auto-selects.
         shard_size: Rows per CSR X shard. None uses the default.
+        shard_obs: "off", "auto" (default), or "always" — shard the shared
+            outer obs (see pyscx.from_h5ad). Per-modality var is always a
+            single section.
         csc: "off", "auto", or "always" (column-major sidecar). When
             omitted, an accel-ready index_preset ("training" / "perturbseq")
             upgrades the default to "auto"; otherwise "off". An explicit
