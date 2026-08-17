@@ -1,34 +1,17 @@
-//! Test-only instrumentation for the parallel coordinator.
+//! Test-only fault, panic and delay injection for the *ingest* coordinator.
 //!
-//! `IN_FLIGHT_NOW` tracks worker tasks currently executing (one
-//! entry per running `encode_one_shard_worker`); `IN_FLIGHT_PEAK`
-//! is the running maximum across the most recent run. The
-//! coordinator acquires `SERIALIZE` for the duration of the
-//! parallel scope to ensure exactly one parallel coordinator run
-//! is in flight at a time across all tests in the binary, then
-//! captures `IN_FLIGHT_PEAK` into the calling thread's
-//! `LAST_RUN_PEAK` before releasing the lock. Tests read
-//! `LAST_RUN_PEAK` after the streaming call returns; the
-//! thread-local pin makes the read race-free without requiring
-//! tests themselves to hold the global lock.
+//! The counters that used to live here — in-flight workers, reorder-buffer
+//! occupancy, the run-serialisation mutex and the per-thread peak pins — moved
+//! to [`crate::parallel_drain::hooks`] when the two coordinators were unified:
+//! they measure the drain, not the ingest path, and the export direction was
+//! never instrumented at all. What is left is genuinely ingest-specific,
+//! because it is injected into `encode_one_shard_worker`.
+//!
+//! Every switch here is a thread-local rather than a global atomic, so a
+//! concurrently scheduled test on another thread never observes another test's
+//! configuration. The coordinator copies the value at entry on its calling
+//! thread and the worker closure reads the copy.
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
-
-pub static IN_FLIGHT_NOW: AtomicUsize = AtomicUsize::new(0);
-pub static IN_FLIGHT_PEAK: AtomicUsize = AtomicUsize::new(0);
-pub static SERIALIZE: Mutex<()> = Mutex::new(());
-
-/// Running maximum of the coordinator's reorder-buffer occupancy — the
-/// `BTreeMap` holding shards that have been *received* but not yet
-/// *written*.
-///
-/// This is the quantity review §11.2 is about, and it is emphatically not
-/// [`IN_FLIGHT_PEAK`]: that counter is incremented inside the spawned worker
-/// body, so it measures worker bodies executing concurrently, which the rayon
-/// pool bounds by `num_threads` no matter what the coordinator does. A test
-/// asserting on it cannot observe an unbounded buffer.
-pub static BUFFER_LEN_PEAK: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     /// Per-thread fault-injection switch read by the parallel
@@ -190,55 +173,5 @@ impl Drop for DelayIngestShardGuard {
     fn drop(&mut self) {
         let prev = self.prev;
         DELAY_INGEST_SHARD_AT.with(|c| c.set(prev));
-    }
-}
-
-thread_local! {
-    pub static LAST_RUN_PEAK: Cell<usize> = const { Cell::new(0) };
-    pub static LAST_RUN_BUFFER_PEAK: Cell<usize> = const { Cell::new(0) };
-}
-
-pub fn reset_in_flight() {
-    IN_FLIGHT_NOW.store(0, Ordering::SeqCst);
-    IN_FLIGHT_PEAK.store(0, Ordering::SeqCst);
-    BUFFER_LEN_PEAK.store(0, Ordering::SeqCst);
-}
-
-pub fn last_run_peak() -> usize {
-    LAST_RUN_PEAK.with(|c| c.get())
-}
-
-pub fn set_last_run_peak(v: usize) {
-    LAST_RUN_PEAK.with(|c| c.set(v));
-}
-
-/// Fold one observation of the reorder buffer's occupancy into
-/// [`BUFFER_LEN_PEAK`]. Called by the coordinator immediately after inserting
-/// a received item, which is the moment the buffer is at its largest.
-pub fn record_buffer_len(n: usize) {
-    BUFFER_LEN_PEAK.fetch_max(n, Ordering::SeqCst);
-}
-
-pub fn last_run_buffer_peak() -> usize {
-    LAST_RUN_BUFFER_PEAK.with(|c| c.get())
-}
-
-pub fn set_last_run_buffer_peak(v: usize) {
-    LAST_RUN_BUFFER_PEAK.with(|c| c.set(v));
-}
-
-pub struct InFlightGuard;
-
-impl InFlightGuard {
-    pub fn new() -> Self {
-        let now = IN_FLIGHT_NOW.fetch_add(1, Ordering::SeqCst) + 1;
-        IN_FLIGHT_PEAK.fetch_max(now, Ordering::SeqCst);
-        Self
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        IN_FLIGHT_NOW.fetch_sub(1, Ordering::SeqCst);
     }
 }

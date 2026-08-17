@@ -389,7 +389,7 @@ fn parallel_reorder_buffer_bounded_by_window() {
 
     let cap = 4 + 2; // reader_threads + writer_queue_depth
 
-    let buffer_peak = super::pipeline::test_hooks::last_run_buffer_peak();
+    let buffer_peak = super::parallel_drain::hooks::last_run_buffer_peak();
     assert!(
         buffer_peak > 0,
         "expected the reorder buffer to hold at least one out-of-order shard; \
@@ -405,7 +405,7 @@ fn parallel_reorder_buffer_bounded_by_window() {
     // Retained from the previous version, with an honest label. Rayon bounds
     // this by `num_threads` on its own, so it is a liveness check ("workers
     // ran at all"), not a bound on anything the coordinator controls.
-    let executing_peak = super::pipeline::test_hooks::last_run_peak();
+    let executing_peak = super::parallel_drain::hooks::last_run_peak();
     assert!(
         executing_peak > 0,
         "expected the in-flight counter to record worker activity"
