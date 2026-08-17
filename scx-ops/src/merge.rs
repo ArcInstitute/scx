@@ -464,12 +464,12 @@ pub fn merge_with_options(
             writer.write_deletion_vectors(&dv)?;
         }
 
-        writer.finish()?;
-        crate::carry::audit_output(
+        crate::carry::audit_staged(
             crate::carry::RewriteOp::Merge,
             &readers.iter().map(|r| r.catalog()).collect::<Vec<_>>(),
-            output_path,
+            &writer,
         )?;
+        writer.finish()?;
         return Ok(PredicateIndexBuildSummary {
             result: index_result,
             multimodal_skip: None,
@@ -875,12 +875,12 @@ pub fn merge_with_options(
         writer.write_deletion_vectors(&dv)?;
     }
 
-    writer.finish()?;
-    crate::carry::audit_output(
+    crate::carry::audit_staged(
         crate::carry::RewriteOp::Merge,
         &readers.iter().map(|r| r.catalog()).collect::<Vec<_>>(),
-        output_path,
+        &writer,
     )?;
+    writer.finish()?;
     Ok(PredicateIndexBuildSummary {
         result: index_result,
         multimodal_skip: None,
@@ -1469,12 +1469,12 @@ fn merge_multimodal(
     if let Some(dv) = remap_deletion_vectors(readers, None)? {
         writer.write_deletion_vectors(&dv)?;
     }
-    writer.finish()?;
-    crate::carry::audit_output(
+    crate::carry::audit_staged(
         crate::carry::RewriteOp::Merge,
         &readers.iter().map(|r| r.catalog()).collect::<Vec<_>>(),
-        output_path,
+        &writer,
     )?;
+    writer.finish()?;
     Ok(())
 }
 

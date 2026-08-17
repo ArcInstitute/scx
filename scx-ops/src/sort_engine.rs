@@ -1026,8 +1026,8 @@ pub fn sort_with_strategy(
     ));
     writer.write_provenance(prov)?;
 
+    crate::carry::audit_staged(crate::carry::RewriteOp::Sort, &[reader.catalog()], &writer)?;
     writer.finish()?;
-    crate::carry::audit_output(crate::carry::RewriteOp::Sort, &[reader.catalog()], output)?;
 
     Ok(SortSummary {
         n_obs: n_live as u64,
@@ -1272,8 +1272,8 @@ fn sort_multimodal(
         opts.shuffle,
     ));
     writer.write_provenance(prov)?;
+    crate::carry::audit_staged(crate::carry::RewriteOp::Sort, &[reader.catalog()], &writer)?;
     writer.finish()?;
-    crate::carry::audit_output(crate::carry::RewriteOp::Sort, &[reader.catalog()], output)?;
 
     Ok(SortSummary {
         n_obs: n_live as u64,

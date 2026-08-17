@@ -1724,6 +1724,27 @@ impl ScxWriter {
     }
 
     /// Number of modalities registered so far.
+    /// The catalog entries written so far, and the header row count they
+    /// describe.
+    ///
+    /// Exists so a caller can check *what it is about to persist* before
+    /// [`Self::finish`] does. `finish` consumes `self` and ends with an atomic
+    /// rename over the final path, so anything checked after it returns is a
+    /// post-mortem: on an in-place rewrite (`scx optimize --output == input`,
+    /// `scx build-csc` with no `<OUTPUT>`) the original is already gone by then
+    /// and an error can only report the loss, not prevent it.
+    ///
+    /// **Two sections are written by `finish` itself and are therefore absent
+    /// here**: the `ModalityTable`, and any CSC sidecar auto-emitted for a
+    /// modality registered with `build_csc = true`. A caller that asserts on
+    /// either must do so after `finish`, not through this.
+    ///
+    /// Read-only by design — mutating the entries from outside would let a
+    /// caller desynchronise them from the offsets already written to disk.
+    pub fn staged_catalog(&self) -> (&[FullCatalogEntry], u64) {
+        (&self.entries, self.header.n_obs)
+    }
+
     pub fn n_modalities(&self) -> usize {
         self.modalities.len()
     }

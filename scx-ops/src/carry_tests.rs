@@ -86,6 +86,7 @@ compact
   obsm                         row-filtered
   varm                         verbatim
   obsp                         remapped
+  obsp (CSR-backed)            dropped(SILENT)
   varp                         verbatim
   uns                          verbatim
   provenance                   rebuilt
@@ -105,8 +106,9 @@ merge
   layers                       rebuilt
   layer CSC sidecars           dropped(SILENT)
   obsm                         rebuilt
-  varm                         verbatim
+  varm                         conditional
   obsp                         dropped(SILENT)
+  obsp (CSR-backed)            dropped(SILENT)
   varp                         dropped(SILENT)
   uns                          rebuilt
   provenance                   rebuilt
@@ -128,6 +130,7 @@ optimize
   obsm                         verbatim
   varm                         verbatim
   obsp                         verbatim
+  obsp (CSR-backed)            verbatim
   varp                         verbatim
   uns                          verbatim
   provenance                   rebuilt
@@ -149,6 +152,7 @@ sort
   obsm                         remapped
   varm                         verbatim
   obsp                         remapped
+  obsp (CSR-backed)            dropped(SILENT)
   varp                         verbatim
   uns                          verbatim
   provenance                   rebuilt
@@ -170,6 +174,7 @@ build-csc
   obsm                         verbatim
   varm                         dropped(warns)
   obsp                         dropped(warns)
+  obsp (CSR-backed)            dropped(warns)
   varp                         dropped(warns)
   uns                          verbatim
   provenance                   rebuilt
@@ -191,6 +196,7 @@ upgrade
   obsm                         verbatim
   varm                         dropped(warns)
   obsp                         dropped(warns)
+  obsp (CSR-backed)            dropped(warns)
   varp                         dropped(warns)
   uns                          verbatim
   provenance                   rebuilt
@@ -267,6 +273,35 @@ fn open_bugs_are_labelled_in_the_table() {
                 op.label(),
                 f.label()
             ),
+        }
+    }
+}
+
+/// `audit_staged` runs before `ScxWriter::finish()`, and `finish()` writes two
+/// things of its own: the `ModalityTable`, and a CSC sidecar auto-emitted for
+/// any modality registered with `build_csc = true`. Neither is in the staged
+/// catalog, so neither can be asserted.
+///
+/// That is only safe while no op's policy for those two families requires
+/// presence. This pins it. Without this test the doc comment on `audit_staged`
+/// is an assertion nothing checks — and the failure it guards against is the
+/// worst kind: flipping `ModalityTable` to `Verbatim` would not break a unit
+/// test, it would make *every multimodal compact and merge* fail at run time.
+#[test]
+fn finish_writes_only_non_asserting_families() {
+    for &op in RewriteOp::ALL {
+        for f in [SectionFamily::ModalityTable, SectionFamily::XCsc] {
+            let rule = policy(op, f);
+            assert!(
+                !matches!(rule, Carry::Verbatim | Carry::RowFiltered | Carry::Remapped),
+                "{}/{} is {} — but that family is written by ScxWriter::finish(), \
+                 which runs after audit_staged, so the audit would demand a \
+                 section that cannot be there yet. Either keep it non-asserting \
+                 or move that op's audit after finish()",
+                op.label(),
+                f.label(),
+                rule.tag()
+            );
         }
     }
 }

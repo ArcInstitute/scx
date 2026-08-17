@@ -34,6 +34,19 @@ pub const RAW_N_VARS: usize = 9;
 /// Built by hand rather than by running an op, so it does not inherit any op's
 /// idea of what a file contains — which is the thing under test.
 pub fn fixture_all_families(dir: &Path, name: &str) -> PathBuf {
+    build_all_families(dir, name, true)
+}
+
+/// The same file with **no `varm`**, and otherwise byte-for-byte the same shape.
+///
+/// For `merge_succeeds_when_only_a_later_input_has_varm`: merge validates var
+/// identity and requires every input to carry the same layers, so the no-varm
+/// side cannot be some other fixture — it has to differ in exactly one family.
+pub fn fixture_all_families_without_varm(dir: &Path, name: &str) -> PathBuf {
+    build_all_families(dir, name, false)
+}
+
+fn build_all_families(dir: &Path, name: &str, with_varm: bool) -> PathBuf {
     let path = dir.join(name);
     let mut writer = ScxWriter::new(
         &path,
@@ -92,7 +105,9 @@ pub fn fixture_all_families(dir: &Path, name: &str) -> PathBuf {
 
     // --- obsm / varm -----------------------------------------------------
     writer.write_obsm("X_pca", &dense_embedding(N_OBS)).unwrap();
-    writer.write_varm("PCs", &dense_embedding(N_VARS)).unwrap();
+    if with_varm {
+        writer.write_varm("PCs", &dense_embedding(N_VARS)).unwrap();
+    }
 
     // --- obsp / varp -----------------------------------------------------
     writer
@@ -180,11 +195,86 @@ pub fn fixture_all_families(dir: &Path, name: &str) -> PathBuf {
 
     writer.finish().unwrap();
 
-    // --- deletion vectors, and the CSC sidecar ----------------------------
-    // Both via their real ops: a hand-written deletion vector would not be
-    // exercising the same section the ops read, and `build-csc` is the only
-    // thing that writes a CSC sidecar.
+    // --- deletion vectors -------------------------------------------------
+    // Via the real op: a hand-written deletion vector would not be exercising
+    // the same section the ops read.
+    //
+    // **No CSC sidecar.** An earlier version of this comment said the fixture
+    // added one "via its real op" alongside the deletion vector; it never did,
+    // and it cannot — the only thing that writes a CSC sidecar is `build-csc`,
+    // which would strip varm/obsp/varp/raw/bitmaps/group-index from this fixture
+    // on the way. `XCsc` and `LayerCsc` are therefore excluded from
+    // `the_fixture_carries_every_family_an_op_can_decide_about`, and the CSC
+    // `Dropped` arms are pinned by the pre-existing CLI tests rather than here.
     scx_ops::mark_deleted(&path, &[2, 5]).unwrap();
+    path
+}
+
+/// The fixture plus a **CSR-backed** obsp graph (`ObspCsrShard`), which is a
+/// different section family from the COO graphs `read_all_obsp` returns.
+///
+/// Separate rather than folded into `fixture_all_families` because it is the
+/// input that distinguishes the two: `optimize` re-encodes it in its shard loop,
+/// while `compact` and `sort` never read it at all. A fixture carrying only COO
+/// obsp cannot tell those apart.
+pub fn fixture_with_csr_obsp(dir: &Path, name: &str) -> PathBuf {
+    // `n_vars > n_obs` on purpose. An `ObspCsrShard` is obs x obs, but the
+    // writer stamps every shard's minor extent from the header's `n_vars`, so a
+    // fixture with fewer genes than cells cannot hold a valid obs x obs graph —
+    // it fails with `ShardIndexOutOfRange` before any op sees it.
+    const CSR_OBSP_N_VARS: usize = N_OBS + 4;
+    let path = dir.join(name);
+    let mut writer = ScxWriter::new(
+        &path,
+        FileHeader::new_single_modality(
+            N_OBS as u64,
+            CSR_OBSP_N_VARS as u64,
+            0,
+            SHARD_ROWS as u32,
+            0,
+            0,
+        ),
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch()).unwrap();
+    writer
+        .write_var(&var_batch(CSR_OBSP_N_VARS, "gene"))
+        .unwrap();
+    for row_start in (0..N_OBS).step_by(SHARD_ROWS) {
+        let (indptr, indices, values) = csr_rows(row_start, SHARD_ROWS, CSR_OBSP_N_VARS, 1);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    // obs x obs, so the column extent is N_OBS — canonical CSR, one entry per
+    // row, which `scx validate --deep` requires of this section type.
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for row in 0..N_OBS {
+        indices.push(((row + 1) % N_OBS) as u32);
+        values.push((row + 1) as u8);
+        indptr.push(indptr.last().unwrap() + 1);
+    }
+    writer
+        .write_obsp_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+            "connectivities",
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
     path
 }
 

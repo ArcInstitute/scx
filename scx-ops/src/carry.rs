@@ -50,7 +50,7 @@
 //!
 //! **Whether a rebuild actually happened.** See [`Carry::Rebuilt`].
 
-use scx_format_io::catalog::FullCatalog;
+use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format_io::section::SectionType;
 
 use crate::error::{OpsError, Result as OpsResult};
@@ -82,8 +82,23 @@ pub enum SectionFamily {
     Obsm,
     /// `VarmEmbedding` + `VarmEmbeddingShard`.
     Varm,
-    /// `ObspCsrShard` + `ObspEmbedding` + `ObspEmbeddingShard`.
+    /// `ObspEmbedding` + `ObspEmbeddingShard` — the COO obs×obs graphs, the
+    /// ones `ScxReader::read_all_obsp` returns.
     Obsp,
+    /// `ObspCsrShard` — the *CSR-backed* obs×obs graph, deliberately its own
+    /// family.
+    ///
+    /// Folding it in with the COO forms was the first design and it was wrong in
+    /// both directions. `read_all_obsp` reads only the COO types, so `compact`
+    /// and `sort` do not carry a CSR graph at all — a CSR-only input would have
+    /// produced a graphless output and then failed the audit, on code that had
+    /// not changed. And a file with one graph of each kind would have kept the
+    /// family "present" while the CSR one was silently lost, so the audit would
+    /// have passed over exactly the loss it exists to catch.
+    ///
+    /// The general rule: a family is a unit of *decision*, so two physical
+    /// encodings the ops treat differently are two families, not one.
+    ObspCsr,
     /// `VarpEmbedding` + `VarpEmbeddingShard`.
     Varp,
     /// `UnsBlob`.
@@ -129,6 +144,7 @@ impl SectionFamily {
         SectionFamily::Obsm,
         SectionFamily::Varm,
         SectionFamily::Obsp,
+        SectionFamily::ObspCsr,
         SectionFamily::Varp,
         SectionFamily::Uns,
         SectionFamily::Provenance,
@@ -154,6 +170,7 @@ impl SectionFamily {
             Self::Obsm => "obsm",
             Self::Varm => "varm",
             Self::Obsp => "obsp",
+            Self::ObspCsr => "obsp (CSR-backed)",
             Self::Varp => "varp",
             Self::Uns => "uns",
             Self::Provenance => "provenance",
@@ -186,9 +203,8 @@ pub fn family(ty: SectionType) -> SectionFamily {
         SectionType::LayerCscShard => SectionFamily::LayerCsc,
         SectionType::ObsmEmbedding | SectionType::ObsmEmbeddingShard => SectionFamily::Obsm,
         SectionType::VarmEmbedding | SectionType::VarmEmbeddingShard => SectionFamily::Varm,
-        SectionType::ObspCsrShard
-        | SectionType::ObspEmbedding
-        | SectionType::ObspEmbeddingShard => SectionFamily::Obsp,
+        SectionType::ObspEmbedding | SectionType::ObspEmbeddingShard => SectionFamily::Obsp,
+        SectionType::ObspCsrShard => SectionFamily::ObspCsr,
         SectionType::VarpEmbedding | SectionType::VarpEmbeddingShard => SectionFamily::Varp,
         SectionType::UnsBlob => SectionFamily::Uns,
         SectionType::Provenance => SectionFamily::Provenance,
@@ -230,11 +246,19 @@ pub enum Carry {
     ///
     /// So `Rebuilt` is the weakest entry in the table and it is the one to be
     /// careful about: it records intent, and the intent is not enforced here.
-    /// The known live instance is `build-csc`, which copies the predicate-index
-    /// sections and never re-derives the per-shard `column_stats` they need, so
-    /// the sections survive and Level-1 pushdown does not — pinned, unfixed, at
+    /// Live instances: every op's `Provenance`, `merge`'s `Uns` (which
+    /// `UnsPolicy` can legitimately reduce to nothing), and the predicate-index
+    /// entries for `compact` / `merge` / `sort`.
+    ///
+    /// An earlier version of this doc named `build-csc`'s predicate-index
+    /// handling as the live instance. That cell is `Verbatim`, not `Rebuilt` —
+    /// the sections *are* required to be present, and the defect there is a
+    /// different one that no `Carry` variant expresses: `build-csc` copies them
+    /// and never re-derives the per-shard `column_stats` they need, so the
+    /// sections survive and Level-1 pushdown does not. Pinned and unfixed at
     /// `scx-cli/tests/cli_ops_integration.rs`
     /// (`test_build_csc_preserves_predicate_index_sections_but_not_pushdown`).
+    /// **The audit cannot see that**, and no entry in this table claims it can.
     Rebuilt,
     /// Carried or dropped depending on something decided at run time, so
     /// neither presence nor absence can be asserted.
@@ -346,6 +370,13 @@ fn compact(family: SectionFamily) -> Carry {
         // Both COO axes are the obs axis, so entries touching a deleted row go
         // too — that is a remap, not a filter.
         F::Obsp => Carry::Remapped,
+        // `read_all_obsp` returns only the COO forms, so the CSR-backed graph is
+        // never read and never re-emitted. Pre-existing, and recorded nowhere
+        // until this table: `optimize` carries it, `compact` does not.
+        F::ObspCsr => Carry::Dropped {
+            why: "read_all_obsp reads only the COO forms; the CSR graph is not carried",
+            warns: false,
+        },
         // var-axis data; compact never drops columns.
         F::VarMetadata | F::Varm | F::Varp | F::Uns => Carry::Verbatim,
         F::Provenance => Carry::Rebuilt,
@@ -395,7 +426,18 @@ fn merge(family: SectionFamily) -> Carry {
         // Concatenated across inputs under a unified schema.
         F::ObsMetadata | F::X | F::Layer | F::Obsm => Carry::Rebuilt,
         // Validated equal across inputs (or assumed so), then written once.
-        F::VarMetadata | F::Varm => Carry::Verbatim,
+        F::VarMetadata => Carry::Verbatim,
+        // NOT `Verbatim`, though the first version of this table said so and it
+        // read plausibly next to `var`. `merge` never validates varm across
+        // inputs: `merge_global_dense_mapping_sharded` takes `&readers[..1]`, so
+        // a key present only in a later input is not carried — and the
+        // multimodal path omits global varm by design, since `n_vars` differs
+        // per modality and there is no canonical `n_rows_total` for it.
+        // Requiring presence turned `merge([no_varm, has_varm])` into a hard
+        // error on a merge that had always worked.
+        F::Varm => Carry::Conditional {
+            on: "taken from input 0 only; multimodal global varm omitted by design",
+        },
         // Row ids rebased by each input's offset in the concatenated space.
         F::DeletionVectors => Carry::Remapped,
         // Combined under `UnsPolicy`, which can legitimately yield nothing.
@@ -408,6 +450,10 @@ fn merge(family: SectionFamily) -> Carry {
         // a compacted or sorted one survives, with no warning. Phase 5b.
         F::Obsp => Carry::Dropped {
             why: "§6.4 (open): merge has no obsp writer; a merged graph is lost silently",
+            warns: false,
+        },
+        F::ObspCsr => Carry::Dropped {
+            why: "§6.4 (open): merge has no obsp writer, in either encoding",
             warns: false,
         },
         // §6.4 — OPEN MAJOR, same shape on the var axis.
@@ -451,6 +497,10 @@ fn optimize(family: SectionFamily) -> Carry {
         // Re-encoded (canonicalised), same rows in the same order.
         F::X | F::Layer => Carry::Verbatim,
         F::Obsm | F::Varm | F::Obsp | F::Varp | F::Uns => Carry::Verbatim,
+        // Re-encoded in the same shard loop as X and the layers rather than
+        // copied as an aux section — which is why optimize is the only op that
+        // keeps it.
+        F::ObspCsr => Carry::Verbatim,
         // Row order and CSR shard boundaries are 1:1, so shard-local bitmap row
         // keys and the group index's global ranges both stay valid.
         F::Bitmap | F::GroupIndex => Carry::Verbatim,
@@ -483,6 +533,12 @@ fn sort(family: SectionFamily) -> Carry {
     use SectionFamily as F;
     match family {
         F::ObsMetadata | F::X | F::Layer | F::Obsm | F::Obsp => Carry::Remapped,
+        // As for `compact`: `read_all_obsp` does not return it, so the
+        // permutation never reaches it and it is not re-emitted.
+        F::ObspCsr => Carry::Dropped {
+            why: "read_all_obsp reads only the COO forms; the CSR graph is not carried",
+            warns: false,
+        },
         F::VarMetadata | F::Varm | F::Varp | F::Uns => Carry::Verbatim,
         // Rebuilt against the permuted rows when `--bitmap auto/always` asks
         // for it, and dropped otherwise — which is the default. Shard-local
@@ -533,9 +589,11 @@ fn build_csc(family: SectionFamily) -> Carry {
         F::ObsMetadata | F::VarMetadata => Carry::Verbatim,
         F::X | F::Layer | F::Obsm | F::Uns => Carry::Verbatim,
         F::DeletionVectors => Carry::Verbatim,
-        // Sections copied through; see `Carry::Rebuilt` for why this entry is
-        // the weak one — the per-shard `column_stats` those sections need are
-        // not re-derived, so Level-1 pushdown is lost while the section stays.
+        // Copied through, so presence *is* asserted — but presence is the only
+        // thing asserted, and it is not the property that matters here: the
+        // per-shard `column_stats` these sections need are never re-derived, so
+        // Level-1 pushdown is lost while the section stays. No `Carry` variant
+        // expresses that, and none pretends to; it is 5c's to fix.
         F::ObsPredicateIndex | F::VarPredicateIndex => Carry::Verbatim,
         // The whole point of the op.
         F::XCsc => Carry::Rebuilt,
@@ -550,6 +608,10 @@ fn build_csc(family: SectionFamily) -> Carry {
         },
         F::Obsp => Carry::Dropped {
             why: "§6.3 (open): not in the copy allowlist; user data with no rebuild path",
+            warns: true,
+        },
+        F::ObspCsr => Carry::Dropped {
+            why: "§6.3 (open): not in the copy allowlist, in either encoding",
             warns: true,
         },
         F::Varp => Carry::Dropped {
@@ -638,12 +700,13 @@ pub struct CarryReport {
 pub fn audit(
     op: RewriteOp,
     inputs: &[&FullCatalog],
-    output: &FullCatalog,
+    output: &[FullCatalogEntry],
     output_n_obs: u64,
 ) -> OpsResult<CarryReport> {
-    let present = |catalog: &FullCatalog, f: SectionFamily| {
-        catalog.entries.iter().any(|e| family(e.section_type) == f)
+    let present_in = |entries: &[FullCatalogEntry], f: SectionFamily| {
+        entries.iter().any(|e| family(e.section_type) == f)
     };
+    let present = |catalog: &FullCatalog, f: SectionFamily| present_in(&catalog.entries, f);
 
     let mut dropped = Vec::new();
     let mut carried = Vec::new();
@@ -652,7 +715,7 @@ pub fn audit(
         if !inputs.iter().any(|c| present(c, f)) {
             continue;
         }
-        let in_output = present(output, f);
+        let in_output = present_in(output, f);
         let rule = policy(op, f);
 
         match rule {
@@ -720,24 +783,34 @@ pub fn audit(
     Ok(CarryReport { dropped, carried })
 }
 
-/// [`audit`] against a finished file on disk.
+/// [`audit`] the file a writer is **about to persist**.
 ///
-/// The ops call this **after** `ScxWriter::finish()`, not before. `finish()`
-/// consumes the writer and its catalog is private, so auditing earlier would
-/// mean widening `scx-format-io`'s public API — and it would check the writer's
-/// intent rather than the artifact. Reopening costs one catalog parse per op
-/// invocation, which is not on any per-row or per-shard path.
+/// Call this immediately before `ScxWriter::finish()`. The ordering is the whole
+/// point, and it was not the first design: auditing the finished file was
+/// simpler (no `scx-format-io` API to widen, and it checks the artifact rather
+/// than the writer's intent) but it can only ever be a post-mortem. `finish()`
+/// ends with an atomic rename over the final path, and both `optimize` and
+/// `build-csc` support an in-place form where that path *is* the input — so a
+/// violation found afterwards reports a loss that has already happened and that
+/// `scx rollback` cannot undo, since neither op leaves a prior catalog. Checking
+/// first means the error propagates, `finish()` is never called, the staged
+/// tempfile is dropped, and the original is still there.
 ///
-/// Callers that rename the output over the input (`build-csc`, `optimize
-/// --output == input`) must have captured their input catalogs before writing;
-/// all of them do, since every one opens its reader first.
-pub fn audit_output(
+/// The cost is one pass over catalog entries already in memory.
+///
+/// ⚠️ **`ModalityTable` and auto-emitted CSC sidecars are written by `finish()`
+/// itself**, so they are absent from the staged catalog and cannot be asserted
+/// here. That is safe only because no op's policy for either family requires
+/// presence — `finish_writes_only_non_asserting_families` pins exactly that, so
+/// a policy change that made one of them `Verbatim` fails a test instead of
+/// failing every op at run time.
+pub fn audit_staged(
     op: RewriteOp,
     inputs: &[&FullCatalog],
-    output_path: &std::path::Path,
+    writer: &scx_format_io::writer::ScxWriter,
 ) -> OpsResult<CarryReport> {
-    let out = scx_format_io::ScxReader::open(output_path)?;
-    audit(op, inputs, out.catalog(), out.header().n_obs)
+    let (entries, n_obs) = writer.staged_catalog();
+    audit(op, inputs, entries, n_obs)
 }
 
 /// Render the whole table as text, one line per (op, family) with a non-default
