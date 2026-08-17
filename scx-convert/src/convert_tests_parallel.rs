@@ -132,8 +132,9 @@ fn parallel_memory_budget_refuses_oversized_shard() {
     // Parallel path only fires when libhdf5 is built thread-safe;
     // otherwise the dispatcher falls back to sequential which has no
     // per-worker budget check.
-    if !super::hdf5_threadsafe::hdf5_is_threadsafe() {
-        eprintln!("skipping: libhdf5 not built thread-safe");
+    if super::hdf5_threadsafe::skip_if_not_threadsafe(
+        "parallel_memory_budget_refuses_oversized_shard",
+    ) {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -163,8 +164,7 @@ fn parallel_memory_budget_refuses_oversized_shard() {
 
 #[test]
 fn parallel_memory_budget_derates_workers() {
-    if !super::hdf5_threadsafe::hdf5_is_threadsafe() {
-        eprintln!("skipping: libhdf5 not built thread-safe");
+    if super::hdf5_threadsafe::skip_if_not_threadsafe("parallel_memory_budget_derates_workers") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -283,8 +283,9 @@ fn compute_shard_row_ranges_partition_invariants() {
 /// the sequential path.
 #[test]
 fn dense_parallel_with_memory_budget_byte_identical() {
-    if !super::hdf5_threadsafe::hdf5_is_threadsafe() {
-        eprintln!("skipping: libhdf5 not built thread-safe");
+    if super::hdf5_threadsafe::skip_if_not_threadsafe(
+        "dense_parallel_with_memory_budget_byte_identical",
+    ) {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -334,23 +335,37 @@ fn dense_parallel_with_memory_budget_byte_identical() {
     assert_eq!(csr_a.data, csr_b.data);
 }
 
-/// Fix 2: the BTreeMap reorder buffer used to be unbounded — a slow
-/// shard 0 let the caller drain the channel into the map until it
-/// held ~`n_ranges` shards. The rolling-window spawn caps outstanding
-/// shards (encoding + in channel + in buffer) at `reader_threads +
-/// writer_queue_depth`. Asserts the in-flight peak observed during
-/// the coordinator stays within that bound.
+/// The ingest reorder buffer is what the rolling window is supposed to bound,
+/// and it is what this test measures.
+///
+/// The `BTreeMap` holds shards that have been *received* but not yet
+/// *written*. Spawning a replacement worker on receive bounds
+/// `spawned − received` and leaves `received − written` free to grow toward
+/// `n_ranges`; spawning inside the drain loop — what the export sibling in
+/// `stream_write.rs` does — is what actually caps it.
+///
+/// ⚠️ **This test replaces one that could not fail.** The previous version
+/// asserted on `last_run_peak()`, whose counter is incremented by an
+/// `InFlightGuard` constructed *inside* the spawned worker body: it counts
+/// worker bodies executing concurrently, which rayon bounds by the pool's
+/// `num_threads` regardless of what the coordinator does. With
+/// `reader_threads = 4` and `writer_queue_depth = 2` it asserted `4 <= 6`,
+/// and would have gone on asserting `4 <= 6` with the buffer holding all 50
+/// shards. That assertion is kept below, relabelled for what it does measure.
+///
+/// The injected delay on shard 0 is load-bearing: without it the natural
+/// completion skew across 50 tiny shards stays under the cap and the
+/// assertion passes against the unbounded coordinator too.
 #[test]
-fn parallel_in_flight_bounded_by_window() {
-    if !super::hdf5_threadsafe::hdf5_is_threadsafe() {
-        eprintln!("skipping: libhdf5 not built thread-safe");
+fn parallel_reorder_buffer_bounded_by_window() {
+    if super::hdf5_threadsafe::skip_if_not_threadsafe("parallel_reorder_buffer_bounded_by_window") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("many.h5ad");
-    // Many small shards exercise the rolling-window spawn — without
-    // the cap, a delayed shard 0 would let the BTreeMap accumulate
-    // dozens of out-of-order shards.
+    // 400 rows / shard_size 8 → 50 shards, each tiny enough to encode in
+    // microseconds, so the 250 ms head-of-line stall on shard 0 lets every
+    // other shard finish behind it.
     create_test_h5ad(&h5ad, 400, 13, "csr", false);
 
     let mut opts = streaming_opts(8);
@@ -358,24 +373,57 @@ fn parallel_in_flight_bounded_by_window() {
     opts.writer_queue_depth = 2;
 
     let scx = dir.path().join("out.scx");
-    h5ad_to_scx_streaming(
-        &h5ad,
-        &scx,
-        &opts,
-        &StreamingOverrides::default(),
-        &mut WarningSink::log(),
-    )
-    .unwrap();
+    {
+        // Guard is created on this thread — the coordinator captures the
+        // thread-local at entry — and Drop clears it even on panic.
+        let _delay = super::pipeline::test_hooks::DelayIngestShardGuard::new(0, 250);
+        h5ad_to_scx_streaming(
+            &h5ad,
+            &scx,
+            &opts,
+            &StreamingOverrides::default(),
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+    }
 
-    let peak = super::pipeline::test_hooks::last_run_peak();
     let cap = 4 + 2; // reader_threads + writer_queue_depth
+
+    let buffer_peak = super::parallel_drain::hooks::last_run_buffer_peak();
+    // Equality, not `<= cap` — and not `> 0` or `> 1` either. All three of the
+    // weaker forms pass without the stall, which makes them assertions about
+    // nothing:
+    //
+    //   peak with the 250 ms stall on shard 0:  6, 6, 6      (== cap, every run)
+    //   peak with the stall removed:            3, 4, 4, 4, 5 (never reaches cap)
+    //
+    // The drain records occupancy right after the insert and before the apply
+    // loop, so a strictly in-order run peaks at 1 and ordinary completion skew
+    // across 50 tiny shards gets partway to the window on its own. Only the
+    // head-of-line stall fills it exactly. So `== cap` is the one form that
+    // asserts both halves at once: the buffer really was pushed to the window
+    // (the hook fired), and the window really held (the bound works). If the
+    // spawn moves back to the receive site this reads 50.
+    assert_eq!(
+        buffer_peak, cap,
+        "reorder-buffer peak {buffer_peak}, expected exactly the rolling-window \
+         cap {cap}. Above: a replacement worker is being spawned per shard \
+         *received* rather than per shard *applied*, so `received - written` is \
+         unbounded. Below: the delay hook did not fire, the \
+         buffer was never pushed to the window, and this test proves nothing."
+    );
+
+    // Retained from the previous version, with an honest label. Rayon bounds
+    // this by `num_threads` on its own, so it is a liveness check ("workers
+    // ran at all"), not a bound on anything the coordinator controls.
+    let executing_peak = super::parallel_drain::hooks::last_run_peak();
     assert!(
-        peak > 0,
-        "expected the in-flight counter to record activity"
+        executing_peak > 0,
+        "expected the in-flight counter to record worker activity"
     );
     assert!(
-        peak <= cap,
-        "in-flight peak {peak} exceeds rolling-window cap {cap}"
+        executing_peak <= 4,
+        "concurrently executing workers {executing_peak} exceeds the pool size 4"
     );
 }
 
@@ -950,6 +998,17 @@ fn parallel_ingest_worker_error_does_not_deadlock() {
     use super::pipeline::{h5ad_to_scx_streaming, test_hooks, StreamingOverrides};
     use std::time::{Duration, Instant};
 
+    // Without this the test does not skip on a non-thread-safe libhdf5 — it
+    // *fails*: the dispatcher routes to the sequential coordinator, whose
+    // workers never run, so the injected fault never fires and the convert
+    // returns `Ok`. Four of the six parallel-coordinator tests carried the
+    // guard and these two did not.
+    if super::hdf5_threadsafe::skip_if_not_threadsafe(
+        "parallel_ingest_worker_error_does_not_deadlock",
+    ) {
+        return;
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("src.h5ad");
     let scx_out = dir.path().join("out.scx");
@@ -1005,12 +1064,25 @@ fn parallel_ingest_worker_error_does_not_deadlock() {
 /// `received` counter never reaches `n_ranges`, and `rx.recv()` blocks
 /// forever because the original `tx` in the scope frame keeps the
 /// channel open. The `PanicIngestShardGuard` hook forces a real
-/// `panic!` inside `encode_one_shard_worker`'s `catch_unwind`; the
-/// coordinator must convert it to a `ConvertError` and return `Err`.
+/// `panic!` in the coordinator's worker closure; the `catch_unwind`
+/// that catches it lives in `parallel_drain::ordered_parallel_drain`,
+/// which must convert it to a `ConvertError` and return `Err`.
+///
+/// The drain's own `a_panicking_worker_returns_an_error_instead_of_deadlocking`
+/// covers the same contract without libhdf5; this one additionally pins that
+/// the ingest coordinator really does route through the drain.
 #[test]
 fn parallel_ingest_worker_panic_does_not_deadlock() {
     use super::pipeline::{h5ad_to_scx_streaming, test_hooks, StreamingOverrides};
     use std::time::{Duration, Instant};
+
+    // See the sibling above: sequential fallback makes this a failure rather
+    // than a skip on a non-thread-safe libhdf5.
+    if super::hdf5_threadsafe::skip_if_not_threadsafe(
+        "parallel_ingest_worker_panic_does_not_deadlock",
+    ) {
+        return;
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("src.h5ad");
@@ -1060,9 +1132,15 @@ fn parallel_ingest_worker_panic_does_not_deadlock() {
 }
 
 /// Symmetric regression test for the export coordinator
-/// (`stream_csr_into_prealloc_parallel`): a worker that panics before
-/// `tx.send(...)` must not deadlock the SCX → h5ad drain loop. Same
-/// `catch_unwind` fix, forced via the `PanicExportShardGuard` hook.
+/// (`stream_csr_into_prealloc_parallel`): a worker that panics must not
+/// deadlock the SCX → h5ad drain loop. Forced via the
+/// `PanicExportShardGuard` hook, which panics in the coordinator's worker
+/// closure; the `catch_unwind` that converts it into a delivered `Err` lives
+/// in `parallel_drain::ordered_parallel_drain`, shared with ingest.
+///
+/// Its libhdf5-free twin is the drain's own
+/// `a_panicking_worker_returns_an_error_instead_of_deadlocking`; this one
+/// additionally pins that the export coordinator routes through the drain.
 #[test]
 fn parallel_export_worker_panic_does_not_deadlock() {
     use super::pipeline::{scx_to_h5ad_streaming, test_hooks};

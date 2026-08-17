@@ -47,6 +47,46 @@ pub fn try_emit_not_threadsafe_warning(sink: &mut WarningSink) {
     }
 }
 
+/// Name of the environment variable that turns a non-thread-safe libhdf5
+/// from a silent test skip into a hard failure. Set by the `Test (hdf5
+/// features)` CI job. Test-only: production never consults it, because a
+/// non-thread-safe build is a supported configuration that falls back to
+/// the sequential coordinator.
+#[cfg(test)]
+pub(crate) const REQUIRE_THREADSAFE_ENV: &str = "SCX_REQUIRE_HDF5_THREADSAFE";
+
+/// `true` when the caller has demanded a thread-safe libhdf5 (CI).
+///
+/// Tests of the parallel coordinators return early on a non-thread-safe
+/// build, which is right on a developer laptop and wrong in CI: libtest
+/// captures the skip message, so the lane reports green with the
+/// coordinator untested.
+#[cfg(test)]
+pub(crate) fn threadsafe_required() -> bool {
+    std::env::var_os(REQUIRE_THREADSAFE_ENV).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Skip-or-fail helper for tests that need the parallel coordinator.
+///
+/// Returns `true` when the caller should skip. Panics — failing the test —
+/// when libhdf5 is not thread-safe *and* [`REQUIRE_THREADSAFE_ENV`] is set,
+/// so the CI lane cannot go green on a build where every parallel test
+/// quietly returns early.
+#[cfg(test)]
+pub(crate) fn skip_if_not_threadsafe(test_name: &str) -> bool {
+    if hdf5_is_threadsafe() {
+        return false;
+    }
+    assert!(
+        !threadsafe_required(),
+        "{test_name} needs a libhdf5 built with --enable-threadsafe, and \
+         {REQUIRE_THREADSAFE_ENV} is set. This test would otherwise skip \
+         silently and take the whole parallel-coordinator surface with it."
+    );
+    eprintln!("skipping {test_name}: libhdf5 not built thread-safe");
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +99,28 @@ mod tests {
         let a = hdf5_is_threadsafe();
         let b = hdf5_is_threadsafe();
         assert_eq!(a, b);
+    }
+
+    /// The lane-level guard. Every test of the parallel ingest / export
+    /// coordinators returns early when libhdf5 lacks `--enable-threadsafe`,
+    /// and libtest swallows the message — so on such a host the whole
+    /// `Test (hdf5 features)` job would report green having exercised none
+    /// of it. `docs/development.md`'s claim that the Ubuntu system package
+    /// ships the option is a claim about someone else's build, not a
+    /// measurement of the runner's. This turns it into one.
+    ///
+    /// Same shape as `SCX_REQUIRE_GPU`, which exists because 176 `scx-gpu`
+    /// tests were passing while doing nothing on a CPU host.
+    #[test]
+    fn ci_requires_a_threadsafe_libhdf5() {
+        if !threadsafe_required() {
+            return;
+        }
+        assert!(
+            hdf5_is_threadsafe(),
+            "{REQUIRE_THREADSAFE_ENV} is set but H5is_library_threadsafe() \
+             reports false: this libhdf5 was built without --enable-threadsafe, \
+             so every parallel-coordinator test would skip itself."
+        );
     }
 }

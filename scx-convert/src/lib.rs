@@ -66,6 +66,16 @@ pub use export_filter::min_counts_obs_mask;
 
 #[cfg(feature = "hdf5")]
 mod hdf5_threadsafe;
+// Deliberately NOT gated on `hdf5`: the drain is pure rayon + crossbeam, and
+// keeping it feature-free is what lets its tests run in the default
+// `cargo test --workspace` job rather than only in the hdf5 lane.
+//
+// Its only production callers — the two streaming coordinators — *are*
+// hdf5-gated, so at default features every item in it is dead by construction
+// while its tests still exercise them. That is the intended shape, not an
+// oversight, hence the narrow allow rather than gating the module.
+#[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
+mod parallel_drain;
 #[cfg(feature = "hdf5")]
 mod permuted_reader;
 #[cfg(feature = "hdf5")]

@@ -104,6 +104,17 @@ pub enum ConvertError {
     Other(String),
 }
 
+/// A failure of the shared parallel drain itself — pool construction, or the
+/// worker channel closing early — as opposed to a failure of any one shard.
+/// `crate::parallel_drain` is generic over the error type so it can stay
+/// feature-free (and therefore testable without libhdf5); this is how it
+/// re-enters `ConvertError`.
+impl From<crate::parallel_drain::DrainFailure> for ConvertError {
+    fn from(f: crate::parallel_drain::DrainFailure) -> Self {
+        ConvertError::Other(f.0)
+    }
+}
+
 #[derive(Clone)]
 pub struct ConvertOptions {
     pub shard_target_rows: u32,
@@ -2179,9 +2190,6 @@ fn streaming_writer_coordinator_parallel(
     queue_depth: usize,
     ranges: Vec<(u64, u32)>,
 ) -> Result<(u32, Vec<(u64, u64)>), ConvertError> {
-    use crossbeam_channel::bounded;
-    use rayon::ThreadPoolBuilder;
-
     if ranges.is_empty() {
         return Ok((0, Vec::new()));
     }
@@ -2192,45 +2200,12 @@ fn streaming_writer_coordinator_parallel(
         .collect();
 
     let n_ranges = ranges.len();
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(reader_threads)
-        .thread_name(|i| format!("scx-stream-{i}"))
-        .build()
-        .map_err(|e| {
-            ConvertError::Other(format!(
-                "failed to build rayon pool with {reader_threads} threads: {e}"
-            ))
-        })?;
-
-    let queue_depth = queue_depth.max(1);
-    let (tx, rx) = bounded::<(usize, Result<EncodedShardOutput, ConvertError>)>(queue_depth);
-
     let source_name: String = reader.source_matrix_name().to_string();
     let opts_codec = opts.codec;
     let opts_bitmap = opts.bitmap;
     let opts_framing = opts.framing();
     let want_bitmap = section_type == SectionType::CsrShard;
     let name_prefix = section_name_prefix.to_string();
-
-    // Cap outstanding shards (encoding + in channel + in BTreeMap) at
-    // `reader_threads + queue_depth`. Rolling-window spawn: prime the
-    // pool with `in_flight_cap` tasks, then spawn one new task each
-    // time a shard is received. This bounds the reorder buffer; the
-    // previous up-front spawn loop let the BTreeMap grow to ~n_ranges
-    // when shard 0 was slow (Gemini code review feedback).
-    let in_flight_cap = reader_threads.saturating_add(queue_depth);
-
-    // Serialize parallel coordinator runs across the test binary so
-    // the cfg(test) in-flight counter is observable race-free. Held
-    // for the entire parallel scope; no effect in production.
-    #[cfg(test)]
-    let _serial = {
-        let lock = test_hooks::SERIALIZE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        test_hooks::reset_in_flight();
-        lock
-    };
 
     // Capture the fault-injection setting on the calling thread (the
     // caller's `FailIngestShardGuard` lives in this thread's
@@ -2241,187 +2216,114 @@ fn streaming_writer_coordinator_parallel(
     #[cfg(test)]
     let captured_fault_shard = test_hooks::current_ingest_fault_shard();
 
-    // Panic-injection sibling of the fault switch above: forces a
-    // real worker `panic!` before `tx.send(...)`, exercising the
-    // `catch_unwind` guard in the worker body. Copied here on the
-    // calling thread and propagated into workers via closure capture.
+    // Panic-injection sibling of the fault switch above: forces a real
+    // `panic!` inside the worker body, exercising the `catch_unwind` that
+    // `ordered_parallel_drain` wraps it in — which is what turns a panic into
+    // a delivered `Err` rather than a lost send and a hung drain.
     #[cfg(test)]
     let captured_panic_shard = test_hooks::current_ingest_panic_shard();
 
-    // Macro-style local spawn: must inline because extracting a
-    // closure would re-borrow `reader` from a nested closure scope
-    // and rayon's `'scope` lifetime can't be reconciled with that
-    // shape. Each spawn clones `tx` + `source_name` for the worker.
-    //
-    // `move` is load-bearing: it moves `rx` into the closure so an
-    // early `return Err(...)` from the drain loop drops `rx` on
-    // unwind, unblocking workers parked in `tx.send(...)` on the
-    // bounded channel. Without `move` `rx` lives in the parent frame
-    // and the scope can never join those workers.
-    pool.in_place_scope(move |s| -> Result<(), ConvertError> {
-        macro_rules! spawn_shard {
-            ($scope:expr, $idx:expr) => {{
-                let idx_ = $idx;
-                let (row_start, n_rows) = ranges[idx_];
-                let tx = tx.clone();
-                let source_name = source_name.clone();
-                let name = format!("{name_prefix}_{idx_}");
-                $scope.spawn(move |_| {
-                    #[cfg(test)]
-                    let _guard = crate::pipeline::test_hooks::InFlightGuard::new();
-                    #[cfg(test)]
-                    if Some(idx_) == captured_fault_shard {
-                        let inner = ConvertError::Other(format!(
-                            "test_hooks: injected failure at shard {idx_}"
-                        ));
-                        let wrapped = ConvertError::ShardRead {
-                            row_start,
-                            n_rows,
-                            source: source_name,
-                            inner: Box::new(inner),
-                        };
-                        let _ = tx.send((idx_, Err(wrapped)));
-                        return;
-                    }
-                    // `catch_unwind` converts a worker panic into a
-                    // delivered `Err` rather than a silent no-send. A
-                    // panic that skipped the `tx.send(...)` below would
-                    // leave the drain loop's `received` counter short
-                    // of `n_ranges` forever (the original `tx` in the
-                    // scope frame keeps `rx` open), so the coordinator
-                    // would deadlock. `AssertUnwindSafe` is sound: the
-                    // worker only reads the shared `&dyn` stream and
-                    // builds output locally; the writer runs on the
-                    // calling thread, so nothing shared is left
-                    // poisoned by a caught unwind.
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        #[cfg(test)]
-                        if Some(idx_) == captured_panic_shard {
-                            panic!("test_hooks: injected panic at shard {idx_}");
-                        }
-                        encode_one_shard_worker(
-                            reader,
-                            row_start,
-                            n_rows,
-                            opts_codec,
-                            index_dtype,
-                            n_vars_u32,
-                            section_type,
-                            modality_type,
-                            name,
-                            opts_bitmap,
-                            want_bitmap,
-                            opts_framing,
-                        )
-                    }));
-                    let wrapped = match outcome {
-                        Ok(Ok(out)) => Ok(out),
-                        Ok(Err(inner)) => Err(ConvertError::ShardRead {
-                            row_start,
-                            n_rows,
-                            source: source_name,
-                            inner: Box::new(inner),
-                        }),
-                        Err(payload) => Err(ConvertError::ShardRead {
-                            row_start,
-                            n_rows,
-                            source: source_name,
-                            inner: Box::new(ConvertError::Other(format!(
-                                "worker panicked while encoding shard {idx_}: {}",
-                                panic_message(payload)
-                            ))),
-                        }),
-                    };
-                    let _ = tx.send((idx_, wrapped));
-                });
-            }};
-        }
-
-        // Prime the pump with up to `in_flight_cap` tasks.
-        let mut next_to_spawn: usize = 0;
-        let prime = in_flight_cap.min(n_ranges);
-        while next_to_spawn < prime {
-            spawn_shard!(s, next_to_spawn);
-            next_to_spawn += 1;
-        }
-
-        // Drain in the calling thread, reordering by shard_idx and
-        // spawning one new task per received shard. The BTreeMap can
-        // hold at most `in_flight_cap - 1` out-of-order shards.
-        let mut buffer: std::collections::BTreeMap<usize, EncodedShardOutput> =
-            std::collections::BTreeMap::new();
-        let mut next_idx: usize = 0;
-        let mut received: usize = 0;
-        while received < n_ranges {
-            let (idx, r) = rx.recv().map_err(|_| {
-                ConvertError::Other(
-                    "parallel streaming worker channel closed before all shards arrived".into(),
-                )
-            })?;
-            received += 1;
-            if next_to_spawn < n_ranges {
-                spawn_shard!(s, next_to_spawn);
-                next_to_spawn += 1;
-            }
-            let out = r?;
-            buffer.insert(idx, out);
-            while let Some(out) = buffer.remove(&next_idx) {
-                if out.duplicates_merged > 0 {
-                    sink.emit(ConvertWarning::DuplicateCoordinatesMerged {
-                        count: out.duplicates_merged,
-                        policy: "sum".to_string(),
-                    });
-                }
-                let bitmap = out.bitmap;
-                writer.write_preencoded_shard(out.pre)?;
-                if want_bitmap {
-                    match bitmap {
-                        None => { /* policy was Off — nothing to do */ }
-                        Some(BitmapBuildOutcome::Skip { reason }) => {
-                            sink.emit(ConvertWarning::BitmapSkipped {
-                                modality: None,
-                                reason,
-                            });
-                        }
-                        Some(BitmapBuildOutcome::Built(shard)) => {
-                            writer
-                                .write_bitmap_shard(&shard)
-                                .map_err(ConvertError::from)?;
-                        }
-                    }
-                }
-                next_idx += 1;
-            }
-        }
-        Ok(())
-    })?;
-
-    // Capture the in-flight peak into the calling thread's
-    // thread-local *before* releasing `_serial`, so tests reading
-    // `LAST_RUN_PEAK` after `h5ad_to_scx_streaming` returns see the
-    // peak from this run without interference from any subsequent
-    // parallel coordinator invocation. No-op in production.
+    // Slow-worker injection, captured on the calling thread like the two
+    // above. Makes one shard take long enough that every other shard
+    // completes behind it — the skew the reorder-buffer bound exists for.
     #[cfg(test)]
-    {
-        let peak = test_hooks::IN_FLIGHT_PEAK.load(std::sync::atomic::Ordering::SeqCst);
-        test_hooks::set_last_run_peak(peak);
-        drop(_serial);
-    }
+    let captured_delay_shard = test_hooks::current_ingest_delay_shard();
+
+    // The pool, the bounded channel, the rolling-window spawn, the reorder
+    // buffer and the panic-to-`Err` conversion all live in
+    // `crate::parallel_drain`, shared with the export coordinator in
+    // `h5ad/stream_write.rs`. What stays here is what is genuinely
+    // ingest-specific: encoding a shard, and the envelope its failures wear.
+    crate::parallel_drain::ordered_parallel_drain(
+        n_ranges,
+        reader_threads,
+        queue_depth,
+        "scx-stream",
+        |idx| -> Result<EncodedShardOutput, ConvertError> {
+            let (row_start, n_rows) = ranges[idx];
+            #[cfg(test)]
+            if Some(idx) == captured_fault_shard {
+                return Err(ConvertError::ShardRead {
+                    row_start,
+                    n_rows,
+                    source: source_name.clone(),
+                    inner: Box::new(ConvertError::Other(format!(
+                        "test_hooks: injected failure at shard {idx}"
+                    ))),
+                });
+            }
+            #[cfg(test)]
+            if Some(idx) == captured_panic_shard {
+                panic!("test_hooks: injected panic at shard {idx}");
+            }
+            #[cfg(test)]
+            if let Some((delay_idx, millis)) = captured_delay_shard {
+                if delay_idx == idx {
+                    std::thread::sleep(std::time::Duration::from_millis(millis));
+                }
+            }
+            encode_one_shard_worker(
+                reader,
+                row_start,
+                n_rows,
+                opts_codec,
+                index_dtype,
+                n_vars_u32,
+                section_type,
+                modality_type,
+                format!("{name_prefix}_{idx}"),
+                opts_bitmap,
+                want_bitmap,
+                opts_framing,
+            )
+            .map_err(|inner| ConvertError::ShardRead {
+                row_start,
+                n_rows,
+                source: source_name.clone(),
+                inner: Box::new(inner),
+            })
+        },
+        |idx, message| {
+            let (row_start, n_rows) = ranges[idx];
+            ConvertError::ShardRead {
+                row_start,
+                n_rows,
+                source: source_name.clone(),
+                inner: Box::new(ConvertError::Other(format!(
+                    "worker panicked while encoding shard {idx}: {message}"
+                ))),
+            }
+        },
+        |_idx, out| {
+            if out.duplicates_merged > 0 {
+                sink.emit(ConvertWarning::DuplicateCoordinatesMerged {
+                    count: out.duplicates_merged,
+                    policy: "sum".to_string(),
+                });
+            }
+            let bitmap = out.bitmap;
+            writer.write_preencoded_shard(out.pre)?;
+            if want_bitmap {
+                match bitmap {
+                    None => { /* policy was Off — nothing to do */ }
+                    Some(BitmapBuildOutcome::Skip { reason }) => {
+                        sink.emit(ConvertWarning::BitmapSkipped {
+                            modality: None,
+                            reason,
+                        });
+                    }
+                    Some(BitmapBuildOutcome::Built(shard)) => {
+                        writer
+                            .write_bitmap_shard(&shard)
+                            .map_err(ConvertError::from)?;
+                    }
+                }
+            }
+            Ok(())
+        },
+    )?;
 
     Ok((n_ranges as u32, row_ranges))
-}
-
-/// Extract a human-readable message from a `catch_unwind` panic
-/// payload. Mirrors the idiom in `pyscx/src/accel/pca.rs`: most
-/// panics carry a `String` or `&str`; anything else falls back to a
-/// placeholder. Shared by both parallel coordinators (ingest here and
-/// SCX → h5ad export in `h5ad::stream_write`).
-pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
-        .unwrap_or_else(|| "unknown panic payload".to_string())
 }
 
 /// Worker body: read + canonicalise + encode one shard and (if

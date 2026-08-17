@@ -393,7 +393,10 @@ reader supports indexed row-range reads, and libhdf5 is thread-safe
 2. Partitions the input into row ranges matching `shard_target_rows`.
 3. Fans shard read → sort → encode work out via `rayon::in_place_scope`,
    using a **rolling-window spawn** that caps outstanding shards at
-   `reader_threads + writer_queue_depth`.
+   `reader_threads + writer_queue_depth` — one replacement worker per
+   shard *written*, not per shard received. That distinction is the
+   bound: spawning on receive caps `spawned − received`, while the
+   reorder buffer holds `received − written`.
 4. A bounded `crossbeam` reorder buffer drains encoded shards in shard-index
    order on the calling thread, which performs sequential writes to the
    `ScxWriter`. Output is byte-identical to the sequential path.
@@ -425,6 +428,14 @@ exporter:
 3. No `H5is_library_threadsafe` probe is required — per-shard memory comes
    from exact `FullCatalogEntry::stats.nnz` and row range (no density
    heuristic). Same rolling-window spawn cap as ingest.
+
+Both directions are the same code: `scx-convert/src/parallel_drain.rs`'s
+`ordered_parallel_drain` owns the pool, the bounded channel, the reorder
+buffer, the spawn placement, the panic-to-`Err` conversion and the
+receiver-drop that releases parked workers. Each coordinator supplies only
+its worker body, its per-item error envelope, and its sink. The drain is
+generic over the item and error types and carries no `hdf5` gate, so its
+tests run in the default `cargo test --workspace` job.
 
 ```python
 # Python: parallel export

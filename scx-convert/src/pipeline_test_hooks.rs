@@ -1,29 +1,26 @@
-//! Test-only instrumentation for the parallel coordinator.
+//! Test-only fault, panic and delay injection for the two streaming
+//! coordinators' worker closures.
 //!
-//! `IN_FLIGHT_NOW` tracks worker tasks currently executing (one
-//! entry per running `encode_one_shard_worker`); `IN_FLIGHT_PEAK`
-//! is the running maximum across the most recent run. The
-//! coordinator acquires `SERIALIZE` for the duration of the
-//! parallel scope to ensure exactly one parallel coordinator run
-//! is in flight at a time across all tests in the binary, then
-//! captures `IN_FLIGHT_PEAK` into the calling thread's
-//! `LAST_RUN_PEAK` before releasing the lock. Tests read
-//! `LAST_RUN_PEAK` after the streaming call returns; the
-//! thread-local pin makes the read race-free without requiring
-//! tests themselves to hold the global lock.
+//! The counters that used to live here — in-flight workers, reorder-buffer
+//! occupancy, the run-serialisation mutex and the per-thread peak pins — moved
+//! to [`crate::parallel_drain::hooks`] when the two coordinators were unified:
+//! they measure the drain, not either coordinator, and the export direction was
+//! never instrumented at all. What is left is per-coordinator, because each
+//! switch is read inside that coordinator's own worker closure — the ingest
+//! ones before it calls `encode_one_shard_worker`, the export one before
+//! `read_shard_payload`.
+//!
+//! Every switch here is a thread-local rather than a global atomic, so a
+//! concurrently scheduled test on another thread never observes another test's
+//! configuration. The coordinator copies the value at entry on its calling
+//! thread and the worker closure reads the copy.
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
-
-pub static IN_FLIGHT_NOW: AtomicUsize = AtomicUsize::new(0);
-pub static IN_FLIGHT_PEAK: AtomicUsize = AtomicUsize::new(0);
-pub static SERIALIZE: Mutex<()> = Mutex::new(());
 
 thread_local! {
     /// Per-thread fault-injection switch read by the parallel
     /// ingest coordinator (`streaming_writer_coordinator_parallel`)
-    /// at entry. Workers fail synthetically on the configured shard
-    /// index instead of running the real shard worker. Used by the
+    /// at entry. Its worker closure returns a synthetic `Err` for the
+    /// configured shard index instead of encoding it. Used by the
     /// deadlock regression test to force a mid-stream worker failure
     /// without corrupting the source h5ad on disk.
     ///
@@ -49,10 +46,10 @@ pub fn current_ingest_fault_shard() -> Option<usize> {
 
 thread_local! {
     /// Per-thread panic-injection switch for the ingest coordinator.
-    /// Unlike [`FAIL_INGEST_SHARD_AT`] (which makes a worker *send* an
-    /// `Err`), this makes the worker `panic!` *before* its
-    /// `tx.send(...)` — exercising the `catch_unwind` guard that turns
-    /// a worker panic into a delivered error rather than a deadlock.
+    /// Unlike [`FAIL_INGEST_SHARD_AT`] (which makes the worker return an
+    /// `Err`), this makes it `panic!` — exercising the `catch_unwind` in
+    /// [`crate::parallel_drain::ordered_parallel_drain`] that turns a worker
+    /// panic into a delivered error rather than a lost send and a hung drain.
     /// Mutate only via [`PanicIngestShardGuard`].
     pub static PANIC_INGEST_SHARD_AT: Cell<Option<usize>> = const { Cell::new(None) };
 
@@ -140,34 +137,44 @@ impl Drop for FailIngestShardGuard {
 }
 
 thread_local! {
-    pub static LAST_RUN_PEAK: Cell<usize> = const { Cell::new(0) };
+    /// Per-thread ingest slow-worker switch: `(shard_idx, millis)`. The
+    /// worker for that shard sleeps before doing any real work.
+    ///
+    /// Load-bearing for the reorder-buffer bound test, not a convenience. At
+    /// 50 small shards over 4 threads the natural completion skew is well
+    /// under the `threads + queue_depth` cap, so a buffer-occupancy assertion
+    /// passes against an *unbounded* coordinator too — the same vacuum the
+    /// test it replaces had, in a new costume. Delaying shard 0 is what makes
+    /// every later shard pile up behind it, which is exactly the production
+    /// scenario (`--group-by --reference` makes shard 0 the deliberately
+    /// oversized reference shard).
+    ///
+    /// Mutate only via [`DelayIngestShardGuard`].
+    pub static DELAY_INGEST_SHARD_AT: Cell<Option<(usize, u64)>> = const { Cell::new(None) };
 }
 
-pub fn reset_in_flight() {
-    IN_FLIGHT_NOW.store(0, Ordering::SeqCst);
-    IN_FLIGHT_PEAK.store(0, Ordering::SeqCst);
+/// Read the current thread's ingest delay-injection setting.
+pub fn current_ingest_delay_shard() -> Option<(usize, u64)> {
+    DELAY_INGEST_SHARD_AT.with(|c| c.get())
 }
 
-pub fn last_run_peak() -> usize {
-    LAST_RUN_PEAK.with(|c| c.get())
+/// RAII guard arming the ingest delay injector for the current thread. Drop
+/// restores the previous value. Same thread-scoping rules as
+/// [`FailIngestShardGuard`].
+pub struct DelayIngestShardGuard {
+    prev: Option<(usize, u64)>,
 }
 
-pub fn set_last_run_peak(v: usize) {
-    LAST_RUN_PEAK.with(|c| c.set(v));
-}
-
-pub struct InFlightGuard;
-
-impl InFlightGuard {
-    pub fn new() -> Self {
-        let now = IN_FLIGHT_NOW.fetch_add(1, Ordering::SeqCst) + 1;
-        IN_FLIGHT_PEAK.fetch_max(now, Ordering::SeqCst);
-        Self
+impl DelayIngestShardGuard {
+    pub fn new(shard_idx: usize, millis: u64) -> Self {
+        let prev = DELAY_INGEST_SHARD_AT.with(|c| c.replace(Some((shard_idx, millis))));
+        Self { prev }
     }
 }
 
-impl Drop for InFlightGuard {
+impl Drop for DelayIngestShardGuard {
     fn drop(&mut self) {
-        IN_FLIGHT_NOW.fetch_sub(1, Ordering::SeqCst);
+        let prev = self.prev;
+        DELAY_INGEST_SHARD_AT.with(|c| c.set(prev));
     }
 }

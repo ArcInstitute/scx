@@ -20,7 +20,6 @@
 //   `uns`) reuse the non-streaming helpers in `write.rs`. Only
 //   `/X` and `/layers/{name}` change.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use hdf5::types::VarLenUnicode;
@@ -461,14 +460,17 @@ fn stream_csr_into_prealloc_sequential(
 }
 
 /// Phase 8d — parallel drain. Workers decode shards in a rayon pool;
-/// the calling thread drains the channel in shard-index order and
-/// performs the HDF5 hyperslab writes.
+/// the calling thread applies them in shard-index order and performs
+/// the HDF5 hyperslab writes.
 ///
-/// Bounded outstanding shards = `reader_threads + writer_queue_depth`
-/// via a rolling-window spawn (mirrors the ingest coordinator in
-/// `pipeline.rs::streaming_writer_coordinator_parallel`). This caps
-/// peak RSS at roughly that many decoded shards in flight, regardless
-/// of how slow shard 0 is relative to shard N.
+/// Outstanding shards are bounded at `reader_threads +
+/// writer_queue_depth`, so peak RSS is that many decoded shards
+/// regardless of how slow shard 0 is relative to shard N. It no longer
+/// *mirrors* the ingest coordinator — both now run on
+/// `crate::parallel_drain::ordered_parallel_drain`, which is where that
+/// bound and the panic / early-return contracts live. Mirroring is what let
+/// the two drift apart in the first place: ingest spawned its replacement
+/// worker per shard *received*, which bounds nothing the buffer holds.
 #[allow(clippy::too_many_arguments)]
 fn stream_csr_into_prealloc_parallel(
     datasets: TripletDatasets<'_>,
@@ -481,27 +483,10 @@ fn stream_csr_into_prealloc_parallel(
     reader_threads: usize,
     writer_queue_depth: usize,
 ) -> Result<(), ConvertError> {
-    use crossbeam_channel::bounded;
-    use rayon::ThreadPoolBuilder;
-
     if shards.is_empty() {
         return Ok(());
     }
 
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(reader_threads)
-        .thread_name(|i| format!("scx-export-{i}"))
-        .build()
-        .map_err(|e| {
-            ConvertError::Other(format!(
-                "failed to build rayon pool with {reader_threads} threads: {e}"
-            ))
-        })?;
-
-    let (tx, rx) = bounded::<(u32, Result<DecodedShard, ConvertError>)>(writer_queue_depth.max(1));
-
-    // Build the worker-task closure factory once; each spawned
-    // closure captures the next shard's index and row_start.
     let n_shards = shards.len();
     let shard_row_starts: Vec<u64> = shards
         .iter()
@@ -509,142 +494,80 @@ fn stream_csr_into_prealloc_parallel(
         .collect();
     let source_label = source_label_for(modality_id, section_type, layer_name, reader);
 
-    // Panic-injection switch for the deadlock regression test. Copied
-    // on the calling thread and propagated into workers via the
-    // `move` closure capture; `#[cfg(test)]`-gated, no production cost.
+    // Panic-injection switch for the deadlock regression test. Copied on the
+    // calling thread and read inside the worker closure; `#[cfg(test)]`-gated,
+    // no production cost.
     #[cfg(test)]
     let captured_panic_shard = crate::pipeline::test_hooks::current_export_panic_shard();
 
-    // Macro-style local spawn (mirrors `pipeline.rs:1325` in the
-    // ingest coordinator): extracting this as a closure runs afoul
-    // of rayon's invariant `'scope` lifetime — the nested closure
-    // would re-borrow `reader` / `shards` / `layer_name` shorter
-    // than `'scope`. Inlining the spawn body via a macro keeps the
-    // borrows on the scope's lifetime directly.
-    //
-    // `move` is load-bearing: it moves `rx` into the closure so that
-    // an early `return Err(...)` from the drain loop drops `rx` on
-    // unwind, unblocking workers parked in `tx.send(...)` on the
-    // bounded channel. Without `move` `rx` lives in the parent frame
-    // and the scope can never join those workers.
-    pool.in_place_scope(move |s| -> Result<(), ConvertError> {
-        macro_rules! spawn_shard {
-            ($scope:expr, $idx:expr) => {{
-                let idx_ = $idx;
-                let row_start = shard_row_starts[idx_];
-                let source = source_label.clone();
-                let entry = shards[idx_];
-                let tx = tx.clone();
-                $scope.spawn(move |_| {
-                    // `catch_unwind` converts a worker panic into a
-                    // delivered `Err` rather than a silent no-send,
-                    // which would strand the drain loop's `received`
-                    // counter below `n_shards` forever (deadlock). See
-                    // the ingest coordinator in `pipeline.rs` for the
-                    // full rationale; `AssertUnwindSafe` is sound
-                    // because the worker only reads via `reader` and
-                    // the HDF5 writer runs on the calling thread.
-                    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        #[cfg(test)]
-                        if Some(idx_) == captured_panic_shard {
-                            panic!("test_hooks: injected panic at shard {idx_}");
-                        }
-                        read_shard_payload(reader, modality_id, section_type, layer_name, idx_)
-                    }));
-                    let res = match decoded {
-                        Ok(Ok((indptr, indices, data))) => {
-                            let n_rows = indptr.len().saturating_sub(1) as u32;
-                            Ok(DecodedShard {
-                                shard_idx: idx_ as u32,
-                                shard_row_start: row_start as usize,
-                                n_rows,
-                                indptr,
-                                indices,
-                                data,
-                            })
-                        }
-                        Ok(Err(inner)) => {
-                            Err(wrap_shard_read_error(inner, row_start, entry, &source))
-                        }
-                        Err(payload) => Err(wrap_shard_read_error(
-                            ConvertError::Other(format!(
-                                "worker panicked while decoding shard {idx_}: {}",
-                                crate::pipeline::panic_message(payload)
-                            )),
-                            row_start,
-                            entry,
-                            &source,
-                        )),
-                    };
-                    let _ = tx.send((idx_ as u32, res));
-                });
-            }};
-        }
+    let mut nnz_offset: u64 = 0;
+    let mut row_offset_kept: u64 = 0;
 
-        // Rolling-window spawn: prime the pool with at most
-        // `reader_threads + writer_queue_depth` outstanding tasks,
-        // then spawn one per drained shard. Without this cap a slow
-        // shard 0 would let the BTreeMap accumulate all later
-        // shards (matches the ingest coordinator's invariant).
-        let outstanding_cap = reader_threads.saturating_add(writer_queue_depth);
-        let prime = outstanding_cap.min(n_shards);
-        let mut next_to_spawn: usize = 0;
-        for _ in 0..prime {
-            spawn_shard!(s, next_to_spawn);
-            next_to_spawn += 1;
-        }
-
-        // Drain in shard-index order. The main thread's `tx`
-        // keepalive stays alive across the loop — worker spawns
-        // continue to clone it. The `received < n_shards` counter
-        // terminates regardless of channel closure.
-        let mut buffer: BTreeMap<u32, DecodedShard> = BTreeMap::new();
-        let mut next_idx: u32 = 0;
-        let mut nnz_offset: u64 = 0;
-        let mut row_offset_kept: u64 = 0;
-        let mut received: usize = 0;
-
-        while received < n_shards {
-            let (idx, res) = rx.recv().map_err(|_| {
-                ConvertError::Other(
-                    "parallel export worker channel closed before all shards arrived".into(),
-                )
-            })?;
-            received += 1;
-            let out = res?;
-            buffer.insert(idx, out);
-            while let Some(shard) = buffer.remove(&next_idx) {
-                let DecodedShard {
-                    shard_row_start,
-                    indptr,
-                    indices,
-                    data,
-                    ..
-                } = shard;
-                write_one_shard_to_prealloc(
-                    &datasets,
-                    indptr,
-                    indices,
-                    data,
-                    keep_mask_opt,
-                    shard_row_start,
-                    &mut nnz_offset,
-                    &mut row_offset_kept,
-                )?;
-                next_idx += 1;
-                if next_to_spawn < n_shards {
-                    spawn_shard!(s, next_to_spawn);
-                    next_to_spawn += 1;
-                }
+    // Pool, bounded channel, rolling-window spawn, reorder buffer and the
+    // panic-to-`Err` conversion all live in `crate::parallel_drain`, shared
+    // with the ingest coordinator in `pipeline.rs`. Export keeps only what is
+    // its own: decoding a shard, and the envelope its failures wear.
+    crate::parallel_drain::ordered_parallel_drain(
+        n_shards,
+        reader_threads,
+        writer_queue_depth,
+        "scx-export",
+        |idx| -> Result<DecodedShard, ConvertError> {
+            #[cfg(test)]
+            if Some(idx) == captured_panic_shard {
+                panic!("test_hooks: injected panic at shard {idx}");
             }
-        }
-
-        // Drop our keepalive sender; the scope joins the spawned
-        // tasks before returning. Workers have already finished by
-        // construction (we counted `received == n_shards`).
-        drop(tx);
-        Ok(())
-    })?;
+            let row_start = shard_row_starts[idx];
+            match read_shard_payload(reader, modality_id, section_type, layer_name, idx) {
+                Ok((indptr, indices, data)) => {
+                    let n_rows = indptr.len().saturating_sub(1) as u32;
+                    Ok(DecodedShard {
+                        shard_idx: idx as u32,
+                        shard_row_start: row_start as usize,
+                        n_rows,
+                        indptr,
+                        indices,
+                        data,
+                    })
+                }
+                Err(inner) => Err(wrap_shard_read_error(
+                    inner,
+                    row_start,
+                    shards[idx],
+                    &source_label,
+                )),
+            }
+        },
+        |idx, message| {
+            wrap_shard_read_error(
+                ConvertError::Other(format!(
+                    "worker panicked while decoding shard {idx}: {message}"
+                )),
+                shard_row_starts[idx],
+                shards[idx],
+                &source_label,
+            )
+        },
+        |_idx, shard| {
+            let DecodedShard {
+                shard_row_start,
+                indptr,
+                indices,
+                data,
+                ..
+            } = shard;
+            write_one_shard_to_prealloc(
+                &datasets,
+                indptr,
+                indices,
+                data,
+                keep_mask_opt,
+                shard_row_start,
+                &mut nnz_offset,
+                &mut row_offset_kept,
+            )
+        },
+    )?;
 
     Ok(())
 }

@@ -222,6 +222,47 @@ cd rscx && Rscript -e 'testthat::test_dir("tests/testthat")' && cd ..
 | `scx-gpu` | Unit tests | CUDA decode, SpMM, GPU PCA/UMAP/preprocess |
 | `scx-integration-tests` | `tests/golden_files.rs` | Golden file regression (15 fixtures) |
 
+### The hdf5-gated suites are not in that run
+
+`cargo test --workspace` builds every member at its **default** features, and no
+workspace member enables `scx-convert/hdf5` by default — `scx-cli` declares
+`default = []`, and `pyscx` declares no `default` at all (its `hdf5` comes from
+`[tool.maturin] features`, which affects `maturin` and not `cargo test`). The
+h5ad / h5mu ingest, export and dataframe tests are
+`#[cfg(all(test, feature = "hdf5"))]`, so the line above runs none of them. They
+have their own CI job, `Test (hdf5 features)`:
+
+```bash
+cargo test -p scx-convert --features hdf5
+cargo test -p scx-cli --features hdf5 -- --test-threads=1
+```
+
+(The concurrency *invariants* of the shared parallel drain are a separate,
+feature-free matter — `scx-convert/src/parallel_drain_tests.rs` is deliberately
+ungated and does run in the default workspace job. What the hdf5 lane adds is the
+coordinators' end-to-end behaviour against real libhdf5.)
+
+**`--test-threads=1` on the `scx-cli` suite is required, not tuning.** Those
+tests build an h5ad with `hdf5::File::create` in the test process and then spawn
+the `scx` binary to open it; run in parallel, sibling tests' open files make
+libhdf5 refuse the child's `H5Fopen` with
+`unable to lock file, errno = 11`. Measured on ext4: 11–13 of the 18 tests in
+`convert_stream.rs` fail that way in parallel, and all 18 pass serialised — so
+this is cargo's parallel harness, **not** a network-filesystem quirk.
+`scx-convert`'s suite is unaffected (its tests spawn no child processes) and runs
+in parallel.
+
+`HDF5_USE_FILE_LOCKING=FALSE` also makes the suite pass, and is the convenient
+thing to do locally on a network filesystem (Weka / NFS / Lustre), where genuine
+lock failures are common. CI deliberately does **not** set it: on the one lane
+that exists to stop hiding things, disabling the lock would hide the next real
+locking failure too.
+
+`SCX_REQUIRE_HDF5_THREADSAFE=1` (set by that CI job) turns a libhdf5 built
+without `--enable-threadsafe` into a hard failure instead of letting the parallel
+coordinator's tests skip themselves — the same discipline as `SCX_REQUIRE_GPU`
+below.
+
 ### GPU test skip behavior
 
 A GPU test that cannot run is **ignored**, never passed. Each one carries
@@ -277,7 +318,10 @@ combinations that are not covered by the default workspace build:
 `scx-gpu` is deliberately included in `default-members` because `cudarc`
 compiles without CUDA installed. This ensures that:
 - `cargo build --workspace --exclude rscx` works on any machine with a Rust toolchain
-- `cargo test --workspace --exclude rscx` runs all non-GPU tests everywhere
+- `cargo test --workspace --exclude rscx` runs every non-GPU test that is
+  reachable at **default** features — which excludes the hdf5-gated
+  `scx-convert` / `scx-cli` suites; see [The hdf5-gated suites are not in that
+  run](#the-hdf5-gated-suites-are-not-in-that-run)
 - GPU tests are `#[ignore]`d, so they are counted and named as ignored rather
   than reported as passes that did nothing; `scx-gpu/tests/gpu_test_gating.rs`
   fails the build if a GPU test drops either half of that contract
@@ -395,7 +439,8 @@ to `main`:
 | Job | What it does |
 |-----|-------------|
 | `build-cpu-only` | `cargo build --workspace --exclude rscx` — pins the CPU-only build contract |
-| `test` | `cargo test --workspace --exclude rscx` |
+| `test` | `cargo test --workspace --exclude rscx` — default features only |
+| `test-hdf5` | `cargo test -p scx-convert --features hdf5` + `-p scx-cli --features hdf5` — the h5ad/h5mu suites the `test` job cannot reach |
 | `clippy` | `cargo clippy --workspace --exclude rscx --all-targets -- -D warnings` — `--all-targets` lints test and bench code too |
 | `fmt` | `cargo fmt --check` |
 | `feature-check` | Matrix of `cargo check`/`clippy --all-targets` for feature combos (cloud, hdf5, gpu) |
