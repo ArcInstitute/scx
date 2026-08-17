@@ -8,8 +8,9 @@
 //! export).
 //!
 //! It was written twice, and the two copies had already diverged on the one line
-//! that decides whether the reorder buffer is bounded (review §11.2). This module
-//! is that line, once.
+//! that decides whether the reorder buffer is bounded — ingest spawned its
+//! replacement worker per item *received*, export per item *applied*, and only
+//! the second bounds anything. This module is that line, once.
 //!
 //! # Invariants this owns, so a caller cannot re-lose them
 //!
@@ -211,8 +212,9 @@ where
 /// `IN_FLIGHT_PEAK` counts worker bodies executing concurrently — rayon bounds
 /// that by the pool size on its own, so it is a liveness signal, not a bound on
 /// anything the drain decides. `BUFFER_LEN_PEAK` is the reorder buffer's
-/// occupancy, which is the quantity review §11.2 is about. Confusing the two is
-/// what made the original regression test unable to fail.
+/// occupancy, which is the quantity the rolling window exists to bound.
+/// Confusing the two is what made the original regression test unable to fail:
+/// it asserted `4 <= 6` on a counter rayon pins at the pool size.
 #[cfg(test)]
 pub(crate) mod hooks {
     use std::cell::Cell;

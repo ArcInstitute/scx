@@ -335,8 +335,8 @@ fn dense_parallel_with_memory_budget_byte_identical() {
     assert_eq!(csr_a.data, csr_b.data);
 }
 
-/// Review §11.2: the ingest reorder buffer is what the rolling window is
-/// supposed to bound, and it is what this test measures.
+/// The ingest reorder buffer is what the rolling window is supposed to bound,
+/// and it is what this test measures.
 ///
 /// The `BTreeMap` holds shards that have been *received* but not yet
 /// *written*. Spawning a replacement worker on receive bounds
@@ -409,7 +409,7 @@ fn parallel_reorder_buffer_bounded_by_window() {
         "reorder-buffer peak {buffer_peak}, expected exactly the rolling-window \
          cap {cap}. Above: a replacement worker is being spawned per shard \
          *received* rather than per shard *applied*, so `received - written` is \
-         unbounded (review §11.2). Below: the delay hook did not fire, the \
+         unbounded. Below: the delay hook did not fire, the \
          buffer was never pushed to the window, and this test proves nothing."
     );
 
@@ -1132,9 +1132,15 @@ fn parallel_ingest_worker_panic_does_not_deadlock() {
 }
 
 /// Symmetric regression test for the export coordinator
-/// (`stream_csr_into_prealloc_parallel`): a worker that panics before
-/// `tx.send(...)` must not deadlock the SCX → h5ad drain loop. Same
-/// `catch_unwind` fix, forced via the `PanicExportShardGuard` hook.
+/// (`stream_csr_into_prealloc_parallel`): a worker that panics must not
+/// deadlock the SCX → h5ad drain loop. Forced via the
+/// `PanicExportShardGuard` hook, which panics in the coordinator's worker
+/// closure; the `catch_unwind` that converts it into a delivered `Err` lives
+/// in `parallel_drain::ordered_parallel_drain`, shared with ingest.
+///
+/// Its libhdf5-free twin is the drain's own
+/// `a_panicking_worker_returns_an_error_instead_of_deadlocking`; this one
+/// additionally pins that the export coordinator routes through the drain.
 #[test]
 fn parallel_export_worker_panic_does_not_deadlock() {
     use super::pipeline::{scx_to_h5ad_streaming, test_hooks};

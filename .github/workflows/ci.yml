@@ -79,8 +79,9 @@ jobs:
   # it. So before this job existed, ~210 `#[test]`s in
   # `scx-convert/src/convert_tests_*.rs` plus every hdf5-gated `scx-cli`
   # integration test were built by CI and executed by nothing — which is how two
-  # Criticals (review §11.1 categorical vocabulary, §11.2 unbounded reorder
-  # buffer) shipped with regression tests that could not fail.
+  # Criticals — the streaming h5ad exporter's categorical vocabulary, and the
+  # unbounded ingest reorder buffer this PR fixes — shipped with regression
+  # tests that could not fail.
   test-hdf5:
     name: Test (hdf5 features)
     runs-on: ubuntu-latest

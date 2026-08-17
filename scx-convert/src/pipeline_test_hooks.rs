@@ -1,11 +1,14 @@
-//! Test-only fault, panic and delay injection for the *ingest* coordinator.
+//! Test-only fault, panic and delay injection for the two streaming
+//! coordinators' worker closures.
 //!
 //! The counters that used to live here — in-flight workers, reorder-buffer
 //! occupancy, the run-serialisation mutex and the per-thread peak pins — moved
 //! to [`crate::parallel_drain::hooks`] when the two coordinators were unified:
-//! they measure the drain, not the ingest path, and the export direction was
-//! never instrumented at all. What is left is genuinely ingest-specific,
-//! because it is injected into `encode_one_shard_worker`.
+//! they measure the drain, not either coordinator, and the export direction was
+//! never instrumented at all. What is left is per-coordinator, because each
+//! switch is read inside that coordinator's own worker closure — the ingest
+//! ones before it calls `encode_one_shard_worker`, the export one before
+//! `read_shard_payload`.
 //!
 //! Every switch here is a thread-local rather than a global atomic, so a
 //! concurrently scheduled test on another thread never observes another test's
@@ -16,8 +19,8 @@ use std::cell::Cell;
 thread_local! {
     /// Per-thread fault-injection switch read by the parallel
     /// ingest coordinator (`streaming_writer_coordinator_parallel`)
-    /// at entry. Workers fail synthetically on the configured shard
-    /// index instead of running the real shard worker. Used by the
+    /// at entry. Its worker closure returns a synthetic `Err` for the
+    /// configured shard index instead of encoding it. Used by the
     /// deadlock regression test to force a mid-stream worker failure
     /// without corrupting the source h5ad on disk.
     ///
@@ -43,10 +46,10 @@ pub fn current_ingest_fault_shard() -> Option<usize> {
 
 thread_local! {
     /// Per-thread panic-injection switch for the ingest coordinator.
-    /// Unlike [`FAIL_INGEST_SHARD_AT`] (which makes a worker *send* an
-    /// `Err`), this makes the worker `panic!` *before* its
-    /// `tx.send(...)` — exercising the `catch_unwind` guard that turns
-    /// a worker panic into a delivered error rather than a deadlock.
+    /// Unlike [`FAIL_INGEST_SHARD_AT`] (which makes the worker return an
+    /// `Err`), this makes it `panic!` — exercising the `catch_unwind` in
+    /// [`crate::parallel_drain::ordered_parallel_drain`] that turns a worker
+    /// panic into a delivered error rather than a lost send and a hung drain.
     /// Mutate only via [`PanicIngestShardGuard`].
     pub static PANIC_INGEST_SHARD_AT: Cell<Option<usize>> = const { Cell::new(None) };
 

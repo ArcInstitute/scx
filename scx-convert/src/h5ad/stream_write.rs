@@ -466,10 +466,11 @@ fn stream_csr_into_prealloc_sequential(
 /// Outstanding shards are bounded at `reader_threads +
 /// writer_queue_depth`, so peak RSS is that many decoded shards
 /// regardless of how slow shard 0 is relative to shard N. It no longer
-/// *mirrors* the ingest coordinator — since ORG-11.16-2 both run on
+/// *mirrors* the ingest coordinator — both now run on
 /// `crate::parallel_drain::ordered_parallel_drain`, which is where that
-/// bound and the panic / early-return contracts live. Mirroring is what
-/// let the two drift apart in the first place (review §11.2).
+/// bound and the panic / early-return contracts live. Mirroring is what let
+/// the two drift apart in the first place: ingest spawned its replacement
+/// worker per shard *received*, which bounds nothing the buffer holds.
 #[allow(clippy::too_many_arguments)]
 fn stream_csr_into_prealloc_parallel(
     datasets: TripletDatasets<'_>,
