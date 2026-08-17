@@ -304,8 +304,15 @@ pub fn run_build_csc(
     // unchanged.
     rewrite_helpers::copy_auxiliary_sections(&reader, &mut writer, "build-csc", &params_json)?;
 
-    // 15. Finalize
+    // 15. Finalize, then check the output against the declared carry policy.
+    //     After `finish()` rather than before: it consumes the writer, and the
+    //     artifact is what we want to check, not the writer's intent.
     writer.finish()?;
+    crate::carry::audit_output(
+        crate::carry::RewriteOp::BuildCsc,
+        &[reader.catalog()],
+        output,
+    )?;
     pb.finish_and_clear();
 
     println!(

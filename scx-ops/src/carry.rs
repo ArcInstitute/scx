@@ -235,6 +235,21 @@ pub enum Carry {
     /// `scx-cli/tests/cli_ops_integration.rs`
     /// (`test_build_csc_preserves_predicate_index_sections_but_not_pushdown`).
     Rebuilt,
+    /// Carried or dropped depending on something decided at run time, so
+    /// neither presence nor absence can be asserted.
+    ///
+    /// Distinct from [`Carry::Rebuilt`] on purpose. `Rebuilt` means "the output's
+    /// copy is derived from the output"; `Conditional` means "the op looked at
+    /// this run and chose". Collapsing them would hide a real difference behind
+    /// the same non-assertion — `on` records the actual condition, so a reader
+    /// of the table learns which runs keep it.
+    ///
+    /// Introduced because the first table said `upgrade` drops the CSC sidecar
+    /// and the audit immediately disagreed: `upgrade` re-emits CSC **unless**
+    /// canonicalising actually changed the matrix, in which case the old sidecar
+    /// would be a second view that disagrees with the first, and it is dropped
+    /// with a warning.
+    Conditional { on: &'static str },
     /// Deliberately not carried. Must be **absent** from the output.
     ///
     /// `warns` records whether the op tells the user *today*. It is part of the
@@ -257,6 +272,7 @@ impl Carry {
             Self::RowFiltered => "row-filtered",
             Self::Remapped => "remapped",
             Self::Rebuilt => "rebuilt",
+            Self::Conditional { .. } => "conditional",
             Self::Dropped { warns: true, .. } => "dropped(warns)",
             Self::Dropped { warns: false, .. } => "dropped(SILENT)",
             Self::Refuse => "refuse",
@@ -571,9 +587,15 @@ fn build_csc(family: SectionFamily) -> Carry {
 fn upgrade(family: SectionFamily) -> Carry {
     use SectionFamily as F;
     match family {
-        F::XCsc => Carry::Dropped {
-            why: "upgrade emits no column-major sidecar (rebuild: scx build-csc)",
-            warns: true,
+        // Re-emitted from the input's own CSC shards — but only when
+        // canonicalising left the CSR matrix alone. If it summed a duplicate
+        // coordinate or dropped an explicit zero, the sidecar built against the
+        // old matrix is no longer a faithful second view of it, and carrying it
+        // forward would leave the file holding two matrices that disagree,
+        // under a `csc_build_generation` fresh enough to bless the stale one.
+        // Dropped with a warning in exactly that case, and only that case.
+        F::XCsc => Carry::Conditional {
+            on: "carried unless canonicalisation changed the CSR matrix",
         },
         other => build_csc(other),
     }
@@ -687,6 +709,26 @@ pub fn audit(
     dropped.sort();
     carried.sort();
     Ok(CarryReport { dropped, carried })
+}
+
+/// [`audit`] against a finished file on disk.
+///
+/// The ops call this **after** `ScxWriter::finish()`, not before. `finish()`
+/// consumes the writer and its catalog is private, so auditing earlier would
+/// mean widening `scx-format-io`'s public API — and it would check the writer's
+/// intent rather than the artifact. Reopening costs one catalog parse per op
+/// invocation, which is not on any per-row or per-shard path.
+///
+/// Callers that rename the output over the input (`build-csc`, `optimize
+/// --output == input`) must have captured their input catalogs before writing;
+/// all of them do, since every one opens its reader first.
+pub fn audit_output(
+    op: RewriteOp,
+    inputs: &[&FullCatalog],
+    output_path: &std::path::Path,
+) -> OpsResult<CarryReport> {
+    let out = scx_format_io::ScxReader::open(output_path)?;
+    audit(op, inputs, out.catalog(), out.header().n_obs)
 }
 
 /// Render the whole table as text, one line per (op, family) with a non-default

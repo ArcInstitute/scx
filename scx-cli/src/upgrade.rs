@@ -287,6 +287,15 @@ fn rewrite_with_current_version(
     scx_ops::copy_auxiliary_sections_canonicalizing(reader, &mut writer, "upgrade", "{}", true)?;
 
     writer.finish()?;
+    // `upgrade` is the one op in the carry table whose call site lives outside
+    // `scx-ops`, so the audit is wired here rather than inside the shared helper
+    // above — which cannot see the finished output, and is shared with
+    // `build-csc`, whose policy differs on the CSC sidecar.
+    scx_ops::carry::audit_output(
+        scx_ops::carry::RewriteOp::Upgrade,
+        &[reader.catalog()],
+        output,
+    )?;
     Ok(())
 }
 

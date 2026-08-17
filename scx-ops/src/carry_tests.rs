@@ -185,7 +185,7 @@ upgrade
   obs                          verbatim
   var                          verbatim
   X                            verbatim
-  X CSC sidecar                dropped(warns)
+  X CSC sidecar                conditional
   layers                       verbatim
   layer CSC sidecars           dropped(warns)
   obsm                         verbatim
@@ -216,11 +216,13 @@ upgrade
 fn upgrade_matches_build_csc_except_the_csc_sidecar() {
     for &f in SectionFamily::ALL {
         if f == SectionFamily::XCsc {
-            assert_ne!(
+            // build-csc *creates* the sidecar; upgrade re-emits the input's,
+            // and only when canonicalising did not change the matrix under it.
+            assert_eq!(policy(RewriteOp::BuildCsc, f), Carry::Rebuilt);
+            assert!(matches!(
                 policy(RewriteOp::Upgrade, f),
-                policy(RewriteOp::BuildCsc, f),
-                "upgrade emits no CSC sidecar; build-csc's whole purpose is to"
-            );
+                Carry::Conditional { .. }
+            ));
             continue;
         }
         assert_eq!(
