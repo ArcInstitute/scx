@@ -120,6 +120,19 @@ pub enum OpsError {
     )]
     MultimodalUnsupported { op: &'static str },
 
+    /// The output disagrees with what [`crate::carry::policy`] says the op does
+    /// with a section family.
+    ///
+    /// Fails closed rather than warning: by the time this fires the file has
+    /// already been written, and the only useful moment to say a section went
+    /// missing is before the caller believes the op succeeded.
+    #[error("{op}: section-carry policy violated for {family}: {detail}")]
+    SectionCarryViolation {
+        op: &'static str,
+        family: &'static str,
+        detail: String,
+    },
+
     #[error(transparent)]
     Arrow(#[from] arrow::error::ArrowError),
 }
