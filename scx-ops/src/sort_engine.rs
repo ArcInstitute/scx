@@ -1026,6 +1026,7 @@ pub fn sort_with_strategy(
     ));
     writer.write_provenance(prov)?;
 
+    crate::carry::audit_staged(crate::carry::RewriteOp::Sort, &[reader.catalog()], &writer)?;
     writer.finish()?;
 
     Ok(SortSummary {
@@ -1271,6 +1272,7 @@ fn sort_multimodal(
         opts.shuffle,
     ));
     writer.write_provenance(prov)?;
+    crate::carry::audit_staged(crate::carry::RewriteOp::Sort, &[reader.catalog()], &writer)?;
     writer.finish()?;
 
     Ok(SortSummary {

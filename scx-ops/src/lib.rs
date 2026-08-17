@@ -1,5 +1,6 @@
 pub mod append;
 pub mod build_csc;
+pub mod carry;
 pub mod checksum;
 pub mod codec_intent;
 pub mod compact;

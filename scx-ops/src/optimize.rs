@@ -382,6 +382,11 @@ pub fn optimize_with_framing(
     append_provenance(&reader, &mut writer, "optimize", &params)
         .map_err(|e| OpsError::InvalidInput(format!("append provenance: {e}")))?;
 
+    crate::carry::audit_staged(
+        crate::carry::RewriteOp::Optimize,
+        &[reader.catalog()],
+        &writer,
+    )?;
     writer.finish()?;
     Ok(stats)
 }

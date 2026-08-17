@@ -592,6 +592,11 @@ pub fn compact_with_options(
     });
     writer.write_provenance(prov_entries)?;
 
+    crate::carry::audit_staged(
+        crate::carry::RewriteOp::Compact,
+        &[reader.catalog()],
+        &writer,
+    )?;
     writer.finish()?;
     Ok(PredicateIndexBuildSummary {
         result: index_result,
@@ -1574,6 +1579,11 @@ fn compact_multimodal(
         input_checksums: vec![],
     });
     writer.write_provenance(prov_entries)?;
+    crate::carry::audit_staged(
+        crate::carry::RewriteOp::Compact,
+        &[reader.catalog()],
+        &writer,
+    )?;
     writer.finish()?;
     Ok(())
 }

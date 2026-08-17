@@ -304,7 +304,16 @@ pub fn run_build_csc(
     // unchanged.
     rewrite_helpers::copy_auxiliary_sections(&reader, &mut writer, "build-csc", &params_json)?;
 
-    // 15. Finalize
+    // 15. Check the staged catalog against the declared carry policy, then
+    //     finalize. Before `finish()`, not after: `finish()` renames over the
+    //     target, and `scx build-csc` with no `<OUTPUT>` makes that target the
+    //     input — so an audit afterwards could only report a loss it was too
+    //     late to stop.
+    crate::carry::audit_staged(
+        crate::carry::RewriteOp::BuildCsc,
+        &[reader.catalog()],
+        &writer,
+    )?;
     writer.finish()?;
     pb.finish_and_clear();
 

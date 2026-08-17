@@ -120,6 +120,22 @@ pub enum OpsError {
     )]
     MultimodalUnsupported { op: &'static str },
 
+    /// The output disagrees with what [`crate::carry::policy`] says the op does
+    /// with a section family.
+    ///
+    /// Raised **before** the output is persisted (`carry::audit_staged` runs
+    /// ahead of `ScxWriter::finish`), so on the in-place forms of `optimize`,
+    /// `build-csc` and `upgrade` the original file is still intact when this
+    /// surfaces — the staged tempfile is dropped instead of being renamed over
+    /// it. An earlier version of this doc said the opposite, which was true of
+    /// the first implementation and is exactly what moving the check fixed.
+    #[error("{op}: section-carry policy violated for {family}: {detail}")]
+    SectionCarryViolation {
+        op: &'static str,
+        family: &'static str,
+        detail: String,
+    },
+
     #[error(transparent)]
     Arrow(#[from] arrow::error::ArrowError),
 }

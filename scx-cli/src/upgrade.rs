@@ -286,6 +286,17 @@ fn rewrite_with_current_version(
     // `--in-place` renames over the target with no prior catalog to roll back to.
     scx_ops::copy_auxiliary_sections_canonicalizing(reader, &mut writer, "upgrade", "{}", true)?;
 
+    // `upgrade` is the one op in the carry table whose call site lives outside
+    // `scx-ops`, so the audit is wired here rather than inside the shared helper
+    // above — which is also shared with `build-csc`, whose policy differs on the
+    // CSC sidecar. Before `finish()`, so a violation drops the staged tempfile
+    // instead of reporting a loss the `--in-place` rename has already made
+    // permanent.
+    scx_ops::carry::audit_staged(
+        scx_ops::carry::RewriteOp::Upgrade,
+        &[reader.catalog()],
+        &writer,
+    )?;
     writer.finish()?;
     Ok(())
 }
