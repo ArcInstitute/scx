@@ -327,13 +327,13 @@ fn merge_carries_the_graph_it_used_to_drop() {
         "both inputs' edges must survive, not just input 0's"
     );
 
-    // The deleted rows are gone from the obs axis, so the offset for input 1 is
-    // the merged file's own row count for input 0's block, not `N_OBS`.
-    let offset = *rows.iter().max().unwrap() as usize;
-    assert!(
-        offset > 0,
-        "input 1's edges must be rebased off zero, or the two blocks alias"
-    );
+    // `merge` *carries* deletion vectors rather than applying them (`compact`
+    // is the op that materialises a delete), so every physical row survives and
+    // input 1's offset is exactly `N_OBS`. Asserted exactly rather than as
+    // "some offset > 0": an off-by-one rebase produces a graph that is present,
+    // well-formed, and wrong, and only the exact value catches it.
+    assert_eq!(reader.header().n_obs, 2 * common::N_OBS as u64);
+    let mut by_block = [0usize, 0usize];
     for (&r, &c) in rows.iter().zip(cols.iter()) {
         assert!(
             (r as u64) < reader.header().n_obs && (c as u64) < reader.header().n_obs,
@@ -341,7 +341,19 @@ fn merge_carries_the_graph_it_used_to_drop() {
              (got row={r}, col={c}, n_obs={})",
             reader.header().n_obs
         );
+        by_block[(r as usize) / common::N_OBS] += 1;
     }
+    assert_eq!(
+        by_block,
+        [common::N_OBS, common::N_OBS],
+        "each input must contribute its edges to its own half of the merged axis"
+    );
+    // And the second block really is offset, rather than a second copy of the
+    // first: input 1's rows all start at N_OBS.
+    assert_eq!(
+        rows.iter().filter(|&&r| r >= common::N_OBS as i64).count(),
+        common::N_OBS
+    );
 }
 
 /// §6.3, from the user's side: `build-csc` no longer loses what `optimize`
