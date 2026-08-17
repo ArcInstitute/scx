@@ -556,3 +556,114 @@ pub fn fixture_multimodal_per_modality_obsp(dir: &Path, name: &str) -> PathBuf {
     writer.finish().unwrap();
     path
 }
+
+/// A multimodal file carrying pairwise graphs at **both** scopes.
+///
+/// `fixture_multimodal_per_modality_obsp` deliberately has only the
+/// modality-scoped one, so it cannot distinguish "the global carry ran" from
+/// "nothing ran". This one can: the file-scope graph must survive a merge and
+/// the modality-scoped one must not, in the same output.
+///
+/// That pair is the whole reason `SectionScope` exists. A file with one of each
+/// is also the case where a scope-blind audit is *most* wrong — the surviving
+/// global copy vouches for the lost per-modality one and the loss goes
+/// unremarked.
+pub fn fixture_multimodal_both_obsp_scopes(dir: &Path, name: &str) -> PathBuf {
+    const RNA_VARS: usize = 8;
+    const ADT_VARS: usize = 4;
+    let path = dir.join(name);
+    let mut writer = ScxWriter::new(
+        &path,
+        FileHeader::new_single_modality(N_OBS as u64, RNA_VARS as u64, 0, SHARD_ROWS as u32, 0, 0),
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch()).unwrap();
+
+    // File scope, before any modality is registered — obs is shared across
+    // modalities, so an obs x obs graph over it is well defined.
+    writer
+        .write_obsp("global_connectivities", &coo_batch(N_OBS))
+        .unwrap();
+
+    let ids: Vec<(u8, usize)> = [
+        ("rna", ModalityType::Rna, RNA_VARS),
+        ("adt", ModalityType::Protein, ADT_VARS),
+    ]
+    .into_iter()
+    .map(|(name, ty, n_vars)| {
+        let id = writer
+            .add_modality(name, ty, CodecId::None, ValueEncoding::Uint8, false)
+            .unwrap();
+        writer.write_var_for(id, &var_batch(n_vars, name)).unwrap();
+        writer.set_modality_n_vars(id, n_vars as u64).unwrap();
+        (id, n_vars)
+    })
+    .collect();
+
+    for &(id, n_vars) in &ids {
+        let (indptr, indices, values) = csr_rows(0, N_OBS, n_vars, 1);
+        writer
+            .write_csr_shard_for(
+                id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+    }
+
+    let rna_id = ids[0].0;
+    writer
+        .with_modality::<_, (), scx_format_io::ScxError>(rna_id, |w| {
+            w.write_obsp("rna_connectivities", &coo_batch(N_OBS))?;
+            Ok(())
+        })
+        .unwrap();
+
+    writer.finish().unwrap();
+    path
+}
+
+/// A file whose `obsm` is **row-sharded**, so a rewrite has something to
+/// collapse.
+///
+/// `fixture_all_families` writes obsm as one legacy section, which cannot tell
+/// "the layout was preserved" from "the layout was rebuilt into one section".
+pub fn fixture_with_sharded_obsm(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let mut writer = ScxWriter::new(
+        &path,
+        FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, SHARD_ROWS as u32, 0, 0),
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch()).unwrap();
+    writer.write_var(&var_batch(N_VARS, "gene")).unwrap();
+    for row_start in (0..N_OBS).step_by(SHARD_ROWS) {
+        let (indptr, indices, values) = csr_rows(row_start, SHARD_ROWS, N_VARS, 1);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+        writer
+            .write_obsm_shard(
+                "X_pca",
+                (row_start / SHARD_ROWS) as u32,
+                row_start as u64,
+                SHARD_ROWS as u64,
+                N_OBS as u64,
+                &dense_embedding(SHARD_ROWS),
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}

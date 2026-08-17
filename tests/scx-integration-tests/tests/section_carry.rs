@@ -44,7 +44,8 @@ use scx_ops::carry::{family, policy, Carry, RewriteOp, SectionFamily};
 
 use common::{
     fixture_all_families, fixture_all_families_with_extra_obsm, fixture_all_families_without_varm,
-    fixture_multimodal_per_modality_obsp, fixture_with_csr_obsp, fixture_with_explicit_zero_in_x,
+    fixture_multimodal_both_obsp_scopes, fixture_multimodal_per_modality_obsp,
+    fixture_with_csr_obsp, fixture_with_explicit_zero_in_x, fixture_with_sharded_obsm,
 };
 
 /// The `(row, col)` endpoints of a COO pairwise batch, widened to `i64`.
@@ -631,6 +632,118 @@ fn merge_drops_per_modality_pairwise() {
         !families_of(&out).contains(&SectionFamily::Obsp),
         "and it really is dropped — merge has no per-modality pairwise reader, \
          so the per-modality cell is a declared drop, not the global Remapped"
+    );
+}
+
+/// Both scopes at once, which is the only input that can tell the two apart.
+///
+/// `merge_drops_per_modality_pairwise` above uses a fixture whose *only* graph
+/// is modality-scoped, so it cannot distinguish "the per-modality drop is
+/// correct" from "merge carries no obsp on a multimodal file at all" — and
+/// nothing else exercised the multimodal path's *global* obsp carry, which
+/// `merge_obsp_only` exists for.
+///
+/// It is also the case where a scope-blind audit is most wrong: the surviving
+/// global copy keeps the family "present" and vouches for the lost
+/// modality-scoped one, so the loss passes unremarked. That is the second half
+/// of the finding Phase 5a's review round 2 made.
+#[test]
+fn merge_keeps_the_global_graph_and_drops_the_modality_scoped_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = fixture_multimodal_both_obsp_scopes(dir.path(), "a.scx");
+    let b = fixture_multimodal_both_obsp_scopes(dir.path(), "b.scx");
+
+    let scoped_keys = |p: &Path| -> (BTreeSet<String>, BTreeSet<String>) {
+        let reader = ScxReader::open(p).unwrap();
+        let mut global = BTreeSet::new();
+        let mut per_modality = BTreeSet::new();
+        for e in &reader.catalog().entries {
+            if family(e.section_type) != SectionFamily::Obsp {
+                continue;
+            }
+            let target = if e.modality_id == 0 {
+                &mut global
+            } else {
+                &mut per_modality
+            };
+            target.insert(e.name.clone());
+        }
+        (global, per_modality)
+    };
+
+    let (in_global, in_scoped) = scoped_keys(&a);
+    assert_eq!(in_global.len(), 1, "premise: one file-scope graph");
+    assert_eq!(in_scoped.len(), 1, "premise: and one modality-scoped graph");
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge::merge(&[&a, &b], &out).unwrap();
+
+    let (out_global, out_scoped) = scoped_keys(&out);
+    assert!(
+        !out_global.is_empty(),
+        "the file-scope graph must survive a multimodal merge — obs is shared \
+         across modalities, so it is well defined and rebased like everything \
+         else on that axis"
+    );
+    assert!(
+        out_scoped.is_empty(),
+        "and the modality-scoped one must not: there is no per-modality pairwise \
+         reader to round-trip it through (got {out_scoped:?})"
+    );
+}
+
+/// A row-sharded `obsm` must come out of `build-csc` still sharded.
+///
+/// Not part of §6.3, and not something this PR set out to change. The old
+/// `copy_obsm` went `read_all_obsm()` → `write_obsm(name, batch)`, and
+/// `read_all_obsm` *assembles* shards — so `build-csc` on an atlas with sharded
+/// `obsm` silently rebuilt it as one legacy `ObsmEmbedding` section. That is the
+/// `obsm` twin of review §4.5, which was about `obs` and was fixed by
+/// `copy_obs_var_preserving_layout`. Moving `obsm` onto the same verbatim copy
+/// as the rest of the dense mappings fixes it; this pins the fix, since nothing
+/// else in the suite would notice it regressing.
+#[test]
+fn build_csc_keeps_obsm_sharded() {
+    use scx_format_io::SectionType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = fixture_with_sharded_obsm(dir.path(), "sharded_obsm.scx");
+    let count = |p: &Path, ty: SectionType| {
+        ScxReader::open(p)
+            .unwrap()
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == ty)
+            .count()
+    };
+    assert_eq!(
+        count(&input, SectionType::ObsmEmbeddingShard),
+        2,
+        "premise: the fixture's obsm must actually be sharded"
+    );
+
+    let output = dir.path().join("with_csc.scx");
+    scx_ops::run_build_csc(&input, &output, "1G", false, 1024, None).unwrap();
+
+    assert_eq!(
+        count(&output, SectionType::ObsmEmbeddingShard),
+        2,
+        "build-csc must preserve the sharded obsm layout, not collapse it"
+    );
+    assert_eq!(
+        count(&output, SectionType::ObsmEmbedding),
+        0,
+        "and must not have rebuilt it as one legacy section"
+    );
+    // The values still round-trip through the assembling reader.
+    assert_eq!(
+        ScxReader::open(&output)
+            .unwrap()
+            .read_obsm("X_pca")
+            .unwrap()
+            .num_rows(),
+        common::N_OBS
     );
 }
 
