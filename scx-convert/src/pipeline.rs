@@ -2213,11 +2213,16 @@ fn streaming_writer_coordinator_parallel(
     let name_prefix = section_name_prefix.to_string();
 
     // Cap outstanding shards (encoding + in channel + in BTreeMap) at
-    // `reader_threads + queue_depth`. Rolling-window spawn: prime the
-    // pool with `in_flight_cap` tasks, then spawn one new task each
-    // time a shard is received. This bounds the reorder buffer; the
-    // previous up-front spawn loop let the BTreeMap grow to ~n_ranges
-    // when shard 0 was slow (Gemini code review feedback).
+    // `reader_threads + queue_depth`. Rolling-window spawn: prime the pool
+    // with `in_flight_cap` tasks, then spawn one new task each time a shard
+    // is *written*.
+    //
+    // Spawning on write rather than on receive is the whole bound (review
+    // §11.2). Spawning on receive caps `spawned - received`, which is not
+    // the quantity that costs memory: the BTreeMap holds `received -
+    // written`, and with a slow shard 0 every completion spawned another
+    // worker, so the map grew toward `n_ranges` fully-encoded shards. The
+    // export sibling in `h5ad/stream_write.rs` had it right.
     let in_flight_cap = reader_threads.saturating_add(queue_depth);
 
     // Serialize parallel coordinator runs across the test binary so
@@ -2357,9 +2362,10 @@ fn streaming_writer_coordinator_parallel(
             next_to_spawn += 1;
         }
 
-        // Drain in the calling thread, reordering by shard_idx and
-        // spawning one new task per received shard. The BTreeMap can
-        // hold at most `in_flight_cap - 1` out-of-order shards.
+        // Drain in the calling thread, reordering by shard_idx and spawning
+        // one new task per *written* shard. Outstanding work is therefore
+        // `spawned - written <= in_flight_cap`, and since the buffer holds a
+        // subset of the outstanding shards it can never exceed that either.
         let mut buffer: std::collections::BTreeMap<usize, EncodedShardOutput> =
             std::collections::BTreeMap::new();
         let mut next_idx: usize = 0;
@@ -2371,10 +2377,6 @@ fn streaming_writer_coordinator_parallel(
                 )
             })?;
             received += 1;
-            if next_to_spawn < n_ranges {
-                spawn_shard!(s, next_to_spawn);
-                next_to_spawn += 1;
-            }
             let out = r?;
             buffer.insert(idx, out);
             // Observed here, immediately after the insert: this is the
@@ -2408,6 +2410,10 @@ fn streaming_writer_coordinator_parallel(
                     }
                 }
                 next_idx += 1;
+                if next_to_spawn < n_ranges {
+                    spawn_shard!(s, next_to_spawn);
+                    next_to_spawn += 1;
+                }
             }
         }
         Ok(())
