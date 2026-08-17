@@ -460,14 +460,16 @@ fn stream_csr_into_prealloc_sequential(
 }
 
 /// Phase 8d — parallel drain. Workers decode shards in a rayon pool;
-/// the calling thread drains the channel in shard-index order and
-/// performs the HDF5 hyperslab writes.
+/// the calling thread applies them in shard-index order and performs
+/// the HDF5 hyperslab writes.
 ///
-/// Bounded outstanding shards = `reader_threads + writer_queue_depth`
-/// via a rolling-window spawn (mirrors the ingest coordinator in
-/// `pipeline.rs::streaming_writer_coordinator_parallel`). This caps
-/// peak RSS at roughly that many decoded shards in flight, regardless
-/// of how slow shard 0 is relative to shard N.
+/// Outstanding shards are bounded at `reader_threads +
+/// writer_queue_depth`, so peak RSS is that many decoded shards
+/// regardless of how slow shard 0 is relative to shard N. It no longer
+/// *mirrors* the ingest coordinator — since ORG-11.16-2 both run on
+/// `crate::parallel_drain::ordered_parallel_drain`, which is where that
+/// bound and the panic / early-return contracts live. Mirroring is what
+/// let the two drift apart in the first place (review §11.2).
 #[allow(clippy::too_many_arguments)]
 fn stream_csr_into_prealloc_parallel(
     datasets: TripletDatasets<'_>,

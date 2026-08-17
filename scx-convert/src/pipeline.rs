@@ -2216,10 +2216,10 @@ fn streaming_writer_coordinator_parallel(
     #[cfg(test)]
     let captured_fault_shard = test_hooks::current_ingest_fault_shard();
 
-    // Panic-injection sibling of the fault switch above: forces a
-    // real worker `panic!` before `tx.send(...)`, exercising the
-    // `catch_unwind` guard in the worker body. Copied here on the
-    // calling thread and propagated into workers via closure capture.
+    // Panic-injection sibling of the fault switch above: forces a real
+    // `panic!` inside the worker body, exercising the `catch_unwind` that
+    // `ordered_parallel_drain` wraps it in — which is what turns a panic into
+    // a delivered `Err` rather than a lost send and a hung drain.
     #[cfg(test)]
     let captured_panic_shard = test_hooks::current_ingest_panic_shard();
 
