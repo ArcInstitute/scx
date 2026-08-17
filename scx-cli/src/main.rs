@@ -740,7 +740,9 @@ enum Commands {
         /// by these obs columns (CSV, lexicographic). Each input must
         /// already be a sorted run by this key (e.g. from `scx convert
         /// --sort-by`); an unsorted input errors. Reorders obs / X /
-        /// layers; var-axis preserved; obsm unsupported (errors).
+        /// layers; var-axis preserved (including varm / varp);
+        /// obsm and obsp unsupported (errors) — merge without --sort-by,
+        /// then `scx sort`.
         #[arg(long, value_name = "CSV")]
         sort_by: Option<String>,
         /// Descending order for `--sort-by`.
