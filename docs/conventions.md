@@ -378,9 +378,19 @@ validated by a suite that cannot fail is indistinguishable from a regression.
   byte-for-byte. Outstanding shards (encoding + in channel + in
   reorder buffer) are bounded at `reader_threads + writer_queue_depth`
   via a rolling-window spawn: the coordinator primes the pool with
-  that many tasks and spawns one new task per received shard. Without
-  this cap, a slow shard 0 would let the BTreeMap accumulate ~all
-  remaining shards.
+  that many tasks and spawns one new task **per written shard**.
+  Per *received* shard is the version that does not work, and shipped
+  for a while: it bounds `spawned − received`, while the `BTreeMap`
+  holds `received − written`, so a slow shard 0 let the map accumulate
+  ~all remaining shards regardless.
+- Both directions run on one implementation,
+  `scx_convert::parallel_drain::ordered_parallel_drain`. It is generic
+  over the item and error types and is **not** gated on the `hdf5`
+  feature, so its tests — the buffer bound, panic-to-`Err`, and the
+  `move`-on-scope contract that releases parked senders — run in the
+  ordinary `cargo test --workspace` job. Write a new fan-out/reorder
+  loop through it rather than beside it: the two hand-written copies
+  had already diverged on the spawn placement above.
 - Reader slab caps: `IndexedCsrShardStream::max_slab_rows` reports a
   hard upper bound on rows the reader can serve in one `read_range`
   call. `None` (default) means no cap (CSR + in-memory CSC).
@@ -439,10 +449,11 @@ dispatcher but with a simpler precondition set:
   `ScxReader::read_csr_shard_for(modality_id, shard_idx)`; the
   source isn't gated by a slab budget the way an HDF5 dense reader
   is on the ingest side.
-- **Rolling-window spawn carries over.** The reorder buffer
-  (`BTreeMap<u32, DecodedShard>`) on the writer thread is bounded
-  by the same `reader_threads + writer_queue_depth` window so a
-  slow shard 0 can't accumulate the rest of the file in memory.
+- **Rolling-window spawn carries over** — literally: export and
+  ingest share `ordered_parallel_drain`, so the reorder buffer on the
+  writer thread is bounded by the same
+  `reader_threads + writer_queue_depth` window, by the same code, and
+  a slow shard 0 can't accumulate the rest of the file in memory.
 - **Filtering stays on the writer thread.** Deletion-vector
   filtering (`filter_shard`) reads the running `nnz_offset` /
   `row_offset_kept` accumulators, which must be sequential to keep
