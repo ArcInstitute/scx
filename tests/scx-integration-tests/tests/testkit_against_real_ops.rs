@@ -119,3 +119,113 @@ fn compact_digests_differ_when_the_input_differs() {
         "compacting away different rows must change the digest"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The ops Phase 5's rewrite-loop consolidation (ORG-6.14-1) will actually
+// touch, over a file that carries every section family.
+//
+// The cases above run on `mixed_codec_file`, which is X shards and `uns`. That
+// is enough to prove the provenance exclusion works, and not enough to tell a
+// phase that lifts `CsrEmitter` out of `sort_engine` and pushes `compact` and
+// `merge` rows through it whether the harness still holds when the file also
+// has layers, obsm/varm, obsp/varp, `.raw`, bitmaps, a group index, predicate
+// indexes and a deletion vector.
+//
+// `merge` and `sort` are the gap that matters: neither was covered before, and
+// both are in that phase's blast radius. Better to learn the harness does not
+// hold for one of them now than after the refactor is written.
+//
+// What these prove is that provenance's clock does not leak into the digest for
+// these ops -- i.e. that the harness is usable on them. They compare two runs of
+// the *same* code, so they cannot and do not say anything about whether that
+// code's behaviour changed; that claim needs a comparison across two trees.
+// ---------------------------------------------------------------------------
+
+mod common;
+
+use common::fixture_all_families;
+
+/// Run `op` twice over **one** fixture, a second apart, and assert the digests
+/// agree while the raw bytes do not.
+///
+/// One source, not two. Building a second fixture would make the two outputs
+/// differ for a reason that has nothing to do with the clock — each fixture ends
+/// with `mark_deleted`, which stamps its own `SystemTime::now()`, so the two
+/// inputs' `file_checksum`s differ and `merge` copies those into its provenance.
+/// The premise assertion then passes with `wait_for_next_second()` deleted,
+/// which is how this helper was first written and how it was caught: removing
+/// the wait left every case green.
+fn assert_op_is_clock_independent(label: &str, op: impl Fn(&Path, &Path)) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = fixture_all_families(dir.path(), "src.scx");
+
+    let a = dir.path().join(format!("{label}_a.scx"));
+    op(&src, &a);
+
+    wait_for_next_second();
+
+    let b = dir.path().join(format!("{label}_b.scx"));
+    op(&src, &b);
+
+    assert_provenance_actually_differs(&a, &b);
+    assert_digests_eq(
+        &digest_file(&a, Strictness::Content).unwrap(),
+        &digest_file(&b, Strictness::Content).unwrap(),
+    );
+}
+
+#[test]
+fn compact_over_every_family_is_clock_independent() {
+    assert_op_is_clock_independent("compact", |src, out| {
+        scx_ops::compact(src, out).unwrap();
+    });
+}
+
+#[test]
+fn sort_over_every_family_is_clock_independent() {
+    let opts = scx_ops::SortOptions {
+        by: vec!["cell_type".to_string()],
+        ..Default::default()
+    };
+    assert_op_is_clock_independent("sort", |src, out| {
+        scx_ops::sort_engine::sort(src, out, &opts).unwrap();
+    });
+}
+
+#[test]
+fn optimize_over_every_family_is_clock_independent() {
+    assert_op_is_clock_independent("optimize", |src, out| {
+        scx_ops::optimize::optimize(src, out, None, scx_format_io::ObsShardPolicy::Off).unwrap();
+    });
+}
+
+#[test]
+fn build_csc_over_every_family_is_clock_independent() {
+    assert_op_is_clock_independent("build_csc", |src, out| {
+        scx_ops::run_build_csc(src, out, "1G", false, 1024, None).unwrap();
+    });
+}
+
+/// `merge` takes two inputs, so it does not fit the helper — and it is the op
+/// whose provenance carries the *inputs'* checksums alongside its own timestamp,
+/// which is the case most likely to break the exclusion.
+#[test]
+fn merge_over_every_family_is_clock_independent() {
+    let dir = tempfile::tempdir().unwrap();
+    let x = fixture_all_families(dir.path(), "x.scx");
+    let y = fixture_all_families(dir.path(), "y.scx");
+    let mk = |tag: &str| {
+        let out = dir.path().join(format!("{tag}_merged.scx"));
+        scx_ops::merge::merge(&[&x, &y], &out).unwrap();
+        out
+    };
+    let a = mk("a");
+    wait_for_next_second();
+    let b = mk("b");
+
+    assert_provenance_actually_differs(&a, &b);
+    assert_digests_eq(
+        &digest_file(&a, Strictness::Content).unwrap(),
+        &digest_file(&b, Strictness::Content).unwrap(),
+    );
+}
