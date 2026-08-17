@@ -19,6 +19,17 @@ pub static IN_FLIGHT_NOW: AtomicUsize = AtomicUsize::new(0);
 pub static IN_FLIGHT_PEAK: AtomicUsize = AtomicUsize::new(0);
 pub static SERIALIZE: Mutex<()> = Mutex::new(());
 
+/// Running maximum of the coordinator's reorder-buffer occupancy — the
+/// `BTreeMap` holding shards that have been *received* but not yet
+/// *written*.
+///
+/// This is the quantity review §11.2 is about, and it is emphatically not
+/// [`IN_FLIGHT_PEAK`]: that counter is incremented inside the spawned worker
+/// body, so it measures worker bodies executing concurrently, which the rayon
+/// pool bounds by `num_threads` no matter what the coordinator does. A test
+/// asserting on it cannot observe an unbounded buffer.
+pub static BUFFER_LEN_PEAK: AtomicUsize = AtomicUsize::new(0);
+
 thread_local! {
     /// Per-thread fault-injection switch read by the parallel
     /// ingest coordinator (`streaming_writer_coordinator_parallel`)
@@ -140,12 +151,57 @@ impl Drop for FailIngestShardGuard {
 }
 
 thread_local! {
+    /// Per-thread ingest slow-worker switch: `(shard_idx, millis)`. The
+    /// worker for that shard sleeps before doing any real work.
+    ///
+    /// Load-bearing for the reorder-buffer bound test, not a convenience. At
+    /// 50 small shards over 4 threads the natural completion skew is well
+    /// under the `threads + queue_depth` cap, so a buffer-occupancy assertion
+    /// passes against an *unbounded* coordinator too — the same vacuum the
+    /// test it replaces had, in a new costume. Delaying shard 0 is what makes
+    /// every later shard pile up behind it, which is exactly the production
+    /// scenario (`--group-by --reference` makes shard 0 the deliberately
+    /// oversized reference shard).
+    ///
+    /// Mutate only via [`DelayIngestShardGuard`].
+    pub static DELAY_INGEST_SHARD_AT: Cell<Option<(usize, u64)>> = const { Cell::new(None) };
+}
+
+/// Read the current thread's ingest delay-injection setting.
+pub fn current_ingest_delay_shard() -> Option<(usize, u64)> {
+    DELAY_INGEST_SHARD_AT.with(|c| c.get())
+}
+
+/// RAII guard arming the ingest delay injector for the current thread. Drop
+/// restores the previous value. Same thread-scoping rules as
+/// [`FailIngestShardGuard`].
+pub struct DelayIngestShardGuard {
+    prev: Option<(usize, u64)>,
+}
+
+impl DelayIngestShardGuard {
+    pub fn new(shard_idx: usize, millis: u64) -> Self {
+        let prev = DELAY_INGEST_SHARD_AT.with(|c| c.replace(Some((shard_idx, millis))));
+        Self { prev }
+    }
+}
+
+impl Drop for DelayIngestShardGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        DELAY_INGEST_SHARD_AT.with(|c| c.set(prev));
+    }
+}
+
+thread_local! {
     pub static LAST_RUN_PEAK: Cell<usize> = const { Cell::new(0) };
+    pub static LAST_RUN_BUFFER_PEAK: Cell<usize> = const { Cell::new(0) };
 }
 
 pub fn reset_in_flight() {
     IN_FLIGHT_NOW.store(0, Ordering::SeqCst);
     IN_FLIGHT_PEAK.store(0, Ordering::SeqCst);
+    BUFFER_LEN_PEAK.store(0, Ordering::SeqCst);
 }
 
 pub fn last_run_peak() -> usize {
@@ -154,6 +210,21 @@ pub fn last_run_peak() -> usize {
 
 pub fn set_last_run_peak(v: usize) {
     LAST_RUN_PEAK.with(|c| c.set(v));
+}
+
+/// Fold one observation of the reorder buffer's occupancy into
+/// [`BUFFER_LEN_PEAK`]. Called by the coordinator immediately after inserting
+/// a received item, which is the moment the buffer is at its largest.
+pub fn record_buffer_len(n: usize) {
+    BUFFER_LEN_PEAK.fetch_max(n, Ordering::SeqCst);
+}
+
+pub fn last_run_buffer_peak() -> usize {
+    LAST_RUN_BUFFER_PEAK.with(|c| c.get())
+}
+
+pub fn set_last_run_buffer_peak(v: usize) {
+    LAST_RUN_BUFFER_PEAK.with(|c| c.set(v));
 }
 
 pub struct InFlightGuard;

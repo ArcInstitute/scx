@@ -2248,6 +2248,12 @@ fn streaming_writer_coordinator_parallel(
     #[cfg(test)]
     let captured_panic_shard = test_hooks::current_ingest_panic_shard();
 
+    // Slow-worker injection, captured on the calling thread like the two
+    // above. Makes one shard take long enough that every other shard
+    // completes behind it — the skew the reorder-buffer bound exists for.
+    #[cfg(test)]
+    let captured_delay_shard = test_hooks::current_ingest_delay_shard();
+
     // Macro-style local spawn: must inline because extracting a
     // closure would re-borrow `reader` from a nested closure scope
     // and rayon's `'scope` lifetime can't be reconciled with that
@@ -2298,6 +2304,12 @@ fn streaming_writer_coordinator_parallel(
                         #[cfg(test)]
                         if Some(idx_) == captured_panic_shard {
                             panic!("test_hooks: injected panic at shard {idx_}");
+                        }
+                        #[cfg(test)]
+                        if let Some((delay_idx, millis)) = captured_delay_shard {
+                            if delay_idx == idx_ {
+                                std::thread::sleep(std::time::Duration::from_millis(millis));
+                            }
                         }
                         encode_one_shard_worker(
                             reader,
@@ -2365,6 +2377,11 @@ fn streaming_writer_coordinator_parallel(
             }
             let out = r?;
             buffer.insert(idx, out);
+            // Observed here, immediately after the insert: this is the
+            // moment the buffer is at its largest, and it is the quantity
+            // the rolling window is supposed to bound.
+            #[cfg(test)]
+            test_hooks::record_buffer_len(buffer.len());
             while let Some(out) = buffer.remove(&next_idx) {
                 if out.duplicates_merged > 0 {
                     sink.emit(ConvertWarning::DuplicateCoordinatesMerged {
@@ -2405,6 +2422,8 @@ fn streaming_writer_coordinator_parallel(
     {
         let peak = test_hooks::IN_FLIGHT_PEAK.load(std::sync::atomic::Ordering::SeqCst);
         test_hooks::set_last_run_peak(peak);
+        let buf_peak = test_hooks::BUFFER_LEN_PEAK.load(std::sync::atomic::Ordering::SeqCst);
+        test_hooks::set_last_run_buffer_peak(buf_peak);
         drop(_serial);
     }
 

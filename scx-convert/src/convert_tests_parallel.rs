@@ -335,22 +335,37 @@ fn dense_parallel_with_memory_budget_byte_identical() {
     assert_eq!(csr_a.data, csr_b.data);
 }
 
-/// Fix 2: the BTreeMap reorder buffer used to be unbounded — a slow
-/// shard 0 let the caller drain the channel into the map until it
-/// held ~`n_ranges` shards. The rolling-window spawn caps outstanding
-/// shards (encoding + in channel + in buffer) at `reader_threads +
-/// writer_queue_depth`. Asserts the in-flight peak observed during
-/// the coordinator stays within that bound.
+/// Review §11.2: the ingest reorder buffer is what the rolling window is
+/// supposed to bound, and it is what this test measures.
+///
+/// The `BTreeMap` holds shards that have been *received* but not yet
+/// *written*. Spawning a replacement worker on receive bounds
+/// `spawned − received` and leaves `received − written` free to grow toward
+/// `n_ranges`; spawning inside the drain loop — what the export sibling in
+/// `stream_write.rs` does — is what actually caps it.
+///
+/// ⚠️ **This test replaces one that could not fail.** The previous version
+/// asserted on `last_run_peak()`, whose counter is incremented by an
+/// `InFlightGuard` constructed *inside* the spawned worker body: it counts
+/// worker bodies executing concurrently, which rayon bounds by the pool's
+/// `num_threads` regardless of what the coordinator does. With
+/// `reader_threads = 4` and `writer_queue_depth = 2` it asserted `4 <= 6`,
+/// and would have gone on asserting `4 <= 6` with the buffer holding all 50
+/// shards. That assertion is kept below, relabelled for what it does measure.
+///
+/// The injected delay on shard 0 is load-bearing: without it the natural
+/// completion skew across 50 tiny shards stays under the cap and the
+/// assertion passes against the unbounded coordinator too.
 #[test]
-fn parallel_in_flight_bounded_by_window() {
-    if super::hdf5_threadsafe::skip_if_not_threadsafe("parallel_in_flight_bounded_by_window") {
+fn parallel_reorder_buffer_bounded_by_window() {
+    if super::hdf5_threadsafe::skip_if_not_threadsafe("parallel_reorder_buffer_bounded_by_window") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("many.h5ad");
-    // Many small shards exercise the rolling-window spawn — without
-    // the cap, a delayed shard 0 would let the BTreeMap accumulate
-    // dozens of out-of-order shards.
+    // 400 rows / shard_size 8 → 50 shards, each tiny enough to encode in
+    // microseconds, so the 250 ms head-of-line stall on shard 0 lets every
+    // other shard finish behind it.
     create_test_h5ad(&h5ad, 400, 13, "csr", false);
 
     let mut opts = streaming_opts(8);
@@ -358,24 +373,46 @@ fn parallel_in_flight_bounded_by_window() {
     opts.writer_queue_depth = 2;
 
     let scx = dir.path().join("out.scx");
-    h5ad_to_scx_streaming(
-        &h5ad,
-        &scx,
-        &opts,
-        &StreamingOverrides::default(),
-        &mut WarningSink::log(),
-    )
-    .unwrap();
+    {
+        // Guard is created on this thread — the coordinator captures the
+        // thread-local at entry — and Drop clears it even on panic.
+        let _delay = super::pipeline::test_hooks::DelayIngestShardGuard::new(0, 250);
+        h5ad_to_scx_streaming(
+            &h5ad,
+            &scx,
+            &opts,
+            &StreamingOverrides::default(),
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+    }
 
-    let peak = super::pipeline::test_hooks::last_run_peak();
     let cap = 4 + 2; // reader_threads + writer_queue_depth
+
+    let buffer_peak = super::pipeline::test_hooks::last_run_buffer_peak();
     assert!(
-        peak > 0,
-        "expected the in-flight counter to record activity"
+        buffer_peak > 0,
+        "expected the reorder buffer to hold at least one out-of-order shard; \
+         if this is 0 the delay hook did not fire and the test proves nothing"
     );
     assert!(
-        peak <= cap,
-        "in-flight peak {peak} exceeds rolling-window cap {cap}"
+        buffer_peak <= cap,
+        "reorder-buffer peak {buffer_peak} exceeds the rolling-window cap {cap}: \
+         a replacement worker is being spawned on receive rather than on write, \
+         so `received - written` is unbounded (review §11.2)"
+    );
+
+    // Retained from the previous version, with an honest label. Rayon bounds
+    // this by `num_threads` on its own, so it is a liveness check ("workers
+    // ran at all"), not a bound on anything the coordinator controls.
+    let executing_peak = super::pipeline::test_hooks::last_run_peak();
+    assert!(
+        executing_peak > 0,
+        "expected the in-flight counter to record worker activity"
+    );
+    assert!(
+        executing_peak <= 4,
+        "concurrently executing workers {executing_peak} exceeds the pool size 4"
     );
 }
 
