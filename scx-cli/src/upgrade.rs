@@ -284,7 +284,18 @@ fn rewrite_with_current_version(
     // header would carry the same false claim. It also warns about the section
     // families this helper does not carry, which matters here because
     // `--in-place` renames over the target with no prior catalog to roll back to.
-    scx_ops::copy_auxiliary_sections_canonicalizing(reader, &mut writer, "upgrade", "{}", true)?;
+    // `x_was_rewritten` is the same flag the CSC decision above turns on, and
+    // it decides the same kind of question for the detection bitmaps: both are
+    // second views of the matrix, and canonicalisation moved the matrix.
+    scx_ops::copy_auxiliary_sections_canonicalizing(
+        reader,
+        &mut writer,
+        "upgrade",
+        "{}",
+        scx_ops::LayerCanonicalization::On {
+            x_was_rewritten: csr_was_rewritten,
+        },
+    )?;
 
     // `upgrade` is the one op in the carry table whose call site lives outside
     // `scx-ops`, so the audit is wired here rather than inside the shared helper

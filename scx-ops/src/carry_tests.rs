@@ -65,14 +65,13 @@ fn table_is_total() {
 
 /// The whole table, pinned.
 ///
-/// The point is not that these values are *right* — several of them are open
-/// bugs and are labelled as such in `carry.rs`. The point is that changing one
-/// shows up here, in a diff a reviewer reads, instead of inside a `match` arm
-/// in a 600-line module.
+/// The point is not that these values are *right*. The point is that changing
+/// one shows up here, in a diff a reviewer reads, instead of inside a `match`
+/// arm in a 600-line module.
 ///
-/// When a Phase 5b fix flips `merge`'s obsp/varp or `build-csc`'s
-/// varm/obsp/varp/raw/bitmaps, this string changes with it, and that change is
-/// the fix's most legible artifact.
+/// It has already earned that once: Phase 5b flipped ten cells — `merge`'s
+/// obsp/varp and `build-csc`'s varm/obsp/varp/raw/bitmaps/group-index — and the
+/// diff to this string is the most legible artifact that PR produced.
 #[test]
 fn table_snapshot() {
     let expected = "\
@@ -141,7 +140,7 @@ optimize
   uns                          verbatim
   provenance                   rebuilt
   deletion vectors             verbatim
-  detection bitmaps            verbatim
+  detection bitmaps            conditional
   obs predicate index          verbatim
   var predicate index          verbatim
   modality table               refuse
@@ -181,19 +180,19 @@ build-csc
   layers                       verbatim
   layer CSC sidecars           dropped(warns)
   obsm                         verbatim
-  varm                         dropped(warns)
-  obsp                         dropped(warns)
-  obsp (CSR-backed)            dropped(warns)
-  varp                         dropped(warns)
+  varm                         verbatim
+  obsp                         verbatim
+  obsp (CSR-backed)            verbatim
+  varp                         verbatim
   uns                          verbatim
   provenance                   rebuilt
   deletion vectors             verbatim
-  detection bitmaps            dropped(warns)
+  detection bitmaps            verbatim
   obs predicate index          verbatim
   var predicate index          verbatim
   modality table               refuse
-  adata.raw                    dropped(warns)
-  grouped-sort group index     dropped(warns)
+  adata.raw                    verbatim
+  grouped-sort group index     verbatim
   unwritten legacy index section dropped(SILENT)
 upgrade
   obs                          verbatim
@@ -203,19 +202,19 @@ upgrade
   layers                       verbatim
   layer CSC sidecars           dropped(warns)
   obsm                         verbatim
-  varm                         dropped(warns)
-  obsp                         dropped(warns)
-  obsp (CSR-backed)            dropped(warns)
-  varp                         dropped(warns)
+  varm                         verbatim
+  obsp                         verbatim
+  obsp (CSR-backed)            verbatim
+  varp                         verbatim
   uns                          verbatim
   provenance                   rebuilt
   deletion vectors             verbatim
-  detection bitmaps            dropped(warns)
+  detection bitmaps            conditional
   obs predicate index          verbatim
   var predicate index          verbatim
   modality table               refuse
-  adata.raw                    dropped(warns)
-  grouped-sort group index     dropped(warns)
+  adata.raw                    verbatim
+  grouped-sort group index     verbatim
   unwritten legacy index section dropped(SILENT)
 ";
     assert_eq!(render_table(), expected);
@@ -240,6 +239,20 @@ fn upgrade_matches_build_csc_except_the_csc_sidecar() {
             ));
             continue;
         }
+        if f == SectionFamily::Bitmap {
+            // The second exception, added in Phase 5b. Both ops carry the
+            // sidecar, but only `upgrade` canonicalises — and canonicalisation
+            // drops explicit zeros, which changes which genes a row *stores*
+            // and therefore what the bitmap should say. `build_csc` clamps its
+            // output version so it never canonicalises (SCX-005), so nothing
+            // moves under its bitmaps.
+            assert_eq!(policy(RewriteOp::BuildCsc, f), Carry::Verbatim);
+            assert!(matches!(
+                policy(RewriteOp::Upgrade, f),
+                Carry::Conditional { .. }
+            ));
+            continue;
+        }
         assert_eq!(
             policy(RewriteOp::Upgrade, f),
             policy(RewriteOp::BuildCsc, f),
@@ -250,42 +263,37 @@ fn upgrade_matches_build_csc_except_the_csc_sidecar() {
     }
 }
 
-/// Four cells of the table are open Majors, and a reader who does not already
-/// know that will read the table as a specification.
+/// No cell claims to be an open bug.
 ///
-/// Pinned so that a Phase 5b fix has to come here and delete the entry, rather
-/// than leaving a `why:` string that still says "(open)" about something that
-/// has been closed.
+/// The inverse of what this test used to be. Phase 5a listed ten cells as open
+/// Majors (§6.3's seven for `build-csc`, §6.4's three for `merge`) and asserted
+/// that each one's `why:` string said `(open)`, so that a reader would not take
+/// the table for a specification and so that a fix had to come *here* and delete
+/// the entry rather than leaving stale prose behind.
+///
+/// Phase 5b closed all ten, which empties the list — and an empty list is a test
+/// that cannot fail. So the assertion is turned around: nothing in the table may
+/// still call itself open. That catches the thing the list was really guarding
+/// against (a `why:` that outlives the bug it describes) without needing anyone
+/// to maintain a roster, and it needs no edit at all if a future cell is
+/// correctly marked and later correctly fixed.
 #[test]
-fn open_bugs_are_labelled_in_the_table() {
-    let open: Vec<(RewriteOp, SectionFamily)> = vec![
-        // §6.4's three cells were here until Phase 5b closed them: merge now
-        // remaps obsp by each input's row offset and takes varp from input 0.
-        // `ObspCsr` is still a drop but no longer an *open* one — nothing in
-        // the crate reads a CSR-backed graph outside `optimize`'s shard loop,
-        // which is the same reason `compact` and `sort` drop it.
-        (RewriteOp::BuildCsc, SectionFamily::Varm),
-        (RewriteOp::BuildCsc, SectionFamily::Obsp),
-        (RewriteOp::BuildCsc, SectionFamily::ObspCsr),
-        (RewriteOp::BuildCsc, SectionFamily::Varp),
-        (RewriteOp::BuildCsc, SectionFamily::Raw),
-        (RewriteOp::BuildCsc, SectionFamily::Bitmap),
-        (RewriteOp::BuildCsc, SectionFamily::GroupIndex),
-    ];
-    for (op, f) in open {
-        match policy(op, f) {
-            Carry::Dropped { why, .. } => assert!(
-                why.contains("(open)"),
-                "{}/{}: a known-open drop must say so in its `why`, got {why:?}",
-                op.label(),
-                f.label()
-            ),
-            other => panic!(
-                "{}/{} is no longer a drop ({other:?}) — if it was fixed, remove it from \
-                 this list and from the §6.3/§6.4 notes in carry.rs",
-                op.label(),
-                f.label()
-            ),
+fn no_cell_still_claims_to_be_an_open_bug() {
+    for &op in RewriteOp::ALL {
+        for &f in SectionFamily::ALL {
+            for scope in [SectionScope::Global, SectionScope::PerModality] {
+                if let Carry::Dropped { why, .. } = policy_scoped(op, f, scope) {
+                    assert!(
+                        !why.contains("(open)"),
+                        "{}/{} ({}) still describes itself as an open bug: {why:?}. \
+                         If it is open, that is fine — but §6.3 and §6.4 are closed, \
+                         so say which review section this one is.",
+                        op.label(),
+                        f.label(),
+                        scope.label(),
+                    );
+                }
+            }
         }
     }
 }

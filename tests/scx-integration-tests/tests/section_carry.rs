@@ -396,6 +396,38 @@ fn build_csc_carries_what_optimize_carries() {
             f.label()
         );
     }
+
+    // Presence in the catalog is not the property. A section copied verbatim
+    // into a file whose header or stats no longer describe it is present and
+    // useless, and `.raw` is the case where that was a live question: nothing
+    // sets a raw column count on the output, so it has to come back from the
+    // shards' own stats.
+    let src = ScxReader::open(&input).unwrap();
+    let out = ScxReader::open(&with_csc).unwrap();
+    assert_eq!(
+        out.raw_n_vars(),
+        src.raw_n_vars(),
+        "raw's own var extent must survive the copy, not just its sections"
+    );
+    assert_eq!(
+        out.read_raw_var().unwrap().num_rows(),
+        src.read_raw_var().unwrap().num_rows()
+    );
+    assert_eq!(
+        out.read_all_varm().unwrap().keys().collect::<BTreeSet<_>>(),
+        src.read_all_varm().unwrap().keys().collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        out.read_all_obsp().unwrap().keys().collect::<BTreeSet<_>>(),
+        src.read_all_obsp().unwrap().keys().collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        out.read_all_varp().unwrap().keys().collect::<BTreeSet<_>>(),
+        src.read_all_varp().unwrap().keys().collect::<BTreeSet<_>>()
+    );
+    // build-csc does not canonicalise, so the bitmaps describe an unchanged
+    // matrix and must agree with it exactly.
+    assert_eq!(bitmap_detections(&with_csc), x_detections(&with_csc));
 }
 
 /// Merge takes its obsm key set from **input 0 only**, so a key that only a
