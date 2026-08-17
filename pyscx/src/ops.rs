@@ -1232,6 +1232,22 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
 ///   Applied independently at the global and per-modality levels
 ///   for multimodal inputs.
 ///
+/// Raises `RuntimeError` when the inputs disagree about what they carry:
+/// an `obsm` or `obsp` key that some inputs have and others lack is a
+/// hard error naming the axis, the key and the input — the same answer a
+/// missing *layer* has always had. Merging per-sample files where one
+/// lacks `X_umap` used to succeed and silently produce an atlas without
+/// it. Drop the key from the others, or add it to the one, before
+/// merging. An `obsp` key whose `data` column disagrees in dtype or
+/// nullability across inputs is refused for the same reason: the merged
+/// shards are read back under one schema, so writing them would produce
+/// a graph that cannot be loaded.
+///
+/// File-scope `obsp` (COO) is carried, rebased into the merged obs
+/// space, and `varp` comes from input 0. The **CSR-backed** `obsp`
+/// encoding and modality-scoped pairwise graphs are dropped with a
+/// warning; `sort_by` refuses COO `obsp` as it already refuses `obsm`.
+///
 /// Example:
 ///     pyscx.merge(["batch1.scx", "batch2.scx", "batch3.scx"], "atlas.scx")
 ///     pyscx.merge(["a.scx", "b.scx"], "merged.scx",

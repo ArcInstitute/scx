@@ -129,7 +129,19 @@ impl ScxReader {
             .collect()
     }
 
-    fn is_canonical_csr_section(section_type: SectionType) -> bool {
+    /// Which section types the v3 canonical-CSR invariant applies to.
+    ///
+    /// **Public because it must be the only such list.** `scx-cli`'s
+    /// `validate --deep` loop kept its own copy that omitted `RawCsrShard`, so
+    /// the CLI silently checked three of the four families — the exact gap
+    /// SCX-008 added raw here to close, reopened one crate over. That is the
+    /// same "one question answered in two places" shape the section-carry table
+    /// exists to remove, and the answer is the same: one list, exported.
+    ///
+    /// Callers deciding whether to *emit* a canonical shard want this too: an
+    /// op that stamps a version asserting the invariant must hold every one of
+    /// these to it (see `scx_ops::rewrite_helpers::copy_csr_class_aux`).
+    pub fn is_canonical_csr_section(section_type: SectionType) -> bool {
         // RawCsrShard is stored as canonical CSR too, so deep validation must
         // cover it — otherwise `.raw` corruption escapes the canonical pass
         // (SCX-008).

@@ -38,8 +38,8 @@ first if you want a way back.
 | **modify_metadata** / **set_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`); a supplied `obsm` sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | **Carried forward** for the replaced axis — rebuilt over the columns the file already indexed, which also re-derives the per-shard column stats. `--index-obs` / `--index-var` override that axis's column set (`--index-preset` / `--index-auto-threshold` override both); a previously indexed column the new set omits is *reported*, not silently dropped. Untouched when only `uns` / `obsm` / `varm` change — see the note below | **Preserved** (X and its row space are untouched) |
 | **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deleted rows are dropped and no vector is emitted. This is the op that materializes deletions |
 | **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | Sections **preserved** (rows + shard boundaries unchanged), but like `build-csc` the re-emit does not re-derive the per-shard column stats, so **Level-1** pruning stops firing. See the note below | **Carried** verbatim (rows are 1:1, so the global row indices stay valid) |
-| **upgrade** | New file, or in place (`--in-place`, temp + rename) — **not** rollback-able; **refuses multimodal input** | Decoded, **canonicalized** and re-emitted **unframed** (per-shard codec preserved; canonicalizing can change `nnz`); a file already newer than the target (v4) is **declined**. Detection bitmaps, `varm`, `obsp`, `varp`, `.raw` and the group index are **dropped with a warning** — see below | **Preserved** (rows 1:1; a sharded layout stays sharded) | **Preserved** | **Preserved** when canonicalizing left the matrix unchanged (every file a current writer produces) — the one op that carries the sidecar through rather than dropping it. **Dropped with a warning** when canonicalizing actually rewrote X, since the sidecar is then a view of a different matrix | Sections **copied verbatim** by `copy_auxiliary_sections`, but the per-shard catalog **column stats are not re-derived** — so **Level-1** shard pruning stops firing, exactly as for `build-csc`. See the note below | **Carried** verbatim (a 1:1 re-emit, so the global row indices stay valid) |
-| **merge** | New file (`<OUTPUT>` required) | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Carried**, with each input's rows offset into the merged row space (a sorted merge follows the merge permutation). Physical rows are all retained — run `compact` to reclaim them |
+| **upgrade** | New file, or in place (`--in-place`, temp + rename) — **not** rollback-able; **refuses multimodal input** | Decoded, **canonicalized** and re-emitted **unframed** (per-shard codec preserved; canonicalizing can change `nnz`); a file already newer than the target (v4) is **declined**. `varm`, `obsp`, `varp`, `.raw` and the group index are **carried**; detection bitmaps are carried too unless canonicalizing actually rewrote X, in which case they are dropped with a warning — see below | **Preserved** (rows 1:1; a sharded layout stays sharded) | **Preserved** | **Preserved** when canonicalizing left the matrix unchanged (every file a current writer produces) — the one op that carries the sidecar through rather than dropping it. **Dropped with a warning** when canonicalizing actually rewrote X, since the sidecar is then a view of a different matrix | Sections **copied verbatim** by `copy_auxiliary_sections`, but the per-shard catalog **column stats are not re-derived** — so **Level-1** shard pruning stops firing, exactly as for `build-csc`. See the note below | **Carried** verbatim (a 1:1 re-emit, so the global row indices stay valid) |
+| **merge** | New file (`<OUTPUT>` required) | Writes new output combining all inputs | Writes merged metadata; an `obsm` key some inputs lack is a **hard error** naming the input | Writes merged; `varm` / `varp` come from input 0 | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Carried**, with each input's rows offset into the merged row space (a sorted merge follows the merge permutation). Physical rows are all retained — run `compact` to reclaim them |
 | **subset** | New file (`<OUTPUT>` required, optional with `--dry-run`) | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — a subset builds a new row space, so deleted cells are excluded (whether or not `--filter` is given, and intersected with it when it is) |
 | **sort** | New file (`<OUTPUT>` required) | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deletions are materialized away by the reorder |
 | **sort `--shuffle`** | New file (`<OUTPUT>` required) | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them | **Applied** — as for `sort` |
@@ -62,23 +62,50 @@ Read that table rather than this document when you need the answer for `varm`,
 sidecar. It is the source of truth, it is snapshot-tested, and it cannot get out
 of step with the code without a test going red.
 
-Two of its answers are worth surfacing here, because they are **losses of user
-data that the ops do not currently prevent**:
+Three of its answers are worth surfacing here.
 
-- **`merge` does not carry `obsp` or `varp`.** A merged file has no cell–cell
-  graph, even though `compact` remaps one through its keep-mask and `sort`
-  through its permutation. Merging per-sample files after computing kNN loses
-  the graph, with no warning. Compute the neighbours *after* the merge.
-- **`build-csc` carries only layers, `obsm`, `uns`, the predicate-index sections
-  and the deletion vector.** `varm`, `obsp`, `varp`, `adata.raw`, detection
-  bitmaps and the group index are dropped — and because `build-csc --in-place`
-  renames a wholly new file over the target carrying no prior catalog,
-  `scx rollback` cannot bring them back. It does warn. If the input has any of
-  them, copy out to a separate `<OUTPUT>` rather than rewriting in place, or use
-  `scx optimize`, which carries all of them.
+**`merge` carries the cell–cell graph in its COO encoding, and refuses a partial
+`obsm`.** A COO `obsp` graph is rebased by each input's offset in the
+concatenated obs axis; `varp` comes from input 0, the rule `var` and `varm`
+already follow. Three things this means in practice:
 
-Both are known defects rather than intended behaviour, and both are scheduled to
-be fixed; the table records what the code does today, not what it should do.
+- `merge --sort-by` **refuses** an input carrying COO `obsp`, the way it already
+  refuses `obsm`: a sorted merge interleaves rows, so there is no per-input
+  output row range to record. Merge without `--sort-by`, then `scx sort`.
+- An `obsm` / `obsp` key that some inputs have and others lack is now a hard
+  error naming the axis, the key and the input — the same answer a missing
+  *layer* has always had. Merging 100 per-sample files where one lacks `X_umap`
+  used to yield an atlas with no UMAP and no message. Drop the key from the
+  others, or add it to the one, before merging. A key whose `data` column
+  disagrees in dtype or nullability across inputs is refused for the same
+  reason: the merged shards are read back under one schema.
+- The **CSR-backed** `obsp` encoding (`ObspCsrShard`) is **not** carried, by any
+  merge path, and does not trigger the sorted-merge refusal. Nothing outside
+  `scx optimize` reads one, so there is nothing to rebase — `compact` and `sort`
+  drop it too. It is dropped with a warning; recompute neighbours on the merged
+  file. `scx optimize` does **not** help, because it re-emits the graph in this
+  same encoding. **The warning does not reach R**: `rscx` installs no Rust `log`
+  sink, so `rscx::scx_merge` still drops it silently. That is a gap in the R
+  binding, not in the op.
+
+Modality-scoped `obsp` / `varp` are also dropped, with a warning: the format
+has no per-modality pairwise reader to round-trip them through.
+
+**`build-csc` and `scx upgrade` carry everything `optimize` does, plus
+`adata.raw`.** They used to copy only layers, `obsm`, `uns`, the predicate-index
+sections and the deletion vector, dropping `varm`, `obsp`, `varp`, `adata.raw`,
+detection bitmaps and the group index — unrecoverably on the in-place forms,
+which rename a wholly new file over the target carrying no prior catalog. The
+one thing still dropped is a layer's CSC sidecar (rerun `scx build-csc`).
+
+**A detection bitmap does not survive a rewrite that canonicalizes the matrix
+under it.** `optimize` and `scx upgrade` both canonicalize, and canonicalizing
+drops explicit zeros — which changes which genes a row *stores*, and a detection
+bitmap records exactly that. Both ops therefore drop the sidecar, with a
+warning, when canonicalizing actually rewrote X, and carry it otherwise. Every
+file a current writer produces is already canonical, so in practice the sidecar
+survives; a pre-v3 file with explicit zeros is the case that loses it. Rebuild
+with `scx sort --bitmap always`.
 
 ### Deletion vectors: carried vs. applied
 
@@ -173,22 +200,25 @@ would flatten every modality's shards into one global matrix and zero the
 modality table — and multimodal only requires v2, so it lands in this branch.
 `optimize` and `build-csc` refuse for the same reason.
 
-It copies layers, `obsm`, `uns`, predicate indexes and deletion vectors. It does
-**not** carry detection bitmaps, `varm`, `obsp`, `varp`, `adata.raw`, layer CSC
-sidecars, or the grouped-sort group index — the same allowlist `build-csc` uses, and the same
-gap. On the in-place form of either op — a rename over the target carrying no
-prior catalog — that loss cannot be rolled back, so the op warns before writing:
+It copies layers, `obsm`, `varm`, `obsp` (both the COO and CSR-backed forms),
+`varp`, `uns`, `adata.raw`, the grouped-sort group index, predicate indexes and
+deletion vectors — the same allowlist `build-csc` uses. All of that is sound for
+one reason: both ops preserve the global obs row space and the CSR shard
+boundaries 1:1, so a section keyed to either stays valid.
+
+The one section it does not carry is a layer's CSC sidecar; rerun
+`scx build-csc`. On the in-place form of either op — a rename over the target
+carrying no prior catalog — a loss cannot be rolled back, so the op warns before
+writing:
 
 ```
-scx upgrade: the output will not carry varm, obsp — this rewrite copies only
-layers, obsm, uns, predicate indexes and deletion vectors. Copy them across from
-the input if you need them, or use `scx optimize`, which carries obsm / varm /
-obsp / varp.
+scx upgrade: the output will not carry layer CSC sidecars (rebuild: scx
+build-csc) — rebuild them against the output if you need them.
 ```
 
-`varm` / `obsp` / `varp` are user data with no rebuild path; bitmaps and `.raw`
-can be regenerated by the op that produced them. Prefer `scx optimize`, which
-carries `obsm` / `varm` / `obsp` / `varp` through.
+Detection bitmaps are a separate case, because what invalidates them is not the
+allowlist but the canonicalization: see the note above. When canonicalizing
+actually rewrites X, the sidecar is dropped with its own warning.
 
 ### Restoring CSC after a mutating operation
 

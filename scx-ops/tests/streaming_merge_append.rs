@@ -2280,10 +2280,16 @@ fn merge_streams_multimodal_per_modality_obsm() {
 }
 
 #[test]
-fn merge_streams_drops_obsm_keys_missing_from_any_input() {
-    // Phase 3d: existing semantic preserved — if any input lacks the
-    // obsm key, the key is dropped from the output. Input 0 has X_pca,
-    // input 1 does not.
+fn merge_streams_refuses_obsm_keys_missing_from_any_input() {
+    // Phase 5b, review §6.4. This test used to be
+    // `merge_streams_drops_obsm_keys_missing_from_any_input` and asserted
+    // `n_obsm == 0` under the heading "existing semantic preserved" — i.e. it
+    // specified the silent drop as intended behaviour, the same way `append`'s
+    // categorical tests specify `Utf8`. It was preserving a `continue` with no
+    // diagnostic, while a *layer* in exactly this position had always been a
+    // hard `LayerMissing` naming the file index.
+    //
+    // Input 0 has X_pca, input 1 does not.
     let dir = tempfile::tempdir().unwrap();
     let var = var_batch();
     let p0 = dir.path().join("a.scx");
@@ -2292,22 +2298,12 @@ fn merge_streams_drops_obsm_keys_missing_from_any_input() {
     write_legacy_input(&p1, 50, "donor_B", &var, None); // no obsm
 
     let out = dir.path().join("merged.scx");
-    scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap();
-
-    let reader = ScxReader::open(&out).unwrap();
-    let n_obsm = reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| {
-            (e.section_type == SectionType::ObsmEmbeddingShard
-                || e.section_type == SectionType::ObsmEmbedding)
-                && e.name.starts_with("obsm/")
-        })
-        .count();
-    assert_eq!(
-        n_obsm, 0,
-        "obsm key missing from any input must be dropped from merge output"
+    let err = scx_ops::merge(&[p0.as_path(), p1.as_path()], &out)
+        .expect_err("an obsm key input 1 lacks must not be dropped without a word");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("obsm") && msg.contains("X_pca") && msg.contains('1'),
+        "the error must name the axis, the key and the input that lacks it, got: {msg}"
     );
 }
 

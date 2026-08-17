@@ -246,6 +246,9 @@ pub fn optimize_with_framing(
         format_version: out_format_version,
         ..Default::default()
     };
+    // Set when canonicalising X actually changed the matrix — see the
+    // detection-bitmap block far below, which is the only consumer.
+    let mut x_was_rewritten = false;
     for entry in x_entries
         .into_iter()
         .chain(layer_entries)
@@ -259,6 +262,15 @@ pub fn optimize_with_framing(
         let (indptr_i64, indices_i32, mut values) = reader.read_shard_from_entry(entry)?;
         let mut indptr: Vec<u64> = indptr_i64.iter().map(|&v| v as u64).collect();
         let mut indices: Vec<u32> = indices_i32.iter().map(|&v| v as u32).collect();
+        // Whether canonicalisation rewrote **X** specifically, which is what
+        // the detection bitmaps below are keyed to. `canonicalize_csr`
+        // short-circuits on already-canonical input, so this is the same test
+        // it runs internally and costs nothing extra on the common path.
+        if entry.section_type == SectionType::CsrShard
+            && !scx_sparse::is_canonical_csr(&indptr, &indices, &values)
+        {
+            x_was_rewritten = true;
+        }
         canonicalize_csr(&mut indptr, &mut indices, &mut values);
 
         let pre = encode_one_shard(
@@ -316,17 +328,42 @@ pub fn optimize_with_framing(
 
     // Detection-bitmap shards (SCXB) are keyed to CSR shard-local rows and are
     // read back in `row_start` order (`bitmap_shards_for_modality`). Optimize
-    // preserves row order and CSR shard boundaries 1:1, and `canonicalize_csr`
-    // only reorders `(col, val)` *within* a row (the set of expressed genes per
-    // row is unchanged), so the gene→rows-expressing bitmaps stay valid — copy
-    // them verbatim (sorted by `row_start` for deterministic output). Dropping
-    // them would silently disable `detection_counts` / `cells_expressing`.
+    // preserves row order and CSR shard boundaries 1:1, so the keys stay valid
+    // and the sidecar is copied verbatim (sorted by `row_start` for
+    // deterministic output). Dropping it unconditionally would silently disable
+    // `detection_counts` / `cells_expressing`.
+    //
+    // ⚠️ The clause that used to justify this was **false**, and it read
+    // plausibly for two releases: "`canonicalize_csr` only reorders `(col,
+    // val)` within a row (the set of expressed genes per row is unchanged)".
+    // `canonicalize_csr` also calls `drop_explicit_zeros_inplace`, and
+    // `BitmapShard::build_from_csr` records a gene for a row whenever the row
+    // *stores* that column, regardless of the value in it. So an input holding
+    // an explicit zero came out of `scx optimize` with a sidecar claiming a
+    // gene the output's own X no longer stores, and `detection_counts`
+    // over-reported it with nothing to notice by. Found in Phase 5b while
+    // giving `upgrade` the same carry; `upgrade`'s cell is conditional for
+    // exactly this reason, and now so is this one.
+    //
+    // Rare in practice — `canonicalize_csr` short-circuits via
+    // `is_canonical_csr` and every file a current writer produces is canonical
+    // — which is why the sidecar is dropped only when X was actually rewritten,
+    // rather than dropped outright the way the CSC sidecar is.
     let mut bitmap_entries: Vec<_> = reader
         .catalog()
         .entries
         .iter()
         .filter(|e| e.section_type == SectionType::BitmapShard)
         .collect();
+    if x_was_rewritten && !bitmap_entries.is_empty() {
+        log::warn!(
+            "scx optimize: canonicalizing X changed which genes each row stores, so the \
+             detection bitmaps built against the old matrix would over-report and have \
+             been dropped. Rebuild them with `scx sort --bitmap always` or a re-convert \
+             if you need `detection_counts` / `cells_expressing`."
+        );
+        bitmap_entries.clear();
+    }
     bitmap_entries.sort_by_key(|e| e.stats.as_ref().map(|s| s.row_start).unwrap_or(0));
     for entry in bitmap_entries {
         let bytes = reader.section_bytes(entry)?;

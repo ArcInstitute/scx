@@ -699,10 +699,28 @@ pub(crate) fn remap_obsp_coo(
     batch: &arrow::array::RecordBatch,
     old_to_new: &[i64],
 ) -> Result<arrow::array::RecordBatch> {
+    // The surviving axis is exactly the rows that map somewhere, which is what
+    // `compact` and `sort` want: they rewrite one file's graph into a file whose
+    // obs axis is that same graph's surviving rows.
+    let new_dim = old_to_new.iter().filter(|&&v| v >= 0).count() as i64;
+    remap_obsp_coo_to_dim(batch, old_to_new, new_dim)
+}
+
+/// [`remap_obsp_coo`] with the output dimension stated rather than derived.
+///
+/// `merge` needs this: it remaps each input's graph into the **concatenated**
+/// obs axis, so the output `n_rows`/`n_cols` is the merged total and not the
+/// number of endpoints this particular input contributed. Deriving it — which
+/// is right for every single-file rewrite — would stamp each input's own row
+/// count onto a shard of a much larger matrix, and a reader assembling the
+/// shards would see a cover that disagrees with itself.
+pub(crate) fn remap_obsp_coo_to_dim(
+    batch: &arrow::array::RecordBatch,
+    old_to_new: &[i64],
+    new_dim: i64,
+) -> Result<arrow::array::RecordBatch> {
     use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field};
-
-    let new_dim = old_to_new.iter().filter(|&&v| v >= 0).count() as i64;
 
     let rows = obsp_coords_as_i64(batch, "row")?;
     let cols = obsp_coords_as_i64(batch, "col")?;

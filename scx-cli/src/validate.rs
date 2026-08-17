@@ -2,7 +2,6 @@ use std::path::Path;
 
 use scx_format_io::checksum::blake3_hash;
 use scx_format_io::reader::ScxReader;
-use scx_format_io::section::SectionType;
 
 /// Validate all section checksums. Returns true if all pass.
 ///
@@ -79,10 +78,12 @@ pub fn run_validate(
         // be a false failure — skip the canonical-CSR loop below v3.
         if header.format_version >= 3 {
             for entry in &catalog.entries {
-                if matches!(
-                    entry.section_type,
-                    SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
-                ) {
+                // The shared predicate, not a second hand-written list. This
+                // loop used to name CsrShard / LayerCsrShard / ObspCsrShard and
+                // omit `RawCsrShard`, so `scx validate --deep` skipped `.raw`
+                // entirely — reopening the gap SCX-008 closed inside the reader,
+                // one crate over, where nothing compared the two lists.
+                if ScxReader::is_canonical_csr_section(entry.section_type) {
                     n_checks += 1;
                     let result = reader.validate_canonical_csr_entry(entry);
                     let passed = result.is_ok();

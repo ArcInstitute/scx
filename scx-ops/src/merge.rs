@@ -17,6 +17,7 @@ use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
 use crate::helpers::{encode_value, widest_value_encoding};
 use crate::merge_options::MergeOptions;
+use crate::merge_pairwise;
 use crate::merge_sorted;
 use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
@@ -337,14 +338,32 @@ pub fn merge_with_options(
     // ---------------------------------------------------------------
     // Sorted k-way merge. Self-contained path so
     // the legacy concatenation below stays byte-identical. Reorders obs /
-    // X / layers globally by the key; var-axis sections preserved; obsm
-    // rejected for now; obsp dropped (as plain merge does).
+    // X / layers globally by the key; var-axis sections preserved (including
+    // varm and varp, which a row permutation does not touch); obsm and COO obsp
+    // both rejected up front — a sorted merge interleaves rows, so there is no
+    // per-input output row range to stamp on an obsp shard. The CSR-backed obsp
+    // encoding is dropped with a warning here as on every merge path.
     // ---------------------------------------------------------------
     if sorted {
         if merge_sorted::has_obsm(&readers) {
             return Err(OpsError::InvalidInput(
                 "merge --sort-by does not yet support obsm; merge without --sort-by then \
                  `scx sort`, or drop obsm before a sorted merge"
+                    .into(),
+            ));
+        }
+        // Same rejection, same reason. `write_obsp_shard_coo` stamps the output
+        // row range a shard covers and the reader verifies a contiguous cover,
+        // and a sorted merge interleaves every input's rows — so there is no
+        // per-input range to stamp. Refusing is the honest answer; carrying the
+        // graph as one un-sharded section would work but would reintroduce the
+        // whole-graph materialisation the sharded path exists to avoid.
+        if merge_pairwise::has_global_obsp(&readers) {
+            return Err(OpsError::InvalidInput(
+                "merge --sort-by does not yet support COO obsp; merge without --sort-by \
+                 then `scx sort`, or drop obsp before a sorted merge. (A CSR-backed \
+                 obsp graph is dropped with a warning on every merge path, sorted or \
+                 not, so it does not reach this guard.)"
                     .into(),
             ));
         }
@@ -365,8 +384,10 @@ pub fn merge_with_options(
             &mut obs_index_builder,
         )?;
         writer.write_var(&var)?;
-        // varm is var-axis (shared, unchanged); obsm errored above.
+        // varm and varp are var-axis (shared, unchanged, taken from input 0);
+        // obsm and obsp both errored above.
         merge_global_dense_mapping_sharded(&readers, &mut writer, DenseMappingAxis::Varm, n_vars)?;
+        merge_pairwise::carry_varp_only(&readers, &mut writer)?;
         let mut uns_conflicts_warned: usize = 0;
         if let Some(combined_uns) =
             combine_uns_for_merge(&readers, options.uns_policy, &mut uns_conflicts_warned)?
@@ -620,10 +641,22 @@ pub fn merge_with_options(
     // Phase 3b: stream global obsm and varm shard-by-shard. Each input's
     // shards are re-stamped with cumulative `row_start` and emitted as
     // the next output shard via `write_obsm_shard` / `write_varm_shard`.
-    // Legacy single-section inputs are treated as one source shard. Keys
-    // missing from any input are dropped (existing semantic).
+    // Legacy single-section inputs are treated as one source shard. A key any
+    // input lacks is a hard `DenseMappingMissing` (§6.4); this said "dropped
+    // (existing semantic)" until Phase 5b, which is the semantic that lost a
+    // 100-file atlas its `X_umap` without a word.
     merge_global_dense_mapping_sharded(&readers, &mut writer, DenseMappingAxis::Obsm, total_n_obs)?;
     merge_global_dense_mapping_sharded(&readers, &mut writer, DenseMappingAxis::Varm, n_vars)?;
+
+    // §6.4: the pairwise graphs. obsp is obs×obs, so every endpoint is rebased
+    // by its input's offset in the concatenated row space; varp is var×var on a
+    // shared axis, so input 0's is the canonical one.
+    merge_pairwise::merge_pairwise_sections(
+        &readers,
+        &mut writer,
+        &input_row_offsets(&readers),
+        total_n_obs,
+    )?;
 
     // Merge uns according to the policy. Default `UnsPolicy::First`
     // matches today's pre-refactor behaviour (read first input's
@@ -887,6 +920,55 @@ pub fn merge_with_options(
     })
 }
 
+/// The subset of `dense_mapping_shards_sorted`'s hits that really are shards of
+/// `key`.
+///
+/// `dense_mapping_shards_sorted` settles membership with
+/// `e.name.starts_with(name_prefix)`, so a lookup for `g` (prefix
+/// `obsm/g_shard_`) also collects `obsm/g_shard_x_shard_0` — a shard of the
+/// separate, legal key `g_shard_x`. Both would be re-emitted under `g`,
+/// `cumulative_rows` would exceed `n_rows_total`, the merge would succeed, and
+/// `read_obsm` would then reject the oversized cover.
+///
+/// This is the same defect `merge_pairwise::pairwise_entries` had, fixed the
+/// same way and for the same reason: the shard index is the segment after the
+/// prefix and it has to *parse*, which is what `read_sharded_layout_by_prefix`
+/// has always required. Filtered here rather than inside the catalog helper
+/// because merge is its only non-test caller, so the narrower change is also
+/// the complete one.
+///
+/// Found by codex - gpt-5.6-sol.
+fn shards_of_key<'a>(
+    shards: Vec<&'a scx_format_io::catalog::FullCatalogEntry>,
+    shard_name_prefix: &str,
+) -> Vec<&'a scx_format_io::catalog::FullCatalogEntry> {
+    shards
+        .into_iter()
+        .filter(|e| {
+            e.name
+                .strip_prefix(shard_name_prefix)
+                .is_some_and(|suffix| suffix.parse::<u32>().is_ok())
+        })
+        .collect()
+}
+
+/// Each input's first row in the concatenated obs space.
+///
+/// A concatenating merge drops no rows, so this is just a running sum of
+/// `n_obs`. Shared by the deletion-vector remap and the obsp remap because they
+/// are the same rebase of the same axis, and having them derive it separately is
+/// how the two would drift.
+fn input_row_offsets(readers: &[ScxReader]) -> Vec<u64> {
+    readers
+        .iter()
+        .scan(0u64, |acc, r| {
+            let start = *acc;
+            *acc += r.n_obs();
+            Some(start)
+        })
+        .collect()
+}
+
 /// Union the inputs' deletion vectors into the merged output's row space, or
 /// `Ok(None)` when no input has any.
 ///
@@ -923,14 +1005,7 @@ fn remap_deletion_vectors(
     // out_rows[input][input_row] — built once, then reused for every bitmap of
     // that input. For the concatenation case this is just an offset, so only the
     // sorted case materializes a map.
-    let offsets: Vec<u64> = readers
-        .iter()
-        .scan(0u64, |acc, r| {
-            let start = *acc;
-            *acc += r.n_obs();
-            Some(start)
-        })
-        .collect();
+    let offsets = input_row_offsets(readers);
     let sorted_map: Option<Vec<Vec<u64>>> = match order {
         None => None,
         Some(order) => {
@@ -1141,11 +1216,24 @@ fn merge_multimodal(
     // Phase 3b: stream global obsm shard-by-shard (multimodal). Same
     // pattern as single-modality: every input's shards (or legacy
     // single-section as one source shard) are re-stamped and emitted
-    // as the next output shard. Keys missing from any input are dropped.
+    // as the next output shard. A key any input lacks is a hard
+    // `DenseMappingMissing` (§6.4), not the silent drop this said until 5b.
     // Multimodal global varm is omitted by design — `n_vars` differs
     // per modality, so there is no canonical `n_rows_total` for a
     // global varm shard. Per-modality varm is handled below in Step 5.
     merge_global_dense_mapping_sharded(readers, &mut writer, DenseMappingAxis::Obsm, total_n_obs)?;
+
+    // §6.4, multimodal: a file-scope obs×obs graph is carried on the same
+    // offsets as everything else on the shared obs axis. A file-scope `varp` is
+    // omitted for the same reason global `varm` is, just above.
+    // Modality-scoped pairwise graphs are dropped with a warning — there is no
+    // per-modality pairwise reader to round-trip them through.
+    merge_pairwise::merge_obsp_only(
+        readers,
+        &mut writer,
+        &input_row_offsets(readers),
+        total_n_obs,
+    )?;
 
     // Register modalities in input order.
     for info in &table.entries {
@@ -1255,9 +1343,11 @@ fn merge_multimodal(
     // Phase 3b: stream per-modality obsm and varm shard-by-shard via
     // the new `write_obsm_shard_for` / `write_varm_shard_for` writer
     // APIs. Each input's shards (or legacy single-section as one source
-    // shard) are re-stamped and emitted as the next output shard. Keys
-    // missing from any input are dropped. Per-modality varm support is
-    // newly added in Phase 3b — it was silently dropped pre-Phase-3.
+    // shard) are re-stamped and emitted as the next output shard. A key any
+    // input lacks is dropped **with a warning** here — unlike the global helper,
+    // which hard-errors: an input may legitimately carry nothing at all for a
+    // given modality+axis, and §6.4 measured the global path. Per-modality varm
+    // support is newly added in Phase 3b — it was silently dropped pre-Phase-3.
     for (idx, info) in table.entries.iter().enumerate() {
         let modality_id = (idx + 1) as u8;
         merge_per_modality_dense_mapping_sharded(
@@ -1835,8 +1925,11 @@ impl DenseMappingAxis {
 /// Row semantics differ by axis:
 /// - **obsm**: rows align with `obs`, which is concatenated across
 ///   inputs, so this helper walks every input's shards in order and
-///   re-stamps each as the next output shard. Keys missing from any
-///   input are dropped (existing semantic).
+///   re-stamps each as the next output shard. Keys are the **union**
+///   across source inputs, and a key any input lacks is a hard
+///   `DenseMappingMissing` (§6.4) — this rustdoc said "dropped (existing
+///   semantic)" until Phase 5b, which is the semantic that lost a
+///   100-file atlas its `X_umap` without a word.
 /// - **varm**: rows align with `var`, which is **shared** across
 ///   inputs (validated by var-identity check at merge entry).
 ///   Concatenating varm would duplicate rows, so this helper takes
@@ -1863,10 +1956,15 @@ fn merge_global_dense_mapping_sharded(
         DenseMappingAxis::Varm => &readers[..1],
     };
 
-    let keys: BTreeSet<String> = readers[0]
-        .catalog()
-        .entries
+    // The **union** across every source input, not input 0's set. Taking it
+    // from `readers[0]` alone (§6.4) meant a key only a later input carried was
+    // never considered — so merging files where the first happened to lack
+    // `X_umap` produced an atlas with no UMAP and nothing to notice it by. For
+    // `varm`, `source_readers` is `&readers[..1]`, so the union *is* input 0's
+    // set and this changes nothing on that axis.
+    let keys: BTreeSet<String> = source_readers
         .iter()
+        .flat_map(|reader| reader.catalog().entries.iter())
         .filter(|e| e.modality_id == 0)
         .filter_map(|e| {
             if e.section_type == shard_type {
@@ -1882,7 +1980,13 @@ fn merge_global_dense_mapping_sharded(
                 Some(stem[..pos].to_string())
             } else if e.section_type == legacy_type {
                 let stem = e.name.strip_prefix(&prefix_slash)?;
-                if stem.contains('/') || stem.contains("_shard_") {
+                // `/` still disqualifies (that is the per-modality namespace),
+                // but `_shard_` no longer does: the section *type* already says
+                // this is a legacy single section, and the reader takes its stem
+                // verbatim — so excluding it silently dropped a key the reader
+                // will happily list, which contradicted the union this helper
+                // now claims to take. Same fix as `global_pairwise_keys`.
+                if stem.contains('/') {
                     return None;
                 }
                 Some(stem.to_string())
@@ -1892,7 +1996,7 @@ fn merge_global_dense_mapping_sharded(
         })
         .collect();
 
-    'next_key: for key in &keys {
+    for key in &keys {
         // Validate presence in every *source* input before writing
         // anything. For obsm, source_readers == readers (concatenate).
         // For varm, source_readers == &readers[..1] (input 0 only).
@@ -1905,10 +2009,12 @@ fn merge_global_dense_mapping_sharded(
         let legacy_name = format!("{prefix_slash}{key}");
         for (idx, reader) in source_readers.iter().enumerate() {
             // Already sorted by row_start by the catalog helper.
-            let shards =
+            let shards = shards_of_key(
                 reader
                     .catalog()
-                    .dense_mapping_shards_sorted(shard_type, 0, &shard_name_prefix);
+                    .dense_mapping_shards_sorted(shard_type, 0, &shard_name_prefix),
+                &shard_name_prefix,
+            );
             let legacy = if shards.is_empty() {
                 reader.catalog().entries.iter().find(|e| {
                     e.section_type == legacy_type && e.modality_id == 0 && e.name == legacy_name
@@ -1917,7 +2023,17 @@ fn merge_global_dense_mapping_sharded(
                 None
             };
             if shards.is_empty() && legacy.is_none() {
-                continue 'next_key;
+                // §6.4: this was a bare `continue 'next_key` — the key was
+                // dropped from the output with no diagnostic, while a *layer*
+                // in this exact position was already a hard `LayerMissing`
+                // naming the file index. Same loss, same unrecoverability, so
+                // now the same answer.
+                return Err(OpsError::DenseMappingMissing {
+                    axis: prefix,
+                    key: key.clone(),
+                    file_index: idx,
+                    total: source_readers.len(),
+                });
             }
             per_input.push((idx, shards, legacy));
         }
@@ -1997,7 +2113,9 @@ fn merge_global_dense_mapping_sharded(
 /// for `obsm/{mname}/{key}_shard_*` (sharded) or `obsm/{mname}/{key}`
 /// (legacy), filtered by `modality_id`, and re-stamps via the new
 /// `write_obsm_shard_for` / `write_varm_shard_for` writer APIs. Keys
-/// missing from any input are dropped. Inputs that have no entries
+/// missing from any input are dropped **with a warning** (the global
+/// helper hard-errors instead — see §6.4 and the note at the `continue`
+/// below). Inputs that have no entries
 /// for this modality+axis combination are also tolerated — the helper
 /// is a no-op when there's nothing to merge (consistent with the
 /// existing varm-not-present behaviour in multimodal files).
@@ -2023,10 +2141,13 @@ fn merge_per_modality_dense_mapping_sharded(
         DenseMappingAxis::Varm => &readers[..1],
     };
 
-    let keys: BTreeSet<String> = readers[0]
-        .catalog()
-        .entries
+    // The union across source inputs, for the same reason as the global helper:
+    // input 0's set alone made a key only a later input carried invisible. What
+    // happens to a key some input lacks differs, though — see the `continue`
+    // below.
+    let keys: BTreeSet<String> = source_readers
         .iter()
+        .flat_map(|reader| reader.catalog().entries.iter())
         .filter(|e| e.modality_id == modality_id && e.name.starts_with(&key_prefix))
         .filter_map(|e| {
             let stem = e.name.strip_prefix(&key_prefix)?;
@@ -2055,9 +2176,12 @@ fn merge_per_modality_dense_mapping_sharded(
         )> = Vec::with_capacity(source_readers.len());
         for (idx, reader) in source_readers.iter().enumerate() {
             // Already sorted by row_start by the catalog helper.
-            let shards = reader.catalog().dense_mapping_shards_sorted(
-                shard_type,
-                modality_id,
+            let shards = shards_of_key(
+                reader.catalog().dense_mapping_shards_sorted(
+                    shard_type,
+                    modality_id,
+                    &shard_name_prefix,
+                ),
                 &shard_name_prefix,
             );
             let legacy = if shards.is_empty() {
@@ -2070,6 +2194,21 @@ fn merge_per_modality_dense_mapping_sharded(
                 None
             };
             if shards.is_empty() && legacy.is_none() {
+                // **Not** the global helper's hard error, deliberately. That
+                // helper's tolerance was an accident of a bare `continue`; this
+                // one is documented above as intentional, because an input may
+                // legitimately carry nothing at all for a given modality+axis
+                // and refusing the whole merge over that would be refusing the
+                // ordinary multimodal case. What was wrong here was only the
+                // silence — a dropped key is now named. Review §6.4 measured
+                // the global path; narrowing the hard error to it is a
+                // deliberate scope choice, not an oversight.
+                log::warn!(
+                    "scx merge: dropping {prefix}['{modality_name}/{key}'] — input file \
+                     {idx} of {} does not carry it. Every input must have a key for it \
+                     to survive the merge.",
+                    source_readers.len()
+                );
                 continue 'next_key;
             }
             per_input.push((idx, shards, legacy));

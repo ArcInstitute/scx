@@ -388,10 +388,12 @@ impl RewriteOp {
 /// The table.
 ///
 /// Read it as: *if the input carries this family, this is what the op does with
-/// it.* Entries marked `Dropped { warns: false }` are silent data loss; the
-/// four flagged `§6.3` / `§6.4` below are open Majors from the 2026-08-05
-/// review, declared here rather than fixed so the fix arrives as a visible diff
-/// against a stated baseline.
+/// it.* Entries marked `Dropped { warns: false }` are silent data loss.
+///
+/// §6.3 and §6.4 — the ten cells this doc used to describe as "open Majors
+/// declared here rather than fixed" — were closed in Phase 5b. Nothing in the
+/// table claims to be an open bug any more, and
+/// `no_cell_still_claims_to_be_an_open_bug` keeps it that way.
 pub fn policy(op: RewriteOp, family: SectionFamily) -> Carry {
     policy_scoped(op, family, SectionScope::Global)
 }
@@ -429,6 +431,18 @@ fn per_modality_override(op: RewriteOp, family: SectionFamily) -> Option<Carry> 
         (RewriteOp::Sort, F::Obsp | F::ObspCsr | F::Varp) => Some(Carry::Dropped {
             why: "no per-modality pairwise reader exists, so it cannot be round-tripped",
             warns: false,
+        }),
+        // The same split, and the reason this override list is the first thing
+        // to touch when an op gains a pairwise carry. Giving `merge` a global
+        // `Obsp => Remapped` without this row makes the per-modality case
+        // inherit it, and `merge_multimodal` has no per-modality pairwise reader
+        // either — so a multimodal merge of a file whose only graph is
+        // modality-scoped would write its whole output and then hard-fail the
+        // audit, on a merge that had always worked. That is the failure shape
+        // review round 1 of Phase 5a found three times.
+        (RewriteOp::Merge, F::Obsp | F::ObspCsr | F::Varp) => Some(Carry::Dropped {
+            why: "no per-modality pairwise reader exists, so it cannot be round-tripped",
+            warns: true,
         }),
         _ => None,
     }
@@ -528,21 +542,30 @@ fn merge(family: SectionFamily) -> Carry {
         F::Provenance => Carry::Rebuilt,
         F::ObsPredicateIndex | F::VarPredicateIndex => Carry::Rebuilt,
         F::ModalityTable => Carry::Rebuilt,
-        // §6.4 — OPEN MAJOR. `compact` remaps obsp through its keep-mask and
-        // `sort` through its permutation, so a merged kNN graph vanishes where
-        // a compacted or sorted one survives, with no warning. Phase 5b.
-        F::Obsp => Carry::Dropped {
-            why: "§6.4 (open): merge has no obsp writer; a merged graph is lost silently",
-            warns: false,
-        },
+        // Every input's COO graph is rebased by that input's offset in the
+        // concatenated obs space and re-emitted as the next output shard
+        // (`merge_pairwise`). Was §6.4: merge had no obsp writer at all, so a
+        // merged kNN graph vanished where a compacted or sorted one survived.
+        F::Obsp => Carry::Remapped,
+        // Still dropped, and for the reason `compact` and `sort` drop it rather
+        // than §6.4's: nothing in the crate reads a CSR-backed pairwise graph
+        // outside `optimize`'s shard loop, so there is nothing to rebase.
+        //
+        // It **warns** now. While the COO cell said "dropped, silently" this was
+        // one silent drop among several; once merge started carrying COO obsp
+        // and the docs said so, the unqualified word "obsp" made this the one
+        // graph a user is told survives and does not.
         F::ObspCsr => Carry::Dropped {
-            why: "§6.4 (open): merge has no obsp writer, in either encoding",
-            warns: false,
+            why: "no CSR-graph reader outside optimize's shard loop; nothing to rebase",
+            warns: true,
         },
-        // §6.4 — OPEN MAJOR, same shape on the var axis.
-        F::Varp => Carry::Dropped {
-            why: "§6.4 (open): merge has no varp writer; lost silently",
-            warns: false,
+        // Var-axis on both dimensions, and merge validates one shared var axis,
+        // so input 0's graph is the canonical one — exactly as for `varm`, and
+        // `Conditional` for exactly the same reason: a key only a later input
+        // carries is not carried, and multimodal omits the global section by
+        // design because `n_vars` is per-modality.
+        F::Varp => Carry::Conditional {
+            on: "taken from input 0 only; multimodal global varp omitted by design",
         },
         F::XCsc => Carry::Dropped {
             why: "output row space differs from every input's (rebuild: scx build-csc)",
@@ -584,9 +607,18 @@ fn optimize(family: SectionFamily) -> Carry {
         // copied as an aux section — which is why optimize is the only op that
         // keeps it.
         F::ObspCsr => Carry::Verbatim,
-        // Row order and CSR shard boundaries are 1:1, so shard-local bitmap row
-        // keys and the group index's global ranges both stay valid.
-        F::Bitmap | F::GroupIndex => Carry::Verbatim,
+        // Row order and CSR shard boundaries are 1:1, so the group index's
+        // global ranges stay valid.
+        F::GroupIndex => Carry::Verbatim,
+        // Bitmap row keys are shard-local and the boundaries are 1:1, so the
+        // *keys* survive — but what the sidecar records is which genes a row
+        // stores, and `canonicalize_csr` drops explicit zeros. The old comment
+        // here claimed canonicalisation left the per-row expressed-gene set
+        // alone; it does not, and a carried sidecar over-reported. Same
+        // condition, same wording, as `upgrade`'s.
+        F::Bitmap => Carry::Conditional {
+            on: "carried unless canonicalisation changed which genes a row stores",
+        },
         F::DeletionVectors => Carry::Verbatim,
         F::ObsPredicateIndex | F::VarPredicateIndex => Carry::Verbatim,
         F::Provenance => Carry::Rebuilt,
@@ -664,8 +696,11 @@ fn sort(family: SectionFamily) -> Carry {
 
 /// `build-csc` rewrites the file 1:1 and appends a column-major sidecar. Its
 /// carry set is [`crate::rewrite_helpers::copy_auxiliary_sections`]'s allowlist,
-/// which is the narrowest of any op here — and its output renames over the
-/// input with no prior catalog, so `scx rollback` cannot recover what it drops.
+/// which used to be the narrowest of any op here — Phase 5b widened it to
+/// everything `optimize` carries plus `adata.raw`, leaving only a layer's CSC
+/// sidecar. Its output still renames over the input with no prior catalog, so
+/// `scx rollback` cannot recover what it does drop, which is why the allowlist
+/// being narrow mattered so much.
 fn build_csc(family: SectionFamily) -> Carry {
     use SectionFamily as F;
     match family {
@@ -683,38 +718,31 @@ fn build_csc(family: SectionFamily) -> Carry {
         F::Provenance => Carry::Rebuilt,
         // Rejected up front, pointing at `scx subset --modality`.
         F::ModalityTable => Carry::Refuse,
-        // §6.3 — OPEN MAJOR (all four below). `optimize` carries every one of
-        // these and `compact` carries varm/varp. Phase 5b.
-        F::Varm => Carry::Dropped {
-            why: "§6.3 (open): not in the copy allowlist; user data with no rebuild path",
-            warns: true,
-        },
-        F::Obsp => Carry::Dropped {
-            why: "§6.3 (open): not in the copy allowlist; user data with no rebuild path",
-            warns: true,
-        },
-        F::ObspCsr => Carry::Dropped {
-            why: "§6.3 (open): not in the copy allowlist, in either encoding",
-            warns: true,
-        },
-        F::Varp => Carry::Dropped {
-            why: "§6.3 (open): not in the copy allowlist; user data with no rebuild path",
-            warns: true,
-        },
-        F::Raw => Carry::Dropped {
-            why: "§6.3 (open): not in the copy allowlist",
-            warns: true,
-        },
-        F::Bitmap => Carry::Dropped {
-            why: "§6.3 (open): not in the copy allowlist (rebuild: --bitmap)",
-            warns: true,
-        },
-        F::GroupIndex => Carry::Dropped {
-            why: "§6.3 (open): not in the copy allowlist",
-            warns: true,
-        },
+        // Was §6.3, all seven below. The rewrite preserves the global obs row
+        // space and the CSR shard boundaries 1:1, which is what makes a
+        // verbatim copy of each of these sound — and the reason `optimize`
+        // could already carry all but `.raw`. `build-csc --in-place` renames
+        // over the target with no prior catalog, so every one of these was an
+        // unrecoverable loss.
+        F::Varm | F::Obsp | F::Varp => Carry::Verbatim,
+        // Carried verbatim here, unlike in `optimize`, which re-encodes it in
+        // its own CSR shard loop. `build_csc`'s loop filters to `CsrShard`, so
+        // the graph never passes through it and is copied as an aux section.
+        F::ObspCsr => Carry::Verbatim,
+        // Raw shares the obs axis, which is 1:1, and brings its own `var` with
+        // it. The one family where `build-csc` now carries more than
+        // `optimize`, whose raw drop is a separate open item.
+        F::Raw => Carry::Verbatim,
+        // Shard-local row keys, valid because the shard boundaries are. For
+        // `upgrade`, whose canonicalisation can change which genes a row
+        // stores, the answer is conditional instead — see `upgrade`.
+        F::Bitmap => Carry::Verbatim,
+        // Global output-row ranges plus shard indices, both preserved.
+        F::GroupIndex => Carry::Verbatim,
+        // The one thing genuinely still dropped: a column-major view of a
+        // layer, which nothing in this path rebuilds.
         F::LayerCsc => Carry::Dropped {
-            why: "not in the copy allowlist (rebuild: scx build-csc)",
+            why: "no rebuild path in this op (rebuild: scx build-csc)",
             warns: true,
         },
         F::Unwritten => Carry::Dropped {
@@ -750,6 +778,19 @@ fn upgrade(family: SectionFamily) -> Carry {
         // Dropped with a warning in exactly that case, and only that case.
         F::XCsc => Carry::Conditional {
             on: "carried unless canonicalisation changed the CSR matrix",
+        },
+        // The **same** condition, for a reason that took a Phase 5b test to
+        // surface rather than a reading: a detection bitmap records the genes a
+        // row *stores*, not the genes with a nonzero value there, and
+        // `canonicalize_csr` drops explicit zeros. So a bitmap carried across a
+        // canonicalising rewrite of a non-canonical input claims genes the
+        // output no longer has, and `detection_counts` answers from it.
+        //
+        // `build_csc` does not canonicalise (SCX-005 clamps its output version
+        // precisely so it does not have to), so its cell stays `Verbatim` —
+        // which is why this is one of the two arms that does not delegate.
+        F::Bitmap => Carry::Conditional {
+            on: "carried unless canonicalisation changed which genes a row stores",
         },
         other => build_csc(other),
     }

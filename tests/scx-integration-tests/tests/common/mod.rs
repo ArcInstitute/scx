@@ -30,12 +30,43 @@ pub const N_VARS: usize = 6;
 pub const SHARD_ROWS: usize = 4;
 pub const RAW_N_VARS: usize = 9;
 
+/// What to vary in the all-families fixture.
+///
+/// A struct rather than a run of positional `bool`s. Every knob here exists to
+/// isolate exactly one carry decision, and `build_all_families(dir, name, true,
+/// false, true)` at a call site does not say which — which matters, because
+/// merge validates var identity and requires identical layers across inputs, so
+/// two fixtures compared by a merge test **have to** differ in one thing only.
+#[derive(Clone, Copy, Default)]
+pub struct FixtureShape {
+    /// Omit `varm`. For `merge_succeeds_when_only_a_later_input_has_varm`.
+    pub without_varm: bool,
+    /// Write a second `obsm` key under this name. For merge's key-symmetry
+    /// tests, which need two inputs whose obsm key sets differ by one.
+    pub extra_obsm_key: Option<&'static str>,
+    /// Write the obsp graph under this key instead of `connectivities`.
+    pub obsp_key: Option<&'static str>,
+    /// Store the obsp graph's `data` column as `Float64` instead of `Float32`.
+    ///
+    /// `remap_obsp_coo_to_dim` preserves the source dtype, so two inputs that
+    /// differ here produce shards that cannot be concatenated under one schema.
+    pub obsp_f64_values: bool,
+    /// Store an **explicit zero** as X row 0's first value.
+    ///
+    /// `is_canonical_csr` treats a stored `0.0` as non-canonical, so this is
+    /// what makes `canonicalize_csr` actually rewrite the shard instead of
+    /// short-circuiting — and `BitmapShard::build_from_csr` keys off the stored
+    /// index regardless of its value, so the bitmap written below records a
+    /// gene that canonicalisation is about to remove.
+    pub explicit_zero_in_x: bool,
+}
+
 /// Every family the format can carry, in one file.
 ///
 /// Built by hand rather than by running an op, so it does not inherit any op's
 /// idea of what a file contains — which is the thing under test.
 pub fn fixture_all_families(dir: &Path, name: &str) -> PathBuf {
-    build_all_families(dir, name, true)
+    build_all_families(dir, name, FixtureShape::default())
 }
 
 /// The same file with **no `varm`**, and otherwise byte-for-byte the same shape.
@@ -44,10 +75,47 @@ pub fn fixture_all_families(dir: &Path, name: &str) -> PathBuf {
 /// identity and requires every input to carry the same layers, so the no-varm
 /// side cannot be some other fixture — it has to differ in exactly one family.
 pub fn fixture_all_families_without_varm(dir: &Path, name: &str) -> PathBuf {
-    build_all_families(dir, name, false)
+    build_all_families(
+        dir,
+        name,
+        FixtureShape {
+            without_varm: true,
+            ..FixtureShape::default()
+        },
+    )
 }
 
-fn build_all_families(dir: &Path, name: &str, with_varm: bool) -> PathBuf {
+/// The same file plus one more `obsm` key.
+///
+/// Merge takes its obsm key set from input 0 only and drops any key an input
+/// lacks, both silently; this is the fixture that makes either asymmetry
+/// visible, depending on which side of the merge it is placed.
+pub fn fixture_all_families_with_extra_obsm(dir: &Path, name: &str, key: &'static str) -> PathBuf {
+    build_all_families(
+        dir,
+        name,
+        FixtureShape {
+            extra_obsm_key: Some(key),
+            ..FixtureShape::default()
+        },
+    )
+}
+
+/// The same file with an explicit zero stored in X, so that canonicalisation
+/// has something to do and the detection bitmap written alongside is left
+/// describing a matrix that no longer exists.
+pub fn fixture_with_explicit_zero_in_x(dir: &Path, name: &str) -> PathBuf {
+    build_all_families(
+        dir,
+        name,
+        FixtureShape {
+            explicit_zero_in_x: true,
+            ..FixtureShape::default()
+        },
+    )
+}
+
+fn build_all_families(dir: &Path, name: &str, shape: FixtureShape) -> PathBuf {
     let path = dir.join(name);
     let mut writer = ScxWriter::new(
         &path,
@@ -64,7 +132,14 @@ fn build_all_families(dir: &Path, name: &str, with_varm: bool) -> PathBuf {
     // --- X, in two shards ------------------------------------------------
     let mut shard_ranges: Vec<(u64, u64)> = Vec::new();
     for (shard_idx, row_start) in (0..N_OBS).step_by(SHARD_ROWS).enumerate() {
-        let (indptr, indices, values) = csr_rows(row_start, SHARD_ROWS, N_VARS, 1);
+        let (indptr, indices, mut values) = csr_rows(row_start, SHARD_ROWS, N_VARS, 1);
+        // Row 0's first stored value only. One is enough — `is_canonical_csr`
+        // rejects the whole matrix on the first zero it finds — and keeping it
+        // to one shard means the *other* shard's bitmap stays correct, so a
+        // test can tell "the carry was gated" from "the carry was removed".
+        if shape.explicit_zero_in_x && row_start == 0 {
+            values[0] = 0;
+        }
         writer
             .write_csr_shard(
                 &indptr,
@@ -106,19 +181,22 @@ fn build_all_families(dir: &Path, name: &str, with_varm: bool) -> PathBuf {
 
     // --- obsm / varm -----------------------------------------------------
     writer.write_obsm("X_pca", &dense_embedding(N_OBS)).unwrap();
-    if with_varm {
+    if let Some(key) = shape.extra_obsm_key {
+        writer.write_obsm(key, &dense_embedding(N_OBS)).unwrap();
+    }
+    if !shape.without_varm {
         writer.write_varm("PCs", &dense_embedding(N_VARS)).unwrap();
     }
 
     // --- obsp / varp -----------------------------------------------------
     writer
         .write_obsp_shard_coo(
-            "connectivities",
+            shape.obsp_key.unwrap_or("connectivities"),
             0,
             0,
             N_OBS as u64,
             N_OBS as u64,
-            &coo_batch(N_OBS),
+            &coo_batch_typed(N_OBS, shape.obsp_f64_values),
         )
         .unwrap();
     writer.write_varp("gene_corr", &coo_i32(N_VARS)).unwrap();
@@ -366,11 +444,31 @@ fn dense_embedding(n_rows: usize) -> RecordBatch {
 
 /// obs×obs COO in the Int64 form `write_obsp_shard_coo` takes.
 fn coo_batch(n: usize) -> RecordBatch {
+    coo_batch_typed(n, false)
+}
+
+/// [`coo_batch`] with control over the `data` column's width.
+fn coo_batch_typed(n: usize, f64_values: bool) -> RecordBatch {
+    let (data_type, data): (DataType, Arc<dyn arrow::array::Array>) = if f64_values {
+        (
+            DataType::Float64,
+            Arc::new(arrow::array::Float64Array::from(
+                (0..n).map(|i| (i + 1) as f64).collect::<Vec<_>>(),
+            )),
+        )
+    } else {
+        (
+            DataType::Float32,
+            Arc::new(Float32Array::from(
+                (0..n).map(|i| (i + 1) as f32).collect::<Vec<_>>(),
+            )),
+        )
+    };
     let schema = Arc::new(Schema::new_with_metadata(
         vec![
             Field::new("row", DataType::Int64, false),
             Field::new("col", DataType::Int64, false),
-            Field::new("data", DataType::Float32, false),
+            Field::new("data", data_type, false),
         ],
         HashMap::from([
             ("n_rows".to_string(), n.to_string()),
@@ -386,9 +484,7 @@ fn coo_batch(n: usize) -> RecordBatch {
                     .map(|r| (r + 1) % n as i64)
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(Float32Array::from(
-                (0..n).map(|i| (i + 1) as f32).collect::<Vec<_>>(),
-            )),
+            data,
         ],
     )
     .unwrap()
@@ -482,6 +578,225 @@ pub fn fixture_multimodal_per_modality_obsp(dir: &Path, name: &str) -> PathBuf {
         })
         .unwrap();
 
+    writer.finish().unwrap();
+    path
+}
+
+/// A multimodal file carrying pairwise graphs at **both** scopes.
+///
+/// `fixture_multimodal_per_modality_obsp` deliberately has only the
+/// modality-scoped one, so it cannot distinguish "the global carry ran" from
+/// "nothing ran". This one can: the file-scope graph must survive a merge and
+/// the modality-scoped one must not, in the same output.
+///
+/// That pair is the whole reason `SectionScope` exists. A file with one of each
+/// is also the case where a scope-blind audit is *most* wrong — the surviving
+/// global copy vouches for the lost per-modality one and the loss goes
+/// unremarked.
+pub fn fixture_multimodal_both_obsp_scopes(dir: &Path, name: &str) -> PathBuf {
+    const RNA_VARS: usize = 8;
+    const ADT_VARS: usize = 4;
+    let path = dir.join(name);
+    let mut writer = ScxWriter::new(
+        &path,
+        FileHeader::new_single_modality(N_OBS as u64, RNA_VARS as u64, 0, SHARD_ROWS as u32, 0, 0),
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch()).unwrap();
+
+    // File scope, before any modality is registered — obs is shared across
+    // modalities, so an obs x obs graph over it is well defined.
+    writer
+        .write_obsp("global_connectivities", &coo_batch(N_OBS))
+        .unwrap();
+
+    let ids: Vec<(u8, usize)> = [
+        ("rna", ModalityType::Rna, RNA_VARS),
+        ("adt", ModalityType::Protein, ADT_VARS),
+    ]
+    .into_iter()
+    .map(|(name, ty, n_vars)| {
+        let id = writer
+            .add_modality(name, ty, CodecId::None, ValueEncoding::Uint8, false)
+            .unwrap();
+        writer.write_var_for(id, &var_batch(n_vars, name)).unwrap();
+        writer.set_modality_n_vars(id, n_vars as u64).unwrap();
+        (id, n_vars)
+    })
+    .collect();
+
+    for &(id, n_vars) in &ids {
+        let (indptr, indices, values) = csr_rows(0, N_OBS, n_vars, 1);
+        writer
+            .write_csr_shard_for(
+                id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+    }
+
+    let rna_id = ids[0].0;
+    writer
+        .with_modality::<_, (), scx_format_io::ScxError>(rna_id, |w| {
+            w.write_obsp("rna_connectivities", &coo_batch(N_OBS))?;
+            Ok(())
+        })
+        .unwrap();
+
+    writer.finish().unwrap();
+    path
+}
+
+/// A file whose `obsm` is **row-sharded**, so a rewrite has something to
+/// collapse.
+///
+/// `fixture_all_families` writes obsm as one legacy section, which cannot tell
+/// "the layout was preserved" from "the layout was rebuilt into one section".
+pub fn fixture_with_sharded_obsm(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let mut writer = ScxWriter::new(
+        &path,
+        FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, SHARD_ROWS as u32, 0, 0),
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch()).unwrap();
+    writer.write_var(&var_batch(N_VARS, "gene")).unwrap();
+    for row_start in (0..N_OBS).step_by(SHARD_ROWS) {
+        let (indptr, indices, values) = csr_rows(row_start, SHARD_ROWS, N_VARS, 1);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+        writer
+            .write_obsm_shard(
+                "X_pca",
+                (row_start / SHARD_ROWS) as u32,
+                row_start as u64,
+                SHARD_ROWS as u64,
+                N_OBS as u64,
+                &dense_embedding(SHARD_ROWS),
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// The all-families fixture with its `obsp` graph under a different key, or
+/// with a `Float64` `data` column instead of `Float32`.
+///
+/// Two knobs, one fixture, because a merge test needs two inputs that differ in
+/// **exactly one** thing — merge validates var identity and requires identical
+/// layers, so the two sides cannot be unrelated files.
+pub fn fixture_all_families_obsp(
+    dir: &Path,
+    name: &str,
+    key: &'static str,
+    f64_values: bool,
+) -> PathBuf {
+    build_all_families(
+        dir,
+        name,
+        FixtureShape {
+            obsp_key: Some(key),
+            obsp_f64_values: f64_values,
+            ..FixtureShape::default()
+        },
+    )
+}
+
+/// A file with two obsp keys where one key's name is a **prefix** of the
+/// other's shard naming: `g` and `g_shard_x`.
+///
+/// `obsp/g_shard_0` (a shard of `g`) and `obsp/g_shard_x_shard_0` (a shard of
+/// `g_shard_x`) both start with `obsp/g_shard_`, so a lookup for `g` that only
+/// tests the prefix swallows the other key's shard as well.
+pub fn fixture_with_colliding_obsp_keys(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let mut writer = ScxWriter::new(
+        &path,
+        FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, SHARD_ROWS as u32, 0, 0),
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch()).unwrap();
+    writer.write_var(&var_batch(N_VARS, "gene")).unwrap();
+    for row_start in (0..N_OBS).step_by(SHARD_ROWS) {
+        let (indptr, indices, values) = csr_rows(row_start, SHARD_ROWS, N_VARS, 1);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    for key in ["g", "g_shard_x"] {
+        writer
+            .write_obsp_shard_coo(key, 0, 0, N_OBS as u64, N_OBS as u64, &coo_batch(N_OBS))
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// The obsm analogue of [`fixture_with_colliding_obsp_keys`]: keys `g` and
+/// `g_shard_x`, both **sharded**, plus a legacy single-section key whose own
+/// name contains `_shard_`.
+pub fn fixture_with_colliding_obsm_keys(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let mut writer = ScxWriter::new(
+        &path,
+        FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, SHARD_ROWS as u32, 0, 0),
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch()).unwrap();
+    writer.write_var(&var_batch(N_VARS, "gene")).unwrap();
+    for row_start in (0..N_OBS).step_by(SHARD_ROWS) {
+        let (indptr, indices, values) = csr_rows(row_start, SHARD_ROWS, N_VARS, 1);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    for key in ["g", "g_shard_x"] {
+        for (idx, row_start) in (0..N_OBS).step_by(SHARD_ROWS).enumerate() {
+            writer
+                .write_obsm_shard(
+                    key,
+                    idx as u32,
+                    row_start as u64,
+                    SHARD_ROWS as u64,
+                    N_OBS as u64,
+                    &dense_embedding(SHARD_ROWS),
+                )
+                .unwrap();
+        }
+    }
+    // A legacy single section whose key contains the shard marker. The reader
+    // lists it; the merge key scan used to drop it.
+    writer
+        .write_obsm("legacy_shard_name", &dense_embedding(N_OBS))
+        .unwrap();
     writer.finish().unwrap();
     path
 }
