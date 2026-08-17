@@ -31,8 +31,12 @@
 //! and so is every test that exercises the two coordinators. Binding the drain to
 //! that error would have put its tests in the same place: compiled by CI, run by
 //! nothing. Generic over `E` it needs no libhdf5, so
-//! [`tests::buffer_stays_within_the_window_when_item_zero_stalls`] and its
+//! `tests::buffer_stays_within_the_window_when_item_zero_stalls` and its
 //! siblings run in the ordinary `cargo test --workspace` job.
+//!
+//! (Plain backticks, not an intra-doc link: the test module is `#[cfg(test)]`,
+//! so the link is unresolvable in a normal `cargo doc` run — a warning
+//! `cargo clippy --all-targets -- -D warnings` does not lint.)
 
 use std::collections::BTreeMap;
 
