@@ -553,7 +553,8 @@ is lost *silently*.
 | --- | --- | --- | --- |
 | `X` counts / values | lossy | — | On-disk `u8`–`u32` ↔ in-memory `f32`; `float64` `X` is **downcast to `f32`** to match scipy CSR zero-copy. Integer counts are bit-exact. |
 | obs/var columns (numeric, string, bool, nullable, categorical) | preserved | — | Nullable int/string/bool and categoricals round-trip via anndata's nullable-group / categorical encodings. |
-| obs/var **ordered** categoricals | preserved | — | The `ordered` bit + category order round-trip both `h5ad → scx → h5ad` and `pyscx.open(...).to_anndata()` (carried in Arrow field metadata, re-applied to the reconstructed pandas factor). |
+| obs/var **ordered** categoricals | preserved | — | The `ordered` bit + category order round-trip both `h5ad → scx → h5ad` and `pyscx.open(...).to_anndata()` (carried in Arrow field metadata, re-applied to the reconstructed pandas factor). Order is the **declared** one, independent of the order the values happen to appear in the data. |
+| obs/var declared-but-unused categories | preserved (dropped when a row filter is active) | — | A category no row uses is part of the declared factor and survives an ordinary export. It is dropped only when the export applies a row filter — a deletion vector, or `obs_mask=` / `min_counts=` on `pyscx.to_h5ad` — matching pandas' `remove_unused_categories()` on a subset. |
 | obs/var **MultiIndex** | lossy | — | Only the single pandas `_index` is preserved; additional index levels are not carried. |
 | unreadable obs/var column | dropped | `SkippedColumn` | Unsupported encoding-type or read error; column absent from output. |
 | obsm / varm embeddings | preserved | `SkippedObsm` (on failure) | Dense embeddings round-trip; an unreadable embedding is dropped with the warning. |

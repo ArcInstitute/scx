@@ -1,6 +1,6 @@
 // Write scx file back to h5ad format
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -239,28 +239,66 @@ pub(crate) fn write_sparse_group_at(
     write_sparse_arrays(&group, indptr, indices, data, n_obs, n_vars)
 }
 
+/// Whole-batch driver over [`write_dataframe_group_from_shards`]: a dataframe
+/// already assembled in memory is one shard with no row filter.
+///
+/// This is the *only* difference between the two export directions. Both used
+/// to carry a full implementation of the nine column encodings, selected at
+/// runtime by whether the source had `ObsMetadataShard` sections, and they had
+/// already drifted apart twice — once on `LargeUtf8` handling, and once on the
+/// categorical vocabulary, which is review §11.1.
 pub(crate) fn write_dataframe_group_at(
     parent: &hdf5::Group,
     name: &str,
     batch: &arrow::array::RecordBatch,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    let group = parent.group(name).or_else(|_| parent.create_group(name))?;
-    write_dataframe_body(&group, name, batch, sink)
+    write_dataframe_group_filtered_at(parent, name, batch, None, sink)
 }
 
-/// Shared body for `write_dataframe_group_at`. Caller is responsible
-/// for opening or creating `group`. Resolves the pandas index from
-/// schema metadata, renames pyarrow's `__index_level_0__` to anndata's
-/// `_index` literal on disk (named indexes keep their original name),
-/// excludes the index column from `column-order`, and always writes
-/// `column-order` (length-0 OK) since anndata.read_h5ad requires the
-/// attribute to be present.
+/// [`write_dataframe_group_at`] with a row filter: the legacy single-section
+/// obs path under a deletion vector.
+///
+/// The mask is passed *through* rather than applied to `batch` first, so the
+/// unsharded path prunes unused categories on exactly the rule the sharded one
+/// uses. Filtering first would hide the filter from the writer, which is how
+/// the two came to disagree: `arrow`'s `filter` keeps a `DictionaryArray`'s
+/// full dictionary, so a legacy file exported every declared category while a
+/// sharded one exported only the used ones.
+pub(crate) fn write_dataframe_group_filtered_at(
+    parent: &hdf5::Group,
+    name: &str,
+    batch: &arrow::array::RecordBatch,
+    keep_mask_opt: Option<&[bool]>,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
+    let schema = batch.schema();
+    let n_rows_kept = match keep_mask_opt {
+        None => batch.num_rows(),
+        Some(mask) => mask.iter().take(batch.num_rows()).filter(|&&b| b).count(),
+    };
+    let one_shard = || {
+        std::iter::once::<Result<RecordBatch, scx_format_io::error::ScxError>>(Ok(batch.clone()))
+    };
+    let layout = scan_column_export_layout(one_shard, schema.as_ref(), keep_mask_opt)?;
+    let unified = build_unified_export_schema(schema.as_ref(), &layout);
+    write_dataframe_group_from_shards(
+        parent,
+        name,
+        &unified,
+        one_shard(),
+        n_rows_kept,
+        keep_mask_opt,
+        layout,
+        sink,
+    )
+}
+
 /// Write the dataframe-level encoding attrs (`encoding-type="dataframe"`,
 /// `encoding-version="0.2.0"`), resolve the pandas index field, and write the
-/// `_index` attr. Shared prologue for the eager [`write_dataframe_body`] and
-/// streaming [`write_dataframe_group_streaming`] writers — anndata.read_h5ad
-/// requires these on every dataframe group, even an empty one.
+/// `_index` attr. Prologue of [`write_dataframe_group_from_shards`], and so of
+/// both its drivers — anndata.read_h5ad requires these on every dataframe
+/// group, even an empty one.
 ///
 /// Returns `(index_field_name, on_disk_index)` for the caller's per-column
 /// loop. The index field is probed as: (1) the `pandas` schema metadata's
@@ -327,37 +365,6 @@ fn write_column_order_attr(
         .shape(col_order.len())
         .create("column-order")?
         .write_raw(col_order)?;
-    Ok(())
-}
-
-fn write_dataframe_body(
-    group: &hdf5::Group,
-    df_name: &str,
-    batch: &arrow::array::RecordBatch,
-    sink: &mut WarningSink,
-) -> Result<(), ConvertError> {
-    let schema = batch.schema();
-    let (index_field_name, on_disk_index) = write_dataframe_header(group, schema.as_ref())?;
-
-    let mut col_order: Vec<VarLenUnicode> =
-        Vec::with_capacity(batch.num_columns().saturating_sub(1));
-    for (col_idx, field) in schema.fields().iter().enumerate() {
-        let col = batch.column(col_idx);
-        if Some(field.name()) == index_field_name.as_ref() {
-            // Index column → write under the anndata on-disk name and
-            // exclude from `column-order` (matches anndata convention).
-            // anndata requires `_index` to be a plain dataset, so the
-            // nullable-group encoding is disabled for it.
-            write_column_to_hdf5(group, df_name, &on_disk_index, col, field, false, sink)?;
-        } else if write_column_to_hdf5(group, df_name, field.name(), col, field, true, sink)? {
-            // Only list the column in `column-order` when a dataset
-            // was actually created — unsupported types are
-            // warn-and-skipped and must not appear in the index.
-            col_order.push(vlu(field.name()));
-        }
-    }
-
-    write_column_order_attr(group, &col_order)?;
     Ok(())
 }
 
@@ -908,364 +915,6 @@ impl CatAccum {
     }
 }
 
-/// Collect a `Utf8` / `LargeUtf8` string column into `(values, mask)`:
-/// `values[i]` is the string with null positions filled with `""`, and
-/// `mask[i] == true` ⇔ row `i` is null. Dispatches on the concrete array
-/// type so both narrow (`StringArray`) and wide (`LargeStringArray`)
-/// offsets are handled, mirroring the streaming string writer's
-/// `Utf8 | LargeUtf8` arm.
-fn string_values_and_mask(
-    array: &dyn Array,
-    name: &str,
-) -> Result<(Vec<VarLenUnicode>, Vec<bool>), ConvertError> {
-    macro_rules! collect {
-        ($t:ty, $label:literal) => {{
-            let arr = array
-                .as_any()
-                .downcast_ref::<$t>()
-                .ok_or_else(|| downcast_err(name, $label))?;
-            let values: Vec<VarLenUnicode> = (0..arr.len())
-                .map(|i| {
-                    if arr.is_valid(i) {
-                        vlu(arr.value(i))
-                    } else {
-                        vlu("")
-                    }
-                })
-                .collect();
-            let mask: Vec<bool> = (0..arr.len()).map(|i| !arr.is_valid(i)).collect();
-            Ok((values, mask))
-        }};
-    }
-    match array.data_type() {
-        DataType::Utf8 => collect!(arrow::array::StringArray, "Utf8"),
-        DataType::LargeUtf8 => collect!(LargeStringArray, "LargeUtf8"),
-        other => Err(ConvertError::Other(format!(
-            "column '{name}': expected Utf8/LargeUtf8, got {other:?}"
-        ))),
-    }
-}
-
-/// Write one Arrow column into `group/name`. Returns `Ok(true)` on a
-/// supported type (dataset created), `Ok(false)` when the type is
-/// not yet supported and the column was warn-and-skipped. The caller
-/// uses the boolean to decide whether to add `name` to `column-order`
-/// — adding a name without a backing dataset breaks
-/// `anndata.read_h5ad`'s lookup.
-///
-/// `allow_nullable_group` is `false` for the pandas index column
-/// (`_index`), which anndata requires to be a plain dataset, never a
-/// nullable group. For every other column, integer / string columns
-/// that actually contain nulls are written using anndata's
-/// `nullable-integer` / `nullable-string-array` group encodings
-/// (`values` + `mask`), preserving null state; null-free columns stay
-/// plain datasets (byte-identical to the pre-fix output). Floats are
-/// always plain datasets with `NaN` at null positions — anndata has no
-/// `nullable-float` encoding, so `NaN` is the canonical missing-float
-/// representation.
-fn write_column_to_hdf5(
-    group: &hdf5::Group,
-    df_name: &str,
-    name: &str,
-    array: &dyn Array,
-    field: &Field,
-    allow_nullable_group: bool,
-    sink: &mut WarningSink,
-) -> Result<bool, ConvertError> {
-    // `dtype` selects the encoding; `ordered` (categorical only) is
-    // resolved from the field's `scx.categorical.ordered` metadata.
-    let dtype = field.data_type();
-    let ordered = field_ordered(field);
-    match dtype {
-        DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| downcast_err(name, "Int32"))?;
-            if allow_nullable_group && arr.null_count() > 0 {
-                let values: Vec<i32> = (0..arr.len())
-                    .map(|i| if arr.is_valid(i) { arr.value(i) } else { 0 })
-                    .collect();
-                let mask: Vec<bool> = (0..arr.len()).map(|i| !arr.is_valid(i)).collect();
-                write_nullable_group(group, name, &values, &mask, "nullable-integer")?;
-            } else {
-                warn_index_coerced_nulls(sink, df_name, name, "Int32", arr, allow_nullable_group);
-                let values: Vec<i32> = arr.iter().map(|v| v.unwrap_or(0)).collect();
-                group
-                    .new_dataset::<i32>()
-                    .shape([values.len()])
-                    .create(name)?
-                    .write(&values)?;
-            }
-        }
-        DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| downcast_err(name, "Int64"))?;
-            if allow_nullable_group && arr.null_count() > 0 {
-                let values: Vec<i64> = (0..arr.len())
-                    .map(|i| if arr.is_valid(i) { arr.value(i) } else { 0 })
-                    .collect();
-                let mask: Vec<bool> = (0..arr.len()).map(|i| !arr.is_valid(i)).collect();
-                write_nullable_group(group, name, &values, &mask, "nullable-integer")?;
-            } else {
-                warn_index_coerced_nulls(sink, df_name, name, "Int64", arr, allow_nullable_group);
-                let values: Vec<i64> = arr.iter().map(|v| v.unwrap_or(0)).collect();
-                group
-                    .new_dataset::<i64>()
-                    .shape([values.len()])
-                    .create(name)?
-                    .write(&values)?;
-            }
-        }
-        DataType::Float32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| downcast_err(name, "Float32"))?;
-            // NaN is anndata's canonical missing-float value — lossless,
-            // unlike the prior `0.0` coercion.
-            let values: Vec<f32> = arr.iter().map(|v| v.unwrap_or(f32::NAN)).collect();
-            group
-                .new_dataset::<f32>()
-                .shape([values.len()])
-                .create(name)?
-                .write(&values)?;
-        }
-        DataType::Float64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| downcast_err(name, "Float64"))?;
-            let values: Vec<f64> = arr.iter().map(|v| v.unwrap_or(f64::NAN)).collect();
-            group
-                .new_dataset::<f64>()
-                .shape([values.len()])
-                .create(name)?
-                .write(&values)?;
-        }
-        DataType::Utf8 | DataType::LargeUtf8 => {
-            // Handle both narrow (`StringArray`, i32 offsets) and wide
-            // (`LargeStringArray`, i64 offsets) string columns; the eager
-            // assembled-obs path can legitimately carry either, matching
-            // the streaming writer's `Utf8 | LargeUtf8` handling.
-            let (values, mask) = string_values_and_mask(array, name)?;
-            let null_count = mask.iter().filter(|&&m| m).count();
-            if allow_nullable_group && null_count > 0 {
-                write_nullable_group(group, name, &values, &mask, "nullable-string-array")?;
-            } else {
-                warn_index_coerced_nulls(sink, df_name, name, "Utf8", array, allow_nullable_group);
-                group
-                    .new_dataset::<VarLenUnicode>()
-                    .shape([values.len()])
-                    .create(name)?
-                    .write(&values)?;
-            }
-        }
-        DataType::Boolean => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| downcast_err(name, "Boolean"))?;
-
-            // anndata's only registered IOSpec for h5py boolean
-            // columns is `nullable-boolean` v0.1.0 — a *group* with
-            // `values` and `mask` datasets. The legacy
-            // flat-u8-with-encoding-type-boolean shape isn't
-            // registered at all, so `anndata.read_h5ad` raises on
-            // it. The group form additionally preserves Arrow's
-            // per-element validity bits in the mask
-            // (`mask[i] == 1` ⇔ row is null).
-            let bool_group = group.create_group(name)?;
-
-            // anndata + pandas's BooleanArray reader is strict: the
-            // values dataset must have native HDF5 boolean dtype,
-            // not u8. Plain u8 trips
-            // `TypeError: values should be boolean numpy array`.
-            let values: Vec<bool> = (0..arr.len())
-                .map(|i| arr.is_valid(i) && arr.value(i))
-                .collect();
-            let mask: Vec<bool> = (0..arr.len()).map(|i| !arr.is_valid(i)).collect();
-
-            bool_group
-                .new_dataset::<bool>()
-                .shape([values.len()])
-                .create("values")?
-                .write(&values)?;
-            bool_group
-                .new_dataset::<bool>()
-                .shape([mask.len()])
-                .create("mask")?
-                .write(&mask)?;
-
-            bool_group
-                .new_attr::<VarLenUnicode>()
-                .create("encoding-type")?
-                .write_scalar(&vlu("nullable-boolean"))?;
-            bool_group
-                .new_attr::<VarLenUnicode>()
-                .create("encoding-version")?
-                .write_scalar(&vlu("0.1.0"))?;
-        }
-        DataType::Dictionary(_key_type, _value_type) => {
-            // Modern anndata categorical (encoding-version 0.2.0):
-            // write as a group with `codes` + `categories` as
-            // separate datasets, NOT as a `categories` attribute on
-            // the codes dataset. The legacy attribute form overflows
-            // HDF5's ~64 KB object-header limit on high-cardinality
-            // categoricals (census-scale `cell_type` / `donor_id`):
-            // `H5Acreate2(): object header message is too large`.
-            //
-            // Key types: pandas/Arrow picks the narrowest integer
-            // type that fits the cardinality (Int8 for <128
-            // categories, Int16 for <32K, Int32 above). We promote
-            // every input to i32 on disk so the SCX → h5ad output
-            // is uniform; anndata reads any width on the round-trip.
-            //
-            // Categories keep their source class (string / integer /
-            // float): anndata reconstructs a `pd.Categorical` from a
-            // numeric `categories` dataset, so integer-/float-keyed
-            // categoricals round-trip instead of being dropped.
-            // Extract categories + codes *before* creating the group so an
-            // unsupported value type OR key width leaves no partial group
-            // behind. Both fall through to the same warn-and-skip (an
-            // unsupported key type previously aborted the whole export via
-            // `?` — now it skips the column like an unsupported value type),
-            // and the warning carries the underlying error so a dropped
-            // column is debuggable.
-            macro_rules! skip_unsupported {
-                ($e:expr) => {{
-                    sink.emit(ConvertWarning::UnsupportedExportColumn {
-                        column: format!("{df_name}/{name}"),
-                        dtype: format!("{dtype:?} ({})", $e),
-                    });
-                    return Ok(false);
-                }};
-            }
-            let cats = match dict_category_values(array, name) {
-                Ok(c) => c,
-                Err(e) => skip_unsupported!(e),
-            };
-            let codes = match dict_codes_i32(array, name) {
-                Ok(c) => c,
-                Err(e) => skip_unsupported!(e),
-            };
-
-            let cat_group = group.create_group(name)?;
-            cat_group
-                .new_dataset::<i32>()
-                .shape([codes.len()])
-                .create("codes")?
-                .write(&codes)?;
-            match cats {
-                CatValues::Str(cats) => {
-                    cat_group
-                        .new_dataset::<VarLenUnicode>()
-                        .shape([cats.len()])
-                        .create("categories")?
-                        .write(&cats)?;
-                }
-                CatValues::Int(cats) => {
-                    cat_group
-                        .new_dataset::<i64>()
-                        .shape([cats.len()])
-                        .create("categories")?
-                        .write(&cats)?;
-                }
-                CatValues::Float(cats) => {
-                    cat_group
-                        .new_dataset::<f64>()
-                        .shape([cats.len()])
-                        .create("categories")?
-                        .write(&cats)?;
-                }
-            }
-
-            cat_group
-                .new_attr::<VarLenUnicode>()
-                .create("encoding-type")?
-                .write_scalar(&vlu("categorical"))?;
-            cat_group
-                .new_attr::<VarLenUnicode>()
-                .create("encoding-version")?
-                .write_scalar(&vlu("0.2.0"))?;
-            // The pandas `ordered` bit is carried in the Arrow field
-            // metadata (`scx.categorical.ordered`) the h5ad reader stamps;
-            // `ordered` is resolved from it by the caller. Native HDF5
-            // bool — anndata's categorical reader expects
-            // `H5T_NATIVE_HBOOL_8`, not u8.
-            cat_group
-                .new_attr::<bool>()
-                .create("ordered")?
-                .write_scalar(&ordered)?;
-        }
-        _ => {
-            sink.emit(ConvertWarning::UnsupportedExportColumn {
-                column: format!("{df_name}/{name}"),
-                dtype: format!("{dtype:?}"),
-            });
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Write an anndata nullable group (`encoding-type` ∈ {`nullable-integer`,
-/// `nullable-string-array`}, version `0.1.0`): a subgroup with a `values`
-/// dataset (null positions filled with `0` / `""`) and a boolean `mask`
-/// dataset (`mask[i] == true` ⇔ null). Byte-for-byte the shape anndata's
-/// `write_nullable` emits and `_read_nullable` consumes. Generic over the
-/// HDF5 element type so the same helper serves integer and string values.
-fn write_nullable_group<T: hdf5::H5Type>(
-    group: &hdf5::Group,
-    name: &str,
-    values: &[T],
-    mask: &[bool],
-    encoding_type: &str,
-) -> Result<(), ConvertError> {
-    let g = group.create_group(name)?;
-    g.new_dataset::<T>()
-        .shape([values.len()])
-        .create("values")?
-        .write(values)?;
-    g.new_dataset::<bool>()
-        .shape([mask.len()])
-        .create("mask")?
-        .write(mask)?;
-    g.new_attr::<VarLenUnicode>()
-        .create("encoding-type")?
-        .write_scalar(&vlu(encoding_type))?;
-    g.new_attr::<VarLenUnicode>()
-        .create("encoding-version")?
-        .write_scalar(&vlu("0.1.0"))?;
-    Ok(())
-}
-
-/// Surface the one residual null-coercion case: the pandas index column
-/// (`_index`), which anndata requires to be a plain dataset and so can
-/// never use a nullable group. Indexes virtually never carry nulls, but
-/// if one does its null becomes `0` / `""` — emit
-/// [`ConvertWarning::CoercedNulls`] so that is visible. No-op for
-/// non-index columns (`allow_nullable_group == true`) or when there are
-/// no nulls.
-fn warn_index_coerced_nulls(
-    sink: &mut WarningSink,
-    df_name: &str,
-    col_name: &str,
-    dtype: &str,
-    array: &dyn Array,
-    allow_nullable_group: bool,
-) {
-    if !allow_nullable_group && array.null_count() > 0 {
-        sink.emit(ConvertWarning::CoercedNulls {
-            column: format!("{df_name}/{col_name}"),
-            dtype: dtype.to_string(),
-            count: array.null_count() as u64,
-        });
-    }
-}
-
 fn write_obsm_entry(
     obsm_group: &hdf5::Group,
     name: &str,
@@ -1321,12 +970,49 @@ pub(crate) struct ColumnExportLayout {
     /// unified export schema so a column that is categorical in any shard
     /// is exported as an h5ad categorical even when shard 0 is plain.
     pub dict_fields: Vec<Option<FieldRef>>,
+    /// Aligned with `schema.fields()`: `Some(set)` ⇔ a row filter is active
+    /// **and** the column is categorical, so the exported vocabulary is
+    /// restricted to the category values at least one kept row references.
+    /// `None` means "keep every declared category" — the unfiltered case.
+    ///
+    /// Populated by a second decode pass ([`scan_used_categories`]) that runs
+    /// **only** when a keep mask is passed, because it is the one signal that
+    /// cannot be derived from declared dictionaries alone. Without a filter the
+    /// exporter never prunes, so the pass never runs and an ordinary export
+    /// still costs exactly one pre-scan.
+    pub used_categories: Vec<Option<UsedCategories>>,
+}
+
+impl ColumnExportLayout {
+    /// The layout of a frame with no nullable columns and no categoricals:
+    /// every column a plain dataset. Only meaningful when the caller already
+    /// knows that — tests that drive [`write_dataframe_group_from_shards`]
+    /// directly with a hand-built frame, where scanning would just restate the
+    /// fixture — which is why it is `#[cfg(test)]`: production callers must go
+    /// through [`scan_column_export_layout`], whose answer is measured.
+    #[cfg(test)]
+    pub fn all_plain(n_fields: usize) -> Self {
+        ColumnExportLayout {
+            needs_nullable: vec![false; n_fields],
+            dict_fields: vec![None; n_fields],
+            used_categories: (0..n_fields).map(|_| None).collect(),
+        }
+    }
+}
+
+/// The category values a filtered export actually keeps, per value class.
+/// Mirrors [`CatValues`] / [`CatAccum`]; floats are keyed by bit pattern for
+/// the same reason (category values are exact labels, never computed).
+pub(crate) enum UsedCategories {
+    Str(HashSet<String>),
+    Int(HashSet<i64>),
+    Float(HashSet<u64>),
 }
 
 /// Pre-scan metadata shards to decide (a) which integer / string columns
 /// need anndata's nullable group encoding, and (b) which columns are a
 /// `Dictionary` in any shard (so the unified export schema can declare
-/// them categorical — see [`write_dataframe_group_streaming`]).
+/// them categorical — see [`write_dataframe_group_from_shards`]).
 ///
 /// The streaming writer must allocate each HDF5 dataset (plain vs.
 /// nullable group vs. categorical group) before it sees any shard data,
@@ -1346,13 +1032,22 @@ pub(crate) struct ColumnExportLayout {
 /// name (positional capture would otherwise mis-assign columns) or on a
 /// categorical column's value **class** (`Dictionary(_, Utf8)` in one
 /// shard vs `Dictionary(_, Int64)` in another is genuine corruption).
-pub(crate) fn scan_column_export_layout<I>(
-    shards: I,
+///
+/// `make_shards` is a *factory*, not an iterator, because a filtered export
+/// needs a second pass ([`scan_used_categories`]) that cannot be planned until
+/// this one has decided which columns are categorical. `keep_mask` is `None`
+/// for var and for an unfiltered obs export, and that is the case that still
+/// costs exactly one pass.
+pub(crate) fn scan_column_export_layout<I, F>(
+    make_shards: F,
     schema: &Schema,
+    keep_mask: Option<&[bool]>,
 ) -> Result<ColumnExportLayout, ConvertError>
 where
     I: IntoIterator<Item = Result<RecordBatch, scx_format_io::error::ScxError>>,
+    F: Fn() -> I,
 {
+    let shards = make_shards();
     let n_fields = schema.fields().len();
     let eligible: Vec<bool> = schema
         .fields()
@@ -1419,10 +1114,113 @@ where
             }
         }
     }
+    let used_categories = match keep_mask {
+        // Nothing is filtered out, so nothing is pruned: every declared
+        // category is exported, and the second pass is not run at all.
+        None => (0..n_fields).map(|_| None).collect(),
+        Some(mask) => scan_used_categories(make_shards(), schema, &dict_fields, mask)?,
+    };
+
     Ok(ColumnExportLayout {
         needs_nullable,
         dict_fields,
+        used_categories,
     })
+}
+
+/// Second decode pass over the metadata shards, run **only** for a filtered
+/// export: collect, per categorical column, the category values at least one
+/// *kept* row references.
+///
+/// This is the one signal the declared dictionaries cannot supply. The
+/// exporter's rule is anndata's `remove_unused_categories`-on-subset rule —
+/// a filtered frame drops the levels its surviving rows no longer use, an
+/// unfiltered one keeps the vocabulary the user declared — and deciding it
+/// per category requires looking at rows, before any code is written to the
+/// pre-allocated `codes` dataset.
+///
+/// It cannot be fused into [`scan_column_export_layout`]'s pass: which columns
+/// are categorical is only known once *every* shard has been inspected (a
+/// column plain in shard 0 and a `Dictionary` in shard 5 is categorical), and
+/// interning every plain column on the chance it might be promoted would mean
+/// interning the obs index — one entry per cell.
+fn scan_used_categories<I>(
+    shards: I,
+    schema: &Schema,
+    dict_fields: &[Option<FieldRef>],
+    keep_mask: &[bool],
+) -> Result<Vec<Option<UsedCategories>>, ConvertError>
+where
+    I: IntoIterator<Item = Result<RecordBatch, scx_format_io::error::ScxError>>,
+{
+    let n_fields = schema.fields().len();
+    let mut used: Vec<Option<UsedCategories>> = (0..n_fields)
+        .map(|i| {
+            dict_fields[i].as_ref().map(|f| match f.data_type() {
+                DataType::Dictionary(_, v) => match v.as_ref() {
+                    DataType::Float32 | DataType::Float64 => UsedCategories::Float(HashSet::new()),
+                    DataType::Utf8 | DataType::LargeUtf8 => UsedCategories::Str(HashSet::new()),
+                    _ => UsedCategories::Int(HashSet::new()),
+                },
+                // `dict_fields` only ever stores `Dictionary` fields.
+                _ => UsedCategories::Str(HashSet::new()),
+            })
+        })
+        .collect();
+    if used.iter().all(|u| u.is_none()) {
+        return Ok(used);
+    }
+
+    let mut cumulative_rows: usize = 0;
+    for batch_result in shards {
+        let batch = batch_result?;
+        let n_shard_rows = batch.num_rows();
+        // Same offset resolution as the write pass; a disagreement between the
+        // stamp and the running count is that pass's error to raise, and this
+        // one never reaches it because the export aborts first.
+        let row_start = parse_shard_row_start(&batch).unwrap_or(cumulative_rows);
+        for (i, slot) in used.iter_mut().enumerate() {
+            let Some(slot) = slot.as_mut() else { continue };
+            let name = schema.fields()[i].name();
+            let (local_codes, local_values) = local_categorical_view(batch.column(i), name)?;
+            for (r, &code) in local_codes.iter().enumerate().take(n_shard_rows) {
+                if code < 0 {
+                    continue;
+                }
+                let global_row = row_start + r;
+                if !keep_mask.get(global_row).copied().unwrap_or(false) {
+                    continue;
+                }
+                let idx = code as usize;
+                match (&mut *slot, &local_values) {
+                    (UsedCategories::Str(s), CatValues::Str(vals)) => {
+                        let v = vals[idx].as_str();
+                        if !s.contains(v) {
+                            s.insert(v.to_string());
+                        }
+                    }
+                    (UsedCategories::Int(s), CatValues::Int(vals)) => {
+                        s.insert(vals[idx]);
+                    }
+                    (UsedCategories::Float(s), CatValues::Float(vals)) => {
+                        s.insert(vals[idx].to_bits());
+                    }
+                    _ => return Err(cat_class_mismatch_err(name)),
+                }
+            }
+        }
+        cumulative_rows += n_shard_rows;
+    }
+    Ok(used)
+}
+
+/// A shard presents a categorical column in a different value class than the
+/// column was declared with. Shared by the pre-scan and the write pass so the
+/// two report the same corruption identically.
+fn cat_class_mismatch_err(name: &str) -> ConvertError {
+    ConvertError::Other(format!(
+        "column '{name}': categorical value type changed across shards"
+    ))
 }
 
 /// Two categorical value types belong to the same value *class* for export
@@ -1505,27 +1303,27 @@ pub(crate) fn build_unified_export_schema(schema: &Schema, layout: &ColumnExport
 /// mask; `None` means no filtering. The mask is indexed by global row,
 /// so this is consumed only on the obs axis (var has no DV).
 ///
-/// `needs_nullable` is aligned with `schema.fields()`: when
-/// `needs_nullable[i]` is `true`, the integer / string column at field
-/// `i` is written with anndata's `nullable-integer` /
-/// `nullable-string-array` group encoding (it contains nulls); otherwise
-/// it is written as a plain dataset. Computed up front by
-/// [`scan_column_export_layout`] because the HDF5 datasets must be
-/// allocated before any shard is seen. Float columns ignore this flag
-/// (always plain datasets with `NaN` at nulls).
+/// `layout` is [`scan_column_export_layout`]'s result for the same shards and
+/// the same `keep_mask_opt`, taken **by value** because the categorical
+/// vocabularies move into the per-column writers. Its `needs_nullable` decides
+/// plain-dataset vs. nullable-group per integer / string column (float columns
+/// ignore it — always plain datasets with `NaN` at nulls), and its
+/// `used_categories` decides which declared categories survive. Both must be
+/// known before any HDF5 dataset is allocated, which is why they are scanned
+/// rather than discovered while writing.
 ///
 /// `schema` is the unified export schema from
 /// [`build_unified_export_schema`]: a column that is a `Dictionary` in any
 /// shard is declared categorical here even when shard 0 was plain.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_dataframe_group_streaming<I>(
+pub(crate) fn write_dataframe_group_from_shards<I>(
     parent: &hdf5::Group,
     name: &str,
     schema: &Schema,
     shards: I,
     n_rows_kept: usize,
     keep_mask_opt: Option<&[bool]>,
-    needs_nullable: &[bool],
+    mut layout: ColumnExportLayout,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError>
 where
@@ -1554,8 +1352,20 @@ where
         };
         // The index column is forced to a plain dataset (anndata requires
         // `_index` to be a plain dataset, never a nullable group).
-        let want_nullable = !is_index && needs_nullable.get(col_idx).copied().unwrap_or(false);
-        let writer = create_column_writer(&group, on_disk_name, field, n_rows_kept, want_nullable)?;
+        let want_nullable =
+            !is_index && layout.needs_nullable.get(col_idx).copied().unwrap_or(false);
+        let used = layout
+            .used_categories
+            .get_mut(col_idx)
+            .and_then(|slot| slot.take());
+        let writer = create_column_writer(
+            &group,
+            on_disk_name,
+            field,
+            n_rows_kept,
+            want_nullable,
+            used,
+        )?;
         if matches!(writer, ColumnStreamWriter::Unsupported) {
             sink.emit(ConvertWarning::UnsupportedExportColumn {
                 column: format!("{name}/{}", field.name()),
@@ -1568,6 +1378,10 @@ where
     }
 
     write_column_order_attr(&group, &col_order)?;
+
+    // One accumulator per column writer, positionally aligned with
+    // `col_writers`; see `append_shard_to_column`.
+    let mut coerced_nulls: Vec<u64> = vec![0; col_writers.len()];
 
     // Drain shards. Each shard's stamped `row_start` schema metadata
     // (set by the writer via `stamp_dense_shard_metadata`) gives its
@@ -1618,15 +1432,33 @@ where
             }
         };
 
-        if !kept_local.is_empty() {
-            for (col_idx, writer) in col_writers.iter_mut() {
-                let array = batch.column(*col_idx);
-                let field_name = schema.fields()[*col_idx].name();
-                append_shard_to_column(writer, array, &kept_local, field_name)?;
-            }
+        // Called even for a shard with no kept rows: nothing is written, but a
+        // categorical column still contributes its declared vocabulary, which
+        // is a property of the column and not of which rows survive.
+        for (slot, (col_idx, writer)) in coerced_nulls.iter_mut().zip(col_writers.iter_mut()) {
+            let array = batch.column(*col_idx);
+            let field_name = schema.fields()[*col_idx].name();
+            append_shard_to_column(writer, array, &kept_local, field_name, slot)?;
         }
 
         cumulative_rows += n_shard_rows;
+    }
+
+    // Surface the one residual null-coercion case: a column written as a plain
+    // dataset that nonetheless carried nulls. In practice that is only ever the
+    // pandas index (`_index`), which anndata requires to be a plain dataset and
+    // so can never use a nullable group; indexes virtually never carry nulls,
+    // but when one does its null became `0` / `""` and that must be visible.
+    for (count, (col_idx, _)) in coerced_nulls.iter().zip(col_writers.iter()) {
+        if *count == 0 {
+            continue;
+        }
+        let field = &schema.fields()[*col_idx];
+        sink.emit(ConvertWarning::CoercedNulls {
+            column: format!("{name}/{}", field.name()),
+            dtype: format!("{:?}", field.data_type()),
+            count: *count,
+        });
     }
 
     // Validate every non-skipped column filled its pre-allocated
@@ -1801,10 +1633,15 @@ enum ColumnStreamWriter {
         // Cross-shard global category vocabulary. The variant (string /
         // integer / float) is fixed at writer creation from the column's
         // dictionary value type; `append_shard_to_column` folds each shard's
-        // local categories in (insertion order preserved), and
+        // **declared** categories in (declared order preserved), and
         // `finalize_column_writer` writes a `categories` dataset of the
         // matching HDF5 dtype.
         accum: CatAccum,
+        // `Some` ⇔ a row filter is active, and then only these category
+        // values enter the vocabulary. Computed by `scan_used_categories`
+        // before any code was written, because a category dropped after the
+        // fact would need every already-written code renumbered.
+        used: Option<UsedCategories>,
         // pandas `ordered` bit, resolved from the source field metadata
         // ([`CATEGORICAL_ORDERED_KEY`]) at writer creation and emitted at
         // finalize (the `Field` is gone by then).
@@ -1836,10 +1673,8 @@ enum NullableKind {
 }
 
 /// Pre-allocate an anndata nullable group (`values` + `mask` datasets +
-/// encoding attrs) for the streaming path. Generic over the HDF5 value
-/// element type so it serves both `nullable-integer` (i32/i64) and
-/// `nullable-string-array` (`VarLenUnicode`). The streaming sibling of
-/// [`write_nullable_group`].
+/// encoding attrs). Generic over the HDF5 value element type so it serves both
+/// `nullable-integer` (i32/i64) and `nullable-string-array` (`VarLenUnicode`).
 fn create_nullable_writer<T: hdf5::H5Type>(
     group: &hdf5::Group,
     on_disk_name: &str,
@@ -1874,6 +1709,7 @@ fn create_column_writer(
     field: &Field,
     n_rows_kept: usize,
     want_nullable: bool,
+    used: Option<UsedCategories>,
 ) -> Result<ColumnStreamWriter, ConvertError> {
     match field.data_type() {
         DataType::Int32 => {
@@ -1975,6 +1811,7 @@ fn create_column_writer(
                 codes_ds,
                 offset: 0,
                 accum: CatAccum::new(value_type.as_ref()),
+                used,
                 ordered: field_ordered(field),
             })
         }
@@ -1988,12 +1825,32 @@ fn create_column_writer(
     }
 }
 
+/// `coerced_nulls` accumulates the nulls this column had to flatten to `0` /
+/// `""` because it is written as a plain dataset. That only happens on the
+/// pandas index (`_index`), which anndata requires to be a plain dataset and so
+/// can never carry a nullable group: every other integer / string column with
+/// nulls got a `Nullable` writer from the pre-scan. The caller turns a non-zero
+/// total into one [`ConvertWarning::CoercedNulls`] per column.
 fn append_shard_to_column(
     writer: &mut ColumnStreamWriter,
     array: &dyn Array,
     kept_local: &[usize],
     name: &str,
+    coerced_nulls: &mut u64,
 ) -> Result<(), ConvertError> {
+    if kept_local.is_empty() {
+        // A shard every row of which was filtered out contributes no values —
+        // and an empty hyperslab selection is not a write HDF5 accepts. Its
+        // *declared* categories still belong in the vocabulary though, since a
+        // category list is declared by the column, not implied by its rows. If
+        // a row filter is active they are pruned by `used` like any other, so
+        // this cannot resurrect a category no kept row references.
+        if let ColumnStreamWriter::Categorical { accum, used, .. } = writer {
+            let (_, local_values) = local_categorical_view(array, name)?;
+            intern_declared_categories(accum, used.as_ref(), &local_values, name)?;
+        }
+        return Ok(());
+    }
     match writer {
         ColumnStreamWriter::Int32 { ds, offset } => {
             let arr = array
@@ -2002,7 +1859,14 @@ fn append_shard_to_column(
                 .ok_or_else(|| downcast_err(name, "Int32"))?;
             let values: Vec<i32> = kept_local
                 .iter()
-                .map(|&i| if arr.is_valid(i) { arr.value(i) } else { 0 })
+                .map(|&i| {
+                    if arr.is_valid(i) {
+                        arr.value(i)
+                    } else {
+                        *coerced_nulls += 1;
+                        0
+                    }
+                })
                 .collect();
             ds.write_slice(
                 ArrayView1::from(values.as_slice()),
@@ -2017,7 +1881,14 @@ fn append_shard_to_column(
                 .ok_or_else(|| downcast_err(name, "Int64"))?;
             let values: Vec<i64> = kept_local
                 .iter()
-                .map(|&i| if arr.is_valid(i) { arr.value(i) } else { 0 })
+                .map(|&i| {
+                    if arr.is_valid(i) {
+                        arr.value(i)
+                    } else {
+                        *coerced_nulls += 1;
+                        0
+                    }
+                })
                 .collect();
             ds.write_slice(
                 ArrayView1::from(values.as_slice()),
@@ -2080,6 +1951,7 @@ fn append_shard_to_column(
                             if arr.is_valid(i) {
                                 vlu(arr.value(i))
                             } else {
+                                *coerced_nulls += 1;
                                 vlu("")
                             }
                         })
@@ -2096,6 +1968,7 @@ fn append_shard_to_column(
                             if arr.is_valid(i) {
                                 vlu(arr.value(i))
                             } else {
+                                *coerced_nulls += 1;
                                 vlu("")
                             }
                         })
@@ -2142,83 +2015,40 @@ fn append_shard_to_column(
             codes_ds,
             offset,
             accum,
+            used,
             ..
         } => {
             // Accept both a `Dictionary(_, V)` shard (base) and a plain `V`
             // shard (appended): the helper normalizes both to local codes +
             // distinct values, generic over the value class (§3.3).
             let (local_codes, local_values) = local_categorical_view(array, name)?;
+            let local_to_global =
+                intern_declared_categories(accum, used.as_ref(), &local_values, name)?;
 
-            // C10: intern only the dictionary values actually referenced by
-            // `kept_local` rows, so categories present only in
-            // deletion-dropped rows don't enter the global vocabulary. The
-            // local→global map is filled lazily as kept codes are visited.
-            // `key`/`store` adapt the shared remap to the value class: the
-            // dedup-map key (`String` / `i64` / `u64`-bits) and the stored
-            // category order value. Cardinality is capped at i32::MAX
-            // (defensive — real categoricals stay well below).
-            macro_rules! remap {
-                ($vals:expr, $dict:expr, $order:expr, $key:expr, $store:expr) => {{
-                    let vals = $vals;
-                    let mut local_to_global: Vec<Option<i32>> = vec![None; vals.len()];
-                    let mut kept_codes: Vec<i32> = Vec::with_capacity(kept_local.len());
-                    for &i in kept_local {
-                        let lc = local_codes[i];
-                        if lc < 0 {
-                            kept_codes.push(-1);
-                            continue;
-                        }
-                        let lc_idx = lc as usize;
-                        let g = match local_to_global[lc_idx] {
-                            Some(g) => g,
-                            None => {
-                                let v = &vals[lc_idx];
-                                let k = $key(v);
-                                let g = match $dict.get(&k) {
-                                    Some(&g) => g,
-                                    None => {
-                                        let g: i32 = $order.len().try_into().map_err(|_| {
-                                            ConvertError::Other(format!(
-                                                "column '{name}': categorical cardinality exceeds i32::MAX"
-                                            ))
-                                        })?;
-                                        $dict.insert(k, g);
-                                        $order.push($store(v));
-                                        g
-                                    }
-                                };
-                                local_to_global[lc_idx] = Some(g);
-                                g
-                            }
-                        };
-                        kept_codes.push(g);
+            let mut kept_codes: Vec<i32> = Vec::with_capacity(kept_local.len());
+            for &i in kept_local {
+                let lc = local_codes[i];
+                if lc < 0 {
+                    kept_codes.push(-1);
+                    continue;
+                }
+                match local_to_global[lc as usize] {
+                    Some(g) => kept_codes.push(g),
+                    // Unreachable by construction: `used` is exactly the set of
+                    // categories the *kept* rows reference, computed from the
+                    // same mask over the same shards. Reaching it would mean
+                    // the pre-scan and the write pass disagreed about which
+                    // rows survive, which must fail loudly rather than write a
+                    // code into a vocabulary that does not contain it.
+                    None => {
+                        return Err(ConvertError::Other(format!(
+                            "column '{name}': kept row {i} references category {lc}, which the \
+                             pre-scan recorded as referenced by no kept row (the keep mask used \
+                             for the vocabulary scan disagrees with the one used for the write)"
+                        )))
                     }
-                    kept_codes
-                }};
+                }
             }
-
-            let kept_codes = match (&mut *accum, local_values) {
-                (CatAccum::Str { dict, order }, CatValues::Str(vals)) => {
-                    let svals: Vec<String> = vals.iter().map(|v| v.as_str().to_string()).collect();
-                    remap!(svals, dict, order, |v: &String| v.clone(), |v: &String| v
-                        .clone())
-                }
-                (CatAccum::Int { dict, order }, CatValues::Int(vals)) => {
-                    remap!(vals, dict, order, |v: &i64| *v, |v: &i64| *v)
-                }
-                (CatAccum::Float { dict, order }, CatValues::Float(vals)) => {
-                    remap!(vals, dict, order, |v: &f64| v.to_bits(), |v: &f64| *v)
-                }
-                _ => {
-                    // The accumulator variant is fixed from the column's
-                    // declared value type at writer creation; every shard
-                    // must present the same class. A mismatch means a
-                    // malformed file (shards disagree on dtype).
-                    return Err(ConvertError::Other(format!(
-                        "column '{name}': categorical value type changed across shards"
-                    )));
-                }
-            };
             codes_ds.write_slice(
                 ArrayView1::from(kept_codes.as_slice()),
                 ndarray::s![*offset..*offset + kept_codes.len()],
@@ -2322,6 +2152,129 @@ fn append_shard_to_column(
         }
     }
     Ok(())
+}
+
+/// Fold one shard's **declared** category vocabulary into the cross-shard
+/// accumulator, in declared order, returning `local_to_global[c]` — the global
+/// code for local category `c`, or `None` when that category is pruned.
+///
+/// Declared order, not appearance order, is the whole point (§11.1): a
+/// `pd.Categorical`'s category list is chosen by the user, is what `ordered=True`
+/// makes every comparison mean, and may name levels no row uses. Interning it
+/// wholesale is what preserves both properties. For a shard that arrives as a
+/// plain `V` array rather than a `Dictionary` there is no declared order —
+/// `local_categorical_view` supplies first-appearance-within-the-shard, which
+/// is all the shard carries.
+///
+/// A category is skipped only when `used` says no kept row references it, so an
+/// unfiltered export prunes nothing. Lookups borrow (`&str`, `i64`, `u64`) and
+/// allocate only on insert, so a re-declared vocabulary costs a hash per
+/// category per shard and no allocation.
+///
+/// The two key projections are free functions rather than closures because a
+/// closure returning a reference borrowed from its argument does not infer the
+/// `for<'a>` bound the `HashMap::get` / `HashSet::contains` calls need.
+fn intern_declared_categories(
+    accum: &mut CatAccum,
+    used: Option<&UsedCategories>,
+    local_values: &CatValues,
+    name: &str,
+) -> Result<Vec<Option<i32>>, ConvertError> {
+    /// Shared body: walk the declared values in order, skip the pruned ones,
+    /// and assign each survivor its global code (existing or freshly issued).
+    macro_rules! fold {
+        ($vals:expr, $dict:expr, $order:expr, $used:expr, $key:expr, $store:expr) => {{
+            let vals = $vals;
+            let mut out: Vec<Option<i32>> = Vec::with_capacity(vals.len());
+            for v in vals.iter() {
+                let k = $key(v);
+                if let Some(u) = $used {
+                    if !u.contains(k) {
+                        out.push(None);
+                        continue;
+                    }
+                }
+                let g = match $dict.get(k) {
+                    Some(&g) => g,
+                    None => {
+                        // Defensive: real categoricals stay far below i32::MAX,
+                        // but the on-disk `codes` dataset is i32.
+                        let g: i32 = $order.len().try_into().map_err(|_| cardinality_err(name))?;
+                        $dict.insert($store(v), g);
+                        $order.push($store(v));
+                        g
+                    }
+                };
+                out.push(Some(g));
+            }
+            out
+        }};
+    }
+
+    // The accumulator variant is fixed from the column's declared value type
+    // at writer creation; every shard must present the same class, and so must
+    // the pre-scan's `used` set.
+    Ok(match (accum, local_values) {
+        (CatAccum::Str { dict, order }, CatValues::Str(vals)) => {
+            let used = match used {
+                None => None,
+                Some(UsedCategories::Str(s)) => Some(s),
+                Some(_) => return Err(cat_class_mismatch_err(name)),
+            };
+            fn key(v: &VarLenUnicode) -> &str {
+                v.as_str()
+            }
+            fn store(v: &VarLenUnicode) -> String {
+                v.as_str().to_string()
+            }
+            fold!(vals, dict, order, used, key, store)
+        }
+        (CatAccum::Int { dict, order }, CatValues::Int(vals)) => {
+            let used = match used {
+                None => None,
+                Some(UsedCategories::Int(s)) => Some(s),
+                Some(_) => return Err(cat_class_mismatch_err(name)),
+            };
+            fn key(v: &i64) -> &i64 {
+                v
+            }
+            fn store(v: &i64) -> i64 {
+                *v
+            }
+            fold!(vals, dict, order, used, key, store)
+        }
+        (CatAccum::Float { dict, order }, CatValues::Float(vals)) => {
+            let used = match used {
+                None => None,
+                Some(UsedCategories::Float(s)) => Some(s),
+                Some(_) => return Err(cat_class_mismatch_err(name)),
+            };
+            // Floats key on the bit pattern in both the accumulator and the
+            // used-set, so the borrowed key is a `u64` held in a local.
+            let mut out: Vec<Option<i32>> = Vec::with_capacity(vals.len());
+            for v in vals.iter() {
+                let k = v.to_bits();
+                if let Some(u) = used {
+                    if !u.contains(&k) {
+                        out.push(None);
+                        continue;
+                    }
+                }
+                let g = match dict.get(&k) {
+                    Some(&g) => g,
+                    None => {
+                        let g: i32 = order.len().try_into().map_err(|_| cardinality_err(name))?;
+                        dict.insert(k, g);
+                        order.push(*v);
+                        g
+                    }
+                };
+                out.push(Some(g));
+            }
+            out
+        }
+        _ => return Err(cat_class_mismatch_err(name)),
+    })
 }
 
 fn finalize_column_writer(writer: &ColumnStreamWriter) -> Result<(), ConvertError> {

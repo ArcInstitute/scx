@@ -31,7 +31,8 @@ use scx_format_io::section::SectionType;
 
 use super::write::{
     build_unified_export_schema, scan_column_export_layout, write_dataframe_group_at,
-    write_dataframe_group_streaming, write_obsm_entry_at, write_uns_entries_at,
+    write_dataframe_group_filtered_at, write_dataframe_group_from_shards, write_obsm_entry_at,
+    write_uns_entries_at,
 };
 use crate::h5_write_util::vlu;
 use crate::pipeline::{ConvertError, ConvertOptions};
@@ -42,11 +43,13 @@ use crate::warnings::{ConvertWarning, WarningSink};
 /// to the eager `read_obs() + write_dataframe_group_at` path (a single
 /// `ObsMetadata` section has nothing to stream).
 ///
-/// `keep_mask_opt` is the global deletion-vector keep mask. The
-/// streaming path filters per shard; the eager fallback filters the
-/// assembled batch before writing so both branches honour the mask
-/// symmetrically (and match the `/X` streaming path's filtered row
-/// count). Pre-task-6a, this fallback ignored the mask — a latent
+/// `keep_mask_opt` is the global deletion-vector keep mask. Both branches
+/// hand it to the same writer, which filters per shard — the single-section
+/// branch has exactly one. It is deliberately *not* applied to the assembled
+/// batch first: `arrow`'s `filter` keeps a `DictionaryArray`'s full dictionary,
+/// so pre-filtering hides the filter from the writer and the unsharded path
+/// would keep every declared category where the sharded one prunes the unused
+/// ones. Pre-task-6a, this fallback ignored the mask entirely — a latent
 /// row-count mismatch with `/X` when DVs were active on a legacy file.
 pub(crate) fn write_obs_streaming_or_eager(
     parent: &hdf5::Group,
@@ -55,15 +58,11 @@ pub(crate) fn write_obs_streaming_or_eager(
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     if reader.obs_metadata_shard_count() == 0 {
-        // Legacy single-section path: nothing to stream — produce the
-        // same output as before by going through the eager helper.
+        // Legacy single-section path: nothing to stream, so the whole-batch
+        // driver takes it — the same writer, one shard.
         match reader.read_obs() {
             Ok(obs) => {
-                let filtered = match keep_mask_opt {
-                    Some(mask) => filter_record_batch_by_mask(&obs, mask)?,
-                    None => obs,
-                };
-                write_dataframe_group_at(parent, "obs", &filtered, sink)?;
+                write_dataframe_group_filtered_at(parent, "obs", &obs, keep_mask_opt, sink)?;
             }
             // A genuinely absent obs section is the only tolerable
             // miss (some legacy files carry none). Any other failure —
@@ -92,16 +91,16 @@ pub(crate) fn write_obs_streaming_or_eager(
     // detect columns that are a `Dictionary` in any shard. Both signals are
     // needed before any HDF5 dataset is allocated. The unified schema then
     // declares a dict-anywhere column categorical even when shard 0 was plain.
-    let layout = scan_column_export_layout(reader.obs_shards(), &schema)?;
+    let layout = scan_column_export_layout(|| reader.obs_shards(), &schema, keep_mask_opt)?;
     let unified_schema = build_unified_export_schema(&schema, &layout);
-    write_dataframe_group_streaming(
+    write_dataframe_group_from_shards(
         parent,
         "obs",
         &unified_schema,
         reader.obs_shards(),
         n_rows_kept,
         keep_mask_opt,
-        &layout.needs_nullable,
+        layout,
         sink,
     )
 }
@@ -134,16 +133,16 @@ pub(crate) fn write_var_streaming_or_eager(
 
     let schema = reader.read_var_schema_logical_lossy()?;
     let n_rows_total = reader.n_vars() as usize;
-    let layout = scan_column_export_layout(reader.var_shards(), &schema)?;
+    let layout = scan_column_export_layout(|| reader.var_shards(), &schema, None)?;
     let unified_schema = build_unified_export_schema(&schema, &layout);
-    write_dataframe_group_streaming(
+    write_dataframe_group_from_shards(
         parent,
         "var",
         &unified_schema,
         reader.var_shards(),
         n_rows_total,
         None,
-        &layout.needs_nullable,
+        layout,
         sink,
     )
 }

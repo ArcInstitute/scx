@@ -672,7 +672,7 @@ fn process_outcomes_non_missing_forced_error_stays_fail_fast() {
 
 mod streaming_obs_hdf5 {
     //! Round-trip and edge-case tests for the
-    //! [`write_dataframe_group_streaming`] obs/var writer wired into
+    //! [`write_dataframe_group_from_shards`] obs/var writer wired into
     //! `scx_to_h5ad_streaming` / `scx_to_h5mu_streaming`.
     //!
     //! Fixtures construct sharded-obs SCX files directly via
@@ -700,7 +700,7 @@ mod streaming_obs_hdf5 {
     use crate::h5ad::read::read_dataframe_group;
     use crate::h5ad::stream_write::write_scx_to_h5ad_streaming;
     use crate::h5ad::write::{
-        write_dataframe_group_at, write_dataframe_group_streaming, write_scx_to_h5ad,
+        write_dataframe_group_at, write_dataframe_group_from_shards, write_scx_to_h5ad,
     };
     use crate::pipeline::ConvertOptions;
     use crate::warnings::WarningSink;
@@ -1646,6 +1646,52 @@ mod streaming_obs_hdf5 {
                     }
                 }
             }
+            (DataType::Int64, DataType::Int64) => {
+                let s = s.as_any().downcast_ref::<Int64Array>().unwrap();
+                let e = e.as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..n {
+                    assert_eq!(s.is_valid(i), e.is_valid(i), "{col_name} mask row {i}");
+                    if s.is_valid(i) {
+                        assert_eq!(s.value(i), e.value(i), "{col_name} row {i}");
+                    }
+                }
+            }
+            (DataType::LargeUtf8, DataType::LargeUtf8) => {
+                let s = s.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                let e = e.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                for i in 0..n {
+                    assert_eq!(s.value(i), e.value(i), "{col_name} row {i}");
+                }
+            }
+            // Floats: `NaN` is anndata's canonical missing value, so a
+            // bit-pattern comparison is the right one — `NaN != NaN` would
+            // make every null-carrying float column pass vacuously.
+            (DataType::Float32, DataType::Float32) => {
+                let s = s.as_any().downcast_ref::<Float32Array>().unwrap();
+                let e = e.as_any().downcast_ref::<Float32Array>().unwrap();
+                for i in 0..n {
+                    assert_eq!(
+                        s.value(i).to_bits(),
+                        e.value(i).to_bits(),
+                        "{col_name} row {i}: {} vs {}",
+                        s.value(i),
+                        e.value(i)
+                    );
+                }
+            }
+            (DataType::Float64, DataType::Float64) => {
+                let s = s.as_any().downcast_ref::<Float64Array>().unwrap();
+                let e = e.as_any().downcast_ref::<Float64Array>().unwrap();
+                for i in 0..n {
+                    assert_eq!(
+                        s.value(i).to_bits(),
+                        e.value(i).to_bits(),
+                        "{col_name} row {i}: {} vs {}",
+                        s.value(i),
+                        e.value(i)
+                    );
+                }
+            }
             // Dictionary <K, Utf8> — compare by resolved strings.
             (DataType::Dictionary(_, _), DataType::Dictionary(_, _)) => {
                 let s_strings = dict_to_strings(s, col_name);
@@ -1665,16 +1711,27 @@ mod streaming_obs_hdf5 {
             .as_any()
             .downcast_ref::<DictionaryArray<arrow::datatypes::Int32Type>>()
             .unwrap_or_else(|| panic!("{col_name}: expected Dictionary<Int32, Utf8>"));
-        let values = dict
-            .values()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap_or_else(|| panic!("{col_name}: expected Utf8 dict values"));
+        // Numeric-keyed categoricals (integer cluster labels, dose levels)
+        // round-trip as `Dictionary<Int32, Int64/Float64>`; render their
+        // categories to strings so one comparison covers every value class.
+        let vals = dict.values();
+        let render: Box<dyn Fn(usize) -> String> =
+            if let Some(a) = vals.as_any().downcast_ref::<StringArray>() {
+                Box::new(move |c| a.value(c).to_string())
+            } else if let Some(a) = vals.as_any().downcast_ref::<Int64Array>() {
+                Box::new(move |c| a.value(c).to_string())
+            } else if let Some(a) = vals.as_any().downcast_ref::<Float64Array>() {
+                Box::new(move |c| a.value(c).to_string())
+            } else {
+                panic!(
+                    "{col_name}: unsupported dict value type {:?}",
+                    vals.data_type()
+                )
+            };
         (0..dict.len())
             .map(|i| {
                 if dict.is_valid(i) {
-                    let code = dict.keys().value(i) as usize;
-                    Some(values.value(code).to_string())
+                    Some(render(dict.keys().value(i) as usize))
                 } else {
                     None
                 }
@@ -1964,17 +2021,16 @@ mod streaming_obs_hdf5 {
         )
         .unwrap();
 
-        let needs_nullable = vec![false; schema.fields().len()];
         let shards: Vec<Result<RecordBatch, scx_format_io::error::ScxError>> =
             vec![Ok(good), Ok(bad)];
-        let res = write_dataframe_group_streaming(
+        let res = write_dataframe_group_from_shards(
             &root,
             "obs",
             &schema,
             shards,
             4,
             None,
-            &needs_nullable,
+            crate::h5ad::write::ColumnExportLayout::all_plain(schema.fields().len()),
             &mut WarningSink::log(),
         );
         let err = res.expect_err("reordered shard must be rejected");
@@ -2301,7 +2357,7 @@ mod streaming_obs_hdf5 {
     /// 3.5 — a deletion vector that drops every row of a category present in
     /// only one shard prunes that category from the exported `categories`
     /// (the `kept_local` path on a plain shard). Driven at the
-    /// `write_dataframe_group_streaming` level with an explicit keep mask.
+    /// `write_dataframe_group_from_shards` level with an explicit keep mask.
     #[test]
     fn test_p3_5_deletion_vector_prunes_singleton_category() {
         let dir = tempfile::tempdir().unwrap();
@@ -2309,22 +2365,26 @@ mod streaming_obs_hdf5 {
         let s1 = str_cat_obs_shard(4, &["C", "C"], false); // rows 4..6, 'C' only here
         let shard0_schema = s0.schema();
         let shards = vec![s0, s1];
-        let layout =
-            scan_column_export_layout(shards.iter().cloned().map(Ok), &shard0_schema).unwrap();
-        let unified = build_unified_export_schema(&shard0_schema, &layout);
-
         // Keep all of shard 0, drop all of shard 1.
         let keep_mask = [true, true, true, true, false, false];
+        let layout = scan_column_export_layout(
+            || shards.iter().cloned().map(Ok),
+            &shard0_schema,
+            Some(&keep_mask),
+        )
+        .unwrap();
+        let unified = build_unified_export_schema(&shard0_schema, &layout);
+
         let file = hdf5::File::create(dir.path().join("dv.h5ad")).unwrap();
         let root = file.as_group().unwrap();
-        write_dataframe_group_streaming(
+        write_dataframe_group_from_shards(
             &root,
             "obs",
             &unified,
             shards.into_iter().map(Ok),
             4,
             Some(&keep_mask),
-            &layout.needs_nullable,
+            layout,
             &mut WarningSink::log(),
         )
         .unwrap();
@@ -2428,6 +2488,657 @@ mod streaming_obs_hdf5 {
         assert_eq!(cat_rows(&cats, &codes), want);
     }
 
+    // ---- §11.1: the exported categorical vocabulary is the *declared* one ----
+    //
+    // A `pd.Categorical` carries a declared category list that is independent
+    // of the data: it has an order the user chose (`ordered=True` makes every
+    // `<` comparison depend on it) and it may declare levels no row uses. The
+    // streaming exporter used to rebuild that list by interning categories in
+    // first-appearance-in-kept-rows order, which silently reordered it and
+    // dropped the unused levels while still writing `ordered=True`.
+    //
+    // The fixtures below are deliberately built so declared order ≠ appearance
+    // order and at least one declared level has zero rows — the two properties
+    // the pre-existing P3 fixtures lack, which is why they could not see it
+    // (`str_cat_obs_shard` builds its dictionary with `from_iter`, so declared
+    // order *is* appearance order and every level is used).
+
+    /// One obs shard whose `cell_type` is a `Dictionary<Int8, Utf8>` with an
+    /// **explicitly declared** vocabulary: `declared` is the category list in
+    /// declared order, `vals` the per-row values. A value in `vals` must appear
+    /// in `declared`; a level in `declared` need not appear in `vals`.
+    fn declared_cat_obs_shard(start: usize, declared: &[&str], vals: &[&str]) -> RecordBatch {
+        let n = vals.len();
+        let cell_ids: Vec<String> = (start..start + n).map(|i| format!("cell_{i:06}")).collect();
+        let keys: Vec<i8> = vals
+            .iter()
+            .map(|v| {
+                declared
+                    .iter()
+                    .position(|d| d == v)
+                    .unwrap_or_else(|| panic!("value {v:?} not in declared {declared:?}"))
+                    as i8
+            })
+            .collect();
+        let dict = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(keys),
+            Arc::new(StringArray::from(declared.to_vec())) as ArrayRef,
+        )
+        .unwrap();
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("cell_type", dict.data_type().clone(), false),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(cell_ids)) as ArrayRef,
+                Arc::new(dict) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// §11.1 — the declared category **order** survives the streaming export.
+    ///
+    /// The review's own repro: declared `["I","II","III","IV"]`, data starting
+    /// at `"III"`. First-appearance interning produced `["III","I","II"]` — a
+    /// different order, still stamped `ordered=True`, so every downstream
+    /// `<` / `.sort_values()` / legend silently meant something else.
+    #[test]
+    fn streaming_export_preserves_declared_category_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = ["I", "II", "III", "IV"];
+        let s0 = declared_cat_obs_shard(0, &declared, &["III", "III", "I", "II"]);
+        let s1 = declared_cat_obs_shard(4, &declared, &["II", "I"]);
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(
+            cats,
+            vec!["I", "II", "III", "IV"],
+            "exported categories must keep the declared order, not data order"
+        );
+        // The values must still decode to the same per-row strings.
+        let want: Vec<Option<String>> = ["III", "III", "I", "II", "II", "I"]
+            .iter()
+            .map(|s| Some(s.to_string()))
+            .collect();
+        assert_eq!(cat_rows(&cats, &codes), want);
+    }
+
+    /// §11.1 — a declared-but-unused category survives when **no** row filter
+    /// is active. `"IV"` is declared by every shard and referenced by no row;
+    /// dropping it silently changes the factor's levels on a plain export.
+    ///
+    /// This is the inversion of
+    /// [`test_p3_5_deletion_vector_prunes_singleton_category`]: pruning is
+    /// correct there because a row filter *is* active (anndata's
+    /// `remove_unused_categories` on subset), and wrong here.
+    #[test]
+    fn streaming_export_keeps_a_declared_but_unused_category_without_a_row_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = ["I", "II", "III", "IV"];
+        let s0 = declared_cat_obs_shard(0, &declared, &["I", "II"]);
+        let s1 = declared_cat_obs_shard(2, &declared, &["III", "I"]);
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let (cats, _codes) = read_str_cat(&file, "obs", "cell_type");
+        assert!(
+            cats.contains(&"IV".to_string()),
+            "declared-but-unused category 'IV' must survive an unfiltered export, got {cats:?}"
+        );
+        assert_eq!(cats, vec!["I", "II", "III", "IV"]);
+    }
+
+    /// §11.1 — pruning under a row filter is decided **per category**, not per
+    /// shard. `"C"` is declared by the one and only shard and referenced by a
+    /// single row, which the mask drops; the surviving rows keep the shard
+    /// alive, so nothing short of looking at the rows can tell that `"C"` is
+    /// now unused.
+    ///
+    /// This is the arm [`test_p3_5_deletion_vector_prunes_singleton_category`]
+    /// does not reach: there the whole shard carrying `"C"` is dropped, so the
+    /// writer skips the shard outright and the category never enters the
+    /// vocabulary whether or not the pre-scan ran. Measured: disabling
+    /// `scan_used_categories` leaves that test green and this one red with
+    /// `["A","B","C"]`.
+    #[test]
+    fn streaming_export_prunes_a_category_used_only_by_filtered_rows_of_a_kept_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = ["A", "B", "C"];
+        let s0 = declared_cat_obs_shard(0, &declared, &["A", "B", "C", "A"]);
+        let shard0_schema = s0.schema();
+        let shards = vec![s0];
+        // Drop only row 2 — the single "C".
+        let keep_mask = [true, true, false, true];
+        let layout = scan_column_export_layout(
+            || shards.iter().cloned().map(Ok),
+            &shard0_schema,
+            Some(&keep_mask),
+        )
+        .unwrap();
+        let unified = build_unified_export_schema(&shard0_schema, &layout);
+        let file = hdf5::File::create(dir.path().join("dv_partial.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+        write_dataframe_group_from_shards(
+            &root,
+            "obs",
+            &unified,
+            shards.into_iter().map(Ok),
+            3,
+            Some(&keep_mask),
+            layout,
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+        drop(file);
+
+        let file = hdf5::File::open(dir.path().join("dv_partial.h5ad")).unwrap();
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(
+            cats,
+            vec!["A", "B"],
+            "'C' is referenced by no kept row and must be pruned, in declared order"
+        );
+        let want: Vec<Option<String>> = ["A", "B", "A"]
+            .iter()
+            .map(|s| Some(s.to_string()))
+            .collect();
+        assert_eq!(cat_rows(&cats, &codes), want);
+    }
+
+    /// §11.1 — a shard whose rows are *all* filtered out still contributes its
+    /// declared vocabulary, filtered by the same per-category rule. The
+    /// exporter skips such a shard's writes (an empty hyperslab selection is
+    /// not a write HDF5 accepts), and skipping the interning with it would make
+    /// the surviving vocabulary depend on how the rows happen to be sharded.
+    #[test]
+    fn streaming_export_vocabulary_does_not_depend_on_shard_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = ["A", "B", "C", "D"];
+        // "D" is declared everywhere and used nowhere; "C" lives only in the
+        // shard that is entirely dropped.
+        let s0 = declared_cat_obs_shard(0, &declared, &["A", "B"]);
+        let s1 = declared_cat_obs_shard(2, &declared, &["C", "C"]);
+        let shard0_schema = s0.schema();
+        let shards = vec![s0, s1];
+
+        // Unfiltered: every declared level survives, shard boundaries and all.
+        let layout =
+            scan_column_export_layout(|| shards.iter().cloned().map(Ok), &shard0_schema, None)
+                .unwrap();
+        let unified = build_unified_export_schema(&shard0_schema, &layout);
+        let file = hdf5::File::create(dir.path().join("unfiltered.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+        write_dataframe_group_from_shards(
+            &root,
+            "obs",
+            &unified,
+            shards.iter().cloned().map(Ok),
+            4,
+            None,
+            layout,
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+        drop(file);
+        let file = hdf5::File::open(dir.path().join("unfiltered.h5ad")).unwrap();
+        let (cats, _) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(cats, vec!["A", "B", "C", "D"]);
+        drop(file);
+
+        // Filtered so shard 1 vanishes entirely: "C" and "D" both go, and the
+        // survivors keep declared order.
+        let keep_mask = [true, true, false, false];
+        let layout = scan_column_export_layout(
+            || shards.iter().cloned().map(Ok),
+            &shard0_schema,
+            Some(&keep_mask),
+        )
+        .unwrap();
+        let unified = build_unified_export_schema(&shard0_schema, &layout);
+        let file = hdf5::File::create(dir.path().join("filtered.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+        write_dataframe_group_from_shards(
+            &root,
+            "obs",
+            &unified,
+            shards.into_iter().map(Ok),
+            2,
+            Some(&keep_mask),
+            layout,
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+        drop(file);
+        let file = hdf5::File::open(dir.path().join("filtered.h5ad")).unwrap();
+        let (cats, _) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(cats, vec!["A", "B"]);
+    }
+
+    /// §11.1 — shards that declare **different** vocabularies union in
+    /// declared order, first shard first. This is the layout `append` produces
+    /// (each appended shard carries its own dictionary).
+    #[test]
+    fn streaming_export_unions_declared_vocabularies_in_declared_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Shard 0 declares B,A (reverse-alphabetical, and A appears first in
+        // the data); shard 1 declares D,C and uses only D.
+        let s0 = declared_cat_obs_shard(0, &["B", "A"], &["A", "B"]);
+        let s1 = declared_cat_obs_shard(2, &["D", "C"], &["D", "D"]);
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(
+            cats,
+            vec!["B", "A", "D", "C"],
+            "each shard's declared order is preserved and the shards concatenate"
+        );
+        let want: Vec<Option<String>> = ["A", "B", "D", "D"]
+            .iter()
+            .map(|s| Some(s.to_string()))
+            .collect();
+        assert_eq!(cat_rows(&cats, &codes), want);
+    }
+
+    /// §11.1 — the `ordered` bit and the category order must agree. A file
+    /// that declares `ordered=True` and exports a reordered vocabulary is
+    /// worse than one that drops the bit: every comparison still *works*, and
+    /// silently answers differently.
+    #[test]
+    fn streaming_export_ordered_bit_and_declared_order_stay_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = ["low", "medium", "high"];
+        // Data order is the reverse of the declared (severity) order.
+        let mut s0 = declared_cat_obs_shard(0, &declared, &["high", "medium"]);
+        let mut s1 = declared_cat_obs_shard(2, &declared, &["low", "high"]);
+        s0 = with_ordered_categorical(&s0, "cell_type");
+        s1 = with_ordered_categorical(&s1, "cell_type");
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let g = file.group("obs").unwrap().group("cell_type").unwrap();
+        let ordered: bool = g.attr("ordered").unwrap().read_scalar().unwrap();
+        assert!(ordered, "the ordered bit must survive");
+        let (cats, _) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(
+            cats,
+            vec!["low", "medium", "high"],
+            "an ordered factor exported in data order silently redefines every comparison"
+        );
+    }
+
+    /// Stamp `scx.categorical.ordered=true` on one column's field metadata —
+    /// the same key the h5ad reader sets and the writer resolves the `ordered`
+    /// attribute from.
+    fn with_ordered_categorical(batch: &RecordBatch, col: &str) -> RecordBatch {
+        let schema = batch.schema();
+        let fields: Vec<Arc<Field>> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == col {
+                    let mut md = f.metadata().clone();
+                    md.insert(
+                        crate::CATEGORICAL_ORDERED_KEY.to_string(),
+                        "true".to_string(),
+                    );
+                    Arc::new(f.as_ref().clone().with_metadata(md))
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+            batch.columns().to_vec(),
+        )
+        .unwrap()
+    }
+
+    // ---- ORG-11.16-1: the two drivers write the same thing ----
+
+    /// A structural fingerprint of an h5ad dataframe group: the group-level
+    /// attrs, then per member whether it is a plain dataset or a group, its
+    /// anndata `encoding-type` / `ordered`, its own members, and — for a
+    /// categorical — the exact `categories` list in order.
+    ///
+    /// Deliberately *not* a value comparison: `read_dataframe_group` already
+    /// covers values, and it normalises exactly the things that diverged here
+    /// (a categorical's vocabulary and its order survive a logical comparison
+    /// unchanged, which is why §11.1 lived undetected under one).
+    fn dataframe_group_shape(file: &hdf5::File, grp: &str) -> Vec<String> {
+        fn attr_strings(obj: &hdf5::Group, name: &str) -> String {
+            let Ok(a) = obj.attr(name) else {
+                return "<absent>".to_string();
+            };
+            if let Ok(v) = a.read_scalar::<hdf5::types::VarLenUnicode>() {
+                return v.to_string();
+            }
+            if let Ok(v) = a.read_scalar::<bool>() {
+                return v.to_string();
+            }
+            if let Ok(v) = a.read_1d::<hdf5::types::VarLenUnicode>() {
+                return format!(
+                    "[{}]",
+                    v.iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+            "<unreadable>".to_string()
+        }
+        fn categories_of(g: &hdf5::Group) -> Option<String> {
+            let ds = g.dataset("categories").ok()?;
+            use hdf5::types::TypeDescriptor as TD;
+            Some(match ds.dtype().ok()?.to_descriptor().ok()? {
+                TD::VarLenUnicode | TD::VarLenAscii | TD::FixedUnicode(_) | TD::FixedAscii(_) => {
+                    let v = ds.read_1d::<hdf5::types::VarLenUnicode>().ok()?;
+                    format!(
+                        "[{}]",
+                        v.iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
+                TD::Integer(_) | TD::Unsigned(_) => {
+                    format!("{:?}", ds.read_1d::<i64>().ok()?.to_vec())
+                }
+                TD::Float(_) => format!("{:?}", ds.read_1d::<f64>().ok()?.to_vec()),
+                other => format!("<{other:?}>"),
+            })
+        }
+
+        let g = file.group(grp).unwrap();
+        let mut out = vec![
+            format!("@encoding-type = {}", attr_strings(&g, "encoding-type")),
+            format!(
+                "@encoding-version = {}",
+                attr_strings(&g, "encoding-version")
+            ),
+            format!("@_index = {}", attr_strings(&g, "_index")),
+            format!("@column-order = {}", attr_strings(&g, "column-order")),
+        ];
+        let mut members = g.member_names().unwrap();
+        members.sort();
+        for m in members {
+            match g.group(&m) {
+                Ok(sub) => {
+                    out.push(format!(
+                        "{m}: group encoding-type={} encoding-version={} ordered={}",
+                        attr_strings(&sub, "encoding-type"),
+                        attr_strings(&sub, "encoding-version"),
+                        attr_strings(&sub, "ordered"),
+                    ));
+                    let mut sm = sub.member_names().unwrap();
+                    sm.sort();
+                    for d in sm {
+                        let shape = sub.dataset(&d).map(|x| x.shape()).unwrap_or_default();
+                        out.push(format!("{m}/{d}: shape={shape:?}"));
+                    }
+                    if let Some(cats) = categories_of(&sub) {
+                        out.push(format!("{m}/categories = {cats}"));
+                    }
+                }
+                Err(_) => {
+                    let ds = g.dataset(&m).unwrap();
+                    out.push(format!("{m}: dataset shape={:?}", ds.shape()));
+                }
+            }
+        }
+        out
+    }
+
+    /// An obs frame spanning every column encoding the writer implements,
+    /// each in the state that selects a *different* on-disk shape: integers
+    /// and strings both with and without nulls (nullable group vs plain
+    /// dataset), a float with nulls (plain, `NaN`-filled — anndata has no
+    /// nullable float), a nullable boolean, a string categorical whose
+    /// declared order is not its data order and which declares an unused
+    /// level, and an integer categorical.
+    fn all_encodings_obs_batch(n: usize) -> RecordBatch {
+        let cell_ids: Vec<String> = (0..n).map(|i| format!("cell_{i:06}")).collect();
+        let n_genes: Vec<Option<i32>> = (0..n)
+            .map(|i| if i % 5 == 0 { None } else { Some(i as i32) })
+            .collect();
+        let total_counts: Vec<i64> = (0..n).map(|i| 1000 + i as i64).collect();
+        let pct_mito: Vec<Option<f32>> = (0..n)
+            .map(|i| {
+                if i % 7 == 0 {
+                    None
+                } else {
+                    Some(i as f32 / 3.0)
+                }
+            })
+            .collect();
+        let score: Vec<f64> = (0..n).map(|i| i as f64 * 0.5).collect();
+        let note: Vec<Option<String>> = (0..n)
+            .map(|i| {
+                if i % 4 == 0 {
+                    None
+                } else {
+                    Some(format!("note{i}"))
+                }
+            })
+            .collect();
+        let wide_note: Vec<String> = (0..n).map(|i| format!("wide{i}")).collect();
+        let is_doublet: Vec<Option<bool>> = (0..n)
+            .map(|i| if i % 6 == 0 { None } else { Some(i % 2 == 0) })
+            .collect();
+
+        // Declared ["I","II","III","IV"]; the data starts at "III" and never
+        // uses "IV".
+        let ct_declared = ["I", "II", "III", "IV"];
+        let ct_keys: Vec<i8> = (0..n).map(|i| (2 - (i % 3)) as i8).collect();
+        let cell_type = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(ct_keys),
+            Arc::new(StringArray::from(ct_declared.to_vec())) as ArrayRef,
+        )
+        .unwrap();
+        // Integer categorical with a non-sorted declared order.
+        let cl_keys: Vec<i8> = (0..n).map(|i| (i % 3) as i8).collect();
+        let cluster = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(cl_keys),
+            Arc::new(Int64Array::from(vec![10i64, 5, 7])) as ArrayRef,
+        )
+        .unwrap();
+
+        let ordered_md = std::collections::HashMap::from([(
+            crate::CATEGORICAL_ORDERED_KEY.to_string(),
+            "true".to_string(),
+        )]);
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("n_genes", DataType::Int32, true),
+            Field::new("total_counts", DataType::Int64, false),
+            Field::new("pct_mito", DataType::Float32, true),
+            Field::new("score", DataType::Float64, false),
+            Field::new("note", DataType::Utf8, true),
+            Field::new("wide_note", DataType::LargeUtf8, false),
+            Field::new("is_doublet", DataType::Boolean, true),
+            Field::new("cell_type", cell_type.data_type().clone(), false)
+                .with_metadata(ordered_md.clone()),
+            Field::new("cluster", cluster.data_type().clone(), false),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(cell_ids)) as ArrayRef,
+                Arc::new(Int32Array::from(n_genes)) as ArrayRef,
+                Arc::new(Int64Array::from(total_counts)) as ArrayRef,
+                Arc::new(Float32Array::from(pct_mito)) as ArrayRef,
+                Arc::new(Float64Array::from(score)) as ArrayRef,
+                Arc::new(StringArray::from(note)) as ArrayRef,
+                Arc::new(LargeStringArray::from(wide_note)) as ArrayRef,
+                Arc::new(BooleanArray::from(is_doublet)) as ArrayRef,
+                Arc::new(cell_type) as ArrayRef,
+                Arc::new(cluster) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// ORG-11.16-1 — the whole-batch driver and the shard-stream driver
+    /// produce the *same* `/obs` group, across every encoding, down to the
+    /// categorical vocabularies and the `ordered` bit.
+    ///
+    /// The two used to be independent implementations of the nine encodings,
+    /// picked by whether the source file had `ObsMetadataShard` sections, and
+    /// they had drifted apart twice — most recently on the categorical
+    /// vocabulary (§11.1). This is the assertion that a third drift cannot
+    /// happen quietly: they are now one implementation, and if that is ever
+    /// undone, this is what notices.
+    #[test]
+    fn both_dataframe_drivers_write_the_same_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = all_encodings_obs_batch(30);
+
+        let eager_path = dir.path().join("whole_batch.h5ad");
+        {
+            let f = hdf5::File::create(&eager_path).unwrap();
+            write_dataframe_group_at(
+                &f.as_group().unwrap(),
+                "obs",
+                &batch,
+                &mut WarningSink::log(),
+            )
+            .unwrap();
+        }
+
+        // The same frame as 3 shards. `RecordBatch::slice` keeps each
+        // dictionary whole, which is the layout `from_anndata` emits.
+        let shards: Vec<RecordBatch> = [(0, 10), (10, 10), (20, 10)]
+            .iter()
+            .map(|&(o, l)| batch.slice(o, l))
+            .collect();
+        let stream_path = dir.path().join("shard_stream.h5ad");
+        {
+            let schema = batch.schema();
+            let layout =
+                scan_column_export_layout(|| shards.iter().cloned().map(Ok), &schema, None)
+                    .unwrap();
+            let unified = build_unified_export_schema(&schema, &layout);
+            let f = hdf5::File::create(&stream_path).unwrap();
+            write_dataframe_group_from_shards(
+                &f.as_group().unwrap(),
+                "obs",
+                &unified,
+                shards.into_iter().map(Ok),
+                batch.num_rows(),
+                None,
+                layout,
+                &mut WarningSink::log(),
+            )
+            .unwrap();
+        }
+
+        let eager = hdf5::File::open(&eager_path).unwrap();
+        let stream = hdf5::File::open(&stream_path).unwrap();
+        let eager_shape = dataframe_group_shape(&eager, "obs");
+        let stream_shape = dataframe_group_shape(&stream, "obs");
+        assert_eq!(
+            eager_shape, stream_shape,
+            "the whole-batch and shard-stream drivers disagree on the /obs group"
+        );
+
+        // The fingerprint is only worth something if it can tell the
+        // encodings apart, so pin what it should contain.
+        let joined = eager_shape.join("\n");
+        for expected in [
+            "n_genes: group encoding-type=nullable-integer",
+            "note: group encoding-type=nullable-string-array",
+            "is_doublet: group encoding-type=nullable-boolean",
+            "cell_type: group encoding-type=categorical encoding-version=0.2.0 ordered=true",
+            "cell_type/categories = [I,II,III,IV]",
+            "cluster/categories = [10, 5, 7]",
+            "total_counts: dataset",
+            "pct_mito: dataset",
+            "wide_note: dataset",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "fingerprint missing {expected:?}; got:\n{joined}"
+            );
+        }
+
+        // And the values must match too, via the reader AnnData uses.
+        let eager_obs = read_dataframe_group(&eager, "obs", &mut WarningSink::log()).unwrap();
+        let stream_obs = read_dataframe_group(&stream, "obs", &mut WarningSink::log()).unwrap();
+        assert_eq!(eager_obs.num_rows(), stream_obs.num_rows());
+        for f in eager_obs.schema().fields() {
+            let e = eager_obs.column(eager_obs.schema().index_of(f.name()).unwrap());
+            let s = stream_obs.column(stream_obs.schema().index_of(f.name()).unwrap());
+            compare_columns_logical(s, e, f.name());
+        }
+    }
+
+    /// ORG-11.16-1 — the whole-batch driver honours a row filter the same way,
+    /// including the categorical pruning rule. The legacy single-obs-section
+    /// export used to filter its batch *before* handing it to the writer,
+    /// which hid the filter: `arrow`'s `filter` keeps a `DictionaryArray`'s
+    /// full dictionary, so an unsharded file kept every declared category
+    /// where a sharded one pruned the unused ones.
+    #[test]
+    fn both_dataframe_drivers_apply_a_row_filter_the_same_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = all_encodings_obs_batch(30);
+        // Keep only rows whose `cell_type` is "III" (keys are 2,1,0 cycling,
+        // so `i % 3 == 0` selects declared index 2).
+        let keep: Vec<bool> = (0..30).map(|i| i % 3 == 0).collect();
+        let n_kept = keep.iter().filter(|&&b| b).count();
+
+        let whole_path = dir.path().join("whole_filtered.h5ad");
+        {
+            let f = hdf5::File::create(&whole_path).unwrap();
+            crate::h5ad::write::write_dataframe_group_filtered_at(
+                &f.as_group().unwrap(),
+                "obs",
+                &batch,
+                Some(&keep),
+                &mut WarningSink::log(),
+            )
+            .unwrap();
+        }
+
+        let shards: Vec<RecordBatch> = [(0, 10), (10, 10), (20, 10)]
+            .iter()
+            .map(|&(o, l)| batch.slice(o, l))
+            .collect();
+        let shard_path = dir.path().join("shard_filtered.h5ad");
+        {
+            let schema = batch.schema();
+            let layout =
+                scan_column_export_layout(|| shards.iter().cloned().map(Ok), &schema, Some(&keep))
+                    .unwrap();
+            let unified = build_unified_export_schema(&schema, &layout);
+            let f = hdf5::File::create(&shard_path).unwrap();
+            write_dataframe_group_from_shards(
+                &f.as_group().unwrap(),
+                "obs",
+                &unified,
+                shards.into_iter().map(Ok),
+                n_kept,
+                Some(&keep),
+                layout,
+                &mut WarningSink::log(),
+            )
+            .unwrap();
+        }
+
+        let whole = hdf5::File::open(&whole_path).unwrap();
+        let shard = hdf5::File::open(&shard_path).unwrap();
+        assert_eq!(
+            dataframe_group_shape(&whole, "obs"),
+            dataframe_group_shape(&shard, "obs"),
+            "the two drivers disagree on a filtered /obs group"
+        );
+        let (cats, codes) = read_str_cat(&whole, "obs", "cell_type");
+        assert_eq!(
+            cats,
+            vec!["III"],
+            "only the surviving level is kept, and 'IV' was never used at all"
+        );
+        assert_eq!(codes.len(), n_kept);
+    }
+
     // ---- Review-driven coverage (PR #280 review fixes) ----
 
     /// Drive shards through the real unified-schema + streaming writer pipeline
@@ -2438,18 +3149,19 @@ mod streaming_obs_hdf5 {
         n_rows: usize,
     ) -> Result<(), crate::pipeline::ConvertError> {
         let shard0_schema = shards[0].schema();
-        let layout = scan_column_export_layout(shards.iter().cloned().map(Ok), &shard0_schema)?;
+        let layout =
+            scan_column_export_layout(|| shards.iter().cloned().map(Ok), &shard0_schema, None)?;
         let unified = build_unified_export_schema(&shard0_schema, &layout);
         let file = hdf5::File::create(dir.join("err.h5ad")).unwrap();
         let root = file.as_group().unwrap();
-        write_dataframe_group_streaming(
+        write_dataframe_group_from_shards(
             &root,
             "obs",
             &unified,
             shards.into_iter().map(Ok),
             n_rows,
             None,
-            &layout.needs_nullable,
+            layout,
             &mut WarningSink::log(),
         )
     }
