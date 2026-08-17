@@ -32,7 +32,8 @@
 //!   six edits for one.
 //! * A new **`SectionFamily`** — a genuinely new thing to decide about —
 //!   produces **six** errors: [`SectionFamily::label`] plus the five explicit
-//!   policies. [`upgrade`] is the deliberate exception; see its doc comment.
+//!   policies. The private `upgrade` policy is the deliberate exception; see
+//!   its doc comment.
 //!
 //! So the accurate claim is not "adding a section type breaks six matches". It
 //! is that nothing can reach an op without a declared family, and no new

@@ -48,6 +48,38 @@ first if you want a way back.
 | **cellbender-import** (`attach_external_layer`) | In place (`<FILE> <CELLBENDER_H5>`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | Same as **obs-import**: preserved on a pure column *add*, dropped when `overwrite` rewrites an indexed obs column, and the column stats cleared per rewritten column | **Preserved** (X untouched) |
 | **rollback** | In place (`<FILE>`) | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored | Restored (as of the previous catalog) |
 
+### Everything the matrix above does not have a column for
+
+The matrix covers the seven things most people need. A file can carry twenty
+kinds of section, and "which of them survive this op" used to be answered in
+five different places in the source with no two agreeing. It is now answered
+once, in **`scx-ops/src/carry.rs`** — a table over (operation × section family)
+that every rewrite op is checked against at run time, so an op that stops
+writing something it claims to carry fails loudly instead of losing it quietly.
+
+Read that table rather than this document when you need the answer for `varm`,
+`obsp`, `varp`, `adata.raw`, detection bitmaps, layers or the grouped-sort
+sidecar. It is the source of truth, it is snapshot-tested, and it cannot get out
+of step with the code without a test going red.
+
+Two of its answers are worth surfacing here, because they are **losses of user
+data that the ops do not currently prevent**:
+
+- **`merge` does not carry `obsp` or `varp`.** A merged file has no cell–cell
+  graph, even though `compact` remaps one through its keep-mask and `sort`
+  through its permutation. Merging per-sample files after computing kNN loses
+  the graph, with no warning. Compute the neighbours *after* the merge.
+- **`build-csc` carries only layers, `obsm`, `uns`, the predicate-index sections
+  and the deletion vector.** `varm`, `obsp`, `varp`, `adata.raw`, detection
+  bitmaps and the group index are dropped — and because `build-csc --in-place`
+  renames a wholly new file over the target carrying no prior catalog,
+  `scx rollback` cannot bring them back. It does warn. If the input has any of
+  them, copy out to a separate `<OUTPUT>` rather than rewriting in place, or use
+  `scx optimize`, which carries all of them.
+
+Both are known defects rather than intended behaviour, and both are scheduled to
+be fixed; the table records what the code does today, not what it should do.
+
 ### Deletion vectors: carried vs. applied
 
 `mark_deleted` is a *logical* delete — the rows stay on disk and readers filter

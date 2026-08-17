@@ -23,7 +23,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[docs/testing.md](docs/testing.md)** — Test, benchmark, and correctness validation details.
 - **[docs/multithreading.md](docs/multithreading.md)** — Multithreading architecture across crates.
 - **[docs/sharding.md](docs/sharding.md)** — Sharding design and usage.
-- **[docs/operations.md](docs/operations.md)** — SCX operations reference: behavior of mutating ops (append, delete, compact, merge, rollback) and their invariants.
+- **[docs/operations.md](docs/operations.md)** — SCX operations reference: behavior of mutating ops (append, delete, compact, merge, rollback) and their invariants. The per-section answer to "which sections survive this op" lives in `scx-ops/src/carry.rs` (an exhaustive table over operation × section family, snapshot-tested and checked against every rewrite op's output at run time), not in the doc's Operations Matrix.
 - **[docs/multimodal.md](docs/multimodal.md)** — Multimodal (CITE-seq / Multiome / TEA-seq / spatial) layout and APIs.
 - **[docs/cloud.md](docs/cloud.md)** — Cloud auth, layouts, tuning, provider-specific notes.
 - **[docs/conventions.md](docs/conventions.md)** — Coding conventions (serialization, error handling, checksums, language binding rules, GPU/accel constraints).
