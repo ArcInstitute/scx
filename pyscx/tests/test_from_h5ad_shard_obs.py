@@ -184,3 +184,40 @@ def test_from_h5mu_shards_the_outer_obs():
         exp = pyscx.open(scx)
         assert exp.obs_metadata_shard_count == 4
         assert exp.n_obs == n_obs
+
+
+def test_force_legacy_metadata_survives_backed_routing():
+    """`from_anndata(backed_adata, force_legacy_metadata=True)` must still
+    produce a single-section obs.
+
+    A backed `X` routes `from_anndata` through `scx-convert`'s streaming
+    ingest — the same path `from_h5ad` takes — so once that path started
+    sharding obs by default, the flag became reachable only on the in-memory
+    branch and was silently ignored here. The flag exists precisely to keep the
+    legacy layout for readers that have not migrated to `obs_shards()`;
+    ignoring it on one of the two branches breaks exactly those readers, and
+    quietly.
+    """
+    import anndata
+
+    with tempfile.TemporaryDirectory() as tmp:
+        h5ad = os.path.join(tmp, "in.h5ad")
+        _write_h5ad(h5ad, n_obs=40)
+
+        for legacy, want in ((False, 4), (True, 0)):
+            for mode in ("backed", "memory"):
+                src = (
+                    anndata.read_h5ad(h5ad, backed="r")
+                    if mode == "backed"
+                    else anndata.read_h5ad(h5ad)
+                )
+                out = os.path.join(tmp, f"{mode}_{legacy}.scx")
+                pyscx.from_anndata(
+                    src, out, shard_size=10, force_legacy_metadata=legacy
+                )
+                if mode == "backed":
+                    src.file.close()
+                assert pyscx.open(out).obs_metadata_shard_count == want, (
+                    f"{mode} + force_legacy_metadata={legacy} should give "
+                    f"{want} obs shards"
+                )

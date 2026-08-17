@@ -651,6 +651,7 @@ pub fn from_anndata_impl(
                 row_group_target_nnz,
                 codec_trial,
                 decode_target,
+                force_legacy_metadata,
             );
         }
         #[cfg(not(feature = "hdf5"))]

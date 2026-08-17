@@ -331,12 +331,12 @@ pub(crate) fn deep_validate_into(
 ///   `from_anndata` emits the Phase 2 sharded layout
 ///   (`ObsMetadataShard` / `VarMetadataShard`). The opt-out preserves
 ///   the legacy single-section layout for tools that haven't migrated
-///   to `ScxReader::read_obs_shard` / `obs_shards()`. Applies to the
-///   in-memory path only — backed routing goes through the streaming
-///   converter which writes single-section metadata regardless (use
-///   `pyscx.compact(..., reshape_obs=True)` or `scx compact
-///   --reshape-obs` post-hoc if sharded metadata is needed for a backed
-///   conversion).
+///   to `ScxReader::read_obs_shard` / `obs_shards()`. Honoured on both
+///   branches: the in-memory writer applies it directly, and a backed
+///   `X` (which routes through `scx-convert`'s streaming ingest) maps it
+///   to `obs_shard_policy = Off`. On the backed branch it governs **obs
+///   only** — that path never shards var at any `n_vars`, while the
+///   in-memory one shards both.
 #[pyfunction]
 #[pyo3(signature = (
     adata, path, codec=None, shard_size=None, in_place=false, csc=None,
