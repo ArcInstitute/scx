@@ -296,9 +296,9 @@ pub(crate) fn write_dataframe_group_filtered_at(
 
 /// Write the dataframe-level encoding attrs (`encoding-type="dataframe"`,
 /// `encoding-version="0.2.0"`), resolve the pandas index field, and write the
-/// `_index` attr. Shared prologue for the eager [`write_dataframe_body`] and
-/// streaming [`write_dataframe_group_from_shards`] writers — anndata.read_h5ad
-/// requires these on every dataframe group, even an empty one.
+/// `_index` attr. Prologue of [`write_dataframe_group_from_shards`], and so of
+/// both its drivers — anndata.read_h5ad requires these on every dataframe
+/// group, even an empty one.
 ///
 /// Returns `(index_field_name, on_disk_index)` for the caller's per-column
 /// loop. The index field is probed as: (1) the `pandas` schema metadata's
@@ -1673,10 +1673,8 @@ enum NullableKind {
 }
 
 /// Pre-allocate an anndata nullable group (`values` + `mask` datasets +
-/// encoding attrs) for the streaming path. Generic over the HDF5 value
-/// element type so it serves both `nullable-integer` (i32/i64) and
-/// `nullable-string-array` (`VarLenUnicode`). The streaming sibling of
-/// [`write_nullable_group`].
+/// encoding attrs). Generic over the HDF5 value element type so it serves both
+/// `nullable-integer` (i32/i64) and `nullable-string-array` (`VarLenUnicode`).
 fn create_nullable_writer<T: hdf5::H5Type>(
     group: &hdf5::Group,
     on_disk_name: &str,

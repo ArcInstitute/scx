@@ -714,19 +714,22 @@ for the binary layout.
 ### Streaming export over sharded obs/var
 
 `pyscx.to_h5ad` / `pyscx.to_h5mu` (and `scx convert --to h5ad/h5mu`)
-stream sharded obs/var through `write_dataframe_group_streaming` in
+stream sharded obs/var through `write_dataframe_group_from_shards` in
 `scx-convert/src/h5ad/write.rs`: HDF5 datasets are pre-allocated to
 `n_rows_kept` (computed catalog-only from `obs_metadata_shard_count`
 + catalog stats, minus deletion-vector kept-count when active), then
 `obs_shards()` / `var_shards()` are drained one shard at a time and
-hyperslab-written per column. Categorical (`Dictionary<_, Utf8>`)
-columns maintain a running global dictionary across shards — disjoint
-per-shard vocabularies (which `scx append` can produce when categories
-diverge) are unified on the fly without a second pass over the data.
+hyperslab-written per column. Categorical columns union each shard's
+declared vocabulary in declared order — disjoint per-shard vocabularies
+(which `scx append` can produce when categories diverge) are unified on
+the fly, and a shard that arrives as a plain array rather than a
+dictionary contributes its distinct values in first-appearance order,
+which is all such a shard carries.
 Peak RSS during export is bounded to one shard per matrix plus one
-shard per obs/var column, even at multi-million-row scale. Legacy
-single-section obs/var sources transparently fall back to the eager
-`write_dataframe_group_at` writer.
+shard per obs/var column, even at multi-million-row scale. A legacy
+single-section obs/var source goes through the whole-batch driver
+`write_dataframe_group_at`, which is the same writer over a one-shard
+iterator — not a separate implementation.
 
 ## CSC sharding
 
