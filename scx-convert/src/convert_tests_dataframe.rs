@@ -2428,6 +2428,184 @@ mod streaming_obs_hdf5 {
         assert_eq!(cat_rows(&cats, &codes), want);
     }
 
+    // ---- §11.1: the exported categorical vocabulary is the *declared* one ----
+    //
+    // A `pd.Categorical` carries a declared category list that is independent
+    // of the data: it has an order the user chose (`ordered=True` makes every
+    // `<` comparison depend on it) and it may declare levels no row uses. The
+    // streaming exporter used to rebuild that list by interning categories in
+    // first-appearance-in-kept-rows order, which silently reordered it and
+    // dropped the unused levels while still writing `ordered=True`.
+    //
+    // The fixtures below are deliberately built so declared order ≠ appearance
+    // order and at least one declared level has zero rows — the two properties
+    // the pre-existing P3 fixtures lack, which is why they could not see it
+    // (`str_cat_obs_shard` builds its dictionary with `from_iter`, so declared
+    // order *is* appearance order and every level is used).
+
+    /// One obs shard whose `cell_type` is a `Dictionary<Int8, Utf8>` with an
+    /// **explicitly declared** vocabulary: `declared` is the category list in
+    /// declared order, `vals` the per-row values. A value in `vals` must appear
+    /// in `declared`; a level in `declared` need not appear in `vals`.
+    fn declared_cat_obs_shard(start: usize, declared: &[&str], vals: &[&str]) -> RecordBatch {
+        let n = vals.len();
+        let cell_ids: Vec<String> = (start..start + n).map(|i| format!("cell_{i:06}")).collect();
+        let keys: Vec<i8> = vals
+            .iter()
+            .map(|v| {
+                declared
+                    .iter()
+                    .position(|d| d == v)
+                    .unwrap_or_else(|| panic!("value {v:?} not in declared {declared:?}"))
+                    as i8
+            })
+            .collect();
+        let dict = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(keys),
+            Arc::new(StringArray::from(declared.to_vec())) as ArrayRef,
+        )
+        .unwrap();
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("cell_type", dict.data_type().clone(), false),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(cell_ids)) as ArrayRef,
+                Arc::new(dict) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// §11.1 — the declared category **order** survives the streaming export.
+    ///
+    /// The review's own repro: declared `["I","II","III","IV"]`, data starting
+    /// at `"III"`. First-appearance interning produced `["III","I","II"]` — a
+    /// different order, still stamped `ordered=True`, so every downstream
+    /// `<` / `.sort_values()` / legend silently meant something else.
+    #[test]
+    fn streaming_export_preserves_declared_category_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = ["I", "II", "III", "IV"];
+        let s0 = declared_cat_obs_shard(0, &declared, &["III", "III", "I", "II"]);
+        let s1 = declared_cat_obs_shard(4, &declared, &["II", "I"]);
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(
+            cats,
+            vec!["I", "II", "III", "IV"],
+            "exported categories must keep the declared order, not data order"
+        );
+        // The values must still decode to the same per-row strings.
+        let want: Vec<Option<String>> = ["III", "III", "I", "II", "II", "I"]
+            .iter()
+            .map(|s| Some(s.to_string()))
+            .collect();
+        assert_eq!(cat_rows(&cats, &codes), want);
+    }
+
+    /// §11.1 — a declared-but-unused category survives when **no** row filter
+    /// is active. `"IV"` is declared by every shard and referenced by no row;
+    /// dropping it silently changes the factor's levels on a plain export.
+    ///
+    /// This is the inversion of
+    /// [`test_p3_5_deletion_vector_prunes_singleton_category`]: pruning is
+    /// correct there because a row filter *is* active (anndata's
+    /// `remove_unused_categories` on subset), and wrong here.
+    #[test]
+    fn streaming_export_keeps_a_declared_but_unused_category_without_a_row_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = ["I", "II", "III", "IV"];
+        let s0 = declared_cat_obs_shard(0, &declared, &["I", "II"]);
+        let s1 = declared_cat_obs_shard(2, &declared, &["III", "I"]);
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let (cats, _codes) = read_str_cat(&file, "obs", "cell_type");
+        assert!(
+            cats.contains(&"IV".to_string()),
+            "declared-but-unused category 'IV' must survive an unfiltered export, got {cats:?}"
+        );
+        assert_eq!(cats, vec!["I", "II", "III", "IV"]);
+    }
+
+    /// §11.1 — shards that declare **different** vocabularies union in
+    /// declared order, first shard first. This is the layout `append` produces
+    /// (each appended shard carries its own dictionary).
+    #[test]
+    fn streaming_export_unions_declared_vocabularies_in_declared_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Shard 0 declares B,A (reverse-alphabetical, and A appears first in
+        // the data); shard 1 declares D,C and uses only D.
+        let s0 = declared_cat_obs_shard(0, &["B", "A"], &["A", "B"]);
+        let s1 = declared_cat_obs_shard(2, &["D", "C"], &["D", "D"]);
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(
+            cats,
+            vec!["B", "A", "D", "C"],
+            "each shard's declared order is preserved and the shards concatenate"
+        );
+        let want: Vec<Option<String>> = ["A", "B", "D", "D"]
+            .iter()
+            .map(|s| Some(s.to_string()))
+            .collect();
+        assert_eq!(cat_rows(&cats, &codes), want);
+    }
+
+    /// §11.1 — the `ordered` bit and the category order must agree. A file
+    /// that declares `ordered=True` and exports a reordered vocabulary is
+    /// worse than one that drops the bit: every comparison still *works*, and
+    /// silently answers differently.
+    #[test]
+    fn streaming_export_ordered_bit_and_declared_order_stay_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = ["low", "medium", "high"];
+        // Data order is the reverse of the declared (severity) order.
+        let mut s0 = declared_cat_obs_shard(0, &declared, &["high", "medium"]);
+        let mut s1 = declared_cat_obs_shard(2, &declared, &["low", "high"]);
+        s0 = with_ordered_categorical(&s0, "cell_type");
+        s1 = with_ordered_categorical(&s1, "cell_type");
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let g = file.group("obs").unwrap().group("cell_type").unwrap();
+        let ordered: bool = g.attr("ordered").unwrap().read_scalar().unwrap();
+        assert!(ordered, "the ordered bit must survive");
+        let (cats, _) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(
+            cats,
+            vec!["low", "medium", "high"],
+            "an ordered factor exported in data order silently redefines every comparison"
+        );
+    }
+
+    /// Stamp `scx.categorical.ordered=true` on one column's field metadata —
+    /// the same key the h5ad reader sets and the writer resolves the `ordered`
+    /// attribute from.
+    fn with_ordered_categorical(batch: &RecordBatch, col: &str) -> RecordBatch {
+        let schema = batch.schema();
+        let fields: Vec<Arc<Field>> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == col {
+                    let mut md = f.metadata().clone();
+                    md.insert(
+                        crate::CATEGORICAL_ORDERED_KEY.to_string(),
+                        "true".to_string(),
+                    );
+                    Arc::new(f.as_ref().clone().with_metadata(md))
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+            batch.columns().to_vec(),
+        )
+        .unwrap()
+    }
+
     // ---- Review-driven coverage (PR #280 review fixes) ----
 
     /// Drive shards through the real unified-schema + streaming writer pipeline
