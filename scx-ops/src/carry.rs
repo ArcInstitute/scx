@@ -10,9 +10,12 @@
 //! missing invariant, found independently in four crates by the 2026-08-05
 //! review.
 //!
-//! What this module changes is **not** the behaviour. Every entry below records
-//! what the tree does today, including the drops that are open bugs. What it
-//! changes is that the answer is now
+//! Every entry below records what the tree does **today**, including the drops
+//! that are open bugs — the consolidation is not meant to change behaviour, and
+//! where it did, that was a wrong cell rather than a deliberate change. Three
+//! were found in review and fixed: `merge`/`varm`, the COO-vs-CSR obsp
+//! encodings, and the global-vs-per-modality scope. What the module changes is
+//! that the answer is now
 //!
 //! * **in one place**, so a reviewer reads a table instead of five call graphs;
 //! * **exhaustive**, so a new section type cannot default to "dropped"; and
@@ -59,11 +62,19 @@ use crate::error::{OpsError, Result as OpsResult};
 ///
 /// The 29 section types do not each get their own decision: a legacy single
 /// section and its row-shard twin are one decision (`ObsMetadata` /
-/// `ObsMetadataShard`), and three physical encodings of `obsp` are still just
-/// "obsp". Keying the policy on the family rather than the type is not
+/// `ObsMetadataShard`). Keying on the family rather than the type is not
 /// cosmetic — `compact` can read a legacy `ObsMetadata` input and emit
 /// `ObsMetadataShard`s, so a type-keyed audit would report a section that
 /// "vanished" on a perfectly correct rewrite.
+///
+/// **The converse is just as load-bearing, and this enum got it wrong twice.**
+/// A family is a unit of *decision*, so two things the ops treat differently are
+/// two families however alike they look on disk. The COO and CSR obsp encodings
+/// were one family until the audit started false-failing `compact` on a CSR-only
+/// file; see [`SectionFamily::ObspCsr`]. The global/per-modality split is the
+/// same mistake on a different axis, and is handled by [`SectionScope`] rather
+/// than by more variants, because there the *scope* differs and the family does
+/// not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SectionFamily {
     /// obs table: `ObsMetadata` + `ObsMetadataShard`.
@@ -219,6 +230,36 @@ pub fn family(ty: SectionType) -> SectionFamily {
     }
 }
 
+/// Whether a section belongs to the file as a whole or to one modality.
+///
+/// The audit checks the two **separately**, because several ops treat them
+/// differently and a single boolean per family cannot express that. `compact`
+/// remaps *global* obsp through its keep-mask, and its multimodal path warns and
+/// drops *per-modality* obsp and varp outright — the format has no per-modality
+/// pairwise reader, so it cannot round-trip them.
+///
+/// Collapsing the two was wrong in both directions, exactly as collapsing the
+/// CSR and COO encodings was. A file whose only obsp is per-modality failed an
+/// audit on a compact that had always succeeded; a file with both kept the
+/// family "present" from its global copy while the per-modality graph was
+/// silently lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SectionScope {
+    /// `modality_id == 0` — the file-level section.
+    Global,
+    /// `modality_id != 0` — scoped to one modality.
+    PerModality,
+}
+
+impl SectionScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::PerModality => "per-modality",
+        }
+    }
+}
+
 /// What an op does with a family **that is present in its input**.
 ///
 /// Every variant is conditional on presence, which is why there is no
@@ -352,6 +393,48 @@ impl RewriteOp {
 /// review, declared here rather than fixed so the fix arrives as a visible diff
 /// against a stated baseline.
 pub fn policy(op: RewriteOp, family: SectionFamily) -> Carry {
+    policy_scoped(op, family, SectionScope::Global)
+}
+
+/// [`policy`] for a given scope.
+///
+/// Almost every cell is the same for both scopes, so rather than doubling the
+/// table this defers to [`policy`] unless the private `per_modality_override` says the op
+/// treats the per-modality case differently.
+pub fn policy_scoped(op: RewriteOp, family: SectionFamily, scope: SectionScope) -> Carry {
+    if scope == SectionScope::PerModality {
+        if let Some(c) = per_modality_override(op, family) {
+            return c;
+        }
+    }
+    policy_global(op, family)
+}
+
+/// The cells where an op's answer for a per-modality section differs from its
+/// answer for the global one.
+///
+/// Deliberately a short override list rather than a second full table: three
+/// cells differ, and writing out 120 more to express that would bury them.
+fn per_modality_override(op: RewriteOp, family: SectionFamily) -> Option<Carry> {
+    use SectionFamily as F;
+    match (op, family) {
+        // `compact_multimodal` detects per-modality pairwise sections and warns
+        // that it is dropping them ("no per-modality pairwise reader, so they
+        // cannot be round-tripped"); `sort_multimodal` only ever copies
+        // `modality_id == 0` pairwise, so it drops them without saying so.
+        (RewriteOp::Compact, F::Obsp | F::ObspCsr | F::Varp) => Some(Carry::Dropped {
+            why: "no per-modality pairwise reader exists, so it cannot be round-tripped",
+            warns: true,
+        }),
+        (RewriteOp::Sort, F::Obsp | F::ObspCsr | F::Varp) => Some(Carry::Dropped {
+            why: "no per-modality pairwise reader exists, so it cannot be round-tripped",
+            warns: false,
+        }),
+        _ => None,
+    }
+}
+
+fn policy_global(op: RewriteOp, family: SectionFamily) -> Carry {
     match op {
         RewriteOp::Compact => compact(family),
         RewriteOp::Merge => merge(family),
@@ -694,92 +777,121 @@ pub struct CarryReport {
 /// wrote no rows for some *other* reason still fails.
 ///
 /// Fails closed: a violation is an error, not a warning, matching how
-/// `assign_csr_shard_column_stats` treats a shard-count mismatch. A rewrite that
-/// has silently lost a section has already produced the file; the only useful
-/// moment to say so is before the caller believes it succeeded.
+/// `assign_csr_shard_column_stats` treats a shard-count mismatch. Callers reach
+/// this through [`audit_staged`], which runs before the output is persisted, so
+/// the error prevents the loss rather than reporting it.
+///
+/// Cost is O(families x scopes x catalog entries x inputs) — a nested scan, not
+/// a single pass. It runs once per op invocation over an in-memory catalog, so
+/// the shape is irrelevant at any realistic file size; stated precisely here
+/// because an earlier version of this doc called it "one pass".
 pub fn audit(
     op: RewriteOp,
     inputs: &[&FullCatalog],
     output: &[FullCatalogEntry],
     output_n_obs: u64,
 ) -> OpsResult<CarryReport> {
-    let present_in = |entries: &[FullCatalogEntry], f: SectionFamily| {
-        entries.iter().any(|e| family(e.section_type) == f)
+    let scope_of = |e: &FullCatalogEntry| {
+        if e.modality_id == 0 {
+            SectionScope::Global
+        } else {
+            SectionScope::PerModality
+        }
     };
-    let present = |catalog: &FullCatalog, f: SectionFamily| present_in(&catalog.entries, f);
+    let present_in = |entries: &[FullCatalogEntry], f: SectionFamily, sc: SectionScope| {
+        entries
+            .iter()
+            .any(|e| family(e.section_type) == f && scope_of(e) == sc)
+    };
+    let present = |catalog: &FullCatalog, f: SectionFamily, sc: SectionScope| {
+        present_in(&catalog.entries, f, sc)
+    };
 
     let mut dropped = Vec::new();
     let mut carried = Vec::new();
 
     for &f in SectionFamily::ALL {
-        if !inputs.iter().any(|c| present(c, f)) {
-            continue;
-        }
-        let in_output = present_in(output, f);
-        let rule = policy(op, f);
-
-        match rule {
-            Carry::Refuse => {
-                return Err(OpsError::SectionCarryViolation {
-                    op: op.label(),
-                    family: f.label(),
-                    detail: "op declares it refuses this input, but the guard did not fire"
-                        .to_string(),
-                });
+        for sc in [SectionScope::Global, SectionScope::PerModality] {
+            if !inputs.iter().any(|c| present(c, f, sc)) {
+                continue;
             }
-            // `warns` is not consulted here: the warnings live at their existing
-            // sites in each op, where the input path and the remedy are in
-            // scope. The flag is part of the table's description of today, and
-            // what reads it is the snapshot test — where `dropped(SILENT)` is
-            // legible next to `dropped(warns)` as the anomaly it is.
-            Carry::Dropped { why, warns: _ } => {
-                if in_output {
+            let in_output = present_in(output, f, sc);
+            let rule = policy_scoped(op, f, sc);
+
+            match rule {
+                Carry::Refuse => {
                     return Err(OpsError::SectionCarryViolation {
                         op: op.label(),
                         family: f.label(),
-                        detail: format!("declared dropped ({why}) but the output carries it"),
+                        detail: format!(
+                        "op declares it refuses this input ({} scope), but the guard did not fire",
+                        sc.label()
+                    ),
                     });
                 }
-                if f == SectionFamily::Unwritten {
-                    log::warn!(
+                // `warns` is not consulted here: the warnings live at their existing
+                // sites in each op, where the input path and the remedy are in
+                // scope. The flag is part of the table's description of today, and
+                // what reads it is the snapshot test — where `dropped(SILENT)` is
+                // legible next to `dropped(warns)` as the anomaly it is.
+                Carry::Dropped { why, warns: _ } => {
+                    if in_output {
+                        return Err(OpsError::SectionCarryViolation {
+                            op: op.label(),
+                            family: f.label(),
+                            detail: format!(
+                                "declared dropped in {} scope ({why}) but the output carries it",
+                                sc.label()
+                            ),
+                        });
+                    }
+                    if f == SectionFamily::Unwritten {
+                        log::warn!(
                         "scx {}: input carries a legacy `obs_index` / `var_index` section, which \
                          no writer in this workspace produces and which this op drops. If it \
                          holds data you need, extract it before rewriting.",
                         op.label()
                     );
-                }
-                dropped.push(f);
-            }
-            _ if rule.requires_presence() => {
-                // A row-filtered family may vanish legitimately, but only when
-                // there is nothing left to carry.
-                let exempt = rule == Carry::RowFiltered && output_n_obs == 0;
-                if !in_output && !exempt {
-                    return Err(OpsError::SectionCarryViolation {
-                        op: op.label(),
-                        family: f.label(),
-                        detail: format!("declared {} but the output does not carry it", rule.tag()),
-                    });
-                }
-                if in_output {
-                    carried.push(f);
-                } else {
+                    }
                     dropped.push(f);
                 }
-            }
-            // `Rebuilt` asserts nothing — see its doc comment.
-            _ => {
-                if in_output {
-                    carried.push(f);
-                } else {
-                    dropped.push(f);
+                _ if rule.requires_presence() => {
+                    // A row-filtered family may vanish legitimately, but only when
+                    // there is nothing left to carry.
+                    let exempt = rule == Carry::RowFiltered && output_n_obs == 0;
+                    if !in_output && !exempt {
+                        return Err(OpsError::SectionCarryViolation {
+                            op: op.label(),
+                            family: f.label(),
+                            detail: format!(
+                                "declared {} in {} scope but the output does not carry it",
+                                rule.tag(),
+                                sc.label()
+                            ),
+                        });
+                    }
+                    if in_output {
+                        carried.push(f);
+                    } else {
+                        dropped.push(f);
+                    }
+                }
+                // `Rebuilt` asserts nothing — see its doc comment.
+                _ => {
+                    if in_output {
+                        carried.push(f);
+                    } else {
+                        dropped.push(f);
+                    }
                 }
             }
         }
     }
 
     dropped.sort();
+    dropped.dedup();
     carried.sort();
+    carried.dedup();
     Ok(CarryReport { dropped, carried })
 }
 
@@ -823,6 +935,11 @@ pub fn render_table() -> String {
         out.push('\n');
         for &f in SectionFamily::ALL {
             out.push_str(&format!("  {:<28} {}\n", f.label(), policy(op, f).tag()));
+            // Only the cells whose per-modality answer differs, so the grid
+            // stays readable and a scope override is still a visible diff.
+            if let Some(c) = per_modality_override(op, f) {
+                out.push_str(&format!("    (per-modality)             {}\n", c.tag()));
+            }
         }
     }
     out

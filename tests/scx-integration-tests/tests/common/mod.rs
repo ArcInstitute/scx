@@ -20,6 +20,7 @@ use arrow::array::{Float32Array, Int32Array, Int64Array, RecordBatch, StringArra
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::header::FileHeader;
+use scx_format_io::modality::ModalityType;
 use scx_format_io::writer::ScxWriter;
 
 pub const N_OBS: usize = 8;
@@ -421,4 +422,66 @@ fn coo_i32(n: usize) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+/// A multimodal file whose **only** pairwise graph is scoped to a modality.
+///
+/// This is the input the global/per-modality scope split exists for.
+/// `compact_multimodal` detects per-modality obsp/varp, warns that it cannot
+/// round-trip them ("no per-modality pairwise reader"), and drops them — so a
+/// file-wide "obsp is remapped" policy turns a compact that had always
+/// succeeded into a hard failure.
+pub fn fixture_multimodal_per_modality_obsp(dir: &Path, name: &str) -> PathBuf {
+    const RNA_VARS: usize = 8;
+    const ADT_VARS: usize = 4;
+    let path = dir.join(name);
+    let mut writer = ScxWriter::new(
+        &path,
+        FileHeader::new_single_modality(N_OBS as u64, RNA_VARS as u64, 0, SHARD_ROWS as u32, 0, 0),
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch()).unwrap();
+
+    let ids: Vec<(u8, usize)> = [
+        ("rna", ModalityType::Rna, RNA_VARS),
+        ("adt", ModalityType::Protein, ADT_VARS),
+    ]
+    .into_iter()
+    .map(|(name, ty, n_vars)| {
+        let id = writer
+            .add_modality(name, ty, CodecId::None, ValueEncoding::Uint8, false)
+            .unwrap();
+        writer.write_var_for(id, &var_batch(n_vars, name)).unwrap();
+        writer.set_modality_n_vars(id, n_vars as u64).unwrap();
+        (id, n_vars)
+    })
+    .collect();
+
+    for &(id, n_vars) in &ids {
+        let (indptr, indices, values) = csr_rows(0, N_OBS, n_vars, 1);
+        writer
+            .write_csr_shard_for(
+                id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+    }
+
+    // The point of the fixture: an obsp graph on the rna modality and none at
+    // file scope, so a scope-blind audit sees "obsp present in, absent out".
+    let rna_id = ids[0].0;
+    writer
+        .with_modality::<_, (), scx_format_io::ScxError>(rna_id, |w| {
+            w.write_obsp("connectivities", &coo_batch(N_OBS))?;
+            Ok(())
+        })
+        .unwrap();
+
+    writer.finish().unwrap();
+    path
 }

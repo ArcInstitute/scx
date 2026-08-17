@@ -37,7 +37,10 @@ use scx_format_io::reader::ScxReader;
 use scx_format_io::ObsShardPolicy;
 use scx_ops::carry::{family, policy, Carry, RewriteOp, SectionFamily};
 
-use common::{fixture_all_families, fixture_all_families_without_varm, fixture_with_csr_obsp};
+use common::{
+    fixture_all_families, fixture_all_families_without_varm, fixture_multimodal_per_modality_obsp,
+    fixture_with_csr_obsp,
+};
 
 /// The families a file actually carries, read off its catalog.
 fn families_of(path: &Path) -> BTreeSet<SectionFamily> {
@@ -338,5 +341,33 @@ fn merge_succeeds_when_only_a_later_input_has_varm() {
         !families_of(&out).contains(&SectionFamily::Varm),
         "and it really is dropped — merge sources varm from input 0 only, which \
          is why the cell is Conditional rather than Verbatim"
+    );
+}
+
+/// A pairwise graph scoped to a modality is a different decision from a
+/// file-level one, and `compact` treats them differently: it remaps the global
+/// graph through its keep-mask and drops the per-modality graphs outright,
+/// because the format has no per-modality pairwise reader.
+///
+/// A file-wide "obsp is remapped" cell made this compact — which had always
+/// worked, warning as it dropped — into a hard failure. The scope split closes
+/// that direction *and* the mirror one: a file with both a global and a
+/// per-modality graph no longer has the global copy vouch for the lost one.
+#[test]
+fn per_modality_pairwise_is_a_different_decision_from_global() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = fixture_multimodal_per_modality_obsp(dir.path(), "mm_obsp.scx");
+    assert!(
+        families_of(&input).contains(&SectionFamily::Obsp),
+        "premise: the fixture must carry an obsp graph at all"
+    );
+
+    let out = dir.path().join("compacted.scx");
+    scx_ops::compact(&input, &out).expect("compact must not fail on per-modality-only obsp");
+
+    assert!(
+        !families_of(&out).contains(&SectionFamily::Obsp),
+        "and it really is dropped — which is why the per-modality cell is a \
+         declared drop rather than the global cell's Remapped"
     );
 }

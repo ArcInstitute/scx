@@ -86,8 +86,11 @@ compact
   obsm                         row-filtered
   varm                         verbatim
   obsp                         remapped
+    (per-modality)             dropped(warns)
   obsp (CSR-backed)            dropped(SILENT)
+    (per-modality)             dropped(warns)
   varp                         verbatim
+    (per-modality)             dropped(warns)
   uns                          verbatim
   provenance                   rebuilt
   deletion vectors             dropped(SILENT)
@@ -152,8 +155,11 @@ sort
   obsm                         remapped
   varm                         verbatim
   obsp                         remapped
+    (per-modality)             dropped(SILENT)
   obsp (CSR-backed)            dropped(SILENT)
+    (per-modality)             dropped(SILENT)
   varp                         verbatim
+    (per-modality)             dropped(SILENT)
   uns                          verbatim
   provenance                   rebuilt
   deletion vectors             dropped(SILENT)
@@ -251,9 +257,11 @@ fn upgrade_matches_build_csc_except_the_csc_sidecar() {
 fn open_bugs_are_labelled_in_the_table() {
     let open: Vec<(RewriteOp, SectionFamily)> = vec![
         (RewriteOp::Merge, SectionFamily::Obsp),
+        (RewriteOp::Merge, SectionFamily::ObspCsr),
         (RewriteOp::Merge, SectionFamily::Varp),
         (RewriteOp::BuildCsc, SectionFamily::Varm),
         (RewriteOp::BuildCsc, SectionFamily::Obsp),
+        (RewriteOp::BuildCsc, SectionFamily::ObspCsr),
         (RewriteOp::BuildCsc, SectionFamily::Varp),
         (RewriteOp::BuildCsc, SectionFamily::Raw),
         (RewriteOp::BuildCsc, SectionFamily::Bitmap),
@@ -283,10 +291,19 @@ fn open_bugs_are_labelled_in_the_table() {
 /// catalog, so neither can be asserted.
 ///
 /// That is only safe while no op's policy for those two families requires
-/// presence. This pins it. Without this test the doc comment on `audit_staged`
-/// is an assertion nothing checks — and the failure it guards against is the
-/// worst kind: flipping `ModalityTable` to `Verbatim` would not break a unit
-/// test, it would make *every multimodal compact and merge* fail at run time.
+/// **presence**. This pins exactly that and no more. Without it, flipping
+/// `ModalityTable` to `Verbatim` would not break a unit test — it would make
+/// every multimodal compact and merge fail at run time.
+///
+/// ⚠️ **It does not pin the mirror direction**, and the doc on `audit_staged`
+/// should not be read as claiming it does: a family declared `Dropped` that
+/// `finish()` then auto-emits would pass the pre-persist audit and leave a
+/// persisted artifact violating the policy. `XCsc` is `Dropped` for most ops, so
+/// that shape is only unreachable because every rewrite call site registers its
+/// modalities with `build_csc = false`. That is a property of the call sites,
+/// not of this table, and nothing here enforces it — if a rewrite op ever passes
+/// `build_csc = true`, this test will still be green and the invariant will be
+/// false.
 #[test]
 fn finish_writes_only_non_asserting_families() {
     for &op in RewriteOp::ALL {

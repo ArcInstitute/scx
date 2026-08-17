@@ -1723,7 +1723,6 @@ impl ScxWriter {
             .map(|idx| (idx + 1) as u8)
     }
 
-    /// Number of modalities registered so far.
     /// The catalog entries written so far, and the header row count they
     /// describe.
     ///
@@ -1745,6 +1744,7 @@ impl ScxWriter {
         (&self.entries, self.header.n_obs)
     }
 
+    /// Number of modalities registered so far.
     pub fn n_modalities(&self) -> usize {
         self.modalities.len()
     }
