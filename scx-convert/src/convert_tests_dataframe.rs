@@ -672,7 +672,7 @@ fn process_outcomes_non_missing_forced_error_stays_fail_fast() {
 
 mod streaming_obs_hdf5 {
     //! Round-trip and edge-case tests for the
-    //! [`write_dataframe_group_streaming`] obs/var writer wired into
+    //! [`write_dataframe_group_from_shards`] obs/var writer wired into
     //! `scx_to_h5ad_streaming` / `scx_to_h5mu_streaming`.
     //!
     //! Fixtures construct sharded-obs SCX files directly via
@@ -700,7 +700,7 @@ mod streaming_obs_hdf5 {
     use crate::h5ad::read::read_dataframe_group;
     use crate::h5ad::stream_write::write_scx_to_h5ad_streaming;
     use crate::h5ad::write::{
-        write_dataframe_group_at, write_dataframe_group_streaming, write_scx_to_h5ad,
+        write_dataframe_group_at, write_dataframe_group_from_shards, write_scx_to_h5ad,
     };
     use crate::pipeline::ConvertOptions;
     use crate::warnings::WarningSink;
@@ -1646,6 +1646,52 @@ mod streaming_obs_hdf5 {
                     }
                 }
             }
+            (DataType::Int64, DataType::Int64) => {
+                let s = s.as_any().downcast_ref::<Int64Array>().unwrap();
+                let e = e.as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..n {
+                    assert_eq!(s.is_valid(i), e.is_valid(i), "{col_name} mask row {i}");
+                    if s.is_valid(i) {
+                        assert_eq!(s.value(i), e.value(i), "{col_name} row {i}");
+                    }
+                }
+            }
+            (DataType::LargeUtf8, DataType::LargeUtf8) => {
+                let s = s.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                let e = e.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                for i in 0..n {
+                    assert_eq!(s.value(i), e.value(i), "{col_name} row {i}");
+                }
+            }
+            // Floats: `NaN` is anndata's canonical missing value, so a
+            // bit-pattern comparison is the right one — `NaN != NaN` would
+            // make every null-carrying float column pass vacuously.
+            (DataType::Float32, DataType::Float32) => {
+                let s = s.as_any().downcast_ref::<Float32Array>().unwrap();
+                let e = e.as_any().downcast_ref::<Float32Array>().unwrap();
+                for i in 0..n {
+                    assert_eq!(
+                        s.value(i).to_bits(),
+                        e.value(i).to_bits(),
+                        "{col_name} row {i}: {} vs {}",
+                        s.value(i),
+                        e.value(i)
+                    );
+                }
+            }
+            (DataType::Float64, DataType::Float64) => {
+                let s = s.as_any().downcast_ref::<Float64Array>().unwrap();
+                let e = e.as_any().downcast_ref::<Float64Array>().unwrap();
+                for i in 0..n {
+                    assert_eq!(
+                        s.value(i).to_bits(),
+                        e.value(i).to_bits(),
+                        "{col_name} row {i}: {} vs {}",
+                        s.value(i),
+                        e.value(i)
+                    );
+                }
+            }
             // Dictionary <K, Utf8> — compare by resolved strings.
             (DataType::Dictionary(_, _), DataType::Dictionary(_, _)) => {
                 let s_strings = dict_to_strings(s, col_name);
@@ -1665,16 +1711,27 @@ mod streaming_obs_hdf5 {
             .as_any()
             .downcast_ref::<DictionaryArray<arrow::datatypes::Int32Type>>()
             .unwrap_or_else(|| panic!("{col_name}: expected Dictionary<Int32, Utf8>"));
-        let values = dict
-            .values()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap_or_else(|| panic!("{col_name}: expected Utf8 dict values"));
+        // Numeric-keyed categoricals (integer cluster labels, dose levels)
+        // round-trip as `Dictionary<Int32, Int64/Float64>`; render their
+        // categories to strings so one comparison covers every value class.
+        let vals = dict.values();
+        let render: Box<dyn Fn(usize) -> String> =
+            if let Some(a) = vals.as_any().downcast_ref::<StringArray>() {
+                Box::new(move |c| a.value(c).to_string())
+            } else if let Some(a) = vals.as_any().downcast_ref::<Int64Array>() {
+                Box::new(move |c| a.value(c).to_string())
+            } else if let Some(a) = vals.as_any().downcast_ref::<Float64Array>() {
+                Box::new(move |c| a.value(c).to_string())
+            } else {
+                panic!(
+                    "{col_name}: unsupported dict value type {:?}",
+                    vals.data_type()
+                )
+            };
         (0..dict.len())
             .map(|i| {
                 if dict.is_valid(i) {
-                    let code = dict.keys().value(i) as usize;
-                    Some(values.value(code).to_string())
+                    Some(render(dict.keys().value(i) as usize))
                 } else {
                     None
                 }
@@ -1966,7 +2023,7 @@ mod streaming_obs_hdf5 {
 
         let shards: Vec<Result<RecordBatch, scx_format_io::error::ScxError>> =
             vec![Ok(good), Ok(bad)];
-        let res = write_dataframe_group_streaming(
+        let res = write_dataframe_group_from_shards(
             &root,
             "obs",
             &schema,
@@ -2300,7 +2357,7 @@ mod streaming_obs_hdf5 {
     /// 3.5 — a deletion vector that drops every row of a category present in
     /// only one shard prunes that category from the exported `categories`
     /// (the `kept_local` path on a plain shard). Driven at the
-    /// `write_dataframe_group_streaming` level with an explicit keep mask.
+    /// `write_dataframe_group_from_shards` level with an explicit keep mask.
     #[test]
     fn test_p3_5_deletion_vector_prunes_singleton_category() {
         let dir = tempfile::tempdir().unwrap();
@@ -2320,7 +2377,7 @@ mod streaming_obs_hdf5 {
 
         let file = hdf5::File::create(dir.path().join("dv.h5ad")).unwrap();
         let root = file.as_group().unwrap();
-        write_dataframe_group_streaming(
+        write_dataframe_group_from_shards(
             &root,
             "obs",
             &unified,
@@ -2562,7 +2619,7 @@ mod streaming_obs_hdf5 {
         let unified = build_unified_export_schema(&shard0_schema, &layout);
         let file = hdf5::File::create(dir.path().join("dv_partial.h5ad")).unwrap();
         let root = file.as_group().unwrap();
-        write_dataframe_group_streaming(
+        write_dataframe_group_from_shards(
             &root,
             "obs",
             &unified,
@@ -2612,7 +2669,7 @@ mod streaming_obs_hdf5 {
         let unified = build_unified_export_schema(&shard0_schema, &layout);
         let file = hdf5::File::create(dir.path().join("unfiltered.h5ad")).unwrap();
         let root = file.as_group().unwrap();
-        write_dataframe_group_streaming(
+        write_dataframe_group_from_shards(
             &root,
             "obs",
             &unified,
@@ -2641,7 +2698,7 @@ mod streaming_obs_hdf5 {
         let unified = build_unified_export_schema(&shard0_schema, &layout);
         let file = hdf5::File::create(dir.path().join("filtered.h5ad")).unwrap();
         let root = file.as_group().unwrap();
-        write_dataframe_group_streaming(
+        write_dataframe_group_from_shards(
             &root,
             "obs",
             &unified,
@@ -2735,6 +2792,353 @@ mod streaming_obs_hdf5 {
         .unwrap()
     }
 
+    // ---- ORG-11.16-1: the two drivers write the same thing ----
+
+    /// A structural fingerprint of an h5ad dataframe group: the group-level
+    /// attrs, then per member whether it is a plain dataset or a group, its
+    /// anndata `encoding-type` / `ordered`, its own members, and — for a
+    /// categorical — the exact `categories` list in order.
+    ///
+    /// Deliberately *not* a value comparison: `read_dataframe_group` already
+    /// covers values, and it normalises exactly the things that diverged here
+    /// (a categorical's vocabulary and its order survive a logical comparison
+    /// unchanged, which is why §11.1 lived undetected under one).
+    fn dataframe_group_shape(file: &hdf5::File, grp: &str) -> Vec<String> {
+        fn attr_strings(obj: &hdf5::Group, name: &str) -> String {
+            let Ok(a) = obj.attr(name) else {
+                return "<absent>".to_string();
+            };
+            if let Ok(v) = a.read_scalar::<hdf5::types::VarLenUnicode>() {
+                return v.to_string();
+            }
+            if let Ok(v) = a.read_scalar::<bool>() {
+                return v.to_string();
+            }
+            if let Ok(v) = a.read_1d::<hdf5::types::VarLenUnicode>() {
+                return format!(
+                    "[{}]",
+                    v.iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+            "<unreadable>".to_string()
+        }
+        fn categories_of(g: &hdf5::Group) -> Option<String> {
+            let ds = g.dataset("categories").ok()?;
+            use hdf5::types::TypeDescriptor as TD;
+            Some(match ds.dtype().ok()?.to_descriptor().ok()? {
+                TD::VarLenUnicode | TD::VarLenAscii | TD::FixedUnicode(_) | TD::FixedAscii(_) => {
+                    let v = ds.read_1d::<hdf5::types::VarLenUnicode>().ok()?;
+                    format!(
+                        "[{}]",
+                        v.iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
+                TD::Integer(_) | TD::Unsigned(_) => {
+                    format!("{:?}", ds.read_1d::<i64>().ok()?.to_vec())
+                }
+                TD::Float(_) => format!("{:?}", ds.read_1d::<f64>().ok()?.to_vec()),
+                other => format!("<{other:?}>"),
+            })
+        }
+
+        let g = file.group(grp).unwrap();
+        let mut out = vec![
+            format!("@encoding-type = {}", attr_strings(&g, "encoding-type")),
+            format!(
+                "@encoding-version = {}",
+                attr_strings(&g, "encoding-version")
+            ),
+            format!("@_index = {}", attr_strings(&g, "_index")),
+            format!("@column-order = {}", attr_strings(&g, "column-order")),
+        ];
+        let mut members = g.member_names().unwrap();
+        members.sort();
+        for m in members {
+            match g.group(&m) {
+                Ok(sub) => {
+                    out.push(format!(
+                        "{m}: group encoding-type={} encoding-version={} ordered={}",
+                        attr_strings(&sub, "encoding-type"),
+                        attr_strings(&sub, "encoding-version"),
+                        attr_strings(&sub, "ordered"),
+                    ));
+                    let mut sm = sub.member_names().unwrap();
+                    sm.sort();
+                    for d in sm {
+                        let shape = sub.dataset(&d).map(|x| x.shape()).unwrap_or_default();
+                        out.push(format!("{m}/{d}: shape={shape:?}"));
+                    }
+                    if let Some(cats) = categories_of(&sub) {
+                        out.push(format!("{m}/categories = {cats}"));
+                    }
+                }
+                Err(_) => {
+                    let ds = g.dataset(&m).unwrap();
+                    out.push(format!("{m}: dataset shape={:?}", ds.shape()));
+                }
+            }
+        }
+        out
+    }
+
+    /// An obs frame spanning every column encoding the writer implements,
+    /// each in the state that selects a *different* on-disk shape: integers
+    /// and strings both with and without nulls (nullable group vs plain
+    /// dataset), a float with nulls (plain, `NaN`-filled — anndata has no
+    /// nullable float), a nullable boolean, a string categorical whose
+    /// declared order is not its data order and which declares an unused
+    /// level, and an integer categorical.
+    fn all_encodings_obs_batch(n: usize) -> RecordBatch {
+        let cell_ids: Vec<String> = (0..n).map(|i| format!("cell_{i:06}")).collect();
+        let n_genes: Vec<Option<i32>> = (0..n)
+            .map(|i| if i % 5 == 0 { None } else { Some(i as i32) })
+            .collect();
+        let total_counts: Vec<i64> = (0..n).map(|i| 1000 + i as i64).collect();
+        let pct_mito: Vec<Option<f32>> = (0..n)
+            .map(|i| {
+                if i % 7 == 0 {
+                    None
+                } else {
+                    Some(i as f32 / 3.0)
+                }
+            })
+            .collect();
+        let score: Vec<f64> = (0..n).map(|i| i as f64 * 0.5).collect();
+        let note: Vec<Option<String>> = (0..n)
+            .map(|i| {
+                if i % 4 == 0 {
+                    None
+                } else {
+                    Some(format!("note{i}"))
+                }
+            })
+            .collect();
+        let wide_note: Vec<String> = (0..n).map(|i| format!("wide{i}")).collect();
+        let is_doublet: Vec<Option<bool>> = (0..n)
+            .map(|i| if i % 6 == 0 { None } else { Some(i % 2 == 0) })
+            .collect();
+
+        // Declared ["I","II","III","IV"]; the data starts at "III" and never
+        // uses "IV".
+        let ct_declared = ["I", "II", "III", "IV"];
+        let ct_keys: Vec<i8> = (0..n).map(|i| (2 - (i % 3)) as i8).collect();
+        let cell_type = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(ct_keys),
+            Arc::new(StringArray::from(ct_declared.to_vec())) as ArrayRef,
+        )
+        .unwrap();
+        // Integer categorical with a non-sorted declared order.
+        let cl_keys: Vec<i8> = (0..n).map(|i| (i % 3) as i8).collect();
+        let cluster = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(cl_keys),
+            Arc::new(Int64Array::from(vec![10i64, 5, 7])) as ArrayRef,
+        )
+        .unwrap();
+
+        let ordered_md = std::collections::HashMap::from([(
+            crate::CATEGORICAL_ORDERED_KEY.to_string(),
+            "true".to_string(),
+        )]);
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("n_genes", DataType::Int32, true),
+            Field::new("total_counts", DataType::Int64, false),
+            Field::new("pct_mito", DataType::Float32, true),
+            Field::new("score", DataType::Float64, false),
+            Field::new("note", DataType::Utf8, true),
+            Field::new("wide_note", DataType::LargeUtf8, false),
+            Field::new("is_doublet", DataType::Boolean, true),
+            Field::new("cell_type", cell_type.data_type().clone(), false)
+                .with_metadata(ordered_md.clone()),
+            Field::new("cluster", cluster.data_type().clone(), false),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(cell_ids)) as ArrayRef,
+                Arc::new(Int32Array::from(n_genes)) as ArrayRef,
+                Arc::new(Int64Array::from(total_counts)) as ArrayRef,
+                Arc::new(Float32Array::from(pct_mito)) as ArrayRef,
+                Arc::new(Float64Array::from(score)) as ArrayRef,
+                Arc::new(StringArray::from(note)) as ArrayRef,
+                Arc::new(LargeStringArray::from(wide_note)) as ArrayRef,
+                Arc::new(BooleanArray::from(is_doublet)) as ArrayRef,
+                Arc::new(cell_type) as ArrayRef,
+                Arc::new(cluster) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// ORG-11.16-1 — the whole-batch driver and the shard-stream driver
+    /// produce the *same* `/obs` group, across every encoding, down to the
+    /// categorical vocabularies and the `ordered` bit.
+    ///
+    /// The two used to be independent implementations of the nine encodings,
+    /// picked by whether the source file had `ObsMetadataShard` sections, and
+    /// they had drifted apart twice — most recently on the categorical
+    /// vocabulary (§11.1). This is the assertion that a third drift cannot
+    /// happen quietly: they are now one implementation, and if that is ever
+    /// undone, this is what notices.
+    #[test]
+    fn both_dataframe_drivers_write_the_same_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = all_encodings_obs_batch(30);
+
+        let eager_path = dir.path().join("whole_batch.h5ad");
+        {
+            let f = hdf5::File::create(&eager_path).unwrap();
+            write_dataframe_group_at(
+                &f.as_group().unwrap(),
+                "obs",
+                &batch,
+                &mut WarningSink::log(),
+            )
+            .unwrap();
+        }
+
+        // The same frame as 3 shards. `RecordBatch::slice` keeps each
+        // dictionary whole, which is the layout `from_anndata` emits.
+        let shards: Vec<RecordBatch> = [(0, 10), (10, 10), (20, 10)]
+            .iter()
+            .map(|&(o, l)| batch.slice(o, l))
+            .collect();
+        let stream_path = dir.path().join("shard_stream.h5ad");
+        {
+            let schema = batch.schema();
+            let layout =
+                scan_column_export_layout(|| shards.iter().cloned().map(Ok), &schema, None)
+                    .unwrap();
+            let unified = build_unified_export_schema(&schema, &layout);
+            let f = hdf5::File::create(&stream_path).unwrap();
+            write_dataframe_group_from_shards(
+                &f.as_group().unwrap(),
+                "obs",
+                &unified,
+                shards.into_iter().map(Ok),
+                batch.num_rows(),
+                None,
+                layout,
+                &mut WarningSink::log(),
+            )
+            .unwrap();
+        }
+
+        let eager = hdf5::File::open(&eager_path).unwrap();
+        let stream = hdf5::File::open(&stream_path).unwrap();
+        let eager_shape = dataframe_group_shape(&eager, "obs");
+        let stream_shape = dataframe_group_shape(&stream, "obs");
+        assert_eq!(
+            eager_shape, stream_shape,
+            "the whole-batch and shard-stream drivers disagree on the /obs group"
+        );
+
+        // The fingerprint is only worth something if it can tell the
+        // encodings apart, so pin what it should contain.
+        let joined = eager_shape.join("\n");
+        for expected in [
+            "n_genes: group encoding-type=nullable-integer",
+            "note: group encoding-type=nullable-string-array",
+            "is_doublet: group encoding-type=nullable-boolean",
+            "cell_type: group encoding-type=categorical encoding-version=0.2.0 ordered=true",
+            "cell_type/categories = [I,II,III,IV]",
+            "cluster/categories = [10, 5, 7]",
+            "total_counts: dataset",
+            "pct_mito: dataset",
+            "wide_note: dataset",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "fingerprint missing {expected:?}; got:\n{joined}"
+            );
+        }
+
+        // And the values must match too, via the reader AnnData uses.
+        let eager_obs = read_dataframe_group(&eager, "obs", &mut WarningSink::log()).unwrap();
+        let stream_obs = read_dataframe_group(&stream, "obs", &mut WarningSink::log()).unwrap();
+        assert_eq!(eager_obs.num_rows(), stream_obs.num_rows());
+        for f in eager_obs.schema().fields() {
+            let e = eager_obs.column(eager_obs.schema().index_of(f.name()).unwrap());
+            let s = stream_obs.column(stream_obs.schema().index_of(f.name()).unwrap());
+            compare_columns_logical(s, e, f.name());
+        }
+    }
+
+    /// ORG-11.16-1 — the whole-batch driver honours a row filter the same way,
+    /// including the categorical pruning rule. The legacy single-obs-section
+    /// export used to filter its batch *before* handing it to the writer,
+    /// which hid the filter: `arrow`'s `filter` keeps a `DictionaryArray`'s
+    /// full dictionary, so an unsharded file kept every declared category
+    /// where a sharded one pruned the unused ones.
+    #[test]
+    fn both_dataframe_drivers_apply_a_row_filter_the_same_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = all_encodings_obs_batch(30);
+        // Keep only rows whose `cell_type` is "III" (keys are 2,1,0 cycling,
+        // so `i % 3 == 0` selects declared index 2).
+        let keep: Vec<bool> = (0..30).map(|i| i % 3 == 0).collect();
+        let n_kept = keep.iter().filter(|&&b| b).count();
+
+        let whole_path = dir.path().join("whole_filtered.h5ad");
+        {
+            let f = hdf5::File::create(&whole_path).unwrap();
+            crate::h5ad::write::write_dataframe_group_filtered_at(
+                &f.as_group().unwrap(),
+                "obs",
+                &batch,
+                Some(&keep),
+                &mut WarningSink::log(),
+            )
+            .unwrap();
+        }
+
+        let shards: Vec<RecordBatch> = [(0, 10), (10, 10), (20, 10)]
+            .iter()
+            .map(|&(o, l)| batch.slice(o, l))
+            .collect();
+        let shard_path = dir.path().join("shard_filtered.h5ad");
+        {
+            let schema = batch.schema();
+            let layout =
+                scan_column_export_layout(|| shards.iter().cloned().map(Ok), &schema, Some(&keep))
+                    .unwrap();
+            let unified = build_unified_export_schema(&schema, &layout);
+            let f = hdf5::File::create(&shard_path).unwrap();
+            write_dataframe_group_from_shards(
+                &f.as_group().unwrap(),
+                "obs",
+                &unified,
+                shards.into_iter().map(Ok),
+                n_kept,
+                Some(&keep),
+                layout,
+                &mut WarningSink::log(),
+            )
+            .unwrap();
+        }
+
+        let whole = hdf5::File::open(&whole_path).unwrap();
+        let shard = hdf5::File::open(&shard_path).unwrap();
+        assert_eq!(
+            dataframe_group_shape(&whole, "obs"),
+            dataframe_group_shape(&shard, "obs"),
+            "the two drivers disagree on a filtered /obs group"
+        );
+        let (cats, codes) = read_str_cat(&whole, "obs", "cell_type");
+        assert_eq!(
+            cats,
+            vec!["III"],
+            "only the surviving level is kept, and 'IV' was never used at all"
+        );
+        assert_eq!(codes.len(), n_kept);
+    }
+
     // ---- Review-driven coverage (PR #280 review fixes) ----
 
     /// Drive shards through the real unified-schema + streaming writer pipeline
@@ -2750,7 +3154,7 @@ mod streaming_obs_hdf5 {
         let unified = build_unified_export_schema(&shard0_schema, &layout);
         let file = hdf5::File::create(dir.join("err.h5ad")).unwrap();
         let root = file.as_group().unwrap();
-        write_dataframe_group_streaming(
+        write_dataframe_group_from_shards(
             &root,
             "obs",
             &unified,
