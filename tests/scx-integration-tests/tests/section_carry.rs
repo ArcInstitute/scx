@@ -45,8 +45,9 @@ use scx_ops::carry::{family, policy, Carry, RewriteOp, SectionFamily};
 use common::{
     fixture_all_families, fixture_all_families_obsp, fixture_all_families_with_extra_obsm,
     fixture_all_families_without_varm, fixture_multimodal_both_obsp_scopes,
-    fixture_multimodal_per_modality_obsp, fixture_with_colliding_obsp_keys, fixture_with_csr_obsp,
-    fixture_with_explicit_zero_in_x, fixture_with_sharded_obsm,
+    fixture_multimodal_per_modality_obsp, fixture_with_colliding_obsm_keys,
+    fixture_with_colliding_obsp_keys, fixture_with_csr_obsp, fixture_with_explicit_zero_in_x,
+    fixture_with_sharded_obsm,
 };
 
 /// The `(row, col)` endpoints of a COO pairwise batch, widened to `i64`.
@@ -941,4 +942,54 @@ fn merge_does_not_conflate_keys_that_share_a_shard_prefix() {
     // would carry twice that many edges — and the row cover would not assemble.
     assert_eq!(merged["g"].num_rows(), 2 * common::N_OBS);
     assert_eq!(merged["g_shard_x"].num_rows(), 2 * common::N_OBS);
+}
+
+/// The obsm half of the shard-prefix collision, and the legacy key the union
+/// used to drop.
+///
+/// `merge_pairwise::pairwise_entries` was fixed in round 1; the obsm/varm
+/// helper resolves its shards through `dense_mapping_shards_sorted`, which
+/// settles membership with `starts_with` and therefore had the identical bug —
+/// looking up `g` also collects `obsm/g_shard_x_shard_0`. Merge would succeed
+/// and `read_obsm` would then reject the oversized cover.
+///
+/// The same fixture carries `legacy_shard_name`, a legacy single section whose
+/// key contains `_shard_`. The key scan excluded those, so it was dropped
+/// silently — which contradicted this PR's own claim that keys are the union
+/// across inputs.
+///
+/// Found by codex - gpt-5.6-sol.
+#[test]
+fn merge_does_not_conflate_obsm_keys_that_share_a_shard_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = fixture_with_colliding_obsm_keys(dir.path(), "a.scx");
+    let b = fixture_with_colliding_obsm_keys(dir.path(), "b.scx");
+
+    let src = ScxReader::open(&a).unwrap().read_all_obsm().unwrap();
+    for k in ["g", "g_shard_x", "legacy_shard_name"] {
+        assert!(
+            src.contains_key(k),
+            "premise: input must carry {k}, got {:?}",
+            src.keys()
+        );
+    }
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge::merge(&[&a, &b], &out).unwrap();
+
+    let merged = ScxReader::open(&out).unwrap().read_all_obsm().unwrap();
+    for k in ["g", "g_shard_x", "legacy_shard_name"] {
+        assert!(
+            merged.contains_key(k),
+            "{k} must survive, got {:?}",
+            merged.keys()
+        );
+        // Two inputs. If `g` had swallowed `g_shard_x`'s shards it would carry
+        // twice this many rows — and the cover would not assemble at all.
+        assert_eq!(
+            merged[k].num_rows(),
+            2 * common::N_OBS,
+            "{k} must have exactly both inputs' rows"
+        );
+    }
 }

@@ -920,6 +920,38 @@ pub fn merge_with_options(
     })
 }
 
+/// The subset of `dense_mapping_shards_sorted`'s hits that really are shards of
+/// `key`.
+///
+/// `dense_mapping_shards_sorted` settles membership with
+/// `e.name.starts_with(name_prefix)`, so a lookup for `g` (prefix
+/// `obsm/g_shard_`) also collects `obsm/g_shard_x_shard_0` — a shard of the
+/// separate, legal key `g_shard_x`. Both would be re-emitted under `g`,
+/// `cumulative_rows` would exceed `n_rows_total`, the merge would succeed, and
+/// `read_obsm` would then reject the oversized cover.
+///
+/// This is the same defect `merge_pairwise::pairwise_entries` had, fixed the
+/// same way and for the same reason: the shard index is the segment after the
+/// prefix and it has to *parse*, which is what `read_sharded_layout_by_prefix`
+/// has always required. Filtered here rather than inside the catalog helper
+/// because merge is its only non-test caller, so the narrower change is also
+/// the complete one.
+///
+/// Found by codex - gpt-5.6-sol.
+fn shards_of_key<'a>(
+    shards: Vec<&'a scx_format_io::catalog::FullCatalogEntry>,
+    shard_name_prefix: &str,
+) -> Vec<&'a scx_format_io::catalog::FullCatalogEntry> {
+    shards
+        .into_iter()
+        .filter(|e| {
+            e.name
+                .strip_prefix(shard_name_prefix)
+                .is_some_and(|suffix| suffix.parse::<u32>().is_ok())
+        })
+        .collect()
+}
+
 /// Each input's first row in the concatenated obs space.
 ///
 /// A concatenating merge drops no rows, so this is just a running sum of
@@ -1948,7 +1980,13 @@ fn merge_global_dense_mapping_sharded(
                 Some(stem[..pos].to_string())
             } else if e.section_type == legacy_type {
                 let stem = e.name.strip_prefix(&prefix_slash)?;
-                if stem.contains('/') || stem.contains("_shard_") {
+                // `/` still disqualifies (that is the per-modality namespace),
+                // but `_shard_` no longer does: the section *type* already says
+                // this is a legacy single section, and the reader takes its stem
+                // verbatim — so excluding it silently dropped a key the reader
+                // will happily list, which contradicted the union this helper
+                // now claims to take. Same fix as `global_pairwise_keys`.
+                if stem.contains('/') {
                     return None;
                 }
                 Some(stem.to_string())
@@ -1971,10 +2009,12 @@ fn merge_global_dense_mapping_sharded(
         let legacy_name = format!("{prefix_slash}{key}");
         for (idx, reader) in source_readers.iter().enumerate() {
             // Already sorted by row_start by the catalog helper.
-            let shards =
+            let shards = shards_of_key(
                 reader
                     .catalog()
-                    .dense_mapping_shards_sorted(shard_type, 0, &shard_name_prefix);
+                    .dense_mapping_shards_sorted(shard_type, 0, &shard_name_prefix),
+                &shard_name_prefix,
+            );
             let legacy = if shards.is_empty() {
                 reader.catalog().entries.iter().find(|e| {
                     e.section_type == legacy_type && e.modality_id == 0 && e.name == legacy_name
@@ -2136,9 +2176,12 @@ fn merge_per_modality_dense_mapping_sharded(
         )> = Vec::with_capacity(source_readers.len());
         for (idx, reader) in source_readers.iter().enumerate() {
             // Already sorted by row_start by the catalog helper.
-            let shards = reader.catalog().dense_mapping_shards_sorted(
-                shard_type,
-                modality_id,
+            let shards = shards_of_key(
+                reader.catalog().dense_mapping_shards_sorted(
+                    shard_type,
+                    modality_id,
+                    &shard_name_prefix,
+                ),
                 &shard_name_prefix,
             );
             let legacy = if shards.is_empty() {

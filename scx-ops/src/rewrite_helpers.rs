@@ -695,11 +695,17 @@ fn copy_raw(
     if entries.is_empty() {
         return Ok(());
     }
-    // `set_raw_n_vars` is needed only on the re-encoding arm, which builds a
-    // fresh shard header and takes `n_minor` from this field. The verbatim arm
-    // carries the source's header bytes, and `ScxReader::raw_n_vars` recovers
-    // the extent from the shards' own stats rather than from the file header —
-    // so setting it unconditionally is harmless and setting it never is not.
+    // `set_raw_n_vars` no longer affects either arm, and is kept only so the
+    // writer's own `raw_n_vars` view of the file stays truthful for anything
+    // added later. The verbatim arm carries the source's header bytes; the
+    // re-encoding arm passes the source shard's `n_minor` straight to
+    // `encode_one_shard_with_value_encoding` (see `copy_csr_class_aux`) rather
+    // than reading this field, which is exactly the change that stopped it
+    // stamping the wrong extent. `ScxReader::raw_n_vars` recovers the extent
+    // from the shards' own stats regardless.
+    //
+    // This comment described the old behaviour for one commit after that stopped
+    // being true — the same stale-guidance shape this phase keeps deleting.
     if let Some(n) = reader.raw_n_vars() {
         writer.set_raw_n_vars(n as u64);
     }

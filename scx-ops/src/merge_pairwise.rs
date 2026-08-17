@@ -39,9 +39,12 @@
 //! ## It carries the COO encodings only
 //!
 //! `ObspCsrShard` — the CSR-backed obs×obs graph — is **not** carried by any
-//! merge path and does **not** trigger the sorted-merge refusal. Nothing in the
-//! crate reads one outside `optimize`'s own shard loop, so there is nothing to
-//! rebase; `compact` and `sort` drop it for the same reason.
+//! merge path and does **not** trigger the sorted-merge refusal. No merge path
+//! has a reader for it, so there is nothing to rebase onto the concatenated obs
+//! axis; `compact` and `sort` drop it for the same reason. (`optimize`
+//! re-encodes it in its own shard loop and, since Phase 5b, `upgrade`
+//! canonicalizes it — so "nothing reads one" is no longer the reason, and
+//! saying it that way would be a fact that has stopped being true.)
 //!
 //! That distinction has to be said out loud wherever this module's behaviour is
 //! described, because "merge carries obsp" and "merge --sort-by refuses obsp"
@@ -81,9 +84,15 @@ pub(crate) fn has_global_obsp(readers: &[ScxReader]) -> bool {
 
 /// Warn about a **CSR-backed** obs×obs graph, which no merge path carries.
 ///
-/// `merge` reads and rebases the COO encodings only. Nothing in the crate reads
-/// a CSR-backed pairwise graph outside `optimize`'s own shard loop, so there is
-/// nothing to rebase — the same reason `compact` and `sort` drop it.
+/// `merge` reads and rebases the COO encodings only. No *merge* path has a
+/// reader for the CSR-backed graph, so there is nothing to rebase onto the
+/// concatenated obs axis — the same reason `compact` and `sort` drop it.
+///
+/// (An earlier version said "nothing in the crate reads one outside
+/// `optimize`'s shard loop". That stopped being true in this same PR:
+/// `rewrite_helpers::copy_csr_class_aux` reads one to canonicalize it on
+/// `upgrade`. The conclusion is unchanged — merge still cannot rebase it — but
+/// the reason had to stop naming a fact that is no longer a fact.)
 ///
 /// Before this warning it was a **silent** drop on the plain path, and on the
 /// sorted path the guard did not fire at all, so a `merge --sort-by` over a
@@ -114,8 +123,8 @@ pub(crate) fn warn_dropped_csr_backed_obsp(readers: &[ScxReader]) {
     if any {
         log::warn!(
             "scx merge: dropping the CSR-backed obsp graph — merge carries the COO \
-             encodings only, and nothing outside `scx optimize` reads a CSR-backed \
-             pairwise graph, so there is nothing to rebase onto the merged obs axis. \
+             encodings only and has no reader for the CSR-backed one, so there is \
+             nothing to rebase onto the merged obs axis. \
              Recompute neighbours on the merged file; note that `scx optimize` will \
              NOT help, because it re-emits the graph in this same encoding."
         );

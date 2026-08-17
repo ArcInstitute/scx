@@ -752,3 +752,51 @@ pub fn fixture_with_colliding_obsp_keys(dir: &Path, name: &str) -> PathBuf {
     writer.finish().unwrap();
     path
 }
+
+/// The obsm analogue of [`fixture_with_colliding_obsp_keys`]: keys `g` and
+/// `g_shard_x`, both **sharded**, plus a legacy single-section key whose own
+/// name contains `_shard_`.
+pub fn fixture_with_colliding_obsm_keys(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let mut writer = ScxWriter::new(
+        &path,
+        FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, SHARD_ROWS as u32, 0, 0),
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch()).unwrap();
+    writer.write_var(&var_batch(N_VARS, "gene")).unwrap();
+    for row_start in (0..N_OBS).step_by(SHARD_ROWS) {
+        let (indptr, indices, values) = csr_rows(row_start, SHARD_ROWS, N_VARS, 1);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    for key in ["g", "g_shard_x"] {
+        for (idx, row_start) in (0..N_OBS).step_by(SHARD_ROWS).enumerate() {
+            writer
+                .write_obsm_shard(
+                    key,
+                    idx as u32,
+                    row_start as u64,
+                    SHARD_ROWS as u64,
+                    N_OBS as u64,
+                    &dense_embedding(SHARD_ROWS),
+                )
+                .unwrap();
+        }
+    }
+    // A legacy single section whose key contains the shard marker. The reader
+    // lists it; the merge key scan used to drop it.
+    writer
+        .write_obsm("legacy_shard_name", &dense_embedding(N_OBS))
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
