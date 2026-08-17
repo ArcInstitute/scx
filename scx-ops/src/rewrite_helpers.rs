@@ -502,9 +502,9 @@ pub fn copy_auxiliary_sections_canonicalizing(
 ) -> Result<(), Box<dyn std::error::Error>> {
     warn_dropped_sections(reader, action);
     copy_layers(reader, writer, canonicalization.canonicalizes())?;
-    copy_dense_and_pairwise(reader, writer)?;
+    copy_dense_and_pairwise(reader, writer, canonicalization)?;
     copy_uns(reader, writer)?;
-    copy_raw(reader, writer)?;
+    copy_raw(reader, writer, canonicalization)?;
     copy_bitmaps(reader, writer, canonicalization, action)?;
     copy_group_index(reader, writer)?;
     copy_predicate_indices(reader, writer)?;
@@ -524,13 +524,20 @@ pub fn copy_auxiliary_sections_canonicalizing(
 ///
 /// `ObspCsrShard` is included here, unlike in `optimize` — `optimize`
 /// re-encodes it in its own CSR shard loop, whereas `build_csc`'s loop filters
-/// to `SectionType::CsrShard` and never sees it. An upgrade re-emits it
-/// unchanged rather than canonicalizing it; a pairwise graph is not what the v3
-/// canonical-CSR contract is about, and rewriting a user's graph structure is
-/// not something this op should do on the way past.
+/// to `SectionType::CsrShard` and never sees it.
+///
+/// ⚠️ It is **not** copied verbatim by a canonicalizing caller. An earlier
+/// version of this comment argued that "a pairwise graph is not what the v3
+/// canonical-CSR contract is about", which is false:
+/// `ScxReader::is_canonical_csr_section` names `ObspCsrShard` (and
+/// `RawCsrShard`) alongside `CsrShard` and `LayerCsrShard`, so `scx validate
+/// --deep` holds them to the same invariant the v3 header asserts. Copying a
+/// pre-v3 graph through unchanged and then stamping v3 produces a file that
+/// fails its own validator — irreversibly under `upgrade --in-place`.
 fn copy_dense_and_pairwise(
     reader: &ScxReader,
     writer: &mut ScxWriter,
+    canonicalization: LayerCanonicalization,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut entries: Vec<_> = reader
         .catalog()
@@ -554,10 +561,109 @@ fn copy_dense_and_pairwise(
     // Sorted by name for deterministic output, as `optimize` does.
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     for entry in entries {
+        if entry.section_type == SectionType::ObspCsrShard {
+            copy_csr_class_aux(reader, writer, entry, canonicalization)?;
+            continue;
+        }
         let bytes = reader.section_bytes(entry)?;
         writer.copy_section_verbatim(entry, bytes)?;
     }
     Ok(())
+}
+
+/// Re-emit one CSR-class auxiliary shard (`ObspCsrShard` / `RawCsrShard`),
+/// canonicalizing it only when the caller must and only when it is not already
+/// canonical.
+///
+/// The short-circuit is load-bearing in both directions. Skipping it would make
+/// a canonicalizing rewrite re-encode every already-canonical shard, changing
+/// bytes for no reason and costing the byte-identity these paths are measured
+/// against. Dropping the canonicalization would let `upgrade` stamp v3 over a
+/// shard that violates it (see [`copy_dense_and_pairwise`]).
+///
+/// `build_csc` passes [`LayerCanonicalization::Off`] and therefore always takes
+/// the verbatim arm — which is correct there, because it clamps its output
+/// version to the source's (SCX-005) and so never claims an invariant the
+/// source did not already hold.
+fn copy_csr_class_aux(
+    reader: &ScxReader,
+    writer: &mut ScxWriter,
+    entry: &FullCatalogEntry,
+    canonicalization: LayerCanonicalization,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sh = reader.read_shard_header(entry)?;
+    let ve = ValueEncoding::from_u8(sh.value_encoding)
+        .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
+    let ci = CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
+    let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
+
+    if canonicalization.canonicalizes() {
+        let (indptr, indices, mut data) = reader.read_shard_from_entry(entry)?;
+        let mut indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
+        let mut indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        if !scx_sparse::is_canonical_csr(&indptr_u64, &indices_u32, &data) {
+            scx_sparse::canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut data);
+            // Summing duplicates can outgrow the width the source chose, and the
+            // codec has to follow the encoding — the same two-step `copy_layers`
+            // and `upgrade`'s X loop both perform.
+            let widened = encoding_for_canonicalized(ve, &data);
+            let codec = codec_for_canonicalized(ci, widened);
+            let mut raw_values = Vec::new();
+            for &v in &data {
+                widened.encode_f32(&mut raw_values, v)?;
+            }
+            match entry.section_type {
+                SectionType::ObspCsrShard => {
+                    let (name, shard_idx) = obsp_csr_name_and_index(&entry.name)?;
+                    writer.write_obsp_shard(
+                        &indptr_u64,
+                        &indices_u32,
+                        &raw_values,
+                        codec,
+                        widened,
+                        row_start,
+                        &name,
+                        shard_idx,
+                    )?;
+                }
+                _ => {
+                    writer.write_raw_csr_shard(
+                        &indptr_u64,
+                        &indices_u32,
+                        &raw_values,
+                        codec,
+                        widened,
+                        row_start,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    let bytes = reader.section_bytes(entry)?;
+    writer.copy_section_verbatim(entry, bytes)?;
+    Ok(())
+}
+
+/// Split `obsp/<key>_shard_<idx>` back into its parts.
+///
+/// `rfind` rather than `find`: a key may itself contain `_shard_`, and the
+/// index is always the final segment — the same rule
+/// `read_sharded_layout_by_prefix` applies when it parses the suffix as `u32`.
+fn obsp_csr_name_and_index(
+    section_name: &str,
+) -> Result<(String, u32), Box<dyn std::error::Error>> {
+    let stem = section_name
+        .strip_prefix("obsp/")
+        .ok_or_else(|| format!("obsp CSR shard '{section_name}' is not under obsp/"))?;
+    let pos = stem
+        .rfind("_shard_")
+        .ok_or_else(|| format!("obsp CSR shard '{section_name}' has no _shard_ suffix"))?;
+    let idx: u32 = stem[pos + "_shard_".len()..]
+        .parse()
+        .map_err(|_| format!("obsp CSR shard '{section_name}' has a non-numeric shard index"))?;
+    Ok((stem[..pos].to_string(), idx))
 }
 
 /// Copy `adata.raw` — its CSR shards and its own var axis.
@@ -567,7 +673,15 @@ fn copy_dense_and_pairwise(
 /// carry raw, so this is the one family where `build-csc` now carries more than
 /// `optimize` does. That asymmetry is real and is recorded in the carry table
 /// rather than smoothed over: `optimize`'s raw drop is a separate open item.
-fn copy_raw(reader: &ScxReader, writer: &mut ScxWriter) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `RawCsrShard` is a CSR-class section that `scx validate --deep` holds to the
+/// canonical invariant, so a canonicalizing caller re-emits it rather than
+/// copying it — see [`copy_csr_class_aux`].
+fn copy_raw(
+    reader: &ScxReader,
+    writer: &mut ScxWriter,
+    canonicalization: LayerCanonicalization,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut entries: Vec<_> = reader
         .catalog()
         .entries
@@ -582,12 +696,20 @@ fn copy_raw(reader: &ScxReader, writer: &mut ScxWriter) -> Result<(), Box<dyn st
     if entries.is_empty() {
         return Ok(());
     }
-    // No `set_raw_n_vars` needed. That writer field exists to stamp `n_minor`
-    // into a shard header being *built*; a verbatim copy carries the source's
-    // header bytes, and `ScxReader::raw_n_vars` recovers the extent from the
-    // shards' own stats rather than from anything on the file header.
+    // `set_raw_n_vars` is needed only on the re-encoding arm, which builds a
+    // fresh shard header and takes `n_minor` from this field. The verbatim arm
+    // carries the source's header bytes, and `ScxReader::raw_n_vars` recovers
+    // the extent from the shards' own stats rather than from the file header —
+    // so setting it unconditionally is harmless and setting it never is not.
+    if let Some(n) = reader.raw_n_vars() {
+        writer.set_raw_n_vars(n as u64);
+    }
     entries.sort_by_key(|e| e.stats.as_ref().map(|s| s.row_start).unwrap_or(0));
     for entry in entries {
+        if entry.section_type == SectionType::RawCsrShard {
+            copy_csr_class_aux(reader, writer, entry, canonicalization)?;
+            continue;
+        }
         let bytes = reader.section_bytes(entry)?;
         writer.copy_section_verbatim(entry, bytes)?;
     }

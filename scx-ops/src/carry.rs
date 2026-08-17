@@ -388,10 +388,12 @@ impl RewriteOp {
 /// The table.
 ///
 /// Read it as: *if the input carries this family, this is what the op does with
-/// it.* Entries marked `Dropped { warns: false }` are silent data loss; the
-/// four flagged `§6.3` / `§6.4` below are open Majors from the 2026-08-05
-/// review, declared here rather than fixed so the fix arrives as a visible diff
-/// against a stated baseline.
+/// it.* Entries marked `Dropped { warns: false }` are silent data loss.
+///
+/// §6.3 and §6.4 — the ten cells this doc used to describe as "open Majors
+/// declared here rather than fixed" — were closed in Phase 5b. Nothing in the
+/// table claims to be an open bug any more, and
+/// `no_cell_still_claims_to_be_an_open_bug` keeps it that way.
 pub fn policy(op: RewriteOp, family: SectionFamily) -> Carry {
     policy_scoped(op, family, SectionScope::Global)
 }
@@ -548,9 +550,14 @@ fn merge(family: SectionFamily) -> Carry {
         // Still dropped, and for the reason `compact` and `sort` drop it rather
         // than §6.4's: nothing in the crate reads a CSR-backed pairwise graph
         // outside `optimize`'s shard loop, so there is nothing to rebase.
+        //
+        // It **warns** now. While the COO cell said "dropped, silently" this was
+        // one silent drop among several; once merge started carrying COO obsp
+        // and the docs said so, the unqualified word "obsp" made this the one
+        // graph a user is told survives and does not.
         F::ObspCsr => Carry::Dropped {
             why: "no CSR-graph reader outside optimize's shard loop; nothing to rebase",
-            warns: false,
+            warns: true,
         },
         // Var-axis on both dimensions, and merge validates one shared var axis,
         // so input 0's graph is the canonical one — exactly as for `varm`, and
@@ -689,8 +696,11 @@ fn sort(family: SectionFamily) -> Carry {
 
 /// `build-csc` rewrites the file 1:1 and appends a column-major sidecar. Its
 /// carry set is [`crate::rewrite_helpers::copy_auxiliary_sections`]'s allowlist,
-/// which is the narrowest of any op here — and its output renames over the
-/// input with no prior catalog, so `scx rollback` cannot recover what it drops.
+/// which used to be the narrowest of any op here — Phase 5b widened it to
+/// everything `optimize` carries plus `adata.raw`, leaving only a layer's CSC
+/// sidecar. Its output still renames over the input with no prior catalog, so
+/// `scx rollback` cannot recover what it does drop, which is why the allowlist
+/// being narrow mattered so much.
 fn build_csc(family: SectionFamily) -> Carry {
     use SectionFamily as F;
     match family {

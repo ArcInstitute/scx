@@ -43,9 +43,10 @@ use scx_format_io::ObsShardPolicy;
 use scx_ops::carry::{family, policy, Carry, RewriteOp, SectionFamily};
 
 use common::{
-    fixture_all_families, fixture_all_families_with_extra_obsm, fixture_all_families_without_varm,
-    fixture_multimodal_both_obsp_scopes, fixture_multimodal_per_modality_obsp,
-    fixture_with_csr_obsp, fixture_with_explicit_zero_in_x, fixture_with_sharded_obsm,
+    fixture_all_families, fixture_all_families_obsp, fixture_all_families_with_extra_obsm,
+    fixture_all_families_without_varm, fixture_multimodal_both_obsp_scopes,
+    fixture_multimodal_per_modality_obsp, fixture_with_colliding_obsp_keys, fixture_with_csr_obsp,
+    fixture_with_explicit_zero_in_x, fixture_with_sharded_obsm,
 };
 
 /// The `(row, col)` endpoints of a COO pairwise batch, widened to `i64`.
@@ -491,6 +492,77 @@ fn merge_rejects_a_key_a_later_input_lacks() {
     assert!(msg.contains('1'), "and the input that lacks it, got: {msg}");
 }
 
+/// The same key-set rule applies to `obsp`, and it has to be pinned separately.
+///
+/// `merge_rejects_a_key_*` above cover `obsm`, which goes through
+/// `merge_global_dense_mapping_sharded`; `obsp` goes through `merge_obsp`,
+/// which is a different function with its own copy of the presence check. A
+/// regression in one would not show up in the other's tests, and this is the
+/// exact `[has_knn, no_knn]` case the choice was argued over.
+///
+/// Requested by Cursor Agent - Grok 4.6 High.
+#[test]
+fn merge_rejects_an_obsp_key_a_later_input_lacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let knn = fixture_all_families_obsp(dir.path(), "knn.scx", "connectivities", false);
+    let other = fixture_all_families_obsp(dir.path(), "other.scx", "distances", false);
+
+    let out = dir.path().join("merged.scx");
+    let err = scx_ops::merge::merge(&[&knn, &other], &out)
+        .expect_err("a graph input 1 lacks must not be dropped without a word");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("obsp") && msg.contains("connectivities"),
+        "the error must name the axis and the key, got: {msg}"
+    );
+}
+
+/// A graph whose `data` column disagrees across inputs must be refused **before**
+/// anything is written, not discovered on read.
+///
+/// `remap_obsp_coo_to_dim` deliberately preserves each input's `data` dtype and
+/// nullability (it rebuilds only `row`/`col`, at a width chosen from the merged
+/// dimension). So a `Float32` graph and a `Float64` graph — each perfectly
+/// readable alone — become shards under one key that `read_all_obsp`'s
+/// `concat_batches` cannot assemble. Measured, with the guard removed:
+/// `"It is not possible to concatenate arrays of different data types (Float32,
+/// Float64)"` — the merge succeeded and produced a file whose graph could not
+/// be read back.
+///
+/// The obsm path has had this guard since Phase 3b; the obsp carry shipped with
+/// the missing-key half of that parity and none of the schema half.
+///
+/// Found independently by codex - gpt-5.6-sol and Cursor Agent - Grok 4.6 High.
+#[test]
+fn merge_rejects_an_obsp_graph_whose_value_dtype_disagrees() {
+    let dir = tempfile::tempdir().unwrap();
+    let f32_side = fixture_all_families_obsp(dir.path(), "f32.scx", "connectivities", false);
+    let f64_side = fixture_all_families_obsp(dir.path(), "f64.scx", "connectivities", true);
+
+    // Premise: each input is individually readable, so the failure below is
+    // about the *combination* and not about a broken fixture.
+    for p in [&f32_side, &f64_side] {
+        assert!(ScxReader::open(p)
+            .unwrap()
+            .read_all_obsp()
+            .unwrap()
+            .contains_key("connectivities"));
+    }
+
+    let out = dir.path().join("merged.scx");
+    let err = scx_ops::merge::merge(&[&f32_side, &f64_side], &out)
+        .expect_err("a dtype-mismatched graph must be refused before writing");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("obsp") && msg.contains("connectivities"),
+        "the error must name the axis and the key, got: {msg}"
+    );
+    assert!(
+        msg.contains("Float32") && msg.contains("Float64"),
+        "and both dtypes, so the user knows which side to cast: {msg}"
+    );
+}
+
 /// Merging files that agree on their obsm keys stays a merge.
 ///
 /// The accept side of the two guards above. Without it, "reject a mismatched
@@ -830,4 +902,43 @@ fn x_canonical_detections(path: &Path) -> BTreeSet<(u32, u64)> {
         }
     }
     out
+}
+
+/// A key whose name is a prefix of another key's shard naming must not swallow
+/// that other key's shards.
+///
+/// `pairwise_entries` matched on `name.starts_with("obsp/<key>_shard_")` alone,
+/// so looking up `g` also collected `obsp/g_shard_x_shard_0` — a shard of the
+/// separate key `g_shard_x`. Both landed under `g` with overlapping row covers,
+/// and the merged graph failed on read. `read_sharded_layout_by_prefix` has
+/// always parsed the suffix as a `u32`; this now matches it.
+///
+/// Found by codex - gpt-5.6-sol.
+#[test]
+fn merge_does_not_conflate_keys_that_share_a_shard_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = fixture_with_colliding_obsp_keys(dir.path(), "a.scx");
+    let b = fixture_with_colliding_obsp_keys(dir.path(), "b.scx");
+
+    // Premise: both keys really are present and independently readable.
+    let src = ScxReader::open(&a).unwrap().read_all_obsp().unwrap();
+    assert!(
+        src.contains_key("g") && src.contains_key("g_shard_x"),
+        "premise: {:?}",
+        src.keys()
+    );
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge::merge(&[&a, &b], &out).unwrap();
+
+    let merged = ScxReader::open(&out).unwrap().read_all_obsp().unwrap();
+    assert!(
+        merged.contains_key("g") && merged.contains_key("g_shard_x"),
+        "both keys must survive as themselves, got {:?}",
+        merged.keys()
+    );
+    // Two inputs x one shard each. If `g` had swallowed `g_shard_x`'s shard it
+    // would carry twice that many edges — and the row cover would not assemble.
+    assert_eq!(merged["g"].num_rows(), 2 * common::N_OBS);
+    assert_eq!(merged["g_shard_x"].num_rows(), 2 * common::N_OBS);
 }

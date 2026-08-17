@@ -64,21 +64,28 @@ of step with the code without a test going red.
 
 Three of its answers are worth surfacing here.
 
-**`merge` carries the cell–cell graph, and refuses a partial `obsm`.** An
-`obsp` graph is rebased by each input's offset in the concatenated obs axis;
-`varp` comes from input 0, the rule `var` and `varm` already follow. Two things
-this means in practice:
+**`merge` carries the cell–cell graph in its COO encoding, and refuses a partial
+`obsm`.** A COO `obsp` graph is rebased by each input's offset in the
+concatenated obs axis; `varp` comes from input 0, the rule `var` and `varm`
+already follow. Three things this means in practice:
 
-- `merge --sort-by` **refuses** an input carrying `obsp`, the way it already
+- `merge --sort-by` **refuses** an input carrying COO `obsp`, the way it already
   refuses `obsm`: a sorted merge interleaves rows, so there is no per-input
   output row range to record. Merge without `--sort-by`, then `scx sort`.
 - An `obsm` / `obsp` key that some inputs have and others lack is now a hard
   error naming the axis, the key and the input — the same answer a missing
   *layer* has always had. Merging 100 per-sample files where one lacks `X_umap`
   used to yield an atlas with no UMAP and no message. Drop the key from the
-  others, or add it to the one, before merging.
+  others, or add it to the one, before merging. A key whose `data` column
+  disagrees in dtype or nullability across inputs is refused for the same
+  reason: the merged shards are read back under one schema.
+- The **CSR-backed** `obsp` encoding (`ObspCsrShard`) is **not** carried, by any
+  merge path, and does not trigger the sorted-merge refusal. Nothing outside
+  `scx optimize` reads one, so there is nothing to rebase — `compact` and `sort`
+  drop it too. It is dropped with a warning. Run `scx optimize` on the inputs if
+  you need it preserved, or recompute neighbours after the merge.
 
-Modality-scoped `obsp` / `varp` are still dropped, with a warning: the format
+Modality-scoped `obsp` / `varp` are also dropped, with a warning: the format
 has no per-modality pairwise reader to round-trip them through.
 
 **`build-csc` and `scx upgrade` carry everything `optimize` does, plus

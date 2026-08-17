@@ -1648,4 +1648,123 @@ mod tests {
         // The matrix really was rewritten, or the drop above is vacuous.
         assert_eq!(out.read_all_csr_shards().unwrap().data, vec![7.0, 4.0]);
     }
+
+    /// A pre-v3 file whose `.raw` and CSR-backed `obsp` are **non-canonical**
+    /// must not upgrade into a v3 file that its own validator rejects.
+    ///
+    /// `ScxReader::is_canonical_csr_section` names `RawCsrShard` and
+    /// `ObspCsrShard` alongside `CsrShard` and `LayerCsrShard`, so `scx validate
+    /// --deep` holds all four to the invariant a v3 header asserts. Phase 5b
+    /// started carrying the first two — verbatim — and a comment in
+    /// `copy_dense_and_pairwise` argued that a pairwise graph "is not what the
+    /// v3 canonical-CSR contract is about". It is. Copying a pre-v3 graph
+    /// through unchanged and then stamping v3 produced a file that fails its own
+    /// deep validation, and `upgrade --in-place` renames it over the source.
+    ///
+    /// Found by codex - gpt-5.6-sol.
+    #[test]
+    fn upgrade_canonicalizes_the_csr_class_sections_it_carries() {
+        use crate::test_utils::{sample_header, sample_obs, sample_var};
+        use scx_format_io::section::SectionType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("noncanonical_aux.scx");
+        // obsp is obs x obs, so `n_vars >= n_obs` keeps the graph's minor extent
+        // representable — the writer stamps it from the header.
+        let (n_obs, n_vars) = (2usize, 4usize);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 1;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&sample_obs(n_obs)).unwrap();
+        w.write_var(&sample_var(n_vars)).unwrap();
+        // X itself is canonical: the defect is in what the *aux* carry does, and
+        // a non-canonical X would canonicalize via a path that already worked.
+        w.write_csr_shard(
+            &[0u64, 1, 2],
+            &[0u32, 2],
+            &[3u8, 4],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+        // Row 0 repeats column 1 — canonicalizing sums them and drops one nnz.
+        // `set_raw_n_vars` first: it stamps the shard header's minor extent, and
+        // without it raw's column axis reads back as 0 and every index in it is
+        // "out of range" — a malformed fixture, not the defect under test.
+        w.set_raw_n_vars(n_vars as u64);
+        w.write_raw_csr_shard(
+            &[0u64, 2, 3],
+            &[1u32, 1, 0],
+            &[2u8, 3, 7],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.write_raw_var(&sample_var(n_vars)).unwrap();
+
+        // Row 0 stores an explicit zero, which canonicalizing removes.
+        w.write_obsp_shard(
+            &[0u64, 2, 3],
+            &[0u32, 1, 0],
+            &[0u8, 5, 6],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+            "connectivities",
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        // Premise: the input really is invalid under the invariant v3 asserts,
+        // for both families — otherwise the assertion below is vacuous.
+        let src = ScxReader::open(&input).unwrap();
+        let bad: Vec<String> = src
+            .validate_canonical_csr_shards()
+            .into_iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            bad.iter().any(|n| n.starts_with("raw/")),
+            "premise: raw must start non-canonical, got {bad:?}"
+        );
+        assert!(
+            bad.iter().any(|n| n.starts_with("obsp/")),
+            "premise: the obsp graph must start non-canonical, got {bad:?}"
+        );
+        drop(src);
+
+        let output = dir.path().join("upgraded.scx");
+        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        let still_bad: Vec<String> = out
+            .validate_canonical_csr_shards()
+            .into_iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            still_bad.is_empty(),
+            "a v3 file must satisfy the canonical-CSR invariant it claims; \
+             these sections do not: {still_bad:?}"
+        );
+
+        // Carried, not dropped-to-make-the-check-pass.
+        for ty in [SectionType::RawCsrShard, SectionType::ObspCsrShard] {
+            assert!(
+                out.catalog().entries.iter().any(|e| e.section_type == ty),
+                "{ty:?} must still be carried"
+            );
+        }
+        // And canonicalized rather than merely re-encoded: the duplicate
+        // coordinate in raw row 0 is summed (2 + 3 = 5), the explicit zero in
+        // the graph's row 0 is gone.
+        assert_eq!(out.read_all_raw_csr_shards().unwrap().data, vec![5.0, 7.0]);
+    }
 }

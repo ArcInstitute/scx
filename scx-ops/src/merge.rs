@@ -338,8 +338,11 @@ pub fn merge_with_options(
     // ---------------------------------------------------------------
     // Sorted k-way merge. Self-contained path so
     // the legacy concatenation below stays byte-identical. Reorders obs /
-    // X / layers globally by the key; var-axis sections preserved; obsm
-    // rejected for now; obsp dropped (as plain merge does).
+    // X / layers globally by the key; var-axis sections preserved (including
+    // varm and varp, which a row permutation does not touch); obsm and COO obsp
+    // both rejected up front — a sorted merge interleaves rows, so there is no
+    // per-input output row range to stamp on an obsp shard. The CSR-backed obsp
+    // encoding is dropped with a warning here as on every merge path.
     // ---------------------------------------------------------------
     if sorted {
         if merge_sorted::has_obsm(&readers) {
@@ -636,8 +639,10 @@ pub fn merge_with_options(
     // Phase 3b: stream global obsm and varm shard-by-shard. Each input's
     // shards are re-stamped with cumulative `row_start` and emitted as
     // the next output shard via `write_obsm_shard` / `write_varm_shard`.
-    // Legacy single-section inputs are treated as one source shard. Keys
-    // missing from any input are dropped (existing semantic).
+    // Legacy single-section inputs are treated as one source shard. A key any
+    // input lacks is a hard `DenseMappingMissing` (§6.4); this said "dropped
+    // (existing semantic)" until Phase 5b, which is the semantic that lost a
+    // 100-file atlas its `X_umap` without a word.
     merge_global_dense_mapping_sharded(&readers, &mut writer, DenseMappingAxis::Obsm, total_n_obs)?;
     merge_global_dense_mapping_sharded(&readers, &mut writer, DenseMappingAxis::Varm, n_vars)?;
 
@@ -1177,7 +1182,8 @@ fn merge_multimodal(
     // Phase 3b: stream global obsm shard-by-shard (multimodal). Same
     // pattern as single-modality: every input's shards (or legacy
     // single-section as one source shard) are re-stamped and emitted
-    // as the next output shard. Keys missing from any input are dropped.
+    // as the next output shard. A key any input lacks is a hard
+    // `DenseMappingMissing` (§6.4), not the silent drop this said until 5b.
     // Multimodal global varm is omitted by design — `n_vars` differs
     // per modality, so there is no canonical `n_rows_total` for a
     // global varm shard. Per-modality varm is handled below in Step 5.
@@ -1303,9 +1309,11 @@ fn merge_multimodal(
     // Phase 3b: stream per-modality obsm and varm shard-by-shard via
     // the new `write_obsm_shard_for` / `write_varm_shard_for` writer
     // APIs. Each input's shards (or legacy single-section as one source
-    // shard) are re-stamped and emitted as the next output shard. Keys
-    // missing from any input are dropped. Per-modality varm support is
-    // newly added in Phase 3b — it was silently dropped pre-Phase-3.
+    // shard) are re-stamped and emitted as the next output shard. A key any
+    // input lacks is dropped **with a warning** here — unlike the global helper,
+    // which hard-errors: an input may legitimately carry nothing at all for a
+    // given modality+axis, and §6.4 measured the global path. Per-modality varm
+    // support is newly added in Phase 3b — it was silently dropped pre-Phase-3.
     for (idx, info) in table.entries.iter().enumerate() {
         let modality_id = (idx + 1) as u8;
         merge_per_modality_dense_mapping_sharded(
@@ -2060,7 +2068,9 @@ fn merge_global_dense_mapping_sharded(
 /// for `obsm/{mname}/{key}_shard_*` (sharded) or `obsm/{mname}/{key}`
 /// (legacy), filtered by `modality_id`, and re-stamps via the new
 /// `write_obsm_shard_for` / `write_varm_shard_for` writer APIs. Keys
-/// missing from any input are dropped. Inputs that have no entries
+/// missing from any input are dropped **with a warning** (the global
+/// helper hard-errors instead — see §6.4 and the note at the `continue`
+/// below). Inputs that have no entries
 /// for this modality+axis combination are also tolerated — the helper
 /// is a no-op when there's nothing to merge (consistent with the
 /// existing varm-not-present behaviour in multimodal files).

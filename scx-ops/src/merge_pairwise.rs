@@ -33,8 +33,21 @@
 //! **It is not reachable under `--sort-by`.** A sorted merge interleaves rows
 //! from every input, so "this shard covers output rows `[a, b)`" — which is what
 //! `write_obsp_shard_coo` stamps and what the reader verifies as a contiguous
-//! cover — has no meaning per input. The caller rejects obsp up front there,
+//! cover — has no meaning per input. The caller rejects COO obsp up front there,
 //! the same way and for the same reason it already rejects obsm.
+//!
+//! ## It carries the COO encodings only
+//!
+//! `ObspCsrShard` — the CSR-backed obs×obs graph — is **not** carried by any
+//! merge path and does **not** trigger the sorted-merge refusal. Nothing in the
+//! crate reads one outside `optimize`'s own shard loop, so there is nothing to
+//! rebase; `compact` and `sort` drop it for the same reason.
+//!
+//! That distinction has to be said out loud wherever this module's behaviour is
+//! described, because "merge carries obsp" and "merge --sort-by refuses obsp"
+//! are both **false of the CSR encoding**, and shipping them unqualified is how
+//! a declared drop turns into a promise the code does not keep.
+//! [`warn_dropped_csr_backed_obsp`] is what tells the user at run time.
 
 use std::collections::BTreeSet;
 
@@ -44,11 +57,16 @@ use scx_format_io::{ScxReader, ScxWriter, SectionType};
 use crate::compact::remap_obsp_coo_to_dim;
 use crate::error::{OpsError, Result};
 
-/// True if any input carries a **file-scope** obs×obs graph.
+/// True if any input carries a **file-scope** obs×obs graph, in the COO
+/// encoding this module carries.
 ///
 /// Used by the sorted-merge guard. Per-modality graphs do not count: they are
 /// dropped on every merge path, so refusing a sorted merge over one would be
 /// refusing to do something the caller was not going to get anyway.
+///
+/// `ObspCsrShard` deliberately does not count either, and that is a *narrower*
+/// promise than "merge --sort-by refuses obsp" — see
+/// [`warn_dropped_csr_backed_obsp`], which is what tells the user about it.
 pub(crate) fn has_global_obsp(readers: &[ScxReader]) -> bool {
     readers.iter().any(|r| {
         r.catalog().entries.iter().any(|e| {
@@ -59,6 +77,36 @@ pub(crate) fn has_global_obsp(readers: &[ScxReader]) -> bool {
                 )
         })
     })
+}
+
+/// Warn about a **CSR-backed** obs×obs graph, which no merge path carries.
+///
+/// `merge` reads and rebases the COO encodings only. Nothing in the crate reads
+/// a CSR-backed pairwise graph outside `optimize`'s own shard loop, so there is
+/// nothing to rebase — the same reason `compact` and `sort` drop it.
+///
+/// Before this warning it was a **silent** drop on the plain path, and on the
+/// sorted path the guard did not fire at all, so a `merge --sort-by` over a
+/// CSR-backed graph succeeded and lost it while the CLI help and
+/// `docs/operations.md` both said obsp was refused. Saying "obsp" without
+/// qualifying the encoding is what made that read as a promise.
+///
+/// Found by codex - gpt-5.6-sol.
+pub(crate) fn warn_dropped_csr_backed_obsp(readers: &[ScxReader]) {
+    let any = readers.iter().any(|r| {
+        r.catalog()
+            .entries
+            .iter()
+            .any(|e| e.modality_id == 0 && e.section_type == SectionType::ObspCsrShard)
+    });
+    if any {
+        log::warn!(
+            "scx merge: dropping the CSR-backed obsp graph — merge carries the COO \
+             encodings only, and nothing outside `scx optimize` reads a CSR-backed \
+             pairwise graph. Run `scx optimize` on the inputs if you need it preserved, \
+             or recompute neighbours after the merge."
+        );
+    }
 }
 
 /// Warn about modality-scoped pairwise sections a merge is about to drop.
@@ -105,6 +153,7 @@ pub(crate) fn merge_pairwise_sections(
     total_n_obs: u64,
 ) -> Result<()> {
     warn_dropped_per_modality_pairwise(readers);
+    warn_dropped_csr_backed_obsp(readers);
     merge_obsp(readers, writer, offsets, total_n_obs)?;
     carry_varp_from_input_zero(readers, writer)?;
     Ok(())
@@ -125,6 +174,7 @@ pub(crate) fn merge_obsp_only(
     total_n_obs: u64,
 ) -> Result<()> {
     warn_dropped_per_modality_pairwise(readers);
+    warn_dropped_csr_backed_obsp(readers);
     merge_obsp(readers, writer, offsets, total_n_obs)
 }
 
@@ -164,6 +214,8 @@ fn merge_obsp(
             }
         }
 
+        validate_obsp_value_schemas(readers, &key)?;
+
         let mut out_shard_idx: u32 = 0;
         for (idx, reader) in readers.iter().enumerate() {
             let offset = offsets[idx];
@@ -201,6 +253,77 @@ fn merge_obsp(
     Ok(())
 }
 
+/// Refuse a key whose `data` column disagrees across inputs, before any of it
+/// is written.
+///
+/// The obsm path has had this guard since Phase 3b
+/// (`validate_dense_mapping_schemas`) for exactly this reason: without it a
+/// merge *succeeds* and the failure surfaces later, on read, in a file the user
+/// now has to throw away. The obsp carry shipped with the missing-key half of
+/// that parity and none of the schema half.
+///
+/// Only the `data` field is compared, and that is deliberate rather than lazy.
+/// `remap_obsp_coo_to_dim` **rebuilds** `row`/`col` at a width chosen from the
+/// merged dimension, so inputs that disagree there are normalised on the way
+/// through and comparing them would reject merges that are actually fine. It
+/// preserves `data`'s dtype *and* nullability, so those are what can still
+/// differ between two shards written under one key — and
+/// `read_all_obsp` → `concat_batches` requires one shared schema, where arrow's
+/// `Schema` equality counts nullability.
+///
+/// Not `schema_field_diff` (the obsm helper) for the same two reasons: it would
+/// compare the coordinate columns, and it does not compare nullability at all.
+///
+/// Found independently by codex - gpt-5.6-sol and Cursor Agent - Grok 4.6 High.
+fn validate_obsp_value_schemas(readers: &[ScxReader], key: &str) -> Result<()> {
+    if readers.len() < 2 {
+        return Ok(());
+    }
+    let value_field = |reader: &ScxReader| -> Result<Option<(arrow::datatypes::DataType, bool)>> {
+        let Some(entry) = pairwise_entries(
+            reader,
+            "obsp",
+            key,
+            SectionType::ObspEmbedding,
+            SectionType::ObspEmbeddingShard,
+        )
+        .into_iter()
+        .next() else {
+            return Ok(None);
+        };
+        let batch = reader
+            .read_dense_mapping_entry(entry)
+            .map_err(OpsError::Format)?;
+        Ok(batch
+            .schema()
+            .column_with_name("data")
+            .map(|(_, f)| (f.data_type().clone(), f.is_nullable())))
+    };
+
+    let Some(first) = value_field(&readers[0])? else {
+        return Ok(());
+    };
+    for (idx, reader) in readers.iter().enumerate().skip(1) {
+        let Some(other) = value_field(reader)? else {
+            continue;
+        };
+        if other != first {
+            return Err(OpsError::DenseMappingMismatch {
+                axis: "obsp",
+                key: key.to_string(),
+                detail: format!(
+                    "input 0 vs input {idx}: 'data' column is {:?} (nullable={}) vs {:?} \
+                     (nullable={}). The merged shards would be written under one key and \
+                     `read_all_obsp` concatenates them under a single schema, so the graph \
+                     would be unreadable. Cast them to one dtype before merging.",
+                    first.0, first.1, other.0, other.1,
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The var-axis half on its own, for the sorted-merge path.
 ///
 /// A sorted merge refuses obsp (see the module doc) but `varp` is indexed by
@@ -208,6 +331,7 @@ fn merge_obsp(
 /// data for a reason that does not apply to it.
 pub(crate) fn carry_varp_only(readers: &[ScxReader], writer: &mut ScxWriter) -> Result<()> {
     warn_dropped_per_modality_pairwise(readers);
+    warn_dropped_csr_backed_obsp(readers);
     carry_varp_from_input_zero(readers, writer)
 }
 
@@ -273,10 +397,20 @@ fn global_pairwise_keys(
                 continue;
             };
             if entry.section_type == shard {
+                // The index is the FINAL segment, so `rfind` — a key may itself
+                // contain `_shard_`. A non-numeric tail means this is not a
+                // shard of anything (the reader skips it too), so no key.
                 if let Some(pos) = stem.rfind("_shard_") {
-                    keys.insert(stem[..pos].to_string());
+                    if stem[pos + "_shard_".len()..].parse::<u32>().is_ok() {
+                        keys.insert(stem[..pos].to_string());
+                    }
                 }
-            } else if entry.section_type == single && !stem.contains("_shard_") {
+            } else if entry.section_type == single {
+                // No `_shard_` exclusion. The section *type* already says this
+                // is a legacy single section, and `read_all_sharded_or_single`
+                // takes its stem verbatim — so excluding names containing
+                // `_shard_` (as the obsm helper still does) silently drops a key
+                // the reader will happily list and return.
                 keys.insert(stem.to_string());
             }
         }
@@ -289,6 +423,15 @@ fn global_pairwise_keys(
 /// Sharded entries win over a legacy single section of the same name, matching
 /// `read_all_sharded_or_single` — a file carrying both is malformed, and
 /// silently emitting the graph twice would be worse than picking one.
+///
+/// ⚠️ **The suffix must parse as a `u32`, not merely be present.** A bare
+/// `starts_with("obsp/foo_shard_")` also matches `obsp/foo_shard_bar_shard_0`,
+/// which belongs to the key `foo_shard_bar` — so looking up `foo` swallowed
+/// another key's shard, and both landed under `foo` with overlapping row covers
+/// that fail on read. `read_sharded_layout_by_prefix` has always parsed the
+/// suffix; this now matches it exactly rather than approximating it.
+///
+/// Found by codex - gpt-5.6-sol.
 fn pairwise_entries<'a>(
     reader: &'a ScxReader,
     prefix: &str,
@@ -297,17 +440,20 @@ fn pairwise_entries<'a>(
     shard: SectionType,
 ) -> Vec<&'a FullCatalogEntry> {
     let shard_prefix = format!("{prefix}/{key}_shard_");
-    let mut shards: Vec<&FullCatalogEntry> = reader
+    let mut shards: Vec<(u32, &FullCatalogEntry)> = reader
         .catalog()
         .entries
         .iter()
-        .filter(|e| {
-            e.modality_id == 0 && e.section_type == shard && e.name.starts_with(&shard_prefix)
+        .filter(|e| e.modality_id == 0 && e.section_type == shard)
+        .filter_map(|e| {
+            let suffix = e.name.strip_prefix(&shard_prefix)?;
+            let idx: u32 = suffix.parse().ok()?;
+            Some((idx, e))
         })
         .collect();
     if !shards.is_empty() {
-        shards.sort_by_key(|e| shard_index_of(&e.name));
-        return shards;
+        shards.sort_by_key(|(idx, _)| *idx);
+        return shards.into_iter().map(|(_, e)| e).collect();
     }
     let legacy_name = format!("{prefix}/{key}");
     reader
@@ -316,14 +462,6 @@ fn pairwise_entries<'a>(
         .iter()
         .filter(|e| e.modality_id == 0 && e.section_type == single && e.name == legacy_name)
         .collect()
-}
-
-/// The `_shard_N` suffix as a number, so shards order numerically rather than
-/// lexically — `_shard_10` sorts before `_shard_9` as a string.
-fn shard_index_of(name: &str) -> u32 {
-    name.rfind("_shard_")
-        .and_then(|pos| name[pos + "_shard_".len()..].parse().ok())
-        .unwrap_or(u32::MAX)
 }
 
 /// A pairwise shard's `(row_start, n_shard_rows)` in its own file's space.

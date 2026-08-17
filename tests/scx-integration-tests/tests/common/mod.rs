@@ -44,6 +44,13 @@ pub struct FixtureShape {
     /// Write a second `obsm` key under this name. For merge's key-symmetry
     /// tests, which need two inputs whose obsm key sets differ by one.
     pub extra_obsm_key: Option<&'static str>,
+    /// Write the obsp graph under this key instead of `connectivities`.
+    pub obsp_key: Option<&'static str>,
+    /// Store the obsp graph's `data` column as `Float64` instead of `Float32`.
+    ///
+    /// `remap_obsp_coo_to_dim` preserves the source dtype, so two inputs that
+    /// differ here produce shards that cannot be concatenated under one schema.
+    pub obsp_f64_values: bool,
     /// Store an **explicit zero** as X row 0's first value.
     ///
     /// `is_canonical_csr` treats a stored `0.0` as non-canonical, so this is
@@ -184,12 +191,12 @@ fn build_all_families(dir: &Path, name: &str, shape: FixtureShape) -> PathBuf {
     // --- obsp / varp -----------------------------------------------------
     writer
         .write_obsp_shard_coo(
-            "connectivities",
+            shape.obsp_key.unwrap_or("connectivities"),
             0,
             0,
             N_OBS as u64,
             N_OBS as u64,
-            &coo_batch(N_OBS),
+            &coo_batch_typed(N_OBS, shape.obsp_f64_values),
         )
         .unwrap();
     writer.write_varp("gene_corr", &coo_i32(N_VARS)).unwrap();
@@ -437,11 +444,31 @@ fn dense_embedding(n_rows: usize) -> RecordBatch {
 
 /// obs×obs COO in the Int64 form `write_obsp_shard_coo` takes.
 fn coo_batch(n: usize) -> RecordBatch {
+    coo_batch_typed(n, false)
+}
+
+/// [`coo_batch`] with control over the `data` column's width.
+fn coo_batch_typed(n: usize, f64_values: bool) -> RecordBatch {
+    let (data_type, data): (DataType, Arc<dyn arrow::array::Array>) = if f64_values {
+        (
+            DataType::Float64,
+            Arc::new(arrow::array::Float64Array::from(
+                (0..n).map(|i| (i + 1) as f64).collect::<Vec<_>>(),
+            )),
+        )
+    } else {
+        (
+            DataType::Float32,
+            Arc::new(Float32Array::from(
+                (0..n).map(|i| (i + 1) as f32).collect::<Vec<_>>(),
+            )),
+        )
+    };
     let schema = Arc::new(Schema::new_with_metadata(
         vec![
             Field::new("row", DataType::Int64, false),
             Field::new("col", DataType::Int64, false),
-            Field::new("data", DataType::Float32, false),
+            Field::new("data", data_type, false),
         ],
         HashMap::from([
             ("n_rows".to_string(), n.to_string()),
@@ -457,9 +484,7 @@ fn coo_batch(n: usize) -> RecordBatch {
                     .map(|r| (r + 1) % n as i64)
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(Float32Array::from(
-                (0..n).map(|i| (i + 1) as f32).collect::<Vec<_>>(),
-            )),
+            data,
         ],
     )
     .unwrap()
@@ -662,6 +687,66 @@ pub fn fixture_with_sharded_obsm(dir: &Path, name: &str) -> PathBuf {
                 N_OBS as u64,
                 &dense_embedding(SHARD_ROWS),
             )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// The all-families fixture with its `obsp` graph under a different key, or
+/// with a `Float64` `data` column instead of `Float32`.
+///
+/// Two knobs, one fixture, because a merge test needs two inputs that differ in
+/// **exactly one** thing — merge validates var identity and requires identical
+/// layers, so the two sides cannot be unrelated files.
+pub fn fixture_all_families_obsp(
+    dir: &Path,
+    name: &str,
+    key: &'static str,
+    f64_values: bool,
+) -> PathBuf {
+    build_all_families(
+        dir,
+        name,
+        FixtureShape {
+            obsp_key: Some(key),
+            obsp_f64_values: f64_values,
+            ..FixtureShape::default()
+        },
+    )
+}
+
+/// A file with two obsp keys where one key's name is a **prefix** of the
+/// other's shard naming: `g` and `g_shard_x`.
+///
+/// `obsp/g_shard_0` (a shard of `g`) and `obsp/g_shard_x_shard_0` (a shard of
+/// `g_shard_x`) both start with `obsp/g_shard_`, so a lookup for `g` that only
+/// tests the prefix swallows the other key's shard as well.
+pub fn fixture_with_colliding_obsp_keys(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let mut writer = ScxWriter::new(
+        &path,
+        FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, SHARD_ROWS as u32, 0, 0),
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch()).unwrap();
+    writer.write_var(&var_batch(N_VARS, "gene")).unwrap();
+    for row_start in (0..N_OBS).step_by(SHARD_ROWS) {
+        let (indptr, indices, values) = csr_rows(row_start, SHARD_ROWS, N_VARS, 1);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    for key in ["g", "g_shard_x"] {
+        writer
+            .write_obsp_shard_coo(key, 0, 0, N_OBS as u64, N_OBS as u64, &coo_batch(N_OBS))
             .unwrap();
     }
     writer.finish().unwrap();

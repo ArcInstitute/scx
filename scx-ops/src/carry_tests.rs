@@ -111,7 +111,7 @@ merge
   varm                         conditional
   obsp                         remapped
     (per-modality)             dropped(warns)
-  obsp (CSR-backed)            dropped(SILENT)
+  obsp (CSR-backed)            dropped(warns)
     (per-modality)             dropped(warns)
   varp                         conditional
     (per-modality)             dropped(warns)

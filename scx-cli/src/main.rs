@@ -741,8 +741,9 @@ enum Commands {
         /// already be a sorted run by this key (e.g. from `scx convert
         /// --sort-by`); an unsorted input errors. Reorders obs / X /
         /// layers; var-axis preserved (including varm / varp);
-        /// obsm and obsp unsupported (errors) — merge without --sort-by,
-        /// then `scx sort`.
+        /// obsm and COO obsp unsupported (errors) — merge without
+        /// --sort-by, then `scx sort`. A CSR-backed obsp graph is
+        /// dropped with a warning, on every merge path.
         #[arg(long, value_name = "CSV")]
         sort_by: Option<String>,
         /// Descending order for `--sort-by`.
