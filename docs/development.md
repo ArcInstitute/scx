@@ -225,20 +225,38 @@ cd rscx && Rscript -e 'testthat::test_dir("tests/testthat")' && cd ..
 ### The hdf5-gated suites are not in that run
 
 `cargo test --workspace` builds every member at its **default** features, and no
-workspace member enables `scx-convert/hdf5` by default (`scx-cli` and `pyscx`
-both declare `default = []`). The h5ad / h5mu ingest, export, dataframe and
-parallel-coordinator tests are all `#[cfg(all(test, feature = "hdf5"))]`, so the
-line above runs none of them. They have their own CI job, `Test (hdf5 features)`:
+workspace member enables `scx-convert/hdf5` by default — `scx-cli` declares
+`default = []`, and `pyscx` declares no `default` at all (its `hdf5` comes from
+`[tool.maturin] features`, which affects `maturin` and not `cargo test`). The
+h5ad / h5mu ingest, export and dataframe tests are
+`#[cfg(all(test, feature = "hdf5"))]`, so the line above runs none of them. They
+have their own CI job, `Test (hdf5 features)`:
 
 ```bash
-cargo test -p scx-convert --features hdf5      # convert_tests_* — ingest, export, dataframe
-cargo test -p scx-cli --features hdf5          # convert_stream, convert_subset, cellbender_cli, …
+cargo test -p scx-convert --features hdf5
+cargo test -p scx-cli --features hdf5 -- --test-threads=1
 ```
 
-On a network filesystem (Weka / NFS / Lustre) prefix both with
-`HDF5_USE_FILE_LOCKING=FALSE`. Without it libhdf5's SWMR locking fails on
-`H5Fopen(): unable to lock file, errno = 11` under cargo's parallel test threads;
-every failure is an open error, never an assertion, and it is not a code defect.
+(The concurrency *invariants* of the shared parallel drain are a separate,
+feature-free matter — `scx-convert/src/parallel_drain_tests.rs` is deliberately
+ungated and does run in the default workspace job. What the hdf5 lane adds is the
+coordinators' end-to-end behaviour against real libhdf5.)
+
+**`--test-threads=1` on the `scx-cli` suite is required, not tuning.** Those
+tests build an h5ad with `hdf5::File::create` in the test process and then spawn
+the `scx` binary to open it; run in parallel, sibling tests' open files make
+libhdf5 refuse the child's `H5Fopen` with
+`unable to lock file, errno = 11`. Measured on ext4: 11–13 of the 18 tests in
+`convert_stream.rs` fail that way in parallel, and all 18 pass serialised — so
+this is cargo's parallel harness, **not** a network-filesystem quirk.
+`scx-convert`'s suite is unaffected (its tests spawn no child processes) and runs
+in parallel.
+
+`HDF5_USE_FILE_LOCKING=FALSE` also makes the suite pass, and is the convenient
+thing to do locally on a network filesystem (Weka / NFS / Lustre), where genuine
+lock failures are common. CI deliberately does **not** set it: on the one lane
+that exists to stop hiding things, disabling the lock would hide the next real
+locking failure too.
 
 `SCX_REQUIRE_HDF5_THREADSAFE=1` (set by that CI job) turns a libhdf5 built
 without `--enable-threadsafe` into a hard failure instead of letting the parallel

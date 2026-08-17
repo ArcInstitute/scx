@@ -71,8 +71,10 @@ jobs:
       - run: cargo test --workspace --exclude rscx
 
   # `cargo test --workspace` above runs at DEFAULT features, and nothing in the
-  # workspace enables `scx-convert/hdf5` by default — `scx-cli` and `pyscx` both
-  # declare `default = []` and only opt in through their own `hdf5` feature. The
+  # workspace enables `scx-convert/hdf5` by default — `scx-cli` declares
+  # `default = []`, `pyscx` declares no `default` at all, and each only opts in
+  # through its own `hdf5` feature (`pyscx`'s comes from `[tool.maturin]
+  # features`, which affects `maturin` and not `cargo test`). The
   # `feature-check` lane compiles and clippy-checks the gated half but never runs
   # it. So before this job existed, ~210 `#[test]`s in
   # `scx-convert/src/convert_tests_*.rs` plus every hdf5-gated `scx-cli`
@@ -112,7 +114,22 @@ jobs:
       - name: Install hdf5 dev headers
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
       - run: cargo test -p scx-convert --features hdf5
-      - run: cargo test -p scx-cli --features hdf5
+      # `--test-threads=1`, and NOT `HDF5_USE_FILE_LOCKING=FALSE`.
+      #
+      # `scx-cli`'s integration tests build an h5ad with `hdf5::File::create` in
+      # the test process and then spawn the `scx` binary to open it. Run in
+      # parallel, sibling tests' open files make libhdf5 refuse the child's
+      # `H5Fopen` with `unable to lock file, errno = 11`. This is not a
+      # network-filesystem quirk: measured locally on ext4, 11-13 of the 18
+      # tests in `convert_stream.rs` fail this way in parallel and all 18 pass
+      # serialised. The first run of this job caught it on `ubuntu-latest`.
+      #
+      # Disabling the lock would make the whole suite pass too, and that is what
+      # every developer does locally — but it would also hide any future
+      # *genuine* locking failure, on the one lane that exists to stop hiding
+      # things. Serialising keeps libhdf5's locking fully enforced. Measured
+      # cost: 203 tests in 7.2 s.
+      - run: cargo test -p scx-cli --features hdf5 -- --test-threads=1
 
   clippy:
     name: Clippy

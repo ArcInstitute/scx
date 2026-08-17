@@ -45,10 +45,13 @@ cargo fmt --check
 # `scx-convert/hdf5` by default — so it runs NONE of the h5ad/h5mu tests. Those
 # need their own invocation (CI job `Test (hdf5 features)`):
 cargo test -p scx-convert --features hdf5
-cargo test -p scx-cli --features hdf5
-# On a network filesystem (Weka/NFS/Lustre) prefix both with
-# `HDF5_USE_FILE_LOCKING=FALSE` — libhdf5's SWMR lock fails there with
-# `H5Fopen(): unable to lock file, errno = 11` and it is not a code failure.
+cargo test -p scx-cli --features hdf5 -- --test-threads=1
+# `--test-threads=1` is required, not tuning: the scx-cli tests spawn the `scx`
+# binary to open an h5ad the test process just created, and in parallel libhdf5
+# refuses the child's H5Fopen with `unable to lock file, errno = 11`. Measured on
+# ext4 — it is cargo's parallel harness, not a network-filesystem quirk.
+# `HDF5_USE_FILE_LOCKING=FALSE` also works and is the convenient local escape on
+# Weka/NFS/Lustre, but it hides real locking failures, so CI does not set it.
 
 # With cloud features:
 cargo test --workspace --exclude rscx --features cloud

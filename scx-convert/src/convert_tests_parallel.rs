@@ -390,16 +390,27 @@ fn parallel_reorder_buffer_bounded_by_window() {
     let cap = 4 + 2; // reader_threads + writer_queue_depth
 
     let buffer_peak = super::parallel_drain::hooks::last_run_buffer_peak();
-    assert!(
-        buffer_peak > 0,
-        "expected the reorder buffer to hold at least one out-of-order shard; \
-         if this is 0 the delay hook did not fire and the test proves nothing"
-    );
-    assert!(
-        buffer_peak <= cap,
-        "reorder-buffer peak {buffer_peak} exceeds the rolling-window cap {cap}: \
-         a replacement worker is being spawned on receive rather than on write, \
-         so `received - written` is unbounded (review §11.2)"
+    // Equality, not `<= cap` — and not `> 0` or `> 1` either. All three of the
+    // weaker forms pass without the stall, which makes them assertions about
+    // nothing:
+    //
+    //   peak with the 250 ms stall on shard 0:  6, 6, 6      (== cap, every run)
+    //   peak with the stall removed:            3, 4, 4, 4, 5 (never reaches cap)
+    //
+    // The drain records occupancy right after the insert and before the apply
+    // loop, so a strictly in-order run peaks at 1 and ordinary completion skew
+    // across 50 tiny shards gets partway to the window on its own. Only the
+    // head-of-line stall fills it exactly. So `== cap` is the one form that
+    // asserts both halves at once: the buffer really was pushed to the window
+    // (the hook fired), and the window really held (the bound works). If the
+    // spawn moves back to the receive site this reads 50.
+    assert_eq!(
+        buffer_peak, cap,
+        "reorder-buffer peak {buffer_peak}, expected exactly the rolling-window \
+         cap {cap}. Above: a replacement worker is being spawned per shard \
+         *received* rather than per shard *applied*, so `received - written` is \
+         unbounded (review §11.2). Below: the delay hook did not fire, the \
+         buffer was never pushed to the window, and this test proves nothing."
     );
 
     // Retained from the previous version, with an honest label. Rayon bounds
@@ -1053,8 +1064,13 @@ fn parallel_ingest_worker_error_does_not_deadlock() {
 /// `received` counter never reaches `n_ranges`, and `rx.recv()` blocks
 /// forever because the original `tx` in the scope frame keeps the
 /// channel open. The `PanicIngestShardGuard` hook forces a real
-/// `panic!` inside `encode_one_shard_worker`'s `catch_unwind`; the
-/// coordinator must convert it to a `ConvertError` and return `Err`.
+/// `panic!` in the coordinator's worker closure; the `catch_unwind`
+/// that catches it lives in `parallel_drain::ordered_parallel_drain`,
+/// which must convert it to a `ConvertError` and return `Err`.
+///
+/// The drain's own `a_panicking_worker_returns_an_error_instead_of_deadlocking`
+/// covers the same contract without libhdf5; this one additionally pins that
+/// the ingest coordinator really does route through the drain.
 #[test]
 fn parallel_ingest_worker_panic_does_not_deadlock() {
     use super::pipeline::{h5ad_to_scx_streaming, test_hooks, StreamingOverrides};

@@ -4,13 +4,20 @@
 
 **Run**: `cargo test --workspace` (all crates) or `cargo test --workspace --features cloud` (with cloud features)
 
+⚠️ That runs at **default** features, and nothing in the workspace enables
+`scx-convert/hdf5` by default — so it runs none of the h5ad / h5mu ingest,
+export or dataframe tests in `scx-convert` and `scx-cli`. Those need their own
+invocation (CI job `Test (hdf5 features)`); see
+[development.md § The hdf5-gated suites are not in that run](development.md#the-hdf5-gated-suites-are-not-in-that-run)
+for the commands and why the `scx-cli` half must be serialised.
+
 | Crate | Location | Key tests |
 |-------|----------|-----------|
 | `scx-format` | `tests/` proptests + per-module unit tests | Modality round-trip, header, catalog, checksum verification |
 | `scx-codec` | Per-module unit tests | Rice, FOR-BP (scalar + SIMD BitPacker4x), Delta-Golomb, LZ4+shuffle, Pcodec, byte-shuffle encode/decode round-trips. Reference vector tests for all codecs. |
 | `scx-sparse` | Unit tests | CSR construction, row slicing, dense conversion |
 | `scx-format-io` | Unit tests + `tests/` | Reader/writer round-trip, backed I/O, Arrow compat, bitmap, CSC sidecar |
-| `scx-convert` | Per-module unit tests | h5ad/h5mu streaming ingest, parallel determinism, HDF5 thread-safety probe |
+| `scx-convert` | Per-module unit tests | h5ad/h5mu streaming ingest, parallel determinism, HDF5 thread-safety probe (all `--features hdf5` only); the shared parallel drain's bound / panic / early-return invariants are feature-free and do run in the default job |
 | `scx-ops` | `tests/` | Append, delete, compact, rollback, merge, flock concurrency, predicate-index rewrite, streaming merge/append |
 | `scx-engine` | Unit tests | Predicate parsing, pipeline validation, pushdown, fused ops |
 | `scx-loader` | Unit tests | Pipeline lifecycle, batch format, shuffle, projection, normalize |
