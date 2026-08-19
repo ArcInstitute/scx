@@ -672,31 +672,88 @@ pub async fn pull_filtered(
 
     let mut total_bytes_downloaded = (catalog_bytes.len() + header_data.len()) as u64;
 
-    // 3. Download obs.arrow and evaluate predicate
-    let obs_path_str = section_name_to_path("obs", SectionType::ObsMetadata)
-        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-    let obs_obj_path = make_path(&obs_path_str);
-    let obs_data = get_with_retry(backend.as_ref(), &obs_obj_path).await?;
-    total_bytes_downloaded += obs_data.len() as u64;
-    let obs_bytes = obs_data.to_vec();
+    // 3. Download obs and evaluate the predicate.
+    //
+    // Two on-disk layouts, and this path must read both. A row-sharded obs
+    // has **no `obs.arrow` object at all** — `explode` maps each
+    // `ObsMetadataShard` to `obs/000000.arrow`, `obs/000001.arrow`, … — so
+    // the unconditional single-object fetch this used to do returned
+    // `NotFound` before the predicate was even parsed, failing every
+    // selective pull of a sharded file. Mirrors the dual-layout handling in
+    // `CloudReader::read_obs`, and assembles through the same shared
+    // `scx_format_io::assemble_sharded_metadata` so the row order and the
+    // shard-cover validation are not a second implementation.
+    let mut obs_shard_entries: Vec<(u32, &FullCatalogEntry)> = original_catalog
+        .entries
+        .iter()
+        .filter(|e| {
+            e.section_type == SectionType::ObsMetadataShard
+                && e.name.starts_with("obs_metadata/shard_")
+        })
+        .filter_map(|e| {
+            let idx: u32 = e.name.strip_prefix("obs_metadata/shard_")?.parse().ok()?;
+            Some((idx, e))
+        })
+        .collect();
+    obs_shard_entries.sort_by_key(|(idx, _)| *idx);
 
-    // Parse obs as Arrow IPC. Downcast `LargeUtf8 → Utf8` (and binary)
-    // so the predicate evaluator and downstream pyscx callers see the
-    // canonical narrow types regardless of the on-disk encoding.
-    let obs_cursor = Cursor::new(&obs_bytes);
-    let obs_reader = arrow::ipc::reader::FileReader::try_new(obs_cursor, None)
+    // Decode one obs Arrow IPC payload to its single batch.
+    fn decode_obs_ipc(bytes: &[u8], what: &str) -> Result<arrow::array::RecordBatch> {
+        let reader = arrow::ipc::reader::FileReader::try_new(Cursor::new(bytes), None)
+            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        reader
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                CloudError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{what} Arrow IPC file contains no batches"),
+                ))
+            })?
+            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+    }
+
+    // `downcast_large_types` on the way out of both branches, so the
+    // predicate evaluator and downstream pyscx callers see the canonical
+    // narrow types regardless of the on-disk encoding.
+    let obs_batch = if obs_shard_entries.is_empty() {
+        let obs_path_str = section_name_to_path("obs", SectionType::ObsMetadata)
+            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        let obs_data = get_with_retry(backend.as_ref(), &make_path(&obs_path_str)).await?;
+        total_bytes_downloaded += obs_data.len() as u64;
+        let raw_batch = decode_obs_ipc(&obs_data, "obs")?;
+        scx_format_io::downcast_large_types(&raw_batch)?
+    } else {
+        let mut raw: Vec<(u32, arrow::array::RecordBatch)> =
+            Vec::with_capacity(obs_shard_entries.len());
+        for (idx, entry) in &obs_shard_entries {
+            let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
+                CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+            let data = get_with_retry(backend.as_ref(), &make_path(&rel_path)).await?;
+            total_bytes_downloaded += data.len() as u64;
+            raw.push((*idx, decode_obs_ipc(&data, "obs_metadata")?));
+        }
+        let assembled = scx_format_io::assemble_sharded_metadata("obs_metadata", raw)?;
+        // `assemble_sharded_metadata` keeps the source's `n_rows_total` stamp.
+        // A selective pull re-emits obs as a single `ObsMetadata` section over
+        // a row *subset*, so carrying that stamp through would leave the output
+        // asserting the source's row count — 100 in a file with 50 rows — and
+        // would make the two source layouts produce different bytes for the
+        // same logical result. Drop it so they converge.
+        let schema = assembled.schema();
+        let mut md = schema.metadata().clone();
+        md.remove("n_rows_total");
+        let assembled = arrow::array::RecordBatch::try_new(
+            std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
+                schema.fields().clone(),
+                md,
+            )),
+            assembled.columns().to_vec(),
+        )
         .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-    let raw_batch: arrow::array::RecordBatch = obs_reader
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            CloudError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "obs Arrow IPC file contains no batches",
-            ))
-        })?
-        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-    let obs_batch = scx_format_io::downcast_large_types(&raw_batch)?;
+        scx_format_io::downcast_large_types(&assembled)?
+    };
     let obs_schema = obs_batch.schema();
 
     // Parse and evaluate predicate
@@ -775,7 +832,10 @@ pub async fn pull_filtered(
 
     for entry in &original_catalog.entries {
         match entry.section_type {
-            SectionType::ObsMetadata => continue, // already downloaded
+            // Both obs layouts are already downloaded and re-emitted as one
+            // `ObsMetadata` section below; carrying the source entries through
+            // would duplicate obs in the output.
+            SectionType::ObsMetadata | SectionType::ObsMetadataShard => continue,
             SectionType::CsrShard if shard_name_set.contains(&entry.name) => {
                 entries_to_download.push(entry);
             }

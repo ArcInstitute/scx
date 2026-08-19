@@ -671,9 +671,9 @@ Arrow IPC's 2 GB narrow-offset ceiling for string columns at atlas scale.
 
 Obs/var **metadata** sharding is decided independently of X sharding.
 
-**The obs axis on ingest.** `scx convert`, `pyscx.from_h5ad` and
-`pyscx.from_h5mu` shard obs under `--shard-obs off|auto|always` /
-`shard_obs=`, default `auto` — the same tri-state, the same
+**The obs axis on ingest.** `scx convert` (h5ad, h5mu, 10x and mtx alike),
+`pyscx.from_h5ad`, `pyscx.from_h5mu` and `pyscx.from_mtx` shard obs under
+`--shard-obs off|auto|always` / `shard_obs=`, default `auto` — the same tri-state, the same
 `ObsShardPolicy::parse`, and the same `n_obs > shard_target_rows` boundary
 `scx optimize --shard-obs` and `pyscx.from_anndata` use, so the four
 producers converge on one layout for a given `n_obs`. Shard boundaries come
@@ -695,8 +695,9 @@ obs-scoped, matching `scx optimize`. (`pyscx.from_anndata` *does* shard var
 above the threshold — a divergence between the in-memory and on-disk ingest
 routes, not yet reconciled.)
 
-**Other ingest routes.** `pyscx.from_mtx` and `pyscx.from_mudata` still write
-a single-section obs at any scale. To shard those, migrate the output with
+**Other ingest routes.** `pyscx.from_mudata` (the in-memory MuData sibling of
+`from_anndata`) still writes a single-section obs at any scale. To shard it,
+migrate the output with
 `pyscx.compact(src, dst, reshape_obs=True)` (`scx compact --reshape-obs`) or
 `pyscx.optimize(src, dst, shard_obs=...)` (`scx optimize --shard-obs`).
 

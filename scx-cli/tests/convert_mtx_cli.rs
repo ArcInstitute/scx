@@ -244,3 +244,57 @@ fn every_convert_direction_reachable_without_stream_flag() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `--shard-obs` on the MTX ingest direction (phase 6c review round 1).
+//
+// The flag was accepted here and silently did nothing: `run_convert` returns
+// through `dispatch_mtx_to_scx` before the policy is ever parsed, so
+// `--shard-obs always` exited 0 having written one legacy `obs_metadata`
+// section. A successful no-op on an explicit request is worse than an error,
+// and it made `docs/api.md`'s "every scx convert ingest" claim false.
+// ---------------------------------------------------------------------------
+
+fn mtx_obs_shard_count(extra: &[&str]) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    create_mtx_dir(&mtx_dir);
+    let out = dir.path().join("out.scx");
+
+    let mut args: Vec<&str> = vec!["convert", "--from", "mtx"];
+    args.extend_from_slice(extra);
+    let mtx_s = mtx_dir.to_str().unwrap().to_string();
+    let out_s = out.to_str().unwrap().to_string();
+    args.push(&mtx_s);
+    args.push(&out_s);
+
+    let output = scx().args(&args).output().expect("scx convert spawn");
+    assert!(
+        output.status.success(),
+        "mtx convert {args:?} failed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reader = scx_format_io::reader::ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 3);
+    reader.obs_metadata_shard_count()
+}
+
+#[test]
+fn mtx_shard_obs_always_actually_shards() {
+    // 3 obs rows at a target of 100: `auto` must not shard, `always` must —
+    // so the pair distinguishes "honoured" from "ignored".
+    assert_eq!(
+        mtx_obs_shard_count(&["--shard-size", "100", "--shard-obs", "always"]),
+        1,
+    );
+    assert_eq!(mtx_obs_shard_count(&["--shard-size", "100"]), 0);
+}
+
+#[test]
+fn mtx_shard_obs_auto_shards_above_the_threshold() {
+    assert_eq!(mtx_obs_shard_count(&["--shard-size", "2"]), 2);
+    assert_eq!(
+        mtx_obs_shard_count(&["--shard-size", "2", "--shard-obs", "off"]),
+        0,
+    );
+}

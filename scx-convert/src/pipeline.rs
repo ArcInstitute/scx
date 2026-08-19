@@ -584,8 +584,8 @@ impl Default for ConvertOptions {
 /// Every `scx-convert` ingest path funnels through here — the eager and
 /// streaming h5ad routes, 10x, and both h5mu routes — so the threshold is
 /// decided once and the shard boundaries come from
-/// [`scx_ops::write_obs_section`], the same routine `scx compact --reshape-obs`
-/// and `scx optimize --shard-obs` use. Convert's sharded obs is therefore
+/// [`scx_format_io::write_obs_section`] — the same routine `scx compact
+/// --reshape-obs`, `scx optimize --shard-obs` and `scx-mtx` use. Convert's sharded obs is therefore
 /// layout-identical to theirs by construction rather than by review.
 ///
 /// The var axis deliberately does not have a counterpart: it stays a single
@@ -605,12 +605,12 @@ pub(crate) fn write_ingest_obs(
     let reshape = opts
         .obs_shard_policy
         .should_shard_single_section(obs.num_rows() as u64, opts.shard_target_rows);
-    scx_ops::write_obs_section(writer, obs, reshape, opts.shard_target_rows).map_err(|e| match e {
-        // Everything this can fail on is a writer error; keep it typed rather
-        // than flattening a checksum/IO failure into a string.
-        scx_ops::OpsError::Format(scx) => ConvertError::Scx(scx),
-        other => ConvertError::Other(format!("failed to write obs metadata: {other}")),
-    })
+    Ok(scx_format_io::write_obs_section(
+        writer,
+        obs,
+        reshape,
+        opts.shard_target_rows,
+    )?)
 }
 
 /// Reject the SCX → h5ad/h5mu export row-filter options on an import

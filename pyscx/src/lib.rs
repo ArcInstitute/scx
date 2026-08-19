@@ -1107,23 +1107,31 @@ fn from_mudata(
 /// Reads the MTX directory (matrix.mtx[.gz], barcodes.tsv[.gz], features.tsv[.gz])
 /// and writes an SCX file.
 ///
+/// `shard_obs` (`"off"` | `"auto"` | `"always"`, default `"auto"`) writes obs
+/// as row-sharded `ObsMetadataShard` sections above `n_obs > shard_size` — the
+/// same knob and threshold as `pyscx.from_h5ad`. Var stays a single section.
+///
 /// Example:
 ///     pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "output.scx")
 #[pyfunction]
-#[pyo3(signature = (mtx_dir, scx_path, codec=None, shard_size=None))]
+#[pyo3(signature = (mtx_dir, scx_path, codec=None, shard_size=None, shard_obs="auto"))]
 fn from_mtx(
     py: Python<'_>,
     mtx_dir: &str,
     scx_path: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
+    shard_obs: &str,
 ) -> PyResult<()> {
+    let obs_shard_policy =
+        scx_format_io::ObsShardPolicy::parse(shard_obs).map_err(PyValueError::new_err)?;
     let orientation = scx_mtx::mtx_to_scx(
         std::path::Path::new(mtx_dir),
         std::path::Path::new(scx_path),
         resolve_shard_size(shard_size, 16384)?,
         codec.unwrap_or("auto"),
         "pyscx",
+        obs_shard_policy,
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 

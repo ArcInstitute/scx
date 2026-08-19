@@ -35,9 +35,9 @@ pub use append::{
 };
 pub use build_csc::run_build_csc;
 pub use codec_intent::{framing_for_rewrite, intent_from_codec_selection, seed_codec};
-pub use compact::{
-    compact, compact_with_index_options, compact_with_options, write_obs_section, CompactOptions,
-};
+pub use compact::{compact, compact_with_index_options, compact_with_options, CompactOptions};
+// Re-exported from `scx-format-io`, which is where the obs shard-boundary loop
+// now lives so `scx-mtx` (which cannot depend on this crate) shares it too.
 pub use delete::mark_deleted;
 pub use error::{OpsError, Result};
 pub use external_layer::{
@@ -62,6 +62,7 @@ pub use rewrite_helpers::{
     copy_obs_var_preserving_layout, encoding_for_canonicalized, LayerCanonicalization,
 };
 pub use rollback::{rollback, rollback_to};
+pub use scx_format_io::write_obs_section;
 pub use shuffle_order::seeded_permutation;
 pub use sort::{ReferenceSpec, SortOptions, SortStrategy, SortSummary};
 pub use sort_engine::{

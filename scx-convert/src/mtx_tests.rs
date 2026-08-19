@@ -104,7 +104,8 @@ fn test_mtx_to_scx_round_trip() {
     create_test_mtx_dir(&mtx_dir, n_obs, n_vars);
 
     // MTX → SCX
-    crate::mtx_pipeline::mtx_to_scx(&mtx_dir, &scx_path, 10000, "auto").unwrap();
+    crate::mtx_pipeline::mtx_to_scx(&mtx_dir, &scx_path, 10000, "auto", Default::default())
+        .unwrap();
 
     // Verify SCX
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -135,7 +136,8 @@ fn test_mtx_to_scx_round_trip() {
 
     // Read back the output MTX and convert again
     let scx_path2 = dir.path().join("test2.scx");
-    crate::mtx_pipeline::mtx_to_scx(&mtx_out_dir, &scx_path2, 10000, "auto").unwrap();
+    crate::mtx_pipeline::mtx_to_scx(&mtx_out_dir, &scx_path2, 10000, "auto", Default::default())
+        .unwrap();
 
     let reader2 = ScxReader::open(&scx_path2).unwrap();
     assert_eq!(reader2.n_obs(), n_obs as u64);
@@ -156,7 +158,8 @@ fn test_mtx_gzipped() {
 
     create_test_mtx_dir_gz(&mtx_dir, 15, 10);
 
-    crate::mtx_pipeline::mtx_to_scx(&mtx_dir, &scx_path, 10000, "auto").unwrap();
+    crate::mtx_pipeline::mtx_to_scx(&mtx_dir, &scx_path, 10000, "auto", Default::default())
+        .unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
     assert_eq!(reader.n_obs(), 15);
@@ -174,7 +177,8 @@ fn test_mtx_old_genes_tsv() {
     // Rename features.tsv to genes.tsv
     std::fs::rename(mtx_dir.join("features.tsv"), mtx_dir.join("genes.tsv")).unwrap();
 
-    crate::mtx_pipeline::mtx_to_scx(&mtx_dir, &scx_path, 10000, "auto").unwrap();
+    crate::mtx_pipeline::mtx_to_scx(&mtx_dir, &scx_path, 10000, "auto", Default::default())
+        .unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
     assert_eq!(reader.n_obs(), 10);
@@ -194,6 +198,7 @@ fn test_mtx_missing_sidecars() {
     writeln!(f, "2 2 1").unwrap();
     writeln!(f, "1 1 1").unwrap();
 
-    let result = crate::mtx_pipeline::mtx_to_scx(&mtx_dir, &scx_path, 10000, "auto");
+    let result =
+        crate::mtx_pipeline::mtx_to_scx(&mtx_dir, &scx_path, 10000, "auto", Default::default());
     assert!(result.is_err(), "should fail without barcodes.tsv");
 }

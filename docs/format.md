@@ -691,14 +691,21 @@ in the same accessor — no migration required.
 
 #### Sharded metadata layout (section types 24–25)
 
-Files written by streaming `scx merge`, `scx append`, and pyscx 0.5+
-`from_anndata` (when `n_obs > shard_target_rows`) shard the obs/var
-metadata batches the same way obsm/varm/obsp/varp are sharded above.
-This bounds peak memory at one shard's worth of metadata during the
-merge/append/ingest hot path and — critically — keeps each shard
-below Arrow IPC's 2 GB narrow-offset ceiling for string columns,
-which the legacy single-section `obs_metadata` / `var_metadata`
-layout could overflow on atlas-scale obs string payloads.
+Files written by streaming `scx merge`, `scx append`, `from_anndata`,
+`scx optimize --shard-obs`, and — since phase 6c — every `scx convert` /
+`from_h5ad` / `from_h5mu` / `from_mtx` ingest (all when
+`n_obs > shard_target_rows`, under `--shard-obs off|auto|always`) shard the
+obs metadata batch the same way obsm/varm/obsp/varp are sharded above. Each
+shard stays below Arrow IPC's 2 GB narrow-offset ceiling for string columns,
+which the legacy single-section `obs_metadata` / `var_metadata` layout could
+overflow on atlas-scale obs string payloads.
+
+Two scope notes, because the obvious readings are both wrong. **Only merge
+and append actually bound peak memory this way** — they never hold the whole
+table. The convert paths read obs whole and slice it zero-copy, so sharding
+there buys the bounded layout for *downstream* readers, not a smaller
+conversion. And on the convert paths the **var axis is never sharded**, at any
+`n_vars`; `from_anndata` shards both.
 
 - **`obs_metadata_shard` (24)** — name `obs_metadata/shard_<idx>`. Arrow
   IPC of one `RecordBatch` covering obs rows

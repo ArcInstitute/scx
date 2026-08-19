@@ -1968,6 +1968,7 @@ fn run_convert(
                 input,
                 output,
                 shard_size,
+                shard_obs,
                 codec,
                 csc_policy,
                 csc_cols_per_shard,
@@ -2415,6 +2416,7 @@ fn dispatch_mtx_to_scx(
     input: &std::path::Path,
     output: &std::path::Path,
     shard_size: u32,
+    shard_obs: &str,
     codec: &str,
     csc_policy: convert::CscPolicy,
     csc_cols_per_shard: usize,
@@ -2430,7 +2432,8 @@ fn dispatch_mtx_to_scx(
     );
     pb.set_message(format!("Converting MTX {}...", input.display()));
 
-    let orientation = mtx_pipeline::mtx_to_scx(input, output, shard_size, codec)?;
+    let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(shard_obs)?;
+    let orientation = mtx_pipeline::mtx_to_scx(input, output, shard_size, codec, obs_shard_policy)?;
     pb.finish_and_clear();
 
     if orientation == convert::MtxOrientation::Ambiguous {

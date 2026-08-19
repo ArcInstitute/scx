@@ -3133,3 +3133,44 @@ pub fn compute_shard_stats(
 #[cfg(test)]
 #[path = "writer_tests.rs"]
 mod tests;
+
+/// Write an obs metadata batch as either one legacy `ObsMetadata` section or
+/// `shard_target_rows`-sized [`SectionType::ObsMetadataShard`] sections.
+///
+/// The single place the obs shard boundaries are decided, for every producer
+/// that holds a coherent obs batch: `scx compact --reshape-obs`,
+/// `scx optimize --shard-obs`, every `scx-convert` ingest path, and
+/// `scx-mtx`. It lives here rather than in `scx-ops` because `scx-mtx` cannot
+/// depend on that crate — and a second copy of this loop is exactly the
+/// divergence the caller-side policy exists to prevent.
+///
+/// `reshape == false`, or an empty batch, writes the single section: a 0-row
+/// file stays well-formed rather than gaining a zero-length shard. Decide
+/// `reshape` with [`crate::ObsShardPolicy::should_shard_single_section`].
+///
+/// [`Self::write_obs_shard`] upcasts `Utf8 → LargeUtf8` per shard internally,
+/// so individual shards never hit the Arrow IPC 2 GB narrow-offset ceiling.
+pub fn write_obs_section(
+    writer: &mut ScxWriter,
+    obs: &RecordBatch,
+    reshape: bool,
+    shard_target_rows: u32,
+) -> Result<()> {
+    let n = obs.num_rows();
+    if !reshape || n == 0 {
+        writer.write_obs(obs)?;
+        return Ok(());
+    }
+    let chunk = (shard_target_rows.max(1)) as usize;
+    let total = n as u64;
+    let (mut shard_idx, mut row_start, mut cursor) = (0u32, 0u64, 0usize);
+    while cursor < n {
+        let take = chunk.min(n - cursor);
+        let slice = obs.slice(cursor, take); // zero-copy
+        writer.write_obs_shard(shard_idx, row_start, take as u64, total, &slice)?;
+        shard_idx += 1;
+        row_start += take as u64;
+        cursor += take;
+    }
+    Ok(())
+}

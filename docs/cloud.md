@@ -184,8 +184,12 @@ s3://bucket/atlas.scxd/
 ├── _header.bin               # 256-byte file header
 ├── _catalog.bin              # Full catalog (uploaded LAST)
 ├── _modality_table.bin       # Optional — present on multimodal v2 files
-├── obs.arrow                 # Cell metadata
+├── obs.arrow                 # Cell metadata — single-section obs only
+├── obs/                      # Row-sharded obs (ObsMetadataShard); replaces
+│   ├── 000000.arrow          #   obs.arrow, never coexists with it
+│   └── 000001.arrow
 ├── var.arrow                 # Gene metadata
+├── var/                      # Row-sharded var, when the source has it
 ├── X/
 │   ├── 000000.shard          # Single-modality CSR shards — byte-identical to packed
 │   ├── 000001.shard
@@ -201,6 +205,13 @@ s3://bucket/atlas.scxd/
 ├── _provenance.bin           # Optional
 └── _deletion_vectors.bin     # Optional
 ```
+
+A file has **either** `obs.arrow` **or** `obs/NNNNNN.arrow`, never both — the
+two on-disk obs layouts are mutually exclusive (see
+[format.md § Sharded metadata layout](format.md#sharded-metadata-layout-section-types-2425)).
+Since phase 6c the sharded form is what `scx convert` / `pyscx.from_h5ad`
+produce by default above `n_obs > shard_size`, so consumers of this layout
+must handle both; `scx pull`, `scx pull --filter` and `open_cloud` do.
 
 `_catalog.bin` is uploaded last, which gives the `.scxd/` directory
 **atomic-publish semantics**: until the catalog object exists, a reader opening
