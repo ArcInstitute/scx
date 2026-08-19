@@ -137,3 +137,53 @@ def test_orientation_mismatch_raises(tmp_path):
     out = str(tmp_path / "bad.scx")
     with pytest.raises(Exception, match="orientation mismatch"):
         pyscx.from_mtx(str(mtx_dir), out)
+
+
+def _mtx_dir_with(tmp_path, n_cells):
+    """A features × barcodes fixture with `n_cells` cells and 4 genes."""
+    entries = [(1 + (i % 4), 1 + i, 1 + (i % 5)) for i in range(n_cells)]
+    body = (
+        "%%MatrixMarket matrix coordinate integer general\n"
+        f"4 {n_cells} {len(entries)}\n"
+        + "".join(f"{g} {c} {v}\n" for g, c, v in entries)
+    )
+    d = tmp_path / "fbm"
+    write_cellranger_mtx(
+        d,
+        body,
+        [f"CELL{i:04d}-1" for i in range(n_cells)],
+        [(f"ENSG{i:03d}", f"Gene{i}") for i in range(4)],
+    )
+    return d
+
+
+def test_from_mtx_shard_obs_policy(tmp_path):
+    """`shard_obs` reaches `scx-mtx`.
+
+    Until phase 6c's review round the flag was accepted on this route and did
+    nothing: `run_convert` returned through the MTX dispatch before the policy
+    was parsed, so `always` exited 0 having written one legacy `obs_metadata`
+    section. Each assertion is paired with a control that must *not* shard, so
+    "honoured" is distinguishable from "ignored".
+    """
+    mtx_dir = _mtx_dir_with(tmp_path, 12)
+
+    for kwargs, want in (
+        ({"shard_size": 100, "shard_obs": "always"}, 1),
+        ({"shard_size": 100}, 0),  # auto, below threshold -> single section
+        ({"shard_size": 4}, 3),  # auto, above threshold -> sharded
+        ({"shard_size": 4, "shard_obs": "off"}, 0),
+    ):
+        out = str(tmp_path / f"out_{want}_{kwargs.get('shard_obs', 'auto')}.scx")
+        pyscx.from_mtx(str(mtx_dir), out, **kwargs)
+        exp = pyscx.open(out)
+        assert exp.n_obs == 12
+        assert exp.obs_metadata_shard_count == want, (
+            f"from_mtx({kwargs}) -> {exp.obs_metadata_shard_count} obs shards, want {want}"
+        )
+
+
+def test_from_mtx_rejects_bad_shard_obs(tmp_path):
+    mtx_dir = _mtx_dir_with(tmp_path, 8)
+    with pytest.raises(ValueError, match="shard_obs"):
+        pyscx.from_mtx(str(mtx_dir), str(tmp_path / "bad.scx"), shard_obs="sometimes")

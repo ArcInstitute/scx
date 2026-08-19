@@ -839,7 +839,17 @@ pub async fn pull_filtered(
             SectionType::CsrShard if shard_name_set.contains(&entry.name) => {
                 entries_to_download.push(entry);
             }
-            SectionType::VarMetadata | SectionType::VarIndex | SectionType::UnsBlob => {
+            // Var is untouched by an obs-axis row filter, so both var layouts
+            // copy through verbatim — their `row_start` stamps stay valid.
+            // `VarMetadataShard` was missing here, so a filtered pull of a
+            // sharded-var source (any `from_anndata` / merge / append output
+            // with `n_vars > shard_target_rows`) silently dropped every var
+            // shard into `omitted_section_types` and produced a file whose
+            // `read_var()` fails with "section not found: var".
+            SectionType::VarMetadata
+            | SectionType::VarMetadataShard
+            | SectionType::VarIndex
+            | SectionType::UnsBlob => {
                 entries_to_download.push(entry);
             }
             // Phase G.1c: pull the modality table so we can re-emit
@@ -870,7 +880,7 @@ pub async fn pull_filtered(
     // used by pull(): var → csr shards → uns.
     let type_priority = |st: SectionType| -> u8 {
         match st {
-            SectionType::VarMetadata => 0,
+            SectionType::VarMetadata | SectionType::VarMetadataShard => 0,
             SectionType::VarIndex => 1,
             SectionType::CsrShard => 2,
             SectionType::UnsBlob => 3,

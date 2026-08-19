@@ -677,7 +677,7 @@ Obs/var **metadata** sharding is decided independently of X sharding.
 `ObsShardPolicy::parse`, and the same `n_obs > shard_target_rows` boundary
 `scx optimize --shard-obs` and `pyscx.from_anndata` use, so the four
 producers converge on one layout for a given `n_obs`. Shard boundaries come
-from the shared `scx_ops::write_obs_section`, not a per-producer copy of the
+from the shared `scx_format_io::write_obs_section`, not a per-producer copy of the
 loop.
 
 > This is a **layout** choice, not a memory one. Ingest reads obs whole

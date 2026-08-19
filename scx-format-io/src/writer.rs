@@ -3139,8 +3139,8 @@ mod tests;
 ///
 /// The single place the obs shard boundaries are decided, for every producer
 /// that holds a coherent obs batch: `scx compact --reshape-obs`,
-/// `scx optimize --shard-obs`, every `scx-convert` ingest path, and
-/// `scx-mtx`. It lives here rather than in `scx-ops` because `scx-mtx` cannot
+/// `scx optimize --shard-obs`, every `scx-convert` ingest path, `scx-mtx`,
+/// and `pyscx.from_anndata`. It lives here rather than in `scx-ops` because `scx-mtx` cannot
 /// depend on that crate — and a second copy of this loop is exactly the
 /// divergence the caller-side policy exists to prevent.
 ///
@@ -3148,7 +3148,7 @@ mod tests;
 /// file stays well-formed rather than gaining a zero-length shard. Decide
 /// `reshape` with [`crate::ObsShardPolicy::should_shard_single_section`].
 ///
-/// [`Self::write_obs_shard`] upcasts `Utf8 → LargeUtf8` per shard internally,
+/// [`ScxWriter::write_obs_shard`] upcasts `Utf8 → LargeUtf8` per shard internally,
 /// so individual shards never hit the Arrow IPC 2 GB narrow-offset ceiling.
 pub fn write_obs_section(
     writer: &mut ScxWriter,

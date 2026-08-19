@@ -890,21 +890,12 @@ pub fn from_anndata_impl(
     let shard_obs = !force_legacy_metadata && obs_rows > step;
     let shard_var = !force_legacy_metadata && var_rows > step;
     py.detach(|| -> std::result::Result<(), scx_format_io::ScxError> {
-        if shard_obs {
-            let n_total = obs_rows as u64;
-            let mut shard_idx: u32 = 0;
-            let mut row_start: usize = 0;
-            while row_start < obs_rows {
-                let lo = row_start;
-                let hi = (lo + step).min(obs_rows);
-                let shard = obs_batch.slice(lo, hi - lo);
-                writer.write_obs_shard(shard_idx, lo as u64, (hi - lo) as u64, n_total, &shard)?;
-                shard_idx += 1;
-                row_start = hi;
-            }
-        } else {
-            writer.write_obs(&obs_batch)?;
-        }
+        // Obs goes through the shared boundary loop, so this producer cannot
+        // drift from `scx convert` / `scx-mtx` / `compact --reshape-obs` /
+        // `optimize --shard-obs`. (Var keeps its own loop below: it is the one
+        // axis this entry point shards and the shared helper is obs-scoped,
+        // matching `ObsShardPolicy`.)
+        scx_format_io::write_obs_section(&mut writer, &obs_batch, shard_obs, shard_target_rows)?;
         if shard_var {
             let n_total = var_rows as u64;
             let mut shard_idx: u32 = 0;

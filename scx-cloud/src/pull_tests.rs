@@ -1772,3 +1772,107 @@ async fn test_selective_pull_agrees_across_obs_layouts() {
         );
     }
 }
+
+/// A selective pull must carry **var** through in either layout too.
+///
+/// `VarMetadataShard` was missing from `pull_filtered`'s download match, so a
+/// sharded-var source lost every var shard into `omitted_section_types` and
+/// produced an output whose `read_var()` fails outright with "section not
+/// found: var". Var is untouched by an obs-axis row filter, so the shards copy
+/// through verbatim.
+#[tokio::test]
+async fn test_selective_pull_carries_sharded_var_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sharded_var.scx");
+    let (n_obs, n_vars) = (100usize, 60usize);
+    let mut writer = ScxWriter::new(&path, sample_header(n_obs as u64, n_vars as u64)).unwrap();
+
+    let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    let types: Vec<String> = (0..n_obs)
+        .map(|i| if i < n_obs / 2 { "typeA" } else { "typeB" }.to_string())
+        .collect();
+    let obs_batch = arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("cell_type", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                types.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch).unwrap();
+
+    // Var as row-shards, 20 rows each.
+    let var_batch = sample_var(n_vars);
+    let step = 20usize;
+    let (mut vi, mut cursor) = (0u32, 0usize);
+    while cursor < n_vars {
+        let take = step.min(n_vars - cursor);
+        writer
+            .write_var_shard(
+                vi,
+                cursor as u64,
+                take as u64,
+                n_vars as u64,
+                &var_batch.slice(cursor, take),
+            )
+            .unwrap();
+        vi += 1;
+        cursor += take;
+    }
+
+    let mut row_offset = 0;
+    while row_offset < n_obs {
+        let shard_rows = std::cmp::min(50, n_obs - row_offset);
+        let (indptr, indices, values) = sample_shard_data(shard_rows, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_offset as u64,
+            )
+            .unwrap();
+        row_offset += shard_rows;
+    }
+    writer.finish().unwrap();
+
+    // The fixture must actually have sharded var, or this proves nothing.
+    let src = ScxReader::open(&path).unwrap();
+    assert_eq!(src.var_metadata_shard_count(), 3);
+    drop(src);
+
+    let exploded = dir.path().join("sharded_var.scxd");
+    crate::explode::explode(&path, &exploded).unwrap();
+    let out = dir.path().join("filtered_var.scx");
+    let stats = pull_filtered(
+        &exploded.to_string_lossy(),
+        &out,
+        "cell_type == 'typeA'",
+        PullOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !stats
+            .omitted_section_types
+            .contains(&SectionType::VarMetadataShard),
+        "var shards must be carried through, not reported as omitted"
+    );
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.var_metadata_shard_count(), 3);
+    let var = reader
+        .read_var()
+        .expect("read_var must work on the pulled output");
+    assert_eq!(var.num_rows(), n_vars);
+}
