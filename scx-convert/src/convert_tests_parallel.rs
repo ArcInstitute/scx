@@ -1183,3 +1183,207 @@ fn parallel_export_worker_panic_does_not_deadlock() {
         "expected Err from injected export worker panic; got Ok"
     );
 }
+
+/// §11.5: `--memory-budget` on a dense h5ad must not silently destroy
+/// parallelism.
+///
+/// ⚠️ **This is the assertion `dense_parallel_with_memory_budget_byte_identical`
+/// never made, and without which its two arms are secretly one arm.** That test
+/// asks for `reader_threads = Some(4)`, but the budget derate collapses the
+/// grant to 1 and `pipeline.rs`'s `if granted <= 1` routes it to the
+/// *sequential* coordinator — so it compares the sequential path against itself
+/// and byte-identity is trivially true. Its own comment computes
+/// `(8192 / 200) / 4 = 10` and then asserts nothing about it.
+///
+/// The oracle is `parallel_drain::hooks::last_run_peak()`, a thread-local set
+/// at the tail of `ordered_parallel_drain`. Only two production callers exist —
+/// parallel ingest (`pipeline.rs:2286`) and parallel export
+/// (`stream_write.rs:509`) — and the sequential coordinator calls neither, so it
+/// leaves the counter at its initial `0`. That makes `0` vs `> 0` an exact
+/// answer to "which coordinator ran", which is the only question this test asks.
+/// (It is deliberately *not* an assertion about how much concurrency was
+/// achieved: rayon bounds that by the pool size regardless of the coordinator,
+/// as `parallel_reorder_buffer_bounded_by_window` documents at length.)
+///
+/// **Arm order is load-bearing.** The counter is never reset to zero, so the
+/// sequential arm must run first, on a virgin thread-local — otherwise it would
+/// read the parallel arm's leftover value and pass for the wrong reason.
+///
+/// The arithmetic, with `n_vars = 50` f32 (`row_bytes = 200`) and
+/// `memory_budget = 24_000`:
+///
+/// | | today | after the fix |
+/// |---|---|---|
+/// | `max_slab_rows` | `(24000/200)/4 = 30` | `(24000/4)/(50×12) = 10` |
+/// | `per_worker_bytes` | `30×200×2 = 12000` (= B/2) | `10×50×12 = 6000` (= B/4) |
+/// | `outstanding_max` | 2 | 4 |
+/// | `granted_threads` | **1 → sequential** | **3 → parallel** |
+#[test]
+fn dense_convert_under_a_memory_budget_stays_parallel() {
+    if super::hdf5_threadsafe::skip_if_not_threadsafe(
+        "dense_convert_under_a_memory_budget_stays_parallel",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("dense.h5ad");
+    // 200 rows × 50 vars, f32 dense → row_bytes = 200.
+    create_test_h5ad(&h5ad, 200, 50, "dense", false);
+
+    // ---- control arm: sequential, on a virgin thread-local ----
+    let mut seq_opts = streaming_opts(32);
+    seq_opts.reader_threads = Some(1);
+    seq_opts.memory_budget = Some(24_000);
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &dir.path().join("seq.scx"),
+        &seq_opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect("sequential dense convert under memory_budget");
+    assert_eq!(
+        super::parallel_drain::hooks::last_run_peak(),
+        0,
+        "the sequential coordinator entered the parallel drain — the control \
+         arm is not a control, and the assertion below proves nothing"
+    );
+
+    // ---- the arm under test ----
+    let mut par_opts = streaming_opts(32);
+    par_opts.reader_threads = Some(8);
+    par_opts.writer_queue_depth = 4;
+    par_opts.memory_budget = Some(24_000);
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &dir.path().join("par.scx"),
+        &par_opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect("parallel dense convert under memory_budget must not abort");
+
+    let peak = super::parallel_drain::hooks::last_run_peak();
+    assert!(
+        peak > 0,
+        "§11.5: a dense convert with reader_threads=8 under memory_budget \
+         24000 ran on the SEQUENTIAL coordinator (drain in-flight peak {peak}). \
+         The dense slab cap divides the budget by 4 and the per-worker estimate \
+         then multiplies the already-capped slab by 2, so the same reserve is \
+         spent twice: outstanding_max lands at 2, granted_threads at 1, and \
+         `if granted <= 1` routes away from the parallel path."
+    );
+}
+
+/// The dense slab cap reserves `4 × sizeof(source_dtype)` bytes per element,
+/// but what `read_range_inner` actually holds does **not** scale with the
+/// source width — so a narrow-dtype dense h5ad exceeds its own
+/// `--memory-budget`, on the sequential path, with no parallel reader involved.
+///
+/// ⚠️ **This bug is not §11.5 and is not in the code review at all.** §11.5 is
+/// the ÷4-then-×2 double-count, which costs parallelism; this is the ÷4 being
+/// keyed to the wrong unit, which costs the budget itself. They live on the
+/// same line (`dense_stream.rs:142`) and are fixed by the same split, but only
+/// one of them was known.
+///
+/// What is resident at peak, from `read_range_inner` and `read_dense_slab_f32`,
+/// with `N = slab_rows × n_vars` and `s = sizeof(source dtype)`:
+///
+/// * **read + cast**: the `F32` arm moves its `Vec` out of `read_slice_2d`
+///   (`into_raw_vec_and_offset`, no copy) → `4N`. Every other arm does
+///   `data.into_iter().map(…).collect()`, and `data`'s allocation lives until
+///   the `IntoIter` drops, so both buffers coexist → `(s + 4)·N`, max `12N`.
+/// * **sparsify**: `flat` (`4N`) + `indices` + `values`, which at exact capacity
+///   is `4N` each → `12N`.
+///
+/// The two never coexist (`read_slab_f32` drops the source before returning),
+/// so peak is `max(…) = 12N` — **independent of `s`**. Against the reserved
+/// `4s` B/elem:
+///
+/// | dtype | `s` | reserved | needed | |
+/// |---|---|---|---|---|
+/// | `u8` / `i8` | 1 | 4 | 12 | **3× over budget** |
+/// | `f16`/`u16`/`i16` | 2 | 8 | 12 | **1.5× over budget** |
+/// | `f32`/`i32`/`u32` | 4 | 16 | 12 | ok |
+/// | `f64`/`i64`/`u64` | 8 | 32 | 12 | conservative |
+///
+/// This asserts only the **no-OOM** bound (one slab ≤ the whole budget), which
+/// isolates the dtype bug: it passes for f32/f64 today and fails for the narrow
+/// three. The stricter share bound — one slab ≤ a *quarter* of the budget, which
+/// is what leaves room for more than one worker — fails for every dtype today
+/// and is what `dense_convert_under_a_memory_budget_stays_parallel` measures.
+#[test]
+fn dense_slab_cap_never_exceeds_the_budget_for_any_dtype() {
+    /// Peak bytes per source element held by `read_range_inner`. Independent of
+    /// the source dtype; see the table above.
+    const PEAK_BYTES_PER_ELEM: u64 = 12;
+
+    let dir = tempfile::tempdir().unwrap();
+    let n_vars: u64 = 1000;
+    let budget: u64 = 4_800_000;
+
+    // `create_test_h5ad` only writes f32, and `open_dense_streaming` takes a
+    // bare `hdf5::File` plus a dataset path — no h5ad validity required — so a
+    // one-dataset file is the whole fixture.
+    let mut failures = Vec::new();
+    for (name, write) in dense_dtype_writers() {
+        let path = dir.path().join(format!("{name}.h5"));
+        write(&path, 64, n_vars as usize);
+
+        let file = hdf5::File::open(&path).unwrap();
+        let mut opts = streaming_opts(32);
+        opts.memory_budget = Some(budget);
+        let reader = super::open_dense_streaming(&file, "X", &opts, &mut WarningSink::log())
+            .unwrap_or_else(|e| panic!("open_dense_streaming for {name}: {e}"));
+
+        let rows = <_ as super::stream::IndexedCsrShardStream>::max_slab_rows(&reader)
+            .expect("a budget is set, so the dense reader must report a cap")
+            as u64;
+        let peak = rows * n_vars * PEAK_BYTES_PER_ELEM;
+        if peak > budget {
+            failures.push(format!(
+                "{name}: max_slab_rows={rows} → peak {peak} B = {:.1}× the \
+                 memory_budget of {budget} B",
+                peak as f64 / budget as f64
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "the dense slab cap exceeds memory_budget for {} of the source dtypes \
+         tested:\n  {}\n\nThe cap divides by `4 × sizeof(source_dtype)`, but the \
+         resident slab is f32 whatever the input was, and the sparsified output \
+         does not depend on the source width at all.",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
+
+/// One minimal single-dataset HDF5 file per source dtype the dense reader
+/// supports. `open_dense_streaming` reads only shape and dtype, so the values
+/// are irrelevant and a zero-filled array is the cheapest valid fixture.
+fn dense_dtype_writers() -> Vec<(&'static str, fn(&std::path::Path, usize, usize))> {
+    fn write_dense<T>(path: &std::path::Path, n_obs: usize, n_vars: usize)
+    where
+        T: hdf5::H5Type + Default + Clone,
+    {
+        let file = hdf5::File::create(path).unwrap();
+        let arr = ndarray::Array2::<T>::from_elem((n_obs, n_vars), T::default());
+        file.new_dataset::<T>()
+            .shape([n_obs, n_vars])
+            .create("X")
+            .unwrap()
+            .write(&arr)
+            .unwrap();
+    }
+    vec![
+        (
+            "u8",
+            write_dense::<u8> as fn(&std::path::Path, usize, usize),
+        ),
+        ("i16", write_dense::<i16>),
+        ("f32", write_dense::<f32>),
+        ("f64", write_dense::<f64>),
+    ]
+}
