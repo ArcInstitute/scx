@@ -1243,10 +1243,20 @@ fn phase1_streaming_dense_memory_budget_caps_slab() {
     write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
 
     let file = hdf5::File::open(&h5ad).unwrap();
-    // Budget = n_vars * 4 (f32) * shard_target_rows / 2 — half what
-    // a full shard would need, so the slab cap activates.
+    // A budget that admits several slab rows but fewer than a full shard, so
+    // the cap activates without tripping the refusal.
+    //
+    // ⚠️ The old value here was `n_vars * 4 * shard_target_rows / 2` = 32_000,
+    // derived from the source dtype's width. That is below the honest minimum
+    // for a 1000-var dense matrix (one row costs 1000 × 12 B, and one slab may
+    // claim a quarter of the budget, so the floor is 48_000) — under the fixed
+    // model this file is refused rather than capped, and the test would be
+    // asserting on an error it never meant to provoke. Derived from the table
+    // instead of restated, so it tracks the model.
     let shard_target_rows: usize = 16;
-    let budget = (n_vars as u64) * 4 * (shard_target_rows as u64) / 2;
+    let row_cost = crate::budget::dense_slab_bytes(1, n_vars as u64, 4);
+    // 4 slab rows: comfortably above the 1-row floor, comfortably below 16.
+    let budget = crate::budget::SHARD_BUDGET_SHARE.min_budget_for(row_cost * 4);
 
     let opts = ConvertOptions {
         memory_budget: Some(budget),
@@ -2102,4 +2112,87 @@ fn phase3_streaming_h5mu_non_aligned_obs_errors() {
         msg.contains("rna") && msg.contains("12") && msg.contains("8"),
         "expected message to name 'rna' and the offending counts; got: {msg}"
     );
+}
+
+/// The dense sparsify path allocates `indices` / `values` at exactly the
+/// nonzero count, and the counting predicate agrees with the retain predicate
+/// on every value class that distinguishes them.
+///
+/// Both halves matter, and for different reasons.
+///
+/// **Exactness** is what makes `budget::DENSE_SPARSIFY_BYTES_PER_ELEM = 12` a
+/// bound rather than a hope. These vectors used to start at `n/32` and grow by
+/// doubling, which overshoots the final length by up to 2x — and transiently 3x
+/// while a realloc holds both buffers — so a dense slab could reach ~24
+/// B/element against the 12 the allocation table budgets for. A budget the
+/// reader silently exceeds by 2x is the OOM that `dense_max_slab_rows` exists
+/// to prevent.
+///
+/// **Agreement** is what keeps the count honest. The counting pass and the two
+/// retain loops spell the same predicate three times, and NaN is the value that
+/// tells them apart: `NaN != 0.0` is true, but `NaN.abs() > eps` is false, so an
+/// epsilon-mode counter written the obvious way would under-count and the
+/// vectors would grow after all — quietly restoring the doubling this test
+/// exists to rule out.
+#[test]
+fn dense_sparsify_allocates_exactly() {
+    use super::stream::CsrShardStream;
+    use crate::h5ad::dense_stream::open_dense_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars) = (8usize, 16usize);
+
+    // One of each class the predicates must classify: exact zero, a value below
+    // epsilon, a value above it, a negative below/above, and NaN.
+    let mut dense = vec![0.0f32; n_obs * n_vars];
+    for row in 0..n_obs {
+        dense[row * n_vars] = 0.0; // dropped by both modes
+        dense[row * n_vars + 1] = 1e-9; // kept when eps == 0, dropped when eps > 1e-9
+        dense[row * n_vars + 2] = 5.0; // kept by both
+        dense[row * n_vars + 3] = -5.0; // kept by both
+        dense[row * n_vars + 4] = f32::NAN; // kept by both — the trap
+    }
+    let h5ad = dir.path().join("classes.h5ad");
+    write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
+    let file = hdf5::File::open(&h5ad).unwrap();
+
+    for (label, eps, expected_per_row) in [
+        ("eps == 0", 0.0f32, 4usize),    // 1e-9, 5.0, -5.0, NaN
+        ("eps > 1e-9", 1e-6f32, 3usize), // 5.0, -5.0, NaN
+    ] {
+        let opts = ConvertOptions {
+            shard_target_rows: n_obs as u32,
+            dense_zero_epsilon: eps,
+            ..ConvertOptions::default()
+        };
+        let mut sink = WarningSink::log();
+        let mut reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();
+        let shard = reader
+            .next_csr_shard(n_obs)
+            .unwrap()
+            .expect("expected one shard");
+
+        assert_eq!(
+            shard.values.len(),
+            expected_per_row * n_obs,
+            "{label}: the counting pass and the retain loop disagree about \
+             which values survive"
+        );
+        assert_eq!(
+            shard.indices.capacity(),
+            shard.indices.len(),
+            "{label}: indices over-allocated ({} cap for {} entries) — the \
+             sparsify buffers grew after the counting pass, so the budget's \
+             12 B/element is not a bound",
+            shard.indices.capacity(),
+            shard.indices.len()
+        );
+        assert_eq!(
+            shard.values.capacity(),
+            shard.values.len(),
+            "{label}: values over-allocated ({} cap for {} entries)",
+            shard.values.capacity(),
+            shard.values.len()
+        );
+    }
 }

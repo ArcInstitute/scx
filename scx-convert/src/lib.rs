@@ -78,12 +78,7 @@ mod hdf5_threadsafe;
 // not (see the note above it): the budget table is integer arithmetic, and
 // keeping it feature-free is what lets its fractions invariant run in the
 // default `cargo test --workspace` job rather than only in the hdf5 lane.
-//
-// The `allow(dead_code)` is unconditional rather than `cfg_attr`'d because the
-// shares and the dense cost model land one commit before the reader that
-// consumes them; the next commit removes it. Everything here is exercised by
-// `budget_tests.rs` in the meantime.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
 mod budget;
 #[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
 mod parallel_drain;

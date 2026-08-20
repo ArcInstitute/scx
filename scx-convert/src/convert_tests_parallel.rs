@@ -496,10 +496,20 @@ fn parallel_per_worker_bytes_dense_uses_dense_formula() {
     let reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();
     let indexed: &dyn IndexedCsrShardStream = &reader;
 
-    // f32 = 4 bytes. Expected: 32 × 40 × 4 × 2 = 10_240.
+    // 32 rows × 40 vars × 12 B/element = 15_360.
+    //
+    // ⚠️ This was `32 × 40 × 4 × 2 = 10_240`, and the change is the point of
+    // the fix rather than a casualty of it. The old expression charged
+    // `2 × sizeof(source_dtype)` per element, which was wrong twice over: the
+    // ×2 double-counted a reserve `open_dense_streaming` had already taken
+    // (§11.5), and keying the per-element cost to the *source* width is wrong
+    // in the other direction, since the resident slab is f32 whatever the
+    // input was and the sparsified output does not depend on the source width
+    // at all. 12 B/element is what `read_range_inner` actually holds; see
+    // `budget::DENSE_SPARSIFY_BYTES_PER_ELEM`.
     let bytes_rna = indexed.per_worker_bytes(32, ModalityType::Rna);
     let bytes_atac = indexed.per_worker_bytes(32, ModalityType::Atac);
-    assert_eq!(bytes_rna, 10_240);
+    assert_eq!(bytes_rna, 15_360);
     // Dense override ignores modality — same formula regardless.
     assert_eq!(bytes_rna, bytes_atac);
     // And it's never zero.
@@ -1360,10 +1370,13 @@ fn dense_slab_cap_never_exceeds_the_budget_for_any_dtype() {
     );
 }
 
+/// Writes a zero-filled dense `/X` of one dtype at `(n_obs, n_vars)`.
+type DenseFixtureWriter = fn(&std::path::Path, usize, usize);
+
 /// One minimal single-dataset HDF5 file per source dtype the dense reader
 /// supports. `open_dense_streaming` reads only shape and dtype, so the values
 /// are irrelevant and a zero-filled array is the cheapest valid fixture.
-fn dense_dtype_writers() -> Vec<(&'static str, fn(&std::path::Path, usize, usize))> {
+fn dense_dtype_writers() -> Vec<(&'static str, DenseFixtureWriter)> {
     fn write_dense<T>(path: &std::path::Path, n_obs: usize, n_vars: usize)
     where
         T: hdf5::H5Type + Default + Clone,

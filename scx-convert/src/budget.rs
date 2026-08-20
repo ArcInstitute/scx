@@ -219,12 +219,20 @@ pub(crate) fn dense_max_slab_rows(budget: u64, n_vars: u64, dtype_bytes: u64) ->
 
 /// When a reservation's bytes are *held*.
 ///
+/// The table below is a **declaration**: production code derives its shares
+/// from the constants above, and the table records what each of those claims
+/// costs so `allocation_table_shares_sum_to_at_most_one_per_phase` can check
+/// that the concurrent ones fit. It is therefore read only from tests, which is
+/// the intended shape rather than an oversight -- a reservation nobody wrote
+/// down is exactly the state this module exists to end.
+///
 /// The distinction matters because reservations in different phases are not
 /// concurrent and must not be summed. The CSC external transpose is the case
 /// that forces this: it claims half the budget for a column chunk in pass 1 and
 /// a quarter for bucket records in pass 2, and a naive "the fractions must sum
 /// to at most one" test over those two would be asserting something nobody
 /// claimed.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     /// Dense h5ad ingest, steady state.
@@ -240,6 +248,7 @@ pub(crate) enum Phase {
 }
 
 /// One declared claim on the budget.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Reservation {
     pub name: &'static str,
     pub phase: Phase,
@@ -253,16 +262,32 @@ pub(crate) struct Reservation {
     pub enforced: bool,
 }
 
+impl Reservation {
+    /// `"1/4 x 4"` — the share and how many copies are held at once. Used in
+    /// the invariant's failure message, which is also what keeps `site` and
+    /// `share` load-bearing rather than decorative.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn share_str(&self) -> String {
+        format!(
+            "{}/{} x {}",
+            self.share.numerator(),
+            self.share.denominator(),
+            self.multiplicity
+        )
+    }
+}
+
 /// Every declared claim on a `memory_budget`, by phase.
 ///
 /// A reservation that is not in this table is a claim nobody wrote down —
 /// which is the state this module exists to end.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
     Reservation {
         name: "dense slab, one in-flight shard",
         phase: Phase::DenseIngest,
         share: SHARD_BUDGET_SHARE,
-        multiplicity: 4, // == SHARD_BUDGET_SHARE.max_concurrent()
+        multiplicity: SHARD_BUDGET_SHARE.max_concurrent(),
         site: "h5ad/dense_stream.rs::open_dense_streaming + per_worker_bytes",
         enforced: true,
     },
@@ -270,7 +295,7 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         name: "CSR shard working set, one in-flight shard",
         phase: Phase::SparseIngest,
         share: SHARD_BUDGET_SHARE,
-        multiplicity: 4,
+        multiplicity: SHARD_BUDGET_SHARE.max_concurrent(),
         site: "h5ad/stream.rs::per_worker_bytes -> derate_threads_and_depth",
         enforced: true,
     },
@@ -278,7 +303,7 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         name: "export shard working set, one in-flight shard",
         phase: Phase::Export,
         share: SHARD_BUDGET_SHARE,
-        multiplicity: 4,
+        multiplicity: SHARD_BUDGET_SHARE.max_concurrent(),
         site: "h5ad/stream_write.rs::per_shard_export_bytes -> derate_threads_and_depth",
         enforced: true,
     },

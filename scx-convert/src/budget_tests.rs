@@ -50,7 +50,9 @@ fn allocation_table_shares_sum_to_at_most_one_per_phase() {
              more than there is. Reservations held in one phase are \
              concurrent by definition, so this is an over-subscription, not a \
              rounding artefact: {:?}",
-            rows.iter().map(|r| r.name).collect::<Vec<_>>()
+            rows.iter()
+                .map(|r| format!("{} ({}) at {}", r.name, r.share_str(), r.site))
+                .collect::<Vec<_>>()
         );
     }
 }

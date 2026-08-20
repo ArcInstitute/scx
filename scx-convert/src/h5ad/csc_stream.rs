@@ -310,10 +310,18 @@ impl CscToCsrExternalTransposer {
                       // bucket flush; sink is held by the writer
                       // coordinator, not threaded through here.
 
-        // Bucket sizing. Reserve 1/4 of the budget for the in-memory
-        // bucket buffer (sort scratch, dup-coalesce). Floor at 1
-        // bucket-row to make progress even on tiny budgets.
-        let bucket_record_cap = ((budget / 4) / RECORD_BYTES_USIZE as u64).max(1);
+        // Bucket sizing: the in-memory bucket buffer (sort scratch,
+        // dup-coalesce) claims `budget::CSC_BUCKET_SHARE`, held in pass 2.
+        // Floor at 1 bucket-row to make progress even on tiny budgets.
+        //
+        // ⚠️ The table marks this reservation `enforced: false`, and the reason
+        // is here: `nnz_per_obs` is the *mean*, so on a right-skewed depth
+        // distribution a high-depth bucket loads well past this share. That is
+        // §11.4, and it is named rather than fixed -- see the table's note on
+        // why the review's prescribed quantile is not derivable from
+        // `col_indptr`.
+        let bucket_record_cap =
+            (crate::budget::CSC_BUCKET_SHARE.of(budget) / RECORD_BYTES_USIZE as u64).max(1);
         let nnz_per_obs = nnz.div_ceil(n_obs.max(1)).max(1);
         let bucket_rows: u64 = (bucket_record_cap / nnz_per_obs).max(1);
         let n_buckets = n_obs.div_ceil(bucket_rows) as usize;
@@ -345,8 +353,10 @@ impl CscToCsrExternalTransposer {
         // the half-budget allocated to "in-flight column data"
         // (indices: i32 + data: f32 = 8 bytes per nnz). Floor at one
         // column at a time.
-        let col_bytes_per_nnz: u64 = 8;
-        let cols_budget = (budget / 2).max(col_bytes_per_nnz * 8);
+        let col_bytes_per_nnz: u64 = crate::budget::PAYLOAD_BYTES_PER_NNZ;
+        let cols_budget = crate::budget::CSC_COLUMN_CHUNK_SHARE
+            .of(budget)
+            .max(col_bytes_per_nnz * 8);
         let n_vars_usize = n_vars as usize;
         let mut col_start = 0usize;
         while col_start < n_vars_usize {
