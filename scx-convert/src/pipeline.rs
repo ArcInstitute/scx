@@ -327,8 +327,7 @@ const BITMAP_AUTO_SIZE_PERCENT: usize = 15;
 /// sequential coordinator (safe failure mode), so values err
 /// conservative. The dense reader overrides `per_worker_bytes`
 /// entirely; these constants only affect sparse readers.
-pub(crate) const PARALLEL_DENSITY_DEFAULT_DEN: u64 = 20; // ≈ 5 % RNA/general
-pub(crate) const PARALLEL_DENSITY_ATAC_DEN: u64 = 10; // ≈ 10 % ATAC peak matrices
+pub(crate) use crate::budget::{PARALLEL_DENSITY_ATAC_DEN, PARALLEL_DENSITY_DEFAULT_DEN};
 
 /// Outcome of [`maybe_build_bitmap_shard`]. Either a built shard
 /// (ready to write) or a structured reason for skipping that the
