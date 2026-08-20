@@ -975,6 +975,12 @@ fn to_h5ad(
         }
     }
 
+    // Exhaustive, and now visibly so: this literal names every field of
+    // `ExportOptions`, which is the measurement behind the claim that
+    // `to_h5ad` was already a hand-rolled export options struct. It touched
+    // exactly the six fields the type has and nothing else, for as long as it
+    // has existed -- the 27 ingest-only fields it inherited from the shared
+    // struct were dead weight it never set.
     let opts = scx_convert::ExportOptions {
         tool: "pyscx".into(),
         reader_threads,
@@ -982,7 +988,6 @@ fn to_h5ad(
         memory_budget: memory_budget_bytes,
         export_obs_keep_mask: obs_mask_owned,
         export_min_counts: min_counts,
-        ..Default::default()
     };
     py.detach(|| -> Result<(), scx_convert::ConvertError> {
         let mut sink = scx_convert::WarningSink::log();
