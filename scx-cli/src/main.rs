@@ -2064,36 +2064,38 @@ fn run_convert(
         direction,
         input,
         output,
-        shard_size,
-        shard_obs,
-        codec,
-        csc_policy,
-        csc_cols_per_shard,
-        row_group_rows,
-        row_group_target_nnz,
         modality,
-        min_counts,
         stream,
-        memory_budget_bytes,
-        strict_uns,
-        dense_zero_epsilon,
-        temp_dir,
-        modalities_list,
-        modality_types_list,
-        index_obs_list,
-        index_var_list,
-        index_preset_value,
-        index_auto_threshold,
-        bitmap,
-        reader_threads,
-        writer_queue_depth,
-        sort_by_list,
-        sort_reverse,
-        group_by_value,
-        reference_spec,
-        group_target_bytes_val,
-        group_max_bytes_val,
-        group_pass_val,
+        ConvertCliArgs {
+            shard_size,
+            shard_obs: shard_obs.to_string(),
+            codec: codec.to_string(),
+            csc_policy,
+            csc_cols_per_shard,
+            row_group_rows,
+            row_group_target_nnz,
+            min_counts,
+            memory_budget: memory_budget_bytes,
+            strict_uns,
+            dense_zero_epsilon,
+            temp_dir,
+            modalities: modalities_list,
+            modality_types: modality_types_list,
+            index_obs: index_obs_list,
+            index_var: index_var_list,
+            index_preset: index_preset_value,
+            index_auto_threshold,
+            bitmap: bitmap.to_string(),
+            reader_threads,
+            writer_queue_depth,
+            sort_by: sort_by_list,
+            sort_reverse,
+            group_by: group_by_value,
+            reference: reference_spec,
+            group_target_bytes: group_target_bytes_val,
+            group_max_bytes: group_max_bytes_val,
+            group_pass: group_pass_val,
+        },
     )
 }
 
@@ -2169,52 +2171,107 @@ fn parse_modality_types(
         .collect()
 }
 
+/// Every `scx convert` flag, bundled.
+///
+/// `dispatch_convert` took 33 positional parameters, and a second
+/// `#[cfg(not(feature = "hdf5"))]` stub mirrored all 33 with `_` prefixes, so
+/// adding a flag meant editing two parallel lists in lockstep -- and a wrong
+/// expression in an argument position is invisible to the compiler when every
+/// neighbour has the same type (review finding X-3, which names this function).
+/// Bundling collapses both signatures to six parameters and makes a new flag
+/// one field here instead of two edits there.
+///
+/// Declared OUTSIDE the `hdf5` cfg on purpose: the stub has to name the type
+/// too. Every field type is reachable without the feature -- `CscPolicy`,
+/// `BitmapPolicy` and `GroupPass` are re-exported from `scx-convert` ungated
+/// for exactly this reason.
+// Without `hdf5` the only `dispatch_convert` is the stub, which returns an
+// error without reading anything -- so every field here is genuinely unread in
+// that configuration. Scoped to it rather than blanket-allowed, so a field that
+// stops being read in the REAL build still fails the lint.
+#[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
+pub(crate) struct ConvertCliArgs {
+    pub shard_size: u32,
+    pub shard_obs: String,
+    pub codec: String,
+    pub csc_policy: convert::CscPolicy,
+    pub csc_cols_per_shard: usize,
+    /// Framed by default; `0` = unframed (v3) opt-out, normalized to `None`.
+    pub row_group_rows: u32,
+    pub row_group_target_nnz: Option<u64>,
+    pub min_counts: Option<f64>,
+    pub memory_budget: Option<u64>,
+    pub strict_uns: bool,
+    pub dense_zero_epsilon: f32,
+    pub temp_dir: Option<std::path::PathBuf>,
+    pub modalities: Option<Vec<String>>,
+    pub modality_types: Vec<(String, scx_format_io::modality::ModalityType)>,
+    pub index_obs: Vec<String>,
+    pub index_var: Vec<String>,
+    pub index_preset: Option<String>,
+    pub index_auto_threshold: usize,
+    pub bitmap: String,
+    pub reader_threads: Option<usize>,
+    pub writer_queue_depth: usize,
+    pub sort_by: Vec<String>,
+    pub sort_reverse: bool,
+    pub group_by: Option<String>,
+    pub reference: Option<scx_ops::ReferenceSpec>,
+    pub group_target_bytes: Option<u64>,
+    pub group_max_bytes: Option<u64>,
+    pub group_pass: convert::GroupPass,
+}
+
 #[cfg(feature = "hdf5")]
-#[allow(clippy::too_many_arguments)]
 fn dispatch_convert(
     direction: &str,
     input: &std::path::Path,
     output: &std::path::Path,
-    shard_size: u32,
-    shard_obs: &str,
-    codec: &str,
-    csc_policy: convert::CscPolicy,
-    csc_cols_per_shard: usize,
-    // Framed by default; `0` = unframed (v3) opt-out, normalized to `None` below.
-    row_group_rows: u32,
-    row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
-    min_counts: Option<f64>,
     stream: bool,
-    memory_budget: Option<u64>,
-    strict_uns: bool,
-    dense_zero_epsilon: f32,
-    temp_dir: Option<std::path::PathBuf>,
-    modalities: Option<Vec<String>>,
-    modality_types: Vec<(String, scx_format_io::modality::ModalityType)>,
-    index_obs: Vec<String>,
-    index_var: Vec<String>,
-    index_preset: Option<String>,
-    index_auto_threshold: usize,
-    bitmap: &str,
-    reader_threads: Option<usize>,
-    writer_queue_depth: usize,
-    sort_by: Vec<String>,
-    sort_reverse: bool,
-    group_by: Option<String>,
-    reference: Option<scx_ops::ReferenceSpec>,
-    group_target_bytes: Option<u64>,
-    group_max_bytes: Option<u64>,
-    group_pass: convert::GroupPass,
+    args: ConvertCliArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{BitmapPolicy, ConvertError, IngestOptions};
     use indicatif::{ProgressBar, ProgressStyle};
-    let bitmap_policy = BitmapPolicy::parse(bitmap).map_err(|e| e.to_string())?;
+    // Destructured rather than used as `args.x` so the body below reads exactly
+    // as it did when these were parameters: this commit changes the signature,
+    // not the logic.
+    let ConvertCliArgs {
+        shard_size,
+        shard_obs,
+        codec,
+        csc_policy,
+        csc_cols_per_shard,
+        row_group_rows,
+        row_group_target_nnz,
+        min_counts,
+        memory_budget,
+        strict_uns,
+        dense_zero_epsilon,
+        temp_dir,
+        modalities,
+        modality_types,
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold,
+        bitmap,
+        reader_threads,
+        writer_queue_depth,
+        sort_by,
+        sort_reverse,
+        group_by,
+        reference,
+        group_target_bytes,
+        group_max_bytes,
+        group_pass,
+    } = args;
+    let bitmap_policy = BitmapPolicy::parse(&bitmap).map_err(|e| e.to_string())?;
 
     // Resolve the codec intent axis (`auto`/`fast`/`compact` + explicit forces).
     // `compact`/`compact-trial`/explicit-`shufdelta` require framing; `auto`
     // silently falls back to the heuristic single-encode when unframed.
-    let resolved = scx_format_io::resolve_codec(Some(codec))?;
+    let resolved = scx_format_io::resolve_codec(Some(&codec))?;
     let explicit_codec = resolved.explicit_codec;
     let codec_trial = resolved.codec_trial;
     let decode_target = resolved.decode_target;
@@ -2230,7 +2287,7 @@ fn dispatch_convert(
     let row_group_rows = (row_group_rows != 0).then_some(row_group_rows);
     // Same parser `scx optimize --shard-obs` uses, so the two subcommands
     // cannot drift on what `auto` means.
-    let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(shard_obs)?;
+    let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(&shard_obs)?;
 
     let opts = IngestOptions {
         shard_target_rows: shard_size,
@@ -2388,41 +2445,13 @@ fn dispatch_convert(
 }
 
 #[cfg(not(feature = "hdf5"))]
-#[allow(clippy::too_many_arguments)]
 fn dispatch_convert(
     _direction: &str,
     _input: &std::path::Path,
     _output: &std::path::Path,
-    _shard_size: u32,
-    _shard_obs: &str,
-    _codec: &str,
-    _csc_policy: convert::CscPolicy,
-    _csc_cols_per_shard: usize,
-    _row_group_rows: u32,
-    _row_group_target_nnz: Option<u64>,
     _modality: Option<&str>,
-    _min_counts: Option<f64>,
     _stream: bool,
-    _memory_budget: Option<u64>,
-    _strict_uns: bool,
-    _dense_zero_epsilon: f32,
-    _temp_dir: Option<std::path::PathBuf>,
-    _modalities: Option<Vec<String>>,
-    _modality_types: Vec<(String, scx_format_io::modality::ModalityType)>,
-    _index_obs: Vec<String>,
-    _index_var: Vec<String>,
-    _index_preset: Option<String>,
-    _index_auto_threshold: usize,
-    _bitmap: &str,
-    _reader_threads: Option<usize>,
-    _writer_queue_depth: usize,
-    _sort_by: Vec<String>,
-    _sort_reverse: bool,
-    _group_by: Option<String>,
-    _reference: Option<scx_ops::ReferenceSpec>,
-    _group_target_bytes: Option<u64>,
-    _group_max_bytes: Option<u64>,
-    _group_pass: convert::GroupPass,
+    _args: ConvertCliArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\
