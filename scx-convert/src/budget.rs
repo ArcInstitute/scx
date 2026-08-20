@@ -24,7 +24,8 @@
 //!
 //! Deliberately **not** gated on `hdf5`, for the same reason `parallel_drain`
 //! is not: this is integer arithmetic, and keeping it feature-free is what lets
-//! [`allocation_table_shares_sum_to_at_most_one_per_phase`] run in the ordinary
+//! `allocation_table_shares_sum_to_at_most_one_per_phase` (a `#[cfg(test)]`
+//! item, so deliberately not an intra-doc link) run in the ordinary
 //! `cargo test --workspace` job rather than only in the hdf5 lane. Its
 //! production callers *are* hdf5-gated, so at default features the items here
 //! are dead by construction while the tests still exercise them.

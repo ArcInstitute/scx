@@ -661,9 +661,11 @@ behind `--memory-budget` and `build-csc --memory-limit` (CLI) and the
 `memory_budget=` kwarg on `from_h5ad` / `from_h5mu`. It caps dense row
 slabs in the h5ad streaming reader, CSC external-transpose buffers when
 CSC-on-disk exceeds the budget, and the parallel streaming reader's
-worker derate. It lives in `scx-format` (re-exported as
+worker derate. It lives in `scx-format-io` (re-exported as
 `scx_convert::MemoryBudget`) so sibling crates such as `scx-ops` —
 which owns `build-csc` — can share it without a dependency cycle.
+It parses a byte count and nothing more; what a budget *buys* is the
+allocation table below.
 
 Accepted forms:
 
@@ -675,6 +677,36 @@ Decimal prefixes (`KB`, `MB`, `GB`, `TB`) are **rejected** to avoid
 1000-vs-1024 ambiguity. When the requested budget cannot fit even one
 shard's metadata plus one worker, conversion refuses to start with
 an actionable error rather than OOMing partway through.
+
+### The allocation table
+
+What a budget *buys* is declared in one place, `scx-convert/src/budget.rs`,
+rather than derived at each site. Two things were previously tangled in a
+single division and are now separate:
+
+- a **share** — what fraction of the budget one concurrent unit may claim.
+  One in-flight shard takes a quarter, which is what leaves room for the
+  derate to grant more than one worker.
+- a **cost model** — how many bytes that unit actually holds. A dense slab
+  costs 12 B per source element (the f32 slab plus the sparsified indices and
+  values, at exact capacity); a CSR shard costs 8 B/nnz plus scratch plus the
+  indptr.
+
+Reservations are declared per *phase*, and only reservations in the same phase
+are concurrent — the CSC external transpose claims half the budget for a
+column chunk in pass 1 and a quarter for bucket records in pass 2, and those
+never coexist. A unit test asserts that each phase's concurrent claims sum to
+at most the whole budget.
+
+Two claims are declared but **not enforced**: the CSC bucket count and bucket
+record buffer are sized from the *mean* nnz per row, so a right-skewed
+sequencing-depth distribution overshoots them. They are named in the table so
+the gap is visible rather than silent.
+
+Three different things are called "no budget", and they are not
+interchangeable: an unset `memory_budget` means *no cap at all*; pyscx's
+eager-materialisation path warns above 8 GiB; and the CSC sidecar builder
+defaults to 4 GiB when no budget is given.
 
 ### Ops that bound themselves without a budget knob
 
@@ -1448,11 +1480,16 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     granted count to fit a per-worker estimate; the estimate is
     delegated to the reader: sparse readers assume density 5 % (RNA
     and general) or 10 % (ATAC), times `n_vars × 16 B/nnz`; the
-    dense reader sizes the dense slab buffer
-    (`shard_target_rows × n_vars × sizeof(dtype) × 2`). When the
-    dense reader's `memory_budget`-derived slab cap is tighter than
+    dense reader sizes the dense slab buffer at
+    `shard_target_rows × n_vars × 12 B/element`. When the dense
+    reader's `memory_budget`-derived slab cap is tighter than
     `shard_target_rows`, the parallel coordinator silently clamps
     its partition to that cap (matching the sequential path).
+    The 12 B/element and the quarter-of-the-budget share both come
+    from the allocation table described under
+    [Memory budgets](#memory-budgets); the dense figure does **not**
+    scale with the source dtype width, because the resident slab is
+    f32 whatever the input was.
   - `writer_queue_depth`: backpressure window between the parallel
     encoder pool and the ordered writer. Default 4. The parallel
     coordinator caps outstanding shards (encoding + in channel + in

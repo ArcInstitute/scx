@@ -113,9 +113,10 @@ pub use h5ad::read::{
 /// working regardless of which scx-convert features are enabled.
 pub use scx_format_io::CATEGORICAL_ORDERED_KEY;
 
-// Re-exported from scx-format so existing `scx_convert::MemoryBudget`
-// call sites keep working; the parser lives in scx-format so sibling
-// crates (scx-ops) can share it without a dependency cycle.
+// Re-exported from scx-format-io so existing `scx_convert::MemoryBudget`
+// call sites keep working; the parser lives there so sibling crates
+// (scx-ops) can share it without a dependency cycle. It parses a byte
+// count and nothing more — what a budget buys is `crate::budget`.
 pub use scx_format_io::MemoryBudget;
 #[cfg(feature = "hdf5")]
 pub use stream::{CsrShardStream, MajorAxis, StreamedCsrShard};
