@@ -861,7 +861,14 @@ fn convert_min_counts_filters_rows_on_export() {
 }
 
 /// `--min-counts` on an ingest direction must fail loudly rather than being
-/// silently ignored (the option lives on the shared `ConvertOptions`).
+/// silently ignored.
+///
+/// The reason it *could* be ignored is gone: `export_min_counts` now lives on
+/// `ExportOptions`, so the CLI cannot hand it to an ingest entry point at all.
+/// This guard is `run_convert`'s own direction check, which survives the split
+/// because it fires before any I/O and names the direction -- a better message
+/// than a type error, and the only thing standing between a user and the flag
+/// on the wrong direction.
 #[test]
 fn convert_min_counts_rejected_on_import_direction() {
     let dir = tempfile::tempdir().unwrap();

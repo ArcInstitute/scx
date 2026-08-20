@@ -487,10 +487,10 @@ fn parallel_per_worker_bytes_dense_uses_dense_formula() {
     create_test_h5ad(&h5ad, 64, 40, "dense", false);
     let file = hdf5::File::open(&h5ad).unwrap();
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 32,
         memory_budget: None,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     let reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();
@@ -534,10 +534,10 @@ fn dense_max_slab_rows_clamps_partition() {
     let file = hdf5::File::open(&h5ad).unwrap();
 
     // No budget → no cap.
-    let opts_nocap = ConvertOptions {
+    let opts_nocap = IngestOptions {
         shard_target_rows: 32,
         memory_budget: None,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     let r_nocap = open_dense_streaming(&file, "X", &opts_nocap, &mut sink).unwrap();
@@ -545,10 +545,10 @@ fn dense_max_slab_rows_clamps_partition() {
     assert_eq!(indexed_nocap.max_slab_rows(), None);
 
     // Tight budget → cap fires.
-    let opts_capped = ConvertOptions {
+    let opts_capped = IngestOptions {
         shard_target_rows: 32,
         memory_budget: Some(8192),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let r_capped = open_dense_streaming(&file, "X", &opts_capped, &mut sink).unwrap();
     let indexed_capped: &dyn IndexedCsrShardStream = &r_capped;
@@ -617,9 +617,9 @@ fn parallel_export_with_layers_byte_identical() {
 
     // `include_extras = true` adds a layer alongside the main X.
     create_test_h5ad(&h5ad, 64, 9, "csr", true);
-    let import_opts = ConvertOptions {
+    let import_opts = IngestOptions {
         shard_target_rows: 8,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5ad_to_scx(&h5ad, &scx, &import_opts, &mut WarningSink::log()).unwrap();
 
@@ -738,9 +738,9 @@ fn parallel_export_h5mu_byte_identical() {
 
     // Two modalities (rna 40 × 7, adt 40 × 5); shard_size 8 → 5 shards each.
     create_test_h5mu(&h5mu_in, 40, 7, 5);
-    let import_opts = ConvertOptions {
+    let import_opts = IngestOptions {
         shard_target_rows: 8,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5mu_to_scx(&h5mu_in, &scx, &import_opts, &mut WarningSink::log()).unwrap();
 
@@ -922,7 +922,7 @@ fn parallel_export_worker_error_does_not_deadlock() {
     let h5ad_out = dir.path().join("out.h5ad");
 
     // 80 rows / shard 10 → 8 CSR shards. With the default
-    // ConvertOptions, no bitmap shards are emitted, so every `SCXS`
+    // IngestOptions, no bitmap shards are emitted, so every `SCXS`
     // magic in the file is a CSR shard header.
     make_multishard_scx(&scx_path, 80, 11, 10);
 

@@ -44,7 +44,7 @@ pub const DEFAULT_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// writer's framing for the scope of this call and restores it afterward, so CSC
 /// framing no longer depends on hidden writer state (the caller need not
 /// `set_framing` first). The caller is responsible for the file `format_version`
-/// being v4 when framing (see `ConvertOptions`/`from_anndata`).
+/// being v4 when framing (see `IngestOptions`/`from_anndata`).
 #[allow(clippy::too_many_arguments)]
 pub fn write_csc_sidecar(
     writer: &mut ScxWriter,

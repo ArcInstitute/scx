@@ -639,13 +639,13 @@ fn from_h5ad(
     let obs_shard_policy =
         scx_format_io::ObsShardPolicy::parse(shard_obs).map_err(PyValueError::new_err)?;
 
-    let opts = scx_convert::ConvertOptions {
+    let opts = scx_convert::IngestOptions {
         shard_target_rows,
         codec: explicit_codec,
         csc: csc_policy,
         csc_cols_per_shard,
         // Framing on by default (G=256); `row_group_rows=0` opts out to unframed
-        // v3. `ConvertOptions::framing()` treats `Some(0)` as unframed, but store
+        // v3. `IngestOptions::framing()` treats `Some(0)` as unframed, but store
         // None for 0 so the v4 header bump is clean.
         row_group_rows: (row_group_rows != 0).then_some(row_group_rows),
         row_group_target_nnz,

@@ -6,7 +6,7 @@
 //
 // Peak memory per shard is bounded by
 // `slab_rows × n_vars × sizeof(source_dtype)` for the dense buffer,
-// plus the sparsified CSR working set. `ConvertOptions::memory_budget`
+// plus the sparsified CSR working set. `IngestOptions::memory_budget`
 // caps `slab_rows` independently of `shard_target_rows` so dense
 // inputs with very large `n_vars` don't exceed the budget. When the
 // budget is smaller than a single dense row, `open_dense_streaming`
@@ -14,7 +14,7 @@
 
 use ndarray::s;
 
-use crate::pipeline::{ConvertError, ConvertOptions};
+use crate::pipeline::{ConvertError, IngestOptions};
 use crate::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
 use crate::warnings::WarningSink;
 
@@ -32,7 +32,7 @@ pub struct DenseXStreamReader {
     dataset: hdf5::Dataset,
     /// On-disk numeric dtype; drives the per-slab cast to f32.
     dtype: DenseDtype,
-    /// `dense_zero_epsilon` snapshot from [`ConvertOptions`].
+    /// `dense_zero_epsilon` snapshot from [`IngestOptions`].
     /// `0.0` means equality-to-zero filtering (matches scipy).
     zero_eps: f32,
     cursor: u64,
@@ -99,7 +99,7 @@ pub(crate) fn read_dense_slab_f32(
 pub fn open_dense_streaming(
     file: &hdf5::File,
     path: &str,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     _sink: &mut WarningSink,
 ) -> Result<DenseXStreamReader, ConvertError> {
     let dataset = file.dataset(path)?;
@@ -163,7 +163,7 @@ pub fn open_dense_streaming(
 pub fn open_dense_layer_streaming(
     file: &hdf5::File,
     layer_name: &str,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<DenseXStreamReader, ConvertError> {
     open_dense_streaming(file, &format!("layers/{layer_name}"), opts, sink)

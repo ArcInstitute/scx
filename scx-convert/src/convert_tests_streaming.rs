@@ -443,13 +443,13 @@ fn streaming_csc_always_emits_sidecar_matching_non_streaming() {
 
     let scx_stream = dir.path().join("stream_csc.scx");
     let scx_bulk = dir.path().join("bulk_csc.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 16,
         codec: None,
         csc: super::pipeline::CscPolicy::Always,
         csc_cols_per_shard: 5,
         tool: "scx".into(),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5ad_to_scx_streaming(
         &h5ad,
@@ -690,7 +690,7 @@ fn streaming_provenance_escapes_path_quotes() {
 
 #[test]
 fn streaming_provenance_uses_configured_tool_name() {
-    // `ConvertOptions::tool` must flow through to the provenance
+    // `IngestOptions::tool` must flow through to the provenance
     // entry verbatim — `pyscx` overrides it to "pyscx" so the
     // recorded provenance reflects the actual caller.
     let dir = tempfile::tempdir().unwrap();
@@ -821,9 +821,9 @@ fn phase1_streaming_dense_nan_retained_with_epsilon() {
     let dense = vec![f32::NAN, 0.05, 0.0, 3.0];
     write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         dense_zero_epsilon: 0.1,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let file = hdf5::File::open(&h5ad).unwrap();
     let mut reader =
@@ -1258,10 +1258,10 @@ fn phase1_streaming_dense_memory_budget_caps_slab() {
     // 4 slab rows: comfortably above the 1-row floor, comfortably below 16.
     let budget = crate::budget::SHARD_BUDGET_SHARE.min_budget_for(row_cost * 4);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         memory_budget: Some(budget),
         shard_target_rows: shard_target_rows as u32,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     let mut reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();
@@ -1292,12 +1292,12 @@ fn phase1_streaming_dense_budget_too_small_actionable_error() {
     write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 2,
         // `n_vars * 4` is 4000 bytes per row; budget = 1 byte cannot
         // fit anything.
         memory_budget: Some(1),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let err = h5ad_to_scx_streaming(
         &h5ad,
@@ -1365,10 +1365,10 @@ fn phase2_streaming_csc_external_transpose_matches_in_memory() {
 
     // 2 KiB budget — well below the in-memory threshold of
     // `16 × nnz + 16 × n_obs`, so the external route is forced.
-    let ext_opts = ConvertOptions {
+    let ext_opts = IngestOptions {
         shard_target_rows: 16,
         memory_budget: Some(2048),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
 
     h5ad_to_scx_streaming(
@@ -1442,10 +1442,10 @@ fn phase2_streaming_csc_external_unsorted_rows_per_col() {
     );
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 8,
         memory_budget: Some(1024),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5ad_to_scx_streaming(
         &h5ad,
@@ -1486,10 +1486,10 @@ fn phase2_streaming_csc_duplicate_coords_sum() {
     // here) but above the 4-record minimum (64 B) — forces the
     // external transposer which is the path that coalesces
     // duplicates.
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 8,
         memory_budget: Some(80),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     h5ad_to_scx_streaming(
@@ -1568,11 +1568,11 @@ fn phase2_streaming_csc_external_temp_cleanup_on_success() {
     create_test_h5ad(&h5ad, 12, 4, "csc", false);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         memory_budget: Some(1024),
         temp_dir: Some(scratch.clone()),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5ad_to_scx_streaming(
         &h5ad,
@@ -1603,10 +1603,10 @@ fn phase2_streaming_csc_budget_too_small_actionable_error() {
     create_test_h5ad(&h5ad, 6, 3, "csc", false);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         memory_budget: Some(1),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let err = h5ad_to_scx_streaming(
         &h5ad,
@@ -1846,9 +1846,9 @@ fn phase3_streaming_h5mu_dense_modality_non_f32_dtype() {
     create_test_h5mu_with_dense_f64_modality(&h5mu, 6, 4, 3);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log()).unwrap();
     let reader = ScxReader::open(&scx).unwrap();
@@ -1870,10 +1870,10 @@ fn phase3_streaming_h5mu_modality_filter() {
     create_test_h5mu(&h5mu, 8, 5, 3);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         modalities: Some(vec!["rna".to_string()]),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log()).unwrap();
     let reader = ScxReader::open(&scx).unwrap();
@@ -1891,10 +1891,10 @@ fn phase3_streaming_h5mu_modality_filter_unknown_errors() {
     create_test_h5mu(&h5mu, 6, 3, 2);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         modalities: Some(vec!["zzz".to_string()]),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let err = h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log())
         .expect_err("unknown modality must fail");
@@ -1918,10 +1918,10 @@ fn streaming_h5mu_csc_always_rejected() {
     create_test_h5mu(&h5mu, 8, 30, 5);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         csc: CscPolicy::Always,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let err = h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log())
         .expect_err("csc='always' must be rejected on the streaming h5mu path");
@@ -1949,10 +1949,10 @@ fn streaming_h5mu_csc_auto_warns_and_skips() {
     let h5mu = dir.path().join("cite.h5mu");
     create_test_h5mu(&h5mu, 8, 30, 5);
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         csc: CscPolicy::Auto,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     let result = h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut sink);
@@ -1989,13 +1989,13 @@ fn phase3_streaming_h5mu_modality_types_override() {
     // can tell override actually took effect). The default heuristic
     // would map "adt" → Protein. No override for rna → inference +
     // ModalityTypeInferred warning emitted for rna only.
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         modality_types: vec![(
             "adt".to_string(),
             scx_format_io::modality::ModalityType::Atac,
         )],
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut sink).unwrap();
@@ -2160,10 +2160,10 @@ fn dense_sparsify_allocates_exactly() {
         ("eps == 0", 0.0f32, 4usize),    // 1e-9, 5.0, -5.0, NaN
         ("eps > 1e-9", 1e-6f32, 3usize), // 5.0, -5.0, NaN
     ] {
-        let opts = ConvertOptions {
+        let opts = IngestOptions {
             shard_target_rows: n_obs as u32,
             dense_zero_epsilon: eps,
-            ..ConvertOptions::default()
+            ..IngestOptions::default()
         };
         let mut sink = WarningSink::log();
         let mut reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();

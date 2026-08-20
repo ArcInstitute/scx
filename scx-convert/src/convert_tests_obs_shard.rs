@@ -39,11 +39,11 @@ use crate::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
 /// Ingest options with an explicit obs-shard policy and a small
 /// `shard_target_rows`, so a modest fixture crosses the `Auto` threshold
 /// without a large-`n_obs` test.
-fn opts_with(policy: ObsShardPolicy, shard_target_rows: u32) -> ConvertOptions {
-    ConvertOptions {
+fn opts_with(policy: ObsShardPolicy, shard_target_rows: u32) -> IngestOptions {
+    IngestOptions {
         shard_target_rows,
         obs_shard_policy: policy,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     }
 }
 

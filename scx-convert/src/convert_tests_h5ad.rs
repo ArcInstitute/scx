@@ -14,7 +14,7 @@ fn test_h5ad_csr_to_scx_to_h5ad_round_trip() {
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", true);
 
     // h5ad → scx
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     // Verify scx
@@ -124,7 +124,7 @@ fn test_eager_csr_canonicalizes_messy_indices() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -219,7 +219,7 @@ fn test_eager_csr_malformed_indptr_errors_not_panics() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     let res = h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log());
     assert!(
         res.is_err(),
@@ -240,9 +240,9 @@ fn test_h5ad_raw_round_trip() {
 
     // Small shard target so raw spans multiple shards on both paths,
     // exercising the streaming coordinator + multi-shard raw assembly.
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
 
     for streaming in [false, true] {
@@ -307,7 +307,7 @@ fn raw_varm_is_dropped_with_a_warning_on_both_ingest_paths() {
 
     let dir = tempfile::tempdir().unwrap();
     let (n_obs, n_vars, raw_n_vars) = (8, 10, 17);
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
 
     for streaming in [false, true] {
         let tag = if streaming { "stream" } else { "eager" };
@@ -373,14 +373,14 @@ fn reorder_on_convert_reports_a_write_side_raw_drop_worded_for_this_door() {
         add_raw_group(&h5ad_path, n_obs, raw_n_vars);
 
         let opts = if mode == "sort_by" {
-            ConvertOptions {
+            IngestOptions {
                 sort_by: vec!["n_counts".to_string()],
-                ..ConvertOptions::default()
+                ..IngestOptions::default()
             }
         } else {
-            ConvertOptions {
+            IngestOptions {
                 group_by: Some("n_counts".to_string()),
-                ..ConvertOptions::default()
+                ..IngestOptions::default()
             }
         };
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -448,7 +448,7 @@ fn raw_without_varm_entries_emits_no_varm_warning() {
         h5ad_to_scx(
             &h5ad_path,
             &dir.path().join(format!("rawnovarm_{shape}.scx")),
-            &ConvertOptions::default(),
+            &IngestOptions::default(),
             &mut sink,
         )
         .unwrap();
@@ -470,7 +470,7 @@ fn test_tenx_to_scx() {
     let n_genes = 10;
     create_test_tenx_h5(&tenx_path, n_cells, n_genes);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     tenx_to_scx(&tenx_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -494,7 +494,7 @@ fn test_dense_x() {
     let n_vars = 8;
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "dense", false);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -515,7 +515,7 @@ fn test_csc_x() {
     let n_vars = 8;
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csc", false);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     // Compare with CSR version
@@ -660,7 +660,7 @@ fn test_eager_skips_layer_with_mismatched_shape() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     let mut sink = WarningSink::log();
     h5ad_to_scx(&path, &scx, &opts, &mut sink).unwrap();
 
@@ -756,7 +756,7 @@ fn test_eager_layer_csc_without_encoding_type_round_trips() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     let mut sink = WarningSink::log();
     h5ad_to_scx(&path, &scx, &opts, &mut sink).unwrap();
 
@@ -806,7 +806,7 @@ fn test_uns_skip_non_serializable() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -865,7 +865,7 @@ fn test_uns_2d_and_bool_round_trip() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
 
@@ -925,7 +925,7 @@ fn test_uns_length1_array_preserves_rank() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
 
@@ -1008,7 +1008,7 @@ fn test_categorical_columns() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
 
@@ -1076,7 +1076,7 @@ fn h5ad_with_int8_categorical_codes_converts() {
     h5ad_to_scx_streaming(
         &h5ad_path,
         &scx_stream,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )
@@ -1087,7 +1087,7 @@ fn h5ad_with_int8_categorical_codes_converts() {
     h5ad_to_scx(
         &h5ad_path,
         &scx_bulk,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &mut WarningSink::log(),
     )
     .expect("non-streaming convert must accept int8 categorical codes");
@@ -1152,7 +1152,7 @@ macro_rules! categorical_codes_dtype_test {
             h5ad_to_scx_streaming(
                 &h5ad_path,
                 &scx,
-                &ConvertOptions::default(),
+                &IngestOptions::default(),
                 &StreamingOverrides::default(),
                 &mut WarningSink::log(),
             )
@@ -1212,7 +1212,7 @@ macro_rules! unsigned_dataframe_column_test {
             h5ad_to_scx_streaming(
                 &h5ad_path,
                 &scx,
-                &ConvertOptions::default(),
+                &IngestOptions::default(),
                 &StreamingOverrides::default(),
                 &mut WarningSink::log(),
             )
@@ -1283,7 +1283,7 @@ fn h5ad_with_empty_float64_column_order_converts() {
     h5ad_to_scx_streaming(
         &h5ad_path,
         &scx_path,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )
@@ -1306,7 +1306,7 @@ fn test_format_detection_mismatch() {
     create_test_tenx_h5(&tenx_path, 10, 5);
 
     // Try converting as h5ad → should error with helpful message
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     let result = h5ad_to_scx(&tenx_path, &scx_path, &opts, &mut WarningSink::log());
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -1411,9 +1411,9 @@ fn test_multi_shard() {
     let n_vars = 10;
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 10,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
@@ -1508,7 +1508,7 @@ fn test_float_data_uses_zstd() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -1534,10 +1534,10 @@ fn test_h5ad_to_scx_csc_always() {
     let n_vars = 10;
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", true);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         csc: super::pipeline::CscPolicy::Always,
         csc_cols_per_shard: 4, // → ceil(10/4) = 3 CSC shards
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
@@ -1586,10 +1586,10 @@ fn test_tenx_to_scx_csc_always() {
     let n_genes = 12;
     create_test_tenx_h5(&tenx_path, n_cells, n_genes);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         csc: super::pipeline::CscPolicy::Always,
         csc_cols_per_shard: 5, // → ceil(12/5) = 3 CSC shards
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     tenx_to_scx(&tenx_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
@@ -1601,7 +1601,7 @@ fn test_tenx_to_scx_csc_always() {
     assert_eq!(dense_csc, dense_csr);
 }
 
-/// default `ConvertOptions` (csc=false) emits no CSC sidecar.
+/// default `IngestOptions` (csc=false) emits no CSC sidecar.
 #[test]
 fn test_h5ad_default_csc_off() {
     let dir = tempfile::tempdir().unwrap();
@@ -1609,7 +1609,7 @@ fn test_h5ad_default_csc_off() {
     let scx_path = dir.path().join("csr_only.scx");
     create_test_h5ad(&h5ad_path, 10, 8, "csr", true);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -1650,7 +1650,7 @@ fn test_h5mu_round_trip() {
     let scx_path = dir.path().join("cite.scx");
     create_test_h5mu(&h5mu_path, 12, 50, 10);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -1729,7 +1729,7 @@ fn test_h5mu_frames_v4_by_default() {
     let scx_path = dir.path().join("cite.scx");
     create_test_h5mu(&h5mu_path, 12, 50, 10);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     assert!(opts.framing().is_some(), "default opts should frame");
     h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
@@ -1755,7 +1755,7 @@ fn test_h5mu_row_group_rows_zero_stays_v3() {
     let scx_path = dir.path().join("cite.scx");
     create_test_h5mu(&h5mu_path, 12, 50, 10);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         row_group_rows: Some(0),
         ..Default::default()
     };
@@ -1787,7 +1787,7 @@ fn test_h5mu_streaming_frames_v4_by_default() {
     let scx_path = dir.path().join("cite.scx");
     create_test_h5mu(&h5mu_path, 12, 50, 10);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx_streaming(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -1815,7 +1815,7 @@ fn test_h5mu_per_modality_codec_routing() {
     let scx_path = dir.path().join("cite.scx");
     create_test_h5mu(&h5mu_path, 12, 50, 10);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -1880,7 +1880,7 @@ fn test_scx_to_h5mu_round_trip() {
     let h5mu_out = dir.path().join("out.h5mu");
     create_test_h5mu(&h5mu_in, 8, 30, 5);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_to_h5mu(&scx_path, &h5mu_out, &mut WarningSink::log()).unwrap();
 
@@ -1912,7 +1912,7 @@ fn test_modality_extract_to_h5ad() {
     let h5ad_out = dir.path().join("rna.h5ad");
     create_test_h5mu(&h5mu_in, 6, 40, 7);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_modality_to_h5ad(&scx_path, &h5ad_out, "rna", &mut WarningSink::log()).unwrap();
 
@@ -1937,7 +1937,7 @@ fn test_info_modality_table_exposed() {
     let scx_path = dir.path().join("cite.scx");
     create_test_h5mu(&h5mu_path, 8, 30, 5);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -1971,7 +1971,7 @@ fn test_merge_multimodal_mismatch_raises() {
     // Two multimodal files where modality b's RNA n_vars differs.
     create_test_h5mu(&h5mu_a, 6, 30, 5);
     create_test_h5mu(&h5mu_b, 6, 50, 5); // different rna n_vars
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx(&h5mu_a, &scx_a, &opts, &mut WarningSink::log()).unwrap();
     h5mu_to_scx(&h5mu_b, &scx_b, &opts, &mut WarningSink::log()).unwrap();
 
@@ -2006,7 +2006,7 @@ fn test_merge_multimodal_match_still_unsupported() {
 
     create_test_h5mu(&h5mu_a, 6, 30, 5);
     create_test_h5mu(&h5mu_b, 6, 30, 5); // matching modality structure
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx(&h5mu_a, &scx_a, &opts, &mut WarningSink::log()).unwrap();
     h5mu_to_scx(&h5mu_b, &scx_b, &opts, &mut WarningSink::log()).unwrap();
 
@@ -2039,7 +2039,7 @@ fn test_compact_multimodal_unsupported() {
     let scx_out = dir.path().join("compacted.scx");
     create_test_h5mu(&h5mu_in, 6, 20, 5);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_in, &opts, &mut WarningSink::log()).unwrap();
 
     scx_ops::compact(&scx_in, &scx_out).unwrap();
@@ -2070,7 +2070,7 @@ fn test_append_for_modality_updates_table() {
     let scx_path = dir.path().join("cite.scx");
     create_test_h5mu(&h5mu_path, 8, 20, 5);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     // Capture pre-append per-modality state.
@@ -2211,7 +2211,7 @@ fn numeric_categorical_columns_round_trip() {
     let warnings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let w = Arc::clone(&warnings);
     let mut sink = WarningSink::with_handler(move |x| w.lock().unwrap().push(format!("{x:?}")));
-    h5ad_to_scx(&h5ad_path, &scx_path, &ConvertOptions::default(), &mut sink).unwrap();
+    h5ad_to_scx(&h5ad_path, &scx_path, &IngestOptions::default(), &mut sink).unwrap();
     let warns = warnings.lock().unwrap().join("\n");
     assert!(
         !warns.contains("int_cat") && !warns.contains("\"lvl\""),
@@ -2374,7 +2374,7 @@ fn none_uns_scalar_round_trips_as_null() {
     h5ad_to_scx(
         &h5ad_path,
         &scx_path,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &mut WarningSink::log(),
     )
     .unwrap();
@@ -2488,7 +2488,7 @@ fn test_obsm_dataframe_sparse_warn_and_f16_upcast() {
 
     // h5ad → scx must SUCCEED (B5: no fatal abort) and warn for the two
     // unconvertible obsm members (B4).
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     let mut sink = WarningSink::log();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
     assert_eq!(
@@ -2552,7 +2552,7 @@ fn test_obs_float16_column_upcasts_to_f32() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     let mut sink = WarningSink::log();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
     assert_eq!(
@@ -2620,7 +2620,7 @@ fn uns_nonfinite_floats_round_trip() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
 
@@ -2692,7 +2692,7 @@ fn uns_3d_arrays_round_trip() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     let mut sink = WarningSink::log();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
     assert_eq!(
@@ -2765,7 +2765,7 @@ fn uns_sparse_matrix_emits_warning() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     let mut sink = WarningSink::log();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
     assert_eq!(
@@ -2821,7 +2821,7 @@ fn uns_2d_nonfinite_float_round_trips() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
 
@@ -2868,7 +2868,7 @@ fn uns_f16_array_round_trips() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
 

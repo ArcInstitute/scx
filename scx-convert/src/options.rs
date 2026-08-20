@@ -1,6 +1,6 @@
 //! Direction-specific conversion options (ORG-11.16-3).
 //!
-//! `ConvertOptions` used to carry both directions' knobs, which meant an
+//! `IngestOptions` used to carry both directions' knobs, which meant an
 //! export-only field could be *set* on an ingest call. Nothing in the type
 //! could say otherwise, so a runtime helper policed it instead:
 //! `reject_export_row_filter_on_import`, called at the top of all five ingest
@@ -30,9 +30,9 @@
 /// can assert it — only a `compile_fail` doctest can:
 ///
 /// ```compile_fail
-/// # use scx_convert::ConvertOptions;
+/// # use scx_convert::IngestOptions;
 /// // `export_min_counts` is not a field of the ingest options.
-/// let _ = ConvertOptions {
+/// let _ = IngestOptions {
 ///     export_min_counts: Some(5.0),
 ///     ..Default::default()
 /// };
@@ -55,22 +55,22 @@
 ///
 /// Deliberately **no** `Debug` derive: `export_obs_keep_mask` holds one bool
 /// per cell in the global obs row space, and a `{:?}` of an atlas-scale mask on
-/// an error path is a denial of service. `ConvertOptions` does not derive it
+/// an error path is a denial of service. `IngestOptions` does not derive it
 /// either.
 #[derive(Clone)]
 pub struct ExportOptions {
     /// Provenance tool name recorded in the exported `uns["scx_export"]`.
-    /// Shared with [`crate::ConvertOptions::tool`].
+    /// Shared with [`crate::IngestOptions::tool`].
     pub tool: String,
     /// Byte budget for the export reader pool. Shared with
-    /// [`crate::ConvertOptions::memory_budget`].
+    /// [`crate::IngestOptions::memory_budget`].
     pub memory_budget: Option<u64>,
     /// Export-side shard-decode worker count; `None` resolves to
     /// `RAYON_NUM_THREADS` or `available_parallelism`. Shared with
-    /// [`crate::ConvertOptions::reader_threads`].
+    /// [`crate::IngestOptions::reader_threads`].
     pub reader_threads: Option<usize>,
     /// Backpressure window between the decode pool and the HDF5 writer.
-    /// Shared with [`crate::ConvertOptions::writer_queue_depth`].
+    /// Shared with [`crate::IngestOptions::writer_queue_depth`].
     pub writer_queue_depth: usize,
     /// Caller-supplied obs keep mask, in the **global / physical** obs row
     /// space — its length must equal the file header's `n_obs`, not the
@@ -104,7 +104,7 @@ impl ExportOptions {
     /// True when any caller-supplied export row filter is set.
     ///
     /// The export path uses it to decide whether to record filter provenance.
-    /// It no longer has a second job: on `ConvertOptions` this also answered
+    /// It no longer has a second job: on `IngestOptions` this also answered
     /// "should an ingest entry point refuse this?", a question the split
     /// deletes rather than answers.
     pub fn has_export_row_filter(&self) -> bool {

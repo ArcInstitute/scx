@@ -116,7 +116,7 @@ impl From<crate::parallel_drain::DrainFailure> for ConvertError {
 }
 
 #[derive(Clone)]
-pub struct ConvertOptions {
+pub struct IngestOptions {
     pub shard_target_rows: u32,
     /// Explicit codec override. None = auto-select based on value distribution.
     pub codec: Option<CodecId>,
@@ -423,7 +423,7 @@ pub use scx_format_io::BitmapPolicy;
 /// `scx-convert` get the CSC policy type without an explicit `scx-format` dep.
 pub use scx_format_io::CscPolicy;
 
-impl ConvertOptions {
+impl IngestOptions {
     /// Build the row-group [`FramingConfig`] for the shard emitters, or `None`
     /// for the unframed (v3) layout. Framing is active iff `row_group_rows` is set
     /// to a value > 0; `Some(0)` is the explicit unframed opt-out (v3 output).
@@ -493,9 +493,9 @@ pub fn codec_selection_json(
     serde_json::json!({ "profile": profile })
 }
 
-impl Default for ConvertOptions {
+impl Default for IngestOptions {
     fn default() -> Self {
-        ConvertOptions {
+        IngestOptions {
             shard_target_rows: 16384,
             codec: None,
             csc: CscPolicy::Off,
@@ -535,7 +535,7 @@ impl Default for ConvertOptions {
 }
 
 /// Write the obs table for an ingest, sharded or not per
-/// [`ConvertOptions::obs_shard_policy`].
+/// [`IngestOptions::obs_shard_policy`].
 ///
 /// Every `scx-convert` ingest path funnels through here — the eager and
 /// streaming h5ad routes, 10x, and both h5mu routes — so the threshold is
@@ -556,7 +556,7 @@ impl Default for ConvertOptions {
 pub(crate) fn write_ingest_obs(
     writer: &mut ScxWriter,
     obs: &RecordBatch,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
 ) -> Result<(), ConvertError> {
     let reshape = opts
         .obs_shard_policy
@@ -712,7 +712,7 @@ fn build_and_write_predicate_indexes(
     var: &RecordBatch,
     csr_row_ranges: &[(u64, u64)],
     n_vars: usize,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     // Sort-on-convert: extra obs columns to force-index (the sort key) so its
     // now-contiguous `shard_ranges` are emitted. Merged into `index_obs`,
     // deduped, order preserved.
@@ -878,7 +878,7 @@ pub(crate) fn process_predicate_index_outcomes(
 pub fn h5ad_to_scx(
     input: &Path,
     output: &Path,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     // Reorder-on-convert (`--sort-by` / `--group-by`) runs only on the streaming
@@ -1108,7 +1108,7 @@ pub fn h5ad_to_scx(
 pub fn tenx_to_scx(
     input: &Path,
     output: &Path,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let file = hdf5::File::open(input)?;
@@ -1329,7 +1329,7 @@ fn h5ad_has_obsp_members(file: &hdf5::File) -> bool {
 pub fn h5ad_to_scx_streaming(
     input: &Path,
     output: &Path,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     overrides: &StreamingOverrides,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
@@ -1914,7 +1914,7 @@ pub fn h5ad_to_scx_streaming(
 fn convert_then_sort_grouped(
     input: &Path,
     output: &Path,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     overrides: &StreamingOverrides,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
@@ -1930,7 +1930,7 @@ fn convert_then_sort_grouped(
     let stem = output.file_name().and_then(|s| s.to_str()).unwrap_or("out");
     let tmp = parent.join(format!(".{stem}.grouptmp.scx"));
 
-    let plain_opts = ConvertOptions {
+    let plain_opts = IngestOptions {
         group_by: None,
         reference: None,
         group_target_bytes: None,
@@ -1960,7 +1960,7 @@ fn convert_then_sort_grouped(
         // Carry this convert's own codec intent into the grouping sort, so
         // `scx convert --group-by --codec auto` gets the same adaptive
         // per-shard selection as the ungrouped path. Reconstructed from the
-        // fields `resolve_codec` populated on `ConvertOptions` rather than
+        // fields `resolve_codec` populated on `IngestOptions` rather than
         // collapsed to Auto-or-explicit, which is what dropped `decode_target`
         // and left the grouped path on the `fast` heuristic.
         codec: scx_format_io::ResolvedCodec {
@@ -2033,7 +2033,7 @@ fn convert_then_sort_grouped(
 pub fn streaming_writer_coordinator(
     reader: &mut dyn CsrShardStream,
     writer: &mut ScxWriter,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     index_dtype: u8,
     n_vars_u32: u32,
     section_type: SectionType,
@@ -2161,7 +2161,7 @@ struct EncodedShardOutput {
 fn streaming_writer_coordinator_parallel(
     reader: &dyn crate::stream::IndexedCsrShardStream,
     writer: &mut ScxWriter,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     index_dtype: u8,
     n_vars_u32: u32,
     section_type: SectionType,
@@ -2387,7 +2387,7 @@ fn encode_one_shard_worker(
 pub fn run_streaming_writer_coordinator(
     reader: &mut dyn CsrShardStream,
     writer: &mut ScxWriter,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     index_dtype: u8,
     n_vars_u32: u32,
     section_type: SectionType,
@@ -2610,7 +2610,7 @@ pub fn run_streaming_writer_coordinator(
 fn streaming_writer_coordinator_ranges(
     reader: &dyn crate::stream::IndexedCsrShardStream,
     writer: &mut ScxWriter,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     index_dtype: u8,
     n_vars_u32: u32,
     section_type: SectionType,
@@ -2894,7 +2894,7 @@ fn ingest_raw_if_present(
     file: &hdf5::File,
     writer: &mut ScxWriter,
     n_obs: usize,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let Some(((indptr, indices, data, raw_n_obs, raw_n_vars), raw_var)) =
@@ -2938,7 +2938,7 @@ fn ingest_raw_streaming(
     file: &hdf5::File,
     writer: &mut ScxWriter,
     n_obs: usize,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     if file.group("raw").is_err() {
@@ -3690,10 +3690,10 @@ mod default_framing_tests {
     use super::*;
 
     /// Phase C: the convert default frames at `DEFAULT_ROW_GROUP_ROWS` (256), so
-    /// a plain `ConvertOptions::default()` yields an active framing config.
+    /// a plain `IngestOptions::default()` yields an active framing config.
     #[test]
     fn default_convert_options_frame_at_256() {
-        let opts = ConvertOptions::default();
+        let opts = IngestOptions::default();
         assert_eq!(
             opts.row_group_rows,
             Some(scx_format_io::DEFAULT_ROW_GROUP_ROWS)
@@ -3708,7 +3708,7 @@ mod default_framing_tests {
     /// `framing()` returns None so the pipeline keeps the legacy layout.
     #[test]
     fn zero_row_group_rows_opts_out_of_framing() {
-        let opts = ConvertOptions {
+        let opts = IngestOptions {
             row_group_rows: Some(0),
             ..Default::default()
         };

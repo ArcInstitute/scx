@@ -51,7 +51,7 @@ fn build_index_options(
         index_obs: index_obs.unwrap_or_default(),
         index_var: index_var.unwrap_or_default(),
         index_preset,
-        // 1000 mirrors `scx-convert::pipeline::ConvertOptions::default`.
+        // 1000 mirrors `scx-convert::pipeline::IngestOptions::default`.
         index_auto_threshold: index_auto_threshold.unwrap_or(1000),
     })
 }

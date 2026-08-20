@@ -428,7 +428,7 @@ fn h5ad_to_scx_streaming_preserves_obs_var_names() {
     h5ad_to_scx_streaming(
         &h5ad_path,
         &scx_path,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )

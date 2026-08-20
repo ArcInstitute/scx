@@ -20,13 +20,13 @@ use byteorder::{LittleEndian, WriteBytesExt};
 
 use super::read::{read_i64_dataset, read_x_matrix_at};
 use super::stream::{read_slice_f32, read_slice_i32};
-use crate::pipeline::{ConvertError, ConvertOptions};
+use crate::pipeline::{ConvertError, IngestOptions};
 use crate::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
 use crate::warnings::WarningSink;
 
 /// Open a CSC-on-disk matrix as a [`CsrShardStream`]. Picks the
 /// in-memory or external-memory route based on
-/// [`ConvertOptions::memory_budget`]:
+/// [`IngestOptions::memory_budget`]:
 ///
 /// - `None` or `Some(budget)` where the materialised CSR working set
 ///   (≈ `16 × nnz + 16 × n_obs` bytes) fits → in-memory.
@@ -38,7 +38,7 @@ use crate::warnings::WarningSink;
 pub fn open_csc_streaming(
     file: &hdf5::File,
     path: &str,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<Box<dyn CsrShardStream>, ConvertError> {
     let group = file.group(path)?;
@@ -109,7 +109,7 @@ pub fn open_csc_streaming(
 pub fn open_csc_layer_streaming(
     file: &hdf5::File,
     layer_name: &str,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<Box<dyn CsrShardStream>, ConvertError> {
     open_csc_streaming(file, &format!("layers/{layer_name}"), opts, sink)

@@ -39,7 +39,7 @@ use crate::h5ad::csc_stream::open_csc_streaming;
 use crate::h5ad::dense_stream::{open_dense_streaming, read_dense_slab_f32, DenseDtype};
 use crate::h5ad::read::{read_dataframe_group, read_layers_at, read_obsm_at, read_x_matrix_at};
 use crate::h5ad::stream::{open_x_streaming, read_slice_f32};
-use crate::pipeline::{ConvertError, ConvertOptions, CscPolicy};
+use crate::pipeline::{ConvertError, CscPolicy, IngestOptions};
 use crate::stream::CsrShardStream;
 use crate::warnings::{ConvertWarning, WarningSink};
 
@@ -58,7 +58,7 @@ pub fn is_h5mu_file(file: &hdf5::File) -> bool {
 /// Convert-time grouping (`--group-by`) is single-modality
 /// only. Reject it on h5mu input rather than silently emit an ungrouped file —
 /// multimodal grouping (per-modality emission over one shared obs order).
-fn reject_group_by_multimodal(opts: &ConvertOptions) -> Result<(), ConvertError> {
+fn reject_group_by_multimodal(opts: &IngestOptions) -> Result<(), ConvertError> {
     if opts.group_by.is_some() {
         return Err(ConvertError::Other(
             "convert --group-by is not supported on multimodal (h5mu) inputs (Phase 7.5); \
@@ -69,7 +69,7 @@ fn reject_group_by_multimodal(opts: &ConvertOptions) -> Result<(), ConvertError>
     Ok(())
 }
 
-fn emit_multimodal_index_skip_warning(opts: &ConvertOptions, sink: &mut WarningSink) {
+fn emit_multimodal_index_skip_warning(opts: &IngestOptions, sink: &mut WarningSink) {
     if opts.index_obs.is_empty() && opts.index_var.is_empty() && opts.index_preset.is_none() {
         return;
     }
@@ -90,7 +90,7 @@ fn emit_multimodal_index_skip_warning(opts: &ConvertOptions, sink: &mut WarningS
 /// inference is visible in provenance and the CLI summary.
 pub(crate) fn resolve_modality_type(
     name: &str,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> ModalityType {
     if let Some((_, t)) = opts.modality_types.iter().find(|(n, _)| n == name) {
@@ -202,7 +202,7 @@ fn read_modality_header_meta(
 pub fn h5mu_to_scx(
     input: &Path,
     output: &Path,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let file = hdf5::File::open(input)?;
@@ -429,7 +429,7 @@ pub fn h5mu_to_scx(
 pub fn h5mu_to_scx_streaming(
     input: &Path,
     output: &Path,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let file = hdf5::File::open(input)?;

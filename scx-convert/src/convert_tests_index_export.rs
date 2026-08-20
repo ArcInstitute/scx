@@ -9,9 +9,9 @@ fn convert_with_index_obs_writes_predicate_index() {
     let scx_path = dir.path().join("output.scx");
     create_test_h5ad_with_cell_type(&h5ad_path, 10, 5);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         index_obs: vec!["cell_type".to_string()],
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
@@ -39,9 +39,9 @@ fn convert_with_unknown_forced_index_column_errors() {
     let scx_path = dir.path().join("output.scx");
     create_test_h5ad_with_cell_type(&h5ad_path, 6, 4);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         index_obs: vec!["nonexistent_column".to_string()],
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     let err = h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap_err();
@@ -59,9 +59,9 @@ fn convert_with_preset_missing_column_warns() {
     let scx_path = dir.path().join("output.scx");
     create_test_h5ad_with_cell_type(&h5ad_path, 6, 4);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         index_preset: Some("cellxgene".to_string()),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let counter = std::sync::Arc::new(std::sync::Mutex::new(0u64));
     let counter_clone = counter.clone();
@@ -107,9 +107,9 @@ fn unknown_index_preset_name_errors() {
     let scx_path = dir.path().join("output.scx");
     create_test_h5ad_with_cell_type(&h5ad_path, 4, 3);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         index_preset: Some("does_not_exist".to_string()),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     let err = h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap_err();
@@ -127,9 +127,9 @@ fn convert_with_index_var_writes_predicate_index() {
     let scx_path = dir.path().join("output.scx");
     create_test_h5ad_with_cell_type(&h5ad_path, 8, 6);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         index_var: vec!["feature_type".to_string()],
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
@@ -175,9 +175,9 @@ fn convert_with_forced_missing_var_column_errors() {
     let scx_path = dir.path().join("output.scx");
     create_test_h5ad_with_cell_type(&h5ad_path, 4, 3);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         index_var: vec!["no_such_var_column".to_string()],
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     let err = h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap_err();
@@ -206,9 +206,9 @@ fn convert_h5mu_with_index_obs_emits_skip_warning() {
     let scx_path = dir.path().join("output.scx");
     create_test_h5mu(&h5mu_path, 6, 4, 3);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         index_obs: vec!["cell_type".to_string()],
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let saw_skip = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let saw_skip_clone = saw_skip.clone();
@@ -245,9 +245,9 @@ fn convert_with_bitmap_always_emits_section() {
     let scx_path = dir.path().join("output.scx");
     create_test_h5ad(&h5ad_path, 8, 4, "csr", false);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         bitmap: super::pipeline::BitmapPolicy::Always,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
@@ -301,9 +301,9 @@ fn convert_with_bitmap_auto_dense_skips() {
     let scx_path = dir.path().join("output.scx");
     create_test_h5ad(&h5ad_path, 8, 4, "csr", false);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         bitmap: super::pipeline::BitmapPolicy::Auto,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let counter = std::sync::Arc::new(std::sync::Mutex::new(0u64));
     let counter_clone = counter.clone();
@@ -332,7 +332,7 @@ fn bitmap_off_default_no_section() {
     let scx_path = dir.path().join("output.scx");
     create_test_h5ad(&h5ad_path, 6, 4, "csr", false);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     let mut sink = WarningSink::log();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
     let reader = ScxReader::open(&scx_path).unwrap();
@@ -356,7 +356,7 @@ fn test_h5ad_csr_to_scx_to_h5ad_streaming_round_trip() {
     let n_vars = 15;
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", true);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     scx_to_h5ad_streaming(
@@ -460,7 +460,7 @@ fn test_scx_to_h5mu_streaming_round_trip() {
     let h5mu_out = dir.path().join("out.h5mu");
     create_test_h5mu(&h5mu_in, 8, 30, 5);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_to_h5mu_streaming(
         &scx_path,
@@ -520,7 +520,7 @@ fn test_h5ad_streaming_multi_shard_round_trip() {
     let n_vars = 12;
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 7, // 5 shards for 32 rows
         ..Default::default()
     };
@@ -595,7 +595,7 @@ fn test_h5ad_streaming_with_deletion_vectors() {
     let n_vars: usize = 8;
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     // Mark rows 1, 3, 7 deleted; 7 kept rows remain.
@@ -663,7 +663,7 @@ fn test_modality_extract_to_h5ad_streaming() {
     let h5ad_out = dir.path().join("rna.h5ad");
     create_test_h5mu(&h5mu_in, 6, 40, 7);
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_modality_to_h5ad_streaming(
         &scx_path,
@@ -723,7 +723,7 @@ fn test_boolean_round_trip_via_streaming_export() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     scx_to_h5ad_streaming(
         &scx_path,
@@ -824,7 +824,7 @@ fn test_categorical_wide_round_trip() {
             .unwrap();
     }
 
-    let opts = ConvertOptions::default();
+    let opts = IngestOptions::default();
     h5ad_to_scx(&h5ad_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
     // This is the call that previously failed at HDF5's attribute

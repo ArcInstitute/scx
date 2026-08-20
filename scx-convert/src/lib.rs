@@ -127,7 +127,7 @@ pub use warnings::{ConvertWarning, WarningSink};
 pub use scx_format_io::CscPolicy;
 
 /// Strategy for realizing convert-time grouping (`--group-pass`). See
-/// [`pipeline::ConvertOptions::group_pass`]. Defined at the crate root (not in
+/// [`pipeline::IngestOptions::group_pass`]. Defined at the crate root (not in
 /// the hdf5-gated `pipeline` module) because the CLI's non-hdf5 build path
 /// parses and threads it before dispatch, like [`CscPolicy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -168,7 +168,7 @@ pub mod pipeline;
 pub use pipeline::{
     codec_selection_json, h5ad_to_scx, h5ad_to_scx_streaming, run_streaming_writer_coordinator,
     scx_to_h5ad, scx_to_h5ad_streaming, streaming_writer_coordinator, tenx_to_scx, BitmapPolicy,
-    ConvertError, ConvertOptions, StreamingOverrides,
+    ConvertError, IngestOptions, StreamingOverrides,
 };
 
 #[cfg(feature = "hdf5")]

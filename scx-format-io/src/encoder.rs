@@ -387,7 +387,7 @@ pub struct FramingConfig {
 /// is 1.4–2.1× faster for scattered/training reads on multi-shard files, so 256
 /// is the scatter-friendly middle between decode latency and block-index size.
 /// This is the single chokepoint shared by every framed-by-default write site
-/// (`ConvertOptions::default`, the CLI `--row-group-rows` default, and the pyscx
+/// (`IngestOptions::default`, the CLI `--row-group-rows` default, and the pyscx
 /// `from_*` defaults); a plain `codec="auto"` write frames at this G (framing is
 /// codec-agnostic — see the encoder's framing branch), so it costs no extra
 /// encode work. Pass `row_group_rows = 0` to opt out (unframed v3 output).

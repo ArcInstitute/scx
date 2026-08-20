@@ -1,5 +1,5 @@
 //! Integration tests for the caller-supplied export row filter
-//! (`ConvertOptions::export_obs_keep_mask` / `export_min_counts`).
+//! (`IngestOptions::export_obs_keep_mask` / `export_min_counts`).
 //!
 //! The invariants worth pinning, in rough order of how badly a regression
 //! would hurt:
@@ -23,7 +23,7 @@ fn build_scx(dir: &Path, n_obs: usize, n_vars: usize, extras: bool) -> std::path
     h5ad_to_scx(
         &h5ad,
         &scx,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &mut WarningSink::log(),
     )
     .unwrap();
@@ -348,7 +348,7 @@ fn modality_scoped_export_records_provenance_and_filters() {
     crate::h5mu::pipeline::h5mu_to_scx(
         &h5mu,
         &scx,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &mut WarningSink::log(),
     )
     .unwrap();
@@ -386,7 +386,7 @@ fn unfiltered_modality_export_writes_no_provenance() {
     crate::h5mu::pipeline::h5mu_to_scx(
         &h5mu,
         &scx,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &mut WarningSink::log(),
     )
     .unwrap();

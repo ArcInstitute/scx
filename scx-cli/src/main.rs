@@ -1981,7 +1981,7 @@ fn run_convert(
 
     // Parse `--memory-budget` once here so an invalid value fails the
     // command before we touch the file. Empty string and `None` both
-    // mean "use default heuristics" (= `ConvertOptions::memory_budget = None`).
+    // mean "use default heuristics" (= `IngestOptions::memory_budget = None`).
     // The parser lives behind scx-convert's `hdf5` feature gate; the
     // non-hdf5 CLI stub never reaches the dispatch, so silently drop
     // the budget there (it would be unused anyway).
@@ -2207,7 +2207,7 @@ fn dispatch_convert(
     group_max_bytes: Option<u64>,
     group_pass: convert::GroupPass,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use convert::{BitmapPolicy, ConvertError, ConvertOptions};
+    use convert::{BitmapPolicy, ConvertError, IngestOptions};
     use indicatif::{ProgressBar, ProgressStyle};
     let bitmap_policy = BitmapPolicy::parse(bitmap).map_err(|e| e.to_string())?;
 
@@ -2232,7 +2232,7 @@ fn dispatch_convert(
     // cannot drift on what `auto` means.
     let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(shard_obs)?;
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: shard_size,
         codec: explicit_codec,
         csc: csc_policy,

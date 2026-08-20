@@ -34,7 +34,7 @@ fn eager_h5ad_ingest_output_is_unchanged() {
     super::h5ad_to_scx(
         &h5ad,
         &scx,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &mut WarningSink::log(),
     )
     .unwrap();
@@ -54,13 +54,13 @@ fn streaming_h5ad_ingest_output_is_unchanged() {
     let h5ad = dir.path().join("in.h5ad");
     create_test_h5ad(&h5ad, 64, 13, "csr", true);
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         reader_threads: Some(1),
         writer_queue_depth: 2,
         index_obs: vec!["n_counts".to_string()],
         obs_shard_policy: scx_format_io::ObsShardPolicy::Always,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     super::h5ad_to_scx_streaming(
         &h5ad,
@@ -97,7 +97,7 @@ fn export_round_trip_output_is_unchanged() {
     super::h5ad_to_scx(
         &h5ad,
         &scx,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &mut WarningSink::log(),
     )
     .unwrap();
@@ -118,9 +118,36 @@ fn export_round_trip_output_is_unchanged() {
     super::h5ad_to_scx(
         &exported,
         &back,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &mut WarningSink::log(),
     )
     .unwrap();
     assert_matches_golden(&back, &golden("export_round_trip"), Strictness::Content).unwrap();
+}
+
+/// The four fields both directions read are declared on both structs, and this
+/// is what stops them drifting.
+///
+/// It is the whole price of choosing two flat structs over a nested
+/// `CommonOptions`. Of the three ways the duplicated declarations could
+/// diverge, only one can hurt a caller: a divergent **default**, which changes
+/// behaviour silently. A divergent type is a compile error at the one site that
+/// cares, and a divergent doc comment is cosmetic. So this pins the defaults
+/// and nothing else — six lines against the ~83 extra edit sites nesting would
+/// have cost, 39 of them in `..Default::default()` literals where a dropped
+/// initializer compiles.
+#[test]
+fn shared_option_defaults_agree_across_directions() {
+    let ingest = IngestOptions::default();
+    let export = ExportOptions::default();
+    assert_eq!(ingest.tool, export.tool, "tool");
+    assert_eq!(ingest.memory_budget, export.memory_budget, "memory_budget");
+    assert_eq!(
+        ingest.reader_threads, export.reader_threads,
+        "reader_threads"
+    );
+    assert_eq!(
+        ingest.writer_queue_depth, export.writer_queue_depth,
+        "writer_queue_depth"
+    );
 }

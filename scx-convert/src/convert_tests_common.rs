@@ -34,7 +34,7 @@ pub(crate) use super::dtype::detect_value_encoding;
 
 pub(crate) use super::options::ExportOptions;
 pub(crate) use super::pipeline::{
-    h5ad_to_scx, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions,
+    h5ad_to_scx, scx_to_h5ad, tenx_to_scx, ConvertError, IngestOptions,
 };
 pub(crate) use crate::GroupPass;
 
@@ -774,14 +774,14 @@ pub(crate) fn drain_streaming(
 // multi-layer round-trips are the load-bearing cases.
 // -----------------------------------------------------------------------
 
-pub(crate) fn streaming_opts(shard_size: u32) -> ConvertOptions {
-    ConvertOptions {
+pub(crate) fn streaming_opts(shard_size: u32) -> IngestOptions {
+    IngestOptions {
         shard_target_rows: shard_size,
         codec: None,
         csc: super::pipeline::CscPolicy::Off,
         csc_cols_per_shard: 5000,
         tool: "scx".into(),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     }
 }
 
@@ -1076,9 +1076,9 @@ pub(crate) fn make_multishard_scx(scx_path: &Path, n_obs: usize, n_vars: usize, 
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("src.h5ad");
     create_test_h5ad(&h5ad, n_obs, n_vars, "csr", false);
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: shard_size,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5ad_to_scx(&h5ad, scx_path, &opts, &mut WarningSink::log()).unwrap();
 }
