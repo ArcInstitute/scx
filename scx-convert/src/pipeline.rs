@@ -968,6 +968,7 @@ pub fn h5ad_to_scx(
             value_encoding,
             codec_id,
             opts.csc_cols_per_shard,
+            opts.memory_budget,
             opts.framing(),
         )?;
     }
@@ -1192,6 +1193,7 @@ pub fn tenx_to_scx(
             value_encoding,
             codec_id,
             opts.csc_cols_per_shard,
+            opts.memory_budget,
             opts.framing(),
         )?;
     }
@@ -1897,7 +1899,7 @@ pub fn h5ad_to_scx_streaming(
         scx_ops::rebuild_csc_inplace(
             output,
             opts.csc_cols_per_shard,
-            "4G",
+            &crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
             opts.framing_preserving_codec(),
         )
         .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
@@ -2004,7 +2006,7 @@ fn convert_then_sort_grouped(
             scx_ops::rebuild_csc_inplace(
                 output,
                 opts.csc_cols_per_shard,
-                "4G",
+                &crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
                 opts.framing_preserving_codec(),
             )
             .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
@@ -2688,6 +2690,11 @@ fn write_csc_shards_from_csr(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     csc_cols_per_shard: usize,
+    // Caller's `memory_budget`; capped at the sidecar builder's own default by
+    // `budget::csc_sidecar_bytes`. Threaded rather than defaulted because the
+    // bound is on the emitted shard's column count, so ignoring it silently let
+    // a `--memory-budget 512M --csc always` convert claim 4 GiB.
+    memory_budget: Option<u64>,
     framing: Option<scx_format_io::FramingConfig>,
 ) -> Result<(), ConvertError> {
     // Wrap the canonical in-memory CSR as a single ScxCsr "shard"
@@ -2734,7 +2741,7 @@ fn write_csc_shards_from_csr(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+        crate::budget::csc_sidecar_bytes(memory_budget) as usize,
         None,
         framing,
     )?;

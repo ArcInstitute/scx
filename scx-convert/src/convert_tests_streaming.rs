@@ -2196,3 +2196,57 @@ fn dense_sparsify_allocates_exactly() {
         );
     }
 }
+
+/// The CSC sidecar builder receives the caller's `memory_budget`, capped at its
+/// own 4 GiB default.
+///
+/// `write_csc_sidecar` documents its bound as "`cols_per_shard` or
+/// `memory_budget_bytes`, whichever is smaller", and `pipeline.rs` documented
+/// the convert side the same way — but all three convert call sites passed the
+/// 4 GiB default unconditionally, so `--memory-budget 512M --csc always` let
+/// sidecar generation claim 4 GiB regardless. The doc was true of the callee and
+/// false of every caller.
+///
+/// Observable through the emitted shard count: a budget tight enough to bound
+/// the column chunk below `csc_cols_per_shard` must produce **more** CSC shards
+/// than an unbounded one. Asserting `>` rather than an exact count keeps this
+/// about the budget arriving, not about the transpose's chunking arithmetic.
+#[test]
+fn csc_sidecar_honours_memory_budget() {
+    use crate::pipeline::h5ad_to_scx;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("csc_budget.h5ad");
+    // Enough columns that the chunker has room to split.
+    create_test_h5ad(&h5ad, 64, 400, "csr", false);
+
+    let mut counts = Vec::new();
+    for (label, budget) in [("unbounded", None), ("tight", Some(64_000u64))] {
+        let out = dir.path().join(format!("{label}.scx"));
+        let opts = IngestOptions {
+            csc: super::pipeline::CscPolicy::Always,
+            csc_cols_per_shard: 400, // never the binding constraint here
+            memory_budget: budget,
+            ..IngestOptions::default()
+        };
+        h5ad_to_scx(&h5ad, &out, &opts, &mut WarningSink::log()).unwrap();
+        let r = ScxReader::open(&out).unwrap();
+        let n = r
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == FmtSectionType::CscShard)
+            .count();
+        assert!(n >= 1, "{label}: expected at least one CSC shard");
+        counts.push((label, n));
+    }
+
+    let unbounded = counts[0].1;
+    let tight = counts[1].1;
+    assert!(
+        tight > unbounded,
+        "a tight memory_budget did not reach the CSC sidecar builder: \
+         unbounded gave {unbounded} shard(s), 64_000 bytes gave {tight}. \
+         Equal counts mean the call site is still passing the 4 GiB default."
+    );
+}

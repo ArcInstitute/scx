@@ -354,6 +354,7 @@ pub fn h5mu_to_scx(
                 value_encoding,
                 codec_id,
                 opts.csc_cols_per_shard,
+                opts.memory_budget,
                 opts.framing(),
             )?;
         }
@@ -964,6 +965,10 @@ fn write_modality_csc_shards_from_csr(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     csc_cols_per_shard: usize,
+    // Same threading as the single-modality sibling in `pipeline.rs`: the bound
+    // is on the emitted shard's column count, so passing the builder's 4 GiB
+    // default here made `--memory-budget` inert for multimodal sidecars too.
+    memory_budget: Option<u64>,
     framing: Option<scx_format_io::FramingConfig>,
 ) -> Result<(), ConvertError> {
     // Multimodal data arrives already canonical from upstream, so wrap it
@@ -983,7 +988,7 @@ fn write_modality_csc_shards_from_csr(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+        crate::budget::csc_sidecar_bytes(memory_budget) as usize,
         Some(modality_id),
         framing, // frame the CSC sidecar to match the v4 default (None = v3)
     )?;

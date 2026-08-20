@@ -4,11 +4,19 @@
 // `target_rows` rows at a time and sparsifying each slab into a
 // [`StreamedCsrShard`].
 //
-// Peak memory per shard is bounded by
-// `slab_rows × n_vars × sizeof(source_dtype)` for the dense buffer,
-// plus the sparsified CSR working set. `IngestOptions::memory_budget`
-// caps `slab_rows` independently of `shard_target_rows` so dense
-// inputs with very large `n_vars` don't exceed the budget. When the
+// Peak memory for one `read_range` is `slab_rows × n_vars ×
+// crate::budget::dense_peak_bytes_per_elem(dtype)` — 12 B/element, and
+// deliberately NOT keyed to `sizeof(source_dtype)`: the resident slab is f32
+// whatever the input was, and the sparsified output does not depend on the
+// source width at all. Sizing by the source width is the bug the `/4` here used
+// to have (it under-reserved 3x for `u8`), so do not reintroduce that shape.
+// `IngestOptions::memory_budget` caps `slab_rows` independently of
+// `shard_target_rows` so dense inputs with very large `n_vars` stay inside
+// their share of the budget.
+//
+// ⚠️ That bound covers the READER phase only. The worker calling it also holds
+// the encoded shard alongside the raw CSR — see the `enforced: false` note on
+// the ingest rows in `crate::budget::ALLOCATION_TABLE`. When the
 // budget is smaller than a single dense row, `open_dense_streaming`
 // returns an actionable error rather than silently disabling the cap.
 

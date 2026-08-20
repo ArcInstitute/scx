@@ -618,6 +618,17 @@ fn index_request_without_a_matching_axis_is_refused() {
             matches!(err, OpsError::InvalidInput(_)),
             "{label}: expected InvalidInput, got {err:?}"
         );
+        // These strings are user-facing (`pyscx.modify_metadata` /
+        // `scx modify-metadata`), and a multiline Rust literal without `\`
+        // continuations bakes the source indentation into the message. Asserting
+        // only the variant let 14-18 space runs ship once already, so assert the
+        // text too.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("  "),
+            "{label}: refusal message carries wrap padding — a multiline literal \
+             is missing its `\\` continuations: {msg:?}"
+        );
         // Refused before `prepare_in_place`, so the file is untouched — a
         // rejection that had already appended would be a worse outcome than
         // the no-op it replaces.

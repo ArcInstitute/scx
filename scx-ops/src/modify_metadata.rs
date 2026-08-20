@@ -257,12 +257,12 @@ fn unhonourable_index_request(patch: &MetadataPatch) -> Option<String> {
     if patch.obs.is_none() && patch.var.is_none() {
         if let Some(preset) = &idx.index_preset {
             return Some(format!(
-                "index_preset={preset:?} was requested but neither obs nor var                  was supplied"
+                "index_preset={preset:?} was requested but neither obs nor var was supplied"
             ));
         }
         if idx.index_auto_threshold > 0 {
             return Some(format!(
-                "index_auto_threshold={} was requested but neither obs nor var                  was supplied",
+                "index_auto_threshold={} was requested but neither obs nor var was supplied",
                 idx.index_auto_threshold
             ));
         }
@@ -289,7 +289,9 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
     // asymmetry is why this cannot be one `user_wants_index` check.
     if let Some(detail) = unhonourable_index_request(patch) {
         return Err(OpsError::InvalidInput(format!(
-            "modify_metadata: {detail}. An index is rebuilt only over an axis              this call replaces, so the request would have been silently              ignored; pass the matching obs=/var= frame, or drop the index              option."
+            "modify_metadata: {detail}. An index is rebuilt only over an axis this \
+             call replaces, so the request would have been silently ignored; \
+             pass the matching obs=/var= frame, or drop the index option."
         )));
     }
 

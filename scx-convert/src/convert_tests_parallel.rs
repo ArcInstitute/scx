@@ -513,7 +513,7 @@ fn parallel_per_worker_bytes_dense_uses_dense_formula() {
     let reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();
     let indexed: &dyn IndexedCsrShardStream = &reader;
 
-    // 32 rows × 40 vars × 12 B/element = 15_360.
+    // 32 rows × 40 vars × 12 B/element + 33 × 8 B indptr = 15_624.
     //
     // ⚠️ This was `32 × 40 × 4 × 2 = 10_240`, and the change is the point of
     // the fix rather than a casualty of it. The old expression charged
@@ -524,9 +524,13 @@ fn parallel_per_worker_bytes_dense_uses_dense_formula() {
     // input was and the sparsified output does not depend on the source width
     // at all. 12 B/element is what `read_range_inner` actually holds; see
     // `budget::DENSE_SPARSIFY_BYTES_PER_ELEM`.
+    //
+    // The `+ 33 × 8` is the `u64` indptr, added after review: it is noise at
+    // atlas `n_vars` and the dominant term at `n_vars = 1`, so leaving it out
+    // was an under-count that no fixture in the suite happened to expose.
     let bytes_rna = indexed.per_worker_bytes(32, ModalityType::Rna);
     let bytes_atac = indexed.per_worker_bytes(32, ModalityType::Atac);
-    assert_eq!(bytes_rna, 15_360);
+    assert_eq!(bytes_rna, 15_624);
     // Dense override ignores modality — same formula regardless.
     assert_eq!(bytes_rna, bytes_atac);
     // And it's never zero.
@@ -1232,19 +1236,33 @@ fn parallel_export_worker_panic_does_not_deadlock() {
 /// achieved: rayon bounds that by the pool size regardless of the coordinator,
 /// as `parallel_reorder_buffer_bounded_by_window` documents at length.)
 ///
-/// **Arm order is load-bearing.** The counter is never reset to zero, so the
-/// sequential arm must run first, on a virgin thread-local — otherwise it would
-/// read the parallel arm's leftover value and pass for the wrong reason.
+/// ⚠️ **The counter must be zeroed explicitly, and arm order alone does not do
+/// it.** `LAST_RUN_PEAK` is a `thread_local!` written only at the tail of
+/// `ordered_parallel_drain`; `hooks::reset()` zeros the three atomics but not
+/// this cell, and it runs *inside* the drain, so a control arm where no drain
+/// executes never reaches it. libtest reuses OS threads across `#[test]`s, so
+/// any earlier parallel convert on this thread — `dense_parallel_with_memory_budget_byte_identical`
+/// now takes the parallel path itself — leaves a non-zero value behind and the
+/// control arm fails claiming the sequential coordinator entered the drain.
+/// An earlier version of this test relied on arm order alone and was flaky by
+/// construction; it passed only because of thread-scheduling luck. Both arms
+/// now zero the cell first, which makes each assertion a statement about the
+/// convert it just ran and nothing else.
 ///
 /// The arithmetic, with `n_vars = 50` f32 (`row_bytes = 200`) and
 /// `memory_budget = 24_000`:
 ///
-/// | | today | after the fix |
+/// | | before the fix | after |
 /// |---|---|---|
-/// | `max_slab_rows` | `(24000/200)/4 = 30` | `(24000/4)/(50×12) = 10` |
-/// | `per_worker_bytes` | `30×200×2 = 12000` (= B/2) | `10×50×12 = 6000` (= B/4) |
+/// | `max_slab_rows` | `(24000/200)/4 = 30` | `(6000−8)/(50×12+8) = 9` |
+/// | `per_worker_bytes` | `30×200×2 = 12000` (= B/2) | `9×50×12 + 10×8 = 5480` |
 /// | `outstanding_max` | 2 | 4 |
 /// | `granted_threads` | **1 → sequential** | **3 → parallel** |
+///
+/// The post-fix column includes the `u64` indptr and solves for rows affinely
+/// (`rows × (n_vars × 12 + 8) + 8 ≤ share`), both added in the review round. An
+/// earlier version of this table said `10` and `6000`, from before the indptr
+/// term existed — the same staleness this file was already caught carrying once.
 #[test]
 fn dense_convert_under_a_memory_budget_stays_parallel() {
     if super::hdf5_threadsafe::skip_if_not_threadsafe(
@@ -1257,7 +1275,8 @@ fn dense_convert_under_a_memory_budget_stays_parallel() {
     // 200 rows × 50 vars, f32 dense → row_bytes = 200.
     create_test_h5ad(&h5ad, 200, 50, "dense", false);
 
-    // ---- control arm: sequential, on a virgin thread-local ----
+    // ---- control arm: sequential, on a deliberately zeroed thread-local ----
+    super::parallel_drain::hooks::set_last_run_peak(0);
     let mut seq_opts = streaming_opts(32);
     seq_opts.reader_threads = Some(1);
     seq_opts.memory_budget = Some(24_000);
@@ -1273,10 +1292,13 @@ fn dense_convert_under_a_memory_budget_stays_parallel() {
         super::parallel_drain::hooks::last_run_peak(),
         0,
         "the sequential coordinator entered the parallel drain — the control \
-         arm is not a control, and the assertion below proves nothing"
+         arm is not a control, and the assertion below proves nothing. (The \
+         cell is zeroed just above, so a stale value from a sibling test on \
+         this libtest thread is not the explanation.)"
     );
 
     // ---- the arm under test ----
+    super::parallel_drain::hooks::set_last_run_peak(0);
     let mut par_opts = streaming_opts(32);
     par_opts.reader_threads = Some(8);
     par_opts.writer_queue_depth = 4;

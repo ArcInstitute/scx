@@ -66,16 +66,29 @@ fn unenforced_reservations_are_declared_not_silent() {
         .filter(|r| !r.enforced)
         .map(|r| r.name)
         .collect();
-    // Both are §11.4: the CSC bucket count and the bucket record buffer are
-    // sized from the *mean* nnz/row, so a right-skewed depth distribution
-    // overshoots. Pinned as a number so closing one is a deliberate edit here.
+    // Five, in two groups, and the count is pinned so a sixth cannot arrive
+    // unannounced:
+    //
+    //   * the two §11.4 CSC rows — bucket count and bucket record buffer are
+    //     sized from the *mean* nnz/row, so a right-skewed depth distribution
+    //     overshoots them;
+    //   * the three per-shard ingest/export rows — each sizes a READER working
+    //     set, while `encode_one_shard_worker` holds the raw CSR across
+    //     `encode_one_shard`, so the encoded section is live alongside it. The
+    //     derate bounds the stage, not the whole worker.
+    //
+    // Closing the second group means sizing from the maximum complete worker
+    // phase and re-deriving the share, which trades away the parallelism §11.5
+    // restored. That is a measured change; until it happens, `enforced: false`
+    // is what keeps the table honest.
     assert_eq!(
         unenforced.len(),
-        2,
-        "expected exactly the two §11.4 bucket-sizing rows to be unenforced, \
-         got {unenforced:?}. Adding an unenforced row without updating this \
-         count lets a known gap enter the table unannounced; removing one \
-         means §11.4 moved and this test should say so."
+        5,
+        "expected exactly the two §11.4 bucket rows plus the three reader-phase \
+         per-shard rows to be unenforced, got {unenforced:?}. Adding an \
+         unenforced row without updating this count lets a known gap enter the \
+         table unannounced; removing one means a gap actually closed and this \
+         test should say so."
     );
 }
 

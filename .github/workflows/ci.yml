@@ -611,20 +611,48 @@ jobs:
       # which the resident buffers do not depend on, so a u8 input exceeded its
       # budget threefold.
       #
-      # Dividing or multiplying anything named `budget*` by an integer literal
-      # is the fingerprint of a hand-rolled reservation; a legitimate caller
-      # asks the table for a `Share`. Test modules are exempt (they assert on
+      # Dividing or multiplying any identifier CONTAINING `budget` by an integer
+      # literal is the fingerprint of a hand-rolled reservation; a legitimate
+      # caller asks the table for a `Share`.
+      #
+      # The pattern is `[a-z_]*budget[a-z_]*`, not `\bbudget[a-z_]*`. The first
+      # version used a word boundary and so matched only a bare `budget`,
+      # missing `memory_budget / 4` and `opts.memory_budget / 4` -- the
+      # spellings the real call sites actually use -- because `_` is a word
+      # character, so `\bbudget` cannot match inside `memory_budget`. It was
+      # falsified with a bare `budget / 4` and passed, which is exactly how a
+      # guard weaker than its own comment survives review. Test modules are exempt (they assert on
       # the numbers); a justified standalone use marks itself
       # `ORG-11.16-5-ALLOW` with a reason.
       - name: Budget arithmetic lives only in scx-convert/src/budget.rs
         run: |
           if grep -rEn --include='*.rs' \
-               '\bbudget[a-z_]*[[:space:]]*(/|\*)[[:space:]]*[0-9]' scx-convert/src \
+               '[a-z_]*budget[a-z_]*[[:space:]]*(/|\*)[[:space:]]*[0-9]' scx-convert/src \
                | grep -vE 'scx-convert/src/budget(_tests)?\.rs' \
                | grep -vE 'scx-convert/src/convert_tests_' \
                | grep -vE 'ORG-11\.16-5-ALLOW' \
                | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
             echo "::error::budget arithmetic outside scx-convert/src/budget.rs — add a Reservation row and ask the table for a Share instead of dividing the budget inline (ORG-11.16-5)."
+            exit 1
+          fi
+      # The arithmetic grep above cannot see a budget bypassed as a CONSTANT or a
+      # STRING rather than a division -- which is how the CSC sidecar ignored
+      # `memory_budget` for three releases while `pipeline.rs` documented the
+      # opposite: the call sites passed `DEFAULT_CSC_MEMORY_BYTES` and the
+      # literal "4G". Both spellings now come from
+      # `budget::csc_sidecar_bytes(opts.memory_budget)`.
+      - name: No scx-convert site hard-codes a sidecar memory budget
+        run: |
+          set -e
+          if grep -rEn --include='*.rs' 'DEFAULT_CSC_MEMORY_BYTES' scx-convert/src \
+               | grep -vE 'scx-convert/src/budget\.rs' \
+               | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::a scx-convert call site passes DEFAULT_CSC_MEMORY_BYTES directly — route it through budget::csc_sidecar_bytes so --memory-budget reaches the sidecar (ORG-11.16-5)."
+            exit 1
+          fi
+          if grep -rEn --include='*.rs' '"[0-9]+[KMGT]"' scx-convert/src \
+               | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::a scx-convert call site hard-codes a byte-size string (e.g. \"4G\") — pass a resolved budget instead (ORG-11.16-5)."
             exit 1
           fi
       # Positive half: deleting the table outright leaves the grep above nothing

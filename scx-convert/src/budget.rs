@@ -22,6 +22,14 @@
 //! is held in, so "what fraction of the budget does this phase claim" has a
 //! written answer that a test can check.
 //!
+//! ⚠️ **What the table does not yet bound.** Every reservation here sizes one
+//! *stage* — the reader's working set, the transpose's buffers — and the ingest
+//! and export rows carry `enforced: false` because the worker that owns them
+//! also holds the *encoded* shard at the same time. So the invariant proves the
+//! declared stages fit, not that the process peak fits. Read `enforced` before
+//! quoting a row as a guarantee; the flag is the difference between "we sized
+//! this" and "nothing exceeds this".
+//!
 //! Deliberately **not** gated on `hdf5`, for the same reason `parallel_drain`
 //! is not: this is integer arithmetic, and keeping it feature-free is what lets
 //! `allocation_table_shares_sum_to_at_most_one_per_phase` (a `#[cfg(test)]`
@@ -189,10 +197,16 @@ pub(crate) fn shard_working_set_bytes(nnz: u64, n_rows: u64) -> u64 {
 }
 
 /// Resident bytes for one dense slab of `rows` x `n_vars` elements.
+///
+/// Includes the `u64` indptr. It is negligible at atlas `n_vars` and is not
+/// negligible at `n_vars = 1`, where it is the dominant term — omitting it was
+/// an under-count that happened to be invisible on every fixture in the suite.
 pub(crate) fn dense_slab_bytes(rows: u64, n_vars: u64, dtype_bytes: u64) -> u64 {
-    rows.saturating_mul(n_vars)
-        .saturating_mul(dense_peak_bytes_per_elem(dtype_bytes))
-        .max(1)
+    let elements = rows
+        .saturating_mul(n_vars)
+        .saturating_mul(dense_peak_bytes_per_elem(dtype_bytes));
+    let indptr = rows.saturating_add(1).saturating_mul(INDPTR_BYTES_PER_ROW);
+    elements.saturating_add(indptr).max(1)
 }
 
 /// The smallest `memory_budget` that admits one row of a dense slab.
@@ -206,12 +220,34 @@ pub(crate) fn dense_min_budget(n_vars: u64, dtype_bytes: u64) -> u64 {
 /// an actionable refusal quoting [`dense_min_budget`], so the predicate and the
 /// advertised minimum are the same expression by construction.
 pub(crate) fn dense_max_slab_rows(budget: u64, n_vars: u64, dtype_bytes: u64) -> Result<u64, ()> {
-    let row_bytes = dense_slab_bytes(1, n_vars, dtype_bytes);
-    let rows = SHARD_BUDGET_SHARE.of(budget) / row_bytes.max(1);
+    // Solve `rows` from `dense_slab_bytes`, rather than dividing the share by a
+    // one-row cost. The indptr's terminator makes the cost affine, not linear —
+    // `rows x (n_vars x peak + 8) + 8` — so dividing by `dense_slab_bytes(1, …)`
+    // charges the terminator once per row and leaves a whole row unused.
+    let share = SHARD_BUDGET_SHARE.of(budget);
+    let per_row = n_vars
+        .saturating_mul(dense_peak_bytes_per_elem(dtype_bytes))
+        .saturating_add(INDPTR_BYTES_PER_ROW)
+        .max(1);
+    let rows = share.saturating_sub(INDPTR_BYTES_PER_ROW) / per_row;
     if rows == 0 {
         return Err(());
     }
     Ok(rows)
+}
+
+/// Bytes the CSC sidecar builder may use: the caller's `memory_budget` capped
+/// at the builder's own default, or that default when no budget was given.
+///
+/// `write_csc_sidecar` documents its bound as "`cols_per_shard` or
+/// `memory_budget_bytes`, whichever is smaller", and `pipeline.rs` documented
+/// the convert side as "or the memory budget, whichever is smaller" — but the
+/// callers passed the 4 GiB default unconditionally, so `--memory-budget 512M
+/// --csc always` could still let sidecar generation claim 4 GiB. The doc was
+/// true of the callee and false of every caller.
+pub(crate) fn csc_sidecar_bytes(memory_budget: Option<u64>) -> u64 {
+    let default = scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES as u64;
+    memory_budget.map_or(default, |b| b.min(default))
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +282,8 @@ pub(crate) enum Phase {
     CscExternalColumnScan,
     /// CSC external transpose, pass 2: load one bucket, emit shards.
     CscExternalBucketDrain,
+    /// CSC sidecar generation, after X is written.
+    CscSidecar,
 }
 
 /// One declared claim on the budget.
@@ -290,7 +328,16 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         share: SHARD_BUDGET_SHARE,
         multiplicity: SHARD_BUDGET_SHARE.max_concurrent(),
         site: "h5ad/dense_stream.rs::open_dense_streaming + per_worker_bytes",
-        enforced: true,
+        // READER-PHASE ONLY, which is why this is not `enforced: true`.
+        // `encode_one_shard_worker` holds the raw CSR across `encode_one_shard`
+        // and `maybe_build_bitmap_shard`, so the encoded `PreEncodedSection`
+        // (and any bitmap) is live *alongside* the slab this reservation sizes.
+        // The derate therefore bounds the reader working set, not the whole
+        // worker, and `outstanding x share <= 1` is a statement about the
+        // former. Closing it means sizing from the maximum complete worker
+        // phase and re-deriving the share, which trades away the parallelism
+        // 11.5 just restored -- a measured change, not a footnote.
+        enforced: false,
     },
     Reservation {
         name: "CSR shard working set, one in-flight shard",
@@ -298,7 +345,9 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         share: SHARD_BUDGET_SHARE,
         multiplicity: SHARD_BUDGET_SHARE.max_concurrent(),
         site: "h5ad/stream.rs::per_worker_bytes -> derate_threads_and_depth",
-        enforced: true,
+        // Same reader-vs-worker gap as the dense row above: the encoded output
+        // overlaps the shard working set this sizes.
+        enforced: false,
     },
     Reservation {
         name: "export shard working set, one in-flight shard",
@@ -306,6 +355,18 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         share: SHARD_BUDGET_SHARE,
         multiplicity: SHARD_BUDGET_SHARE.max_concurrent(),
         site: "h5ad/stream_write.rs::per_shard_export_bytes -> derate_threads_and_depth",
+        // Same reader-vs-worker gap as the dense row above: the encoded output
+        // overlaps the shard working set this sizes.
+        enforced: false,
+    },
+    Reservation {
+        name: "CSC sidecar transpose",
+        phase: Phase::CscSidecar,
+        share: Share::new(1, 1),
+        multiplicity: 1,
+        site: "pipeline.rs -> scx_format_io::csc_sidecar::write_csc_sidecar",
+        // Bounds the emitted shard's column count. Whole budget rather than a
+        // share: the sidecar is built after X is written, not alongside it.
         enforced: true,
     },
     Reservation {
