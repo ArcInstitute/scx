@@ -281,6 +281,14 @@ fn compute_shard_row_ranges_partition_invariants() {
 /// `IndexedCsrShardStream::max_slab_rows`, matching the sequential
 /// path's slab clamp. Verifies the run completes and CSR bytes match
 /// the sequential path.
+///
+/// ⚠️ **This test does not assert which coordinator its "parallel" arm ran
+/// on, and for a long time that arm was not parallel at all** — the budget
+/// derate collapsed the grant to one thread and `if granted <= 1` routed it
+/// back to the sequential path, so byte-identity held trivially between two
+/// runs of the same code. `dense_convert_under_a_memory_budget_stays_parallel`
+/// is the test that asserts the route; keep both. This one's job is the byte
+/// comparison, and it is only worth something because that one exists.
 #[test]
 fn dense_parallel_with_memory_budget_byte_identical() {
     if super::hdf5_threadsafe::skip_if_not_threadsafe(
@@ -293,9 +301,18 @@ fn dense_parallel_with_memory_budget_byte_identical() {
     // 100 rows × 50 vars dense, f32 → row_bytes = 200.
     create_test_h5ad(&h5ad, 100, 50, "dense", false);
 
-    // budget = 8192 → max_slab_rows = (8192 / 200) / 4 = 10
-    // shard_target = 32 → parallel must clamp the partition to 10.
-    // Per-worker dense bytes = 10 × 50 × 4 × 2 = 4000 ≤ 8192.
+    // budget = 8192, 50 vars at 12 B/element (`budget::dense_slab_bytes`):
+    //   one slab may claim SHARD_BUDGET_SHARE (1/4) = 2048 B
+    //   → max_slab_rows = 2048 / (50 × 12) = 3, well under shard_target 32,
+    //     so the partition clamp is exercised;
+    //   → per-worker = 3 × 50 × 12 = 1800 B, outstanding_max = 4.
+    //
+    // ⚠️ These numbers are derived, not decorative: the previous version of
+    // this comment read `(8192 / 200) / 4 = 10` and `10 × 50 × 4 × 2 = 4000`,
+    // which is the pre-fix arithmetic — the ÷4 keyed to the source dtype width
+    // and the ×2 that double-counted it. It went stale the moment the sizing
+    // changed, and a stale comment on a passing test is how the next reader
+    // learns the wrong model.
     let scx_seq = dir.path().join("seq.scx");
     let scx_par = dir.path().join("par.scx");
 
