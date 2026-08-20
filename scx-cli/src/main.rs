@@ -2263,8 +2263,6 @@ fn dispatch_convert(
         group_target_bytes,
         group_max_bytes,
         group_pass,
-        export_obs_keep_mask: None,
-        export_min_counts: min_counts,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -2283,6 +2281,22 @@ fn dispatch_convert(
     // Special-case scx_to_h5ad on multimodal input: gate on the
     // `--modality` flag and route through `scx_modality_to_h5ad` when
     // present. The plain single-modality path stays untouched.
+    // Export-only options. Built separately from `opts` because the two
+    // directions are now separate types -- which is the point: `--min-counts`
+    // can no longer be handed to an ingest entry point that would ignore it.
+    // The CLI's own direction guard (`--min-counts` outside `scx_to_h5ad`)
+    // still runs earlier, in `run_convert`, and still gives the better message;
+    // what the type removes is the possibility of a *new* export-only flag
+    // being silently dropped on an ingest direction.
+    let export_opts = convert::ExportOptions {
+        tool: "scx".into(),
+        memory_budget,
+        reader_threads,
+        writer_queue_depth,
+        export_obs_keep_mask: None,
+        export_min_counts: min_counts,
+    };
+
     let result: Result<(), ConvertError> = match direction {
         "h5ad_to_scx" => {
             if stream {
@@ -2308,7 +2322,13 @@ fn dispatch_convert(
         "scx_to_h5ad" => match modality {
             Some(name) => {
                 if stream {
-                    convert::scx_modality_to_h5ad_streaming(input, output, name, &opts, &mut sink)
+                    convert::scx_modality_to_h5ad_streaming(
+                        input,
+                        output,
+                        name,
+                        &export_opts,
+                        &mut sink,
+                    )
                 } else {
                     convert::scx_modality_to_h5ad(input, output, name, &mut sink)
                 }
@@ -2331,7 +2351,7 @@ fn dispatch_convert(
                     .into());
                 }
                 if stream {
-                    convert::scx_to_h5ad_streaming(input, output, &opts, &mut sink)
+                    convert::scx_to_h5ad_streaming(input, output, &export_opts, &mut sink)
                 } else {
                     convert::scx_to_h5ad(input, output, &mut sink)
                 }
@@ -2339,7 +2359,7 @@ fn dispatch_convert(
         },
         "scx_to_h5mu" => {
             if stream {
-                convert::scx_to_h5mu_streaming(input, output, &opts, &mut sink)
+                convert::scx_to_h5mu_streaming(input, output, &export_opts, &mut sink)
             } else {
                 convert::scx_to_h5mu(input, output, &mut sink)
             }

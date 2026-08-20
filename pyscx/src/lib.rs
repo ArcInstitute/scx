@@ -673,9 +673,6 @@ fn from_h5ad(
         group_target_bytes: group_target_bytes_val,
         group_max_bytes: group_max_bytes_val,
         group_pass: group_pass_val,
-        // Export-only; this is an ingest direction.
-        export_obs_keep_mask: None,
-        export_min_counts: None,
     };
 
     let input = std::path::PathBuf::from(path);
@@ -978,7 +975,7 @@ fn to_h5ad(
         }
     }
 
-    let opts = scx_convert::ConvertOptions {
+    let opts = scx_convert::ExportOptions {
         tool: "pyscx".into(),
         reader_threads,
         writer_queue_depth,
@@ -1035,7 +1032,7 @@ fn to_h5mu(
 ) -> PyResult<()> {
     use std::path::Path;
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
-    let opts = scx_convert::ConvertOptions {
+    let opts = scx_convert::ExportOptions {
         tool: "pyscx".into(),
         reader_threads,
         writer_queue_depth,

@@ -205,7 +205,6 @@ pub fn h5mu_to_scx(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    crate::pipeline::reject_export_row_filter_on_import(opts, "h5mu_to_scx")?;
     let file = hdf5::File::open(input)?;
 
     if !is_h5mu_file(&file) {
@@ -433,7 +432,6 @@ pub fn h5mu_to_scx_streaming(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    crate::pipeline::reject_export_row_filter_on_import(opts, "h5mu_to_scx_streaming")?;
     let file = hdf5::File::open(input)?;
 
     if !is_h5mu_file(&file) {
@@ -770,7 +768,7 @@ pub fn h5mu_to_scx_streaming(
         .as_secs() as i64;
     let modality_names_for_json: Vec<&String> =
         modality_meta.iter().map(|(name, _, _)| name).collect();
-    let resolved_reader_threads = crate::pipeline::resolve_reader_threads(opts);
+    let resolved_reader_threads = crate::pipeline::resolve_reader_threads(opts.reader_threads);
     writer.write_provenance(vec![ProvenanceEntry {
         timestamp,
         action: "convert".to_string(),

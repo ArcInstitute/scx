@@ -686,6 +686,7 @@ mod streaming_obs_hdf5 {
     //! format-level sharded round-trip; this module covers the export
     //! direction (sharded obs → h5ad/h5mu via hyperslab writes).
 
+    use super::ExportOptions;
     use std::sync::Arc;
 
     use arrow::array::{
@@ -702,7 +703,6 @@ mod streaming_obs_hdf5 {
     use crate::h5ad::write::{
         write_dataframe_group_at, write_dataframe_group_from_shards, write_scx_to_h5ad,
     };
-    use crate::pipeline::ConvertOptions;
     use crate::warnings::WarningSink;
 
     fn header(n_obs: u64, n_vars: u64) -> FileHeader {
@@ -830,7 +830,7 @@ mod streaming_obs_hdf5 {
         assert_eq!(reader.n_obs(), 200);
 
         // Streaming export.
-        let opts = ConvertOptions::default();
+        let opts = ExportOptions::default();
         write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream, &opts, &mut WarningSink::log())
             .unwrap();
         // Eager baseline (the existing materialising writer reads
@@ -997,7 +997,7 @@ mod streaming_obs_hdf5 {
         );
         assert_eq!(reader.n_obs(), n_obs);
 
-        let opts = ConvertOptions::default();
+        let opts = ExportOptions::default();
         write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream, &opts, &mut WarningSink::log())
             .unwrap();
         write_scx_to_h5ad(&scx_path, &h5ad_eager, &mut WarningSink::log()).unwrap();
@@ -1111,7 +1111,7 @@ mod streaming_obs_hdf5 {
             "fixture must be legacy"
         );
 
-        let opts = ConvertOptions::default();
+        let opts = ExportOptions::default();
         write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream, &opts, &mut WarningSink::log())
             .unwrap();
         write_scx_to_h5ad(&scx_path, &h5ad_eager, &mut WarningSink::log()).unwrap();
@@ -1149,7 +1149,7 @@ mod streaming_obs_hdf5 {
         let deleted: Vec<u64> = vec![3, 15, 27, 60];
         scx_ops::mark_deleted(&scx_path, &deleted).unwrap();
 
-        let opts = ConvertOptions::default();
+        let opts = ExportOptions::default();
         write_scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
 
         let file = hdf5::File::open(&h5ad_out).unwrap();
@@ -1288,7 +1288,7 @@ mod streaming_obs_hdf5 {
         let deleted: Vec<u64> = vec![3, 15, 27, 60];
         scx_ops::mark_deleted(&scx_path, &deleted).unwrap();
 
-        let opts = ConvertOptions::default();
+        let opts = ExportOptions::default();
         write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream_out, &opts, &mut WarningSink::log())
             .unwrap();
         write_scx_to_h5ad(&scx_path, &h5ad_eager_out, &mut WarningSink::log()).unwrap();
@@ -1379,7 +1379,7 @@ mod streaming_obs_hdf5 {
             writer.finish().unwrap();
         }
 
-        let opts = ConvertOptions::default();
+        let opts = ExportOptions::default();
         write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream, &opts, &mut WarningSink::log())
             .unwrap();
         // Eager path also routes through the streaming-or-eager
@@ -1485,7 +1485,7 @@ mod streaming_obs_hdf5 {
         let reader = ScxReader::open(&scx_path).unwrap();
         assert_eq!(reader.var_metadata_shard_count(), var_shards as usize);
 
-        let opts = ConvertOptions::default();
+        let opts = ExportOptions::default();
         write_scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
 
         let file = hdf5::File::open(&h5ad_out).unwrap();
@@ -1586,7 +1586,7 @@ mod streaming_obs_hdf5 {
             writer.finish().unwrap();
         }
 
-        let opts = ConvertOptions::default();
+        let opts = ExportOptions::default();
         scx_to_h5mu_streaming(&scx_path, &h5mu_out, &opts, &mut WarningSink::log()).unwrap();
 
         let file = hdf5::File::open(&h5mu_out).unwrap();
@@ -1950,7 +1950,7 @@ mod streaming_obs_hdf5 {
             3
         );
 
-        let opts = ConvertOptions::default();
+        let opts = ExportOptions::default();
         write_scx_to_h5ad_streaming(&scx_path, &h5ad, &opts, &mut WarningSink::log()).unwrap();
 
         let file = hdf5::File::open(&h5ad).unwrap();
@@ -1970,7 +1970,7 @@ mod streaming_obs_hdf5 {
         let h5ad = dir.path().join("out.h5ad");
 
         build_sharded_obs_scx(&scx_path, 2, 25);
-        let opts = ConvertOptions::default();
+        let opts = ExportOptions::default();
         write_scx_to_h5ad_streaming(&scx_path, &h5ad, &opts, &mut WarningSink::log()).unwrap();
 
         let file = hdf5::File::open(&h5ad).unwrap();
@@ -2207,7 +2207,7 @@ mod streaming_obs_hdf5 {
         write_scx_to_h5ad_streaming(
             &scx_path,
             &h5ad,
-            &ConvertOptions::default(),
+            &ExportOptions::default(),
             &mut WarningSink::log(),
         )
         .unwrap();
@@ -2338,7 +2338,7 @@ mod streaming_obs_hdf5 {
         write_scx_to_h5ad_streaming(
             &scx_path,
             &h5ad,
-            &ConvertOptions::default(),
+            &ExportOptions::default(),
             &mut WarningSink::log(),
         )
         .unwrap();

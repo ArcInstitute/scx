@@ -32,6 +32,7 @@ pub(crate) use scx_codec::value_encoding::is_integer_data;
 
 pub(crate) use super::dtype::detect_value_encoding;
 
+pub(crate) use super::options::ExportOptions;
 pub(crate) use super::pipeline::{
     h5ad_to_scx, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions,
 };

@@ -584,16 +584,16 @@ fn parallel_export_byte_identical_to_sequential() {
     assert!(reader.catalog().shards_sorted().len() >= 4);
     drop(reader);
 
-    let seq_opts = ConvertOptions {
+    let seq_opts = ExportOptions {
         reader_threads: Some(1),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
 
-    let par_opts = ConvertOptions {
+    let par_opts = ExportOptions {
         reader_threads: Some(4),
         writer_queue_depth: 4,
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_par, &par_opts, &mut WarningSink::log()).unwrap();
 
@@ -623,15 +623,15 @@ fn parallel_export_with_layers_byte_identical() {
     };
     h5ad_to_scx(&h5ad, &scx, &import_opts, &mut WarningSink::log()).unwrap();
 
-    let seq_opts = ConvertOptions {
+    let seq_opts = ExportOptions {
         reader_threads: Some(1),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
 
-    let par_opts = ConvertOptions {
+    let par_opts = ExportOptions {
         reader_threads: Some(4),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_par, &par_opts, &mut WarningSink::log()).unwrap();
 
@@ -691,15 +691,15 @@ fn parallel_export_with_deletion_vectors_byte_identical() {
     let deleted: Vec<u64> = vec![1, 9, 12, 25, 41, 67];
     scx_ops::mark_deleted(&scx, &deleted).unwrap();
 
-    let seq_opts = ConvertOptions {
+    let seq_opts = ExportOptions {
         reader_threads: Some(1),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
 
-    let par_opts = ConvertOptions {
+    let par_opts = ExportOptions {
         reader_threads: Some(4),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_par, &par_opts, &mut WarningSink::log()).unwrap();
 
@@ -744,15 +744,15 @@ fn parallel_export_h5mu_byte_identical() {
     };
     h5mu_to_scx(&h5mu_in, &scx, &import_opts, &mut WarningSink::log()).unwrap();
 
-    let seq_opts = ConvertOptions {
+    let seq_opts = ExportOptions {
         reader_threads: Some(1),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5mu_streaming(&scx, &h5mu_seq, &seq_opts, &mut WarningSink::log()).unwrap();
 
-    let par_opts = ConvertOptions {
+    let par_opts = ExportOptions {
         reader_threads: Some(4),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5mu_streaming(&scx, &h5mu_par, &par_opts, &mut WarningSink::log()).unwrap();
 
@@ -794,10 +794,10 @@ fn parallel_export_memory_budget_refuses_oversized_shard() {
     let h5ad = dir.path().join("out.h5ad");
 
     make_multishard_scx(&scx, 80, 64, 16);
-    let opts = ConvertOptions {
+    let opts = ExportOptions {
         reader_threads: Some(4),
         memory_budget: Some(1), // 1 byte — well below any shard's working set
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     let err = scx_to_h5ad_streaming(&scx, &h5ad, &opts, &mut WarningSink::log())
         .expect_err("expected refusal");
@@ -831,11 +831,11 @@ fn parallel_export_memory_budget_derates_workers() {
         log_clone.lock().unwrap().push(format!("{:?}", w));
     });
 
-    let opts = ConvertOptions {
+    let opts = ExportOptions {
         reader_threads: Some(8),
         writer_queue_depth: 4,
         memory_budget: Some(1500),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad, &opts, &mut sink).unwrap();
 
@@ -859,9 +859,9 @@ fn parallel_export_memory_budget_derates_workers() {
 
     // Output must still match the sequential path.
     let h5ad_seq = dir.path().join("seq.h5ad");
-    let seq_opts = ConvertOptions {
+    let seq_opts = ExportOptions {
         reader_threads: Some(1),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
     let (a_indptr, a_indices, a_data, _) = read_h5ad_x_triplet(&h5ad);
@@ -968,10 +968,10 @@ fn parallel_export_worker_error_does_not_deadlock() {
     // reports its error.
     let scx = scx_path.clone();
     let handle = std::thread::spawn(move || {
-        let opts = ConvertOptions {
+        let opts = ExportOptions {
             reader_threads: Some(4),
             writer_queue_depth: 1,
-            ..ConvertOptions::default()
+            ..ExportOptions::default()
         };
         scx_to_h5ad_streaming(&scx, &h5ad_out, &opts, &mut WarningSink::log())
     });
@@ -1167,10 +1167,10 @@ fn parallel_export_worker_panic_does_not_deadlock() {
     let scx = scx_path.clone();
     let handle = std::thread::spawn(move || {
         let _panic = test_hooks::PanicExportShardGuard::new(3);
-        let opts = ConvertOptions {
+        let opts = ExportOptions {
             reader_threads: Some(4),
             writer_queue_depth: 1,
-            ..ConvertOptions::default()
+            ..ExportOptions::default()
         };
         scx_to_h5ad_streaming(&scx, &h5ad_out, &opts, &mut WarningSink::log())
     });

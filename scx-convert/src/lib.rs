@@ -155,6 +155,12 @@ impl GroupPass {
     }
 }
 
+// Direction-specific options (ORG-11.16-3). Gated with its consumers.
+#[cfg(feature = "hdf5")]
+mod options;
+#[cfg(feature = "hdf5")]
+pub use options::ExportOptions;
+
 #[cfg(feature = "hdf5")]
 pub mod pipeline;
 

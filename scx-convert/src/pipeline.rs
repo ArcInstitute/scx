@@ -266,40 +266,6 @@ pub struct ConvertOptions {
     /// (the grouped random-row gather over a dense matrix reads full rows and
     /// is ~4–5× slower / ~2× the memory). `One` / `Two` force the choice.
     pub group_pass: GroupPass,
-    /// SCX → h5ad/h5mu **export only**: caller-supplied obs keep mask.
-    ///
-    /// Indexed in the **global / physical** obs row space — the length must
-    /// equal the file header's `n_obs`, *not* the post-deletion live count.
-    /// This is the same coordinate system
-    /// [`scx_format_io::ScxReader::deletion_keep_mask`] and
-    /// [`crate::min_counts_obs_mask`] use.
-    ///
-    /// Intersected (AND) with the deletion-vector mask, never substituted for
-    /// it: a logically deleted row stays dropped regardless of its entry here.
-    ///
-    /// `Arc<[bool]>` so the derived `Clone` stays O(1) on atlas-scale masks.
-    /// Rejected up front on import directions.
-    pub export_obs_keep_mask: Option<std::sync::Arc<[bool]>>,
-    /// SCX → h5ad **export only**: keep observations whose total `X` UMI count
-    /// is `>= export_min_counts`, computed with one streaming pass over the CSR
-    /// shards (see [`crate::min_counts_obs_mask`]) in the same global obs row
-    /// space as [`Self::export_obs_keep_mask`], and ANDed with it and with the
-    /// deletion-vector mask.
-    ///
-    /// `>=` matches `pyscx.accel.filter_cells(min_counts=)` and
-    /// `sc.pp.filter_cells`. Ambiguous for a multimodal h5mu export (which
-    /// modality's X?), so that direction rejects it.
-    pub export_min_counts: Option<f64>,
-}
-
-impl ConvertOptions {
-    /// True when any caller-supplied export row filter is set. Import
-    /// directions use this to reject options that would otherwise be
-    /// silently ignored; the export path uses it to decide whether to
-    /// record filter provenance.
-    pub fn has_export_row_filter(&self) -> bool {
-        self.export_obs_keep_mask.is_some() || self.export_min_counts.is_some()
-    }
 }
 
 /// Phase 5b: density threshold below which `--bitmap=auto` considers a
@@ -564,8 +530,6 @@ impl Default for ConvertOptions {
             group_target_bytes: None,
             group_max_bytes: None,
             group_pass: GroupPass::default(),
-            export_obs_keep_mask: None,
-            export_min_counts: None,
         }
     }
 }
@@ -605,31 +569,11 @@ pub(crate) fn write_ingest_obs(
     )?)
 }
 
-/// Reject the SCX → h5ad/h5mu export row-filter options on an import
-/// direction.
-///
-/// `ConvertOptions` is shared across both directions, so an export-only field
-/// would otherwise be silently ignored on ingest. Erroring keeps the "an option
-/// you set always did something" contract that the existing `--index-*` /
-/// `--stream` / `--modalities` direction guards uphold.
-pub(crate) fn reject_export_row_filter_on_import(
-    opts: &ConvertOptions,
-    direction: &str,
-) -> Result<(), ConvertError> {
-    if opts.has_export_row_filter() {
-        return Err(ConvertError::Other(format!(
-            "export_obs_keep_mask / export_min_counts are SCX → h5ad export options \
-             and have no effect on '{direction}'"
-        )));
-    }
-    Ok(())
-}
-
-/// Resolve [`ConvertOptions::reader_threads`] to a concrete
+/// Resolve a `reader_threads` option to a concrete
 /// worker count. `None` (auto) reads `RAYON_NUM_THREADS` if set, else
 /// falls back to [`std::thread::available_parallelism`].
-pub(crate) fn resolve_reader_threads(opts: &ConvertOptions) -> usize {
-    if let Some(n) = opts.reader_threads {
+pub(crate) fn resolve_reader_threads(reader_threads: Option<usize>) -> usize {
+    if let Some(n) = reader_threads {
         return n.max(1);
     }
     if let Ok(s) = std::env::var("RAYON_NUM_THREADS") {
@@ -937,7 +881,6 @@ pub fn h5ad_to_scx(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    reject_export_row_filter_on_import(opts, "h5ad_to_scx")?;
     // Reorder-on-convert (`--sort-by` / `--group-by`) runs only on the streaming
     // path (it needs the random-access gather). Callers route these to streaming;
     // guard the eager path defensively.
@@ -1168,7 +1111,6 @@ pub fn tenx_to_scx(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    reject_export_row_filter_on_import(opts, "tenx_to_scx")?;
     let file = hdf5::File::open(input)?;
 
     let format = detect_input_format(&file)?;
@@ -1312,7 +1254,7 @@ pub fn scx_to_h5ad(
 pub fn scx_to_h5ad_streaming(
     scx_path: &Path,
     h5ad_path: &Path,
-    opts: &ConvertOptions,
+    opts: &crate::ExportOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     crate::h5ad::stream_write::write_scx_to_h5ad_streaming(scx_path, h5ad_path, opts, sink)
@@ -1391,7 +1333,6 @@ pub fn h5ad_to_scx_streaming(
     overrides: &StreamingOverrides,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    reject_export_row_filter_on_import(opts, "h5ad_to_scx_streaming")?;
     let file = hdf5::File::open(input)?;
 
     // Format gating. `open_x_streaming` re-checks CSC/dense and the
@@ -1898,7 +1839,7 @@ pub fn h5ad_to_scx_streaming(
         MatrixFormat::Csc => "csc_matrix",
         MatrixFormat::Dense => "array",
     };
-    let resolved_reader_threads = resolve_reader_threads(opts);
+    let resolved_reader_threads = resolve_reader_threads(opts.reader_threads);
     // Phase 7.4: record the grouping config when `--group-by` was used (mirrors
     // `scx sort`'s `grouping_provenance`), else `null`.
     let grouping_json = match &opts.group_by {
@@ -2455,7 +2396,7 @@ pub fn run_streaming_writer_coordinator(
     sink: &mut WarningSink,
     explicit_ranges: Option<&[(u64, u32)]>,
 ) -> Result<(u32, Vec<(u64, u64)>), ConvertError> {
-    let requested = resolve_reader_threads(opts);
+    let requested = resolve_reader_threads(opts.reader_threads);
 
     // ----- Phase 7.4: group-aligned ranges -----
     if let Some(ranges) = explicit_ranges {

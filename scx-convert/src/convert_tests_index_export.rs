@@ -359,7 +359,13 @@ fn test_h5ad_csr_to_scx_to_h5ad_streaming_round_trip() {
     let opts = ConvertOptions::default();
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
 
-    scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad_streaming(
+        &scx_path,
+        &h5ad_out,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     let orig_file = hdf5::File::open(&h5ad_path).unwrap();
     let out_file = hdf5::File::open(&h5ad_out).unwrap();
@@ -456,7 +462,13 @@ fn test_scx_to_h5mu_streaming_round_trip() {
 
     let opts = ConvertOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
-    scx_to_h5mu_streaming(&scx_path, &h5mu_out, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5mu_streaming(
+        &scx_path,
+        &h5mu_out,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     let file = hdf5::File::open(&h5mu_out).unwrap();
     assert!(file.group("mod").is_ok());
@@ -523,7 +535,13 @@ fn test_h5ad_streaming_multi_shard_round_trip() {
         "fixture should produce multiple shards to exercise the streaming loop"
     );
 
-    scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad_streaming(
+        &scx_path,
+        &h5ad_out,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     let orig_file = hdf5::File::open(&h5ad_path).unwrap();
     let out_file = hdf5::File::open(&h5ad_out).unwrap();
@@ -584,7 +602,13 @@ fn test_h5ad_streaming_with_deletion_vectors() {
     let deleted: Vec<u64> = vec![1, 3, 7];
     scx_ops::mark_deleted(&scx_path, &deleted).unwrap();
 
-    scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad_streaming(
+        &scx_path,
+        &h5ad_out,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     let out_file = hdf5::File::open(&h5ad_out).unwrap();
     let shape: Vec<i64> = out_file
@@ -641,8 +665,14 @@ fn test_modality_extract_to_h5ad_streaming() {
 
     let opts = ConvertOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
-    scx_modality_to_h5ad_streaming(&scx_path, &h5ad_out, "rna", &opts, &mut WarningSink::log())
-        .unwrap();
+    scx_modality_to_h5ad_streaming(
+        &scx_path,
+        &h5ad_out,
+        "rna",
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     let file = hdf5::File::open(&h5ad_out).unwrap();
     assert!(file.group("X").is_ok());
@@ -695,7 +725,13 @@ fn test_boolean_round_trip_via_streaming_export() {
 
     let opts = ConvertOptions::default();
     h5ad_to_scx(&h5ad_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
-    scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad_streaming(
+        &scx_path,
+        &h5ad_out,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     // Output shape: /obs/is_doublet is a group with values + mask.
     let file = hdf5::File::open(&h5ad_out).unwrap();
@@ -793,7 +829,13 @@ fn test_categorical_wide_round_trip() {
 
     // This is the call that previously failed at HDF5's attribute
     // limit. With the writer fix, it succeeds.
-    scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad_streaming(
+        &scx_path,
+        &h5ad_out,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
 
     // Output shape: /obs/wide_cat is a *group* (not a dataset)
     // containing codes + categories.

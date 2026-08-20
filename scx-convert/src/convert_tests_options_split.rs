@@ -106,9 +106,9 @@ fn export_round_trip_output_is_unchanged() {
     super::scx_to_h5ad_streaming(
         &scx,
         &exported,
-        &ConvertOptions {
+        &ExportOptions {
             tool: "scx".into(),
-            ..ConvertOptions::default()
+            ..ExportOptions::default()
         },
         &mut WarningSink::log(),
     )

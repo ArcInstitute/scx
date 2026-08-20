@@ -30,12 +30,12 @@ fn build_scx(dir: &Path, n_obs: usize, n_vars: usize, extras: bool) -> std::path
     scx
 }
 
-fn export(scx: &Path, out: &Path, opts: &ConvertOptions) -> Result<(), ConvertError> {
+fn export(scx: &Path, out: &Path, opts: &ExportOptions) -> Result<(), ConvertError> {
     scx_to_h5ad_streaming(scx, out, opts, &mut WarningSink::log())
 }
 
-fn mask_opts(mask: Vec<bool>) -> ConvertOptions {
-    ConvertOptions {
+fn mask_opts(mask: Vec<bool>) -> ExportOptions {
+    ExportOptions {
         export_obs_keep_mask: Some(Arc::from(mask)),
         ..Default::default()
     }
@@ -113,7 +113,7 @@ fn mask_selects_the_right_rows_not_just_the_right_count() {
     let unfiltered = dir.path().join("all.h5ad");
     let filtered = dir.path().join("even.h5ad");
 
-    export(&scx, &unfiltered, &ConvertOptions::default()).unwrap();
+    export(&scx, &unfiltered, &ExportOptions::default()).unwrap();
 
     let mask: Vec<bool> = (0..n_obs).map(|i| i % 2 == 0).collect();
     export(&scx, &filtered, &mask_opts(mask.clone())).unwrap();
@@ -145,7 +145,7 @@ fn mask_intersects_deletion_vector_and_never_resurrects() {
     // Baseline captured before the delete, so the expected values below come
     // from the same file rather than a re-generated one.
     let all_out = dir.path().join("all.h5ad");
-    export(&scx, &all_out, &ConvertOptions::default()).unwrap();
+    export(&scx, &all_out, &ExportOptions::default()).unwrap();
 
     scx_ops::mark_deleted(&scx, &[0, 1]).unwrap();
 
@@ -211,7 +211,7 @@ fn all_deleted_without_a_caller_filter_still_exports() {
     scx_ops::mark_deleted(&scx, &all).unwrap();
 
     let out = dir.path().join("out.h5ad");
-    export(&scx, &out, &ConvertOptions::default()).unwrap();
+    export(&scx, &out, &ExportOptions::default()).unwrap();
     assert_eq!(x_rows(&hdf5::File::open(&out).unwrap()), 0);
 }
 
@@ -234,7 +234,7 @@ fn min_counts_matches_an_equivalent_explicit_mask() {
     export(
         &scx,
         &by_counts,
-        &ConvertOptions {
+        &ExportOptions {
             export_min_counts: Some(threshold),
             ..Default::default()
         },
@@ -269,7 +269,7 @@ fn min_counts_and_mask_intersect() {
     export(
         &scx,
         &out,
-        &ConvertOptions {
+        &ExportOptions {
             export_obs_keep_mask: Some(Arc::from(user_mask)),
             export_min_counts: Some(threshold),
             ..Default::default()
@@ -296,7 +296,7 @@ fn masked_export_parallel_equals_sequential() {
     export(
         &scx,
         &seq_out,
-        &ConvertOptions {
+        &ExportOptions {
             reader_threads: Some(1),
             ..mask_opts(mask.clone())
         },
@@ -307,7 +307,7 @@ fn masked_export_parallel_equals_sequential() {
     export(
         &scx,
         &par_out,
-        &ConvertOptions {
+        &ExportOptions {
             reader_threads: Some(4),
             ..mask_opts(mask)
         },
@@ -396,7 +396,7 @@ fn unfiltered_modality_export_writes_no_provenance() {
         &scx,
         &out,
         "rna",
-        &ConvertOptions::default(),
+        &ExportOptions::default(),
         &mut WarningSink::log(),
     )
     .unwrap();
@@ -416,33 +416,17 @@ fn unfiltered_modality_export_writes_no_provenance() {
 // ---------------------------------------------------------------------------
 // Direction guards
 // ---------------------------------------------------------------------------
-
-#[test]
-fn export_row_filter_is_rejected_on_import_directions() {
-    let dir = tempfile::tempdir().unwrap();
-    let h5ad = dir.path().join("in.h5ad");
-    let scx = dir.path().join("out.scx");
-    create_test_h5ad(&h5ad, 10, 8, "csr", false);
-
-    let opts = ConvertOptions {
-        export_min_counts: Some(5.0),
-        ..Default::default()
-    };
-    let err = h5ad_to_scx(&h5ad, &scx, &opts, &mut WarningSink::log()).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("export_min_counts"), "{msg}");
-    assert!(msg.contains("h5ad_to_scx"), "{msg}");
-
-    let err = h5ad_to_scx_streaming(
-        &h5ad,
-        &scx,
-        &opts,
-        &StreamingOverrides::default(),
-        &mut WarningSink::log(),
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("export_min_counts"));
-}
+//
+// `export_row_filter_is_rejected_on_import_directions` lived here. It asserted
+// that `h5ad_to_scx` / `h5ad_to_scx_streaming` returned an error naming
+// `export_min_counts` when handed one.
+//
+// ORG-11.16-3 retired it by making the state it tested unrepresentable:
+// `export_min_counts` is on `ExportOptions`, the ingest entry points take
+// `IngestOptions`, and the combination no longer type-checks. The test did not
+// lose coverage -- it changed instrument, from a runtime string to a compile
+// error, and the compile-fail doctest pair on `ExportOptions` is where that
+// claim is now asserted.
 
 // ---------------------------------------------------------------------------
 // uns provenance
@@ -453,7 +437,7 @@ fn unfiltered_export_writes_no_scx_export_key() {
     let dir = tempfile::tempdir().unwrap();
     let scx = build_scx(dir.path(), 10, 8, true);
     let out = dir.path().join("out.h5ad");
-    export(&scx, &out, &ConvertOptions::default()).unwrap();
+    export(&scx, &out, &ExportOptions::default()).unwrap();
 
     let f = hdf5::File::open(&out).unwrap();
     let uns = f.group("uns").unwrap();
@@ -474,7 +458,7 @@ fn deletion_only_export_writes_no_scx_export_key() {
     let scx = build_scx(dir.path(), 10, 8, true);
     scx_ops::mark_deleted(&scx, &[0]).unwrap();
     let out = dir.path().join("out.h5ad");
-    export(&scx, &out, &ConvertOptions::default()).unwrap();
+    export(&scx, &out, &ExportOptions::default()).unwrap();
 
     let f = hdf5::File::open(&out).unwrap();
     assert!(f
@@ -494,7 +478,7 @@ fn filtered_export_records_provenance_alongside_existing_uns() {
     export(
         &scx,
         &out,
-        &ConvertOptions {
+        &ExportOptions {
             export_min_counts: Some(100.0),
             ..Default::default()
         },
@@ -548,7 +532,7 @@ fn existing_scx_export_uns_key_is_preserved() {
     scx_to_h5ad_streaming(
         &scx,
         &out,
-        &ConvertOptions {
+        &ExportOptions {
             export_min_counts: Some(100.0),
             ..Default::default()
         },
