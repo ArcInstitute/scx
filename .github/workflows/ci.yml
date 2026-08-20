@@ -555,6 +555,91 @@ jobs:
             fi
           done
 
+
+      # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
+      # call. `export_obs_keep_mask` / `export_min_counts` live on
+      # `ExportOptions` and nowhere else. The runtime helper that used to police
+      # this -- `reject_export_row_filter_on_import`, called at the top of all
+      # five ingest entry points purely to turn a nonsensical combination into
+      # an error string -- is deleted, because the type now expresses the
+      # distinction.
+      #
+      # The convention the grep keys on: an export-only option is named
+      # `export_*`. Declaring one on `IngestOptions` re-creates the whole "flag
+      # silently ignored on the wrong direction" class (review 1.1, 11.12).
+      - name: No export-only option is declared on the ingest options
+        run: |
+          set -e
+          if grep -rEn --include='*.rs' 'fn reject_export_row_filter_on_import' . \
+               | grep -v '^./target'; then
+            echo "::error::reject_export_row_filter_on_import is back — the ingest/export split is what makes it unnecessary (ORG-11.16-3)."
+            exit 1
+          fi
+          if sed -n '/^pub struct IngestOptions {/,/^}/p' scx-convert/src/pipeline.rs \
+               | grep -nE '^[[:space:]]*pub[[:space:]]+export_'; then
+            echo "::error::an export-only option (export_*) is declared on IngestOptions — it belongs on ExportOptions (ORG-11.16-3)."
+            exit 1
+          fi
+      # The greps above only reject a forbidden shape, so re-widening an export
+      # entry point back to the ingest type would pass them: no forbidden token
+      # appears. This is the positive half. Named individually rather than
+      # counted, so adding a private helper does not move the number.
+      #
+      # Known limit, stated so a green run is not read as more than it is: the
+      # negative half keys on a NAMING convention, so a genuinely export-only
+      # field called something other than `export_*` slips through. What catches
+      # that is the compiler, once the field is on ExportOptions; the grep is a
+      # tripwire against re-widening IngestOptions, not a classifier.
+      - name: Every export entry point takes ExportOptions
+        run: |
+          set -e
+          for f in scx_to_h5ad_streaming write_scx_to_h5ad_streaming \
+                   scx_to_h5mu_streaming scx_modality_to_h5ad_streaming; do
+            if ! grep -rA8 --include='*.rs' "pub fn $f(" scx-convert/src \
+                 | grep -qE 'opts:[[:space:]]*&(crate::)?(options::)?ExportOptions'; then
+              echo "::error::$f no longer takes &ExportOptions — an export writer that accepts ingest options can silently ignore half of them (ORG-11.16-3)."
+              exit 1
+            fi
+          done
+
+      # ORG-11.16-5: memory-budget arithmetic is derived in exactly one place,
+      # `scx-convert/src/budget.rs`. Review 11.5 is what one-site drift looks
+      # like: `dense_stream.rs` divided the budget by 4 in one function and
+      # multiplied the resulting slab by 2 in another, spending the same reserve
+      # twice and collapsing every budget-bound dense convert to a single
+      # thread. The same line also keyed its reserve to the source dtype width,
+      # which the resident buffers do not depend on, so a u8 input exceeded its
+      # budget threefold.
+      #
+      # Dividing or multiplying anything named `budget*` by an integer literal
+      # is the fingerprint of a hand-rolled reservation; a legitimate caller
+      # asks the table for a `Share`. Test modules are exempt (they assert on
+      # the numbers); a justified standalone use marks itself
+      # `ORG-11.16-5-ALLOW` with a reason.
+      - name: Budget arithmetic lives only in scx-convert/src/budget.rs
+        run: |
+          if grep -rEn --include='*.rs' \
+               '\bbudget[a-z_]*[[:space:]]*(/|\*)[[:space:]]*[0-9]' scx-convert/src \
+               | grep -vE 'scx-convert/src/budget(_tests)?\.rs' \
+               | grep -vE 'scx-convert/src/convert_tests_' \
+               | grep -vE 'ORG-11\.16-5-ALLOW' \
+               | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::budget arithmetic outside scx-convert/src/budget.rs — add a Reservation row and ask the table for a Share instead of dividing the budget inline (ORG-11.16-5)."
+            exit 1
+          fi
+      # Positive half: deleting the table outright leaves the grep above nothing
+      # to find. The two dense sites that drifted apart in 11.5 -- the slab cap
+      # in `open_dense_streaming` and the estimate in `per_worker_bytes` -- must
+      # each derive from it. Re-splitting them is exactly the double-count.
+      - name: Both dense budget sites derive from one table entry
+        run: |
+          n=$(grep -cE 'budget::dense_(slab_bytes|max_slab_rows|min_budget|peak_bytes_per_elem)[[:space:]]*\(' \
+                scx-convert/src/h5ad/dense_stream.rs || true)
+          if [ "$n" -lt 3 ]; then
+            echo "::error::expected at least 3 budget::dense_* call sites in dense_stream.rs (slab cap, refusal message, per_worker_bytes estimate), found $n. Re-deriving any of them locally is the 11.5 double-count (ORG-11.16-5)."
+            exit 1
+          fi
+
   feature-check:
     name: Feature matrix (cargo check)
     runs-on: ubuntu-latest
