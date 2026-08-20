@@ -159,12 +159,6 @@ pub struct ConvertOptions {
     /// sizing heuristic. Parse user-facing strings with
     /// [`crate::MemoryBudget::parse`].
     pub memory_budget: Option<u64>,
-    /// Prefer streaming I/O over full materialisation when the input
-    /// supports it (CSR and dense `/X`). When `false`, `h5ad_to_scx`
-    /// keeps the legacy in-memory path. When `true` (default), CSR
-    /// and dense routes go through `h5ad_to_scx_streaming`; CSC-on-
-    /// disk still errors with the Phase 2 message.
-    pub stream: bool,
     /// Fail conversion on the first unsupported `uns` key instead of
     /// skipping it with a warning. Default `false` keeps the existing
     /// lenient behaviour.
@@ -550,7 +544,6 @@ impl Default for ConvertOptions {
             decode_target: None,
             tool: "scx".into(),
             memory_budget: None,
-            stream: true,
             strict_uns: false,
             dense_zero_epsilon: 0.0,
             temp_dir: None,

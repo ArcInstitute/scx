@@ -455,7 +455,6 @@ pub fn from_h5mu_impl(
         csc_cols_per_shard,
         tool: "pyscx".into(),
         memory_budget: memory_budget_bytes,
-        stream,
         strict_uns,
         dense_zero_epsilon: 0.0,
         temp_dir: temp_dir.map(std::path::PathBuf::from),

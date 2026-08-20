@@ -653,7 +653,6 @@ fn from_h5ad(
         decode_target: decode_target_parsed,
         tool: "pyscx".into(),
         memory_budget: memory_budget_bytes,
-        stream,
         strict_uns,
         dense_zero_epsilon,
         temp_dir: temp_dir.map(std::path::PathBuf::from),
@@ -980,7 +979,6 @@ fn to_h5ad(
     }
 
     let opts = scx_convert::ConvertOptions {
-        stream,
         tool: "pyscx".into(),
         reader_threads,
         writer_queue_depth,
@@ -1038,7 +1036,6 @@ fn to_h5mu(
     use std::path::Path;
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     let opts = scx_convert::ConvertOptions {
-        stream,
         tool: "pyscx".into(),
         reader_threads,
         writer_queue_depth,

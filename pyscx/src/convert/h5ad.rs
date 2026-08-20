@@ -211,7 +211,6 @@ pub(crate) fn route_backed_anndata_to_streaming(
         csc_cols_per_shard,
         tool: "pyscx".into(),
         memory_budget,
-        stream,
         strict_uns,
         dense_zero_epsilon,
         temp_dir: temp_dir.map(std::path::PathBuf::from),

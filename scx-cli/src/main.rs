@@ -2243,7 +2243,6 @@ fn dispatch_convert(
         decode_target,
         tool: "scx".into(),
         memory_budget,
-        stream,
         strict_uns,
         dense_zero_epsilon,
         temp_dir,
@@ -2308,7 +2307,7 @@ fn dispatch_convert(
         "tenx_to_scx" => convert::tenx_to_scx(input, output, &opts, &mut sink),
         "scx_to_h5ad" => match modality {
             Some(name) => {
-                if opts.stream {
+                if stream {
                     convert::scx_modality_to_h5ad_streaming(input, output, name, &opts, &mut sink)
                 } else {
                     convert::scx_modality_to_h5ad(input, output, name, &mut sink)
@@ -2331,7 +2330,7 @@ fn dispatch_convert(
                     )
                     .into());
                 }
-                if opts.stream {
+                if stream {
                     convert::scx_to_h5ad_streaming(input, output, &opts, &mut sink)
                 } else {
                     convert::scx_to_h5ad(input, output, &mut sink)
@@ -2339,7 +2338,7 @@ fn dispatch_convert(
             }
         },
         "scx_to_h5mu" => {
-            if opts.stream {
+            if stream {
                 convert::scx_to_h5mu_streaming(input, output, &opts, &mut sink)
             } else {
                 convert::scx_to_h5mu(input, output, &mut sink)
