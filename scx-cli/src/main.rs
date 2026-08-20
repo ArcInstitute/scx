@@ -779,8 +779,9 @@ enum Commands {
         /// Print matching cell count only
         #[arg(long)]
         count: bool,
-        /// Write matching cells to a new SCX file
-        #[arg(long)]
+        /// Write matching cells to a new SCX file. Mutually exclusive with
+        /// `--count`, which prints a number and writes nothing.
+        #[arg(long, conflicts_with = "count")]
         output: Option<PathBuf>,
         /// File containing gene indices for projection (one per line)
         #[arg(long)]
