@@ -1,0 +1,1113 @@
+{
+  "strictness": "Content",
+  "excluded_section_types": [
+    11
+  ],
+  "header": {
+    "format_version": 4,
+    "flags": 4,
+    "n_obs": 64,
+    "n_vars": 13,
+    "nnz": 160,
+    "n_csr_shards": 16,
+    "n_csc_shards": 0,
+    "shard_target_rows": 4,
+    "codec_id": 0,
+    "index_dtype": 0,
+    "manifest_sequence": 1,
+    "n_modalities": 0
+  },
+  "catalog": {
+    "catalog_version": 4,
+    "manifest_sequence": 1,
+    "n_obs": 64,
+    "data_generation": 1,
+    "csc_build_generation": 0
+  },
+  "sections": [
+    {
+      "name": "X_shard_0",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "0fc10d12144218fbb2ba39c65d694223dbad28c80b3e6f198c6e921fbc208672",
+      "stats": {
+        "row_start": 0,
+        "row_end": 4,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 2,
+        "value_max": 29,
+        "value_sum": 156,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:0000000000000000:403e000000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_1",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "448478d175b3542a641426415833d76e3fa86ba63fa1aef72a65113ee59b697e",
+      "stats": {
+        "row_start": 4,
+        "row_end": 8,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 30,
+        "value_max": 57,
+        "value_sum": 436,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:4044000000000000:4051800000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_10",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "d31087dc3ec38031337ad93ccfaa36fbd25f496b3f1e328ba5a61ec2a9e12f14",
+      "stats": {
+        "row_start": 40,
+        "row_end": 44,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 82,
+        "value_max": 109,
+        "value_sum": 956,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:4079000000000000:407ae00000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_11",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "4092d8bfa48ff270ec84e6b2c244cdf34720c41b3b46974834bcafa5a0903f82",
+      "stats": {
+        "row_start": 44,
+        "row_end": 48,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 110,
+        "value_max": 137,
+        "value_sum": 1236,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:407b800000000000:407d600000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_12",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "57a893092ff4dea3653d2a1ee812f09bfe11d15b99b455aaf9e5c98156c7b1e1",
+      "stats": {
+        "row_start": 48,
+        "row_end": 52,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 138,
+        "value_max": 165,
+        "value_sum": 1516,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:407e000000000000:407fe00000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_13",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "f6bfe76f8c29e31872899b22fb9ace6f1df3fa626600f0a0f4fe5cdcfe967da7",
+      "stats": {
+        "row_start": 52,
+        "row_end": 56,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 166,
+        "value_max": 193,
+        "value_sum": 1796,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:4080400000000000:4081300000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_14",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "9879c2eb5ebbe98459ef045abc489636d087398d500248fece82a5037586afec",
+      "stats": {
+        "row_start": 56,
+        "row_end": 60,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 1,
+        "value_max": 197,
+        "value_sum": 476,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:4081800000000000:4082700000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_15",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "3235b2f2fea19071a0619cb49eed6f0c67c2f29cd6a77221d2c75a8e9c46b94d",
+      "stats": {
+        "row_start": 60,
+        "row_end": 64,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 22,
+        "value_max": 49,
+        "value_sum": 356,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:4082c00000000000:4083b00000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_2",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "abefc14635bbe7871151bac0685015444dab2b511df60b49c04e346f55d99125",
+      "stats": {
+        "row_start": 8,
+        "row_end": 12,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 58,
+        "value_max": 85,
+        "value_sum": 716,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:4054000000000000:405b800000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_3",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "5341a4cfc5a03c93b85f7bb1615fffd625260e455b3b5c24901e0e5a03c9ebd9",
+      "stats": {
+        "row_start": 12,
+        "row_end": 16,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 86,
+        "value_max": 113,
+        "value_sum": 996,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:405e000000000000:4062c00000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_4",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "713f2035b8f21bd8bdccff4e5c7b5c4080c8b0e01a9f238bd397d12408a87dec",
+      "stats": {
+        "row_start": 16,
+        "row_end": 20,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 114,
+        "value_max": 141,
+        "value_sum": 1276,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:4064000000000000:4067c00000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_5",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "b96794f05cd28a38643a3fb022cb6fa7d36ad10be37202d6b670cf135ab40a99",
+      "stats": {
+        "row_start": 20,
+        "row_end": 24,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 142,
+        "value_max": 169,
+        "value_sum": 1556,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:4069000000000000:406cc00000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_6",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "7fa6cbabd9e2e10efbe893bcb8413b6daeee5f6cd11e6cdabd49799c2bec4b4b",
+      "stats": {
+        "row_start": 24,
+        "row_end": 28,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 170,
+        "value_max": 197,
+        "value_sum": 1836,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:406e000000000000:4070e00000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_7",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "618fcd164896453471e413d91222115dc1e2b1878f9cec0031f94e6d1ef7c92d",
+      "stats": {
+        "row_start": 28,
+        "row_end": 32,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 1,
+        "value_max": 198,
+        "value_sum": 316,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:4071800000000000:4073600000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_8",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "338490b26da17d93522577fb337495b74ff4629bd2fa93a1ce288ec0e929c3d4",
+      "stats": {
+        "row_start": 32,
+        "row_end": 36,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 26,
+        "value_max": 53,
+        "value_sum": 396,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:4074000000000000:4075e00000000000"
+        ]
+      }
+    },
+    {
+      "name": "X_shard_9",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "5442d99998aaf81cedd92acade5dd46e626307a68336b80cd1f5cb332e7d75b6",
+      "stats": {
+        "row_start": 36,
+        "row_end": 40,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 54,
+        "value_max": 81,
+        "value_sum": 676,
+        "n_indexed_columns": 1,
+        "column_stats": [
+          "minmax:8132a1927494084f:4076800000000000:4078600000000000"
+        ]
+      }
+    },
+    {
+      "name": "obs_metadata/shard_0",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "1642a91808488ed002c4c437c74518a03079c5a9c212dfa17896ea890f5342c9",
+      "stats": {
+        "row_start": 0,
+        "row_end": 4,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_1",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "2ca122a0ff1fc5bd6084fe1530a0120e26d20c01f0931f5ea723d556eda632cb",
+      "stats": {
+        "row_start": 4,
+        "row_end": 8,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_10",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "c61e31e6325bd739722926c2581d1ee66e6d1dcd6e0ba24e04268c7dea60e469",
+      "stats": {
+        "row_start": 40,
+        "row_end": 44,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_11",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "c904f8b5c49dfbd72667f9beb61462ef83b59e35f82c452405ac225f79ae0c9c",
+      "stats": {
+        "row_start": 44,
+        "row_end": 48,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_12",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "e1a710671b94fafb122ee2df0a16a6adb28a2a20327cc862c98384f5211becb1",
+      "stats": {
+        "row_start": 48,
+        "row_end": 52,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_13",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "ebd0f4f5424bac10e39d6731a9815a15c93d95032f6c3b74323a25d3fe277a4b",
+      "stats": {
+        "row_start": 52,
+        "row_end": 56,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_14",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "38cb0f5fdb75570dccfeebe48d6b8ab0cbb684bf4b129a0c012ce6a49e49944a",
+      "stats": {
+        "row_start": 56,
+        "row_end": 60,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_15",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "f48e0cd9a7e0a077069d25207ffc1f47a7f542cd40626a4599a0807ec610ff34",
+      "stats": {
+        "row_start": 60,
+        "row_end": 64,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_2",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "baefab5e48a393cb32a266397bd54d842adbabe2d180ac5a4ede81389b77e0b9",
+      "stats": {
+        "row_start": 8,
+        "row_end": 12,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_3",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "bc13798d709ff6dbff673a148757e17490fca96c3423ad61bc3940c9a810242f",
+      "stats": {
+        "row_start": 12,
+        "row_end": 16,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_4",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "55d4df2bfeca08e63eaa4808ff2adc6d4a0aafc3befa7588bbc8ed27886f7776",
+      "stats": {
+        "row_start": 16,
+        "row_end": 20,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_5",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "2d20e44ff1dcd69eadd5c2b231d9ca1125b178b409305e7005a1e583ae8e62ad",
+      "stats": {
+        "row_start": 20,
+        "row_end": 24,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_6",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "9ae7890ddb1464a9b39c881b7e1994eaff9494bfdf06d581f539fc5154bac62a",
+      "stats": {
+        "row_start": 24,
+        "row_end": 28,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_7",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "8fecdfa4c6b4574748f8d378c0796247f1e991691a5beb425406b2830ab1d8b6",
+      "stats": {
+        "row_start": 28,
+        "row_end": 32,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_8",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "780e8d1c62c7aeff666d532c9f130e78e682e3625191f5e9373ee2e3fea1560f",
+      "stats": {
+        "row_start": 32,
+        "row_end": 36,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_metadata/shard_9",
+      "section_type": 24,
+      "modality_id": 0,
+      "length": 1658,
+      "blake3": "e766a7d9eca0dcaedd55074cc0863cb64dec69d2a01dafe29dc8eb9cd792c2ad",
+      "stats": {
+        "row_start": 36,
+        "row_end": 40,
+        "col_start": 0,
+        "col_end": 0,
+        "nnz": 0,
+        "value_min": 0,
+        "value_max": 0,
+        "value_sum": 0,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "obs_predicate_index",
+      "section_type": 13,
+      "modality_id": 0,
+      "length": 480,
+      "blake3": "c76ffeb30edfb2efcf48a511fe3d978829c1c4a32afa164fd6094b64aa4fe7e7"
+    },
+    {
+      "name": "obsm/X_pca_shard_0",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "12da12f3784351246f175f114ccc86d978dd2c88f6354008dd24b1a3c344d366"
+    },
+    {
+      "name": "obsm/X_pca_shard_1",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "930c14430dac6370720c417e3da07d05857f772bb4e582cef0521a0ea886a9a7"
+    },
+    {
+      "name": "obsm/X_pca_shard_10",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "0d629bcc6c9b35df22e1b612ea39dd912d7646fd76d390482558801d33ffec21"
+    },
+    {
+      "name": "obsm/X_pca_shard_11",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "f172fe231cf7b8f17b2abe8598a58a2cbb7dfafb4d911739a6c342c05c1991b9"
+    },
+    {
+      "name": "obsm/X_pca_shard_12",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "4b30143d80fa25760dc291759641d1a09d486be17ec589ef0d7ab4811fbfb833"
+    },
+    {
+      "name": "obsm/X_pca_shard_13",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "6a5b662718fb9eab8459bfa5543d2bc47b5cbfdce1c29c62299e46443603a662"
+    },
+    {
+      "name": "obsm/X_pca_shard_14",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "ef2aedacb9643ef7d18986da5e9761d0420efab78feed1bcf5502500a8cc6053"
+    },
+    {
+      "name": "obsm/X_pca_shard_15",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "5b79651c5caebff08f5c69bc779ed1f123537b00b131503f3aed9fe20a6d5220"
+    },
+    {
+      "name": "obsm/X_pca_shard_2",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "dd4ade2da181421a556d7574c79bcb4cb56bcb75d72532905156894777fd9ff3"
+    },
+    {
+      "name": "obsm/X_pca_shard_3",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "f9a6885ef50179f9dc7ca6e89c1ac947d34b9842eac40f3186415c7154880236"
+    },
+    {
+      "name": "obsm/X_pca_shard_4",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "5aefaf0b74e07239f3c5ab05f02e911b74e461e2b76bf8a1517ecc8d01ee2a37"
+    },
+    {
+      "name": "obsm/X_pca_shard_5",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "7087484e2a2b9ec62974e5a5f79d252a8acd090ba913c94e9ed17858e9d691a7"
+    },
+    {
+      "name": "obsm/X_pca_shard_6",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "f05f9afa634840ea80c0184c5a24e427a25bee4d21f942a3bb14986a1cf5d7cc"
+    },
+    {
+      "name": "obsm/X_pca_shard_7",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "7f609e5e426aaf7df99d53329ba07c0224826a030a0bea3511d85d8def9b6786"
+    },
+    {
+      "name": "obsm/X_pca_shard_8",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "9e404064bce7edb4d09e8b5acd18b3d23b15a133b977161a9b1c18e397c76e61"
+    },
+    {
+      "name": "obsm/X_pca_shard_9",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1322,
+      "blake3": "8039765f0cb023308145729329dabcfce3771e782059b4c61bd762d7fd37fa8b"
+    },
+    {
+      "name": "raw_shard_0",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "0fc10d12144218fbb2ba39c65d694223dbad28c80b3e6f198c6e921fbc208672",
+      "stats": {
+        "row_start": 0,
+        "row_end": 4,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 2,
+        "value_max": 29,
+        "value_sum": 156,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_1",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "448478d175b3542a641426415833d76e3fa86ba63fa1aef72a65113ee59b697e",
+      "stats": {
+        "row_start": 4,
+        "row_end": 8,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 30,
+        "value_max": 57,
+        "value_sum": 436,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_10",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "d31087dc3ec38031337ad93ccfaa36fbd25f496b3f1e328ba5a61ec2a9e12f14",
+      "stats": {
+        "row_start": 40,
+        "row_end": 44,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 82,
+        "value_max": 109,
+        "value_sum": 956,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_11",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "4092d8bfa48ff270ec84e6b2c244cdf34720c41b3b46974834bcafa5a0903f82",
+      "stats": {
+        "row_start": 44,
+        "row_end": 48,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 110,
+        "value_max": 137,
+        "value_sum": 1236,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_12",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "57a893092ff4dea3653d2a1ee812f09bfe11d15b99b455aaf9e5c98156c7b1e1",
+      "stats": {
+        "row_start": 48,
+        "row_end": 52,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 138,
+        "value_max": 165,
+        "value_sum": 1516,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_13",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "f6bfe76f8c29e31872899b22fb9ace6f1df3fa626600f0a0f4fe5cdcfe967da7",
+      "stats": {
+        "row_start": 52,
+        "row_end": 56,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 166,
+        "value_max": 193,
+        "value_sum": 1796,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_14",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "9879c2eb5ebbe98459ef045abc489636d087398d500248fece82a5037586afec",
+      "stats": {
+        "row_start": 56,
+        "row_end": 60,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 1,
+        "value_max": 197,
+        "value_sum": 476,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_15",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "3235b2f2fea19071a0619cb49eed6f0c67c2f29cd6a77221d2c75a8e9c46b94d",
+      "stats": {
+        "row_start": 60,
+        "row_end": 64,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 22,
+        "value_max": 49,
+        "value_sum": 356,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_2",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "abefc14635bbe7871151bac0685015444dab2b511df60b49c04e346f55d99125",
+      "stats": {
+        "row_start": 8,
+        "row_end": 12,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 58,
+        "value_max": 85,
+        "value_sum": 716,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_3",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "5341a4cfc5a03c93b85f7bb1615fffd625260e455b3b5c24901e0e5a03c9ebd9",
+      "stats": {
+        "row_start": 12,
+        "row_end": 16,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 86,
+        "value_max": 113,
+        "value_sum": 996,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_4",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "713f2035b8f21bd8bdccff4e5c7b5c4080c8b0e01a9f238bd397d12408a87dec",
+      "stats": {
+        "row_start": 16,
+        "row_end": 20,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 114,
+        "value_max": 141,
+        "value_sum": 1276,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_5",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "b96794f05cd28a38643a3fb022cb6fa7d36ad10be37202d6b670cf135ab40a99",
+      "stats": {
+        "row_start": 20,
+        "row_end": 24,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 142,
+        "value_max": 169,
+        "value_sum": 1556,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_6",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "7fa6cbabd9e2e10efbe893bcb8413b6daeee5f6cd11e6cdabd49799c2bec4b4b",
+      "stats": {
+        "row_start": 24,
+        "row_end": 28,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 170,
+        "value_max": 197,
+        "value_sum": 1836,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_7",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "618fcd164896453471e413d91222115dc1e2b1878f9cec0031f94e6d1ef7c92d",
+      "stats": {
+        "row_start": 28,
+        "row_end": 32,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 1,
+        "value_max": 198,
+        "value_sum": 316,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_8",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "338490b26da17d93522577fb337495b74ff4629bd2fa93a1ce288ec0e929c3d4",
+      "stats": {
+        "row_start": 32,
+        "row_end": 36,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 26,
+        "value_max": 53,
+        "value_sum": 396,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "raw_shard_9",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 182,
+      "blake3": "5442d99998aaf81cedd92acade5dd46e626307a68336b80cd1f5cb332e7d75b6",
+      "stats": {
+        "row_start": 36,
+        "row_end": 40,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 10,
+        "value_min": 54,
+        "value_max": 81,
+        "value_sum": 676,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "uns",
+      "section_type": 10,
+      "modality_id": 0,
+      "length": 31,
+      "blake3": "65a30a6680525ca230473808196b04ec146a1f5dde2644f29e5c27390afc7db2"
+    },
+    {
+      "name": "var",
+      "section_type": 2,
+      "modality_id": 0,
+      "length": 1106,
+      "blake3": "afa3d84d34857a057acfac4555b417b2018350539e369c9694faf91582cba1d0"
+    },
+    {
+      "name": "var_predicate_index",
+      "section_type": 14,
+      "modality_id": 0,
+      "length": 316,
+      "blake3": "cf81cde37f1b8fcbace052d0738467c1c229b676e25bdb3e00bdf1feb8e31172"
+    }
+  ]
+}

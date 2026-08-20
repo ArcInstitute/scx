@@ -54,4 +54,7 @@ libz-sys = { version = "1", optional = true, default-features = false }
 ndarray = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Output-identity harness. Acyclic: scx-testkit depends only on scx-format,
+# scx-format-io and scx-codec, all of which scx-convert already depends on.
+scx-testkit = { path = "../scx-testkit" }
 flate2 = "1"
