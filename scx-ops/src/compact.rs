@@ -281,7 +281,7 @@ pub fn compact_with_options(
         .with_data_generation(reader.catalog().data_generation + 1);
     writer.set_framing(framing_for_rewrite(opts.codec, output_framed, "the input")?);
     if let Some(ref filtered_obs) = eager_filtered_obs {
-        write_obs_section(
+        scx_format_io::write_obs_section(
             &mut writer,
             filtered_obs,
             reshape_obs,
@@ -834,46 +834,6 @@ pub(crate) fn discover_modality_keys(
     keys.into_iter().collect()
 }
 
-/// Write the (filtered) obs metadata batch to `writer`.
-///
-/// When `reshape` is false this writes a single legacy `ObsMetadata`
-/// section (the historical compact behaviour). When true the batch is
-/// sliced into `shard_target_rows`-sized chunks and emitted as
-/// `ObsMetadataShard` sections — the in-place migration path for files
-/// written before sharded obs metadata existed. `write_obs_shard`
-/// upcasts `Utf8 → LargeUtf8` per shard internally, so individual shards
-/// never hit the Arrow IPC 2 GB narrow-offset ceiling.
-///
-/// `pub(crate)` so `scx optimize` can reuse it to migrate a single-section
-/// legacy obs to the sharded layout under `ObsShardPolicy` (it reads a single
-/// coherent source section and chunks the already-resident batch).
-pub(crate) fn write_obs_section(
-    writer: &mut ScxWriter,
-    obs: &arrow::array::RecordBatch,
-    reshape: bool,
-    shard_target_rows: u32,
-) -> Result<()> {
-    let n = obs.num_rows();
-    if !reshape || n == 0 {
-        // Nothing to shard (or reshape not requested); a single section
-        // keeps an empty file well-formed.
-        writer.write_obs(obs)?;
-        return Ok(());
-    }
-    let chunk = (shard_target_rows.max(1)) as usize;
-    let total = n as u64;
-    let (mut shard_idx, mut row_start, mut cursor) = (0u32, 0u64, 0usize);
-    while cursor < n {
-        let take = chunk.min(n - cursor);
-        let slice = obs.slice(cursor, take); // zero-copy
-        writer.write_obs_shard(shard_idx, row_start, take as u64, total, &slice)?;
-        shard_idx += 1;
-        row_start += take as u64;
-        cursor += take;
-    }
-    Ok(())
-}
-
 /// Stream input obs shards, applying the obs `keep_mask` (true = keep) per
 /// shard and yielding `(filtered_batch, cumulative_kept_offset)`. Never
 /// materialises the full obs table — peak memory is one input shard. Shared by
@@ -1216,7 +1176,7 @@ fn compact_multimodal(
         "the input",
     )?);
     if let Some(ref filtered_obs) = eager_filtered_obs {
-        write_obs_section(
+        scx_format_io::write_obs_section(
             &mut writer,
             filtered_obs,
             reshape_obs,

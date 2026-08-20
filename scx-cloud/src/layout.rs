@@ -28,8 +28,17 @@ pub(crate) use scx_format_io::SECTIONS_START_OFFSET;
 /// here (unknown/future types) are appended after, in `section_type` order.
 pub(crate) const SECTION_ORDER: &[SectionType] = &[
     SectionType::ObsMetadata,
+    // The row-sharded twins sit next to their single-section counterparts, not
+    // at the end. Omitting them did not read as a bug because unlisted types
+    // are *appended* rather than rejected, so a sharded-obs file was silently
+    // rewritten as var -> X -> provenance -> obs — the exact inversion of the
+    // metadata-first layout this module exists to produce. Reachable from any
+    // `from_anndata` / merge / append output since the sharded layout shipped,
+    // and the default for `scx convert` since phase 6c.
+    SectionType::ObsMetadataShard,
     SectionType::ObsIndex,
     SectionType::VarMetadata,
+    SectionType::VarMetadataShard,
     SectionType::VarIndex,
     SectionType::CsrShard,
     SectionType::CscShard,

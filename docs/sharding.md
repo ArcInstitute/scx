@@ -254,6 +254,10 @@ scx convert experiment.h5ad experiment.scx --shard-size 5000
 
 # Convert MTX → SCX with custom shard size
 scx convert /path/to/filtered_feature_bc_matrix/ experiment.scx --shard-size 20000
+
+# Obs metadata is sharded on the same threshold by default (`--shard-obs auto`,
+# i.e. when n_obs > --shard-size). `off` keeps one legacy obs_metadata section.
+scx convert experiment.h5ad experiment.scx --shard-obs off
 ```
 
 ### Appending with shard size control
@@ -662,19 +666,51 @@ Streaming `scx merge`, `scx append`, and `pyscx.from_anndata` (when
 `n_obs > shard_size`) write obs and var metadata as row-sharded
 Arrow IPC sections (section types 24/25) instead of a single monolithic
 `obs_metadata` / `var_metadata` section. This bounds peak memory at one
-shard's worth of metadata during the merge/append/ingest hot path and
-avoids Arrow IPC's 2 GB narrow-offset ceiling for string columns at atlas
-scale.
+shard's worth of metadata during the merge/append hot path and avoids
+Arrow IPC's 2 GB narrow-offset ceiling for string columns at atlas scale.
 
-Obs/var **metadata** sharding is decided independently of X sharding and
-applies only to the paths listed above. The streaming h5ad / MTX convert
-path — `pyscx.from_h5ad`, `pyscx.from_mtx`, and `scx convert` — always
-writes a single-section `obs_metadata` / `var_metadata`, regardless of
-`n_obs` (the X matrix is still row-sharded at `shard_target_rows`). To
-obtain sharded metadata from an h5ad source, either ingest with
-`pyscx.from_anndata`, or migrate an existing single-section file with
-`pyscx.compact(src, dst, reshape_obs=True)` (`scx compact --reshape-obs`)
-or `pyscx.optimize(src, dst, shard_obs=...)` (`scx optimize --shard-obs`).
+Obs/var **metadata** sharding is decided independently of X sharding.
+
+**The obs axis on ingest.** `scx convert` (h5ad, h5mu, 10x and mtx alike),
+`pyscx.from_h5ad`, `pyscx.from_h5mu` and `pyscx.from_mtx` shard obs under
+`--shard-obs off|auto|always` / `shard_obs=`, default `auto` — the same tri-state, the same
+`ObsShardPolicy::parse`, and the same `n_obs > shard_target_rows` boundary
+`scx optimize --shard-obs` and `pyscx.from_anndata` use, so the four
+producers converge on one layout for a given `n_obs`. Shard boundaries come
+from the shared `scx_format_io::write_obs_section`, not a per-producer copy of the
+loop.
+
+> This is a **layout** choice, not a memory one. Ingest reads obs whole
+> (`read_dataframe_group`) and `RecordBatch::slice` is zero-copy, so
+> conversion peak RSS is identical either way — and a `>2 GB` obs string
+> column still overflows `i32` offsets in the *reader*, before any of this
+> runs. What sharding buys is the bounded layout for downstream streaming /
+> cloud / bounded-memory readers, and putting converted files on the
+> streaming h5ad export writer (see [Streaming export over sharded
+> obs/var](#streaming-export-over-sharded-obsvar) below), which is otherwise reachable only from `from_anndata` output.
+
+**The var axis on ingest is never sharded.** Every ingest path writes a
+single `var_metadata` section regardless of `n_vars`; `ObsShardPolicy` is
+obs-scoped, matching `scx optimize`. (`pyscx.from_anndata` *does* shard var
+above the threshold — a divergence between the in-memory and on-disk ingest
+routes, not yet reconciled.)
+
+**Other ingest routes.** `pyscx.from_mudata` (the in-memory MuData sibling of
+`from_anndata`) still writes a single-section obs at any scale. To shard it,
+migrate the output with
+`pyscx.compact(src, dst, reshape_obs=True)` (`scx compact --reshape-obs`) or
+`pyscx.optimize(src, dst, shard_obs=...)` (`scx optimize --shard-obs`).
+
+⚠️ **One observable difference between the two layouts**: a categorical read
+back from sharded obs carries a dictionary key narrowed to the minimal fit
+(e.g. `Dictionary(Int8, Utf8)` for four categories), because
+`assemble_sharded_metadata` widens every shard's key to `Int32` for the
+concat and `unify_dictionary_columns` narrows it again after dedup. A
+single-section read has nothing to unify and keeps whatever key the source
+reader built (`Int32` from an h5ad categorical group). Values, the declared
+category list and the `ordered` bit are identical, and pandas does not
+observe key width — but Rust code that downcasts to
+`DictionaryArray<Int32Type>` does.
 
 `scx optimize --shard-obs off|auto|always` (default `auto`) migrates a
 **single-section** obs table to the sharded layout while it modernizes the

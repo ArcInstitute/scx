@@ -11,7 +11,15 @@ pub fn mtx_to_scx(
     output: &Path,
     shard_target_rows: u32,
     codec_str: &str,
+    obs_shard_policy: scx_format_io::ObsShardPolicy,
 ) -> Result<scx_mtx::MtxOrientation, Box<dyn std::error::Error>> {
-    let orientation = scx_mtx::mtx_to_scx(input_dir, output, shard_target_rows, codec_str, "scx")?;
+    let orientation = scx_mtx::mtx_to_scx(
+        input_dir,
+        output,
+        shard_target_rows,
+        codec_str,
+        "scx",
+        obs_shard_policy,
+    )?;
     Ok(orientation)
 }

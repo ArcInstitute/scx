@@ -86,6 +86,14 @@ enum Commands {
         /// Target rows per shard
         #[arg(long, default_value_t = scx_format_io::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
         shard_size: u32,
+        /// Write obs as row-sharded `ObsMetadataShard` sections: `auto` (shard
+        /// when n_obs > --shard-size — the same threshold `scx optimize
+        /// --shard-obs` and `pyscx.from_anndata` use), `always`, or `off`
+        /// (one legacy `ObsMetadata` section). Obs axis only — var is always a
+        /// single section on import. Ignored on export directions (`--to`).
+        /// Default: auto.
+        #[arg(long = "shard-obs", default_value = "auto", value_parser = ["off", "auto", "always"])]
+        shard_obs: String,
         /// Compression codec / intent profile. `auto` (default): cost-aware
         /// adaptive — adopts ShufDeltaZstd per framed integer shard where it wins
         /// by a margin, else the heuristic (Scx1/Zstd); float → Pcodec. `fast`:
@@ -1240,6 +1248,7 @@ fn main() {
             from,
             to,
             shard_size,
+            shard_obs,
             codec,
             csc,
             csc_cols_per_shard,
@@ -1281,6 +1290,7 @@ fn main() {
                 from.as_deref(),
                 to.as_deref(),
                 shard_size,
+                &shard_obs,
                 &codec,
                 &csc,
                 csc_cols_per_shard,
@@ -1811,6 +1821,7 @@ fn run_convert(
     from: Option<&str>,
     to: Option<&str>,
     shard_size: u32,
+    shard_obs: &str,
     codec: &str,
     csc: &str,
     csc_cols_per_shard: usize,
@@ -1957,6 +1968,7 @@ fn run_convert(
                 input,
                 output,
                 shard_size,
+                shard_obs,
                 codec,
                 csc_policy,
                 csc_cols_per_shard,
@@ -2052,6 +2064,7 @@ fn run_convert(
         input,
         output,
         shard_size,
+        shard_obs,
         codec,
         csc_policy,
         csc_cols_per_shard,
@@ -2162,6 +2175,7 @@ fn dispatch_convert(
     input: &std::path::Path,
     output: &std::path::Path,
     shard_size: u32,
+    shard_obs: &str,
     codec: &str,
     csc_policy: convert::CscPolicy,
     csc_cols_per_shard: usize,
@@ -2213,6 +2227,9 @@ fn dispatch_convert(
     // Framing is on by default (row_group_rows default = 256); `0` is the
     // explicit unframed (v3) opt-out → None threads through as the legacy layout.
     let row_group_rows = (row_group_rows != 0).then_some(row_group_rows);
+    // Same parser `scx optimize --shard-obs` uses, so the two subcommands
+    // cannot drift on what `auto` means.
+    let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(shard_obs)?;
 
     let opts = ConvertOptions {
         shard_target_rows: shard_size,
@@ -2236,6 +2253,7 @@ fn dispatch_convert(
         index_preset,
         index_auto_threshold,
         bitmap: bitmap_policy,
+        obs_shard_policy,
         reader_threads,
         writer_queue_depth,
         sort_by,
@@ -2356,6 +2374,7 @@ fn dispatch_convert(
     _input: &std::path::Path,
     _output: &std::path::Path,
     _shard_size: u32,
+    _shard_obs: &str,
     _codec: &str,
     _csc_policy: convert::CscPolicy,
     _csc_cols_per_shard: usize,
@@ -2397,6 +2416,7 @@ fn dispatch_mtx_to_scx(
     input: &std::path::Path,
     output: &std::path::Path,
     shard_size: u32,
+    shard_obs: &str,
     codec: &str,
     csc_policy: convert::CscPolicy,
     csc_cols_per_shard: usize,
@@ -2412,7 +2432,8 @@ fn dispatch_mtx_to_scx(
     );
     pb.set_message(format!("Converting MTX {}...", input.display()));
 
-    let orientation = mtx_pipeline::mtx_to_scx(input, output, shard_size, codec)?;
+    let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(shard_obs)?;
+    let orientation = mtx_pipeline::mtx_to_scx(input, output, shard_size, codec, obs_shard_policy)?;
     pb.finish_and_clear();
 
     if orientation == convert::MtxOrientation::Ambiguous {

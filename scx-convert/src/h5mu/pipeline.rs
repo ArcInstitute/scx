@@ -276,7 +276,7 @@ pub fn h5mu_to_scx(
     writer.set_framing(opts.framing());
 
     // Global obs goes first. Outer obsm and uns are also global.
-    writer.write_obs(&outer_obs)?;
+    crate::pipeline::write_ingest_obs(&mut writer, &outer_obs, opts)?;
 
     // Outer obsm (global) → write as obsm/{key} with modality_id=0.
     // `read_obsm_at` returns Ok(empty) when absent and warns per-entry; a
@@ -553,7 +553,7 @@ pub fn h5mu_to_scx_streaming(
     writer.set_framing(opts.framing());
 
     // Outer obs / obsm / uns. Global obs goes first.
-    writer.write_obs(&outer_obs)?;
+    crate::pipeline::write_ingest_obs(&mut writer, &outer_obs, opts)?;
     // Ok(empty) when absent / warned per-entry; Err only on a present-but-
     // unreadable obsm group — propagate rather than silently skip.
     let global_obsm = read_obsm_at(&file, "obsm", sink)?;

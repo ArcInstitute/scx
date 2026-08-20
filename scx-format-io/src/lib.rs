@@ -82,5 +82,5 @@ pub use shard_source::{ColumnShardSource, ShardSizeHint, ShardSource};
 pub use writer::{
     assign_csr_shard_column_stats, chmod_to_umask, clear_all_csr_shard_column_stats,
     clear_csr_shard_column_stats_for, compute_shard_stats, fsync_parent_dir, make_sibling_tempfile,
-    MajorAxis, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,
+    write_obs_section, MajorAxis, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,
 };

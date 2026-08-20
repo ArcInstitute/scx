@@ -458,6 +458,114 @@ mod tests {
         assert_eq!(reader.n_obs(), 100);
     }
 
+    /// Row-sharded obs must get the same metadata-first placement as a legacy
+    /// single section.
+    ///
+    /// `SECTION_ORDER` listed only `ObsMetadata` / `VarMetadata`, and unlisted
+    /// types are *appended* rather than rejected — so a sharded-obs file was
+    /// silently rewritten as var -> X -> provenance -> obs, the exact inversion
+    /// of what this module exists to produce, with nothing failing to say so.
+    /// Reachable from any `from_anndata` / merge / append output, and the
+    /// default for `scx convert` since phase 6c.
+    #[test]
+    fn test_sharded_obs_placed_before_x_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sharded_in.scx");
+        let (n_obs, n_vars) = (100usize, 50usize);
+        let mut writer = ScxWriter::new(&path, sample_header(n_obs as u64, n_vars as u64)).unwrap();
+        let obs = sample_obs(n_obs);
+        let step = 25usize;
+        let mut idx: u32 = 0;
+        let mut cursor = 0usize;
+        while cursor < n_obs {
+            let take = step.min(n_obs - cursor);
+            writer
+                .write_obs_shard(
+                    idx,
+                    cursor as u64,
+                    take as u64,
+                    n_obs as u64,
+                    &obs.slice(cursor, take),
+                )
+                .unwrap();
+            idx += 1;
+            cursor += take;
+        }
+        writer.write_var(&sample_var(n_vars)).unwrap();
+        let mut row_offset = 0;
+        while row_offset < n_obs {
+            let shard_rows = std::cmp::min(50, n_obs - row_offset);
+            let (indptr, indices, values) = sample_shard_data(shard_rows, n_vars);
+            writer
+                .write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_offset as u64,
+                )
+                .unwrap();
+            row_offset += shard_rows;
+        }
+        writer.finish().unwrap();
+
+        // The fixture must actually be sharded, or this proves nothing.
+        let r = ScxReader::open(&path).unwrap();
+        assert_eq!(r.obs_metadata_shard_count(), 4);
+        drop(r);
+
+        let output = dir.path().join("sharded_out.scx");
+        cloud_optimize(&path, &output).unwrap();
+
+        let data = std::fs::read(&output).unwrap();
+        let hdr = FileHeader::read_from(&mut Cursor::new(&data[..HEADER_SIZE])).unwrap();
+        let fc_start = hdr.full_catalog_offset as usize;
+        let fc_len = hdr.full_catalog_length as usize;
+        let catalog = FullCatalog::read_from(
+            &mut Cursor::new(&data[fc_start..fc_start + fc_len]),
+            fc_len,
+            true,
+        )
+        .unwrap();
+
+        let last_obs_shard = catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+            .map(|e| e.offset)
+            .max()
+            .expect("obs shards must survive cloud_optimize");
+        let first_obs_shard = catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+            .map(|e| e.offset)
+            .min()
+            .unwrap();
+        let var_entry = catalog.get("var").unwrap();
+        let first_shard = catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::CsrShard)
+            .unwrap();
+        let front_end = hdr.front_catalog_offset + hdr.front_catalog_length;
+
+        assert!(
+            first_obs_shard >= front_end,
+            "obs shards should follow the front catalog: {first_obs_shard} < {front_end}"
+        );
+        assert!(
+            var_entry.offset > last_obs_shard,
+            "var should come after every obs shard: var={} last_obs_shard={last_obs_shard}",
+            var_entry.offset
+        );
+        assert!(
+            first_shard.offset > var_entry.offset,
+            "X shards should come after var"
+        );
+    }
+
     #[test]
     fn test_obs_var_placed_after_front_catalog() {
         let dir = tempfile::tempdir().unwrap();

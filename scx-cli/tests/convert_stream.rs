@@ -959,3 +959,101 @@ fn convert_min_counts_negative_errors() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("non-negative"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// `scx convert --shard-obs` (organization phase 6c, ORG-11.16-4)
+// ---------------------------------------------------------------------------
+
+/// Run `scx convert` on a fixture and return the output's obs shard count.
+fn convert_and_count_obs_shards(extra: &[&str], n_obs: usize, shard_size: &str) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let scx_path = dir.path().join("out.scx");
+    create_test_h5ad(&h5ad, n_obs, 12);
+
+    let mut args: Vec<&str> = vec![
+        "convert",
+        "--from",
+        "h5ad",
+        "--to",
+        "scx",
+        "--shard-size",
+        shard_size,
+    ];
+    args.extend_from_slice(extra);
+    let h5ad_s = h5ad.to_str().unwrap().to_string();
+    let scx_s = scx_path.to_str().unwrap().to_string();
+    args.push(&h5ad_s);
+    args.push(&scx_s);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args(&args)
+        .status()
+        .expect("scx convert failed to spawn");
+    assert!(status.success(), "scx convert exited {status} for {args:?}");
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert_eq!(reader.header().n_obs, n_obs as u64);
+    reader.obs_metadata_shard_count()
+}
+
+/// `--shard-obs` defaults to `auto` on `convert`, exactly as it does on
+/// `optimize` — a converted file above the threshold carries sharded obs
+/// without the operator asking, which is what puts it on the streaming h5ad
+/// export path.
+#[test]
+fn convert_shard_obs_defaults_to_auto() {
+    assert_eq!(convert_and_count_obs_shards(&[], 64, "16"), 4);
+}
+
+#[test]
+fn convert_shard_obs_off_keeps_a_single_section() {
+    assert_eq!(
+        convert_and_count_obs_shards(&["--shard-obs", "off"], 64, "16"),
+        0
+    );
+}
+
+/// Below the `auto` threshold `always` still shards — otherwise the flag
+/// would be indistinguishable from `auto` on every small file.
+#[test]
+fn convert_shard_obs_always_shards_below_the_threshold() {
+    assert_eq!(
+        convert_and_count_obs_shards(&["--shard-obs", "always"], 8, "1024"),
+        1
+    );
+    assert_eq!(convert_and_count_obs_shards(&[], 8, "1024"), 0);
+}
+
+/// clap rejects an unknown value before any file is touched, so a typo can
+/// never be read as "the default".
+#[test]
+fn convert_rejects_an_unknown_shard_obs_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    create_test_h5ad(&h5ad, 8, 4);
+    let out = dir.path().join("out.scx");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--shard-obs",
+            "sometimes",
+            h5ad.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scx convert failed to spawn");
+    assert!(!output.status.success(), "expected a rejection");
+    assert!(
+        !out.exists(),
+        "a rejected convert must not leave an output file"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shard-obs"),
+        "error should name the flag, got: {stderr}"
+    );
+}

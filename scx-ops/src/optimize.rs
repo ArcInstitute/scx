@@ -201,7 +201,7 @@ pub fn optimize_with_framing(
             );
             obs_resharded = true;
         }
-        crate::compact::write_obs_section(
+        scx_format_io::write_obs_section(
             &mut writer,
             &reader.read_obs()?,
             reshape,

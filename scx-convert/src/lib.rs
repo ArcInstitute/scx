@@ -186,6 +186,8 @@ mod convert_tests_h5ad;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_index_export;
 #[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_obs_shard;
+#[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_parallel;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_sort;

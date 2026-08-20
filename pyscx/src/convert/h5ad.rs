@@ -52,6 +52,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
     row_group_target_nnz: Option<u64>,
     codec_trial: bool,
     decode_target: Option<scx_format_io::DecodeTarget>,
+    force_legacy_metadata: bool,
 ) -> PyResult<()> {
     let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -221,6 +222,16 @@ pub(crate) fn route_backed_anndata_to_streaming(
         index_preset,
         index_auto_threshold,
         bitmap: bitmap_policy,
+        // `force_legacy_metadata` reaches this branch too. The in-memory
+        // `from_anndata` writer honours it directly; without this the flag
+        // would be silently ignored for a backed `X` — which is precisely the
+        // caller that needs it, since the legacy layout exists for readers that
+        // have not migrated to `obs_shards()`.
+        obs_shard_policy: if force_legacy_metadata {
+            scx_format_io::ObsShardPolicy::Off
+        } else {
+            scx_format_io::ObsShardPolicy::Auto
+        },
         reader_threads,
         writer_queue_depth,
         sort_by,

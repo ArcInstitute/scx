@@ -554,9 +554,14 @@ pub fn mark_deleted(path: &str, cell_indices: Vec<i64>) -> PyResult<u64> {
 ///
 /// `reshape_obs`: when True, migrate legacy single-section obs metadata
 /// to the atlas-scale sharded `ObsMetadataShard` layout. Mirrors
-/// `scx compact --reshape-obs`; useful after a backed `from_anndata`
-/// conversion (which always writes single-section metadata regardless of
-/// `n_obs`). Composes with the `index_*` kwargs.
+/// `scx compact --reshape-obs`. Useful for files written before ingest
+/// sharded obs, or for output of a producer that still does not:
+/// `pyscx.from_mudata`, or any conversion pinned with `shard_obs="off"` /
+/// `force_legacy_metadata=True`. It is a **no-op on already-sharded obs**,
+/// which since phase 6c includes every `scx convert` / `from_h5ad` /
+/// `from_h5mu` / `from_mtx` output above `n_obs > shard_size` — including a
+/// backed `from_anndata`, which routes through that same ingest.
+/// Composes with the `index_*` kwargs.
 ///
 /// Example:
 ///     pyscx.compact("experiment.scx", "compacted.scx")

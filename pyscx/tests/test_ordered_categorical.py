@@ -8,15 +8,18 @@ and not an artefact of the data. An unordered categorical must stay
 (`scx.categorical.ordered`) through the SCX obs section and re-emitted by
 the h5ad writer.
 
-Both export writers are exercised, but **not** by varying `shard_size` on
-`from_h5ad`. Measured: `from_h5ad(shard_size=4)` produces
-`obs_metadata_shard_count == 0` — `shard_size` shards `X`, while every
-`scx-convert` ingest path writes obs as a single section. So a `from_h5ad`
-round trip always takes the whole-batch writer no matter what `shard_size`
-says. `from_anndata` is the one entry point that emits `ObsMetadataShard`
-sections, and it is what the shard-stream arm below uses; that arm asserts
-the shard count, because an arm that silently falls back to the other
-writer tests nothing and looks like it tests everything.
+Both export writers are exercised, and each arm **asserts which one it
+reached** — an arm that silently falls back to the other tests nothing and
+looks like it tests everything.
+
+That assertion has already earned its keep twice. When these arms were
+written, `from_h5ad(shard_size=4)` produced `obs_metadata_shard_count == 0`
+(`shard_size` sharded `X`, while every `scx-convert` ingest path wrote obs
+as a single section), so varying `shard_size` gave two copies of the
+whole-batch arm. Organization phase 6c then made ingest shard obs on that
+same threshold, which flipped the whole-batch arm into a *second* copy of
+the shard-stream one — caught by its own assertion, and now pinned
+explicitly with `shard_obs="off"` rather than left to a default.
 
 The fixture is deliberately reorder-sensitive: declared order is neither
 alphabetical nor first-appearance order, and one declared level has no
@@ -82,9 +85,11 @@ def test_ordered_categorical_round_trips_whole_batch(tmp_dir):
     h5ad_in = str(tmp_dir / "in_whole.h5ad")
     src.write_h5ad(h5ad_in)
     scx_path = str(tmp_dir / "ordered_whole.scx")
-    pyscx.from_h5ad(h5ad_in, scx_path, shard_size=4)
+    # `shard_obs="off"` is what makes this the whole-batch arm. Since phase 6c
+    # the default (`"auto"`) shards obs at `n_obs > shard_size`, so relying on
+    # the default here would make this a duplicate of the shard-stream arm.
+    pyscx.from_h5ad(h5ad_in, scx_path, shard_size=4, shard_obs="off")
 
-    # The premise of this arm: `shard_size` does not shard obs on ingest.
     assert pyscx.open(scx_path).obs_metadata_shard_count == 0
 
     h5ad_out = str(tmp_dir / "out_whole.h5ad")

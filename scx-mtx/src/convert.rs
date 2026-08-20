@@ -29,6 +29,7 @@ pub fn mtx_to_scx(
     shard_target_rows: u32,
     codec_str: &str,
     tool_name: &str,
+    obs_shard_policy: scx_format_io::ObsShardPolicy,
 ) -> Result<MtxOrientation, MtxError> {
     // Defense-in-depth (SCX-011): a zero shard size never advances the
     // shard-boundary loop below and would hang. Callers (CLI, pyscx) also
@@ -55,7 +56,13 @@ pub fn mtx_to_scx(
 
     let mut writer = ScxWriter::new(output, header)?;
 
-    writer.write_obs(&mtx_data.obs)?;
+    // Same policy, same threshold and the same shard-boundary loop as every
+    // other ingest path — `--shard-obs` used to be accepted here and silently
+    // do nothing, which is worse than rejecting it. Obs axis only; var stays a
+    // single section, matching `ObsShardPolicy`'s scope.
+    let reshape = obs_shard_policy
+        .should_shard_single_section(mtx_data.obs.num_rows() as u64, shard_target_rows);
+    scx_format_io::write_obs_section(&mut writer, &mtx_data.obs, reshape, shard_target_rows)?;
     writer.write_var(&mtx_data.var)?;
 
     write_csr_shards(

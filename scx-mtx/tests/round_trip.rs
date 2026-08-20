@@ -105,7 +105,15 @@ fn round_trip_v3_features() {
 
     // 2. Convert MTX → SCX
     let scx_path = tmp.path().join("test.scx");
-    mtx_to_scx(&mtx_in, &scx_path, 1000, "auto", "round-trip-test").unwrap();
+    mtx_to_scx(
+        &mtx_in,
+        &scx_path,
+        1000,
+        "auto",
+        "round-trip-test",
+        Default::default(),
+    )
+    .unwrap();
 
     // 3. Convert SCX → MTX
     let mtx_out = tmp.path().join("mtx_out");
@@ -163,7 +171,15 @@ fn round_trip_v2_genes() {
 
     // 2. Convert MTX → SCX
     let scx_path = tmp.path().join("test.scx");
-    mtx_to_scx(&mtx_in, &scx_path, 1000, "auto", "round-trip-test").unwrap();
+    mtx_to_scx(
+        &mtx_in,
+        &scx_path,
+        1000,
+        "auto",
+        "round-trip-test",
+        Default::default(),
+    )
+    .unwrap();
 
     // 3. Convert SCX → MTX
     let mtx_out = tmp.path().join("mtx_out");
@@ -213,7 +229,15 @@ fn round_trip_all_codecs() {
         let original = read_mtx_directory(&mtx_in).unwrap();
 
         let scx_path = tmp.path().join("test.scx");
-        mtx_to_scx(&mtx_in, &scx_path, 2, codec, "codec-test").unwrap();
+        mtx_to_scx(
+            &mtx_in,
+            &scx_path,
+            2,
+            codec,
+            "codec-test",
+            Default::default(),
+        )
+        .unwrap();
 
         let mtx_out = tmp.path().join("mtx_out");
         write_scx_to_mtx(&scx_path, &mtx_out).unwrap();
@@ -247,7 +271,15 @@ fn round_trip_multi_shard() {
 
     // shard_target_rows = 1 → each row is its own shard
     let scx_path = tmp.path().join("test.scx");
-    mtx_to_scx(&mtx_in, &scx_path, 1, "auto", "shard-test").unwrap();
+    mtx_to_scx(
+        &mtx_in,
+        &scx_path,
+        1,
+        "auto",
+        "shard-test",
+        Default::default(),
+    )
+    .unwrap();
 
     let mtx_out = tmp.path().join("mtx_out");
     write_scx_to_mtx(&scx_path, &mtx_out).unwrap();
@@ -288,7 +320,15 @@ fn round_trip_real_values() {
 
     // Float values should use zstd codec (scx1 is integer-only)
     let scx_path = tmp.path().join("test.scx");
-    mtx_to_scx(&mtx_in, &scx_path, 1000, "auto", "real-test").unwrap();
+    mtx_to_scx(
+        &mtx_in,
+        &scx_path,
+        1000,
+        "auto",
+        "real-test",
+        Default::default(),
+    )
+    .unwrap();
 
     let mtx_out = tmp.path().join("mtx_out");
     write_scx_to_mtx(&scx_path, &mtx_out).unwrap();
@@ -492,7 +532,15 @@ fn round_trip_empty_matrix() {
     assert_eq!(original.data.len(), 0);
 
     let scx_path = tmp.path().join("test.scx");
-    mtx_to_scx(&mtx_in, &scx_path, 1000, "auto", "empty-test").unwrap();
+    mtx_to_scx(
+        &mtx_in,
+        &scx_path,
+        1000,
+        "auto",
+        "empty-test",
+        Default::default(),
+    )
+    .unwrap();
 
     let mtx_out = tmp.path().join("mtx_out");
     write_scx_to_mtx(&scx_path, &mtx_out).unwrap();
@@ -521,7 +569,15 @@ fn export_is_features_by_barcodes() {
     create_v3_mtx_dir(&mtx_in);
 
     let scx_path = tmp.path().join("test.scx");
-    mtx_to_scx(&mtx_in, &scx_path, 1000, "auto", "orient-test").unwrap();
+    mtx_to_scx(
+        &mtx_in,
+        &scx_path,
+        1000,
+        "auto",
+        "orient-test",
+        Default::default(),
+    )
+    .unwrap();
 
     let mtx_out = tmp.path().join("mtx_out");
     write_scx_to_mtx(&scx_path, &mtx_out).unwrap();

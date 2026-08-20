@@ -331,12 +331,12 @@ pub(crate) fn deep_validate_into(
 ///   `from_anndata` emits the Phase 2 sharded layout
 ///   (`ObsMetadataShard` / `VarMetadataShard`). The opt-out preserves
 ///   the legacy single-section layout for tools that haven't migrated
-///   to `ScxReader::read_obs_shard` / `obs_shards()`. Applies to the
-///   in-memory path only — backed routing goes through the streaming
-///   converter which writes single-section metadata regardless (use
-///   `pyscx.compact(..., reshape_obs=True)` or `scx compact
-///   --reshape-obs` post-hoc if sharded metadata is needed for a backed
-///   conversion).
+///   to `ScxReader::read_obs_shard` / `obs_shards()`. Honoured on both
+///   branches: the in-memory writer applies it directly, and a backed
+///   `X` (which routes through `scx-convert`'s streaming ingest) maps it
+///   to `obs_shard_policy = Off`. On the backed branch it governs **obs
+///   only** — that path never shards var at any `n_vars`, while the
+///   in-memory one shards both.
 #[pyfunction]
 #[pyo3(signature = (
     adata, path, codec=None, shard_size=None, in_place=false, csc=None,
@@ -454,6 +454,13 @@ fn from_anndata(
 ///     the non-streaming CLI converter).
 ///
 /// Hardening / index kwargs:
+///   * `shard_obs` (`"off"` | `"auto"` | `"always"`, default
+///     `"auto"`): write obs as row-sharded `ObsMetadataShard`
+///     sections. `"auto"` shards when `n_obs > shard_size`, the same
+///     threshold `pyscx.from_anndata` and `pyscx.optimize(shard_obs=)`
+///     use. Obs axis only — var is always a single section on import.
+///     Sharded obs is what the streaming h5ad export path consumes;
+///     it does not lower conversion peak memory.
 ///   * `strict_uns`: when `True`, the first unrepresentable `uns`
 ///     entry raises; default `False` emits a `UserWarning` per
 ///     skipped key (`SkippedUnsKey`).
@@ -486,7 +493,7 @@ fn from_anndata(
 #[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (
-    path, out, codec=None, shard_size=None, csc=None, csc_cols_per_shard=5000,
+    path, out, codec=None, shard_size=None, shard_obs="auto", csc=None, csc_cols_per_shard=5000,
     uns_format="tagged", stream=true, strict_uns=false, dense_zero_epsilon=0.0,
     memory_budget=None, temp_dir=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
@@ -504,6 +511,7 @@ fn from_h5ad(
     out: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
+    shard_obs: &str,
     csc: Option<&str>,
     csc_cols_per_shard: usize,
     uns_format: &str,
@@ -626,6 +634,11 @@ fn from_h5ad(
         overrides.uns = Some(convert::uns_py_to_json(py, uns, uns_format_parsed)?);
     }
 
+    // Same parser `pyscx.optimize(shard_obs=)` uses, so the two cannot drift
+    // on what `"auto"` means.
+    let obs_shard_policy =
+        scx_format_io::ObsShardPolicy::parse(shard_obs).map_err(PyValueError::new_err)?;
+
     let opts = scx_convert::ConvertOptions {
         shard_target_rows,
         codec: explicit_codec,
@@ -651,6 +664,7 @@ fn from_h5ad(
         index_preset,
         index_auto_threshold,
         bitmap: bitmap_policy,
+        obs_shard_policy,
         reader_threads,
         writer_queue_depth,
         sort_by,
@@ -770,6 +784,12 @@ fn from_10x(
 /// bounded by `shard_target_rows × max_n_vars × density × ~16`
 /// bytes plus the always-resident outer obs.
 ///
+/// `shard_obs` (`"off"` | `"auto"` | `"always"`, default `"auto"`):
+/// write the shared outer obs as row-sharded `ObsMetadataShard`
+/// sections; `"auto"` shards when `n_obs > shard_size`. Same knob and
+/// same threshold as `pyscx.from_h5ad`. Per-modality `var` is always a
+/// single section.
+///
 /// `modalities`: optional list of modality names to include
 /// (case-sensitive match against `/mod/{name}`). Unknown names
 /// raise `ValueError` with the available list. `None` (default)
@@ -794,7 +814,7 @@ fn from_10x(
 #[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (
-    path, out, codec=None, shard_size=None, csc=None, csc_cols_per_shard=5000,
+    path, out, codec=None, shard_size=None, shard_obs="auto", csc=None, csc_cols_per_shard=5000,
     stream=true, strict_uns=false, memory_budget=None, temp_dir=None,
     modalities=None, modality_types=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
@@ -808,6 +828,7 @@ fn from_h5mu(
     out: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
+    shard_obs: &str,
     csc: Option<&str>,
     csc_cols_per_shard: usize,
     stream: bool,
@@ -832,6 +853,7 @@ fn from_h5mu(
         out,
         codec,
         shard_size,
+        shard_obs,
         &csc,
         csc_cols_per_shard,
         stream,
@@ -1085,23 +1107,31 @@ fn from_mudata(
 /// Reads the MTX directory (matrix.mtx[.gz], barcodes.tsv[.gz], features.tsv[.gz])
 /// and writes an SCX file.
 ///
+/// `shard_obs` (`"off"` | `"auto"` | `"always"`, default `"auto"`) writes obs
+/// as row-sharded `ObsMetadataShard` sections above `n_obs > shard_size` — the
+/// same knob and threshold as `pyscx.from_h5ad`. Var stays a single section.
+///
 /// Example:
 ///     pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "output.scx")
 #[pyfunction]
-#[pyo3(signature = (mtx_dir, scx_path, codec=None, shard_size=None))]
+#[pyo3(signature = (mtx_dir, scx_path, codec=None, shard_size=None, shard_obs="auto"))]
 fn from_mtx(
     py: Python<'_>,
     mtx_dir: &str,
     scx_path: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
+    shard_obs: &str,
 ) -> PyResult<()> {
+    let obs_shard_policy =
+        scx_format_io::ObsShardPolicy::parse(shard_obs).map_err(PyValueError::new_err)?;
     let orientation = scx_mtx::mtx_to_scx(
         std::path::Path::new(mtx_dir),
         std::path::Path::new(scx_path),
         resolve_shard_size(shard_size, 16384)?,
         codec.unwrap_or("auto"),
         "pyscx",
+        obs_shard_policy,
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 

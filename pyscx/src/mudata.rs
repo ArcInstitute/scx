@@ -383,6 +383,7 @@ pub fn from_h5mu_impl(
     out: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
+    shard_obs: &str,
     csc: &str,
     csc_cols_per_shard: usize,
     stream: bool,
@@ -467,6 +468,8 @@ pub fn from_h5mu_impl(
         index_preset,
         index_auto_threshold,
         bitmap: bitmap_policy,
+        obs_shard_policy: scx_format_io::ObsShardPolicy::parse(shard_obs)
+            .map_err(PyValueError::new_err)?,
         reader_threads,
         writer_queue_depth,
         // Sort-on-convert and grouped convert are not supported for multimodal
