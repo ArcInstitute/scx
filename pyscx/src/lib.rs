@@ -1,3 +1,8 @@
+// Rust 1.98's `clippy::chunks_exact_to_as_chunks` fires here on code this PR
+// does not touch; see the crate-root note in `scx-codec/src/lib.rs` for why it
+// is suppressed rather than rewritten, and who owns the rewrite.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 mod accel;
 pub(crate) mod anndata_hooks;
 pub(crate) mod axis_align;

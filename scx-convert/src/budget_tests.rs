@@ -20,13 +20,35 @@ use super::*;
 /// multiplicity 4 that reads `1/2 x 4 = 2 > 1`, and this test is what says so.
 #[test]
 fn allocation_table_shares_sum_to_at_most_one_per_phase() {
-    let phases = [
-        Phase::DenseIngest,
-        Phase::SparseIngest,
-        Phase::Export,
-        Phase::CscExternalColumnScan,
-        Phase::CscExternalBucketDrain,
-    ];
+    // Exhaustive by construction. The first version of this test hard-coded
+    // five variants; `Phase::CscSidecar` was added in the same commit and left
+    // off the list, so the phase was declared and never checked — the invariant
+    // silently stopped covering it. The `match` below turns that into a compile
+    // error: a new variant does not build until it is listed here.
+    fn all_phases() -> Vec<Phase> {
+        let every = |p: Phase| -> Phase {
+            match p {
+                Phase::DenseIngest
+                | Phase::SparseIngest
+                | Phase::Export
+                | Phase::CscExternalColumnScan
+                | Phase::CscExternalBucketDrain
+                | Phase::CscSidecar => p,
+            }
+        };
+        [
+            Phase::DenseIngest,
+            Phase::SparseIngest,
+            Phase::Export,
+            Phase::CscExternalColumnScan,
+            Phase::CscExternalBucketDrain,
+            Phase::CscSidecar,
+        ]
+        .into_iter()
+        .map(every)
+        .collect()
+    }
+    let phases = all_phases();
     for phase in phases {
         // Exact rational sum over a common denominator — no floats, so a
         // design where three phases each take a third sums to exactly one.
@@ -75,7 +97,11 @@ fn unenforced_reservations_are_declared_not_silent() {
     //   * the three per-shard ingest/export rows — each sizes a READER working
     //     set, while `encode_one_shard_worker` holds the raw CSR across
     //     `encode_one_shard`, so the encoded section is live alongside it. The
-    //     derate bounds the stage, not the whole worker.
+    //     derate bounds the stage, not the whole worker;
+    //   * the CSC sidecar row — the budget sizes the transpose chunk, while the
+    //     writer's full-length index/value copies and the encoder's streams are
+    //     live alongside it (and `build_csc.rs` additionally retains every
+    //     source shard). It controls shard sizing, not a ceiling.
     //
     // Closing the second group means sizing from the maximum complete worker
     // phase and re-deriving the share, which trades away the parallelism §11.5
@@ -83,7 +109,7 @@ fn unenforced_reservations_are_declared_not_silent() {
     // is what keeps the table honest.
     assert_eq!(
         unenforced.len(),
-        5,
+        6,
         "expected exactly the two §11.4 bucket rows plus the three reader-phase \
          per-shard rows to be unenforced, got {unenforced:?}. Adding an \
          unenforced row without updating this count lets a known gap enter the \

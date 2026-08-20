@@ -1,3 +1,8 @@
+// See the crate-root note in `scx-codec/src/lib.rs`: Rust 1.98's
+// `chunks_exact_to_as_chunks` fires here too, and a crate-level allow in the
+// library does not reach an integration test.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 //! Conformance tests for the runtime-check replacements of the former
 //! `debug_assert!` corruption guards in `scx-codec` (P0 #4 of the 2026-05-11
 //! code review). Each test hand-crafts a malformed input that would have

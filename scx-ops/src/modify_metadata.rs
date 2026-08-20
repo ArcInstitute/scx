@@ -233,9 +233,6 @@ impl MetadataPatch {
     }
 }
 
-/// Apply `patch` to the file at `path` in place. O(size of replaced sections);
-/// `X`/CSR shards are never read or rewritten. Atomic: a single header write
-/// commits, and the change is rollback-able via the catalog chain.
 /// Describe an index request `modify_metadata` cannot act on, if any.
 ///
 /// Returns `None` when every index option given has an axis to apply to.
@@ -270,6 +267,9 @@ fn unhonourable_index_request(patch: &MetadataPatch) -> Option<String> {
     None
 }
 
+/// Apply `patch` to the file at `path` in place. O(size of replaced sections);
+/// `X`/CSR shards are never read or rewritten. Atomic: a single header write
+/// commits, and the change is rollback-able via the catalog chain.
 pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetadataSummary> {
     if patch.is_empty() {
         return Err(OpsError::InvalidInput(

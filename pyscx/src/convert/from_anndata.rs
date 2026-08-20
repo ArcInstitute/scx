@@ -284,6 +284,11 @@ pub(crate) fn write_csc_shards_from_owned(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     csc_cols_per_shard: usize,
+    // Capped at the sidecar builder's own default by
+    // `scx_convert::csc_sidecar_bytes`. This was the fifth call site still
+    // passing that default unconditionally; it sits outside `scx-convert/src`,
+    // so the CI guard added for the other four did not see it.
+    memory_budget: Option<u64>,
     framing: Option<scx_format_io::FramingConfig>,
 ) -> Result<(), scx_format_io::ScxError> {
     let CscInput {
@@ -308,7 +313,7 @@ pub(crate) fn write_csc_shards_from_owned(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+        scx_convert::csc_sidecar_bytes(memory_budget) as usize,
         None,
         framing,
     )
@@ -1370,6 +1375,7 @@ pub fn from_anndata_impl(
                 first_encoding,
                 header_codec,
                 csc_cols_per_shard,
+                memory_budget,
                 framing,
             )
         })

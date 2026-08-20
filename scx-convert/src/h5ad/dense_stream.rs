@@ -5,7 +5,8 @@
 // [`StreamedCsrShard`].
 //
 // Peak memory for one `read_range` is `slab_rows × n_vars ×
-// crate::budget::dense_peak_bytes_per_elem(dtype)` — 12 B/element, and
+// crate::budget::dense_peak_bytes_per_elem(dtype)` plus the `u64` indptr —
+// 12 B/element, and
 // deliberately NOT keyed to `sizeof(source_dtype)`: the resident slab is f32
 // whatever the input was, and the sparsified output does not depend on the
 // source width at all. Sizing by the source width is the bug the `/4` here used

@@ -80,6 +80,12 @@ mod hdf5_threadsafe;
 // default `cargo test --workspace` job rather than only in the hdf5 lane.
 #[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
 mod budget;
+// The CSC sidecar budget resolver is the one item in the table that a *binding*
+// needs: `pyscx.from_anndata` builds a sidecar too, and it was the fifth call
+// site still passing the 4 GiB default. Exported rather than reimplemented so
+// there is one answer to "what may the sidecar claim". Ungated — it is integer
+// arithmetic over an `Option<u64>`.
+pub use budget::csc_sidecar_bytes;
 #[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
 mod parallel_drain;
 #[cfg(feature = "hdf5")]

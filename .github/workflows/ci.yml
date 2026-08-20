@@ -641,10 +641,17 @@ jobs:
       # opposite: the call sites passed `DEFAULT_CSC_MEMORY_BYTES` and the
       # literal "4G". Both spellings now come from
       # `budget::csc_sidecar_bytes(opts.memory_budget)`.
+      #
+      # Scoped to every crate that can build a sidecar, not just scx-convert:
+      # the first version of this guard looked only at `scx-convert/src` and so
+      # missed `pyscx`'s `from_anndata`, which was a fifth site passing the
+      # default. A guard that stops at the crate the bug was found in only
+      # catches the instance, not the class.
       - name: No scx-convert site hard-codes a sidecar memory budget
         run: |
           set -e
-          if grep -rEn --include='*.rs' 'DEFAULT_CSC_MEMORY_BYTES' scx-convert/src \
+          if grep -rEn --include='*.rs' 'DEFAULT_CSC_MEMORY_BYTES' \
+               scx-convert/src pyscx/src scx-ops/src \
                | grep -vE 'scx-convert/src/budget\.rs' \
                | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
             echo "::error::a scx-convert call site passes DEFAULT_CSC_MEMORY_BYTES directly — route it through budget::csc_sidecar_bytes so --memory-budget reaches the sidecar (ORG-11.16-5)."

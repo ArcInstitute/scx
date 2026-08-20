@@ -660,7 +660,8 @@ written: `adata.raw.shape` reports the parent's `n_obs` rather than
 behind `--memory-budget` and `build-csc --memory-limit` (CLI) and the
 `memory_budget=` kwarg on `from_h5ad` / `from_h5mu`. It caps dense row
 slabs in the h5ad streaming reader, CSC external-transpose buffers when
-CSC-on-disk exceeds the budget, and the parallel streaming reader's
+CSC-on-disk exceeds the budget, the **CSC sidecar** transpose chunk (which
+therefore affects `n_csc_shards`), and the parallel streaming reader's
 worker derate. It lives in `scx-format-io` (re-exported as
 `scx_convert::MemoryBudget`) so sibling crates such as `scx-ops` —
 which owns `build-csc` — can share it without a dependency cycle.
@@ -698,10 +699,22 @@ column chunk in pass 1 and a quarter for bucket records in pass 2, and those
 never coexist. A unit test asserts that each phase's concurrent claims sum to
 at most the whole budget.
 
-Two claims are declared but **not enforced**: the CSC bucket count and bucket
-record buffer are sized from the *mean* nnz per row, so a right-skewed
-sequencing-depth distribution overshoots them. They are named in the table so
-the gap is visible rather than silent.
+Six claims are declared but **not enforced**, and the `enforced` flag is the
+difference between "we sized this" and "nothing exceeds this" — read it before
+quoting a row as a guarantee:
+
+- the two CSC **bucket** rows are sized from the *mean* nnz per row, so a
+  right-skewed sequencing-depth distribution overshoots them;
+- the three per-shard **ingest / export** rows size a *reader* working set,
+  while the worker holds the encoded shard alongside it — so the derate bounds
+  the stage, not the whole worker;
+- the CSC **sidecar** row's budget sizes the transpose chunk, while the writer's
+  full-length index and value copies and the encoder's streams are live next to
+  it, and the rebuild path additionally retains every source shard. It controls
+  column and shard sizing, not a ceiling.
+
+They are named in the table so each gap is visible rather than silent, and a
+unit test pins the count so a seventh cannot arrive unannounced.
 
 Three different things are called "no budget", and they are not
 interchangeable: an unset `memory_budget` means *no cap at all*; pyscx's

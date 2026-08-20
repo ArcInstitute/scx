@@ -245,7 +245,7 @@ pub(crate) fn dense_max_slab_rows(budget: u64, n_vars: u64, dtype_bytes: u64) ->
 /// callers passed the 4 GiB default unconditionally, so `--memory-budget 512M
 /// --csc always` could still let sidecar generation claim 4 GiB. The doc was
 /// true of the callee and false of every caller.
-pub(crate) fn csc_sidecar_bytes(memory_budget: Option<u64>) -> u64 {
+pub fn csc_sidecar_bytes(memory_budget: Option<u64>) -> u64 {
     let default = scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES as u64;
     memory_budget.map_or(default, |b| b.min(default))
 }
@@ -365,9 +365,19 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         share: Share::new(1, 1),
         multiplicity: 1,
         site: "pipeline.rs -> scx_format_io::csc_sidecar::write_csc_sidecar",
-        // Bounds the emitted shard's column count. Whole budget rather than a
-        // share: the sidecar is built after X is written, not alongside it.
-        enforced: true,
+        // Whole budget rather than a share: the sidecar is built after X is
+        // written, not alongside it.
+        //
+        // NOT enforced, and the first version of this row wrongly said it was.
+        // The parameter sizes the transpose CHUNK only: `compute_chunk_cols`
+        // reserves 12 B per potential entry while the chunk it returns is
+        // 8 B/entry, and `write_csc_sidecar` then builds full-length
+        // `csc_indptr_u64` / `csc_indices_u32` / raw value copies while that
+        // chunk is still live, before the writer allocates encoded streams.
+        // `scx-ops/src/build_csc.rs` is worse: it collects every source shard
+        // into a `Vec<ScxCsr>` and holds it across the transpose loop. So the
+        // budget controls column/shard sizing, not a memory ceiling.
+        enforced: false,
     },
     Reservation {
         name: "CSC column chunk",
