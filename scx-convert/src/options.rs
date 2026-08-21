@@ -23,7 +23,6 @@
 //! `convert_tests_options_split::shared_option_defaults_agree_across_directions`,
 //! for six lines.
 
-use crate::pipeline::codec_selection_json;
 use crate::GroupPass;
 use scx_codec::CodecId;
 use scx_format_io::modality::ModalityType;
@@ -355,6 +354,32 @@ impl Default for IngestOptions {
             group_pass: GroupPass::default(),
         }
     }
+}
+
+/// Build the `codec_selection` provenance value from a write's codec choice.
+/// Shared by the streaming coordinators and the pyscx in-memory writer so the
+/// stamp is identical across paths. `decode_target` is the internal mechanism
+/// behind the adaptive intent profiles: `Auto` → `auto`, `Storage` → `compact`.
+/// `None` (no adaptive bias) stamps `fast` (or the explicit codec name).
+pub fn codec_selection_json(
+    codec: Option<scx_codec::CodecId>,
+    codec_trial: bool,
+    decode_target: Option<scx_format_io::DecodeTarget>,
+) -> serde_json::Value {
+    use scx_format_io::DecodeTarget;
+    let profile = if let Some(dt) = decode_target {
+        match dt {
+            DecodeTarget::Auto => "auto",
+            DecodeTarget::Storage => "compact",
+        }
+    } else if codec_trial {
+        "compact-trial"
+    } else {
+        // No adaptive bias and no explicit codec → heuristic single-encode
+        // (the `fast` profile). An explicit codec stamps its own name.
+        codec.map(|c| c.display_name()).unwrap_or("fast")
+    };
+    serde_json::json!({ "profile": profile })
 }
 
 #[cfg(test)]

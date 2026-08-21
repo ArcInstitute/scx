@@ -1001,11 +1001,23 @@ them.
 | `shards.rs` | X / `raw/X` / layer / CSC-sidecar shard writers |
 | `mappings.rs` | `obsm` / `varm` / `obsp` / `varp` row-sharded section writers |
 
-Two things deliberately are **not** submodules here. `IngestOptions` and
-`ExportOptions` live in `scx-convert/src/options.rs`, and what a memory budget
-buys lives in `scx-convert/src/budget.rs` — both are crate-level policy that the
-non-`hdf5` build paths also name, and `budget.rs` in particular has to stay
-reachable from the always-compiled MTX path.
+Two things deliberately are **not** submodules here, for different reasons.
+`IngestOptions` and `ExportOptions` live in `scx-convert/src/options.rs`, which is
+`hdf5`-gated exactly like `pipeline/` — it is a sibling because keeping the
+ingest/export pair in one file is the point of ORG-11.16-3, not because the
+default build names it. What a memory budget buys lives in
+`scx-convert/src/budget.rs`, which **is** ungated: its arithmetic invariants run in
+the default test job, and `csc_sidecar_bytes` has to stay reachable from the
+non-`hdf5` `pyscx.from_anndata` sidecar path. (`mtx_pipeline.rs` names neither.)
+
+The carve also **narrowed** the internal surface, which is worth stating because
+it is not what "pure move" implies. Five items were reachable in production at
+`crate::pipeline::*` before and are not now: `BitmapBuildOutcome`,
+`maybe_build_bitmap_shard` and `ensure_shard_fits_budget` have no re-export, and
+`compute_shard_row_ranges` / `process_predicate_index_outcomes` are re-exported
+only under `cfg(test)`. No caller outside `pipeline` used any of them, so nothing
+broke — but the `pub`/`pub(crate)` *declaration* set being unchanged is not the
+same claim as every old path still resolving, and only the first was measured.
 
 ### h5ad export (`scx-convert/src/h5ad/`)
 
@@ -1060,7 +1072,7 @@ HDF5 datasets. The total `nnz` is computed up front from catalog
 `ShardStats` (single pre-scan decode when deletion vectors are
 active) so the on-disk layout is deterministic — no extendable HDF5
 datasets. Obs and var metadata stream through the symmetric
-`h5ad::write::write_dataframe_group_from_shards`: schema comes from
+`h5ad::column_stream::write_dataframe_group_from_shards`: schema comes from
 `read_obs_schema_logical_lossy()` (catalog-only), HDF5 datasets are
 pre-allocated to `n_rows_kept`, then `obs_shards()` / `var_shards()`
 are drained shard-by-shard with kept-row hyperslab writes per column.

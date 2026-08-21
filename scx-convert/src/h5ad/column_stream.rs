@@ -180,7 +180,7 @@ fn write_column_order_attr(
 ///
 /// `schema` is taken from `ScxReader::read_obs_schema_logical_lossy()`
 /// (resp. var). It carries the same `pandas` index metadata as a
-/// `read_obs()` batch, so index resolution mirrors `write_dataframe_body`.
+/// `read_obs()` batch, so index resolution mirrors `write_dataframe_header`.
 /// Per-shard batches may carry `LargeUtf8` / `Dictionary(_, LargeUtf8)`
 /// even when the schema says narrow — the runtime dispatch accepts both.
 ///
@@ -217,7 +217,7 @@ where
     let group = parent.group(name).or_else(|_| parent.create_group(name))?;
 
     // Dataframe-level encoding attrs + pandas index resolution + `_index`
-    // attr — shared prologue with the eager `write_dataframe_body`.
+    // attr — shared prologue with `write_dataframe_header`.
     let (index_field_name, on_disk_index) = write_dataframe_header(&group, schema)?;
 
     // Pre-allocate column writers and assemble `column-order` in schema

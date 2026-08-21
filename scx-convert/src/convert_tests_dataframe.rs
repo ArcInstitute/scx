@@ -165,7 +165,7 @@ fn write_dataframe_group_no_pandas_metadata_fallback() {
 fn read_dataframe_group_index_only_recovers_values() {
     // When a dataframe group has an empty `column-order` attribute (the
     // canonical anndata emission for an index-only frame, and what
-    // `write_dataframe_body` now emits when all schema fields are the
+    // `write_dataframe_header` now emits when all schema fields are the
     // pandas index), `read_dataframe_group` must still read the real
     // values from the `_index` dataset — not synthesise blank
     // strings, which is what the pre-fix fallback did.
@@ -223,7 +223,7 @@ fn read_dataframe_group_index_only_recovers_values() {
     // `__index_level_0__` in the Arrow schema, and the schema gains a
     // `pandas` metadata envelope so consumers like
     // `pyscx.open(...).to_anndata()` and
-    // `scx-convert/src/h5ad/column_stream.rs::write_dataframe_body` identify
+    // `scx-convert/src/h5ad/column_stream.rs::write_dataframe_header` identify
     // the index automatically.
     assert_eq!(batch.num_columns(), 1, "expected single index column");
     assert_eq!(batch.schema().field(0).name(), "__index_level_0__");

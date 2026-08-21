@@ -21,8 +21,22 @@
 //!
 //! The direction-specific option types are [`IngestOptions`] and
 //! [`crate::ExportOptions`], both in `crate::options` (ORG-11.16-3); what a memory
-//! budget *buys* is `crate::budget` (ORG-11.16-5). Neither is a submodule here --
-//! both are crate-level policy that the non-hdf5 build paths also name.
+//! budget *buys* is `crate::budget` (ORG-11.16-5). Neither is a submodule here,
+//! for different reasons: `options` is hdf5-gated exactly like this module but is
+//! policy rather than pipeline, and keeping the ingest/export pair in one file is
+//! the whole point of ORG-11.16-3; `budget` is **ungated**, so its arithmetic
+//! invariants run in the default test job and `csc_sidecar_bytes` stays reachable
+//! from the non-hdf5 `pyscx.from_anndata` sidecar path.
+
+//! ### Not a "same visibility" carve, and the difference is worth naming
+//!
+//! Five items were reachable in production at `crate::pipeline::*` before the
+//! split and are not now: `BitmapBuildOutcome`, `maybe_build_bitmap_shard` and
+//! `ensure_shard_fits_budget` have no re-export at all, and
+//! `compute_shard_row_ranges` / `process_predicate_index_outcomes` are re-exported
+//! only under `cfg(test)`. Nothing outside `pipeline` called any of them, so no
+//! caller broke -- but the internal `pub(crate)` surface was **deliberately
+//! reduced**, which is a narrowing and not merely a move.
 
 mod bitmap;
 mod coordinator;
@@ -56,9 +70,14 @@ pub(crate) use coordinator::compute_shard_row_ranges;
 #[cfg(test)]
 pub(crate) use index::process_predicate_index_outcomes;
 
-// `IngestOptions` lives in `crate::options` beside `ExportOptions` (ORG-11.16-3);
-// re-exported here so `scx_convert::pipeline::IngestOptions` still resolves.
-pub use crate::options::IngestOptions;
+// `IngestOptions` and `codec_selection_json` live in `crate::options` beside
+// `ExportOptions` (ORG-11.16-3); re-exported here so
+// `scx_convert::pipeline::{IngestOptions, codec_selection_json}` still resolve.
+// `codec_selection_json` is pure option policy whose only caller is
+// `IngestOptions::codec_selection_value`; leaving it here made `options` import
+// `pipeline` while `pipeline` re-exported `options`, which contradicted the
+// one-way dependency this module doc claims.
+pub use crate::options::{codec_selection_json, IngestOptions};
 
 use arrow::record_batch::RecordBatch;
 use scx_format_io::writer::ScxWriter;
@@ -75,32 +94,6 @@ pub use scx_format_io::BitmapPolicy;
 /// Re-exported from [`scx_format_io::CscPolicy`] so callers depending only on
 /// `scx-convert` get the CSC policy type without an explicit `scx-format` dep.
 pub use scx_format_io::CscPolicy;
-
-/// Build the `codec_selection` provenance value from a write's codec choice.
-/// Shared by the streaming coordinators and the pyscx in-memory writer so the
-/// stamp is identical across paths. `decode_target` is the internal mechanism
-/// behind the adaptive intent profiles: `Auto` → `auto`, `Storage` → `compact`.
-/// `None` (no adaptive bias) stamps `fast` (or the explicit codec name).
-pub fn codec_selection_json(
-    codec: Option<scx_codec::CodecId>,
-    codec_trial: bool,
-    decode_target: Option<scx_format_io::DecodeTarget>,
-) -> serde_json::Value {
-    use scx_format_io::DecodeTarget;
-    let profile = if let Some(dt) = decode_target {
-        match dt {
-            DecodeTarget::Auto => "auto",
-            DecodeTarget::Storage => "compact",
-        }
-    } else if codec_trial {
-        "compact-trial"
-    } else {
-        // No adaptive bias and no explicit codec → heuristic single-encode
-        // (the `fast` profile). An explicit codec stamps its own name.
-        codec.map(|c| c.display_name()).unwrap_or("fast")
-    };
-    serde_json::json!({ "profile": profile })
-}
 
 /// Write the obs table for an ingest, sharded or not per
 /// [`IngestOptions::obs_shard_policy`].

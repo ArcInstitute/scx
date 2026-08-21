@@ -858,7 +858,7 @@ fn sample_modality_values(
 ///
 /// Per-shard validate + rebase + index-narrow go through the shared
 /// `scx_sparse` helpers (`shard_nnz_bounds` + `rebase_csr_shard`), matching the
-/// eager `pipeline/entry.rs` and streaming `h5ad/stream.rs` ingest paths. This also
+/// eager `pipeline/shards.rs` and streaming `h5ad/stream.rs` ingest paths. This also
 /// runs the `indices < n_vars` column-bound check (via `validate_csr_arrays`)
 /// that the previously hand-rolled h5mu loops skipped.
 #[allow(clippy::too_many_arguments)]
