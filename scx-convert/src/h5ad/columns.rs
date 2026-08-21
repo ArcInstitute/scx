@@ -64,7 +64,8 @@ impl ColumnExportLayout {
 }
 
 /// The category values a filtered export actually keeps, per value class.
-/// Mirrors [`CatValues`] / [`CatAccum`]; floats are keyed by bit pattern for
+/// Mirrors [`CatValues`] / [`super::categorical::CatAccum`]; floats are keyed
+/// by bit pattern for
 /// the same reason (category values are exact labels, never computed).
 pub(crate) enum UsedCategories {
     Str(HashSet<String>),
@@ -75,7 +76,8 @@ pub(crate) enum UsedCategories {
 /// Pre-scan metadata shards to decide (a) which integer / string columns
 /// need anndata's nullable group encoding, and (b) which columns are a
 /// `Dictionary` in any shard (so the unified export schema can declare
-/// them categorical — see [`write_dataframe_group_from_shards`]).
+/// them categorical — see
+/// [`super::column_stream::write_dataframe_group_from_shards`]).
 ///
 /// The streaming writer must allocate each HDF5 dataset (plain vs.
 /// nullable group vs. categorical group) before it sees any shard data,

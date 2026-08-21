@@ -93,7 +93,8 @@ fn gather_dense_mapping_shard(
 }
 
 /// Emit one logical obsm/varm matrix as a sequence of row-shards. Used
-/// by [`h5ad_to_scx_streaming`] for both the override path (in-memory
+/// by [`super::entry_streaming::h5ad_to_scx_streaming`] for both the override
+/// path (in-memory
 /// `RecordBatch` from pyscx) and the disk-streaming path (h5py
 /// hyperslab reads per shard).
 #[allow(clippy::too_many_arguments)]

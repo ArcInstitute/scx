@@ -83,7 +83,7 @@ pub trait CsrShardStream {
 /// Implementers must be `Send + Sync` and stateless across calls
 /// (no internal cursor). The streaming writer coordinator partitions
 /// the matrix into `[(row_start, n_rows)]` ranges via
-/// [`crate::pipeline::compute_shard_row_ranges`] and fans them out
+/// the pipeline coordinator's `compute_shard_row_ranges` and fans them out
 /// across a rayon worker pool. The encoded shards funnel through a
 /// bounded reorder buffer and are written in shard-index order so
 /// the output `.scx` file is byte-identical to the sequential path.

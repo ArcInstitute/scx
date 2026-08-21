@@ -74,7 +74,7 @@ rscx (R bindings via extendr, depends on scx-format-io, scx-codec, scx-sparse, s
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
 | **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |
 | **scx-mtx** | Matrix Market (MTX) I/O (always-on, no feature gate) | `read` (COO→CSR, TSV parsers, gzip), `write` (CSR→COO, gzipped output) |
-| **scx-convert** | h5ad / h5mu / 10x / CellBender ↔ SCX streaming conversion (opt. `hdf5` feature). Note: depends on **scx-ops** (`sort` for sort-on-convert, `external_layer` for the CellBender seam type) — an edge the ASCII graph above omits. | `pipeline` (parallel streaming writer coordinator), `h5ad` (`read`, `write`, `stream_write`, `dense_stream`, `csc_stream`), `h5mu` (multimodal pipeline), `tenx_read`, `cellbender` (remove-background output reader), `export_filter` (streaming `min_counts` obs mask) |
+| **scx-convert** | h5ad / h5mu / 10x / CellBender ↔ SCX streaming conversion (opt. `hdf5` feature). Note: depends on **scx-ops** (`sort` for sort-on-convert, `external_layer` for the CellBender seam type) — an edge the ASCII graph above omits. | `pipeline/` (entry points, coordinators, shard + mapping writers — see the module table below), `options` + `budget` (direction-specific options; what a memory budget buys), `h5ad/` (`read`, `write`, `columns`, `column_stream`, `categorical`, `uns`, `stream_write`, `dense_stream`, `csc_stream`), `h5mu` (multimodal pipeline), `tenx_read`, `cellbender` (remove-background output reader), `export_filter` (streaming `min_counts` obs mask) |
 | **scx-accel** | Rust-native analysis accelerators (opt. GPU via `gpu` feature) | `route` (accelerator execution planner + rapids probe), `pca` (streaming/randomized SVD, auto-routed; in-VRAM routes to `rsc.pp.pca`), `neighbors` (HNSW kNN; in-VRAM routes to `rsc.pp.neighbors`), `umap` (routes to `rsc.tl.umap`), `hvg` (streaming `seurat_v3`; extra flavors route to `rsc.pp.highly_variable_genes`), `fused` (fused `pca_neighbors_umap` / `pca_neighbors` pipelines via rapids), `diffexp` (Wilcoxon rank-sum with pre-ranking), `leiden` (Rust-native CPU + cuGraph GPU), `harmony` (Harmony2 batch integration — soft k-means + ridge regression), `lisi` (exact-kNN Local Inverse Simpson Index), `pseudobulk`. GPU dispatch when `gpu` feature enabled; rapids-singlecell detected at runtime (not a pip extra). |
 | **scx-gpu** | CUDA-accelerated codec decoding, GPU analysis, and GPU interop | `rice_decode`, `forbp_decode`, `sparse_to_dense`, `cusparse` (SpMM), `cusolver` (QR), `curand` (random matrix), `gpu_pca`, `gpu_knn` (CAGRA, device-resident fused path), `gpu_harmony` (distance / softmax+penalty / L2-normalize / batched correction kernels), `gpu_preprocess` (fused normalize+log1p), `gpu_matrix_source` (unified `GpuMatrixSource` capability trait over the row-major `GpuShardSource` (CSR) and column-major `GpuCscShardSource` (CSC) device shard sources, with G3-shaped pinned-ring staging), `gds` |
 | **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `optimize`, `merge`, `rollback`, `cellbender-import`, `obs-import`, `doublet-import`, `benchmark`, cloud ops |
@@ -979,6 +979,51 @@ feature; see the crate summary above). Both `scx-cli` and `pyscx` depend on
 it; the previous in-line `scx-cli/src/convert/` module was extracted
 when streaming conversion landed so `pyscx` could share the pipeline
 without depending on the binary-only `scx-cli`.
+
+### Conversion pipeline (`scx-convert/src/pipeline/`)
+
+`pipeline.rs` was 3727 lines, the largest production file in the workspace, with
+nine concerns interleaved behind `// ====` banners. The split exists so that the
+dependency runs one way: the entry points sequence, and each thing they sequence
+lives in a module that does not know about them.
+
+| Module | Holds |
+|---|---|
+| `mod.rs` | the re-exports every `pipeline::<name>` path resolves through, `codec_selection_json`, `write_ingest_obs`, and the `BitmapPolicy` / `CscPolicy` re-exports |
+| `error.rs` | `ConvertError` and its `parallel_drain::DrainFailure` conversion |
+| `bitmap.rs` | detection-bitmap `auto` eligibility (density, `n_vars` cap, size budget) and the per-shard writer |
+| `threads.rs` | reader-thread and queue-depth derating — the *consumer* of `budget.rs`, not a second copy of it |
+| `index.rs` | when to build a convert-time predicate index, and its per-column outcomes → `ConvertWarning` |
+| `entry.rs` | the eager entry points: `h5ad_to_scx`, `tenx_to_scx`, `scx_to_h5ad` |
+| `entry_streaming.rs` | `h5ad_to_scx_streaming`, the bounded-memory sequencer, and `convert_then_sort_grouped` |
+| `coordinator.rs` | the four shard coordinators and `encode_one_shard_worker`; the pool, channel and reorder buffer are in `parallel_drain` |
+| `shards.rs` | X / `raw/X` / layer / CSC-sidecar shard writers |
+| `mappings.rs` | `obsm` / `varm` / `obsp` / `varp` row-sharded section writers |
+
+Two things deliberately are **not** submodules here. `IngestOptions` and
+`ExportOptions` live in `scx-convert/src/options.rs`, and what a memory budget
+buys lives in `scx-convert/src/budget.rs` — both are crate-level policy that the
+non-`hdf5` build paths also name, and `budget.rs` in particular has to stay
+reachable from the always-compiled MTX path.
+
+### h5ad export (`scx-convert/src/h5ad/`)
+
+The export side was one 2908-line `write.rs`. Two thirds of it was the dataframe
+column writer, which is why `columns` / `column_stream` / `categorical` are three
+modules rather than one: the layout pre-pass and the write pass are separate
+passes over the same shards, and the categorical decode is the only thing both
+need.
+
+| Module | Holds |
+|---|---|
+| `write.rs` | the SCX → h5ad drivers, `/X`, `/raw`, `/obsm`, `/obsp`, `/varp` |
+| `columns.rs` | the dataframe layout / schema pre-pass: nullable columns, any-shard-dictionary promotion, used-category scan |
+| `column_stream.rs` | `write_dataframe_group_from_shards` and the nine column encodings, plus the whole-batch driver over it |
+| `categorical.rs` | Arrow dictionary → h5ad categorical: decode, widen, cross-shard vocabulary (`CatAccum`) |
+| `uns.rs` | `/uns`: JSON → HDF5, including the `__scx_type__` envelope decode |
+| `read.rs` | h5ad ingest reads: dataframes, `X` shape, `uns`, mapping shards |
+| `stream_write.rs` | the streaming SCX → h5ad / h5mu writer and its rayon shard-decode pool |
+| `stream.rs`, `dense_stream.rs`, `csc_stream.rs`, `csc_transpose.rs` | the three source layouts and the external-memory CSC → CSR transpose |
 
 **Streaming ingestion** (`scx convert --stream`, `pyscx.from_h5ad`,
 auto-routing on backed AnnData): `scx_convert::h5ad_to_scx_streaming`

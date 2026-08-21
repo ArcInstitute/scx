@@ -272,7 +272,8 @@ pub struct IngestOptions {
 }
 
 impl IngestOptions {
-    /// Build the row-group [`FramingConfig`] for the shard emitters, or `None`
+    /// Build the row-group [`scx_format_io::FramingConfig`] for the shard
+    /// emitters, or `None`
     /// for the unframed (v3) layout. Framing is active iff `row_group_rows` is set
     /// to a value > 0; `Some(0)` is the explicit unframed opt-out (v3 output).
     pub fn framing(&self) -> Option<scx_format_io::FramingConfig> {

@@ -49,7 +49,7 @@ pub enum ConvertError {
     /// catchable error in any binding.
     ///
     /// Reached through the ordinary `strict_uns` channel on the read side, so
-    /// the default is a [`ConvertWarning::SkippedUnsKey`] naming the key
+    /// the default is a [`crate::ConvertWarning::SkippedUnsKey`] naming the key
     /// rather than a failed conversion: one pathological key in someone
     /// else's h5ad should not make the file unconvertible.
     #[error("uns/{path}: nesting is deeper than the maximum of {max_depth} levels")]
