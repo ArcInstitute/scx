@@ -868,7 +868,7 @@ pub fn merge_with_options(
         }
     }
     // Record the actually-indexed columns in provenance (mirrors the convert
-    // path at `scx-convert/src/pipeline.rs`) so the merge record carries an
+    // path at `scx-convert/src/pipeline/index.rs`) so the merge record carries an
     // audit trail of which predicate indexes were rebuilt — closes the
     // "NO index field in params_json" gap reported against atlas merges.
     let mut params = serde_json::json!({

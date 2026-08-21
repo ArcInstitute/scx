@@ -178,7 +178,8 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   level rewrite `use super::X` → `use super::super::X` (see
   `scx-engine/src/index_tests.rs`).
 - `#[cfg(test)]` instrumentation embedded *inside production functions* (e.g. the
-  parallel-coordinator in-flight counters in `scx-convert/src/pipeline.rs`) stays
+  parallel-coordinator in-flight counters in
+  `scx-convert/src/pipeline/coordinator.rs`) stays
   in place — it is conditional compilation of production flow, not unit tests.
 - For a very large single-file test suite, split by subject into sibling modules
   sharing a `*_common` fixtures module (see `scx-convert`'s `convert_tests_*`),

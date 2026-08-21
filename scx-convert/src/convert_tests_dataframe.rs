@@ -223,7 +223,7 @@ fn read_dataframe_group_index_only_recovers_values() {
     // `__index_level_0__` in the Arrow schema, and the schema gains a
     // `pandas` metadata envelope so consumers like
     // `pyscx.open(...).to_anndata()` and
-    // `scx-convert/src/h5ad/write.rs::write_dataframe_body` identify
+    // `scx-convert/src/h5ad/column_stream.rs::write_dataframe_body` identify
     // the index automatically.
     assert_eq!(batch.num_columns(), 1, "expected single index column");
     assert_eq!(batch.schema().field(0).name(), "__index_level_0__");

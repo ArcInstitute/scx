@@ -834,7 +834,7 @@ pub fn read_dataframe_group(
     // anndata convention, so the loop above never visited it — yet
     // downstream consumers (`scx_format_io::pandas_index_columns`, used
     // by `pyscx.open(...).to_anndata()` and by
-    // `scx-convert/src/h5ad/write.rs::write_dataframe_body`) rely on
+    // `scx-convert/src/h5ad/column_stream.rs::write_dataframe_body`) rely on
     // the resulting schema's `pandas` metadata envelope to identify
     // which column is the index. Without this block, obs_names /
     // var_names silently default to integer-positional strings.
@@ -842,7 +842,7 @@ pub fn read_dataframe_group(
     // Rename the literal `_index` (anndata's on-disk sentinel for an
     // unnamed pandas index) to `__index_level_0__` (pyarrow's
     // canonical name). The inverse rename lives in
-    // `scx-convert/src/h5ad/write.rs::write_dataframe_body`'s
+    // `scx-convert/src/h5ad/column_stream.rs::write_dataframe_body`'s
     // `Some("__index_level_0__") => "_index"` arm — together they
     // round-trip an unnamed pandas index byte-equivalent through SCX.
     let mut injected_index_field_name: Option<String> = None;

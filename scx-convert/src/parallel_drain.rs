@@ -52,7 +52,8 @@ pub(crate) struct DrainFailure(pub String);
 /// Mirrors the idiom in `pyscx/src/accel/pca.rs`: most panics carry a `String`
 /// or `&str`; anything else falls back to a placeholder.
 ///
-/// Moved here verbatim from `pipeline.rs`, where both coordinators already
+/// Moved here verbatim from what is now `pipeline/coordinator.rs`, where both
+/// coordinators already
 /// shared it — the one piece of this machinery that had been factored out.
 pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     payload

@@ -240,7 +240,7 @@ pub(crate) fn dense_max_slab_rows(budget: u64, n_vars: u64, dtype_bytes: u64) ->
 /// at the builder's own default, or that default when no budget was given.
 ///
 /// `write_csc_sidecar` documents its bound as "`cols_per_shard` or
-/// `memory_budget_bytes`, whichever is smaller", and `pipeline.rs` documented
+/// `memory_budget_bytes`, whichever is smaller", and the pipeline documented
 /// the convert side as "or the memory budget, whichever is smaller" — but the
 /// callers passed the 4 GiB default unconditionally, so `--memory-budget 512M
 /// --csc always` could still let sidecar generation claim 4 GiB. The doc was
@@ -364,7 +364,7 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         phase: Phase::CscSidecar,
         share: Share::new(1, 1),
         multiplicity: 1,
-        site: "pipeline.rs -> scx_format_io::csc_sidecar::write_csc_sidecar",
+        site: "pipeline/shards.rs + h5mu/pipeline.rs -> csc_sidecar::write_csc_sidecar",
         // Whole budget rather than a share: the sidecar is built after X is
         // written, not alongside it.
         //

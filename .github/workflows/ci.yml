@@ -662,7 +662,7 @@ jobs:
           fi
       # The arithmetic grep above cannot see a budget bypassed as a CONSTANT or a
       # STRING rather than a division -- which is how the CSC sidecar ignored
-      # `memory_budget` for three releases while `pipeline.rs` documented the
+      # `memory_budget` for three releases while the pipeline documented the
       # opposite: the call sites passed `DEFAULT_CSC_MEMORY_BYTES` and the
       # literal "4G". Both spellings now come from
       # `budget::csc_sidecar_bytes(opts.memory_budget)`.

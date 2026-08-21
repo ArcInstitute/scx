@@ -505,7 +505,7 @@ fn stream_csr_into_prealloc_parallel(
 
     // Pool, bounded channel, rolling-window spawn, reorder buffer and the
     // panic-to-`Err` conversion all live in `crate::parallel_drain`, shared
-    // with the ingest coordinator in `pipeline.rs`. Export keeps only what is
+    // with the ingest coordinator in `pipeline/coordinator.rs`. Export keeps only
     // its own: decoding a shard, and the envelope its failures wear.
     crate::parallel_drain::ordered_parallel_drain(
         n_shards,
