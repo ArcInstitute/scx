@@ -127,8 +127,8 @@ pub trait IndexedCsrShardStream: Send + Sync {
     /// override it to size the dense slab buffer instead.
     fn per_worker_bytes(&self, shard_target_rows: u32, modality_type: ModalityType) -> u64 {
         let density_den: u64 = match modality_type {
-            ModalityType::Atac => crate::pipeline::PARALLEL_DENSITY_ATAC_DEN,
-            _ => crate::pipeline::PARALLEL_DENSITY_DEFAULT_DEN,
+            ModalityType::Atac => crate::budget::PARALLEL_DENSITY_ATAC_DEN,
+            _ => crate::budget::PARALLEL_DENSITY_DEFAULT_DEN,
         };
         let est = (shard_target_rows as u64)
             .saturating_mul(self.n_vars())

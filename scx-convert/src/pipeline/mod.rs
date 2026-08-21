@@ -75,15 +75,6 @@ pub use scx_format_io::BitmapPolicy;
 /// `scx-convert` get the CSC policy type without an explicit `scx-format` dep.
 pub use scx_format_io::CscPolicy;
 
-/// Per-modality density assumptions used by the
-/// `IndexedCsrShardStream::per_worker_bytes` default impl. The
-/// dispatcher uses this estimate to derate workers under
-/// `memory_budget`. Over-estimating routes the convert to the
-/// sequential coordinator (safe failure mode), so values err
-/// conservative. The dense reader overrides `per_worker_bytes`
-/// entirely; these constants only affect sparse readers.
-pub(crate) use crate::budget::{PARALLEL_DENSITY_ATAC_DEN, PARALLEL_DENSITY_DEFAULT_DEN};
-
 /// Build the `codec_selection` provenance value from a write's codec choice.
 /// Shared by the streaming coordinators and the pyscx in-memory writer so the
 /// stamp is identical across paths. `decode_target` is the internal mechanism
