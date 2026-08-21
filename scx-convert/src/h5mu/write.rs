@@ -25,12 +25,12 @@ use scx_format_io::reader::ScxReader;
 use scx_format_io::section::SectionType;
 
 use crate::h5_write_util::vlu;
+use crate::h5ad::column_stream::write_dataframe_group_at;
 use crate::h5ad::stream_write::{
     stream_csr_to_group_at, stream_layers_at, write_obs_streaming_or_eager,
 };
-use crate::h5ad::write::{
-    write_dataframe_group_at, write_obsm_entry_at, write_sparse_group_at, write_uns_entries_at,
-};
+use crate::h5ad::uns::write_uns_entries_at;
+use crate::h5ad::write::{write_obsm_entry_at, write_sparse_group_at};
 use crate::pipeline::ConvertError;
 use crate::warnings::WarningSink;
 
@@ -427,7 +427,7 @@ pub fn scx_modality_to_h5ad_streaming(
             crate::h5ad::stream_write::EXPORT_PROVENANCE_KEY: note,
         });
         let uns_group = root.create_group("uns")?;
-        crate::h5ad::write::write_uns_entries_at(&uns_group, &uns)?;
+        write_uns_entries_at(&uns_group, &uns)?;
     }
 
     Ok(())

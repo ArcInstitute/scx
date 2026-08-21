@@ -17,8 +17,13 @@ fn write_dataframe_group_honors_pandas_index_metadata_unnamed() {
         "__index_level_0__",
         &["MIR1302-2HG", "FAM138A"],
     );
-    crate::h5ad::write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
-        .unwrap();
+    crate::h5ad::column_stream::write_dataframe_group_at(
+        &root,
+        "var",
+        &batch,
+        &mut WarningSink::log(),
+    )
+    .unwrap();
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
@@ -63,8 +68,13 @@ fn write_dataframe_group_honors_pandas_index_metadata_named() {
         "gene_symbols",
         &["MIR1302-2HG", "FAM138A"],
     );
-    crate::h5ad::write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
-        .unwrap();
+    crate::h5ad::column_stream::write_dataframe_group_at(
+        &root,
+        "var",
+        &batch,
+        &mut WarningSink::log(),
+    )
+    .unwrap();
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
@@ -122,8 +132,13 @@ fn write_dataframe_group_no_pandas_metadata_fallback() {
     let symbols = Arc::new(StringArray::from(vec!["GENE_A", "GENE_B"]));
     let gene_ids = Arc::new(StringArray::from(vec!["ENSG1", "ENSG2"]));
     let batch = arrow::record_batch::RecordBatch::try_new(schema, vec![symbols, gene_ids]).unwrap();
-    crate::h5ad::write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
-        .unwrap();
+    crate::h5ad::column_stream::write_dataframe_group_at(
+        &root,
+        "var",
+        &batch,
+        &mut WarningSink::log(),
+    )
+    .unwrap();
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
@@ -698,11 +713,10 @@ mod streaming_obs_hdf5 {
     use scx_codec::{CodecId, ValueEncoding};
     use scx_format_io::{FileHeader, ScxReader, ScxWriter};
 
+    use crate::h5ad::column_stream::{write_dataframe_group_at, write_dataframe_group_from_shards};
     use crate::h5ad::read::read_dataframe_group;
     use crate::h5ad::stream_write::write_scx_to_h5ad_streaming;
-    use crate::h5ad::write::{
-        write_dataframe_group_at, write_dataframe_group_from_shards, write_scx_to_h5ad,
-    };
+    use crate::h5ad::write::write_scx_to_h5ad;
     use crate::warnings::WarningSink;
 
     fn header(n_obs: u64, n_vars: u64) -> FileHeader {
@@ -2030,7 +2044,7 @@ mod streaming_obs_hdf5 {
             shards,
             4,
             None,
-            crate::h5ad::write::ColumnExportLayout::all_plain(schema.fields().len()),
+            crate::h5ad::columns::ColumnExportLayout::all_plain(schema.fields().len()),
             &mut WarningSink::log(),
         );
         let err = res.expect_err("reordered shard must be rejected");
@@ -2135,7 +2149,7 @@ mod streaming_obs_hdf5 {
     // streaming export (`write_scx_to_h5ad_streaming`, which computes the
     // unified schema), then asserts on the on-disk categorical group.
 
-    use crate::h5ad::write::{build_unified_export_schema, scan_column_export_layout};
+    use crate::h5ad::columns::{build_unified_export_schema, scan_column_export_layout};
 
     /// One obs shard: `cell_id` (index) + a string `cell_type` column, written
     /// either as a `Dictionary<Int8, Utf8>` (`dict=true`) or a plain `Utf8`
@@ -3088,7 +3102,7 @@ mod streaming_obs_hdf5 {
         let whole_path = dir.path().join("whole_filtered.h5ad");
         {
             let f = hdf5::File::create(&whole_path).unwrap();
-            crate::h5ad::write::write_dataframe_group_filtered_at(
+            crate::h5ad::column_stream::write_dataframe_group_filtered_at(
                 &f.as_group().unwrap(),
                 "obs",
                 &batch,
@@ -3305,8 +3319,13 @@ fn export_finds_the_index_without_a_pandas_envelope() {
     )
     .unwrap();
 
-    crate::h5ad::write::write_dataframe_group_at(&root, "obs", &batch, &mut WarningSink::log())
-        .unwrap();
+    crate::h5ad::column_stream::write_dataframe_group_at(
+        &root,
+        "obs",
+        &batch,
+        &mut WarningSink::log(),
+    )
+    .unwrap();
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
@@ -3353,8 +3372,13 @@ fn export_still_falls_back_to_field_zero_for_cli_obs() {
     )
     .unwrap();
 
-    crate::h5ad::write::write_dataframe_group_at(&root, "obs", &batch, &mut WarningSink::log())
-        .unwrap();
+    crate::h5ad::column_stream::write_dataframe_group_at(
+        &root,
+        "obs",
+        &batch,
+        &mut WarningSink::log(),
+    )
+    .unwrap();
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
