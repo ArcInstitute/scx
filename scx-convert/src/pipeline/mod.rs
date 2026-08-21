@@ -4,9 +4,10 @@
 //! until ORG-11.16-6, holding nine concerns with no section markers and no module
 //! doc comment: line 1 was a bare `use`. The table below is the seam. Submodules
 //! are private; the re-export block below preserves every `pipeline::<name>` path
-//! that had a caller, so nothing outside `scx-convert` changed. It is **not** a
-//! same-visibility carve -- five internal paths were deliberately dropped, and
-//! they are enumerated below rather than glossed.
+//! with a **production** caller, so nothing outside `scx-convert` changed. It is
+//! **not** a same-visibility carve: of five paths with no production caller, three
+//! were removed outright and two narrowed to `cfg(test)`. They are enumerated below
+//! rather than glossed.
 //!
 //! | Module            | Holds                                                     |
 //! |-------------------|-----------------------------------------------------------|
@@ -28,16 +29,23 @@
 //! the whole point of ORG-11.16-3; `budget` is **ungated**, so its arithmetic
 //! invariants run in the default test job and `csc_sidecar_bytes` stays reachable
 //! from the non-hdf5 `pyscx.from_anndata` sidecar path.
-
+//!
 //! ### Not a "same visibility" carve, and the difference is worth naming
 //!
-//! Five items were reachable in production at `crate::pipeline::*` before the
-//! split and are not now: `BitmapBuildOutcome`, `maybe_build_bitmap_shard` and
-//! `ensure_shard_fits_budget` have no re-export at all, and
-//! `compute_shard_row_ranges` / `process_predicate_index_outcomes` are re-exported
-//! only under `cfg(test)`. Nothing outside `pipeline` called any of them, so no
-//! caller broke -- but the internal `pub(crate)` surface was **deliberately
-//! reduced**, which is a narrowing and not merely a move.
+//! Five items were reachable in production at `crate::pipeline::*` before the split
+//! and are not now, in two groups:
+//!
+//! * `BitmapBuildOutcome`, `maybe_build_bitmap_shard` and
+//!   `ensure_shard_fits_budget` -- **removed outright**. No caller anywhere, test or
+//!   production, named them through `pipeline`.
+//! * `compute_shard_row_ranges` and `process_predicate_index_outcomes` -- **narrowed
+//!   to `cfg(test)`**. These do have callers: eight `use super::pipeline::…` sites in
+//!   `convert_tests_parallel.rs` / `convert_tests_dataframe.rs`, which are attached to
+//!   this module and cannot see the submodules directly. So "dropped" would be wrong
+//!   for these two; they exist, in the test build only.
+//!
+//! No production caller broke either way -- but the internal `pub(crate)` surface was
+//! **deliberately reduced**, which is a narrowing and not merely a move.
 
 mod bitmap;
 mod coordinator;

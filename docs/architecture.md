@@ -990,7 +990,7 @@ them.
 
 | Module | Holds |
 |---|---|
-| `mod.rs` | the re-exports for every `pipeline::<name>` path that had a caller (five that had none were dropped — see below), `write_ingest_obs`, and the `BitmapPolicy` / `CscPolicy` / `IngestOptions` / `codec_selection_json` re-exports |
+| `mod.rs` | the re-exports for every `pipeline::<name>` path with a **production** caller; of five without one, three were removed and two narrowed to `cfg(test)` for the attached test files (see below). Plus `write_ingest_obs` and the `BitmapPolicy` / `CscPolicy` / `IngestOptions` / `codec_selection_json` re-exports |
 | `error.rs` | `ConvertError` and its `parallel_drain::DrainFailure` conversion |
 | `bitmap.rs` | detection-bitmap `auto` eligibility (density, `n_vars` cap, size budget) and the per-shard writer |
 | `threads.rs` | reader-thread and queue-depth derating — the *consumer* of `budget.rs`, not a second copy of it |
