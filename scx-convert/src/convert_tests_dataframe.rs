@@ -165,7 +165,7 @@ fn write_dataframe_group_no_pandas_metadata_fallback() {
 fn read_dataframe_group_index_only_recovers_values() {
     // When a dataframe group has an empty `column-order` attribute (the
     // canonical anndata emission for an index-only frame, and what
-    // `write_dataframe_header` now emits when all schema fields are the
+    // `write_column_order_attr` now emits when all schema fields are the
     // pandas index), `read_dataframe_group` must still read the real
     // values from the `_index` dataset — not synthesise blank
     // strings, which is what the pre-fix fallback did.

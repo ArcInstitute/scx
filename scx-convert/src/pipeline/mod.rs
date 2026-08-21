@@ -3,9 +3,10 @@
 //! This was one 3727-line file -- the largest production file in the workspace --
 //! until ORG-11.16-6, holding nine concerns with no section markers and no module
 //! doc comment: line 1 was a bare `use`. The table below is the seam. Submodules
-//! are private and everything reachable at
-//! `pipeline::<name>` before is re-exported here at the SAME visibility, so no
-//! caller inside or outside the crate changed a path.
+//! are private; the re-export block below preserves every `pipeline::<name>` path
+//! that had a caller, so nothing outside `scx-convert` changed. It is **not** a
+//! same-visibility carve -- five internal paths were deliberately dropped, and
+//! they are enumerated below rather than glossed.
 //!
 //! | Module            | Holds                                                     |
 //! |-------------------|-----------------------------------------------------------|
