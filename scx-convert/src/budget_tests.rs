@@ -88,7 +88,7 @@ fn unenforced_reservations_are_declared_not_silent() {
         .filter(|r| !r.enforced)
         .map(|r| r.name)
         .collect();
-    // Five, in two groups, and the count is pinned so a sixth cannot arrive
+    // Seven, in three groups, and the count is pinned so an eighth cannot arrive
     // unannounced:
     //
     //   * the two §11.4 CSC rows — bucket count and bucket record buffer are
@@ -101,7 +101,10 @@ fn unenforced_reservations_are_declared_not_silent() {
     //   * the CSC sidecar row — the budget sizes the transpose chunk, while the
     //     writer's full-length index/value copies and the encoder's streams are
     //     live alongside it (and `build_csc.rs` additionally retains every
-    //     source shard). It controls shard sizing, not a ceiling.
+    //     source shard). It controls shard sizing, not a ceiling;
+    //   * the CSC column-chunk row — the scan always reads the first column
+    //     whole before testing the budget, so one wide column exceeds the
+    //     share, and the floor exceeds it for budgets under 128 bytes.
     //
     // Closing the second group means sizing from the maximum complete worker
     // phase and re-deriving the share, which trades away the parallelism §11.5
@@ -109,7 +112,7 @@ fn unenforced_reservations_are_declared_not_silent() {
     // is what keeps the table honest.
     assert_eq!(
         unenforced.len(),
-        6,
+        7,
         "expected exactly the two §11.4 bucket rows plus the three reader-phase \
          per-shard rows to be unenforced, got {unenforced:?}. Adding an \
          unenforced row without updating this count lets a known gap enter the \

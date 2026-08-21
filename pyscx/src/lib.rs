@@ -327,7 +327,15 @@ pub(crate) fn deep_validate_into(
 ///   or a binary-prefixed size string — `K`/`M`/`G`/`T` or
 ///   `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024; decimal
 ///   `KB`/`MB`/`GB`/`TB` is rejected), e.g. `"4G"` / `"512MiB"`.
-///   Warn-only — shard size is not derated. Applies to both the
+///   ⚠️ No longer warn-only when a CSC sidecar is built: the budget is
+///   also passed to the sidecar transpose (capped at its 4 GiB default),
+///   so it changes the CSC shard count, and a budget too small for one
+///   column chunk now **raises** — `RuntimeError: CSC transpose failed:
+///   memory limit too small: need at least N bytes for 1 column chunk` —
+///   where it previously succeeded. Measured: a 2000-row matrix needs
+///   24000 bytes, so `memory_budget=1024, csc="always"` fails. The
+///   obsm / varm / obsp / varp footprint check remains warn-only.
+///   Applies to both the
 ///   in-memory and backed routing paths.
 ///
 /// `force_legacy_metadata`: when True, write obs/var as a single

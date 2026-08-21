@@ -385,7 +385,16 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         share: CSC_COLUMN_CHUNK_SHARE,
         multiplicity: 1,
         site: "h5ad/csc_stream.rs::CscToCsrExternalTransposer::open",
-        enforced: true,
+        // NOT enforced. The chunk loop starts `col_end` at `col_start + 1` and
+        // only then tests the budget, so column `col_start` is always read
+        // whole: a single column with `8 x nnz` over the share blows it, which
+        // on a large atlas is an ordinary ubiquitous gene rather than a corner
+        // case. The `.max(PAYLOAD_BYTES_PER_NNZ * 8)` floor also exceeds the
+        // share for any accepted budget under 128 bytes. Bounding it means
+        // splitting or refusing an over-budget first column — a behaviour
+        // change in the external transpose, which is §11.4's territory (see
+        // ORG-11.16-5b), not a flag flip.
+        enforced: false,
     },
     Reservation {
         name: "CSC bucket spill writers",

@@ -699,7 +699,7 @@ column chunk in pass 1 and a quarter for bucket records in pass 2, and those
 never coexist. A unit test asserts that each phase's concurrent claims sum to
 at most the whole budget.
 
-Six claims are declared but **not enforced**, and the `enforced` flag is the
+Seven claims are declared but **not enforced**, and the `enforced` flag is the
 difference between "we sized this" and "nothing exceeds this" — read it before
 quoting a row as a guarantee:
 
@@ -711,7 +711,11 @@ quoting a row as a guarantee:
 - the CSC **sidecar** row's budget sizes the transpose chunk, while the writer's
   full-length index and value copies and the encoder's streams are live next to
   it, and the rebuild path additionally retains every source shard. It controls
-  column and shard sizing, not a ceiling.
+  column and shard sizing, not a ceiling;
+- the CSC **column-chunk** row's scan always reads the first column whole before
+  testing the budget, so one wide column exceeds the share (on a large atlas
+  that is an ordinary ubiquitous gene), and its floor exceeds the share for
+  budgets under 128 bytes.
 
 They are named in the table so each gap is visible rather than silent, and a
 unit test pins the count so a seventh cannot arrive unannounced.
@@ -1420,7 +1424,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   emits `ObsMetadataShard` / `VarMetadataShard` sections when
   `n_obs > shard_size`. `memory_budget` (`"4G"`, `"512M"`,
   bytes) emits `MappingPeakFootprintHigh` when an individual mapping's
-  estimated footprint exceeds the budget. `shard_size` sets the per-shard
+  estimated footprint exceeds the budget, and — when a CSC sidecar is
+  built — is passed to the sidecar transpose (capped at its 4 GiB
+  default), so it also changes the CSC shard count; a budget too small for
+  one column chunk now **raises** (`RuntimeError: CSC transpose failed:
+  memory limit too small…`) where it previously succeeded. `shard_size` sets the per-shard
   row count for both `X` and the obs/var metadata shards. Obsm, varm,
   obsp, and varp are extracted and written one key at a time (incremental,
   not collected).
@@ -1472,8 +1480,10 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     (h5ad encoding-type missing/ambiguous), `DenseSparsified`,
     `DuplicateCoordinatesMerged`. See
     [Conversion warnings](#conversion-warnings-convertwarning).
-  - `memory_budget`: caps dense slabs and the CSC external-transpose
-    buffers. Accepts an int byte count or a binary-prefixed size —
+  - `memory_budget`: caps dense slabs, the CSC external-transpose
+    buffers, and the CSC **sidecar** transpose chunk (so it changes
+    `n_csc_shards` when `csc=` builds one). Accepts an int byte count or
+    a binary-prefixed size —
     `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024); decimal
     `KB`/`MB`/`GB`/`TB` is rejected to avoid 1000-vs-1024 ambiguity
     (see [Memory budgets](#memory-budgets)). E.g. `"4G"` / `"512M"` / `"2GiB"`.
