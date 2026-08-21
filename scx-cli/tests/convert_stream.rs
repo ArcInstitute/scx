@@ -861,7 +861,14 @@ fn convert_min_counts_filters_rows_on_export() {
 }
 
 /// `--min-counts` on an ingest direction must fail loudly rather than being
-/// silently ignored (the option lives on the shared `ConvertOptions`).
+/// silently ignored.
+///
+/// The reason it *could* be ignored is gone: `export_min_counts` now lives on
+/// `ExportOptions`, so the CLI cannot hand it to an ingest entry point at all.
+/// This guard is `run_convert`'s own direction check, which survives the split
+/// because it fires before any I/O and names the direction -- a better message
+/// than a type error, and the only thing standing between a user and the flag
+/// on the wrong direction.
 #[test]
 fn convert_min_counts_rejected_on_import_direction() {
     let dir = tempfile::tempdir().unwrap();
@@ -1055,5 +1062,49 @@ fn convert_rejects_an_unknown_shard_obs_value() {
     assert!(
         stderr.contains("shard-obs"),
         "error should name the flag, got: {stderr}"
+    );
+}
+
+/// `scx convert` validates `--codec` / `--row-group-rows` / `--bitmap` /
+/// `--shard-obs` for **both** directions, and must keep doing so.
+///
+/// This is a regression guard for the shape of ORG-11.16-3's CLI change rather
+/// than for a bug that shipped. `dispatch_convert` now chooses which options
+/// type to build based on the direction, and the obvious way to write that --
+/// move each parse into the branch that consumes it -- would silently stop
+/// validating these four on export, because only the ingest options carry them.
+/// The parses therefore stay above the direction match, and this test is what
+/// says so.
+///
+/// Deliberately runs against a path that does not exist: the failure must come
+/// from argument validation, before any I/O, so the assertion cannot be
+/// satisfied by an unrelated "file not found".
+#[test]
+fn convert_validates_codec_framing_on_an_export_direction() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does_not_exist.scx");
+    let out = dir.path().join("out.h5ad");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args([
+            "convert",
+            "--to",
+            "h5ad",
+            "--codec",
+            "compact",
+            "--row-group-rows",
+            "0",
+            missing.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "expected a validation failure");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires row-group framing"),
+        "expected the codec/framing validation to fire on an export direction, \
+         got: {stderr}"
     );
 }

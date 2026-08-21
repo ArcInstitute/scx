@@ -1,6 +1,6 @@
 //! scx-convert integration tests — sort-on-convert.
 //!
-//! Exercises `--sort-by` / `ConvertOptions::sort_by`: the obs axis (and X,
+//! Exercises `--sort-by` / `IngestOptions::sort_by`: the obs axis (and X,
 //! layers, obsm) is globally reordered by an obs key during conversion.
 
 use super::convert_tests_common::*;
@@ -25,7 +25,7 @@ fn make_h5ad(path: &Path, n_obs: usize, n_vars: usize, fmt: &str, extras: bool) 
 }
 
 fn convert_sorted(h5ad: &Path, scx: &Path, by: &[&str], reverse: bool) {
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         sort_by: by.iter().map(|s| s.to_string()).collect(),
         sort_reverse: reverse,
         ..Default::default()
@@ -41,7 +41,7 @@ fn convert_sorted(h5ad: &Path, scx: &Path, by: &[&str], reverse: bool) {
 }
 
 fn convert_sorted_shard_rows(h5ad: &Path, scx: &Path, by: &[&str], shard_target_rows: u32) {
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         sort_by: by.iter().map(|s| s.to_string()).collect(),
         shard_target_rows,
         ..Default::default()
@@ -60,7 +60,7 @@ fn convert_plain(h5ad: &Path, scx: &Path) {
     h5ad_to_scx_streaming(
         h5ad,
         scx,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )
@@ -307,7 +307,7 @@ fn sort_csc_input_errors() {
     let h5ad = dir.path().join("in.h5ad");
     let scx = dir.path().join("out.scx");
     make_h5ad(&h5ad, 10, 8, "csc", false);
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         sort_by: vec!["n_counts".to_string()],
         ..Default::default()
     };

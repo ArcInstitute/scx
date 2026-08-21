@@ -419,7 +419,7 @@ pub fn from_h5mu_impl(
         crate::resolve_shard_size(shard_size, scx_format_io::DEFAULT_SHARD_TARGET_ROWS)?;
     let memory_budget_bytes = crate::convert::parse_memory_budget(memory_budget.as_ref())?;
 
-    // Translate the Python dict form into ConvertOptions::modality_types.
+    // Translate the Python dict form into IngestOptions::modality_types.
     let modality_types_vec: Vec<(String, ModalityType)> = match modality_types {
         None => Vec::new(),
         Some(map) => map
@@ -444,7 +444,7 @@ pub fn from_h5mu_impl(
             .collect::<PyResult<Vec<_>>>()?,
     };
 
-    let opts = scx_convert::ConvertOptions {
+    let opts = scx_convert::IngestOptions {
         shard_target_rows,
         // Row-group framing (v4) default; `row_group_rows=0` opts out to v3.
         // Explicit here so the opt-out is reachable (Default would force
@@ -455,7 +455,6 @@ pub fn from_h5mu_impl(
         csc_cols_per_shard,
         tool: "pyscx".into(),
         memory_budget: memory_budget_bytes,
-        stream,
         strict_uns,
         dense_zero_epsilon: 0.0,
         temp_dir: temp_dir.map(std::path::PathBuf::from),
@@ -548,9 +547,9 @@ pub fn from_mudata_impl(
 
     // Row-group framing (v4) default, matching the unimodal in-memory path;
     // `row_group_rows=0` opts out to the legacy unframed v3 layout. Unlike
-    // `from_h5mu_impl` (which sets `ConvertOptions::row_group_rows` and lets
-    // `ConvertOptions::framing()` build the config), this path bypasses
-    // `ConvertOptions` entirely and drives `ScxWriter` directly, so it
+    // `from_h5mu_impl` (which sets `IngestOptions::row_group_rows` and lets
+    // `IngestOptions::framing()` build the config), this path bypasses
+    // `IngestOptions` entirely and drives `ScxWriter` directly, so it
     // constructs the `FramingConfig` here and calls `writer.set_framing`
     // itself. `..Default::default()` keeps `target_nnz`/`codec_trial` at their
     // defaults (compact-trial for in-memory MuData is a future follow-on).

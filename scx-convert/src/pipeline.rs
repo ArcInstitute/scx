@@ -116,7 +116,7 @@ impl From<crate::parallel_drain::DrainFailure> for ConvertError {
 }
 
 #[derive(Clone)]
-pub struct ConvertOptions {
+pub struct IngestOptions {
     pub shard_target_rows: u32,
     /// Explicit codec override. None = auto-select based on value distribution.
     pub codec: Option<CodecId>,
@@ -159,12 +159,6 @@ pub struct ConvertOptions {
     /// sizing heuristic. Parse user-facing strings with
     /// [`crate::MemoryBudget::parse`].
     pub memory_budget: Option<u64>,
-    /// Prefer streaming I/O over full materialisation when the input
-    /// supports it (CSR and dense `/X`). When `false`, `h5ad_to_scx`
-    /// keeps the legacy in-memory path. When `true` (default), CSR
-    /// and dense routes go through `h5ad_to_scx_streaming`; CSC-on-
-    /// disk still errors with the Phase 2 message.
-    pub stream: bool,
     /// Fail conversion on the first unsupported `uns` key instead of
     /// skipping it with a warning. Default `false` keeps the existing
     /// lenient behaviour.
@@ -272,40 +266,6 @@ pub struct ConvertOptions {
     /// (the grouped random-row gather over a dense matrix reads full rows and
     /// is ~4–5× slower / ~2× the memory). `One` / `Two` force the choice.
     pub group_pass: GroupPass,
-    /// SCX → h5ad/h5mu **export only**: caller-supplied obs keep mask.
-    ///
-    /// Indexed in the **global / physical** obs row space — the length must
-    /// equal the file header's `n_obs`, *not* the post-deletion live count.
-    /// This is the same coordinate system
-    /// [`scx_format_io::ScxReader::deletion_keep_mask`] and
-    /// [`crate::min_counts_obs_mask`] use.
-    ///
-    /// Intersected (AND) with the deletion-vector mask, never substituted for
-    /// it: a logically deleted row stays dropped regardless of its entry here.
-    ///
-    /// `Arc<[bool]>` so the derived `Clone` stays O(1) on atlas-scale masks.
-    /// Rejected up front on import directions.
-    pub export_obs_keep_mask: Option<std::sync::Arc<[bool]>>,
-    /// SCX → h5ad **export only**: keep observations whose total `X` UMI count
-    /// is `>= export_min_counts`, computed with one streaming pass over the CSR
-    /// shards (see [`crate::min_counts_obs_mask`]) in the same global obs row
-    /// space as [`Self::export_obs_keep_mask`], and ANDed with it and with the
-    /// deletion-vector mask.
-    ///
-    /// `>=` matches `pyscx.accel.filter_cells(min_counts=)` and
-    /// `sc.pp.filter_cells`. Ambiguous for a multimodal h5mu export (which
-    /// modality's X?), so that direction rejects it.
-    pub export_min_counts: Option<f64>,
-}
-
-impl ConvertOptions {
-    /// True when any caller-supplied export row filter is set. Import
-    /// directions use this to reject options that would otherwise be
-    /// silently ignored; the export path uses it to decide whether to
-    /// record filter provenance.
-    pub fn has_export_row_filter(&self) -> bool {
-        self.export_obs_keep_mask.is_some() || self.export_min_counts.is_some()
-    }
 }
 
 /// Phase 5b: density threshold below which `--bitmap=auto` considers a
@@ -327,8 +287,7 @@ const BITMAP_AUTO_SIZE_PERCENT: usize = 15;
 /// sequential coordinator (safe failure mode), so values err
 /// conservative. The dense reader overrides `per_worker_bytes`
 /// entirely; these constants only affect sparse readers.
-pub(crate) const PARALLEL_DENSITY_DEFAULT_DEN: u64 = 20; // ≈ 5 % RNA/general
-pub(crate) const PARALLEL_DENSITY_ATAC_DEN: u64 = 10; // ≈ 10 % ATAC peak matrices
+pub(crate) use crate::budget::{PARALLEL_DENSITY_ATAC_DEN, PARALLEL_DENSITY_DEFAULT_DEN};
 
 /// Outcome of [`maybe_build_bitmap_shard`]. Either a built shard
 /// (ready to write) or a structured reason for skipping that the
@@ -464,7 +423,7 @@ pub use scx_format_io::BitmapPolicy;
 /// `scx-convert` get the CSC policy type without an explicit `scx-format` dep.
 pub use scx_format_io::CscPolicy;
 
-impl ConvertOptions {
+impl IngestOptions {
     /// Build the row-group [`FramingConfig`] for the shard emitters, or `None`
     /// for the unframed (v3) layout. Framing is active iff `row_group_rows` is set
     /// to a value > 0; `Some(0)` is the explicit unframed opt-out (v3 output).
@@ -534,9 +493,9 @@ pub fn codec_selection_json(
     serde_json::json!({ "profile": profile })
 }
 
-impl Default for ConvertOptions {
+impl Default for IngestOptions {
     fn default() -> Self {
-        ConvertOptions {
+        IngestOptions {
             shard_target_rows: 16384,
             codec: None,
             csc: CscPolicy::Off,
@@ -551,7 +510,6 @@ impl Default for ConvertOptions {
             decode_target: None,
             tool: "scx".into(),
             memory_budget: None,
-            stream: true,
             strict_uns: false,
             dense_zero_epsilon: 0.0,
             temp_dir: None,
@@ -572,14 +530,12 @@ impl Default for ConvertOptions {
             group_target_bytes: None,
             group_max_bytes: None,
             group_pass: GroupPass::default(),
-            export_obs_keep_mask: None,
-            export_min_counts: None,
         }
     }
 }
 
 /// Write the obs table for an ingest, sharded or not per
-/// [`ConvertOptions::obs_shard_policy`].
+/// [`IngestOptions::obs_shard_policy`].
 ///
 /// Every `scx-convert` ingest path funnels through here — the eager and
 /// streaming h5ad routes, 10x, and both h5mu routes — so the threshold is
@@ -600,7 +556,7 @@ impl Default for ConvertOptions {
 pub(crate) fn write_ingest_obs(
     writer: &mut ScxWriter,
     obs: &RecordBatch,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
 ) -> Result<(), ConvertError> {
     let reshape = opts
         .obs_shard_policy
@@ -613,31 +569,11 @@ pub(crate) fn write_ingest_obs(
     )?)
 }
 
-/// Reject the SCX → h5ad/h5mu export row-filter options on an import
-/// direction.
-///
-/// `ConvertOptions` is shared across both directions, so an export-only field
-/// would otherwise be silently ignored on ingest. Erroring keeps the "an option
-/// you set always did something" contract that the existing `--index-*` /
-/// `--stream` / `--modalities` direction guards uphold.
-pub(crate) fn reject_export_row_filter_on_import(
-    opts: &ConvertOptions,
-    direction: &str,
-) -> Result<(), ConvertError> {
-    if opts.has_export_row_filter() {
-        return Err(ConvertError::Other(format!(
-            "export_obs_keep_mask / export_min_counts are SCX → h5ad export options \
-             and have no effect on '{direction}'"
-        )));
-    }
-    Ok(())
-}
-
-/// Resolve [`ConvertOptions::reader_threads`] to a concrete
+/// Resolve a `reader_threads` option to a concrete
 /// worker count. `None` (auto) reads `RAYON_NUM_THREADS` if set, else
 /// falls back to [`std::thread::available_parallelism`].
-pub(crate) fn resolve_reader_threads(opts: &ConvertOptions) -> usize {
-    if let Some(n) = opts.reader_threads {
+pub(crate) fn resolve_reader_threads(reader_threads: Option<usize>) -> usize {
+    if let Some(n) = reader_threads {
         return n.max(1);
     }
     if let Ok(s) = std::env::var("RAYON_NUM_THREADS") {
@@ -776,7 +712,7 @@ fn build_and_write_predicate_indexes(
     var: &RecordBatch,
     csr_row_ranges: &[(u64, u64)],
     n_vars: usize,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     // Sort-on-convert: extra obs columns to force-index (the sort key) so its
     // now-contiguous `shard_ranges` are emitted. Merged into `index_obs`,
     // deduped, order preserved.
@@ -942,10 +878,9 @@ pub(crate) fn process_predicate_index_outcomes(
 pub fn h5ad_to_scx(
     input: &Path,
     output: &Path,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    reject_export_row_filter_on_import(opts, "h5ad_to_scx")?;
     // Reorder-on-convert (`--sort-by` / `--group-by`) runs only on the streaming
     // path (it needs the random-access gather). Callers route these to streaming;
     // guard the eager path defensively.
@@ -1033,6 +968,7 @@ pub fn h5ad_to_scx(
             value_encoding,
             codec_id,
             opts.csc_cols_per_shard,
+            opts.memory_budget,
             opts.framing(),
         )?;
     }
@@ -1173,10 +1109,9 @@ pub fn h5ad_to_scx(
 pub fn tenx_to_scx(
     input: &Path,
     output: &Path,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    reject_export_row_filter_on_import(opts, "tenx_to_scx")?;
     let file = hdf5::File::open(input)?;
 
     let format = detect_input_format(&file)?;
@@ -1258,6 +1193,7 @@ pub fn tenx_to_scx(
             value_encoding,
             codec_id,
             opts.csc_cols_per_shard,
+            opts.memory_budget,
             opts.framing(),
         )?;
     }
@@ -1320,7 +1256,7 @@ pub fn scx_to_h5ad(
 pub fn scx_to_h5ad_streaming(
     scx_path: &Path,
     h5ad_path: &Path,
-    opts: &ConvertOptions,
+    opts: &crate::ExportOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     crate::h5ad::stream_write::write_scx_to_h5ad_streaming(scx_path, h5ad_path, opts, sink)
@@ -1395,11 +1331,10 @@ fn h5ad_has_obsp_members(file: &hdf5::File) -> bool {
 pub fn h5ad_to_scx_streaming(
     input: &Path,
     output: &Path,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     overrides: &StreamingOverrides,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    reject_export_row_filter_on_import(opts, "h5ad_to_scx_streaming")?;
     let file = hdf5::File::open(input)?;
 
     // Format gating. `open_x_streaming` re-checks CSC/dense and the
@@ -1906,7 +1841,7 @@ pub fn h5ad_to_scx_streaming(
         MatrixFormat::Csc => "csc_matrix",
         MatrixFormat::Dense => "array",
     };
-    let resolved_reader_threads = resolve_reader_threads(opts);
+    let resolved_reader_threads = resolve_reader_threads(opts.reader_threads);
     // Phase 7.4: record the grouping config when `--group-by` was used (mirrors
     // `scx sort`'s `grouping_provenance`), else `null`.
     let grouping_json = match &opts.group_by {
@@ -1964,7 +1899,7 @@ pub fn h5ad_to_scx_streaming(
         scx_ops::rebuild_csc_inplace(
             output,
             opts.csc_cols_per_shard,
-            "4G",
+            &crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
             opts.framing_preserving_codec(),
         )
         .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
@@ -1981,7 +1916,7 @@ pub fn h5ad_to_scx_streaming(
 fn convert_then_sort_grouped(
     input: &Path,
     output: &Path,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     overrides: &StreamingOverrides,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
@@ -1997,7 +1932,7 @@ fn convert_then_sort_grouped(
     let stem = output.file_name().and_then(|s| s.to_str()).unwrap_or("out");
     let tmp = parent.join(format!(".{stem}.grouptmp.scx"));
 
-    let plain_opts = ConvertOptions {
+    let plain_opts = IngestOptions {
         group_by: None,
         reference: None,
         group_target_bytes: None,
@@ -2027,7 +1962,7 @@ fn convert_then_sort_grouped(
         // Carry this convert's own codec intent into the grouping sort, so
         // `scx convert --group-by --codec auto` gets the same adaptive
         // per-shard selection as the ungrouped path. Reconstructed from the
-        // fields `resolve_codec` populated on `ConvertOptions` rather than
+        // fields `resolve_codec` populated on `IngestOptions` rather than
         // collapsed to Auto-or-explicit, which is what dropped `decode_target`
         // and left the grouped path on the `fast` heuristic.
         codec: scx_format_io::ResolvedCodec {
@@ -2071,7 +2006,7 @@ fn convert_then_sort_grouped(
             scx_ops::rebuild_csc_inplace(
                 output,
                 opts.csc_cols_per_shard,
-                "4G",
+                &crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
                 opts.framing_preserving_codec(),
             )
             .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
@@ -2100,7 +2035,7 @@ fn convert_then_sort_grouped(
 pub fn streaming_writer_coordinator(
     reader: &mut dyn CsrShardStream,
     writer: &mut ScxWriter,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     index_dtype: u8,
     n_vars_u32: u32,
     section_type: SectionType,
@@ -2228,7 +2163,7 @@ struct EncodedShardOutput {
 fn streaming_writer_coordinator_parallel(
     reader: &dyn crate::stream::IndexedCsrShardStream,
     writer: &mut ScxWriter,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     index_dtype: u8,
     n_vars_u32: u32,
     section_type: SectionType,
@@ -2454,7 +2389,7 @@ fn encode_one_shard_worker(
 pub fn run_streaming_writer_coordinator(
     reader: &mut dyn CsrShardStream,
     writer: &mut ScxWriter,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     index_dtype: u8,
     n_vars_u32: u32,
     section_type: SectionType,
@@ -2463,7 +2398,7 @@ pub fn run_streaming_writer_coordinator(
     sink: &mut WarningSink,
     explicit_ranges: Option<&[(u64, u32)]>,
 ) -> Result<(u32, Vec<(u64, u64)>), ConvertError> {
-    let requested = resolve_reader_threads(opts);
+    let requested = resolve_reader_threads(opts.reader_threads);
 
     // ----- Phase 7.4: group-aligned ranges -----
     if let Some(ranges) = explicit_ranges {
@@ -2677,7 +2612,7 @@ pub fn run_streaming_writer_coordinator(
 fn streaming_writer_coordinator_ranges(
     reader: &dyn crate::stream::IndexedCsrShardStream,
     writer: &mut ScxWriter,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     index_dtype: u8,
     n_vars_u32: u32,
     section_type: SectionType,
@@ -2755,6 +2690,11 @@ fn write_csc_shards_from_csr(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     csc_cols_per_shard: usize,
+    // Caller's `memory_budget`; capped at the sidecar builder's own default by
+    // `budget::csc_sidecar_bytes`. Threaded rather than defaulted because the
+    // bound is on the emitted shard's column count, so ignoring it silently let
+    // a `--memory-budget 512M --csc always` convert claim 4 GiB.
+    memory_budget: Option<u64>,
     framing: Option<scx_format_io::FramingConfig>,
 ) -> Result<(), ConvertError> {
     // Wrap the canonical in-memory CSR as a single ScxCsr "shard"
@@ -2801,7 +2741,7 @@ fn write_csc_shards_from_csr(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+        crate::budget::csc_sidecar_bytes(memory_budget) as usize,
         None,
         framing,
     )?;
@@ -2961,7 +2901,7 @@ fn ingest_raw_if_present(
     file: &hdf5::File,
     writer: &mut ScxWriter,
     n_obs: usize,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let Some(((indptr, indices, data, raw_n_obs, raw_n_vars), raw_var)) =
@@ -3005,7 +2945,7 @@ fn ingest_raw_streaming(
     file: &hdf5::File,
     writer: &mut ScxWriter,
     n_obs: usize,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     if file.group("raw").is_err() {
@@ -3757,10 +3697,10 @@ mod default_framing_tests {
     use super::*;
 
     /// Phase C: the convert default frames at `DEFAULT_ROW_GROUP_ROWS` (256), so
-    /// a plain `ConvertOptions::default()` yields an active framing config.
+    /// a plain `IngestOptions::default()` yields an active framing config.
     #[test]
     fn default_convert_options_frame_at_256() {
-        let opts = ConvertOptions::default();
+        let opts = IngestOptions::default();
         assert_eq!(
             opts.row_group_rows,
             Some(scx_format_io::DEFAULT_ROW_GROUP_ROWS)
@@ -3775,7 +3715,7 @@ mod default_framing_tests {
     /// `framing()` returns None so the pipeline keeps the legacy layout.
     #[test]
     fn zero_row_group_rows_opts_out_of_framing() {
-        let opts = ConvertOptions {
+        let opts = IngestOptions {
             row_group_rows: Some(0),
             ..Default::default()
         };

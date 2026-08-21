@@ -204,14 +204,13 @@ pub(crate) fn route_backed_anndata_to_streaming(
         varp: varp_override,
     };
 
-    let opts = scx_convert::ConvertOptions {
+    let opts = scx_convert::IngestOptions {
         shard_target_rows,
         codec: explicit_codec,
         csc: csc_policy,
         csc_cols_per_shard,
         tool: "pyscx".into(),
         memory_budget,
-        stream,
         strict_uns,
         dense_zero_epsilon,
         temp_dir: temp_dir.map(std::path::PathBuf::from),
@@ -237,7 +236,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
         sort_by,
         sort_reverse,
         // F5 row-group framing (the pipeline does the v4 header bump + set_framing
-        // via `ConvertOptions::framing()`).
+        // via `IngestOptions::framing()`).
         row_group_rows,
         row_group_target_nnz,
         codec_trial,

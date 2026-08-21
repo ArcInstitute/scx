@@ -660,10 +660,13 @@ written: `adata.raw.shape` reports the parent's `n_obs` rather than
 behind `--memory-budget` and `build-csc --memory-limit` (CLI) and the
 `memory_budget=` kwarg on `from_h5ad` / `from_h5mu`. It caps dense row
 slabs in the h5ad streaming reader, CSC external-transpose buffers when
-CSC-on-disk exceeds the budget, and the parallel streaming reader's
-worker derate. It lives in `scx-format` (re-exported as
+CSC-on-disk exceeds the budget, the **CSC sidecar** transpose chunk (which
+therefore affects `n_csc_shards`), and the parallel streaming reader's
+worker derate. It lives in `scx-format-io` (re-exported as
 `scx_convert::MemoryBudget`) so sibling crates such as `scx-ops` —
 which owns `build-csc` — can share it without a dependency cycle.
+It parses a byte count and nothing more; what a budget *buys* is the
+allocation table below.
 
 Accepted forms:
 
@@ -675,6 +678,52 @@ Decimal prefixes (`KB`, `MB`, `GB`, `TB`) are **rejected** to avoid
 1000-vs-1024 ambiguity. When the requested budget cannot fit even one
 shard's metadata plus one worker, conversion refuses to start with
 an actionable error rather than OOMing partway through.
+
+### The allocation table
+
+What a budget *buys* is declared in one place, `scx-convert/src/budget.rs`,
+rather than derived at each site. Two things were previously tangled in a
+single division and are now separate:
+
+- a **share** — what fraction of the budget one concurrent unit may claim.
+  One in-flight shard takes a quarter, which is what leaves room for the
+  derate to grant more than one worker.
+- a **cost model** — how many bytes that unit actually holds. A dense slab
+  costs 12 B per source element (the f32 slab plus the sparsified indices and
+  values, at exact capacity); a CSR shard costs 8 B/nnz plus scratch plus the
+  indptr.
+
+Reservations are declared per *phase*, and only reservations in the same phase
+are concurrent — the CSC external transpose claims half the budget for a
+column chunk in pass 1 and a quarter for bucket records in pass 2, and those
+never coexist. A unit test asserts that each phase's concurrent claims sum to
+at most the whole budget.
+
+Seven claims are declared but **not enforced**, and the `enforced` flag is the
+difference between "we sized this" and "nothing exceeds this" — read it before
+quoting a row as a guarantee:
+
+- the two CSC **bucket** rows are sized from the *mean* nnz per row, so a
+  right-skewed sequencing-depth distribution overshoots them;
+- the three per-shard **ingest / export** rows size a *reader* working set,
+  while the worker holds the encoded shard alongside it — so the derate bounds
+  the stage, not the whole worker;
+- the CSC **sidecar** row's budget sizes the transpose chunk, while the writer's
+  full-length index and value copies and the encoder's streams are live next to
+  it, and the rebuild path additionally retains every source shard. It controls
+  column and shard sizing, not a ceiling;
+- the CSC **column-chunk** row's scan always reads the first column whole before
+  testing the budget, so one wide column exceeds the share (on a large atlas
+  that is an ordinary ubiquitous gene), and its floor exceeds the share for
+  budgets under 128 bytes.
+
+They are named in the table so each gap is visible rather than silent, and a
+unit test pins the count so a seventh cannot arrive unannounced.
+
+Three different things are called "no budget", and they are not
+interchangeable: an unset `memory_budget` means *no cap at all*; pyscx's
+eager-materialisation path warns above 8 GiB; and the CSC sidecar builder
+defaults to 4 GiB when no budget is given.
 
 ### Ops that bound themselves without a budget knob
 
@@ -1375,7 +1424,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   emits `ObsMetadataShard` / `VarMetadataShard` sections when
   `n_obs > shard_size`. `memory_budget` (`"4G"`, `"512M"`,
   bytes) emits `MappingPeakFootprintHigh` when an individual mapping's
-  estimated footprint exceeds the budget. `shard_size` sets the per-shard
+  estimated footprint exceeds the budget, and — when a CSC sidecar is
+  built — is passed to the sidecar transpose (capped at its 4 GiB
+  default), so it also changes the CSC shard count; a budget too small for
+  one column chunk now **raises** (`RuntimeError: CSC transpose failed:
+  memory limit too small…`) where it previously succeeded. `shard_size` sets the per-shard
   row count for both `X` and the obs/var metadata shards. Obsm, varm,
   obsp, and varp are extracted and written one key at a time (incremental,
   not collected).
@@ -1427,8 +1480,10 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     (h5ad encoding-type missing/ambiguous), `DenseSparsified`,
     `DuplicateCoordinatesMerged`. See
     [Conversion warnings](#conversion-warnings-convertwarning).
-  - `memory_budget`: caps dense slabs and the CSC external-transpose
-    buffers. Accepts an int byte count or a binary-prefixed size —
+  - `memory_budget`: caps dense slabs, the CSC external-transpose
+    buffers, and the CSC **sidecar** transpose chunk (so it changes
+    `n_csc_shards` when `csc=` builds one). Accepts an int byte count or
+    a binary-prefixed size —
     `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024); decimal
     `KB`/`MB`/`GB`/`TB` is rejected to avoid 1000-vs-1024 ambiguity
     (see [Memory budgets](#memory-budgets)). E.g. `"4G"` / `"512M"` / `"2GiB"`.
@@ -1448,11 +1503,16 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     granted count to fit a per-worker estimate; the estimate is
     delegated to the reader: sparse readers assume density 5 % (RNA
     and general) or 10 % (ATAC), times `n_vars × 16 B/nnz`; the
-    dense reader sizes the dense slab buffer
-    (`shard_target_rows × n_vars × sizeof(dtype) × 2`). When the
-    dense reader's `memory_budget`-derived slab cap is tighter than
+    dense reader sizes the dense slab buffer at
+    `shard_target_rows × n_vars × 12 B/element`. When the dense
+    reader's `memory_budget`-derived slab cap is tighter than
     `shard_target_rows`, the parallel coordinator silently clamps
     its partition to that cap (matching the sequential path).
+    The 12 B/element and the quarter-of-the-budget share both come
+    from the allocation table described under
+    [Memory budgets](#memory-budgets); the dense figure does **not**
+    scale with the source dtype width, because the resident slab is
+    f32 whatever the input was.
   - `writer_queue_depth`: backpressure window between the parallel
     encoder pool and the ordered writer. Default 4. The parallel
     coordinator caps outstanding shards (encoding + in channel + in

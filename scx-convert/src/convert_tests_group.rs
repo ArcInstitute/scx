@@ -1,6 +1,6 @@
 //! scx-convert integration tests — convert-time grouping.
 //!
-//! Exercises `ConvertOptions::group_by` / `--group-by`: the grouped
+//! Exercises `IngestOptions::group_by` / `--group-by`: the grouped
 //! (reference-first, group-clustered) CSR layout is written directly during
 //! conversion. The headline guarantee is **byte-equivalence to
 //! convert-then-`scx sort --group-by`** at the order / roles / ranges level —
@@ -75,7 +75,7 @@ fn convert_grouped(
     group_target_bytes: Option<u64>,
     sink: &mut WarningSink,
 ) {
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         group_by: Some(group_by.to_string()),
         reference,
         group_target_bytes,
@@ -99,7 +99,7 @@ fn convert_then_sort_grouped(
     h5ad_to_scx_streaming(
         h5ad,
         tmp,
-        &ConvertOptions {
+        &IngestOptions {
             shard_target_rows,
             ..Default::default()
         },
@@ -292,7 +292,7 @@ fn group_convert_forced_one_pass_with_obsp_errors() {
     let scx = dir.path().join("out.scx");
     make_grouped_h5ad_with_obsp(&h5ad, 10, 8, "csr");
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         group_by: Some("cell_type".to_string()),
         reference: Some(scx_ops::ReferenceSpec::Labels(vec!["A".to_string()])),
         shard_target_rows: 16,
@@ -398,7 +398,7 @@ fn group_reference_requires_group_by_errors() {
     let h5ad = dir.path().join("in.h5ad");
     let scx = dir.path().join("out.scx");
     make_grouped_h5ad(&h5ad, 10, 8, "csr");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         reference: Some(scx_ops::ReferenceSpec::Labels(vec!["A".to_string()])),
         ..Default::default()
     };
@@ -419,7 +419,7 @@ fn group_csc_input_errors() {
     let h5ad = dir.path().join("in.h5ad");
     let scx = dir.path().join("out.scx");
     make_grouped_h5ad(&h5ad, 10, 8, "csc");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         group_by: Some("cell_type".to_string()),
         ..Default::default()
     };
@@ -443,7 +443,7 @@ fn group_convert_sequential_tiny_budget_errors() {
     let h5ad = dir.path().join("in.h5ad");
     make_grouped_h5ad(&h5ad, 10, 8, "csr");
 
-    let base = |budget: u64| ConvertOptions {
+    let base = |budget: u64| IngestOptions {
         group_by: Some("cell_type".to_string()),
         reference: Some(scx_ops::ReferenceSpec::Labels(vec!["A".to_string()])),
         shard_target_rows: 16,
@@ -495,7 +495,7 @@ fn group_dense_byte_mode_one_pass_errors() {
     make_grouped_h5ad(&h5ad, 10, 8, "dense");
 
     let mut sink = WarningSink::log();
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         group_by: Some("cell_type".to_string()),
         reference: Some(scx_ops::ReferenceSpec::Labels(vec!["A".to_string()])),
         group_target_bytes: Some(64),
@@ -535,7 +535,7 @@ fn group_dense_auto_two_pass_matches_one_pass() {
 
     // Default Auto on dense → internal two-pass.
     let mut sink = WarningSink::log();
-    let opts_auto = ConvertOptions {
+    let opts_auto = IngestOptions {
         group_by: Some("cell_type".to_string()),
         reference: reference.clone(),
         shard_target_rows: 16,
@@ -552,7 +552,7 @@ fn group_dense_auto_two_pass_matches_one_pass() {
     .unwrap();
 
     // Forced one-pass (the dense random-row gather) for the same inputs.
-    let opts_one = ConvertOptions {
+    let opts_one = IngestOptions {
         group_pass: GroupPass::One,
         ..opts_auto.clone()
     };

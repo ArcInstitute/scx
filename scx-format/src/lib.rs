@@ -1,3 +1,11 @@
+// Rust 1.98's `clippy::chunks_exact_to_as_chunks`, same story as the crate-root
+// note in `scx-codec/src/lib.rs`: it fires twice in `codec_select.rs`, which the
+// PR adding this allow does not touch, and `main` fails identically under 1.98.
+// Suppressed rather than rewritten because `as_chunks::<N>()` restructures the
+// loop in byte-level codec-selection code; the rewrite belongs to that crate's
+// own phase.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 //! On-disk layout and spec for the SCX format: file header, catalogs, shard
 //! structs, modality table, provenance, codec selection, and the error/checksum
 //! primitives. This crate is **pure** — no `std::fs`, no `memmap2`, no decode

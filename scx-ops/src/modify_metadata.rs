@@ -233,6 +233,40 @@ impl MetadataPatch {
     }
 }
 
+/// Describe an index request `modify_metadata` cannot act on, if any.
+///
+/// Returns `None` when every index option given has an axis to apply to.
+fn unhonourable_index_request(patch: &MetadataPatch) -> Option<String> {
+    let idx = &patch.index;
+    if !idx.index_obs.is_empty() && patch.obs.is_none() {
+        return Some(format!(
+            "index_obs={:?} was requested but no obs frame was supplied",
+            idx.index_obs
+        ));
+    }
+    if !idx.index_var.is_empty() && patch.var.is_none() {
+        return Some(format!(
+            "index_var={:?} was requested but no var frame was supplied",
+            idx.index_var
+        ));
+    }
+    // Cross-axis knobs need only *one* axis to be replaced to do something.
+    if patch.obs.is_none() && patch.var.is_none() {
+        if let Some(preset) = &idx.index_preset {
+            return Some(format!(
+                "index_preset={preset:?} was requested but neither obs nor var was supplied"
+            ));
+        }
+        if idx.index_auto_threshold > 0 {
+            return Some(format!(
+                "index_auto_threshold={} was requested but neither obs nor var was supplied",
+                idx.index_auto_threshold
+            ));
+        }
+    }
+    None
+}
+
 /// Apply `patch` to the file at `path` in place. O(size of replaced sections);
 /// `X`/CSR shards are never read or rewritten. Atomic: a single header write
 /// commits, and the change is rollback-able via the catalog chain.
@@ -241,6 +275,24 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
         return Err(OpsError::InvalidInput(
             "modify_metadata: empty patch (set at least one of uns/obs/var/obsm/varm)".to_string(),
         ));
+    }
+
+    // An index request the op cannot honour is rejected here rather than
+    // ignored. Index rebuilds are gated on the axis actually being replaced
+    // (`rebuild_obs_index` / `rebuild_var_index` below), so `--index-obs
+    // cell_type` with no `--obs` used to exit 0, print "Updated metadata..."
+    // and build nothing at all.
+    //
+    // Decided per axis, because the knobs are not all axis-scoped:
+    // `index_preset` and `index_auto_threshold` genuinely span both, so they
+    // are only unhonourable when *neither* axis is being replaced. That
+    // asymmetry is why this cannot be one `user_wants_index` check.
+    if let Some(detail) = unhonourable_index_request(patch) {
+        return Err(OpsError::InvalidInput(format!(
+            "modify_metadata: {detail}. An index is rebuilt only over an axis this \
+             call replaces, so the request would have been silently ignored; \
+             pass the matching obs=/var= frame, or drop the index option."
+        )));
     }
 
     let (mut lock, mut prep) = prepare_in_place(path, patch.modality_id)?;

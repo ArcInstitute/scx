@@ -542,3 +542,145 @@ fn empty_patch_is_rejected() {
     let err = modify_metadata(&path, &MetadataPatch::default()).unwrap_err();
     assert!(matches!(err, OpsError::InvalidInput(_)), "got {err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// §11.12 — an index option with no axis to apply to is refused, not ignored
+// ---------------------------------------------------------------------------
+
+/// `--index-*` without the matching `--obs` / `--var` used to be a complete
+/// no-op: the op exited 0, reported success, and built nothing, because index
+/// rebuilds are gated on the axis actually being replaced.
+///
+/// The reject side. Each case names a different knob, because the axis rule is
+/// not uniform: `index_obs` / `index_var` are axis-scoped, while `index_preset`
+/// and `index_auto_threshold` span both axes and are therefore only
+/// unhonourable when *neither* axis is supplied. A single `user_wants_index`
+/// check would get the second pair wrong in one direction or the other.
+#[test]
+fn index_request_without_a_matching_axis_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let cases: Vec<(&str, MetadataPatch)> = vec![
+        (
+            "index_obs with no obs",
+            MetadataPatch {
+                uns: Some(serde_json::json!({"k": 1})),
+                index: scx_engine::ConversionPredicateIndexOptions {
+                    index_obs: vec!["donor".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
+        (
+            "index_var with no var",
+            MetadataPatch {
+                uns: Some(serde_json::json!({"k": 1})),
+                index: scx_engine::ConversionPredicateIndexOptions {
+                    index_var: vec!["gene".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
+        (
+            "index_preset with neither axis",
+            MetadataPatch {
+                uns: Some(serde_json::json!({"k": 1})),
+                index: scx_engine::ConversionPredicateIndexOptions {
+                    index_preset: Some("cellxgene".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
+        (
+            "index_auto_threshold with neither axis",
+            MetadataPatch {
+                uns: Some(serde_json::json!({"k": 1})),
+                index: scx_engine::ConversionPredicateIndexOptions {
+                    index_auto_threshold: 1000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ),
+    ];
+
+    for (label, patch) in cases {
+        let path = dir.path().join(format!("{}.scx", label.replace(' ', "_")));
+        write_base(&path, 30, 5, None);
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        let err = modify_metadata(&path, &patch)
+            .expect_err(&format!("{label}: expected a refusal, got success"));
+        assert!(
+            matches!(err, OpsError::InvalidInput(_)),
+            "{label}: expected InvalidInput, got {err:?}"
+        );
+        // These strings are user-facing (`pyscx.modify_metadata` /
+        // `scx modify-metadata`), and a multiline Rust literal without `\`
+        // continuations bakes the source indentation into the message. Asserting
+        // only the variant let 14-18 space runs ship once already, so assert the
+        // text too.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("  "),
+            "{label}: refusal message carries wrap padding — a multiline literal \
+             is missing its `\\` continuations: {msg:?}"
+        );
+        // Refused before `prepare_in_place`, so the file is untouched — a
+        // rejection that had already appended would be a worse outcome than
+        // the no-op it replaces.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            before,
+            "{label}: the refusal wrote to the file"
+        );
+    }
+}
+
+/// The accept side. Without it the guard above would pass just as well if it
+/// rejected *every* index request, and the op would be broken in the other
+/// direction with nothing to say so.
+#[test]
+fn index_request_with_its_axis_supplied_is_honoured() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Axis-scoped: obs supplied, obs indexed.
+    let path = dir.path().join("obs_ok.scx");
+    write_base(&path, 30, 5, None);
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_batch(30, "donor_A")),
+            index: scx_engine::ConversionPredicateIndexOptions {
+                index_obs: vec!["donor".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("index_obs alongside obs must be accepted");
+    assert!(
+        has_section(&path, SectionType::ObsPredicateIndex),
+        "the accepted request must actually build the index — otherwise this \
+         asserts only that it did not error"
+    );
+
+    // Cross-axis: a preset needs only ONE axis present to have work to do.
+    let path = dir.path().join("preset_ok.scx");
+    write_base(&path, 30, 5, None);
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_batch(30, "donor_A")),
+            index: scx_engine::ConversionPredicateIndexOptions {
+                index_preset: Some("cellxgene".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("index_preset with obs supplied must be accepted");
+}

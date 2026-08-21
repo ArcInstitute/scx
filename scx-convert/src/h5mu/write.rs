@@ -31,7 +31,7 @@ use crate::h5ad::stream_write::{
 use crate::h5ad::write::{
     write_dataframe_group_at, write_obsm_entry_at, write_sparse_group_at, write_uns_entries_at,
 };
-use crate::pipeline::{ConvertError, ConvertOptions};
+use crate::pipeline::ConvertError;
 use crate::warnings::WarningSink;
 
 /// Write an SCX file to h5mu format. Requires `reader.is_multimodal()`.
@@ -103,7 +103,7 @@ pub fn scx_to_h5mu(
 pub fn scx_to_h5mu_streaming(
     scx_path: &Path,
     h5mu_path: &Path,
-    opts: &ConvertOptions,
+    opts: &crate::ExportOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let reader = ScxReader::open(scx_path)?;
@@ -359,7 +359,7 @@ pub fn scx_modality_to_h5ad_streaming(
     scx_path: &Path,
     h5ad_path: &Path,
     modality_name: &str,
-    opts: &ConvertOptions,
+    opts: &crate::ExportOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let reader = ScxReader::open(scx_path)?;

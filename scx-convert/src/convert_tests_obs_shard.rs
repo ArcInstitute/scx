@@ -39,12 +39,11 @@ use crate::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
 /// Ingest options with an explicit obs-shard policy and a small
 /// `shard_target_rows`, so a modest fixture crosses the `Auto` threshold
 /// without a large-`n_obs` test.
-fn opts_with(policy: ObsShardPolicy, shard_target_rows: u32, stream: bool) -> ConvertOptions {
-    ConvertOptions {
+fn opts_with(policy: ObsShardPolicy, shard_target_rows: u32) -> IngestOptions {
+    IngestOptions {
         shard_target_rows,
-        stream,
         obs_shard_policy: policy,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     }
 }
 
@@ -217,7 +216,7 @@ fn eager_h5ad_ingest_shards_obs_above_the_threshold() {
     h5ad_to_scx(
         &h5ad,
         &scx,
-        &opts_with(ObsShardPolicy::Auto, 10, false),
+        &opts_with(ObsShardPolicy::Auto, 10),
         &mut WarningSink::log(),
     )
     .unwrap();
@@ -241,7 +240,7 @@ fn streaming_h5ad_ingest_shards_obs_above_the_threshold() {
     h5ad_to_scx_streaming(
         &h5ad,
         &scx,
-        &opts_with(ObsShardPolicy::Auto, 10, true),
+        &opts_with(ObsShardPolicy::Auto, 10),
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )
@@ -262,7 +261,7 @@ fn tenx_ingest_shards_obs_above_the_threshold() {
     tenx_to_scx(
         &tenx,
         &scx,
-        &opts_with(ObsShardPolicy::Auto, 10, false),
+        &opts_with(ObsShardPolicy::Auto, 10),
         &mut WarningSink::log(),
     )
     .unwrap();
@@ -282,7 +281,7 @@ fn eager_h5mu_ingest_shards_outer_obs_above_the_threshold() {
     h5mu_to_scx(
         &h5mu,
         &scx,
-        &opts_with(ObsShardPolicy::Auto, 10, false),
+        &opts_with(ObsShardPolicy::Auto, 10),
         &mut WarningSink::log(),
     )
     .unwrap();
@@ -302,7 +301,7 @@ fn streaming_h5mu_ingest_shards_outer_obs_above_the_threshold() {
     h5mu_to_scx_streaming(
         &h5mu,
         &scx,
-        &opts_with(ObsShardPolicy::Auto, 10, true),
+        &opts_with(ObsShardPolicy::Auto, 10),
         &mut WarningSink::log(),
     )
     .unwrap();
@@ -326,7 +325,7 @@ fn shard_obs_off_keeps_a_single_section_however_large() {
     h5ad_to_scx_streaming(
         &h5ad,
         &scx,
-        &opts_with(ObsShardPolicy::Off, 10, true),
+        &opts_with(ObsShardPolicy::Off, 10),
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )
@@ -352,7 +351,7 @@ fn shard_obs_always_shards_a_sub_threshold_file() {
         &h5ad,
         &scx,
         // 6 rows at a target of 100: `Auto` would not shard, `Always` must.
-        &opts_with(ObsShardPolicy::Always, 100, true),
+        &opts_with(ObsShardPolicy::Always, 100),
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )
@@ -378,7 +377,7 @@ fn auto_does_not_shard_at_exactly_the_threshold() {
         h5ad_to_scx_streaming(
             &h5ad,
             &scx,
-            &opts_with(ObsShardPolicy::Auto, target, true),
+            &opts_with(ObsShardPolicy::Auto, target),
             &StreamingOverrides::default(),
             &mut WarningSink::log(),
         )
@@ -422,7 +421,7 @@ fn sharded_and_single_section_obs_read_back_identically() {
     h5ad_to_scx_streaming(
         &h5ad,
         &sharded,
-        &opts_with(ObsShardPolicy::Auto, 10, true),
+        &opts_with(ObsShardPolicy::Auto, 10),
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )
@@ -430,7 +429,7 @@ fn sharded_and_single_section_obs_read_back_identically() {
     h5ad_to_scx_streaming(
         &h5ad,
         &single,
-        &opts_with(ObsShardPolicy::Off, 10, true),
+        &opts_with(ObsShardPolicy::Off, 10),
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )
@@ -523,7 +522,7 @@ fn a_converted_file_exports_through_the_multi_shard_writer() {
     h5ad_to_scx_streaming(
         &h5ad,
         &scx,
-        &opts_with(ObsShardPolicy::Auto, 10, true),
+        &opts_with(ObsShardPolicy::Auto, 10),
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )
@@ -573,7 +572,7 @@ fn obs_section_is_written_wide() {
         &h5ad,
         &scx,
         // Single-section: the claim under test is about `write_obs`, not shards.
-        &opts_with(ObsShardPolicy::Off, 100, true),
+        &opts_with(ObsShardPolicy::Off, 100),
         &StreamingOverrides::default(),
         &mut WarningSink::log(),
     )

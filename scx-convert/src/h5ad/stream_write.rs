@@ -35,7 +35,7 @@ use super::write::{
     write_uns_entries_at,
 };
 use crate::h5_write_util::vlu;
-use crate::pipeline::{ConvertError, ConvertOptions};
+use crate::pipeline::ConvertError;
 use crate::warnings::{ConvertWarning, WarningSink};
 
 /// Write obs into `parent` under `name="obs"`. Routes to the streaming
@@ -174,7 +174,7 @@ pub(crate) fn filter_record_batch_by_mask(
 pub fn write_scx_to_h5ad_streaming(
     scx_path: &Path,
     h5ad_path: &Path,
-    opts: &ConvertOptions,
+    opts: &crate::ExportOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let reader = ScxReader::open(scx_path)?;
@@ -316,7 +316,7 @@ pub(crate) fn stream_csr_to_group_at(
     layer_name: Option<&str>,
     n_vars: usize,
     keep_mask_opt: Option<&[bool]>,
-    opts: &ConvertOptions,
+    opts: &crate::ExportOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let shards = collect_shards(reader, modality_id, section_type, layer_name);
@@ -358,7 +358,7 @@ pub(crate) fn stream_csr_to_group_at(
         data: &data_ds,
     };
 
-    let requested_threads = crate::pipeline::resolve_reader_threads(opts);
+    let requested_threads = crate::pipeline::resolve_reader_threads(opts.reader_threads);
     let queue_depth = opts.writer_queue_depth.max(1);
 
     let (granted_threads, granted_depth) = if requested_threads <= 1 {
@@ -707,7 +707,7 @@ pub(crate) fn stream_layers_at(
     reader: &ScxReader,
     modality_id: u8,
     keep_mask_opt: Option<&[bool]>,
-    opts: &ConvertOptions,
+    opts: &crate::ExportOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let names = reader.layer_names_for(modality_id);
@@ -975,7 +975,7 @@ pub(crate) const EXPORT_PROVENANCE_KEY: &str = "scx_export";
 pub(crate) fn build_export_provenance(
     reader: &ScxReader,
     scx_path: &Path,
-    opts: &ConvertOptions,
+    opts: &crate::ExportOptions,
     filter: &ExportRowFilter,
 ) -> Option<serde_json::Value> {
     if !filter.caller_filtered {
@@ -1039,7 +1039,7 @@ pub(crate) fn build_export_keep_mask(
     reader: &ScxReader,
     scx_path: &Path,
     modality_id: u8,
-    opts: &ConvertOptions,
+    opts: &crate::ExportOptions,
 ) -> Result<ExportRowFilter, ConvertError> {
     let n_obs = reader.n_obs() as usize;
 

@@ -1,0 +1,112 @@
+{
+  "strictness": "Content",
+  "excluded_section_types": [
+    11
+  ],
+  "header": {
+    "format_version": 4,
+    "flags": 4,
+    "n_obs": 64,
+    "n_vars": 13,
+    "nnz": 160,
+    "n_csr_shards": 1,
+    "n_csc_shards": 0,
+    "shard_target_rows": 16384,
+    "codec_id": 2,
+    "index_dtype": 0,
+    "manifest_sequence": 1,
+    "n_modalities": 0
+  },
+  "catalog": {
+    "catalog_version": 4,
+    "manifest_sequence": 1,
+    "n_obs": 64,
+    "data_generation": 1,
+    "csc_build_generation": 0
+  },
+  "sections": [
+    {
+      "name": "X_shard_0",
+      "section_type": 4,
+      "modality_id": 0,
+      "length": 486,
+      "blake3": "97125c10260355beaf9c8d8620bc52cc76f80f200b33f07bbff4e829808408cd",
+      "stats": {
+        "row_start": 0,
+        "row_end": 64,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 160,
+        "value_min": 1,
+        "value_max": 198,
+        "value_sum": 14696,
+        "n_indexed_columns": 2,
+        "column_stats": [
+          "minmax:8132a1927494084f:0000000000000000:4083b00000000000",
+          "bitset:32d83cb41dbbf03e:73919af90e1fee9f2c6585e4534a6fa9e04931c0090b9c7ab9e631b16d8c8da0"
+        ]
+      }
+    },
+    {
+      "name": "obs",
+      "section_type": 0,
+      "modality_id": 0,
+      "length": 2386,
+      "blake3": "de6c9a002fe53b6a9eee2e6e56a54d2de57d8608093f1ce56d6ba584f380fb3d"
+    },
+    {
+      "name": "obs_predicate_index",
+      "section_type": 13,
+      "modality_id": 0,
+      "length": 1546,
+      "blake3": "678b70b2476a463b16038f99e0542f07ee2947ae0df063de468065f85ae1cdb7"
+    },
+    {
+      "name": "obsm/X_pca_shard_0",
+      "section_type": 20,
+      "modality_id": 0,
+      "length": 1706,
+      "blake3": "179853dcfdde28f266176353eb1e91fcf0349d9b34f5be2601762d872ba283c9"
+    },
+    {
+      "name": "raw_shard_0",
+      "section_type": 7,
+      "modality_id": 0,
+      "length": 486,
+      "blake3": "97125c10260355beaf9c8d8620bc52cc76f80f200b33f07bbff4e829808408cd",
+      "stats": {
+        "row_start": 0,
+        "row_end": 64,
+        "col_start": 0,
+        "col_end": 13,
+        "nnz": 160,
+        "value_min": 1,
+        "value_max": 198,
+        "value_sum": 14696,
+        "n_indexed_columns": 0,
+        "column_stats": []
+      }
+    },
+    {
+      "name": "uns",
+      "section_type": 10,
+      "modality_id": 0,
+      "length": 31,
+      "blake3": "65a30a6680525ca230473808196b04ec146a1f5dde2644f29e5c27390afc7db2"
+    },
+    {
+      "name": "var",
+      "section_type": 2,
+      "modality_id": 0,
+      "length": 1106,
+      "blake3": "afa3d84d34857a057acfac4555b417b2018350539e369c9694faf91582cba1d0"
+    },
+    {
+      "name": "var_predicate_index",
+      "section_type": 14,
+      "modality_id": 0,
+      "length": 316,
+      "blake3": "cf81cde37f1b8fcbace052d0738467c1c229b676e25bdb3e00bdf1feb8e31172"
+    }
+  ]
+}

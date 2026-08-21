@@ -459,3 +459,48 @@ def test_from_10x_explicit_csc_off_overrides_preset(tenx_h5, tmp_path, monkeypat
         str(tenx_h5), str(path), index_preset="training", csc="off", csc_cols_per_shard=5
     )
     assert _csc_available(path) is False
+
+
+def test_from_anndata_memory_budget_reaches_the_csc_sidecar(tmp_path):
+    """`memory_budget` binds the CSC sidecar transpose, not just the obsm warning.
+
+    `pyscx.from_anndata` was the fifth call site still passing the sidecar
+    builder's 4 GiB default unconditionally, so a caller who set
+    `memory_budget` to bound memory got a sidecar that ignored it. It sits
+    outside `scx-convert/src`, so the CI guard covering the other four did not
+    see it.
+
+    ⚠️ This is a **behaviour change on a public API**, which is why it is pinned
+    here rather than left to the Rust tests: the budget now genuinely binds, so
+    a value too small for one column chunk raises where it previously
+    succeeded. Loud and actionable beats silently ignoring a budget the caller
+    asked for — but it is a new failure mode and belongs in a test that says so.
+
+    The docstring for `memory_budget` promised "warn-only" before this; the two
+    have to move together.
+    """
+    import anndata as ad
+    import numpy as np
+    import pyscx
+    import pytest
+    import scipy.sparse as sp
+
+    # 2000 rows => one column chunk needs 2000 * 12 = 24_000 bytes.
+    adata = ad.AnnData(X=sp.random(2000, 50, density=0.9, format="csr", dtype=np.float32))
+
+    # Comfortably above the per-chunk minimum: builds, sidecar present.
+    ok = tmp_path / "ok.scx"
+    pyscx.from_anndata(adata, str(ok), csc="always", memory_budget=1_000_000)
+    assert pyscx.open(str(ok)).has_csc
+
+    # Below it: the budget binds, so this must fail rather than quietly
+    # allocating 4 GiB worth of chunk.
+    with pytest.raises(RuntimeError, match="memory limit too small"):
+        pyscx.from_anndata(
+            adata, str(tmp_path / "too_small.scx"), csc="always", memory_budget=1024
+        )
+
+    # And an unset budget still uses the builder's own default.
+    unset = tmp_path / "unset.scx"
+    pyscx.from_anndata(adata, str(unset), csc="always")
+    assert pyscx.open(str(unset)).has_csc

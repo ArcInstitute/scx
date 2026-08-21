@@ -443,13 +443,13 @@ fn streaming_csc_always_emits_sidecar_matching_non_streaming() {
 
     let scx_stream = dir.path().join("stream_csc.scx");
     let scx_bulk = dir.path().join("bulk_csc.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 16,
         codec: None,
         csc: super::pipeline::CscPolicy::Always,
         csc_cols_per_shard: 5,
         tool: "scx".into(),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5ad_to_scx_streaming(
         &h5ad,
@@ -690,7 +690,7 @@ fn streaming_provenance_escapes_path_quotes() {
 
 #[test]
 fn streaming_provenance_uses_configured_tool_name() {
-    // `ConvertOptions::tool` must flow through to the provenance
+    // `IngestOptions::tool` must flow through to the provenance
     // entry verbatim — `pyscx` overrides it to "pyscx" so the
     // recorded provenance reflects the actual caller.
     let dir = tempfile::tempdir().unwrap();
@@ -821,9 +821,9 @@ fn phase1_streaming_dense_nan_retained_with_epsilon() {
     let dense = vec![f32::NAN, 0.05, 0.0, 3.0];
     write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         dense_zero_epsilon: 0.1,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let file = hdf5::File::open(&h5ad).unwrap();
     let mut reader =
@@ -1243,15 +1243,25 @@ fn phase1_streaming_dense_memory_budget_caps_slab() {
     write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
 
     let file = hdf5::File::open(&h5ad).unwrap();
-    // Budget = n_vars * 4 (f32) * shard_target_rows / 2 — half what
-    // a full shard would need, so the slab cap activates.
+    // A budget that admits several slab rows but fewer than a full shard, so
+    // the cap activates without tripping the refusal.
+    //
+    // ⚠️ The old value here was `n_vars * 4 * shard_target_rows / 2` = 32_000,
+    // derived from the source dtype's width. That is below the honest minimum
+    // for a 1000-var dense matrix (one row costs 1000 × 12 B, and one slab may
+    // claim a quarter of the budget, so the floor is 48_000) — under the fixed
+    // model this file is refused rather than capped, and the test would be
+    // asserting on an error it never meant to provoke. Derived from the table
+    // instead of restated, so it tracks the model.
     let shard_target_rows: usize = 16;
-    let budget = (n_vars as u64) * 4 * (shard_target_rows as u64) / 2;
+    let row_cost = crate::budget::dense_slab_bytes(1, n_vars as u64, 4);
+    // 4 slab rows: comfortably above the 1-row floor, comfortably below 16.
+    let budget = crate::budget::SHARD_BUDGET_SHARE.min_budget_for(row_cost * 4);
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         memory_budget: Some(budget),
         shard_target_rows: shard_target_rows as u32,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     let mut reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();
@@ -1282,12 +1292,12 @@ fn phase1_streaming_dense_budget_too_small_actionable_error() {
     write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 2,
         // `n_vars * 4` is 4000 bytes per row; budget = 1 byte cannot
         // fit anything.
         memory_budget: Some(1),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let err = h5ad_to_scx_streaming(
         &h5ad,
@@ -1355,10 +1365,10 @@ fn phase2_streaming_csc_external_transpose_matches_in_memory() {
 
     // 2 KiB budget — well below the in-memory threshold of
     // `16 × nnz + 16 × n_obs`, so the external route is forced.
-    let ext_opts = ConvertOptions {
+    let ext_opts = IngestOptions {
         shard_target_rows: 16,
         memory_budget: Some(2048),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
 
     h5ad_to_scx_streaming(
@@ -1432,10 +1442,10 @@ fn phase2_streaming_csc_external_unsorted_rows_per_col() {
     );
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 8,
         memory_budget: Some(1024),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5ad_to_scx_streaming(
         &h5ad,
@@ -1476,10 +1486,10 @@ fn phase2_streaming_csc_duplicate_coords_sum() {
     // here) but above the 4-record minimum (64 B) — forces the
     // external transposer which is the path that coalesces
     // duplicates.
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 8,
         memory_budget: Some(80),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     h5ad_to_scx_streaming(
@@ -1558,11 +1568,11 @@ fn phase2_streaming_csc_external_temp_cleanup_on_success() {
     create_test_h5ad(&h5ad, 12, 4, "csc", false);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         memory_budget: Some(1024),
         temp_dir: Some(scratch.clone()),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5ad_to_scx_streaming(
         &h5ad,
@@ -1593,10 +1603,10 @@ fn phase2_streaming_csc_budget_too_small_actionable_error() {
     create_test_h5ad(&h5ad, 6, 3, "csc", false);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         memory_budget: Some(1),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let err = h5ad_to_scx_streaming(
         &h5ad,
@@ -1836,9 +1846,9 @@ fn phase3_streaming_h5mu_dense_modality_non_f32_dtype() {
     create_test_h5mu_with_dense_f64_modality(&h5mu, 6, 4, 3);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log()).unwrap();
     let reader = ScxReader::open(&scx).unwrap();
@@ -1860,10 +1870,10 @@ fn phase3_streaming_h5mu_modality_filter() {
     create_test_h5mu(&h5mu, 8, 5, 3);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         modalities: Some(vec!["rna".to_string()]),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log()).unwrap();
     let reader = ScxReader::open(&scx).unwrap();
@@ -1881,10 +1891,10 @@ fn phase3_streaming_h5mu_modality_filter_unknown_errors() {
     create_test_h5mu(&h5mu, 6, 3, 2);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         modalities: Some(vec!["zzz".to_string()]),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let err = h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log())
         .expect_err("unknown modality must fail");
@@ -1908,10 +1918,10 @@ fn streaming_h5mu_csc_always_rejected() {
     create_test_h5mu(&h5mu, 8, 30, 5);
 
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         csc: CscPolicy::Always,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let err = h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log())
         .expect_err("csc='always' must be rejected on the streaming h5mu path");
@@ -1939,10 +1949,10 @@ fn streaming_h5mu_csc_auto_warns_and_skips() {
     let h5mu = dir.path().join("cite.h5mu");
     create_test_h5mu(&h5mu, 8, 30, 5);
     let scx = dir.path().join("out.scx");
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         csc: CscPolicy::Auto,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     let result = h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut sink);
@@ -1979,13 +1989,13 @@ fn phase3_streaming_h5mu_modality_types_override() {
     // can tell override actually took effect). The default heuristic
     // would map "adt" → Protein. No override for rna → inference +
     // ModalityTypeInferred warning emitted for rna only.
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 4,
         modality_types: vec![(
             "adt".to_string(),
             scx_format_io::modality::ModalityType::Atac,
         )],
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut sink).unwrap();
@@ -2101,5 +2111,142 @@ fn phase3_streaming_h5mu_non_aligned_obs_errors() {
     assert!(
         msg.contains("rna") && msg.contains("12") && msg.contains("8"),
         "expected message to name 'rna' and the offending counts; got: {msg}"
+    );
+}
+
+/// The dense sparsify path allocates `indices` / `values` at exactly the
+/// nonzero count, and the counting predicate agrees with the retain predicate
+/// on every value class that distinguishes them.
+///
+/// Both halves matter, and for different reasons.
+///
+/// **Exactness** is what makes `budget::DENSE_SPARSIFY_BYTES_PER_ELEM = 12` a
+/// bound rather than a hope. These vectors used to start at `n/32` and grow by
+/// doubling, which overshoots the final length by up to 2x — and transiently 3x
+/// while a realloc holds both buffers — so a dense slab could reach ~24
+/// B/element against the 12 the allocation table budgets for. A budget the
+/// reader silently exceeds by 2x is the OOM that `dense_max_slab_rows` exists
+/// to prevent.
+///
+/// **Agreement** is what keeps the count honest. The counting pass and the two
+/// retain loops spell the same predicate three times, and NaN is the value that
+/// tells them apart: `NaN != 0.0` is true, but `NaN.abs() > eps` is false, so an
+/// epsilon-mode counter written the obvious way would under-count and the
+/// vectors would grow after all — quietly restoring the doubling this test
+/// exists to rule out.
+#[test]
+fn dense_sparsify_allocates_exactly() {
+    use super::stream::CsrShardStream;
+    use crate::h5ad::dense_stream::open_dense_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars) = (8usize, 16usize);
+
+    // One of each class the predicates must classify: exact zero, a value below
+    // epsilon, a value above it, a negative below/above, and NaN.
+    let mut dense = vec![0.0f32; n_obs * n_vars];
+    for row in 0..n_obs {
+        dense[row * n_vars] = 0.0; // dropped by both modes
+        dense[row * n_vars + 1] = 1e-9; // kept when eps == 0, dropped when eps > 1e-9
+        dense[row * n_vars + 2] = 5.0; // kept by both
+        dense[row * n_vars + 3] = -5.0; // kept by both
+        dense[row * n_vars + 4] = f32::NAN; // kept by both — the trap
+    }
+    let h5ad = dir.path().join("classes.h5ad");
+    write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
+    let file = hdf5::File::open(&h5ad).unwrap();
+
+    for (label, eps, expected_per_row) in [
+        ("eps == 0", 0.0f32, 4usize),    // 1e-9, 5.0, -5.0, NaN
+        ("eps > 1e-9", 1e-6f32, 3usize), // 5.0, -5.0, NaN
+    ] {
+        let opts = IngestOptions {
+            shard_target_rows: n_obs as u32,
+            dense_zero_epsilon: eps,
+            ..IngestOptions::default()
+        };
+        let mut sink = WarningSink::log();
+        let mut reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();
+        let shard = reader
+            .next_csr_shard(n_obs)
+            .unwrap()
+            .expect("expected one shard");
+
+        assert_eq!(
+            shard.values.len(),
+            expected_per_row * n_obs,
+            "{label}: the counting pass and the retain loop disagree about \
+             which values survive"
+        );
+        assert_eq!(
+            shard.indices.capacity(),
+            shard.indices.len(),
+            "{label}: indices over-allocated ({} cap for {} entries) — the \
+             sparsify buffers grew after the counting pass, so the budget's \
+             12 B/element is not a bound",
+            shard.indices.capacity(),
+            shard.indices.len()
+        );
+        assert_eq!(
+            shard.values.capacity(),
+            shard.values.len(),
+            "{label}: values over-allocated ({} cap for {} entries)",
+            shard.values.capacity(),
+            shard.values.len()
+        );
+    }
+}
+
+/// The CSC sidecar builder receives the caller's `memory_budget`, capped at its
+/// own 4 GiB default.
+///
+/// `write_csc_sidecar` documents its bound as "`cols_per_shard` or
+/// `memory_budget_bytes`, whichever is smaller", and `pipeline.rs` documented
+/// the convert side the same way — but every convert call site passed the
+/// 4 GiB default unconditionally, so `--memory-budget 512M --csc always` let
+/// sidecar generation claim 4 GiB regardless. The doc was true of the callee and
+/// false of every caller.
+///
+/// Observable through the emitted shard count: a budget tight enough to bound
+/// the column chunk below `csc_cols_per_shard` must produce **more** CSC shards
+/// than an unbounded one. Asserting `>` rather than an exact count keeps this
+/// about the budget arriving, not about the transpose's chunking arithmetic.
+#[test]
+fn csc_sidecar_honours_memory_budget() {
+    use crate::pipeline::h5ad_to_scx;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("csc_budget.h5ad");
+    // Enough columns that the chunker has room to split.
+    create_test_h5ad(&h5ad, 64, 400, "csr", false);
+
+    let mut counts = Vec::new();
+    for (label, budget) in [("unbounded", None), ("tight", Some(64_000u64))] {
+        let out = dir.path().join(format!("{label}.scx"));
+        let opts = IngestOptions {
+            csc: super::pipeline::CscPolicy::Always,
+            csc_cols_per_shard: 400, // never the binding constraint here
+            memory_budget: budget,
+            ..IngestOptions::default()
+        };
+        h5ad_to_scx(&h5ad, &out, &opts, &mut WarningSink::log()).unwrap();
+        let r = ScxReader::open(&out).unwrap();
+        let n = r
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == FmtSectionType::CscShard)
+            .count();
+        assert!(n >= 1, "{label}: expected at least one CSC shard");
+        counts.push((label, n));
+    }
+
+    let unbounded = counts[0].1;
+    let tight = counts[1].1;
+    assert!(
+        tight > unbounded,
+        "a tight memory_budget did not reach the CSC sidecar builder: \
+         unbounded gave {unbounded} shard(s), 64_000 bytes gave {tight}. \
+         Equal counts mean the call site is still passing the 4 GiB default."
     );
 }

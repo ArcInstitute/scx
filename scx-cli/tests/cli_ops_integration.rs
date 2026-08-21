@@ -2399,3 +2399,68 @@ fn test_build_csc_preserves_predicate_index_sections_but_not_pushdown() {
         "losing pruning must not change which rows match"
     );
 }
+
+/// §11.12: `scx query --count --output out.scx` used to exit 0, print the
+/// count, and silently discard `--output` — the count branch returns before
+/// the write, and nothing declared the two mutually exclusive.
+///
+/// The reject side plus, below, the two accept sides. Without those the guard
+/// would pass equally well if it rejected `--output` outright, and the flag
+/// would be broken in the other direction with nothing to say so.
+#[test]
+fn query_count_and_output_are_mutually_exclusive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "conflict.scx", 12, 10);
+    let out = dir.path().join("never_written.scx");
+
+    let output = scx_cli()
+        .args([
+            "query",
+            path.to_str().unwrap(),
+            "cell_type == 'T cell'",
+            "--count",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "--count --output must be refused, not silently ignored"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "expected a clap conflict message naming both flags, got: {stderr}"
+    );
+    assert!(
+        !out.exists(),
+        "the refused invocation created an output file"
+    );
+}
+
+/// Accept side 1: `--output` alone still writes.
+#[test]
+fn query_output_without_count_still_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "out_ok.scx", 12, 10);
+    let out = dir.path().join("written.scx");
+
+    let output = scx_cli()
+        .args([
+            "query",
+            path.to_str().unwrap(),
+            "cell_type == 'T cell'",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "query --output failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out.exists(), "--output alone must still write the file");
+}

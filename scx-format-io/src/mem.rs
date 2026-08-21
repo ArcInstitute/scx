@@ -7,9 +7,12 @@
 // convention, matching `dd` / `du -h`) or explicit `KiB`/`MiB`/`GiB`/
 // `TiB`. Decimal suffixes (`KB`/`MB`/`GB`/`TB`) are rejected to avoid
 // the usual 1000-vs-1024 ambiguity — pass the exact byte count for
-// decimal magnitudes. It lives in `scx-format` (rather than
+// decimal magnitudes. It lives in `scx-format-io` (rather than
 // `scx-convert`) so sibling crates like `scx-ops` can share it without
 // a dependency cycle.
+//
+// This is a PARSER, not a budget model: what a budget buys is declared in
+// `scx_convert::budget`, which owns the shares and the per-element costs.
 
 /// Namespacing struct; constructors live as associated functions.
 pub struct MemoryBudget;

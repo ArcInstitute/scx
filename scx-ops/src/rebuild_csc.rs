@@ -47,7 +47,7 @@ pub fn framing_for_csc_rebuild(path: &Path) -> Option<FramingConfig> {
 /// authorises the writer to *re-select* each CSR shard's codec (see
 /// `FramingConfig`'s contract) — the opposite of the preservation a sidecar
 /// rebuild needs. The streaming-convert `--csc` path is the one exception: it
-/// passes `ConvertOptions::framing_preserving_codec()` so a custom
+/// passes `IngestOptions::framing_preserving_codec()` so a custom
 /// `--row-group-rows` is honoured on the sidecar too, with `decode_target`
 /// stripped for the same reason.
 pub fn rebuild_csc_inplace(

@@ -364,7 +364,7 @@ validated by a suite that cannot fail is indistinguishable from a regression.
   (1) the reader exposes `IndexedCsrShardStream::read_range` via the
   `as_indexed` trait override, (2) `H5is_library_threadsafe` reports
   the libhdf5 build is thread-safe (cached in `OnceLock`), and (3)
-  `ConvertOptions::reader_threads` resolves to `> 1`. Any precondition
+  `IngestOptions::reader_threads` resolves to `> 1`. Any precondition
   failing falls back to the sequential path; the `Hdf5NotThreadsafe`
   warning is emitted at most once per process (via
   `hdf5_threadsafe::try_emit_not_threadsafe_warning`), because the
@@ -405,13 +405,29 @@ validated by a suite that cannot fail is indistinguishable from a regression.
   `IndexedCsrShardStream::per_worker_bytes(effective_target,
   modality_type)`. Sparse readers (default impl) assume density 5 %
   (RNA / general) or 10 % (ATAC), times `n_vars × 16 B/nnz`.
-  `DenseXStreamReader` overrides this to size the dense slab buffer
-  (`effective_target × n_vars × sizeof(dtype) × 2`). Densities live
-  in `PARALLEL_DENSITY_DEFAULT_DEN` / `PARALLEL_DENSITY_ATAC_DEN`;
-  values err conservative because over-estimating only routes to the
-  sequential coordinator. When `--memory-budget` is set, worker
+  `DenseXStreamReader` overrides this with
+  `effective_target × n_vars × 12 B/element`. Every constant and
+  fraction here comes from `scx-convert/src/budget.rs`; do not
+  re-derive one at a call site. When `--memory-budget` is set, worker
   count is clamped to fit; a single shard exceeding the budget fails
   the convert with an actionable message rather than risking OOM.
+  ⚠️ **"Over-estimating is safe because it only routes to the
+  sequential coordinator" is false, and this file used to say it.**
+  Routing to sequential *is* the failure: an over-estimate does not
+  degrade throughput gracefully, it destroys parallelism outright
+  while leaving most of the budget unused. That reasoning is how the
+  dense reader came to divide the budget by 4 in one function and
+  multiply the resulting slab by 2 in another, charging the same
+  reserve twice, so that every budget-bound dense convert ran on one
+  thread. Size honestly instead: the cost model says what a unit
+  holds, the share says how much of the budget it may claim, and the
+  two are separate numbers.
+- Direction-typed convert options: ingest entry points take
+  `IngestOptions`, export entry points take `ExportOptions`. An
+  export-only option must be named `export_*` and live on the latter
+  — a CI guard enforces both halves. Do not add a runtime check that
+  an option "has no effect on this direction"; that is the shape the
+  split removed.
 - CSC external-memory transpose stays sequential (the bucket pipeline
   serialises by construction). h5mu cross-modality is sequential
   across modalities; each modality's X / layers go through the
@@ -462,4 +478,4 @@ dispatcher but with a simpler precondition set:
 - **No new public API.** `pyscx.to_h5ad` / `pyscx.to_h5mu` gain
   `reader_threads=`, `writer_queue_depth=`, `memory_budget=` kwargs
   symmetric with the ingest wrappers, plus the existing CLI flags
-  already flow through `ConvertOptions`.
+  already flow through `IngestOptions` / `ExportOptions`.

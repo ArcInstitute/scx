@@ -4,17 +4,26 @@
 // `target_rows` rows at a time and sparsifying each slab into a
 // [`StreamedCsrShard`].
 //
-// Peak memory per shard is bounded by
-// `slab_rows × n_vars × sizeof(source_dtype)` for the dense buffer,
-// plus the sparsified CSR working set. `ConvertOptions::memory_budget`
-// caps `slab_rows` independently of `shard_target_rows` so dense
-// inputs with very large `n_vars` don't exceed the budget. When the
+// Peak memory for one `read_range` is `slab_rows × n_vars ×
+// crate::budget::dense_peak_bytes_per_elem(dtype)` plus the `u64` indptr —
+// 12 B/element, and
+// deliberately NOT keyed to `sizeof(source_dtype)`: the resident slab is f32
+// whatever the input was, and the sparsified output does not depend on the
+// source width at all. Sizing by the source width is the bug the `/4` here used
+// to have (it under-reserved 3x for `u8`), so do not reintroduce that shape.
+// `IngestOptions::memory_budget` caps `slab_rows` independently of
+// `shard_target_rows` so dense inputs with very large `n_vars` stay inside
+// their share of the budget.
+//
+// ⚠️ That bound covers the READER phase only. The worker calling it also holds
+// the encoded shard alongside the raw CSR — see the `enforced: false` note on
+// the ingest rows in `crate::budget::ALLOCATION_TABLE`. When the
 // budget is smaller than a single dense row, `open_dense_streaming`
 // returns an actionable error rather than silently disabling the cap.
 
 use ndarray::s;
 
-use crate::pipeline::{ConvertError, ConvertOptions};
+use crate::pipeline::{ConvertError, IngestOptions};
 use crate::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
 use crate::warnings::WarningSink;
 
@@ -32,7 +41,7 @@ pub struct DenseXStreamReader {
     dataset: hdf5::Dataset,
     /// On-disk numeric dtype; drives the per-slab cast to f32.
     dtype: DenseDtype,
-    /// `dense_zero_epsilon` snapshot from [`ConvertOptions`].
+    /// `dense_zero_epsilon` snapshot from [`IngestOptions`].
     /// `0.0` means equality-to-zero filtering (matches scipy).
     zero_eps: f32,
     cursor: u64,
@@ -99,7 +108,7 @@ pub(crate) fn read_dense_slab_f32(
 pub fn open_dense_streaming(
     file: &hdf5::File,
     path: &str,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     _sink: &mut WarningSink,
 ) -> Result<DenseXStreamReader, ConvertError> {
     let dataset = file.dataset(path)?;
@@ -120,28 +129,30 @@ pub fn open_dense_streaming(
         ))
     })?;
 
-    // `memory_budget / (n_vars * sizeof(dtype)) / 4` — the `/4`
-    // reserves headroom for the sparsified output, the encoder queue,
-    // and per-shard sort scratch. A budget too small to fit one
-    // 4×-reserved row would silently lose the cap and risk OOM —
-    // reject with an actionable error instead, mirroring the
-    // `csc_stream::open_csc_streaming` precedent.
+    // One slab may claim `budget::SHARD_BUDGET_SHARE` of the budget; how many
+    // rows that is comes from the table's cost model. Both the refusal
+    // predicate and the number the message advertises come from the same pair
+    // of functions, so they cannot drift -- they used to: the guard tested
+    // `budget / row_bytes == 0` while the message promised `4 x row_bytes`, so
+    // a budget of two rows passed a check claiming to need four.
+    let dtype_bytes = dtype.size_bytes() as u64;
     let max_slab_rows = match opts.memory_budget {
         None => usize::MAX,
-        Some(budget) => {
-            let row_bytes = (n_vars as usize).saturating_mul(dtype.size_bytes());
-            let min_required = row_bytes.saturating_mul(4);
-            match (budget as usize).checked_div(row_bytes) {
-                None | Some(0) => {
-                    return Err(ConvertError::Other(format!(
-                        "memory_budget {budget} bytes too small for dense streaming of \
-                         {n_vars} vars × {dtype:?}; need at least {min_required} bytes \
-                         (≈ 4 × row_bytes for slab + sparsified output + encoder headroom)"
-                    )));
-                }
-                Some(rows) => (rows / 4).max(1),
+        Some(budget) => match crate::budget::dense_max_slab_rows(budget, n_vars, dtype_bytes) {
+            Err(()) => {
+                let min_required = crate::budget::dense_min_budget(n_vars, dtype_bytes);
+                return Err(ConvertError::Other(format!(
+                    "memory_budget {budget} bytes too small for dense streaming of \
+                     {n_vars} vars × {dtype:?}; need at least {min_required} bytes \
+                     (one slab row at {} B/element, which is \
+                     {}/{} of the budget)",
+                    crate::budget::dense_peak_bytes_per_elem(dtype_bytes),
+                    crate::budget::SHARD_BUDGET_SHARE.numerator(),
+                    crate::budget::SHARD_BUDGET_SHARE.denominator(),
+                )));
             }
-        }
+            Ok(rows) => usize::try_from(rows).unwrap_or(usize::MAX).max(1),
+        },
     };
 
     Ok(DenseXStreamReader {
@@ -161,7 +172,7 @@ pub fn open_dense_streaming(
 pub fn open_dense_layer_streaming(
     file: &hdf5::File,
     layer_name: &str,
-    opts: &ConvertOptions,
+    opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<DenseXStreamReader, ConvertError> {
     open_dense_streaming(file, &format!("layers/{layer_name}"), opts, sink)
@@ -198,12 +209,32 @@ impl DenseXStreamReader {
 
         let flat = self.read_slab_f32(row_start_usize, row_end, n_vars)?;
 
+        // Count first, then reserve exactly.
+        //
+        // These used to start at `slab_rows * n_vars / 32` and grow by
+        // doubling, which is what made this function's true peak unbounded by
+        // anything the budget knew about: doubling overshoots the final length
+        // by up to 2x, and while a realloc is in flight both the old and new
+        // buffers are live, so a dense slab could reach ~24 B/element against
+        // the 12 the allocation table budgets for
+        // (`budget::DENSE_SPARSIFY_BYTES_PER_ELEM`). One extra linear scan of
+        // `flat` buys an exact allocation, and it also deletes up to five
+        // realloc+memcpy rounds on the way up.
+        //
+        // The predicate below must stay identical to the two retain predicates
+        // in the loops that follow; `dense_sparsify_allocates_exactly` pins
+        // that they agree.
+        let eps = self.zero_eps;
+        let nnz = if eps == 0.0 {
+            flat.iter().filter(|v| **v != 0.0).count()
+        } else {
+            flat.iter().filter(|v| v.is_nan() || v.abs() > eps).count()
+        };
         let mut indptr: Vec<u64> = Vec::with_capacity(slab_rows + 1);
-        let mut indices: Vec<u32> = Vec::with_capacity(slab_rows * n_vars / 32 + 1);
-        let mut values: Vec<f32> = Vec::with_capacity(slab_rows * n_vars / 32 + 1);
+        let mut indices: Vec<u32> = Vec::with_capacity(nnz);
+        let mut values: Vec<f32> = Vec::with_capacity(nnz);
 
         indptr.push(0);
-        let eps = self.zero_eps;
         if eps == 0.0 {
             for row in 0..slab_rows {
                 let base = row * n_vars;
@@ -307,17 +338,21 @@ impl IndexedCsrShardStream for DenseXStreamReader {
         shard_target_rows: u32,
         _modality_type: scx_format_io::modality::ModalityType,
     ) -> u64 {
-        // Dense slab buffer is the binding bound (the sparsified
-        // output is bounded by it). Match the sequential reservation
-        // philosophy at `open_dense_streaming` (× 4 row_bytes for slab
-        // + sparsified output + encoder headroom) with × 2 here — the
-        // dispatcher only needs to know "fits or doesn't" rather than
-        // exact peak.
-        let row_bytes = (self.n_vars).saturating_mul(self.dtype.size_bytes() as u64);
-        (shard_target_rows as u64)
-            .saturating_mul(row_bytes)
-            .saturating_mul(2)
-            .max(1)
+        // The same cost model that sized the cap in `open_dense_streaming`.
+        //
+        // ⚠️ This deliberately does NOT apply a further multiplier. It used to
+        // multiply by 2 "so the dispatcher knows fits-or-doesn't", but
+        // `shard_target_rows` reaching here has already been clamped to
+        // `max_slab_rows`, which was itself produced by taking a quarter of the
+        // budget -- so the ×2 charged the same reserve a second time. The
+        // arithmetic worked out to `per_worker ≈ budget/2`, hence
+        // `outstanding_max = 2`, `granted_threads = 1`, and every budgeted
+        // dense convert silently taking the sequential coordinator (§11.5).
+        crate::budget::dense_slab_bytes(
+            shard_target_rows as u64,
+            self.n_vars,
+            self.dtype.size_bytes() as u64,
+        )
     }
 }
 

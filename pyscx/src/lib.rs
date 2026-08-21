@@ -1,3 +1,8 @@
+// Rust 1.98's `clippy::chunks_exact_to_as_chunks` fires here on code this PR
+// does not touch; see the crate-root note in `scx-codec/src/lib.rs` for why it
+// is suppressed rather than rewritten, and who owns the rewrite.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 mod accel;
 pub(crate) mod anndata_hooks;
 pub(crate) mod axis_align;
@@ -322,7 +327,15 @@ pub(crate) fn deep_validate_into(
 ///   or a binary-prefixed size string — `K`/`M`/`G`/`T` or
 ///   `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024; decimal
 ///   `KB`/`MB`/`GB`/`TB` is rejected), e.g. `"4G"` / `"512MiB"`.
-///   Warn-only — shard size is not derated. Applies to both the
+///   ⚠️ No longer warn-only when a CSC sidecar is built: the budget is
+///   also passed to the sidecar transpose (capped at its 4 GiB default),
+///   so it changes the CSC shard count, and a budget too small for one
+///   column chunk now **raises** — `RuntimeError: CSC transpose failed:
+///   memory limit too small: need at least N bytes for 1 column chunk` —
+///   where it previously succeeded. Measured: a 2000-row matrix needs
+///   24000 bytes, so `memory_budget=1024, csc="always"` fails. The
+///   obsm / varm / obsp / varp footprint check remains warn-only.
+///   Applies to both the
 ///   in-memory and backed routing paths.
 ///
 /// `force_legacy_metadata`: when True, write obs/var as a single
@@ -639,13 +652,13 @@ fn from_h5ad(
     let obs_shard_policy =
         scx_format_io::ObsShardPolicy::parse(shard_obs).map_err(PyValueError::new_err)?;
 
-    let opts = scx_convert::ConvertOptions {
+    let opts = scx_convert::IngestOptions {
         shard_target_rows,
         codec: explicit_codec,
         csc: csc_policy,
         csc_cols_per_shard,
         // Framing on by default (G=256); `row_group_rows=0` opts out to unframed
-        // v3. `ConvertOptions::framing()` treats `Some(0)` as unframed, but store
+        // v3. `IngestOptions::framing()` treats `Some(0)` as unframed, but store
         // None for 0 so the v4 header bump is clean.
         row_group_rows: (row_group_rows != 0).then_some(row_group_rows),
         row_group_target_nnz,
@@ -653,7 +666,6 @@ fn from_h5ad(
         decode_target: decode_target_parsed,
         tool: "pyscx".into(),
         memory_budget: memory_budget_bytes,
-        stream,
         strict_uns,
         dense_zero_epsilon,
         temp_dir: temp_dir.map(std::path::PathBuf::from),
@@ -674,9 +686,6 @@ fn from_h5ad(
         group_target_bytes: group_target_bytes_val,
         group_max_bytes: group_max_bytes_val,
         group_pass: group_pass_val,
-        // Export-only; this is an ingest direction.
-        export_obs_keep_mask: None,
-        export_min_counts: None,
     };
 
     let input = std::path::PathBuf::from(path);
@@ -979,15 +988,19 @@ fn to_h5ad(
         }
     }
 
-    let opts = scx_convert::ConvertOptions {
-        stream,
+    // Exhaustive, and now visibly so: this literal names every field of
+    // `ExportOptions`, which is the measurement behind the claim that
+    // `to_h5ad` was already a hand-rolled export options struct. It touched
+    // exactly the six fields the type has and nothing else, for as long as it
+    // has existed -- the 27 ingest-only fields it inherited from the shared
+    // struct were dead weight it never set.
+    let opts = scx_convert::ExportOptions {
         tool: "pyscx".into(),
         reader_threads,
         writer_queue_depth,
         memory_budget: memory_budget_bytes,
         export_obs_keep_mask: obs_mask_owned,
         export_min_counts: min_counts,
-        ..Default::default()
     };
     py.detach(|| -> Result<(), scx_convert::ConvertError> {
         let mut sink = scx_convert::WarningSink::log();
@@ -1037,8 +1050,7 @@ fn to_h5mu(
 ) -> PyResult<()> {
     use std::path::Path;
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
-    let opts = scx_convert::ConvertOptions {
-        stream,
+    let opts = scx_convert::ExportOptions {
         tool: "pyscx".into(),
         reader_threads,
         writer_queue_depth,

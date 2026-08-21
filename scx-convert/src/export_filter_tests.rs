@@ -6,7 +6,7 @@
 //! silently off-by-N on any file with deletions.
 
 use super::*;
-use crate::convert_tests_common::{create_test_h5ad, h5ad_to_scx, ConvertOptions, WarningSink};
+use crate::convert_tests_common::{create_test_h5ad, h5ad_to_scx, IngestOptions, WarningSink};
 
 /// Row sums as the exporter itself would compute them, straight from the
 /// backed reader — an independent oracle for the mask.
@@ -22,7 +22,7 @@ fn build_fixture(dir: &std::path::Path, n_obs: usize, n_vars: usize) -> std::pat
     h5ad_to_scx(
         &h5ad,
         &scx,
-        &ConvertOptions::default(),
+        &IngestOptions::default(),
         &mut WarningSink::log(),
     )
     .unwrap();

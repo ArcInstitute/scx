@@ -74,6 +74,18 @@ mod hdf5_threadsafe;
 // hdf5-gated, so at default features every item in it is dead by construction
 // while its tests still exercise them. That is the intended shape, not an
 // oversight, hence the narrow allow rather than gating the module.
+// Deliberately NOT gated on `hdf5`, for the same reason `parallel_drain` is
+// not (see the note above it): the budget table is integer arithmetic, and
+// keeping it feature-free is what lets its fractions invariant run in the
+// default `cargo test --workspace` job rather than only in the hdf5 lane.
+#[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
+mod budget;
+// The CSC sidecar budget resolver is the one item in the table that a *binding*
+// needs: `pyscx.from_anndata` builds a sidecar too, and it was the fifth call
+// site still passing the 4 GiB default. Exported rather than reimplemented so
+// there is one answer to "what may the sidecar claim". Ungated — it is integer
+// arithmetic over an `Option<u64>`.
+pub use budget::csc_sidecar_bytes;
 #[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
 mod parallel_drain;
 #[cfg(feature = "hdf5")]
@@ -107,9 +119,10 @@ pub use h5ad::read::{
 /// working regardless of which scx-convert features are enabled.
 pub use scx_format_io::CATEGORICAL_ORDERED_KEY;
 
-// Re-exported from scx-format so existing `scx_convert::MemoryBudget`
-// call sites keep working; the parser lives in scx-format so sibling
-// crates (scx-ops) can share it without a dependency cycle.
+// Re-exported from scx-format-io so existing `scx_convert::MemoryBudget`
+// call sites keep working; the parser lives there so sibling crates
+// (scx-ops) can share it without a dependency cycle. It parses a byte
+// count and nothing more — what a budget buys is `crate::budget`.
 pub use scx_format_io::MemoryBudget;
 #[cfg(feature = "hdf5")]
 pub use stream::{CsrShardStream, MajorAxis, StreamedCsrShard};
@@ -121,7 +134,7 @@ pub use warnings::{ConvertWarning, WarningSink};
 pub use scx_format_io::CscPolicy;
 
 /// Strategy for realizing convert-time grouping (`--group-pass`). See
-/// [`pipeline::ConvertOptions::group_pass`]. Defined at the crate root (not in
+/// [`pipeline::IngestOptions::group_pass`]. Defined at the crate root (not in
 /// the hdf5-gated `pipeline` module) because the CLI's non-hdf5 build path
 /// parses and threads it before dispatch, like [`CscPolicy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -149,6 +162,12 @@ impl GroupPass {
     }
 }
 
+// Direction-specific options (ORG-11.16-3). Gated with its consumers.
+#[cfg(feature = "hdf5")]
+mod options;
+#[cfg(feature = "hdf5")]
+pub use options::ExportOptions;
+
 #[cfg(feature = "hdf5")]
 pub mod pipeline;
 
@@ -156,7 +175,7 @@ pub mod pipeline;
 pub use pipeline::{
     codec_selection_json, h5ad_to_scx, h5ad_to_scx_streaming, run_streaming_writer_coordinator,
     scx_to_h5ad, scx_to_h5ad_streaming, streaming_writer_coordinator, tenx_to_scx, BitmapPolicy,
-    ConvertError, ConvertOptions, StreamingOverrides,
+    ConvertError, IngestOptions, StreamingOverrides,
 };
 
 #[cfg(feature = "hdf5")]
@@ -187,6 +206,8 @@ mod convert_tests_h5ad;
 mod convert_tests_index_export;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_obs_shard;
+#[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_options_split;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_parallel;
 #[cfg(all(test, feature = "hdf5"))]

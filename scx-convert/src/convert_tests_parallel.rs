@@ -281,6 +281,14 @@ fn compute_shard_row_ranges_partition_invariants() {
 /// `IndexedCsrShardStream::max_slab_rows`, matching the sequential
 /// path's slab clamp. Verifies the run completes and CSR bytes match
 /// the sequential path.
+///
+/// ⚠️ **This test does not assert which coordinator its "parallel" arm ran
+/// on, and for a long time that arm was not parallel at all** — the budget
+/// derate collapsed the grant to one thread and `if granted <= 1` routed it
+/// back to the sequential path, so byte-identity held trivially between two
+/// runs of the same code. `dense_convert_under_a_memory_budget_stays_parallel`
+/// is the test that asserts the route; keep both. This one's job is the byte
+/// comparison, and it is only worth something because that one exists.
 #[test]
 fn dense_parallel_with_memory_budget_byte_identical() {
     if super::hdf5_threadsafe::skip_if_not_threadsafe(
@@ -293,9 +301,18 @@ fn dense_parallel_with_memory_budget_byte_identical() {
     // 100 rows × 50 vars dense, f32 → row_bytes = 200.
     create_test_h5ad(&h5ad, 100, 50, "dense", false);
 
-    // budget = 8192 → max_slab_rows = (8192 / 200) / 4 = 10
-    // shard_target = 32 → parallel must clamp the partition to 10.
-    // Per-worker dense bytes = 10 × 50 × 4 × 2 = 4000 ≤ 8192.
+    // budget = 8192, 50 vars at 12 B/element (`budget::dense_slab_bytes`):
+    //   one slab may claim SHARD_BUDGET_SHARE (1/4) = 2048 B
+    //   → max_slab_rows = 2048 / (50 × 12) = 3, well under shard_target 32,
+    //     so the partition clamp is exercised;
+    //   → per-worker = 3 × 50 × 12 = 1800 B, outstanding_max = 4.
+    //
+    // ⚠️ These numbers are derived, not decorative: the previous version of
+    // this comment read `(8192 / 200) / 4 = 10` and `10 × 50 × 4 × 2 = 4000`,
+    // which is the pre-fix arithmetic — the ÷4 keyed to the source dtype width
+    // and the ×2 that double-counted it. It went stale the moment the sizing
+    // changed, and a stale comment on a passing test is how the next reader
+    // learns the wrong model.
     let scx_seq = dir.path().join("seq.scx");
     let scx_par = dir.path().join("par.scx");
 
@@ -487,19 +504,33 @@ fn parallel_per_worker_bytes_dense_uses_dense_formula() {
     create_test_h5ad(&h5ad, 64, 40, "dense", false);
     let file = hdf5::File::open(&h5ad).unwrap();
 
-    let opts = ConvertOptions {
+    let opts = IngestOptions {
         shard_target_rows: 32,
         memory_budget: None,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     let reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();
     let indexed: &dyn IndexedCsrShardStream = &reader;
 
-    // f32 = 4 bytes. Expected: 32 × 40 × 4 × 2 = 10_240.
+    // 32 rows × 40 vars × 12 B/element + 33 × 8 B indptr = 15_624.
+    //
+    // ⚠️ This was `32 × 40 × 4 × 2 = 10_240`, and the change is the point of
+    // the fix rather than a casualty of it. The old expression charged
+    // `2 × sizeof(source_dtype)` per element, which was wrong twice over: the
+    // ×2 double-counted a reserve `open_dense_streaming` had already taken
+    // (§11.5), and keying the per-element cost to the *source* width is wrong
+    // in the other direction, since the resident slab is f32 whatever the
+    // input was and the sparsified output does not depend on the source width
+    // at all. 12 B/element is what `read_range_inner` actually holds; see
+    // `budget::DENSE_SPARSIFY_BYTES_PER_ELEM`.
+    //
+    // The `+ 33 × 8` is the `u64` indptr, added after review: it is noise at
+    // atlas `n_vars` and the dominant term at `n_vars = 1`, so leaving it out
+    // was an under-count that no fixture in the suite happened to expose.
     let bytes_rna = indexed.per_worker_bytes(32, ModalityType::Rna);
     let bytes_atac = indexed.per_worker_bytes(32, ModalityType::Atac);
-    assert_eq!(bytes_rna, 10_240);
+    assert_eq!(bytes_rna, 15_624);
     // Dense override ignores modality — same formula regardless.
     assert_eq!(bytes_rna, bytes_atac);
     // And it's never zero.
@@ -524,10 +555,10 @@ fn dense_max_slab_rows_clamps_partition() {
     let file = hdf5::File::open(&h5ad).unwrap();
 
     // No budget → no cap.
-    let opts_nocap = ConvertOptions {
+    let opts_nocap = IngestOptions {
         shard_target_rows: 32,
         memory_budget: None,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let mut sink = WarningSink::log();
     let r_nocap = open_dense_streaming(&file, "X", &opts_nocap, &mut sink).unwrap();
@@ -535,10 +566,10 @@ fn dense_max_slab_rows_clamps_partition() {
     assert_eq!(indexed_nocap.max_slab_rows(), None);
 
     // Tight budget → cap fires.
-    let opts_capped = ConvertOptions {
+    let opts_capped = IngestOptions {
         shard_target_rows: 32,
         memory_budget: Some(8192),
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     let r_capped = open_dense_streaming(&file, "X", &opts_capped, &mut sink).unwrap();
     let indexed_capped: &dyn IndexedCsrShardStream = &r_capped;
@@ -574,16 +605,16 @@ fn parallel_export_byte_identical_to_sequential() {
     assert!(reader.catalog().shards_sorted().len() >= 4);
     drop(reader);
 
-    let seq_opts = ConvertOptions {
+    let seq_opts = ExportOptions {
         reader_threads: Some(1),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
 
-    let par_opts = ConvertOptions {
+    let par_opts = ExportOptions {
         reader_threads: Some(4),
         writer_queue_depth: 4,
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_par, &par_opts, &mut WarningSink::log()).unwrap();
 
@@ -607,21 +638,21 @@ fn parallel_export_with_layers_byte_identical() {
 
     // `include_extras = true` adds a layer alongside the main X.
     create_test_h5ad(&h5ad, 64, 9, "csr", true);
-    let import_opts = ConvertOptions {
+    let import_opts = IngestOptions {
         shard_target_rows: 8,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5ad_to_scx(&h5ad, &scx, &import_opts, &mut WarningSink::log()).unwrap();
 
-    let seq_opts = ConvertOptions {
+    let seq_opts = ExportOptions {
         reader_threads: Some(1),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
 
-    let par_opts = ConvertOptions {
+    let par_opts = ExportOptions {
         reader_threads: Some(4),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_par, &par_opts, &mut WarningSink::log()).unwrap();
 
@@ -681,15 +712,15 @@ fn parallel_export_with_deletion_vectors_byte_identical() {
     let deleted: Vec<u64> = vec![1, 9, 12, 25, 41, 67];
     scx_ops::mark_deleted(&scx, &deleted).unwrap();
 
-    let seq_opts = ConvertOptions {
+    let seq_opts = ExportOptions {
         reader_threads: Some(1),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
 
-    let par_opts = ConvertOptions {
+    let par_opts = ExportOptions {
         reader_threads: Some(4),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_par, &par_opts, &mut WarningSink::log()).unwrap();
 
@@ -728,21 +759,21 @@ fn parallel_export_h5mu_byte_identical() {
 
     // Two modalities (rna 40 × 7, adt 40 × 5); shard_size 8 → 5 shards each.
     create_test_h5mu(&h5mu_in, 40, 7, 5);
-    let import_opts = ConvertOptions {
+    let import_opts = IngestOptions {
         shard_target_rows: 8,
-        ..ConvertOptions::default()
+        ..IngestOptions::default()
     };
     h5mu_to_scx(&h5mu_in, &scx, &import_opts, &mut WarningSink::log()).unwrap();
 
-    let seq_opts = ConvertOptions {
+    let seq_opts = ExportOptions {
         reader_threads: Some(1),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5mu_streaming(&scx, &h5mu_seq, &seq_opts, &mut WarningSink::log()).unwrap();
 
-    let par_opts = ConvertOptions {
+    let par_opts = ExportOptions {
         reader_threads: Some(4),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5mu_streaming(&scx, &h5mu_par, &par_opts, &mut WarningSink::log()).unwrap();
 
@@ -784,10 +815,10 @@ fn parallel_export_memory_budget_refuses_oversized_shard() {
     let h5ad = dir.path().join("out.h5ad");
 
     make_multishard_scx(&scx, 80, 64, 16);
-    let opts = ConvertOptions {
+    let opts = ExportOptions {
         reader_threads: Some(4),
         memory_budget: Some(1), // 1 byte — well below any shard's working set
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     let err = scx_to_h5ad_streaming(&scx, &h5ad, &opts, &mut WarningSink::log())
         .expect_err("expected refusal");
@@ -821,11 +852,11 @@ fn parallel_export_memory_budget_derates_workers() {
         log_clone.lock().unwrap().push(format!("{:?}", w));
     });
 
-    let opts = ConvertOptions {
+    let opts = ExportOptions {
         reader_threads: Some(8),
         writer_queue_depth: 4,
         memory_budget: Some(1500),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad, &opts, &mut sink).unwrap();
 
@@ -849,9 +880,9 @@ fn parallel_export_memory_budget_derates_workers() {
 
     // Output must still match the sequential path.
     let h5ad_seq = dir.path().join("seq.h5ad");
-    let seq_opts = ConvertOptions {
+    let seq_opts = ExportOptions {
         reader_threads: Some(1),
-        ..ConvertOptions::default()
+        ..ExportOptions::default()
     };
     scx_to_h5ad_streaming(&scx, &h5ad_seq, &seq_opts, &mut WarningSink::log()).unwrap();
     let (a_indptr, a_indices, a_data, _) = read_h5ad_x_triplet(&h5ad);
@@ -912,7 +943,7 @@ fn parallel_export_worker_error_does_not_deadlock() {
     let h5ad_out = dir.path().join("out.h5ad");
 
     // 80 rows / shard 10 → 8 CSR shards. With the default
-    // ConvertOptions, no bitmap shards are emitted, so every `SCXS`
+    // IngestOptions, no bitmap shards are emitted, so every `SCXS`
     // magic in the file is a CSR shard header.
     make_multishard_scx(&scx_path, 80, 11, 10);
 
@@ -958,10 +989,10 @@ fn parallel_export_worker_error_does_not_deadlock() {
     // reports its error.
     let scx = scx_path.clone();
     let handle = std::thread::spawn(move || {
-        let opts = ConvertOptions {
+        let opts = ExportOptions {
             reader_threads: Some(4),
             writer_queue_depth: 1,
-            ..ConvertOptions::default()
+            ..ExportOptions::default()
         };
         scx_to_h5ad_streaming(&scx, &h5ad_out, &opts, &mut WarningSink::log())
     });
@@ -1157,10 +1188,10 @@ fn parallel_export_worker_panic_does_not_deadlock() {
     let scx = scx_path.clone();
     let handle = std::thread::spawn(move || {
         let _panic = test_hooks::PanicExportShardGuard::new(3);
-        let opts = ConvertOptions {
+        let opts = ExportOptions {
             reader_threads: Some(4),
             writer_queue_depth: 1,
-            ..ConvertOptions::default()
+            ..ExportOptions::default()
         };
         scx_to_h5ad_streaming(&scx, &h5ad_out, &opts, &mut WarningSink::log())
     });
@@ -1182,4 +1213,229 @@ fn parallel_export_worker_panic_does_not_deadlock() {
         result.is_err(),
         "expected Err from injected export worker panic; got Ok"
     );
+}
+
+/// §11.5: `--memory-budget` on a dense h5ad must not silently destroy
+/// parallelism.
+///
+/// ⚠️ **This is the assertion `dense_parallel_with_memory_budget_byte_identical`
+/// never made, and without which its two arms are secretly one arm.** That test
+/// asks for `reader_threads = Some(4)`, but the budget derate collapses the
+/// grant to 1 and `pipeline.rs`'s `if granted <= 1` routes it to the
+/// *sequential* coordinator — so it compares the sequential path against itself
+/// and byte-identity is trivially true. Its own comment computes
+/// `(8192 / 200) / 4 = 10` and then asserts nothing about it.
+///
+/// The oracle is `parallel_drain::hooks::last_run_peak()`, a thread-local set
+/// at the tail of `ordered_parallel_drain`. Only two production callers exist —
+/// parallel ingest (`pipeline.rs:2286`) and parallel export
+/// (`stream_write.rs:509`) — and the sequential coordinator calls neither, so it
+/// leaves the counter at its initial `0`. That makes `0` vs `> 0` an exact
+/// answer to "which coordinator ran", which is the only question this test asks.
+/// (It is deliberately *not* an assertion about how much concurrency was
+/// achieved: rayon bounds that by the pool size regardless of the coordinator,
+/// as `parallel_reorder_buffer_bounded_by_window` documents at length.)
+///
+/// ⚠️ **The counter must be zeroed explicitly, and arm order alone does not do
+/// it.** `LAST_RUN_PEAK` is a `thread_local!` written only at the tail of
+/// `ordered_parallel_drain`; `hooks::reset()` zeros the three atomics but not
+/// this cell, and it runs *inside* the drain, so a control arm where no drain
+/// executes never reaches it. libtest reuses OS threads across `#[test]`s, so
+/// any earlier parallel convert on this thread — `dense_parallel_with_memory_budget_byte_identical`
+/// now takes the parallel path itself — leaves a non-zero value behind and the
+/// control arm fails claiming the sequential coordinator entered the drain.
+/// An earlier version of this test relied on arm order alone and was flaky by
+/// construction; it passed only because of thread-scheduling luck. Both arms
+/// now zero the cell first, which makes each assertion a statement about the
+/// convert it just ran and nothing else.
+///
+/// The arithmetic, with `n_vars = 50` f32 (`row_bytes = 200`) and
+/// `memory_budget = 24_000`:
+///
+/// | | before the fix | after |
+/// |---|---|---|
+/// | `max_slab_rows` | `(24000/200)/4 = 30` | `(6000−8)/(50×12+8) = 9` |
+/// | `per_worker_bytes` | `30×200×2 = 12000` (= B/2) | `9×50×12 + 10×8 = 5480` |
+/// | `outstanding_max` | 2 | 4 |
+/// | `granted_threads` | **1 → sequential** | **3 → parallel** |
+///
+/// The post-fix column includes the `u64` indptr and solves for rows affinely
+/// (`rows × (n_vars × 12 + 8) + 8 ≤ share`), both added in the review round. An
+/// earlier version of this table said `10` and `6000`, from before the indptr
+/// term existed — the same staleness this file was already caught carrying once.
+#[test]
+fn dense_convert_under_a_memory_budget_stays_parallel() {
+    if super::hdf5_threadsafe::skip_if_not_threadsafe(
+        "dense_convert_under_a_memory_budget_stays_parallel",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("dense.h5ad");
+    // 200 rows × 50 vars, f32 dense → row_bytes = 200.
+    create_test_h5ad(&h5ad, 200, 50, "dense", false);
+
+    // ---- control arm: sequential, on a deliberately zeroed thread-local ----
+    super::parallel_drain::hooks::set_last_run_peak(0);
+    let mut seq_opts = streaming_opts(32);
+    seq_opts.reader_threads = Some(1);
+    seq_opts.memory_budget = Some(24_000);
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &dir.path().join("seq.scx"),
+        &seq_opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect("sequential dense convert under memory_budget");
+    assert_eq!(
+        super::parallel_drain::hooks::last_run_peak(),
+        0,
+        "the sequential coordinator entered the parallel drain — the control \
+         arm is not a control, and the assertion below proves nothing. (The \
+         cell is zeroed just above, so a stale value from a sibling test on \
+         this libtest thread is not the explanation.)"
+    );
+
+    // ---- the arm under test ----
+    super::parallel_drain::hooks::set_last_run_peak(0);
+    let mut par_opts = streaming_opts(32);
+    par_opts.reader_threads = Some(8);
+    par_opts.writer_queue_depth = 4;
+    par_opts.memory_budget = Some(24_000);
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &dir.path().join("par.scx"),
+        &par_opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect("parallel dense convert under memory_budget must not abort");
+
+    let peak = super::parallel_drain::hooks::last_run_peak();
+    assert!(
+        peak > 0,
+        "§11.5: a dense convert with reader_threads=8 under memory_budget \
+         24000 ran on the SEQUENTIAL coordinator (drain in-flight peak {peak}). \
+         The dense slab cap divides the budget by 4 and the per-worker estimate \
+         then multiplies the already-capped slab by 2, so the same reserve is \
+         spent twice: outstanding_max lands at 2, granted_threads at 1, and \
+         `if granted <= 1` routes away from the parallel path."
+    );
+}
+
+/// The dense slab cap reserves `4 × sizeof(source_dtype)` bytes per element,
+/// but what `read_range_inner` actually holds does **not** scale with the
+/// source width — so a narrow-dtype dense h5ad exceeds its own
+/// `--memory-budget`, on the sequential path, with no parallel reader involved.
+///
+/// ⚠️ **This bug is not §11.5 and is not in the code review at all.** §11.5 is
+/// the ÷4-then-×2 double-count, which costs parallelism; this is the ÷4 being
+/// keyed to the wrong unit, which costs the budget itself. They live on the
+/// same line (`dense_stream.rs:142`) and are fixed by the same split, but only
+/// one of them was known.
+///
+/// What is resident at peak, from `read_range_inner` and `read_dense_slab_f32`,
+/// with `N = slab_rows × n_vars` and `s = sizeof(source dtype)`:
+///
+/// * **read + cast**: the `F32` arm moves its `Vec` out of `read_slice_2d`
+///   (`into_raw_vec_and_offset`, no copy) → `4N`. Every other arm does
+///   `data.into_iter().map(…).collect()`, and `data`'s allocation lives until
+///   the `IntoIter` drops, so both buffers coexist → `(s + 4)·N`, max `12N`.
+/// * **sparsify**: `flat` (`4N`) + `indices` + `values`, which at exact capacity
+///   is `4N` each → `12N`.
+///
+/// The two never coexist (`read_slab_f32` drops the source before returning),
+/// so peak is `max(…) = 12N` — **independent of `s`**. Against the reserved
+/// `4s` B/elem:
+///
+/// | dtype | `s` | reserved | needed | |
+/// |---|---|---|---|---|
+/// | `u8` / `i8` | 1 | 4 | 12 | **3× over budget** |
+/// | `f16`/`u16`/`i16` | 2 | 8 | 12 | **1.5× over budget** |
+/// | `f32`/`i32`/`u32` | 4 | 16 | 12 | ok |
+/// | `f64`/`i64`/`u64` | 8 | 32 | 12 | conservative |
+///
+/// This asserts only the **no-OOM** bound (one slab ≤ the whole budget), which
+/// isolates the dtype bug: it passes for f32/f64 today and fails for the narrow
+/// three. The stricter share bound — one slab ≤ a *quarter* of the budget, which
+/// is what leaves room for more than one worker — fails for every dtype today
+/// and is what `dense_convert_under_a_memory_budget_stays_parallel` measures.
+#[test]
+fn dense_slab_cap_never_exceeds_the_budget_for_any_dtype() {
+    /// Peak bytes per source element held by `read_range_inner`. Independent of
+    /// the source dtype; see the table above.
+    const PEAK_BYTES_PER_ELEM: u64 = 12;
+
+    let dir = tempfile::tempdir().unwrap();
+    let n_vars: u64 = 1000;
+    let budget: u64 = 4_800_000;
+
+    // `create_test_h5ad` only writes f32, and `open_dense_streaming` takes a
+    // bare `hdf5::File` plus a dataset path — no h5ad validity required — so a
+    // one-dataset file is the whole fixture.
+    let mut failures = Vec::new();
+    for (name, write) in dense_dtype_writers() {
+        let path = dir.path().join(format!("{name}.h5"));
+        write(&path, 64, n_vars as usize);
+
+        let file = hdf5::File::open(&path).unwrap();
+        let mut opts = streaming_opts(32);
+        opts.memory_budget = Some(budget);
+        let reader = super::open_dense_streaming(&file, "X", &opts, &mut WarningSink::log())
+            .unwrap_or_else(|e| panic!("open_dense_streaming for {name}: {e}"));
+
+        let rows = <_ as super::stream::IndexedCsrShardStream>::max_slab_rows(&reader)
+            .expect("a budget is set, so the dense reader must report a cap")
+            as u64;
+        let peak = rows * n_vars * PEAK_BYTES_PER_ELEM;
+        if peak > budget {
+            failures.push(format!(
+                "{name}: max_slab_rows={rows} → peak {peak} B = {:.1}× the \
+                 memory_budget of {budget} B",
+                peak as f64 / budget as f64
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "the dense slab cap exceeds memory_budget for {} of the source dtypes \
+         tested:\n  {}\n\nThe cap divides by `4 × sizeof(source_dtype)`, but the \
+         resident slab is f32 whatever the input was, and the sparsified output \
+         does not depend on the source width at all.",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
+
+/// Writes a zero-filled dense `/X` of one dtype at `(n_obs, n_vars)`.
+type DenseFixtureWriter = fn(&std::path::Path, usize, usize);
+
+/// One minimal single-dataset HDF5 file per source dtype the dense reader
+/// supports. `open_dense_streaming` reads only shape and dtype, so the values
+/// are irrelevant and a zero-filled array is the cheapest valid fixture.
+fn dense_dtype_writers() -> Vec<(&'static str, DenseFixtureWriter)> {
+    fn write_dense<T>(path: &std::path::Path, n_obs: usize, n_vars: usize)
+    where
+        T: hdf5::H5Type + Default + Clone,
+    {
+        let file = hdf5::File::create(path).unwrap();
+        let arr = ndarray::Array2::<T>::from_elem((n_obs, n_vars), T::default());
+        file.new_dataset::<T>()
+            .shape([n_obs, n_vars])
+            .create("X")
+            .unwrap()
+            .write(&arr)
+            .unwrap();
+    }
+    vec![
+        (
+            "u8",
+            write_dense::<u8> as fn(&std::path::Path, usize, usize),
+        ),
+        ("i16", write_dense::<i16>),
+        ("f32", write_dense::<f32>),
+        ("f64", write_dense::<f64>),
+    ]
 }
