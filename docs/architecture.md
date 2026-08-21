@@ -982,10 +982,11 @@ without depending on the binary-only `scx-cli`.
 
 ### Conversion pipeline (`scx-convert/src/pipeline/`)
 
-`pipeline.rs` was 3727 lines, the largest production file in the workspace, with
-nine concerns interleaved behind `// ====` banners. The split exists so that the
-dependency runs one way: the entry points sequence, and each thing they sequence
-lives in a module that does not know about them.
+`pipeline.rs` was 3727 lines, the largest production file in the workspace, holding
+nine concerns with no section markers and no module doc comment — line 1 was a bare
+`use`. The split exists so that the dependency runs one way: the entry points
+sequence, and each thing they sequence lives in a module that does not know about
+them.
 
 | Module | Holds |
 |---|---|

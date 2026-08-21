@@ -1,8 +1,9 @@
 //! h5ad / h5mu / 10x ingest and the SCX -> h5ad export drivers.
 //!
 //! This was one 3727-line file -- the largest production file in the workspace --
-//! until ORG-11.16-6. Nine concerns were interleaved behind `// ====` banners; the
-//! table below is the seam. Submodules are private and everything reachable at
+//! until ORG-11.16-6, holding nine concerns with no section markers and no module
+//! doc comment: line 1 was a bare `use`. The table below is the seam. Submodules
+//! are private and everything reachable at
 //! `pipeline::<name>` before is re-exported here at the SAME visibility, so no
 //! caller inside or outside the crate changed a path.
 //!
