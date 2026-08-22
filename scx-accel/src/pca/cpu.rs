@@ -66,7 +66,7 @@ use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
 use scx_format_io::ShardSource;
-use scx_sparse::total_variance_from_col_sq;
+use scx_sparse::{closed_form_variance_unstable, total_variance_from_col_sq};
 
 use scx_sparse::ScxCsr;
 
@@ -589,22 +589,15 @@ pub fn randomized_pca_with_depth<S: ShardSource + Sync + ?Sized>(
     // For the centered case, guard against catastrophic cancellation in the closed
     // form; on the rare unstable input re-stream the shards once for a stable
     // centered recompute (read_shard_arc is cached — T4.4).
-    let mut total_var = total_variance_from_col_sq(&col_sum_sq, means_ref, n_obs);
-    if let Some(mu) = means_ref {
-        if closed_form_variance_unstable(&col_sum_sq, mu, n_obs) {
-            log::debug!(
-                "randomized_pca: closed-form total variance lost precision to \
-                 cancellation; re-streaming shards for a stable centered recompute"
-            );
-            let mut total = 0.0f64;
-            let mut col_nnz = vec![0u64; n_vars];
-            crate::prefetch::for_each_shard_ordered(source, depth, |_idx, csr| {
-                accumulate_centered_ss(&csr, mu, &mut total, &mut col_nnz);
-                Ok(())
-            })?;
-            total_var = finalize_centered_variance(total, &col_nnz, mu, n_obs);
-        }
-    }
+    let (total_var, _) = guarded_total_variance_streaming(
+        source,
+        &col_sum_sq,
+        means_ref,
+        n_obs,
+        n_vars,
+        depth,
+        "randomized_pca",
+    )?;
     let b_view = MatRef::from_row_major_slice(&b_rm, n_vars, k);
     build_pca_result(&q, &b_view, &means, n_components, n_obs, n_vars, total_var)
 }
@@ -905,12 +898,13 @@ pub fn randomized_pca_inmemory(
     // case, guard against catastrophic cancellation in the closed form
     // (`Σx² − nμ²`); on the rare unstable input recompute the stable centered
     // variance over the resident CSR.
-    let mut total_var = total_variance_from_col_sq(&col_sum_sq, means_ref, n_obs);
-    if let Some(mu) = means_ref {
-        if closed_form_variance_unstable(&col_sum_sq, mu, n_obs) {
-            total_var = stable_centered_total_variance_inmemory(csr, mu, n_obs);
-        }
-    }
+    let (total_var, _) = guarded_total_variance_inmemory(
+        csr,
+        &col_sum_sq,
+        means_ref,
+        n_obs,
+        "randomized_pca_inmemory",
+    );
     let b_view = MatRef::from_row_major_slice(&b_rm, n_vars, k);
     build_pca_result(&q, &b_view, &means, n_components, n_obs, n_vars, total_var)
 }
@@ -967,23 +961,112 @@ fn validate_inputs(n_obs: usize, n_vars: usize, n_components: usize) -> Result<(
 
 /// Relative-cancellation threshold for the closed-form total variance.
 ///
-/// The closed form `Σ col_sum_sq − n·Σ μ²` (via `total_variance_from_col_sq`)
-/// loses precision to catastrophic cancellation when the true variance is tiny
-/// relative to the magnitude being subtracted (e.g. near-constant large-offset
-/// columns). For real scRNA data (counts / log1p — small non-negative values)
-/// the ratio is O(1), far above this threshold, so the guard never fires on the
-/// hot path; it only engages for pathological large-offset inputs.
-const CLOSED_FORM_VAR_REL_EPS: f64 = 1e-7;
+/// The one guarded total-variance entry point every PCA route calls.
+///
+/// `total_var` is the denominator of `variance_ratio`, and computing it as
+/// `Σ col_sum_sq − n·Σ μ²` is the same cancellation-prone subtraction the
+/// per-column moments finalize does — so it carries the same guard
+/// ([`scx_sparse::closed_form_variance_unstable`]) and, when that fires, the same
+/// stable two-pass recompute (`Σ (x − μ)²` formed directly, plus the implicit
+/// zeros' `(n − nnz)·μ²`).
+///
+/// Before Phase 7a only the two *randomized* routes had this. The two covariance
+/// routes derived `total_var` from `Σ all_eigenvalues` instead — every eigenvalue
+/// of a matrix built by subtracting `n·μᵢ·μⱼ` from an uncentered cross-product
+/// `n_vars²` times, round-off negatives included — while `variance_explained`
+/// clamped each eigenvalue with `.max(0.0)`. Numerator and denominator therefore
+/// disagreed, which is review finding §7.6. On a large-mean/small-variance f32
+/// fixture that produced both an all-zero `variance_ratio` and a ratio of 3.72;
+/// `pca::cpu::tests::covariance_route_variance_ratio_*` pin both.
+///
+/// `auto` routes to covariance whenever `n_vars ≤ 5000` — the HVG-selected
+/// default — so the unguarded route was the common one.
+///
+/// Uncentered (`means == None`) needs no guard: the sum has nothing to cancel.
+fn guarded_total_variance_streaming<S: ShardSource + Sync + ?Sized>(
+    source: &S,
+    col_sum_sq: &[f64],
+    means: Option<&[f64]>,
+    n_obs: usize,
+    n_vars: usize,
+    depth: usize,
+    route: &str,
+) -> Result<(f64, bool)> {
+    let closed = total_variance_from_col_sq(col_sum_sq, means, n_obs);
+    let Some(mu) = means else {
+        return Ok((closed, false));
+    };
+    if !closed_form_variance_unstable(col_sum_sq, mu, n_obs) {
+        return Ok((closed, false));
+    }
+    log::debug!(
+        "{route}: closed-form total variance lost precision to cancellation \
+         (got {closed}); re-streaming shards for a stable centered recompute"
+    );
+    let mut total = 0.0f64;
+    let mut col_nnz = vec![0u64; n_vars];
+    crate::prefetch::for_each_shard_ordered(source, depth, |_idx, csr| {
+        accumulate_centered_ss(&csr, mu, &mut total, &mut col_nnz);
+        Ok(())
+    })?;
+    Ok((finalize_centered_variance(total, &col_nnz, mu, n_obs), true))
+}
 
-/// Returns `true` when the closed-form centered total variance has lost too much
-/// precision to cancellation and the caller should recompute via the stable
-/// centered formula. Only meaningful for the centered (`zero_center`) case — the
-/// uncentered path sums `col_sum_sq` directly with no subtraction.
-fn closed_form_variance_unstable(col_sum_sq: &[f64], means: &[f64], n_obs: usize) -> bool {
-    let sum_sq: f64 = col_sum_sq.iter().sum();
-    let mean_sq: f64 = means.iter().map(|&m| m * m).sum::<f64>() * n_obs as f64;
-    // Catches both `≤ 0` (sign-flipped garbage) and tiny-positive garbage.
-    (sum_sq - mean_sq) <= CLOSED_FORM_VAR_REL_EPS * sum_sq
+/// In-memory counterpart of [`guarded_total_variance_streaming`]. The stable
+/// recompute walks the resident CSR instead of re-streaming.
+fn guarded_total_variance_inmemory(
+    csr: &ScxCsr,
+    col_sum_sq: &[f64],
+    means: Option<&[f64]>,
+    n_obs: usize,
+    route: &str,
+) -> (f64, bool) {
+    let closed = total_variance_from_col_sq(col_sum_sq, means, n_obs);
+    let Some(mu) = means else {
+        return (closed, false);
+    };
+    if !closed_form_variance_unstable(col_sum_sq, mu, n_obs) {
+        return (closed, false);
+    }
+    log::debug!(
+        "{route}: closed-form total variance lost precision to cancellation \
+         (got {closed}); recomputing the stable centered variance"
+    );
+    (
+        stable_centered_total_variance_inmemory(csr, mu, n_obs),
+        true,
+    )
+}
+
+/// Say what a fired cancellation guard means for a **covariance** route.
+///
+/// For the randomized routes the guard is a total-variance concern only: the SVD
+/// runs on the data, so a recomputed `total_var` makes the whole result right.
+/// The covariance routes eigendecompose `Σxy − n·μᵢ·μⱼ`, and the guard firing
+/// means that subtraction is unreliable in every one of its `n_vars²` entries —
+/// so the *eigenvalues* are suspect too, and a correct denominator cannot repair
+/// them. The measured effect on a large-mean f32 fixture is a `variance_ratio`
+/// that no longer collapses to zero but still disagrees with the randomized
+/// route, and can exceed 1.
+///
+/// This is reported rather than repaired because the review's suggested remedy —
+/// centering per shard instead of correcting the uncentered cross-product — does
+/// not survive contact with sparse input: `Σ (x − μᵢ)(y − μⱼ)` has a nonzero
+/// term for every row where *both* entries are implicit zeros, so it is
+/// `O(n_obs · n_vars²)` and cannot be folded in analytically from per-column nnz
+/// (it needs pairwise co-occurrence counts). Routing away from the covariance
+/// method is the real fix and belongs with the binding-agnostic accel entry
+/// point, not here.
+fn warn_covariance_cross_product_ill_conditioned(route: &str, total_var: f64) {
+    log::warn!(
+        "{route}: the covariance cross-product lost conditioning on this input \
+         (large column means relative to their variance). `total_var` was \
+         recomputed stably as {total_var}, but the eigenvalues are derived from \
+         `sum(xy) - n*mu_i*mu_j` and are themselves unreliable, so \
+         `variance_ratio` may disagree with `method=\"randomized\"` and may \
+         exceed 1. Prefer `method=\"randomized\"`, or normalize / log-transform \
+         before the PCA."
+    );
 }
 
 /// Accumulate the centered sum-of-squares `Σ (x − μ_c)²` over one CSR shard's
@@ -1527,6 +1610,13 @@ pub fn covariance_pca_with_depth<S: ShardSource + Sync + ?Sized>(
         None
     };
 
+    // `accumulate_covariance_into` puts `Σ x²` for column c at `cov[c*n_vars + c]`,
+    // so the diagonal *before* `finalize_covariance` mutates it is exactly the
+    // `col_sum_sq` the randomized routes accumulate separately. Snapshot it here
+    // rather than re-streaming: it costs `n_vars` reads and is the input the one
+    // guarded total-variance entry point needs (§7.6).
+    let col_sum_sq: Vec<f64> = (0..n_vars).map(|c| cov[c * n_vars + c]).collect();
+
     finalize_covariance(&mut cov, means.as_deref(), n_obs, n_vars);
 
     // --- Eigendecomposition ---
@@ -1539,8 +1629,23 @@ pub fn covariance_pca_with_depth<S: ShardSource + Sync + ?Sized>(
     let all_eigenvalues = evd.S().column_vector();
     let eigvecs = evd.U(); // columns are eigenvectors
 
-    // Total variance = sum of all eigenvalues (they ARE the variances since C is sample cov)
-    let total_var: f64 = (0..n_vars).map(|i| all_eigenvalues[i]).sum();
+    // Total variance through the one guarded entry point, NOT `Σ eigenvalues`.
+    // The eigenvalue sum is mathematically the trace but numerically carries both
+    // the `n_vars²` mean-correction subtractions and the eigensolver's own
+    // round-off, unclamped — while `variance_explained` below clamps each
+    // eigenvalue at zero. That disagreement is §7.6.
+    let (total_var, guard_fired) = guarded_total_variance_streaming(
+        source,
+        &col_sum_sq,
+        means.as_deref(),
+        n_obs,
+        n_vars,
+        depth,
+        "covariance_pca",
+    )?;
+    if guard_fired {
+        warn_covariance_cross_product_ill_conditioned("covariance_pca", total_var);
+    }
 
     // Select top k eigenvectors (last k columns, reversed for descending order)
     let n_components = n_components.min(n_vars);
@@ -1660,6 +1765,13 @@ pub fn covariance_pca_inmemory(
         None
     };
 
+    // `accumulate_covariance_into` puts `Σ x²` for column c at `cov[c*n_vars + c]`,
+    // so the diagonal *before* `finalize_covariance` mutates it is exactly the
+    // `col_sum_sq` the randomized routes accumulate separately. Snapshot it here
+    // rather than re-streaming: it costs `n_vars` reads and is the input the one
+    // guarded total-variance entry point needs (§7.6).
+    let col_sum_sq: Vec<f64> = (0..n_vars).map(|c| cov[c * n_vars + c]).collect();
+
     finalize_covariance(&mut cov, means.as_deref(), n_obs, n_vars);
 
     // Eigendecomposition — reads the lower triangle only.
@@ -1669,7 +1781,19 @@ pub fn covariance_pca_inmemory(
 
     let all_eigenvalues = evd.S().column_vector();
     let eigvecs = evd.U();
-    let total_var: f64 = (0..n_vars).map(|i| all_eigenvalues[i]).sum();
+    // Same guarded entry point as every other route (§7.6). This is the second
+    // covariance copy — fixing only the one a report names is how `optimize`'s
+    // half of §6.1 survived a round.
+    let (total_var, guard_fired) = guarded_total_variance_inmemory(
+        csr,
+        &col_sum_sq,
+        means.as_deref(),
+        n_obs,
+        "covariance_pca_inmemory",
+    );
+    if guard_fired {
+        warn_covariance_cross_product_ill_conditioned("covariance_pca_inmemory", total_var);
+    }
 
     let n_components = n_components.min(n_vars);
     let mut variance_explained = Vec::with_capacity(n_components);
@@ -1763,6 +1887,164 @@ mod tests {
     }
 
     /// A simple in-memory multi-shard `ShardSource` for streaming-PCA tests.
+    /// A dense fixture with a large per-column mean and a small per-row
+    /// variation — the shape that makes `Sxy - n*mu_x*mu_y` cancel.
+    ///
+    /// Not a realistic count matrix, and it does not need to be: this is a
+    /// numerical-conditioning fixture. It *is* the shape a PCA on un-normalized
+    /// data reaches — a raw-count `use_rep`, or an `obsm` embedding that was
+    /// never centered — and `auto` routes to the covariance path whenever
+    /// `n_vars <= 5000`, which is the HVG-selected default.
+    ///
+    /// Values stay inside f32's exact range so the pathology is a property of the
+    /// *finalize*, not of the stored data: at `base = 1e7` the f32 spacing is
+    /// exactly 1.0, so `base`, `base + 1` and `base + 2` all round-trip.
+    fn large_mean_small_variance_source(n_obs: usize, base: f32, step: f32) -> VecShardSource {
+        let n_vars = 6usize;
+        let mut indptr: Vec<i64> = vec![0];
+        let mut indices: Vec<i32> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                // Odd per-column stride so the columns are not collinear.
+                data.push(base + step * (((r * (2 * c + 1)) % 3) as f32));
+                indices.push(c as i32);
+            }
+            indptr.push(indices.len() as i64);
+        }
+        VecShardSource {
+            shards: vec![ScxCsr::new_unchecked(
+                (n_obs, n_vars),
+                indptr,
+                indices,
+                data,
+            )],
+            n_obs,
+            n_vars,
+        }
+    }
+
+    /// Recover the `total_var` a route divided by, from its own two outputs.
+    fn implied_total_var(r: &PcaResult) -> f64 {
+        r.variance_explained[0] / r.variance_ratio[0]
+    }
+
+    /// §7.6: all four PCA routes now agree on the total variance.
+    ///
+    /// This is the assertion that tests the actual change — "one `total_variance`
+    /// entry point both routes call", in the review's words. Before it, the two
+    /// covariance routes derived `total_var` from `Σ all_eigenvalues`: every
+    /// eigenvalue of a matrix built by subtracting `n·μᵢ·μⱼ` from an uncentered
+    /// cross-product `n_vars²` times, round-off negatives included, while
+    /// `variance_explained` clamped each eigenvalue at zero. The two randomized
+    /// routes already went through the guarded closed form.
+    ///
+    /// Falsifiable by reverting either covariance route to the eigenvalue sum:
+    /// on this fixture that made the covariance total **negative**, which the
+    /// `variance_ratio` short-circuit then turned into `vec![0.0; k]`.
+    #[test]
+    fn all_pca_routes_agree_on_total_variance() {
+        let src = large_mean_small_variance_source(1024, 1.0e7, 1.0);
+        let csr = src.read_shard(0).unwrap();
+
+        let rand_stream = randomized_pca(&src, 3, 7, 2, true, 42).unwrap();
+        let rand_mem = randomized_pca_inmemory(&csr, 3, 7, 2, true, 42).unwrap();
+        let cov_stream = covariance_pca(&src, 3, true).unwrap();
+        let cov_mem = covariance_pca_inmemory(&csr, 3, true).unwrap();
+
+        let reference = implied_total_var(&rand_stream);
+        assert!(
+            reference > 0.0 && reference.is_finite(),
+            "premise: the guarded route must produce a usable total, got {reference}"
+        );
+        for (name, r) in [
+            ("randomized_inmemory", &rand_mem),
+            ("covariance_streaming", &cov_stream),
+            ("covariance_inmemory", &cov_mem),
+        ] {
+            let got = implied_total_var(r);
+            assert!(
+                (got - reference).abs() <= 1e-9 * reference,
+                "{name} total_var = {got}, randomized_streaming = {reference} \
+                 (ratios {:?})",
+                r.variance_ratio
+            );
+        }
+    }
+
+    /// §7.6, the half that is fixed: `variance_ratio` is no longer silently zero.
+    ///
+    /// The covariance routes used to return `vec![0.0; k]` on this input — the
+    /// short-circuit `variance_ratio` takes when `total_var <= 0.0` — with no
+    /// diagnostic of any kind. The randomized route on the identical source is
+    /// the oracle proving there is real structure to find, so an all-zero answer
+    /// was a defect and not a property of the data.
+    #[test]
+    fn covariance_route_variance_ratio_is_not_silently_zero() {
+        let src = large_mean_small_variance_source(1024, 1.0e7, 1.0);
+        let csr = src.read_shard(0).unwrap();
+        let rand = randomized_pca(&src, 3, 7, 2, true, 42).unwrap();
+        assert!(
+            rand.variance_ratio[0] > 0.5,
+            "premise: randomized route should find a dominant PC, got {:?}",
+            rand.variance_ratio
+        );
+        for (name, ratios) in [
+            (
+                "covariance_pca",
+                covariance_pca(&src, 3, true).unwrap().variance_ratio,
+            ),
+            (
+                "covariance_pca_inmemory",
+                covariance_pca_inmemory(&csr, 3, true)
+                    .unwrap()
+                    .variance_ratio,
+            ),
+        ] {
+            assert!(
+                ratios[0] > 0.0 && ratios[0].is_finite(),
+                "{name} reported variance_ratio {ratios:?}; randomized {:?}",
+                rand.variance_ratio
+            );
+        }
+    }
+
+    /// §7.6, the half that is **not** fixed, pinned so it is not mistaken for
+    /// fixed.
+    ///
+    /// A correct denominator does not repair the eigenvalues. The covariance
+    /// routes eigendecompose `Σxy − n·μᵢ·μⱼ`, and on this fixture that matrix is
+    /// numerically meaningless in every entry — so the covariance
+    /// `variance_ratio` still disagrees with the randomized route's, and can
+    /// exceed 1. `warn_covariance_cross_product_ill_conditioned` says so at
+    /// `warn` level whenever the guard fires.
+    ///
+    /// It is not repaired because the review's suggested remedy — center per
+    /// shard rather than correcting the uncentered cross-product — does not
+    /// survive sparse input: `Σ (x − μᵢ)(y − μⱼ)` has a nonzero term for every
+    /// row where *both* entries are implicit zeros, making it
+    /// `O(n_obs · n_vars²)`, and the implicit-zero contribution cannot be folded
+    /// in from per-column nnz because it needs pairwise co-occurrence counts.
+    /// Routing away from the covariance method on an ill-conditioned input is the
+    /// real fix and needs a route-owning entry point that does not exist yet
+    /// (today `auto` picks covariance on `n_vars <= 5000` alone, in `pyscx`).
+    ///
+    /// If this test starts failing because the ratios now agree, that is the
+    /// remaining half being fixed: delete the test and the warn helper together.
+    #[test]
+    fn covariance_eigenvalues_stay_untrustworthy_when_the_guard_fires() {
+        let src = large_mean_small_variance_source(1024, 1.0e7, 1.0);
+        let rand = randomized_pca(&src, 3, 7, 2, true, 42).unwrap();
+        let cov = covariance_pca(&src, 3, true).unwrap();
+        assert!(
+            (cov.variance_ratio[0] - rand.variance_ratio[0]).abs() > 0.05,
+            "the covariance eigenvalues now agree with the randomized route on an \
+             ill-conditioned input ({:?} vs {:?}) — see this test's doc comment",
+            cov.variance_ratio,
+            rand.variance_ratio
+        );
+    }
+
     struct VecShardSource {
         shards: Vec<ScxCsr>,
         n_obs: usize,
