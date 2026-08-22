@@ -619,6 +619,60 @@ jobs:
           fi
 
 
+      # ORG-7.21-1: one column-moments finalize, one cancellation threshold.
+      # The Bessel-corrected `(sum(x^2) - n*mean^2)/(n-1)` per-column finalize was
+      # written out nine times before Phase 7a -- four HVG CSR arms, one CSC arm,
+      # two `scx-gpu` device arms and two `scx-accel/src/hvg/gpu.rs` batched arms,
+      # four of them with a NaN-swallowing `.max(0.0)` clamp and five with
+      # `if v < 0.0`. It now lives once, in `scx-sparse`, which is the only crate
+      # below both `scx-accel` and `scx-gpu`.
+      - name: One column-moments finalize, one cancellation threshold
+        run: |
+          set -euo pipefail
+          prim=scx-sparse/src/moments.rs
+          # Assert the input exists before asserting anything about it: a guard
+          # keyed on a path that has moved passes vacuously and says nothing.
+          test -f "$prim" || { echo "::error::$prim is missing — this guard's path moved; retarget it rather than deleting it (ORG-7.21-1)."; exit 1; }
+
+          # Positive half 1: the primitive and the one threshold are declared here.
+          for sym in 'pub fn finalize_column_moments' 'pub const CLOSED_FORM_VAR_REL_EPS' 'pub fn residual_lost_to_cancellation'; do
+            if ! grep -qE "^$sym" "$prim"; then
+              echo "::error::$prim no longer declares \`$sym\` — it is the single source of the per-column mean/variance finalize and its cancellation guard (ORG-7.21-1)."
+              exit 1
+            fi
+          done
+          # Positive half 2: the primitive is actually used by more than one crate.
+          # Deleting it outright would otherwise leave the negative greps below
+          # nothing to find, and this guard would pass on a fully re-duplicated tree.
+          for crate in scx-accel scx-gpu; do
+            n=$(grep -rhoE 'finalize_column_moments\(' "$crate/src" --include='*.rs' | wc -l | tr -d ' ')
+            if [ "$n" -lt 2 ]; then
+              echo "::error::$crate has $n finalize_column_moments call sites, expected at least 2. A kernel that stopped calling it has its own copy of the finalize again (ORG-7.21-1). If a refactor legitimately merged entry points, lower this number in the same commit."
+              exit 1
+            fi
+          done
+
+          # Negative half 1: nobody re-derives the finalize. `nb_glm/dispersion.rs`
+          # is exempt and deliberately so -- it is a *scalar* per-gene variance, not
+          # a per-column vector, and routing it through a vector primitive would
+          # allocate two 1-element slices per gene inside a per-gene loop.
+          # `*_tests.rs` files are exempt: a test re-implementing the formula to
+          # check the kernel is the point (see pflog_tests.rs).
+          if grep -rEn --include='*.rs' -- '- *(n|nf|total_f|n_obs as f64) \* mean \* mean' \
+               scx-accel/src scx-gpu/src scx-format-io/src pyscx/src \
+               | grep -vE '(^|/)[a-z_0-9]*_tests?\.rs:' \
+               | grep -vE '(^|/)dispersion\.rs:' \
+               | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::a site computes the Bessel-corrected column variance itself — call scx_sparse::finalize_column_moments so the formula, the clamp and the cancellation report exist once (ORG-7.21-1)."
+            exit 1
+          fi
+          # Negative half 2: the threshold is not redefined anywhere.
+          if grep -rEn --include='*.rs' 'CLOSED_FORM_VAR_REL_EPS *: *f64 *=' \
+               scx-accel/src scx-gpu/src scx-engine/src scx-format-io/src pyscx/src; then
+            echo "::error::the cancellation threshold is redefined outside scx-sparse — one threshold, one definition, shared by the per-column, whole-matrix and pflog guards (ORG-7.21-1)."
+            exit 1
+          fi
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police

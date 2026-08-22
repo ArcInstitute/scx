@@ -2050,11 +2050,33 @@ Two methods, auto-routed by the number of variables:
 
 - **Covariance PCA** (CPU: n_vars ≤ 5,000): Builds the covariance matrix
   `X^T @ X` directly from CSR nonzeros via sparse outer product accumulation
-  (exploiting symmetry), then eigendecomposes. Exact results, faster than
-  randomized SVD for HVG-selected data. Parallel accumulation into one shared
+  (exploiting symmetry), then eigendecomposes. Faster than randomized SVD for
+  HVG-selected data. Parallel accumulation into one shared
   matrix whose columns are partitioned across rayon workers (see
   [Reproducibility](#reproducibility)). CPU-only; the former native GPU covariance path
   (`cusolverDnSsyevd`) was removed in Phase 3.2.
+
+  **It is exact only on well-conditioned input**, and that qualifier is load-bearing
+  rather than pedantic. Mean-centering a sparse cross-product means computing
+  `Σxy − n·μₓ·μ_y`, a difference of same-order quantities, in every one of the
+  matrix's `n_vars²` entries. When the column means are large relative to their
+  variances — un-normalized counts, a raw `use_rep`, an uncentered embedding — that
+  subtraction loses most of its significant digits and the eigenvalues stop
+  meaning anything. Measured on a synthetic f32 fixture with a column mean of
+  1e7 and a per-cell variation of 1, `variance_ratio` came back
+  `[0.0, 0.0, 0.0]`; at a mean of 1e12, `variance_ratio[0]` came back as **3.72**
+  — one component explaining 372% of the total variance.
+
+  Since v0.14.0 the route detects this and says so: `total_var` is computed
+  through the same guarded entry point the randomized routes use (so it is no
+  longer derived from a sum of round-off-contaminated eigenvalues, and no longer
+  collapses to zero), and a `warn`-level log names the condition and points at
+  the remedy. The remedy is `method="randomized"`, which decomposes the data
+  rather than a differenced cross-product, or normalizing / log-transforming
+  first. The eigenvalues themselves cannot be repaired in this route: the
+  textbook fix — center each shard before accumulating — has a nonzero term for
+  every cell where *both* genes are zero, so on sparse input it is
+  `O(n_obs · n_vars²)` and defeats the purpose of the method.
 - **Randomized SVD** (CPU: n_vars > 5,000): Streaming shard-by-shard SpMM
   with zero-copy `MatRef::from_row_major_slice` views. Skips intermediate QR
   on transpose results for n_power_iterations ≤ 2 (matching sklearn's default).
