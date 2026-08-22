@@ -118,44 +118,38 @@ pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
             |e| crate::error::AccelError::LinAlg(format!("gpu_streaming_mean_var_batched: {e}")),
         )?;
 
-    // Per-batch means & variances (Bessel's correction).
+    // Per-batch and global finalize, through the same
+    // `scx_sparse::finalize_column_moments` the CPU batched path uses — so
+    // "matches the CPU path" below is shared code rather than two copies of the
+    // formula that happen to agree.
     let mut per_batch = Vec::with_capacity(n_batches);
     for b in 0..n_batches {
-        let n = batch_counts[b] as f64;
-        let mut means = vec![0.0f64; n_vars];
-        let mut variances = vec![0.0f64; n_vars];
-        if batch_counts[b] > 0 {
-            let denom = (n - 1.0).max(1.0);
-            for j in 0..n_vars {
-                let mean = batch_sum[b][j] / n;
-                means[j] = mean;
-                variances[j] = ((batch_sum_sq[b][j] - n * mean * mean) / denom).max(0.0);
-            }
-        }
-        per_batch.push(HvgStats { means, variances });
+        let m =
+            scx_sparse::finalize_column_moments(&batch_sum[b], &batch_sum_sq[b], batch_counts[b]);
+        m.warn_if_unstable(&format!(
+            "streaming_mean_var_batched_with_device[batch {b}]"
+        ));
+        per_batch.push(HvgStats {
+            means: m.means,
+            variances: m.variances,
+        });
     }
 
-    // Derive global stats from per-batch accumulators — matches the CPU path.
     let total_n: usize = batch_counts.iter().sum();
-    let total_f = total_n as f64;
-    let mut global_means = vec![0.0f64; n_vars];
-    let mut global_variances = vec![0.0f64; n_vars];
-    if total_n > 0 {
-        let denom = (total_f - 1.0).max(1.0);
-        for j in 0..n_vars {
-            let global_sum: f64 = batch_sum.iter().map(|bs| bs[j]).sum();
-            let global_sum_sq: f64 = batch_sum_sq.iter().map(|bs| bs[j]).sum();
-            let mean = global_sum / total_f;
-            global_means[j] = mean;
-            global_variances[j] = ((global_sum_sq - total_f * mean * mean) / denom).max(0.0);
-        }
+    let mut global_sum = vec![0.0f64; n_vars];
+    let mut global_sum_sq = vec![0.0f64; n_vars];
+    for j in 0..n_vars {
+        global_sum[j] = batch_sum.iter().map(|bs| bs[j]).sum();
+        global_sum_sq[j] = batch_sum_sq.iter().map(|bs| bs[j]).sum();
     }
+    let global = scx_sparse::finalize_column_moments(&global_sum, &global_sum_sq, total_n);
+    global.warn_if_unstable("streaming_mean_var_batched_with_device[global]");
 
     Ok(BatchedHvgStats {
         per_batch,
         global: HvgStats {
-            means: global_means,
-            variances: global_variances,
+            means: global.means,
+            variances: global.variances,
         },
         batch_counts,
     })

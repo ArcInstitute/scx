@@ -121,23 +121,12 @@ pub fn streaming_mean_var<S: ShardSource + Sync>(source: &S) -> Result<HvgStats>
     // the ordered (bit-exact default) and budgeted-parallel modes are valid.
     let (col_sum, col_sum_sq) = accumulate_col_moments(source, n_vars, |v| v)?;
 
-    let n = n_obs as f64;
-    let denom = (n - 1.0).max(1.0); // avoid division by zero for n <= 1
-    let mut means = vec![0.0f64; n_vars];
-    let mut variances = vec![0.0f64; n_vars];
-
-    for j in 0..n_vars {
-        let mean = col_sum[j] / n;
-        means[j] = mean;
-        // Var = (sum_sq - n * mean^2) / (n - 1)
-        variances[j] = (col_sum_sq[j] - n * mean * mean) / denom;
-        // Clamp to zero (numerical noise can produce tiny negatives)
-        if variances[j] < 0.0 {
-            variances[j] = 0.0;
-        }
-    }
-
-    Ok(HvgStats { means, variances })
+    let m = scx_sparse::finalize_column_moments(&col_sum, &col_sum_sq, n_obs);
+    m.warn_if_unstable("streaming_mean_var");
+    Ok(HvgStats {
+        means: m.means,
+        variances: m.variances,
+    })
 }
 
 /// Single-pass streaming mean/variance per column on `expm1(scale · value)`.
@@ -167,20 +156,12 @@ pub fn streaming_mean_var_expm1<S: ShardSource + Sync>(source: &S, scale: f64) -
     // decode-prefetched, order-stable by default).
     let (col_sum, col_sum_sq) = accumulate_col_moments(source, n_vars, |v| (v * scale).exp_m1())?;
 
-    let n = n_obs as f64;
-    let denom = (n - 1.0).max(1.0);
-    let mut means = vec![0.0f64; n_vars];
-    let mut variances = vec![0.0f64; n_vars];
-    for j in 0..n_vars {
-        let mean = col_sum[j] / n;
-        means[j] = mean;
-        variances[j] = (col_sum_sq[j] - n * mean * mean) / denom;
-        if variances[j] < 0.0 {
-            variances[j] = 0.0;
-        }
-    }
-
-    Ok(HvgStats { means, variances })
+    let m = scx_sparse::finalize_column_moments(&col_sum, &col_sum_sq, n_obs);
+    m.warn_if_unstable("streaming_mean_var_expm1");
+    Ok(HvgStats {
+        means: m.means,
+        variances: m.variances,
+    })
 }
 
 /// Single-pass streaming clipped accumulation for seurat_v3 normalized variance.
@@ -311,18 +292,15 @@ pub fn streaming_mean_var_batched<S: ShardSource + Sync>(
     // Compute per-batch means and variances.
     let mut per_batch = Vec::with_capacity(n_batches);
     for b in 0..n_batches {
-        let n = batch_count[b] as f64;
-        let mut means = vec![0.0f64; n_vars];
-        let mut variances = vec![0.0f64; n_vars];
-        if batch_count[b] > 0 {
-            let denom = (n - 1.0).max(1.0);
-            for j in 0..n_vars {
-                let mean = batch_sum[b][j] / n;
-                means[j] = mean;
-                variances[j] = ((batch_sum_sq[b][j] - n * mean * mean) / denom).max(0.0);
-            }
-        }
-        per_batch.push(HvgStats { means, variances });
+        // `finalize_column_moments` returns zeros for `n == 0`, so the
+        // empty-batch case needs no separate arm here.
+        let m =
+            scx_sparse::finalize_column_moments(&batch_sum[b], &batch_sum_sq[b], batch_count[b]);
+        m.warn_if_unstable(&format!("streaming_mean_var_batched[batch {b}]"));
+        per_batch.push(HvgStats {
+            means: m.means,
+            variances: m.variances,
+        });
     }
 
     // Derive global stats from per-batch accumulators (no second pass over the
@@ -334,25 +312,20 @@ pub fn streaming_mean_var_batched<S: ShardSource + Sync>(
     // `Σx² − n·mean²` variance path (see `streaming_mean_var_with_device`
     // accuracy caveat); the per-batch partial sums do not worsen it.
     let total_n: usize = batch_count.iter().sum();
-    let total_f = total_n as f64;
-    let mut global_means = vec![0.0f64; n_vars];
-    let mut global_variances = vec![0.0f64; n_vars];
-    if total_n > 0 {
-        let denom = (total_f - 1.0).max(1.0);
-        for j in 0..n_vars {
-            let global_sum: f64 = batch_sum.iter().map(|bs| bs[j]).sum();
-            let global_sum_sq: f64 = batch_sum_sq.iter().map(|bs| bs[j]).sum();
-            let mean = global_sum / total_f;
-            global_means[j] = mean;
-            global_variances[j] = ((global_sum_sq - total_f * mean * mean) / denom).max(0.0);
-        }
+    let mut global_sum = vec![0.0f64; n_vars];
+    let mut global_sum_sq = vec![0.0f64; n_vars];
+    for j in 0..n_vars {
+        global_sum[j] = batch_sum.iter().map(|bs| bs[j]).sum();
+        global_sum_sq[j] = batch_sum_sq.iter().map(|bs| bs[j]).sum();
     }
+    let global = scx_sparse::finalize_column_moments(&global_sum, &global_sum_sq, total_n);
+    global.warn_if_unstable("streaming_mean_var_batched[global]");
 
     Ok(BatchedHvgStats {
         per_batch,
         global: HvgStats {
-            means: global_means,
-            variances: global_variances,
+            means: global.means,
+            variances: global.variances,
         },
         batch_counts: batch_count,
     })

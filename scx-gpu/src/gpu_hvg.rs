@@ -110,16 +110,13 @@ pub fn gpu_streaming_mean_var(
     let col_sum: Vec<f64> = dev.dtoh_copy(&d_col_sum)?;
     let col_sum_sq: Vec<f64> = dev.dtoh_copy(&d_col_sum_sq)?;
 
-    let n = n_obs as f64;
-    let denom = (n - 1.0).max(1.0);
-    let mut means = vec![0.0f64; n_vars];
-    let mut variances = vec![0.0f64; n_vars];
-    for j in 0..n_vars {
-        let mean = col_sum[j] / n;
-        means[j] = mean;
-        let var = (col_sum_sq[j] - n * mean * mean) / denom;
-        variances[j] = if var < 0.0 { 0.0 } else { var };
-    }
+    // The finalize is host arithmetic and is shared with the two CPU HVG paths
+    // (`scx_accel::hvg::cpu`, `scx_accel::csc::mean_var`) via `scx-sparse` —
+    // which is where it has to live, since `scx-accel` depends on this crate and
+    // not the reverse. Only the accumulation is on the device.
+    let m = scx_sparse::finalize_column_moments(&col_sum, &col_sum_sq, n_obs);
+    m.warn_if_unstable("gpu_streaming_mean_var");
+    let (means, variances) = (m.means, m.variances);
 
     Ok((means, variances))
 }
@@ -245,16 +242,13 @@ pub fn gpu_streaming_mean_var_csc(
     let col_sum: Vec<f64> = dev.dtoh_copy(&d_col_sum)?;
     let col_sum_sq: Vec<f64> = dev.dtoh_copy(&d_col_sum_sq)?;
 
-    let n = n_obs as f64;
-    let denom = (n - 1.0).max(1.0);
-    let mut means = vec![0.0f64; n_vars];
-    let mut variances = vec![0.0f64; n_vars];
-    for j in 0..n_vars {
-        let mean = col_sum[j] / n;
-        means[j] = mean;
-        let var = (col_sum_sq[j] - n * mean * mean) / denom;
-        variances[j] = if var < 0.0 { 0.0 } else { var };
-    }
+    // The finalize is host arithmetic and is shared with the two CPU HVG paths
+    // (`scx_accel::hvg::cpu`, `scx_accel::csc::mean_var`) via `scx-sparse` —
+    // which is where it has to live, since `scx-accel` depends on this crate and
+    // not the reverse. Only the accumulation is on the device.
+    let m = scx_sparse::finalize_column_moments(&col_sum, &col_sum_sq, n_obs);
+    m.warn_if_unstable("gpu_streaming_mean_var_csc");
+    let (means, variances) = (m.means, m.variances);
     Ok((means, variances))
 }
 

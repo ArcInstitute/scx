@@ -72,20 +72,18 @@ pub fn streaming_mean_var_csc<S: ColumnShardSource + ?Sized>(source: &S) -> Resu
         }
     }
 
-    let n = n_obs as f64;
-    let denom = (n - 1.0).max(1.0);
-    let mut means = vec![0.0f64; n_vars];
-    let mut variances = vec![0.0f64; n_vars];
-    for j in 0..n_vars {
-        let mean = col_sum[j] / n;
-        means[j] = mean;
-        variances[j] = (col_sum_sq[j] - n * mean * mean) / denom;
-        if variances[j] < 0.0 {
-            variances[j] = 0.0;
-        }
-    }
-
-    Ok(HvgStats { means, variances })
+    // Same finalize as the CSR path, literally: `finalize_column_moments` is why
+    // "numerically equivalent within f64 epsilon" above is now a shared-code
+    // fact rather than two implementations that happen to agree. The two still
+    // differ in accumulation *order* (CSR walks a shard's rows, CSC walks a
+    // column's entries contiguously), which is what `csc::parity_test`'s 1e-9
+    // bar is for.
+    let m = scx_sparse::finalize_column_moments(&col_sum, &col_sum_sq, n_obs);
+    m.warn_if_unstable("streaming_mean_var_csc");
+    Ok(HvgStats {
+        means: m.means,
+        variances: m.variances,
+    })
 }
 
 /// Single-pass streaming clipped accumulation per column on a CSC source.

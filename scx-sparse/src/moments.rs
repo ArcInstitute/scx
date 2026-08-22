@@ -65,6 +65,41 @@ pub struct ColumnMoments {
     pub unstable: Vec<u32>,
 }
 
+impl ColumnMoments {
+    /// Log the columns whose variance lost too much precision to cancellation.
+    ///
+    /// `Σx² − n·mean²` is used rather than a stable two-pass form because the
+    /// stable form needs a second pass over the data, which for an out-of-core
+    /// HVG is a full extra I/O pass on every call, to guard against an input
+    /// almost nobody has. The compromise: keep the one-pass form and **say so**
+    /// when it fails, instead of returning a confidently wrong small variance. A
+    /// column listed here is near-constant at a large magnitude; its reported
+    /// variance may carry only a handful of significant digits.
+    ///
+    /// Deliberately a log line and not an error. One such gene among 30k is not
+    /// grounds for refusing an HVG call, and every caller of these kernels treats
+    /// them as infallible but for input validation. It lives here rather than in
+    /// `scx-accel` so the two `scx-gpu` callers get it too — the reason the
+    /// primitive is in this crate at all.
+    pub fn warn_if_unstable(&self, op: &str) {
+        if self.unstable.is_empty() {
+            return;
+        }
+        let shown: Vec<u32> = self.unstable.iter().copied().take(8).collect();
+        let truncated = if self.unstable.len() > shown.len() {
+            " (truncated)"
+        } else {
+            ""
+        };
+        log::warn!(
+            "{op}: {} of the per-column variances lost precision to cancellation in \
+             `sum(x^2) - n*mean^2` (near-constant columns at large magnitude); first \
+             affected column indices: {shown:?}{truncated}",
+            self.unstable.len(),
+        );
+    }
+}
+
 /// Bessel-corrected (`ddof = 1`) per-column mean and variance from raw moments.
 ///
 /// `col_sum[j] = Σ x_ij` and `col_sum_sq[j] = Σ x_ij²` over **all** `n` rows —
