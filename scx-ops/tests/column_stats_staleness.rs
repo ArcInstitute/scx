@@ -95,6 +95,71 @@ fn shard_csr(n_rows: usize) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
 /// `apply_obs_shard_column_stats` call the fixture would be blind to this whole
 /// class of bug, which is exactly why the pre-existing index fixtures in
 /// `external_obs_tests.rs` never caught it.
+/// Like [`write_indexed_fixture`] but **without** the per-shard `column_stats`:
+/// the index section is written and `apply_obs_shard_column_stats` is not called.
+///
+/// That is exactly the on-disk shape `modify_metadata` leaves when it falls back
+/// to building the index over obs-shard ranges — it writes the index and then
+/// clears the stats, because the index's shard space is not the CSR one.
+fn write_indexed_fixture_without_stats(dir: &TempDir, name: &str) -> PathBuf {
+    let path = dir.path().join(name);
+    let header =
+        FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, SHARD_ROWS as u32, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    let obs = obs_frame(n_counts_before);
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&var_frame()).unwrap();
+
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for start in (0..N_OBS).step_by(SHARD_ROWS) {
+        let (indptr, indices, values) = shard_csr(SHARD_ROWS);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                start as u64,
+            )
+            .unwrap();
+        ranges.push((start as u64, (start + SHARD_ROWS) as u64));
+    }
+
+    let opts = scx_engine::PredicateIndexBuildOptions {
+        forced_columns: vec!["n_counts".to_string()],
+        preset_columns: Vec::new(),
+        auto_threshold: 1000,
+        high_cardinality_threshold: 100_000,
+    };
+    let mut outcomes = Vec::new();
+    let mut named = Vec::new();
+    let bytes = scx_engine::build_obs_predicate_index_bytes(
+        &obs,
+        &ranges,
+        &opts,
+        &mut outcomes,
+        &mut named,
+    )
+    .unwrap()
+    .expect("n_counts must be indexable");
+    writer.write_obs_predicate_index(&bytes).unwrap();
+    // Deliberately NOT `apply_obs_shard_column_stats`.
+
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1_710_000_000,
+            action: "convert".to_string(),
+            tool: "column_stats_staleness fixture (no stats)".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
 fn write_indexed_fixture(dir: &TempDir, name: &str) -> PathBuf {
     let path = dir.path().join(name);
     let header =
@@ -784,29 +849,46 @@ fn obs_replacement_with_an_index_rebuild_restores_pruning() {
 // Ops that must NOT lose their stats
 // ---------------------------------------------------------------------------
 
-/// The contrast case, and the reason the two failure modes must not be
-/// conflated: `optimize` re-emits every shard through the writer and never
-/// re-derives the stats, so it **loses** them. That costs Level-1 pruning and
-/// nothing else — the rows still come back correct. Keeping a *stale* stat is
-/// the one that returns the wrong answer.
+/// `optimize` re-emits every shard through the writer, and until Phase 5c it
+/// never re-derived the stats — so it silently **lost** them, costing Level-1
+/// pruning and nothing else. This test used to assert that loss: it read
+/// `csr_column_stats(&out).is_empty()` and `skipped_shards == 0`, which is a
+/// specification for the bug rather than for the behaviour anyone wanted. It
+/// now asserts the carry, and the two failure modes it exists to separate are
+/// still separated — losing a stat costs pruning, keeping a *stale* one returns
+/// the wrong rows, and only the second is a correctness bug.
 ///
-/// Pinned so the operations-matrix cell describing this stays honest. `optimize`
-/// itself is deliberately unchanged here.
+/// `optimize` declares `ObsPredicateIndex => Carry::Verbatim`; the audit checks
+/// the section is present and cannot see whether the statistics its pruning
+/// needs came along. `build-csc` had the identical defect —
+/// `scx-cli/tests/cli_ops_integration.rs::build_csc_carries_predicate_index_and_pushdown`.
 #[test]
-fn optimize_loses_the_column_stats_but_never_returns_wrong_rows() {
+fn optimize_carries_the_column_stats_and_the_pruning() {
     let dir = TempDir::new().unwrap();
     let path = write_indexed_fixture(&dir, "atlas.scx");
+    let before_stats = csr_column_stats(&path);
+    assert!(
+        !before_stats.is_empty(),
+        "fixture precondition: the input must carry per-shard column stats"
+    );
+    let before = query(&path, "n_counts > 300");
+
     let out = dir.path().join("optimized.scx");
     scx_ops::optimize(&path, &out, None, scx_format_io::ObsShardPolicy::Auto).unwrap();
 
-    assert!(
-        csr_column_stats(&out).is_empty(),
-        "optimize re-encodes shards and does not re-derive column stats"
+    assert_eq!(
+        csr_column_stats(&out),
+        before_stats,
+        "optimize preserves row order and CSR shard boundaries, so the stats it \
+         carries from the input must equal the input's"
     );
-    // Which is safe: no stats means no pruning, and the row evaluator is exact.
-    let r = query(&out, "n_counts > 300");
-    assert_eq!(r.matched_rows, expected_gt(n_counts_before, 300));
-    assert_eq!(r.skipped_shards, 0, "no stats, so nothing can be pruned");
+    let after = query(&out, "n_counts > 300");
+    assert_eq!(after.matched_rows, expected_gt(n_counts_before, 300));
+    assert_eq!(
+        after.skipped_shards, before.skipped_shards,
+        "carrying the index bytes without the stats leaves Level-1 pruning off"
+    );
+    assert_stats_counts_agree(&out);
 }
 
 /// A patch that never touches obs has no reason to cost the file its pushdown.
@@ -834,4 +916,80 @@ fn uns_only_patch_keeps_the_column_stats() {
         "a uns-only patch must not disable Level-1 pruning"
     );
     assert_stats_counts_agree(&path);
+}
+
+/// An index whose keying a rewrite cannot verify must not have statistics
+/// fabricated for it.
+///
+/// `build-csc` / `optimize` re-encode every CSR shard and must restore the
+/// per-shard `column_stats` Level-1 pruning reads. The first implementation
+/// re-derived them from the carried index bytes, gated on
+/// `max(shard_id) + 1 == n_csr_shards`. **That equality is not proof the index is
+/// keyed to the CSR partition**: `modify_metadata` falls back to building the
+/// index over *obs*-shard ranges when the CSR shards do not tile `[0, n_obs)`,
+/// and an obs partition can have the same shard *count* as the CSR one with
+/// different *boundaries* — CSR `[0,100) [100,200) [200,300)` against obs
+/// `[0,134) [134,268) [268,400)`. Derivation would then attach shard 0's obs
+/// statistics to CSR rows they do not describe, and Level-1 consumes
+/// `column_stats` *before* residual evaluation — so a fabricated "value absent"
+/// prunes a shard holding real matches and the query returns an incomplete row
+/// set. Reported by review (codex - gpt-5.6-sol) on PR #451.
+///
+/// The fix carries the input's stats instead of re-deriving, which makes the
+/// inference unnecessary: a file in that state has had its stats cleared, so
+/// there is nothing to carry and nothing to mis-attribute. This asserts the end
+/// state — no stats in, no stats out, rows unchanged — rather than the
+/// arithmetic, so it stays valid if the implementation changes again.
+#[test]
+fn a_rewrite_does_not_fabricate_stats_for_an_unverifiable_index() {
+    let dir = TempDir::new().unwrap();
+
+    // Control half: stats present on the input must survive the rewrite. Without
+    // it this test would pass equally well if rewrites simply never carried
+    // stats at all.
+    let with_stats = write_indexed_fixture(&dir, "atlas.scx");
+    let before = csr_column_stats(&with_stats);
+    assert!(!before.is_empty(), "fixture precondition: stats present");
+    let out = dir.path().join("optimized.scx");
+    scx_ops::optimize(&with_stats, &out, None, scx_format_io::ObsShardPolicy::Auto).unwrap();
+    assert_eq!(
+        csr_column_stats(&out),
+        before,
+        "control: a rewrite must carry the stats a CSR-keyed index left behind"
+    );
+
+    // The case that matters: index section present, stats absent.
+    let no_stats = write_indexed_fixture_without_stats(&dir, "no_stats.scx");
+    assert!(
+        csr_column_stats(&no_stats).is_empty(),
+        "setup: no per-shard stats"
+    );
+    assert!(
+        ScxReader::open(&no_stats)
+            .unwrap()
+            .read_obs_predicate_index_bytes()
+            .unwrap()
+            .is_some(),
+        "setup: the index section must be present, or this proves nothing"
+    );
+
+    for (label, out) in [
+        ("optimize", dir.path().join("opt_no_stats.scx")),
+        ("build-csc", dir.path().join("csc_no_stats.scx")),
+    ] {
+        if label == "optimize" {
+            scx_ops::optimize(&no_stats, &out, None, scx_format_io::ObsShardPolicy::Auto).unwrap();
+        } else {
+            scx_ops::run_build_csc(&no_stats, &out, "64M", false, 0, None).unwrap();
+        }
+        assert!(
+            csr_column_stats(&out).is_empty(),
+            "{label} must not derive Level-1 statistics from an index whose keying it \
+             cannot verify — fabricated bounds prune shards holding real matches"
+        );
+        // Losing pruning costs speed, never rows.
+        let r = query(&out, "n_counts > 300");
+        assert_eq!(r.matched_rows, expected_gt(n_counts_before, 300), "{label}");
+        assert_eq!(r.skipped_shards, 0, "{label}: no stats, nothing to prune");
+    }
 }

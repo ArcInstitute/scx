@@ -297,6 +297,18 @@ fn rewrite_with_current_version(
         },
     )?;
 
+    // Same half-carry `build-csc` and `optimize` had, and for the same reason:
+    // the helper above copies the predicate-index *section*, but this op decodes
+    // and re-emits every CSR shard, and `compute_shard_stats` produces no
+    // `column_stats`. Level-1 pruning reads those, not the section — so without
+    // this the index survives and the pruning silently stops, a full scan that
+    // still returns the right rows. Row order and shard boundaries are 1:1 here
+    // (`upgrade` re-emits, it does not re-shard), so the input's statistics are
+    // exactly right for the output's shards. Found by review
+    // (Cursor Agent - Grok 4.6 High) on PR #451, which noted this op was a third
+    // instance the fix had missed.
+    writer.carry_csr_shard_column_stats_from(&reader.catalog().entries);
+
     // `upgrade` is the one op in the carry table whose call site lives outside
     // `scx-ops`, so the audit is wired here rather than inside the shared helper
     // above — which is also shared with `build-csc`, whose policy differs on the
@@ -348,6 +360,192 @@ mod tests {
         // Carried, not applied — the rows are still physically there.
         assert_eq!(out.n_obs(), 8);
         assert_eq!(out.read_all_csr_shards_filtered().unwrap().shape.0, 6);
+    }
+
+    /// An upgrade re-emits every CSR shard, so it must bring the per-shard obs
+    /// `column_stats` with it — those, not the `ObsPredicateIndex` section, are
+    /// what Level-1 pruning reads. `build-csc` and `optimize` had this defect and
+    /// were fixed first; `upgrade` reaches the same `Carry::Verbatim` arm through
+    /// `other => build_csc(other)` in `carry.rs` and was missed, because the first
+    /// pass counted explicit match arms. Found by review
+    /// (Cursor Agent - Grok 4.6 High) on PR #451; this test was added after a
+    /// second reviewer (Antigravity - Gemini 3.7 Flash) noted the fix had shipped
+    /// with the other two ops covered and `upgrade` not.
+    ///
+    /// Both directions, because either alone is passable by broken code: stats
+    /// present on the input must survive, and an input whose index section is
+    /// present with its stats absent must not have any invented for it. The
+    /// second arm builds that shape explicitly — an input with *neither* would
+    /// pass against code that invents stats only when an index exists.
+    #[test]
+    fn upgrade_carries_obs_column_stats() {
+        use scx_format_io::section::SectionType;
+
+        fn column_stats(p: &std::path::Path) -> Vec<usize> {
+            ScxReader::open(p)
+                .unwrap()
+                .catalog()
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
+                .filter_map(|e| e.stats.as_ref())
+                .map(|s| s.column_stats.len())
+                .collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 12, 5);
+
+        // Give the input an index and the per-shard stats that go with it, the
+        // way any indexing op would.
+        let indexed = dir.path().join("indexed.scx");
+        scx_ops::compact_with_index_options(
+            &input,
+            &indexed,
+            &scx_engine::ConversionPredicateIndexOptions {
+                index_obs: vec!["cell_type".to_string()],
+                index_var: vec![],
+                index_preset: None,
+                index_auto_threshold: 0,
+            },
+            false,
+        )
+        .unwrap();
+
+        let before = column_stats(&indexed);
+        assert!(
+            before.iter().any(|n| *n > 0),
+            "fixture precondition: the indexed input must carry per-shard column \
+             stats, or this test cannot tell a carry from a drop (got {before:?})"
+        );
+
+        let upgraded = dir.path().join("upgraded.scx");
+        let reader = ScxReader::open(&indexed).unwrap();
+        rewrite_with_current_version(&reader, &upgraded).unwrap();
+        drop(reader);
+
+        assert_eq!(
+            column_stats(&upgraded),
+            before,
+            "upgrade re-emits every CSR shard, so it must carry the per-shard \
+             column stats Level-1 pruning reads — carrying the index section \
+             alone leaves pruning off"
+        );
+        assert!(
+            ScxReader::open(&upgraded)
+                .unwrap()
+                .read_obs_predicate_index_bytes()
+                .unwrap()
+                .is_some(),
+            "the index section itself must still be there"
+        );
+
+        // The other direction, and it has to be the *dangerous* shape: an index
+        // section PRESENT with the stats absent. An input with neither (which is
+        // what `write_test_file` gives) would pass even against code that invents
+        // stats conditionally on an index existing — the exact reintroduction this
+        // arm is here to catch. Round 3 caught the rustdoc claiming this arm
+        // before it did it (codex - gpt-5.6-sol, Cursor Agent - Grok 4.6 High).
+        //
+        // Multiple shards, so a mis-attribution would have somewhere wrong to go.
+        let bare_src = dir.path().join("indexed_no_stats.scx");
+        {
+            use scx_format_io::writer::ScxWriter;
+            let src = ScxReader::open(&input).unwrap();
+            let obs = src.read_obs().unwrap();
+            let var = src.read_var().unwrap();
+            let (indptr, indices, values) = src
+                .read_shard_from_entry(
+                    src.catalog()
+                        .entries
+                        .iter()
+                        .find(|e| e.section_type == SectionType::CsrShard)
+                        .unwrap(),
+                )
+                .unwrap();
+            let mut header = src.header().clone();
+            drop(src);
+            header.shard_target_rows = 4;
+
+            let mut w = ScxWriter::new(&bare_src, header).unwrap();
+            w.write_obs(&obs).unwrap();
+            w.write_var(&var).unwrap();
+            // Three shards of four rows over the same 12 rows.
+            let mut ranges: Vec<(u64, u64)> = Vec::new();
+            for shard in 0..3u64 {
+                let lo = (shard * 4) as usize;
+                let ip: Vec<u64> = (lo..=lo + 4)
+                    .map(|r| indptr[r] as u64 - indptr[lo] as u64)
+                    .collect();
+                let nnz_lo = indptr[lo] as usize;
+                let nnz_hi = indptr[lo + 4] as usize;
+                let idx: Vec<u32> = indices[nnz_lo..nnz_hi].iter().map(|&v| v as u32).collect();
+                let vals = ValueEncoding::Uint8
+                    .encode_f32_batch(&values[nnz_lo..nnz_hi])
+                    .unwrap();
+                w.write_csr_shard(
+                    &ip,
+                    &idx,
+                    &vals,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    shard * 4,
+                )
+                .unwrap();
+                ranges.push((shard * 4, shard * 4 + 4));
+            }
+            // Through the real resolver, not a hand-built options struct: it is
+            // the one place the high-cardinality cap is set (ORG-6.14-2, and the
+            // CI guard that enforces it caught the hand-built version here), and
+            // it means this fixture is built the way production builds one.
+            let opts = scx_engine::resolve_predicate_index_build_options(
+                &scx_engine::ConversionPredicateIndexOptions {
+                    index_obs: vec!["cell_type".to_string()],
+                    index_var: vec![],
+                    index_preset: None,
+                    index_auto_threshold: 0,
+                },
+            )
+            .unwrap()
+            .obs;
+            let mut outcomes = Vec::new();
+            let mut named = Vec::new();
+            let bytes = scx_engine::build_obs_predicate_index_bytes(
+                &obs,
+                &ranges,
+                &opts,
+                &mut outcomes,
+                &mut named,
+            )
+            .unwrap()
+            .expect("cell_type must be indexable");
+            w.write_obs_predicate_index(&bytes).unwrap();
+            // Deliberately NOT `apply_obs_shard_column_stats` — this is the shape
+            // `modify_metadata` leaves when its index is obs-keyed.
+            w.finish().unwrap();
+        }
+        assert!(
+            column_stats(&bare_src).iter().all(|n| *n == 0),
+            "setup: the fixture must have no per-shard stats"
+        );
+        assert!(
+            ScxReader::open(&bare_src)
+                .unwrap()
+                .read_obs_predicate_index_bytes()
+                .unwrap()
+                .is_some(),
+            "setup: the index section must be PRESENT, or this arm proves nothing"
+        );
+
+        let bare = dir.path().join("bare.scx");
+        let reader = ScxReader::open(&bare_src).unwrap();
+        rewrite_with_current_version(&reader, &bare).unwrap();
+        drop(reader);
+        assert!(
+            column_stats(&bare).iter().all(|n| *n == 0),
+            "an index whose keying cannot be verified must not have stats invented \
+             for it — fabricated bounds prune shards holding real matches"
+        );
     }
 
     #[test]

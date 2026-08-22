@@ -37,13 +37,13 @@ first if you want a way back.
 | **delete** (`mark_deleted`) | In place (`<FILE>`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged | **Written** (this is the op that creates them) |
 | **modify_metadata** / **set_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`); a supplied `obsm` sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | **Carried forward** for the replaced axis — rebuilt over the columns the file already indexed, which also re-derives the per-shard column stats. `--index-obs` / `--index-var` override that axis's column set (`--index-preset` / `--index-auto-threshold` override both); a previously indexed column the new set omits is *reported*, not silently dropped. Untouched when only `uns` / `obsm` / `varm` change — see the note below | **Preserved** (X and its row space are untouched) |
 | **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deleted rows are dropped and no vector is emitted. This is the op that materializes deletions |
-| **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | Sections **preserved** (rows + shard boundaries unchanged), but like `build-csc` the re-emit does not re-derive the per-shard column stats, so **Level-1** pruning stops firing. See the note below | **Carried** verbatim (rows are 1:1, so the global row indices stay valid) |
-| **upgrade** | New file, or in place (`--in-place`, temp + rename) — **not** rollback-able; **refuses multimodal input** | Decoded, **canonicalized** and re-emitted **unframed** (per-shard codec preserved; canonicalizing can change `nnz`); a file already newer than the target (v4) is **declined**. `varm`, `obsp`, `varp`, `.raw` and the group index are **carried**; detection bitmaps are carried too unless canonicalizing actually rewrote X, in which case they are dropped with a warning — see below | **Preserved** (rows 1:1; a sharded layout stays sharded) | **Preserved** | **Preserved** when canonicalizing left the matrix unchanged (every file a current writer produces) — the one op that carries the sidecar through rather than dropping it. **Dropped with a warning** when canonicalizing actually rewrote X, since the sidecar is then a view of a different matrix | Sections **copied verbatim** by `copy_auxiliary_sections`, but the per-shard catalog **column stats are not re-derived** — so **Level-1** shard pruning stops firing, exactly as for `build-csc`. See the note below | **Carried** verbatim (a 1:1 re-emit, so the global row indices stay valid) |
+| **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | Sections **preserved** (rows + shard boundaries unchanged), and the per-shard column stats are **carried from the input** (rows are 1:1, so the input's stats are exactly right for the output's shards), so **Level-1** pruning survives. See the note below | **Carried** verbatim (rows are 1:1, so the global row indices stay valid) |
+| **upgrade** | New file, or in place (`--in-place`, temp + rename) — **not** rollback-able; **refuses multimodal input** | Decoded, **canonicalized** and re-emitted **unframed** (per-shard codec preserved; canonicalizing can change `nnz`); a file already newer than the target (v4) is **declined**. `varm`, `obsp`, `varp`, `.raw` and the group index are **carried**; detection bitmaps are carried too unless canonicalizing actually rewrote X, in which case they are dropped with a warning — see below | **Preserved** (rows 1:1; a sharded layout stays sharded) | **Preserved** | **Preserved** when canonicalizing left the matrix unchanged (every file a current writer produces) — the one op that carries the sidecar through rather than dropping it. **Dropped with a warning** when canonicalizing actually rewrote X, since the sidecar is then a view of a different matrix | Sections **copied verbatim** by `copy_auxiliary_sections`, and the per-shard catalog column stats are **carried from the input** (a 1:1 re-emit), so **Level-1** shard pruning survives — as for `build-csc`. See the note below | **Carried** verbatim (a 1:1 re-emit, so the global row indices stay valid) |
 | **merge** | New file (`<OUTPUT>` required) | Writes new output combining all inputs | Writes merged metadata; an `obsm` key some inputs lack is a **hard error** naming the input | Writes merged; `varm` / `varp` come from input 0 | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Carried**, with each input's rows offset into the merged row space (a sorted merge follows the merge permutation). Physical rows are all retained — run `compact` to reclaim them |
 | **subset** | New file (`<OUTPUT>` required, optional with `--dry-run`) | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — a subset builds a new row space, so deleted cells are excluded (whether or not `--filter` is given, and intersected with it when it is) |
 | **sort** | New file (`<OUTPUT>` required) | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deletions are materialized away by the reorder |
 | **sort `--shuffle`** | New file (`<OUTPUT>` required) | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them | **Applied** — as for `sort` |
-| **build-csc** | In place, or a new file with `<OUTPUT>` | **Re-emitted** (not re-encoded or canonicalized); row-group framing is preserved from the input | **Preserved** | **Preserved** | **Built** (this is the op that creates it) | Sections **copied verbatim** (shard boundaries are unchanged, so their `ShardRange`s stay valid), but the per-shard catalog **column stats are not re-derived** — so **Level-1** shard pruning stops firing. See the note below | **Carried** verbatim (a 1:1 re-emit; the CSC sidecar is built over the physical rows, which the vector still indexes correctly) |
+| **build-csc** | In place, or a new file with `<OUTPUT>` | **Re-emitted** (not re-encoded or canonicalized); row-group framing is preserved from the input | **Preserved** | **Preserved** | **Built** (this is the op that creates it) | Sections **copied verbatim** (shard boundaries are unchanged, so their `ShardRange`s stay valid), and the per-shard catalog column stats are **carried from the input**, so **Level-1** shard pruning survives. See the note below | **Carried** verbatim (a 1:1 re-emit; the CSC sidecar is built over the physical rows, which the vector still indexes correctly) |
 | **obs-import** / **doublet-import** | In place (`<FILE> <SOURCE>`) | **Unchanged** (never read or rewritten) | Replaced (same `n_obs`, plus the new columns) | **Preserved** | **Preserved** (X untouched) | **Preserved** on a pure column *add*; dropped only when `--overwrite` rewrites an indexed column (`obs_index_would_go_stale` decides). The per-shard catalog column stats are cleared **per rewritten column** — see the note below | **Preserved** (X untouched) |
 | **cellbender-import** (`attach_external_layer`) | In place (`<FILE> <CELLBENDER_H5>`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | Same as **obs-import**: preserved on a pure column *add*, dropped when `overwrite` rewrites an indexed obs column, and the column stats cleared per rewritten column | **Preserved** (X untouched) |
 | **rollback** | In place (`<FILE>`) | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored | Restored (as of the previous catalog) |
@@ -253,37 +253,62 @@ a framed output. Both derive it from `scx_ops::framing_for_csc_rebuild`, which
 is the only correct source — see the note on `rebuild_csc_inplace` for why both
 `None` and a `decode_target`-carrying `FramingConfig` are wrong here.
 
-> **Known gap: `build-csc` keeps the predicate index but loses Level-1 pruning.**
-> `copy_auxiliary_sections` copies `obs_predicate_index` / `var_predicate_index`
+> **`build-csc`, `optimize` and `upgrade` keep the predicate index *and* its
+> Level-1 pruning.** All three copy `obs_predicate_index` / `var_predicate_index`
 > byte-for-byte, and the copy stays *valid* — shard boundaries and row ranges are
-> unchanged. But `run_build_csc` re-encodes each shard through its own path and
-> does not re-derive the per-shard catalog `column_stats`, and **Level-1** pruning
-> resolves a categorical predicate against those stats' `CategoryBitset`.
+> unchanged. All three also re-encode every CSR shard, and `compute_shard_stats` emits
+> no per-shard `column_stats`, so each additionally **carries the input's** stats
+> onto the output's shards, matched by `row_start`
+> (`scx_format_io::carry_csr_shard_column_stats`). All three re-emit one output
+> shard per input shard at the same offset, so the input's statistics are already
+> exactly right for the output's rows.
 >
-> Scope matters, because the index drives two independent pushdown paths:
+> Both halves matter, because the index drives two independent pushdown paths:
 >
-> - **Level-1** (catalog-stats shard pruning) **stops.** Measured on a
->   200-cell / 8-shard file indexed on a clustered `cell_type`: `Level 1
->   eliminated 6/8` before `build-csc`, `0/8` after — same correct row count.
-> - **Level-2** (row-set pushdown) reads the copied `PredicateIndex` directly and
->   does **not** consult `column_stats`, so it is unaffected. It has its own
->   precondition — row-sharded obs metadata — so on a single-section-obs file,
->   where Level-2 is inactive regardless, the query does degrade to a full obs
->   scan.
+> - **Level-1** (catalog-stats shard pruning) reads the per-shard
+>   `column_stats`, not the index section.
+> - **Level-2** (row-set pushdown) reads the `PredicateIndex` directly and does
+>   **not** consult `column_stats`. It has its own precondition — row-sharded obs
+>   metadata — so on a single-section-obs file, where Level-2 is inactive
+>   regardless, a query degrades to a full obs scan.
 >
-> Correctness is never affected either way: the same rows match, just without the
-> pruning. The real fix is to derive the stats on re-emit
-> (`scx_engine::apply_obs_shard_column_stats`, as `merge` does). Until then, if
-> you need Level-1 pruning back, rebuild the index with an op that derives stats
-> — e.g. `scx sort --by <col> --index-preset …`. Prefer that over `scx compact`,
-> which re-runs `codec=auto` and can grow the file; and note `scx convert` cannot
-> take an `.scx` input at all. Pinned by
-> `scx-cli/tests/cli_ops_integration.rs::test_build_csc_preserves_predicate_index_sections_but_not_pushdown`.
+> Until v0.14 the stats were dropped: the section survived, Level-1 pruning
+> stopped, and the query returned the *right* rows after a full scan — which is
+> why it went unnoticed. Measured on a 200-cell / 8-shard file indexed on a
+> clustered `cell_type`: `Level 1 eliminated 6/8` before `build-csc`, `0/8`
+> after. `optimize` and `upgrade` had the identical defect for the identical
+> reason — `upgrade` reaches `build-csc`'s carry policy through
+> `other => build_csc(other)` in `scx-ops/src/carry.rs`, which is why the first
+> pass at this fix counted two ops and missed the third.
 >
-> `optimize` has the same gap for the same reason: it re-encodes every shard
-> through `write_preencoded_shard` and never calls `apply_obs_shard_column_stats`.
 > Pinned by
-> `scx-ops/tests/column_stats_staleness.rs::optimize_loses_the_column_stats_but_never_returns_wrong_rows`.
+> `scx-cli/tests/cli_ops_integration.rs::build_csc_carries_predicate_index_and_pushdown`
+> and
+> `scx-ops/tests/column_stats_staleness.rs::optimize_carries_the_column_stats_and_the_pruning`,
+> plus `scx-ops::optimize::tests::optimize_preserves_level1_shard_pruning` — the
+> earlier `optimize` test could not see the loss because its fixture has a single
+> CSR shard, and Level-1 pruning is unobservable on one shard.
+>
+> **Why carrying rather than re-deriving from the index.** An earlier version of
+> this fix derived the stats afresh from the carried index bytes, gated on the
+> index's highest recorded `shard_id + 1` matching the output CSR shard count.
+> That equality is not proof the index is keyed to the CSR partition:
+> `modify_metadata` falls back to building the index over **obs**-shard ranges
+> when the CSR shards do not tile `[0, n_obs)`, and an obs partition can have the
+> same shard *count* with different *boundaries* — CSR `[0,100) [100,200)
+> [200,300)` against obs `[0,134) [134,268) [268,400)`. Derivation would attach
+> shard 0's obs statistics to CSR rows they do not describe, and Level-1 consumes
+> `column_stats` **before** residual evaluation, so a fabricated "value absent"
+> prunes a shard holding real matches and the query returns an **incomplete row
+> set**. Copying removes the inference entirely.
+>
+> A file in that state has no stats to carry — `modify_metadata` clears them
+> (`clear_all_csr_shard_column_stats`) precisely because its index is obs-keyed —
+> so the rewrite output is unprunable rather than wrongly pruned. To get Level-1
+> pruning back, rebuild the index with an op that derives stats against the CSR
+> partition: `scx sort --by <col> --index-preset …`. Prefer that over
+> `scx compact`, which re-runs `codec=auto` and can grow the file; and note
+> `scx convert` cannot take an `.scx` input at all.
 
 ### Per-shard column stats and the in-place ops
 
@@ -301,8 +326,9 @@ dictionary the index carries. A numeric literal is a *value*, never an ordinal:
 it is left unresolved and prunes nothing, which is why `batch == 3` on an
 integer-valued categorical is served by the numeric `MinMax` arm instead.
 
-- **Losing** the stats, as `build-csc` and `optimize` do, costs pruning. Rows are
-  still correct.
+- **Losing** the stats costs pruning; rows are still correct. `build-csc`,
+  `optimize` and `upgrade` all used to lose them on re-emit and now carry them
+  from the input instead.
 - **Keeping a stale one** returns the wrong rows. A shard whose recorded `max`
   predates a rescaled column is excluded from a query the new values satisfy, and
   the result comes back short with no error and no warning.

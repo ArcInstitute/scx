@@ -82,6 +82,24 @@ ALL_BENCHMARKS: list[str] = [
     # Data-load Phase 0 — per-file obs-open cost microbench (matrix-free SCX
     # read_obs vs anndata eager-obs baseline) at 1-file + manifest scale.
     "obs_open",
+    # Streaming vs materialising h5ad -> SCX conversion. The streaming
+    # converter's contract is bounded peak RSS, gated by a
+    # `streaming_peak_rss_mb` absolute floor on census_1m in thresholds.yaml.
+    # `SUPPORTED_FORMATS = {"scx_auto"}` inside the module; in run_parallel's
+    # `_NO_CONVERSION` because it works from `dataset.h5ad_path`.
+    #
+    # Registered here in Phase 5c. Before that it lived only in
+    # `scripts/run_all.py::AVAILABLE_BENCHMARKS`, so `capture_baseline.py` and
+    # `run_parallel.py` — which both derive their lists from ALL_BENCHMARKS —
+    # could not schedule it and `gate_candidate.py` refused the name outright.
+    # A never-run triple is silently scoped out of the floor check rather than
+    # failed, so the floor read as coverage and provided none.
+    "conversion_streaming",
+    # The inverse: streaming vs materialising SCX -> h5ad / h5mu export. Same
+    # bounded-peak-RSS contract, same floor, same registration history.
+    # NOT in `_NO_CONVERSION`: it consumes a pre-converted SCX file via
+    # `converted_path` from Phase A.
+    "export_streaming",
     # Data-load Phase 1D — `scx sort --shuffle` global pre-shuffle: rewrite cost,
     # the output-size delta swept across codec variants (the open question:
     # scx1 codes row-independently and should be neutral, zstd/shufdelta should
@@ -120,6 +138,13 @@ ALL_BENCHMARKS: list[str] = [
     # the gate tracks speedup and CPU↔GPU parity. Variants live in
     # `benchmarks/comprehensive/benchmarks/accel_de.py`.
     "accel_de",
+    # Perturbation-evaluation metrics (cell-eval / arc-bench parity), CPU vs GPU.
+    # Registered in Phase 5c alongside the two streaming benchmarks: its variants
+    # were already in `config.accel_formats()`, it was already in run_parallel's
+    # `_NO_CONVERSION`, and it already had two `*_route_gpu_correct` floors in
+    # thresholds.yaml — every part of the wiring except the one list that
+    # schedules it. Those floors have therefore never actually been evaluated.
+    "accel_eval_metrics",
     # GPU pseudobulk NB-GLM DE (route `gpu_nb_glm_csr`). Synthetic stratified
     # Perturb-seq fixture (`_pert_synth.make_raw_counts_stratified`); CPU vs GPU
     # with route correctness, CPU↔GPU concordance, and a pdex_ref anchor. Runs

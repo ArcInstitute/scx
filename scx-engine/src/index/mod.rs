@@ -34,8 +34,9 @@ pub use build::{
     build_and_write_conversion_predicate_indexes,
     build_and_write_conversion_predicate_indexes_streaming, build_categorical_index, build_indexes,
     build_numeric_index, build_obs_predicate_index_bytes, build_var_predicate_index_bytes,
-    BuildOutcome, ConversionPredicateIndexOptions, ConversionPredicateIndexResult,
-    PredicateIndexBuildOptions, SkipReason,
+    resolve_predicate_index_build_options, BuildOutcome, ConversionPredicateIndexOptions,
+    ConversionPredicateIndexResult, PredicateIndexBuildOptions, ResolvedIndexBuildOptions,
+    SkipReason, HIGH_CARDINALITY_THRESHOLD,
 };
 pub use derive::{apply_obs_shard_column_stats, derive_shard_column_stats};
 pub use diagnostics::{

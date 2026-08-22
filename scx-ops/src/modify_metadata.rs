@@ -26,7 +26,7 @@
 //! [`OpsError::MultimodalUnsupported`]; per-modality metadata replace is a
 //! focused follow-on.
 
-use std::io::{Cursor, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use arrow::array::RecordBatch;
@@ -41,12 +41,13 @@ use scx_format_io::reader::ScxReader;
 use scx_format_io::section::{write_alignment_padding, SectionType};
 use scx_format_io::writer::ScxWriter;
 
-use crate::append::{predicate_index_build_options_for_obs, unify_dict_columns};
+use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::external_obs::indexed_column_names;
 use crate::in_place::{commit_in_place, entry_matches_key, prepare_in_place, read_provenance_ops};
 use crate::predicate_index::{
-    user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
+    user_wants_index, validate_forced_columns, ObsVarIndexPass, PredicateIndexBuildSummary,
+    StatsSink,
 };
 
 /// A set of metadata replacements to apply atomically. Any `None` field is left
@@ -399,19 +400,13 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
     let rebuild_obs_index = patch.obs.is_some() && (explicit_obs || carry_obs);
     let rebuild_var_index = patch.var.is_some() && (explicit_var || carry_var);
 
-    // Carried columns enter as *preset*, never *forced*: a preset column the new
-    // frame no longer has is a `PresetSkipped` warning, where a forced one is a
-    // hard error. Forcing them would make an ordinary `doublet_consensus` start
-    // raising on a file whose indexed column an earlier edit had dropped.
-    let carried_build_options = |columns: &[String]| scx_engine::PredicateIndexBuildOptions {
-        forced_columns: Vec::new(),
-        preset_columns: columns.to_vec(),
-        // Belt and braces. A non-empty `preset_columns` already turns
-        // auto-detection off; pinning this to 0 keeps a future refactor from
-        // silently indexing columns the file never had.
-        auto_threshold: 0,
-        high_cardinality_threshold: 100_000,
-    };
+    // Two passes, because this op has two modes on the same axes. `carried`
+    // enters the file's existing indexed columns as *preset*, never *forced*
+    // (see `ObsVarIndexPass::carried` for why that distinction is load-bearing);
+    // `requested` is the ordinary user request. Both resolve before the writer
+    // is adopted, so an unknown `--index-preset` fails with nothing written.
+    let carried_pass = ObsVarIndexPass::carried(&existing_obs_index, &existing_var_index);
+    let requested_pass = ObsVarIndexPass::resolve(&patch.index)?;
 
     if user_wants_index(&patch.index) && (rebuild_obs_index || rebuild_var_index) {
         let mut vopts = patch.index.clone();
@@ -479,16 +474,13 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
         // Unify dictionary columns to their value type, matching the obs
         // sharding the append/merge paths perform.
         let unified = unify_dict_columns(obs)?;
+        let obs_pass = if carry_obs {
+            &carried_pass
+        } else {
+            &requested_pass
+        };
         let mut builder = if rebuild_obs_index {
-            let opts = if carry_obs {
-                carried_build_options(&existing_obs_index)
-            } else {
-                predicate_index_build_options_for_obs(&patch.index)
-            };
-            Some(
-                scx_engine::ObsPredicateIndexBuilder::new(unified.schema(), &opts)
-                    .map_err(OpsError::Engine)?,
-            )
+            Some(obs_pass.obs_builder(unified.schema())?)
         } else {
             None
         };
@@ -539,31 +531,24 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
             } else {
                 &index_ranges
             };
-            let obs_bytes = builder
-                .finish(
-                    ranges,
-                    &mut index_result.obs_outcomes,
-                    &mut index_result.obs_indexed_columns,
-                )
-                .map_err(OpsError::Engine)?;
-            match obs_bytes {
-                Some(bytes) => {
-                    writer.write_obs_predicate_index(&bytes)?;
-                    if !index_ranges.is_empty() {
-                        let index = scx_engine::PredicateIndex::read_from(&mut Cursor::new(&bytes))
-                            .map_err(OpsError::Engine)?;
-                        per_shard_obs_stats = Some(scx_engine::derive_shard_column_stats(
-                            &index,
-                            csr_ranges.len(),
-                        ));
-                    } else {
-                        // An index WAS written, over the obs-shard ranges. Another
-                        // in-place rebuild will land here again — the file's shape
-                        // is the problem, not the request.
-                        no_stats_reason = NoStatsReason::CsrRangesUnderCoverObsAxis;
-                    }
-                }
-                None => no_stats_reason = NoStatsReason::NoColumnWasIndexable,
+            // `ranges` is `index_ranges` (== `csr_ranges`) whenever that list
+            // covers the obs axis, so `Deferred` derives over exactly the
+            // CSR-shard space. In the fallback case it is the obs-shard space,
+            // where Level-1 stats cannot be derived at all — hence `Skip`.
+            let sink = if index_ranges.is_empty() {
+                StatsSink::Skip
+            } else {
+                StatsSink::Deferred(&mut per_shard_obs_stats)
+            };
+            let wrote =
+                obs_pass.finish_obs(builder, ranges, &mut writer, &mut index_result, sink)?;
+            if !wrote {
+                no_stats_reason = NoStatsReason::NoColumnWasIndexable;
+            } else if index_ranges.is_empty() {
+                // An index WAS written, over the obs-shard ranges. Another
+                // in-place rebuild will land here again — the file's shape
+                // is the problem, not the request.
+                no_stats_reason = NoStatsReason::CsrRangesUnderCoverObsAxis;
             }
         }
     }
@@ -573,32 +558,12 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
             .var
             .as_ref()
             .expect("rebuild_var_index implies patch.var is Some");
-        let var_build_opts = if carry_var {
-            carried_build_options(&existing_var_index)
+        let var_pass = if carry_var {
+            &carried_pass
         } else {
-            let preset_var = match patch.index.index_preset.as_deref() {
-                Some(name) => scx_engine::index_preset_columns(name)
-                    .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            };
-            scx_engine::PredicateIndexBuildOptions {
-                forced_columns: patch.index.index_var.clone(),
-                preset_columns: preset_var,
-                auto_threshold: patch.index.index_auto_threshold,
-                high_cardinality_threshold: 100_000,
-            }
+            &requested_pass
         };
-        let var_bytes = scx_engine::build_var_predicate_index_bytes(
-            var,
-            &[(0, prep.target_n_vars)],
-            &var_build_opts,
-            &mut index_result.var_outcomes,
-            &mut index_result.var_indexed_columns,
-        )?;
-        if let Some(bytes) = var_bytes {
-            writer.write_var_predicate_index(&bytes)?;
-        }
+        var_pass.write_var(var, prep.target_n_vars, &mut writer, &mut index_result)?;
     }
 
     if let Some(obsm) = &patch.obsm {

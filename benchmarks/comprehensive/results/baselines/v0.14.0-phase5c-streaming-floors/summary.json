@@ -1,0 +1,42 @@
+{
+  "schema_version": 2,
+  "snapshot_name": "phase6-streaming-floors",
+  "tier": "small",
+  "datasets": [
+    "census_1m"
+  ],
+  "rows": {
+    "conversion_streaming__scx_streaming_vs_materialize__census_1m": {
+      "median_wall_s": 25.368267418816686,
+      "wall_s_iqr": 17.95294709224254,
+      "n_runs": 9,
+      "peak_rss_mb_median": 5893.00390625,
+      "file_size_bytes": null,
+      "source_file": "conversion_streaming__scx_streaming_vs_materialize__census_1m.json"
+    },
+    "export_streaming__scx_streaming_vs_materialize__census_1m": {
+      "median_wall_s": 21.435684327036142,
+      "wall_s_iqr": 2.502485263161361,
+      "n_runs": 9,
+      "peak_rss_mb_median": 5622.015625,
+      "file_size_bytes": null,
+      "source_file": "export_streaming__scx_streaming_vs_materialize__census_1m.json"
+    },
+    "obs_open__h5ad_none__census_1m": {
+      "median_wall_s": 1.0218348437920213,
+      "wall_s_iqr": 0.05180837260559201,
+      "n_runs": 12,
+      "peak_rss_mb_median": 733.046875,
+      "file_size_bytes": 11398091528,
+      "source_file": "obs_open__h5ad_none__census_1m.json"
+    },
+    "obs_open__scx_auto__census_1m": {
+      "median_wall_s": 0.5803613290190697,
+      "wall_s_iqr": 0.5989475529640913,
+      "n_runs": 15,
+      "peak_rss_mb_median": 1613.82421875,
+      "file_size_bytes": 2800057397,
+      "source_file": "obs_open__scx_auto__census_1m.json"
+    }
+  }
+}

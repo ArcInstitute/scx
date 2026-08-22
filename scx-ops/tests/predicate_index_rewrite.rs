@@ -1361,3 +1361,116 @@ fn append_on_gapped_obs_shard_cover_is_rejected() {
         "error must name the cover violation; got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Unknown --index-preset (ORG-6.14-2)
+// ---------------------------------------------------------------------------
+//
+// Before the ops shared `scx_engine::resolve_predicate_index_build_options`,
+// each of the six preset lookups in `scx-ops` was
+// `index_preset_columns(name).map(…).unwrap_or_default()`, where
+// `scx convert --index-preset typo` had always failed with
+// `UnknownIndexPreset`. Neither `scx-cli` nor `pyscx` validates the name — the
+// seven `index_preset: Option<String>` clap fields carry no `value_parser` — so
+// the divergence was reachable from the CLI on every rewrite op.
+//
+// **And "silently ignored" understates it.** An empty `preset_columns` does not
+// mean "index nothing": it means auto-detection is still on, so the typo fell
+// through to `auto_threshold`. Measured on `main`, `--index-preset perturbsequ`
+// indexed `["cell_id", "perturbation", "cell_type"]` — `cell_id` is a per-cell
+// unique identifier that no preset names and that auto-detect only tolerates
+// because this fixture is small. The user asked for one column set, got a
+// different one, and was told it succeeded.
+//
+// Both halves are asserted: the reject side, and a *known* preset still
+// building an index. Without the accept side the reject arm would pass equally
+// well if presets had stopped working altogether.
+
+fn preset_options(name: &str) -> ConversionPredicateIndexOptions {
+    ConversionPredicateIndexOptions {
+        index_obs: vec![],
+        index_var: vec![],
+        index_preset: Some(name.to_string()),
+        index_auto_threshold: 1000,
+    }
+}
+
+#[test]
+fn merge_rejects_an_unknown_index_preset() {
+    let dir = TempDir::new().unwrap();
+    let a = write_test_file(&dir, "a.scx", 32, 8, "DRUG_A");
+    let b = write_test_file(&dir, "b.scx", 32, 8, "DRUG_B");
+    let out = dir.path().join("merged.scx");
+
+    let err = scx_ops::merge_with_index_options(
+        &[a.as_path(), b.as_path()],
+        &out,
+        &preset_options("perturbsequ"),
+    )
+    .expect_err("an unknown --index-preset must be refused, not silently ignored");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("perturbsequ"),
+        "the error must name the preset that was not recognised, got: {msg}"
+    );
+}
+
+/// The accept side: `perturbseq` names `perturbation` and `cell_type`, both of
+/// which the fixture's obs carries, so a known preset must still produce an
+/// index section.
+#[test]
+fn merge_accepts_a_known_index_preset() {
+    let dir = TempDir::new().unwrap();
+    let a = write_test_file(&dir, "a.scx", 32, 8, "DRUG_A");
+    let b = write_test_file(&dir, "b.scx", 32, 8, "DRUG_B");
+    let out = dir.path().join("merged.scx");
+
+    let summary = scx_ops::merge_with_index_options(
+        &[a.as_path(), b.as_path()],
+        &out,
+        &preset_options("perturbseq"),
+    )
+    .unwrap();
+
+    assert!(summary.result.is_some(), "expected an index result");
+    assert_eq!(
+        count_section(&out, SectionType::ObsPredicateIndex),
+        1,
+        "a known preset naming present columns must write an obs predicate index"
+    );
+}
+
+#[test]
+fn append_rejects_an_unknown_index_preset() {
+    let dir = TempDir::new().unwrap();
+    let target = write_test_file(&dir, "target.scx", 32, 8, "DRUG_A");
+    let before = std::fs::metadata(&target).unwrap().len();
+
+    let new_obs = obs_with_categories(8, "DRUG_B");
+    let indptr: Vec<u64> = (0..=8u64).collect();
+    let indices: Vec<u32> = (0..8u32).collect();
+    let values: Vec<u8> = vec![1u8; 8];
+
+    let err = scx_ops::append_with_index_options(
+        &target,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        &AppendOptions::default(),
+        &preset_options("trainng"),
+    )
+    .expect_err("an unknown --index-preset must be refused, not silently ignored");
+    assert!(
+        err.to_string().contains("trainng"),
+        "the error must name the preset that was not recognised, got: {err}"
+    );
+    // append writes into the existing file, so the refusal has to land before
+    // any bytes are appended — that is why the pass is resolved up front.
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().len(),
+        before,
+        "a refused append must not have grown the target"
+    );
+}

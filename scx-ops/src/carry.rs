@@ -291,15 +291,32 @@ pub enum Carry {
     /// `UnsPolicy` can legitimately reduce to nothing), and the predicate-index
     /// entries for `compact` / `merge` / `sort`.
     ///
+    /// ## What `Verbatim` does not assert, for a section with derived state
+    ///
     /// An earlier version of this doc named `build-csc`'s predicate-index
-    /// handling as the live instance. That cell is `Verbatim`, not `Rebuilt` —
-    /// the sections *are* required to be present, and the defect there is a
-    /// different one that no `Carry` variant expresses: `build-csc` copies them
-    /// and never re-derives the per-shard `column_stats` they need, so the
-    /// sections survive and Level-1 pushdown does not. Pinned and unfixed at
-    /// `scx-cli/tests/cli_ops_integration.rs`
-    /// (`test_build_csc_preserves_predicate_index_sections_but_not_pushdown`).
-    /// **The audit cannot see that**, and no entry in this table claims it can.
+    /// handling as `Rebuilt`'s live instance. That cell is [`Carry::Verbatim`] —
+    /// the sections *are* required to be present — and the defect there was one
+    /// no `Carry` variant expresses: `build-csc` copied the bytes and never
+    /// re-derived the per-shard `column_stats` those bytes' Level-1 pushdown
+    /// reads, so the section survived and the pruning did not. `optimize`, the
+    /// only other op declaring `Verbatim` for that family in its own match arm,
+    /// had it too — and so did `upgrade`, which reaches that arm through
+    /// `other => build_csc(other)` and re-emits every CSR shard as well. Three
+    /// ops, not two: an earlier version of this note said two, because it counted
+    /// the explicit match arms and missed the delegation. Found by review
+    /// (Cursor Agent - Grok 4.6 High) on PR #451.
+    ///
+    /// All three are fixed (Phase 5c,
+    /// `scx_format_io::carry_csr_shard_column_stats`, which copies the input's
+    /// stats by `row_start` rather than inferring the index's keying), but the lesson is
+    /// structural and outlives the fix: **`Verbatim` asserts that the section is
+    /// present, not that state derived from it elsewhere in the catalog is still
+    /// correct.** The audit cannot see the difference, and no entry in this table
+    /// claims it can. Any future `Verbatim` cell on a section with derived state
+    /// owes its own test — see
+    /// `scx-cli/tests/cli_ops_integration.rs::build_csc_carries_predicate_index_and_pushdown`
+    /// and
+    /// `scx-ops/tests/column_stats_staleness.rs::optimize_carries_the_column_stats_and_the_pruning`.
     Rebuilt,
     /// Carried or dropped depending on something decided at run time, so
     /// neither presence nor absence can be asserted.
@@ -620,6 +637,10 @@ fn optimize(family: SectionFamily) -> Carry {
             on: "carried unless canonicalisation changed which genes a row stores",
         },
         F::DeletionVectors => Carry::Verbatim,
+        // Same shape as `build_csc`'s cell below, and it had the same defect:
+        // optimize re-encodes every shard, so the per-shard `column_stats` that
+        // Level-1 pushdown reads have to be carried over from the input.
+        // `Verbatim` does not assert that half.
         F::ObsPredicateIndex | F::VarPredicateIndex => Carry::Verbatim,
         F::Provenance => Carry::Rebuilt,
         // Rejected up front with a message pointing at `scx compact`.
@@ -708,10 +729,12 @@ fn build_csc(family: SectionFamily) -> Carry {
         F::X | F::Layer | F::Obsm | F::Uns => Carry::Verbatim,
         F::DeletionVectors => Carry::Verbatim,
         // Copied through, so presence *is* asserted — but presence is the only
-        // thing asserted, and it is not the property that matters here: the
-        // per-shard `column_stats` these sections need are never re-derived, so
-        // Level-1 pushdown is lost while the section stays. No `Carry` variant
-        // expresses that, and none pretends to; it is 5c's to fix.
+        // thing asserted, and it is not the whole property that matters here.
+        // Level-1 pushdown reads the per-shard `column_stats`, not this section,
+        // and build-csc re-encodes every CSR shard; 5c carries them over from the
+        // input instead (`scx_format_io::carry_csr_shard_column_stats`, keyed by
+        // `row_start`). No `Carry` variant expresses that half and none pretends
+        // to — see `Carry::Rebuilt`'s doc, and the tests it names.
         F::ObsPredicateIndex | F::VarPredicateIndex => Carry::Verbatim,
         // The whole point of the op.
         F::XCsc => Carry::Rebuilt,

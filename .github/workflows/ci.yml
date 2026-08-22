@@ -555,6 +555,69 @@ jobs:
             fi
           done
 
+      # ORG-6.14-2: one predicate-index rebuild, so a rewrite op cannot grow its
+      # own longhand copy again. Before 5c there were four rebuild bodies in
+      # scx-ops, three obs-option resolvers, four copies of the var half, and the
+      # `100_000` high-cardinality cap spelled out at seven sites -- which is how
+      # `--index-preset <typo>` came to be a hard error on `convert` and a silent
+      # fall-through to auto-detection on `merge` / `append` / `modify_metadata`.
+      #
+      # Both halves are asserted. Deleting `ObsVarIndexPass` outright would leave
+      # the negative greps below trivially satisfied, so the positive half runs
+      # first -- the mistake 6e's guard audit found in two existing guards.
+      - name: One predicate-index rebuild pass, one high-cardinality cap
+        run: |
+          set -euo pipefail
+          engine=scx-engine/src/index/build.rs
+          pass=scx-ops/src/predicate_index.rs
+          # Assert the inputs exist before asserting anything about them: a guard
+          # keyed on a path that has moved passes vacuously and says nothing.
+          for f in "$engine" "$pass"; do
+            test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-6.14-2)."; exit 1; }
+          done
+
+          # Positive half 1: the cap is declared once, in the engine.
+          if ! grep -qE '^pub const HIGH_CARDINALITY_THRESHOLD: usize' "$engine"; then
+            echo "::error::$engine no longer declares pub const HIGH_CARDINALITY_THRESHOLD — every builder derives the cap from it (ORG-6.14-2)."
+            exit 1
+          fi
+          # Positive half 2: the shared resolver and the ops pass both exist, and
+          # the pass is actually used by more than one op.
+          if ! grep -qE '^pub fn resolve_predicate_index_build_options' "$engine"; then
+            echo "::error::$engine no longer defines resolve_predicate_index_build_options — that is the one place an --index-preset is resolved, and where an unknown name errors (ORG-6.14-2)."
+            exit 1
+          fi
+          if ! grep -qE '^pub struct ObsVarIndexPass' "$pass"; then
+            echo "::error::$pass no longer defines ObsVarIndexPass (ORG-6.14-2)."
+            exit 1
+          fi
+          n=$(grep -rhoE 'ObsVarIndexPass::(resolve|carried)\(' scx-ops/src --include='*.rs' \
+                | wc -l | tr -d ' ')
+          if [ "$n" -lt 5 ]; then
+            echo "::error::ObsVarIndexPass has $n construction sites in scx-ops, expected at least 5 (append x2, merge x1, modify_metadata x2). An op that stopped using it has its own rebuild again (ORG-6.14-2). If a refactor legitimately merged two entry points, lower this number in the same commit."
+            exit 1
+          fi
+
+          # Negative half 1: the cap is assigned nowhere else. Test files build
+          # `PredicateIndexBuildOptions` directly to exercise the builder at other
+          # thresholds, which is legitimate; production code must ask the table.
+          if grep -rEn --include='*.rs' 'high_cardinality_threshold:' \
+               scx-engine/src scx-ops/src scx-convert/src scx-cli/src pyscx/src \
+               | grep -vE '(^|/)[a-z_]*_tests\.rs:' \
+               | grep -vE "^($engine|$pass):" \
+               | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::a production site sets high_cardinality_threshold itself — resolve it through scx_engine::resolve_predicate_index_build_options (or ObsVarIndexPass) so the cap has one derivation (ORG-6.14-2)."
+            exit 1
+          fi
+          # Negative half 2: the var half of a rebuild lives only in the pass.
+          if grep -rEn --include='*.rs' 'build_var_predicate_index_bytes\(' scx-ops/src \
+               | grep -vE "^$pass:" \
+               | grep -vE '(^|/)[a-z_]*_tests\.rs:' \
+               | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::a scx-ops site builds the var predicate index directly — use ObsVarIndexPass::write_var so the var half exists once (ORG-6.14-2)."
+            exit 1
+          fi
+
 
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on

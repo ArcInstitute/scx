@@ -43,7 +43,7 @@ from pathlib import Path
 
 from benchmarks.comprehensive.config import DatasetConfig
 from benchmarks.comprehensive.results import BenchmarkResult
-from benchmarks.comprehensive.rss import current_rss_mb
+from benchmarks.comprehensive.rss import PeakRssSampler
 
 
 log = logging.getLogger(__name__)
@@ -60,6 +60,54 @@ _THREAD_ENV_VARS = (
 )
 
 _THREAD_COUNTS_ENV = "SCX_CONV_STREAM_THREAD_COUNTS"
+
+# Only the canonical SCX variant runs: the metric is path-shape, not
+# format-shape, and both paths emit the same format under the same auto-codec.
+# Declared as a module constant (not only as the inline `run()` guard below) so
+# `run_parallel._bench_format_compatible` filters at cohort-build time. Without
+# it the orchestrator schedules one job per format in the tier, each of which
+# returns `None` — the phantom `missing_result` entries that function exists to
+# prevent. Same pattern as `obs_open.py` / `cellset_gather.py`.
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+
+# Above this many cells the `materialize` arm is skipped and only `streaming`
+# runs. The materialize arm loads the whole h5ad: measured 13.6 GB peak RSS on
+# census_1m (98.2 s / 851 MB for streaming — see docs/performance.md
+# "Streaming conversion"), which extrapolates to ~68 GB at census_5m and ~136 GB
+# at census_10m. It is a comparison baseline, not the thing under contract — the
+# `streaming_peak_rss_mb` floor gates the streaming arm — so it is bounded here
+# rather than being sized for by `estimate_memory_gb` on every future full-tier
+# capture. The skip is recorded in `metadata`, never silent.
+MATERIALIZE_MAX_N_OBS: int = 1_000_000
+
+# Reader threads for the **gated** streaming arm.
+#
+# The `streaming_peak_rss_mb` floor has to be machine-independent, and the
+# parallel reader's bound is `shards_in_flight x per_shard_working_set` — so with
+# `reader_threads` left to `available_parallelism()` the floor's value is a
+# property of the runner, not of the code. Measured on census_1m
+# (1402 nnz/cell => 351 MB per 16384-row shard): 5.67-5.84 GB true peak at 16
+# threads, matching 16 x 351 MB to within 6%. The same build would pass on a
+# 4-core runner and fail on a 64-core one.
+#
+# Pinning the gated arm makes the floor test the actual contract — "bounded by N
+# shards, independent of file size" — deterministically. The default-parallelism
+# number is still measured and recorded under
+# `streaming_default_threads_peak_rss_mb`, just not gated; that is how this suite
+# already treats wall clock.
+GATED_READER_THREADS: int = 4
+
+
+def _skip_materialize_reason(n_obs: int) -> str | None:
+    """Why the materialize arm is not run at this scale, or `None` to run it."""
+    if n_obs > MATERIALIZE_MAX_N_OBS:
+        return (
+            f"materialize loads the whole h5ad (~14 GB at 1M cells, scaling "
+            f"linearly); skipped above n_obs={MATERIALIZE_MAX_N_OBS:,} so a "
+            f"full-tier capture does not pay it. The streaming arm — the one "
+            f"the thresholds.yaml floor gates — still runs."
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -83,24 +131,44 @@ def _structural_summary(scx_path: Path) -> dict[str, int]:
     }
 
 
-def _timed_streaming(h5ad_path: Path, out_path: Path) -> dict[str, float]:
-    """Run `pyscx.from_h5ad` and capture wall + RSS deltas.
+def _timed_streaming(
+    h5ad_path: Path,
+    out_path: Path,
+    reader_threads: int | None = None,
+) -> dict[str, float]:
+    """Run `pyscx.from_h5ad` and capture wall + the true in-region peak RSS.
 
-    Peak RSS uses the same max(before, after) sampling pattern as
-    `FormatRunner.timed_run` (no sampler-thread upgrade yet). For
-    short conversions this under-reports the true peak; the
-    streaming path's memory profile is bounded structurally so the
-    under-report is harmless for regression detection. Wall clock is
-    monotonic.
+    Uses :class:`PeakRssSampler`, like the six sibling modules that already do
+    (`ooc_rss_boundary`, `ooc_loader`, `cellset_gather`, `obs_open`,
+    `shuffle_layout`, `grouped_read`).
+
+    It previously took `max(before, after)` of the *instantaneous* RSS and
+    argued here that the under-report was "harmless for regression detection"
+    because "the streaming path's memory profile is bounded structurally" —
+    which assumes the very property the `streaming_peak_rss_mb` floor exists to
+    check. Two things followed, both measured on 2026-08-22:
+
+    * it is not a peak, so a transient spike inside the call is invisible; and
+    * `rss_before` picks up whatever the *previous* run left resident. The
+      materialize arm allocates ~14 GB and glibc does not return it, so with
+      the arms interleaved in one process the streaming figure climbed
+      1722 -> 2983 -> 3472 MB across three identical runs and tripped the
+      2048 MB floor. Job 2834649 measured the same build in a fresh process per
+      thread count: 736 MB at 1 reader thread rising to 1771 MB at 16 — bounded
+      by shards-in-flight, sub-linear, and inside the floor. The floor was
+      correct; the measurement was not.
+
+    Hence also the per-arm process isolation in `_run_isolated` below: no
+    in-process sampler can subtract another arm's retained heap.
     """
     import pyscx
 
-    rss_before = current_rss_mb()
+    kwargs = {} if reader_threads is None else {"reader_threads": reader_threads}
     t0 = time.perf_counter()
-    pyscx.from_h5ad(str(h5ad_path), str(out_path))
+    with PeakRssSampler() as sampler:
+        pyscx.from_h5ad(str(h5ad_path), str(out_path), **kwargs)
     wall = time.perf_counter() - t0
-    rss_after = current_rss_mb()
-    return {"wall_s": wall, "peak_rss_mb": max(rss_before, rss_after)}
+    return {"wall_s": wall, "peak_rss_mb": sampler.peak_mb}
 
 
 def _timed_materialize(h5ad_path: Path, out_path: Path) -> dict[str, float]:
@@ -111,13 +179,13 @@ def _timed_materialize(h5ad_path: Path, out_path: Path) -> dict[str, float]:
     import anndata
     import pyscx
 
-    rss_before = current_rss_mb()
     t0 = time.perf_counter()
-    adata = anndata.read_h5ad(h5ad_path)
-    pyscx.from_anndata(adata, str(out_path))
+    with PeakRssSampler() as sampler:
+        adata = anndata.read_h5ad(h5ad_path)
+        pyscx.from_anndata(adata, str(out_path))
+        del adata
     wall = time.perf_counter() - t0
-    rss_after = current_rss_mb()
-    return {"wall_s": wall, "peak_rss_mb": max(rss_before, rss_after)}
+    return {"wall_s": wall, "peak_rss_mb": sampler.peak_mb}
 
 
 # ---------------------------------------------------------------------------
@@ -135,11 +203,13 @@ _WORKER_SCRIPT = textwrap.dedent("""\
     import json
     import sys
     import tempfile
-    import time
     from pathlib import Path
 
     h5ad_path = sys.argv[1]
     n_runs = int(sys.argv[2])
+    scenario = sys.argv[3]          # "streaming" | "materialize"
+    rt = sys.argv[4]                # reader_threads, or "" to inherit
+    reader_threads = int(rt) if rt else None
 
     from benchmarks.comprehensive.benchmarks.conversion_streaming import (
         _timed_streaming,
@@ -147,76 +217,79 @@ _WORKER_SCRIPT = textwrap.dedent("""\
         _structural_summary,
     )
 
+    prefix = "scx_bench_stream_" if scenario == "streaming" else "scx_bench_bulk_"
+    fname = "stream.scx" if scenario == "streaming" else "bulk.scx"
+
     records = []
-    structural_stream = None
-    structural_bulk = None
-    streaming_output_bytes = None
-    materialize_output_bytes = None
-
+    structural = None
     for run_idx in range(n_runs):
-        with tempfile.TemporaryDirectory(prefix="scx_bench_stream_") as tmp:
-            stream_out = Path(tmp) / "stream.scx"
-            t = _timed_streaming(Path(h5ad_path), stream_out)
+        with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
+            out = Path(tmp) / fname
+            if scenario == "streaming":
+                t = _timed_streaming(Path(h5ad_path), out, reader_threads)
+            else:
+                # `from_anndata` has no reader-threads knob; the arm is a
+                # whole-file materialization either way.
+                t = _timed_materialize(Path(h5ad_path), out)
             rec = {
-                "scenario": "streaming",
+                "scenario": scenario,
                 "run_idx": run_idx,
+                "reader_threads": reader_threads,
                 "wall_s": t["wall_s"],
                 "peak_rss_mb": t["peak_rss_mb"],
             }
-            if structural_stream is None:
-                structural_stream = _structural_summary(stream_out)
-                streaming_output_bytes = stream_out.stat().st_size
-                rec["structural"] = structural_stream
-                rec["output_bytes"] = streaming_output_bytes
-            records.append(rec)
-
-        with tempfile.TemporaryDirectory(prefix="scx_bench_bulk_") as tmp:
-            bulk_out = Path(tmp) / "bulk.scx"
-            t = _timed_materialize(Path(h5ad_path), bulk_out)
-            rec = {
-                "scenario": "materialize",
-                "run_idx": run_idx,
-                "wall_s": t["wall_s"],
-                "peak_rss_mb": t["peak_rss_mb"],
-            }
-            if structural_bulk is None:
-                structural_bulk = _structural_summary(bulk_out)
-                materialize_output_bytes = bulk_out.stat().st_size
-                rec["structural"] = structural_bulk
-                rec["output_bytes"] = materialize_output_bytes
+            if structural is None:
+                structural = _structural_summary(out)
+                rec["structural"] = structural
+                rec["output_bytes"] = out.stat().st_size
             records.append(rec)
 
     print(json.dumps(records))
 """)
 
 
-def _run_thread_count_subprocess(
+def _run_arm_subprocess(
     h5ad_path: Path,
     n_runs: int,
-    thread_count: int,
+    scenario: str,
+    thread_count: int | None = None,
+    reader_threads: int | None = None,
 ) -> list[dict]:
-    """Run paired streaming + materialize conversions in a subprocess
-    with `RAYON_NUM_THREADS={thread_count}` (and friends) set.
+    """Run ``n_runs`` of **one** arm in a fresh subprocess.
 
-    Returns the worker's parsed JSON records. Failure surfaces the
-    worker's stderr verbatim — debugging a `parallel_write_scaling`
-    timing regression is far easier with the inner traceback visible.
+    One arm per process is the point, not an implementation detail. The
+    materialize arm allocates ~14 GB on census_1m and glibc does not return it,
+    so with both arms interleaved in one process the *streaming* figure inherits
+    the materialize arm's retained heap — measured at 1722 -> 2983 -> 3472 MB
+    across three identical runs, tripping a 2048 MB floor that a fresh process
+    puts at 1771 MB for the same build (job 2834649). No in-process sampler can
+    subtract another arm's garbage, so the arms have to be separated by a process
+    boundary.
+
+    ``thread_count`` pins ``RAYON_NUM_THREADS`` and friends when set; ``None``
+    inherits the caller's environment. Failure surfaces the worker's stderr
+    verbatim.
     """
     env = os.environ.copy()
-    for var in _THREAD_ENV_VARS:
-        env[var] = str(thread_count)
+    if thread_count is not None:
+        for var in _THREAD_ENV_VARS:
+            env[var] = str(thread_count)
 
     proc = subprocess.run(
-        [sys.executable, "-c", _WORKER_SCRIPT, str(h5ad_path), str(n_runs)],
+        [
+            sys.executable, "-c", _WORKER_SCRIPT,
+            str(h5ad_path), str(n_runs), scenario,
+            "" if reader_threads is None else str(reader_threads),
+        ],
         capture_output=True,
         text=True,
         env=env,
-        timeout=14400,  # streaming + materialize on census_10m comfortably under 4 h
+        timeout=14400,  # census_10m comfortably under 4 h for a single arm
     )
     if proc.returncode != 0:
         raise RuntimeError(
-            f"conversion_streaming worker failed (threads={thread_count}, "
-            f"exit={proc.returncode}).\n"
+            f"conversion_streaming worker failed (scenario={scenario}, "
+            f"threads={thread_count}, exit={proc.returncode}).\n"
             f"--- stderr ---\n{proc.stderr}\n"
             f"--- stdout ---\n{proc.stdout}"
         )
@@ -227,6 +300,22 @@ def _run_thread_count_subprocess(
             f"Failed to parse worker JSON output: {exc}\n"
             f"--- stdout ---\n{proc.stdout}"
         ) from exc
+
+
+def _run_thread_count_subprocess(
+    h5ad_path: Path,
+    n_runs: int,
+    thread_count: int,
+) -> list[dict]:
+    """Both arms at one thread count, **each in its own subprocess**.
+
+    Was one process running the pair; see :func:`_run_arm_subprocess` for why
+    that made the streaming figure carry the materialize arm's retained heap.
+    """
+    return (
+        _run_arm_subprocess(h5ad_path, n_runs, "streaming", thread_count)
+        + _run_arm_subprocess(h5ad_path, n_runs, "materialize", thread_count)
+    )
 
 
 def _parse_thread_counts(raw: str | None) -> list[int] | None:
@@ -325,89 +414,99 @@ def run(
         },
     )
 
+    skip_materialize = _skip_materialize_reason(dataset.n_obs)
+    result.metadata["materialize_skipped_reason"] = skip_materialize
+    if skip_materialize:
+        log.info("materialize arm skipped: %s", skip_materialize)
+
     if thread_counts is None:
-        return _run_in_process(h5ad_path, n_runs, result)
+        return _run_isolated(h5ad_path, n_runs, result, skip_materialize)
+    if skip_materialize:
+        # Thread scaling exists to compare how the two arms scale, so dropping
+        # one silently would make its output meaningless — and running a ~136 GB
+        # arm the operator did not know they asked for is worse. Refuse and say
+        # which knob to change.
+        raise ValueError(
+            f"{_THREAD_COUNTS_ENV} is set on a dataset with n_obs="
+            f"{dataset.n_obs:,}, where the materialize arm is skipped "
+            f"({skip_materialize}). A thread-scaling run compares the two arms, "
+            f"so it needs both: either use a dataset at or below "
+            f"n_obs={MATERIALIZE_MAX_N_OBS:,}, or unset {_THREAD_COUNTS_ENV}."
+        )
     return _run_with_thread_scaling(h5ad_path, n_runs, thread_counts, result)
 
 
-def _run_in_process(
+def _run_isolated(
     h5ad_path: Path,
     n_runs: int,
     result: BenchmarkResult,
+    skip_materialize: str | None = None,
 ) -> BenchmarkResult:
-    """Legacy path: run paired streaming + materialize in-process at
-    the inherited thread count. Used when
-    `SCX_CONV_STREAM_THREAD_COUNTS` is unset — smoke runs and the
-    existing census_1m gate keep their wall budget low by skipping
-    subprocess overhead."""
-    structural_stream: dict[str, int] | None = None
-    structural_bulk: dict[str, int] | None = None
+    """Default path: three arms, each in its own subprocess.
 
-    for run_idx in range(n_runs):
-        with tempfile.TemporaryDirectory(prefix="scx_bench_stream_") as tmp:
-            stream_out = Path(tmp) / "stream.scx"
-            timings = _timed_streaming(h5ad_path, stream_out)
-            # `streaming_peak_rss_mb` / `streaming_wall_s` are mirrored
-            # into `extra` so `compare_against_baseline.py --gate` (which
-            # only reads metrics from `runs[].extra`, see
-            # `_load_current_raw_metric`) can floor the streaming
-            # scenario without dragging the materialise scenario into
-            # the median.
+    * ``streaming`` at :data:`GATED_READER_THREADS` — carries
+      ``streaming_peak_rss_mb``, the key ``thresholds.yaml`` floors. Pinned so
+      the floor is a property of the code and not of the runner's core count.
+    * ``streaming_default_threads`` at the inherited parallelism — carries
+      ``streaming_default_threads_peak_rss_mb``, **recorded, not gated**, so the
+      real-world number stays visible without making the gate machine-dependent.
+    * ``materialize`` — the comparison baseline. No reader-threads knob applies.
+
+    One arm per process is load-bearing, not tidiness: the materialize arm
+    allocates tens of GB, glibc does not return it, and
+    ``PeakRssSampler.__enter__`` seeds itself with the entry RSS — so a shared
+    process makes one arm's peak include another's garbage. Measured: interleaved
+    in one process, the streaming figure climbed 1722 -> 2983 -> 3472 MB across
+    three identical runs.
+    """
+    arms: list[tuple[str, int | None]] = [("streaming", GATED_READER_THREADS)]
+    arms.append(("streaming_default_threads", None))
+    if not skip_materialize:
+        arms.append(("materialize", None))
+
+    structural: dict[str, dict | None] = {}
+    for label, reader_threads in arms:
+        scenario = "materialize" if label == "materialize" else "streaming"
+        records = _run_arm_subprocess(
+            h5ad_path, n_runs, scenario, reader_threads=reader_threads,
+        )
+        for rec in records:
+            if rec.get("structural") is not None and label not in structural:
+                structural[label] = rec["structural"]
+                if rec.get("output_bytes") is not None:
+                    result.metadata[f"{label}_output_bytes"] = rec["output_bytes"]
             result.add_run(
-                wall_s=timings["wall_s"],
-                peak_rss_mb=timings["peak_rss_mb"],
-                extra={
-                    "scenario": "streaming",
-                    "run_idx": run_idx,
-                    "streaming_peak_rss_mb": timings["peak_rss_mb"],
-                    "streaming_wall_s": timings["wall_s"],
+                wall_s=rec["wall_s"],
+                peak_rss_mb=rec["peak_rss_mb"],
+                **{
+                    "scenario": label,
+                    "run_idx": rec["run_idx"],
+                    "reader_threads": reader_threads,
+                    f"{label}_peak_rss_mb": rec["peak_rss_mb"],
+                    f"{label}_wall_s": rec["wall_s"],
                 },
             )
-            result.metadata["scenarios"].append("streaming")
-            if structural_stream is None:
-                structural_stream = _structural_summary(stream_out)
-                result.metadata["streaming_output_bytes"] = stream_out.stat().st_size
+            result.metadata["scenarios"].append(label)
             log.info(
-                "  streaming run %d: wall=%.2fs peak_rss=%.1f MB",
-                run_idx,
-                timings["wall_s"],
-                timings["peak_rss_mb"],
+                "  %s (reader_threads=%s) run %d: wall=%.2fs peak_rss=%.1f MB",
+                label, reader_threads, rec["run_idx"],
+                rec["wall_s"], rec["peak_rss_mb"],
             )
 
-        with tempfile.TemporaryDirectory(prefix="scx_bench_bulk_") as tmp:
-            bulk_out = Path(tmp) / "bulk.scx"
-            timings = _timed_materialize(h5ad_path, bulk_out)
-            result.add_run(
-                wall_s=timings["wall_s"],
-                peak_rss_mb=timings["peak_rss_mb"],
-                extra={
-                    "scenario": "materialize",
-                    "run_idx": run_idx,
-                    "materialize_peak_rss_mb": timings["peak_rss_mb"],
-                    "materialize_wall_s": timings["wall_s"],
-                },
-            )
-            result.metadata["scenarios"].append("materialize")
-            if structural_bulk is None:
-                structural_bulk = _structural_summary(bulk_out)
-                result.metadata["materialize_output_bytes"] = bulk_out.stat().st_size
-            log.info(
-                "  materialize run %d: wall=%.2fs peak_rss=%.1f MB",
-                run_idx,
-                timings["wall_s"],
-                timings["peak_rss_mb"],
-            )
-
+    result.metadata["gated_reader_threads"] = GATED_READER_THREADS
     result.metadata["structural"] = {
-        "streaming": structural_stream,
-        "materialize": structural_bulk,
-        "equal": structural_stream == structural_bulk,
+        **structural,
+        # `None`, not `False`, when an arm did not run: nothing to compare is not
+        # the same claim as "they differ".
+        "equal": (
+            None if skip_materialize
+            else structural.get("streaming") == structural.get("materialize")
+        ),
     }
-    if structural_stream != structural_bulk:
+    if not skip_materialize and structural.get("streaming") != structural.get("materialize"):
         log.warning(
             "Structural mismatch streaming=%s materialize=%s",
-            structural_stream,
-            structural_bulk,
+            structural.get("streaming"), structural.get("materialize"),
         )
     return result
 
@@ -452,12 +551,22 @@ def _run_with_thread_scaling(
             result.add_run(
                 wall_s=rec["wall_s"],
                 peak_rss_mb=rec["peak_rss_mb"],
-                extra={
+                **{
                     "scenario": scenario,
                     "run_idx": rec["run_idx"],
                     "thread_count": tc,
-                    f"{scenario}_peak_rss_mb": rec["peak_rss_mb"],
-                    f"{scenario}_wall_s": rec["wall_s"],
+                    # Thread-count-qualified, NOT the bare `{scenario}_peak_rss_mb`.
+                    # That bare key is what `thresholds.yaml` floors, and
+                    # `_load_current_raw_metric` takes the MEDIAN of every run
+                    # carrying it — so emitting it here would make the pinned
+                    # rt=4 ceiling a median over whatever thread counts the
+                    # operator swept, silently undoing the pinning. Found by
+                    # review (codex - gpt-5.6-sol) on PR #451, reproduced with
+                    # mocked workers: counts 1 and 16 both emitted the floored
+                    # key. `submit_streaming_threads_census1m.sh` exercises this
+                    # branch, so it is not hypothetical.
+                    f"{scenario}_t{tc}_peak_rss_mb": rec["peak_rss_mb"],
+                    f"{scenario}_t{tc}_wall_s": rec["wall_s"],
                 },
             )
             result.metadata["scenarios"].append(scenario)

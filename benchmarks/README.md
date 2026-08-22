@@ -1060,13 +1060,26 @@ performance currently under regression governance:
 | **End-to-end residency pipeline (CPU + GPU + rapids-singlecell)** | `accel_pipeline` |
 | **Multimodal — h5mu compression and training-loader throughput** | `multimodal_compression`, `multimodal_training` |
 
-That is 30 benchmarks across 13 distinct domains, each expanded across the
-relevant format variants (h5ad / zarr / scx / tiledb / parquet / bpcells
-plus accelerator-implementation variants like `accel_pca__pyscx_gpu_rand_hh`)
-and the tier's dataset list (pbmc3k → census_10m). The canonical list
-lives in [`benchmarks/comprehensive/benchmarks/__init__.py::ALL_BENCHMARKS`](comprehensive/benchmarks/__init__.py).
-Adding a new benchmark to the suite is a one-line edit there — every
-capture run picks it up automatically.
+Each is expanded across the relevant format variants (h5ad / zarr / scx /
+tiledb / parquet / bpcells plus accelerator-implementation variants like
+`accel_pca__pyscx_gpu_rand_hh`) and the tier's dataset list (pbmc3k →
+census_10m). The canonical list lives in
+[`benchmarks/comprehensive/benchmarks/__init__.py::ALL_BENCHMARKS`](comprehensive/benchmarks/__init__.py)
+— 50 entries. Adding a new benchmark to the suite is a one-line edit there;
+every capture run picks it up automatically.
+
+> **That one-line edit is not optional, and skipping it is silent.**
+> `capture_baseline.py` and `run_parallel.py` both derive their lists from
+> `ALL_BENCHMARKS`, and `capture_baseline.py` additionally *rejects* an
+> off-list `--benchmarks` name — so a module that exists, has a `run()`, and
+> even carries `thresholds.yaml` floors is unreachable by any supported gate
+> invocation until it is registered. A floor on a never-run triple is skipped
+> rather than failed (see `_triple_was_run` in
+> `scripts/compare_against_baseline.py`), so it reads as coverage and provides
+> none. Three benchmarks were in that state until v0.14 —
+> `conversion_streaming`, `export_streaming` and `accel_eval_metrics` — and
+> `benchmarks/comprehensive/tests/test_floor_reachability.py` now fails if it
+> happens again.
 
 > **Capture vs gate coverage are not the same.** The capture phase runs
 > every entry in `ALL_BENCHMARKS`. The gate phase only flags regressions
@@ -1080,18 +1093,31 @@ capture run picks it up automatically.
 >     print(sorted(keys))"
 > ```
 >
-> The current `LATEST` symlink points at `v0.6.5-accel-gpu-rapids-floors`.
-> It gates **format** (`compression`, `read_full`, `read_selective`,
-> `write`, `memory`, `parallel_scaling`, `parallel_write_scaling`,
-> `roundtrip`), **cloud** (`cloud_metadata`, `cloud_read`,
+> The current `LATEST` symlink points at `v0.11.2-multimodal-loader-fix`
+> (snapshot `candidate_auto_converge_20260712`, tier `full`). Measured with
+> the command above, it carries rows for **38** benchmarks: **format**
+> (`compression`, `read_full`, `read_selective`, `read_scattered`,
+> `read_streaming_vs_inmemory`, `write`, `memory`, `parallel_scaling`,
+> `parallel_write_scaling`, `roundtrip`, `ooc_rss_boundary`,
+> `shardad_fidelity`), **cloud** (`cloud_metadata`, `cloud_read`,
 > `cloud_filtered`, `cloud_pull`, `cloud_push`, `cloud_large_atlas`,
 > `cloud_reader_vs_pull`, `cost_model`), **`ml_loader`**, **multimodal**
-> (`multimodal_compression`, `multimodal_training`), `index_plan`,
-> `fragment_ops`, `correctness`, and the **`accel_*`** family
-> (`accel_pca`, `accel_knn`, `accel_umap`, `accel_leiden`,
-> `accel_preprocess`, `accel_hvg`) including per-op rapids-route
-> correctness floors (`*_route_rapids_correct`,
+> (`multimodal_compression`, `multimodal_training`,
+> `multimodal_read_streaming_vs_inmemory`), `index_plan`, `fragment_ops`,
+> `correctness`, and the **`accel_*`** family (`accel_pca`, `accel_knn`,
+> `accel_umap`, `accel_leiden`, `accel_preprocess`, `accel_hvg`,
+> `accel_de`, `accel_pipeline`, `accel_format_pipeline`,
+> `accel_to_gpu_anndata`, `bench_csc_dispatch`) including per-op
+> rapids-route correctness floors (`*_route_rapids_correct`,
 > `*_fallback_no_rapids_correct`).
+>
+> **It predates the Data-load Phase 0/1D benchmarks entirely**, so it carries
+> no rows for `obs_open`, `cellset_gather`, `ooc_loader`, `shuffle_layout`,
+> `conversion_streaming` or `export_streaming`. A gate over any of those
+> reports them as *appearing*, not regressing (`diff_summaries` treats a
+> baseline-absent row as non-regressing by design), so only their
+> `thresholds.yaml` absolute floors carry signal. Say so when reporting such a
+> run: "no regressions against LATEST" is not what was measured.
 
 **Accelerator route gates.** Every GPU accelerator benchmark records the
 execution route each call actually took (read back from
@@ -1239,8 +1265,9 @@ asserts the rapids-absent path stamps `fallback_reason="no_rapids"` and stays
 correct on CPU.
 
 > **Baseline promoted.** `LATEST` was promoted to
-> `v0.6.5-accel-gpu-rapids-floors` after the Phase 2 routing flip merged.
-> The `*_route_rapids_correct` / `*_fallback_no_rapids_correct` floors are
+> `v0.6.5-accel-gpu-rapids-floors` after the Phase 2 routing flip merged, and
+> has since moved on to `v0.11.2-multimodal-loader-fix`. The
+> `*_route_rapids_correct` / `*_fallback_no_rapids_correct` floors are
 > absolute (baseline-independent) and gate alongside the relative
 > regression checks.
 
@@ -1589,7 +1616,7 @@ Run it locally before opening a PR that touches the gate.
 
 The comprehensive baseline at
 `comprehensive/results/baselines/LATEST` (currently
-`v0.6.5-accel-gpu-rapids-floors`) covers both format-level **and**
+`v0.11.2-multimodal-loader-fix`) covers both format-level **and**
 GPU-accelerator benchmarks (`accel_pca`, `accel_knn`, `accel_umap`,
 `accel_leiden`, `accel_preprocess`, `accel_hvg`) across pbmc3k,
 tabula_sapiens_100k, and census_1m. Per-run correctness metrics
