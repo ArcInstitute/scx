@@ -417,32 +417,46 @@ pub fn streaming_clip_square_sum_batched<S: ShardSource + Sync>(
     Ok(batch_bcs.into_iter().zip(batch_sbcs).collect())
 }
 
+/// A simple in-memory `ShardSource` for testing.
+///
+/// Lives at module scope rather than inside `mod tests` so the sibling
+/// `moments_golden` module can reuse it — the crate already carries five
+/// in-memory `ShardSource` doubles (`gene_score_tests`, `pflog_tests`,
+/// `fused::gpu`, and two in `pca::cpu`) and a sixth is not an improvement.
+#[cfg(test)]
+struct InMemorySource {
+    shards: Vec<scx_sparse::ScxCsr>,
+    n_obs: usize,
+    n_vars: usize,
+}
+
+#[cfg(test)]
+impl ShardSource for InMemorySource {
+    fn n_shards(&self) -> usize {
+        self.shards.len()
+    }
+    fn n_obs(&self) -> usize {
+        self.n_obs
+    }
+    fn n_vars(&self) -> usize {
+        self.n_vars
+    }
+    fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<scx_sparse::ScxCsr> {
+        Ok(self.shards[shard_idx].clone())
+    }
+}
+
+/// Golden per-column moment values for every finalize site in this crate,
+/// pinned before Phase 7a's unification so the adoption is provably
+/// behaviour-preserving rather than preserving-by-intent.
+#[cfg(test)]
+#[path = "moments_golden_tests.rs"]
+mod moments_golden;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use scx_sparse::ScxCsr;
-
-    /// A simple in-memory ShardSource for testing.
-    struct InMemorySource {
-        shards: Vec<ScxCsr>,
-        n_obs: usize,
-        n_vars: usize,
-    }
-
-    impl ShardSource for InMemorySource {
-        fn n_shards(&self) -> usize {
-            self.shards.len()
-        }
-        fn n_obs(&self) -> usize {
-            self.n_obs
-        }
-        fn n_vars(&self) -> usize {
-            self.n_vars
-        }
-        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
-            Ok(self.shards[shard_idx].clone())
-        }
-    }
 
     fn make_test_source() -> InMemorySource {
         // 4 rows x 3 cols, split into 2 shards of 2 rows each:
